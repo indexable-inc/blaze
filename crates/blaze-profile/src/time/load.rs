@@ -58,6 +58,8 @@ pub fn run(source: &Source<'_>, ask: &Ask<'_>) -> Result<String, TimeError> {
     report::table(&report::rows(&model, ask.by, ask.matching), ask.by, ask.top, &mut out);
     out.push('\n');
     report::path(&model, &path, ask.top, &mut out);
+    out.push('\n');
+    report::scheduling(&model, &path, ask.top, &mut out);
     if let Some(lines) = ask.cores {
         out.push('\n');
         report::cores(&model, lines, &mut out);
@@ -119,8 +121,8 @@ pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError>
         "SELECT CAST(process AS BIGINT) AS process, CAST(thread AS BIGINT) AS thread, CAST(t_ns AS BIGINT) AS t_ns, \
          CAST(event AS VARCHAR) AS event, CAST(job AS UBIGINT) AS job, CAST(fiber AS BIGINT) AS fiber, \
          CAST(core AS BIGINT) AS core, CAST(wait_kind AS VARCHAR) AS wait_kind, CAST(wait_value AS UBIGINT) AS wait_value, \
-         CAST(by_job AS UBIGINT) AS by_job, CAST(since_ns AS BIGINT) AS since_ns, CAST(began_as AS UBIGINT) AS began_as \
-         FROM {}",
+         CAST(by_job AS UBIGINT) AS by_job, CAST(since_ns AS BIGINT) AS since_ns, CAST(began_as AS UBIGINT) AS began_as, \
+         CAST(queued_ns AS BIGINT) AS queued_ns FROM {}",
         of_build("switches", build, SWITCHES_SINCE_2, window.map(|(t0, t1)| format!("t_ns BETWEEN {t0} AND {t1}")))
     );
     let switches = switches(&query(source, &sql, "reading the build's switches")?)?;
@@ -149,7 +151,8 @@ pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError>
 
 /// The columns schema version 2 added, as typed nulls: a history of version 1 files has none of
 /// them, and a query naming a column no file has fails to bind.
-const SWITCHES_SINCE_2: &str = "NULL::UBIGINT AS by_job, NULL::BIGINT AS since_ns, NULL::UBIGINT AS began_as";
+const SWITCHES_SINCE_2: &str =
+    "NULL::UBIGINT AS by_job, NULL::BIGINT AS since_ns, NULL::UBIGINT AS began_as, NULL::BIGINT AS queued_ns";
 const SPANS_SINCE_2: &str = "NULL::UBIGINT AS job";
 
 /// `table`'s rows of `build`, and its rows of no build that `window` holds (a condition on the
@@ -221,6 +224,7 @@ fn switches(batches: &[RecordBatch]) -> Result<Vec<SwitchIn>, TimeError> {
         let (job, fiber, core) = (uints(batch, T, "job")?, ints(batch, T, "fiber")?, ints(batch, T, "core")?);
         let (wait_kind, wait_value) = (texts(batch, T, "wait_kind")?, uints(batch, T, "wait_value")?);
         let (by_job, since_ns, began_as) = (uints(batch, T, "by_job")?, ints(batch, T, "since_ns")?, uints(batch, T, "began_as")?);
+        let queued_ns = ints(batch, T, "queued_ns")?;
         for row in 0..batch.num_rows() {
             let name = get(event, row, |it, row| it.value(row)).ok_or(TimeError::BadColumn { table: T, column: "event", why: "is null" })?;
             let wait = get(wait_kind, row, |it, row| it.value(row)).map(|kind| (kind, get(wait_value, row, |it, row| it.value(row))));
@@ -235,6 +239,7 @@ fn switches(batches: &[RecordBatch]) -> Result<Vec<SwitchIn>, TimeError> {
                 by: get(by_job, row, |it, row| it.value(row)),
                 since_ns: get(since_ns, row, |it, row| it.value(row)),
                 began_as: get(began_as, row, |it, row| it.value(row)),
+                queued_ns: get(queued_ns, row, |it, row| it.value(row)),
             });
         }
     }

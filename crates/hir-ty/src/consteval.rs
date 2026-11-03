@@ -5,7 +5,7 @@ use std::mem::offset_of;
 use base_db::{Db, Crate};
 use blaze_format::{FormatError, Placed, Slice, Writer};
 use hir_def::{
-    ConstId, EnumVariantId, ExpressionStoreOwnerId, ItemContainerId, StaticId,
+    ConstId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId, StaticId,
     expr_store::{ExpressionStore, HygieneId, path::Path},
     hir::{Expr, ExprId, Literal},
     resolver::{Resolver, ValueNs},
@@ -18,7 +18,7 @@ use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
 
 use crate::{
-    ComplexMemoryMap, MemoryMap, ParamEnvAndCrate, Span, StaticMemory,
+    ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, Span, StaticMemory,
     db::{AnonConstId, AnonConstLoc, HirDatabase},
     generics::Generics,
     lower::LoweringMode,
@@ -35,7 +35,6 @@ use crate::{
 
 pub mod deps;
 pub mod discriminants;
-pub mod hir_eval;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum ConstEvalError<'db> {
@@ -478,6 +477,33 @@ pub(crate) fn const_eval<'db>(
     }
 }
 
+/// The value of the body `owner` for `subst`, evaluated in `trait_env` (its own environment when
+/// `None`): its MIR, monomorphized and run by the MIR evaluator, the one evaluator of constants.
+pub(crate) fn evaluate<'db>(
+    db: &'db Db,
+    owner: InferBodyId<'db>,
+    subst: GenericArgs<'db>,
+    trait_env: Option<ParamEnvAndCrate<'db>>,
+) -> Result<Allocation<'db>, ConstEvalError<'db>> {
+    // As rustc's `eval_to_allocation` of a body whose type check is tainted by errors: no value,
+    // so a type using the constant is an error, not a mismatch with whatever it would run to.
+    if InferenceResult::of(db, owner).has_errors {
+        return Err(ConstEvalError::MirLowerError(MirLowerError::HasErrors));
+    }
+    let body = db.monomorphized_runtime_mir_body(
+        owner,
+        subst.store(),
+        // The crate the constant is evaluated for, not the one it is in: the impls its
+        // generic arguments select can be in crates its own doesn't depend on.
+        ParamEnvAndCrate {
+            param_env: db.trait_environment(owner.generic_def(db)),
+            krate: trait_env.map_or_else(|| owner.krate(db), |env| env.krate),
+        }
+        .store(),
+    )?;
+    Ok(db.interpret_mir(body, trait_env)?)
+}
+
 #[blaze_query::tracked(returns(ref), cycle_result = const_eval_cycle_result, lru = 0, mem_tag = Infer)]
 pub fn const_eval_query<'db>(
     db: &'db Db,
@@ -490,7 +516,7 @@ pub fn const_eval_query<'db>(
         return Ok(kept.store());
     }
     let trait_env = trait_env.as_ref().map(|env| env.as_ref(db));
-    let value = hir_eval::value(db, def.into(), subst, trait_env).map(|it| it.store());
+    let value = evaluate(db, def.into(), subst, trait_env).map(|it| it.store());
     deps::record(db, def, subst, &value);
     value
 }
@@ -525,7 +551,7 @@ pub(crate) fn anon_const_eval_query<'db>(
     trait_env: Option<StoredParamEnvAndCrate>,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
     let trait_env = trait_env.as_ref().map(|env| env.as_ref(db));
-    Ok(hir_eval::value(db, def.into(), subst.as_ref(), trait_env)?.store())
+    Ok(evaluate(db, def.into(), subst.as_ref(), trait_env)?.store())
 }
 
 fn anon_const_eval_cycle_result<'db>(
@@ -553,7 +579,7 @@ pub(crate) fn const_eval_static_query<'db>(
     db: &'db Db,
     def: StaticId,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-    Ok(hir_eval::value(db, def.into(), GenericArgs::empty(), None)?.store())
+    Ok(evaluate(db, def.into(), GenericArgs::empty(), None)?.store())
 }
 
 fn const_eval_static_cycle_result<'db>(
@@ -599,17 +625,19 @@ blaze_format::record! {
     /// A [`MemoryMap`]: `kind` 0 for [`MemoryMap::Empty`], 1 for [`MemoryMap::Simple`] (its
     /// bytes in `bytes`, every other column empty), 2 for [`MemoryMap::Complex`] (its pieces'
     /// bytes in `bytes` in the order of their addresses). Types are indices in the buffer's
-    /// type table (`next_solver::persist`): `vtable` in the order of their ids, `type_ids` one
-    /// more than the index, 0 for a `TypeId` of no type. `value_pointers` and
+    /// type table (`next_solver::persist`): `vtable` in the order of their ids, `vtable_dyns`
+    /// the `dyn` type each id is a vtable for, one more than the index, 0 for a function's;
+    /// `type_ids` one more than the index, 0 for a `TypeId` of no type. `value_pointers` and
     /// `memory_pointers` are where its words with provenance are, sorted.
     #[derive(Clone, Copy)]
-    pub struct MemoryMapRec: 2 {
+    pub struct MemoryMapRec: 3 {
         pub kind: u32,
         pub bytes: Slice<u8>,
         pub pieces: Slice<PieceRec>,
         pub aligns: Slice<AlignRec>,
         pub statics: Slice<StaticRec>,
         pub vtable: Slice<u32>,
+        pub vtable_dyns: Slice<u32>,
         pub type_ids: Slice<u32>,
         pub value_pointers: Slice<u64>,
         pub memory_pointers: Slice<u64>,
@@ -627,7 +655,7 @@ blaze_format::record! {
     }
 }
 
-const _: () = assert!(size_of::<MemoryMapRec>() == 4 + 8 * 8);
+const _: () = assert!(size_of::<MemoryMapRec>() == 4 + 9 * 8);
 const _: () = assert!(size_of::<AllocationRec>() == 4 + 8 + size_of::<MemoryMapRec>());
 
 /// Writes `allocation` into `out`, its types into `tys`; returns where its record is, for the
@@ -671,6 +699,7 @@ struct MapColumns {
     aligns: Placed,
     statics: Placed,
     vtable: Placed,
+    vtable_dyns: Placed,
     type_ids: Placed,
     value_pointers: Placed,
     memory_pointers: Placed,
@@ -687,6 +716,7 @@ impl MapColumns {
             aligns: self.aligns.slice(field(offset_of!(MemoryMapRec, aligns))),
             statics: self.statics.slice(field(offset_of!(MemoryMapRec, statics))),
             vtable: self.vtable.slice(field(offset_of!(MemoryMapRec, vtable))),
+            vtable_dyns: self.vtable_dyns.slice(field(offset_of!(MemoryMapRec, vtable_dyns))),
             type_ids: self.type_ids.slice(field(offset_of!(MemoryMapRec, type_ids))),
             value_pointers: self
                 .value_pointers
@@ -712,6 +742,7 @@ fn write_memory_map<'db>(
         aligns: none,
         statics: none,
         vtable: none,
+        vtable_dyns: none,
         type_ids: none,
         value_pointers: none,
         memory_pointers: none,
@@ -767,6 +798,11 @@ fn write_memory_map<'db>(
                 map.vtable.tys().len(),
                 map.vtable.tys().map(&mut *ty),
             );
+            columns.vtable_dyns = Placed::push_each(
+                out,
+                map.vtable.tys().len(),
+                map.vtable.entries().map(|(_, it)| it.map_or(0, |it| ty(it) + 1)),
+            );
             columns.type_ids = Placed::push_each(
                 out,
                 map.type_ids.len(),
@@ -801,6 +837,7 @@ fn read_memory_map<'db>(
     let aligns = record.aligns.follow(buffer)?;
     let statics = record.statics.follow(buffer)?;
     let vtable = record.vtable.follow(buffer)?;
+    let vtable_dyns = record.vtable_dyns.follow(buffer)?;
     let type_ids = record.type_ids.follow(buffer)?;
     let value_pointers = record.value_pointers.follow(buffer)?;
     let memory_pointers = record.memory_pointers.follow(buffer)?;
@@ -808,6 +845,7 @@ fn read_memory_map<'db>(
         && aligns.is_empty()
         && statics.is_empty()
         && vtable.is_empty()
+        && vtable_dyns.is_empty()
         && type_ids.is_empty()
         && value_pointers.is_empty()
         && memory_pointers.is_empty();
@@ -851,9 +889,16 @@ fn read_memory_map<'db>(
             .ok_or_else(|| invalid("a static of id index 0 or not in the table"))?;
         map.statics.push(StaticMemory { start: word(it.start)?, size: word(it.size)?, id });
     }
+    if vtable_dyns.len() != vtable.len() {
+        return Err(invalid("a vtable map whose ids and `dyn` types differ in number"));
+    }
     let mut last = None;
-    for &at in vtable {
-        let id = map.vtable.id(ty(at)?);
+    for (&at, &dyn_at) in vtable.iter().zip(vtable_dyns) {
+        let dyn_ty = match dyn_at {
+            0 => None,
+            at => Some(ty(at - 1)?),
+        };
+        let id = map.vtable.intern(ty(at)?, dyn_ty);
         if last.is_some_and(|last: usize| id != last + 1) {
             return Err(invalid("a type twice in a vtable map"));
         }
@@ -978,6 +1023,7 @@ mod tests {
             aligns: none,
             statics: none,
             vtable: none,
+            vtable_dyns: none,
             type_ids: none,
             value_pointers,
             memory_pointers: none,

@@ -5,6 +5,7 @@ use std::{fmt, hash::Hash};
 use base_db::{Db, Crate};
 use hir_def::{
     AdtId, AssocItemId, ExpressionStoreOwnerId, GenericDefId, HasModule, ImplId, Lookup, TraitId,
+    TypeParamId,
     expr_store::ExpressionStore,
     hir::generics::WherePredicate,
     lang_item::{LangItemEnum, LangItems},
@@ -19,7 +20,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use intern::sym;
 use rustc_type_ir::{
-    AliasTy, AliasTyKind, TypeVisitableExt, TypingMode,
+    AliasTy, AliasTyKind, ClausePolarity, TypeVisitableExt, TypingMode,
     inherent::{BoundExistentialPredicates, IntoKind, Ty as _},
 };
 
@@ -29,7 +30,7 @@ use crate::{
     generics::Generics,
     lower::LoweringMode,
     next_solver::{
-        DbInterner, GenericArgs, ParamEnv, StoredClauses, Ty, TyKind,
+        ClauseKind, DbInterner, GenericArgs, ParamEnv, StoredClauses, Ty, TyKind,
         infer::{
             DbInternerInferExt, InferCtxt,
             select::EvaluationResult,
@@ -584,44 +585,298 @@ fn check_orphan_rules_uncached<'db>(db: &'db Db, impl_: ImplId) -> bool {
         trait_ref
     };
 
-    let unwrap_fundamental = |mut ty: Ty<'db>| {
-        // Unwrap all layers of fundamental types with a loop.
-        loop {
-            match ty.kind() {
-                TyKind::Ref(_, referenced, _) => ty = referenced,
-                TyKind::Adt(adt_def, subs) => {
-                    let AdtId::StructId(s) = adt_def.def_id() else {
-                        break ty;
-                    };
-                    let struct_signature = StructSignature::of(db, s);
-                    if struct_signature.flags.contains(StructFlags::FUNDAMENTAL) {
-                        let next = subs.types().next();
-                        match next {
-                            Some(it) => ty = it,
-                            None => break ty,
-                        }
-                    } else {
-                        break ty;
-                    }
-                }
-                _ => break ty,
-            }
-        }
-    };
     //   - At least one of the types `T0..=Tn` must be a local type. Let `Ti` be the first such type.
 
     // FIXME: param coverage
     //   - No uncovered type parameters `P1..=Pn` may appear in `T0..Ti` (excluding `Ti`)
-    let is_not_orphan = trait_ref.args.types().any(|ty| match unwrap_fundamental(ty).kind() {
-        TyKind::Adt(adt_def, _) => is_local(adt_def.def_id().module(db).krate(db)),
+    // blaze: a type parameter bounded by a closed `#[blaze::sealed]` trait of the crate is a
+    // local type (`sealed_local_bound`).
+    trait_ref.args.types().any(|ty| {
+        is_local_key_ty(db, local_crate, ty, |param| sealed_local_bound(db, impl_, param).is_some())
+    })
+}
+
+/// `ty`, `&`, `&mut` and `#[fundamental]` structs (`Box`, `Pin`) unwrapped down to the first
+/// type argument of each: the type the orphan rules decide by.
+fn unwrap_fundamental<'db>(db: &'db Db, mut ty: Ty<'db>) -> Ty<'db> {
+    loop {
+        match ty.kind() {
+            TyKind::Ref(_, referenced, _) => ty = referenced,
+            TyKind::Adt(adt_def, subs) => {
+                let AdtId::StructId(s) = adt_def.def_id() else {
+                    break ty;
+                };
+                let struct_signature = StructSignature::of(db, s);
+                if struct_signature.flags.contains(StructFlags::FUNDAMENTAL) {
+                    let next = subs.types().next();
+                    match next {
+                        Some(it) => ty = it,
+                        None => break ty,
+                    }
+                } else {
+                    break ty;
+                }
+            }
+            _ => break ty,
+        }
+    }
+}
+
+/// blaze: rustc's walk of a type under fundamental types (`OrphanChecker::visit_ty` in
+/// `rustc_next_trait_solver::coherence`): through `&` and `&mut`, through `Box` to its first type
+/// argument alone, and through every other `#[fundamental]` ADT (`Pin`, or any crate's own) to
+/// each of its type arguments, whichever crate the ADT is of: a downstream crate sees all of
+/// them as fundamental. Whether `leaf` holds for one of the types the walk stops at, in order.
+/// [`unwrap_fundamental`], which follows the first argument alone, is the orphan check's own
+/// walk; the relaxation's rules that ask what another crate could put in a position use this.
+fn any_fundamental_leaf<'db>(
+    db: &'db Db,
+    ty: Ty<'db>,
+    leaf: &mut impl FnMut(Ty<'db>) -> bool,
+) -> bool {
+    match ty.kind() {
+        TyKind::Ref(_, referenced, _) => any_fundamental_leaf(db, referenced, leaf),
+        TyKind::Adt(adt_def, args)
+            if matches!(adt_def.def_id(), AdtId::StructId(s)
+                if StructSignature::of(db, s).flags.contains(StructFlags::FUNDAMENTAL)) =>
+        {
+            if adt_def.is_box() {
+                args.types().next().is_some_and(|it| any_fundamental_leaf(db, it, leaf))
+            } else {
+                args.types().any(|it| any_fundamental_leaf(db, it, leaf))
+            }
+        }
+        _ => leaf(ty),
+    }
+}
+
+/// Whether `ty` is a local type of `krate` as the orphan rules see it: under fundamental types,
+/// an ADT or a `dyn` of a trait `krate` defines (an error type counts, as rustc's does), or a
+/// type parameter `param_is_local` takes for local.
+fn is_local_key_ty<'db>(
+    db: &'db Db,
+    krate: Crate,
+    ty: Ty<'db>,
+    param_is_local: impl Fn(TypeParamId) -> bool,
+) -> bool {
+    match unwrap_fundamental(db, ty).kind() {
+        TyKind::Adt(adt_def, _) => adt_def.def_id().module(db).krate(db) == krate,
         TyKind::Error(_) => true,
         TyKind::Dynamic(it, _) => {
-            it.principal_def_id().is_some_and(|trait_id| is_local(trait_id.0.module(db).krate(db)))
+            it.principal_def_id().is_some_and(|trait_id| trait_id.0.module(db).krate(db) == krate)
         }
+        TyKind::Param(param) => param_is_local(param.id),
         _ => false,
+    }
+}
+
+/// blaze: the `#[blaze::sealed]` traits of `impl_`'s own crate that bound one of its type
+/// parameters directly (`T: Sealed`, positive), each with the parameter, in where-clause order.
+/// Only these can make a parameter local ([`sealed_local_bound`]); the store's coherence fact
+/// hashes their impls, which an overlap check of the impl reads through the bound.
+pub fn sealed_bounds(db: &Db, impl_: ImplId) -> impl Iterator<Item = (TypeParamId, TraitId)> + '_ {
+    let krate = impl_.lookup(db).container.krate(db);
+    crate::lower::GenericPredicates::query_explicit(db, impl_.into()).skip_binder().filter_map(
+        move |clause| {
+            let ClauseKind::Trait(predicate) = clause.kind().skip_binder() else { return None };
+            if predicate.polarity != ClausePolarity::Positive {
+                return None;
+            }
+            let TyKind::Param(param) = predicate.self_ty().kind() else { return None };
+            let trait_ = predicate.trait_ref.def_id.0;
+            let sealed = TraitSignature::of(db, trait_).flags.contains(TraitFlags::SEALED);
+            (sealed && trait_.module(db).krate(db) == krate).then_some((param.id, trait_))
+        },
+    )
+}
+
+/// blaze: the `#[blaze::sealed]` trait that makes `impl_`'s type parameter `param` a local type
+/// in its orphan check, if one does: a direct bound `param: S` ([`sealed_bounds`]) where every
+/// impl of `S` is for a local type of the crate ([`sealed_closure`]), the first such bound in
+/// where-clause order. Then a blanket impl over `S` stands for one impl per impl of `S`, each of
+/// which the orphan rules allow in the crate (docs/v2/plan/lanes/frontend/sealed-orphan.md,
+/// "Why it is sound"); `hir-ty-coherence` checks the rest (sealing in other crates, overlap,
+/// the traits it may not relax).
+pub fn sealed_local_bound(db: &Db, impl_: ImplId, param: TypeParamId) -> Option<TraitId> {
+    sealed_bounds(db, impl_)
+        .find(|&(bounded, trait_)| bounded == param && sealed_closure(db, trait_).is_ok())
+        .map(|(_, trait_)| trait_)
+}
+
+/// blaze: the sealed bound an impl of another crate's trait leans on, if it has one: the
+/// trait-ref's first input type that is, under fundamental types, local or a type parameter
+/// (the one the orphan rules decide by) is a parameter with a direct bound on a
+/// `#[blaze::sealed]` trait of the impl's crate ([`sealed_bounds`]). Whether that trait is
+/// closed ([`sealed_closure`]) decides whether the parameter is local; `hir-ty-coherence`
+/// checks such an impl further (overlap, the traits it may not relax). An impl the orphan
+/// rules allow without the bound (`impl<T: Sealed> From<T> for Local`) leans on nothing.
+///
+/// Of several sealed bounds on the parameter it is the one [`sealed_local_bound`] picks, the
+/// first closed one, so the order of the bounds decides nothing; only when none is closed is it
+/// the first, whose open impl the refusal names.
+pub fn sealed_relaxation(db: &Db, impl_: ImplId) -> Option<(TypeParamId, TraitId)> {
+    let trait_ref = db.impl_trait(impl_)?.instantiate_identity().skip_norm_wip();
+    let krate = impl_.lookup(db).container.krate(db);
+    if trait_ref.def_id.0.module(db).krate(db) == krate {
+        return None;
+    }
+    let first = trait_ref.args.types().map(|ty| unwrap_fundamental(db, ty)).find(|&ty| {
+        matches!(ty.kind(), TyKind::Param(_)) || is_local_key_ty(db, krate, ty, |_| false)
+    })?;
+    let TyKind::Param(param) = first.kind() else { return None };
+    match sealed_local_bound(db, impl_, param.id) {
+        Some(closed) => Some((param.id, closed)),
+        None => sealed_bounds(db, impl_).find(|&(bounded, _)| bounded == param.id),
+    }
+}
+
+/// blaze: the first input type of a relaxed impl's trait-ref (in argument order, the self type
+/// first) that holds an uncovered type parameter other than a sealed one: under fundamental
+/// types, walked as rustc walks them ([`any_fundamental_leaf`]: `&`, `&mut`, `Box`'s first
+/// argument, every argument of `Pin` and of any other `#[fundamental]` ADT), a type parameter
+/// with no closed sealed bound ([`sealed_local_bound`]), or an alias that the orphan rules can't
+/// see through. Its index among the trait-ref's types, with the input type and the parameter
+/// (or alias) found in it, if there is one.
+///
+/// A relaxed impl with one is refused until blaze checks overlap across crates (E0119 in every
+/// crate): with `impl<T: Sealed, U> F<U> for T`, a downstream crate could write
+/// `impl F<Downstream> for Local`, which the orphan rules allow there and which overlaps the
+/// expansion's `impl<U> F<U> for Local`; rustc refuses that in the downstream crate (E0119),
+/// and blaze can't yet. The same holds for `impl<T: Sealed, U> F for Pair<T, U>` with a
+/// `#[fundamental] struct Pair<X, Y>`: rustc's orphan rules let a downstream crate write
+/// `impl F for Pair<Local, Downstream>`. A parameter under a type that is not fundamental
+/// (`Vec<U>`) is covered: no downstream type unifies with it.
+pub fn relaxed_uncovered_input<'db>(
+    db: &'db Db,
+    impl_: ImplId,
+) -> Option<(usize, Ty<'db>, Ty<'db>)> {
+    let trait_ref = db.impl_trait(impl_)?.instantiate_identity().skip_norm_wip();
+    trait_ref.args.types().enumerate().find_map(|(at, ty)| {
+        let mut uncovered = None;
+        any_fundamental_leaf(db, ty, &mut |leaf| {
+            let open = match leaf.kind() {
+                TyKind::Param(param) => sealed_local_bound(db, impl_, param.id).is_none(),
+                TyKind::Alias(..) => true,
+                _ => false,
+            };
+            if open {
+                uncovered = Some(leaf);
+            }
+            open
+        });
+        uncovered.map(|leaf| (at, ty, leaf))
+    })
+}
+
+/// blaze: whether `param` of `impl_` must be `Sized`: a `Sized` bound, written or implicit,
+/// is among the impl's where clauses. Every relaxed impl needs it on each of its parameters with
+/// a sealed bound ([`sealed_bounds`]), so that no `dyn` type, which the solver implements its
+/// supertraits for without an impl, ever stands for one.
+pub fn param_is_sized(db: &Db, impl_: ImplId, param: TypeParamId) -> bool {
+    let krate = impl_.lookup(db).container.krate(db);
+    let Some(sized) = hir_def::lang_item::lang_items(db, krate).Sized else { return false };
+    crate::lower::GenericPredicates::query_all(db, impl_.into()).skip_binder().any(|clause| {
+        let ClauseKind::Trait(predicate) = clause.kind().skip_binder() else { return false };
+        predicate.polarity == ClausePolarity::Positive
+            && predicate.trait_ref.def_id.0 == sized
+            && matches!(predicate.self_ty().kind(), TyKind::Param(it) if it.id == param)
+    })
+}
+
+/// blaze: whether a `#[blaze::sealed]` trait is declared in `krate` or in any crate it depends
+/// on, directly or not: whether the sealed checks (`hir-ty-coherence`) bind `krate`'s items. A
+/// crate whose items no other check covers (a dependency of which only what the build's programs
+/// reach is checked) gets them run alone when this holds (`hir::check::check_sealed`), and
+/// for a graph with no `#[blaze::sealed]` anywhere this is the one thing asked. Tracked per
+/// crate, so a graph costs one [`declares_sealed`] per crate, once.
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+pub fn sealed_in_graph(db: &Db, krate: Crate) -> bool {
+    declares_sealed(db, krate)
+        || krate.data(db).dependencies.iter().any(|dep| sealed_in_graph(db, dep.crate_id))
+}
+
+/// blaze: whether `krate` declares a `#[blaze::sealed]` trait: one among its modules' items, or
+/// one in a body's block that a relaxed impl there leans on (an impl in a block with a sealed
+/// bound, [`sealed_bounds`]; a block's trait no impl outside the block can name). Reads each
+/// module-level trait's attributes and the crate's impl table ([`TraitImpls::for_crate`],
+/// which holds the impls of bodies' blocks too).
+///
+/// [`TraitImpls::for_crate`]: crate::method_resolution::TraitImpls::for_crate
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+pub fn declares_sealed(db: &Db, krate: Crate) -> bool {
+    let _p = tracing::info_span!(target: "blaze", "declares_sealed", ?krate).entered();
+    let in_modules = hir_def::nameres::crate_def_map(db, krate).modules(db).any(|(_, module)| {
+        module.scope(db).declarations().any(|def| {
+            matches!(def, hir_def::ModuleDefId::TraitId(it)
+                if hir_def::attrs::AttrFlags::query(db, it.into())
+                    .contains(hir_def::attrs::AttrFlags::BLAZE_SEALED))
+        })
     });
-    #[allow(clippy::let_and_return, reason = "the name clarifies the meaning of the boolean")]
-    is_not_orphan
+    in_modules
+        || crate::method_resolution::TraitImpls::for_crate(db, krate).impls().any(|impl_| {
+            impl_.lookup(db).container.block(db).is_some()
+                && sealed_bounds(db, impl_).next().is_some()
+        })
+}
+
+/// Why a `#[blaze::sealed]` trait is not closed over its crate's local types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+pub enum SealedOpen {
+    /// An auto trait: the solver implements it for types no impl names.
+    Auto,
+    /// This impl of it is for a type that is not local to the trait's crate.
+    NonLocalImpl(ImplId),
+    /// This impl of it is for a type with a type parameter (or an alias) under a
+    /// `#[fundamental]` type (`impl<Q> Sealed for LPair<A, Q>`), where another crate could put
+    /// its own type.
+    FundamentalParam(ImplId),
+}
+
+/// blaze: whether every impl of the `#[blaze::sealed]` trait `trait_` is for a local type of its
+/// crate (an ADT or `dyn` of a trait the crate defines, under fundamental types) with no type
+/// parameter or alias under a fundamental type (as rustc walks them, [`any_fundamental_leaf`]),
+/// so that a blanket impl bounded by it implements only for the crate's own types and leaves
+/// another crate no position to put its own. Impls of it can only be
+/// in its crate (`hir-ty-coherence` refuses one anywhere else), the bodies' blocks included.
+/// Tracked: the orphan check, the diagnostics walk and `hir-ty-coherence` each ask it per
+/// parameter, and it walks every impl of the trait; it reruns when one of them changes.
+pub fn sealed_closure(db: &Db, trait_: TraitId) -> Result<(), SealedOpen> {
+    sealed_closure_query(db, trait_)
+}
+
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+fn sealed_closure_query(db: &Db, trait_: TraitId) -> Result<(), SealedOpen> {
+    let _p = tracing::info_span!(target: "blaze", "sealed_closure", ?trait_).entered();
+    if TraitSignature::of(db, trait_).flags.contains(TraitFlags::AUTO) {
+        return Err(SealedOpen::Auto);
+    }
+    let krate = trait_.module(db).krate(db);
+    let mut open = None;
+    crate::method_resolution::TraitImpls::for_crate_and_trait(db, krate, trait_).for_trait(
+        trait_,
+        |run| {
+            // A builtin derive is of a local ADT, and no builtin derive implements a sealed trait.
+            let either::Either::Left(impls) = run else { return };
+            for &impl_ in impls {
+                if open.is_some() {
+                    return;
+                }
+                let self_ty = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
+                if !is_local_key_ty(db, krate, self_ty, |_| false) {
+                    open = Some(SealedOpen::NonLocalImpl(impl_));
+                } else if any_fundamental_leaf(db, self_ty, &mut |leaf| {
+                    matches!(leaf.kind(), TyKind::Param(_) | TyKind::Alias(..))
+                }) {
+                    // `impl<Q> Sealed for LPair<A, Q>` with a `#[fundamental] LPair`: a blanket
+                    // over `Sealed` would stand for `impl<Q> F for LPair<A, Q>`, which a
+                    // downstream crate's `impl F for LPair<A, Downstream>` overlaps, legal there
+                    // by rustc's orphan rules (they look through every argument of `LPair`).
+                    open = Some(SealedOpen::FundamentalParam(impl_));
+                }
+            }
+        },
+    );
+    open.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]

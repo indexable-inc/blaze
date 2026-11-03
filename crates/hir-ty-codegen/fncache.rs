@@ -64,7 +64,6 @@ use hir_ty_mir::mir::purity::{is_const_pure, operands, raw_use};
 use super::{
     CodegenError, CompiledFunction, ConstBlob, DataRequest, FuncTarget, FunctionCx, Instance,
     InstanceDef, MEM, Requests, Result, compiled_instance, compiled_root, compiled_static,
-    home::Homes,
     Target, is_thread_local, link_name_for,
 };
 
@@ -128,6 +127,35 @@ pub(super) enum Uncached {
     /// blaze can't give the body a code identity. The build stops with this, naming the
     /// function and the refusal: running it uncached in its place is a fallback (rule 3).
     Refused(String),
+    /// blaze can't compile something the body reaches, and nothing else it reaches is impure,
+    /// so nothing tells whether it can be cached. The build stops with this: running it
+    /// uncached in its place is a fallback (rule 3).
+    Uncompiled(Uncompiled),
+}
+
+/// A cached function's body reaches code the code generator refuses ([`Uncached::Uncompiled`]).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(super) struct Uncompiled {
+    /// The cached function, as a backtrace names it, with its generic arguments.
+    pub function: String,
+    /// What the code generator refused, by the shortest way from the body: "it reaches
+    /// `a` → `b`, which can't be compiled by blaze, at src/lib.rs:4:5".
+    pub reached: String,
+    /// The code generator's refusal of it.
+    pub refusal: CodegenError,
+}
+
+impl std::fmt::Display for Uncompiled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Uncompiled { function, reached, refusal } = self;
+        write!(
+            f,
+            "`{function}` (`#[blaze::cache]`) can't be built: {reached}. The code generator \
+             refused it: {refusal}. What blaze can't compile tells nothing of whether the \
+             function can be cached, and running it uncached in its place would be a fallback \
+             (rule 3, no-fallback)"
+        )
+    }
 }
 
 /// The hash of the code of the closure a cached function keeps its body in and of all it
@@ -151,10 +179,20 @@ pub(super) fn cache_code(
         walk.look_at(next as u32);
         next += 1;
     }
-    if let Some(why) = walk.impure(root).or(trouble) {
+    // A known impurity decides alone: what blaze can't compile can add to it, never take it
+    // away. Without one, a body that reaches code blaze can't compile stops the build.
+    let (impure, uncompiled) = walk.impure(root);
+    if let Some(why) = impure.or(trouble) {
         let name = cached_name(db, &closure);
         // alloc: the error, why the function is not cached
         return Err(Uncached::Impure(format!("`{name}` is not cached: {why}")));
+    }
+    if let Some((reached, refusal)) = uncompiled {
+        return Err(Uncached::Uncompiled(Uncompiled {
+            function: cached_name(db, &closure),
+            reached,
+            refusal,
+        }));
     }
     // What the closure can run is its behaviour identity: its code, its arguments, and the
     // CodeId of every instance it can reach, std's with them (docs/v2/plan/design/code-identity.md).
@@ -207,7 +245,7 @@ pub(super) fn written_code<'db>(
         args: instance.args,
         checked: instance.checked,
     };
-    let env = Homes::default().home(db, &closure, env);
+    let env = closure.home_env(db, env);
     Some(cache_code(db, closure, env))
 }
 
@@ -466,14 +504,14 @@ struct Walk<'db> {
     db: &'db Db,
     /// The target of the cached function's crate, which the symbols it reaches are of.
     target: &'static Target,
-    homes: Homes,
     nodes: Vec<Seen>,
     /// Every node's edges, a node's together: [`Seen::edges`] says where.
     edges: Vec<Edge>,
     /// Where in `nodes` each node is, by the hash of the node there.
     index: hashbrown::HashTable<u32>,
-    /// The nodes blaze can't compile, whose code tells nothing of what they do.
-    uncompiled: HashSet<u32, Global>,
+    /// The nodes blaze can't compile, whose code tells nothing of what they do, with the
+    /// code generator's refusal of each.
+    uncompiled: HashMap<u32, CodegenError, Global>,
     /// An argument holds a reference count, which what reads one gives and the key does not
     /// tell: two arguments can share a value or not.
     counted: bool,
@@ -494,13 +532,12 @@ impl<'db> Walk<'db> {
         Walk {
             db,
             target,
-            homes: Homes::default(),
             // alloc: the walk's table of nodes, grown once a node found (a walk is a miss)
             nodes: Vec::new(),
             // alloc: the walk's edges, grown once an edge found (a walk is a miss)
             edges: Vec::new(),
             index: hashbrown::HashTable::new(),
-            uncompiled: HashSet::new_in(Global),
+            uncompiled: HashMap::new_in(Global),
             counted,
             library: HashMap::new_in(Global),
             library_walk: LibraryWalk::default(),
@@ -562,7 +599,7 @@ impl<'db> Walk<'db> {
             // Another cached function, or this one called again: its body is what it runs
             // when its result is not kept, and what it reaches from there is the body's.
             let closure = Instance { def: InstanceDef::Closure(closure), ..*instance };
-            let env = self.homes.home(db, &closure, env);
+            let env = closure.home_env(db, env);
             return (Node::Instance(closure, env), site, false);
         }
         let name = || function_name(db, func, instance.args.as_ref());
@@ -728,11 +765,11 @@ impl<'db> Walk<'db> {
         }
     }
 
-    /// Notes that the node did not compile: nothing tells what it does then.
+    /// Notes that the node did not compile: nothing tells what it does then. That is no
+    /// impurity: unless one is found apart from it, the build stops on it ([`Uncompiled`]).
     fn cannot(&mut self, at: u32, e: &CodegenError) {
-        self.uncompiled.insert(at);
-        // alloc: the error's message, on the path of a node that did not compile
-        self.nodes[at as usize].why = Why::own(format!("can't be compiled by blaze ({e})"));
+        // clone: the walk keeps the refusal; the query keeps its own
+        self.uncompiled.insert(at, e.clone());
     }
 
     fn function_code(&mut self, at: u32, compiled: &CompiledFunction) {
@@ -856,20 +893,31 @@ impl<'db> Walk<'db> {
         }
     }
 
-    /// Why what `from` reaches is not pure, by the shortest way to the first that is not:
-    /// the edges to the codec are left out.
-    fn impure(&self, from: u32) -> Option<String> {
+    /// Why what `from` reaches is not pure, by the shortest way to the first that is not, and
+    /// when nothing it reaches is known not to be, the first it reaches that blaze can't
+    /// compile with the code generator's refusal: the edges to the codec are left out.
+    fn impure(&self, from: u32) -> (Option<String>, Option<(String, CodegenError)>) {
         let mut parent: HashMap<u32, (u32, usize), Global> = HashMap::new_in(Global);
         let mut seen = HashSet::new_in(Global);
         let mut queue = std::collections::VecDeque::from([from]);
         seen.insert(from);
+        let mut uncompiled = None;
         while let Some(at) = queue.pop_front() {
             let seen_at = &self.nodes[at as usize];
             if let Node::Leaf(_, Some(text)) = &seen_at.node {
-                return Some(self.told(at, &parent, text, true, None));
+                return (Some(self.told(at, &parent, text, true, None)), None);
             }
             if let Some(why) = &seen_at.why {
-                return Some(self.told(at, &parent, &why.text, why.of_user, why.place.as_deref()));
+                let told = self.told(at, &parent, &why.text, why.of_user, why.place.as_deref());
+                return (Some(told), None);
+            }
+            // The first found is the nearest; it has no edges, since nothing compiled tells them.
+            if uncompiled.is_none()
+                && let Some(refusal) = self.uncompiled.get(&at)
+            {
+                let told = self.told(at, &parent, "can't be compiled by blaze", false, None);
+                // clone: the error owns the refusal; the walk keeps its own
+                uncompiled = Some((told, refusal.clone()));
             }
             // A `const fn` with no generic arguments that is const-pure reaches nothing that is
             // not: what a generic one calls by a trait can be a non-const `impl` at run time.
@@ -885,7 +933,7 @@ impl<'db> Walk<'db> {
                 }
             }
         }
-        None
+        (None, uncompiled)
     }
 
     /// Says why `at`, found by way of `parent`, is not pure: "it reaches `a` → `b`, which
@@ -1657,7 +1705,8 @@ impl<'db> FunctionCx<'_, 'db> {
     /// A call of `__blaze_cache_code::<F>`: writes the code of the closure `F` to `dst`, as
     /// the `Code` of `blaze::__private` has it. That is two words of hash, then the name of
     /// the function, or why it can't be cached when the hash is zero. A body blaze can't give
-    /// a code identity is an error naming the function ([`Uncached::Refused`]).
+    /// a code identity is an error naming the function ([`Uncached::Refused`]), and so is one
+    /// that reaches code blaze can't compile and nothing impure ([`Uncached::Uncompiled`]).
     pub(super) fn cache_code(&mut self, generic_args: GenericArgs<'db>, dst: Value) -> Result<()> {
         let db = self.cg.db;
         let ty = generic_args.type_at(0);
@@ -1673,7 +1722,7 @@ impl<'db> FunctionCx<'_, 'db> {
             args: parent.store(),
             checked: self.cg.checked,
         };
-        let env = Homes::default().home(db, &closure, &self.env.store());
+        let env = closure.home_env(db, &self.env.store());
         let (hash, text) = match cache_code(db, closure, env) {
             Ok(hash) => (*hash, cached_name(db, &closure)),
             Err(Uncached::Impure(why)) => {
@@ -1683,6 +1732,8 @@ impl<'db> FunctionCx<'_, 'db> {
             }
             // clone: the error owns its text; the query keeps its own
             Err(Uncached::Refused(why)) => return Err(CodegenError::Refused(why.clone())),
+            // alloc: the error's message
+            Err(Uncached::Uncompiled(it)) => return Err(CodegenError::Refused(it.to_string())),
         };
         let words = [hash as u64, (hash >> 64) as u64];
         for (i, word) in words.into_iter().enumerate() {

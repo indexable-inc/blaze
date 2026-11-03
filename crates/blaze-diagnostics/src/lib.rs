@@ -37,7 +37,7 @@ pub mod print;
 #[cfg(test)]
 mod tests;
 
-pub use check::{Options, check_crate, check_planned};
+pub use check::{Options, check_crate, check_planned, check_sealed};
 pub use cx::{Cx, Files};
 pub use lower::{Found, Phase};
 pub use model::{Code, Diag, Level, Span};

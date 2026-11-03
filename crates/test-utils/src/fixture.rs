@@ -150,6 +150,12 @@ pub struct Fixture {
     ///
     /// Syntax: `library`
     pub library: bool,
+    /// Declares this crate one of the standard library's (origin `Lang`) whatever its name, as
+    /// a build gives `panic_unwind` and `panic_abort`; `std`, `core`, `alloc`, `proc_macro` and
+    /// `test` are without it. This must be used with `crate` meta.
+    ///
+    /// Syntax: `lang`
+    pub lang: bool,
     /// Actual file contents. All meta comments are stripped.
     pub text: String,
     /// The line number in the original fixture of the beginning of this fixture.
@@ -301,9 +307,14 @@ impl FixtureWithProjectMeta {
         let mut env = HashMap::new_in(Global);
         let mut introduce_new_source_root = None;
         let mut library = false;
+        let mut lang = false;
         for component in components {
             if component == "library" {
                 library = true;
+                continue;
+            }
+            if component == "lang" {
+                lang = true;
                 continue;
             }
 
@@ -363,6 +374,7 @@ impl FixtureWithProjectMeta {
             env,
             introduce_new_source_root,
             library,
+            lang,
         }
     }
 }

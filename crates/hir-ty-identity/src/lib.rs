@@ -100,8 +100,13 @@ pub const COMPILE_DOMAIN: &str = "blaze v2 compile identity 7";
 pub const WALK_DOMAIN: &str = "blaze v2 compile identity walk 1";
 /// The domain of what a call, or an argument list, is keyed by.
 pub const CALLEE_DOMAIN: &str = "blaze v2 compile identity callee 1";
-/// The domain of an evaluated constant's bytes.
-pub const VALUE_DOMAIN: &str = "blaze v2 compile identity value 1";
+/// The domain of an evaluated constant's bytes. 2: each vtable in its table is hashed with the
+/// `dyn` type const eval's id names for it (`MemoryMap::vtable_of`), not its concrete type alone,
+/// as the code generator emits the vtable of that type for that `dyn`. 3: the map's content is
+/// hashed by `ComplexMemoryMap::hash_content` (the one list of its content fields, which
+/// `Facts::allocation` shares), each number at a fixed width, where it was the map's own `Hash`
+/// with its types taken out.
+pub const VALUE_DOMAIN: &str = "blaze v2 compile identity value 3";
 /// The domain of an instance's own part of its behaviour identity.
 pub const BEHAVIOUR_DOMAIN: &str = "blaze v2 behaviour identity 1";
 /// The domain of a leaf of the behaviour walk.
@@ -123,15 +128,20 @@ pub const LEAF_DOMAIN: &str = "blaze v2 behaviour identity leaf 1";
 /// capture, an unsafe binder, a `DynMetadata` of no `dyn`) is refused, naming the constant or
 /// static: its trait, and so the code its slots run, is not known. A refusal is no code id,
 /// never a different one. Nothing was persisted under 3 before these, so they are one bump. 4:
-/// the vtable walk follows the code generator's relocation rules (`facts.rs`, `VtableWalk`):
-/// behind a raw pointer or in a union a pointer without provenance is a number and a metadata
-/// word with it no vtable, so neither is paired; a raw pointer into memory that is a whole
-/// number of its pointee walks every element (`as_ptr`), a union whose fields but one are empty
-/// walks that one, a struct's slice tail walks its elements, and a raw pointer one past its
-/// memory's end is to that memory; and a word holding a vtable's or function's id that a type
-/// reaching it does not say is one (a vtable behind `&&dyn Tr as *const _ as *const u8`) is
-/// refused, as the code generator refuses it.
-pub const CODE_ID_DOMAIN: &str = "blaze v2 code id 4";
+/// const eval's id of a vtable names its `dyn` type (rustc's `GlobalAlloc::VTable`), and each
+/// vtable a pointer of the value holds is hashed with that `dyn` (`Facts::allocation`), as the
+/// code generator relocates it, where it used to be paired with the `dyn` at the place a type
+/// reaching it named, and refused where none did (`as_ptr`, a union, a slice tail, a pointer
+/// cast to another type); a vtable id no pointer holds is skipped, a function's id is hashed as
+/// what its pointer runs only; and a word holding an id without provenance that no type reaching
+/// it says is a pointer is refused, as the code generator refuses it (`VtableWalk`, which
+/// follows its relocation rules). 5: a static is named by its key every time a body meets it,
+/// where a static met before hashed nothing, so a constant pointing at one of two statics the
+/// body named before kept its code id when it came to point at the other; and a value's memory
+/// map is hashed by `ComplexMemoryMap::hash_content`, which adds each piece's alignment and
+/// which words of the value and its pieces have provenance, both of which the code generator
+/// reads (a data object's alignment; which words it relocates).
+pub const CODE_ID_DOMAIN: &str = "blaze v2 code id 5";
 /// The domain of the bodies inlined into another.
 pub const INLINED_DOMAIN: &str = "blaze v2 code identity inlined 2";
 /// The domain of the stable name that orders the members of one component.

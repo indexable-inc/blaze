@@ -203,9 +203,9 @@ enum Room {
 struct Placed<F> {
     header: Header,
     cell: Room,
-    /// The job running where this one was given to the pool, as a profiler numbers it
-    /// ([`crate::sched::fiber::observe_spawner`]); 0 for none.
-    spawner: u64,
+    /// The job running where this one was given to the pool and when, as a profiler says them
+    /// ([`crate::sched::fiber::observe_spawner`]).
+    given: crate::sched::Given,
     f: F,
 }
 
@@ -259,11 +259,15 @@ fn give_back(cell: Room) {
 /// closure, or of the plane's runner) on this thread, giving a number for `ended`, which closes
 /// it on whatever thread the job ended on. A job that parks on its fiber closes its span as it
 /// parks and opens another as it resumes: the profiler's `take` and `put` of
-/// [`crate::sched::fiber::carry`] do that.
+/// [`crate::sched::fiber::carry`] do that. `driving` opens and enters the span of a worker's
+/// own work between jobs ([`Driving`], its name), giving a number for `drove`, which closes it
+/// on the same thread: with the jobs' spans, every moment of a worker is inside one.
 #[derive(Clone, Copy)]
 pub struct JobSpans {
     pub began: fn(kind: &'static str) -> u64,
     pub ended: fn(u64),
+    pub driving: fn(doing: &'static str) -> u64,
+    pub drove: fn(u64),
 }
 
 static JOB_SPANS: OnceLock<JobSpans> = OnceLock::new();
@@ -289,6 +293,50 @@ impl Drop for JobSpan {
     fn drop(&mut self) {
         if let Some((ended, span)) = self.0 {
             ended(span);
+        }
+    }
+}
+
+/// What a pool worker does when it runs no job, each under a span of its own
+/// ([`JobSpans::driving`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Driving {
+    /// Looking for a job: its own queues, the injectors, stealing, the timers due.
+    Search,
+    /// Parked with nothing to run, until a job is queued or a timed wait is due.
+    Idle,
+    /// The fiber driver between two jobs: a fiber made or ended, a parked or ended job's
+    /// record and the scheduler's dispatch of what it changed.
+    Switch,
+}
+
+impl Driving {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Driving::Search => "search",
+            Driving::Idle => "idle",
+            Driving::Switch => "switch",
+        }
+    }
+}
+
+/// The span of a worker's own work ([`Driving`]), open while this lives on the thread that
+/// opened it; nothing while no profiler spans jobs. Never held across a job's run: a job's
+/// fiber takes its thread's open spans with it.
+pub(crate) struct DriverSpan(Option<(fn(u64), u64)>);
+
+impl DriverSpan {
+    #[inline]
+    pub(crate) fn open(doing: Driving) -> DriverSpan {
+        DriverSpan(JOB_SPANS.get().map(|spans| (spans.drove, (spans.driving)(doing.name()))))
+    }
+}
+
+impl Drop for DriverSpan {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some((drove, span)) = self.0 {
+            drove(span);
         }
     }
 }
@@ -319,16 +367,16 @@ impl Job {
             let f = unsafe { &raw const (*at).f };
             // SAFETY: the closure is read out once, so it runs and drops once.
             let f = unsafe { f.read() };
-            // SAFETY: `at` is the live `Placed<F>` that `erase` wrote; a `u64` is `Copy`.
-            let spawner = unsafe { (*at).spawner };
+            // SAFETY: `at` is the live `Placed<F>` that `erase` wrote; a `Given` is `Copy`.
+            let given = unsafe { (*at).given };
             give_back(cell);
-            crate::sched::job_begins(spawner);
+            crate::sched::job_begins(given);
             let _span = JobSpan::begin(std::any::type_name::<F>());
             f();
         }
         let class = const { Placed::<F>::CLASS };
         let header = Header::new(run::<F>);
-        let spawner = crate::sched::spawner();
+        let given = crate::sched::spawner();
         CACHES.with(move |caches| {
             let mut caches = caches.borrow_mut();
             let caches = caches.get_or_insert_with(Caches::new);
@@ -341,7 +389,7 @@ impl Job {
             // SAFETY: the cell is this job's alone, committed, 64-byte aligned and at least
             // `size_of::<Placed<F>>()` bytes (`CLASS` chose its size), and holds nothing that
             // needs a drop.
-            unsafe { at.write(Placed { header, cell, spawner, f }) };
+            unsafe { at.write(Placed { header, cell, given, f }) };
             Job(at.cast())
         })
     }
@@ -1531,6 +1579,7 @@ impl Local {
                 // A timed wait of any pool's job ends only as a worker looks at the clock.
                 let due = crate::sched::until_due();
                 crate::sched::idle(true);
+                let parked = DriverSpan::open(Driving::Idle);
                 if shared.parked.load(Ordering::Acquire) != 0 && pool_idle(ptr::from_ref(shared).expose_provenance()) {
                     // The last to sleep with jobs parked: none of them wakes unless a job ends a
                     // wait, so after a while with none, the scheduler checks for a stall.
@@ -1543,6 +1592,7 @@ impl Local {
                 } else {
                     thread::park();
                 }
+                drop(parked);
                 crate::sched::idle(false);
                 crate::sched::fire_due();
             }
@@ -1616,7 +1666,11 @@ fn work(local: &Local) {
     let mut searching = false;
     // What the stop's drain backs off with while another worker takes what is left.
     let mut drain = crate::spin::SpinWait::new();
+    // The span of this worker's search, open from a job's end (or a wake) to the next job's
+    // start: closed before a job runs, as the job's fiber would take it along.
+    let mut search: Option<DriverSpan> = None;
     loop {
+        search.get_or_insert_with(|| DriverSpan::open(Driving::Search));
         #[cfg(not(blaze_check))]
         crate::sched::fire_due();
         if let Some(job) = local.next() {
@@ -1624,17 +1678,20 @@ fn work(local: &Local) {
                 local.end_search(true);
                 searching = false;
             }
+            search = None;
             local.run(&mut runner, job);
             continue;
         }
         if searching || local.begin_search() {
             searching = false;
             if let Some(job) = local.search(ROUNDS) {
+                search = None;
                 local.run(&mut runner, job);
                 continue;
             }
         }
         if let Some(job) = local.later() {
+            search = None;
             local.run(&mut runner, job);
             continue;
         }
@@ -1656,8 +1713,10 @@ fn work(local: &Local) {
             }
             break;
         }
+        search = None;
         searching = local.sleep(&|| shared.stop.load(Ordering::SeqCst));
     }
+    drop(search);
     drop(runner);
     LOCAL.set(ptr::null());
 }

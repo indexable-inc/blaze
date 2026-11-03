@@ -30,8 +30,8 @@ mod const_ast;
 mod const_macro;
 mod const_traits;
 mod deps;
-mod hir_eval;
 mod intrinsics;
+mod memo;
 mod word;
 
 fn simplify(e: ConstEvalError<'_>) -> ConstEvalError<'_> {
@@ -171,7 +171,6 @@ fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Allocation<'_>, Co
             _ => None,
         })
         .expect("No const named GOAL found in the test");
-    hir_eval::check_all(db, file_id);
     db.const_eval(const_id, GenericArgs::empty(), None)
 }
 
@@ -3862,5 +3861,120 @@ fn a_loaded_constants_vtable_behind_an_alias_or_a_tail_is_its_own() {
     const GOAL: i32 = { let b: &dyn Tr = &B; b.f() * 100 + WT.0 * 10 + WT.1.f() };
         "#,
         231,
+    );
+}
+
+/// A constant loaded into another evaluation keeps the vtable it was made with where no type
+/// says the vtable is there (a `&dyn Tr` behind a `*const u8`): the word's provenance says it
+/// is a vtable, and its id is remapped to the one this evaluation gives `A` for `Tr`, where
+/// `B` took the first id, so the call is `A`'s.
+#[test]
+fn a_loaded_constants_vtable_behind_a_cast_is_its_own() {
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, dispatch_from_dyn
+    trait Tr { fn f(&self) -> i32; }
+    struct A;
+    impl Tr for A { fn f(&self) -> i32 { 7 } }
+    struct B;
+    impl Tr for B { fn f(&self) -> i32 { 1000 } }
+    struct RawU8(*const u8);
+    const CAST: RawU8 = RawU8(&(&A as &dyn Tr) as *const &dyn Tr as *const u8);
+    const GOAL: i32 = {
+        let b: &dyn Tr = &B;
+        let a: &dyn Tr = unsafe { *(CAST.0 as *const &dyn Tr) };
+        b.f() - 1000 + a.f()
+    };
+        "#,
+        7,
+    );
+}
+
+/// rustc's `unsize_into_ptr`: a `dyn`-to-`dyn` cast between two types that are not one checks
+/// that the vtable is one of the source type's trait before giving it one of the target's. A
+/// `Tr` vtable transmuted to `&dyn Sub` and upcast to `&dyn Display` is refused as undefined
+/// behavior naming the constant and the rule, never relabeled a valid `Display` vtable (the
+/// round-3 review's C1).
+#[test]
+fn an_upcast_of_a_vtable_of_another_trait_is_refused() {
+    check_fail(
+        r#"
+    //- minicore: coerce_unsized, dispatch_from_dyn, transmute, fmt
+    use core::{fmt::{Display, Formatter, Result}, mem::transmute};
+    trait Tr { fn f(&self) -> i32; }
+    trait Sub: Display {}
+    struct A(i32);
+    impl Tr for A { fn f(&self) -> i32 { self.0 } }
+    impl Display for A { fn fmt(&self, _: &mut Formatter<'_>) -> Result { Ok(()) } }
+    const GOAL: &dyn Display = {
+        let t: &dyn Tr = &A(1);
+        let s: &dyn Sub = unsafe { transmute::<&dyn Tr, &dyn Sub>(t) };
+        s
+    };
+    "#,
+        |e| {
+            matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(it))
+                if it.contains("the constant `GOAL`") && it.contains("InvalidVTableTrait"))
+        },
+    );
+}
+
+/// What the check of [`an_upcast_of_a_vtable_of_another_trait_is_refused`] lets through: a
+/// real upcast, and a cast that drops an auto trait (checked too, and of the right trait),
+/// each calling through its new vtable.
+#[test]
+fn an_upcast_and_a_dropped_auto_trait_keep_their_vtables_right() {
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, dispatch_from_dyn, send
+    trait Base { fn b(&self) -> i32; }
+    trait Sub: Base { fn s(&self) -> i32; }
+    struct A(i32);
+    impl Base for A { fn b(&self) -> i32 { self.0 } }
+    impl Sub for A { fn s(&self) -> i32 { self.0 * 10 } }
+    const GOAL: i32 = {
+        let s: &dyn Sub = &A(3);
+        let b: &dyn Base = s;
+        let sent: &(dyn Base + Send) = &A(4);
+        let unsent: &dyn Base = sent;
+        b.b() * 100 + s.s() + unsent.b()
+    };
+    "#,
+        334,
+    );
+}
+
+/// A constant whose value is an empty slice one past its block's end (`split_at(len).1`), or
+/// a reference to an unsized struct of no size, keeps an alignment for that empty piece (or
+/// no piece, where it is at no allocation), so another constant that reads it copies it,
+/// with no "no alignment its evaluation recorded" (the round-3 review's C4).
+#[test]
+fn a_constant_read_by_another_keeps_its_empty_pieces_aligned() {
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, slice, transmute
+    use core::mem::transmute;
+    #[rustc_intrinsic]
+    pub fn offset<Ptr, Delta>(dst: Ptr, offset: Delta) -> Ptr;
+    #[repr(C)]
+    struct Parts(*const u8, usize);
+    const fn split_at(s: &'static [u8], mid: usize) -> (&'static [u8], &'static [u8]) {
+        unsafe {
+            let Parts(p, n) = transmute::<&'static [u8], Parts>(s);
+            (
+                transmute::<Parts, &'static [u8]>(Parts(p, mid)),
+                transmute::<Parts, &'static [u8]>(Parts(offset(p, mid), n - mid)),
+            )
+        }
+    }
+    const A: &[u8] = &[1, 2, 3];
+    const H: &[u8] = split_at(A, 3).0;
+    const T: &[u8] = split_at(A, 3).1;
+    const N: usize = T.len();
+    struct W<X: ?Sized>(X);
+    const E: &W<[u8]> = &W([]);
+    const GOAL: usize = H.len() * 100 + N * 10 + E.0.len() + 7;
+    "#,
+        307,
     );
 }

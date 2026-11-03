@@ -19,7 +19,9 @@ fn run(fixture: &str) -> Report {
 fn run_compiled(fixture: &str) -> Report {
     let mut db = fixture::db(fixture).into_db();
     let krate = fixture::test_crate(&db);
-    let codegen = Codegen::dev("fixture", Arc::new(HashMap::new())).expect("a dev build's policy for this machine");
+    let host = blaze_lower::target_data(hir_ty_codegen::Target::host()).expect("this machine's target data");
+    let codegen =
+        Codegen::dev("fixture", Arc::new(HashMap::new()), &host).expect("a dev build's policy for this machine");
     let mut harness = Harness::new(&mut db, krate, Some(codegen)).expect("the harness sets up");
     harness.run(&mut db, 1).expect("every edit is made")
 }

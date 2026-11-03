@@ -2,7 +2,15 @@
 //! and per (crate, name), each with its content, set only when the content changed, and its
 //! `ContentId` a query over it, asked only by lane item-hash (through the identities it
 //! installs, [`ImplIdentities`]); the crate's [`SliceDirectory`] for keys a reader asks of
-//! before they have a slice; and the singleton [`ImplSlices`] that finds a crate's directory.
+//! before they have a slice; and the singleton [`ImplSlices`] that finds a crate's directory
+//! through its [`DirectorySlot`].
+//!
+//! A crate maintained for the first time gets its slot (one write for every such crate, before
+//! any crate's node runs), and its node makes its slices and directory and fills the slot by
+//! `&` of the database ([`Published::make`]): a write-once slot, which every reader waits on
+//! until it is filled, so publishing a crate on a cold pass opens no view (design
+//! docs/v2/plan/design/scheduler.md §3.2). An edit sets the slices and directory fields by
+//! `&mut`, as before.
 //!
 //! A slice, once made, is kept for the life of the database, emptied rather than dropped, so a
 //! directory gains a key once and never loses it: it changes only when a key is first seen.
@@ -19,7 +27,7 @@ use blaze_dbsp::{Pos, SliceHasher};
 use blaze_hash::HashMap;
 use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
-use blaze_query::db::Setter;
+use blaze_query::db::{Setter, Slot, SlotName};
 use hir_def::{BuiltinDeriveImplId, ImplId, ModuleId, TraitId, nameres::crate_def_map};
 use hir_expand::name::Name;
 use rustc_type_ir::fast_reject::SimplifiedType as S;
@@ -107,21 +115,48 @@ pub struct SliceDirectory {
     pub body_modules: Arc<[ModuleId]>,
 }
 
-/// The directory of every crate the maintainer has gone over; set when a crate is first.
+/// Where one crate's directory is published: a write-once slot its node fills, once, by `&`.
+/// A reader that comes before the fill waits on the node that claimed it.
+#[blaze_query::input(debug)]
+pub struct DirectorySlot {
+    #[returns(copy)]
+    pub krate: Crate,
+    #[returns(ref)]
+    pub slot: Slot<SliceDirectory>,
+}
+
+/// What a crate's directory slot is called in a wait's span and an error.
+pub(crate) fn slot_name(db: &Db, krate: Crate) -> SlotName {
+    SlotName {
+        maintainer: super::state::NAME,
+        what: "the impl directory",
+        // alloc: a crate's slot's name, once per crate first maintained
+        of: format!("crate {}", hir_def::span_names::crate_name(db, krate)).into_boxed_str(),
+    }
+}
+
+/// The directory slot of every crate the maintainer has gone over; set when a crate is first.
 #[blaze_query::input(singleton, debug)]
 pub struct ImplSlices {
     #[returns(ref)]
-    pub crates: Arc<HashMap<Crate, SliceDirectory, Global>>,
+    pub crates: Arc<HashMap<Crate, DirectorySlot, Global>>,
 }
 
-/// The directory of `krate`. A crate the impls maintainer never went over, and which no
-/// frozen table serves, has none: that is a bug in the caller (no maintainer ran), reported
-/// with the crate.
+/// The directory of `krate`, waiting for its node to fill its slot on the pass that first
+/// maintains it. A crate the impls maintainer never went over, and which no frozen table
+/// serves, has none: that is a bug in the caller (no maintainer ran), reported with the crate;
+/// as is a slot read before its node began, or given up unfilled ([`blaze_query::db::SlotError`]).
 pub(crate) fn directory(db: &Db, krate: Crate) -> SliceDirectory {
     let found = ImplSlices::try_get(db).and_then(|it| it.crates(db).get(&krate).copied());
-    found.unwrap_or_else(|| {
+    let Some(slot) = found else {
         panic!("impls: no maintained impl tables for crate {krate:?}: no maintainer ran")
-    })
+    };
+    #[cfg(debug_assertions)]
+    super::state::assert_slot_read_in_warm(db, krate);
+    match slot.slot(db).get(db) {
+        Ok(&directory) => directory,
+        Err(error) => panic!("impls: crate {krate:?} has no directory: {error}"),
+    }
 }
 
 /// The slice of `trait_` in `krate`, if it has one: reads the directory's traits, and backdates
@@ -445,6 +480,9 @@ pub(crate) fn candidate_rows_hash(db: &Db, name: Name, rows: &CandidateRows) -> 
 /// directory. What readers see is only what these inputs hold.
 #[derive(Default)]
 pub(crate) struct Published {
+    /// The slot the directory is published in, for a crate first maintained in this pass
+    /// ([`Published::unpublished`]); kept, full, after.
+    slot: Option<DirectorySlot>,
     directory: Option<SliceDirectory>,
     traits: HashMap<TraitId, TraitImplsSlice, Global>,
     heads: HashMap<Head, InherentSlice, Global>,
@@ -458,6 +496,68 @@ pub(crate) struct Published {
 }
 
 impl Published {
+    /// A crate's inputs before its first publication, which goes into `slot`.
+    pub(crate) fn unpublished(slot: DirectorySlot) -> Published {
+        Published { slot: Some(slot), ..Published::default() }
+    }
+
+    /// The slot this crate's node fills, while it has no directory.
+    pub(crate) fn unfilled(&self) -> Option<DirectorySlot> {
+        self.slot.filter(|_| self.directory.is_none())
+    }
+
+    pub(crate) fn is_published(&self) -> bool {
+        self.directory.is_some()
+    }
+
+    /// The crate's first publication, by `&` of the database: every slice of `trait_rows`,
+    /// `head_rows` and `name_rows` and the directory made new (a new input opens no view), the
+    /// directory to go into the crate's slot. How many inputs it made, and the directory.
+    pub(crate) fn make(
+        &mut self,
+        db: &Db,
+        krate: Crate,
+        trait_rows: &mut Vec<(TraitId, TraitRows)>,
+        head_rows: &mut Vec<(Head, InherentRows)>,
+        body_modules: Option<Vec<ModuleId>>,
+        name_rows: &mut Vec<(Name, CandidateRows)>,
+    ) -> (u64, SliceDirectory) {
+        assert!(
+            self.directory.is_none() && self.traits.is_empty() && self.heads.is_empty() && self.names.is_empty(),
+            "impls: crate {krate:?} is published already, and made anew"
+        );
+        let mut made = 1;
+        for (trait_, rows) in trait_rows.drain(..) {
+            self.traits.insert(trait_, TraitImplsSlice::new(db, krate, trait_, rows));
+            made += 1;
+        }
+        for (head, rows) in head_rows.drain(..) {
+            self.heads.insert(head, InherentSlice::new(db, krate, head, rows));
+            made += 1;
+        }
+        for (name, rows) in name_rows.drain(..) {
+            self.names.insert(name, CandidateSlice::new(db, krate, name, rows));
+            made += 1;
+        }
+        if let Some(modules) = body_modules {
+            self.body_modules = modules.into(); // alloc: the crate's first list
+        }
+        self.new_traits = false;
+        self.new_heads = false;
+        self.new_names = false;
+        self.new_body_modules = false;
+        let directory = SliceDirectory::new(
+            db,
+            krate,
+            Arc::new(self.traits.clone()), // alloc: clone: the crate's first directory
+            Arc::new(self.heads.clone()), // alloc: clone: as above
+            Arc::new(self.names.clone()), // alloc: clone: as above
+            self.body_modules.clone(),    // clone: a count
+        );
+        self.directory = Some(directory);
+        (made, directory)
+    }
+
     /// Sets the slice of `trait_` to `rows` unless it holds them already; whether it was set.
     pub(crate) fn set_trait(
         &mut self,
@@ -547,13 +647,11 @@ impl Published {
         )
     }
 
-    /// Gives the directory the keys first seen in this write, making it the first time: how
-    /// many inputs it set or made, and the directory when it made it, which the run registers
-    /// in [`ImplSlices`] with every other crate's ([`register`]). A directory field is set only
-    /// when its keys grew.
-    pub(crate) fn finish(&mut self, db: &mut Db, krate: Crate) -> (u64, Option<SliceDirectory>) {
+    /// Gives the directory the keys first seen in this write: how many inputs it set. A
+    /// directory field is set only when its keys grew. The crate's first directory is its
+    /// node's ([`Published::make`]).
+    pub(crate) fn finish(&mut self, db: &mut Db, krate: Crate) -> u64 {
         let mut set = 0;
-        let mut made = None;
         match self.directory {
             Some(directory) => {
                 if std::mem::take(&mut self.new_traits) {
@@ -577,46 +675,33 @@ impl Published {
                     set += 1;
                 }
             }
-            None => {
-                self.new_traits = false;
-                self.new_heads = false;
-                self.new_names = false;
-                self.new_body_modules = false;
-                let directory = SliceDirectory::new(
-                    &*db,
-                    krate,
-                    Arc::new(self.traits.clone()), // alloc: clone: the crate's first directory
-                    Arc::new(self.heads.clone()), // alloc: clone: as above
-                    Arc::new(self.names.clone()), // alloc: clone: as above
-                    self.body_modules.clone(),    // clone: a count
-                );
-                self.directory = Some(directory);
-                made = Some(directory);
-                set += 1;
-            }
+            None => panic!(
+                "impls: crate {krate:?} reached its publish with no directory: its node, which \
+                 makes the first, did not run"
+            ),
         }
-        (set, made)
+        set
     }
 }
 
-/// Adds the directories of the crates a run first maintained to the singleton, with one write:
-/// a write opens a view, which sweeps every `lru` table, so one per crate was a sweep per crate.
-/// Nothing when there are none.
-pub(crate) fn register(db: &mut Db, directories: &[(Crate, SliceDirectory)]) {
-    if directories.is_empty() {
+/// Adds the slots of the crates a pass first maintains to the singleton, with one write before
+/// any crate's node runs: a write opens a view, which sweeps every `lru` table, so one per crate
+/// was a sweep per crate. Nothing when there are none.
+pub(crate) fn register_slots(db: &mut Db, slots: &[(Crate, DirectorySlot)]) {
+    if slots.is_empty() {
         return;
     }
     match ImplSlices::try_get(&*db) {
         Some(all) => {
             // alloc: clone: the crate map, once per write that first maintains a crate
             let mut crates = (**all.crates(&*db)).clone();
-            crates.extend(directories.iter().copied());
+            crates.extend(slots.iter().copied());
             // alloc: the singleton's map, once per write that first maintains a crate
             all.set_crates(db).to(Arc::new(crates));
         }
         None => {
             let mut crates = HashMap::new_in(Global);
-            crates.extend(directories.iter().copied());
+            crates.extend(slots.iter().copied());
             // alloc: the singleton's map, once per database
             _ = ImplSlices::new(db, Arc::new(crates));
         }

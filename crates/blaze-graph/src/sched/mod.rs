@@ -53,7 +53,7 @@ use blaze_core::wheel::Wheel;
 
 pub use cores::{CoreInfo, Cores, Distances, LEVELS, Level, MAX_CORES, ShapeError};
 pub use fiber::{
-    Carried, Idle, IdleReason, NoWait, Switch, SwitchEvent, carry, current_job, miss, observe, observe_idle, observe_spawner,
+    Carried, Given, Idle, IdleReason, NoWait, Switch, SwitchEvent, carry, current_job, miss, observe, observe_idle, observe_spawner,
     on_fiber,
 };
 pub(crate) use fiber::spawner;

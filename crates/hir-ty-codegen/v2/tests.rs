@@ -23,11 +23,11 @@ use super::{
     allocator::{self, Forward},
     by_id::ById,
     backend::{built, compiled_in},
-    build::{self, Build},
+    build::Build,
     places::{self, Placer, place_requests},
     refs,
 };
-use crate::{InstanceDef, home::Homes};
+use crate::InstanceDef;
 use db::TestDB;
 
 /// The fixture lives as long as the test process, as the frontend borrows it.
@@ -46,9 +46,17 @@ fn held_as(db: TestDB, policy: &Policy) -> (&'static TestDB, HirFrontend<'static
     (db, frontend.with_policy(policy))
 }
 
+/// The stencil library the process copies from for the fixtures' target, as a toolchain names
+/// it: what a unit at opt-level 0 or 1 compiles with.
+fn stencils() -> Option<String> {
+    let stencils = crate::Target::for_fixtures().stencil()?;
+    let library = blaze_stencil::library_id(&stencils).expect("the stencil library");
+    Some(blaze_format::hex::encode(&library))
+}
+
 /// A build at `level` of members and dependencies, whose units are as [`spec`]'s.
 fn policy(level: OptLevel) -> Policy {
-    let toolchain = Toolchain { llvm: Some("test".to_owned()), ..spec().toolchain };
+    let toolchain = Toolchain { llvm: Some("test".to_owned()), stencils: stencils(), ..spec().toolchain };
     Policy {
         toolchain,
         profile: Profile {
@@ -135,14 +143,13 @@ fn unit(spec: &Spec) -> Unit {
 /// The instances of `of` that `root` calls, in the order it calls them.
 fn called(
     db: &Db,
-    homes: &mut Homes,
     root: &HirInstance,
     of: FunctionId,
 ) -> Vec<HirInstance> {
     let is_of = |instance: &HirInstance| {
         matches!(&instance.0, Kind::Code(called, _) if called.def == InstanceDef::Fn(of))
     };
-    refs::walk(db, root, refs::Walking::plain(false), homes)
+    refs::walk(db, root, refs::Walking::plain(false))
         .expect("the walk of the root")
         .into_iter()
         .filter_map(|it| match it {
@@ -155,10 +162,9 @@ fn called(
 /// What a backend is given for the references of an instance: one target each.
 fn refs_of(
     db: &Db,
-    homes: &mut Homes,
     (instance, inlined): (&HirInstance, bool),
 ) -> Vec<blaze_codegen::Target> {
-    let walked = refs::walk(db, instance, refs::Walking::plain(inlined), homes).expect("the walk");
+    let walked = refs::walk(db, instance, refs::Walking::plain(inlined)).expect("the walk");
     (0..walked.len()).map(|at| blaze_codegen::Target::Extern(format!("ref{at}"))).collect()
 }
 
@@ -167,12 +173,12 @@ fn shape(frontend: &HirFrontend, instance: &HirInstance) -> Shape {
 }
 
 fn prepared(frontend: &HirFrontend, spec: &Spec, instance: &HirInstance) -> (Shape, super::Prepared) {
-    frontend.with(|db, homes| {
-        let refs = refs_of(db, homes, (instance, inlines(spec)));
+    frontend.with(|db| {
+        let refs = refs_of(db, (instance, inlines(spec)));
         let refs: &Refs = &refs;
         let walked = (instance, refs::Walking::plain(inlines(spec)));
         Backends::default()
-            .prepared(db, homes, &frontend.hashes, &unit(spec), spec, walked, refs)
+            .prepared(db, &frontend.hashes, &unit(spec), spec, walked, refs)
             .unwrap_or_else(|e| panic!("{instance:?}: {e:?}"))
     })
 }
@@ -197,7 +203,7 @@ fn siblings_over_pointers_have_one_shape() {
     let (db, frontend) = frontend(SIBLINGS);
     let (roots, outer) = (function(&db, "roots"), function(&db, "outer"));
     let root = frontend.root(roots);
-    let siblings = frontend.with(|db, homes| called(db, homes, &root, outer));
+    let siblings = frontend.with(|db| called(db, &root, outer));
     let [a, b] = &siblings[..] else { panic!("{siblings:?}") };
     assert_ne!(a, b);
     assert_eq!(shape(&frontend, a), shape(&frontend, b));
@@ -208,7 +214,7 @@ fn different_constants_are_different_shapes() {
     let (db, frontend) = frontend(SIBLINGS);
     let (roots, konst) = (function(&db, "roots"), function(&db, "konst"));
     let root = frontend.root(roots);
-    let siblings = frontend.with(|db, homes| called(db, homes, &root, konst));
+    let siblings = frontend.with(|db| called(db, &root, konst));
     let [one, two] = &siblings[..] else { panic!("{siblings:?}") };
     assert_ne!(shape(&frontend, one), shape(&frontend, two));
 }
@@ -251,7 +257,7 @@ fn instances_with_one_share_key_are_one() {
     hir_ty::attach_db(db, || {
         let policy = policy(OptLevel::O0);
         let root = frontend.root(function(db, "roots"));
-        let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+        let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
         let key = |instance: &HirInstance| {
             let described = (frontend.describe(instance, &origin))
                 .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
@@ -261,7 +267,7 @@ fn instances_with_one_share_key_are_one() {
         };
         let of = |name| {
             let func = function(db, name);
-            frontend.with(|hir, homes| called(hir, homes, &root, func))
+            frontend.with(|hir| called(hir, &root, func))
         };
         let ids = of("id");
         let [a, b] = &ids[..] else { panic!("{ids:?}") };
@@ -317,7 +323,7 @@ fn equal_share_keys_compile_to_one_shape() {
         let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
         hir_ty::attach_db(db, || {
             let root = frontend.root(function(db, "roots"));
-            let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+            let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let keyed = |instance: &HirInstance| {
                 let described = (frontend.describe(instance, &origin))
                     .unwrap_or_else(|e| panic!("{debuginfo:?} {instance:?}: {}", e.what));
@@ -331,7 +337,7 @@ fn equal_share_keys_compile_to_one_shape() {
             let mut all = Vec::new(); // alloc: a test's list
             for name in ["id", "swap", "wrap"] {
                 let func = function(db, name);
-                let instances = frontend.with(|hir, homes| called(hir, homes, &root, func));
+                let instances = frontend.with(|hir| called(hir, &root, func));
                 assert_eq!(instances.len(), 8, "{debuginfo:?} `{name}`: {instances:?}");
                 let keyed: Vec<_> = instances.into_iter().map(|it| { let k = keyed(&it); (it, k) }).collect(); // alloc: a test's list
                 let mut shared = Vec::new(); // alloc: a test's list
@@ -348,7 +354,7 @@ fn equal_share_keys_compile_to_one_shape() {
             // `roots` asks for `c` with `A, B, W`, in that order.
             {
                 let func = function(db, "c");
-                let instances = frontend.with(|hir, homes| called(hir, homes, &root, func));
+                let instances = frontend.with(|hir| called(hir, &root, func));
                 assert_eq!(instances.len(), 3, "{debuginfo:?} `c`: {instances:?}");
                 let keyed: Vec<_> = instances.into_iter().map(|it| { let k = keyed(&it); (it, k) }).collect(); // alloc: a test's list
                 let shared: Vec<(usize, usize)> = (0..keyed.len()) // alloc: a test's list
@@ -386,9 +392,9 @@ fn a_key_covers_the_types_of_the_locals_a_debugger_is_told() {
         let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
         hir_ty::attach_db(db, || {
             let root = frontend.root(function(db, "roots"));
-            let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+            let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let func = function(db, "id");
-            let instances = frontend.with(|hir, homes| called(hir, homes, &root, func));
+            let instances = frontend.with(|hir| called(hir, &root, func));
             // `roots` asks for `id` with `A` first, then `B`, one compile identity.
             let [a, b, ..] = &instances[..] else { panic!("{instances:?}") };
             let keyed = |instance: &HirInstance| {
@@ -424,11 +430,11 @@ fn one_instance_under_two_debuginfo_levels_shares_a_key_only_with_its_shape() {
             let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
             hir_ty::attach_db(db, || {
                 let root = frontend.root(function(db, "roots"));
-                let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+                let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
                 let mut all = Vec::new(); // alloc: a test's list
                 for name in ["id", "swap", "wrap", "c"] {
                     let func = function(db, name);
-                    let instances = frontend.with(|hir, homes| called(hir, homes, &root, func));
+                    let instances = frontend.with(|hir| called(hir, &root, func));
                     for (at, instance) in instances.iter().enumerate() {
                         let described = (frontend.describe(instance, &origin))
                             .unwrap_or_else(|e| panic!("{debuginfo:?} {instance:?}: {}", e.what));
@@ -483,7 +489,7 @@ fn a_cached_function_is_new_code_when_what_its_closure_reaches_is() {
         let (db, frontend) = frontend(&cached_fixture(deep));
         hir_ty::attach_db(db, || {
             let root = frontend.root(function(db, "cached"));
-            let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+            let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let described = (frontend.describe(&root, &origin))
                 .unwrap_or_else(|e| panic!("{root:?}: {}", e.what));
             described.code
@@ -520,40 +526,48 @@ pub fn cached(x: u32) -> u32 {{
     )
 }
 
-/// A cached function whose body code identity refuses is a build error naming the function
-/// and the refusal (PR #1603 review, rule 3), from the code generator and from the frontend
-/// both: the closure reads `S`, whose `B` vtable identity finds at no place whose type names
-/// its trait (a raw pointer to the array's first element). Writing a zero hash and running the
-/// function uncached took the slow path in its place. A body that is impure, reading a
-/// `static mut`, still compiles and runs uncached: that is the program's doing.
+/// A cached function whose body reaches code the code generator refuses, and nothing impure, is
+/// a build error naming the function, what it reaches that can't be compiled, the refusal and
+/// the rule (rule 3), from the code generator and from the frontend both. Writing a zero hash
+/// and running the function uncached took another path in its place. `deep` holds const eval's
+/// first id (0x0600_0000) as a `usize` with no provenance, under a type that says it points to a
+/// function, which the code generator refuses (`refuse_ids_left`). A body that is impure still
+/// compiles and runs uncached, also when it reaches `deep` beside: that is the program's doing,
+/// and what can't be compiled can add to an impurity, never take it away.
 #[test]
-fn a_cached_function_whose_body_has_no_code_identity_is_an_error() {
+fn a_cached_function_whose_body_blaze_cannot_compile_is_an_error() {
     use blaze_codegen::backend::Frontend as _;
-    let refused = cached_reading(
-        "const ARR: &[&(dyn Tr + Sync)] = &[&A(1), &B(2, 3)];\n\
-         static S: P = P(ARR as *const [&(dyn Tr + Sync)] as *const &'static (dyn Tr + Sync));",
-        "S.0",
-    );
+    let deep = "fn eight() -> u32 { 8 }\n\
+                const C: (fn() -> u32, *const fn() -> u32) =\n\
+                    (eight, &0x0600_0000usize as *const usize as *const fn() -> u32);\n\
+                pub fn deep() -> u32 { keep(C); 1 }\n\
+                static mut M: u32 = 0;";
+    let refusal = "it has no provenance, so const eval did not make it a pointer";
+    let named = |what: &str| {
+        assert!(what.contains("cached`") && what.contains("can't be built"), "{what}");
+        assert!(what.contains("it reaches `") && what.contains("deep`, which can't be compiled by blaze"), "{what}");
+        assert!(what.contains(refusal) && what.contains("rule 3"), "{what}");
+    };
+    let refused = cached_reading(deep, "deep()");
     let (db, front) = frontend(&refused);
     hir_ty::attach_db(db, || {
         let cached = function(db, "cached");
         let compiled = crate::compiled_root(db, cached).as_ref().map(|_| ()).map_err(ToString::to_string);
-        let what = compiled.expect_err("the code generator refuses `cached`");
-        assert!(what.contains("cached") && what.contains("no code identity"), "{what}");
-        assert!(what.contains("at no place whose type names its trait"), "{what}");
+        named(&compiled.expect_err("the code generator refuses `cached`"));
         let root = front.root(cached);
-        let origin = front.with(|hir, _| front.origin(hir, fixture::test_crate(&db)));
-        let what = front.describe(&root, &origin).map(|_| ()).expect_err("the frontend refuses `cached`").what;
-        assert!(what.contains("no code identity") && what.contains("at no place whose type names its trait"), "{what}");
+        let origin = front.with(|hir| front.origin(hir, fixture::test_crate(&db)));
+        named(&front.describe(&root, &origin).map(|_| ()).expect_err("the frontend refuses `cached`").what);
     });
-    let impure = cached_reading("static mut S: u32 = 0;", "unsafe { S }");
-    let (db, _) = frontend(&impure);
-    hir_ty::attach_db(db, || {
-        let compiled = crate::compiled_root(db, function(db, "cached"));
-        if let Err(e) = compiled {
-            panic!("an impure cached function compiles, uncached: {e}");
-        }
-    });
+    for read in ["unsafe { M }", "(unsafe { M }, deep())"] {
+        let impure = cached_reading(deep, read);
+        let (db, _) = frontend(&impure);
+        hir_ty::attach_db(db, || {
+            let compiled = crate::compiled_root(db, function(db, "cached"));
+            if let Err(e) = compiled {
+                panic!("an impure cached function reading `{read}` compiles, uncached: {e}");
+            }
+        });
+    }
 }
 
 #[test]
@@ -568,7 +582,7 @@ fn a_root_takes_function_items_for_its_type_parameters() {
         let with_mac = root(expand, &[mac]).unwrap();
         assert_ne!(with_mac, root(expand, &[other]).unwrap());
         assert_eq!(with_mac, root(expand, &[mac]).unwrap());
-        let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+        let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
         frontend.describe(&with_mac, &origin).unwrap_or_else(|e| panic!("{with_mac:?}: {}", e.what));
         for (func, items, name) in [(two, &[mac][..], "two"), (expand, &[], "expand"), (sized, &[mac], "sized")] {
             let what = root(func, items).unwrap_err();
@@ -588,7 +602,7 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
         MirOptions,
     };
     let (db, frontend) = frontend(SHARED);
-    let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+    let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
     let options = |policy: &Policy| {
         let build_time = std::sync::Arc::new(BuildTime(Default::default()));
         let frontend =
@@ -688,22 +702,21 @@ fn the_walk_lists_what_the_ir_asks_for() {
     let (db, frontend) = frontend(REFERRING);
     let root = frontend.root(function(&db, "roots"));
     let spec = spec();
-    frontend.with(|db, homes| {
+    frontend.with(|db| {
         let mut seen = vec![root.clone()];
         let mut at = 0;
         while let Some(instance) = seen.get(at).cloned() {
             at += 1;
-            let walked = refs::walk(db, &instance, refs::Walking::plain(false), homes).expect("the walk");
-            assert_eq!(walked, refs::walk(db, &instance, refs::Walking::plain(false), homes).expect("the walk again"));
-            let mut code = build::with(Build::of(&spec), || built(db, &instance, crate::Target::for_fixtures(), false))
-                .and_then(|it| it)
+            let walked = refs::walk(db, &instance, refs::Walking::plain(false)).expect("the walk");
+            assert_eq!(walked, refs::walk(db, &instance, refs::Walking::plain(false)).expect("the walk again"));
+            let mut code = built(db, &instance, crate::Target::for_fixtures(), false, Build::of(&spec))
                 .unwrap_or_else(|e| panic!("{instance:?}: {e}"));
             let requests = match &mut code {
                 super::Built::Ir(pending) => &mut pending.wants.requests,
                 super::Built::Assembled(_, requests) => requests,
             };
             let mut placer = Placer::listed(walked.clone());
-            place_requests(db, homes, &HashSource::ById(ById), compiled_in(db, &instance), &mut placer, requests)
+            place_requests(db, &HashSource::ById(ById), compiled_in(db, &instance), &mut placer, requests)
                 .unwrap_or_else(|e| panic!("{instance:?} asks for what its walk has not: {e}"));
             for it in walked {
                 if let FrontRef::Function(next) = it
@@ -725,15 +738,69 @@ fn a_reference_left_out_of_the_walk_is_an_error() {
     let (db, frontend) = frontend(REFERRING);
     let root = frontend.root(function(&db, "callee"));
     let spec = spec();
-    frontend.with(|db, homes| {
-        let mut code = build::with(Build::of(&spec), || built(db, &root, crate::Target::for_fixtures(), false))
-            .and_then(|it| it)
+    frontend.with(|db| {
+        let mut code = built(db, &root, crate::Target::for_fixtures(), false, Build::of(&spec))
             .expect("the IR");
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
         let mut placer = Placer::listed(Vec::new());
         let krate = compiled_in(db, &root);
-        let placed = place_requests(db, homes, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests);
+        let placed = place_requests(db, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests);
         assert!(placed.is_err());
+    });
+}
+
+/// A function holding a value with drop glue across a call: unwinding, the call has a
+/// landing pad that drops it; aborting, it has none.
+const HOLDS_ACROSS_A_CALL: &str = r#"
+//- minicore: sized, drop
+pub struct Held(u32);
+impl Drop for Held {
+    fn drop(&mut self) {}
+}
+#[inline(never)]
+pub fn callee(x: u32) -> u32 { x }
+pub fn holds(x: u32) -> u32 {
+    let _held = Held(x);
+    callee(x)
+}
+"#;
+
+/// One function built under two units' settings in one database gives two IRs, and neither
+/// build reuses the other's: the settings are an argument of the compile and the key of every
+/// body it reads (`MirStage::compiled`'s options), never state on the thread, which a fiber
+/// that waits in a query leaves behind (rule 24) and a memo would not cover (rule 18).
+/// Unwinding, the call has a landing pad that drops the held value; aborting, none. Built
+/// unwinding, then aborting, then unwinding again, each is its own settings' IR, and the
+/// compile directly under `instance_code` agrees with `built`.
+#[test]
+fn one_function_under_two_settings_builds_two_irs_in_one_database() {
+    let (db, frontend) = frontend(HOLDS_ACROSS_A_CALL);
+    let root = frontend.root(function(&db, "holds"));
+    let aborting = Build::of(&Spec { panic: Panic::Abort, ..spec() });
+    let unwinding = Build::of(&spec());
+    frontend.with(|db| {
+        let text = |code: super::Built| match code {
+            super::Built::Ir(pending) => pending.func.display().to_string(),
+            super::Built::Assembled(..) => panic!("`holds` is no assembly"),
+        };
+        let under = |build: Build| {
+            built(db, &root, crate::Target::for_fixtures(), false, build)
+                .map(text)
+                .unwrap_or_else(|e| panic!("{root:?} under {build:?}: {e}"))
+        };
+        let unwinds = under(unwinding);
+        let aborts = under(aborting);
+        let unwinds_again = under(unwinding);
+        assert_ne!(aborts, unwinds, "built after the unwinding IR, the aborting one is its own, not a reuse");
+        assert_eq!(unwinds_again, unwinds, "built after the aborting IR, the unwinding one is its own again");
+        let HirInstance(Kind::Code(instance, env)) = &root else { panic!("{root:?} is no function") };
+        let instance = crate::Instance { checked: false, ..*instance };
+        let direct = match crate::instance_code(db, instance, *env, crate::Detach::Unit, Some(aborting)) {
+            Ok(crate::Produced::Pending(pending)) => pending.func.display().to_string(),
+            Ok(crate::Produced::Code(_)) => panic!("a unit's compile leaves its IR to the back end"),
+            Err(e) => panic!("{root:?}: {e}"),
+        };
+        assert_eq!(direct, aborts, "the compile's own settings, wherever it is called from");
     });
 }
 
@@ -757,8 +824,8 @@ fn an_always_inline_callee_of_a_dependency_is_built_in() {
     let (db, frontend) = held(fixture::db(ALWAYS).into_db());
     let root = frontend.root(function(&db, "roots"));
     let spec = spec();
-    frontend.with(|db, homes| {
-        let walked = refs::walk(db, &root, refs::Walking::plain(false), homes).expect("the walk");
+    frontend.with(|db| {
+        let walked = refs::walk(db, &root, refs::Walking::plain(false)).expect("the walk");
         let built_in = refs::built_in(db, &root, refs::Walking::plain(false)).expect("the walk");
         let [at, nested] = built_in[..] else { panic!("built in: {built_in:?} of {walked:?}") };
         let FrontRef::Function(outer) = &walked[at as usize] else { panic!("{walked:?}") };
@@ -779,12 +846,11 @@ fn an_always_inline_callee_of_a_dependency_is_built_in() {
         let inlined =
             super::frontend::inlined(db, &HashSource::ById(ById), (&root, refs::Walking::plain(false))).expect("what is built in");
         assert_eq!(inlined.len(), 2, "outer and twice: {inlined:?}");
-        let mut code = build::with(Build::of(&spec), || built(db, &root, crate::Target::for_fixtures(), false))
-            .and_then(|it| it)
+        let mut code = built(db, &root, crate::Target::for_fixtures(), false, Build::of(&spec))
             .unwrap_or_else(|e| panic!("{root:?}: {e}"));
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
         let mut placer = Placer::listed(walked);
-        place_requests(db, homes, &HashSource::ById(ById), compiled_in(db, &root), &mut placer, &mut pending.wants.requests)
+        place_requests(db, &HashSource::ById(ById), compiled_in(db, &root), &mut placer, &mut pending.wants.requests)
             .expect("the IR asks only for what the walk lists");
     });
 }
@@ -809,7 +875,7 @@ fn an_asm_function_a_dependencys_generic_asks_for_is_the_images() {
     use blaze_codegen::{Owner, backend::Frontend as _};
     let (db, frontend) = frontend(ASKED_BY_THE_IMAGE);
     let root = frontend.root(function(&db, "roots"));
-    let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+    let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
     hir_ty::attach_db(db, || {
         let describe = |instance: &HirInstance| {
             frontend.describe(instance, &origin).unwrap_or_else(|e| panic!("{instance:?}: {}", e.what))
@@ -866,7 +932,7 @@ fn an_instances_arguments_are_evaluated() {
     let (db, frontend) = frontend(UNEVALUATED);
     let (roots, takes) = (function(&db, "roots"), function(&db, "takes"));
     let root = frontend.root(roots);
-    let called = frontend.with(|db, homes| called(db, homes, &root, takes));
+    let called = frontend.with(|db| called(db, &root, takes));
     assert!(!called.is_empty(), "no instance of `takes`");
     for it in &called {
         let Kind::Code(instance, _) = &it.0 else { panic!("{it:?}") };
@@ -881,16 +947,16 @@ fn a_units_mir_level_is_rustcs() {
     use hir_ty_mir::mir::MirOptLevel;
     let (db, _) = frontend(SIBLINGS);
     let krate = fixture::test_crate(&db);
-    let level = |spec: &Spec| Build::of(spec).options(db, krate, krate).level;
+    let level = |spec: &Spec| Build::of(spec).options(db, krate, false).level;
     let mut spec = spec();
     assert_eq!(level(&spec), MirOptLevel::Debug);
     spec.backend = Backend::Llvm { opt: 0 };
     assert_eq!(level(&spec), MirOptLevel::Debug);
     spec.backend = Backend::Llvm { opt: 2 };
     assert_eq!(level(&spec), MirOptLevel::Release);
-    assert_eq!(Build::WALK.options(db, krate, krate).level, MirOptLevel::Debug);
+    assert_eq!(Build::WALK.options(db, krate, false).level, MirOptLevel::Debug);
     spec.debug_assertions = true;
-    assert!(Build::of(&spec).options(db, krate, krate).ub_checks);
+    assert!(Build::of(&spec).options(db, krate, false).ub_checks);
 }
 
 /// An entry of the allocator shim is built against what its walk lists, the function it
@@ -905,15 +971,14 @@ fn an_allocator_entry_calls_what_its_walk_lists() {
     assert_ne!(allocator::code(&defaults), allocator::code(&entry(Some("__blaze_global_alloc"))));
     assert!(allocator::walk(&entry(None)).is_empty());
     let spec = spec();
-    frontend.with(|db, homes| {
-        let walked = refs::walk(db, &ours, refs::Walking::plain(false), homes).expect("the walk");
+    frontend.with(|db| {
+        let walked = refs::walk(db, &ours, refs::Walking::plain(false)).expect("the walk");
         assert_eq!(walked, vec![FrontRef::Extern("__blaze_global_alloc".to_owned())]);
-        let mut code = build::with(Build::of(&spec), || built(db, &ours, crate::Target::for_fixtures(), false))
-            .and_then(|it| it)
+        let mut code = built(db, &ours, crate::Target::for_fixtures(), false, Build::of(&spec))
             .expect("the IR");
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
         let mut placer = Placer::listed(walked);
-        place_requests(db, homes, &HashSource::ById(ById), compiled_in(db, &ours), &mut placer, &mut pending.wants.requests)
+        place_requests(db, &HashSource::ById(ById), compiled_in(db, &ours), &mut placer, &mut pending.wants.requests)
             .expect("what the walk lists");
     });
     // The fixture links no `alloc`: its program has no shim.
@@ -1021,26 +1086,38 @@ fn two_allocators_are_named_in_order_of_name() {
     }
 }
 
-/// A `std` (a lang crate) that depends on both panic runtimes and names neither, as the
-/// toolchain's does.
-const PANIC_RUNTIMES: &str = r#"
-//- minicore: sized
-//- /unwind.rs crate:panic_unwind
+/// The toolchain's panic runtimes as a build gives them: crates of the standard library, each
+/// built with the strategy it implements (`panic_abort` always aborts), and a `std` built with
+/// `std` (`unwind`, as the sysroot's, or `abort` where the target aborts) that depends on both
+/// and names neither. A program's crate also depends on `panic_unwind` directly, as
+/// `-Zbuild-std` gives every crate (a `noprelude` extern, blaze-units' `attach_std`). Every
+/// crate says its strategy, as a build's cfg does, so no minicore, whose `core` says none.
+fn panic_runtimes(std: &str) -> String {
+    format!(
+        r#"
+//- /unwind.rs crate:panic_unwind lang cfg:panic=unwind
 #![feature(panic_runtime)]
 #![panic_runtime]
-//- /abort.rs crate:panic_abort
+//- /abort.rs crate:panic_abort lang cfg:panic=abort
 #![feature(panic_runtime)]
 #![panic_runtime]
-//- /std.rs crate:std deps:panic_unwind,panic_abort
+//- /std.rs crate:std deps:panic_unwind,panic_abort cfg:panic={std}
 #![feature(needs_panic_runtime)]
 #![needs_panic_runtime]
+"#
+    )
+}
+
+/// A panic runtime of the program's own, not the standard library's.
+const CUSTOM_RUNTIME: &str = r#"
+//- /custom.rs crate:panic_custom cfg:panic=unwind
+#![feature(panic_runtime)]
+#![panic_runtime]
 "#;
 
-/// The panic runtimes the program of `main` links, by name, `main` having `deps` and `-C
-/// panic=<strategy>`.
-fn linked_runtimes(strategy: &str, deps: &str, main: &str) -> Result<Vec<String>, String> {
-    let text = format!("{PANIC_RUNTIMES}//- /main.rs crate:main deps:std{deps} cfg:panic={strategy}\n{main}\nfn main() {{}}\n");
-    let db = fixture::db(&text).into_db();
+/// The panic runtimes the program of `main` links, by name, of the fixture `text` with `main`.
+fn runtimes_of(text: &str) -> Result<Vec<String>, String> {
+    let db = fixture::db(text).into_db();
     let krate = fixture::test_crate(&db);
     let mut names: Vec<String> = crate::linked_crates(&db, krate)?
         .into_iter()
@@ -1051,27 +1128,160 @@ fn linked_runtimes(strategy: &str, deps: &str, main: &str) -> Result<Vec<String>
     Ok(names)
 }
 
-/// A program links one panic runtime: the one its strategy names, though std depends on
-/// both, or the one it names itself, as rustc's `inject_panic_runtime` and
-/// `activate_injected_dep` choose. Both linked defined `__rust_panic_cleanup` twice, and a
-/// `catch_unwind` cleaned up `panic_unwind`'s exception with `panic_abort`'s (#1611).
+/// The panic runtimes the program of `main` links, by name, `main` having `deps` beside `std`
+/// and `panic_unwind`, `-C panic=<strategy>` and the code `main`, std built to unwind.
+/// `panic_custom` is in the fixture only when `deps` names it: the test crate is the one
+/// nothing depends on.
+fn linked_runtimes(strategy: &str, deps: &str, main: &str) -> Result<Vec<String>, String> {
+    let custom = if deps.contains("panic_custom") { CUSTOM_RUNTIME } else { "" };
+    let runtimes = panic_runtimes("unwind");
+    runtimes_of(&format!(
+        "{runtimes}{custom}//- /main.rs crate:main deps:std,panic_unwind{deps} cfg:panic={strategy}\n{main}\nfn main() {{}}\n"
+    ))
+}
+
+/// A program links one panic runtime: the one its strategy names, though std and the program's
+/// own crate depend on `panic_unwind`, or one it names itself, as rustc's
+/// `inject_panic_runtime` and `activate_injected_dep` choose. Both linked defined
+/// `__rust_panic_cleanup` twice, and a `catch_unwind` cleaned up `panic_unwind`'s exception
+/// with `panic_abort`'s (#1611); `panic_unwind` alone under `abort` made every panic "failed to
+/// initiate panic".
 #[test]
 fn a_program_links_the_one_panic_runtime_its_strategy_names() {
     assert_eq!(linked_runtimes("unwind", "", ""), Ok(vec!["panic_unwind".to_owned()]));
-    assert_eq!(linked_runtimes("abort", "", ""), Ok(vec!["panic_abort".to_owned()]));
     assert_eq!(
-        linked_runtimes("unwind", ",panic_abort", "extern crate panic_abort;"),
+        linked_runtimes("abort", "", ""),
         Ok(vec!["panic_abort".to_owned()]),
-        "a runtime the program names replaces the injected one"
+        "a dependency on `panic_unwind` the program's code never names is no runtime it names"
     );
-    let text = format!("{PANIC_RUNTIMES}//- /main.rs crate:main deps:std\nfn main() {{}}\n");
+    assert_eq!(
+        linked_runtimes("abort", ",panic_abort", "extern crate panic_abort;"),
+        Ok(vec!["panic_abort".to_owned()]),
+        "the runtime the program names, built with its strategy"
+    );
+    assert_eq!(
+        linked_runtimes("unwind", ",panic_custom", "extern crate panic_custom;"),
+        Ok(vec!["panic_custom".to_owned()]),
+        "a runtime of the program's own replaces the injected one"
+    );
+    let runtimes = panic_runtimes("unwind");
+    let text = format!("{runtimes}//- /main.rs crate:main deps:std,panic_unwind\nfn main() {{}}\n");
     let db = fixture::db(&text).into_db();
     assert_eq!(
         crate::linked_crates(&db, fixture::test_crate(&db)).map(drop),
-        Err("the program of crate `main` has a panic strategy that names no panic runtime: its cfg \
-             has neither `panic = \"unwind\"` nor `panic = \"abort\"`"
+        Err("crate `main` has a panic strategy that names no panic runtime: its cfg has neither \
+             `panic = \"unwind\"` nor `panic = \"abort\"`"
             .to_owned()),
         "no strategy is an error, never a runtime guessed"
+    );
+}
+
+/// A runtime the program names that is not built with the program's strategy is an error
+/// naming the program, the runtime, the crate that named it and both strategies, as rustc's
+/// `BadPanicStrategy` refuses it (tests/ui/panic-runtime/want-unwind-got-abort.rs,
+/// want-abort-got-unwind.rs).
+#[test]
+fn a_panic_runtime_of_another_strategy_is_refused_naming_it() {
+    assert_eq!(
+        linked_runtimes("unwind", ",panic_abort", "extern crate panic_abort;"),
+        Err("the program of crate `main` panics by `unwind`, and it links the panic runtime \
+             `panic_abort` (named by crate `main`), built to panic by `abort`: a program's panic \
+             runtime is built with its panic strategy"
+            .to_owned())
+    );
+    assert_eq!(
+        linked_runtimes("abort", "", "extern crate panic_unwind;"),
+        Err("the program of crate `main` panics by `abort`, and it links the panic runtime \
+             `panic_unwind` (named by crate `main`), built to panic by `unwind`: a program's panic \
+             runtime is built with its panic strategy"
+            .to_owned())
+    );
+    // Found apart from the walk, which reads nothing once no ordinary dependency is left: in a
+    // body by the file's text, written by a macro at the level of items by the def map.
+    let refused = Err("the program of crate `main` panics by `unwind`, and it links the panic runtime \
+                       `panic_abort` (named by crate `main`), built to panic by `abort`: a program's \
+                       panic runtime is built with its panic strategy"
+        .to_owned());
+    assert_eq!(
+        linked_runtimes("unwind", ",panic_abort", "fn f() { extern crate panic_abort; }"),
+        refused,
+        "an `extern crate` in a body"
+    );
+    assert_eq!(
+        linked_runtimes("unwind", ",panic_abort", "macro_rules! m { () => { extern crate panic_abort; } }\nm!();"),
+        refused,
+        "an `extern crate` a macro writes"
+    );
+}
+
+/// Two runtimes named are refused naming each and the crate that named it, the one to edit
+/// (rustc's `TwoPanicRuntimes`).
+#[test]
+fn two_panic_runtimes_named_are_refused_naming_who_named_each() {
+    let runtimes = panic_runtimes("unwind");
+    let text = format!(
+        "{runtimes}{CUSTOM_RUNTIME}//- /mid.rs crate:mid deps:panic_custom cfg:panic=unwind\n\
+         extern crate panic_custom;\n\
+         //- /main.rs crate:main deps:std,panic_unwind,mid cfg:panic=unwind\n\
+         extern crate mid;\nextern crate panic_unwind;\nfn main() {{}}\n"
+    );
+    assert_eq!(
+        runtimes_of(&text),
+        Err("the program of crate `main` names two panic runtimes, `panic_custom` (named by crate \
+             `mid`) and `panic_unwind` (named by crate `main`): a program links one"
+            .to_owned())
+    );
+}
+
+/// A program that aborts links the standard library built to unwind with `panic_abort`, as the
+/// toolchain's sysroot has it (an unwinding test of an aborting profile shares that std), and a
+/// crate built to abort is refused in a program that unwinds, naming it, as rustc's
+/// `RequiredPanicStrategy` refuses it. A std built to abort under an unwinding test was
+/// refused as the runtime's strategy instead, or linked unchecked (#1611 round 2, C5).
+#[test]
+fn crates_built_to_abort_link_only_into_programs_that_abort() {
+    // `dep`, built to `dep_panic`, is in the fixture only when `main` depends on it: the test
+    // crate is the first nothing depends on, which a `dep` written before `main` would be.
+    let program = |std: &str, strategy: &str, deps: &str, dep_panic: &str| {
+        let runtimes = panic_runtimes(std);
+        let (dep, call) = match deps.contains("dep") {
+            true => (format!("//- /dep.rs crate:dep cfg:panic={dep_panic}\npub fn f() {{}}\n"), "dep::f();"),
+            false => (String::new(), ""),
+        };
+        format!(
+            "{runtimes}{dep}//- /main.rs crate:main deps:std,panic_unwind{deps} cfg:panic={strategy}\n\
+             fn main() {{ {call} }}\n"
+        )
+    };
+    let main = |std: &str, strategy: &str, deps: &str| program(std, strategy, deps, "abort");
+    assert_eq!(runtimes_of(&main("unwind", "abort", "")), Ok(vec!["panic_abort".to_owned()]));
+    assert_eq!(runtimes_of(&main("unwind", "abort", ",dep")), Ok(vec!["panic_abort".to_owned()]));
+    assert_eq!(
+        runtimes_of(&main("unwind", "unwind", ",dep")),
+        Err("the program of crate `main` panics by `unwind`, and it links crate `dep`, built to \
+             panic by `abort`: a crate built to panic by `abort` is linked only into a program \
+             that panics by `abort`"
+            .to_owned())
+    );
+    assert_eq!(
+        runtimes_of(&main("abort", "unwind", ",dep")),
+        Err("the program of crate `main` panics by `unwind`, and it links crates `dep`, `std`, \
+             built to panic by `abort`: a crate built to panic by `abort` is linked only into a \
+             program that panics by `abort`"
+            .to_owned()),
+        "a std built to abort under a program that unwinds"
+    );
+    // rustc lets a crate built to unwind into a program that aborts unless it makes a call that
+    // may unwind out of foreign code; blaze checks no bodies for that, so it links one only
+    // from the standard library, and refuses any other by name (#1611 round 3, L5).
+    assert_eq!(
+        runtimes_of(&program("unwind", "abort", ",dep", "unwind")),
+        Err("the program of crate `main` panics by `abort`, and it links crate `dep`, built to \
+             panic by `unwind` and not the standard library's: blaze does not check a crate \
+             built to unwind for calls that may unwind out of foreign code (rustc's \
+             `has_ffi_unwind_calls`), so a program that aborts links one only from the standard \
+             library"
+            .to_owned())
     );
 }
 
@@ -1116,8 +1326,8 @@ fn a_functions_sanitizers_off_are_its_nearest_attributes() {
     assert_eq!(off(&spec(), &root("quiet")), Sanitizers::NONE);
     assert_eq!(off(&all, &root("inherited")), both);
     assert_eq!(off(&all, &root("nearest")), Sanitizers::ADDRESS);
-    let closure = frontend.with(|db, homes| {
-        refs::walk(db, &root("closure"), refs::Walking::plain(false), homes)
+    let closure = frontend.with(|db| {
+        refs::walk(db, &root("closure"), refs::Walking::plain(false))
             .expect("the walk")
             .into_iter()
             .find_map(|it| match it {
@@ -1155,7 +1365,7 @@ fn cranelift_refuses_a_sanitized_unit() {
     use blaze_codegen::backend::Prepare as _;
     let (db, frontend) = frontend(SANITIZED);
     let loud = frontend.root(function(&db, "loud"));
-    let refs = frontend.with(|db, homes| refs_of(db, homes, (&loud, false)));
+    let refs = frontend.with(|db| refs_of(db, (&loud, false)));
     let refs: &Refs = &refs;
     for spec in [sanitizing(Sanitizers::ADDRESS, 0), sanitizing(Sanitizers::NONE, 1)] {
         let Err(e) = Backends::default().prepare(&frontend, &unit(&spec), &spec, &loud, refs) else {
@@ -1180,8 +1390,7 @@ fn is_call(it: &places::Ref, func: FunctionId) -> bool {
 
 /// The IR of `instance` built as `spec` says, with what it asked for.
 fn built_as(db: &Db, spec: &Spec, instance: &HirInstance) -> super::Built {
-    build::with(Build::of(spec), || built(db, instance, crate::Target::for_fixtures(), false))
-        .and_then(|it| it)
+    built(db, instance, crate::Target::for_fixtures(), false, Build::of(spec))
         .unwrap_or_else(|e| panic!("{instance:?}: {e}"))
 }
 
@@ -1196,7 +1405,7 @@ fn a_units_bodies_are_inlined_as_rustcs() {
         .copied()
         .find(|it| it.data(db).origin.is_lang())
         .expect("minicore's crate");
-    let inline = |build: Build, written| build.options(db, written, krate).inline;
+    let inline = |build: Build, written| build.options(db, written, false).inline;
     let backends = [
         (Backend::Cranelift { speed: false }, false),
         (Backend::Cranelift { speed: true }, false),
@@ -1226,19 +1435,19 @@ fn which_units_inline_is_the_policys() {
     let (db, frontend) = frontend(SIBLINGS);
     let root = frontend.root(function(db, "roots"));
     let outer = function(db, "outer");
-    let generic = frontend.with(|db, homes| called(db, homes, &root, outer)).remove(0);
+    let generic = frontend.with(|db| called(db, &root, outer)).remove(0);
     let inlines = |policy: &Policy, instance: &HirInstance| {
         let build_time = std::sync::Arc::new(BuildTime(Default::default()));
         let frontend =
             HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time).with_policy(policy);
-        frontend.with(|db, _| frontend.inlines(db, instance)).expect("the policy")
+        frontend.with(|db| frontend.inlines(db, instance)).expect("the policy")
     };
     assert!(!inlines(&policy(OptLevel::O0), &root));
     assert!(inlines(&policy(OptLevel::O3), &root));
     assert!(inlines(&policy(OptLevel::O2), &root));
     assert!(!inlines(&policy(OptLevel::O1), &root));
     let mut set_apart = policy(OptLevel::O3);
-    let name = frontend.with(|hir, _| match frontend.origin(hir, fixture::test_crate(&db)) {
+    let name = frontend.with(|hir| match frontend.origin(hir, fixture::test_crate(&db)) {
         blaze_codegen::plan::Origin::Member(name) => name.as_str().to_owned(),
         other => panic!("the fixture's crate is {other:?}"),
     });
@@ -1249,7 +1458,7 @@ fn which_units_inline_is_the_policys() {
     assert!(inlines(&set_apart, &generic));
     let unwalked =
         HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
-    let refused = unwalked.with(|db, _| unwalked.inlines(db, &root));
+    let refused = unwalked.with(|db| unwalked.inlines(db, &root));
     assert!(refused.is_err_and(|e| e.contains("with_policy")));
 }
 
@@ -1270,10 +1479,10 @@ fn the_walk_lists_what_inlined_code_calls() {
     let (db, frontend) = held_as(fixture::db(INLINED).into_db(), &policy(OptLevel::O3));
     let root = frontend.root(function(db, "caller"));
     let (f, g) = (function(db, "f"), function(db, "g"));
-    frontend.with(|db, homes| {
+    frontend.with(|db| {
         assert!(frontend.inlines(db, &root).expect("the policy"));
-        let plain = refs::walk(db, &root, refs::Walking::plain(false), homes).expect("the walk");
-        let walked = refs::walk(db, &root, refs::Walking::plain(true), homes).expect("the walk for inlining");
+        let plain = refs::walk(db, &root, refs::Walking::plain(false)).expect("the walk");
+        let walked = refs::walk(db, &root, refs::Walking::plain(true)).expect("the walk for inlining");
         assert!(plain.iter().any(|it| is_call(it, f)), "{plain:?}");
         assert!(!plain.iter().any(|it| is_call(it, g)), "{plain:?}");
         assert!(walked.iter().any(|it| is_call(it, g)), "{walked:?}");
@@ -1286,7 +1495,7 @@ fn the_walk_lists_what_inlined_code_calls() {
             let mut code = built_as(db, &llvm(2), &root);
             let super::Built::Ir(pending) = &mut code else { panic!("asm") };
             let mut placer = Placer::listed(refs);
-            place_requests(db, homes, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests)
+            place_requests(db, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests)
                 .map(drop)
         };
         assert!(place(plain).is_err(), "the inlined IR asks only for what the plain walk lists");
@@ -1310,8 +1519,8 @@ fn a_callee_inlined_twice_is_built_in_once() {
     let (db, frontend) = held_as(fixture::db(TWICE).into_db(), &policy(OptLevel::O3));
     let root = frontend.root(function(db, "caller"));
     let (leaf, mid) = (function(db, "leaf"), function(db, "mid"));
-    frontend.with(|db, homes| {
-        let walked = refs::walk(db, &root, refs::Walking::plain(true), homes).expect("the walk");
+    frontend.with(|db| {
+        let walked = refs::walk(db, &root, refs::Walking::plain(true)).expect("the walk");
         let built_in = refs::built_in(db, &root, refs::Walking::plain(true)).expect("the walk");
         assert_eq!(walked.iter().filter(|it| is_call(it, leaf)).count(), 1, "{walked:?}");
         let [one, two] = built_in[..] else { panic!("built in: {built_in:?} of {walked:?}") };
@@ -1347,7 +1556,7 @@ pub fn caller(x: u32) -> u32 { dep::load(x) }
 fn the_walk_lists_what_a_built_in_callees_inlined_body_calls() {
     let (db, frontend) = held_as(fixture::db(BUILT_IN_INLINES).into_db(), &policy(OptLevel::O3));
     let root = frontend.root(function(db, "caller"));
-    frontend.with(|db, homes| {
+    frontend.with(|db| {
         let named = |it: &places::Ref, name: &str| match it {
             FrontRef::Function(HirInstance(Kind::Code(called, _))) => match called.def {
                 InstanceDef::Fn(func) => FunctionSignature::of(db, func).name.as_str() == name,
@@ -1356,8 +1565,8 @@ fn the_walk_lists_what_a_built_in_callees_inlined_body_calls() {
             _ => false,
         };
         assert!(frontend.inlines(db, &root).expect("the policy"));
-        let plain = refs::walk(db, &root, refs::Walking::plain(false), homes).expect("the walk");
-        let walked = refs::walk(db, &root, refs::Walking::plain(true), homes).expect("the walk for inlining");
+        let plain = refs::walk(db, &root, refs::Walking::plain(false)).expect("the walk");
+        let walked = refs::walk(db, &root, refs::Walking::plain(true)).expect("the walk for inlining");
         assert!(!plain.iter().any(|it| named(it, "leaf")), "{plain:?}");
         assert!(walked.iter().any(|it| named(it, "leaf")), "{walked:?}");
         let krate = compiled_in(db, &root);
@@ -1365,7 +1574,7 @@ fn the_walk_lists_what_a_built_in_callees_inlined_body_calls() {
             let mut code = built_as(db, &llvm(2), &root);
             let super::Built::Ir(pending) = &mut code else { panic!("asm") };
             let mut placer = Placer::listed(refs);
-            place_requests(db, homes, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests)
+            place_requests(db, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests)
                 .map(drop)
         };
         assert!(place(plain).is_err(), "the unit's IR asks for `leaf`");
@@ -1391,8 +1600,8 @@ fn an_inlined_track_caller_callee_reports_the_call() {
     let root = frontend.root(function(db, "caller"));
     let here = function(db, "here");
     let caller: DefWithBodyId = function(db, "caller").into();
-    frontend.with(|db, homes| {
-        let walked = refs::walk(db, &root, refs::Walking::plain(true), homes).expect("the walk");
+    frontend.with(|db| {
+        let walked = refs::walk(db, &root, refs::Walking::plain(true)).expect("the walk");
         let built_in = refs::built_in(db, &root, refs::Walking::plain(true)).expect("the walk");
         assert!(built_in.iter().any(|&at| is_call(&walked[at as usize], here)), "{built_in:?}");
         let locations = |spec: &Spec| {
@@ -1511,7 +1720,7 @@ fn a_line_is_read_from_the_location_where_it_is_written() {
     let (db, frontend) = held(db);
     let here = function(db, "here");
     let root = frontend.root(here);
-    frontend.with(|db, _| {
+    frontend.with(|db| {
         let lines = |spec: &Spec| {
             let super::Built::Ir(pending) = built_as(db, spec, &root) else { panic!("asm") };
             (pending.wants.requests.datas.iter())
@@ -1621,15 +1830,15 @@ pub fn roots(x: u32) {
     hir_ty::attach_db(db, || {
         let policy = policy(OptLevel::O0);
         let root = frontend.root(function(db, "roots"));
-        let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+        let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
         let key = |instance: &HirInstance| {
             let described = (frontend.describe(instance, &origin))
                 .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
             let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
             UnitInstance { code: described.code, args: described.args, settings: choice.first.settings() }.key()
         };
-        let glues: Vec<HirInstance> = frontend.with(|hir, homes| {
-            refs::walk(hir, &root, refs::Walking::plain(false), homes)
+        let glues: Vec<HirInstance> = frontend.with(|hir| {
+            refs::walk(hir, &root, refs::Walking::plain(false))
                 .expect("the walk of the root")
                 .into_iter()
                 .filter_map(|it| match it {
@@ -1699,7 +1908,7 @@ fn every_pointer_to_dyn_in_a_constant_points_at_its_vtable() {
             [("raw", "A"), ("aliased", "B"), ("behind", "C"), ("wrap", "D"), ("raw_slice", "E")];
         for (name, of) in cases {
             let root = frontend.root(function(db, name));
-            let (vtable, pointers) = frontend.with(|db, _| {
+            let (vtable, pointers) = frontend.with(|db| {
                 let super::Built::Ir(pending) = built_as(db, &spec(), &root) else {
                     panic!("asm")
                 };
@@ -1734,7 +1943,7 @@ fn every_pointer_to_dyn_in_a_constant_points_at_its_vtable() {
             );
         }
         let root = frontend.root(function(db, "fn_behind"));
-        let functions = frontend.with(|db, _| {
+        let functions = frontend.with(|db| {
             let super::Built::Ir(pending) = built_as(db, &spec(), &root) else { panic!("asm") };
             (pending.wants.requests.datas.iter())
                 .filter_map(|it| match it {
@@ -1898,6 +2107,32 @@ pub const NOTHING: (&(), &[u32], &[u8; 0]) = {
     (&(), &[], &e.1)
 };
 pub fn nothing() -> (&'static (), &'static [u32], &'static [u8; 0]) { NOTHING }
+pub const RAW_DYN: P = P(&(&A(2) as &dyn Tr) as *const &dyn Tr as *const u8);
+pub fn raw_dyn() -> P { RAW_DYN }
+pub trait TOne { fn one(&self) -> u32; }
+pub trait TThree { fn t1(&self) -> u32; fn t2(&self) -> u32; fn t3(&self) -> u32; }
+pub struct XOne(pub u32);
+impl TOne for XOne { fn one(&self) -> u32 { self.0 } }
+pub struct YBoth(pub u32);
+impl TOne for YBoth { fn one(&self) -> u32 { self.0 } }
+impl TThree for YBoth {
+    fn t1(&self) -> u32 { 1 }
+    fn t2(&self) -> u32 { 2 }
+    fn t3(&self) -> u32 { 3 }
+}
+pub struct MixedP(pub *const &'static dyn TOne);
+pub const MIXED: MixedP = MixedP(
+    &(&XOne(1) as &dyn TOne, &YBoth(2) as &dyn TThree) as *const (&dyn TOne, &dyn TThree)
+        as *const &dyn TOne,
+);
+pub fn mixed() -> MixedP { MIXED }
+pub trait Sub: TOne + TThree {}
+impl Sub for YBoth {}
+pub const UP: &dyn TOne = &YBoth(3) as &dyn Sub as &dyn TOne;
+pub fn up() -> &'static dyn TOne { UP }
+pub const ID_NUM: (&dyn Tr, P) =
+    (&A(1) as &dyn Tr, P(&0x0600_0000usize as *const usize as *const u8));
+pub fn id_num() -> (&'static dyn Tr, P) { ID_NUM }
 "#;
 
 /// What the IR of `name`, a function of [`CONSTANT_MEMORY`], asks for as data, each with a
@@ -1906,11 +2141,9 @@ fn constant_datas(name: &str) -> Result<Vec<(crate::fragment::DataRequest, Strin
     let (db, frontend) = frontend(CONSTANT_MEMORY);
     hir_ty::attach_db(db, || {
         let root = frontend.root(function(db, name));
-        frontend.with(|db, _| {
-            let built = build::with(Build::of(&spec()), || {
-                built(db, &root, crate::Target::for_fixtures(), false)
-            });
-            match built.and_then(|it| it) {
+        frontend.with(|db| {
+            let code = built(db, &root, crate::Target::for_fixtures(), false, Build::of(&spec()));
+            match code {
                 Ok(super::Built::Ir(pending)) => {
                     let datas = pending.wants.requests.datas;
                     let named = (datas.into_iter().enumerate())
@@ -1952,7 +2185,9 @@ fn described(index: usize, data: &crate::fragment::DataRequest) -> String {
             let (len, relocs, fns) = (blob.bytes.len(), &blob.relocs, &blob.fn_relocs);
             format!("{index}: {len} bytes, relocs {relocs:?}, functions {fns:?}")
         }
-        DataRequest::Vtable { ty, .. } => format!("{index}: vtable of {:?}", ty.as_ref()),
+        DataRequest::Vtable { ty, blob, .. } => {
+            format!("{index}: vtable of {:?}, {} bytes", ty.as_ref(), blob.bytes.len())
+        }
         DataRequest::Static(_) => format!("{index}: a static"),
         _ => format!("{index}: other"),
     }
@@ -1983,16 +2218,92 @@ fn a_pointer_behind_a_raw_pointer_of_another_type_is_relocated() {
     );
 }
 
-/// A vtable in memory reached through a pointer of a type that does not say it is there
-/// (`*const u8` from a `&&dyn Tr`) is an error, not const eval's id left as a number: the id
-/// names the type only, so which trait's vtable it is is not known there.
+/// A vtable in memory reached first through a pointer of a type that does not say it is there
+/// (`*const u8` from a `&&dyn Tr`, then the `&&dyn Tr`) points at the vtable const eval's id
+/// names, `A`'s for `Tr`: the id names the trait as well as the type, as rustc's
+/// `GlobalAlloc::VTable` does, whatever type reaches the word.
 #[test]
-fn a_vtable_no_type_says_is_there_is_refused() {
-    let e = match constant_datas("two") {
-        Ok(datas) => panic!("`TWO` built: {}", all_described(&datas)),
+fn a_vtable_reached_first_through_a_raw_pointer_points_at_its_trait() {
+    let datas = constant_datas("two").unwrap_or_else(|e| panic!("`TWO` is refused: {e}"));
+    let word = crate::Target::for_fixtures().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, word, "A"),
+        "`TWO`'s vtable is not relocated: {}",
+        all_described(&datas)
+    );
+}
+
+/// A vtable in memory reached only through a raw pointer of a type that says nothing of it
+/// (`*const u8` from a `&&dyn Tr`) points at the vtable const eval's id names.
+#[test]
+fn a_vtable_reached_only_through_a_raw_pointer_points_at_its_trait() {
+    let datas = constant_datas("raw_dyn").unwrap_or_else(|e| panic!("`RAW_DYN` is refused: {e}"));
+    let word = crate::Target::for_fixtures().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, word, "A"),
+        "`RAW_DYN`'s vtable is not relocated: {}",
+        all_described(&datas)
+    );
+}
+
+/// The length of the vtable of a type whose name has `of` in it, from [`described`].
+fn vtable_len(datas: &[(crate::fragment::DataRequest, String)], of: &str) -> Option<usize> {
+    let index = vtable_of(datas, of)? as usize;
+    let (_, rest) = datas[index].1.rsplit_once(", ")?;
+    rest.strip_suffix(" bytes")?.parse().ok()
+}
+
+/// An array of a `&dyn TOne` and a `&dyn TThree` reached through a `*const &dyn TOne` gets
+/// each element's own vtable: the walk behind the raw pointer reads every element as a
+/// `&dyn TOne`, and `YBoth`'s vtable must still be the one for `TThree` (three methods, longer
+/// than `XOne`'s for `TOne`), not one for `TOne`.
+#[test]
+fn a_raw_pointer_over_dyn_pointers_of_two_traits_keeps_each_ones_vtable() {
+    let datas = datas_or("mixed").unwrap_or_else(|e| panic!("`MIXED` is refused: {e}"));
+    let (one, three) = (vtable_len(&datas, "XOne"), vtable_len(&datas, "YBoth"));
+    assert!(
+        matches!((one, three), (Some(one), Some(three)) if three > one),
+        "`YBoth`'s vtable is not the one for `TThree`: {}",
+        all_described(&datas)
+    );
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, word, "XOne")
+            && points_at_vtable(&datas, &words, 3 * word, "YBoth"),
+        "`MIXED`'s vtables are not relocated: {}",
+        all_described(&datas)
+    );
+}
+
+/// A word equal to one of const eval's ids that has no provenance (a number behind a
+/// `*const u8`, which no type says is a number) is refused, naming the word and the id's type:
+/// every vtable and function const eval makes has provenance, so this one is a number or a
+/// pointer made a number, and emitting it as either could be wrong.
+#[test]
+fn an_id_word_with_no_provenance_is_refused() {
+    let e = match datas_or("id_num") {
+        Ok(datas) => panic!("`ID_NUM` built: {}", all_described(&datas)),
         Err(e) => e,
     };
-    assert!(e.contains("const eval's id of `A`"), "{e}");
+    assert!(e.contains("const eval's id of `A`") && e.contains("no provenance"), "{e}");
+}
+
+/// A `&dyn Sub` upcast to a `&dyn TOne` in a constant points at `YBoth`'s vtable for `TOne`:
+/// const eval gives the upcast pointer the vtable of its concrete type for the target trait,
+/// as rustc does, and the trait it names is the pointer's.
+#[test]
+fn an_upcast_constant_points_at_the_targets_vtable() {
+    let datas = datas_or("up").unwrap_or_else(|e| panic!("`UP` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, word, "YBoth"),
+        "`UP`'s vtable is not relocated: {}",
+        all_described(&datas)
+    );
 }
 
 /// A `&dyn` inside the `dyn` tail of a struct (`&Wrap<dyn Tr>` holding a `Holder(&dyn Tr)`)
@@ -2202,7 +2513,7 @@ fn interleaved_units_keep_their_own_frame_pointers() {
     };
     let (keeps, omits) = (with(true), with(false));
     assert_ne!(unit(&keeps).instance.key(), unit(&omits).instance.key(), "the setting is in the unit's key");
-    let refs: Vec<blaze_codegen::Target> = frontend.with(|db, homes| refs_of(db, homes, (&root, false)));
+    let refs: Vec<blaze_codegen::Target> = frontend.with(|db| refs_of(db, (&root, false)));
     let backends = Backends::default();
     let prepare = |spec: &Spec| {
         super::toolchain::select(&spec.toolchain).expect("the toolchain");
@@ -2248,7 +2559,7 @@ fn fuel_meters_a_loop_at(spec: Spec) {
     use blaze_codegen::backend::Prepare;
     let (db, frontend) = frontend(SPIN);
     let root = frontend.root(function(&db, "spin"));
-    let refs: Vec<blaze_codegen::Target> = frontend.with(|db, homes| refs_of(db, homes, (&root, false)));
+    let refs: Vec<blaze_codegen::Target> = frontend.with(|db| refs_of(db, (&root, false)));
     let backends = Backends::default();
     let emit = |spec: &Spec| {
         super::toolchain::select(&spec.toolchain).expect("the toolchain");
@@ -2401,15 +2712,19 @@ fn a_union_of_one_dyn_pointer_points_at_its_vtable() {
     );
 }
 
-/// A vtable in a union of two fields, which const eval does not say it holds, is an error
-/// naming the union, in the constant's own value too.
+/// A vtable in a union of two non-empty fields (`U2 { d: &dyn Tr }` beside a `(usize,
+/// usize)`) points at the vtable const eval's id names: its provenance says which word it is
+/// and the id which vtable, so no field has to be chosen.
 #[test]
-fn a_vtable_in_a_union_of_two_fields_is_refused_naming_it() {
-    let e = match datas_or("u2_dyn") {
-        Ok(datas) => panic!("`U2_DYN` built: {}", all_described(&datas)),
-        Err(e) => e,
-    };
-    assert!(e.contains("union `U2`") && e.contains("value"), "{e}");
+fn a_vtable_in_a_union_of_two_fields_points_at_its_vtable() {
+    let datas = datas_or("u2_dyn").unwrap_or_else(|e| panic!("`U2_DYN` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, word, "A"),
+        "`U2_DYN`'s vtable is not relocated: {}",
+        all_described(&datas)
+    );
 }
 
 /// A union's fields are not walked by type: numbers in one (`U2 { n: (1, 2) }`) are no
@@ -2452,15 +2767,19 @@ fn a_slice_in_a_packed_structs_nested_tail_is_at_the_layouts_offset() {
     );
 }
 
-/// One allocation reached as two types that relocate it differently (`&(usize, usize)` and
-/// `&&dyn Tr`) is refused: the first walk would decide what the second sees.
+/// One allocation reached as numbers (`&(usize, usize)`, transmuted) and as a `&&dyn Tr`
+/// points at its vtable: which walk reaches it first decides nothing, since the vtable is
+/// relocated from its provenance and const eval's id.
 #[test]
-fn an_allocation_two_types_relocate_differently_is_refused() {
-    let e = match datas_or("two_views") {
-        Ok(datas) => panic!("`TWO_VIEWS` built: {}", all_described(&datas)),
-        Err(e) => e,
-    };
-    assert!(e.contains("relocate it differently"), "{e}");
+fn an_allocation_reached_as_numbers_and_as_a_dyn_pointer_points_at_its_vtable() {
+    let datas = datas_or("two_views").unwrap_or_else(|e| panic!("`TWO_VIEWS` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, word, "A"),
+        "`TWO_VIEWS`'s vtable is not relocated: {}",
+        all_described(&datas)
+    );
 }
 
 /// A word equal to a function's id behind a raw pointer, with no provenance, is no function:
@@ -2526,4 +2845,89 @@ fn a_reference_to_nothing_is_its_alignment() {
     let datas = datas_or("nothing").unwrap_or_else(|e| panic!("`NOTHING` is refused: {e}"));
     let words = relocated_words(&datas);
     assert!(words.iter().all(|it| it.is_empty()), "`NOTHING` is relocated: {words:?}");
+}
+
+/// `k` depends on `dep` but names it only through `m`'s macro in a body, which
+/// `loaded_crates` misses: the solver of `k`'s environment does not see `dep`'s impls, while
+/// `main`, which names `dep`, does. `dep`'s impl of `t::Tr` specializes `t`'s `default`
+/// blanket impl, so which `go` `k::run::<u8>` calls depends on the crate it is compiled in.
+const MACRO_ONLY_DEP: &str = r#"
+//- minicore: sized
+//- /t.rs crate:t
+#![feature(min_specialization)]
+pub trait Tr {
+    fn go(&self) -> u32;
+}
+impl<T> Tr for T {
+    default fn go(&self) -> u32 { 1 }
+}
+//- /m.rs crate:m
+#[macro_export]
+macro_rules! val {
+    () => {
+        ::dep::DType
+    };
+}
+//- /dep.rs crate:dep deps:t
+#![feature(min_specialization)]
+pub struct DType;
+impl t::Tr for DType {
+    fn go(&self) -> u32 { 2 }
+}
+//- /k.rs crate:k deps:t,m,dep
+pub fn run<T>(_: T) -> u32 {
+    t::Tr::go(&m::val!())
+}
+//- /main.rs crate:main deps:k,dep
+pub fn roots() -> u32 {
+    let _ = dep::DType;
+    k::run(0u8)
+}
+"#;
+
+/// `k::run::<u8>`, generic, which rustc instantiates in `main`, is compiled where `dep`'s
+/// specializing impl is seen: `k` is no home of it asked from `main`
+/// (`hir_ty_mir::mir::home::stands_for`), so its call of `go` on `DType` is `dep`'s. Compiled
+/// in `k`, the one crate it names, it would call `t`'s default and return 1 where rustc's
+/// returns 2 (rule 18: the home is in the instance's key, and `k` misses an input `main`'s
+/// answer reads).
+#[test]
+fn an_instance_is_not_compiled_in_a_crate_that_misses_a_specializing_impl_its_asker_sees() {
+    use base_db::{Crate, all_crates};
+    use hir_def::HasModule;
+    use hir_ty::method_resolution::loaded_crates;
+    let (db, frontend) = frontend(MACRO_ONLY_DEP);
+    let named = |name: &str| -> Crate {
+        all_crates(db)
+            .iter()
+            .copied()
+            .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == name))
+            .unwrap_or_else(|| panic!("no crate `{name}`"))
+    };
+    let (k, dep, main) = (named("k"), named("dep"), named("main"));
+    hir_ty::attach_db(db, || {
+        assert!(!loaded_crates(db, k).contains(&dep), "the fixture's premise: `k` names `dep` only through a macro");
+        assert!(loaded_crates(db, main).contains(&dep));
+    });
+    let root = frontend.root(hir_def::test_items::function(db, main, "roots"));
+    let run = hir_def::test_items::function(db, k, "run");
+    let called = frontend.with(|db| called(db, &root, run));
+    let [run] = &called[..] else { panic!("one call of `k::run`: {called:?}") };
+    let Kind::Code(_, env) = &run.0 else { panic!("{run:?}") };
+    let go: Vec<Crate> = frontend.with(|db| {
+        refs::walk(db, run, refs::Walking::plain(false))
+            .expect("the walk of `k::run`")
+            .iter()
+            .filter_map(|it| match it {
+                FrontRef::Function(HirInstance(Kind::Code(callee, _))) => match callee.def {
+                    InstanceDef::Fn(func) if FunctionSignature::of(db, func).name.as_str() == "go" => {
+                        Some(func.krate(db))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    });
+    assert_eq!(go, [dep], "`k::run` compiled in {:?} (`k` is {k:?}, `main` {main:?}) calls `go` of {go:?}", env.krate);
 }

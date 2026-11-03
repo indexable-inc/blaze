@@ -49,15 +49,15 @@ is, `#![feature(...)]` included. A project that needs another Rust pins another 
 `cargo` still builds with the project's toolchain, in its own `target/` in the checkout:
 blaze's build directory is elsewhere ([Where a build writes](#where-a-build-writes)).
 
-Where the nightly's files come from, found with nothing run: rustup's `nightly-2026-10-27`,
-when rustup has it (only as a copy of the same files; what rustup would pick
-is not asked); else blaze's own copy in
+Where the nightly's files come from, found with nothing run: blaze's own copy in
 `~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), laid out as rustup lays
-out a toolchain. blaze downloads its copy the first time it needs it, once, with a line on
-stderr while it does: rustc, cargo and the built standard library from the Rust project's
+out a toolchain, never rustup's own (its directory is not read, not even when it has the same
+nightly). blaze downloads its copy the first time it needs it, once, with a line on
+stderr while it does: rustc, cargo and the built standard library (the host's, and
+wasm32-wasip1's for the wasi-libc proc macros link with) from the Rust project's
 own servers (the standard library's source is blaze's own `library/`, a 6.0 MB archive from
-blaze's release, [toolchain.md](toolchain.md#the-standard-library-library)), 97 MB on macOS, 134 MB on Linux x86-64 and 118 MB on Linux ARM64 (548 MB on macOS
-and 710 MB on Linux x86-64 once unpacked). Each file's sha256 is built
+blaze's release, [toolchain.md](toolchain.md#the-standard-library-library)), 122 MB on macOS, 159 MB on Linux x86-64 and 143 MB on Linux ARM64 (about 654 MB on macOS
+and 816 MB on Linux x86-64 once unpacked, wasm32-wasip1's 106 MB of it). Each file's sha256 is built
 into blaze, from the nightly's published manifest (`harness/toolchain_pins.py` writes them into
 `crates/blaze-cargo/src/toolchain/pins.txt`), and a file with other bytes is refused. Concurrent
 builds download it once; a download that stopped goes on from where it stopped the next time.
@@ -190,6 +190,26 @@ The next build compiles only the functions an edit changed, and links each progr
 against an image it kept of the last link at that path, so the link writes only what changed
 (`crates/blaze-cargo/src/serve/unit/codegen.rs`, `Linked`). Build scripts and proc macros
 are compiled by blaze too, as units of the same graph ([below](#build-scripts-and-proc-macros-run-in-a-sandbox)).
+
+The standard library is built to unwind, whatever the profile's `panic`, as the toolchain's
+sysroot is; only the proc macros' and a target's that only aborts are built to abort
+(`std_key`, `crates/blaze-units/src/load/units.rs`). So a `panic = "abort"` program links it
+with `panic_abort`, and its tests, benches and build scripts, which unwind under any profile as
+cargo builds them, link the same std. Under an explicit `-Zbuild-std` that builds `std`, with
+`panic = "abort"`, cargo builds std to abort; blaze builds it to unwind there too, so the
+build's tests link the same std. That costs the program std's landing pads and unwind tables
+in size and changes nothing it does. A `-Zbuild-std` with neither `std` nor `panic_unwind` (`core`,
+`core,alloc`) is built with the profile's `panic`, as cargo builds it: nothing in it defines
+`rust_eh_personality`, which a `core` built to unwind would need.
+
+Linking checks most of what rustc's `dependency_format` checks (`linked_crates`,
+`crates/hir-ty-codegen/mod.rs`): one panic runtime, built with the program's strategy, and no
+crate built to abort in a program that unwinds; each refusal names the crates. rustc also
+refuses, in a program that aborts, a crate built to unwind that makes a call that may unwind out
+of foreign code (`has_ffi_unwind_calls`). blaze does not read bodies for that, so it links a
+crate built to unwind into a program that aborts only from the standard library, which rustc
+links that way from its sysroot, and refuses any other by name. Cargo's unit graphs never ask
+for one.
 
 `test` and `bench` build what cargo would, as its unit graph has them: each member's library,
 binaries and integration tests with `test = true`, the examples built beside them, and the
@@ -872,8 +892,8 @@ them, `CARGO_PROFILE_<NAME>_OPT_LEVEL`, and `inherits`. A custom profile that in
 
 | `opt-level` | Backend | Profiles that have it by default |
 |---|---|---|
-| `0` | Cranelift | `dev`, `test` |
-| `1` | Cranelift: rustc's `-O1` has no LLVM pipeline blaze runs to match it | |
+| `0` | copy-and-patch stencils | `dev`, `test` |
+| `1` | copy-and-patch stencils: rustc's `-O1` has no LLVM pipeline blaze runs to match it | |
 | `2` | LLVM at `-O2` | |
 | `3` | LLVM at `-O3` | `release`, `bench` |
 | `s`, `z` | LLVM at `-O2`: blaze's LLVM has no pipeline for size yet, so the code is not smaller than at `-O2` | |
@@ -881,16 +901,19 @@ them, `CARGO_PROFILE_<NAME>_OPT_LEVEL`, and `inherits`. A custom profile that in
 The level is chosen per function's package, as cargo's is: `[profile.<name>.package.<spec>]`
 (`"*"` for every package that is not a workspace member) and `build-override` for what build
 scripts and proc macros run are read over the profile (`crates/blaze-codegen/src/plan.rs`).
-Cranelift optimizes all but a workspace member's code, which no edit reaches and so is compiled
-once. The standard library's own functions are compiled as rustc's shipped std is, at `-O3`. A
-blaze built without LLVM refuses a profile that asks for it, saying so, rather than building it
-with Cranelift.
+Native code is never Cranelift's: stencils at 0 and 1 (a tail call, `become`, included), and a
+target with no stencil library stops at those levels with an error naming it. Stencil code
+built to keep counts nothing; only a tiered run's counts its calls. A proc macro's wasm module
+is the one place Cranelift's code generator runs. `codegen-backend = "cranelift"` at 0 or 1
+asks for the fast unoptimized code stencils are, and is taken. The standard library's own
+functions are compiled as rustc's shipped std is, at `-O3`. A blaze built without LLVM refuses
+a profile that asks for it, saying so, rather than building it with stencils.
 
 Each function's code is kept by the backend and level that compiled it, which are part of its
-spec's hash (`crates/blaze-codegen/src/settings.rs`): code Cranelift compiled is never given to
-a build with LLVM, nor `-O2`'s to `-O3`'s.
+spec's hash (`crates/blaze-codegen/src/settings.rs`): stencil code is never given to a build
+with LLVM, nor `-O2`'s to `-O3`'s.
 
-A build with LLVM takes longer than one with Cranelift. A first build takes the most longer,
+A build with LLVM takes longer than one with stencils. A first build takes the most longer,
 because LLVM compiles every function then
 ([#807](https://github.com/indexable-inc/blaze/issues/807)).
 

@@ -503,7 +503,15 @@ pub fn coroutine_witnesses_query<'db>(
 /// rustc's `erase_regions`: every free region `'erased`, and every binder's variables
 /// anonymized. MIR locals keep typeck's regions (`'static`, early-bound parameters, errors).
 pub(crate) fn erase_regions<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
-    return ty.fold_with(&mut EraseRegions { interner });
+    erase_regions_in(interner, ty)
+}
+
+/// [`erase_regions`] of any value that holds types (a predicate, generic arguments).
+pub(crate) fn erase_regions_in<'db, T: TypeFoldable<DbInterner<'db>>>(
+    interner: DbInterner<'db>,
+    value: T,
+) -> T {
+    return value.fold_with(&mut EraseRegions { interner });
 
     struct EraseRegions<'db> {
         interner: DbInterner<'db>,

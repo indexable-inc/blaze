@@ -21,6 +21,7 @@ use crate::{
 };
 
 mod closure;
+mod errors;
 mod field_order;
 
 /// The data layout of the machine the tests run on, from the pinned nightly's recorded target

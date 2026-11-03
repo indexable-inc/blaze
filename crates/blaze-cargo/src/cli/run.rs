@@ -123,6 +123,39 @@ pub fn planned(artifact: &Artifact, program_args: &[OsString], cwd: &Path) -> Re
     Ok(Exec::of(artifact, shown, program_args.iter().cloned(), cwd.to_owned()))
 }
 
+/// `exec` made to start `artifact`'s program on the daemon's code memory, where the daemon
+/// holds it as a dev executable (docs/v2/plan/lanes/fastcompile/inproc.md): the daemon writes
+/// the executable from the memory when it is not that file, and gives the start hook's
+/// variable, which waits for this process, the one that becomes the program ([`exec`]). Any
+/// other program runs its file, as does one under a runner, which takes the file.
+pub fn launch(artifact: &Artifact, exec: &mut Exec) -> Result<(), String> {
+    let Some(executable) = artifact.executable.as_deref() else { return Ok(()) };
+    if !artifact.runner.is_empty() {
+        return Ok(());
+    }
+    let request = blaze_api::Request::Launch { program: executable.to_owned(), pid: std::process::id() };
+    let mut launched = None;
+    super::observe::ask(request, super::daemon::Start::Never, |response| {
+        if let blaze_api::ResponseRef::Launched { live, env } = response {
+            launched = Some((live, env));
+        }
+        Ok(())
+    })
+    .map_err(|why| format!("starting {executable} on the daemon's code memory: {why}"))?;
+    match launched {
+        Some((true, env)) if cfg!(unix) => exec.env.extend(env),
+        Some((true, _)) => {
+            return Err(format!(
+                "{executable} runs on the daemon's code memory, and on this platform `blaze run` starts it as a child \
+                 whose process ID the daemon's launch can't know beforehand"
+            ));
+        }
+        Some((false, _)) => {}
+        None => return Err(format!("the daemon answered the launch of {executable} with no `Launched`")),
+    }
+    Ok(())
+}
+
 /// How `run` speaks of its program: colored, `-q`, how many `-v`s.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Told {

@@ -43,9 +43,9 @@ You do not need Rust or rustup. blaze is its own Rust toolchain ([toolchain.md](
 `blaze-2026-10-27` today, the nightly of that date (`rustc 1.101.0-nightly (16d1ffac1
 2026-10-26)`), moved to a newer one on blaze's schedule. blaze compiles your code and the
 standard library itself and behaves as that nightly does. Its linker still takes a few files
-from the nightly the Rust project publishes (rustc, cargo and the standard library, 97 MB on
-macOS, 118 to 133 MB on Linux): WASI's C runtime and the sanitizer runtimes. It finds them in
-`~/.blaze` or in rustup's `nightly-2026-10-27` when rustup has it. The standard library's
+from the nightly the Rust project publishes (rustc, cargo and the standard library of the host and of wasm32-wasip1, 122 MB on
+macOS, 143 to 159 MB on Linux): WASI's C runtime and the sanitizer runtimes. It finds them in
+`~/.blaze` only, never in rustup's directory. The standard library's
 source comes from blaze's own release. v2's blaze does not download that copy itself yet (the installer asks for it with
 `blaze toolchain`, which v2 lacks: [toolchain.md](toolchain.md)). blaze builds your project with
 that nightly whatever its `rust-toolchain.toml` says, so a project on a stable release or an

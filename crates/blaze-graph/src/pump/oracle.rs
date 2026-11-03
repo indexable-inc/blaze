@@ -12,7 +12,7 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use hegel::{TestCase, generators as gs};
 
-use super::{Flights, sharded::Sharded};
+use super::{Flights, NotHeld, sharded::Sharded};
 use crate::{Cancelled, Key};
 
 const ACTORS: usize = 3;
@@ -51,7 +51,12 @@ impl Design for Flights<u32> {
     }
 
     fn hold(&self, key: Key) -> Option<Release<'_>> {
-        let held = Flights::hold(self, key)?;
+        let held = match Flights::hold(self, key) {
+            Ok(held) => held,
+            Err(NotHeld::Busy) => return None,
+            // The model has no self-hold: the oracle never asks for one.
+            Err(NotHeld::ByThisTask) => panic!("the oracle held {key:?} twice from one task"),
+        };
         Some(Box::new(move |value| match value {
             Some(value) => held.end(&value),
             None => drop(held),

@@ -595,7 +595,10 @@ type Fetched = Result<Option<(ContentId, ImageBuf, Option<ImageBuf>)>, String>;
 /// dependencies, whose check keys its own is made from (asked now, or found by an earlier call),
 /// one task a crate of a layer ([`ImageStore::for_each`]). A crate one of whose dependencies has
 /// no check key has none. A crate asked again under the keys it was found or missed under is not
-/// looked up again; one under other keys is, and loses what it had when nothing is found. The
+/// looked up again; one under other keys is, and loses what it had when nothing is found. A
+/// crate asked that is read from no image now (its key moved and the image went with it), or
+/// one of whose dependencies has no check key now, loses what it had too, so nothing served
+/// under an image a crate is no longer read from stays (rule 18). The
 /// bodies of every crate of `served` are given to the database
 /// ([`hir_ty::check_cache::set_served`]) when they changed; the check keys and outcomes are kept
 /// in `served`, for [`read`] and [`store`].
@@ -621,14 +624,25 @@ pub fn serve(
         .filter_map(|&(krate, inputs)| Some((krate, (image_key(db, krate)?, inputs))))
         // alloc: setup: once per serve
         .collect();
-    let (layers, _) = layers(db, images.keys().copied(), &served.keys);
     let mut changed = false;
+    for &(krate, _) in crates {
+        if !images.contains_key(&krate) {
+            changed |= forget(served, krate);
+        }
+    }
+    let (layers, left) = layers(db, images.keys().copied(), &served.keys);
+    for (krate, _) in left {
+        changed |= forget(served, krate);
+    }
     for layer in layers {
         // alloc: setup: once per layer per serve
         let mut asked: Vec<(Crate, ContentId)> = Vec::with_capacity(layer.len());
         for krate in layer {
             let (image, inputs) = images[&krate];
-            let Some(deps) = dep_keys(db, krate, &served.keys) else { continue };
+            let Some(deps) = dep_keys(db, krate, &served.keys) else {
+                changed |= forget(served, krate);
+                continue;
+            };
             let base = bodies_key(image, &deps, inputs.borrowck);
             let outcome_at = served.keys.get(&krate).map(|&check| key(check, &inputs));
             if served.asked.get(&krate) == Some(&(base, outcome_at)) {
@@ -670,6 +684,15 @@ pub fn serve(
         hir_ty::check_cache::set_served(db, served.parts.clone());
     }
     Ok(())
+}
+
+/// `served` with nothing of `krate`: its check key, outcome, bodies part and what it was asked
+/// under. Whether the bodies the database is given change.
+fn forget(served: &mut Served, krate: Crate) -> bool {
+    served.keys.remove(&krate);
+    served.outcomes.remove(&krate);
+    served.asked.remove(&krate);
+    served.parts.remove(&krate).is_some()
 }
 
 /// The bodies part of `krate` filed by `base` and its bodies' reads as they are now, and the

@@ -16,7 +16,6 @@ use super::{
 use crate::{
     ConstBlob, compiled_static,
     fragment::{CompiledStatic, Requests},
-    home::Homes,
     is_thread_local,
 };
 
@@ -40,7 +39,6 @@ pub(crate) struct Value {
 /// What the static `id` holds, evaluated.
 pub(crate) fn value(
     db: &Db,
-    homes: &mut Homes,
     hashes: &HashSource,
     id: StaticId,
 ) -> Result<Value, String> {
@@ -75,7 +73,7 @@ pub(crate) fn value(
             (blob, requests, *writable)
         }
     };
-    let places = place_requests(db, homes, hashes, Some(id.krate(db)), &mut placer, &mut requests)?;
+    let places = place_requests(db, hashes, Some(id.krate(db)), &mut placer, &mut requests)?;
     let imports = wasm_imports(db, target, id, &requests)?;
     let mut bytes = super::shape::value(&blob, &requests, &places)?;
     Ok(Value {
@@ -129,7 +127,6 @@ fn wasm_imports(
 /// The static `id` with its references at `refs`.
 pub(crate) fn compile(
     db: &Db,
-    homes: &mut Homes,
     hashes: &HashSource,
     arch: Arch,
     id: StaticId,
@@ -146,7 +143,7 @@ pub(crate) fn compile(
             target.arch
         ));
     }
-    let value = value(db, homes, hashes, id)?;
+    let value = value(db, hashes, id)?;
     if value.refs.len() != refs.len() {
         // alloc: the error's message
         return Err(format!(

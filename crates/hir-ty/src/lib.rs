@@ -141,7 +141,11 @@ pub use specialization::{
     SpecializationMode, impl_unconstrained_params, specialization_mode, specialized_ancestor,
 };
 pub use target_feature::{TargetFeature, TargetFeatureSet, TargetFeatures, crate_target_features};
-pub use traits::{ParamEnvAndCrate, check_orphan_rules};
+pub use traits::{
+    ParamEnvAndCrate, SealedOpen, check_orphan_rules, declares_sealed, param_is_sized,
+    relaxed_uncovered_input, sealed_bounds, sealed_closure, sealed_in_graph, sealed_local_bound,
+    sealed_relaxation,
+};
 pub use used_imports::used_imports_with_traits;
 pub use utils::{
     TargetFeatureIsSafeInTarget, Unsafety, all_super_traits, direct_super_traits,
@@ -209,24 +213,59 @@ pub struct ComplexMemoryMap<'db> {
 
 impl Hash for ComplexMemoryMap<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.hash_content(state);
+        let ComplexMemoryMap { vtable, statics, type_ids, .. } = self;
+        // `VTableMap`'s ids follow from the order of its entries, each a type and the `dyn`
+        // type it is a vtable for.
+        state.write_usize(vtable.tys().len());
+        vtable.entries().for_each(|entry| entry.hash(state));
+        statics.iter().for_each(|it| it.id.hash(state));
+        type_ids.hash(state);
+    }
+}
+
+impl ComplexMemoryMap<'_> {
+    /// Feeds `state` every field of the map that is bytes and addresses, which is what the code
+    /// generator reads of it beside types and statics: each piece's address and bytes, where
+    /// each static's memory is and its size, each piece's alignment (its data object's), and
+    /// which words of the value and of the pieces are pointers with provenance (each one it
+    /// relocates). Left out, for the caller to hash by identity, are what names a type or an
+    /// item by the database's ids: the table of functions and vtables, the types of the
+    /// `TypeId`s and which static each range of memory is. The one place that says which fields
+    /// are content, so a field added is hashed by every identity that reads the map (rule 18).
+    /// Every number is written by `write_usize`, each column after its length, so a hasher
+    /// that writes integers at a fixed width (`blaze_hash::Blake3Hasher`) gets the same bytes
+    /// on every target.
+    pub fn hash_content<H: std::hash::Hasher>(&self, state: &mut H) {
         let ComplexMemoryMap {
             memory,
-            vtable,
+            vtable: _,
             statics,
             aligns,
-            type_ids,
+            type_ids: _,
             value_pointers,
             memory_pointers,
         } = self;
-        memory.hash(state);
-        // `VTableMap`'s ids of types follow from the order of its types.
-        state.write_usize(vtable.tys().len());
-        vtable.tys().for_each(|ty| ty.hash(state));
-        statics.hash(state);
-        aligns.hash(state);
-        type_ids.hash(state);
-        value_pointers.hash(state);
-        memory_pointers.hash(state);
+        state.write_usize(memory.len());
+        for (address, bytes) in memory.iter() {
+            state.write_usize(*address);
+            state.write_usize(bytes.len());
+            state.write(bytes);
+        }
+        state.write_usize(statics.len());
+        for StaticMemory { start, size, id: _ } in statics {
+            state.write_usize(*start);
+            state.write_usize(*size);
+        }
+        state.write_usize(aligns.len());
+        for (address, align) in aligns {
+            state.write_usize(*address);
+            state.write_usize(*align);
+        }
+        for column in [value_pointers, memory_pointers] {
+            state.write_usize(column.len());
+            column.iter().for_each(|it| state.write_usize(*it));
+        }
     }
 }
 
@@ -538,6 +577,24 @@ impl<'db> MemoryMap<'db> {
         }
     }
 
+    /// The concrete type and the `dyn` type of the vtable whose id is `id`, if it is one:
+    /// rustc's `GlobalAlloc::VTable(ty, dyn_ty)`. A word holding it is the vtable only where
+    /// it has provenance ([`Self::has_provenance`]).
+    pub fn vtable_of(&self, id: usize) -> Option<(Ty<'db>, Ty<'db>)> {
+        let MemoryMap::Complex(map) = self else { return None };
+        map.vtable.vtable(id)
+    }
+
+    /// The function (a fn item or a closure type) whose id is `id`, if it is one and not a
+    /// vtable's.
+    pub fn function_of(&self, id: usize) -> Option<Ty<'db>> {
+        let MemoryMap::Complex(map) = self else { return None };
+        match map.vtable.entry(id)? {
+            (ty, None) if matches!(ty.kind(), TyKind::FnDef(..) | TyKind::Closure(..)) => Some(ty),
+            _ => None,
+        }
+    }
+
     /// The type of the `TypeId` whose bytes, as an integer, are `id`.
     pub fn type_id_ty(&self, id: u128) -> Option<Ty<'db>> {
         let MemoryMap::Complex(map) = self else { return None };
@@ -556,16 +613,32 @@ impl<'db> MemoryMap<'db> {
     /// This functions convert each address by a function `f` which gets the byte intervals and assign an address
     /// to them. It is useful when you want to load a constant with a memory map in a new memory. You can pass an
     /// allocator function as `f` and it will return a mapping of old addresses to new addresses.
+    ///
+    /// Each piece is given the alignment its evaluation recorded; a literal's map (`Simple`) is
+    /// the bytes of a string or byte string, of alignment 1. A piece of a `Complex` map with no
+    /// alignment recorded is an error naming `what` (the constant): a guess could under-align a
+    /// pointee that needs more.
     pub fn transform_addresses(
         &self,
+        what: impl Fn() -> String,
         mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError<'db>>,
     ) -> Result<HashMap<usize, usize, Global>, MirEvalError<'db>> {
         let mut transform = |(addr, val): (&usize, &[u8])| {
             let addr = *addr;
-            let align = match self.align_at(addr) {
-                Some(align) => align,
-                None if addr == 0 => 64,
-                None => (addr - (addr & (addr - 1))).min(64),
+            let align = match self {
+                MemoryMap::Simple(_) => 1,
+                MemoryMap::Empty | MemoryMap::Complex(_) => match self.align_at(addr) {
+                    Some(align) => align,
+                    None => {
+                        return Err(MirEvalError::NotSupported(format!(
+                            // alloc: error path
+                            "{}: its memory at {addr:#x} ({} bytes) has no alignment its evaluation \
+                             recorded, and const eval does not guess one, which could under-align it",
+                            what(),
+                            val.len()
+                        )));
+                    }
+                },
             };
             f(val, align).map(|it| (addr, it))
         };
@@ -713,7 +786,7 @@ mod memory_map_tests {
         assert_eq!(map, other);
         assert_eq!(hash(&map), hash(&other));
         let addresses: HashMap<usize, usize, Global> = map
-            .transform_addresses(|bytes, align| Ok(bytes.len() * 1000 + align))
+            .transform_addresses(|| "the test's map".to_owned(), |bytes, align| Ok(bytes.len() * 1000 + align))
             .unwrap();
         assert_eq!(addresses.get(&64), Some(&8008));
     }

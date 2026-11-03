@@ -10,11 +10,12 @@
 //! given its cost and memory by the plane's [`Predict`] (the daemon's is a
 //! `blaze_history::History`) from its kind and key, and each one's own run teaches it: a
 //! thread task's time and what it held at most ([`arena::measure`]), a loop task's time from
-//! its start to its end.
+//! its start to its end; a run that replays what was kept teaches nothing ([`Plane::replays`]).
 
 #![forbid(unsafe_code)]
 
 use std::{
+    alloc::Global,
     collections::{BTreeMap, VecDeque},
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -29,6 +30,7 @@ use blaze_graph::{
     machine::{NodeId, Outcome, Pool},
     plane::{Key, NodeRef, Nodes, Unsettled},
 };
+use blaze_hash::HashSet;
 use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_protocol::events::{Event, NodeState};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -514,6 +516,9 @@ pub struct Plane<W: Work, P: Predict> {
     /// Each program's build that runs alone, never measured ([`Plane::push_program`]): what
     /// the process held as it started, for the most it held while it ran.
     alone: BTreeMap<NodeId, u64>,
+    /// Each node whose task replays what was kept, so its run teaches nothing
+    /// ([`Plane::replays`]), until it ends or settles.
+    replays: HashSet<NodeId, Global>,
 }
 
 pub(crate) fn ns(at: Duration) -> u64 {
@@ -535,6 +540,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
             now_ns: 0,
             loops: BTreeMap::new(),
             alone: BTreeMap::new(),
+            replays: HashSet::new_in(Global), // alloc: the plane's, once
         })
     }
 
@@ -574,19 +580,51 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// # Panics
     ///
     /// When `fresh` has all the nodes it was made for, or `task` is [`Task::Gone`].
-    pub fn push(&self, fresh: &mut Fresh, mut node: NodeRef<'_>, task: Task) -> NodeId {
+    pub fn push(&self, fresh: &mut Fresh, node: NodeRef<'_>, task: Task) -> NodeId {
+        let learn = node.key;
+        self.push_predicted(fresh, node, task, learn, false)
+    }
+
+    /// The next node of `fresh`, as [`Plane::push`], but predicted and taught by `learn`, a
+    /// key of the predictor's alone: the node has no key of the plane's, so nothing
+    /// single-flights or memoizes it by `learn`. A unit's phase is so given the cost of its own
+    /// last runs, not its kind's mean, and the plane starts the longest chain first by what
+    /// each node takes (docs/v2/plan/design/scheduler.md §6, step 1).
+    ///
+    /// Its memory is never under its kind's predicted peak, whatever `learn`'s record says: a
+    /// thread task learns only what its own thread held ([`arena::measure`]), so a phase that
+    /// hands its work to pool threads (a library's codegen, the front end's fan-out) records a
+    /// peak under what it holds, while its kind's tracks the largest peak of every task of the
+    /// kind and comes down slowly. Learning the key alone would admit more at once under a
+    /// budget than fits.
+    ///
+    /// # Panics
+    ///
+    /// As [`Plane::push`], and when `node` has a key.
+    pub fn push_learned(&self, fresh: &mut Fresh, node: NodeRef<'_>, task: Task, learn: Key) -> NodeId {
+        assert!(node.key.is_none(), "node {} is given a key of the plane's beside the one it learns by", node.name);
+        self.push_predicted(fresh, node, task, Some(learn), true)
+    }
+
+    /// The next node of `fresh`, its memory and cost predicted by `learn` (or its kind alone),
+    /// which its run then teaches ([`Plane::key`]); with `kind_floor`, its memory never under
+    /// its kind's predicted peak ([`Plane::push_learned`]).
+    fn push_predicted(&self, fresh: &mut Fresh, mut node: NodeRef<'_>, task: Task, learn: Option<Key>, kind_floor: bool) -> NodeId {
         assert!((fresh.tasks.len() as u32) < fresh.count, "a batch of {} nodes given another", fresh.count);
         let kind = match task {
             Task::Thread { kind, .. } | Task::Loop { kind } => kind,
             Task::Gone => panic!("node {} is pushed with no task", node.name),
         };
-        let Prediction { cost, peak } = self.predict.predict(kind, node.key);
+        let Prediction { cost, mut peak } = self.predict.predict(kind, learn);
+        if kind_floor {
+            peak = peak.max(self.predict.predict(kind, None).peak);
+        }
         node.memory = node.memory.max(peak);
         if let Some(cost) = cost {
             node.cost = cost;
         }
         fresh.tasks.push(task);
-        fresh.keys.push(node.key);
+        fresh.keys.push(learn);
         fresh.nodes.push(node)
     }
 
@@ -661,6 +699,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
     }
 
     fn settled(&mut self, id: NodeId) {
+        self.replays.remove(&id);
         let Some((&first, batch)) = self.batches.range_mut(..=id.0).next_back() else { return };
         let Some(task) = batch.tasks.get_mut((id.0 - first) as usize) else { return };
         if *task != Task::Gone {
@@ -747,13 +786,17 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.said = said;
     }
 
-    /// A loop task is over: the time since it started teaches the predictor.
+    /// A loop task is over: the time since it started teaches the predictor, unless it replayed
+    /// what was kept ([`Plane::replays`]).
     pub fn ended(&mut self, at: Duration, id: NodeId, outcome: Outcome) {
         let kind = match self.task(id) {
             Some((_, Task::Loop { kind })) => Some(kind),
             _ => None,
         };
-        if let (Some(start), Some(kind)) = (self.loops.remove(&id), kind) {
+        let replayed = self.replays.remove(&id);
+        if let (Some(start), Some(kind)) = (self.loops.remove(&id), kind)
+            && !replayed
+        {
             let key = self.key(id);
             self.predict.observe(kind, key, ns(at).saturating_sub(start), 0);
         }
@@ -771,6 +814,16 @@ impl<W: Work, P: Predict> Plane<W, P> {
             self.happened.push(Happened::Started { id: task.id });
         }
         self.runner.post(task, work, readers);
+    }
+
+    /// Node `id`'s task replays what was kept (its unit is fresh: its record is in the store),
+    /// so its run teaches the predictor nothing, neither its key nor its kind: a replay's
+    /// near-zero time and peak are not what the work they predict takes, and a few warm
+    /// builds would otherwise bring a unit's prediction to nothing for the build that really
+    /// compiles it. Said before its task can end: before a thread task is posted
+    /// ([`Plane::post`]), before a loop task is [`Plane::ended`].
+    pub fn replays(&mut self, id: NodeId) {
+        self.replays.insert(id);
     }
 
     /// A thread task of [`Happened::Post`] the loop has no readers for: it ends failed.
@@ -806,7 +859,9 @@ impl<W: Work, P: Predict> Plane<W, P> {
             };
             let key = self.key(id);
             let peak = self.learned(id, task.kind, key, peak);
-            self.predict.observe(task.kind, key, ran_ns, peak);
+            if !self.replays.remove(&id) {
+                self.predict.observe(task.kind, key, ran_ns, peak);
+            }
             let input = PlaneInput::Done { at_ns: ns(at), id, outcome, added: Vec::new(), group: None, peak };
             self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of task {id}: {error}"));
         }
@@ -841,6 +896,11 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// How many loop tasks run ([`Happened::Run`], not yet [`Plane::ended`]).
     pub fn loops_running(&self) -> usize {
         self.loops.len()
+    }
+
+    /// Whether `id` is a loop task that runs ([`Happened::Run`], not yet [`Plane::ended`]).
+    pub fn loop_runs(&self, id: NodeId) -> bool {
+        self.loops.contains_key(&id)
     }
 
     /// Each node of an open request that has not settled, to `each`, in no order.

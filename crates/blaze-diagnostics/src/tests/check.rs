@@ -1,7 +1,7 @@
 //! The driver over whole crates: every error of every file given, whatever was edited, and
 //! rustc's abort before its late passes.
 
-use super::{assert_reports, checked, error, ui};
+use super::{assert_reports, checked, checked_appending, error, ui};
 use crate::emit::Style;
 
 /// #1522: an error in a `#[cfg(test)]` module is an error of the crate built for tests.
@@ -148,4 +148,25 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0539`.
 "#);
+}
+
+/// The module blaze appends to a crate root (a wasm proc macro's glue, a test harness) is the
+/// compiler's own code, as rustc's injected harness is: the crate's lint levels, a `forbid`
+/// included, give no lint in it. Linted, a proc macro with `#![forbid(unsafe_code)]` failed on
+/// the glue's `unsafe`, at a place past the end of its file on disk.
+#[test]
+fn no_lint_is_given_in_the_module_the_compiler_appends() {
+    let fixture = r#"
+//- /lib.rs crate:other:main
+#![forbid(unsafe_code)]
+pub fn f() {}
+pub mod __appended {
+    pub fn g() {
+        unsafe {}
+    }
+}
+"#;
+    let unsafe_code = |messages: Vec<String>| messages.into_iter().filter(|it| it.starts_with("unsafe_code")).count();
+    assert_eq!(unsafe_code(checked(fixture).messages()), 1, "the module written in the file is linted");
+    assert_eq!(unsafe_code(checked_appending(fixture, "__appended").messages()), 0, "the appended module is not");
 }

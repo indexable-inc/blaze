@@ -61,6 +61,7 @@ hir-def.workspace = true
 hir-ty-comptime.workspace = true
 hir-expand.workspace = true
 base-db.workspace = true
+blaze-graph.workspace = true
 syntax.workspace = true
 span.workspace = true
 target-features.workspace = true
@@ -71,7 +72,6 @@ blaze-check.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-blaze-graph.workspace = true
 crossbeam-channel.workspace = true
 expect-test.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }

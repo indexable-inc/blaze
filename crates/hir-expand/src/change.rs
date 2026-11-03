@@ -17,7 +17,7 @@ impl ChangeWithProcMacros {
     /// proc macros it carries are both set, and a change setting a crate graph needs no
     /// [`ProcMacros`] input made before it.
     pub fn apply(self, db: &mut Db) -> Option<CratesIdMap> {
-        db.batch(|db| {
+        db.batch(base_db::Trigger::named("Change::apply"), |db| {
             if self.source_change.crate_graph.is_some() && ProcMacros::try_get(db).is_none() {
                 ProcMacros::init_default(db, Durability::HIGH);
             }

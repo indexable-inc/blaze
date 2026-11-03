@@ -446,12 +446,29 @@ local account in. With `IX_PROF`, the address and the token are written to
 `<IX_PROF>/http.endpoint`: one 0600 file, `<addr>\n<token>\n`, renamed into place whole so a
 reader never pairs a new token with an old address, and removed at stop if it still holds this
 session's token. stderr then says where the file is, not the token; without `IX_PROF` the
-stderr line carries the token (`…/live?token=<token>`). The directory must be this user's own:
-ix-prof makes it 0700 if missing and refuses, at start, one that is a symbolic link, belongs
-to another user or has any group or other mode bits, never changing its mode. Clients
-(`blaze pprof --dir`, `--token-file`) apply the same directory rule, read only this user's own
-regular 0600 file of at most 64 bytes (never through a link, never a FIFO), require a loopback
-address, and send the token only to that address. A client sends it as
+stderr line carries the token (`…/live?token=<token>`). The directory must be this user's own,
+with owner-only mode and no ACL, on a local volume that keeps ownership and that this user or
+root mounted: ix-prof makes it 0700
+if missing and refuses, at start, one that is a symbolic link (trailing `/` and `.` stripped
+first), belongs to another user, has any group or other mode bits, has an ACL entry (on macOS,
+`acl_get_fd_np(ACL_TYPE_EXTENDED)` with an entry, which a directory inherits from a parent
+another user owns; on Linux, a `system.posix_acl_access` attribute, or on the directory a
+`system.posix_acl_default` one), or sits on a volume `fstatfs` shows ignoring ownership
+(macOS `MNT_IGNORE_OWNERSHIP`), mounted by another user (macOS `f_owner` neither this user nor
+root) or not local (macOS: no `MNT_LOCAL`; Linux: NFS, SMB, CIFS, SMB2, AFS or Coda by magic), or
+on a Linux FUSE mount (`FUSE_SUPER_MAGIC`) whose `/proc/self/mountinfo` line, found by
+`statx(STATX_MNT_ID)` and checked against the descriptor's device, shows neither `user_id` of
+this user with no `allow_other` or with `default_permissions` (counted only when this user is
+root or `/proc/self/uid_map` is exactly `0 0 4294967295`, since `user_id` is in the mounter's
+user namespace), nor `user_id=0` with `default_permissions` on a type that is not a network
+store (`fuse.sshfs`, `fuse.s3fs`, `fuse.rclone`, `fuse.gcsfuse`, `fuse.goofys`, `fuse.juicefs`,
+`fuse.davfs`), nor type `virtiofs`; never changing its mode or ACL. On macOS, once the owner
+check passes, it calls `fchown(fd, geteuid(), -1)` on the directory and refuses on error, which
+turns a directory stored as uid 99 (shown as owned by whoever asks) into this user's own. Clients (`blaze pprof
+--dir`, `--token-file`) apply the same directory rule, read only this user's own regular 0600
+file with no ACL, of at most 64 bytes (never through a link, never a FIFO), require a loopback
+IP address and port (for `--token-file`, the source URL's), and send the token only to that
+address. A client sends it as
 `Authorization: Bearer <token>`; a browser, which cannot set the header on the explorer's
 fetches, as `token=<token>` in the query. A token on a command line is readable by every local
 user (`ps`), so non-browser clients read it from `http.endpoint`. The server
@@ -578,8 +595,8 @@ so the live view can backfill a zoomed range or a gap from the retention ring.
   loopback (CORS and the Host check as above, and a new token per run that every request must
   carry, `token=` or `Authorization: Bearer`), then opens
   `https://ix.dev/explore#profile=<url-encoded http://127.0.0.1:PORT/profile.ixprof?token=TOKEN>`
-  through a 0600 page in a new 0700 temporary directory (the browser's command line holds the
-  page's path, not the token).
+  through a 0600 page in a new 0700 temporary directory, checked by the same rule as
+  `http.endpoint`'s (the browser's command line holds the page's path, not the token).
   The explorer fetches that URL, parses the container (2) and draws it.
 - The explorer may also accept a dropped/picked `.ixprof` file, and a URL to a live
   `/debug/pprof/ixprof?seconds=N` endpoint.

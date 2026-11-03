@@ -119,11 +119,13 @@ pub struct QueryCount {
 /// The daemon's heap (`live bytes`) and footprint around the build, in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Memory {
-    /// The last `live bytes` before the build began: what the daemon held after the build before.
+    /// The last `live bytes` as the build before ended: what the daemon held after it.
     pub live_before: Option<i64>,
     /// The first `live bytes` in the build's window.
     pub live_first: Option<i64>,
     pub live_peak: Option<i64>,
+    /// The least `live bytes` in the build's window.
+    pub live_least: Option<i64>,
     pub footprint_peak: Option<i64>,
 }
 
@@ -394,7 +396,7 @@ impl<'a> Ctx<'a> {
         let busy = Steps::of(workers.iter().map(|it| it.1.as_slice()));
         let (workers, running): (Vec<_>, Vec<_>) = workers.into_iter().unzip();
 
-        let path_ran = path_segments(model, path);
+        let path_ran = crate::time::path::segments(model, path);
         let lost: i64 = path.links.iter().filter(|it| it.kind == LinkKind::Unrecorded).map(Link::dur_ns).sum();
         let path_trusted = matches!(path.reached, Reached::BuildStart) && lost * 5 < path.len_ns().max(1);
         Ctx { model, path, facts, workers, running, busy, path_ran, path_trusted }
@@ -458,7 +460,7 @@ impl<'a> Ctx<'a> {
             group.busy_ns += i128::from(self.busy.integral(from, to));
             if let Some(span) = span {
                 // alloc: an example, once a span a report
-                let subject = model.spans[span].subject().unwrap_or("").to_owned();
+                let subject = subject_of(model, span).unwrap_or("").to_owned();
                 group.subjects.push((subject, ns));
                 group.spans.push(span);
                 let root = model.root_of(span);
@@ -482,7 +484,7 @@ impl<'a> Ctx<'a> {
             // alloc: a finding's evidence
             let mut evidence = Vec::new();
             let count = group.spans.len();
-            if !subjects.is_empty() {
+            if subjects.iter().any(|it| !it.0.is_empty()) {
                 evidence.push(format!("of {count} spans on the path: {}", list(&subjects)));
             }
             if !roots.is_empty() {
@@ -626,6 +628,8 @@ impl<'a> Ctx<'a> {
             on_path: Vec<(i64, i64)>,
             stretches: Vec<(i64, i64)>,
             owners: Vec<(String, i64)>,
+            /// The packages a class over many (`scope of unit codegen (build script)`) was of.
+            of: Vec<(String, i64)>,
             known: u64,
             named: bool,
             moved: bool,
@@ -664,12 +668,23 @@ impl<'a> Ctx<'a> {
             if of_wait[w] == 0 {
                 continue;
             }
-            let class = classes.entry(report::wait_class(model, wait)).or_default();
+            // A wait with no `awaits` is classed by its kind alone: its value says nothing a
+            // reader can act on, and one row per value would bury the rest.
+            let named = wait.span.and_then(|it| model.spans[it].awaits.as_deref()).is_some();
+            let (class, of) = match named {
+                true => by_package(report::wait_class(model, wait)),
+                // alloc: a row's key
+                false => (format!("{} with no awaits", wait.on.map_or("span", |it| it.name())), None),
+            };
+            let class = classes.entry(class).or_default();
+            if let Some(of) = of {
+                class.of.push((of, of_wait[w]));
+            }
             class.count += 1;
             class.ns += of_wait[w];
             class.on_path.append(&mut path_of_wait[w]);
             class.stretches.append(&mut stretches[w]);
-            class.named |= wait.span.and_then(|it| model.spans[it].awaits.as_deref()).is_some();
+            class.named |= named;
             class.moved |= wait.on == Some(crate::flight::WaitedOn::Moved);
             if let Some(lane) = wait.waker.lane() {
                 class.known += 1;
@@ -695,7 +710,7 @@ impl<'a> Ctx<'a> {
             let idle = (1.0 - busy as f64 / (workers as f64 * wall.max(1) as f64)).clamp(0.0, 1.0);
             let owners = top(&mut class.owners);
             let mut evidence = vec![format!(
-                "{} waits, {} of thread time, {} of wall with one or more waiting, {:.0}% of workers idle meanwhile",
+                "{} waits, {} of job time, {} of wall with one or more waiting, {:.0}% of workers idle meanwhile",
                 class.count,
                 s(class.ns),
                 s(wall),
@@ -703,6 +718,9 @@ impl<'a> Ctx<'a> {
             )];
             if on_path > 0 {
                 evidence.push(format!("{} of it on the critical path", s(on_path)));
+            }
+            if !class.of.is_empty() {
+                evidence.push(format!("of: {}", list(&top(&mut class.of))));
             }
             match owners.is_empty() {
                 false => evidence.push(format!("woken by: {}", list(&owners))),
@@ -712,7 +730,7 @@ impl<'a> Ctx<'a> {
                 blind.push(BlindSpot {
                     kind: BlindKind::UnnamedWait,
                     hidden_ns: class.ns,
-                    title: format!("waits on `{name}` say nothing of what they wait for: {} of thread time", s(class.ns)),
+                    title: format!("waits on `{name}` say nothing of what they wait for: {} of job time", s(class.ns)),
                     subject: name,
                     evidence,
                     fix: "open a `wait` span naming the awaited key, lock, channel or child, and its owner (rule 13)".to_owned(),
@@ -723,7 +741,7 @@ impl<'a> Ctx<'a> {
                 blind.push(BlindSpot {
                     kind: BlindKind::OwnerlessWait,
                     hidden_ns: class.ns,
-                    title: format!("waits on `{name}` never name who runs what they wait for: {} of thread time", s(class.ns)),
+                    title: format!("waits on `{name}` never name who runs what they wait for: {} of job time", s(class.ns)),
                     // clone: a blind spot's subject
                     subject: name.clone(),
                     // clone: its evidence, also the finding's
@@ -839,6 +857,7 @@ impl<'a> Ctx<'a> {
                 kind.query_kind.as_deref() == Some(it.query.as_str())
                     || kind.name == it.query
                     || it.query.strip_suffix(kind.name.as_str()).is_some_and(|rest| rest.ends_with("::"))
+                    || kind.name.strip_suffix("_query").is_some_and(|name| it.query.rsplit("::").next() == Some(name))
             });
             let per_run = kind.filter(|it| it.runs > 0).map(|it| it.self_cpu_ns as f64 / it.runs as f64);
             let cost = |runs: u64| per_run.map_or(0, |per| (per * runs as f64 / parallelism) as i64);
@@ -907,9 +926,16 @@ impl<'a> Ctx<'a> {
     /// The daemon's heap fell by most of itself between the build before and this one.
     fn shed(&self, out: &mut Vec<Finding>) {
         let memory = self.facts.memory;
-        let (Some(before), Some(first)) = (memory.live_before, memory.live_first) else { return };
+        // What the daemon held coming in (as the build before ended, or as this one began), against
+        // the least it held during this one: the database let go between builds or at a build's
+        // start is computed again.
+        let Some(least) = memory.live_least else { return };
+        let Some(before) = memory.live_before.max(memory.live_first) else { return };
+        let first = least;
         const MIB: f64 = 1024.0 * 1024.0;
-        if before - first < 256 * 1024 * 1024 || first * 2 > before {
+        // Shed: more than a GiB, or more than half of a heap of 256 MiB or more.
+        let dropped = before - first;
+        if dropped <= 1 << 30 && (dropped < 256 << 20 || first * 2 > before) {
             return;
         }
         out.push(Finding {
@@ -920,7 +946,7 @@ impl<'a> Ctx<'a> {
             subject: "live bytes".to_owned(),
             owner: Some("blaze_cargo::serve".to_owned()),
             title: format!(
-                "shed: the daemon held {:.0} MiB after the build before and {:.0} MiB as this one began",
+                "shed: the daemon held {:.0} MiB coming into the build and fell to {:.0} MiB during it",
                 before as f64 / MIB,
                 first as f64 / MIB
             ),
@@ -997,7 +1023,7 @@ impl<'a> Ctx<'a> {
         let running: i64 = self.running.iter().flatten().map(|it| it.1 - it.0).sum();
         let cpu: i64 = self.facts.span_kinds.iter().map(|it| it.self_cpu_ns).sum();
         let uncounted = model.spans.iter().filter(|it| it.self_cpu_ns.is_none()).count();
-        if running > 0 && (cpu * 2 < running || uncounted > 0) {
+        if running > 0 && cpu * 2 < running {
             let mut evidence = vec![format!(
                 "the pool's switches say workers ran {}; spans counted {} of CPU ({:.0}%)",
                 s(running),
@@ -1193,72 +1219,6 @@ impl Steps {
     }
 }
 
-/// The critical path's running links cut by the innermost span open on their lane: (from, to,
-/// span, lane), in path order.
-fn path_segments(model: &Model, path: &Path) -> Vec<(i64, i64, Option<usize>, usize)> {
-    let mut cuts: HashMap<usize, Vec<(i64, i64, usize)>, Global> = HashMap::new_in(Global);
-    // alloc: once a report
-    let mut out = Vec::new();
-    for link in path.links.iter().filter(|it| it.kind == LinkKind::Ran) {
-        // alloc: a lane's cut, once a lane on the path
-        let cut = cuts.entry(link.lane).or_insert_with(|| innermost(model, link.lane));
-        let mut t = link.from_ns;
-        let at = cut.partition_point(|it| it.1 <= link.from_ns);
-        for &(from, to, span) in &cut[at..] {
-            if from >= link.to_ns {
-                break;
-            }
-            let (from, to) = (from.max(link.from_ns), to.min(link.to_ns));
-            if from > t {
-                out.push((t, from, None, link.lane));
-            }
-            if to > from {
-                out.push((from, to, Some(span), link.lane));
-            }
-            t = t.max(to);
-        }
-        if t < link.to_ns {
-            out.push((t, link.to_ns, None, link.lane));
-        }
-    }
-    out
-}
-
-/// A lane's time cut by the innermost of its spans open, end to end where spans are: (from, to,
-/// span), sorted, none overlapping.
-fn innermost(model: &Model, lane: usize) -> Vec<(i64, i64, usize)> {
-    let spans = &model.spans;
-    // alloc: a lane's cut, once a lane on the path
-    let mut out: Vec<(i64, i64, usize)> = Vec::new();
-    let mut open: Vec<usize> = Vec::new();
-    let mut t = i64::MIN;
-    let emit = |out: &mut Vec<(i64, i64, usize)>, from: i64, to: i64, span: usize| {
-        if to > from {
-            out.push((from, to, span));
-        }
-    };
-    for &i in &model.lanes[lane].spans {
-        let start = spans[i].start_ns;
-        while let Some(&top) = open.last()
-            && spans[top].end_ns() <= start
-        {
-            emit(&mut out, t, spans[top].end_ns(), top);
-            t = t.max(spans[top].end_ns());
-            open.pop();
-        }
-        if let Some(&top) = open.last() {
-            emit(&mut out, t, start, top);
-        }
-        t = t.max(start);
-        open.push(i);
-    }
-    while let Some(top) = open.pop() {
-        emit(&mut out, t, spans[top].end_ns(), top);
-        t = t.max(spans[top].end_ns());
-    }
-    out
-}
-
 /// What `lane` was doing at `t`: the innermost span of the interval there, in its outermost.
 fn doing_at(model: &Model, lane: usize, t: i64) -> String {
     let lane_ = &model.lanes[lane];
@@ -1266,18 +1226,65 @@ fn doing_at(model: &Model, lane: usize, t: i64) -> String {
         .at_or_before(t)
         .and_then(|i| lane_.intervals[i].inside)
         .or_else(|| lane_.spans.iter().copied().find(|&i| model.parent[i].is_none()));
-    match span {
-        Some(span) => {
-            let root = model.root_of(span);
-            match root == span {
-                true => model.spans[span].item(),
-                // alloc: a label
-                false => format!("{} in {}", model.spans[span].item(), model.spans[root].name),
-            }
-        }
+    let Some(span) = span else {
         // alloc: a label
-        None => lane_.id.to_string(),
+        return lane_.id.to_string();
+    };
+    let root = model.root_of(span);
+    let label = |i: usize| -> String {
+        let it = &model.spans[i];
+        match (it.name.as_str(), subject_of(model, i)) {
+            // A `job` span names its closure's whole type: say the code it runs instead.
+            // alloc: a label
+            ("job", Some(function)) => format!("job of {}", code_in(function)),
+            // alloc: a label
+            (name, Some(of)) => format!("{name} {of}"),
+            // alloc: a label
+            (name, None) => name.to_owned(),
+        }
+    };
+    match root == span {
+        true => label(span),
+        // alloc: a label
+        false => format!("{} in {}", label(span), model.spans[root].name),
     }
+}
+
+/// `class` with the package and version it names taken out, and them: `scope of unit codegen
+/// serde v1.0.214 (build script)` is `scope of unit codegen (build script)`, of `serde v1.0.214`.
+fn by_package(class: String) -> (String, Option<String>) {
+    let words: Vec<&str> = class.split(' ').collect();
+    let version = |it: &str| it.strip_prefix('v').is_some_and(|it| it.starts_with(|c: char| c.is_ascii_digit()) && it.contains('.'));
+    match words.iter().skip(1).position(|it| version(it)).map(|it| it + 1) {
+        Some(at) => {
+            let of = format!("{} {}", words[at - 1], words[at]);
+            let rest: Vec<&str> = words.iter().enumerate().filter(|(i, _)| *i + 1 != at && *i != at).map(|it| *it.1).collect();
+            (rest.join(" "), Some(of))
+        }
+        None => (class, None),
+    }
+}
+
+/// What a span is about: its own subject, else its nearest ancestor's.
+fn subject_of(model: &Model, mut span: usize) -> Option<&str> {
+    for _ in 0..=model.spans.len() {
+        if let Some(it) = model.spans[span].subject() {
+            return Some(it);
+        }
+        span = model.parent[span]?;
+    }
+    None
+}
+
+/// The first path in a type name that is not the scheduler's or the query engine's plumbing:
+/// `hir_def::nameres::facts::collect::expand_all` out of a pool job's closure type.
+fn code_in(function: &str) -> &str {
+    const PLUMBING: [&str; 8] = ["blaze_graph::", "blaze_query::", "base_db::db::", "core::", "std::", "alloc::", "{{closure}}", "impl "];
+    function
+        .split(['<', '>', ',', ' ', '&', '(', ')'])
+        .map(|it| it.trim_end_matches("::{{closure}}").trim_matches(':'))
+        .find(|it| it.contains("::") && !PLUMBING.iter().any(|p| it.starts_with(p)))
+        .unwrap_or(function)
 }
 
 /// `items` summed by name, the [`EXAMPLES`] largest, largest first (ties by name).

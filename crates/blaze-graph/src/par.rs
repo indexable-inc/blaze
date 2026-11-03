@@ -58,8 +58,8 @@ pub unsafe trait Source: Sync {
 
     /// Whether an index may be taken again once the call that took it unwound: a borrowed
     /// item may, as nothing of the first is left; an owned one may not, as the unwind dropped
-    /// it. A loop runs an item that gave way ([`crate::Cancelled`] for a cycle) on another
-    /// worker again on its caller's thread only when this holds.
+    /// it. A loop runs an item that gave way ([`crate::Cancelled`] for a cycle), on any of its
+    /// threads, again on its caller's thread after the loop only when this holds.
     const AGAIN: bool = false;
 
     fn len(&self) -> usize;
@@ -530,10 +530,14 @@ pub fn for_each_giving_way(
 /// Runs `run` over ranges that cover `0..len` once, each with the state its thread's
 /// `init` made (once per thread that claims a range), on the pool a loop called here runs on.
 ///
-/// With `again` (the items' [`Source::AGAIN`]), an item that gave way on another worker (its
-/// wait would close a cycle through a task that waits for this loop) is run once more on this
-/// thread after the loop, where it meets that cycle on its own stack, rather than failing the
-/// loop. An item that gives way on this thread gives way for the caller, as any panic does.
+/// With `again` (the items' [`Source::AGAIN`]), each item is run on its own, and one that gave
+/// way (its wait would close a cycle through a task that waits for this loop, or through what
+/// this loop's own items hold) is run once more on this thread after the loop, in index order,
+/// where it meets that cycle on its own stack, rather than failing the loop. That holds on
+/// every thread of the loop, this caller's too, and for a loop of one job, which runs here
+/// alone: an item knows it will run again exactly when its unwind counted a give-way
+/// ([`pump::gave_way`]), wherever it ran. A rerun that gives way again, and any other panic,
+/// goes on to the caller (the first other panic once every thread stopped claiming).
 fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn(&mut St, Range<usize>) + Sync) {
     if len == 0 {
         return;
@@ -541,7 +545,7 @@ fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn
     let threads = pool::threads_here();
     let grain = len.div_ceil(threads * RANGES).max(1);
     let jobs = len.div_ceil(grain).min(threads);
-    if jobs <= 1 {
+    if jobs <= 1 && !again {
         run(&mut init(), 0..len);
         return;
     }
@@ -550,7 +554,7 @@ fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn
     // dyn: a panic's payload, as `catch_unwind` gives it
     let panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
     let gave: SegQueue<usize> = SegQueue::new();
-    let claim = |here: bool| {
+    let claim = || {
         let mut state = None;
         while !failed.load(Ordering::Relaxed) {
             let at = next.fetch_add(grain, Ordering::Relaxed);
@@ -558,7 +562,7 @@ fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn
                 break;
             }
             let range = at..(at + grain).min(len);
-            if here || !again {
+            if !again {
                 run(state.get_or_insert_with(&init), range);
                 continue;
             }
@@ -581,12 +585,18 @@ fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn
             panic.lock_said("a loop's first panic").get_or_insert(it);
         }
     };
-    pool::scope_here(|scope| {
-        for _ in 1..jobs {
-            scope.submit(None, || claim(false), &caught);
-        }
-        caught(catch_unwind(AssertUnwindSafe(|| claim(true))));
-    });
+    if jobs <= 1 {
+        // One job: this thread claims every range, catching each item's give-way as a worker
+        // does, with no scope to open.
+        caught(catch_unwind(AssertUnwindSafe(&claim)));
+    } else {
+        pool::scope_here(|scope| {
+            for _ in 1..jobs {
+                scope.submit(None, &claim, &caught);
+            }
+            caught(catch_unwind(AssertUnwindSafe(&claim)));
+        });
+    }
     if let Some(it) = panic.into_inner() {
         resume_unwind(it);
     }
@@ -929,6 +939,66 @@ mod tests {
         let (made, runs) = rx.recv_timeout(LONG).expect("the loop ends");
         assert_eq!(made, (0..64).map(|it| it * 2).collect::<Vec<_>>());
         assert!(runs.iter().all(|&it| it == 1 || it == 2), "{runs:?}");
+    }
+
+    /// sched3's C4: an item that gives way on the loop's caller thread, or on the one thread of
+    /// a loop of one job, is caught as a worker's is and run again after the loop, in index
+    /// order, rather than unwinding the whole loop with no item named. On a pool of one
+    /// worker every item runs here; on a pool of two the caller's own ranges do.
+    #[test]
+    fn an_item_that_gives_way_on_the_callers_thread_runs_again_after_the_loop() {
+        for workers in [1, 2] {
+            let pool = Pool::new(&Topology::flat(workers), false).unwrap();
+            let (made, runs, reruns) = pool.install(|| {
+                let caller = std::thread::current().id();
+                let runs: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(0)).collect();
+                let gave: Vec<AtomicBool> = (0..64).map(|_| AtomicBool::new(false)).collect();
+                let reruns = Mutex::new(Vec::new());
+                let made = super::map(0..64, |at| {
+                    runs[at].fetch_add(1, Ordering::Relaxed);
+                    if gave[at].load(Ordering::Relaxed) {
+                        reruns.lock().push(at);
+                    } else if std::thread::current().id() == caller {
+                        gave[at].store(true, Ordering::Relaxed);
+                        _ = crate::pump::give_way();
+                        std::panic::resume_unwind(Box::new("gave way on the caller"));
+                    }
+                    at * 2
+                });
+                let runs: Vec<usize> = runs.iter().map(|it| it.load(Ordering::Relaxed)).collect();
+                (made, runs, reruns.into_inner())
+            });
+            assert_eq!(made, (0..64).map(|it| it * 2).collect::<Vec<_>>(), "{workers} workers");
+            assert!(!reruns.is_empty(), "{workers} workers: no item ran on the caller to give way");
+            assert!(reruns.is_sorted(), "{workers} workers: reruns in index order: {reruns:?}");
+            for (at, &ran) in runs.iter().enumerate() {
+                let want = if reruns.contains(&at) { 2 } else { 1 };
+                assert_eq!(ran, want, "{workers} workers: item {at} ran {ran} times: {runs:?}");
+            }
+            if workers == 1 {
+                assert_eq!(reruns, (0..64).collect::<Vec<_>>(), "one worker runs every item here");
+            }
+        }
+    }
+
+    /// A loop of one job whose item panics for any other reason (no give-way counted) unwinds
+    /// to the caller with that panic, its item never run again.
+    #[test]
+    fn an_item_of_a_one_job_loop_that_panics_reaches_the_caller() {
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let runs = AtomicUsize::new(0);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.install(|| {
+                super::for_each(0..8, |at| {
+                    runs.fetch_add(1, Ordering::Relaxed);
+                    if at == 3 {
+                        std::panic::resume_unwind(Box::new("item 3 failed"));
+                    }
+                })
+            })
+        }));
+        assert_eq!(caught.unwrap_err().downcast_ref::<&str>(), Some(&"item 3 failed"));
+        assert_eq!(runs.load(Ordering::Relaxed), 4, "the loop stops claiming at the failure, and reruns nothing");
     }
 
     /// self10's livelock: a task that runs a key gives a batch whose every task asks for that

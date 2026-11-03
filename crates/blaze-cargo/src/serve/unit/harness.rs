@@ -30,15 +30,16 @@ use super::{Job, codegen, graph::Waits, lower_error};
 ///
 /// A crate that reaches a proc macro whose expanders are not loaded yet is left: what its
 /// attributes expand to (a `#[tokio::test]`'s `#[test]`, a function of the root) is not listed
-/// until they are, and [`macros_applied`] writes it then. Its unit's identity was set before;
+/// until they are, and [`reached`] has it written then. Its unit's identity was set before;
 /// the module is made from what that identity covers and the unit's mode and panic strategy,
 /// which its record key covers, so the key stays true.
 ///
 /// Each harness takes the panic strategy of its profile and the mode of its codegen policy
 /// ([`codegen::policy`]), which a unit's build is compiled with. Two units of one crate that
 /// want different modules are refused naming both ([`Lowered::append_roots`]), as is a module
-/// that can't be made, naming its crate.
-pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<Item = u32>) -> Result<(), ApiError> {
+/// that can't be made, naming its crate. A refusal is that unit's alone: the error lists each
+/// unit refused with why, and every other unit's root is written.
+pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<Item = u32>) -> Result<(), Vec<(usize, ApiError)>> {
     let paths = Arc::clone(lowered.paths());
     let appended = units.into_iter().filter(|&unit| tested(job, unit as usize) || codegen::wasm_macro(job, unit as usize));
     let made = lowered.append_roots(appended, |db, unit, krate| {
@@ -64,32 +65,56 @@ pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<I
         // front end keeps of a root that `#![cfg]` takes away.
         Ok(Some(Appended { after: harness, module: HARNESS_MODULE }))
     });
-    made.map(drop).map_err(lower_error)
+    // alloc: an error, once per unit refused
+    made.map(drop).map_err(|refused| refused.into_iter().map(|(unit, error)| (unit, lower_error(error))).collect())
 }
 
-/// The harnesses the proc macros `loaded` (their units, just applied) complete: of every unit
-/// that is ready and reaches one of them through its dependents ([`write`]). A unit not ready
-/// yet is written when it is.
-pub(super) fn macros_applied(lowered: &mut Lowered, job: &Job, waits: &Waits, loaded: &[u32]) -> Result<(), ApiError> {
+/// The units [`write`] refused, each with why, as one error naming every one: what a write
+/// with no unit to charge a refusal to (the lowering's) fails with.
+pub(super) fn refused(refused: Vec<(usize, ApiError)>) -> ApiError {
+    let at = refused.first().and_then(|(_, error)| error.at.clone()); // clone: an error, once
+    let each = refused
+        .iter()
+        .map(|(_, error)| match &error.at {
+            Some(at) => format!("{} (at {at})", error.what), // alloc: an error, once per unit
+            None => error.what.clone(),                     // clone: an error, once per unit
+        })
+        .collect::<Vec<_>>() // alloc: an error, once
+        .join("; ");
+    ApiError::new(format!("writing the crate roots' harnesses: {each}"), at) // alloc: an error, once
+}
+
+/// The units whose harness one apply writes: `ready`, the units its runs made ready, then
+/// every unit that is ready and reaches one of the proc macros `loaded` (their units, just
+/// applied) through its dependents, which those macros complete ([`write`]), each once. A
+/// unit not ready yet is written when it is.
+pub(super) fn reached(job: &Job, waits: &Waits, loaded: &[u32], ready: &[u32]) -> Vec<u32> {
+    // alloc: once an apply, the units it writes harnesses of
+    let mut written: Vec<u32> = ready.to_vec();
     if loaded.is_empty() {
-        return Ok(());
+        return written;
     }
     // alloc: once an apply that loaded proc macros, the units they reach
     let mut seen = vec![false; job.graph.len()];
+    for &unit in ready {
+        seen[unit as usize] = true;
+    }
     let mut stack: Vec<u32> = loaded.to_vec(); // alloc: as `seen`
     let mut reached = Vec::new(); // alloc: as `seen`
+    let mut visited = vec![false; job.graph.len()]; // alloc: as `seen`
     while let Some(at) = stack.pop() {
         for &up in job.graph.dependents(at) {
-            if !std::mem::replace(&mut seen[up as usize], true) {
+            if !std::mem::replace(&mut visited[up as usize], true) {
                 stack.push(up);
-                if waits.ready(up) {
+                if waits.ready(up) && !seen[up as usize] {
                     reached.push(up);
                 }
             }
         }
     }
     radix::sort_by_key(&mut reached, |&it| u64::from(it));
-    write(lowered, job, reached)
+    written.extend(reached);
+    written
 }
 
 /// Whether `unit`'s crate is built with `cfg(test)`, as blaze-lower makes it: a test, or a check

@@ -138,7 +138,7 @@ pub fn fix(db: &mut Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -
             applied += taken.len();
             made.push((file, appended, working));
         }
-        db.batch(|db| {
+        db.batch(base_db::Trigger::named("lint fixes applied"), |db| {
             for (file, _, working) in &made {
                 db.set_file_text(*file, working.bytes());
             }
@@ -226,7 +226,7 @@ fn settled(
         error: error.message.clone(),
         by: by.into_iter().collect(),
     };
-    db.batch(|db| {
+    db.batch(base_db::Trigger::named("lint fixes undone"), |db| {
         for (file, text) in originals {
             if fixed.files.iter().any(|(it, _)| it == file) {
                 db.set_file_text(*file, text);

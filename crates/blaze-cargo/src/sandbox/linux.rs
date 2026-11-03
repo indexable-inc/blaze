@@ -868,9 +868,16 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
     let mut writable = spec.writable.clone();
     // alloc: as `writable` is.
     writable.push(scratch.to_owned());
+    // A writable entry that is not there is a directory, made here; one that is there is what
+    // a sandbox in namespaces may write ([`Passed::open`]): Landlock would give a socket, a pipe
+    // or a device the rights of a file it writes.
     for dir in &spec.writable {
-        // alloc: the error, once, and no sandbox is made.
-        std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+        match std::fs::metadata(dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir)
+                // alloc: the error, once, and no sandbox is made.
+                .map_err(|error| format!("{}: {error}", dir.display()))?,
+            _ => drop(Passed::open(dir, Given::Write)?),
+        }
     }
     landlock::restrict(&writable, made.network)?;
     let cwd = c(&spec.cwd);
@@ -1044,6 +1051,17 @@ mod landlock {
             };
             let stat = super::raw::stat_of(fd.as_raw_fd());
             let is_dir = stat.is_some_and(|it| it.st_mode & libc::S_IFMT == libc::S_IFDIR);
+            let is_file = stat.is_some_and(|it| it.st_mode & libc::S_IFMT == libc::S_IFREG && it.st_nlink == 1);
+            // A writable entry checked by its path before ([`super::Passed::open`]) is still
+            // checked by what was opened here: no device, pipe, socket or linked file.
+            if required && !(is_dir || is_file) {
+                // alloc: the error, once, and no sandbox is made.
+                return Err(format!(
+                    "the writable entry {} is not a directory or a regular file with one link \
+                     as it is opened for Landlock",
+                    path.display()
+                ));
+            }
             // A device's directory (`/dev/pts`) is given what its devices are.
             let allowed = if is_dir && required { dir } else { file };
             let rule = PathBeneath { allowed_access: allowed, parent_fd: fd.as_raw_fd() };
@@ -1072,9 +1090,136 @@ mod landlock {
     }
 }
 
+/// How a sandbox is given an entry of its spec.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Given {
+    /// [`Spec::readable`]: seen as it is, read-only.
+    Read,
+    /// [`Spec::writable`]: written for real.
+    Write,
+}
+
+impl Given {
+    fn name(self) -> &'static str {
+        match self {
+            Given::Read => "readable",
+            Given::Write => "writable",
+        }
+    }
+
+    /// How the entries that can cover one given so are given.
+    fn other(self) -> Given {
+        match self {
+            Given::Read => Given::Write,
+            Given::Write => Given::Read,
+        }
+    }
+}
+
+/// A readable or writable entry of a sandbox ([`Spec::readable`], [`Spec::writable`]), opened
+/// before anything is made read-only or hidden. Whether it is a directory is what its
+/// descriptor says (`fstat`), never what its path looks like: a file (the launcher a build
+/// script runs through) or a socket (a test's fork server's) is mounted on a file, a directory
+/// on a directory.
+struct Passed {
+    fd: OwnedFd,
+    dir: bool,
+    /// Where the descriptor is, its links followed and no `..` left (`/proc/self/fd/N`): what
+    /// the order of the binds is made by, never the spelling the spec gave.
+    real: PathBuf,
+}
+
+impl Passed {
+    /// `at`, given as `given` says, when it is what such an entry may be:
+    /// - a directory;
+    /// - a regular file, and when it is written one with no other link (a write to it would
+    ///   reach every other name of the file, wherever that is);
+    /// - when it is read, a Unix socket: one it is handed to connect to (a test's fork
+    ///   server's), which the supervisor lets it reach by that exact path alone
+    ///   ([`super::Recorder::may_connect`]).
+    ///
+    /// Anything else is refused, naming it: a pipe or a device is written through a read-only
+    /// mount, and a written socket, pipe or device is no file the sandbox writes into. This
+    /// looks at the entry itself, not at what is in a directory: a pipe or a socket made below
+    /// a readable directory is reached through it as the directory has it (a device is not,
+    /// its mount being `nodev`).
+    fn open(at: &Path, given: Given) -> Result<Passed, String> {
+        let what = given.name();
+        let Some(fd) = raw::open(&c(at), libc::O_PATH | libc::O_CLOEXEC) else {
+            // alloc: the error, once, and no sandbox is made.
+            return Err(os(&format!("the {what} entry {}", at.display())));
+        };
+        let Some(stat) = raw::stat_of(fd.as_raw_fd()) else {
+            // alloc: the error, once, and no sandbox is made.
+            return Err(os(&format!("the {what} entry {} (fstat)", at.display())));
+        };
+        // alloc: once per entry, the path its descriptor reaches.
+        let real = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .ok()
+            .filter(|it| it.is_absolute())
+            // alloc: the error, once, and no sandbox is made.
+            .ok_or_else(|| format!("the {what} entry {}: where its descriptor is can't be read", at.display()))?;
+        let kind = match (stat.st_mode & libc::S_IFMT, given) {
+            (libc::S_IFDIR, _) => return Ok(Passed { fd, dir: true, real }),
+            (libc::S_IFREG, Given::Write) if stat.st_nlink > 1 => {
+                // alloc: the error, once, and no sandbox is made.
+                return Err(format!(
+                    "the writable entry {} is a file with {} links: a write to it would reach \
+                     each of its other names too, so a sandbox writes only a file with one",
+                    at.display(),
+                    stat.st_nlink
+                ));
+            }
+            (libc::S_IFREG, _) | (libc::S_IFSOCK, Given::Read) => return Ok(Passed { fd, dir: false, real }),
+            (libc::S_IFSOCK, Given::Write) => "a socket",
+            (libc::S_IFIFO, _) => "a pipe",
+            (libc::S_IFCHR, _) => "a character device",
+            (libc::S_IFBLK, _) => "a block device",
+            _ => "neither a directory nor a regular file",
+        };
+        let may = match given {
+            Given::Read => "a directory, a regular file or a Unix socket",
+            Given::Write => "a directory or a regular file",
+        };
+        // alloc: the error, once, and no sandbox is made.
+        Err(format!("the {what} entry {} is {kind}: a sandbox is given as {what} only {may}", at.display()))
+    }
+
+    /// Makes the point `at` this is mounted on, as the sandbox sees the machine now (read-only,
+    /// with the empty directories on it): a directory for a directory, and for a file its
+    /// directories and an empty file in them. Where `at` is there already it must be what this
+    /// is, or the bind would hide one kind with the other.
+    fn mount_point(&self, at: &Path, given: Given) -> Result<(), String> {
+        let what = given.name();
+        let kind = |dir: bool| if dir { "a directory" } else { "a file" };
+        match std::fs::metadata(at) {
+            Ok(meta) if meta.is_dir() == self.dir => Ok(()),
+            // alloc: the error, once, and no sandbox is made.
+            Ok(meta) => Err(format!(
+                "the {what} entry {} is {} outside the sandbox and {} where it is mounted",
+                at.display(),
+                kind(self.dir),
+                kind(meta.is_dir()),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let made = match (self.dir, at.parent()) {
+                    (true, _) => std::fs::create_dir_all(at),
+                    (false, parent) => parent.map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
+                        std::fs::OpenOptions::new().write(true).create_new(true).open(at).map(drop)
+                    }),
+                };
+                // alloc: the error, once, and no sandbox is made.
+                made.map_err(|error| format!("{} mounted on, for the {what} entry: {error}", at.display()))
+            }
+            // alloc: the error, once, and no sandbox is made.
+            Err(error) => Err(format!("{} mounted on, for the {what} entry: {error}", at.display())),
+        }
+    }
+}
+
 /// Puts the machine's file system in place for a sandbox without a view: every mount
-/// read-only, the overlays, the writable and the readable directories and the empty ones on
-/// it.
+/// read-only, the overlays, the writable and the readable entries (each a directory or a file)
+/// and the empty directories on it.
 fn machine(spec: &Spec) -> Result<(), String> {
     let root = c(Path::new("/"));
     let opened = |at: &Path| -> Result<std::os::fd::OwnedFd, String> {
@@ -1083,13 +1228,15 @@ fn machine(spec: &Spec) -> Result<(), String> {
             // alloc: the error, once, and no sandbox is made.
             .ok_or_else(|| os(&at.display().to_string()))
     };
-    // The writable directories are reached through descriptors opened before anything is
-    // made read-only or hidden, and bound back in place after: they stay the directories
+    // The writable entries are reached through descriptors opened before anything is made
+    // read-only or hidden, and bound back in place after: they stay the directories and files
     // outside, written for real.
     // alloc: once per sandbox, a descriptor of each.
-    let writable = spec.writable.iter().map(|it| opened(it)).collect::<Result<Vec<_>, _>>()?;
+    let writable =
+        spec.writable.iter().map(|it| Passed::open(it, Given::Write)).collect::<Result<Vec<_>, _>>()?;
     // alloc: as `writable`'s.
-    let readable = spec.readable.iter().map(|it| opened(it)).collect::<Result<Vec<_>, _>>()?;
+    let readable =
+        spec.readable.iter().map(|it| Passed::open(it, Given::Read)).collect::<Result<Vec<_>, _>>()?;
     let attr = MountAttr { attr_set: MOUNT_ATTR_RDONLY, attr_clr: 0, propagation: 0, userns_fd: 0 };
     if raw::mount_setattr(&root, AT_RECURSIVE, &attr) < 0 {
         return Err(os("making every mount read-only (mount_setattr)"));
@@ -1169,34 +1316,105 @@ fn machine(spec: &Spec) -> Result<(), String> {
         let work = by_fd(&staged, &format!("/{at}/work"));
         overlay(dir, &by_fd(lower, ""), &upper, &work)?;
     }
-    // The readable directories are bound back in place, read-only as their mount now is, where
-    // an empty directory hid them; the writable ones go on top.
-    for (dir, fd) in spec.readable.iter().zip(&readable) {
-        // alloc: the error, once, and no sandbox is made.
-        std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-        let (from, to) = (c(&by_fd(fd, "")), c(dir));
-        let flags = libc::MS_BIND | libc::MS_REC;
-        if raw::mount(Some(from.as_c_str()), &to, None, flags, None) < 0 {
-            // alloc: the error, once, and no sandbox is made.
-            return Err(os(&format!("{} seen read-only", dir.display())));
+    // The readable and writable entries are bound back in place where an empty directory hid
+    // them, outer ones first by where each really is ([`Passed::real`], not the spelling with
+    // its links and `..`), so that one inside another lands on what the outer one shows: a
+    // written `OUT_DIR` inside a read target directory is written, and a read entry inside a
+    // written directory stays read-only. An entry is never below one bound before it, so a
+    // writable bind's recursive copy and its recursive clear of read-only never reach a
+    // readable one. At one place the readable one goes last, on top (and the check below
+    // stops the sandbox). A file is bound alone on a file of its own, so that nothing beside
+    // it is seen.
+    // alloc: once per sandbox, the order its entries are bound in.
+    let mut order: Vec<(Given, usize)> = (0..spec.writable.len())
+        .map(|at| (Given::Write, at))
+        .chain((0..spec.readable.len()).map(|at| (Given::Read, at)))
+        .collect();
+    let depth = |passed: &Passed| {
+        passed.real.components().filter(|it| matches!(it, std::path::Component::Normal(_))).count()
+    };
+    let passed_of = |given: Given, at: usize| match given {
+        Given::Write => (&spec.writable[at], &writable[at]),
+        Given::Read => (&spec.readable[at], &readable[at]),
+    };
+    blaze_ids::radix::sort_by_key(&mut order, |&(given, at)| {
+        2 * depth(passed_of(given, at).1) + usize::from(given == Given::Read)
+    });
+    for &(given, at) in &order {
+        let (path, passed) = match given {
+            Given::Write => (&spec.writable[at], &writable[at]),
+            Given::Read => (&spec.readable[at], &readable[at]),
+        };
+        passed.mount_point(path, given)?;
+        let from = by_fd(&passed.fd, "");
+        match given {
+            // Read-only as its source's mount now is, said again rather than left to the bind.
+            Given::Read => bind(&from, path, MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)
+                // alloc: the error, once, and no sandbox is made.
+                .map_err(|error| format!("{} seen read-only: {error}", path.display()))?,
+            Given::Write => {
+                let (from, to) = (c(&from), c(path));
+                let flags = libc::MS_BIND | libc::MS_REC;
+                if raw::mount(Some(from.as_c_str()), &to, None, flags, None) < 0 {
+                    // alloc: the error, once, and no sandbox is made.
+                    return Err(os(&format!("{} written for real", path.display())));
+                }
+                // A bind keeps the read-only mark its source was given above; it is cleared,
+                // and no set-user-ID program or device is used through it.
+                let attr = MountAttr {
+                    attr_set: MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
+                    attr_clr: MOUNT_ATTR_RDONLY,
+                    propagation: 0,
+                    userns_fd: 0,
+                };
+                if raw::mount_setattr(&to, AT_RECURSIVE, &attr) < 0 {
+                    // alloc: the error, once, and no sandbox is made.
+                    return Err(os(&format!("{} written for real (mount_setattr)", path.display())));
+                }
+            }
         }
     }
-    for (dir, fd) in spec.writable.iter().zip(&writable) {
+    // Each entry is now seen as it was given, read-only or written, or the sandbox stops naming
+    // what covers it: two entries at one place, or a file system that is mounted read-only
+    // itself, would otherwise leave a written `OUT_DIR` read-only with nothing said.
+    for &(given, at) in &order {
+        let (path, passed) = passed_of(given, at);
+        let what = given.name();
+        let Some(fs) = raw::statvfs(&c(path)) else {
+            // alloc: the error, once, and no sandbox is made.
+            return Err(os(&format!("the {what} entry {} as the sandbox sees it (statvfs)", path.display())));
+        };
+        let read_only = fs.f_flag & libc::ST_RDONLY != 0;
+        if read_only == (given == Given::Read) {
+            continue;
+        }
+        let seen = if read_only { "read-only" } else { "writable" };
+        let other = given.other();
+        let covering = order
+            .iter()
+            .filter(|&&(it, _)| it == other)
+            .map(|&(it, at)| passed_of(it, at))
+            .filter(|(_, it)| passed.real.starts_with(&it.real))
+            .max_by_key(|(_, it)| depth(it));
         // alloc: the error, once, and no sandbox is made.
-        std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-        let (from, to) = (c(&by_fd(fd, "")), c(dir));
-        let flags = libc::MS_BIND | libc::MS_REC;
-        if raw::mount(Some(from.as_c_str()), &to, None, flags, None) < 0 {
-            // alloc: the error, once, and no sandbox is made.
-            return Err(os(&format!("{} written for real", dir.display())));
-        }
-        // A bind keeps the read-only mark its source was given above.
-        let attr =
-            MountAttr { attr_set: 0, attr_clr: MOUNT_ATTR_RDONLY, propagation: 0, userns_fd: 0 };
-        if raw::mount_setattr(&to, AT_RECURSIVE, &attr) < 0 {
-            // alloc: the error, once, and no sandbox is made.
-            return Err(os(&format!("{} written for real (mount_setattr)", dir.display())));
-        }
+        return Err(match covering {
+            Some((outer, it)) => format!(
+                "the {what} entry {} is {seen} in the sandbox: the {} entry {} ({}) covers it, \
+                 at {}",
+                path.display(),
+                other.name(),
+                outer.display(),
+                it.real.display(),
+                passed.real.display()
+            ),
+            None => format!(
+                "the {what} entry {} ({}) is {seen} in the sandbox, and no {} entry covers it: \
+                 the file system it is on is mounted {seen}",
+                path.display(),
+                passed.real.display(),
+                other.name()
+            ),
+        });
     }
     drop((lowers, staged, writable, readable));
     // A `TMPDIR` in one of the empty directories is there, empty as they are.
@@ -3125,6 +3343,375 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
     }
 
     const FAIL: &str = "fail() { echo \"$*\" >&2; exit 1; }\n";
+
+    /// A sandbox without a view (a build script's) is given single files to read, as a build
+    /// script is given the blaze binary it runs through: one below an empty directory (`/tmp`),
+    /// mounted on a file of its own, and one the machine shows anyway (this test's binary).
+    /// Each is read, neither is written, and nothing beside the first is seen. Skipped where no
+    /// sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn a_build_scripts_sandbox_reads_a_single_file_passed_as_readable() {
+        if alone::run(&Spec { cwd: "/".into(), ..Spec::default() }, None) != Ok(0) {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "no sandbox can be made here");
+            eprintln!("skipped: no sandbox can be made here");
+            return;
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let bash = std::env::split_paths(&path).map(|it| it.join("bash")).find(|it| it.exists());
+        let Some(bash) = bash else {
+            eprintln!("skipped: no bash on PATH");
+            return;
+        };
+        let dir = scratch("readable-file");
+        let (given, beside, out) = (dir.join("given"), dir.join("beside"), dir.join("out"));
+        std::fs::write(&given, "given alone\n").unwrap();
+        std::fs::write(&beside, "not given\n").unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let launcher = std::env::current_exe().unwrap();
+        let shown = |it: &Path| it.display().to_string();
+        let env = [
+            ("PATH", std::env::var("PATH").unwrap_or_default()),
+            ("DIR", shown(&dir)),
+            ("GIVEN", shown(&given)),
+            ("BESIDE", shown(&beside)),
+            ("LAUNCHER", shown(&launcher)),
+            ("OUT", shown(&out)),
+        ];
+        let script = format!(
+            "{FAIL}{}",
+            r#"
+[ -f "$GIVEN" ] || fail "$GIVEN is not a file"
+{ read -r line < "$GIVEN" && [ "$line" = "given alone" ]; } || fail "it could not read $GIVEN"
+if [ -w "$GIVEN" ] || (echo x > "$GIVEN") 2>/dev/null; then fail "it may write $GIVEN"; fi
+if [ -e "$BESIDE" ] || [ -L "$BESIDE" ]; then fail "$BESIDE, beside what it was given, is seen"; fi
+printf '%s\n' "$DIR"/* > "$OUT/listed"
+[ -f "$LAUNCHER" ] && [ -r "$LAUNCHER" ] || fail "it could not see $LAUNCHER"
+if [ -w "$LAUNCHER" ]; then fail "it may write $LAUNCHER"; fi
+echo hi > "$OUT/written" || fail "it could not write $OUT"
+"#
+        );
+        let env = env.iter().map(|(name, value)| ((*name).to_owned(), value.clone())).collect();
+        let spec = Spec {
+            cwd: out.clone(),
+            env,
+            readable: vec![given.clone(), launcher],
+            writable: vec![out.clone()],
+            ..Spec::default()
+        };
+        let program: Vec<OsString> = vec![bash.into(), "-c".into(), script.into()];
+        assert_eq!(alone::run(&spec, Some(&program)), Ok(0));
+        let read = |it: &Path| std::fs::read_to_string(it).unwrap();
+        assert_eq!(read(&out.join("written")), "hi\n");
+        assert_eq!(read(&given), "given alone\n");
+        assert_eq!(read(&out.join("listed")), format!("{}\n{}\n", shown(&given), shown(&out)));
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bash from `PATH`, when a sandbox in namespaces can be made here; `None`, said, when not
+    /// (a failure with `BLAZE_VIEW_TESTS=require`, as in an ix VM).
+    fn namespaced_bash() -> Option<PathBuf> {
+        let skip = |why: &str| {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "{why}");
+            eprintln!("skipped: {why}");
+            None
+        };
+        if alone::run(&Spec { cwd: "/".into(), ..Spec::default() }, None) != Ok(0) {
+            return skip("no sandbox can be made here");
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        match std::env::split_paths(&path).map(|it| it.join("bash")).find(|it| it.exists()) {
+            Some(bash) => Some(bash),
+            None => skip("no bash on PATH"),
+        }
+    }
+
+    /// `mkfifo path`, through the program of that name.
+    fn fifo(path: &Path) {
+        let made = std::process::Command::new("mkfifo").arg(path).status().unwrap();
+        assert!(made.success(), "mkfifo {}", path.display());
+    }
+
+    /// What a readable or writable entry may be: a directory, a regular file (written only with
+    /// one link, or a write would reach its other names), and a Unix socket to read (a test's
+    /// fork server's, which the supervisor lets it connect to by that path alone). A pipe and a
+    /// device are refused either way, naming the entry and what it is.
+    #[test]
+    fn an_entry_is_a_directory_a_file_or_a_socket_to_read_and_nothing_else() {
+        use super::{Given, Passed};
+        let dir = scratch("entry-kinds");
+        let (file, linked, pipe, socket) =
+            (dir.join("file"), dir.join("linked"), dir.join("pipe"), dir.join("socket"));
+        std::fs::write(&file, "").unwrap();
+        std::fs::hard_link(&file, &linked).unwrap();
+        fifo(&pipe);
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let dev_null = Path::new("/dev/null");
+        let kind = |at: &Path, given| Passed::open(at, given).map(|it| it.dir);
+        assert_eq!(kind(&dir, Given::Read), Ok(true));
+        assert_eq!(kind(&dir, Given::Write), Ok(true));
+        assert_eq!(kind(&file, Given::Read), Ok(false));
+        assert_eq!(kind(&socket, Given::Read), Ok(false));
+        let refused = |at: &Path, given, says: &str| {
+            let error = kind(at, given).expect_err(&at.display().to_string());
+            assert!(error.contains(&at.display().to_string()) && error.contains(says), "{error}");
+        };
+        refused(&file, Given::Write, "2 links");
+        refused(&socket, Given::Write, "a socket");
+        refused(&pipe, Given::Read, "a pipe");
+        refused(&pipe, Given::Write, "a pipe");
+        refused(dev_null, Given::Read, "a character device");
+        refused(dev_null, Given::Write, "a character device");
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sandbox in namespaces writes a single file passed as writable and nothing beside it;
+    /// one entry inside another is what it was given as, whichever is outside: a written
+    /// directory inside a read one (a build script's `OUT_DIR` in its target directory) is
+    /// written, a read directory inside a written one is not, and a written one is `nosuid` and
+    /// `nodev`. A socket passed as readable is there; a pipe is refused, naming it. Skipped where
+    /// no sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn each_entry_is_written_or_read_only_as_given_wherever_it_is() {
+        let Some(bash) = namespaced_bash() else { return };
+        let dir = scratch("nested-entries");
+        let at = |it: &str| dir.join(it);
+        for it in ["w/ro", "r/out", "out"] {
+            std::fs::create_dir_all(at(it)).unwrap();
+        }
+        std::fs::write(at("written"), "before\n").unwrap();
+        std::fs::write(at("beside"), "not given\n").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(at("socket")).unwrap();
+        let shown = |it: &str| at(it).display().to_string();
+        let env = [
+            ("PATH", std::env::var("PATH").unwrap_or_default()),
+            ("WRITTEN", shown("written")),
+            ("BESIDE", shown("beside")),
+            ("W", shown("w")),
+            ("R", shown("r")),
+            ("SOCKET", shown("socket")),
+            ("OUT", shown("out")),
+        ];
+        let script = format!(
+            "{FAIL}{}",
+            r#"
+echo after > "$WRITTEN" || fail "it could not write $WRITTEN"
+if [ -e "$BESIDE" ] || [ -L "$BESIDE" ]; then fail "$BESIDE, beside what it was given, is seen"; fi
+echo x > "$W/x" || fail "it could not write $W"
+if (echo x > "$W/ro/x") 2>/dev/null; then fail "it wrote $W/ro, read-only inside $W"; fi
+echo x > "$R/out/x" || fail "it could not write $R/out, written inside $R"
+if (echo x > "$R/x") 2>/dev/null; then fail "it wrote $R"; fi
+[ -S "$SOCKET" ] || fail "$SOCKET is not a socket here"
+while read -r _ _ _ _ point opts _; do
+  [ "$point" = "$W" ] && echo "$opts" > "$OUT/w-options"
+done < /proc/self/mountinfo
+true
+"#
+        );
+        let env: Vec<(String, String)> =
+            env.iter().map(|(name, value)| ((*name).to_owned(), value.clone())).collect();
+        let spec = Spec {
+            cwd: at("out"),
+            env: env.clone(),
+            readable: vec![at("w/ro"), at("r"), at("socket")],
+            writable: vec![at("written"), at("w"), at("r/out"), at("out")],
+            ..Spec::default()
+        };
+        let program: Vec<OsString> = vec![bash.clone().into(), "-c".into(), script.into()];
+        let (code, said) = alone::run_said(&spec, Some(&program));
+        assert_eq!(code, Ok(0), "{said}");
+        let read = |it: &str| std::fs::read_to_string(at(it)).unwrap();
+        assert_eq!(read("written"), "after\n");
+        assert_eq!(read("beside"), "not given\n");
+        assert_eq!(read("w/x"), "x\n");
+        assert_eq!(read("r/out/x"), "x\n");
+        assert!(!at("w/ro/x").exists() && !at("r/x").exists());
+        let options = read("out/w-options");
+        let has = |it: &str| options.trim().split(',').any(|option| option == it);
+        assert!(has("rw") && has("nosuid") && has("nodev"), "{options}");
+        // A pipe passed as readable is refused before anything runs, naming it.
+        fifo(&at("pipe"));
+        let spec = Spec { cwd: at("out"), env, readable: vec![at("pipe")], ..Spec::default() };
+        let program: Vec<OsString> = vec![bash.into(), "-c".into(), "true".into()];
+        let (code, said) = alone::run_said(&spec, Some(&program));
+        assert_ne!(code, Ok(0));
+        assert!(said.contains(&shown("pipe")) && said.contains("is a pipe"), "{said}");
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sandbox confined where no user namespace can be made (Landlock) writes a single file
+    /// passed as writable, and refuses a writable pipe or a file with another link before
+    /// anything runs, as one in namespaces does: Landlock alone would let them be written.
+    /// Skipped where the kernel has no Landlock, unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn a_confined_sandbox_writes_a_file_given_and_refuses_a_pipe_or_a_linked_file() {
+        if let Err(why) = super::landlock::abi() {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "{why}");
+            eprintln!("skipped: {why}");
+            return;
+        }
+        let dir = scratch("confined-entries");
+        let at = |it: &str| dir.join(it);
+        std::fs::create_dir_all(at("out")).unwrap();
+        std::fs::write(at("written"), "before\n").unwrap();
+        std::fs::write(at("beside"), "not given\n").unwrap();
+        std::fs::write(at("linked"), "").unwrap();
+        std::fs::hard_link(at("linked"), at("link")).unwrap();
+        fifo(&at("pipe"));
+        let env = vec![
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("WRITTEN".to_owned(), at("written").display().to_string()),
+            ("BESIDE".to_owned(), at("beside").display().to_string()),
+        ];
+        let forced = || "a user namespace: not made in this test".to_owned();
+        let run = |writable: Vec<PathBuf>, script: &str| {
+            let spec = Spec { cwd: at("out"), env: env.clone(), writable, ..Spec::default() };
+            let program: Vec<OsString> = vec!["/bin/sh".into(), "-c".into(), script.into()];
+            alone::run_as_said(&spec, Some(&program), forced())
+        };
+        let script = "echo after > \"$WRITTEN\" || exit 3; (echo x > \"$BESIDE\") 2>/dev/null && exit 4; exit 0";
+        let (code, said) = run(vec![at("written")], script);
+        assert_eq!(code, Ok(0), "{said}");
+        assert_eq!(std::fs::read_to_string(at("written")).unwrap(), "after\n");
+        assert_eq!(std::fs::read_to_string(at("beside")).unwrap(), "not given\n");
+        for (entry, says) in [("pipe", "is a pipe"), ("linked", "2 links")] {
+            let (code, said) = run(vec![at(entry)], "exit 0");
+            assert_ne!(code, Ok(0), "{entry} was written: {said}");
+            assert!(said.contains(&at(entry).display().to_string()) && said.contains(says), "{said}");
+        }
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory of this test's own beside its binary, out of the sandbox's empty
+    /// directories, so that what the sandbox binds lands on the machine's own mounts.
+    fn beside_binary(name: &str) -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap().join(format!("blaze-sandbox-{name}-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Runs `script` in bash in a sandbox in namespaces with `readable` and `writable`, `$D`
+    /// set to `dir`: its status and what it and the sandbox said.
+    fn run_entries(
+        bash: &Path,
+        dir: &Path,
+        readable: Vec<PathBuf>,
+        writable: Vec<PathBuf>,
+        script: &str,
+    ) -> (Result<i32, String>, String) {
+        let env = vec![
+            ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+            ("D".to_owned(), dir.display().to_string()),
+        ];
+        let spec = Spec { cwd: "/".into(), env, readable, writable, ..Spec::default() };
+        let script = format!("{FAIL}{script}");
+        let program: Vec<OsString> = vec![bash.into(), "-c".into(), script.into()];
+        alone::run_said(&spec, Some(&program))
+    }
+
+    /// Entries are bound in the order of where they really are, not of how they are spelled: a
+    /// written `OUT_DIR` inside a read directory named through a deeper link, or through `..`,
+    /// is written, and a read directory inside a written one named through a link is not.
+    /// Skipped where no sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn entries_are_bound_by_where_they_really_are_not_how_they_are_spelled() {
+        let Some(bash) = namespaced_bash() else { return };
+        let d = beside_binary("real-order");
+        for it in ["real/t/b/out", "a/b/c/d", "w/ro", "t/out", "x/y/z"] {
+            std::fs::create_dir_all(d.join(it)).unwrap();
+        }
+        std::os::unix::fs::symlink(d.join("real/t"), d.join("a/b/c/d/link")).unwrap();
+        std::os::unix::fs::symlink(d.join("w"), d.join("a/b/c/d/wl")).unwrap();
+        let ran = run_entries(
+            &bash,
+            &d,
+            vec![d.join("a/b/c/d/link")],
+            vec![d.join("real/t/b/out")],
+            r#"echo x > "$D/real/t/b/out/x" || fail "OUT_DIR inside a read directory named through a link is read-only""#,
+        );
+        assert_eq!(ran.0, Ok(0), "{}", ran.1);
+        let ran = run_entries(
+            &bash,
+            &d,
+            vec![d.join("w/ro")],
+            vec![d.join("a/b/c/d/wl")],
+            r#"if (echo x > "$D/w/ro/x") 2>/dev/null; then fail "a read directory inside a written one named through a link was written"; fi
+echo y > "$D/w/y" || fail "the written directory named through a link is read-only""#,
+        );
+        assert_eq!(ran.0, Ok(0), "{}", ran.1);
+        let ran = run_entries(
+            &bash,
+            &d,
+            vec![d.join("x/y/z/../../../t")],
+            vec![d.join("t/out")],
+            r#"echo x > "$D/t/out/x" || fail "OUT_DIR inside a read directory named through .. is read-only""#,
+        );
+        assert_eq!(ran.0, Ok(0), "{}", ran.1);
+        assert!(!d.join("w/ro/x").exists());
+        _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An entry that the binds leave other than it was given (a writable one where a readable
+    /// one is too, named through a link) stops the sandbox before anything runs, naming both,
+    /// rather than leaving it read-only with nothing said. Skipped where no sandbox can be made,
+    /// unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn a_writable_entry_a_readable_one_covers_stops_the_sandbox_naming_both() {
+        let Some(bash) = namespaced_bash() else { return };
+        let d = beside_binary("covered");
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        std::os::unix::fs::symlink(d.join("out"), d.join("alias")).unwrap();
+        let ran = run_entries(
+            &bash,
+            &d,
+            vec![d.join("alias")],
+            vec![d.join("out")],
+            r#"echo x > "$D/out/x" 2>/dev/null; echo ran > /dev/null"#,
+        );
+        assert_ne!(ran.0, Ok(0), "{}", ran.1);
+        let named = |it: &str| ran.1.contains(&d.join(it).display().to_string());
+        assert!(named("out") && named("alias") && ran.1.contains("covers it"), "{}", ran.1);
+        assert!(!d.join("out/x").exists(), "the program ran");
+        _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A socket passed as readable is reached; a socket of the machine's beside it, seen through
+    /// the read-only machine but not given, is refused by the supervisor. Skipped without a
+    /// Python to connect with, or where no sandbox can be made (unless
+    /// `BLAZE_VIEW_TESTS=require`).
+    #[test]
+    fn a_readable_socket_is_reached_and_one_not_given_is_not() {
+        let Some(bash) = namespaced_bash() else { return };
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let Some(python) = std::env::split_paths(&path).map(|it| it.join("python3")).find(|it| it.exists()) else {
+            eprintln!("skipped: no python3 on PATH");
+            return;
+        };
+        let d = beside_binary("socket-gate");
+        // The directory's path may be longer than a socket's address holds: the sockets are
+        // made through its descriptor, and reached from the sandbox's working directory.
+        let held = std::fs::File::open(&d).unwrap();
+        let short = |name: &str| format!("/proc/self/fd/{}/{name}", std::os::fd::AsRawFd::as_raw_fd(&held));
+        let _given = std::os::unix::net::UnixListener::bind(short("given")).unwrap();
+        let _other = std::os::unix::net::UnixListener::bind(short("other")).unwrap();
+        let script = format!(
+            r#"{FAIL}connect() {{ "{}" -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' "$1" 2>/dev/null; }}
+connect given || fail "the socket given was not reached"
+if connect other; then fail "a socket not given was reached"; fi"#,
+            python.display()
+        );
+        let env = vec![("PATH".to_owned(), path.to_string_lossy().into_owned())];
+        let spec = Spec { cwd: d.clone(), env, readable: vec![d.join("given")], ..Spec::default() };
+        let program: Vec<OsString> = vec![bash.into(), "-c".into(), script.into()];
+        let (code, said) = alone::run_said(&spec, Some(&program));
+        assert_eq!(code, Ok(0), "{said}");
+        drop(held);
+        _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn a_view_shows_its_binds_and_nothing_of_the_machine() {

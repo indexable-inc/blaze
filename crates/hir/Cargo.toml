@@ -35,6 +35,7 @@ hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
 hir-ty-mir.workspace = true
+hir-ty-coherence.workspace = true
 hir-ty-specialization.workspace = true
 hir-ty-borrowck.workspace = true
 hir-ty-matchck.workspace = true

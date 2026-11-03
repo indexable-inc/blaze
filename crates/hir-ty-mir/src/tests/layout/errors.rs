@@ -1,4 +1,5 @@
 //! A layout blaze cannot compute is an error naming why, never a guess the build goes on with.
+//! Here, not in hir-ty's tests: a discriminant is evaluated by MIR, which only this crate builds.
 
 use hir_def::{AdtId, EnumId, GenericDefId, ModuleDefId, nameres::crate_def_map};
 use hir_expand::fixture;

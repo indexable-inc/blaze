@@ -140,6 +140,8 @@ impl DefMap {
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
                         | "reflect"
+                        // `#[blaze::sealed]`, from `AttrFlags::BLAZE_SEALED` (`hir-ty-coherence`).
+                        | "sealed"
                 )
             {
                 return true;

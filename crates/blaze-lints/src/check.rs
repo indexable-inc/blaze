@@ -329,6 +329,21 @@ impl<'q> Driver<'q> {
 
     /// The level sets around `at` of `file`, outermost first, and whether `cfg(test)` alone
     /// keeps it.
+    /// Whether `at` of `file` is in the module the compiler appended to the crate root `file`
+    /// is (a test harness, a wasm proc macro's glue: `FileText::appended_root_module`): the
+    /// root's last item, a module of that name. It is the compiler's own code, as rustc's
+    /// injected harness and proc-macro declarations are, so no lint is given in it, whatever
+    /// the crate's levels.
+    fn in_appended(&self, file: usize, at: TextRange) -> bool {
+        use syntax::view::HasModuleItem as _;
+        let db = self.db;
+        let id = self.files[file].id;
+        let Some(name) = db.file_text(id.file_id(db)).appended_root_module(db) else { return false };
+        let Some(root) = ast::SourceFile::cast(id.parse(db).root()) else { return false };
+        let Some(ast::Item::Module(module)) = root.items().last() else { return false };
+        module.name().is_some_and(|it| it.text() == name) && module.syntax().text_range().contains_range(at)
+    }
+
     fn sets_at(&self, file: usize, at: TextRange) -> (Vec<Set>, bool) {
         let db = self.db;
         let mut owners: Vec<(usize, ast::AnyHasAttrs<'q>)> = Vec::new();
@@ -381,6 +396,10 @@ impl<'q> Driver<'q> {
         let mut fulfilled: HashSet<Span, Global> = HashSet::new_in(Global);
         let mut sets_of: HashMap<(usize, TextRange), (Vec<Set>, bool), Global> = HashMap::new_in(Global);
         for Pending { lint, file, at, mut diagnostic, hot, .. } in pending {
+            // The compiler's own code: what blaze appended to the root is linted at no level.
+            if self.in_appended(file, at) {
+                continue;
+            }
             let (sets, test_only) =
                 sets_of.entry((file, at)).or_insert_with(|| self.sets_at(file, at)).clone();
             // blaze's own lints add their link after their own help, as clippy's order is.

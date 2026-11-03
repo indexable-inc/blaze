@@ -355,6 +355,9 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     machine: Hooks<M>,
     provs: RefCell<Provs<M::Prov>>,
     db: &'db Db,
+    /// The body the evaluation was made for (a constant, a static, a function), which its
+    /// errors name ([`Self::evaluated`]).
+    owner: InferBodyId<'db>,
     param_env: ParamEnvAndCrate<'db>,
     target_data_layout: &'db TargetDataLayout,
     stack: Vec<u8>,
@@ -990,6 +993,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             extern_statics: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             in_static: matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(_))),
             db,
+            owner,
             random_state: blaze_rng::SplitMix64::new(0),
             param_env: trait_env.unwrap_or_else(|| ParamEnvAndCrate {
                 param_env: db.trait_environment(owner.generic_def(db)),
@@ -1022,6 +1026,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     #[inline]
+    /// The body this evaluation was made for, as an error names it: "the constant `GOAL`".
+    fn evaluated(&self) -> String {
+        evaluated(self.db, self.owner)
+    }
+
     fn interner(&self) -> DbInterner<'db> {
         self.infcx.interner
     }
@@ -3038,15 +3047,64 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     not_supported!("slice unsizing from non array type {t:?}")
                 }
             },
-            // From `dyn A` (to itself, or upcast) the pointer keeps its vtable, as rustc's
-            // `unsized_info` keeps it for one principal: a vtable here names the concrete type,
-            // which answers every trait of it.
-            TyKind::Dynamic(..) if matches!(current_ty.kind(), TyKind::Dynamic(..)) => {
-                IntervalOrOwned::Borrowed(addr)
+            // rustc's `unsize_into_ptr`: between two `dyn` types that are one (regions aside;
+            // MIR building makes such casts) the pointer keeps its vtable, unchecked, so a
+            // vtable of another trait transmuted in (`&dyn Tr` read as `&dyn Display`) stays
+            // as it is for the value's check to refuse. Any other cast (an upcast, dropping
+            // an auto trait) first checks that the vtable is one of the source type's trait,
+            // generic arguments and projections included (`get_ptr_vtable_ty` with
+            // `Some(data_a)`), and refuses it as undefined behavior where it is not, naming
+            // the constant; only then does it get the vtable of its concrete type for the
+            // target. Never a vtable relabeled unchecked: a `Tr` vtable transmuted to
+            // `&dyn Sub` and upcast to `&dyn Display` would come out a valid `Display` one.
+            // An id with no `dyn` type is a vtable only where the evaluator made it for a
+            // panic's payload (unwind's `&'static str` message, a `dyn Any + Send` by
+            // construction); a function's id there is refused as rustc refuses a pointer that
+            // is no vtable (`InvalidVTablePointer`).
+            TyKind::Dynamic(..) if let TyKind::Dynamic(..) = current_ty.kind() => {
+                let size = self.ptr_size();
+                if addr.size != 2 * size {
+                    not_supported!("upcasting `{current_ty:?}` from a pointer of no metadata")
+                }
+                let id = from_bytes!(
+                    usize,
+                    self.cached_ptr_size,
+                    self.read_memory(addr.addr.offset(size), size)?
+                );
+                let Some((concrete, from)) = self.vtable_map.entry(id) else {
+                    return Err(MirEvalError::InvalidVTableId(id));
+                };
+                let interner = self.interner();
+                if hir_ty::mir::same_dyn_type(interner, current_ty, target_ty) {
+                    IntervalOrOwned::Borrowed(addr)
+                } else {
+                    match from {
+                        Some(from) if hir_ty::mir::same_vtable_trait(interner, from, current_ty) => {}
+                        None if !matches!(concrete.kind(), TyKind::FnDef(..) | TyKind::Closure(..)) => {}
+                        _ => {
+                            let held = match from {
+                                // alloc: error path
+                                Some(from) => format!("the vtable of `{concrete:?}` for `{from:?}`"),
+                                // alloc: error path
+                                None => format!("the id of the function `{concrete:?}`, no vtable"),
+                            };
+                            // alloc: error path
+                            return Err(MirEvalError::UndefinedBehavior(format!(
+                                "{}: a pointer cast from `{current_ty:?}` to `{target_ty:?}` holds \
+                                 {held}, where its type says a vtable of `{current_ty:?}`: rustc refuses \
+                                 a vtable of another trait than the pointer's (`InvalidVTableTrait`) as \
+                                 undefined behavior",
+                                self.evaluated()
+                            )));
+                        }
+                    }
+                    let vtable = self.vtable_map.vtable_id(concrete, target_ty);
+                    self.with_vtable(Interval::new(addr.addr, size), vtable)?
+                }
             }
             TyKind::Dynamic(..) => {
-                let vtable = self.vtable_map.id(current_ty);
-                self.with_metadata(addr, &word_bytes(vtable, self.cached_ptr_size))?
+                let vtable = self.vtable_map.vtable_id(current_ty, target_ty);
+                self.with_vtable(addr, vtable)?
             }
             TyKind::Adt(adt_def, target_subst) => match &current_ty.kind() {
                 TyKind::Adt(current_adt_def, current_subst) => {
@@ -3098,6 +3156,22 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             return Ok(IntervalOrOwned::Owned(r));
         }
         shadow.put(ptr.size, &M::Shadow::init(metadata.len()));
+        Ok(IntervalOrOwned::Shadowed(r, shadow))
+    }
+
+    /// The pointer at `ptr` made a `dyn` one by the vtable `id`, which carries the provenance
+    /// the machine gives vtables, as rustc's `GlobalAlloc::VTable` pointer does.
+    fn with_vtable(&self, ptr: Interval, id: usize) -> Result<'db, IntervalOrOwned<M::Shadow>> {
+        let metadata = word_bytes(id, self.cached_ptr_size);
+        let (bytes, mut shadow) = self.read_shadowed(ptr.addr, ptr.size)?;
+        let mut r = OwnedBytes::with_capacity(bytes.len() + metadata.len());
+        r.extend_from_slice(bytes);
+        r.extend_from_slice(&metadata);
+        if !M::CHECKS {
+            return Ok(IntervalOrOwned::Owned(r));
+        }
+        let prov = self.machine.vtable(id as u64);
+        shadow.put(ptr.size, &M::Shadow::pointer(metadata.len(), prov));
         Ok(IntervalOrOwned::Shadowed(r, shadow))
     }
 
@@ -3290,8 +3364,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     None => match self.constants.get(&Either::Right(allocation)) {
                         Some(&interval) => interval,
                         None => {
-                            let interval =
-                                self.allocate_allocation_in_heap(locals, allocation, Mutability::Not)?;
+                            let (db, owner) = (self.db, locals.body.owner);
+                            // alloc: error path
+                            let whose = || format!("a constant value in {}", evaluated(db, owner));
+                            let interval = self.allocate_allocation_in_heap(
+                                locals,
+                                allocation,
+                                &whose,
+                                Mutability::Not,
+                            )?;
                             self.constants.insert(Either::Right(allocation), interval);
                             interval
                         }
@@ -3547,7 +3628,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             ConstKind::Value(value) => self.allocate_valtree_in_heap(value.ty, value.value, locals),
             ConstKind::Alias(_, alias) => {
                 let subst = alias.args;
-                let allocation = match alias.kind {
+                let (allocation, id): (_, GeneralConstId<'db>) = match alias.kind {
                     AliasConstKind::Projection { def_id: TraitAssocConstId(const_id) }
                     | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(const_id) }
                     | AliasConstKind::Free { def_id: FreeConstAliasId(const_id) } => {
@@ -3557,29 +3638,42 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             const_id,
                             subst,
                         );
-                        self.db.const_eval(const_id, subst, Some(self.param_env)).map_err(|e| {
-                            let name = GeneralConstId::ConstId(const_id).name(self.db);
-                            // alloc: error path
-                            MirEvalError::ConstEvalError(name, Box::new(e))
-                        })?
+                        let allocation =
+                            self.db.const_eval(const_id, subst, Some(self.param_env)).map_err(|e| {
+                                let name = GeneralConstId::ConstId(const_id).name(self.db);
+                                // alloc: error path
+                                MirEvalError::ConstEvalError(name, Box::new(e))
+                            })?;
+                        (allocation, const_id.into())
                     }
                     AliasConstKind::Anon { def_id: AnonConstIdWrapper(konst) } => {
                         if konst.is_inline_const(self.db) {
                             return self.inline_const_in_heap(konst, subst, locals);
                         }
-                        self.db.anon_const_eval(konst, subst, Some(self.param_env)).map_err(
-                            |e| {
+                        let allocation = self
+                            .db
+                            .anon_const_eval(konst, subst, Some(self.param_env))
+                            .map_err(|e| {
                                 let name = GeneralConstId::AnonConstId(konst).name(self.db);
                                 // alloc: error path
                                 MirEvalError::ConstEvalError(name, Box::new(e))
-                            },
-                        )?
+                            })?;
+                        (allocation, konst.into())
                     }
                     AliasConstKind::InherentSelf { .. } => {
                         not_supported!("the inherent constant {alias:?} in Self form after type check")
                     }
                 };
-                self.allocate_allocation_in_heap(locals, allocation, Mutability::Not)
+                let db = self.db;
+                let whose = || match id {
+                    // alloc: error path
+                    GeneralConstId::ConstId(_) => format!("the constant `{}`", id.name(db)),
+                    // alloc: error path
+                    GeneralConstId::StaticId(_) => format!("the static `{}`", id.name(db)),
+                    // alloc: error path
+                    GeneralConstId::AnonConstId(_) => "an anonymous constant".to_owned(),
+                };
+                self.allocate_allocation_in_heap(locals, allocation, &whose, Mutability::Not)
             }
             _ => not_supported!("evaluating unknown const"),
         }
@@ -3628,17 +3722,19 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// A copy of a constant's value, read-only with what it points to unless `mutability` is
-    /// `Mut` (the value of a `static mut`, whose pointees may be written).
+    /// `Mut` (the value of a `static mut`, whose pointees may be written). `whose` names the
+    /// constant for an error.
     fn allocate_allocation_in_heap(
         &mut self,
         locals: &Locals<'db>,
         allocation: Allocation<'db>,
+        whose: &dyn Fn() -> String,
         mutability: Mutability,
     ) -> Result<'db, Interval> {
         let (size, align) =
             self.size_align_of_sized(allocation.ty, locals, "the value of a constant")?;
         let addr = self.heap_allocate(size, align)?;
-        self.write_allocation(locals, allocation, addr, size, mutability)?;
+        self.write_allocation(locals, allocation, whose, addr, size, mutability)?;
         let value = Interval::new(addr, size);
         if mutability == Mutability::Not {
             self.freeze(value);
@@ -3648,11 +3744,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// Copies a constant's value to `addr`, along with the memory it points to, which is
     /// read-only once written unless `nested` is `Mut` (rustc's interning: only a
-    /// `static mut`'s pointees may be written).
+    /// `static mut`'s pointees may be written). `whose` names the constant ("the constant
+    /// `T`") for an error.
     fn write_allocation(
         &mut self,
         locals: &Locals<'db>,
         allocation: Allocation<'db>,
+        whose: &dyn Fn() -> String,
         addr: Address,
         size: usize,
         nested: Mutability,
@@ -3664,7 +3762,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         let mut frozen: SmallVec<[Interval; 4]> = SmallVec::new();
         let freezes = M::CHECKS && nested == Mutability::Not;
-        let patch_map = memory_map.transform_addresses(|b, align| {
+        let (db, owner) = (self.db, self.owner);
+        let what = || format!("{} (of `{ty:?}`), read by {}", whose(), evaluated(db, owner)); // alloc: error path
+        let patch_map = memory_map.transform_addresses(what, |b, align| {
             let addr = self.heap_allocate(b.len(), align)?;
             self.write_memory(addr, b)?;
             if freezes {
@@ -3687,6 +3787,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             v
         };
         self.write_memory(addr, v)?;
+        let ids = self.ids_by_provenance(memory_map, &patch_map, addr, v, size)?;
         let ptr_size = self.cached_ptr_size;
         self.patch_addresses(
             &patch_map,
@@ -3701,6 +3802,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             ty,
             locals,
         )?;
+        self.own_ids(memory_map, ids)?;
         for block in frozen {
             self.freeze(block);
         }
@@ -3956,6 +4058,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             return Ok(());
         }
         let shadow = M::Shadow::pointer(bytes.len(), self.machine.function(id as u64));
+        self.write_shadowed(at, &bytes, &shadow)
+    }
+
+    /// Writes at `at` the vtable `id` (a [`VTableMap`] id of a type and a `dyn` type), which
+    /// carries the provenance the machine gives vtables.
+    fn write_vtable_pointer(&mut self, at: Address, id: usize) -> Result<'db, ()> {
+        let bytes = word_bytes(id, self.cached_ptr_size);
+        if !M::CHECKS {
+            self.poke_memory(at, bytes.len())?.copy_from_slice(&bytes);
+            return Ok(());
+        }
+        let shadow = M::Shadow::pointer(bytes.len(), self.machine.vtable(id as u64));
         self.write_shadowed(at, &bytes, &shadow)
     }
 
@@ -4349,9 +4463,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// Records in `map` what `addr` is known to be a multiple of: what its allocation was
-    /// aligned to, or less when it is at an offset that is a multiple of less.
+    /// aligned to, or less when it is at an offset that is a multiple of less. An address one
+    /// past an allocation's end is of that allocation, as `behind_raw` takes it (the heap and
+    /// the stack leave no allocation starting there): the empty piece a slice's empty tail
+    /// keeps (`split_at(len).1`), or a zero-size last field's, is aligned as that offset of
+    /// it, never left without an alignment for its reader to refuse. A value of no size
+    /// elsewhere is at its alignment, of no allocation (`Address::invalid`), and keeps no piece.
     fn note_align(&self, map: &mut ComplexMemoryMap<'db>, addr: usize) {
-        let Some(allocation) = self.allocation_at(addr) else { return };
+        let allocation = self.allocation_at(addr).or_else(|| {
+            let it = self.allocation_at(addr.checked_sub(1)?)?;
+            (addr - it.start == it.size).then_some(it)
+        });
+        let Some(allocation) = allocation else { return };
         let align = match addr - allocation.start {
             0 => allocation.align,
             offset => allocation.align.min(1 << offset.trailing_zeros()),
@@ -4705,6 +4828,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 // followed as a sized one's are, the tail's by its metadata.
                                 if let Some(size) = this.size_of_unsized_struct(t, meta)? {
                                     let addr = Address::from_bytes(addr, this.cached_ptr_size)?;
+                                    // Of no size and at no allocation (a zero-size local's
+                                    // address is its alignment): nothing to keep, as for
+                                    // a sized pointee or a slice.
+                                    if addr.is_of_nothing(size) {
+                                        return Ok(());
+                                    }
                                     let b = this.read_memory(addr, size)?;
                                     mm.memory.insert(addr.to_usize(this.cached_ptr_size), b);
                                     this.note_align(mm, addr.to_usize(this.cached_ptr_size));
@@ -4964,6 +5093,79 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok(mm)
     }
 
+    /// The id this evaluation has for what `id`, an id of the evaluation that made `source`,
+    /// names: the same type, and for a vtable the same `dyn` type; and whether it is a
+    /// vtable's.
+    fn own_id(&mut self, source: &MemoryMap<'db>, id: usize) -> Result<'db, (usize, bool)> {
+        let MemoryMap::Complex(map) = source else {
+            return Err(MirEvalError::InvalidVTableId(id));
+        };
+        let Some((ty, dyn_ty)) = map.vtable.entry(id) else {
+            return Err(MirEvalError::InvalidVTableId(id));
+        };
+        Ok((self.vtable_map.intern(ty, dyn_ty), dyn_ty.is_some()))
+    }
+
+    /// The words of the constant `source`, copied to `value` (`size` bytes of it) and to the
+    /// memory `patch_map` moved, that are a function or a vtable by their provenance, each
+    /// with where it is now and the id it holds, of `source`'s evaluation. The walk by type
+    /// of [`Self::patch_addresses`] does not see those its types do not name (behind a
+    /// pointer cast to another type, in a union); [`Self::own_ids`] gives each this
+    /// evaluation's id, as rustc keeps a pointer's provenance whatever type it is copied as.
+    fn ids_by_provenance(
+        &self,
+        source: &MemoryMap<'db>,
+        patch_map: &HashMap<usize, usize, std::alloc::Global>,
+        value: Address,
+        value_bytes: &[u8],
+        size: usize,
+    ) -> Result<'db, SmallVec<[(Address, usize); 4]>> {
+        let mut ids = SmallVec::new();
+        let MemoryMap::Complex(map) = source else { return Ok(ids) };
+        if map.vtable.is_empty() {
+            return Ok(ids);
+        }
+        let word = self.ptr_size();
+        let id_at = |bytes: &[u8], at: usize| {
+            let bytes = bytes.get(at..at + word)?;
+            let id = usize_of(bytes, word)?;
+            map.vtable.entry(id).map(|_| id)
+        };
+        for &at in source.value_pointers() {
+            if at + word <= size
+                && let Some(id) = id_at(value_bytes, at)
+            {
+                ids.push((value.offset(at), id));
+            }
+        }
+        for (&start, bytes) in map.memory.iter() {
+            let Some(&moved) = patch_map.get(&start) else { continue };
+            for &pointer in source.pointers_in(start..start + bytes.len()) {
+                let at = pointer - start;
+                if let Some(id) = id_at(bytes, at) {
+                    ids.push((Address::from_usize(moved + at, self.cached_ptr_size), id));
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Writes this evaluation's id over each of `ids`, with the provenance of a vtable or a
+    /// function as its entry says.
+    fn own_ids(
+        &mut self,
+        source: &MemoryMap<'db>,
+        ids: SmallVec<[(Address, usize); 4]>,
+    ) -> Result<'db, ()> {
+        for (at, id) in ids {
+            match self.own_id(source, id)? {
+                (id, true) => self.write_vtable_pointer(at, id)?,
+                (id, false) => self.write_function_pointer(at, id)?,
+            }
+        }
+        Ok(())
+    }
+
     fn patch_addresses(
         &mut self,
         patch_map: &HashMap<usize, usize, std::alloc::Global>,
@@ -4981,16 +5183,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         use rustc_type_ir::TyKind;
         // The vtable of a `dyn` pointer is the id the value's own evaluation gave the type it
-        // points at, and this one has another for it: of a pointee that normalizes to a `dyn`
-        // (`&<T as Tr>::Obj`) or ends in one (`&Wrap<dyn Tr>`) too.
+        // points at and the trait, and this one has another for them: of a pointee that
+        // normalizes to a `dyn` (`&<T as Tr>::Obj`) or ends in one (`&Wrap<dyn Tr>`) too.
         if let TyKind::RawPtr(t, _) | TyKind::Ref(_, t, _) = ty.kind()
             && let TyKind::Dynamic(..) = self.struct_tail(t)?.kind()
         {
             let at = addr.offset(self.ptr_size());
-            let concrete = ty_of_bytes(self.peek_memory(at, self.ptr_size())?)?;
-            let new_id = self.vtable_map.id(concrete);
-            let ptr_size = self.cached_ptr_size;
-            self.poke_memory(at, ptr_size)?.copy_from_slice(&word_bytes(new_id, ptr_size));
+            let id = from_bytes!(usize, self.cached_ptr_size, self.peek_memory(at, self.ptr_size())?);
+            let (new_id, _) = self.own_id(source, id)?;
+            self.write_vtable_pointer(at, new_id)?;
         }
         // A pointer into a static points into this evaluator's copy of it.
         if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind() {
@@ -5736,7 +5937,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.write_pointer(location, memory)?;
             self.thread_statics.insert(st, location);
             let nested = self.static_nested_mutability(st);
-            self.write_allocation(locals, allocation, memory, size, nested)?;
+            let db = self.db;
+            // alloc: error path
+            let whose = || format!("the static `{}`", GeneralConstId::StaticId(st).name(db));
+            self.write_allocation(locals, allocation, &whose, memory, size, nested)?;
             self.freeze_static(st, allocation.ty, Interval::new(memory, size));
             self.record_static(memory, size, st)?;
             return Ok(location);
@@ -5765,7 +5969,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             // Known before its value is written: what it points to may point back at it.
             let location = self.locate_static(st, result.addr)?;
             let nested = self.static_nested_mutability(st);
-            self.write_allocation(locals, allocation, result.addr, size, nested)?;
+            let db = self.db;
+            // alloc: error path
+            let whose = || format!("the static `{}`", GeneralConstId::StaticId(st).name(db));
+            self.write_allocation(locals, allocation, &whose, result.addr, size, nested)?;
             self.initialized(result);
             self.freeze_static(st, allocation.ty, result);
             self.record_static(result.addr, size, st)?;
@@ -6151,6 +6358,27 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 }
 
+/// The body an evaluation was made for, as an error names it: "the constant `GOAL`".
+fn evaluated(db: &Db, owner: InferBodyId<'_>) -> String {
+    // alloc: error text, every arm
+    match owner {
+        InferBodyId::DefWithBodyId(DefWithBodyId::ConstId(id)) => {
+            format!("the constant `{}`", GeneralConstId::ConstId(id).name(db))
+        }
+        InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(id)) => {
+            format!("the static `{}`", GeneralConstId::StaticId(id).name(db))
+        }
+        InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(id)) => format!(
+            "the function `{}`",
+            hir_def::signatures::FunctionSignature::of(db, id).name.as_str()
+        ),
+        InferBodyId::DefWithBodyId(DefWithBodyId::VariantId(_)) => {
+            "an enum variant's discriminant".to_owned()
+        }
+        InferBodyId::AnonConstId(_) => "an anonymous constant".to_owned(),
+    }
+}
+
 pub fn render_const_using_debug_impl<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,
@@ -6165,7 +6393,9 @@ pub fn render_const_using_debug_impl<'db>(
             // alloc: error path
             .map_err(|_| MirEvalError::NotSupported("unreachable".to_owned()))?,
     };
-    let data = evaluator.allocate_allocation_in_heap(locals, c, Mutability::Not)?;
+    // alloc: error path
+    let whose = || format!("a constant rendered for {}", evaluated(db, owner));
+    let data = evaluator.allocate_allocation_in_heap(locals, c, &whose, Mutability::Not)?;
     let lang_items = evaluator.interner().lang_items();
     let resolver = owner.resolver(db);
     let Some(debug_fmt_fn) = lang_items.Debug_fmt else {

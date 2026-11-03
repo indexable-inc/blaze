@@ -198,9 +198,14 @@ pub(super) fn walk(forward: &Forward) -> Vec<Ref> {
     forward.to.iter().map(|to| FrontRef::Extern((*to).to_owned())).collect()
 }
 
-pub(super) fn built(db: &Db, forward: &Forward, checked: bool) -> crate::Result<Produced> {
+pub(super) fn built(
+    db: &Db,
+    forward: &Forward,
+    checked: bool,
+    unit: Option<super::build::Build>,
+) -> crate::Result<Produced> {
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: forward.krate };
-    compile_as(db, env, None, false, checked, true, |fx| {
+    compile_as(db, env, None, false, checked, true, unit, |fx| {
         let mut sig = Signature::new(fx.cg.isa.default_call_conv());
         let pointer = fx.cg.target.pointer();
         sig.params.extend((0..forward.params).map(|_| AbiParam::new(pointer)));

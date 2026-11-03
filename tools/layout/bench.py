@@ -244,8 +244,10 @@ async def main(bench: Bench) -> None:
         tree_before = group.create_task(tree_digest(Path(bench.tree), logs / "tree-before"))
         old_hash = group.create_task(sha256(old_builder))
         new_hash = group.create_task(sha256(new_builder))
-    # An empty `layout`: the cold build writes its map there and reads no profile.
+    # An empty `layout`: the cold build writes its map there and reads no profile. It is
+    # `IX_PROF` too, which refuses a directory anyone but its owner can enter (0700).
     layout.mkdir(parents=True, exist_ok=True)
+    layout.chmod(0o700)
     for stale in layout.glob("*.ixprof"):
         stale.unlink()
     homes = scratch / "builders"

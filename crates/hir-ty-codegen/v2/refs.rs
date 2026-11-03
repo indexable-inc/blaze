@@ -55,7 +55,6 @@ use crate::{
     Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, NarrowInt, asm,
     fn_trait_methods, fncache,
     fragment::{DataRequest, FuncTarget, Recorder},
-    home::Homes,
     is_integer, is_thread_local,
 };
 
@@ -90,7 +89,6 @@ pub(crate) fn walk(
     db: &Db,
     instance: &HirInstance,
     walking: Walking,
-    _: &mut Homes,
 ) -> Result<Vec<Ref>, String> {
     listed(db, instance, walking).map(Cow::into_owned)
 }
@@ -337,9 +335,8 @@ fn pass<'db>(
 ) -> Result<(), String> {
     let target = crate::target_of_crate(db, env.krate).map_err(told)?;
     let isa = &**crate::isa_for(target).map_err(told)?;
-    let mut cg = Recorder::new(db, isa, target, true);
     // The settings a walk reads are its own, never the thread's unit's: the walk is a query.
-    cg.unit = Some(build);
+    let mut cg = Recorder::new(db, isa, target, true, Some(build));
     let mut done = None;
     crate::build(&mut cg, env, body, tracked, |fx| {
         // The union of what the settings of a unit compile.
@@ -375,7 +372,6 @@ pub(super) struct Walk<'w, 'cx, 'db> {
 
 /// What the walks of an instance's bodies found.
 struct Found<'db> {
-    homes: Homes,
     /// The walk's `fx.env`, as the requests hold it.
     env: StoredParamEnvAndCrate,
     listed: Listed,
@@ -394,7 +390,6 @@ impl<'db> Found<'db> {
         // About one reference a block, and the few of `outside`.
         let capacity = body.map_or(0, |it| it.basic_blocks.len()) + 8;
         Found {
-            homes: Homes::default(),
             env,
             listed: Listed::with_capacity(capacity),
             called: HashMap::with_capacity_in(capacity, Global),
@@ -520,13 +515,13 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// symbol, with what Cranelift calls to reach a thread-local one.
     fn drain(&mut self) -> Result<(), String> {
         let Walk { fx, found, drained, .. } = self;
-        let Found { homes, listed, facts, .. } = &mut **found;
+        let Found { listed, facts, .. } = &mut **found;
         let db = fx.cg.db;
         let requests = &fx.cg.wants.requests;
         for request in &requests.funcs[drained.0..] {
             match &request.target {
                 FuncTarget::Symbol(symbol) => listed.symbol(Cow::Borrowed(symbol.as_str())),
-                target => listed.add(places::func_ref(db, homes, target)?),
+                target => listed.add(places::func_ref(db, target)?),
             };
         }
         for request in &requests.datas[drained.1..] {
@@ -612,7 +607,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     fn call_place(&mut self, def: InstanceDef, args: GenericArgs<'db>) -> Result<u32, String> {
         let db = self.fx.cg.db;
         let wasm = self.fx.cg.target.is_wasm();
-        let Found { homes, env, listed, called, .. } = &mut *self.found;
+        let Found { env, listed, called, .. } = &mut *self.found;
         if let Some(&at) = called.get(&(def, args)) {
             return Ok(at);
         }
@@ -625,7 +620,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         {
             listed.symbol(Cow::Borrowed(import));
         }
-        let at = listed.add(places::call_ref(db, homes, def, args, env)?);
+        let at = listed.add(places::call_ref(db, def, args, env)?);
         called.insert((def, args), at);
         Ok(at)
     }
@@ -774,8 +769,8 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     }
                     ConstKind::Alias(_, unevaluated) => {
                         self.recorded(|fx| {
-                            let allocation = fx.eval_const(unevaluated)?;
-                            fx.allocation_blob(allocation, false)
+                            let (allocation, whose) = fx.eval_named_const(unevaluated)?;
+                            fx.allocation_blob(allocation, whose, false)
                         })?;
                     }
                     // alloc: the error's message
@@ -787,7 +782,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 let allocation = allocation.as_ref();
                 let ty = allocation.ty;
                 if !self.located(operand) {
-                    self.recorded(|fx| fx.allocation_blob(allocation, false))?;
+                    self.recorded(|fx| fx.allocation_blob(allocation, fx.in_place(), false))?;
                 }
                 Ok(ty)
             }
@@ -1130,7 +1125,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             if let Some(allocation) = allocation {
                 // A constant whose data can't be made is not promoted, and leaves what it
                 // asked for before then.
-                _ = self.fx.allocation_blob(allocation, false);
+                _ = self.fx.allocation_blob(allocation, crate::ConstOf::Promoted(promoted), false);
                 self.drain()?;
             }
         }

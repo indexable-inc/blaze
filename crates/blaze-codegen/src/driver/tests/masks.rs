@@ -99,12 +99,6 @@ impl Prepare for Folding {
     }
 }
 
-fn folding_policy() -> Policy {
-    let mut policy = policy(OptLevel::O0, Mode::Output);
-    policy.fold = true;
-    policy
-}
-
 /// Two builds of one program with one daemon's masks and store, the second after a change of
 /// the data no key holds: the second's group has the constants its members' IR gives now.
 #[test]

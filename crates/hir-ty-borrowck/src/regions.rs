@@ -38,7 +38,7 @@ use hir_ty::{
     },
 };
 
-pub(super) use super::inference::{RegionValues, infer};
+pub(super) use super::inference::{RegionValues, answer_placeholders, infer};
 use super::{
     Ctx,
     bitset::{BitMatrix, BitSet, bits, matrix},
@@ -90,6 +90,21 @@ pub(super) enum Category {
 /// more general signature (a function coerced to a higher-ranked fn pointer, or one fn pointer
 /// a subtype of another) must prove: rustc drops it, rust-lang/rust#25860, the hole cve-rs
 /// builds use-after-free on in safe code. Its regions are the instantiated signature's.
+/// The one bound of the more general side of a higher-ranked relate that answers a bound of
+/// the less general side the relate proves (`sup: sub`, an `ImpliedBound` constraint, `sub`
+/// instantiating the less general side's `for<'a>` where the more general side has the
+/// placeholder `placeholder`): the more general side's region `answer` in `sup`'s position,
+/// whose `answer: placeholder` the more general side implies (`Regions::placeholder_bounds`).
+/// `'t: 'a` of `for<'a> fn(&'a Local<'t>, &'a Local<'u>)` is answered by the target's region
+/// in place of `'t`, not by its region in place of `'u`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PositionalAnswer {
+    pub(super) sup: Rv,
+    pub(super) sub: Rv,
+    pub(super) placeholder: Rv,
+    pub(super) answer: Rv,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DroppedBound<'db> {
     /// The region that must outlive `sub`, or `None` where `subject` must.
@@ -230,12 +245,48 @@ pub(super) struct Regions<'f, 'db> {
     /// What relating a signature's `for<'a>` with a more general one needs of it, each an
     /// `ImpliedBound` constraint or a type test (rust-lang/rust#25860).
     pub(super) dropped_bounds: FVec<'f, DroppedBound<'db>>,
+    /// What the more general side of relating two signatures' `for<'a>` implies of its
+    /// placeholders, `sup: sub` with a placeholder on one side (`'r: 'x` of
+    /// `for<'x> fn(&'x Row<'r>)`): every call of the fn pointer proves it, so it holds where a
+    /// region is checked against that placeholder (`binder_assumes` in `check`), and nowhere
+    /// else. Never in `known`, whose closure would make `'a: 'x` and `'x: 'b` into `'a: 'b` for
+    /// the whole body.
+    pub(super) placeholder_bounds: FVec<'f, (Rv, Rv)>,
+    /// Its type bounds of a placeholder, `T: 'x` of `for<'x> fn(&'x T)`, known of that
+    /// placeholder only.
+    pub(super) placeholder_type_bounds: FVec<'f, (Ty<'db>, Rv)>,
+    /// Its type bounds of any other region, `T: 'static` of `fn(&'static T)`, by the span of
+    /// the relate: known only to the type tests of what that relate proves of the less general
+    /// side (`Regions::dropped_type_bound`).
+    pub(super) binder_type_bounds: FVec<'f, (MirSpan, Ty<'db>, Rv)>,
+    /// The placeholders of `placeholder_bounds` whose assumed bounds stand for them where a
+    /// region of the body is made to outlive them (`inference::answer_placeholders`): they
+    /// give what outlives them none of their points.
+    pub(super) answered_placeholders: FVec<'f, Rv>,
+    /// For each `ImpliedBound` constraint of a higher-ranked relate, the bound of the more
+    /// general side in its position that answers it (`inference::answer_placeholders`).
+    pub(super) positional_answers: FVec<'f, PositionalAnswer>,
+    /// The constraints `inference::answer_placeholders` adds, `sup: answer` for `sup: sub`
+    /// into a placeholder's component, as `(sup, answer, sub)`: an error through one is about
+    /// the constraint it answers (`Regions::dropped_bound`).
+    pub(super) answered_edges: FVec<'f, (Rv, Rv, Rv)>,
+    /// Rounds `inference::answer_placeholders` used up without settling, which is a bug in
+    /// it: the error says so, and no placeholder is answered.
+    pub(super) answers_unsettled: Option<usize>,
 }
 
 impl<'f, 'db> Regions<'f, 'db> {
-    /// The bound an `ImpliedBound` constraint `sup: sub` proves.
+    /// The bound an `ImpliedBound` constraint `sup: sub` proves, or the constraint
+    /// `inference::answer_placeholders` answered with it does.
     pub(super) fn dropped_bound(&self, sup: Rv, sub: Rv) -> Option<&DroppedBound<'db>> {
-        self.dropped_bounds.iter().find(|it| it.sup == Some(sup) && it.sub == sub)
+        let proves =
+            |sub: Rv| self.dropped_bounds.iter().find(|it| it.sup == Some(sup) && it.sub == sub);
+        proves(sub).or_else(|| {
+            self.answered_edges
+                .iter()
+                .filter(|it| it.0 == sup && it.1 == sub)
+                .find_map(|&(_, _, answered)| proves(answered))
+        })
     }
 
     /// The bound the type test `ty: lower` at `span` proves, if it is one of a signature's
@@ -271,7 +322,10 @@ impl<'f, 'db> Regions<'f, 'db> {
     pub(super) fn type_outlives_known(&self, ty: Ty<'_>, universal: usize) -> bool {
         self.type_bounds.iter().any(|&(bounded, region)| {
             bounded == ty && self.universal(region).is_some_and(|it| self.knows(it, universal))
-        })
+        }) || self
+            .placeholder_type_bounds
+            .iter()
+            .any(|&(bounded, region)| bounded == ty && self.universal(region) == Some(universal))
     }
 }
 
@@ -625,6 +679,13 @@ pub(super) fn build<'a, 'db>(
             callee_reads: Vec::new_in(frame),
             choices: Vec::new_in(frame),
             dropped_bounds: Vec::new_in(frame),
+            placeholder_bounds: Vec::new_in(frame),
+            placeholder_type_bounds: Vec::new_in(frame),
+            binder_type_bounds: Vec::new_in(frame),
+            answered_placeholders: Vec::new_in(frame),
+            positional_answers: Vec::new_in(frame),
+            answered_edges: Vec::new_in(frame),
+            answers_unsettled: None,
         },
         requirements,
         early: mem::map(frame),
@@ -645,7 +706,6 @@ pub(super) fn build<'a, 'db>(
         synthesized: synthesized(ctx),
         placeholders: mem::map(frame),
         relate_universes: mem::set(frame),
-        assumed: Vec::new_in(frame),
         coercing: None,
         elided: std::cell::RefCell::new(mem::set(frame)),
         scratch: Scratch::new(frame),
@@ -745,10 +805,6 @@ struct Builder<'c, 'a, 'db> {
     placeholders: FMap<'a, Region<'db>, Region<'db>>,
     /// The universes made to relate two types' `for<'a>`.
     relate_universes: FSet<'a, rustc_type_ir::UniverseIndex>,
-    /// What the more general side of relating two signatures' `for<'a>` implies of its
-    /// placeholders, `'b: 'a` of `for<'a, 'b> fn(&'a &'b ())`, known as a where clause is: its
-    /// callers prove it, as every call proves its signature well-formed.
-    assumed: FVec<'a, (Rv, Rv)>,
     /// The function item a `ReifyFnPointer` cast relates, with the type it is cast to as
     /// written and the item's signature as the fn pointer related, while it does.
     coercing: Option<(CallableDefId, Ty<'db>, Ty<'db>)>,
@@ -2632,8 +2688,6 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         for bound in self.regions.type_bounds.iter_mut() {
             bound.0 = unrigid(interner, bound.0);
         }
-        // And what the more general side of each `for<'a>` related implies of its placeholders.
-        pairs.extend(self.assumed.iter().copied());
         let count = self.regions.universals.len();
         let mut known = matrix(self.ctx.frame, count, count);
         let static_index = self.regions.universal(self.regions.static_rv).unwrap();
@@ -3502,7 +3556,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             return;
         }
         // The more general side's placeholders as their universal regions, and what its
-        // signature implies of them assumed.
+        // signature implies assumed: of its placeholders where a region is checked against one,
+        // and of other regions only by the type tests below (`Regions::placeholder_bounds`).
         let mut placeholders: FVec<'_, Rv> = Vec::new_in(self.ctx.frame);
         let general = rustc_type_ir::fold_regions(interner, general, |r, _| match r.kind() {
             RegionKind::RePlaceholder(_) => {
@@ -3512,24 +3567,50 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             }
             _ => r,
         });
+        // The two sides' regions in step, as `relate_sig_tys` relates them: by position, each
+        // region of the less general side with the more general side's in its place. Only
+        // where the two have their regions in the same places, as two fn pointer types related
+        // are; else no bound is answered by position (`PositionalAnswer`).
+        let mut in_step: FVec<'_, (Option<Rv>, Option<Rv>)> = Vec::new_in(self.ctx.frame);
+        rustc_type_ir::fold_regions(interner, specific, |r, _| {
+            in_step.push((self.region_rv(r), None));
+            r
+        });
+        let mut position = 0;
+        rustc_type_ir::fold_regions(interner, general, |r, _| {
+            if let Some(it) = in_step.get_mut(position) {
+                it.1 = self.region_rv(r);
+            }
+            position += 1;
+            r
+        });
+        let in_step = match position == in_step.len() {
+            true => &in_step[..],
+            false => &in_step[..0],
+        };
         let start = self.regions.type_bounds.len();
         let mut pairs = Vec::new_in(self.ctx.frame);
         let mut seen = mem::set(self.ctx.frame);
         for ty in general.iter() {
             self.implied_bounds(ty, &mut pairs, &mut seen, 0, false);
         }
-        let mut kept = start;
         for index in start..self.regions.type_bounds.len() {
-            let it = self.regions.type_bounds[index];
-            if placeholders.contains(&it.1) {
-                self.regions.type_bounds[kept] = it;
-                kept += 1;
+            let (ty, region) = self.regions.type_bounds[index];
+            let ty = unrigid(interner, ty);
+            match placeholders.contains(&region) {
+                true => self.regions.placeholder_type_bounds.push((ty, region)),
+                false => self.regions.binder_type_bounds.push((at.span, ty, region)),
             }
         }
-        self.regions.type_bounds.truncate(kept);
-        self.assumed.extend(
-            pairs.drain(..).filter(|(a, b)| placeholders.contains(a) || placeholders.contains(b)),
-        );
+        self.regions.type_bounds.truncate(start);
+        for (sup, sub) in pairs.drain(..) {
+            if sup != sub
+                && (placeholders.contains(&sup) || placeholders.contains(&sub))
+                && !self.regions.placeholder_bounds.contains(&(sup, sub))
+            {
+                self.regions.placeholder_bounds.push((sup, sub));
+            }
+        }
         // What the less general side implies of its variables, proven.
         let start = self.regions.type_bounds.len();
         seen.clear();
@@ -3569,6 +3650,9 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                     span: at.span,
                 });
             }
+            if of_binder(shorter) {
+                self.record_positional_answers(longer, shorter, in_step, &placeholders);
+            }
             self.outlives(longer, shorter, at);
         }
         for &(ty, shorter) in subjects.iter() {
@@ -3594,6 +3678,36 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 forall: false,
                 signature: false,
             });
+        }
+    }
+
+    /// Records what answers `longer: shorter`, proven of the less general side of a
+    /// higher-ranked relate with `shorter` of its `for<'a>` (`PositionalAnswer`): where
+    /// `shorter` stands the more general side has a placeholder `'x`, and where `longer`
+    /// stands a region `'r` with `'r: 'x` assumed. `in_step` is the two sides' regions by
+    /// position (`binder_implied_bounds`). rustc's `NllTypeRelating::regions`
+    /// (rustc_borrowck/src/type_check/relate_tys.rs) relates a binder's two sides region by
+    /// region in the same way, one outlives constraint per position, never every region of one
+    /// side with every region of the other.
+    fn record_positional_answers(
+        &mut self,
+        longer: Rv,
+        shorter: Rv,
+        in_step: &[(Option<Rv>, Option<Rv>)],
+        placeholders: &[Rv],
+    ) {
+        for &(_, answer) in in_step.iter().filter(|it| it.0 == Some(longer)) {
+            let Some(answer) = answer else { continue };
+            for &(_, placeholder) in in_step.iter().filter(|it| it.0 == Some(shorter)) {
+                let Some(placeholder) = placeholder else { continue };
+                let it = PositionalAnswer { sup: longer, sub: shorter, placeholder, answer };
+                if placeholders.contains(&placeholder)
+                    && self.regions.placeholder_bounds.contains(&(answer, placeholder))
+                    && !self.regions.positional_answers.contains(&it)
+                {
+                    self.regions.positional_answers.push(it);
+                }
+            }
         }
     }
 
@@ -3671,7 +3785,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                         true => ((a, sa, xs), (b, ys)),
                         false => ((b, sb, ys), (a, xs)),
                     };
-                    let _ = (specific, general);
+                    this.binder_implied_bounds(specific, general, at);
                 };
                 match variance {
                     Variance::Covariant => pass(self, true),
@@ -5043,6 +5157,13 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                                         )),
                                     ),
                                 );
+                                // As rustc's `ReifyFnPointer` arm, the signature well-formed
+                                // with its `for<'a>` kept: what names no lifetime of it, that
+                                // `'b: 'a` of `&'a &'b ()` with both early-bound.
+                                let wf = At { category: Category::Boring, span };
+                                for ty in inner.inputs_and_output.iter() {
+                                    self.well_formed_unbound(ty, wf, 0);
+                                }
                                 let sig = rustc_type_ir::Binder::bind_with_vars(inner, bound_vars);
                                 let source = Ty::new_fn_ptr(interner, sig);
                                 // What its signature implies is proven for the target's
@@ -5083,12 +5204,15 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                     }
                     // rustc's: the closure's signature as a `fn` pointer's, a subtype of the
                     // target, higher-ranked as both are: `for<'a> fn(<&'a () as Trait>::Ty)`
-                    // of `|_| {}` normalizes the projection for a placeholder.
+                    // of `|_| {}` normalizes the projection for a placeholder. A closure with
+                    // a `for<'a>` of its own (`for<'a> |x: &'a T| ..`) is related as one
+                    // whatever the target, so what its signature implies is proven
+                    // (`binder_implied_bounds`).
                     CastKind::PointerCoercion(hir_ty::PointerCast::ClosureFnPointer(_))
                         if let TyKind::Closure(_, args) = source.kind()
                             && let TyKind::FnPtr(to, _) = target.kind()
-                            && !to.bound_vars().is_empty()
                             && let sig = args.as_closure().sig()
+                            && !(to.bound_vars().is_empty() && sig.bound_vars().is_empty())
                             && let &[tupled] = sig.skip_binder().inputs().as_slice()
                             && let TyKind::Tuple(_) = tupled.kind() =>
                     {
@@ -7327,6 +7451,18 @@ pub(super) fn constraint_path<'f>(
     from: Rv,
     to: Rv,
 ) -> FVec<'f, Outlives> {
+    constraint_path_through(regions, count, from, to, |_| true)
+}
+
+/// [`constraint_path`] through the regions `through` says what they outlive passes on from,
+/// as region inference's values do (`RegionValues::passes_on`).
+pub(super) fn constraint_path_through<'f>(
+    regions: &Regions<'f, '_>,
+    count: usize,
+    from: Rv,
+    to: Rv,
+    through: impl Fn(Rv) -> bool,
+) -> FVec<'f, Outlives> {
     const NONE: u32 = u32::MAX;
     let frame = *regions.universals.allocator();
     let constraints = &regions.outlives;
@@ -7349,7 +7485,7 @@ pub(super) fn constraint_path<'f>(
             path.reverse();
             return path;
         }
-        let ids = if rv < count { constraints.of_sup(rv) } else { &[] };
+        let ids = if rv < count && through(rv) { constraints.of_sup(rv) } else { &[] };
         for &index in ids {
             let sub = constraints.sub(index as usize);
             if seen.insert(sub) {
@@ -7704,6 +7840,9 @@ mod object_default_tests;
 
 #[cfg(test)]
 mod dropped_bound_tests;
+
+#[cfg(test)]
+mod closure_bound_tests;
 
 #[cfg(test)]
 mod tests {

@@ -62,13 +62,13 @@ use std::{
 #[expect(clippy::disallowed_types, reason = "a job's slots, one per unit, each set once by the unit's task: per job, not global")]
 use std::sync::OnceLock;
 
-use base_db::FileId;
+use base_db::{FileId, Trigger};
 use blaze_api::{ApiError, Artifact, CrateType, Reach, Response, Table, TargetKind, TestResult, Ub, UnitOf, UnitTarget};
 use blaze_cas::Store;
 use blaze_core::{Completion, Effect, Tag};
 use blaze_ids::ContentId;
 use blaze_units::{
-    query::{BuildConfig, Fetch, Units},
+    query::{BuildConfig, EnvMoved, EnvReads, Fetch, Units},
     schema::{Mode, Unit},
 };
 use blaze_lower::{Crates, Db, Lower, Lowered, ProcMacroLoadResult, Ran};
@@ -79,7 +79,7 @@ use crate::serve::{
     fetch::Fetcher,
     work::{
         Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, KeptPut, Library, Phase, Put, RunPuts,
-        Runs, Selection, Source, SourceFile, Steps, Writer, applying,
+        Runs, Selection, Source, SourceFile, Steps, Writer, applying, applying_fallible,
     },
 };
 
@@ -105,6 +105,9 @@ pub(crate) struct Shared {
     /// Test selection's one selector per suite, for the daemon's life
     /// (fastcompile-sol-select 1): each test run takes its suites' and gives them back.
     pub(crate) selectors: test::image::Selectors,
+    /// The dev executables in the daemon's code memory, by path, which a `run` starts from
+    /// and each link patches (docs/v2/plan/lanes/fastcompile/inproc.md).
+    pub(crate) dev_runs: run::inproc::DevRuns,
 }
 
 impl Real {
@@ -123,6 +126,7 @@ impl Real {
                 features,
             }),
             selectors: test::image::Selectors::default(),
+            dev_runs: run::inproc::DevRuns::new(paths.state.join("inproc")),
         };
         Ok(Real { fetcher, shared: Arc::new(shared) })
     }
@@ -179,6 +183,10 @@ impl Steps for Real {
         Ok(Library { at: named, fingerprint, source: Some(Source { files, under: String::new() }) })
     }
 
+    fn launch(&self, program: &str, pid: u32) -> Result<Option<Vec<(String, String)>>, ApiError> {
+        self.shared.dev_runs.launch(program, pid).map_err(|what| ApiError::new(what, Some(program.to_owned())))
+    }
+
     fn lease(&self, units: &blaze_units::query::Units, checkout: &str, builds: &str) -> crate::serve::work::Leased {
         crate::serve::job::lease_build_dirs(units, checkout, builds)
     }
@@ -216,7 +224,7 @@ impl Steps for Real {
         if input.cancelled.load(Ordering::Relaxed) {
             return Err(Failed::Again);
         }
-        let writer = cancellable(move || -> Result<(UnitWriter, Vec<Put>), Failed> {
+        let writer = cancellable(move || -> Result<(UnitWriter, Vec<Put>, Vec<blaze_kernel::Miss>), Failed> {
             let mut kept = kept;
             // Held until this job's front end is kept with its own: what the head's last build
             // used stays in the memo for this one.
@@ -243,11 +251,15 @@ impl Steps for Real {
             let retractions = input.macros.keeps().retractions_now();
             // A kept front end that is not lowered into is let go by name: the build lowers
             // anew, and the daemon's log and the profile say which part of its inputs moved.
+            let mut misses = Vec::new(); // alloc: none unless a kept front end is let go for a variable
             let kept = match kept {
                 Some(it) => match unkept(&it, input, retractions) {
                     None => Some(it),
-                    Some(why) => {
-                        let_go(it, &why);
+                    Some((why, moved)) => {
+                        if let Some(moved) = &moved {
+                            misses.push(env_miss(&it, moved));
+                        }
+                        let_go(it, &why, moved.as_ref().map(|it| it.name.as_str()));
                         None
                     }
                 },
@@ -261,8 +273,9 @@ impl Steps for Real {
                 host_cpu: self.shared.host_cpu.as_ref(),
             };
             let failed = |error| Failed::Error(lower_error(error));
-            // A front end kept and moved to the view keeps what it was served: only crates of
-            // the build's dependencies were, and moving reads again only the view's files.
+            // A front end kept and moved to the view keeps what it was served, until a serve of
+            // this job finds a crate's key moved: moving reads again only the view's files, and
+            // the runs and proc macros applied again are served after as in a fresh job.
             let (mut lowered, session, seeded) = match kept {
                 Some(KeptLowered { session, mut lowered, seeds, .. }) => match lowered
                     .refresh(lower(), |db| seed(db, &seeds))
@@ -273,7 +286,9 @@ impl Steps for Real {
                         let why = "the view moves the workspace's root or what its root manifest sets, which every crate is made with";
                         let checkout = input.config.invocation.root.as_str();
                         {
-                            let _span = tracing::info_span!(target: "blaze", "kept front end let go", checkout, why).entered();
+                            let variable = "";
+                            let _span =
+                                tracing::info_span!(target: "blaze", "kept front end let go", checkout, why, variable).entered();
                             eprintln!("blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}");
                             drop((session, lowered, seeds));
                         }
@@ -299,7 +314,8 @@ impl Steps for Real {
             let waits = graph::Waits::new(&job.graph);
             // After the seeds (the root's parse is seeded as on disk), before any identity:
             // a test crate is identified by its root with the harness.
-            harness::write(&mut lowered, &job, (0..job.graph.len() as u32).filter(|&unit| waits.ready(unit)))?;
+            // A unit refused here has no write to charge it to yet: the lowering fails, naming each.
+            harness::write(&mut lowered, &job, (0..job.graph.len() as u32).filter(|&unit| waits.ready(unit))).map_err(harness::refused)?;
             for unit in 0..job.graph.len() as u32 {
                 if unit % 64 == 0 && input.cancelled.load(Ordering::Relaxed) {
                     return Err(Failed::Again);
@@ -308,10 +324,11 @@ impl Steps for Real {
                     identify(&mut lowered, &job, unit);
                 }
             }
+            // Kept or fresh alike: the session's keys say which crates' keys moved, and a kept
+            // front end's serve of the units ready now finds none moved unless a write before
+            // this job's moved one.
             let mut deps = None;
-            if fresh {
-                deps::serve(&mut lowered, &job, &deps::ready(&job, &waits), &mut session, &mut deps)?;
-            }
+            deps::serve(&mut lowered, &job, &deps::ready(&job, &waits), &mut session, &mut deps)?;
             let writer = UnitWriter {
                 session,
                 front: Held::new(Arc::new(lowered), "a job's front end"),
@@ -326,35 +343,98 @@ impl Steps for Real {
                 broken: false,
                 retractions,
             };
-            Ok((writer, puts))
+            Ok((writer, puts, misses))
         })??;
-        let (writer, puts) = writer;
+        let (writer, puts, misses) = writer;
         let front = Arc::new(JobFront(writer.job.clone()));
-        Ok(FrontEnd { front, writer, puts })
+        Ok(FrontEnd { front, writer, puts, misses })
     }
 }
 
 /// Why job `input`'s lowering does not lower into the kept front end `kept`, by the part of
-/// its inputs that moved; `None` when it does. `retractions` is the epoch read now
+/// its inputs that moved, with the variable when that part is one the front end read of the
+/// environment ([`env_moved`]); `None` when it does. `retractions` is the epoch read now
 /// ([`proc_macro_api::kept::Keeping::retractions_now`]).
-fn unkept(kept: &KeptLowered, input: &JobInput, retractions: u64) -> Option<String> {
+fn unkept(kept: &KeptLowered, input: &JobInput, retractions: u64) -> Option<(String, Option<EnvMoved>)> {
     if !Arc::ptr_eq(&kept.units, &input.units) && kept.units != input.units {
         // alloc: a reason, once per front end let go
-        return Some(format!("the plan's units moved ({})", units_differ(&kept.units, &input.units)));
+        return Some((format!("the plan's units moved ({})", units_differ(&kept.units, &input.units)), None));
     }
     if let Some(part) = blaze_lower::config_differs(&kept.config, &input.config) {
         // alloc: a reason, once per front end let go
-        return Some(format!("its build config's {part} moved"));
+        return Some((format!("its build config's {part} moved"), None));
+    }
+    if let Some(moved) = env_moved(&kept.lowered, kept.session.env_read(), &input.config.invocation.env) {
+        // alloc: a reason, once per front end let go
+        return Some((format!("{moved} (rule 18: a front end is keyed by the variables it read)"), Some(moved)));
     }
     if kept.retractions != retractions {
         // alloc: a reason, once per front end let go
-        return Some(format!(
-            "a record retracting a value verified across checkouts was published since it was lowered \
-             (retractions epoch {} then, {retractions} now; rule 18)",
-            kept.retractions
+        return Some((
+            format!(
+                "a record retracting a value verified across checkouts was published since it was lowered \
+                 (retractions epoch {} then, {retractions} now; rule 18)",
+                kept.retractions
+            ),
+            None,
         ));
     }
     None
+}
+
+/// The first variable a kept front end read whose value `now`, a request's environment, has
+/// another of: what its crates' `env!` and `option_env!` read
+/// ([`blaze_lower::Lowered::env_moved`]), then what the daemon read into what it keeps with it
+/// (`read`, its stores' modes, [`deps::Session::env_read`]). Nothing else of the environment
+/// lets it go, so a no-op build from another shell or systemd unit lowers nothing again.
+pub(crate) fn env_moved(lowered: &Lowered, read: &EnvReads, now: &[(String, String)]) -> Option<EnvMoved> {
+    lowered.env_moved(now).or_else(|| read.moved(now))
+}
+
+/// `blaze why`'s line for the kept front end of `kept` let go because `moved` did: a miss of
+/// the step `front end` of its checkout, the read named with whether the variable was set,
+/// unset or set to another value, and nothing made from a value. A hash of the value, even with
+/// the name, would let whoever holds the build history try every short secret against it.
+fn env_miss(kept: &KeptLowered, moved: &EnvMoved) -> blaze_kernel::Miss {
+    let (was, now) = env_seen(moved);
+    let read = base_db::process_env_reads(kept.lowered.db()).len() + kept.session.env_read().names().count();
+    blaze_kernel::Miss {
+        step: "front end",
+        subject: ContentId::of("blaze v2 front end subject 1", kept.root.as_bytes()),
+        item: kept.root.clone(), // clone: a miss, once per front end let go
+        missed: blaze_kernel::Missed::Read {
+            // alloc: as above
+            read: moved.to_string(),
+            names: None,
+            was,
+            now,
+            changed: 1,
+            reads: u32::try_from(read).unwrap_or(u32::MAX),
+        },
+        key: ContentId::default(),
+        kept: None,
+        parts: Vec::new(), // alloc: none
+        beyond: None,
+    }
+}
+
+/// What `blaze why` says a moved variable was and is: [`blaze_kernel::Seen::Gone`] when unset,
+/// else a marker for "set" or, when it was set too, one for "set to another value": the same
+/// for every variable and value, so it says which of the three changes it was and nothing of
+/// the value.
+fn env_seen(moved: &EnvMoved) -> (blaze_kernel::Seen, blaze_kernel::Seen) {
+    const MARK: &str = "blaze v2 front end variable 2";
+    let mark = |what: &[u8]| blaze_kernel::Seen::Is(ContentId::of(MARK, what));
+    let was = match moved.was {
+        Some(_) => mark(b"set"),
+        None => blaze_kernel::Seen::Gone,
+    };
+    let now = match (&moved.was, &moved.now) {
+        (_, None) => blaze_kernel::Seen::Gone,
+        (Some(_), Some(_)) => mark(b"set to another value"),
+        (None, Some(_)) => mark(b"set"),
+    };
+    (was, now)
 }
 
 /// The first part of two plans' units that differs, by name. Every field is named, so one
@@ -387,11 +467,13 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
 }
 
 /// Lets go of the kept front end `kept`, which the build does not lower into because of
-/// `why`, inside a span naming its checkout and why (dropping a whole database takes time),
-/// and says so in the daemon's log.
-fn let_go(kept: KeptLowered, why: &str) {
+/// `why`, inside a span naming its checkout, why and the variable that moved when one did
+/// (`variable`, empty when none: a profile query finds every drop a variable caused by it), as
+/// dropping a whole database takes time, and says so in the daemon's log.
+fn let_go(kept: KeptLowered, why: &str, variable: Option<&str>) {
     let checkout = kept.root.as_str();
-    let _span = tracing::info_span!(target: "blaze", "kept front end let go", checkout, why).entered();
+    let variable = variable.unwrap_or("");
+    let _span = tracing::info_span!(target: "blaze", "kept front end let go", checkout, why, variable).entered();
     eprintln!("blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}");
     drop(kept);
 }
@@ -499,7 +581,8 @@ pub struct UnitWriter {
     runs: Vec<(usize, Ran)>,
     /// Proc macros' loads asked for, checked, in the order asked.
     macros: Vec<(usize, ProcMacroLoadResult)>,
-    /// What a front end freshly lowered was served with ([`deps::serve`]).
+    /// What this job's serves served of crates whose key moved ([`deps::serve`]), for the front
+    /// end's images to be stored with it: none when no key moved.
     deps: Option<deps::Kept>,
     /// What storing the kept front end this one lowered into did with its goals and bodies'
     /// steps ([`deps::store`]); None when nothing was kept.
@@ -512,11 +595,13 @@ pub struct UnitWriter {
     retractions: u64,
 }
 
-/// `broke`, a panic of a step of an apply for each of the units `ready`, kept once for each.
-fn broke_each(into: &mut Vec<Broke>, broke: Broke, ready: &[u32]) {
+/// `broke`, a failure or a panic of a step of an apply for each of the units `ready`, kept
+/// once for each. `itself`: the step was part of making those units (their harness, their
+/// dependencies served), so each is refused too, not only what depends on it.
+fn broke_each(into: &mut Vec<Broke>, broke: Broke, ready: &[u32], itself: bool) {
     for &unit in ready {
-        // clone: a panic, once per unit it fails
-        into.push(Broke { unit: unit as usize, what: broke.what, panic: broke.panic.clone() });
+        // clone: a failure, once per unit it fails
+        into.push(Broke { unit: unit as usize, what: broke.what, how: broke.how.clone(), itself });
     }
 }
 
@@ -541,55 +626,114 @@ impl Writer<Real> for UnitWriter {
         !self.runs.is_empty() || !self.macros.is_empty()
     }
 
+    /// The writes asked for since the last apply, as three changes, each one maintenance pass
+    /// of the database ([`base_db::Trigger`] names each on its `maintain` span), not one per
+    /// input set: every proc macro's load and build script's run in one batch; then, reading
+    /// the database as those left it, the harness and glue of every unit they reached or made
+    /// ready in one ([`harness::write`]), before those units are identified; then the images of
+    /// the units made ready or reached by a loaded proc macro ([`deps::serve`]), in a front end
+    /// kept or fresh.
     fn apply(&mut self) -> Result<bool, ApiError> {
         if !self.waiting() {
             return Ok(true);
         }
         let Some(lowered) = Arc::get_mut(&mut self.front) else { return Ok(false) };
         self.ready.clear();
-        for (unit, macros) in self.macros.drain(..) {
-            match applying(unit, "a proc macro's load", || lowered.macros(unit, macros)) {
-                Ok(done) => {
-                    done.map_err(lower_error)?;
-                    self.ready.push(unit as u32);
+        // alloc: once an apply, the units it writes, named on its `maintain` span
+        let touched: Vec<u32> = self.macros.iter().map(|(unit, _)| *unit as u32).chain(self.runs.iter().map(|(run, _)| *run as u32)).collect();
+        let trigger_of = touched.iter().map(|&unit| lowered.what(unit as usize)).collect::<Vec<_>>().join(", "); // alloc: as `touched`
+        let trigger = Trigger::of("proc macros loaded and build scripts' runs applied", &trigger_of);
+        // alloc: once an apply, the proc macros it loaded
+        let mut loaded: Vec<u32> = Vec::with_capacity(self.macros.len());
+        let (waits, ready, broke, macros, runs) =
+            (&mut self.waits, &mut self.ready, &mut self.broke, &mut self.macros, &mut self.runs);
+        let first = touched[0] as usize;
+        // Each write's failure, an error or a panic, is its unit's ([`Writer::broke`]): the
+        // writes after it are still applied, and only the units that depend on it are refused.
+        let applied = applying(first, "the proc macros' loads and build scripts' runs", || {
+            lowered.batch(trigger, |lowered| {
+                for (unit, macros) in macros.drain(..) {
+                    match applying_fallible(unit, "a proc macro's load", || lowered.macros(unit, macros).map_err(lower_error)) {
+                        Ok(()) => loaded.push(unit as u32),
+                        Err(it) => broke.push(it),
+                    }
                 }
-                Err(broke) => self.broke.push(broke),
-            }
+                for (run, ran) in runs.drain(..) {
+                    let from = ready.len();
+                    let applied = applying_fallible(run, "a build script's run", || {
+                        lowered.ran(run, &ran).map_err(lower_error)?;
+                        waits.applied(run as u32, ready);
+                        Ok(())
+                    });
+                    if let Err(it) = applied {
+                        ready.truncate(from);
+                        broke.push(it);
+                    }
+                }
+            })
+        });
+        if let Err(it) = applied {
+            // The pass at the batch's end panicked: every write of it fails.
+            broke_each(&mut self.broke, it, &touched, false);
+            self.ready.clear();
+            return Ok(true);
         }
+        // The harnesses: of the units these runs made ready, and of every ready unit a proc
+        // macro just loaded reaches ([`harness::reached`]), in one write.
+        // Also the units whose dependencies are served again: a proc macro built into other
+        // code moves the key of every crate it reaches.
         let (job, waits, ready) = (&self.job, &self.waits, &self.ready);
-        if let Some(first) = ready.first() {
-            match applying(*first as usize, "a proc macro's load", || harness::macros_applied(lowered, job, waits, ready)) {
-                Ok(done) => done?,
-                Err(broke) => broke_each(&mut self.broke, broke, &self.ready),
-            }
-        }
-        self.ready.clear();
-        for (run, ran) in self.runs.drain(..) {
-            let from = self.ready.len();
-            let (job, waits, ready) = (&self.job, &mut self.waits, &mut self.ready);
-            let applied = applying(run, "a build script's run", || -> Result<(), ApiError> {
-                lowered.ran(run, &ran).map_err(lower_error)?;
-                waits.applied(run as u32, ready);
-                harness::write(lowered, job, ready[from..].iter().copied())?;
-                for &unit in &ready[from..] {
-                    identify(lowered, job, unit);
+        let mut written = harness::reached(job, waits, &loaded, ready);
+        if let Some(&first) = written.first() {
+            match applying(first as usize, "the harness", || harness::write(lowered, job, written.iter().copied())) {
+                Ok(Ok(())) => {}
+                // A root that can't be made is its unit's alone ([`harness::write`]): that unit
+                // is refused, and what depends on it, naming it; every other unit's harness was
+                // written, and it goes on.
+                Ok(Err(refused)) => {
+                    for (unit, error) in refused {
+                        self.broke.push(Broke { itself: true, ..Broke::failed(unit, "the harness", error) });
+                        written.retain(|&it| it as usize != unit);
+                        self.ready.retain(|&it| it as usize != unit);
+                    }
                 }
-                Ok(())
-            });
-            match applied {
-                Ok(done) => done?,
-                Err(broke) => {
-                    self.ready.truncate(from);
-                    self.broke.push(broke);
+                // It panicked, making no one knows which root: every unit of the write is refused.
+                Err(it) => {
+                    broke_each(&mut self.broke, it, &written, true);
+                    self.ready.clear();
+                    return Ok(true);
                 }
             }
         }
-        // A front end freshly lowered was served; the units these runs made ready are served too.
-        if self.deps.is_some() && !self.ready.is_empty() {
-            let (job, ready, session, kept) = (&self.job, &self.ready, &mut self.session, &mut self.deps);
-            match applying(ready[0] as usize, "serving its dependencies", || deps::serve(lowered, job, ready, session, kept)) {
-                Ok(done) => done?,
-                Err(broke) => broke_each(&mut self.broke, broke, &self.ready),
+        for &unit in &self.ready {
+            identify(lowered, job, unit);
+        }
+        // The units these runs made ready and those a loaded proc macro reaches are served, in a
+        // kept front end as in a fresh one: a run applied again with other cfgs, env or
+        // `OUT_DIR` files, or a macro built into other code, moved the keys of the crates it
+        // reaches, and a crate read from an image under its old key would resolve as it did
+        // before (rule 18). A serve that fails or panics has left the front end partly served,
+        // which no unit's write owns: it is the writer's own error, and ends the job with or
+        // without keep-going, naming the units it served; no unit is built over it.
+        if let Some(&first) = written.first() {
+            let (job, session, kept) = (&self.job, &mut self.session, &mut self.deps);
+            let served = applying(first as usize, "serving dependencies", || deps::serve(lowered, job, &written, session, kept));
+            let failed = match served {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(broke) => Some(ApiError::new(broke.how.to_string(), None)), // alloc: an error, once
+            };
+            if let Some(error) = failed {
+                self.broken = true;
+                let units = written.iter().map(|&it| lowered.what(it as usize)).collect::<Vec<_>>().join(", "); // alloc: an error, once
+                let at = error.at.as_deref().map(|at| format!(" at {at}")).unwrap_or_default(); // alloc: an error, once
+                let what = format!(
+                    "serving from the store the dependencies of {units}, which a batch of build scripts' runs and \
+                     proc macros' loads made ready, failed{at}: {}; the front end is left partly served, and no unit \
+                     is built over it",
+                    error.what
+                ); // alloc: an error, once
+                return Err(ApiError::new(what, error.at));
             }
         }
         Ok(true)
@@ -1050,11 +1194,14 @@ pub(crate) fn unit_target(unit: &Unit) -> Result<UnitTarget, ApiError> {
 }
 
 /// Whether the job stops `unit` after the front end: a check, or every unit of `cargo check`
-/// but a build script's compile, which is linked as cargo links it there, for its run.
+/// but the two whose code the build itself runs, each linked as under `cargo build`: a build
+/// script's compile, for its run, and a proc macro's, its wasm32-wasip1 module, for the
+/// expansions of the crates that use it ([`codegen::wasm_macro`]). A proc macro only checked
+/// has no module, and its `.wasm` output would be a library's crate record (an `ar` archive).
 pub(crate) fn checks_only(goal: Goal, unit: &Unit) -> bool {
     match unit.mode {
         Mode::Check => true,
-        Mode::Build if unit.target.is_custom_build() => false,
+        Mode::Build if unit.target.is_custom_build() || unit.target.is_proc_macro() => false,
         _ => goal == Goal::Check,
     }
 }
@@ -1089,6 +1236,23 @@ pub(crate) fn program_key(unit: &Unit, phase: Phase) -> Option<blaze_graph::Key>
     }
     hasher.update(&[unit.mode as u8, phase as u8]);
     Some(blaze_graph::Key(hasher.finish().0))
+}
+
+/// The key phase `phase` of `unit` (`None` for a build script's run) is predicted and taught
+/// by (`plane::Plane::push_learned`), where it is not a program's ([`program_key`]): the same
+/// unit of the same profile, platform and mode has the same key in every build and daemon, so
+/// its node costs what its own last runs that did work took, which the daemon's image keeps: a
+/// run of a fresh unit replays its record and teaches nothing (`plane::Plane::replays`). Its
+/// memory is never under its kind's predicted peak (`plane::Plane::push_learned`).
+pub(crate) fn cost_key(unit: &Unit, phase: Option<Phase>) -> blaze_graph::Key {
+    let mut hasher = blaze_ids::Hasher::new("blaze v2 unit cost 1");
+    let platform = unit.platform.as_deref().unwrap_or("");
+    let parts = [unit.pkg_id.as_str(), &unit.target.name, &unit.profile.name, platform];
+    for part in parts.into_iter().chain(unit.target.kind.iter().map(String::as_str)) {
+        hasher.update(&(part.len() as u64).to_le_bytes()).update(part.as_bytes());
+    }
+    hasher.update(&[unit.mode as u8, u8::from(unit.macro_wasm), phase.map_or(u8::MAX, |it| it as u8)]);
+    blaze_graph::Key(hasher.finish().0)
 }
 
 /// A job's front as the loop holds it.

@@ -107,16 +107,23 @@ fn paths(fixture: &str) -> Vec<String> {
 /// The workspace crates of `fixture` checked with `options`, each file named as the fixture
 /// names it, with `prefix` before it.
 pub(crate) fn checked_with(fixture: &str, prefix: &str, options: &Options) -> Checked {
-    checked_as(fixture, prefix, options, false)
+    checked_as(fixture, prefix, options, false, None)
 }
 
 /// [`checked_with`] with builtin derives expanded, as a build that generates code expands them
 /// (`hir_def::nameres::set_expand_builtin_derives`), so what they write is checked.
 pub(crate) fn checked_expanding_derives(fixture: &str, options: &Options) -> Checked {
-    checked_as(fixture, "", options, true)
+    checked_as(fixture, "", options, true, None)
 }
 
-fn checked_as(fixture: &str, prefix: &str, options: &Options, expand_derives: bool) -> Checked {
+/// [`checked`] with the module `module`, the last item of the fixture's first file, set as
+/// the module the compiler appended to that root (`FileText::appended_root_module`), as blaze
+/// appends a test harness or a wasm proc macro's glue.
+pub(crate) fn checked_appending(fixture: &str, module: &'static str) -> Checked {
+    checked_as(fixture, "", &Options::default(), false, Some(module))
+}
+
+fn checked_as(fixture: &str, prefix: &str, options: &Options, expand_derives: bool, appended: Option<&'static str>) -> Checked {
     // compiletest's `should_emit_metadata`: a `check-pass` or `check-fail` UI test is given
     // `--emit=metadata`.
     let checks_only = fixture.lines().any(|it| matches!(it.trim(), "//@ check-pass" | "//@ check-fail"));
@@ -130,6 +137,10 @@ fn checked_as(fixture: &str, prefix: &str, options: &Options, expand_derives: bo
     let mut db = fx.into_db();
     if expand_derives {
         hir_def::nameres::set_expand_builtin_derives(&mut db, true);
+    }
+    if let Some(module) = appended {
+        let root = files[0].file_id(&db);
+        db.set_appended_root_module(root, Some(module), blaze_query::db::Durability::LOW);
     }
     let mut names: HashMap<FileId, String> = files
         .iter()

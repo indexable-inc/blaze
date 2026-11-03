@@ -198,12 +198,14 @@ fn is_sysroot(db: &Db, krate: Crate) -> bool {
 
 /// Sets `cfg(doc)` on the crates documented, as rustdoc does for the crate it documents.
 pub fn set_cfg_doc(db: &mut Db, crates: &[Documented]) {
-    for documented in crates {
-        let krate: base_db::Crate = documented.krate.into();
-        let mut cfg = krate.cfg_options(db).clone();
-        cfg.insert_atom(intern::Symbol::intern("doc"));
-        krate.set_cfg_options(db, cfg);
-    }
+    db.batch(base_db::Trigger::named("cfg(doc) set on the crates documented"), |db| {
+        for documented in crates {
+            let krate: base_db::Crate = documented.krate.into();
+            let mut cfg = krate.cfg_options(db).clone();
+            cfg.insert_atom(intern::Symbol::intern("doc"));
+            krate.set_cfg_options(db, cfg);
+        }
+    });
 }
 
 /// The documentation of `crates`, ready to write.

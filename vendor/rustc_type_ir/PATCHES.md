@@ -185,6 +185,17 @@ caller's stack, so a deep type overflowed a release build's default stack. Blaze
 recursions grow the stack the same way (fiber-aware). Test:
 `hir-ty-identity`'s `a_type_with_an_alias_at_the_bottom_normalizes_at_any_depth` overflows without it.
 
+### 0013-sealed-traits
+
+What: `Interner::trait_is_sealed`, a provided method that answers `false`. hir-ty's interner
+answers `TraitFlags::SEALED` (`#[blaze::sealed]`). `rustc_next_trait_solver`'s patch
+`0013-sealed-traits-knowable` asks it.
+
+Why: blaze's sealed traits (docs/v2/plan/lanes/frontend/sealed-orphan.md, `hir-ty-coherence`):
+no crate but a sealed trait's own may implement it, so coherence may not assume a downstream
+crate could. A provided method keeps every other interner unchanged; a program with no `#[blaze::sealed]`
+solves exactly as before.
+
 ## Dropped since the previous base (ra-ap-rustc_type_ir 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#159228 (the retry with twice the recursion limit:

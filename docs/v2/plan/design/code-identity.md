@@ -141,8 +141,33 @@ naming its replacement (rule 11). The call sites are in the identity lane's hand
    behaviour, not its executable's bytes: `Settings`, template keys, premap keys and cargo's
    record inputs take the code generator's CodeId and the pinned nightly in place of the
    executable hash, so a blaze rebuild that does not change codegen keeps every template.
-   Until then the key is `temporary_executable_id` (`hir-ty-codegen/v2/toolchain.rs`), named
-   as temporary in code and in `Toolchain::id`'s doc. The steps, in order:
+   Done at package granularity (2026-11-02): `Toolchain::id` is `H(ID_DOMAIN 5, NIGHTLY,
+   CodegenCode, TargetData::content)`, where `CodegenCode` is the content identity of every
+   package the closure's roots are built from (`hir-ty-codegen`, and `blaze-item-hash`, whose
+   `BodyFacts` is installed into the front end through a `dyn` hook; registry packages by lock
+   checksum, checkout ones by their files), the workspace manifests and cargo's configuration
+   files (the root's, those above it and `$CARGO_HOME`'s), `harness/toolchain`, LLVM by its pin
+   (llvm.json's version, commit and the sha256 of the release for `TARGET` and `HOST`, and the
+   prefix's `blaze-llvm.json` when set, checked by vendor/llvm-sys/pin.rs, which the build
+   script includes), `$RUSTC -vV` and the build's `TARGET`, `PROFILE`, cfgs, features,
+   rustflags and the variables the closure's build scripts read. blaze as `rustc` ends its
+   `-vV` with `blaze-identity: <its code identity>`, so a blaze built by blaze is another code
+   than one rustc built. blaze-engine's build script (`crates/blaze-codegen-code`) works it out
+   from `Cargo.lock` and the manifests alone (no cargo, no network, nothing written), refuses
+   when a file, lock or manifest it read or a package directory it listed changed while it
+   ran, and hands it over with `hir_ty_codegen::v2::set_code`. The window between the script
+   and the compiles of the closure's crates is accepted for direct builds in a tree being
+   edited, in both orders: the shared runner and land.py build from snapshots nothing writes
+   to, and working the identity out again over the exact tree of a checkpoint or landing
+   closes it (#1619). The target data (data layout) is read from blaze-units'
+   recorded spec, past the closure, so it is in the id itself. Tests hold it to every file and
+   variable rustc's dep-info says those crates read, to what the closure's build scripts say
+   they read (`rerun-if-changed`, `rerun-if-env-changed`), and every implementation of a
+   front-end hook past the closure to a reviewed list. No
+   executable hash is left in a template key; the front end's stores, kept expansions and
+   cargo's unit records still key by the whole executable (`blaze_cargo::serve::unit::deps::build`),
+   as their producers sit outside the code generator. What follows replaces the package
+   grain with the code generator's CodeId. The steps, in order:
    1. Lane comptime: const eval answers `fn_info(f).code_id` from `hir_ty_identity::code_id`
       through a table registered in `hir_ty::providers` with `inventory::submit!`; no table is
       a typed `MirEvalError` naming `f`, never a zero id.
@@ -152,8 +177,8 @@ naming its replacement (rule 11). The call sites are in the identity lane's hand
       the code too: either they are in the walk, or their own CodeId is a second part of the
       key. A door that leaves either out keys stale code (rule 18).
    3. blaze builds blaze with `#![feature(blaze_comptime)]` in `hir-ty-codegen`.
-   4. `toolchain::of` sets `id` to `H(ID_DOMAIN 4, NIGHTLY, fn_info(<entry>).code_id)` and
-      deletes `temporary_executable_id`, `build` and `build_of`; a CodeId that can't be had
+   4. `toolchain::of` sets `id` to `H(ID_DOMAIN 6, NIGHTLY, fn_info(<entry>).code_id, TargetData)` and
+      deletes `CodegenCode`, `set_code` and `crates/blaze-codegen-code`; a CodeId that can't be had
       stops the build with its error. Every reader of the id then keeps working as is: they
       take `Toolchain` or `Settings` whole (blaze-global `public.rs`, blaze-cargo
       `serve/unit/compile.rs`, blaze-codegen `driver.rs`, `later.rs`, `kernel.rs`, blaze-premap

@@ -899,7 +899,7 @@ fn a_dependency_batch_is_what_the_per_item_lowering_gives() {
     let files = [fx.file_at("/dep.rs"), fx.file_at("/main.rs")].map(|it| it.file_id(fx.db()));
     let mut db = fx.into_db();
     let written = db.log_mut(|db| {
-        db.batch(|db| {
+        db.batch(base_db::Trigger::named("the test's edit"), |db| {
             for file in files {
                 db.set_file_text(file, SIGNATURES);
             }

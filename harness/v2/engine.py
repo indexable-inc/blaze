@@ -4,8 +4,10 @@ Every script under harness/v2 takes, in its typed input, an `engine`:
 
     {"kind": "v1", "blaze": "target/release/blaze", "backend": "cranelift"}
 
-(v2 also takes `"dev_backend": "stencil"` or `"cranelift"`, forcing the dev tier's backend
-for every function, `"default"` leaving it to blaze), and does everything through `Engine`. Builds, runs and tests go through the `blaze` command
+(`backend` is v1's, given it as BLAZE_BACKEND; v2 takes only the default, as it picks each
+unit's backend from its profile and refuses every unit while BLAZE_BACKEND is set. v2 also takes
+`"dev_backend": "stencil"` or `"cranelift"`, forcing the dev tier's backend for every function,
+`"default"` leaving it to blaze), and does everything through `Engine`. Builds, runs and tests go through the `blaze` command
 line (`blaze build`, `run`, `test`, `check`, `status`, `stop`), which v1 and v2 both have, so a
 script is the same for both. What only an engine's insides can say (what an edit recompiled,
 the codegen inputs of a build, the critical path of a cold build) is a method here:
@@ -404,6 +406,11 @@ class Engine(ABC):
         self.blaze = Path(spec.blaze).resolve()
         if not self.blaze.is_file():
             raise Failed(f"engine.blaze: no file {self.blaze}")
+        if spec.kind == "v2" and spec.backend != "cranelift":
+            raise Failed(f"engine.backend {spec.backend!r}: v2 picks each unit's backend from its profile "
+                         "(opt-level), and BLAZE_BACKEND, BLAZE_OPT and BLAZE_EMIT are v1's: the v2 code "
+                         "generator refuses every unit while one is set (CHANGES_CODE in "
+                         "crates/hir-ty-codegen/v2/backend.rs); build with `--release` for LLVM")
         if spec.dev_backend != "default":
             if spec.kind == "v1":
                 raise Failed(f"engine.dev_backend {spec.dev_backend!r}: v1 has no stencil backend and no setting "
@@ -432,10 +439,13 @@ class Engine(ABC):
                          f"{store_of(home)} and reads no other")
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
         env = scrubbed()
-        env.update(BLAZE_HOME=str(home), BLAZE_STATS="1",
-                   BLAZE_BACKEND=self.spec.backend, PATH=f"{self.blaze.parent}{os.pathsep}{env.get('PATH', '')}")
-        if self.spec.backend == "llvm":
-            env.update(BLAZE_OPT="2", BLAZE_EMIT="fast")
+        env.update(BLAZE_HOME=str(home), BLAZE_STATS="1", PATH=f"{self.blaze.parent}{os.pathsep}{env.get('PATH', '')}")
+        # v1 is told its backend by the environment. v2 refuses every unit while BLAZE_BACKEND,
+        # BLAZE_OPT or BLAZE_EMIT is set (`scrubbed` drops the caller's), so it gets none.
+        if self.kind == "v1":
+            env.update(BLAZE_BACKEND=self.spec.backend)
+            if self.spec.backend == "llvm":
+                env.update(BLAZE_OPT="2", BLAZE_EMIT="fast")
         if target is not None:
             env["CARGO_TARGET_DIR"] = str(target)
         env.update(extra or {})

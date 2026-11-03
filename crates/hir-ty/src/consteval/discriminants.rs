@@ -21,7 +21,7 @@ use rustc_abi::{Integer, IntegerType};
 use smallvec::SmallVec;
 
 use crate::{
-    consteval::{ConstEvalError, allocation_as_isize, allocation_as_usize, hir_eval},
+    consteval::{ConstEvalError, allocation_as_isize, allocation_as_usize, evaluate},
     db::HirDatabase,
     layout::LayoutError,
     mir::MirLowerError,
@@ -396,7 +396,7 @@ pub fn explicit_discriminant<'db>(
     variant: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
     let int = DiscrInt::of(db, variant.lookup(db).parent)?;
-    let value = hir_eval::value(db, variant.into(), GenericArgs::empty(), None)?;
+    let value = evaluate(db, variant.into(), GenericArgs::empty(), None)?;
     let value = if int.signed { allocation_as_isize(value) } else { allocation_as_usize(value) as i128 };
     Ok(int.normalize(value))
 }

@@ -21,6 +21,7 @@ pub mod checks;
 pub mod const_check;
 pub mod dispatch;
 mod eval;
+pub mod home;
 mod framed;
 pub mod location;
 mod lower;

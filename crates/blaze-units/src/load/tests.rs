@@ -34,8 +34,9 @@ fn package(name: &str, extra: &str) -> String {
     format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\ntest = false\nbench = false\n\n{extra}")
 }
 
-/// A standard library of eight crates, laid out and locked as library/ is (cargo-std's), with
-/// compiler_builtins' build script.
+/// A standard library of nine crates, laid out and locked as library/ is (cargo-std's), with
+/// compiler_builtins' build script. `test` is libtest, which a harnessed test unit adds (cargo's
+/// `std_crates`); as in library/, `sysroot` depends on it.
 pub(crate) fn library(tree: &MemTree) -> ContentId {
     let manifest = "cargo-features = [\"profile-rustflags\"]\n\n[workspace]\nresolver = \"1\"\nmembers = [\"std\", \"sysroot\"]\n\n\
                     [profile.dev.package.panic_abort]\nrustflags = [\"-Cpanic=abort\"]\n\n\
@@ -49,7 +50,8 @@ pub(crate) fn library(tree: &MemTree) -> ContentId {
          [[package]]\nname = \"panic_unwind\"\nversion = \"0.0.0\"\ndependencies = [\n \"alloc\",\n \"core\",\n]\n\n\
          [[package]]\nname = \"proc_macro\"\nversion = \"0.0.0\"\ndependencies = [\n \"core\",\n \"std\",\n]\n\n\
          [[package]]\nname = \"std\"\nversion = \"0.0.0\"\ndependencies = [\n \"alloc\",\n \"core\",\n \"panic_abort\",\n \"panic_unwind\",\n]\n\n\
-         [[package]]\nname = \"sysroot\"\nversion = \"0.0.0\"\ndependencies = [\n \"proc_macro\",\n \"std\",\n]\n"
+         [[package]]\nname = \"sysroot\"\nversion = \"0.0.0\"\ndependencies = [\n \"proc_macro\",\n \"std\",\n \"test\",\n]\n\n\
+         [[package]]\nname = \"test\"\nversion = \"0.0.0\"\ndependencies = [\n \"core\",\n \"panic_abort\",\n \"panic_unwind\",\n \"std\",\n]\n"
     );
     let core = package("core", "");
     let builtins = package("compiler_builtins", "[dependencies]\ncore = { path = \"../../core\" }\n\n[features]\nmem = []\n");
@@ -70,8 +72,13 @@ pub(crate) fn library(tree: &MemTree) -> ContentId {
     let proc_macro = package("proc_macro", "[dependencies]\nstd = { path = \"../std\" }\ncore = { path = \"../core\" }\n");
     let sysroot = package(
         "sysroot",
-        "[dependencies]\nproc_macro = { path = \"../proc_macro\" }\nstd = { path = \"../std\" }\n\n\
+        "[dependencies]\nproc_macro = { path = \"../proc_macro\" }\nstd = { path = \"../std\" }\ntest = { path = \"../test\" }\n\n\
          [features]\ndefault = [\"panic-unwind\"]\npanic-unwind = [\"std/panic-unwind\"]\nbacktrace = [\"std/backtrace\"]\n",
+    );
+    let test = package(
+        "test",
+        "[dependencies]\ncore = { path = \"../core\" }\nstd = { path = \"../std\" }\n\
+         panic_unwind = { path = \"../panic_unwind\" }\npanic_abort = { path = \"../panic_abort\" }\n",
     );
     let lib = b"#![no_std]\n".as_slice();
     tree.root(&[
@@ -93,6 +100,8 @@ pub(crate) fn library(tree: &MemTree) -> ContentId {
         ("std/src/lib.rs", b"".as_slice()),
         ("proc_macro/Cargo.toml", proc_macro.as_bytes()),
         ("proc_macro/src/lib.rs", lib),
+        ("test/Cargo.toml", test.as_bytes()),
+        ("test/src/lib.rs", b"".as_slice()),
         ("sysroot/Cargo.toml", sysroot.as_bytes()),
         ("sysroot/src/lib.rs", b"".as_slice()),
     ])
@@ -353,6 +362,98 @@ fn std_panic_abort_aborts_by_its_profile_not_its_rustflags() {
     assert_eq!(unit.profile.rustflags, ["-Cpanic=abort"]);
     let plan = &units.plans[at];
     assert!(!plan.rustflags.iter().any(|it| it.contains("panic")), "{plan:?}");
+}
+
+// The standard library is built to unwind whatever the profile's `panic`, as the toolchain's
+// sysroot is: a test unwinds under any profile (cargo's `AlwaysUnwind`), so under `[profile.dev]
+// panic = "abort"` a std built to abort was linked by an unwinding test, which hir-ty-codegen's
+// `linked_crates` refuses (#1611 round 2, C5). One std serves the program that aborts (with
+// `panic_abort`) and its tests.
+#[test]
+fn std_unwinds_under_a_profile_that_aborts_and_its_tests_link_it() {
+    let fixture = Fixture::new();
+    let manifest = format!("{A}\n[profile.dev]\npanic = \"abort\"\n");
+    let files = [
+        ("ws/Cargo.toml", manifest.as_str()),
+        ("ws/src/lib.rs", "#[test]\nfn t() {}\n"),
+        ("ws/src/main.rs", "fn main() {}\n"),
+    ];
+    // Each std crate's library once, built to unwind but `panic_abort`.
+    let std_unwinds = |units: &Units| {
+        let mut libs: Vec<(&str, &str)> = units
+            .graph
+            .units
+            .iter()
+            .filter(|it| it.is_std && it.target.is_lib())
+            .map(|it| (it.target.name.as_str(), it.profile.panic.as_str()))
+            .collect();
+        libs.sort_unstable();
+        assert!(libs.iter().any(|it| it.0 == "std"), "{libs:?}");
+        for (name, panic) in &libs {
+            let want = if *name == "panic_abort" { "abort" } else { "unwind" };
+            assert_eq!(*panic, want, "{name}: {libs:?}");
+        }
+        assert!(libs.windows(2).all(|it| it[0].0 != it[1].0), "one std a platform: {libs:?}");
+    };
+    // The panic strategy of the std crate `name` that `unit` links.
+    let linked = |units: &Units, unit: &Unit, name: &str| {
+        let edge = unit.dependencies.iter().find(|it| it.extern_crate_name == name);
+        let at = edge.unwrap_or_else(|| panic!("{} links no `{name}`", unit.target.name)).index;
+        assert!(units.graph.units[at].is_std, "`{name}` is the standard library's");
+        units.graph.units[at].profile.panic.clone()
+    };
+    let built = ready(fixture.plan(fixture.open(&ask(&files))));
+    std_unwinds(&built);
+    let (_, bin) = units_of(&built, "a").into_iter().find(|(_, it)| it.target.kind == ["bin"]).expect("a bin");
+    assert_eq!(bin.profile.panic, "abort", "the program aborts");
+    assert_eq!(linked(&built, bin, "std"), "unwind", "and links std built to unwind, with `panic_abort`");
+
+    // `--lib`: the library's test in libtest's harness, and no doctest (blaze runs no rustdoc).
+    let test = Ask { command: Command::Test, args: &["--lib"], ..ask(&files) };
+    let tested = ready(fixture.plan(fixture.open(&test)));
+    std_unwinds(&tested);
+    let (_, unit) = units_of(&tested, "a")
+        .into_iter()
+        .find(|(_, it)| it.mode == Mode::Test && it.target.is_lib())
+        .expect("the library's test");
+    assert_eq!(unit.profile.panic, "unwind", "a test unwinds under any profile");
+    assert_eq!(linked(&tested, unit, "std"), "unwind");
+    assert_eq!(linked(&tested, unit, "test"), "unwind", "and its harness, libtest, is built to unwind too");
+}
+
+// A `-Zbuild-std` of `core` (or `core,alloc`) under `panic = "abort"`, on a target that can
+// unwind, is built to abort, as cargo builds it: with no `std` and no `panic_unwind`, nothing
+// defines `rust_eh_personality`, which a `core` built to unwind names from its landing pads
+// (#1611 round 3, L9). With `std` it unwinds, as the sysroot's.
+#[test]
+fn a_build_std_without_std_takes_the_profiles_panic() {
+    let fixture = Fixture::new();
+    let manifest = format!("{A}\n[profile.dev]\npanic = \"abort\"\n");
+    let files = [("ws/Cargo.toml", manifest.as_str()), ("ws/src/main.rs", "#![no_std]\n#![no_main]\n")];
+    let std_panics = |build_std: &str| {
+        let flag = format!("build-std={build_std}");
+        let built = ready(fixture.plan(fixture.open(&Ask { args: &["-Z", &flag], ..ask(&files) })));
+        let mut libs: Vec<(String, String)> = built
+            .graph
+            .units
+            .iter()
+            .filter(|it| it.is_std && it.target.is_lib())
+            .map(|it| (it.target.name.clone(), it.profile.panic.clone()))
+            .collect();
+        libs.sort_unstable();
+        libs
+    };
+    let pairs = |it: &[(&str, &str)]| it.iter().map(|(a, b)| ((*a).to_owned(), (*b).to_owned())).collect::<Vec<_>>();
+    assert_eq!(std_panics("core"), pairs(&[("compiler_builtins", "abort"), ("core", "abort")]));
+    assert_eq!(
+        std_panics("core,alloc"),
+        pairs(&[("alloc", "abort"), ("compiler_builtins", "abort"), ("core", "abort")])
+    );
+    let with_std = std_panics("std");
+    assert!(with_std.iter().any(|(name, _)| name == "std"), "{with_std:?}");
+    for (name, panic) in &with_std {
+        assert_eq!(panic, if name == "panic_abort" { "abort" } else { "unwind" }, "{name}: {with_std:?}");
+    }
 }
 
 // cargo's `UnitInterner::intern`: library/std's `crate-type = ["dylib", "rlib"]` is built as

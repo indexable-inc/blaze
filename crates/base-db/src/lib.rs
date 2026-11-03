@@ -49,7 +49,7 @@ pub use crate::{
         ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId,
         TargetKind, UniqueCrateData,
     },
-    maintain::{Maintained, Maintainer, Reads, Written},
+    maintain::{Maintained, Maintainer, Reads, Trigger, Written},
     named::NAMED_PATHS_DOMAIN,
     reparse::Reparse,
     settings::{BorrowckMode, FrontSettings},
@@ -144,15 +144,36 @@ pub fn process_env_var(db: &Db, key: &str) -> Option<String> {
     ProcessEnv::try_get(db)?.vars(db).get(key)
 }
 
-/// Has builds from here on be for a process with the variables `vars`.
+/// What of the process's variables the database's crates read: each `env!` or `option_env!`
+/// the `env!` log has ([`Files::env_read`]) that read the process's variable, by crate and
+/// name, sorted. A read by a crate of the standard library, which reads its own variables
+/// alone, or of a variable the crate has of its own, read none of the process's
+/// (`hir_expand`'s `get_env_inner`). The log is never cleared, so it holds every read any value
+/// of the database was made from, and a few more: what a front end kept from one build to the
+/// next is keyed by in the process's environment.
+pub fn process_env_reads(db: &Db) -> Vec<(Crate, String)> {
+    let mut read = db.files().env_read();
+    read.retain(|(krate, name)| !krate.data(db).origin.is_lang() && krate.env(db).get(name).is_none());
+    read
+}
+
+/// Has builds from here on be for a process with the variables `vars`. The maintainers run
+/// again only when a variable the crates read ([`process_env_reads`]) has another value: no
+/// maintained state was made from any other, and a query that reads one later reads it here.
 pub fn set_process_env(db: &mut Db, vars: Env) {
-    db.batch(|db| {
+    let read = process_env_reads(db);
+    db.write("set_process_env", |db| {
         let content = InputId(vars.content());
         match ProcessEnv::try_get(&*db) {
             Some(env) => {
+                if env.content_field(&*db) == content {
+                    return;
+                }
+                let was = env.vars(&*db);
+                let moved = read.iter().any(|(_, name)| was.get(name) != vars.get(name));
                 env.set_vars_field(db).to(vars);
-                if env.content_field(&*db) != content {
-                    env.set_content_field(db).to(content);
+                env.set_content_field(db).to(content);
+                if moved {
                     db.note(maintain::Note::Crates);
                 }
             }
@@ -510,7 +531,7 @@ pub fn set_all_crates_with_durability(
 ) {
     // alloc: the crate graph's list, once per set (setup).
     let crates: std::sync::Arc<[Crate]> = crates.into_iter().collect();
-    db.write_crates(|db| {
+    db.write_crates("set_all_crates_with_durability", |db| {
         let content = InputId(crate_graph_content(&*db, &crates));
         match AllCrates::try_get(&*db) {
             Some(all) => {

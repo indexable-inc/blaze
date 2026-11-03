@@ -657,14 +657,15 @@ mod tests {
         _ = fs::remove_dir_all(&dir);
     }
 
-    /// Two workers of a build from 0 to 100 ns. Worker 10 runs job 1 from 0, parks it at 40 and
-    /// resumes it at 60 to its end at 100, its job span closed at the park and opened again at
-    /// the resume: covered throughout. Worker 11 runs job 2 from 0 to 100 inside a job span
-    /// only to 50: half its time is a job's run inside no span, which the gate fails, though it
-    /// is after its first switch.
+    /// Two workers of a build from 0 to 100 ns. Worker 10 begins job 1 at 0, which joins the
+    /// graph as it parks at 40; it searches under a `worker` span and resumes the job at 60 to
+    /// its end at 100. The job's span moved with it and closed on another thread, so only the
+    /// job's switch rows (its `since_ns`, its `resumed`) cover 0 to 40 and 60 to 100: covered
+    /// throughout. Worker 11 runs job 2 from 0 and parks it at 50, then is in no span,
+    /// no run and no idle to the build's end: half its time is uncovered, which the gate fails.
     #[test]
     #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
-    fn a_workers_time_running_a_job_inside_no_span_is_uncovered() {
+    fn a_worker_outside_every_span_run_and_idle_is_uncovered() {
         let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
         let dir = std::env::temp_dir().join(format!("blaze-sql-uncovered-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
@@ -673,16 +674,15 @@ mod tests {
             "COPY (SELECT * FROM (VALUES (1::UBIGINT, 0::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
                 AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000001.builds.parquet';\n\
              COPY (SELECT * FROM (VALUES \
-                (1::UBIGINT, 7::UINTEGER, 10::UINTEGER, 1::UBIGINT, 0::USMALLINT, 'job', 0::BIGINT, 40::BIGINT), \
-                (1, 7, 10, 2, 0, 'job', 60, 40), \
+                (1::UBIGINT, 7::UINTEGER, 10::UINTEGER, 4::UBIGINT, 0::USMALLINT, 'worker', 40::BIGINT, 20::BIGINT), \
                 (1, 7, 11, 3, 0, 'job', 0, 50)) \
                 AS t(build_id, process, thread, span_id, depth, name, start_ns, dur_ns)) TO '{d}/1-00000001.spans.parquet';\n\
              COPY (SELECT * FROM (VALUES \
-                (1::UBIGINT, 7::UINTEGER, 10::UINTEGER, 'worker 10', 0::BIGINT, 'started', 1::UBIGINT), \
-                (1, 7, 10, 'worker 10', 40, 'parked', 1), (1, 7, 10, 'worker 10', 60, 'resumed', 1), \
-                (1, 7, 10, 'worker 10', 100, 'ended', 1), \
-                (1, 7, 11, 'worker 11', 0, 'started', 2), (1, 7, 11, 'worker 11', 100, 'ended', 2)) \
-                AS t(build_id, process, thread, thread_name, t_ns, event, job)) TO '{d}/1-00000001.switches.parquet';\n",
+                (1::UBIGINT, 7::UINTEGER, 10::UINTEGER, 'worker 10', 40::BIGINT, 'started', 1::UBIGINT, 0::BIGINT), \
+                (1, 7, 10, 'worker 10', 40, 'parked', 1, NULL), (1, 7, 10, 'worker 10', 60, 'resumed', 1, NULL), \
+                (1, 7, 10, 'worker 10', 100, 'ended', 1, NULL), \
+                (1, 7, 11, 'worker 11', 0, 'started', 2, 0), (1, 7, 11, 'worker 11', 50, 'parked', 2, NULL)) \
+                AS t(build_id, process, thread, thread_name, t_ns, event, job, since_ns)) TO '{d}/1-00000001.switches.parquet';\n",
             d = dir.display()
         );
         let written = Command::new(&duckdb)

@@ -160,10 +160,12 @@ pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Libr
     let process: Env = std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect();
-    let db = lowered.served_db();
-    krate.set_cfg_options(db, cfg);
-    krate.set_env(db, Env::default());
-    base_db::set_process_env(db, process);
+    let trigger = base_db::Trigger::named("the probe's cfgs and environment set");
+    lowered.served_db().batch(trigger, |db| {
+        krate.set_cfg_options(db, cfg);
+        krate.set_env(db, Env::default());
+        base_db::set_process_env(db, process);
+    });
 
     let db = lowered.db();
     let root_file = krate.data(db).root_file_id;
@@ -226,9 +228,10 @@ fn std_script(lowered: &mut blaze_lower::Lowered, units: &Units, library: &Libra
             _ => bail!("std's build script printed `{line}`, which the rustc stand-in does not read"),
         }
     }
-    let db = lowered.served_db();
-    krate.set_cfg_options(db, cfg);
-    krate.set_env(db, env);
+    lowered.served_db().batch(base_db::Trigger::named("std's build script's run applied"), |db| {
+        krate.set_cfg_options(db, cfg);
+        krate.set_env(db, env);
+    });
     Ok(())
 }
 

@@ -50,7 +50,7 @@ impl HirFrontend<'_> {
         krate: Crate,
         triple: &str,
     ) -> Result<Option<GlobalAsmObject>, CodegenError> {
-        self.with(|db, _| object(db, krate, triple)).map_err(error)
+        self.with(|db| object(db, krate, triple)).map_err(error)
     }
 }
 
@@ -221,8 +221,8 @@ fn file_path(db: &Db, krate: Crate, file: base_db::FileId) -> String {
     path.strip_prefix(workspace).map_or(path, |it| it.trim_start_matches('/')).to_owned()
 }
 
-/// The error of an assembler that refused `text`: each line it names (`<inline asm>:L:C:`
-/// from LLVM, `<stdin>:L:C:` from a C compiler, `before` lines past the text's own) as the
+/// The error of LLVM's assembler that refused `text`: each line it names (`<inline asm>:L:C:`,
+/// `before` lines past the text's own) as the
 /// block it is in, that line of its template and what was said of it. An error that names no
 /// line is said of every block of the crate.
 fn refused(
@@ -262,7 +262,7 @@ fn refused(
 fn diagnostics(said: &str) -> Vec<(usize, &str)> {
     // alloc: error path
     let mut found = Vec::new();
-    for marker in ["<inline asm>:", "<stdin>:"] {
+    for marker in ["<inline asm>:"] {
         let mut rest = said;
         while let Some(at) = rest.find(marker) {
             rest = &rest[at + marker.len()..];

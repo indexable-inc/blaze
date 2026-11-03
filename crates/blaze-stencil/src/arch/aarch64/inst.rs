@@ -43,6 +43,14 @@ pub(super) struct Mem {
     pub(super) scale: u8,
 }
 
+impl Mem {
+    /// Whether it stores a general register (`strb`/`strh`/`str` of a W or X register): `opc`
+    /// 00 with `V` clear. A vector store's register is no X register to clash with.
+    const fn stores_x(self) -> bool {
+        self.bits & (1 << 26) == 0 && self.bits & 0x00c0_0000 == 0
+    }
+}
+
 pub(super) const LDRB: Mem = Mem { bits: 0x3940_0000, scale: 0 };
 pub(super) const LDRH: Mem = Mem { bits: 0x7940_0000, scale: 1 };
 pub(super) const LDRW: Mem = Mem { bits: 0xb940_0000, scale: 2 };
@@ -328,6 +336,14 @@ pub(super) const LDST_MAX: u32 = 12;
 /// access size below 4096 of them, and otherwise the offset put in `tmp` and the
 /// register form (`sxtx`). `tmp` must be neither `rn` nor (for a store) `rt`.
 pub(super) fn ldst(buf: &mut Buf<'_>, op: Mem, rt: u8, rn: u8, off: u32, tmp: u8) {
+    // Checked at every offset, not only the far ones that use `tmp`, so a caller that breaks
+    // it fails on its first use and not only in a frame past 32 KiB: a store of `x16` with
+    // `x16` its scratch stored the offset in place of the value (cranelift-assembler-x64's
+    // build script, 2026-11-02).
+    assert!(
+        tmp != rn && !(op.stores_x() && tmp == rt),
+        "a load or store's far-offset scratch x{tmp} is its base x{rn} or the register x{rt} it stores"
+    );
     if off < 256 {
         buf.put4(ldur(op, rt, rn, off as i32));
     } else if let Some(word) = ldst_scaled(op, rt, rn, off) {
@@ -339,7 +355,7 @@ pub(super) fn ldst(buf: &mut Buf<'_>, op: Mem, rt: u8, rn: u8, off: u32, tmp: u8
 }
 
 /// `op rt, [rn, xm, sxtx]`.
-const fn ldst_reg(op: Mem, rt: u8, rn: u8, rm: u8) -> u32 {
+pub(super) const fn ldst_reg(op: Mem, rt: u8, rn: u8, rm: u8) -> u32 {
     (op.bits & !0x0100_0000) | 0x0020_e800 | r(rm) << 16 | r(rn) << 5 | r(rt)
 }
 

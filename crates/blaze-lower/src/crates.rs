@@ -84,6 +84,14 @@ pub(crate) fn workspace_data(
     toolchain: &Version,
     const_eval: ConstEvalBudget,
 ) -> Result<Arc<CrateWorkspaceData>, LowerError> {
+    Ok(Arc::new(CrateWorkspaceData { target: Ok(target_data(triple)?), toolchain: Some(toolchain.clone()), const_eval }))
+}
+
+/// The target data every crate built for `triple` is given, which the front end lays types out
+/// by: its data layout from blaze's recorded spec, its arch and `has_thumb_interworking`. The
+/// code generator's toolchain id hashes it (`hir_ty_codegen::v2::toolchain`), as the data is
+/// past the code generator's packages.
+pub fn target_data(triple: &str) -> Result<TargetData, LowerError> {
     let data_layout = target::data_layout(triple).map_err(|what| LowerError::at(what, triple))?;
     let has_thumb_interworking =
         target::has_thumb_interworking(triple).map_err(|what| LowerError::at(what, triple))?;
@@ -92,16 +100,7 @@ pub(crate) fn workspace_data(
         Some("wasm64") => Arch::Wasm64,
         _ => Arch::Other,
     };
-    Ok(Arc::new(CrateWorkspaceData {
-        target: Ok(TargetData {
-            tuple: Symbol::intern(triple),
-            data_layout: data_layout.into_boxed_str(),
-            arch,
-            has_thumb_interworking,
-        }),
-        toolchain: Some(toolchain.clone()),
-        const_eval,
-    }))
+    Ok(TargetData { tuple: Symbol::intern(triple), data_layout: data_layout.into_boxed_str(), arch, has_thumb_interworking })
 }
 
 /// The cfgs rustc compiles the unit with: the target's, with what the profile, the crate type,

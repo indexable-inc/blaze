@@ -33,16 +33,19 @@ the standard library is part of a compiler.
 - **Name:** `blaze-<date>` (`blaze-2026-10-27`), after the date of the Rust nightly it is built
   from (`harness/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`). v2's blaze
   has no command that prints it or where it is (v1's `blaze toolchain` did).
-- **Bytes:** the upstream nightly's `rustc`, `cargo` and the host's `rust-std`, unchanged,
+- **Bytes:** the upstream nightly's `rustc`, `cargo`, the host's `rust-std` and
+  wasm32-wasip1's (for wasi-libc, which blaze's linker links every proc macro's module with), unchanged,
   from static.rust-lang.org, each checked against the sha256 compiled into blaze
   (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
-- **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, or rustup's `nightly-2026-10-27`
-  when rustup already has it (the same bytes), found with nothing run
-  (`crates/blaze-cargo/src/toolchain.rs`, `found`). The installer downloads it by running
+- **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), found
+  with nothing run (`crates/blaze-cargo/src/toolchain.rs`, `found`). rustup's directory is never
+  read, not even when it has the same nightly: a toolchain found by its directory's name is
+  trusted by name, whatever was installed there ([v2/plan/toolchain-c.md](v2/plan/toolchain-c.md),
+  which also plans the end of this download). The installer downloads it by running
   `blaze toolchain`, which v2's blaze does not have, and no v2 build downloads it
-  (`toolchain::own::fetch` has no caller): today it must already be in one of those two places,
-  or a build stops with "blaze's toolchain is not installed".
+  (`toolchain::own::fetch` has no caller): today it must already be there, or a build stops
+  with "blaze's toolchain is not installed".
 - **The standard library's source** is not the toolchain's `rust-src`, which blaze neither
   downloads nor reads: it is blaze's own `library/` ([below](#the-standard-library-library)).
   A rustup toolchain that has `rust-src` is used without it, `RUST_SRC_PATH` is not read,
@@ -76,7 +79,12 @@ archive. `nix develop` fetches it and sets `LLVM_SYS_231_PREFIX` to it (the flak
 archive; for a target with no archive, the `llvm` workflow (`.github/workflows/llvm.yaml`) builds
 one. llvm-sys's build script refuses any other prefix with one error before anything links it
 ([contributing.md](contributing.md#llvm-for---features-llvm)). The LLVM inside a blaze binary
-is not a toolchain for projects: it builds them with the toolchain above.
+is not a toolchain for projects: it builds them with the toolchain above. It is the only
+assembler blaze has: `asm!`, `naked_asm!` and `global_asm!` go to its MC assembler in process,
+never to the machine's clang or `cc`, and a blaze built without LLVM refuses them. What else
+blaze still takes from the machine's C toolchain (the C driver the linker asks for crt files,
+the macOS SDK, MSVC's libraries, build scripts' `CC`) and the plan to replace it with one C
+toolchain built from this LLVM: [v2/plan/toolchain-c.md](v2/plan/toolchain-c.md).
 
 ## The daily bump
 

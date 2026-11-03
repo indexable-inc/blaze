@@ -25,7 +25,9 @@ use crate::{
 
 /// A dependency with closures, a coroutine closure, an `async fn`, an opaque type, constants in
 /// types and in blocks, a `dyn` type with auto traits, derives; [`PAD`] comes first in the
-/// second database, so the dependency's ids there are not the first one's.
+/// second database, so the dependency's ids there are not the first one's. Its constants in
+/// types are literals: one the solver evaluates needs MIR, which hir-ty's tests do not build, so
+/// a part of evaluated constants is hir-ty-mir's test (`tests::check_cache`).
 const FIXTURE: &str = r#"
 //- minicore: sized, copy, clone, add, mul, fn, option, deref, async_fn, future, derive, eq, send, sync
 //- /other.rs crate:other deps:core new_source_root:library
@@ -48,7 +50,7 @@ pub fn area(shape: &Shape) -> u32 {
 }
 pub fn adder(n: u32) -> impl Fn(u32) -> u32 { move |x| x + n }
 pub fn use_adder() -> u32 { adder(1)(2) }
-pub fn arrays() -> u8 { let a = [1u8; 4]; let b: [u8; 2 + 2] = a; let [x, ..] = b; x }
+pub fn arrays() -> u8 { let a = [1u8; 4]; let b: [u8; 4] = a; let [x, ..] = b; x }
 pub fn inline_const() -> u32 { const { 5 } }
 pub async fn later(x: u32) -> u32 { x }
 pub fn coroutine_closure() -> u32 { let f = async || 1u32; let _g = f; 0 }

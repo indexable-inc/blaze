@@ -145,8 +145,18 @@ pub(super) fn prologue<'f, 'm>(cx: &mut impl Ctx<'f, 'm>) -> Result<(), Error> {
         let loc = cx.loc(params[i]);
         param(cx.buf(), frame.grow, place, loc)
     })?;
-    count(cx.buf(), CALLS);
+    if cx.target().counts {
+        count(cx.buf(), CALLS);
+    }
     Ok(())
+}
+
+/// The scratch register beside X register `rt`, the glue's one choice of it: `x16`, or
+/// `x17` when `rt` is `x16` itself (an address [`address`] loaded, the stack pointer). It holds
+/// a far slot's offset for [`inst::ldst`] storing or loading `rt`, and an offset [`load_name`]
+/// adds to `rt`.
+fn scratch(rt: u8) -> u8 {
+    if rt == X16 { X17 } else { X16 }
 }
 
 /// Stores the parameter at `place` to `loc`; a stack one is above the frame record, which a
@@ -159,12 +169,12 @@ fn param(buf: &mut Buf<'_>, grow: u32, place: Place, loc: Loc) -> Result<(), Err
     };
     match place {
         Place::Reg(Reg::X(n), ty) => {
-            inst::ldst(buf, inst::str_int(ty.bytes() as u8), n, X20, off, X16)
+            inst::ldst(buf, inst::str_int(ty.bytes() as u8), n, X20, off, scratch(n))
         }
         Place::Reg(Reg::V(n), ty) => inst::ldst(buf, inst::str_v(ty.bytes()), n, X20, off, X16),
         Place::Pair(lo, hi) => {
-            inst::ldst(buf, inst::STRX, lo, X20, off, X16);
-            inst::ldst(buf, inst::STRX, hi, X20, off + 8, X16);
+            inst::ldst(buf, inst::STRX, lo, X20, off, scratch(lo));
+            inst::ldst(buf, inst::STRX, hi, X20, off + 8, scratch(hi));
         }
         Place::Stack(at, ty) => copy(buf, (FP, 16 + grow + at), (X20, off), ty.bytes()),
     }
@@ -267,12 +277,12 @@ fn store(buf: &mut Buf<'_>, inst: ir::Inst, place: Place, loc: Loc) -> Result<()
     };
     match place {
         Place::Reg(Reg::X(n), ty) => {
-            inst::ldst(buf, inst::str_int(ty.bytes() as u8), n, X20, off, X16)
+            inst::ldst(buf, inst::str_int(ty.bytes() as u8), n, X20, off, scratch(n))
         }
         Place::Reg(Reg::V(n), ty) => inst::ldst(buf, inst::str_v(ty.bytes()), n, X20, off, X16),
         Place::Pair(lo, hi) => {
-            inst::ldst(buf, inst::STRX, lo, X20, off, X16);
-            inst::ldst(buf, inst::STRX, hi, X20, off + 8, X16);
+            inst::ldst(buf, inst::STRX, lo, X20, off, scratch(lo));
+            inst::ldst(buf, inst::STRX, hi, X20, off + 8, scratch(hi));
         }
         Place::Stack(..) => return Err(Error::at(inst, "a result on the stack")),
     }
@@ -368,7 +378,7 @@ fn load_loc(
 
 /// The value of `ty` at slot `off` into the X register `rd`, extended as `ext` says.
 fn load_x(buf: &mut Buf<'_>, rd: u8, off: u32, ty: ir::Type, ext: Option<bool>) {
-    let tmp = if rd == X16 { X17 } else { X16 };
+    let tmp = scratch(rd);
     inst::ldst(buf, inst::ldr_ext(ty.bytes(), ext == Some(true)), rd, X20, off, tmp);
 }
 
@@ -635,7 +645,7 @@ fn br_table<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Err
 /// position-independent code (the offset added after), `adrp` and `add` when it is near, and
 /// otherwise an absolute literal jumped over.
 fn load_name(buf: &mut Buf<'_>, target: &Target, rd: u8, name: Name, near: bool, offset: i64) {
-    let tmp = if rd == X16 { X17 } else { X16 };
+    let tmp = scratch(rd);
     if target.pic {
         let at = buf.len();
         buf.reloc(at, Reloc::Aarch64AdrGotPage21, name, 0);

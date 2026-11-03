@@ -62,7 +62,7 @@ fn write(loaded: &mut Loaded, texts: &[(FileId, String)]) -> bool {
     if changed.is_empty() {
         return false;
     }
-    loaded.db.batch(|db| {
+    loaded.db.batch(base_db::Trigger::named("the test's edit"), |db| {
         for (file, text) in changed {
             db.set_file_text(*file, text);
         }

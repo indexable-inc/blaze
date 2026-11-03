@@ -497,6 +497,7 @@ impl Image {
         stage.referrers();
         stage.needs()?;
         stage.sweep();
+        stage.cells_of_removed();
         stage.asan_globals(&change)?;
         stage.dangling()?;
         // Each round places what the last made; GOT cells and PLT stubs need nothing past the
@@ -730,6 +731,12 @@ impl Image {
     /// The generation the image is at: counts commits, never reused.
     pub fn generation(&self) -> u64 {
         self.state.generation
+    }
+
+    /// What the image is across its generations ([`Output::live`]'s descriptor `id`): the
+    /// image a running program's patch or restart message is for. Zeros before the first link.
+    pub fn lineage(&self) -> [u8; 16] {
+        self.state.lineage
     }
 
     /// The image's build id as its file says it (Mach-O's `LC_UUID`, ELF's

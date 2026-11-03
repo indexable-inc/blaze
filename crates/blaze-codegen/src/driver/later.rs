@@ -41,7 +41,7 @@ use crate::{
     Backend, CodegenError, CompiledFunction, Instance, InstanceKey, Unit,
     backend::{Frontend, Prepare},
     blob,
-    flight::Asked,
+    flight::{self, Asked},
     memo::Memo,
     plan::{Mode, Origin},
     query::keys,
@@ -140,7 +140,7 @@ fn dev_only<I, S>(key: InstanceKey, node: &FnNode<I, S>) -> Result<(), CodegenEr
         format!(
             "a lazy build compiles each function alone on its first call, and this one's first \
              code is {backend:?}'s, whose imports need the whole build; a live build starts it \
-             at Cranelift"
+             as stencils"
         ),
     ))
 }
@@ -232,11 +232,11 @@ fn compiled<B: Prepare>(
 }
 
 /// [`compiled`], by one build of the memo ([`crate::flight`]), keyed by what the function is
-/// stored under: this call's when it claims it first, after `check`; else the template
-/// another build compiled, taken once it landed. No claim is held while waiting. With the
-/// shape its template is kept under in the memo. A landed template is taken without a
-/// comparison: this call has prepared nothing to compare it with, and the lander's stored
-/// key is this one's, which is what a store hit is taken by too.
+/// stored under: this call's when it asks first, after `check`; else the template another
+/// build compiled, taken once it landed, waited for alone. Nothing is held while waiting. With
+/// the shape its template is kept under in the memo. A landed template is taken without a
+/// comparison: this call has prepared nothing to compare it with, and the lander's stored key
+/// is this one's, which is what a store hit is taken by too.
 #[allow(clippy::too_many_arguments)]
 fn claimed<B: Prepare>(
     backend: &B,
@@ -250,33 +250,55 @@ fn claimed<B: Prepare>(
 ) -> Result<(CompiledFunction, Vec<Put>, Made, ContentId), CodegenError> {
     let (key, at) = (unit.instance.key(), placed(stored(unit.instance.key(), &node.built_in), &node.refs));
     let flights = memo.flights();
-    loop {
-        let mut claims = flights.claims("a function compiled at its first call");
-        let shape = match claims.claim(&[at])[0] {
-            Asked::Landed(shape) => shape,
-            Asked::Ours => {
-                check()?;
-                let made = compiled(backend, frontend, memo, nodes, node, unit, spec)?;
-                claims.land(&[(at, made.3)]);
-                return Ok(made);
-            }
-            Asked::Theirs => {
-                drop(claims);
-                let waited = flights.wait(&[at], || frontend.stopped()).ok_or_else(stopped)?;
-                match waited[0] {
-                    Some(shape) => shape,
-                    // Let go of by the build that claimed it, which did not compile it.
-                    None => continue,
+    let mut plan = flight::Plan::new(1);
+    // alloc: what other builds' waits for this compile name it by, once per later compile
+    let owner: std::sync::Arc<str> = std::sync::Arc::from("a later compile");
+    let shape = loop {
+        let Some(decision) = plan.take_decisions().pop() else {
+            unreachable!("a plan of one function ends taken, run or given up, each returned here")
+        };
+        match decision {
+            flight::Decision::Ask(_) => {
+                let asked = flights.ask(at, &owner, || match check().and_then(|()| compiled(backend, frontend, memo, nodes, node, unit, spec)) {
+                    Ok(made) => (Some(made.3), Ok(made)),
+                    Err(why) => (None, Err(why)),
+                });
+                match asked {
+                    Asked::Ran(made) => return made,
+                    Asked::Theirs => plan.asked(0, flight::Found::Theirs),
+                    Asked::Landed(shape) => plan.asked(0, flight::Found::Landed(shape)),
                 }
             }
-        };
-        return match memo.get(&shape) {
-            Some(template) => {
-                memoized(node, key, dev_template_key(&unit.instance, &node.built_in, &node.refs, &spec.toolchain.id), shape, template).map(|(function, puts)| (function, puts, Made::Flown, shape))
+            flight::Decision::Wait(_) => {
+                if frontend.stopped() {
+                    return Err(stopped());
+                }
+                let landing = flights.wait(at, |it, owner| {
+                    use std::fmt::Write as _;
+                    _ = write!(it, "codegen: `{}` {at:?}, which {owner} compiles", node.described.name);
+                });
+                plan.waited(0, landing);
             }
-            // alloc: an error
-            None => Err(error(key, unit.item, format!("its compile landed under shape {shape:?}, which the memo has no template of"))),
-        };
+            flight::Decision::Take(_, shape) => break shape,
+            flight::Decision::GiveUp { asks, .. } => {
+                return Err(error(
+                    key,
+                    unit.item,
+                    // alloc: an error
+                    format!(
+                        "`{}` ({at:?}) given up: asked for {asks} times, each time another build of the memo compiled it and let it go unlanded (rule 15)",
+                        node.described.name
+                    ),
+                ));
+            }
+        }
+    };
+    match memo.get(&shape) {
+        Some(template) => {
+            memoized(node, key, dev_template_key(&unit.instance, &node.built_in, &node.refs, &spec.toolchain.id), shape, template).map(|(function, puts)| (function, puts, Made::Flown, shape))
+        }
+        // alloc: an error
+        None => Err(error(key, unit.item, format!("its compile landed under shape {shape:?}, which the memo has no template of"))),
     }
 }
 

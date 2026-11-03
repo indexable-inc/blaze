@@ -9,8 +9,6 @@ use std::{
     cell::RefCell,
     fmt::Write,
     hash::BuildHasher,
-    path::PathBuf,
-    process::Command,
     sync::{
         Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
@@ -1531,7 +1529,7 @@ fn assembled(triple: &str, text: &str) -> Result<&'static Assembled, String> {
     if let Some((_, code)) = ASSEMBLED.get(hash, &key) {
         return Ok(code);
     }
-    let code = code(&Assembler::selected().object(triple, text, &key)?)?;
+    let code = code(&assembled_object(triple, text)?)?;
     // Two threads may both have assembled it: the first one kept is the one all are given.
     let (_, code) = ASSEMBLED.insert(hash, key, code).expect("2^36 blocks of assembly at most");
     Ok(code)
@@ -1549,14 +1547,14 @@ pub(super) fn object(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
         return Ok(object.clone());
     }
     // alloc: once per text assembled, the object the process keeps
-    let object: Arc<[u8]> = Assembler::selected().object(triple, text, &key)?.into();
+    let object: Arc<[u8]> = assembled_object(triple, text)?.into();
     let (_, object) = OBJECTS.insert(hash, key, object).expect("2^36 objects of assembly at most");
     // clone: an `Arc`, the one object kept
     Ok(object.clone())
 }
 
 /// How many lines the assembler is given before a text: the switch to Intel's syntax on
-/// x86-64 (`llvm::assemble`, [`as_rustc_gives_it`]). A line its error names is this many
+/// x86-64 (`llvm::assemble`). A line its error names is this many
 /// past the text's own.
 pub(super) fn lines_before(arch: Arch) -> usize {
     match arch {
@@ -1576,189 +1574,40 @@ fn keyed(domain: &str, triple: &str, text: &str) -> ([u8; 32], u64) {
     (key, u64::from_le_bytes(key[..8].try_into().expect("8 bytes")))
 }
 
-/// What turns the text of a block into an object file. `BLAZE_ASSEMBLER=cc` picks the C
-/// compiler in a build with LLVM.
-#[derive(Clone, Copy)]
-enum Assembler {
-    /// The platform's C compiler, run as a process: clang, or a `cc` for the host.
-    Cc,
-    /// LLVM's, in this process, when blaze is built with LLVM.
+/// The object file of `text` for `triple`, assembled by blaze's pinned LLVM's own assembler, in
+/// this process, and by nothing else (docs/v2/plan/toolchain-c.md, slice 1): no C compiler,
+/// clang or `as` of the machine's assembles a block, as what they make depends on whichever one
+/// is installed, which no key names. A blaze built without LLVM assembles nothing and says so.
+/// `BLAZE_ASSEMBLER`, which once picked the machine's C compiler, is refused rather than ignored.
+fn assembled_object(triple: &str, text: &str) -> Result<Vec<u8>, String> {
+    static SET: LazyLock<Option<String>> =
+        LazyLock::new(|| std::env::var_os("BLAZE_ASSEMBLER").map(|it| it.to_string_lossy().into_owned()));
+    if let Some(set) = &*SET {
+        // alloc: the error's message
+        return Err(format!(
+            "inline assembly for {triple}: `BLAZE_ASSEMBLER={set}` is set, and blaze assembles \
+             `asm!`, `naked_asm!` and `global_asm!` only with its pinned LLVM's assembler, never \
+             with the machine's C compiler: unset `BLAZE_ASSEMBLER`"
+        ));
+    }
     #[cfg(feature = "llvm")]
-    Llvm,
-}
-
-impl Assembler {
-    fn selected() -> Assembler {
-        static CC: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("BLAZE_ASSEMBLER").is_some_and(|it| it == "cc"));
-        if *CC {
-            return Assembler::Cc;
-        }
-        #[cfg(feature = "llvm")]
-        return Assembler::Llvm;
-        #[cfg(not(feature = "llvm"))]
-        Assembler::Cc
-    }
-
-    /// The object file of `text`, whose [`keyed`] key is `key`.
-    fn object(self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, String> {
-        match self {
-            Assembler::Cc => run_cc(triple, text, key).unwrap_or_else(|| Err(no_assembler(triple))),
-            #[cfg(feature = "llvm")]
-            Assembler::Llvm => super::llvm::assemble(super::Target::of(triple)?, text),
-        }
+    return super::llvm::assemble(super::Target::of(triple)?, text);
+    #[cfg(not(feature = "llvm"))]
+    {
+        _ = text;
+        Err(no_assembler(triple))
     }
 }
 
-/// The text as rustc hands it to the assembler: `asm!` is in Intel's syntax on x86-64.
-fn as_rustc_gives_it(triple: &str, text: &str) -> String {
-    if triple.starts_with("x86_64") {
-        // alloc: once per text a C compiler assembles, beside the process it spawns
-        let text: Vec<String> = text.lines().map(hash_comment).collect();
-        // alloc: once per text a C compiler assembles, beside the process it spawns
-        format!(".intel_syntax noprefix\n{}\n.att_syntax\n", text.join("\n"))
-    } else {
-        // alloc: once per text a C compiler assembles, beside the process it spawns
-        format!("{text}\n")
-    }
-}
-
-/// The line with a comment of `//`, which LLVM's assembler takes on every target and GNU's
-/// on x86 only at the start of a line, as the `#` both take. A `//` in a string or a
-/// character (`'c'`, `'\c'`) is not one, as LLVM's lexer reads them; a line with a `'`
-/// before it that is not a character is left as it is.
-fn hash_comment(line: &str) -> String {
-    let mut chars = line.char_indices().peekable();
-    while let Some((at, c)) = chars.next() {
-        match c {
-            '"' => loop {
-                match chars.next() {
-                    Some((_, '\\')) => _ = chars.next(),
-                    Some((_, '"')) => break,
-                    Some(_) => {}
-                    // alloc: once per line a C compiler assembles, beside the process it spawns
-                    None => return line.to_owned(),
-                }
-            },
-            '\'' => {
-                if let Some((_, '\\')) = chars.next() {
-                    chars.next();
-                }
-                if !matches!(chars.next(), Some((_, '\''))) {
-                    // alloc: once per line a C compiler assembles, beside the process it spawns
-                    return line.to_owned();
-                }
-            }
-            '/' if matches!(chars.peek(), Some((_, '/'))) => {
-                // alloc: once per line a C compiler assembles, beside the process it spawns
-                return format!("{}#{}", &line[..at], &line[at + 2..]);
-            }
-            _ => {}
-        }
-    }
-    // alloc: once per line a C compiler assembles, beside the process it spawns
-    line.to_owned()
-}
-
-/// The C compiler that assembles for `triple`, with the arguments that say the target:
-/// clang for any target it knows, else `cc` for the host's alone. `None` when there is none.
-fn c_compiler(triple: &str) -> Option<(PathBuf, Vec<String>)> {
-    let paths = std::env::var_os("PATH")?;
-    let find = |name: &str| {
-        // alloc: once per text a C compiler assembles, beside the process it spawns
-        let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-        std::env::split_paths(&paths).map(|dir| dir.join(&name)).find(|it| it.is_file())
-    };
-    if let Some(clang) = find("clang") {
-        // alloc: the spawned compiler's arguments, beside the process
-        return Some((clang, vec![format!("--target={triple}")]));
-    }
-    let host = triple.starts_with(std::env::consts::ARCH)
-        && match std::env::consts::OS {
-            "macos" => triple.contains("-apple-darwin"),
-            "linux" => triple.contains("-linux-"),
-            _ => false,
-        };
-    // alloc: empty, allocates nothing
-    Some((find("cc").filter(|_| host)?, Vec::new()))
-}
-
-/// Why a block for `triple` is not assembled by a build of blaze without LLVM, and what to
-/// install that would.
+/// Why a block for `triple` is not assembled by a build of blaze without LLVM.
+#[cfg(not(feature = "llvm"))]
 fn no_assembler(triple: &str) -> String {
-    let host = triple.starts_with(std::env::consts::ARCH)
-        && matches!(std::env::consts::OS, "macos" | "linux");
-    let or_cc = if host { " or a C compiler (`cc`)" } else { "" };
     // alloc: the error's message
     format!(
-        "inline assembly: nothing here assembles it for {triple}. This blaze was built without \
-         LLVM, so it assembles `asm!` with clang{or_cc}, and there is none on PATH: install \
-         clang, or use a build of blaze with LLVM (`--features llvm`)"
+        "inline assembly for {triple}: this blaze was built without LLVM, and blaze assembles \
+         `asm!`, `naked_asm!` and `global_asm!` only with its pinned LLVM's assembler, never with \
+         the machine's C compiler: use a build of blaze with LLVM (`--features llvm`)"
     )
-}
-
-/// The object file of the block, assembled by the platform's C compiler. `None` when there
-/// is none for `triple`.
-fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Vec<u8>, String>> {
-    let (compiler, target) = c_compiler(triple)?;
-    static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name: String =
-        // alloc: the object's file name, once per text a C compiler assembles
-        key[..8].iter().map(|it| format!("{it:02x}")).chain([format!("-{run}.o")]).collect();
-    // alloc: the directory's name, once per text a C compiler assembles
-    let dir = std::env::temp_dir().join(format!("blaze-asm-{}", std::process::id()));
-    fn failed(what: &str, e: impl std::fmt::Display) -> String {
-        // alloc: the error's message
-        format!("inline assembly: {what}: {e}")
-    }
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return Some(Err(failed("no directory to assemble in", &e)));
-    }
-    let object = dir.join(name);
-    #[allow(clippy::disallowed_methods)]
-    let child = Command::new(&compiler)
-        .args(&target)
-        .args(["-c", "-x", "assembler", "-o"])
-        .arg(&object)
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
-    let output = child.and_then(|mut child| {
-        let mut stdin = child.stdin.take().ok_or(std::io::ErrorKind::BrokenPipe)?;
-        std::io::Write::write_all(&mut stdin, as_rustc_gives_it(triple, text).as_bytes())?;
-        drop(stdin);
-        child.wait_with_output()
-    });
-    // alloc: the compiler's name for an error, once per text a C compiler assembles
-    let said = compiler.display().to_string();
-    let code = match output {
-        Ok(output) if output.status.success() => {
-            std::fs::read(&object).map_err(|e| failed("no object", &e))
-        }
-        // An `xcrun` shim (`/usr/bin/clang` without the command line tools) is one that runs
-        // and assembles nothing: the error names it and what would.
-        Ok(output) => {
-            // alloc: the error's message
-            let said_why = String::from_utf8_lossy(&output.stderr);
-            Err(failed(
-                // alloc: the error's message
-                &format!("{said}, the C compiler this blaze without LLVM assembles `asm!` with, failed"),
-                // alloc: the error's message
-                &format!(
-                    "{}; install a working clang or cc on PATH, or use a build of blaze with LLVM \
-                     (`--features llvm`)",
-                    said_why.trim()
-                ),
-            ))
-        }
-        // alloc: the error's message
-        Err(e) => Err(failed(&format!("{said} did not run"), &e)),
-    };
-    _ = std::fs::remove_file(&object);
-    Some(code)
 }
 
 /// The function in an object that defines it alone. What else the object holds that the
@@ -1884,19 +1733,7 @@ fn holds_code_or_data(section: &object::Section<'_, '_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arch, extensions, hash_comment};
-
-    /// compiler_builtins' `__rust_probestack` ends an instruction with `// ...`.
-    #[test]
-    fn a_comment_of_two_slashes_is_one_gnu_as_reads() {
-        assert_eq!(hash_comment("mov r11, rax // dup"), "mov r11, rax # dup");
-        assert_eq!(hash_comment(".ascii \"a//b\\\"//\" // c"), ".ascii \"a//b\\\"//\" # c");
-        assert_eq!(hash_comment("// we're guaranteed"), "# we're guaranteed");
-        assert_eq!(hash_comment("mov al, '/' // c'"), "mov al, '/' # c'");
-        assert_eq!(hash_comment("mov al, '\\'' // c"), "mov al, '\\'' # c");
-        assert_eq!(hash_comment("mov al, 'ab' // c"), "mov al, 'ab' // c");
-        assert_eq!(hash_comment("div rcx"), "div rcx");
-    }
+    use super::{Arch, extensions};
 
     /// constant_time_eq's `#[target_feature(enable = "dit")]` reads DIT, which LLVM's
     /// assembler has no extension of: the architecture that has it comes before the

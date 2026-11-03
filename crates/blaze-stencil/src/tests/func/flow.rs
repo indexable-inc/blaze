@@ -327,6 +327,28 @@ pub fn brifs(mk: &Mk) -> Family {
     Family::new("flow/brifs", vec![entry])
 }
 
+/// Code built to keep (`Target::counts` off, a build's or a test's) names no counter cell on
+/// any target, and is shorter than the counting code of the same function.
+#[test]
+fn uncounted_code_names_no_counter_cell() {
+    for target in crate::tests::host::TARGETS {
+        let counting = Mk::new(target);
+        let plain = Mk::new(crate::Target { counts: false, ..target });
+        for (counted, uncounted) in [(loops(&counting), loops(&plain)), (table_loop(&counting), table_loop(&plain))] {
+            for (i, (a, b)) in counted.funcs.iter().zip(&uncounted.funcs).enumerate() {
+                let compile = |func: &ir::Function, target: &crate::Target| {
+                    crate::compile(func, target).unwrap_or_else(|e| panic!("{} u0:{i} on {target:?}: {e}", counted.name))
+                };
+                let (a, b) = (compile(a, &counting.target), compile(b, &plain.target));
+                let names_counter = |code: &crate::Code| code.relocs.iter().any(|it| it.name == crate::code::Name::Counter);
+                assert!(names_counter(&a), "{} u0:{i} on {target:?}: counting code counts", counted.name);
+                assert!(!names_counter(&b), "{} u0:{i} on {target:?}: code built to keep counts nothing", counted.name);
+                assert!(b.bytes.len() < a.bytes.len(), "{} u0:{i} on {target:?}: no counting code", counted.name);
+            }
+        }
+    }
+}
+
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod run {
     use cranelift_codegen::{
@@ -378,6 +400,22 @@ mod run {
         check_counted(&mk, &family, &inputs, &Opts::interp(), |input| {
             super::loops_counts(int(input, 0), int(input, 1), int(input, 2))
         });
+    }
+
+    /// Code that counts nothing runs as counting code does, its cells untouched: the loops of
+    /// a build's or a test's code.
+    #[test]
+    fn uncounted_loops_run_alike_and_count_nothing() {
+        let Some(mk) = host_mk() else { return };
+        let mk = super::Mk::new(crate::Target { counts: false, ..mk.target });
+        let family = super::loops(&mk);
+        let mut inputs = vec![i64s(&[0, 0, 0]), i64s(&[1, 1, 1]), i64s(&[15, 15, 31]), i64s(&[3, 0, 2])];
+        inputs.extend(random_inputs(35, &family, 16));
+        check_counted(&mk, &family, &inputs, &Opts::interp(), |_| vec![[0, 0]; 2]);
+        let family = super::table_loop(&mk);
+        let mut inputs = vec![i64s(&[0, 1]), i64s(&[15, -1]), i64s(&[8, 3])];
+        inputs.extend(random_inputs(36, &family, 16));
+        check_counted(&mk, &family, &inputs, &Opts::interp(), |_| vec![[0, 0]]);
     }
 
     #[test]

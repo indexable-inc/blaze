@@ -544,7 +544,10 @@ pub(crate) struct Start {
     /// The environment it is started in, which its output is read with.
     env: Vec<(OsString, OsString)>,
     /// The machine's files and the run's environment, as what it read is checked against:
-    /// made once per run, so no check sorts the environment again or takes a shared lock.
+    /// made once per run, so no check sorts the environment again or takes a shared lock. Its
+    /// environment is the run's own key's check ([`Prepared::env`]: the given names left out),
+    /// never a pure key's, which reads the script's whole environment
+    /// ([`Prepared::script_env`]).
     disk: blaze_usercode::inputs::Disk,
     how: How,
     /// What elision says the script prints, when it is inert: its result when it is not run
@@ -1202,7 +1205,7 @@ impl Runs<Real> for ScriptRun {
                                 return self.error(what, out);
                             }
                         };
-                        match pure::keep(&job, run_unit, unit, checked, store, disk, &prepared.spec.roots, &value) {
+                        match pure::keep(&job, run_unit, unit, checked, store, prepared.script_env(), &prepared.spec.roots, &value) {
                             Ok(puts) => self.puts.extend(puts),
                             Err((what, puts)) => {
                                 self.puts.extend(puts);
@@ -1251,7 +1254,7 @@ impl Runs<Real> for ScriptRun {
                                     what = format!("{what}; and {more}"); // alloc: error path
                                 }
                             }
-                            match pure::keep(&job, run_unit, unit, checked, store, disk, &prepared.spec.roots, ran) {
+                            match pure::keep(&job, run_unit, unit, checked, store, prepared.script_env(), &prepared.spec.roots, ran) {
                                 Ok(puts) => self.puts.extend(puts),
                                 Err((more, puts)) => {
                                     self.puts.extend(puts);

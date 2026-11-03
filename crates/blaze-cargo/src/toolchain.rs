@@ -1,14 +1,17 @@
-//! blaze's own toolchain, the Rust `blaze` builds with: `blaze-2026-10-25` ([`name`]), today
-//! the Rust nightly of that date (docs/toolchain.md). The language and standard library are the
+//! blaze's own toolchain, the Rust `blaze` builds with: `blaze-<date>` ([`name`]), today the
+//! Rust nightly of that date (`harness/toolchain`, docs/toolchain.md). The language and standard library are the
 //! ones this blaze ships, and nothing else picks them: blaze ignores `RUSTC`,
 //! `RUSTUP_TOOLCHAIN`, rustup's settings and the project's `rust-toolchain` files, and never
 //! runs or asks a rustc to learn anything (docs/no-rustc.md). A project that needs another
 //! Rust pins another blaze (`[workspace.metadata.blaze] version`).
 //!
-//! The files of the release (its cargo, rustc and lld, the standard library of each target)
-//! are found on disk with nothing run: rustup's copy of the release when it has one, else
-//! blaze's own copy (`own.rs`), which [`own::fetch`] downloads. The source of the
-//! standard library is not the release's: it is blaze's own `library/` ([`library`]).
+//! The files of the release that blaze's linker still takes (the sanitizer runtimes and
+//! wasm32-wasip1's C runtime) are blaze's own copy of the release (`own.rs`), which
+//! [`own::fetch`] downloads, each file checked against its sha256 in `pins.txt`. rustup's
+//! directory is never read, not even as a copy of the same files: a toolchain found by its
+//! directory's name is trusted by name, and its bytes are whatever was installed there
+//! (docs/v2/plan/toolchain-c.md, slice 2). The source of the standard library is not the
+//! release's: it is blaze's own `library/` ([`library`]).
 
 pub mod library;
 pub mod own;
@@ -51,54 +54,36 @@ pub fn host() -> Option<&'static str> {
     own::host()
 }
 
-/// Where the files of blaze's release are.
-pub enum Chosen {
-    Rustup(PathBuf),
-    Own(PathBuf),
-}
+/// Where the files of blaze's release are: blaze's own copy, never rustup's.
+pub struct Chosen(PathBuf);
 
 impl Chosen {
     /// Where the toolchain is: its sysroot.
     pub fn dir(&self) -> &Path {
-        match self {
-            Chosen::Rustup(dir) | Chosen::Own(dir) => dir,
-        }
+        &self.0
     }
 }
 
 impl std::fmt::Display for Chosen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (name, ours) = (name(), OURS.trim());
-        let dir = self.dir().display();
-        match self {
-            Chosen::Rustup(_) => {
-                write!(f, "{name}, blaze's toolchain (Rust {ours}), rustup's copy at {dir}")
-            }
-            Chosen::Own(_) => write!(f, "{name}, blaze's toolchain (Rust {ours}), at {dir}"),
-        }
+        write!(f, "{name}, blaze's toolchain (Rust {ours}), at {}", self.0.display())
     }
 }
 
-/// The files of blaze's release, found with nothing run: rustup's copy, else blaze's own when it
-/// is whole. `None` when neither is there.
+/// The files of blaze's release, found with nothing run: blaze's own copy when it has every
+/// component `pins.txt` pins. `None` when it is not there or not whole.
 pub fn found() -> Option<Chosen> {
     if let Some(dir) = FOUND.get() {
-        return Some(chosen_at(dir.clone()));
+        return Some(Chosen(dir.clone()));
     }
-    let ours = OURS.trim();
-    let chosen = match rustup_home().and_then(|home| installed(&home, ours)) {
-        Some(dir) => Chosen::Rustup(dir),
-        _ => {
-            let release = own::Release::ours()?;
-            let dir = release.dir()?;
-            if !own::complete(&release, &dir) {
-                return None;
-            }
-            Chosen::Own(dir)
-        }
-    };
-    let _ = FOUND.set(chosen.dir().to_owned());
-    Some(chosen)
+    let release = own::Release::ours()?;
+    let dir = release.dir()?;
+    if !own::complete(&release, &dir) {
+        return None;
+    }
+    let _ = FOUND.set(dir.clone());
+    Some(Chosen(dir))
 }
 
 /// [`found`], else blaze's own copy of the release, downloaded once: what a command needs
@@ -121,7 +106,7 @@ pub fn ensure() -> Result<Chosen, String> {
     };
     own::fetch(&release, &dir)?;
     let _ = FOUND.set(dir.clone());
-    Ok(Chosen::Own(dir))
+    Ok(Chosen(dir))
 }
 
 /// Where [`found`] found blaze's release, or was told it is ([`known_at`]).
@@ -132,14 +117,9 @@ pub fn ensure() -> Result<Chosen, String> {
 static FOUND: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Tells this process where blaze's release is, as the blaze that started it found it: a
-/// build script's sandbox may not see where rustup and blaze keep toolchains.
+/// build script's sandbox may not see where blaze keeps its toolchain.
 pub fn known_at(sysroot: PathBuf) {
     let _ = FOUND.set(sysroot);
-}
-
-fn chosen_at(dir: PathBuf) -> Chosen {
-    let own = own::Release::ours().and_then(|it| it.dir());
-    if own.as_deref() == Some(&*dir) { Chosen::Own(dir) } else { Chosen::Rustup(dir) }
 }
 
 /// The sysroot of blaze's release: what blaze answers `rustc --print sysroot` with. Looked for
@@ -216,41 +196,6 @@ fn base(address: &str) -> anyhow::Result<url::Url> {
     Ok(url::Url::parse(&format!("{}/", address.trim_end_matches('/')))?)
 }
 
-/// Where rustup keeps its toolchains, which is only where to look for a copy of blaze's
-/// release: what rustup would pick is not asked.
-fn rustup_home() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("RUSTUP_HOME") {
-        return Some(PathBuf::from(home));
-    }
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
-    Some(PathBuf::from(home).join(".rustup")).filter(|it| it.is_dir())
-}
-
-/// The directory rustup installed `release` for this host in:
-/// `nightly-2026-10-25-aarch64-apple-darwin`. One of another host's is none: its libraries
-/// are not this host's.
-fn installed(home: &Path, release: &str) -> Option<PathBuf> {
-    let prefix = format!("{release}-");
-    let cargo = format!("cargo{}", std::env::consts::EXE_SUFFIX);
-    let mut found: Vec<PathBuf> = std::fs::read_dir(home.join("toolchains"))
-        .ok()?
-        .flatten()
-        .filter(|it| it.file_name().to_str().is_some_and(|name| name.starts_with(&prefix)))
-        .map(|it| it.path())
-        .filter(|it| it.join("bin").join(&cargo).is_file())
-        .collect();
-    found.sort();
-    let host = |dir: &PathBuf| {
-        let name = dir.file_name().and_then(|it| it.to_str()).unwrap_or_default();
-        let os = match std::env::consts::OS {
-            "macos" => "apple-darwin",
-            os => os,
-        };
-        name[prefix.len()..].starts_with(std::env::consts::ARCH) && name.contains(os)
-    };
-    found.into_iter().find(host)
-}
-
 /// The `rust-toolchain` or `rust-toolchain.toml` nearest `dir`, which rustup would follow and
 /// blaze does not.
 pub fn toolchain_file(dir: &Path) -> Option<PathBuf> {
@@ -300,24 +245,5 @@ mod tests {
             NotUtf8Var("BLAZE_RUST_DIST").to_string(),
             "`BLAZE_RUST_DIST` is not UTF-8, and blaze reads the address or directory it names as text"
         );
-    }
-
-    #[test]
-    fn rustups_toolchain_of_another_host_is_not_this_ones() {
-        let home = tempfile::tempdir().unwrap();
-        let make = |name: &str| {
-            let bin = home.path().join("toolchains").join(name).join("bin");
-            std::fs::create_dir_all(&bin).unwrap();
-            std::fs::write(bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX)), "").unwrap();
-        };
-        make("nightly-2026-10-25-riscv64gc-unknown-none-elf");
-        assert_eq!(installed(home.path(), "nightly-2026-10-25"), None);
-        let os = match std::env::consts::OS {
-            "macos" => "apple-darwin",
-            os => os,
-        };
-        let ours = format!("nightly-2026-10-25-{}-{os}", std::env::consts::ARCH);
-        make(&ours);
-        assert_eq!(installed(home.path(), "nightly-2026-10-25"), Some(home.path().join("toolchains").join(ours)));
     }
 }

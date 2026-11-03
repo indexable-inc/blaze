@@ -3,6 +3,10 @@
 //! that gave it to the pool, when the record names that job. The links are contiguous, so their
 //! durations add up to the path's length.
 
+use std::alloc::Global;
+
+use blaze_hash::HashMap;
+
 use super::{Model, State};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,4 +190,106 @@ pub fn critical(model: &Model) -> Path {
     }
     links.reverse();
     Path { links, reached }
+}
+
+/// The critical path's running links cut by the innermost span open on their lane: (from, to,
+/// span, lane), in path order; `None` where no span of the lane is open.
+pub fn segments(model: &Model, path: &Path) -> Vec<(i64, i64, Option<usize>, usize)> {
+    // alloc: once a report
+    let mut cuts: HashMap<usize, Vec<(i64, i64, usize)>, Global> = HashMap::new_in(Global);
+    // alloc: once a report
+    let mut out = Vec::new();
+    for link in path.links.iter().filter(|it| it.kind == LinkKind::Ran) {
+        // alloc: a lane's cut, once a lane on the path
+        let cut = cuts.entry(link.lane).or_insert_with(|| innermost(model, link.lane));
+        let mut t = link.from_ns;
+        let at = cut.partition_point(|it| it.1 <= link.from_ns);
+        for &(from, to, span) in &cut[at..] {
+            if from >= link.to_ns {
+                break;
+            }
+            let (from, to) = (from.max(link.from_ns), to.min(link.to_ns));
+            if from > t {
+                out.push((t, from, None, link.lane));
+            }
+            if to > from {
+                out.push((from, to, Some(span), link.lane));
+            }
+            t = t.max(to);
+        }
+        if t < link.to_ns {
+            out.push((t, link.to_ns, None, link.lane));
+        }
+    }
+    out
+}
+
+/// A lane's time cut by the innermost of its spans open, end to end where spans are: (from, to,
+/// span), sorted, none overlapping.
+pub fn innermost(model: &Model, lane: usize) -> Vec<(i64, i64, usize)> {
+    let spans = &model.spans;
+    // alloc: a lane's cut, once a lane on the path
+    let mut out: Vec<(i64, i64, usize)> = Vec::new();
+    // alloc: a lane's open spans, once a lane on the path
+    let mut open: Vec<usize> = Vec::new();
+    let mut t = i64::MIN;
+    let emit = |out: &mut Vec<(i64, i64, usize)>, from: i64, to: i64, span: usize| {
+        if to > from {
+            out.push((from, to, span));
+        }
+    };
+    for &i in &model.lanes[lane].spans {
+        let start = spans[i].start_ns;
+        while let Some(&top) = open.last()
+            && spans[top].end_ns() <= start
+        {
+            emit(&mut out, t, spans[top].end_ns(), top);
+            t = t.max(spans[top].end_ns());
+            open.pop();
+        }
+        if let Some(&top) = open.last() {
+            emit(&mut out, t, start, top);
+        }
+        t = t.max(start);
+        open.push(i);
+    }
+    while let Some(top) = open.pop() {
+        emit(&mut out, t, spans[top].end_ns(), top);
+        t = t.max(spans[top].end_ns());
+    }
+    out
+}
+
+/// What the critical path ran, by query: its running time under each innermost span, summed by
+/// the span's name and what it was about (a query span's `function`, a unit phase's unit), so
+/// the queries the build's length stood on are named, not the jobs they ran in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnPath {
+    /// The span's name; `None` for running time under no span of its lane.
+    pub name: Option<String>,
+    pub subject: Option<String>,
+    pub ns: i64,
+    /// The path's stretches under it.
+    pub stretches: u64,
+}
+
+/// [`OnPath`] of each innermost span on `path`, the most time first (by name and subject on a
+/// tie), and the path's running time under none.
+pub fn by_query(model: &Model, path: &Path) -> Vec<OnPath> {
+    // alloc: once a report
+    let mut sums: HashMap<(Option<&str>, Option<&str>), (i64, u64), Global> = HashMap::new_in(Global);
+    for (from, to, span, _) in segments(model, path) {
+        let key = span.map_or((None, None), |it| (Some(model.spans[it].name.as_str()), model.spans[it].subject()));
+        let sum = sums.entry(key).or_insert((0, 0));
+        sum.0 += to - from;
+        sum.1 += 1;
+    }
+    let mut out: Vec<OnPath> = sums
+        .into_iter()
+        // alloc: a row's labels, once a row a report
+        .map(|((name, subject), (ns, stretches))| OnPath { name: name.map(str::to_owned), subject: subject.map(str::to_owned), ns, stretches })
+        // alloc: once a report
+        .collect();
+    out.sort_by(|a, b| b.ns.cmp(&a.ns).then_with(|| (&a.name, &a.subject).cmp(&(&b.name, &b.subject))));
+    out
 }

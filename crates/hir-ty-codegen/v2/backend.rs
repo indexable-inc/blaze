@@ -32,7 +32,7 @@ use hir_ty_mir::mir::MirSpan;
 
 use super::{
     Built, DataPlace, Function, HashSource, Hashes, HirFrontend, HirInstance, Kind, Places, Prepared,
-    build::{self, Build},
+    build::Build,
     failed,
     places::{Placer, Ref, evaluated, place_requests, resolve},
     refs, shape, side,
@@ -42,7 +42,6 @@ use crate::{
     debuginfo::{LineRow, SlotPlaces, VariablePlace},
     fragment::{self, Hint, Requests},
     frame_map::{self, FrameHashMap},
-    home::Homes,
     instance_code,
     unwind::FunctionUnwind,
 };
@@ -64,19 +63,19 @@ const CHANGES_CODE: &[&str] = &[
     "BLAZE_EMIT",
     "BLAZE_NO_HOME",
     "BLAZE_BUILT_IN",
+    // asm.rs: `0` lowers inline asm another way.
+    "BLAZE_INLINE_ASM",
+    // llvm.rs: LLVM's inliner threshold, read once per process; code inlined at another is other code.
+    "BLAZE_LLVM_INLINE_THRESHOLD",
 ];
 
 /// Whether the process's code generator is the one `spec` asks for: its IR as
 /// [`check_built`] says, compiled to code that is position-independent or static as the
-/// toolchain says and, for a stencil unit, counts its calls.
+/// toolchain says, counting only where the code can count.
 fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
     check_built(unit, spec)?;
     let fail = |what: String| failed(unit, what);
     let (cranelift, stencil) = (spec.backend.is_cranelift(), spec.backend == Backend::Stencil);
-    if stencil && !spec.counted {
-        // alloc: an error
-        return Err(fail("a stencil unit that does not count its calls: stencil code always does".to_owned()));
-    }
     if spec.counted && !cranelift && !stencil {
         // alloc: an error
         return Err(fail(format!(
@@ -260,7 +259,6 @@ impl Backends<'_> {
     pub(super) fn prepared(
         &self,
         db: &Db,
-        homes: &mut Homes,
         hashes: &HashSource,
         unit: &Unit,
         spec: &Spec,
@@ -271,7 +269,7 @@ impl Backends<'_> {
         // tables, the shape's tables) is in a frame of the worker's, reset when it returns;
         // what it keeps (the IR, its places, spans, variables and scopes) is the heap's.
         blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
-            let function = built_function(db, homes, hashes, unit, spec, (instance, walking), refs, frame)?;
+            let function = built_function(db, hashes, unit, spec, (instance, walking), refs, frame)?;
             let shape = shape::of(unit, &function, frame)
                 // alloc: an error
                 .map_err(|what| failed(unit, format!("{}: {what}", super::Named(db, instance))))?;
@@ -306,7 +304,6 @@ fn unwalked(what: String, build: Build, inlined: bool) -> String {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn built_function(
     db: &Db,
-    homes: &mut Homes,
     hashes: &HashSource,
     unit: &Unit,
     spec: &Spec,
@@ -356,18 +353,16 @@ pub(super) fn built_function(
             )));
         }
     }
-    let mut code = build::with(build, || built(db, instance, target, spec.overflow_checks))
-        .map_err(fail)?
-        .map_err(fail)?;
+    let mut code = built(db, instance, target, spec.overflow_checks, build).map_err(fail)?;
     let (places, source, variables) = match &mut code {
         Built::Ir(pending) => {
             let requests = &mut pending.wants.requests;
-            let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
+            let places = place_requests(db, hashes, krate, &mut placer, requests)
                 .map_err(|what| fail(unwalked(what, build, inlined)))?;
             (places, pending.source.take(), pending.variables.take())
         }
         Built::Assembled(_, requests) => {
-            let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
+            let places = place_requests(db, hashes, krate, &mut placer, requests)
                 .map_err(|what| fail(unwalked(what, build, inlined)))?;
             (places, None, None)
         }
@@ -587,28 +582,43 @@ fn foldable(db: &Db, instance: &HirInstance) -> Result<bool, String> {
     })
 }
 
-/// The IR of an instance, built as a unit with overflow checks `checked` asks.
+/// The IR of an instance, built as a unit with overflow checks `checked` asks, under the
+/// unit's settings `build`. They come in as an argument, never off the thread: the compile
+/// waits in queries, after which its fiber may be on another thread, or interleaved with
+/// another unit's compile on this one (rule 24). Each body it reads is keyed by the options
+/// `build` derives for it ([`Build::options`]), so what it builds follows from its arguments
+/// alone (rule 18). An `asm!` block's code is its text, the same under every unit's settings.
 pub(super) fn built(
     db: &Db,
     instance: &HirInstance,
     target: &'static crate::Target,
     checked: bool,
+    build: Build,
 ) -> Result<Built, String> {
+    // A unit's compile is no part of a compile at a level above 1 that may be under way on
+    // the thread: what it builds in is the unit's (`Build::built_in`), not that compile's.
+    crate::tier::plain(|| built_plain(db, instance, target, checked, build))
+}
+
+fn built_plain(
+    db: &Db,
+    instance: &HirInstance,
+    target: &'static crate::Target,
+    checked: bool,
+    build: Build,
+) -> Result<Built, String> {
+    let unit = Some(build);
     let produced = match &instance.0 {
         Kind::Code(instance, env) => {
             let instance = Instance { checked, ..*instance };
-            instance_code(db, instance, *env, Detach::Unit, super::build::building())
+            instance_code(db, instance, *env, Detach::Unit, unit)
         }
         Kind::Start(main) => {
             let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
-            compile_as(db, env, None, false, checked, true, |fx| fx.start_shim(*main))
+            compile_as(db, env, None, false, checked, true, unit, |fx| fx.start_shim(*main))
         }
-        Kind::Asm(text, _) => {
-            // An `asm!` block's code is its text, the same under every unit's settings.
-            _ = super::build::building();
-            return assembled(target, text);
-        }
-        Kind::Allocator(forward) => super::allocator::built(db, forward, checked),
+        Kind::Asm(text, _) => return assembled(target, text),
+        Kind::Allocator(forward) => super::allocator::built(db, forward, checked, unit),
     }
     .map_err(|e| e.to_string())?; // alloc: the error's message
     Ok(match produced {
@@ -889,9 +899,11 @@ pub(crate) fn emit_cranelift(
 }
 
 /// Compiles a prepared function by copy-and-patch (`blaze_stencil`), against `refs`.
-fn emit_stencil(unit: &Unit, function: Box<Function>, refs: &Refs) -> Result<Emitted, CodegenError> {
+/// Copies a prepared function's stencils, against `refs`; `counted`, its code counts its calls
+/// and back edges into its own cells.
+fn emit_stencil(unit: &Unit, function: Box<Function>, refs: &Refs, counted: bool) -> Result<Emitted, CodegenError> {
     let target = function.target;
-    emit_built(unit, function, refs, |func, named| stenciled(unit, target, func, named))
+    emit_built(unit, function, refs, |func, named| stenciled(unit, target, func, named, counted))
 }
 
 /// A prepared function's code, its IR made code by `backend` (given the stack slots of its
@@ -1111,15 +1123,17 @@ fn stenciled(
     target: &'static crate::Target,
     func: ir::Function,
     named: &[ir::StackSlot],
+    counted: bool,
 ) -> Result<fragment::Code, CodegenError> {
     if unit.backend != Backend::Stencil {
         // alloc: an error
         return Err(failed(unit, format!("copy-and-patch code of a unit for {:?}", unit.backend)));
     }
-    let Some(stencils) = target.stencil() else {
+    let Some(mut stencils) = target.stencil() else {
         // alloc: an error
         return Err(failed(unit, format!("copy-and-patch code for {}, which has no stencils", target.triple())));
     };
+    stencils.counts = counted;
     crate::with_context(func, |context| {
         let pairs = stencil_ir(&mut context.func);
         let func = &context.func;
@@ -1210,9 +1224,9 @@ impl<'db> Prepare for Backends<'db> {
         refs: &Refs,
     ) -> Result<(Shape, Prepared), CodegenError> {
         check_spec(unit, spec)?;
-        frontend.with(|db, homes| {
+        frontend.with(|db| {
             let walking = frontend.walking(db, instance).map_err(|e| failed(unit, e))?;
-            self.prepared(db, homes, &frontend.hashes, unit, spec, (instance, walking), refs)
+            self.prepared(db, &frontend.hashes, unit, spec, (instance, walking), refs)
         })
     }
 
@@ -1254,7 +1268,7 @@ impl<'db> Prepare for Backends<'db> {
                 if imports.is_some() {
                     return Err(failed(unit, "imports for a stencil unit: imports are LLVM's"));
                 }
-                emit_stencil(unit, function, refs)
+                emit_stencil(unit, function, refs, spec.counted)
             }
         }
     }
@@ -1318,9 +1332,9 @@ impl<'db> Prepare for Backends<'db> {
         value: &super::HirStatic,
         refs: &Refs,
     ) -> Result<Static, CodegenError> {
-        frontend.with(|db, homes| {
+        frontend.with(|db| {
             let hashes = &frontend.hashes;
-            super::statics::compile(db, homes, hashes, spec.toolchain.arch, value.0, refs)
+            super::statics::compile(db, hashes, spec.toolchain.arch, value.0, refs)
                 .map_err(|what| super::undescribed(db, &super::StaticNamed(db, value.0), None, what))
         })
     }

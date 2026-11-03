@@ -450,7 +450,9 @@ const START: Duration = Duration::from_secs(60);
 pub struct Program {
     host: Arc<Host>,
     memory: Arc<Mutex<CodeMemory>>,
-    image: Image,
+    /// Changed only with `memory` locked ([`Program::relaid`]), so a launch, which reads it
+    /// with `memory` locked, writes the file of the memory it maps.
+    image: Mutex<Image>,
     sessions: crossbeam_channel::Sender<Result<Session, Error>>,
     starts: Arc<Mutex<Starts>>,
 }
@@ -486,7 +488,20 @@ impl Program {
     /// `memory` laid out ([`CodeMemory::lay_out`]), its image part the executable `image`
     /// names.
     pub fn new(host: Arc<Host>, memory: Arc<Mutex<CodeMemory>>, image: Image, sessions: crossbeam_channel::Sender<Result<Session, Error>>) -> Program {
-        Program { host, memory, image, sessions, starts: Arc::default() }
+        Program { host, memory, image: Mutex::new(image), sessions, starts: Arc::default() }
+    }
+
+    /// The executable is now `image`: `memory`, which the caller holds locked, was committed
+    /// into and laid out again ([`CodeMemory::lay_out`]), so its image part is that file. Runs
+    /// started from here on are written from it; runs already started keep theirs.
+    pub fn relaid(&self, memory: &CodeMemory, image: Image) -> Result<(), Error> {
+        if !memory.is_pristine() {
+            return Err(Error::new(
+                "a program's executable changed to a code memory not laid out since its last write".to_owned(),
+            ));
+        }
+        *self.image.lock() = image;
+        Ok(())
     }
 
     pub fn memory(&self) -> &Arc<Mutex<CodeMemory>> {
@@ -516,11 +531,13 @@ impl Program {
     ) -> Result<(Command, Started), Error> {
         let (command, pending) = {
             let memory = lock(&self.memory);
+            // clone: once per launch, a key, a length and a store path
+            let image = self.image.lock().clone();
             let executable = Executable {
                 path: &command.program,
-                key: self.image.key,
-                len: self.image.len,
-                store: self.image.store.as_deref(),
+                key: image.key,
+                len: image.len,
+                store: image.store.as_deref(),
             };
             self.host.write_executable(&memory, &executable)?;
             let launch = Launch {

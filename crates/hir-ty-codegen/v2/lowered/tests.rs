@@ -167,9 +167,9 @@ fn function(db: &TestDB, name: &str) -> FunctionId {
 
 /// One target a reference, each another symbol.
 fn refs_of(frontend: &HirFrontend<'_>, instance: &HirInstance) -> Vec<Target> {
-    frontend.with(|db, homes| {
+    frontend.with(|db| {
         let inlined = frontend.inlines(db, instance).expect("the policy");
-        let walked = refs::walk(db, instance, refs::Walking::plain(inlined), homes).expect("the walk");
+        let walked = refs::walk(db, instance, refs::Walking::plain(inlined)).expect("the walk");
         (0..walked.len()).map(|at| Target::Extern(format!("ref{at}"))).collect()
     })
 }
@@ -286,7 +286,7 @@ fn the_reach_of_a_root_is_the_drivers() {
     let (db, frontend) = frontend();
     let policy = policy();
     let root = frontend.root(function(db, "caller"));
-    let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+    let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
     let roots = [(root, origin)];
     let backends = Backends::default();
     let memo = Memo::new();

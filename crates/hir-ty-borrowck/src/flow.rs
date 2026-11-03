@@ -149,7 +149,8 @@ pub(super) fn analyze<'a, 'db>(
     let mut fuel = Fuel { used: 0 };
     let mut universal = bits(frame, count);
     for &(rv, _) in &regions.universals {
-        if rv < count {
+        // An answered placeholder holds no point (`inference::answer_placeholders`).
+        if rv < count && !regions.answered_placeholders.contains(&rv) {
             universal.insert(rv);
         }
     }

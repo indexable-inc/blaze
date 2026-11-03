@@ -1269,6 +1269,11 @@ bitflags::bitflags! {
         /// `#[blaze::specialization_trait]`: the always-applicable kind came from blaze's
         /// extension, so its impls are held to blaze's rules in every crate.
         const BLAZE_SPECIALIZATION_TRAIT = 1 << 14;
+        /// `#[blaze::sealed]`: no crate but the trait's may implement it or name it as a
+        /// supertrait. In coherence a trait-ref of it has no downstream conflict
+        /// (`Interner::trait_is_sealed`), and when it is closed over local types a parameter
+        /// bounded by it is local in its crate's orphan check (`hir_ty::sealed_local_bound`).
+        const SEALED = 1 << 15;
     }
 }
 
@@ -1286,6 +1291,7 @@ impl TraitFlags {
             BLAZE_SPECIALIZATION_TRAIT => SPECIALIZATION_ALWAYS_APPLICABLE,
             RUSTC_UNSAFE_SPECIALIZATION_MARKER => SPECIALIZATION_UNSAFE_MARKER,
             BLAZE_SPECIALIZATION_TRAIT => BLAZE_SPECIALIZATION_TRAIT,
+            BLAZE_SEALED => SEALED,
         })
     }
 }

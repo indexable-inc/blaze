@@ -88,6 +88,7 @@ pub enum ResponseRef<'a> {
     UnitBegan(#[serde(borrow)] UnitOfRef<'a>),
     TestReady(Artifact),
     Rebuilt(Rebuilt),
+    Launched { live: bool, env: Vec<(String, String)> },
 }
 
 /// [`LiveFrame`], read where it lies: a frame every 250 ms decodes with no copy of its tables.
@@ -329,6 +330,7 @@ impl ResponseRef<'_> {
             ResponseRef::UnitBegan(it) => Response::UnitBegan(it.into_owned()),
             ResponseRef::TestReady(it) => Response::TestReady(it),
             ResponseRef::Rebuilt(it) => Response::Rebuilt(it),
+            ResponseRef::Launched { live, env } => Response::Launched { live, env },
         }
     }
 }

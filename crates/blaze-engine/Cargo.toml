@@ -78,8 +78,15 @@ cfg.workspace = true
 hir.workspace = true
 intern.workspace = true
 
+# `BLAZE_CODEGEN_CODE` (build.rs): the code generator's code identity, of the packages it is
+# built from, so a rebuild that edits none of them keeps every stored template.
+[build-dependencies]
+blaze-codegen-code.workspace = true
+
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# as_rustc's tests: what blaze answers `rustc -vV` is a compiler the code identity takes.
+blaze-codegen-code.workspace = true
 
 [features]
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm`.

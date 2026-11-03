@@ -905,7 +905,7 @@ pub(super) struct Recorder<'db> {
     pub(super) target: &'static Target,
     /// Whether the crate compiling the function has `-C overflow-checks`.
     pub(super) checked: bool,
-    /// The settings of the v2 unit the function is built for ([`super::v2::build::building`]):
+    /// The settings of the v2 unit the function is built for (`v2::backend::built`'s `build`):
     /// its `-C debug-assertions` and panic strategy in place of the crate's, and no callee's
     /// body built in, which the unit's key would not name. `None` outside a v2 unit.
     pub(super) unit: Option<super::v2::build::Build>,
@@ -1472,13 +1472,18 @@ impl<'db> Recorder<'db> {
         isa: &'static dyn TargetIsa,
         target: &'static Target,
         checked: bool,
+        // The v2 unit's settings the function is built under, from its caller's key; `None` in
+        // v1. Never read off the thread: a compile can wait inside
+        // (`instance_body` is a query), and a fiber resumes on any thread, whose unit is another
+        // compile's or none (rule 24), while what it builds is memoized by its own key (rule 18).
+        unit: Option<super::v2::build::Build>,
     ) -> Self {
         Recorder {
             db,
             isa,
             target,
             checked,
-            unit: super::v2::build::building(),
+            unit,
             wants: Wants::new(target, isa),
             vtables: HashTable::new(),
             statics: HashMap::new_in(Global),
