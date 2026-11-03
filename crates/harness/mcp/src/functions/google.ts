@@ -1,4 +1,5 @@
 import { withHiddenPage, type Page } from "../cdp.ts";
+import { table, type Table } from "../table.ts";
 
 export type SearchResult = {
   title: string;
@@ -12,7 +13,7 @@ export type SearchResult = {
 };
 
 /** Search Google in a hidden tab of the browser on CDP :9222 (Dia) and return the organic results. */
-export async function googleSearch(query: string, opts: { limit?: number; hl?: string } = {}): Promise<SearchResult[]> {
+export async function googleSearch(query: string, opts: { limit?: number; hl?: string } = {}): Promise<Table<SearchResult>> {
   const { limit = 10, hl = "en" } = opts;
   return withHiddenPage(async (page) => {
     await page.goto(`https://www.google.com/search?${new URLSearchParams({ q: query, hl })}`);
@@ -37,10 +38,10 @@ export async function googleSearch(query: string, opts: { limit?: number; hl?: s
       return out;
     })).slice(0, limit);
     const locations = await resolveInPage(page, raw.map((r) => r.href));
-    return raw.map((r) => {
+    return table(raw.map((r): SearchResult => {
       const direct = new URL(r.href).hostname.endsWith("google.com") ? locations.get(r.href) : r.href;
       return { title: r.title, url: direct ?? r.href, resolved: !!direct, site: r.cite, snippet: r.snippet };
-    });
+    }));
   });
 }
 

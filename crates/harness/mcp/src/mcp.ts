@@ -18,6 +18,7 @@ server.registerTool(
     description: [
       "Run TypeScript in a persistent Bun REPL. Top-level const/let/function/import persist across calls; top-level await works;",
       "the value of the last expression is returned; console.log output is captured. All Bun/Node APIs and fetch are available.",
+      "Results print as NUON (compact JSON: bare strings/keys; lists of records as [[cols]; [row], ...]), capped at 100 rows with a '# … N more rows' note. Strings print raw.",
       "Functions in scope:",
       ...Object.values(docs).map((d) => `- ${d}`),
     ].join("\n"),

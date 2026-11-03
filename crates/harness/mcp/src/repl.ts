@@ -1,6 +1,7 @@
 // A persistent TypeScript REPL: each cell is TS, top-level declarations survive into later cells,
 // top-level await works, the last expression is the result, and console output is captured.
 import * as acorn from "acorn";
+import { nuon } from "./nuon.ts";
 
 const transpiler = new Bun.Transpiler({ loader: "ts", target: "bun", trimUnusedImports: false, deadCodeElimination: false });
 const AsyncFunction = (async () => {}).constructor as new (...args: string[]) => (...a: unknown[]) => Promise<unknown>;
@@ -79,7 +80,7 @@ export class Repl {
     const logs: string[] = [];
     const saved = { log: console.log, info: console.info, warn: console.warn, error: console.error, debug: console.debug };
     const capture = (level: string) => (...args: unknown[]) =>
-      logs.push((level === "log" ? "" : `[${level}] `) + args.map((a) => (typeof a === "string" ? a : Bun.inspect(a, { depth: 6 }))).join(" "));
+      logs.push((level === "log" ? "" : `[${level}] `) + args.map((a) => (typeof a === "string" ? a : nuon(a, { maxRows: 100 }))).join(" "));
     for (const k of Object.keys(saved) as (keyof typeof saved)[]) console[k] = capture(k);
     try {
       const js = transpiler.transformSync(code);
@@ -92,7 +93,7 @@ export class Repl {
         fn(this.scope),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`cell timed out after ${timeoutMs}ms`)), timeoutMs); }),
       ]).finally(() => clearTimeout(timer));
-      return { ok: true, result: value === undefined ? "undefined" : Bun.inspect(value, { depth: 8, colors: false }), logs };
+      return { ok: true, result: value === undefined ? "undefined" : typeof value === "string" ? value : nuon(value, { maxRows: 100 }), logs };
     } catch (e) {
       return { ok: false, result: e instanceof Error ? (e.stack ?? e.message) : String(e), logs };
     } finally {
