@@ -39,8 +39,8 @@ REF_LINK = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*<?(\S+?)>?(?:\s|$)", re.M)
 SPAN = re.compile(r"(`+)(.+?)\1")
 HTML_ID = re.compile(r"<a\s+(?:name|id)=\"([^\"]+)\"")
 # Not checked for the docs they name: docs/ itself (its links are), the history, others' code
-# (the standard library's own docs/, vendored crates) and skills about other projects.
-NOT_OURS = ("docs/", "CHANGELOG.md", "library/", "vendor/", ".agents/")
+# (the standard library's own docs/, vendored crates) and the flecs skill, about another project.
+NOT_OURS = ("docs/", "CHANGELOG.md", "library/", "vendor/", ".agents/skills/flecs/")
 
 
 @dataclass(frozen=True)
