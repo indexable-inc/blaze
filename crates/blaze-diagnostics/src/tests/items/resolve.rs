@@ -274,7 +274,9 @@ use Glob::*; //~ ERROR `use` associated items of traits is unstable
 fn main() {}
 "#;
     let name = "feature-gate-import-trait-associated-functions.rs";
-    let fixture = format!("//- minicore: sized, default, option\n{STD_HASH_MAP}//- /{name} crate:other:main edition:2018 deps:std\n{source}");
+    let fixture = format!(
+        "//- minicore: sized, default, option\n{STD_HASH_MAP}//- /{name} crate:other:main edition:2018 deps:std\n{source}"
+    );
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     let unstable = |line| error(line, &["`use` associated items of traits"]);
     assert_reports(
@@ -304,7 +306,10 @@ fn main() {
     hold("d");
 }
 "#;
-    assert_reports(&super::ui_fixture(fixture), &[error(2, &["E0425", "`try_hold`", "`gc::lease`"])]);
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(2, &["E0425", "`try_hold`", "`gc::lease`"])],
+    );
 }
 
 #[test]
@@ -317,10 +322,16 @@ fn main() {
     let _ = A;
 }
 "#;
-assert_reports(&super::ui_fixture(fixture), &[
-    error(4, &["E0423", "expected function, tuple struct or tuple variant, found struct `A`"]),
-    error(5, &["E0423", "expected value, found struct `A`"]),
-]);
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[
+            error(
+                4,
+                &["E0423", "expected function, tuple struct or tuple variant, found struct `A`"],
+            ),
+            error(5, &["E0423", "expected value, found struct `A`"]),
+        ],
+    );
 }
 
 #[test]
@@ -332,6 +343,27 @@ fn main() {
     let _ = r#match;
 }
 "#;
-    assert_reports(&super::ui_fixture(fixture), &[error(4, &["E0423", "expected value, found struct `r#match`"])]);
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(4, &["E0423", "expected value, found struct `r#match`"])],
+    );
 }
 
+
+#[test]
+fn a_raw_identifier_struct_called_as_a_function_is_e0423() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+struct r#Widget { b: u8 }
+
+fn main() {
+    let _ = r#Widget(1);
+}
+"#;
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(
+            4,
+            &["E0423", "expected function, tuple struct or tuple variant, found struct `r#Widget`"],
+        )],
+    );
+}
