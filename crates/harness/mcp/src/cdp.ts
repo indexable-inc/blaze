@@ -1,5 +1,12 @@
 // Minimal Chrome DevTools Protocol client: one browser-level websocket, flat sessions,
 // hidden tabs (not in the tab strip; closed automatically when this connection drops).
+import { confirm } from "./host.ts";
+
+const ENDPOINT = () => process.env.CDP_ENDPOINT ?? "http://localhost:9222";
+const howToStart = (endpoint: string) =>
+  `No browser is listening for DevTools at ${endpoint}. Start Dia (or Chrome) with remote debugging, e.g.\n` +
+  `  open -a Dia --args --remote-debugging-port=${new URL(endpoint).port || 9222}\n` +
+  `(quit it first if it is already running without the flag).`;
 
 type Msg = { id?: number; method?: string; params?: any; result?: any; error?: { message: string }; sessionId?: string };
 type Listener = (params: any, sessionId?: string) => void;
@@ -21,9 +28,9 @@ export class Browser {
     });
   }
 
-  static async connect(endpoint = process.env.CDP_ENDPOINT ?? "http://localhost:9222"): Promise<Browser> {
-    const res = await fetch(`${endpoint}/json/version`).catch((e) => {
-      throw new Error(`no Chrome DevTools at ${endpoint} (start Chrome with --remote-debugging-port=9222): ${e.message}`);
+  static async connect(endpoint = ENDPOINT()): Promise<Browser> {
+    const res = await fetch(`${endpoint}/json/version`, { signal: AbortSignal.timeout(3_000) }).catch((e) => {
+      throw new CdpUnavailable(`${howToStart(endpoint)}\n(${e.message})`);
     });
     const { webSocketDebuggerUrl } = (await res.json()) as { webSocketDebuggerUrl: string };
     const ws = new WebSocket(webSocketDebuggerUrl);
@@ -111,15 +118,27 @@ export class Page {
   close() { return this.browser.send("Target.closeTarget", { targetId: this.targetId }).catch(() => {}); }
 }
 
+export class CdpUnavailable extends Error { override name = "CdpUnavailable"; }
+
 let shared: Promise<Browser> | undefined;
-/** One cached connection per process; reconnects if Chrome dropped it. */
+/** One cached connection per process; reconnects if the browser dropped it. If nothing is listening,
+ *  asks the person (via MCP elicitation when available) to start the browser, and retries when they accept. */
 export async function browser(): Promise<Browser> {
   if (shared) {
     const b = await shared.catch(() => undefined);
     if (b && !b.closed) return b;
   }
-  shared = Browser.connect();
-  return shared;
+  for (let attempt = 1; ; attempt++) {
+    shared = Browser.connect();
+    try {
+      return await shared;
+    } catch (e) {
+      shared = undefined;
+      if (!(e instanceof CdpUnavailable) || attempt > 3) throw e;
+      const retry = await confirm(`${howToStart(ENDPOINT())}\n\nAccept once it is running to retry; decline to cancel.`);
+      if (!retry) throw e;
+    }
+  }
 }
 
 export async function withHiddenPage<T>(fn: (page: Page) => Promise<T>): Promise<T> {

@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { functions, docs } from "./functions/index.ts";
 import { Repl } from "./repl.ts";
+import { setConfirm } from "./host.ts";
 
 // stdout is the MCP channel; anything logged outside a cell must go to stderr.
 console.log = console.error;
@@ -30,5 +31,16 @@ server.registerTool(
     return { content: [{ type: "text", text }], isError: !ok };
   },
 );
+
+// Functions that need the person (e.g. "start Dia with remote debugging") ask through MCP elicitation.
+// Clients without it get confirm() === false, and the function's error text reaches the model instead.
+setConfirm(async (message) => {
+  if (!server.server.getClientCapabilities()?.elicitation) return false;
+  const r = await server.server.elicitInput({ message, requestedSchema: { type: "object", properties: {} } }).catch((e) => {
+    console.error("elicitation failed:", e);
+    return undefined;
+  });
+  return r?.action === "accept";
+});
 
 await server.connect(new StdioServerTransport());
