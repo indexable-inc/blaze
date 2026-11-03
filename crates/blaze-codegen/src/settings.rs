@@ -48,11 +48,13 @@ pub enum Relocation {
 /// for every function of a build.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)] // clone: setup, once per plan and per unit's settings
 pub struct Toolchain {
-    /// The pinned nightly's and blaze's own code identity (`harness/toolchain` and the hash of
-    /// the blaze executable, `hir_ty_codegen::v2::build`): another blaze is other code.
-    /// TEMPORARY: the executable's hash stands in for the code generator's CodeId
-    /// (`fn_info(..).code_id`) until that exists; see `temporary_executable_id` in
-    /// `hir_ty_codegen::v2::toolchain` and docs/v2/plan/design/code-identity.md.
+    /// The pinned nightly and the code generator's code identity (`hir_ty_codegen::v2::code`,
+    /// of the packages the code generator is built from, the LLVM it links and how blaze was
+    /// built; never the executable's bytes): a blaze rebuilt with only code outside the code
+    /// generator changed (its CLI, the daemon, the lints) has the same id and reads every
+    /// template the last one kept. TEMPORARY in its granularity (a whole package is one
+    /// input) until the code generator's CodeId (`fn_info(..).code_id`) replaces it; see
+    /// docs/v2/plan/design/code-identity.md.
     pub id: ContentId,
     /// The target triple.
     pub target: String,
@@ -181,8 +183,8 @@ pub struct Spec {
     /// function's code is.
     pub fold: bool,
     /// The code counts its calls and back edges into its own `Target::Counter` cells, for
-    /// tier-up (`blaze_stencil::tier`): stencil code always does, the Cranelift tier of a
-    /// tiered run does, LLVM code never does.
+    /// tier-up (`blaze_stencil::tier`): a tiered run's stencil and Cranelift code does, code
+    /// built to keep (a build's, a test's) and LLVM code never does.
     pub counted: bool,
     /// Whether rustc's MIR inliner runs on the bodies of the crates compiled at these
     /// settings (`Inline::is_enabled`): `-Copt-level` 2 or 3, not `s`/`z`, which share

@@ -200,11 +200,10 @@ fn run_of(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsString)>)
 }
 
 /// The environment `unit`'s script sees, started in `inherited`: what a pure key's variables
-/// have the values of, as [`blaze_usercode::script::prepare`] gives a run its own.
+/// have the values of, the whole of it as [`blaze_usercode::script::prepare`] starts a run in
+/// it ([`blaze_usercode::script::Prepared::script_env`], what [`keep`] reads them from).
 fn script_env(unit: &bs::Unit, inherited: &[(OsString, OsString)]) -> Result<Vec<(OsString, OsString)>, ApiError> {
-    blaze_build_script::env(unit, inherited)
-        .map(|it| it.vars)
-        .map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))
+    blaze_usercode::script::script_env(unit, inherited).map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))
 }
 
 /// What a build's report says of run unit `run`'s script: [`purity`] of its compile, and
@@ -274,7 +273,11 @@ pub(crate) fn retract(
 /// its trace. A run that failed is not kept, as no failed run is; a trace that showed an effect
 /// the proof said absent is an error whether it failed or not. `roots` are the run's prepared
 /// ones (its spec's), never made again here: a root's links are compared with how they were
-/// as it was prepared ([`blaze_usercode::roots::Roots::relinked`]). The ticket of a record that
+/// as it was prepared ([`blaze_usercode::roots::Roots::relinked`]). `script_env` is the
+/// script's whole environment ([`blaze_usercode::script::Prepared::script_env`]): a pure key has
+/// no given part, so its variables are kept by their values from all of it, as [`work_out`]'s
+/// lookup reads them ([`script_env`]), never from the run's own check, which leaves the given
+/// names out. The ticket of a record that
 /// the run depends on where its roots are, when one was put: durable before the run is
 /// reported done. An error carries what landed before it.
 pub(crate) fn keep(
@@ -283,7 +286,7 @@ pub(crate) fn keep(
     unit: &bs::Unit,
     checked: Option<Result<Read, String>>,
     store: &mut Store,
-    disk: &mut Disk,
+    script_env: &[(OsString, OsString)],
     roots: &RootMap,
     value: &Value,
 ) -> Result<RunPuts, (String, RunPuts)> {
@@ -295,7 +298,8 @@ pub(crate) fn keep(
     let Some(pure) = compile_of(job.units(), run).and_then(|compile| of(job, compile)) else { return Ok(RunPuts::default()) };
     let script = unit.package.descr();
     pure::checked_value(&script, &pure.proof, value).map_err(|it| (it.0, RunPuts::default()))?;
-    pure::keep(store, &pure.proof, roots.view(), read, disk, value)
+    let mut disk = Disk::new(script_env.to_vec()); // alloc: once per kept run of a pure script, its key's environment
+    pure::keep(store, &pure.proof, roots.view(), read, &mut disk, value)
         .map(|kept| {
             let mut puts = RunPuts::default();
             puts.kept(kept.tickets);

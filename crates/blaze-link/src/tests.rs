@@ -655,6 +655,50 @@ fn a_removed_function_still_called_through_its_slot_is_an_error() {
     assert_eq!(linked.through_stub(linked.rel32(linked.symbol("start") + 1)), linked.symbol("g2"));
 }
 
+/// `start` reads `g`'s address from `g`'s GOT cell. A rebuild fills both anew under new keys
+/// (as a moved `option_env!` value does to `main` and the `main` whose address it takes) and
+/// removes the old ones. The old `g`'s cell is the linker's, owned by no function: it goes
+/// with `g`, so the relink takes the change in place and the new `start`'s cell holds the
+/// new `g`. A removed function still read through its cell is refused, naming it by its path,
+/// what reads it, and the image.
+#[test]
+fn a_removed_functions_got_cell_goes_with_it() {
+    // `mov rax, [rip + target@GOTPCREL]; ret`
+    let through_got = |n: u8, target: u8| {
+        let reloc = blaze_codegen::Relocation { at: 3, kind: RelocKind::GotPcRel32, target: Target::Direct(key(target)), addend: -4 };
+        function(n, &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3], vec![reloc])
+    };
+    let (start, g) = (through_got(1, 2), function(2, &returns(1), Vec::new()));
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    let mut disk = Disk::default();
+    disk.link(&mut image, first(&start, &g)).unwrap();
+    let a = Linked::of(disk.file(TO));
+    assert_eq!(a.u64_at(a.rel32(a.symbol("start") + 3)), a.symbol("g"), "the cell holds `g`");
+
+    let error = image.stage(Change { removed: vec![key(2)], ..Change::default() }).unwrap_err();
+    assert!(
+        error.what.contains("the function `g`")
+            && error.what.contains("the function `start`")
+            && error.what.contains("in the image `app`"),
+        "{error}"
+    );
+    assert!(!error.what.contains("GOT cell"), "the reader is named, not the linker's cell: {error}");
+    assert_eq!(error.function, Some(key(1)), "the error names the reader");
+    assert_eq!(image.generation(), 1);
+
+    let (start2, g2) = (through_got(4, 3), function(3, &returns(2), Vec::new()));
+    let rebuilt = Change {
+        added: vec![&start2, &g2],
+        removed: vec![key(1), key(2)],
+        names: vec![("_start".into(), Target::Direct(key(4)))],
+        debug_names: vec![(key(4), "start2".into()), (key(3), "g2".into())],
+        ..Change::default()
+    };
+    disk.link(&mut image, rebuilt).unwrap();
+    let b = Linked::of(disk.file(TO));
+    assert_eq!(b.u64_at(b.rel32(b.symbol("start2") + 3)), b.symbol("g2"), "the new cell holds the new `g`");
+}
+
 #[test]
 fn slots_need_a_jump_table() {
     let (start, g) = program(Target::Direct);

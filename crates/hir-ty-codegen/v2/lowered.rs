@@ -59,7 +59,7 @@ pub fn lowered(
         Kind::Allocator(forward) => return Ok(Lowering::Allocator(forward.symbol)),
         Kind::Code(..) | Kind::Start(_) => {}
     }
-    frontend.with(|db, homes| {
+    frontend.with(|db| {
         let refused = |what: &str| {
             let name = super::linked::debug_name(db, &instance.0);
             // alloc: an error
@@ -76,7 +76,7 @@ pub fn lowered(
         blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
             let walked = (instance, super::refs::Walking::plain(inlined));
             let function =
-                backend::built_function(db, homes, &frontend.hashes, unit, spec, walked, refs, frame)?;
+                backend::built_function(db, &frontend.hashes, unit, spec, walked, refs, frame)?;
             let Built::Ir(pending) = function.code else {
                 return Err(refused("a naked function (`naked_asm!`)"));
             };

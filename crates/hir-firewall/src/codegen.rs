@@ -27,9 +27,18 @@ pub struct Codegen {
 }
 
 impl Codegen {
-    /// A dev build of workspace member `package` for this machine.
-    pub fn dev(package: &str, names: Arc<HashMap<FileId, String>>) -> Result<Codegen, String> {
-        let toolchain = hir_ty_codegen::v2::toolchain(hir_ty_codegen::Target::host(), &[], Runs::Here)?;
+    /// A dev build of workspace member `package` for this machine, whose crates are laid out by
+    /// `target_data` (the host's).
+    pub fn dev(
+        package: &str,
+        names: Arc<HashMap<FileId, String>>,
+        target_data: &base_db::target::TargetData,
+    ) -> Result<Codegen, String> {
+        // The harness's own code generator: it keeps no store, so nothing it compiles is read by
+        // another blaze build.
+        let code = hir_ty_codegen::v2::CodegenCode(blaze_ids::ContentId::of("blaze v2 hir-firewall code", b""));
+        let toolchain =
+            hir_ty_codegen::v2::toolchain_for(&code, hir_ty_codegen::Target::host(), target_data, &[], Runs::Here)?;
         hir_ty_codegen::v2::select(&toolchain)?;
         let policy = Policy {
             toolchain,

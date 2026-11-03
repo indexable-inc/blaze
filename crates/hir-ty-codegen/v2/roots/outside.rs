@@ -18,10 +18,7 @@ use super::{
     super::{HirFrontend, HirInstance, Kind, places::Ref, refs, statics},
     RootTest,
 };
-use crate::{
-    fncache::{self, Kind as Reads},
-    home::Homes,
-};
+use crate::fncache::{self, Kind as Reads};
 
 struct Visit<'db> {
     /// Its place in the order of the walk, which is its place in [`Graph::visits`].
@@ -48,7 +45,6 @@ struct Graph<'a, 'f, 'db> {
 pub(super) fn of<'db>(
     frontend: &HirFrontend<'_>,
     db: &'db Db,
-    homes: &mut Homes,
     roots: &[HirInstance],
     tests: &[RootTest],
 ) -> Result<Vec<bool>, String> {
@@ -65,7 +61,7 @@ pub(super) fn of<'db>(
         .iter()
         .map(|test| {
             // clone: once a test
-            let at = graph.visit(db, homes, Ref::Function(roots[test.root].clone()))?;
+            let at = graph.visit(db, Ref::Function(roots[test.root].clone()))?;
             Ok(graph.visits[at as usize].outside)
         })
         // alloc: once a harness, a flag a test
@@ -74,11 +70,11 @@ pub(super) fn of<'db>(
 
 impl<'db> Graph<'_, '_, 'db> {
     /// The place of `node`, once all it reaches is visited.
-    fn visit(&mut self, db: &'db Db, homes: &mut Homes, node: Ref) -> Result<u32, String> {
+    fn visit(&mut self, db: &'db Db, node: Ref) -> Result<u32, String> {
         if let Some(&at) = self.places.get(&node) {
             return Ok(at);
         }
-        let root = self.open(db, homes, node)?;
+        let root = self.open(db, node)?;
         // Each frame: a node, and how many of what it names are walked.
         // alloc: once a test not yet reached, as deep as its walk
         let mut frames: Vec<(u32, usize)> = vec![(root, 0)];
@@ -91,7 +87,7 @@ impl<'db> Graph<'_, '_, 'db> {
                 }
                 let Some(&to) = self.places.get(named) else {
                     let named = named.clone(); // clone: once a node of the program, its key
-                    let to = self.open(db, homes, named)?;
+                    let to = self.open(db, named)?;
                     frames.push((to, 0));
                     continue;
                 };
@@ -136,11 +132,11 @@ impl<'db> Graph<'_, '_, 'db> {
     }
 
     /// Places `node`, a function or a static, and reads what it names.
-    fn open(&mut self, db: &'db Db, homes: &mut Homes, node: Ref) -> Result<u32, String> {
+    fn open(&mut self, db: &'db Db, node: Ref) -> Result<u32, String> {
         let at = u32::try_from(self.visits.len())
             // alloc: the error's message
             .map_err(|_| "a program of more than 2^32 functions and statics".to_owned())?;
-        let (outside, names) = self.read(db, homes, &node)?;
+        let (outside, names) = self.read(db, &node)?;
         self.places.insert(node, at);
         self.visits.push(Visit { index: at, low: at, on_stack: true, outside, names });
         self.stack.push(at);
@@ -151,7 +147,6 @@ impl<'db> Graph<'_, '_, 'db> {
     fn read(
         &self,
         db: &'db Db,
-        homes: &mut Homes,
         node: &Ref,
     ) -> Result<(bool, Cow<'db, [Ref]>), String> {
         let names = match node {
@@ -163,7 +158,7 @@ impl<'db> Graph<'_, '_, 'db> {
             },
             // alloc: once a static of the program, the references its value gives
             Ref::Static(value) => {
-                Cow::Owned(statics::value(db, homes, &self.frontend.hashes, value.0)?.refs)
+                Cow::Owned(statics::value(db, &self.frontend.hashes, value.0)?.refs)
             }
             Ref::Extern(_) | Ref::Weak(_) => unreachable!("a symbol outside blaze's code is no node"),
         };

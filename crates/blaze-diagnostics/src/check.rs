@@ -71,6 +71,39 @@ pub fn check_planned(
     hir::attach_db(db, || frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, plan, frame)))
 }
 
+/// blaze: the `#[blaze::sealed]` checks of `krate` alone ([`hir::check::check_sealed`]), lowered
+/// as [`check_crate`] lowers them, and rustc's orphan check of each impl of another crate's trait
+/// (`lower::trait_impl_orphan::in_sealed_graph`), with rustc's closing lines: for a dependency
+/// of which nothing else is checked (only what the build's programs reach of it). Its lints are
+/// left out, as `--cap-lints` leaves a dependency's. Empty, after one flag read, for a crate
+/// with no sealed trait in its graph ([`hir_ty::sealed_in_graph`]).
+pub fn check_sealed(db: &Db, krate: hir::Crate, files: Files<'_>, options: &Options) -> Vec<Diag> {
+    hir::attach_db(db, || {
+        let checked = hir::check::check_sealed(db, krate);
+        if checked.diagnostics.is_empty() && checked.foreign_impls.is_empty() {
+            return Vec::new(); // alloc: empty, allocates nothing
+        }
+        frame::task(Tag::Diagnostics, |frame| {
+            let cx = Cx::new(db, krate, files, frame).with_lints(&options.lints);
+            // alloc: the error path, the few refusals of a crate in a sealed graph
+            let mut lowered: Vec<Found> = Vec::new();
+            for diagnostic in checked.diagnostics {
+                lowered.extend(lower::lower(&cx, diagnostic));
+            }
+            for foreign in &checked.foreign_impls {
+                lowered.extend(lower::trait_impl_orphan::in_sealed_graph(&cx, foreign));
+            }
+            radix::sort_by_key(&mut lowered, |it| it.phase as u8);
+            let diags = lowered
+                .into_iter()
+                .map(|it| it.diag)
+                .filter(|it| !it.is_lint())
+                .collect(); // alloc: the error path, as above
+            written(diags, options)
+        })
+    })
+}
+
 /// The check of `krate`, its tables in `frame`, its bodies by `plan`.
 fn run(
     db: &Db,

@@ -345,26 +345,38 @@ FROM switched
 ORDER BY thread, start_ns
 
 -- name: uncovered_per_worker
--- says: per pool worker, the share of a build's wall time it ran a job (from the job's start or resume to its next switch) or was in no state the pool said (before its first switch) and was inside no span: every job opens a span of its own, so the gate holds it under 1%
+-- says: per pool worker, the share of a build's wall time it was inside no span and not idle: every job opens a `job` span and the worker's own search and switches between jobs a `worker` span, so the gate holds it under 1%
 WITH bounds AS (
     SELECT started_ns AS t0, started_ns + dur_ns AS t1
     FROM builds
     WHERE build_id = $build
 ), workers AS (
+    -- A pool worker runs jobs or sleeps; a thread that only wakes jobs (`ready`) is not one.
     SELECT DISTINCT process, thread, any_value(thread_name) OVER (PARTITION BY process, thread) AS thread_name
     FROM switches, bounds
-    WHERE t_ns BETWEEN t0 AND t1
+    WHERE t_ns BETWEEN t0 AND t1 AND event <> 'ready'
 ), switched AS (
-    SELECT switches.process, switches.thread, t_ns, event,
+    -- From before the build too: a worker idle as the build began is idle from its start.
+    SELECT switches.process, switches.thread, t_ns, event, since_ns,
         lead(t_ns, 1, (SELECT t1 FROM bounds)) OVER (PARTITION BY switches.process, switches.thread ORDER BY t_ns) AS next_ns
-    FROM switches, bounds
-    WHERE t_ns BETWEEN t0 AND t1
+    FROM switches JOIN workers USING (process, thread), bounds
+    WHERE t_ns <= t1
 ), covered AS (
-    -- What the pool said the worker did besides running a job: idle, or between a job's park
-    -- or end and the next job's start or resume.
-    SELECT process, thread, t_ns AS start_ns, next_ns AS end_ns
-    FROM switched
-    WHERE event NOT IN ('started', 'resumed')
+    -- Idle as the pool said it: an idle span the build's end left open is not in the history.
+    SELECT process, thread, greatest(t_ns, t0) AS start_ns, least(next_ns, t1) AS end_ns
+    FROM switched, bounds
+    WHERE event = 'idle' AND next_ns > t0
+    UNION ALL
+    -- A job's run: its spans move with it and are written on the thread they close on, so a
+    -- span begun on another thread, or still open, covers this one's stretch only through here.
+    SELECT process, thread, greatest(t_ns, t0), least(next_ns, t1)
+    FROM switched, bounds
+    WHERE event IN ('started', 'resumed') AND next_ns > t0
+    UNION ALL
+    -- And its run before it joined the graph, from its begin on this thread.
+    SELECT process, thread, greatest(since_ns, t0), least(t_ns, t1)
+    FROM switched, bounds
+    WHERE event IN ('started', 'ran') AND t_ns > t0 AND since_ns < t1
     UNION ALL
     SELECT spans.process, spans.thread, greatest(start_ns, t0), least(start_ns + dur_ns, t1)
     FROM spans, bounds

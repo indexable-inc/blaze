@@ -7,7 +7,7 @@ use blaze_core::{
 
 use super::*;
 
-fn opened(sim: &mut Sim) -> blaze_cas::Store {
+pub(crate) fn opened(sim: &mut Sim) -> blaze_cas::Store {
     let config = blaze_cas::Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 40 };
     let mut effects = Vec::new();
     let mut store = blaze_cas::Store::open(config, &mut effects);
@@ -21,7 +21,7 @@ fn opened(sim: &mut Sim) -> blaze_cas::Store {
 }
 
 /// Proc macros that keep nothing: these tests read no expansion's reads.
-fn no_macros() -> Arc<blaze_macro_eval::Macros> {
+pub(crate) fn no_macros() -> Arc<blaze_macro_eval::Macros> {
     blaze_macro_eval::Macros::nothing("a test of the images alone")
 }
 
@@ -90,6 +90,7 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
 #[test]
 fn blaze_dep_images_is_check_verify_or_unset() {
     let env = |value: &str| vec![("PATH".to_owned(), "/bin".to_owned()), (IMAGES.to_owned(), value.to_owned())];
+    let mode_in = |env: &[(String, String)]| mode_in(&mut EnvReads::default(), env);
     assert_eq!(mode_in(&[]).unwrap(), Mode::Serve);
     assert_eq!(mode_in(&env("check")).unwrap(), Mode::Check);
     assert_eq!(mode_in(&env("verify")).unwrap(), Mode::Verify);
@@ -150,11 +151,28 @@ fn the_goal_note_names_every_count_that_kept_goals_out() {
 #[test]
 fn blaze_item_store_is_verify_off_or_unset() {
     let env = |value: &str| vec![(ITEMS.to_owned(), value.to_owned())];
+    let items_in = |env: &[(String, String)]| items_in(&mut EnvReads::default(), env);
     assert_eq!(items_in(&[]).unwrap(), Some(body_store::Mode::Serve));
     assert_eq!(items_in(&env("verify")).unwrap(), Some(body_store::Mode::Verify));
     assert_eq!(items_in(&env("off")).unwrap(), None);
     let error = items_in(&env("check")).unwrap_err();
     assert!(error.what.starts_with("BLAZE_ITEM_STORE=check is not a value blaze takes"), "{}", error.what);
+}
+
+/// The stores' modes are read through the session's [`EnvReads`], so the front end kept with
+/// it is let go when one moves and kept whatever else of the environment does.
+#[test]
+fn the_stores_modes_are_noted_read() {
+    let mut read = EnvReads::default();
+    let first = vec![(ITEMS.to_owned(), "verify".to_owned()), ("SHLVL".to_owned(), "1".to_owned())];
+    items_in(&mut read, &first).unwrap();
+    mode_in(&mut read, &first).unwrap();
+    let names: Vec<_> = read.names().map(|(name, _)| name).collect();
+    assert_eq!(names, [IMAGES, ITEMS]);
+    let unrelated = vec![(ITEMS.to_owned(), "verify".to_owned()), ("SHLVL".to_owned(), "2".to_owned())];
+    assert_eq!(read.moved(&unrelated), None);
+    let images = vec![(IMAGES.to_owned(), "check".to_owned()), (ITEMS.to_owned(), "verify".to_owned())];
+    assert_eq!(read.moved(&images).map(|it| it.name), Some(IMAGES.to_owned()));
 }
 
 #[test]

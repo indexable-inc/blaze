@@ -22,7 +22,7 @@ use rustc_type_ir::inherent::IntoKind;
 
 use crate::{Unshared, identity::unhashable};
 
-pub const CODE_DOMAIN: &str = "blaze v2 codegen code 1";
+pub const CODE_DOMAIN: &str = "blaze v2 body code 1";
 pub const DISCRIMINANT_DOMAIN: &str = "blaze v2 codegen discriminant 1";
 pub const NAMES_DOMAIN: &str = "blaze v2 codegen binding names 1";
 

@@ -668,6 +668,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
+                (Some(Word::blaze), Some(Word::sealed)) => AttrFlags::BLAZE_SEALED,
                 (Some(Word::clippy), Some(Word::has_significant_drop)) => {
                     AttrFlags::HAS_SIGNIFICANT_DROP
                 }
@@ -923,6 +924,7 @@ name_set! {
     rustc_unsafe_specialization_marker,
     sanitize,
     sans_io,
+    sealed,
     skip,
     specialization,
     specialization_trait,
@@ -1123,6 +1125,12 @@ bitflags::bitflags! {
         /// `#[blaze::nonblocking]` or `#[blaze::nonblocking(..)]`: as [`AttrFlags::NOPANIC`],
         /// for no call that blocks the thread (`blaze::nonblocking`).
         const NONBLOCKING = 1 << 99;
+        /// `#[blaze::sealed]`, a word, on a trait: a blaze extension (inert under rustc with
+        /// `#![register_tool(blaze)]`). No crate but the trait's may implement it or name it as
+        /// a supertrait, and when every impl of it is for a local type, a type parameter
+        /// bounded by it counts as local in its crate's orphan check
+        /// (`TraitFlags::SEALED`, `hir_ty::sealed_local_bound`, `hir-ty-coherence`).
+        const BLAZE_SEALED = 1 << 100;
         /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
         /// (docs/v2/plan/lanes/linear.md). On a struct or enum: a value of it may not be

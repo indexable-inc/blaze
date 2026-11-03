@@ -10,10 +10,10 @@
 //! A running program's endpoint needs its token, which is kept off the command line (every
 //! local user can read another's arguments): `--dir <IX_PROF> ENDPOINT` reads the address
 //! and token from `<IX_PROF>/http.endpoint`, and `--token-file FILE` gives the token for an
-//! `http://` URL. Both are read only from this user's own 0600 file in a directory that is
-//! this user's own and closed to group and other, and the address must be loopback
-//! (`ix_prof::endpoint`). The token is sent as `Authorization: Bearer`, and only to the
-//! source's own host and port, never to a `diff --base` elsewhere.
+//! `http://` URL. Both are read only from this user's own 0600 file with no ACL, in a directory
+//! that is this user's own, with owner-only mode and no ACL; and for both the address must be a
+//! loopback IP address and port (`ix_prof::endpoint`). The token is sent as `Authorization:
+//! Bearer`, and only to the source's own host and port, never to a `diff --base` elsewhere.
 
 use std::{
     ffi::OsString,
@@ -136,6 +136,9 @@ fn run(words: Vec<OsString>) -> Result<(), Refused> {
             let host = source.strip_prefix("http://").map(|rest| rest.split_once('/').map_or(rest, |it| it.0)).ok_or_else(|| {
                 usage(format!("--token-file is for an http:// source, not {source}"))
             })?;
+            // Checked before the token is read: it goes to this machine's loopback only, in
+            // the clear, as for --dir.
+            ix_prof::endpoint::loopback(host).map_err(|why| usage(format!("--token-file with {source}: {why}")))?;
             let token = ix_prof::endpoint::read_token_file(file).map_err(|why| failed(format!("reading the token: {why}")))?;
             (source.clone(), Some(Scoped { host: host.to_owned(), token }))
         }
@@ -401,9 +404,12 @@ fn encode_component(s: &str) -> String {
 
 /// A page that sends the browser on to `link`, in a new 0700 directory under the temporary
 /// one, mode 0600: the opener (and the browser it starts) gets the page's path on its command
-/// line, never the token. With the program that opens it.
+/// line, never the token. The page holds the token, so it is written through
+/// `ix_prof::endpoint::PrivateDir`, under the same rule as `http.endpoint`: the directory this
+/// user's own on a local volume that keeps ownership, owner-only mode and no ACL (one inherited
+/// from a parent of `TMPDIR` included). With the program that opens it.
 fn open_page(link: &str) -> Result<(&'static str, PathBuf), String> {
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::DirBuilderExt as _;
     let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     // A random name of its own, not the token.
     let name = ix_prof::token::new().map_err(|why| format!("naming the page's directory: {why}"))?;
@@ -416,21 +422,23 @@ fn open_page(link: &str) -> Result<(&'static str, PathBuf), String> {
         "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer>\
          <meta http-equiv=refresh content=\"0;url={html_link}\"><a href=\"{html_link}\">open the explorer</a>\n"
     );
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&page)
-        .and_then(|mut f| f.write_all(html.as_bytes()))
-        .map_err(|why| format!("writing {}: {why}", page.display()))?;
+    let written = ix_prof::endpoint::PrivateDir::open(&dir)
+        .and_then(|private| private.write_whole("open.html", "open.html.part", html.as_bytes()));
+    if let Err(why) = written {
+        // Refused (or the write failed, which removes its part file): leave no empty directory behind.
+        return Err(match std::fs::remove_dir(&dir) {
+            Ok(()) => why,
+            Err(also) => format!("{why}; removing the empty {}: {also}", dir.display()),
+        });
+    }
     Ok((program, page))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Read as _, net::TcpListener};
+    use std::{ffi::OsString, io::Read as _, net::TcpListener};
 
-    use super::{Fetch, Scoped, load};
+    use super::{Fetch, Scoped, load, run};
 
     /// S4: the token goes to the source's own host:port only. A `diff --base` at another port
     /// (one another user may have bound) is fetched with no `Authorization` header.
@@ -459,5 +467,44 @@ mod tests {
         let request = seen.join().unwrap();
         assert!(request.starts_with("GET /debug/pprof/heap"), "{request:?}");
         assert!(!request.contains("s3cret") && !request.to_ascii_lowercase().contains("authorization"), "{request:?}");
+    }
+
+    /// S8a: `--token-file` sends its token only to a loopback IP address and port, as `--dir`
+    /// does. A remote host, a host name (a resolver could point it elsewhere) or an
+    /// IPv4-mapped address is refused before the token file is even read; a loopback address
+    /// gets as far as reading it.
+    #[test]
+    fn a_token_file_goes_to_a_loopback_address_only() {
+        let token_file = "/nonexistent/ix-prof-pprof-token";
+        let refused = |url: &str| {
+            let words = ["--token-file", token_file, url].map(OsString::from).to_vec(); // alloc: test
+            run(words).expect_err(url).1
+        };
+        for url in ["http://10.0.0.5:6060/debug/pprof/heap", "http://localhost:6060/debug/pprof/heap", "http://[::ffff:127.0.0.1]:6060/x"] {
+            let why = refused(url);
+            assert!(why.contains("loopback") && !why.contains("reading the token"), "{url}: {why}");
+        }
+        let why = refused("http://127.0.0.1:6060/debug/pprof/heap");
+        assert!(why.contains("reading the token") && why.contains("/nonexistent"), "loopback: {why}");
+    }
+
+    /// S2 (round 3): the `--http` page, which holds the serve token, is written through
+    /// `PrivateDir`: a 0600 regular file, the link in it, in a new 0700 directory of its own.
+    #[test]
+    fn the_explorer_page_is_written_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let link = "https://ix.dev/explore#profile=http%3A%2F%2F127.0.0.1%3A1%2Fprofile.ixprof%3Ftoken%3Dabc&x";
+        let (_, page) = super::open_page(link).unwrap();
+        let dir = page.parent().unwrap().to_owned();
+        let (html, file_mode, dir_mode) = (
+            std::fs::read_to_string(&page).unwrap(),
+            std::fs::metadata(&page).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|it| it.unwrap().file_name()).collect(); // alloc: test
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((file_mode, dir_mode), (0o600, 0o700));
+        assert_eq!(names, ["open.html"]);
+        assert!(html.contains(&link.replace('&', "&amp;")), "{html}");
     }
 }

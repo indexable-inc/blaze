@@ -584,7 +584,7 @@ pub(crate) fn compile_in<A: Glue, R>(
         select::run::<A>(plan, func, target, library)?;
         slots::run(plan, func, library, A::NEAR)?;
         let frame = A::frame(func, target, plan.area())?;
-        emit::edges(plan, func, library)?;
+        emit::edges(plan, func, target, library)?;
         let size = emit::size::<A>(plan, func, target, &frame, library)?;
         buf.reserve(size.bytes, size.labels, size.fixups);
         side.lines.reserve(size.lines);

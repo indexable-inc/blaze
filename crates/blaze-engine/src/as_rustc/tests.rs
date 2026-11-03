@@ -93,9 +93,17 @@ fn probes_read() {
     assert_eq!(none.to_string(), "no input filename given");
 }
 
+/// This test binary's code identity, as blaze-engine's main hands it over: `-vV` names it.
+fn hand_over_code() -> &'static str {
+    let code = env!("BLAZE_CODEGEN_CODE");
+    hir_ty_codegen::v2::CodegenCode::from_hex(code).and_then(hir_ty_codegen::v2::set_code).unwrap();
+    code
+}
+
 /// Questions are answered without the library, as blaze's release's rustc answers them.
 #[test]
 fn questions_answered() {
+    hand_over_code();
     let no_library = || -> anyhow::Result<probe::Library> { panic!("a question reads no library") };
     let version = answer(&args(&["--version"]), &[], no_library).unwrap();
     assert_eq!(version.code, 0);
@@ -114,6 +122,22 @@ fn questions_answered() {
     assert!(verbose.starts_with(&version), "{verbose}");
     let release = verbose.lines().find_map(|it| it.strip_prefix("release: ")).unwrap();
     assert_eq!(release, format!("1.{minor}.{patch}-nightly"));
+}
+
+/// N2 of the code-identity review: blaze as `rustc` ends its `-vV` with which blaze it is, its
+/// code identity, which the build script of a blaze it builds takes as its compiler and keys
+/// that blaze's code by; so a blaze built by blaze is no blaze built by rustc.
+#[test]
+fn the_verbose_version_says_which_blaze_this_is() {
+    let code = hand_over_code();
+    let no_library = || -> anyhow::Result<probe::Library> { panic!("a question reads no library") };
+    let verbose = answer(&args(&["-vV"]), &[], no_library).unwrap();
+    let verbose = String::from_utf8(verbose.stdout).unwrap();
+    assert!(verbose.ends_with(&format!("\n{}{code}\n", blaze_codegen_code::BLAZE_IDENTITY)), "{verbose}");
+    let rustc = target::rustc_verbose_version(blaze_cargo::toolchain::host().unwrap());
+    assert!(verbose.starts_with(&rustc), "{verbose}");
+    assert_eq!(blaze_codegen_code::check_compiler("blaze", verbose.clone()), Ok(verbose));
+    assert_eq!(blaze_codegen_code::check_compiler("rustc", rustc.clone()), Ok(rustc));
 }
 
 #[test]

@@ -801,8 +801,7 @@ fn imported<'ctx>(
         Symbol::Func(at) => Some(Symbol::Func(*import.funcs.get(at as usize)?).named()),
         Symbol::Data(at) => Some(Symbol::Data(*import.datas.get(at as usize)?).named()),
     };
-    let mut names: SmallVec<[(GlobalValue<'ctx>, SymbolName); 16]> = SmallVec::new();
-    names.push((own.as_global_value(), own_name));
+    let mut functions: SmallVec<[(FunctionValue<'ctx>, SymbolName); 16]> = SmallVec::new();
     let mut next = imported.get_first_function();
     while let Some(function) = next {
         next = function.get_next_function();
@@ -820,19 +819,53 @@ fn imported<'ctx>(
             unsafe { function.delete() };
             continue;
         }
-        names.push((function.as_global_value(), name));
+        functions.push((function, name));
     }
+    let mut datas: SmallVec<[(GlobalValue<'ctx>, SymbolName); 16]> = SmallVec::new();
     for global in imported.get_globals() {
         if let Some(name) = renamed(global.get_name()) {
-            names.push((global, name));
+            datas.push((global, name));
         }
     }
+    let function_name = |it: FunctionValue<'ctx>| it.get_name().to_string_lossy().into_owned();
+    one_per_request(&mut functions, import, function_name, |it| it.count_basic_blocks() > 0, |_, _| false, |kept, gone| {
+        gone.replace_all_uses_with(kept);
+        // SAFETY: `gone` is a function of `imported` that `functions` no longer holds
+        // (`one_per_request` drops it), and `replace_all_uses_with` just above left no use of
+        // it, so freeing it leaves nothing dangling.
+        unsafe { gone.delete() };
+    })?;
+    let data_name = |it: GlobalValue<'ctx>| it.get_name().to_string_lossy().into_owned();
+    let defined = |it: GlobalValue<'ctx>| it.get_initializer().is_some();
+    let same = |a: GlobalValue<'ctx>, b: GlobalValue<'ctx>| a.get_initializer() == b.get_initializer();
+    one_per_request(&mut datas, import, data_name, defined, same, |kept, gone| {
+        gone.as_pointer_value().replace_all_uses_with(kept.as_pointer_value());
+        // SAFETY: `gone` is a global variable of `imported` (from `get_globals`) that `datas`
+        // no longer holds, and `replace_all_uses_with` just above left no use of it, so
+        // freeing it leaves nothing dangling.
+        unsafe { gone.delete() };
+    })?;
+    let mut names: SmallVec<[(GlobalValue<'ctx>, SymbolName); 16]> = SmallVec::new();
+    names.push((own.as_global_value(), own_name));
+    names.extend(functions.iter().map(|&(function, name)| (function.as_global_value(), name)));
+    names.extend(datas);
     // In two steps, as a name given may be one another still has.
     for (at, (global, _)) in names.iter().enumerate() {
         global.set_name(&SymbolName::of("blaze.import.", at as u32));
     }
     for (global, name) in &names {
         global.set_name(name);
+        // Each name is one request's and given once above, so none is taken: LLVM would make
+        // it another (`blaze.d.3.1`), which no request is.
+        if global.get_name().to_bytes() != name.bare().as_bytes() {
+            // alloc: the error's message
+            return Err(Unhandled::Duplicate(format!(
+                "the import of `{}` names `{}` twice, and LLVM called the second `{}`",
+                own_name.bare(),
+                name.bare(),
+                global.get_name().to_string_lossy()
+            )));
+        }
     }
     // Of its linkage only once in `module`: LLVM links in a body that is only available
     // externally only where the module it goes to has the function, and the imports are
@@ -842,6 +875,63 @@ fn imported<'ctx>(
         module.add_function(&own_name, own.get_type(), Some(Linkage::External));
     }
     Ok(imported)
+}
+
+/// Leaves one of `items`, the functions or the data objects of an import's module with the
+/// names of the compile's requests they are to have, for each name. Two requests of the
+/// export can be one of the compile: `v2::release`'s `merge` takes two equal ones (a file's
+/// path or a place asked for twice) as one, and the request is then the one object. Named
+/// both, LLVM would call the second `blaze.d.3.1`, which no request is, and the code would
+/// refer to nothing (an undefined symbol at link, in 2 of 4 cold self-builds on 2026-11-02).
+/// The uses of the others go to the one kept, which is the one with a definition, by `merge`
+/// (kept, gone); the others are dropped from `items`. Two with different definitions are
+/// refused, naming both by their names in the export (`name_of`, read before any is renamed).
+fn one_per_request<T: Copy>(
+    items: &mut SmallVec<[(T, SymbolName); 16]>,
+    import: &Import,
+    name_of: impl Fn(T) -> String,
+    defined: impl Fn(T) -> bool,
+    same: impl Fn(T, T) -> bool,
+    merge: impl Fn(T, T),
+) -> Result<(), Unhandled> {
+    if items.len() < 2 {
+        return Ok(());
+    }
+    // In the order of their names, then of the module, so the one kept is the same each time.
+    // alloc: on the stack up to 16, else once per import with more, its own objects
+    let mut order: SmallVec<[usize; 16]> = (0..items.len()).collect();
+    order.sort_unstable_by(|&a, &b| items[a].1.bare().cmp(items[b].1.bare()).then(a.cmp(&b)));
+    let mut gone: SmallVec<[usize; 4]> = SmallVec::new();
+    for run in order.chunk_by(|&a, &b| items[a].1.bare() == items[b].1.bare()) {
+        if run.len() < 2 {
+            continue;
+        }
+        let kept = run.iter().copied().find(|&it| defined(items[it].0)).unwrap_or(run[0]);
+        for &other in run {
+            if other == kept {
+                continue;
+            }
+            let (keep, it) = (items[kept].0, items[other].0);
+            if defined(it) && !same(keep, it) {
+                // alloc: the error's message
+                return Err(Unhandled::Duplicate(format!(
+                    "the import of `{}` has `{}` and `{}` of its export, defined differently, as \
+                     the one request `{}`",
+                    Symbol::Func(import.id),
+                    name_of(keep),
+                    name_of(it),
+                    items[kept].1.bare(),
+                )));
+            }
+            merge(keep, it);
+            gone.push(other);
+        }
+    }
+    gone.sort_unstable();
+    for at in gone.into_iter().rev() {
+        items.remove(at);
+    }
+    Ok(())
 }
 
 /// Has each call in the bodies linked in ([`link`]) made through the type its callee has in
@@ -1070,8 +1160,10 @@ pub(super) fn assemble(target: &'static super::Target, text: &str) -> Result<Vec
 /// 2 to 5% more code and no more compile time; 1000 is no faster (1.079) for twice the code.
 const INLINE_THRESHOLD: u32 = 500;
 
-/// [`INLINE_THRESHOLD`], or `BLAZE_LLVM_INLINE_THRESHOLD=N` to measure another. The store's
-/// key has it, as code inlined at another threshold is other code.
+/// [`INLINE_THRESHOLD`], or the threshold `BLAZE_LLVM_INLINE_THRESHOLD=N` names. No key has it:
+/// code inlined at another threshold is other code, so a unit refuses to be built with it set,
+/// like the other variables of `v2::backend`'s `CHANGES_CODE`. To measure another threshold,
+/// change [`INLINE_THRESHOLD`] and rebuild.
 pub(super) fn inline_threshold() -> u32 {
     std::env::var("BLAZE_LLVM_INLINE_THRESHOLD").map_or(INLINE_THRESHOLD, |it| {
         it.parse().unwrap_or_else(|_| panic!("BLAZE_LLVM_INLINE_THRESHOLD={it} is not a number"))
@@ -1655,6 +1747,17 @@ impl Symbol {
         }
         name.strip_prefix("blaze.d.")?.parse().ok().map(Symbol::Data)
     }
+
+    /// The name `name` was before LLVM made it unique (`blaze.d.40.1` of `blaze.d.40`), where
+    /// it is one of ours that does not [`parse`](Symbol::parse): a second object was given a
+    /// name another had.
+    fn uniqued(name: &str) -> Option<Symbol> {
+        if Symbol::parse(name).is_some() {
+            return None;
+        }
+        let (stem, suffix) = name.rsplit_once('.')?;
+        suffix.bytes().all(|it| it.is_ascii_digit()).then(|| Symbol::parse(stem))?
+    }
 }
 
 impl fmt::Display for Symbol {
@@ -1859,6 +1962,9 @@ pub enum Unhandled {
     /// stops it: LLVM guarantees the tail call only where the callee is called through the
     /// caller's own type and parameter attributes.
     TailCall(String),
+    /// Two functions or data objects under one name of the module's own ([`Symbol`]), which
+    /// LLVM would tell apart by renaming one to a name no request has: what they are.
+    Duplicate(String),
 }
 
 impl fmt::Display for Unhandled {
@@ -1873,6 +1979,7 @@ impl fmt::Display for Unhandled {
                 write!(f, "llvm: {}", message.lines().next().unwrap_or_default())
             }
             Unhandled::TailCall(why) => write!(f, "a tail call (`become`) LLVM can't guarantee: {why}"),
+            Unhandled::Duplicate(what) => write!(f, "two objects under one name of the module's own: {what}"),
         }
     }
 }
@@ -2080,6 +2187,99 @@ define void @"blaze.own"(ptr %to, i64 %from) {
         assert!(text.contains("@blaze.f.7(") && text.contains("@blaze.d.3"), "{text}");
         assert!(!text.contains("blaze.f.5"), "{text}");
         assert!(module.get_function("blaze.f.5").is_none_or(|it| it.count_basic_blocks() == 0));
+    }
+
+    /// An export that reads two of its data objects.
+    const READS_TWO: &str = r#"
+@"blaze.d.0" = external hidden global i8
+@"blaze.d.1" = external hidden global i8
+
+define i32 @"blaze.own"() {
+  %a = load i32, ptr @"blaze.d.0"
+  %b = load i32, ptr @"blaze.d.1"
+  %sum = add i32 %a, %b
+  ret i32 %sum
+}
+"#;
+
+    /// [`READS_TWO`] with the two defined, differently.
+    const DEFINES_TWO: &str = r#"
+@"blaze.d.0" = available_externally hidden constant i32 1
+@"blaze.d.1" = available_externally hidden constant i32 2
+
+define i32 @"blaze.own"() {
+  %a = load i32, ptr @"blaze.d.0"
+  %b = load i32, ptr @"blaze.d.1"
+  %sum = add i32 %a, %b
+  ret i32 %sum
+}
+"#;
+
+    /// Two data objects of an export that the compile has as one request (`v2::release`'s
+    /// `merge` takes two equal requests as one) are one global of the module, named for the
+    /// request: LLVM had called the second `blaze.d.3.1`, which the code then referred to and
+    /// nothing defined ("undefined symbol `blaze.d.40.1`" linking build scripts in a cold
+    /// self-build, 2026-11-02). Built twice, the object is the same bytes, and its symbols
+    /// name the request once.
+    #[test]
+    fn two_objects_of_an_import_that_are_one_request_are_one_global() {
+        let object = || {
+            let context = Context::create();
+            let mut import = exported(&context, READS_TWO, vec![5], 5);
+            import.datas = vec![3, 3];
+            let module = context.create_module("blaze");
+            let machine = Machine::create(crate::Target::for_host(), Optimization::NONE).unwrap();
+            module.set_triple(&machine.get_triple());
+            module.set_data_layout(&machine.get_target_data().get_data_layout());
+            link(&context, &module, std::slice::from_ref(&import), Linkage::External).unwrap();
+            module.verify().unwrap();
+            let globals: Vec<String> =
+                module.get_globals().map(|it| it.get_name().to_string_lossy().into_owned()).collect();
+            assert_eq!(globals, ["blaze.d.3"], "{}", module.print_to_string().to_string_lossy());
+            let body = module.get_function("blaze.f.5").unwrap().print_to_string().to_string_lossy().into_owned();
+            assert_eq!(body.matches("ptr @blaze.d.3").count(), 2, "{body}");
+            machine.write_to_memory_buffer(&module, FileType::Object).unwrap().as_slice().to_vec()
+        };
+        let (first, second) = (object(), object());
+        assert_eq!(first, second, "the object differs between two builds");
+        use object::{Object as _, ObjectSymbol as _};
+        let file = object::File::parse(&*first).unwrap();
+        // Mach-O puts `_` before every C name.
+        let mut named: Vec<&str> = file
+            .symbols()
+            .filter_map(|it| it.name().ok())
+            .map(|it| it.strip_prefix('_').unwrap_or(it))
+            .filter(|it| it.starts_with("blaze.d."))
+            .collect(); // alloc: test
+        named.sort_unstable();
+        assert_eq!(named, ["blaze.d.3"]);
+    }
+
+    /// Two objects of an export that are one request of the compile and defined differently
+    /// are refused, naming both and the request, never one renamed.
+    #[test]
+    fn two_definitions_of_one_request_in_an_import_are_refused_by_name() {
+        let context = Context::create();
+        let mut import = exported(&context, DEFINES_TWO, vec![5], 5);
+        import.datas = vec![3, 3];
+        let module = context.create_module("blaze");
+        let refused = link(&context, &module, std::slice::from_ref(&import), Linkage::External).unwrap_err();
+        let Unhandled::Duplicate(what) = &refused else { panic!("{refused:?}") };
+        assert!(
+            ["`blaze.f.5`", "`blaze.d.0`", "`blaze.d.1`", "`blaze.d.3`"].iter().all(|it| what.contains(it)),
+            "{what}"
+        );
+    }
+
+    /// A reference in the code to a name of the module's own that LLVM made unique is
+    /// refused, never taken for an outside symbol of that name.
+    #[test]
+    fn a_name_llvm_made_unique_is_a_duplicate_and_no_symbol() {
+        assert_eq!(Symbol::uniqued("blaze.d.40.1"), Some(Symbol::Data(40)));
+        assert_eq!(Symbol::uniqued("blaze.f.7.12"), Some(Symbol::Func(7)));
+        assert_eq!(Symbol::uniqued("blaze.d.40"), None);
+        assert_eq!(Symbol::uniqued("memcpy"), None);
+        assert_eq!(Symbol::uniqued("blaze.d.x.1"), None);
     }
 
     /// The imports of a compile are linked to each other before they are linked into its

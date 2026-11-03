@@ -9,7 +9,7 @@
 //! structs `OnlyCurrentTraits*` and `UncoveredTyParam` of `compiler/rustc_hir_analysis/src/
 //! diagnostics.rs` (MIT or Apache-2.0).
 
-use std::ops::ControlFlow;
+use std::{alloc::Global, ops::ControlFlow};
 
 use blaze_items::{Fact, ItemId};
 use hir::InFile;
@@ -21,8 +21,9 @@ use syntax::view::{self as ast, AstNode as _, HasName as _};
 
 use crate::{
     cx::Cx,
-    lower::{Found, Phase, incoherent_impl::{ImplAt, unresolved}},
+    lower::{Found, Phase, incoherent_impl::{ImplAt, unresolved}, type_must_be_known::crate_name},
     model::{Applicability, Diag, Span},
+    print,
 };
 
 /// rustc's `OrphanCheckMode`: whether a projection with a type parameter in it is taken for
@@ -60,7 +61,14 @@ pub(crate) fn orphan_check<'db>(
         // alloc: the error's parts, for an error hir found
         (0..len).filter_map(|index| trait_ref.get_type_argument(index)).collect();
     // alloc: the error's parts, for an error hir found
-    let mut checker = Checker { cx, mode, in_self_ty: true, search_first_local: false, non_local: Vec::new() };
+    let mut checker = Checker {
+        cx,
+        impl_: hir_def::ImplId::try_from(impl_).ok(),
+        mode,
+        in_self_ty: true,
+        search_first_local: false,
+        non_local: Vec::new(),
+    };
     let mut found = ControlFlow::Continue(());
     for ty in &inputs {
         found = checker.visit(ty);
@@ -102,6 +110,8 @@ enum Exit<'db> {
 
 struct Checker<'a, 'b, 'db> {
     cx: &'a Cx<'b, 'db>,
+    /// The impl, for its `#[blaze::sealed]` bounds (a builtin derive has none).
+    impl_: Option<hir_def::ImplId>,
     mode: Mode,
     in_self_ty: bool,
     search_first_local: bool,
@@ -129,14 +139,25 @@ impl<'db> Checker<'_, '_, 'db> {
 
     /// rustc's `OrphanChecker::visit_ty`, the impl's parameters standing for its inference
     /// variables: a parameter is uncovered, a fundamental type (`&T`, `Box<T>`, `Pin<T>`) is
-    /// looked into, any other type is local or not by where it is defined.
+    /// looked into (`Box` by its first argument only), any other type is local or not by where
+    /// it is defined.
     fn visit(&mut self, ty: &hir::Type<'db>) -> ControlFlow<Exit<'db>> {
         let db = self.cx.db;
         let result = if ty.is_unknown() {
             // clone: on the error path, for an error hir found
             ControlFlow::Break(Exit::Local(ty.clone()))
-        } else if ty.as_type_param(db).is_some() {
-            self.uncovered(ty)
+        } else if let Some(param) = ty.as_type_param(db) {
+            // blaze: a parameter bounded by a closed `#[blaze::sealed]` trait of the crate is
+            // a local type, as in hir's `check_orphan_rules` (`hir_ty::sealed_local_bound`).
+            let sealed = self.impl_.is_some_and(|impl_| {
+                hir_ty::sealed_local_bound(db, impl_, hir_def::TypeParamId::from(param)).is_some()
+            });
+            if sealed {
+                // clone: on the error path, for an error hir found
+                ControlFlow::Break(Exit::Local(ty.clone()))
+            } else {
+                self.uncovered(ty)
+            }
         } else if ty.as_associated_type_parent_trait(db).is_some() || ty.as_impl_traits(db).is_some() {
             let projection = ty.as_associated_type_parent_trait(db).is_some();
             if ty.generic_params(db).iter().any(|it| matches!(it, hir::GenericParam::TypeParam(_))) {
@@ -153,9 +174,13 @@ impl<'db> Checker<'_, '_, 'db> {
             if self.is_local(adt.module(db).krate(db)) {
                 // clone: on the error path, for an error hir found
                 ControlFlow::Break(Exit::Local(ty.clone()))
-            } else if is_fundamental(self.cx, adt) {
+            } else if struct_flags(self.cx, adt).contains(StructFlags::FUNDAMENTAL) {
+                // rustc: the `owned_box` lang item is looked into by its first argument only
+                // (`OwnedBox => args.type_at(0)`), so a local allocator does not make
+                // `Box<Foreign, LocalAlloc>` local; any other fundamental type by all of them.
+                let take = if struct_flags(self.cx, adt).contains(StructFlags::IS_BOX) { 1 } else { usize::MAX };
                 // alloc: the error's parts, for an error hir found
-                let args: Vec<_> = ty.type_arguments().collect();
+                let args: Vec<_> = ty.type_arguments().take(take).collect();
                 let mut result = ControlFlow::Continue(());
                 for arg in &args {
                     result = self.visit(arg);
@@ -182,11 +207,13 @@ impl<'db> Checker<'_, '_, 'db> {
     }
 }
 
-/// Whether `adt` is `#[fundamental]` (`Box`, `Pin`): its type argument decides for it.
-fn is_fundamental(cx: &Cx<'_, '_>, adt: hir::Adt) -> bool {
+/// The flags of `adt` if it is a struct: whether it is `#[fundamental]` (`Box`, `Pin`), whose
+/// type arguments decide for it, and whether it is `Box` (the `owned_box` lang item,
+/// `StructFlags::IS_BOX`, as hir-ty's `AdtDef::is_box`).
+fn struct_flags(cx: &Cx<'_, '_>, adt: hir::Adt) -> StructFlags {
     match AdtId::from(adt) {
-        AdtId::StructId(id) => StructSignature::of(cx.db, id).flags.contains(StructFlags::FUNDAMENTAL),
-        _ => false,
+        AdtId::StructId(id) => StructSignature::of(cx.db, id).flags,
+        _ => StructFlags::empty(),
     }
 }
 
@@ -208,6 +235,86 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplOrphan) -> Vec<Found> {
     diag.fact(at.coherence(cx), "the orphan check of the impl");
     // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Items)]
+}
+
+/// blaze: rustc's orphan check of an impl of another crate's trait in a crate whose graph has a
+/// `#[blaze::sealed]` trait and of which nothing else is checked (only what the build's programs
+/// reach of it, [`crate::check_sealed`]). The knowability rule and the expansion argument of
+/// sealing assume every crate that can name a sealed trait obeys rustc's orphan rule, and a
+/// registry crate that depends on a blaze-only one was never checked by rustc
+/// (docs/v2/plan/lanes/frontend/sealed-orphan.md, "Where the checks run"). Only what rustc
+/// refuses is refused (E0117, E0210), never what only hir's stricter `check_orphan_rules` does;
+/// the `uncovered_param_in_projection` lint is left out, as `--cap-lints` leaves a dependency's.
+/// Each error's message names the impl, its trait, the rule and the crate that seals.
+pub(crate) fn in_sealed_graph(cx: &Cx<'_, '_>, d: &hir::diagnostics::ForeignTraitImpl) -> Vec<Found> {
+    let Some(at) = ImplAt::of_ptr(cx, d.file_id, d.impl_) else {
+        return unresolved(cx, d.file_id, d.impl_, "an orphan check in a sealed graph");
+    };
+    let mut found = report(cx, &at);
+    found.retain(|it| !it.diag.is_lint());
+    if found.is_empty() {
+        return found;
+    }
+    let db = cx.db;
+    let header = match at.impl_.trait_ref(db) {
+        // alloc: the error's text, for an error rustc's walk found
+        Some(tr) => format!(
+            "`impl {}{} for {}`",
+            if at.impl_.is_negative(db) { "!" } else { "" },
+            print::trait_path(cx, &tr),
+            cx.ty(&at.impl_.self_ty(db)),
+        ),
+        // alloc: the error's text, as above
+        None => "the impl".to_owned(),
+    };
+    let trait_ = match at.impl_.trait_(db) {
+        // alloc: the error's text, as above
+        Some(trait_) => format!(
+            "`{}` of crate `{}`",
+            cx.def_path(hir::ModuleDef::Trait(trait_)),
+            crate_name(cx, trait_.module(db).krate(db)),
+        ),
+        // alloc: the error's text, as above
+        None => "its trait".to_owned(),
+    };
+    let sealing = match sealing_crate(cx) {
+        // alloc: the error's text, as above
+        Some(krate) => format!("crate `{}` seals a trait", crate_name(cx, krate)),
+        // alloc: the error's text, as above
+        None => "a crate of its graph seals a trait".to_owned(),
+    };
+    for it in &mut found {
+        // alloc: the error's text, as above
+        it.diag.message = format!(
+            "{}: {header} implements {trait_} (rule: orphan, checked in every crate of a graph where {sealing} with `#[blaze::sealed]`)",
+            it.diag.message
+        );
+        it.diag.note(
+            "rustc's orphan rule binds every crate that can name a `#[blaze::sealed]` trait, a dependency only partly checked included",
+        );
+    }
+    found
+}
+
+/// The first crate of `cx.krate`'s graph, itself first then its dependencies depth first in
+/// their order, that declares a `#[blaze::sealed]` trait ([`hir_ty::declares_sealed`]): the
+/// crate an orphan error in a sealed graph names. Only asked on that error's path.
+fn sealing_crate(cx: &Cx<'_, '_>) -> Option<hir::Crate> {
+    let db = cx.db;
+    // alloc: the error path, a word per crate of the graph
+    let mut seen: blaze_hash::HashSet<base_db::Crate, Global> = blaze_hash::HashSet::new_in(Global);
+    // alloc: as above
+    let mut stack = vec![cx.krate.base()];
+    while let Some(krate) = stack.pop() {
+        if !seen.insert(krate) {
+            continue;
+        }
+        if hir_ty::declares_sealed(db, krate) {
+            return Some(hir::Crate::from(krate));
+        }
+        stack.extend(krate.data(db).dependencies.iter().rev().map(|dep| dep.crate_id));
+    }
+    None
 }
 
 /// rustc's `orphan_check_impl`: the `Proper` check, and when it fails the `Compat` one, whose

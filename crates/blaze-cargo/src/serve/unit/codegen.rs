@@ -24,7 +24,7 @@ use blaze_items::ItemKey;
 use blaze_link::{Change, Image, Native, NativeKind, Output};
 use blaze_units::schema::{self, Mode, Unit};
 use hir_ty_codegen::v2::{
-    Backends, BodyChecks, BuildTime, Databases, GlobalAsmObject, HashSource, HirFrontend, HirInstance, ItemHashes,
+    Assumed, Backends, BodyChecks, BuildTime, Databases, GlobalAsmObject, HashSource, HirFrontend, HirInstance, ItemHashes,
     LinkInputs, RootKind, Roots, Runs,
 };
 
@@ -108,12 +108,16 @@ pub(crate) fn triple<'a>(job: &'a Job, unit: &'a Unit) -> &'a str {
     unit.platform.as_deref().unwrap_or(job.input.config.host.as_str())
 }
 
-/// The toolchain `unit` is compiled with: its target, the `-C target-cpu`,
+/// The toolchain `unit` is compiled with: its target and its target data, the `-C target-cpu`,
 /// `-C target-feature` of its rustflags, where it runs, the backends of this blaze.
 pub(crate) fn toolchain(job: &Job, unit: usize) -> Result<Toolchain, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let plan = job.plan(unit).map_err(|it| it.what)?;
-    hir_ty_codegen::v2::toolchain(triple(job, u), &plan.rustflags, runs(u))
+    let triple = triple(job, u);
+    // The data its crates are laid out by, which the toolchain's id is of.
+    blaze_lower::target_data(triple)
+        .map_err(|it| it.to_string())
+        .and_then(|target_data| hir_ty_codegen::v2::toolchain(triple, &target_data, &plan.rustflags, runs(u)))
         // alloc: an error
         .map_err(|it| format!("unit {unit} (`{}` of {}): {it}", u.target.name, u.pkg_id))
 }
@@ -194,8 +198,9 @@ pub(crate) fn origin(job: &Job, unit: &Unit) -> Result<Origin, String> {
 }
 
 /// What blaze makes of cargo's `codegen-backend` for `package`'s code at `level`: `llvm`,
-/// rustc's default, leaves the machine code blaze's own choice, and so does `cranelift` where
-/// the level compiles with it already. Any other is an error naming it, never a key ignored:
+/// rustc's default, leaves the machine code blaze's own choice, and so do `cranelift` (rustc's
+/// fast unoptimized back end) and `stencil` where the level compiles with stencils, blaze's
+/// fast unoptimized native code. Any other is an error naming it, never a key ignored:
 /// blaze's code generator has no setting that puts a backend over the level's.
 pub(crate) fn codegen_backend(profile: &schema::Profile, package: &str, level: OptLevel) -> Result<(), String> {
     let asked = match profile.codegen_backend.as_deref() {
@@ -204,7 +209,7 @@ pub(crate) fn codegen_backend(profile: &schema::Profile, package: &str, level: O
     };
     let name = &profile.name;
     match asked {
-        "cranelift" if level.backend(false).is_some_and(Backend::is_cranelift) => Ok(()),
+        "cranelift" | "stencil" if level.backend(false) == Some(Backend::Stencil) => Ok(()),
         "cranelift" | "stencil" => Err(format!(
             "the profile `{name}` of `{package}` asks for codegen-backend `{asked}`, and blaze's code \
              generator takes no backend over the one opt-level {} compiles with",
@@ -670,7 +675,7 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
             packages.insert(name, differs);
         }
     }
-    Ok(Policy {
+    let mut policy = Policy {
         toolchain,
         profile: Profile {
             opt_level: opt,
@@ -695,7 +700,13 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
         // What the program's allocator allows is read from its sources, which [`generate`]
         // has: there it is set for the unit's program.
         heap_to_stack: false,
-    })
+    };
+    // A dev executable runs on the daemon's code memory and takes edits while it runs: its
+    // members' functions are reached through slots ([`super::run::inproc::runs_in_process`]).
+    if super::run::inproc::runs_in_process(job, unit, &policy)? {
+        policy.mode = BuildMode::Live;
+    }
+    Ok(policy)
 }
 
 /// What a unit's codegen made ([`generate`]), kept for its link: nothing of the front end
@@ -920,6 +931,14 @@ pub struct Linked {
     /// The profile its first link laid it out by ([`super::layout::Weights::id`]): a kept
     /// image keeps that order, so another profile makes it again.
     layout: Option<ContentId>,
+    /// A dev executable's program in the daemon's code memory, which its runs map
+    /// ([`Output::dev_run`]): each link is committed into it.
+    loaded: Option<Arc<super::run::inproc::Loaded>>,
+    /// A live image's slots by what their function is across edits ([`edited_slots`]).
+    slotted: Vec<(ContentId, InstanceKey)>,
+    /// What a dev executable's running code assumes of its workspace crates' items, as of its
+    /// last link ([`HirFrontend::live_assumed`]).
+    assumed: Vec<(ItemKey, Assumed)>,
 }
 
 impl Linked {
@@ -1060,12 +1079,14 @@ const FIRST_LIBRARY: u32 = 1 << 20;
 pub(crate) type Read = (String, ContentId);
 
 /// What [`link`] made: the file's bytes, every native input the link read off the machine, a
-/// test binary's execution table, and how it reached the image.
+/// test binary's execution table, how it reached the image, and, for a dev executable whose
+/// runs could not take the link as a patch, why they were told to start again.
 pub(crate) struct LinkMade {
     pub(crate) bytes: Vec<u8>,
     pub(crate) read: Vec<Read>,
     pub(crate) table: Option<blaze_codegen::ExecTable>,
     pub(crate) how: Linking,
+    pub(crate) restart: Option<String>,
 }
 
 /// Why [`link`] made no image at `image`.
@@ -1196,6 +1217,13 @@ fn link_at(
         false => blaze_link::target::output(triple(job, u), shared, debug, true),
     };
     let mut output = output.map_err(linker(LinkStep::Output))?;
+    // Code built to take edits ([`policy`]) is linked as a dev executable: the live descriptor
+    // and the start hook's reservations, committed into the daemon's code memory ([`relink`]).
+    let dev_run = generated.policy.mode == BuildMode::Live && *makes == Makes::Executable && !test && !wasm;
+    if dev_run {
+        output.live = Some(blaze_link::Live);
+        output.dev_run = Some(super::run::inproc::dev_run(None));
+    }
     output.exec_log = test && blaze_codegen::exec::records(generated.policy.mode);
     output.sanitize = generated.policy.sanitize;
     let Natives { libs, search, assembled } = natives(job, unit, &generated.frontend, triple(job, u))?;
@@ -1212,7 +1240,7 @@ fn link_at(
     let (mut linked, changed, relaid) = kept_image(images, path, &output, weights.map(super::layout::Weights::id))?;
     // The image goes back whether the link is made or not: one that fails leaves it as it
     // was, and the next link is a change of it.
-    let made = relink(path, generated, test, &assembled, &located, side, heat.as_ref(), &mut linked);
+    let made = relink(job, unit, path, generated, test, &assembled, &located, side, heat.as_ref(), &mut linked);
     // What address holds which function, for a profile of this build to be read through.
     let mapped = match (&made, profiles) {
         (Ok(_), Some(profiles)) => {
@@ -1227,14 +1255,18 @@ fn link_at(
         Err(_) => Ok(()),
     };
     images.push(KeptImage { path: path.to_owned(), kept: linked });
-    let (bytes, read, table, full) = made?;
+    let (bytes, read, table, full, told) = made?;
     mapped?;
     perf_mapped?;
     let how = match relaid && changed.is_some_and(OutputFields::is_empty) {
         true => Linking::Full(Full::Layout),
         false => linking(changed, full, output.incremental),
     };
-    Ok(LinkMade { bytes, read, table, how })
+    let restart = match told {
+        super::run::inproc::Told::Restart { why } => Some(why),
+        super::run::inproc::Told::Nothing | super::run::inproc::Told::Patched { .. } => None,
+    };
+    Ok(LinkMade { bytes, read, table, how, restart })
 }
 
 /// The image to link `output` laid out by profile `layout` into at `path`, taken out of
@@ -1267,6 +1299,9 @@ pub(crate) fn kept_image(
         natives: Vec::new(),
         names: Vec::new(),
         layout,
+        loaded: None,
+        slotted: Vec::new(),
+        assumed: Vec::new(),
     };
     if let Some(at) = at {
         images.swap_remove(at);
@@ -1412,6 +1447,8 @@ pub(crate) fn function_rows(
 /// still say what the image holds.
 #[expect(clippy::too_many_arguments, reason = "the link's inputs, each its own")]
 fn relink(
+    job: &Job,
+    unit: usize,
     path: &str,
     generated: &Generated<'_>,
     test: bool,
@@ -1420,7 +1457,7 @@ fn relink(
     side: &LinkInputs,
     heat: Option<&blaze_link::Heat>,
     linked: &mut Linked,
-) -> Result<(Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>, bool), LinkCause> {
+) -> Result<(Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>, bool, super::run::inproc::Told), LinkCause> {
     let built = generated.built;
     // Each native input by the hash of its contents, through the process's table of files by
     // their `stat`: one `stat` for a library the image already has, read only when it is new.
@@ -1485,6 +1522,12 @@ fn relink(
     for (item, instance, name) in &built.static_symbols {
         names.push((name.clone(), Target::Static { item: *item, instance: *instance }));
     }
+    let (slots, slotted) = match linked.output.live {
+        Some(_) => edited_slots(&linked.slotted, &patchable, &built.identities, &built.debug_names)
+            // alloc: error path
+            .map_err(|what| LinkCause::Given(format!("{path}: {what}")))?,
+        None => (Vec::new(), Vec::new()),
+    };
     let mut now_named: Vec<&str> = names.iter().map(|it| it.0.as_str()).collect();
     let (kept_names, unnamed) = renamed(std::mem::take(&mut linked.names), &mut now_named);
     // clone: the names gone, a few a link, which an image that refuses the change still has
@@ -1492,8 +1535,9 @@ fn relink(
     let change = Change {
         added: built.functions.iter().filter(|it| added_keys.binary_search(&it.key).is_ok()).collect(),
         removed,
-        // A whole build tiers nothing up, so no slot runs another function than its own.
-        slots: Vec::new(),
+        // A whole build tiers nothing up: the slots that run another function than their own
+        // are an edited function's earlier keys', in a live image.
+        slots,
         statics: built
             .statics
             .iter()
@@ -1521,24 +1565,55 @@ fn relink(
         // clone: once per image linked, the functions codegen inferred cold
         cold: built.cold.clone(),
     };
-    let made = linked.image.stage(change).map_err(|error| (LinkStep::Stage, error)).and_then(|staged| {
+    // What a dev executable's running code assumes, and what of it this link changes: a
+    // program running the earlier link is told to start again, naming each change.
+    let (assumed, refused) = match linked.output.dev_run {
+        Some(_) => {
+            let assumed = live_assumed(job, unit, &generated.frontend);
+            let refused = changed_assumptions(&linked.assumed, &assumed, &generated.frontend);
+            (assumed, refused)
+        }
+        None => (Vec::new(), None),
+    };
+    let made = linked.image.stage(change).map_err(|error| LinkCause::Linker { step: LinkStep::Stage, error }).and_then(|staged| {
         let full = staged.full();
-        linked.image.bytes(staged).map(|bytes| (bytes, full)).map_err(|error| (LinkStep::Bytes, error))
+        match linked.output.dev_run {
+            // A dev executable's file is its code memory's image part, which its runs map.
+            Some(dev_run) => super::run::inproc::commit(
+                &job.shared.dev_runs,
+                path,
+                &mut linked.image,
+                &mut linked.loaded,
+                staged,
+                dev_run.cells,
+                refused.as_deref(),
+            )
+            .map(|(bytes, told)| (bytes, full, told))
+            // alloc: error path
+            .map_err(|what| LinkCause::Given(format!("{path}: {what}"))),
+            None => linked
+                .image
+                .bytes(staged)
+                .map(|bytes| (bytes, full, super::run::inproc::Told::Nothing))
+                .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error }),
+        }
     });
-    let (bytes, full) = match made {
+    let (bytes, full, told) = match made {
         Ok(made) => made,
-        Err((step, error)) => {
+        Err(cause) => {
             // Every name the image may still hold: one it never took is unnamed harmlessly.
             linked.names = kept_names;
             linked.names.extend(gone_names);
             linked.names.sort_unstable();
-            return Err(LinkCause::Linker { step, error });
+            return Err(cause);
         }
     };
     linked.functions = functions;
     linked.statics = statics;
     linked.natives = new_natives;
     linked.names = kept_names;
+    linked.slotted = slotted;
+    linked.assumed = assumed;
     // A test binary's tests are selected by its table, which only its link numbers.
     let table = match test {
         true => Some(super::test::image::table(
@@ -1552,7 +1627,133 @@ fn relink(
         )?),
         false => None,
     };
-    Ok((bytes, read, table, full))
+    Ok((bytes, read, table, full, told))
+}
+
+/// What the code `unit` links of its workspace crates assumes of their items, by key, sorted
+/// ([`HirFrontend::live_assumed`]).
+fn live_assumed(job: &Job, unit: usize, frontend: &HirFrontend<'_>) -> Vec<(ItemKey, Assumed)> {
+    // alloc: per live link, kept by the image
+    let mut rows = Vec::new();
+    for at in job.graph.linked_in(unit as u32) {
+        if let Some(krate) = job.crates.krate(at as usize) {
+            rows.extend(frontend.live_assumed(krate));
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
+/// Why a program running a dev executable's earlier link can't take this one as a patch: the
+/// functions whose signature and the types whose layout changed, named (the first few, and
+/// how many more); `None` when nothing it assumed did. Code built before the edit (a frame
+/// still running, a value it made) would meet code built after it. An item added or removed
+/// changes nothing the running code assumed: its old code never named a new one, and a
+/// removed function's slot keeps its code until another fills it.
+fn changed_assumptions(
+    old: &[(ItemKey, Assumed)],
+    new: &[(ItemKey, Assumed)],
+    frontend: &HirFrontend<'_>,
+) -> Option<String> {
+    use std::fmt::Write as _;
+    /// How many changes the reason names.
+    const NAMED: usize = 3;
+    // alloc: per live link with a change, the changed items
+    let mut changed: Vec<(ItemKey, Assumed)> = Vec::new();
+    let (mut a, mut b) = (0, 0);
+    while a < old.len() && b < new.len() {
+        match old[a].0.cmp(&new[b].0) {
+            std::cmp::Ordering::Less => a += 1,
+            std::cmp::Ordering::Greater => b += 1,
+            std::cmp::Ordering::Equal => {
+                if old[a].1 != new[b].1 {
+                    changed.push(new[b]);
+                }
+                a += 1;
+                b += 1;
+            }
+        }
+    }
+    if changed.is_empty() {
+        return None;
+    }
+    // alloc: a restart's reason, once per refused link
+    let mut why = String::new();
+    for (at, (key, now)) in changed.iter().take(NAMED).enumerate() {
+        if at > 0 {
+            why.push_str("; ");
+        }
+        let path = frontend.item_path(*key);
+        let _ = match now {
+            Assumed::Signature(_) => {
+                write!(why, "the signature of `{path}` changed: code built before the edit calls it as it was")
+            }
+            Assumed::Layout(_) => {
+                write!(why, "the layout of `{path}` changed: values made before the edit are laid out as it was")
+            }
+            Assumed::Unhashable(_) => write!(why, "`{path}` changed, and blaze can't hash what code assumes of it"),
+        };
+    }
+    if changed.len() > NAMED {
+        let _ = write!(why, "; and {} more", changed.len() - NAMED);
+    }
+    Some(why)
+}
+
+/// The slots of a live image that run an edited function's new code, as `(slot, function)`,
+/// and the image's slots by identity after this link. An edit of a function's body gives it a
+/// new key, and its new callers call that key's slot; code built before the edit (a frame
+/// still running, a caller whose code did not change) calls the slot of a key it had before,
+/// which has to run the new code too, or the edit never reaches it. `slotted` holds, for each
+/// identity (what a function is across edits of its body, `Built::identities`),
+/// every key the image made a slot for; `patchable` (sorted) is this build's functions
+/// reached through slots. A function gone from the build leaves its keys out: its slots are
+/// emptied with its code, as the linker does for any function removed.
+pub(crate) fn edited_slots(
+    slotted: &[(ContentId, InstanceKey)],
+    patchable: &[InstanceKey],
+    identities: &[(InstanceKey, ContentId)],
+    debug_names: &[(InstanceKey, String)],
+) -> Result<(Vec<(InstanceKey, InstanceKey)>, Vec<(ContentId, InstanceKey)>), String> {
+    // alloc: once per live link, a pair per patchable function, kept by the image
+    let mut now: Vec<(ContentId, InstanceKey)> =
+        identities.iter().filter(|it| patchable.binary_search(&it.0).is_ok()).map(|(key, id)| (*id, *key)).collect();
+    now.sort_unstable();
+    now.dedup();
+    // Two functions one across edits: which of them an earlier key's slot runs is not
+    // decidable (rule 18), never a guess.
+    if let Some(pair) = now.windows(2).find(|it| it[0].0 == it[1].0) {
+        let name = |key: InstanceKey| debug_names.iter().find(|it| it.0 == key).map_or("(no debug name)", |it| it.1.as_str());
+        // alloc: error path
+        return Err(format!(
+            "`{}` ({:?}) and `{}` ({:?}) are one function across edits (identity {:?}): the live image can't \
+             say which of them the slots of its earlier keys run",
+            name(pair[0].1),
+            pair[0].1,
+            name(pair[1].1),
+            pair[1].1,
+            pair[0].0
+        ));
+    }
+    // alloc: once per live link, a pair per slot an edited function's earlier key has
+    let mut slots = Vec::new();
+    // alloc: once per live link, kept by the image
+    let mut kept = Vec::with_capacity(now.len() + slotted.len());
+    for &(id, key) in &now {
+        let from = slotted.partition_point(|it| it.0 < id);
+        for &(_, old) in slotted[from..].iter().take_while(|it| it.0 == id) {
+            if old != key {
+                slots.push((old, key));
+                kept.push((id, old));
+            }
+        }
+        kept.push((id, key));
+    }
+    kept.sort_unstable();
+    kept.dedup();
+    slots.sort_unstable();
+    Ok((slots, kept))
 }
 
 /// A `rustc-link-lib` as rustc takes `-l`: `[KIND[:MODIFIERS]=]NAME[:RENAME]`.

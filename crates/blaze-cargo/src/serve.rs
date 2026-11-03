@@ -486,9 +486,9 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     let host = crate::toolchain::host()
         .context("blaze has no target triple for this machine's architecture and system")?
         .to_owned();
-    let toolchain = hir_ty_codegen::v2::toolchain(&host, &[], hir_ty_codegen::v2::Runs::Elsewhere)
-        .map_err(|why| anyhow::anyhow!("the toolchain proc macros are built with, for {host}: {why}"))?
-        .id;
+    // What kept expansions are keyed by: the whole blaze, as `unit::deps::build` is, since the
+    // macro server and bridge that expand them are past the code generator's packages.
+    let toolchain = build.id;
     let options = Options {
         state: file_name(&paths.state)?,
         std: file_name(&std)?,

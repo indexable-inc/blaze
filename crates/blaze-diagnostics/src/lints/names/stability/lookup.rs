@@ -169,7 +169,7 @@ fn enabled_in(cx: &Cx<'_, '_>, enabled: &mut HashTable<(Symbol, bool), &Frame>, 
 fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange, feature: &Symbol) -> bool {
     use hir_expand::MacroDefKind;
     let db = cx.db;
-    if in_appended(cx, file, range) {
+    if cx.in_appended(file, range) {
         return true;
     }
     let ctxt = file.span_map(db).span_for_range(range).ctx;
@@ -189,14 +189,3 @@ fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange, feature: 
     attr::allows_internal_unstable(node, hir::Crate::from(def.krate).cfg(db), feature)
 }
 
-/// Whether `range` of `file` is in the module the compiler appended to the crate root `file`
-/// is: the root's last item, a module of that name ([`allows_unstable`]).
-fn in_appended(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) -> bool {
-    use syntax::view::{self as ast, HasModuleItem as _, HasName as _};
-    let db = cx.db;
-    let Some(real) = file.file_id() else { return false };
-    let Some(name) = db.file_text(real.file_id(db)).appended_root_module(db) else { return false };
-    let Some(root) = ast::SourceFile::cast(cx.root(file)) else { return false };
-    let Some(ast::Item::Module(module)) = root.items().last() else { return false };
-    module.name().is_some_and(|it| it.text() == name) && module.syntax().text_range().contains_range(range)
-}

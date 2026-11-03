@@ -1199,6 +1199,14 @@ pub struct TraitImplOrphan {
     pub impl_: AstPtr<ast::Impl>,
 }
 
+/// blaze: an impl of another crate's trait, written in source, that rustc's orphan check is to
+/// decide (`crate::check::SealedCheck::foreign_impls`): no diagnostic of itself.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ForeignTraitImpl {
+    pub file_id: HirFileId,
+    pub impl_: AstPtr<ast::Impl>,
+}
+
 // FIXME: Split this off into the corresponding 4 rustc errors
 #[derive(Debug, PartialEq, Eq)]
 pub struct TraitImplIncorrectSafety {
@@ -2372,9 +2380,128 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
 
         self.collect_generic_def(def.into());
         self.collect_wfcheck(def.into());
+        for error in hir_ty_coherence::check_trait(self.db, def) {
+            self.push_coherence_error(signature_owner(self.db, def.into()), error);
+        }
         self.emit_def_diagnostics(&items.1);
         items.0.macro_calls().for_each(|(_, call)| self.collect_macro_call(call));
         self.collect_assoc_items(&items.0.items, def_map);
+    }
+
+    /// A `#[blaze::sealed]` error of hir-ty-coherence at `node`, with its note.
+    fn push_coherence_error(
+        &mut self,
+        node: InFile<SyntaxNodePtr>,
+        error: hir_ty_coherence::CoherenceError,
+    ) {
+        let children = error
+            .note
+            .into_iter()
+            .map(|message| BorrowckChild {
+                level: BorrowckSublevel::Note,
+                message,
+                // alloc: empty
+                spans: Vec::new(),
+                // alloc: empty
+                labels: Vec::new(),
+            })
+            // alloc: error path, at most one note per reported error
+            .collect();
+        self.acc.push(
+            BorrowckError {
+                node,
+                at_end: false,
+                code: error.rule.code(),
+                message: error.message,
+                // alloc: empty
+                labels: Vec::new(),
+                children,
+                // alloc: empty
+                suggestions: Vec::new(),
+            }
+            .into(),
+        );
+    }
+
+    /// blaze: the `#[blaze::sealed]` checks of `krate` alone (`hir-ty-coherence`'s
+    /// `check_impl` and `check_trait`) into `acc`, and each impl of another crate's trait
+    /// written in source into `foreign_impls`, for rustc's orphan check (blaze-diagnostics'
+    /// `trait_impl_orphan`), over the items of its modules and of every body's blocks, in the
+    /// def maps' order: what [`crate::check::check_sealed`] gives, for a crate whose items no
+    /// other check covers.
+    pub(crate) fn collect_sealed(
+        db: &'db Db,
+        krate: base_db::Crate,
+        acc: &'a mut Vec<AnyDiagnostic<'db>>,
+        foreign_impls: &mut Vec<ForeignTraitImpl>,
+        bodies: &'a F,
+    ) {
+        let _p = tracing::info_span!(target: "blaze", "sealed_check", ?krate).entered();
+        let edition = krate.data(db).edition;
+        let mut this = DiagnosticsCollector {
+            db,
+            krate,
+            edition,
+            style_lints: false,
+            acc,
+            bodies,
+            deferred: None,
+        };
+        for (module, _) in hir_def::nameres::crate_def_map(db, krate).modules(db) {
+            this.collect_sealed_module(module, foreign_impls);
+        }
+        // A trait in a body's block may name a sealed trait of another crate as a supertrait, and
+        // an impl there is as global as any other: every body is lowered (not checked) for its
+        // blocks. Only a crate with a sealed trait in its graph pays this (`sealed_in_graph`).
+        for owner in hir_def::nameres::demand::every_body(db, krate) {
+            for (_, block_def_map) in Body::of(db, owner).blocks(db) {
+                for (module, _) in block_def_map.modules(db) {
+                    this.collect_sealed_module(module, foreign_impls);
+                }
+            }
+        }
+    }
+
+    /// [`Self::collect_sealed`] of the items `module` declares.
+    fn collect_sealed_module(
+        &mut self,
+        module: ModuleId,
+        foreign_impls: &mut Vec<ForeignTraitImpl>,
+    ) {
+        let db = self.db;
+        let scope = module.def_map(db).module(db, module).scope(db);
+        for def in scope.declarations() {
+            if let ModuleDefId::TraitId(trait_) = def {
+                for error in hir_ty_coherence::check_trait(db, trait_) {
+                    self.push_coherence_error(signature_owner(db, trait_.into()), error);
+                }
+            }
+        }
+        for impl_ in scope.impls() {
+            let loc = impl_.lookup(db);
+            let file_id = loc.id.file_id;
+            if file_id.macro_file().is_some_and(|it| it.kind(db) == MacroKind::DeriveBuiltIn) {
+                // A builtin derive implements its own trait for a local type: never relaxed.
+                continue;
+            }
+            let ast = || file_id.ast_id_map(db).get(loc.id.value);
+            for error in hir_ty_coherence::check_impl(db, impl_) {
+                self.push_coherence_error(InFile::new(file_id, ast().syntax_node_ptr()), error);
+            }
+            // The orphan rule binds every impl of another crate's trait: the knowability rule
+            // (`coherence.rs` skipping the downstream conflict for a sealed trait) and the
+            // expansion argument assume every crate that can name a sealed trait obeys it, and
+            // a registry crate that depends on a blaze-only one was never checked by rustc.
+            // rustc's walker decides (blaze-diagnostics' `trait_impl_orphan`), not hir's
+            // `check_orphan_rules`, which refuses impls rustc accepts.
+            let foreign = db.impl_trait(impl_).is_some_and(|trait_ref| {
+                hir_def::HasModule::krate(&trait_ref.instantiate_identity().skip_norm_wip().def_id.0, db)
+                    != self.krate
+            });
+            if foreign {
+                foreign_impls.push(ForeignTraitImpl { impl_: ast(), file_id });
+            }
+        }
     }
 
     fn collect_impl(
@@ -2454,6 +2581,13 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 }
                 .into(),
             );
+        }
+
+        // blaze's sealed-trait relaxation of the orphan rules, `#[blaze::sealed]`
+        // (hir-ty-coherence): sealing, closure, overlap and the traits it may not relax.
+        for error in hir_ty_coherence::check_impl(self.db, def) {
+            let node = InFile::new(file_id, ast_id_map.get(loc.id.value).syntax_node_ptr());
+            self.push_coherence_error(node, error);
         }
 
         let trait_impl = impl_signature.target_trait.is_some();

@@ -61,10 +61,10 @@ pub use backend::Backends;
 pub use frontend::{BodyChecks, Databases, HirFrontend};
 pub use global_asm::GlobalAsmObject;
 pub use hashes::ItemHashes;
-pub use linked::{LinkInputs, span_tables_of};
+pub use linked::{Assumed, LinkInputs, span_tables_of};
 pub use lowered::{Lowering, lowered};
 pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE};
-pub use toolchain::{Runs, build, select, toolchain};
+pub use toolchain::{CodegenCode, Runs, code, select, set_code, toolchain, toolchain_for};
 #[cfg(feature = "llvm")]
 pub use crate::llvm::pgo::Profile;
 #[cfg(feature = "llvm")]
@@ -205,7 +205,7 @@ impl HirInstance {
 pub(crate) enum Kind {
     /// What the IR builder compiles: a function, closure, coroutine or shim with its generic
     /// arguments, regions erased, in the environment of the crate it is compiled as
-    /// ([`crate::home::Homes`]). `checked` is always `false`: a unit's overflow checks are
+    /// (its home, `hir_ty_mir::mir::home`). `checked` is always `false`: a unit's overflow checks are
     /// its [`blaze_codegen::settings::Spec`]'s.
     Code(Instance, StoredParamEnvAndCrate),
     /// The function a `global_asm!` or `naked_asm!` defines, by its text, and whether code of

@@ -432,26 +432,39 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     if let Some((addr, size)) = synthetic(INTERP) {
         phdrs.push(Phdr { p_type: elf::PT_INTERP, flags: 4, vaddr: addr, filesz: size, memsz: size, align: 1 });
     }
-    for load in &loads {
+    // The loader protects relro in whole pages of the running kernel's size, rounding its end
+    // down (glibc's `_dl_protect_relro`), and `mprotect` of a page the image doesn't map fails
+    // the start with ENOMEM. So relro ends on the next segment's page, a multiple of every page
+    // size the architecture runs with (64 KiB on AArch64, whose kernels run 4, 16 or 64 KiB
+    // pages), and its `PT_LOAD` maps zeroed memory up to there (lld's `.relro_padding`): on a
+    // 4 KiB kernel the pages between its last byte and that boundary are in no mapping
+    // otherwise. With nothing after it, it ends at its last byte.
+    let relro = loads.iter().position(|it| it.segment == Segment::Relro).map(|at| {
+        let load = &loads[at];
+        let end = if at + 1 < loads.len() { load.end.next_multiple_of(plan.page) } else { load.end };
+        (at, end)
+    });
+    for (at, load) in loads.iter().enumerate() {
+        let end = match relro {
+            Some((relro, end)) if relro == at => end,
+            _ => load.end,
+        };
         phdrs.push(Phdr {
             p_type: elf::PT_LOAD,
             flags: load.segment.flags(),
             vaddr: load.vaddr,
             filesz: load.file_end - load.vaddr,
-            memsz: load.end - load.vaddr,
+            memsz: end - load.vaddr,
             align: plan.page,
         });
     }
     if let Some((addr, size)) = synthetic(DYNAMIC) {
         phdrs.push(Phdr { p_type: elf::PT_DYNAMIC, flags: 6, vaddr: addr, filesz: size, memsz: size, align: 8 });
     }
-    if let Some(at) = loads.iter().position(|it| it.segment == Segment::Relro) {
+    if let Some((at, end)) = relro {
         let load = &loads[at];
-        // The loader protects whole pages: round up to the next segment's page so the last
-        // one is protected too, but never past the mapping when nothing follows.
-        let end = if at + 1 < loads.len() { load.end.next_multiple_of(plan.page) } else { load.end };
-        let size = end - load.vaddr;
-        phdrs.push(Phdr { p_type: elf::PT_GNU_RELRO, flags: 4, vaddr: load.vaddr, filesz: size, memsz: size, align: 1 });
+        let (filesz, memsz) = (load.file_end - load.vaddr, end - load.vaddr);
+        phdrs.push(Phdr { p_type: elf::PT_GNU_RELRO, flags: 4, vaddr: load.vaddr, filesz, memsz, align: 1 });
     }
     if let (Some(_), Some((addr, size))) = (placed.region(&Class::EhFrame), synthetic(EH_FRAME_HDR)) {
         phdrs.push(Phdr { p_type: elf::PT_GNU_EH_FRAME, flags: 4, vaddr: addr, filesz: size, memsz: size, align: 4 });

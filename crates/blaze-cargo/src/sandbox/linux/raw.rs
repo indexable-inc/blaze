@@ -188,6 +188,16 @@ pub(super) fn stat_of(fd: c_int) -> Option<libc::stat> {
     (done == 0).then_some(stat)
 }
 
+/// What `statvfs` says of the file system and mount `path` is on, or `None` with `errno` set.
+pub(super) fn statvfs(path: &CStr) -> Option<libc::statvfs> {
+    // SAFETY: `libc::statvfs` is integers only, for which all-zero bytes are a valid value.
+    let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a nul-terminated string borrowed for the call, which only reads it,
+    // and `fs` is a live, exclusive `struct statvfs` for the call to fill, and nothing else.
+    let done = unsafe { libc::statvfs(path.as_ptr(), &mut fs) };
+    (done == 0).then_some(fs)
+}
+
 /// What `stat` says of `path`, or `lstat` when not `follow`, or `None` with `errno` set.
 pub(super) fn stat(path: &CStr, follow: bool) -> Option<libc::stat> {
     // SAFETY: `libc::stat` is integers only, for which all-zero bytes are a valid value.

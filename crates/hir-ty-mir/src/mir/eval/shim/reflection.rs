@@ -928,7 +928,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Obligation::new(interner, ObligationCause::dummy(), param_env, clause)
         }));
         let holds = ocx.evaluate_obligations_error_on_ambiguity().is_empty();
-        let vtable = holds.then(|| word_bytes(self.vtable_map.id(ty), self.cached_ptr_size));
+        // The vtable of `ty` for `trait_ty`, which its id names, as rustc's
+        // `GlobalAlloc::VTable(ty, trait_ty)` does: the `DynMetadata<*const ()>` it is returned
+        // in does not say which trait.
+        let id = holds.then(|| self.vtable_map.vtable_id(ty, trait_ty));
+        let vtable = id.map(|id| word_bytes(id, self.cached_ptr_size));
         let Some(dyn_metadata) = self.lang_items().DynMetadata else {
             not_supported!("no `DynMetadata` in core")
         };
@@ -938,6 +942,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             dyn_metadata.into(),
             GenericArgs::new_from_slice(&[unit_ptr.into()]),
         );
-        self.write_option(destination, dyn_metadata, vtable, locals)
+        self.write_option(destination, dyn_metadata, vtable, locals)?;
+        // The word carries the provenance of a vtable pointer: `Some`'s field, the
+        // `DynMetadata`, holds it in its first field.
+        if let Some(id) = id {
+            let Some(some) = self.lang_items().OptionSome else { not_supported!("no `Option` in core") };
+            let args = GenericArgs::new_from_slice(&[dyn_metadata.into()]);
+            let (_, layout, _) = self.layout_of_variant(some.into(), args, locals)?;
+            let at = layout.fields.offset(0).bytes_usize()
+                + self.layout(dyn_metadata)?.fields.offset(0).bytes_usize();
+            self.write_vtable_pointer(destination.addr.offset(at), id)?;
+        }
+        Ok(())
     }
 }

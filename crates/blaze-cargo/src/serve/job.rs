@@ -38,6 +38,19 @@ mod slab;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+thread_local! {
+    /// Each build script run node [`Jobs::run_script`] held for its program, on the loop's
+    /// thread: what a test sees of the hold, which no response says.
+    pub(super) static HELD_RUNS: std::cell::RefCell<Vec<NodeId>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// Each held run [`end_held_runs`] ended, and the reason it gave the plane.
+    pub(super) static ENDED_HELD: std::cell::RefCell<Vec<(NodeId, String)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// Each unit whose task or build script run a broken write refused ([`Refused`]), and the
+    /// reason it gave the plane: what a test sees of a refused dependent, which no response
+    /// says on its own.
+    pub(super) static REFUSED_UNITS: std::cell::RefCell<Vec<(usize, String)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+}
+
 use std::{
     sync::{
         Arc,
@@ -498,7 +511,10 @@ fn named(a: &str, b: &str) -> String {
     name
 }
 
-/// A node of cost 1, its memory to be predicted from its kind.
+/// A node whose cost and memory the plane predicts as it is pushed: by its own key's last runs
+/// where it is learned by one (`Plane::push_learned`, its memory never under its kind's peak;
+/// `push_program`; or the plane's key), else by its kind's mean; the 1 stands only where the
+/// predictor has neither.
 fn node<'a>(kind: NodeKind, name: &'a str, deps: &'a [NodeId], pool: Pool, key: Option<Key>) -> NodeRef<'a> {
     NodeRef { kind, name, deps, pool, cost: 1, key, memory: 0 }
 }
@@ -508,6 +524,21 @@ fn lone<S: Steps>(plane: &mut Tasks<S>, kind: NodeKind, name: &str, pool: Pool, 
     let mut fresh = plane.fresh(1, name.len(), 0);
     plane.push(&mut fresh, node(kind, name, &[], pool, key), one(task));
     fresh
+}
+
+/// [`lone`], its node with no key of the plane's, predicted and taught by `learn`.
+fn lone_learned<S: Steps>(plane: &mut Tasks<S>, kind: NodeKind, name: &str, pool: Pool, task: TaskKind, learn: Key) -> Fresh {
+    let mut fresh = plane.fresh(1, name.len(), 0);
+    plane.push_learned(&mut fresh, node(kind, name, &[], pool, None), one(task), learn);
+    fresh
+}
+
+/// The key a checkout's lowering is predicted and taught by: the same checkout lowers alike
+/// from one build to the next.
+fn lower_cost_key(checkout: &str) -> Key {
+    let mut hasher = blaze_ids::Hasher::new("blaze v2 lowering cost 1");
+    hasher.update(checkout.as_bytes());
+    Key(hasher.finish().0)
 }
 
 /// A job's place in [`Jobs::jobs`].
@@ -953,16 +984,28 @@ struct Build<S: Steps> {
     ready: Vec<(u32, u32)>,
     /// `blaze test --ub`'s tests, run in the evaluator once every unit is checked.
     evaluation: Option<Evaluation>,
-    /// The units a write that panicked leaves unbuilt; none until one does.
+    /// The units a write that failed or panicked leaves unbuilt; none until one does.
     refused: Option<Refused>,
+    /// Each unit's freshness by its place in the plan, once asked ([`Build::is_fresh`]).
+    fresh: Vec<Option<bool>>,
 }
 
-/// The units of a build that depend on a write to its front end that panicked
-/// ([`Writer::broke`]): each task of one is refused, naming the panic, while keep-going
-/// builds the rest.
+/// The units of a build that depend on a write to its front end that failed or panicked
+/// ([`Writer::broke`]): each task of one is refused, naming that write and its unit, while
+/// keep-going builds the rest.
 struct Refused {
-    units: BitSet<u32>,
-    why: String,
+    /// Each unit's place in `whys`, `u32::MAX` for a unit not refused.
+    by: Vec<u32>,
+    /// Why, one for each write that broke.
+    whys: Vec<String>,
+}
+
+impl Refused {
+    /// Why `unit` is refused, if it is.
+    fn why(&self, unit: usize) -> Option<&str> {
+        let at = *self.by.get(unit)?;
+        self.whys.get(at as usize).map(String::as_str)
+    }
 }
 
 struct Evaluation {
@@ -978,28 +1021,40 @@ impl<S: Steps> Build<S> {
         self.units.get(node.0.wrapping_sub(self.first.0) as usize).map(|it| *it as usize)
     }
 
-    /// The job's error for `broke`, a write that panicked, with every unit that depends on its
-    /// unit refused from now on. The unit itself was built: its write is what failed.
+    /// The job's error for `broke`, a write that failed or panicked, naming the write and its
+    /// unit, with every unit that depends on its unit refused from now on, each naming it. The
+    /// unit itself was built, its write is what failed, unless the write was part of making
+    /// it ([`Broke::itself`]). A unit refused already keeps its first reason.
     fn refuse_after(&mut self, broke: &Broke) -> ApiError {
         let graph = &self.input.units.graph.units;
         let unit = &graph[broke.unit];
         let error = ApiError::new(
             // alloc: an error, once
-            format!("the daemon {}, applying {} of {} of {}", broke.panic, broke.what, unit.target.name, unit.pkg_id),
+            format!("applying {} of {} of {}: {}", broke.what, unit.target.name, unit.pkg_id, broke.how),
             Some(unit.pkg_id.clone()), // clone: an error, once
         );
         let refused = self.refused.get_or_insert_with(|| Refused {
-            units: BitSet::new(graph.len()), // alloc: once a write panics
-            why: format!("a write it depends on panicked: {}", error.what), // alloc: an error, once
+            by: vec![u32::MAX; graph.len()], // alloc: once a write breaks
+            whys: Vec::new(),                // alloc: once a write breaks
         });
-        let after = broke.unit as u32;
+        let why = refused.whys.len() as u32;
+        refused.whys.push(format!("a write it depends on broke: {}", error.what)); // alloc: an error, once
+        let after = broke.unit;
+        if broke.itself && refused.by[after] == u32::MAX {
+            refused.by[after] = why;
+        }
+        // Units come in no particular order of their dependencies: reach until none is added.
         let mut grew = true;
         while grew {
             grew = false;
-            for (at, it) in (0u32..).zip(graph) {
-                let reached = |dep: &blaze_units::schema::UnitDep| dep.index as u32 == after || refused.units.contains(dep.index as u32);
-                if at != after && !refused.units.contains(at) && it.dependencies.iter().any(reached) {
-                    refused.units.insert(at);
+            for (at, it) in graph.iter().enumerate() {
+                if at == after || refused.by[at] != u32::MAX {
+                    continue;
+                }
+                let reached =
+                    |dep: &blaze_units::schema::UnitDep| dep.index as usize == after || refused.by.get(dep.index as usize).is_some_and(|it| *it == why);
+                if it.dependencies.iter().any(reached) {
+                    refused.by[at] = why;
                     grew = true;
                 }
             }
@@ -1011,6 +1066,27 @@ impl<S: Steps> Build<S> {
     fn begins(&self, node: NodeId) -> bool {
         let at = node.0.wrapping_sub(self.first.0) as usize;
         at < self.units.len() && (at == 0 || self.units[at - 1] != self.units[at])
+    }
+
+    /// Whether unit `at` is fresh, its record kept so its tasks replay it: asked of the front
+    /// end once, as its first task is posted or its run starts, and the same answer for its
+    /// other tasks, for what they teach the plane ([`plane::Plane::replays`]) and its report.
+    ///
+    /// Asked at first post rather than at start, it answers the same but in one window. A post
+    /// comes once the unit's dependencies settled, and the answer (`compile::fresh`,
+    /// `script::fresh`) reads only the record key those fix and the store. So the two differ
+    /// only when another job fills this unit's record in the store between its first post and
+    /// its start: asked at post it says not fresh, the run then finds the record and is a hit,
+    /// and the plane learns a near-zero cost for its key, one bad sample of the last few its
+    /// prediction is the median of. Rare, and it costs one prediction, never a built value; the
+    /// answer cached here also survives a repost of the task.
+    fn is_fresh(&mut self, at: usize) -> bool {
+        if let Some(fresh) = self.fresh[at] {
+            return fresh;
+        }
+        let fresh = self.front.fresh(at);
+        self.fresh[at] = Some(fresh);
+        fresh
     }
 }
 
@@ -1760,9 +1836,7 @@ impl<S: Steps> Jobs<S> {
             (_, Some(view)) => vec![view],                           // alloc: once per job
             (_, None) => Vec::new(),                                 // alloc: none
         };
-        let keep_going = targets_of(&work)
-            .and_then(|it| it.cargo.as_ref())
-            .is_some_and(|cargo| cargo.args.iter().any(|arg| arg == "--keep-going"));
+        let keep_going = keeps_going(&work);
         let snapshot = matches!(work, Work::Snapshot);
         // A daemon already running starts recording at the first request that asks.
         let profiled = match profile_dir(&work) {
@@ -1968,11 +2042,13 @@ impl<S: Steps> Jobs<S> {
         let job = self.batches.job_of(task.id).and_then(|id| self.jobs.get_mut(key_of(id)));
         let readers = match job {
             Some(Job { stage: Stage::Units(build), .. }) => {
-                if let Some(refused) = &build.refused
-                    && build.unit(task.id).is_some_and(|unit| refused.units.contains(unit as u32))
+                if let Some(unit) = build.unit(task.id)
+                    && let Some(why) = build.refused.as_ref().and_then(|refused| refused.why(unit))
                 {
-                    // clone: a refused task's why, once
-                    w.plane.refuse(w.now, task, refused.why.clone());
+                    #[cfg(test)]
+                    REFUSED_UNITS.with_borrow_mut(|it| it.push((unit, why.to_owned()))); // alloc: a test's record
+                    // alloc: a refused task's why, once
+                    w.plane.refuse(w.now, task, why.to_owned());
                     return;
                 }
                 let Some(this) = build.writer.reader() else {
@@ -1983,6 +2059,10 @@ impl<S: Steps> Jobs<S> {
                     true => self.paths.take_images(build.outputs.of(Phase::of(task.arg).0)),
                     false => Vec::new(), // alloc: none
                 };
+                // Said before it is posted, so it is in before the task can end.
+                if build.unit(task.id).is_some_and(|at| build.is_fresh(at)) {
+                    w.plane.replays(task.id);
+                }
                 Some(Readers { this: Some(this), images, ..Readers::default() })
             }
             Some(job) if matches!(job.stage, Stage::Answer(_) | Stage::Ahead(_)) => match job.work {
@@ -2024,27 +2104,41 @@ impl<S: Steps> Jobs<S> {
                 continue;
             }
             let applied = build.writer.apply();
+            // The first write that broke in this apply, for the held tasks a job that fails fast
+            // refuses.
+            let mut first: Option<String> = None;
             while let Some(broke) = build.writer.broke() {
                 let error = build.refuse_after(&broke);
+                first.get_or_insert_with(|| error.what.clone()); // clone: an error, once
                 if !job.cancelled.load(Ordering::Acquire) {
                     job.over.get_or_insert((false, Some(error)));
                 }
             }
-            match applied {
-                Ok(true) => posts.append(&mut build.held),
-                Ok(false) => {}
-                Err(error) => {
-                    for (task, _) in build.held.drain(..) {
-                        // alloc: a write that failed, once per task it held
-                        let why = format!("applying a build script's run or a proc macro: {}", error.what);
-                        w.plane.refuse(w.now, task, why);
-                    }
+            // Without keep-going a write that broke ends the job now, as a writer's own error
+            // does: the plane fails fast only once a refused task is posted, which waits for
+            // that task's other dependencies, and meanwhile it would start every unit no
+            // failure reaches.
+            let why = match (applied, first) {
+                (Err(error), _) => {
+                    let why = format!("applying a build script's run or a proc macro: {}", error.what); // alloc: an error, once
                     if !job.cancelled.load(Ordering::Acquire) {
                         job.over.get_or_insert((false, Some(error)));
                     }
-                    self.end(w, id, false, None);
+                    why
                 }
+                (Ok(_), Some(broke)) if !keeps_going(&job.work) => {
+                    format!("{broke}, and the build fails fast without --keep-going") // alloc: an error, once
+                }
+                (Ok(true), _) => {
+                    posts.append(&mut build.held);
+                    continue;
+                }
+                (Ok(false), _) => continue,
+            };
+            for (task, _) in build.held.drain(..) {
+                w.plane.refuse(w.now, task, why.clone()); // clone: a write that broke, once per task it held
             }
+            self.end(w, id, false, None);
         }
         self.order = order;
         for (task, again) in posts.drain(..) {
@@ -2262,7 +2356,8 @@ impl<S: Steps> Jobs<S> {
                 self.open(w, id, prep.opened, prep.asked);
             }
             Stage::Lower(at, input, root) if at == node => match job.take_value(node) {
-                Some(Value::Lowered(Ok(FrontEnd { front, writer, puts }))) => {
+                Some(Value::Lowered(Ok(FrontEnd { front, writer, puts, mut misses }))) => {
+                    job.misses.append(&mut misses);
                     for put in puts {
                         let (key, kind) = (put.key, put.kind);
                         match w.store.put(put.key, put.kind, put.bytes) {
@@ -2501,8 +2596,9 @@ impl<S: Steps> Jobs<S> {
         let kept = Mutex::new(root.and_then(|root| self.roots.fronts[root as usize].take()));
         let (steps, lowering) = (w.steps.clone(), input.clone()); // clone: refcounts, once per view
         let (leases, builds) = (Arc::clone(&job.leases), self.setup.builds.clone()); // clone: a refcount and a path, once per view
+        let learn = lower_cost_key(&checkout);
         let work = Step::of(&job.cancelled, Does::Lower { steps, input: lowering, kept, leases, checkout, builds });
-        let fresh = lone(w.plane, NodeKind::Names, name, Pool::Work, None, kinds::LOWER);
+        let fresh = lone_learned(w.plane, NodeKind::Names, name, Pool::Work, kinds::LOWER, learn);
         job.stage = Stage::Lower(fresh.first(), input, root);
         self.add(w, id, fresh, Some(work), false);
     }
@@ -2732,6 +2828,7 @@ impl<S: Steps> Jobs<S> {
         // Each built unit's last node, by its place after the batch's first; `u32::MAX` for one
         // not built. A unit's first node waits for the last of each unit it depends on.
         let mut last = vec![u32::MAX; all.len()]; // alloc: once per build
+        let fresh_units = vec![None; all.len()]; // alloc: once per build
         let mut units_of = Vec::new(); // alloc: once per build, a unit a node
         let (mut names, mut all_deps) = (0, 0);
         for offset in 0..built {
@@ -2762,7 +2859,8 @@ impl<S: Steps> Jobs<S> {
             let phases = phases_of(unit);
             if phases.is_empty() {
                 let task = Task::Loop { kind: loops::SCRIPT_RUN };
-                w.plane.push(&mut nodes, node(NodeKind::ScriptRun, &name, &deps, Pool::Work, None), task);
+                let learn = super::unit::cost_key(unit, None);
+                w.plane.push_learned(&mut nodes, node(NodeKind::ScriptRun, &name, &deps, Pool::Work, None), task, learn);
                 next += 1;
                 continue;
             }
@@ -2799,7 +2897,10 @@ impl<S: Steps> Jobs<S> {
                 // one never measured alone.
                 match program.zip(super::unit::program_key(unit, phase)) {
                     Some((kind, key)) => _ = w.plane.push_program(&mut nodes, spec, kind, arg, key),
-                    None => _ = w.plane.push(&mut nodes, spec, Task::Thread { kind: task, arg }),
+                    None => {
+                        let learn = super::unit::cost_key(unit, Some(phase));
+                        _ = w.plane.push_learned(&mut nodes, spec, Task::Thread { kind: task, arg }, learn);
+                    }
                 }
                 next += 1;
             }
@@ -2859,6 +2960,7 @@ impl<S: Steps> Jobs<S> {
             ready: Vec::new(),     // alloc: none until a test executable compiles
             evaluation,
             refused: None,
+            fresh: fresh_units,
         }));
         if count > 0 {
             self.add(w, id, nodes, Some(work), true);
@@ -2911,7 +3013,7 @@ impl<S: Steps> Jobs<S> {
         if !build.begins(node) {
             return;
         }
-        let fresh = build.front.fresh(at);
+        let fresh = build.is_fresh(at);
         match fresh {
             true => job.fresh += 1,
             false => job.compiled += 1,
@@ -2974,19 +3076,69 @@ impl<S: Steps> Jobs<S> {
     }
 
     /// A build script's run begins, on the loop.
+    ///
+    /// Every way out ends the node at the plane or keeps a run that will: a run node the loop
+    /// lets go unended keeps its request, and so its job, open with nothing in flight (the
+    /// 2026-11-02 self-build stall, whose held runs met a job already over).
     fn run_script(&mut self, w: &mut World<'_, S>, node: NodeId) {
-        let Some(id) = self.batches.job_of(node) else { return };
+        let Some(id) = self.batches.job_of(node) else {
+            // alloc: a failure, once
+            let why = format!("build script run node {node} is of no batch of a job, so nothing would run it");
+            w.plane.ended(w.now, node, Outcome::Failed { why });
+            return;
+        };
+        // A run a broken write refused ([`Refused`]) never runs its user code. The plane hands
+        // a run over here, never through [`Jobs::post`], so its refusal is checked here: one
+        // after a `links` dependency's run whose write broke (cargo's run-to-run edge), which
+        // ended well at the plane, or one whose own write was part of what broke. It fails at
+        // the plane naming that write and its unit.
+        if let Some(Job { stage: Stage::Units(build), .. }) = self.jobs.get(key_of(id))
+            && let Some(unit) = build.unit(node)
+            && let Some(why) = build.refused.as_ref().and_then(|refused| refused.why(unit))
+        {
+            #[cfg(test)]
+            REFUSED_UNITS.with_borrow_mut(|it| it.push((unit, why.to_owned()))); // alloc: a test's record
+            w.plane.ended(w.now, node, Outcome::Failed { why: why.to_owned() }); // alloc: a refused run's why, once
+            return;
+        }
         // The plane starts a run once its compile's node ends, before the loop has placed what
         // it made: the run waits for its program to be all there ([`Jobs::release_held`]).
         if let Some(job) = self.jobs.get_mut(key_of(id))
             && waits_for_program(job, node)
         {
+            #[cfg(test)]
+            HELD_RUNS.with_borrow_mut(|it| it.push(node));
             job.held.push(node);
             return;
         }
+        // A fresh unit's run replays what it kept: said before it can end.
+        if let Some(Job { stage: Stage::Units(build), .. }) = self.jobs.get_mut(key_of(id))
+            && build.unit(node).is_some_and(|at| build.is_fresh(at))
+        {
+            w.plane.replays(node);
+        }
         self.started_unit(w, node);
-        let Some(Stage::Units(build)) = self.jobs.get(key_of(id)).map(|it| &it.stage) else { return };
-        let Some(unit) = build.unit(node) else { return };
+        let unit = match self.jobs.get(key_of(id)) {
+            Some(Job { stage: Stage::Units(build), .. }) => build.unit(node).ok_or_else(|| {
+                // alloc: a failure, once
+                format!("build script run node {node} is no unit of job {id}'s build, so nothing would run it")
+            }),
+            // alloc: a failure, once
+            Some(job) => Err(format!(
+                "{} never started: job {id} is past its build ({}) as the run comes to start",
+                run_named(job, node),
+                stage_name(&job.stage)
+            )),
+            // alloc: a failure, once
+            None => Err(format!("build script run node {node} never started: job {id} is gone")),
+        };
+        let unit = match unit {
+            Ok(unit) => unit,
+            Err(why) => {
+                w.plane.ended(w.now, node, Outcome::Failed { why });
+                return;
+            }
+        };
         let (run, tags) = match self.run_tags(id, Some(node)) {
             Ok(it) => it,
             Err(error) => {
@@ -2999,6 +3151,9 @@ impl<S: Steps> Jobs<S> {
         };
         let Some(Job { stage: Stage::Units(build), over, .. }) = self.jobs.get_mut(key_of(id)) else {
             self.run_over(run);
+            // alloc: a failure, once
+            let why = format!("build script run node {node} (unit {unit}) never started: job {id} left its build as the run was made");
+            w.plane.ended(w.now, node, Outcome::Failed { why });
             return;
         };
         let mut runs = match build.front.script(unit, tags) {
@@ -3693,6 +3848,29 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
+    /// What loop task `node`, running at the plane and held for nothing ([`Jobs::holding`]),
+    /// waits on as the loop sees it: what a stall names of it. Its run of user code started and
+    /// waiting on its effects, made and never started, or none open at all: a node the loop
+    /// took and let go without ending it, which nothing will ever end.
+    pub fn run_wait(&self, node: NodeId) -> String {
+        let Some(id) = self.batches.job_of(node) else {
+            return "no job's batch has it: nothing of the loop will end it".to_owned(); // alloc: a stall, once
+        };
+        let Some(job) = self.jobs.get(key_of(id)) else {
+            // alloc: a stall, once
+            return format!("its job {id} is gone: nothing of the loop will end it");
+        };
+        let run = self.runs.iter().find(|(_, it)| it.node == Some(node)).map(|(_, it)| (it.runs.is_some(), it.killed));
+        let what = match run {
+            Some((true, false)) => "its run of user code started and waits on its effects, none of which is in flight",
+            Some((true, true)) => "its run of user code was killed and waits on its effects to end, none of which is in flight",
+            Some((false, _)) => "its run of user code was made and never started",
+            None => "no run of it is open: the loop took it and let it go without ending it, so nothing will",
+        };
+        // alloc: a stall, once
+        format!("{}: {what}; job {id} is {}", run_named(job, node), stage_name(&job.stage))
+    }
+
     pub fn stalled(&mut self, w: &mut World<'_, S>, error: &ApiError) {
         let jobs = &self.jobs;
         let stalled: Vec<JobId> = self
@@ -3773,6 +3951,7 @@ impl<S: Steps> Jobs<S> {
             job.stage = Stage::Over;
         }
         refuse_held(w, &mut job.stage);
+        end_held_runs(w, job, "was cancelled");
         if let (Some(request), false) = (job.request, job.finished) {
             // Finished at the plane, its word not yet read here: nothing is left to cancel.
             if w.plane.is_open(request) {
@@ -3821,6 +4000,7 @@ impl<S: Steps> Jobs<S> {
             None => job.over = Some((ok, error)),
         }
         refuse_held(w, &mut job.stage);
+        end_held_runs(w, job, "ended");
         // A build's scripts that still run would apply their runs to a front end let go.
         let scripts = matches!(job.stage, Stage::Units(_)) && job.runs > 0;
         if !matches!(job.stage, Stage::Runs(..)) {
@@ -4139,6 +4319,67 @@ fn fail_over(over: &mut Option<(bool, Option<ApiError>)>, error: ApiError) {
             kept.get_or_insert(error);
         }
         None => *over = Some((false, Some(error))),
+    }
+}
+
+/// The build script runs a job held for their programs ([`Jobs::run_script`]) ended failed at
+/// the plane, as the job ends or is cancelled (`how`) before their programs are placed: none
+/// of them starts now, and a run node left open would keep the job's request open with
+/// nothing in flight, a stall (the 2026-11-02 self-build's). The job's own error, when it has
+/// one, is said with each.
+fn end_held_runs<S: Steps>(w: &mut World<'_, S>, job: &mut Job<S>, how: &str) {
+    if job.held.is_empty() {
+        return;
+    }
+    let held = std::mem::take(&mut job.held);
+    let because = job.over.as_ref().and_then(|(_, error)| error.as_ref()).map(|it| it.what.as_str());
+    for &node in &held {
+        // alloc: a failure, once per run held
+        let mut why = format!("{} never started: its job {how} while its program was still being placed", run_named(job, node));
+        if let Some(because) = because {
+            why.push_str(": ");
+            why.push_str(because);
+        }
+        #[cfg(test)]
+        ENDED_HELD.with_borrow_mut(|it| it.push((node, why.clone()))); // clone: a test's record
+        w.plane.ended(w.now, node, Outcome::Failed { why });
+    }
+}
+
+/// Build script run `node` of `job` as an error names it: its package and unit while the job
+/// still has its build, its node alone after.
+fn run_named<S: Steps>(job: &Job<S>, node: NodeId) -> String {
+    let Stage::Units(build) = &job.stage else {
+        return format!("build script run node {node}"); // alloc: an error, once
+    };
+    let Some(at) = build.unit(node) else {
+        return format!("build script run node {node}"); // alloc: an error, once
+    };
+    let units = &build.input.units;
+    let package = units.graph.units.get(at).and_then(|it| package_named(units, &it.pkg_id)).unwrap_or("?");
+    format!("the build script run of `{package}` (unit {at}, node {node})") // alloc: an error, once
+}
+
+/// Whether a job's work keeps going past a failure (cargo's `--keep-going`): the plane builds
+/// every unit no failure reaches, and a broken write fails only what depends on it. Without
+/// it the job fails fast.
+fn keeps_going(work: &Work) -> bool {
+    targets_of(work).and_then(|it| it.cargo.as_ref()).is_some_and(|cargo| cargo.args.iter().any(|arg| arg == "--keep-going"))
+}
+
+/// A job's stage, as a stall or an error names it.
+fn stage_name<S: Steps>(stage: &Stage<S>) -> &'static str {
+    match stage {
+        Stage::Library(_) => "reading the standard library",
+        Stage::Plan(..) => "planning",
+        Stage::Fetch(_) => "fetching",
+        Stage::Lower(..) => "lowering its units",
+        Stage::Units(_) => "building its units",
+        Stage::Answer(_) => "answering",
+        Stage::Ahead(_) => "choosing units ahead",
+        Stage::Runs(_) => "running its tests or program",
+        Stage::Snapshot { .. } => "snapshotting",
+        Stage::Over => "over",
     }
 }
 

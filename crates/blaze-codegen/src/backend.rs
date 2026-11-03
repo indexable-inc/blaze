@@ -50,6 +50,12 @@ pub struct Described<I, S> {
     pub args: ContentId,
     /// Whose code it is: the item's crate's, or for a generic, the crate that instantiates it.
     pub origin: Origin,
+    /// Whether its body is written in a workspace crate, which an edit reaches: of a member's
+    /// instances, only these are patchable in a live build ([`crate::plan::Choice::patchable`]).
+    /// A generic of another crate that a member instantiates is the member's by `origin` but
+    /// not editable: no edit changes its body (an edit of its arguments' types gives another
+    /// instance), and a caller may build it in (`#[inline(always)]`, [`Self::built_in`]).
+    pub editable: bool,
     /// `Some` when its MIR says (std's built without, `#[rustc_inherit_overflow_checks]`).
     pub overflow_checks: Option<bool>,
     pub address: Address,

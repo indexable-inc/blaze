@@ -74,8 +74,9 @@ use serde::{Deserialize, Serialize};
 /// [`Request::Hot`] and [`Response::Hot`]. 24: [`Request::Gc`] and [`Response::Collected`]. 25:
 /// [`Response::UnitBegan`] and [`Response::TestReady`], which let `blaze test` run a test
 /// executable while the rest of the build goes on. 26: [`Request::Rebuilt`] and
-/// [`Response::Rebuilt`] (`blaze why`), grouped on the daemon. 27: [`Worked::placed`].
-pub const SCHEMA: u32 = 27;
+/// [`Response::Rebuilt`] (`blaze why`), grouped on the daemon. 27: [`Worked::placed`]. 28:
+/// [`Request::Launch`] and [`Response::Launched`].
+pub const SCHEMA: u32 = 28;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -323,6 +324,11 @@ pub enum Request {
     /// (an absolute path), or with none the newest build's. Answered with
     /// [`Response::Rebuilt`] by the daemon's loop, which keeps each workspace's last reasons.
     Rebuilt { all: bool, cwd: Option<String>, item: Option<String> },
+    /// `blaze run` of a built program, before it execs it as process `pid`: what that process
+    /// needs to run on the daemon's code memory when `program` (the path the build linked it
+    /// at) is a dev executable the daemon holds (docs/v2/plan/lanes/fastcompile/inproc.md).
+    /// Answered with [`Response::Launched`] by the daemon's loop, which holds the programs.
+    Launch { program: String, pid: u32 },
 }
 
 /// [`Request::Rebuilt`]'s answer.
@@ -642,6 +648,10 @@ pub enum Response {
     TestReady(Artifact),
     /// [`Request::Rebuilt`]'s answer.
     Rebuilt(Rebuilt),
+    /// [`Request::Launch`]'s answer: `live` when the program runs on the daemon's code memory
+    /// and takes the build's edits while it runs, with the variables `env` its process is
+    /// started with; otherwise it runs its file as linked, and `env` is empty.
+    Launched { live: bool, env: Vec<(String, String)> },
 }
 
 /// What a [`Request::Doc`] documented.

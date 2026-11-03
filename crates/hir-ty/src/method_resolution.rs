@@ -988,6 +988,38 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
     })
 }
 
+/// The `#[rustc_reservation_impl]` impls of `krate`'s modules, each with its trait, in module
+/// order. The tables the solver reads ([`TraitImpls`]) leave them out (rust-lang/rust#64631),
+/// but coherence must see them: rustc refuses an impl that overlaps one (E0119), and
+/// `hir-ty-coherence`'s overlap check of a `#[blaze::sealed]` relaxed impl reads them here. Only
+/// a crate with `#![feature(rustc_attrs)]` may write one, so every other crate's is empty
+/// without a walk. Impls in bodies' blocks are not walked: a reservation keeps an impl free for
+/// the trait's crate to add later, which an impl hidden in a block can't be.
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
+pub fn reservation_impls(db: &Db, krate: Crate) -> Box<[(TraitId, ImplId)]> {
+    let features = hir_def::unstable_features::UnstableFeatures::query(db, krate);
+    if !features.is_enabled(&sym::rustc_attrs) {
+        return Box::default();
+    }
+    let _p = tracing::info_span!(target: "blaze", "reservation_impls", ?krate).entered();
+    blaze_mem::frame::current(|frame| {
+        let mut found = Vec::new_in(frame);
+        for (module, _) in crate_def_map(db, krate).modules(db) {
+            for &impl_id in module_impls(db, module).trait_impls.iter() {
+                if !AttrFlags::query(db, impl_id.into()).contains(AttrFlags::RUSTC_RESERVATION_IMPL)
+                {
+                    continue;
+                }
+                if let Some(trait_ref) = db.impl_trait(impl_id) {
+                    found.push((trait_ref.skip_binder().def_id.0, impl_id));
+                }
+            }
+        }
+        // alloc: the memo's value, once at its length.
+        found.iter().copied().collect()
+    })
+}
+
 /// For each crate `krate`'s [`loaded_crates`] depend on, which of those can name its items: a
 /// crate that is it or depends on it, directly or not. An impl names its trait and the type it
 /// is for, so only a crate that can name the crates of both holds one: the walks over the
@@ -2446,9 +2478,8 @@ impl<'db> TraitImpls<'db> {
             // Reservation impls should be ignored during trait resolution, so we never need
             // them during type analysis. See rust-lang/rust#64631 for details.
             //
-            // FIXME: Reservation impls should be considered during coherence checks. If we are
-            // (ever) to implement coherence checks, this filtering should be done by the trait
-            // solver.
+            // Coherence reads them from [`reservation_impls`] (`hir-ty-coherence`'s overlap
+            // check); E0119 for every impl, when blaze has it, reads them there too.
             if AttrFlags::query(db, impl_id.into()).contains(AttrFlags::RUSTC_RESERVATION_IMPL) {
                 continue;
             }
@@ -2524,6 +2555,16 @@ impl<'db> TraitImpls<'db> {
                 builder.push_derive(row, impl_id);
             }
         }
+    }
+
+    /// Every impl of the table, trait by trait, each trait's blanket impls first (its builtin
+    /// derives aside): every trait impl of the crate the solver sees, those in bodies' blocks
+    /// included. `hir`'s `#[blaze::sealed]` check of a crate no other check covers walks these.
+    pub fn impls(&self) -> impl Iterator<Item = ImplId> + '_ {
+        self.trait_indices().flat_map(move |(_, t)| {
+            let rows = self.rows(t).flat_map(move |r| self.impls.run(r).iter().copied());
+            self.blanket.run(t).iter().copied().chain(rows)
+        })
     }
 
     pub fn blanket_impls(&self, for_trait: TraitId) -> &[ImplId] {

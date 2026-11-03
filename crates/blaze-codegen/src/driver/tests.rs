@@ -139,6 +139,7 @@ impl Frontend for Program {
             code,
             args: ContentId::default(),
             origin: function.origin,
+            editable: matches!(function.origin, Origin::Member(_)),
             overflow_checks: None,
             address: match function.symbol {
                 Some(_) => Address::Significant,
@@ -425,6 +426,16 @@ impl Store {
     }
 }
 
+/// A policy whose code folds (#1292): wasm32's, the one target whose code is Cranelift's.
+fn folding_policy() -> Policy {
+    let mut policy = policy(OptLevel::O0, Mode::Output);
+    policy.toolchain.target = "wasm32-wasip1".to_owned();
+    policy.toolchain.arch = Arch::Wasm32;
+    policy.toolchain.stencils = None;
+    policy.fold = true;
+    policy
+}
+
 fn policy(level: OptLevel, mode: Mode) -> Policy {
     Policy {
         toolchain: Toolchain {
@@ -435,7 +446,7 @@ fn policy(level: OptLevel, mode: Mode) -> Policy {
             features: Vec::new(),
             cranelift: "0.136".to_owned(),
             llvm: Some("23.1".to_owned()),
-            stencils: None,
+            stencils: Some("ab".repeat(32)),
             frame_pointers: false,
             relocation: Relocation::Pic,
         },
@@ -522,18 +533,29 @@ fn the_front_end_hears_each_level_before_it_and_a_stop_ends_the_build() {
 
 /// Two functions defining one symbol are refused, naming the symbol and both: the linker's
 /// table of names holds one target a name, so calls by that name went to whichever was
-/// given last (two panic runtimes' `__rust_panic_cleanup`, #1611).
+/// given last (two panic runtimes' `__rust_panic_cleanup`, #1611). Every such symbol is
+/// refused in the one pass, from the walk, before anything is prepared or compiled.
 #[test]
-fn one_symbol_defined_by_two_functions_is_refused_naming_both() {
+fn symbols_defined_twice_are_refused_before_anything_compiles_naming_each() {
     let policy = policy(OptLevel::O0, Mode::Output);
     let mut program = program();
-    for id in [4, 5] {
-        program.functions.get_mut(&id).unwrap().symbol = Some("__rust_panic_cleanup".to_owned());
+    for (id, symbol) in [(4, "__rust_panic_cleanup"), (5, "__rust_panic_cleanup"), (2, "__rust_start_panic"), (3, "__rust_start_panic")] {
+        program.functions.get_mut(&id).unwrap().symbol = Some(symbol.to_owned());
     }
-    let errors = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap_err();
-    let [error] = errors.as_slice() else { panic!("one error: {errors:?}") };
-    assert!(error.what.starts_with("the symbol `__rust_panic_cleanup` is defined twice in one program, by `f"), "{error:?}");
-    assert!(error.what.contains("`f4`") && error.what.contains("`f5`"), "{error:?}");
+    let machine = Machine::default();
+    let errors = build(&program, &machine, &policy, &Memo::new(), &Store::default()).unwrap_err();
+    let mut whats: Vec<&str> = errors.iter().map(|it| it.what.as_str()).collect();
+    whats.sort_unstable();
+    assert_eq!(
+        whats,
+        [
+            "the symbol `__rust_panic_cleanup` is defined twice in one program, by `f4` and by `f5`",
+            "the symbol `__rust_start_panic` is defined twice in one program, by `f2` and by `f3`",
+        ],
+        "{errors:?}"
+    );
+    assert_eq!(machine.prepared.load(Ordering::Relaxed), 0, "refused before anything is prepared");
+    assert_eq!(machine.emitted.load(Ordering::Relaxed), 0, "refused before anything is compiled");
 }
 
 #[test]
@@ -1204,8 +1226,7 @@ fn another_summary_under_a_summarys_flight_key_fails_the_build() {
 /// (rule 18), never given the landed template.
 #[test]
 fn a_fold_candidate_prepared_as_another_shape_than_the_landed_fails_the_build() {
-    let (program, mut policy) = (program(), policy(OptLevel::O0, Mode::Output));
-    policy.fold = true;
+    let (program, policy) = (program(), folding_policy());
     let memo = Memo::new();
     build(&program, &Machine::default(), &policy, &memo, &Store::default()).unwrap();
     let salted = Machine { salt: 1, ..Machine::default() };

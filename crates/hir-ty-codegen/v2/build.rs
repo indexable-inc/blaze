@@ -1,13 +1,15 @@
 //! What a v2 unit's [`Spec`] decides of its IR, for the IR builder: v1 reads these from the
 //! crate's cfg and the process's environment, a v2 unit from its spec alone.
 //!
-//! The IR builder reads [`building`] when it starts a function (`Recorder::new`): with
-//! `Some`, the compiling crate's `-C debug-assertions` (what `ub_checks()` folds to) and panic
-//! strategy are these, the bodies it reads are those [`Build::options`] says, and the only
-//! callees it builds in are the `#[inline(always)]` ones of crates no edit reaches, which the
-//! unit's references and key name ([`super::refs::built_in`]).
-
-use std::cell::Cell;
+//! The IR builder is handed the unit's [`Build`] as an argument (`backend::built`'s `build`,
+//! `Recorder::new`'s `unit`), never through the thread: a compile waits in queries, and a fiber
+//! resumes on any thread, or interleaves with another compile on its own (rule 24). Every body
+//! it reads is the MIR query's under the options [`Build::options`] derives, which are that
+//! query's key, so a body built under one unit's settings is never served for another's (rule
+//! 18). With `Some`, the compiling crate's `-C debug-assertions` (what `ub_checks()` folds to)
+//! and panic strategy are these, and the only callees it builds in are the `#[inline(always)]`
+//! ones of crates no edit reaches, which the unit's references and key name
+//! ([`super::refs::built_in`]).
 
 use base_db::{Db, Crate};
 use blaze_codegen::{
@@ -86,27 +88,37 @@ impl Build {
         }
     }
 
-    /// What a body of `written` is optimized with in a function compiled as `compiling`, by
-    /// rustc's rules: the library's crates' MIR at level 2 and inlined, as shipped, and every
-    /// other at the unit's level, inlined where the unit inlines ([`Self::inlines`]); UB
-    /// checks as `sess.ub_checks()` of the crate whose MIR it is, which for the compiling
-    /// crate is the unit's. The code generator always gives lifetimes. Allocations move to the
+    /// What a body of `written` is optimized with, `generic` where it is an instance compiled
+    /// per instance, by rustc's rules: the library's crates' MIR at level 2 and inlined, as
+    /// shipped, and every other at the unit's level, inlined where the unit inlines
+    /// ([`Self::inlines`]). The code generator always gives lifetimes. Allocations move to the
     /// stack in every crate but the library's, whose bodies are one for every program.
+    ///
+    /// UB checks (`CheckAlignment`, `CheckNull`) are `sess.ub_checks()` of the crate whose MIR
+    /// it is, `written`: rustc runs them in that crate's `optimized_mir`, wherever the instance
+    /// is later monomorphized. A body that is not generic is compiled in its own crate's unit,
+    /// whose setting this is (as rustc's copy of it in that crate); a generic one has
+    /// `written`'s own `-C debug-assertions`, as its cfg says, whichever unit or home crate
+    /// compiles it. Never the home's (`hir_ty_mir::mir::home`), a choice of sharing that no
+    /// store key names: the key (`code`, `args`, the unit's settings) covers `written`, whether
+    /// the instance is generic and this unit's setting, so one key is one body (rule 18). What
+    /// `ub_checks()` itself is, the compiling unit's in the library's crates, is
+    /// `ub_checks_in`'s, at code generation.
     ///
     /// `hir-ty-mir`'s inliner gives a callee of another crate the options this gives it
     /// (`inline.rs` `callee_options`): the two change together. Neither moves an allocation
     /// of a body built into another to the stack: the inliner's callees have
     /// `heap_to_stack: false`, and a body this side builds into its caller is built under
     /// [`Self::built_in`].
-    pub(crate) fn options(self, db: &Db, written: Crate, compiling: Crate) -> MirOptions {
+    pub(crate) fn options(self, db: &Db, written: Crate, generic: bool) -> MirOptions {
         let lang = written.data(db).origin.is_lang();
         let level = match self.optimized || lang {
             true => MirOptLevel::Release,
             false => MirOptLevel::Debug,
         };
-        let ub_checks = match written == compiling {
-            true => self.debug_assertions && !lang,
-            false => crate::debug_assertions(db, written),
+        let ub_checks = match generic {
+            false => self.debug_assertions && !lang,
+            true => crate::debug_assertions(db, written),
         };
         let inline = lang || self.inlines;
         let heap_to_stack = self.heap_to_stack && !lang;
@@ -125,32 +137,6 @@ impl Build {
     pub(crate) fn built_in(self) -> Build {
         Build { heap_to_stack: false, ..self }
     }
-}
-
-thread_local! {
-    static BUILDING: Cell<Option<Build>> = const { Cell::new(None) };
-    static READ: Cell<bool> = const { Cell::new(false) };
-}
-
-/// The settings of the v2 unit whose IR the thread is building; `None` outside one.
-pub(crate) fn building() -> Option<Build> {
-    READ.set(true);
-    BUILDING.get()
-}
-
-/// Runs `work`, which builds one function's IR, with `build` as what [`building`] says. An
-/// IR builder that never asked would have built the function as v1 does: that is an error.
-pub(crate) fn with<T>(build: Build, work: impl FnOnce() -> T) -> Result<T, String> {
-    let held = (BUILDING.replace(Some(build)), READ.replace(false));
-    let out = crate::tier::plain(work);
-    let read = READ.replace(held.1);
-    BUILDING.set(held.0);
-    if !read {
-        return Err("the IR builder did not read the unit's settings (`v2::build::building`), \
-                    so it built the function with the crate's"
-            .to_owned()); // alloc: the error's message
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

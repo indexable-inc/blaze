@@ -263,6 +263,101 @@ pub struct Invocation {
     pub files: Vec<(String, Vec<u8>)>,
 }
 
+/// The variable `name` of a request's environment ([`Invocation::env`]).
+pub fn env_var<'e>(env: &'e [(String, String)], name: &str) -> Option<&'e str> {
+    env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_str())
+}
+
+/// The variables of a request's environment ([`Invocation::env`]) that something the daemon
+/// keeps from one request to the next read, each by name with the value it read (`None`:
+/// unset) and what read it, noted at the read ([`EnvReads::var`]). It is what the kept thing
+/// is keyed by in the environment: a request whose other variables differ (a shell's `SHLVL`,
+/// `OLDPWD` or `TERM_SESSION_ID`, systemd's `INVOCATION_ID`) reuses it, and one in which a
+/// variable it read moved does not (rule 18 both ways). Sorted by name, each once.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct EnvReads {
+    read: Vec<(String, Option<String>, &'static str)>,
+}
+
+impl EnvReads {
+    /// The variable `name` of `env`, noted read by `by` (what a person is told read it: "the
+    /// item store's mode"). A name read before with another value is an error naming it: what
+    /// is kept would be made from two values of one variable, and its key would hold one.
+    pub fn var<'e>(&mut self, env: &'e [(String, String)], name: &str, by: &'static str) -> Result<Option<&'e str>, String> {
+        let value = env_var(env, name);
+        match self.read.binary_search_by(|it| it.0.as_str().cmp(name)) {
+            Ok(at) if self.read[at].1.as_deref() == value => Ok(value),
+            Ok(at) => Err(format!(
+                // alloc: an error, once
+                "`{name}` is read by {by} with another value than {} read it with, into one kept front end: \
+                 its key holds the first read alone (rule 18)",
+                self.read[at].2
+            )),
+            Err(at) => {
+                // alloc: a variable read, a few per front end
+                self.read.insert(at, (name.to_owned(), value.map(str::to_owned), by));
+                Ok(value)
+            }
+        }
+    }
+
+    /// The first variable read (by name) whose value in `now` is not the one read: why what
+    /// read it can't serve a request with `now`. `None` whatever else of `now` differs.
+    pub fn moved(&self, now: &[(String, String)]) -> Option<EnvMoved> {
+        self.read.iter().find_map(|(name, was, by)| {
+            let value = env_var(now, name);
+            (value != was.as_deref()).then(|| EnvMoved {
+                name: name.clone(),       // clone: a reason, once per front end let go
+                by: (*by).to_owned(),     // alloc: as above
+                was: was.clone(),         // clone: as above
+                now: value.map(str::to_owned), // alloc: as above
+            })
+        })
+    }
+
+    /// Each variable read, by name, with what read it.
+    pub fn names(&self) -> impl Iterator<Item = (&str, &'static str)> {
+        self.read.iter().map(|(name, _, by)| (name.as_str(), *by))
+    }
+}
+
+/// Never the values: a variable may hold a secret.
+impl std::fmt::Debug for EnvReads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.read.iter().map(|(name, value, by)| (name, value.is_some(), by))).finish()
+    }
+}
+
+/// A variable that something kept read with one value, which a request has another of (or
+/// has unset, or sets where it was unset): the reason the kept thing does not serve it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EnvMoved {
+    pub name: String,
+    /// What read it, for a person: "`env!` in a v0.1.0 (lib)", "the item store's mode".
+    pub by: String,
+    pub was: Option<String>,
+    pub now: Option<String>,
+}
+
+impl std::fmt::Display for EnvMoved {
+    /// By name and what read it, never its values: a variable may hold a secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let how = match (&self.was, &self.now) {
+            (Some(_), Some(_)) => "has another value now",
+            (Some(_), None) => "is unset now",
+            (None, _) => "is set now, and was unset",
+        };
+        write!(f, "the variable `{}`, which {} read, {how}", self.name, self.by)
+    }
+}
+
+/// As [`Display`](std::fmt::Display): never the values.
+impl std::fmt::Debug for EnvMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EnvMoved({self})")
+    }
+}
+
 /// The build of the view, as its [`BuildConfig`] asks: the one query the daemon asks per job.
 /// `impl Query for Plan` (cargo-load, `crate::load`): key `()`, value `Cbor<Planned>`, kind
 /// [`kinds::PLAN`].
@@ -576,6 +671,34 @@ pub fn key_input<K: Serialize>(domain: &'static str, key: &K) -> ContentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env(vars: &[(&str, &str)]) -> Vec<(String, String)> {
+        vars.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect()
+    }
+
+    /// What a kept front end read of a request's environment is all it is keyed by there: a
+    /// variable nothing read moving (a shell's or systemd's per-run ones) keeps it, a variable
+    /// read with another value, unset, or set where it was unset lets it go, named and never
+    /// valued. A second read of one variable with another value is refused.
+    #[test]
+    fn env_reads_move_only_with_a_variable_read() {
+        let first = env(&[("BLAZE_ITEM_STORE", "verify"), ("SHLVL", "1"), ("SECRET", "hunter2")]);
+        let mut reads = EnvReads::default();
+        assert_eq!(reads.var(&first, "BLAZE_ITEM_STORE", "the item store's mode"), Ok(Some("verify")));
+        assert_eq!(reads.var(&first, "BLAZE_DEP_IMAGES", "the dependency images' mode"), Ok(None));
+        let unrelated = env(&[("BLAZE_ITEM_STORE", "verify"), ("SHLVL", "3"), ("INVOCATION_ID", "9f"), ("OLDPWD", "/x")]);
+        assert_eq!(reads.moved(&unrelated), None);
+        let other = env(&[("BLAZE_ITEM_STORE", "off"), ("SECRET", "hunter3")]);
+        let moved = reads.moved(&other).expect("a variable read has another value");
+        assert_eq!((moved.name.as_str(), moved.by.as_str()), ("BLAZE_ITEM_STORE", "the item store's mode"));
+        let said = format!("{moved} {moved:?} {reads:?}");
+        assert!(said.contains("has another value now") && !said.contains("verify") && !said.contains("off"), "{said}");
+        let set = env(&[("BLAZE_ITEM_STORE", "verify"), ("BLAZE_DEP_IMAGES", "check")]);
+        assert_eq!(reads.moved(&set).map(|it| it.name), Some("BLAZE_DEP_IMAGES".to_owned()), "set where it was unset");
+        assert!(reads.moved(&env(&[])).is_some_and(|it| it.to_string().contains("is unset now")));
+        let refused = reads.var(&other, "BLAZE_ITEM_STORE", "a later serve").expect_err("two values of one variable");
+        assert!(refused.contains("`BLAZE_ITEM_STORE`") && refused.contains("the item store's mode"), "{refused}");
+    }
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
     struct Words(Vec<String>);

@@ -759,7 +759,7 @@ fn annotate_source_of_ambiguity<'db>(
 }
 
 /// rustc's `tcx.crate_name`: the crate's name, else its root file's stem.
-fn crate_name(cx: &Cx<'_, '_>, krate: hir::Crate) -> String {
+pub(crate) fn crate_name(cx: &Cx<'_, '_>, krate: hir::Crate) -> String {
     match krate.display_name(cx.db) {
         Some(name) => name.crate_name().to_string(), // alloc: the error's text, for an error hir found
         None => {

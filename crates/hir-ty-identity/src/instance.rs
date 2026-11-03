@@ -60,10 +60,8 @@
 //! component, as behaviour identity does ([`crate::scc`]). Each of these reads only the
 //! instance's own key: an identity never depends on which root asked first.
 
-use std::hash::Hash as _;
-
 use base_db::Db;
-use blaze_hash::HashSet;
+use blaze_hash::{Blake3Hasher, HashSet};
 use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, closure_code, code_hash, coroutine_code, interface_hash, item_key, key};
@@ -200,42 +198,33 @@ fn allocation_value(db: &Db, allocation: &AllocationData<'_>) -> Result<ContentI
             )));
         }
         MemoryMap::Complex(map) => {
-            // The map's own `Hash` reads every field; the types of its `TypeId`s and of its
-            // function pointers and vtables are taken out first and hashed by their identity.
-            // A function pointer's or vtable's bytes are its id, `FIRST_ID` plus its type's
-            // place in the table, so the table is hashed in that order.
-            // clone: once per constant with a `TypeId` or more pieces, on the query's miss
-            let mut bare = (**map).clone();
-            let types = std::mem::take(&mut bare.type_ids);
-            let pointees = std::mem::take(&mut bare.vtable);
-            bare.hash(&mut Fed(h.update(&[2])));
-            h.update(&(types.len() as u64).to_le_bytes());
-            for ty in types {
+            // The map's content (`ComplexMemoryMap::hash_content`, which code identity's
+            // `Facts::allocation` hashes too): pieces, alignments and provenance. Then the types
+            // of its `TypeId`s and of its function pointers and vtables, by their identity. A
+            // function pointer's or vtable's bytes are its id, `FIRST_ID` plus its type's place
+            // in the table, so the table is hashed in that order, each vtable with the `dyn`
+            // type it is for, which the code generator emits it for.
+            h.update(&[2]);
+            map.hash_content(&mut Blake3Hasher(&mut h));
+            h.update(&(map.type_ids.len() as u64).to_le_bytes());
+            for ty in &map.type_ids {
                 match ty {
-                    Some(ty) => h.update(&[1]).id(&identity::ty(db, ty)?),
+                    Some(ty) => h.update(&[1]).id(&identity::ty(db, *ty)?),
                     None => h.update(&[0]),
                 };
             }
-            h.update(&(pointees.tys().len() as u64).to_le_bytes());
-            for ty in pointees.tys() {
+            let pointees = &map.vtable;
+            h.update(&(pointees.entries().len() as u64).to_le_bytes());
+            for (ty, dyn_ty) in pointees.entries() {
                 h.id(&identity::ty(db, ty)?);
+                match dyn_ty {
+                    Some(dyn_ty) => h.update(&[1]).id(&identity::ty(db, dyn_ty)?),
+                    None => h.update(&[0]),
+                };
             }
         }
     };
     Ok(h.finish())
-}
-
-/// A [`std::hash::Hasher`] into a content hash: every byte it is given is hashed.
-struct Fed<'a>(&'a mut Hasher);
-
-impl std::hash::Hasher for Fed<'_> {
-    fn finish(&self) -> u64 {
-        unreachable!("a content hash is finished by its owner")
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        self.0.update(bytes);
-    }
 }
 
 /// The compile identity of `instance` in `env`, with its body under each options of
@@ -464,11 +453,13 @@ fn unhashable_nested<'db>(
             body: name_of(db, subject),
             through: Through::Own,
         },
-        // alloc: error path
-        Some(error) => Unshared::Unhashable(format!(
-            "blaze-items: the code of {} has no hash: MIR that failed to lower ({error:?})",
-            name_of(db, subject)
-        )),
+        Some(error) => {
+            // alloc: error path
+            let mut said = format!("blaze-items: the code of {} has no hash: MIR that failed to lower (", name_of(db, subject));
+            blaze_items::lowering::write(db, &error, &mut said);
+            said.push(')');
+            Unshared::Unhashable(said)
+        }
         None => identity::unhashable(db)(it),
     }
 }

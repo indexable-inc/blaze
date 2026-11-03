@@ -18,7 +18,7 @@ struct Merging {
 fn compiled(key: InstanceKey, code: Vec<u8>, relocs: Vec<crate::Relocation>) -> Emitted {
     let function = CompiledFunction {
         key,
-        arch: Arch::X86_64,
+        arch: Arch::Wasm32,
         align: 16,
         code,
         relocs: relocs.into(),
@@ -110,8 +110,7 @@ impl Prepare for Merging {
 /// is.
 #[test]
 fn a_landed_group_holds_every_thunk_it_is_asked_for() {
-    let mut policy = policy(OptLevel::O0, Mode::Output);
-    policy.fold = true;
+    let policy = folding_policy();
     for edited in [2, 3] {
         let mut program = program();
         let (machine, memo) = (Merging::default(), Memo::new());

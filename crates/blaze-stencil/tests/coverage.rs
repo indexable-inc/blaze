@@ -326,7 +326,11 @@ fn policy() -> Result<(Policy, blaze_stencil::Target), String> {
     let mut stencils = target.stencil().ok_or_else(|| format!("{} has no stencils", target.triple()))?;
     stencils.pic = false;
     let library = blaze_stencil::library_id(&stencils).map_err(|error| error.to_string())?;
-    let mut toolchain = hir_ty_codegen::v2::toolchain(hir_ty_codegen::Target::host(), &[], Runs::Here)?;
+    // The survey's own code generator: nothing it compiles is kept past the process.
+    let code = hir_ty_codegen::v2::CodegenCode(blaze_ids::ContentId::of("blaze-stencil coverage survey code", b""));
+    let host = hir_ty_codegen::Target::host();
+    let target_data = blaze_lower::target_data(host).map_err(|it| it.to_string())?;
+    let mut toolchain = hir_ty_codegen::v2::toolchain_for(&code, host, &target_data, &[], Runs::Here)?;
     hir_ty_codegen::v2::select(&toolchain)?;
     toolchain.relocation = Relocation::Static;
     toolchain.stencils = Some(blaze_format::hex::encode(&library));

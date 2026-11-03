@@ -1,0 +1,26 @@
+[package]
+name = "blaze-codegen-code"
+description = "The content identity of blaze's code generator, worked out by the build script of the program that runs it: what stored templates are keyed by in place of the executable's bytes"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# A build-dependency of the programs (blaze-engine, blaze-wasm) and a dev-dependency of
+# hir-ty-codegen's coverage check: nothing of it is linked into blaze.
+# It reads `Cargo.lock` and the manifests itself (`toml`, `glob` for `members`): a build script
+# runs no cargo, whose `$CARGO` is blaze under blaze.
+[dependencies]
+blake3.workspace = true
+glob.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

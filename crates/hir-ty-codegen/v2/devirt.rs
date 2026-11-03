@@ -211,7 +211,7 @@ impl State {
             (program.makes, lists.0, lists.1, program.held.as_ref().map(|it| it.world().id))
         };
         let Some((kind, krate)) = makes.filter(|it| it.0 != RootKind::Library) else { return Ok(false) };
-        let made = frontend.with(|db, _| {
+        let made = frontend.with(|db| {
             let program = program_name(db, kind, krate);
             let _span = tracing::info_span!(target: "blaze", "devirt world", program = &*program).entered();
             world_of(frontend, db, (kind, program), &functions, &statics)
@@ -225,7 +225,7 @@ impl State {
                 Ok(true)
             }
             (Some(world), Some(id)) if world.id == id => Ok(false),
-            (made, Some(id)) => Err(frontend.with(|db, _| {
+            (made, Some(id)) => Err(frontend.with(|db| {
                 // alloc: the error's message
                 let found = made.map_or_else(|| "none".to_owned(), |it| format!("{:?}", it.id));
                 refused(db, krate, kind, format!(

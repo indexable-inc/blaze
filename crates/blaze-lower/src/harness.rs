@@ -42,35 +42,71 @@ impl Lowered {
     /// root again, and so may the others of that crate given with it. A crate whose root is
     /// not an alias is refused.
     ///
+    /// A refusal is the unit's alone (`wanted`'s error for it, a root another unit wants
+    /// otherwise, an alias that takes no module): every other unit's root is still made, and
+    /// the error lists each unit refused with why, in the order given.
+    ///
     /// A write, as [`Lowered::ran`] is: call it before [`Lowered::identity`] of these units.
+    /// One change: `wanted` is asked of every unit first, on the database as it stands, and
+    /// the roots are then written in one batch, so no unit's `wanted` reads what another's
+    /// write left unmaintained.
     pub fn append_roots(
         &mut self,
         units: impl IntoIterator<Item = u32>,
         mut wanted: impl FnMut(&Db, usize, Crate) -> Result<Option<Appended>, LowerError>,
-    ) -> Result<usize, LowerError> {
+    ) -> Result<usize, Vec<(usize, LowerError)>> {
         // alloc: once a call, the units given and the roots made in it
         let units: Vec<u32> = units.into_iter().collect();
-        let mut made: HashSet<base_db::FileId, Global> = HashSet::new_in(Global);
-        let mut written = 0;
+        let mut asked = Vec::with_capacity(units.len()); // alloc: as `units`
+        let mut refused = Vec::new(); // alloc: none until a unit is refused
         for &unit in &units {
             let unit = unit as usize;
             let Some(krate) = self.crates.krate(unit) else { continue };
-            let Some(appended) = wanted(&self.db, unit, krate)? else { continue };
+            match wanted(&self.db, unit, krate) {
+                Ok(Some(appended)) => asked.push((unit, krate, appended)),
+                Ok(None) => {}
+                Err(error) => refused.push((unit, error)),
+            }
+        }
+        let written = match asked.is_empty() {
+            true => 0,
+            false => {
+                let trigger = base_db::Trigger::named("crate roots appended to (test harnesses, wasm macro glue)");
+                self.batch(trigger, |this| this.write_roots(&units, asked, &mut refused))
+            }
+        };
+        match refused.is_empty() {
+            true => Ok(written),
+            false => {
+                refused.sort_by_key(|(unit, _)| units.iter().position(|it| *it as usize == *unit));
+                Err(refused)
+            }
+        }
+    }
+
+    /// [`Lowered::append_roots`]'s writes, in its batch: each root of `asked` made, `units` the
+    /// units it was given, each unit whose root can't be made added to `refused` and left.
+    fn write_roots(&mut self, units: &[u32], asked: Vec<(usize, Crate, Appended)>, refused: &mut Vec<(usize, LowerError)>) -> usize {
+        let mut made: HashSet<base_db::FileId, Global> = HashSet::new_in(Global);
+        let mut written = 0;
+        for (unit, krate, appended) in asked {
             let file = krate.data(&self.db).root_file_id;
             let asked = FileText::content_of(&appended.after, Some(appended.module));
             match self.appended.get(&file) {
                 Some(&(_, was)) if was == asked => continue,
                 Some(&(by, _)) if made.contains(&file) || !units.contains(&(by as u32)) => {
-                    return Err(self.two_roots(by, unit, file));
+                    refused.push((unit, self.two_roots(by, unit, file)));
+                    continue;
                 }
                 _ => {}
             }
             let before = self.db.file_text(file).content(&self.db);
-            self.db.set_alias_appended(file, Some((appended.module, &appended.after))).map_err(|error| {
+            if let Err(error) = self.db.set_alias_appended(file, Some((appended.module, &appended.after))) {
                 let what = &self.crates.units[unit].what;
                 // alloc: the error's message
-                LowerError::at(format!("the root of {what} can't have a module appended: {error}"), what.clone())
-            })?;
+                refused.push((unit, LowerError::at(format!("the root of {what} can't have a module appended: {error}"), what.clone())));
+                continue;
+            }
             made.insert(file);
             self.appended.insert(file, (unit, asked));
             if self.db.file_text(file).content(&self.db) != before {
@@ -80,7 +116,7 @@ impl Lowered {
         if written > 0 {
             self.identities.clear();
         }
-        Ok(written)
+        written
     }
 
     fn two_roots(&self, first: usize, second: usize, file: base_db::FileId) -> LowerError {

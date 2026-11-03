@@ -24,7 +24,8 @@ use hir_def::{DefWithBodyId, GenericDefId, Lookup, nameres::crate_def_map};
 
 use self::bodies::Plan;
 use crate::{
-    AnyDiagnostic, Crate, DefWithBody, Module, TypeOwnerId, diagnostics::DiagnosticsCollector,
+    AnyDiagnostic, Crate, DefWithBody, Module, TypeOwnerId,
+    diagnostics::{DiagnosticsCollector, ForeignTraitImpl},
 };
 
 /// The body filter of a check that asks for every body.
@@ -63,6 +64,39 @@ pub fn check_module<'db>(
     let mut acc = Vec::new();
     DiagnosticsCollector::collect(db, module.id, &mut acc, style_lints, bodies);
     acc
+}
+
+/// What [`check_sealed`] gives of a crate.
+pub struct SealedCheck<'db> {
+    /// `hir-ty-coherence`'s refusals.
+    pub diagnostics: Vec<AnyDiagnostic<'db>>,
+    /// Each impl of another crate's trait written in its source (a builtin derive's aside), its
+    /// modules' and its bodies' blocks', in the def maps' order: for rustc's orphan check
+    /// (blaze-diagnostics' `trait_impl_orphan`), whose refusals alone are errors.
+    pub foreign_impls: Vec<ForeignTraitImpl>,
+}
+
+/// blaze: the `#[blaze::sealed]` checks of `krate` alone, `hir-ty-coherence`'s, with the impls
+/// of other crates' traits that rustc's orphan check is to run on: for a crate of which nothing
+/// else is checked (a dependency of which only what the build's programs reach is,
+/// `blaze-cargo`'s `reached_only`) whose graph has a sealed trait in it
+/// ([`hir_ty::sealed_in_graph`]). Sealing is the sealing crate's opt-in, and binds every crate
+/// that can name its trait, a registry crate rustc accepted included
+/// (docs/v2/plan/lanes/frontend/sealed-orphan.md). Empty, with one flag read, for a crate with
+/// no sealed trait in its graph.
+pub fn check_sealed(db: &Db, krate: Crate) -> SealedCheck<'_> {
+    // alloc: the results; empty, so no allocation, unless the graph has a sealed trait
+    let (mut diagnostics, mut foreign_impls) = (Vec::new(), Vec::new());
+    if hir_ty::sealed_in_graph(db, krate.id) {
+        DiagnosticsCollector::collect_sealed(
+            db,
+            krate.id,
+            &mut diagnostics,
+            &mut foreign_impls,
+            &every_body,
+        );
+    }
+    SealedCheck { diagnostics, foreign_impls }
 }
 
 /// The diagnostics of body `def` alone, as a [`Plan`]'s task for it checks it: inference,

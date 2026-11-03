@@ -1,8 +1,11 @@
-//! `BLAZE_VERSION` and `BLAZE_VERSION_LINE`: which blaze this is (see [`version`]).
+//! `BLAZE_VERSION` and `BLAZE_VERSION_LINE`: which blaze this is (see [`version`]); and
+//! `BLAZE_CODEGEN_CODE`, the code identity of its code generator, which stored templates are
+//! keyed by (`blaze_codegen_code`).
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     version();
+    blaze_codegen_code::emit();
 }
 
 /// Which blaze this is, from the one place it is said: `BLAZE_RELEASE`, the tag a release is

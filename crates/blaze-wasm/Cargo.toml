@@ -42,6 +42,11 @@ proc-macro2 = "1"
 quote = "1"
 syn = "2"
 
+# `BLAZE_CODEGEN_CODE` (build.rs): the code generator's code identity, which its templates are
+# keyed by.
+[build-dependencies]
+blaze-codegen-code = { path = "../blaze-codegen-code" }
+
 [dev-dependencies]
 wasmparser = "0.263"
 

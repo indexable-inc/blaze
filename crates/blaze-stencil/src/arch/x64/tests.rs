@@ -50,6 +50,7 @@ const LINUX: Target = Target {
     tls: TlsModel::ElfGd,
     probe_stack: true,
     probe_log2: 12,
+    counts: true,
 };
 const MACOS: Target = Target { os: Os::MacOs, tls: TlsModel::MachO, ..LINUX };
 const WINDOWS: Target = Target { os: Os::Windows, pic: false, tls: TlsModel::Coff, ..LINUX };

@@ -180,9 +180,11 @@ fn memory(source: &Source<'_>, build: u64, window: Option<(i64, i64)>) -> Result
     // alloc: a query, once a report
     let sql = format!(
         "SELECT \
-         CAST((SELECT arg_max(value, t_ns) FROM counters WHERE name = 'live bytes' AND t_ns < {t0}) AS BIGINT) AS live_before, \
+         CAST((SELECT arg_max(value, t_ns) FROM counters WHERE name = 'live bytes' AND t_ns <= coalesce( \
+             (SELECT max(started_ns + dur_ns) FROM builds WHERE started_ns + dur_ns <= {t0}), {t0})) AS BIGINT) AS live_before, \
          CAST(arg_min(value, t_ns) FILTER (WHERE name = 'live bytes') AS BIGINT) AS live_first, \
          CAST(max(value) FILTER (WHERE name = 'live bytes') AS BIGINT) AS live_peak, \
+         CAST(min(value) FILTER (WHERE name = 'live bytes') AS BIGINT) AS live_least, \
          CAST(max(value) FILTER (WHERE name = 'footprint bytes') AS BIGINT) AS footprint_peak \
          FROM counters WHERE (build_id = {build} OR build_id IS NULL) AND t_ns BETWEEN {t0} AND {t1}"
     );
@@ -193,6 +195,7 @@ fn memory(source: &Source<'_>, build: u64, window: Option<(i64, i64)>) -> Result
         live_before: int(batch, T, "live_before", row)?,
         live_first: int(batch, T, "live_first", row)?,
         live_peak: int(batch, T, "live_peak", row)?,
+        live_least: int(batch, T, "live_least", row)?,
         footprint_peak: int(batch, T, "footprint_peak", row)?,
     })
 }

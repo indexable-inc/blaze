@@ -699,6 +699,8 @@ struct Begun {
     /// Its number until it joins the graph ([`UNJOINED_SLOT`]).
     unjoined: u64,
     spawner: u64,
+    /// When it was given to the pool, in ticks; 0 when not said.
+    given: u64,
 }
 
 thread_local! {
@@ -717,18 +719,32 @@ pub fn running_job() -> u64 {
     RUNNING.with(Cell::get).job
 }
 
-/// A pool job given to the pool by `spawner` begins on this thread. No row: its `started` or
-/// `ran` row says when (`since`), so a job's life costs no row more than its switches.
-pub fn job_begins(spawner: u64) {
+/// A pool job given to the pool by `spawner` at `given` (ticks, 0 for not said) begins on this
+/// thread. No row: its `started` or `ran` row says when (`since`) and how long it waited for a
+/// core (`queued`), so a job's life costs no row more than its switches.
+pub fn job_begins(spawner: u64, given: u64) {
     let unjoined = UNJOINED.fetch_add(1, Ordering::Relaxed) << 32 | UNJOINED_SLOT;
-    BEGUN.with(|it| it.set(Some(Begun { ticks: clock::ticks(), unjoined, spawner })));
+    BEGUN.with(|it| it.set(Some(Begun { ticks: clock::ticks(), unjoined, spawner, given })));
     RUNNING.with(|it| it.set(OnThread { job: unjoined, build: BUILD.with(Cell::get) }));
+}
+
+/// The bits of a switch row's word 4 above its kind, wait and event bytes, and of its word 6
+/// above its build, that hold how long a `started` or `ran` job was queued: its ticks from
+/// given to begun, plus one (0: not said), low bits in word 4.
+const QUEUED_LOW_SHIFT: u32 = 24;
+const QUEUED_LOW_BITS: u32 = 62 - QUEUED_LOW_SHIFT;
+
+/// The ticks a job begun at `begun` waited since it was given to the pool, as the row holds
+/// them ([`QUEUED_LOW_SHIFT`]): 0 when the pool did not say when.
+fn queued_word(begun: &Begun) -> u64 {
+    if begun.given == 0 { 0 } else { begun.ticks.saturating_sub(begun.given).saturating_add(1) }
 }
 
 /// Notes `switch` now, in this thread's ring: one row, the `switches` table's. Its words past
 /// the switch's own: `by` (word 5), the spawner of a `started` or `ran` job and the waker of
-/// a `ready` one; `since` (word 7), when a `started` or `ran` job began; and for `started`,
-/// in the value word, the number it had before it joined the graph.
+/// a `ready` one; `since` (word 7), when a `started` or `ran` job began; for `started`, in the
+/// value word, the number it had before it joined the graph; and for both, how long it was
+/// queued before it began, in the spare bits of words 4 and 6 ([`QUEUED_LOW_SHIFT`]).
 #[inline]
 pub fn switched(switch: Switch) {
     let running = RUNNING.with(Cell::get);
@@ -737,18 +753,18 @@ pub fn switched(switch: Switch) {
         build => build,
     };
     let (waited, mut value) = switch.waited.map_or((0, 0), |(on, value)| (on as u64, value));
-    let (mut job, mut by, mut since) = (switch.job, 0, 0);
+    let (mut job, mut by, mut since, mut queued) = (switch.job, 0, 0, 0);
     match switch.event {
         Switched::Started => {
             if let Some(begun) = BEGUN.with(Cell::take) {
-                (value, by, since) = (begun.unjoined, begun.spawner, begun.ticks);
+                (value, by, since, queued) = (begun.unjoined, begun.spawner, begun.ticks, queued_word(&begun));
             }
             RUNNING.with(|it| it.set(OnThread { job: switch.job, build }));
         }
         Switched::Ran => {
             // A job that began before the observer was installed: its life is not in the record.
             let Some(begun) = BEGUN.with(Cell::take) else { return };
-            (job, by, since) = (begun.unjoined, begun.spawner, begun.ticks);
+            (job, by, since, queued) = (begun.unjoined, begun.spawner, begun.ticks, queued_word(&begun));
             RUNNING.with(|it| it.set(OnThread::default()));
         }
         Switched::Ended => {
@@ -760,9 +776,11 @@ pub fn switched(switch: Switch) {
     }
     // The thread's running job moves above whether or not the row is kept.
     let Some(ring) = ring() else { return };
-    let what = KIND_PLOT << 62 | waited << 16 | (switch.event as u64) << 8 | SWITCH_ROW;
+    let queued_low = (queued & ((1 << QUEUED_LOW_BITS) - 1)) << QUEUED_LOW_SHIFT;
+    let what = KIND_PLOT << 62 | queued_low | waited << 16 | (switch.event as u64) << 8 | SWITCH_ROW;
     let where_ = u64::from(switch.core) << 32 | u64::from(switch.fiber);
-    ring.put([clock::ticks(), job, value, where_, what, by, u64::from(build), since]);
+    let build = (queued >> QUEUED_LOW_BITS) << 32 | u64::from(build);
+    ring.put([clock::ticks(), job, value, where_, what, by, build, since]);
 }
 
 // --- Events -------------------------------------------------------------------------------
@@ -1720,6 +1738,9 @@ pub struct SwitchRow {
     /// For `started` after a `Began`, the number the job had before it joined the graph, which
     /// what it did before then (its spans, the jobs it gave the pool) names.
     pub began_as: Option<u64>,
+    /// For `started` and `ran`, how long the job waited for a core: from its pool's submit to
+    /// `since_ns`. `None` when the pool did not say when it was given.
+    pub queued_ns: Option<i64>,
 }
 
 /// A row of the schema's `events` table: an [`evented`] `tracing` event, on the thread it
@@ -1863,6 +1884,7 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                 }
                 KIND_PLOT if row[4] & 0xff == SWITCH_ROW => {
                     let Some(event) = Switched::of(row[4] >> 8 & 0xff) else { continue };
+                    let queued = (row[4] >> QUEUED_LOW_SHIFT & ((1 << QUEUED_LOW_BITS) - 1)) | (row[6] >> 32) << QUEUED_LOW_BITS;
                     into.switches.push(SwitchRow {
                         build: row[6] as u32,
                         thread: by.tid,
@@ -1876,6 +1898,7 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         by: (row[5] != 0).then_some(row[5]),
                         since_ns: (row[7] != 0).then(|| scale.mono(row[7])),
                         began_as: (event == Switched::Started && row[2] != 0).then_some(row[2]),
+                        queued_ns: queued.checked_sub(1).map(|it| scale.ns(it) as i64),
                     });
                 }
                 KIND_PLOT if row[4] & 0xff == EVENT_ROW => into.events.push(EventRow {

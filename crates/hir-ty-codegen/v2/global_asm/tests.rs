@@ -180,6 +180,7 @@ fn assembled(triple: &str, text: &str) -> Result<Option<GlobalAsmObject>, String
 /// defines each trampoline, global and in code, with the unwind entries its `.cfi_*`s say:
 /// the symbols `blaze-graph`'s scheduler left undefined when blaze dropped them.
 #[test]
+#[cfg(feature = "llvm")]
 fn corosenseis_trampolines_assemble_to_an_object_defining_them() {
     for (triple, format, arch, prefix, unwind) in [
         ("aarch64-apple-darwin", MACH_O, AARCH64, "_", &["__compact_unwind", "__eh_frame"][..]),
@@ -217,6 +218,7 @@ fn line_of(text: &str, line: &str) -> usize {
 /// A directive the assembler does not know is an error naming the crate, the file and line
 /// of the `global_asm!`, the line of its template and the directive, never an object without it.
 #[test]
+#[cfg(feature = "llvm")]
 fn a_directive_blaze_cannot_assemble_is_an_error_naming_it() {
     for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
         let text = format!(
@@ -255,12 +257,22 @@ fn a_crate_without_global_asm_has_no_object() {
     assert_eq!(assembled("aarch64-apple-darwin", &text), Ok(None));
 }
 
-/// An assembler's error, read for the lines it names: LLVM's and a C compiler's.
+/// LLVM's assembler's error, read for the lines it names.
 #[test]
 fn an_assemblers_lines_are_read_from_its_error() {
     let llvm = "inline assembly: <inline asm>:4:1: error: unknown directive\n.foo\n^; <inline asm>:9:3: invalid operand";
     assert_eq!(diagnostics(llvm), [(4, "unknown directive"), (9, "invalid operand")]);
-    let cc = "inline assembly: clang failed: <stdin>:2:5: error: unknown directive\n    .foo\n    ^";
-    assert_eq!(diagnostics(cc), [(2, "unknown directive")]);
     assert!(diagnostics("inline assembly: nothing here assembles it").is_empty());
+}
+
+/// A blaze without LLVM assembles no `global_asm!`: it says so, naming the block, and never
+/// hands the text to the machine's C compiler (docs/v2/plan/toolchain-c.md, slice 1).
+#[test]
+#[cfg(not(feature = "llvm"))]
+fn without_llvm_a_global_asm_is_an_error_not_the_machines_compiler() {
+    let text = format!("//- /lib.rs crate:nollvm\n{BUILTINS}\nglobal_asm!(\"nop\");\n");
+    let error = assembled("x86_64-unknown-linux-gnu", &text).unwrap_err();
+    for said in ["of crate `nollvm`", "built without LLVM", "pinned LLVM", "--features llvm"] {
+        assert!(error.contains(said), "says {said:?}: {error}");
+    }
 }

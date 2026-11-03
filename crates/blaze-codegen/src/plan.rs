@@ -4,16 +4,19 @@
 //! - The profile's `opt-level`, with cargo's `[profile.<name>.package.<spec>]` overrides
 //!   (`"*"` for every package that is not a workspace member) and `build-override` for what
 //!   build scripts and proc macros run, picks the backend (docs/cargo.md, "Backends"): 0 and
-//!   1 Cranelift, 2, `s` and `z` LLVM at `-O2`, 3 LLVM at `-O3` (#635: tests are built at the
-//!   profile's level). Cranelift optimizes (`opt_level=speed`) all but a workspace member's
-//!   code, which no edit reaches and so is compiled once.
+//!   1 copy-and-patch stencils, 2, `s` and `z` LLVM at `-O2`, 3 LLVM at `-O3` (#635: tests
+//!   are built at the profile's level). Native code is never Cranelift's (AGENTS.md rule 8),
+//!   and a target with no stencil library stops at 0 and 1 with an error naming it. wasm32's
+//!   one producer is the lowering of Cranelift's IR at every level; Cranelift optimizes
+//!   (`opt_level=speed`) all but a workspace member's code there, which no edit reaches and
+//!   so is compiled once.
 //! - The standard library's own functions are compiled as rustc's shipped std is: `-O3`, no
 //!   overflow checks, no debug assertions, line tables. A generic of std is compiled as the
 //!   crate that instantiates it asks, as rustc compiles it in that crate's codegen unit.
 //! - Only a workspace member's functions are reached through slots in a build that takes
 //!   edits: nothing else is ever patched, so its callers call it directly (#1404).
-//! - Tiering (#807): a build that takes edits starts a function whose level is LLVM's at
-//!   Cranelift and puts LLVM's code in its slot once compiled. A build whose output is a file
+//! - Tiering (#807): a build that takes edits starts a function whose level is LLVM's as
+//!   stencils and puts LLVM's code in its slot once compiled. A build whose output is a file
 //!   compiles each function once, at its level: the output never depends on timing.
 //! - A tiered run ([`Mode::Tiered`]) starts each function at opt-level 0 as stencils that
 //!   count, patchable: `blaze_stencil::tier` tiers it up by its counts, not the plan.
@@ -43,11 +46,11 @@ pub enum OptLevel {
 }
 
 impl OptLevel {
-    /// The backend the level is compiled with, Cranelift at `opt_level=none`; `None` when it
-    /// asks for LLVM and blaze has none.
+    /// The backend native code at the level is compiled with: copy-and-patch stencils below
+    /// LLVM's levels; `None` when it asks for LLVM and blaze has none.
     pub fn backend(self, llvm: bool) -> Option<Backend> {
         match self {
-            OptLevel::O0 | OptLevel::O1 => Some(Backend::Cranelift { speed: false }),
+            OptLevel::O0 | OptLevel::O1 => Some(Backend::Stencil),
             OptLevel::O2 | OptLevel::S | OptLevel::Z => llvm.then_some(Backend::Llvm { opt: 2 }),
             OptLevel::O3 => llvm.then_some(Backend::Llvm { opt: 3 }),
         }
@@ -179,8 +182,7 @@ pub enum Mode {
     /// A file: an executable, a test binary, a library. Each function compiled once.
     Output,
     /// A running program that takes edits (`blaze run`, `blaze test --watch`): members'
-    /// functions are reached through slots, and what is at LLVM's level starts at
-    /// Cranelift's.
+    /// functions are reached through slots, and what is at LLVM's level starts as stencils.
     Live,
     /// A dev or test run the daemon runs in process (`blaze-inproc`, lazily through
     /// `blaze-lazy`): code at opt-level 0 starts as stencils that count, and
@@ -234,9 +236,10 @@ pub struct Choice {
 pub enum PlanError {
     /// The level asks for LLVM, and this blaze was built without it.
     NoLlvm { origin: Origin, level: OptLevel },
-    /// A tiered build's code at opt-level 0 is stencils, and the target has no stencil
-    /// library ([`Toolchain::stencils`]).
-    NoStencils { target: String },
+    /// The code is stencils (native code at opt-level 0 or 1, and the first tier of a live
+    /// build's or a tiered run's), and the target has no stencil library
+    /// ([`Toolchain::stencils`]).
+    NoStencils { origin: Origin, level: OptLevel, target: String },
 }
 
 impl std::fmt::Display for PlanError {
@@ -247,10 +250,11 @@ impl std::fmt::Display for PlanError {
                 "{origin:?} is compiled at opt-level {level:?}, which needs LLVM, and this blaze \
                  was built without it (`--features llvm`)"
             ),
-            PlanError::NoStencils { target } => write!(
+            PlanError::NoStencils { origin, level, target } => write!(
                 f,
-                "a tiered run compiles opt-level 0 code as stencils, and {target} has no stencil \
-                 library"
+                "{origin:?} is compiled at opt-level {level:?}, whose native code starts as \
+                 copy-and-patch stencils, and {target} has no stencil library: native code is \
+                 never Cranelift's (AGENTS.md rule 8)"
             ),
         }
     }
@@ -290,12 +294,9 @@ impl Policy {
 
     /// How a function whose code is `origin`'s is compiled. `overflow_checks` is the front
     /// end's when the instance says (`#[rustc_inherit_overflow_checks]` or std's MIR, built
-    /// without them), else the profile's for the origin.
-    pub fn choose(
-        &self,
-        origin: &Origin,
-        overflow_checks: Option<bool>,
-    ) -> Result<Choice, PlanError> {
+    /// without them), else the profile's for the origin. A tail call (`become`) changes
+    /// nothing here: stencils make one as LLVM does (`return_call`, `musttail`).
+    pub fn choose(&self, origin: &Origin, overflow_checks: Option<bool>) -> Result<Choice, PlanError> {
         let profile = &self.profile;
         let mut level = profile.opt_level;
         let mut checks = profile.overflow_checks;
@@ -308,20 +309,17 @@ impl Policy {
             debuginfo = layer.debuginfo.unwrap_or(debuginfo);
         }
         let llvm = self.toolchain.llvm.is_some();
-        // wasm32 has one code producer, the lowering of the IR to wasm (`hir-ty-codegen`'s
-        // `wasm::lower`, which `check_built` holds every wasm32 unit to): the level picks
-        // no other, as LLVM writes no wasm32 for blaze (its pinned build has no WebAssembly
-        // target). The level still says what the IR is optimized for.
-        let backend = match self.toolchain.arch {
-            crate::Arch::Wasm32 => Backend::Cranelift { speed: level != OptLevel::O0 },
-            _ => level.backend(llvm).ok_or(PlanError::NoLlvm { origin: *origin, level })?,
-        };
         // Only a member's code is edited, so only it is recompiled: the rest is compiled once
         // and can afford Cranelift's optimizer.
         let member = matches!(origin, Origin::Member(_));
-        let backend = match backend {
-            Backend::Cranelift { .. } => Backend::Cranelift { speed: !member },
-            other => other,
+        let native = self.toolchain.arch != crate::Arch::Wasm32;
+        // wasm32 has one code producer, the lowering of the IR to wasm (`hir-ty-codegen`'s
+        // `wasm::lower`, which `check_built` holds every wasm32 unit to): the level picks
+        // no other, as LLVM writes no wasm32 for blaze (its pinned build has no WebAssembly
+        // target). Native code is stencils or LLVM's, never Cranelift's (AGENTS.md rule 8).
+        let backend = match native {
+            false => Backend::Cranelift { speed: !member },
+            true => level.backend(llvm).ok_or(PlanError::NoLlvm { origin: *origin, level })?,
         };
         let live = self.mode == Mode::Live;
         let spec = Spec {
@@ -333,6 +331,7 @@ impl Policy {
             debug_assertions: assertions,
             panic: profile.panic,
             debuginfo,
+            // Folds are Cranelift's (#1292): wasm32's alone.
             fold: self.fold && backend.is_cranelift(),
             counted: false,
             // A member's code built into another function's would outlive a patch of it.
@@ -340,7 +339,7 @@ impl Policy {
             sanitize: self.sanitize,
             pgo: self.pgo,
             proc_macro_bridge: self.proc_macro_bridge,
-            // Only LLVM's code is read for it; the stencil and Cranelift tiers report nothing.
+            // Only LLVM's code is read for it; stencil and Cranelift code reports nothing.
             report: self.report && matches!(backend, Backend::Llvm { .. }),
             // std's bodies never move an allocation (`hir-ty-codegen`'s `Build::options`), so
             // their settings leave out a flag that is the program's: one copy of each for every
@@ -348,19 +347,19 @@ impl Policy {
             heap_to_stack: self.heap_to_stack && !matches!(origin, Origin::Std),
             // Only code of the tests' processes has the fuel runtime to call; wasm32's one
             // producer has no lowering of it.
-            fuel: self.fuel
-                && self.toolchain.arch != crate::Arch::Wasm32
-                && !self.proc_macro_bridge
-                && !matches!(origin, Origin::BuildTime(_)),
+            fuel: self.fuel && native && !self.proc_macro_bridge && !matches!(origin, Origin::BuildTime(_)),
         };
         // Build-time code runs out of the run's process, where no counter cells are: it is
         // compiled as an output's.
         let counted = self.mode == Mode::Tiered && level == OptLevel::O0 && !matches!(origin, Origin::BuildTime(_));
+        // A live build's LLVM code starts as stencils until LLVM's is in the slot.
+        let tiered = live && backend.is_release();
+        let stencils = counted || tiered || backend == Backend::Stencil;
+        if stencils && self.toolchain.stencils.is_none() {
+            // clone: an error names the target
+            return Err(PlanError::NoStencils { origin: *origin, level, target: self.toolchain.target.clone() });
+        }
         if counted {
-            if self.toolchain.stencils.is_none() {
-                // clone: an error names the target
-                return Err(PlanError::NoStencils { target: self.toolchain.target.clone() });
-            }
             // Its tier-up is `blaze_stencil::tier`'s, by its counts: never a plan's `then`.
             return Ok(Choice {
                 first: Spec { fold: false, counted: true, backend: Backend::Stencil, ..spec },
@@ -369,11 +368,10 @@ impl Policy {
             });
         }
         let patchable = live && member;
-        let tiered = live && !backend.is_cranelift();
         Ok(if tiered {
             // The first tier runs only until LLVM's code is in the slot: compiled fast.
             Choice {
-                first: Spec { fold: self.fold, ..spec.at(Backend::Cranelift { speed: false }) },
+                first: Spec { fold: false, report: false, ..spec.at(Backend::Stencil) },
                 then: Some(spec),
                 patchable,
             }
@@ -398,7 +396,7 @@ mod tests {
                 features: Vec::new(),
                 cranelift: "0.136".to_owned(),
                 llvm: Some("23.1".to_owned()),
-                stencils: None,
+                stencils: Some("ab".repeat(32)),
                 frame_pointers: true,
                 relocation: Relocation::Pic,
             },
@@ -422,32 +420,92 @@ mod tests {
         }
     }
 
+    /// The policy of a proc macro's wasm module: wasm32, whose one producer is Cranelift's IR.
+    fn wasm(level: OptLevel) -> Policy {
+        let mut policy = policy(level, Mode::Output);
+        policy.toolchain.target = "wasm32-wasip1".to_owned();
+        policy.toolchain.arch = Arch::Wasm32;
+        policy.toolchain.cpu = "generic".to_owned();
+        policy.toolchain.llvm = None;
+        policy.toolchain.stencils = None;
+        policy.proc_macro_bridge = true;
+        policy
+    }
+
     fn member() -> Origin {
         Origin::Member(Package::new("app"))
     }
 
+    fn origins() -> [Origin; 4] {
+        [
+            member(),
+            Origin::Dependency(Package::new("regex")),
+            Origin::BuildTime(Package::new("serde_derive")),
+            Origin::Std,
+        ]
+    }
+
     #[test]
-    fn dev_is_cranelift_and_only_members_are_patched() {
+    fn dev_is_stencils_and_only_members_are_patched() {
         let policy = policy(OptLevel::O0, Mode::Live);
         let own = policy.choose(&member(), None).unwrap();
-        assert_eq!(own.first.backend, Backend::Cranelift { speed: false });
+        assert_eq!(own.first.backend, Backend::Stencil);
+        assert!(!own.first.counted, "a live build's code counts nothing");
         assert!(own.patchable && own.then.is_none());
         let dependency = policy.choose(&Origin::Dependency(Package::new("regex")), None).unwrap();
         assert!(!dependency.patchable);
     }
 
+    /// AGENTS.md rule 8: native code is stencils or LLVM's at every level, origin and mode,
+    /// the first tier of a live build's included.
     #[test]
-    fn only_a_members_cranelift_code_is_unoptimized() {
-        for mode in [Mode::Output, Mode::Live] {
-            let policy = policy(OptLevel::O0, mode);
-            let speed = |origin: Origin| policy.choose(&origin, None).unwrap().first.backend;
-            assert_eq!(speed(member()), Backend::Cranelift { speed: false });
-            assert_eq!(speed(Origin::Dependency(Package::new("regex"))), Backend::Cranelift { speed: true });
-            assert_eq!(speed(Origin::BuildTime(Package::new("serde_derive"))), Backend::Cranelift { speed: true });
+    fn native_code_is_never_cranelifts() {
+        let levels = [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3, OptLevel::S, OptLevel::Z];
+        for level in levels {
+            for mode in [Mode::Output, Mode::Live, Mode::Tiered] {
+                let mut policy = policy(level, mode);
+                policy.fold = true;
+                for origin in origins() {
+                    let choice = policy.choose(&origin, None).unwrap();
+                    for spec in std::iter::once(&choice.first).chain(&choice.then) {
+                        assert!(!spec.backend.is_cranelift(), "{level:?} {mode:?} {origin:?}: {:?}", spec.backend);
+                        assert!(!spec.fold, "{level:?} {mode:?} {origin:?}: folds are Cranelift's");
+                    }
+                }
+            }
         }
-        let dependency = policy(OptLevel::O0, Mode::Output).choose(&Origin::Dependency(Package::new("regex")), None);
-        let own = policy(OptLevel::O0, Mode::Output).choose(&member(), None);
-        assert_ne!(dependency.unwrap().first.settings(), own.unwrap().first.settings());
+    }
+
+    #[test]
+    fn a_target_with_no_stencil_library_stops_below_llvms_levels() {
+        for (level, mode) in [(OptLevel::O0, Mode::Output), (OptLevel::O1, Mode::Output), (OptLevel::O3, Mode::Live)] {
+            let mut policy = policy(level, mode);
+            policy.toolchain.stencils = None;
+            let why = policy.choose(&member(), None).unwrap_err();
+            assert_eq!(
+                why,
+                PlanError::NoStencils { origin: member(), level, target: "aarch64-unknown-linux-gnu".to_owned() }
+            );
+            let message = why.to_string();
+            assert!(message.contains("Member(\"app\")") && message.contains("aarch64-unknown-linux-gnu"), "{message}");
+        }
+        let mut output = policy(OptLevel::O3, Mode::Output);
+        output.toolchain.stencils = None;
+        assert_eq!(output.choose(&member(), None).unwrap().first.backend, Backend::Llvm { opt: 3 });
+    }
+
+    #[test]
+    fn only_a_members_wasm_code_is_unoptimized() {
+        for level in [OptLevel::O0, OptLevel::O3] {
+            let policy = wasm(level);
+            let backend = |origin: Origin| policy.choose(&origin, None).unwrap().first.backend;
+            assert_eq!(backend(member()), Backend::Cranelift { speed: false });
+            assert_eq!(backend(Origin::Dependency(Package::new("regex"))), Backend::Cranelift { speed: true });
+            assert_eq!(backend(Origin::BuildTime(Package::new("serde_derive"))), Backend::Cranelift { speed: true });
+        }
+        let mut folding = wasm(OptLevel::O0);
+        folding.fold = true;
+        assert!(folding.choose(&member(), None).unwrap().first.fold);
     }
 
     #[test]
@@ -471,14 +529,14 @@ mod tests {
             Override { opt_level: Some(OptLevel::O0), ..Override::default() },
         );
         let own = policy.choose(&member(), None).unwrap();
-        assert_eq!(own.first.backend, Backend::Cranelift { speed: false });
+        assert_eq!(own.first.backend, Backend::Stencil);
         let dependency = policy.choose(&Origin::Dependency(Package::new("nalgebra")), None).unwrap();
         assert_eq!(dependency.first.backend, Backend::Llvm { opt: 3 });
         let named = policy.choose(&Origin::Dependency(Package::new("slow")), None).unwrap();
-        assert_eq!(named.first.backend, Backend::Cranelift { speed: true });
+        assert_eq!(named.first.backend, Backend::Stencil);
         // `"*"` is not for members, even one named like a dependency.
         let member_star = policy.choose(&Origin::Member(Package::new("nalgebra")), None).unwrap();
-        assert_eq!(member_star.first.backend, Backend::Cranelift { speed: false });
+        assert_eq!(member_star.first.backend, Backend::Stencil);
     }
 
     #[test]
@@ -486,19 +544,21 @@ mod tests {
         let mut policy = policy(OptLevel::O3, Mode::Output);
         policy.profile.build_override.opt_level = Some(OptLevel::O0);
         let build = policy.choose(&Origin::BuildTime(Package::new("serde_derive")), None).unwrap();
-        assert_eq!(build.first.backend, Backend::Cranelift { speed: true });
+        assert_eq!(build.first.backend, Backend::Stencil);
     }
 
     #[test]
     fn a_live_build_tiers_and_an_output_does_not() {
         let mut live = policy(OptLevel::O0, Mode::Live);
+        live.fold = true;
         live.profile.packages.insert(
             "*".to_owned(),
             Override { opt_level: Some(OptLevel::O3), ..Override::default() },
         );
         let dependency = Origin::Dependency(Package::new("memchr"));
         let tiered = live.choose(&dependency, None).unwrap();
-        assert_eq!(tiered.first.backend, Backend::Cranelift { speed: false });
+        assert_eq!(tiered.first.backend, Backend::Stencil);
+        assert!(!tiered.first.counted && !tiered.first.fold);
         assert_eq!(tiered.then.as_ref().unwrap().backend, Backend::Llvm { opt: 3 });
         assert_ne!(tiered.first.settings(), tiered.then.unwrap().settings());
         let mut output = live.clone();
@@ -547,13 +607,17 @@ mod tests {
         assert_eq!((at_three.then, at_three.patchable), (as_output.then, as_output.patchable));
         assert_eq!(tiered.choose(&Origin::Std, None).unwrap().first.backend, Backend::Llvm { opt: 3 });
         let build = tiered.choose(&Origin::BuildTime(Package::new("serde_derive")), None).unwrap();
-        assert_eq!(build.first.backend, Backend::Cranelift { speed: true });
+        assert_eq!(build.first.backend, Backend::Stencil);
         assert!(!build.first.counted);
 
         tiered.toolchain.stencils = None;
         assert_eq!(
             tiered.choose(&member(), None),
-            Err(PlanError::NoStencils { target: "aarch64-unknown-linux-gnu".to_owned() })
+            Err(PlanError::NoStencils {
+                origin: member(),
+                level: OptLevel::O0,
+                target: "aarch64-unknown-linux-gnu".to_owned()
+            })
         );
         assert!(tiered.choose(&higher, None).is_ok());
     }

@@ -432,3 +432,102 @@ pub fn cores(model: &Model, buckets: usize, out: &mut String) {
         _ = writeln!(out, "  {:>8.1} s {:>5.1} {}", s(t0 - model.bounds.start_ns), busy, "#".repeat(bar));
     }
 }
+
+/// The scheduling lines: the workers' idle time and how much of it sat beside queued work, the
+/// critical path's running time by query, and the transcript simulator's replay of the build,
+/// calibrated on the record's own workers, then with other cores and policies.
+pub fn scheduling(model: &Model, path: &Path, top: usize, out: &mut String) {
+    let idle = model.idle_with_work();
+    _ = writeln!(
+        out,
+        "workers: {}, idle {:.1}% of workers x wall ({:.1} s); idle beside a job waiting for a core {:.2}% ({:.1} s){}",
+        idle.workers,
+        100.0 * idle.share(idle.idle_ns),
+        s(idle.idle_ns),
+        100.0 * idle.share(idle.with_work_ns),
+        s(idle.with_work_ns),
+        if idle.submits_said { "" } else { ", the record saying no submit's wait (no `queued_ns`): only waits after a `ready` row or a move" }
+    );
+    let on_path = super::path::by_query(model, path);
+    let ran: i64 = on_path.iter().map(|it| it.ns).sum();
+    _ = writeln!(out, "critical path by query: {:.1} s running, its {} longest:", s(ran), top.min(on_path.len()));
+    for it in on_path.iter().take(top) {
+        let label = match (&it.name, &it.subject) {
+            // alloc: a cell
+            (Some(name), Some(of)) => format!("{name} {of}"),
+            // clone: a cell
+            (Some(name), None) => name.clone(),
+            // alloc: a cell
+            (None, _) => "inside no span".to_owned(),
+        };
+        _ = writeln!(out, "  {:>9.1} s {:>5.1}% {:>7}x  {label}", s(it.ns), pct(it.ns, ran), it.stretches);
+    }
+    let transcript = super::sim::Transcript::of(model);
+    _ = writeln!(
+        out,
+        "simulator: {} jobs ({} spawned, {} roots released at their time), {} runs costing {:.1} s, waits {} woken by a job, {} timed as recorded, {} moves",
+        transcript.jobs.len(),
+        transcript.spawned,
+        transcript.roots,
+        transcript.runs,
+        s(transcript.cost_ns),
+        transcript.woken,
+        transcript.timed,
+        transcript.moves
+    );
+    let calibration = transcript.calibrate();
+    let p = calibration.predicted;
+    _ = writeln!(
+        out,
+        "  calibrated on {} cores, {}, {:.1} us a run: wall {:.1} s (measured {:.1} s), idle {:.1}% (measured {:.1}%): {:.1} points off{}",
+        p.cores,
+        p.policy.name(),
+        calibration.overhead_ns as f64 / 1e3,
+        s(p.wall_ns),
+        s(calibration.measured_wall_ns),
+        100.0 * p.idle_share(),
+        100.0 * calibration.measured_idle,
+        calibration.error_points,
+        match (p.stuck, p.out_of_fuel) {
+            (0, false) => String::new(),
+            // alloc: a line
+            (stuck, fuel) => format!(
+                ", {stuck} jobs stuck ({} on a wait, {} never started){}",
+                p.stuck_waiting,
+                stuck - p.stuck_waiting,
+                if fuel { ", out of fuel" } else { "" }
+            ),
+        }
+    );
+    _ = writeln!(
+        out,
+        "  to the record's last run ({:.1} s; {:.1} s after it are no job's): idle {:.1}% predicted, {:.1}% measured: {:.1} points off",
+        s(calibration.measured_last_run_ns),
+        s(calibration.measured_wall_ns - calibration.measured_last_run_ns),
+        100.0 * p.idle_share(),
+        100.0 * calibration.measured_idle_to_last_run,
+        calibration.error_points_to_last_run
+    );
+    let unbounded = transcript.replay(u32::MAX, super::sim::Policy::Fifo, calibration.overhead_ns);
+    let workers = transcript.workers.max(1);
+    let t1 = transcript.cost_ns + calibration.overhead_ns * transcript.runs as i64;
+    let bound = (t1 / i64::from(workers)).max(unbounded.wall_ns);
+    _ = writeln!(
+        out,
+        "  T1 {:.1} s, T1/P {:.1} s, T_inf {:.1} s (unbounded cores, at most {} busy): wall / max(T1/P, T_inf) = {:.2}",
+        s(t1),
+        s(t1 / i64::from(workers)),
+        s(unbounded.wall_ns),
+        unbounded.peak,
+        model.bounds.wall_ns() as f64 / bound.max(1) as f64
+    );
+    for (cores, policy) in [
+        (1, super::sim::Policy::Fifo),
+        (workers.div_ceil(2), super::sim::Policy::Fifo),
+        (workers, super::sim::Policy::Lifo),
+        (workers.saturating_mul(2), super::sim::Policy::Fifo),
+    ] {
+        let it = transcript.replay(cores, policy, calibration.overhead_ns);
+        _ = writeln!(out, "  {:>4} cores, {}: wall {:.1} s, idle {:.1}%", cores, policy.name(), s(it.wall_ns), 100.0 * it.idle_share());
+    }
+}

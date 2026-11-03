@@ -109,7 +109,12 @@ enum Place {
 }
 
 /// Each branch's edges, and the orientation of its `BrIcmp`.
-pub(super) fn edges(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>) -> Result<(), Error> {
+pub(super) fn edges(
+    plan: &mut Plan<'_>,
+    func: &ir::Function,
+    target: &Target,
+    library: &Reader<'_>,
+) -> Result<(), Error> {
     plan.edges.clear();
     reset(&mut plan.edges_of, func.dfg.num_insts(), (NONE, 0));
     for block in func.layout.blocks() {
@@ -122,11 +127,11 @@ pub(super) fn edges(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'
         match data.exception_table() {
             Some(table) => {
                 let table = &func.dfg.exception_tables[table];
-                edge(plan, func, block, term, *table.normal_return(), false)?;
+                edge(plan, func, target, block, term, *table.normal_return(), false)?;
                 for item in table.items() {
                     match item {
                         ir::ExceptionTableItem::Tag(_, call) | ir::ExceptionTableItem::Default(call) => {
-                            edge(plan, func, block, term, call, true)?;
+                            edge(plan, func, target, block, term, call, true)?;
                         }
                         ir::ExceptionTableItem::Context(_) => {}
                     }
@@ -135,7 +140,7 @@ pub(super) fn edges(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'
             None => {
                 for &call in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 {
-                    edge(plan, func, block, term, call, false)?;
+                    edge(plan, func, target, block, term, call, false)?;
                 }
             }
         }
@@ -151,6 +156,7 @@ pub(super) fn edges(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'
 fn edge(
     plan: &mut Plan<'_>,
     func: &ir::Function,
+    target: &Target,
     from: ir::Block,
     term: ir::Inst,
     call: ir::BlockCall,
@@ -163,7 +169,8 @@ fn edge(
         // alloc: the error's message, once per failed compile.
         return Err(Error::at(term, format!("a branch to {block}, which is not in the layout")));
     }
-    let back = bix <= plan.bix[from.as_u32() as usize];
+    // A back edge has code of its own only where the code counts it.
+    let back = target.counts && bix <= plan.bix[from.as_u32() as usize];
     let params = func.dfg.block_params(block);
     let moves = call.args(pool).zip(params).any(|(arg, &param)| {
         let to = plan.slot[param.as_u32() as usize];

@@ -120,8 +120,11 @@ fn within_one_function_a_core(at: usize) -> usize {
     at + blaze_graph::par::threads()
 }
 
+/// A dev build prepares and compiles each function in one go, its own flight
+/// ([`crate::flight`]): a stop while preparing ends it within one function a core, and only a
+/// function prepared is compiled.
 #[test]
-fn a_stop_while_preparing_ends_a_dev_build_before_any_compile() {
+fn a_stop_while_preparing_ends_a_dev_build_within_one_function() {
     let program = wide();
     let machine = stopping(&program, Some(10), None);
     let policy = policy(OptLevel::O0, Mode::Output);
@@ -129,9 +132,11 @@ fn a_stop_while_preparing_ends_a_dev_build_before_any_compile() {
     let (prepared, _, emitted) = machine.counts();
     assert!(prepared >= 10 && prepared <= within_one_function_a_core(10), "{prepared} prepared");
     assert!((prepared as u32) < LEAVES, "the stop came before every prepare was begun");
-    assert_eq!(emitted, 0, "nothing is compiled once stopped");
+    assert!(emitted <= prepared, "{emitted} compiled of {prepared} prepared");
 }
 
+/// A stop while compiling ends a dev build within one function a core: no function is
+/// prepared or compiled past that.
 #[test]
 fn a_stop_while_compiling_ends_a_dev_build_within_one_function() {
     let program = wide();
@@ -139,8 +144,9 @@ fn a_stop_while_compiling_ends_a_dev_build_within_one_function() {
     let policy = policy(OptLevel::O0, Mode::Output);
     stopped_with(Build::new(&machine, &program, &policy, &Memo::new()).run(&[(1, member())], &Store::default()));
     let (prepared, _, emitted) = machine.counts();
-    assert_eq!(prepared as u32, LEAVES + 1, "every IR was built before the first compile");
     assert!(emitted >= 5 && emitted <= within_one_function_a_core(5), "{emitted} compiled");
+    assert!(prepared >= emitted && prepared <= within_one_function_a_core(emitted), "{prepared} prepared, {emitted} compiled");
+    assert!((prepared as u32) < LEAVES, "the stop came before every prepare was begun");
 }
 
 #[test]

@@ -213,6 +213,11 @@ pub const SWITCHES: Table = Table {
             Type::U64,
             "for started, the job's number before it joined the graph, which its spawned jobs' `by_job` and its `job` span name until then",
         ),
+        opt(
+            "queued_ns",
+            Type::I64,
+            "for started and ran, how long the job waited for a core: from its pool's submit to `since_ns`; null when the pool did not say when it was given",
+        ),
     ],
 };
 

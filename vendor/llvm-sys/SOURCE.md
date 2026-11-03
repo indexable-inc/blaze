@@ -33,8 +33,9 @@ Changes, each marked `blaze:` in build.rs:
    its blocklist (`LLVM_SYS_231_IGNORE_BLOCKLIST`, `LLVM_SYS_231_STRICT_VERSIONING`) are gone,
    with the `regex-lite` and `semver` build-dependencies; the `strict-versioning` feature is
    kept for inkwell and does nothing. `rust-version` is 1.77 for the `cargo::` directives. Every
-   LLVM consumer in blaze links through llvm-sys, so this is the one check; `pin.rs` is also the
-   `pin` test target.
+   LLVM consumer in blaze links through llvm-sys, so this is the one check; `tests/pin.rs`, the
+   `pin` test target, includes `pin.rs` with its tests, kept out of `pin.rs` so that no other
+   includer's test binary runs its `llvm-config` script beside one of its own (ETXTBSY).
 
 Why here and not in hir-ty-codegen's build.rs: rustc names a crate's native libraries right after
 that crate's rlib, and GNU ld takes from an archive only what earlier inputs asked for. Libraries

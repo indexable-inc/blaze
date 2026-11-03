@@ -1462,3 +1462,64 @@ fn a_permutation_of_the_caller_s_distinct_arguments_is_not_passed_on() {
     assert_eq!(made, 2, "`a` over 8 distinct types made {made} identities ({got:?})");
     assert!(got.is_ok(), "`a` over 8 distinct types: {got:?}");
 }
+
+/// Const eval's id of a vtable names its type and the `dyn` it is for, as rustc's
+/// `GlobalAlloc::VTable` does (rule 18): `One::V` and `Two::V` have one type and equal bytes, each
+/// the vtable of `u32` for another trait, and are two values to the code generator (one vtable's
+/// slot runs `T1::a`, the other's `T2::b`), so `v::<One>` and `v::<Two>` share no compile
+/// identity (`Again::V` is `One::V` again, and shares), and a body reading one has another code
+/// id than one reading the other.
+#[test]
+fn a_vtable_of_one_type_for_two_traits_is_two_values() {
+    let db = fixture::db(&format!(
+        "//- minicore: {MINICORE}, transmute
+{}",
+        r#"
+pub trait T1 { fn a(&self) -> u32; }
+pub trait T2 { fn b(&self) -> u32; }
+impl T1 for u32 { fn a(&self) -> u32 { 1 } }
+impl T2 for u32 { fn b(&self) -> u32 { 2 } }
+pub struct Parts(pub *const (), pub *const ());
+pub struct One;
+pub struct Two;
+pub struct Again;
+pub type OneT = One;
+pub type TwoT = Two;
+pub type AgainT = Again;
+pub trait K { const V: Parts; }
+impl K for One { const V: Parts = unsafe { core::mem::transmute::<&dyn T1, Parts>(&5u32) }; }
+impl K for Two { const V: Parts = unsafe { core::mem::transmute::<&dyn T2, Parts>(&5u32) }; }
+impl K for Again { const V: Parts = unsafe { core::mem::transmute::<&dyn T1, Parts>(&5u32) }; }
+pub fn v<T: K>() -> Parts { T::V }
+"#
+    ))
+    .into_db();
+    same(&db, "v", Ty("OneT"), Ty("AgainT"));
+    apart(&db, "v", Ty("OneT"), Ty("TwoT"));
+    // A code id names its root's arguments, so it is read off a root with none: `f` reads `P` by
+    // projection, whose value's trait is picked in `make`'s body, so `f`'s own code is one text
+    // either way (a free constant read by name would not do: its interface is its value, `dyn`
+    // types included), and only `Facts::allocation`'s hash of the vtable's `dyn` tells them
+    // apart.
+    let step = |tr: &str| {
+        let db = fixture::db(&format!(
+            "//- minicore: {MINICORE}, transmute
+             pub trait T1 {{ fn a(&self) -> u32; }}
+pub trait T2 {{ fn b(&self) -> u32; }}
+             impl T1 for u32 {{ fn a(&self) -> u32 {{ 1 }} }}
+impl T2 for u32 {{ fn b(&self) -> u32 {{ 2 }} }}
+             pub struct Parts(pub *const (), pub *const ());
+             const fn make() -> Parts {{ unsafe {{ core::mem::transmute::<&dyn {tr}, Parts>(&5u32) }} }}
+             pub trait Get {{ const P: Parts; }}
+             pub struct K;
+             impl Get for K {{ const P: Parts = make(); }}
+             pub fn f() -> Parts {{ <K as Get>::P }}
+"
+        ))
+        .into_db();
+        hir_ty::attach_db(&db, || crate::code_id(&db, &instance(&db, "f", &[]), &env(&db)))
+            .unwrap_or_else(|why| panic!("`f` reading the vtable for `{tr}` has no code id: {why}"))
+    };
+    assert_eq!(step("T1"), step("T1"), "built twice");
+    assert_ne!(step("T1"), step("T2"), "the code id names the vtable's `dyn`");
+}

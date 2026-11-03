@@ -39,7 +39,6 @@ pub mod arena;
 pub mod build;
 #[allow(unsafe_code)]
 pub mod exec;
-pub mod history;
 pub mod machine;
 #[allow(unsafe_code)]
 pub mod par;

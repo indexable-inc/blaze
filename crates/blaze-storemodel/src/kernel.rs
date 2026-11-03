@@ -168,11 +168,14 @@ pub struct KernelScenario {
     pub askers: Vec<Asker>,
 }
 
+/// The domain of each step's code identity.
+const CODE_DOMAIN: &str = "blaze storemodel code 1";
+
 /// The kernel every model uses: both steps registered.
 pub fn kernel() -> Kernel {
     let mut kernel = Kernel::new();
-    kernel.register::<Dialed>(CodeId(ContentId::of("blaze storemodel code 1", b"dialed"))).expect("one registration");
-    kernel.register::<Salted>(CodeId(ContentId::of("blaze storemodel code 1", b"salted"))).expect("one registration");
+    kernel.register::<Dialed>(CodeId(ContentId::of(CODE_DOMAIN, b"dialed"))).expect("one registration");
+    kernel.register::<Salted>(CodeId(ContentId::of(CODE_DOMAIN, b"salted"))).expect("one registration");
     kernel
 }
 

@@ -636,3 +636,38 @@ fn main() {
 "#;
     assert_reports(&ui_core("issue-38868.rs", "drop, panic", source), &[error(5, &["`Drop`"])]);
 }
+
+#[test]
+fn an_orphan_impl_for_a_box_of_a_foreign_type_with_a_local_allocator() {
+    // rustc's orphan check looks into `Box` by its first argument only
+    // (`rustc_next_trait_solver/src/coherence.rs`, `OwnedBox => args.type_at(0)`): a local
+    // allocator does not make `Box<ForeignTy, LocalAlloc>` local (E0117), a local first
+    // argument does.
+    let std_items = r#"#![feature(fundamental, lang_items)]
+pub trait Foreign {}
+pub struct ForeignTy;
+pub struct Global;
+pub mod boxed {
+    #[lang = "owned_box"]
+    #[fundamental]
+    pub struct Box<T: ?Sized, A = crate::Global>(*mut T, A);
+}
+"#;
+    let source = r#"struct LocalAlloc;
+struct Local;
+
+impl Foreign for Box<ForeignTy, LocalAlloc> {} //~ ERROR E0117
+impl Foreign for Box<Local, Global> {}
+
+fn main() {}
+"#;
+    let prelude = "pub use crate::{Foreign, ForeignTy, Global, boxed::Box};";
+    let stderr = ui_std("orphan-box-allocator.rs", "sized", std_items, prelude, source);
+    // rustc's walk refuses it (`non_local`), not only hir's stricter check (whose refusal the
+    // walk takes would say "though rustc's finds a local type").
+    assert!(!stderr.contains("though rustc's finds"), "{stderr}");
+    assert_reports(
+        &stderr,
+        &[error(4, &["E0117", "is not defined in the current crate", "impl doesn't have any local type before any uncovered type parameters"])],
+    );
+}

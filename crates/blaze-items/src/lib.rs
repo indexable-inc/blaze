@@ -46,6 +46,7 @@ pub mod goals;
 pub mod hash;
 mod index;
 pub mod key;
+pub mod lowering;
 pub mod pgo;
 pub mod table;
 #[cfg(test)]

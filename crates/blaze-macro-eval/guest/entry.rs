@@ -4,6 +4,10 @@
 // `__blaze_proc_macros` after its list of macros (`src/wasm/glue.rs`), so `super` is that
 // module. It is written for every edition a macro crate may have, and allows no lint a crate
 // may forbid (`unsafe_code`): a crate's `#![forbid]` of one would make its `allow` an error.
+// Every edition means 2015 and 2018 too, whose prelude has no `TryFrom`: a trait the 2015
+// prelude lacks is named by its path (`<usize as std::convert::TryFrom<isize>>::try_from`),
+// never called as `usize::try_from`, which resolves to nothing there (serde_derive 1.0.214,
+// seq-macro, zerocopy-derive 0.7).
 //
 // The bridge's `Buffer`, `Closure` and `BridgeConfig` are private to `proc_macro`; their
 // `#[repr(C)]` layouts are mirrored here, as blaze's server checks them against the pinned
@@ -41,7 +45,7 @@ pub mod __blaze_wasm_entry {
         let mut dir = Vec::<u8>::new();
         loop {
             let len = unsafe { current_dir(dir.as_mut_ptr(), dir.capacity()) };
-            let Ok(len) = usize::try_from(len) else { return true };
+            let Ok(len) = <usize as std::convert::TryFrom<isize>>::try_from(len) else { return true };
             if len <= dir.capacity() {
                 unsafe { dir.set_len(len) };
                 break;
@@ -65,7 +69,7 @@ pub mod __blaze_wasm_entry {
         let mut value = Vec::<u8>::new();
         loop {
             let len = unsafe { env_var(name.as_ptr(), name.len(), value.as_mut_ptr(), value.capacity()) };
-            let Ok(len) = usize::try_from(len) else { return std::ptr::null_mut() };
+            let Ok(len) = <usize as std::convert::TryFrom<isize>>::try_from(len) else { return std::ptr::null_mut() };
             if len <= value.capacity() {
                 unsafe { value.set_len(len) };
                 break;

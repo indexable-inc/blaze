@@ -43,10 +43,10 @@ strict-versioning = []
 name = "llvm_sys"
 path = "src/lib.rs"
 
-# blaze: the pin check build.rs includes, tested on its own.
+# blaze: the pin check build.rs includes, tested on its own (tests/pin.rs includes pin.rs).
 [[test]]
 name = "pin"
-path = "pin.rs"
+path = "tests/pin.rs"
 
 [dependencies.clang-sys]
 version = "1.2.2"

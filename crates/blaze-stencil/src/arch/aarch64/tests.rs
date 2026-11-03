@@ -50,6 +50,7 @@ pub(crate) const LINUX: Target = Target {
     tls: TlsModel::ElfGd,
     probe_stack: true,
     probe_log2: 12,
+    counts: true,
 };
 const MACOS: Target = Target { os: Os::MacOs, cpu: Cpu::AppleM1, tls: TlsModel::MachO, ..LINUX };
 const LINUX_STATIC: Target = Target { pic: false, ..LINUX };
@@ -161,6 +162,8 @@ struct Run<'f, 'm> {
     edges: [Label; 8],
     rows: Vec<(u32, Rule)>,
     sites: Vec<(u32, ir::Inst)>,
+    /// Where value 0's slot is: [`SLOTS`], or past what one `ldr`/`str` reaches.
+    slots: u32,
 }
 
 impl<'f, 'm> Run<'f, 'm> {
@@ -172,7 +175,7 @@ impl<'f, 'm> Run<'f, 'm> {
     ) -> Run<'f, 'm> {
         let mut buf = Buf::new_in(temp);
         let edges = std::array::from_fn(|_| buf.label());
-        Run { buf, func, target, frame, edges, rows: Vec::new(), sites: Vec::new() }
+        Run { buf, func, target, frame, edges, rows: Vec::new(), sites: Vec::new(), slots: SLOTS }
     }
 }
 
@@ -194,7 +197,7 @@ impl<'f, 'm> Ctx<'f, 'm> for Run<'f, 'm> {
     }
 
     fn loc(&self, value: ir::Value) -> Loc {
-        Loc::Slot(SLOTS + 16 * value.as_u32())
+        Loc::Slot(self.slots + 16 * value.as_u32())
     }
 
     fn returned(&self, _: ir::Inst, k: usize) -> Loc {
@@ -249,11 +252,12 @@ impl Out {
 
 fn whole(func: &ir::Function, target: &Target) -> Out {
     let frame = Aarch64::frame(func, target, AREA).unwrap_or_else(|e| panic!("{e}"));
-    on_frame(|temp| whole_on(func, target, frame, temp))
+    on_frame(|temp| whole_on(func, target, frame, temp, SLOTS))
 }
 
-fn whole_on(func: &ir::Function, target: &Target, frame: Frame, temp: &blaze_mem::Frame) -> Out {
+fn whole_on(func: &ir::Function, target: &Target, frame: Frame, temp: &blaze_mem::Frame, slots: u32) -> Out {
     let mut run = Run::new(func, target, &frame, temp);
+    run.slots = slots;
     glue::prologue(&mut run).unwrap_or_else(|e| panic!("{e}"));
     let prologue = run.buf.len();
     let mut spans = Vec::new();
@@ -777,6 +781,44 @@ fn global_values_are_cranelifts() {
     assert_eq!(span[..2], [inst::ldr_lit(inst::X16, 8), inst::b(3)]);
     let literal = ours.relocs.iter().find(|reloc| reloc.kind == Reloc::Abs8).expect("an Abs8");
     assert_eq!((literal.name, literal.addend), (Name::User { namespace: 1, index: 3 }, 16));
+}
+
+/// A value the glue has in `x16` (an address `symbol_value` or `func_addr` loads, the stack
+/// pointer, the return address), stored to a slot past what one `str` reaches, is stored as
+/// itself, its slot's offset put in `x17`. With `x16` the offset's scratch too, the slot got
+/// its own offset in place of the value: cranelift-assembler-x64's build script (`add::list`,
+/// a frame of about 160 KiB) loaded a static's address that way and crashed on Linux arm64.
+#[test]
+fn a_value_in_x16_stored_to_a_far_slot_is_the_value_not_the_slots_offset() {
+    // The crash's slot: 0x196d0 above `x20`.
+    const FAR: u32 = 0x1_96d0;
+    for target in [LINUX, MACOS, LINUX_STATIC] {
+        let conv = conv(&target);
+        let func = build(sig(conv, &[], &[I64]), |b, _| {
+            let data = symbol(b, 3, 16, false, false);
+            let address = b.ins().symbol_value(I64, data);
+            let callee = import(b, 5, sig(conv, &[], &[]), false);
+            let func = b.ins().func_addr(I64, callee);
+            let sp = b.ins().get_stack_pointer(I64);
+            let ra = b.ins().get_return_address(I64);
+            let sum = b.ins().iadd(address, func);
+            let sum = b.ins().iadd(sum, sp);
+            let sum = b.ins().iadd(sum, ra);
+            b.ins().return_(&[sum]);
+        });
+        let frame = Aarch64::frame(&func, &target, AREA).unwrap_or_else(|e| panic!("{e}"));
+        let ours = on_frame(|temp| whole_on(&func, &target, frame, temp, FAR));
+        for opcode in [ir::Opcode::SymbolValue, ir::Opcode::FuncAddr, ir::Opcode::GetStackPointer, ir::Opcode::GetReturnAddress] {
+            let span = ours.span(opcode, &func);
+            let store = span.last().copied();
+            assert_eq!(
+                store,
+                Some(inst::ldst_reg(inst::STRX, inst::X16, inst::X20, inst::X17)),
+                "{opcode} on {:?}: its result is stored from x16 with the offset in x17: {span:08x?}",
+                target.os
+            );
+        }
+    }
 }
 
 #[test]

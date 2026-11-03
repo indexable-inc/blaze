@@ -398,7 +398,11 @@ mod tests {
         let (restored, unlearned) = history(&none, config).unwrap();
         assert_eq!(restored.encode(), empty());
         assert!(matches!(unlearned, Some(Unlearned::Refused(Refused::Missing { .. }))), "{unlearned:?}");
-        let estimates = with_history(blaze_graph::history::SCHEMA, b"blzest01");
+        // The schema of the section blaze-graph wrote before blaze-history owned it.
+        let estimates = with_history(
+            blaze_format::schema("blaze plane history 1: Estimates::encode bytes, version blzest01"),
+            b"blzest01",
+        );
         let (restored, unlearned) = history(&estimates, config).unwrap();
         assert_eq!(restored.encode(), empty());
         assert!(matches!(unlearned, Some(Unlearned::Refused(Refused::Schema { .. }))), "{unlearned:?}");

@@ -1013,6 +1013,40 @@ fn a_check_links_its_build_scripts_and_checks_the_rest() {
     assert!(!super::checks_only(Goal::Build, &bin));
 }
 
+/// `blaze check` links a proc macro a crate uses as its wasm32-wasip1 module, as `blaze build`
+/// does, so the crates that use it expand its macros; only checked, its `.wasm` would be a
+/// crate record. A proc-macro crate checked for itself (a member, `Mode::Check`) is only checked.
+#[test]
+fn a_check_links_its_proc_macros_as_wasm_modules() {
+    use crate::serve::work::Goal;
+    let mut macros = target("m", "proc-macro", "/w/m/src/lib.rs");
+    macros.crate_types = vec!["proc-macro".to_owned()];
+    let mut used = unit(P, macros.clone(), Mode::Build, &[]);
+    used.macro_wasm = true;
+    let mut checked = unit(P, macros, Mode::Check, &[]);
+    checked.macro_wasm = true;
+    assert!(!super::checks_only(Goal::Check, &used));
+    assert_eq!(super::phases(Goal::Check, &used), &crate::serve::work::Phase::BUILD);
+    assert!(!super::checks_only(Goal::Build, &used));
+    assert!(super::checks_only(Goal::Check, &checked));
+}
+
+/// A proc macro's `.wasm` output that holds a library's crate record (an `ar` archive) is
+/// refused before Wasmtime parses it, the error naming the file and both kinds.
+#[test]
+fn an_archive_where_a_wasm_module_is_expected_is_refused_naming_both_kinds() {
+    let mut macros = target("m", "proc-macro", "/w/m/src/lib.rs");
+    macros.crate_types = vec!["proc-macro".to_owned()];
+    let record = compile::crate_record(&unit(P, macros, Mode::Build, &[]), None, &[]);
+    let path = "/t/wasm32-wasip1+macros/debug/build/m/0/out/m-0.wasm";
+    let error = compile::module_at(path, record).unwrap_err();
+    assert_eq!(error, compile::ModuleError::NotAModule { path: path.to_owned(), found: compile::FileKind::Archive });
+    let said = error.to_string();
+    assert!(said.contains(path) && said.contains("an `ar` archive") && said.contains("a linked wasm32-wasip1 module"), "{said}");
+    let module = b"\0asm\x01\0\0\0".to_vec();
+    assert_eq!(compile::module_at(path, module.clone()), Ok(module));
+}
+
 /// A front end held on the loop whose drop panics (a storage with a table it can't walk) lets
 /// go of nothing past the catch: dropped, its holder goes on; let go of by a refusal, the job
 /// is given the panic.
@@ -1070,6 +1104,32 @@ fn script_run(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> (blaz
 
 /// [`script_run`]'s front end, its crate resolved, and the record's base key.
 fn script_lowered(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> (blaze_lower::Lowered, blaze_cas::Key) {
+    let front = script_front(text, on_core, env);
+    (front.lowered, front.base)
+}
+
+/// [`script_lowered`]'s front end with what it was lowered from, for a later build to lower
+/// into it.
+struct ScriptFront {
+    lowered: blaze_lower::Lowered,
+    base: blaze_cas::Key,
+    units: Units,
+    config: blaze_units::query::BuildConfig,
+    tree: blaze_query::MemTree,
+    view: ContentId,
+}
+
+impl ScriptFront {
+    /// The build config of this front end's build run with the variables `env` in place of
+    /// its own.
+    fn config_with(&self, env: &[(&str, &str)]) -> blaze_units::query::BuildConfig {
+        let mut config = self.config.clone();
+        config.invocation.env = super::reads::tests::env(env);
+        config
+    }
+}
+
+fn script_front(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> ScriptFront {
     use blaze_units::{
         query::{BuildConfig, Command, Invocation, Mount, Origin},
         schema::{Strip, Stripped},
@@ -1131,7 +1191,7 @@ fn script_lowered(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> (
         unit: compile::KeyedUnit::among(script, |at| Ok(&units.graph.units[at])).unwrap(),
         plan: &units.plans[1],
         run_env: &[],
-        toolchain: ContentId::of("blaze v2 cargo test toolchain", b"one blaze"),
+        blaze: ContentId::of("blaze v2 cargo test toolchain", b"one blaze"),
         goal: compile::keyed_goal(crate::serve::work::Goal::Build, script),
         color: false,
         short: false,
@@ -1145,7 +1205,7 @@ fn script_lowered(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> (
     }
     .key(1)
     .unwrap();
-    (lowered, base)
+    ScriptFront { lowered, base, units, config, tree, view }
 }
 
 /// The key of the record of `base` that `store` has for the variables `env`, as
@@ -1214,6 +1274,521 @@ fn a_real_input_of_a_build_script_makes_its_record_miss() {
     let (alone, _) = script_run(SCRIPT, false, &run);
     assert_ne!(alone, base, "a dependency");
     assert_eq!(look(&store, alone, &run), None, "a dependency");
+}
+
+/// A kept front end is keyed by the variables of the environment its crates read, never the
+/// whole environment: a no-op build from another shell tab or systemd unit (`SHLVL`,
+/// `OLDPWD`, `TERM_SESSION_ID`, `INVOCATION_ID`, `_`), or with a variable only a build
+/// script's run reads (`CC`, which its sandbox traces into the run's own key), lowers into it,
+/// and the build reads the new values. On a VM, systemd's per-unit `INVOCATION_ID` made every
+/// no-op rebuild lower everything again: 86 s in place of about 1 s.
+#[test]
+fn a_kept_front_end_outlives_a_variable_no_crate_read() {
+    let first = [("FOO", "on"), ("SHLVL", "1"), ("OLDPWD", "/w"), ("TERM_SESSION_ID", "w0t0p0"), ("INVOCATION_ID", "5e1f")];
+    let second = [
+        ("CC", "clang"),
+        ("FOO", "on"),
+        ("INVOCATION_ID", "77aa"),
+        ("OLDPWD", "/tmp/elsewhere"),
+        ("SHLVL", "3"),
+        ("TERM_SESSION_ID", "w1t2p0"),
+        ("_", "/usr/local/bin/blaze"),
+    ];
+    let mut front = script_front(SCRIPT, true, &first);
+    let now = front.config_with(&second);
+    assert_eq!(blaze_lower::config_differs(&front.config, &now), None, "the environment is not compared whole");
+    let read = blaze_units::query::EnvReads::default();
+    assert_eq!(super::env_moved(&front.lowered, &read, &now.invocation.env), None, "no crate read what moved");
+    let krate = front.lowered.krate(1).unwrap();
+    let lower = blaze_lower::Lower { units: &front.units, config: &now, files: &front.tree, root: front.view, host_cpu: None };
+    assert_eq!(front.lowered.refresh(lower, |_| Ok(())), Ok(true));
+    let db = front.lowered.db();
+    assert_eq!(base_db::process_env_var(db, "SHLVL").as_deref(), Some("3"), "the build reads the request's values");
+    assert_eq!(super::reads::Reads::of(db, krate).unwrap(), super::reads::Reads::named(&["FOO"]));
+}
+
+/// A variable a crate's `env!` or `option_env!` read lets the kept front end go, named with
+/// the crate that read it and never valued, and so does a variable the daemon read into what
+/// it keeps with the front end (a store's mode); what read it computes again, as its record
+/// misses (`a_real_input_of_a_build_script_makes_its_record_miss`), and nothing else does.
+#[test]
+fn a_variable_a_crate_read_lets_the_kept_front_end_go_by_name() {
+    let first = [("FOO", "value-before"), ("SHLVL", "1")];
+    let front = script_front(SCRIPT, true, &first);
+    let other: &[(&str, &str)] = &[("FOO", "value-after"), ("SHLVL", "1")];
+    let unset: &[(&str, &str)] = &[("SHLVL", "1")];
+    let read = blaze_units::query::EnvReads::default();
+    for changed in [other, unset] {
+        let now = front.config_with(changed);
+        assert_eq!(blaze_lower::config_differs(&front.config, &now), None, "{changed:?}");
+        let moved = super::env_moved(&front.lowered, &read, &now.invocation.env).expect("`FOO` was read");
+        assert_eq!(moved.name, "FOO", "{changed:?}");
+        assert!(moved.by.contains("option_env!") && moved.by.contains("build-script-build"), "{}", moved.by);
+        let said = format!("{moved} {moved:?}");
+        assert!(!said.contains("value-before") && !said.contains("value-after"), "{said}");
+    }
+    let mut read = blaze_units::query::EnvReads::default();
+    let env = super::reads::tests::env(&first);
+    read.var(&env, "BLAZE_ITEM_STORE", "the item store's mode").unwrap();
+    let now = front.config_with(&[("BLAZE_ITEM_STORE", "off"), ("FOO", "value-before"), ("SHLVL", "2")]);
+    let moved = super::env_moved(&front.lowered, &read, &now.invocation.env).expect("the item store's mode moved");
+    assert_eq!((moved.name.as_str(), moved.by.as_str()), ("BLAZE_ITEM_STORE", "the item store's mode"));
+}
+
+/// Where `d`'s build script's run (unit 1) writes, as cargo names it.
+const D_OUT: &str = "/w/target/debug/build/d-0001/out";
+
+/// `d`, a registry dependency whose build script (units 0 and 1) decides by its run's cfg
+/// which of `fast` and `slow` its library (unit 2) has, lowered over files in memory.
+fn script_cfg_front() -> blaze_lower::Lowered {
+    use blaze_units::query::{BuildConfig, Command, Invocation, Mount, Origin};
+    const D: &str = "registry+https://github.com/rust-lang/crates.io-index#d@0.1.0";
+    let tree = blaze_query::MemTree::default();
+    let registry = tree.root(&[
+        ("d/Cargo.toml", b"[package]\nname = \"d\"\nbuild = \"build.rs\"\n"),
+        ("d/build.rs", b"fn main() {}\n"),
+        ("d/src/lib.rs", b"#[cfg(fast)]\npub fn fast() {}\n#[cfg(not(fast))]\npub fn slow() {}\n"),
+    ]);
+    let view = tree.root(&[]);
+    let units = Units {
+        graph: UnitGraph {
+            version: 1,
+            units: vec![
+                unit(D, target("build-script-build", "custom-build", "/r/d/build.rs"), Mode::Build, &[]),
+                unit(D, target("build-script-build", "custom-build", "/r/d/build.rs"), Mode::RunCustomBuild, &[0]),
+                unit(D, target("d", "lib", "/r/d/src/lib.rs"), Mode::Build, &[1]),
+            ],
+            roots: vec![2],
+        },
+        plans: vec![
+            plan("-0000", &[]),
+            UnitPlan { out_dir: Some(D_OUT.to_owned()), ..plan("-0001", &[]) },
+            plan("-0002", &[]),
+        ],
+        packages: vec![PackagePlan {
+            is_member: false,
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+            ..package(D, "d", "/r/d")
+        }],
+        lock: None,
+        warnings: Vec::new(),
+        target_dir: "/w/target".to_owned(),
+        build_dir: "/w/target".to_owned(),
+        finished: String::new(),
+        link_dirs: Vec::new(),
+        sandboxed_tests: false,
+    };
+    let config = BuildConfig {
+        invocation: Invocation {
+            command: Command::Build,
+            args: Vec::new(),
+            root: "/w".to_owned(),
+            cwd: "/w".to_owned(),
+            env: Vec::new(),
+            files: Vec::new(),
+        },
+        mounts: vec![
+            Mount { at: "/r".to_owned(), origin: Origin::Root(registry), under: String::new() },
+            Mount { at: "/w".to_owned(), origin: Origin::View, under: String::new() },
+        ],
+        host: HOST.to_owned(),
+        library: "/rustc/abc/library".to_owned(),
+        std: "/s/std".to_owned(),
+        builds: "/s/build".to_owned(),
+    };
+    blaze_lower::lower(blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None }).unwrap()
+}
+
+/// A package of a front lowered over files in memory ([`front_of`]): its name, whether it is at
+/// a path (checked whole) or from the registry (reached only), its `src/lib.rs`, and the units it
+/// depends on, each with the name it calls it.
+struct MemPkg<'a> {
+    name: &'a str,
+    path: bool,
+    lib: &'a str,
+    deps: &'a [(usize, &'a str)],
+}
+
+/// A front [`front_of`] lowered, with the units it lowered.
+struct MemFront {
+    lowered: blaze_lower::Lowered,
+    units: Units,
+}
+
+/// `pkgs`, one lib unit each (unit `i` is `pkgs[i]`) under `/r`, lowered over files in memory as
+/// a build lowers them; a unit no other depends on is a root. Each registry package is checked
+/// to be reached only and each path package to be checked whole, as the test means them.
+fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
+    use blaze_units::query::{BuildConfig, Command, Invocation, Mount, Origin};
+    let tree = blaze_query::MemTree::default();
+    let paths: Vec<(String, String)> =
+        pkgs.iter().map(|it| (format!("{}/Cargo.toml", it.name), format!("{}/src/lib.rs", it.name))).collect();
+    let manifests: Vec<String> = pkgs.iter().map(|it| format!("[package]\nname = \"{}\"\n", it.name)).collect();
+    let mut files: Vec<(&str, &[u8])> = Vec::new();
+    for ((pkg, (manifest_at, lib_at)), manifest) in pkgs.iter().zip(&paths).zip(&manifests) {
+        files.push((manifest_at.as_str(), manifest.as_bytes()));
+        files.push((lib_at.as_str(), pkg.lib.as_bytes()));
+    }
+    let registry = tree.root(&files);
+    let view = tree.root(&[]);
+    let id = |pkg: &MemPkg<'_>| match pkg.path {
+        true => format!("path+file:///r/{}#0.1.0", pkg.name),
+        false => format!("registry+https://github.com/rust-lang/crates.io-index#{}@0.1.0", pkg.name),
+    };
+    let units: Vec<Unit> = pkgs
+        .iter()
+        .map(|pkg| {
+            let mut u = unit(&id(pkg), target(pkg.name, "lib", &format!("/r/{}/src/lib.rs", pkg.name)), Mode::Build, &[]);
+            u.dependencies = pkg
+                .deps
+                .iter()
+                .map(|&(index, name)| UnitDep {
+                    index,
+                    extern_crate_name: name.to_owned(),
+                    public: None,
+                    noprelude: None,
+                    nounused: None,
+                    dev: false,
+                })
+                .collect();
+            u
+        })
+        .collect();
+    let roots = (0..pkgs.len()).filter(|at| !pkgs.iter().any(|it| it.deps.iter().any(|dep| dep.0 == *at))).collect();
+    let packages: Vec<PackagePlan> = pkgs
+        .iter()
+        .map(|pkg| PackagePlan {
+            is_member: false,
+            source: Some(match pkg.path {
+                true => format!("(/r/{})", pkg.name),
+                false => "(registry+https://github.com/rust-lang/crates.io-index)".to_owned(),
+            }),
+            ..package(&id(pkg), pkg.name, &format!("/r/{}", pkg.name))
+        })
+        .collect();
+    for (pkg, plan) in pkgs.iter().zip(&packages) {
+        let reached = compile::capped(false, plan.is_member, plan.source.as_deref());
+        assert_eq!(reached, !pkg.path, "{} is {}", pkg.name, if pkg.path { "checked whole" } else { "reached only" });
+    }
+    let units = Units {
+        graph: UnitGraph { version: 1, units, roots },
+        plans: (0..pkgs.len()).map(|at| plan(&format!("-{at:04}"), &[])).collect(),
+        packages,
+        lock: None,
+        warnings: Vec::new(),
+        target_dir: "/w/target".to_owned(),
+        build_dir: "/w/target".to_owned(),
+        finished: String::new(),
+        link_dirs: Vec::new(),
+        sandboxed_tests: false,
+    };
+    let config = BuildConfig {
+        invocation: Invocation {
+            command: Command::Build,
+            args: Vec::new(),
+            root: "/w".to_owned(),
+            cwd: "/w".to_owned(),
+            env: Vec::new(),
+            files: Vec::new(),
+        },
+        mounts: vec![
+            Mount { at: "/r".to_owned(), origin: Origin::Root(registry), under: String::new() },
+            Mount { at: "/w".to_owned(), origin: Origin::View, under: String::new() },
+        ],
+        host: HOST.to_owned(),
+        library: "/rustc/abc/library".to_owned(),
+        std: "/s/std".to_owned(),
+        builds: "/s/build".to_owned(),
+    };
+    let lowered =
+        blaze_lower::lower(blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None }).unwrap();
+    MemFront { lowered, units }
+}
+
+/// What a reached-only build runs of unit `unit`'s crate: whether its graph has a sealed trait,
+/// and [`compile::reached_only_diags`].
+fn sealed_diags(lowered: &blaze_lower::Lowered, unit: usize) -> (bool, Vec<blaze_diagnostics::Diag>) {
+    let db = lowered.db();
+    let krate = lowered.krate(unit).unwrap();
+    let files = blaze_diagnostics::Files::new(lowered.paths(), "/");
+    let in_graph = hir::attach_db(db, || hir_ty::sealed_in_graph(db, krate));
+    let diags = compile::reached_only_diags(db, krate, files, || Ok(blaze_diagnostics::Options::default())).unwrap();
+    (in_graph, diags)
+}
+
+/// Three registry crates: `l` (unit 0) seals `S`; `d` (unit 1), which depends on `l`,
+/// implements `S` and extends `l`'s subtrait of it, both of which rustc accepts
+/// (`#[blaze::sealed]` is inert there); `plain` (unit 2) has no sealed trait in its graph.
+fn sealed_registry_front() -> blaze_lower::Lowered {
+    front_of(&[
+        MemPkg {
+            name: "l",
+            path: false,
+            lib: "#[blaze::sealed]\npub trait S {}\npub trait LSub: S {}\npub struct A;\nimpl S for A {}\n",
+            deps: &[],
+        },
+        MemPkg {
+            name: "d",
+            path: false,
+            lib: "pub struct DT;\nimpl dep::S for DT {}\npub trait DSub: dep::LSub {}\n",
+            deps: &[(0, "dep")],
+        },
+        MemPkg { name: "plain", path: false, lib: "pub trait P {}\npub struct X;\nimpl P for X {}\n", deps: &[] },
+    ])
+    .lowered
+}
+
+/// A registry crate that implements, or extends, a trait sealed upstream fails its unit though
+/// only what programs reach of it is checked (`BLAZE_DEPS` unset): sealing is `l`'s opt-in and
+/// binds every crate that can name `S`, so the sealed checks run for every crate whose graph
+/// has a sealed trait, and each refusal names both crates, the trait and the rule. A graph with
+/// no `#[blaze::sealed]` anywhere gets no check and no diagnostic, as before.
+#[test]
+fn a_reached_only_crate_that_implements_a_trait_sealed_upstream_is_refused() {
+    let lowered = sealed_registry_front();
+    let diags = |unit: usize| sealed_diags(&lowered, unit);
+
+    let (in_graph, d) = diags(1);
+    assert!(in_graph, "`d` depends on `l`, which seals `S`");
+    let errors: Vec<&str> = d.iter().filter(|it| it.is_error()).map(|it| it.message.as_str()).collect();
+    assert!(
+        errors.iter().any(|it| it.contains("impl S for DT")
+            && it.contains("`S`")
+            && it.contains("crate `l`")
+            && it.contains("rule: sealed-impl-elsewhere")),
+        "{d:#?}"
+    );
+    assert!(
+        errors.iter().any(|it| it.contains("`DSub`") && it.contains("DSub: LSub: S") && it.contains("rule: sealed-supertrait-elsewhere")),
+        "{d:#?}"
+    );
+
+    let (in_graph, l) = diags(0);
+    assert!(in_graph, "`l` seals `S` itself");
+    assert!(!l.iter().any(|it| it.is_error()), "`l`'s own impl of `S` is allowed: {l:#?}");
+
+    let (in_graph, plain) = diags(2);
+    assert!(!in_graph, "no crate of `plain`'s graph seals a trait");
+    assert!(plain.is_empty(), "{plain:#?}");
+}
+
+/// `up`'s source: a foreign trait with an associated type, a generic one, and a two-argument
+/// `#[fundamental]` type, whose every argument rustc's orphan walk looks into.
+const ORPHAN_UP: &str = "#![feature(fundamental)]\npub trait Conv { type Out; }\npub trait Gen<X> {}\n\
+     #[fundamental]\npub struct Pair<X, Y>(pub X, pub Y);\n";
+
+/// `l`'s source, sealing `S` (with `sealed`) and relaxing the orphan rule for `up::Conv` on it.
+fn orphan_l(sealed: bool) -> String {
+    let attr = if sealed { "#[blaze::sealed]\n" } else { "" };
+    format!("{attr}pub trait S {{}}\npub struct A;\nimpl S for A {{}}\nimpl<T: S> up::Conv for T {{ type Out = u64; }}\n")
+}
+
+/// R3-C1's graph: `up` (unit 0, registry) has `Conv`; `l` (unit 1, a path package, so checked
+/// whole, and not here: with no `core` its `T` has no `Sized` bound to show) seals `S` when
+/// `sealed` and relaxes the orphan rule for `Conv` on it; `d` (unit 2,
+/// registry, reached only) implements `Conv` for `l::A`, which rustc refuses (E0117); `ok`
+/// (unit 3, registry, reached only) writes only impls of `up`'s traits that rustc's orphan rule
+/// allows, one of which (`Conv for Pair<l::A, OkLocal>`) hir's stricter walk would refuse.
+fn orphan_front(sealed: bool) -> MemFront {
+    let l = orphan_l(sealed);
+    front_of(&[
+        MemPkg { name: "up", path: false, lib: ORPHAN_UP, deps: &[] },
+        MemPkg { name: "l", path: true, lib: &l, deps: &[(0, "up")] },
+        MemPkg {
+            name: "d",
+            path: false,
+            lib: "impl up::Conv for l::A { type Out = &'static str; }\n",
+            deps: &[(0, "up"), (1, "l")],
+        },
+        MemPkg {
+            name: "ok",
+            path: false,
+            lib: "pub struct OkLocal;\npub struct Wrap<X>(pub X);\n\
+                  impl up::Conv for OkLocal { type Out = u8; }\n\
+                  impl up::Conv for &'static OkLocal { type Out = u16; }\n\
+                  impl up::Gen<OkLocal> for l::A {}\n\
+                  impl<X> up::Gen<X> for Wrap<X> {}\n\
+                  impl up::Conv for up::Pair<l::A, OkLocal> { type Out = u32; }\n",
+            deps: &[(0, "up"), (1, "l")],
+        },
+    ])
+}
+
+/// A reached-only registry crate in a sealed graph gets rustc's orphan check on every impl of a
+/// foreign trait, not only on impls with sealed bounds (R3-C1): the knowability rule and the
+/// expansion argument assume every crate that can name `l::S` obeys it, and rustc never checked
+/// `d` against a blaze-only `l`. Without the check, `<l::A as up::Conv>::Out` is `u64` in `l` and
+/// `&'static str` in `d`: a transmute across the crate boundary. The refusal is rustc's E0117 and
+/// names the impl, the trait with its crate, the rule and the crate that seals.
+#[test]
+fn a_reached_only_orphan_impl_in_a_sealed_graph_is_refused() {
+    let front = orphan_front(true);
+    let (in_graph, d) = sealed_diags(&front.lowered, 2);
+    assert!(in_graph, "`d` depends on `l`, which seals `S`");
+    let errors: Vec<&blaze_diagnostics::Diag> = d.iter().filter(|it| it.is_error()).collect();
+    assert!(
+        errors.iter().any(|it| it.code.as_ref().and_then(|it| it.error()) == Some("E0117")
+            && it.message.contains("`impl ")
+            && it.message.contains("Conv for ")
+            && it.message.contains("A`")
+            && it.message.contains("of crate `up`")
+            && it.message.contains("rule: orphan")
+            && it.message.contains("crate `l` seals a trait")),
+        "{d:#?}"
+    );
+}
+
+/// The other side of R3-C1: a registry crate rustc accepts stays accepted in a sealed graph.
+/// Every impl of `ok` is of a foreign trait and allowed by rustc's orphan rule, including
+/// `Conv for Pair<l::A, OkLocal>`, which only a walk into every argument of a fundamental type
+/// (rustc's) allows; the check is rustc's walker, never hir's stricter `check_orphan_rules`.
+#[test]
+fn a_reached_only_crate_rustc_accepts_stays_accepted_in_a_sealed_graph() {
+    let front = orphan_front(true);
+    let (in_graph, ok) = sealed_diags(&front.lowered, 3);
+    assert!(in_graph, "`ok` depends on `l`, which seals `S`");
+    assert!(!ok.iter().any(|it| it.is_error()), "{ok:#?}");
+}
+
+/// A registry crate that seals keeps its relaxed impl in its own sealed graph: `l`, reached only,
+/// writes `impl<T: S> up::Conv for T` with `S` sealed and closed, and the orphan check of every
+/// foreign impl ([`a_reached_only_orphan_impl_in_a_sealed_graph_is_refused`]) takes `T` for a
+/// local type (`hir_ty::sealed_local_bound`), so no E0210. With no `core` here `T` has no `Sized`
+/// bound to show, so only the orphan error is looked for.
+#[test]
+fn a_reached_only_crate_that_seals_keeps_its_relaxed_impl_in_its_sealed_graph() {
+    let l = orphan_l(true);
+    let front = front_of(&[
+        MemPkg { name: "up", path: false, lib: ORPHAN_UP, deps: &[] },
+        MemPkg { name: "l", path: false, lib: &l, deps: &[(0, "up")] },
+    ]);
+    let (in_graph, l) = sealed_diags(&front.lowered, 1);
+    assert!(in_graph, "`l` seals `S` itself");
+    assert!(!l.iter().any(|it| matches!(it.code.as_ref().and_then(|it| it.error()), Some("E0210" | "E0117"))), "{l:#?}");
+}
+
+/// Rule 18 for the sealed checks of a reached-only crate: when `l` gains `#[blaze::sealed]`,
+/// `d`'s record key moves, so a record of `d` built while its graph had no sealed trait (no check
+/// of its own, so no refusal) is never served for the sealed graph, and `d` is checked again and
+/// refused. The key moves through the unit's identity, which hashes each dependency's identity
+/// and so `l`'s source; `up`, which depends on nothing that changed, keeps its key.
+#[test]
+fn a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it_again() {
+    let key = |front: &mut MemFront, unit: usize| {
+        let identity = front.lowered.identity(unit).unwrap();
+        let u = &front.units.graph.units[unit];
+        compile::RecordInputs {
+            identity,
+            unit: compile::KeyedUnit::among(u, |at| Ok(&front.units.graph.units[at])).unwrap(),
+            plan: &front.units.plans[unit],
+            run_env: &[],
+            blaze: ContentId::of("blaze v2 cargo test toolchain", b"one blaze"),
+            goal: compile::keyed_goal(crate::serve::work::Goal::Build, u),
+            color: false,
+            short: false,
+            verified: false,
+            reached: true,
+            pgo: None,
+            lint_profile: None,
+            layout: None,
+            width: None,
+            refused: None,
+        }
+        .key(unit)
+        .unwrap()
+    };
+    let mut open = orphan_front(false);
+    let mut sealed = orphan_front(true);
+
+    let (in_graph, before) = sealed_diags(&open.lowered, 2);
+    assert!(!in_graph, "no crate of `d`'s graph seals a trait yet");
+    assert!(before.is_empty(), "a reached-only crate with no sealed graph runs no check: {before:#?}");
+    let (in_graph, after) = sealed_diags(&sealed.lowered, 2);
+    assert!(in_graph, "`l` seals `S` now");
+    assert!(after.iter().any(|it| it.is_error() && it.code.as_ref().and_then(|it| it.error()) == Some("E0117")), "{after:#?}");
+
+    assert_ne!(key(&mut open, 2), key(&mut sealed, 2), "`d`'s record key moves when `l` gains `#[blaze::sealed]`");
+    assert_eq!(key(&mut open, 0), key(&mut sealed, 0), "`up` depends on nothing that changed");
+}
+
+/// `d`'s build script's run, giving the cfgs `cfgs`.
+fn d_ran(cfgs: &[&str]) -> blaze_lower::Ran {
+    blaze_lower::Ran { cfgs: strings(cfgs), env: Vec::new(), out_dir: D_OUT.to_owned(), files: Vec::new() }
+}
+
+/// The value items of `krate`'s root, by name, sorted: what its dependents resolve in it.
+fn root_values(lowered: &blaze_lower::Lowered, krate: base_db::Crate) -> Vec<String> {
+    let db = lowered.db();
+    let def_map = hir_def::nameres::crate_def_map(db, krate);
+    let mut names: Vec<String> =
+        def_map.module(db, def_map.crate_root(db)).scope(db).values().map(|(name, _)| name.as_str().to_owned()).collect();
+    names.sort();
+    names
+}
+
+/// A dependency read from its image whose build script's output moves while its front end is
+/// kept (a variable only the script reads, such as `CC`, changed: the front end is kept, the
+/// script runs again and gives another cfg) is served again under its new key, so it resolves
+/// with the cfg its run gives now, never as its image of the old cfg has it (rule 18). Without
+/// the serve after the run is applied, what a kept job did before, the old cfg's def map is
+/// what every dependent resolves against. The new cfg's image is then written, and a run giving
+/// either cfg again finds its image.
+#[test]
+fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
+    let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
+    let mut store = super::deps::tests::opened(&mut sim);
+    // A reader sees what is put after it is made.
+    let reader = store.reader();
+    let macros = super::deps::tests::no_macros();
+    let build = ContentId::of("blaze v2 cargo test build", b"a served dependency's script moves");
+    let mode = hir_def::deps::Mode::Serve;
+    let mut keep = |lowered: &blaze_lower::Lowered, session: &mut super::deps::Session, served: hir_def::deps::Served| {
+        let kept = super::deps::Kept { served, mode };
+        let (puts, _) = super::deps::store(lowered, Some(kept), session, &[], "/w").unwrap();
+        for it in puts {
+            store.put(it.put.key, it.put.kind, it.put.bytes).unwrap();
+        }
+    };
+
+    // One daemon resolves `d` as its script's first run leaves it, and images it.
+    let mut first = script_cfg_front();
+    first.ran(1, &d_ran(&[])).unwrap();
+    let d = first.krate(2).unwrap();
+    let mut session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
+    let served = super::deps::images(&mut first, &[d], build, &mut session, mode).unwrap().expect("`d` is keyed");
+    assert_eq!(served.hits, Vec::new(), "a cold store");
+    assert_eq!(root_values(&first, d), ["slow"]);
+    keep(&first, &mut session, served);
+    drop((session, first));
+
+    // The next reads `d` from that image.
+    let mut kept = script_cfg_front();
+    kept.ran(1, &d_ran(&[])).unwrap();
+    let d = kept.krate(2).unwrap();
+    let mut session = super::deps::session(&kept, &reader, &macros, &[]).unwrap();
+    let served = super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().expect("`d` is keyed");
+    assert_eq!(served.hits, [d], "`d` is read from its image");
+    assert_eq!(root_values(&kept, d), ["slow"]);
+    assert!(super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().is_none(), "no key moved");
+
+    // Its front end is kept for a build whose `CC` moved: the script's run gives `fast` now.
+    kept.ran(1, &d_ran(&["fast"])).unwrap();
+    let fast = cfg::CfgAtom::Flag(intern::Symbol::intern("fast"));
+    assert!(d.cfg_options(kept.db()).check_atom(&fast), "the run's cfg is applied to `d`");
+    assert_eq!(root_values(&kept, d), ["slow"], "unserved, `d` resolves as its image of the old cfg has it");
+    let served = super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().expect("`d`'s key moved");
+    assert_eq!(served.hits, Vec::new(), "no image of `d` with `fast`");
+    assert!(hir_def::deps::image_of(kept.db(), d).is_none(), "`d` lost the image of the old cfg");
+    assert_eq!(root_values(&kept, d), ["fast"], "`d` resolves with the cfg its run gives now");
+    keep(&kept, &mut session, served);
+
+    // Either cfg again finds its own image.
+    for (cfgs, values) in [(&[][..], ["slow"]), (&["fast"][..], ["fast"])] {
+        kept.ran(1, &d_ran(cfgs)).unwrap();
+        let served = super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().expect("`d`'s key moved");
+        assert_eq!(served.hits, [d], "{cfgs:?}");
+        assert_eq!(root_values(&kept, d), values, "{cfgs:?}");
+    }
 }
 
 /// A proc macro can read a file outside the source tree (a schema or a `.proto` beside the

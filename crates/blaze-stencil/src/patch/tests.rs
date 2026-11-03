@@ -283,6 +283,7 @@ const TARGET: Target = Target {
     tls: TlsModel::ElfGd,
     probe_stack: true,
     probe_log2: 12,
+    counts: true,
 };
 
 /// One stencil of the code, with each hole's value (a place for the PC-relative ones).

@@ -86,10 +86,16 @@ thread_local! {
     static GAVE_WAYS: Cell<u64> = const { Cell::new(0) };
 }
 
-/// How many waits on this thread have given way ([`Cancelled`] for a cycle): a loop tells an
-/// item that unwound because it gave way, which it may run again where the cycle is its own,
-/// from one that failed.
-pub(crate) fn gave_way() -> u64 {
+/// How many waits of the job running here have given way ([`Cancelled`] for a cycle): a loop
+/// tells an item that unwound because it gave way, which it may run again where the cycle is
+/// its own, from one that failed, by this count before and after the item. A task that drops
+/// what it holds as it unwinds compares it the same way, to tell whether the loop will run it
+/// again ([`crate::par`]). The count moves with its job when the job switches threads.
+///
+/// Not inlined: the thread-local's address is looked up anew at each call, never kept across
+/// a wait that may resume the job on another thread (rule 24).
+#[inline(never)]
+pub fn gave_way() -> u64 {
     GAVE_WAYS.with(Cell::get)
 }
 
@@ -103,7 +109,13 @@ pub(crate) fn put_gave_ways(taken: usize) {
     GAVE_WAYS.with(|it| it.set(taken as u64));
 }
 
-fn give_way() -> Cancelled {
+/// Counts a give-way of this task and says it: what a wait outside these flights calls when it
+/// would close a cycle, so a loop ([`crate::par`]) runs its item again as for a flight's own
+/// give-way. A write-once slot given back for its filler's rerun is one: its reader waits for the
+/// rerun, which the loop's owner makes once the loop, this reader in it, is done (or which
+/// another task of the loop makes sooner, claiming the slot anew).
+#[inline(never)]
+pub fn give_way() -> Cancelled {
     GAVE_WAYS.with(|it| it.set(it.get() + 1));
     Cancelled
 }
@@ -208,22 +220,31 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
     /// Holds the run of `key` for this task until the [`Held`] ends, as though a closure of
     /// [`Flights::run_if_idle`] ran all that while: for a run that is a stretch between two
     /// calls (claimed, then let go of) rather than one call. Whoever asks for `key` meanwhile
-    /// waits, holding no thread. `None` when another task runs `key` now.
-    pub fn hold(&self, key: Key) -> Option<Held<'_, V>> {
+    /// waits, holding no thread.
+    ///
+    /// # Errors
+    ///
+    /// [`NotHeld`]: another task runs `key` now, or this task does already.
+    pub fn hold(&self, key: Key) -> Result<Held<'_, V>, NotHeld> {
         self.hold_named(key, |it| it.push_str(&hex(&key)))
     }
 
     /// [`Flights::hold`], the hold a span `hold` (see [`WaitSpans::held`]) naming what is held
     /// by what `named` writes and this task as its holder, so a convoy of waits behind it shows
     /// who holds them up and for how long.
-    pub fn hold_named(&self, key: Key, mut named: impl FnMut(&mut String)) -> Option<Held<'_, V>> {
+    ///
+    /// # Errors
+    ///
+    /// As [`Flights::hold`]: a second hold by the task that holds `key` is [`NotHeld::ByThisTask`]
+    /// for the caller to name what it held twice, never a panic or a wait on itself.
+    pub fn hold_named(&self, key: Key, mut named: impl FnMut(&mut String)) -> Result<Held<'_, V>, NotHeld> {
         let me = task(sched::job_here());
         let claim = match self.runs.claim_if_idle(key, me, sched::innermost_scope()) {
             Idle::Claimed(claim) => claim,
-            Idle::Busy => return None,
-            Idle::Itself => panic!("key {} is held by the task that holds it already", hex(&key)),
+            Idle::Busy => return Err(NotHeld::Busy),
+            Idle::Itself => return Err(NotHeld::ByThisTask),
         };
-        Some(Held { run: Ending { runs: &self.runs, claim, ended: false }, _span: Waiting::holding(&mut named, me) })
+        Ok(Held { run: Ending { runs: &self.runs, claim, ended: false }, _span: Waiting::holding(&mut named, me) })
     }
 
     /// How many keys are running now.
@@ -297,6 +318,16 @@ impl<V: Clone + Send + Sync + 'static> Drop for Ending<'_, V> {
             self.end(None);
         }
     }
+}
+
+/// Why [`Flights::hold`] holds nothing; the key is the caller's to name, which it knows by what
+/// it holds (rule 16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotHeld {
+    /// Another task runs the key now.
+    Busy,
+    /// This task runs or holds the key already: a second hold would wait on itself.
+    ByThisTask,
 }
 
 /// A run [`Flights::hold`] holds: its waiters get `value` when it [`Held::end`]s, and ask again

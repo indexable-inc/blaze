@@ -122,7 +122,7 @@ pub fn served_passed(db: &Db, def: DefWithBodyId) -> bool {
 /// crate has no part, it is in a block, or it was left out of the part). A record that does not
 /// read is a panic naming the crate and body: the store checked the bytes against their key, so
 /// inferring the body instead would hide a bug.
-pub(crate) fn served_inference(db: &Db, def: DefWithBodyId) -> Option<InferenceResult<'_>> {
+pub fn served_inference(db: &Db, def: DefWithBodyId) -> Option<InferenceResult<'_>> {
     let (krate, body) = served_body(db, def)?;
     let items = served_items(db, krate);
     let result = body

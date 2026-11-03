@@ -196,6 +196,21 @@ Blaze's other deep recursions grow the stack the same way (fiber-aware). Tests: 
 `a_type_with_an_alias_at_the_bottom_normalizes_at_any_depth` (the normalizer) and
 `a_body_naming_a_deep_type_has_an_identity` (the canonicalizer) overflow without them.
 
+### 0013-sealed-traits-knowable
+
+What: `coherence::trait_ref_is_knowable` reports a downstream conflict only when the trait is
+not sealed (`Interner::trait_is_sealed`, `rustc_type_ir` patch `0013-sealed-traits`); the rest
+of the function (local or fundamental, then the local orphan check for an upstream conflict)
+is unchanged.
+
+Why: no crate but a `#[blaze::sealed]` trait's own may implement it (hir-ty-coherence refuses
+an impl of it anywhere else, and any trait of another crate with it anywhere among its
+supertraits, so no `dyn` type of another crate implements it either; a relaxed impl's sealed
+parameter must also be `Sized`), so no downstream or cousin crate can make `?T: Sealed` hold
+(docs/v2/plan/lanes/frontend/sealed-orphan.md). Without this, `impl<T: Sealed> Display for T` always overlaps std's
+`impl<T: Display + ?Sized> Display for &T` in coherence, because a downstream crate could
+otherwise implement `Sealed` for `&Local`. With no sealed trait, every answer is upstream's.
+
 ## Dropped since the previous base (ra-ap-rustc_next_trait_solver 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#161380 (a constant sends a goal back to the caller's typing

@@ -1,5 +1,5 @@
 //! The constants `hir-ty-mir`'s consteval tests evaluate infer with no error: since a body whose
-//! inference has errors evaluates to `HasErrors` (`consteval::hir_eval::value`), `loops`,
+//! inference has errors evaluates to `HasErrors` (`consteval::evaluate`), `loops`,
 //! `options` and `ranges` refuse their `GOAL`. On a failure the message has, per body, the
 //! error flag, the diagnostics and each node whose type has an error.
 

@@ -48,7 +48,7 @@ fn llvm_and_no_backend_leave_the_choice_to_blaze() {
 }
 
 #[test]
-fn cranelift_is_taken_where_the_level_compiles_with_it() {
+fn cranelift_is_taken_where_the_level_compiles_with_stencils() {
     let dev = profile("dev", "0", Some("cranelift"));
     assert_eq!(codegen_backend(&dev, "app", OptLevel::O0), Ok(()));
     assert_eq!(codegen_backend(&dev, "app", OptLevel::O1), Ok(()));
@@ -63,8 +63,9 @@ fn cranelift_is_taken_where_the_level_compiles_with_it() {
 
 #[test]
 fn a_backend_blaze_has_no_setting_for_is_an_error_naming_it() {
-    let stencil = codegen_backend(&profile("dev", "0", Some("stencil")), "app", OptLevel::O0).unwrap_err();
-    assert!(stencil.contains("`dev` of `app`") && stencil.contains("`stencil`"), "{stencil}");
+    assert_eq!(codegen_backend(&profile("dev", "0", Some("stencil")), "app", OptLevel::O0), Ok(()));
+    let stencil = codegen_backend(&profile("release", "3", Some("stencil")), "app", OptLevel::O3).unwrap_err();
+    assert!(stencil.contains("`release` of `app`") && stencil.contains("`stencil`"), "{stencil}");
     let gcc = codegen_backend(&profile("dev", "0", Some("gcc")), "dep", OptLevel::O0).unwrap_err();
     assert_eq!(
         gcc,
@@ -300,6 +301,9 @@ fn kept(path: &str, output: &blaze_link::Output) -> KeptImage {
         natives: Vec::new(),
         names: Vec::new(),
         layout: None,
+        loaded: None,
+        slotted: Vec::new(),
+        assumed: Vec::new(),
     };
     KeptImage { path: path.to_owned(), kept }
 }

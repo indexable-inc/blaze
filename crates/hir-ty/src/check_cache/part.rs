@@ -84,7 +84,7 @@ const _: () = {
 /// The schema of the part, and the version of everything its bytes are made with: the records,
 /// the type tables, the ids, frontend-deps' portable table and the key a body is found by.
 pub(crate) const SCHEMA: SchemaHash = schema_of(&[
-    SchemaPart::Str("blaze v2 dependency bodies 1"),
+    SchemaPart::Str(super::BODIES_DOMAIN),
     SchemaPart::Schema(<PartRoot as Record>::SCHEMA),
     SchemaPart::Schema(<BodyRoot as Record>::SCHEMA),
     SchemaPart::Schema(<InferenceRecord as Persist>::SCHEMA),

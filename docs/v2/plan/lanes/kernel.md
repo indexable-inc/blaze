@@ -97,8 +97,9 @@ catches it (below). The trusted functions a step reaches (`PureProof::trusted`) 
 
 The kernel takes `Identity::of` and `CodeId` as given. `Kernel::register::<S>(code)` records
 a step's `CodeId` once per process, and `Kernel::identity::<S>(input)` puts it in. Until lane
-identity gives code identities, codegen passes `Toolchain::id` (the pinned nightly and the
-blaze executable's hash). The step's numbers live in one table, `blaze_kernel::steps`, and
+identity gives code identities, codegen passes `Toolchain::id`: the pinned nightly and the
+code generator's code identity, of the packages it is built from (`hir_ty_codegen::v2::code`,
+`crates/blaze-codegen-code`), never the executable's bytes. The step's numbers live in one table, `blaze_kernel::steps`, and
 registration refuses a second step of one number or one name.
 
 ## Checks (lane verify)
@@ -127,9 +128,10 @@ stores miss their dev templates once.
 The driver still compiles templates in batches (the memo, flights, folding), so
 `DevTemplate` is a `Step` the kernel keys, not a `Compute` it runs. Next, in order:
 
-1. Lane identity gives `DevTemplate` a `CodeId` of the codegen code it runs, and `Settings`
-   drops the executable's hash. Then a blaze rebuilt without changes to codegen reads the
-   last one's templates, which is today's biggest loss of stored code.
+1. Done at package grain (2026-11-02): `Settings` has no executable hash left;
+   `Toolchain::id` is the code generator's code identity, so a blaze rebuilt without changes
+   to the code generator's packages reads the last one's templates. Next, lane identity gives
+   `DevTemplate` the `CodeId` of the codegen code it runs, finer than a package.
 2. The instance key's `args` (the facts of the type arguments the code reads) become recorded
    reads of a `World` over `blaze_items` facts, and `of` becomes lane identity's identity of
    the generic. One entry then serves every instantiation whose facts hash alike.

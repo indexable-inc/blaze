@@ -310,6 +310,7 @@ fn target(arch: blaze_codegen::Arch, cpu: Cpu) -> Target {
         tls: TlsModel::ElfGd,
         probe_stack: true,
         probe_log2: 12,
+        counts: true,
     }
 }
 

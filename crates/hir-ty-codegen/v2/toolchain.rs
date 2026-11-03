@@ -10,8 +10,9 @@
 #[cfg(test)]
 mod tests;
 
-use std::{collections::BTreeSet, path::Path};
+use std::collections::BTreeSet;
 
+use base_db::target::TargetData;
 use blaze_codegen::{
     Arch,
     settings::{Relocation, Toolchain},
@@ -20,8 +21,7 @@ use blaze_ids::{ContentId, Hasher};
 
 use crate::{ObjectFormat, Target};
 
-const ID_DOMAIN: &str = "blaze v2 toolchain id 3";
-const BUILD_DOMAIN: &str = "blaze v2 codegen build 1";
+const ID_DOMAIN: &str = "blaze v2 toolchain id 5";
 
 /// The nightly blaze is pinned to (`harness/toolchain`).
 pub(crate) const NIGHTLY: &str = include_str!("../../../harness/toolchain").trim_ascii_end();
@@ -126,8 +126,29 @@ pub enum Runs {
 
 /// The toolchain of a unit for `target`, built with `rustflags` (its `RUSTFLAGS`, as cargo
 /// gives them to rustc), for a program that `runs` there. A `-C target-cpu` or
-/// `-C target-feature` in the flags wins over where it runs.
-pub fn toolchain(target: &str, rustflags: &[String], runs: Runs) -> Result<Toolchain, String> {
+/// `-C target-feature` in the flags wins over where it runs. `target_data` is what the front end
+/// lays the unit's types out by (its crates' `TargetData`, the data layout from blaze-units'
+/// recorded spec): part of the id, as code made under one layout is not code for another.
+pub fn toolchain(target: &str, target_data: &TargetData, rustflags: &[String], runs: Runs) -> Result<Toolchain, String> {
+    toolchain_for(&code()?, target, target_data, rustflags, runs)
+}
+
+/// [`toolchain`], made by the code generator whose code is `code` rather than this process's.
+pub fn toolchain_for(
+    code: &CodegenCode,
+    target: &str,
+    target_data: &TargetData,
+    rustflags: &[String],
+    runs: Runs,
+) -> Result<Toolchain, String> {
+    if target_data.tuple.as_str() != target {
+        // alloc: an error
+        return Err(format!(
+            "the toolchain for `{target}` is given the target data of `{}`: a unit's code is laid out by \
+             its own target's",
+            target_data.tuple.as_str()
+        ));
+    }
     let emitted = Target::of(target)?;
     let flags = Flags::read(rustflags)?;
     let arch = match emitted.arch {
@@ -204,7 +225,7 @@ pub fn toolchain(target: &str, rustflags: &[String], runs: Runs) -> Result<Toolc
         }
     };
     Ok(Toolchain {
-        id: temporary_executable_id(&build()?),
+        id: id_of(code, target_data),
         // alloc: per toolchain made, a few names
         target: target.to_owned(),
         arch,
@@ -237,54 +258,101 @@ pub fn select(toolchain: &Toolchain) -> Result<(), String> {
     Ok(())
 }
 
-/// The pinned nightly blaze compiles against and the blaze build that makes the code (#1439):
-/// the backends' versions are fields of their own.
+/// The content identity of the code that makes blaze's generated code: of every package the
+/// code generator (`hir-ty-codegen`, the front end it reads and the backends it drives) is
+/// built from, with the LLVM it links and how blaze itself was built. blaze-engine's build
+/// script works it out (`blaze_codegen_code::emit`, crates/blaze-codegen-code) and the program hands it
+/// over with [`set_code`] before any command runs, so an edit to code outside the code
+/// generator (the CLI, the daemon, the lints) keeps it, and every template stored with it.
 ///
-/// TEMPORARY: this keys code by the executable's bytes, so every rebuild of blaze misses every
-/// stored template, whatever it changed. It is replaced, not kept beside, by the code
-/// generator's own behaviour identity, `core::reflect::fn_info(<codegen entry>).code_id`
-/// (docs/v2/plan/design/code-identity.md, "Toolchain::id"), once const eval answers `fn_info`
-/// (lane comptime), codegen's entry traits are trusted doors (lane pure) and blaze builds itself
-/// with `blaze_comptime`. Until then this is the key, named as what it is; nothing falls back to
-/// it once the CodeId exists, and a CodeId that can't be had is an error, never this.
-fn temporary_executable_id(build: &ContentId) -> ContentId {
-    let mut hasher = Hasher::new(ID_DOMAIN);
-    hasher.update(NIGHTLY.as_bytes()).update(b"\n").id(build);
-    hasher.finish()
-}
+/// TEMPORARY in its granularity: an edit anywhere in a package of the code generator changes
+/// it, so a change to codegen misses every template, not only those it affects. It is
+/// replaced, not kept beside, by the code generator's behaviour identity,
+/// `core::reflect::fn_info(<codegen entry>).code_id` (docs/v2/plan/design/code-identity.md,
+/// "Toolchain::id"), once const eval answers `fn_info` and blaze builds itself with
+/// `blaze_comptime`. No key falls back to the executable's bytes: a process that was handed no
+/// code identity makes no toolchain.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CodegenCode(pub ContentId);
 
-/// Which blaze build this process is: the hash of its executable's bytes, read once. The code
-/// made for one code hash is what this blaze's front end and code generator make of it, and the
-/// code hash reads neither (it is of the item's source, its callees by their interfaces), so a
-/// store kept across blaze builds would hold another build's code under every key.
-#[expect(clippy::disallowed_types, reason = "the hash of the running blaze executable, which does not change while the process runs")]
-pub fn build() -> Result<ContentId, String> {
-    static BUILD: std::sync::OnceLock<Result<ContentId, String>> = std::sync::OnceLock::new();
-    BUILD
-        .get_or_init(|| {
-            // alloc: an error, once a process
-            let exe = std::env::current_exe().map_err(|why| format!("the path of blaze itself: {why}"))?;
-            build_of(&exe)
-        })
-        // clone: a content ID, or the error that stops every toolchain of the process
-        .clone()
-}
-
-fn build_of(exe: &Path) -> Result<ContentId, String> {
-    use std::io::Read as _;
-    // alloc: an error, once a process
-    let failed = |why: std::io::Error| format!("reading blaze itself, {}: {why}", exe.display());
-    let mut file = std::fs::File::open(exe).map_err(failed)?;
-    let mut hasher = Hasher::new(BUILD_DOMAIN);
-    // alloc: one buffer, once a process
-    let mut chunk = vec![0u8; 1 << 20];
-    loop {
-        let read = file.read(&mut chunk).map_err(failed)?;
-        if read == 0 {
-            return Ok(hasher.finish());
+impl CodegenCode {
+    /// Of the 64 hex digits `blaze_codegen_code::emit` sets `BLAZE_CODEGEN_CODE` to.
+    pub fn from_hex(hex: &str) -> Result<CodegenCode, String> {
+        let refused = || format!("the code generator's code identity `{hex}` is not 64 hex digits (`BLAZE_CODEGEN_CODE`)");
+        if hex.len() != 64 {
+            return Err(refused());
         }
-        hasher.update(&chunk[..read]);
+        let mut bytes = [0u8; 32];
+        for (byte, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+            let pair = std::str::from_utf8(pair).map_err(|_| refused())?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| refused())?;
+        }
+        Ok(CodegenCode(ContentId(bytes)))
     }
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "which code generator the process is, handed over once by the program's main so that no edit outside the code generator changes this crate"
+)]
+static CODE: std::sync::OnceLock<CodegenCode> = std::sync::OnceLock::new();
+
+/// Hands over the code identity of the process's code generator: once, before the first
+/// toolchain. Handing over another one after is refused, naming both: one process is one code
+/// generator.
+pub fn set_code(code: CodegenCode) -> Result<(), String> {
+    match CODE.get_or_init(|| code) {
+        it if *it == code => Ok(()),
+        // alloc: an error, once
+        it => Err(format!(
+            "the code generator's code identity is {:x} already, and {:x} was handed over: one \
+             process is one code generator",
+            it.0, code.0
+        )),
+    }
+}
+
+/// The code identity [`set_code`] was handed, or an error naming who should have: a program
+/// or test that makes toolchains hands its own over first, as blaze-engine's main does from its
+/// build script's `BLAZE_CODEGEN_CODE`.
+pub fn code() -> Result<CodegenCode, String> {
+    CODE.get().copied().ok_or_else(|| {
+        "the code generator was handed no code identity (`hir_ty_codegen::v2::set_code`): the \
+         program that runs it hands over its build script's `BLAZE_CODEGEN_CODE` before any \
+         toolchain is made, and blaze keys no code by the executable's bytes in its place"
+            // alloc: an error
+            .to_owned()
+    })
+}
+
+/// The target data of a test's made-up crates for `tuple`: x86-64 Linux's data layout, as the
+/// front end's fixtures give it, under `tuple`'s name.
+#[cfg(test)]
+pub(crate) fn fixture_target_data(tuple: &str) -> TargetData {
+    TargetData {
+        tuple: intern::Symbol::intern(tuple),
+        data_layout: "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128".into(),
+        arch: base_db::target::Arch::Other,
+        has_thumb_interworking: false,
+    }
+}
+
+/// `Toolchain::id`: the pinned nightly blaze compiles against, the code generator's code, the
+/// target data the front end lays types out by (`TargetData::content`: the tuple, the data
+/// layout, the arch; read from data past the code generator's packages, so not in its code)
+/// and what of this crate's own build changes the code it makes (its features and debug
+/// assertions, which the build script, run for blaze-engine, does not see). The backends'
+/// versions are fields of their own.
+fn id_of(code: &CodegenCode, target_data: &TargetData) -> ContentId {
+    let mut hasher = Hasher::new(ID_DOMAIN);
+    hasher.part(NIGHTLY.as_bytes()).id(&code.0).id(&target_data.content());
+    hasher.update(&[
+        u8::from(cfg!(feature = "llvm")),
+        u8::from(cfg!(feature = "llvm-wasm")),
+        u8::from(cfg!(feature = "wasm")),
+        u8::from(cfg!(debug_assertions)),
+    ]);
+    hasher.finish()
 }
 
 /// The pinned LLVM's version and commit; `None` for a blaze built without it.

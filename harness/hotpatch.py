@@ -13,9 +13,13 @@ timed from just before the file is written to the program running the new number
   subsecond  `dx serve --hotpatch` (Dioxus 0.7.10) runs the program and patches it while it
              runs: dx sees the file change, rustc builds the crate, dx links a patch and sends
              it to the program, which swaps it in
-  blaze     the program is stopped, `blaze build`, and it is started again. blaze
-             does not patch a running program on Linux yet (on macOS it does: live_latency.py
-             measures that)
+  blaze     the program is stopped, `blaze build`, and it is started again. blaze v2
+             patches no running program on any platform yet: no program it starts runs on its
+             code memory (a dev run is refused with `NOT_IN_PROCESS`,
+             crates/blaze-cargo/src/serve/unit/run.rs; `blaze run` execs the file) and its links
+             carry no live descriptor (blaze-link `target::output` sets `live: None`). Until
+             that is wired, live_e2e.py and live_latency.py fail on macOS as on Linux
+             (2026-11-02)
   cargo      the program is stopped, incremental `cargo build`, and it is started again: what
              `cargo watch -x run` does, without its file watcher
 

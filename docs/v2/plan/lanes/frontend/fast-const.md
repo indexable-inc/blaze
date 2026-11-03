@@ -5,6 +5,13 @@ date: 2026-10-29
 ---
 # frontend-fast-const: constants over HIR, and dependencies' constants by content
 
+**2026-11-02: the HIR evaluator is removed** (AGENTS.md one-concept-one-home: two evaluators of
+one constant are a bug). It read an arbitrary-width integer's size as `bits / 8` bytes, so a `u12`
+constant evaluated as a `u8`, and its speed was never measured. Every constant is evaluated by MIR
+(`crates/hir-ty/src/consteval.rs`, `evaluate`); the dependencies' constants by content
+(`fast-const-deps.md`) stay. A speed path for constants comes back as part of the one evaluator,
+quoting spans (rule slow-is-p0-traced), never as a second one.
+
 Section 6 of [fast.md](fast.md). Written 2026-10-29; nothing was built or run, so every cost
 below is counted from the code, and every claim of agreement is what a named test checks once
 the tree builds.

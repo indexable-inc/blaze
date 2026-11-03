@@ -70,7 +70,9 @@ impl Glue for X64 {
             let (buf, side) = (&mut *cx.buf, &mut *cx.side);
             frame::enter(buf, &mut |at, rule| side.rule(at, rule), &frame)?;
         }
-        count(cx, tier::CALLS);
+        if cx.target.counts {
+            count(cx, tier::CALLS);
+        }
         let func = cx.func;
         if let (Some(off), Some(place)) = (frame.sret, frame::sret_place(func)?) {
             frame::param(cx.buf, frame.grow, place, ir::types::I64, super::Loc::Slot(off))?;

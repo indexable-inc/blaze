@@ -186,6 +186,13 @@ impl<'db, M: Machine<'db>> Hooks<M> {
         }
     }
     #[inline(always)]
+    pub(super) fn vtable(&self, id: u64) -> Option<M::Prov> {
+        match M::CHECKS {
+            true => self.with(|m| m.vtable(id)),
+            false => None,
+        }
+    }
+    #[inline(always)]
     pub(super) fn freeze(&self, addr: u64) {
         if M::CHECKS {
             self.with(|m| m.freeze(addr))

@@ -237,6 +237,12 @@ pub trait Machine<'db> {
     fn function(&mut self, _id: u64) -> Option<Self::Prov> {
         None
     }
+    /// The provenance of a `dyn` pointer's metadata, the vtable `id` (a [`VTableMap`] id of a
+    /// type and the `dyn` type it is a vtable for), which is in no allocation. A machine that
+    /// gives vtables none sees the metadata as an integer.
+    fn vtable(&mut self, _id: u64) -> Option<Self::Prov> {
+        None
+    }
     /// The [`MemKind::Global`] allocation that starts at `addr` is read-only from now on, its
     /// initial bytes written; a write to it is undefined behavior. By rustc's interning
     /// (`intern_const_alloc_recursive`): a constant's value and all it points to; a static's

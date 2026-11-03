@@ -53,6 +53,11 @@ const TARGET: &str = "wasm32-unknown-unknown";
 /// The layout of `wasm32-unknown-unknown`.
 const DATA_LAYOUT: &str = "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20";
 
+/// What the page's crates are laid out by, and so what its toolchain's id is of.
+fn target_data() -> TargetData {
+    TargetData { tuple: Symbol::intern(TARGET), data_layout: DATA_LAYOUT.into(), arch: Arch::Wasm32, has_thumb_interworking: false }
+}
+
 pub struct Compiler {
     db: Db,
     files: HashMap<String, FileId>,
@@ -281,12 +286,7 @@ impl Compiler {
             cfg.extend([key("target_has_atomic", width), key("target_has_atomic_load_store", width)]);
         }
         let workspace = TArc::new(CrateWorkspaceData {
-            target: Ok(TargetData {
-                tuple: Symbol::intern(TARGET),
-                data_layout: DATA_LAYOUT.into(),
-                arch: Arch::Wasm32,
-                has_thumb_interworking: false,
-            }),
+            target: Ok(target_data()),
             toolchain: None,
             const_eval: Default::default(),
         });
@@ -325,7 +325,9 @@ impl Compiler {
     /// the code generator can't compile stops the build, naming it.
     pub fn build(&mut self) -> Result<Build, String> {
         let start = stdx::time::Instant::now();
-        let toolchain = hir_ty_codegen::v2::toolchain(TARGET, &[], Runs::Elsewhere)?;
+        // The code generator's code, which build.rs worked out: what its templates are keyed by.
+        hir_ty_codegen::v2::CodegenCode::from_hex(env!("BLAZE_CODEGEN_CODE")).and_then(hir_ty_codegen::v2::set_code)?;
+        let toolchain = hir_ty_codegen::v2::toolchain(TARGET, &target_data(), &[], Runs::Elsewhere)?;
         hir_ty_codegen::v2::select(&toolchain)?;
         let policy = policy(toolchain);
         let db = &self.db;

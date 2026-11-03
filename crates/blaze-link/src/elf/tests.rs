@@ -550,6 +550,61 @@ fn an_executable_reads_back() {
     assert_eq!(verneed.sh_info(endian), 2, "one Elf64_Verneed per library with versions");
 }
 
+/// glibc's loader protects `[down(start), down(end))` of `PT_GNU_RELRO` in the running kernel's
+/// pages, and a page of that range no `PT_LOAD` maps fails the start ("cannot apply additional
+/// memory protection after relocation: Cannot allocate memory", every AArch64 program on a
+/// 4 KiB kernel, 2026-11-02). On every page size AArch64 kernels run, the protected range must
+/// be mapped by relro's own `PT_LOAD` and cover all of relro.
+#[test]
+fn relro_is_protected_whole_and_only_where_its_load_maps_on_every_page_size() {
+    let pieces = [
+        (Class::Text, 64, 16),
+        (Class::RelRo, 24, 8),
+        (Class::InitArray, 8, 8),
+        (Class::Data, 16, 8),
+        (Class::Bss, 32, 8),
+    ];
+    let counts = Counts::default();
+    let output = output(
+        blaze_codegen::Arch::Aarch64,
+        OutputKind::Executable { entry: "_start".into() },
+        Some("/lib/ld-linux-aarch64.so.1"),
+    );
+    let mut image = Fixture::new(output, &pieces, &counts);
+    let text = image.at(&Class::Text);
+    image.functions = vec![Function { addr: text, size: 64, fde: None, windows: None, name: Some("_start".into()) }];
+    image.entry = Some(text);
+    let relro_classes = [Class::RelRo, Class::InitArray, Class::Synthetic(super::DYNAMIC)];
+    let relro_bytes: Vec<(u64, u64)> = image
+        .regions
+        .iter()
+        .filter(|it| relro_classes.contains(&it.class))
+        .map(|it| (it.addr, it.addr + it.size))
+        .collect();
+    assert_eq!(relro_bytes.len(), relro_classes.len());
+
+    let bytes = image.link();
+    let file = ElfFile64::<Endianness>::parse(&bytes[..]).unwrap();
+    let endian = file.endian();
+    let phdrs = file.elf_program_headers();
+    let relro = phdrs.iter().find(|it| it.p_type(endian) == elf::PT_GNU_RELRO).unwrap();
+    let (start, end) = (relro.p_vaddr(endian), relro.p_vaddr(endian) + relro.p_memsz(endian));
+    let loads: Vec<_> = phdrs.iter().filter(|it| it.p_type(endian) == elf::PT_LOAD).collect();
+    let at = loads.iter().position(|it| it.p_vaddr(endian) == start).expect("relro starts its own PT_LOAD");
+    let load = loads[at];
+    assert!(at + 1 < loads.len(), "writable data follows relro");
+    assert!(end <= loads[at + 1].p_vaddr(endian), "relro ends before the next PT_LOAD");
+    for page in [0x1000u64, 0x4000, 0x10000] {
+        let down = |it: u64| it / page * page;
+        let mapped = load.p_vaddr(endian) + (load.p_memsz(endian)).next_multiple_of(page);
+        let (from, to) = (down(start), down(end));
+        assert!(to <= mapped, "{page:#x} pages: relro is protected to {to:#x}, its PT_LOAD maps to {mapped:#x}");
+        for &(first, past) in &relro_bytes {
+            assert!(from <= first && past <= to, "{page:#x} pages: {first:#x}..{past:#x} is outside {from:#x}..{to:#x}");
+        }
+    }
+}
+
 #[test]
 fn a_shared_library_exports_through_its_hash_table() {
     let names: Vec<String> = (0..100).map(|it| format!("blaze_export_{it}")).collect();

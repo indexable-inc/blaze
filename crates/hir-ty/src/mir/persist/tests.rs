@@ -159,6 +159,9 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
         ..ComplexMemoryMap::default()
     };
     complex.vtable.id(types.u32);
+    // A vtable's id names the `dyn` type too, which must read back: const eval puts a `dyn`
+    // there, and the map stores any type as it stores the other.
+    complex.vtable.vtable_id(types.u32, tuple);
     let mut constants = vec![
         Operand::from_bytes(Box::new([1, 0, 0, 0]), types.u32),
         Operand::const_zst(types.unit),

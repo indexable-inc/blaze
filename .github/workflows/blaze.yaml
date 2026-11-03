@@ -101,6 +101,8 @@ jobs:
       # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
       # their index (tools/docs.py).
       - run: python3 tools/docs.py check
+      # Each hash domain in crates/ is written once outside tests (tools/v2/domains.py).
+      - run: uv run --frozen python tools/v2/domains.py '{"root": "."}'
 
   linux-x64:
     name: linux x64

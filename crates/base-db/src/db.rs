@@ -78,6 +78,11 @@ pub enum RunOrder {
     Strided(usize),
     /// None of them: each result is computed by the query that reads it, as it reads it.
     LeftToReaders,
+    /// As a build's database runs them: on the pool this thread is a worker of (the process's
+    /// from a thread of no pool), through `blaze_graph::par`'s loops, so a test meets what a
+    /// task giving way on the loop's own thread does there. A test runs under a pool of one
+    /// worker (`Pool::install`) to have every task on that thread, in order.
+    OnPool,
 }
 
 thread_local! {
@@ -209,7 +214,7 @@ impl Db {
 
     pub fn set_file_text(&mut self, file_id: FileId, text: &str) {
         let files = Arc::clone(&self.files);
-        self.write_file(file_id, |db| files.set_file_text(db, file_id, text));
+        self.write_file("Db::set_file_text", file_id, |db| files.set_file_text(db, file_id, text));
     }
 
     pub fn set_file_text_with_durability(
@@ -219,7 +224,7 @@ impl Db {
         durability: Durability,
     ) {
         let files = Arc::clone(&self.files);
-        self.write_file(file_id, |db| {
+        self.write_file("Db::set_file_text_with_durability", file_id, |db| {
             files.set_file_text_with_durability(db, file_id, text, durability)
         });
     }
@@ -239,7 +244,7 @@ impl Db {
     /// See [`Files::reload_included_file`].
     pub fn reload_included_file(&mut self, path: &AbsPath) -> bool {
         let files = Arc::clone(&self.files);
-        self.batch(|db| {
+        self.write("Db::reload_included_file", |db| {
             let changed = files.reload_included_file(db, path);
             if changed && let Some(file) = files.find_included(path) {
                 db.note(Note::Included(file));
@@ -255,7 +260,7 @@ impl Db {
         durability: Durability,
     ) {
         let files = Arc::clone(&self.files);
-        self.batch(|db| {
+        self.write("Db::set_file_source_root_with_durability", |db| {
             files.set_file_source_root_with_durability(db, id, source_root_id, durability);
             db.note(Note::Root(source_root_id));
         });
@@ -268,7 +273,7 @@ impl Db {
         durability: Durability,
     ) {
         let files = Arc::clone(&self.files);
-        self.batch(|db| {
+        self.write("Db::set_source_root_with_durability", |db| {
             let old = files
                 .has_source_root(source_root_id)
                 .then(|| db.source_root(source_root_id).source_root(&*db));
@@ -286,7 +291,7 @@ impl Db {
         durability: Durability,
     ) {
         let files = Arc::clone(&self.files);
-        self.write_file(file_id, |db| {
+        self.write_file("Db::set_appended_root_module", file_id, |db| {
             files.set_appended_root_module(db, file_id, module, durability)
         });
     }
@@ -299,14 +304,14 @@ impl Db {
         durability: Option<Durability>,
     ) {
         let files = Arc::clone(&self.files);
-        self.write_crates(|db| files.set_crate_attr_files(db, krate, gone, durability));
+        self.write_crates("Db::set_crate_attr_files", |db| files.set_crate_attr_files(db, krate, gone, durability));
     }
 
     /// A new file with `of`'s path and text, whose appended root module is its own: see
     /// [`Files::alias`]. [`Files::aliases_of`] lists them.
     pub fn alias(&mut self, of: FileId) -> Result<FileId, crate::AliasError> {
         let files = Arc::clone(&self.files);
-        self.batch(|db| {
+        self.write("Db::alias", |db| {
             let (alias, roots) = files.alias(db, of)?;
             db.note(Note::View { set: &[], added: &[alias], removed: &[], roots: &roots });
             Ok(alias)
@@ -322,14 +327,14 @@ impl Db {
         appended: Option<(&'static str, &str)>,
     ) -> Result<(), crate::AliasError> {
         let files = Arc::clone(&self.files);
-        self.write_file(alias, |db| files.set_alias_appended(db, alias, appended))
+        self.write_file("Db::set_alias_appended", alias, |db| files.set_alias_appended(db, alias, appended))
     }
 
     /// Sets the inputs of one view's files, writing only those that changed: see
     /// [`Files::set_view_root`].
     pub fn set_view_root(&mut self, view: ViewRoot<'_>) -> Result<ViewChange, ViewError> {
         let files = Arc::clone(&self.files);
-        self.batch(|db| {
+        self.write("Db::set_view_root", |db| {
             let change = files.set_view_root(db, view)?;
             db.note(Note::View {
                 set: &change.set,
@@ -468,21 +473,48 @@ impl Db {
     /// result, and no reader asks for it.
     ///
     /// A build's database runs them on the pool (`blaze_graph::par`, inside a
-    /// [`blaze_query::db::pump_barrier`]); a test database runs them here, in [`RunOrder`].
+    /// [`blaze_query::db::pump_barrier`]); a test database runs them here, in [`RunOrder`]
+    /// (on the pool too under [`RunOrder::OnPool`]). As the pool's loop does for a task on any
+    /// of its threads, its caller's included, a task that gave way
+    /// ([`blaze_query::db::Cancelled::WouldWaitOnItself`]) runs again once the others have, in
+    /// index order, and a give-way of that second run goes on to the caller: so a test sees
+    /// the rerun a maintainer's task must survive.
     pub fn run_each<T: Send>(&self, tag: Tag, items: &mut [T], task: impl Fn(&Db, &mut T) + Sync) {
         let run = |item: &mut T| frame::task(tag, |_| task(self, item));
+        let order = RUN_ORDER.get();
         match self.run {
             Run::Pool => blaze_query::db::pump_barrier(|| blaze_graph::par::for_each(items, run)),
-            Run::Here => match RUN_ORDER.get() {
-                RunOrder::InOrder | RunOrder::LeftToReaders => items.iter_mut().for_each(&run),
-                RunOrder::Reversed => items.iter_mut().rev().for_each(&run),
-                RunOrder::Strided(stride) => {
-                    let stride = stride.max(1);
-                    for first in 0..stride {
-                        items.iter_mut().skip(first).step_by(stride).for_each(&run);
+            Run::Here if order == RunOrder::OnPool => {
+                blaze_query::db::pump_barrier(|| blaze_graph::par::for_each(items, run));
+            }
+            Run::Here => {
+                let mut again = Vec::new(); // alloc: a test database's tasks that gave way, few
+                let mut once = |at: usize, item: &mut T| {
+                    let ran = panic::catch_unwind(panic::AssertUnwindSafe(|| run(item)));
+                    if let Err(payload) = ran {
+                        match payload.downcast_ref::<blaze_query::db::Cancelled>() {
+                            Some(blaze_query::db::Cancelled::WouldWaitOnItself { .. }) => again.push(at),
+                            _ => panic::resume_unwind(payload),
+                        }
+                    }
+                };
+                match order {
+                    RunOrder::InOrder | RunOrder::LeftToReaders | RunOrder::OnPool => {
+                        items.iter_mut().enumerate().for_each(|(at, item)| once(at, item));
+                    }
+                    RunOrder::Reversed => items.iter_mut().enumerate().rev().for_each(|(at, item)| once(at, item)),
+                    RunOrder::Strided(stride) => {
+                        let stride = stride.max(1);
+                        for first in 0..stride {
+                            items.iter_mut().enumerate().skip(first).step_by(stride).for_each(|(at, item)| once(at, item));
+                        }
                     }
                 }
-            },
+                again.sort_unstable();
+                for at in again {
+                    run(&mut items[at]);
+                }
+            }
         }
     }
 
@@ -511,6 +543,7 @@ impl Db {
         match self.run {
             Run::Pool => blaze_query::db::par_for_each(count, |at| run(self, at)),
             Run::Here => match RUN_ORDER.get() {
+                RunOrder::OnPool => blaze_query::db::par_for_each(count, |at| run(self, at)),
                 RunOrder::InOrder => (0..count).for_each(|at| run(self, at)),
                 RunOrder::Reversed => (0..count).rev().for_each(|at| run(self, at)),
                 RunOrder::Strided(stride) => {

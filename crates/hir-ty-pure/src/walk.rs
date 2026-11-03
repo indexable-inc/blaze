@@ -353,10 +353,28 @@ fn callees_of<'db>(
     }
 }
 
-/// What the instance does, asked from `env`: worked out in its home (`crate::home`), so every
+/// The environment `instance` is worked out in, asked from `env`: its own crate's where it is
+/// not generic, else its home's (`hir_ty_mir::mir::home::env_of`), the one rule the code
+/// generator compiles it by too, so a script's summary describes the body that runs.
+pub(crate) fn home_env(db: &Db, env: &StoredParamEnvAndCrate, instance: &Instance) -> StoredParamEnvAndCrate {
+    hir_ty_mir::mir::home::env_of(db, env, Some(def_crate(db, instance.def)), instance.args.as_ref())
+}
+
+/// The crate whose code `def` is.
+pub(crate) fn def_crate(db: &Db, def: Def) -> Crate {
+    match def {
+        Def::Body(Body::Fn(func)) | Def::Leaf(func, _) => func.krate(db),
+        Def::Body(Body::Closure(id)) => InternedClosureId::from_id(id).loc(db).owner.krate(db),
+        Def::Body(Body::Coroutine(id) | Body::CoroutineByMove(id)) => {
+            InternedCoroutineId::from_id(id).loc(db).owner.krate(db)
+        }
+    }
+}
+
+/// What the instance does, asked from `env`: worked out in its home ([`home_env`]), so every
 /// build script that reaches it shares one summary.
 pub(crate) fn summary<'db>(db: &'db Db, env: StoredParamEnvAndCrate, instance: Instance) -> &'db Summary {
-    summary_in(db, crate::home::env_of(db, &env, &instance), instance)
+    summary_in(db, home_env(db, &env, &instance), instance)
 }
 
 /// What the instance does, in `env`. A cycle of instances starts from the empty summary and
@@ -1621,7 +1639,12 @@ impl<'a, 'db> Walk<'a, 'db> {
         }
         let mut dyns: SmallVec<[Ty<'db>; 2]> = SmallVec::new();
         self.scan(ty, true, &mut HashSet::new_in(Global), &mut dyns);
-        for pointee in map.vtable.tys() {
+        for (pointee, entry_dyn) in map.vtable.entries() {
+            // A vtable's id names its `dyn` type, as rustc's `GlobalAlloc::VTable` does.
+            if let Some(dyn_ty) = entry_dyn {
+                self.vtable(pointee, dyn_ty);
+                continue;
+            }
             match pointee.kind() {
                 TyKind::FnDef(def, args) => {
                     if let CallableDefId::FunctionId(f) = def.0 {

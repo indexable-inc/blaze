@@ -30,7 +30,6 @@ use super::{
     super::{Hashes as _, HirFrontend, HirInstance, Kind},
     Listed, RootTest, refused,
 };
-use crate::home::Homes;
 
 /// The module's name in the crate's root.
 pub const MODULE: &str = "__blaze_test_harness";
@@ -277,7 +276,6 @@ fn digest(tests: &[Test], test_type: &str) -> String {
 pub(super) fn roots(
     frontend: &HirFrontend<'_>,
     db: &Db,
-    homes: &mut Homes,
     krate: Crate,
     listed: &mut Listed,
 ) -> Result<Vec<RootTest>, CodegenError> {
@@ -299,7 +297,7 @@ pub(super) fn roots(
     Ok(tests
         .into_iter()
         .map(|test| RootTest {
-            root: listed.function(db, homes, test.function),
+            root: listed.function(db, test.function),
             name: test.name,
             function: test.function,
             ignore: test.ignore,
@@ -346,7 +344,7 @@ impl HirFrontend<'_> {
         fork_server: fn(bool) -> &'static str,
     ) -> Result<Option<String>, CodegenError> {
         let fork_server = fork_server(exec::records(mode));
-        self.with(|db, _| {
+        self.with(|db| {
             if !tested(db, krate) {
                 return Ok(None);
             }

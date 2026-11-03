@@ -368,6 +368,22 @@ impl<'a, 'db> Cx<'a, 'db> {
         self.span(ptr.map(|it| it.text_range()))
     }
 
+    /// Whether `range` of `file` is in the module the compiler appended to the crate root
+    /// `file` is (a test harness, a wasm proc macro's glue: `FileText::appended_root_module`):
+    /// the root's last item, a module of that name. It is the compiler's own code, as rustc's
+    /// injected harness and proc-macro declarations are: no lint is given in it, whatever the
+    /// crate's levels (a `#![forbid(unsafe_code)]` included), and an unstable feature it uses
+    /// is allowed.
+    pub(crate) fn in_appended(&self, file: HirFileId, range: TextRange) -> bool {
+        use syntax::view::{HasModuleItem as _, HasName as _};
+        let db = self.db;
+        let Some(real) = file.file_id() else { return false };
+        let Some(name) = db.file_text(real.file_id(db)).appended_root_module(db) else { return false };
+        let Some(root) = view::SourceFile::cast(self.root(file)) else { return false };
+        let Some(view::Item::Module(module)) = root.items().last() else { return false };
+        module.name().is_some_and(|it| it.text() == name) && module.syntax().text_range().contains_range(range)
+    }
+
     /// The root of `file`, parsed or expanded, as a view of a tree [`Cx::vsema`] gave out.
     pub fn root(&self, file: HirFileId) -> view::Node<'db> {
         self.vsema.parse_or_expand(file)

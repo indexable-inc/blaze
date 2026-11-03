@@ -16,7 +16,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use blaze_api::{ApiError, Artifact, Diagnostic, Level};
 use blaze_cas::{Key, Kind};
@@ -244,7 +244,7 @@ fn with_record_inputs<T>(
     then: impl FnOnce(&RecordInputs<'_>) -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
     let u = job.unit(unit)?;
-    let toolchain = codegen::toolchain(job, unit).map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?;
+    let blaze = super::deps::build()?;
     let runs = runs(job, unit);
     // An inert script's compile makes nothing, unless `BLAZE_ELIDE=verify` builds it to run it.
     let verified = u.target.is_custom_build()
@@ -270,7 +270,7 @@ fn with_record_inputs<T>(
         unit: KeyedUnit::of(job, u)?,
         plan: job.plan(unit)?,
         run_env: &runs.env,
-        toolchain: toolchain.id,
+        blaze,
         goal: keyed_goal(job.input.goal, u),
         color: job.input.color,
         short: job.input.short,
@@ -394,7 +394,10 @@ pub(crate) struct RecordInputs<'a> {
     pub(crate) plan: &'a blaze_units::query::UnitPlan,
     /// How its program is run ([`artifact::run_env`]).
     pub(crate) run_env: &'a [(String, String)],
-    pub(crate) toolchain: ContentId,
+    /// The blaze that makes the record: its whole executable ([`super::deps::build`]), as a
+    /// record holds what blaze-cargo, the lints and the linker made, past the code generator
+    /// whose code `Toolchain::id` is. The unit's target and flags are in its plan.
+    pub(crate) blaze: ContentId,
     /// [`keyed_goal`].
     pub(crate) goal: u8,
     pub(crate) color: bool,
@@ -424,7 +427,7 @@ impl RecordInputs<'_> {
             hash_cbor(&mut hasher, scratch, self.plan, "plan", unit)?;
             hash_cbor(&mut hasher, scratch, self.run_env, "run environment", unit)
         })?;
-        hasher.id(&self.toolchain).update(&[
+        hasher.id(&self.blaze).update(&[
             self.goal,
             u8::from(self.color),
             u8::from(self.short),
@@ -480,7 +483,7 @@ impl RecordInputs<'_> {
             flag("whether it is std's", u.is_std),
             cbor("plan", self.plan)?,
             cbor("run environment", &self.run_env)?,
-            id("the toolchain", Some(&self.toolchain)),
+            id("the blaze executable", Some(&self.blaze)),
             bytes("goal", &[self.goal]),
             flag("color", self.color),
             flag("short diagnostics", self.short),
@@ -574,6 +577,26 @@ pub(crate) fn reached_only(job: &Job, unit: &Unit) -> Result<bool, ApiError> {
     }
     let package = job.package(unit)?;
     Ok(capped(unit.is_std, package.is_member, package.source.as_deref()))
+}
+
+/// The diagnostics of a crate [`reached_only`] with no check outcome in the store: its one check
+/// of its own is the `#[blaze::sealed]` one (`blaze_diagnostics::check_sealed`), run whatever
+/// [`DEPS`] says when a crate of its graph seals a trait (`hir_ty::sealed_in_graph`). Sealing is
+/// the sealing crate's opt-in and binds every crate that can name the trait, a registry crate
+/// rustc accepted included, and a registry crate that seals is checked by nothing else
+/// (docs/v2/plan/lanes/frontend/sealed-orphan.md). Any other crate pays one flag read and gets
+/// none: `options` is asked only for a crate in a sealed graph.
+pub(crate) fn reached_only_diags(
+    db: &base_db::Db,
+    krate: base_db::Crate,
+    files: blaze_diagnostics::Files<'_>,
+    options: impl FnOnce() -> Result<Options, ApiError>,
+) -> Result<Vec<Diag>, ApiError> {
+    if !hir::attach_db(db, || hir_ty::sealed_in_graph(db, krate)) {
+        return Ok(Vec::new()); // alloc: none: an empty `Vec` holds no buffer
+    }
+    let _span = tracing::info_span!(target: "blaze", "unit sealed check", ?krate).entered();
+    Ok(blaze_diagnostics::check_sealed(db, hir::Crate::from(krate), files, &options()?))
 }
 
 /// Whether a unit's diagnostics are ones cargo never shows (lints capped, so only an error
@@ -1125,8 +1148,11 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
         // A dependency's check outcome from the store: no check runs, and codegen reads the
         // bodies' records served with it.
         Some(Ok(outcome)) => (None, Some(outcome.diags)),
-        // alloc: none: an empty `Vec` holds no buffer
-        None if reached => (None, Some(Vec::new())),
+        // Of a crate checked only where its programs reach it, the one check of its own.
+        None if reached => {
+            let files = blaze_diagnostics::Files::new(reader.paths(), job.mounted.root());
+            (None, Some(reached_only_diags(db, krate, files, || Ok(options(job, unit, u)?.1))?))
+        }
         // alloc: once per unit checked, shared by its check and its codegen
         None => (Some(Arc::new(Checking::new(db, hir::Crate::from(krate)))), None),
     };
@@ -1524,31 +1550,113 @@ enum Module<'a> {
 
 impl Module<'_> {
     /// The module's bytes: the one `.wasm` file the unit writes ([`codegen::wasm_macro`]'s
-    /// output is named as a `cdylib` of wasm32-wasip1 is). An error says why there are none.
-    fn bytes(&self, job: &Job) -> Result<Vec<u8>, String> {
+    /// output is named as a `cdylib` of wasm32-wasip1 is), checked to be a module before
+    /// Wasmtime is given it. An error says why there are none, or what the file is instead.
+    fn bytes(&self, job: &Job) -> Result<Vec<u8>, ModuleError> {
         let wasm = |path: &str| path.ends_with(".wasm");
-        match self {
+        let (path, bytes) = match self {
             Module::Linked(files) => match files.iter().find(|(path, _, _)| wasm(path)) {
                 // alloc: once per proc macro linked for wasm, the module's bytes for its load
-                Some((_, bytes, _)) => Ok(bytes.clone()),
-                None => Err("its link wrote no `.wasm` file".to_owned()),
+                Some((path, bytes, _)) => (path.as_str(), bytes.clone()),
+                None => return Err(ModuleError::NotLinked),
             },
             Module::Kept(kept) => {
                 let Some(output) = kept.outputs.iter().find(|it| wasm(&it.path)) else {
-                    return Err("its kept record names no `.wasm` output".to_owned());
+                    return Err(ModuleError::NotKept);
                 };
-                if let Some(put) = kept.puts.iter().find(|it| it.key == output.key) {
+                let path = output.path.as_str();
+                match kept.puts.iter().find(|it| it.key == output.key) {
                     // alloc: once per proc macro kept for wasm, the module's bytes for its load
-                    return Ok(put.bytes.clone());
-                }
-                let guard = blaze_cas::enter();
-                match job.input.store.get(&guard, &output.key) {
-                    // alloc: as above
-                    Ok(Some(it)) => Ok(it.bytes.to_vec()),
-                    Ok(None) => Err(format!("its kept module {} is not in the store", output.path)),
-                    Err(corrupt) => Err(format!("its kept module {}: {corrupt}", output.path)),
+                    Some(put) => (path, put.bytes.clone()),
+                    None => {
+                        let guard = blaze_cas::enter();
+                        match job.input.store.get(&guard, &output.key) {
+                            // alloc: as above
+                            Ok(Some(it)) => (path, it.bytes.to_vec()),
+                            // alloc: error path
+                            Ok(None) => return Err(ModuleError::NotInStore { path: path.to_owned() }),
+                            // alloc: error path
+                            Err(corrupt) => return Err(ModuleError::Corrupt { path: path.to_owned(), why: corrupt.to_string() }),
+                        }
+                    }
                 }
             }
+        };
+        module_at(path, bytes)
+    }
+}
+
+/// `bytes`, a proc macro's `.wasm` output at `path`, if they are a wasm module; else what they
+/// are instead, so Wasmtime is never given a crate record or other file to parse.
+pub(crate) fn module_at(path: &str, bytes: Vec<u8>) -> Result<Vec<u8>, ModuleError> {
+    match FileKind::of(&bytes) {
+        FileKind::WasmModule => Ok(bytes),
+        // alloc: error path
+        found => Err(ModuleError::NotAModule { path: path.to_owned(), found }),
+    }
+}
+
+/// What a file a unit writes is, by its first bytes: what a proc macro's `.wasm` output is
+/// checked to be before Wasmtime is given it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FileKind {
+    /// A WebAssembly module (`\0asm`): what a proc macro's link writes.
+    WasmModule,
+    /// An `ar` archive (`!<arch>\n`): a library's crate record ([`crate_record`]), what a unit
+    /// that is only checked writes for each of its outputs.
+    Archive,
+    /// Neither.
+    Other,
+}
+
+impl FileKind {
+    pub(crate) fn of(bytes: &[u8]) -> FileKind {
+        match bytes {
+            [0, b'a', b's', b'm', ..] => FileKind::WasmModule,
+            _ if bytes.starts_with(b"!<arch>\n") => FileKind::Archive,
+            _ => FileKind::Other,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            FileKind::WasmModule => "a linked wasm32-wasip1 module",
+            FileKind::Archive => "an `ar` archive (a library's crate record, which a unit only checked writes)",
+            FileKind::Other => "neither a wasm module nor an archive",
+        }
+    }
+}
+
+/// Why a proc macro built for wasm has no module to load ([`Module::bytes`]), each said after
+/// "the wasm module of the proc-macro crate `name`:".
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum ModuleError {
+    /// Its link wrote no `.wasm` file.
+    NotLinked,
+    /// Its kept record names no `.wasm` output.
+    NotKept,
+    /// Its kept record's `.wasm` output is not in the store.
+    NotInStore { path: String },
+    /// The store could not read its kept `.wasm` output.
+    Corrupt { path: String, why: String },
+    /// Its `.wasm` output holds `found`, not a module: the unit was not linked as a wasm proc
+    /// macro (it was only checked, or a record of another kind is kept under its key).
+    NotAModule { path: String, found: FileKind },
+}
+
+impl fmt::Display for ModuleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ModuleError::NotLinked => f.write_str("its link wrote no `.wasm` file"),
+            ModuleError::NotKept => f.write_str("its kept record names no `.wasm` output"),
+            ModuleError::NotInStore { path } => write!(f, "its kept module {path} is not in the store"),
+            ModuleError::Corrupt { path, why } => write!(f, "its kept module {path}: {why}"),
+            ModuleError::NotAModule { path, found } => write!(
+                f,
+                "its output {path} is {}, where {} is expected: the unit was not linked as a wasm proc macro",
+                found.name(),
+                FileKind::WasmModule.name()
+            ),
         }
     }
 }
@@ -1582,9 +1690,11 @@ fn macros(job: &Job, reader: &UnitReader, unit: usize, ok: bool, module: Module<
     let Some(krate) = job.crates.krate(unit) else {
         return failed(format!("proc macro `{name}` has no crate in the front end"));
     };
-    let toolchain = match codegen::toolchain(job, unit) {
-        Ok(it) => it.id,
-        Err(why) => return failed(format!("proc macro `{name}`: its toolchain: {why}")),
+    // What its expansions are kept under: the whole blaze, whose macro server and bridge run
+    // them ([`super::deps::build`]), past the code generator that compiled the macro.
+    let toolchain = match super::deps::build() {
+        Ok(it) => it,
+        Err(why) => return failed(format!("proc macro `{name}`: {}", why.what)),
     };
     let bytes = match module.bytes(job) {
         Ok(it) => it,
@@ -1781,6 +1891,13 @@ fn assemble(job: &Job, reader: &UnitReader, unit: usize, phases: &Phases, images
                 }
                 match codegen::link(job, unit, path, makes, &generated, images) {
                     Ok(linked) => {
+                        // The running program was told to start again: the build says so too,
+                        // naming the executable and why, as no patch reached it.
+                        if let Some(why) = &linked.restart {
+                            // alloc: a warning's text, once per restart
+                            let what = format!("`{path}` is running and can't take this build as a patch: {why}; start it again to run it");
+                            diagnostics.push(say::cargo(Level::Warning, what, Some(unit_of.clone()), color));
+                        }
                         natives.extend(linked.read);
                         if linked.table.is_some() {
                             made.table = linked.table;

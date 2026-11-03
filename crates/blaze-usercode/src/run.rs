@@ -120,6 +120,17 @@ pub enum RunError<E> {
     /// It succeeded printing what cargo refuses, so what cargo would watch of it is not known:
     /// nothing is kept.
     Output { key: RunKey, error: blaze_build_script::Error },
+    /// It ran (its key missed, or nothing was found for it) and gave other than the result the
+    /// store already keeps under the same key, `stored`, for the same inputs read: it read what
+    /// its key misses (randomness, the clock, an input not traced), or it is not a function of
+    /// its inputs. `what` is the first field that differs, with both values
+    /// ([`differs_with_stderr`]); the kept result is never replaced. `landed` and `retracted`
+    /// are as [`RunError::Keep`]'s.
+    Rerun { key: RunKey, stored: Key, what: String, landed: Vec<Ticket>, retracted: Option<Ticket> },
+    /// What its sandbox traced it reading disagrees with what a check of it reads
+    /// ([`crate::script::keyed`]): kept, its result would be under a key no check makes again
+    /// (rule 18), so nothing is kept.
+    Traced { key: RunKey, error: blaze_build_script::Error },
 }
 
 impl<E: fmt::Debug> fmt::Display for RunError<E> {
@@ -147,6 +158,18 @@ impl<E: fmt::Debug> fmt::Display for RunError<E> {
             RunError::Output { key, error } => {
                 write!(f, "the run of {} given {} printed what cargo refuses: {error}", key.code, key.given)
             }
+            RunError::Rerun { key, stored, what, .. } => write!(
+                f,
+                "the run of {} given {} gave other than the result kept under the same key {stored:?} for \
+                 the same inputs ({what}): it read what its key misses (randomness, the clock, an \
+                 input not traced), or it is not a function of its inputs, or blaze's lookup and keep \
+                 make different keys for one run, so it ran when its result was kept (rule 18, a bug \
+                 in blaze); the kept result stays",
+                key.code, key.given
+            ),
+            RunError::Traced { key, error } => {
+                write!(f, "keeping the run of {} given {}: {error}; nothing is kept", key.code, key.given)
+            }
         }
     }
 }
@@ -156,7 +179,7 @@ impl<E> RunError<E> {
     /// so the caller waits for them to be durable as for a run that succeeded.
     pub fn landed(&self) -> &[Ticket] {
         match self {
-            RunError::Keep { landed, .. } | RunError::Differs { landed, .. } => landed,
+            RunError::Keep { landed, .. } | RunError::Differs { landed, .. } | RunError::Rerun { landed, .. } => landed,
             _ => &[],
         }
     }
@@ -165,7 +188,9 @@ impl<E> RunError<E> {
     /// flushes it at once and lets go of what it retracts, as for a run that succeeded.
     pub fn retracted(&self) -> Option<Ticket> {
         match self {
-            RunError::Keep { retracted, .. } | RunError::Differs { retracted, .. } => *retracted,
+            RunError::Keep { retracted, .. } | RunError::Differs { retracted, .. } | RunError::Rerun { retracted, .. } => {
+                *retracted
+            }
             _ => None,
         }
     }
@@ -273,7 +298,8 @@ impl Run {
     /// Takes the spawn's completion: the result, kept when it succeeded (what `rule` says
     /// cargo would watch is added when it read what can't be traced). `inputs` hash what it
     /// read as it is now, when it has just ended. `keyed` takes out of what was traced what
-    /// the run's key has already ([`crate::script::keyed`]); what it read in its own
+    /// the run's key has already ([`crate::script::keyed`]), and refuses a trace that disagrees
+    /// with what a check of the run reads ([`RunError::Traced`]); what it read in its own
     /// `OUT_DIR`, given empty, it wrote itself, and is no input.
     ///
     /// It is kept written against its roots, marked with every root
@@ -289,7 +315,7 @@ impl Run {
         store: &mut Store,
         inputs: &mut I,
         rule: impl FnOnce(&Exit) -> Result<CargoRule, blaze_build_script::Error>,
-        keyed: impl FnOnce(&mut Traced),
+        keyed: impl FnOnce(&mut Traced) -> Result<(), blaze_build_script::Error>,
     ) -> Result<Completed, RunError<I::Error>>
     where
         I::Error: From<NoRoot>,
@@ -309,7 +335,7 @@ impl Run {
                 self.spec.command.program.display()
             )));
         };
-        keyed(&mut traced);
+        keyed(&mut traced).map_err(|error| RunError::Traced { key: self.spec.key, error })?;
         if let Some(out_dir) = &self.spec.out_dir {
             traced.files.retain(|it| !it.0.starts_with(out_dir));
             traced.dirs.retain(|it| !it.0.starts_with(out_dir));
@@ -376,8 +402,18 @@ impl Run {
         let roots = self.spec.roots.view();
         // alloc: error path, why the scan could not be made
         let (marked, stored) = roots.kept(&traced, &value).map_err(|error| RunError::keep(KeepError::Scan { run: key, why: error.to_string() }))?;
-        let kept = verify::keep(store, &roots, &key, marked, stored.encode(), ported_differs)
-            .map_err(|it| RunError::Keep { error: it.error, landed: it.tickets, retracted: it.retracted })?;
+        let kept = verify::keep(store, &roots, &key, marked, stored.encode(), ported_differs).map_err(|it| match it.error {
+            // The store keeps another value under this run's key and trace: said by what
+            // differs, both values named, never by the two hashes alone (rule 16).
+            KeepError::Mismatch(mismatch) => {
+                let what = rerun_differs(store, &mismatch, &stored).unwrap_or_else(|why| {
+                    // alloc: error path
+                    format!("its value hashes {}, not {} as kept; {why}", mismatch.given, mismatch.kept)
+                });
+                RunError::Rerun { key, stored: mismatch.key, what, landed: it.tickets, retracted: it.retracted }
+            }
+            error => RunError::Keep { error, landed: it.tickets, retracted: it.retracted },
+        })?;
         // Verify mode: a copy comparison that retracted is a difference too, said as one.
         if self.spec.mode == Mode::Verify
             && let Some(ticket) = kept.retracted
@@ -393,11 +429,30 @@ impl Run {
     }
 }
 
+/// How the value the store keeps under `mismatch`'s key differs from `ran` (as kept: ported),
+/// the value a rerun gave: [`differs_with_stderr`], both values named. An error saying why
+/// when the kept bytes are not a run's value, or are equal to it after all.
+fn rerun_differs(store: &Store, mismatch: &blaze_cas::Mismatch, ran: &Value) -> Result<String, String> {
+    let entry = store.get(&mismatch.key).map_err(|error| format!("reading the kept value: {error:?}"))?; // alloc: error path
+    let Some(entry) = entry else {
+        return Err("the kept value is no longer in the store".to_owned()); // alloc: error path
+    };
+    let bytes = index::split_verified(entry.bytes).map_or(entry.bytes, |(_, value)| value);
+    let kept = Value::decode(bytes)?;
+    differs_with_stderr(&kept, ran).ok_or_else(|| {
+        "the kept value decodes equal to the rerun's, its bytes otherwise (an encoding that is not one to one)".to_owned() // alloc: error path
+    })
+}
+
 /// [`differs`], and what it printed to stderr too: the comparison sharing makes, since a value
 /// verified across checkouts is given as it is.
 pub fn differs_with_stderr(kept: &Value, ran: &Value) -> Option<String> {
     differs(kept, ran).or_else(|| {
-        (kept.stderr != ran.stderr).then(|| "what it printed to stderr differs".to_owned()) // alloc: a difference said
+        (kept.stderr != ran.stderr).then(|| {
+            let line = first_line_differing(&kept.stderr, &ran.stderr);
+            let [kept, ran] = [&kept.stderr, &ran.stderr].map(|it| shown_line(it, line));
+            format!("what it printed to stderr differs at line {line}: {ran}, not {kept}") // alloc: a difference said
+        })
     })
 }
 
@@ -418,7 +473,8 @@ pub fn differs(kept: &Value, ran: &Value) -> Option<String> {
     }
     if kept.stdout != ran.stdout {
         let line = first_line_differing(&kept.stdout, &ran.stdout);
-        return Some(format!("what it printed differs at line {line}")); // alloc: a difference said
+        let [kept, ran] = [&kept.stdout, &ran.stdout].map(|it| shown_line(it, line));
+        return Some(format!("what it printed differs at line {line}: {ran}, not {kept}")); // alloc: a difference said
     }
     fn paths(value: &Value) -> impl Iterator<Item = &str> {
         value.files.iter().map(|it| it.path.as_str())
@@ -427,11 +483,34 @@ pub fn differs(kept: &Value, ran: &Value) -> Option<String> {
         let [kept, ran]: [Vec<&str>; 2] = [paths(kept).collect(), paths(ran).collect()]; // alloc: a difference said
         return Some(format!("its OUT_DIR holds {ran:?}, not {kept:?}")); // alloc: a difference said
     }
-    kept.files
-        .iter()
-        .zip(&ran.files)
-        .find(|(a, b)| a != b)
-        .map(|(a, _)| format!("{} in its OUT_DIR differs", a.path)) // alloc: a difference said
+    kept.files.iter().zip(&ran.files).find(|(a, b)| a != b).map(|(a, b)| {
+        let shown = |it: &OutFile| match &it.bytes {
+            None => "a directory".to_owned(), // alloc: a difference said
+            Some(bytes) => format!(
+                "{} bytes{} hashing {}",
+                bytes.len(),
+                if it.executable { ", executable," } else { "" },
+                blaze_ids::ContentId::of("blaze v2 run file shown 1", bytes)
+            ), // alloc: a difference said
+        };
+        format!("{} in its OUT_DIR differs: {}, not {}", a.path, shown(b), shown(a)) // alloc: a difference said
+    })
+}
+
+/// Line `line` (from 1) of `bytes` as a difference shows it: quoted, lossy, cut at 200
+/// characters, or `no line` past the end.
+fn shown_line(bytes: &[u8], line: usize) -> String {
+    match bytes.split(|it| *it == b'\n').nth(line.saturating_sub(1)) {
+        None => "no line".to_owned(), // alloc: a difference said
+        Some(it) => {
+            let text = String::from_utf8_lossy(it);
+            let cut: String = text.chars().take(200).collect(); // alloc: a difference said
+            match cut.len() < text.len() {
+                true => format!("{cut:?}..."), // alloc: a difference said
+                false => format!("{cut:?}"), // alloc: a difference said
+            }
+        }
+    }
 }
 
 fn first_line_differing(a: &[u8], b: &[u8]) -> usize {
@@ -771,7 +850,7 @@ mod tests {
         };
         let mut done = None;
         run_until_idle(sim, &mut effects, |completion, _| done = Some(completion));
-        let completed = run.complete(done.unwrap(), store, inputs, |_| Ok(CargoRule::default()), |_| {})?;
+        let completed = run.complete(done.unwrap(), store, inputs, |_| Ok(CargoRule::default()), |_| Ok(()))?;
         Ok((completed.value, true))
     }
 
@@ -968,10 +1047,15 @@ mod tests {
         assert_eq!(differs(&value(), &value()), None);
         let mut printed = value();
         printed.stdout = b"cargo:rustc-cfg=a\ncargo:rustc-cfg=c\n".to_vec();
-        assert_eq!(differs(&value(), &printed).as_deref(), Some("what it printed differs at line 2"));
+        assert_eq!(
+            differs(&value(), &printed).as_deref(),
+            Some(r#"what it printed differs at line 2: "cargo:rustc-cfg=c", not "cargo:rustc-cfg=b""#)
+        );
         let mut file = value();
         file.files[1].bytes = Some(b"y".to_vec());
-        assert_eq!(differs(&value(), &file).as_deref(), Some("gen/a.rs in its OUT_DIR differs"));
+        let file_differs = differs(&value(), &file).unwrap();
+        assert!(file_differs.starts_with("gen/a.rs in its OUT_DIR differs: 1 bytes hashing "), "{file_differs}");
+        assert!(file_differs.contains(", not 1 bytes hashing "), "{file_differs}");
         let mut failed = value();
         failed.code = Some(1);
         assert!(differs(&value(), &failed).unwrap().contains("ended"));

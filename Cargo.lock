@@ -693,6 +693,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-codegen-code"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "glob",
+ "toml",
+]
+
+[[package]]
 name = "blaze-core"
 version = "0.0.0"
 dependencies = [
@@ -798,6 +807,7 @@ dependencies = [
  "base-db",
  "blaze-alloc-count",
  "blaze-cargo",
+ "blaze-codegen-code",
  "blaze-diagnostics",
  "blaze-format",
  "blaze-graph",
@@ -3170,6 +3180,7 @@ dependencies = [
  "hir-expand",
  "hir-ty",
  "hir-ty-borrowck",
+ "hir-ty-coherence",
  "hir-ty-matchck",
  "hir-ty-mir",
  "hir-ty-specialization",
@@ -3410,6 +3421,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-cas",
  "blaze-codegen",
+ "blaze-codegen-code",
  "blaze-core",
  "blaze-format",
  "blaze-hash",
@@ -3458,6 +3470,21 @@ dependencies = [
  "tracing",
  "triomphe",
  "wasm-encoder 0.263.0",
+]
+
+[[package]]
+name = "hir-ty-coherence"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-mem",
+ "either",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "hir-ty-mir",
+ "rustc_type_ir",
+ "tracing",
 ]
 
 [[package]]
@@ -3552,6 +3579,7 @@ dependencies = [
  "arrayvec",
  "base-db",
  "blaze-alloc-count",
+ "blaze-format",
  "blaze-hash",
  "blaze-hashcons",
  "blaze-ids",

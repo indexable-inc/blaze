@@ -39,7 +39,7 @@ use super::{
     plane::{Inline, Runner},
     work::{
         Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, KeptPut, Library, Output, Phase, Put,
-        RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer, applying,
+        RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer, applying_fallible,
     },
 };
 
@@ -71,6 +71,11 @@ thread_local! {
     static APPLIES: Cell<usize> = const { Cell::new(0) };
     /// The build script's run whose write panics as it is applied, as a maintainer's would.
     static PANICS_RUN: Cell<Option<usize>> = const { Cell::new(None) };
+    /// The build script's run whose write fails with an error as it is applied, as a real
+    /// one's does on a proc macro it cannot load.
+    static FAILS_RUN: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Each build script's run that reached the runner ([`Front::script`]), by its unit.
+    static SCRIPTS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     /// The unit whose compile panics, as a bug of blaze's would.
     static PANICS_COMPILE: Cell<Option<usize>> = const { Cell::new(None) };
     /// The unit whose compile ends in an error that is no refusal, as an `Unsupported` codegen
@@ -114,6 +119,14 @@ thread_local! {
     static OUTPUT: Cell<bool> = const { Cell::new(false) };
     /// Whether the program's compile warns twice, as its unit.
     static WARNS: Cell<bool> = const { Cell::new(false) };
+    /// Whether a writer's apply fails as a whole, an error of the writer's own that no unit's
+    /// write owns: it ends the job.
+    static FAILS_APPLY: Cell<bool> = const { Cell::new(false) };
+    /// The unit whose compile gives [`SCRIPT`] as its output at [`SCRIPT_AT`]: a build
+    /// script's program, which its run waits to be placed.
+    static SCRIPT_OUTPUT: Cell<Option<usize>> = const { Cell::new(None) };
+    /// The build script's run that ends this long after it starts, on a timer of its own.
+    static SLOW_SCRIPT: Cell<Option<(usize, Duration)>> = const { Cell::new(None) };
     /// Whether the first unit's compile shares [`SHARED`] in the standard library's shared
     /// store, as a std unit made here does.
     static SHARES: Cell<bool> = const { Cell::new(false) };
@@ -149,6 +162,9 @@ fn holds_kept(store: &Store, checkout: &str) -> bool {
     let shared = store.get(&shared_kept_key()).unwrap().is_some_and(|it| it.bytes == SHARED_KEPT);
     shared && (0..2).all(|at| store.get(&kept_key(checkout, at)).unwrap().is_some_and(|it| it.bytes == kept_value(checkout, at)))
 }
+
+const SCRIPT: &[u8] = b"\x7fELF a build script\n";
+const SCRIPT_AT: &str = "/w/target/debug/build/app-b/build-script-build";
 
 const APP: &[u8] = b"\x7fELF the program\n";
 const APP_AT: &str = "/w/target/debug/app";
@@ -229,6 +245,8 @@ impl Query for FakePlan {
         let wave = manifest.strip_prefix("wave ").and_then(|it| it.trim().parse().ok());
         Ok(Cbor(Planned::Ready(match wave {
             Some(scripts) => wave_units(&config.invocation.root, manifest, scripts),
+            None if manifest.starts_with("two scripts") => two_script_units(&config.invocation.root, manifest),
+            None if manifest.starts_with("links scripts") => links_script_units(&config.invocation.root, manifest),
             None => units(&config.invocation.root, manifest),
         })))
     }
@@ -285,6 +303,52 @@ fn units(root: &str, manifest: String) -> Units {
             unit(&app, "bin", Mode::Build, &[0, 2]),
         ],
         roots: vec![3],
+    };
+    of_graph(root, manifest, graph)
+}
+
+/// Two build scripts, each compiled (units 1 and 3) and run (2 and 4), and the program on both
+/// runs and `dep`'s library (unit 0).
+fn two_script_units(root: &str, manifest: String) -> Units {
+    let app = format!("path+file://{root}#app@0.1.0");
+    let dep = "registry+https://github.com/rust-lang/crates.io-index#dep@1.0.0".to_owned();
+    let graph = UnitGraph {
+        version: 1,
+        units: vec![
+            unit(&dep, "lib", Mode::Build, &[]),
+            unit(&app, "custom-build", Mode::Build, &[]),
+            unit(&app, "custom-build", Mode::RunCustomBuild, &[1]),
+            unit(&app, "custom-build", Mode::Build, &[]),
+            unit(&app, "custom-build", Mode::RunCustomBuild, &[3]),
+            unit(&app, "bin", Mode::Build, &[0, 2, 4]),
+        ],
+        roots: vec![5],
+    };
+    let mut units = of_graph(root, manifest, graph);
+    // The second script's program is a planned output of its compile, so its run waits for
+    // the program's placement ([`super::job`]'s `waits_for_program`).
+    units.plans[3].outputs = vec![SCRIPT_AT.to_owned()];
+    units
+}
+
+/// `dep`'s build script (compiled as unit 1, run as 2), which its library (unit 0) depends on,
+/// and the program's (compiled as 3, run as 4), whose run depends on `dep`'s run as well, the
+/// edge cargo makes for a dependency with `links` (its run is told `DEP_<links>_*`); the
+/// program (5) on `dep`'s library and its own run.
+fn links_script_units(root: &str, manifest: String) -> Units {
+    let app = format!("path+file://{root}#app@0.1.0");
+    let dep = "registry+https://github.com/rust-lang/crates.io-index#dep@1.0.0".to_owned();
+    let graph = UnitGraph {
+        version: 1,
+        units: vec![
+            unit(&dep, "lib", Mode::Build, &[2]),
+            unit(&dep, "custom-build", Mode::Build, &[]),
+            unit(&dep, "custom-build", Mode::RunCustomBuild, &[1]),
+            unit(&app, "custom-build", Mode::Build, &[]),
+            unit(&app, "custom-build", Mode::RunCustomBuild, &[3, 2]),
+            unit(&app, "bin", Mode::Build, &[0, 4]),
+        ],
+        roots: vec![5],
     };
     of_graph(root, manifest, graph)
 }
@@ -443,7 +507,7 @@ impl Steps for Fake {
             }
         };
         let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new(), broke: Vec::new() };
-        Ok(FrontEnd { front: Arc::new(FakeFront { goal: job.goal }), writer, puts: Vec::new() })
+        Ok(FrontEnd { front: Arc::new(FakeFront { goal: job.goal }), writer, puts: Vec::new(), misses: Vec::new() })
     }
 
     fn register(&self, db: &mut Database) {
@@ -535,11 +599,18 @@ impl Writer<Fake> for FakeWriter {
         if self.asked.is_empty() {
             return Ok(true);
         }
+        if FAILS_APPLY.get() {
+            return Err(ApiError::new(format!("serve-test: applying runs {:?} fails", self.asked), None));
+        }
         let Some(inputs) = Arc::get_mut(&mut self.inputs) else { return Ok(false) };
         for run in self.asked.drain(..) {
-            let applied = applying(run, "a build script's run", || {
+            let applied = applying_fallible(run, "a build script's run", || {
                 assert_ne!(PANICS_RUN.get(), Some(run), "serve-test: the run's write panics");
+                if FAILS_RUN.get() == Some(run) {
+                    return Err(ApiError::new("serve-test: the run's write fails", Some("serve-test's run".into())));
+                }
                 inputs.runs.push(run);
+                Ok(())
             });
             if let Err(broke) = applied {
                 self.broke.push(broke);
@@ -576,6 +647,7 @@ impl Writer<Fake> for FakeWriter {
 /// keeps what it did in the store.
 enum FakeRuns {
     Script(Script),
+    Slow(Slow),
     Over(Over),
     Lost(Lost),
     Keeps(Keeps),
@@ -591,6 +663,7 @@ impl Runs<Fake> for FakeRuns {
     ) -> Option<bool> {
         match self {
             FakeRuns::Script(it) => it.start(store, writer, effects, out),
+            FakeRuns::Slow(it) => it.start(store, writer, effects, out),
             FakeRuns::Over(it) => it.start(store, writer, effects, out),
             FakeRuns::Lost(it) => it.start(store, writer, effects, out),
             FakeRuns::Keeps(it) => it.start(store, writer, effects, out),
@@ -600,6 +673,7 @@ impl Runs<Fake> for FakeRuns {
     fn owns(&self, tag: Tag) -> bool {
         match self {
             FakeRuns::Script(it) => it.owns(tag),
+            FakeRuns::Slow(it) => it.owns(tag),
             FakeRuns::Over(it) => it.owns(tag),
             FakeRuns::Lost(it) => it.owns(tag),
             FakeRuns::Keeps(it) => it.owns(tag),
@@ -616,6 +690,7 @@ impl Runs<Fake> for FakeRuns {
     ) -> Option<bool> {
         match self {
             FakeRuns::Script(it) => it.complete(completion, store, writer, effects, out),
+            FakeRuns::Slow(it) => it.complete(completion, store, writer, effects, out),
             FakeRuns::Over(it) => it.complete(completion, store, writer, effects, out),
             FakeRuns::Lost(it) => it.complete(completion, store, writer, effects, out),
             FakeRuns::Keeps(it) => it.complete(completion, store, writer, effects, out),
@@ -625,6 +700,7 @@ impl Runs<Fake> for FakeRuns {
     fn cancel(&mut self, effects: &mut Vec<Effect>) -> Option<bool> {
         match self {
             FakeRuns::Script(it) => it.cancel(effects),
+            FakeRuns::Slow(it) => it.cancel(effects),
             FakeRuns::Over(it) => it.cancel(effects),
             FakeRuns::Lost(it) => it.cancel(effects),
             FakeRuns::Keeps(it) => it.cancel(effects),
@@ -634,6 +710,7 @@ impl Runs<Fake> for FakeRuns {
     fn take_puts(&mut self) -> RunPuts {
         match self {
             FakeRuns::Script(it) => it.take_puts(),
+            FakeRuns::Slow(it) => it.take_puts(),
             FakeRuns::Over(it) => it.take_puts(),
             FakeRuns::Lost(it) => it.take_puts(),
             FakeRuns::Keeps(it) => it.take_puts(),
@@ -663,6 +740,45 @@ impl Runs<Fake> for Script {
         _: &mut Vec<Response>,
     ) -> Option<bool> {
         unreachable!("it asked for nothing")
+    }
+
+    fn cancel(&mut self, _: &mut Vec<Effect>) -> Option<bool> {
+        Some(false)
+    }
+
+    fn take_puts(&mut self) -> RunPuts {
+        RunPuts::default()
+    }
+}
+
+/// A build script's run that ends on a timer of its own ([`SLOW_SCRIPT`]), its run then
+/// asked of the writer.
+struct Slow {
+    unit: usize,
+    tag: Tag,
+    after: Duration,
+}
+
+impl Runs<Fake> for Slow {
+    fn start(&mut self, _: &Store, _: Option<&mut FakeWriter>, effects: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
+        effects.push(Effect::Timer { after: self.after, tag: self.tag });
+        None
+    }
+
+    fn owns(&self, tag: Tag) -> bool {
+        tag == self.tag
+    }
+
+    fn complete(
+        &mut self,
+        _: Completion,
+        _: &mut Store,
+        writer: Option<&mut FakeWriter>,
+        _: &mut Vec<Effect>,
+        _: &mut Vec<Response>,
+    ) -> Option<bool> {
+        // A run that ends after its job left its build has no writer to ask: it fails.
+        Some(writer.is_some_and(|writer| writer.ran(self.unit, blaze_lower::Ran::default()).is_ok()))
     }
 
     fn cancel(&mut self, _: &mut Vec<Effect>) -> Option<bool> {
@@ -823,6 +939,11 @@ impl Front<Fake> for FakeFront {
             return Ok(None);
         }
         let (mut puts, mut outputs) = (Vec::new(), Vec::new());
+        if SCRIPT_OUTPUT.get() == Some(unit) {
+            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", SCRIPT));
+            puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: SCRIPT.to_vec() });
+            outputs.push(Output { path: SCRIPT_AT.into(), key, executable: true });
+        }
         if unit == 3 && OUTPUT.get() {
             let key = blaze_cas::Key(ContentId::of("blaze serve tests output", APP));
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: APP.to_vec() });
@@ -843,10 +964,12 @@ impl Front<Fake> for FakeFront {
         Diagnostic { level: Level::Error, rendered: format!("error: {what}\n"), ..warning_of_app(&what) }
     }
 
-    fn script(&self, unit: usize, _: u64) -> Result<FakeRuns, ApiError> {
-        Ok(match LOSES_RUNS.get() {
-            true => FakeRuns::Lost(Lost),
-            false => FakeRuns::Script(Script(unit)),
+    fn script(&self, unit: usize, tags: u64) -> Result<FakeRuns, ApiError> {
+        SCRIPTS.with_borrow_mut(|it| it.push(unit));
+        Ok(match (LOSES_RUNS.get(), SLOW_SCRIPT.get()) {
+            (true, _) => FakeRuns::Lost(Lost),
+            (false, Some((slow, after))) if slow == unit => FakeRuns::Slow(Slow { unit, tag: Tag(tags), after }),
+            (false, _) => FakeRuns::Script(Script(unit)),
         })
     }
 
@@ -1166,11 +1289,74 @@ fn a_build_nothing_can_move_fails_with_the_stall_naming_each_wait() {
             _ => None,
         })
         .unwrap_or_else(|| panic!("the build fails with the stall: {got:#?}"));
-    for part in ["nothing could move the build", "1 loop tasks open", "waits on node"] {
+    for part in [
+        "nothing could move the build",
+        "1 loop tasks open",
+        "waits on node",
+        "its run of user code started and waits on its effects, none of which is in flight",
+    ] {
         assert!(said.contains(part), "the stall says `{part}`: {said}");
     }
     let quiet: f64 = said["blaze stalled: for ".len()..].split(' ').next().unwrap().parse().unwrap();
     assert!((2.0..10.0).contains(&quiet), "the stall is said within seconds of the build going still: {said}");
+}
+
+/// The 2026-11-02 self-build stall: a build script's run that the plane starts while its
+/// program's placement is still in flight is held for it ([`Jobs::release_held`]); the job
+/// ends meanwhile (here the writer's apply failing as a whole, there a proc macro's write), and the held run
+/// was let go without being ended at the plane. Its node stayed running, so its request, and
+/// the job, never finished, and the build sat still with its error unsaid until the stall
+/// detector fired. A run its job ends before it starts now fails at once, naming the run and
+/// the job's error, and the build ends with that error, not a stall.
+#[test]
+fn a_build_script_run_held_for_its_program_fails_when_its_job_ends_rather_than_stalling() {
+    use super::job::{ENDED_HELD, HELD_RUNS};
+    ASKED.set(0);
+    HELD_RUNS.with_borrow_mut(Vec::clear);
+    ENDED_HELD.with_borrow_mut(Vec::clear);
+    // Script 2's compile (unit 1) places nothing, and its run ends on a 1 s timer; script 4's
+    // compile (unit 3) places its program, through writes under /w/target slowed to 5 s, so
+    // its run is held for the placement past the moment run 2 ends and its apply fails.
+    SCRIPT_OUTPUT.set(Some(3));
+    SLOW_SCRIPT.set(Some((2, Duration::from_secs(1))));
+    FAILS_APPLY.set(true);
+    let mut sim = Sim::new(41, Faults::default());
+    checkout(&mut sim, "two scripts\n");
+    sim.slow_writes(name("w/target"), Duration::from_secs(5));
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 41);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    SCRIPT_OUTPUT.set(None);
+    SLOW_SCRIPT.set(None);
+    FAILS_APPLY.set(false);
+    let held = HELD_RUNS.with_borrow_mut(std::mem::take);
+    let ended = ENDED_HELD.with_borrow_mut(std::mem::take);
+
+    // The setup did what it means to: one run was held for its program, and the job ended
+    // while it still was.
+    assert_eq!(held.len(), 1, "exactly one run is held for its program's placement: {held:?}");
+    assert_eq!(ended.len(), 1, "the held run is ended as its job ends: held {held:?}, ended {ended:?}");
+    let (node, why) = &ended[0];
+    assert_eq!(*node, held[0], "the run ended is the run held");
+    for part in ["the build script run of `app`", "never started", "its job ended while its program was still being placed", "serve-test: applying runs"] {
+        assert!(why.contains(part), "the held run's failure says `{part}`: {why}");
+    }
+
+    // The build ends with the job's own error, rather than stalling.
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let errors: Vec<&str> = got
+        .iter()
+        .filter_map(|it| match it {
+            Response::Error(error) => Some(error.what.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(!errors.iter().any(|it| it.starts_with("blaze stalled")), "the build ends, not stalls: {errors:#?}");
+    assert!(errors.iter().any(|it| it.contains("serve-test: applying runs")), "the build says the job's own error: {errors:#?}");
+    // Only the run that was never held reached the writer: the held one never started.
+    assert_eq!(ASKED.get(), 1, "the held run never starts after its job ended");
 }
 
 /// What a daemon of one `BLAZE_HOME` shares of the standard library, a daemon of another finds
@@ -2328,6 +2514,154 @@ fn a_write_that_panics_fails_the_units_after_it_and_keep_going_builds_the_rest()
     assert!(ran.contains(&(0, Phase::Store)), "dep's library, which needs no run, is built: {ran:?}");
     assert!(!ran.iter().any(|it| it.0 == 3), "the program, after the run, is never compiled: {ran:?}");
 
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+}
+
+/// A write to the front end that fails with an error as it is applied (as a real writer's does
+/// on a proc macro it cannot load) fails only the units after it, naming the write and its
+/// unit, while keep-going builds the rest: before, the error ended the whole job. The build
+/// script's run (unit 2) fails as it is applied, the program (unit 3) is never compiled, and
+/// dep's library (unit 0) is; the daemon answers the next request.
+#[test]
+fn a_write_that_fails_fails_only_the_units_after_it_and_keep_going_builds_the_rest() {
+    use super::job::REFUSED_UNITS;
+    PHASES.with(|it| it.borrow_mut().clear());
+    REFUSED_UNITS.with_borrow_mut(Vec::clear);
+    FAILS_RUN.set(Some(2));
+    let mut sim = Sim::new(46, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 46);
+    let mut client = dial(&mut daemon);
+    let cargo = blaze_api::Cargo {
+        cwd: "/w".into(),
+        env: Vec::new(),
+        args: vec!["--keep-going".into()],
+        root: "/w".into(),
+        color: false,
+        files: Vec::new(),
+        width: None,
+        command: "build".into(),
+        refused: None,
+        verbose: 0,
+    };
+    let targets = Targets { cargo: Some(cargo), ..agent() };
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
+    let got = client.wait(&mut daemon, id);
+    FAILS_RUN.set(None);
+
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let named = got.iter().any(|it| {
+        matches!(it, Response::Error(error) if error.what.starts_with("applying a build script's run of custom-build of ")
+            && error.what.contains("it failed at serve-test's run: serve-test: the run's write fails"))
+    });
+    assert!(named, "the build's error names the write, its unit, where it failed and why: {got:#?}");
+    // The program, which depends on the run, is refused naming the write and its unit.
+    let refused = REFUSED_UNITS.with_borrow_mut(std::mem::take);
+    let program: Vec<&String> = refused.iter().filter(|(unit, _)| *unit == 3).map(|(_, why)| why).collect();
+    assert!(!program.is_empty(), "the program is refused: {refused:#?}");
+    for why in program {
+        for part in ["a write it depends on broke", "applying a build script's run of custom-build of path+file://", "#app@0.1.0", "it failed at serve-test's run"] {
+            assert!(why.contains(part), "the program's refusal says `{part}`: {why}");
+        }
+    }
+    assert!(refused.iter().all(|(unit, _)| *unit == 3), "only what depends on the run is refused: {refused:#?}");
+    let ran = PHASES.with(|it| it.take());
+    assert!(ran.contains(&(0, Phase::Store)), "dep's library, which needs no run, is built: {ran:?}");
+    assert!(!ran.iter().any(|it| it.0 == 3), "the program, after the run, is never compiled: {ran:?}");
+
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+}
+
+/// Without `--keep-going`, a write that fails as it is applied ends the job at once, as a
+/// writer's own error does. Before, it only failed the job's result, and the plane failed fast
+/// once the program, which depends on the run, was posted, which waited for the program's other
+/// dependency: here the second build script's run (unit 4), on a timer of an hour. The first
+/// run's write (unit 2) fails; the job ends without that run ever finishing, well inside its
+/// hour, with the write named, and the daemon answers the next request.
+#[test]
+fn without_keep_going_a_write_that_fails_ends_the_job_at_once() {
+    ASKED.set(0);
+    FAILS_RUN.set(Some(2));
+    SLOW_SCRIPT.set(Some((4, Duration::from_secs(3600))));
+    let mut sim = Sim::new(47, Faults::default());
+    checkout(&mut sim, "two scripts\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 47);
+    let mut client = dial(&mut daemon);
+    let began = daemon.driver().now();
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    let took = daemon.driver().now() - began;
+    FAILS_RUN.set(None);
+    SLOW_SCRIPT.set(None);
+
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let named = got.iter().any(|it| {
+        matches!(it, Response::Error(error) if error.what.starts_with("applying a build script's run of custom-build of ")
+            && error.what.contains("it failed at serve-test's run: serve-test: the run's write fails"))
+    });
+    assert!(named, "the build's error names the write, its unit and its error: {got:#?}");
+    assert_eq!(ASKED.get(), 1, "the slow run never finished to ask its write: the job ended first");
+    assert!(took < Duration::from_secs(3600), "the job ended without waiting for the slow run: it took {took:?}");
+
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+}
+
+/// A build script's run refused by a write that broke never reaches the runner. The plane
+/// hands a run to the loop directly, never through the post that refuses a task, so a run that
+/// ended well at the plane let its dependent run start: here the program's build script run
+/// (unit 4), after `dep`'s (unit 2) through the edge cargo makes for a `links` dependency.
+/// `dep`'s run's write fails as it is applied (its run on a timer, so every compile is done by
+/// then); under keep-going the program's run fails naming that write and its unit, and its user
+/// code never runs.
+#[test]
+fn a_build_script_run_after_a_write_that_failed_never_reaches_the_runner() {
+    use super::job::REFUSED_UNITS;
+    REFUSED_UNITS.with_borrow_mut(Vec::clear);
+    SCRIPTS.with_borrow_mut(Vec::clear);
+    FAILS_RUN.set(Some(2));
+    SLOW_SCRIPT.set(Some((2, Duration::from_secs(1))));
+    let mut sim = Sim::new(48, Faults::default());
+    checkout(&mut sim, "links scripts\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 48);
+    let mut client = dial(&mut daemon);
+    let cargo = blaze_api::Cargo {
+        cwd: "/w".into(),
+        env: Vec::new(),
+        args: vec!["--keep-going".into()],
+        root: "/w".into(),
+        color: false,
+        files: Vec::new(),
+        width: None,
+        command: "build".into(),
+        refused: None,
+        verbose: 0,
+    };
+    let targets = Targets { cargo: Some(cargo), ..agent() };
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
+    let got = client.wait(&mut daemon, id);
+    FAILS_RUN.set(None);
+    SLOW_SCRIPT.set(None);
+    let scripts = SCRIPTS.with_borrow_mut(std::mem::take);
+    let refused = REFUSED_UNITS.with_borrow_mut(std::mem::take);
+
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    assert_eq!(scripts, vec![2], "only dep's run reached the runner; the program's, after it, never did");
+    let run: Vec<&String> = refused.iter().filter(|(unit, _)| *unit == 4).map(|(_, why)| why).collect();
+    let [why] = &run[..] else { panic!("the program's run is refused once: {refused:#?}") };
+    for part in ["a write it depends on broke", "applying a build script's run of custom-build of registry+", "#dep@1.0.0", "it failed at serve-test's run"] {
+        assert!(why.contains(part), "the run's refusal says `{part}`: {why}");
+    }
+
+    daemon.driver().change(&name("w/Cargo.toml"), b"[package]\n");
     let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
