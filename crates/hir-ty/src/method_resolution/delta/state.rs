@@ -534,11 +534,15 @@ impl Begun<'_> {
             {
                 let db = self.db;
                 let job = self.job.as_mut().expect("taken above");
-                let _span = tracing::info_span!(
-                    target: "blaze",
-                    "impls node",
-                    krate = hir_def::span_names::crate_name(db, job.krate),
-                    predicted_ns = self.nodes.predicted[node as usize],
+                let _span = hir_def::span_names::with_crate(
+                    db,
+                    job.krate,
+                    tracing::info_span!(
+                        target: "blaze",
+                        "impls node",
+                        krate = tracing::field::Empty,
+                        predicted_ns = self.nodes.predicted[node as usize],
+                    ),
                 )
                 .entered();
                 #[cfg(test)]
@@ -784,10 +788,10 @@ fn forget_reads(state: &mut State, imp: ImplId) {
 /// state alone, so the crates' works run at once.
 fn work_crate(db: &Db, shared: &Shared<'_>, job: &mut Job) {
     let krate = job.krate;
-    let _span = tracing::info_span!(
-        target: "blaze",
-        "impls crate",
-        krate = hir_def::span_names::crate_name(db, krate)
+    let _span = hir_def::span_names::with_crate(
+        db,
+        krate,
+        tracing::info_span!(target: "blaze", "impls crate", krate = tracing::field::Empty),
     )
     .entered();
     macro_rules! phase {
@@ -822,10 +826,10 @@ fn work_crate(db: &Db, shared: &Shared<'_>, job: &mut Job) {
 /// its node's), its state put back, its delta handed on and its work reported.
 fn finish_crate(db: &mut Db, state: &mut State, job: Job, out: &mut Vec<ImplsDelta>) {
     let Job { krate, mut crate_state, mut scratch, mut work, .. } = job;
-    let _span = tracing::info_span!(
-        target: "blaze",
-        "impls publish",
-        krate = hir_def::span_names::crate_name(&*db, krate)
+    let _span = hir_def::span_names::with_crate(
+        &*db,
+        krate,
+        tracing::info_span!(target: "blaze", "impls publish", krate = tracing::field::Empty),
     )
     .entered();
     replay(state, &mut scratch, krate);

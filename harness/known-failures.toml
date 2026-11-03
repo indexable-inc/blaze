@@ -39,7 +39,6 @@ crates = ["blaze-engine"]
 
 [crates.blaze-cargo]
 "blaze_cargo::sandbox::linux::tests::a_confined_sandbox_writes_only_where_it_may_and_reaches_nothing" = { owner = "https://github.com/indexable-inc/blaze/issues/960", cause = "fails when blaze builds and tests it on Linux (from unittests.py OPEN_BLAZE)", only = { runner = "blaze", os = "linux" } }
-"blaze_cargo::serve::tests::serve_takes_activated_alone_and_names_it_among_its_flags" = { owner = "v2-sched-qos", cause = "serve's flag error now lists `--stall-bound SECS`; the test still expects \"`--activated` and `--ready-fd N`, not `--activated=yes`\"" }
 "blaze_cargo::socket::tests::a_client_that_never_reads_is_given_up_on" = { owner = "https://github.com/indexable-inc/blaze/issues/892", cause = "fails when blaze builds and tests it, not under rustc (from unittests.py OPEN_BLAZE)", only = { runner = "blaze" } }
 "blaze_cargo::socket::tests::a_directory_others_can_swap_is_refused" = { owner = "https://github.com/indexable-inc/blaze/issues/892", cause = "fails when blaze builds and tests it, not under rustc (from unittests.py OPEN_BLAZE)", only = { runner = "blaze" } }
 "blaze_cargo::socket::tests::a_log_that_was_there_becomes_the_users_alone" = { owner = "https://github.com/indexable-inc/blaze/issues/892", cause = "fails when blaze builds and tests it, not under rustc (from unittests.py OPEN_BLAZE)", only = { runner = "blaze" } }
@@ -132,7 +131,6 @@ crates = ["blaze-engine"]
 
 [crates.blaze-macro-eval]
 "blaze_macro_eval::run::describe::tests::memory_past_its_bound_stops_saying_so" = { owner = "unowned", cause = "front-end MIR UnresolvedMethod(\"[overloaded index]\") in the evaluator; v2-pm-wasm.md:84 and v2-pm-par.md:120 both disclaim" }
-"blaze_macro_eval::wasm::tests::probe_real_module_statics" = { owner = "v2-pm-wasm", cause = "wasm macro statics not carried between calls (pm-wasm C1)" }
 
 [crates.blaze-manifest]
 "config_get::config_fixtures_read_as_cargo_reads_them" = { owner = "unowned", cause = "`config get --show-origin` for a runner list differs from cargo's" }
@@ -184,6 +182,7 @@ crates = ["blaze-engine"]
 "hir_ty::method_resolution::delta::tests::a_dependency_served_from_its_image_keeps_impl_tables_over_the_decoded_map" = { owner = "v2-nameres-panic", cause = "nameres maintainer apply runs crate_local_def_map: finish_crate's served_delta calls crate_def_map inside apply (hir-def nameres/delta.rs), tripping maintain.rs's reads/apply check" }
 "hir_ty::next_solver::goal_store::tests::the_solver_version_covers_every_patch" = { owner = "v2-uint", cause = "SOLVER_FILES (next_solver/goal_store.rs) lacks the new 0011 patches (v2-uint) and 0012-deep-folds-guarded (v2-identity-port.md:1291)" }
 "hir_ty::tests::budget::a_cold_infer_allocates_its_result_alone" = { owner = "unowned", cause = "cold infer makes 65 allocations, result owns 22; routed to sol-all-ty (01441) by v2-no-fallback-front.md:43, which has no handoff" }
+"hir_ty::tests::fn_item_predicates::a_fn_item_with_a_reference_to_dyn_fn_parameter_meets_fn_of_every_lifetime" = { owner = "v2-sb-frontend2", cause = "`as_static` (`&dyn Fn(usize, &(dyn Fn(usize) + 'static))` from `&with_static`) is a TypeMismatch with an error region; the test is new in sb-frontend2, whose fix passes the other shapes; on cp36 a404bdfc8a with the test added every shape fails (cp37-521)" }
 
 [crates.hir-ty-borrowck]
 "hir_ty_borrowck::budget::a_large_clean_body_and_smaller_ones_after_it_allocate_nothing" = { owner = "unowned", cause = "closures: 16 bytes, 1 global allocation; v2-main-green.md:54-60 owes a revert run, v2-dropck-overflow.md:40 says it failed before" }
@@ -250,9 +249,6 @@ crates = ["blaze-engine"]
 "hir_ty_mir::tests::traits::trait_object_no_coercion" = { owner = "v2-no-fallback-front-ty-next1", cause = "expect-test type dump moved: `dyn Trait + 'static` now prints the elided reference lifetime (ty-next1 01551)" }
 "mir::alloc_budget::lowering_allocates_the_kept_body_and_its_setup_only" = { owner = "unowned", cause = "MIR lowering / warm interpreter allocation counts over budget" }
 "mir::alloc_budget::warm_interpreter_calls_allocate_nothing" = { owner = "unowned", cause = "MIR lowering / warm interpreter allocation counts over budget" }
-"mir::devirt::object_the_program_never_makes_is_read_as_absent" = { owner = "v2-devirt", cause = "fails; its panic message was cut from the runner's 40-line tail by the backtrace (rerun it to read it)" }
-"mir::devirt::one_type_closed_is_called_directly" = { owner = "v2-devirt", cause = "fails; its panic message was cut from the runner's 40-line tail by the backtrace (rerun it to read it)" }
-"mir::devirt::open_object_stays_virtual_saying_why" = { owner = "v2-devirt", cause = "panics at crates/hir-ty-mir/tests/mir/../../src/mir/optimize/devirt/fixtures.rs: assertion `left == right` failed" }
 
 [crates.proc-macro-api]
 "proc_macro_api::kept::puts::tests::a_record_verify_says_to_put_is_published_durable" = { owner = "v2-portable-keys", cause = "publish hands back the expansion's ticket, not the record's own" }

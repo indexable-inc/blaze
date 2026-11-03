@@ -154,8 +154,8 @@ search's list, and says `Documenting`, `Finished` and `Generated` (or `Opening`,
 page with `$BROWSER` or the system's opener, for `--open`) as cargo does. What `cargo doc`
 reads and blaze can't honor yet stops it with an error naming it: rustdoc's flags
 (`RUSTDOCFLAGS`, `build.rustdocflags`, `target.<triple>.rustdocflags`), `doc.browser` under
-`--open`, a JSON `--message-format`, `--unit-graph` and `--timings`; doctests are refused as
-`test --doc` is. What the pages hold is in [doc.md](doc.md), a record of v1's
+`--open`, a JSON `--message-format`, `--unit-graph` and `--timings`; doctests are
+`blaze test --doc`'s. What the pages hold is in [doc.md](doc.md), a record of v1's
 `blaze doc`, which wrote them from the same crate.
 
 While a build waits, the client prints each unit's lines as the daemon sends them; there is no
@@ -225,7 +225,7 @@ terminal, with the variables and working directory cargo gives, cargo's `Running
 the doc tests, stopping at the first that fails unless `--no-fail-fast`; `--no-run` lists them.
 That runs every test, outside any sandbox, as cargo does. blaze's `--reached` runs only the
 tests an edit can have changed, in the daemon, and `--ub` runs them in blaze's evaluator
-([below](#which-tests-run)). v2's daemon makes no doctest yet (below).
+([below](#which-tests-run)). Doc tests are blaze's own build of each example (below).
 
 ### Sandboxed tests (an experiment, opt-in)
 
@@ -683,10 +683,15 @@ plans the units and builds them, or stops with an error naming what it can't do 
 ([above](#what-a-build-does)). A changed manifest, `Cargo.lock` or configuration file is read
 again by the next request; there is no cargo build in between.
 
-Doc tests are not run: v1 ran them itself, with no cargo, rustc or rustdoc, and that code
-was deleted on 2026-10-30. The daemon makes no doctest yet (the agent API has the artifact
-kind, `ArtifactKind::Doctest`, and `blaze test` runs any it is given), so `blaze test` runs a
-library's unit and integration tests and none of its examples.
+Doc tests are built by blaze, never rustdoc: `blaze test` plans a library's doctest unit as
+cargo does, and `blaze test --doc` plans only those. The daemon finds the examples with
+rustdoc's rules and makes each its own crate, program and process, never merged; the unit's
+program is a libtest runner that runs each under rustdoc's name and judges it as rustdoc
+does. The examples are built side by side, an edit of one example rebuilds and relinks that
+one alone, and a `test_harness` example is built as a test under its own libtest harness, as
+rustdoc's `--test` builds it. A unit blaze can't build fails alone: under
+`--keep-going`, which `blaze test` and `blaze bench` take (cargo refuses it there), every
+other unit's tests still run. The design and what is left are in [v2/plan/doctests.md](v2/plan/doctests.md).
 
 ## The daemon
 
@@ -765,6 +770,22 @@ another volume than the store) fails the build, naming both volumes, and nothing
 instead. Each build reports the bytes it placed by clone, wrote and copied in its `blaze-work`
 line (`placed`). `OUT_DIR`s are still written whole on restore and `doc` pages by the client.
 
+The packages a build fetches (registry `.crate`s and git checkouts) are kept in `<root>/sources`,
+laid out as cargo lays out its home (`registry/src/<registry dir>/<name>-<version>`,
+`git/checkouts/<ident>/<commit>`, the whole commit where cargo takes a short one): each is
+mounted there for the front end and written there whole at its fetch (into a directory beside
+it, its files read-only, then renamed), because a build script runs in its package's directory,
+and its sandbox is given that directory, as are the C compiler and the other programs it runs.
+The last file written into each is `.blaze-ok`, the content id of its files: a copy without it
+or with another id (edited in place, written by another fetch) is refused by name, never read
+as the package. A write is refused anywhere but under `registry/src/` and `git/checkouts/` of
+`<root>/sources`, and a lock file's package name that cargo refuses, or a git commit that is no
+object id, is refused before any fetch. blaze keeps no packages in `$CARGO_HOME` (it still
+reads `$CARGO_HOME/config.toml`, as cargo does): a machine with no `~/.cargo` builds the same.
+A package whose copy was deleted is fetched again at the daemon's next start, and a write a
+stopped daemon left half done (`.<name>.part-<pid>-<n>`) is removed then
+(`crates/blaze-cargo/src/serve/fetch.rs`, `keep_on_disk` and `sweep_parts`).
+
 `--target-dir`, `CARGO_TARGET_DIR` and `build.target-dir` still name the directory, as tools
 and scripts pass them; `build.build-dir` still names where the intermediate files go. The paths
 blaze prints (a test executable, `blaze doc`'s pages) are the real ones, and `cargo metadata`'s
@@ -817,23 +838,50 @@ it). From then on the `blaze` anyone runs in that workspace runs that
 release, as Bazelisk runs the Bazel a `.bazelversion` names: when it is another release
 itself, it runs `~/.blaze/versions/<version>/blaze` (`$BLAZE_HOME/versions` with `BLAZE_HOME`)
 with the same arguments, and when that is not there it first downloads
-`blaze-v<version>-<host>.tar.gz` from the release on GitHub, checks its BLAKE3 hash against
-the release's `B3SUMS` and unpacks it there. The network is used only then, once per
-release. A pinned release that can't be fetched (offline, no such release, no `B3SUMS`, no
-build for this host, another hash) is an error, and no other blaze builds in its place.
+`blaze-v<version>-<host>.tar.gz` from the release on GitHub, checks it against every list of
+sums the release publishes (`SHA256SUMS`, which every release has, and `B3SUMS`, BLAKE3, which
+every release dated 2026-10-31 or later has too, and is refused without) and unpacks it there.
+The sums come from the same release as the archive, so they catch a corrupt or cut-short
+download, not a release whose assets someone replaced ([release.md](release.md) has the plan
+for that). The network is used only then, once per release, over HTTPS only (a redirect to
+plain HTTP is refused) and at most 1 GiB per asset. A pinned release that can't be fetched or
+checked (offline, no such release, neither list, no build for this host, another hash in either
+list) is an error, and no other blaze builds in its place.
 `BLAZE_RELEASES` names a mirror laid out as
-`https://github.com/indexable-inc/blaze/releases/download` (`<mirror>/v<version>/<asset>`),
-or a directory of `v<version>` directories of the assets. `blaze --version` says which
-blaze runs and why: as the workspace pins it, or as nothing pins one. `--manifest-path`
-picks the workspace a command is for, as it does for cargo.
+`https://github.com/indexable-inc/blaze/releases/download` (`<mirror>/v<version>/<asset>`,
+an `https://` address; `http://` is refused), or a directory of `v<version>` directories of
+the assets. `--manifest-path` picks the workspace a command is for, as it does for cargo.
+
+A build of blaze's source tree (`blaze 0.0.0-dev`, built without `BLAZE_RELEASE`) runs itself
+in blaze's own tree, whatever that pins: that is how blaze's tree, which pins a release for
+everyone else, builds itself. blaze's tree is any workspace whose root holds
+`crates/blaze-engine/Cargo.toml` naming the package `blaze-engine`, wherever it is (a worktree,
+a copy in a VM, the source of a Nix build, a fork). In any other workspace that pins a release
+it hands off to that release as a release does, with one line on stderr naming its own
+version, the pin and the manifest, and saying `--ignore-pin` runs it instead.
+`--ignore-pin`, as the first word after `blaze` (`blaze --ignore-pin build`), runs the blaze it
+is given to in place of whatever the workspace pins, a release or a build of the tree: how a
+build of blaze is tried on a pinned project. Anywhere else it is the command's own word
+(`blaze run --bin tool x --ignore-pin` passes it to `tool`). It applies to that one command's
+workspace: blaze sets `BLAZE_IGNORE_PIN_FOR` to its root manifest for the processes under it, so
+a blaze a test or build script runs there (`$CARGO`) runs itself too, and one run in another
+workspace (a test's temporary one) follows that workspace's pin. Likewise `BLAZE_PINNED_BY`,
+which the blaze that hands off sets for the release it runs, holds only in the workspace it
+names.
+
+`blaze --version` answers in any workspace and says which blaze runs and why: as the workspace
+pins it, as a build of blaze's tree in that tree, as `--ignore-pin` says, or as nothing pins
+one; where the pinned one runs in its place it first names it, and where the pinned one can't
+run (it can't be fetched or its pin can't be read) it prints this blaze's version and why.
 
 The pin may name a channel instead of a version ([release.md](release.md)):
 `version = "stable"` runs the newest release that passed the heavy tests, and
 `version = "canary"` the newest release. blaze reads which release the channel names from its
 pointer (`<releases>/channels/<channel>`, one small download, through `BLAZE_RELEASES` too),
 keeps it in `~/.blaze/channels/<channel>` and reads it again after an hour; that release is
-then run as a pinned version is. When the pointer can't be read (offline), the release it named
-when last read runs, with a line saying so; with none read before, it is an error. A pin to a
+then run as a pinned version is. When the pointer can't be read again once the hour has passed
+(offline), it is an error naming the release it named when last read, which does not run in
+its place; `blaze version-resolve <channel>` reads it again. A pin to a
 version stays on that release, whose bytes never change: promotion from canary to stable flips
 the same release.
 
@@ -905,9 +953,14 @@ Native code is never Cranelift's: stencils at 0 and 1 (a tail call, `become`, in
 target with no stencil library stops at those levels with an error naming it. Stencil code
 built to keep counts nothing; only a tiered run's counts its calls. A proc macro's wasm module
 is the one place Cranelift's code generator runs. `codegen-backend = "cranelift"` at 0 or 1
-asks for the fast unoptimized code stencils are, and is taken. The standard library's own
-functions are compiled as rustc's shipped std is, at `-O3`. A blaze built without LLVM refuses
-a profile that asks for it, saying so, rather than building it with stencils.
+asks for the fast unoptimized code stencils are, and is taken; at 2 and up it is an error.
+`codegen-backend = "stencil"` compiles every function of the build as stencils whatever its
+level, the standard library's and what build scripts and proc macros run included. It is the
+seed's setting (todo/bootstrap/plan.md, "std and assembly in the seed"), works with or without
+LLVM, and is taken for a whole build from the profile, never per package. Otherwise the
+standard library's own functions are compiled as rustc's shipped std is, at `-O3`, and a blaze
+built without LLVM refuses a profile that asks for LLVM, saying so and naming
+`codegen-backend = "stencil"`, rather than building it with stencils.
 
 Each function's code is kept by the backend and level that compiled it, which are part of its
 spec's hash (`crates/blaze-codegen/src/settings.rs`): stencil code is never given to a build

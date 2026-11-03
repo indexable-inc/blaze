@@ -866,13 +866,6 @@ struct Tok<'t> {
     newline_before: bool,
 }
 
-/// The punctuation of more than one character rustc's lexer makes one token of; each one's
-/// prefixes are ones too.
-const GLUED: &[&str] = &[
-    "!=", "%=", "&&", "&=", "*=", "+=", "-=", "->", "..", "...", "..=", "/=", "::", "<-", "<<", "<<=", "<=", "==", "=>",
-    ">=", ">>", ">>=", "^=", "|=", "||",
-];
-
 /// The tokens between a token tree's delimiters, nested trees opened, trivia left out.
 fn flatten(tt: ast::TokenTree<'_>) -> SmallVec<[Tok<'_>; 16]> {
     let mut elements = tt.syntax().children_with_tokens().peekable();
@@ -932,9 +925,9 @@ fn is_glue(kind: SyntaxKind) -> bool {
     kind.is_punct() && !kind.is_l_delimiter() && !kind.is_r_delimiter()
 }
 
+/// Whether rustc's lexer makes one token of `first` and `then` written together ([`tt::glue`]).
 fn is_glued(first: &str, then: &str) -> bool {
-    let len = first.len() + then.len();
-    GLUED.iter().any(|it| it.len() == len && it.starts_with(first) && it.ends_with(then))
+    tt::glue_str(first, then).is_some()
 }
 
 /// rustc's parser of the tokens of a meta list (`parse_in` of `parse_meta_seq_top`), with the

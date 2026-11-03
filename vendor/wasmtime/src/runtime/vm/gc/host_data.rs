@@ -1,0 +1,119 @@
+//! Implementation of the side table for `externref` host data.
+//!
+//! The actual host data is kept in a side table, rather than inside the GC
+//! heap, because we do not trust any data coming from the GC heap. If we
+//! constructed `&dyn Any`s from GC heap data and called any function loaded
+//! from the `dyn Any`'s vtable, then any bug in our collector could lead to
+//! corrupted vtables, which could lead to security vulnerabilities and sandbox
+//! escapes.
+//!
+//! Much better to store host data IDs inside the GC heap, and then do checked
+//! accesses into the host data table from those untrusted IDs. At worst, we can
+//! return the wrong (but still valid) host data object or panic. This is way
+//! less catastrophic than doing an indirect call to an attacker-controlled
+//! function pointer.
+
+use crate::bail_bug;
+use crate::prelude::*;
+use core::any::Any;
+use wasmtime_core::{
+    alloc::PanicOnOom,
+    slab::{Id, Slab},
+};
+
+/// Side table for each `externref`'s host data value.
+#[derive(Default)]
+pub struct ExternRefHostDataTable {
+    slab: Slab<Box<dyn Any + Send + Sync>>,
+}
+
+/// ID into the `externref` host data table.
+///
+/// Not every bit pattern is a valid ID, so this must never be a field of a
+/// type reinterpreted from GC heap bytes; use `into_raw` and `from_raw`
+/// instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExternRefHostDataId(Id);
+
+impl ExternRefHostDataId {
+    /// Get the raw `u32` to store in the GC heap for this ID.
+    ///
+    /// Biased by one so that zero is never a valid encoding.
+    pub fn into_raw(self) -> u32 {
+        self.0.into_raw() + 1
+    }
+
+    /// Resolve a raw ID loaded from the GC heap, if it is well-formed.
+    ///
+    /// A well-formed ID is not necessarily a live one; lookups are still
+    /// checked.
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        let id = raw.checked_sub(1)?;
+        Some(ExternRefHostDataId(Id::try_from_raw(id)?))
+    }
+}
+
+fn deref_box<T: ?Sized>(b: &Box<T>) -> &T {
+    &**b
+}
+
+fn deref_box_mut<T: ?Sized>(b: &mut Box<T>) -> &mut T {
+    &mut **b
+}
+
+impl ExternRefHostDataTable {
+    /// Allocate a new `externref` host data value.
+    pub fn alloc(&mut self, value: Box<dyn Any + Send + Sync>) -> ExternRefHostDataId {
+        // TODO(#12069): handle allocation failure here
+        let id = self.slab.alloc(value).panic_on_oom();
+        let id = ExternRefHostDataId(id);
+        log::trace!("allocated new externref host data: {id:?}");
+        id
+    }
+
+    /// Deallocate an `externref` host data value.
+    pub fn dealloc(&mut self, id: ExternRefHostDataId) -> Result<Box<dyn Any + Send + Sync>> {
+        // Verify this exists before deleting it
+        self.get(id)?;
+        log::trace!("deallocated externref host data: {id:?}");
+        Ok(self.slab.dealloc(id.0))
+    }
+
+    /// Get a shared borrow of the host data associated with the given ID.
+    pub fn get(&self, id: ExternRefHostDataId) -> Result<&(dyn Any + Send + Sync)> {
+        let data: &Box<dyn Any + Send + Sync> = match self.slab.get(id.0) {
+            Some(data) => data,
+            None => bail_bug!("invalid `ExternRefHostDataId`"),
+        };
+        Ok(deref_box(data))
+    }
+
+    /// Get a mutable borrow of the host data associated with the given ID.
+    pub fn get_mut(&mut self, id: ExternRefHostDataId) -> Result<&mut (dyn Any + Send + Sync)> {
+        let data: &mut Box<dyn Any + Send + Sync> = match self.slab.get_mut(id.0) {
+            Some(data) => data,
+            None => bail_bug!("invalid `ExternRefHostDataId`"),
+        };
+        Ok(deref_box_mut(data))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn correct_dyn_object() {
+        let mut table = ExternRefHostDataTable::default();
+
+        let x = 42_u32;
+        let id = table.alloc(Box::new(x));
+        assert!(table.get(id).unwrap().is::<u32>());
+        assert_eq!(*table.get(id).unwrap().downcast_ref::<u32>().unwrap(), 42);
+        assert!(table.get_mut(id).unwrap().is::<u32>());
+        assert_eq!(
+            *table.get_mut(id).unwrap().downcast_ref::<u32>().unwrap(),
+            42
+        );
+    }
+}

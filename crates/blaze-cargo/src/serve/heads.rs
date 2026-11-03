@@ -140,7 +140,8 @@ pub fn named(request: &Request) -> Vec<&str> {
 }
 
 /// Whether `request` runs user code (build scripts, proc macros, tests, a binary), whose checks
-/// of their inputs outside views read the watches' round.
+/// of their inputs outside views read the watches' round. A reach, an edit and a build ahead
+/// build their views' proc macros and run their build scripts before they read them.
 pub fn runs_user_code(request: &Request) -> bool {
     matches!(
         request,
@@ -152,6 +153,8 @@ pub fn runs_user_code(request: &Request) -> bool {
             | Request::Verify { .. }
             | Request::Pack { .. }
             | Request::Doc { .. }
+            | Request::Reach { .. }
+            | Request::Edit { .. }
             | Request::WillTest { .. }
             | Request::WillSave { .. }
     )
@@ -586,6 +589,8 @@ mod tests {
         assert!(runs_user_code(&Request::Verify { view: view(), targets: targets.clone() }));
         let ahead = Request::WillTest { view: view(), filter: Vec::new(), targets: targets.clone(), wait_ms: 0 };
         assert!(runs_user_code(&ahead));
+        let edit = Request::Edit { base: ContentId::of("heads test", b"root"), head: "/w".to_owned(), edits: Vec::new() };
+        assert!(runs_user_code(&edit), "an edit builds its view's proc macros and runs its build scripts first");
         assert!(!runs_user_code(&Request::Trace { view: view(), targets }));
         assert!(!runs_user_code(&Request::Open { view: view() }));
         assert!(!runs_user_code(&Request::Status));

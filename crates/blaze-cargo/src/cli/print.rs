@@ -10,7 +10,8 @@
 //! bitset, and a unit by its own ([`blaze_api::UnitOf::id`]) in a `u32` column: no hash and no
 //! compare. A unit seen first keeps the two names its summary prints, copied once into one text
 //! buffer. A diagnostic is deduplicated by a 64-bit hash of its text, as cargo's `DiagDedupe`
-//! does, never a copy of it. Once the printer's tables have grown to the build's size, printing
+//! does, never a copy of it; an error with no span, a unit's own failure, is printed for each
+//! unit it fails. Once the printer's tables have grown to the build's size, printing
 //! a response allocates nothing.
 //!
 //! `--message-format=short` prints as `human` does (cargo's `on_stderr_line_inner` takes both
@@ -123,6 +124,8 @@ struct Unit {
     target: Name,
     kind: TargetKind,
     test: bool,
+    /// The library's doc tests, named as such when they fail.
+    doctest: bool,
     /// A path package, whose summary hints at `cargo fix`.
     local: bool,
 }
@@ -421,8 +424,13 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         let writes = renders || diagnostic.unit.is_none();
         // cargo takes one newline off the end, then writes the text and a newline.
         let rendered = diagnostic.rendered.strip_suffix('\n').unwrap_or(diagnostic.rendered);
+        // An error with no span is a unit's own failure (a refusal of blaze's, a build script
+        // that failed), said once a unit: deduplicated, a second unit failing with the same
+        // words printed only its "could not compile" (selfbuild2: psm's and llvm-sys's build
+        // scripts). Spanned diagnostics are deduplicated as cargo's `DiagDedupe` does.
+        let own_failure = diagnostic.level == Level::Error && diagnostic.spans.is_empty();
         let printed = match writes {
-            true => self.printed.insert(FixedState.hash_one(rendered)),
+            true => own_failure || self.printed.insert(FixedState.hash_one(rendered)),
             false => true,
         };
         if writes && printed {
@@ -476,7 +484,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         let package = name(&mut self.names, say::package_name(unit.package_id));
         let target = name(&mut self.names, unit.target.name);
         let local = unit.package_id.starts_with("path+");
-        self.units.push(Unit { package, target, kind: unit.target.kind, test: unit.test, local });
+        self.units.push(Unit { package, target, kind: unit.target.kind, test: unit.test, doctest: unit.doctest, local });
         let warned = say::Warned { fixable: Some(0), ..say::Warned::default() };
         self.counted.push(Counted { warned, ..Counted::default() });
         Ok(Some(row))
@@ -536,8 +544,9 @@ fn summary(line: &mut String, unit: &Unit, names: &str, counted: &Counted, shown
         });
     }
     if counted.errors > 0 {
-        say::leveled_with(line, say::ERROR, "error", shown.color, |line| {
-            say::could_not_compile_into(line, package, target, unit.test, counted.errors, counted.warnings);
+        say::leveled_with(line, say::ERROR, "error", shown.color, |line| match unit.doctest {
+            true => say::doctests_could_not_compile_into(line, package, counted.errors, counted.warnings),
+            false => say::could_not_compile_into(line, package, target, unit.test, counted.errors, counted.warnings),
         });
     }
 }

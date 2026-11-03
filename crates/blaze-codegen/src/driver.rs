@@ -204,6 +204,11 @@ pub struct Built {
     pub owners: Vec<(InstanceKey, Owner, CodeHash)>,
     /// Every static by item and instance, whose it is.
     pub static_owners: Vec<(ItemKey, ContentId, Owner)>,
+    /// Every instance the walk reached whose body is written in a workspace crate
+    /// ([`Described::editable`]), by key: the code a lint of the workspace's code reports on
+    /// (`blaze::vecreport`). Not [`Self::owners`], which says what a dependency image holds
+    /// and, in a build that links none, makes every crate but the library's the workspace's.
+    pub editable: Vec<InstanceKey>,
     /// Of each of [`Built::inputs`], in its order, what test selection keys it by: what it is
     /// across versions and its code as it runs ([`crate::exec::fn_id`], `exec::bound`). A bound its item has none of is the error a test binary's
     /// [`crate::exec::ExecTable`] names, and no build's but its.
@@ -611,7 +616,9 @@ struct Job<'n, B: Prepare> {
     node: &'n Node<B>,
 }
 
-/// A body `function` built in that none of `keys` is: code its store key does not hold.
+/// A body `function` built in that none of `keys` is: code its store key does not hold. Each
+/// held body holds its [`Described::held_codes`]: an import of it is its own code, a copy built
+/// into a caller is its built-in code.
 fn unkept_inline<I, S>(
     nodes: &Sorted<InstanceKey, FnNode<I, S>>,
     function: &CompiledFunction,
@@ -622,7 +629,7 @@ fn unkept_inline<I, S>(
     }
     let kept: HashSet<blaze_items::CodeHash> =
         // alloc: per compile that builds code in, sized by what it builds in
-        keys.into_iter().filter_map(|it| nodes.get(&it)).map(|it| it.unit.instance.code).collect();
+        keys.into_iter().filter_map(|it| nodes.get(&it)).flat_map(|it| it.described.held_codes()).collect();
     function.inlined.iter().find(|it| !kept.contains(*it)).copied()
 }
 
@@ -638,7 +645,7 @@ fn unkept_message<I, S>(
 ) -> String {
     let name = |key: &InstanceKey| nodes.get(key).map_or("an instance of no node", |it| &it.described.name);
     let of_it: Vec<&str> = (nodes.iter())
-        .filter(|(_, it_node)| it_node.unit.instance.code == it)
+        .filter(|(_, it_node)| it_node.described.held_codes().contains(&it))
         .map(|(_, it_node)| &*it_node.described.name)
         .take(3)
         .collect(); // alloc: an error
@@ -705,6 +712,17 @@ fn summarized(stored: InstanceKey, refs: &[Target]) -> InstanceKey {
 
 fn error(unit: InstanceKey, item: ItemKey, what: impl Into<String>) -> CodegenError {
     CodegenError { unit, item, what: what.into() }
+}
+
+/// `why`, the refusal of the function called `name`, with its message naming it where it does
+/// not already (rule 16): a backend's error knows the unit's keys, not the function's path, so
+/// "LLVM has no code for it: opcode `swizzle`" alone says nothing of which function.
+fn naming(why: CodegenError, name: &str) -> CodegenError {
+    if why.what.contains(name) {
+        return why;
+    }
+    // alloc: an error
+    CodegenError { what: format!("`{name}`: {}", why.what), ..why }
 }
 
 /// The refusals of symbols each defined by more than one function or static of a build (rule
@@ -1521,7 +1539,16 @@ impl<'a, B: Prepare> Build<'a, B> {
             self.frontend.reached(&level.functions, &level.statics);
             // alloc: per build, sized by its units
             let described: Vec<_> = par::map(&level.functions, |(instance, requester)| {
-                self.frontend.describe(instance, requester).and_then(|it| self.node(instance, *requester, it))
+                // One span an instance, named for its function once described: a level's
+                // describes run as a few long pool jobs (`par::split`), and a job of 149 s in a
+                // self-build said only `par::map` (spans37).
+                let span = tracing::info_span!(target: "blaze", "codegen describe", function = tracing::field::Empty);
+                let _entered = span.enter();
+                let described = self.frontend.describe(instance, requester);
+                if let Ok(it) = &described {
+                    span.record("function", it.name.as_str());
+                }
+                described.and_then(|it| self.node(instance, *requester, it))
             });
             // alloc: per build, sized by its units
             let described_statics: Vec<_> = par::map(&level.statics, |value| {
@@ -1559,6 +1586,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     blaze_hash::hash_map::Entry::Occupied(mut it) => {
                         let (kept, new) = (&it.get().described, &node.described);
                         if kept.code != new.code
+                            || kept.built_in_code != new.built_in_code
                             || kept.built_in.len() != new.built_in.len()
                             || kept.refs.len() != new.refs.len()
                         {
@@ -1568,13 +1596,15 @@ impl<'a, B: Prepare> Build<'a, B> {
                                 // alloc: the error's message
                                 format!(
                                     "`{}` and `{}` have one instance key {key:?} but other code: \
-                                     code {:?} against {:?}, {} built-in callees against {}, \
-                                     {} references against {}; the key misses an input their \
-                                     code reads",
+                                     code {:?} against {:?}, built in as {:?} against {:?}, {} \
+                                     built-in callees against {}, {} references against {}; the \
+                                     key misses an input their code reads",
                                     kept.name,
                                     new.name,
                                     kept.code,
                                     new.code,
+                                    kept.built_in_code,
+                                    new.built_in_code,
                                     kept.built_in.len(),
                                     new.built_in.len(),
                                     kept.refs.len(),
@@ -1987,13 +2017,16 @@ impl<'a, B: Prepare> Build<'a, B> {
             statics.keys.iter().zip(&statics.values).map(|(id, node)| owners::StaticOf {
                 id: *id,
                 unit: InstanceKey(node.described.value),
-                owner: Owner::of(&node.described.origin),
+                owner: node.described.owner,
                 refs: &node.refs,
                 symbol: node.described.symbol.as_deref(),
                 origin: node.described.origin,
             }),
             &mut out.errors,
         );
+        // alloc: per build, the keys of its functions written in workspace crates
+        let editable: Vec<InstanceKey> =
+            nodes.keys.iter().zip(&nodes.values).filter(|(_, node)| node.described.editable).map(|(key, _)| *key).collect();
         symbols_defined_twice(&nodes, &statics, &mut out.errors);
         // Set with `self.last`, refused or not: `tier_up` reads the two together.
         // alloc: per build, sized by its statics' references
@@ -2147,6 +2180,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             entry: lazily.entry,
             owners: owned.functions,
             static_owners: owned.statics,
+            editable,
             versions,
             digests: pieces,
             memo_used: used,
@@ -2833,7 +2867,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     (Some(flight.0), (piece, Some((name, summary, export, made))))
                 }
                 Err(why) => {
-                    piece.errors.push(why);
+                    piece.errors.push(naming(why, &job.node.described.name));
                     (None, (piece, None))
                 }
             }
@@ -2887,6 +2921,12 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
         };
         let patchable = |key: &InstanceKey| nodes.get(key).is_some_and(|node| node.patchable);
+        // The functions already refused, each by the error that says why (its summary failed,
+        // or its stored one could not be read): one without a decision for that reason is not
+        // refused a second time.
+        let refused: blaze_hash::HashSet<InstanceKey, Global> =
+            // alloc: per build, sized by its errors
+            out.errors.iter().map(|it| it.unit).collect();
         // `None` for a function the decision has no entry of: one with no summary, which is
         // refused, never compiled as if it imported nothing.
         let imports_of = |name: &InstanceKey| -> Option<Imports> {
@@ -2905,6 +2945,9 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut sampled = Vec::new();
         for job in jobs {
             let Some(imports) = imports_of(&job.name) else {
+                if refused.contains(&job.name) || refused.contains(&job.unit.instance.key()) {
+                    continue;
+                }
                 out.errors.push(error(
                     job.name,
                     job.unit.item,
@@ -3051,7 +3094,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     exports.entry(name).or_insert(export);
                     prepared.entry(name).or_insert(made);
                 }
-                Err(why) => out.errors.push(why),
+                Err(why) => out.errors.push(naming(why, &by_name[&name].node.described.name)),
             }
         }
         if self.frontend.stopped() {

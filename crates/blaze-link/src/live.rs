@@ -51,7 +51,7 @@ impl Stage<'_> {
             arch: match self.output.arch {
                 Arch::X86_64 => ARCH_X86_64,
                 Arch::Aarch64 => ARCH_AARCH64,
-                Arch::Wasm32 => return Err(error(None, "live patching of wasm")),
+                Arch::Wasm32 | Arch::Wasm64 => return Err(error(None, "live patching of wasm")),
             },
             id: self.new.lineage,
             generation: self.new.generation,
@@ -93,6 +93,24 @@ impl Stage<'_> {
         let mut ids = Vec::with_capacity_in(self.write.len(), arena);
         ids.extend(self.write.iter());
         ids.sort_unstable();
+        // An import's GOT cell is filled by the loader when the program starts: one this
+        // stage made, or moved (a PE import address table laid out again when an import or a
+        // DLL comes or goes), holds nothing in the running program.
+        for id in ids.iter().copied() {
+            let Some(piece) = self.new.piece(id) else { continue };
+            let What::Got { target, .. } = piece.what() else { continue };
+            let Some(at) = self.import_of(target) else { continue };
+            let how = if self.fresh.contains(id) {
+                "is new"
+            } else if self.old.piece(id).is_some_and(|it| it.addr != piece.addr) {
+                "moved"
+            } else {
+                continue;
+            };
+            let name = self.new.resolved.imports.get(at as usize).map_or("(an import the image does not list)", |it| &*it.name);
+            // alloc: a restart's reason, which the message carries: once per message
+            return restart(format!("the GOT cell of the import `{name}` {how}, and the loader fills it only at start"));
+        }
         let mut code: FrameVec<'_, CodeRef<'_>> = Vec::with_capacity_in(ids.len(), arena);
         let mut data: FrameVec<'_, (u64, &[u8])> = Vec::with_capacity_in(ids.len(), arena);
         let mut rebase: FrameVec<'_, u64> = Vec::new_in(arena);

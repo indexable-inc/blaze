@@ -31,6 +31,8 @@
 
 #![deny(unsafe_code)]
 #![feature(allocator_api, register_tool)]
+// wasm: the fibers' switch of `__stack_pointer` (`sched::stack`'s wasm layer).
+#![cfg_attr(target_family = "wasm", feature(asm_experimental_arch))]
 // `#[blaze::nonblocking]` / `#[blaze::noalloc]` (docs/v2/plan/lanes/effects.md); inert under rustc.
 #![register_tool(blaze)]
 

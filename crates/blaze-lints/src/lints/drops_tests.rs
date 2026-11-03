@@ -231,6 +231,12 @@ pub mod par {
     pub fn for_each<T, F: Fn(&T) + Sync>(items: &[T], f: F) {}
     pub fn map<T, R, F: Fn(&T) -> R + Sync>(items: &[T], f: F) -> alloc::vec::Vec<R> { loop {} }
 }
+pub mod sched {
+    pub mod stack {
+        pub struct Yielder(());
+        impl Yielder { pub fn suspend(&self, value: u32) -> u32 { value } }
+    }
+}
 "#;
 
 const MAIN: &str =

@@ -62,10 +62,11 @@ const CRATE_ROOT_DOMAIN: &str = "blaze v2 item-hash crate root 1";
 const MATCH_CHECK_DOMAIN: &str = "blaze v2 item-hash match check 1";
 const ABSENT_DOMAIN: &str = "blaze v2 item-hash absent 1";
 
-/// The value `fact` has now, `None` when it cannot be hashed or names what is no fact.
-pub fn value(db: &Db, fact: FactRef) -> Option<ContentId> {
+/// The value `fact` has now as a body of `krate` sees it (lane items' facts about impls cover
+/// the crates it loads), `None` when it cannot be hashed or names what is no fact.
+pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
     if !kinds::RANGE.contains(&fact.kind.0) {
-        return Goals.value(db, fact);
+        return Goals.value(db, Some(krate), fact);
     }
     let FactObject::None = fact.object else { return None };
     let kind = fact.kind;

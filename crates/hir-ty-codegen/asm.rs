@@ -31,6 +31,8 @@ use super::{
 };
 
 mod aarch64;
+#[cfg(all(feature = "rsasm", not(feature = "llvm")))]
+mod rsasm;
 
 /// The name of the function in the text of a [`Wrapper`].
 const SYMBOL: &str = "blaze_asm_block";
@@ -636,7 +638,7 @@ pub(super) fn naked(
     match arch {
         Arch::X86_64 | Arch::Aarch64 => Ok(text),
         // alloc: the error's message
-        Arch::Wasm32 => Err("inline assembly in a wasm module".to_owned()),
+        Arch::Wasm32 | Arch::Wasm64 => Err("inline assembly in a wasm module".to_owned()),
     }
 }
 
@@ -846,7 +848,7 @@ pub(super) fn wrapper(
         Arch::X86_64 => wrapper_x86_64((format, target.call_conv), template, options, operands),
         Arch::Aarch64 => aarch64::wrapper(format, template, options, operands),
         // alloc: the error's message
-        Arch::Wasm32 => Err("inline assembly in a wasm module".to_owned()),
+        Arch::Wasm32 | Arch::Wasm64 => Err("inline assembly in a wasm module".to_owned()),
     }
 }
 
@@ -1559,7 +1561,7 @@ pub(super) fn object(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
 pub(super) fn lines_before(arch: Arch) -> usize {
     match arch {
         Arch::X86_64 => 1,
-        Arch::Aarch64 | Arch::Wasm32 => 0,
+        Arch::Aarch64 | Arch::Wasm32 | Arch::Wasm64 => 0,
     }
 }
 
@@ -1574,11 +1576,13 @@ fn keyed(domain: &str, triple: &str, text: &str) -> ([u8; 32], u64) {
     (key, u64::from_le_bytes(key[..8].try_into().expect("8 bytes")))
 }
 
-/// The object file of `text` for `triple`, assembled by blaze's pinned LLVM's own assembler, in
-/// this process, and by nothing else (docs/v2/plan/toolchain-c.md, slice 1): no C compiler,
-/// clang or `as` of the machine's assembles a block, as what they make depends on whichever one
-/// is installed, which no key names. A blaze built without LLVM assembles nothing and says so.
-/// `BLAZE_ASSEMBLER`, which once picked the machine's C compiler, is refused rather than ignored.
+/// The object file of `text` for `triple`, assembled in this process by the assembler blaze was
+/// built with, and by nothing else (docs/v2/plan/toolchain-c.md, slice 1): blaze's pinned LLVM's
+/// own, or in a blaze built without LLVM, rsasm (`--features rsasm`, the seed's: [`rsasm`]).
+/// No C compiler, clang or `as` of the machine's assembles a block, as what they make depends on
+/// whichever one is installed, which no key names. A blaze built with neither assembles nothing
+/// and says so. `BLAZE_ASSEMBLER`, which once picked the machine's C compiler, is refused rather
+/// than ignored.
 fn assembled_object(triple: &str, text: &str) -> Result<Vec<u8>, String> {
     static SET: LazyLock<Option<String>> =
         LazyLock::new(|| std::env::var_os("BLAZE_ASSEMBLER").map(|it| it.to_string_lossy().into_owned()));
@@ -1592,22 +1596,58 @@ fn assembled_object(triple: &str, text: &str) -> Result<Vec<u8>, String> {
     }
     #[cfg(feature = "llvm")]
     return super::llvm::assemble(super::Target::of(triple)?, text);
-    #[cfg(not(feature = "llvm"))]
+    #[cfg(all(feature = "rsasm", not(feature = "llvm")))]
+    return rsasm::assemble(super::Target::of(triple)?, text);
+    #[cfg(not(any(feature = "llvm", feature = "rsasm")))]
     {
         _ = text;
         Err(no_assembler(triple))
     }
 }
 
-/// Why a block for `triple` is not assembled by a build of blaze without LLVM.
-#[cfg(not(feature = "llvm"))]
+/// Why a block for `triple` is not assembled by a build of blaze with no assembler.
+#[cfg(not(any(feature = "llvm", feature = "rsasm")))]
 fn no_assembler(triple: &str) -> String {
     // alloc: the error's message
     format!(
-        "inline assembly for {triple}: this blaze was built without LLVM, and blaze assembles \
-         `asm!`, `naked_asm!` and `global_asm!` only with its pinned LLVM's assembler, never with \
-         the machine's C compiler: use a build of blaze with LLVM (`--features llvm`)"
+        "inline assembly for {triple}: this blaze was built with no assembler, and blaze \
+         assembles `asm!`, `naked_asm!` and `global_asm!` only with its own (LLVM's, `--features \
+         llvm`, or rsasm, `--features rsasm`), never with the machine's C compiler"
     )
+}
+
+/// What an error calls the function of an `asm!` block, whose instance has no name of its own:
+/// its first few instructions, without what a [`wrapper`] puts around the template (the
+/// directives, labels, frame, and the moves through the slot `x19` or `rbx` points at).
+pub(super) fn summary(text: &str) -> String {
+    const SHOWN: usize = 4;
+    const AROUND: [&str; 10] = [
+        "stp x29, x30, [sp, #-32]!",
+        "mov x29, sp",
+        "str x19, [sp, #16]",
+        "mov x19, x0",
+        "ldr x19, [sp, #16]",
+        "ldp x29, x30, [sp], #32",
+        "brk #1",
+        "push rbx",
+        "pop rbx",
+        "ret",
+    ];
+    let mut lines = text.lines().map(str::trim).filter(|it| {
+        !it.is_empty()
+            && !it.starts_with('.')
+            && !it.ends_with(':')
+            && !AROUND.contains(it)
+            && !it.starts_with("mov rbx, ")
+            && !it.contains("[x19")
+            && !it.contains("[rbx")
+    });
+    // alloc: an error's name of the block
+    let mut out: Vec<&str> = lines.by_ref().take(SHOWN).collect();
+    if lines.next().is_some() {
+        out.push("...");
+    }
+    out.join("; ")
 }
 
 /// The function in an object that defines it alone. What else the object holds that the

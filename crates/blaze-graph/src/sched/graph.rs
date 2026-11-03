@@ -47,8 +47,9 @@ pub(crate) enum Target {
 pub enum StallWait {
     /// Another job's end.
     Job(JobId),
-    /// A key's flight, and the job that claimed it.
-    Key { key: Key, claimer: JobId },
+    /// A key's flight, and the job that claimed it: none for an [`super::Event`]'s, which no job
+    /// holds.
+    Key { key: Key, claimer: Option<JobId> },
     /// Every job counted towards a counter (a scope's jobs).
     Counter(CounterId),
 }
@@ -655,29 +656,67 @@ impl Graph {
     }
 
     /// Whether no wait in the graph can end by what is in it: some job waits, and every live
-    /// job waits, each on a job, a counter, or a key a job claimed (one claimed by none may be
-    /// made outside the graph). Each waiting job and its wait into `into`.
-    pub(crate) fn stuck(&self, into: &mut Vec<(JobId, StallWait)>) -> bool {
+    /// job waits, each on a job, a counter, or a key a job claimed. Each waiting job and its
+    /// wait into `into`.
+    ///
+    /// The jobs of `clients` (threads on no fiber, as the daemon's loop and its IO threads are:
+    /// in the graph from their first claim or wait to their thread's end) run outside it: one
+    /// that does not wait holds nothing off, since all it can end is what it claimed. A wait on
+    /// what such a running client claimed (or on its end) can end from outside, as can one on a
+    /// key claimed by no job (an [`super::Event`], which any thread fires): neither is stuck,
+    /// unless `quiet`, which says the threads outside the graph are still and will end nothing
+    /// they claimed until a wait ends, as the daemon says once nothing can move its build.
+    /// An event's wait is never stuck: its firer is no job, and may be busy where no one sees.
+    pub(crate) fn stuck(&self, into: &mut Vec<(JobId, StallWait)>, clients: Option<u32>, quiet: bool) -> bool {
         into.clear();
+        let client = |job: u32| clients.is_some_and(|member| self.jobs[job as usize].home.member == member);
+        // A client that runs, not waiting in the graph: what it claimed may end from outside.
+        let outside = |job: u32| client(job) && self.jobs[job as usize].wait == Target::None;
         for (j, node) in self.jobs.iter().enumerate() {
             if node.life != Life::Live {
                 continue;
             }
             let wait = match node.wait {
+                Target::None if client(j as u32) => continue,
                 Target::None => return false,
-                Target::Job(other) => StallWait::Job(JobId(other)),
-                Target::Key(entry) => {
-                    let claimer = self.key_claimer[entry as usize];
-                    if claimer == NONE {
+                Target::Job(other) => {
+                    if !quiet && outside(other) {
                         return false;
                     }
-                    StallWait::Key { key: self.key_name[entry as usize], claimer: JobId(claimer) }
+                    StallWait::Job(JobId(other))
+                }
+                Target::Key(entry) => {
+                    let claimer = self.key_claimer[entry as usize];
+                    if claimer == NONE || (!quiet && outside(claimer)) {
+                        return false;
+                    }
+                    StallWait::Key { key: self.key_name[entry as usize], claimer: Some(JobId(claimer)) }
                 }
                 Target::Counter(counter) => StallWait::Counter(CounterId(counter)),
             };
             into.push((JobId(j as u32), wait));
         }
         !into.is_empty()
+    }
+
+    /// Every live job that waits now and what on, stuck or not, into `into`: what a report of a
+    /// build that stopped names, as a parked job's own spans are on no thread while it waits.
+    pub(crate) fn waiting(&self, into: &mut Vec<(JobId, StallWait)>) {
+        into.clear();
+        for (j, node) in self.jobs.iter().enumerate() {
+            let wait = match node.wait {
+                _ if node.life != Life::Live => continue,
+                Target::None => continue,
+                Target::Job(other) => StallWait::Job(JobId(other)),
+                Target::Key(entry) => {
+                    let claimer = self.key_claimer[entry as usize];
+                    let claimer = (claimer != NONE).then_some(JobId(claimer));
+                    StallWait::Key { key: self.key_name[entry as usize], claimer }
+                }
+                Target::Counter(counter) => StallWait::Counter(CounterId(counter)),
+            };
+            into.push((JobId(j as u32), wait));
+        }
     }
 
     /// Ends every wait for a job or a key, and on a counter no job counts towards: each waiting
@@ -767,5 +806,91 @@ impl Graph {
                 assert!(self.counter_left[c] > 0 && self.counter_waiters[c] == NONE, "dropped counter {c}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stuck_tests {
+    use super::*;
+
+    /// The pool's member and the clients' (threads on no fiber), as the world numbers members
+    /// of their own placement.
+    const POOL: u32 = 1 << 31;
+    const CLIENTS: u32 = (1 << 31) | 1;
+
+    fn key(n: u8) -> Key {
+        Key([n; 32])
+    }
+
+    fn job(graph: &mut Graph, n: u32, member: u32) -> JobId {
+        graph.add(JobId(n), Home { member, local: n }, None);
+        JobId(n)
+    }
+
+    /// The poolborrow stall (2026-11-02): the daemon's loop thread, a client of the graph from
+    /// its first query, runs and waits on nothing in the graph; a pool job's scope never ends,
+    /// as a job of it was lost and never counted down; another pool job waits for a key that
+    /// job claimed. The client held the check off forever (it ran ~285 times and found
+    /// nothing): a client that runs holds nothing off, and the stall names the key and both
+    /// waiters.
+    #[test]
+    fn a_running_client_thread_does_not_hide_a_stall_of_the_pools_jobs() {
+        let mut graph = Graph::new(8);
+        let _daemon = job(&mut graph, 0, CLIENTS);
+        let scope = job(&mut graph, 1, POOL);
+        let waiter = job(&mut graph, 2, POOL);
+        assert!(graph.claim(key(7), Some(scope)));
+        let lost = graph.counter();
+        graph.hold(lost);
+        graph.open_scope(scope, lost);
+        assert_eq!(graph.wait(scope, On::Counter(lost)), Ok(Waited::Waiting));
+        assert_eq!(graph.wait(waiter, On::Key(key(7))), Ok(Waited::Waiting));
+        let mut waits = Vec::new();
+        assert!(graph.stuck(&mut waits, Some(CLIENTS), false), "the client hid the stall: {waits:?}");
+        assert_eq!(
+            waits,
+            vec![
+                (scope, StallWait::Counter(lost)),
+                (waiter, StallWait::Key { key: key(7), claimer: Some(scope) }),
+            ]
+        );
+    }
+
+    /// A wait on a key a running client claimed can end from outside (the daemon's loop holds
+    /// a flight across its turns): no stall while the outside may move; once the outside says
+    /// it is still, the wait is stuck, naming the key and the client that claimed it. A wait on
+    /// an event (a key no job claimed) is never stuck: its firer is no job.
+    #[test]
+    fn a_wait_on_what_a_client_claimed_is_stuck_only_once_the_outside_is_quiet() {
+        let mut graph = Graph::new(8);
+        let daemon = job(&mut graph, 0, CLIENTS);
+        let waiter = job(&mut graph, 1, POOL);
+        assert!(graph.claim(key(3), Some(daemon)));
+        assert_eq!(graph.wait(waiter, On::Key(key(3))), Ok(Waited::Waiting));
+        let mut waits = Vec::new();
+        assert!(!graph.stuck(&mut waits, Some(CLIENTS), false), "a running client may end its key: {waits:?}");
+        assert!(graph.stuck(&mut waits, Some(CLIENTS), true));
+        assert_eq!(waits, vec![(waiter, StallWait::Key { key: key(3), claimer: Some(daemon) })]);
+
+        let mut graph = Graph::new(8);
+        let waiter = job(&mut graph, 0, POOL);
+        assert!(graph.claim(key(4), None));
+        assert_eq!(graph.wait(waiter, On::Key(key(4))), Ok(Waited::Waiting));
+        assert!(!graph.stuck(&mut waits, Some(CLIENTS), true), "an event's wait is no stall: {waits:?}");
+        graph.waiting(&mut waits);
+        assert_eq!(waits, vec![(waiter, StallWait::Key { key: key(4), claimer: None })], "every wait is listed");
+    }
+
+    /// A pool job that runs (a timed wait, which is no wait in the graph) holds the check off,
+    /// as before: it may end what the others wait for.
+    #[test]
+    fn a_pool_job_that_runs_holds_the_stall_off() {
+        let mut graph = Graph::new(8);
+        let runner = job(&mut graph, 0, POOL);
+        let waiter = job(&mut graph, 1, POOL);
+        assert!(graph.claim(key(5), Some(runner)));
+        assert_eq!(graph.wait(waiter, On::Key(key(5))), Ok(Waited::Waiting));
+        let mut waits = Vec::new();
+        assert!(!graph.stuck(&mut waits, Some(CLIENTS), true));
     }
 }

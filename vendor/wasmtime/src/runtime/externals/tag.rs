@@ -1,0 +1,133 @@
+use crate::Result;
+use crate::runtime::types::TagType;
+use crate::trampoline::generate_tag_export;
+use crate::{
+    AsContext, AsContextMut,
+    store::{StoreInstanceId, StoreOpaque},
+};
+use wasmtime_environ::DefinedTagIndex;
+
+#[cfg(feature = "gc")]
+use crate::store::InstanceId;
+#[cfg(feature = "gc")]
+use wasmtime_environ::EntityRef;
+
+/// A WebAssembly `tag`.
+#[derive(Copy, Clone, Debug)]
+#[repr(C)] // here for the C API in the future
+pub struct Tag {
+    instance: StoreInstanceId,
+    index: DefinedTagIndex,
+}
+
+impl Tag {
+    pub(crate) fn from_raw(instance: StoreInstanceId, index: DefinedTagIndex) -> Tag {
+        Tag { instance, index }
+    }
+
+    /// Create a new tag instance from a given TagType.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `ty` was not created with the same
+    /// [`Engine`](crate::Engine) as `store`.
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
+    pub fn new(mut store: impl AsContextMut, ty: &TagType) -> Result<Tag> {
+        generate_tag_export(store.as_context_mut().0, ty)
+    }
+
+    /// Returns the underlying type of this `tag`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `store` does not own this tag.
+    pub fn ty(&self, store: impl AsContext) -> TagType {
+        self._ty(store.as_context().0)
+    }
+
+    pub(crate) fn _ty(&self, store: &StoreOpaque) -> TagType {
+        TagType::from_wasmtime_tag(store.engine(), self.wasmtime_ty(store))
+    }
+
+    pub(crate) fn wasmtime_ty<'a>(&self, store: &'a StoreOpaque) -> &'a wasmtime_environ::Tag {
+        let module = store[self.instance].env_module();
+        let index = module.tag_index(self.index);
+        &module.tags[index]
+    }
+
+    pub(crate) fn vmimport(&self, store: &StoreOpaque) -> crate::runtime::vm::VMTagImport {
+        let instance = &store[self.instance];
+        crate::runtime::vm::VMTagImport {
+            from: instance.tag_ptr(self.index).into(),
+            vmctx: instance.vmctx().into(),
+            index: self.index,
+        }
+    }
+
+    pub(crate) fn comes_from_same_store(&self, store: &StoreOpaque) -> bool {
+        store.id() == self.instance.store_id()
+    }
+
+    /// Returns a stable identifier for this tag within its store.
+    ///
+    /// This allows distinguishing tags when introspecting them
+    /// e.g. via debug APIs.
+    #[cfg(feature = "debug")]
+    pub fn debug_index_in_store(&self) -> u64 {
+        u64::from(self.instance.instance().as_u32()) << 32 | u64::from(self.index.as_u32())
+    }
+
+    /// Determines whether this tag is reference equal to the other
+    /// given tag in the given store.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either tag do not belong to the given `store`.
+    pub fn eq(a: &Tag, b: &Tag, store: impl AsContext) -> bool {
+        // make sure both tags belong to the store
+        let store = store.as_context();
+        let _ = &store[a.instance];
+        let _ = &store[b.instance];
+
+        // then compare to see if they have the same definition
+        a.instance == b.instance && a.index == b.index
+    }
+
+    /// Get the "index coordinates" for this `Tag`: the raw instance
+    /// ID and defined-tag index within that instance. This can be
+    /// used to "serialize" the tag as a pair of plain integers, e.g.
+    /// within the GC store for an exception object. Nothing keeps those
+    /// integers from being tampered with, so `from_raw_indices`
+    /// re-validates them.
+    #[cfg(feature = "gc")]
+    pub(crate) fn to_raw_indices(&self) -> (InstanceId, DefinedTagIndex) {
+        (self.instance.instance(), self.index)
+    }
+
+    /// Create a new `Tag` from raw indices as produced by `to_raw_indices()`,
+    /// if those indices are in bounds for the given store.
+    ///
+    /// Returns `None` if either index is out-of-bounds, which can happen when
+    /// they were round-tripped through somewhere untrusted, such as the GC
+    /// heap.
+    #[cfg(feature = "gc")]
+    pub(crate) fn from_raw_indices(
+        store: &StoreOpaque,
+        instance: InstanceId,
+        index: DefinedTagIndex,
+    ) -> Option<Tag> {
+        let num_defined_tags = store
+            .try_instance(instance)?
+            .env_module()
+            .num_defined_tags();
+        if index.index() >= num_defined_tags {
+            return None;
+        }
+
+        let instance = StoreInstanceId::new(store.id(), instance);
+        Some(Tag { instance, index })
+    }
+}

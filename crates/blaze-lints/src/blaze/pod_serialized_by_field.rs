@@ -59,7 +59,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
     if layout.size() != sum {
         return;
     }
-    let serde = hir::Impl::all_for_type(db, adt.ty(db)).into_iter().find_map(|imp| {
+    let serde = hir::Impl::all_for_type(db, cx.krate(), adt.ty(db)).into_iter().find_map(|imp| {
         let trait_ = imp.trait_(db)?;
         let krate = trait_.module(db).krate(db);
         let name = trait_.name(db);

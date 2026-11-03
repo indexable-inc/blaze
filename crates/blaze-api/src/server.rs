@@ -25,6 +25,12 @@
 //! passed a daemon they socket-activated ([`Unix::Passed`], [`crate::activation`]): the driver
 //! listens on a copy of it once it is a listening Unix socket bound at the name, and fails the
 //! listen naming it otherwise. Nothing is made in its place.
+//!
+//! A server that listens on nothing takes requests from its own process instead
+//! ([`Config::local`]): the seed's one-shot build (todo/bootstrap/plan.md), whose CLI runs the
+//! daemon's engine in process. Its connections ([`Server::open_local`]) speak the Unix socket's
+//! frames both ways, handed in ([`Server::send_local`]) and taken out ([`Server::take_local`])
+//! by the caller rather than received and sent through the driver.
 
 use std::{fmt, net::SocketAddr};
 
@@ -83,6 +89,9 @@ pub enum Unix {
 pub struct Config {
     pub unix: Option<Unix>,
     pub http: Option<Http>,
+    /// Takes requests from this process alone, on connections it opens
+    /// ([`Server::open_local`]), and listens on nothing: `unix` and `http` are `None`.
+    pub local: bool,
     /// The tags it uses are `tags..tags + 2^32`.
     pub tags: u64,
     pub most_connections: usize,
@@ -100,6 +109,10 @@ pub struct Server {
     stopped: bool,
     /// What arrived, handed over at the end of the next [`Server::complete`].
     told: Vec<Arrived>,
+    /// It takes this process's requests ([`Config::local`]).
+    local: bool,
+    /// The number of the next connection [`Server::open_local`] opens.
+    next_local: u64,
     /// Every reply is encoded with it, onto its connection's queue.
     writer: cbor::Writer,
     /// An HTTP chunk's content, put together before its size is known.
@@ -161,6 +174,9 @@ struct Connection {
     closing: bool,
     /// The request the last reply queued on it answers, for [`Server::abandon`] to name.
     last_request: Option<u64>,
+    /// One of this process's ([`Server::open_local`]): its bytes are handed in and its
+    /// replies taken out by the caller, never through the driver.
+    local: bool,
 }
 
 /// What [`Server::abandon`] hung up on: each connection left, by its number, and what it was
@@ -229,14 +245,21 @@ impl Server {
             failed: None,
             stopped: false,
             told,
+            local: config.local,
+            next_local: 0,
             writer: cbor::Writer::new(),
             line,
             #[cfg(unix)]
             passed: None,
         };
-        if config.unix.is_none() && config.http.is_none() {
+        let listens = config.unix.is_some() || config.http.is_some();
+        if !listens && !config.local {
             // alloc: error path, at start.
             server.fail("the API server was given no address to listen on".to_owned());
+        }
+        if listens && config.local {
+            // alloc: error path, at start.
+            server.fail("the API server takes this process's requests only when it listens on nothing".to_owned());
         }
         match config.unix {
             Some(Unix::Bind(name)) => server.listen(Side::Unix, Address::Unix(name), effects),
@@ -349,11 +372,60 @@ impl Server {
         let mut conns: Vec<Conn> = self.conns.keys().copied().collect();
         radix::sort_copy_by_key(&mut conns, |it| it.0);
         for conn in conns {
-            match self.conns.get(&conn).is_some_and(|it| it.sending.is_some()) {
+            let unsent = |it: &Connection| it.sending.is_some() || (it.local && !it.queue.is_empty());
+            match self.conns.get(&conn).is_some_and(unsent) {
                 true => self.close(conn),
                 false => self.gone(conn, effects),
             }
         }
+    }
+
+    /// Opens a connection of this process's own: requests handed in on it with
+    /// [`Server::send_local`], their replies taken with [`Server::take_local`]. `None` when the
+    /// server does not take this process's requests ([`Config::local`]) or has stopped.
+    pub fn open_local(&mut self) -> Option<Conn> {
+        if !self.local || self.stopped || self.conns.len() >= self.most_connections {
+            return None;
+        }
+        let conn = Conn(self.next_local);
+        self.next_local += 1;
+        let connection = Connection {
+            reader: Reader::Unix(Frames::new()),
+            receiving: None,
+            sending: None,
+            sending_bytes: 0,
+            // alloc: none until a reply is queued; once per connection.
+            queue: Vec::new(),
+            closing: false,
+            last_request: None,
+            local: true,
+        };
+        self.conns.insert(conn, connection);
+        Some(conn)
+    }
+
+    /// `bytes` this process sent on its connection `conn`, in the Unix socket's frames: each
+    /// whole request is handed over in `arrived`, and what is no request answered on `conn`, as
+    /// a socket's would be. Bytes for a connection that is gone or closing are dropped.
+    pub fn send_local(&mut self, conn: Conn, bytes: &[u8], effects: &mut Vec<Effect>, arrived: &mut Vec<Arrived>) {
+        if let Some(Connection { reader: Reader::Unix(frames), local: true, closing: false, .. }) = self.conns.get_mut(&conn) {
+            frames.push(bytes);
+            self.unix_items(conn, effects);
+        }
+        arrived.append(&mut self.told);
+    }
+
+    /// What was replied on this process's connection `conn` since it was last taken, its
+    /// frames appended to `into`; `false` once the connection is gone, its replies all taken.
+    /// A connection a stop closed is gone once they are.
+    pub fn take_local(&mut self, conn: Conn, into: &mut Vec<u8>, effects: &mut Vec<Effect>) -> bool {
+        let Some(connection) = self.conns.get_mut(&conn).filter(|it| it.local) else { return false };
+        into.extend_from_slice(&connection.queue);
+        connection.queue.clear();
+        if connection.closing {
+            self.gone(conn, effects);
+        }
+        true
     }
 
     /// Hangs up on every connection left, what is queued or in flight on it unsent: the end
@@ -450,6 +522,7 @@ impl Server {
             queue,
             closing: false,
             last_request: None,
+            local: false,
         };
         self.conns.insert(conn, connection);
         self.receive(conn, effects);
@@ -465,7 +538,7 @@ impl Server {
                 (RECEIVE, answering.is_some() && parser.held() > MOST_HELD)
             }
         };
-        if connection.receiving.is_some() || connection.closing || held {
+        if connection.receiving.is_some() || connection.closing || held || connection.local {
             return;
         }
         let tag = self.tag();
@@ -693,6 +766,10 @@ impl Server {
     /// peer with too much waiting is hung up on.
     fn flush(&mut self, conn: Conn, effects: &mut Vec<Effect>) {
         let Some(connection) = self.conns.get_mut(&conn) else { return };
+        // A connection of this process's keeps its replies until they are taken.
+        if connection.local {
+            return;
+        }
         let waiting = connection.queue.len();
         match connection.sending {
             None if waiting > 0 => {
@@ -722,9 +799,12 @@ impl Server {
 
     /// The connection is over: the session hears so, and it is hung up on.
     fn gone(&mut self, conn: Conn, effects: &mut Vec<Effect>) {
-        if self.conns.remove(&conn).is_some() {
+        if let Some(connection) = self.conns.remove(&conn) {
             self.told.push(Arrived::Gone { conn });
-            self.hang_up(conn, effects);
+            // The driver never had a connection of this process's.
+            if !connection.local {
+                self.hang_up(conn, effects);
+            }
         }
     }
 

@@ -169,7 +169,7 @@ fn a_units_uncovered_time_is_its_running_under_no_child_and_its_waits_are_not_wo
     assert_eq!((rows[0].uncovered_ns, rows[0].unnamed_wait_ns), (40, 10));
     let waits = report::rows(&m, By::Wait, None);
     let keys: Vec<&str> = waits.iter().map(|it| it.key.as_str()).collect();
-    assert_eq!(keys, ["key fact_value", "counter counter 2"]);
+    assert_eq!(keys, ["key fact_value", "counter wait with no wait span"], "a wait with no span is named by its kind, not its raw value");
 }
 
 /// Build 53 has no `ended` row the model reads (they carried no build): the old model ran a

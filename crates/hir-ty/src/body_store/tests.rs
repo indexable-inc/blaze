@@ -230,7 +230,7 @@ impl BodyFacts for TestFacts {
         }
     }
 
-    fn value(&self, db: &Db, fact: FactRef) -> Option<ContentId> {
+    fn value(&self, db: &Db, _: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
         if fact != IMPLS {
             return None;
         }
@@ -336,7 +336,7 @@ fn answer_of(memory: &Memory, s: &Session, def: DefWithBodyId) -> (ContentId, Co
     let shape = ShapeRef::open(shape.bytes(), &base).unwrap();
     let mut key = AnswerKey::new(&shape_key);
     for fact in shape.facts() {
-        key.value(&s.facts.value(&s.db, fact).unwrap());
+        key.value(&s.facts.value(&s.db, def, fact).unwrap());
     }
     let answer_key = key.finish();
     let at = record::answer_at(Step::Infer, &answer_key);

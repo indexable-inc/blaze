@@ -278,6 +278,7 @@ fn policy(heap_to_stack: bool) -> Policy {
             panic: Panic::Unwind,
             packages: Default::default(),
             build_override: Override::default(),
+            stencils: false,
         },
         mode: Mode::Output,
         fold: false,
@@ -302,7 +303,7 @@ fn build(
     let policy = policy(heap_to_stack);
     // Named by path, so two databases of one text give one key ([`HashSource::ById`] would not).
     let hashes = ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned())));
-    let build_time = std::sync::Arc::new(BuildTime(Default::default()));
+    let build_time = BuildTime::default();
     let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), build_time).with_policy(&policy);
     let krate = fixture::test_crate(db);
     let roots = frontend.roots(krate, RootKind::Library).map_err(|it| it.what)?;

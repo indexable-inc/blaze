@@ -8,7 +8,7 @@ use super::{TestDB, edit, item, single};
 use crate::{
     ItemHashes, ItemId, Resolved,
     hash::{self, Graph, Members},
-    hashes, item_key, key, layout_hash, resolve,
+    hashes, item_key, key, layout_hash, resolve, signature_hash,
 };
 
 fn of(db: &TestDB, path: &str) -> ItemHashes {
@@ -1054,3 +1054,238 @@ fn mir_that_fails_to_lower_is_named_in_the_error() {
     assert!(said.contains(":1:17 has no function: "), "the call's place is given: {said}");
     assert!(said.ends_with("its name resolves to nothing)"), "inference's reason is given: {said}");
 }
+
+/// MIR that fails to lower in a closure written in a body is named by where the closure is
+/// written, then why it failed (rule 16): the item's hash covers the closure's code, so the
+/// item is what has no hash, but the error says which body of it.
+#[test]
+fn mir_that_fails_to_lower_in_a_closure_names_the_closure_and_its_place() {
+    let (db, _) = single("fn f() -> u32 {\n    let c = || -> u32 { g() };\n    0\n}\n");
+    let err = hashes(&db, item(&db, "f")).expect_err("`f`'s closure calls a name that does not resolve");
+    assert_eq!(err.what, "MIR that failed to lower", "{}", err.describe(&db));
+    let said = err.describe(&db);
+    assert!(said.contains("MIR that failed to lower (the closure at "), "the closure is named: {said}");
+    assert!(said.contains(":2:13: the call of `g` at "), "the closure's place, then the call: {said}");
+}
+
+/// selfbuild2's T1 at its cause: `rustc_type_ir::binder::BoundVarIndexKind` had an error type
+/// only while rustc_type_ir's proc macro `rustc_index_macros` was not built, as its field's type
+/// `DebruijnIndex` is written by `rustc_index::newtype_index!`; another crate's test link read
+/// it then. Here `Idx` is written by a proc macro: with its expanders the enum hashes; while
+/// they are not built yet no item of the crate has a hash, whatever it reads (pmwait's
+/// `Missed::MacroPending`), and the error names the crate and the proc macros it waits on;
+/// with a proc macro that failed to build, the error type names the field and the proc macro
+/// and why it has none; and given them back it hashes again.
+#[test]
+fn an_error_type_left_by_an_unbuilt_proc_macro_names_the_field_and_the_macro() {
+    use base_db::{ProcMacroLoadingError, all_crates};
+    use hir_expand::proc_macro::ProcMacros;
+
+    let fx = fixture::db(
+        "//- proc_macros: mirror\n//- /lib.rs crate:lib\n\
+         proc_macros::mirror! { ; (u32) Idx struct pub }\npub enum K { A(Idx) }\n",
+    );
+    let mut db = fx.into_db();
+    let k = item(&db, "K");
+    signature_hash(&db, k).unwrap_or_else(|err| panic!("with its proc macro built: {}", err.describe(&db)));
+    let pm = all_crates(&db).iter().copied().find(|it| it.loads_only_macros(&db)).expect("the proc macros' crate");
+    let built = ProcMacros::get_for_crate(&db, pm).and_then(|it| it.macros()).expect("its macros").to_vec();
+
+    ProcMacros::give(&mut db, [(pm, Err(ProcMacroLoadingError::NotYetBuilt))]);
+    let pending = signature_hash(&db, k).expect_err("no item of `lib` hashes while `mirror!` is not built");
+    let (err, said) = (pending, pending.describe(&db));
+    assert_eq!(err.what, "an item of a crate whose proc macros are not built yet", "{said}");
+    assert!(said.contains("Enum `lib::K` has no hash"), "the item is named: {said}");
+    assert!(said.contains("`lib` was read before the proc macros of `proc_macros` were built"), "{said}");
+
+    ProcMacros::give(&mut db, [(pm, Err(ProcMacroLoadingError::FailedToBuild))]);
+    let err = signature_hash(&db, k).expect_err("`Idx` does not resolve while `mirror!` has no expander");
+    let said = err.describe(&db);
+    assert_eq!(err.what, "a type with an error", "{said}");
+    assert!(said.contains("Enum `lib::K` has no hash"), "the item is named: {said}");
+    assert!(said.contains("field `A.0`"), "the field is named: {said}");
+    assert!(said.contains("`proc_macros` (proc-macro failed to build)"), "the proc macro and why: {said}");
+
+    ProcMacros::give(&mut db, [(pm, Ok(built))]);
+    signature_hash(&db, k).unwrap_or_else(|err| panic!("with its proc macro given back: {}", err.describe(&db)));
+    // The refusal keeps the proc macro it found pending: said once it is built, it still names it.
+    let said = pending.describe(&db);
+    assert!(said.contains("`lib` was read before the proc macros of `proc_macros` were built"), "{said}");
+}
+
+/// An iterator for the RPITIT fixtures below: minicore has no adapter that borrows.
+const RPITIT_PRELUDE: &str = "//- minicore: iterator, option, sized, unsize, coerce_unsized, dispatch_from_dyn
+struct It<'a>(&'a [u32]);
+impl Iterator for It<'_> { type Item = u32; fn next(&mut self) -> Option<u32> { None } }
+struct Once(u32);
+impl Iterator for Once { type Item = u32; fn next(&mut self) -> Option<u32> { None } }
+";
+
+fn rpitit_db(body: &str) -> (TestDB, base_db::FileId) {
+    single(&format!("{RPITIT_PRELUDE}{body}"))
+}
+
+/// Every item of the fixture hashes, and the trait method that returns `impl Trait`, the impl
+/// method that gives its hidden type and the callers through the trait and through `dyn`.
+#[track_caller]
+fn all_hash(db: &TestDB, what: &str) {
+    for id in super::items(db) {
+        if let Err(err) = hashes(db, id) {
+            panic!("{what}: {}", err.describe(db));
+        }
+    }
+}
+
+/// A trait method returning `impl Trait` (RPITIT) has a hash in every shape of `self` and
+/// lifetime: with no default body it defines no hidden type, rustc's synthesized associated
+/// type with no value, and is hashed by its bounds; each impl's method gives its own.
+#[test]
+fn a_trait_method_returning_impl_trait_has_a_hash() {
+    for (what, body) in [
+        (
+            "elided `&self`",
+            "pub(crate) trait G { fn roots(&self) -> impl Iterator<Item = u32>; }
+struct F<'a>(&'a [u32]);
+impl G for F<'_> { fn roots(&self) -> impl Iterator<Item = u32> { It(self.0) } }
+fn walk(g: &impl G) -> Option<u32> { g.roots().next() }
+pub fn run(x: &[u32]) -> Option<u32> { walk(&F(x)) }",
+        ),
+        (
+            "elided `&self` and another parameter",
+            "pub(crate) trait G { fn roots(&self, n: u32) -> impl Iterator<Item = u32>; }
+struct F;
+impl G for F { fn roots(&self, n: u32) -> impl Iterator<Item = u32> { Once(n) } }
+fn walk(g: &impl G) -> Option<u32> { g.roots(1).next() }
+pub fn run() -> Option<u32> { walk(&F) }",
+        ),
+        (
+            "explicit lifetime",
+            "pub(crate) trait G { fn roots<'s>(&'s self) -> impl Iterator<Item = u32> + 's; }
+struct F<'a>(&'a [u32]);
+impl G for F<'_> {
+    fn roots<'s>(&'s self) -> impl Iterator<Item = u32> + 's { It(self.0) }
+}
+fn walk(g: &impl G) -> Option<u32> { g.roots().next() }
+pub fn run(x: &[u32]) -> Option<u32> { walk(&F(x)) }",
+        ),
+        (
+            "by-value `self`",
+            "pub(crate) trait G { fn roots(self) -> impl Iterator<Item = u32>; }
+struct F(u32);
+impl G for F { fn roots(self) -> impl Iterator<Item = u32> { Once(self.0) } }
+fn walk(g: impl G) -> Option<u32> { g.roots().next() }
+pub fn run(x: u32) -> Option<u32> { walk(F(x)) }",
+        ),
+        (
+            "default body, one impl keeps it and one overrides it",
+            "pub(crate) trait G { fn roots(&self) -> impl Iterator<Item = u32> { Once(7) } }
+struct F;
+struct H<'a>(&'a [u32]);
+impl G for F {}
+impl G for H<'_> { fn roots(&self) -> impl Iterator<Item = u32> { It(self.0) } }
+fn walk(g: &impl G) -> Option<u32> { g.roots().next() }
+pub fn run(x: &[u32]) -> Option<u32> { let _ = walk(&F); walk(&H(x)) }",
+        ),
+        (
+            "dyn-incompatible method left out of a `dyn` trait",
+            "pub(crate) trait G {
+    fn roots(&self) -> impl Iterator<Item = u32> where Self: Sized;
+    fn len(&self) -> u32;
+}
+struct F;
+impl G for F {
+    fn roots(&self) -> impl Iterator<Item = u32> where Self: Sized { Once(1) }
+    fn len(&self) -> u32 { 1 }
+}
+fn by_dyn(g: &dyn G) -> u32 { g.len() }
+fn walk(g: &impl G) -> Option<u32> { g.roots().next() }
+pub fn run() -> u32 { by_dyn(&F) + walk(&F).unwrap_or(0) }",
+        ),
+    ] {
+        let (db, _) = rpitit_db(body);
+        all_hash(&db, what);
+    }
+}
+
+/// Rule 18: the trait's declaration holds no impl's hidden type, so each impl's comes from
+/// that impl's method. Changing what one impl's method returns behind its `impl Trait`
+/// changes that method's interface, keeps the trait method's and the other impl's, and two
+/// impls with different hidden types never hash alike.
+#[test]
+fn an_impls_hidden_type_for_a_trait_methods_impl_trait_reaches_its_callers() {
+    let text = |hidden: &str| {
+        format!(
+            "pub(crate) trait G {{ fn roots(&self) -> impl Iterator<Item = u32>; }}
+struct F<'a>(&'a [u32]);
+struct K;
+impl G for F<'_> {{ fn roots(&self) -> impl Iterator<Item = u32> {{ {hidden} }} }}
+impl G for K {{ fn roots(&self) -> impl Iterator<Item = u32> {{ Once(2) }} }}
+fn walk(g: &impl G) -> Option<u32> {{ g.roots().next() }}
+pub fn run(x: &[u32]) -> Option<u32> {{ walk(&F(x)) }}"
+        )
+    };
+    let (mut db, file) = rpitit_db(&text("It(self.0)"));
+    // The impls' `roots`, in the order the impls are written: `F`'s, then `K`'s.
+    let roots = |db: &TestDB, impl_of: &str| {
+        let found: Vec<ItemId> = super::items(db)
+            .into_iter()
+            .filter(|&id| {
+                matches!(id, ItemId::Function(it) if matches!(
+                    hir_def::Lookup::lookup(&it, db).container,
+                    hir_def::ItemContainerId::ImplId(_)
+                )) && key::path(db, id).ends_with("::roots")
+            })
+            .collect();
+        let at = match impl_of {
+            "F" => 0,
+            "K" => 1,
+            _ => unreachable!(),
+        };
+        assert_eq!(found.len(), 2, "{found:?}");
+        hashes(db, found[at]).unwrap_or_else(|err| panic!("{}", err.describe(db)))
+    };
+    let (trait_roots, f_roots, k_roots, run) =
+        (of(&db, "G::roots"), roots(&db, "F"), roots(&db, "K"), of(&db, "run"));
+    assert_ne!(f_roots.interface, k_roots.interface, "two impls' hidden types hash apart");
+    edit(&mut db, file, &format!("{RPITIT_PRELUDE}{}", text("Once(3)")));
+    assert_eq!(of(&db, "G::roots"), trait_roots, "the trait holds no impl's hidden type");
+    assert_eq!(roots(&db, "K"), k_roots, "the other impl is unchanged");
+    assert_ne!(roots(&db, "F").interface, f_roots.interface, "the impl's hidden type changed");
+    // `run` reaches the impl's method only once `walk` is instantiated: that is the
+    // instance's code identity (hir-ty-identity's
+    // `an_impls_hidden_type_for_a_trait_methods_impl_trait_is_in_its_callers_identity`), not
+    // an item hash, which keeps a generic body's trait call by the trait's method.
+    assert_eq!(of(&db, "run").code, run.code);
+}
+
+/// Rule 16: the site an error type is at is named by what holds the error, never a parameter
+/// whose only error is the region of an elided lifetime (every elided lifetime of a signature
+/// is an error region, and is hashed).
+#[test]
+fn an_error_type_names_its_site_in_a_function() {
+    for (body, path, site) in [
+        ("fn f(x: u32, y: Missing) -> u32 { x }", "f", "(parameter 1)"),
+        ("trait T { fn f(&self) -> Missing; }", "T::f", "(the return type)"),
+        (
+            "trait T { fn f(&self) -> impl Iterator<Item = Missing>; }",
+            "T::f",
+            "(the bounds of `impl Trait` 0 of the return type)",
+        ),
+        ("fn f<X>(x: X) -> X where X: Iterator<Item = Missing> { x }", "f", "(a bound or where clause)"),
+        (
+            "fn f() -> impl Sized { let x: Option<Missing> = None; x }",
+            "f",
+            "(the hidden type the body gives `impl Trait` 0 of the return type)",
+        ),
+        ("fn f() -> u32 { let _x: Option<Missing> = None; 0 }", "f", "(a type in the body's MIR)"),
+    ] {
+        let (db, _) = rpitit_db(body);
+        let said = match hashes(&db, item(&db, path)) {
+            Ok(_) => panic!("`{body}` hashed"),
+            Err(err) => err.describe(&db),
+        };
+        assert!(said.contains(site), "`{body}`: {said}");
+        assert!(said.contains(&format!("`ra_test_fixture::{path}`")), "`{body}`: {said}");
+    }
+}
+

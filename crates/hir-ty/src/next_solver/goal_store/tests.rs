@@ -201,12 +201,18 @@ impl GoalFacts for TestFacts {
         CRATE
     }
 
-    fn fact_of(&self, _: &Db, _: blaze_query::db::DatabaseKeyIndex, name: &'static str) -> Option<FactRef> {
+    fn fact_of(
+        &self,
+        _: &Db,
+        _: Option<Crate>,
+        _: blaze_query::db::DatabaseKeyIndex,
+        name: &'static str,
+    ) -> Option<FactRef> {
         self.names.lock().push(name);
         self.expressible.then_some(KNOB)
     }
 
-    fn value(&self, db: &Db, fact: FactRef) -> Option<ContentId> {
+    fn value(&self, db: &Db, _: Option<Crate>, fact: FactRef) -> Option<ContentId> {
         (fact == KNOB).then(|| ContentId::of("blaze v2 goal test knob", &self.knob.value(db).to_le_bytes()))
     }
 }
@@ -256,6 +262,10 @@ impl<'db> Source<'db> for RawSource<'_> {
     fn invalid(&self, what: &'static str) -> &'static str {
         what
     }
+
+    fn past(&self, what: &'static str, _: u64, _: u64) -> &'static str {
+        what
+    }
 }
 
 /// A stable form, read back: children inline, definitions by the keys [`TestFacts`] made.
@@ -293,6 +303,10 @@ impl<'db> Source<'db> for Back<'_, 'db> {
     }
 
     fn invalid(&self, what: &'static str) -> &'static str {
+        what
+    }
+
+    fn past(&self, what: &'static str, _: u64, _: u64) -> &'static str {
         what
     }
 

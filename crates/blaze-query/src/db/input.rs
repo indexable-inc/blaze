@@ -314,7 +314,7 @@ impl<I: Input, T> Setter for InputSetter<'_, I, T> {
 
     fn to(self, value: T) -> T {
         let node = row::<I>(self.storage, self.id).first.load(Ordering::Relaxed) + self.field;
-        let old = Durability(((self.storage.color_of(node) >> 32) as u32 & !FIELD) as u8);
+        let old = Durability(((*self.storage.node_mut(node).color_mut() >> 32) as u32 & !FIELD) as u8);
         let durability = self.durability.unwrap_or(old);
         let view = self.storage.new_view(old.max(durability), input_bits(node));
         let row = row::<I>(self.storage, self.id);
@@ -322,7 +322,7 @@ impl<I: Input, T> Setter for InputSetter<'_, I, T> {
         // writes them.
         let fields = unsafe { (*row.fields.get()).assume_init_mut() };
         let old_value = std::mem::replace((self.at)(fields), value);
-        self.storage.repaint(node, color(FIELD | u32::from(durability.0), view));
+        *self.storage.node_mut(node).color_mut() = color(FIELD | u32::from(durability.0), view);
         old_value
     }
 }

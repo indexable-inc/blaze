@@ -30,6 +30,7 @@ hir-ty-mir.workspace = true
 intern.workspace = true
 proc-macro-api.workspace = true
 span.workspace = true
+syntax.workspace = true
 
 [dev-dependencies]
 blaze-items.workspace = true

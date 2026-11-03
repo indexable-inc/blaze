@@ -765,6 +765,59 @@ impl<'p, T> Limbo<'p, T> {
         self.head += passed;
         passed
     }
+
+    /// Takes out up to `N` of the objects whose grace has passed, oldest first, for the caller
+    /// to drop once it has let go of what guards this limbo ([`Passed`]). An object's drop takes
+    /// as long as the object is big (a trait solver's cache of a whole crate is hundreds of
+    /// megabytes of maps), so a limbo behind a lock other threads wait on
+    /// ([`crate::lock::SpinLock`]) never drops under it; [`Limbo::collect`] is for an owner no
+    /// other thread waits on.
+    pub fn take_passed<const N: usize>(&mut self) -> Passed<'p, T, N> {
+        let passed = self.held[self.head..].partition_point(|retired| retired.grace.passed()).min(N);
+        let mut taken = Passed { pool: self.cache.pool, indices: [0; N], len: 0, dropped: 0 };
+        for at in self.head..self.head + passed {
+            taken.indices[taken.len] = self.held[at].index;
+            taken.len += 1;
+        }
+        // The head moves past them: the limbo never drops them, `taken` does.
+        self.head += passed;
+        taken
+    }
+}
+
+/// Objects a [`Limbo`] let go of, each past its grace ([`Limbo::take_passed`]): each is dropped,
+/// and its slot given back to the pool, when this drops.
+#[must_use = "dropping it drops the objects: drop it once the limbo's lock is let go"]
+pub struct Passed<'p, T, const N: usize> {
+    pool: &'p Pool<T>,
+    indices: [u32; N],
+    len: usize,
+    /// Those before it are dropped: a drop that panics leaves the rest held, never dropped twice.
+    dropped: usize,
+}
+
+impl<T, const N: usize> Passed<'_, T, N> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<T, const N: usize> Drop for Passed<'_, T, N> {
+    fn drop(&mut self) {
+        while self.dropped < self.len {
+            let index = self.indices[self.dropped];
+            self.dropped += 1;
+            // SAFETY: the limbo handed the slot over with the value retired into it, past its
+            // grace (no reader can reach it), and moved its head past it, so only this drops it,
+            // once (`dropped` moved first).
+            unsafe { self.pool.slot(index).drop_in_place() };
+            self.pool.give_one(index);
+        }
+    }
 }
 
 impl<T> Drop for Limbo<'_, T> {

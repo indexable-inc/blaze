@@ -1,0 +1,10 @@
+[package]
+name = "repro"
+version = "0.1.0"
+edition = "2024"
+
+# A body of the program at MIR level 2 is what is devirtualized against its dyn facts.
+[profile.dev]
+opt-level = 3
+
+[workspace]

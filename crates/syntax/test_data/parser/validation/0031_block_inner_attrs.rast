@@ -346,6 +346,5 @@ SOURCE_FILE@0..1186
         WHITESPACE@1183..1184 "\n"
         R_CURLY@1184..1185 "}"
   WHITESPACE@1185..1186 "\n"
-error 39..83: A block in this position cannot accept inner attributes
-error 152..171: A block in this position cannot accept inner attributes
-error 180..212: A block in this position cannot accept inner attributes
+error 152..171: an inner attribute is not permitted in this context
+error 180..212: an inner attribute is not permitted in this context

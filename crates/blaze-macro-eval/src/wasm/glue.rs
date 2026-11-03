@@ -27,8 +27,8 @@ const ENTRY: &str = include_str!("../../guest/entry.rs");
 const MARK: &str = "\n// blaze's list of this crate's proc macros and its wasm module's glue, which are not in the file on disk.\n";
 
 /// The text blaze appends to the root of `krate`, a proc-macro crate built for
-/// `wasm32-wasip1`: [`MODULE`] with the list of its macros and the glue. An error names the
-/// crate when it is no proc-macro crate or has no macros.
+/// `wasm32-wasip1`: [`MODULE`] with the list of its macros (none, for a crate that has none)
+/// and the glue. An error names the crate when it is no proc-macro crate.
 pub fn wasm_glue(db: &Db, krate: Crate) -> Result<String, String> {
     let name = || match &krate.extra_data(db).display_name {
         Some(name) => name.to_string(), // alloc: error path
@@ -37,10 +37,9 @@ pub fn wasm_glue(db: &Db, krate: Crate) -> Result<String, String> {
     if !hir_def::nameres::crate_def_map(db, krate).is_proc_macro() {
         return Err(format!("`{}` is not a proc-macro crate, so it has no wasm module's glue", name())); // alloc: error path
     }
+    // A proc-macro crate with no macros is one rustc builds (`superset-of-rust`): its list is
+    // empty, and a use of a macro it lacks fails at the use, naming it.
     let mut functions = run::functions(db, krate);
-    if functions.is_empty() {
-        return Err(format!("the proc-macro crate `{}` has no proc macros to list in its wasm module", name())); // alloc: error path
-    }
     // The order `load_on` numbers them in: by the name each is invoked by, stably.
     functions.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
     let edition = krate.data(db).edition;

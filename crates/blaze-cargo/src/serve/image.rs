@@ -185,8 +185,8 @@ enum State {
     Idle,
     /// The VFS's journal is moving to another image: made once it can be.
     Waiting,
-    /// `made` is how long the image took to make; the write began at `since`.
-    Writing { mark: ImageMark, made: Duration, since: Instant },
+    /// `made` is how long the image took to make; the write of its `bytes` began at `since`.
+    Writing { mark: ImageMark, made: Duration, since: Instant, bytes: usize },
     Mapping { made: Duration, wrote: Duration, since: Instant },
 }
 
@@ -201,6 +201,8 @@ pub struct Images {
     mapped: Option<Arc<Image<Mapping>>>,
     /// Why the last image asked was not made; cleared when one is asked again.
     failed: Option<ImageFailed>,
+    /// How many images it has made and handed to the driver to write, in its life.
+    made: u64,
 }
 
 impl Images {
@@ -214,7 +216,14 @@ impl Images {
             again: false,
             mapped: None,
             failed: None,
+            made: 0,
         }
+    }
+
+    /// How many images it has made and handed to the driver to write: what a test of the stop
+    /// counts (a stop during an unchanged settle makes none of its own).
+    pub fn made(&self) -> u64 {
+        self.made
     }
 
     pub fn owns(&self, tag: Tag) -> bool {
@@ -278,9 +287,11 @@ impl Images {
         match builder.finish_on(&on_pool) {
             Ok(bytes) => {
                 _span.record("bytes", bytes.len());
+                let len = bytes.len();
                 // clone: the effect owns its name; once an image.
                 parts.effects.push(Effect::Write { file: self.file.clone(), bytes, tag: self.write });
-                self.state = State::Writing { mark, made: began.elapsed(), since: Instant::now() };
+                self.made += 1;
+                self.state = State::Writing { mark, made: began.elapsed(), since: Instant::now(), bytes: len };
             }
             Err(error) => self.fail(Unmade::TooLarge(error)),
         }
@@ -289,7 +300,7 @@ impl Images {
     /// Takes a completion of its own.
     pub fn complete(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>) {
         match (std::mem::replace(&mut self.state, State::Idle), completion.done) {
-            (State::Writing { mark, made, since }, Done::Written) => {
+            (State::Writing { mark, made, since, .. }, Done::Written) => {
                 assert!(vfs.image_durable(mark.name), "the image written is the one the VFS staged last");
                 vfs.flush(effects);
                 // clone: as the write's.
@@ -321,6 +332,22 @@ impl Images {
         self.state = State::Idle;
         // clone: a refcount, once a failed image.
         self.failed = Some(ImageFailed { file: self.file.clone(), why });
+    }
+
+    /// What it is doing, for a person waiting on it (`blaze stop`): none when idle with no
+    /// image asked.
+    pub fn doing(&self) -> Option<String> {
+        let file = &self.file;
+        Some(match self.state {
+            State::Idle if self.again => format!("making another daemon image /{file}: the daemon changed while the last was made"),
+            State::Idle => return None,
+            State::Waiting => format!("waiting for the VFS journal to move before making the daemon image /{file}"),
+            State::Writing { bytes, .. } => match self.again {
+                false => format!("writing the daemon image /{file} ({} MiB)", bytes >> 20),
+                true => format!("writing the daemon image /{file} ({} MiB), then another", bytes >> 20),
+            },
+            State::Mapping { .. } => format!("mapping the daemon image /{file} it wrote"),
+        })
     }
 
     /// Whether every image asked was made, or failed.

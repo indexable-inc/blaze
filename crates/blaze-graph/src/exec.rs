@@ -374,6 +374,8 @@ struct Run<R: Runner> {
     /// The job that posted it last, as a profiler numbers it ([`crate::sched::fiber::observe_spawner`]):
     /// written by [`post`] before the pool's queue hands it over, which orders it before the read.
     spawner: AtomicU64,
+    /// The build the poster worked for ([`crate::sched::Given::build`]), written beside `spawner`.
+    build: AtomicU32,
 }
 
 // SAFETY: `live` has one reader or writer at a time: the owner while it fills the slot, then
@@ -457,7 +459,7 @@ impl<R: Runner> Table<R> {
     ) -> Result<u64, MemError> {
         let header = Header::new(run_pooled::<R>);
         let live = UnsafeCell::new(Some(live));
-        let run = self.cache.try_alloc(Run { header, ctx, at: u64::MAX, live, spawner: AtomicU64::new(0) })?;
+        let run = self.cache.try_alloc(Run { header, ctx, at: u64::MAX, live, spawner: AtomicU64::new(0), build: AtomicU32::new(0) })?;
         let handle = self.live.try_insert(Slot { run, tag, pool, near })?;
         let slot = self.live.get_mut(handle).expect("a run just placed is in the table");
         slot.run.at = handle.to_bits();
@@ -1209,7 +1211,9 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
 /// Runs `run` on the scheduler's pool near `near` (on a fast group when it is critical).
 #[allow(clippy::needless_pass_by_value, reason = "posting transfers the run's sole ownership to the pool job")]
 fn post<R: Runner>(ctx: &Ctx<R>, near: Option<u32>, critical: bool, run: Ran<R>) {
-    run.run().spawner.store(crate::sched::spawner().spawner, Ordering::Relaxed);
+    let given = crate::sched::spawner();
+    run.run().spawner.store(given.spawner, Ordering::Relaxed);
+    run.run().build.store(given.build, Ordering::Relaxed);
     // SAFETY: the slot's header is its first field (`Run` is `repr(C)`) and runs `run_pooled`;
     // the slot stays in the scheduler's pool, unmoved, until its `Done` is taken, and `run`,
     // moved here, was its one name.
@@ -1226,7 +1230,11 @@ fn post<R: Runner>(ctx: &Ctx<R>, near: Option<u32>, critical: bool, run: Ran<R>)
 unsafe fn run_pooled<R: Runner>(header: NonNull<Header>) {
     let run = Ran(header.cast::<Run<R>>());
     let (ctx, critical) = (run.run().ctx, run.live().critical);
-    crate::sched::job_begins(crate::sched::Given { spawner: run.run().spawner.load(Ordering::Relaxed), at: 0 });
+    crate::sched::job_begins(crate::sched::Given {
+        spawner: run.run().spawner.load(Ordering::Relaxed),
+        at: 0,
+        build: run.run().build.load(Ordering::Relaxed),
+    });
     let span = pool::JobSpan::begin(std::any::type_name::<R>());
     let result = catch_unwind(AssertUnwindSafe(|| measured(&ctx.runner, run.live())));
     drop(span);

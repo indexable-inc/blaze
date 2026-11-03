@@ -20,13 +20,9 @@ struct T;
 impl T {
     fn m<const N: usize>(&self) {}
 }
-static S: usize = 1;
 fn local() {
     let n = 1usize;
     T.m::<n>();
-}
-fn statik() {
-    T.m::<{ S }>();
 }
 fn mismatched() {
     T.m::<true>();
@@ -72,14 +68,9 @@ fn a_local_as_a_const_arg_is_e0435_at_its_type_ref() {
     );
 }
 
-#[test]
-fn a_static_as_a_const_arg_is_e0013_at_its_expression() {
-    let found = invalid_const_args(&diagnostics("statik"));
-    assert!(
-        matches!(found.as_slice(), [(Span::ExprId(_), CreateConstError::Static)]),
-        "`m::<{{ S }}>` reads a static: {found:?}",
-    );
-}
+// A constant may read a static (`const_refs_to_static`): `m::<{ S }>()` is tested in
+// hir-ty-mir (`consteval::a_static_as_a_const_arg_is_an_anon_const_that_reads_it`), since type
+// checking the call normalizes `{ S }`, which evaluates it, and this binary builds no MIR.
 
 #[test]
 fn a_literal_of_another_type_is_a_type_mismatch() {
@@ -97,8 +88,10 @@ fn a_constant_const_arg_has_no_error() {
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
 }
 
-/// In a type, a static is E0013 at its path, and a literal of another type is an anon const,
-/// whose own type check gives E0308 as rustc's.
+/// In a type, an array length that names a static is an anon const that reads it (no E0013, as
+/// rustc since 1.83), and so is a literal of another type, whose own type check gives E0308 as
+/// rustc's. A bare path to a static as a generic argument, which rustc also makes an anon
+/// const, has no expression for blaze to make one of yet, and says so.
 #[test]
 fn a_field_type_reports_its_invalid_const_args() {
     let db = fixture::db(
@@ -110,6 +103,7 @@ struct V {
     a: W<S>,
     b: W<true>,
     c: W<3>,
+    d: [u8; S],
 }
 "#,
     )
@@ -129,11 +123,14 @@ struct V {
         assert!(
             matches!(
                 lowered.diagnostics(),
-                [TyLoweringDiagnostic::InvalidConstArg { site: Span::TypeRefId(_), reason: CreateConstError::Static }]
+                [TyLoweringDiagnostic::InvalidConstArg {
+                    site: Span::TypeRefId(_),
+                    reason: CreateConstError::NeedsAnonConst
+                }]
             ),
             "only `W<S>` is an error of lowering: {:?}",
             lowered.diagnostics(),
         );
-        assert_eq!(lowered.defined_anon_consts().len(), 1, "`W<true>` is an anon const");
+        assert_eq!(lowered.defined_anon_consts().len(), 2, "`W<true>` and `[u8; S]` are anon consts");
     });
 }

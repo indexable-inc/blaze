@@ -83,7 +83,7 @@ macro_rules! quote_impl__ {
                     *SYMBOL.get_or_init(|| intern::Symbol::intern(stringify!($tt)))
                 },
                 span: $span,
-                is_raw: tt::IdentIsRaw::No,
+                is_raw: $crate::tt::IdentIsRaw::No,
             })
         );
     };

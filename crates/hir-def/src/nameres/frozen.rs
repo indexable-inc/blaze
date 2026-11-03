@@ -78,7 +78,7 @@ type R<T = ()> = Result<T, String>;
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 16";
+pub const ENCODING: &str = "blaze frozen def map 17";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -583,15 +583,9 @@ impl<'a> Enc<'a> {
             // clone: encoding, once per crate per image write (not on a build's path)
             let (owner, path) = self.file_names[&file].clone();
             self.u32(owner);
+            // No text: every file is of its owner's source root ([`Enc::file_name`]), whose
+            // texts the owner's image key covers, and the crate's key covers that key.
             self.str(&path)?;
-            // A file outside the directory of its crate's root may be one a build script
-            // wrote, which the key does not cover: its text is.
-            let outside = path.starts_with("../") || path.starts_with(OUT);
-            self.bool(outside);
-            if outside {
-                let text = self.db.file_text(file).text(self.db);
-                self.out.put_u128(hash128(text.as_bytes()));
-            }
             if !path.starts_with(OUT) {
                 let full = joined(&self.dirs[&owner], &path);
                 if let Some(place) = places.iter().find(|it| full.starts_with(it.as_str())) {
@@ -2294,10 +2288,11 @@ impl Dec<'_> {
         all.get(index).copied().ok_or_else(|| format!("variant {index}"))
     }
 
-    /// The files the bytes name, as named in the header: the first that is not loaded, or
-    /// that is outside its crate's directory and whose text is not what was written, is an
-    /// error. Each that is not loaded is noted as an `include!` that found nothing is, for
-    /// whoever owns the VFS to load.
+    /// The files the bytes name, as named in the header, each looked up in its owner's source
+    /// root: the first that is not there is an error. Their texts are the image key's, which
+    /// covers every file of that source root, so they are not checked here again. Each that is
+    /// not loaded is noted as an `include!` that found nothing is, for whoever owns the VFS to
+    /// load.
     fn files(&mut self) -> R {
         let n = self.len()?;
         let mut not_loaded = None;
@@ -2305,10 +2300,6 @@ impl Dec<'_> {
             let owner = self.u32()?;
             // alloc: the decoded map's own storage, once per crate served
             let path = self.str()?.to_owned();
-            let written = match self.bool()? {
-                true => Some(self.r.u128()?),
-                false => None,
-            };
             if !self.paths.contains_key(&owner) {
                 let krate = *self.closure.get(owner as usize).ok_or("a file's crate")?;
                 self.paths.insert(owner, root_dir(self.db, krate)?);
@@ -2333,12 +2324,6 @@ impl Dec<'_> {
                 not_loaded.get_or_insert_with(|| format!("{full} is not loaded"));
                 continue;
             };
-            if let Some(written) = written
-                && hash128(self.db.file_text(found).text(self.db).as_bytes()) != written
-            {
-                // alloc: error path
-                return Err(format!("{full} is not the file that was written"));
-            }
             self.files.push(found);
         }
         not_loaded.map_or(Ok(()), Err)
@@ -3752,7 +3737,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
     }
 
     #[test]
-    fn a_file_outside_the_crate_is_read_only_as_written() {
+    fn a_file_above_the_crate_s_directory_is_read_from_its_source_root() {
         const OUTSIDE: &str = r#"
 //- /main.rs crate:main deps:lib
 use lib::made::made;
@@ -3766,16 +3751,14 @@ pub fn made() {}
         let lib = crate_named(&db, "lib");
         let bytes = encode(&db, lib).unwrap();
         assert_eq!(unreadable(&db, lib, &bytes), None);
-        let changed = fixture::db(&OUTSIDE.replace("{}\n", "{}\npub fn more() {}\n")).into_db();
-        let why = unreadable(&changed, crate_named(&changed, "lib"), &bytes);
-        assert!(
-            why.as_ref().is_some_and(|it| it.ends_with("is not the file that was written")),
-            "{why:?}"
-        );
+        // Its text is the image key's to cover (`deps::key`), not the bytes'.
+        let missing = fixture::db(OUTSIDE.split("//- /lib/made.rs").next().unwrap()).into_db();
+        let why = unreadable(&missing, crate_named(&missing, "lib"), &bytes);
+        assert!(why.as_ref().is_some_and(|it| it.ends_with("is not loaded")), "{why:?}");
     }
 
     #[test]
-    fn an_included_file_is_read_only_as_written() {
+    fn an_included_file_is_read_from_its_source_root() {
         const INCLUDED: &str = r#"
 //- /main.rs crate:main deps:lib
 lib::unroll!();
@@ -3800,12 +3783,6 @@ macro_rules! unroll { () => { pub fn made() {} } }
                 |db: &TestDB| super::super::crate_def_map(db, crate_named(db, name)).dump(db);
             assert_eq!(dump(&served), dump(&db), "{name}");
         }
-        let changed = fixture::db(&INCLUDED.replace("unroll {", "unroll_more {")).into_db();
-        let why = unreadable(&changed, crate_named(&changed, "lib"), &bytes);
-        assert!(
-            why.as_ref().is_some_and(|it| it.ends_with("is not the file that was written")),
-            "{why:?}"
-        );
         let missing = fixture::db(INCLUDED.split("//- /lib/out").next().unwrap()).into_db();
         let why = unreadable(&missing, crate_named(&missing, "lib"), &bytes);
         assert!(why.as_ref().is_some_and(|it| it.ends_with("is not loaded")), "{why:?}");

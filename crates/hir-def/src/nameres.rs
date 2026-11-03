@@ -52,6 +52,7 @@ pub mod attr_resolution;
 mod batch;
 #[cfg(test)]
 mod collector;
+mod def_site;
 pub mod delta;
 pub mod demand;
 pub mod diagnostics;
@@ -111,6 +112,7 @@ use crate::{
 
 pub use self::facts::impls::{ModuleImpls, module_impls};
 pub use self::path_resolution::ResolvePathResultPrefixInfo;
+pub(crate) use self::def_site::Hygienic;
 
 #[cfg(test)]
 thread_local! {

@@ -54,6 +54,7 @@ fn diagnostic() -> Diagnostic {
         unit: Some(UnitOf {
             id: 4,
             test: false,
+            doctest: false,
             target: target(),
             package_id: "path+file:///w#app@0.1.0".to_owned(),
             manifest_path: "/w/Cargo.toml".to_owned(),

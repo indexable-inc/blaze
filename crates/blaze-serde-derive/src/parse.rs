@@ -252,10 +252,10 @@ pub(crate) fn item(input: TokenStream) -> Result<Item, Error> {
             generics.predicates.extend(c.where_clause());
             let fields = match c.next() {
                 Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace => {
-                    named_fields(&name, None, group, container.rename_all)?
+                    named_fields(&name, None, &group, container.rename_all)?
                 }
                 Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis => {
-                    let fields = tuple_fields(&name, None, group)?;
+                    let fields = tuple_fields(&name, None, &group)?;
                     generics.predicates.extend(c.where_clause());
                     fields
                 }
@@ -269,7 +269,7 @@ pub(crate) fn item(input: TokenStream) -> Result<Item, Error> {
             let Some(TokenTree::Group(body)) = c.next().filter(|it| matches!(it, TokenTree::Group(g) if g.delimiter() == Delimiter::Brace)) else {
                 return Err(Error::new(ident.span(), format!("enum `{name}` ({}): its body does not read as an enum's", at(ident.span()))));
             };
-            Data::Enum(variants(&name, body, container.rename_all)?)
+            Data::Enum(variants(&name, &body, container.rename_all)?)
         }
         other => {
             return Err(Error::new(
@@ -723,7 +723,7 @@ fn variant_attrs(attrs: &[Group], owner: &Owner<'_>) -> Result<VariantAttrs, Err
     Ok(out)
 }
 
-fn named_fields(item: &str, variant: Option<&str>, body: Group, rename_all: Option<RenameRule>) -> Result<Fields, Error> {
+fn named_fields(item: &str, variant: Option<&str>, body: &Group, rename_all: Option<RenameRule>) -> Result<Fields, Error> {
     let mut list = Vec::new();
     for (index, chunk) in split_commas(body.stream().into_iter().collect()).into_iter().enumerate() {
         let mut c = Cursor::new(chunk);
@@ -752,7 +752,7 @@ fn named_fields(item: &str, variant: Option<&str>, body: Group, rename_all: Opti
     Ok(Fields { style: Style::Named, list })
 }
 
-fn tuple_fields(item: &str, variant: Option<&str>, body: Group) -> Result<Fields, Error> {
+fn tuple_fields(item: &str, variant: Option<&str>, body: &Group) -> Result<Fields, Error> {
     let mut list = Vec::new();
     for (index, chunk) in split_commas(body.stream().into_iter().collect()).into_iter().enumerate() {
         let mut c = Cursor::new(chunk);
@@ -773,7 +773,7 @@ fn tuple_fields(item: &str, variant: Option<&str>, body: Group) -> Result<Fields
     Ok(Fields { style: Style::Tuple, list })
 }
 
-fn variants(item: &str, body: Group, rename_all: Option<RenameRule>) -> Result<Vec<Variant>, Error> {
+fn variants(item: &str, body: &Group, rename_all: Option<RenameRule>) -> Result<Vec<Variant>, Error> {
     let mut out = Vec::new();
     for chunk in split_commas(body.stream().into_iter().collect()) {
         let mut c = Cursor::new(chunk);
@@ -782,14 +782,14 @@ fn variants(item: &str, body: Group, rename_all: Option<RenameRule>) -> Result<V
         let name = unraw(&ident);
         let fields = match c.peek() {
             Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace => {
-                let group = group.clone();
+                let fields = named_fields(item, Some(&name), group, None)?;
                 c.next();
-                named_fields(item, Some(&name), group, None)?
+                fields
             }
             Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis => {
-                let group = group.clone();
+                let fields = tuple_fields(item, Some(&name), group)?;
                 c.next();
-                tuple_fields(item, Some(&name), group)?
+                fields
             }
             _ => Fields { style: Style::Unit, list: Vec::new() },
         };

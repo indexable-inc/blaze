@@ -196,7 +196,10 @@ pub(super) fn rustc_outputs(mode: CompileMode, kind: &TargetKind, triple: &str, 
             }
             (types, unsupported)
         }
-        CompileMode::Test => match file_types(&CrateType::Bin, Flavor::Normal, triple)? {
+        // cargo writes nothing for a library's doctests (rustdoc builds each example in a
+        // directory it deletes); blaze plans the unit's program where a test's goes, and each
+        // example is a program of its own beside it (docs/v2/plan/doctests.md).
+        CompileMode::Test | CompileMode::Doctest => match file_types(&CrateType::Bin, Flavor::Normal, triple)? {
             Some(it) => (it, Vec::new()),
             None => (Vec::new(), vec![CrateType::Bin]),
         },

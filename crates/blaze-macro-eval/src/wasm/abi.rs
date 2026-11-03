@@ -9,7 +9,7 @@ use wasmtime::{ExternType, Module};
 /// The module of the bridge's shims.
 pub(crate) const BRIDGE: &str = "blaze_proc_macro";
 /// The module of WASI preview 1, which std for `wasm32-wasip1` calls.
-pub(crate) const WASI: &str = "wasi_snapshot_preview1";
+pub(crate) const WASI: &str = <blaze_wasi::W32 as blaze_wasi::Width>::MODULE;
 
 /// The bridge's shims, each in `host.rs`:
 ///
@@ -27,33 +27,9 @@ pub(crate) const WASI: &str = "wasi_snapshot_preview1";
 ///   resolves a relative path against its own working directory (`/` until then).
 pub(crate) const BRIDGE_SHIMS: &[&str] = &["dispatch", "reply", "output", "hashmap_random_keys", "env_var", "current_dir"];
 
-/// The WASI preview 1 functions std for `wasm32-wasip1` reaches, each answered in `wasi.rs`.
-pub(crate) const WASI_SHIMS: &[&str] = &[
-    "args_get",
-    "args_sizes_get",
-    "clock_res_get",
-    "clock_time_get",
-    "environ_get",
-    "environ_sizes_get",
-    "fd_close",
-    "fd_fdstat_get",
-    "fd_fdstat_set_flags",
-    "fd_filestat_get",
-    "fd_prestat_dir_name",
-    "fd_prestat_get",
-    "fd_read",
-    "fd_readdir",
-    "fd_seek",
-    "fd_tell",
-    "fd_write",
-    "path_filestat_get",
-    "path_open",
-    "path_readlink",
-    "poll_oneoff",
-    "proc_exit",
-    "random_get",
-    "sched_yield",
-];
+/// The WASI preview 1 functions std for `wasm32-wasip1` reaches, each `blaze_wasi`'s over the
+/// sandbox's answers in `wasi.rs`.
+pub(crate) const WASI_SHIMS: &[&str] = blaze_wasi::FUNCTIONS;
 
 /// The module's linear memory.
 pub(crate) const MEMORY: &str = "memory";

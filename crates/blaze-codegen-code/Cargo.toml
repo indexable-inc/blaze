@@ -22,5 +22,9 @@ blake3.workspace = true
 glob.workspace = true
 toml.workspace = true
 
+[features]
+# blake3's SIMD128 code on wasm32 (Rust, no C); does nothing on other targets.
+wasm32-simd = ["blake3/wasm32_simd"]
+
 [lints]
 workspace = true

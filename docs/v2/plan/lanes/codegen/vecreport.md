@@ -82,7 +82,8 @@ side table does. `Policy::report` sets it for LLVM units only.
 
 **Printing.** blaze-cargo turns it on from the unit's rustflags (`-W`/`-D`/`-F`/`--force-warn`
 `blaze::vecreport` or `blaze::pedantic_perf`, the last flag winning). At the link phase,
-`Generated::report` reads the side table of each workspace function (`Owner::Workspace`) from
+`Generated::report` reads the side table of each function written in a workspace crate
+(`Built::editable`; not `Owner`, which says what a dependency image holds) from
 the build's puts or the store, and `HirFrontend::vecreport` resolves each `SpanRef` through
 the build's span tables to `file:line:col`, classifies the callee by its debug name (bounds,
 overflow, division, `unwrap`, panic), drops rows not hot under a profile, sorts by position and

@@ -102,6 +102,16 @@ pub(crate) fn lint_given(fixture: &str, flags: &str, conf: Conf, given: fn(&mut 
 }
 
 fn lint_once(fixture: &str, flags: &str, conf: Conf, given: fn(&mut fixture::Fixture)) -> String {
+    try_lint_once(fixture, flags, conf, given).expect("the crate's lints run")
+}
+
+/// [`lint_once`], or the error that refused the crate's check.
+pub(crate) fn try_lint_once(
+    fixture: &str,
+    flags: &str,
+    conf: Conf,
+    given: fn(&mut fixture::Fixture),
+) -> Result<String, crate::diag::CheckError> {
     let mut built = fixture::db(fixture);
     given(&mut built);
     let db = built.into_db();
@@ -130,13 +140,13 @@ fn lint_once(fixture: &str, flags: &str, conf: Conf, given: fn(&mut fixture::Fix
         let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
         let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };
         let name_of = |file: FileId| names.get(&file).cloned();
-        let found = check(&db, krate, &setup, &name_of).expect("every file of the crates is named");
+        let found = check(&db, krate, &setup, &name_of)?;
         let mut sources = Sources::of(texts);
-        crate::serve::written(found.iter(), &mut sources, |_| None, Style::default())
+        Ok(crate::serve::written(found.iter(), &mut sources, |_| None, Style::default())
             .expect("every file a lint points into is given")
             .into_iter()
             .map(|it| it.rendered)
-            .collect()
+            .collect())
     })
 }
 

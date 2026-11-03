@@ -14,7 +14,11 @@ Andrew, 2026-10-26, answering "blaze uses its pinned nightly even when the proje
 Andrew, 2026-10-28 03:30Z: zero Rust toolchain pinning. blaze uses the language and std its own
 binary ships, ignores rust-toolchain, rust-toolchain.toml, rustup's settings and
 `RUSTUP_TOOLCHAIN`, and never runs or asks rustc, not even with rustup installed. Projects pin
-the blaze version instead.
+the blaze version instead (`[workspace.metadata.blaze] version`): a released `blaze` runs the
+release a workspace pins, a build of blaze's tree runs itself in blaze's tree and runs the
+pinned release elsewhere, as a release does, and `blaze --ignore-pin` runs the blaze given
+whatever is pinned
+([cargo.md](cargo.md#pinning-a-release-of-blaze)).
 
 ## Why one toolchain, and why blaze's
 
@@ -79,9 +83,10 @@ archive. `nix develop` fetches it and sets `LLVM_SYS_231_PREFIX` to it (the flak
 archive; for a target with no archive, the `llvm` workflow (`.github/workflows/llvm.yaml`) builds
 one. llvm-sys's build script refuses any other prefix with one error before anything links it
 ([contributing.md](contributing.md#llvm-for---features-llvm)). The LLVM inside a blaze binary
-is not a toolchain for projects: it builds them with the toolchain above. It is the only
-assembler blaze has: `asm!`, `naked_asm!` and `global_asm!` go to its MC assembler in process,
-never to the machine's clang or `cc`, and a blaze built without LLVM refuses them. What else
+is not a toolchain for projects: it builds them with the toolchain above. Its MC assembler is
+what assembles `asm!`, `naked_asm!` and `global_asm!` in process, never the machine's clang or
+`cc`. A blaze built without LLVM assembles them with rsasm in process when built with
+`--features rsasm`, as the seed is (`vendor/rsasm/SOURCE.md`), and refuses them otherwise. What else
 blaze still takes from the machine's C toolchain (the C driver the linker asks for crt files,
 the macOS SDK, MSVC's libraries, build scripts' `CC`) and the plan to replace it with one C
 toolchain built from this LLVM: [v2/plan/toolchain-c.md](v2/plan/toolchain-c.md).

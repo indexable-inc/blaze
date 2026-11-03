@@ -767,3 +767,45 @@ fn main() {
     "#]],
     );
 }
+
+#[test]
+fn alloc_error_handler_exports_rg_oom_calling_the_handler() {
+    // #1069: `#[alloc_error_handler]` keeps the function and adds the `__rg_oom` the allocator
+    // shim's `__rust_alloc_error_handler` forwards to, calling it with the `Layout`.
+    check(
+        r#"
+//- /main.rs crate:main
+#[rustc_builtin_macro]
+pub macro alloc_error_handler($item:item) {}
+pub mod alloc {
+    pub struct Layout;
+    impl Layout {
+        pub const unsafe fn from_size_align_unchecked(_: usize, _: usize) -> Layout { Layout }
+    }
+}
+#[alloc_error_handler]
+fn on_oom(_: alloc::Layout) -> ! { loop {} }
+"#,
+        expect![[r##"
+#[rustc_builtin_macro]
+pub macro alloc_error_handler($item:item) {}
+pub mod alloc {
+    pub struct Layout;
+    impl Layout {
+        pub const unsafe fn from_size_align_unchecked(_: usize, _: usize) -> Layout { Layout }
+    }
+}
+#[alloc_error_handler]
+fn on_oom(_: alloc::Layout) -> ! { loop {} }
+
+fn on_oom(_: alloc::Layout) -> ! {
+    loop {}
+}
+#[unsafe (export_name = "__rg_oom")] unsafe extern "C" fn __rg_oom(size: usize, align: usize) -> ! {
+    on_oom(unsafe {
+        $crate::alloc::Layout::from_size_align_unchecked(size, align)
+    }
+    )
+}"##]],
+    );
+}

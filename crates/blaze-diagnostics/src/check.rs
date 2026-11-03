@@ -71,26 +71,53 @@ pub fn check_planned(
     hir::attach_db(db, || frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, plan, frame)))
 }
 
-/// blaze: the `#[blaze::sealed]` checks of `krate` alone ([`hir::check::check_sealed`]), lowered
-/// as [`check_crate`] lowers them, and rustc's orphan check of each impl of another crate's trait
-/// (`lower::trait_impl_orphan::in_sealed_graph`), with rustc's closing lines: for a dependency
-/// of which nothing else is checked (only what the build's programs reach of it). Its lints are
-/// left out, as `--cap-lints` leaves a dependency's. Empty, after one flag read, for a crate
-/// with no sealed trait in its graph ([`hir_ty::sealed_in_graph`]).
-pub fn check_sealed(db: &Db, krate: hir::Crate, files: Files<'_>, options: &Options) -> Vec<Diag> {
+/// blaze: the check of a dependency of which nothing else is checked (only what the build's
+/// programs reach of it): rustc's errors of expanding its macro calls and lowering its bodies
+/// ([`hir::check::check_expansions`]), each in a body with a note naming the body; and, when a
+/// crate of its graph seals a trait ([`hir_ty::sealed_in_graph`]), the `#[blaze::sealed]`
+/// checks of `krate` alone ([`hir::check::check_sealed`]) and rustc's orphan check of each impl
+/// of another crate's trait (`lower::trait_impl_orphan::in_sealed_graph`). Lowered as
+/// [`check_crate`] lowers them, with rustc's closing lines. Its lints are left out, as
+/// `--cap-lints` leaves a dependency's, and of expanding and lowering so is anything not an
+/// error. Empty for a crate
+/// whose expansion and lowering found nothing and with no sealed trait in its graph.
+pub fn check_reached_only(db: &Db, krate: hir::Crate, files: Files<'_>, options: &Options) -> Vec<Diag> {
     hir::attach_db(db, || {
-        let checked = hir::check::check_sealed(db, krate);
-        if checked.diagnostics.is_empty() && checked.foreign_impls.is_empty() {
+        let expanded = hir::check::check_expansions(db, krate);
+        let sealed = hir::check::check_sealed(db, krate);
+        if expanded.is_empty() && sealed.diagnostics.is_empty() && sealed.foreign_impls.is_empty() {
             return Vec::new(); // alloc: empty, allocates nothing
         }
         frame::task(Tag::Diagnostics, |frame| {
             let cx = Cx::new(db, krate, files, frame).with_lints(&options.lints);
-            // alloc: the error path, the few refusals of a crate in a sealed graph
+            // alloc: the error path, the few refusals of a dependency
             let mut lowered: Vec<Found> = Vec::new();
-            for diagnostic in checked.diagnostics {
+            // Of expanding and lowering, only the errors: an inactive item's note or a lint is
+            // not rustc's to show of a dependency.
+            let error = |it: &Found| it.diag.is_error() && !it.diag.is_lint();
+            for diagnostic in expanded.items {
+                lowered.extend(lower::lower(&cx, diagnostic).into_iter().filter(error));
+            }
+            for (owner, found) in expanded.bodies {
+                let at = lowered.len();
+                for diagnostic in found {
+                    lowered.extend(lower::lower(&cx, diagnostic).into_iter().filter(error));
+                }
+                if lowered.len() == at {
+                    continue;
+                }
+                // alloc: the error path, a body's path, once per body with an error
+                let mut path = String::new();
+                hir_def::span_names::write_body_path(db, owner, &mut path);
+                for it in &mut lowered[at..] {
+                    // alloc: the error path, the note naming the body
+                    it.diag.note(format!("in the body of `{path}`"));
+                }
+            }
+            for diagnostic in sealed.diagnostics {
                 lowered.extend(lower::lower(&cx, diagnostic));
             }
-            for foreign in &checked.foreign_impls {
+            for foreign in &sealed.foreign_impls {
                 lowered.extend(lower::trait_impl_orphan::in_sealed_graph(&cx, foreign));
             }
             radix::sort_by_key(&mut lowered, |it| it.phase as u8);

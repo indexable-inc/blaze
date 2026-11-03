@@ -86,7 +86,11 @@ s! {
         pub tm_wday: c_int,
         pub tm_yday: c_int,
         pub tm_isdst: c_int,
+        // wasi-libc's (musl's) `long __tm_gmtoff`: an int where long is 32 bits.
+        #[cfg(target_pointer_width = "32")]
         pub __tm_gmtoff: c_int,
+        #[cfg(target_pointer_width = "64")]
+        pub __tm_gmtoff: c_long,
         pub __tm_zone: *const c_char,
         pub __tm_nsec: c_int,
     }
@@ -182,7 +186,7 @@ s! {
     }
 
     pub struct pthread_attr_t {
-        size: [c_long; 9],
+        size: [c_long; __PTHREAD_ATTR_LONGS],
     }
 
     pub struct pthread_mutexattr_t {
@@ -202,21 +206,44 @@ s! {
     }
 
     pub struct pthread_cond_t {
-        size: [*mut c_void; 12],
+        size: [*mut c_void; __PTHREAD_COND_PTRS],
     }
 
     pub struct pthread_mutex_t {
-        size: [*mut c_void; 6],
+        size: [*mut c_void; __PTHREAD_MUTEX_PTRS],
     }
 
     pub struct pthread_rwlock_t {
-        size: [*mut c_void; 8],
+        size: [*mut c_void; __PTHREAD_RWLOCK_PTRS],
     }
 
     pub struct pthread_barrier_t {
-        size: [*mut c_void; 5],
+        size: [*mut c_void; __PTHREAD_BARRIER_PTRS],
     }
 }
+
+// The sizes of the pthread types, as wasi-libc's (musl's) `alltypes.h` has them for the width of
+// `long`: wasm32-wasip1's, and on a 64-bit wasi (blaze's wasm64-blaze-wasip1) musl's LP64 sizes.
+#[cfg(target_pointer_width = "32")]
+const __PTHREAD_ATTR_LONGS: usize = 9;
+#[cfg(target_pointer_width = "64")]
+const __PTHREAD_ATTR_LONGS: usize = 7;
+#[cfg(target_pointer_width = "32")]
+const __PTHREAD_COND_PTRS: usize = 12;
+#[cfg(target_pointer_width = "64")]
+const __PTHREAD_COND_PTRS: usize = 6;
+#[cfg(target_pointer_width = "32")]
+const __PTHREAD_MUTEX_PTRS: usize = 6;
+#[cfg(target_pointer_width = "64")]
+const __PTHREAD_MUTEX_PTRS: usize = 5;
+#[cfg(target_pointer_width = "32")]
+const __PTHREAD_RWLOCK_PTRS: usize = 8;
+#[cfg(target_pointer_width = "64")]
+const __PTHREAD_RWLOCK_PTRS: usize = 7;
+#[cfg(target_pointer_width = "32")]
+const __PTHREAD_BARRIER_PTRS: usize = 5;
+#[cfg(target_pointer_width = "64")]
+const __PTHREAD_BARRIER_PTRS: usize = 4;
 
 // Declare dirent outside of s! so that it doesn't implement Copy, Eq, Hash,
 // etc., since it contains a flexible array member with a dynamic size.
@@ -278,8 +305,15 @@ pub const AT_EACCESS: c_int = 0x0;
 pub const AT_SYMLINK_NOFOLLOW: c_int = 0x1;
 pub const AT_SYMLINK_FOLLOW: c_int = 0x2;
 pub const AT_REMOVEDIR: c_int = 0x4;
+// wasi-libc's `UTIME_OMIT` (-2) and `UTIME_NOW` (-1).
+#[cfg(target_pointer_width = "32")]
 pub const UTIME_OMIT: c_long = u32_cast_long(0xfffffffe);
+#[cfg(target_pointer_width = "32")]
 pub const UTIME_NOW: c_long = u32_cast_long(0xffffffff);
+#[cfg(target_pointer_width = "64")]
+pub const UTIME_OMIT: c_long = -2;
+#[cfg(target_pointer_width = "64")]
+pub const UTIME_NOW: c_long = -1;
 pub const S_IFIFO: mode_t = 0o1_0000;
 pub const S_IFCHR: mode_t = 0o2_0000;
 pub const S_IFBLK: mode_t = 0o6_0000;
@@ -646,13 +680,13 @@ pub const PTHREAD_SCOPE_PROCESS: c_int = 1;
 pub const PTHREAD_PROCESS_PRIVATE: c_int = 0;
 pub const PTHREAD_PROCESS_SHARED: c_int = 1;
 pub const PTHREAD_MUTEX_INITIALIZER: pthread_mutex_t = pthread_mutex_t {
-    size: [ptr::null_mut(); 6],
+    size: [ptr::null_mut(); __PTHREAD_MUTEX_PTRS],
 };
 pub const PTHREAD_RWLOCK_INITIALIZER: pthread_rwlock_t = pthread_rwlock_t {
-    size: [ptr::null_mut(); 8],
+    size: [ptr::null_mut(); __PTHREAD_RWLOCK_PTRS],
 };
 pub const PTHREAD_COND_INITIALIZER: pthread_cond_t = pthread_cond_t {
-    size: [ptr::null_mut(); 12],
+    size: [ptr::null_mut(); __PTHREAD_COND_PTRS],
 };
 pub const PTHREAD_ONCE_INIT: pthread_once_t = 0;
 pub const PTHREAD_CANCEL_ENABLE: c_int = 0;

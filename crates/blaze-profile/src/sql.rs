@@ -185,6 +185,7 @@ pub fn run_live_with(
 /// Waits for `child` to end, or for `stop`: its exit status, or `None` once it is killed for
 /// `stop`. A thread of its own hears the exit without reaping the child, so the child's
 /// number stays its own until `child` reaps it here, and a kill can reach no other process.
+#[cfg(any(unix, windows))]
 fn ended_or_stopped(child: &mut Child, stop: &Stop) -> io::Result<Option<ExitStatus>> {
     #[cfg(unix)]
     let watched = child.id();
@@ -208,6 +209,16 @@ fn ended_or_stopped(child: &mut Child, stop: &Stop) -> io::Result<Option<ExitSta
             }
         }
     })
+}
+
+/// WASI (the wasm32-wasip1 seed) has no processes, so no DuckDB child can be waited for: an
+/// error naming the call, never a wait that can't end.
+#[cfg(target_os = "wasi")]
+fn ended_or_stopped(_child: &mut Child, _stop: &Stop) -> io::Result<Option<ExitStatus>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "DuckDB: waiting for a child's exit is refused on WASI (the wasm32-wasip1 seed): no processes",
+    ))
 }
 
 /// Waits until the child `pid` has ended, leaving it to be reaped by its `Child`.

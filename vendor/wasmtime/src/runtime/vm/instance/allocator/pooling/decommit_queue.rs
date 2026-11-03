@@ -1,0 +1,234 @@
+//! A queue for batching decommits together.
+//!
+//! We don't immediately decommit a Wasm table/memory/stack/etc... eagerly, but
+//! instead batch them up to be decommitted together. This module implements
+//! that queuing and batching.
+//!
+//! Even when batching is "disabled" we still use this queue. Batching is
+//! disabled by specifying a batch size of one, in which case, this queue will
+//! immediately get flushed every time we push onto it.
+
+use super::PoolingInstanceAllocator;
+use crate::vm::sys::vm::{decommit_pages, iovec};
+use crate::vm::{MemoryAllocationIndex, MemoryImageSlot, Table, TableAllocationIndex};
+use smallvec::SmallVec;
+use std::io;
+
+#[cfg(feature = "async")]
+use wasmtime_fiber::FiberStack;
+
+#[repr(transparent)]
+struct IoVec(iovec);
+
+unsafe impl Send for IoVec {}
+unsafe impl Sync for IoVec {}
+
+impl std::fmt::Debug for IoVec {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IoVec")
+            .field("base", &self.0.iov_base)
+            .field("len", &self.0.iov_len)
+            .finish()
+    }
+}
+
+#[cfg(feature = "async")]
+struct SendSyncStack(FiberStack);
+#[cfg(feature = "async")]
+unsafe impl Send for SendSyncStack {}
+#[cfg(feature = "async")]
+unsafe impl Sync for SendSyncStack {}
+
+#[derive(Default)]
+pub struct DecommitQueue {
+    raw: SmallVec<[IoVec; 2]>,
+    memories: SmallVec<[(MemoryAllocationIndex, MemoryImageSlot, usize); 1]>,
+    tables: SmallVec<[(TableAllocationIndex, Table, usize); 1]>,
+    #[cfg(feature = "async")]
+    stacks: SmallVec<[(SendSyncStack, usize); 1]>,
+    //
+    // TODO: GC heaps are not well-integrated with the pooling allocator
+    // yet. Once we better integrate them, we should start (optionally) zeroing
+    // them, and batching that up here.
+    //
+    // #[cfg(feature = "gc")]
+    // pub gc_heaps: SmallVec<[(GcHeapAllocationIndex, Box<dyn GcHeap>); 1]>,
+}
+
+impl std::fmt::Debug for DecommitQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecommitQueue")
+            .field("raw", &self.raw)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DecommitQueue {
+    /// Append another queue to this queue.
+    pub fn append(
+        &mut self,
+        Self {
+            raw,
+            memories,
+            tables,
+            #[cfg(feature = "async")]
+            stacks,
+        }: &mut Self,
+    ) {
+        self.raw.append(raw);
+        self.memories.append(memories);
+        self.tables.append(tables);
+        #[cfg(feature = "async")]
+        self.stacks.append(stacks);
+    }
+
+    /// How many raw memory regions are enqueued for decommit?
+    pub fn raw_len(&self) -> usize {
+        self.raw.len()
+    }
+
+    /// Enqueue a region of memory for decommit.
+    ///
+    /// It is the caller's responsibility to push the associated data via
+    /// `self.push_{memory,table,stack}` as appropriate.
+    ///
+    /// # Safety
+    ///
+    /// The enqueued memory regions must be safe to decommit when `flush` is
+    /// called (no other references, not in use, won't be otherwise unmapped,
+    /// etc...).
+    pub unsafe fn push_raw(&mut self, ptr: *mut u8, len: usize) {
+        self.raw.push(IoVec(iovec {
+            iov_base: ptr.cast(),
+            iov_len: len,
+        }));
+    }
+
+    /// Push a memory into the queue.
+    ///
+    /// # Safety
+    ///
+    /// This memory should not be in use, and its decommit regions must have
+    /// already been enqueued via `self.enqueue_raw`.
+    pub unsafe fn push_memory(
+        &mut self,
+        allocation_index: MemoryAllocationIndex,
+        image: MemoryImageSlot,
+        bytes_resident: usize,
+    ) {
+        self.memories
+            .push((allocation_index, image, bytes_resident));
+    }
+
+    /// Push a table into the queue.
+    ///
+    /// # Safety
+    ///
+    /// This table should not be in use, and its decommit regions must have
+    /// already been enqueued via `self.enqueue_raw`.
+    pub unsafe fn push_table(
+        &mut self,
+        allocation_index: TableAllocationIndex,
+        table: Table,
+        bytes_resident: usize,
+    ) {
+        self.tables.push((allocation_index, table, bytes_resident));
+    }
+
+    /// Push a stack into the queue.
+    ///
+    /// # Safety
+    ///
+    /// This stack should not be in use, and its decommit regions must have
+    /// already been enqueued via `self.enqueue_raw`.
+    #[cfg(feature = "async")]
+    pub unsafe fn push_stack(&mut self, stack: FiberStack, bytes_resident: usize) {
+        self.stacks.push((SendSyncStack(stack), bytes_resident));
+    }
+
+    /// Returns if any decommit call failed.
+    fn decommit_all_raw(&mut self) -> io::Result<()> {
+        let iov: &[IoVec] = self.raw.as_slice();
+        // SAFETY: `IoVec` is `repr(transparent)` over `iovec` so it should be
+        // safe to reinterpret the slice as the same type.
+        let iov = unsafe { &*(iov as *const [IoVec] as *const [iovec]) };
+
+        // SAFETY: the safety of this function depends on the caller of `push_*`
+        // functions, otherwise this is just forwarding its safety requirements.
+        unsafe {
+            decommit_pages(iov)?;
+        }
+        self.raw.clear();
+        Ok(())
+    }
+
+    /// Flush this queue, decommitting all enqueued regions in batch.
+    ///
+    /// Returns `true` if we did any decommits and returned their entities to
+    /// the associated free lists; `false` if the queue was empty.
+    pub fn flush(mut self, pool: &PoolingInstanceAllocator) -> bool {
+        // First, do the raw decommit syscall(s).
+        let decommit_succeeded = self.decommit_all_raw().is_ok();
+
+        // Second, restore the various entities to their associated pools' free
+        // lists. This is safe, and they are ready for reuse, now that their
+        // memory regions have been decommitted. Each pool's slots are returned
+        // in batch so its index-allocator lock is only acquired once per
+        // flush.
+        let mut deallocated_any = false;
+        if !self.memories.is_empty() {
+            deallocated_any = true;
+            unsafe {
+                pool.memories.deallocate_many(self.memories.into_iter().map(
+                    |(allocation_index, image, bytes_resident)| {
+                        // Note that for memory images the images are all dropped
+                        // here and ignored if any decommits failed. This signifies
+                        // how the state of the slot is unknown and needs to be
+                        // paved over in the future. Also note that
+                        // `bytes_resident` is probably too low, but there's no
+                        // other precise way to know, so it's left here as-is and
+                        // it'll get reset when the slot is reused.
+                        let image = if decommit_succeeded {
+                            Some(image)
+                        } else {
+                            None
+                        };
+                        (allocation_index, image, bytes_resident)
+                    },
+                ));
+            }
+        }
+        if !self.tables.is_empty() {
+            deallocated_any = true;
+            unsafe {
+                pool.tables.deallocate_many(self.tables.into_iter().map(
+                    |(allocation_index, mut table, bytes_resident)| {
+                        // Like with memories, if any decommit failed then we need
+                        // to ensure that tables are still in a defined state.
+                        // Unlike memories which track this via images tables are
+                        // always assumed to be all-null on returning to the
+                        // allocator. If the OS couldn't do it then manually do it
+                        // ourselves here.
+                        if !decommit_succeeded {
+                            table.manually_memset_zeros();
+                        }
+                        (allocation_index, table, bytes_resident)
+                    },
+                ));
+            }
+        }
+        #[cfg(feature = "async")]
+        if !self.stacks.is_empty() {
+            deallocated_any = true;
+            unsafe {
+                pool.stacks.deallocate_many(
+                    self.stacks
+                        .into_iter()
+                        .map(|(stack, bytes_resident)| (stack.0, bytes_resident)),
+                );
+            }
+        }
+
+        deallocated_any
+    }
+}

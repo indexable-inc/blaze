@@ -348,6 +348,7 @@ fn policy() -> Result<(Policy, blaze_stencil::Target), String> {
             panic: Panic::Unwind,
             packages: Default::default(),
             build_override: Override::default(),
+            stencils: false,
         },
         mode: PlanMode::Output,
         fold: false,
@@ -417,7 +418,7 @@ fn survey(
     let hashes = ItemHashes::new(Box::new(move |file: FileId| {
         Some(names.get(&file).cloned().unwrap_or_else(|| format!("file{}.rs", file.index())))
     }));
-    let build_time = Arc::new(BuildTime(Default::default()));
+    let build_time = BuildTime::default();
     let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), build_time).with_policy(policy);
     let backends = Backends::default();
     let memo = Memo::new();
@@ -655,6 +656,7 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str) -> Result<(
             library: stdlib::library_at(&library.commit),
             std: "/s/std".to_owned(),
             builds: "/s/build".to_owned(),
+            sources: "/s/sources".to_owned(),
         };
         let opened = db.open_with(View { root: view }, &config.encode());
         let planned = db.pin().get::<Plan>(opened, &()).map_err(|error| format!("planning {dir}: {error:?}"))?.get();

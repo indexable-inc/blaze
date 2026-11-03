@@ -302,8 +302,10 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         let node = self.cx.node_view(src);
         let syntax = node.value.syntax();
         let local = hir::Crate::from(hir_def::HasModule::krate(&owner, db)) == self.cx.krate;
-        if !local {
-            let path = paths::closure_path(self.cx, syntax).expect("a closure is written in a body");
+        // A dependency's closure by its path; one in a block with no function, const or
+        // static around it (an array length, a discriminant: rustc's `{constant#N}`, which
+        // `closure_path` doesn't give) by its span, as a local one.
+        if !local && let Some(path) = paths::closure_path(self.cx, syntax) {
             return Site::Path(path);
         }
         Site::Span(self.cx.span(node.with_value(crate::cx::closure_decl_range_view(syntax))))

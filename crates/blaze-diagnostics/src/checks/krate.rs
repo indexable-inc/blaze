@@ -129,7 +129,7 @@ fn main_def(cx: &Cx<'_, '_>, root: hir::Module) -> Option<MainDef> {
 /// rustc's `no_main_err`.
 fn no_main(cx: &Cx<'_, '_>, root: hir::Module, non_main_fns: &[&FreeItem<'_>], main: Option<MainDef>) -> Diag {
     // alloc: the error's message
-    let message = format!("`main` function not found in crate `{}`", crate_name(cx, root));
+    let message = format!("`main` function not found in crate `{}`", cx.crate_name(cx.krate));
     let file = root.as_source_file_id(cx.db).map(|it| it.file_id(cx.db));
     let filename = file.map(|it| cx.file_name(it));
     let at = file.and_then(|file| Some(cx.span_in_file(file, TextRange::empty(crate_end(cx, file)?))));
@@ -175,17 +175,6 @@ fn no_main(cx: &Cx<'_, '_>, root: hir::Module, non_main_fns: &[&FreeItem<'_>], m
         diag.fact(cx.resolves_fact(item.module, "main"), "the items named `main` below the crate root");
     }
     diag
-}
-
-/// The crate's name: `--crate-name`, else rustc's from the root file's name.
-fn crate_name(cx: &Cx<'_, '_>, root: hir::Module) -> String {
-    if let Some(name) = cx.krate.display_name(cx.db) {
-        // alloc: the error's message
-        return name.crate_name().to_string();
-    }
-    let file = root.as_source_file_id(cx.db).map(|it| cx.file_name(it.file_id(cx.db))).unwrap_or_default();
-    let stem = file.rsplit('/').next().unwrap_or(&file);
-    stem.strip_suffix(".rs").unwrap_or(stem).replace('-', "_")
 }
 
 /// Where the crate root's span ends (rustc's `inner_span.hi()`): after its last token, or at

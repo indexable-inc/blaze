@@ -268,6 +268,6 @@ fn arch(target: &Target) -> usize {
     match target.arch {
         blaze_codegen::Arch::X86_64 => 0,
         blaze_codegen::Arch::Aarch64 => 1,
-        blaze_codegen::Arch::Wasm32 => panic!("wasm32 has no stencils"),
+        blaze_codegen::Arch::Wasm32 | blaze_codegen::Arch::Wasm64 => panic!("wasm has no stencils"),
     }
 }

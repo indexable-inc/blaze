@@ -15,7 +15,7 @@ use db::TestDB;
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(fixture::db(text).into_db()));
     let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned()))));
-    (db, HirFrontend::new(Databases::new(db), hashes, Arc::new(BuildTime(Default::default()))))
+    (db, HirFrontend::new(Databases::new(db), hashes, BuildTime::default()))
 }
 
 /// The builtin macros a crate's `global_asm!` and corosensei's own reach.
@@ -265,14 +265,15 @@ fn an_assemblers_lines_are_read_from_its_error() {
     assert!(diagnostics("inline assembly: nothing here assembles it").is_empty());
 }
 
-/// A blaze without LLVM assembles no `global_asm!`: it says so, naming the block, and never
-/// hands the text to the machine's C compiler (docs/v2/plan/toolchain-c.md, slice 1).
+/// A blaze with no assembler (neither LLVM nor rsasm) assembles no `global_asm!`: it says so,
+/// naming the block, and never hands the text to the machine's C compiler
+/// (docs/v2/plan/toolchain-c.md, slice 1).
 #[test]
-#[cfg(not(feature = "llvm"))]
+#[cfg(not(any(feature = "llvm", feature = "rsasm")))]
 fn without_llvm_a_global_asm_is_an_error_not_the_machines_compiler() {
     let text = format!("//- /lib.rs crate:nollvm\n{BUILTINS}\nglobal_asm!(\"nop\");\n");
     let error = assembled("x86_64-unknown-linux-gnu", &text).unwrap_err();
-    for said in ["of crate `nollvm`", "built without LLVM", "pinned LLVM", "--features llvm"] {
+    for said in ["of crate `nollvm`", "built with no assembler", "--features llvm", "--features rsasm"] {
         assert!(error.contains(said), "says {said:?}: {error}");
     }
 }

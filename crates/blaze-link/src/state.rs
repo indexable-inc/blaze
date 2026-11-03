@@ -115,7 +115,8 @@ pub(crate) enum What {
     /// [`State::function`] of this.
     Function(FuncId),
     /// Shared by what refers to it and gone with the last: read-only data merged by content,
-    /// a panic location, a file name, a CIE. [`State::users`] counts the fixups to it.
+    /// a panic location, a file name, a CIE. [`State::users`] counts the pieces whose fixups
+    /// refer to it, each once, but for the linker's cells ([`What::is_linkers_cell`]).
     Shared,
     Static { thread_local: bool },
     Native { obj: Obj, section: u32, unwind: bool },
@@ -135,6 +136,20 @@ pub(crate) enum What {
     /// The jump table's cells: no fixups. Entry `slot` holds the address of
     /// [`State::cell`] of it.
     Cells,
+}
+
+impl What {
+    /// Whether the piece is a GOT cell or PLT stub: the linker's own, made for the fixups that
+    /// reach their target through it (`Stage::needs`), and gone with its target
+    /// (`Stage::cells_of_removed`). It is no user of its target: each fixup it was made for
+    /// refers to the target itself. Counted, a cell would keep alive the data it holds the
+    /// address of after the last code reading it went (a vtable naming a function the same
+    /// change removes), since nothing removes a cell whose target is live. Neither the sweep
+    /// of shared pieces ([`State::users`]) nor native collection counts it.
+    #[inline]
+    pub fn is_linkers_cell(self) -> bool {
+        matches!(self, What::Got { .. } | What::Plt { .. })
+    }
 }
 
 /// A full link's order within a class: rank, then for native pieces the input's place on the
@@ -489,7 +504,9 @@ pub(crate) struct State {
     sort: CowVec<Sort>,
     piece_lists: CowVec<Lists>,
     loader: CowVec<Loader>,
-    /// Of each [`What::Shared`] piece, the fixups to it.
+    /// Of each [`What::Shared`] piece, how many live pieces refer to it ([`State::targets`]
+    /// counts each piece once, however many of its fixups do), but for the linker's cells
+    /// ([`What::is_linkers_cell`]).
     users: CowVec<u32>,
     fixups: CowList<Fixup>,
     syms: CowList<Sym>,
@@ -1196,12 +1213,6 @@ impl State {
             .filter(|(_, it)| **it != crate::symbols::NO_SYM)
             .map(|(slot, it)| (slot as u32, *it))
     }
-}
-
-/// Whether a class's regions have no bytes in the file: zeroed at load, or a dev run's
-/// reservation ([`crate::model::reserved`]).
-pub(crate) fn zeroed(class: &Class) -> bool {
-    matches!(class, Class::Bss | Class::Tbss | Class::Reserve(_))
 }
 
 /// Whether a format reaches functions by address through stubs (not wasm's indexes).

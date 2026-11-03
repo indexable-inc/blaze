@@ -13,6 +13,7 @@ mod tests;
 use std::{path::PathBuf, sync::Arc};
 
 use blaze_api::ApiError;
+use blaze_ids::{ContentId, Hasher};
 use blaze_registry::http::{Http, HttpNotSuccessful, HyperHttp, Response, Retry};
 use blaze_units::query::{Fetch, FetchKind};
 use blaze_vfs::Mode;
@@ -155,6 +156,217 @@ impl<H: Http + 'static> Fetcher<H> {
             Ok(answer)
         })
     }
+}
+
+/// The file [`keep_on_disk`] writes last into each package directory, holding the
+/// [`on_disk_id`] of what it wrote: a directory without it, or with another id, is not the
+/// package its mount holds.
+pub const ON_DISK_MARK: &str = ".blaze-ok";
+
+const ON_DISK_DOMAIN: &str = "blaze v2 fetched package on disk 1";
+
+/// What a package directory written on disk holds, by each file's `/`-separated path under it
+/// (each once), mode and [`blaze_vfs::FILE_DOMAIN`] content id: the one id [`keep_on_disk`]
+/// writes into [`ON_DISK_MARK`] and the daemon's start checks a recovered mount's root
+/// against ([`super::mounts::Mounts::forget_unwritten`]), so the files a build script reads
+/// from disk are the files the front end compiles from the mount.
+pub fn on_disk_id<'a>(files: impl Iterator<Item = (&'a str, Mode, ContentId)>) -> ContentId {
+    // alloc: once per package written or checked, its files sorted by path
+    let mut files: Vec<(&str, Mode, ContentId)> = files.collect();
+    files.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut hasher = Hasher::new(ON_DISK_DOMAIN);
+    for (path, mode, id) in files {
+        let mode: u8 = match mode {
+            Mode::Regular => 0,
+            Mode::Executable => 1,
+            Mode::Symlink => 2,
+        };
+        hasher.part(path.as_bytes()).update(&[mode]).id(&id);
+    }
+    hasher.finish()
+}
+
+/// [`on_disk_id`] of a fetched source's files.
+pub fn source_on_disk_id(source: &Source) -> ContentId {
+    on_disk_id(
+        source.files.iter().map(|it| (it.path.as_str(), it.mode, ContentId::of(blaze_vfs::FILE_DOMAIN, &it.bytes))),
+    )
+}
+
+/// The id `dir`'s [`ON_DISK_MARK`] holds: `Ok(None)` for no mark, an error for one that is
+/// not an id.
+pub fn on_disk_mark(dir: &std::path::Path) -> Result<Option<ContentId>, String> {
+    let mark = dir.join(ON_DISK_MARK);
+    let text = match std::fs::read_to_string(&mark) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("reading {}: {e}", mark.display())),
+    };
+    let hex = text.trim_end();
+    let bytes: Option<Vec<u8>> = (hex.len() == 64)
+        .then(|| (0..32).map(|at| u8::from_str_radix(hex.get(2 * at..2 * at + 2)?, 16).ok()).collect())
+        .flatten();
+    let bytes: [u8; 32] = bytes
+        .and_then(|it| it.try_into().ok())
+        .ok_or_else(|| format!("{} holds `{hex}`, which is no content id", mark.display()))?;
+    Ok(Some(ContentId(bytes)))
+}
+
+/// Why `at` is not a place [`keep_on_disk`] writes a package: it must be an absolute path with
+/// no empty, `.` or `..` part, under `<sources>/registry/src/` or `<sources>/git/checkouts/`.
+/// A lock file names the package (its name, a git commit), and nothing it says may move the
+/// write out of blaze's sources.
+fn outside_sources(at: &str, sources: &std::path::Path) -> Option<String> {
+    let Some(rest) = at.strip_prefix('/') else { return Some("it is not an absolute path".to_owned()) };
+    if let Some(part) = rest.split('/').find(|it| matches!(*it, "" | "." | "..")) {
+        return Some(format!("it has a part `{part}`, which names no directory of its own"));
+    }
+    let sources = sources.to_string_lossy();
+    let sources = sources.trim_end_matches('/');
+    let under = ["registry/src/", "git/checkouts/"];
+    match under.iter().any(|it| at.strip_prefix(sources).and_then(|rest| rest.strip_prefix('/')).is_some_and(|rest| rest.starts_with(it))) {
+        true => None,
+        false => Some(format!("it is under neither {sources}/registry/src/ nor {sources}/git/checkouts/")),
+    }
+}
+
+/// A fetched package (a `.crate`'s files, a git tree) written on disk where it is mounted,
+/// `fetch.at` under blaze's own sources directory `sources` ([`blaze_manifest::home::sources`]):
+/// a build script runs in its package's directory and reads it from disk, as does the C
+/// compiler it runs (`cc`'s `src/lib.c`), so the sandbox is given a directory that exists
+/// without cargo ever having unpacked the package into `$CARGO_HOME`. A sparse index's file is
+/// only the load's and is not written. An `at` outside `<sources>/registry/src/` and
+/// `<sources>/git/checkouts/`, or with a `..` in it, is refused ([`outside_sources`]).
+///
+/// Written whole or not at all: into a directory of its own beside `at`, its files read-only,
+/// [`ON_DISK_MARK`] last, renamed into place. A directory already at `at` is kept only when its
+/// mark holds this source's [`on_disk_id`]; one with no mark or another id is an error naming
+/// both, never read as the package.
+pub fn keep_on_disk(fetch: &Fetch, source: &Source, sources: &std::path::Path) -> Result<(), ApiError> {
+    if matches!(fetch.kind, FetchKind::IndexFile) {
+        return Ok(());
+    }
+    let fail = |what: String| ApiError::new(what, Some(fetch.what.clone()));
+    if let Some(why) = outside_sources(&fetch.at, sources) {
+        return Err(fail(format!("blaze will not write the package `{}` to {}: {why}", fetch.what, fetch.at)));
+    }
+    let at = std::path::Path::new(&fetch.at);
+    let id = source_on_disk_id(source);
+    if at.is_dir() {
+        return same_on_disk(at, id).map_err(fail);
+    }
+    if source.files.iter().any(|it| it.path == ON_DISK_MARK) {
+        return Err(fail(format!(
+            "the package `{}` has a file `{ON_DISK_MARK}`, the name of the mark blaze writes into it on disk",
+            fetch.what
+        )));
+    }
+    let (Some(parent), Some(name)) = (at.parent(), last_part(&fetch.at)) else {
+        return Err(fail(format!("`{}` names no package directory to write the package into", fetch.at)));
+    };
+    std::fs::create_dir_all(parent).map_err(|e| fail(format!("creating {}: {e}", parent.display())))?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let part = parent.join(format!(".{name}{PART}{}-{n}", std::process::id()));
+    let written = write_tree(&part, &source.files)
+        .and_then(|()| {
+            let mark = part.join(ON_DISK_MARK);
+            std::fs::write(&mark, format!("{id:x}\n")).map_err(|e| format!("{}: {e}", mark.display()))
+        })
+        .and_then(|()| match std::fs::rename(&part, at) {
+            Ok(()) => Ok(()),
+            // Another fetch of the same package put it there first: kept if it is the same.
+            Err(_) if at.is_dir() => {
+                std::fs::remove_dir_all(&part).map_err(|e| format!("removing {}: {e}", part.display()))?;
+                same_on_disk(at, id)
+            }
+            Err(e) => Err(format!("renaming {} to {}: {e}", part.display(), at.display())),
+        });
+    written.map_err(|why| {
+        _ = std::fs::remove_dir_all(&part);
+        fail(format!("writing the package to {}: {why}", at.display()))
+    })
+}
+
+/// What a package directory being written is named, after a `.` and the package's directory
+/// name: `.<name>.part-<pid>-<n>`.
+const PART: &str = ".part-";
+
+/// Whether the package directory `at` holds what `id` says, by its [`ON_DISK_MARK`].
+fn same_on_disk(at: &std::path::Path, id: ContentId) -> Result<(), String> {
+    match on_disk_mark(at)? {
+        Some(it) if it == id => Ok(()),
+        Some(it) => Err(format!(
+            "{} holds the files of {it:x} by its {ON_DISK_MARK}, and the package fetched for it is \
+             {id:x}: something changed it or another package was written there; delete it and \
+             blaze writes it again",
+            at.display()
+        )),
+        None => Err(format!(
+            "{} is there without the {ON_DISK_MARK} blaze writes last into a package it fetched \
+             ({id:x}), so it is not known to hold that package; delete it and blaze writes it again",
+            at.display()
+        )),
+    }
+}
+
+/// The package directories a write left half done (`.<name>.part-<pid>-<n>`, beside where each
+/// package goes under `<sources>/registry/src/<dir>/` and `<sources>/git/checkouts/<ident>/`),
+/// removed: a daemon that stopped mid-write leaves one, which nothing reads. Returns each
+/// removed; an error names the one that could not be.
+pub fn sweep_parts(sources: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut removed = Vec::new();
+    for under in ["registry/src", "git/checkouts"] {
+        let Ok(groups) = std::fs::read_dir(sources.join(under)) else { continue };
+        for group in groups.flatten() {
+            let Ok(entries) = std::fs::read_dir(group.path()) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') && name.contains(PART) {
+                    let path = entry.path();
+                    std::fs::remove_dir_all(&path).map_err(|e| format!("removing the half-written package {}: {e}", path.display()))?;
+                    removed.push(path);
+                }
+            }
+        }
+    }
+    removed.sort();
+    Ok(removed)
+}
+
+/// `files` written under the new directory `dir`, each with its mode, read-only: a fetched
+/// package is never edited in place (its [`ON_DISK_MARK`] would no longer hold).
+fn write_tree(dir: &std::path::Path, files: &[SourceFile]) -> Result<(), String> {
+    std::fs::create_dir(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    for file in files {
+        let path = dir.join(&file.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        }
+        match file.mode {
+            Mode::Symlink => {
+                let to = String::from_utf8_lossy(&file.bytes);
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(to.as_ref(), &path).map_err(|e| format!("{}: {e}", path.display()))?;
+                #[cfg(not(unix))]
+                return Err(format!("{} is a symlink to {to}, and this platform has none to write", path.display()));
+            }
+            Mode::Regular | Mode::Executable => {
+                std::fs::write(&path, &file.bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+                let mut permissions = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?.permissions();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    permissions.set_mode(if file.mode == Mode::Executable { 0o555 } else { 0o444 });
+                }
+                #[cfg(not(unix))]
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&path, permissions).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The last `/`-separated part of an absolute path, when it is a name.

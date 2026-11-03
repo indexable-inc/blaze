@@ -26,7 +26,10 @@ normal code:
 - **The root** is corosensei's `Yielder::suspend` (crate `corosensei`, inherent method `suspend`
   of `Yielder`): the one call that switches a fiber out. Only `blaze_graph::sched::fiber` calls
   it, and the fiber-boundary lint keeps it there, so it is the fiber driver's suspend
-  (`Cx::switch`) and nothing else.
+  (`Cx::switch`) and nothing else. Since 2026-11-02 (lane seedfiber2) the root is the stack
+  layer's `blaze_graph::sched::stack::Yielder::suspend`, the same path on native (corosensei
+  under it) and on wasm (the seed host's fibers, `blaze_seed.fiber_*`, since lane wasm64fiber,
+  2026-11-02), and a `blaze_graph` without it is the error `MissingRoot`.
 - **An instance is may-suspend** when a call in its monomorphized runtime MIR reaches the root:
   directly, through a function it calls, a closure it calls through `Fn*`, drop glue, the
   `Future::poll` of an `async` block, or the impl's method of a trait method it calls with a

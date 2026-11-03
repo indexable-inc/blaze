@@ -7,22 +7,31 @@
 //!
 //! - impls: one crate's impls of one trait ([`trait_impls_in`], from hir-ty's per-module
 //!   bucket `TraitImpls::for_crate_and_trait`, which reruns only when a module's impls of that
-//!   trait change), then every crate's impls of the trait ([`trait_impls`]), then the impls for
-//!   one simplified self type ([`impls_of`]) and the blanket ones ([`blanket_impls_of`]);
+//!   trait change) and their values, all of them ([`own_impls_value`]), for one simplified self
+//!   type ([`own_impls_for`]) or the blanket ones ([`own_blanket_impls`]); then, for a crate
+//!   that asks, the crates it sees with an impl of the trait ([`trait_holders`]) and what their
+//!   values combine to ([`seen_impls_value`], [`implements_entries`]);
 //! - inherent impls: one module's by simplified self type ([`inherent_impls_in_module`]), the
 //!   modules of a crate with impls for each type ([`inherent_impl_modules`],
 //!   [`inherent_modules_of`]) and one module's for one type ([`module_inherent_impls_of`]),
-//!   then every crate's for one self type ([`inherent_impls_of`]); a frozen crate's come from
-//!   its one frozen table ([`inherent_impls_in`]);
+//!   then the seen crates' for one self type ([`inherent_impls_of`]); a frozen crate's come
+//!   from its one frozen table ([`inherent_impls_in`]);
 //! - traits with an item of a name, for method candidates: one crate's for one name, from
-//!   hir-ty's maintained candidate slice ([`traits_named`]), then every crate's
+//!   hir-ty's maintained candidate slice ([`traits_named`]), then the seen crates'
 //!   ([`traits_with`]); a frozen crate's per module ([`traits_in_module`], [`traits_in`]);
 //! - names: one scope's, all of them ([`scope_names`]), from which [`scope`] picks one.
 //!
-//! Impls are found as hir-ty's `TraitImpls` and `InherentImpls` find them, in every crate:
+//! Impls are found as hir-ty's `TraitImpls` and `InherentImpls` find them, in each crate:
 //! the crate's modules, the bodies that may hold impls, and built-in derive impls. Traits are
-//! found in every crate's modules; a trait declared in a body is visible only in that body,
+//! found in each crate's modules; a trait declared in a body is visible only in that body,
 //! whose own edit reruns whatever read it.
+//!
+//! Every question that spans crates is asked by a crate and reads only the crates it sees
+//! ([`loaded_crates`]): itself and those rustc loads to compile it, which a build builds, their
+//! proc macros first, before any job of the asking crate runs. No index walks the whole crate
+//! graph: another member, a sibling test target, or a crate whose proc macros are not built yet
+//! (whose calls expand to nothing until they are) is never read, so no answer a crate keeps
+//! depends on which other units the build has reached.
 //!
 //! Each index is columns (docs/v2/plan/design/data.md): the searched column apart, so a binary
 //! search touches only it, keys and the cold payloads beside it, and lists as runs of one
@@ -51,7 +60,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use hir_ty::{
     db::HirDatabase,
-    method_resolution::{InherentImpls, TraitImpls, delta, frozen},
+    method_resolution::{InherentImpls, TraitImpls, delta, frozen, loaded_crates},
     next_solver::{DbInterner, SimplifiedType as HirSimplifiedType},
 };
 use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
@@ -67,6 +76,7 @@ use crate::{
 const IMPLS_DOMAIN: &str = "blaze v2 index impls 2";
 const SCOPE_DOMAIN: &str = "blaze v2 index scope 1";
 const BUILTIN_DERIVE_DOMAIN: &str = "blaze v2 builtin derive signature 1";
+const SEEN_IMPLS_DOMAIN: &str = "blaze v2 seen impls 1";
 
 /// The hash of each of `names`, in order, as [`key::name_hash`] gives it, in one batched call.
 pub(crate) fn name_hashes<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<NameHash> {
@@ -79,22 +89,41 @@ pub(crate) fn name_hashes<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<N
     hashes.into_iter().map(NameHash).collect()
 }
 
-/// The impls of `key.trait_` whose simplified self type is `key.self_ty`, by key and
-/// signature hash, sorted; empty is "no impl". Answers `Implements` both ways.
-pub fn impls(db: &Db, key: ImplIndexKey) -> Result<ImplEntry, Unhashable> {
+/// The impls of `key.trait_` that `krate` sees ([`loaded_crates`]) whose simplified self type is
+/// `key.self_ty`, by key and signature hash, sorted; empty is "no impl". Answers `Implements`
+/// both ways.
+pub fn impls(db: &Db, krate: Crate, key: ImplIndexKey) -> Result<ImplEntry, Unhashable> {
     match resolve_trait(db, key.trait_) {
-        Some(trait_) => entry(db, impls_of(db, trait_, key.self_ty).iter()),
+        Some(trait_) => seen_entry(db, krate, trait_, Some(key.self_ty)),
         None => Ok(ImplEntry::TraitAbsent),
     }
 }
 
-/// The impls of `trait_` whose self type simplifies to nothing (`impl<T> Trait for T`): they
-/// unify with any self type.
-pub fn blanket_impls(db: &Db, trait_: ItemKey) -> Result<ImplEntry, Unhashable> {
+/// The impls of `trait_` that `krate` sees whose self type simplifies to nothing
+/// (`impl<T> Trait for T`): they unify with any self type.
+pub fn blanket_impls(db: &Db, krate: Crate, trait_: ItemKey) -> Result<ImplEntry, Unhashable> {
     match resolve_trait(db, trait_) {
-        Some(trait_) => entry(db, blanket_impls_of(db, trait_).iter()),
+        Some(trait_) => seen_entry(db, krate, trait_, None),
         None => Ok(ImplEntry::TraitAbsent),
     }
+}
+
+/// The impls of `trait_` in the crates `krate` sees, of the run of `self_ty` (`None`: the
+/// blanket ones), sorted by key.
+fn seen_entry(
+    db: &Db,
+    krate: Crate,
+    trait_: TraitId,
+    self_ty: Option<SimplifiedType>,
+) -> Result<ImplEntry, Unhashable> {
+    frame::task(Tag::Other, |frame| {
+        let mut rows: Vec<(ItemKey, AnyImpl), &Frame> = Vec::new_in(frame);
+        for &holder in trait_holders(db, krate, trait_) {
+            rows.extend(trait_impls_in(db, holder, trait_).run(self_ty).iter());
+        }
+        rows.sort_unstable_by_key(|&(key, _)| key);
+        entry(db, rows.iter().copied())
+    })
 }
 
 /// What `key.name` is in `key.scope`; "nothing" is an answer. Answers `Resolves` both ways.
@@ -322,39 +351,154 @@ where
     Ok(ImplEntry::Impls(found.into_boxed_slice()))
 }
 
-/// The value of `Implements { trait_, self_ty }`: the impls for that self type and the
-/// blanket ones.
+/// The crates `krate` sees ([`loaded_crates`]) that hold an impl of `trait_`, in that order: what
+/// each impl question of `krate` about `trait_` combines, so a crate with none of its impls
+/// costs a read here, once per asking crate and trait, and none per question.
+#[blaze_query::tracked(returns(deref))]
+fn trait_holders(db: &Db, krate: Crate, trait_: TraitId) -> Box<[Crate]> {
+    let _p = tracing::info_span!(target: "blaze", "trait_holders", ?krate, ?trait_).entered();
+    frame::task(Tag::Other, |frame| {
+        let mut found: Vec<Crate, &Frame> = Vec::new_in(frame);
+        for &seen in loaded_crates(db, krate) {
+            if trait_impls_in(db, seen, trait_).all().iter().len() != 0 {
+                found.push(seen);
+            }
+        }
+        Box::from(&found[..]) // alloc: the memo's value at its length.
+    })
+}
+
+/// The value of `Implements { trait_, self_ty }` as `krate` sees it: the impls for that self
+/// type and the blanket ones, of the crates it sees.
 pub(crate) fn implements_value(
     db: &Db,
     domain: &'static str,
+    krate: Crate,
     trait_: TraitId,
     self_ty: SimplifiedType,
 ) -> Result<ContentId, Unhashable> {
-    let (impls, blanket) = implements_entries(db, trait_, self_ty)?;
+    let (impls, blanket) = implements_entries(db, krate, trait_, self_ty)?;
     Ok(Hasher::new(domain).part(b"present").id(&impls).id(&blanket).finish())
 }
 
-/// The values of the impls of `trait_` for `self_ty` and of its blanket impls, hashed once
-/// for every fact that reads them.
+/// The values of the impls of `trait_` for `self_ty` and of its blanket impls that `krate`
+/// sees, hashed once for every fact of `krate` that reads them: each holder's own values,
+/// combined ([`combined`]).
 #[blaze_query::tracked(returns(copy))]
 fn implements_entries(
     db: &Db,
+    krate: Crate,
     trait_: TraitId,
     self_ty: SimplifiedType,
 ) -> Result<(ContentId, ContentId), Unhashable> {
-    let impls = entry(db, impls_of(db, trait_, self_ty).iter())?;
-    let blanket = entry(db, blanket_impls_of(db, trait_).iter())?;
-    Ok((impls.value(), blanket.value()))
+    let holders = trait_holders(db, krate, trait_);
+    let impls = combined(holders.iter().map(|&it| own_impls_for(db, it, trait_, self_ty)))?;
+    Ok((impls, seen_blanket_value(db, krate, trait_)?))
 }
 
-/// The value of every impl of `trait_`, in the order of [`trait_impls`]: what a blanket impl's
-/// coherence reads, hashed once per trait rather than once per blanket impl.
+/// The value of the blanket impls of `trait_` that `krate` sees, once per crate and trait.
 #[blaze_query::tracked(returns(copy))]
-pub(crate) fn all_impls_value(
+fn seen_blanket_value(db: &Db, krate: Crate, trait_: TraitId) -> Result<ContentId, Unhashable> {
+    combined(trait_holders(db, krate, trait_).iter().map(|&it| own_blanket_impls(db, it, trait_)))
+}
+
+/// The value of every impl of `trait_` that `krate` sees ([`loaded_crates`]): what an object of
+/// `trait_` made in a body of `krate` can hold, and what a blanket impl's coherence in `krate`
+/// reads. An object's source type and the trait's arguments are named in the body, so the
+/// orphan rule puts each impl that could apply in a crate `krate` sees. An impl of a crate it
+/// does not see (another member, a sibling test target, a crate of the graph no binary of
+/// `krate` links) is none of it, so neither its edits nor its errors reach `krate`'s bound
+/// hashes; a generic body's objects of a downstream type are its instances', whose vtables are
+/// among their refs (`blaze_codegen::exec::bound`).
+///
+/// It combines each holder's [`own_impls_value`], so a crate's impls are hashed once for every
+/// crate that sees it rather than once per one: O(holders) here.
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn seen_impls_value(
     db: &Db,
+    krate: Crate,
     trait_: TraitId,
 ) -> Result<ContentId, Unhashable> {
-    Ok(entry(db, trait_impls(db, trait_).all().iter())?.value())
+    combined(trait_holders(db, krate, trait_).iter().map(|&it| own_impls_value(db, it, trait_)))
+}
+
+/// Per-crate values, `None` for a crate with none, as one: sorted, so the walk's order is not
+/// part of the hash (rule 22); each value covers its impls' keys, so the set of impls is still
+/// what it hashes. An error of any is the error.
+fn combined(
+    owns: impl Iterator<Item = Result<Option<ContentId>, Unhashable>>,
+) -> Result<ContentId, Unhashable> {
+    frame::task(Tag::Other, |frame| {
+        let mut found: Vec<ContentId, &Frame> = Vec::new_in(frame);
+        for own in owns {
+            if let Some(own) = own? {
+                found.push(own);
+            }
+        }
+        found.sort_unstable();
+        let mut hasher = Hasher::new(SEEN_IMPLS_DOMAIN);
+        hasher.update(&(found.len() as u64).to_le_bytes());
+        for own in found.iter() {
+            hasher.id(own);
+        }
+        Ok(hasher.finish())
+    })
+}
+
+/// The value of the impls of `trait_` in `krate` alone, sorted by key: `None` when it has
+/// none. What [`seen_impls_value`] combines over the crates a crate sees.
+#[blaze_query::tracked(returns(copy))]
+fn own_impls_value(
+    db: &Db,
+    krate: Crate,
+    trait_: TraitId,
+) -> Result<Option<ContentId>, Unhashable> {
+    own_value(db, trait_impls_in(db, krate, trait_).all(), true)
+}
+
+/// The value of the impls of `trait_` for `self_ty` in `krate` alone: `None` when it has none.
+#[blaze_query::tracked(returns(copy))]
+fn own_impls_for(
+    db: &Db,
+    krate: Crate,
+    trait_: TraitId,
+    self_ty: SimplifiedType,
+) -> Result<Option<ContentId>, Unhashable> {
+    own_value(db, trait_impls_in(db, krate, trait_).run(Some(self_ty)), false)
+}
+
+/// The value of the blanket impls of `trait_` in `krate` alone: `None` when it has none.
+#[blaze_query::tracked(returns(copy))]
+fn own_blanket_impls(
+    db: &Db,
+    krate: Crate,
+    trait_: TraitId,
+) -> Result<Option<ContentId>, Unhashable> {
+    own_value(db, trait_impls_in(db, krate, trait_).run(None), false)
+}
+
+/// The value of `impls`, sorted by key (a run is already; every row is not, `sort`): `None`
+/// when there are none.
+fn own_value(
+    db: &Db,
+    impls: Columns<'_, AnyImpl>,
+    sort: bool,
+) -> Result<Option<ContentId>, Unhashable> {
+    if impls.iter().len() == 0 {
+        return Ok(None);
+    }
+    frame::task(Tag::Other, |frame| {
+        let mut rows: Vec<(ItemKey, AnyImpl), &Frame> = Vec::new_in(frame);
+        rows.extend(impls.iter());
+        if sort {
+            rows.sort_unstable_by_key(|&(key, _)| key);
+        }
+        debug_assert!(
+            rows.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "the impls of one trait in one crate are sorted by key, no two sharing one"
+        );
+        Ok(Some(entry(db, rows.iter().copied())?.value()))
+    })
 }
 
 pub(crate) fn resolve_trait(db: &Db, trait_: ItemKey) -> Option<TraitId> {
@@ -431,19 +575,6 @@ impl<S: Copy + Ord, T: Copy> Runs<S, T> {
     pub(crate) fn all(&self) -> Columns<'_, T> {
         Columns { keys: &self.keys, values: &self.values }
     }
-
-    /// Every row with its searched value, in order.
-    fn rows(&self) -> impl Iterator<Item = (Option<S>, ItemKey, T)> + '_ {
-        let none = self.run(None).iter().map(|(key, value)| (None, key, value));
-        let runs = self.searched.iter().enumerate().flat_map(move |(i, &at)| {
-            let rows = self.starts[i] as usize..self.starts[i + 1] as usize;
-            // clone: a range, two indexes.
-            Columns { keys: &self.keys[rows.clone()], values: &self.values[rows] }
-                .iter()
-                .map(move |(key, value)| (Some(at), key, value))
-        });
-        none.chain(runs)
-    }
 }
 
 fn row_index(row: usize) -> u32 {
@@ -492,7 +623,8 @@ impl<T: Copy> Keyed<T> {
     }
 }
 
-/// The impls of `trait_` in `krate`, as [`trait_impls`] holds them.
+/// The impls of `trait_` in `krate`, by simplified self type (the blanket ones as their own
+/// run, first), then key.
 #[blaze_query::tracked(returns(ref))]
 fn trait_impls_in(
     db: &Db,
@@ -516,37 +648,6 @@ fn trait_impls_in(
         });
         Runs::new(&mut found)
     })
-}
-
-/// The impls of `trait_` in every crate, by simplified self type (the blanket ones as their
-/// own run, first), then key.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn trait_impls(db: &Db, trait_: TraitId) -> Runs<SimplifiedType, AnyImpl> {
-    frame::task(Tag::Other, |frame| {
-        let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
-        // `krate` and the crates that depend on it: the only ones that can hold an impl of
-        // one of its traits, which the impl names.
-        for &krate in trait_.krate(db).transitive_rev_deps(db) {
-            rows.extend(trait_impls_in(db, krate, trait_).rows());
-        }
-        Runs::new(&mut rows)
-    })
-}
-
-/// The impls of `trait_` whose simplified self type is `self_ty`, sorted by key.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn impls_of(
-    db: &Db,
-    trait_: TraitId,
-    self_ty: SimplifiedType,
-) -> Keyed<AnyImpl> {
-    Keyed::of(trait_impls(db, trait_).run(Some(self_ty)).iter())
-}
-
-/// The blanket impls of `trait_`, sorted by key.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn blanket_impls_of(db: &Db, trait_: TraitId) -> Keyed<AnyImpl> {
-    Keyed::of(trait_impls(db, trait_).run(None).iter())
 }
 
 /// The inherent impls of a frozen `krate`, from its one frozen table, by the hash of their
@@ -615,22 +716,22 @@ fn module_inherent_impls_of(
     Keyed::of(inherent_impls_in_module(db, module).run(Some(self_ty)).iter())
 }
 
-/// The inherent impls of every crate for `self_ty`, sorted by key. Reads, in each crate, only
-/// the modules with impls for that type.
+/// The inherent impls for `self_ty` of the crates `krate` sees ([`loaded_crates`]), sorted by
+/// key. Reads, in each crate, only the modules with impls for that type.
 #[blaze_query::tracked(returns(ref))]
 pub(crate) fn inherent_impls_of(
     db: &Db,
+    krate: Crate,
     self_ty: SimplifiedType,
-    _: (),
 ) -> Keyed<ImplId> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
-        for &krate in base_db::all_crates(db).iter() {
-            if frozen::served(db, krate) {
-                rows.extend(inherent_impls_in(db, krate).run(Some(self_ty)).iter());
+        for &seen in loaded_crates(db, krate) {
+            if frozen::served(db, seen) {
+                rows.extend(inherent_impls_in(db, seen).run(Some(self_ty)).iter());
                 continue;
             }
-            for &module in inherent_modules_of(db, krate, self_ty) {
+            for &module in inherent_modules_of(db, seen, self_ty) {
                 rows.extend(module_inherent_impls_of(db, module, self_ty).iter());
             }
         }
@@ -719,16 +820,17 @@ fn traits_named(db: &Db, krate: Crate, name: NameHash) -> Keyed<TraitId> {
     })
 }
 
-/// The traits of every crate with an item whose name hashes to `name`, sorted by key.
+/// The traits with an item whose name hashes to `name` of the crates `krate` sees
+/// ([`loaded_crates`]), sorted by key.
 #[blaze_query::tracked(returns(ref))]
-pub(crate) fn traits_with(db: &Db, name: NameHash, _: ()) -> Keyed<TraitId> {
+pub(crate) fn traits_with(db: &Db, krate: Crate, name: NameHash) -> Keyed<TraitId> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
-        for &krate in base_db::all_crates(db).iter() {
-            if frozen::served(db, krate) {
-                rows.extend(traits_in(db, krate).run(Some(name)).iter());
+        for &seen in loaded_crates(db, krate) {
+            if frozen::served(db, seen) {
+                rows.extend(traits_in(db, seen).run(Some(name)).iter());
             } else {
-                rows.extend(traits_named(db, krate, name).iter());
+                rows.extend(traits_named(db, seen, name).iter());
             }
         }
         Keyed::sorted(&mut rows)

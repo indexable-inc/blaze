@@ -159,6 +159,27 @@ fn ptr_of<N: AstNode>(kind: SyntaxKind, start: u32, end: u32) -> Option<AstPtr<N
     AstPtr::try_from_raw(SyntaxNodePtr::from_parts(kind, range))
 }
 
+/// The file of `file_kind` and the id word `file`, read from a record at byte `rec` whose
+/// `file` field is at byte `word`: a kind out of range is refused at the record, and a word that
+/// is no id at its own byte, naming the word and `what` it is ([`blaze_query::db::Id::decode`]).
+fn file_at(
+    file_kind: u32,
+    file: u64,
+    rec: u64,
+    word: u64,
+    what: &'static str,
+) -> Result<HirFileId, FormatError> {
+    if !matches!(file_kind, FILE | MACRO_FILE) {
+        let what = "a file kind that is neither 1 (a file) nor 2 (a macro file)";
+        return Err(FormatError::Invalid { at: rec, what });
+    }
+    let id = blaze_query::db::Id::decode(file, word, what)?;
+    Ok(match file_kind {
+        FILE => HirFileId::FileId(FromId::from_id(id)),
+        _ => HirFileId::MacroFile(FromId::from_id(id)),
+    })
+}
+
 /// Writes `table` in its order, which is by id.
 fn put_table<K: Code, V: Code>(w: &mut Words, table: &IdTable<K, V>) {
     w.len(table.entries().len());
@@ -205,24 +226,24 @@ impl Src {
         }
     }
 
-    /// The pointer this is, `None` for no pointer.
-    fn get<N: AstNode>(&self) -> Result<Option<InFile<AstPtr<N>>>, &'static str> {
+    /// The pointer this is, `None` for no pointer; `at` is this record's byte, which a
+    /// refusal names (with the file word's own byte when that word is no id).
+    fn get<N: AstNode>(&self, at: u64) -> Result<Option<InFile<AstPtr<N>>>, FormatError> {
+        let invalid = |what| FormatError::Invalid { at, what };
         if self.file_kind == 0 {
             return match *self == Src::default() {
                 true => Ok(None),
-                false => Err("an empty slot that is not zeros"),
+                false => Err(invalid("an empty slot that is not zeros")),
             };
         }
-        let file = match self.file_kind {
-            FILE | MACRO_FILE => file_of(self.file_kind, self.file).ok_or("an id of 0 or past 32 bits")?,
-            _ => return Err("a file kind out of range"),
-        };
-        let kind = syntax_kind(self.kind).ok_or("a syntax kind out of range")?;
+        let word = at + offset_of!(Src, file) as u64;
+        let file = file_at(self.file_kind, self.file, at, word, "a syntax pointer's file id")?;
+        let kind = syntax_kind(self.kind).ok_or(invalid("a syntax kind out of range"))?;
         if self.start > self.end {
-            return Err("a range that ends before it starts");
+            return Err(invalid("a range that ends before it starts"));
         }
         let ptr = ptr_of(kind, self.start, self.end)
-            .ok_or("a syntax pointer of a kind its type does not cast")?;
+            .ok_or(invalid("a syntax pointer of a kind its type does not cast"))?;
         Ok(Some(InFile::new(file, ptr)))
     }
 }
@@ -331,8 +352,9 @@ impl<'a> BackRef<'a> {
         };
         ensure(head.start == 0, head, buffer, "a first file run that does not start at id 0")?;
         for run in self.runs {
-            let file = file_of(run.file_kind, run.file).is_some();
-            ensure(file, run, buffer, "a file run of a file kind out of range or an id of 0 or past 32 bits")?;
+            let at = at_of(run, buffer);
+            let word = at + offset_of!(FileRun, file) as u64;
+            file_at(run.file_kind, run.file, at, word, "a file run's file id")?;
         }
         for pair in self.runs.windows(2) {
             let (before, run) = (&pair[0], &pair[1]);
@@ -433,8 +455,7 @@ fn check_table<N: AstNode, W>(
     let paired = keys.len() == values.len();
     ensure(paired, root, buffer, "a source table that is not one value for each key")?;
     for src in keys {
-        let found =
-            src.get::<N>().map_err(|what| FormatError::Invalid { at: at_of(src, buffer), what })?;
+        let found = src.get::<N>(at_of(src, buffer))?;
         ensure(found.is_some(), src, buffer, "an empty key in a source table")?;
     }
     for value in values {
@@ -456,7 +477,7 @@ fn source_table<N: AstNode, W: Copy, V>(
     let entries = (keys.iter().zip(values))
         .map(|(src, &word)| {
             let at = at_of(src, buffer);
-            let found = src.get::<N>().map_err(|what| FormatError::Invalid { at, what })?;
+            let found = src.get::<N>(at)?;
             let found =
                 found.ok_or(FormatError::Invalid { at, what: "an empty key in a source table" })?;
             Ok((found, value(word)))
@@ -744,8 +765,11 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
         check_table::<ast::Type, _>(map.types_map, map.types_map_ids, ty, root, buffer)?;
         let lifetime = |&lifetime: &u32| (lifetime as usize) < lifetimes;
         check_table::<ast::Lifetime, _>(map.lifetime_map, map.lifetime_map_ids, lifetime, root, buffer)?;
-        let call = |&call: &u64| id_of_bits(call).is_some();
-        check_table::<ast::MacroCall, _>(map.expansions, map.expansion_calls, call, root, buffer)?;
+        // A macro call's id is a word of its own, refused naming it (not as an arena index).
+        for call in map.expansion_calls {
+            blaze_query::db::Id::decode(*call, at_of(call, buffer), "a source table's macro call id")?;
+        }
+        check_table::<ast::MacroCall, _>(map.expansions, map.expansion_calls, |_| true, root, buffer)?;
         Ok(map)
     }
 
@@ -900,7 +924,8 @@ impl<'a> BodySourceMapRef<'a> {
 
     /// As [`BodySourceMap::self_param_syntax`].
     pub fn self_param(self) -> Option<InFile<SelfParamPtr>> {
-        self.self_param?.get().ok()?
+        // Checked when the buffer was read, so no refusal (whose byte this has not) is left.
+        self.self_param?.get(0).ok()?
     }
 
     /// The source map, back as the value that was written.
@@ -949,9 +974,7 @@ impl Persist for BodySourceMap {
         ensure(self_params.len() <= 1, root, buffer, "more than one `self` parameter")?;
         let self_param = self_params.first();
         if let Some(src) = self_param {
-            let found = src
-                .get::<ast::SelfParam>()
-                .map_err(|what| FormatError::Invalid { at: at_of(src, buffer), what })?;
+            let found = src.get::<ast::SelfParam>(at_of(src, buffer))?;
             ensure(found.is_some(), src, buffer, "an empty `self` parameter")?;
         }
         Ok(BodySourceMapRef { store, self_param })
@@ -1284,7 +1307,9 @@ fn f(a: u32, (b, c): (u32, u32)) -> u32 {
         assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, start)), 1)), "a first run past 0");
         assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file_kind)), 7)), "a file kind");
         assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)), 0)), "an id of 0");
-        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)) + 4, 1)), "an id past 32 bits");
+        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)) + 4, 1)), "an id word past `u32`");
+        let past = blaze_query::db::Id::MAX_U32 + 1;
+        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)), past)), "an id word past `Id::MAX_U32`");
         let second = offset_of!(FileRun, start);
         assert!(refused(&with_word(&bytes, run(1, second), exprs.runs[2].start)), "runs out of order");
         let empty = exprs.runs[1].start - 1;

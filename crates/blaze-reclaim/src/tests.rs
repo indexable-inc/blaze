@@ -99,6 +99,33 @@ fn only_the_outermost_guard_ends_a_task() {
     }
 }
 
+/// A parked task put on a thread that is in a task of its own is refused, and the refusal
+/// ends it: its slot stops pinning the epoch it began at, so a grace started after it still
+/// passes. Before, the panic came first and the slot pinned that epoch for the process's life.
+#[test]
+fn a_parked_task_a_busy_thread_refuses_is_ended_not_left_pinning() {
+    let parked = thread::spawn(|| {
+        let guard = enter();
+        let parked = park().expect("a thread in a task parks it");
+        // The guard went with the task: a job's guard stays on its fiber, never dropped here.
+        std::mem::forget(guard);
+        parked
+    })
+    .join()
+    .unwrap();
+    let grace = Grace::start();
+    let busy = enter();
+    let refused = std::panic::catch_unwind(|| unpark(parked));
+    assert!(refused.is_err(), "a thread in a task took a parked one");
+    assert!(in_task(), "the refusal left this thread's own task");
+    drop(busy);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !grace.passed() {
+        assert!(Instant::now() < deadline, "the refused parked task still pins its epoch");
+        thread::yield_now();
+    }
+}
+
 #[test]
 fn a_thread_that_ends_gives_its_slot_back() {
     for _ in 0..(SLOTS * 3) {

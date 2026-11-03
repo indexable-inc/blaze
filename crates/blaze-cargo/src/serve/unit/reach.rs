@@ -1,5 +1,7 @@
 //! What a change reaches ([`Front::reach`](crate::serve::work::Front::reach)), building
-//! nothing: each member crate's items' hashes ([`blaze_items::crate_hashes`]) before and after,
+//! nothing more than each view's proc macros and build scripts' runs, which the job builds and
+//! applies to its front end first, as a check does (`Jobs::next`): each member crate's items'
+//! hashes ([`blaze_items::crate_hashes`]) before and after,
 //! the items whose hashes differ with the facts that changed (a function's signature, a type's
 //! layout, a body's code), the functions that would compile again, and the tests that reach
 //! code that changed, from what the last compile of each test binary recorded.
@@ -18,7 +20,7 @@ use std::alloc::Global;
 use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
 use blaze_lower::Db;
 
-use super::Job;
+use super::{Job, answer_macros_built};
 use crate::serve::work::Failed;
 
 /// The facts of an item that differ from `old` to `new`, each with what it says.
@@ -112,10 +114,17 @@ pub(crate) fn reach(
         if to.cancelled() {
             return Err(Failed::Again);
         }
+        // A crate whose proc macros are not built has items that no hash covers
+        // (`Missed::MacroPending`), which a diff would read as unchanged or removed. The job
+        // built and applied every view's proc macros before posting this; checked again here.
+        answer_macros_built(after, new_krate, &unit.target.name, "reach")?;
         let new: &HashColumns = blaze_items::crate_hashes(after, new_krate);
         let empty = HashColumns::default();
         let old: &HashColumns = match old_krate {
-            Some(krate) => blaze_items::crate_hashes(before, krate),
+            Some(krate) => {
+                answer_macros_built(before, krate, &unit.target.name, "reach")?;
+                blaze_items::crate_hashes(before, krate)
+            }
             None => &empty,
         };
         for key in new.changed_since(old) {

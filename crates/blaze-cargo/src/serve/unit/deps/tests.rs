@@ -35,7 +35,7 @@ fn macros_of(store: &blaze_cas::Store, path: &str) -> Arc<blaze_macro_eval::Macr
         environment,
     };
     let keeping = proc_macro_api::kept::Keeping::new(expansions).unwrap();
-    blaze_macro_eval::Macros::new(proc_macro_api::kept::Keeps::In(keeping))
+    blaze_macro_eval::Macros::new(proc_macro_api::kept::Keeps::In(keeping), None)
 }
 
 #[test]

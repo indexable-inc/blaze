@@ -5,8 +5,8 @@
 //!
 //! Follows rustc's `compiler/rustc_parse/src/lexer/tokentrees.rs` (`bump`: a token is glued to
 //! the next unless whitespace or a comment is between), `compiler/rustc_parse/src/lexer/mod.rs`
-//! (`next_token_from_cursor`: what is a token) and `compiler/rustc_ast/src/token.rs`
-//! (`Token::glue`) (MIT or Apache-2.0).
+//! (`next_token_from_cursor`: what is a token) (MIT or Apache-2.0); which punctuation glues is
+//! [`tt::glue`]'s, rustc's `Token::glue`.
 
 use span::Edition;
 use syntax::{
@@ -81,68 +81,86 @@ pub(super) enum Punct {
     Question,
 }
 
+/// Each [`Punct`] with the text it is written as, in declaration order: the names this file
+/// gives rustc's punctuation tokens. Which of them glue is [`tt::glue`]'s, the one copy of
+/// rustc's rule.
+const TEXT: [(Punct, &str); 46] = [
+    (Punct::Eq, "="),
+    (Punct::Lt, "<"),
+    (Punct::Le, "<="),
+    (Punct::EqEq, "=="),
+    (Punct::Ne, "!="),
+    (Punct::Ge, ">="),
+    (Punct::Gt, ">"),
+    (Punct::AndAnd, "&&"),
+    (Punct::OrOr, "||"),
+    (Punct::Bang, "!"),
+    (Punct::Tilde, "~"),
+    (Punct::Plus, "+"),
+    (Punct::Minus, "-"),
+    (Punct::Star, "*"),
+    (Punct::Slash, "/"),
+    (Punct::Percent, "%"),
+    (Punct::Caret, "^"),
+    (Punct::And, "&"),
+    (Punct::Or, "|"),
+    (Punct::Shl, "<<"),
+    (Punct::Shr, ">>"),
+    (Punct::PlusEq, "+="),
+    (Punct::MinusEq, "-="),
+    (Punct::StarEq, "*="),
+    (Punct::SlashEq, "/="),
+    (Punct::PercentEq, "%="),
+    (Punct::CaretEq, "^="),
+    (Punct::AndEq, "&="),
+    (Punct::OrEq, "|="),
+    (Punct::ShlEq, "<<="),
+    (Punct::ShrEq, ">>="),
+    (Punct::At, "@"),
+    (Punct::Dot, "."),
+    (Punct::DotDot, ".."),
+    (Punct::DotDotDot, "..."),
+    (Punct::DotDotEq, "..="),
+    (Punct::Comma, ","),
+    (Punct::Semi, ";"),
+    (Punct::Colon, ":"),
+    (Punct::PathSep, "::"),
+    (Punct::RArrow, "->"),
+    (Punct::LArrow, "<-"),
+    (Punct::FatArrow, "=>"),
+    (Punct::Pound, "#"),
+    (Punct::Dollar, "$"),
+    (Punct::Question, "?"),
+];
+
+const _: () = {
+    assert!(TEXT.len() == Punct::Question as usize + 1);
+    let mut at = 0;
+    while at < TEXT.len() {
+        assert!(TEXT[at].0 as usize == at, "TEXT is in Punct's declaration order");
+        at += 1;
+    }
+};
+
 impl Punct {
+    /// The token the one character `c` is, if it is punctuation.
     fn of(c: char) -> Option<Punct> {
-        Some(match c {
-            '=' => Punct::Eq,
-            '<' => Punct::Lt,
-            '>' => Punct::Gt,
-            '!' => Punct::Bang,
-            '~' => Punct::Tilde,
-            '+' => Punct::Plus,
-            '-' => Punct::Minus,
-            '*' => Punct::Star,
-            '/' => Punct::Slash,
-            '%' => Punct::Percent,
-            '^' => Punct::Caret,
-            '&' => Punct::And,
-            '|' => Punct::Or,
-            '@' => Punct::At,
-            '.' => Punct::Dot,
-            ',' => Punct::Comma,
-            ';' => Punct::Semi,
-            ':' => Punct::Colon,
-            '#' => Punct::Pound,
-            '$' => Punct::Dollar,
-            '?' => Punct::Question,
-            _ => return None,
-        })
+        let mut buf = [0; 4];
+        Punct::named(c.encode_utf8(&mut buf))
     }
 
-    /// rustc's `Token::glue`: what `self` written right before `next` lexes as.
-    fn glue(self, next: Punct) -> Option<Punct> {
-        use Punct::*;
-        Some(match (self, next) {
-            (Eq, Eq) => EqEq,
-            (Eq, Gt) => FatArrow,
-            (Lt, Eq) => Le,
-            (Lt, Lt) => Shl,
-            (Lt, Le) => ShlEq,
-            (Lt, Minus) => LArrow,
-            (Gt, Eq) => Ge,
-            (Gt, Gt) => Shr,
-            (Gt, Ge) => ShrEq,
-            (Bang, Eq) => Ne,
-            (Plus, Eq) => PlusEq,
-            (Minus, Eq) => MinusEq,
-            (Minus, Gt) => RArrow,
-            (Star, Eq) => StarEq,
-            (Slash, Eq) => SlashEq,
-            (Percent, Eq) => PercentEq,
-            (Caret, Eq) => CaretEq,
-            (And, Eq) => AndEq,
-            (And, And) => AndAnd,
-            (Or, Eq) => OrEq,
-            (Or, Or) => OrOr,
-            (Shl, Eq) => ShlEq,
-            (Shr, Eq) => ShrEq,
-            (Dot, Dot) => DotDot,
-            (Dot, DotDot) => DotDotDot,
-            (DotDot, Dot) => DotDotDot,
-            (DotDot, Eq) => DotDotEq,
-            (Colon, Colon) => PathSep,
-            _ => return None,
-        })
+    fn named(text: &str) -> Option<Punct> {
+        TEXT.iter().find(|(_, it)| *it == text).map(|&(punct, _)| punct)
+    }
+
+    fn text(self) -> &'static str {
+        TEXT[self as usize].1
+    }
+
+    /// rustc's `Token::glue` ([`tt::glue`]): what `self` written right before the character
+    /// `next` lexes as.
+    fn glued(self, next: char) -> Option<Punct> {
+        tt::glue(self.text(), next).and_then(Punct::named)
     }
 }
 
@@ -360,7 +378,7 @@ impl<'t> Tokens<'t> {
                     if glue
                         && let Some(Tt::Token(last)) = scratch.last_mut()
                         && let Kind::Punct(before) = last.kind
-                        && let Some(glued) = before.glue(punct)
+                        && let Some(glued) = before.glued(c)
                     {
                         last.kind = Kind::Punct(glued);
                         last.range = last.range.cover(at);

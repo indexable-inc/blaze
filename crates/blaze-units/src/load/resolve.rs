@@ -102,7 +102,7 @@ pub(crate) fn resolved<'r, 'db, R>(
         Ok(net) => spec.offline.or(net.offline.unwrap_or(false).then_some("--offline")),
         Err(error) => return Ok(fail(error)),
     };
-    let sources = match Sources::new(&ctx.config, offline) {
+    let sources = match Sources::new(&ctx.config, &spec.sources, offline) {
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };

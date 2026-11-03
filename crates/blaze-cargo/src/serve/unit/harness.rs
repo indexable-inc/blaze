@@ -19,7 +19,7 @@ use blaze_units::schema::Mode;
 use hir_ty_codegen::v2::HARNESS_MODULE;
 use blaze_lower::{Appended, LowerError, Lowered};
 
-use super::{Job, codegen, graph::Waits, lower_error};
+use super::{Job, codegen, compile, graph::Waits, lower_error};
 
 /// The harness of each of `units` built with `cfg(test)` (a test, a check of tests), or the
 /// glue of each that is a proc macro built for wasm, written into its crate's root: the
@@ -39,9 +39,14 @@ use super::{Job, codegen, graph::Waits, lower_error};
 /// want different modules are refused naming both ([`Lowered::append_roots`]), as is a module
 /// that can't be made, naming its crate. A refusal is that unit's alone: the error lists each
 /// unit refused with why, and every other unit's root is written.
+///
+/// A library's `Doctest` unit has no harness of its own: each of its examples, and its runner,
+/// is made into a crate of its own here ([`compile::doctest::expand`]), refused as above.
 pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<Item = u32>) -> Result<(), Vec<(usize, ApiError)>> {
     let paths = Arc::clone(lowered.paths());
-    let appended = units.into_iter().filter(|&unit| tested(job, unit as usize) || codegen::wasm_macro(job, unit as usize));
+    // alloc: once a write, the units it is given
+    let units: Vec<u32> = units.into_iter().collect();
+    let appended = units.iter().copied().filter(|&unit| tested(job, unit as usize) || codegen::wasm_macro(job, unit as usize));
     let made = lowered.append_roots(appended, |db, unit, krate| {
         if !blaze_lower::macros_loaded(db, krate) {
             return Ok(None);
@@ -58,7 +63,7 @@ pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<I
         }
         let toolchain = codegen::toolchain(job, unit).map_err(refused)?;
         let policy = codegen::policy(job, unit, toolchain).map_err(refused)?;
-        let frontend = codegen::frontend_over(job, db, &paths, &job.mounted);
+        let frontend = codegen::frontend_over(db, &paths, &job.mounted, codegen::build_time(job, unit));
         let harness = frontend.harness(krate, policy.profile.panic, policy.mode, blaze_usercode::test::fork_server);
         let Some(harness) = harness.map_err(|it| refused(it.what))? else { return Ok(None) };
         // The module the harness is written in, by its name in the crate's root: what the
@@ -66,7 +71,23 @@ pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<I
         Ok(Some(Appended { after: harness, module: HARNESS_MODULE }))
     });
     // alloc: an error, once per unit refused
-    made.map(drop).map_err(|refused| refused.into_iter().map(|(unit, error)| (unit, lower_error(error))).collect())
+    let mut refused: Vec<(usize, ApiError)> = match made {
+        Ok(_) => Vec::new(),
+        Err(refused) => refused.into_iter().map(|(unit, error)| (unit, lower_error(error))).collect(),
+    };
+    // A library's doctests: each example and the runner a crate of its own
+    // ([`compile::doctest::expand`]).
+    for unit in units.into_iter().map(|it| it as usize) {
+        if job.unit(unit).is_ok_and(|it| it.mode == Mode::Doctest)
+            && let Err(error) = compile::doctest::expand(lowered, job, unit)
+        {
+            refused.push((unit, lower_error(error)));
+        }
+    }
+    match refused.is_empty() {
+        true => Ok(()),
+        false => Err(refused),
+    }
 }
 
 /// The units [`write`] refused, each with why, as one error naming every one: what a write

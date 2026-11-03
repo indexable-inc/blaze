@@ -40,7 +40,7 @@ pub(super) fn soft_floats(target: &Target) -> bool {
         // wasm32's LLVM passes an `f16` as the bits of an `i32` and an `f128` as an `i128`
         // (`wasm::Class`), and works on both through compiler-builtins, as on x86-64 without
         // F16C; its C `long double` is the `f128`, so C's functions of it are the `l` ones.
-        (Arch::Wasm32, _) => true,
+        (Arch::Wasm32 | Arch::Wasm64, _) => true,
         _ => false,
     }
 }
@@ -124,7 +124,7 @@ impl<'db> FunctionCx<'_, 'db> {
     /// `__truncdfhf2`), as LLVM does on x86-64 and wasm32, not by AArch64's `fcvt`.
     /// `v2::refs` lists the same.
     pub(super) fn half_by_builtins(&self) -> bool {
-        matches!(self.cg.target.arch, Arch::X86_64 | Arch::Wasm32)
+        matches!(self.cg.target.arch, Arch::X86_64 | Arch::Wasm32 | Arch::Wasm64)
     }
 
     /// Whether the function being compiled is x86-64's with AVX512-FP16, whose instructions

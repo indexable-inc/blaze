@@ -11,7 +11,7 @@
 //!   the path: `/home/a/ws/p/build.rs` is `\0p/build.rs` in this checkout and in every other
 //!   ([`Roots::path`]). Under two roots, the nearer one. A path under no root stays absolute,
 //!   and means the same file in another checkout only when it is in a machine-wide place
-//!   ([`MACHINE`], the cargo home): a run that read any other is kept against where every one
+//!   ([`MACHINE`], blaze's fetched packages): a run that read any other is kept against where every one
 //!   of its roots is ([`Roots::kept`]), as its key no longer says which checkout it ran in.
 //! - A variable's value, or what a run printed, has each root in it that starts a path (after
 //!   the string's start or a byte no path has) and ends a name replaced by its placeholder,
@@ -164,8 +164,8 @@ pub struct RootMap {
     /// Each root's other spellings ([`spellings`]): looked for in what a run wrote, never
     /// ported.
     aliases: Vec<(Role, String)>,
-    /// Machine-wide directories besides [`MACHINE`] (the cargo home's registry and git
-    /// checkouts): a path under one means the same file in every checkout on the machine.
+    /// Machine-wide directories besides [`MACHINE`] (blaze's fetched registry packages
+    /// and git checkouts, [`RootMap::with_sources`]): a path under one means the same file in every checkout on the machine.
     machine: Vec<PathBuf>,
     /// The path each root's links resolved to when it was set: a root whose links resolve
     /// elsewhere when the run is kept ([`Roots::relinked`]) ties it to this checkout.
@@ -215,17 +215,11 @@ impl RootMap {
         self
     }
 
-    /// The cargo home's registry and git checkouts, machine-wide ([`RootMap::with_machine`]):
-    /// `CARGO_HOME`, else `$HOME/.cargo`, as `var` has them.
-    pub fn with_cargo_home<'v>(self, var: impl Fn(&str) -> Option<&'v str>) -> RootMap {
-        let home = match var("CARGO_HOME") {
-            Some(it) => PathBuf::from(it),
-            None => match var("HOME") {
-                Some(it) => Path::new(it).join(".cargo"),
-                None => return self,
-            },
-        };
-        self.with_machine(&home.join("registry")).with_machine(&home.join("git"))
+    /// Where blaze keeps the packages it fetches (`blaze_manifest::home::sources`): its
+    /// registry packages and git checkouts, machine-wide ([`RootMap::with_machine`]), the
+    /// place every registry and git package of a build is.
+    pub fn with_sources(self, sources: &Path) -> RootMap {
+        self.with_machine(&sources.join("registry")).with_machine(&sources.join("git"))
     }
 
     pub fn view(&self) -> Roots<'_> {
@@ -697,7 +691,7 @@ impl<'a> Roots<'a> {
 
     /// Whether `path` (a ported trace's) is outside every root and every machine-wide place: a
     /// file there in another checkout is not this one's. The machine-wide places are
-    /// [`MACHINE`] and the cargo home's registry and git checkouts, where a package is the same
+    /// [`MACHINE`] and blaze's fetched registry packages and git checkouts, where a package is the same
     /// one at the same path in every checkout, except one that has the run's package,
     /// `OUT_DIR`, target directory or workspace in it (a checkout under `/usr/src`, a git
     /// dependency's build script): a sibling of those is another checkout's or another

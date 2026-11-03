@@ -196,7 +196,7 @@ pub(crate) fn register(arch: Arch) -> Result<Stub, LinkError> {
     match arch {
         Arch::X86_64 => Ok(Stub { code: &X86_REGISTER, fields: &X86_REGISTER_FIELDS }),
         Arch::Aarch64 => Ok(Stub { code: &A64_REGISTER, fields: &A64_REGISTER_FIELDS }),
-        Arch::Wasm32 => Err(error(None, "AddressSanitizer on wasm: a module has no constructors to register globals in")),
+        Arch::Wasm32 | Arch::Wasm64 => Err(error(None, "AddressSanitizer on wasm: a module has no constructors to register globals in")),
     }
 }
 
@@ -260,7 +260,7 @@ pub(crate) fn at_exit(arch: Arch) -> Result<Stub, LinkError> {
     match arch {
         Arch::X86_64 => Ok(Stub { code: &X86_AT_EXIT, fields: &X86_AT_EXIT_FIELDS }),
         Arch::Aarch64 => Ok(Stub { code: &A64_AT_EXIT, fields: &A64_AT_EXIT_FIELDS }),
-        Arch::Wasm32 => Err(error(None, "AddressSanitizer on wasm: a module has no constructors to register globals in")),
+        Arch::Wasm32 | Arch::Wasm64 => Err(error(None, "AddressSanitizer on wasm: a module has no constructors to register globals in")),
     }
 }
 
@@ -328,7 +328,7 @@ pub(crate) fn calls(format: Format, arch: Arch) -> Result<&'static Calls, LinkEr
         (Format::Pe, Arch::X86_64) => Ok(&WIN64_CALLS),
         (_, Arch::X86_64) => Ok(&X86_CALLS),
         (_, Arch::Aarch64) => Ok(&A64_CALLS),
-        (_, Arch::Wasm32) => Err(error(None, "SanitizerCoverage on wasm: a module has no sections for its arrays")),
+        (_, Arch::Wasm32 | Arch::Wasm64) => Err(error(None, "SanitizerCoverage on wasm: a module has no sections for its arrays")),
     }
 }
 

@@ -89,6 +89,7 @@ pub enum ResponseRef<'a> {
     TestReady(Artifact),
     Rebuilt(Rebuilt),
     Launched { live: bool, env: Vec<(String, String)> },
+    Stopping { doing: &'a str },
 }
 
 /// [`LiveFrame`], read where it lies: a frame every 250 ms decodes with no copy of its tables.
@@ -145,6 +146,7 @@ pub struct UnitOfRef<'a> {
     pub test: bool,
     #[serde(borrow)]
     pub target: UnitTargetRef<'a>,
+    pub doctest: bool,
     pub package_id: &'a str,
     pub manifest_path: &'a str,
 }
@@ -331,6 +333,7 @@ impl ResponseRef<'_> {
             ResponseRef::TestReady(it) => Response::TestReady(it),
             ResponseRef::Rebuilt(it) => Response::Rebuilt(it),
             ResponseRef::Launched { live, env } => Response::Launched { live, env },
+            ResponseRef::Stopping { doing } => Response::Stopping { doing: owned(doing) },
         }
     }
 }
@@ -356,6 +359,7 @@ impl UnitOfRef<'_> {
         UnitOf {
             id: self.id,
             test: self.test,
+            doctest: self.doctest,
             target: self.target.into_owned(),
             package_id: owned(self.package_id),
             manifest_path: owned(self.manifest_path),

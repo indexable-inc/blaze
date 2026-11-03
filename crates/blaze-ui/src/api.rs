@@ -280,6 +280,7 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             }
             out.push('\n');
         }
+        Response::Stopping { doing } => put!(out, "{} {doing}\n", status("Stopping")),
     }
 }
 

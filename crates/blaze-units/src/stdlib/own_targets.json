@@ -1,0 +1,180 @@
+{
+ "targets": {
+  "wasm64-blaze-wasip1": {
+   "cfg": [
+    "target_abi=\"\"",
+    "target_arch=\"wasm64\"",
+    "target_endian=\"little\"",
+    "target_env=\"p1\"",
+    "target_family=\"wasm\"",
+    "target_feature=\"bulk-memory\"",
+    "target_feature=\"crt-static\"",
+    "target_feature=\"multivalue\"",
+    "target_feature=\"mutable-globals\"",
+    "target_feature=\"nontrapping-fptoint\"",
+    "target_feature=\"reference-types\"",
+    "target_feature=\"sign-ext\"",
+    "target_has_atomic=\"16\"",
+    "target_has_atomic=\"32\"",
+    "target_has_atomic=\"64\"",
+    "target_has_atomic=\"8\"",
+    "target_has_atomic=\"ptr\"",
+    "target_has_atomic_primitive_alignment=\"16\"",
+    "target_has_atomic_primitive_alignment=\"32\"",
+    "target_has_atomic_primitive_alignment=\"64\"",
+    "target_has_atomic_primitive_alignment=\"8\"",
+    "target_has_atomic_primitive_alignment=\"ptr\"",
+    "target_os=\"wasi\"",
+    "target_pointer_width=\"64\"",
+    "target_vendor=\"blaze\""
+   ],
+   "cpu_features": [
+    [
+     "atomics",
+     "bulk-memory",
+     "crt-static",
+     "exception-handling",
+     "extended-const",
+     "gc",
+     "multivalue",
+     "mutable-globals",
+     "nontrapping-fptoint",
+     "reference-types",
+     "relaxed-simd",
+     "sign-ext",
+     "simd128",
+     "tail-call"
+    ],
+    [
+     "bulk-memory",
+     "crt-static",
+     "multivalue",
+     "mutable-globals",
+     "nontrapping-fptoint",
+     "reference-types",
+     "sign-ext"
+    ],
+    [
+     "crt-static",
+     "extended-const",
+     "multivalue",
+     "mutable-globals",
+     "nontrapping-fptoint",
+     "sign-ext"
+    ],
+    [
+     "crt-static"
+    ]
+   ],
+   "cpus": {
+    "bleeding-edge": 0,
+    "generic": 1,
+    "lime1": 2,
+    "mvp": 3
+   },
+   "feature_cfgs": {
+    "atomics": [
+     "target_has_threads"
+    ]
+   },
+   "features": {
+    "atomics": [
+     "atomics"
+    ],
+    "bulk-memory": [],
+    "crt-static": [],
+    "exception-handling": [
+     "exception-handling"
+    ],
+    "extended-const": [
+     "extended-const"
+    ],
+    "gc": [
+     "gc"
+    ],
+    "multivalue": [],
+    "mutable-globals": [],
+    "nontrapping-fptoint": [],
+    "reference-types": [],
+    "relaxed-simd": [
+     "relaxed-simd",
+     "simd128"
+    ],
+    "sign-ext": [],
+    "simd128": [
+     "simd128"
+    ],
+    "tail-call": [
+     "tail-call"
+    ],
+    "wide-arithmetic": [
+     "wide-arithmetic"
+    ]
+   },
+   "features_off": {
+    "bulk-memory": [
+     "bulk-memory"
+    ],
+    "crt-static": [
+     "crt-static"
+    ],
+    "multivalue": [
+     "multivalue"
+    ],
+    "mutable-globals": [
+     "mutable-globals"
+    ],
+    "nontrapping-fptoint": [
+     "nontrapping-fptoint"
+    ],
+    "reference-types": [
+     "gc",
+     "reference-types"
+    ],
+    "sign-ext": [
+     "sign-ext"
+    ]
+   },
+   "file_names": {
+    "bin": "___.wasm",
+    "cdylib": "___.wasm",
+    "dylib": null,
+    "lib": "lib___.rlib",
+    "proc-macro": null,
+    "rlib": "lib___.rlib",
+    "staticlib": "lib___.a"
+   },
+   "llvm_features": {},
+   "nightly_cfg": [
+    "fmt_debug=\"full\"",
+    "relocation_model=\"static\"",
+    "target_has_atomic",
+    "target_has_atomic_load_store",
+    "target_has_atomic_load_store=\"16\"",
+    "target_has_atomic_load_store=\"32\"",
+    "target_has_atomic_load_store=\"64\"",
+    "target_has_atomic_load_store=\"8\"",
+    "target_has_atomic_load_store=\"ptr\"",
+    "target_has_reliable_f128",
+    "target_has_reliable_f16",
+    "target_has_reliable_f16_math",
+    "target_object_format=\"wasm\"",
+    "target_thread_local"
+   ],
+   "other_features": [
+    "bulk-memory-opt",
+    "call-indirect-overlong",
+    "fp16",
+    "multimemory",
+    "relaxed-atomics"
+   ],
+   "panic": "abort",
+   "split_debuginfo": [
+    "off"
+   ],
+   "target_spec_json": {
+    "*": "{\n  \"arch\": \"wasm64\",\n  \"binary-format\": \"wasm\",\n  \"crt-static-allows-dylibs\": true,\n  \"crt-static-default\": true,\n  \"crt-static-respected\": true,\n  \"data-layout\": \"e-m:e-p:64:64-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20\",\n  \"dll-prefix\": \"\",\n  \"dll-suffix\": \".wasm\",\n  \"dynamic-linking\": true,\n  \"eh-frame-header\": false,\n  \"emit-debug-gdb-scripts\": false,\n  \"entry-name\": \"__main_void\",\n  \"env\": \"p1\",\n  \"exe-suffix\": \".wasm\",\n  \"generate-arange-section\": false,\n  \"has-thread-local\": true,\n  \"is-like-wasm\": true,\n  \"linker\": \"rust-lld\",\n  \"linker-flavor\": \"wasm-lld\",\n  \"linker-is-gnu\": false,\n  \"lld-flavor\": \"wasm\",\n  \"llvm-args\": [\n    \"-wasm-use-legacy-eh=false\"\n  ],\n  \"llvm-target\": \"wasm64-unknown-unknown\",\n  \"main-needs-argc-argv\": false,\n  \"max-atomic-width\": 64,\n  \"metadata\": {\n    \"description\": \"WebAssembly with 64-bit memory (memory64) and WASI preview 1 over 64-bit pointers (import module wasi_snapshot_preview1_64): blaze's own target, of its bootstrap seed\",\n    \"host_tools\": false,\n    \"std\": true,\n    \"tier\": null\n  },\n  \"only-cdylib\": true,\n  \"os\": \"wasi\",\n  \"panic-strategy\": \"abort\",\n  \"pre-link-args\": {\n    \"wasm-lld\": [\n      \"-z\",\n      \"stack-size=1048576\",\n      \"--stack-first\",\n      \"--no-demangle\",\n      \"-mwasm64\"\n    ]\n  },\n  \"relocation-model\": \"static\",\n  \"singlethread\": true,\n  \"target-family\": [\n    \"wasm\"\n  ],\n  \"target-pointer-width\": 64,\n  \"tls-model\": \"local-exec\",\n  \"vendor\": \"blaze\"\n}\n"
+   }
+  }
+ }
+}

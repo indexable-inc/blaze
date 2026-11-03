@@ -99,6 +99,58 @@ pub fn check_sealed(db: &Db, krate: Crate) -> SealedCheck<'_> {
     SealedCheck { diagnostics, foreign_impls }
 }
 
+/// What [`check_expansions`] gives of a crate.
+#[derive(Default)]
+pub struct ExpansionCheck<'db> {
+    /// The expansion errors of the items its modules declare outside any body, module by
+    /// module in the def map's order.
+    pub items: Vec<AnyDiagnostic<'db>>,
+    /// Each body that lowering found anything in, with what it found: its macro calls'
+    /// expansion errors and the errors of the items its blocks declare among them. In the def
+    /// map's order, each body before those declared in it.
+    pub bodies: Vec<(DefWithBodyId, Vec<AnyDiagnostic<'db>>)>,
+}
+
+impl ExpansionCheck<'_> {
+    /// Whether expanding and lowering the crate found nothing.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty() && self.bodies.is_empty()
+    }
+}
+
+/// blaze: what expanding the macro calls of `krate` and lowering its bodies finds, nothing
+/// type-checked: for a crate of which nothing else is checked (a dependency of which only what
+/// the build's programs reach is, `blaze-cargo`'s `reached_only`). rustc expands every macro
+/// call of every crate it compiles, so a call that fails to expand there is an error of that
+/// crate, reached or not; found only where a program reaches the body, it was a later crate's
+/// "MIR that failed to lower" with no call in it, the crate that holds it built. Every body is
+/// lowered, the crate's roots split over the database's workers; what they found is then read
+/// in the def map's order, so the result is the same whatever the threads.
+pub fn check_expansions(db: &Db, krate: Crate) -> ExpansionCheck<'_> {
+    let _p = tracing::info_span!(target: "blaze", "expansion_check", krate = ?krate.id).entered();
+    let roots = hir_def::nameres::demand::crate_body_owners(db, krate.id);
+    // Each root's body, those declared in it, and their macro calls' expansions, lowered in
+    // parallel: what the walk below reads is then in the database.
+    db.run_all(blaze_mem::Tag::Expand, roots.len(), |db, at| {
+        // alloc: one root a task, its walk's queue
+        hir_def::nameres::demand::walk_bodies(db, vec![roots[at]], |_| true, |_, _| {});
+    });
+    // alloc: the results; empty, so no allocation, unless a diagnostic is reported
+    let mut items = Vec::new();
+    DiagnosticsCollector::collect_item_expansions(db, krate.id, &mut items, &every_body);
+    // alloc: as above
+    let mut bodies = Vec::new();
+    hir_def::nameres::demand::walk_bodies(db, roots, |_| true, |owner, _| {
+        // alloc: as above
+        let mut found = Vec::new();
+        DiagnosticsCollector::collect_body_expansions(db, owner, &mut found, &every_body);
+        if !found.is_empty() {
+            bodies.push((owner, found));
+        }
+    });
+    ExpansionCheck { items, bodies }
+}
+
 /// The diagnostics of body `def` alone, as a [`Plan`]'s task for it checks it: inference,
 /// borrow, match and unsafety checks, without its module's item checks. An enum variant's
 /// discriminant is checked in the generics of its enum, as its module's check does.

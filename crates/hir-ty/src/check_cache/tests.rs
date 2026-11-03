@@ -10,8 +10,8 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 use blaze_query::db::AsId;
 use hir_def::{
-    DefWithBodyId, FunctionId, LoweringMode, deps::ImageBuf, nameres::demand::crate_body_owners,
-    signatures::FunctionSignature,
+    DefWithBodyId, FunctionId, LoweringMode, deps::ImageBuf, expr_store::Body,
+    nameres::demand::crate_body_owners, signatures::FunctionSignature,
 };
 use hir_expand::fixture;
 use hir_expand::name::Name;
@@ -19,7 +19,10 @@ use hir_expand::name::Name;
 use super::{ids::Table, part, *};
 use crate::{
     InferenceResult,
-    infer::{infer_query_with_inspect, persist::InferenceRecord},
+    infer::{
+        infer_query_with_inspect,
+        persist::{InferenceRecord, Nodes},
+    },
     next_solver::DbInterner,
 };
 
@@ -155,7 +158,8 @@ fn outside_a_scope_a_record_is_todays_bytes() {
 
     let outside = blaze_format::to_bytes(&result.to_record(interner));
     assert_eq!(outside, blaze_format::to_bytes(&result.to_record(interner)), "deterministic");
-    let read = InferenceRecord::read(&Aligned::copy_from(&outside)).unwrap().to_result(interner);
+    let nodes = Nodes::of(Body::of(&db, area.into()));
+    let read = InferenceRecord::read(&Aligned::copy_from(&outside)).unwrap().to_result(interner, nodes);
     assert!(read.unwrap() == *result, "a record outside a scope reads back in its own database");
     let sum_bits = u64::from(sum.as_id().as_u32()).to_le_bytes();
     let names = |bytes: &[u8]| bytes.windows(8).any(|it| it == sum_bits);
@@ -246,12 +250,17 @@ fn a_damaged_record_is_refused_by_its_read() {
     let key = part.keys()[0];
     let body = part.find(&key).unwrap();
     let start = body.as_ptr() as usize - original.as_ptr() as usize;
+    let def = crate_body_owners(&db, dep)
+        .into_iter()
+        .find(|&def| body_key(&db, def) == Some(key))
+        .expect("the part's first body is one of `dep`'s");
+    let nodes = Nodes::of(Body::of(&db, def));
     for at in 0..HEADER_LEN {
         let mut damaged = bytes.clone();
         damaged[start + at] ^= 0xff;
         let damaged = Aligned::copy_from(&damaged);
         let body = part::view(&damaged).unwrap().find(&key).unwrap();
-        let read = part::open_body(body).and_then(|it| it.inference(&db, dep, &items).map(drop));
+        let read = part::open_body(body).and_then(|it| it.inference(&db, dep, &items, nodes).map(drop));
         assert!(read.is_err(), "the body's header byte {at} flipped");
     }
 }

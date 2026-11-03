@@ -211,6 +211,7 @@ fn unit_of() -> UnitOf {
         id: 0,
         test: false,
         target: unit_target(),
+        doctest: false,
         package_id: "path+file:///w#a@0.1.0".to_owned(),
         manifest_path: "/w/Cargo.toml".to_owned(),
     }

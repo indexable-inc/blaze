@@ -9,14 +9,14 @@ use blaze_codegen::{
     wasm::{Code, Import},
 };
 use cranelift_codegen::binemit::Reloc;
-use hir_def::{FunctionId, HasModule, ItemContainerId, Lookup, attrs::AttrFlags, signatures::FunctionSignature};
+use hir_def::{FunctionId, HasModule, ItemContainerId, Lookup, signatures::FunctionSignature};
 
 use super::{HirInstance, Kind, fold::BODY};
 use crate::{
     Instance, InstanceDef, exported_symbol,
     fragment::{FuncTarget, RelocName, Requests},
     link_name_for,
-    wasm::{CALL, WasmSignature},
+    wasm::{Address, CALL, WasmSignature},
 };
 
 /// The module a function of an `extern` block is imported from when the block names none
@@ -84,7 +84,8 @@ pub(crate) fn header(
 
 /// What each outside function `requests` name is imported as, by its symbol: a function of an
 /// `extern` block from its block's `#[link(wasm_import_module)]` or [`ENV`], a symbol of no
-/// item from [`ENV`]; the field is the symbol, and the type the one a call of it is lowered to
+/// item from [`ENV`]; the field is the link name (the symbol, but for a block that names its
+/// module: [`link_name_for`]), and the type the one a call of it is lowered to
 /// ([`WasmSignature::of`]). Empty but when `target` is wasm. `owner` names what asks, in an error:
 /// a function whose `Code::imports` these are, or a static (`Static::imports`).
 pub(crate) fn imports(
@@ -98,50 +99,47 @@ pub(crate) fn imports(
     if !target.is_wasm() {
         return Ok(imports);
     }
+    let address = Address::of(target);
     for request in &requests.funcs {
-        let (name, module) = match &request.target {
+        let (name, module, field) = match &request.target {
             // A bridged call is recorded only in a proc macro's module (`Recorder::callee`).
             FuncTarget::Symbol(symbol) if symbol == RANDOM_KEYS => {
-                let ty = WasmSignature::of(&request.sig).map_err(|what| {
+                let ty = WasmSignature::of(&request.sig, address).map_err(|what| {
                     // alloc: an error
                     format!("{} calls std's `{RANDOM_KEYS}`, whose signature has no wasm type: {what}", owner())
                 })?;
-                if ty.params != [crate::wasm::WasmType::I32] || !ty.results.is_empty() {
+                if ty.params != [address.wasm()] || !ty.results.is_empty() {
                     // alloc: an error
                     return Err(format!(
                         "{} calls std's `{RANDOM_KEYS}` as {ty:?}, and the bridge's import takes the \
-                         pointer its keys are written to, (i32) -> ()",
-                        owner()
+                         pointer its keys are written to, ({:?}) -> ()",
+                        owner(),
+                        address.wasm()
                     ));
                 }
                 // alloc: the import's to keep, keyed by it
-                (RANDOM_KEYS.to_owned(), BRIDGE.to_owned())
+                (RANDOM_KEYS.to_owned(), BRIDGE.to_owned(), RANDOM_KEYS.to_owned())
             }
-            // clone: the import's to keep, keyed by it
-            FuncTarget::Symbol(symbol) => (symbol.clone(), ENV.to_owned()),
+            // clone: the import's to keep, keyed by it; a symbol of no item is `env`'s field
+            FuncTarget::Symbol(symbol) => (symbol.clone(), ENV.to_owned(), symbol.clone()),
             FuncTarget::Instance(instance, _) => {
                 let InstanceDef::Fn(func) = instance.def else { continue };
-                let ItemContainerId::ExternBlockId(block) = func.lookup(db).container else { continue };
-                let Some(name) = link_name_for(db, target, func) else {
+                let ItemContainerId::ExternBlockId(_) = func.lookup(db).container else { continue };
+                let (Some(name), Some((module, field))) = (link_name_for(db, target, func), crate::wasm_import(db, func))
+                else {
                     // alloc: an error
                     return Err(format!("{} names a function of an `extern` block with no link name", owner()));
                 };
-                let module = match AttrFlags::wasm_import_module(db, block) {
-                    // alloc: the import's module, which it keeps
-                    Some(module) => module.as_str().to_owned(),
-                    // alloc: as above
-                    None => ENV.to_owned(),
-                };
-                (name, module)
+                // alloc: the import's module, which it keeps
+                (name, module.unwrap_or_else(|| ENV.to_owned()), field)
             }
             FuncTarget::Path(_) | FuncTarget::Asm(_) => continue,
         };
-        let ty = WasmSignature::of(&request.sig).map_err(|what| {
+        let ty = WasmSignature::of(&request.sig, address).map_err(|what| {
             // alloc: an error
             format!("{} names `{name}` of the wasm module `{module}`, whose signature has no wasm type: {what}", owner())
         })?;
-        // clone: the field is the symbol, and both are the import's to keep
-        let import = Import { module, field: name.clone(), ty: ty.format() };
+        let import = Import { module, field, ty: ty.format() };
         match imports.iter().find(|it| it.0 == name) {
             Some((_, seen)) if *seen == import => {}
             Some((_, seen)) => {
@@ -185,14 +183,16 @@ pub(crate) fn with_header(code: Vec<u8>, header: &Header) -> Result<(Vec<u8>, u3
 
 /// The kind of a relocation of wasm code that `wasm::lower` made: a `call`'s function index
 /// ([`CALL`]), or an `i32.const` of a function's slot in the table or of the address of data
-/// (`Abs4`), each a padded LEB of five bytes. A function is a request's or the body a fold's
-/// thunk calls.
+/// (`Abs4`), each a padded LEB of five bytes; on wasm64 an `i64.const` of either (`Abs8`), a
+/// padded LEB of ten. A function is a request's or the body a fold's thunk calls.
 pub(crate) fn reloc_kind(kind: Reloc, name: RelocName) -> Result<RelocKind, String> {
     let function = matches!(name, RelocName::Func(_) | RelocName::User { namespace: BODY, index: 0 });
     match name {
         _ if function && kind == CALL => Ok(RelocKind::WasmFunction),
         _ if function && kind == Reloc::Abs4 => Ok(RelocKind::WasmTable),
+        _ if function && kind == Reloc::Abs8 => Ok(RelocKind::WasmTable64),
         RelocName::Data(_) if kind == Reloc::Abs4 => Ok(RelocKind::WasmMemory),
+        RelocName::Data(_) if kind == Reloc::Abs8 => Ok(RelocKind::WasmMemory64),
         // alloc: an error
         _ => Err(format!("a {kind:?} relocation at {name:?} in wasm code, which `wasm::lower` makes none of")),
     }

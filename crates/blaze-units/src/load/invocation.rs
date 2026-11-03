@@ -26,6 +26,8 @@ pub(crate) struct Asked {
     pub std: String,
     /// [`crate::query::BuildConfig::builds`].
     pub builds: String,
+    /// [`crate::query::BuildConfig::sources`].
+    pub sources: String,
     pub packages: Vec<String>,
     pub workspace: bool,
     pub exclude: Vec<String>,
@@ -193,6 +195,7 @@ fn configure(bytes: &[u8]) -> Configured {
         library: config.library,
         std: config.std,
         builds: config.builds,
+        sources: config.sources,
         ..Asked::default()
     };
     asked.command = Some(invocation.command);
@@ -501,6 +504,7 @@ mod tests {
             library: "/rustc/0/library".to_owned(),
             std: "/s/std".to_owned(),
             builds: "/s/build".to_owned(),
+            sources: "/s/sources".to_owned(),
         };
         let configured = configure(&config.encode());
         let asked = configured.asked.unwrap();

@@ -472,6 +472,44 @@ fn foo() {
 }
 
 #[test]
+fn a_macro_call_a_macro_wrote_under_a_false_cfg_declares_nothing() {
+    // zerocopy's `assert_unaligned!` writes `#[cfg(test)] static_assertions::const_assert_eq!(..);`
+    // in a `const _` block: outside tests that call is no item, and its path is never resolved.
+    check_at(
+        r#"
+macro_rules! inner_declare {
+    ($ident:ident) => {
+        static $ident: u32 = 0;
+    };
+}
+macro_rules! declare {
+    ($off:ident, $on:ident) => {
+        #[cfg(never)]
+        inner_declare!($off);
+        #[cfg(never)]
+        missing::declare!($off);
+        inner_declare!($on);
+    };
+}
+
+fn foo() {
+    declare!(off, on);
+    $0
+}
+        "#,
+        expect![[r#"
+            (block scope)
+            - on : value
+
+            crate
+            - foo : value
+            - (legacy) declare : macro!
+            - (legacy) inner_declare : macro!
+        "#]],
+    )
+}
+
+#[test]
 fn is_visible_from_same_def_map_regression_9481() {
     // Regression test for https://github.com/rust-lang/rust-analyzer/issues/9481
     check_at(
@@ -644,6 +682,52 @@ macro_rules! target_os {
 
             crate
             - load_manually : value
+        "#]],
+    )
+}
+
+#[test]
+fn macro2_body_macro_path_resolves_at_def_site() {
+    // #1635: a path a `macro` writes is looked up where the macro is defined, not where it is
+    // called, as std's `syscall!` names the `weak!` its module imports. The call site has a
+    // `helper` of its own, which rustc does not see from `mac`'s body.
+    check_at(
+        r#"
+#![feature(decl_macro)]
+mod real {
+    pub macro helper() { fn from_def_site() {} }
+}
+mod defs {
+    use super::real::helper;
+    pub macro mac() { helper!(); }
+}
+mod user {
+    macro helper() { fn from_call_site() {} }
+    fn f() {
+        crate::defs::mac!();
+        $0
+    }
+}
+"#,
+        expect![[r#"
+            (block scope)
+            - from_def_site : value
+
+            crate
+            - defs : type
+            - real : type
+            - user : type
+
+            crate::defs
+            - helper : macro! (import)
+            - mac : macro!
+
+            crate::real
+            - helper : macro!
+
+            crate::user
+            - f : value
+            - helper : macro!
         "#]],
     )
 }

@@ -11,7 +11,10 @@
 use std::cell::RefCell;
 
 use base_db::{Crate, Db};
-use blaze_format::cursor::{Put, Reader};
+use blaze_format::{
+    FormatError,
+    cursor::{Put, Reader},
+};
 use blaze_hash::HashMap;
 use std::alloc::Global;
 use blaze_query::db::{AsId, FromId};
@@ -209,6 +212,7 @@ fn carry_table() {
         blaze_query::carry(blaze_query::Carried {
             take: || stdx::lend::take_carried(&TABLE, Option::is_none),
             put: |it| stdx::lend::put_carried(&TABLE, Option::is_none, it),
+            end: |it| stdx::lend::end_carried(&TABLE, it),
         });
     });
 }
@@ -265,25 +269,71 @@ pub(crate) fn id_bits<T: Relocate>(id: T) -> u64 {
     })
 }
 
-/// The id `bits` name, as [`id_bits`] wrote them: `None` for 0, and in a scope for an index
-/// the table has no id of `T`'s kind at.
+/// Why the bits a record wrote for an id ([`id_of`]) name none, with the bits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IdRefused {
+    /// Bits 0, which name no id.
+    Zero,
+    /// Outside a scope, bits past [`blaze_query::db::Id::MAX_U32`] (or past 32 bits): no
+    /// query storage gives that id, so the record is corrupt or another space's.
+    PastIds { bits: u64 },
+    /// In a scope, an index (the bits less one) past the record's table of `len` entries.
+    PastTable { index: u64, len: u64 },
+    /// In a scope, an entry of another kind than the reader's, or one not made yet.
+    OtherKind,
+}
+
+impl IdRefused {
+    /// The error of the record at byte `at` that held the refused bits.
+    pub(crate) fn at(self, at: u64) -> FormatError {
+        match self {
+            IdRefused::Zero => FormatError::Zero { at, what: "an id's bits" },
+            IdRefused::PastIds { bits } => FormatError::Bound {
+                at,
+                what: "an id's bits (past `Id::MAX_U32`, which no query storage gives)",
+                found: bits,
+                bound: u64::from(blaze_query::db::Id::MAX_U32),
+            },
+            IdRefused::PastTable { index, len } => FormatError::Bound {
+                at,
+                what: "an id's index in the record's table",
+                found: index,
+                bound: len,
+            },
+            IdRefused::OtherKind => FormatError::Invalid {
+                at,
+                what: "an id whose entry in the record's table is of another kind or not made",
+            },
+        }
+    }
+}
+
+/// The id `bits` name, as [`id_bits`] wrote them, or why they name none: 0, bits past every
+/// id outside a scope, and in a scope an index the table has no id of `T`'s kind at.
 #[inline(never)]
-pub(crate) fn id_of<T: Relocate>(bits: u64) -> Option<T> {
-    if bits as u32 == 0 {
-        return None;
+pub(crate) fn id_of<T: Relocate>(bits: u64) -> Result<T, IdRefused> {
+    if bits == 0 {
+        return Err(IdRefused::Zero);
     }
     TABLE.with(|slot| match slot.borrow().as_ref() {
-        None => id_at(bits).map(T::from_id),
+        None => id_at(bits).map(T::from_id).ok_or(IdRefused::PastIds { bits }),
         Some(table) => {
-            let index = u32::try_from(bits - 1).ok()?;
-            table.get(T::KIND, index).and_then(id_at).map(T::from_id)
+            let index = bits - 1;
+            let len = table.len() as u64;
+            let index = u32::try_from(index)
+                .ok()
+                .filter(|&it| u64::from(it) < len)
+                .ok_or(IdRefused::PastTable { index, len })?;
+            let bits = table.get(T::KIND, index).ok_or(IdRefused::OtherKind)?;
+            Ok(T::from_id(entry_id(bits)))
         }
     })
 }
 
-/// The id whose bits are the word `bits`: `None` for 0 or a word past `u32`.
+/// The id whose bits are the word `bits`: `None` for 0 or a word past
+/// [`blaze_query::db::Id::MAX_U32`].
 fn id_at(bits: u64) -> Option<blaze_query::db::Id> {
-    u32::try_from(bits).ok().filter(|&bits| bits != 0).map(blaze_query::db::Id::from_u32)
+    u32::try_from(bits).ok().and_then(blaze_query::db::Id::new)
 }
 
 /// The id a [`Table`] entry holds: [`Table::index`] adds only an id's bits.

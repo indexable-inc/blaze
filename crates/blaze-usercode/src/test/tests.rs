@@ -419,6 +419,34 @@ fn a_child_closes_exactly_what_was_not_open() {
     assert_eq!(ranges, [(3, u32::MAX)], "nothing but 0 to 2 open: one range");
 }
 
+/// The harness is compiled in the tested crate, whose prelude may be core's alone (a
+/// `#![no_std]` crate testing with `extern crate std`, as flecs-c does): every module of the
+/// fork server imports std's prelude and the macros of it it names (`format!`, `vec!`,
+/// `eprintln!`), so none resolves through the crate's prelude. flecs-c's tests failed with
+/// "cannot find macro `format`" in the harness.
+#[test]
+fn a_no_std_crates_harness_reaches_std_through_its_own_extern_crate_in_every_module() {
+    // A `#![no_std]` crate's extern prelude has no `std`: the harness names it only through the
+    // harness module's `extern crate std`, which every module imports with its prelude.
+    for record in [true, false] {
+        let text = fork_server(record);
+        let code: Vec<&str> = text.lines().filter(|it| !it.trim_start().starts_with("//")).collect();
+        let opens = |it: &str| {
+            let it = it.trim_start().trim_start_matches("pub ");
+            it.starts_with("mod ") && it.ends_with('{')
+        };
+        let modules = code.iter().filter(|it| opens(it)).count();
+        let count = |line: &str| code.iter().filter(|it| it.trim() == line).count();
+        let std = count("use super::std;");
+        let prelude = count("use self::std::prelude::rust_2021::*;");
+        let macros = count("use self::std::{eprintln, format, vec};");
+        assert!(modules > 1, "{modules} modules");
+        assert_eq!((std, prelude, macros), (modules, modules, modules), "each of the {modules} modules imports std, its prelude and macros");
+        let rooted: Vec<&&str> = code.iter().filter(|it| it.contains("::std::") && !it.contains("self::std::") && !it.contains("super::std::")).collect();
+        assert!(rooted.is_empty(), "lines that name `::std`, which a no_std crate lacks: {rooted:?}");
+    }
+}
+
 #[test]
 fn the_harness_texts_are_one_module_with_the_protocol_and_the_server() {
     for record in [true, false] {
@@ -439,7 +467,7 @@ fn the_harness_texts_are_one_module_with_the_protocol_and_the_server() {
         // A test's child closes the server's descriptors in one call per gap (Linux).
         assert!(text.contains("close_range"));
         assert!(text.contains("Kept::now()"));
-        assert!(text.contains("pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: ::std::ffi::OsString) -> !"));
+        assert!(text.contains("pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: std::ffi::OsString) -> !"));
         // Nothing of blaze is named in what the tested crate compiles but the runtime's
         // exports, and those only with slots.
         let code: Vec<&str> = text.lines().filter(|it| !it.trim_start().starts_with("//")).collect();

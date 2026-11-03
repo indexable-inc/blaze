@@ -574,3 +574,54 @@ fn a_damaged_buffer_form_is_refused_or_decodes_never_panicking() {
     assert!(forms.hot_from_warm(&longer).is_err());
     assert!(forms.hot_from_cold(&warm).is_err(), "a warm form read as cold");
 }
+
+/// What C zstd 1.5.7 (zstd-sys 2.1.2+zstd.1.5.7, the zstd every target used until wasm got
+/// libzstd-rs-sys: vendor/zstd-sys/SOURCE.md) wrote: a dictionary trained on 200
+/// `fixture_sample`s (`ColdDictionary::train`, at most 4 KiB) and the level-9 frame `compress`
+/// made of one of them. Never regenerated: they stand for what images already hold.
+const OLD_DICTIONARY: &[u8] = include_bytes!("fixtures/zstd-1.5.7/dictionary");
+const OLD_FRAME: &[u8] = include_bytes!("fixtures/zstd-1.5.7/dictionary-level9.zst");
+
+/// The fixtures' values (blaze-cas's `cold.rs` has the same function for its own fixtures).
+fn fixture_sample(n: usize) -> Vec<u8> {
+    format!(
+        "{{\"unit\": \"crate-{n}\", \"cfg\": [\"feature=\\\"std\\\"\", \"target_os=\\\"linux\\\"\"], \
+         \"env\": {{\"OUT_DIR\": \"/build/out/{n}\", \"PROFILE\": \"debug\"}}, \"links\": \
+         [\"z\", \"ssl\", \"crypto\"], \"rerun\": [\"build.rs\", \"src/{n}.c\"], \"n\": {}}}\n",
+        n * 7919 % 1000
+    )
+    .repeat(4)
+    .into_bytes()
+}
+
+/// Durability, and the same bytes on every target: a cold column holding the old zstd's frame
+/// reads back to its value, and this target's zstd writes that column, dictionary included, byte
+/// for byte. On wasm that zstd is libzstd-rs-sys, a translation of zstd's dev branch after 1.5.7
+/// (vendor/libzstd-rs-sys/SOURCE.md): the same bytes are measured, not promised, and this test is
+/// what holds them.
+#[test]
+fn a_cold_column_c_zstd_1_5_7_wrote_reads_and_is_what_every_target_writes() {
+    let dictionary = ColdDictionary::new(OLD_DICTIONARY.to_vec());
+    let value = fixture_sample(12_345);
+    let mut old = vec![super::COLD_VERSION];
+    old.extend_from_slice(&dictionary.id.0);
+    old.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    old.extend_from_slice(OLD_FRAME);
+    assert_eq!(decode_cold_bytes(&old, Some(&dictionary)), Ok(value.clone()));
+    assert_eq!(encode_cold_bytes(&value, Some(&dictionary)), old);
+    let samples: Vec<Vec<u8>> = (0..200).map(fixture_sample).collect();
+    assert_eq!(ColdDictionary::train(&samples, 4 << 10).unwrap().bytes, OLD_DICTIONARY);
+}
+
+/// Only a standard zstd frame reaches zstd: a cold column whose frame starts with a legacy
+/// frame's magic (v0.7's) is refused naming it, whatever decoders this target's zstd has.
+#[test]
+fn a_cold_column_of_another_frame_magic_is_refused_naming_it() {
+    let dictionary = ColdDictionary::new(OLD_DICTIONARY.to_vec());
+    let value = fixture_sample(12_345);
+    let mut column = encode_cold_bytes(&value, Some(&dictionary));
+    let at = column.len() - OLD_FRAME.len();
+    column[at] = 0x27;
+    let why = decode_cold_bytes(&column, Some(&dictionary));
+    assert_eq!(why, Err(FormatError::Frame { at: at as u64, found: [0x27, 0xb5, 0x2f, 0xfd] }));
+}

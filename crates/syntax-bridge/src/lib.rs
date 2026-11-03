@@ -1453,6 +1453,9 @@ struct TtTreeSink<'a> {
     open_fragments: SmallVec<[(TextSize, Span); 4]>,
     /// Where the last token ends, before the whitespace that may follow it.
     token_end: TextSize,
+    /// The span of the last token, when it is an unsuffixed decimal integer that a `.` right
+    /// after it would make a float of in the text ([`TtTreeSink::keep_apart`]).
+    int_before: Option<Span>,
 }
 
 impl<'a> TtTreeSink<'a> {
@@ -1474,6 +1477,32 @@ impl<'a> TtTreeSink<'a> {
             token_map,
             open_fragments: SmallVec::new(),
             token_end: 0.into(),
+            int_before: None,
+        }
+    }
+
+    /// Before a `.` of the parse, a space after the integer literal right before it when the
+    /// two would lex as a float in the text (`1.` then a `}`, a group, a literal or another
+    /// punct; never before an identifier or a second `.`). They are two tokens (a macro's
+    /// `$a $b` given `1` and `.`, as quote's `#ident.1.expect(..)` makes), and rustc never
+    /// lexes a token tree again; the text is read again when a macro call in the expansion is
+    /// made a token tree (`ViewConverter`'s float splitting, which takes `1.` for the float
+    /// the parser split), which then gave the call one token fewer. A float the parser did
+    /// split ([`TtTreeSink::float_split`]) keeps its pieces together.
+    fn keep_apart(&mut self) {
+        let Some(span) = self.int_before.take() else { return };
+        let glues = !matches!(
+            self.cursor.peek_two_leaves(),
+            Some([tt::Leaf::Punct(tt::Punct { char: '.', .. }), tt::Leaf::Ident(_)])
+                | Some([
+                    tt::Leaf::Punct(tt::Punct { char: '.', .. }),
+                    tt::Leaf::Punct(tt::Punct { char: '.', .. })
+                ])
+        );
+        if glues {
+            self.inner.token(WHITESPACE, " ");
+            self.text_pos += TextSize::of(' ');
+            self.token_map.push(self.text_pos, span);
         }
     }
 
@@ -1525,6 +1554,7 @@ impl TtTreeSink<'_> {
     /// Parses a float literal as if it was a one to two name ref nodes with a dot inbetween.
     /// This occurs when a float literal is used as a field access.
     fn float_split(&mut self, has_pseudo_dot: bool) {
+        self.int_before = None;
         let token_tree = self.cursor.token_tree();
         let (text, span) = match &token_tree {
             Some(tt::TokenTree::Leaf(tt::Leaf::Literal(
@@ -1597,6 +1627,10 @@ impl TtTreeSink<'_> {
     fn token(&mut self, kind: SyntaxKind, mut n_tokens: u8) {
         if kind == LIFETIME_IDENT {
             n_tokens = 2;
+        }
+        match kind {
+            T![.] => self.keep_apart(),
+            _ => self.int_before = None,
         }
 
         let mut last_two = self.cursor.peek_two_leaves();
@@ -1678,9 +1712,12 @@ impl TtTreeSink<'_> {
             }
         }
 
-        self.token_map.push(self.text_pos, combined_span.expect("expected at least one token"));
+        let span = combined_span.expect("expected at least one token");
+        self.token_map.push(self.text_pos, span);
         self.token_end = self.text_pos;
         self.inner.token(kind, self.buf.as_str());
+        let decimal = |text: &str| text.bytes().all(|it| it.is_ascii_digit() || it == b'_');
+        self.int_before = (kind == INT_NUMBER && decimal(&self.buf)).then_some(span);
         self.buf.clear();
         // FIXME: Emitting whitespace for this is really just a hack, we should get rid of it.
         // Add whitespace between adjoint puncts

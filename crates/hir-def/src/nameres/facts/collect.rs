@@ -23,7 +23,7 @@ use hir_expand::{
     proc_macro::{CustomProcMacroExpander, ProcMacros},
 };
 use intern::{Symbol, sym};
-use span::{Edition, FileAstId, ROOT_ERASED_FILE_AST_ID};
+use span::{Edition, FileAstId, ROOT_ERASED_FILE_AST_ID, SyntaxContext};
 use syntax::ast;
 use triomphe::Arc;
 
@@ -40,7 +40,8 @@ use crate::{
     },
     macro_call_as_call_id,
     nameres::{
-        BuiltinShadowMode, DefMap, DefMapCrateData, DiagnosticsByModule, LocalDefMap, MacroSubNs,
+        BuiltinShadowMode, DefMap, DefMapCrateData, DiagnosticsByModule, Hygienic, LocalDefMap,
+        MacroSubNs,
         ModuleData, ModuleOrigin, ModulesMap, ModulesSlot, ResolveMode, crate_def_map,
         diagnostics::{DefDiagnostic, PreludeError},
         enable_builtin_derive_fast_path,
@@ -48,7 +49,7 @@ use crate::{
         proc_macro::{ProcMacroDef, ProcMacroKind, parse_macro_name_and_helper_attrs},
         sub_namespace_match,
     },
-    per_ns::{Item, PerNs},
+    per_ns::{Item, Namespace, PerNs},
     tt,
     visibility::{RawVisibility, Visibility, VisibilityExplicitness},
 };
@@ -2143,7 +2144,13 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
             self.macro_depth + 1,
             self.sink.def_map().recursion_limit(),
             |path| {
-                let def = this.case_one_macro_def(path);
+                // The call's own path carries its context; a path in its eager arguments is
+                // looked up where the call is.
+                let path_ctxt = match path == &ast_id.path {
+                    true => ctxt,
+                    false => SyntaxContext::root(Edition::Edition2015),
+                };
+                let def = this.case_one_macro_def(path, path_ctxt);
                 if let Some(def) = def
                     && path != &ast_id.path
                 {
@@ -2218,13 +2225,38 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
 
     /// What Case 1 of [`Self::collect_macro_call`] resolves `path` to: the textual scope, the
     /// module's scope, the `#[macro_use]` prelude, a name a `use` of another crate imports, or
-    /// the std prelude.
-    fn case_one_macro_def(&self, path: &ModPath) -> Option<MacroDefId> {
+    /// the std prelude. A path a `macro` wrote is looked up where its def-site hygiene says
+    /// ([`DefMap::hygienic_origin`]), here only when that is in a def map already collected.
+    fn case_one_macro_def(&self, path: &ModPath, ctxt: SyntaxContext) -> Option<MacroDefId> {
         let db = self.cx.db;
         let module_id = self.module_id;
         let sink = &*self.sink;
         {
                 let def_map = sink.def_map();
+                match def_map.hygienic_origin(db, module_id, path, Some(Namespace::Macros), ctxt) {
+                    Hygienic::Here => {}
+                    Hygienic::Unknown => return None,
+                    // In this def map, being collected: Case 2 resolves it once it is.
+                    Hygienic::At(at) if std::ptr::eq(def_map.map_for(db, at), def_map) => {
+                        return None;
+                    }
+                    origin @ Hygienic::At(_) => {
+                        return def_map
+                            .resolve_path_from(
+                                sink.local_def_map(),
+                                db,
+                                module_id,
+                                path,
+                                BuiltinShadowMode::Module,
+                                Some(MacroSubNs::Bang),
+                                origin,
+                            )
+                            .0
+                            .take_macros()
+                            .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
+                            .map(|it| it.definition(db));
+                    }
+                }
                 // Where the path goes on in another crate, that crate is collected in full, so
                 // what it names there it will still name once this crate is.
                 let of_another_crate = |path: &ModPath| {

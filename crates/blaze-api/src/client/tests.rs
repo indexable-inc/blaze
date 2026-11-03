@@ -234,12 +234,44 @@ fn until_hung_up_waits_for_the_end_and_keeps_what_came_first() {
     assert_eq!(client.receive().unwrap(), Envelope::new(3, Response::Done { ok: true }));
 }
 
+/// A stop longer than the patience but saying each step as it begins (the survey's: two
+/// 679 MiB images, 15 s, against 10 s) is waited for; one step that outlasts the patience is
+/// named in the error.
+#[test]
+fn until_hung_up_waits_per_step_said_and_names_the_step_it_outlasted() {
+    let patience = std::time::Duration::from_millis(300);
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    let daemon = thread::spawn(move || {
+        let say = |theirs: &mut UnixStream, response| theirs.write_all(&frames::encode(&Envelope::new(3, response)).unwrap()).unwrap();
+        say(&mut theirs, Response::Done { ok: true });
+        for step in ["making the daemon image", "writing the daemon image /v2/image (679 MiB)", "mapping the daemon image"] {
+            thread::sleep(patience / 2);
+            say(&mut theirs, Response::Stopping { doing: step.to_owned() });
+        }
+        thread::sleep(patience / 2);
+    });
+    let mut client = Client::over(Link::Unix(ours));
+    let began = std::time::Instant::now();
+    client.until_hung_up(patience).unwrap();
+    assert!(began.elapsed() > patience, "the stop took {:?}, no longer than the patience", began.elapsed());
+    daemon.join().unwrap();
+    assert_eq!(client.receive().unwrap(), Envelope::new(3, Response::Done { ok: true }));
+
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    let step = Response::Stopping { doing: "writing the daemon image /v2/image (679 MiB)".to_owned() };
+    theirs.write_all(&frames::encode(&Envelope::new(3, step)).unwrap()).unwrap();
+    let mut client = Client::over(Link::Unix(ours));
+    let error = client.until_hung_up(std::time::Duration::from_millis(20)).unwrap_err();
+    assert!(error.to_string().contains("said it was writing the daemon image /v2/image (679 MiB)"), "{error}");
+    drop(theirs);
+}
+
 #[test]
 fn until_hung_up_gives_up_after_its_patience() {
     let (ours, _theirs) = UnixStream::pair().unwrap();
     let mut client = Client::over(Link::Unix(ours));
     let error = client.until_hung_up(std::time::Duration::from_millis(20)).unwrap_err();
-    assert!(error.to_string().contains("still holds the connection after 20 ms"), "{error}");
+    assert!(error.to_string().contains("still holds the connection after 20 ms, saying nothing"), "{error}");
     let (at, _daemon) = http_daemon(0, None);
     let mut client = Client::http(at, "tok".to_owned()).unwrap();
     assert!(matches!(client.until_hung_up(std::time::Duration::from_millis(20)), Err(ClientError::Refused(_))));

@@ -937,6 +937,13 @@ fn decompress(bytes: &[u8], dictionary: Option<&ColdDictionary>) -> Result<Vec<u
         return Err(CORRUPT);
     }
     let frame = &bytes[COLD_HEADER..];
+    // Only a standard zstd frame reaches zstd: no cold column holds another, and a legacy
+    // (v0.1 to v0.7) or skippable frame would reach decoders nothing here writes for.
+    match frame.first_chunk::<4>() {
+        Some(magic) if u32::from_le_bytes(*magic) == zstd_safe::zstd_sys::ZSTD_MAGICNUMBER => {}
+        Some(magic) => return Err(FormatError::Frame { at: COLD_HEADER as u64, found: *magic }),
+        None => return Err(CORRUPT),
+    }
     let mut raw = Vec::with_capacity(len as usize);
     let read = CONTEXTS.with_borrow_mut(|(_, decompressor)| match dictionary {
         Some(dictionary) => decompressor.decompress_using_ddict(&mut raw, frame, &dictionary.decompress),

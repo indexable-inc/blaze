@@ -53,6 +53,8 @@ use crate::{
     unwind::{self, seh::ARRIVAL},
 };
 
+mod vector;
+
 type Lowered<T> = Result<T, Unhandled>;
 
 /// A Cranelift value in LLVM.
@@ -1220,6 +1222,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     }
 
     fn inst(&mut self, inst: Inst) -> Lowered<()> {
+        if self.vector(inst)? {
+            return Ok(());
+        }
         let dfg = &self.func.dfg;
         let data = dfg.insts[inst];
         let opcode = data.opcode();
@@ -1722,6 +1727,12 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 Operand::Int(b.build_int_cast_sign_flag(bits, to, false, "")?)
             }
             Opcode::Popcnt => Operand::Int(self.int_intrinsic("llvm.ctpop", &[self.int(arg)?])?),
+            // Wrapping: the absolute value of the least integer is itself.
+            Opcode::Iabs => {
+                let int = self.int(arg)?;
+                let poison = self.context.bool_type().const_zero();
+                self.intrinsic("llvm.abs", &[int.get_type().into()], &[int.into(), poison.into()])?.into()
+            }
             Opcode::Bitrev => {
                 Operand::Int(self.int_intrinsic("llvm.bitreverse", &[self.int(arg)?])?)
             }

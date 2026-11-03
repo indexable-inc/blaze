@@ -66,8 +66,8 @@ pub mod plumbing {
         owner_is,
         tracked::{Tracked, tracked_fields, tracked_identity, tracked_new},
         value::{
-            HashEqLike, IdOfAsId, IdOfNamed, IdOfOther, IdsOf, Lookup, ReturnsAsDeref,
-            ReturnsAsRef, value_hash,
+            HashEqLike, IdOfAsId, IdOfNamed, IdOfOther, IdsOf, KeyText, KeyTextDebug, KeyTextId,
+            KeyTextOther, Lookup, ReturnsAsDeref, ReturnsAsRef, value_hash,
         },
     };
 }
@@ -168,6 +168,80 @@ impl fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
+/// Why [`with_fuel`]'s work stopped: it brought `steps` rows up to date that were not already,
+/// and was bringing `query`'s row of `key` up to date `depth` frames deep when none was left.
+/// `value` is that key as its type shows it ([`function::Function::write_key`], read while the
+/// database was attached), so the error names the item and not only its number (rule 16).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct OutOfFuel {
+    pub steps: u64,
+    pub query: &'static str,
+    pub key: Id,
+    pub value: String,
+    pub depth: usize,
+}
+
+impl fmt::Display for OutOfFuel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let OutOfFuel { steps, query, key, value, depth } = self;
+        write!(
+            f,
+            "ran out of fuel after bringing {steps} rows up to date, at `{query}` of {value} ({key:?}), {depth} frames deep"
+        )
+    }
+}
+
+impl std::error::Error for OutOfFuel {}
+
+/// Runs `f`, which may bring at most `steps` rows that are not up to date in this view up to
+/// date (a row run or verified, each time it is reached), on this task: what bounds a walk
+/// whose verification would otherwise not end in a useful time (rule 15). Out of fuel, the
+/// row being reached unwinds, as a panic in it does (its row and the cycle it is in are left
+/// empty, and a later call runs them again), and `f` gives way with [`OutOfFuel`]. Ended, it
+/// gives what `f` gave and the steps it spent, what a caller records to know its margin.
+/// Nested, the inner bound is at most what the outer has left, and what it spends is the
+/// outer's.
+///
+/// Only this task is charged: a job pumped onto its thread while it waits, or one it hands to
+/// the pool, runs without its bound, and a bound such a pumped job sets is its own, neither
+/// taken from nor charged to the waiting task's.
+pub fn with_fuel<R>(steps: u64, f: impl FnOnce() -> R) -> Result<(R, u64), OutOfFuel> {
+    let outer = local::with(|local| local.fuel(steps));
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    let ours = local::with(|local| local.unfuel(outer));
+    let spent = ours.map_or(0, |it| it.given - it.left);
+    match ran {
+        Ok(value) => Ok((value, spent)),
+        Err(payload) => match payload.downcast::<OutOfFuel>() {
+            Ok(out) => Err(*out),
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+/// Unwinds the task out of fuel ([`with_fuel`]), at `F`'s row of `key`, which it names as
+/// [`function::Function::write_key`] shows it with `db` attached. The bound is set aside while
+/// the key is written, so a `Debug` that reads a row is not charged and can't run out again
+/// here, and a panic in it leaves the key named by its number (rule 17).
+#[cold]
+#[inline(never)]
+pub(crate) fn out_of_fuel<F: function::Function>(db: &F::Db, steps: u64, index: u32, key: F::Key) -> ! {
+    let depth = local::with(|local| local.frames.len());
+    let id = key.as_id();
+    let fuel = local::with(|local| local.fuel.take());
+    let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut value = String::new(); // alloc: an error's text, once per bound that trips
+        attach(db, || F::write_key(key, &mut value)).map(|()| value)
+    }));
+    local::with(|local| local.fuel = fuel);
+    let value = match written {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) | Err(_) => format!("{id:?} (its key's `Debug` failed)"), // alloc: an error's text, once per bound that trips
+    };
+    let out = OutOfFuel { steps, query: ingredient::name(index), key: id, value, depth };
+    std::panic::resume_unwind(Box::new(out)) // alloc: an unwind's payload
+}
+
 /// What a fixpoint's `cycle_fn` is told of the round.
 pub struct Cycle<'a> {
     pub(crate) heads: &'a [Id],
@@ -267,7 +341,7 @@ pub fn par_map<R: Send>(count: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
 
 /// The thread's query stack, carried with a job on a fiber across its waits.
 pub(crate) fn carried() -> blaze_graph::sched::Carried {
-    blaze_graph::sched::Carried { take: local::take, put: local::put }
+    blaze_graph::sched::Carried { take: local::take, put: local::put, end: local::end }
 }
 
 /// Puts `db`'s storage where [`with_attached`] finds it (a `Debug` impl's database) while `f`

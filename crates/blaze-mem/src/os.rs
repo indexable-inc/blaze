@@ -1,8 +1,11 @@
 //! The kernel's virtual memory: reserve address space, commit pages of it, give pages back,
 //! release it. Linux and macOS through `mmap`/`mprotect`/`madvise`, Windows through
 //! `VirtualAlloc`/`VirtualFree`. Every other function of the crate reaches the kernel through
-//! these. Elsewhere (wasm32) there is no address space to reserve, and a reservation is
-//! memory taken whole.
+//! these. On wasm there is no address space to reserve. On wasm64 (the bootstrap seed) a
+//! reservation is linear memory grown at its end (`memory.grow`), which the seed's runner
+//! (`blaze-seed-run`) commits only where it is touched, and pages go back through the runner's
+//! `blaze_seed::decommit`. Elsewhere (wasm32, whose hosts have no such import) a reservation is
+//! memory taken whole from the global allocator.
 //!
 //! A reservation is `PROT_NONE` (`PAGE_NOACCESS`, `MEM_RESERVE`): it costs address space and a
 //! mapping, no memory. Committing makes a prefix readable and writable; Linux backs it with
@@ -47,10 +50,19 @@ fn query_page_size() -> usize {
 }
 
 /// Windows' page is 4 KB on every architecture it runs blaze on (x86-64, arm64); without
-/// virtual memory it is only the unit regions commit in.
-#[cfg(not(unix))]
+/// virtual memory (wasm32) it is only the unit regions commit in.
+#[cfg(all(not(unix), not(target_arch = "wasm64")))]
 fn query_page_size() -> usize {
     4096
+}
+
+/// On wasm64 a page is the wasm page, 64 KiB: what regions purge and decommit in, through the
+/// seed runner's `decommit`. Every host page size (4 KiB, Apple silicon's 16 KiB) divides it,
+/// so a purge never reaches the runner as part of a host page, which it would have to zero by
+/// writing it, making it resident.
+#[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
+fn query_page_size() -> usize {
+    64 << 10
 }
 
 /// Reserves `bytes` (a multiple of [`page_size`]) of address space, aligned to
@@ -58,6 +70,44 @@ fn query_page_size() -> usize {
 /// transparent huge pages where it can.
 #[cfg(unix)]
 pub(crate) fn reserve(bytes: usize, huge: bool) -> io::Result<NonNull<u8>> {
+    reserve_with(bytes, huge, libc::PROT_NONE)
+}
+
+/// Reserves `bytes` (a multiple of [`page_size`]) of address space, aligned to
+/// [`RESERVE_ALIGN`], readable and writable from the start and reading zeros: a sparse table's
+/// (a page directory's), of which only the entries written ever cost memory. Linux and macOS
+/// back a page on first touch and charge nothing before (`MAP_NORESERVE`); Linux is told not
+/// to make it of transparent huge pages, which would turn the first entry written into 2 MiB
+/// resident. Windows can make a range accessible only by committing it, so there it is
+/// committed whole and charged ([`crate::Region::reserve_sparse`] counts it so); without
+/// virtual memory it is [`reserve`], which reads zeros already.
+#[cfg(unix)]
+pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
+    let base = reserve_with(bytes, false, libc::PROT_READ | libc::PROT_WRITE)?;
+    #[cfg(target_os = "linux")]
+    // Advice only: with transparent huge pages off the kernel says EINVAL, which is what is
+    // asked anyway.
+    // SAFETY: `[base, base + bytes)` is the reservation just made.
+    let _ = unsafe { libc::madvise(base.as_ptr().cast(), bytes, libc::MADV_NOHUGEPAGE) };
+    Ok(base)
+}
+
+#[cfg(windows)]
+pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    // SAFETY: a fresh reservation at an address the kernel picks, committed whole.
+    let base = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+    NonNull::new(base.cast::<u8>()).ok_or_else(io::Error::last_os_error)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
+    reserve(bytes, false)
+}
+
+/// [`reserve`] with the pages' protection `prot`.
+#[cfg(unix)]
+fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNull<u8>> {
     let padded = bytes
         .checked_add(RESERVE_ALIGN)
         .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "reservation overflows"))?;
@@ -67,7 +117,7 @@ pub(crate) fn reserve(bytes: usize, huge: bool) -> io::Result<NonNull<u8>> {
         libc::mmap(
             std::ptr::null_mut(),
             padded,
-            libc::PROT_NONE,
+            prot,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
             -1,
             0,
@@ -109,10 +159,40 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     NonNull::new(base.cast::<u8>()).ok_or_else(io::Error::last_os_error)
 }
 
-/// Without virtual memory (wasm32's linear memory only grows at its end) a reservation is the
-/// whole range taken at once, zeroed, from the global allocator: it never moves, as on the
-/// kernels, but costs its full size from the start.
-#[cfg(not(any(unix, windows)))]
+/// On wasm64 (linear memory only grows at its end) a reservation is whole 64 KiB pages
+/// ([`RESERVE_ALIGN`]) of linear memory reading zeros: a released range ([`freed`]) when one
+/// is big enough, else fresh pages grown at the end with `memory.grow`. Either way it never
+/// moves, as on the kernels, and nothing writes it: under the seed's runner a page costs
+/// memory only once it is touched (`blaze-seed-run`'s `memory.rs`), and a released range was
+/// decommitted, so a reservation costs address space alone. Never the global allocator, whose
+/// reuse would zero a range by writing it and make it all resident.
+#[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
+pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
+    use core::arch::wasm64::memory_grow;
+    let pages = bytes.div_ceil(RESERVE_ALIGN).max(1);
+    if let Some(at) = freed::take(pages) {
+        // As below: an address in the module's own memory, from the free list's answer.
+        let base = std::ptr::with_exposed_provenance_mut::<u8>(at * RESERVE_ALIGN);
+        return NonNull::new(base).ok_or_else(|| io::Error::other("the free list gave pages at address 0"));
+    }
+    let old = memory_grow::<0>(pages);
+    if old == usize::MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            // alloc: the error of a reservation refused, once
+            format!("growing linear memory by {pages} pages of 64 KiB for a {bytes}-byte reservation (memory.grow) failed"),
+        ));
+    }
+    // The pages are the module's own memory at `old` pages in: an address, with nothing to
+    // derive it from but the instruction's answer.
+    let base = std::ptr::with_exposed_provenance_mut::<u8>(old * RESERVE_ALIGN);
+    NonNull::new(base).ok_or_else(|| io::Error::other("memory.grow gave pages at address 0"))
+}
+
+/// Without virtual memory or the seed's runner (wasm32's linear memory only grows at its end) a
+/// reservation is the whole range taken at once, zeroed, from the global allocator: it never
+/// moves, as on the kernels, but costs its full size from the start.
+#[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
 pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     let layout = whole(bytes)?;
     // SAFETY: `layout` has a nonzero size (`whole` refuses zero).
@@ -120,6 +200,78 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     NonNull::new(base).ok_or_else(|| {
         io::Error::new(io::ErrorKind::OutOfMemory, "the reservation is more than memory holds")
     })
+}
+
+/// Released ranges of linear memory, in 64 KiB pages, by address, neighbours merged: linear
+/// memory never shrinks, so [`release`] decommits a range and files it here for the next
+/// [`reserve`]. Without it a seed that makes and drops reservations (link's 7,028 regions of
+/// about 126 MiB each at native blaze's peak, todo/bootstrap/plan.md) would grow its memory by
+/// each one until it hit the runner's maximum.
+#[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
+mod freed {
+    use std::collections::BTreeMap;
+
+    use parking_lot::Mutex;
+
+    /// First page to page count. A `BTreeMap` because merging a range with its neighbours
+    /// needs them by address.
+    static FREE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+    /// The first page of the smallest released range of at least `pages`, its tail filed
+    /// again, or `None` when no range is big enough.
+    pub(super) fn take(pages: usize) -> Option<usize> {
+        let mut free = FREE.lock();
+        let (&at, &have) = free.iter().filter(|&(_, &have)| have >= pages).min_by_key(|&(&at, &have)| (have, at))?;
+        free.remove(&at);
+        if have > pages {
+            free.insert(at + pages, have - pages); // alloc: the free list's node, global as the list is
+        }
+        Some(at)
+    }
+
+    /// Files `[at, at + pages)`, merged with a released neighbour on either side. A range that
+    /// overlaps one already filed was released twice, or is not what `reserve` gave: filing it
+    /// would hand the same pages to two regions, so the process aborts, naming both.
+    pub(super) fn give(mut at: usize, mut pages: usize) {
+        let mut free = FREE.lock();
+        let before = free.range(..at).next_back().filter(|&(&before, &len)| before + len > at);
+        let after = free.range(at..).next().filter(|&(&next, _)| next < at + pages);
+        if let Some((&filed, &len)) = before.or(after) {
+            let page = super::RESERVE_ALIGN;
+            eprintln!(
+                "blaze-mem: the reservation released at {:#x}..{:#x} overlaps the released range {:#x}..{:#x} \
+                 already on the free list: released twice, or not as reserved; aborting rather than give its pages \
+                 to two regions",
+                at * page,
+                (at + pages) * page,
+                filed * page,
+                (filed + len) * page
+            );
+            std::process::abort();
+        }
+        if let Some((&before, &len)) = free.range(..at).next_back()
+            && before + len == at
+        {
+            free.remove(&before);
+            at = before;
+            pages += len;
+        }
+        if let Some(len) = free.remove(&(at + pages)) {
+            pages += len;
+        }
+        free.insert(at, pages); // alloc: the free list's node, global as the list is
+    }
+}
+
+/// The seed runner's import that gives pages back (`blaze-seed-run`'s `RUNNER`).
+#[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
+mod runner {
+    #[link(wasm_import_module = "blaze_seed")]
+    unsafe extern "C" {
+        /// Gives the pages of `[ptr, ptr + bytes)` back to the host; the range reads as zeros
+        /// after. A range outside linear memory traps, naming it.
+        pub(super) fn decommit(ptr: *mut u8, bytes: usize);
+    }
 }
 
 /// As [`reserve`], with the pages the range is backed by preferred on NUMA node `node`.
@@ -248,7 +400,7 @@ fn one_node(node: u32) -> io::Result<()> {
     ))
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
 fn whole(bytes: usize) -> io::Result<std::alloc::Layout> {
     std::alloc::Layout::from_size_align(bytes.max(1), RESERVE_ALIGN)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "reservation overflows"))
@@ -488,8 +640,17 @@ pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, _huge: bool) -> io
     if ok != 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
+/// Gives the pages back through the runner, which leaves them reading zeros, as on Linux.
+#[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
+pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, _huge: bool) -> io::Result<()> {
+    // SAFETY: the caller says the range is inside a live reservation of ours, grown linear
+    // memory, that nothing uses.
+    unsafe { runner::decommit(ptr.as_ptr(), bytes) };
+    Ok(())
+}
+
 /// Keeps the memory and zeroes it, so a range committed again reads zeros as on Linux.
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
 pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, _huge: bool) -> io::Result<()> {
     // SAFETY: the caller says the range is inside a live reservation of ours that nothing
     // uses; the reservation is memory we own, so it is writable.
@@ -521,7 +682,14 @@ pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) {
     let _ = unsafe { VirtualAlloc(ptr.as_ptr().cast(), bytes, MEM_RESET, PAGE_READWRITE) };
 }
 
-#[cfg(not(any(unix, windows)))]
+/// The pages go back through the runner, as for [`decommit`]; they read zeros after.
+#[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
+pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) {
+    // SAFETY: the caller says the committed range holds nothing anyone reads.
+    unsafe { runner::decommit(ptr.as_ptr(), bytes) };
+}
+
+#[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
 pub(crate) unsafe fn purge(_ptr: NonNull<u8>, _bytes: usize) {}
 
 /// Releases a whole reservation.
@@ -543,7 +711,18 @@ pub(crate) unsafe fn release(ptr: NonNull<u8>, _bytes: usize) {
     let _ = unsafe { VirtualFree(ptr.as_ptr().cast(), 0, MEM_RELEASE) };
 }
 
-#[cfg(not(any(unix, windows)))]
+/// Linear memory never shrinks: the pages go back through the runner, and the range, reading
+/// zeros, to the free list for the next [`reserve`].
+#[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
+pub(crate) unsafe fn release(ptr: NonNull<u8>, bytes: usize) {
+    let pages = bytes.div_ceil(RESERVE_ALIGN).max(1);
+    // SAFETY: the caller hands over the whole reservation, `pages` whole pages from `reserve`,
+    // which nothing uses any more.
+    unsafe { runner::decommit(ptr.as_ptr(), pages * RESERVE_ALIGN) };
+    freed::give(ptr.as_ptr().addr() / RESERVE_ALIGN, pages);
+}
+
+#[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
 pub(crate) unsafe fn release(ptr: NonNull<u8>, bytes: usize) {
     if let Ok(layout) = whole(bytes) {
         // SAFETY: the caller hands over exactly what `reserve` returned for `bytes`, which

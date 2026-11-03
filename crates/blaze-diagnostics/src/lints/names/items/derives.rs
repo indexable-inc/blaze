@@ -72,7 +72,7 @@ pub(super) fn copy<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effectiv
         return Vec::new(); // alloc: empty, allocates nothing
     }
     let ty = adt.ty(db);
-    let impls = hir::Impl::all_for_type(db, ty.clone()); // clone: `hir::Type` is an owner ID and an interned `Ty`, a copy
+    let impls = hir::Impl::all_for_type(db, cx.krate, ty.clone()); // clone: `hir::Type` is an owner ID and an interned `Ty`, a copy
     let impl_of = |trait_: Option<hir_def::TraitId>, negative: bool| {
         trait_.is_some_and(|trait_| {
             impls.iter().any(|it| {
@@ -107,7 +107,7 @@ pub(super) fn debug<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effecti
     let db = cx.db;
     let ty = adt.ty(db);
     // clone: `hir::Type` is an owner ID and an interned `Ty`, a copy
-    let own = hir::Impl::all_for_type(db, ty.clone())
+    let own = hir::Impl::all_for_type(db, cx.krate, ty.clone())
         .into_iter()
         .any(|it| it.trait_(db).is_some_and(|t| hir_def::TraitId::from(t) == debug));
     if own || (!generic && ty.impls_trait(db, hir::Trait::from(debug), &[])) {

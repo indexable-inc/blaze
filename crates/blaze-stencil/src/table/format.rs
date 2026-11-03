@@ -65,6 +65,14 @@ pub const FORMAT: u32 = 3;
 pub const HEADER: usize = ID + 32;
 /// Where the header's id starts.
 const ID: usize = 52;
+
+/// The id of the library `bytes`, the one formula [`Writer::finish`] stores and
+/// [`Reader::hashed_id`] checks: `hash` (BLAKE3) of the bytes with the id field zeroed, which
+/// this leaves zeroed in `bytes`.
+fn id_of(bytes: &mut [u8], hash: impl FnOnce(&[u8]) -> [u8; 32]) -> [u8; 32] {
+    bytes[ID..HEADER].fill(0);
+    hash(bytes)
+}
 pub const STENCIL: usize = 16;
 pub const HOLE: usize = 8;
 pub const FAULT: usize = 2;
@@ -583,11 +591,23 @@ impl<'a> Reader<'a> {
         self.variant
     }
 
-    /// The BLAKE3 hash of the bytes with this field zeroed, which the writer computed.
+    /// The id the header says the bytes have: the BLAKE3 hash of the bytes with this field
+    /// zeroed, as the writer computed it. Nothing here recomputes it; blaze-stencil's build
+    /// script checks it equals [`Reader::hashed_id`] and the pin (`stencils.json`) for every
+    /// library it includes, and `Library::get` checks the included bytes again once per process.
     pub fn id(&self) -> [u8; 32] {
         let mut id = [0; 32];
         id.copy_from_slice(&self.bytes[ID..HEADER]);
         id
+    }
+
+    /// The id the bytes hash to: `hash` (BLAKE3, given by the caller, which has the dependency)
+    /// of them with the id field zeroed, as [`Writer::finish`] computes it.
+    pub fn hashed_id(&self, hash: impl FnOnce(&[u8]) -> [u8; 32]) -> [u8; 32] {
+        // alloc: once per library, in blaze-stencil's build script and once per process in
+        // `Library::get`
+        let mut zeroed = self.bytes.to_vec();
+        id_of(&mut zeroed, hash)
     }
 
     pub fn len(&self) -> u32 {
@@ -815,7 +835,7 @@ impl Writer {
         out.resize(layout.rodata, 0);
         out.extend_from_slice(&self.rodata);
         debug_assert_eq!(out.len(), layout.end);
-        let id = hash(&out);
+        let id = id_of(&mut out, hash);
         out[ID..HEADER].copy_from_slice(&id);
         Ok(out)
     }

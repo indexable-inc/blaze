@@ -323,13 +323,6 @@ fn is_trivia(kind: SyntaxKind) -> bool {
     kind.is_trivia() || matches!(kind, SyntaxKind::SHEBANG | SyntaxKind::FRONTMATTER)
 }
 
-/// The punctuation rustc's lexer glues out of single characters written together
-/// (`Token::glue`).
-const GLUED: &[&str] = &[
-    "==", "=>", "<=", "<<", "<-", ">=", ">>", "!=", "+=", "-=", "->", "*=", "/=", "%=", "^=", "&&",
-    "&=", "||", "|=", "<<=", ">>=", "..", "...", "..=", "::",
-];
-
 fn tokens(lexed: &LexedStr<'_>, text: &str) -> Vec<Tok> {
     // alloc: the error's parts, for an error hir found
     let mut toks: Vec<Tok> = Vec::new();
@@ -343,7 +336,7 @@ fn tokens(lexed: &LexedStr<'_>, text: &str) -> Vec<Tok> {
             && let Some(last) = toks.last_mut()
             && last.kind.is_punct()
             && last.range.end() == range.start()
-            && GLUED.contains(&&text[TextRange::new(last.range.start(), range.end())])
+            && tt::glue_str(&text[last.range], &text[range]).is_some()
         {
             last.range = TextRange::new(last.range.start(), range.end());
             continue;

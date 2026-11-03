@@ -236,58 +236,57 @@ fn build(
     let backend::Backend::Llvm(optimization) = backend::Backend::from_env().ok()? else {
         return None;
     };
-    super::tier::plain(|| {
-        if let InstanceDef::Fn(func) = instance.def
-            && db.mir_body(func.into()).ok()?.coroutine.is_some()
-        {
-            return None;
-        }
-        // Drop glue is built from the type it drops, and has no MIR.
-        let body = match instance.def {
-            InstanceDef::DropGlue => None,
-            // clone: once per export in the process; the query takes its key
-            _ => Some(super::instance_body(db, instance, env.clone(), None).ok()?),
-        };
-        // No export, never one for a guessed target: the compile that imports it is of a crate
-        // of this target graph and loaded the target with `?`, so a target that fails reaches
-        // it as that error.
-        let target = super::target_of_crate(db, env.as_ref(db).krate).ok()?;
-        let mut cg = Recorder::new(db, &**super::isa_for(target).ok()?, target, instance.checked, None);
-        cg.unlocated = true;
-        // clone: once per export in the process, moved into the closure that builds it
-        let args = instance.args.clone();
-        let mut ctx =
-            super::build(&mut cg, env.as_ref(db), body.as_deref(), tracked, |fx| match fx.body {
-                Some(_) => {
-                    fx.args = Some(args);
-                    fx.codegen()
-                }
-                None => {
-                    use rustc_type_ir::inherent::GenericArgs as _;
-                    fx.drop_glue(args.as_ref().type_at(0))
-                }
-            })
-            .ok()?;
-        if cg.naked.is_some() || cg.opaque {
-            return None;
-        }
-        super::inline(&mut ctx, &cg.inlined).ok()?;
-        super::promote::promote(&mut ctx.func, cg.named_slots());
-        super::tier::fold_known_branches(&mut ctx, cg.isa);
-        if ctx.func.dfg.num_insts() > room * CLIF_PER_IMPORTED {
-            return None;
-        }
-        let pointees = std::mem::take(&mut cg.pointees);
-        let lowered = Tally::global().time(Phase::Export, || {
-            super::llvm::export(&cg.wants, &ctx.func, &pointees, hint, optimization)
-        });
-        let (bitcode, size) = lowered.ok()?;
-        let requests = cg.finish().0;
-        if size > room || !requests.ordered() {
-            return None;
-        }
-        // clone: once per export in the process, kept with it
-        let signature = ctx.func.signature.clone();
-        Some(Export { bitcode, requests, signature, size, hint })
-    })
+    // Its `Recorder` is its own, which builds in no compile's hot functions (`tier::Inlining`).
+    if let InstanceDef::Fn(func) = instance.def
+        && db.mir_body(func.into()).ok()?.coroutine.is_some()
+    {
+        return None;
+    }
+    // Drop glue is built from the type it drops, and has no MIR.
+    let body = match instance.def {
+        InstanceDef::DropGlue => None,
+        // clone: once per export in the process; the query takes its key
+        _ => Some(super::instance_body(db, instance, env.clone(), None).ok()?),
+    };
+    // No export, never one for a guessed target: the compile that imports it is of a crate
+    // of this target graph and loaded the target with `?`, so a target that fails reaches
+    // it as that error.
+    let target = super::target_of_crate(db, env.as_ref(db).krate).ok()?;
+    let mut cg = Recorder::new(db, &**super::isa_for(target).ok()?, target, instance.checked, None);
+    cg.unlocated = true;
+    // clone: once per export in the process, moved into the closure that builds it
+    let args = instance.args.clone();
+    let mut ctx =
+        super::build(&mut cg, env.as_ref(db), body.as_deref(), tracked, |fx| match fx.body {
+            Some(_) => {
+                fx.args = Some(args);
+                fx.codegen()
+            }
+            None => {
+                use rustc_type_ir::inherent::GenericArgs as _;
+                fx.drop_glue(args.as_ref().type_at(0))
+            }
+        })
+        .ok()?;
+    if cg.naked.is_some() || cg.opaque {
+        return None;
+    }
+    super::inline(&mut ctx, &cg.inlined).ok()?;
+    super::promote::promote(&mut ctx.func, cg.named_slots());
+    super::tier::fold_known_branches(&mut ctx, cg.isa);
+    if ctx.func.dfg.num_insts() > room * CLIF_PER_IMPORTED {
+        return None;
+    }
+    let pointees = std::mem::take(&mut cg.pointees);
+    let lowered = Tally::global().time(Phase::Export, || {
+        super::llvm::export(&cg.wants, &ctx.func, &pointees, hint, optimization)
+    });
+    let (bitcode, size) = lowered.ok()?;
+    let requests = cg.finish().0;
+    if size > room || !requests.ordered() {
+        return None;
+    }
+    // clone: once per export in the process, kept with it
+    let signature = ctx.func.signature.clone();
+    Some(Export { bitcode, requests, signature, size, hint })
 }

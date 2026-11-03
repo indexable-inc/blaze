@@ -2071,10 +2071,14 @@ fn a_switching_job_takes_its_query_marks_and_stacks_with_it() {
     assert!(!crate::inside_a_query(), "the thread is outside any query once the job is off it");
     assert_eq!(crate::Run::new().base, 0, "the thread's key stack is empty for the next job");
     assert!(crate::take_unreadable_corrupt().is_none());
+    assert!(
+        (crate::take_inside(), crate::take_stacks(), crate::take_unreadable()) == (None, None, None),
+        "a thread outside any query has nothing to carry"
+    );
 
-    crate::put_inside(taken.0);
-    crate::put_stacks(taken.1);
-    crate::put_unreadable(taken.2);
+    crate::put_inside(taken.0.expect("the job runs a query"));
+    crate::put_stacks(taken.1.expect("the job's key stack is not empty"));
+    crate::put_unreadable(taken.2.expect("the job stopped on a file"));
     assert!(crate::inside_a_query());
     assert_eq!(crate::Run::new().base, 1, "the job's own key is back");
     assert_eq!(crate::take_unreadable_corrupt(), Some(BROKEN));

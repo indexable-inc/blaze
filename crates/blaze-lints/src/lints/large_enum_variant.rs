@@ -83,7 +83,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     };
     let whole = approx_ty_size(db, &ty, 0);
     let copy = cx.lang_trait(hir::LangItem::Copy);
-    let is_copy = ty.is_copy(db) || copy.is_some_and(|copy| maybe_copy(db, &ty, copy));
+    let is_copy = ty.is_copy(db) || copy.is_some_and(|copy| maybe_copy(db, cx.krate(), &ty, copy));
     let mut fix: Option<Vec<(Span, String)>> = None;
     let mut note: Option<Span> = None;
     if is_copy {
@@ -148,9 +148,9 @@ fn field_types<'t>(variant: ast::Variant<'t>) -> Vec<ast::Type<'t>> {
 
 /// clippy's `maybe_copy`: a generic enum with an impl of `Copy` of its own, which holds for
 /// some arguments.
-fn maybe_copy<'q>(db: &'q base_db::Db, ty: &hir::Type<'q>, copy: hir::Trait) -> bool {
+fn maybe_copy<'q>(db: &'q base_db::Db, krate: hir::Crate, ty: &hir::Type<'q>, copy: hir::Trait) -> bool {
     ty.type_arguments().next().is_some()
-        && hir::Impl::all_for_type(db, ty.clone())
+        && hir::Impl::all_for_type(db, krate, ty.clone())
             .into_iter()
             .any(|it| it.trait_(db) == Some(copy))
 }

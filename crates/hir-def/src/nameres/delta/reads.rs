@@ -96,14 +96,17 @@ fn carry_capture() {
         blaze_query::carry(blaze_query::Carried {
             take: || stdx::lend::take_carried_cell(&ON, |on| !on),
             put: |it| stdx::lend::put_carried_cell(&ON, |on| !on, it),
+            end: |it| stdx::lend::end_carried_cell(&ON, it),
         });
         blaze_query::carry(blaze_query::Carried {
             take: || stdx::lend::take_carried_cell(&READER, Option::is_none),
             put: |it| stdx::lend::put_carried_cell(&READER, Option::is_none, it),
+            end: |it| stdx::lend::end_carried_cell(&READER, it),
         });
         blaze_query::carry(blaze_query::Carried {
             take: || stdx::lend::take_carried(&READS, Vec::is_empty),
             put: |it| stdx::lend::put_carried(&READS, Vec::is_empty, it),
+            end: |it| stdx::lend::end_carried(&READS, it),
         });
     });
 }

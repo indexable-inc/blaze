@@ -344,7 +344,7 @@ only there. So:
 ### Checks on write
 
 - **Every blob is hashed by the gateway.** `/put` decompresses each frame (pure-Rust `ruzstd`,
-  which runs in the Worker's WebAssembly; dictionaries come from the caller's readable
+  which runs in the Worker's WebAssembly, an open choice: [One zstd](#one-zstd-a-decision-this-plan-still-needs-2026-11-02); dictionaries come from the caller's readable
   namespaces) and refuses the whole request when one does not hash to the name it came with, or
   when its uncompressed length exceeds what its header says or 4 MiB. Then the frames are written
   as one `.bpk` into the caller's namespace, named by the SHA-256 the gateway computes over it
@@ -358,6 +358,21 @@ and put only if absent, and recorded in D1. So the CAS cannot be poisoned,
   because the gateway is trusted for confidentiality and availability, never for integrity
   ([Trust and signing](#trust-and-signing)).
 - **No delete** in the API. Objects leave only by the lifecycle rules.
+
+### One zstd: a decision this plan still needs (2026-11-02)
+
+This plan reads frames with `ruzstd` (here, [Hash](#hash-sha-256) and `blaze-pack` in the crate
+table) and writes them with `zstd`: two zstd implementations, and in `blaze-pack` two in one crate.
+`one-concept-one-home` allows one zstd API. Since 2026-11-02 the `zstd` crate itself runs on wasm:
+`vendor/zstd-sys` picks the implementation per target, C zstd on native targets and the pure-Rust
+libzstd-rs-sys on wasm (vendor/zstd-sys/SOURCE.md), and it decodes only standard zstd frames on
+every target. So the decision is one `zstd` crate everywhere, its implementation per target, with
+`ruzstd` gone from this plan, unless the gateway's owner shows a reason a second decoder is worth
+it. Safety is the real argument for one: `ruzstd` is safe Rust, libzstd-rs-sys is mostly unsafe
+c2rust output whose decoder upstream calls not yet battle-tested, so reading untrusted uploads with
+it in the Worker needs a fuzz campaign first. libzstd-rs-sys on `wasm32-unknown-unknown` (the
+Worker's target, which has no libc) is also unchecked. `/put` today uses neither: it decompresses
+with workerd's `node:zlib` (status above). The gateway is not redesigned here.
 
 ### Abuse, metering and billing
 
@@ -572,7 +587,7 @@ second of which decides it:
 
 1. **The Worker checks every upload, and SHA-256 is native there.** A blob's name is the hash of its
    uncompressed bytes, so the Worker decompresses each frame (`ruzstd`, in WebAssembly, whatever the
-   hash) and then hashes the result. With SHA-256 that hash is a call into the runtime's native
+   hash; which zstd is open: [One zstd](#one-zstd-a-decision-this-plan-still-needs-2026-11-02)) and then hashes the result. With SHA-256 that hash is a call into the runtime's native
    WebCrypto, `crypto.subtle.digest`, or its streaming form `crypto.DigestStream("SHA-256")`, which
    workers-rs wraps as `worker::crypto::DigestStream` (**read**,
    [web-crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/#constructors),
@@ -1056,7 +1071,7 @@ under `Sim`.
 | `blaze-semver` | the version constants, nothing else | none |
 | `blaze-cas` | `Digest` (SHA-256), streaming verification (`Verifier::push(&[u8])`, `finish() -> Result`), chunk lists | `sha2` |
 | `blaze-cdc` | VectorCDC AE: scalar reference, AVX-512, AVX2, NEON; a streaming chunker that is fed bytes and yields cut points | none. Ported from ix's `crates/storage/cdc` (below) |
-| `blaze-pack` | the `.bpk` format and the pack stream: writer and reader over byte slices, the frame index, dictionary references | `blaze-cas`, `ruzstd` to read, `zstd` (feature) to write |
+| `blaze-pack` | the `.bpk` format and the pack stream: writer and reader over byte slices, the frame index, dictionary references | `blaze-cas`, `ruzstd` to read, `zstd` (feature) to write (two zstds: an open decision, [One zstd](#one-zstd-a-decision-this-plan-still-needs-2026-11-02)) |
 | `blaze-index` | entry kinds, segments (deterministic CBOR), heads with their tenant, key lists, Ed25519 signing and checking, turns | `blaze-cas`, `ed25519-dalek`, a CBOR crate |
 | `blaze-gateway-api` | the wire API: request and response types, their CBOR, status codes. The one contract between client and gateway | `blaze-index`, `blaze-pack` |
 | `blaze-http` | sans-IO HTTP/1.1 client and server codec, and TLS through `rustls`'s unbuffered API: connection bytes in and out, requests and responses with streamed bodies | `httparse`, `rustls` |
@@ -1092,7 +1107,8 @@ Drivers, and what each is for:
 Crates to reuse, and not:
 
 - **Reuse**: `sha2` 0.11; `zstd` with `zdict_builder` for writing and training (0.13.3 in the
-  workspace today, 0.14 current, **reported**); `ruzstd` for reading inside the Worker, where the C
+  workspace today, 0.14 current, **reported**); `ruzstd` for reading inside the Worker (open since 2026-11-02, when the
+  `zstd` crate gained a pure-Rust implementation on wasm: [One zstd](#one-zstd-a-decision-this-plan-still-needs-2026-11-02)), where the C
   library is awkward in WebAssembly (whether it reads every frame `zstd` writes with a dictionary is
   checked by a property test, **unverified**); `ed25519-dalek` (2.2, already used by
   `remote/signed.rs`); `hmac` and `hkdf`; workers-rs (`worker`) for the Worker; `rusty-s3` 0.10

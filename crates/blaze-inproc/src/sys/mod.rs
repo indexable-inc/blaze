@@ -36,7 +36,9 @@
 //!   `pthread_jit_write_protect_np`, Windows `VirtualProtectEx`) with the instruction cache
 //!   maintenance `View::publish` does. The data is within 1 GiB of every code byte.
 //!   `fn code_address(&self) -> u64`, `fn data_address(&self) -> u64`,
-//!   `fn data(&mut self) -> &mut [u8]`.
+//!   `fn data(&mut self) -> &mut [u8]`. `fn after_fork()`: makes the calling thread, the one
+//!   thread of a child just forked, able to run every `Exec`'s code (macOS: its `MAP_JIT`
+//!   pages executable, `pthread_jit_write_protect_np(1)`; nothing elsewhere), async-signal-safe.
 //! - `struct Stream` (`Send`): a connected byte stream of the channel.
 //!   `fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error>` (0 when the peer hung up),
 //!   `fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error>`,

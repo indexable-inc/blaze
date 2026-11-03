@@ -51,7 +51,10 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 impl Image {
-    fn read(path: &std::path::Path) -> Option<Image> {
+    /// Reads the executable at `path`: its symbol table, and its DWARF when `dwarf` (as large
+    /// as the rest of the binary, read and parsed only for a caller that wants lines and
+    /// inline chains).
+    fn read(path: &std::path::Path, dwarf: bool) -> Option<Image> {
         use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
         let file = std::fs::File::open(path).ok()?;
         let cache = object::ReadCache::new(file);
@@ -69,10 +72,11 @@ impl Image {
         };
         let endian =
             if object.is_little_endian() { gimli::RunTimeEndian::Little } else { gimli::RunTimeEndian::Big };
+        let want_dwarf = dwarf;
         let has_dwarf = object.section_by_name(".debug_info").is_some_and(|s| s.size() > 0);
-        let mut dwarf = if has_dwarf { load_dwarf(&object, endian) } else { None };
+        let mut dwarf = if want_dwarf && has_dwarf { load_dwarf(&object, endian) } else { None };
         // macOS keeps DWARF beside the binary in a .dSYM bundle when dsymutil ran.
-        if dwarf.is_none() && cfg!(target_vendor = "apple") {
+        if want_dwarf && dwarf.is_none() && cfg!(target_vendor = "apple") {
             let name = path.file_name()?.to_owned();
             let mut dsym = path.as_os_str().to_owned();
             dsym.push(".dSYM");
@@ -149,6 +153,8 @@ impl Image {
 /// Symbolizes addresses of this process.
 pub struct Symbolizer {
     image: Option<Option<Image>>,
+    /// Read the executable's DWARF with its symbol table: [`names`] needs only the symbols.
+    dwarf: bool,
     slide: Option<u64>,
     own_base: Option<u64>,
     cache: BTreeMap<u64, Vec<Frame>>,
@@ -162,8 +168,13 @@ impl Default for Symbolizer {
 
 impl Symbolizer {
     pub fn new() -> Symbolizer {
+        Symbolizer::reading(true)
+    }
+
+    fn reading(dwarf: bool) -> Symbolizer {
         Symbolizer {
             image: None,
+            dwarf,
             slide: slide(),
             own_base: image_base(image_base as fn(u64) -> Option<u64> as usize as u64),
             cache: BTreeMap::new(),
@@ -171,8 +182,9 @@ impl Symbolizer {
     }
 
     fn image(&mut self) -> Option<&Image> {
+        let dwarf = self.dwarf;
         self.image
-            .get_or_insert_with(|| std::env::current_exe().ok().and_then(|it| Image::read(&it)))
+            .get_or_insert_with(|| std::env::current_exe().ok().and_then(|it| Image::read(&it, dwarf)))
             .as_ref()
     }
 
@@ -216,7 +228,9 @@ impl Symbolize for Symbolizer {
 /// A name for each of `pcs`: the function demangled with its offset, or the library and
 /// offset, or the bare address. What blaze-profile's dumps print.
 pub fn names(pcs: &[u64]) -> BTreeMap<u64, String> {
-    let mut sym = Symbolizer::new();
+    // The symbol table only: blaze-profile names a flush's samples with this every flush, and
+    // the DWARF it never reads was 1.4 GiB of heap each time building blaze's own tree.
+    let mut sym = Symbolizer::reading(false);
     let mut out = BTreeMap::new();
     let mut pcs = pcs.to_vec();
     pcs.sort_unstable();

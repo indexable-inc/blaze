@@ -328,6 +328,25 @@ fn a_wasi_command_starts_at_start_and_wasm32_unknown_unknown_links_only_librarie
 }
 
 #[test]
+fn a_wasm64_command_links_no_c_runtime_and_its_rust_runtime_provides_c() {
+    let output = executable(&Cache::new(), &Answers::new(), "wasm64-blaze-wasip1").unwrap();
+    assert_eq!((output.format, output.arch), (Format::Wasm, Arch::Wasm64));
+    assert_eq!(output.kind, OutputKind::Executable { entry: "_start".to_owned() });
+    // The seed's stack is the target's: 64 MiB, where wasm32-wasip1 keeps wasm-ld's 1 MiB.
+    assert_eq!(output.stack, Some(64 << 20));
+    // No wasi-libc: an empty toolchain is enough, and the `libc` crate's `c` is not searched
+    // for, where any other library still is.
+    let empty = temp("wasm64-sysroot");
+    let located = locate_with(&Cache::new(), &Answers::new(), &output, &[dylib("c"), static_lib("c", false)], &[], &empty).unwrap();
+    assert!(located.is_empty(), "{located:?}");
+    let error = locate_with(&Cache::new(), &Answers::new(), &output, &[static_lib("m", false)], &[], &empty).unwrap_err();
+    assert!(error.what.contains("libm.a"), "{}", error.what);
+    // wasm32-wasip1's `c` is still wasi-libc's.
+    let wasip1 = executable(&Cache::new(), &Answers::new(), "wasm32-wasip1").unwrap();
+    assert!(locate_with(&Cache::new(), &Answers::new(), &wasip1, &[static_lib("c", false)], &[], &empty).is_err());
+}
+
+#[test]
 fn another_triple_is_an_error_naming_it() {
     for triple in ["x86_64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-pc-windows-msvc", "riscv64gc-unknown-linux-gnu"] {
         let error = executable(&Cache::new(), &Answers::new(), triple).unwrap_err();

@@ -7,6 +7,24 @@ pub(super) use blaze_format::leb::{
 };
 use blaze_format::cursor::Put;
 
+/// The bytes a wasm64 object leaves for an `i64.const`'s address or slot: a padded LEB of the
+/// most bytes a 64-bit value takes.
+pub(super) const PADDED64: usize = blaze_format::leb::MAX_LEN;
+
+/// `value` unsigned in exactly [`PADDED64`] bytes.
+pub(super) fn padded_uleb64(value: u64) -> [u8; PADDED64] {
+    let mut out = [0; PADDED64];
+    blaze_format::leb::put_padded_u64(&mut out, value).expect("every u64 fits ten LEB bytes");
+    out
+}
+
+/// `value` signed in exactly [`PADDED64`] bytes.
+pub(super) fn padded_sleb64(value: i64) -> [u8; PADDED64] {
+    let mut out = [0; PADDED64];
+    blaze_format::leb::put_padded_i64(&mut out, value).expect("every i64 fits ten LEB bytes");
+    out
+}
+
 pub(super) fn name(out: &mut Vec<u8>, name: &str) {
     out.put_bytes_uleb(name.as_bytes());
 }
@@ -29,6 +47,13 @@ pub(super) fn custom(out: &mut Vec<u8>, custom: &str, payload: &[u8]) {
 pub(super) fn i32_const(out: &mut Vec<u8>, value: i32) {
     out.push(0x41);
     sleb(out, value.into());
+    out.push(0x0b);
+}
+
+/// `i64.const value; end`: a constant expression of memory64's addresses.
+pub(super) fn i64_const(out: &mut Vec<u8>, value: i64) {
+    out.push(0x42);
+    sleb(out, value);
     out.push(0x0b);
 }
 

@@ -8,9 +8,9 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_units::query::{Mount, Origin};
-use blaze_vfs::{CommitError, Op, OpError, Ticket, Vfs};
+use blaze_vfs::{CommitError, Mode, Op, OpError, Ticket, Vfs};
 
-use crate::serve::work::Source;
+use crate::serve::{fetch::on_disk_id, work::Source};
 
 /// What every mount's head is named by: `mount:<at>`, a NUL, then what `at` is under the root.
 /// A NUL is in no path.
@@ -46,6 +46,50 @@ impl Mounts {
             }
         }
         Mounts { by_at }
+    }
+
+    /// Each recovered package mount under `sources` (a registry package, a git checkout) whose
+    /// copy on disk is not the mount's files, forgotten, its head removed: a build script runs
+    /// in its package's directory, which [`crate::serve::fetch::keep_on_disk`] wrote at its
+    /// fetch with an [`ON_DISK_MARK`](crate::serve::fetch::ON_DISK_MARK) holding its
+    /// [`on_disk_id`]. `mark` reads the mark of a directory (`Ok(None)` for none, or no
+    /// directory). A package whose copy was deleted is fetched and written again rather than
+    /// handed to a sandbox as a directory that is not there; one whose mark holds another id is
+    /// fetched again too, and the write then refuses the copy by name, never reads it as the
+    /// mount. Returns where each was mounted, with why.
+    pub fn forget_unwritten(
+        &mut self,
+        vfs: &mut Vfs,
+        sources: &str,
+        mark: impl Fn(&str) -> Result<Option<ContentId>, String>,
+    ) -> Vec<(String, String)> {
+        let inside = format!("{}/", sources.trim_end_matches('/'));
+        let reader = vfs.reader();
+        let mut gone: Vec<(String, String)> = Vec::new(); // alloc: once per start, the packages forgotten
+        for mount in self.by_at.values() {
+            let Origin::Root(root) = mount.origin else { continue };
+            if !mount.under.is_empty() || !mount.at.starts_with(&inside) {
+                continue;
+            }
+            let Some(want) = tree_on_disk_id(&reader, root) else {
+                gone.push((mount.at.clone(), format!("its mount's root {root} is not in the tree"))); // clone: once per package forgotten
+                continue;
+            };
+            let why = match mark(&mount.at) {
+                Ok(Some(it)) if it == want => continue,
+                Ok(Some(it)) => format!("its copy on disk holds {it:x}, its mount {want:x}"),
+                Ok(None) => "it has no copy on disk".to_owned(),
+                Err(why) => why,
+            };
+            gone.push((mount.at.clone(), why)); // clone: once per package forgotten
+        }
+        gone.sort_unstable();
+        for (at, _) in &gone {
+            if let Some(mount) = self.by_at.remove(at) {
+                _ = vfs.remove_head(&head_of(&mount));
+            }
+        }
+        gone
     }
 
     pub fn get(&self, at: &str) -> Option<&Mount> {
@@ -136,6 +180,32 @@ fn commit_error(at: &str, error: &CommitError) -> String {
     format!("keeping the mount at {at}: {error}")
 }
 
+/// [`on_disk_id`] of the files under `root`, read from the tree without hashing their bytes
+/// again (a file's content id is the tree's); `None` when the tree has no such root.
+fn tree_on_disk_id(reader: &blaze_vfs::Reader, root: ContentId) -> Option<ContentId> {
+    let pinned = reader.pin();
+    let mut files: Vec<(String, Mode, ContentId)> = Vec::new(); // alloc: once per package checked at a start
+    let mut dirs = vec![String::new()]; // alloc: as above
+    while let Some(dir) = dirs.pop() {
+        // alloc: as above, the names of one directory, owned past the next list
+        let names: Vec<(String, bool)> = pinned.list(root, &dir)?.map(|(name, is_dir)| (name.to_owned(), is_dir)).collect();
+        for (name, is_dir) in names {
+            let path = match dir.is_empty() {
+                true => name,
+                false => format!("{dir}/{name}"),
+            };
+            match is_dir {
+                true => dirs.push(path),
+                false => {
+                    let (id, mode, _) = pinned.held(root, &path).ok()??;
+                    files.push((path, mode, id));
+                }
+            }
+        }
+    }
+    Some(on_disk_id(files.iter().map(|(path, mode, id)| (path.as_str(), *mode, *id))))
+}
+
 #[cfg(test)]
 mod tests {
     use blaze_core::FileName;
@@ -168,6 +238,34 @@ mod tests {
         assert_eq!(again.get(at), Some(&mount));
         assert_eq!(again.get(index).unwrap().under, "serde");
         assert_eq!(again.roots().len(), 2);
+    }
+
+    /// A recovered package mount is kept only while its copy on disk holds the mount's own
+    /// files: the id the fetch writes into the mark ([`crate::serve::fetch::source_on_disk_id`],
+    /// from the fetched bytes) is the id the start reads off the tree, and a copy with no mark
+    /// or another id is fetched again, never read as the mount.
+    #[test]
+    fn a_package_mount_is_kept_only_while_its_copy_on_disk_holds_its_files() {
+        let (mut vfs, _) = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]);
+        let mut mounts = Mounts::default();
+        let mut fetched = source(&[("Cargo.toml", b"[package]\n"), ("src/lib.rs", b"pub fn f() {}\n"), ("src-a.c", b"int a;\n")], "");
+        fetched.files[2].mode = Mode::Executable;
+        let id = crate::serve::fetch::source_on_disk_id(&fetched);
+        let (kept, edited, deleted) = ("/s/registry/src/x/a-1.0.0", "/s/git/checkouts/b-0123/0123abcd", "/s/registry/src/x/c-1.0.0");
+        for at in [kept, edited, deleted] {
+            mounts.mount(&mut vfs, at, fetched.clone()).unwrap();
+        }
+        mounts.mount(&mut vfs, "/elsewhere/d", fetched.clone()).unwrap();
+        let other = crate::serve::fetch::source_on_disk_id(&source(&[("Cargo.toml", b"[package]\n")], ""));
+        let gone = mounts.forget_unwritten(&mut vfs, "/s", |at| match at {
+            _ if at == kept => Ok(Some(id)),
+            _ if at == edited => Ok(Some(other)),
+            _ => Ok(None),
+        });
+        let gone: Vec<&str> = gone.iter().map(|(at, _)| at.as_str()).collect();
+        assert_eq!(gone, [edited, deleted]);
+        assert!(mounts.has(kept) && mounts.has("/elsewhere/d"));
+        assert_eq!(Mounts::recover(&vfs), mounts, "the forgotten heads are gone from the journal");
     }
 
     #[test]

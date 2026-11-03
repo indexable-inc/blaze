@@ -361,24 +361,24 @@ fn a_path_between_roots_of_two_tops_is_kept_against_them() {
     assert!(inside.view().stored(&printed(b"cargo:rustc-env=T=../target/debug\n")).unwrap().1.is_empty());
 }
 
-/// A git dependency's build script, its package in the cargo home, reading `../` of it reads
+/// A git dependency's build script, its package in blaze's sources, reading `../` of it reads
 /// another revision's files: marked. The registry, and `/nix/store` that blaze's tools are in,
 /// stay machine-wide.
 #[test]
-fn a_read_next_to_a_root_in_the_cargo_home_is_kept_against_it() {
+fn a_read_next_to_a_root_in_blazes_sources_is_kept_against_it() {
     let map = RootMap::default()
-        .with(Role::Package, Path::new("/h/.cargo/git/checkouts/dep-1/abc"))
+        .with(Role::Package, Path::new("/b/sources/git/checkouts/dep-1/abc"))
         .with(Role::OutDir, Path::new("/h/ws/target/debug/build/dep-1/out"))
         .with(Role::Target, Path::new("/h/ws/target"))
         .with(Role::Workspace, Path::new("/h/ws"))
         .with(Role::Tools, Path::new("/nix/store/x-blaze/bin"))
-        .with_cargo_home(|name| (name == "CARGO_HOME").then_some("/h/.cargo"));
+        .with_sources(Path::new("/b/sources"));
     let roots = map.view();
-    let (kept, _) = roots.kept(&reading(&["/h/.cargo/git/checkouts/dep-1/proto/x.proto"]), &printed(b"")).unwrap();
+    let (kept, _) = roots.kept(&reading(&["/b/sources/git/checkouts/dep-1/proto/x.proto"]), &printed(b"")).unwrap();
     assert!(kept.shared.is_none());
     assert_eq!(kept.bound, roots.all());
     let (kept, _) =
-        roots.kept(&reading(&["/h/.cargo/registry/src/index/foo-1.0/lib.rs", "/nix/store/y-zlib/include/zlib.h"]), &printed(b"")).unwrap();
+        roots.kept(&reading(&["/b/sources/registry/src/index/foo-1.0/lib.rs", "/nix/store/y-zlib/include/zlib.h"]), &printed(b"")).unwrap();
     assert!(kept.bound.is_empty() && kept.shared.is_some());
 }
 

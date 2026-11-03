@@ -4,7 +4,8 @@
 //! build dependency, and on the registry package `testonly` and the checkout package `devonly`
 //! as dev-dependencies; `blaze-item-hash` depends on `front`. [`Workspace::with_llvm`] adds the
 //! checkout package `llvm-sys` as a build dependency of `hir-ty-codegen`, and its pin
-//! `crates/hir-ty-codegen/llvm.json`.
+//! `crates/hir-ty-codegen/llvm.json`; and `blaze-stencil`, a dependency of `hir-ty-codegen` with
+//! `llvm-sys` as its build dependency, and its pin `crates/blaze-stencil/stencils.json`.
 
 use std::{
     collections::BTreeMap,
@@ -106,11 +107,15 @@ pub fn lock(checksum: &str, llvm: bool) -> String {
     let registry = |name: &str, checksum: &str| {
         format!("[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"{REGISTRY}\"\nchecksum = \"{checksum}\"\n\n")
     };
-    let codegen: &[&str] =
-        if llvm { &["devonly", "front", "llvm-sys", "reg", "testonly"] } else { &["devonly", "front", "reg", "testonly"] };
+    let codegen: &[&str] = if llvm {
+        &["blaze-stencil", "devonly", "front", "llvm-sys", "reg", "testonly"]
+    } else {
+        &["devonly", "front", "reg", "testonly"]
+    };
     [
         "version = 4\n\n".to_owned(),
         local("blaze-item-hash", &["front"]),
+        if llvm { local("blaze-stencil", &["llvm-sys"]) } else { String::new() },
         local("cli", &["blaze-item-hash", "hir-ty-codegen"]),
         local("devonly", &[]),
         local("front", &[]),
@@ -142,9 +147,17 @@ pub const LLVM_JSON: &str = r#"{
 }
 "#;
 
+/// The fixture's stencils.json: two libraries.
+pub const STENCILS_JSON: &str = r#"{
+  "x86_64.stencils": "4444444444444444444444444444444444444444444444444444444444444444",
+  "aarch64.stencils": "5555555555555555555555555555555555555555555555555555555555555555"
+}
+"#;
+
 /// The workspace's files.
 fn files(checksum: &str, llvm: bool) -> Vec<(&'static str, String)> {
     let llvm_sys = if llvm { "llvm-sys = { path = \"../llvm-sys\" }\n" } else { "" };
+    let stencil = if llvm { "blaze-stencil = { path = \"../blaze-stencil\" }\n" } else { "" };
     let mut files = vec![
         ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/excluded\"]\n".to_owned()),
         ("Cargo.lock", lock(checksum, llvm)),
@@ -154,7 +167,7 @@ fn files(checksum: &str, llvm: bool) -> Vec<(&'static str, String)> {
             manifest(
                 "hir-ty-codegen",
                 &format!(
-                    "[dependencies]\nfront = {{ path = \"../front\" }}\n\n[build-dependencies]\nreg = \"1\"\n{llvm_sys}\n\
+                    "[dependencies]\nfront = {{ path = \"../front\" }}\n{stencil}\n[build-dependencies]\nreg = \"1\"\n{llvm_sys}\n\
                      [dev-dependencies]\ntestonly = \"1\"\ndevonly = {{ path = \"../devonly\" }}\n"
                 ),
             ),
@@ -186,6 +199,12 @@ fn files(checksum: &str, llvm: bool) -> Vec<(&'static str, String)> {
         files.push(("crates/llvm-sys/Cargo.toml", manifest("llvm-sys", "")));
         files.push(("crates/llvm-sys/src/lib.rs", "pub fn link() {}\n".to_owned()));
         files.push(("crates/hir-ty-codegen/llvm.json", LLVM_JSON.to_owned()));
+        files.push((
+            "crates/blaze-stencil/Cargo.toml",
+            manifest("blaze-stencil", "[build-dependencies]\nllvm-sys = { path = \"../llvm-sys\" }\n"),
+        ));
+        files.push(("crates/blaze-stencil/src/lib.rs", "pub fn patch() {}\n".to_owned()));
+        files.push(("crates/blaze-stencil/stencils.json", STENCILS_JSON.to_owned()));
     }
     files
 }

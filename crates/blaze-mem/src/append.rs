@@ -198,7 +198,14 @@ impl<T> Writer<'_, T> {
         Ok(len)
     }
 
+    /// Slot `index` of a room [`Writer::room`] gave.
+    ///
+    /// INVARIANT (no wrapped offset): every caller's `index` is in `[len, end]` of a room
+    /// `room` gave, and `room` bounds `end <= max`, so `index <= max`; `max * SIZE` was checked
+    /// not to overflow (`AppendVec::bytes`), so `index * SIZE` does not wrap, and `Region::at`
+    /// holds it inside the reservation.
     fn slot(&self, index: usize) -> *mut T {
+        debug_assert!(index <= self.column.max);
         self.column.region.at(index * AppendVec::<T>::SIZE).cast::<T>().as_ptr()
     }
 

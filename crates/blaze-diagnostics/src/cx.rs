@@ -272,6 +272,19 @@ impl<'a, 'db> Cx<'a, 'db> {
         self.db.file_text(file).text(self.db)
     }
 
+    /// rustc's `tcx.crate_name`: the crate's name (`--crate-name`), else its root file's stem
+    /// with `-` as `_`.
+    pub(crate) fn crate_name(&self, krate: hir::Crate) -> String {
+        match krate.display_name(self.db) {
+            Some(name) => name.crate_name().to_string(), // alloc: the error's text, for an error hir found
+            None => {
+                let path = self.file_name(krate.root_file(self.db));
+                let stem = path.rsplit('/').next().unwrap_or(&path);
+                stem.strip_suffix(".rs").unwrap_or(stem).replace('-', "_")
+            }
+        }
+    }
+
     /// `range` of `file`, as a span with no expansion.
     pub fn span_in_file(&self, file: FileId, range: TextRange) -> Span {
         Span::new(&self.file_name(file), range)
@@ -407,10 +420,10 @@ impl<'a, 'db> Cx<'a, 'db> {
         let (kind, name, at) = self.call_of(call, true)?;
         let call_site = self.span(at);
         let def_site = match loc.def.kind {
-            MacroDefKind::ProcMacro(id, ..) => {
-                let file = id.file_id.file_id()?.file_id(db);
-                Some(self.span_in_file(file, signature_range_view(id.to_view(db))))
-            }
+            // Its declaration where it is written: in a file, or in what a macro of its crate
+            // wrote (synstructure's `decl_derive!`, which rustc_type_ir_macros and vir_macros
+            // declare their derives with).
+            MacroDefKind::ProcMacro(id, ..) => Some(self.span(id.with_value(signature_range_view(id.to_view(db))))),
             MacroDefKind::Declarative(id, _)
             | MacroDefKind::BuiltIn(id, _)
             | MacroDefKind::BuiltInAttr(id, _)
@@ -429,9 +442,6 @@ impl<'a, 'db> Cx<'a, 'db> {
     fn call_of(&self, call: MacroCallId, named: bool) -> Option<(MacroKind, String, InFile<TextRange>)> {
         let db = self.db;
         let loc = call.loc(db);
-        if let MacroDefKind::ProcMacro(id, ..) = loc.def.kind {
-            id.file_id.file_id()?;
-        }
         let node = loc.to_node_view(db);
         // alloc: the macro's name, kept in the diagnostic; none unless `named`
         let owned = |text: &str| if named { text.to_owned() } else { String::new() };

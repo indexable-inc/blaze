@@ -11,7 +11,7 @@
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, closure_code, code_hash, coroutine_code, interface_hash, key};
-use hir_def::{DefWithBodyId, expr_store::ExpressionStore};
+use hir_def::{DefWithBodyId, HasModule as _, expr_store::ExpressionStore};
 use hir_ty::{
     InferBodyId, InferenceResult,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
@@ -186,8 +186,9 @@ pub fn of_coroutine_by_move<'db>(
             )));
         }
     };
-    let captures =
-        blaze_items::value(db, &blaze_items::captures(db, closure)).map_err(unhashable(db))?;
+    // A closure's captures are its own body's, the same for every crate that asks: its own.
+    let captures = blaze_items::value(db, loc.owner.krate(db), &blaze_items::captures(db, closure))
+        .map_err(unhashable(db))?;
     let body =
         db.mir_body_for_coroutine_by_move(coroutine).map_err(|it| no_mir(coroutine, it))?;
     Ok(with_spans(db, BY_MOVE, &[code.0, captures], body))

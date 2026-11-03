@@ -16,6 +16,8 @@
 
 #![forbid(unsafe_code)]
 
+pub(super) mod doctest;
+
 use std::{fmt, sync::Arc};
 
 use blaze_api::{ApiError, Artifact, Diagnostic, Level};
@@ -531,7 +533,6 @@ pub(crate) fn keyed_goal(goal: Goal, unit: &Unit) -> u8 {
         Goal::Build => 1,
         Goal::Test => 2,
         Goal::Run => 3,
-        Goal::Reach => 4,
     }
 }
 
@@ -580,23 +581,24 @@ pub(crate) fn reached_only(job: &Job, unit: &Unit) -> Result<bool, ApiError> {
 }
 
 /// The diagnostics of a crate [`reached_only`] with no check outcome in the store: its one check
-/// of its own is the `#[blaze::sealed]` one (`blaze_diagnostics::check_sealed`), run whatever
-/// [`DEPS`] says when a crate of its graph seals a trait (`hir_ty::sealed_in_graph`). Sealing is
-/// the sealing crate's opt-in and binds every crate that can name the trait, a registry crate
-/// rustc accepted included, and a registry crate that seals is checked by nothing else
-/// (docs/v2/plan/lanes/frontend/sealed-orphan.md). Any other crate pays one flag read and gets
-/// none: `options` is asked only for a crate in a sealed graph.
+/// of its own (`blaze_diagnostics::check_reached_only`), run whatever [`DEPS`] says. It has two
+/// parts. Expanding every macro call and lowering every body: rustc does that for every crate it
+/// compiles, so a call that fails to expand fails this crate's unit, naming the call, the body
+/// and where it is, never a later crate's as "MIR that failed to lower" with this one built.
+/// And the `#[blaze::sealed]` checks, when a crate of its graph seals a trait
+/// (`hir_ty::sealed_in_graph`): sealing is the sealing crate's opt-in and binds every crate
+/// that can name the trait, a registry crate rustc accepted included, and a registry crate that
+/// seals is checked by nothing else (docs/v2/plan/lanes/frontend/sealed-orphan.md). Nothing is
+/// type-checked; only what the build's programs reach is. std is checked like every other
+/// crate.
 pub(crate) fn reached_only_diags(
     db: &base_db::Db,
     krate: base_db::Crate,
     files: blaze_diagnostics::Files<'_>,
     options: impl FnOnce() -> Result<Options, ApiError>,
 ) -> Result<Vec<Diag>, ApiError> {
-    if !hir::attach_db(db, || hir_ty::sealed_in_graph(db, krate)) {
-        return Ok(Vec::new()); // alloc: none: an empty `Vec` holds no buffer
-    }
-    let _span = tracing::info_span!(target: "blaze", "unit sealed check", ?krate).entered();
-    Ok(blaze_diagnostics::check_sealed(db, hir::Crate::from(krate), files, &options()?))
+    let _span = tracing::info_span!(target: "blaze", "unit reached-only check", ?krate).entered();
+    Ok(blaze_diagnostics::check_reached_only(db, hir::Crate::from(krate), files, &options()?))
 }
 
 /// Whether a unit's diagnostics are ones cargo never shows (lints capped, so only an error
@@ -973,6 +975,8 @@ pub(crate) struct Phases {
     /// Why its record and the templates its codegen missed were not in the store, for
     /// `blaze why` ([`Compiled::misses`]).
     misses: Vec<blaze_kernel::Miss>,
+    /// What [`Phase::Codegen`] made of a `Doctest` unit's examples and runner ([`doctest`]).
+    doctests: Option<doctest::Generated>,
 }
 
 /// What a unit does, as [`Phase::Names`] finds it.
@@ -1065,7 +1069,12 @@ pub(super) fn span_unit(unit: &Unit) -> String {
     };
     // As cargo names a unit: a test or bench target's test is just the target.
     let test = (unit.mode == Mode::Test || unit.checked_as_test) && !matches!(kind, "test" | "bench");
-    format!("{package} v{version} ({named}{})", if test { " test" } else { "" }) // alloc: once per phase of a unit
+    let suffix = match () {
+        _ if unit.mode == Mode::Doctest => " doctest",
+        _ if test => " test",
+        _ => "",
+    };
+    format!("{package} v{version} ({named}{suffix})") // alloc: once per phase of a unit
 }
 
 /// A unit's phases, each holding the lock while it changes them. Only [`Phase::Bodies`] and
@@ -1116,9 +1125,13 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
         return Ok(());
     }
     let u = job.unit(unit)?;
+    if u.mode == Mode::Doctest {
+        return doctest::names(job, unit, slot);
+    }
     let krate = crate_of(job, unit, u)?;
-    options(job, unit, u)?;
     let db = reader.db();
+    macros_built(db, krate, u)?;
+    options(job, unit, u)?;
     {
         let _span = tracing::info_span!("unit def map").entered();
         let _ = hir_def::nameres::crate_def_map(db, krate);
@@ -1148,6 +1161,9 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
         // A dependency's check outcome from the store: no check runs, and codegen reads the
         // bodies' records served with it.
         Some(Ok(outcome)) => (None, Some(outcome.diags)),
+        // A build script neither built nor run (an elision found inert, std's own that blaze
+        // has a port of, one proved pure) compiles nothing, so nothing of it is checked.
+        None if reached && inert => (None, Some(Vec::new())), // alloc: empty, allocates nothing
         // Of a crate checked only where its programs reach it, the one check of its own.
         None if reached => {
             let files = blaze_diagnostics::Files::new(reader.paths(), job.mounted.root());
@@ -1339,10 +1355,14 @@ fn generate(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -
     };
     let Some(Does { builds_code: true, .. }) = does else { return Ok(()) };
     let u = job.unit(unit)?;
+    if u.mode == Mode::Doctest {
+        return doctest::generate(job, reader, unit, slot);
+    }
+    let krate = crate_of(job, unit, u)?;
     // dyn: `HirFrontend::with_checks` takes it; called once a level of the walk
     let checks = checking.as_deref().map(|it| it as &dyn BodyChecks);
     let generated = codegen::makes(u).map(|makes| {
-        let generated = codegen::generate(job, reader, unit, &makes, &job.mounted, checks);
+        let generated = codegen::generate(job, reader, unit, krate, &makes, &job.mounted, checks);
         (makes, generated)
     });
     // Its build may have stopped for the cancel, with an error that is not the unit's.
@@ -1361,6 +1381,9 @@ fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases, images
         kept.macros = macros(job, reader, unit, kept.ok, Module::Kept(&kept));
         phases.linked = Some(Linked::Kept(kept));
         return Ok(());
+    }
+    if job.unit(unit)?.mode == Mode::Doctest {
+        return doctest::link(job, reader, unit, phases, images);
     }
     let mut making = assemble(job, reader, unit, phases, images)?;
     making.macros = macros(job, reader, unit, making.ok, Module::Linked(&making.files));
@@ -1481,6 +1504,18 @@ fn store(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases) -> Re
             outputs.push(Output { path: path.clone(), key, executable });
         }
         let main = artifact::main(u, plan);
+        // A library's doctests: each example's program and their verdicts, beside the runner
+        // the plan names ([`doctest::link`]).
+        if u.mode == Mode::Doctest
+            && let Some(main) = &main
+        {
+            for (path, key, executable) in &keyed {
+                if doctest::beside(main, path) {
+                    // clone: a path, once per example stored
+                    outputs.push(Output { path: path.clone(), key: *key, executable: *executable });
+                }
+            }
+        }
         let main_key = main.as_ref().and_then(|main| outputs.iter().find(|it| it.path == *main)).map(|it| it.key);
         made.main = match (&main, main_key) {
             (Some(path), Some(key)) => Some((path.clone(), key.0)),
@@ -1726,6 +1761,19 @@ pub(crate) fn cargo_hides(message: &str) -> bool {
 
 
 
+/// `Ok` once every proc macro `krate` can expand is built ([`blaze_items::macros_built`]): what
+/// a unit's front-end job asks as it starts, before its def map, check, inference or codegen
+/// reads anything. A unit is posted after each unit it depends on is done, a proc macro's load
+/// applied, so this holds in every build; a unit ordered ahead of a proc macro's build stops
+/// here with an error naming it and the macro (rule 3), never checks a half-expanded crate.
+fn macros_built(db: &base_db::Db, krate: base_db::Crate, u: &Unit) -> Result<(), ApiError> {
+    blaze_items::macros_built(db, krate).map_err(|pending| {
+        // alloc: error path
+        let what = format!("{} was to start before the proc macros it loads were built: {}", span_unit(u), pending.describe(db));
+        ApiError::new(what, Some(u.target.name.clone()))
+    })
+}
+
 /// `unit`'s crate in the front end.
 fn crate_of(job: &Job, unit: usize, u: &Unit) -> Result<base_db::Crate, ApiError> {
     job.crates.krate(unit).ok_or_else(|| {
@@ -1773,10 +1821,14 @@ fn assemble(job: &Job, reader: &UnitReader, unit: usize, phases: &Phases, images
     let mut diagnostics: Vec<Diagnostic> = diags
         .iter()
         .filter(|it| !cargo_hides(&it.message))
-        .map(|it| blaze_diagnostics::api::diagnostic(it, &sources, style, Some(unit_of.clone())))
+        .map(|it| {
+            blaze_diagnostics::api::diagnostic(it, &sources, style, Some(unit_of.clone()))
+                // alloc: error path, naming the diagnostic whose span can't be placed
+                .map_err(|why| format!("{why}, in the diagnostic `{}`", it.message.lines().next().unwrap_or_default()))
+        })
         .collect::<Result<_, _>>()
         // clone: the unit's name, on the error path
-        .map_err(|why| ApiError::new(why.to_string(), Some(u.target.name.clone())))?;
+        .map_err(|why| ApiError::new(why, Some(u.target.name.clone())))?;
     let failed = diagnostics.iter().any(|it| it.level == Level::Error);
     let mut made = Made::default();
     let nothing = |diagnostics: Vec<Diagnostic>, ok: bool, made: Made| Making {
@@ -1821,7 +1873,7 @@ fn assemble(job: &Job, reader: &UnitReader, unit: usize, phases: &Phases, images
                 Ok(it) => it,
                 Err(errors) => {
                     // clone: error path
-                    let what = crate::refused_error(&u.target.name, errors.len(), errors.iter().cloned(), job.input.refused);
+                    let what = crate::refused_error(&span_unit(u), errors.len(), errors.iter().cloned(), job.input.refused);
                     diagnostics.push(say::refused(what, Some(unit_of), color));
                     return Ok(nothing(diagnostics, false, made));
                 }
@@ -1829,7 +1881,7 @@ fn assemble(job: &Job, reader: &UnitReader, unit: usize, phases: &Phases, images
             if job.cancelled() {
                 return Err(Failed::Again);
             }
-            let generated = parts.over(job, reader, mounted);
+            let generated = parts.over(reader, mounted);
             // Lint `blaze::vecreport`: what the optimized code still does in its loops, at
             // the source line, in the order of the positions.
             let reported = generated.report(&job.input.store).map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?;
@@ -1889,7 +1941,7 @@ fn assemble(job: &Job, reader: &UnitReader, unit: usize, phases: &Phases, images
                     files.push((path.to_owned(), crate_record(u, identity, &roots), false));
                     continue;
                 }
-                match codegen::link(job, unit, path, makes, &generated, images) {
+                match codegen::link(job, unit, crate_of(job, unit, u)?, path, makes, &generated, images) {
                     Ok(linked) => {
                         // The running program was told to start again: the build says so too,
                         // naming the executable and why, as no patch reached it.

@@ -87,18 +87,18 @@ const CHOICES: u32 = 2;
 #[cfg(not(blaze_check))]
 const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// What the queues hold: a pointer to a job's [`Header`], which says how to run it. 8 bytes,
-/// so a line of a deque's buffer holds eight jobs.
+/// What the queues hold: a pointer to a job's [`Header`], which says how to run it. One pointer
+/// (8 bytes on 64-bit targets), so a line of a deque's buffer holds eight jobs there.
 pub(crate) struct Job(NonNull<Header>);
 
-const _: () = assert!(size_of::<Job>() == 8);
+const _: () = assert!(size_of::<Job>() == size_of::<usize>());
 
 // SAFETY: a job is made only of work that may move to another thread (`Job::erase`'s bound, or
 // a scheduler's run, whose fields are `Send`), and is run once, by the thread that takes it.
 unsafe impl Send for Job {}
 
 /// The first field of every job: the function that runs it, given the job, and its link in
-/// the [`Inject`] queue it waits in. 16 bytes.
+/// the [`Inject`] queue it waits in. Two pointers (16 bytes on 64-bit targets).
 #[repr(C)]
 pub(crate) struct Header {
     run: unsafe fn(NonNull<Header>),
@@ -108,7 +108,7 @@ pub(crate) struct Header {
 }
 
 #[cfg(not(blaze_check))]
-const _: () = assert!(size_of::<Header>() == 16);
+const _: () = assert!(size_of::<Header>() == 2 * size_of::<usize>());
 
 impl Header {
     pub(crate) const fn new(run: unsafe fn(NonNull<Header>)) -> Header {
@@ -174,6 +174,9 @@ struct Caches {
     small: Cache<'static, Small>,
     medium: Cache<'static, Medium>,
     large: Cache<'static, Large>,
+    /// The thread whose caches these are: every use checks it is that thread's.
+    #[cfg(all(test, not(blaze_check)))]
+    owner: std::thread::ThreadId,
 }
 
 impl Caches {
@@ -183,12 +186,42 @@ impl Caches {
             small: cells.small.cache(),
             medium: cells.medium.cache(),
             large: cells.large.cache(),
+            #[cfg(all(test, not(blaze_check)))]
+            owner: this_thread(),
         }
     }
 }
 
 thread_local! {
     static CACHES: RefCell<Option<Caches>> = const { RefCell::new(None) };
+}
+
+/// `f` with this thread's caches. Not inlined, and so are its callers ([`take_room`],
+/// [`give_back`]): the compiler keeps a thread-local's address across calls inside one
+/// function, so a caller inlined into a job's code that waits between two submits (checkpoint
+/// 36's `blaze_codegen::driver::Build::walk`, two `par::map`s in a loop) borrowed the cache of
+/// the thread it ran on before the wait, racing that thread's own jobs on a `RefCell` that is
+/// not `Sync`: "RefCell already borrowed" at every job of the victim thread (rule 24).
+#[inline(never)]
+fn with_caches<R>(f: impl FnOnce(&mut Caches) -> R) -> Option<R> {
+    CACHES
+        .try_with(|caches| {
+            let mut caches = caches
+                .try_borrow_mut()
+                .expect("this thread's job-cell caches, borrowed twice: a thread-local's address kept across a fiber switch (rule 24)");
+            let caches = caches.get_or_insert_with(Caches::new);
+            #[cfg(all(test, not(blaze_check)))]
+            assert_eq!(caches.owner, this_thread(), "a job used another thread's job-cell caches: a thread-local's address kept across a wait (rule 24)");
+            f(caches)
+        })
+        .ok()
+}
+
+/// The calling thread, looked up anew at each call (never a kept thread-local's address).
+#[cfg(all(test, not(blaze_check)))]
+#[inline(never)]
+fn this_thread() -> std::thread::ThreadId {
+    std::thread::current().id()
 }
 
 /// A cell of a job, owned by the job it holds.
@@ -240,18 +273,41 @@ fn take_cell<const N: usize>(
     (room(cell), at)
 }
 
+/// A cell of class `class` (0, 1 or 2, [`Placed::CLASS`]) from this thread's cache, and where
+/// its room begins.
+fn take_room(class: usize) -> (Room, NonNull<u8>) {
+    with_caches(|caches| match class {
+        0 => take_cell(&mut caches.small, Room::Small),
+        1 => take_cell(&mut caches.medium, Room::Medium),
+        _ => take_cell(&mut caches.large, Room::Large),
+    })
+    .expect("a job submitted by a thread whose locals are gone: its job-cell caches went with them")
+}
+
 /// Gives `cell` back to this thread's cache, its job's closure already read out of it. A
 /// thread whose locals are gone drops it, which gives it to its pool's strays.
 fn give_back(cell: Room) {
-    _ = CACHES.try_with(move |caches| {
-        let mut caches = caches.borrow_mut();
-        let caches = caches.get_or_insert_with(Caches::new);
-        match cell {
-            Room::Small(cell) => caches.small.recycle(cell),
-            Room::Medium(cell) => caches.medium.recycle(cell),
-            Room::Large(cell) => caches.large.recycle(cell),
-        }
+    with_caches(move |caches| match cell {
+        Room::Small(cell) => caches.small.recycle(cell),
+        Room::Medium(cell) => caches.medium.recycle(cell),
+        Room::Large(cell) => caches.large.recycle(cell),
     });
+}
+
+/// How the pool's own work before a job's closure went (giving back its cell, beginning its
+/// span): `Err` with what that panicked with, which the job reports as its failure rather than
+/// run. A job is never dropped unrun for it, so whoever waits on the job hears of it (rule 17).
+// dyn: a panic's payload, as `catch_unwind` gives it
+pub(crate) type Started = Result<(), Box<dyn Any + Send>>;
+
+/// What a job of `kind` fails with when its start panicked with `panic`: a message naming the
+/// job and the panic.
+// dyn: a panic's payload, as `catch_unwind` gives it
+#[cold]
+fn failed_start(kind: &'static str, panic: &(dyn Any + Send)) -> Box<dyn Any + Send> {
+    let said = panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("a panic of no message");
+    // alloc: a failed start's message, once per failed job
+    Box::new(format!("the pool could not start job `{kind}`: {said}"))
 }
 
 /// What a profiler is told of each job a pool runs, so a worker's time is always inside a span
@@ -342,8 +398,8 @@ impl Drop for DriverSpan {
 }
 
 impl Job {
-    /// `f` in a cell, given back as it runs.
-    fn new<F: FnOnce() + Send + 'static>(f: F) -> Job {
+    /// `f` in a cell, given back as it runs; `f` is told how its start went ([`Started`]).
+    fn new<F: FnOnce(Started) + Send + 'static>(f: F) -> Job {
         // SAFETY: `f` borrows nothing.
         unsafe { Job::erase(f) }
     }
@@ -351,12 +407,12 @@ impl Job {
     /// # Safety
     ///
     /// What `f` borrows outlives its run.
-    unsafe fn erase<F: FnOnce() + Send>(f: F) -> Job {
+    unsafe fn erase<F: FnOnce(Started) + Send>(f: F) -> Job {
         /// # Safety
         ///
         /// `header` is the header of the `Placed<F>` that `erase` wrote into its cell, and
         /// this is its one run (it gives the cell back).
-        unsafe fn run<F: FnOnce()>(header: NonNull<Header>) {
+        unsafe fn run<F: FnOnce(Started)>(header: NonNull<Header>) {
             let at = header.cast::<Placed<F>>().as_ptr();
             // SAFETY: `at` is the live `Placed<F>` that `erase` wrote.
             let cell = unsafe { &raw const (*at).cell };
@@ -369,29 +425,28 @@ impl Job {
             let f = unsafe { f.read() };
             // SAFETY: `at` is the live `Placed<F>` that `erase` wrote; a `Given` is `Copy`.
             let given = unsafe { (*at).given };
-            give_back(cell);
-            crate::sched::job_begins(given);
-            let _span = JobSpan::begin(std::any::type_name::<F>());
-            f();
+            let kind = std::any::type_name::<F>();
+            // A panic here is the job's failure, given to `f`, never a job dropped unrun.
+            let started = catch_unwind(AssertUnwindSafe(move || {
+                give_back(cell);
+                crate::sched::job_begins(given);
+                JobSpan::begin(kind)
+            }));
+            match started {
+                Ok(_span) => f(Ok(())),
+                Err(panic) => f(Err(failed_start(kind, &*panic))),
+            }
         }
         let class = const { Placed::<F>::CLASS };
         let header = Header::new(run::<F>);
         let given = crate::sched::spawner();
-        CACHES.with(move |caches| {
-            let mut caches = caches.borrow_mut();
-            let caches = caches.get_or_insert_with(Caches::new);
-            let (cell, at) = match class {
-                0 => take_cell(&mut caches.small, Room::Small),
-                1 => take_cell(&mut caches.medium, Room::Medium),
-                _ => take_cell(&mut caches.large, Room::Large),
-            };
-            let at = at.cast::<Placed<F>>();
-            // SAFETY: the cell is this job's alone, committed, 64-byte aligned and at least
-            // `size_of::<Placed<F>>()` bytes (`CLASS` chose its size), and holds nothing that
-            // needs a drop.
-            unsafe { at.write(Placed { header, cell, given, f }) };
-            Job(at.cast())
-        })
+        let (cell, at) = take_room(class);
+        let at = at.cast::<Placed<F>>();
+        // SAFETY: the cell is this job's alone, committed, 64-byte aligned and at least
+        // `size_of::<Placed<F>>()` bytes (`CLASS` chose its size), and holds nothing that
+        // needs a drop.
+        unsafe { at.write(Placed { header, cell, given, f }) };
+        Job(at.cast())
     }
 
     /// # Safety
@@ -562,6 +617,12 @@ struct Slot {
     sleeping: AtomicBool,
     group: u32,
     thread: OnceLock<Thread>,
+    /// How many jobs ended on this worker (ran to their end, not parked): written by its
+    /// worker alone, summed by [`Pool::ended`].
+    ended: AtomicU64,
+    /// Whether its worker runs a job's code now, from a fiber's resume to its yield or end:
+    /// written by its worker alone, counted by [`Pool::working`].
+    inside: AtomicBool,
 }
 
 /// How many workers search and how many sleep, in one word so a submit reads both at once.
@@ -665,8 +726,15 @@ thread_local! {
     static LOCAL: Cell<*const Local> = const { Cell::new(ptr::null()) };
 }
 
+/// The worker this thread is, or null. Not inlined, as [`with_caches`] is not: a job that reads
+/// it, waits and reads it again must find the worker it resumed on (rule 24).
+#[inline(never)]
+fn local() -> *const Local {
+    LOCAL.get()
+}
+
 fn with_local<R>(f: impl FnOnce(&Local) -> R) -> Option<R> {
-    let at = LOCAL.get();
+    let at = local();
     // SAFETY: `work` points it at its own `Local`, which lives until `work` clears it on its
     // way out, on this thread.
     (!at.is_null()).then(|| f(unsafe { &*at }))
@@ -733,6 +801,8 @@ impl Pool {
                 sleeping: AtomicBool::new(false),
                 group: cpu.group,
                 thread: OnceLock::new(),
+                ended: AtomicU64::new(0),
+                inside: AtomicBool::new(false),
             })
             // alloc: made once with the pool
             .collect();
@@ -855,6 +925,22 @@ impl Pool {
         self.shared.parked.load(Ordering::Acquire)
     }
 
+    /// How many of the pool's jobs ran to their end so far: it grows only as jobs finish, never
+    /// as a worker searches, parks, checks for a stall or switches fibers, nor as a job parks
+    /// or resumes. What a stall watchdog counts as the pool's progress. 0 under the model
+    /// checker, whose jobs run on their worker's stack with no host to count them.
+    pub fn ended(&self) -> u64 {
+        self.shared.slots.iter().map(|slot| slot.ended.load(Ordering::Relaxed)).sum()
+    }
+
+    /// How many workers run a job's code now (a job resumed and not yet parked or ended): work
+    /// under way though no job ends, as one long compile is, which a stall watchdog counts as
+    /// moving. A job blocked outside the scheduler (a lock, a syscall) counts too; a worker
+    /// that searches, sleeps or switches fibers never does. 0 under the model checker.
+    pub fn working(&self) -> usize {
+        self.shared.slots.iter().filter(|slot| slot.inside.load(Ordering::Relaxed)).count()
+    }
+
     /// Runs `run` on a worker near `group` (a group this pool does not have is no group), then
     /// `done` on the same thread with what came of it: its value, or its panic, caught. The
     /// pool goes on after a panic; a panic of `done` is kept and raised when the pool is
@@ -865,7 +951,7 @@ impl Pool {
         run: impl FnOnce() -> R + Send + 'static,
         done: impl FnOnce(thread::Result<R>) + Send + 'static,
     ) {
-        self.shared.push(near, Job::new(move || done(catch_unwind(AssertUnwindSafe(run)))));
+        self.shared.push(near, Job::new(move |started: Started| done(started.and_then(|()| catch_unwind(AssertUnwindSafe(run))))));
     }
 
     /// As [`Pool::submit`], but called on one of this pool's workers the job runs next on it
@@ -875,7 +961,7 @@ impl Pool {
         run: impl FnOnce() -> R + Send + 'static,
         done: impl FnOnce(thread::Result<R>) + Send + 'static,
     ) {
-        let job = Job::new(move || done(catch_unwind(AssertUnwindSafe(run))));
+        let job = Job::new(move |started: Started| done(started.and_then(|()| catch_unwind(AssertUnwindSafe(run)))));
         if let Some(job) = push_next(&self.shared, None, job) {
             self.shared.push(None, job);
         }
@@ -890,7 +976,7 @@ impl Pool {
         run: impl FnOnce() -> R + Send + 'static,
         done: impl FnOnce(thread::Result<R>) + Send + 'static,
     ) {
-        self.push_placed(near, true, Job::new(move || done(catch_unwind(AssertUnwindSafe(run)))));
+        self.push_placed(near, true, Job::new(move |started: Started| done(started.and_then(|()| catch_unwind(AssertUnwindSafe(run))))));
     }
 
     /// As [`Pool::submit`], for a job of `class`: a critical one placed as
@@ -906,7 +992,7 @@ impl Pool {
         if class == Class::Critical {
             self.shared.critical.fetch_add(1, Ordering::Relaxed);
         }
-        self.shared.push_as(near, class, Job::new(move || done(catch_unwind(AssertUnwindSafe(run)))));
+        self.shared.push_as(near, class, Job::new(move |started: Started| done(started.and_then(|()| catch_unwind(AssertUnwindSafe(run))))));
     }
 
     /// Every background job queued now becomes a normal one, behind those queued: what is
@@ -957,7 +1043,7 @@ impl Pool {
 /// [`Pool::scope`] on the pool this thread is a worker of, or on the process's
 /// ([`crate::exec::shared`]) from a thread of no pool.
 pub(crate) fn scope_here<'env, R>(f: impl FnOnce(&Scope<'env>) -> R) -> R {
-    let at = LOCAL.get();
+    let at = local();
     // SAFETY: as in `with_local`: `work` points it at its own `Local`, which lives until `work`
     // returns, and this call is on that thread, inside `work`.
     match unsafe { at.as_ref() } {
@@ -1190,11 +1276,11 @@ impl<'env> Scope<'env> {
         #[cfg(not(blaze_check))]
         // SAFETY: as above.
         let counter = unsafe { &*self.pending }.counter;
-        let job = move || {
+        let job = move |started: Started| {
             let _left = left;
             #[cfg(not(blaze_check))]
             crate::sched::count_towards(counter);
-            done(catch_unwind(AssertUnwindSafe(run)));
+            done(started.and_then(|()| catch_unwind(AssertUnwindSafe(run))));
         };
         // SAFETY: the job borrows only what lives for `'env`, which outlives the call of
         // `Pool::scope` this scope is of. That call returns (or unwinds) only once `finished`
@@ -1219,7 +1305,7 @@ impl<'env> Scope<'env> {
 /// Gives `job` to this thread's LIFO slot when it is a worker of `shared`'s pool and `near`
 /// is its group or none; otherwise gives it back.
 fn push_next(shared: &Shared, near: Option<u32>, job: Job) -> Option<Job> {
-    let at = LOCAL.get();
+    let at = local();
     // SAFETY: as in `with_local`.
     match unsafe { at.as_ref() } {
         Some(local)
@@ -1417,6 +1503,10 @@ impl Local {
     #[allow(clippy::needless_pass_by_value, reason = "the LIFO slot takes sole ownership of the job until it is taken")]
     fn push_next(&self, job: Job) {
         let slot = &self.shared.slots[self.index];
+        #[cfg(all(test, not(blaze_check)))]
+        if let Some(thread) = slot.thread.get() {
+            assert_eq!(thread.id(), this_thread(), "a job gave a job to another worker's own slot and deque: a thread-local's address kept across a wait (rule 24)");
+        }
         if let Some(old) = NonNull::new(slot.next.swap(job.0.as_ptr(), Ordering::AcqRel)) {
             self.deque.push(Job(old));
         }
@@ -1660,6 +1750,8 @@ fn work(local: &Local) {
         shared.member.load(Ordering::Relaxed),
         u32::try_from(local.index).expect("a worker's index is a u32"),
         &shared.parked,
+        &shared.slots[local.index].ended,
+        &shared.slots[local.index].inside,
     );
     #[cfg(blaze_check)]
     let mut runner = Runner(PhantomData);
@@ -2085,28 +2177,27 @@ mod tests {
     }
 
     /// A waiting job frees its worker: two workers, 48 jobs each waiting on a later one, the
-    /// last on a key a client runs until every job has started, which no two workers could
+    /// last on a key a client runs until every job waits, parked, which no two workers could
     /// hold at once; then all finish, each with its key's value.
+    ///
+    /// The client ends its key only once all 48 are parked, never once they have only started:
+    /// a job that has started may still be on its way down the chain, and would reach the
+    /// client's key after it ended and find no one running it (the pre-2026-11-02 flake under
+    /// load, "the client runs the last key").
     #[test]
     fn a_waiting_job_frees_its_worker() {
         const JOBS: u32 = 48;
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
-        let started = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = unbounded::<(u32, Result<u32, Cancelled>)>();
         let last = flights.get_or_run(key(JOBS), || {
             for at in 0..JOBS {
-                let (flights, started, tx) = (Arc::clone(&flights), Arc::clone(&started), tx.clone());
-                pool.submit(
-                    None,
-                    move || {
-                        started.fetch_add(1, Ordering::SeqCst);
-                        chain(&flights, at, JOBS)
-                    },
-                    move |it| _ = tx.send((at, it.unwrap())),
-                );
+                let (flights, tx) = (Arc::clone(&flights), tx.clone());
+                pool.submit(None, move || chain(&flights, at, JOBS), move |it| _ = tx.send((at, it.unwrap())));
             }
-            until("every job to start", || started.load(Ordering::SeqCst) == JOBS as usize);
+            // Each job waits on a key another claimed, or the job holding key 47 on this one's:
+            // all of them park, and none can end before this key does.
+            until("every job to wait, parked", || pool.parked() == JOBS as usize);
             Ok(0)
         });
         assert_eq!(last, Ok(0));
@@ -2120,12 +2211,12 @@ mod tests {
         static MARK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    fn take_mark() -> usize {
-        MARK.replace(0)
+    fn take_mark() -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(MARK.replace(0))
     }
 
-    fn put_mark(taken: usize) {
-        MARK.set(taken);
+    fn put_mark(taken: std::num::NonZeroUsize) {
+        MARK.set(taken.get());
     }
 
     /// A job inside a frame task that waits resumes in its own frame, on whichever worker takes
@@ -2136,7 +2227,7 @@ mod tests {
     fn a_waiting_job_keeps_its_frame_on_any_worker() {
         use blaze_mem::{Tag, frame};
         static CARRIED: std::sync::Once = std::sync::Once::new();
-        CARRIED.call_once(|| crate::sched::carry(crate::sched::Carried { take: take_mark, put: put_mark }));
+        CARRIED.call_once(|| crate::sched::carry(crate::sched::Carried::word(take_mark, put_mark)));
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
         let mut moved = 0;
@@ -2285,6 +2376,141 @@ mod tests {
         assert!(moved > 0, "in 50 rounds the waiting job never resumed on the other worker");
     }
 
+    /// One function, so the compiler may keep a thread-local's address from its first submit to
+    /// its last, across the wait between them, as it did in checkpoint 36's `Build::walk`.
+    #[inline(never)]
+    fn submit_wait_submit(flights: &Flights<u32>, at: Key, round: u32, waiting: &AtomicUsize) -> (bool, usize) {
+        let ran = AtomicUsize::new(0);
+        let mut resumed_elsewhere = false;
+        super::scope_here(|scope| {
+            let before = super::this_thread();
+            for _ in 0..2 {
+                scope.submit(None, || ran.fetch_add(1, Ordering::SeqCst), |it| _ = it.unwrap());
+            }
+            waiting.store(1, Ordering::SeqCst);
+            assert_eq!(flights.get_or_run(at, || panic!("the client runs the key")), Ok(round));
+            resumed_elsewhere = super::this_thread() != before;
+            for _ in 0..2 {
+                scope.submit(None, || ran.fetch_add(1, Ordering::SeqCst), |it| _ = it.unwrap());
+            }
+        });
+        (resumed_elsewhere, ran.load(Ordering::SeqCst))
+    }
+
+    /// Checkpoint 36's "RefCell already borrowed" at pool.rs:247 and :381 (hyperfine and the
+    /// self-build, 2026-11-02): `Build::walk` ran two `par::map`s in a loop, each a scope's
+    /// submits and a wait, and the compiler kept the job-cell caches' and the worker's
+    /// thread-local addresses from the function's entry, so a job resumed on another worker took
+    /// cells from, and gave jobs to, the worker it left, racing that worker's own jobs. Here a job
+    /// submits to a scope, waits until it may resume on the other worker, and submits again in
+    /// the same function, in rounds until it moved: every submit uses the thread it runs on
+    /// (`Caches::owner`, the LIFO slot's thread), and every job of the scope runs.
+    #[test]
+    fn a_job_resumed_on_another_worker_submits_through_that_workers_own_thread_locals() {
+        let pool = Pool::new(&Topology::flat(2), false).unwrap();
+        let flights = Arc::new(Flights::<u32>::new());
+        let mut moved = 0;
+        for round in 0..200u32 {
+            if moved >= 3 {
+                break;
+            }
+            let at = key(3_000 + round);
+            let (tx, rx) = unbounded::<std::thread::Result<(bool, usize)>>();
+            let waiting = Arc::new(AtomicUsize::new(0));
+            let held = flights.get_or_run(at, || {
+                {
+                    let (flights, waiting) = (Arc::clone(&flights), Arc::clone(&waiting));
+                    pool.submit(None, move || submit_wait_submit(&flights, at, round, &waiting), move |it| _ = tx.send(it));
+                }
+                until("the job to park", || {
+                    waiting.load(Ordering::SeqCst) == 1 && pool.shared.parked.load(Ordering::SeqCst) == 1
+                });
+                // Both workers busy a while, so the parked job may resume on either.
+                for _ in 0..2 {
+                    pool.submit(None, || crate::spin::busy(Duration::from_millis(5)), |it| it.unwrap());
+                }
+                crate::spin::busy(Duration::from_millis(2));
+                Ok(round)
+            });
+            assert_eq!(held, Ok(round));
+            let got = rx.recv_timeout(LONG).expect("the job ends");
+            let (resumed_elsewhere, ran) = got.unwrap_or_else(|panic| panic!("round {round}: {}", message(&*panic)));
+            assert_eq!(ran, 4, "round {round}: a job of the scope did not run");
+            moved += usize::from(resumed_elsewhere);
+        }
+        assert!(moved > 0, "in 200 rounds the job never resumed on the other worker");
+    }
+
+    /// The other half of checkpoint 36's stall: a job whose start panicked (its cell's give-back,
+    /// pool.rs:247, on a worker whose caches were left borrowed) was dropped unrun, so its `done`
+    /// never ran and the unit waiting on it waited for good. Here a job leaves its worker's caches
+    /// borrowed for good; each job that worker starts after fails through its own `done`, with a
+    /// message naming the job and the panic, a scope's job as well, and the scope's call returns.
+    #[test]
+    fn a_job_whose_start_panics_fails_through_its_done_and_is_never_lost() {
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let (tx, rx) = unbounded::<()>();
+        pool.submit(None, || super::CACHES.with(|caches| std::mem::forget(caches.borrow_mut())), move |it| {
+            it.unwrap();
+            _ = tx.send(());
+        });
+        rx.recv_timeout(LONG).expect("the job that leaves its caches borrowed ends");
+        let (tx, rx) = unbounded::<String>();
+        pool.submit(None, || 7, move |it| _ = tx.send(message(&*it.expect_err("a job whose start panicked ran"))));
+        let said = rx.recv_timeout(Duration::from_secs(10)).expect("the job was lost: its done never ran");
+        assert!(said.contains("could not start job") && said.contains("borrowed twice"), "{said}");
+        let mut got = None;
+        pool.scope(|scope| scope.submit(None, || 7, |it| got = Some(it.map_err(|panic| message(&*panic)))));
+        let said = got.expect("the scope's job told its done").expect_err("a scope's job whose start panicked ran");
+        assert!(said.contains("could not start job"), "{said}");
+    }
+
+    /// The poolborrow stall (2026-11-02) went unseen for ten minutes as the daemon's watchdog
+    /// counted every span closed as progress, and a pool with a job parked goes on closing its
+    /// workers' `search`, `idle` and `switch` spans, its last sleeper checking for a stall every
+    /// [`STALL_AFTER`]. The pool's own count of progress, its jobs ended, stands still through
+    /// all that and moves by one for each job that ends.
+    #[test]
+    fn the_jobs_ended_count_moves_only_as_jobs_end_never_while_workers_idle() {
+        use crate::sched::{self, Wait};
+        let pool = Pool::new(&Topology::flat(2), false).unwrap();
+        let at = Key([0x5a; 32]);
+        assert!(sched::claim(at), "the key is new");
+        // Ends the key however the test ends, before the pool's drop waits for the parked job.
+        struct Done(Option<Key>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                if let Some(at) = self.0.take() {
+                    sched::key_done(at);
+                }
+            }
+        }
+        let mut done = Done(Some(at));
+        let (tx, rx) = unbounded::<bool>();
+        {
+            let tx = tx.clone();
+            pool.submit(None, move || sched::wait(Wait::Key(at)).is_ok(), move |it| _ = tx.send(it.unwrap_or(false)));
+        }
+        until("the job to park", || pool.parked() == 1);
+        let before = pool.ended();
+        // Past the pool's stall check: its workers search, park, check and park again.
+        assert!(rx.recv_timeout(STALL_AFTER * 2).is_err(), "the parked job ended while its key was held");
+        assert_eq!(pool.ended(), before, "the pool's idle workers moved its count of jobs ended");
+        if let Some(at) = done.0.take() {
+            sched::key_done(at);
+        }
+        assert_eq!(rx.recv_timeout(LONG), Ok(true), "the job ends once its key is done");
+        until("the job's end to be counted", || pool.ended() == before + 1);
+        for _ in 0..10 {
+            let tx = tx.clone();
+            pool.submit(None, || true, move |it| _ = tx.send(it.unwrap_or(false)));
+        }
+        for _ in 0..10 {
+            assert_eq!(rx.recv_timeout(LONG), Ok(true));
+        }
+        until("ten more jobs' ends to be counted", || pool.ended() == before + 11);
+    }
+
     /// A panic's message, as a job's `done` gets it.
     fn message(panic: &(dyn std::any::Any + Send)) -> String {
         panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned())).unwrap_or_default()
@@ -2344,13 +2570,13 @@ mod tests {
     /// The value of [`REFUSED`] whose put panics.
     const REFUSE: usize = usize::MAX;
 
-    fn take_refused() -> usize {
-        REFUSED.replace(0)
+    fn take_refused() -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(REFUSED.replace(0))
     }
 
-    fn put_refused(taken: usize) {
-        assert_ne!(taken, REFUSE, "a carried thread-local refused to move");
-        REFUSED.set(taken);
+    fn put_refused(taken: std::num::NonZeroUsize) {
+        assert_ne!(taken.get(), REFUSE, "a carried thread-local refused to move");
+        REFUSED.set(taken.get());
     }
 
     /// A job whose carried thread-local panics as it is put back on the thread the job resumes
@@ -2359,7 +2585,7 @@ mod tests {
     #[test]
     fn a_carried_put_that_panics_fails_its_job_and_the_pool_goes_on() {
         static CARRIED: std::sync::Once = std::sync::Once::new();
-        CARRIED.call_once(|| crate::sched::carry(crate::sched::Carried { take: take_refused, put: put_refused }));
+        CARRIED.call_once(|| crate::sched::carry(crate::sched::Carried::word(take_refused, put_refused)));
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
         for round in 0..10u32 {
@@ -2416,17 +2642,20 @@ mod tests {
             crate::sched::carry(crate::sched::Carried {
                 take: || stdx::lend::take_carried(&LENT, Option::is_none),
                 put: |it| stdx::lend::put_carried(&LENT, Option::is_none, it),
+                end: |it| stdx::lend::end_carried(&LENT, it),
             });
         });
     }
 
     /// Two jobs each lend a value to a carried thread-local ([`stdx::lend`]), park on a key and
-    /// resume, often on each other's worker, while each worker holds a value of its own in the
-    /// slot (left by a job that ended without taking it back). A job always comes on to an
-    /// empty slot, finds its own value after the wait, and the jobs after them find it empty:
-    /// a job's carried values are swapped with its worker's, never put over them.
+    /// resume, often on each other's worker, after a job on each worker ended holding a value
+    /// in the slot (ended with it, `go_off_ended`, so the worker's slot is empty again). A job
+    /// always comes on to an empty slot, finds its own value after the wait, and the jobs after
+    /// them find it empty: a value a job ends holding is ended, never left for the next job,
+    /// and none outlives its job. (A worker that holds a value of its own across jobs is
+    /// `sched::fiber_tests::a_workers_own_carried_value_is_set_aside_for_each_job_and_back_when_it_ends`.)
     #[test]
-    fn jobs_holding_lends_resume_crosswise_on_workers_whose_slots_are_held() {
+    fn jobs_holding_lends_resume_crosswise_after_jobs_that_ended_holding_one() {
         carry_lent();
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
@@ -2502,11 +2731,12 @@ mod tests {
         assert!(crossed > 0, "in 50 rounds no job resumed on the other worker");
     }
 
-    /// On a pool of one worker, whose own slot a job that ended left holding a value, two jobs
-    /// each lend the carried slot a value and park, the first on one key and the second on
-    /// another; the keys end in the other order, so they resume on the one thread swapped.
-    /// Each sees its own value after its wait, and the jobs after them an empty slot: between
-    /// jobs the slot is the worker's, set aside while a job runs and given back as it goes off.
+    /// On a pool of one worker, after a job ended holding a value in the carried slot (ended
+    /// with it), two jobs each lend the slot a value and park, the first on one key and the
+    /// second on another; the keys end in the other order, so they resume on the one thread
+    /// swapped. Each sees its own value after its wait, and the jobs after them an empty slot:
+    /// between jobs the slot is the worker's, set aside while a job runs and given back as it
+    /// goes off.
     #[test]
     fn jobs_holding_lends_resume_on_one_thread_in_swapped_order() {
         carry_lent();
@@ -2617,34 +2847,64 @@ mod tests {
         assert_eq!(rx.recv_timeout(LONG).unwrap(), "after the fire");
     }
 
-    /// On a pool of one worker, a job waits 20 ms on the pool's clock and holds no thread: the
-    /// worker runs another job meanwhile, then sleeps with nothing queued, and wakes for the
+    /// On a pool of one worker, a job waits on the pool's clock and holds no thread: it parks,
+    /// the worker runs another job meanwhile, then sleeps with nothing queued, and wakes for the
     /// deadline. The job goes on no earlier than it; a wait for a time gone by ends at once.
+    ///
+    /// The park is seen only while the wait lasts, and a test thread kept off its core longer
+    /// than that (a loaded machine) misses it: then the wait ended first, and the round is
+    /// tried again with a wait twice as long, never left polling a park that is over (the
+    /// pre-2026-11-02 flake, "timed out after 60s waiting for the timed job to park"). A job
+    /// that held its thread would never park in any round, and fails naming every wait tried.
     #[test]
     fn a_job_waiting_for_a_time_holds_no_thread_and_goes_on_once_it_is_due() {
         use crate::sched::{self, Wait};
+        const ROUNDS: u32 = 8;
         let pool = Pool::new(&Topology::flat(1), false).unwrap();
-        let (tx, rx) = unbounded::<Result<u64, String>>();
-        {
-            let tx = tx.clone();
-            pool.submit(
-                None,
-                || {
-                    let at = sched::now() + 20_000_000;
-                    sched::wait(Wait::Until(at)).unwrap();
-                    let late = sched::now().checked_sub(at).expect("the job went on before its deadline");
-                    sched::wait(Wait::Until(at)).unwrap();
-                    late
-                },
-                move |it| _ = tx.send(it.map_err(|it| message(&*it))),
-            );
+        for round in 0..ROUNDS {
+            let wait_ns = 20_000_000u64 << round;
+            let (tx, rx) = unbounded::<(&'static str, Result<u64, String>)>();
+            {
+                let tx = tx.clone();
+                pool.submit(
+                    None,
+                    move || {
+                        let at = sched::now() + wait_ns;
+                        sched::wait(Wait::Until(at)).unwrap();
+                        let late = sched::now().checked_sub(at).expect("the job went on before its deadline");
+                        sched::wait(Wait::Until(at)).unwrap();
+                        late
+                    },
+                    move |it| _ = tx.send(("timed", it.map_err(|it| message(&*it)))),
+                );
+            }
+            let seen = std::cell::Cell::new(false);
+            until("the timed job to park or end", || {
+                seen.set(pool.parked() == 1);
+                seen.get() || !rx.is_empty()
+            });
+            let parked = seen.get();
+            if parked {
+                pool.submit(None, || u64::MAX, move |it| _ = tx.send(("meanwhile", it.map_err(|it| message(&*it)))));
+            }
+            let first = rx.recv_timeout(LONG).expect("the pool's first job's end");
+            if first.0 == "timed" {
+                // The wait was over before this thread saw the park, or before the job given
+                // meanwhile ran: that one ends too, and the round goes again.
+                assert!(first.1.is_ok(), "round {round}: the timed job failed: {first:?}");
+                if parked {
+                    assert_eq!(rx.recv_timeout(LONG), Ok(("meanwhile", Ok(u64::MAX))), "round {round}: the job meanwhile");
+                }
+                continue;
+            }
+            assert_eq!(first, ("meanwhile", Ok(u64::MAX)), "round {round}: the job meanwhile");
+            let (_, late) = rx.recv_timeout(LONG).expect("the timed job's end");
+            let late = late.unwrap_or_else(|it| panic!("round {round}: the timed job failed: {it}"));
+            assert!(late < u64::try_from(LONG.as_nanos()).unwrap(), "the timed job went on {late} ns late");
+            assert_eq!(pool.parked(), 0);
+            return;
         }
-        until("the timed job to park", || pool.shared.parked.load(Ordering::SeqCst) == 1);
-        pool.submit(None, || u64::MAX, move |it| _ = tx.send(it.map_err(|it| message(&*it))));
-        assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(u64::MAX), "the job meanwhile");
-        let late = rx.recv_timeout(LONG).unwrap().unwrap();
-        assert!(late < u64::try_from(LONG.as_nanos()).unwrap(), "the timed job went on {late} ns late");
-        assert_eq!(pool.shared.parked.load(Ordering::SeqCst), 0);
+        panic!("in {ROUNDS} rounds, waits of 20 ms to {} ms, the timed job never parked while its wait lasted", 20u64 << (ROUNDS - 1));
     }
 
     /// A job's wait for a time past the pool's stall check, with every pool idle meanwhile: no
@@ -3301,6 +3561,8 @@ mod model {
                 sleeping: AtomicBool::new(false),
                 group: 0,
                 thread: OnceLock::new(),
+                ended: AtomicU64::new(0),
+                inside: AtomicBool::new(false),
             })
             .collect();
         let group = Group {
@@ -3348,7 +3610,7 @@ mod model {
 
     fn job(history: &Arc<History<Bag>>, id: u8) -> Job {
         let history = history.clone();
-        Job::new(move || {
+        Job::new(move |_started| {
             history.record(Op::Ran(id), |_| true);
         })
     }

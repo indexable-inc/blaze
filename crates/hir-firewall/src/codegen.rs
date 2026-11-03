@@ -50,6 +50,7 @@ impl Codegen {
                 panic: Panic::Unwind,
                 packages: Default::default(),
                 build_override: Override::default(),
+                stencils: false,
             },
             mode: Mode::Output,
             fold: false,
@@ -76,9 +77,12 @@ pub(crate) fn instances(db: &Db, krate: Crate, codegen: &Codegen) -> Result<Keys
         // alloc: tests only, once a pass
         Some(names.get(&file).cloned().unwrap_or_else(|| format!("file{}.rs", file.index()))) // alloc: clone: tests only, a file's name
     }));
-    let build_time = Arc::new(BuildTime(Default::default())); // alloc: tests only, once a pass
+    let build_time = BuildTime::default();
+    // Split as a dev executable that links the dependency image splits it, whose owners
+    // follow what an edit reaches: without the image every crate's code is the workspace's.
     let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), build_time)
-        .with_policy(&codegen.policy);
+        .with_policy(&codegen.policy)
+        .with_image(true);
     let mut queue = frontend.every_function(krate);
     let mut keys = Keys::default();
     while let Some(instance) = queue.pop() {

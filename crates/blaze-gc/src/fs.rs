@@ -888,6 +888,9 @@ impl Protected {
         // workspace's build dir part of one build's (review round 5, B1).
         it.holds.push(real("blaze's build directories", &root.join(BUILDS))?);
         it.within.push(real("the daemon's state", &root.join("v2"))?);
+        // The packages the daemon fetched and mounts (`blaze_manifest::home::sources`): no
+        // target dir inside them, nothing a clean deletes there.
+        it.within.push(real("blaze's fetched sources", &root.join("sources"))?);
         if let Some(machine) = machine {
             it.holds.push(real("the machine's shared directory", machine)?);
             it.within.push(real("the std stores", &machine.join("std"))?);

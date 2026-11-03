@@ -25,14 +25,20 @@
 //!    script is rerun only on files that exist).
 //! 3. The files outside every package that the packages read ([`EXTRA`]) and the variables
 //!    they or their build scripts read ([`READ_ENV`]).
-//! 4. LLVM, when `llvm-sys` is a package of the closure (blaze-stencil's build script makes the
-//!    stencils with it in every build; the `llvm` feature links it too): the pin, as
+//! 4. The stencil libraries, when blaze-stencil is a package of the closure: each by the id its
+//!    pin (`crates/blaze-stencil/stencils.json`) names, which blaze-stencil's build script holds
+//!    every library it includes to, made by LLVM or copied (this crate includes its reader,
+//!    crates/blaze-stencil/pin.rs). The pin is a file of blaze-stencil's too.
+//! 5. LLVM, when `llvm-sys` is a package of the closure (blaze-stencil's build script makes the
+//!    stencils with it in every build but the seed's; the `llvm` feature links it too), and the
+//!    program is not built as the seed ([`SEED_FEATURE`], which has no LLVM and whose stencils
+//!    are the pinned ones, step 4): the pin, as
 //!    `crates/hir-ty-codegen/llvm.json` says it (version, commit and the sha256 of the release
 //!    for `TARGET` and for `HOST`), since vendor/llvm-sys/pin.rs refuses every other LLVM; and,
 //!    when `$LLVM_SYS_231_PREFIX` is set, its `blaze-llvm.json`, which pin.rs checks is the pin
 //!    (this crate includes pin.rs: one check, one refusal). An unset prefix is no error here:
 //!    llvm-sys's own build script stops the build that needs it.
-//! 5. How blaze is built: `TARGET`, `HOST`, `PROFILE`, `OPT_LEVEL`, `DEBUG`, every
+//! 6. How blaze is built: `TARGET`, `HOST`, `PROFILE`, `OPT_LEVEL`, `DEBUG`, every
 //!    `CARGO_CFG_*`, `CARGO_PROFILE_*` and `CARGO_FEATURE_*` the build script is given,
 //!    `CARGO_ENCODED_RUSTFLAGS`, and the compiler that builds it (`$RUSTC -vV`). blaze, as
 //!    `rustc`, ends its `-vV` with a `blaze-identity:` line naming its own code identity
@@ -79,7 +85,7 @@ use std::{
 };
 
 /// The domain of the code identity; another formula is another domain.
-pub const DOMAIN: &str = "blaze v2 codegen code 2";
+pub const DOMAIN: &str = "blaze v2 codegen code 3";
 /// The domain of one input's digest.
 const INPUT_DOMAIN: &str = "blaze v2 codegen code input 1";
 /// The code generator: the program must link it.
@@ -211,6 +217,23 @@ pub const LLVM_PREFIX: &str = pin::PIN_PREFIX;
 /// The package that links LLVM: LLVM is an input when it is one.
 const LLVM_PACKAGE: &str = "llvm-sys";
 
+/// The pin of the stencil libraries and its reader (crates/blaze-stencil/pin.rs), as
+/// blaze-stencil's build script reads it: one reader, one pin.
+#[allow(dead_code, reason = "the pin's writer and hex are blaze-stencil's build script's; this crate reads the pin")]
+mod stencil_pin {
+    include!("../../blaze-stencil/pin.rs");
+}
+
+/// The package whose stencil libraries are keyed by their pin.
+const STENCIL_PACKAGE: &str = "blaze-stencil";
+/// The variable naming where the seed's prebuilt stencil libraries are: no input, since
+/// blaze-stencil refuses any bytes but the pinned ones.
+pub const STENCILS_DIR: &str = stencil_pin::PREBUILT;
+/// The program's feature that builds it as the seed (todo/bootstrap/plan.md): no LLVM, its
+/// stencils copied and held to their pin. blaze-engine's build script refuses it with any
+/// feature that brings LLVM back.
+pub const SEED_FEATURE: &str = "CARGO_FEATURE_SEED";
+
 /// Why a variable a closure package's build script reads is no input, or `None` when it must
 /// be one: the C compiler, its flags, archiver and SDK, which build the C of the closure's
 /// packages (cc's variables, per target and per host), as the module doc says.
@@ -240,10 +263,10 @@ pub fn unkeyed_env(name: &str) -> Option<&'static str> {
 /// One input of the identity.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Input {
-    /// What it is: `package`, `manifest`, `file`, `llvm`, `env`, `compiler`.
+    /// What it is: `package`, `manifest`, `file`, `stencils`, `llvm`, `env`, `compiler`.
     pub kind: &'static str,
-    /// Which: a package's `name version source`, a path relative to the workspace, a library's
-    /// name, a variable's name.
+    /// Which: a package's `name version source`, a path relative to the workspace, a stencil
+    /// library's file, a library's name, a variable's name.
     pub name: String,
     pub digest: [u8; 32],
 }
@@ -259,7 +282,7 @@ pub struct Stamp {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Worked {
     pub code: [u8; 32],
-    /// In the order hashed: packages, manifests, files, LLVM, variables, the compiler.
+    /// In the order hashed: packages, manifests, files, stencils, LLVM, variables, the compiler.
     pub inputs: Vec<Input>,
     /// Every file hashed, by its absolute path: what the coverage check holds rustc's reads to.
     pub files: BTreeSet<PathBuf>,
@@ -278,6 +301,9 @@ pub struct Worked {
     pub rerun_env: Vec<String>,
     /// The pinned LLVM's prefix, checked to be the pin: everything under it is the pin's.
     pub llvm_prefix: Option<PathBuf>,
+    /// In the seed, where its prebuilt stencil libraries are: everything blaze-stencil includes
+    /// from there it checked to be the pinned bytes.
+    pub stencils_dir: Option<PathBuf>,
 }
 
 impl Worked {
@@ -411,6 +437,8 @@ pub struct BuildEnv {
     pub llvm_prefix: Option<String>,
     /// What `$RUSTC -vV` printed; `None` where no compiler is asked (the coverage test).
     pub compiler: Option<String>,
+    /// Where the seed's prebuilt stencil libraries are ([`STENCILS_DIR`]), if set.
+    pub stencils_dir: Option<String>,
     /// Where cargo's own configuration is: `$CARGO_HOME`, else `$HOME/.cargo`.
     pub cargo_home: Option<PathBuf>,
 }
@@ -433,11 +461,17 @@ impl BuildEnv {
             vars.insert((*name).to_owned(), env.get(*name).cloned());
         }
         let llvm_prefix = env.get(LLVM_PREFIX).filter(|it| !it.is_empty()).cloned();
+        let stencils_dir = env.get(STENCILS_DIR).filter(|it| !it.is_empty()).cloned();
         let cargo_home = match env.get("CARGO_HOME").filter(|it| !it.is_empty()) {
             Some(home) => Some(PathBuf::from(home)),
             None => env.get("HOME").filter(|it| !it.is_empty()).map(|it| Path::new(it).join(".cargo")),
         };
-        BuildEnv { vars, llvm_prefix, compiler: None, cargo_home }
+        BuildEnv { vars, llvm_prefix, compiler: None, stencils_dir, cargo_home }
+    }
+
+    /// Whether the program is built as the seed ([`SEED_FEATURE`]).
+    pub fn seed(&self) -> bool {
+        self.vars.contains_key(SEED_FEATURE)
     }
 }
 
@@ -973,10 +1007,25 @@ pub fn work_out(workspace: &Workspace, env: &BuildEnv) -> Result<Worked, String>
         files.insert(path);
     }
 
-    // 4. LLVM: the pin, and the prefix checked to be it.
+    // 4. The stencil libraries, by their pin.
+    let stencils = closure.iter().map(|at| &workspace.lock[*at]).find(|it| it.source.is_none() && it.name == STENCIL_PACKAGE);
+    if let Some(stencils) = stencils {
+        let path = workspace.local(stencils)?.dir.join(stencil_pin::PIN_FILE);
+        let text = String::from_utf8(read_stamped(&path, &mut stamps)?).map_err(|_| format!("{} is not UTF-8", path.display()))?;
+        let pinned = stencil_pin::pin_parse(&text).map_err(|why| format!("the stencil libraries' pin {}: {why}", path.display()))?;
+        for (name, id) in pinned {
+            inputs.push(Input { kind: "stencils", name, digest: id });
+        }
+        files.insert(path);
+    }
+    let seed = env.seed();
+    let stencils_dir = if seed { env.stencils_dir.as_ref().map(PathBuf::from) } else { None };
+
+    // 5. LLVM: the pin, and the prefix checked to be it; none in the seed, which links no LLVM
+    // and makes no stencils with it.
     let mut rerun_env: Vec<String> = READ_ENV.iter().map(|it| (*it).to_owned()).collect();
     let mut llvm_prefix = None;
-    if links_llvm {
+    if links_llvm && !seed {
         rerun_env.push(LLVM_PREFIX.to_owned());
         let (pinned, json) = llvm_pin(workspace, &closure, &mut stamps, &mut files)?;
         let mut built_for = BTreeSet::new();
@@ -1004,7 +1053,7 @@ pub fn work_out(workspace: &Workspace, env: &BuildEnv) -> Result<Worked, String>
         }
     }
 
-    // 5. How blaze is built.
+    // 6. How blaze is built.
     if let Some(Some(dir)) = env.vars.get(ISLE_SOURCE_DIR) {
         return Err(format!(
             "${ISLE_SOURCE_DIR} is `{dir}`: cranelift-codegen's build script then makes its code \
@@ -1043,6 +1092,7 @@ pub fn work_out(workspace: &Workspace, env: &BuildEnv) -> Result<Worked, String>
         crates,
         rerun_env,
         llvm_prefix,
+        stencils_dir,
     })
 }
 

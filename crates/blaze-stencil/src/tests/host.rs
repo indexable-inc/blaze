@@ -64,7 +64,7 @@ pub fn host() -> Option<Target> {
         let arch = match target.arch {
             blaze_codegen::Arch::X86_64 => cfg!(target_arch = "x86_64"),
             blaze_codegen::Arch::Aarch64 => cfg!(target_arch = "aarch64"),
-            blaze_codegen::Arch::Wasm32 => false,
+            blaze_codegen::Arch::Wasm32 | blaze_codegen::Arch::Wasm64 => false,
         };
         let os = match target.os {
             Os::Linux => cfg!(target_os = "linux"),
@@ -84,6 +84,7 @@ pub fn triple(target: &Target) -> &'static str {
         (blaze_codegen::Arch::Aarch64, Os::MacOs) => "aarch64-apple-darwin",
         (blaze_codegen::Arch::Aarch64, Os::Windows) => "aarch64-pc-windows-msvc",
         (blaze_codegen::Arch::Wasm32, _) => "wasm32-unknown-unknown",
+        (blaze_codegen::Arch::Wasm64, _) => "wasm64-blaze-wasip1",
     }
 }
 

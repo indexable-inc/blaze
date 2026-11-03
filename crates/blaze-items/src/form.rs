@@ -62,7 +62,7 @@ use hir_ty::{
     next_solver::{
         AliasConstKind, Allocation, Binder, BoundRegion, Clause, Const, ConstKind, DbInterner,
         FnSig, GenericArgs, ImplTraitIdx, OpaqueTyIdWrapper, Pattern, Region, StoredTy, Term,
-        TermId, TraitRef, Ty, TyKind, ValTree,
+        TermId, TraitRef, Ty, TyKind, ValTree, references_non_lt_error,
     },
     rpit_hidden_types,
     traits::{ParamEnvAndCrate, implements_traits_unique},
@@ -72,7 +72,7 @@ use rustc_abi::ReprOptions;
 use rustc_type_ir::{
     AliasTermKind, AliasTyKind, BoundRegionKind, BoundTyKind, BoundVarIndexKind, ClauseKind,
     ExistentialPredicate, GenericArgKind, InferConst, InferTy, Interner as _, OutlivesClause,
-    PatternKind, RegionKind, TermKind, ValTreeKind,
+    PatternKind, RegionKind, TermKind, TypeVisitableExt as _, ValTreeKind,
     inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
@@ -97,6 +97,7 @@ pub(crate) enum Missed {
     ImplItemNotInTrait,
     VisibilityOutside,
     ProcMacroWithoutFn,
+    MacroPending,
 }
 
 impl Missed {
@@ -110,8 +111,53 @@ impl Missed {
             Missed::ImplItemNotInTrait => "an impl item its trait does not have",
             Missed::VisibilityOutside => "a visibility of a module the item is not in",
             Missed::ProcMacroWithoutFn => "a procedural macro without its function",
+            Missed::MacroPending => "an item of a crate whose proc macros are not built yet",
         }
     }
+}
+
+/// The proc-macro crates `krate`'s items can expand a macro of, each once, in the order a walk
+/// of its [`Crate::transitive_loaded_deps`] meets them: a dependency of `krate`, or of a crate
+/// it sees, that dependents load only for its macros. The one walk both
+/// [`pending_proc_macro`] and [`Cx::error_type_site`] read.
+#[blaze_query::tracked(returns(deref))]
+fn macro_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
+    let mut found: Vec<Crate> = Vec::new(); // alloc: the memo's value, a few crates, once per crate.
+    for &seen in krate.transitive_loaded_deps(db) {
+        for dep in seen.data(db).dependencies.iter() {
+            let dep = dep.crate_id;
+            if dep.loads_only_macros(db) && !found.contains(&dep) {
+                found.push(dep);
+            }
+        }
+    }
+    found.into_boxed_slice()
+}
+
+/// The first proc-macro crate `krate`'s items can expand a macro of ([`macro_crates`]) whose
+/// expanders are not built yet: `ProcMacroLoadingError::NotYetBuilt`, as lowering sets every
+/// proc-macro crate until the build hands it its expanders. Until then each call of one of its
+/// macros expands to nothing, so `krate`'s def map, impls and types are not the program's.
+/// Nothing reads them as if they were:
+///
+/// - an item of `krate` has no form ([`Missed::MacroPending`]), and a form other than an
+///   item's own (a field's, a closure's captures) no hash (`hash::filled`);
+/// - the facts of which impls and traits `krate` sees (`Implements`, `Method`, `Vtable`) have
+///   no value, as what it loads may get an impl from such a macro;
+/// - a job of `krate` (its check, its bodies' inference and so the goal and body stores, its
+///   codegen) refuses to start ([`crate::macros_built`]), naming the macro.
+///
+/// So nothing kept (a memo a later revision reuses, the goal store, the body store, a
+/// dependency image) holds an answer read off a half-expanded program. A build reads `krate`
+/// only once those are built, so this is a refusal a misordered read hits, never a state a
+/// correct build sees.
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn pending_proc_macro(db: &Db, krate: Crate) -> Option<Crate> {
+    macro_crates(db, krate).iter().copied().find(|&dep| {
+        hir_expand::proc_macro::ProcMacros::get_for_crate(db, dep).is_some_and(|macros| {
+            matches!(macros.get_error(), Some(base_db::ProcMacroLoadingError::NotYetBuilt))
+        })
+    })
 }
 
 /// A form, hashed: what every hash of an item reads of it. Its positions are apart, in
@@ -125,7 +171,9 @@ pub(crate) struct Sub {
     pub(crate) missed: Option<Missed>,
 }
 
-const _: () = assert!(size_of::<Sub>() == 56);
+// The digest and `missed` (33 bytes) and a boxed slice, padded to a word: 56 bytes on a 64-bit
+// target.
+const _: () = assert!(size_of::<Sub>() == (33 + size_of::<Box<[ItemId]>>()).next_multiple_of(align_of::<usize>()));
 
 /// A body's form and the hash of the positions (MirSpans) of its code, in order: read by what
 /// fills positions in, never by a hash of the item.
@@ -135,7 +183,7 @@ pub(crate) struct Code {
     pub(crate) spans: ContentId,
 }
 
-const _: () = assert!(size_of::<Code>() == 88);
+const _: () = assert!(size_of::<Code>() == size_of::<Sub>() + 32);
 
 #[cfg(test)]
 impl Code {
@@ -454,8 +502,9 @@ impl<'db> Nests<'db> {
 /// Entries of [`Cx::seen`].
 const SEEN: usize = 64;
 
-/// 16 bytes an entry, 1 KiB a [`Cx`].
-const _: () = assert!(size_of::<Option<(Ty<'static>, &'static Code)>>() == 16);
+/// Two words an entry (a 4-byte `Ty` padded to the reference's alignment): 16 bytes, 1 KiB a
+/// [`Cx`], on a 64-bit target.
+const _: () = assert!(size_of::<Option<(Ty<'static>, &'static Code)>>() == 2 * size_of::<usize>());
 
 pub(crate) struct Cx<'db> {
     db: &'db Db,
@@ -506,6 +555,14 @@ pub(crate) fn signature_ty_form<'db>(db: &'db Db, ty: FormTy<'db>) -> Code {
 
 /// What a signature form writes in place of what a body leaks into an interface.
 const LEAK: u8 = 0xfe;
+
+/// In place of an opaque type's hidden type (and its auto traits) where its owner defines none:
+/// a trait method with no body, whose `impl Trait` is rustc's synthesized associated type with
+/// no value. Each impl gives its own (the impl method's `impl Trait`), which the impl method's
+/// own form holds as its hidden type, so no two impls' answers meet under this tag: it says
+/// only that the trait has none, and callers that see through to an impl's reach that impl's
+/// method by its key.
+const NO_HIDDEN: u8 = 0xfd;
 
 /// The type forms as each `Cx` spelled them before [`ty_form`]: memoized for its lifetime,
 /// with a stack of the types being spelled to stop at one that contains itself. The tests
@@ -686,6 +743,11 @@ impl<'db> Cx<'db> {
 
     fn item_form(&self, tag: &str, id: ItemId) -> Sub {
         let mut form = Form::new(tag);
+        if pending_proc_macro(self.db, id.krate(self.db)).is_some() {
+            // Nothing of the half-expanded item is read: its form is the refusal alone.
+            form.error(Missed::MacroPending);
+            return form.sub();
+        }
         let f = &mut form;
         match id {
             ItemId::Function(it) => {
@@ -728,6 +790,11 @@ impl<'db> Cx<'db> {
     /// it; `None` for an item with no body.
     pub(crate) fn body(&self, id: ItemId) -> Option<Code> {
         let def = self.body_owner(id)?;
+        if pending_proc_macro(self.db, id.krate(self.db)).is_some() {
+            let mut f = Form::new("body");
+            f.error(Missed::MacroPending);
+            return Some(f.code());
+        }
         if let DefWithBodyId::ConstId(it) = def
             && let Some(value) = self.const_value(it)
         {
@@ -756,10 +823,13 @@ impl<'db> Cx<'db> {
         let (within, error) = self.mir_lowering_error(id)?;
         // alloc: the error a build stops with, once
         let mut said = String::new();
-        match within {
-            None => {}
-            Some(Nested::Closure(_)) => said.push_str("a closure in it: "),
-            Some(Nested::Coroutine(_)) => said.push_str("a coroutine in it: "),
+        if let Some(nested) = within {
+            let (what, loc) = match nested {
+                Nested::Closure(it) => ("closure", it.loc(self.db)),
+                Nested::Coroutine(it) => ("coroutine", it.loc(self.db)),
+            };
+            let at = crate::lowering::place(self.db, loc.owner, MirSpan::ExprId(loc.expr));
+            _ = write!(said, "the {what} at {at}: ");
         }
         crate::lowering::write(self.db, &error, &mut said);
         Some(said)
@@ -769,30 +839,202 @@ impl<'db> Cx<'db> {
     /// (`None` for its own body, else the closure or coroutine), so a reader can tell one
     /// reason from another (an intrinsic missing from the table) without parsing text, and
     /// name the body that failed.
+    ///
+    /// A function's signature reads bodies too: the hidden type of each `impl Trait` it returns
+    /// is written with what [`Cx::held`] reads of each coroutine in it, so after its own body
+    /// this looks in the closures and coroutines those hidden types hold (an `async fn`'s
+    /// future), where the item itself may have no body.
     pub(crate) fn mir_lowering_error(&self, id: ItemId) -> Option<(Option<Nested<'db>>, MirLowerError<'db>)> {
         let db = self.db;
-        let def = self.body_owner(id)?;
-        let body = match db.mir_body(InferBodyId::DefWithBodyId(def)) {
-            Ok(body) => body,
-            Err(error) => return Some((None, error)),
-        };
         let mut scratch = Form::quiet();
         let mut nested = Nests::default();
-        self.mir(&mut scratch, body, &mut nested);
-        let mut at = 0;
+        if let Some(def) = self.body_owner(id) {
+            match db.mir_body(InferBodyId::DefWithBodyId(def)) {
+                Ok(body) => self.mir(&mut scratch, body, &mut nested),
+                Err(error) => return Some((None, error)),
+            }
+        }
+        let at = match self.first_failing(&mut scratch, &mut nested, 0) {
+            Ok(at) => at,
+            Err(failed) => return Some(failed),
+        };
+        if let ItemId::Function(func) = id {
+            let count = SelfAndAssocBounds::return_type_impl_traits(db, func).len() as u32;
+            for index in 0..count {
+                let Some(hidden) = self.hidden(id, index) else { continue };
+                for inner in hidden.walk() {
+                    if let Some(it) = inner.ty().and_then(|ty| self.nested_of(ty)) {
+                        nested.push(it);
+                    }
+                }
+            }
+            if let Err(failed) = self.first_failing(&mut scratch, &mut nested, at) {
+                return Some(failed);
+            }
+        }
+        None
+    }
+
+    /// The first of `nested.order[at..]`, and of what their bodies make in turn, whose MIR
+    /// fails to lower, as `Err` with its error; `Ok` with how far it got when each lowers. A coroutine's
+    /// is also its runtime body, which [`Cx::held`] reads.
+    fn first_failing(
+        &self,
+        scratch: &mut Form,
+        nested: &mut Nests<'db>,
+        mut at: usize,
+    ) -> Result<usize, (Option<Nested<'db>>, MirLowerError<'db>)> {
+        let db = self.db;
         while at < nested.order.len() {
             let next = nested.order[at];
             at += 1;
             let body = match next {
                 Nested::Closure(it) => db.mir_body_for_closure(it),
-                Nested::Coroutine(it) => db.mir_body_for_coroutine(it),
+                Nested::Coroutine(it) => {
+                    db.mir_body_for_coroutine(it).and_then(|body| db.runtime_mir_body_for_coroutine(it).map(|_| body))
+                }
             };
             match body {
-                Ok(body) => self.mir(&mut scratch, body, &mut nested),
-                Err(error) => return Some((Some(next), error)),
+                Ok(body) => self.mir(scratch, body, nested),
+                Err(error) => return Err((Some(next), error)),
             }
         }
-        None
+        Ok(at)
+    }
+
+    /// Where the signature of `id` holds an error type, and what can have left it there: for
+    /// the error a build stops with at [`Missed::ErrorType`] (rule 16), never hashed. It names
+    /// the first field of an ADT, or the parameter or return type of a function, whose type
+    /// has an error, and each proc macro the item's crate loads, directly or through a crate
+    /// it sees, that has no expanders yet or failed: such a macro expands to nothing, so a
+    /// name it defines (a type `rustc_index::newtype_index!` writes) does not resolve, and an
+    /// item read before its crate's proc macros are built has an error type rustc never sees.
+    /// `None` when it finds neither.
+    pub(crate) fn error_type_site(&self, id: ItemId) -> Option<String> {
+        let db = self.db;
+        // alloc: the error a build stops with, once
+        let mut said = String::new();
+        match id {
+            ItemId::Adt(adt) => {
+                let mut first = |variant: VariantId, name: Option<&str>| {
+                    let types = db.field_types(variant);
+                    for (field, data) in variant.fields(db).fields().iter() {
+                        if types.get(field).is_none_or(|it| it.ty().skip_binder().references_error()) {
+                            let field = data.name.symbol().as_str();
+                            _ = match name {
+                                Some(variant) => write!(said, "field `{variant}.{field}`"),
+                                None => write!(said, "field `{field}`"),
+                            };
+                            return true;
+                        }
+                    }
+                    false
+                };
+                match adt {
+                    AdtId::StructId(it) => _ = first(it.into(), None),
+                    AdtId::UnionId(it) => _ = first(it.into(), None),
+                    AdtId::EnumId(it) => {
+                        for (name, &(variant, _)) in it.enum_variants(db).variants.iter() {
+                            if first(variant.into(), Some(name.symbol().as_str())) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            ItemId::Function(it) => self.function_error_site(it, &mut said),
+            _ => {}
+        }
+        // Not in the signature: in the body's MIR, when that is where the form misses.
+        if said.is_empty()
+            && self.interface(id).missed != Some(Missed::ErrorType)
+            && self.body(id).is_some_and(|code| code.sub.missed == Some(Missed::ErrorType))
+        {
+            said.push_str("a type in the body's MIR");
+        }
+        let krate = id.krate(db);
+        let mut wrote_macro = false;
+        for &dep in macro_crates(db, krate) {
+            let why = match hir_expand::proc_macro::ProcMacros::get_for_crate(db, dep) {
+                None => "it has no entry in the proc-macro map".to_owned(), // alloc: as `said`
+                Some(macros) => match macros.get_error() {
+                    None => continue,
+                    Some(error) => error.to_string(), // alloc: as `said`
+                },
+            };
+            if wrote_macro {
+                said.push_str(", ");
+            } else {
+                if !said.is_empty() {
+                    said.push_str("; ");
+                }
+                _ = write!(
+                    said,
+                    "`{}` loads proc macros with no expanders, whose calls expand to nothing: ",
+                    crate::hash::crate_name(db, krate)
+                );
+            }
+            _ = write!(said, "`{}` ({why})", crate::hash::crate_name(db, dep));
+            wrote_macro = true;
+        }
+        (!said.is_empty()).then_some(said)
+    }
+
+    /// Where in function `func`'s form an error type is, in the order [`Cx::function`] writes
+    /// it: a parameter (by index and pattern), the return type, a bound or where clause, or an
+    /// `impl Trait` it returns (its bounds, or the hidden type its body gives). An error
+    /// region is no error type (every elided lifetime of a signature is one, and is spelled),
+    /// so only types and constants with an error count.
+    fn function_error_site(&self, func: FunctionId, said: &mut String) {
+        let db = self.db;
+        let sig = db.callable_item_signature(func.into()).skip_binder().skip_binder();
+        if let Some(at) = sig.inputs().iter().position(|ty| references_non_lt_error(ty)) {
+            _ = write!(said, "parameter {at}");
+            let data = FunctionSignature::of(db, func);
+            if at == 0 && data.has_self_param() {
+                said.push_str(" (`self`)");
+            }
+            return;
+        }
+        if references_non_lt_error(&sig.output()) {
+            return said.push_str("the return type");
+        }
+        let predicates = GenericPredicates::query_all(db, func.into()).skip_binder();
+        if predicates.into_iter().any(|clause| references_non_lt_error(&clause)) {
+            return said.push_str("a bound or where clause");
+        }
+        let owner = ItemId::Function(func);
+        let count = SelfAndAssocBounds::return_type_impl_traits(db, func).len();
+        for index in 0..count as u32 {
+            let idx = ImplTraitIdx::from_raw(index.into());
+            let opaque = InternedOpaqueTyId::new(db, ImplTraitId::ReturnTypeImplTrait(func, idx));
+            let bounds = opaque.predicates(db).skip_binder();
+            if bounds.iter().any(|clause| references_non_lt_error(clause)) {
+                _ = write!(said, "the bounds of `impl Trait` {index} of the return type");
+                return;
+            }
+            if self.defines_no_hidden(owner) {
+                continue;
+            }
+            match self.hidden(owner, index) {
+                Some(hidden) if references_non_lt_error(&hidden) => {
+                    _ = write!(
+                        said,
+                        "the hidden type the body gives `impl Trait` {index} of the return type"
+                    );
+                    return;
+                }
+                Some(_) => {}
+                None => {
+                    _ = write!(
+                        said,
+                        "`impl Trait` {index} of the return type, to which the body gives no \
+                         hidden type"
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     /// The body `id` has, if it has one.
@@ -902,6 +1144,13 @@ impl<'db> Cx<'db> {
             }
         };
         let mut f = Form::new("auto traits");
+        // A trait method's `impl Trait` with no default body leaks no auto trait: rustc's
+        // synthesized associated type has no value to see through, only its bounds, which the
+        // method's own form holds.
+        if self.defines_no_hidden(owner) {
+            f.u8(NO_HIDDEN);
+            return f;
+        }
         let Some(hidden) = self.hidden(owner, index) else {
             f.error(Missed::ErrorType);
             return f;
@@ -1265,6 +1514,9 @@ impl<'db> Cx<'db> {
     /// see through to the auto traits it implements and its layout.
     fn opaque(&self, f: &mut Form, owner: ItemId, index: u32, opaque: InternedOpaqueTyId<'db>) {
         self.clauses(f, opaque.predicates(self.db).skip_binder().iter().copied());
+        if self.defines_no_hidden(owner) {
+            return f.u8(NO_HIDDEN);
+        }
         if self.leak_free {
             return f.u8(LEAK);
         }
@@ -1275,6 +1527,12 @@ impl<'db> Cx<'db> {
             }
             None => f.error(Missed::ErrorType),
         }
+    }
+
+    /// Whether `owner` defines no hidden type for its opaque types: a function with no body
+    /// (a trait method's declaration), whose `impl Trait` each impl's method gives.
+    fn defines_no_hidden(&self, owner: ItemId) -> bool {
+        matches!(owner, ItemId::Function(it) if !FunctionSignature::of(self.db, it).has_body())
     }
 
     fn hidden(&self, owner: ItemId, index: u32) -> Option<Ty<'db>> {

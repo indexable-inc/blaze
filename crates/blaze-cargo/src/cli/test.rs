@@ -22,6 +22,10 @@ use super::{
 /// What runs a test executable: the process itself, or the tests' fake.
 pub trait Programs {
     fn run(&mut self, exec: &Exec) -> io::Result<say::Ended>;
+
+    /// Readies `exec` to start `artifact`'s program, asking the daemon whether it runs on its
+    /// code memory ([`super::run::launch`]); the tests' fake asks no daemon.
+    fn launch(&mut self, artifact: &Artifact, exec: &mut Exec) -> Result<(), String>;
 }
 
 /// Runs each program on the terminal, its output inherited.
@@ -30,6 +34,10 @@ pub struct Spawned;
 impl Programs for Spawned {
     fn run(&mut self, exec: &Exec) -> io::Result<say::Ended> {
         exec.command().status().map(say::Ended::of)
+    }
+
+    fn launch(&mut self, artifact: &Artifact, exec: &mut Exec) -> Result<(), String> {
+        super::run::launch(artifact, exec)
     }
 }
 

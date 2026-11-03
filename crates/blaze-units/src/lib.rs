@@ -45,7 +45,7 @@ use blaze_resolve::{Cfg, PackageId, Platform, Resolve};
 pub use read::Read;
 pub use schema::UnitGraph;
 
-/// What the user asked cargo to do (cargo's `UserIntent`, less `doctest`).
+/// What the user asked cargo to do (cargo's `UserIntent`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent {
     Build,
@@ -54,6 +54,10 @@ pub enum Intent {
         test: bool,
     },
     Test,
+    /// `test --doc`: the doctests of the selected libraries only (cargo's `UserIntent::Doctest`),
+    /// each library's examples built and run by blaze, never by rustdoc
+    /// (docs/v2/plan/doctests.md).
+    Doctest,
     Bench,
     /// `cargo doc`: the targets cargo documents, checked, for the front end the pages are
     /// written from. With or without `--no-deps` every dependency is checked, as cargo checks
@@ -68,7 +72,7 @@ impl Intent {
     pub fn default_profile(self) -> &'static str {
         match self {
             Intent::Build | Intent::Check { .. } | Intent::Doc { .. } => "dev",
-            Intent::Test => "test",
+            Intent::Test | Intent::Doctest => "test",
             Intent::Bench => "bench",
         }
     }
@@ -171,7 +175,7 @@ impl Filter {
     /// Whether the build needs the dev-dependencies resolved (`HasDevUnits`).
     pub fn need_dev_deps(&self, intent: Intent) -> bool {
         match intent {
-            Intent::Test | Intent::Bench | Intent::Check { test: true } => true,
+            Intent::Test | Intent::Doctest | Intent::Bench | Intent::Check { test: true } => true,
             Intent::Build | Intent::Check { test: false } | Intent::Doc { .. } => match self {
                 Filter::Default { .. } => false,
                 Filter::Only { examples, tests, benches, .. } => {

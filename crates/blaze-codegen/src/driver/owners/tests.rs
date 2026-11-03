@@ -24,12 +24,7 @@ fn static_of<'a>(id: (ItemKey, ContentId), unit: InstanceKey, owner: Owner, refs
 }
 
 #[test]
-fn an_origin_owns_what_no_type_argument_makes_another_s() {
-    assert_eq!(Owner::of(&Origin::Std), Owner::Dependency);
-    use crate::plan::Package;
-    assert_eq!(Owner::of(&Origin::Dependency(Package::new("regex"))), Owner::Dependency);
-    assert_eq!(Owner::of(&Origin::Member(Package::new("app"))), Owner::Workspace);
-    assert_eq!(Owner::of(&Origin::BuildTime(Package::new("serde_derive"))), Owner::Workspace);
+fn of_two_describers_the_image_s_owner_wins() {
     assert!(Owner::Dependency < Owner::Workspace, "of two describers, the image's wins");
 }
 

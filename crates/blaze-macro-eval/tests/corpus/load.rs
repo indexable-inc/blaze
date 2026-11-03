@@ -176,6 +176,8 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str, homes: Home
             library: stdlib::library_at(&library.commit),
             std: homes.std.to_owned(),
             builds: homes.builds.to_owned(),
+            // The corpus is fetched by `cargo fetch` into `cargo_home`, laid out as blaze keeps its sources.
+            sources: cargo_home.to_owned(),
         };
         let opened = db.open_with(View { root: view }, &config.encode());
         let planned = db.pin().get::<Plan>(opened, &()).map_err(|error| format!("planning {dir}: {error:?}"))?.get();

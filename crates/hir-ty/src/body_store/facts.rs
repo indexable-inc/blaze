@@ -57,8 +57,9 @@ pub trait BodyFacts: Send + Sync + 'static {
         name: &'static str,
     ) -> Classified;
 
-    /// The value of `fact` now; `None` when it cannot be hashed now.
-    fn value(&self, db: &Db, fact: FactRef) -> Option<ContentId>;
+    /// The value of `fact` now as `def`'s crate sees it (a fact about impls covers only the
+    /// crates it loads); `None` when it cannot be hashed now.
+    fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId>;
 
     /// The key of a definition `body`'s record names, relative to `body`: `body` itself and what
     /// it owns (closures, coroutines, opaque types, anonymous constants) as "self", an item one of

@@ -120,8 +120,12 @@ impl Release {
 
     /// What the download comes to, in megabytes as people count them.
     pub fn megabytes(&self) -> u64 {
-        let bytes: u64 = self.components.iter().map(|it| it.pin.bytes).sum();
-        (bytes + self.manifest.bytes + 500_000) / 1_000_000
+        (self.bytes() + 500_000) / 1_000_000
+    }
+
+    /// What the download comes to, in bytes: each pinned file and the manifest.
+    pub fn bytes(&self) -> u64 {
+        self.components.iter().map(|it| it.pin.bytes).sum::<u64>() + self.manifest.bytes
     }
 
     /// Where blaze keeps this release.
@@ -228,6 +232,10 @@ fn fetch_from(
         release.megabytes()
     );
     let start = Instant::now();
+    // The client has no flight recorder: the download is its own step in the client's part of
+    // a `BLAZE_PROFILE` profile and the table it prints, and a span wherever spans are recorded.
+    let step = format!("toolchain download {} ({} bytes)", release.version, release.bytes()); // alloc: once per download
+    let _span = tracing::info_span!(target: "blaze", "toolchain download", toolchain = release.version, bytes = release.bytes()).entered();
     let downloads = parent.join(format!(".{name}.download"));
     let staging = parent.join(format!(".{name}.unpacking"));
     let fetched = (|| {
@@ -242,6 +250,7 @@ fn fetch_from(
         remove_dir(&downloads)?;
         anyhow::Ok(())
     })();
+    blaze_profile::note(&step, blaze_profile::CLIENT, start);
     if let Err(e) = fetched {
         _ = remove_dir(&staging);
         return Err(match e.downcast_ref::<NotPublished>() {

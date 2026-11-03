@@ -4,8 +4,35 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    seed();
     version();
     blaze_codegen_code::emit();
+}
+
+/// The `seed` feature is the seed profile, `--no-default-features --features seed`
+/// (todo/bootstrap/plan.md): no C, C++ or LLVM. With a feature that brings them back (`default`
+/// among them, which is on unless `--no-default-features` is given) it is refused, naming both,
+/// never built as a seed that isn't one.
+fn seed() {
+    let on = |feature: &str| {
+        std::env::var_os(format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_")))
+            .is_some()
+    };
+    if !on("seed") {
+        return;
+    }
+    // `tui` too: crossterm has no wasm32 (Cargo.toml).
+    let not_in_seed = ["default", "llvm-stencils", "net", "explore", "mimalloc", "llvm", "tui"];
+    let also: Vec<&str> = not_in_seed.into_iter().filter(|it| on(it)).collect();
+    if !also.is_empty() {
+        panic!(
+            "blaze-engine's `seed` feature is the seed profile, which has no C, C++ or LLVM, and \
+             `{}` {} on too: build the seed with `--no-default-features --features seed` and no \
+             other feature",
+            also.join("`, `"),
+            if also.len() == 1 { "is" } else { "are" }
+        );
+    }
 }
 
 /// Which blaze this is, from the one place it is said: `BLAZE_RELEASE`, the tag a release is

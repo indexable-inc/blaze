@@ -118,14 +118,14 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
     // (`blaze_codegen::wasm::Code`), and none counts into cells, which a page has none of.
     // Nor is there a fuel runtime there (`blaze_stencil::fuel`): the plan meters native code
     // only.
-    if toolchain.arch == Arch::Wasm32 && spec.fuel {
+    if toolchain.arch.is_wasm() && spec.fuel {
         // alloc: the error's message
         return Err(fail(format!(
             "a wasm32 unit for {:?} metered for fuel: only native code calls the fuel runtime",
             spec.backend
         )));
     }
-    if toolchain.arch == Arch::Wasm32 && (!spec.backend.is_cranelift() || spec.counted) {
+    if toolchain.arch.is_wasm() && (!spec.backend.is_cranelift() || spec.counted) {
         // alloc: the error's message
         return Err(fail(format!(
             "a wasm32 unit for {:?}{}: wasm32 code is lowered from the IR as Cranelift's is \
@@ -139,6 +139,7 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
         crate::Arch::X86_64 => Arch::X86_64,
         crate::Arch::Aarch64 => Arch::Aarch64,
         crate::Arch::Wasm32 => Arch::Wasm32,
+        crate::Arch::Wasm64 => Arch::Wasm64,
     };
     if arch != toolchain.arch {
         // alloc: the error's message
@@ -290,9 +291,11 @@ impl Backends<'_> {
 /// the walks its references came from: a unit whose settings neither walk has is where the
 /// two disagree.
 fn unwalked(what: String, build: Build, inlined: bool) -> String {
+    let [first, second] = Build::WALKS_INLINED;
+    let all = [Build::WALK, first, second];
     let walks = match inlined {
-        true => [Build::WALK, Build::WALK_INLINED].as_slice(),
-        false => [Build::WALK].as_slice(),
+        true => &all[..],
+        false => &all[..1],
     };
     // alloc: an error
     format!("{what}; the unit is built as {build:?}, its references walked as {walks:?}")
@@ -401,9 +404,13 @@ pub(super) fn built_function(
             colocate(&mut pending.func, &places, placer.refs(), frame);
         }
     }
-    let inlined = super::frontend::inlined(db, hashes, (instance, walking)).map_err(fail)?;
+    let built_in = match &code {
+        Built::Ir(pending) => pending.built_in(),
+        Built::Assembled(..) => &[],
+    };
+    let inlined = super::frontend::inlined(db, hashes, instance, built_in).map_err(fail)?;
     let (features, own_features) = features(db, spec, target, instance).map_err(fail)?;
-    let wasm = if unit.arch == Arch::Wasm32 {
+    let wasm = if unit.arch.is_wasm() {
         let requests = match &code {
             Built::Ir(pending) => &pending.wants.requests,
             Built::Assembled(_, requests) => requests,
@@ -595,27 +602,19 @@ pub(super) fn built(
     checked: bool,
     build: Build,
 ) -> Result<Built, String> {
-    // A unit's compile is no part of a compile at a level above 1 that may be under way on
-    // the thread: what it builds in is the unit's (`Build::built_in`), not that compile's.
-    crate::tier::plain(|| built_plain(db, instance, target, checked, build))
-}
-
-fn built_plain(
-    db: &Db,
-    instance: &HirInstance,
-    target: &'static crate::Target,
-    checked: bool,
-    build: Build,
-) -> Result<Built, String> {
+    // A unit's compile builds in no compile's hot functions (`&mut None`, `tier::Inlining`):
+    // what it builds in is the unit's (`Build::built_in`).
     let unit = Some(build);
     let produced = match &instance.0 {
         Kind::Code(instance, env) => {
             let instance = Instance { checked, ..*instance };
-            instance_code(db, instance, *env, Detach::Unit, unit)
+            instance_code(db, instance, *env, Detach::Unit, unit, &mut None)
         }
         Kind::Start(main) => {
             let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
-            compile_as(db, env, None, false, checked, true, unit, |fx| fx.start_shim(*main))
+            compile_as(db, env, None, false, checked, true, unit, &mut None, |fx| {
+                fx.start_shim(*main)
+            })
         }
         Kind::Asm(text, _) => return assembled(target, text),
         Kind::Allocator(forward) => super::allocator::built(db, forward, checked, unit),
@@ -637,7 +636,9 @@ fn assembled(target: &'static crate::Target, text: &str) -> Result<Built, String
     }
     let isa = crate::isa_for(target).map_err(|e| e.to_string())?; // alloc: the error's message
     // alloc: only an `asm!` function, whose assembler takes the triple as text
-    let assembled = crate::asm::assemble(&isa.triple().to_string(), text)?;
+    let assembled = crate::asm::assemble(&isa.triple().to_string(), text)
+        // alloc: the error's message, which names the block (its instance has no other name)
+        .map_err(|e| format!("{e}; the block: `{}`", crate::asm::summary(text)))?;
     if !assembled.relocs.is_empty() {
         // alloc: the error's message
         return Err("an `asm!` function that names a symbol".to_owned());
@@ -1318,6 +1319,7 @@ impl<'db> Prepare for Backends<'db> {
         // pointers; the IR's are 32-bit.
         let pointer = match first.arch {
             Arch::Wasm32 => ir::types::I32,
+            Arch::Wasm64 => ir::types::I64,
             Arch::X86_64 | Arch::Aarch64 => isa(first, unit_target(first, first_spec)?)?.pointer_type(),
         };
         super::fold::merge(group, &members, pointer, |unit, _, function, ir, refs| {

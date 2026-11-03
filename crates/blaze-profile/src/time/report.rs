@@ -112,8 +112,15 @@ fn row<'a>(rows: &'a mut HashMap<String, Row, Global>, matching: Option<&str>, k
 /// What kind of thing a wait waited for, for a report's row: a scope's creator, a key's
 /// query, else its label.
 pub fn wait_class(model: &Model, wait: &Wait) -> String {
-    let label = model.wait_label(wait);
     let kind = wait.on.map_or("span", |it| it.name());
+    // A wait whose span the record lacks is named by its kind alone: its value (a key's raw
+    // number, `key key 0000…`) says nothing a reader can act on, and one class per value would
+    // bury the rest.
+    if wait.span.and_then(|it| model.spans[it].awaits.as_deref()).is_none() {
+        // alloc: a row's key
+        return format!("{kind} wait with no wait span");
+    }
+    let label = model.wait_label(wait);
     if let Some(rest) = label.strip_prefix("scope ")
         && let Some((_, creator)) = rest.split_once(" of ")
     {

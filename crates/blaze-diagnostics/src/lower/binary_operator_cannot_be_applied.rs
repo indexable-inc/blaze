@@ -283,7 +283,7 @@ fn derivable<'db>(
         return None;
     }
     // clone: the type, for the impl lookup on the error path
-    let has_own_impl = hir::Impl::all_for_type(cx.db, self_ty.clone())
+    let has_own_impl = hir::Impl::all_for_type(cx.db, cx.krate, self_ty.clone())
         .into_iter()
         .any(|it| it.trait_(cx.db) == Some(trait_) && it.self_ty(cx.db).as_adt() == Some(adt));
     (!has_own_impl).then_some(traits)

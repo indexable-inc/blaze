@@ -67,7 +67,10 @@ none of its type arguments names a workspace type, closure or item. Codegen know
 makes the instance; it says so per instance with the generic's code hash (`Built::owners`,
 `fastcompile-premap 3`). So `Vec<my::Type>::push` is the workspace's. It is made only for this
 workspace, and putting it in the image would make the image depend on workspace code. Statics
-aren't generic and belong to their crate.
+aren't generic and belong to their crate. One rule decides both, `HirFrontend::workspace`: a
+crate is the workspace's when it reaches a local crate through its non-proc-macro dependencies
+(a registry crate over a `[patch]`ed path crate is), and in a build that links no image
+(anything but `Mode::Live`) every crate but the library's is.
 
 - `image_part` takes the dependency pieces and checks the image is closed. A dependency
   function or static that reaches a workspace instance or static is an error naming both;

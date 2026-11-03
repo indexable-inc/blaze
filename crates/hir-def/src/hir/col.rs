@@ -66,7 +66,8 @@ pub(crate) struct Col<T> {
 // Both owners are counts of unsized values (a pointer and a length or a vtable), so the owner
 // takes a tag word besides: 32 bytes would need a slab that is itself a `dyn Held`, which is a
 // second allocation a store.
-const _: () = assert!(size_of::<Col<u32>>() == 40);
+// Five words: the pointer, the length, and the owner's tag and two words (40 bytes on 64-bit).
+const _: () = assert!(size_of::<Col<u32>>() == 5 * size_of::<usize>());
 
 // SAFETY: a `Col` is a `Box<[T]>` or shares `T`s with other `Col`s as an `Arc<[T]>` does; both
 // are `Send` and `Sync` when `T` is `Send + Sync`. An image owner is `Send + Sync` ([`Held`]).

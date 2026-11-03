@@ -46,8 +46,8 @@ pub(super) fn read(name: &str, text: &str, arch: Arch, platform: u32) -> Result<
 }
 
 fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Library, String> {
-    if matches!(arch, Arch::Wasm32) {
-        return Err("a `.tbd` describes a Mach-O library; this output is wasm32".to_owned());
+    if arch.is_wasm() {
+        return Err(format!("a `.tbd` describes a Mach-O library; this output is {arch:?}"));
     }
     if text.trim_start().starts_with('{') {
         return Err("a JSON `.tbd` (version 5) is not read: only versions 1 to 4".to_owned());

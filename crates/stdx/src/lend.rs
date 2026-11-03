@@ -2,6 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    num::NonZeroUsize,
     thread::LocalKey,
 };
 
@@ -49,40 +50,52 @@ fn give_back<T: 'static>(slot: &'static LocalKey<RefCell<Option<T>>>) -> Option<
     slot.with(|slot| slot.borrow_mut().take())
 }
 
-/// The `take` of a pair that carries a thread-local with a job that switches out (a job on a
-/// fiber waiting on a query, which may resume on another thread; `blaze_query::carry`): a
+/// The `take` of the functions that carry a thread-local with a job that switches out (a job on
+/// a fiber waiting on a query, which may resume on another thread; `blaze_query::carry`): a
 /// value the job set or lent the thread-local and reads again after the wait. What the slot
-/// holds is moved off the thread, which is left with the default: boxed, or 0 when it is the
-/// default (`is_default`, and then left in place), so a thread-local no job set costs nothing.
-pub fn take_carried<T: Default + 'static>(slot: &'static LocalKey<RefCell<T>>, is_default: fn(&T) -> bool) -> usize {
+/// holds is moved off the thread, which is left with the default: boxed, or `None` when it is
+/// the default (`is_default`, and then left in place), so a thread-local no job set costs
+/// nothing. The box is the carried value's until [`put_carried`] or [`end_carried`] frees it.
+pub fn take_carried<T: Default + 'static>(
+    slot: &'static LocalKey<RefCell<T>>,
+    is_default: fn(&T) -> bool,
+) -> Option<NonZeroUsize> {
     let taken = slot.try_with(|slot| {
         let mut slot = slot.borrow_mut();
         (!is_default(&slot)).then(|| std::mem::take(&mut *slot))
     });
-    // alloc: only for a value a job set, once a switch of the job holding it
-    taken.ok().flatten().map_or(0, |value| Box::into_raw(Box::new(value)).expose_provenance())
+    taken.ok().flatten().map(boxed)
 }
 
-/// Puts back what [`take_carried`] took of `slot`, on the thread the job resumes on.
+/// Puts back what [`take_carried`] took of `slot`, on the thread the job resumes on. The value
+/// is unboxed first, so a panic here drops it rather than losing its box.
 ///
 /// # Panics
 ///
-/// Where that thread's slot holds a value: another job's would be lost.
-#[allow(unsafe_code)]
-pub fn put_carried<T: Default + 'static>(slot: &'static LocalKey<RefCell<T>>, is_default: fn(&T) -> bool, taken: usize) {
-    slot.with(|slot| {
+/// Where that thread's slot holds a value: another job's would be lost (it stays in place).
+pub fn put_carried<T: Default + 'static>(slot: &'static LocalKey<RefCell<T>>, is_default: fn(&T) -> bool, taken: NonZeroUsize) {
+    // SAFETY: `taken` is what `take_carried` of this slot gave, so a boxed `T`, handed to this
+    // one put once.
+    let value = unsafe { unboxed::<T>(taken) };
+    slot.with(move |slot| {
         let mut slot = slot.borrow_mut();
         assert!(is_default(&*slot), "a job's thread-local put back on a thread that holds another's");
-        if taken != 0 {
-            // SAFETY: `taken` is what `take_carried` of this slot, so of a `T`, boxed and
-            // exposed, handed to this pair's `put` once.
-            *slot = *unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<T>(taken)) };
-        }
+        *slot = value;
     });
 }
 
+/// Ends what [`take_carried`] took of `slot` for a job that ended holding it, or whose parked
+/// record was dropped: the value is dropped and its box freed. `slot` only names the type.
+pub fn end_carried<T: 'static>(_slot: &'static LocalKey<RefCell<T>>, taken: NonZeroUsize) {
+    // SAFETY: as in `put_carried`: `taken` is a boxed `T`, handed to this end once.
+    drop(unsafe { unboxed::<T>(taken) });
+}
+
 /// [`take_carried`] for a thread-local `Cell`.
-pub fn take_carried_cell<T: Default + 'static>(slot: &'static LocalKey<Cell<T>>, is_default: fn(&T) -> bool) -> usize {
+pub fn take_carried_cell<T: Default + 'static>(
+    slot: &'static LocalKey<Cell<T>>,
+    is_default: fn(&T) -> bool,
+) -> Option<NonZeroUsize> {
     let taken = slot.try_with(|slot| {
         let value = slot.take();
         if is_default(&value) {
@@ -92,8 +105,7 @@ pub fn take_carried_cell<T: Default + 'static>(slot: &'static LocalKey<Cell<T>>,
             Some(value)
         }
     });
-    // alloc: as in `take_carried`
-    taken.ok().flatten().map_or(0, |value| Box::into_raw(Box::new(value)).expose_provenance())
+    taken.ok().flatten().map(boxed)
 }
 
 /// [`put_carried`] for a thread-local `Cell`.
@@ -101,17 +113,41 @@ pub fn take_carried_cell<T: Default + 'static>(slot: &'static LocalKey<Cell<T>>,
 /// # Panics
 ///
 /// As [`put_carried`].
-#[allow(unsafe_code)]
-pub fn put_carried_cell<T: Default + 'static>(slot: &'static LocalKey<Cell<T>>, is_default: fn(&T) -> bool, taken: usize) {
-    slot.with(|slot| {
+pub fn put_carried_cell<T: Default + 'static>(slot: &'static LocalKey<Cell<T>>, is_default: fn(&T) -> bool, taken: NonZeroUsize) {
+    // SAFETY: as in `put_carried`.
+    let value = unsafe { unboxed::<T>(taken) };
+    slot.with(move |slot| {
         let here = slot.take();
-        assert!(is_default(&here), "a job's thread-local put back on a thread that holds another's");
-        slot.set(here);
-        if taken != 0 {
-            // SAFETY: as in `put_carried`.
-            slot.set(*unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<T>(taken)) });
+        if !is_default(&here) {
+            slot.set(here);
+            panic!("a job's thread-local put back on a thread that holds another's");
         }
+        slot.set(value);
     });
+}
+
+/// [`end_carried`] for a thread-local `Cell`.
+pub fn end_carried_cell<T: 'static>(_slot: &'static LocalKey<Cell<T>>, taken: NonZeroUsize) {
+    // SAFETY: as in `end_carried`.
+    drop(unsafe { unboxed::<T>(taken) });
+}
+
+/// A carried value, boxed and exposed as a word.
+fn boxed<T>(value: T) -> NonZeroUsize {
+    // alloc: only for a value a job set, once a switch of the job holding it
+    let at = Box::into_raw(Box::new(value)).expose_provenance();
+    NonZeroUsize::new(at).expect("a box is never at address 0")
+}
+
+/// The value [`boxed`] made.
+///
+/// # Safety
+///
+/// `taken` is what `boxed::<T>` returned, not yet unboxed.
+#[allow(unsafe_code)]
+unsafe fn unboxed<T>(taken: NonZeroUsize) -> T {
+    // SAFETY: the caller's contract: a `Box<T>` leaked and exposed by `boxed`, unboxed once.
+    *unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<T>(taken.get())) }
 }
 
 #[cfg(test)]
@@ -166,12 +202,14 @@ mod tests {
         rx.recv().unwrap()
     }
 
-    fn take() -> usize {
+    fn take() -> Option<std::num::NonZeroUsize> {
         super::take_carried(&SLOT, Option::is_none)
     }
 
-    fn put(taken: usize) {
-        super::put_carried(&SLOT, Option::is_none, taken);
+    fn put(taken: Option<std::num::NonZeroUsize>) {
+        if let Some(taken) = taken {
+            super::put_carried(&SLOT, Option::is_none, taken);
+        }
     }
 
     /// Two jobs each holding a lend run crosswise on two threads whose own slots hold a value,
@@ -240,5 +278,46 @@ mod tests {
     fn lends_do_not_nest() {
         let (mut outer, mut inner) = (Vec::new(), Vec::new());
         lend(&SLOT, &mut outer, || lend(&SLOT, &mut inner, || ()));
+    }
+
+    /// Counts its drops: a carried value lost without one leaked its box.
+    #[derive(Default)]
+    struct Counted(Option<std::rc::Rc<std::cell::Cell<u32>>>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            if let Some(drops) = &self.0 {
+                drops.set(drops.get() + 1);
+            }
+        }
+    }
+
+    thread_local! {
+        static HELD: RefCell<Counted> = RefCell::new(Counted(None));
+        static HELD_CELL: std::cell::Cell<Counted> = std::cell::Cell::new(Counted(None));
+    }
+
+    /// A put onto a slot that holds another job's value refuses, and neither value is lost:
+    /// the one put is dropped (its box freed, not leaked), the one held stays in place.
+    #[test]
+    fn a_put_onto_a_held_slot_drops_what_it_was_given_and_keeps_what_is_held() {
+        let is_default = |it: &Counted| it.0.is_none();
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        HELD.set(Counted(Some(std::rc::Rc::clone(&drops))));
+        let taken = super::take_carried(&HELD, is_default).expect("a held value is taken");
+        HELD.set(Counted(Some(std::rc::Rc::new(std::cell::Cell::new(0)))));
+        let refused = panic::catch_unwind(|| super::put_carried(&HELD, is_default, taken));
+        assert!(refused.is_err(), "a put onto a held slot refuses");
+        assert_eq!(drops.get(), 1, "the refused value was not dropped");
+        assert!(HELD.with_borrow(|it| it.0.is_some()), "the held value was lost");
+
+        HELD_CELL.set(Counted(Some(std::rc::Rc::clone(&drops))));
+        let taken = super::take_carried_cell(&HELD_CELL, is_default).expect("a held value is taken");
+        HELD_CELL.set(Counted(Some(std::rc::Rc::new(std::cell::Cell::new(0)))));
+        let refused = panic::catch_unwind(|| super::put_carried_cell(&HELD_CELL, is_default, taken));
+        assert!(refused.is_err(), "a put onto a held cell refuses");
+        assert_eq!(drops.get(), 2, "the refused cell value was not dropped");
+        let held = HELD_CELL.take();
+        assert!(held.0.is_some(), "the held cell value was lost");
     }
 }

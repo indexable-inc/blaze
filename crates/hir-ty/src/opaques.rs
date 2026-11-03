@@ -9,7 +9,7 @@ use hir_def::{
     expr_store::Body,
     nameres::{DefMap, crate_def_map},
     resolver::HasResolver,
-    signatures::ImplSignature,
+    signatures::{FunctionSignature, ImplSignature},
 };
 use hir_expand::name::Name;
 use la_arena::ArenaMap;
@@ -141,11 +141,18 @@ fn type_aliases_of(frame: &Frame, items: &[(Name, AssocItemId)]) -> Box<[TypeAli
 
 // These are firewall queries to prevent drawing dependencies between infers:
 
+/// The hidden type of each `impl Trait` `function` returns, by its index, as its body defines
+/// it. A function with no body defines none: a trait method's `impl Trait` without a default
+/// body is rustc's synthesized associated type with no value, whose type each impl's method
+/// gives (`hir_ty_mir::opaque_of_impl`), so nothing is inferred for it and its map is empty.
 #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub fn rpit_hidden_types(
     db: &Db,
     function: FunctionId,
 ) -> ArenaMap<ImplTraitIdx, StoredEarlyBinder<StoredTy>> {
+    if !FunctionSignature::of(db, function).has_body() {
+        return ArenaMap::new();
+    }
     let infer = InferenceResult::of(db, DefWithBodyId::from(function));
     // `insert` grows the map to the index it is given: sized once to the highest, nothing is
     // shrunk after.

@@ -2,9 +2,10 @@
 //! docs/v2/plan/lanes/fastcompile/premap.md): a dependency's code goes in the image linked
 //! once per set of dependencies, the workspace's in the link of every edit.
 //!
-//! The front end decides an instance's owner where it sees its type arguments
-//! ([`crate::backend::Described::owner`]): an instance of a dependency's generic made for a
-//! workspace type is the workspace's. A static is its crate's. A dependency's code never refers
+//! The front end decides every owner, by one rule, where it sees the crates and the type
+//! arguments ([`crate::backend::Described::owner`], [`crate::backend::DescribedStatic::owner`]):
+//! an instance of a dependency's generic made for a workspace type is the workspace's, and a
+//! static is its crate's. A dependency's code never refers
 //! to the workspace's, or the image would change with workspace code: the build checks every
 //! reference of the dependency's code and refuses one to the workspace's, naming both.
 
@@ -25,18 +26,6 @@ pub enum Owner {
     Dependency,
     /// Linked with every edit.
     Workspace,
-}
-
-impl Owner {
-    /// The owner of code of a crate of `origin` that no type argument makes another's: a
-    /// dependency's and the standard library's are the image's, a member's and build-time
-    /// code's the workspace's.
-    pub fn of(origin: &Origin) -> Owner {
-        match origin {
-            Origin::Dependency(_) | Origin::Std => Owner::Dependency,
-            Origin::Member(_) | Origin::BuildTime(_) => Owner::Workspace,
-        }
-    }
 }
 
 /// A function of the build as [`owners`] takes it.

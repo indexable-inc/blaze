@@ -344,6 +344,55 @@ fn extract_doc_tt_attr(attr_flags: &mut AttrFlags, tt: ast::TokenTree<'_>) {
     }
 }
 
+/// The attributes `test(attr(..))` directly inside the `doc(..)` token tree `tt` names,
+/// pushed onto `out` as rustdoc words them ([`AttrFlags::doc_test_attrs`]).
+fn doc_test_attrs_of(tt: ast::TokenTree<'_>, out: &mut Vec<String>) {
+    let mut doc = TokenTreeChildren::new(tt).peekable();
+    while let Some(child) = doc.next() {
+        let NodeOrToken::Token(word) = child else { continue };
+        if word.text() != "test" {
+            continue;
+        }
+        let Some(NodeOrToken::Node(test)) = doc.peek().copied() else { continue };
+        let mut test = TokenTreeChildren::new(test).peekable();
+        while let Some(child) = test.next() {
+            let NodeOrToken::Token(word) = child else { continue };
+            if word.text() != "attr" {
+                continue;
+            }
+            let Some(NodeOrToken::Node(attr)) = test.peek().copied() else { continue };
+            let mut attr = TokenTreeChildren::new(attr).peekable();
+            while let Some(child) = attr.next() {
+                let NodeOrToken::Token(name) = child else { continue };
+                if !name.kind().is_any_identifier() {
+                    continue;
+                }
+                let name = name.text();
+                match attr.peek().copied() {
+                    Some(NodeOrToken::Node(group)) => {
+                        attr.next();
+                        // alloc: an attribute of an example, rare
+                        out.push(format!("{name}{}", group.syntax().text()));
+                    }
+                    Some(NodeOrToken::Token(eq)) if eq.kind() == T![=] => {
+                        attr.next();
+                        if let Some(last) = attr.next() {
+                            let last = match last {
+                                NodeOrToken::Node(it) => it.syntax().text(),
+                                NodeOrToken::Token(it) => it.text(),
+                            };
+                            // alloc: an attribute of an example, rare
+                            out.push(format!("{name}={last}"));
+                        }
+                    }
+                    // alloc: an attribute of an example, rare
+                    _ => out.push(name.to_owned()),
+                }
+            }
+        }
+    }
+}
+
 fn extract_ra_completions(attr_flags: &mut AttrFlags, tt: ast::TokenTree<'_>) {
     let tt = TokenTreeChildren::new(tt);
     if let Ok(NodeOrToken::Token(option)) = Itertools::exactly_one(tt)
@@ -2380,6 +2429,40 @@ impl AttrFlags {
             }
             ControlFlow::Continue(())
         });
+        result
+    }
+
+    /// What `#[doc(test(attr(..)))]` on `owner` (cfg_attr expanded, a crate root's inner and
+    /// command-line attributes included) adds to the examples in its documentation and in that
+    /// of every item inside it, in rustdoc's words (`HirCollector::visit_testable`): of each
+    /// `attr(..)`, an identifier and the group after it (`deny(warnings)`), an identifier,
+    /// `=` and the token after it (`crate_name="x"`), or a lone identifier. Read once per
+    /// item by a doctest unit's expansion, so it is no query.
+    pub fn doc_test_attrs(db: &Db, owner: Either<AttrDefId, FieldId>) -> Vec<String> {
+        // alloc: the doctest expansion's, once per item; empty for nearly every item
+        let mut result = Vec::new();
+        let mut each = |meta: ast::Meta<'_>| {
+            if let ast::Meta::TokenTreeMeta(meta) = meta
+                && path_is(meta.path(), "doc")
+                && let Some(tt) = meta.token_tree()
+            {
+                doc_test_attrs_of(tt, &mut result);
+            }
+            ControlFlow::<Infallible>::Continue(())
+        };
+        match owner {
+            Either::Left(owner) => {
+                collect_attrs(db, owner, |meta| each(meta));
+            }
+            Either::Right(field) => {
+                let at = u32::from(field.local_id.into_raw());
+                for_each_field(db, field.parent, Tree::Outline, |idx, cfg_options, it| {
+                    if idx == at {
+                        expand_cfg_attr_view(it.value.attrs(), || cfg_options, |meta, _| each(meta));
+                    }
+                });
+            }
+        }
         result
     }
 

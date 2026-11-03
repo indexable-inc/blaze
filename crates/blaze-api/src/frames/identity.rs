@@ -22,7 +22,7 @@ use crate::{
 };
 
 const REQUESTS: usize = 33;
-const RESPONSES: usize = 40;
+const RESPONSES: usize = 41;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -404,6 +404,7 @@ impl Gen {
         UnitOf {
             id: self.u32(),
             test: self.yes(),
+            doctest: self.yes(),
             target: self.unit_target(),
             package_id: self.text(),
             manifest_path: self.text(),
@@ -686,6 +687,7 @@ impl Gen {
             36 => Response::TestReady(self.artifact()),
             37 => Response::Rebuilt(self.rebuilt(depth)),
             38 => Response::Launched { live: self.yes(), env: self.many(depth, |g| (g.text(), g.text())) },
+            39 => Response::Stopping { doing: self.text() },
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }  // alloc: test and fuzz reference only
             }
@@ -864,7 +866,8 @@ fn response_index(response: &Response) -> usize {
         Response::TestReady(_) => 36,
         Response::Rebuilt(_) => 37,
         Response::Launched { .. } => 38,
-        Response::Of { .. } => 39,
+        Response::Stopping { .. } => 39,
+        Response::Of { .. } => 40,
     }
 }
 

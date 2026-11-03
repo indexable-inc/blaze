@@ -24,7 +24,7 @@
 mod coff;
 mod image;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::fmt;
 
@@ -33,7 +33,7 @@ use blaze_ids::radix;
 use parking_lot::Mutex;
 
 use crate::model::{
-    Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special, Writer,
+    Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special, Writer, zeroed,
 };
 use crate::reset::{self, Reset};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
@@ -54,6 +54,9 @@ pub(crate) const START_HOOK: &str = "blaze_inproc_start";
 /// other TLS callback (std's is `.CRT$XLB`).
 const START_HOOK_SECTION: &str = ".CRT$XLAB";
 
+/// The prefix of a name that is the import address table cell of the symbol the rest names
+/// (`__imp_X`, [`Special::Got`]).
+pub(crate) const IMP: &str = "__imp_";
 pub(crate) const IDATA: &str = "pe.idata";
 pub(crate) const EDATA: &str = "pe.edata";
 pub(crate) const DEBUG: &str = "pe.debug";
@@ -226,11 +229,6 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
     }
 }
 
-/// Whether a class's regions are not in the file: zeros, or a reservation.
-pub(crate) fn zeroed(class: &Class) -> bool {
-    matches!(class, Class::Bss | Class::Tbss | Class::Reserve(_))
-}
-
 /// The rank of a grouped section's `$` suffix: link.exe sorts the pieces of a section by the
 /// part after the `$`, so `.CRT$XCA` < `.CRT$XCU` < `.CRT$XCZ` and `.tls` < `.tls$` <
 /// `.tls$ZZZ`. The first 4 bytes of the suffix, big-endian, order them.
@@ -332,11 +330,12 @@ impl Writer for Pe {
             "_tls_index" => Some(Special::Start(Class::Synthetic(TLS_INDEX))),
             "__blaze_live" => Some(Special::LiveDescriptor),
             _ if ABSENT.contains(&name) => Some(Special::Absolute(0)),
-            _ => name
-                .strip_prefix("__imp_")
-                .filter(|it| !it.is_empty())
-                .map(|_| Special::Got { from: "__imp_".len() as u32 }),
+            _ => name.strip_prefix(IMP).filter(|it| !it.is_empty()).map(|_| Special::Got { from: IMP.len() as u32 }),
         }
+    }
+
+    fn got_prefix(&self) -> Option<&'static str> {
+        Some(IMP)
     }
 
     fn read(&self, name: &str, bytes: &[u8], kind: &NativeKind) -> Result<NativeFile, String> {

@@ -469,7 +469,7 @@ struct Foo {
 }
 
 #[automatically_derived] impl <> $crate::hash::Hash for Foo< > where {
-    fn hash<H: $crate::hash::Hasher>(&self , ra_expand_state: &mut H) {
+    fn hash<__H: $crate::hash::Hasher>(&self , ra_expand_state: &mut __H) {
         match self {
             Foo {
                 x: x_self, y: y_self, z: z_self,
@@ -507,7 +507,7 @@ enum Command {
 }
 
 #[automatically_derived] impl <> $crate::hash::Hash for Command< > where {
-    fn hash<H: $crate::hash::Hasher>(&self , ra_expand_state: &mut H) {
+    fn hash<__H: $crate::hash::Hasher>(&self , ra_expand_state: &mut __H) {
         $crate::hash::Hash::hash(&$crate::mem::discriminant(self ), ra_expand_state);
         match self {
             Command::Move {
@@ -1061,5 +1061,90 @@ enum Foo<T> {
         Foo::Baz
     }
 }"#]],
+    );
+}
+
+/// A field named by a word that is a keyword only in a later edition than the item's (`gen` in
+/// 2021, as streaming-iterator 0.1.9's `FromFn`) derives: the derive writes the field in its own
+/// context, whose edition is core's (2024), so it writes the name raw (`r#gen`), as rustc's
+/// `Ident::is_raw_guess` prints one, and the field's name in `Debug`'s output stays `gen`.
+/// Before, each derive's output failed to parse ("expected identifier") at `gen`.
+#[test]
+fn a_field_named_by_a_later_editions_keyword_derives() {
+    check(
+        r#"
+//- minicore: derive, clone, fmt
+//- /main.rs edition:2021
+#[derive(Clone, Debug)]
+pub struct FromFn<T, F> {
+    gen: F,
+    item: Option<T>,
+}
+#[derive(Clone, Copy, Debug)]
+#[repr(packed)]
+pub struct P {
+    gen: u8,
+}
+"#,
+        expect![[r##"
+#[derive(Clone, Debug)]
+pub struct FromFn<T, F> {
+    gen: F,
+    item: Option<T>,
+}
+#[derive(Clone, Copy, Debug)]
+#[repr(packed)]
+pub struct P {
+    gen: u8,
+}
+
+#[automatically_derived] impl <T: $crate::clone::Clone, F: $crate::clone::Clone, > $crate::clone::Clone for FromFn<T, F, > where {
+    fn clone(&self ) -> Self {
+        match self {
+            FromFn {
+                r#gen: gen_self, item: item_self,
+            }
+            =>FromFn {
+                r#gen: $crate::clone::Clone::clone(gen_self), item: $crate::clone::Clone::clone(item_self),
+            }
+            ,
+        }
+    }
+}
+#[automatically_derived] impl <T: $crate::fmt::Debug, F: $crate::fmt::Debug, > $crate::fmt::Debug for FromFn<T, F, > where {
+    fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
+        match self {
+            FromFn {
+                r#gen: gen_self, item: item_self,
+            }
+            => {
+                let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "FromFn");
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "gen", &gen_self);
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "item", &item_self);
+                $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
+            }
+            ,
+        }
+    }
+}
+#[automatically_derived] impl <> $crate::clone::Clone for P< > where {
+    fn clone(&self ) -> Self {
+        *self
+    }
+}
+#[automatically_derived] impl <> $crate::marker::Copy for P< > where {}
+#[automatically_derived] impl <> $crate::fmt::Debug for P< > where {
+    fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result { {
+            let gen_self = {
+                self .r#gen
+            }
+            ; {
+                let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "P");
+                $crate::fmt::DebugStruct::field(&mut ra_expand_builder, "gen", &&gen_self);
+                $crate::fmt::DebugStruct::finish(&mut ra_expand_builder)
+            }
+        }
+    }
+}"##]],
     );
 }

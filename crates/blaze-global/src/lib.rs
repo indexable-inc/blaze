@@ -33,33 +33,45 @@
 #![forbid(unsafe_code)]
 #![feature(allocator_api, allocator_ext)]
 
+// The cache over the network: TLS (rustls on ring), Ed25519 signatures (ring) and what uses
+// them. Without the `net` feature (the seed profile, which has no C) only what may be
+// published ([`public`]) and the HTTP framing are built.
+#[cfg(feature = "net")]
 pub mod bundle;
+#[cfg(feature = "net")]
 pub mod client;
 pub mod http;
 pub mod public;
+#[cfg(feature = "net")]
 pub mod server;
+#[cfg(feature = "net")]
 pub mod sign;
+#[cfg(feature = "net")]
 pub mod tls;
+#[cfg(feature = "net")]
 pub mod wire;
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
-#[cfg(test)]
+#[cfg(all(test, feature = "net"))]
 mod tests;
 
 use std::fmt;
 
 use blaze_cas::Key;
+#[cfg(feature = "net")]
 pub(crate) use blaze_core::Tags;
+#[cfg(feature = "net")]
 pub(crate) use blaze_hash::ByHash;
 
+pub use crate::public::{
+    DerivedMade, DevFunctionMade, FnSource, FunctionMade, ImageMade, ImagePart, ImageRead, Origin,
+    Private, Public, QueryMade, Root, Rule, RunMade, RunPart, Secrets,
+};
+#[cfg(feature = "net")]
 pub use crate::{
     bundle::{BundleId, BundleSpec, Download, Downloaded, Locked, Manifest},
     client::{Client, Endpoint, GotBundle, Published},
-    public::{
-        DerivedMade, DevFunctionMade, FnSource, FunctionMade, ImageMade, ImagePart, ImageRead, Origin, Private, Public,
-        QueryMade, Root, Rule, RunMade, RunPart, Secrets,
-    },
     server::{Server, record_key},
     sign::{PINNED, Publisher, PublisherKey, Record, Signed, Trust},
     tls::{Channel, Channels, Tls, TlsClient, TlsServer},

@@ -414,6 +414,11 @@ fn outputs_on_linux() {
         files(HOST, hash::CompileMode::Test, &TargetKind::Test, "it", Some(H), true),
         [format!("{out}/it-{H}"), format!("{out}/it-{H}.dwp"), format!("{out}/it-{H}.d")]
     );
+    // A library's doctests: one program, placed as a test's (blaze builds them, no rustdoc).
+    assert_eq!(
+        files(HOST, hash::CompileMode::Doctest, &lib, "app", Some(H), true),
+        [format!("{out}/app-{H}"), format!("{out}/app-{H}.dwp"), format!("{out}/app-{H}.d")]
+    );
     assert_eq!(
         files(HOST, hash::CompileMode::Build, &TargetKind::ExampleBin, "ex", None, true),
         [
@@ -912,6 +917,9 @@ fn plans_for_a_target() {
 fn refusals() {
     let mut unit = unit("app", &["lib"], &["lib"], "app", None, Mode::Doc, &[], &[]);
     assert!(hash::CompileMode::of(&unit).unwrap_err().what.contains("rustdoc"));
+    // A library's doctests are planned: blaze builds them itself (docs/v2/plan/doctests.md).
+    let doctest = Unit { mode: Mode::Doctest, ..unit.clone() };
+    assert_eq!(hash::CompileMode::of(&doctest).unwrap(), hash::CompileMode::Doctest);
     unit.profile.trim_paths = Some(serde_json::json!("all"));
     assert_eq!(hash::HashedProfile::of(&unit.profile).unwrap().trim_paths, hash::TrimPaths::All);
     unit.profile.panic = "sideways".to_owned();

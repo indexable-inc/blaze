@@ -143,6 +143,7 @@ fn carry_reads() {
         blaze_query::carry(blaze_query::Carried {
             take: || stdx::lend::take_carried_cell(&READS, Option::is_none),
             put: |it| stdx::lend::put_carried_cell(&READS, Option::is_none, it),
+            end: |it| stdx::lend::end_carried_cell(&READS, it),
         });
     });
 }

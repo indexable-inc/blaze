@@ -230,7 +230,7 @@ blaze-ids.workspace = true
 # `Builder`, which `Vfs::write_image` writes into, and `Image`, which `vfs_image` reopens.
 blaze-image.workspace = true
 # `fuzz_read` and the reference readers the link targets call.
-blaze-link = { workspace = true, features = ["fuzz"] }
+blaze-link = { workspace = true, features = ["fuzz", "llvm-stencils"] }
 blaze-live.workspace = true
 blaze-mem.workspace = true
 # `cbor::reference`, the codec's oracle, which the CBOR targets compare the fast one with.

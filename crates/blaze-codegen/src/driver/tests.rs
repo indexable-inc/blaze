@@ -33,9 +33,9 @@ struct Function {
     /// The function whose code it is, itself when `None`: two of one code have one key, as
     /// two instances of a generic whose code reads their arguments alike do.
     code_of: Option<u32>,
-    /// Its owner, its origin's ([`Owner::of`]) when `None`: a dependency's generic made for a
-    /// workspace type is the workspace's.
-    owner: Option<Owner>,
+    /// Its owner for the dependency image, which the front end decides
+    /// ([`Described::owner`]): the workspace's unless a test says.
+    owner: Owner,
 }
 
 #[derive(Default)]
@@ -102,7 +102,7 @@ impl Program {
             built_in: Vec::new(),
             outside: "memcpy",
             code_of: None,
-            owner: None,
+            owner: Owner::Workspace,
         };
         self.functions.insert(id, function);
         self.functions.get_mut(&id).unwrap()
@@ -132,11 +132,12 @@ impl Frontend for Program {
             .collect();
         let code = self.code(*id);
         Ok(Described {
-            owner: function.owner.unwrap_or(Owner::of(&function.origin)),
+            owner: function.owner,
             identity: ContentId::of("blaze v2 test identity 1", &id.to_le_bytes()),
             bound: Ok(code.0),
             item: item(*id),
             code,
+            built_in_code: code,
             args: ContentId::default(),
             origin: function.origin,
             editable: matches!(function.origin, Origin::Member(_)),
@@ -163,6 +164,7 @@ impl Frontend for Program {
             thread_local: false,
             section: section.clone(),
             origin: Origin::Member(Package::new("app")),
+            owner: Owner::Workspace,
             symbol: None,
             name: format!("app::S{id}"),
             refs: self.static_calls.get(id).into_iter().flatten().map(|it| FrontRef::Function(*it)).collect(),
@@ -458,6 +460,7 @@ fn policy(level: OptLevel, mode: Mode) -> Policy {
             panic: Panic::Unwind,
             packages: BTreeMap::new(),
             build_override: Override::default(),
+            stencils: false,
         },
         mode,
         fold: false,
@@ -771,6 +774,7 @@ fn a_live_build_starts_at_cranelift_and_tiers_up() {
     );
     let mut program = program();
     program.functions.get_mut(&4).unwrap().origin = Origin::Dependency(Package::new("memchr"));
+    program.functions.get_mut(&4).unwrap().owner = Owner::Dependency;
     let machine = Machine::default();
     let memo = Memo::new();
     let mut build = Build::new(&machine, &program, &policy, &memo);
@@ -795,6 +799,7 @@ fn a_tiered_callee_may_be_built_in_but_a_patchable_one_may_not() {
     );
     let mut program = program();
     program.functions.get_mut(&4).unwrap().origin = Origin::Dependency(Package::new("memchr"));
+    program.functions.get_mut(&4).unwrap().owner = Owner::Dependency;
     program.functions.get_mut(&2).unwrap().built_in = vec![0];
     let built = Build::new(&Machine::default(), &program, &policy, &Memo::new())
         .run(&[(1, member())], &Store::default())
@@ -922,6 +927,7 @@ fn test_static(id: u32) -> DescribedStatic<u32, u32> {
         thread_local: false,
         section: None,
         origin: Origin::Member(Package::new("app")),
+        owner: Owner::Workspace,
         symbol: None,
         name: format!("app::S{id}"),
         refs: Vec::new(),
@@ -1166,9 +1172,9 @@ fn a_key_the_image_s_describer_shares_is_the_image_s_with_its_references() {
     let workspace = program.function(2, 0x22, &[4]);
     workspace.code_of = Some(9);
     let dependency = program.function(3, 0x22, &[5]);
-    (dependency.code_of, dependency.owner) = (Some(9), Some(Owner::Dependency));
+    (dependency.code_of, dependency.owner) = (Some(9), Owner::Dependency);
     program.function(4, 0x44, &[]);
-    program.function(5, 0x55, &[]).owner = Some(Owner::Dependency);
+    program.function(5, 0x55, &[]).owner = Owner::Dependency;
     let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default())
         .unwrap_or_else(|errors| panic!("{errors:?}"));
     assert_eq!(built.stats.instances, 4, "2 and 3 are one key");
@@ -1520,7 +1526,9 @@ fn a_tier_up_recompiles_its_importer_when_an_imports_tier_changes() {
     };
     let mut program = program();
     program.functions.get_mut(&2).unwrap().origin = Origin::Dependency(Package::new("dep"));
+    program.functions.get_mut(&2).unwrap().owner = Owner::Dependency;
     program.functions.get_mut(&4).unwrap().origin = Origin::Dependency(Package::new("memchr"));
+    program.functions.get_mut(&4).unwrap().owner = Owner::Dependency;
     let mut store = Store::default();
     let (machine, memo, policy) = (Machine::default(), Memo::new(), live(None));
     let mut first = Build::new(&machine, &program, &policy, &memo);

@@ -729,7 +729,11 @@ const _: () = assert!(
 const _: () = assert!(
     size_of::<EnumSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 8
 );
+// These four are padded to the store's (pointer) alignment, so their own bytes are per target:
+// checked on 64-bit targets.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ConstSignature>() == size_of::<ExpressionStore>() + 16);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<StaticSignature>() == size_of::<ExpressionStore>() + 16);
 const _: () = assert!(
     size_of::<ImplSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 16
@@ -737,10 +741,12 @@ const _: () = assert!(
 const _: () = assert!(
     size_of::<TraitSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 8
 );
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     size_of::<FunctionSignature>()
         == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 40
 );
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     size_of::<TypeAliasSignature>()
         == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 32
@@ -1595,7 +1601,9 @@ pub struct FieldData {
     pub default_value: Option<ConstRef>,
 }
 
-// 40 bytes per field with today's 16-byte `RawVisibility`, in one array per variant.
+// 40 bytes per field with today's 16-byte `RawVisibility`, in one array per variant. Padded to
+// the visibility's (pointer) alignment: checked on 64-bit targets.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<FieldData>() == size_of::<RawVisibility>() + 24);
 
 pub type LocalFieldId = Idx<FieldData>;
@@ -1608,7 +1616,11 @@ pub struct VariantFields {
 }
 
 // The field array (24 bytes), the shape and the store (72 bytes today): 104 bytes in its memo.
-const _: () = assert!(size_of::<VariantFields>() == size_of::<ExpressionStore>() + 32);
+// In pointer widths: the array's three words and the shape's byte, padded to a word.
+const _: () = assert!(
+    size_of::<VariantFields>()
+        == size_of::<ExpressionStore>() + (3 * size_of::<usize>() + 1).next_multiple_of(align_of::<usize>())
+);
 
 /// What the fields of `id` are lowered from: the [`variants_syntax`] of an enum variant's
 /// enum, the [`signature_syntax`] of a struct or union. `None` for one a macro writes.
@@ -1914,7 +1926,9 @@ pub struct EnumVariants {
 /// every enum. Bits past the last variant are zero, so equal sets are equal words.
 type VariantBits = Bits<SmallVec<[u64; 1]>>;
 
-// The inline word and its length, or a heap pointer and its length, plus the capacity.
+// The inline word and its length, or a heap pointer and its length, plus the capacity. The
+// inline `u64` aligns it to 8 on every target, so the size is per target: checked on 64-bit.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<VariantBits>() == 24);
 
 // The order of the variants is part of the enum: discriminants and layout follow it. Two

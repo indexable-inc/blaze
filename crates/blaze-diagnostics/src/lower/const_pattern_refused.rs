@@ -198,7 +198,7 @@ fn manual_partial_eq(cx: &Cx<'_, '_>, ty: &Type<'_>) -> Option<Span> {
     let db = cx.db;
     let partial_eq = hir::Trait::lang(db, cx.krate, LangItem::PartialEq)?;
     // clone: `hir::Type` is an owner ID and an interned `Ty`, a copy
-    hir::Impl::all_for_type(db, ty.clone()).into_iter().find_map(|it| {
+    hir::Impl::all_for_type(db, cx.krate, ty.clone()).into_iter().find_map(|it| {
         if it.trait_(db) != Some(partial_eq) || it.module(db).krate(db) != cx.krate {
             return None;
         }

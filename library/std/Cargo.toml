@@ -83,6 +83,11 @@ wasip1 = { version = "1.0.0", features = [
     'rustc-dep-of-std',
 ], default-features = false }
 
+# blaze: the C runtime of a 64-bit WASI preview 1 target (wasm64-blaze-wasip1), in place of
+# wasi-libc, which has no build for its `wasi_snapshot_preview1_64` imports. See library/wasi_rt.
+[target.'cfg(all(target_os = "wasi", target_env = "p1", target_pointer_width = "64"))'.dependencies]
+wasi_rt = { path = "../wasi_rt" }
+
 [target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dependencies]
 wasip2 = { version = '2.0.1', features = [
     'rustc-dep-of-std',

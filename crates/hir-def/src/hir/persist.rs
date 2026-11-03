@@ -63,9 +63,10 @@ macro_rules! query_ids {
 }
 pub(crate) use query_ids;
 
-/// The id whose bits are the word `bits`: `None` for 0 or a word past `u32`, which no id is.
+/// The id whose bits are the word `bits`: `None` for 0 or a word past
+/// [`blaze_query::db::Id::MAX_U32`], which no id is.
 pub(crate) fn id_of_bits(bits: u64) -> Option<blaze_query::db::Id> {
-    u32::try_from(bits).ok().filter(|&it| it != 0).map(blaze_query::db::Id::from_u32)
+    u32::try_from(bits).ok().and_then(blaze_query::db::Id::new)
 }
 
 /// The id of a [`Relocation`] entry's bits, which this database made.
@@ -238,10 +239,12 @@ fn carry_scopes() {
         blaze_query::carry(blaze_query::Carried {
             take: || stdx::lend::take_carried(&RELOCATION, Option::is_none),
             put: |it| stdx::lend::put_carried(&RELOCATION, Option::is_none, it),
+            end: |it| stdx::lend::end_carried(&RELOCATION, it),
         });
         blaze_query::carry(blaze_query::Carried {
             take: || stdx::lend::take_carried(&ANONYMOUS, Option::is_none),
             put: |it| stdx::lend::put_carried(&ANONYMOUS, Option::is_none, it),
+            end: |it| stdx::lend::end_carried(&ANONYMOUS, it),
         });
     });
 }
@@ -680,8 +683,9 @@ impl<'a> Read<'a> {
     /// The id of something the query database made, as [`query_ids`] wrote it outside
     /// [`relocating`].
     pub(crate) fn query_id(&mut self) -> Result<blaze_query::db::Id, FormatError> {
+        let at = self.here();
         let bits = self.u64()?;
-        id_of_bits(bits).ok_or_else(|| self.invalid("an id of 0 or of more than 32 bits"))
+        blaze_query::db::Id::decode(bits, at, "a query id")
     }
 
     /// The id of something the query database made of `kind`, as [`Words::query_id`] wrote it:
@@ -690,8 +694,9 @@ impl<'a> Read<'a> {
         if !in_scope() {
             return self.query_id();
         }
+        let at = self.here();
         let bits = self.relocated(kind)?;
-        id_of_bits(bits).ok_or_else(|| self.invalid("a relocated id of 0 or of more than 32 bits"))
+        blaze_query::db::Id::decode(bits, at, "a relocated query id")
     }
 
     /// The bits of the id of `kind` the next word names in the [`relocating`] table.
@@ -1007,6 +1012,9 @@ pub(crate) fn syntax_context(raw: u32) -> Option<SyntaxContext> {
     if raw == u32::MAX {
         return None;
     }
+    // Persisted but trusted (hash-checked), not process-made: a corrupt word that is a root's
+    // number or below `Id::MAX_U32` names another context, and one between them panics at
+    // `SyntaxContext`'s assert on first use. Neither is a typed error, and neither is UB.
     Some(SyntaxContext::from_u32(raw))
 }
 

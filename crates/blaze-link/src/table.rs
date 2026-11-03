@@ -39,7 +39,7 @@ pub(crate) fn stub_size(arch: Arch) -> u64 {
     match arch {
         Arch::X86_64 => 16,
         Arch::Aarch64 => 24,
-        Arch::Wasm32 => 0,
+        Arch::Wasm32 | Arch::Wasm64 => 0,
     }
 }
 
@@ -67,7 +67,7 @@ pub(crate) fn stub_fixups(arch: Arch) -> &'static [StubFixup] {
     match arch {
         Arch::X86_64 => &X86_STUB_FIXUPS,
         Arch::Aarch64 => &A64_PAGE_FIXUPS,
-        Arch::Wasm32 => &[],
+        Arch::Wasm32 | Arch::Wasm64 => &[],
     }
 }
 
@@ -102,7 +102,7 @@ pub(crate) fn write_stub(arch: Arch, slot: u32, out: &mut [u8]) {
                 to.copy_from_slice(&word.to_le_bytes());
             }
         }
-        Arch::Wasm32 => {}
+        Arch::Wasm32 | Arch::Wasm64 => {}
     }
 }
 
@@ -131,7 +131,7 @@ pub(crate) fn stub(arch: Arch, slot: u32) -> (Vec<u8>, &'static [StubFixup]) {
 pub(crate) fn log_stub_size(arch: Arch) -> u64 {
     match arch {
         Arch::X86_64 | Arch::Aarch64 => 16,
-        Arch::Wasm32 => 0,
+        Arch::Wasm32 | Arch::Wasm64 => 0,
     }
 }
 
@@ -140,7 +140,7 @@ pub(crate) fn log_size(arch: Arch, slots: u64) -> u64 {
     match arch {
         Arch::X86_64 => slots * 16 + X86_LOG.len() as u64,
         Arch::Aarch64 => slots * 16 + A64_LOG.len() as u64 * 4,
-        Arch::Wasm32 => 0,
+        Arch::Wasm32 | Arch::Wasm64 => 0,
     }
 }
 
@@ -231,7 +231,7 @@ pub(crate) fn log_fixups(arch: Arch) -> &'static [StubFixup] {
     match arch {
         Arch::X86_64 => &X86_LOG_FIXUPS,
         Arch::Aarch64 => &A64_LOG_FIXUPS,
-        Arch::Wasm32 => &[],
+        Arch::Wasm32 | Arch::Wasm64 => &[],
     }
 }
 
@@ -264,7 +264,7 @@ pub(crate) fn write_log_stub(arch: Arch, slot: u32, to: u64, out: &mut [u8]) {
                 into.copy_from_slice(&word.to_le_bytes());
             }
         }
-        Arch::Wasm32 => {}
+        Arch::Wasm32 | Arch::Wasm64 => {}
     }
 }
 
@@ -284,7 +284,7 @@ pub(crate) fn log_stubs(arch: Arch, slots: u64, out: &mut [u8]) {
                 into.copy_from_slice(&word.to_le_bytes());
             }
         }
-        Arch::Wasm32 => {}
+        Arch::Wasm32 | Arch::Wasm64 => {}
     }
     let end = slots * size as u64;
     par::for_each(par::enumerate(par::chunks_mut(stubs, size)), |(slot, out)| {
@@ -296,7 +296,7 @@ pub(crate) fn log_stubs(arch: Arch, slots: u64, out: &mut [u8]) {
 pub(crate) fn plt_size(arch: Arch) -> u64 {
     match arch {
         Arch::X86_64 | Arch::Aarch64 => 16,
-        Arch::Wasm32 => 0,
+        Arch::Wasm32 | Arch::Wasm64 => 0,
     }
 }
 
@@ -326,7 +326,7 @@ pub(crate) fn plt(arch: Arch) -> (&'static [u8], &'static [StubFixup]) {
     match arch {
         Arch::X86_64 => (&X86_PLT, &X86_PLT_FIXUPS),
         Arch::Aarch64 => (&A64_PLT, &A64_PAGE_FIXUPS),
-        Arch::Wasm32 => (&[], &[]),
+        Arch::Wasm32 | Arch::Wasm64 => (&[], &[]),
     }
 }
 

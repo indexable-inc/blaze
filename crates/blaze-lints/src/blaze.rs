@@ -98,6 +98,9 @@ mod struct_update;
 mod syscall_in_loop;
 #[cfg(test)]
 mod tests;
+mod thread_local_in_waiting_fn;
+#[cfg(test)]
+mod thread_local_tests;
 mod unbounded_from_input;
 mod unbuffered_io;
 mod unnamed_wait;
@@ -220,6 +223,7 @@ pub enum Lint {
     BorrowWorkaround,
     NllWorkaround,
     NativeContracts,
+    ThreadLocalInWaitingFn,
 }
 
 /// Which workspaces a lint is for.
@@ -378,6 +382,7 @@ impl Lint {
         Lint::BorrowWorkaround,
         Lint::NllWorkaround,
         Lint::NativeContracts,
+        Lint::ThreadLocalInWaitingFn,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -452,6 +457,7 @@ impl Lint {
             | Lint::SerialDependence
             | Lint::FiberBoundary
             | Lint::HeldAcrossWait
+            | Lint::ThreadLocalInWaitingFn
             | Lint::LockAcrossQuery
             | Lint::BlockingOnPool
             | Lint::UnnamedWait
@@ -569,6 +575,7 @@ impl Lint {
             Lint::BorrowWorkaround => "borrow_workaround",
             Lint::NllWorkaround => "nll_workaround",
             Lint::NativeContracts => "native_contracts",
+            Lint::ThreadLocalInWaitingFn => "thread_local_in_waiting_fn",
         }
     }
 
@@ -659,6 +666,7 @@ impl Lint {
             Lint::BorrowWorkaround => concat!(general_docs!(), "#borrow_workaround"),
             Lint::NllWorkaround => concat!(general_docs!(), "#nll_workaround"),
             Lint::NativeContracts => concat!(general_docs!(), "#native_contracts"),
+            Lint::ThreadLocalInWaitingFn => concat!(docs!(), "#thread_local_in_waiting_fn"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/lanes/may-suspend/fiber-boundary.md"
             }
@@ -847,6 +855,9 @@ impl Lint {
             Lint::NllWorkaround => {
                 "look it up once, `if let Some(found) = map.get_mut(&k)`, if the crate is built only by blaze (or nightly Rust); a crate that must build with stable Rust keeps the second lookup, with `#[expect(blaze::nll_workaround, reason = \"builds with stable Rust\")]`"
             }
+            Lint::ThreadLocalInWaitingFn => {
+                "read the thread-local in a small `#[inline(never)]` function that does not wait, and call that here (as `blaze_graph`'s `pool::with_caches` and `pool::local` do)"
+            }
             Lint::NativeContracts => {
                 "write the contract as `requires`/`ensures` clauses between the signature and the body (`blaze check --fix` does), naming the return `-> (r: T)` for the `ensures`"
             }
@@ -947,6 +958,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         dropped_error::check(cx);
         hash_order_output::check(cx);
         held_across_wait::check(cx);
+        thread_local_in_waiting_fn::check(cx);
         lock_across_query::check(cx);
         blocking_on_pool::check(cx);
         unnamed_wait::check(cx);

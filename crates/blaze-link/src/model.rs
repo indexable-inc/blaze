@@ -211,6 +211,14 @@ pub(crate) fn reserved(class: &Class) -> bool {
     matches!(class, Class::Reserve(_))
 }
 
+/// Whether a class's regions have no bytes in the file: zeroed at load ([`Class::Bss`],
+/// [`Class::Tbss`]), or a dev run's reservation ([`reserved`]), which holds nothing. The one
+/// rule every format's writer reads.
+#[inline]
+pub(crate) fn zeroed(class: &Class) -> bool {
+    matches!(class, Class::Bss | Class::Tbss | Class::Reserve(_))
+}
+
 /// What a region may be accessed as.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Prot {
@@ -1290,6 +1298,13 @@ pub(crate) trait Writer: Send + Sync {
     /// The symbol the linker defines under `name`, if it defines one.
     fn special(&self, name: &str) -> Option<Special>;
 
+    /// The prefix of the names that are the GOT cell of the symbol the rest of the name names
+    /// (PE's `__imp_`), which [`Writer::special`] gives as [`Special::Got`]; none in a format
+    /// with no such names. A moved cell's readers by name are found by it (`Stage::relay`).
+    fn got_prefix(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The class and rank of a dev run's pointer to `blaze_inproc_start` ([`crate::DevRun`]),
     /// which the core places before every other piece of that class and rank; an error for a
     /// format with no start hook.
@@ -1396,6 +1411,11 @@ impl Writer for Formats {
     #[inline]
     fn special(&self, name: &str) -> Option<Special> {
         each!(self, it => it.special(name))
+    }
+
+    #[inline]
+    fn got_prefix(&self) -> Option<&'static str> {
+        each!(self, it => it.got_prefix())
     }
 
     fn shared_entry(&self) -> Option<&'static str> {

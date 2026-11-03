@@ -8,7 +8,7 @@ use intern::sym;
 use span::Span;
 
 use crate::{
-    Ident, Leaf, MAX_GLUED_PUNCT_LEN, Punct, Spacing, Subtree, TokenTree, TokenTreesView,
+    Ident, Leaf, MAX_GLUED_PUNCT_LEN, Punct, Spacing, Subtree, TokenTreesView,
     buffer::Cursor,
 };
 
@@ -111,7 +111,8 @@ impl<'a> TtIter<'a> {
         }
     }
 
-    /// Returns consecutive `Punct`s that can be glued together.
+    /// Returns consecutive `Punct`s that rustc's lexer glues into one token ([`crate::glue`]):
+    /// each joint to the one before it, left to right.
     ///
     /// This method currently may return a single quotation, which is part of lifetime ident and
     /// conceptually not a punct in the context of mbe. Callers should handle this.
@@ -119,55 +120,21 @@ impl<'a> TtIter<'a> {
         let TtElement::Leaf(Leaf::Punct(first)) = self.next().ok_or(())? else {
             return Err(());
         };
-
         let mut res = ArrayVec::new();
-        if first.spacing == Spacing::Alone {
-            res.push(first);
-            return Ok(res);
-        }
-
-        let (second, third) = match self.peek_two() {
-            [Some(TokenTree::Leaf(Leaf::Punct(p2))), Some(TokenTree::Leaf(Leaf::Punct(p3)))]
-                if p2.spacing == Spacing::Joint =>
-            {
-                (p2, Some(p3))
-            }
-            [Some(TokenTree::Leaf(Leaf::Punct(p2))), _] => (p2, None),
-            _ => {
-                res.push(first);
-                return Ok(res);
-            }
-        };
-
-        match (first.char, second.char, third.map(|it| it.char)) {
-            ('.', '.', Some('.' | '=')) | ('<', '<', Some('=')) | ('>', '>', Some('=')) => {
-                let _ = self.next().unwrap();
-                let _ = self.next().unwrap();
-                res.push(first);
-                res.push(second);
-                res.push(third.unwrap());
-            }
-            ('-' | '!' | '*' | '/' | '&' | '%' | '^' | '+' | '<' | '=' | '>' | '|', '=', _)
-            | ('-' | '=' | '>', '>', _)
-            | ('<', '-', _)
-            | (':', ':', _)
-            | ('.', '.', _)
-            | ('&', '&', _)
-            | ('<', '<', _)
-            | ('|', '|', _) => {
-                let _ = self.next().unwrap();
-                res.push(first);
-                res.push(second);
-            }
-            _ => res.push(first),
+        res.push(first);
+        let mut buf = [0; 4];
+        let mut glued: &str = first.char.encode_utf8(&mut buf);
+        let mut last = first;
+        // `glue` makes nothing longer than `MAX_GLUED_PUNCT_LEN`, so this ends by then.
+        while last.spacing != Spacing::Alone {
+            let Some(TtElement::Leaf(Leaf::Punct(next))) = self.peek() else { break };
+            let Some(joined) = crate::glue(glued, next.char) else { break };
+            self.next();
+            res.push(next);
+            glued = joined;
+            last = next;
         }
         Ok(res)
-    }
-
-    /// This method won't check for subtrees, so the nth token tree may not be the nth sibling of the current tree.
-    fn peek_two(&self) -> [Option<TokenTree>; 2] {
-        let mut iter = self.inner.iter_flat_tokens();
-        [iter.next(), iter.next()]
     }
 
     pub fn peek(&self) -> Option<TtElement<'a>> {

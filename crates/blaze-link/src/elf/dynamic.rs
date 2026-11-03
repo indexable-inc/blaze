@@ -230,7 +230,7 @@ fn types(arch: Arch) -> Types {
             dtpoff64: elf::R_AARCH64_TLS_DTPREL.0,
             tlsdesc: elf::R_AARCH64_TLSDESC.0,
         },
-        Arch::X86_64 | Arch::Wasm32 => Types {
+        Arch::X86_64 | Arch::Wasm32 | Arch::Wasm64 => Types {
             relative: elf::R_X86_64_RELATIVE.0,
             glob_dat: elf::R_X86_64_GLOB_DAT.0,
             abs64: elf::R_X86_64_64.0,
@@ -834,7 +834,7 @@ fn block_offset(arch: Arch, tls: Tls, tp: i64) -> i64 {
     let align = tls.align.max(1);
     match arch {
         Arch::Aarch64 => tp - 16u64.next_multiple_of(align) as i64,
-        Arch::X86_64 | Arch::Wasm32 => tp + tls.size.next_multiple_of(align) as i64,
+        Arch::X86_64 | Arch::Wasm32 | Arch::Wasm64 => tp + tls.size.next_multiple_of(align) as i64,
     }
 }
 

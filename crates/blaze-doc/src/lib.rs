@@ -11,6 +11,7 @@
 mod attrs;
 mod cfg;
 mod collect;
+pub mod doctest;
 mod highlight;
 pub mod html;
 mod links;

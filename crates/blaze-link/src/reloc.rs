@@ -108,7 +108,7 @@ pub(crate) struct Ctx {
 /// whether it is in a function's code (`in_code`) or in data. A thread-local kind is valid
 /// only on the format and arch whose TLS model it belongs to.
 pub(crate) fn of_kind(kind: RelocKind, format: Format, arch: Arch, in_code: bool) -> Result<Apply, String> {
-    if arch == Arch::Wasm32 {
+    if arch.is_wasm() {
         return crate::wasm::codegen_apply(kind, in_code);
     }
     use {Arch::Aarch64 as A64, Arch::X86_64 as X64, Format::*};
@@ -144,11 +144,19 @@ pub(crate) fn of_kind(kind: RelocKind, format: Format, arch: Arch, in_code: bool
 
 /// The wasm relocation types whose value the core computes before the writer encodes it:
 /// a function's index (`R_WASM_FUNCTION_INDEX_LEB`, `_I32`) or its table slot, the index
-/// + 1 (`R_WASM_TABLE_INDEX_SLEB`, `_I32`).
+/// + 1 (`R_WASM_TABLE_INDEX_SLEB`, `_I32`, and wasm64's `_SLEB64`, `_I64`).
 pub(crate) const WASM_FUNCTION_INDEX_LEB: u32 = 0;
 pub(crate) const WASM_TABLE_INDEX_SLEB: u32 = 1;
 pub(crate) const WASM_TABLE_INDEX_I32: u32 = 2;
+pub(crate) const WASM_TABLE_INDEX_SLEB64: u32 = 18;
+pub(crate) const WASM_TABLE_INDEX_I64: u32 = 19;
 pub(crate) const WASM_FUNCTION_INDEX_I32: u32 = 26;
+
+/// Whether a wasm relocation type is one the core gives a table slot (the function's index
+/// + 1) rather than an address.
+pub(crate) const fn wasm_is_table_slot(r_type: u32) -> bool {
+    matches!(r_type, WASM_TABLE_INDEX_SLEB | WASM_TABLE_INDEX_I32 | WASM_TABLE_INDEX_SLEB64 | WASM_TABLE_INDEX_I64)
+}
 
 /// How many bytes from the place an [`Apply`] writes.
 pub(crate) fn width(apply: Apply) -> usize {
@@ -171,6 +179,12 @@ pub(crate) enum GotKind {
 }
 
 impl GotKind {
+    /// Every kind, each at its own index: the array is as long as the enum has variants, and
+    /// the check below holds each at the index it is numbered, so a kind added to the enum and
+    /// not here fails to compile, and no kind is here twice.
+    pub const ALL: [GotKind; std::mem::variant_count::<GotKind>()] =
+        [GotKind::Address, GotKind::TpOff, GotKind::TlsGd, GotKind::TlsDesc];
+
     pub fn cells(self) -> u64 {
         match self {
             GotKind::Address | GotKind::TpOff => 1,
@@ -178,6 +192,14 @@ impl GotKind {
         }
     }
 }
+
+const _: () = {
+    let mut at = 0;
+    while at < GotKind::ALL.len() {
+        assert!(GotKind::ALL[at] as usize == at, "GotKind::ALL lists each kind at its own number");
+        at += 1;
+    }
+};
 
 pub(crate) fn got_kind(apply: Apply) -> Option<GotKind> {
     match apply {
@@ -227,7 +249,7 @@ pub(crate) fn tp_offset(arch: Arch, tls: Tls, s: u64) -> Result<i64, Bad> {
     Ok(match arch {
         Arch::X86_64 => at as i64 - align_up_u64(tls.size, align) as i64,
         Arch::Aarch64 => (align_up_u64(16, align) + at) as i64,
-        Arch::Wasm32 => return Err(Bad::WasmTls),
+        Arch::Wasm32 | Arch::Wasm64 => return Err(Bad::WasmTls),
     })
 }
 

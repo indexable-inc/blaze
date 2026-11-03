@@ -15,7 +15,9 @@
 //!   package's targets apart (`tests/fetch.rs` and `examples/fetch.rs`), so hashing it would
 //!   only split one image into two equal ones.
 //! - Each file of the source root of the crate's root file: its path and its text's content
-//!   ID ([`base_db::FileText::content`], which has no path in it), sorted by path.
+//!   ID ([`base_db::FileText::content`], which has no path in it), sorted by path; a file with
+//!   no text (not UTF-8), which `include_str!` and `include_bytes!` read from disk, by the
+//!   content ID of the bytes they read ([`base_db::IncludedFile::content`]).
 //! - Of a proc-macro crate, each macro's name and kind and the content ID of the library it is
 //!   built into (`ProcMacroExpander::code`): what its expansions are a function of besides
 //!   their call. A proc-macro crate whose library is not known is not [`eligible`], nor is any
@@ -35,9 +37,18 @@
 //! `env!`s read, what its proc-macro expansions read) is not in the key: it is the crate's
 //! [`super::reads`], which file the image under the key and the values those reads have.
 //!
-//! A file of the crate outside its source root (a `#[path]` out of the crate, an `include!`
-//! of `OUT_DIR`) is not in the key: the frozen def map names it with its text's hash, which
-//! [`crate::nameres::frozen::unreadable`] checks before the image is used.
+//! **Files.** Every file an image depends on is a file of the source root of a crate whose key
+//! the key covers (its own or a dependency's), so its text is in the key wherever in that
+//! source root it is: a `#[path]` or an `include!` into another directory of the package
+//! (`../shared/m.rs`), and a build script's `OUT_DIR` files, which a run puts in its package's
+//! source root (`blaze_lower`'s `apply_run`). A frozen def map names its files by their path in
+//! their owner's source root, and is looked up there alone when read. A crate whose module
+//! files or `include!`s read a file anywhere else (a `#[path]` into another package, a path no
+//! source root has) is refused an image (`serve::refusal`, `serve::include_refusal`): that
+//! file is known only once the crate is resolved, after the key is made. Not yet covered: a
+//! `mod` that names no file, or an `include!` among an impl's or a trait's items, which the
+//! image records as unresolved and the key does not cover if that file appears later in
+//! another source root (an already broken crate's stale error, not a different program).
 
 use base_db::{Crate, Db, ExtraCrateData, FileText, TargetKind};
 use blaze_hash::HashMap;
@@ -251,9 +262,16 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, memo: &Memo, hasher: &mut Ha
 }
 
 /// Each file of the source root of `krate`'s root file, as its path and its text's content ID.
+/// A file with no text (not UTF-8) is hashed by its bytes as `include_str!` and
+/// `include_bytes!` read them ([`base_db::Files::included_file`], the one entry they read), so
+/// an image that holds what they read is keyed by it.
 fn files(db: &Db, krate: Crate, base: &Base, hasher: &mut Hasher) {
     let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
     let root = db.source_root(root).source_root_ref(db);
+    let durability = match root.is_library {
+        true => blaze_query::db::Durability::HIGH,
+        false => blaze_query::db::Durability::LOW,
+    };
     // alloc: setup: the root's files, once per crate per session
     let mut files: Vec<(Vec<u8>, ContentId)> = root
         .iter()
@@ -262,7 +280,10 @@ fn files(db: &Db, krate: Crate, base: &Base, hasher: &mut Hasher) {
             let path = root.path_for_file(&file).map(|it| it.to_string()).unwrap_or_default();
             let content = match db.has_file_text(file) {
                 true => db.file_text(file).content(db),
-                false => FileText::no_text(),
+                false => match root.path_for_file(&file).and_then(|it| it.as_path()) {
+                    Some(on_disk) => db.files().included_file(db, krate, on_disk, durability).content(db),
+                    None => FileText::no_text(),
+                },
             };
             (base.portable(&path), content)
         })
