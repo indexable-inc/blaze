@@ -419,3 +419,19 @@ fn main() {
         )],
     );
 }
+
+#[test]
+fn a_struct_used_as_a_value_still_suggests_a_similar_value() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+struct Foo { x: u8 }
+
+fn main() {
+    let foo = 1;
+    let _ = Foo;
+}
+"#;
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(5, &["E0423", "expected value, found struct `Foo`", "similar name", "foo"])],
+    );
+}

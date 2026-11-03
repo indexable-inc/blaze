@@ -83,7 +83,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
             };
             diag.span_label(defined, label);
         }
-        // rustc still offers the value of that name to import (`report_with_use_injections`).
+        // rustc still suggests a similar value in scope (`suggest_typo`) ...
+        if let Some(scope) = scope.as_ref() {
+            typo(cx, &mut diag, Names::Scope(scope), source, name, &span, &[]);
+        }
+        // ... and the value of that name to import (`report_with_use_injections`).
         if let Some(module) = module {
             let found = imports(cx, module, source, name, None);
             show_imports(cx, &mut diag, module, found, true);
