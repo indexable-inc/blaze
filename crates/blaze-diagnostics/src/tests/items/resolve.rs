@@ -306,3 +306,19 @@ fn main() {
 "#;
     assert_reports(&super::ui_fixture(fixture), &[error(2, &["E0425", "`try_hold`", "`gc::lease`"])]);
 }
+
+#[test]
+fn a_struct_with_named_fields_used_as_a_value_is_e0423() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+struct A { b: u8 }
+
+fn main() {
+    let _ = A(1);
+    let _ = A;
+}
+"#;
+assert_reports(&super::ui_fixture(fixture), &[
+    error(4, &["E0423", "expected function, tuple struct or tuple variant, found struct `A`"]),
+    error(5, &["E0423", "expected value, found struct `A`"]),
+]);
+}

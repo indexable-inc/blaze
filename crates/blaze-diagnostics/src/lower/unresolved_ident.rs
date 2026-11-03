@@ -61,7 +61,18 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
     let mut diag = if name == "self" {
         // clone: on the error path, for an error hir found
         self_value(cx, syntax, d.node.file_id, source, span.clone())
-    } else {
+    }else if let Some((descr, defined)) = scope.as_ref().and_then(|it| as_type(cx,it,source,name)) {
+        // alloc: the error's text, for an error hir found
+        let message = format!("expected {}, found {descr} `{name}` in this scope", source.expected());
+
+        let mut diag = Diag::error(Some("E0423"), message, span.clone()); // clone: on the error path, for an error hir found
+        if let Some(defined) = defined {
+            // alloc: the error's label, for an error hir found
+            diag.span_label(defined, format!("`{name}` defined here"));
+        }
+        diag
+    }
+    else {
         // alloc: the error's text, for an error hir found
         let message = format!("cannot find {} `{name}` in this scope", source.expected());
         // clone: on the error path, for an error hir found
@@ -86,6 +97,31 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
     // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Resolve)]
 }
+
+fn as_type<'db> (
+        cx: &Cx<'_, 'db>,
+        scope: &hir::SemanticsScope<'db>,
+        source: PathSource,
+        name: &str,
+    ) -> Option<(&'static str, Option<Span>)> {
+
+    if !matches!(source, PathSource::Value | PathSource::Callee(_)) {
+        return None;
+    }
+
+    let mut found = None;
+    scope.process_all_names(&mut |it, def| {
+        if found.is_some() || it.symbol().as_str() != name {
+            return;
+        }
+        if let Some(descr) = scope_descr(cx, Ns::Type, &def) && !matches!(descr, "self type" | "macro" | "attribute macro" | "derive macro")
+            {
+             found = Some((descr, scope_span(cx, Ns::Type, &def).0));
+            }
+    });
+    found
+}
+
 
 /// The name a path expression or pattern is written with.
 fn written_name<'t>(node: Either<ast::Expr<'t>, ast::Pat<'t>>) -> &'t str {
