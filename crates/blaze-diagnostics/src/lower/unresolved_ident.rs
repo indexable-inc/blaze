@@ -66,7 +66,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
     let mut diag = if name == "self" {
         // clone: on the error path, for an error hir found
         self_value(cx, syntax, d.node.file_id, source, span.clone())
-    } else if let Some((descr, defined)) =
+    } else if let Some((descr, defined, real)) =
         scope.as_ref().and_then(|it| as_type(cx, it, source, name))
     {
         // alloc: the error's text, for an error hir found
@@ -76,7 +76,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
         let mut diag = Diag::error(Some("E0423"), message, span.clone()); // clone: on the error path, for an error hir found
         if let Some(defined) = defined {
             // alloc: the error's label, for an error hir found
-            diag.span_label(defined, format!("`{display}` defined here"));
+            let label = match real {
+                // The name is an alias (`use m::Real as Alias`): the span is `Real`'s.
+                Some(real) => format!("`{real}` (imported as `{display}`) defined here"),
+                None => format!("`{display}` defined here"),
+            };
+            diag.span_label(defined, label);
         }
         // rustc still offers the value of that name to import (`report_with_use_injections`).
         if let Some(module) = module {
@@ -116,7 +121,7 @@ fn as_type<'db>(
     scope: &hir::SemanticsScope<'db>,
     source: PathSource,
     name: &str,
-) -> Option<(&'static str, Option<Span>)> {
+) -> Option<(&'static str, Option<Span>, Option<String>)> {
     if !matches!(source, PathSource::Value | PathSource::Callee(_)) {
         return None;
     }
@@ -129,7 +134,16 @@ fn as_type<'db>(
         if let Some(descr) = scope_descr(cx, Ns::Type, &def)
             && !matches!(descr, "self type" | "macro" | "attribute macro" | "derive macro")
         {
-            found = Some((descr, scope_span(cx, Ns::Type, &def).0));
+            // The item's own name, when the scope reaches it under another (an alias).
+            // alloc: the error's text, for an error hir found
+            let real = match &def {
+                hir::ScopeDef::ModuleDef(it) => it
+                    .name(cx.db)
+                    .filter(|real| real.symbol().as_str() != name)
+                    .map(|real| real.display_no_db(cx.edition).to_string()),
+                _ => None,
+            };
+            found = Some((descr, scope_span(cx, Ns::Type, &def).0, real));
         }
     });
     found

@@ -397,3 +397,25 @@ fn main() {
 "#;
     assert_reports(&super::ui_fixture(fixture), &[error(4, &["E0425", "r#match"])]);
 }
+
+#[test]
+fn an_aliased_struct_used_as_a_value_names_the_struct_it_points_at() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+mod m {
+    pub struct Real { pub b: u8 }
+}
+
+use m::Real as Alias;
+
+fn main() {
+    let _ = Alias;
+}
+"#;
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(
+            8,
+            &["E0423", "expected value, found struct `Alias`", "`Real` (imported as `Alias`) defined here"],
+        )],
+    );
+}
