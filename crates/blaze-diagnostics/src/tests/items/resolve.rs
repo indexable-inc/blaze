@@ -322,3 +322,16 @@ assert_reports(&super::ui_fixture(fixture), &[
     error(5, &["E0423", "expected value, found struct `A`"]),
 ]);
 }
+
+#[test]
+fn a_raw_identifier_struct_used_as_a_value_is_e0423() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+struct r#match { b: u8 }
+
+fn main() {
+    let _ = r#match;
+}
+"#;
+    assert_reports(&super::ui_fixture(fixture), &[error(4, &["E0423", "expected value, found struct `r#match`"])]);
+}
+

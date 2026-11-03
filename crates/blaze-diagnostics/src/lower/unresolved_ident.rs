@@ -109,9 +109,11 @@ fn as_type<'db> (
         return None;
     }
 
+    let lookup = name.strip_prefix("r#").unwrap_or(name);
+
     let mut found = None;
     scope.process_all_names(&mut |it, def| {
-        if found.is_some() || it.symbol().as_str() != name {
+        if found.is_some() || it.symbol().as_str() != lookup {
             return;
         }
         if let Some(descr) = scope_descr(cx, Ns::Type, &def) && !matches!(descr, "self type" | "macro" | "attribute macro" | "derive macro")
