@@ -63,7 +63,7 @@ struct ModuleBuilder {
     parent: Option<u32>,
     local_names: Vec<(Name, u32)>,
     imports: Vec<ShapeImport>,
-    other_paths: Vec<ModPath>,
+    other_paths: Vec<(ModPath, bool)>,
 }
 
 struct Builder {
@@ -104,30 +104,30 @@ impl Builder {
     fn import(&mut self, module: u32, kind: PathKind, segments: &[&str]) {
         let path = path(kind, segments);
         let binds = path.segments().last().copied();
-        self.raw_import(module, ShapeImport { path, binds, is_glob: false, is_prelude: false });
+        self.raw_import(module, ShapeImport { path, binds, is_glob: false, is_prelude: false, hygienic: false });
     }
 
     fn import_as(&mut self, module: u32, kind: PathKind, segments: &[&str], alias: &str) {
         let import =
-            ShapeImport { path: path(kind, segments), binds: Some(name(alias)), is_glob: false, is_prelude: false };
+            ShapeImport { path: path(kind, segments), binds: Some(name(alias)), is_glob: false, is_prelude: false, hygienic: false };
         self.raw_import(module, import);
     }
 
     /// `use path::*;`.
     fn glob(&mut self, module: u32, kind: PathKind, segments: &[&str]) {
-        let import = ShapeImport { path: path(kind, segments), binds: None, is_glob: true, is_prelude: false };
+        let import = ShapeImport { path: path(kind, segments), binds: None, is_glob: true, is_prelude: false, hygienic: false };
         self.raw_import(module, import);
     }
 
     /// `#[prelude_import] use path::*;`.
     fn prelude_import(&mut self, module: u32, kind: PathKind, segments: &[&str]) {
-        let import = ShapeImport { path: path(kind, segments), binds: None, is_glob: true, is_prelude: true };
+        let import = ShapeImport { path: path(kind, segments), binds: None, is_glob: true, is_prelude: true, hygienic: false };
         self.raw_import(module, import);
     }
 
     /// A `pub(in path)` of one of the module's `use` items.
     fn visibility(&mut self, module: u32, kind: PathKind, segments: &[&str]) {
-        self.modules[module as usize].other_paths.push(path(kind, segments));
+        self.modules[module as usize].other_paths.push((path(kind, segments), false));
     }
 
     /// `extern crate self as alias;` in `module`; at the root it joins the extern prelude.
@@ -147,6 +147,7 @@ impl Builder {
                 .iter()
                 .map(|it| ShapeModule {
                     parent: it.parent,
+                    opaque: false,
                     local_names: it.local_names.iter().copied().collect(),
                     imports: it.imports.iter().cloned().collect(),
                     other_paths: it.other_paths.iter().copied().collect(),
@@ -684,7 +685,7 @@ fn world(bytes: &[u8], this: Crate, other: Crate) -> World {
                 (false, _) => segments.last().copied(),
             };
             let path = ModPath::from_segments(kind, segments);
-            b.raw_import(module, ShapeImport { path, binds, is_glob, is_prelude });
+            b.raw_import(module, ShapeImport { path, binds, is_glob, is_prelude, hygienic: false });
         }
         if r.next(3) == 0 {
             let kind = match r.next(4) {
@@ -695,7 +696,7 @@ fn world(bytes: &[u8], this: Crate, other: Crate) -> World {
             };
             let len = r.next(4);
             let segments: Vec<Name> = (0..len).map(|_| pick(&mut r)).collect();
-            b.modules[module as usize].other_paths.push(ModPath::from_segments(kind, segments));
+            b.modules[module as usize].other_paths.push((ModPath::from_segments(kind, segments), false));
         }
     }
     World { shape: b.build(), names, decls, variants }
@@ -859,7 +860,7 @@ impl<'w> Model<'w> {
                         }
                     }
                 }
-                for other in data.other_paths.iter() {
+                for (other, _) in data.other_paths.iter() {
                     self.resolve(module, other, ResolveMode::Other);
                 }
             }
@@ -934,4 +935,31 @@ fn partition_allocations_do_not_grow_with_edges() {
         "{} allocations, budget {PARTITION_ALLOCATIONS}",
         large_used.allocations
     );
+}
+
+/// A hygienic path (`ShapeImport::hygienic`) of kind `super` or plain 2018 reads every module
+/// around its own: def-site hygiene may start it in any of them (`DefMap::resolve_self`). So
+/// does any `super` path in or under a module a `macro` wrote (`ShapeModule::opaque`):
+/// `resolve_self` walks out past that module whatever context the keyword has.
+#[test]
+fn a_hygienic_path_reads_every_module_around_it() {
+    let (_db, this, _) = crates();
+    let mut b = Builder::new(this, Edition::Edition2021);
+    let a = b.module(Builder::ROOT, "a");
+    let inner = b.module(a, "b");
+    let deep = b.module(inner, "d");
+    let opaque = b.module(a, "o");
+    let under = b.module(opaque, "u");
+    for (module, kind, hygienic) in
+        [(inner, PathKind::Super(1), true), (deep, PathKind::Plain, true), (under, PathKind::Super(1), false)]
+    {
+        let path = path(kind, &["x"]);
+        let binds = path.segments().last().copied();
+        b.raw_import(module, ShapeImport { path, binds, is_glob: false, is_prelude: false, hygienic });
+    }
+    let mut shape = b.build();
+    shape.modules[opaque as usize].opaque = true;
+    assert_eq!(reads(&shape, inner), [Builder::ROOT, a]);
+    assert_eq!(reads(&shape, deep), [Builder::ROOT, a, inner]);
+    assert_eq!(reads(&shape, under), [Builder::ROOT, a, opaque]);
 }

@@ -1,4 +1,5 @@
-diff -ruN a/src/lib.rs b/src/lib.rs
+diff --git a/src/lib.rs b/src/lib.rs
+index 6396c0e..64e4114 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -9,6 +9,10 @@

@@ -164,10 +164,44 @@ naming its replacement (rule 11). The call sites are in the identity lane's hand
    variable rustc's dep-info says those crates read, to what the closure's build scripts say
    they read (`rerun-if-changed`, `rerun-if-env-changed`), and every implementation of a
    front-end hook past the closure to a reviewed list. No
-   executable hash is left in a template key; the front end's stores, kept expansions and
-   cargo's unit records still key by the whole executable (`blaze_cargo::serve::unit::deps::build`),
-   as their producers sit outside the code generator. What follows replaces the package
-   grain with the code generator's CodeId. The steps, in order:
+   executable hash is left in a template key.
+   The front end's stores take a second identity of the same kind (2026-11-03):
+   `blaze_codegen_code::FRONT_END` (`BLAZE_FRONT_END_CODE`), of every package the front end's
+   roots are built from (`hir-def`, `hir-ty`, `blaze-diagnostics`, `blaze-items`, whose `Goals`
+   is installed as `GoalFacts`, `blaze-item-hash`, `blaze-lower`, `blaze-macro-eval`) and of how
+   blaze was built. blaze-engine's build script works it out in the same walk as `CodegenCode`
+   (`emit_all`: one read of the workspace, one `$RUSTC -vV`, each package hashed once) and the
+   program hands it over with `blaze_cargo::serve::set_front_end_code`. It keys def-map images
+   and the check outcomes, bodies and constants served beside them, the goal store, the item
+   store and kept proc-macro expansions, so an edit to the code generator, the CLI or the lints
+   keeps every one of them. Its tests are the code generator's, per identity: dep-info coverage
+   from blaze-cargo's target directory (`blaze_codegen_code::coverage`), and reviewed hooks,
+   where a hook is a trait the identity lists or one its closure defines and names `dyn`,
+   implemented past the closure in a package the program links and built from the trait's
+   package; only the files a crate is compiled from count, read as tokens. A finer key for the
+   images alone (`hir-def` and what it is built from) is not clean: an image holds macro
+   expansions, and blaze-macro-eval, which expands, is built from `hir-ty` and `blaze-lower`.
+   What FRONT_END leaves out is in the keys beside it: a proc macro run in a wasm module keys
+   the crates that call it by its crate's code and the module (`ProcMacroExpander::code`), since
+   the module is the code generator's; a kept check's options are made of its outcome key's
+   inputs (`blaze_diagnostics::cache::Inputs::options`), not by blaze-cargo; and every package
+   that depends on one of the closure's, by any edge of the lock, is an input (its lock checksum
+   or its manifest), since cargo unifies features across what it builds together.
+   Cargo's unit records and the standard library's shared directory (which holds std units'
+   records alone) still key by the whole executable (`blaze_cargo::serve::unit::deps::build`):
+   a record is made by blaze-cargo, whose closure is every linked package but blaze-engine, so
+   a content identity of its code would move on the same edits. A record miss reruns the unit
+   against images and stores that stay. The trait solver has no identity of its own: hir-ty and
+   the vendored solver crates are in `FRONT_END`'s closure, and the goal and item stores' solver
+   version is a domain over it, so no build script runs in the front end (a `SOLVER` identity
+   worked out by hir-ty's own build script reran hir-ty and its 36 dependents on every
+   `Cargo.lock` edit; removed 2026-11-03). Where there is no checkout (a published crate, a Nix
+   unit cut down to its package), the program's build script reads the shipped tree
+   `.github/scripts/publish_crates.py` writes beside the package (`ship-code-identity`, one
+   `shipped-*-code.txt` per identity: what the checkout alone decides, finished with
+   `$CARGO_HOME`, LLVM, the environment and the compiler), and refuses, naming both, when it
+   has neither. What follows replaces the package grain with the code
+   generator's CodeId. The steps, in order:
    1. Lane comptime: const eval answers `fn_info(f).code_id` from `hir_ty_identity::code_id`
       through a table registered in `hir_ty::providers` with `inventory::submit!`; no table is
       a typed `MirEvalError` naming `f`, never a zero id.

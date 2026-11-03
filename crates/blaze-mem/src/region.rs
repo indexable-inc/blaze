@@ -110,6 +110,7 @@ impl Region {
         )?;
         let base = os::reserve_sparse(reserved).map_err(|os| MemError::Reserve { tag, bytes: reserved, os })?;
         tag::reserved(tag, reserved);
+        tag::base_pages(reserved);
         let region = Region {
             base,
             reserved,
@@ -143,6 +144,9 @@ impl Region {
         }
         .map_err(|os| MemError::Reserve { tag, bytes: reserved, os })?;
         tag::reserved(tag, reserved);
+        if pages == Pages::Base {
+            tag::base_pages(reserved);
+        }
         Ok(Region { base, reserved, committed: AtomicUsize::new(0), granule, pages, node, sparse: false, tag })
     }
 
@@ -421,7 +425,8 @@ impl Region {
     /// while they stay reserved; their contents become unspecified, and [`Region::reuse`] makes
     /// them the process's again before they are touched. Pages of the reserved pool are kept:
     /// one given back would be faulted in again on the next touch, which kills the process
-    /// when the pool has none free. Returns the bytes given back.
+    /// when the pool has none free. Returns the bytes given back: 0 when the kernel refused
+    /// them, or the target gives none back, so a caller never counts resident pages as gone.
     ///
     /// # Safety
     ///
@@ -439,8 +444,7 @@ impl Region {
         }
         // SAFETY: `[start, end)` is page-aligned, committed, and the caller says nothing
         // holds data in it.
-        unsafe { os::purge(self.at(start), end - start) };
-        end - start
+        if unsafe { os::purge(self.at(start), end - start) } { end - start } else { 0 }
     }
 
     /// Makes `[from, from + len)` (rounded out to pages), which [`Region::purge`] may have given
@@ -483,6 +487,9 @@ impl Drop for Region {
         // nothing reaches its memory.
         unsafe { os::release(self.base, self.reserved) };
         tag::released(self.tag, self.reserved);
+        if self.pages == Pages::Base {
+            tag::base_pages_released(self.reserved);
+        }
     }
 }
 

@@ -21,7 +21,7 @@
 //!
 //! ## Collecting Modules
 //!
-//! This happens in the `collector` module. In this phase, we recursively walk
+//! This happens in `facts::collect` (`module_decls`). In this phase, we recursively walk
 //! tree of modules, collect raw items from submodules, populate module scopes
 //! with defined items (so, we assign item ids in this phase) and record the set
 //! of unresolved imports and macros.
@@ -50,13 +50,16 @@
 pub mod assoc;
 pub mod attr_resolution;
 mod batch;
-#[cfg(test)]
-mod collector;
 pub(crate) mod def_site;
 pub use def_site::{
     binding_key_at, def_binding_key, import_binding_key, param_name, path_param_name,
 };
 pub use def_site::{assoc_item_is, assoc_item_key, impl_item_name};
+pub use def_site::{
+    assoc_item_binding_name, for_each_hygienic_trait_in_scope, implemented_name, implements,
+    trait_item_is_written, trait_item_name, trait_item_written, written_key, written_name,
+};
+pub use def_site::{impl_expansion, privacy_scope, variant_expansion};
 pub mod delta;
 pub mod demand;
 pub mod diagnostics;
@@ -840,6 +843,20 @@ impl std::fmt::Display for FixpointLimit {
 }
 
 impl std::error::Error for FixpointLimit {}
+
+/// The error a caught panic's payload is, when it is one of name resolution's typed stops
+/// ([`Unmaintained`], [`FixpointLimit`], [`frozen::Unreadable`]): what a driver fails the one
+/// job that asked with (rule 17). `None` for any other payload.
+// dyn: a caught panic's payload, read once
+pub fn stopped(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    if let Some(it) = Unmaintained::of_payload(payload) {
+        return Some(it.to_string()); // alloc: an error, once
+    }
+    if let Some(it) = FixpointLimit::of_payload(payload) {
+        return Some(it.to_string()); // alloc: as above
+    }
+    frozen::Unreadable::of_payload(payload).map(|it| it.to_string()) // alloc: as above
+}
 
 #[blaze_query::tracked(returns(ref))]
 pub fn block_def_map<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {

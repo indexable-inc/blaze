@@ -1,10 +1,13 @@
-//! Tests of the per-module resolver against the old collector, and the helpers they share.
+//! Tests of the per-module resolver, and the helpers they share.
 //!
-//! The old and the new def map of one crate are made by different queries, so the `ModuleId`s
-//! of their modules differ (tracked structs), and with them every item id whose loc names its
-//! module. [`project`] maps a def map to a canonical form that names a module of the map by its
-//! path and origin and every item by its kind, its container's canonical form and its `AstId`,
-//! orders what the notes' §8 lets differ in order, and keeps everything else as it is.
+//! A crate's map as `facts::collect_crate` makes it, the maintained map `crate_local_def_map`
+//! serves (`nameres::delta`) and a fresh maintainer's are three maps of the same inputs, and a
+//! block's map built twice is two: [`compare_db`] checks they agree. Each is made by a query of
+//! its own, so the `ModuleId`s of their modules differ (tracked structs), and with them every
+//! item id whose loc names its module. [`project`] maps a def map to a canonical form that names
+//! a module of the map by its path and origin and every item by its kind, its container's
+//! canonical form and its `AstId`, orders what the notes' §8 lets differ in order, and keeps
+//! everything else as it is.
 //! [`compare`] says, field by field, where two such forms differ.
 
 mod active;
@@ -36,7 +39,6 @@ use intern::Symbol;
 use la_arena::Idx;
 use span::Edition;
 use syntax::ast;
-use triomphe::Arc;
 
 use crate::{
     AdtId, BlockIdLt, BuiltinDeriveImplId, BuiltinType, DefWithBodyId, ExternBlockId,
@@ -51,7 +53,7 @@ use crate::{
     item_tree::TreeId,
     nameres::{
         BlockInfo, DefMap, DefMapCrateData, DefMapPair, LocalDefMap, ModuleData, ModuleOrigin,
-        ModulesSlot, ScopeSlot, collector, crate_local_def_map,
+        ModulesSlot, ScopeSlot, crate_local_def_map,
         diagnostics::{DefDiagnostic, DefDiagnosticKind},
     },
     per_ns::Item,
@@ -61,33 +63,10 @@ use crate::{
     visibility::{Visibility, VisibilityExplicitness},
 };
 
-/// The crate's def map as the old collector made it: `crate_local_def_map` before the per-module
-/// resolver (`nameres.rs`, without `frozen`, which serves and checks images and is the same for
-/// both). A query of its own, so the tracked structs it makes live in one.
+/// The crate's def map as the per-module resolver makes it (`facts::collect_crate`), the
+/// reference the maintained map is checked against.
 #[blaze_query::tracked(returns(ref))]
-pub(in crate::nameres) fn old_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
-    let root_file_id = krate.root_file_id(db);
-    let module_data = ModuleData::new(
-        ModuleOrigin::CrateRoot { definition: root_file_id },
-        Visibility::Public,
-        None,
-    );
-    let def_map = DefMap::empty(
-        db,
-        krate,
-        Arc::new(DefMapCrateData::new(krate.data(db).edition)),
-        module_data,
-        None,
-    );
-    let (mut def_map, local_def_map) =
-        collector::collect_defs(db, def_map, TreeId::new(root_file_id.into(), None), None);
-    def_map.hand_over_scopes(db);
-    DefMapPair::new(db, def_map, local_def_map)
-}
-
-/// The crate's def map as the per-module resolver makes it, without `frozen`.
-#[blaze_query::tracked(returns(ref))]
-pub(in crate::nameres) fn new_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
+pub(in crate::nameres) fn facts_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
     blaze_mem::frame::task(Tag::Nameres, |frame| {
         let (def_map, local_def_map) = super::collect_crate(db, frame, krate);
         DefMapPair::new(db, def_map, local_def_map)
@@ -113,23 +92,10 @@ fn empty_block_def_map(db: &Db, block_id: BlockIdLt<'_>) -> (DefMap, TreeId) {
     (def_map, TreeId::new(ast_id.file_id, Some(block_id)))
 }
 
-/// `block`'s def map as the old collector made it (`block_def_map` before the resolver).
+/// `block`'s def map made again, as `block_def_map` makes it, in a query of its own: the same
+/// inputs give the same map.
 #[blaze_query::tracked(returns(ref))]
-pub(super) fn old_block_def_map<'db>(
-    db: &'db Db,
-    block_id: BlockIdLt<'db>,
-) -> DefMap {
-    let (def_map, tree_id) = empty_block_def_map(db, block_id);
-    let krate = def_map.krate;
-    let local = crate_local_def_map(db, krate).local(db);
-    let (mut def_map, _) = collector::collect_defs(db, def_map, tree_id, Some(local));
-    def_map.hand_over_scopes(db);
-    def_map
-}
-
-/// `block`'s def map as the per-module resolver makes it.
-#[blaze_query::tracked(returns(ref))]
-pub(super) fn new_block_def_map<'db>(
+pub(super) fn block_def_map_again<'db>(
     db: &'db Db,
     block_id: BlockIdLt<'db>,
 ) -> DefMap {
@@ -640,7 +606,7 @@ impl<'a> Projector<'a> {
         };
         // A name two globs give different items is ambiguous (an error where a path uses it):
         // which of them it is bound to follows the order the globs were resolved in, which the
-        // collectors don't share. Its glob binding is listed with the other items it is
+        // maps compared need not share. Its glob binding is listed with the other items it is
         // ambiguous with, so both compare as the same set.
         let ambiguous: HashSet<(Name, u8), Global> = glob_ambiguities
             .iter()
@@ -1269,34 +1235,31 @@ fn bodies(db: &Db, def_map: &DefMap) -> Vec<DefWithBodyId> {
     out
 }
 
-/// Compares the old and the new def map of every crate of `db`, and of every block of their
-/// bodies (found through the database's own def maps, which both sides of a block share as
-/// upstream), appending each difference to `out` under `name`.
+/// Compares the maps of every crate of `db`: the maintained one with a fresh maintainer's and
+/// with `facts::collect_crate`'s, as `delta::tests::check_db` does (§6's fourth difference left
+/// out where an attribute is unresolved); and the map of every block of their bodies with the
+/// block's map built again ([`block_def_map_again`]). Appends each difference to `out` under
+/// `name`.
 pub(super) fn compare_db(db: &TestDB, name: &str, exempt: &Exempt, out: &mut String) {
+    crate::nameres::delta::tests::check_db(db, name, exempt, true, out);
     for &krate in all_crates(db).iter() {
-        let old = old_crate_local_def_map(db, krate);
-        let new = new_crate_local_def_map(db, krate);
-        assert_handed_over(db, new.def_map(db), name);
-        let diff = compare(
-            &project(db, old.def_map(db), Some(old.local(db)), exempt),
-            &project(db, new.def_map(db), Some(new.local(db)), exempt),
-        );
-        if !diff.is_empty() {
-            _ = writeln!(out, "== {name}: crate {:?}\n{diff}", krate.extra_data(db).display_name);
-        }
-
+        assert_handed_over(db, facts_crate_local_def_map(db, krate).def_map(db), name);
         let mut maps = vec![crate_local_def_map(db, krate).def_map(db)];
         while let Some(map) = maps.pop() {
             for body in bodies(db, map) {
                 for (block, real) in Body::of(db, body).blocks(db) {
                     let block = block.to_db(db);
-                    let old = old_block_def_map(db, block);
-                    let new = new_block_def_map(db, block);
-                    assert_handed_over(db, new, name);
+                    let again = block_def_map_again(db, block);
+                    assert_handed_over(db, again, name);
                     let diff =
-                        compare(&project(db, old, None, exempt), &project(db, new, None, exempt));
+                        compare(&project(db, real, None, exempt), &project(db, again, None, exempt));
                     if !diff.is_empty() {
-                        _ = writeln!(out, "== {name}: block {:?} of {body:?}\n{diff}", block.ast_id(db));
+                        _ = writeln!(
+                            out,
+                            "== {name}: block {:?} of {body:?}: `block_def_map` (old) and the \
+                             block's map built again (new) differ\n{diff}",
+                            block.ast_id(db)
+                        );
                     }
                     maps.push(real);
                 }

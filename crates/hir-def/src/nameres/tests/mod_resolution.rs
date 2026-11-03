@@ -16,7 +16,7 @@ pub use self::bar::Baz;
 //- /foo/bar.rs
 pub struct Baz;
 ",
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : _
             - foo : type
@@ -39,7 +39,7 @@ mod n2;
 //- /n1/n2.rs
 struct X;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - n1 : type
 
@@ -74,7 +74,7 @@ mod iterator;
 //- /iter/traits/iterator.rs
 pub trait Iterator;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - iter : type
             - prelude : type
@@ -107,7 +107,7 @@ use self::foo::Bar;
 //- /foo/mod.rs
 pub struct Bar;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (import) value (import)
             - foo : type
@@ -137,7 +137,7 @@ pub struct Foo;
 //- /async/async.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (import) value (import)
             - r#async : type
@@ -174,7 +174,7 @@ pub struct Foo;
 //- /async/async.rs
 pub struct Bar;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (import) value (import)
             - Foo : type (import) value (import)
@@ -205,7 +205,7 @@ use self::foo::Bar;
 //- /bar/baz/foo.rs
 pub struct Bar;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (import) value (import)
             - foo : type
@@ -231,7 +231,7 @@ use self::bar::Baz;
 //- /foo/baz.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -260,7 +260,7 @@ use self::bar::Baz;
 //- /baz.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -286,7 +286,7 @@ pub struct Baz;
 //- /bar/baz/module.rs
 use super::Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type value
             - foo : type
@@ -308,7 +308,7 @@ mod foo;
 //- /module/mod.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -332,7 +332,7 @@ pub mod foo_bar;
 //- /sub.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -359,7 +359,7 @@ pub mod foo_bar;
 //- /sub.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -386,7 +386,7 @@ mod bar;
 //- /bar.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -410,7 +410,7 @@ mod foo;
 //- /module/bar/mod.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -431,7 +431,7 @@ mod foo;
 //- /module/bar/mod.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -452,7 +452,7 @@ mod foo { mod bar; }
 //- /models/bar.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -475,7 +475,7 @@ mod foo { mod bar; }
 //- /foo/bar.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -499,7 +499,7 @@ mod foo { mod bar; }
 //- /models/db/bar.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -526,7 +526,7 @@ mod foo {
 //- /models/db/users.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -553,7 +553,7 @@ mod foo {
 //- /users.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -577,7 +577,7 @@ mod foo;
 //- /foo.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -597,7 +597,7 @@ mod foo { mod bar; }
 //- /models/bar.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -624,7 +624,7 @@ use self::foo::bar::Baz;
 //- /foo/baz.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type (import) value (import)
             - foo : type
@@ -655,7 +655,7 @@ use self::bar::baz::Baz;
 //- /foo/bar/qwe.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -689,7 +689,7 @@ use self::bar::baz::Baz;
 //- /foo/bar/qwe.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -723,7 +723,7 @@ use self::bar::baz::Baz;
 //- /bar/baz.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
 
@@ -754,7 +754,7 @@ pub mod submod;
 //- /module/submod.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - module : type
 
@@ -781,7 +781,7 @@ mod a {
 //- /a/b/c.rs
 struct X;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - a : type
 
@@ -812,7 +812,7 @@ mod a {
 //- /a/d/e/c.rs
 struct X;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - a : type
 
@@ -868,7 +868,7 @@ pub mod core {}
 //- /lib.rs crate:core
 pub mod hash { pub trait Hash {} }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Hash : type (import)
             - core : type
@@ -891,7 +891,7 @@ mod module;
 
 struct AlsoShouldNotAppear;
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
         "#]],
     )
@@ -919,7 +919,7 @@ pub enum Enum {
     Variant,
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - NoAssoc : _
             - const_based : _
@@ -955,7 +955,7 @@ pub trait Trait {
     m!(MACRO_CONST);
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - ASSOC_CONST : _
             - AssocType : _
@@ -986,7 +986,7 @@ pub trait Trait {
     m!(MACRO_CONST);
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - module : type
 
@@ -1015,7 +1015,7 @@ pub trait Trait {
     m!(MACRO_CONST);
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - ASSOC_CONST : value (import)
             - AssocType : type (import)
@@ -1039,7 +1039,7 @@ pub trait Trait {
     m!(MACRO_CONST);
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - ASSOC_CONST : value (glob)
             - AssocType : type (glob)

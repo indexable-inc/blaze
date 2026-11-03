@@ -277,7 +277,7 @@ fn diverging_expression_1() {
             let x: u32 = { let y: u32 = { loop {}; }; };
         }
         ",
-        expect![[r#"
+        &expect![[r#"
             11..39 '{     ...urn; }': !
             21..22 'x': u32
             30..36 'return': !
@@ -326,7 +326,7 @@ fn diverging_expression_2() {
             let x: u32 = { loop {}; "foo" };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             11..84 '{     ..." }; }': !
             54..55 'x': u32
             63..81 '{ loop...foo" }': u32
@@ -365,7 +365,7 @@ fn diverging_expression_3_break() {
             let x: u32 = { while true { return; }; };
         }
         ",
-        expect![[r#"
+        &expect![[r#"
             11..85 '{     ...} }; }': ()
             54..55 'x': u32
             63..82 '{ loop...k; } }': u32
@@ -468,7 +468,7 @@ fn let_else_must_diverge() {
             };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             7..54 '{     ...  }; }': ()
             17..18 '1': i32
             17..18 '1': i32
@@ -483,7 +483,7 @@ fn let_else_must_diverge() {
             let 1 = 2 else {};
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             7..33 '{     ... {}; }': ()
             17..18 '1': i32
             17..18 '1': i32
@@ -567,7 +567,7 @@ fn not_a_read() -> ! {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             21..100 '{     ...   } }': !
             27..98 'unsafe...     }': !
             48..49 'x': *const !
@@ -593,7 +593,7 @@ fn not_a_read_implicit() -> ! {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             30..106 '{     ...   } }': !
             36..104 'unsafe...     }': !
             57..58 'x': *const !
@@ -619,7 +619,7 @@ fn not_a_read_guide_coercion() -> ! {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             36..116 '{     ...   } }': !
             42..114 'unsafe...     }': !
             63..64 'x': *const !
@@ -646,7 +646,7 @@ fn empty_match() -> ! {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             22..108 '{     ...   } }': !
             28..106 'unsafe...     }': !
             49..50 'x': *const !
@@ -674,7 +674,7 @@ fn field_projection() -> ! {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             27..113 '{     ...   } }': !
             33..111 'unsafe...     }': !
             54..55 'x': *const (!, ())
@@ -701,7 +701,7 @@ fn covered_arm() -> ! {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             22..107 '{     ...   } }': !
             28..105 'unsafe...     }': !
             49..50 'x': *const !
@@ -731,7 +731,7 @@ fn uncovered_arm() -> ! {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             24..109 '{     ...   } }': !
             30..107 'unsafe...     }': !
             51..52 'x': *const !
@@ -761,7 +761,7 @@ fn coerce_ref_binding() -> ! {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             29..114 '{     ...   } }': !
             35..112 'unsafe...     }': !
             56..57 'x': *const !
@@ -787,7 +787,7 @@ fn coerce_ref_mut_binding() -> ! {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             33..120 '{     ...   } }': !
             39..118 'unsafe...     }': !
             60..61 'x': *mut !
@@ -860,7 +860,7 @@ fn make_up_a_pointer<T>() -> *const T {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             38..116 '{     ...   } }': *const T
             44..114 'unsafe...     }': *const T
             65..66 'x': *const !
@@ -885,7 +885,7 @@ fn foo() {
     };
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             9..84 '{     ...  }; }': ()
             19..20 'n': i32
             23..81 'match ...     }': i32

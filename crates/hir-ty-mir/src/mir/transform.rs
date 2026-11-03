@@ -256,7 +256,7 @@ pub(super) fn run_one<'db>(
 
 /// The constant behind a promoted `&expr` of `def` after the passes: what the code generator
 /// evaluates for it with the interpreter.
-#[blaze_query::tracked(returns(as_ref), lru = 0)]
+#[blaze_query::tracked(returns(as_ref), lru = 0, mem_tag = Mir)]
 pub fn runtime_promoted_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,

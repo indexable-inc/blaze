@@ -223,6 +223,13 @@ impl Library {
         self.id
     }
 
+    /// What the macros of the proc-macro crate whose code is `code` run in this module: the
+    /// crate's code and the module's id, so a module the code generator made otherwise from the
+    /// same source (a fix of a backend, a stencil or LLVM) runs other code.
+    pub(crate) fn runs(&self, code: ContentId) -> ContentId {
+        blaze_ids::Hasher::new("the code a proc-macro crate's macros run in its wasm module 1").part(&code.0).part(&self.id.0).finish()
+    }
+
     /// Runs the macro at `index` (of `run::functions`) on the one expansion of `expansions`,
     /// with the calling crate's `env`, from the statics `preset` (what the calls before it
     /// left, as [`Ran::statics`] said each), in the working directory `cwd` (the call's, which

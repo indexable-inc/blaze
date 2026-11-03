@@ -60,10 +60,14 @@ items' `key::def_key`), never a salsa ID. Every definition the codec writes goes
 lets a sink take it over is requested from db-ty. A form past 65 536 words is not stored.
 
 The goal's key hashes, in domain `"blaze v2 goal 1"`, the solver version, the crate's key and
-the words. The solver version hashes `harness/toolchain`, the two vendored solver crates'
-`PATCHES.md` and every patch (embedded with `include_bytes!`; a test fails when the
-directories list a file the version does not), and `build`, the content ID of the front end's
-code that `hir_def::deps::serve` is given. The crate's key is lane items': its identity and
+the words. The solver version hashes `build`, the front end's code identity that
+`hir_def::deps::serve` is given (`blaze_codegen_code::FRONT_END`, worked out by blaze-engine's
+build script and handed over at startup). Its closure has hir-ty and the vendored solver crates
+in it, their `src/`, `PATCHES.md` and patches among them, and `harness/toolchain`, so a solver
+edit is another version with no list to keep (since 2026-11-03: first a hand-kept
+`include_bytes!` list that missed patches, then a `SOLVER` identity worked out by a build script
+of hir-ty's own, which reran hir-ty and every package after it on each `Cargo.lock` edit). The
+crate's key is lane items': its identity and
 its lang items, which an interner reads when it is made, outside any capture.
 
 **Records** (`goal_store/record.rs`), as `hir_def::deps::serve` keeps images:
@@ -162,7 +166,9 @@ names by count after every build: the driver shows it under `-v`.
 - `a_goal_with_a_read_that_is_no_fact_is_never_stored`;
 - `a_database_finds_only_its_own_store`;
 - `a_lookup_or_offer_with_no_store_allocates_nothing` (`blaze_alloc_count::assert_at_most(0)`);
-- `the_solver_version_covers_every_patch`.
+- `a_solver_source_edit_changes_the_identity_and_misses_the_goal_store`: a fixture's front-end
+  identity before and after a solver source edit; the answer kept under the first misses under
+  the second and is found again under the first.
 
 ### 3.6 Prior art
 

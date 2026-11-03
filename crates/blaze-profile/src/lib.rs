@@ -59,6 +59,7 @@ pub mod hot;
 pub mod identity;
 pub mod live;
 pub mod perf;
+pub mod reading;
 pub mod sampler;
 pub mod schema;
 pub mod slow;
@@ -293,10 +294,16 @@ fn carry_with_fiber_jobs() {
     });
 }
 
-/// The job running on this thread, the time and the build, as a pool job is given to the pool:
-/// its spawner, the start of its wait for a core, and the build it works for.
+/// The job running on this thread, the time, the build and the span open, as a pool job is
+/// given to the pool: its spawner, the start of its wait for a core, the build it works for,
+/// and its creator.
 fn given() -> blaze_graph::sched::Given {
-    blaze_graph::sched::Given { spawner: flight::running_job(), at: clock::ticks(), build: flight::current_build() }
+    blaze_graph::sched::Given {
+        spawner: flight::running_job(),
+        at: clock::ticks(),
+        build: flight::current_build(),
+        creator: flight::giving_span(),
+    }
 }
 
 /// Opens and enters the span of a pool worker's own work between jobs ([`span::Worker`]),
@@ -311,9 +318,11 @@ fn worker_ended(span: u64) {
 }
 
 /// Opens and enters the span of a job of `kind` beginning on this thread ([`span::Job`]), named
-/// by the job its switches name: the span of the job it runs inside, for [`job_ended`].
+/// by the job its switches name and by the span it was given inside: the span of the job it
+/// runs inside, for [`job_ended`].
 fn job_began(kind: &'static str) -> u64 {
-    flight::job_began(span::open_raw(span::Job { kind: span::Name::kept(kind), job: flight::running_job() }))
+    let job = span::Job { kind: span::Name::kept(kind), job: flight::running_job(), creator: flight::begun_creator() };
+    flight::job_began(span::open_raw(job))
 }
 
 /// Closes the span of the job that ended on this thread, its last segment if it parked, and
@@ -367,6 +376,10 @@ fn idled(idle: blaze_graph::sched::Idle) {
         IdleReason::Nothing => (WaitedOn::Nothing, 0),
         IdleReason::Until(at) => (WaitedOn::Until, at),
     };
+    if idle.began {
+        // What it folded is written before it sleeps, so a flush has it.
+        flight::flush_folds();
+    }
     flight::switched(flight::Switch {
         event: if idle.began { Switched::Idle } else { Switched::Woke },
         job: 0,
@@ -381,7 +394,7 @@ fn observed(switch: blaze_graph::sched::Switch) {
     use blaze_graph::sched::{SwitchEvent, Wait};
     use flight::{Switched, WaitedOn};
     let (event, waited) = match switch.event {
-        SwitchEvent::Began { given } => return flight::job_begins(given.spawner, given.at, given.build),
+        SwitchEvent::Began { given } => return flight::job_begins(given.spawner, given.at, given.build, given.creator),
         SwitchEvent::Started => (Switched::Started, None),
         SwitchEvent::Ready => (Switched::Ready, None),
         SwitchEvent::Resumed => (Switched::Resumed, None),
@@ -429,6 +442,7 @@ pub fn built(built: Built) {
     plot(Plot::MemoMisses, built.misses);
     plot(Plot::Joined, built.joined);
     flight::mark(built.serial);
+    flight::flush_folds();
     hot::read::mark();
 }
 

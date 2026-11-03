@@ -60,7 +60,7 @@ pub enum BinaryEnd {
     /// It exited otherwise: the status as the command says it (`exit status: 101`, `signal: 11
     /// (SIGSEGV)`).
     Failed { status: String },
-    /// The command stopped it: a test elsewhere failed and `--no-fail-fast` was not given.
+    /// The command stopped it: a test elsewhere failed under `--fail-fast`.
     Stopped,
     /// It could not be started: why.
     NeverRan { why: String },
@@ -77,6 +77,9 @@ pub enum Event {
     UnitFailed { id: u32 },
     /// The build is over.
     BuildEnded { ok: bool },
+    /// A test executable or doc test never built: its unit, the unit whose failure held it
+    /// back (itself when its own compile failed), and why that one failed. The summary lists it.
+    Unbuilt { unit: String, behind: String, why: String },
     /// A test executable is known and waits for its turn. `binary` is the driver's dense index;
     /// `order` sorts it among the others as cargo orders them; `rerun` is what reruns it.
     BinaryQueued { binary: u32, label: String, order: String, rerun: String },
@@ -188,6 +191,8 @@ pub struct TestView {
     slowest: Vec<Timed>,
     failures: Vec<Failure>,
     stopping: Option<String>,
+    /// The test units that never built, as (unit, behind, why), in the order said.
+    unbuilt: Vec<(String, String, String)>,
     /// Lines made to print above the region and not yet taken, each a block of styled lines
     /// to wrap to the width it is taken at.
     above: Vec<Above>,
@@ -223,6 +228,7 @@ impl TestView {
             slowest: Vec::with_capacity(SLOWEST + 1), // alloc: once a run
             failures: Vec::new(),                     // alloc: one a failure
             stopping: None,
+            unbuilt: Vec::new(), // alloc: none until a test unit did not build
             above: Vec::new(), // alloc: drained at every draw
         }
     }
@@ -265,6 +271,7 @@ impl TestView {
                 self.build = Build::Ended { ok: ok && self.units_failed == 0, at: now };
                 self.compiling.clear();
             }
+            Event::Unbuilt { unit, behind, why } => self.unbuilt.push((unit, behind, why)),
             Event::BinaryQueued { binary, label, order, rerun } => {
                 let at = binary as usize;
                 // The driver's indexes are dense from 0; one past is a row made for it.
@@ -656,8 +663,8 @@ impl TestView {
                         Span::raw(" "),
                     ];
                     let took = took.map(duration).unwrap_or_default();
-                    // clone: the box's footer names the executable
-                    self.boxed(&mut lines, title, took, self.label(binary).to_owned(), &output, width);
+                    // The box's footer names the executable.
+                    self.boxed(&mut lines, title, &took, self.label(binary), &output, width);
                 }
                 Above::Crashed { binary, status, output } => {
                     let title = vec![
@@ -668,7 +675,7 @@ impl TestView {
                     ];
                     let status = fit(&status, width / 2);
                     let footer = self.binaries.get(binary as usize).map_or_else(String::new, |it| format!("rerun: blaze test {}", it.rerun)); // alloc: a footer
-                    self.boxed(&mut lines, title, status, footer, &output, width);
+                    self.boxed(&mut lines, title, &status, &footer, &output, width);
                 }
             }
         }
@@ -684,7 +691,7 @@ impl TestView {
 
     /// A box: `title` and `right` on its top edge, `footer` on its bottom, and `output` inside:
     /// the panic's place and message first, then the last [`OUTPUT_LINES`] of the rest.
-    fn boxed(&self, lines: &mut Vec<Line<'static>>, title: Vec<Span<'static>>, right: String, footer: String, output: &str, width: usize) {
+    fn boxed(&self, lines: &mut Vec<Line<'static>>, title: Vec<Span<'static>>, right: &str, footer: &str, output: &str, width: usize) {
         let edge = self.style(Color::Red);
         if width < 16 {
             lines.extend(wrap(title, width));
@@ -740,7 +747,7 @@ impl TestView {
                 lines.push(Line::from(line));
             }
         }
-        let footer = fit(&footer, inner.saturating_sub(4));
+        let footer = fit(footer, inner.saturating_sub(4));
         let mut bottom = vec![Span::styled("╰─", edge)];
         if !footer.is_empty() {
             bottom.push(Span::styled(format!(" {footer} "), self.dim())); // alloc: a line
@@ -838,6 +845,24 @@ impl TestView {
                     vec![Span::styled(head, self.dim()), Span::styled(format!("blaze test {}", it.rerun), self.style(Color::Cyan))], // alloc: once a failure
                     width,
                 ));
+            }
+        }
+        // Each test executable that never built, and the failure that held it back.
+        if !self.unbuilt.is_empty() {
+            lines.push(Line::default());
+            for (at, (unit, behind, why)) in self.unbuilt.iter().enumerate() {
+                let head = if at == 0 { " unbuilt " } else { "         " };
+                let held = match behind == unit {
+                    true => format!("  {why}"),              // alloc: once an unbuilt test
+                    false => format!("  behind {behind} ({why})"), // alloc: once an unbuilt test
+                };
+                let line = vec![
+                    Span::styled(head, self.style(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled("✘ ", self.style(Color::Red)),
+                    Span::styled(unit.clone(), Style::new().add_modifier(Modifier::BOLD)), // clone: once an unbuilt test
+                    Span::styled(held, self.dim()),
+                ];
+                lines.extend(wrap(line, width));
             }
         }
         lines.push(Line::default());

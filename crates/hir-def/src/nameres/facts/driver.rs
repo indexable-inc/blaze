@@ -28,6 +28,7 @@ use crate::{
     nameres::{
         BuiltinShadowMode, DefMap, DefMapCrateData, DeriveHelpers, DiagnosticsByModule,
         LocalDefMap, MacroSubNs, ModuleData, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot,
+        def_site,
         diagnostics::{DefDiagnostic, DefDiagnosticKind, is_glob_of_non_module},
         uses::{DeriveHelperUse, MacroCallRecord, MacroVia, NameRecords, Use},
     },
@@ -49,7 +50,7 @@ use super::{
     unit::Unit,
 };
 
-/// The old loop's bound on expansion rounds (`collector::FIXED_POINT_LIMIT`).
+/// The bound on expansion rounds (the old loop's `FIXED_POINT_LIMIT`).
 pub(crate) const FIXED_POINT_LIMIT: u32 = 8192;
 
 /// The error of a resolution of `krate` (a block's when `block`) that passed
@@ -104,10 +105,10 @@ pub(crate) fn fixpoint_limit<'a>(
 // The round queries.
 
 /// Every module of the round in the round's module order: round 0's DFS preorder of
-/// `module_decls` from the root (the old map's insertion order), then each later round's new
-/// modules in the order their steps declared them, steps in module order. With them, the
-/// round's active set (`nameres-core.md` §9): read off the steps of the round before that ran,
-/// so a module no step touched costs a copy of its columns and no query.
+/// `module_decls` from the root (the order collecting items in source order inserts them),
+/// then each later round's new modules in the order their steps declared them, steps in module
+/// order. With them, the round's active set (`nameres-core.md` §9): read off the steps of the
+/// round before that ran, so a module no step touched costs a copy of its columns and no query.
 pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundModules {
     let krate = round.krate(db);
     let r = round.round(db);
@@ -435,6 +436,7 @@ pub(crate) fn import_shape(db: &Db, frame: &Frame, round: RoundKey) -> ImportSha
         }
         out.push(ShapeModule {
             parent: row.parent.map(|parent| index_of(modules, parent)),
+            opaque: def_site::origin_key(db, &row.origin).is_some(),
             local_names: scratch.local_names.as_slice().into(),
             imports: scratch.imports.as_slice().into(),
             other_paths: scratch.other_paths.as_slice().into(),
@@ -473,7 +475,7 @@ fn shapes(op: &DeclOp, module: ModuleId, root: ModuleId) -> bool {
 struct ShapeScratch<'f> {
     local_names: FrameVec<'f, (Name, u32)>,
     imports: FrameVec<'f, ShapeImport>,
-    other_paths: FrameVec<'f, ModPath>,
+    other_paths: FrameVec<'f, (ModPath, bool)>,
 }
 
 impl<'f> ShapeScratch<'f> {
@@ -502,17 +504,19 @@ impl<'f> ShapeScratch<'f> {
                     binds: if is_glob { None } else { import.bound_name() },
                     is_glob,
                     is_prelude: import.source.is_prelude,
+                    hygienic: !import.ctxt.is_root(),
                 });
                 // The use trees of one `use` item share its visibility: kept once.
-                if let RawVisibility::Module(path, _) = &import.visibility
+                if let RawVisibility::Module(path, _, ctxt) = &import.visibility
                     && !path.segments().is_empty()
-                    && self.other_paths.last() != Some(path)
+                    && self.other_paths.last() != Some(&(*path, !ctxt.is_root()))
                 {
-                    self.other_paths.push(*path);
+                    self.other_paths.push((*path, !ctxt.is_root()));
                 }
             }
+            // By text: the graph's paths are, and a hygienic path's keyed lookup is one of them.
             &DeclOp::PushChild { parent, name, child } if parent == module => {
-                self.local_names.push((name, index_of(modules, child)));
+                self.local_names.push((name.unkeyed(), index_of(modules, child)));
             }
             // `extern crate self as n` binds `n` to the crate root.
             DeclOp::Update {
@@ -1262,15 +1266,16 @@ mod tests {
     use super::super::{
         queries::{self, RoundKey, RoundKind},
         tests::{
-            Exempt, compare, compare_fixture, fixture_db, new_block_def_map,
-            new_crate_local_def_map, old_block_def_map, old_crate_local_def_map, project,
+            Exempt, block_def_map_again, compare, compare_fixture, facts_crate_local_def_map,
+            fixture_db, project,
         },
     };
     use crate::{
         DefWithBodyId, ModuleDefId,
         expr_store::Body,
         nameres::{
-            ModuleOrigin, crate_local_def_map,
+            crate_local_def_map,
+            delta::tests::module_path,
             uses::{NameRecords, Used},
         },
         per_ns::PerNs,
@@ -1290,14 +1295,16 @@ mod tests {
         panic!("no final round in 64: {kinds:?}");
     }
 
-    fn assert_same_as_old(name: &str, fixture: &str) {
+    fn assert_maps_agree(name: &str, fixture: &str) {
         let mut out = String::new();
         compare_fixture(name, fixture, &Exempt::NONE, &mut out);
         assert!(out.is_empty(), "{out}");
     }
 
+    /// Round 0 lists the modules in tree order, each before its children and they before its
+    /// next sibling: the order collecting the items in source order inserts them.
     #[test]
-    fn round_zero_order_is_the_old_insertion_order() {
+    fn round_zero_order_is_the_tree_order() {
         let db = fixture_db(
             r#"
 //- /lib.rs
@@ -1315,15 +1322,22 @@ pub struct S;
 "#,
         );
         let krate = db.fetch_test_crate();
-        let old = old_crate_local_def_map(&db, krate).def_map(&db);
-        let old: Vec<ModuleOrigin> = old.modules(&db).map(|(_, data)| data.origin).collect();
-        let new: Vec<ModuleOrigin> = queries::round_modules(&db, RoundKey::new(&db, krate, 0))
+        let map = crate_local_def_map(&db, krate).def_map(&db);
+        let path = |origin| {
+            let (id, _) = map
+                .modules(&db)
+                .find(|(_, data)| data.origin == origin)
+                .unwrap_or_else(|| panic!("no module of the map has origin {origin:?}"));
+            module_path(&db, id)
+        };
+        let order: Vec<String> = queries::round_modules(&db, RoundKey::new(&db, krate, 0))
             .rows
             .iter()
-            .map(|row| row.origin)
+            .map(|row| path(row.origin))
             .collect();
-        assert_eq!(new.len(), 7, "{new:#?}");
-        assert_eq!(old, new);
+        let expected =
+            ["crate", "crate::a", "crate::a::inner", "crate::b", "crate::b::c", "crate::b::d", "crate::e"];
+        assert_eq!(order, expected);
     }
 
     #[test]
@@ -1382,7 +1396,7 @@ crate::make!();
             round_kinds(&db, db.fetch_test_crate()),
             [RoundKind::Normal, RoundKind::Normal, RoundKind::Final]
         );
-        assert_same_as_old("round_kinds_progress", fixture);
+        assert_maps_agree("round_kinds_progress", fixture);
     }
 
     /// The round count of a macro chain behind a glob: the call the expansion makes resolves
@@ -1410,7 +1424,7 @@ outer!();
         let def_map = crate_local_def_map(&db, krate).def_map(&db);
         let scope = def_map.module(&db, def_map.root).scope(&db);
         assert_ne!(scope.get(&Name::new_root("Made")), PerNs::none(), "`Made` through the glob");
-        assert_same_as_old("round_kinds_of_a_macro_chain_through_a_glob", fixture);
+        assert_maps_agree("round_kinds_of_a_macro_chain_through_a_glob", fixture);
     }
 
     #[test]
@@ -1430,7 +1444,7 @@ concat!(not_defined!());
             round_kinds(&db, db.fetch_test_crate()),
             [RoundKind::Normal, RoundKind::EagerWithErrors, RoundKind::Normal, RoundKind::Final]
         );
-        assert_same_as_old("round_kinds_eager_with_errors", fixture);
+        assert_maps_agree("round_kinds_eager_with_errors", fixture);
     }
 
     #[test]
@@ -1454,13 +1468,13 @@ struct Foo;
                 RoundKind::Final
             ]
         );
-        assert_same_as_old("round_kinds_unresolved_attribute", fixture);
+        assert_maps_agree("round_kinds_unresolved_attribute", fixture);
     }
 
     #[test]
-    fn collect_crate_equals_the_old_collector() {
-        assert_same_as_old(
-            "collect_crate_equals_the_old_collector",
+    fn collect_crate_equals_the_maintained_map() {
+        assert_maps_agree(
+            "collect_crate_equals_the_maintained_map",
             r#"
 //- /lib.rs
 mod a;
@@ -1490,13 +1504,12 @@ macro_rules! exported { () => { pub struct Exported; } }
         );
     }
 
-    /// The old collector settles glob ambiguities when collection ends; a crate's scopes are
-    /// handed over by `scc_state`, which must settle them itself at the final round.
+    /// Glob ambiguities are settled when collection ends; a crate's scopes are handed over by
+    /// `scc_state`, which must settle them itself at the final round: `still`'s `X` is
+    /// ambiguous between its two globs, and the root's is `c::X`, which shadows its globs.
     #[test]
-    fn glob_ambiguities_are_settled_as_the_old_collector_settles_them() {
-        assert_same_as_old(
-            "glob_ambiguities_are_settled_as_the_old_collector_settles_them",
-            r#"
+    fn glob_ambiguities_are_settled_at_the_final_round() {
+        let fixture = r#"
 //- /lib.rs
 mod a { pub struct X; }
 mod b { pub struct X; }
@@ -1508,12 +1521,28 @@ mod still {
     pub use crate::a::*;
     pub use crate::b::*;
 }
-"#,
-        );
+"#;
+        assert_maps_agree("glob_ambiguities_are_settled_at_the_final_round", fixture);
+        let db = fixture_db(fixture);
+        let krate = db.fetch_test_crate();
+        let map = facts_crate_local_def_map(&db, krate).def_map(&db);
+        let x = Name::new_root("X");
+        let root = map.module(&db, map.root).scope(&db);
+        let Some((ModuleDefId::AdtId(crate::AdtId::StructId(it)), _)) = root.type_(&x) else {
+            panic!("the root's `X` is {:?}", root.get(&x))
+        };
+        assert_eq!(module_path(&db, crate::Lookup::lookup(&it, &db).container), "crate::c");
+        let settled = root.glob_ambiguities().iter().filter(|it| it.name == x).count();
+        assert_eq!(settled, 0, "the root's `X` is `c::X`, no longer ambiguous: {:?}", root.glob_ambiguities());
+        let still = *map.module(&db, map.root).children(&db).get(&Name::new_root("still")).expect("`still`");
+        let ambiguous = map.module(&db, still).scope(&db).glob_ambiguities().iter().filter(|it| it.name == x).count();
+        assert_ne!(ambiguous, 0, "`still`'s `X` is ambiguous between its globs");
     }
 
+    /// A block's map has its items, its `mod`s and its imports of them and of the crate, with
+    /// the unresolved import and macro diagnosed, and is the same built twice.
     #[test]
-    fn collect_block_equals_the_old_block_path() {
+    fn collect_block_resolves_the_blocks_names() {
         let fixture = r#"
 //- /lib.rs
 pub mod outer {
@@ -1546,17 +1575,18 @@ fn f() {
         let blocks: Vec<_> = body.blocks(&db).map(|(block, _)| block).collect();
         assert_eq!(blocks.len(), 1);
         let block = blocks[0].to_db(&db);
-        let old = old_block_def_map(&db, block);
-        let new = new_block_def_map(&db, block);
+        let real = crate::nameres::block_def_map(&db, block);
+        let again = block_def_map_again(&db, block);
         let diff =
-            compare(&project(&db, &old, None, &Exempt::NONE), &project(&db, &new, None, &Exempt::NONE));
+            compare(&project(&db, real, None, &Exempt::NONE), &project(&db, again, None, &Exempt::NONE));
         assert!(diff.is_empty(), "{diff}");
-        let scope = new.module(&db, new.root).scope(&db);
+        let scope = again.module(&db, again.root).scope(&db);
         for name in ["inner", "Inner", "Outer", "Local"] {
             assert_ne!(scope.get(&Name::new_root(name)), PerNs::none(), "`{name}` in the block");
         }
-        assert!(!new.diagnostics(&db).is_empty(), "the unresolved import and macro are diagnosed");
-        assert_eq!(records(old.name_records(&db)), records(new.name_records(&db)), "the block's name records");
+        assert!(!again.diagnostics(&db).is_empty(), "the unresolved import and macro are diagnosed");
+        assert_eq!(records(real.name_records(&db)), records(again.name_records(&db)), "the block's name records");
+        assert_eq!(records(again.name_records(&db)).1[0], 1, "one unresolved import");
     }
 
     /// What two collections' `NameRecords` must agree on without their ids, which differ: each
@@ -1578,8 +1608,9 @@ fn f() {
         (uses, lens)
     }
 
+    /// `facts::collect_crate`'s name records equal the maintained map's.
     #[test]
-    fn name_records_equal_the_old_ones() {
+    fn name_records_equal_the_maintained_ones() {
         let db = fixture_db(
             r#"
 //- /lib.rs
@@ -1603,14 +1634,77 @@ local!();
 "#,
         );
         let krate = db.fetch_test_crate();
-        let old = old_crate_local_def_map(&db, krate);
-        let new = new_crate_local_def_map(&db, krate);
-        let old = records(old.def_map(&db).name_records(&db));
-        let new = records(new.def_map(&db).name_records(&db));
-        assert_eq!(old, new);
+        let maintained = records(crate_local_def_map(&db, krate).def_map(&db).name_records(&db));
+        let new = records(facts_crate_local_def_map(&db, krate).def_map(&db).name_records(&db));
+        assert_eq!(maintained, new);
         assert!(!new.0.is_empty(), "the fixture's imports go through bindings: {new:?}");
         assert_eq!(new.1[0], 1, "one unresolved import");
         assert_eq!(new.1[1], 1, "one glob of a local module");
         assert_eq!(new.1[2], 2, "two macro calls");
+    }
+
+    // Moved from the deleted `nameres/collector.rs`, whose tests ran the production
+    // `crate_def_map`.
+
+    fn do_resolve(not_ra_fixture: &str) {
+        let fx = hir_expand::fixture::db(not_ra_fixture);
+        let _ = fx.only_file();
+        let db = fx.into_db();
+        let krate = hir_expand::fixture::test_crate(&db);
+
+        crate::nameres::crate_def_map(&db, krate);
+    }
+
+    #[test]
+    fn test_macro_expand_will_stop_1() {
+        do_resolve(
+            r#"
+macro_rules! foo {
+    ($($ty:ty)*) => { foo!($($ty)*); }
+}
+foo!(KABOOM);
+"#,
+        );
+        do_resolve(
+            r#"
+macro_rules! foo {
+    ($($ty:ty)*) => { foo!(() $($ty)*); }
+}
+foo!(KABOOM);
+"#,
+        );
+    }
+
+    #[ignore]
+    #[test]
+    fn test_macro_expand_will_stop_2() {
+        // FIXME: this test does succeed, but takes quite a while: 90 seconds in
+        // the release mode. That's why the argument is not an ra_fixture --
+        // otherwise injection highlighting gets stuck.
+        //
+        // We need to find a way to fail this faster!
+        do_resolve(
+            r#"
+macro_rules! foo {
+    ($($ty:ty)*) => { foo!($($ty)* $($ty)*); }
+}
+foo!(KABOOM);
+"#,
+        );
+    }
+
+    #[test]
+    fn crate_attrs() {
+        let fixture = r#"
+//- /lib.rs crate:foo crate-attr:recursion_limit="4" crate-attr:no_core crate-attr:no_std crate-attr:feature(register_tool)
+        "#;
+        let fx = hir_expand::fixture::db(fixture);
+        let _ = fx.only_file();
+        let db = fx.into_db();
+        let def_map = crate::nameres::crate_def_map(&db, hir_expand::fixture::test_crate(&db));
+        assert_eq!(def_map.recursion_limit(), 4);
+        assert!(def_map.is_no_core());
+        assert!(def_map.is_no_std());
+        assert!(def_map.features().is_enabled(&intern::sym::register_tool));
     }
 }

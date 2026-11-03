@@ -35,6 +35,42 @@ fn resident(status: &str) -> Option<u64> {
     kib.trim().parse::<u64>().ok()?.checked_mul(1024)
 }
 
+/// Bytes of memory this process holds as the system counts it, what a limit on it is held to
+/// (`blaze_mem::tag::resident_by`): its physical footprint on macOS ([`footprint`]), its
+/// resident set on Linux from `/proc/self/statm`. Allocates nothing (the path fits std's stack
+/// buffer and the file is read into one of its own), as it is read once a run ends.
+#[cfg(target_os = "macos")]
+pub fn own_footprint() -> Option<u64> {
+    footprint(std::process::id())
+}
+
+/// Bytes of memory this process holds on Linux: the second field of `/proc/self/statm`, its
+/// resident pages, times the page size. Allocates nothing.
+#[cfg(target_os = "linux")]
+pub fn own_footprint() -> Option<u64> {
+    use std::io::Read as _;
+    let mut buf = [0u8; 256];
+    let mut file = std::fs::File::open("/proc/self/statm").ok()?;
+    let len = file.read(&mut buf).ok()?;
+    let pages = statm_resident(buf.get(..len)?)?;
+    // SAFETY: sysconf reads a constant of the system; no memory of ours.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    pages.checked_mul(u64::try_from(page).ok()?)
+}
+
+/// The resident pages of a `/proc/<pid>/statm`: its second field.
+#[cfg(any(target_os = "linux", test))]
+fn statm_resident(statm: &[u8]) -> Option<u64> {
+    let field = statm.split(|&it| it == b' ').nth(1)?;
+    std::str::from_utf8(field).ok()?.trim().parse().ok()
+}
+
+/// No reading of the process's footprint here.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn own_footprint() -> Option<u64> {
+    None
+}
+
 /// Bytes of memory the machine has.
 #[cfg(target_os = "macos")]
 pub fn machine_bytes() -> Option<u64> {
@@ -114,6 +150,18 @@ mod tests {
         let status = "Name:\tblaze\nVmPeak:\t  9000 kB\nVmRSS:\t   1234 kB\nThreads:\t4\n";
         assert_eq!(super::resident(status), Some(1234 * 1024));
         assert_eq!(super::resident("Name:\tkthreadd\nThreads:\t1\n"), None);
+    }
+
+    #[test]
+    fn statm_says_its_resident_pages_second() {
+        assert_eq!(super::statm_resident(b"52345 1234 567 89 0 4321 0\n"), Some(1234));
+        assert_eq!(super::statm_resident(b"52345"), None);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn this_process_holds_some_by_its_own_count() {
+        assert!(super::own_footprint().is_some_and(|it| it > 0));
     }
 
     #[cfg(target_os = "macos")]

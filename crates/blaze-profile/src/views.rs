@@ -69,11 +69,11 @@ const BUILD: Arg = Arg {
     default: Some("(SELECT max(build_id) FROM spans)"),
 };
 /// A build for a view over its wall time: by default the last to end, as one still running has
-/// no `builds` row to bound it.
+/// only its start's `builds` row, with no end to bound it.
 const ENDED_BUILD: Arg = Arg {
     name: "build",
     ty: ArgType::U64,
-    default: Some("(SELECT max(build_id) FROM builds)"),
+    default: Some("(SELECT max(build_id) FROM builds WHERE dur_ns IS NOT NULL)"),
 };
 const LIMIT: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("20") };
 const EARLIER: Arg = Arg { name: "earlier", ty: ArgType::Text, default: None };
@@ -570,7 +570,7 @@ mod tests {
     const FUNCTIONS: &[&str] = &[
         "any_value", "arg_max", "array_to_string", "count", "lag", "lead", "max", "median", "min",
         "rank", "read_parquet", "round", "starts_with", "sum", "unnest", "range", "least", "greatest",
-        "coalesce", "string_agg", "regexp_matches",
+        "coalesce", "string_agg", "regexp_matches", "row_number",
     ];
 
     /// The identifiers of `sql` outside comments, strings, numbers and `$`/`@` names, each with

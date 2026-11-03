@@ -74,6 +74,22 @@ fn main() {}
     ]);
 }
 
+/// #1638: a diagnostic in a file `include!` read from outside every source root names the file
+/// by its path there, never `<file N>`, so its text can be found to write it from.
+#[test]
+fn a_diagnostic_in_a_file_included_from_outside_every_root_names_its_path() {
+    let dir = std::env::temp_dir().join(format!("blaze-diagnostic-outside-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("the temporary directory");
+    let code = dir.join("code.rs");
+    std::fs::write(&code, "fn more() {}\n").expect("code.rs");
+    let path = code.to_str().expect("a UTF-8 temporary path").to_owned();
+    let checked = checked(&format!("\n//- minicore: include\n//- /main.rs crate:other:main\ninclude!({path:?});\nfn main() {{}}\n"));
+    std::fs::remove_dir_all(&dir).expect("the temporary directory");
+    assert_eq!(checked.messages(), ["dead_code: function `more` is never used"]);
+    let span = checked.diags[0].span.primary_span().expect("the lint's span");
+    assert_eq!(span.file, path);
+}
+
 /// #1440: a call of a non-const function in a constant is refused, as rustc's
 /// `tests/ui/consts/const-call.rs`.
 #[test]

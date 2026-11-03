@@ -18,7 +18,7 @@ about 56 MB of outlines, 170 MB with every body walked.
 | allocations a read | a constant: the tree's handles, its lazy list and slots, its kept hashes | `a_stored_parse_reads_in_place` holds a read under 8 allocations and 64 bytes a lazy node |
 | lexing a stored file | none | `a_restart_reads_library_trees_back_without_parsing` counts whole parses |
 | writing the section | a copy of each live outline's columns, once per image | `write_section`, records copied on unchanged |
-| memory kept | the Parse tag's budget | `Db::admit_parses` once per revision |
+| memory kept | the Parse tag's budget | the query engine's byte budget at each view (`lru, weigh`) |
 
 Where it stands short until measured: a read still allocates a slot per lazy node (about 36
 bytes each), where a slot table in the mapping would need none; that is the one owned column.

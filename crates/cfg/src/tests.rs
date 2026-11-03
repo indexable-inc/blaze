@@ -25,14 +25,14 @@ fn cfgs(input: &str, clean: bool) -> (CfgExpr, CfgExpr) {
 }
 
 #[track_caller]
-fn assert_parse_result(input: &str, expected: CfgExpr) {
+fn assert_parse_result(input: &str, expected: &CfgExpr) {
     let (from_tt, from_view) = cfgs(input, false);
-    assert_eq!(from_tt, expected);
-    assert_eq!(from_view, expected);
+    assert_eq!(&from_tt, expected);
+    assert_eq!(&from_view, expected);
 }
 
 #[track_caller]
-fn check_dnf(input: &str, expect: Expect) {
+fn check_dnf(input: &str, expect: &Expect) {
     let (from_tt, from_view) = cfgs(input, true);
     for cfg in [from_tt, from_view] {
         let actual = format!("#![cfg({})]", DnfExpr::new(&cfg));
@@ -41,7 +41,7 @@ fn check_dnf(input: &str, expect: Expect) {
 }
 
 #[track_caller]
-fn check_why_inactive(input: &str, opts: &CfgOptions, expect: Expect) {
+fn check_why_inactive(input: &str, opts: &CfgOptions, expect: &Expect) {
     let (from_tt, from_view) = cfgs(input, true);
     for cfg in [from_tt, from_view] {
         let dnf = DnfExpr::new(&cfg);
@@ -62,23 +62,23 @@ fn check_enable_hints(input: &str, opts: &CfgOptions, expected_hints: &[&str]) {
 
 #[test]
 fn test_cfg_expr_parser() {
-    assert_parse_result("#![cfg(foo)]", CfgAtom::Flag(Symbol::intern("foo")).into());
-    assert_parse_result("#![cfg(foo,)]", CfgAtom::Flag(Symbol::intern("foo")).into());
+    assert_parse_result("#![cfg(foo)]", &CfgAtom::Flag(Symbol::intern("foo")).into());
+    assert_parse_result("#![cfg(foo,)]", &CfgAtom::Flag(Symbol::intern("foo")).into());
     assert_parse_result(
         "#![cfg(not(foo))]",
-        CfgExpr::Not(Box::new(CfgAtom::Flag(Symbol::intern("foo")).into())),
+        &CfgExpr::Not(Box::new(CfgAtom::Flag(Symbol::intern("foo")).into())),
     );
-    assert_parse_result("#![cfg(foo(bar))]", CfgExpr::Invalid);
+    assert_parse_result("#![cfg(foo(bar))]", &CfgExpr::Invalid);
 
     // Only take the first
     assert_parse_result(
         r#"#![cfg(foo, bar = "baz")]"#,
-        CfgAtom::Flag(Symbol::intern("foo")).into(),
+        &CfgAtom::Flag(Symbol::intern("foo")).into(),
     );
 
     assert_parse_result(
         r#"#![cfg(all(foo, bar = "baz"))]"#,
-        CfgExpr::All(
+        &CfgExpr::All(
             vec![
                 CfgAtom::Flag(Symbol::intern("foo")).into(),
                 CfgAtom::KeyValue { key: Symbol::intern("bar"), value: Symbol::intern("baz") }
@@ -91,28 +91,28 @@ fn test_cfg_expr_parser() {
 
 #[test]
 fn smoke() {
-    check_dnf("#![cfg(test)]", expect![[r#"#![cfg(test)]"#]]);
-    check_dnf("#![cfg(not(test))]", expect![[r#"#![cfg(not(test))]"#]]);
-    check_dnf("#![cfg(not(not(test)))]", expect![[r#"#![cfg(test)]"#]]);
+    check_dnf("#![cfg(test)]", &expect![[r#"#![cfg(test)]"#]]);
+    check_dnf("#![cfg(not(test))]", &expect![[r#"#![cfg(not(test))]"#]]);
+    check_dnf("#![cfg(not(not(test)))]", &expect![[r#"#![cfg(test)]"#]]);
 
-    check_dnf("#![cfg(all(a, b))]", expect![[r#"#![cfg(all(a, b))]"#]]);
-    check_dnf("#![cfg(any(a, b))]", expect![[r#"#![cfg(any(a, b))]"#]]);
+    check_dnf("#![cfg(all(a, b))]", &expect![[r#"#![cfg(all(a, b))]"#]]);
+    check_dnf("#![cfg(any(a, b))]", &expect![[r#"#![cfg(any(a, b))]"#]]);
 
-    check_dnf("#![cfg(not(a))]", expect![[r#"#![cfg(not(a))]"#]]);
+    check_dnf("#![cfg(not(a))]", &expect![[r#"#![cfg(not(a))]"#]]);
 }
 
 #[test]
 fn distribute() {
-    check_dnf("#![cfg(all(any(a, b), c))]", expect![[r#"#![cfg(any(all(a, c), all(b, c)))]"#]]);
-    check_dnf("#![cfg(all(c, any(a, b)))]", expect![[r#"#![cfg(any(all(c, a), all(c, b)))]"#]]);
+    check_dnf("#![cfg(all(any(a, b), c))]", &expect![[r#"#![cfg(any(all(a, c), all(b, c)))]"#]]);
+    check_dnf("#![cfg(all(c, any(a, b)))]", &expect![[r#"#![cfg(any(all(c, a), all(c, b)))]"#]]);
     check_dnf(
         "#![cfg(all(any(a, b), any(c, d)))]",
-        expect![[r#"#![cfg(any(all(a, c), all(a, d), all(b, c), all(b, d)))]"#]],
+        &expect![[r#"#![cfg(any(all(a, c), all(a, d), all(b, c), all(b, d)))]"#]],
     );
 
     check_dnf(
         "#![cfg(all(any(a, b, c), any(d, e, f), g))]",
-        expect![[
+        &expect![[
             r#"#![cfg(any(all(a, d, g), all(a, e, g), all(a, f, g), all(b, d, g), all(b, e, g), all(b, f, g), all(c, d, g), all(c, e, g), all(c, f, g)))]"#
         ]],
     );
@@ -120,33 +120,33 @@ fn distribute() {
 
 #[test]
 fn demorgan() {
-    check_dnf("#![cfg(not(all(a, b)))]", expect![[r#"#![cfg(any(not(a), not(b)))]"#]]);
-    check_dnf("#![cfg(not(any(a, b)))]", expect![[r#"#![cfg(all(not(a), not(b)))]"#]]);
+    check_dnf("#![cfg(not(all(a, b)))]", &expect![[r#"#![cfg(any(not(a), not(b)))]"#]]);
+    check_dnf("#![cfg(not(any(a, b)))]", &expect![[r#"#![cfg(all(not(a), not(b)))]"#]]);
 
-    check_dnf("#![cfg(not(all(not(a), b)))]", expect![[r#"#![cfg(any(a, not(b)))]"#]]);
-    check_dnf("#![cfg(not(any(a, not(b))))]", expect![[r#"#![cfg(all(not(a), b))]"#]]);
+    check_dnf("#![cfg(not(all(not(a), b)))]", &expect![[r#"#![cfg(any(a, not(b)))]"#]]);
+    check_dnf("#![cfg(not(any(a, not(b))))]", &expect![[r#"#![cfg(all(not(a), b))]"#]]);
 }
 
 #[test]
 fn nested() {
-    check_dnf("#![cfg(all(any(a), not(all(any(b)))))]", expect![[r#"#![cfg(all(a, not(b)))]"#]]);
+    check_dnf("#![cfg(all(any(a), not(all(any(b)))))]", &expect![[r#"#![cfg(all(a, not(b)))]"#]]);
 
-    check_dnf("#![cfg(any(any(a, b)))]", expect![[r#"#![cfg(any(a, b))]"#]]);
-    check_dnf("#![cfg(not(any(any(a, b))))]", expect![[r#"#![cfg(all(not(a), not(b)))]"#]]);
-    check_dnf("#![cfg(all(all(a, b)))]", expect![[r#"#![cfg(all(a, b))]"#]]);
-    check_dnf("#![cfg(not(all(all(a, b))))]", expect![[r#"#![cfg(any(not(a), not(b)))]"#]]);
+    check_dnf("#![cfg(any(any(a, b)))]", &expect![[r#"#![cfg(any(a, b))]"#]]);
+    check_dnf("#![cfg(not(any(any(a, b))))]", &expect![[r#"#![cfg(all(not(a), not(b)))]"#]]);
+    check_dnf("#![cfg(all(all(a, b)))]", &expect![[r#"#![cfg(all(a, b))]"#]]);
+    check_dnf("#![cfg(not(all(all(a, b))))]", &expect![[r#"#![cfg(any(not(a), not(b)))]"#]]);
 }
 
 #[test]
 fn regression() {
-    check_dnf("#![cfg(all(not(not(any(any(any()))))))]", expect![[r##"#![cfg(any())]"##]]);
-    check_dnf("#![cfg(all(any(all(any()))))]", expect![[r##"#![cfg(any())]"##]]);
-    check_dnf("#![cfg(all(all(any())))]", expect![[r##"#![cfg(any())]"##]]);
+    check_dnf("#![cfg(all(not(not(any(any(any()))))))]", &expect![[r##"#![cfg(any())]"##]]);
+    check_dnf("#![cfg(all(any(all(any()))))]", &expect![[r##"#![cfg(any())]"##]]);
+    check_dnf("#![cfg(all(all(any())))]", &expect![[r##"#![cfg(any())]"##]]);
 
-    check_dnf("#![cfg(all(all(any(), x)))]", expect![[r##"#![cfg(any())]"##]]);
-    check_dnf("#![cfg(all(all(any()), x))]", expect![[r##"#![cfg(any())]"##]]);
-    check_dnf("#![cfg(all(all(any(x))))]", expect![[r##"#![cfg(x)]"##]]);
-    check_dnf("#![cfg(all(all(any(x), x)))]", expect![[r##"#![cfg(all(x, x))]"##]]);
+    check_dnf("#![cfg(all(all(any(), x)))]", &expect![[r##"#![cfg(any())]"##]]);
+    check_dnf("#![cfg(all(all(any()), x))]", &expect![[r##"#![cfg(any())]"##]]);
+    check_dnf("#![cfg(all(all(any(x))))]", &expect![[r##"#![cfg(x)]"##]]);
+    check_dnf("#![cfg(all(all(any(x), x)))]", &expect![[r##"#![cfg(all(x, x))]"##]]);
 }
 
 #[test]
@@ -189,29 +189,29 @@ fn why_inactive() {
     opts.insert_atom(Symbol::intern("test"));
     opts.insert_atom(Symbol::intern("test2"));
 
-    check_why_inactive("#![cfg(a)]", &opts, expect![["a is disabled"]]);
-    check_why_inactive("#![cfg(not(test))]", &opts, expect![["test is enabled"]]);
+    check_why_inactive("#![cfg(a)]", &opts, &expect![["a is disabled"]]);
+    check_why_inactive("#![cfg(not(test))]", &opts, &expect![["test is enabled"]]);
 
     check_why_inactive(
         "#![cfg(all(not(test), not(test2)))]",
         &opts,
-        expect![["test and test2 are enabled"]],
+        &expect![["test and test2 are enabled"]],
     );
-    check_why_inactive("#![cfg(all(a, b))]", &opts, expect![["a and b are disabled"]]);
+    check_why_inactive("#![cfg(all(a, b))]", &opts, &expect![["a and b are disabled"]]);
     check_why_inactive(
         "#![cfg(all(not(test), a))]",
         &opts,
-        expect![["test is enabled and a is disabled"]],
+        &expect![["test is enabled and a is disabled"]],
     );
     check_why_inactive(
         "#![cfg(all(not(test), test2, a))]",
         &opts,
-        expect![["test is enabled and a is disabled"]],
+        &expect![["test is enabled and a is disabled"]],
     );
     check_why_inactive(
         "#![cfg(all(not(test), not(test2), a))]",
         &opts,
-        expect![["test and test2 are enabled and a is disabled"]],
+        &expect![["test and test2 are enabled and a is disabled"]],
     );
 }
 

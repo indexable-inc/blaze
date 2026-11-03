@@ -15,7 +15,10 @@ use syntax::{
     },
 };
 
-use super::large_types_passed_by_value::{Owner, foreign_abi, owner};
+use super::{
+    large_types_passed_by_value::foreign_abi,
+    utils::{Owner, owner},
+};
 use crate::{
     check::Cx,
     diag::{Applicability, Span, SuggestionStyle},
@@ -27,6 +30,7 @@ const LINT: super::Implemented = super::Implemented::NeedlessPassByValue;
 const DEEPEST: u32 = 8;
 
 /// A parameter that may be linted, by what is written.
+#[derive(Clone, Copy)]
 struct Candidate<'t> {
     /// Its index among the signature's inputs, `self` included.
     input: usize,
@@ -41,6 +45,12 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     let Some(function) = ast::Fn::cast(node) else { return };
     let (Some(params), Some(body)) = (function.param_list(), function.body()) else { return };
+    // rustc lowers an `async fn` to a body that moves every parameter into the future it
+    // returns, which clippy's `MovedVariablesCtxt` sees as consuming each: clippy never lints
+    // one.
+    if function.async_token().is_some() {
+        return;
+    }
     // `self` is never linted.
     let first = usize::from(params.self_param().is_some());
     let mut candidates = Vec::new();
@@ -60,9 +70,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if candidates.is_empty() || !cx.is_written(node) || cx.range(node).is_none() {
         return;
     }
-    match owner(function) {
-        Owner::Trait | Owner::TraitImpl => return,
-        Owner::Item if foreign_abi(function) || requires_exact_signature(function) => return,
+    match owner(cx, node) {
+        None | Some(Owner::Trait | Owner::TraitImpl) => return,
+        Some(Owner::Item) if foreign_abi(function) || requires_exact_signature(function) => return,
         _ => {}
     }
     let db = cx.db();

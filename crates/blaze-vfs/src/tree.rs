@@ -22,6 +22,7 @@ use blaze_ids::{
     ContentId,
     bits::{BitIndex, BitSet},
 };
+use blaze_hash::SipKey;
 use blaze_image::Corrupt;
 use hashbrown::{HashTable, hash_table};
 use smallvec::{SmallVec, smallvec};
@@ -30,7 +31,7 @@ use crate::{
     Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError,
     image::Bytes,
     reader::Reader,
-    store::{Building, DIR, Entries, Shape, Table, Writer, adopt, mode_byte, mode_of, name_hash},
+    store::{Building, DIR, Entries, Shape, Table, Writer, adopt, mode_byte, mode_of},
 };
 
 /// Runs `job(0..n)`, each once, on the caller's workers, returning once all have run: what the
@@ -180,9 +181,12 @@ impl<'a> Dir<'a> {
 /// Every node and name made so far, interned. The one writer of the store readers share.
 pub(crate) struct Tree {
     store: Writer,
-    /// Each name after the base's by its [`name_hash`] (computed once and kept, so growing
-    /// never hashes again); the base's are found by the image's own index.
+    /// Each name after the base's by its hash under `overlay` (computed once and kept, so
+    /// growing never hashes again); the base's are found by the image's own index.
     name_index: HashTable<(u64, u32)>,
+    /// The key `name_index` is placed by: drawn at random, never shown or kept, since the
+    /// names are a checkout's, which whoever writes it picks.
+    overlay: SipKey,
     empty: NodeId,
     /// Tables replaced by collections and not freed yet.
     retired: usize,
@@ -210,6 +214,7 @@ impl Tree {
         let mut tree = Tree {
             store,
             name_index: HashTable::new(),
+            overlay: SipKey::random(),
             empty: NodeId(0),
             retired: 0,
             // alloc: empty, allocates nothing; grown once and reused by every directory.
@@ -302,12 +307,15 @@ impl Tree {
     }
 
     pub(crate) fn name(&mut self, name: &str) -> NameId {
-        let hash = name_hash(name.as_bytes());
-        if let Some(id) = self.store.names().find_base(hash, name.as_bytes()) {
+        if let Some(id) = self.store.names().find_base(name.as_bytes()) {
             return NameId(id);
         }
+        let hash = self.overlay.hash(name.as_bytes());
         let Tree { store, name_index, .. } = self;
-        let same = |&(at, id): &(u64, u32)| at == hash && store.names().get(id) == name.as_bytes();
+        let same = |&(at, id): &(u64, u32)| {
+            crate::probes::count();
+            at == hash && store.names().get(id) == name.as_bytes()
+        };
         match name_index.entry(hash, same, |&(at, _)| at) {
             hash_table::Entry::Occupied(it) => NameId(it.get().1),
             hash_table::Entry::Vacant(it) => {

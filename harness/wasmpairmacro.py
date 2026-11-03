@@ -166,7 +166,9 @@ def main():
             args = parse(Input, text, SCRIPT)
         case _:
             fail(SCRIPT, f"usage: {SCRIPT} [JSON] (see the top of the file)")
-    work = tempfile.mkdtemp(prefix="wasm-pair-macro-", dir="/tmp" if os.name != "nt" else None)
+    # macOS: under /tmp, as a daemon's socket is under its home and macOS allows 104 bytes.
+    # Elsewhere $TMPDIR: /tmp may be a tmpfs, which can't share blocks with blaze's cache.
+    work = tempfile.mkdtemp(prefix="wasm-pair-macro-", dir="/tmp" if sys.platform == "darwin" else None)
     print(f"work: {work}", flush=True)
     at = os.path.join(work, "workspace")
     write(at, "Cargo.toml", '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2024"\n'

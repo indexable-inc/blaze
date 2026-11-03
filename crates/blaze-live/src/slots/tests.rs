@@ -346,7 +346,7 @@ fn read_back(answer: &Answer) -> Answer {
 
 fn applied(switch: &mut Switch<Fake>, patch: Patch) {
     let generation = patch.generation;
-    let (outcome, answer) = switch.handle(Message::Patch(patch));
+    let (outcome, answer) = switch.handle(&Message::Patch(patch));
     assert!(matches!(outcome, Outcome::Applied { .. }), "{outcome}");
     assert_eq!(answer, Some(Answer::Applied { generation }));
 }
@@ -401,7 +401,7 @@ fn patches_switch_the_table_and_roll_back() {
     first.windows =
         vec![(unslid(program.code_at(0)), unslid(program.code_at(8)), unslid(program.code_at(24)))];
     first.statics = 1;
-    let (outcome, answer) = switch.handle(Message::Patch(first));
+    let (outcome, answer) = switch.handle(&Message::Patch(first));
     assert_eq!(outcome, Outcome::Applied { generation: 1, functions: 2, statics: 1 });
     assert_eq!(answer, Some(Answer::Applied { generation: 1 }));
     assert_eq!(program.calls(), (2, 1));
@@ -413,7 +413,7 @@ fn patches_switch_the_table_and_roll_back() {
     );
     assert_eq!(switch.current(), 1);
 
-    let (outcome, _) = switch.handle(Message::Patch(patch(2, 0, vec![(0, unslid(address(one)))])));
+    let (outcome, _) = switch.handle(&Message::Patch(patch(2, 0, vec![(0, unslid(address(one)))])));
     assert!(
         matches!(&outcome, Outcome::Declined { generation: 2, why } if why.contains("is at 1")),
         "{outcome}"
@@ -427,25 +427,25 @@ fn patches_switch_the_table_and_roll_back() {
 
     let mut over = patch(3, 2, vec![]);
     over.code = vec![program.present(16, 8, "over")];
-    let (outcome, _) = switch.handle(Message::Patch(over));
+    let (outcome, _) = switch.handle(&Message::Patch(over));
     assert!(
         matches!(&outcome, Outcome::Declined { why, .. } if why.contains("can be running")),
         "{outcome}"
     );
 
-    let (outcome, answer) = switch.handle(Message::RollBack { id: ID, to: 1 });
+    let (outcome, answer) = switch.handle(&Message::RollBack { id: ID, to: 1 });
     let why = "the linker took it back".to_owned();
     assert_eq!(outcome, Outcome::RolledBack { generation: 2, to: 1, why: why.clone() });
     assert_eq!(answer, Some(Answer::RolledBack { generation: 2, to: 1, why }));
     assert_eq!(program.calls(), (2, 1));
-    switch.handle(Message::RollBack { id: ID, to: 0 });
+    switch.handle(&Message::RollBack { id: ID, to: 0 });
     assert_eq!(program.calls(), (1, 2));
     assert_eq!(program.cell().load(Ordering::Relaxed), image_table);
 
     // Code rolled back stays: a thread can be in it still.
     let mut over = patch(3, 0, vec![(1, unslid(address(one)))]);
     over.code = vec![program.present(0, 8, "over")];
-    let (outcome, _) = switch.handle(Message::Patch(over));
+    let (outcome, _) = switch.handle(&Message::Patch(over));
     assert!(
         matches!(&outcome, Outcome::Declined { why, .. }
             if why.contains("generation 1's code") && why.contains("can be running")),
@@ -456,15 +456,15 @@ fn patches_switch_the_table_and_roll_back() {
     applied(&mut switch, third);
     assert_eq!(switch.kept(), vec![0, 1, 2, 3]);
     assert_eq!(program.calls(), (1, 1));
-    switch.handle(Message::RollBack { id: ID, to: 2 });
+    switch.handle(&Message::RollBack { id: ID, to: 2 });
     assert_eq!(program.calls(), (2, 2));
-    switch.handle(Message::RollBack { id: ID, to: 3 });
+    switch.handle(&Message::RollBack { id: ID, to: 3 });
 
     let restart = Message::Restart { id: ID, generation: 3, why: "a layout changed".into() };
-    let (outcome, answer) = switch.handle(restart);
+    let (outcome, answer) = switch.handle(&restart);
     assert_eq!(outcome, Outcome::Restart { generation: 3, why: "a layout changed".into() });
     assert_eq!(answer, None);
-    let (outcome, _) = switch.handle(Message::RollBack { id: [0; 16], to: 0 });
+    let (outcome, _) = switch.handle(&Message::RollBack { id: [0; 16], to: 0 });
     assert!(
         matches!(&outcome, Outcome::Declined { why, .. } if why.contains("for image")),
         "{outcome}"
@@ -477,14 +477,14 @@ fn a_program_starts_at_the_generation_it_was_linked_at() {
     let program = Program::new();
     let mut switch = program.switch_at(7);
     assert_eq!(switch.current(), 7);
-    let (outcome, _) = switch.handle(Message::Patch(patch(1, 0, vec![])));
+    let (outcome, _) = switch.handle(&Message::Patch(patch(1, 0, vec![])));
     assert!(
         matches!(&outcome, Outcome::Declined { why, .. } if why.contains("where this program is at 7")),
         "{outcome}"
     );
     applied(&mut switch, patch(8, 7, vec![(0, unslid(address(two)))]));
     assert_eq!(program.calls(), (2, 2));
-    switch.handle(Message::RollBack { id: ID, to: 7 });
+    switch.handle(&Message::RollBack { id: ID, to: 7 });
     assert_eq!(program.calls(), (1, 2));
     assert_eq!(switch.kept(), vec![7, 8]);
 }
@@ -572,7 +572,7 @@ fn a_bad_patch_is_declined_before_anything_is_written() {
         ),
     ];
     for (bad, says) in cases {
-        let (outcome, answer) = switch.handle(Message::Patch(bad));
+        let (outcome, answer) = switch.handle(&Message::Patch(bad));
         match &outcome {
             Outcome::Declined { why, .. } => {
                 assert!(why.contains(says), "{why:?} doesn't say {says:?}")
@@ -600,7 +600,7 @@ fn data_outside_the_image_is_refused_before_any_write() {
     bad.code = vec![program.present(0, 8, "f")];
     bad.data =
         vec![(unslid(program.data_at(0)), vec![1; 8]), (unslid(program.data_at(8)), vec![1; 8])];
-    let (outcome, _) = switch.handle(Message::Patch(bad));
+    let (outcome, _) = switch.handle(&Message::Patch(bad));
     assert!(
         matches!(&outcome, Outcome::Declined { why, .. } if why.contains("outside the image")),
         "{outcome}"
@@ -621,9 +621,9 @@ fn the_last_generations_are_kept() {
     }
     assert_eq!(program.call(0), 1);
     assert_eq!(switch.kept(), (101 - KEPT as u64..=100).collect::<Vec<_>>());
-    let (outcome, _) = switch.handle(Message::RollBack { id: ID, to: 1 });
+    let (outcome, _) = switch.handle(&Message::RollBack { id: ID, to: 1 });
     assert!(matches!(outcome, Outcome::Declined { generation: 1, .. }), "{outcome}");
-    switch.handle(Message::RollBack { id: ID, to: 99 });
+    switch.handle(&Message::RollBack { id: ID, to: 99 });
     assert_eq!(program.call(0), 2);
     assert_eq!(switch.current(), 99);
 }
@@ -714,7 +714,7 @@ fn registered_unwind_entries_are_never_written_again() {
     for (at, len) in [(0, 8), (12, 8), (16, 4), (18, 8)] {
         let mut over = patch(2, 1, vec![]);
         over.data = vec![(unslid(program.data_at(at)), vec![1; len])];
-        let (outcome, _) = switch.handle(Message::Patch(over));
+        let (outcome, _) = switch.handle(&Message::Patch(over));
         assert!(
             matches!(&outcome, Outcome::Declined { why, .. }
                 if why.contains("generation 1's unwind entries")),
@@ -729,7 +729,7 @@ fn registered_unwind_entries_are_never_written_again() {
     switch.roll_back(0).expect("generation 0 is kept");
     let mut over = patch(3, 0, vec![]);
     over.data = vec![(unslid(program.data_at(0)), vec![0; 20])];
-    let (outcome, _) = switch.handle(Message::Patch(over));
+    let (outcome, _) = switch.handle(&Message::Patch(over));
     assert!(matches!(outcome, Outcome::Declined { .. }), "{outcome}");
     assert_eq!(program.data[0], 12);
 }
@@ -947,7 +947,7 @@ fn a_full_column_refuses_the_patch() {
     applied(&mut switch, patch(2, 1, vec![(1, unslid(address(one)))]));
     let table = program.cell().load(Ordering::Relaxed);
     let (outcome, answer) =
-        switch.handle(Message::Patch(patch(3, 2, vec![(0, unslid(address(one)))])));
+        switch.handle(&Message::Patch(patch(3, 2, vec![(0, unslid(address(one)))])));
     refused(&outcome, "the log's generation numbers is full: it holds 3 rows at most");
     assert!(matches!(answer, Some(Answer::Declined { generation: 3, .. })), "{answer:?}");
     assert_eq!(program.cell().load(Ordering::Relaxed), table);
@@ -959,7 +959,7 @@ fn a_full_column_refuses_the_patch() {
     let mut switch = program.switch_limited(&Limits { cells: 3, ..roomy });
     let both = |to: u64| vec![(0, unslid(to)), (1, unslid(to))];
     applied(&mut switch, patch(1, 0, both(address(two))));
-    let (outcome, _) = switch.handle(Message::Patch(patch(2, 1, both(address(one)))));
+    let (outcome, _) = switch.handle(&Message::Patch(patch(2, 1, both(address(one)))));
     refused(&outcome, "the log's slots is full: it holds 3 rows at most");
     assert_eq!((switch.current(), program.calls()), (1, (2, 2)));
     applied(&mut switch, patch(2, 1, vec![(0, unslid(address(one)))]));
@@ -969,7 +969,7 @@ fn a_full_column_refuses_the_patch() {
     let mut switch = program.switch_limited(&Limits { code: 2, ..roomy });
     let mut three = patch(1, 0, vec![(0, unslid(address(two)))]);
     three.code = [0, 64, 128].map(|at| program.present(at, 8, "f")).to_vec();
-    let (outcome, _) = switch.handle(Message::Patch(three));
+    let (outcome, _) = switch.handle(&Message::Patch(three));
     refused(&outcome, "the log's code starts is full: it holds 2 rows at most");
     assert_eq!((switch.current(), program.calls()), (0, (1, 2)));
 
@@ -980,7 +980,7 @@ fn a_full_column_refuses_the_patch() {
     applied(&mut switch, two_spans);
     let mut more = patch(2, 1, vec![(1, unslid(address(one)))]);
     more.code = vec![program.present(128, 8, "f")];
-    let (outcome, _) = switch.handle(Message::Patch(more));
+    let (outcome, _) = switch.handle(&Message::Patch(more));
     refused(&outcome, "the lasting ranges' starts is full: it holds 2 rows at most");
     assert_eq!((switch.current(), program.calls()), (1, (2, 2)));
     applied(&mut switch, patch(2, 1, vec![(1, unslid(address(one)))]));
@@ -1206,7 +1206,7 @@ fn code_that_differs_from_the_commit_is_refused_naming_its_function() {
     program.commit(15, &[0xcc], "a later write");
     let mut patch = patch(1, 0, vec![(0, unslid(address(two)))]);
     patch.code = vec![committed];
-    let (outcome, answer) = switch.handle(Message::Patch(patch));
+    let (outcome, answer) = switch.handle(&Message::Patch(patch));
     let Outcome::Declined { generation: 1, why } = &outcome else { panic!("{outcome}") };
     assert!(why.starts_with("`life::step`'s code at "), "{why}");
     assert!(why.contains("is not what the daemon committed"), "{why}");

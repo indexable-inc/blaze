@@ -46,6 +46,38 @@ they are long-lived by design, so `blaze::implicit_allocator` leaves them alone.
 The general-purpose allocator (mimalloc, with huge pages) serves only startup, configuration
 and rare large one-offs. The allocation-budget tests hold the warm loop to zero calls into it.
 
+What the global heap still holds is named by tag all the same. The daemon's allocator,
+`blaze_graph::arena::Counting` over blaze-engine's `heaps::Heaps`, gives mimalloc one
+first-class heap per tag: an allocation made in a task (`blaze_mem::frame::task`) goes to the
+heap of the task's tag, a realloc that moves a block moves it to the running task's heap, and a
+free, on any thread and in any task, finds the block's heap from its address (`mi_heap_of`) and
+is taken off that tag. So each tag's `Counters::heap` is what its tasks allocated (or grew) and
+nobody has freed, wherever it went (a memo, a cache), third-party crates' bytes included, and the
+daemon's memory
+line shows it beside the tag's blaze-mem bytes (`; infer 10.84 (..) + heap 30.12 (most ..)`),
+with what was allocated outside any task (`global heap H GiB, U of it outside any task`) and
+what is outside both blaze-mem and the global heap. std's allocator (the seed) keeps no tags,
+and the line says `not kept by tag`.
+
+The tag is the innermost task's (`blaze_mem::frame::running_tag`): every query run is one, of
+its `mem_tag` (blaze-query's `function.rs`), and so is the daemon's work outside queries at its
+entry: a link (`Tag::Link`, `codegen::link`), a store commit's drain (`Tag::Store`), the profile
+history's flushes (`Tag::Profile`, `observe.rs`) and a whole file's read buffer (`Tag::Vfs`,
+blaze-core's `uring/files.rs`). The cost is a thread-local add per allocation and free, batched
+into the tag's counter, plus the thread's theap of the tag's heap on an allocation and, on a
+free, the block's heap: two loads through mimalloc's page map, one from the page, one from a
+heap table (`heaps.rs`). `benches/global_alloc.rs` in blaze-engine times it. Measured
+2026-11-03 against the tree before (one `Counting` count per pair, no tags), ns per pair, three
+alternated rounds each, Linux aarch64 (lane checkheap): outside any task 8.5 to 10.1 at 64 B,
+10.8 to 11.6 at 1000 B, 26 to 24 at 4096 B (the plain entry points for word-aligned layouts
+gain back what the lookups cost); in a task 8.3 to 14.0, 10.8 to 18.2 and 26 to 26. What is
+left is one dependent chain (page map, page, heap table) that `mi_free` then walks again, and
+three calls (the running tag, the theap, the count); freeing through the page already found
+would take the second walk off. On `blaze check --workspace` of
+blaze itself (lane checkheap, /tmp/blaze-lanes/v2-checkheap.md) the daemon's line at 73.9 GiB
+resident named all but 7.1 GiB (outside blaze-mem and the global heap) and 8.5 GiB (on the
+global heap, made outside any task, before the entry tasks above).
+
 Which general-purpose allocator matters less than what is left on it. Measured 2026-11-03 on
 `blaze build -p blaze-engine --no-default-features --features seed` with one worker, Linux
 aarch64, THP `always`, eight runs started together and stopped at 900 s, each having built the

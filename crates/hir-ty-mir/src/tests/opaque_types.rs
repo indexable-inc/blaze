@@ -153,7 +153,7 @@ static ALIAS: i32 = {
     5
 };
 "#,
-        expect![[r#"
+        &expect![[r#"
             106..220 '{     ...   5 }': i32
             191..193 '_a': impl Trait + ?Sized
             205..211 'Struct': Struct
@@ -225,7 +225,7 @@ impl Miku {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             61..72 '{ loop {} }': Vec<T>
             63..70 'loop {}': !
             68..70 '{}': ()

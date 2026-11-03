@@ -971,3 +971,38 @@ fn a_bits_field_of_no_fixed_width_names_the_struct_the_field_and_the_type() {
         ]
     );
 }
+
+#[test]
+fn variants_a_macro_writes_are_keyed_by_its_context() {
+    // blaze's own, the variants' version of tests/ui/hygiene/fields-definition.rs (checked
+    // against the pinned rustc): an enum a `macro` writes may have variants `V` and `$v` (the
+    // caller's `V`), two names, as tests/ui/hygiene/cross-crate-variants.rs's `MyEnum` has; a
+    // `macro_rules!` writes one name twice.
+    let source = r#"#![feature(decl_macro)]
+
+macro modern($v: ident) {
+    enum Modern {
+        V = 0,
+        $v = 1, // OK
+    }
+}
+
+macro_rules! legacy {
+    ($v: ident) => {
+        enum Legacy {
+            V = 0,
+            $v = 1, //~ ERROR the name `V` is defined multiple times
+        }
+    }
+}
+
+modern!(V);
+legacy!(V);
+
+fn main() {}
+"#;
+    // rustc's one error, `Legacy`'s, checked by count and macro as the fields' version is.
+    let stderr = ui("variants-definition.rs", "2015", source);
+    assert_eq!(stderr.matches("error[E0428]: the name `V` is defined multiple times").count(), 1, "{stderr}");
+    assert!(stderr.contains("this error originates in the macro `legacy`"), "{stderr}");
+}

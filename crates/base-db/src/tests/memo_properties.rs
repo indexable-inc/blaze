@@ -10,8 +10,11 @@ use crate::{Db, FileText};
 
 const FILES: u32 = 4;
 
-/// Held to two memos, so most runs evict some.
-#[blaze_query::tracked(returns(copy), lru = 2)]
+/// What `text_len`'s tag (`Query`, as it names none) may hold in the test's database.
+const BUDGET: u64 = 16;
+
+/// Weighed at 8 bytes a value against a budget of two ([`BUDGET`]), so most runs evict some.
+#[blaze_query::tracked(returns(copy), lru, weigh = |_: &u32| 8)]
 fn text_len(db: &Db, text: FileText) -> u32 {
     text.text(db).len() as u32
 }
@@ -26,7 +29,7 @@ fn len_read_through(db: &Db, text: FileText) -> u32 {
 enum Op {
     Set(u32, String),
     Read { file: u32, through: bool },
-    /// The `lru` caps apply when a view opens: a write that changed nothing, of every kind.
+    /// The budget applies when a view opens: a write that changed nothing, of every kind.
     Evict,
     SyntheticWrite,
 }
@@ -46,11 +49,12 @@ fn op(tc: &TestCase) -> Op {
     }
 }
 
-fn gives_what_recomputing_gives(tc: TestCase) {
+fn gives_what_recomputing_gives(tc: &TestCase) {
     let mut db = Db::for_tests();
+    db.storage_mut().set_value_budget(blaze_mem::Tag::Query, Some(BUDGET));
     let mut model = Vec::new();
     for file in 0..FILES {
-        let text = text(&tc);
+        let text = text(tc);
         db.set_file_text(FileId::from_raw(file), &text);
         model.push(text);
     }
@@ -84,5 +88,5 @@ fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
 /// `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
 fn memos_and_evictions_give_what_recomputing_gives() {
-    run_cases(64, gives_what_recomputing_gives);
+    run_cases(64, |tc| gives_what_recomputing_gives(&tc));
 }

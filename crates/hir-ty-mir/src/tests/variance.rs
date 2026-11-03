@@ -22,7 +22,7 @@ struct Covariant<A> {
     t: core::marker::PhantomData<A>
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
                 Covariant[A: covariant]
             "#]],
     );
@@ -67,7 +67,7 @@ enum Enum<A,B,C> { //~ ERROR [A: +, B: -, C: o]
 #[lang = "covariant_unsafe_cell"]
 pub struct CovariantUnsafeCell<T: ?Sized>(UnsafeCell<T>); //~ ERROR [T: +]
 "#,
-        expect![[r#"
+        &expect![[r#"
                 InvariantMut['a: covariant, A: invariant, B: invariant]
                 InvariantCell[A: invariant]
                 InvariantIndirect[A: invariant]
@@ -91,7 +91,7 @@ struct Other<'a> {
     hello: Hello<'a>,
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
                 Hello['a: bivariant]
                 Other['a: bivariant]
             "#]],
@@ -110,7 +110,7 @@ struct Foo<T: Trait> {
     field: [u8; <T as Trait>::Const]
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             Foo[T: bivariant]
         "#]],
     );
@@ -135,7 +135,7 @@ struct Bar<'a, T : Trait<'a>> { //~ ERROR ['a: o, T: o]
 }
 
 "#,
-        expect![[r#"
+        &expect![[r#"
                 method[Self: contravariant, 'a: contravariant]
                 Foo['a: covariant, T: covariant]
                 Bar['a: invariant, T: invariant]
@@ -154,7 +154,7 @@ trait Foo {
 
 fn make() -> *const dyn Foo<Bar = &'static u32> {}
 "#,
-        expect![""],
+        &expect![""],
     );
 }
 
@@ -189,7 +189,7 @@ struct TestBox<U,T:Getter<U>+Setter<U>> { //~ ERROR [U: *, T: +]
     t: T
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
                 get[Self: contravariant, T: covariant]
                 get[Self: contravariant, T: contravariant]
                 TestStruct[U: covariant, T: covariant]
@@ -225,7 +225,7 @@ fn pick<'b, G>(get: &'b G, if_odd: &'b i32) -> i32
     where G : Get<&'b i32>
 {}
 "#,
-        expect![[r#"
+        &expect![[r#"
                 get[Self: contravariant, T: covariant]
                 Cloner[T: covariant]
                 get[T: invariant]
@@ -249,7 +249,7 @@ struct TOption<'a> { //~ ERROR ['a: +]
     v: Option<*const (dyn T + 'a)>,
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
                 Option[T: covariant]
                 foo[Self: contravariant]
                 TOption['a: covariant]
@@ -294,7 +294,7 @@ struct TestObject<A, R> { //~ ERROR [A: o, R: o]
     m: *const (dyn Getter<R> + Send),
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
                 TestImm[A: covariant, B: covariant]
                 TestMut[A: covariant, B: invariant]
                 TestIndirect[A: covariant, B: invariant]
@@ -314,7 +314,7 @@ struct SomeStruct<'a> { x: u32 } //~ ERROR parameter `'a` is never used
 enum SomeEnum<'a> { Nothing } //~ ERROR parameter `'a` is never used
 trait SomeTrait<'a> { fn foo(&self); } // OK on traits.
 "#,
-        expect![[r#"
+        &expect![[r#"
                 SomeStruct['a: bivariant]
                 SomeEnum['a: bivariant]
                 foo[Self: contravariant, 'a: invariant]
@@ -343,7 +343,7 @@ struct DoubleNothing<T> {
 }
 
 "#,
-        expect![[r#"
+        &expect![[r#"
                 SomeStruct[A: bivariant]
                 SomeEnum[A: bivariant]
                 ListCell[T: bivariant]
@@ -367,7 +367,7 @@ fn foo<'min,'max>(v: SomeStruct<&'max ()>)
     where 'max : 'min
 {}
 "#,
-        expect![[r#"
+        &expect![[r#"
                 SomeStruct[T: contravariant]
                 foo['min: contravariant, 'max: covariant]
             "#]],
@@ -385,7 +385,7 @@ fn bar<'min,'max>(v: SomeStruct<&'min ()>)
     where 'max : 'min
 {}
 "#,
-        expect![[r#"
+        &expect![[r#"
                 SomeStruct[T: contravariant]
                 bar['min: covariant, 'max: contravariant]
             "#]],
@@ -403,7 +403,7 @@ fn foo<'min,'max>(v: SomeStruct<&'min ()>)
     where 'max : 'min
 {}
 "#,
-        expect![[r#"
+        &expect![[r#"
                 SomeStruct[T: covariant]
                 foo['min: contravariant, 'max: covariant]
             "#]],
@@ -421,7 +421,7 @@ fn foo<'min,'max>(v: SomeStruct<&'max ()>)
     where 'max : 'min
 {}
 "#,
-        expect![[r#"
+        &expect![[r#"
                 SomeStruct[T: covariant]
                 foo['min: covariant, 'max: contravariant]
             "#]],
@@ -444,7 +444,7 @@ fn bar<'min,'max>(v: SomeStruct<&'min ()>)
     where 'max : 'min
 {}
 "#,
-        expect![[r#"
+        &expect![[r#"
                 SomeStruct[T: invariant]
                 foo['min: invariant, 'max: invariant]
                 bar['min: invariant, 'max: invariant]
@@ -460,7 +460,7 @@ struct S<T>(T);
 struct S2<T>(S<>);
 struct S3<T>(S<T, T>);
 "#,
-        expect![[r#"
+        &expect![[r#"
                 S[T: covariant]
                 S2[T: bivariant]
                 S3[T: covariant]
@@ -474,7 +474,7 @@ fn prove_fixedpoint() {
         r#"
 struct FixedPoint<T, U, V>(&'static FixedPoint<(), T, U>, V);
 "#,
-        expect![[r#"
+        &expect![[r#"
                 FixedPoint[T: covariant, U: covariant, V: covariant]
             "#]],
     );
@@ -492,14 +492,14 @@ struct Mixed<'a, T, U> {
     d: fn(U),
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
                 Mixed['a: covariant, T: covariant, U: contravariant]
             "#]],
     );
 }
 
 #[track_caller]
-fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected: Expect) {
+fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected: &Expect) {
     // use tracing_subscriber::{layer::SubscriberExt, Layer};
     // let my_layer = tracing_subscriber::fmt::layer();
     // let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(

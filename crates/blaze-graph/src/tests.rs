@@ -581,6 +581,9 @@ fn traces_replay_as_they_were() {
         .unwrap()
         .map(|it| it.unwrap().path())
         .filter(|it| it.extension().is_some_and(|it| it == "jsonl"))
+        // A copy made on a Mac may carry an AppleDouble `._<name>` beside each file: its
+        // metadata (extended attributes, a resource fork), never a trace.
+        .filter(|it| !it.file_name().is_some_and(|it| it.as_encoded_bytes().starts_with(b"._")))
         .collect();
     names.sort();
     assert!(!names.is_empty());

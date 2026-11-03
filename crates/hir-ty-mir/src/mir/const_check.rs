@@ -421,7 +421,7 @@ fn check<'db>(db: &'db Db, owner: InferBodyId<'db>, context: ConstContext) -> Co
 }
 
 /// rustc's `Status` of a `NonConstOp`: refused, or allowed by a feature gate.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum Status {
     Forbidden,
     Unstable {
@@ -737,7 +737,7 @@ fn impl_type_name<'db>(
 ) -> String {
     let self_ty = db.impl_self_ty(impl_);
     let bare = || {
-        super::type_name::rustc_type_name(db, self_ty.skip_binder())
+        hir_ty_print::rustc_type_name(db, self_ty.skip_binder())
             .map(|it| {
                 let bare = it.split('<').next().unwrap_or(&it);
                 // alloc: the text of a diagnostic, made when it is reported
@@ -782,7 +782,7 @@ fn self_ty_name(db: &Db, ty: Ty<'_>) -> TypeName {
         // alloc: the text of a diagnostic, made when it is reported
         return TypeName(Some(name.to_owned()));
     }
-    TypeName(super::type_name::rustc_type_name(db, ty))
+    TypeName(hir_ty_print::rustc_type_name(db, ty))
 }
 
 /// rustc's `def_path_str` of the item `name` in `module`: its modules' names and its own,
@@ -795,7 +795,7 @@ fn def_path<'db>(db: &'db Db, caller: Crate, mut module: ModuleIdLt<'db>, name: 
     loop {
         if module.is_block_module(db)
             && let Some(block) = module.block(db)
-            && let Some((owner, around)) = super::type_name::block_owner(db, block)
+            && let Some((owner, around)) = hir_ty_print::block_owner(db, block)
         {
             owner_segments(db, caller, owner, &mut segments);
             module = around;

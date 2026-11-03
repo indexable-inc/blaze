@@ -300,8 +300,8 @@ impl<'db> FunctionCx<'_, 'db> {
     }
 
     /// A comparison of two `f128`s by compiler-builtins.
-    fn quad_compare(&mut self, op: BinOp, l: Value, r: Value) -> Result<Value> {
-        self.soft_binary_op(&op, l, r)
+    fn quad_compare(&mut self, op: &BinOp, l: Value, r: Value) -> Result<Value> {
+        self.soft_binary_op(op, l, r)
     }
 
     /// `as` where one side is an `f16` or an `f128`.
@@ -402,19 +402,19 @@ impl<'db> FunctionCx<'_, 'db> {
         };
         let low = self.quad_const(quad_bits(to.signed, min));
         let high = self.quad_const(quad_bits(false, quad_floor(max)));
-        let above_low = self.quad_compare(BinOp::Ge, value, low)?;
+        let above_low = self.quad_compare(&BinOp::Ge, value, low)?;
         let raw = self.builtin(name, &[types::F128], ty, &[value])?;
         let raw = if ty.bits() > bits { self.builder.ins().ireduce(to.ty, raw) } else { raw };
         let min = if to.signed { min.wrapping_neg() } else { 0 };
         let (min, max) = (self.iconst(to.ty, min), self.iconst(to.ty, max));
         let value_or_min = self.builder.ins().select(above_low, raw, min);
-        let above_high = self.quad_compare(BinOp::Gt, value, high)?;
+        let above_high = self.quad_compare(&BinOp::Gt, value, high)?;
         let saturated = self.builder.ins().select(above_high, max, value_or_min);
         if !to.signed {
             // NaN is not above zero, so it is zero already.
             return Ok(saturated);
         }
-        let ordered = self.quad_compare(BinOp::Eq, value, value)?;
+        let ordered = self.quad_compare(&BinOp::Eq, value, value)?;
         let zero = self.iconst(to.ty, 0);
         Ok(self.builder.ins().select(ordered, saturated, zero))
     }

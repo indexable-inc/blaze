@@ -1,0 +1,37 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 3ed78b0..d68ab06 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -383,7 +383,6 @@ rustc_index::newtype_index! {
+     /// type -- an idealized representative of "types in general" that we
+     /// use for checking generic functions.
+     #[stable_hash]
+-    #[default]
+     #[encodable]
+     #[orderable]
+     #[debug_format = "U{}"]
+@@ -431,6 +430,12 @@ impl UniverseIndex {
+     }
+ }
+ 
++impl Default for UniverseIndex {
++    fn default() -> Self {
++        Self::ROOT
++    }
++}
++
+ rustc_index::newtype_index! {
+     #[stable_hash]
+     #[encodable]
+diff --git a/src/sty/mod.rs b/src/sty/mod.rs
+index d513dd8..8b83e6d 100644
+--- a/src/sty/mod.rs
++++ b/src/sty/mod.rs
+@@ -310,6 +310,7 @@ impl<I: Interner> TypeFoldable<I> for Region<I> {
+ }
+ 
+ #[derive_where(Clone, Copy, PartialEq, Eq, Hash; I: Interner)]
++#[derive(GenericTypeVisitable)]
+ #[cfg_attr(
+     feature = "nightly",
+     derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)

@@ -318,7 +318,7 @@ impl Server {
     }
 
     /// Sends a reply; one to a connection that is gone is dropped.
-    pub fn reply(&mut self, reply: Reply, effects: &mut Vec<Effect>) {
+    pub fn reply(&mut self, reply: &Reply, effects: &mut Vec<Effect>) {
         let RequestRef { conn, id } = reply.to;
         let Some(connection) = self.conns.get_mut(&conn) else { return };
         let Connection { reader, queue, closing, last_request, .. } = connection;

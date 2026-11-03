@@ -5,7 +5,7 @@
 //! The crate of [`FIXTURE`] has a module `a` that `b` reads names of, `c` globs, and that reads
 //! nothing; `e`, which `d` reads a name of and `y` globs. Each test edits one file of a fresh
 //! database, then checks which modules' queries ran, and that the edited crate's new map still
-//! equals the old collector's.
+//! agrees with the maintained one ([`compare_db`]).
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
@@ -13,7 +13,7 @@ use std::alloc::Global;
 use blaze_query::db::FromId;
 use hir_expand::fixture;
 
-use super::{Exempt, compare_db, new_crate_local_def_map};
+use super::{Exempt, compare_db, facts_crate_local_def_map};
 use crate::{
     ModuleId,
     nameres::facts::queries::{self, DeclKey, FactKey, RoundKey, RoundKind, SccKey},
@@ -131,15 +131,15 @@ fn edit(file: usize, text: &str) -> (TestDB, Vec<(String, blaze_query::db::Id)>)
     let files = fx.files().to_vec();
     let mut db = fx.into_db();
     let krate = db.fetch_test_crate();
-    new_crate_local_def_map(&db, krate);
+    facts_crate_local_def_map(&db, krate);
     let file_id = files[file].file_id(&db);
     let events = executed_write(&mut db, |db| {
         db.set_file_text(file_id, text);
-        new_crate_local_def_map(db, krate);
+        facts_crate_local_def_map(db, krate);
     });
     let mut diff = String::new();
     compare_db(&db, "trace edit", &Exempt::NONE, &mut diff);
-    assert!(diff.is_empty(), "after the edit, old and new def maps differ:\n{diff}");
+    assert!(diff.is_empty(), "after the edit, the def maps differ:\n{diff}");
     (db, events)
 }
 
@@ -189,18 +189,18 @@ fn adding_an_import_reruns_the_partition_and_only_the_readers_of_the_scopes_that
     let files = fx.files().to_vec();
     let mut db = fx.into_db();
     let krate = db.fetch_test_crate();
-    new_crate_local_def_map(&db, krate);
+    facts_crate_local_def_map(&db, krate);
     read_scopes(&db, &final_scopes(&db, krate));
     let a = files[A].file_id(&db);
     let events = executed_write(&mut db, |db| {
         db.set_file_text(a, "use crate::e::E;\npub struct A;\npub fn helper() { let _ = 0; }\n");
-        new_crate_local_def_map(db, krate);
+        facts_crate_local_def_map(db, krate);
     });
     assert!(events.iter().any(|(name, _)| name == "import_shape"), "{events:?}");
     assert!(events.iter().any(|(name, _)| name == "partition"), "{events:?}");
     let mut diff = String::new();
     compare_db(&db, "trace import", &Exempt::NONE, &mut diff);
-    assert!(diff.is_empty(), "after the edit, old and new def maps differ:\n{diff}");
+    assert!(diff.is_empty(), "after the edit, the def maps differ:\n{diff}");
     let scopes = final_scopes(&db, krate);
     let reads = executed(&db, || read_scopes(&db, &scopes));
     // `a` gains `E`, private to `a`, so `c`'s glob of `a` imports nothing new. `b` reads
@@ -225,7 +225,7 @@ fn a_negative_fact_flips_when_the_name_appears() {
     let (db, events) = edit(A, "pub struct A;\npub fn helper() { let _ = 0; }\npub struct N;\n");
     assert!(ran(&db, &events, "scc_state").contains("crate::b"), "{events:?}");
     let krate = db.fetch_test_crate();
-    let map = new_crate_local_def_map(&db, krate).def_map(&db);
+    let map = facts_crate_local_def_map(&db, krate).def_map(&db);
     let b = map
         .modules(&db)
         .find(|&(id, _)| path(&db, id) == "crate::b")
@@ -241,7 +241,7 @@ fn a_negative_fact_holds_before_the_name_appears() {
     let _ = fx.files().to_vec();
     let db = fx.into_db();
     let krate = db.fetch_test_crate();
-    let map = new_crate_local_def_map(&db, krate).def_map(&db);
+    let map = facts_crate_local_def_map(&db, krate).def_map(&db);
     let (b_id, b) = map
         .modules(&db)
         .find(|&(id, _)| path(&db, id) == "crate::b")
@@ -274,10 +274,10 @@ fn removing_a_read_name_reruns_its_reader() {
     let krate = db.fetch_test_crate();
     let a = files[A].file_id(&db);
     db.set_file_text(a, "pub struct A;\npub fn helper() { let _ = 0; }\npub fn foo() {}\n");
-    new_crate_local_def_map(&db, krate);
+    facts_crate_local_def_map(&db, krate);
     db.set_file_text(a, "pub struct A;\npub fn helper() { let _ = 0; }\n");
     let events = executed(&db, || {
-        new_crate_local_def_map(&db, krate);
+        facts_crate_local_def_map(&db, krate);
     });
     assert_eq!(
         ran(&db, &events, "scc_state"),
@@ -286,7 +286,7 @@ fn removing_a_read_name_reruns_its_reader() {
     );
     let mut diff = String::new();
     compare_db(&db, "trace removal", &Exempt::NONE, &mut diff);
-    assert!(diff.is_empty(), "after the edit, old and new def maps differ:\n{diff}");
+    assert!(diff.is_empty(), "after the edit, the def maps differ:\n{diff}");
 }
 
 #[test]

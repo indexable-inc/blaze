@@ -522,7 +522,7 @@ impl<'db> Body<'_, '_, 'db> {
         }
         let mut work = match self.closures(&chain)? {
             Ok(it) => it,
-            Err(dependence) => return self.serial_chain(id, receiver, dependence, chain.overhead()),
+            Err(dependence) => return self.serial_chain(id, receiver, &dependence, chain.overhead()),
         };
         let output = infer.expr_ty(id);
         let mut reduction = None;
@@ -537,7 +537,7 @@ impl<'db> Body<'_, '_, 'db> {
                     }
                     Closure::Captures => {
                         let dependence = Dependence::Carried { name: format!(".{method}(..)") };
-                        return self.serial_chain(id, receiver, dependence, work);
+                        return self.serial_chain(id, receiver, &dependence, work);
                     }
                 }
             }
@@ -555,7 +555,7 @@ impl<'db> Body<'_, '_, 'db> {
                 if matches!(result.kind(), TyKind::Float(_)) && !self.m.reassociate {
                     let dependence =
                         Dependence::Float { name: format!(".{method}()"), reduction: it };
-                    return self.serial_chain(id, receiver, dependence, work);
+                    return self.serial_chain(id, receiver, &dependence, work);
                 }
                 if !matches!(result.kind(), TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)) {
                     return None;
@@ -567,7 +567,7 @@ impl<'db> Body<'_, '_, 'db> {
                 let is = |it: Option<hir_def::AdtId>| it == Some(adt);
                 if is(std.hash_set) || is(std.hash_map) {
                     let dependence = Dependence::HashOrder { name: ".collect()".to_owned() };
-                    return self.serial_chain(id, receiver, dependence, work);
+                    return self.serial_chain(id, receiver, &dependence, work);
                 }
                 if !(is(std.vec) || is(std.string) || is(std.btree_set) || is(std.btree_map)) {
                     return None;
@@ -627,7 +627,7 @@ impl<'db> Body<'_, '_, 'db> {
         &self,
         id: hir_def::hir::ExprId,
         receiver: hir_def::hir::ExprId,
-        dependence: Dependence,
+        dependence: &Dependence,
         work: u64,
     ) -> Option<Finding> {
         let head = Head::of(self.db(), self.analysis.body(), self.analysis.infer(), receiver);

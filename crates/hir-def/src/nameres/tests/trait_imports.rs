@@ -9,7 +9,7 @@ use crate::nameres::diagnostics::DefDiagnosticKind;
 /// reason for an import of trait items, `other` for the rest.
 fn check_trait_imports(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
-    expect: Expect,
+    expect: &Expect,
     diagnostics: &[&str],
 ) {
     compute_crate_def_map(ra_fixture, |db, def_map| {
@@ -37,7 +37,7 @@ trait Tr {
 }
 use self::Tr::*;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - C : value (glob)
             - T : type (glob)
@@ -59,7 +59,7 @@ trait Tr {
 }
 use self::Tr::*;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - C : value (glob)
             - T : type (glob)
@@ -82,7 +82,7 @@ trait Tr {
 }
 use self::Tr::{f, C, T};
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - C : value (import)
             - T : type (import)
@@ -104,7 +104,7 @@ trait Tr {
 }
 use self::Tr::{f, C, T};
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - C : value (import)
             - T : type (import)
@@ -125,7 +125,7 @@ trait Tr {
 }
 use self::Tr::X;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Tr : type
             - X : type (import) value (import)
@@ -149,7 +149,7 @@ pub trait Tr {
     m!();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - T : type (glob)
             - f : value (glob)
@@ -172,7 +172,7 @@ trait Tr {
 use self::Tr::*;
 use self::Tr::f as h;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Tr : type
             - h : _
@@ -194,7 +194,7 @@ trait Tr {
 }
 use self::Tr::*;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Tr : type
             - f : value (glob)

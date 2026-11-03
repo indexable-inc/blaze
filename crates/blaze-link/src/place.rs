@@ -211,6 +211,7 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         LazyStubs => 26,
         LazyEntry(_) => 27,
         StaticList(..) => 28,
+        Thunk(..) => 29,
     };
     let seven = |bytes: &[u8]| {
         let mut out = [0u8; 8];
@@ -224,7 +225,7 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         Local(obj, _) | Section(obj, _) | Frame(obj, ..) => seven(&symbols.content(obj.native).0),
         Name(name) | FileName(name) | IatEnd(name) | Common(name) => seven(symbols.str(name).as_bytes()),
         Got(kind, _) => (kind as u64) << 48,
-        Plt(_) | Generation | Cells | Stubs | Descriptor | Counters | StartHook | LazyStubs => 0,
+        Plt(_) | Thunk(..) | Generation | Cells | Stubs | Descriptor | Counters | StartHook | LazyStubs => 0,
     };
     tag << 56 | rest
 }
@@ -571,6 +572,12 @@ impl<'a> Stage<'a> {
                 ids.clear();
                 ids.extend(entries.iter().map(|it| it.id));
             });
+        }
+        // AArch64 code is cut into segments, each followed by its island of thunks (`thunk`).
+        if self.output.arch == blaze_codegen::Arch::Aarch64 && !self.plan.indexed_code {
+            if let Some(ids) = self.new.find_class(&Class::Text).and_then(|it| groups.get_mut(it.0 as usize)) {
+                self.islands(ids);
+            }
         }
         if let Some(iat) = iat {
             if let Some(ids) = groups.get(iat.0 as usize) {

@@ -13,6 +13,10 @@ use crate::{as_rustc, pin, versions};
 
 /// The program `blaze`, whose `src/main.rs` and `src/bin/blaze.rs` are only this.
 pub fn main() -> ExitCode {
+    // A bug blaze reports and goes on past (`stdx::assert::reported`) is said by the daemon in
+    // `blaze status` and the profile; it doesn't change how this process exits, as it does a
+    // test's.
+    stdx::assert::reported::keep_exit_status();
     if std::env::args_os().nth(1).is_some_and(|it| it == blaze_cargo::sandbox::COMMAND) {
         blaze_cargo::sandbox::command(std::env::args_os().skip(2));
     }
@@ -24,6 +28,14 @@ pub fn main() -> ExitCode {
     // out, never this executable's bytes (`hir_ty_codegen::v2::code`).
     if let Err(why) = hir_ty_codegen::v2::CodegenCode::from_hex(env!("BLAZE_CODEGEN_CODE"))
         .and_then(hir_ty_codegen::v2::set_code)
+    {
+        eprintln!("error: {why}");
+        return ExitCode::FAILURE;
+    }
+    // What images, stored goals and bodies and kept expansions are keyed by: the front end's
+    // code, worked out in the same walk (`blaze_cargo::serve::front_end_code`).
+    if let Err(why) = blaze_cargo::serve::FrontEndCode::from_hex(env!("BLAZE_FRONT_END_CODE"))
+        .and_then(blaze_cargo::serve::set_front_end_code)
     {
         eprintln!("error: {why}");
         return ExitCode::FAILURE;

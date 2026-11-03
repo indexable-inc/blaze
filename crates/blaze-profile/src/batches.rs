@@ -18,7 +18,7 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 
 use crate::{
-    flight::{self, CounterRow, EventRow, Read, SpanRow, SwitchRow, ThreadNow, WaitedOn},
+    flight::{self, CounterRow, EventRow, FoldRow, Read, SpanRow, SwitchRow, ThreadNow, WaitedOn},
     sampler::Sample,
     schema::{self, Table},
     span,
@@ -229,6 +229,7 @@ pub fn open(threads: &[ThreadNow], at_ns: i64, process: Process<'_>) -> Result<R
         column(StringArray::from_iter(spans().map(|(_, (_, span))| span.unit.as_deref()))),
         column(StringArray::from_iter(spans().map(|(_, (_, span))| span.awaits.as_deref()))),
         column(UInt64Array::from_iter(spans().map(|(_, (_, span))| span.owner))),
+        column(Int64Array::from_value(at_ns, rows)),
     ];
     RecordBatch::try_new(schema_of(&schema::OPEN), columns)
 }
@@ -336,6 +337,39 @@ pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, 
         column(UInt64Array::from_iter(events.iter().map(|it| (it.span != 0).then_some(it.span)))),
     ];
     RecordBatch::try_new(schema_of(&schema::EVENTS), columns)
+}
+
+/// The `folded` rows of a read: its sums of short spans.
+pub fn folded(folds: &[FoldRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+    let rows = folds.len();
+    let (mut threads, mut names, mut targets) = (Dict::new(), Dict::new(), Dict::new());
+    // alloc: a batch's keys, once a read
+    let (mut thread_keys, mut name_keys, mut target_keys) = (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
+    for row in folds {
+        let meta = flight::meta(row.site);
+        thread_keys.push(threads.key(u64::from(row.thread_name), || flight::name(row.thread_name).unwrap_or_else(|| "?".into())));
+        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name())));
+        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target())));
+    }
+    // alloc: a batch's list of columns, once a read
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt64Array::from_iter(folds.iter().map(|it| build_id(it.build)))),
+        column(UInt32Array::from_value(process.pid, rows)),
+        column(UInt32Array::from_iter_values(folds.iter().map(|it| it.thread))),
+        threads.finish(UInt32Array::from(thread_keys))?,
+        names.finish(UInt32Array::from(name_keys))?,
+        targets.finish(UInt32Array::from(target_keys))?,
+        column(UInt32Array::from_iter_values(folds.iter().map(|it| u32::from(it.root)))),
+        column(Int64Array::from_iter_values(folds.iter().map(|it| it.from_ns))),
+        column(Int64Array::from_iter_values(folds.iter().map(|it| it.to_ns))),
+        column(UInt64Array::from_iter_values(folds.iter().map(|it| it.spans))),
+        column(Int64Array::from_iter_values(folds.iter().map(|it| it.dur_ns))),
+        column(Int64Array::from_iter_values(folds.iter().map(|it| it.max_dur_ns))),
+        column(Int64Array::from_iter(folds.iter().map(|it| it.self_cpu_ns.map(|it| it as i64)))),
+        column(UInt64Array::from_iter(folds.iter().map(|it| it.alloc.map(|it| it.bytes)))),
+        column(UInt64Array::from_iter(folds.iter().map(|it| it.alloc.map(|it| it.count)))),
+    ];
+    RecordBatch::try_new(schema_of(&schema::FOLDED), columns)
 }
 
 /// Both tables of a read: `spans` then `counters`.

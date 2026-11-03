@@ -102,7 +102,7 @@ pub(crate) fn function(
         0
     };
     // alloc: none until it has data of its own, which the result keeps
-    let mut own = OwnData { data: Vec::new(), word: word(arch), owner: None };
+    let mut own = OwnData { data: Vec::new(), word: word(arch), owner: key.0 };
     let size = code.bytes.len();
     let names: Relocs<RelocName> = Relocs::try_from_iter_in(
         frame,
@@ -186,7 +186,7 @@ pub(crate) fn names(
     resolve: &impl Resolver,
 ) -> Result<(Vec<Option<Target>>, Vec<Data>), String> {
     // alloc: none until it has data of its own, which the caller keeps
-    let mut own = OwnData { data: Vec::new(), word: word(arch), owner: None };
+    let mut own = OwnData { data: Vec::new(), word: word(arch), owner: key.0 };
     let declared = func.params.user_named_funcs();
     let named = declared.values().filter(|it| it.namespace == 1).map(|it| it.index as usize);
     let datas = own.requests(frame, requests, resolve, named)?;
@@ -252,7 +252,7 @@ pub(crate) fn value(
     resolve: &impl Resolver,
 ) -> Result<(Vec<Data>, Relocs), String> {
     // alloc: none until it has data of its own, which the caller keeps
-    let mut own = OwnData { data: Vec::new(), word: word(arch), owner: Some(*owner) };
+    let mut own = OwnData { data: Vec::new(), word: word(arch), owner: *owner };
     let named = blob.relocs.iter().map(|&(_, data, _)| data.as_u32() as usize);
     let targets = own.requests(frame, requests, resolve, named)?;
     let relocs = own.relocs(blob, requests.datas.len(), &targets, requests, resolve)?;
@@ -282,9 +282,11 @@ pub(crate) fn word(arch: Arch) -> Word {
 struct OwnData {
     data: Vec<Data>,
     word: Word,
-    /// The item key of the static whose value this is, whose writable objects are its own
-    /// ([`Data::owned`]); none for a function, whose data is read-only.
-    owner: Option<ContentId>,
+    /// Whose writable objects are its own ([`Data::owned`]): the item key of the static whose
+    /// value this is, or the instance key of the function, whose one writable object is a
+    /// promoted temporary its code writes each call (`promoted_slot`). Each instance has its
+    /// own, as [`blaze_codegen::template::Template::instantiate`] makes them.
+    owner: ContentId,
 }
 
 impl OwnData {
@@ -366,13 +368,11 @@ impl OwnData {
         let align = u32::try_from(blob.align).map_err(|e| e.to_string())?;
         // clone: the data owns its bytes; the request, which the caller keeps, has the blob's
         let bytes = blob.bytes.clone();
-        match (writable, &self.owner) {
-            (false, _) => Ok(Data::new(align, bytes, relocs)),
-            // Its index is where `push` puts it, as `StaticTemplate::instantiate` numbers it.
-            (true, Some(owner)) => Ok(Data::owned(owner, self.data.len() as u32, align, bytes, relocs)),
-            // alloc: an error
-            (true, None) => Err("data a function writes to, which is no constant (`promoted_slot`)".to_owned()),
-        }
+        Ok(match writable {
+            false => Data::new(align, bytes, relocs),
+            // Its index is where `push` puts it, as a template's `instantiate` numbers it.
+            true => Data::owned(&self.owner, self.data.len() as u32, align, bytes, relocs),
+        })
     }
 
     /// The relocations of `blob`, the data request `index` (or what comes after them all),

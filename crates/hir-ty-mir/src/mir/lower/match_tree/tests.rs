@@ -24,7 +24,7 @@ impl<'t> OldTree<'t, '_> {
         loop {
             let Some(first) = candidates.first() else { return start };
             match first.pairs.first() {
-                None => start = self.matched(start, candidates.remove(0)),
+                None => start = self.matched(start, &candidates.remove(0)),
                 Some(_) if candidates.iter().any(starts_with_or) => {
                     (start, candidates) = self.expand(start, candidates)
                 }
@@ -33,8 +33,8 @@ impl<'t> OldTree<'t, '_> {
         }
     }
 
-    fn matched(&mut self, start: bool, candidate: Candidate<'t>) -> bool {
-        let Candidate { arm, guarded, then, .. } = candidate;
+    fn matched(&mut self, start: bool, candidate: &Candidate<'t>) -> bool {
+        let Candidate { arm, guarded, then, .. } = *candidate;
         let Some(then) = then else {
             if start {
                 self.reached.insert(arm);

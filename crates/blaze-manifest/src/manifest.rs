@@ -407,7 +407,7 @@ pub fn read_manifest<F: Files>(
         )?;
         if normalized_toml.package().is_some() {
             to_real_manifest(
-                original_toml,
+                &original_toml,
                 normalized_toml,
                 features,
                 workspace_config,
@@ -892,8 +892,8 @@ fn normalize_dependencies<F: Files>(
     };
     let mut deps = BTreeMap::new();
     for (name_in_toml, v) in dependencies {
-        let mut resolved = match v.clone() {
-            manifest::InheritableDependency::Value(value) => value,
+        let mut resolved = match v {
+            manifest::InheritableDependency::Value(value) => value.clone(),
             manifest::InheritableDependency::Inherit(w) => {
                 inner_dependency_inherit_with(w, name_in_toml, inherit, package_root, edition, warnings)
                     .with_context(|| {
@@ -1037,7 +1037,7 @@ fn lints_inherit_with(
 }
 
 fn inner_dependency_inherit_with<F: Files>(
-    pkg_dep: TomlInheritedDependency,
+    pkg_dep: &TomlInheritedDependency,
     name: &str,
     inherit: &Inherit<'_, F>,
     package_root: &Path,
@@ -1123,7 +1123,7 @@ pub(crate) fn deprecated_underscore<T>(
 
 #[allow(clippy::too_many_arguments)]
 fn to_real_manifest<F: Files>(
-    original_toml: TomlManifest,
+    original_toml: &TomlManifest,
     normalized_toml: TomlManifest,
     features: Features,
     workspace_config: WorkspaceConfig,
@@ -1232,7 +1232,7 @@ fn to_real_manifest<F: Files>(
 
     let targets = targets::to_targets(
         &features,
-        &original_toml,
+        original_toml,
         &normalized_toml,
         package_root,
         edition,

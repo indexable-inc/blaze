@@ -203,6 +203,8 @@ pub struct Stored {
 /// A crate served before under the same key and mode keeps its image as it is and is not
 /// fetched again. One whose key or mode is another is fetched again, and loses its image when
 /// none is found. The frozen def maps and lang items `db` was given for other crates are kept.
+/// A write that moves a served crate's files has already taken its image away, in that write
+/// (`withdraw_moved`): it is fetched again here like a crate never served.
 ///
 /// An image that does not read under the key it is filed by, or reads that do not decode, are
 /// an error naming the crate and why, never a crate resolved instead: the key covers what the
@@ -342,6 +344,123 @@ fn open(db: &Db, krate: Crate, filed: ContentId, bytes: ImageBuf) -> Fetched {
     }
     let parts = image.ranges(bytes.bytes());
     Ok(Found::Hit { bytes, parts, filed })
+}
+
+inventory::submit! {
+    base_db::Implied { name: "dependency images withdrawn", write: withdraw_moved }
+}
+
+/// The write implied by a change to the files of crates read from images. A crate whose own
+/// files moved loses its image, frozen def map and lang items in the same write. Its own files
+/// moved when a file of its source root was set, added or removed: an edit, a build script's
+/// run that left other `OUT_DIR` files, a view moved. So does every crate read from an image
+/// that depends on a crate whose files moved, whether that crate is served or not. The
+/// maintainers then go over the crate graph again, as after a [`serve`] that takes an image
+/// away.
+///
+/// The key covers every file of the crate's source root and every crate it depends on, so the
+/// image no longer names the crate. Kept, it would be read against files it was not made from,
+/// which the content check refuses ([`frozen::Unreadable`]). The next [`serve`] fetches it
+/// under its new key. A serve in the same batch as a write of its crates' files is withdrawn
+/// by it: drivers serve in a batch of its own, after the writes.
+///
+/// A crate whose cfg or env alone moved keeps its image until that serve. The image still
+/// reads, and holds what the crate was before the write.
+fn withdraw_moved(db: &mut Db, written: &base_db::Written<'_>) {
+    let gone = moved_served(db, written);
+    if gone.is_empty() {
+        return;
+    }
+    tracing::info!(target: "blaze", crates = gone.len(), "dependency images withdrawn: their files moved");
+    withdraw(db, &gone);
+}
+
+/// The crates given an image or frozen bytes that `written` moved the files of, or of a crate
+/// they depend on: what [`withdraw_moved`] takes away.
+fn moved_served(db: &Db, written: &base_db::Written<'_>) -> Vec<Crate> {
+    if written.set.is_empty() && written.added.is_empty() && written.removed.is_empty() && written.roots.is_empty() {
+        // alloc: none, an empty list
+        return Vec::new();
+    }
+    let served = served_crates(db);
+    if served.is_empty() {
+        return served;
+    }
+    let moved = moved_crates(db, written);
+    if moved.is_empty() {
+        // alloc: none, an empty list
+        return Vec::new();
+    }
+    // alloc: one entry per crate walked, once per write that moved a served crate's files
+    let mut reaches = HashMap::new_in(Global);
+    // alloc: as above
+    served.into_iter().filter(|&krate| reaches_moved(db, krate, &moved, &mut reaches)).collect()
+}
+
+/// Every crate given an image, a frozen def map or frozen lang items, sorted.
+fn served_crates(db: &Db) -> Vec<Crate> {
+    // alloc: once per write that moved a file while any crate is served
+    let mut crates = Vec::new();
+    if let Some(it) = DepImages::try_get(db) {
+        crates.extend(it.images(db).keys().copied());
+    }
+    if let Some(it) = FrozenDefMaps::try_get(db) {
+        crates.extend(it.maps(db).keys().copied());
+    }
+    if let Some(it) = FrozenLangItems::try_get(db) {
+        crates.extend(it.maps(db).keys().copied());
+    }
+    crates.sort_unstable();
+    crates.dedup();
+    crates
+}
+
+/// The crates whose root is in a source root `written` moved: a file of it set or added, or
+/// its file set changed (which covers a file removed).
+fn moved_crates(db: &Db, written: &base_db::Written<'_>) -> HashSet<Crate, Global> {
+    // alloc: once per write that moved a file while any crate is served
+    let mut roots: Vec<base_db::SourceRootId> = written.roots.to_vec();
+    for &file in written.set.iter().chain(written.added) {
+        roots.push(db.file_source_root(file).source_root_id(db));
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    // alloc: as above
+    roots.iter().flat_map(|&root| base_db::source_root_crates(db, root).iter().copied()).collect()
+}
+
+/// Whether `krate` is one of `moved` or depends on one, through any path: memoized in `memo`.
+fn reaches_moved(
+    db: &Db,
+    krate: Crate,
+    moved: &HashSet<Crate, Global>,
+    memo: &mut HashMap<Crate, bool, Global>,
+) -> bool {
+    if let Some(&it) = memo.get(&krate) {
+        return it;
+    }
+    let it = moved.contains(&krate)
+        || krate.data(db).dependencies.iter().any(|dep| reaches_moved(db, dep.crate_id, moved, memo));
+    memo.insert(krate, it);
+    it
+}
+
+/// Takes the image, frozen def map and frozen lang items of each of `gone` away, and has the
+/// maintainers go over the crate graph again: from here on each resolves as a fresh crate.
+fn withdraw(db: &mut Db, gone: &[Crate]) {
+    // clone: what was served, once per write that withdraws an image
+    let mut images = DepImages::try_get(&*db).map(|it| (**it.images(&*db)).clone()).unwrap_or_default();
+    let mut maps = copied(FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db)));
+    let mut lang_items = copied(FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db)));
+    for krate in gone {
+        images.remove(krate);
+        maps.remove(krate);
+        lang_items.remove(krate);
+    }
+    frozen::set(db, maps);
+    frozen::set_lang_items(db, lang_items);
+    set_images(db, images);
+    db.note_crates_changed();
 }
 
 fn set_images(db: &mut Db, images: HashMap<Crate, Image, Global>) {

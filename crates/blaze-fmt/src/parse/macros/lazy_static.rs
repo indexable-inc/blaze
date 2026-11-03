@@ -10,7 +10,7 @@ use crate::rewrite::RewriteContext;
 
 pub(crate) fn parse_lazy_static(
     context: &RewriteContext<'_>,
-    ts: TokenStream,
+    ts: &TokenStream,
 ) -> Option<Vec<(ast::Visibility, symbol::Ident, Box<ast::Ty>, Box<ast::Expr>)>> {
     let mut result = vec![];
     let mut parser = super::build_parser(context, ts);

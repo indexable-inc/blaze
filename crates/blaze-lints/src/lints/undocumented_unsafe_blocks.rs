@@ -48,12 +48,13 @@ fn check_block<'t>(cx: &mut Cx<'_, 't>, block: ast::BlockExpr<'t>) {
     if !text[usize::from(range.start())..].starts_with("unsafe") {
         return;
     }
-    if has_safety_comment(between_lines(text, 0, usize::from(range.start()))) {
+    let attrs = above_attributes(cx);
+    if has_safety_comment(between_lines(text, 0, usize::from(range.start())), attrs) {
         return;
     }
     if cx.conf().bool("accept-comment-above-statement", true)
         && let Some(start) = parent_start(cx, node)
-        && has_safety_comment(between_lines(text, 0, usize::from(start)))
+        && has_safety_comment(between_lines(text, 0, usize::from(start)), attrs)
     {
         return;
     }
@@ -80,7 +81,7 @@ fn check_impl<'t>(cx: &mut Cx<'_, 't>, imp: ast::Impl<'t>) {
     }
     let Some(comment_start) = comment_start_before_item(cx, node) else { return };
     let between = between_lines(text, usize::from(comment_start), usize::from(range.start()));
-    if has_safety_comment(between) {
+    if has_safety_comment(between, above_attributes(cx)) {
         return;
     }
     let span = cx.span(until_newline(text, range));
@@ -221,14 +222,30 @@ fn between_lines(text: &str, from: usize, to: usize) -> &str {
     }
 }
 
+/// `accept-comment-above-attributes` (on by default): whether the comment may be above the
+/// attributes of what is linted, as in
+///
+/// ```ignore
+/// // SAFETY: ...
+/// #[cfg(unix)]
+/// unsafe impl Send for Fd {}
+/// ```
+fn above_attributes(cx: &Cx<'_, '_>) -> bool {
+    cx.conf().bool("accept-comment-above-attributes", true)
+}
+
 /// clippy's `text_has_safety_comment` over `region`, the lines above what is linted: the
-/// nearest line that is not blank is a line comment of a run of them, one of which says
-/// `SAFETY:` (outside a doc comment's code block), or below the start of a block comment that
-/// says `SAFETY:` and that only whitespace follows.
-fn has_safety_comment(region: &str) -> bool {
+/// nearest line that is not blank (nor, with `attrs`, an attribute on a line of its own) is a
+/// line comment of a run of them, one of which says `SAFETY:` (outside a doc comment's code
+/// block), or below the start of a block comment that says `SAFETY:` and that only whitespace
+/// follows.
+fn has_safety_comment(region: &str, attrs: bool) -> bool {
     let base = region.as_ptr() as usize;
-    let mut lines =
-        region.split_inclusive('\n').rev().map(str::trim_start).filter(|it| !it.is_empty());
+    let mut lines = region
+        .split_inclusive('\n')
+        .rev()
+        .map(str::trim_start)
+        .filter(|it| !(it.is_empty() || (attrs && is_attribute(it))));
     let Some(mut line) = lines.next() else { return false };
     if line.starts_with("//") {
         let mut in_codeblock = false;
@@ -256,6 +273,11 @@ fn has_safety_comment(region: &str) -> bool {
             None => return false,
         }
     }
+}
+
+/// clippy's `is_attribute`: a line that is an outer or inner attribute, whole.
+fn is_attribute(line: &str) -> bool {
+    (line.starts_with("#[") || line.starts_with("#![")) && line.trim_end().ends_with(']')
 }
 
 /// Whether `text`, in ASCII upper case, holds `SAFETY:`.
@@ -312,21 +334,31 @@ mod tests {
 
     #[test]
     fn line_comments() {
-        assert!(has_safety_comment("// SAFETY: fine\n"));
-        assert!(has_safety_comment("// Safety: fine\n\n"));
-        assert!(has_safety_comment("// SAFETY:\n// more of it\n"));
-        assert!(!has_safety_comment("// SAFETY: fine\nlet x = 1;\n"));
-        assert!(!has_safety_comment("// nothing said\n"));
-        assert!(!has_safety_comment(""));
-        assert!(!has_safety_comment("/// ```\n/// SAFETY: in a code block\n/// ```\n"));
+        assert!(has_safety_comment("// SAFETY: fine\n", true));
+        assert!(has_safety_comment("// Safety: fine\n\n", true));
+        assert!(has_safety_comment("// SAFETY:\n// more of it\n", true));
+        assert!(!has_safety_comment("// SAFETY: fine\nlet x = 1;\n", true));
+        assert!(!has_safety_comment("// nothing said\n", true));
+        assert!(!has_safety_comment("", true));
+        assert!(!has_safety_comment("/// ```\n/// SAFETY: in a code block\n/// ```\n", true));
+    }
+
+    #[test]
+    fn attributes_between() {
+        let region = "// SAFETY: fine\n#[cfg(not(blaze_check))]\n#[allow(unsafe_code)]\n";
+        assert!(has_safety_comment(region, true));
+        assert!(!has_safety_comment(region, false));
+        // An attribute over lines is not skipped, as clippy's line test does not.
+        assert!(!has_safety_comment("// SAFETY: fine\n#[cfg(any(\n    unix,\n))]\n", true));
+        assert!(!has_safety_comment("/* SAFETY: fine */\n#[cfg(unix)]\n", true));
     }
 
     #[test]
     fn block_comments() {
-        assert!(has_safety_comment("/* SAFETY: fine */\n"));
-        assert!(has_safety_comment("/* SAFETY:\n   over lines */\n"));
-        assert!(!has_safety_comment("/* SAFETY: fine */\nfoo();\n"));
-        assert!(!has_safety_comment("/* nothing said */\n"));
+        assert!(has_safety_comment("/* SAFETY: fine */\n", true));
+        assert!(has_safety_comment("/* SAFETY:\n   over lines */\n", true));
+        assert!(!has_safety_comment("/* SAFETY: fine */\nfoo();\n", true));
+        assert!(!has_safety_comment("/* nothing said */\n", true));
         assert_eq!(block_comment_len("/* a /* b */ c */ d"), 17);
         assert_eq!(block_comment_len("/* open"), 7);
     }

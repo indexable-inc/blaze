@@ -34,7 +34,7 @@ use std::{
 };
 
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
-use blaze_hash::FixedHasher;
+use blaze_hash::LazyKey;
 use blaze_mem::{AppendVec, MemError, RegionVec};
 
 use crate::sync::{
@@ -153,6 +153,11 @@ fn span(level: usize) -> std::ops::Range<usize> {
     TABLE * ((1 << level) - 1)..TABLE * ((1 << (level + 1)) - 1)
 }
 
+/// What a directory's hash is keyed by, drawn at random on first use: the directories are
+/// where user code (a build script, a proc macro, a traced read) looked, so a hash anyone can
+/// compute would let it pick thousands with one tag, each then probing past all of them.
+static DIR_KEY: LazyKey = LazyKey::new();
+
 /// Marks the end of a part in a key's hash: the parts are hashed in turn, so one pass over a
 /// path gives the tag of every directory above it.
 const PART: u8 = 0xff;
@@ -170,7 +175,7 @@ fn tag(key: &[u8]) -> u32 {
 /// Calls `each(end, tag)` for each directory at or above `bytes`, shortest first: `bytes[..end]`
 /// and its [`tag`], in one pass over the bytes. Stops when `each` says false.
 fn prefixes(bytes: &[u8], mut each: impl FnMut(usize, u32) -> bool) {
-    let mut hasher = FixedHasher::default();
+    let mut hasher = DIR_KEY.get().hasher();
     let mut start = 0;
     for at in 0..=bytes.len() {
         if at < bytes.len() && !is_separator(bytes[at]) {

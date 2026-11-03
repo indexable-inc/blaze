@@ -282,6 +282,10 @@ impl<'q> Driver<'q> {
             // clone: an error's names, once
             return Err(diag::CheckError::SuspendUnchecked { file: file.name.clone(), why: why.clone() });
         }
+        if let Some(why) = &lints.not_in_map {
+            // clone: an error's names, once
+            return Err(diag::CheckError::NotInAstIdMap { file: file.name.clone(), why: why.clone() });
+        }
         let moved = |range: TextRange| range + TextSize::new(offset);
         for Finding { lint, at: found_at, place, diagnostic } in &lints.findings {
             // clone: a finding's diagnostic, out of the query's value, to be given its level
@@ -819,6 +823,8 @@ pub(crate) struct Cx<'q: 't, 't> {
     /// Why the may-suspend check a fiber lint asked of checks nothing, said
     /// ([`Cx::suspend_checked`]).
     unchecked: OnceCell<String>,
+    /// The first path whose resolution missed the analysis' ast id map ([`Cx::path`]).
+    not_in_map: OnceCell<String>,
     /// The expansions read, with the call of each.
     trees: RefCell<Vec<(&'q FlatTree, MacroCallId)>>,
     walking: Walking,
@@ -853,6 +859,7 @@ impl<'q: 't, 't> Cx<'q, 't> {
             disallowed: OnceCell::new(),
             not_known: OnceCell::new(),
             unchecked: OnceCell::new(),
+            not_in_map: OnceCell::new(),
             trees: RefCell::new(Vec::new()),
             walking: Walking::default(),
             found: Vec::new(),
@@ -866,6 +873,7 @@ impl<'q: 't, 't> Cx<'q, 't> {
             expects: self.expects,
             not_known: self.not_known.into_inner(),
             unchecked: self.unchecked.into_inner(),
+            not_in_map: self.not_in_map.into_inner(),
         }
     }
 
@@ -1159,7 +1167,14 @@ impl<'q: 't, 't> Cx<'q, 't> {
     /// field, an item's type) in the scope of the item it is written in.
     pub(crate) fn path(&self, path: ast::Path<'t>) -> Option<hir::PathResolution<'q>> {
         if self.def.is_some() {
-            return self.analysis()?.resolve_path(self.ptr::<syntax::ast::Path>(path));
+            return match self.analysis()?.resolve_path(self.ptr::<syntax::ast::Path>(path)) {
+                Ok(it) => it,
+                Err(it) => {
+                    // alloc: error path, the first path of a query that misses the map
+                    self.not_in_map.get_or_init(|| it.to_string());
+                    None
+                }
+            };
         }
         let path = ast::Path::cast(self.in_sema(path.syntax())?)?;
         self.sema().resolve_path(path)

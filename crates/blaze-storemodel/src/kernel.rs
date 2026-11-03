@@ -136,6 +136,10 @@ impl Step for Salted {
 impl Compute for Salted {
     type World = Dials;
 
+    #[expect(
+        blaze::pure,
+        reason = "the impure step the scenario needs: it reads the actor's salt behind the kernel's back, and the kernel must refuse its second value"
+    )]
     fn compute(ctx: &mut Reads<'_, Dials>, input: &u8) -> Result<Vec<u8>, StepError> {
         let fact = ctx.get::<Value>(input)?;
         Ok(vec![fact, SALT.with(Cell::get)])

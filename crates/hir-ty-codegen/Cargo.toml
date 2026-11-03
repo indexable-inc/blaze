@@ -42,6 +42,7 @@ cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
+hir-ty-print.workspace = true
 hir-ty-mir.workspace = true
 hir-ty-identity.workspace = true
 hir-ty-share.workspace = true

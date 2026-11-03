@@ -135,7 +135,7 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
     if is_sealed(db, trait_) && trait_.krate(db) != krate {
         found.push(error(
             Rule::SealedImplElsewhere,
-            format!(
+            format_args!(
                 "`{}` implements the sealed trait `{}` of crate `{}` outside it",
                 this(),
                 trait_name(db, trait_),
@@ -153,7 +153,7 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
             let sealed_name = sealed_name();
             found.push(error(
                 Rule::SealedNotClosed,
-                format!(
+                format_args!(
                     "`{}` implements a trait of another crate for every `{sealed_name}`, but \
                      `{sealed_name}` is an auto trait, which types implement without an impl",
                     this(),
@@ -166,7 +166,7 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
             let sealed_name = sealed_name();
             found.push(error(
                 Rule::SealedNotClosed,
-                format!(
+                format_args!(
                     "`{}` implements a trait of another crate for every `{sealed_name}`, but \
                      `{}` implements `{sealed_name}` for a type that is not local to crate `{}`",
                     this(),
@@ -185,7 +185,7 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
             let sealed_name = sealed_name();
             found.push(error(
                 Rule::SealedNotClosed,
-                format!(
+                format_args!(
                     "`{}` implements a trait of another crate for every `{sealed_name}`, but \
                      `{}` implements `{sealed_name}` for a type with a type parameter under a \
                      `#[fundamental]` type, where another crate could put its own type and write \
@@ -205,7 +205,7 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
     if let Some(why) = not_relaxable(db, krate, trait_) {
         found.push(error(
             Rule::RelaxedTraitNotAllowed,
-            format!(
+            format_args!(
                 "`{}` implements `{}` for every `{}`, but {why}",
                 this(),
                 trait_name(db, trait_),
@@ -219,7 +219,7 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
     if ImplSignature::of(db, impl_).flags.contains(ImplFlags::NEGATIVE) {
         found.push(error(
             Rule::RelaxedNegative,
-            format!("`{}` is a negative impl over the sealed trait `{}`", this(), sealed_name()),
+            format_args!("`{}` is a negative impl over the sealed trait `{}`", this(), sealed_name()),
             None,
         ));
         return found;
@@ -235,7 +235,7 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
     {
         found.push(error(
             Rule::RelaxedUnsized,
-            format!(
+            format_args!(
                 "`{}` implements a trait of another crate over the sealed trait `{}`, but its \
                  parameter `{}: {}` may be unsized: a `dyn` type implements its supertraits \
                  without an impl, so one could stand for `{}` where another crate may write \
@@ -266,7 +266,7 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
         };
         found.push(error(
             Rule::RelaxedUncoveredParam,
-            format!(
+            format_args!(
                 "`{}` implements `{}` for every `{}`, but {what}: another crate could implement \
                  `{}` with its own type there for one of this crate's types, and blaze does not \
                  check overlap across crates (E0119) yet",
@@ -286,7 +286,7 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
     if let Some(other) = overlapping_impl(db, impl_) {
         found.push(error(
             Rule::Overlap,
-            format!(
+            format_args!(
                 "conflicting implementations of trait `{}`: `{}` overlaps `{}`",
                 trait_name(db, trait_),
                 this(),
@@ -313,7 +313,7 @@ pub fn check_trait(db: &Db, trait_: TraitId) -> Vec<CoherenceError> {
             let name = trait_name(db, trait_);
             error(
                 Rule::SealedSupertraitElsewhere,
-                format!(
+                format_args!(
                     "trait `{name}` has the sealed trait `{}` of crate `{}` among its supertraits \
                      (`{}`), so `dyn {name}` would implement `{}` outside that crate",
                     trait_name(db, sup),
@@ -503,7 +503,7 @@ fn is_sealed(db: &Db, trait_: TraitId) -> bool {
     TraitSignature::of(db, trait_).flags.contains(TraitFlags::SEALED)
 }
 
-fn error(rule: Rule, message: String, note: Option<&str>) -> CoherenceError {
+fn error(rule: Rule, message: std::fmt::Arguments<'_>, note: Option<&str>) -> CoherenceError {
     let extension = "blaze extension `#[blaze::sealed]`";
     CoherenceError {
         rule,

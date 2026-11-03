@@ -4,7 +4,6 @@
 use std::{hash::Hash, sync::Arc};
 
 use blaze_ids::ContentId;
-use blaze_mem::{Tag, tag};
 use span::Edition;
 use syntax::{SyntaxError, ast};
 use crate::FileId;
@@ -18,9 +17,10 @@ pub struct EditionedFileId {
     field: span::EditionedFileId,
 }
 
-/// [`EditionedFileId::parse`]. The query engine keeps every file's parse ([`Db::admit_parses`] lowers that
-/// when the trees outgrow [`Tag::Parse`]'s budget), and the trees count against that tag.
-#[blaze_query::tracked(self_ty = EditionedFileId, lru = 0, mem_tag = Parse, returns(ref))]
+/// [`EditionedFileId::parse`]. Kept by its bytes, [`syntax::Parse::heap_bytes`] (its share of
+/// the tree, with the lazy bodies walked so far, and its errors), under [`blaze_mem::Tag::Parse`]'s budget;
+/// the trees count against that tag.
+#[blaze_query::tracked(self_ty = EditionedFileId, lru, weigh = syntax::Parse::heap_bytes, mem_tag = Parse, returns(ref))]
 fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
     let (file_id, edition) = file.unpack(db);
     let span = tracing::info_span!("parse_query", function = tracing::field::Empty);
@@ -40,59 +40,14 @@ fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
     })
 }
 
-/// What a database keeps its files' parses by: the query engine's capacity for them, which
-/// [`Db::admit_parses`] sets, and the stored trees read in place of parsing ([`Trees`]).
+/// What a database reads its files' parses from besides parsing: the stored trees ([`Trees`]).
 pub(crate) struct Parses {
-    /// How many parses the query engine keeps the values of past a view; 0 keeps every one.
-    capacity: usize,
     pub(crate) trees: Option<Arc<Trees>>,
 }
 
 impl Parses {
     pub(crate) fn new(trees: Option<Arc<Trees>>) -> Parses {
-        Parses { capacity: 0, trees }
-    }
-}
-
-impl Db {
-    /// Sets how many files' parses the query engine keeps past this view by the bytes their trees
-    /// hold against [`Tag::Parse`]'s budget: every one while they fit; over it, as many as
-    /// fit at the bytes a parse holds now (with an eighth to spare), the ones read longest
-    /// ago let go at the next revision; under half of it again, twice as many, back to every
-    /// one. The build calls it once a revision, before it writes the revision's inputs. A
-    /// database with no budget set keeps every parse.
-    pub fn admit_parses(&mut self) {
-        let budget = tag::budget(Tag::Parse);
-        if budget == u64::MAX {
-            return;
-        }
-        let live = tag::snapshot().get(Tag::Parse).live;
-        let capacity = self.parses.capacity;
-        let next = if live > budget {
-            let parsed = self.files().texts().filter(|it| it.reparse_field(self).has_parse()).count();
-            let fit = parsed as u128 * u128::from(budget) * 7 / 8 / u128::from(live);
-            match capacity {
-                0 => (fit as usize).max(1),
-                held => (fit as usize).clamp(1, held),
-            }
-        } else if capacity != 0 && live < budget / 2 {
-            let files = self.files().texts().count();
-            match capacity.saturating_mul(2) {
-                more if more >= files => 0,
-                more => more,
-            }
-        } else {
-            capacity
-        };
-        if next != capacity {
-            self.parses.capacity = next;
-            parse_::set_lru_capacity(self, next);
-        }
-    }
-
-    /// How many files' parses the query engine keeps now ([`Db::admit_parses`]); 0 is every one.
-    pub fn parse_capacity(&self) -> usize {
-        self.parses.capacity
+        Parses { trees }
     }
 }
 

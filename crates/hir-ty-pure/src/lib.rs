@@ -46,7 +46,7 @@ pub use function::{
     fn_memory, fn_purity, fn_purity_generic, instance_effects,
 };
 pub use memory::{Access, MemoryEffects};
-pub use walk::{main_of, script_purity};
+pub use walk::{ScriptProof, main_of, script_proof, script_purity};
 /// What a pure script's code may do, as its proof says: what the first sandboxed run of it is
 /// checked against (`blaze_usercode::pure::check`), and what its key is made of.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1187,6 +1187,8 @@ struct Stack {
     /// A cap's cancel is unwinding this thread: set by [`cancel`], cleared when the thread's
     /// outermost task ends.
     cancelling: Cell<bool>,
+    /// What the thread's global allocations outside any task count to, while [`heap_of`] runs.
+    heap: Cell<Option<Tag>>,
 }
 
 thread_local! {
@@ -1207,6 +1209,7 @@ thread_local! {
             peak: Cell::new(0),
             ids: Cell::new((0, 0)),
             cancelling: Cell::new(false),
+            heap: Cell::new(None),
         }
     };
 }
@@ -1528,6 +1531,41 @@ pub fn take_cancelling() -> Option<NonZeroUsize> {
 #[inline(never)]
 pub fn put_cancelling(_: NonZeroUsize) {
     STACK.with(|stack| stack.cancelling.set(true));
+}
+
+/// The tag of the [`task`] the calling thread runs; outside any, the tag [`heap_of`] names,
+/// else `None`: what the global allocator charges an allocation to
+/// (`blaze_graph::arena::Counting`). Allocates nothing, takes no lock and never panics, so an
+/// allocator may call it, on a thread being torn down too.
+#[inline(never)]
+pub fn running_tag() -> Option<Tag> {
+    // `innermost`'s read, inline: the allocator asks on every allocation, and a call more is a
+    // tenth of its cost. This function is the call that keeps the read from moving across a
+    // job's switch of threads.
+    STACK
+        .try_with(|stack| {
+            let frame = stack.current.get();
+            // SAFETY: as `innermost`'s: the frame is alive while the calling thread is in its
+            // task, and only its tag is read, here.
+            unsafe { frame.as_ref() }.map(Frame::tag).or(stack.heap.get())
+        })
+        .unwrap_or(None)
+}
+
+/// Runs `f` with the global heap the calling thread allocates outside any [`task`] counted to
+/// `tag` ([`running_tag`]): for a thread's own work that opens no frame (the daemon's loop), so
+/// its allocations are named, not counted outside any task. It opens no frame: [`in_task`] stays
+/// false, so what decides by the running task (a kept value's tag, `blocks::Kept::here`; a
+/// tree's budget) decides as outside one, and a task `f` runs counts to its own tag.
+pub fn heap_of<R>(tag: Tag, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Tag>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = STACK.try_with(|stack| stack.heap.set(self.0));
+        }
+    }
+    let _restore = Restore(STACK.try_with(|stack| stack.heap.replace(Some(tag))).unwrap_or(None));
+    f()
 }
 
 /// Whether the calling thread is in a [`task`], so [`current`] has a frame to give.

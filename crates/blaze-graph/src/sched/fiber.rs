@@ -8,11 +8,12 @@
 //! out: a job is never made runnable (and so never resumed by another core) while it is still
 //! on its old core's stack.
 //!
-//! Every driver of the process is a member of one [`World`] behind one lock: one wait graph
-//! for all their jobs, so a cycle of waits through two drivers' jobs is refused as one of a
-//! single driver is, and each driver's own placement. A job's [`JobId`] here (its [`Cx::job`],
-//! [`Handle`], a [`Cycle`]'s) is its world id, unique among the live jobs of every driver. Each
-//! transition is a few dozen instructions and allocates nothing warm.
+//! Each driver holds a scheduler of its own ([`Scheduler`]), its placement a member of its
+//! [`World`]; a wait of one driver's job on another's, or on a pool's, joins their schedulers
+//! into one, so a cycle of waits through two drivers' jobs is refused as one of a single driver
+//! is. A job's [`JobId`] here (its [`Cx::job`], [`Handle`], a [`Cycle`]'s) is its process id,
+//! unique among the live jobs of every driver and pool. Each transition is a few dozen
+//! instructions and allocates nothing warm.
 //!
 //! Code that has no [`Cx`] to hand (the query engine) reaches the running job through
 //! [`wait`], [`miss`] and [`current_job`], which read this thread's fiber.
@@ -37,7 +38,7 @@ use std::{
     ptr,
     sync::{
         Arc, Once,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle, Thread},
     time::{Duration, Instant},
@@ -47,6 +48,7 @@ use parking_lot::{Mutex, MutexGuard};
 
 use super::{
     CoreId, CounterId, Cores, Cycle, JobId, OWN, Spawn, Stats, Suspend, Wait, World, Yielded,
+    domain::{Domain, Guard, Scheduler, lock_joined, wait_cell},
     stack::{FIBER_STACK, Resumed, Stack, Stackful, Yielder},
 };
 use crate::Key;
@@ -153,13 +155,13 @@ pub(super) fn next_fiber() -> u32 {
     FIBERS.fetch_add(1, Ordering::Relaxed)
 }
 
+#[allow(unsafe_code)]
 // SAFETY: a fiber is moved to another thread only while suspended (in the idle pool, or parked
 // in its job's slot), never while it runs. Its stack then holds the driver's frames (an
 // `Arc<Shared>`, the `Yielder` and `Cx`, which only the fiber itself touches, and a payload
 // `J: Send`) and the job's frames below a wait, which phase 2's audit
 // (docs/v2/plan/lanes/sched.md) holds to `Send`: no thread-local borrow, lock guard or `Rc`
 // across a wait; `NoWait` guards are checked at every switch (`Cx::switch`).
-#[allow(unsafe_code)]
 unsafe impl<J: Send> Send for Fiber<J> {}
 
 enum Slot<J> {
@@ -209,22 +211,6 @@ impl CoreSlot {
     }
 }
 
-/// Every driver's scheduling, under one lock for the process: the [`World`] (one wait graph,
-/// each driver's placement as a member) and each member's wakers. A job of one driver woken by
-/// another's is woken through them. The per-core change (docs/v2/plan/lanes/sched.md) takes
-/// spawns and ends off this lock.
-pub(super) struct Global {
-    pub(super) world: World,
-    /// By member, as the world numbers them; `None` once the driver stopped.
-    io: Vec<Option<Io>>,
-    /// By member of its own placement (from [`OWN`]), how its woken jobs are handed back.
-    pub(super) own: Vec<Option<OwnIo>>,
-    dirty: Vec<u32>,
-    woken: Vec<usize>,
-    /// The clients' member ([`super::host`]), joined at the first client's claim or wait.
-    pub(super) clients: Option<u32>,
-}
-
 /// How a member of its own placement takes back a woken job: `wake(ctx, token)`, called under
 /// the scheduler's lock, so it must not call into the scheduler.
 #[derive(Clone, Copy)]
@@ -237,71 +223,31 @@ pub(super) struct OwnIo {
     pub(super) idle: Option<fn(usize) -> bool>,
 }
 
-struct Io {
+/// A fiber driver's wakers, in its scheduler's [`Domain`].
+pub(super) struct Io {
     cores: Arc<[CoreSlot]>,
     /// A `Run` for a core (a local job id) made by another core's worker; read by its worker.
     pending: Vec<u32>,
 }
 
-#[expect(clippy::disallowed_types, reason = "the process's one scheduler: every driver, pool and client thread shares its wait graph")]
-static GLOBAL: std::sync::LazyLock<Mutex<Global>> = std::sync::LazyLock::new(|| {
-    // alloc: the process's scheduler, once
-    Mutex::new(Global {
-        world: World::new(1024),
-        io: Vec::with_capacity(8),
-        own: Vec::with_capacity(8),
-        dirty: Vec::with_capacity(8),
-        woken: Vec::with_capacity(64),
-        clients: None,
-    })
-});
-
-#[cfg(test)]
-thread_local! {
-    /// How many times this thread took the scheduler's lock.
-    pub(crate) static GLOBAL_TAKEN: Cell<u64> = const { Cell::new(0) };
-}
-
-/// The job that took the scheduler's lock last, as the profiler numbers it ([`spawner`]); 0
-/// for none or no profiler. A wait for the lock names it as its owner: the holder, unless it
-/// let go between the waiter's failed try and the read, when it is the job that held it last.
-static HOLDER: AtomicU64 = AtomicU64::new(0);
-
-/// The process's scheduler, locked: always before a driver's own lock.
-pub(super) fn global() -> MutexGuard<'static, Global> {
-    #[cfg(test)]
-    GLOBAL_TAKEN.with(|it| it.set(it.get() + 1));
-    let held = match GLOBAL.try_lock() {
-        Some(held) => held,
-        None => {
-            let owner = HOLDER.load(Ordering::Relaxed);
-            crate::wait::wait(crate::wait::WaitOn::Lock("the scheduler"), (owner != 0).then_some(owner), || GLOBAL.lock())
-        }
-    };
-    if observing() {
-        HOLDER.store(spawner().spawner, Ordering::Relaxed);
-    }
-    held
-}
-
 /// Does what the scheduler decided, for every member whose jobs it changed: a member of its
 /// own placement is handed its woken jobs, a driver its `Run`s, wakes and moves. The `Run` of
 /// `mine` (a driver's member and core), if any, is returned (a local job id).
-pub(super) fn dispatch_global(global: &mut Global, mine: Option<(u32, u32)>) -> Option<u32> {
+pub(super) fn dispatch(domain: &mut Domain, mine: Option<(u32, u32)>) -> Option<u32> {
     let mut found = None;
-    let Global { world, io, own, dirty, woken, clients: _ } = global;
+    let Domain { world, io, own, dirty, woken, .. } = domain;
     world.take_dirty(dirty);
     for &member in dirty.iter() {
         if member & OWN != 0 {
             world.take_woken(member, woken);
-            if let Some(Some(hook)) = own.get((member & !OWN) as usize) {
+            if let Some((_, hook)) = own.iter().find(|it| it.0 == member) {
                 for &token in woken.iter() {
                     (hook.wake)(hook.ctx, token);
                 }
             }
             continue;
         }
-        let Some(Some(io)) = io.get_mut(member as usize) else { continue };
+        let Some((_, io)) = io.iter_mut().find(|it| it.0 == member) else { continue };
         for decision in world.take_decisions(member) {
             match decision {
                 super::Decision::Run { core, job } => {
@@ -322,10 +268,10 @@ pub(super) fn dispatch_global(global: &mut Global, mine: Option<(u32, u32)>) -> 
     found
 }
 
-/// The process's [`Global`] and a driver's [`State`], locked in that order, always, so no two
-/// locks are ever taken the other way round.
+/// A driver's scheduler and its [`State`], locked in that order, always, so no two locks are
+/// ever taken the other way round.
 struct Locked<'a, W: Work> {
-    global: MutexGuard<'static, Global>,
+    global: Guard<'a>,
     state: MutexGuard<'a, State<W>>,
     member: u32,
 }
@@ -337,7 +283,8 @@ impl<W: Work> Locked<'_, W> {
 
     /// This member's pending `Run` of `core`, taken.
     fn take_pending(&mut self, core: u32) -> Option<u32> {
-        let io = self.global.io[self.member as usize].as_mut().expect("a running driver's wakers");
+        let member = self.member;
+        let (_, io) = self.global.io.iter_mut().find(|it| it.0 == member).expect("a running driver's wakers");
         let job = mem::replace(&mut io.pending[core as usize], NONE);
         (job != NONE).then_some(job)
     }
@@ -359,6 +306,8 @@ impl<W: Work> DerefMut for Locked<'_, W> {
 
 struct Shared<W: Work> {
     work: W,
+    /// Its scheduler: its own, or the one it joined.
+    sched: Scheduler,
     /// This driver's number in the [`World`].
     member: u32,
     state: Mutex<State<W>>,
@@ -375,7 +324,15 @@ struct Shared<W: Work> {
 
 impl<W: Work> Shared<W> {
     fn lock(&self) -> Locked<'_, W> {
-        let global = global();
+        let global = self.sched.lock();
+        let state = self.state.lock();
+        Locked { global, state, member: self.member }
+    }
+
+    /// As [`Shared::lock`], the scheduler joined first with the one that has what `on` waits
+    /// for, if another has it.
+    fn lock_for(&self, on: Option<Wait>) -> Locked<'_, W> {
+        let global = lock_joined(self.sched.cell(), || wait_cell(on?));
         let state = self.state.lock();
         Locked { global, state, member: self.member }
     }
@@ -387,7 +344,7 @@ impl<W: Work> Shared<W> {
     /// Does what the scheduler decided, for every driver whose placement it changed; the
     /// `Run` of this driver's core `me`, if any, is returned (a local job id).
     fn dispatch(&self, st: &mut Locked<'_, W>, me: Option<u32>) -> Option<u32> {
-        dispatch_global(&mut st.global, me.map(|me| (self.member, me)))
+        dispatch(&mut st.global, me.map(|me| (self.member, me)))
     }
 
     fn fail(&self, st: &mut State<W>, error: DriverError) {
@@ -513,7 +470,7 @@ impl<W: Work> Cx<'_, W> {
 
     /// This job makes `key`: `false` when another flight has it already (wait for it).
     pub fn claim(&self, key: Key) -> bool {
-        self.shared.lock().world().claim(key, Some(self.job))
+        self.shared.lock().global.claim(key, Some(self.job))
     }
 
     /// This job's flight of `key` ended: its waiters wake on this core.
@@ -585,18 +542,20 @@ impl<W: Work> Cx<'_, W> {
     }
 }
 
+#[allow(unsafe_code)]
 // SAFETY: the one part of a `Cx` that is not `Sync` is its `Yielder`, used only by `switch`,
 // which first asserts that this thread runs the fiber of this very `Cx` (`HERE` holds its
 // address, set by `enter` on that fiber and cleared as it switches out): another thread
 // holding a `&Cx` panics there instead of touching the yielder. The rest goes through
 // `Shared`, which is `Sync`.
-#[allow(unsafe_code)]
 unsafe impl<W: Work> Sync for Cx<'_, W> {}
 
 /// This thread's running job, as the code without a [`Cx`] reaches it.
 #[derive(Clone, Copy)]
 pub(super) struct Here {
     pub(super) cx: *const (),
+    /// The scheduler of the job's pool or driver, which outlives the job's run on its fiber.
+    pub(super) sched: *const Scheduler,
     /// [`UNREGISTERED`] for a job of a pool's until it first joins the wait graph.
     pub(super) job: JobId,
     pub(super) register: unsafe fn(*const ()) -> JobId,
@@ -637,7 +596,7 @@ unsafe fn register_thunk<W: Work>(cx: *const ()) -> JobId {
 unsafe fn count_thunk<W: Work>(cx: *const (), counter: CounterId) {
     // SAFETY: as in `wait_thunk`.
     let cx = unsafe { &*cx.cast::<Cx<'_, W>>() };
-    cx.shared.lock().world().count_towards(cx.job, counter);
+    cx.shared.lock_for(Some(Wait::Counter(counter))).world().count_towards(cx.job, counter);
 }
 
 #[allow(unsafe_code)]
@@ -666,6 +625,7 @@ unsafe fn key_done_thunk<W: Work>(cx: *const (), key: Key) {
 fn enter<W: Work>(cx: &Cx<'_, W>) {
     let here = Here {
         cx: ptr::from_ref(cx).cast(),
+        sched: &raw const cx.shared.sched,
         job: cx.job,
         register: register_thunk::<W>,
         wait: wait_thunk::<W>,
@@ -999,12 +959,14 @@ pub(super) fn observing() -> bool {
     OBSERVER.get().is_some()
 }
 
+/// A switch of `job`, a live job of a driver or pool, its generation read from the process's
+/// table ([`super::ids`]): no lock.
 #[inline]
-pub(super) fn switched(world: &World, event: SwitchEvent, job: JobId, fiber: u32, me: u32) {
+pub(super) fn switched(event: SwitchEvent, job: JobId, fiber: u32, me: u32) {
     if let Some(observer) = OBSERVER.get() {
-        let generation = world.generation(job);
+        let generation = super::ids::generation(job);
         let awaited = match event {
-            SwitchEvent::Parked(Some(Wait::Job(on))) => world.generation(on),
+            SwitchEvent::Parked(Some(Wait::Job(on))) => super::ids::generation(on),
             _ => 0,
         };
         observer(Switch { event, job, generation, awaited, fiber, core: CoreId(me) });
@@ -1039,6 +1001,10 @@ pub struct Given {
     /// works for it too, so its spans and switches are the build's (a job given by a build's
     /// task is that build's work, on whichever thread it runs).
     pub build: u32,
+    /// The span open where it was given, as the observer numbers spans; 0 for none: what gave
+    /// it when no job did (a thread on no fiber, such as the daemon's loop), so the critical
+    /// path crosses from the job's start into the giver's work.
+    pub creator: u64,
 }
 
 #[expect(clippy::disallowed_types, reason = "the process's one profiler hook, set once, read with no lock at every pool submit")]
@@ -1148,11 +1114,11 @@ impl<W: Work> Driver<W> {
         let mut pending = Vec::with_capacity(n);
         pending.resize(n, NONE);
         let jobs = config.fibers.max(64);
+        let sched = Scheduler::new(jobs);
         let member = {
-            let mut global = global();
+            let mut global = sched.lock();
             let member = global.world.join(cores, jobs);
-            assert_eq!(member as usize, global.io.len(), "the world's members and their wakers");
-            global.io.push(Some(Io { cores: Arc::clone(&slots), pending }));
+            global.io.push((member, Io { cores: Arc::clone(&slots), pending }));
             member
         };
         let state = State {
@@ -1169,6 +1135,7 @@ impl<W: Work> Driver<W> {
         // alloc: the driver's shared state, once per driver
         let shared = Arc::new(Shared {
             work,
+            sched,
             member,
             state: Mutex::new(state),
             cores: slots,
@@ -1186,7 +1153,7 @@ impl<W: Work> Driver<W> {
                 Err(error) => {
                     let mut st = shared.lock();
                     st.world().leave(member);
-                    st.global.io[member as usize] = None;
+                    st.global.io.retain(|it| it.0 != member);
                     return Err(error);
                 }
             }
@@ -1277,7 +1244,7 @@ impl<W: Work> Driver<W> {
 
     /// A flight of the driver's (IO, a child process): `false` when the key has one already.
     pub fn claim(&self, key: Key) -> bool {
-        self.shared.lock().world().claim(key, None)
+        self.shared.lock().global.claim(key, None)
     }
 
     /// The driver's flight of `key` ended: its waiters wake, each on the core it last ran on.
@@ -1340,7 +1307,7 @@ impl<W: Work> Driver<W> {
         let slots = mem::take(&mut st.slots);
         let member = self.shared.member;
         let stats = st.world().leave(member).map(|place| place.stats()).unwrap_or_default();
-        st.global.io[member as usize] = None;
+        st.global.io.retain(|it| it.0 != member);
         let (failed, mut panicked) = (st.failed.take(), st.panic.take());
         drop(st);
         // Outside the driver's lock, and after the member left the world, so a panicking `end`
@@ -1468,13 +1435,13 @@ fn run<'a, W: Work>(
             if let Answer::Raise(panic) = come_on(&mut worker, None, None) {
                 st.panic.get_or_insert(panic);
             }
-            switched(&st.global.world, SwitchEvent::Started, job, fiber.1, me);
+            switched(SwitchEvent::Started, job, fiber.1, me);
             (fiber, In::Start(job, payload))
         }
         Slot::Parked(fiber, mut taken, failed) => {
             let answer = come_on(&mut worker, Some(&mut *taken), failed);
             st.spare_taken.push(taken);
-            switched(&st.global.world, SwitchEvent::Resumed, job, fiber.1, me);
+            switched(SwitchEvent::Resumed, job, fiber.1, me);
             (fiber, In::Go(answer))
         }
         Slot::Running => panic!("job {} run on core {me} while it runs", job.0),
@@ -1488,7 +1455,14 @@ fn run<'a, W: Work>(
             Resumed::Return => unreachable!("a fiber ends only when told to exit"),
         };
         clear();
-        let mut st = shared.lock();
+        // The scheduler of what the job waits for joins its own first: a job of another driver
+        // or pool, a key or a counter of theirs.
+        let joins = match &out {
+            Out::Wait(Want::On(on)) => Some(*on),
+            Out::Wait(Want::Job(handle)) => Some(Wait::Job(handle.job)),
+            _ => None,
+        };
+        let mut st = shared.lock_for(joins);
         input = match out {
             Out::Wait(want) => {
                 let on = match want {
@@ -1504,7 +1478,7 @@ fn run<'a, W: Work>(
                     None | Some(Ok(Suspend::Ready)) => In::Go(Answer::Ready),
                     Some(Err(cycle)) => In::Go(Answer::Cycle(cycle)),
                     Some(Ok(Suspend::Waiting)) => {
-                        switched(&st.global.world, SwitchEvent::Parked(on), job, fiber.1, me);
+                        switched(SwitchEvent::Parked(on), job, fiber.1, me);
                         st.slots[j] = park_carried(&mut st, fiber, &mut worker);
                         let next = shared.dispatch(&mut st, Some(me));
                         return (st, next);
@@ -1514,7 +1488,7 @@ fn run<'a, W: Work>(
             Out::Move => match st.world().yielded(member, job) {
                 Yielded::Stay => In::Go(Answer::Ready),
                 Yielded::Moved => {
-                    switched(&st.global.world, SwitchEvent::Parked(None), job, fiber.1, me);
+                    switched(SwitchEvent::Parked(None), job, fiber.1, me);
                     st.slots[j] = park_carried(&mut st, fiber, &mut worker);
                     let next = shared.dispatch(&mut st, Some(me));
                     return (st, next);
@@ -1523,7 +1497,7 @@ fn run<'a, W: Work>(
             Out::Done(panicked) => {
                 // The observer is told first, while the thread still holds the job's own
                 // values (its build in the profiler's state), which `go_off_ended` ends.
-                switched(&st.global.world, SwitchEvent::Ended, job, fiber.1, me);
+                switched(SwitchEvent::Ended, job, fiber.1, me);
                 let left = go_off_ended(&mut worker);
                 st.world().done(member, job);
                 st.slots[j] = Slot::Free;

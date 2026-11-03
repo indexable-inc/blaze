@@ -109,7 +109,7 @@ pub(crate) struct Listener {
 
 impl Listener {
     pub(crate) fn new(
-        secret: Arc<Secret>,
+        secret: &Secret,
         repo: String,
         service: crossbeam_channel::Sender<Input>,
     ) -> Listener {
@@ -118,7 +118,7 @@ impl Listener {
 
     /// A listener remembering the last `most` delivery ids.
     pub(crate) fn remembering(
-        secret: Arc<Secret>,
+        secret: &Secret,
         repo: String,
         service: crossbeam_channel::Sender<Input>,
         most: usize,
@@ -136,9 +136,9 @@ impl Listener {
     }
 }
 
-pub(crate) fn run(listener: TcpListener, secret: Arc<Secret>, repo: String, service: crossbeam_channel::Sender<Input>) {
+pub(crate) fn run(listener: &TcpListener, secret: &Secret, repo: String, service: crossbeam_channel::Sender<Input>) {
     // alloc: once, at start
-    serve(listener, Arc::new(Listener::new(secret, repo, service)));
+    serve(listener, &Arc::new(Listener::new(secret, repo, service)));
 }
 
 /// Accepts connections and hands each to a handler thread. Handlers are started only when
@@ -146,7 +146,7 @@ pub(crate) fn run(listener: TcpListener, secret: Arc<Secret>, repo: String, serv
 /// start (a stack mapped, a clone, an exit), only a channel hand-off to a parked handler.
 /// `open` counts connections taken and not yet answered, and there are never fewer handlers
 /// than that, so a connection handed off always has a handler free for it.
-pub(crate) fn serve(listener: TcpListener, shared: Arc<Listener>) {
+pub(crate) fn serve(listener: &TcpListener, shared: &Arc<Listener>) {
     let (to_handlers, streams) = crossbeam_channel::unbounded::<TcpStream>();
     let mut handlers = 0;
     for stream in listener.incoming() {
@@ -161,7 +161,7 @@ pub(crate) fn serve(listener: TcpListener, shared: Arc<Listener>) {
         };
         let open = shared.open.fetch_add(1, Ordering::AcqRel) + 1;
         if open > MOST_CONNECTIONS {
-            refuse(&shared, &mut stream, "too many deliveries at once; GitHub redelivers");
+            refuse(shared, &mut stream, "too many deliveries at once; GitHub redelivers");
             continue;
         }
         if open > handlers {
@@ -172,7 +172,7 @@ pub(crate) fn serve(listener: TcpListener, shared: Arc<Listener>) {
                 .spawn(move || handler(&its_shared, &its_streams));
             if let Err(error) = started {
                 log(&format!("a webhook handler did not start: {error}")); // alloc: a failed start
-                refuse(&shared, &mut stream, "no thread to read the delivery on; GitHub redelivers");
+                refuse(shared, &mut stream, "no thread to read the delivery on; GitHub redelivers");
                 continue;
             }
             handlers += 1;

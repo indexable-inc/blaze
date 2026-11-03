@@ -142,14 +142,14 @@ fn paths_and_names_resolve_in_the_scope_of_their_block() {
         let (root, file) = analysis.tree();
 
         let (_, wrap) = find::<ast::Path>(root, file, "Wrap");
-        match analysis.resolve_path(wrap) {
+        match analysis.resolve_path(wrap).unwrap() {
             Some(PathResolution::Def(ModuleDef::Adt(it))) => {
                 assert_eq!(it.name(&db).as_str(), "Wrap")
             }
             it => panic!("`Wrap` is {it:?}"),
         }
         let (_, n) = find::<ast::Path>(root, file, "n");
-        assert!(matches!(analysis.resolve_path(n), Some(PathResolution::Local(_))));
+        assert!(matches!(analysis.resolve_path(n).unwrap(), Some(PathResolution::Local(_))));
 
         let (sum, _) = find::<ast::Expr>(root, file, "a + b + c");
         let at = InFile::new(file, view::ptr(sum.syntax()));

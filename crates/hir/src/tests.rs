@@ -361,7 +361,7 @@ fn an_unplaced_diagnostic_is_at_the_item_of_its_body() {
     blaze_query::db::attach(&db, || {
         let def = function(&db, "f");
         let DefWithBodyId::FunctionId(func) = def else { panic!("`f` is a function") };
-        let (_, source_map) = hir_def::expr_store::Body::with_source_map(&db, def);
+        let source_map = hir_def::expr_store::Body::source_map(&db, def);
         let owner =
             crate::diagnostics::unplaced_owner(&db, InferBodyId::DefWithBodyId(def), source_map);
         let item: hir_expand::InFile<syntax::SyntaxNodePtr> =
@@ -460,6 +460,59 @@ fn a_live_patch_has_code_before_the_check_that_refuses_it() {
             }
             other => panic!("the patch must be rolled back, got {other:?}"),
         }
+    });
+}
+
+/// A crate released mid-build (`blaze-cargo`'s release, once its units stored their code)
+/// loses its bodies' inference and keeps every other crate's; MIR goes only when asked, and then
+/// of every crate. Each value read again in the same view is made again equal.
+#[test]
+fn a_released_crate_drops_its_inference_and_mir_goes_only_when_asked() {
+    use hir_def::HasModule as _;
+    let fx = fixture::db(
+        r#"
+//- minicore: sized, copy
+//- /main.rs crate:main
+fn released() -> u32 {
+    let x = 1;
+    x + 1
+}
+//- /other.rs crate:other
+pub fn kept() -> u32 {
+    2
+}
+"#,
+    );
+    let mut db = fx.into_db();
+    let (a, b) = blaze_query::db::attach(&db, || (function(&db, "released"), function(&db, "kept")));
+    let shape = |db: &TestDB, f| {
+        let mir = db.mir_body(InferBodyId::DefWithBodyId(f)).unwrap();
+        (mir.basic_blocks.len(), mir.locals.len())
+    };
+    let (before_a, before_b) = blaze_query::db::attach(&db, || (shape(&db, a), shape(&db, b)));
+    let krate = a.krate(&db);
+    assert_ne!(krate, b.krate(&db));
+
+    let dropped = crate::evict::drop_crates_after_store(&mut db, &[krate], false);
+    assert_eq!((dropped.inference, dropped.mir, dropped.const_eval), (1, 0, 0), "{dropped:?}");
+    blaze_query::db::attach(&db, || {
+        let executed = db.log_executed(|| {
+            InferenceResult::of(&db, InferBodyId::DefWithBodyId(a));
+            InferenceResult::of(&db, InferBodyId::DefWithBodyId(b));
+            assert_eq!((shape(&db, a), shape(&db, b)), (before_a, before_b));
+        });
+        assert_eq!(count(&executed, "infer_body_query"), 1, "the released crate's alone: {executed:#?}");
+        assert_eq!(count(&executed, "mir_body_query"), 0, "MIR kept unless asked: {executed:#?}");
+    });
+
+    let dropped = crate::evict::drop_crates_after_store(&mut db, &[], true);
+    assert!(dropped.mir >= 2 && dropped.inference == 0, "{dropped:?}");
+    blaze_query::db::attach(&db, || {
+        let executed = db.log_executed(|| {
+            assert_eq!((shape(&db, a), shape(&db, b)), (before_a, before_b));
+        });
+        assert_eq!(count(&executed, "mir_body_query"), 2, "every crate's MIR: {executed:#?}");
+        assert_eq!(count(&executed, "infer_body_query"), 0, "{executed:#?}");
     });
 }
 

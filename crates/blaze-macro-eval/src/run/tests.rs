@@ -23,7 +23,7 @@ fn an_evaluator_error_names_its_type_outside_an_attach() {
         let ty = Ty::new_adt(DbInterner::new_with(&db, krate), adt, GenericArgs::empty());
         MirEvalError::TypeIsUnsized(ty.store(), "a test")
     });
-    let stop = stop_of(&db, error);
+    let stop = stop_of(&db, &error);
     assert!(stop.0.starts_with("stopped in the evaluator: "), "{stop}");
     assert!(stop.0.contains("Wrapper is unsized"), "the type is named: {stop}");
 }

@@ -24,13 +24,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blaze_core::exit::Exit;
 use blaze_usercode::{
     confine,
     inputs::Disk,
     trace::{self, Report, Seen},
 };
 
-use super::{COULD_NOT, Live};
+use super::Live;
 
 #[cfg(unix)]
 #[allow(unsafe_code, reason = "fstat and fcntl of a descriptor given by number")]
@@ -43,13 +44,13 @@ pub const NOT_TRACED_ON_WINDOWS: &str = "what a program reads is not traced on W
 pub fn command(mut args: impl Iterator<Item = OsString>) -> ! {
     let (Some(file), None) = (args.next(), args.next()) else {
         eprintln!("blaze sandbox: needs one spec: blaze sandbox --v2 SPEC_FILE");
-        std::process::exit(COULD_NOT);
+        std::process::exit(Exit::CouldNot.code());
     };
     let spec = match read_spec(Path::new(&file)) {
         Ok(spec) => spec,
         Err(why) => {
             eprintln!("blaze sandbox: {why}");
-            std::process::exit(COULD_NOT);
+            std::process::exit(Exit::CouldNot.code());
         }
     };
     std::process::exit(launch(&spec))
@@ -79,7 +80,7 @@ pub fn available() -> Result<(), String> {
 pub fn serve(mut args: impl Iterator<Item = OsString>) -> ! {
     if args.next().is_some() {
         eprintln!("blaze sandbox: --v2-serve takes nothing after it: its runs come on its standard input");
-        std::process::exit(COULD_NOT);
+        std::process::exit(Exit::CouldNot.code());
     }
     #[cfg(windows)]
     super::windows::serve::serve();
@@ -89,12 +90,12 @@ pub fn serve(mut args: impl Iterator<Item = OsString>) -> ! {
             "blaze sandbox: there is no warm launcher on {}: its driver starts `blaze sandbox --v2 SPEC_FILE` for each run",
             std::env::consts::OS
         );
-        std::process::exit(COULD_NOT)
+        std::process::exit(Exit::CouldNot.code())
     }
 }
 
 /// Runs `spec` and writes its report: what the launcher ends with, the program's status (128
-/// and the signal that ended it), or [`COULD_NOT`] when the sandbox could not be made.
+/// and the signal that ended it), or [`Exit::CouldNot`] when the sandbox could not be made.
 pub fn launch(spec: &confine::Spec) -> i32 {
     launch_with(spec, run)
 }
@@ -128,7 +129,7 @@ fn not_made(spec: &confine::Spec, why: &str) -> i32 {
     if let Err(error) = write_report(&spec.report, &Report::NotMade(why.to_owned())) {
         eprintln!("blaze: the sandbox's report: {error}");
     }
-    COULD_NOT
+    Exit::CouldNot.code()
 }
 
 /// Opens the live record, where this run's lines start at its present end, and appends what is
@@ -456,7 +457,7 @@ mod tests {
         let dir = scratch("not-made");
         let mut spec = spec(&dir, "/bin/true", &[], true);
         spec.env.push(("TMPDIR".into(), <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"/tmp/\xff").into()));
-        assert_eq!(super::launch(&spec), super::COULD_NOT);
+        assert_eq!(super::launch(&spec), blaze_core::exit::Exit::CouldNot.code());
         let report = trace::decode(&std::fs::read(&spec.report).unwrap()).unwrap();
         let Report::NotMade(why) = report else { panic!("{report:?}") };
         assert!(why.contains("TMPDIR"), "{why}");

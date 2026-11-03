@@ -647,4 +647,71 @@ pub mod m {
         seen.sort();
         seen
     }
+
+    /// rustc's `resolve_visibility` resolves the path of a `pub(in path)` or `pub(super)` with
+    /// its spans: a `pub(super)` an opaque `macro` writes into a module it did not write names
+    /// the parent of the module defining the `macro` (`resolve_self` walks out to it), here the
+    /// crate root, where a `pub(in $p)` of a path handed in names the call site's parent. Each
+    /// function `c` declares or imports with the module its visibility names, as collected and
+    /// as read off the syntax (`import` for an import). The pinned rustc agrees: `main` may call
+    /// `a::b::c::f` and `a::b::c::u`, and `a::b::c::g` and `a::b::c::v` are E0603.
+    #[test]
+    fn a_visibility_path_a_macro_writes_is_hygienic() {
+        let fx = fixture::db(
+            r#"
+#![feature(decl_macro)]
+pub mod a {
+    pub macro own($f:ident, $u:ident) {
+        pub(super) fn $f() {}
+        pub(super) use crate::h as $u;
+    }
+    pub macro given($g:ident, $v:ident, $p:path) {
+        pub(in $p) fn $g() {}
+        pub(in $p) use crate::h as $v;
+    }
+    pub mod b {
+        pub mod c {
+            super::super::own!(f, u);
+            super::super::given!(g, v, super);
+        }
+    }
+}
+pub fn h() {}
+fn main() {
+    a::b::c::f();
+    a::b::c::g();
+    a::b::c::u();
+    a::b::c::v();
+}
+"#,
+        );
+        let _ = fx.only_file();
+        let db = fx.into_db();
+        let def_map = crate_def_map(&db, db.fetch_test_crate());
+        let root = def_map.root_module_id();
+        let mut seen = Vec::new();
+        for (_, module) in def_map.modules(&db) {
+            let named = |vis: Visibility| match vis {
+                Visibility::Module(m, _) if m == root => "crate".to_owned(),
+                Visibility::Module(m, _) if Some(m) == module.parent => "parent".to_owned(),
+                other => format!("{other:?}"),
+            };
+            for (name, item) in module.scope(&db).values() {
+                let ModuleDefId::FunctionId(f) = item.def else { continue };
+                if matches!(name.as_str(), "main" | "h") {
+                    continue;
+                }
+                let written = match item.import {
+                    Some(_) => "import".to_owned(),
+                    None => {
+                        let source = f.lookup(&db).source_view(&db);
+                        named(visibility_from_ast_view(&db, f, source.map(|it| it.visibility())))
+                    }
+                };
+                seen.push(format!("{} {} {written}", name.as_str(), named(item.vis)));
+            }
+        }
+        seen.sort();
+        assert_eq!(seen, ["f crate crate", "g parent parent", "u crate import", "v parent import"]);
+    }
 }

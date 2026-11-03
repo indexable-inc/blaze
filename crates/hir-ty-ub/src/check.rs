@@ -364,7 +364,7 @@ impl<'db> Checker<'db> {
         let prov = place.prov.expect("memory names an allocation only for a pointer with provenance");
         let span = Span::new(off, size);
         let perm = NewPermission::new(PtrKind::Mut, borrows::RetagMode::FnEntry, true, true, &[]);
-        let tag = match self.borrows.retag(alloc, prov, perm, span, self.at) {
+        let tag = match self.borrows.retag(alloc, prov, &perm, span, self.at) {
             Ok(Some(tag)) => tag,
             Ok(None) => return Ok(()),
             Err(e) => return Err(self.fail(e.into())),
@@ -678,8 +678,14 @@ impl<'db> Machine<'db> for Checker<'db> {
 }
 
 /// Runs the test `test` (a `fn()`) under the checker, once per schedule of `config`, and says
-/// what the first schedule that did not pass found.
-pub fn run_test<'db>(db: &'db Db, test: FunctionId, config: &Config) -> Outcome {
+/// what the first schedule that did not pass found. With `db` attached, as a query's run is:
+/// the daemon's test job calls this outside any query, and the evaluator's errors, logs and
+/// outcome's message format the types they name.
+pub fn run_test(db: &Db, test: FunctionId, config: &Config) -> Outcome {
+    blaze_query::db::attach(db, || run_test_attached(db, test, config))
+}
+
+fn run_test_attached<'db>(db: &'db Db, test: FunctionId, config: &Config) -> Outcome {
     let krate = test.krate(db);
     let ptr_size = match db.target_data_layout(krate) {
         Ok(target) => target.pointer_size().bytes(),
@@ -692,7 +698,7 @@ pub fn run_test<'db>(db: &'db Db, test: FunctionId, config: &Config) -> Outcome 
         let seed = config.seed.wrapping_add(u64::from(i));
         let checker = Checker::with_plans(ptr_size, config, seed, plans);
         let (result, _output, mut checker) = hir_ty_mir::mir::run_function(db, test, checker);
-        if let Some(outcome) = outcome(db, &checker, result, seed) {
+        if let Some(outcome) = outcome(db, &checker, &result, seed) {
             return outcome;
         }
         plans = std::mem::take(&mut checker.plans);
@@ -704,14 +710,14 @@ pub fn run_test<'db>(db: &'db Db, test: FunctionId, config: &Config) -> Outcome 
 fn outcome<'db>(
     db: &'db Db,
     checker: &Checker<'db>,
-    result: Result<(), MirEvalError<'db>>,
+    result: &Result<(), MirEvalError<'db>>,
     seed: u64,
 ) -> Option<Outcome> {
     // clone: the edge: the outcome of a run.
     let found = checker.found.clone();
     // alloc: the edge: the outcome of a run.
     let mut stack = Vec::new();
-    let error = match &result {
+    let error = match result {
         Ok(()) => None,
         Err(e) => Some(innermost(e, &mut stack)),
     };

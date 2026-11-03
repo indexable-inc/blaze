@@ -376,6 +376,8 @@ struct Run<R: Runner> {
     spawner: AtomicU64,
     /// The build the poster worked for ([`crate::sched::Given::build`]), written beside `spawner`.
     build: AtomicU32,
+    /// The span open where it was posted last ([`crate::sched::Given::creator`]), beside `spawner`.
+    creator: AtomicU64,
 }
 
 // SAFETY: `live` has one reader or writer at a time: the owner while it fills the slot, then
@@ -459,7 +461,7 @@ impl<R: Runner> Table<R> {
     ) -> Result<u64, MemError> {
         let header = Header::new(run_pooled::<R>);
         let live = UnsafeCell::new(Some(live));
-        let run = self.cache.try_alloc(Run { header, ctx, at: u64::MAX, live, spawner: AtomicU64::new(0), build: AtomicU32::new(0) })?;
+        let run = self.cache.try_alloc(Run { header, ctx, at: u64::MAX, live, spawner: AtomicU64::new(0), build: AtomicU32::new(0), creator: AtomicU64::new(0) })?;
         let handle = self.live.try_insert(Slot { run, tag, pool, near })?;
         let slot = self.live.get_mut(handle).expect("a run just placed is in the table");
         slot.run.at = handle.to_bits();
@@ -1214,6 +1216,7 @@ fn post<R: Runner>(ctx: &Ctx<R>, near: Option<u32>, critical: bool, run: Ran<R>)
     let given = crate::sched::spawner();
     run.run().spawner.store(given.spawner, Ordering::Relaxed);
     run.run().build.store(given.build, Ordering::Relaxed);
+    run.run().creator.store(given.creator, Ordering::Relaxed);
     // SAFETY: the slot's header is its first field (`Run` is `repr(C)`) and runs `run_pooled`;
     // the slot stays in the scheduler's pool, unmoved, until its `Done` is taken, and `run`,
     // moved here, was its one name.
@@ -1234,6 +1237,7 @@ unsafe fn run_pooled<R: Runner>(header: NonNull<Header>) {
         spawner: run.run().spawner.load(Ordering::Relaxed),
         at: 0,
         build: run.run().build.load(Ordering::Relaxed),
+        creator: run.run().creator.load(Ordering::Relaxed),
     });
     let span = pool::JobSpan::begin(std::any::type_name::<R>());
     let result = catch_unwind(AssertUnwindSafe(|| measured(&ctx.runner, run.live())));
@@ -1252,10 +1256,8 @@ unsafe fn run_pooled<R: Runner>(header: NonNull<Header>) {
 /// cancelling it unwinds from here with [`frame::Cancelled`].
 fn measured<R: Runner>(runner: &R, live: &Live<R::Work>) -> (Result<Did, Cancelled>, Measure) {
     let start = Instant::now();
-    let tag = admission::tag_of(live.kind);
-    let ((did, bytes), frames) =
-        frame::measure(|| arena::measure(|| frame::task(tag, |_| runner.run(&live.work))));
-    (did, Measure { peak: bytes + frames as u64, ran_ns: ns(start) })
+    let (did, peak) = admission::run_as(live.kind, || runner.run(&live.work));
+    (did, Measure { peak, ran_ns: ns(start) })
 }
 
 /// Runs an IO task on this thread; posted again, behind what is queued for the IO threads,

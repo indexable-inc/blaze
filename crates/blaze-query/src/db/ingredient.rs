@@ -3,8 +3,11 @@
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
+use blaze_mem::Tag;
+
 use super::{
     Id, Storage,
+    budget::Held,
     storage::{Relocate, Restamp},
 };
 use crate::sync::Mutex;
@@ -18,6 +21,23 @@ pub enum Kind {
     Input,
     Interned,
     Tracked,
+}
+
+/// What a view boundary asks of a function kept by its values' bytes ([`super::budget`]), with
+/// no reader.
+#[derive(Clone, Copy)]
+pub(crate) struct Weighed {
+    /// The tag its values count to: the function's `mem_tag`.
+    pub(crate) tag: Tag,
+    /// What its values weigh, as counted when each was made and let go; also folds the keys
+    /// that took a value since into its index of values held.
+    pub(crate) weight: fn(storage: &Storage, ingredient: u32) -> u64,
+    /// Pushes each value it holds, weighed now, onto `out`, makes that sum its weight, and
+    /// returns it.
+    pub(crate) held: fn(storage: &Storage, ingredient: u32, out: &mut Vec<Held>) -> u64,
+    /// Lets go of the values of `gone` (its own, each once); returns how many held one and what
+    /// they weighed.
+    pub(crate) evict: fn(storage: &Storage, ingredient: u32, gone: &[Held]) -> (usize, u64),
 }
 
 /// What the storage does with an ingredient's table without knowing its types: the cold
@@ -39,8 +59,11 @@ pub struct Vtable {
     pub(crate) ids_of: Option<fn(storage: &Storage, ingredient: u32, id: Id, out: &mut Vec<Id>)>,
     /// Whether an interned row's value was interned ([`Storage::made`]).
     pub(crate) made: Option<fn(storage: &Storage, ingredient: u32, id: Id) -> bool>,
-    /// What its table holds ([`Storage::memory_usage`]).
+    /// What its table holds ([`Storage::memory_usage`]), from counters: no row is read.
     pub(crate) memory: fn(storage: &Storage, ingredient: u32) -> super::MemoryUsage,
+    /// A function's rows in use, a walk of every row made ([`Storage::memory_usage`]); every
+    /// row of another ingredient is in use, as its `memory` says.
+    pub(crate) used: Option<fn(storage: &Storage, ingredient: u32) -> u64>,
     /// Brings `id`'s row up to the storage's view (verifying it, running it if it changed),
     /// for a reader that verifies an edge on it. `db` is the database that owns `storage`, as
     /// the ingredient's own database type.
@@ -49,14 +72,17 @@ pub struct Vtable {
     /// Empties a function's provisional row (a cycle's round or its unwinding): only the
     /// thread of the row's cycle calls it.
     pub(crate) reset: Option<unsafe fn(storage: &Storage, ingredient: u32, id: Id)>,
-    /// At a view boundary, with no reader: evicts past the function's `lru` cap; returns how
-    /// many rows it read.
-    pub(crate) sweep: Option<fn(storage: &mut Storage, ingredient: u32) -> usize>,
+    /// A function whose values are kept by their bytes (`lru`): what the storage's view
+    /// boundary asks of it ([`super::budget`]).
+    pub(crate) weighed: Option<Weighed>,
     /// Moves each of its rows' edge spans into the compacted array.
     pub(crate) relocate: Option<fn(storage: &mut Storage, ingredient: u32, moved: &mut Relocate)>,
     /// Passes each view stamp its rows hold through `restamp`, storing what it gives: the
     /// renumbering at the view limit, under `&mut`.
     pub(crate) restamp: Option<fn(storage: &Storage, ingredient: u32, restamp: &mut Restamp<'_>)>,
+    /// Writes a function's key `id` as its type shows it, through the attached database, for
+    /// an error that names a row without knowing its function's type ([`super::Runaway`]).
+    pub(crate) write_key: Option<fn(storage: &Storage, id: Id, out: &mut String)>,
     /// Drops its rows and its table.
     pub(crate) drop: fn(storage: &mut Storage, ingredient: u32),
 }

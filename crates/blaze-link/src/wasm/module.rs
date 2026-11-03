@@ -329,7 +329,6 @@ fn check(placed: &Placed<'_>) -> Result<(), String> {
         let unplaceable = match &region.class {
             Class::Plt
             | Class::Stubs
-            | Class::Veneers
             | Class::EhFrame
             | Class::Table
             | Class::Got

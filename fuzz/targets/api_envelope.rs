@@ -410,6 +410,7 @@ fn seeds() -> Vec<Vec<u8>> {
         Response::Why(Why { query: key(1, 3), chain: Vec::new(), input: Some(Input::Dir("src".to_owned())) }),
         Response::Status(Status {
             pid: 4242,
+            bugs: Vec::new(),
             views: 1,
             requests: vec![1, 2],
             budget_bytes: 1 << 30,
@@ -419,6 +420,13 @@ fn seeds() -> Vec<Vec<u8>> {
         }),
         Response::Status(Status {
             pid: 1,
+            bugs: vec![blaze_api::Bug {
+                at: "crates/hir-ty/src/next_solver/interner.rs:1:1".to_owned(),
+                kind: "AdtDef".to_owned(),
+                what: "formatted with no database attached".to_owned(),
+                count: u64::MAX,
+                thread: None,
+            }],
             views: 0,
             requests: Vec::new(),
             budget_bytes: 0,

@@ -449,7 +449,7 @@ fn on_unmatched_args_takes_only_this() {
 #[diagnostic::on_unmatched_args(
     message = "{T}! is missing arguments",
     //~^ WARN this format argument is not allowed in `#[diagnostic::on_unmatched_args]`
-    //~| NOTE only `This` is allowed as a format argument
+    //~| NOTE only `this` is allowed as a format argument
     //~| NOTE remove this format argument
     //~| NOTE `#[warn(malformed_diagnostic_format_literals)]` (part of `#[warn(unknown_or_malformed_diagnostic_attributes)]`) on by default
 )]
@@ -467,7 +467,7 @@ fn main() {
 LL |     message = "{T}! is missing arguments",
    |                 ^ remove this format argument
    |
-   = note: only `This` is allowed as a format argument, referring to the macro's name
+   = note: only `this` is allowed as a format argument, referring to the macro's name
    = note: `#[warn(malformed_diagnostic_format_literals)]` (part of `#[warn(unknown_or_malformed_diagnostic_attributes)]`) on by default
 
 warning: 1 warning emitted
@@ -770,14 +770,14 @@ impl Bar for i32 {}
     //~|WARN there is no parameter `r#struct` on trait `Baz`
     //~|WARN there is no parameter `r#enum` on trait `Baz`
     //~|WARN there is no parameter `union` on trait `Baz`
-    label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This:resolved}"
+    label = "{float}{_Self}{crate_local}{this}{item_context}{this:path}{this:resolved}"
     //~^WARN there is no parameter `float` on trait `Baz`
     //~|WARN there is no parameter `_Self` on trait `Baz`
     //~|WARN there is no parameter `crate_local` on trait `Baz`
-    //~|WARN there is no parameter `ItemContext` on trait `Baz`
-    //~|WARN there is no parameter `This` on trait `Baz`
-    //~|WARN there is no parameter `This` on trait `Baz`
-    //~|WARN there is no parameter `This` on trait `Baz`
+    //~|WARN there is no parameter `item_context` on trait `Baz`
+    //~|WARN there is no parameter `this` on trait `Baz`
+    //~|WARN there is no parameter `this` on trait `Baz`
+    //~|WARN there is no parameter `this` on trait `Baz`
     //~|WARN format specifiers are not permitted in diagnostic attributes
     //~|WARN format specifiers are not permitted in diagnostic attributes
 )]
@@ -864,7 +864,7 @@ LL |     message = "{from_desugaring}{direct}{cause}{integral}{integer}{struct}{
 warning: there is no parameter `float` on trait `Baz`
   --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:15
    |
-LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This:resolved}"
+LL |     label = "{float}{_Self}{crate_local}{this}{item_context}{this:path}{this:resolved}"
    |               ^^^^^
    |
    = help: expect either a generic argument name or `{Self}` as format argument
@@ -872,7 +872,7 @@ LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This
 warning: there is no parameter `_Self` on trait `Baz`
   --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:22
    |
-LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This:resolved}"
+LL |     label = "{float}{_Self}{crate_local}{this}{item_context}{this:path}{this:resolved}"
    |                      ^^^^^
    |
    = help: expect either a generic argument name or `{Self}` as format argument
@@ -880,40 +880,40 @@ LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This
 warning: there is no parameter `crate_local` on trait `Baz`
   --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:29
    |
-LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This:resolved}"
+LL |     label = "{float}{_Self}{crate_local}{this}{item_context}{this:path}{this:resolved}"
    |                             ^^^^^^^^^^^
    |
    = help: expect either a generic argument name or `{Self}` as format argument
 
-warning: there is no parameter `This` on trait `Baz`
+warning: there is no parameter `this` on trait `Baz`
   --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:42
    |
-LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This:resolved}"
+LL |     label = "{float}{_Self}{crate_local}{this}{item_context}{this:path}{this:resolved}"
    |                                          ^^^^
    |
    = help: expect either a generic argument name or `{Self}` as format argument
 
-warning: there is no parameter `ItemContext` on trait `Baz`
+warning: there is no parameter `item_context` on trait `Baz`
   --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:48
    |
-LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This:resolved}"
-   |                                                ^^^^^^^^^^^
+LL |     label = "{float}{_Self}{crate_local}{this}{item_context}{this:path}{this:resolved}"
+   |                                                ^^^^^^^^^^^^
    |
    = help: expect either a generic argument name or `{Self}` as format argument
 
-warning: there is no parameter `This` on trait `Baz`
-  --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:61
+warning: there is no parameter `this` on trait `Baz`
+  --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:62
    |
-LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This:resolved}"
-   |                                                             ^^^^
+LL |     label = "{float}{_Self}{crate_local}{this}{item_context}{this:path}{this:resolved}"
+   |                                                              ^^^^
    |
    = help: expect either a generic argument name or `{Self}` as format argument
 
-warning: there is no parameter `This` on trait `Baz`
-  --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:72
+warning: there is no parameter `this` on trait `Baz`
+  --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:73
    |
-LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This:resolved}"
-   |                                                                        ^^^^
+LL |     label = "{float}{_Self}{crate_local}{this}{item_context}{this:path}{this:resolved}"
+   |                                                                         ^^^^
    |
    = help: expect either a generic argument name or `{Self}` as format argument
 
@@ -960,21 +960,27 @@ LL | #[diagnostic::on_unimplemented(message = "Not allowed to apply it on a impl
    = note: `#[warn(misplaced_diagnostic_attributes)]` (part of `#[warn(unknown_or_malformed_diagnostic_attributes)]`) on by default
 
 warning: format specifiers are not permitted in diagnostic attributes
-  --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:65
+  --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:66
    |
-LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This:resolved}"
-   |                                                                 ^^^^^ remove this format specifier
+LL |     label = "{float}{_Self}{crate_local}{this}{item_context}{this:path}{this:resolved}"
+   |                                                                  ^^^^^ remove this format specifier
 
 warning: format specifiers are not permitted in diagnostic attributes
-  --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:76
+  --> $DIR/do_not_accept_options_of_the_internal_rustc_attribute.rs:38:77
    |
-LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This:resolved}"
-   |                                                                            ^^^^^^^^^ remove this format specifier
+LL |     label = "{float}{_Self}{crate_local}{this}{item_context}{this:path}{this:resolved}"
+   |                                                                             ^^^^^^^^^ remove this format specifier
 
 "#;
     let name = "do_not_accept_options_of_the_internal_rustc_attribute.rs";
     let stderr = ui(name, "2015", source);
     assert_starts_with(&stderr, expected);
+    // `diagnostic::on_unimplemented` takes neither `this` nor `item_context`: they are printed
+    // back as written, a format spec dropped, as the pinned `.stderr`'s E0277 label says.
+    assert!(
+        stderr.contains("^^ {float}{_Self}{crate_local}{this}{item_context}{this}{this}\n"),
+        "{stderr}"
+    );
 }
 
 /// `tests/ui/diagnostic_namespace/on_move/report_warning_on_invalid_formats.rs`.
@@ -1068,9 +1074,9 @@ LL |     label = "second label",
 #[test]
 fn on_move_does_not_take_expected_and_found() {
     let source = r#"#![feature(diagnostic_on_move)]
-#[diagnostic::on_move(message = "Foo", label = "Bar", note = "{Expected} {Found}")]
-//~^ WARN unknown parameter `Expected` [malformed_diagnostic_format_literals]
-//~| WARN unknown parameter `Found` [malformed_diagnostic_format_literals]
+#[diagnostic::on_move(message = "Foo", label = "Bar", note = "{expected} {found}")]
+//~^ WARN unknown parameter `expected` [malformed_diagnostic_format_literals]
+//~| WARN unknown parameter `found` [malformed_diagnostic_format_literals]
 #[derive(Debug)]
 struct Foo;
 fn takes_foo(_: Foo) {}
@@ -1081,19 +1087,19 @@ fn main() {
     //~^ERROR Foo
 }
 "#;
-    let expected = r#"warning: unknown parameter `Expected`
+    let expected = r#"warning: unknown parameter `expected`
   --> $DIR/on-type-error-invalid-placeholders.rs:2:64
    |
-LL | #[diagnostic::on_move(message = "Foo", label = "Bar", note = "{Expected} {Found}")]
+LL | #[diagnostic::on_move(message = "Foo", label = "Bar", note = "{expected} {found}")]
    |                                                                ^^^^^^^^
    |
    = help: expect either a generic argument name or `{Self}` as format argument
    = note: `#[warn(malformed_diagnostic_format_literals)]` (part of `#[warn(unknown_or_malformed_diagnostic_attributes)]`) on by default
 
-warning: unknown parameter `Found`
+warning: unknown parameter `found`
   --> $DIR/on-type-error-invalid-placeholders.rs:2:75
    |
-LL | #[diagnostic::on_move(message = "Foo", label = "Bar", note = "{Expected} {Found}")]
+LL | #[diagnostic::on_move(message = "Foo", label = "Bar", note = "{expected} {found}")]
    |                                                                           ^^^^^
    |
    = help: expect either a generic argument name or `{Self}` as format argument

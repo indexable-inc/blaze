@@ -217,6 +217,20 @@ impl TryFrom<AssocItem> for GenericDefId {
     }
 }
 
+impl TryFrom<AssocItem> for AssocItemId {
+    type Error = ();
+    fn try_from(item: AssocItem) -> Result<Self, Self::Error> {
+        Ok(match item {
+            AssocItem::Function(f) => match f.id {
+                AnyFunctionId::FunctionId(it) => it.into(),
+                AnyFunctionId::BuiltinDeriveImplMethod { .. } => return Err(()),
+            },
+            AssocItem::Const(c) => c.id.into(),
+            AssocItem::TypeAlias(t) => t.id.into(),
+        })
+    }
+}
+
 impl<'db> From<(DefWithBodyId, BindingId)> for Local<'db> {
     fn from((parent, binding_id): (DefWithBodyId, BindingId)) -> Self {
         Local { parent: parent.into(), parent_infer: parent.into(), binding_id }

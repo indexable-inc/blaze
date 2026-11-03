@@ -48,8 +48,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplRedundantAssocItems) -> V
         .filter_map(|it| Some((it.name(db)?.as_str().to_owned(), it)))
         // alloc: the error's parts, for an error hir found
         .collect();
+    // rustc's `check_trait_item` looks the item's name up among the trait's hygienically, in its
+    // namespace and then the other: a trait item of the same text a `macro` names apart is none.
     let named = |value: bool| {
-        trait_items.iter().find(|(it_name, it)| it_name == name && is_value(*it) == value).map(|(_, it)| *it)
+        trait_items.iter().find(|&&(_, it)| is_value(it) == value && item.implements(db, d.trait_, it)).map(|(_, it)| *it)
     };
     let in_trait = named(is_value(item)).or_else(|| named(!is_value(item)));
     let trait_fact = Fact::Signature(cx.key(ItemId::Trait(d.trait_.into())));

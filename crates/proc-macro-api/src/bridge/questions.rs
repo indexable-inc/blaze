@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubRequest {
     FilePath {
         file_id: u32,

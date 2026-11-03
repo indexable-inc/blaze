@@ -5,8 +5,8 @@
 //! installing a handler is a libc call, and std has no safe way to do it.
 
 #[cfg(unix)]
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// What the line a signal that ends the daemon writes starts with, then its pid, then
 /// [`ENDED_BY`], the signal's number and its name: `blaze serve: pid 7 ended by signal 6,
@@ -15,6 +15,15 @@ const PID_SAYS: &str = "blaze serve: pid ";
 const ENDED_BY: &str = " ended by signal ";
 
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
+
+/// How many SIGTERMs and SIGINTs arrived: a second one ends a stop that has not ended at once
+/// (`serve::stop`), with what the daemon was inside written first.
+static STOPS_ASKED: AtomicU32 = AtomicU32::new(0);
+
+/// How many SIGTERMs and SIGINTs arrived since [`catch`].
+pub fn stops_asked() -> u32 {
+    STOPS_ASKED.load(Ordering::Acquire)
+}
 
 /// The first SIGTERM or SIGINT's number, 0 before one, then who sent it: the kernel's word in
 /// its `siginfo_t`.
@@ -72,6 +81,14 @@ pub fn catch() {
             SENDER_UID.store(uid, Ordering::Relaxed);
         }
         SIGNALLED.store(true, Ordering::Release);
+        STOPS_ASKED.fetch_add(1, Ordering::AcqRel);
+        let pipe = STOP_PIPE.load(Ordering::Acquire);
+        if pipe >= 0 {
+            let byte = 1u8;
+            // SAFETY: `write` is async-signal-safe, and `byte` is live for it. A full pipe or a
+            // closed read end loses the byte: the guard reads [`signalled`] when it wakes.
+            unsafe { libc::write(pipe, (&raw const byte).cast(), 1) };
+        }
     }
     // SAFETY: `sigaction` is integers, a mask of integers and a handler address; zeroed is
     // its empty value.
@@ -80,12 +97,69 @@ pub fn catch() {
         on as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as libc::sighandler_t;
     action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
     for signal in [libc::SIGTERM, libc::SIGINT] {
-        // SAFETY: `action` is live and whole; its handler, `on`, only does atomic operations
-        // and reads `info`, which are async-signal-safe; were it to lock or allocate, a signal
+        // SAFETY: `action` is live and whole; its handler, `on`, only does atomic operations,
+        // reads `info` and writes a byte to the stop pipe, which are async-signal-safe; were it
+        // to lock or allocate, a signal
         // arriving inside malloc could deadlock or corrupt the heap.
         unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
     }
     catch_dump();
+}
+
+/// The write end of the pipe [`stop_pipe`] made, -1 before one: [`catch`]'s handler writes a
+/// byte to it.
+#[cfg(unix)]
+static STOP_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+/// A pipe whose read end gets a byte when SIGTERM or SIGINT arrives (at once, if one came
+/// before): what the stop's guard (`serve::stop`) blocks on, so it hears the signal though the
+/// loop that reads [`signalled`] is stuck. Once a process; a second call's pipe takes the
+/// first's place, whose write end is left open, as the handler may be writing to it.
+#[cfg(unix)]
+pub fn stop_pipe() -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd as _;
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is live for the call to fill with two descriptors.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for fd in fds {
+        // SAFETY: takes a number and flags and reads no memory of this process.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    // SAFETY: `fds[0]` was just made by `pipe` and is owned by nothing else.
+    let read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    STOP_PIPE.store(fds[1], Ordering::Release);
+    if signalled() {
+        let byte = 1u8;
+        // SAFETY: `fds[1]` is the pipe's open write end, and `byte` is live for the call.
+        unsafe { libc::write(fds[1], (&raw const byte).cast(), 1) };
+    }
+    Ok(read)
+}
+
+/// Wakes what blocks on [`stop_pipe`]: the daemon began a stop no signal asked for (a
+/// client's Stop, or its own end). Nothing before a pipe is made.
+#[cfg(unix)]
+pub fn stop_begun() {
+    let pipe = STOP_PIPE.load(Ordering::Acquire);
+    if pipe >= 0 {
+        let byte = 1u8;
+        // SAFETY: `pipe` is the stop pipe's write end, never closed, and `byte` is live for the
+        // call. A full pipe has a byte already.
+        unsafe { libc::write(pipe, (&raw const byte).cast(), 1) };
+    }
+}
+
+/// Ends the process now with `exit`, running no destructor and no `atexit` handler: for a
+/// stop that made no progress for its bound, whose threads hold locks a destructor would wait
+/// on. What the daemon writes is renamed into place whole, so nothing is left half-written.
+#[cfg(unix)]
+pub fn exit_now(exit: blaze_core::exit::Exit) -> ! {
+    // SAFETY: `_exit` takes an integer and ends the process; it is safe from any thread.
+    unsafe { libc::_exit(exit.code()) }
 }
 
 /// Turns SIGUSR1 into [`dump_asked`].

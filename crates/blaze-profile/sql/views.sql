@@ -12,8 +12,12 @@ SELECT * FROM read_parquet(@spans, union_by_name = true);
 CREATE OR REPLACE VIEW counters AS
 SELECT * FROM read_parquet(@counters, union_by_name = true);
 
+-- One row a build: a build has a row as it starts (outcome `running`, no `dur_ns`) and another
+-- as it ends, with the same `started_ns`, and the view keeps the end's. A build with only its start's row never ended: it
+-- runs, or its daemon died (`history::writes` tells which).
 CREATE OR REPLACE VIEW builds AS
-SELECT * FROM read_parquet(@builds, union_by_name = true);
+SELECT * FROM read_parquet(@builds, union_by_name = true)
+QUALIFY row_number() OVER (PARTITION BY build_id, started_ns ORDER BY dur_ns DESC NULLS LAST) = 1;
 
 CREATE OR REPLACE VIEW samples AS
 SELECT * FROM read_parquet(@samples, union_by_name = true);
@@ -48,6 +52,11 @@ SELECT * FROM read_parquet(@crate_deps, union_by_name = true);
 CREATE OR REPLACE VIEW query_counts AS
 SELECT * FROM read_parquet(@query_counts, union_by_name = true);
 
+-- The spans every thread was inside at each flush that wrote rows, `read_ns` the reading: the
+-- last of a process is what a daemon that died was doing.
+CREATE OR REPLACE VIEW open AS
+SELECT * FROM read_parquet(@open, union_by_name = true);
+
 -- What each build computed again instead of reusing, and why (`blaze why`).
 CREATE OR REPLACE VIEW misses AS
 SELECT * FROM read_parquet(@misses, union_by_name = true);
@@ -58,6 +67,11 @@ SELECT * FROM read_parquet(@perf_runs, union_by_name = true);
 
 CREATE OR REPLACE VIEW perf_functions AS
 SELECT * FROM read_parquet(@perf_functions, union_by_name = true);
+
+-- Sums of short spans, each under 5 us and named by no row, kept as one row a site, thread
+-- and stretch instead of a row each (`flight::fold_below`): `spans` holds the rest.
+CREATE OR REPLACE VIEW folded AS
+SELECT * FROM read_parquet(@folded, union_by_name = true);
 
 -- What crates/blaze-profile/src/time.rs derives from `switches` and `spans`, for each build
 -- `blaze debug time` has read: a job's intervals end to end, each span's time by its job's

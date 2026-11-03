@@ -1,7 +1,8 @@
-diff -ruN a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
+diff --git a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
+index 3899397..93395f4 100644
 --- a/src/canonical/canonicalizer.rs
 +++ b/src/canonical/canonicalizer.rs
-@@ -551,7 +551,9 @@
+@@ -551,7 +551,9 @@ impl<D: SolverDelegate<Interner = I>, I: Interner> TypeFolder<I> for Canonicaliz
                          }
                      }
                  }
@@ -12,10 +13,11 @@ diff -ruN a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
              },
              ty::ConstKind::Placeholder(placeholder) => match self.canonicalize_mode {
                  CanonicalizeMode::Input { .. } => {
-diff -ruN a/src/solve/effect_goals.rs b/src/solve/effect_goals.rs
+diff --git a/src/solve/effect_goals.rs b/src/solve/effect_goals.rs
+index 4483263..2676816 100644
 --- a/src/solve/effect_goals.rs
 +++ b/src/solve/effect_goals.rs
-@@ -290,7 +290,8 @@
+@@ -290,7 +290,8 @@ where
          _ecx: &mut EvalCtxt<'_, D>,
          _goal: Goal<I, Self>,
      ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
@@ -25,7 +27,7 @@ diff -ruN a/src/solve/effect_goals.rs b/src/solve/effect_goals.rs
      }
  
      #[instrument(level = "trace", skip_all, ret)]
-@@ -347,7 +348,8 @@
+@@ -347,7 +348,8 @@ where
          _goal: Goal<I, Self>,
          _kind: rustc_type_ir::ClosureKind,
      ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
@@ -35,10 +37,11 @@ diff -ruN a/src/solve/effect_goals.rs b/src/solve/effect_goals.rs
      }
  
      fn consider_builtin_async_fn_kind_helper_candidate(
-diff -ruN a/src/solve/mod.rs b/src/solve/mod.rs
+diff --git a/src/solve/mod.rs b/src/solve/mod.rs
+index d944ae7..588892d 100644
 --- a/src/solve/mod.rs
 +++ b/src/solve/mod.rs
-@@ -299,11 +299,16 @@
+@@ -299,11 +299,16 @@ where
              ty::ConstKind::Alias(ty::IsRigid::Yes, alias_const) => {
                  alias_const.type_of(self.cx()).skip_norm_wip()
              }
@@ -59,10 +62,11 @@ diff -ruN a/src/solve/mod.rs b/src/solve/mod.rs
              ),
              ty::ConstKind::Param(_) => {
                  unreachable!("`ConstKind::Param` should have been canonicalized to `Placeholder`")
-diff -ruN a/src/solve/normalizes_to.rs b/src/solve/normalizes_to.rs
+diff --git a/src/solve/normalizes_to.rs b/src/solve/normalizes_to.rs
+index 49e5744..75654a8 100644
 --- a/src/solve/normalizes_to.rs
 +++ b/src/solve/normalizes_to.rs
-@@ -798,9 +798,32 @@
+@@ -798,9 +798,32 @@ where
                  }
              },
  
@@ -98,17 +102,18 @@ diff -ruN a/src/solve/normalizes_to.rs b/src/solve/normalizes_to.rs
              }
  
              ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_))
-@@ -1006,12 +1029,8 @@
+@@ -1006,13 +1029,9 @@ where
              | ty::Slice(_)
              | ty::Dynamic(_, _)
              | ty::Tuple(_)
 +            | ty::UnsafeBinder(_)
              | ty::Error(_) => self_ty.discriminant_ty(ecx.cx()),
--
+ 
 -            ty::UnsafeBinder(_) => {
 -                // FIXME(unsafe_binders): instantiate this with placeholders?? i guess??
 -                unimplemented!("discr subgoal...")
 -            }
- 
+-
              // Given an alias, parameter, or placeholder we add an impl candidate normalizing to a rigid
              // alias. In case there's a where-bound further constraining this alias it is preferred over
+             // this impl candidate anyways. It's still a bit scuffed.

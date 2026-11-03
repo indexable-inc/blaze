@@ -653,3 +653,34 @@ fn a_hit_allocates_only_the_decoded_result_and_no_store_allocates_nothing() {
         lookup_passed(&without, def, CHECKER, || true)
     }));
 }
+
+/// Rule 18, the solver's code: an item kept by the solver before an edit of its source (each
+/// front-end identity as blaze-engine's build script works it out and its main hands it over,
+/// `blaze_codegen_code::FRONT_END`) misses in the item store of the solver after it, and is found
+/// again by the one that kept it.
+#[test]
+fn an_item_kept_by_one_solver_misses_after_a_solver_source_edit() {
+    let (before, after) = blaze_codegen_code::fixture::front_end_around_a_solver_edit();
+    let (before, after) = (ContentId(before), ContentId(after));
+    assert_ne!(before, after, "an edit of the solver's source is another front-end identity");
+    let memory = Arc::new(Memory::default());
+    let defs = Defs::default();
+    let with = |db: Db, build: ContentId| {
+        let facts = Arc::new(TestFacts::new(&db, &defs, None));
+        let installed = install(&db, memory.clone(), facts.clone(), build, Mode::Serve).unwrap();
+        Session { installed, facts, db }
+    };
+    let first = with(db_of(FIXTURE), before);
+    for name in BODIES {
+        let _ = InferenceResult::of(&first.db, function(&first.db, name));
+    }
+    assert_eq!(first.installed.flush().unwrap().written, BODIES.len(), "each body's inference is kept");
+    drop(first);
+    for (build, hits, what) in [(after, 0, "the edited solver finds none"), (before, BODIES.len(), "the solver that kept them finds each")] {
+        let s = with(second(FIXTURE), build);
+        for name in BODIES {
+            let _ = InferenceResult::of(&s.db, function(&s.db, name));
+        }
+        assert_eq!(s.installed.steps()[Step::Infer as usize].hits, hits as u64, "{what}");
+    }
+}

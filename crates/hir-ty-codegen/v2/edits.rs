@@ -510,9 +510,9 @@ fn edits(tc: &TestCase) -> Vec<Edit> {
     (0..count).map(|_| edit(tc)).collect()
 }
 
-fn incremental_is_clean(tc: TestCase) {
+fn incremental_is_clean(tc: &TestCase) {
     let heap_to_stack = tc.draw(gs::booleans());
-    replay(&edits(&tc), heap_to_stack);
+    replay(&edits(tc), heap_to_stack);
 }
 
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
@@ -545,5 +545,5 @@ fn each_edit_kind_builds_incrementally_as_clean() {
 
 #[test]
 fn any_edit_sequence_builds_incrementally_as_clean() {
-    run_cases(12, incremental_is_clean);
+    run_cases(12, |tc| incremental_is_clean(&tc));
 }

@@ -381,6 +381,116 @@ For more information about this error, try `rustc --explain E0277`.
     assert_eq!(ui("E0277.rs", "2015", source), stderr);
 }
 
+/// `#[rustc_on_unimplemented]`'s placeholders as the pinned nightly fills them: core's `FnOnce`
+/// and `FnMut` attributes verbatim, whose `{this:resolved}` is the bound's `FnMut(i32)` sugar
+/// (`tests/ui/trait-bounds/mismatch-fn-trait.rs`'s first case), and a trait of the crate's
+/// whose `{this}`, `{this:path}`, `{item_context}` and `{T}` are of a function, a method and a
+/// closure. No message keeps a placeholder.
+#[test]
+fn rustc_on_unimplemented_fills_this_resolved_this_path_and_item_context() {
+    let fixture = r#"//- /main.rs crate:main edition:2024
+#![no_core]
+#![feature(no_core, lang_items, rustc_attrs, fundamental, unboxed_closures)]
+
+#[lang = "pointee_sized"]
+#[fundamental]
+pub trait PointeeSized {}
+#[lang = "meta_sized"]
+#[fundamental]
+pub trait MetaSized: PointeeSized {}
+#[lang = "sized"]
+#[fundamental]
+pub trait Sized: MetaSized {}
+#[lang = "tuple_trait"]
+pub trait Tuple {}
+
+#[lang = "fn_once"]
+#[rustc_paren_sugar]
+ATTR
+#[fundamental]
+pub trait FnOnce<Args: Tuple> {
+    #[lang = "fn_once_output"]
+    type Output;
+    extern "rust-call" fn call_once(self, args: Args) -> Self::Output;
+}
+
+#[lang = "fn_mut"]
+#[rustc_paren_sugar]
+ATTR
+#[fundamental]
+pub trait FnMut<Args: Tuple>: FnOnce<Args> {
+    extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output;
+}
+
+#[lang = "fn"]
+#[rustc_paren_sugar]
+ATTR
+#[fundamental]
+pub trait Fn<Args: Tuple>: FnMut<Args> {
+    extern "rust-call" fn call(&self, args: Args) -> Self::Output;
+}
+
+#[rustc_on_unimplemented(message = "`{Self}` is no {this} in {item_context}", label = "{this:path} of `{T}`")]
+pub trait Marker<T> {}
+
+fn needs<T: Marker<u8>>(_: T) {}
+
+fn take(_f: impl FnMut(i32)) {}
+
+fn test1(f: impl FnMut(u32)) {
+    take(f)
+}
+
+struct S;
+impl S {
+    fn method() {
+        needs(())
+    }
+}
+
+fn main() {
+    needs(());
+    let _closure = || needs(());
+}
+"#
+    .replace("ATTR", ATTR);
+    let checked = checked(&fixture);
+    let messages = checked.messages();
+    for want in [
+        "E0277: `()` is no Marker in a function",
+        "E0277: `()` is no Marker in a method",
+        "E0277: `()` is no Marker in a closure",
+    ] {
+        assert!(messages.iter().any(|it| it == want), "{want} not in {messages:#?}");
+    }
+    assert!(
+        messages.iter().any(|it| it.starts_with("E0277: expected `FnMut(i32)` signature, found `")),
+        "{messages:#?}"
+    );
+    let e0277 = messages.iter().filter(|it| it.starts_with("E0277"));
+    assert!(e0277.clone().count() >= 4 && e0277.clone().all(|it| !it.contains('{')), "{messages:#?}");
+    let stderr = checked.stderr();
+    assert!(stderr.contains("Marker<T> of `u8`"), "{stderr}");
+    assert!(!stderr.contains("{this") && !stderr.contains("{item_context}"), "{stderr}");
+}
+
+/// Core's `#[rustc_on_unimplemented]` of `FnOnce`, `FnMut` and `Fn`, as the pinned library
+/// writes it.
+const ATTR: &str = r#"#[rustc_on_unimplemented(
+    on(
+        Args = "()",
+        note = "wrap the `{Self}` in a closure with no arguments: `|| {{ /* code */ }}`"
+    ),
+    on(
+        Self = "unsafe fn",
+        note = "unsafe function cannot be called generically without an unsafe block",
+        // SAFETY: tidy is not smart enough to tell that the below unsafe block is a string
+        label = "call the function in a closure: `|| unsafe {{ /* code */ }}`"
+    ),
+    message = "expected `{this:resolved}` signature, found `{Self}`",
+    label = "expected `{this:resolved}` signature, found `{Self}`"
+)]"#;
+
 #[test]
 fn on_unimplemented_gives_the_message_label_and_notes() {
     // tests/ui/diagnostic_namespace/on_unimplemented/multiple_notes.rs

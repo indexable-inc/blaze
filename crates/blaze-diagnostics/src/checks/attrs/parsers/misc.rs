@@ -781,7 +781,7 @@ fn malformed(cx: &Cx<'_, '_>, attr: &Attr<'_>, name: &str, template: &Template, 
     let mut diag = Diag::error(None, format!("malformed `{name}` attribute input"), span.clone());
     if !suggestions.is_empty() {
         let message = if suggestions.len() == 1 { "must be of the form" } else { "the following are the possible correct uses" };
-        diag.suggestions(span, message, suggestions, Applicability::HasPlaceholders, SuggestionStyle::ShowAlways);
+        diag.suggestions(&span, message, suggestions, Applicability::HasPlaceholders, SuggestionStyle::ShowAlways);
     }
     if let Some(link) = template.docs {
         // alloc: the error's note

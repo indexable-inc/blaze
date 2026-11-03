@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 #![feature(random)]
 #![feature(allocator_api)]
+#![feature(alloc_error_hook)]
 
 use std::path::{Path, PathBuf};
 

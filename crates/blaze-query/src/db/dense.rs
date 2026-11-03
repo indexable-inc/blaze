@@ -45,8 +45,9 @@ unsafe impl<T: Zeroed, const N: usize> Zeroed for [T; N] {}
 pub(crate) struct Dense<T: Zeroed, const WHOLE: usize = 0> {
     /// The published length: places `0..len` are committed, and stay so while the column
     /// lives. Only `Dense::grow` raises it, after the commit (see the invariant there);
-    /// nothing lowers it. Never past `capacity`. A [`Whole`] column's is the prefix its
-    /// writers committed, which bounds no read (every place of its reservation is readable).
+    /// only [`Dense::clear`] lowers it, to 0 under `&mut`. Never past `capacity`. A [`Whole`]
+    /// column's is the prefix its writers committed, which bounds no read (every place of its
+    /// reservation is readable).
     len: AtomicUsize,
     region: Region,
     /// Places reserved: `capacity * size_of::<T>() <= region.reserved()`.
@@ -126,6 +127,21 @@ impl<T: Zeroed, const WHOLE: usize> Dense<T, WHOLE> {
         self.len.load(Ordering::Acquire)
     }
 
+    /// Bytes of the column committed now: what it holds of the process's memory.
+    pub(crate) fn committed_bytes(&self) -> usize {
+        self.region.committed()
+    }
+
+    /// Empties the column and gives its pages back to the kernel. `&mut`: no reference into
+    /// the column is alive, so the length may go down (the one place it does). A place is
+    /// committed again before it is next read: `Dense::grow`'s invariant holds from 0.
+    pub(crate) fn clear(&mut self) {
+        if let Err(why) = self.region.decommit_after(0) {
+            panic!("the query database's column of {} could not give its pages back: {why}", self.name);
+        }
+        *self.len.get_mut() = 0;
+    }
+
     /// The bound a read checks: the published length, read with acquire, or a whole column's
     /// capacity, a constant (every place of its sparse reservation readable, see
     /// [`Dense::sparse`]).
@@ -157,8 +173,10 @@ impl<T: Zeroed, const WHOLE: usize> Dense<T, WHOLE> {
         //   read here with acquire or made by this thread).
         // - `published` is that prefix in whole places, at most `capacity`, so every page
         //   under it is committed: whole, not a prefix of a page.
-        // - The prefix never shrinks while the column lives: only `Region::decommit_after`
-        //   lowers it, which takes `&mut Region`, and `Dense` never hands its region out.
+        // - The prefix never shrinks under a shared borrow: only `Region::decommit_after`
+        //   lowers it, which takes `&mut Region`; `Dense` never hands its region out and
+        //   calls it only from `Dense::clear`, under `&mut self`, which lowers `len` to 0
+        //   with it, so no place below a published length is ever left uncommitted.
         // - Release here, acquire in `get`: a reader that sees `published` sees the commit
         //   that came before it in this thread.
         // - `fetch_max`: racing growers each publish a committed prefix, and the length only

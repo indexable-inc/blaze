@@ -26,6 +26,12 @@
 //! work for one crate reads what it set for another (name resolution, by the crate graph) asks
 //! for another step ([`Reads::again`]).
 //!
+//! A change can imply another write that no maintainer may make, because a maintainer's
+//! writes are not noted: a dependency read from its image whose files moved loses that image
+//! (hir-def's `deps`). That is an [`Implied`] write. It runs at the end of the batch, before
+//! the maintainers. Its writes are noted as part of the change, so no maintainer and no
+//! reader sees the change without them.
+//!
 //! A panic in a write or a maintainer drops every maintainer's state: the next write maintains
 //! from empty, which is the cold run, not another path.
 
@@ -124,6 +130,33 @@ pub struct Maintainer {
     /// The step's writes: what the reads computed diffed against the state, and the inputs
     /// that changed set. It executes no query: what it reads, the reads read first.
     pub apply: fn(&mut Db, &Written<'_>, &Reads),
+}
+
+/// A write that every change implies, registered with `inventory::submit!` as a [`Maintainer`]
+/// is. It runs once at the end of each batch that wrote something, after every write of the
+/// batch and before any maintainer. Its `write` gets what the batch wrote, and what it sets is
+/// part of the same change: its write methods are noted (a [`Db::note_crates_changed`] in it
+/// gives the maintainers a crate graph change). A write method in it starts no pass of its
+/// own. The writes it notes are not handed to the implied writes again.
+pub struct Implied {
+    pub name: &'static str,
+    pub write: fn(&mut Db, &Written<'_>),
+}
+
+inventory::collect!(Implied);
+
+/// The implied writes linked into this binary, by name, sorted once.
+pub fn implied() -> &'static [&'static Implied] {
+    static SORTED: OnceLock<Box<[&'static Implied]>> = OnceLock::new();
+    SORTED.get_or_init(|| {
+        // alloc: once per process, the sorted list of linked implied writes
+        let mut all: Vec<&'static Implied> = inventory::iter::<Implied>().collect();
+        all.sort_by_key(|it| it.name);
+        for pair in all.windows(2) {
+            assert!(pair[0].name != pair[1].name, "two implied writes are named `{}`", pair[0].name);
+        }
+        all.into_boxed_slice()
+    })
 }
 
 /// What one step of a maintainer reads ([`Maintainer::reads`]): batches of keys, each read by a
@@ -362,6 +395,21 @@ impl Pending {
         }
     }
 
+    /// Adds what `other` noted to these lists; [`Pending::normalize`] sorts them again.
+    fn absorb(&mut self, other: &Pending) {
+        self.set.extend_from_slice(&other.set);
+        self.added.extend_from_slice(&other.added);
+        self.removed.extend_from_slice(&other.removed);
+        self.roots.extend_from_slice(&other.roots);
+        self.crates |= other.crates;
+        self.proc_macros.extend_from_slice(&other.proc_macros);
+        for &file in &other.included {
+            if !self.included.contains(&file) {
+                self.included.push(file);
+            }
+        }
+    }
+
     /// Sorts and dedups each list, and takes the files added or removed out of `set`.
     fn normalize(&mut self) {
         for files in [&mut self.set, &mut self.added, &mut self.removed] {
@@ -390,6 +438,7 @@ impl Pending {
 }
 
 /// What a write method notes it changed ([`Db::note`]).
+#[derive(Clone, Copy)]
 pub(crate) enum Note<'a> {
     Set(FileId),
     View { set: &'a [FileId], added: &'a [FileId], removed: &'a [FileId], roots: &'a [SourceRootId] },
@@ -633,6 +682,7 @@ impl Db {
         if self.maintenance.pending.is_empty() {
             return;
         }
+        self.run_implied();
         let all = maintainers();
         if all.is_empty() {
             self.maintenance.pending.clear();
@@ -659,6 +709,37 @@ impl Db {
         pending.clear();
         self.maintenance.pending = pending;
         if let Err(panic) = ran {
+            self.forget_maintained_state();
+            panic::resume_unwind(panic);
+        }
+    }
+
+    /// Runs every [`Implied`] write once over the pending writes, and adds what they note to
+    /// them: the maintainers' pass is over the change and what it implied.
+    fn run_implied(&mut self) {
+        let all = implied();
+        if all.is_empty() {
+            return;
+        }
+        self.maintenance.pending.normalize();
+        // The implied writes note into an empty list (alloc: only when one writes), then it is
+        // added to the batch's.
+        let pending = std::mem::replace(&mut self.maintenance.pending, Pending::empty());
+        // Held up: a write method called by an implied write is part of this batch, and runs
+        // no pass of its own.
+        self.maintenance.depth += 1;
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+            let written = pending.written();
+            for it in all {
+                let _span = tracing::info_span!(target: "blaze", "implied write", function = it.name).entered();
+                (it.write)(self, &written);
+            }
+        }));
+        self.maintenance.depth -= 1;
+        let noted = std::mem::replace(&mut self.maintenance.pending, pending);
+        self.maintenance.pending.absorb(&noted);
+        if let Err(panic) = ran {
+            self.maintenance.pending.clear();
             self.forget_maintained_state();
             panic::resume_unwind(panic);
         }

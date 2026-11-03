@@ -96,7 +96,7 @@ impl Space for [u8; 1] {
     type Ty = Self;
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             201..202 'a': Vec<u8>
             213..246 '{     ...r(); }': ()
             223..227 'iter': IntoIter<u8>
@@ -136,7 +136,7 @@ fn test() -> i32 {
 }
 
     "#,
-        expect![[r#"
+        &expect![[r#"
             11..16 '_thin': *const ()
             29..34 '_meta': DynMetadata<T>
             155..170 '{     loop {} }': *const T
@@ -215,7 +215,7 @@ fn f<T: Into<Foo>>(u: T) {
     x.method();
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             38..42 'self': Foo
             51..56 '{ 0 }': i32
             53..54 '0': i32
@@ -246,7 +246,7 @@ impl<'a> IntoIterator for &'a Grid {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             150..154 'self': &'a Grid
             174..181 '{     }': ()
         "#]],
@@ -262,7 +262,7 @@ fn main() {
     _ = [0i32].into_iter().filter_map(|_n| Some(1i32));
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             10..69 '{     ...2)); }': ()
             16..17 '_': FilterMap<IntoIter<i32, 1>, impl FnMut(i32) -> Option<i32>>
             16..66 '_ = [0...1i32))': ()
@@ -335,7 +335,7 @@ fn main() {
   let foo: [_; _] = [false] as _;
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             10..47 '{   le...s _; }': ()
             18..21 'foo': [bool; 1]
             32..39 '[false]': [bool; 1]
@@ -366,7 +366,7 @@ where
     let t: <T as DimMax<U>>::Output = loop {};
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             182..183 't': T
             230..280 '{     ... {}; }': !
             240..241 't': <T as DimMax<U>>::Output
@@ -536,7 +536,7 @@ fn foo() {
     let _x = to_bytes().to_vec();
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             60..64 'self': Self
             85..108 '{     ...     }': Vec<<Self as Foo>::Item>
             95..102 'loop {}': !
@@ -588,7 +588,7 @@ fn test_at_most() {
     let num = '9'.at_most::<1>();
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             48..49 '0': usize
             182..186 'self': Between<M, 0, T>
             188..192 '_sep': &'? str
@@ -741,7 +741,7 @@ fn main() {
         as &dyn Map<Key=u32,MapValue=u32>;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             210..272 '{     ...32>; }': ()
             220..221 '_': &'? (dyn Map<MapValue = u32, Key = u32> + '?)
             224..227 '&()': &'? ()
@@ -784,7 +784,7 @@ where
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             168..172 'self': &'? F
             205..227 '{     ...     }': <F as AsyncFnMut<()>>::CallRefFuture<'?>
             215..219 'self': &'? F
@@ -917,7 +917,7 @@ fn main() {
     join_all(x);
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             164..168 'self': &'? mut Foo<T>
             192..224 '{     ...     }': Option<T>
             202..206 'self': &'? mut Foo<T>
@@ -980,7 +980,7 @@ fn test2<T: FooFactory>(factory: T) {
     let baz = factory.foo_rpit().bar().baz();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             290..293 'foo': impl Foo + ?Sized
             325..359 '{     ...z(); }': ()
             335..338 'baz': u8

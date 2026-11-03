@@ -203,7 +203,7 @@ fn query_id(bits: u64) -> Option<blaze_query::db::Id> {
     u32::try_from(bits).ok().and_then(blaze_query::db::Id::new)
 }
 
-fn id_bits(id: impl AsId) -> u64 {
+fn id_bits(id: impl AsId + Copy) -> u64 {
     u64::from(id.as_id().as_u32())
 }
 

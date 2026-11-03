@@ -791,6 +791,7 @@ impl InstanceDef {
 }
 
 /// What a call transfers control to.
+#[derive(Clone, Copy)]
 enum Callee<'db> {
     Instance(InstanceDef, GenericArgs<'db>),
     /// With how many of the arguments are for named parameters, when the rest are for `...`.
@@ -989,13 +990,13 @@ fn backtrace_name(db: &Db, instance: &Instance) -> String {
     let ty = || args.as_slice().first().and_then(|arg| arg.ty());
     let of_closure = |owner: InferBodyId<'_>, expr| match owner {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
-            hir_ty_mir::mir::type_name::rustc_closure_name(db, func, args.as_slice(), expr)
+            hir_ty_print::rustc_closure_name(db, func, args.as_slice(), expr)
         }
         _ => None,
     };
     let name = match instance.def {
         InstanceDef::Fn(func) => {
-            hir_ty_mir::mir::type_name::rustc_function_name(db, func, args.as_slice())
+            hir_ty_print::rustc_function_name(db, func, args.as_slice())
         }
         InstanceDef::Closure(id) => {
             let at = InternedClosureId::from_id(id).loc(db);
@@ -1006,7 +1007,7 @@ fn backtrace_name(db: &Db, instance: &Instance) -> String {
             of_closure(at.owner, at.expr)
         }
         InstanceDef::DropGlue => ty()
-            .and_then(|ty| hir_ty_mir::mir::type_name::rustc_symbol_type(db, ty))
+            .and_then(|ty| hir_ty_print::rustc_symbol_type(db, ty))
             // alloc: the backtrace name, owned by later.rs, watch.rs and v2's callers
             .map(|ty| format!("core::ptr::drop_glue::<{ty}>")),
         InstanceDef::CallOnceShim
@@ -2026,25 +2027,24 @@ fn refused_const_eval(
 /// macro is called only if the macro is another crate's or the compiler's, and of where the
 /// macro has it otherwise, as it is of what a macro writes of the code of `closure`, or of
 /// the body when there is none, where that is itself what the macro writes.
-#[blaze_query::tracked]
-fn row_location_in_file<'db>(
-    db: &'db Db,
+fn row_location_in_file(
+    db: &Db,
     owner: DefWithBodyId,
     closure: Option<ExprId>,
     span: MirSpan,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let (file_id, range) = source_range(db, owner, span)?;
     if file_id.macro_file().is_none() {
-        return *source_location_in_file(db, owner, span);
+        return source_location_in_file(db, owner, span);
     }
-    let source_map = &Body::with_source_map(db, owner).1;
+    let source_map = Body::source_map(db, owner);
     let code = closure.unwrap_or_else(|| Body::of(db, owner).root_expr());
     let within = match source_map.expr_syntax(code) {
         Ok(body) => {
             let start = TextRange::empty(body.value.syntax_node_ptr().text_range().start());
             body.file_id.span_map(db).span_for_range(start).ctx
         }
-        Err(_) => return *source_location_in_file(db, owner, span),
+        Err(_) => return source_location_in_file(db, owner, span),
     };
     written_place(db, file_id, range, Some(within))
 }
@@ -5265,8 +5265,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Storage for a temporary that is borrowed for `'static` and that [`Self::promoted_constant`]
     /// could not evaluate: one with a place in the source inside it that is not the whole of
-    /// it, or one const eval refused. The function writes the same constant there every time
-    /// it runs, so it is writable data, which a v2 unit refuses (`v2/places.rs`).
+    /// it (`&S { f: file!(), l: line!() }`, which expect-test's `expect![..]` is, its line read
+    /// where the code runs), or one const eval refused. The function writes the same constant
+    /// there every time it runs, so it is writable data: in v2 the function instance's own
+    /// ([`blaze_codegen::Data::owned`] of its key), so two instances never share one. Not a
+    /// stack slot: the borrow may outlive the call, and an `async` body never holds a promoted
+    /// constant across a yield (`MirBody::promoted_constants`), so a slot would be gone when
+    /// it resumes.
     fn promoted_slot(&mut self, layout: &Layout) -> Result<Value> {
         let align = layout.align.abi.bytes();
         if layout.size.bytes() == 0 {
@@ -11861,7 +11866,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             (I::TypeName, []) => {
                 let ty = generic_args.type_at(0);
-                let Some(name) = hir_ty_mir::mir::type_name::rustc_type_name(self.cg.db, ty) else {
+                let Some(name) = hir_ty_print::rustc_type_name(self.cg.db, ty) else {
                     unsupported!("`type_name` of `{ty:?}`");
                 };
                 let len = self.builder.ins().iconst(self.cg.target.pointer(), name.len() as i64);

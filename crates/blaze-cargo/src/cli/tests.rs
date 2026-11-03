@@ -116,7 +116,7 @@ fn ub_results_print_as_libtest_prints_them() {
     let passed = TestResult { name: "tests::fine".to_owned(), outcome: TestOutcome::Passed, output: Vec::new(), ..failed.clone() };
     let mut api = FakeApi::answering(vec![Response::TestResult(passed), Response::TestResult(failed), Response::Done { ok: true }]);
     let (then, out, err) = driven(&mut api, &["blaze", "test", "--ub", "-q"], &mut Fake::default());
-    assert_eq!(then, Then::Exit(FAILED));
+    assert_eq!(then, Then::Exit(Exit::Failed.code()));
     assert!(out.contains("test tests::aliasing ... FAILED\n"), "{out}");
     assert!(out.contains("---- tests::aliasing stdout ----\nundefined behavior:"), "{out}");
     assert!(out.contains("seed: 7"), "{out}");
@@ -157,10 +157,10 @@ fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
 
 #[test]
 fn usage_errors_exit_1() {
-    assert_eq!(command(words(os(&["blaze", "build", "--frobnicate"]))), USAGE);
-    assert_eq!(command(words(os(&["blaze", "build", "--jobs"]))), USAGE);
-    assert_eq!(command(words(os(&["blaze", "test", "--message-format", "xml"]))), USAGE);
-    assert_eq!(command(words(os(&["blaze", "frobnicate"]))), FAILED);
+    assert_eq!(command(words(os(&["blaze", "build", "--frobnicate"]))), Exit::Usage.code());
+    assert_eq!(command(words(os(&["blaze", "build", "--jobs"]))), Exit::Usage.code());
+    assert_eq!(command(words(os(&["blaze", "test", "--message-format", "xml"]))), Exit::Usage.code());
+    assert_eq!(command(words(os(&["blaze", "frobnicate"]))), Exit::Failed.code());
 }
 
 /// Answers every request with `responses`.
@@ -216,10 +216,10 @@ fn driven(api: &mut FakeApi, words: &[&str], programs: &mut Fake) -> (Then, Stri
 }
 
 #[test]
-fn a_failing_test_executable_stops_the_tests() {
+fn under_fail_fast_a_failing_test_executable_stops_the_tests() {
     let mut api = FakeApi::answering(tests_built());
     let mut programs = Fake { ends: vec![("foo-0123abcd", Ended::Code(101))], ..Fake::default() };
-    let (then, out, err) = driven(&mut api, &["blaze", "test"], &mut programs);
+    let (then, out, err) = driven(&mut api, &["blaze", "test", "--fail-fast"], &mut programs);
     assert_eq!(then, Then::Exit(101));
     assert_eq!(out, "");
     let lines: Vec<&str> = err.lines().collect();
@@ -243,7 +243,7 @@ fn a_failing_test_executable_stops_the_tests() {
 fn a_failed_build_runs_nothing() {
     let mut api = FakeApi::answering(vec![foo_compiling(), Response::Done { ok: false }]);
     let mut programs = Fake::default();
-    let (then, _, err) = driven(&mut api, &["blaze", "test"], &mut programs);
+    let (then, _, err) = driven(&mut api, &["blaze", "test", "--fail-fast"], &mut programs);
     assert_eq!(then, Then::Exit(101));
     assert!(programs.ran.is_empty());
     assert_eq!(err, "   Compiling foo v0.1.0 (/w/foo)\n");
@@ -255,23 +255,25 @@ fn a_failed_build_runs_nothing() {
 }
 
 #[test]
-fn under_keep_going_the_tests_that_built_run_past_a_failed_unit() {
+fn by_default_the_tests_that_built_run_past_a_failed_unit() {
     // A unit failed (the daemon said which, by name) and the rest built: their tests still run,
-    // and the run fails.
+    // and the run fails. `--keep-going` is the same, a no-op.
     let failed = |it: Vec<Response>| {
         it.into_iter().map(|it| if matches!(it, Response::Done { .. }) { Response::Done { ok: false } } else { it }).collect()
     };
-    let mut api = FakeApi::answering(failed(tests_built()));
-    let mut programs = Fake::default();
-    let (then, _, err) = driven(&mut api, &["blaze", "test", "--keep-going"], &mut programs);
-    assert_eq!(then, Then::Exit(101));
-    assert_eq!(programs.ran.len(), 4, "{err}");
-    assert!(err.contains("     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)"), "{err}");
+    for words in [&["blaze", "test"][..], &["blaze", "test", "--keep-going"]] {
+        let mut api = FakeApi::answering(failed(tests_built()));
+        let mut programs = Fake::default();
+        let (then, _, err) = driven(&mut api, words, &mut programs);
+        assert_eq!(then, Then::Exit(101), "{words:?}");
+        assert_eq!(programs.ran.len(), 4, "{words:?}: {err}");
+        assert!(err.contains("     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)"), "{err}");
+    }
 
-    // Without it nothing runs.
+    // Under `--fail-fast` nothing runs.
     let mut api = FakeApi::answering(failed(tests_built()));
     let mut programs = Fake::default();
-    let (then, _, _) = driven(&mut api, &["blaze", "test"], &mut programs);
+    let (then, _, _) = driven(&mut api, &["blaze", "test", "--fail-fast"], &mut programs);
     assert_eq!(then, Then::Exit(101));
     assert!(programs.ran.is_empty());
 }
@@ -344,7 +346,7 @@ fn doc_writes_its_pages_and_says_what_cargo_doc_says() {
         Response::Done { ok: true },
     ];
     let (then, _, err) = driven(&mut FakeApi::answering(escaping), &["blaze", "doc"], &mut Fake::default());
-    assert_eq!(then, Then::Exit(FAILED));
+    assert_eq!(then, Then::Exit(Exit::Failed.code()));
     assert!(err.contains("the daemon sent the page `../escaped.html`, which is not under"), "{err}");
     assert!(!dir.join("escaped.html").exists(), "nothing is written outside the documentation's directory");
     std::fs::remove_dir_all(&dir).unwrap();

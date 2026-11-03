@@ -14,7 +14,7 @@ use hir_def::{
         RecordSpread, Statement, Statements, UnaryOp, UnsafeBinderCastKind,
     },
     resolver::{TypeNs, ValueNs},
-    signatures::VariantFields,
+    signatures::{EnumVariants, VariantFields},
     type_ref::TypeRefId,
 };
 use hir_def::{
@@ -501,7 +501,16 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 }
                 breaks.coerce.map(|c| c.complete(self)).unwrap_or(self.types.types.unit)
             }
-            Expr::Closure { body, args, ret_type, arg_types, closure_kind, capture_by: _ } => self
+            // Its binder is read where its signature is lowered (`supplied_sig_of_closure`).
+            Expr::Closure {
+                body,
+                args,
+                ret_type,
+                arg_types,
+                closure_kind,
+                capture_by: _,
+                binder: _,
+            } => self
                 .infer_closure(
                     body,
                     args,
@@ -920,6 +929,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 // MIR lowering needs the type whose fields these are.
                 let container = self.make_ty(offset.container);
                 self.result.type_of_type_placeholder.insert(offset.container, container.store());
+                self.check_offset_of_privacy(tgt_expr, container, offset);
                 self.types.types.usize
             }
             Expr::InlineAsm(asm) => {
@@ -1233,7 +1243,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             let field_type = if let Some(i) = remaining_fields.remove(name) {
                 seen_fields.insert(*name, i);
 
-                if !self.resolver.is_visible(self.db, variant_field_vis[i]) {
+                let expn = hir_def::nameres::variant_expansion(self.db, variant);
+                if !self.resolver.is_visible_written(self.db, variant_field_vis[i], hygiene, expn) {
                     self.push_diagnostic(InferenceDiagnostic::NoSuchField {
                         field: field.expr.into(),
                         private: Some(i),
@@ -1869,6 +1880,61 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         self.infer_top_pat(pat, decl_ty, pat_origin);
     }
 
+    /// rustc's `check_expr_offset_of`, its privacy part: each field `offset_of!` names is
+    /// looked up hygienically ([`VariantFields::field_written`]) and its privacy checked from the
+    /// def site of its name ([`hir_def::resolver::Resolver::privacy_scope`]), else from here as a
+    /// field access is; a private one is E0616. A field that is not there ends the walk: MIR
+    /// lowering, which projects the same fields (`offset_of_place`), refuses it.
+    fn check_offset_of_privacy(
+        &mut self,
+        expr: ExprId,
+        container: Ty<'db>,
+        offset: &hir_def::hir::OffsetOf,
+    ) {
+        let interner = self.interner();
+        let mut ty = container;
+        let mut variant = None;
+        for (index, name) in offset.fields.iter().enumerate() {
+            let resolved = self.table.try_structurally_resolve_type(expr.into(), ty);
+            let (of, args) = match resolved.kind() {
+                TyKind::Tuple(tys) => {
+                    match name.as_tuple_index().and_then(|it| tys.as_slice().get(it)) {
+                        Some(&it) => ty = it,
+                        None => return,
+                    }
+                    continue;
+                }
+                TyKind::Adt(adt, args) => match (adt.def_id(), variant.take()) {
+                    (_, Some(variant)) => (VariantId::EnumVariantId(variant), args),
+                    (AdtId::EnumId(it), None) => {
+                        let ctxt = offset.field_hygiene(index).syntax_context();
+                        let Some(it) = EnumVariants::variant_written(self.db, it, name, ctxt) else {
+                            return;
+                        };
+                        variant = Some(it);
+                        continue;
+                    }
+                    (AdtId::StructId(it), None) => (it.into(), args),
+                    (AdtId::UnionId(it), None) => (it.into(), args),
+                },
+                _ => return,
+            };
+            let hygiene = offset.field_hygiene(index);
+            let Some(local_id) = of.fields(self.db).field_written(self.db, of, name, hygiene) else {
+                return;
+            };
+            let visibility = VariantFields::field_visibilities(self.db, of)[local_id];
+            let expn = hir_def::nameres::variant_expansion(self.db, of);
+            let scope = self.resolver.privacy_scope(self.db, hygiene, expn);
+            if !visibility.is_visible_from(self.db, scope.unwrap_or_else(|| self.resolver.module())) {
+                let field = FieldId { parent: of, local_id };
+                let at = Some(u32::try_from(index).expect("an `offset_of!` names fewer than 2^32 fields"));
+                self.push_diagnostic(InferenceDiagnostic::PrivateField { expr, field, at });
+            }
+            ty = self.db.field_types(of)[local_id].ty().instantiate(interner, args).skip_norm_wip();
+        }
+    }
+
     fn lookup_field(
         &mut self,
         field_expr: ExprId,
@@ -1913,9 +1979,15 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 },
                 _ => return None,
             };
+            // Its privacy is checked from the def site of the name (rustc's `check_field`).
+            let scope = self.resolver.privacy_scope(
+                self.db,
+                hygiene,
+                hir_def::nameres::variant_expansion(self.db, field_id.parent),
+            );
             let is_visible = VariantFields::field_visibilities(self.db, field_id.parent)
                 [field_id.local_id]
-                .is_visible_from(self.db, self.resolver.module());
+                .is_visible_from(self.db, scope.unwrap_or_else(|| self.resolver.module()));
             if !is_visible {
                 if private_field.is_none() {
                     private_field = Some((field_id, parameters));
@@ -2050,6 +2122,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     self.push_diagnostic(InferenceDiagnostic::PrivateField {
                         expr: tgt_expr,
                         field,
+                        at: None,
                     });
                 }
                 ty

@@ -256,16 +256,21 @@ absent run again, in the view right after it is made. `&` can't make a singleton
 
 ### LRU and eviction
 
-- `lru = N`: the value cap, not a correctness knob. At a view boundary (`&mut`) a function's
-  rows past `N`, oldest `verified` first, drop their value and keep stamp, hash and edges;
-  nothing is written on a hit (no recency list). `lru = 0`: no cap, evictable on demand
-  (`Query::evict_values(db)`, `hir/src/evict.rs`).
-- The cap is a runtime value (R15, 01212): `N` is its start, held in the function's table, and
-  `f::set_lru_capacity(db: &mut D, capacity: usize)` replaces it (0: no cap), applied at the
-  next view's sweep. Every `lru` function is on the sweep list whatever its cap, so a cap set
-  later on a function declared `lru = 0` is swept too. Users: base-db's `Db::admit_parses` (the
-  parse budget per revision) and hir-ty `providers.rs`'s MIR-body caps. The cap is read only by
-  the sweep, never on a hit.
+- Superseded 2026-11-02 (lane lrucap): there are no entry-count caps. `lru, weigh = f` keeps a
+  function's values by their bytes: `f(&Value) -> usize` is the heap dropping one frees, the
+  table sums it at each put and drop, and at a view boundary (`&mut`) the storage compares each
+  memory tag's sum with the tag's budget (`blaze_mem::tag::budget`, set by the daemon from the
+  machine, or `Storage::set_value_budget`). Over it, a pass weighs every value again and lets
+  the least recently `verified` go (one view's by ingredient and key) down to 7/8 of the budget;
+  each keeps stamp, hash and edges. Nothing is written on a hit, and a view under budget reads
+  only the values made since the last one. Under the tag's own budget a pass also runs when the
+  tag's live bytes are over it and grew by 1/8 since the last pass (values that grew after they
+  were weighed, a walked outline). `lru = 0`: never weighed, evictable on demand
+  (`Query::evict_values(db)`, `hir/src/evict.rs`); `lru = N > 0` is refused. One home:
+  `crates/blaze-query/src/db/budget.rs` (the plan) and `Storage::sweep` (the trigger).
+  base-db's `parse_` is one of these (`Db::admit_parses` is gone), as are
+  `parse_macro_expansion` and `ast_id_map`. Recompute cost does not weigh in: on the
+  self-build every value fits the default budget, so nothing is evicted there.
 
 ### Memory, tags, frames
 
@@ -496,7 +501,6 @@ pub fn value_hash<V: Hash + ?Sized>(value: &V) -> u64;   // what `hash` calls: t
 pub fn fetch<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value;
 pub fn evict_values<F: Function>(db: &mut F::Db) -> usize;
 pub fn evict_values_of<F: Function>(db: &mut F::Db, keys: &[F::Key]) -> usize;
-pub fn set_lru_capacity<F: Function>(db: &mut F::Db, capacity: usize);   // EVICTABLE only; next sweep (R15)
 
 // Inputs, interned and tracked structs name no database (their attributes don't): their
 // functions take the `Storage` (`Database::storage(db)`), so their methods are generic over
@@ -584,8 +588,8 @@ The macros generate, for a tracked function `fn f(db: &Db, a: A, b: B) -> V`: a 
 fork's does), a private `struct Configuration` implementing `Function` with `execute` calling
 the user's body (private, so a private value type in a `pub fn` is no E0446), its `static
 VTABLE` and `static INGREDIENT`, and `fn f(db, a, b) -> <returns>` doing
-`plumbing::fetch::<Configuration>(db, key)` then the return mode. `evict_values`/`evict_values_of`/
-`set_lru_capacity` (functions with `lru = N`) and `arguments` (several arguments) are inherent associated functions
+`plumbing::fetch::<Configuration>(db, key)` then the return mode. `evict_values`/`evict_values_of`
+(functions with `lru`) and `arguments` (several arguments) are inherent associated functions
 of `struct f`, so `mir_body_query::evict_values(db)` (hir/src/evict.rs) reads as it does now. In a
 tracked `impl`, the user's body stays in the impl as a private method (so `Self` and the impl's
 `'db` mean what they did), the struct is `TypeName_method` beside the impl, and the method calls

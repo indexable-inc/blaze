@@ -420,6 +420,37 @@ pub type T = u8;
     assert!(Goals.value(&db, Some(fixture::test_crate(&db)), fact_ref(&fact)).is_some());
 }
 
+/// An impl method's types for the trait method's `impl Trait`s are written in its signature
+/// form, so a read of them stands for that signature; any other function's read is that
+/// function's too (empty, but keyed the same).
+#[test]
+fn a_read_of_an_impl_methods_rpitit_types_stands_for_its_signature() {
+    let (db, _) = single(
+        r#"
+pub trait Tr { fn f(self) -> impl Sized; }
+impl Tr for u8 { fn f(self) -> u8 { self } }
+"#,
+    );
+    let imp = items(&db)
+        .into_iter()
+        .find_map(|it| match it {
+            ItemId::Impl(it) => Some(it),
+            _ => None,
+        })
+        .expect("the fixture has an impl");
+    let f = imp
+        .impl_items(&db)
+        .items
+        .iter()
+        .find_map(|&(_, it)| match it {
+            AssocItemId::FunctionId(it) => Some(it),
+            _ => None,
+        })
+        .expect("the impl has a method");
+    let read = fact_of_read(&db, fixture::test_crate(&db), "impl_rpitit_tys", f.as_id());
+    assert_eq!(read, Some(Fact::Signature(item_key(&db, ItemId::Function(f)))));
+}
+
 #[test]
 fn a_facts_value_is_one_query() {
     let (db, _) = single(ITEMS);

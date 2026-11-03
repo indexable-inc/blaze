@@ -216,7 +216,7 @@ impl TokenStream {
     /// This is intended for specific proc macro use. For general `TokenStream`
     /// construction within the compiler just build a `Vec<TokenTree>` with
     /// normal `Vec` operations and then do `TokenStream::new`.
-    pub fn push_stream_with_gluing(&mut self, stream: TokenStream) {
+    pub fn push_stream_with_gluing(&mut self, stream: &TokenStream) {
         let vec_mut = Arc::make_mut(&mut self.0);
 
         let stream_iter = stream.0.iter().cloned();

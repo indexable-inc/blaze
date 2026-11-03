@@ -137,7 +137,12 @@ fn clone_loop<'db>(
 ///
 /// A copy that is not one the base can have (a fact of a parameter it does not specialize on,
 /// a class its comparisons do not give) is an error naming the base and the facts.
-#[blaze_query::tracked(returns(as_ref), cycle_result = clone_loop)]
+///
+/// Its value is MIR as every other body's: charged to `mir` and dropped with them once code is
+/// stored (`hir::evict::drop_mir`). coord-108 (B5): it was a plain
+/// query, kept for the daemon's life and charged to `query`, so the release that dropped 150,000
+/// MIR bodies left every specialized copy.
+#[blaze_query::tracked(returns(as_ref), cycle_result = clone_loop, lru = 0, mem_tag = Mir)]
 pub fn specialized_mir_body<'db>(
     db: &'db Db,
     clone: CloneId<'db>,

@@ -10,7 +10,7 @@ use hir_expand::fixture;
 
 use super::super::*;
 
-fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let db = fixture::db(ra_fixture).into_db();
 
     let krate = db.fetch_test_crate();
@@ -86,7 +86,7 @@ struct S<'a, 'b, T: Clone, const C: usize = 3, X = ()> where X: Default, for<'a,
 #[repr(C, packed)]
 struct S {}
 ",
-        expect![[r#"
+        &expect![[r#"
             struct S {...}
             struct S(...)
             ;
@@ -112,7 +112,7 @@ fn foo<'a, const C: usize = 314235, T: Trait<Item = A> = B>(Struct { foo: bar }:
 const async unsafe extern "C" fn a() {}
 fn ret_impl_trait() -> impl Trait {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn foo<'a, const C: usize = 314235, T = B>(&Struct, (), u32) -> &'a dyn Fn::<(), Output = i32>
             where
                 T: Trait::<Item = A>,
@@ -131,7 +131,7 @@ fn an_impl_trait_where_none_is_allowed_is_kept_for_the_type_lowering() {
         r"
 fn f<T = impl Trait>() {}
 ",
-        expect![[r#"
+        &expect![[r#"
             fn f<T = impl Trait>() {...}
         "#]],
     );
@@ -169,7 +169,7 @@ fn allowed2<'a>(baz: impl Baz<Assoc = &'a (impl Foo + 'a)>) {}
 
 fn allowed3(baz: impl Baz<Assoc = Qux<impl Foo>>) {}
 ",
-        expect![[r#"
+        &expect![[r#"
             fn impl_trait_args<T, Param[1]>(Param[1])
             where
                 Param[1]: Trait
@@ -223,7 +223,7 @@ fn type_alias_constrained_lifetime_with_elided_lifetime_args() {
 type Alias<'a, 'b, T> = &'b T;
 fn f<T>(_: Alias<T>) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn f<T>(Alias::<T>) {...}
         "#]],
     );
@@ -235,7 +235,7 @@ fn regression_21138() {
         r#"
 fn foo(v: for<'a> Trait1 + Trait2) {}
     "#,
-        expect![[r#"
+        &expect![[r#"
             fn foo(dyn for<'a> Trait1 + Trait2) {...}
         "#]],
     );
@@ -249,7 +249,7 @@ extern "C" {
     fn extern_fn();
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             extern "C" fn extern_fn() {...}
         "#]],
     );

@@ -130,7 +130,7 @@ fn every_return_mode_hands_out_its_form() {
     assert_eq!(parsed(&db, source), Err(&"x,y".to_owned()));
 }
 
-#[blaze_query_macros::tracked(returns(copy), lru = 2)]
+#[blaze_query_macros::tracked(returns(copy), lru = 0)]
 fn doubled(db: &TestDb, source: Source) -> u32 {
     source.weight(db) * 2
 }
@@ -155,31 +155,35 @@ fn an_lru_query_evicts_its_values_and_runs_again() {
     assert_eq!(runs(), ["doubled", "doubled"]);
 }
 
-#[blaze_query_macros::tracked(returns(copy), lru = 3)]
+/// Weighs its value at its source's weight in bytes.
+#[blaze_query_macros::tracked(returns(copy), lru, weigh = |it: &u32| *it as usize / 3, mem_tag = Usercode)]
 fn tripled(db: &TestDb, source: Source) -> u32 {
     source.weight(db) * 3
 }
 
 #[test]
-fn an_lru_cap_set_at_runtime_applies_at_the_next_view() {
+fn an_lru_query_keeps_its_values_under_its_tags_budget_from_the_next_view() {
+    use blaze_query::db::plumbing::Tag;
     let mut db = TestDb::new();
-    let sources: Vec<Source> = (0..6).map(|i| Source::new(&db, String::new(), i)).collect();
+    let sources: Vec<Source> = (1..=6).map(|i| Source::new(&db, String::new(), i)).collect();
     let fetch_all = |db: &TestDb| {
-        for (&source, weight) in sources.iter().zip(0..) {
+        for (&source, weight) in sources.iter().zip(1..) {
             assert_eq!(tripled(db, source), weight * 3);
         }
     };
-    tripled::set_lru_capacity(&mut db, 5);
+    // 1 + 2 + .. + 6 = 21 bytes against 16: the pass lets values go down to 14, the oldest
+    // first (of one view, by key): after 1, 2 and 3, 15 bytes are still over, so 4 goes too.
+    db.storage_mut().set_value_budget(Tag::Usercode, Some(16));
     fetch_all(&db);
     assert_eq!(runs().len(), 6);
     db.storage_mut().synthetic_write(Durability::LOW);
     fetch_all(&db);
-    assert_eq!(runs(), ["tripled"], "five values kept, one evicted and run again");
+    assert_eq!(runs(), ["tripled"; 4], "5 + 6 = 11 bytes kept, 1 to 4 run again");
 
-    tripled::set_lru_capacity(&mut db, 0);
+    db.storage_mut().set_value_budget(Tag::Usercode, Some(u64::MAX));
     db.storage_mut().synthetic_write(Durability::LOW);
     fetch_all(&db);
-    assert!(runs().is_empty(), "no cap: nothing evicted");
+    assert!(runs().is_empty(), "no budget: nothing evicted");
 }
 
 #[blaze_query_macros::tracked(returns(copy), mem_tag = Infer)]

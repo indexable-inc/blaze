@@ -220,6 +220,33 @@ fn print_stderr() {
 }
 
 #[test]
+fn associated_items_are_told_apart_in_their_own_bodies() {
+    // A method and an associated constant are each linted in a tree of their own, with nothing
+    // above them: what they are in is read from their definitions. clippy lints neither a trait
+    // impl's signature (`box_collection`) nor an associated constant's `'static`.
+    let fixture = fixture(
+        "sized",
+        "trait Tr {
+    fn take(&self, v: Box<Vec<u8>>);
+}
+struct S;
+impl Tr for S {
+    fn take(&self, _v: Box<Vec<u8>>) {}
+}
+impl S {
+    const NAME: &'static str = \"s\";
+}
+const FREE: &'static str = \"f\";",
+    );
+    let found = lint(&fixture, &(only("box_collection") + " -W clippy::redundant_static_lifetimes"));
+    let boxed = "you seem to be trying to use `Box<Vec<..>>`";
+    assert_eq!(found.matches(boxed).count(), 1, "the trait's method only: {found}");
+    assert!(found.contains(" --> src/lib.rs:2:23\n"), "{found}");
+    assert_eq!(found.matches("constants have by default a `'static` lifetime").count(), 1, "{found}");
+    assert!(found.contains(" --> src/lib.rs:11:"), "the free constant only: {found}");
+}
+
+#[test]
 fn box_collection() {
     let fixture = fixture(
         "sized",
@@ -413,6 +440,54 @@ fn callable<F: Fn()>(f: F) {
 }
 
 #[test]
+fn needless_pass_by_value_leaves_trait_methods_alone() {
+    // A trait's impl can't change the signature the trait gives it, nor can a trait's provided
+    // method; clippy lints neither. Each body is linted in its own anchor's tree, where the
+    // method is the root: no `impl` or `trait` is above it to read.
+    let fixture = fixture(
+        "sized, copy, clone, fn",
+        "trait Layer {
+    fn on_close(&self, id: Vec<u8>);
+    fn provided(&self, id: Vec<u8>) -> usize {
+        id.len()
+    }
+}
+struct L;
+impl Layer for L {
+    fn on_close(&self, id: Vec<u8>) {
+        let _ = id.len();
+    }
+}
+impl L {
+    fn inherent(&self, id: Vec<u8>) -> usize {
+        id.len()
+    }
+}",
+    );
+    let found = lint(&fixture, &only("needless_pass_by_value"));
+    assert_eq!(found.matches("this argument is passed by value").count(), 1, "{found}");
+    assert!(found.contains(" --> src/lib.rs:14:28\n"), "the inherent method is still linted: {found}");
+}
+
+#[test]
+fn needless_pass_by_value_leaves_async_fns_alone() {
+    // clippy sees an `async fn`'s parameters moved into its future (blaze checking blaze, E4:
+    // 17 sites in blaze-explore, blaze-registry and blaze-resolve that clippy passes).
+    let fixture = fixture(
+        "sized, copy, clone, fn, future",
+        "async fn served(v: Vec<u8>) -> usize {
+    v.len()
+}
+fn plain(v: Vec<u8>) -> usize {
+    v.len()
+}",
+    );
+    let found = lint(&fixture, &only("needless_pass_by_value"));
+    assert_eq!(found.matches("this argument is passed by value").count(), 1, "{found}");
+    assert!(found.contains(" --> src/lib.rs:4:13\n"), "the plain fn is still linted: {found}");
+}
+
+#[test]
 fn needless_pass_by_value_local_type() {
     let fixture = fixture(
         "sized, copy, clone, fn",
@@ -516,6 +591,27 @@ fn undocumented_unsafe_blocks_multiline() {
     let found = lint(&fixture, &only("undocumented_unsafe_blocks"));
     // The span stops at the first line's end.
     assert!(found.contains("2 |     unsafe {\n  |     ^^^^^^^^\n"), "{found}");
+}
+
+#[test]
+fn undocumented_unsafe_impl_comment_above_attributes() {
+    // intern's space.rs and blaze-graph's fiber.rs: the comment is above the item's attributes,
+    // which clippy's `accept-comment-above-attributes` (on by default) looks past.
+    let fixture = fixture(
+        "sized",
+        "unsafe trait Tr {}
+struct A;
+// SAFETY: A holds nothing
+#[allow(unsafe_code)]
+#[cfg(not(blaze_check))]
+unsafe impl Tr for A {}
+struct B;
+#[allow(unsafe_code)]
+unsafe impl Tr for B {}",
+    );
+    let found = lint(&fixture, &only("undocumented_unsafe_blocks"));
+    assert_eq!(found.matches("unsafe impl missing a safety comment").count(), 1, "{found}");
+    assert!(found.contains(" --> src/lib.rs:9:1\n"), "B has no comment: {found}");
 }
 
 #[test]

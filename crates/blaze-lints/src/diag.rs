@@ -55,6 +55,10 @@ pub enum CheckError {
     /// ([`hir_ty_suspend::Unchecked`], said). The lint can't run, so the crate's lints are not
     /// given as if it had found nothing.
     SuspendUnchecked { file: String, why: String },
+    /// A lint run over `file` resolved a path whose resolution looked up an item the analysis'
+    /// ast id map does not hold: `why` ([`hir::NotInAstIdMap`], said). A bug in the analysis;
+    /// the crate's lints are not given as if the path had resolved to nothing.
+    NotInAstIdMap { file: String, why: String },
 }
 
 impl std::fmt::Display for CheckError {
@@ -68,6 +72,10 @@ impl std::fmt::Display for CheckError {
             CheckError::SuspendUnchecked { file, why } => write!(
                 f,
                 "a fiber lint run over `{file}` reads the may-suspend check, which checks nothing here: {why}"
+            ),
+            CheckError::NotInAstIdMap { file, why } => write!(
+                f,
+                "a lint run over `{file}` resolves a path the analysis can't: {why}; a bug in hir's source analyzer"
             ),
         }
     }

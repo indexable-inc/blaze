@@ -16,7 +16,7 @@ pub struct Foo;
 //- /foo/bar.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type (glob) value (glob)
             - Foo : type (glob) value (glob)
@@ -48,7 +48,7 @@ use ::*;
 //- /bar.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - bar : type
             - foo : type
@@ -80,7 +80,7 @@ pub struct Foo;
 pub struct Baz;
 pub use super::*;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type (glob) value (glob)
             - Foo : type (glob) value (glob)
@@ -118,7 +118,7 @@ pub struct Baz;
 struct PrivateStructBar;
 pub use super::*;
 ",
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type (glob) value (glob)
             - bar : type (glob)
@@ -157,7 +157,7 @@ pub(super) struct PrivateBaz;
 struct PrivateBar;
 pub(crate) struct PubCrateStruct;
 ",
-        expect![[r#"
+        &expect![[r#"
             crate
             - Foo : type (glob)
             - PubCrateStruct : type (glob) value (glob)
@@ -187,7 +187,7 @@ use test_crate::*;
 //- /lib.rs crate:test_crate
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type (glob) value (glob)
         "#]],
@@ -205,7 +205,7 @@ use test_crate::*;
 pub struct Baz;
 struct Foo;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type (glob) value (glob)
         "#]],
@@ -220,7 +220,7 @@ fn glob_enum() {
 enum Foo { Bar, Baz }
 use self::Foo::*;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (glob) value (glob)
             - Baz : type (glob) value (glob)
@@ -237,7 +237,7 @@ fn glob_enum_group() {
 enum Foo { Bar, Baz }
 use self::Foo::{*};
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (glob) value (glob)
             - Baz : type (glob) value (glob)
@@ -264,7 +264,7 @@ pub mod baz { pub struct Foo; }
 //- /bar.rs
 pub mod baz { pub struct Bar; }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (import) value (import)
             - bar : type
@@ -303,7 +303,7 @@ pub mod baz { pub struct Foo; }
 //- /bar.rs
 pub mod baz { pub struct Bar; }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (import) value (import)
             - bar : type
@@ -338,7 +338,7 @@ mod d {
     use foo::Y;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - a : type
             - b : type
@@ -382,7 +382,7 @@ mod event {
 
 use event::Event;
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Event : type (import)
             - event : type
@@ -415,7 +415,7 @@ mod defs {
 }
 use reexport::*;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Trait : type (glob)
             - defs : type
@@ -462,7 +462,7 @@ mod glob_target {
     pub struct ShouldBePrivate;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - glob_target : type
             - outer : type
@@ -500,7 +500,7 @@ pub mod reexport_2 {
 
 use reexport_2::*;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Placeholder : type (glob) value (glob)
             - libs : type
@@ -536,7 +536,7 @@ mod panels {
 }
 use panels::{Left, Right};
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Left : type (import) value (import)
             - Right : type (import) value (import)
@@ -570,7 +570,7 @@ mod numbers {
     use super::sides::Left;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - minusplus : type
             - numbers : type
@@ -617,7 +617,7 @@ mod errors {
 #[proc_macro_derive(Metadata, attributes(metadata))]
 fn derive_metadata() {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Diagnostic : type (import)
         "#]],

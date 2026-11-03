@@ -7,7 +7,7 @@ fn source_file() {
     check(
         TopEntryPoint::SourceFile,
         "",
-        expect![[r#"
+        &expect![[r#"
         SOURCE_FILE
     "#]],
     );
@@ -15,7 +15,7 @@ fn source_file() {
     check(
         TopEntryPoint::SourceFile,
         "struct S;",
-        expect![[r#"
+        &expect![[r#"
         SOURCE_FILE
           STRUCT
             STRUCT_KW "struct"
@@ -29,7 +29,7 @@ fn source_file() {
     check(
         TopEntryPoint::SourceFile,
         "@error@",
-        expect![[r#"
+        &expect![[r#"
             SOURCE_FILE
               ERROR
                 AT "@"
@@ -52,14 +52,14 @@ fn macro_stmt() {
     check(
         TopEntryPoint::MacroStmts,
         "",
-        expect![[r#"
+        &expect![[r#"
             MACRO_STMTS
         "#]],
     );
     check(
         TopEntryPoint::MacroStmts,
         "#!/usr/bin/rust",
-        expect![[r##"
+        &expect![[r##"
             MACRO_STMTS
               ERROR
                 SHEBANG "#!/usr/bin/rust"
@@ -69,7 +69,7 @@ fn macro_stmt() {
     check(
         TopEntryPoint::MacroStmts,
         "let x = 1 2 struct S;",
-        expect![[r#"
+        &expect![[r#"
             MACRO_STMTS
               LET_STMT
                 LET_KW "let"
@@ -102,14 +102,14 @@ fn macro_items() {
     check(
         TopEntryPoint::MacroItems,
         "",
-        expect![[r#"
+        &expect![[r#"
             MACRO_ITEMS
         "#]],
     );
     check(
         TopEntryPoint::MacroItems,
         "#!/usr/bin/rust",
-        expect![[r##"
+        &expect![[r##"
             MACRO_ITEMS
               ERROR
                 SHEBANG "#!/usr/bin/rust"
@@ -119,7 +119,7 @@ fn macro_items() {
     check(
         TopEntryPoint::MacroItems,
         "struct S; foo!{}",
-        expect![[r#"
+        &expect![[r#"
             MACRO_ITEMS
               STRUCT
                 STRUCT_KW "struct"
@@ -146,7 +146,7 @@ fn macro_pattern() {
     check(
         TopEntryPoint::Pattern,
         "",
-        expect![[r#"
+        &expect![[r#"
             ERROR
             error 0: expected pattern
         "#]],
@@ -154,7 +154,7 @@ fn macro_pattern() {
     check(
         TopEntryPoint::Pattern,
         "Some(_)",
-        expect![[r#"
+        &expect![[r#"
             TUPLE_STRUCT_PAT
               PATH
                 PATH_SEGMENT
@@ -170,7 +170,7 @@ fn macro_pattern() {
     check(
         TopEntryPoint::Pattern,
         "None leftover tokens",
-        expect![[r#"
+        &expect![[r#"
             ERROR
               IDENT_PAT
                 NAME
@@ -185,7 +185,7 @@ fn macro_pattern() {
     check(
         TopEntryPoint::Pattern,
         "@err",
-        expect![[r#"
+        &expect![[r#"
             ERROR
               ERROR
                 AT "@"
@@ -197,7 +197,7 @@ fn macro_pattern() {
     check(
         TopEntryPoint::Pattern,
         "| 42 | 43",
-        expect![[r#"
+        &expect![[r#"
             OR_PAT
               PIPE "|"
               WHITESPACE " "
@@ -216,7 +216,7 @@ fn macro_pattern() {
     check(
         TopEntryPoint::Pattern,
         "| 42",
-        expect![[r#"
+        &expect![[r#"
             OR_PAT
               PIPE "|"
               WHITESPACE " "
@@ -232,7 +232,7 @@ fn type_() {
     check(
         TopEntryPoint::Type,
         "",
-        expect![[r#"
+        &expect![[r#"
             ERROR
             error 0: expected type
         "#]],
@@ -241,7 +241,7 @@ fn type_() {
     check(
         TopEntryPoint::Type,
         "Option<!>",
-        expect![[r#"
+        &expect![[r#"
             PATH_TYPE
               PATH
                 PATH_SEGMENT
@@ -258,7 +258,7 @@ fn type_() {
     check(
         TopEntryPoint::Type,
         "() () ()",
-        expect![[r#"
+        &expect![[r#"
             ERROR
               TUPLE_TYPE
                 L_PAREN "("
@@ -274,7 +274,7 @@ fn type_() {
     check(
         TopEntryPoint::Type,
         "$$$",
-        expect![[r#"
+        &expect![[r#"
             ERROR
               ERROR
                 DOLLAR "$"
@@ -290,7 +290,7 @@ fn expr() {
     check(
         TopEntryPoint::Expr,
         "",
-        expect![[r#"
+        &expect![[r#"
             ERROR
             error 0: expected expression
         "#]],
@@ -298,7 +298,7 @@ fn expr() {
     check(
         TopEntryPoint::Expr,
         "2 + 2 == 5",
-        expect![[r#"
+        &expect![[r#"
         BIN_EXPR
           BIN_EXPR
             LITERAL
@@ -318,7 +318,7 @@ fn expr() {
     check(
         TopEntryPoint::Expr,
         "let _ = 0;",
-        expect![[r#"
+        &expect![[r#"
             ERROR
               LET_EXPR
                 LET_KW "let"
@@ -355,7 +355,7 @@ fn a_parse_allocates_its_buffers_not_per_token() {
 }
 
 #[track_caller]
-fn check(entry: TopEntryPoint, input: &str, expect: expect_test::Expect) {
+fn check(entry: TopEntryPoint, input: &str, expect: &expect_test::Expect) {
     let (parsed, _errors) = super::parse(entry, input, crate::Edition::CURRENT);
     expect.assert_eq(&parsed)
 }

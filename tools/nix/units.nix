@@ -35,6 +35,25 @@ let
     then throw "${json} is stale against ${all.dir}/Cargo.lock or Cargo.toml: run tools/nix/unit_graph.py"
     else data;
 
+  # What blaze-engine's build script works the code identities of the code generator and the
+  # front end out of (blaze_codegen_code::CODEGEN and FRONT_END, `Workspace::read`): every
+  # manifest it may read (members, path dependencies, their workspaces), the lock, the pinned
+  # toolchain, the LLVM pin, the pinned nightly's proc-macro bridge (FRONT_END_EXTRA), the repo's
+  # cargo config, and the files of every package of either closure, each a path package of this
+  # graph. blaze-engine is the leaf, so an edit of any of them
+  # rebuilds it alone; a checkout cut to its own directory would have its build script refuse,
+  # naming the checkout it lacks and the shipped value it has none of either.
+  checkout = lib.fileset.unions ([
+    (lib.fileset.fileFilter (f: f.name == "Cargo.toml") repo)
+    (repo + "/${all.dir}/Cargo.lock")
+    (repo + "/harness/toolchain")
+    (repo + "/vendor/llvm-sys/pin.rs")
+    (repo + "/library/proc_macro/src/bridge")
+  ]
+  ++ lib.optional (builtins.pathExists (repo + "/.cargo/config.toml")) (repo + "/.cargo/config.toml")
+  ++ lib.mapAttrsToList (_: p: repo + "/${p.source.dir}")
+    (lib.filterAttrs (_: p: p.source.kind != "registry") all.packages));
+
   # The manifest directory of a workspace-local package, cut down to what the crate reads so that
   # editing anything else in the repo does not change the unit.
   # crates/blaze-cargo include_str!s harness/toolchain and library/{DIGEST,UPSTREAM}.
@@ -46,7 +65,9 @@ let
     in
     "${lib.fileset.toSource {
       root = repo;
-      fileset = lib.fileset.unions ([ (repo + "/${d}") (repo + "/harness/toolchain") ] ++ library);
+      fileset =
+        if d == "crates/blaze-engine" then checkout
+        else lib.fileset.unions ([ (repo + "/${d}") (repo + "/harness/toolchain") ] ++ library);
     }}/${d}";
 
   pkgSrc = lib.mapAttrs

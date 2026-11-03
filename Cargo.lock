@@ -524,6 +524,7 @@ dependencies = [
  "blaze-build-script",
  "blaze-cas",
  "blaze-codegen",
+ "blaze-codegen-code",
  "blaze-core",
  "blaze-diagnostics",
  "blaze-doc",
@@ -696,6 +697,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "glob",
+ "serde_json",
  "toml",
 ]
 
@@ -757,6 +759,7 @@ dependencies = [
  "hir-lint-levels",
  "hir-ty",
  "hir-ty-borrowck",
+ "hir-ty-print",
  "intern",
  "memchr",
  "parking_lot",
@@ -826,8 +829,8 @@ dependencies = [
  "intern",
  "ix-prof",
  "libmimalloc-sys",
- "mimalloc",
  "parking_lot",
+ "stdx",
  "tar",
  "toml",
  "toml_edit",
@@ -1484,6 +1487,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
+ "stdx",
  "thiserror",
  "tracing",
  "windows-sys 0.61.2",
@@ -3365,6 +3369,7 @@ dependencies = [
  "bitflags 2.13.2",
  "blaze-alloc-count",
  "blaze-check",
+ "blaze-codegen-code",
  "blaze-dbsp",
  "blaze-format",
  "blaze-graph",
@@ -3474,6 +3479,7 @@ dependencies = [
  "hir-ty",
  "hir-ty-identity",
  "hir-ty-mir",
+ "hir-ty-print",
  "hir-ty-share",
  "inkwell",
  "intern",
@@ -3629,6 +3635,7 @@ dependencies = [
  "hir-expand",
  "hir-lint-levels",
  "hir-ty",
+ "hir-ty-print",
  "hir-ty-tailck",
  "intern",
  "inventory",
@@ -3653,6 +3660,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hir-ty-print"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-hash",
+ "blaze-mem",
+ "blaze-query",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "intern",
+ "rustc_abi",
+ "rustc_apfloat",
+ "rustc_type_ir",
+ "smallvec",
+ "span",
+]
+
+[[package]]
 name = "hir-ty-pure"
 version = "0.0.0"
 dependencies = [
@@ -3669,6 +3695,7 @@ dependencies = [
  "hir-expand",
  "hir-ty",
  "hir-ty-mir",
+ "hir-ty-print",
  "hir-ty-share",
  "intern",
  "rustc_type_ir",
@@ -3757,6 +3784,7 @@ dependencies = [
  "hir-expand",
  "hir-ty",
  "hir-ty-mir",
+ "hir-ty-print",
  "intern",
  "rustc_abi",
  "rustc_type_ir",
@@ -4520,15 +4548,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "mimalloc"
-version = "0.1.52"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
-dependencies = [
- "libmimalloc-sys",
 ]
 
 [[package]]
@@ -6062,6 +6081,7 @@ dependencies = [
  "hegeltest",
  "itertools 0.15.0",
  "libc",
+ "parking_lot",
  "stacker",
  "tracing",
 ]

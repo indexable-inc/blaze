@@ -28,6 +28,7 @@ mod image;
 mod journal;
 pub mod outside;
 mod paths;
+mod probes;
 mod reader;
 mod rebase;
 mod section;
@@ -53,7 +54,7 @@ use crate::{
 pub use blaze_image::Corrupt;
 
 pub use crate::{
-    image::{Bytes, DisksUnused, ImageError, ImageMark, ImageUse},
+    image::{Bytes, DisksUnused, ImageError, ImageMark, ImageUse, tree_layout},
     outside::{Cover, Outside, cover, generation, unchanged_since, want},
     reader::{Pinned, Reader},
     section::Section,

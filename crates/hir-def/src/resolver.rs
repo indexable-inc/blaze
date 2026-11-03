@@ -405,7 +405,7 @@ impl<'db> Resolver<'db> {
         visibility: &RawVisibility,
     ) -> Result<Visibility, VisibilityError> {
         match visibility {
-            RawVisibility::Module(_, _) => {
+            RawVisibility::Module(..) => {
                 let (item_map, item_local_map, module) = self.item_scope_();
                 item_map.resolve_visibility(
                     item_local_map,
@@ -1066,6 +1066,37 @@ impl<'db> Resolver<'db> {
             self.module_scope.def_map,
             self.module_scope.module_id,
         )
+    }
+
+    /// The module the privacy of a field or associated item named here with `hygiene` is
+    /// checked from, among the fields of an ADT or the items of an impl that `expn` made: the
+    /// def site [`crate::nameres::def_site::privacy_scope`] gives; `None` for a name checked from
+    /// here (rustc's `adjust_ident_and_get_scope`).
+    pub fn privacy_scope(
+        &self,
+        db: &Db,
+        hygiene: HygieneId,
+        expn: Option<hir_expand::MacroCallId>,
+    ) -> Option<ModuleId> {
+        match hygiene.is_root() {
+            true => None,
+            false => crate::nameres::def_site::privacy_scope(db, hygiene.syntax_context(), expn, self.module()),
+        }
+    }
+
+    /// Whether `visibility` admits a name written here with `hygiene`: from
+    /// [`Resolver::privacy_scope`], else as [`Resolver::is_visible`].
+    pub fn is_visible_written(
+        &self,
+        db: &Db,
+        visibility: Visibility,
+        hygiene: HygieneId,
+        expn: Option<hir_expand::MacroCallId>,
+    ) -> bool {
+        match self.privacy_scope(db, hygiene, expn) {
+            Some(scope) => visibility.is_visible_from(db, scope),
+            None => self.is_visible(db, visibility),
+        }
     }
 
     pub fn generic_def(&self) -> Option<GenericDefId> {
@@ -1915,7 +1946,7 @@ impl HasResolver for MacroRulesId {
 
 fn lookup_resolver(
     db: &Db,
-    lookup: impl Lookup<Data = impl AstIdLoc<Container = impl HasResolver>>,
+    lookup: impl Lookup<Data = impl AstIdLoc<Container = impl HasResolver>> + Copy,
 ) -> Resolver<'_> {
     lookup.lookup(db).container().resolver(db)
 }

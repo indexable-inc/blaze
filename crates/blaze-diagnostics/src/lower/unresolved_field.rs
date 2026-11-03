@@ -45,8 +45,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedField<'db>) -> Vec
         // clone: on the error path, for an error hir found
         take_value_of_method(cx, field_expr, &field, &ty, field_span.clone(), &at)
     } else if !is_primitive(receiver) {
-        // clone: on the error path, for an error hir found
-        let mut diag = no_such_field(cx, d, field_expr, base, &field, &ty, field_span.clone(), module, &at);
+        let mut diag = no_such_field(cx, d, field_expr, base, &field, &ty, &field_span, module, &at);
         let peeled = receiver.strip_references();
         if let Some((_, len)) = peeled.as_array(cx.db) {
             // clone: on the error path, for an error hir found
@@ -206,7 +205,7 @@ fn take_value_of_method<'db>(
             false => at(range),
         };
         let params = method_params(cx, field_expr, field).unwrap_or(0);
-        suggest_method_call(&mut diag, "use parentheses to call the method", params, span);
+        suggest_method_call(&mut diag, "use parentheses to call the method", params, &span);
     } else if let Some(base) = field_expr.expr()
         && let Some(receiver) = cx.vsema.type_of_expr(base).map(|it| it.original)
         && let Some((pointee, _)) = receiver.as_raw_ptr()
@@ -237,7 +236,7 @@ fn method_params<'db>(cx: &Cx<'_, 'db>, field_expr: ast::FieldExpr<'db>, name: &
 }
 
 /// rustc's `suggest_method_call`: `()` after `span`, with a `_` for each argument.
-pub(crate) fn suggest_method_call(diag: &mut Diag, message: &str, params: usize, span: Span) {
+pub(crate) fn suggest_method_call(diag: &mut Diag, message: &str, params: usize, span: &Span) {
     // alloc: the error's text, for an error hir found
     let code = format!("({})", vec!["_"; params].join(", "));
     let applicability = match params > 0 {
@@ -271,7 +270,7 @@ fn no_such_field<'db>(
     base: ast::Expr<'_>,
     field: &str,
     ty: &str,
-    field_span: Span,
+    field_span: &Span,
     module: Option<hir::Module>,
     at: &impl Fn(TextRange) -> Span,
 ) -> Diag {
@@ -347,7 +346,7 @@ fn no_such_field<'db>(
                 false => ("one", "has"),
             };
             diag.suggestions(
-                field_span.shrink_to_lo(),
+                &field_span.shrink_to_lo(),
                 // alloc: the error's text, for an error hir found
                 format!("{some} of the expressions' fields {have} a field of the same name"),
                 // alloc: the error's text, for an error hir found

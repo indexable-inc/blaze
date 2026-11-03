@@ -186,6 +186,9 @@ pub struct Printer<'a, O: Write, E: Write> {
     /// The hash of every diagnostic printed, as cargo's `DiagDedupe` keeps them.
     printed: HashedSet<Global>,
     built: Option<Built>,
+    /// The test units the build left unbuilt ([`blaze_api::Unchecked::tests`]), for the end of
+    /// `test`'s run.
+    unbuilt: Vec<blaze_api::Unbuilt>,
     /// The daemon numbered a unit or package past [`IDS`]: said, and the build fails.
     refused: bool,
 }
@@ -207,6 +210,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             names: String::with_capacity(NAMES),
             printed: HashedSet::with_capacity_in(DIAGNOSTICS, Global),
             built: None,
+            unbuilt: Vec::new(), // alloc: none until a test unit did not build
             refused: false,
         }
     }
@@ -270,6 +274,11 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
     pub fn take_artifacts(&mut self) -> Vec<Artifact> {
         // alloc: none; an empty `Vec` holds no memory.
         self.built.as_mut().map_or_else(Vec::new, |built| std::mem::take(&mut built.artifacts))
+    }
+
+    /// The test units the build left unbuilt, taken out of the printer.
+    pub fn take_unbuilt(&mut self) -> Vec<blaze_api::Unbuilt> {
+        std::mem::take(&mut self.unbuilt)
     }
 
     /// The workspace's member count the build said; 1 before it did.
@@ -385,6 +394,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                 }
                 self.to(false)?;
                 blaze_ui::api::unchecked_lines(&mut self.line, &unchecked, self.shown.color);
+                self.unbuilt.extend(unchecked.tests.iter().cloned()); // clone: a failed build's, once
             }
             // blaze's own, for the proof harness: what the request did, then what became of each
             // dependency crate's check.

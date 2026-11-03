@@ -108,11 +108,11 @@ impl Sim {
         cells: &[Span],
         len: u64,
     ) -> R<Ptr> {
-        self.retag_with(p, NewPermission::new(kind, mode, freeze, unpin, cells), len)
+        self.retag_with(p, &NewPermission::new(kind, mode, freeze, unpin, cells), len)
     }
 
     /// The retag `new` of `len` bytes at `p` (for `NewPermission::with_implicit_writes`).
-    pub(crate) fn retag_with(&mut self, p: Ptr, new: NewPermission, len: u64) -> R<Ptr> {
+    pub(crate) fn retag_with(&mut self, p: Ptr, new: &NewPermission, len: u64) -> R<Ptr> {
         let site = self.site();
         let tag = self.b.retag(p.alloc, p.prov, new, Span::new(p.offset, len), site)?;
         Ok(match tag {

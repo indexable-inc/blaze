@@ -10,10 +10,10 @@ date: 2026-10-30
 `EditionedFileId::parse` (`crates/base-db/src/editioned_file_id.rs`) is a plain method over the
 tracked `parse_` (`lru = 0`, `mem_tag = Parse`). A tree's block is charged to the blaze-mem tag
 of the task that made it (`crates/syntax-tree/src/flat/budget.rs`): `Parse` for the query, and
-a lazy body's part to its tree's tag. Nothing is evicted by count. `Db::admit_parses`, called
-once per revision by the driver, sets the memo's capacity from the tag's live bytes against its
-budget: over budget, the count of live parses scaled to 7/8 of the budget; under half of it,
-doubled until unlimited.
+a lazy body's part to its tree's tag. Nothing is evicted by count. Since 2026-11-02 (lane
+lrucap) `parse_` is `lru, weigh = syntax::Parse::heap_bytes`: the query engine keeps parses by
+their bytes under the Parse tag's budget, as every `lru` function's values
+(`crates/blaze-query/src/db/budget.rs`); `Db::admit_parses` is gone.
 
 ## Trees in the image
 

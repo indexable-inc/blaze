@@ -204,15 +204,35 @@ pub fn main_of(db: &Db, krate: Crate) -> Option<FunctionId> {
     (free && FunctionSignature::of(db, main).has_body()).then_some(main)
 }
 
-/// Whether the build script whose `main` is `main` is pure, and its proof if it is.
+/// What the walk of a build script from its `main` found, and how big the walk is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptProof {
+    pub purity: Purity,
+    /// The body instances the walk reaches ([`walk_steps`]), each from the environment that asks
+    /// for it: each one a step of the bound its caller puts on the proof
+    /// (`blaze_query::db::with_steps`). It counts the script's code,
+    /// never what was cached or what another task ran, so a cold, warm or busy database gives
+    /// the same count, and a proof runs out of steps on all of them or on none.
+    pub steps: u32,
+}
+
+/// Whether the build script whose `main` is `main` is pure, and its proof if it is
+/// ([`script_proof`]).
+pub fn script_purity(db: &Db, main: FunctionId) -> &Purity {
+    &script_proof(db, main).purity
+}
+
+/// Whether the build script whose `main` is `main` is pure, its proof if it is, and how many
+/// instances its walk takes.
 #[blaze_query::tracked(returns(ref))]
-pub fn script_purity(db: &Db, main: FunctionId) -> Purity {
+pub fn script_proof(db: &Db, main: FunctionId) -> ScriptProof {
     let stored = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) }.store();
     let cx = Cx::new(db, stored);
     let mut roots: SmallVec<[(Instance, String); 2]> = SmallVec::new();
     let empty = GenericArgs::new_from_slice(&[]).store();
     roots.push((Instance { def: Def::Body(Body::Fn(main)), args: empty }, "`main`".to_owned())); // alloc: once per script
     let output = db.callable_item_signature(main.into()).skip_binder().skip_binder().output();
+    let mut refused = None;
     if !output.is_unit() {
         // `lang_start` reports what `main` returns through `Termination::report`.
         let mut walk = Walk::new(&cx, None);
@@ -225,18 +245,89 @@ pub fn script_purity(db: &Db, main: FunctionId) -> Purity {
             }
             None => walk.refuse(Rule::Unchecked, "returns a value, but the toolchain has no `Termination::report`"),
         }
-        if let Some(what) = walk.own.take() {
-            return Purity::Impure(Impure { what, through: vec!["`main`".to_owned()] }); // alloc: an impure script's reason, once
-        }
+        refused = walk.own.take();
+        // Its sites are roots even when it refused: their summaries were asked for, so their
+        // instances are steps of the walk.
         for site in walk.sites {
             let (Reached::Walk(instance, _) | Reached::Leaf(instance, _)) = site.reached;
             let name = format!("`main` → {}", name_of(db, &instance)); // alloc: once per script root
             roots.push((instance, name));
         }
     }
+    // Every instance the roots reach is a step, taken before any verdict is read from them, on
+    // every path: the count, and whether the bound trips, are the walk's alone.
+    let steps = walk_steps(db, &cx.stored, roots.iter().map(|(it, _)| it));
+    let purity = match refused {
+        // alloc: an impure script's reason, once
+        Some(what) => Purity::Impure(Impure { what, through: vec!["`main`".to_owned()] }),
+        None => prove(db, &cx, &roots),
+    };
+    ScriptProof { purity, steps }
+}
+
+/// How many body instances the summaries of `roots` reach, each once: the walk's size. Each is a
+/// step of the bound the proof's caller sets, given by [`summary`] as it is asked for.
+///
+/// It asks every summary the proof can ask, from the environment that asks it, so it takes
+/// every step a cold proof takes, and a warm one takes the same:
+///
+/// - A summary's run (`summarize`) asks for its sites' summaries from its own environment, the
+///   asked instance's home ([`home_env`]), and that home depends on who asks: an instance
+///   reached through a dependency's code is asked from that crate, which may answer it in
+///   another home than the script would, with other impls in sight and so other sites. So each
+///   site is followed from the home of the instance whose site it is, as the run asks it.
+/// - [`prove`] asks the roots and every callee it reaches from the script's environment
+///   (`reached`), and those asks run summaries too: they are followed as well.
+///
+/// A summary's sites are its body's, the same in every fixpoint round, so the rows a cold walk
+/// runs, and the steps they give, are among these, and this walk gives the rest of them,
+/// whatever was cached: a cold, warm or busy database takes the same steps and runs out or not
+/// alike. It runs on every path, before any verdict, so the asks it makes and `prove` does not
+/// (a refused script's) are steps on every database too.
+fn walk_steps<'a>(db: &Db, stored: &StoredParamEnvAndCrate, roots: impl Iterator<Item = &'a Instance>) -> u32 {
+    // An ask: the environment an instance is asked from, the instance, and whether `prove` asks
+    // it from the script's (so its callees are asked from there as well).
+    type Ask = (StoredParamEnvAndCrate, Instance, bool);
+    // The summaries walked: an ask's home and instance, which is what it reads, and whether its
+    // callees were followed from the script's environment.
+    let mut walked: HashSet<Ask, Global> = HashSet::new_in(Global);
+    let mut instances: HashSet<Instance, Global> = HashSet::new_in(Global);
+    let mut stack: Vec<Ask> = Vec::new(); // alloc: the walk's frontier, once per script
+    for root in roots {
+        stack.push((*stored, root.clone(), true)); // clone: reference counts
+    }
+    while let Some((env, instance, script)) = stack.pop() {
+        if !matches!(instance.def, Def::Body(_)) {
+            continue;
+        }
+        let home = home_env(db, &env, &instance);
+        // An ask `prove` makes covers the same summary's plain one.
+        // clone: reference counts
+        let covered = walked.contains(&(home, instance.clone(), true));
+        // clone: reference counts
+        if covered || !walked.insert((home, instance.clone(), script)) {
+            continue;
+        }
+        instances.insert(instance.clone()); // clone: reference counts
+        let summary = summary(db, env, instance);
+        for site in &summary.sites {
+            stack.push((home, site.instance.clone(), false)); // clone: reference counts
+        }
+        if script {
+            for callee in &summary.callees {
+                stack.push((*stored, callee.clone(), true)); // clone: reference counts
+            }
+        }
+    }
+    instances.len() as u32
+}
+
+/// What the walk from `roots` (`main`, and what `Termination::report` of what it returns
+/// calls) proves of a script that did not refuse on the way to them.
+fn prove<'db>(db: &'db Db, cx: &Cx<'db>, roots: &[(Instance, String)]) -> Purity {
     let mut effects = Effects::NONE;
     let mut env: Vec<Symbol> = Vec::new(); // alloc: the proof's variables, once per script
-    for (root, name) in &roots {
+    for (root, name) in roots {
         let Def::Leaf(func, leaf) = root.def else {
             let summary = summary(db, cx.stored.clone(), root.clone()); // clone: the query's key, reference counts
             if let Some(impure) = &summary.impure {
@@ -372,14 +463,31 @@ pub(crate) fn def_crate(db: &Db, def: Def) -> Crate {
 }
 
 /// What the instance does, asked from `env`: worked out in its home ([`home_env`]), so every
-/// build script that reaches it shares one summary.
+/// build script that reaches it shares one summary. A body instance is a step of the walk's
+/// bound, if one is set (`blaze_query::db::with_steps`), however often it is asked for.
 pub(crate) fn summary<'db>(db: &'db Db, env: StoredParamEnvAndCrate, instance: Instance) -> &'db Summary {
+    if let Def::Body(body) = instance.def {
+        blaze_query::db::step(|| step_key(body, &instance.args), || name_of(db, &instance));
+    }
     summary_in(db, home_env(db, &env, &instance), instance)
+}
+
+/// The body instance `body<args>` as one number, a different one for each instance: what its
+/// step is known by.
+fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
+    let (kind, id) = match body {
+        Body::Fn(func) => (0u128, func.as_id()),
+        Body::Closure(id) => (1, id),
+        Body::Coroutine(id) => (2, id),
+        Body::CoroutineByMove(id) => (3, id),
+    };
+    (kind << 64) | (u128::from(id.as_u32()) << 32) | u128::from(args.as_ref().index())
 }
 
 /// What the instance does, in `env`. A cycle of instances starts from the empty summary and
 /// iterates to its fixpoint: each local's value only rises, in a lattice three high.
 #[blaze_query::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::default())]
+#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
 pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Summary {
     let Some(body) = body_of(db, &env, &instance) else { return Summary::default() };
     match body {
@@ -941,7 +1049,7 @@ pub(crate) fn fn_item_path(db: &Db, func: FunctionId) -> String {
     };
     let path = path.or_else(|| {
         let args = GenericArgs::identity_for_item(DbInterner::new_no_crate(db), func.into());
-        blaze_query::db::attach(db, || hir_ty_mir::mir::type_name::rustc_function_name(db, func, args.as_slice()))
+        blaze_query::db::attach(db, || hir_ty_print::rustc_function_name(db, func, args.as_slice()))
     });
     path.unwrap_or_else(|| name.to_owned()) // alloc: an impure script's reason
 }

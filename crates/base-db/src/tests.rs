@@ -785,7 +785,7 @@ fn an_aliass_text_is_its_files() {
 
 #[test]
 fn a_table_finds_what_a_hash_map_does() {
-    use crate::table::{Table, hash_of};
+    use crate::table::Table;
     use blaze_hash::HashMap;
     use std::alloc::Global;
 
@@ -795,7 +795,7 @@ fn a_table_finds_what_a_hash_map_does() {
     let mut rng = Rng::new(7);
     for _ in 0..20_000 {
         let key = format!("key {}", rng.below(5_000));
-        let hash = hash_of(key.as_str());
+        let hash = table.hash(key.as_str());
         let (at, inserted) = table.insert(hash, |it| **it == *key, || key.as_str().into());
         match model.get(&key) {
             Some(&known) => assert_eq!((at, inserted), (known, false), "{key}"),
@@ -808,16 +808,16 @@ fn a_table_finds_what_a_hash_map_does() {
         assert_eq!(&**table.get(at), key.as_str());
     }
     for (key, &at) in &model {
-        assert_eq!(table.find(hash_of(key.as_str()), |it| **it == **key), Some(at));
+        assert_eq!(table.find(table.hash(key.as_str()), |it| **it == **key), Some(at));
     }
-    assert_eq!(table.find(hash_of("absent"), |it| &**it == "absent"), None);
+    assert_eq!(table.find(table.hash("absent"), |it| &**it == "absent"), None);
     let kept: Vec<&str> = table.iter().map(|it| &**it).collect();
     assert_eq!(kept, order.iter().map(String::as_str).collect::<Vec<_>>());
 }
 
 #[test]
 fn threads_inserting_one_key_get_one_value() {
-    use crate::table::{Table, hash_of};
+    use crate::table::Table;
 
     let table: Table<u64> = Table::new(1 << 16);
     let found: Vec<Vec<u32>> = std::thread::scope(|scope| {
@@ -829,7 +829,7 @@ fn threads_inserting_one_key_get_one_value() {
                     let mut at = vec![u32::MAX; 2_000];
                     for _ in 0..10_000 {
                         let key = rng.below(2_000);
-                        let (got, _) = table.insert(hash_of(key), |it| *it == key, || key);
+                        let (got, _) = table.insert(table.hash(key), |it| *it == key, || key);
                         assert!(at[key as usize] == u32::MAX || at[key as usize] == got);
                         at[key as usize] = got;
                     }
@@ -845,7 +845,7 @@ fn threads_inserting_one_key_get_one_value() {
         assert!(seen.insert(*value), "{value} kept twice");
     }
     for key in 0..2_000u64 {
-        let at = table.find(hash_of(key), |it| *it == key);
+        let at = table.find(table.hash(key), |it| *it == key);
         for thread in &found {
             if thread[key as usize] != u32::MAX {
                 assert_eq!(Some(thread[key as usize]), at);

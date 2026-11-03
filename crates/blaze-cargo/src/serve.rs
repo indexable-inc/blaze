@@ -28,8 +28,11 @@ pub mod observe;
 #[cfg(not(feature = "daemon"))]
 pub(crate) mod once;
 mod plane;
+mod pulse;
 pub(crate) mod signals;
 mod still;
+#[cfg(all(unix, feature = "daemon"))]
+mod stop;
 #[cfg(test)]
 mod tests;
 mod unit;
@@ -55,6 +58,11 @@ pub use daemon::{Daemon, Options};
 /// last start by it, and harness/storelib.py's `LISTENING` that it listens.
 #[cfg(feature = "daemon")]
 pub const LISTENING: &str = "blaze serve: listening on ";
+
+/// What the daemon's line that says how it started begins with, after `blaze serve: `: written
+/// when its warm state is gone, or the daemon before it did not stop, for the client that
+/// started it to quote.
+pub const STARTED: &str = "started: ";
 
 /// Where the daemon is and what it runs.
 #[derive(Clone, Debug)]
@@ -127,6 +135,66 @@ pub fn build_id(exe: &Path) -> anyhow::Result<blaze_ids::ContentId> {
     Ok(build_of(exe)?.id)
 }
 
+/// The content identity of the code that computes what the front end keeps in the store, and
+/// of how it was built (`blaze_codegen_code::FRONT_END`): what def-map images and the check
+/// outcomes, bodies and constants served beside them, the goal and item stores and kept
+/// proc-macro expansions are keyed by. blaze-engine's build script works it out with the code
+/// generator's in one walk and the program hands it over with [`set_front_end_code`] before any
+/// command runs, so an edit outside the front end's packages (the code generator, the CLI, the
+/// daemon, the lints) keeps every image, goal and expansion stored. Unit records and the
+/// standard library's shared directory stay keyed by the whole executable ([`build_id`]): a
+/// record is made by blaze-cargo itself, past the front end.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct FrontEndCode(pub blaze_ids::ContentId);
+
+impl FrontEndCode {
+    /// Of the 64 hex digits `blaze_codegen_code::emit_all` sets `BLAZE_FRONT_END_CODE` to.
+    pub fn from_hex(hex: &str) -> Result<FrontEndCode, String> {
+        let refused = || format!("the front end's code identity `{hex}` is not 64 hex digits (`BLAZE_FRONT_END_CODE`)");
+        if hex.len() != 64 || !hex.is_ascii() {
+            return Err(refused());
+        }
+        let mut bytes = [0u8; 32];
+        for (byte, at) in bytes.iter_mut().zip((0..64).step_by(2)) {
+            *byte = u8::from_str_radix(&hex[at..at + 2], 16).map_err(|_| refused())?;
+        }
+        Ok(FrontEndCode(blaze_ids::ContentId(bytes)))
+    }
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "which front end the process is, handed over once by the program's main so that no edit outside the front end changes this crate"
+)]
+static FRONT_END_CODE: std::sync::OnceLock<FrontEndCode> = std::sync::OnceLock::new();
+
+/// Hands over the code identity of the process's front end: once, before the first job.
+/// Handing over another one after is refused, naming both: one process is one front end.
+pub fn set_front_end_code(code: FrontEndCode) -> Result<(), String> {
+    match FRONT_END_CODE.get_or_init(|| code) {
+        it if *it == code => Ok(()),
+        // alloc: an error, once
+        it => Err(format!(
+            "the front end's code identity is {:x} already, and {:x} was handed over: one process is one front end",
+            it.0, code.0
+        )),
+    }
+}
+
+/// The code identity [`set_front_end_code`] was handed, or an error naming who should have.
+/// blaze-cargo's own tests are one made-up front end, handed over on first ask.
+pub fn front_end_code() -> Result<FrontEndCode, String> {
+    #[cfg(test)]
+    set_front_end_code(FrontEndCode(blaze_ids::ContentId([0x5f; 32])))?;
+    FRONT_END_CODE.get().copied().ok_or_else(|| {
+        "the front end was handed no code identity (`blaze_cargo::serve::set_front_end_code`): the program \
+         that runs it hands over its build script's `BLAZE_FRONT_END_CODE` before any job, and blaze keys no \
+         image, goal or expansion by the executable's bytes in its place"
+            // alloc: an error
+            .to_owned()
+    })
+}
+
 /// [`build_id`] of `exe` with the file it hashed ([`executable`]), as one open file was both:
 /// one that changed while it was read is an error.
 pub fn build_of(exe: &Path) -> anyhow::Result<blaze_api::Build> {
@@ -187,11 +255,13 @@ struct Args {
     ready: Option<i32>,
     /// `--stall-bound SECS`: the stall watchdog's bound ([`daemon::Options::stall`]).
     stall: Option<std::time::Duration>,
+    /// `--memory-gb GB`: the memory it runs under ([`told_memory`]).
+    memory: Option<(u64, String)>,
 }
 
 #[cfg(feature = "daemon")]
 fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
-    let mut parsed = Args { socket: None, http: None, activated: false, ready: None, stall: None };
+    let mut parsed = Args { socket: None, http: None, activated: false, ready: None, stall: None, memory: None };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let arg = arg.into_string().map_err(|it| anyhow::anyhow!("{} is not UTF-8", it.to_string_lossy()))?;
@@ -227,13 +297,70 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
                 })?;
                 parsed.stall = Some(std::time::Duration::from_secs(bound));
             }
+            "--memory-gb" => parsed.memory = Some(told_memory("--memory-gb", &value()?)?),
             _ => bail!(
-                "blaze serve takes `--socket PATH`, `--http ADDR`, `--activated`, `--ready-fd N` and \
-                 `--stall-bound SECS`, not `{arg}`"
+                "blaze serve takes `--socket PATH`, `--http ADDR`, `--activated`, `--ready-fd N`, \
+                 `--stall-bound SECS` and `--memory-gb GB`, not `{arg}`"
             ),
         }
     }
     Ok(parsed)
+}
+
+/// The variable whoever starts the daemon tells it the memory it runs under with, in GiB, as
+/// `--memory-gb` does: what a client that starts the daemon passes on with the rest of its
+/// environment, so a runner that stops the daemon past a footprint (its `daemon_max_gb`) sets
+/// it once and every daemon its commands start is told.
+pub(crate) const MEMORY_VAR: &str = "BLAZE_DAEMON_MEMORY_GB";
+
+/// The limit `gb` says, given as `what` (`--memory-gb`, or [`MEMORY_VAR`]): a number of GiB
+/// above 0, a fraction allowed (a runner's `daemon_max_gb` may be one), as the bytes it is and
+/// the name the budget is said with ([`blaze_graph::arena::machine_budget`]'s `told`). An error
+/// naming `what` and the text when it is no such number, never a default in its place.
+pub(crate) fn told_memory(what: &str, gb: &str) -> anyhow::Result<(u64, String)> {
+    let bytes = gb
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|it| it.is_finite() && *it > 0.0)
+        .map(|it| it * f64::from(1u32 << 30))
+        .filter(|it| *it >= 1.0 && *it < u64::MAX as f64)
+        .with_context(|| format!("{what} {gb:?}: the memory the daemon runs under is a number of GiB above 0"))?;
+    // alloc: the limit's name, once per daemon start
+    Ok((bytes as u64, format!("{what}={}", gb.trim())))
+}
+
+/// The limit the engine was told: `--memory-gb`'s (`flag`), else [`MEMORY_VAR`]'s (`var`, as
+/// the environment has it), else none, when the budgets are the machine's.
+pub(crate) fn told_limit(flag: Option<(u64, String)>, var: Option<std::ffi::OsString>) -> anyhow::Result<Option<(u64, String)>> {
+    if flag.is_some() {
+        return Ok(flag);
+    }
+    let Some(var) = var else { return Ok(None) };
+    let text = var.into_string().map_err(|it| anyhow::anyhow!("{MEMORY_VAR} {} is not UTF-8", it.to_string_lossy()))?;
+    told_memory(MEMORY_VAR, &text).map(Some)
+}
+
+/// What a start says of the limit it runs under (`budget`, [`blaze_graph::arena::machine_budget`]'s):
+/// its bytes and what told it, and when a build's release is due under it
+/// ([`blaze_graph::admission::Squeeze`]): past the limit's line, or one subsystem a release
+/// lowers past its fair share.
+pub(crate) fn limit_said(budget: &blaze_graph::Budget) -> String {
+    use blaze_graph::admission::{LINE, RELEASED, fair_share};
+    let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
+    // alloc: the start's line, once per daemon start
+    let shares = RELEASED
+        .iter()
+        .map(|&tag| format!("{} {:.2}", tag.name(), gib(fair_share(tag, budget.bytes))))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // alloc: as `shares`
+    format!(
+        "memory limit {:.2} GiB ({}): a build lets go of its front end once blaze holds {:.2} GiB, or once one of these holds past its share (GiB): {shares}",
+        gib(budget.bytes),
+        budget.from,
+        gib(budget.bytes - budget.bytes / LINE),
+    )
 }
 
 /// The socket systemd or launchd passed `blaze serve --activated` (the units of
@@ -330,8 +457,51 @@ impl std::error::Error for StillRuns {}
 /// started while the one before it still ends (writing its image, then letting its socket's
 /// name go) waits for it rather than takes its place. At most [`BEFORE_ENDS`]; after,
 /// [`StillRuns`].
+/// How the daemon before this one on its state ended, as `serve.lock` says once it is let go
+/// of: a daemon writes its pid there as it starts, and ` stopped` after it once its stop wrote
+/// its image ([`Running::stopped`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Before {
+    /// No daemon ran on this state, or its lock says nothing readable.
+    None,
+    Stopped(u32),
+    /// It ended without finishing its stop: killed (a SIGKILL, as an out-of-memory kill sends),
+    /// crashed, or ended by its stop's bound; the image is the last it wrote before.
+    Ended(u32),
+}
+
+impl Before {
+    /// What `serve.lock` held.
+    pub(crate) fn of(lock: &str) -> Before {
+        let mut words = lock.split_whitespace();
+        match (words.next().and_then(|it| it.parse().ok()), words.next()) {
+            (Some(pid), Some(STOPPED)) => Before::Stopped(pid),
+            (Some(pid), None) => Before::Ended(pid),
+            _ => Before::None,
+        }
+    }
+}
+
+impl std::fmt::Display for Before {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Before::None => f.write_str("no daemon ran on this state before it"),
+            Before::Stopped(pid) => write!(f, "the daemon before it on this state (pid {pid}) stopped"),
+            Before::Ended(pid) => write!(
+                f,
+                "the daemon before it on this state (pid {pid}) ended without finishing its stop (killed, as an \
+                 out-of-memory kill or `kill -9` does, crashed, or ended by its stop's bound; its log says which): \
+                 what it did after its last image is gone"
+            ),
+        }
+    }
+}
+
+/// What a daemon adds to its pid in `serve.lock` once its stop wrote its image.
+const STOPPED: &str = "stopped";
+
 #[cfg(unix)]
-fn hold(state: &Path, ready: Option<&mut std::fs::File>) -> anyhow::Result<stdx::file_lock::Locked> {
+fn hold(state: &Path, ready: Option<&mut std::fs::File>) -> anyhow::Result<(stdx::file_lock::Locked, Before)> {
     use std::{
         io::{Read as _, Seek as _, Write as _},
         os::unix::fs::OpenOptionsExt as _,
@@ -383,11 +553,16 @@ fn hold(state: &Path, ready: Option<&mut std::fs::File>) -> anyhow::Result<stdx:
             }
         }
     };
+    let mut before = String::new();
+    file.rewind()
+        .and_then(|()| file.read_to_string(&mut before))
+        .with_context(|| format!("reading how the daemon before this one ended from its lock {}", lock.display()))?;
+    let before = Before::of(&before);
     file.set_len(0)
         .and_then(|()| file.rewind())
         .and_then(|()| write!(file, "{}", std::process::id()))
         .with_context(|| format!("writing this daemon's pid to its lock {}", lock.display()))?;
-    Ok(file)
+    Ok((file, before))
 }
 
 /// Says `phase` on the ready pipe, if there is one. The CLI that waits may be gone, and then
@@ -459,13 +634,18 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         #[cfg(unix)]
         activated,
         stall: args.stall,
+        memory: args.memory,
     };
     let engine = engine(serving, ready.as_mut())?;
     let mut running = start(engine, "blaze serve", ready.as_mut())?;
     let ran = listen(&mut running.daemon, ready);
+    let marked = match ran {
+        Ok(()) => running.stopped(),
+        Err(_) => Ok(()),
+    };
     // The daemon is gone, and with it the history's sender: its thread's last flush ends it.
     running.end()?;
-    ran
+    ran.and(marked)
 }
 
 /// Where the engine takes its requests, and the bound of its stall watchdog.
@@ -480,6 +660,8 @@ pub(crate) struct Serving {
     pub(crate) activated: Option<blaze_api::activation::Passed>,
     /// `--stall-bound SECS` ([`daemon::Options::stall`]); `None` is [`blaze_profile::Watchdog::BOUND`].
     pub(crate) stall: Option<Duration>,
+    /// `--memory-gb GB` ([`told_limit`]); `None` reads [`MEMORY_VAR`].
+    pub(crate) memory: Option<(u64, String)>,
 }
 
 /// The engine `blaze serve` runs and the one-shot build runs in its own process: one setup
@@ -497,7 +679,9 @@ pub(crate) struct Engine {
 /// and the lease of the shared standard library's store.
 struct Held {
     #[cfg(unix)]
-    _lock: stdx::file_lock::Locked,
+    lock: stdx::file_lock::Locked,
+    /// How the daemon before this one on the state ended, as its lock said.
+    before: Before,
     _std_lease: blaze_gc::lease::Lease,
 }
 
@@ -508,9 +692,9 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     std::fs::create_dir_all(&state).with_context(|| format!("making the daemon's state directory {}", state.display()))?;
     // Held until the engine ends: the next one on this state waits on it.
     #[cfg(unix)]
-    let lock = hold(&state, ready)?;
+    let (lock, before) = hold(&state, ready)?;
     #[cfg(not(unix))]
-    let _ = ready;
+    let (_, before) = (ready, Before::None);
     // Where a stall's trace is written (`daemon::Failed::Stalled`): by the loop, which makes no
     // directories.
     let stalls = state.join("stalls");
@@ -542,6 +726,8 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     let sysroot = crate::toolchain::sysroot()
         .with_context(|| format!("blaze's toolchain ({}) is not on this machine: `blaze toolchain` installs it", crate::toolchain::name()))?;
     tracing::info!(sysroot = %sysroot.display(), "blaze's toolchain");
+    // Keyed by the whole executable: the shared store holds std units' records and outputs
+    // alone, and a record is made by blaze-cargo, past the front end ([`FrontEndCode`]).
     let build = build_of(&paths.launcher)?;
     let std = machine()?.join("std").join(format!("{:x}", build.id));
     std::fs::create_dir_all(&std).with_context(|| format!("making the standard library's shared directory {}", std.display()))?;
@@ -555,9 +741,10 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     let host = crate::toolchain::host()
         .context("blaze has no target triple for this machine's architecture and system")?
         .to_owned();
-    // What kept expansions are keyed by: the whole blaze, as `unit::deps::build` is, since the
-    // macro server and bridge that expand them are past the code generator's packages.
-    let toolchain = build.id;
+    // What kept expansions are keyed by: the front end's code ([`front_end_code`]), whose
+    // closure holds the macro server and bridge that expand them (blaze-macro-eval,
+    // proc-macro-api), as images and stored goals are.
+    let toolchain = front_end_code().map_err(|why| anyhow::anyhow!(why))?.0;
     let sources = sources()?;
     // A daemon that stopped mid-write left a package's half-written directory, which nothing
     // reads: removed before any fetch writes beside it.
@@ -573,7 +760,10 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
         writer: writer_of(&paths.state)?,
         socket: paths.socket.as_deref().map(file_name).transpose()?,
         http: serving.http.zip(token),
-        budget: Some(blaze_graph::arena::machine_budget(1 << 30).context("the memory the daemon's tasks may hold")?),
+        budget: Some(
+            blaze_graph::arena::machine_budget(1 << 30, told_limit(serving.memory, std::env::var_os(MEMORY_VAR))?)
+                .context("the memory the daemon's tasks may hold")?,
+        ),
         threads,
         io: 16,
         env: ["PATH", "HOME"]
@@ -602,6 +792,7 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     signals::catch();
     signals::record_ends();
     plane::record_panics();
+    plane::record_alloc_failures();
     // Each query run is progress to the stall watchdog: a check inside queries for minutes is
     // no stall. Set once per process, so a second daemon in one (tests) finds it set by the
     // first; a hook something else set first would leave the watchdog counting nothing.
@@ -628,7 +819,8 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
         .with_context(|| format!("making {}, where each sandboxed spawn gets its directory", scratch.display()))?;
     let held = Held {
         #[cfg(unix)]
-        _lock: lock,
+        lock,
+        before,
         _std_lease: std_lease,
     };
     Ok(Engine { options, steps, runner, driver, keeper, held })
@@ -644,13 +836,28 @@ compile_error!(
 pub(crate) struct Running {
     pub(crate) daemon: Daemon<blaze_core::Native, unit::Real>,
     keeper: observe::Keeper,
-    _held: Held,
+    held: Held,
 }
 
 impl Running {
+    /// Its stop wrote its image: its lock says so to the daemon after it ([`Before`]).
+    pub(crate) fn stopped(&mut self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::io::{Seek as _, Write as _};
+            let file = &mut *self.held.lock;
+            file.set_len(0)
+                .and_then(|()| file.rewind())
+                .and_then(|()| write!(file, "{} {STOPPED}", std::process::id()))
+                .context("writing that this daemon stopped to its lock serve.lock")?;
+        }
+        Ok(())
+    }
+
     /// The daemon gone, and with it the history's sender: its thread's last flush ends it.
     pub(crate) fn end(self) -> anyhow::Result<()> {
-        let Running { daemon, keeper, _held } = self;
+        let Running { daemon, keeper, held } = self;
+        let _held = held;
         drop(daemon);
         keeper.join().map_err(|why| anyhow::anyhow!(why))
     }
@@ -661,8 +868,8 @@ impl Running {
 /// stderr, and `ready` hears each phase.
 pub(crate) fn start(engine: Engine, who: &str, mut ready: Option<&mut std::fs::File>) -> anyhow::Result<Running> {
     let Engine { options, steps, runner, driver, keeper, held } = engine;
-    match begin(driver, options, steps, runner, who, ready.as_deref_mut()) {
-        Ok(daemon) => Ok(Running { daemon, keeper, _held: held }),
+    match begin(driver, options, steps, runner, who, held.before, ready.as_deref_mut()) {
+        Ok(daemon) => Ok(Running { daemon, keeper, held }),
         Err(error) => {
             // The daemon was never made, or is gone: the history's sender with it.
             keeper.join().map_err(|why| anyhow::anyhow!(why))?;
@@ -677,11 +884,17 @@ fn begin(
     steps: Arc<unit::Real>,
     runner: plane::Runner<job::Step<unit::Real>>,
     who: &str,
+    before: Before,
     mut ready: Option<&mut std::fs::File>,
 ) -> anyhow::Result<Daemon<blaze_core::Native, unit::Real>> {
     say(ready.as_deref_mut(), Phase::State);
+    let limit = options.budget.as_ref().map(limit_said);
     let mut daemon = Daemon::start(driver, options, steps, runner)?;
     say(ready, Phase::Setup);
+    // Each start says the limit it runs under, so a run's log shows it was told one (B5).
+    if let Some(limit) = limit {
+        eprintln!("{who}: {limit}");
+    }
     let started = daemon.started();
     if started.cold == Some(daemon::Cold::Interned) {
         bail!("{who}: the daemon image's symbols: {}", daemon::Cold::Interned);
@@ -689,8 +902,10 @@ fn begin(
     if let Some(restored) = &started.restored {
         eprintln!("{who}: restored the daemon image {restored}");
     }
-    if !started.whole() {
-        eprintln!("{who}: started: {started}");
+    // What a client that started it quotes (`cli::daemon::start_said`): why the warm state is
+    // gone, and how the daemon before it ended.
+    if !started.whole() || matches!(before, Before::Ended(_)) {
+        eprintln!("{who}: {STARTED}{started}; {before}");
     }
     daemon.install_store().map_err(|why| anyhow::anyhow!("the daemon's store: {why}"))?;
     // What blaze keeps on disk, collected in the background (docs/gc.md): the build dirs
@@ -725,17 +940,29 @@ fn listen(daemon: &mut Daemon<blaze_core::Native, unit::Real>, mut ready: Option
     if !turning {
         bail!("blaze serve: stopped in its first turn, before it listened at {}", daemon.listening());
     }
+    // Armed before the CLI is told it listens: from then on a SIGTERM ends the daemon within
+    // its stall bound, however stuck, saying what it was inside, and a loop stuck inside a turn
+    // is reported with the children it leaves unreaped.
+    let guard = stop::arm(daemon.stall_bound(), daemon.pulse())?;
     eprintln!("{LISTENING}{} (pid {})", daemon.listening(), std::process::id());
     // Its last word: the pipe closes as it goes.
     say(ready.take().as_mut(), Phase::Listening);
-    let mut told = false;
+    let (mut told, mut guarded) = (false, false);
     loop {
         if signals::signalled() && !told {
             told = true;
             let pid = std::process::id();
             let by = signals::stopped_by().unwrap_or_default();
-            eprintln!("blaze serve: pid {pid} asked to stop by {by}: writing the image first");
+            eprintln!(
+                "blaze serve: pid {pid} asked to stop by {by}: writing the image first; a stop in which nothing moves \
+                 for {} s, or a second signal, ends it with what it is inside written here",
+                daemon.stall_bound().as_secs()
+            );
             daemon.stop();
+        }
+        if daemon.stopping() && !guarded {
+            guarded = true;
+            signals::stop_begun();
         }
         if signals::dump_asked() {
             tracing::warn!("SIGUSR1: {}", blaze_profile::watchdog::running());
@@ -744,6 +971,7 @@ fn listen(daemon: &mut Daemon<blaze_core::Native, unit::Real>, mut ready: Option
             break;
         }
     }
+    guard.disarm();
     match daemon.failed() {
         Some(why) => bail!("{why}"),
         None => {

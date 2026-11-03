@@ -1,7 +1,8 @@
-diff -ruN a/src/inherent.rs b/src/inherent.rs
+diff --git a/src/inherent.rs b/src/inherent.rs
+index 4fd9219..898a7c7 100644
 --- a/src/inherent.rs
 +++ b/src/inherent.rs
-@@ -604,7 +604,8 @@
+@@ -604,7 +604,8 @@ pub trait Features<I: Interner>: Copy {
  pub trait DefId<I: Interner, Local = <I as Interner>::LocalDefId>:
      Copy + Debug + Hash + Eq + TypeFoldable<I>
  {

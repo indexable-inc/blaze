@@ -63,7 +63,7 @@ fn display_place(db: &TestDB, store: &ExpressionStore, place: &Place, local: Bin
     result
 }
 
-fn check_closure_captures(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_closure_captures(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let _tracing = setup_tracing();
     let fx = fixture::db(ra_fixture);
     let file_id = fx.only_file();
@@ -177,7 +177,7 @@ fn main() {
     let closure = || { let b = *a; };
 }
 "#,
-        expect!["53..71;20..21;66..68 ByRef(Immutable) *a &'<erased> bool"],
+        &expect!["53..71;20..21;66..68 ByRef(Immutable) *a &'<erased> bool"],
     );
 }
 
@@ -191,7 +191,7 @@ fn main() {
     let closure = || { let &mut ref b = a; };
 }
 "#,
-        expect!["53..79;20..21;62..72 ByRef(Immutable) *a &'<erased> bool"],
+        &expect!["53..79;20..21;62..72 ByRef(Immutable) *a &'<erased> bool"],
     );
     check_closure_captures(
         r#"
@@ -201,7 +201,7 @@ fn main() {
     let closure = || { let &mut ref mut b = a; };
 }
 "#,
-        expect!["53..83;20..21;62..76 ByRef(Mutable) *a &'<erased> mut bool"],
+        &expect!["53..83;20..21;62..76 ByRef(Mutable) *a &'<erased> mut bool"],
     );
 }
 
@@ -215,7 +215,7 @@ fn main() {
     let closure = || { *a = false; };
 }
 "#,
-        expect!["53..71;20..21;58..60 ByRef(Mutable) *a &'<erased> mut bool"],
+        &expect!["53..71;20..21;58..60 ByRef(Mutable) *a &'<erased> mut bool"],
     );
 }
 
@@ -229,7 +229,7 @@ fn main() {
     let closure = || { let ref mut b = *a; };
 }
 "#,
-        expect!["53..79;20..21;74..76 ByRef(Mutable) *a &'<erased> mut bool"],
+        &expect!["53..79;20..21;74..76 ByRef(Mutable) *a &'<erased> mut bool"],
     );
 }
 
@@ -243,7 +243,7 @@ fn main() {
     let closure = || { let _ = *a else { return; }; };
 }
 "#,
-        expect![""],
+        &expect![""],
     );
 }
 
@@ -258,7 +258,7 @@ fn main() {
     let closure = || { let b = a; };
 }
 "#,
-        expect!["67..84;36..37;80..81 ByValue a NonCopy"],
+        &expect!["67..84;36..37;80..81 ByValue a NonCopy"],
     );
 }
 
@@ -274,7 +274,7 @@ fn main() {
     let closure = || { let c = &mut a; };
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             71..89;36..41;85..86 ByRef(Immutable) a &'<erased> NonCopy
             109..131;36..41;127..128 ByRef(Mutable) a &'<erased> mut NonCopy"#]],
     );
@@ -291,7 +291,7 @@ fn main() {
     let closure = || { let b = a.a; };
 }
 "#,
-        expect!["92..111;50..51;105..108 ByRef(Immutable) a.a &'<erased> i32"],
+        &expect!["92..111;50..51;105..108 ByRef(Immutable) a.a &'<erased> i32"],
     );
 }
 
@@ -311,7 +311,7 @@ fn main() {
     };
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             133..212;87..92;155..158 ByRef(Immutable) a.a &'<erased> i32
             133..212;87..92;181..184 ByRef(Mutable) a.b &'<erased> mut i32
             133..212;87..92;202..205 ByValue a.c NonCopy"#]],
@@ -334,7 +334,7 @@ fn main() {
     let closure = || a.mut_();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             123..133;92..97;126..127 ByRef(Immutable) a &'<erased> Foo
             153..164;92..97;156..157 ByRef(Mutable) a &'<erased> mut Foo"#]],
     );
@@ -362,7 +362,7 @@ fn main() {
     };
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             113..167;36..41;127..128,159..160 ByRef(Mutable) a &'<erased> mut &'? mut bool
             231..304;196..201;252..253,276..277,296..297 ByValue a NonCopy"#]],
     );
@@ -378,7 +378,7 @@ fn main() {
     let closure = || { let _ = a; };
 }
 "#,
-        expect![""],
+        &expect![""],
     );
 }
 
@@ -401,7 +401,7 @@ fn main() {
     };
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             125..163;36..41;134..135 ByRef(Immutable) a &'<erased> NonCopy
             183..225;36..41;192..193 ByRef(Mutable) a &'<erased> mut NonCopy"#]],
     );
@@ -417,7 +417,7 @@ fn main() {
     let mut closure = || { let (b | b) = a; };
 }
 "#,
-        expect!["57..80;20..25;76..77 ByRef(Immutable) a &'<erased> bool"],
+        &expect!["57..80;20..25;76..77 ByRef(Immutable) a &'<erased> bool"],
     );
 }
 
@@ -436,7 +436,7 @@ fn main() {
     };
 }
 "#,
-        expect![
+        &expect![
             "57..149;20..25;79..80,99..100,123..124,134..135 ByRef(Mutable) a &'<erased> mut bool"
         ],
     );
@@ -452,7 +452,7 @@ fn main() {
     let mut closure = || { let b = *&mut a; };
 }
 "#,
-        expect!["57..80;20..25;76..77 ByRef(Mutable) a &'<erased> mut bool"],
+        &expect!["57..80;20..25;76..77 ByRef(Mutable) a &'<erased> mut bool"],
     );
 }
 
@@ -470,7 +470,7 @@ fn main() {
     let closure = || { let b = &mut a; };
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             54..72;20..25;68..69 ByRef(Immutable) a &'<erased> &'? bool
             92..114;20..25;110..111 ByRef(Mutable) a &'<erased> mut &'? bool
             158..176;124..125;172..173 ByRef(Immutable) a &'<erased> &'? mut bool
@@ -493,7 +493,7 @@ fn main() {
     closure();
 }
 "#,
-        expect!["99..165;49..54;120..121,133..134 ByRef(Mutable) a &'<erased> mut A"],
+        &expect!["99..165;49..54;120..121,133..134 ByRef(Mutable) a &'<erased> mut A"],
     );
 }
 
@@ -515,7 +515,7 @@ fn main() {
     };
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             129..225;49..54;158..163 ByRef(Immutable) s_ref &'<erased> &'? mut S
             129..225;93..99;201..207 ByRef(Mutable) s_ref2 &'<erased> mut &'? mut S"#]],
     );
@@ -536,7 +536,7 @@ fn main() {
     };
 }
 "#,
-        expect!["73..149;37..38;103..104 ByValue b Option<Box>"],
+        &expect!["73..149;37..38;103..104 ByValue b Option<Box>"],
     );
 }
 
@@ -561,7 +561,7 @@ fn main() {
     };
 }
 "#,
-        expect!["220..257;174..175;245..250 ByRef(Immutable) c.b.x &'<erased> i32"],
+        &expect!["220..257;174..175;245..250 ByRef(Immutable) c.b.x &'<erased> i32"],
     );
 }
 
@@ -579,7 +579,7 @@ fn f() {
     };
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             44..113;17..18;92..93 ByRef(Immutable) a &'<erased> i32
             73..106;17..18;92..93 ByRef(Immutable) a &'<erased> i32"#]],
     );
@@ -599,7 +599,7 @@ fn f() {
     };
 }
 "#,
-        expect!["77..110;46..47;96..97 ByRef(Immutable) b &'<erased> i32"],
+        &expect!["77..110;46..47;96..97 ByRef(Immutable) b &'<erased> i32"],
     );
 }
 
@@ -616,7 +616,7 @@ fn foo(foo: &Foo) {
     || { return foo.arr[0] };
 }
     "#,
-        expect!["102..126;85..88;114..117 ByRef(Immutable) *foo &'<erased> Foo"],
+        &expect!["102..126;85..88;114..117 ByRef(Immutable) *foo &'<erased> Foo"],
     );
 }
 
@@ -653,7 +653,7 @@ fn fun(wrapper: Wrapper) {
     });
 }
     "#,
-        expect!["319..411;206..213;350..357,391..398 ByValue wrapper Wrapper"],
+        &expect!["319..411;206..213;350..357,391..398 ByValue wrapper Wrapper"],
     );
 }
 
@@ -678,6 +678,6 @@ fn fun(pair: Pair) {
     };
 }
     "#,
-        expect!["149..211;131..135;194..205 ByValue pair.second i32"],
+        &expect!["149..211;131..135;194..205 ByValue pair.second i32"],
     );
 }

@@ -157,7 +157,7 @@ pub fn store_buffer(schema: SchemaHash) -> Valid {
     let cols = store(&mut build);
     let mut root = build.root();
     store_root(&mut root, &cols);
-    build.finish(root)
+    build.finish(&root)
 }
 
 /// A `Src` record, as its three words of eight bytes: the file's query ID, then the file kind

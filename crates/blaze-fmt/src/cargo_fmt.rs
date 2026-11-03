@@ -223,11 +223,11 @@ fn execute(args: Vec<String>) -> i32 {
         handle_command_status(format_crate(
             verbosity,
             &strategy,
-            rustfmt_args,
+            &rustfmt_args,
             Some(&manifest_path),
         ))
     } else {
-        handle_command_status(format_crate(verbosity, &strategy, rustfmt_args, None))
+        handle_command_status(format_crate(verbosity, &strategy, &rustfmt_args, None))
     }
 }
 
@@ -313,13 +313,13 @@ fn get_rustfmt_info(args: &[String]) -> Result<i32, io::Error> {
 fn format_crate(
     verbosity: Verbosity,
     strategy: &CargoFmtStrategy,
-    rustfmt_args: Vec<String>,
+    rustfmt_args: &[String],
     manifest_path: Option<&Path>,
 ) -> Result<i32, io::Error> {
     let targets = get_targets(strategy, manifest_path)?;
 
     // Currently only bin and lib files get formatted.
-    run_rustfmt(&targets, &rustfmt_args, verbosity)
+    run_rustfmt(&targets, rustfmt_args, verbosity)
 }
 
 /// Target uses a `path` field for equality and hashing.

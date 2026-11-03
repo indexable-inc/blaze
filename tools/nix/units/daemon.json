@@ -186,7 +186,6 @@
     "version": "60.1.0"
    },
    {
-    "checksum": "7bd46a530bc1a8e763102fc36c1dc0f51f3ffa150c78e7f5658ccb54b1458ade",
     "dependencies": [
      "bytes",
      "half",
@@ -194,7 +193,6 @@
      "num-traits"
     ],
     "name": "arrow-buffer",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "60.1.0"
    },
    {
@@ -508,7 +506,8 @@
    {
     "dependencies": [
      "blaze-alloc-count",
-     "blaze-ids"
+     "blaze-ids",
+     "blaze-mem"
     ],
     "name": "blaze-bytes",
     "version": "0.0.0"
@@ -598,8 +597,7 @@
      "uds_windows",
      "url",
      "windows-sys 0.61.2",
-     "zip",
-     "zstd"
+     "zip"
     ],
     "name": "blaze-cargo",
     "version": "0.0.0"
@@ -694,6 +692,15 @@
    },
    {
     "dependencies": [
+     "blake3",
+     "glob",
+     "toml"
+    ],
+    "name": "blaze-codegen-code",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
      "blaze-alloc-count",
      "blaze-check",
      "blaze-hash",
@@ -762,6 +769,7 @@
      "span",
      "stdx",
      "syntax",
+     "tt",
      "unicode-ident",
      "unicode-normalization",
      "unicode-security"
@@ -774,6 +782,7 @@
      "base-db",
      "blaze-graph",
      "blaze-hash",
+     "blaze-query",
      "either",
      "hir",
      "hir-def",
@@ -796,6 +805,7 @@
      "base-db",
      "blaze-alloc-count",
      "blaze-cargo",
+     "blaze-codegen-code",
      "blaze-diagnostics",
      "blaze-format",
      "blaze-graph",
@@ -804,6 +814,7 @@
      "blaze-mem",
      "blaze-query",
      "blaze-registry",
+     "blaze-sha256",
      "blaze-units",
      "blaze-vfs",
      "cfg",
@@ -813,8 +824,8 @@
      "intern",
      "ix-prof",
      "libmimalloc-sys",
-     "mimalloc",
      "parking_lot",
+     "stdx",
      "tar",
      "toml",
      "toml_edit",
@@ -939,6 +950,7 @@
      "libc",
      "serde",
      "serde_json",
+     "stdx",
      "tracing",
      "windows-sys 0.61.2"
     ],
@@ -982,6 +994,7 @@
      "blaze-protocol",
      "blaze-radix",
      "blaze-reclaim",
+     "blaze-rng",
      "blaze-serde",
      "blaze-spin",
      "corosensei",
@@ -1157,7 +1170,8 @@
      "smallvec",
      "span",
      "stdx",
-     "syntax"
+     "syntax",
+     "tracing"
     ],
     "name": "blaze-items",
     "version": "0.0.0"
@@ -1299,6 +1313,7 @@
      "intern",
      "proc-macro-api",
      "span",
+     "syntax",
      "toml",
      "triomphe"
     ],
@@ -1315,6 +1330,7 @@
      "blaze-graph",
      "blaze-hash",
      "blaze-ids",
+     "blaze-items",
      "blaze-lower",
      "blaze-profile",
      "blaze-query",
@@ -1322,6 +1338,7 @@
      "blaze-units",
      "blaze-usercode",
      "blaze-vfs",
+     "blaze-wasi",
      "cfg",
      "either",
      "hir-def",
@@ -1341,7 +1358,8 @@
      "tracing",
      "tt",
      "unicode-normalization",
-     "wasmtime"
+     "wasmtime",
+     "wat"
     ],
     "name": "blaze-macro-eval",
     "version": "0.0.0"
@@ -1379,7 +1397,7 @@
      "blaze-alloc-count",
      "blaze-check",
      "blaze-reclaim",
-     "blaze-spin",
+     "blaze-rng",
      "crossbeam-channel",
      "hegeltest",
      "libc",
@@ -1448,6 +1466,7 @@
      "arrow-array",
      "arrow-ipc",
      "arrow-schema",
+     "blaze-core",
      "blaze-graph",
      "blaze-hash",
      "blaze-ids",
@@ -1463,6 +1482,7 @@
      "serde",
      "serde_derive",
      "serde_json",
+     "stdx",
      "thiserror",
      "tracing",
      "windows-sys 0.61.2"
@@ -1502,6 +1522,7 @@
      "blaze-serde",
      "blaze-vfs",
      "crossbeam-channel",
+     "crossbeam-queue",
      "either",
      "hashbrown 0.17.1",
      "hegeltest",
@@ -1511,6 +1532,7 @@
      "serde",
      "smallvec",
      "thin-vec",
+     "tracing",
      "triomphe"
     ],
     "name": "blaze-query",
@@ -1558,6 +1580,7 @@
      "blaze-units",
      "filetime",
      "flate2",
+     "http",
      "http-body-util",
      "hyper",
      "hyper-rustls",
@@ -1569,6 +1592,7 @@
      "serde",
      "serde_derive",
      "serde_json",
+     "stdx",
      "tar",
      "tokio",
      "toml",
@@ -1606,6 +1630,16 @@
      "hegeltest"
     ],
     "name": "blaze-rng",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "blaze-wasi",
+     "libc",
+     "wasmtime",
+     "wat"
+    ],
+    "name": "blaze-seed-run",
     "version": "0.0.0"
    },
    {
@@ -1853,6 +1887,13 @@
      "smallvec"
     ],
     "name": "blaze-vfs",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "wasmtime"
+    ],
+    "name": "blaze-wasi",
     "version": "0.0.0"
    },
    {
@@ -3165,6 +3206,7 @@
      "hir-expand",
      "hir-ty",
      "hir-ty-borrowck",
+     "hir-ty-coherence",
      "hir-ty-matchck",
      "hir-ty-mir",
      "hir-ty-specialization",
@@ -3322,6 +3364,7 @@
      "bitflags 2.13.2",
      "blaze-alloc-count",
      "blaze-check",
+     "blaze-codegen-code",
      "blaze-dbsp",
      "blaze-format",
      "blaze-graph",
@@ -3405,6 +3448,7 @@
      "blaze-alloc-count",
      "blaze-cas",
      "blaze-codegen",
+     "blaze-codegen-code",
      "blaze-core",
      "blaze-format",
      "blaze-hash",
@@ -3439,6 +3483,7 @@
      "postcard",
      "ra-ap-rustc_ast_ir",
      "ra-ap-rustc_index",
+     "rsasm",
      "rustc-demangle",
      "rustc-stable-hash",
      "rustc_abi",
@@ -3460,6 +3505,22 @@
    {
     "dependencies": [
      "base-db",
+     "blaze-mem",
+     "blaze-query",
+     "either",
+     "hir-def",
+     "hir-expand",
+     "hir-ty",
+     "hir-ty-mir",
+     "rustc_type_ir",
+     "tracing"
+    ],
+    "name": "hir-ty-coherence",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "base-db",
      "hir-def"
     ],
     "name": "hir-ty-comptime",
@@ -3471,6 +3532,7 @@
      "blaze-ids",
      "blaze-items",
      "blaze-mem",
+     "blaze-query",
      "hir-def",
      "hir-expand",
      "hir-ty",
@@ -3547,6 +3609,7 @@
      "arrayvec",
      "base-db",
      "blaze-alloc-count",
+     "blaze-format",
      "blaze-hash",
      "blaze-hashcons",
      "blaze-ids",
@@ -3639,6 +3702,7 @@
     "dependencies": [
      "base-db",
      "blaze-mem",
+     "blaze-query",
      "hir-def",
      "hir-expand",
      "hir-ty",
@@ -3687,6 +3751,7 @@
      "blaze-alloc-count",
      "blaze-hash",
      "blaze-ids",
+     "blaze-query",
      "either",
      "hir-def",
      "hir-expand",
@@ -3975,6 +4040,12 @@
     "name": "icu_provider",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "2.2.0"
+   },
+   {
+    "checksum": "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954",
+    "name": "id-arena",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "2.3.0"
    },
    {
     "checksum": "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39",
@@ -4300,6 +4371,13 @@
     "version": "0.1.49"
    },
    {
+    "dependencies": [
+     "libc"
+    ],
+    "name": "libzstd-rs-sys",
+    "version": "0.0.1-prerelease.2"
+   },
+   {
     "checksum": "e752191d037c44ad111a8caa762921926658402f01cc1253f7bef2020ece4f5e",
     "dependencies": [
      "bitflags 2.13.2"
@@ -4445,15 +4523,6 @@
     "name": "memoffset",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.9.1"
-   },
-   {
-    "checksum": "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862",
-    "dependencies": [
-     "libmimalloc-sys"
-    ],
-    "name": "mimalloc",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "0.1.52"
    },
    {
     "checksum": "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a",
@@ -5359,6 +5428,10 @@
     "version": "0.8.18"
    },
    {
+    "name": "rsasm",
+    "version": "0.1.3"
+   },
+   {
     "checksum": "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb",
     "name": "rustc-demangle",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -5440,10 +5513,12 @@
      "arrayvec",
      "bitflags 2.13.2",
      "blaze-alloc-count",
+     "blaze-graph",
      "blaze-mem",
      "derive-where",
      "ena",
      "indexmap",
+     "parking_lot",
      "ra-ap-rustc_ast_ir",
      "ra-ap-rustc_index",
      "rustc-hash",
@@ -5978,6 +6053,7 @@
      "hegeltest",
      "itertools 0.15.0",
      "libc",
+     "parking_lot",
      "stacker",
      "tracing"
     ],
@@ -6147,7 +6223,7 @@
     "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd",
     "dependencies": [
      "fastrand",
-     "getrandom 0.4.3",
+     "getrandom 0.3.4",
      "once_cell",
      "rustix",
      "windows-sys 0.61.2"
@@ -6306,7 +6382,6 @@
      "libc",
      "mio",
      "pin-project-lite",
-     "signal-hook-registry",
      "socket2",
      "tokio-macros",
      "windows-sys 0.61.2"
@@ -6532,6 +6607,7 @@
      "blaze-hash",
      "blaze-ids",
      "blaze-mem",
+     "blaze-phf",
      "hegeltest",
      "intern",
      "rustc_lexer",
@@ -6826,6 +6902,18 @@
     "version": "0.263.0"
    },
    {
+    "checksum": "b88de21560ecd49deb8d8f1616b9b695f66fc312c5eca503f43accdc5795339e",
+    "dependencies": [
+     "anyhow",
+     "indexmap",
+     "wasm-encoder 0.261.0",
+     "wasmparser 0.261.0"
+    ],
+    "name": "wasm-metadata",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.261.0"
+   },
+   {
     "checksum": "4f20f20e44f7e8aeb6744823ea9d869ede51e51be4fdaedede2852282e54d2d8",
     "dependencies": [
      "bitflags 2.13.2",
@@ -6861,7 +6949,6 @@
     "version": "0.261.0"
    },
    {
-    "checksum": "fdfacce893df54d319b29720e79edb001cd1b48faaf78fdb3b9c608eaeeea29f",
     "dependencies": [
      "addr2line",
      "async-trait",
@@ -6884,6 +6971,7 @@
      "target-lexicon",
      "wasmparser 0.261.0",
      "wasmtime-environ",
+     "wasmtime-internal-component-macro",
      "wasmtime-internal-core",
      "wasmtime-internal-cranelift",
      "wasmtime-internal-fiber",
@@ -6895,7 +6983,6 @@
      "windows-sys 0.61.2"
     ],
     "name": "wasmtime",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "50.0.1"
    },
    {
@@ -6925,6 +7012,21 @@
      "wasmtime-internal-core"
     ],
     "name": "wasmtime-environ",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "50.0.1"
+   },
+   {
+    "checksum": "61479c89e12c716cc7a962e68574c01f3cf8bfd27fbeb6fc477b27b5096b8350",
+    "dependencies": [
+     "anyhow",
+     "proc-macro2",
+     "quote",
+     "syn 3.0.9",
+     "wasmtime-internal-component-util",
+     "wasmtime-internal-wit-bindgen",
+     "wit-parser"
+    ],
+    "name": "wasmtime-internal-component-macro",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "50.0.1"
    },
@@ -7026,6 +7128,20 @@
      "syn 3.0.9"
     ],
     "name": "wasmtime-internal-versioned-export-macros",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "50.0.1"
+   },
+   {
+    "checksum": "6df6397ebf5957c9d9c6001b7d9cd1586113f3556e7d1f9e0457c7166cf0a1da",
+    "dependencies": [
+     "anyhow",
+     "bitflags 2.13.2",
+     "heck",
+     "indexmap",
+     "wit-component",
+     "wit-parser"
+    ],
+    "name": "wasmtime-internal-wit-bindgen",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "50.0.1"
    },
@@ -7268,6 +7384,44 @@
     "version": "0.57.1"
    },
    {
+    "checksum": "2818766842bd2321074c348fb5c15d8fdb105a9eb78374e6d77c7d4127e1f2f9",
+    "dependencies": [
+     "anyhow",
+     "bitflags 2.13.2",
+     "indexmap",
+     "log",
+     "serde",
+     "serde_derive",
+     "serde_json",
+     "wasm-encoder 0.261.0",
+     "wasm-metadata",
+     "wasmparser 0.261.0",
+     "wit-parser"
+    ],
+    "name": "wit-component",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.261.0"
+   },
+   {
+    "checksum": "962e43c4db2da607b50839a531e5b63473268b40efdf8028d5c54b572ca4f6f6",
+    "dependencies": [
+     "anyhow",
+     "hashbrown 0.17.1",
+     "id-arena",
+     "indexmap",
+     "log",
+     "semver",
+     "serde",
+     "serde_derive",
+     "serde_json",
+     "unicode-ident",
+     "wasmparser 0.261.0"
+    ],
+    "name": "wit-parser",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.261.0"
+   },
+   {
     "checksum": "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4",
     "name": "writeable",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -7497,13 +7651,12 @@
     "version": "8.2.0"
    },
    {
-    "checksum": "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3",
     "dependencies": [
      "cc",
+     "libzstd-rs-sys",
      "pkg-config"
     ],
     "name": "zstd-sys",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "2.1.2+zstd.1.5.7"
    }
   ],
@@ -7512,6 +7665,9 @@
  "manifest": {
   "patch": {
    "crates-io": {
+    "arrow-buffer": {
+     "path": "vendor/arrow-buffer"
+    },
     "cranelift-codegen": {
      "path": "vendor/cranelift-codegen"
     },
@@ -7524,8 +7680,17 @@
     "ra-ap-rustc_ast_ir": {
      "path": "vendor/rustc_ast_ir"
     },
+    "rsasm": {
+     "path": "vendor/rsasm"
+    },
     "sonic-rs": {
      "path": "vendor/sonic-rs"
+    },
+    "wasmtime": {
+     "path": "vendor/wasmtime"
+    },
+    "zstd-sys": {
+     "path": "vendor/zstd-sys"
     }
    }
   },
@@ -7533,6 +7698,12 @@
    "dev": {
     "debug": 1,
     "package": {
+     "blake3": {
+      "opt-level": 3
+     },
+     "blaze-codegen-code": {
+      "opt-level": 3
+     },
      "blaze-hash": {
       "opt-level": 3
      },
@@ -7575,7 +7746,15 @@
     "lto": "thin"
    },
    "release": {
-    "debug": 0
+    "debug": 0,
+    "package": {
+     "blake3": {
+      "opt-level": 3
+     },
+     "blaze-codegen-code": {
+      "opt-level": 3
+     }
+    }
    }
   },
   "workspace": {
@@ -7643,6 +7822,7 @@
      "path": "crates/blaze-bytes"
     },
     "blaze-cargo": {
+     "default-features": false,
      "path": "crates/blaze-cargo"
     },
     "blaze-cas": {
@@ -7653,6 +7833,9 @@
     },
     "blaze-codegen": {
      "path": "crates/blaze-codegen"
+    },
+    "blaze-codegen-code": {
+     "path": "crates/blaze-codegen-code"
     },
     "blaze-core": {
      "path": "crates/blaze-core"
@@ -7680,6 +7863,7 @@
      "path": "crates/blaze-gc"
     },
     "blaze-global": {
+     "default-features": false,
      "path": "crates/blaze-global"
     },
     "blaze-graph": {
@@ -7716,9 +7900,11 @@
      "path": "crates/blaze-kernel"
     },
     "blaze-lazy": {
+     "default-features": false,
      "path": "crates/blaze-lazy"
     },
     "blaze-link": {
+     "default-features": false,
      "path": "crates/blaze-link"
     },
     "blaze-lint-defs": {
@@ -7769,6 +7955,7 @@
      "path": "crates/blaze-reclaim"
     },
     "blaze-registry": {
+     "default-features": false,
      "path": "crates/blaze-registry"
     },
     "blaze-resolve": {
@@ -7776,6 +7963,9 @@
     },
     "blaze-rng": {
      "path": "crates/blaze-rng"
+    },
+    "blaze-seed-run": {
+     "path": "crates/blaze-seed-run"
     },
     "blaze-serde": {
      "path": "crates/blaze-serde"
@@ -7793,6 +7983,7 @@
      "path": "crates/blaze-spin"
     },
     "blaze-stencil": {
+     "default-features": false,
      "path": "crates/blaze-stencil"
     },
     "blaze-store-check": {
@@ -7815,6 +8006,9 @@
     },
     "blaze-vfs": {
      "path": "crates/blaze-vfs"
+    },
+    "blaze-wasi": {
+     "path": "crates/blaze-wasi"
     },
     "blaze-wasm-pack": {
      "path": "crates/blaze-wasm-pack"
@@ -7933,7 +8127,12 @@
      "version": "0.0.0"
     },
     "hir-ty-codegen": {
+     "default-features": false,
      "path": "crates/hir-ty-codegen"
+    },
+    "hir-ty-coherence": {
+     "path": "crates/hir-ty-coherence",
+     "version": "0.0.0"
     },
     "hir-ty-comptime": {
      "path": "crates/hir-ty-comptime",
@@ -7990,6 +8189,7 @@
      "path": "crates/hir-ty-wfcheck",
      "version": "0.0.0"
     },
+    "http": "1.5.0",
     "http-body-util": "0.1.5",
     "hyper": {
      "default-features": false,
@@ -8058,10 +8258,6 @@
      "version": "0.0.0"
     },
     "memchr": "2.8.3",
-    "mimalloc": {
-     "default-features": false,
-     "version": "0.1.52"
-    },
     "object": {
      "default-features": false,
      "features": [
@@ -8146,6 +8342,14 @@
      "version": "1.13.1"
     },
     "ring": "0.17",
+    "rsasm": {
+     "default-features": false,
+     "features": [
+      "x86",
+      "aarch64"
+     ],
+     "version": "=0.1.3"
+    },
     "rustc-demangle": "0.1.28",
     "rustc-literal-escaper": "0.0.8",
     "rustc-stable-hash": "0.1.2",
@@ -8391,12 +8595,16 @@
     "vendor/hegeltest-c",
     "vendor/hegeltest-macros",
     "vendor/sonic-rs",
+    "vendor/arrow-buffer",
     "vendor/blake3-servil",
+    "vendor/wasmtime",
     "vendor/verus/air",
     "vendor/verus/vir",
     "vendor/verus/vir_macros",
     "vendor/verus/builtin",
-    "vendor/verus/vstd"
+    "vendor/verus/vstd",
+    "vendor/zstd-sys",
+    "vendor/libzstd-rs-sys"
    ],
    "lints": {
     "cargo": {
@@ -8938,8 +9146,8 @@
    "repository": "https://github.com/apache/arrow-rs",
    "rust_version": "1.88",
    "source": {
-    "checksum": "7bd46a530bc1a8e763102fc36c1dc0f51f3ffa150c78e7f5658ccb54b1458ade",
-    "kind": "registry"
+    "dir": "vendor/arrow-buffer",
+    "kind": "path"
    },
    "version": "60.1.0"
   },
@@ -9483,6 +9691,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-ci",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-codegen-code@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "The content identities of blaze's code generator and of its trait solver, worked out by a build script over the checkout: what stored templates and stored solver answers are keyed by",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-codegen-code",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-codegen-code",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -10269,6 +10494,23 @@
    },
    "version": "0.0.0"
   },
+  "blaze-seed-run@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "The bootstrap seed's runner: runs blaze-seed.wasm (memory64) under Wasmtime with blaze's WASI host at 64-bit pointers, a linear memory reserved whole and committed only where touched, and a decommit import for blaze-mem (todo/bootstrap/plan.md)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-seed-run",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-seed-run",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "blaze-serde-derive@0.0.0": {
    "authors": "blaze contributors",
    "description": "derive(Serialize) and derive(Deserialize) for serde's traits, read from proc_macro's tokens with no syn, quote or proc-macro2, so blaze's macro engine runs it cheaply",
@@ -10520,6 +10762,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-vfs",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-wasi@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "WASI preview 1 as blaze serves it to a wasm guest: one implementation of every call's memory layout, for 32-bit (wasm32-wasip1) and 64-bit (memory64) pointers, over a System that says what each call does (the macro sandbox's, the seed runner's)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-wasi",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-wasi",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -12904,6 +13163,23 @@
    },
    "version": "0.0.0"
   },
+  "hir-ty-coherence@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's sealed-trait relaxation of the orphan rules (`#[blaze::sealed]`): the checks that keep it coherent.",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "hir-ty-coherence",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/hir-ty-coherence",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "hir-ty-comptime@0.0.0": {
    "authors": "blaze contributors",
    "description": "The domain of `#![feature(blaze_comptime)]` reflection: which fields and variants `for<F: Field<T>>`, `fields_of` and the solver's builtin `Struct`/`Enum`/`Field`/`Variant` candidates range over.",
@@ -13499,6 +13775,23 @@
    },
    "version": "2.2.0"
   },
+  "id-arena@2.3.0": {
+   "authors": "Nick Fitzgerald <fitzgen@gmail.com>:Aleksey Kladov <aleksey.kladov@gmail.com>",
+   "description": "A simple, id-based arena.",
+   "homepage": "",
+   "license": "MIT/Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "id-arena",
+   "readme": "README.md",
+   "repository": "https://github.com/fitzgen/id-arena",
+   "rust_version": "",
+   "source": {
+    "checksum": "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954",
+    "kind": "registry"
+   },
+   "version": "2.3.0"
+  },
   "ident_case@1.0.1": {
    "authors": "Ted Driggs <ted.driggs@outlook.com>",
    "description": "Utility for applying case rules to Rust identifiers.",
@@ -13992,6 +14285,23 @@
    },
    "version": "0.1.49"
   },
+  "libzstd-rs-sys@0.0.1-prerelease.2": {
+   "authors": "",
+   "description": "a rust implementation of zstd compression and decompression",
+   "homepage": "",
+   "license": "BSD-3-Clause",
+   "license_file": "",
+   "links": null,
+   "name": "libzstd-rs-sys",
+   "readme": "README.md",
+   "repository": "https://github.com/trifectatechfoundation/libzstd-rs-sys",
+   "rust_version": "1.95",
+   "source": {
+    "dir": "vendor/libzstd-rs-sys",
+    "kind": "path"
+   },
+   "version": "0.0.1-prerelease.2"
+  },
   "line-clipping@0.3.8": {
    "authors": "Josh McKinney",
    "description": "A simple crate implementing line and polygon clipping algorithms.",
@@ -14280,23 +14590,6 @@
     "kind": "registry"
    },
    "version": "0.9.1"
-  },
-  "mimalloc@0.1.52": {
-   "authors": "Octavian Oncescu <octavonce@gmail.com>:Vincent Rouill\u00e9 <vincent@speedy37.fr>:Thom Chiovoloni <chiovolonit@gmail.com>",
-   "description": "Performance and security oriented drop-in allocator",
-   "homepage": "",
-   "license": "MIT",
-   "license_file": "",
-   "links": null,
-   "name": "mimalloc",
-   "readme": "README.md",
-   "repository": "https://github.com/purpleprotocol/mimalloc_rust",
-   "rust_version": "",
-   "source": {
-    "checksum": "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862",
-    "kind": "registry"
-   },
-   "version": "0.1.52"
   },
   "minimal-lexical@0.2.1": {
    "authors": "Alex Huszagh <ahuszagh@gmail.com>",
@@ -18310,6 +18603,23 @@
    },
    "version": "0.263.0"
   },
+  "wasm-metadata@0.261.0": {
+   "authors": "",
+   "description": "Read and manipulate WebAssembly metadata",
+   "homepage": "",
+   "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+   "license_file": "",
+   "links": null,
+   "name": "wasm-metadata",
+   "readme": "README.md",
+   "repository": "https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasm-metadata",
+   "rust_version": "1.88.0",
+   "source": {
+    "checksum": "b88de21560ecd49deb8d8f1616b9b695f66fc312c5eca503f43accdc5795339e",
+    "kind": "registry"
+   },
+   "version": "0.261.0"
+  },
   "wasmparser@0.261.0": {
    "authors": "Yury Delendik <ydelendik@mozilla.com>",
    "description": "A simple event-driven library for parsing WebAssembly binary files.\n",
@@ -18374,6 +18684,23 @@
    "rust_version": "1.97.0",
    "source": {
     "checksum": "f79df81f2a5d7a1cb8b9eb35b4a2d7a8cb8e948bd3e5a1f79036c0094879275a",
+    "kind": "registry"
+   },
+   "version": "50.0.1"
+  },
+  "wasmtime-internal-component-macro@50.0.1": {
+   "authors": "The Wasmtime Project Developers",
+   "description": "INTERNAL: Macros for deriving component interface types from Rust types",
+   "homepage": "",
+   "license": "Apache-2.0 WITH LLVM-exception",
+   "license_file": "",
+   "links": null,
+   "name": "wasmtime-internal-component-macro",
+   "readme": "",
+   "repository": "https://github.com/bytecodealliance/wasmtime",
+   "rust_version": "1.97.0",
+   "source": {
+    "checksum": "61479c89e12c716cc7a962e68574c01f3cf8bfd27fbeb6fc477b27b5096b8350",
     "kind": "registry"
    },
    "version": "50.0.1"
@@ -18514,6 +18841,23 @@
    },
    "version": "50.0.1"
   },
+  "wasmtime-internal-wit-bindgen@50.0.1": {
+   "authors": "The Wasmtime Project Developers",
+   "description": "INTERNAL: `*.wit` support for the `wasmtime` crate's macros",
+   "homepage": "",
+   "license": "Apache-2.0 WITH LLVM-exception",
+   "license_file": "",
+   "links": null,
+   "name": "wasmtime-internal-wit-bindgen",
+   "readme": "",
+   "repository": "https://github.com/bytecodealliance/wasmtime",
+   "rust_version": "1.97.0",
+   "source": {
+    "checksum": "6df6397ebf5957c9d9c6001b7d9cd1586113f3556e7d1f9e0457c7166cf0a1da",
+    "kind": "registry"
+   },
+   "version": "50.0.1"
+  },
   "wasmtime@50.0.1": {
    "authors": "The Wasmtime Project Developers",
    "description": "High-level API to expose the Wasmtime runtime",
@@ -18526,8 +18870,8 @@
    "repository": "https://github.com/bytecodealliance/wasmtime",
    "rust_version": "1.97.0",
    "source": {
-    "checksum": "fdfacce893df54d319b29720e79edb001cd1b48faaf78fdb3b9c608eaeeea29f",
-    "kind": "registry"
+    "dir": "vendor/wasmtime",
+    "kind": "path"
    },
    "version": "50.0.1"
   },
@@ -19007,6 +19351,40 @@
    },
    "version": "0.57.1"
   },
+  "wit-component@0.261.0": {
+   "authors": "Peter Huene <peter@huene.dev>",
+   "description": "Tooling for working with `*.wit` and component files together.\n",
+   "homepage": "",
+   "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+   "license_file": "",
+   "links": null,
+   "name": "wit-component",
+   "readme": "README.md",
+   "repository": "https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-component",
+   "rust_version": "1.88.0",
+   "source": {
+    "checksum": "2818766842bd2321074c348fb5c15d8fdb105a9eb78374e6d77c7d4127e1f2f9",
+    "kind": "registry"
+   },
+   "version": "0.261.0"
+  },
+  "wit-parser@0.261.0": {
+   "authors": "Alex Crichton <alex@alexcrichton.com>",
+   "description": "Tooling for parsing `*.wit` files and working with their contents.\n",
+   "homepage": "",
+   "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+   "license_file": "",
+   "links": null,
+   "name": "wit-parser",
+   "readme": "README.md",
+   "repository": "https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-parser",
+   "rust_version": "1.88.0",
+   "source": {
+    "checksum": "962e43c4db2da607b50839a531e5b63473268b40efdf8028d5c54b572ca4f6f6",
+    "kind": "registry"
+   },
+   "version": "0.261.0"
+  },
   "writeable@0.6.3": {
    "authors": "The ICU4X Project Developers",
    "description": "A more efficient alternative to fmt::Display",
@@ -19359,8 +19737,8 @@
    "repository": "https://github.com/gyscos/zstd-rs",
    "rust_version": "1.64",
    "source": {
-    "checksum": "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3",
-    "kind": "registry"
+    "dir": "vendor/zstd-sys",
+    "kind": "path"
    },
    "version": "2.1.2+zstd.1.5.7"
   },
@@ -20718,6 +21096,10 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
       }
      ],
      "edition": "2024",
@@ -20760,7 +21142,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -20816,7 +21198,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -20881,10 +21263,6 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
-      },
-      {
-       "name": "cpufeatures",
-       "unit": "cpufeatures@0.3.1 lib cpufeatures build host"
       }
      ],
      "edition": "2024",
@@ -20900,7 +21278,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -21027,7 +21405,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -21047,7 +21430,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build host": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build host"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -21069,7 +21457,15 @@
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-cargo@0.0.0",
@@ -21098,7 +21494,15 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-cargo@0.0.0",
@@ -21432,14 +21836,18 @@
       {
        "name": "zip",
        "unit": "zip@9.1.3 lib zip build"
-      },
-      {
-       "name": "zstd",
-       "unit": "zstd@0.14.3 lib zstd build"
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-cargo@0.0.0",
@@ -21527,6 +21935,39 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_cas"
+    },
+    "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blake3",
+       "unit": "blake3@1.8.7 lib blake3 build host"
+      },
+      {
+       "name": "glob",
+       "unit": "glob@0.3.4 lib glob build host"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.1.8+spec-1.1.0 lib toml build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-codegen-code@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_codegen_code"
     },
     "blaze-codegen@0.0.0 lib blaze_codegen build": {
      "crate_type": "lib",
@@ -21843,6 +22284,10 @@
        "unit": "syntax@0.0.0 lib syntax build"
       },
       {
+       "name": "tt",
+       "unit": "tt@0.0.0 lib tt build"
+      },
+      {
        "name": "unicode_ident",
        "unit": "unicode-ident@1.0.24 lib unicode_ident build"
       },
@@ -21886,6 +22331,10 @@
       {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
        "name": "either",
@@ -22009,6 +22458,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -22045,12 +22498,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -22070,7 +22523,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "bin",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -22142,6 +22604,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -22178,12 +22644,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -22203,7 +22669,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "bin",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -22221,9 +22696,23 @@
     },
     "blaze-engine@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_codegen_code",
+       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
+      }
+     ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -22252,7 +22741,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-engine@0.0.0",
@@ -22320,6 +22818,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -22356,12 +22858,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -22381,7 +22883,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -22555,6 +23066,10 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
        "name": "tracing",
        "unit": "tracing@0.1.44 lib tracing build"
       }
@@ -22645,7 +23160,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "net"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-global@0.0.0",
@@ -22695,6 +23212,10 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "blaze_rng",
+       "unit": "blaze-rng@0.0.0 lib blaze_rng build"
       },
       {
        "name": "blaze_serde",
@@ -23376,6 +23897,10 @@
       {
        "name": "syntax",
        "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",
@@ -23487,7 +24012,7 @@
      "edition": "2024",
      "features": [
       "daemon",
-      "default"
+      "llvm-stencils"
      ],
      "kind": "lib",
      "mode": "build",
@@ -23581,7 +24106,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-link@0.0.0",
@@ -23868,6 +24395,10 @@
        "unit": "span@0.0.0 lib span build"
       },
       {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
        "name": "toml",
        "unit": "toml@1.1.8+spec-1.1.0 lib toml build"
       },
@@ -23925,6 +24456,10 @@
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
       {
+       "name": "blaze_items",
+       "unit": "blaze-items@0.0.0 lib blaze_items build"
+      },
+      {
        "name": "blaze_lower",
        "unit": "blaze-lower@0.0.0 lib blaze_lower build"
       },
@@ -23939,6 +24474,10 @@
       {
        "name": "blaze_usercode",
        "unit": "blaze-usercode@0.0.0 lib blaze_usercode build"
+      },
+      {
+       "name": "blaze_wasi",
+       "unit": "blaze-wasi@0.0.0 lib blaze_wasi build"
       },
       {
        "name": "cfg",
@@ -24135,10 +24674,6 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
       },
@@ -24174,10 +24709,6 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build host"
-      },
-      {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build host"
       },
       {
        "name": "crossbeam_channel",
@@ -24245,6 +24776,10 @@
        "unit": "arrow-schema@60.1.0 lib arrow_schema build"
       },
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_graph",
        "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
@@ -24299,6 +24834,10 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "thiserror",
@@ -24448,6 +24987,10 @@
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "either",
        "unit": "either@1.19.0 lib either build"
       },
@@ -24478,6 +25021,10 @@
       {
        "name": "thin_vec",
        "unit": "thin-vec@0.2.21 lib thin_vec build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       },
       {
        "name": "triomphe",
@@ -24641,6 +25188,10 @@
        "unit": "http-body-util@0.1.5 lib http_body_util build"
       },
       {
+       "name": "http",
+       "unit": "http@1.5.0 lib http build"
+      },
+      {
        "name": "hyper_rustls",
        "unit": "hyper-rustls@0.27.10 lib hyper_rustls build"
       },
@@ -24681,6 +25232,10 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
        "name": "tar",
        "unit": "tar@0.4.46 lib tar build"
       },
@@ -24698,7 +25253,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "net"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-registry@0.0.0",
@@ -24998,26 +25555,6 @@
      "src": "src/lib.rs",
      "target": "blaze_spin"
     },
-    "blaze-spin@0.0.0 lib blaze_spin build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-spin@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_spin"
-    },
     "blaze-stencil@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
@@ -25039,7 +25576,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-stencil@0.0.0",
@@ -25064,7 +25603,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-stencil@0.0.0",
@@ -25117,7 +25658,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-stencil@0.0.0",
@@ -25613,6 +26156,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_vfs"
+    },
+    "blaze-wasi@0.0.0 lib blaze_wasi build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "wasmtime",
+       "unit": "wasmtime@50.0.1 lib wasmtime build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-wasi@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_wasi"
     },
     "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build": {
      "crate_type": "lib",
@@ -26723,26 +27291,6 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "cpufeatures"
-    },
-    "cpufeatures@0.3.1 lib cpufeatures build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "cpufeatures@0.3.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -29657,6 +30205,26 @@
      "src": "src/lib.rs",
      "target": "glob"
     },
+    "glob@0.3.4 lib glob build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "glob@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "glob"
+    },
     "half@2.7.1 lib half build": {
      "crate_type": "lib",
      "deps": [
@@ -30441,7 +31009,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "hir-ty-codegen@0.0.0",
@@ -30456,6 +31026,55 @@
      },
      "src": "mod.rs",
      "target": "hir_ty_codegen"
+    },
+    "hir-ty-coherence@0.0.0 lib hir_ty_coherence build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "either",
+       "unit": "either@1.19.0 lib either build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-coherence@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_coherence"
     },
     "hir-ty-comptime@0.0.0 lib hir_ty_comptime build": {
      "crate_type": "lib",
@@ -31020,6 +31639,10 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
        "name": "hir_def",
        "unit": "hir-def@0.0.0 lib hir_def build"
       },
@@ -31189,6 +31812,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
        "name": "either",
@@ -31366,6 +31993,56 @@
      "src": "src/lib.rs",
      "target": "hir_ty_wfcheck"
     },
+    "hir-ty@0.0.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "blaze_codegen_code",
+       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "hir-ty@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "hir-ty@0.0.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "hir-ty@0.0.0 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "hir-ty@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "hir-ty@0.0.0 lib hir_ty build": {
      "crate_type": "lib",
      "deps": [
@@ -31388,6 +32065,10 @@
       {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_hash",
@@ -31452,6 +32133,10 @@
       {
        "name": "hir_ty_comptime",
        "unit": "hir-ty-comptime@0.0.0 lib hir_ty_comptime build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "hir-ty@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "indexmap",
@@ -31621,6 +32306,10 @@
       {
        "name": "hir_ty_borrowck",
        "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty_coherence",
+       "unit": "hir-ty-coherence@0.0.0 lib hir_ty_coherence build"
       },
       {
        "name": "hir_ty_matchck",
@@ -34168,31 +34857,6 @@
      },
      "src": "src/lib.rs",
      "target": "memchr"
-    },
-    "mimalloc@0.1.52 lib mimalloc build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libmimalloc_sys",
-       "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
-      }
-     ],
-     "edition": "2018",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "mimalloc@0.1.52",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "mimalloc"
     },
     "minimal-lexical@0.2.1 lib minimal_lexical build": {
      "crate_type": "lib",
@@ -37809,6 +38473,10 @@
        "unit": "bitflags@2.13.2 lib bitflags build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
@@ -37823,6 +38491,10 @@
       {
        "name": "indexmap",
        "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "rustc_ast_ir",
@@ -38926,11 +39598,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
+    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,result,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -38985,11 +39658,12 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,result,std"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -39049,6 +39723,7 @@
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -39220,6 +39895,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
+    "serde_spanned@1.1.2 lib serde_spanned build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -40050,6 +40754,10 @@
       {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "stacker",
@@ -41135,10 +41843,6 @@
        "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
       },
       {
-       "name": "signal_hook_registry",
-       "unit": "signal-hook-registry@1.4.8 lib signal_hook_registry build"
-      },
-      {
        "name": "socket2",
        "unit": "socket2@0.6.5 lib socket2 build"
       },
@@ -41159,8 +41863,6 @@
       "net",
       "rt",
       "rt-multi-thread",
-      "signal",
-      "signal-hook-registry",
       "socket2",
       "sync",
       "time",
@@ -41237,6 +41939,57 @@
      "src": "src/lib.rs",
      "target": "toml"
     },
+    "toml@1.1.8+spec-1.1.0 lib toml build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build host"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build host"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.1.8+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
     "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
      "crate_type": "lib",
      "deps": [
@@ -41261,6 +42014,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -41340,6 +42122,34 @@
      "src": "src/lib.rs",
      "target": "toml_parser"
     },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
     "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build": {
      "crate_type": "lib",
      "deps": [],
@@ -41358,6 +42168,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
+    "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.1.3+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -41676,6 +42509,10 @@
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "blaze_phf",
+       "unit": "blaze-phf@0.0.0 lib blaze_phf build"
       },
       {
        "name": "intern",
@@ -43211,6 +44048,26 @@
      "src": "src/lib.rs",
      "target": "winnow"
     },
+    "winnow@1.0.4 lib winnow build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
+    },
     "writeable@0.6.3 lib writeable build": {
      "crate_type": "lib",
      "deps": [],
@@ -43981,8 +44838,6 @@
      "deps": [],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -44016,8 +44871,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -44051,8 +44904,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -44086,7 +44937,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -44116,7 +44966,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -44146,7 +44995,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -44176,9 +45024,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "default",
-      "legacy",
       "zdict_builder",
       "zstdmt"
      ],
@@ -45534,6 +46379,10 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
       }
      ],
      "edition": "2024",
@@ -45576,7 +46425,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -45632,7 +46481,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -45697,10 +46546,6 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
-      },
-      {
-       "name": "cpufeatures",
-       "unit": "cpufeatures@0.3.1 lib cpufeatures build host"
       }
      ],
      "edition": "2024",
@@ -45716,7 +46561,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -45843,7 +46688,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -45863,7 +46713,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build host": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build host"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -45885,7 +46740,15 @@
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-cargo@0.0.0",
@@ -45914,7 +46777,15 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-cargo@0.0.0",
@@ -46248,14 +47119,18 @@
       {
        "name": "zip",
        "unit": "zip@9.1.3 lib zip build"
-      },
-      {
-       "name": "zstd",
-       "unit": "zstd@0.14.3 lib zstd build"
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-cargo@0.0.0",
@@ -46343,6 +47218,39 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_cas"
+    },
+    "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blake3",
+       "unit": "blake3@1.8.7 lib blake3 build host"
+      },
+      {
+       "name": "glob",
+       "unit": "glob@0.3.4 lib glob build host"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.1.8+spec-1.1.0 lib toml build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-codegen-code@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_codegen_code"
     },
     "blaze-codegen@0.0.0 lib blaze_codegen build": {
      "crate_type": "lib",
@@ -46659,6 +47567,10 @@
        "unit": "syntax@0.0.0 lib syntax build"
       },
       {
+       "name": "tt",
+       "unit": "tt@0.0.0 lib tt build"
+      },
+      {
        "name": "unicode_ident",
        "unit": "unicode-ident@1.0.24 lib unicode_ident build"
       },
@@ -46702,6 +47614,10 @@
       {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
        "name": "either",
@@ -46825,6 +47741,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -46861,12 +47781,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -46886,7 +47806,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "bin",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -46958,6 +47887,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -46994,12 +47927,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -47019,7 +47952,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "bin",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -47037,9 +47979,23 @@
     },
     "blaze-engine@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_codegen_code",
+       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
+      }
+     ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -47068,7 +48024,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-engine@0.0.0",
@@ -47136,6 +48101,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -47172,12 +48141,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -47197,7 +48166,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -47371,6 +48349,10 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
        "name": "tracing",
        "unit": "tracing@0.1.44 lib tracing build"
       }
@@ -47461,7 +48443,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "net"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-global@0.0.0",
@@ -47511,6 +48495,10 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "blaze_rng",
+       "unit": "blaze-rng@0.0.0 lib blaze_rng build"
       },
       {
        "name": "blaze_serde",
@@ -48192,6 +49180,10 @@
       {
        "name": "syntax",
        "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",
@@ -48303,7 +49295,7 @@
      "edition": "2024",
      "features": [
       "daemon",
-      "default"
+      "llvm-stencils"
      ],
      "kind": "lib",
      "mode": "build",
@@ -48397,7 +49389,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-link@0.0.0",
@@ -48684,6 +49678,10 @@
        "unit": "span@0.0.0 lib span build"
       },
       {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
        "name": "toml",
        "unit": "toml@1.1.8+spec-1.1.0 lib toml build"
       },
@@ -48741,6 +49739,10 @@
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
       {
+       "name": "blaze_items",
+       "unit": "blaze-items@0.0.0 lib blaze_items build"
+      },
+      {
        "name": "blaze_lower",
        "unit": "blaze-lower@0.0.0 lib blaze_lower build"
       },
@@ -48755,6 +49757,10 @@
       {
        "name": "blaze_usercode",
        "unit": "blaze-usercode@0.0.0 lib blaze_usercode build"
+      },
+      {
+       "name": "blaze_wasi",
+       "unit": "blaze-wasi@0.0.0 lib blaze_wasi build"
       },
       {
        "name": "cfg",
@@ -48951,10 +49957,6 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
       },
@@ -48990,10 +49992,6 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build host"
-      },
-      {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build host"
       },
       {
        "name": "crossbeam_channel",
@@ -49061,6 +50059,10 @@
        "unit": "arrow-schema@60.1.0 lib arrow_schema build"
       },
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_graph",
        "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
@@ -49115,6 +50117,10 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "thiserror",
@@ -49264,6 +50270,10 @@
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "either",
        "unit": "either@1.19.0 lib either build"
       },
@@ -49294,6 +50304,10 @@
       {
        "name": "thin_vec",
        "unit": "thin-vec@0.2.21 lib thin_vec build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       },
       {
        "name": "triomphe",
@@ -49457,6 +50471,10 @@
        "unit": "http-body-util@0.1.5 lib http_body_util build"
       },
       {
+       "name": "http",
+       "unit": "http@1.5.0 lib http build"
+      },
+      {
        "name": "hyper_rustls",
        "unit": "hyper-rustls@0.27.10 lib hyper_rustls build"
       },
@@ -49497,6 +50515,10 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
        "name": "tar",
        "unit": "tar@0.4.46 lib tar build"
       },
@@ -49514,7 +50536,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "net"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-registry@0.0.0",
@@ -49814,26 +50838,6 @@
      "src": "src/lib.rs",
      "target": "blaze_spin"
     },
-    "blaze-spin@0.0.0 lib blaze_spin build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-spin@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_spin"
-    },
     "blaze-stencil@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
@@ -49855,7 +50859,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-stencil@0.0.0",
@@ -49880,7 +50886,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-stencil@0.0.0",
@@ -49933,7 +50941,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-stencil@0.0.0",
@@ -50429,6 +51439,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_vfs"
+    },
+    "blaze-wasi@0.0.0 lib blaze_wasi build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "wasmtime",
+       "unit": "wasmtime@50.0.1 lib wasmtime build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-wasi@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_wasi"
     },
     "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build": {
      "crate_type": "lib",
@@ -51484,26 +52519,6 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "cpufeatures"
-    },
-    "cpufeatures@0.3.1 lib cpufeatures build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "cpufeatures@0.3.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -54414,6 +55429,26 @@
      "src": "src/lib.rs",
      "target": "glob"
     },
+    "glob@0.3.4 lib glob build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "glob@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "glob"
+    },
     "half@2.7.1 lib half build": {
      "crate_type": "lib",
      "deps": [
@@ -55198,7 +56233,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "hir-ty-codegen@0.0.0",
@@ -55213,6 +56250,55 @@
      },
      "src": "mod.rs",
      "target": "hir_ty_codegen"
+    },
+    "hir-ty-coherence@0.0.0 lib hir_ty_coherence build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "either",
+       "unit": "either@1.19.0 lib either build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-coherence@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_coherence"
     },
     "hir-ty-comptime@0.0.0 lib hir_ty_comptime build": {
      "crate_type": "lib",
@@ -55777,6 +56863,10 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
        "name": "hir_def",
        "unit": "hir-def@0.0.0 lib hir_def build"
       },
@@ -55946,6 +57036,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
        "name": "either",
@@ -56123,6 +57217,56 @@
      "src": "src/lib.rs",
      "target": "hir_ty_wfcheck"
     },
+    "hir-ty@0.0.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "blaze_codegen_code",
+       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "hir-ty@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "hir-ty@0.0.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "hir-ty@0.0.0 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "hir-ty@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "hir-ty@0.0.0 lib hir_ty build": {
      "crate_type": "lib",
      "deps": [
@@ -56145,6 +57289,10 @@
       {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_hash",
@@ -56209,6 +57357,10 @@
       {
        "name": "hir_ty_comptime",
        "unit": "hir-ty-comptime@0.0.0 lib hir_ty_comptime build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "hir-ty@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "indexmap",
@@ -56378,6 +57530,10 @@
       {
        "name": "hir_ty_borrowck",
        "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty_coherence",
+       "unit": "hir-ty-coherence@0.0.0 lib hir_ty_coherence build"
       },
       {
        "name": "hir_ty_matchck",
@@ -58924,31 +60080,6 @@
      },
      "src": "src/lib.rs",
      "target": "memfd"
-    },
-    "mimalloc@0.1.52 lib mimalloc build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libmimalloc_sys",
-       "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
-      }
-     ],
-     "edition": "2018",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "mimalloc@0.1.52",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "mimalloc"
     },
     "minimal-lexical@0.2.1 lib minimal_lexical build": {
      "crate_type": "lib",
@@ -62487,6 +63618,10 @@
        "unit": "bitflags@2.13.2 lib bitflags build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
@@ -62501,6 +63636,10 @@
       {
        "name": "indexmap",
        "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "rustc_ast_ir",
@@ -63525,11 +64664,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
+    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,result,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -63584,11 +64724,12 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,result,std"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -63648,6 +64789,7 @@
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -63819,6 +64961,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
+    "serde_spanned@1.1.2 lib serde_spanned build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -64649,6 +65820,10 @@
       {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "stacker",
@@ -65734,10 +66909,6 @@
        "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
       },
       {
-       "name": "signal_hook_registry",
-       "unit": "signal-hook-registry@1.4.8 lib signal_hook_registry build"
-      },
-      {
        "name": "socket2",
        "unit": "socket2@0.6.5 lib socket2 build"
       },
@@ -65758,8 +66929,6 @@
       "net",
       "rt",
       "rt-multi-thread",
-      "signal",
-      "signal-hook-registry",
       "socket2",
       "sync",
       "time",
@@ -65836,6 +67005,57 @@
      "src": "src/lib.rs",
      "target": "toml"
     },
+    "toml@1.1.8+spec-1.1.0 lib toml build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build host"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build host"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.1.8+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
     "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
      "crate_type": "lib",
      "deps": [
@@ -65860,6 +67080,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -65939,6 +67188,34 @@
      "src": "src/lib.rs",
      "target": "toml_parser"
     },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
     "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build": {
      "crate_type": "lib",
      "deps": [],
@@ -65957,6 +67234,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
+    "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.1.3+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -66275,6 +67575,10 @@
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "blaze_phf",
+       "unit": "blaze-phf@0.0.0 lib blaze_phf build"
       },
       {
        "name": "intern",
@@ -67814,6 +69118,26 @@
      "src": "src/lib.rs",
      "target": "winnow"
     },
+    "winnow@1.0.4 lib winnow build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
+    },
     "writeable@0.6.3 lib writeable build": {
      "crate_type": "lib",
      "deps": [],
@@ -68580,8 +69904,6 @@
      "deps": [],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -68615,8 +69937,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -68650,8 +69970,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -68685,7 +70003,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -68715,7 +70032,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -68745,7 +70061,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -68775,9 +70090,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "default",
-      "legacy",
       "zdict_builder",
       "zstdmt"
      ],
@@ -70063,6 +71375,10 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
       }
      ],
      "edition": "2024",
@@ -70105,7 +71421,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -70161,7 +71477,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -70230,10 +71546,6 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
-      },
-      {
-       "name": "cpufeatures",
-       "unit": "cpufeatures@0.3.1 lib cpufeatures build host"
       }
      ],
      "edition": "2024",
@@ -70249,7 +71561,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -70376,7 +71688,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -70396,7 +71713,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build host": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build host"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -70418,7 +71740,15 @@
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-cargo@0.0.0",
@@ -70447,7 +71777,15 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-cargo@0.0.0",
@@ -70781,14 +72119,18 @@
       {
        "name": "zip",
        "unit": "zip@9.1.3 lib zip build"
-      },
-      {
-       "name": "zstd",
-       "unit": "zstd@0.14.3 lib zstd build"
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-cargo@0.0.0",
@@ -70876,6 +72218,39 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_cas"
+    },
+    "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blake3",
+       "unit": "blake3@1.8.7 lib blake3 build host"
+      },
+      {
+       "name": "glob",
+       "unit": "glob@0.3.4 lib glob build host"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.1.8+spec-1.1.0 lib toml build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-codegen-code@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_codegen_code"
     },
     "blaze-codegen@0.0.0 lib blaze_codegen build": {
      "crate_type": "lib",
@@ -71192,6 +72567,10 @@
        "unit": "syntax@0.0.0 lib syntax build"
       },
       {
+       "name": "tt",
+       "unit": "tt@0.0.0 lib tt build"
+      },
+      {
        "name": "unicode_ident",
        "unit": "unicode-ident@1.0.24 lib unicode_ident build"
       },
@@ -71235,6 +72614,10 @@
       {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
        "name": "either",
@@ -71358,6 +72741,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -71394,12 +72781,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -71419,7 +72806,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "bin",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -71491,6 +72887,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -71527,12 +72927,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -71552,7 +72952,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "bin",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -71570,9 +72979,23 @@
     },
     "blaze-engine@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_codegen_code",
+       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
+      }
+     ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -71601,7 +73024,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-engine@0.0.0",
@@ -71669,6 +73101,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -71705,12 +73141,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -71730,7 +73166,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -71904,6 +73349,10 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
        "name": "tracing",
        "unit": "tracing@0.1.44 lib tracing build"
       }
@@ -71994,7 +73443,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "net"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-global@0.0.0",
@@ -72044,6 +73495,10 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "blaze_rng",
+       "unit": "blaze-rng@0.0.0 lib blaze_rng build"
       },
       {
        "name": "blaze_serde",
@@ -72721,6 +74176,10 @@
       {
        "name": "syntax",
        "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",
@@ -72832,7 +74291,7 @@
      "edition": "2024",
      "features": [
       "daemon",
-      "default"
+      "llvm-stencils"
      ],
      "kind": "lib",
      "mode": "build",
@@ -72926,7 +74385,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-link@0.0.0",
@@ -73213,6 +74674,10 @@
        "unit": "span@0.0.0 lib span build"
       },
       {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
        "name": "toml",
        "unit": "toml@1.1.8+spec-1.1.0 lib toml build"
       },
@@ -73270,6 +74735,10 @@
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
       {
+       "name": "blaze_items",
+       "unit": "blaze-items@0.0.0 lib blaze_items build"
+      },
+      {
        "name": "blaze_lower",
        "unit": "blaze-lower@0.0.0 lib blaze_lower build"
       },
@@ -73284,6 +74753,10 @@
       {
        "name": "blaze_usercode",
        "unit": "blaze-usercode@0.0.0 lib blaze_usercode build"
+      },
+      {
+       "name": "blaze_wasi",
+       "unit": "blaze-wasi@0.0.0 lib blaze_wasi build"
       },
       {
        "name": "cfg",
@@ -73480,10 +74953,6 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
       },
@@ -73519,10 +74988,6 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build host"
-      },
-      {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build host"
       },
       {
        "name": "crossbeam_channel",
@@ -73590,6 +75055,10 @@
        "unit": "arrow-schema@60.1.0 lib arrow_schema build"
       },
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_graph",
        "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
@@ -73644,6 +75113,10 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "thiserror",
@@ -73793,6 +75266,10 @@
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "either",
        "unit": "either@1.19.0 lib either build"
       },
@@ -73823,6 +75300,10 @@
       {
        "name": "thin_vec",
        "unit": "thin-vec@0.2.21 lib thin_vec build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       },
       {
        "name": "triomphe",
@@ -73986,6 +75467,10 @@
        "unit": "http-body-util@0.1.5 lib http_body_util build"
       },
       {
+       "name": "http",
+       "unit": "http@1.5.0 lib http build"
+      },
+      {
        "name": "hyper_rustls",
        "unit": "hyper-rustls@0.27.10 lib hyper_rustls build"
       },
@@ -74026,6 +75511,10 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
        "name": "tar",
        "unit": "tar@0.4.46 lib tar build"
       },
@@ -74043,7 +75532,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "net"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-registry@0.0.0",
@@ -74343,26 +75834,6 @@
      "src": "src/lib.rs",
      "target": "blaze_spin"
     },
-    "blaze-spin@0.0.0 lib blaze_spin build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-spin@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_spin"
-    },
     "blaze-stencil@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
@@ -74384,7 +75855,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-stencil@0.0.0",
@@ -74409,7 +75882,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-stencil@0.0.0",
@@ -74462,7 +75937,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-stencil@0.0.0",
@@ -74958,6 +76435,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_vfs"
+    },
+    "blaze-wasi@0.0.0 lib blaze_wasi build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "wasmtime",
+       "unit": "wasmtime@50.0.1 lib wasmtime build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-wasi@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_wasi"
     },
     "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build": {
      "crate_type": "lib",
@@ -76062,26 +77564,6 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "cpufeatures"
-    },
-    "cpufeatures@0.3.1 lib cpufeatures build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "cpufeatures@0.3.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -78992,6 +80474,26 @@
      "src": "src/lib.rs",
      "target": "glob"
     },
+    "glob@0.3.4 lib glob build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "glob@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "glob"
+    },
     "half@2.7.1 lib half build": {
      "crate_type": "lib",
      "deps": [
@@ -79776,7 +81278,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "hir-ty-codegen@0.0.0",
@@ -79791,6 +81295,55 @@
      },
      "src": "mod.rs",
      "target": "hir_ty_codegen"
+    },
+    "hir-ty-coherence@0.0.0 lib hir_ty_coherence build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "either",
+       "unit": "either@1.19.0 lib either build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-coherence@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_coherence"
     },
     "hir-ty-comptime@0.0.0 lib hir_ty_comptime build": {
      "crate_type": "lib",
@@ -80355,6 +81908,10 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
        "name": "hir_def",
        "unit": "hir-def@0.0.0 lib hir_def build"
       },
@@ -80524,6 +82081,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
        "name": "either",
@@ -80701,6 +82262,56 @@
      "src": "src/lib.rs",
      "target": "hir_ty_wfcheck"
     },
+    "hir-ty@0.0.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "blaze_codegen_code",
+       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "hir-ty@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "hir-ty@0.0.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "hir-ty@0.0.0 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "hir-ty@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "hir-ty@0.0.0 lib hir_ty build": {
      "crate_type": "lib",
      "deps": [
@@ -80723,6 +82334,10 @@
       {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_hash",
@@ -80787,6 +82402,10 @@
       {
        "name": "hir_ty_comptime",
        "unit": "hir-ty-comptime@0.0.0 lib hir_ty_comptime build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "hir-ty@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "indexmap",
@@ -80956,6 +82575,10 @@
       {
        "name": "hir_ty_borrowck",
        "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty_coherence",
+       "unit": "hir-ty-coherence@0.0.0 lib hir_ty_coherence build"
       },
       {
        "name": "hir_ty_matchck",
@@ -83503,31 +85126,6 @@
      },
      "src": "src/lib.rs",
      "target": "memchr"
-    },
-    "mimalloc@0.1.52 lib mimalloc build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libmimalloc_sys",
-       "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
-      }
-     ],
-     "edition": "2018",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "mimalloc@0.1.52",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "mimalloc"
     },
     "minimal-lexical@0.2.1 lib minimal_lexical build": {
      "crate_type": "lib",
@@ -87140,6 +88738,10 @@
        "unit": "bitflags@2.13.2 lib bitflags build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
@@ -87154,6 +88756,10 @@
       {
        "name": "indexmap",
        "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "rustc_ast_ir",
@@ -88257,11 +89863,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
+    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,result,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -88316,11 +89923,12 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,result,std"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -88380,6 +89988,7 @@
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -88551,6 +90160,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
+    "serde_spanned@1.1.2 lib serde_spanned build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -89381,6 +91019,10 @@
       {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "stacker",
@@ -90466,10 +92108,6 @@
        "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
       },
       {
-       "name": "signal_hook_registry",
-       "unit": "signal-hook-registry@1.4.8 lib signal_hook_registry build"
-      },
-      {
        "name": "socket2",
        "unit": "socket2@0.6.5 lib socket2 build"
       },
@@ -90490,8 +92128,6 @@
       "net",
       "rt",
       "rt-multi-thread",
-      "signal",
-      "signal-hook-registry",
       "socket2",
       "sync",
       "time",
@@ -90568,6 +92204,57 @@
      "src": "src/lib.rs",
      "target": "toml"
     },
+    "toml@1.1.8+spec-1.1.0 lib toml build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build host"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build host"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.1.8+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
     "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
      "crate_type": "lib",
      "deps": [
@@ -90592,6 +92279,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -90671,6 +92387,34 @@
      "src": "src/lib.rs",
      "target": "toml_parser"
     },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
     "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build": {
      "crate_type": "lib",
      "deps": [],
@@ -90689,6 +92433,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
+    "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.1.3+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -91007,6 +92774,10 @@
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "blaze_phf",
+       "unit": "blaze-phf@0.0.0 lib blaze_phf build"
       },
       {
        "name": "intern",
@@ -92542,6 +94313,26 @@
      "src": "src/lib.rs",
      "target": "winnow"
     },
+    "winnow@1.0.4 lib winnow build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
+    },
     "writeable@0.6.3 lib writeable build": {
      "crate_type": "lib",
      "deps": [],
@@ -93312,8 +95103,6 @@
      "deps": [],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -93347,8 +95136,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -93382,8 +95169,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -93417,7 +95202,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -93447,7 +95231,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -93477,7 +95260,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -93507,9 +95289,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "default",
-      "legacy",
       "zdict_builder",
       "zstdmt"
      ],
@@ -94861,6 +96640,10 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
       }
      ],
      "edition": "2024",
@@ -94903,7 +96686,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -94959,7 +96742,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -95028,10 +96811,6 @@
       {
        "name": "constant_time_eq",
        "unit": "constant_time_eq@0.4.2 lib constant_time_eq build host"
-      },
-      {
-       "name": "cpufeatures",
-       "unit": "cpufeatures@0.3.1 lib cpufeatures build host"
       }
      ],
      "edition": "2024",
@@ -95047,7 +96826,7 @@
       "debug_assertions": false,
       "debuginfo": 0,
       "name": "release",
-      "opt_level": "0",
+      "opt_level": "3",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -95174,7 +96953,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -95194,7 +96978,12 @@
     },
     "blaze-bytes@0.0.0 lib blaze_bytes build host": {
      "crate_type": "lib",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build host"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -95216,7 +97005,15 @@
      "crate_type": "bin",
      "deps": [],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-cargo@0.0.0",
@@ -95245,7 +97042,15 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-cargo@0.0.0",
@@ -95579,14 +97384,18 @@
       {
        "name": "zip",
        "unit": "zip@9.1.3 lib zip build"
-      },
-      {
-       "name": "zstd",
-       "unit": "zstd@0.14.3 lib zstd build"
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-cargo@0.0.0",
@@ -95674,6 +97483,39 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_cas"
+    },
+    "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blake3",
+       "unit": "blake3@1.8.7 lib blake3 build host"
+      },
+      {
+       "name": "glob",
+       "unit": "glob@0.3.4 lib glob build host"
+      },
+      {
+       "name": "toml",
+       "unit": "toml@1.1.8+spec-1.1.0 lib toml build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-codegen-code@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_codegen_code"
     },
     "blaze-codegen@0.0.0 lib blaze_codegen build": {
      "crate_type": "lib",
@@ -95990,6 +97832,10 @@
        "unit": "syntax@0.0.0 lib syntax build"
       },
       {
+       "name": "tt",
+       "unit": "tt@0.0.0 lib tt build"
+      },
+      {
        "name": "unicode_ident",
        "unit": "unicode-ident@1.0.24 lib unicode_ident build"
       },
@@ -96033,6 +97879,10 @@
       {
        "name": "blaze_hash",
        "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
        "name": "either",
@@ -96156,6 +98006,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -96192,12 +98046,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -96217,7 +98071,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "bin",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -96289,6 +98152,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -96325,12 +98192,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -96350,7 +98217,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "bin",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -96368,9 +98244,23 @@
     },
     "blaze-engine@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
-     "deps": [],
+     "deps": [
+      {
+       "name": "blaze_codegen_code",
+       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
+      }
+     ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -96399,7 +98289,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-engine@0.0.0",
@@ -96467,6 +98366,10 @@
        "unit": "blaze-registry@0.0.0 lib blaze_registry build"
       },
       {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      },
+      {
        "name": "blaze_units",
        "unit": "blaze-units@0.0.0 lib blaze_units build"
       },
@@ -96503,12 +98406,12 @@
        "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
       },
       {
-       "name": "mimalloc",
-       "unit": "mimalloc@0.1.52 lib mimalloc build"
-      },
-      {
        "name": "parking_lot",
        "unit": "parking_lot@0.12.5 lib parking_lot build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "tar",
@@ -96528,7 +98431,16 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "daemon",
+      "default",
+      "explore",
+      "llvm-stencils",
+      "mimalloc",
+      "net",
+      "pprof",
+      "tui"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-engine@0.0.0",
@@ -96702,6 +98614,10 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
        "name": "tracing",
        "unit": "tracing@0.1.44 lib tracing build"
       }
@@ -96792,7 +98708,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "net"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-global@0.0.0",
@@ -96842,6 +98760,10 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "blaze_rng",
+       "unit": "blaze-rng@0.0.0 lib blaze_rng build"
       },
       {
        "name": "blaze_serde",
@@ -97523,6 +99445,10 @@
       {
        "name": "syntax",
        "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",
@@ -97634,7 +99560,7 @@
      "edition": "2024",
      "features": [
       "daemon",
-      "default"
+      "llvm-stencils"
      ],
      "kind": "lib",
      "mode": "build",
@@ -97728,7 +99654,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-link@0.0.0",
@@ -98015,6 +99943,10 @@
        "unit": "span@0.0.0 lib span build"
       },
       {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      },
+      {
        "name": "toml",
        "unit": "toml@1.1.8+spec-1.1.0 lib toml build"
       },
@@ -98072,6 +100004,10 @@
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
       {
+       "name": "blaze_items",
+       "unit": "blaze-items@0.0.0 lib blaze_items build"
+      },
+      {
        "name": "blaze_lower",
        "unit": "blaze-lower@0.0.0 lib blaze_lower build"
       },
@@ -98086,6 +100022,10 @@
       {
        "name": "blaze_usercode",
        "unit": "blaze-usercode@0.0.0 lib blaze_usercode build"
+      },
+      {
+       "name": "blaze_wasi",
+       "unit": "blaze-wasi@0.0.0 lib blaze_wasi build"
       },
       {
        "name": "cfg",
@@ -98282,10 +100222,6 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
       },
@@ -98321,10 +100257,6 @@
       {
        "name": "blaze_reclaim",
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build host"
-      },
-      {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build host"
       },
       {
        "name": "crossbeam_channel",
@@ -98392,6 +100324,10 @@
        "unit": "arrow-schema@60.1.0 lib arrow_schema build"
       },
       {
+       "name": "blaze_core",
+       "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
        "name": "blaze_graph",
        "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
@@ -98446,6 +100382,10 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
+      },
+      {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
       },
       {
        "name": "thiserror",
@@ -98595,6 +100535,10 @@
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "either",
        "unit": "either@1.19.0 lib either build"
       },
@@ -98625,6 +100569,10 @@
       {
        "name": "thin_vec",
        "unit": "thin-vec@0.2.21 lib thin_vec build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       },
       {
        "name": "triomphe",
@@ -98788,6 +100736,10 @@
        "unit": "http-body-util@0.1.5 lib http_body_util build"
       },
       {
+       "name": "http",
+       "unit": "http@1.5.0 lib http build"
+      },
+      {
        "name": "hyper_rustls",
        "unit": "hyper-rustls@0.27.10 lib hyper_rustls build"
       },
@@ -98828,6 +100780,10 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
+       "name": "stdx",
+       "unit": "stdx@0.0.0 lib stdx build"
+      },
+      {
        "name": "tar",
        "unit": "tar@0.4.46 lib tar build"
       },
@@ -98845,7 +100801,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "net"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-registry@0.0.0",
@@ -99145,26 +101103,6 @@
      "src": "src/lib.rs",
      "target": "blaze_spin"
     },
-    "blaze-spin@0.0.0 lib blaze_spin build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "blaze-spin@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "blaze_spin"
-    },
     "blaze-stencil@0.0.0 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
@@ -99186,7 +101124,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "custom-build",
      "mode": "build",
      "pkg": "blaze-stencil@0.0.0",
@@ -99211,7 +101151,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "custom-build",
      "mode": "run-custom-build",
      "pkg": "blaze-stencil@0.0.0",
@@ -99264,7 +101206,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-stencil@0.0.0",
@@ -99760,6 +101704,31 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_vfs"
+    },
+    "blaze-wasi@0.0.0 lib blaze_wasi build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "wasmtime",
+       "unit": "wasmtime@50.0.1 lib wasmtime build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-wasi@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_wasi"
     },
     "blaze-wasm-pack@0.0.0 lib blaze_wasm_pack build": {
      "crate_type": "lib",
@@ -100809,26 +102778,6 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "cpufeatures"
-    },
-    "cpufeatures@0.3.1 lib cpufeatures build host": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2024",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "cpufeatures@0.3.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -103739,6 +105688,26 @@
      "src": "src/lib.rs",
      "target": "glob"
     },
+    "glob@0.3.4 lib glob build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "glob@0.3.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "glob"
+    },
     "half@2.7.1 lib half build": {
      "crate_type": "lib",
      "deps": [
@@ -104523,7 +106492,9 @@
       }
      ],
      "edition": "2024",
-     "features": [],
+     "features": [
+      "llvm-stencils"
+     ],
      "kind": "lib",
      "mode": "build",
      "pkg": "hir-ty-codegen@0.0.0",
@@ -104538,6 +106509,55 @@
      },
      "src": "mod.rs",
      "target": "hir_ty_codegen"
+    },
+    "hir-ty-coherence@0.0.0 lib hir_ty_coherence build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "either",
+       "unit": "either@1.19.0 lib either build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-coherence@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_coherence"
     },
     "hir-ty-comptime@0.0.0 lib hir_ty_comptime build": {
      "crate_type": "lib",
@@ -105102,6 +107122,10 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
        "name": "hir_def",
        "unit": "hir-def@0.0.0 lib hir_def build"
       },
@@ -105271,6 +107295,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
        "name": "either",
@@ -105448,6 +107476,56 @@
      "src": "src/lib.rs",
      "target": "hir_ty_wfcheck"
     },
+    "hir-ty@0.0.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "blaze_codegen_code",
+       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "hir-ty@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "hir-ty@0.0.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "hir-ty@0.0.0 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "hir-ty@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "hir-ty@0.0.0 lib hir_ty build": {
      "crate_type": "lib",
      "deps": [
@@ -105470,6 +107548,10 @@
       {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "blaze_hash",
@@ -105534,6 +107616,10 @@
       {
        "name": "hir_ty_comptime",
        "unit": "hir-ty-comptime@0.0.0 lib hir_ty_comptime build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "hir-ty@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "indexmap",
@@ -105703,6 +107789,10 @@
       {
        "name": "hir_ty_borrowck",
        "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty_coherence",
+       "unit": "hir-ty-coherence@0.0.0 lib hir_ty_coherence build"
       },
       {
        "name": "hir_ty_matchck",
@@ -108249,31 +110339,6 @@
      },
      "src": "src/lib.rs",
      "target": "memfd"
-    },
-    "mimalloc@0.1.52 lib mimalloc build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libmimalloc_sys",
-       "unit": "libmimalloc-sys@0.1.49 lib libmimalloc_sys build"
-      }
-     ],
-     "edition": "2018",
-     "features": [],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "mimalloc@0.1.52",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "mimalloc"
     },
     "minimal-lexical@0.2.1 lib minimal_lexical build": {
      "crate_type": "lib",
@@ -111808,6 +113873,10 @@
        "unit": "bitflags@2.13.2 lib bitflags build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
@@ -111822,6 +113891,10 @@
       {
        "name": "indexmap",
        "unit": "indexmap@2.14.2 lib indexmap build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "rustc_ast_ir",
@@ -112846,11 +114919,12 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
+    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,result,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -112905,11 +114979,12 @@
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,result,std"
       }
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -112969,6 +115044,7 @@
      ],
      "edition": "2021",
      "features": [
+      "alloc",
       "result",
       "std"
      ],
@@ -113140,6 +115216,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_spanned"
+    },
+    "serde_spanned@1.1.2 lib serde_spanned build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_spanned@1.1.2",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -113970,6 +116075,10 @@
       {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "stacker",
@@ -115055,10 +117164,6 @@
        "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
       },
       {
-       "name": "signal_hook_registry",
-       "unit": "signal-hook-registry@1.4.8 lib signal_hook_registry build"
-      },
-      {
        "name": "socket2",
        "unit": "socket2@0.6.5 lib socket2 build"
       },
@@ -115079,8 +117184,6 @@
       "net",
       "rt",
       "rt-multi-thread",
-      "signal",
-      "signal-hook-registry",
       "socket2",
       "sync",
       "time",
@@ -115157,6 +117260,57 @@
      "src": "src/lib.rs",
      "target": "toml"
     },
+    "toml@1.1.8+spec-1.1.0 lib toml build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "serde_spanned",
+       "unit": "serde_spanned@1.1.2 lib serde_spanned build host"
+      },
+      {
+       "name": "toml_datetime",
+       "unit": "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host"
+      },
+      {
+       "name": "toml_parser",
+       "unit": "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host"
+      },
+      {
+       "name": "toml_writer",
+       "unit": "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build host"
+      },
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "default",
+      "display",
+      "parse",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml@1.1.8+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml"
+    },
     "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build": {
      "crate_type": "lib",
      "deps": [
@@ -115181,6 +117335,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_datetime"
+    },
+    "toml_datetime@1.1.2+spec-1.1.0 lib toml_datetime build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "serde",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_datetime@1.1.2+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -115260,6 +117443,34 @@
      "src": "src/lib.rs",
      "target": "toml_parser"
     },
+    "toml_parser@1.1.5+spec-1.1.0 lib toml_parser build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "winnow",
+       "unit": "winnow@1.0.4 lib winnow build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_parser@1.1.5+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_parser"
+    },
     "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build": {
      "crate_type": "lib",
      "deps": [],
@@ -115278,6 +117489,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "toml_writer"
+    },
+    "toml_writer@1.1.3+spec-1.1.0 lib toml_writer build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "alloc",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "toml_writer@1.1.3+spec-1.1.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -115596,6 +117830,10 @@
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "blaze_phf",
+       "unit": "blaze-phf@0.0.0 lib blaze_phf build"
       },
       {
        "name": "intern",
@@ -117131,6 +119369,26 @@
      "src": "src/lib.rs",
      "target": "winnow"
     },
+    "winnow@1.0.4 lib winnow build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "winnow@1.0.4",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "winnow"
+    },
     "writeable@0.6.3 lib writeable build": {
      "crate_type": "lib",
      "deps": [],
@@ -117897,8 +120155,6 @@
      "deps": [],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -117932,8 +120188,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -117967,8 +120221,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -118002,7 +120254,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -118032,7 +120283,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -118062,7 +120312,6 @@
      ],
      "edition": "2018",
      "features": [
-      "legacy",
       "std",
       "zdict_builder",
       "zstdmt"
@@ -118092,9 +120341,6 @@
      ],
      "edition": "2018",
      "features": [
-      "arrays",
-      "default",
-      "legacy",
       "zdict_builder",
       "zstdmt"
      ],

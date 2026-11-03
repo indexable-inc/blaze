@@ -75,7 +75,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetimes) -> Vec<Found> {
             let sig = return_of(node);
             let params = sig.map(|sig| fn_params(cx, sig));
             let rib_at = sig.map_or(node, Sig::syntax);
-            let mut diag = report(cx, file, rib_at, &refs, params);
+            let mut diag = report(cx, file, rib_at, &refs, params.as_ref());
             for it in &sites {
                 if let Some(def) = it.def {
                     generics_fact(cx, &mut diag, def);

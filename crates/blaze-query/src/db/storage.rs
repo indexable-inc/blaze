@@ -9,12 +9,13 @@ use std::{
 };
 
 use blaze_graph::{Key, pump::Flights};
-use blaze_mem::Tag;
+use blaze_mem::{Tag, tag};
 use parking_lot::Mutex;
 
 use super::{
-    Event, EventKind,
-    admission::Eviction,
+    Event, EventKind, MemoryUsage,
+    budget::{self, Held},
+    capture::REF,
     counts,
     dense::{Dense, Heap, Zeroed},
     id::{Id, MAX_PAGES, PAGE_BITS, PAGE_LEN},
@@ -185,16 +186,21 @@ pub(crate) fn or(a: Summary, b: Summary) -> Summary {
 const HEAP: usize = 1 << 36;
 #[cfg(target_pointer_width = "64")]
 const INTERN_HEAP: usize = 1 << 35;
-/// Nodes and edges a storage may have.
+/// Nodes and edges a storage may have; entries and captures one view's [`super::Reads`] may
+/// hold.
 #[cfg(target_pointer_width = "64")]
 const NODES: usize = 1 << 28;
 #[cfg(target_pointer_width = "64")]
 const EDGES: usize = 1 << 32;
+#[cfg(target_pointer_width = "64")]
+const CAPTURED: usize = 1 << 32;
+#[cfg(target_pointer_width = "64")]
+const CAPTURES: usize = 1 << 31;
 
 /// The same on a 32-bit target (wasm32), where a reservation is memory taken whole and the
 /// whole address space is 4 GB, so each is a budget: 512 MB and 256 MB of row pages, 2^23
-/// nodes (320 MB of node columns) and 2^26 edges (256 MB). A storage that outgrows one stops
-/// with the error naming it, as on 64-bit.
+/// nodes (320 MB of node columns), 2^26 edges (256 MB), and 2^24 captured entries and 2^21
+/// captures (80 MB). A storage that outgrows one stops with the error naming it, as on 64-bit.
 #[cfg(not(target_pointer_width = "64"))]
 const HEAP: usize = 512 << 20;
 #[cfg(not(target_pointer_width = "64"))]
@@ -203,6 +209,13 @@ const INTERN_HEAP: usize = 256 << 20;
 const NODES: usize = 1 << 23;
 #[cfg(not(target_pointer_width = "64"))]
 const EDGES: usize = 1 << 26;
+#[cfg(not(target_pointer_width = "64"))]
+const CAPTURED: usize = 1 << 24;
+#[cfg(not(target_pointer_width = "64"))]
+const CAPTURES: usize = 1 << 21;
+
+// A captured entry is a node or, with [`REF`] set, a capture's number: neither reaches the bit.
+const _: () = assert!(NODES <= REF as usize && CAPTURES <= REF as usize);
 
 /// Every ingredient's rows, the dependency graph and the view of one database: `Send + Sync`,
 /// read by `&` from any number of tasks, written by `&mut`.
@@ -231,20 +244,37 @@ pub struct Storage {
     /// Each memo's last run: its view and [`Cause`], written by the run's flight holder.
     pub(crate) runs: Dense<AtomicU64>,
     next_node: AtomicU32,
+    /// The rows' edge spans, one per row (in its header's `edges`): a rerun replaces its row's
+    /// span, leaving the old one dead until [`Storage::settle`] moves the
+    /// live ones into a fresh array.
     edges: Dense<AtomicU32>,
     edges_top: AtomicU64,
-    /// Edges no row names any more (replaced spans, captures).
+    /// Edges no row names any more: spans a rerun replaced.
     edges_dead: AtomicU64,
+    /// The edges the array may hold: [`EDGES`], lower in a test of the error.
+    edge_limit: u64,
+    /// What this view's captures ([`super::capture_reads`]) read, each a span of entries: a
+    /// node read in it, or a capture closed or replayed in it as [`REF`] and its number, so a
+    /// read is held once, by the innermost capture that made it. A [`super::Reads`] is used
+    /// only in the view it was made in, so the next view frees them all ([`Storage::settle`]).
+    captured: Dense<AtomicU32>,
+    captured_top: AtomicU64,
+    /// Each capture's span in `captured`, by its number; number 0 is the capture of no read.
+    captures: Dense<AtomicU64>,
+    captures_made: AtomicU32,
     pub(crate) flights: Flights<()>,
     hook: Option<Hook>,
-    /// The ingredients with an `lru` cap, swept at each new view.
-    lru: Mutex<Vec<u32>>,
+    /// The functions whose values are kept by their bytes (`lru`), weighed at each new view.
+    weighed: Mutex<Vec<u32>>,
     /// [`Storage::keep_every_value`].
     keep: bool,
-    /// The rows the last view's sweep read, over every capped function ([`Storage::swept`]).
+    /// The values the last view's passes read, over every tag ([`Storage::swept`]).
     swept: usize,
-    /// [`Storage::set_eviction`].
-    eviction: Eviction,
+    /// [`Storage::set_value_budget`] of each tag: `None` reads the tag's own budget.
+    budgets: [Option<u64>; Tag::COUNT],
+    /// What each tag held live at its last pass ([`Storage::sweep`]): a tag over its budget is
+    /// weighed again once it has grown by a [`budget::SPARE`]th of the budget since.
+    passed_at: [u64; Tag::COUNT],
     /// The database type of its first function table ([`Storage::check_db`]).
     db_type: Mutex<Option<TypeId>>,
 }
@@ -292,13 +322,19 @@ impl Storage {
             edges: Dense::growing(EDGES, Tag::Query, "dependency edges"),
             edges_top: AtomicU64::new(0),
             edges_dead: AtomicU64::new(0),
+            edge_limit: EDGES as u64,
+            captured: Dense::growing(CAPTURED, Tag::Query, "captured reads"),
+            captured_top: AtomicU64::new(0),
+            captures: Dense::growing(CAPTURES, Tag::Query, "captures"),
+            captures_made: AtomicU32::new(1),
             flights: Flights::new(),
             hook,
             // alloc: none, empty: one entry per `lru` function, pushed once
-            lru: Mutex::new(Vec::new()),
+            weighed: Mutex::new(Vec::new()),
             keep: false,
             swept: 0,
-            eviction: Eviction::default(),
+            budgets: [None; Tag::COUNT],
+            passed_at: [0; Tag::COUNT],
             db_type: Mutex::new(None),
         }
     }
@@ -405,19 +441,21 @@ impl Storage {
         self.stopped()
     }
 
-    /// While `keep`, no `lru` cap evicts at a new view.
+    /// While `keep`, no value of an `lru` function is let go at a new view.
     pub fn keep_every_value(&mut self, keep: bool) {
         self.keep = keep;
     }
 
-    /// How every `lru` cap picks the values it evicts from the next view on
-    /// ([`Eviction::Frequency`] unless set).
-    pub fn set_eviction(&mut self, eviction: Eviction) {
-        self.eviction = eviction;
+    /// What the values of `tag`'s `lru` functions may weigh in this storage, from the next view
+    /// on; `None` (the default) is the tag's own budget ([`tag::budget`]), which the daemon sets
+    /// from the machine's memory. `u64::MAX` keeps every value.
+    pub fn set_value_budget(&mut self, tag: Tag, bytes: Option<u64>) {
+        self.budgets[tag.index()] = bytes;
     }
 
-    pub(crate) fn eviction(&self) -> Eviction {
-        self.eviction
+    /// What the values of `tag`'s `lru` functions may weigh ([`Storage::set_value_budget`]).
+    pub fn value_budget(&self, tag: Tag) -> u64 {
+        self.budgets[tag.index()].unwrap_or_else(|| tag::budget(tag))
     }
 
     /// `file!()` where ingredient `ingredient` is defined.
@@ -433,14 +471,82 @@ impl Storage {
         }
     }
 
-    /// What each ingredient in use holds, pushed onto `out`.
-    pub fn memory_usage(&self, out: &mut Vec<super::MemoryUsage>) {
+    /// What each ingredient in use holds, pushed onto `out`, then the dependency graph's own
+    /// columns, which no ingredient owns: its nodes, the rows' edges and this view's captured
+    /// reads, each with the bytes it has committed. Each function's rows in use are counted by
+    /// a walk of its rows made, one header load a row (at worst a read of every row page,
+    /// about a tenth of a second a GiB of rows); sound with queries running, as every count is
+    /// an atomic load. For a total without the walk, [`Storage::held_bytes`].
+    pub fn memory_usage(&self, out: &mut Vec<MemoryUsage>) {
         for index in self.live() {
             if let Some(vtable) = ingredient::vtable(index) {
+                let mut usage = (vtable.memory)(self, index);
+                if let Some(used) = vtable.used {
+                    usage.used = used(self, index);
+                }
                 // alloc: the caller's report, one entry per ingredient
-                out.push((vtable.memory)(self, index));
+                out.push(usage);
             }
         }
+        // alloc: the caller's report, three entries
+        out.extend(self.graph_usage());
+        // Process-wide, not this storage's, and no bytes held now (so not in `held_bytes`): the
+        // most one run's reads and one task's pending rows reached as their stacks grew, what
+        // the query stack bounds are set against (`local::RUN_READS`, `local::PENDING_FLOOR`).
+        let (most_reads, most_pending) = super::local::high_water();
+        let stacks = [
+            ("query stack reads (most one run held)", most_reads),
+            ("query stack pending rows (most one task held)", most_pending),
+        ];
+        // alloc: the caller's report, two entries
+        out.extend(stacks.map(|(name, most)| MemoryUsage {
+            name,
+            rows: most,
+            used: most,
+            row_bytes: 0,
+            value_bytes: 0,
+        }));
+    }
+
+    /// What the query storage holds ([`MemoryUsage::held`] summed over
+    /// [`Storage::memory_usage`]'s report), from counters alone: a load or two an ingredient,
+    /// no row read, cheap enough for a periodic line and sound with queries running.
+    pub fn held_bytes(&self) -> u64 {
+        let tables: u64 = self
+            .live()
+            .filter_map(|index| ingredient::vtable(index).map(|vtable| (vtable.memory)(self, index).held()))
+            .sum();
+        tables + self.graph_usage().iter().map(MemoryUsage::held).sum::<u64>()
+    }
+
+    /// The dependency graph's columns as [`Storage::memory_usage`] reports them.
+    fn graph_usage(&self) -> [MemoryUsage; 3] {
+        let live = self.edges_top.load(Ordering::Relaxed).saturating_sub(self.edges_dead.load(Ordering::Relaxed));
+        let nodes = u64::from(self.nodes_made());
+        let captured = self.captured_top.load(Ordering::Relaxed);
+        [
+            MemoryUsage {
+                name: "dependency nodes",
+                rows: nodes,
+                used: nodes,
+                row_bytes: (self.nodes.committed_bytes() + self.runs.committed_bytes()) as u64,
+                value_bytes: 0,
+            },
+            MemoryUsage {
+                name: "dependency edges",
+                rows: live,
+                used: live,
+                row_bytes: self.edges.committed_bytes() as u64,
+                value_bytes: 0,
+            },
+            MemoryUsage {
+                name: "captured reads",
+                rows: captured,
+                used: captured,
+                row_bytes: (self.captured.committed_bytes() + self.captures.committed_bytes()) as u64,
+                value_bytes: 0,
+            },
+        ]
     }
 
     /// A write of kind `durability` that changed nothing the storage holds: what an input a
@@ -451,15 +557,57 @@ impl Storage {
     }
 
     /// Opens the next view for a write of kind `durability` to the input fields whose
-    /// [`input_bits`] OR to `written`: rows of that kind or below verify again; `lru` caps are
-    /// applied.
+    /// [`input_bits`] OR to `written`: rows of that kind or below verify again; each tag's
+    /// budget for the values of its `lru` functions is applied.
     pub(crate) fn new_view(&mut self, durability: Durability, written: Summary) -> u32 {
         self.next_view(written);
         for kind in &mut self.last_changed[..=durability.0 as usize] {
             *kind = self.view;
         }
+        self.settle();
         self.sweep();
         self.view
+    }
+
+    /// Frees, at a view boundary (`&mut`: no reader, no running row), what the dependency
+    /// records of the views before no longer need:
+    /// - every capture: a [`super::Reads`] is read only in the view it was made in
+    ///   ([`super::Reads::for_each_read`] and [`super::replay_reads`] refuse any other), so
+    ///   the capture arrays are emptied and their pages given back;
+    /// - the edge spans reruns replaced, once they outnumber both the live edges and the
+    ///   nodes: the live spans move into a fresh array, a walk of every row and a copy of the
+    ///   live edges, so its cost is at most the dead edges it frees.
+    fn settle(&mut self) {
+        if *self.captures_made.get_mut() > 1 {
+            self.captured.clear();
+            self.captures.clear();
+            *self.captured_top.get_mut() = 0;
+            *self.captures_made.get_mut() = 1;
+        }
+        let top = *self.edges_top.get_mut();
+        let dead = *self.edges_dead.get_mut();
+        let live = top - dead;
+        if dead <= live.max(u64::from(self.nodes_made())) {
+            return;
+        }
+        // Named, so a build's time moving edges is its own, never its writer's self time
+        // (rule 14).
+        let _settle =
+            tracing::info_span!(target: "blaze", "edge settle", view = self.view, live, dead).entered();
+        let old = std::mem::replace(&mut self.edges, Dense::growing(EDGES, Tag::Query, "dependency edges"));
+        let mut moved = Relocate { old, top: 0 };
+        for index in 1..=ingredient::registered() {
+            if self.tables[index as usize].load(Ordering::Relaxed).is_null() {
+                continue;
+            }
+            if let Some(relocate) = ingredient::vtable(index).and_then(|it| it.relocate) {
+                relocate(self, index, &mut moved);
+            }
+        }
+        // At most `live`: a push the full array refused took its places and stored nothing.
+        debug_assert!(moved.top <= live, "{} edges moved, {live} live", moved.top);
+        *self.edges_top.get_mut() = moved.top;
+        *self.edges_dead.get_mut() = 0;
     }
 
     /// Bumps the view, the clock (clearing the stop flag) and the written-field history; at
@@ -529,40 +677,119 @@ impl Storage {
         *self.clock.get_mut() = u64::from(view | VALUE);
     }
 
-    /// Applies every `lru` cap: with `&mut`, no reader holds a value.
+    /// Keeps each tag's `lru` values under its budget ([`super::budget`]): with `&mut`, no
+    /// reader holds a value. Weighing costs the values made since the last view; a tag is
+    /// passed over (every value of it read and weighed again, the oldest let go past the
+    /// budget) when its values weigh more than its budget, or, under the tag's own budget,
+    /// when the tag holds more than that live and has grown by a [`budget::SPARE`]th of it
+    /// since its last pass: values that grew after they were weighed, such as an outline whose
+    /// bodies were walked, are weighed again.
     fn sweep(&mut self) {
+        self.sweep_values(&[u64::MAX; Tag::COUNT]);
+    }
+
+    /// [`Storage::sweep`] now, between two views: a build that stopped its readers to let go of
+    /// what its front end keeps (`blaze-cargo`'s release) sweeps here, so values are held under
+    /// their budgets mid-build, not only at the next write. Each tag's budget is the least of its
+    /// own ([`Storage::value_budget`]) and `caps` (by [`Tag::index`]; `u64::MAX` for none): under
+    /// memory pressure the caller caps each tag at its fair part of the daemon's limit
+    /// (`blaze_graph::admission::Squeeze::caps`). Opens no view: an evicted value read again in
+    /// this one runs again with its stamp kept (`evict`'s contract).
+    pub fn sweep_values(&mut self, caps: &[u64; Tag::COUNT]) {
+        self.swept = 0;
         if self.keep {
             return;
         }
-        let count = self.lru.get_mut().len();
-        self.swept = 0;
+        let count = self.weighed.get_mut().len();
         if count == 0 {
             return;
         }
-        // Named, so a build's time in sweeps is the sweep's, never its writer's self time
-        // (rule 14): each input write opens a view and sweeps here.
-        let span = tracing::info_span!(target: "blaze", "lru sweep", view = self.view, rows = tracing::field::Empty);
-        let _sweep = span.enter();
-        let mut swept = 0;
+        // Named, so a build's time weighing is its own, never its writer's self time (rule
+        // 14): each input write opens a view and weighs here.
+        let _sweep = tracing::info_span!(target: "blaze", "lru sweep", view = self.view).entered();
+        let mut weight = [0u64; Tag::COUNT];
+        let mut has = [false; Tag::COUNT];
         for at in 0..count {
-            let index = self.lru.get_mut()[at];
-            if let Some(sweep) = ingredient::vtable(index).and_then(|it| it.sweep) {
-                swept += sweep(self, index);
+            let index = self.weighed.get_mut()[at];
+            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else { continue };
+            weight[weighed.tag.index()] += (weighed.weight)(self, index);
+            has[weighed.tag.index()] = true;
+        }
+        let mut live = None;
+        for tag in Tag::ALL {
+            let at = tag.index();
+            let budget = self.value_budget(tag).min(caps[at]);
+            if !has[at] || budget == u64::MAX {
+                continue;
+            }
+            // What the tag holds is the process's, so it is weighed against the tag's own
+            // budget only, never against one this storage was given for its values.
+            let grew = self.budgets[at].is_none() && {
+                let now = live.get_or_insert_with(tag::snapshot).get(tag).live;
+                now > budget && now >= self.passed_at[at].saturating_add(budget / budget::SPARE)
+            };
+            if weight[at] > budget || grew {
+                self.swept += self.pass(tag, budget);
+                self.passed_at[at] = tag::snapshot().get(tag).live;
             }
         }
-        span.record("rows", swept);
-        self.swept = swept;
     }
 
-    /// The rows the last view's sweep read, over every capped function: what it cost, which
-    /// follows the values held, never the rows made.
+    /// Weighs every value of `tag`'s `lru` functions and, past `budget`, lets the least
+    /// recently verified go ([`budget::plan`]); returns how many values it read.
+    #[cold]
+    fn pass(&mut self, tag: Tag, budget: u64) -> usize {
+        // Named, so a build's time in passes is the pass's, never its writer's self time
+        // (rule 14): each input write opens a view, and any view may pass.
+        let span = tracing::info_span!(
+            target: "blaze",
+            "lru pass",
+            tag = tag.name(),
+            view = self.view,
+            budget,
+            values = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+            evicted = tracing::field::Empty,
+            freed = tracing::field::Empty,
+        );
+        let _pass = span.enter();
+        let count = self.weighed.get_mut().len();
+        let mut values: Vec<Held> = Vec::new(); // alloc: a pass's values, once per eighth of a tag's budget made
+        let mut weight = 0;
+        for at in 0..count {
+            let index = self.weighed.get_mut()[at];
+            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else { continue };
+            if weighed.tag == tag {
+                weight += (weighed.held)(self, index, &mut values);
+            }
+        }
+        let gone = budget::plan(&mut values, weight, budget);
+        let victims = &mut values[..gone];
+        victims.sort_unstable_by_key(|it| (it.ingredient, it.key));
+        let (mut evicted, mut freed) = (0, 0);
+        for one in victims.chunk_by(|a, b| a.ingredient == b.ingredient) {
+            let index = one[0].ingredient;
+            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else { continue };
+            let (n, bytes) = (weighed.evict)(self, index, one);
+            evicted += n;
+            freed += bytes;
+        }
+        span.record("values", values.len());
+        span.record("bytes", weight);
+        span.record("evicted", evicted);
+        span.record("freed", freed);
+        values.len()
+    }
+
+    /// The values the last view's passes read, over every tag: what it cost, which follows the
+    /// values held when a tag passes and is 0 when none does.
     #[cfg(test)]
     pub(crate) fn swept(&self) -> usize {
         self.swept
     }
 
-    pub(crate) fn add_lru(&self, index: u32) {
-        self.lru.lock().push(index);
+    pub(crate) fn add_weighed(&self, index: u32) {
+        self.weighed.lock().push(index);
     }
 
     /// The ingredient that owns `id`'s page.
@@ -690,15 +917,21 @@ impl Storage {
         }
     }
 
-    /// Copies `edges` into the edge array: a span for a row or a capture.
-    pub(crate) fn push_edges(&self, edges: &[u32]) -> u64 {
+    /// Copies `edges` into the edge array: the span of the row of `owner`'s run (its ingredient
+    /// and key), which an error names.
+    pub(crate) fn push_edges(&self, edges: &[u32], owner: (u32, Id)) -> u64 {
         let len = edges.len() as u64;
         if len == 0 {
             return 0;
         }
+        if len > span::MAX_LEN {
+            self.too_many_reads(len, owner, "the run of");
+        }
         let start = self.edges_top.fetch_add(len, Ordering::Relaxed);
         let end = start + len;
-        assert!(end as usize <= EDGES, "the query database's edge array is full ({EDGES})");
+        if end > self.edge_limit {
+            self.edges_full(start, len, owner);
+        }
         self.edges.ensure(end as usize);
         for (place, &node) in self.edges.slice(start as usize, edges.len()).iter().zip(edges) {
             // Relaxed: the span is published by the row's (or capture's) own release store.
@@ -718,31 +951,96 @@ impl Storage {
         self.edges_dead.fetch_add(span::len(span), Ordering::Relaxed);
     }
 
-    /// Settles the edge array once it is more than twice what rows name: copies each live
-    /// span into a fresh array. Opens a new view (nothing changed: every row verifies by its
-    /// durability, one compare), so no [`super::Reads`] of the old array is read again.
-    pub fn compact(&mut self) {
-        let top = *self.edges_top.get_mut();
-        let live = top - *self.edges_dead.get_mut();
-        if top <= 2 * live.max(1 << 16) {
-            return;
-        }
-        let old = std::mem::replace(&mut self.edges, Dense::growing(EDGES, Tag::Query, "dependency edges"));
-        let mut moved = Relocate { old, top: 0 };
-        for index in 1..=ingredient::registered() {
-            if self.tables[index as usize].load(Ordering::Relaxed).is_null() {
-                continue;
-            }
-            if let Some(relocate) = ingredient::vtable(index).and_then(|it| it.relocate) {
-                relocate(self, index, &mut moved);
-            }
-        }
-        *self.edges_top.get_mut() = moved.top;
-        *self.edges_dead.get_mut() = 0;
-        self.next_view([0; 2]);
+    #[cold]
+    #[inline(never)]
+    fn edges_full(&self, start: u64, len: u64, (ingredient, id): (u32, Id)) -> ! {
+        let dead = self.edges_dead.load(Ordering::Relaxed);
+        panic!(
+            "the query database's edge array is full ({} places: {} named by rows, {dead} left by \
+             reruns since the last view) storing the {len} reads of `{}`({id:?})",
+            self.edge_limit,
+            start.saturating_sub(dead),
+            self.ingredient_name(ingredient),
+        )
     }
 
-    /// Moves `span` from the old edge array into the new one (compaction only).
+    #[cold]
+    #[inline(never)]
+    fn too_many_reads(&self, len: u64, (ingredient, id): (u32, Id), what: &str) -> ! {
+        panic!(
+            "{what} `{}`({id:?}) holds {len} distinct reads and captures, more than a span holds ({})",
+            self.ingredient_name(ingredient),
+            span::MAX_LEN,
+        )
+    }
+
+    /// Stores the entries of a capture made in the run of `owner` ([`super::capture_reads`]):
+    /// its number in this view, 0 for none.
+    pub(crate) fn push_capture(&self, entries: &[u32], owner: (u32, Id)) -> u32 {
+        let len = entries.len() as u64;
+        if len == 0 {
+            return 0;
+        }
+        if len > span::MAX_LEN {
+            self.too_many_reads(len, owner, "a capture in");
+        }
+        let start = self.captured_top.fetch_add(len, Ordering::Relaxed);
+        let end = start + len;
+        let number = self.captures_made.fetch_add(1, Ordering::Relaxed);
+        if end > CAPTURED as u64 || number as usize >= CAPTURES {
+            self.captures_full(start, len, number, owner);
+        }
+        self.captured.ensure(end as usize);
+        for (place, &entry) in self.captured.slice(start as usize, entries.len()).iter().zip(entries) {
+            // Relaxed: the capture is published with its `Reads`, by whatever hands that over.
+            place.store(entry, Ordering::Relaxed);
+        }
+        self.captures.ensure(number as usize + 1);
+        self.captures.get(number as usize).store(span::pack(start, len), Ordering::Relaxed);
+        number
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn captures_full(&self, start: u64, len: u64, number: u32, (ingredient, id): (u32, Id)) -> ! {
+        panic!(
+            "the query database's captured reads are full in view {} ({start} of {CAPTURED} entries, \
+             {number} of {CAPTURES} captures) storing the {len} entries of a capture in `{}`({id:?})",
+            self.opened,
+            self.ingredient_name(ingredient),
+        )
+    }
+
+    /// The span in the captured entries of capture `number`, made in this view.
+    #[inline]
+    pub(crate) fn capture_span(&self, number: u32) -> u64 {
+        self.captures.get(number as usize).load(Ordering::Relaxed)
+    }
+
+    /// Captured entry `at` of a published capture.
+    #[inline(always)]
+    pub(crate) fn captured(&self, at: u64) -> u32 {
+        self.captured.get(at as usize).load(Ordering::Relaxed)
+    }
+
+    /// The edge array's top and the dead edges under it, and the captured entries' top.
+    #[cfg(test)]
+    pub(crate) fn edge_counts(&self) -> (u64, u64, u64) {
+        (
+            self.edges_top.load(Ordering::Relaxed),
+            self.edges_dead.load(Ordering::Relaxed),
+            self.captured_top.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Lowers the edges the array may hold, to test the error of a full one.
+    #[cfg(test)]
+    pub(crate) fn limit_edges(&mut self, limit: u64) {
+        assert!(limit <= EDGES as u64);
+        self.edge_limit = limit;
+    }
+
+    /// Moves `span` from the old edge array into the new one ([`Storage::settle`] only).
     pub(crate) fn relocate(&self, moved: &mut Relocate, span: u64) -> u64 {
         let len = span::len(span);
         if len == 0 {
@@ -870,6 +1168,8 @@ impl fmt::Debug for Storage {
             .field("pages", &self.pages_made())
             .field("nodes", &self.nodes_made())
             .field("edges", &self.edges_top.load(Ordering::Relaxed))
+            .field("dead edges", &self.edges_dead.load(Ordering::Relaxed))
+            .field("captured", &self.captured_top.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -903,7 +1203,7 @@ impl Restamp<'_> {
     }
 }
 
-/// The old edge array, while compaction copies spans out of it.
+/// The old edge array, while [`Storage::settle`] copies the live spans out of it.
 pub(crate) struct Relocate {
     old: Dense<AtomicU32>,
     top: u64,

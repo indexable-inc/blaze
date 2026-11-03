@@ -29,7 +29,7 @@ use crate::{FileId, VfsPath};
 
 use crate::{
     Db, InputId, SourceRoot, content,
-    table::{Table, hash_of},
+    table::Table,
 };
 
 pub(crate) const BUCKETS: usize = 64;
@@ -51,7 +51,7 @@ pub(crate) struct NamedPaths {
     buckets: Box<[PathBucket]>,
 }
 
-/// The paths of one of [`BUCKETS`], by their [`hash_of`]: see [`NAMED_PATHS_DOMAIN`].
+/// The paths of one of [`BUCKETS`], by [`bucket_of`]: see [`NAMED_PATHS_DOMAIN`].
 #[blaze_query::input(debug)]
 pub(crate) struct PathBucket {
     #[returns(copy)]
@@ -73,9 +73,13 @@ struct NamedPath {
     file: AtomicU32,
 }
 
-fn bucket_of(hash: u64) -> usize {
-    // `Table` picks a shard by the top bits and a place by the low ones.
-    (hash >> 52) as usize % BUCKETS
+/// The bucket of `path`: by foldhash's fixed hasher, not by the table's keyed hash, as a
+/// bucket's content is an input (the same paths must make the same buckets in every process).
+/// A source that picks paths with one fixed hash only fills one bucket, which costs a sum
+/// each, never a probe.
+fn bucket_of(path: &VfsPath) -> usize {
+    use std::hash::BuildHasher;
+    (blaze_hash::FixedState.hash_one(path) >> 52) as usize % BUCKETS
 }
 
 /// The setters' side of the index, in [`Writer`](crate::files::Writer).
@@ -87,9 +91,9 @@ pub(crate) struct Named {
     moves: [u64; BUCKETS],
     /// Buckets a path of moved in since the last [`Named::publish`], a bit each.
     moved: u64,
-    /// Paths named since the last [`Named::publish`], as their [`hash_of`] and place in the
+    /// Paths named since the last [`Named::publish`], as their [`bucket_of`] and place in the
     /// table: hashed for the buckets in one batch there.
-    pending: Vec<(u64, u32)>,
+    pending: Vec<(usize, u32)>,
 }
 
 impl Default for Named {
@@ -110,14 +114,14 @@ impl Default for Named {
 impl Named {
     /// A source root names `file` at `path`: a new path, or one given another file.
     pub(crate) fn note(&mut self, path: &VfsPath, file: FileId) {
-        let hash = hash_of(path);
+        let hash = self.table.hash(path);
         // clone: the table's one copy of a path, made once when a source root first names it.
         let make = || NamedPath { path: path.clone(), file: AtomicU32::new(file.index()) };
         let (at, inserted) = self.table.insert(hash, |it| it.path == *path, make);
         if inserted {
-            self.pending.push((hash, at));
+            self.pending.push((bucket_of(path), at));
         } else if self.table.get(at).file.swap(file.index(), Ordering::Release) != file.index() {
-            let bucket = bucket_of(hash);
+            let bucket = bucket_of(path);
             self.moves[bucket] += 1;
             self.moved |= 1 << bucket;
         }
@@ -151,8 +155,7 @@ impl Named {
         }
         let ids = content::hash_ranges(SourceRoot::PATH_DOMAIN, &bytes, &ranges, frame);
         let mut dirty = std::mem::take(&mut self.moved);
-        for ((hash, _), id) in self.pending.iter().zip(ids) {
-            let bucket = bucket_of(*hash);
+        for (&(bucket, _), id) in self.pending.iter().zip(ids) {
             self.counts[bucket] += 1;
             for (lane, sum) in self.sums[bucket].iter_mut().enumerate() {
                 let word: [u8; 8] = id.0[lane * 8..lane * 8 + 8].try_into().expect("8 bytes");
@@ -192,10 +195,9 @@ impl Named {
 /// there, which is the read a hit reruns on.
 pub(crate) fn lookup(db: &Db, path: &VfsPath) -> Option<FileId> {
     let named = NamedPaths::try_get(db)?;
-    let hash = hash_of(path);
     // The read a miss reruns on.
-    let _ = named.buckets(db)[bucket_of(hash)].content(db);
+    let _ = named.buckets(db)[bucket_of(path)].content(db);
     let table = &named.table(db).0;
-    let at = table.find(hash, |it| it.path == *path)?;
+    let at = table.find(table.hash(path), |it| it.path == *path)?;
     Some(FileId::from_raw(table.get(at).file.load(Ordering::Acquire)))
 }

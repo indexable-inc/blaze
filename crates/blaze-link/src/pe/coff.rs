@@ -157,7 +157,7 @@ fn shared(dll: String) -> Shared {
 
 /// Adds an import to its DLL: the name pushed into the DLL's names, the export name as a
 /// version of its own (each import's differs).
-fn add(shared: &mut Shared, input: Input<'_>, import: Imported<'_>) -> Result<(), String> {
+fn add(shared: &mut Shared, input: Input<'_>, import: &Imported<'_>) -> Result<(), String> {
     let version = u16::try_from(shared.versions.len()).map_err(|_| {
         fail(input, format_args!("more than 65,536 imports of {}, more than a DLL can export", shared.name))
     })?;
@@ -175,7 +175,7 @@ pub(super) fn read(pe: &Pe, name: &str, bytes: &[u8], kind: &NativeKind) -> Resu
             Parsed::Object(object) => Ok(NativeFile::Object(object)),
             Parsed::Import(dll, import) => {
                 let mut shared = shared(dll.into_owned());
-                add(&mut shared, input, import)?;
+                add(&mut shared, input, &import)?;
                 Ok(NativeFile::Shared(shared))
             }
         },
@@ -447,9 +447,9 @@ fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, Stri
         bounds.push(imports.len() - start);
     }
     let mut groups = Vec::with_capacity(bounds.len());
-    let mut rest = imports.as_mut_slice();
+    let mut rest = imports.as_slice();
     for len in bounds {
-        let (group, tail) = rest.split_at_mut(len);
+        let (group, tail) = rest.split_at(len);
         groups.push(group);
         rest = tail;
     }
@@ -457,12 +457,7 @@ fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, Stri
         let first = run[0].1;
         // alloc: once per DLL: the name its `Shared` owns
         let mut dll = shared((*run[0].0).to_owned());
-        for (_, at, import) in run.iter_mut() {
-            let import = Imported {
-                name: std::mem::take(&mut import.name),
-                version: std::mem::take(&mut import.version),
-                kind: import.kind,
-            };
+        for (_, at, import) in run {
             if let Err(error) = add(&mut dll, input_of(&archive.members[*at as usize]), import) {
                 return (first, Err((*at, error)));
             }

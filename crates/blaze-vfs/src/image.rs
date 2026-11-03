@@ -29,7 +29,7 @@
 use std::{fmt, sync::Arc};
 
 use blaze_core::{FileName, Mapping};
-use blaze_format::{SchemaHash, schema};
+use blaze_format::{Record, SchemaHash, schema};
 use blaze_ids::{ContentId, Hasher};
 use blaze_image::{
     Builder, Corrupt, Image, OpenError, Refused, Section as Placed, SectionId, bytes_of,
@@ -41,51 +41,79 @@ use crate::{
     disk::Disks,
     journal::{FromImage, Journal, Loaded, base_of},
     section::Section,
-    store::{Base, FILE, Mapped, Source, Table, Writer, home, name_hash},
+    store::{Base, FILE, Mapped, NAME_INDEX_KEY, Source, Table, Writer, home},
     tree::Tree,
 };
 
 pub const TREE_SCHEMA: SchemaHash = schema(
-    "blaze v2 vfs tree 1: header [u64; 28]; ids ContentId; shapes [u32; 2]; entry names u32; \
+    "blaze v2 vfs tree 2: header [u64; 30]; ids ContentId; shapes [u32; 2]; entry names u32; \
      entry nodes u32; entry modes u8; files [u64; 2]; index u32; spans [u32; 2]; name bytes u8; \
-     name index u32",
+     name index u32 by SipHash-1-3 under the header's key, blaze_ids::index_key of the names",
 );
 pub const BLOBS_SCHEMA: SchemaHash = schema("blaze v2 vfs blobs 1: file bytes");
 pub const DISKS_SCHEMA: SchemaHash = schema("blaze v2 vfs disks 2: disk.rs's encoding");
 
 const IMAGE_DOMAIN: &str = "blaze v2 vfs image 1";
-const MAGIC: u64 = u64::from_le_bytes(*b"BZVFSTR1");
 
-/// The header's words.
-const WORDS: usize = 28;
-const W_MAGIC: usize = 0;
-const W_NODES: usize = 1;
-const W_ENTRIES: usize = 2;
-const W_FILES: usize = 3;
-const W_NAMES: usize = 4;
-const W_NAME_BYTES: usize = 5;
-const W_INDEX: usize = 6;
-const W_NAME_INDEX: usize = 7;
-const W_BLOBS: usize = 8;
-/// Where each of the [`COLUMNS`] columns starts in the section.
-const W_COLUMNS: usize = 9;
-const W_BASED: usize = 19;
-const W_NAME: usize = 20;
-const W_BASED_ON: usize = 24;
-const _: () = assert!(W_BASED_ON + 4 == WORDS);
+/// The `vfs tree` section's layout: its header's words and its columns' order, counts and
+/// element sizes. This module is the one home of it; the fuzz target that damages images
+/// (`fuzz/targets/vfs_image.rs`) reads it from here rather than keeping a copy.
+pub mod tree_layout {
+    /// The header's first word, as bytes.
+    pub const MAGIC_BYTES: [u8; 8] = *b"BZVFSTR2";
+    /// The header's first word.
+    pub const MAGIC: u64 = u64::from_le_bytes(MAGIC_BYTES);
 
-const C_IDS: usize = 0;
-const C_SHAPES: usize = 1;
-const C_ENTRY_NAMES: usize = 2;
-const C_ENTRY_NODES: usize = 3;
-const C_ENTRY_MODES: usize = 4;
-const C_FILES: usize = 5;
-const C_INDEX: usize = 6;
-const C_SPANS: usize = 7;
-const C_NAME_BYTES: usize = 8;
-const C_NAME_INDEX: usize = 9;
-const COLUMNS: usize = 10;
-const _: () = assert!(W_COLUMNS + COLUMNS == W_BASED);
+    /// The header's words.
+    pub const WORDS: usize = 30;
+    pub const W_MAGIC: usize = 0;
+    pub const W_NODES: usize = 1;
+    pub const W_ENTRIES: usize = 2;
+    pub const W_FILES: usize = 3;
+    pub const W_NAMES: usize = 4;
+    pub const W_NAME_BYTES: usize = 5;
+    pub const W_INDEX: usize = 6;
+    pub const W_NAME_INDEX: usize = 7;
+    pub const W_BLOBS: usize = 8;
+    /// Where each of the [`COLUMNS`] columns starts in the section.
+    pub const W_COLUMNS: usize = 9;
+    pub const W_BASED: usize = 19;
+    pub const W_NAME: usize = 20;
+    pub const W_BASED_ON: usize = 24;
+    /// The two words of the [`blaze_hash::SipKey`] the name index is placed by.
+    pub const W_NAME_KEY: usize = 28;
+    const _: () = assert!(W_BASED_ON + 4 == W_NAME_KEY && W_NAME_KEY + 2 == WORDS);
+
+    pub const C_IDS: usize = 0;
+    pub const C_SHAPES: usize = 1;
+    pub const C_ENTRY_NAMES: usize = 2;
+    pub const C_ENTRY_NODES: usize = 3;
+    pub const C_ENTRY_MODES: usize = 4;
+    pub const C_FILES: usize = 5;
+    pub const C_INDEX: usize = 6;
+    pub const C_SPANS: usize = 7;
+    pub const C_NAME_BYTES: usize = 8;
+    pub const C_NAME_INDEX: usize = 9;
+    pub const COLUMNS: usize = 10;
+    const _: () = assert!(W_COLUMNS + COLUMNS == W_BASED);
+
+    /// Each column's count (the header word that holds it) and element size in bytes, in the
+    /// header's order. The image is opened by this table, and each size is checked against the
+    /// column's type where it is opened.
+    pub const LAYOUT: [(usize, usize); COLUMNS] = [
+        (W_NODES, 32),
+        (W_NODES, 8),
+        (W_ENTRIES, 4),
+        (W_ENTRIES, 4),
+        (W_ENTRIES, 1),
+        (W_FILES, 16),
+        (W_INDEX, 4),
+        (W_NAMES, 8),
+        (W_NAME_BYTES, 1),
+        (W_NAME_INDEX, 4),
+    ];
+}
+use tree_layout::*;
 
 /// An image of the tree written into a [`Builder`]: what [`Vfs::image_durable`] is told once
 /// the file holding it is durable.
@@ -343,11 +371,14 @@ fn write_tree(
         }
         index[at] = node as u32 + 1;
     }
+    // The names are a checkout's, which whoever writes it picks: their index is placed by a
+    // key they can't know before every name is chosen, and the same names give the same key.
+    let name_key = blaze_ids::index_key(NAME_INDEX_KEY, (0..names.len()).map(|name| names.get(name)));
     // alloc: as above.
     let mut name_index = vec![0u32; places(spans.len())];
     let mask = name_index.len() - 1;
     for name in 0..names.len() {
-        let mut at = name_hash(names.get(name)) as usize & mask;
+        let mut at = name_key.hash(names.get(name)) as usize & mask;
         while name_index[at] != 0 {
             at = (at + 1) & mask;
         }
@@ -364,9 +395,10 @@ fn write_tree(
     header[W_INDEX] = index.len() as u64;
     header[W_NAME_INDEX] = name_index.len() as u64;
     header[W_BLOBS] = blobs_len;
+    header[W_NAME_KEY..].copy_from_slice(&name_key.words());
     if let Some(based_on) = &based_on {
         header[W_BASED] = 1;
-        header[W_BASED_ON..].copy_from_slice(&words_of(based_on));
+        header[W_BASED_ON..W_NAME_KEY].copy_from_slice(&words_of(based_on));
     }
     let mut section = image.section(SectionId::VFS_TREE, TREE_SCHEMA);
     section.slice(&header);
@@ -428,7 +460,7 @@ fn open(file: Mapping) -> Result<Opened, ImageUse> {
         tree: Tree::over(writer),
         name: id_of(&header[W_NAME..W_BASED_ON]),
         nodes: header[W_NODES],
-        based_on: (header[W_BASED] == 1).then(|| id_of(&header[W_BASED_ON..])),
+        based_on: (header[W_BASED] == 1).then(|| id_of(&header[W_BASED_ON..W_NAME_KEY])),
         image,
     })
 }
@@ -439,20 +471,30 @@ fn view<'a>(
     tree: &Placed,
     header: &[u64],
 ) -> Result<Base<'a>, Corrupt> {
-    let at = |column: usize| header[W_COLUMNS + column];
-    let (nodes, entries) = (header[W_NODES], header[W_ENTRIES]);
     Ok(Base {
-        ids: image.slice(tree, at(C_IDS), nodes)?,
-        shapes: image.slice(tree, at(C_SHAPES), nodes)?,
-        entry_names: image.slice(tree, at(C_ENTRY_NAMES), entries)?,
-        entry_nodes: image.slice(tree, at(C_ENTRY_NODES), entries)?,
-        entry_modes: image.slice(tree, at(C_ENTRY_MODES), entries)?,
-        files: image.slice(tree, at(C_FILES), header[W_FILES])?,
-        index: image.slice(tree, at(C_INDEX), header[W_INDEX])?,
-        spans: image.slice(tree, at(C_SPANS), header[W_NAMES])?,
-        name_bytes: image.slice(tree, at(C_NAME_BYTES), header[W_NAME_BYTES])?,
-        name_index: image.slice(tree, at(C_NAME_INDEX), header[W_NAME_INDEX])?,
+        ids: column::<_, C_IDS>(image, tree, header)?,
+        shapes: column::<_, C_SHAPES>(image, tree, header)?,
+        entry_names: column::<_, C_ENTRY_NAMES>(image, tree, header)?,
+        entry_nodes: column::<_, C_ENTRY_NODES>(image, tree, header)?,
+        entry_modes: column::<_, C_ENTRY_MODES>(image, tree, header)?,
+        files: column::<_, C_FILES>(image, tree, header)?,
+        index: column::<_, C_INDEX>(image, tree, header)?,
+        spans: column::<_, C_SPANS>(image, tree, header)?,
+        name_bytes: column::<_, C_NAME_BYTES>(image, tree, header)?,
+        name_index: column::<_, C_NAME_INDEX>(image, tree, header)?,
+        name_key: [header[W_NAME_KEY], header[W_NAME_KEY + 1]],
     })
+}
+
+/// Column `C` of the tree section, where the header places it and as long as [`LAYOUT`] says,
+/// its elements of the size [`LAYOUT`] gives (checked when this compiles).
+fn column<'a, T: Record, const C: usize>(
+    image: &'a Image<Mapping>,
+    tree: &Placed,
+    header: &[u64],
+) -> Result<&'a [T], Corrupt> {
+    const { assert!(size_of::<T>() == LAYOUT[C].1, "a column's type is the size tree_layout gives") };
+    image.slice(tree, header[W_COLUMNS + C], header[LAYOUT[C].0])
 }
 
 /// The watchers' metadata and cursors of the image, its groups checked.

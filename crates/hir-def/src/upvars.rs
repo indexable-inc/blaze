@@ -224,6 +224,7 @@ impl StoreVisitor for UpvarsMentionedVisitor<'_, '_> {
                 ret_type,
                 capture_by: _,
                 closure_kind: _,
+                binder: _,
             } => {
                 self.on_pats(args);
                 arg_types.iter().for_each(|arg_ty| self.on_type_opt(*arg_ty));
@@ -292,7 +293,7 @@ mod tests {
     };
 
     #[track_caller]
-    fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: Expect) {
+    fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: &Expect) {
         let db = fixture::db(ra_fixture).into_db();
         let def_map = crate_def_map(&db, fixture::test_crate(&db));
         let func = def_map
@@ -336,7 +337,7 @@ mod tests {
 
     /// As [`check`], without the closures' ranges: each closure with upvars, in source order.
     #[track_caller]
-    fn check_names(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: Expect) {
+    fn check_names(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: &Expect) {
         let db = fixture::db(ra_fixture).into_db();
         let def_map = crate_def_map(&db, fixture::test_crate(&db));
         let func = def_map
@@ -383,7 +384,7 @@ fn foo() {
     };
 }
         "#,
-            expect![[r#"
+            &expect![[r#"
                 a, bar2
                 a, bar2, b
                 a, bar2, b"#]],
@@ -400,7 +401,7 @@ fn foo() {
     || x;
 }
         "#,
-            expect!["x"],
+            &expect!["x"],
         );
     }
 
@@ -417,7 +418,7 @@ fn foo(param: i32) {
     || 0xDEAFBEAF;
 }
         "#,
-            expect![[r#"
+            &expect![[r#"
                 60..77: param
                 83..91: local
                 97..131: param, local"#]],
@@ -436,7 +437,7 @@ fn foo() {
     };
 }
         "#,
-            expect![[r#"
+            &expect![[r#"
                 31..69: a, b
                 44..48: a
                 58..62: b"#]],
@@ -455,7 +456,7 @@ fn foo() {
     };
 }
         "#,
-            expect!["34..135: upvar"],
+            &expect!["34..135: upvar"],
         );
     }
 
@@ -473,7 +474,7 @@ fn foo() {
     };
 }
         "#,
-            expect![[r#"
+            &expect![[r#"
                 30..116: a
                 49..110: a, b"#]],
         );
@@ -490,7 +491,7 @@ impl Foo {
     }
 }
         "#,
-            expect!["56..65: self"],
+            &expect!["56..65: self"],
         );
     }
 
@@ -507,7 +508,7 @@ fn main() {
     };
 }
         "#,
-            expect![""],
+            &expect![""],
         );
     }
 
@@ -520,7 +521,7 @@ async fn foo() {
     v
 }
         "#,
-            expect![[r#""#]],
+            &expect![[r#""#]],
         );
     }
 }

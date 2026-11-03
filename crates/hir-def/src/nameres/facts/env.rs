@@ -305,6 +305,7 @@ pub(crate) struct ChildRequest<'a> {
     pub(crate) inherited: &'a [(Name, Box<[MacroId]>)],
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum ChildMode {
     Separate(DeclKey),
     Inline,

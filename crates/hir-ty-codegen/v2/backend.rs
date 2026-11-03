@@ -310,7 +310,7 @@ impl Backends<'_> {
 /// A request the walk did not list, `what`, with the settings the unit built its IR under and
 /// the walks its references came from: a unit whose settings neither walk has is where the
 /// two disagree.
-fn unwalked(what: String, build: Build, inlined: bool) -> String {
+fn unwalked(what: &str, build: Build, inlined: bool) -> String {
     let [first, second] = Build::WALKS_INLINED;
     let all = [Build::WALK, first, second];
     let walks = match inlined {
@@ -383,12 +383,12 @@ pub(super) fn built_function(
         Built::Ir(pending) => {
             let requests = &mut pending.wants.requests;
             let places = place_requests(db, hashes, krate, &mut placer, requests)
-                .map_err(|what| fail(unwalked(what, build, inlined)))?;
+                .map_err(|what| fail(unwalked(&what, build, inlined)))?;
             (places, pending.source.take(), pending.variables.take())
         }
         Built::Assembled(_, requests) => {
             let places = place_requests(db, hashes, krate, &mut placer, requests)
-                .map_err(|what| fail(unwalked(what, build, inlined)))?;
+                .map_err(|what| fail(unwalked(&what, build, inlined)))?;
             (places, None, None)
         }
     };

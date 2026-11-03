@@ -21,6 +21,7 @@ fn shape() -> Shape {
         align: 1,
         size: 1,
         text: true,
+        overlay: Overlay::Secret,
     }
 }
 
@@ -323,6 +324,94 @@ fn a_value_that_is_not_text_is_refused_where_it_is() {
     assert!(error.to_string().contains(&format!("at byte {}", root.bytes)), "{error}");
 }
 
+/// `section` with its index emptied but for one run of `len` full groups from group `from`
+/// (through the last group into the first), filled with the index's own slots in order: an
+/// image the writer never made, its CRC whole. Also `section`'s root.
+fn with_run(section: &[u8], from: usize, len: usize) -> (Result<Table, RestoreError>, Root) {
+    let image = image_of(section);
+    let root = *image.value::<Root>(&image.section(ID, SCHEMA).unwrap(), 0).unwrap();
+    let (ctrl, ids, slots) = (root.ctrl as usize, root.ids as usize, root.groups as usize * GROUP);
+    let tag = |bytes: &[u8], slot: usize| bytes[ctrl + slot];
+    let id = |bytes: &[u8], slot: usize| u32::from_le_bytes(bytes[ids + 4 * slot..][..4].try_into().unwrap());
+    let full: Vec<(u8, u32)> =
+        (0..slots).filter(|&slot| tag(section, slot) != 0).map(|slot| (tag(section, slot), id(section, slot))).collect();
+    assert!(full.len() >= len * GROUP, "{} slots to fill {len} groups", full.len());
+    let mut bytes = section.to_vec();
+    bytes[ctrl..ctrl + slots].fill(0);
+    bytes[ids..ids + 4 * slots].fill(0);
+    for (n, &(tag, id)) in full[..len * GROUP].iter().enumerate() {
+        // A group's control word is little-endian, so slot `i`'s tag is byte `i` of the column.
+        let slot = (from * GROUP + n) % slots;
+        bytes[ctrl + slot] = tag;
+        bytes[ids + 4 * slot..][..4].copy_from_slice(&id.to_le_bytes());
+    }
+    let image = image_of(&bytes);
+    (Table::restore(shape(), image, &image.section(ID, SCHEMA).unwrap(), &serial), root)
+}
+
+/// Review finding L-1: an image at most half full whose full slots make one long run, which
+/// every lookup that misses there walks, is refused where the run starts: inside one chunk of
+/// the check, across two, and through the last group into the first. A run one group shorter
+/// is not refused for its length.
+#[test]
+fn a_long_run_of_full_groups_is_refused_where_it_starts() {
+    let table = Table::new(shape());
+    (0..10_000u32).for_each(|n| _ = table.intern(format!("value {n}").as_bytes()));
+    let section = section_bytes(&table, &everything(&table));
+    let (restored, root) = with_run(&section, 0, 0);
+    assert!(restored.is_err(), "an empty index misses the compiled-in values");
+    let groups = root.groups as usize;
+    assert_eq!(groups, 2 * (CHUNK / GROUP), "two chunks of the check");
+    let refused = refused_run(groups);
+    assert_eq!(refused, 35, "for 2^12 groups: ln 2 (12 + 65) / (8 (ln 2 - 1/2)) is 34.5");
+    let what = "a run of full index groups longer than half full allows";
+    for from in [0, CHUNK / GROUP - refused / 2, groups - refused / 2] {
+        let (restored, _) = with_run(&section, from, refused);
+        let at = root.ctrl + 8 * from as u64;
+        assert_eq!(restored.err(), Some(RestoreError::Invalid { section: ID, what, at }), "a run from group {from}");
+        let (restored, _) = with_run(&section, from, refused - 1);
+        assert!(
+            !matches!(restored, Err(RestoreError::Invalid { what: refused_for, .. }) if refused_for == what),
+            "a run of {} from group {from} is short enough",
+            refused - 1
+        );
+    }
+}
+
+/// Review finding L-2: an image whose index key is not the one its layout was placed by is
+/// refused, naming the key's byte, where every lookup in it would miss and give each value a
+/// second ID: in a table with values compiled in (they are looked up) and in one without
+/// (every kept value is).
+#[test]
+fn an_index_under_another_key_is_refused() {
+    let what = "an index whose key does not find its values";
+    let at = std::mem::offset_of!(Root, key0) as u64;
+    for statics in [STATICS.len() as u32, 0] {
+        let shape = || Shape { statics, ..shape() };
+        let table = Table::new(shape());
+        (0..1_000u32).for_each(|n| _ = table.intern(format!("value {n}").as_bytes()));
+        let section = section_bytes(&table, &everything(&table));
+        let restore = |bytes: &[u8]| {
+            let image = image_of(bytes);
+            Table::restore(shape(), image, &image.section(ID, SCHEMA).unwrap(), &serial)
+        };
+        assert!(restore(&section).is_ok(), "{statics} compiled in: the image as written");
+        let mut bytes = section.clone();
+        bytes[at as usize..][..8].iter_mut().for_each(|byte| *byte ^= 0x5a);
+        assert_eq!(restore(&bytes).err(), Some(RestoreError::Invalid { section: ID, what, at }), "{statics} compiled in");
+    }
+}
+
+/// Review finding M-1: a fixed shape's tables (the fuzz hooks') place by one key, so an input
+/// takes the same probes in every run, while every other table draws its own. (Under the model
+/// checker a drawn key fails `model.rs`'s models: "the model is not deterministic".)
+#[test]
+fn only_a_fixed_shape_places_alike_every_time() {
+    let fixed = || Table::new(Shape { overlay: Overlay::Fixed, ..shape() });
+    assert_eq!(fixed().overlay, fixed().overlay);
+    assert_ne!(Table::new(shape()).overlay, Table::new(shape()).overlay);
+}
+
 /// The table against an `HashMap<Vec<u8>, u32>` over seeded values, many sharing a hash tag,
 /// a home group or an order key: a value new to the map takes the next ID, a known one its own,
 /// and every ID reads back its bytes and key, in the overlay and again after a write and a
@@ -393,13 +482,12 @@ fn live_sets() {
     assert!(live.contains(64) && live.contains(1_000_000) && !live.contains(66));
 }
 
-/// The index's hash is the image's format: it may not depend on the process, the build or
-/// the platform, so it is checked against itself on fixed inputs from two computations.
+/// The mapped index's hash spreads names over tags and home groups under any key.
 #[test]
-fn value_hash_is_deterministic_and_spreads() {
+fn the_index_hash_spreads() {
     let names: Vec<Vec<u8>> = (0..20_000u32).map(|n| format!("name {n}").into_bytes()).collect();
-    let hashes: Vec<u64> = names.iter().map(|name| value_hash(name)).collect();
-    assert_eq!(hashes, names.iter().map(|name| value_hash(&name.clone())).collect::<Vec<_>>());
+    let key = index_key(names.iter().map(Vec::as_slice));
+    let hashes: Vec<u64> = names.iter().map(|name| key.hash(name)).collect();
     let mut distinct = hashes.clone();
     distinct.sort_unstable();
     distinct.dedup();
@@ -413,23 +501,113 @@ fn value_hash_is_deterministic_and_spreads() {
     }
     assert!(tags.iter().all(|&n| n > 0));
     assert!(starts.iter().all(|&n| n < 60), "{:?}", starts.iter().max());
-    assert_ne!(value_hash(b""), value_hash(b"\0"));
-    assert_ne!(value_hash(b"ab"), value_hash(b"ba"));
+    assert_ne!(key.hash(b""), key.hash(b"\0"));
+    assert_ne!(key.hash(b"ab"), key.hash(b"ba"));
 }
 
-/// The hash images' indices were written with, on fixed names (an independent port's values):
-/// moving it to `blaze_phf::name_hash` changed no image.
+/// The hash the image's index is laid out by is SipHash-1-3, on fixed names under a fixed key
+/// (an independent port's values): it may not depend on the process, the build or the
+/// platform. The key is a function of the kept values alone.
 #[test]
-fn value_hash_is_the_images() {
+fn the_index_hash_is_the_images() {
+    let key = SipKey::new(0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908);
     let pinned: [(&[u8], u64); 5] = [
-        (b"", 0x0000_0000_0000_0000),
-        (b"self", 0x8ee2_77cb_dda4_1080),
-        (b"iter_mut", 0x1968_ac94_8c10_92c0),
-        (b"core::fmt", 0x9520_d3d0_256e_a04e),
-        ("ünïcödé".as_bytes(), 0x5842_b22d_3dc8_f64d),
+        (b"", 0xabac_0158_050f_c4dc),
+        (b"self", 0x22f0_2dea_c666_6ba0),
+        (b"iter_mut", 0x777b_0425_4dc8_bc6e),
+        (b"core::fmt", 0x7177_ac06_7f9d_9af4),
+        ("ünïcödé".as_bytes(), 0x0179_9c15_29bb_30bd),
     ];
     for (bytes, hash) in pinned {
-        assert_eq!(value_hash(bytes), hash, "{bytes:?}");
+        assert_eq!(key.hash(bytes), hash, "{bytes:?}");
+    }
+    let values: [&[u8]; 3] = [b"x", b"yz", b""];
+    assert_eq!(index_key(values), index_key(values.map(|it| it)));
+    assert_ne!(index_key(values), index_key([&b"xy"[..], b"z", b""]), "lengths are in the key");
+    assert_ne!(index_key(values), index_key([&b"yz"[..], b"x", b""]), "the order is in the key");
+}
+
+/// Two tables that interned the same values in the same order write the same bytes, though
+/// each drew its own random key for the overlay: no image depends on that key.
+#[test]
+fn an_image_is_the_same_whatever_the_overlay_key() {
+    let tables = [Table::new(shape()), Table::new(shape())];
+    assert_ne!(tables[0].overlay, tables[1].overlay);
+    for table in &tables {
+        let mut rng = SplitMix64::new(9);
+        (0..3_000).for_each(|_| _ = table.intern(name(&mut rng).as_bytes()));
+        (0..3_000u32).for_each(|n| _ = table.intern(format!("value {n}").as_bytes()));
+    }
+    let live = everything(&tables[0]);
+    assert_eq!(section_bytes(&tables[0], &live), section_bytes(&tables[1], &live));
+    let reopened = [reopen(&tables[0], &live).unwrap(), reopen(&tables[1], &live).unwrap()];
+    assert_eq!(reopened[0].base.key, reopened[1].base.key);
+    assert_ne!(reopened[0].overlay, reopened[1].overlay);
+}
+
+/// `n` distinct 24-byte ASCII names with one [`blaze_phf::name_hash`], as review finding S5
+/// made them: every step of that hash inverts, so after two free words the third is solved for
+/// a fixed state before the finish; about one try in 256 solves to ASCII.
+fn names_with_one_name_hash(n: usize) -> Vec<String> {
+    use blaze_phf::{NAME_K, name_hash_start, name_hash_word};
+    const STATE: u64 = 0x0123_4567_89ab_cdef;
+    // NAME_K's inverse mod 2^64, by Newton's iteration: each step doubles the bits that hold.
+    let mut inverse = NAME_K;
+    (0..6).for_each(|_| inverse = inverse.wrapping_mul(2u64.wrapping_sub(NAME_K.wrapping_mul(inverse))));
+    assert_eq!(NAME_K.wrapping_mul(inverse), 1);
+    let before = STATE.rotate_right(26).wrapping_mul(inverse);
+    let hex = |word: u64| -> [u8; 8] { std::array::from_fn(|at| b"0123456789abcdef"[(word >> (4 * at)) as usize & 15]) };
+    let mut names = Vec::with_capacity(n);
+    for tries in 0u64.. {
+        if names.len() == n {
+            break;
+        }
+        let (first, second) = (hex(tries), hex(tries >> 32 | 0x5a5a_0000));
+        let mut h = name_hash_start(24);
+        h = name_hash_word(h, u64::from_le_bytes(first));
+        h = name_hash_word(h, u64::from_le_bytes(second));
+        let third = h ^ before;
+        if third & 0x8080_8080_8080_8080 != 0 {
+            continue;
+        }
+        let bytes = [first, second, third.to_le_bytes()].concat();
+        names.push(String::from_utf8(bytes).expect("ASCII"));
+    }
+    names
+}
+
+/// Review finding S5: names with one `name_hash` cost the table a bounded number of probes
+/// each, interned, found again, written into an image and found in it. With the table placed
+/// by `name_hash` again, each probe walks past every name before it: interning 10k such names
+/// loaded 26 million control words (16k: 74 million and 607 ms, against 75 thousand and 1.7 ms
+/// placed by SipHash), where the bound is 16 a name.
+#[test]
+fn names_with_one_name_hash_take_bounded_probes() {
+    const N: usize = 10_000;
+    let names = names_with_one_name_hash(N);
+    let hash = blaze_phf::name_hash(names[0].as_bytes());
+    assert!(names.iter().all(|name| blaze_phf::name_hash(name.as_bytes()) == hash));
+    assert_eq!(names.iter().collect::<std::collections::BTreeSet<_>>().len(), N, "distinct names");
+
+    let table = Table::new(shape());
+    probes::take();
+    let ids: Vec<u32> = names.iter().map(|name| table.intern(name.as_bytes())).collect();
+    let interned = probes::take();
+    for (name, &id) in names.iter().zip(&ids) {
+        assert_eq!(table.find(name.as_bytes()), Some(id));
+    }
+    let found = probes::take();
+    let restored = reopen(&table, &everything(&table)).unwrap();
+    let written = probes::take();
+    for (name, &id) in names.iter().zip(&ids) {
+        assert_eq!(restored.intern(name.as_bytes()), id);
+    }
+    let found_in_image = probes::take();
+    let bound = 16 * N as u64;
+    for (what, probes) in
+        [("interning", interned), ("finding", found), ("writing the index", written), ("finding in the image", found_in_image)]
+    {
+        assert!(probes <= bound, "{what} {N} names with one name_hash loaded {probes} control words, over {bound}");
     }
 }
 

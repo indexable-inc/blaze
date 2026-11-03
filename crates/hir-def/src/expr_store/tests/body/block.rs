@@ -11,7 +11,7 @@ fn outer() {
     fn inner() {}
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - inner : value
 
@@ -36,7 +36,7 @@ fn outer() {
     $0
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - CrateStruct : type (import)
             - PlainStruct : type (import) value (import)
@@ -64,7 +64,7 @@ fn outer() {
     $0
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - imported : type (import) value (import)
             - name : value
@@ -90,7 +90,7 @@ fn outer() {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - inner1 : type (import)
             - inner2 : value
@@ -119,7 +119,7 @@ mod module {
 
 struct Struct {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - Struct : type (import)
 
@@ -151,7 +151,7 @@ fn outer() {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - ResolveMe : type (import)
 
@@ -188,7 +188,7 @@ fn f() {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             ModuleIdLt {
                 [id]: Id(12291),
                 krate: Crate(
@@ -224,7 +224,7 @@ fn f() {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - ResolveMe : type (import)
 
@@ -261,7 +261,7 @@ fn f() {
     $0
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - Hit : type
 
@@ -297,7 +297,7 @@ pub mod cov_mark {
     pub use crate::_mark as mark;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - Hit : type
 
@@ -330,7 +330,7 @@ fn main() {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - module : type
 
@@ -368,7 +368,7 @@ fn f() {
     }
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - Def : type
 
@@ -395,7 +395,7 @@ fn main() {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - Struct : type
             - module : type
@@ -423,7 +423,7 @@ mod m {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - _ : type (import)
             - Tr : type
@@ -459,7 +459,7 @@ fn foo() {
     $0
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - bar : value
 
@@ -497,7 +497,7 @@ fn foo() {
     $0
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - on : value
 
@@ -522,7 +522,7 @@ fn outer() {
     $0
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - name : _
             - tests : type
@@ -550,7 +550,7 @@ fn foo() {
     $0
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - inner : value
 
@@ -572,7 +572,7 @@ fn f() {$0
     foo!{}
 };
         "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - BAR : value
             - FOO : value
@@ -599,7 +599,7 @@ fn main() {
 //- /core.rs crate:core
 pub struct S;
         "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - f : type
 
@@ -629,7 +629,7 @@ fn main() {
 //- /core.rs crate:core
 pub const S;
         "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - S : type (import) value (import)
             - inner : value
@@ -668,7 +668,7 @@ macro_rules! target_os {
     () => { pub struct Linux; };
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - build : type
 
@@ -709,7 +709,7 @@ mod user {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             (block scope)
             - from_def_site : value
 

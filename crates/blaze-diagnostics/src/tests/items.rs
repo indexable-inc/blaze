@@ -6,12 +6,14 @@ mod crate_attr;
 mod defs;
 mod features;
 mod generics;
+mod impl_trait_in_trait;
 mod impls;
 mod krate;
 mod lifetimes;
 mod macros;
 mod names;
 mod parse;
+mod refine;
 mod refused;
 mod resolve;
 

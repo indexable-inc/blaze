@@ -446,6 +446,7 @@ impl Only {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Entry {
     /// The path as said to a person: `std::env::var`, `<std::fs::File as Read>`.
     what: &'static str,

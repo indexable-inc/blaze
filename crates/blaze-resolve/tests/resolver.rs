@@ -12,7 +12,7 @@ macro_rules! pkg {
     });
 
     ($pkgid:expr) => ({
-        crate::helpers::pkg($pkgid)
+        crate::helpers::pkg(&$pkgid)
     })
 }
 
@@ -878,7 +878,7 @@ fn resolving_slow_case_missing_feature() {
 
     reg.push(pkg_dep_with(&("last", "1.0.0"), vec![], &[("f", &[])]));
     for v in 1..LAST_CRATE_VERSION_COUNT {
-        reg.push(pkg(("last", format!("1.0.{v}"))));
+        reg.push(pkg(&("last", format!("1.0.{v}"))));
     }
 
     reg.push(pkg_dep(
@@ -1115,7 +1115,7 @@ mod validated {
 
     #[test]
     fn missing_dep_feature() {
-        let reg = registry(vec![pkg("a"), pkg_dep_with(&"dep", vec![dep("a")], &[("f", &["a/a"])])]);
+        let reg = registry(vec![pkg(&"a"), pkg_dep_with(&"dep", vec![dep("a")], &[("f", &["a/a"])])]);
 
         let deps = vec![dep("dep").with(&["f"])];
         assert!(resolve_and_validated(deps, &reg).is_err());
@@ -1124,7 +1124,7 @@ mod validated {
     #[test]
     fn missing_weak_dep_feature() {
         let reg = registry(vec![
-            pkg("a"),
+            pkg(&"a"),
             pkg_dep_with(&"dep1", vec![dep("a")], &[("f", &["a/a"])]),
             pkg_dep_with(&"dep2", vec!["a".opt()], &[("f", &["a/a"])]),
             pkg_dep_with(&"dep3", vec!["a".opt()], &[("f", &["a?/a"])]),
@@ -1158,8 +1158,8 @@ mod validated {
     #[test]
     fn conflict_feature_and_sys() {
         let reg = registry(vec![
-            pkg(("a-sys", "1.0.0")),
-            pkg(("a-sys", "2.0.0")),
+            pkg(&("a-sys", "1.0.0")),
+            pkg(&("a-sys", "2.0.0")),
             pkg_dep_with(&("a", "1.0.0"), vec![dep_req("a-sys", "1.0.0")], &[("f", &[])]),
             pkg_dep_with(&("a", "2.0.0"), vec![dep_req("a-sys", "2.0.0")], &[("g", &[])]),
             pkg_dep(&"dep", vec![dep_req("a", "2.0.0")]),
@@ -1172,8 +1172,8 @@ mod validated {
     #[test]
     fn conflict_weak_features() {
         let reg = registry(vec![
-            pkg(("a-sys", "1.0.0")),
-            pkg(("a-sys", "2.0.0")),
+            pkg(&("a-sys", "1.0.0")),
+            pkg(&("a-sys", "2.0.0")),
             pkg_dep(&"a1", vec![dep_req("a-sys", "1.0.0").opt()]),
             pkg_dep(&"a2", vec![dep_req("a-sys", "2.0.0").opt()]),
             pkg_dep_with(
@@ -1192,8 +1192,8 @@ mod validated {
     #[test]
     fn multiple_dep_kinds_and_targets() {
         let reg = registry(vec![
-            pkg(("a-sys", "1.0.0")),
-            pkg(("a-sys", "2.0.0")),
+            pkg(&("a-sys", "1.0.0")),
+            pkg(&("a-sys", "2.0.0")),
             pkg_dep_with(
                 &"dep1",
                 vec![
@@ -1341,7 +1341,7 @@ mod validated {
     #[test]
     fn optional_dep_features_with_rename() {
         let reg = registry(vec![
-            pkg("x1"),
+            pkg(&"x1"),
             pkg_dep(&"a", vec!["x1".opt(), "x2".opt(), "x3".opt()]),
             pkg_dep(
                 &"dep1",
@@ -1375,7 +1375,7 @@ mod validated {
     fn default_feature_multiple_major_versions() {
         let reg = registry(vec![
             pkg_dep_with(&("a", "0.2.0"), vec![], &[("default", &[])]),
-            pkg(("a", "0.3.0")),
+            pkg(&("a", "0.3.0")),
             pkg_dep_with(&("a", "0.4.0"), vec![], &[("default", &[])]),
             pkg_dep(
                 &"dep1",

@@ -229,7 +229,7 @@ fn read_mutability(dec: &mut Dec<'_>) -> R<Mutability> {
 }
 
 fn write_simplified(enc: &mut Enc<'_>, it: &SimplifiedType<'_>) -> R {
-    fn index<T: PartialEq>(all: &[T], it: T) -> u32 {
+    fn index<T: PartialEq + Copy>(all: &[T], it: T) -> u32 {
         all.iter().position(|x| *x == it).unwrap() as u32
     }
     match *it {

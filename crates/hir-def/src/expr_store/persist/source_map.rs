@@ -1354,7 +1354,7 @@ fn f(a: u32, (b, c): (u32, u32)) -> u32 {
     #[test]
     fn a_corrupted_source_table_is_refused() {
         let (db, defs) = bodies("fn f() -> u32 { let a = 1; a + 2 }");
-        let (_, source_map) = Body::with_source_map(&db, defs[0]);
+        let source_map = Body::source_map(&db, defs[0]);
         let bytes = blaze_format::to_bytes(&source_map.store);
         let buffer = Aligned::copy_from(&bytes);
         let read = ExpressionStoreSourceMap::read(&buffer).expect("a source map just written");

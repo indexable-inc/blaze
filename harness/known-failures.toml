@@ -181,9 +181,7 @@ crates = ["blaze-engine"]
 "hir_expand::view_tests::walks_and_ranges_up" = { owner = "unowned", cause = "snapshot differs; followups.md:47 says not comptime lane's file, no owner" }
 
 [crates.hir-ty]
-"hir_ty::db::kinds::tests::every_query_has_a_kind" = { owner = "v2-uint", cause = "`int_gates` (new in v2-uint) has no kind in hir_ty::db::kinds" }
 "hir_ty::method_resolution::delta::tests::a_dependency_served_from_its_image_keeps_impl_tables_over_the_decoded_map" = { owner = "v2-nameres-panic", cause = "nameres maintainer apply runs crate_local_def_map: finish_crate's served_delta calls crate_def_map inside apply (hir-def nameres/delta.rs), tripping maintain.rs's reads/apply check" }
-"hir_ty::next_solver::goal_store::tests::the_solver_version_covers_every_patch" = { owner = "v2-uint", cause = "SOLVER_FILES (next_solver/goal_store.rs) lacks the new 0011 patches (v2-uint) and 0012-deep-folds-guarded (v2-identity-port.md:1291)" }
 "hir_ty::tests::budget::a_cold_infer_allocates_its_result_alone" = { owner = "unowned", cause = "cold infer makes 65 allocations, result owns 22; routed to sol-all-ty (01441) by v2-no-fallback-front.md:43, which has no handoff" }
 "hir_ty::tests::fn_item_predicates::a_fn_item_with_a_reference_to_dyn_fn_parameter_meets_fn_of_every_lifetime" = { owner = "v2-sb-frontend2", cause = "`as_static` (`&dyn Fn(usize, &(dyn Fn(usize) + 'static))` from `&with_static`) is a TypeMismatch with an error region; the test is new in sb-frontend2, whose fix passes the other shapes; on cp36 a404bdfc8a with the test added every shape fails (cp37-521)" }
 

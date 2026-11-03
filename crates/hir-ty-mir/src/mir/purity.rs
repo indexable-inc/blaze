@@ -330,7 +330,7 @@ fn static_state(db: &Db, krate: base_db::Crate, id: StaticId) -> Option<String> 
     if hir_ty::drop::is_freeze(&infcx, ty, ParamEnv::empty()) {
         return None;
     }
-    let shown = super::type_name::rustc_type_name(db, ty)
+    let shown = hir_ty_print::rustc_type_name(db, ty)
         .map(|it| {
             let (bare, rest) = it.split_at(it.find('<').unwrap_or(it.len()));
             // alloc: the impurity the query keeps

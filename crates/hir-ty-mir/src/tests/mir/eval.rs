@@ -1506,6 +1506,29 @@ fn main<'a, T: Foo + Bar + Baz>(
     );
 }
 
+/// An impl whose method returns no type where the trait's has its `impl Trait` gives the
+/// impl's item no value (`hir_ty::rpitit::RpititError`): a generic caller instantiated with that
+/// impl stops with why, naming the method and the item, not with a bare `{error}` type.
+#[test]
+fn an_impl_trait_in_trait_item_with_no_value_stops_with_why() {
+    check_error_with(
+        r#"
+//- minicore: sized
+struct W<T>(T);
+trait Tr { fn f(&self) -> W<impl Sized>; }
+struct S;
+impl Tr for S { fn f(&self) -> u8 { 0 } }
+fn g<T: Tr>(t: &T) { let _x = t.f(); }
+fn main() { g(&S); }
+"#,
+        |e| matches!(
+            innermost(&e),
+            MirEvalError::MirLowerError(_, MirLowerError::RpititValue(message))
+                if message.contains("`f`") && message.contains("{impl Trait#0 of `f`}")
+        ),
+    );
+}
+
 #[test]
 fn derive_from() {
     // Nightly's `#[derive(From)]` (#600): `From` of the one field's type, for a tuple struct, a

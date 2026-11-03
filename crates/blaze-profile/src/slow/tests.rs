@@ -28,6 +28,7 @@ fn span(thread: u32, span_id: u64, parent: Option<u64>, name: &str, start: i64, 
         awaits: None,
         owner: None,
         job: Some(job),
+        creator: None,
         start_ns: start * U,
         dur_ns: dur * U,
         self_cpu_ns: None,
@@ -154,4 +155,183 @@ fn waits_the_record_never_ends_are_told_apart_by_the_wall_they_cover() {
     assert!(unended.hidden_ns <= 100 * U, "the wall the waits cover, not their sum: {}", unended.hidden_ns);
     assert!(it.findings.iter().all(|it| it.kind != Kind::Wait), "no wait class holds them: {:#?}", it.findings);
     assert!(it.blind_spots.iter().all(|it| it.kind != BlindKind::UnnamedWait), "{:#?}", it.blind_spots);
+}
+
+/// The daemon of the [`a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running`]
+/// fixture, in a child process: it claims the history `dir` as blaze-cargo's daemon does,
+/// starts build 1, closes one span in it, enters a wait it never leaves, flushes, says it is
+/// ready, and sleeps until it is killed.
+#[cfg(unix)]
+fn killed_daemon(dir: &std::path::Path) -> ! {
+    use std::io::Write as _;
+    crate::install();
+    let owner = std::fs::File::create(dir.join(crate::history::OWNER)).unwrap();
+    owner.lock().unwrap();
+    write!(&owner, "{}", std::process::id()).unwrap();
+    let mut history = crate::history::History::open(dir, crate::history::CAP_BYTES).unwrap();
+    history.build_started(crate::history::BuildRow {
+        build_id: 1,
+        commit: None,
+        workspace: "/work/app".into(),
+        command: "build".into(),
+        started_ns: crate::clock::mono_ns(),
+        dur_ns: None,
+        started_unix_ns: None,
+        outcome: crate::history::Outcome::Running,
+        hits: None,
+        misses: None,
+        joined: None,
+        tree: None,
+        blaze: None,
+    });
+    let entered = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("worker stuck".to_owned())
+            .spawn_scoped(scope, || {
+                let _build = crate::flight::building(1);
+                drop(tracing::info_span!(target: "blaze", "unit done", krate = "app").entered());
+                let _unit = tracing::info_span!(target: "blaze", "unit bodies", krate = "app").entered();
+                let awaits = crate::span::Name::of("the lock no one lets go");
+                let on = blaze_graph::wait::WaitKind::Key;
+                let _wait = crate::span::Wait { awaits, function: awaits, owner: Some(7), on }.open();
+                entered.wait();
+                loop {
+                    std::thread::park();
+                }
+            })
+            .unwrap();
+        entered.wait();
+        // The history's drain thread takes the closed span within its period; flushed until a
+        // flush holds it, at most 5 s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while history.flush(Some(1)).unwrap().spans == 0 {
+            assert!(std::time::Instant::now() < deadline, "no flush held the closed span in 5 s");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::fs::write(dir.join("ready"), b"").unwrap();
+        loop {
+            std::thread::park();
+        }
+    })
+}
+
+/// A daemon SIGKILLed mid-build leaves no end row, yet `blaze slow` reports its build: as ended
+/// by the daemon's death, to its last row, naming the wait its stuck thread was inside and who
+/// ran what it waited on. Remove the `open` reading from the flush, or the death from the build
+/// pick, and this fails.
+#[test]
+#[cfg(unix)]
+#[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
+fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
+    const CHILD: &str = "BLAZE_TEST_KILLED_DAEMON";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        killed_daemon(std::path::Path::new(&dir));
+    }
+    let duckdb = std::path::PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+    let dir = std::env::temp_dir().join(format!("blaze-slow-killed-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["slow::tests::a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running", "--exact", "--ignored", "--nocapture"])
+        .env(CHILD, &dir)
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !dir.join("ready").exists() {
+        assert!(child.try_wait().unwrap().is_none(), "the daemon child exited before it was ready");
+        assert!(std::time::Instant::now() < deadline, "the daemon child was not ready in 60 s");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let source = crate::time::load::Source { duckdb: &duckdb, history: &dir };
+    let report = load::run(&source, None).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(report.build.id, 1);
+    let died = report.build.died.as_ref().unwrap_or_else(|| panic!("the build is reported as ended by its daemon's death: {report:?}"));
+    assert_eq!(died.process, pid);
+    assert!(died.read_ns.is_some(), "the flush wrote what the threads were inside");
+    let stuck = died.threads.iter().find(|it| it.name.as_deref() == Some("worker stuck")).unwrap_or_else(|| panic!("{died:?}"));
+    let names: Vec<&str> = stuck.spans.iter().map(|it| it.name.as_str()).collect();
+    assert_eq!(names, ["unit bodies", "wait"], "outermost first");
+    assert_eq!(stuck.spans[1].awaits.as_deref(), Some("the lock no one lets go"));
+    assert_eq!(stuck.spans[1].owner, Some(7));
+    let text = text(&report, 10);
+    let pid_said = format!("pid {pid}");
+    for said in ["ended by the daemon's death", pid_said.as_str(), "worker stuck (tid ", ", awaiting the lock no one lets go, run by task 7 ("] {
+        assert!(text.contains(said), "the report says {said:?}:\n{text}");
+    }
+    _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Runs `fixture`, DuckDB's SQL writing a history's Parquet files into `dir` (`{d}`), beside the
+/// history's schema files.
+fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("blaze-slow-{name}-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    crate::history::History::open(&dir, crate::history::CAP_BYTES).unwrap();
+    let fixture = fixture.replace("{d}", &dir.display().to_string());
+    let written = std::process::Command::new(duckdb).args(["-batch", "-bail", "-init", "/dev/null", "-c", &fixture]).output().unwrap();
+    assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
+    dir
+}
+
+/// Two daemons in one history, pid 7 and then pid 8, each with a build 1 (as every daemon
+/// numbered its builds before 2026-11-03 when the one before never flushed its build's end):
+/// `blaze slow` refuses to read them as one build and names both, rather than sum their
+/// workers and windows (selfbuild4 read a 200 s step as 2296 s of 72 workers). And a build of
+/// one daemon takes no row of another process in its window.
+#[test]
+#[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
+fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
+    let duckdb = std::path::PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+    let builds = "COPY (SELECT * FROM (VALUES (1::UBIGINT, 1000::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
+        AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000002.builds.parquet';\n";
+    let mixed = history_of(
+        &duckdb,
+        "mixed",
+        &format!(
+            "{builds}COPY (SELECT * FROM (VALUES \
+                (1::UBIGINT, 7::UINTEGER, 10::UINTEGER, 1::UBIGINT, 0::USMALLINT, 'unit a', 0::BIGINT, 100::BIGINT), \
+                (1, 8, 10, 1, 0, 'unit a', 1000, 100)) \
+                AS t(build_id, process, thread, span_id, depth, name, start_ns, dur_ns)) TO '{{d}}/0-00000001.spans.parquet';\n\
+             COPY (SELECT * FROM (VALUES \
+                (1::UBIGINT, 7::UINTEGER, 10::UINTEGER, 0::BIGINT, 'started', 1::UBIGINT, 1::UINTEGER, 0::UINTEGER), \
+                (1, 7, 10, 100, 'ended', 1, 1, 0), (1, 8, 10, 1000, 'started', 1, 1, 0), (1, 8, 10, 1100, 'ended', 1, 1, 0)) \
+                AS t(build_id, process, thread, t_ns, event, job, fiber, core)) TO '{{d}}/0-00000001.switches.parquet';\n"
+        ),
+    );
+    let source = crate::time::load::Source { duckdb: &duckdb, history: &mixed };
+    match load::run(&source, Some(1)) {
+        Err(crate::time::TimeError::ManyProcesses { build: 1, processes }) => {
+            let pids: Vec<(u32, u64)> = processes.iter().map(|it| (it.process, it.rows)).collect();
+            assert_eq!(pids, [(7, 3), (8, 3)], "each daemon named with its rows: {processes:?}");
+        }
+        other => panic!("two daemons' build 1 read as one build: {other:?}"),
+    }
+    _ = std::fs::remove_dir_all(&mixed);
+
+    let apart = history_of(
+        &duckdb,
+        "apart",
+        &format!(
+            "{builds}COPY (SELECT * FROM (VALUES \
+                (1::UBIGINT, 8::UINTEGER, 10::UINTEGER, 1::UBIGINT, 0::USMALLINT, 'unit a', 1000::BIGINT, 100::BIGINT), \
+                (NULL, 7, 10, 2, 0, 'unit of no build', 1010, 50)) \
+                AS t(build_id, process, thread, span_id, depth, name, start_ns, dur_ns)) TO '{{d}}/1-00000001.spans.parquet';\n\
+             COPY (SELECT * FROM (VALUES (1::UBIGINT, 8::UINTEGER, 10::UINTEGER, 1000::BIGINT, 'started', 1::UBIGINT, 1::UINTEGER, 0::UINTEGER), \
+                (1, 8, 10, 1100, 'ended', 1, 1, 0)) \
+                AS t(build_id, process, thread, t_ns, event, job, fiber, core)) TO '{{d}}/1-00000001.switches.parquet';\n"
+        ),
+    );
+    let source = crate::time::load::Source { duckdb: &duckdb, history: &apart };
+    let pick = crate::time::load::pick(&source, Some(1)).unwrap_or_else(|error| panic!("{error}"));
+    let (input, process) = crate::time::load::rows(&source, pick).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(process, Some(8));
+    let processes: Vec<u32> = input.spans.iter().map(|it| it.process).collect();
+    assert_eq!(processes, [8], "another process's row of no build in the window is not the build's");
+    load::run(&source, Some(1)).unwrap_or_else(|error| panic!("{error}"));
+    _ = std::fs::remove_dir_all(&apart);
 }

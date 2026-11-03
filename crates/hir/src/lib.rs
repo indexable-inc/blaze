@@ -166,6 +166,7 @@ pub use crate::{
     attrs::{AttrsOwner, AttrsWithOwner, HasAttrs, resolve_doc_path_on},
     body_analysis::BodyAnalysis,
     diagnostics::*,
+    source_analyzer::NotInAstIdMap,
     match_lints::{
         BindingOrigin, BindingWithVariantName, ConstPatternError, IrrefutableLet, LetSource,
         ManualPartialEq, MatchLint, NonContiguousRangeEndpoints, OverlappingRangeEndpoints,
@@ -243,7 +244,7 @@ pub use {
     // FIXME: Properly encapsulate mir
     hir_ty_mir::mir,
     hir_ty_mir::{const_macro, mir_pretty::ConstEvalErrorPretty},
-    hir_ty_wfcheck::SignatureMismatchAt,
+    hir_ty_wfcheck::{ImplTraitRefinement, RefinementKind, SignatureMismatchAt, Undercapture},
     intern::{Symbol, sym},
 };
 
@@ -398,15 +399,15 @@ impl Crate {
         }
     }
 
-    pub fn query_external_importables(
+    pub fn query_external_importables<'db>(
         self,
-        db: &Db,
-        query: import_map::Query,
-    ) -> impl Iterator<Item = (Either<ModuleDef, Macro>, Complete)> {
+        db: &'db Db,
+        query: &import_map::Query,
+    ) -> impl Iterator<Item = (Either<ModuleDef, Macro>, Complete)> + use<'db> {
         let _p = tracing::info_span!(target: "blaze", "query_external_importables").entered();
         let mut found = blaze_mem::scratch::lend::<crate::scratch::Importables>();
         let mut seen = crate::scratch::take_importables_seen();
-        import_map::search_dependencies_each(db, self.into(), &query, |item, complete| {
+        import_map::search_dependencies_each(db, self.into(), query, |item, complete| {
             if seen.insert((item, complete)) {
                 found.push((item, complete));
             }
@@ -1818,6 +1819,73 @@ impl Function {
         })
     }
 
+    /// For a method of a trait impl, why it gives no type for an `impl Trait` of its trait
+    /// method's return type: rustc's errors of `collect_return_position_impl_trait_in_trait_tys`.
+    /// `None` when it gives each one, and when the methods differ in what is an error of its
+    /// own first (E0049, E0050, E0185, E0186, E0195). While there is one, the signatures are not
+    /// compared ([`Function::impl_signature_mismatch`] is `None`), as in rustc.
+    pub fn impl_trait_in_trait_error(self, db: &Db) -> Option<ImplTraitInTraitError<'_>> {
+        use hir_ty::rpitit::RpititError;
+        let AnyFunctionId::FunctionId(id) = self.id else {
+            return None;
+        };
+        let trait_fn = hir_ty::rpitit::implemented_trait_method(db, id)?;
+        let trait_method = Function::from(trait_fn);
+        let owner = GenericDefId::FunctionId(id);
+        let interner = DbInterner::new_no_crate(db);
+        let ty = |ty| Type::new_in(interner, owner, ty);
+        let (impl_trait, error) = hir_ty::rpitit::impl_rpitit_tys(db, id)
+            .iter()
+            .enumerate()
+            .find_map(|(index, it)| Some((index as u32, it.as_ref().err()?)))?;
+        Some(match error {
+            // E0049, E0195 and the like, each reported of its own; a signature that does not
+            // normalize is not compared (`compare_impl_method_signature`).
+            RpititError::GenericsDiffer | RpititError::Unnormalized => return None,
+            RpititError::NotFound => {
+                let (_, expected) = hir_ty_wfcheck::trait_signature_in_impl(db, id)?;
+                let found = self.signature(db)?.sig.output();
+                ImplTraitInTraitError::ReturnType {
+                    trait_method,
+                    expected: ty(hir_ty::rpitit::rpitits_unknown(interner, trait_fn, expected.output())),
+                    found: ty(found),
+                }
+            }
+            RpititError::Unsatisfied { bounds, of } => ImplTraitInTraitError::Unsatisfied {
+                trait_method,
+                bounds: of
+                    .iter()
+                    .zip(bounds.as_ref().iter())
+                    .map(|(&impl_trait, clause)| {
+                        let clause = rustc_type_ir::set_aliases_to_non_rigid(interner, clause)
+                            .skip_normalization();
+                        (impl_trait, WherePredicate { clause, owner: TypeOwnerId::GenericDefId(owner) })
+                    })
+                    .collect(), // alloc: error path, a reported error's bounds
+            },
+            RpititError::UncapturedLifetime { lifetime, hidden } => {
+                ImplTraitInTraitError::UncapturedLifetime {
+                    trait_method,
+                    impl_trait,
+                    lifetime: lifetime.clone(),
+                    hidden: ty(hidden.as_ref()),
+                }
+            }
+            RpititError::Unsolved => ImplTraitInTraitError::Unsolved { trait_method, impl_trait },
+        })
+    }
+
+    /// For a method of a trait impl, how it refines the `impl Trait`s its trait's method
+    /// returns: rustc's `refining_impl_trait` lint
+    /// (`check_refining_return_position_impl_trait_in_trait`). Ask it only once the method
+    /// compares with the trait's with no error, as rustc does.
+    pub fn impl_trait_refinement(self, db: &Db) -> Option<ImplTraitRefinement<'_>> {
+        let AnyFunctionId::FunctionId(id) = self.id else {
+            return None;
+        };
+        hir_ty_wfcheck::impl_trait_refinement(db, id)
+    }
+
     /// For a `#[proc_macro]` or `#[proc_macro_derive]` function, or with `attribute` a
     /// `#[proc_macro_attribute]` one, the first place its signature differs from safe Rust
     /// `fn(TokenStream) -> TokenStream` (two `TokenStream`s for an attribute): rustc's
@@ -2341,11 +2409,7 @@ impl ExternCrateDecl {
 
     /// Returns the name under which this crate is made accessible, taking `_` into account.
     pub fn alias_or_name(self, db: &Db) -> Option<Name> {
-        match self.alias(db) {
-            Some(ImportAlias::Underscore) => None,
-            Some(ImportAlias::Alias(alias)) => Some(alias),
-            None => Some(self.name(db)),
-        }
+        self.id.alias_or_name(db)
     }
 }
 
@@ -2508,8 +2572,8 @@ impl Trait {
         traits.iter().map(|tr| Trait::from(*tr)).collect() // alloc: editor edge
     }
 
-    pub fn function(self, db: &Db, name: impl PartialEq<Name>) -> Option<Function> {
-        self.id.trait_items(db).items.iter().find(|(n, _)| name == *n).and_then(|&(_, it)| match it
+    pub fn function(self, db: &Db, name: &impl PartialEq<Name>) -> Option<Function> {
+        self.id.trait_items(db).items.iter().find(|(n, _)| *name == *n).and_then(|&(_, it)| match it
         {
             AssocItemId::FunctionId(id) => Some(id.into()),
             _ => None,
@@ -2763,29 +2827,7 @@ impl Macro {
     }
 
     pub fn name(self, db: &Db) -> Name {
-        match self.id {
-            MacroId::Macro2Id(id) => {
-                let loc = id.lookup(db);
-                let source = loc.source_view(db);
-                as_name_opt(source.value.name())
-            }
-            MacroId::MacroRulesId(id) => {
-                let loc = id.lookup(db);
-                let source = loc.source_view(db);
-                as_name_opt(source.value.name())
-            }
-            MacroId::ProcMacroId(id) => {
-                let loc = id.lookup(db);
-                let source = loc.source_view(db);
-                match loc.kind {
-                    ProcMacroKind::CustomDerive => AttrFlags::derive_info(db, self.id).map_or_else(
-                        || as_name_opt(source.value.name()),
-                        |info| Name::new_symbol_root(info.trait_name),
-                    ),
-                    ProcMacroKind::Bang | ProcMacroKind::Attr => as_name_opt(source.value.name()),
-                }
-            }
-        }
+        self.id.name(db)
     }
 
     pub fn is_proc_macro(self) -> bool {
@@ -3164,6 +3206,34 @@ impl AssocItem {
             AssocItem::Const(it) => it.name(db),
             AssocItem::TypeAlias(it) => Some(it.name(db)),
         }
+    }
+
+    /// Whether this item of an impl of `trait_` implements the trait's `trait_item`, of any
+    /// kind (the caller matches kinds or namespaces): [`hir_def::nameres::implements`], rustc's
+    /// `check_trait_item`, which compares their names hygienically. A builtin derive's method
+    /// and an unnamed `const _` implement nothing here.
+    pub fn implements(self, db: &Db, trait_: Trait, trait_item: AssocItem) -> bool {
+        let (Ok(item), Ok(of_trait)) =
+            (AssocItemId::try_from(self), AssocItemId::try_from(trait_item))
+        else {
+            return false;
+        };
+        let (Some(name), Some(trait_name)) = (self.name(db), trait_item.name(db)) else {
+            return false;
+        };
+        hir_def::nameres::implements(db, trait_.id, item, name, of_trait, trait_name)
+    }
+
+    /// The name this item binds among its trait's or impl's items: its text keyed as a `macro`
+    /// writes it ([`hir_def::nameres::assoc_item_binding_name`], rustc's `BindingKey`), which
+    /// two items of one impl must not share. `None` for an unnamed `const _`.
+    pub fn binding_name(self, db: &Db) -> Option<Name> {
+        let name = self.name(db)?;
+        Some(match AssocItemId::try_from(self) {
+            Ok(id) => hir_def::nameres::assoc_item_binding_name(db, id, name),
+            // A builtin derive's method: core's trait's name, which has no key.
+            Err(()) => name,
+        })
     }
 
     pub fn module(self, db: &Db) -> Module {
@@ -3780,18 +3850,21 @@ impl TypeParam {
             .collect() // alloc: editor edge, the owned bound list callers take
     }
 
-    /// [`TypeParam::trait_bounds`] with the bounds' generic arguments, for blaze's lints.
-    pub fn trait_refs(self, db: &Db) -> Vec<TraitRef<'_>> {
+    /// [`TypeParam::trait_bounds`] with the bounds' generic arguments and their `for<'a>`
+    /// binders, for blaze's lints: `F: Fn(&T)` is `for<'a> F: Fn<(&'a T,)>`.
+    pub fn trait_bound_refs(self, db: &Db) -> Vec<TraitBound<'_>> {
         let interner = DbInterner::new_no_crate(db);
-        let owner = TypeOwnerId::GenericDefId(self.id.parent());
         let self_ty = self.ty(db).ty.instantiate_identity().skip_norm_wip();
         GenericPredicates::query_explicit(db, self.id.parent())
             .iter_identity()
-            .filter_map(|pred| match &pred.kind().skip_binder() {
-                ClauseKind::Trait(trait_ref) if trait_ref.self_ty() == self_ty => {
-                    Some(TraitRef::new(interner, owner, trait_ref.trait_ref))
+            .filter_map(|pred| {
+                let kind = pred.kind().skip_norm_wip();
+                match kind.skip_binder() {
+                    ClauseKind::Trait(it) if it.self_ty() == self_ty => {
+                        Some(TraitBound::new(interner, kind.rebind(it.trait_ref)))
+                    }
+                    _ => None,
                 }
-                _ => None,
             })
             // alloc: lints ask only for a bare type parameter's argument, and walk it twice
             .collect()
@@ -4144,6 +4217,59 @@ impl Impl {
             AnyImplId::ImplId(id) => check_orphan_rules(db, id),
             AnyImplId::BuiltinDeriveImplId(_) => true,
         }
+    }
+}
+
+/// A trait bound of a type parameter, as rustc's where clause: the parameter as `Self`, and
+/// the `for<'a>` binder of a bound like `F: Fn(&T)` kept, whose arguments name the regions it
+/// binds. Its arguments are not [`Type`]s: one under the binder is no type on its own.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct TraitBound<'db> {
+    /// Holds no rigid aliases, like [`TraitRef`]'s.
+    bound: hir_ty::next_solver::PolyTraitRef<'db>,
+}
+
+impl<'db> TraitBound<'db> {
+    fn new(interner: DbInterner<'db>, bound: hir_ty::next_solver::PolyTraitRef<'db>) -> Self {
+        Self { bound: rustc_type_ir::set_aliases_to_non_rigid(interner, bound).skip_normalization() }
+    }
+
+    pub fn trait_(&self) -> Trait {
+        Trait { id: self.bound.skip_binder().def_id.0 }
+    }
+
+    /// Whether `ty` meets the bound in place of its `Self`, in `ty`'s environment: clippy's
+    /// where clause instantiated with another type for the parameter and proven whole, its
+    /// binder kept (`for<'a> {closure}: Fn<(&'a T,)>`). Regions are erased but those the
+    /// binder binds, as trait goals are solved modulo regions; `false` where the bound's other
+    /// arguments name a type or const parameter of its item, or an error.
+    pub fn holds_for(&self, db: &'db Db, ty: &Type<'db>) -> bool {
+        let interner = DbInterner::new_no_crate(db);
+        let erased = Region::new_erased(interner);
+        let referent = rustc_type_ir::fold_regions(interner, ty.ty.skip_binder(), |region, _| {
+            match region.kind() {
+                rustc_type_ir::RegionKind::ReError(_) => erased,
+                _ => region,
+            }
+        });
+        let bound = self.bound.map_bound(|trait_ref| {
+            let args = rustc_type_ir::fold_regions(interner, trait_ref.args, |region, _| {
+                match region.kind() {
+                    rustc_type_ir::RegionKind::ReBound(..) => region,
+                    _ => erased,
+                }
+            });
+            hir_ty::next_solver::TraitRef::new_from_args(
+                interner,
+                trait_ref.def_id,
+                GenericArgs::new_from_iter(iter::once(referent.into()).chain(args.iter().skip(1))),
+            )
+        });
+        let own = &bound.skip_binder().args.as_slice()[1..];
+        if bound.references_error() || own.iter().any(|it| it.has_param()) {
+            return false;
+        }
+        traits::poly_trait_ref_holds(db, ty.param_env(db), bound)
     }
 }
 
@@ -6754,6 +6880,29 @@ pub struct ImplSignatureMismatch<'db> {
     /// The trait method's signature with the impl's arguments, in the impl method's generics.
     pub expected: FnSignature<'db>,
     pub found: FnSignature<'db>,
+}
+
+/// [`Function::impl_trait_in_trait_error`]: why a trait impl's method gives no type for an
+/// `impl Trait` of its trait method's return type. Types are in the impl method's generics,
+/// its late-bound lifetimes free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImplTraitInTraitError<'db> {
+    /// E0053 "method has an incompatible return type for trait": the impl's return type has
+    /// no type where the trait's has an `impl Trait`. `expected` is the trait's return type
+    /// with the impl's arguments, each of its `impl Trait`s unknown (an error type, printed
+    /// `_`).
+    ReturnType { trait_method: Function, expected: Type<'db>, found: Type<'db> },
+    /// E0277, E0271: the impl's types do not satisfy these bounds of the trait's `impl Trait`s,
+    /// each with the index of the `impl Trait` it bounds (rustc's "required by a bound in
+    /// `Trait::method::{anon_assoc#0}`") and the impl's types in place of the trait's.
+    Unsatisfied { trait_method: Function, bounds: Vec<(u32, WherePredicate<'db>)> },
+    /// rustc's "return type captures more lifetimes than trait definition": the impl's type
+    /// `hidden` for the `impl_trait`th `impl Trait` names the lifetime `lifetime` (its name as
+    /// written, `'_` for one left out), which the trait's does not capture.
+    UncapturedLifetime { trait_method: Function, impl_trait: u32, lifetime: Box<str>, hidden: Type<'db> },
+    /// The type of the `impl_trait`th `impl Trait`, in the bounds of another, can't be worked
+    /// out: those bounds stay ambiguous with the outer one's type (rustc's E0283 or E0284).
+    Unsolved { trait_method: Function, impl_trait: u32 },
 }
 
 /// [`Function::proc_macro_signature_mismatch`].

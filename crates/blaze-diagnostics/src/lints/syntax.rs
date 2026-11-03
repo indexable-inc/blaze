@@ -342,12 +342,12 @@ impl<'db> Walk<'db> {
             off,
             replaced,
             skips,
-            // clone: setup, once per tree, its place
-            place: place.clone(),
+            place,
         });
+        let tree = self.trees.len() - 1;
         for (at, expanded) in expansions {
-            // clone: setup, once per tree, as above
-            let mut place = place.clone();
+            // clone: setup, once per tree an expansion adds, its place
+            let mut place = self.trees[tree].place.clone();
             place.push(at);
             self.add(cx, expanded.file_id, expanded.value, place);
         }

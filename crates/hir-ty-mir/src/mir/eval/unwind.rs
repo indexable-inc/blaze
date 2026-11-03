@@ -55,6 +55,7 @@ pub(super) struct Unwinding<'db> {
 
 /// A `catch_unwind`'s call of `try_fn(data)`: a panic unwinding out of it calls
 /// `catch_fn(data, exception)`, and the intrinsic returns 1.
+#[derive(Clone, Copy)]
 pub(super) struct Catch {
     data: Address,
     catch_fn: usize,

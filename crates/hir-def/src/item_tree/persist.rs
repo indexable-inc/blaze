@@ -384,7 +384,8 @@ impl Persist for ItemTree {
     const SCHEMA: blaze_format::SchemaHash = blaze_format::schema_of(&[
         Part::Str("ItemTree"),
         // 5: a keyed name and a path's segment contexts (`ModPath::contexts`) are written.
-        Part::U64(5),
+        // 6: a `pub(in path)` or `pub(super)` visibility's context (`RawVisibility::Module`).
+        Part::U64(6),
         Part::Schema(<Root as Record>::SCHEMA),
     ]);
     type Ref<'a> = ItemTreeRef<'a>;
@@ -497,10 +498,11 @@ impl Persist for ItemTree {
 impl Code for RawVisibility {
     fn put(&self, w: &mut Words) {
         match self {
-            RawVisibility::Module(path, explicitness) => {
+            RawVisibility::Module(path, explicitness, ctxt) => {
                 w.u32(0);
                 path.put(w);
                 explicitness.put(w);
+                ctxt.put(w);
             }
             RawVisibility::PubSelf(explicitness) => {
                 w.u32(1);
@@ -515,7 +517,8 @@ impl Code for RawVisibility {
         Ok(match r.tag(4, "a visibility out of range")? {
             0 => {
                 let path = r.get()?;
-                RawVisibility::Module(path, r.get()?)
+                let explicitness = r.get()?;
+                RawVisibility::Module(path, explicitness, r.get()?)
             }
             1 => RawVisibility::PubSelf(r.get()?),
             2 => RawVisibility::PubCrate,
@@ -1299,6 +1302,17 @@ use a::{b, c};
         for (at, word) in [(count, u32::MAX), (count + 1, 4), (top_len, 9), (top_len, 2)] {
             let bad = patched(&bytes, word_at(at), word);
             assert!(ItemTree::read(&bad).unwrap().decode().is_err(), "word {at} set to {word}");
+        }
+    }
+
+    /// A `pub(in path)` or `pub(super)` visibility's context is written (schema 6): the same
+    /// path read back with each context it was written with.
+    #[test]
+    fn a_visibility_context_round_trips() {
+        let path = hir_expand::mod_path::ModPath::from_kind(hir_expand::mod_path::PathKind::Super(1));
+        for edition in [Edition::Edition2015, Edition::Edition2024] {
+            let ctxt = SyntaxContext::root(edition);
+            round_trip(&RawVisibility::Module(path, VisibilityExplicitness::Explicit, ctxt));
         }
     }
 }

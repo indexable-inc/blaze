@@ -111,7 +111,11 @@ and named; interned values are freed by the image's GC.
     section.
   - `a_restored_table_interns_from_many_threads`: no ID is given twice.
   - `value_hash_is_deterministic_and_spreads`: the index hash is the format's, the same in
-    every process.
+    every process. (2026-11-03, lane symhash: replaced by `the_index_hash_is_the_images` and
+    `an_image_is_the_same_whatever_the_overlay_key`. The index is now placed by SipHash-1-3
+    under a key derived from the kept values with BLAKE3 and stored in the root; the overlay
+    uses a random key per table. `names_with_one_name_hash_take_bounded_probes` bounds the
+    probes for names made to share a `name_hash`, which is review finding S5.)
 - **`crates/intern/src/symbol.rs`**
   - `every_compiled_in_text_interns_to_itself`: every compiled-in text interns to its constant
     ID.

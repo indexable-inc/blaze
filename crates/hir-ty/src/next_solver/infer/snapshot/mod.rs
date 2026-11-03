@@ -15,6 +15,7 @@ pub struct CombinedSnapshot {
     universe: UniverseIndex,
 }
 
+#[derive(Clone, Copy)]
 struct VariableLengths {
     region_constraints_len: usize,
     type_var_len: usize,

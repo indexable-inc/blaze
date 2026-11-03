@@ -409,7 +409,7 @@ fn resolve_doc_path_on_(
     let resolved = resolver.resolve_module_path_in_items(db, &modpath);
     if resolved.is_none() {
         let last_name = modpath.pop_segment()?;
-        resolve_assoc_or_field(db, resolver, modpath, last_name, ns)
+        resolve_assoc_or_field(db, &resolver, modpath, last_name, ns)
     } else {
         let def = match ns {
             Some(Namespace::Types) => resolved.take_types(),
@@ -427,7 +427,7 @@ fn resolve_doc_path_on_(
 
 fn resolve_assoc_or_field<'db>(
     db: &'db Db,
-    resolver: Resolver<'db>,
+    resolver: &Resolver<'db>,
     path: ModPath,
     name: Name,
     ns: Option<Namespace>,
@@ -539,7 +539,7 @@ fn resolve_assoc_item<'db>(
 
 fn resolve_impl_trait_item<'db>(
     db: &'db Db,
-    resolver: Resolver<'db>,
+    resolver: &Resolver<'db>,
     ty: &Type<'db>,
     name: &Name,
     ns: Option<Namespace>,
@@ -558,7 +558,7 @@ fn resolve_impl_trait_item<'db>(
     let resolution = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
         let ctx = MethodResolutionContext {
             infcx: &infcx,
-            resolver: &resolver,
+            resolver,
             param_env: param_env.param_env,
             traits_in_scope: TraitsInScope::Set(TraitSet::collect(
                 traits_in_scope.iter().copied(),

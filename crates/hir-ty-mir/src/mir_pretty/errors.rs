@@ -87,6 +87,7 @@ impl MirLowerError<'_> {
                 writeln!(f, "{}", hir_ty::intrinsic::UnknownIntrinsic(name.clone()))?
             }
             MirLowerError::ComptimeUnexpanded(it) => writeln!(f, "{it}")?,
+            MirLowerError::RpititValue(message) => writeln!(f, "{message}")?,
             MirLowerError::LayoutError(_)
             | MirLowerError::IncompleteExpr
             | MirLowerError::IncompletePattern
@@ -252,7 +253,7 @@ fn source_range(
 ) -> Option<(FileId, TextRange)> {
     let (source_map, self_param_syntax) = match def {
         InferBodyId::DefWithBodyId(def) => {
-            let body = &Body::with_source_map(db, def).1;
+            let body = Body::source_map(db, def);
             (&**body, body.self_param_syntax())
         }
         InferBodyId::AnonConstId(def) => {

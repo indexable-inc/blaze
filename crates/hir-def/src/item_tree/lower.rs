@@ -300,11 +300,11 @@ impl TreeBuilder {
         PathId { raw: self.paths.id(path) }
     }
 
-    fn alias(&mut self, alias: Option<ImportAlias>) -> AliasId {
+    fn alias(&mut self, alias: Option<&ImportAlias>) -> AliasId {
         match alias {
             None => AliasId::NONE,
             Some(ImportAlias::Underscore) => AliasId::UNDERSCORE,
-            Some(ImportAlias::Alias(name)) => AliasId { raw: self.name(name).raw },
+            Some(&ImportAlias::Alias(name)) => AliasId { raw: self.name(name).raw },
         }
     }
 
@@ -514,7 +514,7 @@ impl<'db> Ctx<'db> {
 
     pub(super) fn lower_module_items<'t>(
         mut self,
-        item_owner: impl HasModuleItem<'t>,
+        item_owner: impl HasModuleItem<'t> + Copy,
     ) -> ItemTree {
         for item in item_owner.items() {
             self.pend_top(item);
@@ -526,7 +526,7 @@ impl<'db> Ctx<'db> {
     /// begin, then where the last one's end: what [`super::items`] reuses rows of.
     pub(super) fn lower_module_items_marked<'t>(
         mut self,
-        item_owner: impl HasModuleItem<'t>,
+        item_owner: impl HasModuleItem<'t> + Copy,
         marks: &mut Vec<Marks>,
     ) -> ItemTree {
         for item in item_owner.items() {
@@ -849,7 +849,7 @@ impl<'db> Ctx<'db> {
         let ast_id = self.ids.ast_id_of_view::<tag::ExternCrate>(extern_crate);
 
         let res =
-            ExternCrate { name: self.tree.name(name), alias: self.tree.alias(alias), visibility };
+            ExternCrate { name: self.tree.name(name), alias: self.tree.alias(alias.as_ref()), visibility };
         let data = push(&mut self.tree.extern_crates, res);
         Some(self.tree.item(ItemKind::ExternCrate, ast_id.upcast(), data))
     }
@@ -924,12 +924,12 @@ impl<'db> Ctx<'db> {
         self.tree.item(ItemKind::ExternBlock, ast_id.upcast(), data)
     }
 
-    fn lower_visibility<'t>(&mut self, item: impl HasVisibility<'t>) -> RawVisibilityId {
+    fn lower_visibility<'t>(&mut self, item: impl HasVisibility<'t> + Copy) -> RawVisibilityId {
         let vis = self.lower_visibility_from_ast(item);
         self.tree.visibility(vis)
     }
 
-    fn lower_visibility_from_ast<'t>(&self, item: impl HasVisibility<'t>) -> RawVisibility {
+    fn lower_visibility_from_ast<'t>(&self, item: impl HasVisibility<'t> + Copy) -> RawVisibility {
         visibility_from_ast(self.db, item.visibility(), &mut |range| {
             self.span_map().span_for_range(range).ctx
         })
@@ -1037,7 +1037,7 @@ impl<'t> UseTreeLowering<'_, 't> {
                 (Some(path), alias, false) => {
                     self.map(tree);
                     let path = self.tree.path(path);
-                    let alias = self.tree.alias(alias);
+                    let alias = self.tree.alias(alias.as_ref());
                     Some(self.tree.use_tree(UseTree {
                         kind: UseTree::SINGLE,
                         path,
@@ -1121,5 +1121,12 @@ pub(crate) fn visibility_from_ast(
         }
         ast::VisibilityKind::Pub => return RawVisibility::Public,
     };
-    RawVisibility::Module(path, VisibilityExplicitness::Explicit)
+    // The context of the path's first token (`super`, `self`, `crate`, `::` or a name),
+    // normalized to macros 2.0: what def-site hygiene starts the path by, as rustc's
+    // `resolve_visibility` resolves the path with its spans. A root context in a real file.
+    let written = node.visibility_inner().and_then(|inner| inner.path());
+    let ctxt = written.map_or(SyntaxContext::root(span::Edition::Edition2015), |path| {
+        span_for_range(path.syntax().text_range()).normalize_to_macros_2_0(db)
+    });
+    RawVisibility::Module(path, VisibilityExplicitness::Explicit, ctxt)
 }

@@ -8,6 +8,13 @@
 //! from the body lowered alone ([`Body::relative`]), which an edit elsewhere leaves as it is.
 //! Only where the anchor begins ([`anchor_location`]) is found from the whole file, once per
 //! body, and added when the place is asked for.
+//!
+//! A place is found by plain functions over the body's memos, not memoized per span: a memo
+//! per span cost a row, a graph node, its edges and an interned key (about 140 bytes) for each
+//! of the millions of spans a build places, kept for the daemon's life, and saved little, as
+//! what reads the places (the positions of a body for the link, the rows of a compiled
+//! function) is itself memoized per body or per instance and reads every span of it again only
+//! when it runs again.
 
 #![forbid(unsafe_code)]
 
@@ -35,9 +42,9 @@ pub(crate) fn source_location(
     owner: DefWithBodyId,
     span: MirSpan,
 ) -> Option<(base_db::FileId, u32, u32)> {
-    let found = resolve(db, owner, (*source_place(db, owner, span))?);
+    let found = resolve(db, owner, source_place(db, owner, span)?);
     if check() {
-        compare("source", owner, span, found, *source_location_in_file(db, owner, span));
+        compare("source", owner, span, found, source_location_in_file(db, owner, span));
     }
     found
 }
@@ -49,9 +56,9 @@ pub(crate) fn row_location(
     closure: Option<ExprId>,
     span: MirSpan,
 ) -> Option<(base_db::FileId, u32, u32)> {
-    let found = resolve(db, owner, (*row_place(db, owner, closure, span))?);
+    let found = resolve(db, owner, row_place(db, owner, closure, span)?);
     if check() {
-        compare("row", owner, span, found, *row_location_in_file(db, owner, closure, span));
+        compare("row", owner, span, found, row_location_in_file(db, owner, closure, span));
     }
     found
 }
@@ -64,7 +71,7 @@ fn check() -> bool {
     *CHECK
 }
 
-fn compare<T: PartialEq + fmt::Debug>(
+fn compare<T: PartialEq + fmt::Debug + Copy>(
     what: &str,
     owner: DefWithBodyId,
     span: MirSpan,
@@ -157,7 +164,7 @@ fn source_range(
     syntax: &BodySyntax,
     span: MirSpan,
 ) -> Option<(HirFileId, TextRange)> {
-    let source_map = &Body::relative(db, owner).as_ref()?.1;
+    let source_map = Body::relative(db, owner).as_ref()?;
     let source = match span {
         MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
         // The block an `async fn` is taken to wrap its body in is not written anywhere, and
@@ -205,12 +212,9 @@ fn source_range(
 }
 
 /// The [`Place`] of [`source_location_in_file`].
-// Nothing in its arguments is ever collected (the query database frees no interned value),
-// so they stay interned and are never verified.
-#[blaze_query::tracked]
 fn source_place(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
     let Some(syntax) = body_syntax(db, owner).as_ref() else {
-        let (file, line, column) = (*source_location_in_file(db, owner, span))?;
+        let (file, line, column) = source_location_in_file(db, owner, span)?;
         return Some(Place::At(file, line, column));
     };
     let (file_id, range) = source_range(db, owner, syntax, span)?;
@@ -218,9 +222,6 @@ fn source_place(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
 }
 
 /// The [`Place`] of [`row_location_in_file`].
-// Nothing in its arguments is ever collected (the query database frees no interned value),
-// so they stay interned and are never verified.
-#[blaze_query::tracked]
 fn row_place(
     db: &Db,
     owner: DefWithBodyId,
@@ -228,14 +229,14 @@ fn row_place(
     span: MirSpan,
 ) -> Option<Place> {
     let Some(syntax) = body_syntax(db, owner).as_ref() else {
-        let (file, line, column) = (*row_location_in_file(db, owner, closure, span))?;
+        let (file, line, column) = row_location_in_file(db, owner, closure, span)?;
         return Some(Place::At(file, line, column));
     };
     let (file_id, range) = source_range(db, owner, syntax, span)?;
     if file_id.macro_file().is_none() {
-        return *source_place(db, owner, span);
+        return source_place(db, owner, span);
     }
-    let source_map = &Body::relative(db, owner).as_ref()?.1;
+    let source_map = Body::relative(db, owner).as_ref()?;
     let code = closure.unwrap_or_else(|| Body::of(db, owner).root_expr());
     let within = match source_map.expr_syntax(code) {
         Ok(body) => {
@@ -245,7 +246,7 @@ fn row_place(
                 false => body.file_id.span_map(db).span_for_range(start).ctx,
             }
         }
-        Err(_) => return *source_place(db, owner, span),
+        Err(_) => return source_place(db, owner, span),
     };
     written_place(db, owner, syntax, file_id, range, Some(within))
 }

@@ -413,7 +413,7 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
         child.step = step;
         // SAFETY: the end of the child, running nothing of the parent's (no atexit handler, no
         // stdio flush); async-signal-safe.
-        unsafe { libc::_exit(127) }
+        unsafe { libc::_exit(crate::exit::Exit::ExecFailed.code()) }
     };
     for signal in 1..65 {
         // SAFETY: all zeros is a valid `sigaction`; the call writes it.

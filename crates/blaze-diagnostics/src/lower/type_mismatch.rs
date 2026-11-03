@@ -224,7 +224,7 @@ fn ty_at_error<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>, at_error: Option<&str
 }
 
 /// rustc's `note_expected_found`: the two types in full, aligned, unless both are simple.
-pub(super) fn note_expected_found<'db>(
+pub(crate) fn note_expected_found<'db>(
     cx: &Cx<'_, 'db>,
     expected: &hir::Type<'db>,
     found: &hir::Type<'db>,

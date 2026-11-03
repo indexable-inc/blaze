@@ -550,3 +550,47 @@ fn an_image_brings_nodes_and_never_heads() {
     assert!(matches!(found.image, ImageUse::Resumed { .. }), "{found:?}");
     assert_eq!(state(&back), state(&theirs));
 }
+
+/// File names a checkout's author picked to share the hash the tree's and the image's indexes
+/// of names were once placed by: naming them in a commit, and finding them in the image a
+/// restart maps, each look at a bounded number of places, not at every name before them.
+#[test]
+fn names_with_one_old_hash_take_bounded_probes_in_the_tree_and_its_image() {
+    let names = crate::probes::one_old_hash(4000);
+    let bound = 16 * names.len() as u64;
+    let (mut vfs, mut sim) = start(3);
+    let ops: Vec<Op> = names // alloc: a test's ops
+        .iter()
+        .map(|name| Op::Write { mode: Mode::Regular, path: name.clone(), bytes: b"x".to_vec() })
+        .collect();
+    crate::probes::take();
+    let began = std::time::Instant::now();
+    vfs.commit("main", vfs.empty(), &ops).unwrap();
+    let named = crate::probes::take();
+    eprintln!("flood: a commit of {} names with one old hash: {:?}, {named} names compared", names.len(), began.elapsed());
+    assert!(named <= bound, "a commit of {} names with one old hash compared {named} names, over {bound}", names.len());
+    settle(&mut sim, &mut vfs);
+    let (mark, image) = image_of(&mut vfs).unwrap();
+    let (mut twin, mut twin_sim) = start(4);
+    twin.commit("main", twin.empty(), &ops).unwrap();
+    settle(&mut twin_sim, &mut twin);
+    assert!(image_of(&mut twin).unwrap().1 == image, "the same names give the same image, its key and index");
+    assert!(vfs.image_durable(mark.name));
+    settle(&mut sim, &mut vfs);
+
+    let (mut back, found) = Vfs::restore(file(), 0, &sim.contents(&file()), Some(mapping(&image)));
+    assert!(matches!(found.image, ImageUse::Used { .. }), "{:?}", found.image);
+    let kept = back.tree.table().names().len();
+    crate::probes::take();
+    let began = std::time::Instant::now();
+    for name in &names {
+        let id = back.tree.name(name);
+        assert_eq!(back.tree.name_str(id), name);
+        assert_eq!(back.tree.table().names().len(), kept, "{name} is found in the image");
+    }
+    let looked = crate::probes::take();
+    eprintln!("flood: finding {} names with one old hash in the image: {:?}, {looked} places", names.len(), began.elapsed());
+    assert!(looked <= bound, "finding {} names with one old hash in the image looked at {looked} places, over {bound}", names.len());
+    let root = back.root(back.head("main").unwrap()).unwrap();
+    assert_eq!(back.tree.read(root, &names[17]).unwrap(), Some(&b"x"[..]));
+}

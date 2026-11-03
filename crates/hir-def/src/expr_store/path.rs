@@ -349,6 +349,37 @@ fn exact<T>(column: &mut Vec<T>) -> Vec<T> {
 }
 
 impl PathColumns {
+    /// The bytes of its columns' capacities; mod paths' segments are interned, so not counted.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use crate::heap::vec_bytes as bytes;
+        let PathColumns {
+            kind,
+            data,
+            extra,
+            mod_paths,
+            lang_items,
+            slots,
+            generic_args,
+            args,
+            bindings,
+            bounds,
+            names,
+            use_args,
+        } = self;
+        bytes(kind)
+            + bytes(data)
+            + bytes(extra)
+            + bytes(mod_paths)
+            + bytes(lang_items)
+            + bytes(slots)
+            + bytes(generic_args)
+            + bytes(args)
+            + bytes(bindings)
+            + bytes(bounds)
+            + bytes(names)
+            + bytes(use_args)
+    }
+
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.kind.len()
@@ -847,6 +878,20 @@ impl<'a> Path<'a> {
             Path::BarePath(mod_path) => Some(mod_path),
             Path::Normal(path) => Some(path.mod_path),
             Path::LangItem(..) => None,
+        }
+    }
+
+    /// The context the `i`th segment is written with (normalized to macros 2.0, as the
+    /// [`ModPath`] records it in a macro file), as a [`crate::expr_store::HygieneId`]: what an
+    /// associated item the segment names is looked up by among a trait's or an impl's items
+    /// ([`crate::nameres::trait_item_name`], [`crate::nameres::impl_item_name`]). Root for a
+    /// path a real file writes, and for a lang item's.
+    pub fn segment_hygiene(&self, i: usize) -> crate::expr_store::HygieneId {
+        match self.mod_path() {
+            Some(path) => crate::expr_store::HygieneId::new(
+                path.context_of(i, span::SyntaxContext::root(span::Edition::Edition2015)),
+            ),
+            None => crate::expr_store::HygieneId::ROOT,
         }
     }
 

@@ -61,7 +61,7 @@ pub enum LineFormat {
 
 fn item_name<Id, Loc>(db: &Db, id: Id, default: &str) -> String
 where
-    Id: Lookup<Data = Loc>,
+    Id: Lookup<Data = Loc> + Copy,
     Loc: HasSource,
     Loc::Value: Typed,
     for<'t> <Loc::Value as Typed>::Of<'t>: view::HasName<'t>,
@@ -162,7 +162,7 @@ pub fn print_variant_body_hir(
     for (_, data) in fields.fields().iter() {
         let FieldData { name, type_ref, visibility, is_unsafe, default_value: _ } = data;
         match visibility {
-            crate::item_tree::RawVisibility::Module(interned, _visibility_explicitness) => {
+            crate::item_tree::RawVisibility::Module(interned, _visibility_explicitness, _) => {
                 w!(p, "pub(in {})", interned.display(db, p.edition))
             }
             crate::item_tree::RawVisibility::Public => w!(p, "pub "),
@@ -825,7 +825,28 @@ impl Printer<'_> {
                 self.print_expr(field);
                 w!(self, "]");
             }
-            Expr::Closure { args, arg_types, ret_type, mut body, closure_kind, capture_by } => {
+            Expr::Closure {
+                args,
+                arg_types,
+                ret_type,
+                mut body,
+                closure_kind,
+                capture_by,
+                binder,
+            } => {
+                if !binder.is_empty() {
+                    w!(
+                        self,
+                        "for<{}> ",
+                        self.store
+                            .names(binder)
+                            .iter()
+                            .map(|it| it.display(self.db, self.edition))
+                            .format(", ")
+                            // alloc: printing, the edge; `w!` borrows `self` mutably.
+                            .to_string()
+                    );
+                }
                 let mut print_pipes = true;
                 match closure_kind {
                     ClosureKind::OldCoroutine(Movability::Static) => {

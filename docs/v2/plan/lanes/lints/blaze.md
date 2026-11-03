@@ -188,8 +188,10 @@ Not flagged: an alias that fixes a deterministic hasher (`blaze_hash::HashMap`, 
 `BuildHasherDefault<FixedHasher>`), a hasher parameter `S` the caller picks. A
 `let m: HashMap<K, V> = HashMap::new();` has two findings, the type and the call.
 
-Baseline: `crates/blaze-lints/baselines/blaze.default_hasher.txt`, made by `blaze check
---workspace --baselines crates/blaze-lints/baselines --new-baseline blaze::default_hasher`.
+Baseline: `crates/blaze-lints/baselines/blaze.default_hasher.txt`, not made yet (no baseline
+is: [lints.md](../lints.md#baselines) says why); it is started by `blaze check --workspace
+--target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines --new-baseline
+blaze::default_hasher`.
 
 Misses: an ADT written with no generic arguments at all (every parameter defaulted), and an
 alias with a hasher parameter of its own left to its default, in a written type; their
@@ -200,8 +202,9 @@ collection (`s: RandomState` used for `hash_one`) is not looked at.
 
 AGENTS.md rule bump-allocate: every value names its allocator. Warn everywhere, deny wherever
 `blaze::hot` is, with a shrink-only baseline (`crates/blaze-lints/baselines/blaze.implicit_allocator.txt`,
-made by `blaze check --workspace --baselines crates/blaze-lints/baselines --new-baseline
-blaze::implicit_allocator`). A type is implicit when it is or holds:
+not made yet, as no baseline is ([lints.md](../lints.md#baselines)); it is started by `blaze
+check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines
+--new-baseline blaze::implicit_allocator`). A type is implicit when it is or holds:
 
 - an ADT whose allocator parameter has `Global` as its argument (`Vec<String>` is
   `Vec<String, Global>`; `Box`, `VecDeque`, `Rc`, `Arc`, `BTreeMap`, hashbrown's maps, and any

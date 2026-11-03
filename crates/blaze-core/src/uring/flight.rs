@@ -877,6 +877,8 @@ impl Uring {
     pub(super) fn spawn(&mut self, tag: Tag, command: Box<Command>) -> io::Result<()> {
         let crate::process::Started { pid, pidfd, stdin, stdout, stderr, mut finish } =
             crate::process::start(&self.spawn_dirs, command, self.confine.as_ref())?;
+        // Reaped only as this driver's loop polls its exit: a stall report names the tag.
+        finish.waited_by(tag);
         let input = mem::take(&mut finish.command.stdin);
         let parts = 3 + usize::from(stdin.is_some());
         let spawn = self.spawns.insert(Spawning {

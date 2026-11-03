@@ -11,7 +11,7 @@ use crate::{
 };
 
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`).
-fn ui_core(name: &str, flags: &str, source: &str) -> String {
+pub(super) fn ui_core(name: &str, flags: &str, source: &str) -> String {
     let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
@@ -19,7 +19,7 @@ fn ui_core(name: &str, flags: &str, source: &str) -> String {
 
 /// [`ui_core`] of a file that uses std: a crate `std` of `std_items` over minicore, whose
 /// prelude is core's and `prelude`.
-fn ui_std(name: &str, flags: &str, std_items: &str, prelude: &str, source: &str) -> String {
+pub(super) fn ui_std(name: &str, flags: &str, std_items: &str, prelude: &str, source: &str) -> String {
     let fixture = format!(
         "//- minicore: {flags}\n//- /std.rs crate:std\n\
          pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; {prelude} }} }}\n\
@@ -670,4 +670,182 @@ fn main() {}
         &stderr,
         &[error(4, &["E0117", "is not defined in the current crate", "impl doesn't have any local type before any uncovered type parameters"])],
     );
+}
+
+#[test]
+fn a_trait_impl_a_macro_writes_implements_by_hygienic_names() {
+    // tests/ui/hygiene/assoc_item_ctxt.rs: rustc's `check_trait_item` adjusts an impl item's
+    // name to the trait's expansion. In `ok` the trait's `method` is the caller's, which the
+    // `macro`'s impl names; in `error` it is `mac_trait_item`'s own, which no other expansion
+    // names, so the impl's `method` is not a member (E0407) and leaves it missing (E0046).
+    let source = r#"#![feature(decl_macro)]
+#![allow(unused)]
+
+mod ok {
+    macro mac_trait_item($method: ident) {
+        fn $method();
+    }
+
+    trait Tr {
+        mac_trait_item!(method);
+    }
+
+    macro mac_trait_impl() {
+        impl Tr for u8 { // OK
+            fn method() {} // OK, this method is not hygienic
+        }
+    }
+
+    mac_trait_impl!();
+}
+
+mod error {
+    macro mac_trait_item() {
+        fn method();
+    }
+
+    trait Tr {
+        mac_trait_item!();
+    }
+
+    macro mac_trait_impl() {
+        impl Tr for u8 { //~ ERROR not all trait items implemented, missing: `method`
+            fn method() {} //~ ERROR method `method` is not a member of trait `Tr`
+        }
+    }
+
+    mac_trait_impl!();
+}
+
+fn main() {}
+"#;
+    let stderr = r#"error[E0407]: method `method` is not a member of trait `Tr`
+  --> $DIR/assoc_item_ctxt.rs:33:13
+   |
+LL |             fn method() {}
+   |             ^^^------^^^^^
+   |             |  |
+   |             |  help: there is an associated function with a similar name: `method`
+   |             not a member of trait `Tr`
+...
+LL |     mac_trait_impl!();
+   |     ----------------- in this macro invocation
+   |
+   = note: this error originates in the macro `mac_trait_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0046]: not all trait items implemented, missing: `method`
+  --> $DIR/assoc_item_ctxt.rs:32:9
+   |
+LL |         fn method();
+   |         ------------ `method` from trait
+...
+LL |         impl Tr for u8 {
+   |         ^^^^^^^^^^^^^^ missing `method` in implementation
+...
+LL |     mac_trait_impl!();
+   |     ----------------- in this macro invocation
+   |
+   = note: this error originates in the macro `mac_trait_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: aborting due to 2 previous errors
+
+Some errors have detailed explanations: E0046, E0407.
+For more information about an error, try `rustc --explain E0046`.
+"#;
+    assert_eq!(ui_core("assoc_item_ctxt.rs", "sized", source), stderr);
+}
+
+#[test]
+fn two_items_a_macro_and_its_caller_write_implement_one_trait_item() {
+    // tests/ui/hygiene/impl_items-2.rs: the `macro`'s `foo` and the impl's own implement
+    // `Trait::foo` alike (E0201), while in an inherent impl they are two names.
+    let source = r#"#![feature(decl_macro)]
+
+trait Trait {
+    fn foo() {}
+}
+
+macro trait_impl() {
+    fn foo() {}
+}
+
+// Check that we error on multiple impl items that resolve to the same trait item.
+impl Trait for i32 {
+    trait_impl!();
+    fn foo() {}
+    //~^ ERROR duplicate definitions with name `foo`: [E0201]
+}
+
+struct Type;
+
+// Check that we do not error with inherent impls.
+impl Type {
+    trait_impl!();
+    fn foo() {}
+}
+
+fn main() {}
+"#;
+    let stderr = r#"error[E0201]: duplicate definitions with name `foo`:
+  --> $DIR/impl_items-2.rs:14:5
+   |
+LL |     fn foo() {}
+   |     ----------- item in trait
+...
+LL |     fn foo() {}
+   |     ----------- previous definition here
+...
+LL |     fn foo() {}
+   |     ^^^^^^^^^^^ duplicate definition
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0201`.
+"#;
+    assert_eq!(ui_core("impl_items-2.rs", "sized", source), stderr);
+}
+
+#[test]
+fn bindings_and_paths_a_macro_writes_name_a_real_files_trait_items() {
+    // tests/ui/hygiene/assoc_ty_bindings.rs (check-pass): the `macro`'s `AssocTy` in bindings
+    // (`dyn Base<AssocTy = u8>`, also through the supertrait of `Derived`) and in paths
+    // (`Self::AssocTy`, `T::AssocTy`) is keyed, and adjusted to `Base`, a real file's trait, it
+    // has no key: it names `Base::AssocTy` (`trait_item_written`).
+    let source = r#"#![feature(decl_macro, associated_type_defaults)]
+
+trait Base {
+    type AssocTy;
+    fn f();
+}
+trait Derived: Base {
+    fn g();
+}
+
+macro mac() {
+    type A = dyn Base<AssocTy = u8>;
+    type B = dyn Derived<AssocTy = u8>;
+
+    impl Base for u8 {
+        type AssocTy = u8;
+        fn f() {
+            let _: Self::AssocTy;
+        }
+    }
+    impl Derived for u8 {
+        fn g() {
+            let _: Self::AssocTy;
+        }
+    }
+
+    fn h<T: Base, U: Derived>() {
+        let _: T::AssocTy;
+        let _: U::AssocTy;
+    }
+}
+
+mac!();
+
+fn main() {}
+"#;
+    assert_eq!(ui_core("assoc_ty_bindings.rs", "sized", source), "");
 }

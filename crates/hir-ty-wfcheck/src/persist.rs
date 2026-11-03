@@ -137,7 +137,7 @@ impl Persist for WfResult {
 
 /// The site's variant, the kind of its definition, the definition's id and the site's index.
 fn encode_site(site: Site) -> (u8, u8, u64, u32) {
-    fn bits(id: impl AsId) -> u64 {
+    fn bits(id: impl AsId + Copy) -> u64 {
         u64::from(id.as_id().as_u32())
     }
     match site {

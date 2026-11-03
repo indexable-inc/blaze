@@ -5,7 +5,9 @@
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (MIT or Apache-2.0). Where clippy asks MIR whether
 //! a `&mut` referent is used once, this does not lint; bounds on other parameters and on
 //! projections, which clippy instantiates with the referent's type too, are not checked, nor
-//! are bounds whose arguments are the callee's parameters.
+//! are bounds whose arguments are the callee's type or const parameters. A bound is proven
+//! whole, as clippy's obligation of the instantiated where clause, its `for<'a>` binder kept:
+//! `&f` passed as `impl Fn(&T)` asks `for<'a> {closure}: Fn<(&'a T,)>`.
 
 use hir::{GenericParam, PathResolution};
 use syntax::view as ast;
@@ -15,6 +17,9 @@ use ast::{AstNode as _, HasGenericArgs as _};
 use crate::{check::Cx, diag::Applicability, msrvs};
 
 const LINT: super::Implemented = super::Implemented::NeedlessBorrowsForGenericArgs;
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
     if !cx.on(LINT) || cx.expansion().is_some() {
@@ -94,7 +99,7 @@ fn needless_borrow_count<'t>(
         lang(hir::LangItem::MetaSized),
         cx.std_trait(&["core", "any", "Any"]),
     ];
-    let bounds = type_param.trait_refs(db);
+    let bounds = type_param.trait_bound_refs(db);
     if bounds.iter().all(|it| trivial.contains(&Some(it.trait_()))) {
         return 0;
     }
@@ -111,9 +116,7 @@ fn needless_borrow_count<'t>(
     }
     let into_iter = cx.famous().core_iter_IntoIterator();
     let drop = lang(hir::LangItem::Drop);
-    // The type arguments of the bound being asked of, past its `Self`.
-    let mut args = Vec::new();
-    let mut holds = |referent: ast::Expr<'t>| -> bool {
+    let holds = |referent: ast::Expr<'t>| -> bool {
         let inner = referent.peel_parens();
         if let ast::Expr::FieldExpr(field) = inner
             && let Some(base) = field.expr().and_then(|it| cx.ty(it))
@@ -136,13 +139,7 @@ fn needless_borrow_count<'t>(
             {
                 return false;
             }
-            args.clear();
-            for at in 1.. {
-                let Some(arg) = bound.get_type_argument(at) else { break };
-                let Some(arg) = arg.without_params(db) else { return false };
-                args.push(arg);
-            }
-            ty.impls_trait(db, trait_, &args)
+            bound.holds_for(db, &ty)
         })
     };
     let mut count = 0;

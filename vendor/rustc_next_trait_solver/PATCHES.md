@@ -201,6 +201,20 @@ parameter must also be `Sized`), so no downstream or cousin crate can make `?T: 
 `impl<T: Display + ?Sized> Display for &T` in coherence, because a downstream crate could
 otherwise implement `Sealed` for `&Local`. With no sealed trait, every answer is upstream's.
 
+### 0014-reflect-builtins
+
+What: compile-time reflection in the solver (`#![feature(blaze_comptime)]`,
+docs/v2/plan/design/comptime.md, phase 2), in `src/solve/reflect.rs`: builtin candidates for
+the lang items `ReflectStruct`, `ReflectEnum`, `ReflectField`, `ReflectVariant` and
+`ReflectFnItem` (trait and host-effect goals), the projection `ReflectVariantView`, proving a
+binder with a reflected variable by its container's members (`compute_reflected_forall_goal`),
+and the env clauses a placeholder member brings (`env_with_reflected_member`); param-env
+candidates skip field binders. Uses `rustc_type_ir`'s patch `0016-reflected-binders`.
+
+Why: `for<F: Field<T>>` bounds are proven over the members of `T`, which only the solver can
+enumerate. Made in `src/` by lane comptime-solver (2026-11-02) without a patch; recorded as one
+on 2026-11-03 (lane solverkey) so the series replays to `src/`.
+
 ## Dropped since the previous base (ra-ap-rustc_next_trait_solver 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#161380 (a constant sends a goal back to the caller's typing

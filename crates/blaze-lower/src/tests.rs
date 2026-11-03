@@ -768,6 +768,44 @@ fn a_units_identity_covers_what_it_is_made_from_deeply() {
     assert_eq!(first.lowered.identity(LIB), after[2], "the same inputs, the same identity");
 }
 
+/// A build script that compiles C leaves object files and an archive in `OUT_DIR`, bytes that
+/// are not UTF-8, and its run puts them in its package's source root as files with no text.
+/// A crate's code identity, which a doctest image is keyed by, takes each by its bytes'
+/// content: before, it read every file's text and panicked "Unable to fetch file text" on
+/// flecs-c's `libflecs.a` (selfbuild5, 2026-11-03), failing flecs-c's doctests.
+#[test]
+fn a_code_identity_takes_a_file_with_no_text_by_its_bytes() {
+    let mut built = lowered(&units()).unwrap();
+    fn ran(archive: &[u8], generated: &[u8]) -> Ran {
+        Ran {
+            out_dir: OUT_DIR.to_owned(),
+            files: vec![("gen.rs".to_owned(), generated.to_vec()), ("libgen.a".to_owned(), archive.to_vec())],
+            ..Ran::default()
+        }
+    }
+    let identity = |built: &Built| crate::code_identity(built.lowered.db(), krate(built, LIB));
+
+    built.lowered.ran(RUN, &ran(b"!<arch>\n\xff\xfe one", b"pub fn gen() {}\n")).unwrap();
+    let db = built.lowered.db();
+    let archive = root_of(db, krate(&built, LIB)).file_for_path(&path(&format!("{OUT_DIR}/libgen.a"))).copied().unwrap();
+    assert!(!db.has_file_text(archive), "an archive's bytes are not UTF-8");
+    let one = identity(&built);
+
+    built.lowered.ran(RUN, &ran(b"!<arch>\n\xff\xfe two", b"pub fn gen() {}\n")).unwrap();
+    let two = identity(&built);
+    assert_ne!(one, two, "the archive's bytes are what its code identity reads of it");
+    built.lowered.ran(RUN, &ran(b"!<arch>\n\xff\xfe one", b"pub fn gen() {}\n")).unwrap();
+    assert_eq!(identity(&built), one, "the same bytes, the same identity");
+
+    // A Rust file that loses its text (its bytes are no longer UTF-8) is taken by its bytes
+    // too, and taken by its text again once it has one.
+    built.lowered.ran(RUN, &ran(b"!<arch>\n\xff\xfe one", b"pub fn gen() {}\xff\n")).unwrap();
+    let lost = identity(&built);
+    assert_ne!(lost, one);
+    built.lowered.ran(RUN, &ran(b"!<arch>\n\xff\xfe one", b"pub fn gen() {}\n")).unwrap();
+    assert_eq!(identity(&built), one);
+}
+
 /// The process's environment is no input of an identity: a crate reads it only through
 /// `env!`, and whoever files a value made from the crate keys it by what was read
 /// (`blaze-cargo`'s unit records). Two runs that differ only in variables, a per-run

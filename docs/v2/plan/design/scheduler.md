@@ -444,7 +444,8 @@ the model:
   - Admission (`plane.rs` Budget) holds back new tasks before it evicts expensive state.
 - **What stays is decided by value per byte**: `recompute_cost × P(reuse) / bytes`.
   - `recompute_cost` is the query kind's span self-CPU, plus its inputs' if they would go too.
-  - `P(reuse)` is the W-TinyLFU frequency already kept (`admission::plan`).
+  - `P(reuse)`: the W-TinyLFU frequency this assumed is gone (lane lrucap, 2026-11-02:
+    recency by the row's stamp, values kept by bytes, `blaze_query::db::budget`).
   - Cheap-to-recompute values (parse trees) go first; a lowered workspace's def maps and impl
     tables go last.
 - **A live checkout's lowered front end is pinned while under budget.** An idle daemon does not

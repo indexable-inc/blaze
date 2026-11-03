@@ -4,6 +4,11 @@
 //! stores are statics, so a pointer to a value is good for the life of the process. Memory is
 //! bounded by the database rebuilding what it keeps (docs/v2/plan/lanes/db.md), not by counting references.
 //!
+//! The hash is the caller's, and it must be one the values' authors can't steer: a store's
+//! probes are linear, so values that share a hash (or only a home group) cost each insert a walk
+//! past all of them, under the shard's lock. The symbol table's is SipHash under a key drawn at
+//! random ([`crate::table`]).
+//!
 //! A shard's table maps a hash to the values with it, SwissTable-style ([`crate::swiss`],
 //! docs/v2/plan/design/hardware.md, "interner and memo lookups"): slots in groups of seven, each group one cache line holding a
 //! control word of tag bytes and the seven value pointers, so a lookup reads one line of the
@@ -123,7 +128,10 @@ impl Table {
     /// an empty slot.
     #[inline]
     fn find(&self, hash: u64, mut matches: impl FnMut(NonNull<u8>) -> bool) -> Option<NonNull<u8>> {
-        let ctrl = |at: usize| Ctrl::<GROUP>(self.groups[at].ctrl.load(Ordering::Acquire));
+        let ctrl = |at: usize| {
+            crate::table::probes::count();
+            Ctrl::<GROUP>(self.groups[at].ctrl.load(Ordering::Acquire))
+        };
         swiss::find(hash, swiss::tag(hash), self.groups.len(), ctrl, |at| {
             // Relaxed: the tag's `Acquire` above ordered the slot's writes before us; only tags
             // published in the loaded word are matched.
@@ -137,6 +145,7 @@ impl Table {
     /// lock, the only writer, on a table that stays at most half full.
     fn put(&self, hash: u64, value: *mut u8, publish: Ordering) {
         let at = swiss::vacant(hash, self.groups.len(), |at: usize| {
+            crate::table::probes::count();
             Ctrl::<GROUP>(self.groups[at].ctrl.load(Ordering::Relaxed))
         });
         let group = &self.groups[at.group];

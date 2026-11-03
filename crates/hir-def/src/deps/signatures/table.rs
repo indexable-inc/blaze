@@ -159,7 +159,7 @@ pub(super) fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> R<Relocation> {
     Ok(Relocation::of(entries))
 }
 
-fn bits(it: impl AsId) -> u64 {
+fn bits(it: impl AsId + Copy) -> u64 {
     u64::from(it.as_id().as_u32())
 }
 
@@ -207,7 +207,7 @@ fn read_block(dec: &mut Dec<'_>, db: &Db, entries: &[(Kind, u64)]) -> R<u64> {
         tag => return Err(format!("block module tag {tag}")),
     };
     let token = LoweringMode::Analysis.allow_tracked_structs().expect("analysis makes blocks");
-    Ok(bits(BlockIdLt::new(db, ast_id, module, owner, token)))
+    Ok(bits(BlockIdLt::new(db, ast_id, module, owner, &token)))
 }
 
 /// Where a store's buffer holds an id outside its words.

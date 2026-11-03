@@ -8,10 +8,7 @@ use crate::{
         facts::{
             graph::{ImportGraph, components},
             queries::{self, FactKey, RoundKey, RoundKind, SccKey},
-            tests::{
-                Exempt, compare, fixture_db, new_crate_local_def_map, old_crate_local_def_map,
-                project,
-            },
+            tests::{Exempt, compare_db, facts_crate_local_def_map, fixture_db},
         },
     },
     per_ns::PerNs,
@@ -39,9 +36,10 @@ fn crate_named(db: &TestDB, name: &str) -> Crate {
         .unwrap_or_else(|| panic!("no crate `{name}`"))
 }
 
-/// The crate root's unit, its only member, against the old collector: every name of the root's
-/// scope, imports included, and its scope is the one the unit handed out.
-fn assert_one_member_unit_is_old(fixture: &str, krate: &str, names: &[&str]) {
+/// The crate root's unit, its only member: every name of `names` is in the root's scope,
+/// imports included, the scope is the one the unit handed out, and the crate's maps agree
+/// ([`compare_db`]).
+fn assert_one_member_unit_resolves(fixture: &str, krate: &str, names: &[&str]) {
     let db = fixture_db(fixture);
     let krate = crate_named(&db, krate);
     let r = final_round(&db, krate);
@@ -49,15 +47,11 @@ fn assert_one_member_unit_is_old(fixture: &str, krate: &str, names: &[&str]) {
     let state = queries::scc_state(&db, SccKey::new(&db, root, krate, r));
     assert_eq!(&*state.members, &[root], "the root is the only member");
 
-    let old = old_crate_local_def_map(&db, krate);
-    let new = new_crate_local_def_map(&db, krate);
-    let diff = compare(
-        &project(&db, old.def_map(&db), Some(old.local(&db)), &Exempt::NONE),
-        &project(&db, new.def_map(&db), Some(new.local(&db)), &Exempt::NONE),
-    );
+    let mut diff = String::new();
+    compare_db(&db, "one-member unit", &Exempt::NONE, &mut diff);
     assert!(diff.is_empty(), "{diff}");
 
-    let new = new.def_map(&db);
+    let new = facts_crate_local_def_map(&db, krate).def_map(&db);
     let handle = queries::fact_handle(&db, FactKey::new(&db, root, krate, r));
     assert_eq!(new.module(&db, root).scope, ScopeSlot::Collected(handle));
     let scope = new.module(&db, root).scope(&db);
@@ -67,8 +61,8 @@ fn assert_one_member_unit_is_old(fixture: &str, krate: &str, names: &[&str]) {
 }
 
 #[test]
-fn one_member_unit_equals_the_old_collector() {
-    assert_one_member_unit_is_old(
+fn one_member_unit_resolves_the_roots_imports() {
+    assert_one_member_unit_resolves(
         r#"
 //- /main.rs crate:main deps:dep
 extern crate dep as d;
@@ -93,8 +87,8 @@ pub mod m {}
 }
 
 #[test]
-fn one_member_unit_equals_the_old_collector_globs_and_underscores() {
-    assert_one_member_unit_is_old(
+fn one_member_unit_resolves_the_roots_globs_and_underscores() {
+    assert_one_member_unit_resolves(
         r#"
 //- /main.rs crate:main
 pub enum Own { X, Y(u8), Z { f: u8 } }

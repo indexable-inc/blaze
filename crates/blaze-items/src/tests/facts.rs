@@ -506,3 +506,23 @@ fn a_field_fact_names_its_field() {
     let b = Fact::Field { ty: key_of(1), field: 1 }.key();
     assert_ne!(a, b);
 }
+
+/// A crate's value covers why a file outside the VFS that it read could not be read
+/// (`IncludedFile::content`): a file gone and a directory in its place are other values.
+#[test]
+fn a_crate_s_value_tells_apart_why_an_included_file_could_not_be_read() {
+    let mut db = fixture::db("//- /lib.rs\npub fn f() {}\n").into_db();
+    let krate = fixture::test_crate(&db);
+    let dir = std::env::temp_dir().join(format!("blaze-items-unread-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = base_db::AbsPathBuf::assert_utf8(dir.clone());
+    let file = db.files().included_file(&db, krate, &path, blaze_query::db::Durability::LOW);
+    assert!(file.read(&db).is_err(), "the file is gone");
+    let fact = Fact::Crate(key::crate_key(&db, krate));
+    let gone = val(&db, fact);
+    std::fs::create_dir_all(&dir).expect("the temporary directory");
+    assert!(db.reload_included_file(&path), "a directory is another error");
+    let directory = val(&db, fact);
+    std::fs::remove_dir_all(&dir).expect("the temporary directory");
+    assert_ne!(gone, directory, "two errors are two values");
+}

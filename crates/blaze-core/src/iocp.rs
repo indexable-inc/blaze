@@ -2570,22 +2570,24 @@ mod tests {
         }
     }
 
-    /// `PING` run in `job` until it ends: its code, or 125 where it could not join the job.
+    /// `PING` run in `job` until it ends: its code, or [`crate::exit::Exit::CouldNot`] where it
+    /// could not join the job.
     fn hold(job: &OwnedHandle) -> i32 {
+        let could_not = crate::exit::Exit::CouldNot.code();
         let ping = std::process::Command::new(system().join("PING.EXE"))
             .args(["-n", "60", "127.0.0.1"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
-        let Ok(mut ping) = ping else { return 125 };
+        let Ok(mut ping) = ping else { return could_not };
         // SAFETY: an open job and the process just made.
         if unsafe { AssignProcessToJobObject(job.as_raw_handle(), ping.as_raw_handle()) } == 0 {
             _ = ping.kill();
             _ = ping.wait();
-            return 125;
+            return could_not;
         }
-        ping.wait().map_or(125, |status| status.code().unwrap_or(125))
+        ping.wait().map_or(could_not, |status| status.code().unwrap_or(could_not))
     }
 
     // SAFETY: the C runtime calls each entry of this section as a function before `main`, on
@@ -2661,7 +2663,8 @@ mod tests {
         let seen = run(&mut driver, vec![Effect::Kill { tag: Tag(1) }]);
         let killed = exit(&seen[&1]);
         // Ended as it ran (the kill's code), or refused its start (the launcher's could-not).
-        assert!(matches!(killed.code, Some(1 | 125)), "{killed:?}");
+        let could_not = crate::exit::Exit::CouldNot.code();
+        assert!([Some(process::KILLED as i32), Some(could_not)].contains(&killed.code), "{killed:?}");
         let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(4, 0, b""), tag: Tag(2) }]);
         assert_eq!(exit(&seen[&2]).code, Some(4));
         assert_eq!(driver.warms.len(), 1);

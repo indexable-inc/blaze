@@ -76,9 +76,9 @@ fn handle_tokens(it: TokenAtOffset<syntax::SyntaxToken>) -> Vec<Key> {
     }
 }
 
-fn view_tokens(it: TokenAtOffset<view::Token<'_>>) -> Vec<Key> {
+fn view_tokens(it: &TokenAtOffset<view::Token<'_>>) -> Vec<Key> {
     let key = |it: view::Token<'_>| (it.kind(), it.text_range());
-    match it {
+    match *it {
         TokenAtOffset::None => vec![],
         TokenAtOffset::Single(it) => vec![key(it)],
         TokenAtOffset::Between(l, r) => vec![key(l), key(r)],
@@ -137,7 +137,7 @@ fn check(path: &Path, parse: &Parse<SourceFile>) {
                 let offset = h.text_range().start();
                 assert_eq!(
                     handle_tokens(handle.token_at_offset(offset)),
-                    view_tokens(root.token_at_offset(offset)),
+                    view_tokens(&root.token_at_offset(offset)),
                     "{}", at()
                 );
                 let range = h.text_range();
@@ -163,7 +163,7 @@ fn check(path: &Path, parse: &Parse<SourceFile>) {
         "{path:?}: preorder"
     );
     let end = handle.text_range().end();
-    assert_eq!(handle_tokens(handle.token_at_offset(end)), view_tokens(root.token_at_offset(end)));
+    assert_eq!(handle_tokens(handle.token_at_offset(end)), view_tokens(&root.token_at_offset(end)));
     assert_eq!(format!("{handle:#?}"), format!("{root:#?}"), "{path:?}: the tree's dump");
 }
 

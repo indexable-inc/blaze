@@ -158,6 +158,7 @@ fn fact_of(row: &FactRow) -> Result<FactRef, &'static str> {
     Ok(FactRef { kind: QueryKind(row.kind), subject: row.subject, object })
 }
 
+#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of every read, which hands it the error by value")]
 fn format_error(error: FormatError) -> String {
     // alloc: the reason a record does not open
     error.to_string()

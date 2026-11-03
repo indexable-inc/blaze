@@ -32,7 +32,7 @@ impl DefMap {
         local_def_map: &LocalDefMap,
         db: &Db,
         original_module: ModuleId,
-        ast_id: AstIdWithPath<ast::Item>,
+        ast_id: &AstIdWithPath<ast::Item>,
         attr: &Attr,
         attr_id: AttrId,
         macro_depth: u32,
@@ -67,7 +67,7 @@ impl DefMap {
 
         Ok(ResolvedAttr::Macro(attr_macro_as_call_id(
             db,
-            &ast_id,
+            ast_id,
             attr,
             // There aren't any active attributes before this one, because attribute macros
             // replace their input, and derive macros are not allowed in this function.

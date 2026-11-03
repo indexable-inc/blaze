@@ -35,7 +35,7 @@ fn owners_are_by_key_with_the_generic_s_code() {
     let static_id = (item(9), ContentId::default());
     let statics = [static_of(static_id, key(9), Owner::Dependency, &none)];
     let mut errors = Vec::new();
-    let owned = owners(functions.into_iter(), statics.into_iter(), &mut errors);
+    let owned = owners(&functions.into_iter(), &statics.into_iter(), &mut errors);
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(owned.functions, [(key(1), Owner::Workspace, code(1)), (key(2), Owner::Dependency, code(2))]);
     assert_eq!(owned.statics, [(item(9), ContentId::default(), Owner::Dependency)]);
@@ -48,11 +48,11 @@ fn the_workspace_may_call_a_dependency_and_a_dependency_may_not_call_the_workspa
     let none: [Target; 0] = [];
     let mut errors = Vec::new();
     let fine = [function(1, Owner::Workspace, &calls_dependency), function(2, Owner::Dependency, &none)];
-    owners(fine.into_iter(), std::iter::empty(), &mut errors);
+    owners(&fine.into_iter(), &std::iter::empty(), &mut errors);
     assert!(errors.is_empty(), "{errors:?}");
 
     let wrong = [function(1, Owner::Workspace, &none), function(2, Owner::Dependency, &calls_workspace)];
-    owners(wrong.into_iter(), std::iter::empty(), &mut errors);
+    owners(&wrong.into_iter(), &std::iter::empty(), &mut errors);
     assert_eq!(errors.len(), 1);
     assert_eq!((errors[0].unit, errors[0].item), (key(2), item(2)));
     assert!(errors[0].what.contains("the workspace's"), "{}", errors[0].what);
@@ -70,7 +70,7 @@ fn a_dependency_s_static_and_a_reference_to_a_workspace_static_are_checked() {
         static_of((item(9), ContentId::default()), key(9), Owner::Dependency, &names_function),
     ];
     let mut errors = Vec::new();
-    owners(functions.into_iter(), statics.into_iter(), &mut errors);
+    owners(&functions.into_iter(), &statics.into_iter(), &mut errors);
     let named: Vec<_> = errors.iter().map(|it| (it.unit, it.item)).collect();
     assert_eq!(named, [(key(2), item(2)), (key(9), item(9))]);
 }
@@ -107,7 +107,7 @@ fn refusals_across_cores_come_in_key_order() {
         }))
         .collect();
     let mut errors = Vec::new();
-    owners(functions.iter().copied(), std::iter::empty(), &mut errors);
+    owners(&functions.iter().copied(), &std::iter::empty(), &mut errors);
     let named: Vec<_> = errors.iter().map(|it| it.unit).collect();
     let expected: Vec<_> = (0..3000u32).filter(|n| n % 3 == 1).map(|n| InstanceKey(numbered(n, 0))).collect();
     assert_eq!(named, expected);
@@ -130,7 +130,7 @@ fn a_refusal_names_both_sides_and_their_packages() {
         StaticOf { origin: Origin::Dependency(Package::new("regex")), ..static_of((item(9), ContentId::default()), key(9), Owner::Dependency, &names_static) },
     ];
     let mut errors = Vec::new();
-    owners(functions.into_iter(), statics.into_iter(), &mut errors);
+    owners(&functions.into_iter(), &statics.into_iter(), &mut errors);
     assert_eq!(errors.len(), 2, "{errors:?}");
     let function = &errors[0].what;
     assert!(function.starts_with("`std::rt::run::{closure#0}` (of the standard library) is a dependency's"), "{function}");

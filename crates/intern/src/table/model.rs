@@ -4,6 +4,16 @@
 //! on another thread sees nothing or the whole value, and the ID it finds reads back its bytes
 //! through the ID column, whose slot is set before the index publishes the value. Each value
 //! gets one ID, distinct values distinct IDs, and a restored table hands out each freed ID once.
+//!
+//! Each value has its own history, checked against a sequential set of that one value: the
+//! table is linearizable value by value, not across values. Two values may sit in different
+//! shards, each published with a release store and read with acquire loads
+//! (docs/v2/plan/design/concurrency.md), so a thread that interns 1 and then misses 2 while
+//! another interns 2 and then misses 1 is a run the memory model allows (store buffering) and
+//! no one order of the four explains. No caller can tell: a thread that has not synchronized
+//! with an intern has no "before" to miss it in, and one that has finds it. One history over
+//! both values asked for that order and failed with "not linearizable" on every tree that had
+//! these models.
 
 use std::sync::Arc;
 
@@ -22,7 +32,7 @@ const ID: SectionId = SectionId::SYMBOLS;
 
 /// One compiled-in value, so made IDs start at 2.
 fn shape() -> Shape {
-    Shape { statics: 1, static_bytes: |_| b"s", key: crate::order_key, align: 1, size: 1, text: true }
+    Shape { statics: 1, static_bytes: |_| b"s", key: crate::order_key, align: 1, size: 1, text: true, overlay: Overlay::Secret }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,31 +45,35 @@ fn bytes(value: u8) -> [u8; 1] {
     [b'a' + value]
 }
 
-/// The sequential table: bit `v` is set when value `v` is in it.
+/// The sequential table, seen from one value: whether it is in it.
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
-struct Set(u8);
+struct Has(bool);
 
-impl Spec for Set {
+impl Spec for Has {
     type Op = Op;
     /// `Intern`: always `true`. `Find`: whether it found.
     type Ret = bool;
 
     fn apply(&mut self, op: &Op) -> bool {
         match *op {
-            Op::Intern(value) => {
-                self.0 |= 1 << value;
+            Op::Intern(_) => {
+                self.0 = true;
                 true
             }
-            Op::Find(value) => self.0 & (1 << value) != 0,
+            Op::Find(_) => self.0,
         }
     }
 }
 
-/// Runs `op` as one operation of `history`: the ID it interned or found, whose bytes read back
-/// from this thread.
-fn run(history: &History<Set>, table: &Table, op: Op) -> Option<u32> {
+/// A history for each value the models use.
+type Histories = [History<Has>; 3];
+
+/// Runs `op` as one operation of its value's history: the ID it interned or found, whose bytes
+/// read back from this thread.
+fn run(histories: &Histories, table: &Table, op: Op) -> Option<u32> {
     let mut id = None;
-    history.record(op, |&op| match op {
+    let (Op::Intern(value) | Op::Find(value)) = op;
+    histories[value as usize].record(op, |&op| match op {
         Op::Intern(value) => {
             id = Some(table.intern(&bytes(value)));
             true
@@ -69,9 +83,6 @@ fn run(history: &History<Set>, table: &Table, op: Op) -> Option<u32> {
             id.is_some()
         }
     });
-    let value = match op {
-        Op::Intern(value) | Op::Find(value) => value,
-    };
     if let Some(id) = id {
         assert_eq!(table.get(id), Some(&bytes(value)[..]), "an ID found reads its whole value");
     }
@@ -84,20 +95,20 @@ fn run(history: &History<Set>, table: &Table, op: Op) -> Option<u32> {
 fn model_racing_interns_get_one_id_each() {
     blaze_check::model(|| {
         let table = Arc::new(Table::new(shape()));
-        let history = Arc::new(History::<Set>::new());
+        let histories = Arc::new(Histories::default());
         let other = {
-            let (table, history) = (table.clone(), history.clone());
+            let (table, histories) = (table.clone(), histories.clone());
             thread::spawn(move || {
-                let one = run(&history, &table, Op::Intern(1));
-                let two = run(&history, &table, Op::Find(2));
-                let again = run(&history, &table, Op::Intern(2));
+                let one = run(&histories, &table, Op::Intern(1));
+                let two = run(&histories, &table, Op::Find(2));
+                let again = run(&histories, &table, Op::Intern(2));
                 (one, two, again)
             })
         };
-        let two = run(&history, &table, Op::Intern(2));
-        let one = run(&history, &table, Op::Find(1));
+        let two = run(&histories, &table, Op::Intern(2));
+        let one = run(&histories, &table, Op::Find(1));
         let (one_there, two_found, two_again) = other.join().unwrap();
-        history.check(Set::default());
+        histories.iter().for_each(|history| history.check(Has::default()));
         assert_eq!(two, two_again, "2 interned once");
         if one.is_some() {
             assert_eq!(one, one_there, "1 found under the ID it was given");
@@ -132,15 +143,15 @@ fn model_freed_ids_are_taken_once() {
         let section = image.section(ID, SCHEMA).unwrap();
         let table = Arc::new(Table::restore(shape(), image, &section, &serial).unwrap());
         assert_eq!((table.get(2), table.get(3), table.end()), (Some(&b"k"[..]), None, 4));
-        let history = Arc::new(History::<Set>::new());
+        let histories = Arc::new(Histories::default());
         let other = {
-            let (table, history) = (table.clone(), history.clone());
-            thread::spawn(move || [Op::Intern(0), Op::Find(1)].map(|op| run(&history, &table, op)))
+            let (table, histories) = (table.clone(), histories.clone());
+            thread::spawn(move || [Op::Intern(0), Op::Find(1)].map(|op| run(&histories, &table, op)))
         };
-        let one = run(&history, &table, Op::Intern(1));
-        let zero = run(&history, &table, Op::Find(0));
+        let one = run(&histories, &table, Op::Intern(1));
+        let zero = run(&histories, &table, Op::Find(0));
         let [zero_there, one_found] = other.join().unwrap();
-        history.check(Set::default());
+        histories.iter().for_each(|history| history.check(Has::default()));
         if zero.is_some() {
             assert_eq!(zero, zero_there);
         }

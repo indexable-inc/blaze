@@ -21,8 +21,12 @@ since the last flush, and the CPU sampler's new samples (named once a flush, thr
 
     <dir>/<build>-<seq>.<table>.parquet
 
-Here `build` is the build the flush is for: the daemon flushes once when a build request ends,
-with its id. The timer's flushes (every 5 s while a session runs, `history::EVERY`) are named 0.
+Here `build` is the highest build any of the flush's rows is of, and never below the build the
+flush is for: the daemon flushes once when a build request ends, with its id. The timer's
+flushes (every 5 s while a session runs, `history::EVERY`) are named 0 only when they hold no
+build's rows. A daemon numbers its builds past every name (`History::next_build`), so a build
+whose daemon stopped before its end was flushed keeps its number (until 2026-11-03 a timer's
+flush was always named 0, and daemons that restarted mid-build reused build 1).
 `seq` only grows within a directory; a reopened history continues from the highest one there.
 
 **One file a table, not one file a flush.** A Parquet file has one schema, so a file holding

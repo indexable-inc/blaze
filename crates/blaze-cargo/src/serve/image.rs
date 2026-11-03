@@ -231,28 +231,28 @@ impl Images {
     }
 
     /// Asks for an image of the daemon as it is now.
-    pub fn ask(&mut self, parts: Parts<'_>) {
+    pub fn ask(&mut self, mut parts: Parts<'_>) {
         self.failed = None;
         match self.state {
-            State::Idle => self.make(parts, false),
+            State::Idle => self.make(&mut parts, false),
             State::Waiting | State::Writing { .. } | State::Mapping { .. } => self.again = true,
         }
     }
 
     /// Makes what waits: an image whose VFS sections could not be written yet, or one asked
     /// while another was made. `idle` is whether the driver has no effect in flight or queued.
-    pub fn step(&mut self, parts: Parts<'_>, idle: bool) {
+    pub fn step(&mut self, mut parts: Parts<'_>, idle: bool) {
         match self.state {
-            State::Waiting => self.make(parts, idle),
+            State::Waiting => self.make(&mut parts, idle),
             State::Idle if self.again => {
                 self.again = false;
-                self.make(parts, false);
+                self.make(&mut parts, false);
             }
             State::Idle | State::Writing { .. } | State::Mapping { .. } => {}
         }
     }
 
-    fn make(&mut self, parts: Parts<'_>, idle: bool) {
+    fn make(&mut self, parts: &mut Parts<'_>, idle: bool) {
         let began = Instant::now();
         let _span = tracing::info_span!(target: "blaze", "image make", bytes = tracing::field::Empty).entered();
         let mut builder = Builder::new();

@@ -39,6 +39,7 @@ const _: () = assert!(size_of::<Scalar>() <= 32);
 
 /// What a binary operation gives: a value, or with `AddWithOverflow` and the like, the value
 /// with whether it overflowed.
+#[derive(Clone, Copy)]
 pub(super) enum Output {
     One(Scalar),
     Pair(Scalar, bool),

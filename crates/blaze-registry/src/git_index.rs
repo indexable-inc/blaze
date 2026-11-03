@@ -3,7 +3,10 @@
 //! old caches that use the current commit are also valid. A fetch failure is an error, never
 //! permission to answer from an older tree.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context as _, bail};
 use blaze_source::SourceId;
@@ -29,7 +32,7 @@ struct State {
 }
 
 impl GitIndex {
-    pub(crate) fn new(source: SourceId, dir: PathBuf, context: Arc<Context>) -> GitIndex {
+    pub(crate) fn new(source: SourceId, dir: &Path, context: Arc<Context>) -> GitIndex {
         GitIndex { source, db: dir.join(".git"), context, state: Mutex::default() }
     }
 

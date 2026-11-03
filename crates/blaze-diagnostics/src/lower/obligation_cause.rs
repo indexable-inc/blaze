@@ -85,6 +85,42 @@ fn note_of(
         | hir::ObligationCauseCode::MatchExpressionArm { .. }
         | hir::ObligationCauseCode::IfExpressionWithNoElse
         | hir::ObligationCauseCode::ReturnNoExpression => {}
+        hir::ObligationCauseCode::ImplTraitInTraitBound { trait_method, impl_trait, bound } => {
+            impl_trait_in_trait(cx, diag, trait_method, impl_trait, bound)
+        }
+    }
+}
+
+/// rustc's "required by a bound in `Trait::method::{anon_assoc#0}`" of a trait impl's type for
+/// an `impl Trait` of the trait method's return type (rustc's `WhereClause` cause on the
+/// trait's RPITIT item), on the bound when its syntax is in sight.
+fn impl_trait_in_trait(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    trait_method: hir::Function,
+    impl_trait: u32,
+    bound: Option<InFile<syntax::SyntaxNodePtr>>,
+) {
+    // alloc: the error's text, for an error hir found
+    let name = format!("{}::{{anon_assoc#{impl_trait}}}", print::def_path(cx, ModuleDef::Function(trait_method)));
+    // alloc: the error's text, for an error hir found
+    let descr = format!("required by a bound in `{name}`");
+    match bound {
+        Some(bound) => {
+            let at = cx.span_of(bound);
+            // clone: on the error path, for an error hir found
+            let mut span = MultiSpan::of(at.clone());
+            // alloc: the error's text, for an error hir found
+            span.labels.push((at, format!("required by this bound in `{name}`")));
+            diag.span_note(span, descr);
+        }
+        None => {
+            diag.note(descr);
+        }
+    }
+    if let Ok(id) = FunctionId::try_from(trait_method) {
+        // alloc: the error's text, for an error hir found
+        diag.fact(Fact::Signature(cx.key(ItemId::Function(id))), format!("the signature of `{name}`"));
     }
 }
 

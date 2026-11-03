@@ -200,7 +200,7 @@ mod tests {
     }
 
     /// Every element of the tree a cursor walks, parsing every lazy body, as kind and range.
-    fn elements(root: SyntaxNode) -> Vec<(crate::SyntaxKind, crate::TextRange)> {
+    fn elements(root: &SyntaxNode) -> Vec<(crate::SyntaxKind, crate::TextRange)> {
         root.descendants_with_tokens().map(|it| (it.kind(), it.text_range())).collect()
     }
 
@@ -241,7 +241,7 @@ mod tests {
                 }
                 assert_eq!(read.errors_with_bodies(), parse.errors_with_bodies(), "{name}");
                 let fresh = SourceFile::parse_shared(text.clone(), edition);
-                assert_eq!(elements(read.tree().syntax().clone()), elements(fresh.syntax_node()));
+                assert_eq!(elements(read.tree().syntax()), elements(&fresh.syntax_node()));
                 let other = read_other(&bytes, at, &text, edition, outline);
                 assert_eq!(other, Some("a tree of another edition or kind of parse"), "{name}");
             }

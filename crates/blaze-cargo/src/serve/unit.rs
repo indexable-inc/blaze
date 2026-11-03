@@ -16,6 +16,7 @@
 //! - [`reach`]: what a change reaches, from the database's facts.
 //! - [`pack`]: `blaze pack`'s pack of a checked program, for blaze's in-browser compiler.
 //! - [`say`]: cargo's own lines (`error: ...`, `warning: ...`) as diagnostics.
+//! - [`release`]: what a build lets go of its front end once nothing still to compile reads it.
 //!
 //! The front end is written by the loop alone, through the job's [`UnitWriter`], and read by
 //! each task through the [`UnitReader`] it was posted with, a shared reference: no worker
@@ -43,6 +44,7 @@ mod pack;
 mod perf;
 mod reach;
 mod reads;
+mod release;
 mod run;
 mod say;
 mod script;
@@ -203,7 +205,7 @@ impl Steps for Real {
         }
         let later = std::mem::take(&mut kept.later);
         let deps = kept.deps.take();
-        let stored = cancellable(|| deps::store(&kept.lowered, deps, &mut kept.session, &later, &kept.root));
+        let stored = cancellable(|| deps::store(&kept.lowered, deps.as_ref(), &mut kept.session, &later, &kept.root));
         let (puts, flushes) = match stored {
             Ok(stored) => stored?,
             // A cancel of the front end's database or of the build graph, caught as the
@@ -321,7 +323,7 @@ impl Steps for Real {
             // After the seeds (the root's parse is seeded as on disk), before any identity:
             // a test crate is identified by its root with the harness.
             // A unit refused here has no write to charge it to yet: the lowering fails, naming each.
-            harness::write(&mut lowered, &job, (0..job.graph.len() as u32).filter(|&unit| waits.ready(unit))).map_err(harness::refused)?;
+            harness::write(&mut lowered, &job, (0..job.graph.len() as u32).filter(|&unit| waits.ready(unit))).map_err(|refused| harness::refused(&refused))?;
             for unit in 0..job.graph.len() as u32 {
                 if unit % 64 == 0 && input.cancelled.load(Ordering::Relaxed) {
                     return Err(Failed::Again);
@@ -335,6 +337,7 @@ impl Steps for Real {
             // this job's moved one.
             let mut deps = None;
             deps::serve(&mut lowered, &job, &deps::ready(&job, &waits), &mut session, &mut deps)?;
+            let release = release::Release::new(lowered.crates(), job.graph.len(), input.goal != Goal::Check);
             let writer = UnitWriter {
                 session,
                 front: Held::new(Arc::new(lowered), "a job's front end"),
@@ -348,6 +351,7 @@ impl Steps for Real {
                 broke: Vec::new(),
                 broken: false,
                 retractions,
+                release,
             };
             Ok((writer, puts, misses))
         })??;
@@ -589,6 +593,38 @@ impl UnitReader {
     pub(crate) fn paths(&self) -> &Arc<HashMap<FileId, String>> {
         self.front.paths()
     }
+
+    /// The file of each of `names` (the files diagnostics name, from `root` as
+    /// [`blaze_diagnostics::Files::relative`] names them) that the database has the text of, by
+    /// name: a file of [`UnitReader::paths`], the first by ID of two of one name, else the one
+    /// `include!` parsed of a file outside every source root at that path
+    /// ([`base_db::Files::included_source_file`]), which no path of the job names.
+    pub(crate) fn files_named(&self, root: &str, names: &[&str]) -> Vec<(String, FileId)> {
+        let db = self.db();
+        let mut found: Vec<(String, FileId)> = (self.paths().iter())
+            .filter(|&(&file, _)| db.has_file_text(file))
+            .map(|(&file, path)| (blaze_diagnostics::Files::relative(path, root), file))
+            .filter(|(name, _)| names.contains(name))
+            .map(|(name, file)| (name.to_owned(), file)) // alloc: the few names of a unit's diagnostics
+            .collect(); // alloc: as above
+        // The first file of a name by ID, whatever order the map is in.
+        found.sort_by(|a, b| (&a.0, a.1.index()).cmp(&(&b.0, b.1.index())));
+        found.dedup_by(|a, b| a.0 == b.0);
+        for &name in names {
+            if found.iter().any(|(it, _)| it == name) {
+                continue;
+            }
+            let whole = match name.starts_with('/') {
+                true => name.to_owned(), // alloc: as above
+                false => format!("{}/{name}", root.trim_end_matches('/')), // alloc: as above
+            };
+            let Ok(whole) = base_db::AbsPathBuf::try_from(whole.as_str()) else { continue };
+            if let Some(file) = db.files().included_source_file(&whole) {
+                found.push((name.to_owned(), file)); // alloc: as above
+            }
+        }
+        found
+    }
 }
 
 /// The job's front end as only the loop writes it: the one reference not lent to a reader,
@@ -619,12 +655,14 @@ pub struct UnitWriter {
     broken: bool,
     /// The epoch of retractions its job was lowered at, kept with it ([`KeptLowered`]).
     retractions: u64,
+    /// What the build lets go of its front end as its units compile ([`release`]).
+    release: release::Release,
 }
 
 /// `broke`, a failure or a panic of a step of an apply for each of the units `ready`, kept
 /// once for each. `itself`: the step was part of making those units (their harness, their
 /// dependencies served), so each is refused too, not only what depends on it.
-fn broke_each(into: &mut Vec<Broke>, broke: Broke, ready: &[u32], itself: bool) {
+fn broke_each(into: &mut Vec<Broke>, broke: &Broke, ready: &[u32], itself: bool) {
     for &unit in ready {
         // clone: a failure, once per unit it fails
         into.push(Broke { unit: unit as usize, what: broke.what, how: broke.how.clone(), itself });
@@ -649,7 +687,15 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn waiting(&self) -> bool {
-        !self.runs.is_empty() || !self.macros.is_empty()
+        !self.runs.is_empty() || !self.macros.is_empty() || self.release.due()
+    }
+
+    fn began(&mut self, unit: usize) {
+        self.release.began(unit);
+    }
+
+    fn compiled(&mut self, unit: usize) {
+        self.release.compiled(unit);
     }
 
     /// The writes asked for since the last apply, as three changes, each one maintenance pass
@@ -664,6 +710,12 @@ impl Writer<Real> for UnitWriter {
             return Ok(true);
         }
         let Some(lowered) = Arc::get_mut(&mut self.front) else { return Ok(false) };
+        // First, with the readers stopped for it or for the writes below: what the crates
+        // finished so far keep ([`release`]).
+        self.release.release(lowered);
+        if self.runs.is_empty() && self.macros.is_empty() {
+            return Ok(true);
+        }
         self.ready.clear();
         // alloc: once an apply, the units it writes, named on its `maintain` span
         let touched: Vec<u32> = self.macros.iter().map(|(unit, _)| *unit as u32).chain(self.runs.iter().map(|(run, _)| *run as u32)).collect();
@@ -700,7 +752,7 @@ impl Writer<Real> for UnitWriter {
         });
         if let Err(it) = applied {
             // The pass at the batch's end panicked: every write of it fails.
-            broke_each(&mut self.broke, it, &touched, false);
+            broke_each(&mut self.broke, &it, &touched, false);
             self.ready.clear();
             return Ok(true);
         }
@@ -725,7 +777,7 @@ impl Writer<Real> for UnitWriter {
                 }
                 // It panicked, making no one knows which root: every unit of the write is refused.
                 Err(it) => {
-                    broke_each(&mut self.broke, it, &written, true);
+                    broke_each(&mut self.broke, &it, &written, true);
                     self.ready.clear();
                     return Ok(true);
                 }
@@ -801,6 +853,10 @@ impl Writer<Real> for UnitWriter {
         if self.broken || !self.broke.is_empty() {
             let what = "the front end is not kept for the head's next build: a write to it panicked, and it may be half written";
             return Err(self.refused(what));
+        }
+        // The build is over: what its finished crates keep goes before the front end is kept.
+        if let Some(lowered) = Arc::get_mut(&mut self.front) {
+            self.release.release(lowered);
         }
         let UnitWriter { session, front, job, deps, retractions, .. } = self;
         let Some(lowered) = Arc::into_inner(front.into_inner()) else {
@@ -973,8 +1029,9 @@ fn library_fingerprint(dir: &std::path::Path, prefix: &str, into: &mut blaze_ids
 
 /// `work` on a worker, the front end's or the build graph's cancel as [`Failed::Again`]: the
 /// loop posts it again whole, and nothing of it is kept. Name resolution's typed stops
-/// ([`hir_def::nameres::Unmaintained`], [`hir_def::nameres::FixpointLimit`]) become the unit's
-/// error. Any other panic is not caught.
+/// ([`hir_def::nameres::stopped`]: [`hir_def::nameres::Unmaintained`],
+/// [`hir_def::nameres::FixpointLimit`], [`hir_def::nameres::frozen::Unreadable`]) become the
+/// unit's error. Any other panic is not caught.
 pub(crate) fn cancellable<T>(work: impl FnOnce() -> T) -> Result<T, Failed> {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
     match caught {
@@ -982,10 +1039,8 @@ pub(crate) fn cancellable<T>(work: impl FnOnce() -> T) -> Result<T, Failed> {
         Err(payload) => {
             if payload.is::<blaze_query::db::Cancelled>() || payload.is::<blaze_graph::Cancelled>() {
                 Err(Failed::Again)
-            } else if let Some(it) = hir_def::nameres::Unmaintained::of_payload(&*payload) {
-                Err(Failed::Error(ApiError::new(it.to_string(), None))) // alloc: an error, once
-            } else if let Some(it) = hir_def::nameres::FixpointLimit::of_payload(&*payload) {
-                Err(Failed::Error(ApiError::new(it.to_string(), None))) // alloc: an error, once
+            } else if let Some(it) = hir_def::nameres::stopped(&*payload) {
+                Err(Failed::Error(ApiError::new(it, None)))
             } else {
                 std::panic::resume_unwind(payload)
             }
@@ -1409,6 +1464,18 @@ impl Front<Real> for JobFront {
 impl Kept for codegen::Linked {
     fn tables(&self) -> Vec<(&'static str, u64, u64)> {
         codegen::Linked::tables(self)
+    }
+
+    fn held(&self) -> u64 {
+        codegen::Linked::held(self)
+    }
+
+    fn live(&self) -> bool {
+        codegen::Linked::live(self)
+    }
+
+    fn rest(&mut self) {
+        codegen::Linked::rest(self);
     }
 }
 

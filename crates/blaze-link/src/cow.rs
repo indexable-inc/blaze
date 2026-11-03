@@ -630,11 +630,11 @@ impl<T: Chunked> CowList<T> {
     }
 
     /// A list of `len` copies of `fill`.
-    pub fn push_filled(&mut self, len: usize, fill: T) -> ListRef {
+    pub fn push_filled(&mut self, len: usize, fill: &T) -> ListRef {
         if len == 0 {
             return ListRef::EMPTY;
         }
-        let list = self.place(len, &[], &fill);
+        let list = self.place(len, &[], fill);
         self.live += len;
         list
     }
@@ -1271,7 +1271,7 @@ mod tests {
             fill(&mut ids, &mut syms);
             (ids, syms)
         }
-        fn same<A: Allocator + Copy>(got: (IdSet<A>, SymSet<A>), ids: &IdSet, syms: &SymSet) {
+        fn same<A: Allocator + Copy>(got: &(IdSet<A>, SymSet<A>), ids: &IdSet, syms: &SymSet) {
             assert_eq!(got.0.iter().collect::<Vec<_>>(), ids.iter().collect::<Vec<_>>());
             assert_eq!(got.0.sorted(), ids.sorted());
             assert_eq!(got.0.len(), ids.len());
@@ -1281,9 +1281,9 @@ mod tests {
         let (mut ids, mut syms) = (IdSet::default(), SymSet::default());
         fill(&mut ids, &mut syms);
         let mut frame = crate::arena::stage_frame().unwrap();
-        same(sets_in(&frame), &ids, &syms);
+        same(&sets_in(&frame), &ids, &syms);
         frame.reset();
-        same(blaze_alloc_count::assert_at_most(0, "a warm stage's sets", || sets_in(&frame)), &ids, &syms);
+        same(&blaze_alloc_count::assert_at_most(0, "a warm stage's sets", || sets_in(&frame)), &ids, &syms);
     }
 
     /// The pages against a plain vector given the same writes.
@@ -1463,7 +1463,7 @@ mod tests {
                     }
                     2 => {
                         let (len, fill) = (rng.index(2 * CHUNK), rng.next_u32());
-                        lists.push((arena.push_filled(len, fill), vec![fill; len]));
+                        lists.push((arena.push_filled(len, &fill), vec![fill; len]));
                         live += len;
                     }
                     3 | 4 if !lists.is_empty() => {
@@ -1633,7 +1633,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "2^24")]
     fn a_list_past_the_longest_class_stops() {
-        CowList::<u32>::default().push_filled(LONGEST_LIST + 1, 0);
+        CowList::<u32>::default().push_filled(LONGEST_LIST + 1, &0);
     }
 
     /// The runs, an update and the changed blocks of paged bytes against a plain vector given

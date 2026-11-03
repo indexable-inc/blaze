@@ -5,24 +5,33 @@
 //! A capture frame belongs to the running query: every read in it is the query's, as it
 //! happens. Its reads are the edge stack above where it opened, in read order (a read the query
 //! made before is pushed again inside the frame), so a nested frame's reads and what a replay
-//! pushed in it are the enclosing frame's too. Closing copies them into the edge array as a
-//! [`Reads`], valid in the view it was captured in (compaction opens a new one).
+//! pushed in it are the enclosing frame's too. Closing stores them as a [`Reads`], valid in the
+//! view it was captured in, and freed with it: each read once, and each nested capture or replay
+//! as one entry naming that capture, so the solver's goals, each captured inside its parent's,
+//! hold every read once rather than once per level (`Storage::push_capture`).
 
 use std::ops::ControlFlow;
 
+use blaze_hash::FixedState;
+
 use super::{
-    Database, DatabaseKeyIndex, Storage,
+    Database, DatabaseKeyIndex, Id, Storage,
     ingredient::{self, Kind},
-    local::{self, Capture},
-    row::span,
+    local::{self, Capture, walk_capture},
     storage::{Summary, key_parts, or},
 };
+
+/// The bit of a captured entry that makes it a capture's number, not a node's.
+pub(crate) const REF: u32 = 1 << 31;
 
 /// What a [`capture_reads`] frame read: its edges, the lowest durability and highest
 /// `changed` of them, the OR of their input summaries, and the view it was captured in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Reads {
-    span: u64,
+    /// Its capture's number in its view, 0 for no read.
+    capture: u32,
+    /// The distinct nodes it read.
+    len: u32,
     view: u32,
     /// `changed`, with the durability in its top two bits.
     changed: u32,
@@ -52,8 +61,9 @@ pub enum ReadKind {
 }
 
 impl Reads {
+    /// The distinct dependencies it read.
     pub fn len(&self) -> usize {
-        span::len(self.span) as usize
+        self.len as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -78,7 +88,8 @@ impl Reads {
         );
     }
 
-    /// Calls `f` with each read, in read order, until it breaks.
+    /// Calls `f` with each read, in read order, until it breaks. A read made in several
+    /// captures nested in this one may come more than once.
     ///
     /// # Panics
     ///
@@ -89,13 +100,12 @@ impl Reads {
         mut f: impl FnMut(Read) -> ControlFlow<B>,
     ) -> Option<B> {
         self.check_view(storage);
-        let start = span::start(self.span);
-        for at in start..start + span::len(self.span) {
-            if let ControlFlow::Break(it) = f(read_of_key(storage.key_of(storage.edge(at)))) {
-                return Some(it);
-            }
-        }
-        None
+        // `f` may ask the database, so the walk's lists are its own, not the thread's.
+        let mut spans = Vec::new(); // alloc: a walk's open captures, once per read-out of a capture (a store's offer)
+        let mut walked = hashbrown::HashSet::with_hasher(FixedState); // alloc: as above
+        walk_capture(storage, self.capture, &mut spans, &mut walked, |node| {
+            f(read_of_key(storage.key_of(node)))
+        })
     }
 }
 
@@ -182,15 +192,19 @@ pub fn capture_reads<D: Database, T>(db: &D, f: impl FnOnce() -> T) -> (T, Optio
         frame.summary = or(replayed, capture.summary);
         frame.unshareable = unshareable || capture.unshareable;
         frame.dedup_floor = capture.dedup_floor;
+        let owner = (frame.ingredient, Id::from_u32(frame.id));
         if unshareable {
             return None;
         }
-        local.dedup_from(capture.edges_start as usize);
-        let edges = &local.edges[capture.edges_start as usize..];
-        let span = storage.push_edges(edges);
+        let start = capture.edges_start as usize;
+        let number = storage.push_capture(local.capture_entries(start), owner);
+        local.dedup_from(start);
+        local.mark_capture(start, number);
+        let edges = &local.edges[start..];
         let durability = u32::from(durability.min(2));
         Some(Reads {
-            span,
+            capture: number,
+            len: edges.len() as u32,
             view: storage.view_bits(),
             changed: changed | (durability << DURABILITY_SHIFT),
             summary: or(replayed, storage.summary_of_edges(edges)),
@@ -208,17 +222,16 @@ pub fn capture_reads<D: Database, T>(db: &D, f: impl FnOnce() -> T) -> (T, Optio
 pub fn replay_reads<D: Database>(db: &D, reads: Reads) {
     let storage = db.storage();
     reads.check_view(storage);
-    local::with(|local| {
-        let Some(frame) = local.recording(storage) else { return };
+    let over = local::with(|local| {
+        let Some(frame) = local.recording(storage) else { return false };
         frame.durability = frame.durability.min(reads.durability());
         frame.changed = frame.changed.max(reads.changed());
         frame.summary = or(frame.summary, reads.summary);
-        let start = span::start(reads.span);
-        for at in start..start + span::len(reads.span) {
-            // alloc: none once warm: the edge stack grows to its high-water mark once per thread
-            local.edges.push(storage.edge(at));
-        }
+        local.replay(storage, reads.capture)
     });
+    if over {
+        super::runaway_reads(storage);
+    }
 }
 
 /// Appends to `out` the tracing text `write` writes: a span's name (`hir_def::span_names`).
@@ -279,7 +292,7 @@ struct Unrecorded {
 impl Drop for Unrecorded {
     fn drop(&mut self) {
         local::with(|local| {
-            local.edges.truncate(self.edges as usize);
+            local.truncate_edges(self.edges as usize);
             let Some(frame) = local.frames.get_mut(self.at as usize) else { return };
             frame.dedup_floor = self.dedup_floor;
             frame.durability = self.durability;

@@ -80,6 +80,20 @@ fn nth_impl(db: &Db, n: usize) -> ImplId {
 }
 
 /// A lane items fact as its `FactRef`, as `blaze_items::table` splits it.
+/// The local crate's impl method `name`.
+fn impl_method(db: &Db, name: &str) -> hir_def::FunctionId {
+    crate_def_map(db, local_crate(db))
+        .modules(db)
+        .flat_map(|(_, module)| module.scope(db).impls())
+        .find_map(|imp| {
+            imp.impl_items(db).items.iter().find_map(|(item_name, item)| match *item {
+                hir_def::AssocItemId::FunctionId(it) if item_name.as_str() == name => Some(it),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| panic!("no impl method `{name}` in the local crate"))
+}
+
 fn items_fact(fact: Fact) -> FactRef {
     let (subject, object) = match fact {
         Fact::Method { self_ty, name } => (self_ty.0, FactObject::Id(name.0)),
@@ -322,6 +336,28 @@ fn items_facts_change_through_value() {
             changes: true,
             of: |db| items_fact(auto_traits(db, named(db, "f"), 0)),
         },
+        // The impl method's type for the nested `impl Sized` is `<I as It>::Item`, which another
+        // impl gives: nothing its signature names changes, but the type does.
+        Pair {
+            what: "the type an impl method gives a nested `impl Trait` changed by another impl",
+            before: "pub trait It { type Item; } pub struct I; impl It for I { type Item = u8; }\n\
+                     pub trait T { fn f(&self) -> impl It<Item = impl Sized>; }\n\
+                     pub struct S; impl T for S { fn f(&self) -> I { I } }",
+            after: "pub trait It { type Item; } pub struct I; impl It for I { type Item = u16; }\n\
+                    pub trait T { fn f(&self) -> impl It<Item = impl Sized>; }\n\
+                    pub struct S; impl T for S { fn f(&self) -> I { I } }",
+            changes: true,
+            of: |db| items_fact(Fact::Signature(key::item_key(db, ItemId::Function(impl_method(db, "f"))))),
+        },
+        Pair {
+            what: "the impl method's hidden type changed, the trait's `impl Trait` as written",
+            before: "pub trait T { fn f(&self) -> impl Sized; }\n\
+                     pub struct S; impl T for S { fn f(&self) -> impl Sized { 1u8 } }",
+            after: "pub trait T { fn f(&self) -> impl Sized; }\n\
+                    pub struct S; impl T for S { fn f(&self) -> impl Sized { 1u16 } }",
+            changes: false,
+            of: |db| items_fact(Fact::Signature(key::item_key(db, ItemId::Function(impl_method(db, "f"))))),
+        },
         Pair {
             what: "an opaque type's hidden type changed, still Send",
             before: "pub fn f() -> impl Sized { 1u8 }",
@@ -420,6 +456,10 @@ pub fn calls_generic(p: &Point) -> u8 { generic(p) + Point::new(1, 2).show() }
 pub enum Small { A = 1, B = LIMIT as isize }
 pub fn hidden(n: u32) -> impl Copy + Send { n }
 pub fn sees_hidden() -> u32 { let h = hidden(2); let _ = h; Small::B as u32 + ORIGIN.y }
+pub trait Make { fn make(&self) -> impl Copy; }
+impl Make for Point { fn make(&self) -> u32 { self.x } }
+pub fn makes(p: &Point) -> u32 { p.make() + 1 }
+pub fn copies<M: Make>(m: &M) { let a = m.make(); let b = a; let _ = (a, b); }
 "#;
 
 /// Reads the closure test allows to be refused, each with why. A refused read keeps its step
@@ -457,7 +497,7 @@ const REFUSALS: &[(&str, &str)] = &[
     ("table", "a walk of every module of a crate (hir-ty lower/path.rs inherent_associated_type)"),
     ("modules", "a walk of every module of a published crate (DefMap::table)"),
     // Positions: the identity has no spans.
-    ("Body::with_source_map", "a source map: positions"),
+    ("Body::source_map", "a source map: positions"),
     ("Body::relative", "a source map: positions"),
     ("FunctionSignature::with_source_map", "a source map: positions"),
     ("FunctionSignature::relative", "a source map: positions"),
@@ -615,6 +655,41 @@ fn leak_reads_are_lane_items_facts() {
             assert!(matches!(it.class, Classified::Fact(_)), "fact_value: {:?}", it.class);
         }
     }
+}
+
+/// A generic body's goals about a trait method's `impl Trait` (`<M as Make>::{impl Trait#0}:
+/// Copy`) read its bounds (`rpitit_item_bounds`), which stand for the trait method's signature
+/// (`blaze_items::goals`), so that read keeps no goal out of the goal store. (The same goals
+/// still read the item's variances, `opaque_variances_query`, which no fact names yet.)
+#[test]
+fn rpitit_reads_keep_no_goal_out_of_the_goal_store() {
+    let db = db_of(
+        r#"
+//- minicore: sized, copy, clone, add
+pub trait Make { fn make(self) -> impl Copy; }
+impl Make for u32 { fn make(self) -> u32 { self } }
+pub fn wants<T: Copy>(t: T) -> T { t }
+pub fn concrete() -> u32 { let a = wants(5u32.make()); a + a }
+pub fn copies<M: Make>(m: M) { let a = m.make(); let b = wants(a); let _ = (a, b); }
+"#,
+    );
+    let installed = hir_ty::next_solver::goal_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        Arc::new(blaze_items::goals::Goals),
+        ContentId([7; 32]),
+    )
+    .expect("a goal store for the test database");
+    for &def in &crate_body_owners(&db, local_crate(&db)) {
+        let _ = InferenceResult::of(&db, def);
+        let _ = db.mir_body(InferBodyId::DefWithBodyId(def));
+        let _ = hir_ty_borrowck::checked(&db, def);
+    }
+    let flushed = installed.flush().expect("the test goal store flushes");
+    assert!(flushed.written > 0, "no goal was stored: {flushed:?}");
+    let kept_out: Vec<&(&str, u64)> = // alloc: test
+        flushed.inexpressible.iter().filter(|(name, _)| name.contains("rpitit")).collect();
+    assert!(kept_out.is_empty(), "goals kept out by reads that stand for no fact: {kept_out:?}");
 }
 
 /// A read keyed by several arguments (request 00827) is the fact of what its first names: a

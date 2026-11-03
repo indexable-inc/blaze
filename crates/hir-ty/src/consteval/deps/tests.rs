@@ -49,8 +49,8 @@ fn scalar(ty: Ty<'static>, memory: &[u8]) -> Allocation<'static> {
 /// pointer word with provenance.
 fn complex() -> MemoryMap<'static> {
     let mut map = ComplexMemoryMap::default();
-    map.insert(0x2000, Box::new(*b"hello"));
-    map.insert(0x1000, Box::new([1, 2, 3, 4]));
+    map.insert(0x2000, b"hello");
+    map.insert(0x1000, &[1, 2, 3, 4]);
     map.note_align(0x1000, 4);
     map.note_align(0x2000, 1);
     map.note_pointer(PointerAt::Value(0));

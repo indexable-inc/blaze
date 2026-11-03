@@ -140,9 +140,9 @@ fn old_match_attr_flags(
     fn old_extract_doc_tt_attr(
         attr_flags: &mut AttrFlags,
         root: view::Node<'_>,
-        tt: ast::TokenTree,
+        tt: &ast::TokenTree,
     ) {
-        for atom in DocAtom::parse(view_of(root, &tt)) {
+        for atom in DocAtom::parse(view_of(root, tt)) {
             match atom {
                 DocAtom::Flag(flag) => match &*flag {
                     "notable_trait" => attr_flags.insert(AttrFlags::IS_DOC_NOTABLE_TRAIT),
@@ -202,7 +202,7 @@ fn old_match_attr_flags(
                     "inline" if tt.syntax().text().to_string().contains("never") => {
                         attr_flags.insert(AttrFlags::INLINE_NEVER)
                     }
-                    "doc" => old_extract_doc_tt_attr(attr_flags, root, tt),
+                    "doc" => old_extract_doc_tt_attr(attr_flags, root, &tt),
                     "repr" | "rustc_scalable_vector" => attr_flags.insert(AttrFlags::HAS_REPR),
                     "target_feature" => attr_flags.insert(AttrFlags::HAS_TARGET_FEATURE),
                     "link_ordinal" => attr_flags.insert(AttrFlags::HAS_LINK_ORDINAL),
@@ -818,8 +818,8 @@ fn option_corpus(path: &str, texts: &[&str]) -> Vec<String> {
 fn option_sets_flag_as_the_string_match_did() {
     use syntax::{NodeOrToken, ast::TokenTreeChildren};
 
-    fn old_ra_completions(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
-        let tt = TokenTreeChildren::new(&tt);
+    fn old_ra_completions(attr_flags: &mut AttrFlags, tt: &ast::TokenTree) {
+        let tt = TokenTreeChildren::new(tt);
         if let Ok(NodeOrToken::Token(option)) = itertools::Itertools::exactly_one(tt)
             && option.kind().is_any_identifier()
         {
@@ -833,8 +833,8 @@ fn option_sets_flag_as_the_string_match_did() {
             }
         }
     }
-    fn old_ra_macro_style(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
-        let tt = TokenTreeChildren::new(&tt);
+    fn old_ra_macro_style(attr_flags: &mut AttrFlags, tt: &ast::TokenTree) {
+        let tt = TokenTreeChildren::new(tt);
         if let Ok(NodeOrToken::Token(option)) = itertools::Itertools::exactly_one(tt)
             && option.kind().is_any_identifier()
         {
@@ -846,8 +846,8 @@ fn option_sets_flag_as_the_string_match_did() {
             }
         }
     }
-    fn old_skip_during_method_dispatch(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
-        for kind in TokenTreeChildren::new(&tt) {
+    fn old_skip_during_method_dispatch(attr_flags: &mut AttrFlags, tt: &ast::TokenTree) {
+        for kind in TokenTreeChildren::new(tt) {
             if let NodeOrToken::Token(kind) = kind
                 && kind.kind().is_any_identifier()
             {
@@ -865,7 +865,7 @@ fn option_sets_flag_as_the_string_match_did() {
     }
 
     type Extract = fn(&mut AttrFlags, view::TokenTree<'_>);
-    type OldExtract = fn(&mut AttrFlags, ast::TokenTree);
+    type OldExtract = fn(&mut AttrFlags, &ast::TokenTree);
     for (path, texts, new, old) in [
         (
             "rust_analyzer::completions",
@@ -890,7 +890,7 @@ fn option_sets_flag_as_the_string_match_did() {
             let parse = parse_of(&attr);
             let (mut got, mut want) = (AttrFlags::empty(), AttrFlags::empty());
             new(&mut got, tt_in(&parse));
-            old(&mut want, old_tt_in(&parse));
+            old(&mut want, &old_tt_in(&parse));
             assert_eq!(got, want, "{attr}");
         }
     }

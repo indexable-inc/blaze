@@ -46,6 +46,7 @@ fn span(thread: u32, span_id: u64, parent: Option<u64>, name: &str, start_ns: i6
         awaits: None,
         owner: None,
         job: None,
+        creator: None,
         start_ns,
         dur_ns,
         self_cpu_ns: None,
@@ -328,6 +329,38 @@ fn the_critical_path_crosses_from_a_jobs_start_to_its_spawner() {
     assert_eq!(path.reached, Reached::BuildStart);
     let alone = model(vec![switch(2, 30, Event::Started, 2, 2), switch(2, 50, Event::Ended, 2, 2)], vec![], Some((0, 50)));
     assert!(matches!(path::critical(&alone).reached, Reached::LaneStart { .. }), "no row names its spawner");
+}
+
+/// Job 2 is given to the pool at 15 by a thread that runs no job (a build's driver, the
+/// daemon's main loop), inside its span 1, which ends at 20; the job starts at 30. No row names
+/// a spawning job, so the path crosses through the creator span its `job` span names: back
+/// over the giver's running to the build's start, its links adding up to the wall.
+#[test]
+fn the_critical_path_crosses_from_a_job_to_the_span_that_gave_it_on_a_thread_with_no_job() {
+    let rows = |creator: Option<u64>| {
+        let mut job = job_span(2, 7, 2, 30, 20);
+        job.creator = creator;
+        model(
+            vec![switch(2, 30, Event::Started, 2, 2), switch(2, 50, Event::Ended, 2, 2)],
+            vec![span(5, 1, None, "build driver", 0, 20), job],
+            Some((0, 50)),
+        )
+    };
+    let m = rows(Some(1));
+    let path = path::critical(&m);
+    let driver = m.lane(LaneId::Thread { process: P, thread: 5 }).unwrap();
+    let links: Vec<_> = path.links.iter().map(|it| (it.kind, it.lane, it.from_ns, it.to_ns)).collect();
+    let job = m.lane(LaneId::Job { process: P, job: 2 }).unwrap();
+    assert_eq!(links, [(LinkKind::Ran, driver, 0, 20), (LinkKind::Spawned, job, 20, 30), (LinkKind::Ran, job, 30, 50)]);
+    assert_eq!(path.reached, Reached::BuildStart);
+    assert_eq!(path.len_ns(), 50, "the path is the wall");
+    assert_eq!(m.anomalies.creators_unread, 0);
+
+    let unnamed = rows(None);
+    assert!(matches!(path::critical(&unnamed).reached, Reached::LaneStart { .. }), "no row names who gave it");
+    let unread = rows(Some(99));
+    assert!(matches!(path::critical(&unread).reached, Reached::LaneStart { .. }));
+    assert_eq!(unread.anomalies.creators_unread, 1, "a creator with no row is counted, not guessed");
 }
 
 #[test]

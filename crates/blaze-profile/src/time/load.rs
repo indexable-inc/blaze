@@ -33,7 +33,7 @@ pub struct Source<'a> {
 /// What `blaze debug time` asks for.
 #[derive(Clone, Copy, Debug)]
 pub struct Ask<'a> {
-    /// `None`: the last build that ended.
+    /// `None`: the last build that ended or whose daemon died.
     pub build: Option<u64>,
     pub by: By,
     pub top: usize,
@@ -89,33 +89,108 @@ pub(crate) fn query(source: &Source<'_>, sql: &str, doing: &'static str) -> Resu
     sql::run(&sql::Query { duckdb: source.duckdb, history: source.history, sql }).map_err(|error| TimeError::Sql { doing, error })
 }
 
-/// The rows of `build`, or of the last build that ended.
-pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError> {
-    let build = match build {
-        Some(it) => it,
-        None => {
-            let sql = "SELECT CAST(max(build_id) AS UBIGINT) AS build FROM builds WHERE dur_ns IS NOT NULL";
-            let batches = query(source, sql, "finding the last build that ended")?;
-            first_u64(&batches, "builds", "build")?.ok_or(TimeError::NoBuild)?
-        }
+/// A build to read and its window ([`pick`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pick {
+    pub build: u64,
+    /// When it started and how long it ran: to its end row, or to the last row its dead daemon
+    /// wrote; `None` while it runs, or when the history has no row of it.
+    pub row: Option<(i64, i64)>,
+    /// The process of the daemon whose death ended it: the build's only row is its start and
+    /// that process no longer writes the history ([`history::writes`]).
+    pub died: Option<u32>,
+}
+
+/// `build`, or the last build that ended or whose daemon died, and its window.
+pub fn pick(source: &Source<'_>, build: Option<u64>) -> Result<Pick, TimeError> {
+    // The builds a report may be of: `build`, or the last that ended and every one after it,
+    // newest first; of each, its end row before its start row.
+    let which = match build {
+        // alloc: a query's part, once a report
+        Some(it) => format!("build_id = {it}"),
+        None => "build_id >= coalesce((SELECT max(build_id) FROM builds WHERE dur_ns IS NOT NULL), 0)".to_owned(), // alloc: as above
     };
     // alloc: a query, once a report
     let sql = format!(
-        "SELECT CAST(started_ns AS BIGINT) AS started_ns, CAST(dur_ns AS BIGINT) AS dur_ns FROM builds \
-         WHERE build_id = {build} AND dur_ns IS NOT NULL ORDER BY dur_ns DESC LIMIT 1"
+        "SELECT CAST(build_id AS UBIGINT) AS build, CAST(started_ns AS BIGINT) AS started_ns, CAST(dur_ns AS BIGINT) AS dur_ns, \
+         CAST(process AS BIGINT) AS process FROM (SELECT * FROM builds UNION ALL BY NAME \
+         SELECT NULL::UINTEGER AS process WHERE false) WHERE {which} ORDER BY build_id DESC, dur_ns DESC NULLS LAST"
     );
-    let batches = query(source, &sql, "reading the build's builds row")?;
-    let mut build_row = None;
+    let batches = query(source, &sql, "finding the build: the last that ended or whose daemon died")?;
+    let mut seen = None;
     for batch in &batches {
-        let (started, dur) = (ints(batch, "builds", "started_ns")?, ints(batch, "builds", "dur_ns")?);
-        if batch.num_rows() > 0 {
-            build_row = Some((started.value(0), dur.value(0)));
+        const T: &str = "builds";
+        let (ids, started, dur, process) = (uints(batch, T, "build")?, ints(batch, T, "started_ns")?, ints(batch, T, "dur_ns")?, ints(batch, T, "process")?);
+        for row in 0..batch.num_rows() {
+            let Some(id) = get(ids, row, |it, row| it.value(row)) else { continue };
+            // A build's first row in this order says how it ended; its others are its start.
+            if seen == Some(id) {
+                continue;
+            }
+            seen = Some(id);
+            let start = get(started, row, |it, row| it.value(row));
+            if let (Some(start), Some(dur)) = (start, get(dur, row, |it, row| it.value(row))) {
+                return Ok(Pick { build: id, row: Some((start, dur)), died: None });
+            }
+            let pid = get(process, row, |it, row| it.value(row)).and_then(|it| u32::try_from(it).ok());
+            match (start, pid) {
+                (Some(start), Some(pid)) if !history::writes(source.history, pid) => {
+                    let last = last_row(source, pid, start)?;
+                    return Ok(Pick { build: id, row: Some((start, last.max(start) - start)), died: Some(pid) });
+                }
+                // Still running, in a daemon that writes the history: asked for by name, it is
+                // read as far as its rows go; else the one before it is the report's.
+                _ if build.is_some() => return Ok(Pick { build: id, row: None, died: None }),
+                _ => {}
+            }
         }
     }
+    // A build asked for by name with no `builds` row is read by its tagged rows alone.
+    build.map(|build| Pick { build, row: None, died: None }).ok_or(TimeError::NoBuild)
+}
+
+/// The time of the last row the process `pid` wrote from `since` on: a span's end, a switch, a
+/// counter, an event, or a reading of its open spans.
+fn last_row(source: &Source<'_>, pid: u32, since: i64) -> Result<i64, TimeError> {
+    let at = |table: &str, time: &str| {
+        // alloc: a query's part, once a report
+        format!("(SELECT max({time}) FROM {table} WHERE process = {pid} AND {time} >= {since})")
+    };
+    // alloc: a query, once a report
+    let sql = format!(
+        "SELECT CAST(greatest({}, {}, {}, {}, {}) AS BIGINT) AS last_ns",
+        at("spans", "start_ns + coalesce(dur_ns, 0)"),
+        at("switches", "t_ns"),
+        at("counters", "t_ns"),
+        at("events", "t_ns"),
+        at("open", "read_ns"),
+    );
+    let batches = query(source, &sql, "finding the last row of the daemon that died")?;
+    for batch in &batches {
+        let it = ints(batch, "builds", "last_ns")?;
+        if batch.num_rows() > 0 {
+            return Ok(get(it, 0, |it, row| it.value(row)).unwrap_or(since));
+        }
+    }
+    Ok(since)
+}
+
+/// The rows of `build`, or of the last build that ended or whose daemon died.
+pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError> {
+    rows(source, pick(source, build)?).map(|(input, _)| input)
+}
+
+/// The rows of the picked build, and the process whose rows are of it (`None` when none is).
+pub fn rows(source: &Source<'_>, pick: Pick) -> Result<(Input, Option<u32>), TimeError> {
+    let Pick { build, row: build_row, died: _ } = pick;
     // Rows of no build in the build's window are its too: the recorder leaves `build_id` null on
     // a job's rows once its code let go of the build (most of a cold build's switches and spans
     // on 2026-11-02), and a reader that took only the tagged rows saw a tenth of the work.
     let window = build_row.map(|(start, dur)| (start, start + dur));
+    // The rows of no build in the window are its daemon's alone: another process's there (a
+    // daemon before a reboot, whose clock began again) are of none of its work.
+    let process = build_process(source, build)?;
+    let window = window.map(|(t0, t1)| (t0, t1, process.map_or(String::new(), |it| format!(" AND process = {it}"))));
     // alloc: a query, once a report
     let sql = format!(
         "SELECT CAST(process AS BIGINT) AS process, CAST(thread AS BIGINT) AS thread, CAST(t_ns AS BIGINT) AS t_ns, \
@@ -123,7 +198,7 @@ pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError>
          CAST(core AS BIGINT) AS core, CAST(wait_kind AS VARCHAR) AS wait_kind, CAST(wait_value AS UBIGINT) AS wait_value, \
          CAST(by_job AS UBIGINT) AS by_job, CAST(since_ns AS BIGINT) AS since_ns, CAST(began_as AS UBIGINT) AS began_as, \
          CAST(queued_ns AS BIGINT) AS queued_ns FROM {}",
-        of_build("switches", build, SWITCHES_SINCE_2, window.map(|(t0, t1)| format!("t_ns BETWEEN {t0} AND {t1}")))
+        of_build("switches", build, SWITCHES_SINCE_2, window.as_ref().map(|(t0, t1, of)| format!("t_ns BETWEEN {t0} AND {t1}{of}")))
     );
     let switches = switches(&query(source, &sql, "reading the build's switches")?)?;
     // alloc: a query, once a report
@@ -132,9 +207,9 @@ pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError>
          CAST(parent AS UBIGINT) AS parent, CAST(depth AS BIGINT) AS depth, CAST(name AS VARCHAR) AS name, \
          CAST(crate AS VARCHAR) AS krate, CAST(function AS VARCHAR) AS function, CAST(unit AS VARCHAR) AS unit, \
          CAST(awaits AS VARCHAR) AS awaits, CAST(owner AS UBIGINT) AS owner, CAST(job AS UBIGINT) AS job, \
-         CAST(start_ns AS BIGINT) AS start_ns, CAST(dur_ns AS BIGINT) AS dur_ns, \
+         CAST(creator AS UBIGINT) AS creator, CAST(start_ns AS BIGINT) AS start_ns, CAST(dur_ns AS BIGINT) AS dur_ns, \
          CAST(self_cpu_ns AS BIGINT) AS self_cpu_ns FROM {}",
-        of_build("spans", build, SPANS_SINCE_2, window.map(|(t0, t1)| format!("start_ns >= {t0} AND start_ns < {t1}")))
+        of_build("spans", build, SPANS_SINCE_2, window.as_ref().map(|(t0, t1, of)| format!("start_ns >= {t0} AND start_ns < {t1}{of}")))
     );
     let spans = spans(&query(source, &sql, "reading the build's spans")?)?;
     // alloc: a query, once a report
@@ -143,17 +218,53 @@ pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError>
          CAST(job AS UBIGINT) AS job, CAST(level AS VARCHAR) AS level, CAST(target AS VARCHAR) AS target, \
          CAST(name AS VARCHAR) AS name, CAST(message AS VARCHAR) AS message, CAST(span_id AS UBIGINT) AS span_id \
          FROM events WHERE build_id = {build}{}",
-        window.map_or(String::new(), |(t0, t1)| format!(" OR (build_id IS NULL AND t_ns BETWEEN {t0} AND {t1})"))
+        window.as_ref().map_or(String::new(), |(t0, t1, of)| format!(" OR (build_id IS NULL AND t_ns BETWEEN {t0} AND {t1}{of})"))
     );
     let events = events(&query(source, &sql, "reading the build's events")?)?;
-    Ok(Input { build, build_row, switches, spans, events })
+    Ok((Input { build, build_row, switches, spans, events }, process))
 }
 
-/// The columns schema version 2 added, as typed nulls: a history of version 1 files has none of
-/// them, and a query naming a column no file has fails to bind.
+/// The process whose rows are of `build`, `None` when no row is. Rows of one build from more
+/// than one process are a [`TimeError::ManyProcesses`] naming each (rule 18): daemons that each
+/// numbered a build so in one history, whose workers and windows read as one build would be
+/// summed (selfbuild4, 2026-11-03: four daemons' build 1 read as one of 72 workers and 2296 s).
+fn build_process(source: &Source<'_>, build: u64) -> Result<Option<u32>, TimeError> {
+    // alloc: a query, once a report
+    let sql = format!(
+        "SELECT CAST(process AS BIGINT) AS process, CAST(count(*) AS UBIGINT) AS rows, CAST(min(from_ns) AS BIGINT) AS from_ns, \
+         CAST(max(to_ns) AS BIGINT) AS to_ns FROM (\
+         SELECT process, start_ns AS from_ns, start_ns + dur_ns AS to_ns FROM spans WHERE build_id = {build} \
+         UNION ALL SELECT process, t_ns, t_ns FROM switches WHERE build_id = {build}) GROUP BY 1 ORDER BY 1"
+    );
+    let batches = query(source, &sql, "reading which processes wrote the build's rows")?;
+    // alloc: the build's processes, once a report
+    let mut processes = Vec::new();
+    for batch in &batches {
+        const T: &str = "spans";
+        let (process, rows) = (ints(batch, T, "process")?, uints(batch, T, "rows")?);
+        let (from, to) = (ints(batch, T, "from_ns")?, ints(batch, T, "to_ns")?);
+        for row in 0..batch.num_rows() {
+            processes.push(super::OfProcess {
+                process: process.value(row) as u32,
+                rows: rows.value(row),
+                from_ns: from.value(row),
+                to_ns: to.value(row),
+            });
+        }
+    }
+    match &processes[..] {
+        [] => Ok(None),
+        [one] => Ok(Some(one.process)),
+        _ => Err(TimeError::ManyProcesses { build, processes }),
+    }
+}
+
+/// The columns schema version 2 added, and typed span columns added since (appended, so they
+/// kept the version), as typed nulls: a history of older files has none of them, and a query
+/// naming a column no file has fails to bind.
 const SWITCHES_SINCE_2: &str =
     "NULL::UBIGINT AS by_job, NULL::BIGINT AS since_ns, NULL::UBIGINT AS began_as, NULL::BIGINT AS queued_ns";
-const SPANS_SINCE_2: &str = "NULL::UBIGINT AS job";
+const SPANS_SINCE_2: &str = "NULL::UBIGINT AS job, NULL::UBIGINT AS creator";
 
 /// `table`'s rows of `build`, and its rows of no build that `window` holds (a condition on the
 /// row's time), with the `added` columns null where its files have none.
@@ -205,16 +316,6 @@ fn u32_at(array: &PrimitiveArray<Int64Type>, row: usize, table: &'static str, co
         .ok_or(TimeError::BadColumn { table, column, why: "is null or past u32" })
 }
 
-fn first_u64(batches: &[RecordBatch], table: &'static str, column: &'static str) -> Result<Option<u64>, TimeError> {
-    for batch in batches {
-        let it = uints(batch, table, column)?;
-        if batch.num_rows() > 0 {
-            return Ok(get(it, 0, |it, row| it.value(row)));
-        }
-    }
-    Ok(None)
-}
-
 fn switches(batches: &[RecordBatch]) -> Result<Vec<SwitchIn>, TimeError> {
     const T: &str = "switches";
     // alloc: the build's switches, once a report
@@ -255,6 +356,7 @@ fn spans(batches: &[RecordBatch]) -> Result<Vec<SpanIn>, TimeError> {
         let (process, thread, span_id, parent) = (ints(batch, T, "process")?, ints(batch, T, "thread")?, uints(batch, T, "span_id")?, uints(batch, T, "parent")?);
         let (depth, name, krate, function) = (ints(batch, T, "depth")?, texts(batch, T, "name")?, texts(batch, T, "krate")?, texts(batch, T, "function")?);
         let (unit, awaits, owner, of_job) = (texts(batch, T, "unit")?, texts(batch, T, "awaits")?, uints(batch, T, "owner")?, uints(batch, T, "job")?);
+        let creator = uints(batch, T, "creator")?;
         let (start_ns, dur_ns, self_cpu) = (ints(batch, T, "start_ns")?, ints(batch, T, "dur_ns")?, ints(batch, T, "self_cpu_ns")?);
         let null = |column: &'static str| TimeError::BadColumn { table: T, column, why: "is null" };
         for row in 0..batch.num_rows() {
@@ -271,6 +373,7 @@ fn spans(batches: &[RecordBatch]) -> Result<Vec<SpanIn>, TimeError> {
                 awaits: text(awaits, row),
                 owner: get(owner, row, |it, row| it.value(row)),
                 job: get(of_job, row, |it, row| it.value(row)),
+                creator: get(creator, row, |it, row| it.value(row)),
                 start_ns: get(start_ns, row, |it, row| it.value(row)).ok_or(null("start_ns"))?,
                 dur_ns: get(dur_ns, row, |it, row| it.value(row)).ok_or(null("dur_ns"))?,
                 self_cpu_ns: get(self_cpu, row, |it, row| it.value(row)),

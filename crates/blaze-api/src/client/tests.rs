@@ -9,7 +9,7 @@ use super::*;
 use crate::{Status, http::RequestParser};
 
 fn status() -> Status {
-    Status { pid: 4, requests: vec![7], views: 1, history: None, memory_bytes: 2, budget_bytes: 3, build: crate::Build::default() }
+    Status { pid: 4, requests: vec![7], views: 1, history: None, memory_bytes: 2, budget_bytes: 3, build: crate::Build::default(), bugs: Vec::new() }
 }
 
 /// A client over one end of a socket pair, and a thread on the other that reads one request
@@ -89,7 +89,7 @@ fn a_call_in_place_refuses_another_schema_by_name() {
 #[test]
 fn over_http_a_call_in_place_reads_the_chunked_frames() {
     let (at, daemon) = http_daemon(2, None);
-    let mut client = Client::http(at, "tok".to_owned()).unwrap();
+    let mut client = Client::http(at, "tok").unwrap();
     let mut seen = Vec::new();
     assert!(client.call_ref(Request::Status, |it, _| seen.push(it.into_owned())).unwrap());
     assert_eq!(seen, [Response::Status(status()), Response::Done { ok: true }]);
@@ -169,7 +169,7 @@ fn http_daemon(
 #[test]
 fn over_http_a_call_reads_the_chunked_frames() {
     let (at, daemon) = http_daemon(1, None);
-    let mut client = Client::http(at, "tok".to_owned()).unwrap();
+    let mut client = Client::http(at, "tok").unwrap();
     let mut seen = Vec::new();
     assert!(client.call(Request::Status, |it| seen.push(it.clone())).unwrap());
     assert_eq!(seen, [Response::Status(status()), Response::Done { ok: true }]);
@@ -179,7 +179,7 @@ fn over_http_a_call_reads_the_chunked_frames() {
 #[test]
 fn over_http_a_second_send_keeps_the_first_ones_rest_on_one_connection() {
     let (at, daemon) = http_daemon(3, None);
-    let mut client = Client::http(at, "tok".to_owned()).unwrap();
+    let mut client = Client::http(at, "tok").unwrap();
     assert!(client.call(Request::Status, |_| {}).unwrap());
     assert_eq!(client.send(Request::Status).unwrap(), 2);
     assert_eq!(client.send(Request::Cancel { id: 2 }).unwrap(), 3);
@@ -198,7 +198,7 @@ fn over_http_a_second_send_keeps_the_first_ones_rest_on_one_connection() {
 fn over_http_an_error_status_is_refused_with_its_body() {
     let refusal = http::response(401, &[("WWW-Authenticate", "Bearer")], b"a wrong token");
     let (at, daemon) = http_daemon(1, Some(refusal));
-    let mut client = Client::http(at, "tok".to_owned()).unwrap();
+    let mut client = Client::http(at, "tok").unwrap();
     let error = client.call(Request::Status, |_| {}).unwrap_err();
     let ClientError::Refused(error) = error else { panic!("{error:?}") };
     assert_eq!(error.what, "HTTP 401: a wrong token");
@@ -218,7 +218,7 @@ fn errors_say_what_and_where() {
 #[test]
 fn the_token_is_not_in_debug() {
     let (at, _daemon) = http_daemon(0, None);
-    let client = Client::http(at, "hidden-token".to_owned()).unwrap();
+    let client = Client::http(at, "hidden-token").unwrap();
     assert!(!format!("{client:?}").contains("hidden-token"));
 }
 
@@ -273,6 +273,6 @@ fn until_hung_up_gives_up_after_its_patience() {
     let error = client.until_hung_up(std::time::Duration::from_millis(20)).unwrap_err();
     assert!(error.to_string().contains("still holds the connection after 20 ms, saying nothing"), "{error}");
     let (at, _daemon) = http_daemon(0, None);
-    let mut client = Client::http(at, "tok".to_owned()).unwrap();
+    let mut client = Client::http(at, "tok").unwrap();
     assert!(matches!(client.until_hung_up(std::time::Duration::from_millis(20)), Err(ClientError::Refused(_))));
 }

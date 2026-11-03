@@ -385,6 +385,7 @@ fn bin_hex_repr(b: &BodyCx<'_, '_, '_>, lit: &Lit<'_>) -> Option<String> {
     None
 }
 
+#[derive(Clone, Copy)]
 enum IntType {
     Signed(IntTy),
     Unsigned(UintTy),
@@ -396,7 +397,7 @@ fn report_bin_hex_error(
     lit: &Lit<'_>,
     ty: IntType,
     bits: u32,
-    repr: String,
+    repr: &str,
     value: u128,
     negative: bool,
     out: &mut Vec<Found>,
@@ -455,7 +456,7 @@ fn report_bin_hex_error(
     {
         let lit_no_suffix = match suffix_at {
             Some(at) => &repr[..at],
-            None => &repr[..],
+            None => repr,
         };
         let uint_ty = uint_name(fit_unsigned(value));
         let int_ty = int_ty.name_str();
@@ -567,7 +568,7 @@ fn lint_int_literal(
     }
     if let Some(repr) = bin_hex_repr(b, lit) {
         let Some(bits) = int_type.bit_width() else { return };
-        report_bin_hex_error(b, lit, IntType::Signed(t), bits as u32, repr, value, negative, out);
+        report_bin_hex_error(b, lit, IntType::Signed(t), bits as u32, &repr, value, negative, out);
         return;
     }
     let ast::LiteralKind::IntNumber(number) = &lit.kind else { return };
@@ -642,7 +643,7 @@ fn lint_uint_literal(b: &BodyCx<'_, '_, '_>, lit: &Lit<'_>, t: UintTy, out: &mut
     }
     if let Some(repr) = bin_hex_repr(b, lit) {
         let Some(bits) = uint_type.bit_width() else { return };
-        report_bin_hex_error(b, lit, IntType::Unsigned(t), bits as u32, repr, value, false, out);
+        report_bin_hex_error(b, lit, IntType::Unsigned(t), bits as u32, &repr, value, false, out);
         return;
     }
     let ty = t.name_str();

@@ -294,6 +294,7 @@ impl std::fmt::Display for EncodeError {
     }
 }
 
+#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of every read, which hands it the error by value")]
 fn format_error(error: FormatError) -> String {
     // alloc: the reason an answer does not read
     error.to_string()

@@ -152,13 +152,13 @@ fn encode_symbol(w: &mut Writer, symbol: &Symbol, tag: u32, symbols_map: &HashMa
 
 fn encode(
     w: &mut Writer,
-    tt: TokenTree,
+    tt: &TokenTree,
     span_parts_map: &HashMap<CompressedSpanPart, usize, Global>,
     byte_size_after: &mut [u32],
     symbols_map: &HashMap<Symbol, usize, Global>,
 ) {
     let before = w.len();
-    match tt {
+    match *tt {
         TokenTree::Leaf(Leaf::Punct(Punct { char, spacing, span })) => {
             if char.is_ascii() {
                 let spacing = spacing as u8;
@@ -423,7 +423,7 @@ fn encode_all(
     let mut byte_size_after = vec![0u32; tts_len + 1];
     let mut w = Writer { reversed: Vec::new() };
     for (index, tt) in token_trees.rev() {
-        encode(&mut w, tt, &span_parts_map, &mut byte_size_after[index..], &symbols_map);
+        encode(&mut w, &tt, &span_parts_map, &mut byte_size_after[index..], &symbols_map);
     }
     encode_top_subtree(&mut w, top_subtree, (span_parts.len() - 2) as u32, &byte_size_after);
     VarintTree { buffer: w.finish(), span_parts, len: tts_len, symbols }

@@ -190,6 +190,61 @@ no crate but a sealed trait's own may implement it, so coherence may not assume 
 crate could. A provided method keeps every other interner unchanged; a program with no `#[blaze::sealed]`
 solves exactly as before.
 
+### 0014-universe-index-default-late-param-visitable
+
+What: `UniverseIndex` gets `Default` (`ROOT`) from a hand-written impl in place of the
+`#[default]` of its `newtype_index!`, and `LateParamRegion` derives `GenericTypeVisitable`.
+
+Why: made in `src/` at the 2026-10-30 checkpoint (5719e9d7fb, "workspace type-checks") so that
+the workspace type-checks, without a patch; recorded as one on 2026-11-03 (lane solverkey) so the
+series replays to `src/`.
+
+### 0015-shard-count-per-table
+
+What: `shard_count` in `search_graph/global_cache.rs` (patch 0010) is worked out each time a
+table is first written, not kept in a `OnceLock`.
+
+Why: made in `src/` at the round 34 checkpoint (8498b0dfc1, 2026-11-02) without a patch;
+recorded as one on 2026-11-03 (lane solverkey) so the series replays to `src/`.
+
+### 0016-reflected-binders
+
+What: compile-time reflection's field binders (`#![feature(blaze_comptime)]`,
+docs/v2/plan/design/comptime.md, phase 2): `src/reflect.rs` (`ReflectedVar`,
+`ReflectedDomain`, `ReflectContainer` and the helpers that instantiate a reflected variable and
+fold, visit and flag its container); `BoundVariableKind::Reflected`, whose container folds,
+visits and flags with its binder (binder.rs, flags.rs); the `Interner` methods
+`reflect_members`, `reflect_container_of`, `reflect_is_struct`, `reflect_variant_view`,
+`reflect_is_enum` and `param_env_with_clauses`; and the lang items `ReflectEnum`,
+`ReflectField`, `ReflectFnItem`, `ReflectStruct`, `ReflectVariant` and `ReflectVariantView`.
+`rustc_next_trait_solver`'s patch `0014-reflect-builtins` solves with them.
+
+Why: `for<F: Field<T>>` bounds range over the members of `T` only, which no upstream binder
+expresses. Made in `src/` by lane comptime-solver (2026-11-02) without a patch; recorded as one
+on 2026-11-03 (lane solverkey) so the series replays to `src/`.
+
+### 0017-solver-cache-costs-nothing-unwritten
+
+What, in `search_graph/global_cache.rs` and `search_graph/mod.rs`, with the `Interner` methods
+to match:
+- A lookup makes nothing: `Interned::find` on a table or shard never written finds nothing
+  without making its shards or probe table.
+- `GlobalCache::new(Sharing)`: `Sharing::Many` (four shards and writer locks per core, the
+  cache every query of a crate shares, and `Default`) or `Sharing::One` (one, the cache of one
+  query's interner). `GlobalCache::held` says the bytes of blocks a cache holds.
+- Its blocks are counted to `blaze_mem::Tag::Solver`, and a table blaze-mem can't give
+  panics naming the table and its size.
+- `Cx::with_global_cache_to_read` (and `Interner`'s), by default `with_global_cache`, which both
+  lookups use: an interner may answer `None` where the scope has no cache, so a lookup makes
+  none.
+
+Why: coord-98 (2026-11-03): in one 21-crate `blaze test`, every interner's first lookup made its
+query cache (hir-ty `tls_cache::of_query`) with a table of 128 shards (144 KiB), each made cache
+gave an older one away, and those waiting in the table's limbo for the longest job to end filled
+blaze-mem's 160 KiB class, 16 GiB, so the solver panicked in three units. Tests:
+`a_lookup_in_a_table_never_written_holds_no_memory`,
+`a_table_of_one_writer_holds_one_shard_whatever_the_cores`.
+
 ## Dropped since the previous base (ra-ap-rustc_type_ir 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#159228 (the retry with twice the recursion limit:

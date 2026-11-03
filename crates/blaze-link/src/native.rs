@@ -29,13 +29,12 @@
 
 use std::collections::BTreeMap;
 use blaze_hash::hash_map::Entry;
-use std::hash::Hasher;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use blaze_graph::par;
-use blaze_hash::{FixedHasher, HashMap, HashSet};
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{
     bits::locate,
     radix::{self, Csr},
@@ -68,10 +67,10 @@ fn unpack(it: u64) -> (u32, u32) {
     ((it >> 32) as u32, it as u32)
 }
 
+/// A name's hash in these tables: keyed, as an object's names are the program's (or a C
+/// dependency's) to pick ([`crate::symbols::keyed_name_hash`]).
 fn hash(name: &str) -> u64 {
-    let mut hasher = FixedHasher::default();
-    hasher.write(name.as_bytes());
-    hasher.finish()
+    crate::symbols::keyed_name_hash(name)
 }
 
 /// Sections kept whatever refers to them, by name, as lld keeps them.
@@ -835,6 +834,106 @@ fn object_keys<'f>(obj: Obj, object: &'f Object, records: &[(u32, Vec<unwind::Na
     out.extend((0..object.sections.len() as u32).map(|it| Wide::Key(SymKey::Section(obj, it))));
     for (section, records) in records {
         out.extend(records.iter().map(|it| Wide::Key(SymKey::Frame(obj, *section, it.range.start as u32))));
+    }
+}
+
+/// A native object's symbol, section or call frame record as an error names it: the input by
+/// its path (`lib.a(member.o)` for an archive's member), a symbol by its name and where it
+/// is, a record of `.eh_frame`/`__eh_frame` by its offset and the function its FDE covers.
+/// Any other symbol as [`Symbols::describe`] says it. The input is the first of `states`'
+/// with it; an archive's member is read again, so this is for errors only
+/// ([`crate::stage::named_in`]).
+pub(crate) fn describe(symbols: &Symbols, states: &[&State], writer: &Formats, sym: Sym) -> String {
+    let key = symbols.key(sym);
+    let obj = match key {
+        SymKey::Local(obj, _) | SymKey::Section(obj, _) | SymKey::Frame(obj, ..) => obj,
+        _ => return symbols.describe(sym),
+    };
+    let found = states.iter().flat_map(|it| it.inputs.iter()).find(|it| symbols.find_id(&it.id) == Some(obj.native));
+    let Some(input) = found else {
+        // alloc: error path
+        return format!("{} (of a native input no longer on the link line)", symbols.describe(sym));
+    };
+    let read;
+    let (path, object) = match (&*input.file, obj.member) {
+        // alloc: error path
+        (NativeFile::Object(object), 0) => (input.name.to_string(), object),
+        (NativeFile::Archive(archive), member) if member as usize <= archive.members.len() && member > 0 => {
+            let entry = &archive.members[member as usize - 1];
+            // alloc: error path
+            let path = format!("{}({})", input.name, archive.name(entry.name));
+            read = input
+                .bytes
+                .get(entry.bytes.clone())
+                // alloc: error path
+                .ok_or_else(|| "the member is past the archive's end".to_owned())
+                .and_then(|bytes| writer.read(&input.name, bytes, &NativeKind::Object));
+            match &read {
+                Ok(NativeFile::Object(object)) => (path, object),
+                // alloc: error path
+                Ok(_) => return format!("{} of {path}, which is not an object", symbols.describe(sym)),
+                // alloc: error path
+                Err(why) => return format!("{} of {path}, which doesn't read: {why}", symbols.describe(sym)),
+            }
+        }
+        // alloc: error path
+        _ => return format!("{} of {}, which has no member {}", symbols.describe(sym), input.name, obj.member),
+    };
+    match key {
+        // alloc: error path
+        SymKey::Local(_, at) => format!("{} of {path}", symbol_in(object, at)),
+        // alloc: error path
+        SymKey::Section(_, at) => format!("{} of {path}", section_in(object, at)),
+        SymKey::Frame(_, section, start) => {
+            let fde = (object.sections.get(section as usize))
+                .and_then(|it| object.section_fixups(it).iter().find(|it| it.at == u64::from(start) + 8));
+            // alloc: error path
+            let record = format!("the call frame record at {start:#x} of {} of {path}", section_in(object, section));
+            match fde {
+                // alloc: error path
+                Some(it) => format!("{record} (the FDE of {})", symbol_in(object, it.symbol)),
+                None => record,
+            }
+        }
+        _ => unreachable!("only a native object's keys get here"),
+    }
+}
+
+/// Symbol `at` of `object` for an error: its name (a section's symbol by the named symbol at
+/// the same place, when there is one) and where it is defined.
+fn symbol_in(object: &Object, at: u32) -> String {
+    let Some(symbol) = object.symbols.get(at as usize) else {
+        // alloc: error path
+        return format!("symbol {at}, which the object doesn't have");
+    };
+    let SymbolDef::Section { section, value, .. } = symbol.def else {
+        // alloc: error path
+        return format!("`{}` (symbol {at}, not defined in a section)", object.name(symbol.name));
+    };
+    let named = if symbol.kind == SymbolKind::Section {
+        (object.symbols.iter())
+            .filter(|it| it.kind != SymbolKind::Section && !object.name(it.name).is_empty())
+            .find(|it| matches!(it.def, SymbolDef::Section { section: s, value: v, .. } if s == section && v == value))
+            .map(|it| object.name(it.name))
+    } else {
+        Some(object.name(symbol.name))
+    };
+    let place = section_in(object, section);
+    match named {
+        // alloc: error path
+        Some(name) => format!("`{name}` (symbol {at}, at {value:#x} of {place})"),
+        // alloc: error path
+        None => format!("{value:#x} of {place}"),
+    }
+}
+
+/// Section `at` of `object` for an error: its index and name.
+fn section_in(object: &Object, at: u32) -> String {
+    match object.sections.get(at as usize) {
+        // alloc: error path
+        Some(section) => format!("section {at} (`{}`)", object.name(section.name)),
+        // alloc: error path
+        None => format!("section {at}, which the object doesn't have"),
     }
 }
 
@@ -2139,7 +2238,7 @@ impl<'a> Stage<'a> {
 
     /// Adds an object to the graph: its groups, directives, imports and globals, in lld's
     /// order of precedence (the graph's loads are in link-line order, then pull rounds).
-    fn register(&mut self, b: &mut Build, parsed: Arc<Parsed>, input: u32, pulled: bool) -> Result<(), LinkError> {
+    fn register(&mut self, b: &mut Build, parsed: &Arc<Parsed>, input: u32, pulled: bool) -> Result<(), LinkError> {
         let object = parsed.object();
         let load = b.graph.loads.len() as u32;
         // alloc: the load's slot of each symbol, once per object per graph built
@@ -2999,7 +3098,7 @@ impl<'a> Stage<'a> {
             b.reserve(reads.iter().map(|it| if let Read::Object(parsed) = it { parsed.globals } else { 0 }).sum());
             for (&(input, _), read) in round.iter().zip(reads) {
                 match read {
-                    Read::Object(parsed) => self.register(&mut b, parsed, input, pulled)?,
+                    Read::Object(parsed) => self.register(&mut b, &parsed, input, pulled)?,
                     Read::Shared(file) => b.members.push((file, inputs[input as usize].order)),
                     Read::Index(_) => {}
                 }

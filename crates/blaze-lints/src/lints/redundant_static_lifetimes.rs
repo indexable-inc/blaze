@@ -9,6 +9,7 @@ use syntax::{
     view::{self as ast, AstNode as _},
 };
 
+use super::utils::{Owner, owner};
 use crate::{check::Cx, conf::Version, diag::Applicability};
 
 const LINT: super::Implemented = super::Implemented::RedundantStaticLifetimes;
@@ -17,10 +18,12 @@ const LINT: super::Implemented = super::Implemented::RedundantStaticLifetimes;
 const STATIC_IN_CONST: Version = Version(1, 17, 0);
 
 pub(super) fn check_const<'t>(cx: &mut Cx<'_, 't>, item: ast::Const<'t>) {
-    // An associated constant cannot leave `'static` out.
-    let associated =
-        item.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST);
-    if associated || !cx.on(LINT) || !cx.conf().meets(STATIC_IN_CONST) {
+    if !cx.on(LINT) || !cx.conf().meets(STATIC_IN_CONST) {
+        return;
+    }
+    // An associated constant cannot leave `'static` out. Where it is is read from its
+    // definition: a constant's body is linted in a tree with the constant at its root.
+    if owner(cx, item.syntax()) != Some(Owner::Item) {
         return;
     }
     if let Some(ty) = item.ty() {

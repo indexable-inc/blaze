@@ -96,6 +96,7 @@ thread_local! {
 }
 
 /// What one offer buffers.
+#[derive(Clone, Copy)]
 pub(super) struct Offered<'a> {
     pub(super) step: Step,
     pub(super) def: DefWithBodyId,
@@ -126,8 +127,18 @@ impl Pending {
         }
         let len = |it: usize| u32::try_from(it).expect("an entry is shorter than a shard");
         let Shard { bytes, defs, .. } = &mut *shard;
-        // alloc: the shard's buffer, at most `SHARD_BYTES`, kept from flush to flush
-        bytes.reserve(entry_len);
+        // The buffers grow in a task of the store's tag, so the global heap charges them to
+        // `store` and not to the task whose offer found them full: they are the store's, kept
+        // from flush to flush whatever task filled them, and no release of that task's values
+        // frees them (memcap6, B5: they counted as `infer` and `mir` heap).
+        if bytes.capacity() - bytes.len() < entry_len || defs.len() == defs.capacity() {
+            blaze_mem::frame::task(blaze_mem::Tag::Store, |_| {
+                // alloc: the shard's buffer, at most `SHARD_BYTES`, kept from flush to flush
+                bytes.reserve(entry_len);
+                // alloc: one body per entry, kept from flush to flush
+                defs.reserve(1);
+            });
+        }
         bytes.extend_from_slice(&len(entry_len).to_le_bytes());
         bytes.extend_from_slice(&[step as u8, 0, 0, 0]);
         bytes.extend_from_slice(&len(shape.len()).to_le_bytes());
@@ -138,7 +149,7 @@ impl Pending {
             bytes.extend_from_slice(&value.0);
         }
         bytes.extend_from_slice(answer);
-        // alloc: one body per entry, kept from flush to flush
+        // alloc: none: reserved above
         defs.push(def);
     }
 

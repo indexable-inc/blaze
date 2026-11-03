@@ -19,7 +19,7 @@
 //! (MIT or Apache-2.0).
 
 mod directive;
-mod format;
+pub(crate) mod format;
 mod meta;
 
 use hir::{HirFileId, InFile, PathResolution};
@@ -41,7 +41,7 @@ use crate::{
 
 /// Which attribute a directive is of: rustc's `Mode`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     RustcOnUnimplemented,
     DiagnosticOnUnimplemented,
     DiagnosticOnConst,
@@ -89,10 +89,10 @@ impl Mode {
             Mode::DiagnosticOnConst => {
                 "only `Self` and generics of the implementation are allowed as a format argument"
             }
-            Mode::DiagnosticOnMove => "only `This`, `Self` and generics of the type are allowed as a format argument",
-            Mode::DiagnosticOnUnknown => "only `This` is allowed as a format argument, referring to the failed import",
+            Mode::DiagnosticOnMove => "only `this`, `Self` and generics of the type are allowed as a format argument",
+            Mode::DiagnosticOnUnknown => "only `this` is allowed as a format argument, referring to the failed import",
             Mode::DiagnosticOnUnmatchedArgs => {
-                "only `This` is allowed as a format argument, referring to the macro's name"
+                "only `this` is allowed as a format argument, referring to the macro's name"
             }
             Mode::DiagnosticOnTypeError => "only `note` is allowed as option for `diagnostic::on_type_error`",
         }
@@ -203,7 +203,7 @@ pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, _walk: &Walk<'db>, owners: &[Owner<'d
         }
         if any {
             let mut sink = Sink { cx, owner, file: owner.node.file_id, out: &mut out };
-            check(&mut sink, state);
+            check(&mut sink, &state);
         }
     }
     out
@@ -344,7 +344,7 @@ fn parse(sink: &mut Sink<'_, '_, '_>, state: &mut State, kind: Kind, attr: &Attr
 }
 
 /// `check_mod_attrs`' checks of what the parsers kept.
-fn check(sink: &mut Sink<'_, '_, '_>, state: State) {
+fn check(sink: &mut Sink<'_, '_, '_>, state: &State) {
     let owner = sink.owner;
     let node = owner.node.value;
     if let Some(directive) = &state.on_unimplemented
@@ -417,8 +417,8 @@ fn check(sink: &mut Sink<'_, '_, '_>, state: State) {
             sink,
             directive,
             &params,
-            &["Expected", "Found"],
-            "expect either a generic argument name, `{This}`, `{Expected}` or `{Found}` as format argument",
+            &["expected", "found"],
+            "expect either a generic argument name, `{this}`, `{expected}` or `{found}` as format argument",
         );
     }
 }

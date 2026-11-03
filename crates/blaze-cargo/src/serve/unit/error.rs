@@ -31,8 +31,9 @@ pub(crate) enum UnitError {
     NoExecutable { target: String },
     /// The test unit of `target` compiled no executable: its tests can't run.
     NoTestExecutable { target: String },
-    /// A test run's directory under the daemon's state, `tests/<tags>`, is no name a file can have.
-    TestDir { tags: u64 },
+    /// A test run's directory under the daemon's state, `tests/<tags>`, is no name the driver
+    /// can give a file, and why.
+    TestDir { dir: String, why: String },
     /// The test binary `binary`'s selector was given back before its tests were chosen.
     NoSelector { binary: String },
     /// `cargo run`'s program ended as `how`, neither an exit nor a failure to start.
@@ -72,8 +73,8 @@ impl fmt::Display for UnitError {
             UnitError::NoTestExecutable { target } => {
                 write!(f, "the test unit of `{target}` compiled no executable: its tests can't run")
             }
-            UnitError::TestDir { tags } => {
-                write!(f, "the test run's directory `tests/{tags:016x}` is no name blaze can give a file")
+            UnitError::TestDir { dir, why } => {
+                write!(f, "the test run's directory {dir} is no name blaze's driver can give a file: {why}")
             }
             UnitError::NoSelector { binary } => {
                 write!(f, "the test binary `{binary}` gave its selector back before its tests were chosen")

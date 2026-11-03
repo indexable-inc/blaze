@@ -381,7 +381,7 @@ fn check_other_call_arg<'t>(
     // `can_change_type`: the input is the type parameter itself.
     let Some(type_param) = param.ty().as_type_param(db) else { return false };
     let sized = [cx.lang_trait(hir::LangItem::Sized), cx.lang_trait(hir::LangItem::MetaSized)];
-    let bounds = type_param.trait_refs(db);
+    let bounds = type_param.trait_bound_refs(db);
     let mut traits = bounds.iter().map(|it| it.trait_()).filter(|it| !sized.contains(&Some(*it)));
     let (Some(trait_), None) = (traits.next(), traits.next()) else { return false };
     let deref = cx.std_trait(DEREF);
@@ -411,19 +411,13 @@ fn check_other_call_arg<'t>(
     if elsewhere {
         return false;
     }
-    // Every bound of the parameter holds of the receiver's type as well.
-    let mut args = Vec::new();
+    // Every bound of the parameter holds of the receiver's type as well, each proven whole,
+    // its `for<'a>` binder kept.
     for bound in &bounds {
         if sized.contains(&Some(bound.trait_())) {
             continue;
         }
-        args.clear();
-        for at in 1.. {
-            let Some(arg) = bound.get_type_argument(at) else { break };
-            let Some(arg) = arg.without_params(db) else { return false };
-            args.push(arg);
-        }
-        if !receiver_ty.impls_trait(db, bound.trait_(), &args) {
+        if !bound.holds_for(db, &receiver_ty) {
             return false;
         }
     }

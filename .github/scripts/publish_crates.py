@@ -17,6 +17,13 @@ name does not start with `blaze` (hir-ty-codegen) is published as `blaze-<name>`
 Dev-dependencies, tests and benches are left out. One file outside a crate is copied into it:
 blaze's pinned toolchain (harness/toolchain).
 
+blaze-engine's build script works out the code identities of the code generator and the front
+end, the trait solver among it (`blaze_codegen_code::CODEGEN` and `FRONT_END`), from the
+checkout, which a published crate has none of. So their tree parts are worked out here, from the checkout, and shipped in the
+staged crate (`shipped-codegen-code.txt`, `shipped-front-end-code.txt`, by blaze-codegen-code's
+`ship-code-identity`); the build script finishes them with what it is built with, the same
+identity a build of the checkout in that environment has.
+
 Idempotent: a version already on crates.io is skipped, so a run that stopped can be run again.
 Publishing goes in dependency order and waits out crates.io's rate limit on new crates (a burst,
 then one per ten minutes): on a 429 it sleeps until the time the response names, then retries.
@@ -624,11 +631,41 @@ def stage(dest: Path) -> list[Crate]:
         (out / "Cargo.toml").write_text(toml_dump(m))
     (dest / "Cargo.toml").write_text(toml_dump(staged_workspace(crates, by_dir)))
     shutil.copy2(ROOT / "Cargo.lock", dest / "Cargo.lock")
+    ship_code_identities(dest / ROOT_NAME)
     log(
         f"staged {len(crates)} crates in {dest}: "
         + " ".join(f"{c.name}@{c.version}" for c in crates)
     )
     return crates
+
+
+def ship_code_identities(staged: Path) -> None:
+    """Write the tree parts of blaze-engine's code identities, worked out from the checkout, into
+    its staged crate, where its build script finds them (`blaze_codegen_code::work_out_here`)."""
+    ask = json.dumps({"program": str(ROOT_CRATE), "into": str(staged)})
+    cmd = [
+        "cargo",
+        "run",
+        "--quiet",
+        "--locked",
+        "--package",
+        "blaze-codegen-code",
+        "--features",
+        "ship",
+        "--bin",
+        "ship-code-identity",
+        "--",
+        ask,
+    ]
+    r = run(cmd, ROOT, 1800)
+    if r.returncode != 0:
+        fail(
+            f"shipping blaze-engine's code identities: `{' '.join(cmd)}` in {ROOT} exited "
+            f"{r.returncode}; tail:\n{r.stderr[-3000:]}"
+        )
+    for name in ("shipped-codegen-code.txt", "shipped-front-end-code.txt"):
+        if not (staged / name).is_file():
+            fail(f"ship-code-identity exited 0 and wrote no {staged / name}")
 
 
 # ---------------------------------------------------------------------------------------------

@@ -26,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use blaze_core::utf8::push_lossy;
+use blaze_core::{exit::Exit, utf8::push_lossy};
 use blaze_hash::{FixedState, HashMap, HashSet};
 use std::alloc::Global;
 use blaze_usercode::trace::{self, Seen};
@@ -74,10 +74,6 @@ pub const MARK: &str = "/.blaze-test/";
 pub const ENV_MARK: &str = "/.blaze-env/";
 pub const CLOCK_MARK: &str = "/.blaze-clock";
 pub const LOADED_MARK: &str = "/.blaze-loaded";
-
-/// The status a sandbox that could not be made ends with, as `env` ends when it can't run
-/// what it is given.
-pub const COULD_NOT: i32 = 125;
 
 /// The variable that turns sandboxes off (`off` or `0`), for tests, build scripts and
 /// proc-macro servers alike.
@@ -846,14 +842,14 @@ pub fn command(mut args: impl Iterator<Item = OsString>) -> ! {
             Some(it) if it == "--v2" => Probe::V2,
             Some(it) => {
                 eprintln!("blaze sandbox: --probe takes --overlays or --v2, not {}", it.display());
-                std::process::exit(COULD_NOT);
+                std::process::exit(Exit::CouldNot.code());
             }
         };
         std::process::exit(match probe(kind) {
             Ok(()) => 0,
             Err(why) => {
                 eprintln!("{why}");
-                1
+                Exit::CouldNot.code()
             }
         });
     }
@@ -867,18 +863,18 @@ pub fn command(mut args: impl Iterator<Item = OsString>) -> ! {
         (Ok(spec), false) => spec,
         (Err(what), _) => {
             eprintln!("blaze sandbox: needs {what}: blaze sandbox SPEC -- PROGRAM ARGS...");
-            std::process::exit(COULD_NOT);
+            std::process::exit(Exit::CouldNot.code());
         }
         (_, true) => {
             eprintln!("blaze sandbox: needs a program: blaze sandbox SPEC -- PROGRAM ARGS...");
-            std::process::exit(COULD_NOT);
+            std::process::exit(Exit::CouldNot.code());
         }
     };
     std::process::exit(match backend(&spec, Some(&program), Also::default()) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("blaze: the sandbox could not be made: {error}");
-            COULD_NOT
+            Exit::CouldNot.code()
         }
     })
 }

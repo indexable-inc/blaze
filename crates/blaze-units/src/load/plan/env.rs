@@ -126,6 +126,7 @@ pub(super) fn compile_env(it: CompileEnv<'_>, config_env: &[(String, String)]) -
 }
 
 /// What a build script's run's variables are made of beyond its package's.
+#[derive(Clone, Copy)]
 pub(super) struct RunEnv<'a> {
     pub package: &'a [(String, String)],
     pub out_dir: &'a str,

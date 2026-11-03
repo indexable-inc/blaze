@@ -3,7 +3,8 @@
 //!
 //! What a query reads (`file_text`, `has_file_text`, `source_root`, `file_source_root`) is a
 //! [`Column`] indexed by the file's or root's dense ID: two acquire loads, no lock, nothing
-//! written. What a query notes (`included_file`, `include_source`, `env_is_read`,
+//! written; for a file `include!` read from outside the VFS, its entry in [`Files::included`]
+//! ([`IncludedSource`]). What a query notes (`included_file`, `include_source`, `env_is_read`,
 //! `env_is_unset`) is a [`Table`] keyed by a hash computed once: a lookup of what was noted
 //! already takes no lock and builds no `String` or path. Everything else is the setters'
 //! own state ([`Writer`]), behind one lock that no query takes.
@@ -35,7 +36,7 @@ use crate::{
     SourceRootId, SourceRootInput, content,
     named::Named,
     reparse::Reparse,
-    table::{Column, Log, Table, hash_of},
+    table::{Column, Log, Table},
     view::ViewIndex,
 };
 
@@ -92,12 +93,16 @@ pub struct Files {
     /// no query takes this lock, so no query waits on it. A setter holds it across the input
     /// writes it makes; those call no query.
     writer: Mutex<Writer>,
-    /// The files outside the VFS that `include_bytes!` or `include_str!` named.
+    /// The files outside the VFS that a macro read: `include_bytes!` and `include_str!` their
+    /// bytes, `include!` its source as well ([`Included::source`]). The one home of what a
+    /// macro read from the disk: every reader that keys, files or re-reads such a file reads it
+    /// here ([`Files::included_by`], [`Db::reload_included_files`](crate::Db::reload_included_files)).
     included: Table<Included>,
     /// Which crate read which of `included` (by its index there).
     included_by: Table<(Crate, u32)>,
-    /// Files an `include!` or a module declaration named that are not in the VFS, with the
-    /// source root of the file that names them.
+    /// Files a module declaration named that are not in the VFS, with the source root of the
+    /// file that names them, and files a served def map names that its owner's source root
+    /// lacks. An `include!` reads its file through `included` instead.
     included_sources: Table<(AbsPathBuf, SourceRootId)>,
     /// Which crate named which of `included_sources` (by its index there): a file is shared by
     /// crates through `#[path]`, so the source root of the file naming one does not tell the
@@ -120,6 +125,57 @@ pub struct Files {
 struct Included {
     path: AbsPathBuf,
     file: IncludedFile,
+    /// The file `include!` parses it as, made the first time one does
+    /// ([`Files::included_source`]).
+    source: OnceLock<IncludedSource>,
+}
+
+/// A file outside the VFS as `include!` reads it: a file of its own, with its text read from
+/// its [`Included::file`], in a source root of its own that has it at its absolute path. So a
+/// span in it, a path relative to it (a nested `include!`, rustc's `resolve_path` from the
+/// file the call is in) and its path in an error resolve as in any file.
+///
+/// Its file ID and source root ID are both [`Column::MAX`] less its index in
+/// [`Files::included`]: counted down from the top, where the view's (counted up from 0,
+/// [`Files::unused_file_id`]) never reach while one is there ([`Files::is_used`]). No column is
+/// written for it, so a query makes it with no lock and no writer, as it makes the
+/// [`IncludedFile`] it reads ([`Files::included_file`]); the accessors read it from here.
+#[derive(Clone, Copy)]
+struct IncludedSource {
+    file: FileId,
+    text: FileText,
+    file_root: FileSourceRootInput,
+    root: SourceRootInput,
+}
+
+/// The text an included source has for the read `read` of its file, the blaze-vfs ID of that
+/// text's bytes, and its [`FileText::content`]: an empty text with [`FileText::no_text`]'s
+/// content for a file that could not be read or is not UTF-8, which `include!` refuses before
+/// it parses it.
+fn source_text(read: &Result<std::sync::Arc<[u8]>, ReadError>) -> (syntax::Text, ContentId, ContentId) {
+    let text = read.as_ref().ok().and_then(|bytes| {
+        // clone: a count, the text shares the bytes
+        let text = blaze_vfs::text_of(blaze_vfs::Bytes::from(std::sync::Arc::clone(bytes))).ok()?;
+        Some((text, ContentId::of(blaze_vfs::FILE_DOMAIN, bytes)))
+    });
+    match text {
+        Some((text, file)) => (text, file, FileText::content_of_file(file, None)),
+        None => (syntax::Text::from_static(""), ContentId::of(blaze_vfs::FILE_DOMAIN, b""), no_text()),
+    }
+}
+
+/// The content ID of a source root that has only `file`, at `path`, with the content ID
+/// `content`: by the one rule every source root's is ([`RootContent`]).
+fn one_file_root_content(is_library: bool, file: FileId, path: &VfsPath, id: ContentId) -> ContentId {
+    frame::task(Tag::Parse, |frame| {
+        let mut files = Vec::with_capacity_in(1, frame);
+        files.push((file, content::path_key(path), id));
+        let root = SourceRootId(u32::MAX);
+        let mut contents = HashMap::new_in(Global);
+        contents.insert(root, RootContent::new(is_library, files, None, frame));
+        RootContent::refresh(&mut contents, &[root], frame);
+        contents.get(&root).expect("the root just refreshed").content
+    })
 }
 
 /// A checkout that is looked at as the one it was loaded as with other contents.
@@ -297,19 +353,41 @@ impl Files {
         self.text.iter().map(|(_, text)| text)
     }
 
+    /// The text of `file_id`. A file with none (its bytes are not UTF-8, or it has neither text
+    /// nor bytes) is a bug of the caller, which panics naming the file's path and why it has
+    /// none: a reader of every file of a source root reads [`Files::file_content`] instead.
     pub fn file_text(&self, file_id: FileId) -> FileText {
-        match self.text.get(file_id.index()) {
+        match self.text.get(file_id.index()).or_else(|| Some(self.source_of(file_id.index())?.text)) {
             Some(text) => text,
-            None => {
-                panic!("Unable to fetch file text for `FileId`: {file_id:?}; this is a bug")
-            }
+            None => self.no_text(file_id),
+        }
+    }
+
+    /// [`Files::file_text`]'s panic for `file_id`, which has no text: its path, if a source root
+    /// named one, and why it has none.
+    #[cold]
+    #[inline(never)]
+    fn no_text(&self, file_id: FileId) -> ! {
+        let why = match self.raw.get(file_id.index()) {
+            Some(_) => "its bytes are not UTF-8, so it has no text (read its content with `file_content`, its bytes with `raw_file`)",
+            None => "it has neither text nor bytes: it was never set, or its text was taken away",
+        };
+        // A setter may hold the writer while it reads a text (`set_appended_root_module`): then
+        // the path is left out rather than waited for.
+        let path = self.writer.try_lock().and_then(|writer| {
+            // alloc: a panic's message
+            writer.by_path.iter().find(|(_, it)| **it == file_id).map(|(path, _)| path.to_string())
+        });
+        match path {
+            Some(path) => panic!("no text for the file `{path}` ({file_id:?}): {why}; this is a bug of the reader"),
+            None => panic!("no text for {file_id:?}, a file no source root named: {why}; this is a bug of the reader"),
         }
     }
 
     /// Whether the file was loaded as text. A file of the VFS that is not UTF-8 has an id and
     /// no text.
     pub fn has_file_text(&self, file_id: FileId) -> bool {
-        self.text.get(file_id.index()).is_some()
+        self.text.get(file_id.index()).is_some() || self.source_of(file_id.index()).is_some()
     }
 
     /// The bytes of a file of the VFS that has no text (they are not UTF-8), as the view loader
@@ -327,7 +405,10 @@ impl Files {
         match (self.text.get(file.index()), self.raw.get(file.index())) {
             (Some(input), _) => input.content(db),
             (None, Some(raw)) => raw.content(db),
-            (None, None) => FileText::no_text(),
+            (None, None) => match self.source_of(file.index()) {
+                Some(source) => source.text.content(db),
+                None => FileText::no_text(),
+            },
         }
     }
 
@@ -823,13 +904,14 @@ impl Files {
         }
     }
 
-    /// The files outside the VFS that `include_bytes!` or `include_str!` named, in no order.
+    /// The files outside the VFS that `include!`, `include_bytes!` or `include_str!` named, in
+    /// no order.
     pub fn included_paths(&self) -> impl Iterator<Item = &AbsPath> + '_ {
         self.included.iter().map(|it| it.path.as_path())
     }
 
-    /// A file outside the VFS that `include_bytes!` or `include_str!` names, read from disk the
-    /// first time it is asked for. Whoever watches the disk keeps it current with
+    /// A file outside the VFS that `include!`, `include_bytes!` or `include_str!` names, read
+    /// from disk the first time it is asked for. Whoever watches the disk keeps it current with
     /// [`Files::reload_included_file`]. Two readers that ask for it first at once each read it,
     /// with no lock held; the first to finish is kept.
     pub fn included_file(
@@ -839,40 +921,98 @@ impl Files {
         path: &AbsPath,
         durability: Durability,
     ) -> IncludedFile {
-        let hash = hash_of(path);
+        self.included.get(self.included_at(db, krate, path, durability)).file
+    }
+
+    /// The index in [`Files::included`] of [`Files::included_file`]'s file, noted as read by
+    /// `krate`.
+    fn included_at(&self, db: &Db, krate: Crate, path: &AbsPath, durability: Durability) -> u32 {
+        let hash = self.included.hash(path);
         let at = match self.included.find(hash, |it| it.path.as_path() == path) {
             Some(at) => at,
             None => {
                 let read = self.read_included(path);
                 let content = InputId(IncludedFile::content_of(read.as_deref()));
                 let file = IncludedFile::builder(read, content).durability(durability).new(db);
-                let make = || Included { path: path.to_path_buf(), file };
+                let make = || Included { path: path.to_path_buf(), file, source: OnceLock::new() };
                 self.included.insert(hash, |it| it.path.as_path() == path, make).0
             }
         };
         self.included_by.insert(
-            hash_of((krate, at)),
+            self.included_by.hash((krate, at)),
             |&(by, of)| by == krate && of == at,
             || (krate, at),
         );
-        self.included.get(at).file
+        at
     }
 
-    /// The files outside the VFS that `krate` has read, with the bytes it read of each:
-    /// `None` for one that could not be read. Sorted by path.
-    pub fn included_by(
+    /// The file `include!` parses for a file outside the VFS ([`IncludedSource`]), made from
+    /// [`Files::included_file`]'s read the first time one asks, with that read. `Err` with the
+    /// file ID it would have when a file of the view already has that ID: only a view with
+    /// more files than there are IDs left above them.
+    pub fn included_source(
         &self,
         db: &Db,
         krate: Crate,
-    ) -> Vec<(AbsPathBuf, Option<std::sync::Arc<[u8]>>)> {
+        path: &AbsPath,
+        durability: Durability,
+        is_library: bool,
+    ) -> (IncludedFile, Result<FileId, FileId>) {
+        let at = self.included_at(db, krate, path, durability);
+        let included = self.included.get(at);
+        let raw = Column::<FileText>::MAX - at;
+        let id = FileId::from_raw(raw);
+        if let Some(source) = included.source.get() {
+            return (included.file, Ok(source.file));
+        }
+        let taken = self.text.get(raw).is_some()
+            || self.raw.get(raw).is_some()
+            || self.file_source_roots.get(raw).is_some()
+            || self.source_roots.get(raw).is_some();
+        if taken {
+            return (included.file, Err(id));
+        }
+        let (text, vfs, content) = source_text(included.file.read(db));
+        let reparse = Reparse::new(&text, vfs);
+        let text = FileText::builder(text, id, InputId(content), reparse).durability(durability).new(db);
+        let vfs_path = VfsPath::from(path.to_path_buf());
+        let root_content = one_file_root_content(is_library, id, &vfs_path, content);
+        let mut files = FileSet::default();
+        files.insert(id, vfs_path);
+        let root = match is_library {
+            true => SourceRoot::new_library(files),
+            false => SourceRoot::new_local(files),
+        };
+        let root = SourceRootInput::builder(Arc::new(root), InputId(root_content))
+            .durability(durability)
+            .content_durability(root_content_durability(is_library))
+            .new(db);
+        let file_root = FileSourceRootInput::builder(SourceRootId(raw)).durability(durability).new(db);
+        // A reader that made it first at once keeps its own; this one's inputs are left unread.
+        let source = included.source.get_or_init(|| IncludedSource { file: id, text, file_root, root });
+        (included.file, Ok(source.file))
+    }
+
+    /// The included source ([`IncludedSource`]) whose file ID or source root ID is `raw`.
+    #[inline]
+    fn source_of(&self, raw: u32) -> Option<&IncludedSource> {
+        let at = Column::<FileText>::MAX.checked_sub(raw)?;
+        self.included.try_get(at)?.source.get()
+    }
+
+    /// The files outside the VFS that `krate` has read (with `include!`, `include_bytes!` or
+    /// `include_str!`), with the content ID of what it read of each
+    /// ([`IncludedFile::content`]: of its bytes, or of why it could not be read). Sorted by
+    /// path.
+    pub fn included_by(&self, db: &Db, krate: Crate) -> Vec<(AbsPathBuf, ContentId)> {
         let mut read: Vec<_> = self
             .included_by
             .iter()
             .filter(|(by, _)| *by == krate)
             .map(|&(_, at)| {
                 let included = self.included.get(at);
-                // clone: the edge: the list leaves base-db, read once per build (a path and a refcount each).
-                (included.path.clone(), included.file.bytes(db).cloned())
+                // clone: the edge: the list leaves base-db, read once per build (a path each).
+                (included.path.clone(), included.file.content(db))
             })
             .collect(); // alloc: the edge, as above.
         read.sort_by(|a, b| a.0.cmp(&b.0));
@@ -880,24 +1020,24 @@ impl Files {
     }
 
     fn read_included(&self, path: &AbsPath) -> Result<std::sync::Arc<[u8]>, ReadError> {
-        std::fs::read(self.on_disk(path.as_ref())).map(Into::into).map_err(|it| ReadError::of(&it))
+        IncludedFile::read_now(&self.on_disk(path.as_ref()))
     }
 
     pub(crate) fn find_included(&self, path: &AbsPath) -> Option<IncludedFile> {
-        let at = self.included.find(hash_of(path), |it| it.path.as_path() == path)?;
+        let at = self.included.find(self.included.hash(path), |it| it.path.as_path() == path)?;
         Some(self.included.get(at).file)
     }
 
-    /// Notes a file an `include!` or a module declaration names that the VFS has not: whoever
+    /// Notes a file a module declaration names that the VFS has not: whoever
     /// owns the VFS puts it in the source root, see [`Files::included_sources`].
     pub fn include_source(&self, path: &AbsPath, root: SourceRootId, krate: Crate) {
         let (at, _) = self.included_sources.insert(
-            hash_of(path),
+            self.included_sources.hash(path),
             |(known, _)| known.as_path() == path,
             || (path.to_path_buf(), root),
         );
         self.sources_included_by.insert(
-            hash_of((krate, at)),
+            self.sources_included_by.hash((krate, at)),
             |&(by, of)| by == krate && of == at,
             || (krate, at),
         );
@@ -996,22 +1136,59 @@ impl Files {
         *file.read(db) == self.read_included(path)
     }
 
-    /// Reads the file again, and says whether it changed.
+    /// Reads the file again, and says whether it changed. The text `include!` parses of it
+    /// ([`IncludedSource`]), once one has, changes with it: its edit found for its next parse
+    /// as a file of the view's is ([`Reparse::after`]), and its source root's content.
     pub fn reload_included_file(&self, db: &mut Db, path: &AbsPath) -> bool {
-        let Some(file) = self.find_included(path) else { return false };
+        let Some(at) = self.included.find(self.included.hash(path), |it| it.path.as_path() == path) else {
+            return false;
+        };
+        let included = self.included.get(at);
+        let file = included.file;
         let read = self.read_included(path);
         let changed = *file.read(&*db) != read;
-        if changed {
-            let content = InputId(IncludedFile::content_of(read.as_deref()));
-            file.set_read_field(db).to(read);
-            file.set_content_field(db).to(content);
+        if !changed {
+            return false;
         }
-        changed
+        if let Some(source) = included.source.get() {
+            let (text, vfs, content) = source_text(&read);
+            let input = source.text;
+            let reparse = input.reparse_field(&*db).after(&text, vfs);
+            input.set_reparse_field(db).to(reparse);
+            input.set_text_field(db).to(text);
+            if input.content(&*db) != content {
+                input.set_content_field(db).to(InputId(content));
+                let root = source.root.source_root_ref(&*db);
+                let path = root.path_for_file(&source.file).expect("an included source's root has it");
+                let root_content = one_file_root_content(root.is_library, source.file, path, content);
+                source.root.set_content_field(db).to(InputId(root_content));
+            }
+        }
+        let content = InputId(IncludedFile::content_of(read.as_deref()));
+        file.set_read_field(db).to(read);
+        file.set_content_field(db).to(content);
+        true
+    }
+
+    /// The path outside the VFS of `file`, when it is the file `include!` parses of one
+    /// ([`Files::included_source`]): what names it in the program, as a source root names its
+    /// files.
+    pub fn included_source_path(&self, file: FileId) -> Option<&AbsPath> {
+        let at = Column::<FileText>::MAX.checked_sub(file.index())?;
+        let included = self.included.try_get(at)?;
+        (included.source.get()?.file == file).then_some(included.path.as_path())
+    }
+
+    /// The file `include!` parses of the file outside the VFS at `path`, once one has
+    /// ([`Files::included_source`]).
+    pub fn included_source_file(&self, path: &AbsPath) -> Option<FileId> {
+        let at = self.included.find(self.included.hash(path), |it| it.path.as_path() == path)?;
+        Some(self.included.get(at).source.get()?.file)
     }
 
     /// Source root of the file.
     pub fn source_root(&self, source_root_id: SourceRootId) -> SourceRootInput {
-        match self.source_roots.get(source_root_id.0) {
+        match self.source_roots.get(source_root_id.0).or_else(|| Some(self.source_of(source_root_id.0)?.root)) {
             Some(source_root) => source_root,
             None => panic!(
                 "Unable to fetch `SourceRootInput` with `SourceRootId` ({source_root_id:?}); this is a bug"
@@ -1020,7 +1197,7 @@ impl Files {
     }
 
     pub(crate) fn has_source_root(&self, id: SourceRootId) -> bool {
-        self.source_roots.get(id.0).is_some()
+        self.source_roots.get(id.0).is_some() || self.source_of(id.0).is_some()
     }
 
     pub fn set_source_root_with_durability(
@@ -1065,7 +1242,7 @@ impl Files {
     }
 
     pub fn file_source_root(&self, db: &Db, id: FileId) -> FileSourceRootInput {
-        match self.file_source_roots.get(id.index()) {
+        match self.file_source_roots.get(id.index()).or_else(|| Some(self.source_of(id.index())?.file_root)) {
             Some(file_source_root) => file_source_root,
             None => panic!(
                 "Unable to get `FileSourceRootInput` with `FileId` ({id:?}, path: {}); this is a bug",
@@ -1126,6 +1303,7 @@ impl Files {
             || writer.view_ids.contains_key(id)
             || writer.crate_attrs.contains_key(id)
             || writer.alias_of.contains_key(id)
+            || self.source_of(id.index()).is_some()
     }
 
     /// The first file ID from `next` on that nothing has: the one place base-db hands out file
@@ -1197,7 +1375,7 @@ pub enum ExpansionRead {
 }
 
 fn note_env(table: &Table<(Crate, Box<str>)>, krate: Crate, key: &str) {
-    table.insert(hash_of((krate, key)), |(by, known)| *by == krate && **known == *key, || {
+    table.insert(table.hash((krate, key)), |(by, known)| *by == krate && **known == *key, || {
         (krate, key.into())
     });
 }

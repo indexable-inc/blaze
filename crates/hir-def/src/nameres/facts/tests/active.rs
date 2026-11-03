@@ -4,7 +4,7 @@
 //! adds one item a round (`One` at round 1, `Two` at 2, `Three` at 3); `m1` to `m4`, which
 //! import `leaf::Two`; and `m5` to `m48`, which read nothing of `leaf`. Each test collects the
 //! crate cold, reads which resolver queries ran at round 2 off the query database's `WillExecute` events,
-//! and checks the map against the old collector's.
+//! and checks the crate's maps agree ([`compare_db`]).
 
 use std::fmt::Write as _;
 
@@ -13,7 +13,7 @@ use blaze_hash::HashSet;
 use std::alloc::Global;
 use blaze_query::db::FromId;
 
-use super::{Exempt, compare_db, fixture_db, new_crate_local_def_map};
+use super::{Exempt, compare_db, fixture_db, facts_crate_local_def_map};
 use crate::{
     ModuleId,
     nameres::facts::queries::{self, FactKey, RoundKey, RoundKind, RoundModules, SccKey},
@@ -106,7 +106,7 @@ fn a_round_runs_only_the_leaf_its_macros_change_and_the_leafs_importers() {
     let db = fixture_db(&fixture());
     let krate = db.fetch_test_crate();
     let events = executed(&db, || {
-        new_crate_local_def_map(&db, krate);
+        facts_crate_local_def_map(&db, krate);
     });
     let modules = round_2(&db);
     assert_eq!(modules.order.len(), 50);
@@ -144,7 +144,7 @@ fn a_round_runs_only_the_leaf_its_macros_change_and_the_leafs_importers() {
 fn the_importers_resolve_what_the_leaf_gains() {
     let db = fixture_db(&fixture());
     let krate = db.fetch_test_crate();
-    let map = new_crate_local_def_map(&db, krate).def_map(&db);
+    let map = facts_crate_local_def_map(&db, krate).def_map(&db);
     let two = hir_expand::name::Name::new_symbol_root(intern::Symbol::intern("Two"));
     for (module, data) in map.modules(&db) {
         let name = name(&db, module);

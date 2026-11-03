@@ -133,7 +133,14 @@ fn two_alloc_error_handlers(db: &Db, a: Crate, b: Crate) -> String {
 /// static this can't tell (an expansion that names no static or more than one, or whose MIR
 /// does not build, which compiling the export then reports): `false`, logged under target
 /// `blaze` with why. Two allocators are the error the shim gives too ([`shim`]).
+///
+/// With `db` attached, as a query's run is: the codegen driver calls this outside any query,
+/// and why the MIR does not build formats the types it names.
 pub fn allocations_unobserved(db: &Db, krate: Crate) -> Result<bool, String> {
+    blaze_query::db::attach(db, || allocations_unobserved_attached(db, krate))
+}
+
+fn allocations_unobserved_attached(db: &Db, krate: Crate) -> Result<bool, String> {
     let program = linked_crates(db, krate)?;
     let mut declared = program.iter().copied().filter(|&it| declares_global_allocator(db, it));
     let Some(allocator) = declared.next() else { return Ok(true) };

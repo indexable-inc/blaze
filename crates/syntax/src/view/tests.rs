@@ -142,15 +142,15 @@ fn vts<'t>(it: impl IntoIterator<Item = view::Token<'t>>) -> Vec<Key> {
 }
 
 fn ho<N: ast::AstNode>(n: Option<N>) -> Option<Key> {
-    n.as_ref().map(hn)
+    n.map(|it| hn(&it))
 }
 
 fn vo<'t, N: view::AstNode<'t>>(n: Option<N>) -> Option<Key> {
-    n.as_ref().map(vn)
+    n.map(|it| vn(&it))
 }
 
 fn hto(t: Option<SyntaxToken>) -> Option<Key> {
-    t.as_ref().map(ht)
+    t.map(|it| ht(&it))
 }
 
 fn vto(t: Option<view::Token<'_>>) -> Option<Key> {

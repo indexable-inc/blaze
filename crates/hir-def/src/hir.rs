@@ -39,7 +39,7 @@ use crate::{
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
     expr_store::{
         HygieneId,
-        path::{GenericArgs, Path, PathIdx},
+        path::{GenericArgs, Names, Path, PathIdx},
     },
     type_ref::{Mutability, Rawness},
 };
@@ -425,6 +425,12 @@ pub enum Expr<'a> {
         body: ExprId,
         closure_kind: ClosureKind,
         capture_by: CaptureBy,
+        /// The lifetimes of its `for<'a, ..>` binder (`#![feature(closure_lifetime_binder)]`),
+        /// a run of the store's names read with
+        /// [`ExpressionStore::names`](crate::expr_store::ExpressionStore::names); [`Names::EMPTY`]
+        /// without one. They are the late-bound lifetimes of its signature, in scope in its
+        /// parameters' and return type, as rustc's `ClosureBinder::For`.
+        binder: Names,
     },
     Tuple {
         exprs: &'a [ExprId],
@@ -550,6 +556,22 @@ pub enum UnsafeBinderCastKind {
 pub struct OffsetOf {
     pub container: TypeRefId,
     pub fields: Box<[Name]>,
+    /// The context each of `fields` is written with, where a `macro` (2.0) or a def-site span
+    /// marks one, [`HygieneId::ROOT`] for the others; empty where none is marked, as in every
+    /// `offset_of!` a real file or a `macro_rules!` writes. What a field is looked up by among
+    /// an ADT's ([`crate::signatures::VariantFields::field_written`]) and its privacy checked
+    /// from (rustc's `check_expr_offset_of`, through `adjust_ident_and_get_scope`).
+    pub hygiene: Box<[HygieneId]>,
+}
+
+impl OffsetOf {
+    /// The context the `index`th of [`Self::fields`] is written with ([`Self::hygiene`]).
+    pub fn field_hygiene(&self, index: usize) -> HygieneId {
+        match self.hygiene.is_empty() {
+            true => HygieneId::ROOT,
+            false => self.hygiene[index],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: as `Literal`'s

@@ -46,8 +46,8 @@ fn program(tc: &TestCase) -> String {
 }
 
 /// Each case edits every body of its program.
-fn reaches_only_the_edited_body(tc: TestCase) {
-    let fixture = program(&tc);
+fn reaches_only_the_edited_body(tc: &TestCase) {
+    let fixture = program(tc);
     let mut db = fixture::db(&fixture).into_db();
     let krate = fixture::test_crate(&db);
     let mut harness = Harness::new(&mut db, krate, None).expect("the harness sets up");
@@ -57,9 +57,9 @@ fn reaches_only_the_edited_body(tc: TestCase) {
 }
 
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
+fn run_cases(cases: u64, mut property: impl FnMut(&TestCase)) {
     let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
+    Hegel::new(move |tc: TestCase| property(&tc)).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 
 /// `HEGEL_TEST_CASES=<n>` runs it longer.

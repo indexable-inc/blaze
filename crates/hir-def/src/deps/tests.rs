@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use base_db::{Crate, CrateOrigin, Db, Env};
+use base_db::{Crate, CrateOrigin, Db, Env, FileId};
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
 use std::alloc::Global;
@@ -796,8 +796,16 @@ fn reads_read_back_and_damaged_ones_do_not_panic() {
     }
 }
 
-/// The reads' own decoder before `blaze_format::cursor`: its names, or none where it refused.
-fn old_reads_names(bytes: &[u8]) -> Option<(Vec<Box<str>>, Vec<Box<[u8]>>)> {
+/// What [`Reads::parts_for_tests`] gives: the variables, the expansions' names, each
+/// dependency's by its index, and the crates that read `CARGO_PRIMARY_PACKAGE`.
+pub(super) type ReadsParts = (Vec<Box<str>>, Vec<Box<[u8]>>, Vec<(u32, Vec<Box<[u8]>>)>, Vec<u32>);
+
+/// The version of the reads' encoding [`old_reads`] reads.
+const OLD_READS_VERSION: u8 = 3;
+
+/// The reads' decoder as it was before `blaze_format::cursor`, hand-rolled, written for the
+/// format at [`OLD_READS_VERSION`]: its parts, or none where it refuses.
+fn old_reads(bytes: &[u8]) -> Option<ReadsParts> {
     fn take<'b>(rest: &mut &'b [u8], len: usize) -> Option<&'b [u8]> {
         if rest.len() < len {
             return None;
@@ -806,29 +814,61 @@ fn old_reads_names(bytes: &[u8]) -> Option<(Vec<Box<str>>, Vec<Box<[u8]>>)> {
         *rest = after;
         Some(taken)
     }
+    fn u32_of(rest: &mut &[u8]) -> Option<u32> {
+        Some(u32::from_le_bytes(take(rest, 4)?.try_into().expect("four bytes")))
+    }
     fn count(rest: &mut &[u8]) -> Option<usize> {
-        Some(u32::from_le_bytes(take(rest, 4)?.try_into().expect("four bytes")) as usize)
+        u32_of(rest).map(|it| it as usize)
+    }
+    fn framed(rest: &mut &[u8]) -> Option<Box<[u8]>> {
+        let len = count(rest)?;
+        take(rest, len).map(Box::from)
+    }
+    fn increasing<T: PartialOrd>(items: &[T]) -> bool {
+        items.windows(2).all(|pair| pair[0] < pair[1])
     }
     let mut rest = bytes;
-    if take(&mut rest, 1)? != [1] {
+    if take(&mut rest, 1)? != [OLD_READS_VERSION] {
         return None;
     }
-    let (mut env, mut shapes) = (Vec::new(), Vec::new());
+    let (mut env, mut macros, mut deps, mut primary) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..count(&mut rest)? {
         let len = count(&mut rest)?;
         env.push(Box::<str>::from(std::str::from_utf8(take(&mut rest, len)?).ok()?));
     }
     for _ in 0..count(&mut rest)? {
-        let len = count(&mut rest)?;
-        shapes.push(Box::<[u8]>::from(take(&mut rest, len)?));
+        macros.push(framed(&mut rest)?);
     }
-    let sorted = env.windows(2).all(|pair| pair[0] < pair[1])
-        && shapes.windows(2).all(|pair| pair[0] < pair[1]);
-    (rest.is_empty() && sorted).then_some((env, shapes))
+    for _ in 0..count(&mut rest)? {
+        let at = u32_of(&mut rest)?;
+        let mut shapes = Vec::new();
+        for _ in 0..count(&mut rest)? {
+            shapes.push(framed(&mut rest)?);
+        }
+        if shapes.is_empty() || !increasing(&shapes) {
+            return None;
+        }
+        deps.push((at, shapes));
+    }
+    for _ in 0..count(&mut rest)? {
+        primary.push(u32_of(&mut rest)?);
+    }
+    let sorted = increasing(&env)
+        && increasing(&macros)
+        && deps.windows(2).all(|pair| pair[0].0 < pair[1].0)
+        && increasing(&primary);
+    (rest.is_empty() && sorted).then_some((env, macros, deps, primary))
 }
 
 #[test]
 fn reads_decode_as_the_old_decoder_did() {
+    assert_eq!(
+        Reads::default().encode().first(),
+        Some(&OLD_READS_VERSION),
+        "the reads' encoding moved past the version `old_reads` is written for: \
+         port `old_reads` to the new format (and `OLD_READS_VERSION` with it)"
+    );
     let samples = [
         Reads::default(),
         Reads::for_tests(&["A"], &[]),
@@ -837,10 +877,15 @@ fn reads_decode_as_the_old_decoder_did() {
             &["", "PATH", "\u{e9}t\u{e9}"],
             &[(b"one", ContentId([1; 32])), (b"two", ContentId([2; 32]))],
         ),
+        Reads::default().with_deps_for_tests(&[(0, &[b""])], &[]),
+        Reads::default().with_deps_for_tests(&[], &[7]),
+        Reads::for_tests(&["B"], &[(b"own", ContentId([3; 32]))])
+            .with_deps_for_tests(&[(1, &[b"a", b"bc"]), (4, &[b"d"])], &[1, 2]),
     ];
     let mut rng = blaze_ids::rng::SplitMix64::new(0x5eed_0f_4ead5);
     for reads in &samples {
         let bytes = reads.encode();
+        assert_eq!(old_reads(&bytes), Some(reads.parts_for_tests()), "{reads:?}");
         let mut inputs = vec![bytes.clone()];
         for at in 0..=bytes.len() {
             inputs.push(bytes[..at].to_vec());
@@ -852,11 +897,8 @@ fn reads_decode_as_the_old_decoder_did() {
         }
         inputs.push([&bytes[..], &[0]].concat());
         for input in inputs {
-            let new = Reads::decode(&input).ok().map(|it| {
-                let (env, shapes) = it.names();
-                (env.to_vec(), shapes.map(Box::<[u8]>::from).collect::<Vec<_>>())
-            });
-            assert_eq!(new, old_reads_names(&input), "{input:?}");
+            let new = Reads::decode(&input).ok().map(|it| it.parts_for_tests());
+            assert_eq!(new, old_reads(&input), "{input:?}");
         }
     }
 }
@@ -1438,4 +1480,145 @@ pub mod inner { pub mod gone; }
         "{:?}",
         stored.refused
     );
+}
+
+const ALIASED: &str = r#"
+//- /main.rs crate:main deps:lib new_source_root:local
+use lib::Shown;
+fn main() {}
+
+//- /lib.rs crate:lib deps:core new_source_root:library
+pub struct Shown;
+
+//- /core.rs crate:core new_source_root:library
+#[lang = "sized"]
+pub trait Sized {}
+"#;
+
+/// A database of [`ALIASED`] whose `lib` has as its root an alias of `lib.rs` with `glue`
+/// appended as the module `__glue`, as `Lowered::append_roots` makes for a test harness or a
+/// proc macro's wasm glue.
+fn aliased(glue: &str) -> TestDB {
+    let mut db = fixture::db(ALIASED).into_db();
+    let lib = crate_named(&db, "lib");
+    let mut data = lib.data(&db).clone();
+    let alias = db.alias(data.root_file_id).unwrap();
+    db.set_alias_appended(alias, Some(("__glue", glue))).unwrap();
+    data.root_file_id = alias;
+    lib.set_data(&mut db, data);
+    db.note_crates_changed();
+    db
+}
+
+/// The alias's path is its file's, so named by path it reads back as `lib.rs`, whose syntax
+/// lacks the appended module (seedengine's "Can't find ast id" in a wasm proc-macro crate
+/// after a re-serve): an image names it as the crate's root, and its key covers the appended
+/// text, so a crate with other glue misses the image.
+#[test]
+fn an_image_of_a_crate_whose_root_has_a_module_appended_reads_back_that_root() {
+    let _turn = TURN.lock();
+    const GLUE: &str = "\npub mod __glue { pub struct Glue; }";
+    let memory = Memory::default();
+    let mut db = aliased(GLUE);
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    assert_eq!(names(&db, &store(&db, &served, &memory).unwrap().written), ["core", "lib"]);
+
+    let mut db = aliased(GLUE);
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    assert_eq!(names(&db, &served.hits), ["core", "lib"]);
+    let lib = crate_named(&db, "lib");
+    let root = lib.data(&db).root_file_id;
+    let def_map = crate::nameres::crate_def_map(&db, lib);
+    let files: Vec<FileId> = (def_map.modules(&db))
+        .filter_map(|(_, module)| Some(module.definition_source_file_id().file_id()?.file_id(&db)))
+        .collect();
+    assert_eq!(files, [root, root], "the root module and `__glue` are of the alias");
+
+    let mut other = aliased("\npub mod __glue { pub struct Other; }");
+    let crates = all(&other);
+    let served = serve(&mut other, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    assert_eq!(names(&other, &served.hits), ["core"], "other glue misses `lib`'s image");
+}
+
+/// A write that moves a file of a crate read from its image takes the image away in that
+/// write, with the images of the served crates that depend on it, and leaves the others. No
+/// reader sees the new file with the old image, which no longer reads. The crate then resolves
+/// from its files as they are now, as a fresh database of them does.
+#[test]
+fn a_write_to_a_served_crates_file_withdraws_its_image_and_its_dependents_in_that_write() {
+    let _turn = TURN.lock();
+    let (memory, _) = stored(FIXTURE);
+    // `FIXTURE`'s files in order: main.rs, lib.rs, deep.rs, core.rs.
+    let served_db = |at: usize| {
+        let fixture = fixture::db(FIXTURE);
+        let file = fixture.file(at);
+        let mut db = fixture.into_db();
+        let file = file.file_id(&db);
+        let crates = all(&db);
+        let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+        assert_eq!(names(&db, &served.hits), ["core", "lib"]);
+        (db, file)
+    };
+    let resolves_fresh = |db: &TestDB, edited: &str, name: &str| {
+        let fresh = fixture::db(edited).into_db();
+        let (krate, live) = (crate_named(db, name), crate_named(&fresh, name));
+        assert_eq!(frozen::encode(db, krate), frozen::encode(&fresh, live), "`{name}` resolves as a fresh one");
+    };
+
+    // `deep.rs`, a module of `lib` that is not its root: `lib` loses its image, and `core`,
+    // which depends on nothing that moved, keeps its own.
+    let (mut db, deep) = served_db(2);
+    let (core, lib) = (crate_named(&db, "core"), crate_named(&db, "lib"));
+    assert_eq!((mode(&db, core), mode(&db, lib)), (Some(Mode::Serve), Some(Mode::Serve)));
+    let text = db.file_text(deep).text(&db).replace("pub fn f() {}", "pub fn f() {} pub fn more() {}");
+    db.set_file_text(deep, &text);
+    assert_eq!(mode(&db, lib), None, "`lib`'s image is withdrawn by the write of its file");
+    assert!(image(&db, lib).is_none());
+    assert_eq!(mode(&db, core), Some(Mode::Serve), "`core` keeps its image");
+    resolves_fresh(&db, &FIXTURE.replace("pub fn f() {}", "pub fn f() {} pub fn more() {}"), "lib");
+
+    // `core.rs`: `core` loses its image, and so does `lib`, which depends on it.
+    let (mut db, core_rs) = served_db(3);
+    let (core, lib) = (crate_named(&db, "core"), crate_named(&db, "lib"));
+    let more = |text: &str| text.replace("pub trait Sized {}", "pub trait Sized {}\npub struct More;");
+    let text = more(&db.file_text(core_rs).text(&db));
+    db.set_file_text(core_rs, &text);
+    assert_eq!((mode(&db, core), mode(&db, lib)), (None, None), "`core` and its dependent `lib` are withdrawn");
+    assert!(image(&db, core).is_none() && image(&db, lib).is_none());
+    for name in ["core", "lib"] {
+        resolves_fresh(&db, &more(FIXTURE), name);
+    }
+    assert_eq!(frozen::differences(), Vec::<String>::new());
+}
+
+/// Frozen bytes read against a file they were not made from stop the query that asked with
+/// [`frozen::Unreadable`], naming the crate, the file and both content IDs. Here no write
+/// withdraws them: the bytes are set by hand after the edit. A driver fails that one job with
+/// it ([`crate::nameres::stopped`]). It is never a panic with only text, and never a def map
+/// resolved instead.
+#[test]
+fn a_frozen_def_map_read_against_a_moved_file_stops_the_query_with_an_error_naming_it() {
+    let _turn = TURN.lock();
+    let fixture = fixture::db(FIXTURE);
+    let deep = fixture.file(2);
+    let mut db = fixture.into_db();
+    let deep = deep.file_id(&db);
+    let lib = crate_named(&db, "lib");
+    let bytes = frozen::encode(&db, lib).unwrap();
+    let text = db.file_text(deep).text(&db).replace("pub fn f() {}", "pub fn f() {} pub fn more() {}");
+    db.set_file_text(deep, &text);
+    frozen::set(&mut db, [(lib, frozen::Frozen { bytes: bytes.into(), mode: Mode::Serve })].into_iter().collect());
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        _ = crate::nameres::crate_def_map(&db, lib);
+    }));
+    let Err(payload) = caught else { panic!("`lib`'s frozen def map was read against a file it was not made from") };
+    let Some(stop) = frozen::Unreadable::of_payload(&*payload) else {
+        panic!("the refusal unwound with another payload than `frozen::Unreadable`")
+    };
+    assert_eq!((stop.krate, stop.kind, stop.name.as_deref()), (lib, "def map", Some("lib")));
+    assert!(stop.why.contains("deep.rs") && stop.why.contains("the image was made from"), "{}", stop.why);
+    let text = crate::nameres::stopped(&*payload).expect("a typed stop of name resolution");
+    assert!(text.contains("`lib`") && text.contains("deep.rs") && text.contains("refused"), "{text}");
 }

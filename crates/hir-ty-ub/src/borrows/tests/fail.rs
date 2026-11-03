@@ -76,7 +76,7 @@ fn arg(
     implicit_writes: bool,
 ) -> R<Ptr> {
     let new = NewPermission::new(kind, RetagMode::FnEntry, freeze, true, cells).with_implicit_writes(implicit_writes);
-    s.retag_with(p, new, len)
+    s.retag_with(p, &new, len)
 }
 
 /// The callee's argument `&mut T` (`Freeze`) under `-Zmiri-tree-borrows-implicit-writes`.

@@ -1,7 +1,8 @@
-diff -ruN a/src/predicate.rs b/src/predicate.rs
+diff --git a/src/predicate.rs b/src/predicate.rs
+index 0ce9d68..9ffa326 100644
 --- a/src/predicate.rs
 +++ b/src/predicate.rs
-@@ -126,6 +126,12 @@
+@@ -126,6 +126,12 @@ impl<I: Interner> TraitRef<I> {
          Self { def_id: trait_def_id, args, _use_trait_ref_new_instead: () }
      }
  
@@ -14,7 +15,7 @@ diff -ruN a/src/predicate.rs b/src/predicate.rs
      pub fn new(
          interner: I,
          trait_def_id: I::TraitId,
-@@ -402,6 +408,11 @@
+@@ -402,6 +408,11 @@ impl<I: Interner> ExistentialTraitRef<I> {
          Self { def_id: trait_def_id, args, _use_existential_trait_ref_new_instead: () }
      }
  
@@ -26,26 +27,27 @@ diff -ruN a/src/predicate.rs b/src/predicate.rs
      pub fn new(
          interner: I,
          trait_def_id: I::TraitId,
-@@ -473,6 +484,15 @@
-         term: I::Term,
-     ) -> ExistentialProjection<I> {
-         interner.debug_assert_existential_args_compatible(def_id.into(), args);
-+        Self { def_id, args, term, use_existential_projection_new_instead: () }
-+    }
-+
+@@ -476,6 +487,15 @@ impl<I: Interner> ExistentialProjection<I> {
+         Self { def_id, args, term, use_existential_projection_new_instead: () }
+     }
+ 
 +    /// As [`TraitRef::from_checked_parts`].
 +    pub fn from_checked_parts(
 +        def_id: I::TraitAssocTermId,
 +        args: I::GenericArgs,
 +        term: I::Term,
 +    ) -> Self {
-         Self { def_id, args, term, use_existential_projection_new_instead: () }
-     }
- 
-diff -ruN a/src/ty/alias.rs b/src/ty/alias.rs
++        Self { def_id, args, term, use_existential_projection_new_instead: () }
++    }
++
+     pub fn new(
+         interner: I,
+         def_id: I::TraitAssocTermId,
+diff --git a/src/ty/alias.rs b/src/ty/alias.rs
+index 10fd4c6..c61c8be 100644
 --- a/src/ty/alias.rs
 +++ b/src/ty/alias.rs
-@@ -47,6 +47,14 @@
+@@ -47,6 +47,14 @@ impl<I: Interner, K: Copy> Alias<I, K> {
      pub fn kind(self, _interner: I) -> K {
          self.kind
      }

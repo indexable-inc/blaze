@@ -276,6 +276,17 @@ pub trait Interner:
         f: impl FnOnce(&search_graph::GlobalCache<Self>) -> R,
     ) -> R;
 
+    /// The solver cache of `scope`, to look a goal up in: see
+    /// [`search_graph::Cx::with_global_cache_to_read`]. By default,
+    /// [`Interner::with_global_cache`].
+    fn with_global_cache_to_read<R>(
+        self,
+        scope: search_graph::CacheScope,
+        f: impl FnOnce(&search_graph::GlobalCache<Self>) -> Option<R>,
+    ) -> Option<R> {
+        <Self as Interner>::with_global_cache(self, scope, f)
+    }
+
     /// See [`search_graph::Cx::cache_scope`].
     fn cache_scope(self, dep_node: &Self::DepNodeIndex) -> search_graph::CacheScope;
 
@@ -838,6 +849,13 @@ impl<I: Interner> search_graph::Cx for I {
         f: impl FnOnce(&search_graph::GlobalCache<Self>) -> R,
     ) -> R {
         I::with_global_cache(self, scope, f)
+    }
+    fn with_global_cache_to_read<R>(
+        self,
+        scope: search_graph::CacheScope,
+        f: impl FnOnce(&search_graph::GlobalCache<Self>) -> Option<R>,
+    ) -> Option<R> {
+        I::with_global_cache_to_read(self, scope, f)
     }
     fn cache_scope(self, dep_node: &I::DepNodeIndex) -> search_graph::CacheScope {
         I::cache_scope(self, dep_node)

@@ -50,6 +50,18 @@ reads nothing of this round.
 | `Plain` otherwise (2018 on; a 2015 visibility path, `ResolveMode::Other`) | `{M}` and every prelude target (`resolve_name_in_module`: the module, then the std prelude), plus `root ∈ L_1` for an `extern_prelude_self` name; no segments: nothing |
 | `Abs` from 2018 | extern prelude only: `root ∈ L_1` for an `extern_prelude_self` name, else nothing |
 
+**A hygienic path** (`ShapeImport::hygienic`, the second field of `other_paths`: the path's first
+token has a macros 2.0 context, `ImportOp::ctxt` or `RawVisibility::Module`'s) of kind `Super(k)`
+or a plain one not in the 2015 row, and any `Super(k)` path of a module that is or is under a
+module a `macro` wrote (`ShapeModule::opaque`), adds every ancestor of `M` to `L_0` when it has
+segments.
+Def-site hygiene (`def_site.rs`) may start it in any module around `M`: `resolve_self` walks out
+past modules the `macro` did not write, and a plain name is looked up where the expansion wrote
+it, then at the `macro`'s def site. A def site that is not around `M` (a `macro` imported into a
+module around it) leaves the path unresolved in the unit (`facts::unit::around`), so no read of
+it is made. `crate` and 2015 paths start at this crate's root or another crate's, as above, and
+`$crate` is not moved.
+
 Imports resolve in `ResolveMode::Import` (`DefCollector::resolve_import`), and `pub(in path)`
 paths in `ResolveMode::Other` (`DefMap::resolve_visibility` through `resolve_path`). The std
 prelude of another crate (the injected one: `inject_prelude` runs before the root's items are

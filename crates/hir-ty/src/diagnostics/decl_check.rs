@@ -259,7 +259,7 @@ impl<'a> DeclValidator<'a> {
             return;
         }
 
-        let source_map = &Body::with_source_map(self.db, func.into()).1;
+        let source_map = Body::source_map(self.db, func.into());
         for (id, replacement) in pats_replacements {
             let Ok(source_ptr) = source_map.pat_syntax(id) else {
                 continue;
@@ -294,7 +294,7 @@ impl<'a> DeclValidator<'a> {
         }
     }
 
-    fn edition(&self, id: impl HasModule) -> span::Edition {
+    fn edition(&self, id: impl HasModule + Copy) -> span::Edition {
         let krate = id.krate(self.db);
         krate.data(self.db).edition
     }

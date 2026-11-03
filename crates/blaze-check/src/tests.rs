@@ -30,7 +30,7 @@ use crate::{
 use Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
 /// Every outcome `f` returns over the model's executions.
-fn outcomes<T: Ord + Clone + 'static>(builder: Builder, f: impl Fn() -> T + 'static) -> BTreeSet<T> {
+fn outcomes<T: Ord + Clone + 'static>(builder: &Builder, f: impl Fn() -> T + 'static) -> BTreeSet<T> {
     let seen = StdArc::new(StdMutex::new(BTreeSet::new()));
     let into = StdArc::clone(&seen);
     builder.check(move || {
@@ -42,7 +42,7 @@ fn outcomes<T: Ord + Clone + 'static>(builder: Builder, f: impl Fn() -> T + 'sta
 }
 
 /// The report of the finding `f` must make.
-fn finding(builder: Builder, f: impl Fn() + 'static) -> String {
+fn finding(builder: &Builder, f: impl Fn() + 'static) -> String {
     let out = catch_unwind(AssertUnwindSafe(|| builder.check(f)));
     match out {
         Ok(()) => panic!("the model found nothing"),
@@ -62,7 +62,7 @@ fn builder() -> Builder {
 }
 
 fn store_buffering(store: Ordering, load: Ordering) -> BTreeSet<(u32, u32)> {
-    outcomes(builder(), move || {
+    outcomes(&builder(), move || {
         let x = Arc::new(AtomicU32::new(0));
         let y = Arc::new(AtomicU32::new(0));
         let other = {
@@ -93,7 +93,7 @@ fn store_buffering_seq_cst_never_reads_both_old_values() {
 
 #[test]
 fn store_buffering_with_seq_cst_fences_never_reads_both_old_values() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         let x = Arc::new(AtomicU32::new(0));
         let y = Arc::new(AtomicU32::new(0));
         let other = {
@@ -114,7 +114,7 @@ fn store_buffering_with_seq_cst_fences_never_reads_both_old_values() {
 }
 
 fn message_passing(flag_store: Ordering, flag_load: Ordering) -> BTreeSet<(bool, u32)> {
-    outcomes(builder(), move || {
+    outcomes(&builder(), move || {
         let data = Arc::new(AtomicU32::new(0));
         let flag = Arc::new(AtomicBool::new(false));
         let writer = {
@@ -145,7 +145,7 @@ fn message_passing_relaxed_may_read_the_flag_before_the_data() {
 
 #[test]
 fn message_passing_through_fences_publishes() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         let data = Arc::new(AtomicU32::new(0));
         let flag = Arc::new(AtomicBool::new(false));
         let writer = {
@@ -167,7 +167,7 @@ fn message_passing_through_fences_publishes() {
 
 #[test]
 fn a_release_sequence_goes_on_through_an_rmw() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         let data = Arc::new(AtomicU32::new(0));
         let flag = Arc::new(AtomicU32::new(0));
         let writer = {
@@ -196,7 +196,7 @@ fn a_release_sequence_goes_on_through_an_rmw() {
 
 #[test]
 fn coherence_never_reads_backwards() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         let x = Arc::new(AtomicU32::new(0));
         let writer = {
             let x = x.clone();
@@ -216,7 +216,7 @@ fn coherence_never_reads_backwards() {
 
 #[test]
 fn rmws_never_lose_an_update() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         let n = Arc::new(AtomicUsize::new(0));
         let others: Vec<_> = (0..2)
             .map(|_| {
@@ -237,7 +237,7 @@ fn rmws_never_lose_an_update() {
 
 #[test]
 fn a_load_then_store_increment_loses_updates() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         let n = Arc::new(AtomicI32::new(0));
         let other = {
             let n = n.clone();
@@ -256,7 +256,7 @@ fn a_load_then_store_increment_loses_updates() {
 
 #[test]
 fn compare_exchange_elects_one_winner() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         let owner = Arc::new(AtomicU32::new(0));
         let other = {
             let owner = owner.clone();
@@ -287,7 +287,7 @@ impl<T> std::ops::Deref for Shared<T> {
 
 #[test]
 fn an_unsynchronized_cell_write_is_a_race() {
-    let report = finding(builder(), || {
+    let report = finding(&builder(), || {
         let cell = Arc::new(Shared(UnsafeCell::new(0u32)));
         let other = {
             let cell = cell.clone();
@@ -302,7 +302,7 @@ fn an_unsynchronized_cell_write_is_a_race() {
 
 #[test]
 fn a_relaxed_flag_does_not_order_a_cell() {
-    let report = finding(builder(), || {
+    let report = finding(&builder(), || {
         let cell = Arc::new(Shared(UnsafeCell::new(0u32)));
         let flag = Arc::new(AtomicBool::new(false));
         let writer = {
@@ -342,7 +342,7 @@ fn a_release_acquire_flag_orders_a_cell() {
 
 #[test]
 fn a_mutex_orders_a_cell_and_counts_right() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         let n = Arc::new(Mutex::new(0u32));
         let others: Vec<_> = (0..2)
             .map(|_| {
@@ -362,7 +362,7 @@ fn a_mutex_orders_a_cell_and_counts_right() {
 
 #[test]
 fn locks_taken_in_opposite_orders_deadlock() {
-    let report = finding(builder(), || {
+    let report = finding(&builder(), || {
         let a = Arc::new(Mutex::new(()));
         let b = Arc::new(Mutex::new(()));
         let other = {
@@ -383,7 +383,7 @@ fn locks_taken_in_opposite_orders_deadlock() {
 
 #[test]
 fn a_rwlock_lets_readers_share_and_orders_writers() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         let lock = Arc::new(RwLock::new(0u32));
         let writer = {
             let lock = lock.clone();
@@ -416,7 +416,7 @@ fn a_condvar_wakes_its_waiter() {
 
 #[test]
 fn a_lost_wakeup_is_a_deadlock() {
-    let report = finding(builder(), || {
+    let report = finding(&builder(), || {
         let pair = Arc::new((Mutex::new(()), Condvar::new()));
         let notifier = {
             let pair = pair.clone();
@@ -432,7 +432,7 @@ fn a_lost_wakeup_is_a_deadlock() {
 
 #[test]
 fn the_lot_locks_count_right_and_wake_their_waiter() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         let pair = Arc::new((lot::Mutex::new(0u32), lot::Condvar::new()));
         let others: Vec<_> = (0..2)
             .map(|_| {
@@ -477,7 +477,7 @@ fn a_lot_condvar_timed_out_only_while_its_condition_holds() {
 
 #[test]
 fn a_lost_wakeup_on_a_lot_condvar_is_a_deadlock() {
-    let report = finding(builder(), || {
+    let report = finding(&builder(), || {
         let pair = Arc::new((lot::Mutex::new(()), lot::Condvar::new()));
         let notifier = {
             let pair = pair.clone();
@@ -510,7 +510,7 @@ fn a_spin_loop_with_a_hint_ends() {
 fn a_spin_loop_without_a_yield_is_a_finding() {
     let mut builder = builder();
     builder.max_branches = 200;
-    let report = finding(builder, || {
+    let report = finding(&builder, || {
         let flag = Arc::new(AtomicBool::new(false));
         let setter = {
             let flag = flag.clone();
@@ -543,7 +543,7 @@ fn park_and_unpark_hand_over_a_token() {
 
 #[test]
 fn a_once_lock_runs_its_initializer_once() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         let calls = Arc::new(AtomicU32::new(0));
         let cell = Arc::new(OnceLock::new());
         let other = {
@@ -607,7 +607,7 @@ fn an_atomic_ptr_publishes_what_it_points_to() {
 
 #[test]
 fn statics_start_again_in_each_execution() {
-    let seen = outcomes(builder(), || {
+    let seen = outcomes(&builder(), || {
         static N: AtomicU32 = AtomicU32::new(5);
         let other = thread::spawn(|| {
             N.fetch_add(1, Relaxed);
@@ -636,7 +636,7 @@ fn a_finding_replays_from_its_schedule() {
         }
         writer.join().unwrap();
     }
-    let report = finding(builder(), racy);
+    let report = finding(&builder(), racy);
     let schedule = report
         .split("CHECK_REPLAY=")
         .nth(1)
@@ -645,7 +645,7 @@ fn a_finding_replays_from_its_schedule() {
         .to_owned();
     let mut replay = builder();
     replay.replay = Some(schedule.clone());
-    let again = finding(replay, racy);
+    let again = finding(&replay, racy);
     assert!(again.contains("data race"), "{again}");
     assert!(again.contains(&format!("schedule {schedule}")), "{again}");
 }
@@ -655,7 +655,7 @@ fn random_runs_find_the_lost_update() {
     let mut random = builder();
     random.random = Some(200);
     random.seed = 7;
-    let report = finding(random, || {
+    let report = finding(&random, || {
         let n = Arc::new(AtomicU32::new(0));
         let other = {
             let n = n.clone();
@@ -768,7 +768,7 @@ impl Spec for Counter {
 
 #[test]
 fn a_racy_counter_is_not_linearizable() {
-    let report = finding(builder(), || {
+    let report = finding(&builder(), || {
         let n = Arc::new(AtomicU32::new(0));
         let history = Arc::new(History::<Counter>::new());
         let bump = |n: &AtomicU32| {
@@ -816,7 +816,7 @@ impl Spec for Register {
 /// it, may read the old value (both orders of the two are allowed), so no execution is reported.
 #[test]
 fn a_history_orders_operations_by_happens_before_not_by_execution() {
-    let reads = outcomes(builder(), || {
+    let reads = outcomes(&builder(), || {
         let x = Arc::new(AtomicU32::new(0));
         let history = Arc::new(History::<Register>::new());
         let other = {
@@ -840,7 +840,7 @@ fn a_history_orders_operations_by_happens_before_not_by_execution() {
 /// seen by it: a register whose set writes elsewhere is a finding.
 #[test]
 fn a_history_orders_operations_across_threads_through_synchronization() {
-    let report = finding(builder(), || {
+    let report = finding(&builder(), || {
         let (x, lost) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
         let done = Arc::new(AtomicBool::new(false));
         let history = Arc::new(History::<Register>::new());
@@ -907,7 +907,7 @@ fn tracked_bytes_published_with_release_acquire_do_not_race() {
 
 #[test]
 fn tracked_bytes_read_past_what_was_published_race() {
-    let report = finding(builder(), || {
+    let report = finding(&builder(), || {
         let published = Arc::new(AtomicUsize::new(0));
         let writer = {
             let published = published.clone();
@@ -937,7 +937,7 @@ fn tracked_bytes_are_exact_to_the_byte() {
 
 #[test]
 fn a_free_not_ordered_after_a_read_is_a_use_after_reclaim() {
-    let report = finding(builder(), || {
+    let report = finding(&builder(), || {
         crate::cell::write(buffer(), 8);
         let reader = thread::spawn(|| crate::cell::read(buffer(), 8));
         crate::cell::free(buffer(), 8);
@@ -954,13 +954,13 @@ fn freed_bytes_can_not_be_read_but_can_be_allocated_again() {
         crate::cell::write(buffer(), 4);
         crate::cell::read(buffer(), 4);
     });
-    let report = finding(builder(), || {
+    let report = finding(&builder(), || {
         crate::cell::write(buffer(), 8);
         crate::cell::free(buffer(), 8);
         crate::cell::read(buffer().wrapping_add(4), 2);
     });
     assert!(report.contains("use after free"), "{report}");
-    let report = finding(builder(), || {
+    let report = finding(&builder(), || {
         crate::cell::write(buffer(), 8);
         crate::cell::free(buffer(), 8);
         crate::cell::free(buffer(), 8);

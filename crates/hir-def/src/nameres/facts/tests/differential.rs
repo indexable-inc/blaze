@@ -1,6 +1,7 @@
-//! The per-module resolver against the old collector on every fixture of the name resolution and
-//! macro expansion tests, with the builtin-derive fast path on and off, crate maps and the block
-//! maps of every body.
+//! Every fixture of the name resolution and macro expansion tests, with the builtin-derive fast
+//! path on and off: each crate's maintained map equals a fresh maintainer's and the per-module
+//! resolver's, and the map of every block of its bodies equals the block's map built again
+//! ([`super::compare_db`]).
 //!
 //! The fixtures are read out of the test files themselves (`include_str!`), not copied: every
 //! raw string literal of a file outside an `expect![...]` is a fixture, named by the file, the
@@ -13,7 +14,7 @@ use std::panic::{self, AssertUnwindSafe};
 use super::{Exempt, compare_fixture, fixture_db, with_fast_path};
 use crate::{
     ModuleDefId,
-    nameres::facts::tests::{CDef, CModule, new_crate_local_def_map},
+    nameres::facts::tests::{CDef, CModule, facts_crate_local_def_map},
     test_db::TestDBExt,
 };
 
@@ -97,9 +98,6 @@ fn check_files(files: &[(&str, &'static str)]) {
     let mut not_fixtures = Vec::new();
     for &(file, source) in files {
         for Fixture { name, text } in fixtures(file, source) {
-            if ORDER_DEPENDENT.iter().any(|it| it.name == name) {
-                continue;
-            }
             // `fixture::db` panics on text it can't read as a fixture; that literal is not one.
             let parses = panic::catch_unwind(|| drop(fixture_db(text))).is_ok();
             if !parses {
@@ -129,7 +127,7 @@ fn check_files(files: &[(&str, &'static str)]) {
         eprintln!("not fixtures ({}): {}", not_fixtures.len(), not_fixtures.join(", "));
     }
     assert!(compared > 0, "no fixture in {:?}", files.iter().map(|it| it.0).collect::<Vec<_>>());
-    assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
+    assert!(failures.is_empty(), "the def maps differ:\n{failures}");
 }
 
 macro_rules! sources {
@@ -153,7 +151,6 @@ pub(in crate::nameres) const NAMERES: &[(&str, &str)] = sources![
     "tests/trait_imports.rs",
     "tests/uses.rs",
     "tests/views.rs",
-    "tests/worklist.rs",
     "tests/prelude.rs",
     "tests/stale_ids.rs",
 ];
@@ -247,33 +244,15 @@ fn the_reader_finds_fixtures_and_skips_expectations() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Fixtures of the notes' §8: where the old collector's answer followed its schedule, on
-// programs rustc rejects or (the third) resolves as the new resolver does. Compared on
-// everything but what `exempt` names.
+// Fixtures of the notes' §8: programs whose answer a resolver could take from its schedule,
+// which rustc rejects or (the third) resolves one way. `delta::tests::DIFFERENCES` compares
+// the maps of each.
 
 pub(in crate::nameres) struct OrderDependent {
-    /// Our own name, or the name [`fixtures`] gives one of the test files' fixtures.
     pub(in crate::nameres) name: &'static str,
     /// What rustc (the pinned nightly) says of the program.
     pub(in crate::nameres) rustc: &'static str,
-    /// The text; empty for a fixture of the test files, which is read from there.
     pub(in crate::nameres) fixture: &'static str,
-    pub(in crate::nameres) exempt: Exempt,
-}
-
-impl OrderDependent {
-    pub(in crate::nameres) fn text(&self) -> &'static str {
-        if !self.fixture.is_empty() {
-            return self.fixture;
-        }
-        NAMERES
-            .iter()
-            .chain(MACRO_EXPANSION)
-            .flat_map(|&(file, source)| fixtures(file, source))
-            .find(|it| it.name == self.name)
-            .unwrap_or_else(|| panic!("no fixture `{}` in the test files", self.name))
-            .text
-    }
 }
 
 pub(in crate::nameres) const ORDER_DEPENDENT: &[OrderDependent] = &[
@@ -287,7 +266,6 @@ use a::*;
 use b::*;
 pub use S as Exported;
 "#,
-        exempt: Exempt { names: &["S", "Exported"], unresolved_imports: false },
     },
     OrderDependent {
         name: "two_globs_through_a_cycle",
@@ -299,12 +277,11 @@ mod p { pub use crate::q::*; pub use crate::x::*; }
 mod q { pub use crate::p::*; pub use crate::y::*; }
 use p::T;
 "#,
-        exempt: Exempt { names: &["T"], unresolved_imports: false },
     },
     OrderDependent {
         name: "import_resolved_before_an_expansion_shadows_its_glob",
-        // The old collector binds `x`'s `T`, resolving the import before `foo` expands; the
-        // new resolver waits, as rustc does (`Unit::set_unexpanded`).
+        // An import resolved before `foo` expands would bind `x`'s `T`; the resolver waits, as
+        // rustc does (`Unit::set_unexpanded`).
         rustc: "accepted: `use foo::T` binds the `T` that `make_t!` expands in `foo`; the glob \
                 binding is undetermined while `foo` has unexpanded macros",
         fixture: r#"
@@ -320,7 +297,6 @@ use foo::T;
 #[macro_export]
 macro_rules! make_t { () => { pub struct T; } }
 "#,
-        exempt: Exempt { names: &["T"], unresolved_imports: false },
     },
     OrderDependent {
         name: "unresolved_attributes_in_two_modules",
@@ -340,21 +316,10 @@ mod b {
 use a::BB;
 use b::AA;
 "#,
-        exempt: Exempt { names: &[], unresolved_imports: true },
     },
 ];
 
-#[test]
-fn order_dependent_fixtures_agree_on_everything_else() {
-    let mut failures = String::new();
-    for it in ORDER_DEPENDENT {
-        assert!(!it.rustc.is_empty(), "{}: say what rustc says of it", it.name);
-        compare_fixture(it.name, it.text(), &it.exempt, &mut failures);
-    }
-    assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
-}
-
-/// Of two globs bringing one name into a module, the new resolver keeps the first by position
+/// Of two globs bringing one name into a module, the resolver keeps the first by position
 /// (the notes' §8: component order, then module order, then position).
 #[test]
 fn two_globs_keep_the_first_by_position() {
@@ -363,7 +328,7 @@ fn two_globs_keep_the_first_by_position() {
         with_fast_path(on, || {
             let db = fixture_db(fixture);
             let krate = db.fetch_test_crate();
-            let map = new_crate_local_def_map(&db, krate).def_map(&db);
+            let map = facts_crate_local_def_map(&db, krate).def_map(&db);
             let p = super::Projector::new(&db, map);
             let s = hir_expand::name::Name::new_symbol_root(intern::Symbol::intern("S"));
             let (def, _) = map.module(&db, map.root).scope(&db).type_(&s).expect("`S` is in scope");
@@ -456,6 +421,40 @@ crate::late!();
 mod user { crate::late!(); }
 "#,
     ),
+    // The import fixed points of the deleted `nameres/tests/worklist.rs`.
+    (
+        "a_glob_cycle_reaches_the_same_fixed_point",
+        r#"
+pub mod a { pub use super::b::*; pub struct A; }
+pub mod b { pub use super::c::*; pub struct B; }
+pub mod c { pub use super::a::*; pub struct C; pub use super::d::D; }
+pub mod d { pub use super::a::*; pub struct D; }
+use a::{A, B, C, D};
+"#,
+    ),
+    (
+        "an_import_shadowing_a_glob_reaches_the_same_fixed_point",
+        r#"
+mod x { pub struct T; pub mod inner { pub struct U; } }
+mod y { pub mod inner { pub struct V; } }
+use x::*;
+use y::inner;
+use inner::V;
+pub use self::later::*;
+mod later { pub use crate::y::inner as T; }
+"#,
+    ),
+    (
+        "an_enum_reached_through_a_renamed_import_waits_on_its_declaration",
+        r#"
+mod m {
+    pub(crate) enum E { A, B }
+    pub use self::E as R;
+}
+use m::R::A;
+use m::R::*;
+"#,
+    ),
     (
         "blocks_with_items_and_imports",
         r#"
@@ -474,10 +473,10 @@ fn outer() {
 ];
 
 /// A `#[derive]` in a crate whose `#[prelude_import]` is a module of its own, as minicore's
-/// `core` has it: `fmt` has a module named `derive` too, which `fmt::rt` globs. The old
-/// collector and the maintained map resolve these derives through the prelude, and
-/// `facts::collect_crate` left them unresolved in round 15's derive fixtures: one variant
-/// without the module, one with it, one through the glob, to tell which part it misses.
+/// `core` has it: `fmt` has a module named `derive` too, which `fmt::rt` globs. The maintained
+/// map resolves these derives through the prelude, and `facts::collect_crate` once left them
+/// unresolved (round 15's derive fixtures): one variant without the module, one with it, one
+/// through the glob, to tell which part it misses.
 #[test]
 fn a_derive_through_the_crates_own_prelude() {
     let crate_ = |fmt: &str| {
@@ -507,14 +506,14 @@ pub mod fmt {{
     for (name, fixture) in &variants {
         compare_fixture(name, fixture, &Exempt::NONE, &mut failures);
     }
-    assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
+    assert!(failures.is_empty(), "the def maps differ:\n{failures}");
 }
 
 /// Two globs bring `T` into `crate::a::b::a`, `use super::*` as `pub(in crate::a::b)` and
 /// `use crate::*` privately. Whichever arrives first, the more visible one binds it, as rustc's
-/// `try_define` keeps, and `T` is never also unresolved: the old collector and the new one
-/// widened the first glob's visibility in place, so the binding named whichever glob came first,
-/// and the old one then listed `T` as unresolved (generated_crates_agree, case 154).
+/// `try_define` keeps, and `T` is never also unresolved: widening the first glob's visibility
+/// in place named whichever glob came first, and once listed `T` as unresolved too
+/// (generated_crates_agree, case 154).
 #[test]
 fn a_wider_glob_of_the_same_item_binds_it() {
     let crate_ = |globs: &str| {
@@ -534,7 +533,7 @@ fn a_wider_glob_of_the_same_item_binds_it() {
             with_fast_path(on, || {
                 let db = fixture_db(fixture);
                 let krate = db.fetch_test_crate();
-                let map = new_crate_local_def_map(&db, krate).def_map(&db);
+                let map = facts_crate_local_def_map(&db, krate).def_map(&db);
                 let child = |module, it: &str| match map.module(&db, module).scope(&db).type_(&name(it)) {
                     Some((ModuleDefId::ModuleId(it), _)) => it,
                     other => panic!("{variant}: `{it}` is {other:?}"),
@@ -559,7 +558,7 @@ fn a_wider_glob_of_the_same_item_binds_it() {
             });
         }
     }
-    assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
+    assert!(failures.is_empty(), "the def maps differ:\n{failures}");
 }
 
 /// `reexport_2` globs `reexport_1` twice, privately then `pub`, before `reexport_1` has
@@ -576,7 +575,7 @@ fn a_name_reaching_two_globs_of_one_module_later_is_credited_to_the_wider() {
         with_fast_path(on, || {
             let db = fixture_db(fixture);
             let krate = db.fetch_test_crate();
-            let map = new_crate_local_def_map(&db, krate).def_map(&db);
+            let map = facts_crate_local_def_map(&db, krate).def_map(&db);
             let reexport_2 = match map.module(&db, map.root).scope(&db).type_(&name("reexport_2")) {
                 Some((ModuleDefId::ModuleId(it), _)) => it,
                 other => panic!("`reexport_2` is {other:?}"),
@@ -591,7 +590,7 @@ fn a_name_reaching_two_globs_of_one_module_later_is_credited_to_the_wider() {
             assert!(text.starts_with("pub use"), "fast path {on}: `Placeholder` is credited to `{text}`");
         });
     }
-    assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
+    assert!(failures.is_empty(), "the def maps differ:\n{failures}");
 }
 
 /// `m` globs `a` and `b`, both giving `b::X` as `pub`; `b` has it before `a`'s re-export
@@ -617,7 +616,7 @@ fn of_two_globs_as_wide_giving_one_item_the_first_in_the_source_binds_it() {
             with_fast_path(on, || {
                 let db = fixture_db(fixture);
                 let krate = db.fetch_test_crate();
-                let map = new_crate_local_def_map(&db, krate).def_map(&db);
+                let map = facts_crate_local_def_map(&db, krate).def_map(&db);
                 let m = match map.module(&db, map.root).scope(&db).type_(&name("m")) {
                     Some((ModuleDefId::ModuleId(it), _)) => it,
                     other => panic!("{variant}: `m` is {other:?}"),
@@ -633,7 +632,7 @@ fn of_two_globs_as_wide_giving_one_item_the_first_in_the_source_binds_it() {
             });
         }
     }
-    assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
+    assert!(failures.is_empty(), "the def maps differ:\n{failures}");
 }
 
 /// `crate::a::e::a` takes `a::e`'s private `T` through `pub use super::*` after the root has
@@ -650,7 +649,7 @@ fn a_glob_passes_on_no_name_its_importer_cannot_see() {
         with_fast_path(on, || {
             let db = fixture_db(fixture);
             let krate = db.fetch_test_crate();
-            let map = new_crate_local_def_map(&db, krate).def_map(&db);
+            let map = facts_crate_local_def_map(&db, krate).def_map(&db);
             let root = map.module(&db, map.root).scope(&db);
             let a = match root.type_(&name("a")) {
                 Some((ModuleDefId::ModuleId(it), _)) => it,
@@ -666,7 +665,7 @@ fn a_glob_passes_on_no_name_its_importer_cannot_see() {
             assert_eq!(ambiguous, 0, "fast path {on}: the root's `T` is ambiguous: {:?}", root.glob_ambiguities());
         });
     }
-    assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
+    assert!(failures.is_empty(), "the def maps differ:\n{failures}");
 }
 
 #[test]
@@ -675,5 +674,5 @@ fn own_fixtures() {
     for &(name, fixture) in OWN {
         compare_fixture(name, fixture, &Exempt::NONE, &mut failures);
     }
-    assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
+    assert!(failures.is_empty(), "the def maps differ:\n{failures}");
 }

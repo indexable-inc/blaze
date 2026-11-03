@@ -186,6 +186,7 @@ impl Lint {
 }
 
 /// rustc's `AssertKind` as the lint labels it, each value known or `_`.
+#[derive(Clone, Copy)]
 enum Panic {
     BoundsCheck { len: Option<Scalar>, index: Option<Scalar> },
     Shl(Option<Scalar>),

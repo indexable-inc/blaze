@@ -343,7 +343,7 @@ pub(crate) fn print_resolved(
     // an earlier tree's warnings.
     let trees = feature_resolves(input)?
         .into_iter()
-        .map(|(specs, members)| resolve_tree(input, opts, &targets, &requested_kinds, specs, members));
+        .map(|(specs, members)| resolve_tree(input, opts, &targets, &requested_kinds, specs, &members));
     print_trees(input, opts, kinds, trees, out, warn)
 }
 
@@ -355,7 +355,7 @@ pub(crate) fn resolve_trees<'a>(input: &Input<'a>, opts: &Options, kinds: &Kinds
     let targets = Targets { packages: input.packages, kinds };
     feature_resolves(input)?
         .into_iter()
-        .map(|(specs, members)| resolve_tree(input, opts, &targets, &requested_kinds, specs, members))
+        .map(|(specs, members)| resolve_tree(input, opts, &targets, &requested_kinds, specs, &members))
         .collect()
 }
 
@@ -366,7 +366,7 @@ fn resolve_tree<'a>(
     targets: &Targets<'_>,
     requested_kinds: &[CompileKind],
     specs: Vec<PackageIdSpec>,
-    feature_members: Vec<(&'a Summary, CliFeatures)>,
+    feature_members: &[(&'a Summary, CliFeatures)],
 ) -> Result<Resolved<'a>> {
     let has_dev = match opts.edge_kinds.contains(&EdgeKind::Dep(DepKind::Development)) {
         true => HasDevUnits::Yes,
@@ -377,7 +377,7 @@ fn resolve_tree<'a>(
         false => ForceAllTargets::No,
     };
     let feature_opts = FeatureOpts::new(input.behavior, has_dev, force_all);
-    let features = FeatureResolver::resolve(targets, input.resolve, &feature_members, requested_kinds, feature_opts)?;
+    let features = FeatureResolver::resolve(targets, input.resolve, feature_members, requested_kinds, feature_opts)?;
     let members = members_with_features(&input.members, &specs, input.cli_features)?;
     Ok(Resolved { specs, features, members })
 }

@@ -545,7 +545,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             }
             (I::TypeName, []) => {
                 let ty = generic_args.type_at(0);
-                if hir_ty_mir::mir::type_name::rustc_type_name(self.db(), ty).is_none() {
+                if hir_ty_print::rustc_type_name(self.db(), ty).is_none() {
                     // alloc: the error's message
                     return Err(unsupported(format!("`type_name` of `{ty:?}`")));
                 }

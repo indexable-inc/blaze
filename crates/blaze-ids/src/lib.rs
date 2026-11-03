@@ -10,7 +10,8 @@
 //! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/lanes/items.md
 //!   section 6.2).
 
-#![feature(allocator_api, allocator_ext, portable_simd)]
+#![feature(allocator_api, allocator_ext, portable_simd, register_tool)]
+#![register_tool(blaze)]
 #![deny(unsafe_code)]
 
 use std::{fmt, hash, marker::PhantomData};
@@ -114,6 +115,22 @@ impl fmt::LowerHex for ContentId {
 /// [`Idx`] can't be hashed but by spelling out [`Idx::raw`], which a reviewer sees.
 pub struct Hasher(b3::Hasher);
 
+/// The [`blaze_hash::SipKey`] an image's index of `values` (in the order the image keeps them)
+/// is laid out by: the first 16 bytes of their BLAKE3 in `domain`, each value's length before
+/// it. A function of the values alone, so the same values give the same image (AGENTS.md rule
+/// 22); and unknown until they are all chosen, so none can be chosen to collide under it. Every
+/// persisted index of keys an attacker may pick (the interner's, the VFS's names) takes its
+/// key here, each in a domain of its own.
+pub fn index_key<'a>(domain: &'static str, values: impl IntoIterator<Item = &'a [u8]>) -> blaze_hash::SipKey {
+    let mut hasher = Hasher::new(domain);
+    for value in values {
+        hasher.update(&(value.len() as u64).to_le_bytes()).update(value);
+    }
+    let id = hasher.finish();
+    let word = |at: usize| u64::from_le_bytes(id.0[at..at + 8].try_into().expect("8 bytes of a content ID"));
+    blaze_hash::SipKey::new(word(0), word(8))
+}
+
 /// A hash domain whose BLAKE3 context key is derived once, on first use: what a domain hashed
 /// millions of times is declared as (`pub static KEY: Domain = Domain::new("blaze v2 key 1")`).
 pub struct Domain {
@@ -156,6 +173,7 @@ fn home(name: &str) -> usize {
 }
 
 /// [`b3::context_key`]`(domain)`, derived once per name.
+#[blaze::pure(trusted = "DOMAIN_KEYS memoizes b3::context_key of the domain's text: a slot once set never changes, and a lookup compares the text, so the key is the text's whatever the table holds")]
 fn context_key(domain: &'static str) -> &'static ContextKey {
     context_key_in(&DOMAIN_KEYS, domain)
 }

@@ -75,7 +75,7 @@ a build first needs it.
     blaze build [cargo's flags]                                       (b)
     blaze check [cargo's flags] [--fix [--lint NAME]...]               (c)
     blaze check [cargo's flags] --replace FROM=TO [--replace FROM=TO ...]
-    blaze check [cargo's flags] --baselines DIR [--bless-baselines] [--new-baseline LINT[,LINT...]]
+    blaze check --workspace --target TRIPLE --baselines DIR [--bless-baselines] [--new-baseline LINT[,LINT...]]
     blaze run   [cargo's flags] [-- program arguments]                (r)
     blaze test  [cargo's flags] [TESTNAME] [-- test arguments]        (t)
     blaze bench [cargo's flags] [BENCHNAME] [-- bench arguments]
@@ -185,7 +185,13 @@ blaze's load does not build, saying what: an artifact dependency (`-Z bindeps`),
 `metabuild`, a target spec file, a target blaze has no data of, and a rustc `-Z` flag in
 `RUSTFLAGS` that `crates/blaze-cargo/src/unstable.rs` refuses.
 
-Under `--keep-going` a failed unit stops only what needs it. A unit that is only checked
+blaze keeps going by default, so one run shows every error (`blaze build`, `check`, `test`,
+`bench`, `run` and `doc` alike; cargo stops at the first failure). `--fail-fast` stops at the
+first failure, as cargo does: the first unit that fails ends the build, and the units after it
+are named as skipped. `--keep-going` and `test`'s `--no-fail-fast` are accepted and change
+nothing. The exit status is non-zero whenever anything failed.
+
+Unless `--fail-fast`, a failed unit stops only what needs it. A unit that is only checked
 (`blaze check`, or a library a check reaches) and failed only in its functions' bodies or in
 lints, its items (signatures, types, impls) sound, fails open: it stays failed, nothing is
 built or linked from it, and the units that depend on it are still checked against its items,
@@ -234,7 +240,12 @@ them.
 `run` then becomes the program and `test` runs the test executables the client was told of, as
 cargo's `ops::run_tests` does (`crates/blaze-cargo/src/cli/test.rs`): in cargo's order, on the
 terminal, with the variables and working directory cargo gives, cargo's `Running` lines, then
-the doc tests, stopping at the first that fails unless `--no-fail-fast`; `--no-run` lists them.
+the doc tests; `--no-run` lists them. By default blaze builds every unit it can, runs every
+test executable and doc test that built whichever failed, and ends listing the targets that
+failed (with what reruns each), then each test executable or doc test that never built and the
+failure that held it back: its own compile's, or the unit it was skipped behind
+(`blaze_api::Unchecked::tests`). The exit status is then 101. `--fail-fast` stops at the first
+test executable that fails, with its exit code, as cargo does without `--no-fail-fast`.
 That runs every test, outside any sandbox, as cargo does. blaze's `--reached` runs only the
 tests an edit can have changed, in the daemon, and `--ub` runs them in blaze's evaluator
 ([below](#which-tests-run)). Doc tests are blaze's own build of each example (below).
@@ -701,9 +712,8 @@ rustdoc's rules and makes each its own crate, program and process, never merged;
 program is a libtest runner that runs each under rustdoc's name and judges it as rustdoc
 does. The examples are built side by side, an edit of one example rebuilds and relinks that
 one alone, and a `test_harness` example is built as a test under its own libtest harness, as
-rustdoc's `--test` builds it. A unit blaze can't build fails alone: under
-`--keep-going`, which `blaze test` and `blaze bench` take (cargo refuses it there), every
-other unit's tests still run. The design and what is left are in [v2/plan/doctests.md](v2/plan/doctests.md).
+rustdoc's `--test` builds it. A unit blaze can't build fails alone: unless
+`--fail-fast`, every other unit's tests still run, and the end names the doc tests it held back. The design and what is left are in [v2/plan/doctests.md](v2/plan/doctests.md).
 
 ## The daemon
 
@@ -900,7 +910,7 @@ the same release.
 ## How far a constant's evaluation may go
 
 Every evaluation of a constant, static, array length or other compile-time code has a budget
-of steps (basic blocks run, every one) and of memory (its stack and heap together),
+of steps (basic blocks run, as rustc counts them) and of memory (its stack and heap together),
 1 000 000 000 steps and 1 GiB unless the workspace's root `Cargo.toml` says otherwise:
 
     [workspace.metadata.blaze]
@@ -910,12 +920,8 @@ An evaluation that reaches either stops the build with what it ran out of, where
 the setting to raise, as in ``const eval of `TABLE` exceeded 1000000000 steps at
 src/lib.rs:12:9 (raise `const-eval.steps` under `[workspace.metadata.blaze]`)``. rustc's own
 limit is its `long_running_const_eval` lint, an error at 2 000 000 steps unless the lint is
-allowed (then it only warns, and runs on). blaze fires that lint where rustc does: its steps are
-only the runs of blocks that end in a call or close a loop (rustc's `CtfeLimit` pass), so a
-constant that loops over a few hundred thousand bytes a few times is under it. The budget
-counts every block, 500 times the lint's count, so it ends a loop that never would rather than
-refusing code rustc takes. Each evaluation's `const eval` span in the profile records both
-counts, `blocks` and `steps`.
+allowed (then it only warns, and runs on); the default here is 500 times that, so the budget
+ends a loop that never would rather than refusing code rustc takes.
 
 ## Environment variables
 
@@ -1099,11 +1105,37 @@ its check, with `--cfg clippy` and the `clippy.toml` clippy's search finds; a re
 checked, not linted. `--fix` makes every machine-applicable suggestion of the check (with
 `--lint NAME`, given any number of times, only those of the lints named), checks the result
 again up to four times, and writes the files only when no check of it has an error the first
-did not; `--fix` checks every target when none is named. `--baselines DIR` holds the run's lint
-counts to the baselines checked in under `DIR`, `--bless-baselines` lowers them to the run's,
-and `--new-baseline LINT[,LINT...]` starts a lint's at the run's
-([lints.md](v2/plan/lanes/lints.md#blaze-check-lints)). A baseline holds a lint at `warn`: a
-`deny` lint's finding fails the check, baselined or not.
+did not; `--fix` checks every target when none is named.
+
+`--baselines DIR` holds the run's `clippy::` and `blaze::` findings, counted by lint and crate
+(the package of the unit that gave each; a finding a crate's lib and its lib test both give
+counts once), to the baselines checked in under `DIR`: one file per lint,
+`<tool>.<lint>.txt`, with one `crate<TAB>count` line per package that has findings, sorted, and
+a `TARGET` file naming the target triple the counts are of: cfg'd code differs, so a run for
+another target is refused. It needs `--workspace`, one `--target` and no target selection (each
+package's default targets), since a crate or target the run did not check would read as at
+zero.
+The run fails when a crate's count is over its baseline, when a crate the baseline does not
+have has findings, or when a lint has findings and no baseline; and it fails when a count is
+under its baseline, saying to run the same command again with `--bless-baselines`, which lowers
+the baselines to the run's (it never raises one or adds a crate) and deletes one that reaches
+empty, whose lint then moves to `deny`. `--new-baseline LINT[,LINT...]` starts a lint's
+baseline at the run's counts, refusing a lint with no findings or one that has a baseline. A
+baseline holds a lint at `warn`: a `deny` lint's finding fails the check, baselined or not.
+
+blaze's own baselines go in crates/blaze-lints/baselines, of `aarch64-unknown-linux-gnu`
+(AGENTS.md rule fix-through-blaze-lints), and the merge gate's `lint-baselines` job holds every
+change to them with the blaze the change builds, on Linux AArch64. Run the same command in an
+arm64 Linux VM (`ix new` gives one by default) to check or bless them; another host's check
+needs that target's C compiler and LLVM for the build scripts, so it is not the same run:
+
+    blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines
+
+Tests are not counted yet: blaze's check of a test target fails for now ("can't find crate for
+`test`"), and once it passes the scope grows to every target and the baselines are made again.
+None is made yet: blaze cannot yet finish this check of its own workspace (see
+[the lints plan](v2/plan/lanes/lints.md#baselines)), so `lint-baselines` fails until a run does
+and the first baselines are made with `--new-baseline`.
 
 A record of v1 (as of 2026-10-27). v1's `blaze clippy` linted with
 blaze's own lints, `crates/blaze-lints`:

@@ -350,7 +350,6 @@ fn place(class: &Class) -> (Segment, u8) {
         Class::Patch => (Segment::Text, 1),
         Class::Stubs => (Segment::Text, 2),
         Class::Plt => (Segment::Text, 3),
-        Class::Veneers => (Segment::Text, 4),
         Class::Named { name, .. } => match Segment::of(split(name).0) {
             Some(Segment::Text) => (Segment::Text, 5),
             Some(Segment::DataConst) => (Segment::DataConst, 4),
@@ -390,7 +389,6 @@ fn section_of(class: &Class) -> (Segment, &str, u32) {
         Class::Patch => ("__blaze_patch", code),
         Class::Stubs => ("__blaze_stubs", code),
         Class::Plt => ("__stubs", code),
-        Class::Veneers => ("__blaze_veneers", code),
         Class::Rodata => ("__const", macho::S_REGULAR.to_flags().0),
         Class::Synthetic(name) => (*name, macho::S_REGULAR.to_flags().0),
         Class::EhFrame => (

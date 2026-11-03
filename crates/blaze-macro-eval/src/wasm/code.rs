@@ -120,7 +120,7 @@ impl Codes {
             let guard = blaze_cas::enter();
             if let Some(code) = local(store, &guard, &key)? {
                 let len = code.0.len() as u64;
-                let module = deserialize(engines, code)?;
+                let module = deserialize(engines, &code)?;
                 // clone: as above
                 self.memo.pin().insert(id, module.clone());
                 return Ok((Loaded { module, put: None }, ModuleFrom::Store, Some(len)));
@@ -159,7 +159,7 @@ fn local<'g>(store: &'g Reader, guard: &'g Guard, key: &Key) -> Result<Option<Lo
 
 /// `code`, machine code `Module::serialize` made for this engine, as a module.
 #[allow(unsafe_code)]
-fn deserialize(engines: &Engines, code: Local<'_>) -> Result<Module, LoadError> {
+fn deserialize(engines: &Engines, code: &Local<'_>) -> Result<Module, LoadError> {
     // SAFETY: `Module::deserialize` runs what it is given as machine code, checking only the
     // engine's version and settings. `code` is a `Local`, which only `local` makes: a
     // `Kind::Machine` in the daemon's own store directory, verified against its content hash

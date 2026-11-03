@@ -358,9 +358,10 @@ impl<'db> Lints<'_, '_, 'db> {
     fn predicate(&mut self, file: HirFileId, predicate: ast::CfgPredicate<'_>, anchor: &Anchor<'db>) {
         let mut checks = std::mem::take(&mut self.checks);
         ast_checks(predicate, &mut checks);
-        for check in checks.drain(..) {
+        for check in &checks {
             self.lint(file, check, anchor);
         }
+        checks.clear();
         self.checks = checks;
     }
 
@@ -397,18 +398,18 @@ impl<'db> Lints<'_, '_, 'db> {
                 break;
             }
         }
-        for check in checks {
+        for check in &checks {
             self.lint(anchor.file, check, &anchor);
         }
     }
 
     /// rustc's `parse_name_value` once the name and value are read: the lint, if the cfg is
     /// not expected.
-    fn lint(&mut self, file: HirFileId, check: Check, anchor: &Anchor<'db>) {
+    fn lint(&mut self, file: HirFileId, check: &Check, anchor: &Anchor<'db>) {
         let value = check.value.as_ref().map(|(it, _)| it.as_str());
         let mut diag = match self.expected.get(check.name.as_str()) {
-            Some(Some(values)) if !values.contains(value) => self.value_diag(file, &check),
-            None if self.expected.exhaustive_names => self.name_diag(file, &check),
+            Some(Some(values)) if !values.contains(value) => self.value_diag(file, check),
+            None if self.expected.exhaustive_names => self.name_diag(file, check),
             _ => return,
         };
         let at = self.at(anchor);

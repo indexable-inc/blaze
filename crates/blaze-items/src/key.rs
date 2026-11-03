@@ -567,15 +567,23 @@ pub fn variant_key(db: &Db, variant: EnumVariantId) -> ItemKey {
     match find(enum_variant_keys(db, loc.parent), variant) {
         Some(key) => key,
         None => {
-            let (parent, hash) = hashed(|b| variant_preimage(db, loc.parent, &loc.name, b));
+            let (parent, hash) = hashed(|b| variant_preimage(db, loc.parent, &loc.name, variant, b));
             under(&parent, false, hash)
         }
     }
 }
 
-fn variant_preimage(db: &Db, parent: EnumId, name: &Name, b: &mut Bytes) -> ItemKey {
+fn variant_preimage(db: &Db, parent: EnumId, name: &Name, variant: EnumVariantId, b: &mut Bytes) -> ItemKey {
     let parent = item_key(db, ItemId::Adt(parent.into()));
     b.id(&parent.0).part(b"variant").part(name.as_str().as_bytes());
+    // A variant a `macro` names is keyed by its context (`hir_def::nameres::def_site::
+    // variant_name`) and may share its text with one the `macro` is handed: where it is written
+    // tells the two apart. The context's id is this process's, so it is not hashed.
+    if name.key().is_some() {
+        let loc = variant.lookup(db);
+        b.part(b"keyed");
+        written(db, b, loc.id.file_id, loc.id.value.erase());
+    }
     parent
 }
 
@@ -584,7 +592,7 @@ fn enum_variant_keys(db: &Db, enum_: EnumId) -> Vec<(EnumVariantId, ItemKey)> {
     let variants = &enum_.enum_variants(db).variants;
     let mut batch = Batch::with_capacity(variants.len());
     for (name, &(variant, _)) in variants.iter() {
-        batch.push(variant, |b| variant_preimage(db, enum_, name, b));
+        batch.push(variant, |b| variant_preimage(db, enum_, name, variant, b));
     }
     batch.finish()
 }
@@ -995,14 +1003,14 @@ fn bucket(order: u64, bits: u32) -> usize {
 /// Stops with `error`: an index that cannot have its memory stops the build, naming it.
 #[cold]
 #[track_caller]
-fn stop(what: &str, error: MemError) -> ! {
+fn stop(what: &str, error: &MemError) -> ! {
     panic!("blaze-items: {what}: {error}")
 }
 
 /// An empty column of an index's rows, `MAX_KEYS` of them reserved.
 #[track_caller]
 pub(crate) fn key_rows<T>(what: &str) -> RegionVec<T> {
-    RegionVec::new(MAX_KEYS, Tag::Other).unwrap_or_else(|error| stop(what, error))
+    RegionVec::new(MAX_KEYS, Tag::Other).unwrap_or_else(|error| stop(what, &error))
 }
 
 /// Sorts `rows` by order then key and drops repeats in place, returning how many are left.
@@ -1246,7 +1254,7 @@ fn crate_inner_items(db: &Db, krate: Crate) -> KeyIndex<Resolved> {
     let mut rows = key_rows(WHAT);
     for &inner in crate_items(db, krate).inner.iter() {
         if let Err(error) = rows.try_extend_from_slice(inner_items(db, inner, ())) {
-            stop(WHAT, error)
+            stop(WHAT, &error)
         }
     }
     KeyIndex::new(rows)
@@ -1294,13 +1302,13 @@ const CRATE_STORES: &str = "a crate's list of stores";
 impl Sink for CrateRows {
     fn add(&mut self, key: ItemKey, resolved: Resolved) {
         if let Err(error) = self.rows.try_push((key, resolved)) {
-            stop(CRATE_KEYS, error)
+            stop(CRATE_KEYS, &error)
         }
     }
 
     fn inner(&mut self, inner: Inner) {
         if let Err(error) = self.inner.try_push(inner) {
-            stop(CRATE_STORES, error)
+            stop(CRATE_STORES, &error)
         }
     }
 }

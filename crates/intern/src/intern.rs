@@ -14,13 +14,13 @@
 
 use std::{
     fmt::{self, Debug, Display},
-    hash::{BuildHasher, Hash, Hasher},
+    hash::{Hash, Hasher},
     marker::PhantomData,
     ops::Deref,
     ptr,
 };
 
-use blaze_hash::FixedState;
+use blaze_hash::LazyKey;
 use std::alloc::Global;
 
 use crate::{
@@ -59,8 +59,9 @@ impl<T: Internable> Interned<T> {
 /// The one copy of `obj` in `T::storage()`, interning it if it is not there.
 #[inline]
 fn intern<T: Internable>(obj: T) -> &'static T {
-    let hash = FixedState.hash_one(&obj);
-    T::storage().get().intern(hash, obj)
+    let storage = T::storage();
+    let hash = storage.key.get().hash_one(&obj);
+    storage.get().intern(hash, obj)
 }
 
 impl<T: Internable> Clone for Interned<T> {
@@ -197,6 +198,11 @@ impl<T: Display> Display for InternedRef<'_, T> {
 
 pub struct InternStorage<T: ?Sized> {
     store: OnceLock<Values<T>>,
+    /// The key each value is placed by, drawn at random on first use: a value holds what a
+    /// source picks (a debugger type's sizes and discriminants, a path's names), so a hash
+    /// anyone can compute would let a source pick thousands with one hash, each intern then
+    /// walking them all.
+    key: LazyKey,
 }
 
 #[allow(
@@ -205,7 +211,7 @@ pub struct InternStorage<T: ?Sized> {
 )]
 impl<T: ?Sized> InternStorage<T> {
     pub const fn new() -> Self {
-        Self { store: OnceLock::new() }
+        Self { store: OnceLock::new(), key: LazyKey::new() }
     }
 }
 

@@ -1841,7 +1841,7 @@ fn a_line_is_read_from_the_location_where_it_is_written() {
                 .filter_map(|it| match it {
                     DataRequest::Location(Some((owner, span))) => {
                         let place =
-                            *hir_ty_mir::mir::location::source_location_in_file(db, *owner, *span);
+                            hir_ty_mir::mir::location::source_location_in_file(db, *owner, *span);
                         Some(place.expect("a place").1)
                     }
                     _ => None,
@@ -2669,7 +2669,7 @@ pub fn spin(n: u32) -> u32 {
 /// same code every time; with fuel off it names no fuel symbol and is the same code every
 /// time too. That off leaves every key as it was is `Spec::settings`' construction (fuel is
 /// hashed only when on, `blaze_codegen::settings`).
-fn fuel_meters_a_loop_at(spec: Spec) {
+fn fuel_meters_a_loop_at(spec: &Spec) {
     use blaze_codegen::backend::Prepare;
     let (db, frontend) = frontend(SPIN);
     let root = frontend.root(function(&db, "spin"));
@@ -2697,8 +2697,8 @@ fn fuel_meters_a_loop_at(spec: Spec) {
         names
     };
     let on = Spec { fuel: true, ..spec.clone() };
-    assert_ne!(unit(&spec).instance.key(), unit(&on).instance.key(), "fuel is in the unit's key");
-    let ((off_shape, off), (_, again)) = (emit(&spec), emit(&spec));
+    assert_ne!(unit(spec).instance.key(), unit(&on).instance.key(), "fuel is in the unit's key");
+    let ((off_shape, off), (_, again)) = (emit(spec), emit(spec));
     assert_eq!(off.function.code, again.function.code, "unmetered code is the same every time");
     assert!(fuel(&off).is_empty() && off.extra.is_empty(), "unmetered code calls no fuel runtime");
     let ((on_shape, metered), (_, again)) = (emit(&on), emit(&on));
@@ -2713,7 +2713,7 @@ fn fuel_meters_a_loop_at(spec: Spec) {
 
 #[test]
 fn fuel_meters_a_loop() {
-    fuel_meters_a_loop_at(spec());
+    fuel_meters_a_loop_at(&spec());
 }
 
 #[cfg(feature = "llvm")]
@@ -2721,7 +2721,7 @@ fn fuel_meters_a_loop() {
 fn fuel_meters_a_loop_in_llvm() {
     let base = spec();
     let toolchain = Toolchain { llvm: Some("test".to_owned()), ..base.toolchain.clone() };
-    fuel_meters_a_loop_at(Spec { toolchain, backend: Backend::Llvm { opt: 0 }, ..base });
+    fuel_meters_a_loop_at(&Spec { toolchain, backend: Backend::Llvm { opt: 0 }, ..base });
 }
 
 /// What `name` builds or the error it stops with, and a failure message's description.

@@ -83,6 +83,15 @@ pub struct Lower<'a, T> {
     pub host_cpu: Option<&'a HostCpu>,
 }
 
+// A view of references, copied whatever `T` is: a derive would ask `T: Copy`.
+impl<T> Clone for Lower<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Lower<'_, T> {}
+
 /// The part of `now` a front end lowered from `kept` (with the same units) would read
 /// differently, by name; `None` when [`Lowered::refresh`] can move it to `now`. A front end
 /// reads the mounts, the host, the library's and the stores' paths and the checkout's root. It
@@ -819,7 +828,7 @@ impl Lowered {
         let crates = self.crates.clone();
         let (lowering, cfgs) = checked(&crates, run, ran)?;
         let trigger = Trigger::of("a build script's run applied", &lowering.what);
-        self.batch(trigger, |this| this.apply_run(run, ran, &crates, lowering, cfgs))
+        self.batch(trigger, |this| this.apply_run(run, ran, &crates, lowering, &cfgs))
     }
 
     /// [`Lowered::ran`]'s writes, in its batch: `run` checked against `crates`, its unit
@@ -830,7 +839,7 @@ impl Lowered {
         ran: &Ran,
         crates: &Crates,
         lowering: &Lowering,
-        cfgs: Vec<CfgAtom>,
+        cfgs: &[CfgAtom],
     ) -> Result<(), LowerError> {
         let out_dir = &ran.out_dir;
         let mut loaded = Vec::with_capacity(ran.files.len());
@@ -848,7 +857,7 @@ impl Lowered {
             let Some(krate) = crates.units[dependent].krate else { continue };
             let runs = &mut self.applied[dependent];
             runs.retain(|(it, _)| *it != run);
-            let applying = Applied { cfgs: cfgs.clone(), env: ran.env.clone(), out_dir: out_dir.clone() };
+            let applying = Applied { cfgs: cfgs.to_vec(), env: ran.env.clone(), out_dir: out_dir.clone() };
             runs.push((run, applying));
             radix::sort_by_key(runs, |(it, _)| *it as u64);
             let base = &crates.units[dependent];
@@ -912,7 +921,6 @@ impl Lowered {
             return Ok(false);
         }
         self.identities.clear();
-        self.db.admit_parses();
         // One change: the view's files, the seeds and the const macros they list, one batch.
         self.batch(Trigger::named("the view moved"), |this| this.refresh_writes(&tree, root, seed))?;
         // A crate of the macro host whose root now links `proc_macro` or no longer does is
@@ -1035,8 +1043,10 @@ impl Lowered {
     /// before whose key a later write moved (a run applied again with other cfgs, env or
     /// `OUT_DIR` files, a proc macro built into other code) is fetched again under its new key,
     /// and loses its image when there is none, so its caller serves again after every such
-    /// write. An image that does not read is an error naming its crate. A write, as
-    /// [`Lowered::ran`] is.
+    /// write. A write that moves its files (an `OUT_DIR` file a run left, an edit) has taken
+    /// the image away already, in that write, as it has of every served crate depending on it
+    /// (`hir_def::deps`' implied write). An image that does not read is an error naming its
+    /// crate. A write, as [`Lowered::ran`] is.
     pub fn serve_deps(
         &mut self,
         crates: &[Crate],
@@ -1154,7 +1164,7 @@ fn tables(db: &mut Db) -> Vec<(&'static str, u64, u64)> {
     // alloc: a report, off any build's path
     let mut usage = Vec::new();
     db.storage().memory_usage(&mut usage);
-    usage.into_iter().map(|it| (it.name, it.rows, it.row_bytes + it.value_bytes)).collect()
+    usage.into_iter().map(|it| (it.name, it.rows, it.held())).collect()
 }
 
 /// `change` of source root `set` made in `paths` too.

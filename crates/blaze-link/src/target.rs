@@ -741,6 +741,13 @@ impl Key {
     fn var(&self, at: usize) -> Option<&str> {
         self.vars[at].as_deref()
     }
+
+    /// The variable `name` of [`Target::vars`]; `None` where it is unset or the target reads
+    /// no such variable.
+    fn named(&self, name: &str) -> Option<&str> {
+        let at = self.target.vars().iter().position(|it| *it == name)?;
+        self.var(at)
+    }
 }
 
 /// The default libraries each member of a PE archive asks for, as `(member, library)`
@@ -848,6 +855,10 @@ struct Found {
     sdk: u32,
     /// Mach-O: the SDK, which ld64's `-syslibroot` reroots an install name under.
     root: Option<PathBuf>,
+    /// The `-L` directories of `NIX_LDFLAGS` the C driver does not pass its linker
+    /// ([`unpassed`]): never searched, as rustc's link through `cc` never searches them, and
+    /// named by a library's not-found error when one of them has it.
+    unpassed: Vec<PathBuf>,
 }
 
 impl Found {
@@ -975,7 +986,8 @@ fn linux<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
     };
     let (linker, _) = linker_dirs(ask, &cc, triple)?;
     dirs.retain(|it| !linker.contains(it));
-    Ok(Found { linker, dirs, objects, interpreter: Some(interpreter), ..Found::default() })
+    let unpassed = unpassed(key.named("NIX_LDFLAGS"), &linker);
+    Ok(Found { linker, dirs, objects, interpreter: Some(interpreter), unpassed, ..Found::default() })
 }
 
 /// The C driver a target's toolchain is asked with: `$CC_<triple with _>`, else `$CC`, else
@@ -1052,6 +1064,31 @@ fn linker_dirs<A: Ask>(ask: &A, cc: &CDriver<'_>, triple: &str) -> Result<(Vec<P
     Ok((dirs, frameworks))
 }
 
+/// The `-L` directories `NIX_LDFLAGS` names that are not in `passed`, the C driver's: nix's
+/// cc-wrapper passes `NIX_LDFLAGS` to the linker only where the dev shell's role marker
+/// (`NIX_CC_WRAPPER_TARGET_HOST_<target>`, with lowercase letters) is in the environment, so
+/// an environment copied without it keeps `NIX_LDFLAGS` and loses what it adds. Only an
+/// absolute directory that exists is kept, as [`linker_dirs`] keeps them.
+fn unpassed(nix_ldflags: Option<&str>, passed: &[PathBuf]) -> Vec<PathBuf> {
+    // alloc: none until a directory is left out, which a dev shell's environment never has
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut words = nix_ldflags.unwrap_or_default().split_whitespace();
+    while let Some(word) = words.next() {
+        let dir = match word.strip_prefix("-L") {
+            Some("") => words.next(),
+            Some(dir) => Some(dir),
+            None => None,
+        };
+        let Some(dir) = dir.map(Path::new) else { continue };
+        let seen = passed.iter().chain(&out).any(|it| it == dir);
+        if dir.is_absolute() && dir.is_dir() && !seen {
+            // alloc: once per toolchain asked, each directory left out
+            out.push(dir.to_path_buf());
+        }
+    }
+    out
+}
+
 /// The words of a job as a C driver's `-###` prints it, split as a shell would: a word is in
 /// double quotes (clang, GCC before 16) or bare up to the next space (GCC 16 quotes only words
 /// that need it), and `\` takes the next character as it is in either; `None` for a line with an
@@ -1125,9 +1162,11 @@ fn apple<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
         fail(format!("{}: no `Version` that is `major[.minor[.patch]]`", settings.display()))
     })?;
     let (linker, linker_frameworks) = linker_dirs(ask, &c_driver(key, 3)?, key.target.triple())?;
+    let unpassed = unpassed(key.named("NIX_LDFLAGS"), &linker);
     Ok(Found {
         linker,
         linker_frameworks,
+        unpassed,
         // alloc: once per toolchain asked, its directories
         dirs: vec![sdk.join("usr/lib"), sdk.join("usr/local/lib")],
         // alloc: once per toolchain asked, its directories
@@ -1377,7 +1416,7 @@ impl Line<'_> {
                 }
             }
         }
-        Err(not_found(name, &files, self.searched(framework)))
+        Err(not_found(name, &files, self.searched(framework), &self.found.unpassed))
     }
 
     /// `path` on the line, unless it is already, then the files it names when it is a linker
@@ -1491,7 +1530,8 @@ impl Line<'_> {
                 }
             }
         }
-        Err(not_found(install, &files, searched.iter().map(|(dir, by)| (dir.as_path(), *by))))
+        // An install name is found at its own path, never on a `-L`.
+        Err(not_found(install, &files, searched.iter().map(|(dir, by)| (dir.as_path(), *by)), &[]))
     }
 
     /// The libraries the members of the PE archive at `at` ask for, each after it on the line
@@ -1564,7 +1604,7 @@ impl Line<'_> {
         }
         // alloc: error path
         let files = [(library.to_owned(), NativeKind::Archive { whole: false })];
-        Err(not_found(library, &files, self.searched(false)))
+        Err(not_found(library, &files, self.searched(false), &self.found.unpassed))
     }
 
     /// The files the linker script at `at` names, after it on the line: an absolute path as it
@@ -1685,10 +1725,13 @@ fn by_extension(format: Format, name: &str, kind: NativeLibKind) -> NativeKind {
     }
 }
 
+/// `unpassed` is [`Found::unpassed`]: the first of them with one of `files` is named, since
+/// that library is there and the environment kept the C driver from passing it.
 fn not_found<'a>(
     name: &str,
     files: &[(String, NativeKind)],
     searched: impl Iterator<Item = (&'a Path, Searched)>,
+    unpassed: &[PathBuf],
 ) -> LinkError {
     // alloc: error path
     let searched: Vec<(PathBuf, Searched)> = searched.map(|(dir, by)| (dir.to_path_buf(), by)).collect();
@@ -1712,6 +1755,18 @@ fn not_found<'a>(
     }
     if searched.is_empty() {
         what.push_str("any directory: the link, the C driver and the toolchain name none");
+    }
+    // alloc: error path
+    let there = unpassed.iter().find_map(|dir| files.iter().map(|it| dir.join(&it.0)).find(|it| it.is_file()));
+    if let Some(there) = there {
+        let _ = write!(
+            what,
+            "; {} is there, in a directory NIX_LDFLAGS names that the C driver does not pass its \
+             linker: nix's cc-wrapper reads NIX_LDFLAGS only when its role marker \
+             `NIX_CC_WRAPPER_TARGET_HOST_<target>` is set, as `nix develop` sets it, and this \
+             environment lacks it (copied without the names that have lowercase letters?)",
+            there.display()
+        );
     }
     let found = NotFound {
         // alloc: error path

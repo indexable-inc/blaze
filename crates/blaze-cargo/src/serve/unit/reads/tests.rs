@@ -18,6 +18,11 @@ pub(in crate::serve::unit) fn no_expansion(_: &base_db::Env, _: &[u8]) -> Result
     Err("a test with no proc-macro expansion asked for one's reads".to_owned())
 }
 
+/// A `file_now` for reads that hold no file outside every source root.
+pub(in crate::serve::unit) fn no_file(path: &str) -> ContentId {
+    panic!("a test that read no file outside every source root asked for {path}")
+}
+
 /// A `primary` for a request that makes no package primary.
 pub(in crate::serve::unit) fn no_primary(_: &str) -> bool {
     false
@@ -58,7 +63,13 @@ impl Store {
         env: &[(String, String)],
         now: impl FnMut(&base_db::Env, &[u8]) -> Result<ContentId, String>,
     ) -> Option<Found> {
-        find(base, env, &no_primary, now, |at| self.0.get(at).map(Vec::as_slice), |key| self.0.contains_key(key)).unwrap()
+        find(base, env, &no_primary, now, no_file, |at| self.0.get(at).map(Vec::as_slice), |key| self.0.contains_key(key)).unwrap()
+    }
+
+    /// Where [`find`] finds the record of `base` for no variables, files read by `file_now`.
+    pub(in crate::serve::unit) fn find_files(&self, base: Key, file_now: impl FnMut(&str) -> ContentId) -> Option<Found> {
+        let found = |key: &Key| self.0.contains_key(key);
+        find(base, &[], &no_primary, no_expansion, file_now, |at| self.0.get(at).map(Vec::as_slice), found).unwrap()
     }
 
     pub(in crate::serve::unit) fn find(&self, base: Key, env: &[(String, String)]) -> Option<Found> {
@@ -72,7 +83,7 @@ impl Store {
         env: &[(String, String)],
         primary: &dyn Fn(&str) -> bool,
     ) -> Option<Found> {
-        find(base, env, primary, no_expansion, |at| self.0.get(at).map(Vec::as_slice), |key| self.0.contains_key(key)).unwrap()
+        find(base, env, primary, no_expansion, no_file, |at| self.0.get(at).map(Vec::as_slice), |key| self.0.contains_key(key)).unwrap()
     }
 }
 
@@ -143,7 +154,7 @@ fn a_slot_that_does_not_decode_is_an_error_naming_it() {
 
     let mut store = Store::default();
     store.0.insert(slot(base(), 0), swapped);
-    let error = find(base(), &[], &no_primary, no_expansion, |at| store.0.get(at).map(Vec::as_slice), |key| store.0.contains_key(key)).unwrap_err();
+    let error = find(base(), &[], &no_primary, no_expansion, no_file, |at| store.0.get(at).map(Vec::as_slice), |key| store.0.contains_key(key)).unwrap_err();
     assert!(error.starts_with("slot 0 of record key"), "{error}");
 }
 
@@ -172,4 +183,29 @@ fn a_record_that_read_primary_package_is_filed_by_it() {
     assert_eq!(store.find_for(base(), &env(&[]), &primary).map(|it| it.key), Some(key), "primary again");
     let decoded = Reads::decode(&reads.encode()).unwrap();
     assert_eq!(decoded, reads, "its slot keeps the manifest");
+}
+
+/// A record whose closure read a file outside every source root is filed by the content ID
+/// read of it: found while the file on disk reads the same, missed once it changed or can't
+/// be read, found again once it is back as it was. Its path survives the slot.
+#[test]
+fn a_record_that_read_a_file_outside_every_root_is_found_while_the_file_is_as_it_was() {
+    let mut store = Store::default();
+    let read = |bytes: &[u8]| base_db::IncludedFile::content_of(Ok(bytes));
+    let reads = Reads::of_files(&[("/far/code.rs", read(b"pub fn far() {}"))]);
+    assert_eq!(Reads::decode(&reads.encode()).map(|it| it.files.into_iter().map(|(path, _)| path).collect()), Ok(vec!["/far/code.rs".to_owned()]));
+    let key = store.keep(base(), &reads, &env(&[]));
+    assert_ne!(key, base(), "a record that read a file is filed by it");
+    let now = |bytes: &'static [u8]| {
+        move |path: &str| {
+            assert_eq!(path, "/far/code.rs");
+            read(bytes)
+        }
+    };
+    assert_eq!(store.find_files(base(), now(b"pub fn far() {}")).map(|it| it.key), Some(key), "the file as it was");
+    assert_eq!(store.find_files(base(), now(b"pub fn far() { 1; }")), None, "the file changed");
+    let missing = base_db::ReadError::of(&std::io::Error::from_raw_os_error(2));
+    let gone = |_: &str| base_db::IncludedFile::content_of(Err(&missing));
+    assert_eq!(store.find_files(base(), gone), None, "the file is gone");
+    assert_eq!(store.find_files(base(), now(b"pub fn far() {}")).map(|it| it.key), Some(key), "the file as it was again");
 }

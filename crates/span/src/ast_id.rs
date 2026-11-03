@@ -718,6 +718,24 @@ struct Index {
     bits: u32,
 }
 
+impl AstIdMap {
+    /// The heap the map holds, in bytes, for a query that keeps maps by their bytes: its
+    /// entries, indexes and bodies with the ids walked so far, not the tree its bodies are
+    /// elements of, which the parse that made it holds and counts.
+    pub fn heap_bytes(&self) -> usize {
+        let bodies = &self.bodies;
+        size_of_val(&*self.entries)
+            + size_of_val(&*self.by_start.slots)
+            + size_of_val(&*self.by_id.slots)
+            + size_of_val(&*bodies.starts)
+            + size_of_val(&*bodies.rows)
+            + size_of_val(&*bodies.by_slot)
+            + size_of_val(&*bodies.ats)
+            + size_of_val(&*bodies.ids)
+            + bodies.ids.iter().filter_map(|it| it.get()).map(|it| size_of_val(&**it)).sum::<usize>()
+    }
+}
+
 impl Index {
     /// The index of `len` entries, the `i`th's word `word(i)`.
     fn new(len: usize, word: impl Fn(usize) -> u32) -> Index {
@@ -1440,6 +1458,16 @@ impl AstIdMap {
         item: N::Of<'_>,
     ) -> FileAstId<N> {
         self.ast_id_for_ptr(AstPtr::of(item))
+    }
+
+    /// [`AstIdMap::ast_id_of_view`], or `None` when `item` is not in the map (a node of
+    /// another tree than the one the map was made of).
+    pub fn try_ast_id_of_view<N: AstIdNode + syntax::view::Typed>(
+        &self,
+        item: N::Of<'_>,
+    ) -> Option<FileAstId<N>> {
+        let ptr = AstPtr::<N>::of(item).syntax_node_ptr();
+        self.try_erased_ast_id(ptr).map(|raw| FileAstId { raw, _marker: PhantomData })
     }
 
     /// [`AstIdMap::ast_id_for_ptr_for_block`] of a view: blocks may not be allocated (if they

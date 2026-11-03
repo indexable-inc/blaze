@@ -15,7 +15,7 @@ use blaze_image::{Builder, Image, SectionId};
 pub use crate::table::RestoreError;
 use crate::{
     order_key,
-    table::{Live, Shape, Table, serial},
+    table::{Live, Overlay, Shape, Table, serial},
 };
 
 const ID: SectionId = SectionId::SYMBOLS;
@@ -32,6 +32,7 @@ fn shape() -> Shape {
         align: 1,
         size: 1,
         text: true,
+        overlay: Overlay::Fixed,
     }
 }
 
@@ -133,6 +134,13 @@ mod tests {
         assert_eq!(again.written, restored.written);
         let empty = restore(&section(&[], &[])).unwrap();
         assert_eq!((empty.end, empty.values.len()), (4, 3));
+    }
+
+    /// The hooks' tables place by the fixed key, so an input takes the same probes in every
+    /// run; the `fuzz` feature changes no other table's.
+    #[test]
+    fn the_hooks_place_by_the_fixed_key() {
+        assert_eq!(shape().overlay, Overlay::Fixed);
     }
 
     #[test]

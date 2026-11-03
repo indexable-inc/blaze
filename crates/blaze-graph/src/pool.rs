@@ -668,7 +668,10 @@ struct Shared {
     /// The first panic of a job's `done`, raised when the pool is dropped.
     // dyn: a panic's payload, as `catch_unwind` gives it
     stray: Lock<Option<Box<dyn Any + Send>>>,
-    /// The pool's member of the scheduler ([`crate::sched::join_pool`]).
+    /// The pool's scheduler: its own, or the one it joined as its jobs met another's.
+    #[cfg(not(blaze_check))]
+    sched: crate::sched::Scheduler,
+    /// The pool's member of its scheduler ([`crate::sched::join_pool`]).
     #[cfg(not(blaze_check))]
     member: AtomicU32,
     /// Its jobs parked on a wait now: its workers stop only once there are none. Under
@@ -749,13 +752,15 @@ struct Drivers {
     owner: std::thread::ThreadId,
 }
 
+#[cfg(not(blaze_check))]
 // SAFETY: a pool is shared and sent as any (a process's pool is a static), but its `Drivers` are
 // touched only on the thread that made it: through that thread's own `DRIVEN` list, and by the
 // pool's drop, which refuses any other thread before it reads them (`Drivers::end`).
-#[cfg(not(blaze_check))]
 unsafe impl Send for Drivers {}
-// SAFETY: as above.
 #[cfg(not(blaze_check))]
+// SAFETY: a `&Drivers` reaches the drivers only on the thread that made the pool (its `DRIVEN`
+// list, and the pool's drop, which refuses any other thread first), so sharing one across
+// threads lets no other thread touch them.
 unsafe impl Sync for Drivers {}
 
 #[cfg(not(blaze_check))]
@@ -915,6 +920,8 @@ impl Pool {
             mixed,
             stray: Lock::new(None),
             #[cfg(not(blaze_check))]
+            sched: crate::sched::Scheduler::new(64),
+            #[cfg(not(blaze_check))]
             member: AtomicU32::new(0),
             parked: AtomicUsize::new(0),
             #[cfg(not(blaze_check))]
@@ -927,7 +934,7 @@ impl Pool {
         });
         #[cfg(not(blaze_check))]
         shared.member.store(
-            crate::sched::join_pool(wake_parked, pool_idle, Arc::as_ptr(&shared).expose_provenance()),
+            crate::sched::join_pool(&shared.sched, wake_parked, pool_idle, Arc::as_ptr(&shared).expose_provenance()),
             Ordering::Relaxed,
         );
         if !threaded {
@@ -1210,15 +1217,16 @@ pub(crate) fn threads_here() -> usize {
 }
 
 /// [`Pool::scope`] on the pool `shared` is of, which outlives the call. The caller's job opens
-/// a scope in the scheduler ([`crate::sched::open_scope`]), so a job of it that waits for what
-/// the caller makes gives way rather than wait for a caller that waits for it.
+/// a scope in the scheduler, joined with the pool's ([`crate::sched::open_scope_on`]), so a job
+/// of it that waits for what the caller makes gives way rather than wait for a caller that
+/// waits for it, and a stall check of the scope's wait sees whether the pool is idle.
 fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
     let pending = Pending {
         count: AtomicUsize::new(1),
         finished: AtomicBool::new(false),
         background: AtomicBool::new(false),
         #[cfg(not(blaze_check))]
-        counter: crate::sched::open_scope(),
+        counter: crate::sched::open_scope_on(&shared.sched),
         #[cfg(blaze_check)]
         owner: thread::current(),
     };
@@ -1283,7 +1291,8 @@ unsafe impl radix::Workers for Pool {
 /// The pool of the worker a sort runs on, for [`radix`]'s parallel passes.
 struct Here<'a>(&'a Shared);
 
-// SAFETY: as `Pool`'s; the worker's `Local` keeps the pool's `Shared` for as long as it works.
+// SAFETY: `run_jobs` submits each job once to a scope of the worker's pool, which returns only once
+// every job of it has run; the worker's `Local` keeps the pool's `Shared` for as long as it works.
 unsafe impl radix::Workers for Here<'_> {
     fn threads(&self) -> usize {
         self.0.slots.len()
@@ -1346,7 +1355,7 @@ impl Pool {
                 std::mem::forget(drivers);
                 std::mem::forget(Arc::clone(&self.shared));
             } else {
-                crate::sched::leave_pool(shared.member.load(Ordering::Relaxed));
+                crate::sched::leave_pool(&shared.sched, shared.member.load(Ordering::Relaxed));
             }
             return ended;
         }
@@ -1384,7 +1393,7 @@ impl Pool {
         }
         #[cfg(not(blaze_check))]
         if !own {
-            crate::sched::leave_pool(shared.member.load(Ordering::Relaxed));
+            crate::sched::leave_pool(&shared.sched, shared.member.load(Ordering::Relaxed));
         }
         #[cfg(blaze_check)]
         let _ = (own, bound);
@@ -1478,6 +1487,11 @@ impl StopClock {
 /// [`Pool::stop`] says: `wait(recheck, until)` waits for the pool to move, until `until` on
 /// [`crate::sched::now`]'s clock at the latest, calling `recheck` (true once `ended`) as it
 /// can; `recheck` wakes the parked jobs whose waits lead to this thread.
+///
+/// The thread's job, if it is in the wait graph and of another pool or a client, waits in the
+/// graph for the pool's jobs meanwhile ([`crate::sched::stop_begins`]): a wait that would close
+/// a cycle through the stop is refused, and a stall of what waits on this thread (a job of
+/// another pool waiting on a key it holds) is found, as it is waiting, not running.
 #[cfg(not(blaze_check))]
 fn stop_bounded(
     shared: &Shared,
@@ -1486,8 +1500,20 @@ fn stop_bounded(
     wait: &dyn Fn(&dyn Fn() -> bool, u64),
 ) -> Result<(), Unstopped> {
     use crate::sched::StopReason;
+    /// Ends the stop's wait in the graph, as the stop returns or unwinds.
+    struct Linked<'a>(&'a crate::sched::Scheduler, crate::sched::JobId);
+    impl Drop for Linked<'_> {
+        fn drop(&mut self) {
+            crate::sched::stop_ended(self.0, self.1);
+        }
+    }
     let member = shared.member.load(Ordering::Relaxed);
-    let dropper = crate::sched::job_in_graph();
+    let in_graph = crate::sched::job_in_graph();
+    let _linked = in_graph
+        .as_ref()
+        .filter(|(job, theirs)| crate::sched::stop_begins(&shared.sched, member, *job, theirs))
+        .map(|&(job, _)| Linked(&shared.sched, job));
+    let dropper = in_graph.map(|(job, _)| job);
     let panicking = thread::panicking();
     let recheck = || {
         if ended() {
@@ -1499,7 +1525,7 @@ fn stop_bounded(
             && shared.parked.load(Ordering::Acquire) != 0
             && !shared.any_work()
         {
-            crate::sched::stop_pool(member, StopReason::Dropper { dropper, panicking });
+            crate::sched::stop_pool(&shared.sched, member, StopReason::Dropper { dropper, panicking });
         }
         false
     };
@@ -1515,14 +1541,14 @@ fn stop_bounded(
         match clock.advance_clock(crate::sched::now(), moved) {
             StopStep::Wait { until } => wait(&recheck, until),
             StopStep::FailParked { waited_ns } => {
-                crate::sched::stop_pool(member, StopReason::Bound { waited_ns });
+                crate::sched::stop_pool(&shared.sched, member, StopReason::Bound { waited_ns });
             }
             StopStep::GiveUp { waited_ns } => {
                 return Err(Unstopped {
                     waited_ns,
                     parked: shared.parked.load(Ordering::Acquire),
                     working: shared.slots.iter().filter(|slot| slot.inside.load(Ordering::Relaxed)).count(),
-                    waits: crate::sched::waits_of(member),
+                    waits: crate::sched::waits_of(&shared.sched, member),
                 });
             }
         }
@@ -1563,7 +1589,8 @@ pub struct Scope<'env> {
 // SAFETY: a scope only pushes jobs (lock-free, from any thread) and counts them in `Pending`'s
 // atomics; the pool and `Pending` outlive it, as `Pool::scope` keeps them.
 unsafe impl Send for Scope<'_> {}
-// SAFETY: as above.
+// SAFETY: every method of a `&Scope` only pushes a job (lock-free) or counts in `Pending`'s
+// atomics, both safe from many threads at once; the pool and `Pending` outlive the scope.
 unsafe impl Sync for Scope<'_> {}
 
 /// A scope's count, on the stack of its call: 128-byte aligned, since every job of it writes
@@ -2080,16 +2107,20 @@ impl Local {
         {
             #[cfg(not(blaze_check))]
             {
-                // A timed wait of any pool's job ends only as a worker looks at the clock.
-                let due = crate::sched::until_due();
-                crate::sched::idle(true);
+                // A timed wait of a pool's job ends only as a worker of its scheduler looks at
+                // the clock.
+                let due = crate::sched::until_due(&shared.sched);
+                // Outside any job: the free pages this thread's heaps keep go back if a release
+                // asked since it last gave them (memcap5); nothing otherwise.
+                blaze_mem::tag::settle_heap();
+                crate::sched::idle(&shared.sched, true);
                 let parked = DriverSpan::open(Driving::Idle);
                 if shared.parked.load(Ordering::Acquire) != 0 && pool_idle(ptr::from_ref(shared).expose_provenance()) {
                     // The last to sleep with jobs parked: none of them wakes unless a job ends a
                     // wait, so after a while with none, the scheduler checks for a stall.
                     thread::park_timeout(due.map_or(STALL_AFTER, |due| due.min(STALL_AFTER)));
                     if slot.sleeping.load(Ordering::SeqCst) && !ended() && !shared.any_work() {
-                        _ = crate::sched::check_stall();
+                        _ = crate::sched::check_stall(&shared.sched);
                     }
                 } else if let Some(due) = due {
                     thread::park_timeout(due);
@@ -2097,8 +2128,8 @@ impl Local {
                     thread::park();
                 }
                 drop(parked);
-                crate::sched::idle(false);
-                crate::sched::fire_due();
+                crate::sched::idle(&shared.sched, false);
+                crate::sched::fire_due(&shared.sched);
             }
             #[cfg(blaze_check)]
             {
@@ -2196,16 +2227,17 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
     let park = |ended: &dyn Fn() -> bool| match turns {
         #[cfg(not(blaze_check))]
         Some(turns) => {
-            crate::sched::idle(true);
+            crate::sched::idle(&local.shared.sched, true);
             hand_back(local, &outer, turns, crate::sched::Turn::Idle);
-            crate::sched::idle(false);
-            crate::sched::fire_due();
+            crate::sched::idle(&local.shared.sched, false);
+            crate::sched::fire_due(&local.shared.sched);
         }
         _ => local.park(&ended),
     };
     let shared = &*local.shared;
     #[cfg(not(blaze_check))]
     let mut runner = crate::sched::Host::new(
+        &shared.sched,
         shared.member.load(Ordering::Relaxed),
         u32::try_from(local.index).expect("a worker's index is a u32"),
         &shared.parked,
@@ -2223,7 +2255,7 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
     loop {
         search.get_or_insert_with(|| DriverSpan::open(Driving::Search));
         #[cfg(not(blaze_check))]
-        crate::sched::fire_due();
+        crate::sched::fire_due(&shared.sched);
         if let Some(job) = local.next() {
             if searching {
                 local.end_search(true);
@@ -2337,13 +2369,14 @@ fn block(until: &dyn Fn() -> bool, deadline: Option<u64>) {
                 if until() {
                     return;
                 }
-                if let Some(due) = crate::sched::until_due() {
+                // The thread may drive pools of any scheduler, and wait on any.
+                if let Some(due) = crate::sched::until_due_any() {
                     let _idle = DriverSpan::open(Driving::Idle);
                     rest(left().map_or(due, |left| due.min(left)));
-                    crate::sched::fire_due();
+                    crate::sched::fire_due_any();
                     continue;
                 }
-                if crate::sched::check_stall() {
+                if crate::sched::check_stall_any() {
                     continue;
                 }
                 if let Some(left) = left() {
@@ -3213,6 +3246,49 @@ mod tests {
             assert!(failed.contains(name), "the failure names `{name}`: {failed}");
         }
         assert!(took < Duration::from_secs(10), "the drop ended in {took:?}, not at its bound ({STOP_BOUND:?})");
+    }
+
+    /// A thread holds a key and stops pool P, whose one job waits (through a scope of pool Q) for
+    /// a job of Q that waits for the key: the stop waits for P's job, it for Q's, and Q's for the
+    /// stopping thread. The stop's wait is in the graph, so Q's stall check sees the cycle (the
+    /// stopper is no running client that may still end its key) and fails Q's job naming the
+    /// stop; P's job ends with it, and the stop ends well inside its bound rather than failing
+    /// what is parked at it and giving up a bound later.
+    #[test]
+    fn a_stop_by_the_holder_of_a_key_another_pools_job_waits_on_fails_that_job_naming_the_stop() {
+        use crate::sched::{self, Wait};
+        let key = Key([0x7c; 32]);
+        let bound = Duration::from_secs(5);
+        let (tx, rx) = unbounded::<Result<(), String>>();
+        let q = Arc::new(Pool::new(&groups_of(1, 1), false).unwrap());
+        let p = Pool::new(&groups_of(1, 1), false).unwrap();
+        assert!(sched::claim(key), "the key is new");
+        let inner = Arc::clone(&q);
+        p.submit(
+            None,
+            move || {
+                inner.scope(|scope| {
+                    scope.submit(
+                        None,
+                        move || _ = sched::wait(Wait::Key(key)),
+                        move |it| _ = tx.send(it.map_err(|panic| message(&*panic))),
+                    );
+                });
+            },
+            |_| {},
+        );
+        until("Q's job to park on the key and P's on Q's scope", || q.parked() == 1 && p.parked() == 1);
+        let began = std::time::Instant::now();
+        let stopped = p.stop(bound);
+        let took = began.elapsed();
+        sched::key_done(key);
+        assert!(stopped.is_ok(), "the stop ended: {stopped:?}");
+        assert!(took < bound, "the stop ended in {took:?}, not at its bound ({bound:?})");
+        let failed = rx.recv_timeout(LONG).expect("Q's job ended").expect_err("Q's job fails");
+        for name in ["stalled", "which it stops"] {
+            assert!(failed.contains(name), "the failure names `{name}`: {failed}");
+        }
+        drop(q);
     }
 
     /// The stop's bound as a transcript on its injected clock: progress moves it; at the bound

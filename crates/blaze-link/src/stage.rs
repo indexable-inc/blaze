@@ -192,6 +192,20 @@ pub(crate) struct Stage<'a> {
     pub lazy: Option<&'a crate::lazy::Lazy>,
     /// The profile and cold set a full link orders functions by ([`crate::layout`]).
     pub layout: crate::layout::Pass<'a>,
+    /// Whether [`Stage::thunks`] ran in an earlier placement round of this stage.
+    pub thunked: bool,
+    /// The thunk island an incremental stage gave its new thunks ([`crate::thunk`]).
+    pub island: Option<u32>,
+    /// A full link's code class as its last layout cut it into segments ([`Stage::islands`]).
+    pub text: Option<Text<'a>>,
+}
+
+/// An AArch64 full link's [`Class::Text`] as laid out ([`crate::thunk`]): its pieces but the
+/// thunks, in order; where each segment of them ends; and each thunk with its island.
+pub(crate) struct Text<'a> {
+    pub code: FrameVec<'a, PieceId>,
+    pub ends: FrameVec<'a, usize>,
+    pub thunks: FrameVec<'a, (u32, PieceId)>,
 }
 
 pub(crate) fn error(function: Option<InstanceKey>, what: impl Into<String>) -> LinkError {
@@ -344,7 +358,7 @@ impl<'a> Stage<'a> {
         Self::piece_in(sym, class, align, size, fixups, what)
     }
 
-    fn piece_in<'x>(sym: Sym, class: ClassId, align: u64, size: u64, fixups: &'x [Fixup], what: What) -> NewPiece<'x> {
+    pub(crate) fn piece_in<'x>(sym: Sym, class: ClassId, align: u64, size: u64, fixups: &'x [Fixup], what: What) -> NewPiece<'x> {
         NewPiece {
             sym,
             class,
@@ -375,7 +389,7 @@ impl<'a> Stage<'a> {
         self.output.arch
     }
 
-    fn fixup_slice(&self, fixups: impl IntoIterator<Item = Fixup>) -> &'a [Fixup] {
+    pub(crate) fn fixup_slice(&self, fixups: impl IntoIterator<Item = Fixup>) -> &'a [Fixup] {
         collect_in(fixups, self.arena).leak()
     }
 
@@ -1825,7 +1839,7 @@ impl<'a> Stage<'a> {
         }
     }
 
-    /// Removes the GOT cells and PLT stubs of what this stage left undefined: a piece it
+    /// Removes the GOT cells, PLT stubs and thunks of what this stage left undefined: a piece it
     /// removed and did not put back (swept data too), or a name its resolution no longer
     /// defines (an import whose last caller went). A cell is the linker's own, made for the
     /// fixups that reach its target through it ([`Stage::needs`]), and owned by no function
@@ -1847,9 +1861,28 @@ impl<'a> Stage<'a> {
                     cells.push(piece);
                 }
             }
+            self.thunks_of(sym, &mut cells);
+        }
+        // A going PLT stub's thunks go too.
+        for at in 0..cells.len() {
+            if let Some(What::Plt { .. }) = self.new.piece(cells[at]).map(|it| it.what()) {
+                let stub = self.new.piece(cells[at]).expect("live").sym;
+                self.thunks_of(stub, &mut cells);
+            }
         }
         for id in cells {
             self.unmake(id);
+        }
+    }
+
+    /// The thunks to `target` ([`crate::thunk`]): among its referrers, as each has fixups to it.
+    fn thunks_of(&self, target: Sym, out: &mut FrameVec<'a, PieceId>) {
+        for id in self.new.refs(target) {
+            if let Some(What::Thunk { target: to, .. }) = self.new.piece(id).map(|it| it.what())
+                && to == target
+            {
+                out.push(id);
+            }
         }
     }
 
@@ -1901,18 +1934,7 @@ impl<'a> Stage<'a> {
     /// it, in this link or an earlier one) and its key, anything else as
     /// [`Symbols::describe`] says it.
     fn named(&self, sym: Sym) -> String {
-        match self.symbols.key(sym) {
-            SymKey::Body(id) | SymKey::Slot(id) => {
-                let name = self.new.debug_name(id).or_else(|| self.old.debug_name(id));
-                // alloc: error path
-                format!(
-                    "the function `{}` ({:?})",
-                    name.map_or("(no debug name)", |it| self.symbols.str(it)),
-                    self.symbols.instance(id)
-                )
-            }
-            _ => self.symbols.describe(sym),
-        }
+        named_in(self.symbols, &[&self.new, self.old], self.writer, sym)
     }
 
     /// What a piece is, as an error names what refers to something: a function by its path,
@@ -1932,8 +1954,27 @@ impl<'a> Stage<'a> {
             What::Got { target, .. } => format!("the GOT cell of {}", self.named(target)),
             // alloc: error path
             What::Plt { target } => format!("the PLT stub of {}", self.named(target)),
+            // alloc: error path
+            What::Thunk { target, island } => format!("the thunk to {} in island {island}", self.named(target)),
             _ => self.named(piece.sym),
         }
+    }
+}
+
+/// A symbol as an error names it: a function by its path (the debug name codegen gave it, in
+/// the first of `states` that has one) and its key; a native object's symbol, section or call
+/// frame record by its input's path, its name and place ([`crate::native::describe`], which
+/// reads an archive's member again with `writer`); anything else as [`Symbols::describe`]
+/// says it.
+pub(crate) fn named_in(symbols: &Symbols, states: &[&State], writer: &Formats, sym: Sym) -> String {
+    match symbols.key(sym) {
+        SymKey::Body(id) | SymKey::Slot(id) => {
+            let name = states.iter().find_map(|it| it.debug_name(id));
+            // alloc: error path
+            format!("the function `{}` ({:?})", name.map_or("(no debug name)", |it| symbols.str(it)), symbols.instance(id))
+        }
+        SymKey::Local(..) | SymKey::Section(..) | SymKey::Frame(..) => crate::native::describe(symbols, states, writer, sym),
+        _ => symbols.describe(sym),
     }
 }
 

@@ -57,8 +57,13 @@ pub(crate) trait Shard<K>: Send {
 /// Stops with an error of the shard's memory: past a bound, or memory the kernel refused.
 #[cold]
 #[track_caller]
-fn stop(error: MemError) -> ! {
+fn stop(error: &MemError) -> ! {
     panic!("{error}")
+}
+
+/// The bytes `column` has committed: its capacity, which commits in pages as it grows.
+fn committed<T>(column: &RegionVec<T>) -> u64 {
+    (column.capacity() * size_of::<T>()) as u64
 }
 
 /// Where a probe ended: at the entry it looked for, or at the empty slot the entry would take.
@@ -76,6 +81,11 @@ pub(crate) struct Index {
 impl Index {
     fn new() -> Result<Index, MemError> {
         Ok(Index { slots: RegionVec::new_huge(MAX_SLOTS, Tag::Link)? })
+    }
+
+    /// The bytes its slots have committed.
+    fn held(&self) -> u64 {
+        committed(&self.slots)
     }
 
     #[inline]
@@ -173,6 +183,11 @@ impl KeyShard {
         Ok(KeyShard { index: Index::new()?, keys: RegionVec::new(MAX_ENTRIES, Tag::Link)? })
     }
 
+    /// The bytes its regions have committed.
+    pub(crate) fn held(&self) -> u64 {
+        self.index.held() + committed(&self.keys)
+    }
+
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.keys.len()
@@ -202,10 +217,10 @@ impl Shard<SymKey> for KeyShard {
             Probe::Found(entry) => return entry,
             Probe::Empty(at) => at,
         };
-        let entry = keys.try_push(key).unwrap_or_else(|error| stop(error)) as u32;
+        let entry = keys.try_push(key).unwrap_or_else(|error| stop(&error)) as u32;
         let keys = keys.as_slice();
         if let Err(error) = index.insert(at, hash, entry, |at| hash_key(keys[at as usize])) {
-            stop(error)
+            stop(&error)
         }
         entry
     }
@@ -244,6 +259,11 @@ impl NameShard {
         })
     }
 
+    /// The bytes its regions have committed.
+    pub(crate) fn held(&self) -> u64 {
+        self.index.held() + committed(&self.bytes) + committed(&self.ends)
+    }
+
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.ends.len()
@@ -274,13 +294,13 @@ impl<'k> Shard<&'k str> for NameShard {
             Probe::Empty(at) => at,
         };
         if let Err(error) = bytes.try_extend_from_slice(name.as_bytes()) {
-            stop(error)
+            stop(&error)
         }
         let end = bytes.len() as u32;
-        let entry = ends.try_push(end).unwrap_or_else(|error| stop(error)) as u32;
+        let entry = ends.try_push(end).unwrap_or_else(|error| stop(&error)) as u32;
         let (bytes, ends) = (bytes.as_slice(), ends.as_slice());
         if let Err(error) = index.insert(at, hash, entry, |at| hash_name(name_at(bytes, ends, at))) {
-            stop(error)
+            stop(&error)
         }
         entry
     }
@@ -295,6 +315,11 @@ pub(crate) struct IdShard {
 impl IdShard {
     pub(crate) fn new() -> Result<IdShard, MemError> {
         Ok(IdShard { index: Index::new()?, ids: RegionVec::new(MAX_ENTRIES, Tag::Link)? })
+    }
+
+    /// The bytes its regions have committed.
+    pub(crate) fn held(&self) -> u64 {
+        self.index.held() + committed(&self.ids)
     }
 
     #[inline]
@@ -326,10 +351,10 @@ impl<'k> Shard<&'k ContentId> for IdShard {
             Probe::Found(entry) => return entry,
             Probe::Empty(at) => at,
         };
-        let entry = ids.try_push(*id).unwrap_or_else(|error| stop(error)) as u32;
+        let entry = ids.try_push(*id).unwrap_or_else(|error| stop(&error)) as u32;
         let ids = ids.as_slice();
         if let Err(error) = index.insert(at, hash, entry, |at| hash_id(&ids[at as usize])) {
-            stop(error)
+            stop(&error)
         }
         entry
     }

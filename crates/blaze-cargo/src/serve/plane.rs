@@ -16,6 +16,7 @@
 
 use std::{
     alloc::Global,
+    cell::Cell,
     collections::{BTreeMap, VecDeque},
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -25,7 +26,7 @@ use std::{
 
 use blaze_graph::{
     Budget, Error, Plane as Graph, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
-    admission::{Predict, Prediction, TaskKind},
+    admission::{self, Predict, Prediction, TaskKind},
     arena,
     machine::{NodeId, Outcome, Pool},
     plane::{Key, NodeRef, Nodes, Unsettled},
@@ -254,7 +255,7 @@ impl<W: Work> Threads<W> {
                         // readers.
                         let mut readers = Some(job.readers);
                         let (ended, peak, ran_ns, puts) = loop {
-                            match run_measured(&*job.work, job.task.arg, job.task.build, readers.take().unwrap_or_default()) {
+                            match run_measured(&*job.work, job.task, readers.take().unwrap_or_default()) {
                                 (Some(ended), peak, ran_ns, puts) => break (ended, peak, ran_ns, puts),
                                 (None, peak, ran_ns, puts) if job.task.reads => {
                                     break (Ended::GaveWay { group: None }, peak, ran_ns, puts);
@@ -271,19 +272,25 @@ impl<W: Work> Threads<W> {
     }
 }
 
-/// Runs `work` inside a measure: `None` when it gave way (its readers dropped with it), else
-/// its value or its panic; how long it ran; and what its expansions put once it ended. A task that gave way
+/// Runs `task`'s `work` as a task of its kind ([`admission::run_as`]): in a frame tagged with
+/// its subsystem, so what it allocates is charged to that subsystem and not to the heap outside
+/// any task, and inside a measure. Says `None` when it gave way (its readers dropped with it),
+/// else its value or its panic; the most it held; how long it ran; and what its expansions put
+/// once it ended. A task that gave way
 /// leaves its puts in its thread's buffer, handed on by that thread's next take (or as
 /// orphans, if the thread ends), so none is lost or kept twice.
 fn run_measured<W: Work>(
     work: &W,
-    arg: u32,
-    build: u32,
+    task: Posting,
     readers: W::Readers,
 ) -> (Option<Ended<W::Value>>, u64, u64, Vec<proc_macro_api::kept::Put>) {
+    let Posting { arg, build, kind, .. } = task;
     let _build = blaze_profile::flight::building(build);
     let start = Instant::now();
-    let (result, peak) = arena::measure(|| catch_unwind(AssertUnwindSafe(|| work.run(arg, readers))));
+    let (result, peak) = admission::run_as(kind, || {
+        let _job = InJob::enter();
+        catch_unwind(AssertUnwindSafe(|| work.run(arg, readers)))
+    });
     let ran_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     match result {
         Ok(None) => (None, peak, ran_ns, Vec::new()),
@@ -330,8 +337,14 @@ const fn of_program(kind: TaskKind) -> bool {
 }
 
 /// Has every panic of the process recorded where it was raised, for the task that catches it
-/// ([`Panic::at`]), then printed as before. Once, as the daemon starts.
+/// ([`Panic::at`]), then printed as before. Once, as the daemon starts; a later call does
+/// nothing, so the hook never wraps itself and records each panic once (tests call it each).
 pub fn record_panics() {
+    static RECORDING: std::sync::Once = std::sync::Once::new();
+    RECORDING.call_once(set_recording_hook);
+}
+
+fn set_recording_hook() {
     let printed = std::panic::take_hook();
     // alloc: the process's one panic hook
     std::panic::set_hook(Box::new(move |info| {
@@ -349,10 +362,78 @@ pub fn record_panics() {
     }));
 }
 
+/// Has an allocation the allocator could not make panic, naming its size, instead of aborting
+/// the process: the job that asked fails with that panic, as any job's panic does, and the
+/// daemon goes on serving every other (`panics-fail-one-job`). In coord-98 one block of
+/// 137,740 bytes for a parsed tree, which blaze-mem's used-up 160 KiB class could not give,
+/// aborted the daemon, and the 1,627 tests of 21 crates were lost with it. Once, as the daemon
+/// starts; a failure while a panic unwinds, or where unwinding is not allowed, still aborts.
+pub fn record_alloc_failures() {
+    std::alloc::set_alloc_error_hook(alloc_failed);
+}
+
+thread_local! {
+    /// How many of [`run_measured`]'s tasks this thread is inside, off a fiber (an IO thread's,
+    /// the simulation's): a panic there is caught and fails that task alone. A task on a fiber
+    /// is not counted here: it can wait (its own parallel work does) and resume on another
+    /// worker, so a count raised on one thread would be lowered on another. On a fiber,
+    /// [`blaze_graph::sched::fiber::on_fiber`] answers instead.
+    static IN_JOB: Cell<u32> = const { Cell::new(0) };
+}
+
+/// [`IN_JOB`] raised while a task off a fiber runs, lowered as it ends or unwinds, on the same
+/// thread: off a fiber nothing moves the task to another.
+struct InJob {
+    counted: bool,
+}
+
+impl InJob {
+    fn enter() -> Self {
+        let counted = !blaze_graph::sched::fiber::on_fiber();
+        if counted {
+            IN_JOB.with(|depth| depth.set(depth.get() + 1));
+        }
+        Self { counted }
+    }
+}
+
+impl Drop for InJob {
+    fn drop(&mut self) {
+        if self.counted {
+            IN_JOB.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+}
+
+/// Whether a panic raised here is caught by a job's runner: a plane task's, or a pool job's on
+/// its fiber (blaze-graph's hosts catch each job's panic). Elsewhere (the plane's loop, an IO
+/// thread) nothing catches it, and the thread would end without a word.
+fn in_a_job() -> bool {
+    IN_JOB.try_with(|depth| depth.get() > 0).unwrap_or(false) || blaze_graph::sched::fiber::on_fiber()
+}
+
+/// What [`record_alloc_failures`] has an allocation failure do: in a job, panic, failing that
+/// job alone; elsewhere return, so std aborts as it would without the hook, rather than end a
+/// thread the daemon needs without a word.
+fn alloc_failed(layout: std::alloc::Layout) {
+    if !in_a_job() {
+        return;
+    }
+    panic!(
+        "an allocation of {} bytes (aligned to {}) failed: the allocator had no memory to give",
+        layout.size(),
+        layout.align()
+    );
+}
+
 /// The panic `payload` caught, with where the hook saw the newest one of its message raised.
+/// An unwind the query engine raised with a typed payload (a query past its bound, out of
+/// fuel) is named by its own text: it reaches no hook, and has no `panic!` text.
 // dyn: a panic payload, read once per panicked task
 pub(crate) fn panicked(payload: &(dyn std::any::Any + Send)) -> Panic {
-    let message = stdx::panic_text(payload).map(str::to_owned); // alloc: a panic, once
+    let message = stdx::panic_text(payload)
+        .map(str::to_owned) // alloc: a panic, once
+        .or_else(|| blaze_query::db::unwind_text(payload));
     let mut raised = RAISED.lock();
     let at = raised.iter().rposition(|(it, _)| *it == message).and_then(|place| raised.remove(place)).map(|(_, at)| at);
     Panic { message, at }
@@ -362,7 +443,7 @@ fn post_work<W: Work>(task: Posting, work: Arc<W>, readers: W::Readers, done: &'
     let pool = blaze_graph::exec::shared();
     // The batch's work comes back with the result, for a task that gave way to be posted again
     // without counting another reference.
-    let run = move || (run_measured(&*work, task.arg, task.build, readers), work);
+    let run = move || (run_measured(&*work, task, readers), work);
     let then = move |result: std::thread::Result<_>| match result {
         Ok(((Some(ended), peak, ran_ns, puts), _)) => _ = done.send(Ran { task, ended, peak, ran_ns, puts }),
         Ok(((None, peak, ran_ns, puts), _)) if task.reads => {
@@ -481,7 +562,7 @@ impl<W: Work> Inline<W> {
         let now = 1 + self.rng.below(posted.len() as u64) as usize;
         self.queue.extend(posted.drain(now..));
         for (task, work, readers) in posted.drain(..) {
-            match run_measured(&*work, task.arg, task.build, readers) {
+            match run_measured(&*work, task, readers) {
                 (Some(ended), peak, _, puts) => out.push(Ran { task, ended, peak, ran_ns: 0, puts }),
                 (None, peak, _, puts) if task.reads => {
                     out.push(Ran { task, ended: Ended::GaveWay { group: None }, peak, ran_ns: 0, puts });
@@ -1083,6 +1164,36 @@ mod tests {
         }
     }
 
+    /// coord-102 (B5): the plane ran its tasks in no `blaze_mem::frame::task`, so everything a
+    /// unit's job allocated outside its queries counted to the heap outside any task (8.18 GiB
+    /// of 28.27 at the last sample), named by no subsystem. A task runs in a frame of its own
+    /// kind's subsystem ([`admission::tag_of`]), on every runner and pool, and so does what it
+    /// allocates.
+    #[test]
+    fn a_task_runs_as_its_kinds_subsystem_on_every_runner() {
+        fn running(_: u32) -> Option<Did<u32>> {
+            built(blaze_mem::frame::running_tag().map_or(u32::MAX, |tag| tag as u32))
+        }
+        for kind in [kinds::COMPILE, kinds::UNIT_NAMES, kinds::UNIT_BODIES, kinds::UNIT_LINK, kinds::UNIT_STORE] {
+            let runners: [(Runner<Next>, Pool); 3] = [
+                (Runner::Threads(Threads::new(1, 1)), Pool::Io),
+                (Runner::Threads(Threads::new(1, 1)), Pool::Work),
+                (Runner::Inline(Inline::new(1)), Pool::Work),
+            ];
+            for (mut runner, pool) in runners {
+                let task = Posting { id: NodeId(5), pool, near: None, critical: false, kind, arg: 0, reads: false, build: 1 };
+                runner.post(task, Arc::new(Each(running as fn(u32) -> Option<Did<u32>>)), ());
+                let mut ran = Vec::new();
+                while ran.is_empty() {
+                    runner.take(&mut ran);
+                }
+                let [Ran { ended: Ended::Did(Did { value, .. }), .. }] = ran.as_slice() else { panic!("the task ends with its value") };
+                let want = blaze_graph::admission::tag_of(kind);
+                assert_eq!(*value, want as u32, "a {kind:?} task on {pool:?} runs as {want:?}");
+            }
+        }
+    }
+
     #[test]
     fn a_task_that_panics_ends_with_its_message_and_where_it_was_raised_on_another_thread() {
         record_panics();
@@ -1105,6 +1216,54 @@ mod tests {
         let at = panic.at.as_deref().expect("the hook saw where it was raised");
         assert!(at.contains("serve/plane.rs:") && at.ends_with(" on thread plane-test-raiser"), "{at}");
         assert_eq!(panic.to_string(), format!("panicked at {at}: plane-test: the task's panic"));
+    }
+
+    /// coord-98: a block blaze-mem's used-up size class could not give aborted the daemon, and
+    /// every crate's tests went with it. An allocation that fails in one task fails that task,
+    /// naming the size, and the tasks beside it end with their values: this test's process
+    /// living to check them is the proof that nothing aborted.
+    #[test]
+    fn an_allocation_that_fails_fails_its_task_alone_and_the_rest_finish() {
+        record_panics();
+        record_alloc_failures();
+        let work = Arc::new(Each(|arg| -> Option<Did<u32>> {
+            if arg == 2 {
+                // What a `Vec`, a `Box` or a parsed tree's block does when its allocator has no
+                // block to give, as blaze-mem's full class region had none.
+                let layout = std::alloc::Layout::from_size_align(137_740, 64).expect("a layout");
+                std::alloc::handle_alloc_error(layout);
+            }
+            built(arg + 100)
+        }));
+        let mut runner = Inline::new(4);
+        for arg in 0..4u32 {
+            let task = Posting {
+                id: NodeId(20 + arg),
+                pool: Pool::Work,
+                near: None,
+                critical: false,
+                kind: kinds::COMPILE,
+                arg,
+                reads: false,
+                build: 1,
+            };
+            runner.post(task, work.clone(), ());
+        }
+        let mut ran = Vec::new();
+        while ran.len() < 4 {
+            runner.take(&mut ran);
+        }
+        ran.sort_by_key(|it| it.task.arg);
+        for (arg, it) in ran.iter().enumerate() {
+            match (&it.ended, arg) {
+                (Ended::Panicked(panic), 2) => {
+                    let message = panic.message.as_deref().expect("the panic's message");
+                    assert!(message.starts_with("an allocation of 137740 bytes (aligned to 64) failed"), "{message}");
+                }
+                (Ended::Did(Did { value, .. }), _) => assert_eq!(*value, arg as u32 + 100),
+                _ => panic!("task {arg} should have {}", if arg == 2 { "panicked" } else { "built" }),
+            }
+        }
     }
 
     #[test]

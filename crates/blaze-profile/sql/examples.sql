@@ -393,11 +393,22 @@ WITH bounds AS (
         sum(greatest(start_ns - covered_to, 0)) + greatest((SELECT t1 FROM bounds) - max(greatest(end_ns, covered_to)), 0) AS uncovered_ns
     FROM swept
     GROUP BY process, thread
+), folded_roots AS (
+    -- Outermost spans too short for a row each (`folded`): their time is covered, though no
+    -- row says where in the stretch it fell; they lie between the runs above, in its gaps.
+    SELECT process, thread, sum(dur_ns) AS folded_ns
+    FROM folded, bounds
+    WHERE root = 1 AND to_ns BETWEEN t0 AND t1
+    GROUP BY process, thread
+), uncovered AS (
+    SELECT workers.thread, workers.thread_name,
+        greatest(coalesce(uncovered_ns, (SELECT t1 - t0 FROM bounds)) - coalesce(folded_ns, 0), 0) AS ns
+    FROM workers LEFT JOIN gaps USING (process, thread) LEFT JOIN folded_roots USING (process, thread)
 )
-SELECT workers.thread, workers.thread_name,
-    round(coalesce(uncovered_ns, (SELECT t1 - t0 FROM bounds)) / 1e9, 2) AS uncovered_s,
-    round(100 * coalesce(uncovered_ns, (SELECT t1 - t0 FROM bounds)) / (SELECT t1 - t0 FROM bounds), 2) AS uncovered_pct
-FROM workers LEFT JOIN gaps USING (process, thread)
+SELECT thread, thread_name,
+    round(ns / 1e9, 2) AS uncovered_s,
+    round(100 * ns / (SELECT t1 - t0 FROM bounds), 2) AS uncovered_pct
+FROM uncovered
 ORDER BY uncovered_pct DESC
 
 -- name: raw_blocks
@@ -467,7 +478,7 @@ GROUP BY kind
 ORDER BY errors DESC, kind
 
 -- name: reexecution_per_query_kind
--- says: per query function in a build, the work repeated and what eviction cost: runs, rows verified without running, runs of a row in a view it already ran in, runs for an evicted value, and values swept, refused or dropped (the query engine's counts, `query_counts`), beside its spans' runs, distinct function names and time; a span's `function` is a display name several bodies share, so span_names undercounts keys
+-- says: per query function in a build, the work repeated and what eviction cost: runs, rows verified without running, runs of a row in a view it already ran in, runs for an evicted value, and values a budget's pass let go or dropped (the query engine's counts, `query_counts`), beside its spans' runs, distinct function names and time; a span's `function` is a display name several bodies share, so span_names undercounts keys
 WITH spanned AS (
     SELECT query_kind, count(*) AS span_runs, count(DISTINCT function) AS span_names, sum(dur_ns) AS span_ns
     FROM spans
@@ -487,7 +498,6 @@ SELECT
     counted.reran AS reran,
     counted.evicted_asked AS evicted_asked,
     counted.evicted AS evicted,
-    counted.refused AS refused,
     counted.dropped AS dropped,
     spanned.span_runs AS span_runs,
     spanned.span_names AS span_names,

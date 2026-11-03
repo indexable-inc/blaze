@@ -33,6 +33,7 @@ enum Kind {
     ImplAssocType,
     ImplBlock,
     Function,
+    Closure,
 }
 
 impl Kind {
@@ -44,6 +45,7 @@ impl Kind {
             Kind::ImplAssocType => "associated type",
             Kind::ImplBlock => "impl block",
             Kind::Function => "function",
+            Kind::Closure => "closure",
         }
     }
 
@@ -88,6 +90,13 @@ impl<'t> Binder<'t> {
             it.ty()?;
             return binder(Kind::WhereBound, it.for_binder(), it.syntax().text_range());
         }
+        // `for<'a> |x: &'a u8| ..` (rustc's `ClosureBinder::For`, a rib around the whole
+        // closure). The lifetime walk skips bodies, so only an item inside the closure meets
+        // it, as the outer binder of E0401.
+        if let Some(it) = cast::<ast::ClosureExpr>(node) {
+            let for_binder = it.for_binder()?;
+            return binder(Kind::Closure, Some(for_binder), for_binder.syntax().text_range());
+        }
         let kind = match cast::<ast::Item>(node)? {
             ast::Item::Fn(_) => Kind::Function,
             ast::Item::Struct(_) | ast::Item::Enum(_) | ast::Item::Union(_) | ast::Item::Trait(_) => {
@@ -119,8 +128,8 @@ impl<'t> Binder<'t> {
         Some(Binder { kind, list, span, node })
     }
 
-    fn declares(&self, name: &str) -> Option<ast::Lifetime<'t>> {
-        declared(self.list?, name)
+    fn declares(&self, cx: &Cx<'_, '_>, file: HirFileId, name: &str, key: Key) -> Option<ast::Lifetime<'t>> {
+        declared(cx, file, self.list?, name, key)
     }
 }
 
@@ -129,14 +138,35 @@ fn cast<'t, N: AstNode<'t>>(node: ast::Node<'t>) -> Option<N> {
     N::cast(node)
 }
 
-fn declared<'t>(list: ast::GenericParamList<'t>, name: &str) -> Option<ast::Lifetime<'t>> {
-    list.lifetime_params().filter_map(|it| it.lifetime()).find(|it| it.text() == name)
+/// The key a lifetime's name binds or is looked up by: its context normalized to macros 2.0,
+/// `None` for every lifetime a real file or a `macro_rules!` writes.
+type Key = Option<span::SyntaxContext>;
+
+/// The key of the lifetime `lifetime` of `file` ([`hir_def::nameres::binding_key_at`]).
+fn key_of(cx: &Cx<'_, '_>, file: HirFileId, lifetime: ast::Lifetime<'_>) -> Key {
+    hir_def::nameres::binding_key_at(cx.db, file, lifetime.syntax().text_range())
+}
+
+/// The lifetime parameter of `list`, written in `file`, that a lifetime written `name` with
+/// `key` names: the same text and the same key. Lifetimes always have macros 2.0 hygiene
+/// (rustc's `resolve_lifetime` looks up `ident.normalize_to_macros_2_0()`, as hir-def's
+/// `param_name` binds them), so a `macro`'s own `'a` and the `'a` its caller hands it are two.
+fn declared<'t>(
+    cx: &Cx<'_, '_>,
+    file: HirFileId,
+    list: ast::GenericParamList<'t>,
+    name: &str,
+    key: Key,
+) -> Option<ast::Lifetime<'t>> {
+    list.lifetime_params()
+        .filter_map(|it| it.lifetime())
+        .find(|it| it.text() == name && key_of(cx, file, *it) == key)
 }
 
 /// The impl or trait among whose items a macro call emitted `item`, through the calls of
 /// expansions emitted at the top of another: its generics are a rib of `item`'s, as in rustc,
 /// where a `macro_rules!` lifetime has no hygiene and resolves where the macro expands.
-fn around_call<'db>(cx: &Cx<'_, 'db>, mut file: HirFileId, item: ast::Node<'db>) -> Option<ast::Node<'db>> {
+fn around_call<'db>(cx: &Cx<'_, 'db>, mut file: HirFileId, item: ast::Node<'db>) -> Option<(HirFileId, ast::Node<'db>)> {
     if item.parent()?.parent().is_some() {
         return None;
     }
@@ -144,7 +174,7 @@ fn around_call<'db>(cx: &Cx<'_, 'db>, mut file: HirFileId, item: ast::Node<'db>)
         let call = file.macro_file()?.loc(cx.db).to_node_view(cx.db);
         let parent = call.value.parent()?;
         if ast::AssocItemList::can_cast(parent.kind()) {
-            return parent.parent();
+            return Some((call.file_id, parent.parent()?));
         }
         if parent.parent().is_some() {
             return None;
@@ -181,11 +211,13 @@ pub(super) fn check<'db>(cx: &Cx<'_, 'db>, signature: &Signature<'db>, lifetime:
         true => around_call(cx, signature.node.file_id, inner),
         false => None,
     };
-    for node in ribs().chain(around) {
+    let file = signature.node.file_id;
+    let key = key_of(cx, file, lifetime);
+    for (at, node) in ribs().map(|it| (file, it)).chain(around) {
         if ast::ConstParam::can_cast(node.kind()) {
             return None;
         }
-        if Binder::of(node).is_some_and(|it| it.declares(name).is_some()) {
+        if Binder::of(node).is_some_and(|it| it.declares(cx, at, name, key).is_some()) {
             return None;
         }
     }
@@ -196,9 +228,8 @@ pub(super) fn check<'db>(cx: &Cx<'_, 'db>, signature: &Signature<'db>, lifetime:
         .skip(1)
         .take_while(|it| !ast::Module::can_cast(it.kind()) && !ast::SourceFile::can_cast(it.kind()))
         .filter_map(Binder::of)
-        .find_map(|it| it.declares(name));
+        .find_map(|it| it.declares(cx, file, name, key));
 
-    let file = signature.node.file_id;
     let at = |range: TextRange| cx.span(InFile::new(file, range));
     let span = at(lifetime.syntax().text_range());
     let mut diag = match &outer {

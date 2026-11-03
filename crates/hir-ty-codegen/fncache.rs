@@ -421,7 +421,7 @@ pub(super) fn cached_name(db: &Db, closure: &Instance) -> String {
 }
 
 fn function_name(db: &Db, func: FunctionId, args: GenericArgs<'_>) -> String {
-    hir_ty_mir::mir::type_name::rustc_function_name(db, func, args.as_slice())
+    hir_ty_print::rustc_function_name(db, func, args.as_slice())
         // alloc: a name is owned as `rustc_function_name` gives it: a leaf's key, or a message
         .unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned())
 }
@@ -1373,7 +1373,7 @@ fn describe(db: &Db, node: &Node) -> String {
                 }
                 InstanceDef::DropGlue => {
                     let ty = args.as_slice().first().and_then(|it| it.ty());
-                    let ty = ty.and_then(|ty| hir_ty_mir::mir::type_name::rustc_type_name(db, ty));
+                    let ty = ty.and_then(|ty| hir_ty_print::rustc_type_name(db, ty));
                     push(&["the drop of `", ty.as_deref().unwrap_or_default(), "`"])
                 }
                 _ => push(&["a shim"]),
@@ -1605,7 +1605,7 @@ fn arguments_trouble(
     for ty in types.params.iter().skip(1) {
         let ty = ty.as_ref();
         if let Some(why) = trouble(db, interner, ty, false, &mut seen, &mut counted) {
-            let name = hir_ty_mir::mir::type_name::rustc_type_name(db, ty).unwrap_or_default();
+            let name = hir_ty_print::rustc_type_name(db, ty).unwrap_or_default();
             // alloc: the error, why the function is not cached
             return (Some(format!("an argument of type `{name}` {why}")), counted);
         }

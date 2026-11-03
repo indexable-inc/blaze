@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blaze_core::exit::Exit;
 use blaze_profile::{
     history,
     perf::{
@@ -23,7 +24,7 @@ use blaze_profile::{
     },
 };
 
-use super::{FAILED, USAGE, say};
+use super::say;
 
 const PERF_USAGE: &str = "blaze perf record [--target-dir DIR] [--workspace DIR] FILE.ixprof... \
                           | blaze perf runs [--json] | blaze perf diff [RUN [BASE]] [--json] [--all]";
@@ -41,11 +42,11 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
 }
 
 fn usage(what: impl Into<String>) -> Refused {
-    (USAGE, format!("{}\nusage: {PERF_USAGE}", what.into()))
+    (Exit::Usage.code(), format!("{}\nusage: {PERF_USAGE}", what.into()))
 }
 
 fn failed(what: impl Into<String>) -> Refused {
-    (FAILED, what.into())
+    (Exit::Failed.code(), what.into())
 }
 
 fn run(words: Vec<OsString>) -> Result<(), Refused> {

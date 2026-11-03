@@ -678,8 +678,7 @@ fn variant_enums(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, name: &s
     // alloc: the error's text, on the error path
     let enums: Vec<String> = found.into_iter().map(|(_, it)| it).collect();
     diag.suggestions(
-        // clone: the error's span
-        span.clone(),
+        span,
         // alloc: the error's text, on the error path
         format!("{preamble}try using the variant's enum"),
         // clone: the error's suggestions

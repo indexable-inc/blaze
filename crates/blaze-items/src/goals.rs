@@ -119,7 +119,8 @@ fn goal_crate_key(db: &Db, krate: Crate) -> ContentId {
 /// `krate`, stands for, its value asked as `krate` sees it. Each
 /// query here is keyed by one interned or input struct, taken for one only when the key's page
 /// holds that struct, and returns part of an item's interface (its signature, bounds, fields, items,
-/// variances, attribute flags: `crate::form`'s signature form), the hidden types of an item's
+/// variances, attribute flags, an impl method's types for the trait method's `impl Trait`s:
+/// `crate::form`'s signature form), the hidden types of an item's
 /// `impl Trait`s, the crate's target, the impls of one trait for one simplified self type,
 /// whether an impl may specialize and what it specializes, or a dependency's batch, which
 /// stands for its crate.
@@ -154,6 +155,15 @@ pub(crate) fn fact_of_read(db: &Db, krate: Crate, name: &str, key: Id) -> Option
         | "supertraits_info"
         | "dyn_compatibility_of_trait_query" => signature(ItemId::Trait(arg(db, key)?)),
         "FunctionSignature::kept" | "fn_sig_for_fn" => signature(ItemId::Function(arg(db, key)?)),
+        // An impl method's types for the `impl Trait`s of the trait method it implements: its
+        // signature form writes them (`Cx::function`), as they follow from its signature and the
+        // trait method's.
+        "impl_rpitit_tys" => signature(ItemId::Function(arg(db, key)?)),
+        // The bounds of a trait method's `impl Trait`, its trait item's: those its signature
+        // writes on the opaque type. An impl's item has none.
+        "rpitit_item_bounds" => {
+            signature(ItemId::Function(hir_ty::rpitit::rpitit_item_bounds_of_key(db, key)?.function))
+        }
         // A hidden type is what its defining bodies leak, which the signature hash leaves out.
         "rpit_hidden_types" => Some(facts::hidden_types(db, ItemId::Function(arg(db, key)?))),
         "tait_hidden_types" => Some(facts::hidden_types(db, ItemId::Alias(arg(db, key)?))),

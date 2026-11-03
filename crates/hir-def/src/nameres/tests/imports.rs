@@ -22,7 +22,7 @@ mod foo {
     pub use super::{self as self_zuper};
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - dollar_crate : type (import)
             - foo : type
@@ -49,7 +49,7 @@ mod fmt {
 }
 pub use fmt::self as alias;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - alias : type (import)
             - fmt : type
@@ -71,7 +71,7 @@ use foo::int;
 //- /foo.rs
 pub use i32 as int;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : type
             - int : type (import)

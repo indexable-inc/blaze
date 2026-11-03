@@ -22,8 +22,8 @@ fn errors(tokens: &TokenStream) -> String {
 }
 
 #[track_caller]
-fn refused(tokens: TokenStream, message: &str) {
-    let found = errors(&tokens);
+fn refused(tokens: &TokenStream, message: &str) {
+    let found = errors(tokens);
     assert!(found.contains(message), "expected an error containing {message:?}, got: {found:?}");
 }
 
@@ -48,15 +48,15 @@ fn options_blaze_query_does_not_have_are_unknown() {
         let option: TokenStream = option.parse().unwrap();
         let name = option.to_string();
         let name = name.split_whitespace().next().unwrap().to_owned();
-        refused(tracked_tokens(option, query()), &format!("unknown option `{name}`"));
+        refused(&tracked_tokens(option, query()), &format!("unknown option `{name}`"));
     }
 }
 
 #[test]
 fn unknown_options_are_refused() {
-    refused(tracked_tokens(quote!(frobnicate), query()), "unknown option `frobnicate`");
+    refused(&tracked_tokens(quote!(frobnicate), query()), "unknown option `frobnicate`");
     refused(
-        interned_tokens(
+        &interned_tokens(
             quote!(unsafe(non_update_types)),
             quote!(
                 struct S {
@@ -70,15 +70,15 @@ fn unknown_options_are_refused() {
 
 #[test]
 fn an_option_given_twice_is_refused() {
-    refused(tracked_tokens(quote!(lru = 1, lru = 2), query()), "option `lru` is given twice");
+    refused(&tracked_tokens(quote!(lru = 0, lru = 0), query()), "option `lru` is given twice");
 }
 
 #[test]
 fn options_of_another_site_are_refused() {
-    refused(tracked_tokens(quote!(singleton), query()), "`singleton` is not an option");
+    refused(&tracked_tokens(quote!(singleton), query()), "`singleton` is not an option");
     refused(
-        input_tokens(
-            quote!(lru = 3),
+        &input_tokens(
+            quote!(lru = 0),
             quote!(
                 struct S {
                     a: u32,
@@ -88,7 +88,7 @@ fn options_of_another_site_are_refused() {
         "`lru` is not an option of `#[blaze_query::input]`",
     );
     refused(
-        interned_tokens(
+        &interned_tokens(
             quote!(singleton),
             quote!(
                 struct S {
@@ -101,14 +101,24 @@ fn options_of_another_site_are_refused() {
 }
 
 #[test]
+fn values_are_kept_by_their_bytes_never_by_a_count() {
+    refused(&tracked_tokens(quote!(lru = 512), query()), "a count of values is no bound on memory");
+    refused(&tracked_tokens(quote!(lru), query()), "say what one weighs with `weigh = ");
+    refused(&tracked_tokens(quote!(weigh = f), query()), "`weigh` is for `lru`");
+    refused(&tracked_tokens(quote!(lru = 0, weigh = f), query()), "`weigh` is for `lru`");
+    accepted(tracked_tokens(quote!(lru, weigh = crate::bytes_of), query()));
+    accepted(tracked_tokens(quote!(lru, weigh = |_: &u32| 4, mem_tag = Expand), query()));
+}
+
+#[test]
 fn cycle_options_combine_one_way_out() {
-    refused(tracked_tokens(quote!(cycle_fn = g), query()), "`cycle_fn` needs `cycle_initial`");
+    refused(&tracked_tokens(quote!(cycle_fn = g), query()), "`cycle_fn` needs `cycle_initial`");
     refused(
-        tracked_tokens(quote!(cycle_result = r, cycle_initial = i), query()),
+        &tracked_tokens(quote!(cycle_result = r, cycle_initial = i), query()),
         "`cycle_result` is one way out of a cycle",
     );
     refused(
-        tracked_tokens(quote!(no_eq, cycle_initial = i, cycle_fn = g), query()),
+        &tracked_tokens(quote!(no_eq, cycle_initial = i, cycle_fn = g), query()),
         "`no_eq` can't be used with `cycle_fn`",
     );
     accepted(tracked_tokens(quote!(cycle_initial = |_, _, _| 0, cycle_fn = g), query()));
@@ -116,7 +126,7 @@ fn cycle_options_combine_one_way_out() {
 
 #[test]
 fn a_return_mode_is_one_of_six() {
-    refused(tracked_tokens(quote!(returns(owned)), query()), "`returns` is one of");
+    refused(&tracked_tokens(quote!(returns(owned)), query()), "`returns` is one of");
     for mode in ["ref", "copy", "clone", "deref", "as_ref", "as_deref"] {
         let mode: TokenStream = mode.parse().unwrap();
         accepted(tracked_tokens(quote!(returns(#mode)), query()));
@@ -151,7 +161,7 @@ fn every_option_a_tracked_function_takes_expands() {
 #[test]
 fn a_tracked_function_has_a_database_and_no_type_parameters() {
     refused(
-        tracked_tokens(
+        &tracked_tokens(
             quote!(),
             quote!(
                 fn f() -> V {
@@ -162,7 +172,7 @@ fn a_tracked_function_has_a_database_and_no_type_parameters() {
         "takes the database",
     );
     refused(
-        tracked_tokens(
+        &tracked_tokens(
             quote!(),
             quote!(
                 fn f(db: Db) -> V {
@@ -173,7 +183,7 @@ fn a_tracked_function_has_a_database_and_no_type_parameters() {
         "a shared reference",
     );
     refused(
-        tracked_tokens(
+        &tracked_tokens(
             quote!(),
             quote!(
                 fn f<T>(db: &Db, t: T) -> V {
@@ -184,7 +194,7 @@ fn a_tracked_function_has_a_database_and_no_type_parameters() {
         "no type or const parameters",
     );
     refused(
-        tracked_tokens(
+        &tracked_tokens(
             quote!(),
             quote!(
                 async fn f(db: &Db) -> V {
@@ -199,14 +209,14 @@ fn a_tracked_function_has_a_database_and_no_type_parameters() {
 #[test]
 fn a_tracked_impl_is_inherent_and_its_methods_take_self_by_value() {
     refused(
-        tracked_tokens(
+        &tracked_tokens(
             quote!(),
             quote!(impl Tr for S { #[blaze_query::tracked] fn m(self, db: &Db) {} }),
         ),
         "an inherent `impl`",
     );
     refused(
-        tracked_tokens(
+        &tracked_tokens(
             quote!(),
             quote!(impl S { #[blaze_query::tracked] fn m(&self, db: &Db) {} }),
         ),
@@ -235,7 +245,7 @@ fn a_tracked_impl_is_inherent_and_its_methods_take_self_by_value() {
 #[test]
 fn field_attributes_belong_to_their_struct() {
     refused(
-        input_tokens(
+        &input_tokens(
             quote!(),
             quote!(
                 struct S {
@@ -247,7 +257,7 @@ fn field_attributes_belong_to_their_struct() {
         "`#[tracked]` is not a field attribute of `#[blaze_query::input]`",
     );
     refused(
-        interned_tokens(
+        &interned_tokens(
             quote!(),
             quote!(
                 struct S {
@@ -259,7 +269,7 @@ fn field_attributes_belong_to_their_struct() {
         "`#[default]` is not a field attribute",
     );
     refused(
-        tracked_tokens(
+        &tracked_tokens(
             quote!(),
             quote!(
                 struct S<'db> {
@@ -271,7 +281,7 @@ fn field_attributes_belong_to_their_struct() {
         "`#[no_eq]` goes on a `#[tracked]` field",
     );
     refused(
-        input_tokens(
+        &input_tokens(
             quote!(),
             quote!(
                 struct S {
@@ -336,7 +346,7 @@ fn every_struct_form_expands() {
 #[test]
 fn an_error_gives_the_item_back_so_its_uses_resolve() {
     let tokens = input_tokens(
-        quote!(lru = 3),
+        quote!(lru = 0),
         quote!(
             struct S {
                 #[returns(copy)]

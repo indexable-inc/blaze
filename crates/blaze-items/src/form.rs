@@ -680,7 +680,7 @@ impl<'db> Cx<'db> {
     }
 
     /// `form` finished and written into `f`.
-    fn nest(&self, f: &mut Form, form: Form) {
+    fn nest(&self, f: &mut Form, form: &Form) {
         f.merge(&form.digest_id(), &form.spans_id(), &form.refs, form.missed);
     }
 
@@ -691,7 +691,7 @@ impl<'db> Cx<'db> {
         let Some(first) = forms.next() else { return f.len(0) };
         let Some(second) = forms.next() else {
             f.len(1);
-            return self.nest(f, first);
+            return self.nest(f, &first);
         };
         // alloc: a set of two forms or more; spelling nests as types do, deeper than frames.
         let forms: Vec<Form> = [first, second].into_iter().chain(forms).collect();
@@ -936,7 +936,7 @@ impl<'db> Cx<'db> {
                     AdtId::UnionId(it) => _ = first(it.into(), None),
                     AdtId::EnumId(it) => {
                         for (name, &(variant, _)) in it.enum_variants(db).variants.iter() {
-                            if first(variant.into(), Some(name.symbol().as_str())) {
+                            if first(variant.into(), Some(name.as_str())) {
                                 break;
                             }
                         }
@@ -1280,7 +1280,7 @@ impl<'db> Cx<'db> {
                 f.u8(LEAK);
             } else {
                 f.u8(1);
-                self.nest(f, self.code_form(InferBodyId::DefWithBodyId(func.into())));
+                self.nest(f, &self.code_form(InferBodyId::DefWithBodyId(func.into())));
             }
         } else {
             f.u8(0);
@@ -1291,6 +1291,44 @@ impl<'db> Cx<'db> {
             let idx = ImplTraitIdx::from_raw(index.into());
             let opaque = InternedOpaqueTyId::new(db, ImplTraitId::ReturnTypeImplTrait(func, idx));
             self.opaque(f, ItemId::Function(func), index, opaque);
+        }
+        // An impl method's value for each `impl Trait` of the trait method it implements
+        // (`impl_rpitit_tys`, rustc's `collect_return_position_impl_trait_in_trait_tys`): what
+        // a caller normalizing the trait's item for this impl gets. It is found by matching
+        // this signature against the trait method's, so it changes with the trait method too.
+        let rpitits = hir_ty::rpitit::impl_rpitit_tys(db, func);
+        f.len(rpitits.len());
+        for value in rpitits {
+            match value {
+                Ok(ty) => {
+                    f.u8(1);
+                    self.ty_in(f, ty.get().skip_binder());
+                }
+                Err(error) => {
+                    f.u8(0);
+                    match error {
+                        hir_ty::rpitit::RpititError::GenericsDiffer => f.u8(0),
+                        hir_ty::rpitit::RpititError::NotFound => f.u8(1),
+                        // The impl's type is the impl method's return type's, in the
+                        // signature already.
+                        hir_ty::rpitit::RpititError::UncapturedLifetime { lifetime, hidden: _ } => {
+                            f.u8(2);
+                            f.str(lifetime);
+                        }
+                        hir_ty::rpitit::RpititError::Unsolved => f.u8(3),
+                        hir_ty::rpitit::RpititError::Unnormalized => f.u8(4),
+                        // The bounds are the trait's items', through refs, with the impl's
+                        // types, which are the impl method's signature's.
+                        hir_ty::rpitit::RpititError::Unsatisfied { bounds: _, of } => {
+                            f.u8(5);
+                            f.len(of.len());
+                            for &index in of.iter() {
+                                f.u32(index);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1370,7 +1408,7 @@ impl<'db> Cx<'db> {
             // The name: `for const` over the fields reads it (`Field::NAME`), so two types
             // alike but for a field's name expand apart.
             f.str(data.name.symbol().as_str());
-            self.nest(f, self.field_form(variant, field));
+            self.nest(f, &self.field_form(variant, field));
         }
     }
 
@@ -1455,7 +1493,7 @@ impl<'db> Cx<'db> {
             self.allocation(f, value);
         } else if data.has_body() {
             f.u8(1);
-            self.nest(f, self.code_form(InferBodyId::DefWithBodyId(it.into())));
+            self.nest(f, &self.code_form(InferBodyId::DefWithBodyId(it.into())));
         } else {
             f.u8(0);
         }
@@ -1480,7 +1518,7 @@ impl<'db> Cx<'db> {
             f.u8(LEAK);
         } else if holds {
             f.u8(1);
-            self.nest(f, self.code_form(InferBodyId::DefWithBodyId(it.into())));
+            self.nest(f, &self.code_form(InferBodyId::DefWithBodyId(it.into())));
         } else {
             f.u8(0);
         }
@@ -1524,7 +1562,7 @@ impl<'db> Cx<'db> {
         match self.hidden(owner, index) {
             Some(hidden) => {
                 self.ty_in(f, hidden);
-                self.nest(f, self.auto_traits_form(owner, index));
+                self.nest(f, &self.auto_traits_form(owner, index));
             }
             None => f.error(Missed::ErrorType),
         }
@@ -2106,7 +2144,7 @@ impl<'db> Cx<'db> {
         if self.leak_free {
             f.u8(LEAK);
         } else {
-            self.nest(f, self.captures_of(loc));
+            self.nest(f, &self.captures_of(loc));
         }
     }
 

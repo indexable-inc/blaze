@@ -410,7 +410,10 @@ impl ExprCollector<'_> {
                     if let Some(name_ref) = assoc_type_arg.name_ref() {
                         // Nested impl traits like `impl Foo<Assoc = impl Bar>` are allowed
                         self.with_outer_impl_trait_scope(false, |this| {
-                            let name = name_ref.as_name();
+                            let name = this.assoc_binding_name(
+                                name_ref.as_name(),
+                                name_ref.syntax().text_range(),
+                            );
                             let args = assoc_type_arg
                                 .generic_arg_list()
                                 .and_then(|args| this.lower_generic_args(args, impl_trait_lower_fn))

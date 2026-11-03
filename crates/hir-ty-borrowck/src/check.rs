@@ -507,10 +507,11 @@ pub(super) fn check<'o, 'f, 'db>(
     })
 }
 
-/// rustc's `apply_member_constraint` for each region of a returned `impl Trait`'s hidden type:
-/// the smallest of the choices that outlives what the region holds and is outlived by what
-/// outlives it, of those comparable to all the others; `None` when there is none, and the
-/// hidden type names a lifetime the `impl Trait` does not capture.
+/// rustc's `apply_member_constraint` for each member constraint, a region of a returned
+/// `impl Trait`'s hidden type and that `impl Trait`'s choices: the smallest of the choices that
+/// outlives what the region holds and is outlived by what outlives it, of those comparable to
+/// all the others; `None` when there is none, and the hidden type names a lifetime the
+/// `impl Trait` does not capture.
 fn member_choices<'f>(
     frame: &'f Frame,
     regions: &regions::Regions<'_, '_>,
@@ -529,15 +530,17 @@ fn member_choices<'f>(
             .filter(|&at| constraints.sup(at) < count && constraints.sub(at) < count)
             .map(|at| (constraints.sub(at) as u32, constraints.sup(at) as u32)),
     );
-    let choices =
-        mem::collect(frame, regions.choices.iter().filter_map(|&it| regions.universal(it)));
+    let mut choices: FVec<'_, usize> = Vec::new_in(frame);
     let mut chosen = Vec::with_capacity_in(regions.members.len(), frame);
     let mut lower: FVec<'_, usize> = Vec::new_in(frame);
     let mut upper: FVec<'_, usize> = Vec::new_in(frame);
     let mut seen = bits(frame, count);
     let mut stack: FVec<'_, regions::Rv> = Vec::new_in(frame);
     let mut fits: FVec<'_, usize> = Vec::new_in(frame);
-    for &member in &regions.members {
+    for constraint in &regions.members {
+        let member = constraint.region;
+        choices.clear();
+        choices.extend(regions.choices_of(constraint).iter().filter_map(|&it| regions.universal(it)));
         lower.clear();
         lower.extend(values.universals_of(member).filter(|&it| it != 1));
         // A region of the signature written into the hidden type is that region on both sides.
@@ -2427,6 +2430,7 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                 if kind == UniversalKind::FnBody
                     || self.regions.type_outlives_known(test.ty, universal)
                     || self.binder_type_assumed(test, universal)
+                    || self.placeholder_type_assumed(test, universal)
                 {
                     continue;
                 }
@@ -2586,14 +2590,77 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
     /// Whether the type test `test`, of what a higher-ranked relate proves of its less general
     /// side, holds for `universal` by a type bound the more general side implies of a region
     /// that is not its placeholder (`Regions::binder_type_bounds`): `T: 'static` of
-    /// `for<'x> fn(&'static T, &'x ())`. Of that relate's type tests only.
+    /// `for<'x> fn(&'static T, &'x ())`. Of that relate's type tests only, on the same type up
+    /// to equal regions (`same_type_up_to_components`).
     fn binder_type_assumed(&self, test: &regions::TypeTest<'db>, universal: usize) -> bool {
         self.regions.dropped_type_bound(test.ty, test.lower, test.span).is_some()
             && self.regions.binder_type_bounds.iter().any(|&(span, ty, region)| {
                 span == test.span
-                    && ty == test.ty
                     && self.values.universals_of(region).any(|it| it == universal)
+                    && self.same_type_up_to_components(ty, test.ty)
             })
+    }
+
+    /// Whether the type test `test`, of what a higher-ranked relate proves of its less general
+    /// side, holds for the placeholder `universal` by a type bound the more general side of
+    /// the same relate implies of it (`Regions::placeholder_type_bounds`), on the same type up
+    /// to equal regions: `<M as Machine<'db>>::Prov: '1` of the closure passed as
+    /// `for<'1> FnOnce(&'1 <M as Machine<'db>>::Prov)`, whose two sides name `'db` by
+    /// variables of their own, which the relate makes one. Of that relate's type tests only.
+    fn placeholder_type_assumed(&self, test: &regions::TypeTest<'db>, universal: usize) -> bool {
+        self.regions.dropped_type_bound(test.ty, test.lower, test.span).is_some()
+            && self.regions.placeholder_type_bounds.iter().any(|&(span, bounded, region)| {
+                span == test.span
+                    && self.regions.universal(region) == Some(universal)
+                    && self.same_type_up_to_components(bounded, test.ty)
+            })
+    }
+
+    /// Whether `a` and `b` are one type once each region is its strongly connected component
+    /// of the outlives graph, as region inference left it: rustc's `VerifyIfEq`, which matches
+    /// a bound against the tested type with both normalized to their components'
+    /// representatives (`eval_verify_bound`). Two regions are equal only in one component,
+    /// never because neither outlives a universal region, or because each is known to
+    /// outlive the other through where clauses. A region that is no variable, one a type
+    /// in the type binds, is equal only to itself.
+    fn same_type_up_to_components(&self, a: Ty<'db>, b: Ty<'db>) -> bool {
+        if a == b {
+            return true;
+        }
+        let interner = self.ctx.infcx.interner;
+        let frame = self.ctx.frame;
+        let erase = |ty: Ty<'db>| {
+            rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner))
+        };
+        if erase(a) != erase(b) {
+            return false;
+        }
+        let regions_of = |ty: Ty<'db>| {
+            let mut out: FVec<'_, Region<'db>> = Vec::new_in(frame);
+            rustc_type_ir::fold_regions(interner, ty, |region, _| {
+                out.push(region);
+                region
+            });
+            out
+        };
+        let rv = |region: Region<'db>| match region.kind() {
+            RegionKind::ReStatic => Some(self.regions.static_rv),
+            _ => regions::rv_of(region),
+        };
+        let same = |x: Region<'db>, y: Region<'db>| {
+            x == y
+                || match (rv(x), rv(y)) {
+                    (Some(x), Some(y)) => {
+                        x == y
+                            || (x < self.region_count
+                                && y < self.region_count
+                                && self.values.same_component(x, y))
+                    }
+                    _ => false,
+                }
+        };
+        let (xs, ys) = (regions_of(a), regions_of(b));
+        xs.len() == ys.len() && xs.iter().zip(&ys).all(|(&x, &y)| same(x, y))
     }
 
     /// rustc's `try_propagate_universal_region_error`, for every universal region `longer`
@@ -2811,12 +2878,7 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
         }
         let mut components: FVec<'_, regions::Rv> = Vec::new_in(frame);
         let mut params: FVec<'_, Ty<'db>> = Vec::new_in(frame);
-        let captured = match alias.kind {
-            rustc_type_ir::AliasTyKind::Opaque { def_id } => {
-                regions::opaque_captures(frame, self.ctx.db, def_id, alias.args.len())
-            }
-            _ => None,
-        };
+        let captured = regions::alias_captures(frame, self.ctx.db, alias.kind, alias.args.len());
         for (index, arg) in alias.args.iter().enumerate() {
             if captured.as_ref().is_some_and(|it| !it[index]) {
                 continue;

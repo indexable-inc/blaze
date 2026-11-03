@@ -293,10 +293,7 @@ impl<'db> ProofTreeVisitor<'db> for Select {
 
         // One candidate, no need to winnow.
         if candidates.len() == 1 {
-            return ControlFlow::Break(Ok(to_selection(
-                self.span,
-                candidates.into_iter().next().unwrap(),
-            )));
+            return ControlFlow::Break(Ok(to_selection(self.span, &candidates[0])));
         }
 
         // Don't winnow until `Certainty::Yes` -- we don't need to winnow until
@@ -321,7 +318,7 @@ impl<'db> ProofTreeVisitor<'db> for Select {
             }
         }
 
-        ControlFlow::Break(Ok(to_selection(self.span, candidates.into_iter().next().unwrap())))
+        ControlFlow::Break(Ok(to_selection(self.span, &candidates[0])))
     }
 }
 
@@ -387,7 +384,7 @@ fn candidate_should_be_dropped_in_favor_of<'db>(
     }
 }
 
-fn to_selection<'db>(span: Span, cand: InspectCandidate<'_, 'db>) -> Option<Selection<'db>> {
+fn to_selection<'db>(span: Span, cand: &InspectCandidate<'_, 'db>) -> Option<Selection<'db>> {
     if let Certainty::Maybe(_) = cand.shallow_certainty() {
         return None;
     }

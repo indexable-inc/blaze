@@ -30,7 +30,7 @@ use crate::{
     generics::Generics,
     lower::LoweringMode,
     next_solver::{
-        ClauseKind, DbInterner, GenericArgs, ParamEnv, StoredClauses, Ty, TyKind,
+        ClauseKind, DbInterner, GenericArgs, ParamEnv, PolyTraitRef, StoredClauses, Ty, TyKind,
         infer::{
             DbInternerInferExt, InferCtxt,
             select::EvaluationResult,
@@ -170,6 +170,28 @@ pub fn implements_trait_unique_with_args<'db>(
     args: GenericArgs<'db>,
 ) -> bool {
     implements_trait_unique_with_infcx(db, env, trait_, |_| args)
+}
+
+/// Whether `trait_ref` holds in `env`, its `for<'a>` binder kept: rustc's
+/// `predicate_must_hold_modulo_regions` of an obligation of the whole bound, as clippy proves a
+/// callee's where clause instantiated with another type. Unlike
+/// [`implements_trait_unique_with_args`], whose arguments are free, an argument may name a
+/// region the binder binds (`for<'a> F: Fn(&'a T)`).
+///
+/// This should not be used in `hir-ty`, only in `hir`.
+pub fn poly_trait_ref_holds<'db>(
+    db: &'db Db,
+    env: ParamEnvAndCrate<'db>,
+    trait_ref: PolyTraitRef<'db>,
+) -> bool {
+    if trait_ref.skip_binder().self_ty().is_ty_error() {
+        return false;
+    }
+    let interner = DbInterner::new_with(db, env.krate);
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    crate::comptime_env::enter_universes(&infcx, env.param_env);
+    let obligation = Obligation::new(interner, ObligationCause::dummy(), env.param_env, trait_ref);
+    infcx.predicate_must_hold_modulo_regions(&obligation)
 }
 
 pub fn implements_trait_unique_with_infcx<'db>(

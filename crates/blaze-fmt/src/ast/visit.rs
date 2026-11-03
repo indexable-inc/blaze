@@ -32,7 +32,7 @@ pub enum LifetimeCtxt {
     GenericArg,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum FnKind<'a> {
     /// E.g., `fn foo()`, `fn foo(&self)`, or `extern "Abi" fn foo()`.
     Fn(FnCtxt, &'a Visibility, &'a Fn),

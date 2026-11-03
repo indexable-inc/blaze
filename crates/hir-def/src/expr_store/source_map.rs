@@ -52,6 +52,11 @@ impl<K, V> IdTable<K, V> {
     pub(crate) fn entries(&self) -> &[(K, V)] {
         &self.0
     }
+
+    /// The bytes of its entries, not each value's own heap.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        size_of_val::<[(K, V)]>(&self.0)
+    }
 }
 
 impl<K: Ord + Copy, V> IdTable<K, V> {
@@ -133,6 +138,13 @@ pub(crate) struct SourceTable<K, V>(Box<[(K, V)]>);
 impl<K, V> Default for SourceTable<K, V> {
     fn default() -> Self {
         SourceTable(Box::default())
+    }
+}
+
+impl<K, V> SourceTable<K, V> {
+    /// The bytes of its entries (keys and ids own no heap).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        size_of_val::<[(K, V)]>(&self.0)
     }
 }
 
@@ -338,6 +350,16 @@ impl<T, N> BackMap<T, N> {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.kinds.len()
+    }
+
+    /// The bytes of its columns.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let BackMap { kinds, starts, ends, run_starts, run_files, of: _ } = self;
+        size_of_val::<[u16]>(kinds)
+            + size_of_val::<[u32]>(starts)
+            + size_of_val::<[u32]>(ends)
+            + size_of_val::<[u32]>(run_starts)
+            + size_of_val::<[HirFileId]>(run_files)
     }
 
     /// The run `slot` is in. Only for a slot with syntax, which is in a run.
@@ -642,6 +664,11 @@ impl BindingPats {
         BindingPats { starts: starts.into_boxed_slice(), pats: pats.into_boxed_slice() }
     }
 
+    /// The bytes of its offsets and patterns.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        size_of_val::<[u32]>(&self.starts) + size_of_val::<[PatId]>(&self.pats)
+    }
+
     /// The patterns of `binding`, empty for one past the store's.
     #[inline]
     pub(crate) fn get(&self, binding: BindingId) -> &[PatId] {
@@ -716,6 +743,61 @@ pub(in crate::expr_store) struct ExpressionOnlySourceMap {
     // We store diagnostics on the `ExpressionOnlySourceMap` because diagnostics are rare (except
     // maybe for cfgs, and they are also not common in type places).
     pub(in crate::expr_store) diagnostics: thin_vec::ThinVec<ExpressionStoreDiagnostics>,
+}
+
+impl FormatTemplate {
+    /// The bytes of its tables and of the capture lists in them.
+    fn heap_bytes(&self) -> usize {
+        use crate::heap::vec_bytes;
+        let FormatTemplate { format_args_to_captures, asm_to_captures, implicit_capture_to_source } =
+            self;
+        let format_captures = format_args_to_captures.entries().iter();
+        let format_captures: usize = format_captures.map(|(_, (_, it))| vec_bytes(it)).sum();
+        let asm_captures: usize = asm_to_captures
+            .entries()
+            .iter()
+            .map(|(_, pieces)| vec_bytes(pieces) + pieces.iter().map(vec_bytes).sum::<usize>())
+            .sum();
+        format_args_to_captures.heap_bytes()
+            + format_captures
+            + asm_to_captures.heap_bytes()
+            + asm_captures
+            + implicit_capture_to_source.heap_bytes()
+    }
+}
+
+impl ExpressionOnlySourceMap {
+    /// The bytes of its tables and of its diagnostics' buffer, not each diagnostic's own heap.
+    fn heap_bytes(&self) -> usize {
+        let ExpressionOnlySourceMap {
+            expr_map,
+            expr_map_back,
+            pat_map,
+            pat_map_back,
+            label_map,
+            label_map_back,
+            binding_definitions,
+            field_map_back,
+            pat_field_map_back,
+            template_map,
+            expansions,
+            diagnostics,
+        } = self;
+        let template_map =
+            template_map.as_deref().map_or(0, |it| size_of::<FormatTemplate>() + it.heap_bytes());
+        expr_map.heap_bytes()
+            + expr_map_back.heap_bytes()
+            + pat_map.heap_bytes()
+            + pat_map_back.heap_bytes()
+            + label_map.heap_bytes()
+            + label_map_back.heap_bytes()
+            + binding_definitions.heap_bytes()
+            + field_map_back.heap_bytes()
+            + pat_field_map_back.heap_bytes()
+            + template_map
+            + expansions.heap_bytes()
+            + crate::heap::thin_vec_bytes(diagnostics)
+    }
 }
 
 impl PartialEq for ExpressionOnlySourceMap {
@@ -888,6 +970,26 @@ impl Move<'_> {
 }
 
 impl ExpressionStoreSourceMap {
+    /// The heap the map owns, in bytes: its tables, the capture lists of its templates and its
+    /// diagnostics' buffer, not each diagnostic's own heap.
+    pub fn heap_bytes(&self) -> usize {
+        let ExpressionStoreSourceMap {
+            expr_only,
+            types_map_back,
+            types_map,
+            lifetime_map_back,
+            lifetime_map,
+        } = self;
+        let expr_only = expr_only
+            .as_deref()
+            .map_or(0, |it| size_of::<ExpressionOnlySourceMap>() + it.heap_bytes());
+        expr_only
+            + types_map_back.heap_bytes()
+            + types_map.heap_bytes()
+            + lifetime_map_back.heap_bytes()
+            + lifetime_map.heap_bytes()
+    }
+
     /// The same map with what it points to in `mv.file` moved: what a body lowered as a tree of
     /// its own maps to, as a map of where the body is in its file
     /// ([`crate::expr_store::body::BodySyntax`]).

@@ -597,6 +597,8 @@ impl Kqueue {
     fn spawn(&mut self, command: Box<Command>, tag: Tag) -> io::Result<()> {
         let process::Started { pid, stdin, stdout, stderr, finish } =
             process::start(&self.spawn_dirs, command, self.confine.as_ref())?;
+        // Reaped only as this driver's loop polls its exit: a stall report names the tag.
+        finish.waited_by(tag);
         let spawn = self.spawns.insert(Spawned {
             tag,
             pid,

@@ -303,12 +303,17 @@ fn stopped_by(
     if let Some(stop) = cx.stop.take() {
         return Err(stop);
     }
-    if error.downcast_ref::<Unentered>().is_some() {
+    if let Some(&Unentered { errno }) = error.downcast_ref::<Unentered>() {
         let dir = cx.os.current_dir().unwrap_or("<none>");
+        let why = match (errno, u16::try_from(errno).ok().and_then(|it| blaze_wasi::Errno(it).name())) {
+            (0, _) => "no errno".to_owned(), // alloc: error path
+            (_, Some(name)) => format!("{name} (WASI errno {errno})"), // alloc: error path
+            (_, None) => format!("WASI errno {errno}"), // alloc: error path
+        };
         // alloc: error path
         return Err(Stop(format!(
             "could not enter `{dir}`, the directory cargo runs rustc in for the calling crate, in its \
-             wasm module (`std::env::set_current_dir` in blaze's glue failed)"
+             wasm module: `std::env::set_current_dir` in blaze's glue failed with {why}"
         )));
     }
     if let Some(bytes) = cx.output.take() {
@@ -331,13 +336,15 @@ fn stopped_by(
 }
 
 /// The glue's [`abi::UNENTERED`]: it could not enter the working directory `current_dir`
-/// named, which [`stopped_by`] names.
+/// named, failing with `errno` (0 for none), which [`stopped_by`] names.
 #[derive(Debug)]
-struct Unentered;
+struct Unentered {
+    errno: u32,
+}
 
 impl std::fmt::Display for Unentered {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the module could not enter its working directory")
+        write!(f, "the module could not enter its working directory (errno {})", self.errno)
     }
 }
 
@@ -380,7 +387,7 @@ fn run(store: &mut Store<Host>, pre: &InstancePre<Host>, index: u32, input: &[u8
     match expand.call(&mut *store, (index, at, len))? {
         0 => Ok(()),
         1 => Err(wasmtime::Error::msg(format!("the module has no macro at index {index}"))),
-        abi::UNENTERED => Err(wasmtime::Error::new(Unentered)),
+        status if status & abi::STATUS == abi::UNENTERED => Err(wasmtime::Error::new(Unentered { errno: status >> 8 })),
         status => Err(wasmtime::Error::msg(format!("the module returned status {status}, which the ABI has not"))),
     }
 }

@@ -488,7 +488,15 @@ impl<S: ScopeSink> StoreVisitor for ExprScopeVisitor<'_, S> {
                 });
                 self.const_scope = old_const_scope;
             }
-            Expr::Closure { args, arg_types, ret_type, body, capture_by: _, closure_kind: _ } => {
+            Expr::Closure {
+                args,
+                arg_types,
+                ret_type,
+                body,
+                capture_by: _,
+                closure_kind: _,
+                binder: _,
+            } => {
                 arg_types.iter().for_each(|type_ref| self.on_type_opt(*type_ref));
                 self.on_type_opt(ret_type);
                 let scope = self.new_scope(self.scope, NewScope::Plain);
@@ -977,7 +985,7 @@ fn foo() {
         let function = find_function(&db, file_id);
 
         let scopes = ExprScopes::body_expr_scopes(&db, DefWithBodyId::from(function));
-        let (_, source_map) = Body::with_source_map(&db, function.into());
+        let source_map = Body::source_map(&db, function.into());
 
         let expr_scope = {
             let expr = name_ref.syntax().ancestors().find_map(view::Expr::cast).unwrap();

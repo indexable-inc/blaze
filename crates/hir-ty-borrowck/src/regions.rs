@@ -33,7 +33,7 @@ use hir_ty::{
     },
     next_solver::{
         Clause, ConstKind, FreeConstAliasId, GenericArgKind, GenericArgs, InherentAssocConstId,
-        OpaqueTyIdWrapper, Region, RegionExt as _, StoredRegion, StoredTy, TraitAssocConstId, Ty,
+        Region, RegionExt as _, StoredRegion, StoredTy, TraitAssocConstId, Ty,
         TyKind, infer::region_constraints::Constraint,
     },
 };
@@ -48,6 +48,15 @@ use super::{
 
 /// A region variable.
 pub(super) type Rv = usize;
+
+/// A region of a returned `impl Trait`'s hidden type, which must be one of its choices:
+/// rustc's `MemberConstraint`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Member {
+    pub(super) region: Rv,
+    /// Where its choices are in [`Regions::choices`].
+    pub(super) choices: std::ops::Range<u32>,
+}
 
 /// A `let` with a type written out, in the block it is a statement of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -230,10 +239,13 @@ pub(super) struct Regions<'f, 'db> {
     /// In a closure, the position among the regions of its type of each of its creator's
     /// universal regions, by universal region.
     pub(super) creator_positions: FMap<'f, usize, usize>,
-    /// The regions of a returned `impl Trait`'s hidden type, each of which must be one of
-    /// `choices`, `'static` and the lifetimes the `impl Trait` captures: rustc's member
-    /// constraints. Empty when what it captures is not known exactly.
-    pub(super) members: FVec<'f, Rv>,
+    /// rustc's member constraints: each region of the hidden type of an `impl Trait` the
+    /// signature returns must be one of its choices, `'static` and the lifetimes that
+    /// `impl Trait` captures. One set of choices for each `impl Trait` in the return type,
+    /// nested ones too (`impl Iterator<Item = impl Plain>`, `(impl A, impl B)`); none for one
+    /// whose captures are not known exactly.
+    pub(super) members: FVec<'f, Member>,
+    /// The choices of every member constraint, each [`Member`]'s a range of it.
     pub(super) choices: FVec<'f, Rv>,
     /// The body returns an `impl Trait` that captures no lifetime, of a hidden type alias
     /// liveness keeps some region of live: what it returns must be `'static`, rustc's
@@ -253,8 +265,10 @@ pub(super) struct Regions<'f, 'db> {
     /// the whole body.
     pub(super) placeholder_bounds: FVec<'f, (Rv, Rv)>,
     /// Its type bounds of a placeholder, `T: 'x` of `for<'x> fn(&'x T)`, known of that
-    /// placeholder only.
-    pub(super) placeholder_type_bounds: FVec<'f, (Ty<'db>, Rv)>,
+    /// placeholder only, by the span of the relate: matched up to regions
+    /// (`Checker::placeholder_type_assumed`) only by the type tests of what that relate proves
+    /// of the less general side, as `binder_type_bounds` are.
+    pub(super) placeholder_type_bounds: FVec<'f, (MirSpan, Ty<'db>, Rv)>,
     /// Its type bounds of any other region, `T: 'static` of `fn(&'static T)`, by the span of
     /// the relate: known only to the type tests of what that relate proves of the less general
     /// side (`Regions::dropped_type_bound`).
@@ -276,6 +290,11 @@ pub(super) struct Regions<'f, 'db> {
 }
 
 impl<'f, 'db> Regions<'f, 'db> {
+    /// The choices of the member constraint `member`.
+    pub(super) fn choices_of(&self, member: &Member) -> &[Rv] {
+        &self.choices[member.choices.start as usize..member.choices.end as usize]
+    }
+
     /// The bound an `ImpliedBound` constraint `sup: sub` proves, or the constraint
     /// `inference::answer_placeholders` answered with it does.
     pub(super) fn dropped_bound(&self, sup: Rv, sub: Rv) -> Option<&DroppedBound<'db>> {
@@ -325,7 +344,7 @@ impl<'f, 'db> Regions<'f, 'db> {
         }) || self
             .placeholder_type_bounds
             .iter()
-            .any(|&(bounded, region)| bounded == ty && self.universal(region) == Some(universal))
+            .any(|&(_, bounded, region)| bounded == ty && self.universal(region) == Some(universal))
     }
 }
 
@@ -406,18 +425,20 @@ fn projections<'db>(
     rustc_type_ir::TypeVisitable::visit_with(&ty, &mut Find(out));
 }
 
-/// Which arguments of the `impl Trait` `opaque`, of `len` of them, its hidden type may name:
-/// those not bivariant in rustc's `variances_of` the opaque type (hir-ty's
-/// `next_solver::opaque_variances`), which its liveness skips. `None` when the opaque has another
-/// number of arguments, which counts every argument captured.
-pub(super) fn opaque_captures<'f, 'db>(
+/// Which arguments of an alias of kind `kind`, of `len` of them, the type it stands for may
+/// name: those not bivariant in rustc's `opt_alias_variances`, which relating, outlives and
+/// liveness skip. An `impl Trait` has them, an opaque type or a trait method's `impl Trait`
+/// item (an RPITIT projection, its opaque type's variances; hir-ty's
+/// `next_solver::opaque_variances`). `None` for any other alias, and when the variances are of
+/// another number of arguments, which counts every argument captured.
+pub(super) fn alias_captures<'f, 'db>(
     frame: &'f Frame,
     db: &'db Db,
-    opaque: OpaqueTyIdWrapper<'db>,
+    kind: rustc_type_ir::AliasTyKind<hir_ty::next_solver::DbInterner<'db>>,
     len: usize,
 ) -> Option<FVec<'f, bool>> {
     use rustc_type_ir::Interner as _;
-    let variances = hir_ty::next_solver::DbInterner::new_no_crate(db).variances_of(opaque.into());
+    let variances = hir_ty::next_solver::DbInterner::new_no_crate(db).opt_alias_variances(kind)?;
     if variances.len() != len {
         return None;
     }
@@ -467,13 +488,14 @@ fn any_ty<'db>(ty: Ty<'db>, mut f: impl FnMut(Ty<'db>) -> bool) -> bool {
         .is_break()
 }
 
-/// The parts of `actual` where `declared`, the same type but for its `impl Trait`s, has an
-/// `impl Trait`: the types those hide.
-fn hidden_types<'db>(declared: Ty<'db>, actual: Ty<'db>, out: &mut FVec<'_, Ty<'db>>) {
+/// Each `impl Trait` `declared` has, with the part of `actual`, the same type but for its
+/// `impl Trait`s, that is where it is: the type it hides. `(impl Iterator, &'b str)` hides
+/// it in the tuple's first field.
+fn hidden_types<'db>(declared: Ty<'db>, actual: Ty<'db>, out: &mut FVec<'_, (Ty<'db>, Ty<'db>)>) {
     use rustc_type_ir::inherent::GenericArg as _;
     let args = |declared: hir_ty::next_solver::GenericArgs<'db>,
                 actual: hir_ty::next_solver::GenericArgs<'db>,
-                out: &mut FVec<'_, Ty<'db>>| {
+                out: &mut FVec<'_, (Ty<'db>, Ty<'db>)>| {
         if declared.len() == actual.len() {
             for (declared, actual) in declared.iter().zip(actual.iter()) {
                 if let (Some(declared), Some(actual)) = (declared.as_type(), actual.as_type()) {
@@ -486,7 +508,7 @@ fn hidden_types<'db>(declared: Ty<'db>, actual: Ty<'db>, out: &mut FVec<'_, Ty<'
         (TyKind::Alias(_, alias), _)
             if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind =>
         {
-            out.push(actual)
+            out.push((declared, actual))
         }
         (TyKind::Adt(a, declared), TyKind::Adt(b, actual)) if a == b => args(declared, actual, out),
         (TyKind::Tuple(declared), TyKind::Tuple(actual)) if declared.len() == actual.len() => {
@@ -531,9 +553,8 @@ fn names_captured_lifetime<'db>(frame: &Frame, db: &Db, ty: Ty<'db>) -> bool {
         fn visit_ty(&mut self, ty: Ty<'db>) {
             match ty.kind() {
                 TyKind::Alias(_, alias)
-                    if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind
-                        && let Some(captured) =
-                            opaque_captures(self.frame, self.db, def_id, alias.args.len()) =>
+                    if let Some(captured) =
+                        alias_captures(self.frame, self.db, alias.kind, alias.args.len()) =>
                 {
                     for (arg, captured) in alias.args.iter().zip(captured) {
                         if captured {
@@ -550,29 +571,33 @@ fn names_captured_lifetime<'db>(frame: &Frame, db: &Db, ty: Ty<'db>) -> bool {
     find.found
 }
 
-/// Whether `ty` is an `impl Trait` whose bounds say nothing of its hidden type's lifetimes, as
-/// `impl Cap<'a> + Cap<'b>`: no `+ 'a`, and no associated type that names one. Nested in a
-/// returned one's `Item = ..`, it adds nothing the returned one's member constraints need.
-fn unbounded_opaque<'db>(
+/// Whether `ty`, the type an associated type bound of an `impl Trait` gives, names a lifetime
+/// the `impl Trait` captures other than in an `impl Trait` in it: such a nested one has a
+/// defining use and member constraints of its own (`Builder::opaque_defining_uses`), so it
+/// adds nothing the outer one's member constraints need.
+fn names_captured_lifetime_outside_opaques<'db>(
     frame: &Frame,
     db: &Db,
     interner: hir_ty::next_solver::DbInterner<'db>,
     ty: Ty<'db>,
 ) -> bool {
-    let TyKind::Alias(_, alias) = ty.kind() else { return false };
-    let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind else { return false };
-    rustc_type_ir::Interner::item_bounds(interner, def_id.into())
-        .iter_instantiated(interner, alias.args.as_slice())
-        .all(|clause| match clause.kind().skip_binder() {
-            ClauseKind::TypeOutlives(_) | ClauseKind::RegionOutlives(_) => false,
-            ClauseKind::Projection(projection) => match projection.term.as_type() {
-                Some(ty) => {
-                    !names_captured_lifetime(frame, db, ty) || unbounded_opaque(frame, db, interner, ty)
+    let ty = rustc_type_ir::TypeFoldable::fold_with(
+        ty,
+        &mut hir_ty::next_solver::util::BottomUpFolder {
+            interner,
+            ty_op: |ty: Ty<'db>| match ty.kind() {
+                TyKind::Alias(_, alias)
+                    if matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. }) =>
+                {
+                    Ty::new_unit(interner)
                 }
-                None => !rustc_type_ir::TypeVisitableExt::has_free_regions(&projection.term),
+                _ => ty,
             },
-            _ => true,
-        })
+            lt_op: |region| region,
+            ct_op: |ct| ct,
+        },
+    );
+    names_captured_lifetime(frame, db, ty)
 }
 
 /// The regions of a hidden type that rustc's `CollectMemberConstraintsVisitor` gives member
@@ -616,9 +641,8 @@ fn member_regions<'db>(
                 }
                 TyKind::Alias(_, _) if !self.aliases => (),
                 TyKind::Alias(_, alias)
-                    if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind
-                        && let Some(captured) =
-                            opaque_captures(self.frame, self.db, def_id, alias.args.len()) =>
+                    if let Some(captured) =
+                        alias_captures(self.frame, self.db, alias.kind, alias.args.len()) =>
                 {
                     for (arg, captured) in alias.args.iter().zip(captured) {
                         if captured {
@@ -695,7 +719,9 @@ pub(super) fn build<'a, 'db>(
         returns_opaque: false,
         opaque_bounds: Vec::new_in(frame),
         opaque_hidden: None,
+        opaque_outlived: Vec::new_in(frame),
         elided_output: None,
+        elided_regions: Vec::new_in(frame),
         error_region: false,
         inferred: Default::default(),
         location: None,
@@ -713,6 +739,7 @@ pub(super) fn build<'a, 'db>(
     builder.universal_regions();
     builder.env_aliases();
     builder.location = None;
+    builder.hidden_types_outlive(At { category: Category::Boring, span: MirSpan::Unknown });
     builder.signature_projections();
     builder.signature_higher_ranked();
     builder.annotations();
@@ -787,8 +814,16 @@ struct Builder<'c, 'a, 'db> {
     /// The hidden type of the returned `impl Trait`, which must be well-formed where the body
     /// defines it, as rustc's `add_item_bounds_for_hidden_type` requires (#114728).
     opaque_hidden: Option<Ty<'db>>,
+    /// The hidden type of each `impl Trait` of the return type and the regions its bounds say
+    /// it outlives, whose aliases [`Builder::hidden_types_outlive`] proves once the
+    /// environment's are known.
+    opaque_outlived: FVec<'a, (Ty<'db>, FVec<'a, Rv>)>,
     /// The region lifetime elision gives the elided lifetimes of the return type.
     elided_output: Option<Region<'db>>,
+    /// The regions of the lifetimes the parameters leave out, as
+    /// `hir_ty::ElidedLifetimes::regions_into` gives them, for the arguments of an
+    /// `impl Trait` the function returns that are errors (`hir_ty::with_elided_regions`).
+    elided_regions: FVec<'a, Option<Region<'db>>>,
     /// The body's signature, or that of a function it calls or names, leaves out a lifetime
     /// with none to elide to (E0106): an error region in rustc, its `encountered_re_error`.
     error_region: bool,
@@ -1109,7 +1144,10 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                         .skip_norm_wip()
                         .skip_binder();
                     let mut inputs: FVec<'_, Ty<'db>> = mem::collect(self.ctx.frame, sig.inputs().iter().copied());
-                    let mut output = sig.output();
+                    // A trait method's default body returns its own `impl Trait`, the opaque
+                    // types its environment normalizes the trait's items for them to.
+                    let mut output =
+                        hir_ty::rpitit::rpitits_to_opaques(self.interner(), function, sig.output());
                     // rustc's writeback taints a body whose signature, normalized, has an
                     // error in it, and MIR building then makes no body to check: a projection
                     // of an item an impl with a parameter it does not constrain (E0207)
@@ -1207,6 +1245,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                         let elided = hir_ty::elided_lifetimes(self.ctx.db, function);
                         let mut regions = Vec::new_in(self.ctx.frame);
                         elided.regions_into(&errors, &mut regions);
+                        self.elided_regions.extend(regions.iter().copied());
                         if let Some(hir_ty::ElidedOutput::Elided(index)) = elided.output {
                             elided_input = regions.get(index as usize).copied().flatten();
                         }
@@ -1383,7 +1422,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 let Some(captured) = alias
                     .kind
                     .try_to_opaque()
-                    .and_then(|opaque| opaque_captures(self.ctx.frame, self.ctx.db, opaque, alias.args.len()))
+                    .and_then(|_| alias_captures(self.ctx.frame, self.ctx.db, alias.kind, alias.args.len()))
                 else {
                     return false;
                 };
@@ -1401,11 +1440,11 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             let captures_lifetime = signature.as_ref().is_some_and(|(_, output)| {
                 any_ty(*output, |ty| {
                     let TyKind::Alias(_, alias) = ty.kind() else { return false };
-                    let rustc_type_ir::AliasTyKind::Opaque { def_id: opaque } = alias.kind else {
+                    let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind else {
                         return false;
                     };
                     let Some(captured) =
-                        opaque_captures(self.ctx.frame, self.ctx.db, opaque, alias.args.len())
+                        alias_captures(self.ctx.frame, self.ctx.db, alias.kind, alias.args.len())
                     else {
                         return true;
                     };
@@ -1550,109 +1589,15 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                     self.regions.unsuggested.insert(index);
                 }
             }
-            // A C variadic's `VaList` lifetime is none of the function's generics, which are
-            // all an `impl Trait` it returns could capture; a lifetime parameter no parameter
-            // names is no choice of a region of the body.
+            // rustc's defining uses of each `impl Trait` of the return type. An `async fn`'s
+            // own, the `Output` of its future, is defined where the body makes the future
+            // (`async_output_members`).
             if opaque
                 && !hidden_static
                 && let Some((_, output)) = &signature
-                && let Some((alias, hidden)) = returned_opaque(*output, ty)
-                && let rustc_type_ir::AliasTyKind::Opaque { def_id: opaque_id } = alias.kind
-                && let Some(captured) =
-                    opaque_captures(self.ctx.frame, self.ctx.db, opaque_id, alias.args.len())
-                        .or_else(|| variadic.then(|| filled(self.ctx.frame, alias.args.len(), true)))
             {
-                let mut choices = Vec::new_in(self.ctx.frame);
-                choices.push(self.regions.static_rv);
-                let mut known = true;
-                for (arg, captured) in alias.args.iter().zip(captured) {
-                    if let GenericArgKind::Lifetime(region) = arg.kind()
-                        && captured
-                    {
-                        match self
-                            .signature_region(region, rustc_type_ir::INNERMOST)
-                            .and_then(rv_of)
-                        {
-                            Some(rv) => choices.push(rv),
-                            None if variadic => (),
-                            None => known = false,
-                        }
-                    }
-                }
-                // What the bounds say the `impl Trait` outlives its hidden type must: rustc
-                // proves them of it. A projection bound that names a lifetime constrains it in
-                // ways not followed here, so its member constraints are left out.
-                let mut outlived = Vec::new_in(self.ctx.frame);
-                let bounds =
-                    rustc_type_ir::Interner::item_bounds(self.interner(), opaque_id.into());
-                for clause in bounds.iter_instantiated(self.interner(), alias.args.as_slice()) {
-                    match clause.kind().skip_binder() {
-                        ClauseKind::TypeOutlives(OutlivesClause(bounded, region))
-                            if let TyKind::Alias(_, bounded) = bounded.kind()
-                                && bounded.kind == alias.kind =>
-                        {
-                            // Under the clause's own binder, the signature's is one further out.
-                            let binder = rustc_type_ir::INNERMOST.shifted_in(1);
-                            // A lifetime the bound elides, `+ '_`, rustc captures too.
-                            let elided = matches!(region.kind(), RegionKind::ReError(_));
-                            let rv = match elided {
-                                true => self.elided_output.and_then(rv_of),
-                                false => self.signature_region(region, binder).and_then(rv_of),
-                            };
-                            match rv {
-                                Some(rv) => {
-                                    outlived.push(rv);
-                                    if elided && !choices.contains(&rv) {
-                                        choices.push(rv);
-                                    }
-                                }
-                                None => known = false,
-                            }
-                        }
-                        ClauseKind::Projection(projection)
-                            if match projection.term.as_type() {
-                                Some(ty) => {
-                                    names_captured_lifetime(self.ctx.frame, self.ctx.db, ty)
-                                        && !unbounded_opaque(self.ctx.frame, self.ctx.db, self.interner(), ty)
-                                }
-                                None => rustc_type_ir::TypeVisitableExt::has_free_regions(
-                                    &projection.term,
-                                ),
-                            } =>
-                        {
-                            known = false;
-                        }
-                        _ => (),
-                    }
-                }
-                let mut members = Vec::new_in(self.ctx.frame);
-                member_regions(self.ctx.frame, self.ctx.db, hidden, true, &mut members);
-                members.retain(|&it| it != self.regions.static_rv);
-                radix::sort(&mut members);
-                members.dedup();
-                // An alias's own bounds may already say it outlives them, so the regions within
-                // one are left to the member constraints.
-                let mut bounded = Vec::new_in(self.ctx.frame);
-                member_regions(self.ctx.frame, self.ctx.db, hidden, false, &mut bounded);
-                bounded.retain(|&it| it != self.regions.static_rv);
-                radix::sort(&mut bounded);
-                bounded.dedup();
-                for &member in &bounded {
-                    for &sub in &outlived {
-                        self.regions.outlives.push(Outlives {
-                            sup: member,
-                            sub,
-                            location: None,
-                            category: Category::Boring,
-                            span: MirSpan::Unknown,
-                            from_closure: false,
-                        });
-                    }
-                }
-                if known {
-                    self.regions.members = members;
-                    self.regions.choices = choices;
-                }
+                let at = At { category: Category::Boring, span: MirSpan::Unknown };
+                self.opaque_defining_uses(*output, ty, 0, variadic, !is_async, at);
             }
             if let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)) = owner {
                 self.regions.is_impl_item = matches!(
@@ -1869,7 +1814,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         let hir_def::hir::Expr::Closure { arg_types, .. } = self.ctx.store.expr(closure) else {
             return None;
         };
-        let written = self.lower_written((*arg_types.get(index)?)?, MirSpan::ExprId(closure));
+        let written = self.lower_closure_written(closure, (*arg_types.get(index)?)?);
         let TyKind::Ref(_, written, _) = written.kind() else { return None };
         let TyKind::Dynamic(_, object) = written.kind() else { return None };
         if !matches!(object.kind(), RegionKind::ReStatic) || writes_static_object(self.ctx.store) {
@@ -1903,7 +1848,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         let hir_def::hir::Expr::Closure { arg_types, .. } = self.ctx.store.expr(closure) else {
             return None;
         };
-        let written = self.lower_written((*arg_types.get(index)?)?, MirSpan::ExprId(closure));
+        // A lifetime of the closure's `for<'a, ..>` is bound here, so not left out.
+        let written = self.lower_closure_written(closure, (*arg_types.get(index)?)?);
         let frame = self.ctx.frame;
         let regions = |ty: Ty<'db>| {
             let mut found = Vec::new_in(frame);
@@ -1999,6 +1945,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             arg_types,
             ret_type,
             closure_kind: hir_def::hir::ClosureKind::Closure,
+            binder,
             ..
         } = self.ctx.store.expr(closure)
         else {
@@ -2018,6 +1965,34 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 .zip(arg_types.iter().copied())
                 .chain([(super::return_slot(), ret_type)]),
         );
+        // A closure with a `for<'a, ..>` binder: as rustc's `check_signature_annotation`, its
+        // signature as written has the binder's lifetimes each instantiated with one fresh
+        // variable, the same in every parameter and the return type, so
+        // `|_: &'a &'c (), v: &'c T| -> &'a T` ties `v`'s lifetime to the first parameter's
+        // inner one whatever signature the closure was given. rustc refuses `_` under a binder
+        // (`ClosureImplicitHrtb`), so there is none to solve.
+        if !binder.is_empty() {
+            let interner = self.interner();
+            let mut late = mem::map(self.ctx.frame);
+            for (local, type_ref) in written {
+                let Some(type_ref) = type_ref else { continue };
+                let local_ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
+                let written = self.written(self.lower_closure_written(closure, type_ref));
+                let ty = rustc_type_ir::fold_regions(interner, written, |region, depth| {
+                    match region.kind() {
+                        RegionKind::ReBound(
+                            rustc_type_ir::BoundVarIndexKind::Bound(debruijn),
+                            bound,
+                        ) if debruijn == depth => {
+                            *late.entry(bound.var.as_u32()).or_insert_with(|| self.fresh())
+                        }
+                        _ => region,
+                    }
+                });
+                self.relate(local_ty, ty, Variance::Invariant, at);
+            }
+            return;
+        }
         for (local, type_ref) in written {
             let Some(type_ref) = type_ref else { continue };
             let local_ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
@@ -2608,9 +2583,10 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 .skip_norm_wip()
                 .skip_binder()
                 .output();
+            let declared = hir_ty::rpitit::rpitits_to_opaques(self.interner(), function, declared);
             let mut hidden = Vec::new_in(self.ctx.frame);
             hidden_types(declared, slot, &mut hidden);
-            for ty in hidden {
+            for (_, ty) in hidden {
                 use rustc_type_ir::TypeVisitableExt as _;
                 if ty.references_error() || ty.has_non_region_infer() {
                     continue;
@@ -3055,7 +3031,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             RegionKind::ReVar(vid) if vid.index() < first_new => Some(vid.as_usize()),
             RegionKind::ReStatic => Some(this.regions.static_rv),
             RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
-                this.signature_region(region, rustc_type_ir::INNERMOST).and_then(rv_of)
+                this.lifetime_param_region(region).and_then(rv_of)
             }
             // Of a `for<'a>` instantiated to relate types: `<&'a () as Trait>::Ty` with only
             // `impl Trait for &'static ()` needs the placeholder to be `'static`, an error of
@@ -3084,7 +3060,26 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             }
         }
         self.scratch.constraints.give(constraints);
+        // What the environment gives has its regions: `<D as Tr>::O` with `D: Tr<O = &'a u8>`
+        // is the where clause's `&'a u8`, whose `'a` is the body's universal region, as
+        // rustc's relating maps a free region (`UniversalRegionIndices::to_region_vid`). Left
+        // a lifetime parameter, relating it with the place the value goes would constrain
+        // nothing, and `-> &'static u8 { d.get() }` would hold.
+        let normalized = rustc_type_ir::fold_regions(interner, normalized, |region, _| {
+            self.lifetime_param_region(region).unwrap_or(region)
+        });
         Some(normalized)
+    }
+
+    /// A lifetime parameter of the environment, early-bound or late-bound, as the body's
+    /// universal region for it; `None` for any other region.
+    fn lifetime_param_region(&mut self, region: Region<'db>) -> Option<Region<'db>> {
+        match region.kind() {
+            RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
+                self.signature_region(region, rustc_type_ir::INNERMOST)
+            }
+            _ => None,
+        }
     }
 
     /// The regions and the parameters and projections `ty` outlives what it outlives, with
@@ -3222,7 +3217,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             .instantiate_identity()
             .skip_norm_wip()
             .skip_binder();
-        let TyKind::Alias(_, future) = sig.output().kind() else { return None };
+        let output = hir_ty::rpitit::rpitits_to_opaques(interner, function, sig.output());
+        let TyKind::Alias(_, future) = output.kind() else { return None };
         let rustc_type_ir::AliasTyKind::Opaque { def_id } = future.kind else { return None };
         interner
             .item_bounds(def_id.into())
@@ -3236,7 +3232,12 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
     /// `typed` with fresh regions where `declared` has an `impl Trait`: the lifetimes of a
     /// hidden type are rustc's to choose by member constraints, not the ones type inference
     /// unified, so `I { index: self, req }` of `-> Result<impl Iterator + 'b>` with `'a: 'b`
-    /// can be `I<'b>`.
+    /// can be `I<'b>`. A hidden type that is itself an alias, another function's
+    /// `impl Trait` (`helper(&B)`'s `impl Plain + 'a`) or a projection, is one too: inference
+    /// writes its region variables back as error regions, which `async_fn_output` would
+    /// otherwise take for lifetimes the signature elides, making `helper(&B)` hide
+    /// `impl Plain + 'a` of the parameter's `'a` and `-> impl Plain + 'static` need
+    /// `'a: 'static`. Only the declared `impl Trait` itself, not revealed, keeps its regions.
     fn unnamed_hidden(&self, typed: Ty<'db>, declared: Ty<'db>) -> Ty<'db> {
         let interner = self.interner();
         let frame = self.ctx.frame;
@@ -3252,7 +3253,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         match (typed.kind(), declared.kind()) {
             (kind, TyKind::Alias(_, alias))
                 if matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. })
-                    && !matches!(kind, TyKind::Alias(_, _)) =>
+                    && !matches!(kind, TyKind::Alias(_, it) if it.kind == alias.kind) =>
             {
                 rustc_type_ir::fold_regions(interner, typed, |_, _| self.fresh())
             }
@@ -3275,88 +3276,217 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         }
     }
 
-    /// rustc's member constraints for an `impl Trait` an `async fn` declares it returns: the
-    /// regions of the future's `output` are of its hidden type.
+    /// rustc's defining uses of the `impl Trait`s an `async fn` declares it returns: the
+    /// future's `output` is the type they are in, hidden. What its bounds say an `impl Trait`
+    /// outlives is proven here, as the environment is known by now.
     fn async_output_members(
         &mut self,
         function: hir_def::FunctionId,
         output: Ty<'db>,
         span: MirSpan,
     ) {
+        let Some(declared) = self.async_declared_output(function) else { return };
+        // The lifetimes the parameters leave out, as the sync return type has them: the
+        // `'_` of `-> impl Plain + '_` captures the elided one.
+        let declared =
+            hir_ty::with_elided_regions(self.ctx.db, declared, function, &self.elided_regions);
+        let at = At { category: Category::Return, span };
+        // Under the binder of the future's `Output = ..` bound.
+        self.opaque_defining_uses(declared, output, 1, false, true, at);
+        self.hidden_types_outlive(at);
+    }
+
+    /// rustc's defining uses of the `impl Trait`s of a return type: `declared`, as the
+    /// signature writes it, `depth` binders in from the signature's own late-bound lifetimes,
+    /// hides `hidden`. Each `impl Trait` in it, and with `nested` each one an associated type
+    /// bound of another names (`impl Iterator<Item = impl Plain + 'static>`), whose hidden
+    /// type is what the outer one's hidden type's associated type normalizes to, as rustc's
+    /// defining use of it is in proving that bound. Of each:
+    /// - each region of its hidden type is one of the lifetimes it captures or `'static`
+    ///   (member constraints), when those are known exactly;
+    /// - its hidden type outlives what its bounds say it does: the regions outside its
+    ///   aliases here, at `at`; the aliases in [`Builder::hidden_types_outlive`].
+    fn opaque_defining_uses(
+        &mut self,
+        declared: Ty<'db>,
+        hidden: Ty<'db>,
+        depth: u32,
+        variadic: bool,
+        nested: bool,
+        at: At,
+    ) {
         use rustc_type_ir::Interner as _;
         let interner = self.interner();
-        let Some(inner) = self.async_declared_output(function) else { return };
-        let TyKind::Alias(_, alias) = inner.kind() else { return };
-        let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind else { return };
-        let Some(captured) = opaque_captures(self.ctx.frame, self.ctx.db, def_id, alias.args.len()) else {
-            return;
-        };
-        // What its bounds say it outlives, its hidden type must, as for the `impl Trait` a
-        // function returns.
-        let binder = rustc_type_ir::INNERMOST.shifted_in(1);
-        let mut outlived = Vec::new_in(self.ctx.frame);
-        for clause in interner
-            .item_bounds(def_id.into())
-            .iter_instantiated(interner, alias.args.as_slice())
-        {
-            match clause.kind().skip_binder() {
-                ClauseKind::TypeOutlives(OutlivesClause(bounded, region))
-                    if let TyKind::Alias(_, bounded) = bounded.kind()
-                        && bounded.kind == alias.kind =>
-                {
-                    // Under its clause's binder too.
-                    match self.signature_region(region, binder.shifted_in(1)).and_then(rv_of) {
-                        Some(rv) => outlived.push(rv),
-                        None => return,
+        let frame = self.ctx.frame;
+        let db = self.ctx.db;
+        let mut found = Vec::new_in(frame);
+        hidden_types(declared, hidden, &mut found);
+        // Each `impl Trait`, the type it hides, and how many binders in its arguments are.
+        let mut uses: FVec<'_, (Ty<'db>, Ty<'db>, u32)> =
+            mem::collect(frame, found.iter().map(|&(opaque, hidden)| (opaque, hidden, depth)));
+        // A worklist: a nested `impl Trait` is a part of the signature, so this ends.
+        let mut next = 0;
+        while let Some(&(opaque, hidden, depth)) = uses.get(next) {
+            next += 1;
+            let TyKind::Alias(_, alias) = opaque.kind() else { continue };
+            let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind else { continue };
+            let binder = rustc_type_ir::INNERMOST.shifted_in(depth);
+            let mut known = true;
+            let mut choices = Vec::new_in(frame);
+            choices.push(self.regions.static_rv);
+            // A C variadic's `VaList` lifetime is none of the function's generics, which are
+            // all an `impl Trait` it returns could capture; a lifetime parameter no parameter
+            // names is no choice of a region of the body.
+            match alias_captures(frame, db, alias.kind, alias.args.len())
+                .or_else(|| variadic.then(|| filled(frame, alias.args.len(), true)))
+            {
+                Some(captured) => {
+                    for (arg, captured) in alias.args.iter().zip(captured) {
+                        if let GenericArgKind::Lifetime(region) = arg.kind()
+                            && captured
+                        {
+                            match self.signature_region(region, binder).and_then(rv_of) {
+                                Some(rv) => choices.push(rv),
+                                None if variadic => (),
+                                None => known = false,
+                            }
+                        }
                     }
                 }
-                ClauseKind::Projection(projection)
-                    if match projection.term.as_type() {
-                        Some(ty) => names_captured_lifetime(self.ctx.frame, self.ctx.db, ty),
-                        None => rustc_type_ir::TypeVisitableExt::has_free_regions(&projection.term),
-                    } =>
-                {
-                    return;
-                }
-                _ => (),
+                None => known = false,
             }
-        }
-        let mut choices = Vec::new_in(self.ctx.frame);
-        choices.push(self.regions.static_rv);
-        for (arg, captured) in alias.args.iter().zip(captured) {
-            if let GenericArgKind::Lifetime(region) = arg.kind()
-                && captured
+            // What the bounds say the `impl Trait` outlives its hidden type must: rustc
+            // proves them of it. A projection bound that names a lifetime outside an
+            // `impl Trait` constrains it in ways not followed here, so its member constraints
+            // are left out.
+            let mut outlived = Vec::new_in(frame);
+            for clause in interner
+                .item_bounds(def_id.into())
+                .iter_instantiated(interner, alias.args.as_slice())
             {
-                let Some(rv) = self.signature_region(region, binder).and_then(rv_of) else {
-                    return;
-                };
-                choices.push(rv);
+                match clause.kind().skip_binder() {
+                    ClauseKind::TypeOutlives(OutlivesClause(bounded, region))
+                        if let TyKind::Alias(_, bounded) = bounded.kind()
+                            && bounded.kind == alias.kind =>
+                    {
+                        // A lifetime the bound elides, `+ '_`, rustc captures too.
+                        let elided = matches!(region.kind(), RegionKind::ReError(_));
+                        // Under the clause's own binder, the signature's is one further out.
+                        let rv = match elided {
+                            true => self.elided_output.and_then(rv_of),
+                            false => {
+                                self.signature_region(region, binder.shifted_in(1)).and_then(rv_of)
+                            }
+                        };
+                        match rv {
+                            Some(rv) => {
+                                outlived.push(rv);
+                                if elided && !choices.contains(&rv) {
+                                    choices.push(rv);
+                                }
+                            }
+                            None => known = false,
+                        }
+                    }
+                    ClauseKind::Projection(projection) => {
+                        let term = projection.term.as_type();
+                        known &= match term {
+                            Some(ty) => !names_captured_lifetime_outside_opaques(
+                                frame, db, interner, ty,
+                            ),
+                            None => !rustc_type_ir::TypeVisitableExt::has_free_regions(
+                                &projection.term,
+                            ),
+                        };
+                        if nested
+                            && let Some(term) = term
+                            && has_opaque(term)
+                        {
+                            self.nested_hidden_types(projection, hidden, depth + 1, &mut found);
+                            uses.extend(
+                                found.drain(..).map(|(opaque, hidden)| (opaque, hidden, depth + 1)),
+                            );
+                        }
+                    }
+                    _ => (),
+                }
             }
-        }
-        let mut bounded = Vec::new_in(self.ctx.frame);
-        member_regions(self.ctx.frame, self.ctx.db, output, false, &mut bounded);
-        bounded.retain(|&it| it != self.regions.static_rv);
-        radix::sort(&mut bounded);
-        bounded.dedup();
-        for &member in &bounded {
-            for &sub in &outlived {
-                self.regions.outlives.push(Outlives {
-                    sup: member,
-                    sub,
-                    location: None,
-                    category: Category::Return,
-                    span,
-                    from_closure: false,
-                });
+            // An alias's own bounds may already say it outlives them, so the regions within one
+            // are left to `hidden_types_outlive`.
+            let mut bounded = Vec::new_in(frame);
+            member_regions(frame, db, hidden, false, &mut bounded);
+            bounded.retain(|&it| it != self.regions.static_rv);
+            radix::sort(&mut bounded);
+            bounded.dedup();
+            for &member in &bounded {
+                for &sub in &outlived {
+                    self.regions.outlives.push(Outlives {
+                        sup: member,
+                        sub,
+                        location: None,
+                        category: at.category,
+                        span: at.span,
+                        from_closure: false,
+                    });
+                }
             }
+            if known {
+                let mut members = Vec::new_in(frame);
+                member_regions(frame, db, hidden, true, &mut members);
+                members.retain(|&it| it != self.regions.static_rv);
+                radix::sort(&mut members);
+                members.dedup();
+                let start = self.regions.choices.len() as u32;
+                self.regions.choices.extend(choices.iter().copied());
+                let choices = start..self.regions.choices.len() as u32;
+                self.regions.members.extend(
+                    members.iter().map(|&region| Member { region, choices: choices.clone() }),
+                );
+            }
+            // The aliases in it, which the regions above leave out, outlive them too.
+            self.opaque_outlived.push((hidden, outlived));
         }
-        let mut members = Vec::new_in(self.ctx.frame);
-        member_regions(self.ctx.frame, self.ctx.db, output, true, &mut members);
-        members.retain(|&it| it != self.regions.static_rv);
-        radix::sort(&mut members);
-        members.dedup();
-        self.regions.members = members;
-        self.regions.choices = choices;
+    }
+
+    /// The `impl Trait`s the associated type bound `projection` of an `impl Trait` names, each
+    /// with the type it hides: the parts of what `hidden`, the outer one's hidden type, has for
+    /// that associated type. `depth` is how many binders in from the signature's late-bound
+    /// lifetimes the bound is. One whose associated type does not normalize is not found.
+    fn nested_hidden_types(
+        &mut self,
+        projection: rustc_type_ir::ProjectionClause<hir_ty::next_solver::DbInterner<'db>>,
+        hidden: Ty<'db>,
+        depth: u32,
+        out: &mut FVec<'_, (Ty<'db>, Ty<'db>)>,
+    ) {
+        let interner = self.interner();
+        let Some(term) = projection.term.as_type() else { return };
+        // The signature's own lifetimes as its universal regions, so it can be normalized.
+        let projected = projection
+            .projection_term
+            .with_replaced_self_ty(interner, hidden)
+            .to_term(interner, rustc_type_ir::IsRigid::No);
+        let Some(projected) = projected.as_type() else { return };
+        let projected = rustc_type_ir::fold_regions(interner, projected, |region, at| {
+            self.signature_region(region, at.shifted_in(depth)).unwrap_or(region)
+        });
+        if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&projected) {
+            return;
+        }
+        let Some(normalized) = self.normalize(projected) else { return };
+        if matches!(normalized.kind(), TyKind::Infer(_)) {
+            return;
+        }
+        hidden_types(term, normalized, out);
+    }
+
+    /// That the aliases in the hidden type of each `impl Trait` [`Builder::opaque_defining_uses`]
+    /// found outlive the regions its bounds say it does, at `at`.
+    fn hidden_types_outlive(&mut self, at: At) {
+        let uses = std::mem::replace(&mut self.opaque_outlived, Vec::new_in(self.ctx.frame));
+        for (hidden, outlived) in uses.iter() {
+            self.hidden_aliases_outlive(*hidden, outlived, at);
+        }
     }
 
     /// rustc's `prove_closure_bounds` where the closure `ty` is made: its enclosing item's
@@ -3603,7 +3733,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             let (ty, region) = self.regions.type_bounds[index];
             let ty = unrigid(interner, ty);
             match placeholders.contains(&region) {
-                true => self.regions.placeholder_type_bounds.push((ty, region)),
+                true => self.regions.placeholder_type_bounds.push((at.span, ty, region)),
                 false => self.regions.binder_type_bounds.push((at.span, ty, region)),
             }
         }
@@ -3661,7 +3791,14 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             self.outlives(longer, shorter, at);
         }
         for &(ty, shorter) in subjects.iter() {
-            if !of_binder(shorter) {
+            // Only what rustc type-tests, a parameter or an alias. A type bound on any other
+            // type, `Snap<'r, 'db>: 'a` that `Workspace<'a, S>`'s inferred `S: 'a` gives, is its
+            // components', proven above as theirs: tested whole, it named each side's regions
+            // by variables of its own and matched no bound of the more general side. A type
+            // with a part the components leave out (`undecomposed`) is still tested whole.
+            if !of_binder(shorter)
+                || !(matches!(ty.kind(), TyKind::Param(_) | TyKind::Alias(..)) || undecomposed(ty))
+            {
                 continue;
             }
             let ty = unrigid(interner, ty);
@@ -3872,41 +4009,62 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                         return;
                     }
                 }
-                // rustc relates a projection's arguments invariantly, and an opaque type's by
-                // its variances under the ambient one: an argument it does not capture is
+                // rustc relates a projection's arguments invariantly, and an `impl Trait`'s (an
+                // opaque type's, or a trait method's RPITIT projection's) by its variances under
+                // the ambient one (`opt_alias_variances`): an argument it does not capture is
                 // bivariant, so a covariant `impl Sized` of `'a` is one of `'b`.
-                let (variances, ambient) = match x.kind {
-                    rustc_type_ir::AliasTyKind::Opaque { def_id } => {
-                        let frame = self.ctx.frame;
-                        (
-                            opaque_captures(frame, self.ctx.db, def_id, x.args.len()).map(|it| {
-                                mem::collect(
-                                    frame,
-                                    it.into_iter().map(|captured| match captured {
-                                        true => Variance::Invariant,
-                                        false => Variance::Bivariant,
-                                    }),
-                                )
+                let frame = self.ctx.frame;
+                let captured = alias_captures(frame, self.ctx.db, x.kind, x.args.len());
+                let (variances, ambient) = match captured {
+                    Some(it) => (
+                        Some(mem::collect(
+                            frame,
+                            it.into_iter().map(|captured| match captured {
+                                true => Variance::Invariant,
+                                false => Variance::Bivariant,
                             }),
-                            variance,
-                        )
+                        )),
+                        variance,
+                    ),
+                    None if matches!(x.kind, rustc_type_ir::AliasTyKind::Opaque { .. }) => {
+                        (None, variance)
                     }
-                    _ => (None, Variance::Invariant),
+                    None => (None, Variance::Invariant),
                 };
                 self.relate_args(x.args, y.args, variances.as_deref(), ambient, at)
             }
             // A signature's associated type against what it is,
-            // `<&'a mut Vec<T> as IntoIterator>::IntoIter` and `IterMut<'_, T>`.
+            // `<&'a mut Vec<T> as IntoIterator>::IntoIter` and `IterMut<'_, T>`, as rustc relates
+            // a callee's signature normalized: each projection side is what it normalizes to,
+            // related with the other side even where that is an alias too. A trait method's
+            // `impl Trait` called on an impl's type, `<u8 as Mk>::{impl Trait#0}<'a>`, is the
+            // impl method's own opaque type of `'a`, the type of the call, whose `'a` is so the
+            // lifetime of the borrow passed in.
             (TyKind::Alias(_, x), _) | (_, TyKind::Alias(_, x))
                 if matches!(x.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
             {
-                let normalize = |this: &mut Self, ty: Ty<'db>| match ty.kind() {
-                    TyKind::Alias(_, _) => this.normalize_at(ty, at).filter(|&it| it != ty),
-                    _ => Some(ty),
+                let interner = self.interner();
+                let mut changed = false;
+                let mut normalize = |this: &mut Self, ty: Ty<'db>| match ty.kind() {
+                    TyKind::Alias(_, alias)
+                        if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
+                    {
+                        match this.normalize_at(ty, at) {
+                            Some(it) if unrigid(interner, it) != unrigid(interner, ty) => {
+                                changed = true;
+                                it
+                            }
+                            _ => ty,
+                        }
+                    }
+                    _ => ty,
                 };
-                if let Some(a) = normalize(self, a)
-                    && let Some(b) = normalize(self, b)
-                    && !matches!((a.kind(), b.kind()), (TyKind::Alias(_, _), TyKind::Alias(_, _)))
+                let (a, b) = (normalize(self, a), normalize(self, b));
+                // Only after a side normalized further, so this ends: what normalizing gives
+                // normalizes to itself.
+                if changed
+                    && !matches!(a.kind(), TyKind::Infer(_))
+                    && !matches!(b.kind(), TyKind::Infer(_))
                 {
                     self.relate(a, b, variance, at);
                 }
@@ -3958,6 +4116,36 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 _ => (),
             }
         }
+    }
+
+    /// That the aliases in `hidden`, the type a returned `impl Trait` hides, outlive each of
+    /// `outlived`, the regions the `impl Trait`'s bounds say it outlives. rustc proves the
+    /// bound `Hidden: 'r` of the hidden type (`add_item_bounds_for_hidden_type`) as any type's
+    /// outlives: an `impl Trait` or a projection in it outlives `'r` only as
+    /// `alias_ty_must_outlive` says, by a bound of its own or by the arguments it captures.
+    /// `{ helper(c) }` of `-> impl Plain + 'static + use<'a>`, `helper` returning
+    /// `impl Plain + 'a`, needs `'a: 'static`, as `{ c }` does. The regions outside its aliases
+    /// the callers constrain themselves. An alias with no region in it outlives by its types
+    /// alone, which item well-formedness proves with the function's where clauses
+    /// (hir-ty-wfcheck's `opaques`). A constraint of the signature, it holds everywhere: no
+    /// location.
+    fn hidden_aliases_outlive(&mut self, hidden: Ty<'db>, outlived: &[Rv], at: At) {
+        if outlived.is_empty() {
+            return;
+        }
+        let mut aliases = self.scratch.tys.take();
+        alias_components(hidden, &mut aliases);
+        aliases.retain(|it| rustc_type_ir::TypeVisitableExt::has_free_regions(it));
+        let location = self.location.take();
+        for &alias in aliases.iter() {
+            for &rv in outlived {
+                let region =
+                    Region::new_var(self.interner(), rustc_type_ir::RegionVid::from_usize(rv));
+                self.alias_outlives(alias, region, at, 0);
+            }
+        }
+        self.location = location;
+        self.scratch.tys.give(aliases);
     }
 
     /// That `ty` outlives `region`: each region in it does, and each type parameter in it
@@ -4061,8 +4249,10 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             region
         });
         if !in_env && from_trait.is_empty() && (has_regions || opaque.is_some()) {
-            let captured = opaque
-                .and_then(|opaque| opaque_captures(self.ctx.frame, self.ctx.db, opaque, alias.args.len()));
+            // What it does not capture need not outlive (rustc's `alias_ty_must_outlive` skips
+            // what `opt_alias_variances` makes bivariant).
+            let captured =
+                alias_captures(self.ctx.frame, self.ctx.db, alias.kind, alias.args.len());
             for (index, arg) in alias.args.iter().enumerate() {
                 if captured.as_ref().is_some_and(|it| !it[index]) {
                     continue;
@@ -4080,17 +4270,23 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             self.scratch.regions.give(from_trait);
             return;
         }
+        // The trait's one bound, as rustc's unique bound, where the body has a region for it.
+        // An error region (`type A: 'undeclared`, E0261) is `'static`, as rustc's
+        // `to_region_vid` maps it, so the bound holds and E0261 is the one error. One the body
+        // has no region for (a placeholder, a region bound in the clause) proves nothing of
+        // the alias: the type test below decides, as for several bounds.
         if !in_env
             && let Some(&bound) = from_trait.first()
             && from_trait.iter().all(|&it| it == bound)
-        {
-            if let Some(bound) = self
-                .signature_region(bound, rustc_type_ir::INNERMOST)
-                .and_then(rv_of)
-                .or_else(|| self.region_rv(bound))
-            {
-                self.outlives(bound, rv, at);
+            && let Some(bound) = match bound.kind() {
+                RegionKind::ReError(_) => Some(self.regions.static_rv),
+                _ => self
+                    .signature_region(bound, rustc_type_ir::INNERMOST)
+                    .and_then(rv_of)
+                    .or_else(|| self.region_rv(bound)),
             }
+        {
+            self.outlives(bound, rv, at);
             self.scratch.regions.give(from_trait);
             return;
         }
@@ -4720,6 +4916,27 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
 
     fn lower_written(&self, type_ref: hir_def::type_ref::TypeRefId, span: MirSpan) -> Ty<'db> {
         self.lowering(span, |ctx| ctx.lower_ty(type_ref))
+    }
+
+    /// `type_ref`, a parameter's or the return type of the closure `closure`, lowered as its
+    /// signature has it: under its `for<'a, ..>` binder if it has one
+    /// (`#![feature(closure_lifetime_binder)]`), each of whose lifetimes is then a region bound
+    /// at the innermost binder, escaping the type. Without the binder they would resolve to
+    /// nothing, and read as lifetimes left out.
+    fn lower_closure_written(
+        &self,
+        closure: hir_def::hir::ExprId,
+        type_ref: hir_def::type_ref::TypeRefId,
+    ) -> Ty<'db> {
+        let store = self.ctx.store;
+        let span = MirSpan::ExprId(closure);
+        match store.expr(closure) {
+            hir_def::hir::Expr::Closure { binder, .. } if !binder.is_empty() => {
+                let binder = store.names(binder);
+                self.lowering(span, |ctx| ctx.lower_ty_under_closure_binder(binder, type_ref))
+            }
+            _ => self.lower_written(type_ref, span),
+        }
     }
 
     /// A `let`'s written type with a region variable for each lifetime it leaves out, so an
@@ -6619,7 +6836,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             RegionKind::ReVar(vid) => Some(vid.as_usize()),
             RegionKind::ReStatic => Some(this.regions.static_rv),
             RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
-                this.signature_region(region, rustc_type_ir::INNERMOST).and_then(rv_of)
+                this.lifetime_param_region(region).and_then(rv_of)
             }
             RegionKind::RePlaceholder(_) => rv_of(this.placeholder(region)),
             _ => None,
@@ -6843,6 +7060,7 @@ fn constraint_pairs<'db>(
 /// canonical `type_op_prove_predicate`: a query, so a goal is proven once for every body of the
 /// same environment, and an edit proves again only the goals of what it changes.
 #[blaze_query::tracked(returns(ref))]
+#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
 fn prove_query(
     db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,
@@ -7236,49 +7454,6 @@ fn names_through_type(
     }
 }
 
-/// The `impl Trait` a function's return type `output` has, when it has one, and the part of
-/// `ty`, the type its body returns, that hides it: `(impl Iterator, &'b str)` hides it in
-/// the tuple's first field.
-fn returned_opaque<'db>(
-    output: Ty<'db>,
-    ty: Ty<'db>,
-) -> Option<(rustc_type_ir::AliasTy<hir_ty::next_solver::DbInterner<'db>>, Ty<'db>)> {
-    fn find<'db>(
-        output: Ty<'db>,
-        ty: Ty<'db>,
-    ) -> Option<(rustc_type_ir::AliasTy<hir_ty::next_solver::DbInterner<'db>>, Ty<'db>)> {
-        match (output.kind(), ty.kind()) {
-            (TyKind::Alias(_, alias), _)
-                if matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. }) =>
-            {
-                Some((alias, ty))
-            }
-            (TyKind::Tuple(outputs), TyKind::Tuple(tys)) if outputs.len() == tys.len() => {
-                outputs.iter().zip(tys.iter()).find_map(|(output, ty)| find(output, ty))
-            }
-            (TyKind::Ref(_, output, _), TyKind::Ref(_, ty, _)) => find(output, ty),
-            (TyKind::Adt(def, outputs), TyKind::Adt(other, tys))
-                if def == other && outputs.len() == tys.len() =>
-            {
-                outputs.iter().zip(tys.iter()).find_map(|(output, ty)| find(output.ty()?, ty.ty()?))
-            }
-            _ => None,
-        }
-    }
-    let opaques = output
-        .walk()
-        .filter_map(|it| rustc_type_ir::inherent::GenericArg::as_type(&it))
-        .filter(|ty| {
-            matches!(ty.kind(), TyKind::Alias(_, alias)
-                if matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. }))
-        })
-        .count();
-    if opaques != 1 {
-        return None;
-    }
-    find(output, ty)
-}
-
 /// The variable the path `expr` names, if it names one.
 pub(super) fn path_binding(
     ctx: &Ctx<'_, '_>,
@@ -7384,11 +7559,28 @@ pub(super) fn outlives_components<'db>(
                 outlives_components(it, regions, params);
             }
         }
-        TyKind::Array(inner, _) | TyKind::Slice(inner) | TyKind::RawPtr(inner, _) => {
-            outlives_components(inner, regions, params)
-        }
+        // A pattern type is its base type's (rustc's `compute_components`).
+        TyKind::Array(inner, _)
+        | TyKind::Slice(inner)
+        | TyKind::RawPtr(inner, _)
+        | TyKind::Pat(inner, _) => outlives_components(inner, regions, params),
         _ => (),
     }
+}
+
+/// Whether `ty` has a part `outlives_components` and `alias_components` leave out of what it
+/// outlives a region by: a type placeholder (`non_lifetime_binders`), an unsafe binder, or a
+/// free or inherent alias. A bound on such a type is not proven by its components alone, so
+/// `binder_implied_bounds` type-tests it whole.
+fn undecomposed<'db>(ty: Ty<'db>) -> bool {
+    any_ty(ty, |it| match it.kind() {
+        TyKind::Placeholder(_) | TyKind::UnsafeBinder(_) => true,
+        TyKind::Alias(_, alias) => matches!(
+            alias.kind,
+            rustc_type_ir::AliasTyKind::Free { .. } | rustc_type_ir::AliasTyKind::Inherent { .. }
+        ),
+        _ => false,
+    })
 }
 
 /// The associated and opaque types among what `outlives_components` splits `ty` into, which
@@ -7412,7 +7604,8 @@ pub(super) fn alias_components<'db>(ty: Ty<'db>, out: &mut FVec<'_, Ty<'db>>) {
         TyKind::Ref(_, inner, _)
         | TyKind::Array(inner, _)
         | TyKind::Slice(inner)
-        | TyKind::RawPtr(inner, _) => alias_components(inner, out),
+        | TyKind::RawPtr(inner, _)
+        | TyKind::Pat(inner, _) => alias_components(inner, out),
         TyKind::Dynamic(predicates, _) => {
             for predicate in predicates.iter() {
                 match predicate.skip_binder() {
@@ -7434,8 +7627,16 @@ pub(super) fn alias_components<'db>(ty: Ty<'db>, out: &mut FVec<'_, Ty<'db>>) {
         }
         TyKind::Adt(_, it) => args(it, out),
         TyKind::FnDef(_, it) => args(it.no_bound_vars().unwrap(), out),
+        // As `outlives_components` splits them: an `async` closure's upvars, and a coroutine's
+        // resume type with its upvars.
         TyKind::Closure(_, it) => alias_components(it.as_closure().tupled_upvars_ty(), out),
-        TyKind::Coroutine(_, it) => alias_components(it.as_coroutine().tupled_upvars_ty(), out),
+        TyKind::CoroutineClosure(_, it) => {
+            alias_components(it.as_coroutine_closure().tupled_upvars_ty(), out)
+        }
+        TyKind::Coroutine(_, it) => {
+            alias_components(it.as_coroutine().tupled_upvars_ty(), out);
+            alias_components(it.as_coroutine().resume_ty(), out);
+        }
         TyKind::Tuple(tys) => {
             for it in tys.iter() {
                 alias_components(it, out);
@@ -7862,6 +8063,12 @@ mod closure_bound_tests;
 
 #[cfg(test)]
 mod opaque_bound_tests;
+
+#[cfg(test)]
+mod hidden_alias_tests;
+
+#[cfg(test)]
+mod env_projection_tests;
 
 #[cfg(test)]
 mod tests {

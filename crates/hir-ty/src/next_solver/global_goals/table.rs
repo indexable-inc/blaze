@@ -190,8 +190,9 @@ impl<V: Copy> Table<V> {
         let layout = layout::<V>(level);
         // SAFETY: `layout` has a non-zero size. A zero word is an empty slot, and an entry is
         // read only once its slot is published.
-        // alloc: one level, at most five per table generation, on an insert past half full.
-        let fresh = unsafe { alloc::alloc_zeroed(layout) }.cast::<Slot<V>>();
+        // alloc: one level, at most five per table generation, on an insert past half full,
+        // counted to the solver ([`for_the_solver`]).
+        let fresh = for_the_solver(|| unsafe { alloc::alloc_zeroed(layout) }).cast::<Slot<V>>();
         if fresh.is_null() {
             alloc::handle_alloc_error(layout);
         }
@@ -209,6 +210,19 @@ impl<V: Copy> Table<V> {
             }
         }
     }
+}
+
+/// Runs `f`, the allocation of a level, as a task of [`blaze_mem::Tag::Solver`], so the global
+/// heap charges the level to `solver` and not to the task whose insert found the older levels
+/// half full: a table is its generation's (`tls_cache`), freed when the generation is given
+/// away, and no task's end or release of its values frees it. memcap6 (B5): monomorphizing and
+/// lowering MIR grow the tables of every crate checked (up to 85.25 MiB each), so they counted
+/// as `mir` heap that dropping every MIR body did not lower. A free goes back to the heap of the
+/// tag the block was allocated for, from any thread (blaze-engine's `heaps`), so a level dropped
+/// with its generation leaves `solver`. Cold: a table grows by a level at most five times.
+#[cold]
+fn for_the_solver<R>(f: impl FnOnce() -> R) -> R {
+    blaze_mem::frame::task(blaze_mem::Tag::Solver, |_| f())
 }
 
 impl<V> Drop for Table<V> {

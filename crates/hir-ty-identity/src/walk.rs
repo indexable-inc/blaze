@@ -139,6 +139,7 @@ pub fn fn_code_id<'db>(
 }
 
 #[blaze_query::tracked(returns(ref), cycle_result = code_id_cycle)]
+#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
 fn code_id_of(
     db: &Db,
     root: Instance,
@@ -154,6 +155,7 @@ fn code_id_of(
     node_id(db, env.clone(), Node::Walk(body, root.args.clone()), checked).clone().map(CodeId)
 }
 
+#[expect(clippy::needless_pass_by_value, reason = "the `cycle_result` signature `blaze_query::tracked` calls, with the query's arguments by value")]
 fn code_id_cycle(
     db: &Db,
     _: blaze_query::db::Id,
@@ -166,6 +168,7 @@ fn code_id_cycle(
 
 /// The behaviour identity of `node`: of the step rooted at it.
 #[blaze_query::tracked(returns(ref), cycle_result = node_id_cycle)]
+#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
 fn node_id(
     db: &Db,
     env: StoredParamEnvAndCrate,
@@ -175,6 +178,7 @@ fn node_id(
     scc::identity(&Behaviour { db, env: &env, checked }, CODE_ID_DOMAIN, &node, INSTANCES)
 }
 
+#[expect(clippy::needless_pass_by_value, reason = "the `cycle_result` signature `blaze_query::tracked` calls, with the query's arguments by value")]
 fn node_id_cycle(
     db: &Db,
     _: blaze_query::db::Id,
@@ -326,6 +330,7 @@ fn outside_code<'db>(cx: &Cx<'db>, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>, Glob
 /// constants are evaluated here, so a body whose constant reads the CodeId of a step that runs
 /// it re-enters this query: [`SELF_READ`].
 #[blaze_query::tracked(returns(ref), cycle_result = summary_cycle)]
+#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
 fn summary(
     db: &Db,
     env: StoredParamEnvAndCrate,

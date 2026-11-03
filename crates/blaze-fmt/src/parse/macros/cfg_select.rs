@@ -43,8 +43,7 @@ fn parse_items_from_cfg_select_inner<'a>(
     psess: &'a ParseSess,
     mac: &'a ast::MacCall,
 ) -> Result<Vec<ast::Item>, &'static str> {
-    let ts = mac.args.tokens.clone();
-    let mut parser = build_stream_parser(psess, ts);
+    let mut parser = build_stream_parser(psess, &mac.args.tokens);
 
     if parser.token == TokenKind::OpenBrace {
         return Err("Expression position cfg_select! not yet supported");
@@ -208,7 +207,7 @@ impl CfgSelectArm {
 // and could instead just call rustc_attr_parsing::parse_cfg_select, but this is fine for now.
 pub(crate) fn parse_cfg_select_arms(
     psess: &ParseSess,
-    ts: TokenStream,
+    ts: &TokenStream,
 ) -> Option<Vec<CfgSelectArm>> {
     let result = catch_unwind(AssertUnwindSafe(|| parse_cfg_select_arms_inner(psess, ts)));
     let recovered = false;
@@ -225,7 +224,7 @@ pub(crate) fn parse_cfg_select_arms(
     }
 }
 
-fn parse_cfg_select_arms_inner(psess: &ParseSess, ts: TokenStream) -> Option<Vec<CfgSelectArm>> {
+fn parse_cfg_select_arms_inner(psess: &ParseSess, ts: &TokenStream) -> Option<Vec<CfgSelectArm>> {
     let mut cfg_select_predicates = vec![];
     let mut parser = build_stream_parser(psess, ts);
 

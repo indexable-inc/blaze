@@ -154,7 +154,7 @@ pub fn check(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Verdic
         // alloc: a query, once a check
         Some(build) => format!("build_id = {build}"),
         // alloc: a query, once a check
-        None => "build_id = (SELECT max(build_id) FROM builds)".to_owned(),
+        None => "build_id = (SELECT max(build_id) FROM builds WHERE dur_ns IS NOT NULL)".to_owned(),
     };
     // alloc: a query, once a check
     let row = run(&format!(

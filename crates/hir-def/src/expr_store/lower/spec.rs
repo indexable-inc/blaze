@@ -164,6 +164,7 @@ impl<'db> ExprCollector<'db> {
                                 body,
                                 closure_kind: ClosureKind::Closure,
                                 capture_by: CaptureBy::Ref,
+                                binder: crate::expr_store::path::Names::EMPTY,
                             },
                             ptr,
                         )

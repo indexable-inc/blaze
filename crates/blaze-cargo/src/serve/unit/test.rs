@@ -30,7 +30,7 @@ use std::{
 use blaze_api::{ApiError, Artifact, Level, Response, TestOutcome, TestResult, Ub};
 use blaze_cas::Store;
 use blaze_codegen::ExecTable;
-use blaze_core::{Completion, Effect, FileName, Tag};
+use blaze_core::{Completion, Effect, Tag};
 use blaze_ids::ContentId;
 use blaze_testsel::{Choice, Reached, Selector, Subject};
 use blaze_usercode::test::{
@@ -730,14 +730,23 @@ impl Runs<Real> for TestRun {
                 self.suite_of.push(at);
             }
         }
-        let Some(dir) = FileName::new(&format!("tests/{:016x}", self.tags)) else {
-            self.ok = false;
-            let what = UnitError::TestDir { tags: self.tags }.to_string();
-            out.push(Response::Diagnostic(super::say::refused(what, None, self.job.input.color)));
-            return self.end();
+        // The run's sockets and records go under the daemon's state. The queue names them to the
+        // driver from its root, `/` ([`crate::serve::file_name`]), and gives its processes that
+        // root joined with the name, so both see one file; a name relative to the state would be
+        // written at `/tests/..`.
+        let path = self.job.shared.state.join(format!("tests/{:016x}", self.tags)); // alloc: once per test run
+        let dir = match crate::serve::file_name(&path) {
+            Ok(dir) => dir,
+            Err(why) => {
+                self.ok = false;
+                // alloc: error path
+                let what = UnitError::TestDir { dir: path.display().to_string(), why: format!("{why:#}") }.to_string();
+                out.push(Response::Diagnostic(super::say::refused(what, None, self.job.input.color)));
+                return self.end();
+            }
         };
         let config = Config {
-            root: self.job.shared.state.clone(),
+            root: PathBuf::from("/"), // alloc: once per test run
             dir,
             jobs: std::thread::available_parallelism().map_or(1, |it| it.get()),
             fail_fast: false,

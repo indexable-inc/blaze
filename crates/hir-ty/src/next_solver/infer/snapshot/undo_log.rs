@@ -59,6 +59,7 @@ impl<'db> InferCtxtInner<'db> {
         }
     }
 
+    #[expect(clippy::needless_pass_by_value, reason = "rolling back ends the snapshot: taking it means it ends once")]
     pub fn rollback_to(&mut self, snapshot: Snapshot) {
         assert!(self.undo_log.num_open_snapshots > 0, "rolled back with no open snapshot");
 
@@ -90,6 +91,7 @@ impl<'db> InferCtxtInner<'db> {
         self.undo_log.num_open_snapshots -= 1;
     }
 
+    #[expect(clippy::needless_pass_by_value, reason = "committing ends the snapshot: taking it means it ends once")]
     pub fn commit(&mut self, snapshot: Snapshot) {
         assert!(self.undo_log.num_open_snapshots > 0, "committed with no open snapshot");
         self.undo_log.num_open_snapshots -= 1;

@@ -16,7 +16,7 @@
 //! Off a terminal (a pipe, CI, `--message-format json`, `-q`, `-v`, `BLAZE_UI=plain`) none of
 //! this runs: [`wanted`] says no and `cli::drive` prints its plain lines as before. The exit
 //! code is cargo's either way: 0, the code of the first failing executable in cargo's order,
-//! or 101 under `--no-fail-fast` or when the build failed.
+//! under `--fail-fast`, else 101 when anything failed (the default runs every executable).
 //!
 //! Without blaze-cargo's `tui` feature (the wasm seed, which has no terminal library) a run
 //! that would draw the view is refused, naming the feature ([`drive`]); the runtime around the
@@ -42,6 +42,7 @@ use std::{
 };
 
 use blaze_api::{Artifact, ArtifactKind, Level, Request, ResponseRef, TargetKind};
+use blaze_core::exit::Exit;
 use blaze_hash::HashSet;
 use blaze_ui::test_view::{BinaryEnd, Event, Paint, TestView, Verdict};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
@@ -51,7 +52,7 @@ use ratatui::text::Line;
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
 
 use super::{
-    FAILED, Then,
+    Then,
     args::{Command, Invocation},
     daemon::{self, Api},
     place::Place,
@@ -263,6 +264,9 @@ pub fn drive<A: Api>(
         unwritten.get_or_insert(error);
     }
     let artifacts = printer.take_artifacts();
+    for it in printer.take_unbuilt() {
+        view(Event::Unbuilt { unit: it.unit, behind: it.behind, why: it.why });
+    }
     drop(printer);
     for flushed in [out.flush(), err.flush()] {
         if let Err(error) = flushed {
@@ -272,7 +276,7 @@ pub fn drive<A: Api>(
     view(Event::BuildEnded { ok });
     let _ = to_runner.send(Run::BuildOver { ok, artifacts });
     drop(to_runner);
-    let code = runner.join().unwrap_or(FAILED);
+    let code = runner.join().unwrap_or(Exit::Failed.code());
     let _ = to_screen.send(Msg::Finish);
     drop(to_screen);
     let shown = screen.join().map_err(|_| io::Error::other("the live test view's screen thread panicked"))?;
@@ -443,7 +447,7 @@ impl Screen {
             let _ = self.restore();
         }
         let _ = io::stderr().write_all(b"interrupted\n");
-        std::process::exit(130);
+        std::process::exit(blaze_core::exit::INTERRUPTED);
     }
 }
 
@@ -547,7 +551,7 @@ struct Runner {
 
 impl Runner {
     fn new(asked: &Invocation, to_screen: Sender<Msg>, to_runner: Sender<Run>, spec_flag: bool, color: bool) -> Runner {
-        Runner::of(asked.test_args(), !asked.flags.no_fail_fast, to_screen, to_runner, spec_flag, color)
+        Runner::of(asked.test_args(), asked.flags.fail_fast, to_screen, to_runner, spec_flag, color)
     }
 
     fn of(args: Vec<OsString>, fail_fast: bool, to_screen: Sender<Msg>, to_runner: Sender<Run>, spec_flag: bool, color: bool) -> Runner {
@@ -606,7 +610,7 @@ impl Runner {
                 Err(RecvTimeoutError::Disconnected) => {
                     // Every sender gone with work left: the caller's thread ended early.
                     self.stop_all();
-                    return FAILED;
+                    return Exit::Failed.code();
                 }
             };
             match run {
@@ -629,16 +633,16 @@ impl Runner {
     /// 0, the first failing executable's code in cargo's order (fail-fast), or 101.
     fn code(&mut self) -> i32 {
         if self.build == Some(false) {
-            return FAILED;
+            return Exit::Failed.code();
         }
         if self.failed.is_empty() {
             return 0;
         }
         if !self.fail_fast {
-            return FAILED;
+            return Exit::Failed.code();
         }
         self.failed.sort();
-        self.failed[0].1.unwrap_or(FAILED)
+        self.failed[0].1.unwrap_or(Exit::Failed.code())
     }
 
     fn ready(&mut self, artifact: Artifact) {
@@ -850,7 +854,7 @@ impl Runner {
         }
         self.stopping = true;
         let label = &self.binaries[binary as usize].label;
-        let why = format!("{label} failed; stopping the rest (`--no-fail-fast` runs them)");
+        let why = format!("{label} failed; stopping the rest (`--fail-fast`; without it they run)");
         self.say(Event::Stopping { why });
         self.stop_all();
     }

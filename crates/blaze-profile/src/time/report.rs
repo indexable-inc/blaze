@@ -297,8 +297,8 @@ pub fn summary(model: &Model, out: &mut String) {
     if a != super::Anomalies::default() {
         _ = writeln!(
             out,
-            "  rows that did not line up: {} spans with no parent row, {} spans past their parent or a sibling, {} runs cut by another job's switch, {} job spans naming a job with no switch rows",
-            a.orphans, a.misnested, a.runs_cut, a.spans_of_no_lane
+            "  rows that did not line up: {} spans with no parent row, {} spans past their parent or a sibling, {} runs cut by another job's switch, {} job spans naming a job with no switch rows, {} jobs given by no job whose creator span has no row",
+            a.orphans, a.misnested, a.runs_cut, a.spans_of_no_lane, a.creators_unread
         );
     }
 }

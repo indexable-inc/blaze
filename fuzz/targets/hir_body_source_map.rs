@@ -68,7 +68,7 @@ fn source_map() -> Valid {
     let mut root = build.root();
     expr::source_map_root(&mut root, &cols);
     root.slice(self_param);
-    build.finish(root)
+    build.finish(&root)
 }
 
 /// The empty source map, through the crate's own writer, and [`source_map`].

@@ -449,7 +449,7 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
 
 /// The build of fakes; `fetched` counts each fetch by its `at`.
 #[derive(Default)]
-struct Fake {
+pub(super) struct Fake {
     fetched: Mutex<BTreeMap<String, usize>>,
 }
 
@@ -458,7 +458,7 @@ impl Steps for Fake {
     type Writer = FakeWriter;
     type Reader = FakeReader;
     type KeptFront = FakeInputs;
-    type Linked = NoImage;
+    type Linked = FakeImage;
     type Runs = FakeRuns;
 
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
@@ -567,14 +567,14 @@ impl Steps for Fake {
     }
 }
 
-struct FakeFront {
+pub(super) struct FakeFront {
     goal: Goal,
 }
 
 /// A front end's inputs: the build scripts' runs applied to it, in the order applied, whether
 /// it was stored since it was last kept, and the checkout it was lowered for.
 #[derive(Default)]
-struct FakeInputs {
+pub(super) struct FakeInputs {
     runs: Vec<usize>,
     stored: bool,
     checkout: String,
@@ -589,22 +589,37 @@ impl KeptDb for FakeInputs {
 
 /// The front end written as the real one is: each write asked for waits until no reader of
 /// the inputs is alive.
-struct FakeWriter {
+pub(super) struct FakeWriter {
     inputs: Arc<FakeInputs>,
     asked: Vec<usize>,
     broke: Vec<Broke>,
 }
 
 /// A shared reference to the inputs, as the loop posted a task with it.
-struct FakeReader(Arc<FakeInputs>);
+pub(super) struct FakeReader(Arc<FakeInputs>);
 
-/// The fakes link nothing: no image is ever kept.
-enum NoImage {}
+/// A kept image as the kept images' budget sees it: what it weighs and whether a run maps it.
+/// The fakes' compiles link nothing, so only a test of the budget ([`super::job`]'s `Paths`)
+/// makes one.
+pub(super) struct FakeImage {
+    pub(super) held: u64,
+    pub(super) live: bool,
+}
 
-impl Kept for NoImage {
+impl Kept for FakeImage {
     fn tables(&self) -> Vec<(&'static str, u64, u64)> {
-        match *self {}
+        Vec::new()
     }
+
+    fn held(&self) -> u64 {
+        self.held
+    }
+
+    fn live(&self) -> bool {
+        self.live
+    }
+
+    fn rest(&mut self) {}
 }
 
 impl Writer<Fake> for FakeWriter {
@@ -684,7 +699,7 @@ impl Writer<Fake> for FakeWriter {
 
 /// The fakes' user code: a build script's run, or what is over as it starts, or a run that
 /// keeps what it did in the store.
-enum FakeRuns {
+pub(super) enum FakeRuns {
     Script(Script),
     Slow(Slow),
     Over(Over),
@@ -758,7 +773,7 @@ impl Runs<Fake> for FakeRuns {
 }
 
 /// A build script's run that is over as it starts, its run asked of the writer.
-struct Script(usize);
+pub(super) struct Script(usize);
 
 impl Runs<Fake> for Script {
     fn start(&mut self, _: &Store, writer: Option<&mut FakeWriter>, _: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
@@ -792,7 +807,7 @@ impl Runs<Fake> for Script {
 
 /// A build script's run that ends on a timer of its own ([`SLOW_SCRIPT`]), its run then
 /// asked of the writer.
-struct Slow {
+pub(super) struct Slow {
     unit: usize,
     tag: Tag,
     after: Duration,
@@ -831,7 +846,7 @@ impl Runs<Fake> for Slow {
 
 /// A build script's run whose end never comes: it says it waits on its effects and asked
 /// for none, as a run whose completion was lost.
-struct Lost;
+pub(super) struct Lost;
 
 impl Runs<Fake> for Lost {
     fn start(&mut self, _: &Store, _: Option<&mut FakeWriter>, _: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
@@ -872,7 +887,7 @@ const TEST_RECORD: &[u8] = b"how the tests of /w ran\n";
 /// The tests' run as a real one is to its job (`UnitRuns`): it ends on a completion of its
 /// own, and on it keeps how its tests ran in the store, handing the put's ticket over
 /// ([`Runs::take_puts`]) for its job to wait on before it answers.
-struct Keeps {
+pub(super) struct Keeps {
     tag: Tag,
     puts: RunPuts,
     /// Whether it hands its put's ticket over; not, under [`TESTS_KEEP_UNTOLD`].
@@ -924,7 +939,7 @@ impl Runs<Fake> for Keeps {
 }
 
 /// User code that is over as it starts.
-struct Over(Vec<Response>);
+pub(super) struct Over(Vec<Response>);
 
 impl Runs<Fake> for Over {
     fn start(&mut self, _: &Store, _: Option<&mut FakeWriter>, _: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
@@ -2626,6 +2641,35 @@ fn a_run_reports_what_ran_after_built() {
     assert_eq!(got.last(), Some(&Response::Done { ok: true }));
 }
 
+/// B2 (2026-11-03): the plane finishes once the last unit's node ends, before the loop has
+/// placed what it made, and a job's tests or run started then: on macOS every test of a
+/// binary linked last failed at exec, "No such file or directory", its file not placed yet.
+/// The program's placement slowed to 5 s here, the run still starts only once its job has no
+/// placement in flight ([`super::job::Jobs::release_runs`]), and the job ends ok.
+#[test]
+fn a_run_starts_only_once_its_program_is_placed() {
+    use super::job::RUNS_STARTED_PLACING;
+    RUNS_STARTED_PLACING.with_borrow_mut(Vec::clear);
+    OUTPUT.set(true);
+    let mut sim = Sim::new(43, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    sim.slow_writes(name("w/target"), Duration::from_secs(5));
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 43);
+    let mut client = dial(&mut daemon);
+    let id = client.send(
+        &mut daemon,
+        Request::Run { view: ViewRef::Head("/w".into()), targets: agent(), bin: None, args: Vec::new() },
+    );
+    let got = client.wait(&mut daemon, id);
+    OUTPUT.set(false);
+    let started = RUNS_STARTED_PLACING.with_borrow_mut(std::mem::take);
+    assert_eq!(started, [0], "the run starts once, with none of its job's placements in flight: {got:#?}");
+    assert_eq!(daemon.driver().contents(&name(&APP_AT[1..])), APP, "the program is placed whole");
+    assert!(got.iter().any(|it| matches!(it, Response::Ran { code: Some(0), .. })), "{got:#?}");
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+}
+
 #[test]
 fn a_pack_is_made_once_its_check_is_built_with_every_scripts_run_applied() {
     let mut sim = Sim::new(41, Faults::default());
@@ -2840,14 +2884,14 @@ fn a_write_that_fails_fails_only_the_units_after_it_and_keep_going_builds_the_re
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
 }
 
-/// Without `--keep-going`, a write that fails as it is applied ends the job at once, as a
+/// Under `--fail-fast`, a write that fails as it is applied ends the job at once, as a
 /// writer's own error does. Before, it only failed the job's result, and the plane failed fast
 /// once the program, which depends on the run, was posted, which waited for the program's other
 /// dependency: here the second build script's run (unit 4), on a timer of an hour. The first
 /// run's write (unit 2) fails; the job ends without that run ever finishing, well inside its
 /// hour, with the write named, and the daemon answers the next request.
 #[test]
-fn without_keep_going_a_write_that_fails_ends_the_job_at_once() {
+fn under_fail_fast_a_write_that_fails_ends_the_job_at_once() {
     ASKED.set(0);
     FAILS_RUN.set(Some(2));
     SLOW_SCRIPT.set(Some((4, Duration::from_secs(3600))));
@@ -2856,8 +2900,21 @@ fn without_keep_going_a_write_that_fails_ends_the_job_at_once() {
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 47);
     let mut client = dial(&mut daemon);
+    let cargo = blaze_api::Cargo {
+        cwd: "/w".into(),
+        env: Vec::new(),
+        args: vec!["--fail-fast".into()],
+        root: "/w".into(),
+        color: false,
+        files: Vec::new(),
+        width: None,
+        command: "build".into(),
+        refused: None,
+        verbose: 0,
+    };
+    let targets = Targets { cargo: Some(cargo), ..agent() };
     let began = daemon.driver().now();
-    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
     let got = client.wait(&mut daemon, id);
     let took = daemon.driver().now() - began;
     FAILS_RUN.set(None);
@@ -3396,7 +3453,7 @@ fn serve_takes_activated_alone_and_names_it_among_its_flags() {
     assert_eq!(args.socket.as_deref(), Some(std::path::Path::new("/run/b.sock")));
     assert!(!parse(&[]).unwrap().activated);
     let refused = parse(&["--activated=yes"]).err().unwrap().to_string();
-    assert!(refused.contains("`--activated`, `--ready-fd N` and `--stall-bound SECS`, not `--activated=yes`"), "{refused}");
+    assert!(refused.contains("`--activated`, `--ready-fd N`, `--stall-bound SECS` and `--memory-gb GB`, not `--activated=yes`"), "{refused}");
 }
 
 #[test]
@@ -3413,4 +3470,81 @@ fn status_says_the_daemons_pid() {
         _ => None,
     });
     assert_eq!(pid, Some(std::process::id()), "{got:#?}");
+}
+
+/// The loop's time between its turns is a `wait` span naming what ends it (rule 13). Before
+/// 2026-11-03 it was in no span, and 108.9 s of a self-build check's critical path read as
+/// unrecorded on the daemon's thread.
+#[test]
+fn the_loops_wait_between_turns_is_a_wait_span_naming_what_ends_it() {
+    const THREAD: &str = "daemon loop wait test";
+    blaze_profile::install();
+    std::thread::Builder::new()
+        .name(THREAD.into())
+        .spawn(|| {
+            let mut sim = Sim::new(5, Faults::default());
+            checkout(&mut sim, "[package]\nname = \"app\"\n");
+            let steps = Arc::new(Fake::default());
+            let mut daemon = start(sim, &steps, 5);
+            for _ in 0..100 {
+                daemon.turn();
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let mut read = blaze_profile::flight::Read::default();
+    blaze_profile::flight::window(Duration::from_secs(60), &mut read);
+    let awaits: Vec<String> = read
+        .spans
+        .iter()
+        .filter(|row| blaze_profile::flight::name(row.thread_name).as_deref() == Some(THREAD))
+        .filter_map(|row| blaze_profile::span::read::<blaze_profile::span::Wait>(row).unwrap())
+        .filter_map(|it| it.fields.awaits.text().map(|it| it.to_string()))
+        .collect();
+    assert!(awaits.iter().any(|it| it.starts_with("io daemon loop: ")), "the idle loop's waits say what ends them: {awaits:?}");
+}
+
+/// The limit the daemon runs under: `--memory-gb` first, else `BLAZE_DAEMON_MEMORY_GB`, each a
+/// number of GiB above 0 (a fraction allowed), named as given; a text that is no such number is
+/// an error naming where it came from, never the machine's in its place.
+#[test]
+fn the_memory_limit_is_told_by_flag_then_variable_and_a_bad_one_is_an_error() {
+    use super::{MEMORY_VAR, told_limit, told_memory};
+    const GIB: u64 = 1 << 30;
+    let var = |it: &str| Some(std::ffi::OsString::from(it));
+    assert_eq!(told_limit(None, None).unwrap(), None);
+    assert_eq!(told_limit(None, var("48")).unwrap(), Some((48 * GIB, format!("{MEMORY_VAR}=48"))));
+    assert_eq!(told_limit(None, var("1.5")).unwrap(), Some((3 * GIB / 2, format!("{MEMORY_VAR}=1.5"))));
+    let flag = told_memory("--memory-gb", "24").unwrap();
+    assert_eq!(flag, (24 * GIB, "--memory-gb=24".to_owned()));
+    assert_eq!(told_limit(Some(flag.clone()), var("48")).unwrap(), Some(flag), "the flag wins");
+    for bad in ["0", "-3", "abc", "", "inf", "NaN"] {
+        let error = told_limit(None, var(bad)).unwrap_err().to_string();
+        assert!(error.starts_with(MEMORY_VAR) && error.contains("GiB above 0"), "{bad:?}: {error}");
+    }
+}
+
+/// A daemon started under a budget makes it the limit a build's release is decided against
+/// and every subsystem's budget, before any job, and its start's line names the limit, what
+/// told it and each share. B5, coord-105: the plane carried the budget and nothing set it, so
+/// under `BLAZE_DAEMON_MEMORY_GB=48` no release was ever due and the daemon grew to 49 GiB.
+#[test]
+fn a_daemon_started_under_a_budget_makes_it_the_limit_releases_are_decided_against() {
+    use blaze_graph::admission::{self, share};
+    use blaze_mem::Tag;
+    // Far past what any test holds, so no other daemon's release in this process is made due,
+    // and no budget it sets (32 TiB at least) weighs on another test's sweep.
+    const LIMIT: u64 = (1 << 50) + (64 << 20);
+    let budget = blaze_graph::Budget { bytes: LIMIT, from: "a test's limit".to_owned() };
+    let said = super::limit_said(&budget);
+    assert!(said.starts_with("memory limit 1048576.06 GiB (a test's limit): "), "{said}");
+    assert!(said.contains("holds 917504.05 GiB") && said.contains("mir "), "{said}");
+    let mut options = options();
+    options.budget = Some(budget);
+    let steps = Arc::new(Fake::default());
+    let _daemon = Daemon::start(Sim::new(3, Faults::default()), options, steps, Runner::Inline(Inline::new(3)))
+        .unwrap_or_else(|why| panic!("{why}"));
+    assert_eq!(admission::limit(), LIMIT, "the release's limit is the daemon's");
+    assert_eq!(blaze_mem::tag::budget(Tag::Mir), LIMIT / 64 * share(Tag::Mir), "so is each budget");
 }

@@ -40,10 +40,14 @@
 use std::{
     fmt,
     path::PathBuf,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use base_db::{Crate, Db, Nonce, ProcMacroLoadingError};
+use blaze_graph::{Key, wait};
 use blaze_hash::SharedMap;
 use blaze_ids::ContentId;
 use blaze_usercode::{
@@ -68,6 +72,7 @@ use crate::{
     protocol,
     run::{self, Bridge, Expansion, Ran},
     stream::Stream,
+    turn::{Turn, Turns},
     wasm,
 };
 
@@ -127,7 +132,7 @@ impl Macros {
         libraries.retain(|it| it.strong_count() != 0);
         for library in libraries.iter().filter_map(Weak::upgrade) {
             // Another build that saw one leave state may have told the store since the load.
-            if library.seen.flush() && verdict(&self.keeps, &library.verdict_of) == Ok(Verdict::Unseen) {
+            if library.seen.flush() && verdict(&self.keeps, &library.runs) == Ok(Verdict::Unseen) {
                 tell(&library, STATELESS);
             }
         }
@@ -155,16 +160,20 @@ struct Library {
     engine: Engine,
     /// The code as it was at [`load`], which is asked again each time the crate compiles.
     loaded: ContentId,
-    /// What its verdict is kept under ([`verdict_run`]): its code on the evaluator, and its
-    /// code and module together for a wasm module, whose state is its own.
-    verdict_of: ContentId,
+    /// What its macros run, [`Engine::runs`] of `loaded`: what the key of a crate that calls
+    /// them covers ([`ProcMacroExpander::code`]: dependency images, goal facts) and what its
+    /// verdict is kept under ([`verdict_run`]).
+    runs: ContentId,
     code: code::Memo,
     /// What the store said of the crate's state when it was loaded, and what its expansions
     /// that ran (not found) did since.
     seen: verdicts::Seen,
-    /// Each calling crate's session, each held while a call that has state runs: its calls
-    /// run in order.
-    sessions: SharedMap<Crate, Arc<Mutex<Session>>>,
+    /// Each calling crate's session: its calls run in order, each that runs from its state or
+    /// changes it holding its turn in [`Library::turns`].
+    sessions: SharedMap<Crate, Arc<SessionOf>>,
+    /// The turns of its sessions ([`crate::turn`]): scheduler holds, so a call waiting for one
+    /// holds no thread while the call holding it runs its macro.
+    turns: Turns,
     /// Each calling crate's roots as its expansions are kept against them ([`Library::kept_roots`]).
     kept_roots: SharedMap<Crate, Arc<KeptRoots>>,
 }
@@ -179,7 +188,7 @@ struct KeptRoots {
 }
 
 /// What a library's macros run on.
-enum Engine {
+pub(crate) enum Engine {
     /// The MIR evaluator, through the bridge's functions in the crate's `proc_macro`.
     Evaluator(Bridge),
     /// The crate's wasm module ([`load_wasm`]). Each expansion is a fresh instance, given the
@@ -187,11 +196,26 @@ enum Engine {
     Wasm(wasm::Library),
 }
 
+impl Engine {
+    /// What the macros of the crate whose code is `loaded` run on this engine: on the
+    /// evaluator, the crate's code, which the front end's code runs (`BLAZE_FRONT_END_CODE` is
+    /// in every key beside it); in a wasm module, the crate's code and the module
+    /// ([`wasm::Library::runs`]), which blaze's code generator made, and which the front end's
+    /// code identity leaves out: a fix of the code generator is another module, and so another
+    /// key of every crate that calls its macros.
+    pub(crate) fn runs(&self, loaded: ContentId) -> ContentId {
+        match self {
+            Engine::Evaluator(_) => loaded,
+            Engine::Wasm(module) => module.runs(loaded),
+        }
+    }
+}
+
 /// A call that panicked holding a session or the sessions leaves them as they were at the panic,
 /// and the next call takes them as they are.
 impl std::panic::RefUnwindSafe for Library {}
 
-/// The run a verdict of the crate whose code is `code` (its [`Library::verdict_of`]) is kept
+/// The run a verdict of the crate whose code is `code` (its [`Library::runs`]) is kept
 /// under, in the store expansions are kept in, with nothing read. Each verdict has its own key,
 /// so none is ever put under a key that holds another, and a crate seen stateful by one build
 /// and stateless by another is stateful ([`verdict`]).
@@ -242,7 +266,7 @@ fn tell(library: &Library, verdict: &'static [u8]) {
         return;
     }
     put(Put {
-        keep: Keep::Run { run: verdict_run(&library.verdict_of, verdict), traced: blaze_core::Traced::default() },
+        keep: Keep::Run { run: verdict_run(&library.runs, verdict), traced: blaze_core::Traced::default() },
         value: verdict.to_vec(), // alloc: once per crate per build, a verdict
         // alloc: as above
         what: format!("the verdict of the proc macros of `{}`", library.name),
@@ -271,10 +295,10 @@ impl Library {
 
     /// The session of `calling` in the database's revision now, started again when it was of
     /// another.
-    fn session(&self, db: &Db, calling: Crate) -> Arc<Mutex<Session>> {
+    fn session(&self, db: &Db, calling: Crate) -> Arc<SessionOf> {
         let now = db.nonce_and_revision();
         // clone: the session's handle, held for one call
-        let session = Arc::clone(self.sessions.pin().get_or_insert_with(calling, Arc::default));
+        let session = Arc::clone(self.sessions.pin().get_or_insert_with(calling, SessionOf::new));
         {
             let mut held = session.lock();
             if held.at != Some(now) {
@@ -282,6 +306,19 @@ impl Library {
             }
         }
         session
+    }
+
+    /// The turn of `session`, `calling`'s, for a call that runs from its state or changes it:
+    /// waited for through the scheduler while another call holds it ([`crate::turn`]), the
+    /// wait naming the session. An error says why it was not given: a call of the session asked
+    /// for inside the run of another on the same job, or one starved of its turn.
+    fn turn<'s>(&'s self, db: &Db, calling: Crate, session: &'s SessionOf) -> Result<SessionTurn<'s>, ProcMacroExpansionError> {
+        // alloc: once per call that holds a session's turn, the name its waits and errors say
+        let said = format!("the proc-macro session of `{}` for `{}`", self.name, calling.named(db));
+        let turn = self.turns.take(session.turn, &mut |it| it.push_str(&said)).map_err(|why| system(why.said(&said)))?;
+        let mut held = session.lock();
+        let calls = std::mem::take(&mut held.calls);
+        Ok(SessionTurn { session, at: held.at, calls, _turn: turn })
     }
 
     /// The roots `calling`'s expansion with `roots` is kept against, given `passed`: made once
@@ -313,6 +350,66 @@ impl Library {
 impl fmt::Debug for Library {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Library").field("name", &self.name).field("loaded", &self.loaded).finish_non_exhaustive()
+    }
+}
+
+/// What [`SessionOf::state`] is locked as, said when another holds it.
+const SESSION_STATE: &str = "a proc-macro session's state";
+
+/// One calling crate's session of a library: its state, and what its turn is held under.
+struct SessionOf {
+    /// Locked only to read or write its fields, never across a run, a query or any other wait
+    /// (standard-structures, no-wait-across-thread-locals): a call that runs from the state or
+    /// changes it holds the session's turn ([`Library::turn`]) instead.
+    state: Mutex<Session>,
+    /// The session's turn's key in [`Library::turns`]: one of the process's, from a count.
+    turn: Key,
+}
+
+impl SessionOf {
+    fn new() -> Arc<SessionOf> {
+        static SESSIONS: AtomicU64 = AtomicU64::new(0);
+        let mut turn = [0u8; 32];
+        turn[..8].copy_from_slice(&SESSIONS.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        turn[8..].copy_from_slice(b"a macro session's turn\0\0");
+        // alloc: once per calling crate of a proc-macro crate
+        Arc::new(SessionOf { state: Mutex::new(Session::default()), turn: Key(turn) })
+    }
+
+    /// Its state, for a field's read or write: never held across a wait.
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Session> {
+        wait::lock(&self.state, SESSION_STATE)
+    }
+}
+
+/// A call's hold of its session's turn ([`Library::turn`]). The session's calls (what runs
+/// again before each next call when a static holds an address) are taken out of it for the
+/// turn, as only the turn's holder runs them or adds to them, and put back as it ends, also on
+/// an unwind, unless the session was started again for another revision meanwhile.
+struct SessionTurn<'s> {
+    session: &'s SessionOf,
+    /// The revision the session was of when the turn was taken.
+    at: Option<(Nonce, blaze_query::db::View)>,
+    calls: Vec<Kept>,
+    // Dropped after `drop` has put the calls back: the next holder finds them there.
+    _turn: Turn<'s>,
+}
+
+impl SessionTurn<'_> {
+    /// The session's state for a field's update, `None` when it was started again for another
+    /// revision since the turn was taken: nothing of this turn's call is kept in that one.
+    fn update(&self) -> Option<parking_lot::MutexGuard<'_, Session>> {
+        let held = self.session.lock();
+        (held.at == self.at).then_some(held)
+    }
+}
+
+impl Drop for SessionTurn<'_> {
+    fn drop(&mut self) {
+        let calls = std::mem::take(&mut self.calls);
+        if let Some(mut held) = self.update() {
+            held.calls = calls;
+        }
     }
 }
 
@@ -424,7 +521,7 @@ fn refused(why: String) -> ProcMacroLoadingError {
 /// proc-macro crate, or its `proc_macro` is not the bridge blaze's server speaks. Its expansions
 /// are kept where the daemon's `macros` keeps them.
 pub fn load(db: &Db, krate: Crate, toolchain: ContentId, macros: &Arc<Macros>) -> ProcMacroLoadResult {
-    load_on(db, krate, toolchain, macros, |_, checked| Ok((Engine::Evaluator(checked.bridge), checked.loaded)))
+    load_on(db, krate, toolchain, macros, |_, bridge| Ok(Engine::Evaluator(bridge)))
 }
 
 /// The macros of `krate`, each run in a fresh instance of `module`, the crate built by blaze
@@ -440,34 +537,23 @@ pub fn load_wasm(
     modules: &wasm::Modules,
     module: &[u8],
 ) -> ProcMacroLoadResult {
-    load_on(db, krate, toolchain, macros, |name, checked| {
+    load_on(db, krate, toolchain, macros, |name, _| {
         // alloc: error path, and once a crate the name its put says
         let what = format!("the wasm module of the proc-macro crate `{name}`");
         let mut library = wasm::Library::load(modules, &macros.keeps, module, &what).map_err(|why| refused(format!("{what} {why}")))?; // alloc: error path
         library.watch(db, krate).map_err(|why| refused(format!("{what} {why}")))?; // alloc: error path
-        let verdict_of = blaze_ids::Hasher::new("the verdict of a proc-macro crate's wasm module 1")
-            .part(&checked.loaded.0)
-            .part(&library.id().0)
-            .finish();
-        Ok((Engine::Wasm(library), verdict_of))
+        Ok(Engine::Wasm(library))
     })
 }
 
-/// What [`load_on`] found of a crate for its engine: the bridge's functions, and its code.
-struct Checked {
-    bridge: Bridge,
-    loaded: ContentId,
-}
-
-/// [`load`] and [`load_wasm`]: the crate checked, and its macros on the engine (and what its
-/// verdict is kept under, [`Library::verdict_of`]) `engine` makes of the crate's name and what
-/// was found of it.
+/// [`load`] and [`load_wasm`]: the crate checked, and its macros on the engine `engine` makes
+/// of the crate's name and the bridge's functions found in its `proc_macro`.
 fn load_on(
     db: &Db,
     krate: Crate,
     toolchain: ContentId,
     macros: &Arc<Macros>,
-    engine: impl FnOnce(&str, Checked) -> Result<(Engine, ContentId), ProcMacroLoadingError>,
+    engine: impl FnOnce(&str, Bridge) -> Result<Engine, ProcMacroLoadingError>,
 ) -> ProcMacroLoadResult {
     // alloc: once a proc-macro crate, the name its errors say
     let name = krate.named(db).to_string().into_boxed_str();
@@ -481,8 +567,9 @@ fn load_on(
     let bridge = Bridge::find(db, proc_macro).map_err(|why| refused(format!("the proc-macro crate `{name}`: {why}")))?; // alloc: error path
     let code = code::Memo::default();
     let loaded = code.get(db, krate);
-    let (engine, verdict_of) = engine(&name, Checked { bridge, loaded })?;
-    let verdict = verdict(&macros.keeps, &verdict_of)
+    let engine = engine(&name, bridge)?;
+    let runs = engine.runs(loaded);
+    let verdict = verdict(&macros.keeps, &runs)
         // alloc: error path
         .map_err(|why| refused(format!("the proc-macro crate `{name}`: its verdict in the store: {why}")))?;
     let library = Arc::new(Library { // alloc: once a proc-macro crate loaded
@@ -492,10 +579,11 @@ fn load_on(
         toolchain,
         engine,
         loaded,
-        verdict_of,
+        runs,
         code,
         seen: verdicts::Seen::new(verdict),
         sessions: SharedMap::default(),
+        turns: Turns::default(),
         kept_roots: SharedMap::default(),
     });
     macros.libraries.lock().push(Arc::downgrade(&library));
@@ -603,30 +691,44 @@ impl Evaluated {
         inputs
     }
 
-    /// Runs the call, after the session's calls before it when they must be run again, and
-    /// keeps the state it leaves in the session: what it gave, and the state it ran from
-    /// ([`From`]).
-    fn run(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) -> Result<(Ran, From), ProcMacroExpansionError> {
-        let library = &*self.library;
-        let session = library.session(db, calling);
-        let mut held = session.lock();
-        let this = Kept {
+    /// `call` as its session keeps it, to run again.
+    fn kept(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) -> Kept {
+        Kept {
             function: self.function,
             attr: self.kind == ProcMacroKind::Attr,
             inputs: self.inputs(call),
             sites: [call.def_site, call.call_site, call.mixed_site],
             edition: call.call_site.anchor.file_id.edition(),
             forced_keywords: forced_keywords(db, calling),
+        }
+    }
+
+    /// Runs the call, after the session's calls before it when they must be run again, and
+    /// keeps the state it leaves in the session: what it gave, and the state it ran from
+    /// ([`From`]). It holds the session's turn while it runs from the session's state; a call
+    /// of a session with none gives the turn back while it runs, as its calls run at once.
+    fn run(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) -> Result<(Ran, From), ProcMacroExpansionError> {
+        let library = &*self.library;
+        let this = self.kept(db, calling, call);
+        let session = library.session(db, calling);
+        let mut turn = library.turn(db, calling, &session)?;
+        let (stateless, holds, preset, ahead) = {
+            let mut held = session.lock();
+            held.taken += 1;
+            let stateless = held.statics.is_empty() && !held.holds;
+            let ahead = held.take_ahead(&this);
+            // clone: the statics the call runs from, once per call of a session with state:
+            // read outside the lock, which no query or run is made under
+            let preset = if held.holds { Vec::new() } else { held.statics.clone() };
+            (stateless, held.holds, preset, ahead)
         };
-        let stateless = held.statics.is_empty() && !held.holds;
-        held.taken += 1;
-        let from = From { replayed: held.holds, start: if held.holds { None } else { start_digest(db, &held.statics) } };
-        let ran = if let Some(ahead) = held.take_ahead(&this) {
+        let from = From { replayed: holds, start: if holds { None } else { start_digest(db, &preset) } };
+        let ran = if let Some(ahead) = ahead {
             // Run ahead from the statics the session has now: what a run now would give.
             let ran = match ahead {
                 Ok(ran) => ran?,
                 Err(panic) => {
-                    drop(held);
+                    drop(turn);
                     std::panic::resume_unwind(panic);
                 }
             };
@@ -639,24 +741,23 @@ impl Evaluated {
             ran
         } else if stateless {
             // Its calls run at once: the state of each is the start, which none of them change.
-            drop(held);
+            drop(turn);
             let ran = self.run_on(db, calling, call, &[], &[], &this);
-            held = session.lock();
+            turn = library.turn(db, calling, &session)?;
             ran?
         } else {
-            let replayed: &[Kept] = if held.holds { &held.calls } else { &[] };
-            let preset: &[(StaticId, Vec<u8>)] = if held.holds { &[] } else { &held.statics };
-            self.run_on(db, calling, call, preset, replayed, &this)?
+            let replayed: &[Kept] = if holds { &turn.calls } else { &[] };
+            self.run_on(db, calling, call, &preset, replayed, &this)?
         };
-        let holds = ran.statics.iter().any(|it| it.2);
+        let left_holding = ran.statics.iter().any(|it| it.2);
         library.saw(match () {
             () if ran.statics.is_empty() && !from.replayed => Left::Nothing,
-            () if stateless && !holds => Left::First,
+            () if stateless && !left_holding => Left::First,
             () => Left::Moved,
         })?;
-        let session = &mut *held;
+        let Some(mut session) = turn.update() else { return Ok((ran, from)) };
         if !ran.statics.is_empty() {
-            session.holds |= ran.statics.iter().any(|it| it.2);
+            session.holds |= left_holding;
             if session.holds {
                 // Its calls run again before each next one, from no preset: none runs ahead.
                 session.ahead.clear();
@@ -670,8 +771,10 @@ impl Evaluated {
                 }
             }
         }
-        if !session.statics.is_empty() || session.holds {
-            session.calls.push(this);
+        let keeps_calls = !session.statics.is_empty() || session.holds;
+        drop(session);
+        if keeps_calls {
+            turn.calls.push(this);
         }
         Ok((ran, from))
     }
@@ -679,21 +782,18 @@ impl Evaluated {
     /// Notes in the session of `calling` that `call`'s turn was found in the store, from the
     /// state the session has: it left that state as it was, and is a call the session's later
     /// ones may run after again.
-    fn found(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) {
+    fn found(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) -> Result<(), ProcMacroExpansionError> {
         let session = self.library.session(db, calling);
-        let mut held = session.lock();
-        held.taken += 1;
-        if !held.statics.is_empty() || held.holds {
-            let this = Kept {
-                function: self.function,
-                attr: self.kind == ProcMacroKind::Attr,
-                inputs: self.inputs(call),
-                sites: [call.def_site, call.call_site, call.mixed_site],
-                edition: call.call_site.anchor.file_id.edition(),
-                forced_keywords: forced_keywords(db, calling),
-            };
-            held.calls.push(this);
+        let mut turn = self.library.turn(db, calling, &session)?;
+        let keeps_calls = {
+            let mut held = session.lock();
+            held.taken += 1;
+            !held.statics.is_empty() || held.holds
+        };
+        if keeps_calls {
+            turn.calls.push(self.kept(db, calling, call));
         }
+        Ok(())
     }
 
     /// Runs `this` after `replayed`, from the statics `preset`.
@@ -766,14 +866,7 @@ impl Evaluated {
         let session = self.library.session(db, calling);
         // clone: the statics a run ahead starts from, once per call run ahead
         let preset = session.lock().statics.clone();
-        let this = Kept {
-            function: self.function,
-            attr: self.kind == ProcMacroKind::Attr,
-            inputs: self.inputs(call),
-            sites: [call.def_site, call.call_site, call.mixed_site],
-            edition: call.call_site.anchor.file_id.edition(),
-            forced_keywords: forced_keywords(db, calling),
-        };
+        let this = self.kept(db, calling, call);
         let _span = tracing::info_span!(
             target: "blaze",
             "proc macro run ahead",
@@ -801,8 +894,16 @@ impl Evaluated {
     /// calls before it are run again (a static holds an address), else its [`start_digest`].
     fn start(&self, db: &Db, calling: Crate) -> Option<Option<ContentId>> {
         let session = self.library.session(db, calling);
-        let held = session.lock();
-        (!held.holds).then(|| start_digest(db, &held.statics))
+        let statics = {
+            let held = session.lock();
+            if held.holds {
+                return None;
+            }
+            // clone: the statics the next call starts from, once per kept call of a session
+            // with state: digested outside the lock, as the digest asks the database
+            held.statics.clone()
+        };
+        Some(start_digest(db, &statics))
     }
 
     /// The output of `ran`, or the error it ends in.
@@ -914,7 +1015,7 @@ impl Evaluated {
                     match keeping.mode {
                         Mode::Keep => {
                             let output = read(value, &spans).map_err(|why| system(format_args!("{}: {why}", self.what())))?;
-                            self.found(db, calling, &call);
+                            self.found(db, calling, &call)?;
                             report_reads(reads);
                             return Ok(output);
                         }
@@ -1088,8 +1189,10 @@ impl ProcMacroExpander for Evaluated {
         }
     }
 
+    /// What its crate's macros run ([`Library::runs`]): a wasm module's expansions are another
+    /// crate's key than the evaluator's, and another module's another again.
     fn code(&self) -> Option<ContentId> {
-        Some(self.library.loaded)
+        Some(self.library.runs)
     }
 
     /// A call with no calling crate is its own session.

@@ -31,7 +31,7 @@ fn infer_pattern() {
             let k = mut_ref_to_x;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             8..9 'x': &'? i32
             17..399 '{     ...o_x; }': ()
             27..28 'y': &'? i32
@@ -123,7 +123,7 @@ fn infer_literal_pattern() {
             if let true = any() {}
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             17..28 '{ loop {} }': T
             19..26 'loop {}': !
             24..26 '{}': ()
@@ -198,7 +198,7 @@ fn test() {
     if let 1..=76 = 2u32 {}
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             10..68 '{     ...2 {} }': ()
             16..38 'if let...u32 {}': ()
             19..35 'let 1....= 2u32': bool
@@ -241,7 +241,7 @@ fn infer_pattern_match_ergonomics() {
             let A(n) = &mut A(1);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             27..78 '{     ...(1); }': ()
             37..41 'A(n)': A<i32>
             39..40 'n': &'? i32
@@ -268,7 +268,7 @@ fn infer_pattern_match_ergonomics_ref() {
             let (_, &w) = v;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             10..56 '{     ...= v; }': ()
             20..21 'v': &'? (i32, &'? i32)
             24..32 '&(1, &2)': &'? (i32, &'? i32)
@@ -320,7 +320,7 @@ fn infer_pattern_match_slice() {
             }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             10..209 '{     ...   } }': ()
             20..25 'slice': &'? [f64]
             36..42 '&[0.0]': &'? [f64; 1]
@@ -361,7 +361,7 @@ fn infer_pattern_match_string_literal() {
             }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             10..98 '{     ...   } }': ()
             20..21 's': &'? str
             30..37 '"hello"': &'static str
@@ -393,7 +393,7 @@ fn infer_pattern_match_byte_string_literal() {
             if let b"foo" = &v {}
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             105..109 'self': &'? [T; N]
             111..116 'index': RangeFull
             157..180 '{     ...     }': &'? [u8]
@@ -433,7 +433,7 @@ fn infer_pattern_match_or() {
             }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             10..108 '{     ...   } }': ()
             20..21 's': &'? str
             30..37 '"hello"': &'static str
@@ -468,7 +468,7 @@ fn infer_pattern_match_arr() {
             }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             10..179 '{     ...   } }': ()
             20..23 'arr': [f64; 2]
             36..46 '[0.0, 1.0]': [f64; 2]
@@ -519,7 +519,7 @@ fn infer_adt_pattern() {
             d;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             67..288 '{     ...  d; }': ()
             77..78 'e': E
             81..94 'E::A { x: 3 }': E
@@ -562,7 +562,7 @@ impl Foo {
     }
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             42..151 '{     ...     }': ()
             56..64 'Self(s,)': Foo
             61..62 's': &'? usize
@@ -605,7 +605,7 @@ fn enum_variant_through_self_in_pattern() {
             }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             75..217 '{     ...     }': !
             85..210 'match ...     }': ()
             91..100 '(loop {})': !
@@ -646,7 +646,7 @@ fn infer_generics_in_patterns() {
             };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             78..80 'a1': A<u32>
             90..91 'o': Option<u64>
             106..243 '{     ...  }; }': ()
@@ -704,7 +704,7 @@ fn main() {
     }
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             27..31 'self': &'? S
             41..50 '{ false }': bool
             43..48 'false': bool
@@ -731,7 +731,7 @@ fn test() {
     foo(&(1, "a"), |(x, y)| x);
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             32..33 't': T
             38..39 'f': F
             49..60 '{ loop {} }': U
@@ -776,7 +776,7 @@ fn slice_tail_pattern() {
             }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             7..13 'params': &'? [i32]
             23..92 '{     ...   } }': ()
             29..90 'match ...     }': ()
@@ -806,7 +806,7 @@ fn box_pattern() {
             }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             108..114 'params': Box<i32, Global>
             126..180 '{     ...   } }': ()
             132..178 'match ...     }': ()
@@ -829,7 +829,7 @@ fn box_pattern() {
             }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             77..83 'params': Box<i32>
             95..149 '{     ...   } }': ()
             101..147 'match ...     }': ()
@@ -855,7 +855,7 @@ fn foo(tuple: (u8, i16, f32)) {
         _ => {}
     }
 }"#,
-        expect![[r#"
+        &expect![[r#"
             7..12 'tuple': (u8, i16, f32)
             30..224 '{     ...   } }': ()
             36..222 'match ...     }': ()
@@ -905,7 +905,7 @@ fn foo(tuple: Tuple) {
         _ => {}
     }
 }"#,
-        expect![[r#"
+        &expect![[r#"
             35..40 'tuple': Tuple
             49..268 '{     ...   } }': ()
             55..266 'match ...     }': ()
@@ -977,7 +977,7 @@ fn main() {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             10..142 '{     ...   } }': ()
             16..140 'match ...     }': ()
             22..30 '(false,)': (bool,)
@@ -1020,7 +1020,7 @@ fn main() {
     let [head, middle @ .., tail, tail2] = [1, 2, 3, 4, 5];
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             10..73 '{     ... 5]; }': ()
             20..52 '[head,...tail2]': [i32; 5]
             21..25 'head': i32
@@ -1307,7 +1307,7 @@ fn foo(v: &Box<Foo<i32>>) {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             142..146 'self': &'? Box<T>
             165..188 '{     ...     }': &'? T
             175..182 'loop {}': !

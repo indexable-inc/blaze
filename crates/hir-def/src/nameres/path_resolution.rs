@@ -31,7 +31,7 @@ use crate::{
         BlockInfo, BuiltinShadowMode, DefMap, LocalDefMap, MacroSubNs, crate_def_map,
         sub_namespace_match, trait_items::trait_item_per_ns,
     },
-    per_ns::{PerNs, TypesItem},
+    per_ns::{Namespace, PerNs, TypesItem},
     visibility::{RawVisibility, Visibility, VisibilityError, visibility_path},
 };
 
@@ -103,7 +103,7 @@ impl ResolvePathResult {
     }
 
     /// Adds what the path means in an enclosing def map: names of the inner one win.
-    fn merge(&mut self, new: ResolvePathResult) {
+    fn merge(&mut self, new: &ResolvePathResult) {
         self.resolved_def = self.resolved_def.or(new.resolved_def);
         if self.reached_fixedpoint == ReachedFixedPoint::No {
             self.reached_fixedpoint = new.reached_fixedpoint;
@@ -159,9 +159,22 @@ impl<'a> Segments<'a> {
     /// The `i`th segment's name as the scope of `module` binds it: keyed by its context
     /// adjusted to the module's expansion (rustc's `normalize_to_macros_2_0_and_adjust`).
     fn keyed_in(&self, db: &Db, map: &DefMap, module: ModuleId, i: usize) -> Name {
+        self.keyed_for(db, || map.module_expansion(db, module), i)
+    }
+
+    /// The `i`th segment's name as a scope that `expn` made binds it: [`Self::keyed_in`] for a
+    /// scope that is no module, an enum's variants ([`super::def_site::enum_expansion`]).
+    /// `expn` is only asked for a segment a macro file writes, so a path of a real file reads
+    /// nothing more.
+    fn keyed_for(
+        &self,
+        db: &Db,
+        expn: impl FnOnce() -> Option<hir_expand::MacroCallId>,
+        i: usize,
+    ) -> Name {
         let name = self.names[i];
         let Some(ctxt) = self.contexts.map(|it| it[i]) else { return name };
-        match super::def_site::key_in(db, ctxt, map.module_expansion(db, module)) {
+        match super::def_site::key_in(db, ctxt, expn()) {
             Some(key) => name.keyed(key),
             None => name,
         }
@@ -231,15 +244,20 @@ impl DefMap {
         within_impl: bool,
     ) -> Result<Visibility, VisibilityError> {
         let vis = match visibility {
-            RawVisibility::Module(path, explicitness) => {
+            RawVisibility::Module(path, explicitness, ctxt) => {
                 let path = visibility_path(path, self.data.edition)?;
-                let (result, remaining) = self.resolve_path(
+                // rustc's `resolve_visibility` resolves the path with its spans: its first
+                // segment by def-site hygiene.
+                let origin =
+                    self.hygienic_origin(db, original_module, &path, Some(Namespace::Types), *ctxt);
+                let (result, remaining) = self.resolve_path_from(
                     local_def_map,
                     db,
                     original_module,
                     &path,
                     BuiltinShadowMode::Module,
                     None,
+                    origin,
                 );
                 if remaining.is_some() {
                     return Err(VisibilityError::Unresolved);
@@ -392,7 +410,7 @@ impl DefMap {
                             segments,
                             reads,
                         );
-                        result.merge(new);
+                        result.merge(&new);
                     }
 
                     return result;
@@ -400,7 +418,7 @@ impl DefMap {
             }
 
             let new = current_map.resolve_single(q, original_module, kind, segments, reads);
-            result.merge(new);
+            result.merge(&new);
         }
     }
 
@@ -720,7 +738,10 @@ impl DefMap {
                         crate::Lookup::lookup(&e, db).container,
                         Some(crate::nameres::delta::reads::enum_glob()),
                     );
-                    let res = e.enum_variants(db).variants.get(segment).map(|&(variant, shape)| {
+                    // The variant's name as the enum's scope binds it, adjusted to the enum's
+                    // expansion (rustc's `resolve_ident_in_module` of the enum's module).
+                    let segment = segments.keyed_for(db, || super::def_site::enum_expansion(db, e), i);
+                    let res = e.enum_variants(db).variants.get(&segment).map(|&(variant, shape)| {
                         if shape.has_value_ns_ctor() {
                             PerNs::both(variant.into(), variant.into(), vis, None)
                         } else {

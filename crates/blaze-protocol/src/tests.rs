@@ -26,13 +26,13 @@ fn unhex(text: &str) -> Vec<u8> {
 /// `value` encodes as `expected`, which the checker passes and which decodes to it again.
 #[track_caller]
 fn encodes<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
-    value: T,
+    value: &T,
     expected: &str,
 ) {
-    let bytes = to_vec(&value).unwrap();
+    let bytes = to_vec(value).unwrap();
     assert_eq!(hex(&bytes), expected, "{value:?}");
     check(&bytes).unwrap();
-    assert_eq!(from_slice::<T>(&bytes).unwrap(), value);
+    assert_eq!(from_slice::<T>(&bytes).unwrap(), *value);
 }
 
 #[track_caller]
@@ -59,11 +59,11 @@ fn the_rfc_examples() {
         (1_000_000_000_000, "1b000000e8d4a51000"),
         (u64::MAX, "1bffffffffffffffff"),
     ] {
-        encodes(n, expected);
+        encodes(&n, expected);
     }
-    encodes(-18_446_744_073_709_551_616i128, "3bffffffffffffffff");
+    encodes(&-18_446_744_073_709_551_616i128, "3bffffffffffffffff");
     for (n, expected) in [(-1i64, "20"), (-10, "29"), (-100, "3863"), (-1000, "3903e7")] {
-        encodes(n, expected);
+        encodes(&n, expected);
     }
     for (x, expected) in [
         (0.0f64, "f90000"),
@@ -89,25 +89,25 @@ fn the_rfc_examples() {
     }
     assert_eq!(hex(&to_vec(&f64::NAN).unwrap()), "f97e00");
     assert!(from_slice::<f64>(&unhex("f97e00")).unwrap().is_nan());
-    encodes(false, "f4");
-    encodes(true, "f5");
-    encodes((), "f6");
-    encodes(String::new(), "60");
-    encodes("a".to_owned(), "6161");
-    encodes("IETF".to_owned(), "6449455446");
-    encodes("\"\\".to_owned(), "62225c");
-    encodes("\u{fc}".to_owned(), "62c3bc");
-    encodes("\u{6c34}".to_owned(), "63e6b0b4");
-    encodes("\u{10151}".to_owned(), "64f0908591");
-    encodes(Vec::<u8>::new(), "80");
-    encodes(vec![1, 2, 3], "83010203");
-    encodes((1, (2, 3), (4, 5)), "8301820203820405");
+    encodes(&false, "f4");
+    encodes(&true, "f5");
+    encodes(&(), "f6");
+    encodes(&String::new(), "60");
+    encodes(&"a".to_owned(), "6161");
+    encodes(&"IETF".to_owned(), "6449455446");
+    encodes(&"\"\\".to_owned(), "62225c");
+    encodes(&"\u{fc}".to_owned(), "62c3bc");
+    encodes(&"\u{6c34}".to_owned(), "63e6b0b4");
+    encodes(&"\u{10151}".to_owned(), "64f0908591");
+    encodes(&Vec::<u8>::new(), "80");
+    encodes(&vec![1, 2, 3], "83010203");
+    encodes(&(1, (2, 3), (4, 5)), "8301820203820405");
     encodes(
-        (1..=25).collect::<Vec<u32>>(),
+        &(1..=25).collect::<Vec<u32>>(),
         "98190102030405060708090a0b0c0d0e0f101112131415161718181819",
     );
-    encodes(BTreeMap::<u8, u8>::new(), "a0");
-    encodes(BTreeMap::from([(1, 2), (3, 4)]), "a201020304");
+    encodes(&BTreeMap::<u8, u8>::new(), "a0");
+    encodes(&BTreeMap::from([(1, 2), (3, 4)]), "a201020304");
     let bytes = to_vec(&serde_bytes(&[1, 2, 3, 4])).unwrap();
     assert_eq!(hex(&bytes), "4401020304");
 }
@@ -128,7 +128,7 @@ fn serde_bytes(bytes: &[u8]) -> Bytes<'_> {
 #[test]
 fn map_keys_go_in_the_order_of_their_bytes() {
     let map = BTreeMap::from([("aa".to_owned(), 1), ("b".to_owned(), 2)]);
-    encodes(map, "a261620262616101");
+    encodes(&map, "a261620262616101");
     // A hash map's order is its iteration's, which the encoding does not keep: unsigned
     // before negative, each by its head.
     let hashed: HashMap<i64, (), Global> = (-30..30).map(|it| (it, ())).collect();
@@ -574,7 +574,7 @@ fn frames_are_written_in_place_and_read_into_one_buffer() {
 #[test]
 fn a_cancelled_node_is_settled_and_encodes_as_its_name() {
     use crate::events::NodeState;
-    encodes(NodeState::Cancelled, "6943616e63656c6c6564");
+    encodes(&NodeState::Cancelled, "6943616e63656c6c6564");
     assert!(NodeState::Cancelled.settled());
     assert!(!NodeState::Ready.settled());
 }

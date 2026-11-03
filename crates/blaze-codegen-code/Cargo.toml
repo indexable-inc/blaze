@@ -1,6 +1,6 @@
 [package]
 name = "blaze-codegen-code"
-description = "The content identity of blaze's code generator, worked out by the build script of the program that runs it: what stored templates are keyed by in place of the executable's bytes"
+description = "The content identities of blaze's code generator and of its front end (the trait solver included), worked out by the program's build script over the checkout or a shipped tree: what stored templates and stored front-end answers are keyed by"
 publish = false
 
 version.workspace = true
@@ -13,16 +13,26 @@ repository.workspace = true
 [lib]
 doctest = false
 
-# A build-dependency of the programs (blaze-engine, blaze-wasm) and a dev-dependency of
-# hir-ty-codegen's coverage check: nothing of it is linked into blaze.
+# A build-dependency of the programs (blaze-engine, which works out the code generator's and the
+# front end's identities, and blaze-wasm), and a dev-dependency of the coverage checks
+# (hir-ty-codegen, blaze-cargo) and hir-ty's store tests: nothing of it is linked into blaze.
 # It reads `Cargo.lock` and the manifests itself (`toml`, `glob` for `members`): a build script
 # runs no cargo, whose `$CARGO` is blaze under blaze.
 [dependencies]
 blake3.workspace = true
 glob.workspace = true
 toml.workspace = true
+# The request of `ship-code-identity` (`ship`).
+serde_json = { workspace = true, optional = true }
+
+# What a checkout ships with a package cut from it (.github/scripts/publish_crates.py).
+[[bin]]
+name = "ship-code-identity"
+required-features = ["ship"]
 
 [features]
+# The `ship-code-identity` tool.
+ship = ["dep:serde_json"]
 # blake3's SIMD128 code on wasm32 (Rust, no C); does nothing on other targets.
 wasm32-simd = ["blake3/wasm32_simd"]
 

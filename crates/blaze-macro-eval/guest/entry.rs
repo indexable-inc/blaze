@@ -39,23 +39,24 @@ pub mod __blaze_wasm_entry {
 
     /// Enters the directory cargo runs rustc in for the calling crate, as rustc's process is
     /// in it: wasi-libc makes a relative path absolute against its own working directory, `/`
-    /// until a `chdir`, before the host sees it. False when the host named one and it could not
-    /// be entered; with none named, the macro stays in `/`.
-    fn enter_working_directory() -> bool {
+    /// until a `chdir`, before the host sees it. That directory is wasi-libc's own state in this
+    /// instance's memory: WASI preview 1 has no call that changes one, so the host's process
+    /// never moves. With none named, the macro stays in `/`. When the host named one and it
+    /// could not be entered: the `errno` `set_current_dir` failed with (wasi-libc's are WASI's
+    /// numbers), 0 when it gave none or the name is not UTF-8.
+    fn enter_working_directory() -> Result<(), u32> {
         let mut dir = Vec::<u8>::new();
         loop {
             let len = unsafe { current_dir(dir.as_mut_ptr(), dir.capacity()) };
-            let Ok(len) = <usize as std::convert::TryFrom<isize>>::try_from(len) else { return true };
+            let Ok(len) = <usize as std::convert::TryFrom<isize>>::try_from(len) else { return Ok(()) };
             if len <= dir.capacity() {
                 unsafe { dir.set_len(len) };
                 break;
             }
             dir.reserve_exact(len);
         }
-        match String::from_utf8(dir) {
-            Ok(dir) => std::env::set_current_dir(dir).is_ok(),
-            Err(_) => false,
-        }
+        let dir = String::from_utf8(dir).map_err(|_| 0u32)?;
+        std::env::set_current_dir(dir).map_err(|error| error.raw_os_error().map_or(0, |errno| errno as u32 & 0xFF_FFFF))
     }
 
     /// libc's `getenv`, linked in place of wasi-libc's, which reads every variable through
@@ -175,15 +176,16 @@ pub mod __blaze_wasm_entry {
 
     /// Runs the macro at `index` of the list on the `len` bytes at `input`
     /// ([`blaze_proc_macro_alloc`]'s), in the directory cargo runs rustc in, and gives the host
-    /// its output: 0, 1 for no such macro, or 2 when that directory could not be entered.
+    /// its output: 0, 1 for no such macro, or 2 when that directory could not be entered, with
+    /// the `errno` of why in the bits above the low byte.
     #[unsafe(no_mangle)]
     pub extern "C" fn blaze_proc_macro_expand(index: u32, input: *mut u8, len: usize) -> u32 {
         let input = unsafe { Vec::from_raw_parts(input, len, len) };
         let Some(client) = listed(index) else {
             return 1;
         };
-        if !enter_working_directory() {
-            return 2;
+        if let Err(errno) = enter_working_directory() {
+            return 2 | errno << 8;
         }
         panic::set_hook(Box::new(hook));
         // SAFETY: `Client` is the bridge's `#[repr(C)]` struct of one `extern "C" fn` pointer.

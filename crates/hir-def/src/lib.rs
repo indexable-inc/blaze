@@ -37,6 +37,7 @@ pub mod macro_reach;
 pub mod unstable_features;
 
 pub mod expr_store;
+mod heap;
 pub mod hir;
 pub mod item_hash;
 pub mod resolver;
@@ -644,7 +645,7 @@ impl<'db> BlockIdLt<'db> {
         ast_id: AstId<ast::BlockExpr>,
         module: ModuleIdLt<'db>,
         owner: Option<DefWithBodyId>,
-        token: TrackedStructToken,
+        token: &TrackedStructToken,
     ) -> Self {
         _ = token;
         BlockIdLt::new_(db, ast_id, module, owner)
@@ -982,6 +983,46 @@ impl MacroId {
     pub fn is_attribute(self, db: &Db) -> bool {
         matches!(self, MacroId::ProcMacroId(it) if it.lookup(db).kind == ProcMacroKind::Attr)
     }
+
+    /// The name the macro is declared by: a derive's by the trait it derives.
+    pub fn name(self, db: &Db) -> hir_expand::name::Name {
+        use hir_expand::name::{AsName as _, Name};
+        use src::HasSource as _;
+        use syntax::view::HasName as _;
+        let of = |name: Option<syntax::view::Name<'_>>| name.map_or_else(Name::missing, |it| it.as_name());
+        match self {
+            MacroId::Macro2Id(it) => of(it.lookup(db).source_view(db).value.name()),
+            MacroId::MacroRulesId(it) => of(it.lookup(db).source_view(db).value.name()),
+            MacroId::ProcMacroId(it) => {
+                let loc = it.lookup(db);
+                let source = loc.source_view(db);
+                match loc.kind {
+                    ProcMacroKind::CustomDerive => attrs::AttrFlags::derive_info(db, self)
+                        .map_or_else(|| of(source.value.name()), |info| Name::new_symbol_root(info.trait_name)),
+                    ProcMacroKind::Bang | ProcMacroKind::Attr => of(source.value.name()),
+                }
+            }
+        }
+    }
+}
+
+impl ExternCrateId {
+    /// The name the crate is reached by from where the item is written: its alias, its own name
+    /// with none, and no name for `extern crate krate as _`.
+    pub fn alias_or_name(self, db: &Db) -> Option<hir_expand::name::Name> {
+        use hir_expand::name::{AsName as _, Name};
+        use src::HasSource as _;
+        use syntax::view::HasName as _;
+        let source = self.lookup(db).source_view(db);
+        match source.value.rename() {
+            Some(rename) => match rename.name() {
+                Some(name) => Some(name.as_name()),
+                None if rename.underscore_token().is_some() => None,
+                None => Some(source.value.name_ref().map_or_else(Name::missing, |it| it.as_name())),
+            },
+            None => Some(source.value.name_ref().map_or_else(Name::missing, |it| it.as_name())),
+        }
+    }
 }
 
 #[blaze_query::tracked]
@@ -1264,7 +1305,7 @@ impl GenericDefId {
     ) -> (HirFileId, Option<syntax::view::GenericParamList<'_>>) {
         fn of_item_loc<'db, Loc>(
             db: &'db Db,
-            def: impl Lookup<Data = Loc>,
+            def: impl Lookup<Data = Loc> + Copy,
         ) -> (HirFileId, Option<syntax::view::GenericParamList<'db>>)
         where
             Loc: src::HasSource,
@@ -1485,7 +1526,7 @@ where
 #[inline]
 fn module_for_assoc_item_loc(
     db: &Db,
-    id: impl Lookup<Data = AssocItemLoc<impl AstIdNode>>,
+    id: impl Lookup<Data = AssocItemLoc<impl AstIdNode>> + Copy,
 ) -> ModuleId {
     id.lookup(db).container.module(db)
 }

@@ -405,6 +405,7 @@ fn index_spans<'f>(body: &MirBody<'_>, frame: &'f Frame) -> IndexSpans<'f> {
     spans
 }
 
+#[derive(Clone, Copy)]
 enum Bound {
     Zero,
     MinusOne,

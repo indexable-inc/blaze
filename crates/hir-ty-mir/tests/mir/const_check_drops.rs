@@ -30,7 +30,7 @@ fn check(minicore: &str, src: &str, pick: impl FnOnce(&TestDB) -> DefWithBodyId)
     let db = fx.into_db();
     blaze_query::db::attach(&db, || {
         let def = pick(&db);
-        let (_, map) = Body::with_source_map(&db, def);
+        let map = Body::source_map(&db, def);
         let at = |span: MirSpan| {
             let range = match span {
                 MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => {

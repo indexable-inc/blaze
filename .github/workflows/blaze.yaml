@@ -7,6 +7,8 @@
 #
 #   pull request, merge queue (about 5 minutes): the unit tests and the build on Linux x86-64,
 #       `blaze check --workspace` with the release on Linux x86-64 and macOS,
+#       the lint baselines (crates/blaze-lints/baselines) with the blaze the tree builds, on
+#       Linux AArch64,
 #       `harness/imports.py` and `harness/rustcsites.py`. No `cargo fmt --check`: fmt.yaml
 #       formats main after each push instead.
 #   push to main: the build and the unit tests on Linux x86-64, Linux AArch64 and macOS, which
@@ -173,9 +175,44 @@ jobs:
           PYTHONPATH=python/typed-input/src python3 tools/astlog/scan.py
           '{"astlog": "target/debug/astlog", "rules": "tools/astlog/rules", "paths": ["crates", "tools"]}'
 
+  # AGENTS.md rule fix-through-blaze-lints: each clippy and blaze lint's findings, counted by
+  # crate, may only shrink. crates/blaze-lints/baselines holds the counts, one file per lint;
+  # a count over its baseline, or a lint with findings and no baseline, fails the job, and so
+  # does a count under its baseline, which `--bless-baselines` lowers (blaze_lints::baseline,
+  # docs/cargo.md#lints). It runs the blaze this tree builds, not the release: the counts are
+  # of the lints this tree defines, so a change to a lint and to its baseline land together.
+  # The counts are of aarch64-unknown-linux-gnu's cfg (the directory's TARGET), so this runs on
+  # Linux AArch64 and builds blaze there as the build job does, from the store main's pushes
+  # keep warm for it. Each package's default targets: blaze's check of test targets fails for
+  # now ("can't find crate for `test`"), so tests are counted once it passes. No baseline is
+  # made yet, as blaze cannot yet finish this check of its own workspace, so the job fails until
+  # a run does and makes them (docs/v2/plan/lanes/lints.md#baselines).
+  lint-baselines:
+    name: lint baselines
+    needs: changes
+    if: needs.changes.outputs.tier != 'none'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+      - id: blaze
+        uses: ./.github/actions/blaze
+        with:
+          job: build
+          llvm: true
+      - name: blaze build --release --features blaze-engine/llvm (the build job's)
+        run: python3 harness/unittests.py '{"build": true}'
+      # The release's daemon ends first; the tree's blaze runs its own, from a home of its own.
+      - run: blaze stop
+      - env:
+          BLAZE_HOME: ${{ runner.temp }}/tree-blaze-home
+        run: >-
+          target/release/blaze check --workspace --target aarch64-unknown-linux-gnu
+          --message-format short --baselines crates/blaze-lints/baselines
+
   ci:
     name: ci
-    needs: [changes, scripts, linux-x64, linux-arm64, macos, workspace-check]
+    needs: [changes, scripts, linux-x64, linux-arm64, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

@@ -646,7 +646,7 @@ fn borrowck_reports_rustcs_codes_at_rustcs_spans_in_both_modes() {
                 if !declared('(') && !declared('<') {
                     continue;
                 }
-                let (_, source_map) = Body::with_source_map(&db, def);
+                let source_map = Body::source_map(&db, def);
                 let want: &[(&str, &str)] =
                     diagnosed.iter().find(|it| it.0 == name).map_or(&[], |it| it.1);
                 for mode in [Mode::Nll, Mode::Polonius] {

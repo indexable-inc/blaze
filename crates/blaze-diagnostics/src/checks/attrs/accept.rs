@@ -585,7 +585,7 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
                     // alloc: the error's suggestion message
                     _ => "try changing it to one of the following valid forms of the attribute".to_owned(),
                 };
-                diag.suggestions(inner_span, message, suggestions, Applicability::HasPlaceholders, SuggestionStyle::ShowAlways);
+                diag.suggestions(&inner_span, message, suggestions, Applicability::HasPlaceholders, SuggestionStyle::ShowAlways);
             }
         } else if custom.len() < 4 {
             for it in custom {

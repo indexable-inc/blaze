@@ -567,3 +567,26 @@ pub fn written<T: Serialize>(_: &T) {}
 "#,
     );
 }
+
+/// A path in an attribute of a struct written in a body is read from the body's own tree,
+/// whose ranges begin at the anchor (the enclosing fn), so the struct's ast id is the anchor
+/// map's: looked up in the file's map, `Can't find SyntaxNodePtr` (tt's `Operator`,
+/// blaze-manifest's `WithOptions`, blaze-profile's `Group` in selfbuild4 round 2).
+#[test]
+fn an_attribute_path_on_a_struct_in_a_body_resolves_in_the_body_s_tree() {
+    let main = "pub fn first() -> u8 { 0 }\n\npub fn f() -> u8 {\n    let _x = 1;\n    #[derive(Clone)]\n    struct Local { x: u8 }\n    0\n}\n";
+    let fx = fixture::db(&format!("{CRATES}{MAIN}{main}"));
+    let file = *fx.files().last().expect("src/lib.rs");
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let krate = hir::Crate::all(&db)
+            .into_iter()
+            .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))
+            .expect("the fixture has `main`");
+        let file = file.file_id(&db);
+        let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
+        if let Err(error) = check(&db, krate, &setup(), &name_of) {
+            panic!("{error}");
+        }
+    });
+}

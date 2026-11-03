@@ -106,7 +106,7 @@ impl Server {
         // One byte ends the accept loop's poll; a failed write (the loop already gone, its
         // end closed) leaves nothing to wake.
         let _ = (&self.wake).write_all(&[1]);
-        let _wait = tracing::info_span!(target: "ix_prof", "join", wait = "thread", on = "ix-prof-http").entered();
+        let _wait = tracing::info_span!(target: "blaze::ix_prof", "join", wait = "thread", on = "ix-prof-http").entered();
         let _ = thread.join();
     }
 }
@@ -139,7 +139,7 @@ fn accept_loop(listener: &TcpListener, woken: &std::os::unix::net::UnixStream, t
         };
         let n = {
             let _wait = backoff_ms
-                .map(|ms| tracing::info_span!(target: "ix_prof", "accept_backoff", wait = "timer", on = "ix-prof-http", ms).entered());
+                .map(|ms| tracing::info_span!(target: "blaze::ix_prof", "accept_backoff", wait = "timer", on = "ix-prof-http", ms).entered());
             // SAFETY: `fds` is two pollfds, both open for the loop's life; `nfds` is 1 or 2.
             unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout) }
         };

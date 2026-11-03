@@ -25,7 +25,7 @@
 //! (`emit_delayed_lints`) (MIT or Apache-2.0).
 
 mod check_attr;
-mod diagnostic;
+pub(crate) mod diagnostic;
 mod doc;
 pub(crate) mod features;
 pub(crate) mod parse;

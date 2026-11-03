@@ -3165,7 +3165,9 @@ impl Store {
         if self.broken.is_some() {
             return;
         }
-        self.drain();
+        // In a task of the store's tag, so the packs' bytes the drain copies are named on the
+        // daemon's memory line, whichever thread commits.
+        blaze_mem::frame::task(blaze_mem::Tag::Store, |_| self.drain());
         // A record the drain found against the claim's rule broke the store (`record_home`).
         if self.broken.is_some() {
             return;

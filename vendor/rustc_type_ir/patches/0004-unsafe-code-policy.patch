@@ -1,7 +1,8 @@
-diff -ruN a/src/fold.rs b/src/fold.rs
+diff --git a/src/fold.rs b/src/fold.rs
+index a1b749b..8e093c6 100644
 --- a/src/fold.rs
 +++ b/src/fold.rs
-@@ -289,6 +289,10 @@
+@@ -289,6 +289,10 @@ impl<I: Interner, T: TypeFoldable<I>, E: TypeFoldable<I>> TypeFoldable<I> for Re
      }
  }
  
@@ -12,7 +13,7 @@ diff -ruN a/src/fold.rs b/src/fold.rs
  fn fold_arc<T: Clone, E>(
      mut arc: Arc<T>,
      fold: impl FnOnce(T) -> Result<T, E>,
-@@ -296,6 +300,12 @@
+@@ -296,6 +300,12 @@ fn fold_arc<T: Clone, E>(
      // We merely want to replace the contained `T`, if at all possible,
      // so that we don't needlessly allocate a new `Arc` or indeed clone
      // the contained type.
@@ -25,12 +26,10 @@ diff -ruN a/src/fold.rs b/src/fold.rs
      unsafe {
          // First step is to ensure that we have a unique reference to
          // the contained type, which `Arc::make_mut` will accomplish (by
-@@ -914,5 +924,53 @@
- 
-     fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
+@@ -916,3 +926,51 @@ impl<I: Interner> TypeFolder<I> for RigidnessFolder<I> {
          if self.mode.needs_change(&c) { c.super_fold_with(self) } else { c }
-+    }
-+}
+     }
+ }
 +
 +#[cfg(test)]
 +mod tests {
@@ -77,9 +76,10 @@ diff -ruN a/src/fold.rs b/src/fold.rs
 +        });
 +        assert!(result.is_err());
 +        assert_eq!(Arc::strong_count(&alive), 1, "dropped by the fold, and not again");
-     }
- }
-diff -ruN a/src/generic_visit.rs b/src/generic_visit.rs
++    }
++}
+diff --git a/src/generic_visit.rs b/src/generic_visit.rs
+index 5fc5ab3..79a1bcd 100644
 --- a/src/generic_visit.rs
 +++ b/src/generic_visit.rs
 @@ -8,6 +8,11 @@
@@ -94,7 +94,8 @@ diff -ruN a/src/generic_visit.rs b/src/generic_visit.rs
  
  use std::sync::Arc;
  
-diff -ruN a/src/lib.rs b/src/lib.rs
+diff --git a/src/lib.rs b/src/lib.rs
+index a1c5bca..35b8f23 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -34,6 +34,10 @@
@@ -108,10 +109,11 @@ diff -ruN a/src/lib.rs b/src/lib.rs
  
  extern crate self as rustc_type_ir;
  
-diff -ruN a/src/macros.rs b/src/macros.rs
+diff --git a/src/macros.rs b/src/macros.rs
+index 2fdbdec..d9f943a 100644
 --- a/src/macros.rs
 +++ b/src/macros.rs
-@@ -34,6 +34,8 @@
+@@ -34,6 +34,8 @@ macro_rules! TrivialTypeTraversalImpls {
  
              // NOTE: this deliberately avoids adding an `I: Interner` generic, because that would
              // allow creating a trivial impl for arena-allocating types, which would be incorrect.

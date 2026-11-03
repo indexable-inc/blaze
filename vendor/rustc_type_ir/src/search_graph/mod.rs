@@ -30,7 +30,7 @@ mod stack;
 use stack::{Stack, StackDepth, StackEntry};
 mod global_cache;
 use global_cache::CacheData;
-pub use global_cache::GlobalCache;
+pub use global_cache::{GlobalCache, Sharing};
 
 /// The search graph does not simply use `Interner` directly
 /// to enable its fuzzing without having to stub the rest of
@@ -56,6 +56,17 @@ pub trait Cx: Copy {
     /// Runs `f` on the cache of `scope`. A lookup reads [`CacheScope::Shared`], then
     /// [`CacheScope::Query`]; a result goes where [`Cx::cache_scope`] says.
     fn with_global_cache<R>(self, scope: CacheScope, f: impl FnOnce(&GlobalCache<Self>) -> R) -> R;
+
+    /// Runs `f` on the cache of `scope` to look a goal up in it: `None`, without running `f`,
+    /// where the scope has no cache yet, as a lookup there finds nothing and needs none made.
+    /// By default, [`Cx::with_global_cache`].
+    fn with_global_cache_to_read<R>(
+        self,
+        scope: CacheScope,
+        f: impl FnOnce(&GlobalCache<Self>) -> Option<R>,
+    ) -> Option<R> {
+        <Self as Cx>::with_global_cache(self, scope, f)
+    }
 
     /// Where a goal solved under `dep_node` may be cached: [`CacheScope::Shared`] only when
     /// `dep_node` holds every read the result depends on, so another query reusing it takes
@@ -1397,7 +1408,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
         available_depth: AvailableDepth,
     ) -> Option<X::Result> {
         [CacheScope::Shared, CacheScope::Query].into_iter().find_map(|scope| {
-            cx.with_global_cache(scope, |cache| {
+            cx.with_global_cache_to_read(scope, |cache| {
                 cache
                     .get(cx, input, available_depth, |nested_goals| {
                         self.candidate_is_applicable(step_kind_from_parent, nested_goals)
@@ -1418,7 +1429,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
         available_depth: AvailableDepth,
     ) -> Option<X::Result> {
         [CacheScope::Shared, CacheScope::Query].into_iter().find_map(|scope| {
-            cx.with_global_cache(scope, |cache| {
+            cx.with_global_cache_to_read(scope, |cache| {
                 let CacheData { result, required_depth, encountered_overflow, nested_goals } =
                     cache.get(cx, input, available_depth, |nested_goals| {
                         self.candidate_is_applicable(step_kind_from_parent, nested_goals)
@@ -1713,7 +1724,7 @@ mod tests {
     struct TestCx;
 
     thread_local! {
-        static CACHE: GlobalCache<TestCx> = const { GlobalCache::new() };
+        static CACHE: GlobalCache<TestCx> = const { GlobalCache::new(Sharing::Many) };
     }
 
     impl Cx for TestCx {

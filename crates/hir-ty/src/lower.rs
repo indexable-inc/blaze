@@ -31,6 +31,7 @@ use hir_def::{
     },
     item_tree::FieldsShape,
     lang_item::LangItems,
+    nameres::{trait_item_is_written, trait_item_written},
     resolver::{HasResolver, LifetimeNs, Resolver, TypeNs},
     signatures::{
         ConstSignature, FunctionSignature, ImplSignature, StaticFlags, StaticSignature,
@@ -1319,6 +1320,46 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             })
         });
         bound_vars
+    }
+
+    /// The types a closure with a `for<'a, ..>` binder (rustc's `ClosureBinder::For`,
+    /// `#![feature(closure_lifetime_binder)]`) is written with: its parameters' pushed to
+    /// `lowered`, then its return type, and what its signature binds, the binder's lifetimes
+    /// and no others. Each is a region bound by the signature, as rustc's `resolve_bound_vars`
+    /// makes the binder's parameters the closure's late-bound variables. A lifetime left out
+    /// is refused, as rustc's resolver lowers such a signature (`AnonymousReportError`).
+    pub(crate) fn lower_closure_signature_under_binder(
+        &mut self,
+        binder: &[Name],
+        params: &[Option<TypeRefId>],
+        ret_type: Option<TypeRefId>,
+        lowered: &mut impl Extend<Option<Ty<'db>>>,
+    ) -> (Option<Ty<'db>>, BoundVarKinds<'db>) {
+        let old_lifetime_elision =
+            mem::replace(&mut self.lifetime_elision, LifetimeElisionKind::AnonymousReportError);
+        let result = self.with_shifted_in(binder, |ctx| {
+            lowered.extend(params.iter().map(|&it| it.map(|it| ctx.lower_ty(it))));
+            ret_type.map(|it| ctx.lower_ty(it))
+        });
+        self.lifetime_elision = old_lifetime_elision;
+        result
+    }
+
+    /// `type_ref`, a parameter's or the return type of a closure whose `for<'a, ..>` binder
+    /// has the lifetimes `binder`, lowered as its signature has it: each of the binder's
+    /// lifetimes a region bound at the innermost binder, which escapes the type
+    /// ([`Self::lower_closure_signature_under_binder`]). The borrow checker instantiates them
+    /// as rustc instantiates a closure's user-written signature.
+    pub fn lower_ty_under_closure_binder(
+        &mut self,
+        binder: &[Name],
+        type_ref: TypeRefId,
+    ) -> Ty<'db> {
+        let old_lifetime_elision =
+            mem::replace(&mut self.lifetime_elision, LifetimeElisionKind::AnonymousReportError);
+        let (ty, _) = self.with_shifted_in(binder, |ctx| ctx.lower_ty(type_ref));
+        self.lifetime_elision = old_lifetime_elision;
+        ty
     }
 
     fn lower_fn_ptr(&mut self, fn_: &FnType) -> Ty<'db> {
@@ -3487,7 +3528,9 @@ enum AssocTypeShorthandResolution {
 
 /// Predicates for `param_id` of the form `P: SomeTrait`. If
 /// `assoc_name` is provided, only return predicates referencing traits
-/// that have an associated type of that name.
+/// that have an associated type of that name. `assoc_name` is the name as written
+/// ([`written_name`](hir_def::nameres::written_name), keyed by its context), which each trait
+/// adjusts to its own expansion, as rustc compares `assoc_ident` with `hygienic_eq`.
 ///
 /// This query exists only to be used when resolving short-hand associated types
 /// like `T::Item`.
@@ -3544,10 +3587,10 @@ fn resolve_type_param_assoc_type_shorthand_in(
     if let GenericDefId::TraitId(containing_trait) = param.parent()
         && param.local_id() == GenericParams::SELF_PARAM_ID_IN_SELF
     {
-        // Add the trait's own associated types.
-        if let Some(assoc_type) =
-            containing_trait.trait_items(db).associated_type_by_name(&assoc_name)
-        {
+        // Add the trait's own associated types, the one `assoc_name` names in this trait
+        // (rustc's `trait_defines_associated_item_named`, `hygienic_eq`).
+        let own = trait_item_written(db, containing_trait, assoc_name);
+        if let Some(assoc_type) = containing_trait.trait_items(db).associated_type_named(db, own) {
             let args = GenericArgs::identity_for_item(interner, containing_trait.into());
             this_trait_resolution =
                 Some(StoredEarlyBinder::bind_assoc_ty(interner, assoc_type, args.store()));
@@ -3586,10 +3629,12 @@ fn resolve_type_param_assoc_type_shorthand_in(
             let Some(TypeNs::TraitId(bounded_trait)) = ctx.resolve_path_in_type_ns_fully() else {
                 continue;
             };
+            // rustc's `trait_may_define_assoc_item`: `hygienic_eq` in each supertrait, so the
+            // bounded trait's own lookup below finds the same item.
             if !SupertraitsInfo::query(db, bounded_trait)
                 .defined_assoc_types
                 .iter()
-                .any(|(name, _)| *name == assoc_name)
+                .any(|&(name, id)| trait_item_is_written(db, name, id.into(), assoc_name))
             {
                 continue;
             }
@@ -4353,6 +4398,31 @@ pub(crate) fn param_env_from_predicates<'db>(
     param_env_from_clauses(
         interner,
         predicates.all_predicates().iter_identity().map(Unnormalized::skip_norm_wip),
+    )
+}
+
+/// rustc's hybrid environment of an impl's method against the trait method it implements
+/// (`compare_impl_item.rs`, `compare_method_predicate_entailment` and
+/// `collect_return_position_impl_trait_in_trait_tys`): the impl's where clauses and the trait
+/// method's own, instantiated with `trait_to_impl_args` (the impl's trait arguments, then the
+/// impl method's own), elaborated and normalized as `normalize_param_env_or_error` does.
+pub fn hybrid_param_env<'db>(
+    interner: DbInterner<'db>,
+    impl_: ImplId,
+    trait_fn: FunctionId,
+    trait_to_impl_args: GenericArgs<'db>,
+) -> ParamEnv<'db> {
+    let db = interner.db;
+    param_env_from_clauses(
+        interner,
+        GenericPredicates::query_all(db, impl_.into())
+            .iter_identity()
+            .map(Unnormalized::skip_norm_wip)
+            .chain(
+                GenericPredicates::query_own_explicit(db, trait_fn.into())
+                    .iter_instantiated(interner, trait_to_impl_args.as_slice())
+                    .map(Unnormalized::skip_norm_wip),
+            ),
     )
 }
 

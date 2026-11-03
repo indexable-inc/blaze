@@ -145,8 +145,7 @@ fn use_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, method:
             ", perhaps add a `use` for {}:",
             if suggs.len() == 1 { "it" } else { "one_of_them" }
         );
-        // clone: on the error path, for an error hir found
-        diag.suggestions(span.clone(), message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
+        diag.suggestions(&span, message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
     };
     let for_privacy = |diag: &mut Diag, mut message: String, suggs: Vec<String>| {
         if let [only] = suggs.as_slice() {
@@ -155,8 +154,7 @@ fn use_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, method:
         } else {
             // alloc: the error's text, for an error hir found
             message += &format!(" but {} not reachable", if suggs.len() == 1 { "is" } else { "are" });
-            // clone: on the error path, for an error hir found
-            diag.suggestions(span.clone(), message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
+            diag.suggestions(&span, message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
         }
     };
     if accessible.is_empty() {

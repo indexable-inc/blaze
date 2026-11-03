@@ -1,9 +1,11 @@
-//! What rustc names a definition by: its definitions and their parents (`def_key`), the
-//! children a module, enum or trait shows (`module_children`), the names it trims paths to
-//! (`trimmed_def_paths`), the parents it reaches a dependency's items through
-//! (`visible_parent_map`), and every declaration by its name (what `lookup_import_candidates`
-//! walks the crates for). Ported from `compiler/rustc_middle/src/ty/print/pretty.rs` and
-//! `compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs` (MIT or Apache-2.0).
+//! The names diagnostics print and suggest a definition by: the children a module, enum or
+//! trait shows (`module_children`), the names it trims paths to (`trimmed_def_paths`), the
+//! parents it reaches a dependency's items through (`visible_parent_map`), and every
+//! declaration by its name (what `lookup_import_candidates` walks the crates for). Ported from
+//! `compiler/rustc_middle/src/ty/print/pretty.rs` and
+//! `compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs` (MIT or Apache-2.0). The paths
+//! themselves are printed by `hir_ty_print`, which reads these tables through the check's
+//! `DiagnosticHost`.
 //!
 //! The tables are the check's: [`Paths`] lives in [`Cx`] and keeps them in its frame, each built
 //! the first time it is read, and every later answer is a hash probe and a slice.
@@ -16,22 +18,16 @@ use blaze_hash::FixedState;
 use blaze_mem::Frame;
 use hashbrown::hash_map::Entry;
 use hir_def::{
-    AdtId, AssocItemId, AttrDefId, ConstId, DefWithBodyId, EnumVariantId, ExternCrateId,
-    FunctionId, HasModule, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId,
-    StaticId, TraitId, TypeAliasId,
+    AdtId, AssocItemId, AttrDefId, DefWithBodyId, ExternCrateId, ItemContainerId, Lookup, ModuleDefId,
     attrs::AttrFlags,
     expr_store::Body,
     item_scope::{ImportOrExternCrate, ImportOrGlob, ItemScope},
     nameres::crate_def_map,
-    signatures::FunctionSignature,
     visibility::Visibility,
 };
 use hir_expand::name::Name;
+use hir_ty_print::{Def, Ns};
 use intern::{Symbol, sym};
-use syntax::{
-    SyntaxKind, WalkEvent,
-    view::{self as ast, AstNode as _},
-};
 
 use crate::cx::Cx;
 
@@ -43,298 +39,6 @@ type Column<'f, T> = Vec<T, &'f Frame>;
 
 fn map<K, V>(frame: &Frame) -> Map<'_, K, V> {
     hashbrown::HashMap::with_hasher_in(FixedState, frame)
-}
-
-/// A definition a path names: rustc's `DefId`, of the kinds diagnostics print.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Def {
-    Module(ModuleId),
-    Adt(AdtId),
-    Variant(EnumVariantId),
-    Function(FunctionId),
-    Const(ConstId),
-    Static(StaticId),
-    Trait(TraitId),
-    TypeAlias(TypeAliasId),
-    Macro(MacroId),
-    Impl(ImplId),
-    ExternCrate(ExternCrateId),
-}
-
-impl Def {
-    /// None for a primitive type, which has no definition.
-    pub(crate) fn of(def: ModuleDefId) -> Option<Def> {
-        Some(match def {
-            ModuleDefId::ModuleId(it) => Def::Module(it),
-            ModuleDefId::FunctionId(it) => Def::Function(it),
-            ModuleDefId::AdtId(it) => Def::Adt(it),
-            ModuleDefId::EnumVariantId(it) => Def::Variant(it),
-            ModuleDefId::ConstId(it) => Def::Const(it),
-            ModuleDefId::StaticId(it) => Def::Static(it),
-            ModuleDefId::TraitId(it) => Def::Trait(it),
-            ModuleDefId::TypeAliasId(it) => Def::TypeAlias(it),
-            ModuleDefId::MacroId(it) => Def::Macro(it),
-            ModuleDefId::BuiltinType(_) => return None,
-        })
-    }
-
-    fn of_assoc(item: AssocItemId) -> Def {
-        match item {
-            AssocItemId::FunctionId(it) => Def::Function(it),
-            AssocItemId::ConstId(it) => Def::Const(it),
-            AssocItemId::TypeAliasId(it) => Def::TypeAlias(it),
-        }
-    }
-
-    fn attr_owner(self) -> AttrDefId {
-        match self {
-            Def::Module(it) => AttrDefId::ModuleId(it),
-            Def::Adt(it) => AttrDefId::AdtId(it),
-            Def::Variant(it) => AttrDefId::EnumVariantId(it),
-            Def::Function(it) => AttrDefId::FunctionId(it),
-            Def::Const(it) => AttrDefId::ConstId(it),
-            Def::Static(it) => AttrDefId::StaticId(it),
-            Def::Trait(it) => AttrDefId::TraitId(it),
-            Def::TypeAlias(it) => AttrDefId::TypeAliasId(it),
-            Def::Macro(it) => AttrDefId::MacroId(it),
-            Def::Impl(it) => AttrDefId::ImplId(it),
-            Def::ExternCrate(it) => AttrDefId::ExternCrateId(it),
-        }
-    }
-
-    /// The module the definition is written in (itself, for a module).
-    pub(crate) fn module(self, cx: &Cx<'_, '_>) -> ModuleId {
-        self.attr_owner().module(cx.db)
-    }
-
-    pub(crate) fn krate(self, cx: &Cx<'_, '_>) -> base_db::Crate {
-        self.module(cx).krate(cx.db)
-    }
-
-    pub(crate) fn is_local(self, cx: &Cx<'_, '_>) -> bool {
-        hir::Crate::from(self.krate(cx)) == cx.krate
-    }
-
-    pub(crate) fn is_doc_hidden(self, cx: &Cx<'_, '_>) -> bool {
-        AttrFlags::query(cx.db, self.attr_owner()).contains(AttrFlags::IS_DOC_HIDDEN)
-    }
-
-    /// rustc's `DefKind::ns`: None for an impl.
-    fn ns(self) -> Option<Ns> {
-        match self {
-            Def::Module(_)
-            | Def::Adt(_)
-            | Def::Variant(_)
-            | Def::Trait(_)
-            | Def::TypeAlias(_)
-            | Def::ExternCrate(_) => Some(Ns::Type),
-            Def::Function(_) | Def::Const(_) | Def::Static(_) => Some(Ns::Value),
-            Def::Macro(_) => Some(Ns::Macro),
-            Def::Impl(_) => None,
-        }
-    }
-
-    /// rustc's `DefKind::is_module_like`, with the enums and traits whose children
-    /// `module_children` lists.
-    fn is_module_like(self) -> bool {
-        matches!(self, Def::Module(_) | Def::Adt(AdtId::EnumId(_)) | Def::Trait(_))
-    }
-
-    /// Whether it is in value namespace: what `def_path_str` prints with `::<..>`.
-    pub(crate) fn is_value(self) -> bool {
-        self.ns() == Some(Ns::Value)
-    }
-
-    /// Whether its path segment is rustc's `DefPathData::TypeNs`, the segments a re-export
-    /// can rename.
-    pub(crate) fn is_type_ns(self) -> bool {
-        self.ns() == Some(Ns::Type)
-    }
-
-    /// The name of the definition's path segment; None for a crate root and an impl.
-    pub(crate) fn name(self, cx: &Cx<'_, '_>) -> Option<Name> {
-        let db = cx.db;
-        match self {
-            Def::Module(it) => it.name(db),
-            Def::Impl(_) => None,
-            Def::ExternCrate(it) => hir::ExternCrateDecl::from(it).alias_or_name(db),
-            Def::Variant(it) => Some(it.lookup(db).name),
-            Def::Macro(it) => Some(hir::Macro::from(it).name(db)),
-            Def::Adt(it) => Some(hir::Adt::from(it).name(db)),
-            Def::Function(it) => Some(FunctionSignature::of(db, it).name),
-            Def::Const(it) => hir::Const::from(it).name(db),
-            Def::Static(it) => Some(hir::Static::from(it).name(db)),
-            Def::Trait(it) => Some(hir::Trait::from(it).name(db)),
-            Def::TypeAlias(it) => Some(hir::TypeAlias::from(it).name(db)),
-        }
-    }
-
-    /// The segment rustc's `def_path_str` prints for the definition: its name, or `_` for an
-    /// unnamed one (`const _`, `extern crate krate as _`; rustc's `DefPathData::ValueNs(_)` and
-    /// `TypeNs(_)`). None only for a crate root, an impl and a block module, which have no
-    /// segment of their own: an item in a block is printed under the body's owner.
-    pub(crate) fn segment(self, cx: &Cx<'_, '_>) -> Option<Name> {
-        match self {
-            Def::Module(_) | Def::Impl(_) => self.name(cx),
-            Def::Const(_) | Def::ExternCrate(_) => {
-                Some(self.name(cx).unwrap_or_else(|| Name::new_symbol_root(sym::underscore)))
-            }
-            Def::Adt(_)
-            | Def::Variant(_)
-            | Def::Function(_)
-            | Def::Static(_)
-            | Def::Trait(_)
-            | Def::TypeAlias(_)
-            | Def::Macro(_) => self.name(cx),
-        }
-    }
-
-    /// The container of an associated item, of a function or constant written in a trait or
-    /// an impl.
-    pub(crate) fn container(self, cx: &Cx<'_, '_>) -> Option<ItemContainerId> {
-        let db = cx.db;
-        Some(match self {
-            Def::Function(it) => it.lookup(db).container,
-            Def::Const(it) => it.lookup(db).container,
-            Def::Static(it) => it.lookup(db).container,
-            Def::TypeAlias(it) => it.lookup(db).container,
-            _ => return None,
-        })
-    }
-
-    /// Whether it is written in an `extern` block: a foreign item, not one of rustc's free
-    /// items.
-    fn is_foreign(self, cx: &Cx<'_, '_>) -> bool {
-        matches!(self.container(cx), Some(ItemContainerId::ExternBlockId(_)))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Ns {
-    Type,
-    Value,
-    Macro,
-}
-
-/// What a definition's path is printed under: rustc's `def_key(def).parent`.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum Parent {
-    Def(Def),
-    /// An item written in a body: the body's owner, then the closures it is written in,
-    /// outermost first, each with its `{closure#N}` disambiguator.
-    Body { owner: Def, closures: Vec<u32> },
-}
-
-/// The definition's parent; None for a crate root.
-pub(crate) fn parent(cx: &Cx<'_, '_>, def: Def) -> Option<Parent> {
-    let db = cx.db;
-    let module_parent = |module: ModuleId| {
-        if module.is_block_module(db) { block_owner(cx, module) } else { Some(Parent::Def(Def::Module(module))) }
-    };
-    match def {
-        Def::Module(it) => module_parent(it.containing_module(db)?.to_static()),
-        Def::Variant(it) => Some(Parent::Def(Def::Adt(it.lookup(db).parent.into()))),
-        Def::Function(_) | Def::Const(_) | Def::Static(_) | Def::TypeAlias(_) => {
-            match def.container(cx)? {
-                ItemContainerId::ModuleId(it) => module_parent(it),
-                ItemContainerId::ExternBlockId(it) => module_parent(it.lookup(db).container),
-                ItemContainerId::ImplId(it) => Some(Parent::Def(Def::Impl(it))),
-                ItemContainerId::TraitId(it) => Some(Parent::Def(Def::Trait(it))),
-            }
-        }
-        Def::Adt(_) | Def::Trait(_) | Def::Macro(_) | Def::Impl(_) | Def::ExternCrate(_) => {
-            module_parent(def.module(cx))
-        }
-    }
-}
-
-/// The body a block module is written in, found from the syntax of its block: rustc's
-/// definitions have no blocks, an item in a body is a child of the body's owner, or of the
-/// closure it is written in.
-fn block_owner(cx: &Cx<'_, '_>, module: ModuleId) -> Option<Parent> {
-    let db = cx.db;
-    let block = module.block(db)?;
-    let ast_id = block.ast_id(db);
-    let ptr = ast_id.file_id.ast_id_map(db).get(ast_id.value);
-    body_parent(cx, cx.node_view(ast_id.with_value(ptr)).value.syntax())
-}
-
-/// The path of a closure, an `async` block or a `gen` block `node` (of a tree `cx.vsema`
-/// gave out): its body's owner and the closures down to it, itself last.
-pub(crate) fn closure_path<'db>(cx: &Cx<'_, 'db>, node: ast::Node<'db>) -> Option<Parent> {
-    body_parent(cx, node)
-}
-
-/// The body's owner `node` is written in and the closures around it, `node` included when it
-/// is one.
-fn body_parent<'db>(cx: &Cx<'_, 'db>, node: ast::Node<'db>) -> Option<Parent> {
-    let db = cx.db;
-    // alloc: printing a closure's path, the edge
-    let mut closures = Vec::new();
-    for ancestor in cx.vsema.ancestors_with_macros(node) {
-        if is_closure_like(ancestor) {
-            closures.push(ancestor);
-            continue;
-        }
-        let owner = match ancestor.kind() {
-            SyntaxKind::FN => Def::Function(FunctionId::try_from(cx.vsema.to_def(ast::Fn::cast(ancestor)?)?).ok()?),
-            SyntaxKind::CONST => Def::Const(cx.vsema.to_def(ast::Const::cast(ancestor)?)?.into()),
-            SyntaxKind::STATIC => Def::Static(cx.vsema.to_def(ast::Static::cast(ancestor)?)?.into()),
-            _ => continue,
-        };
-        // alloc: the closures of the path printed, returned in it
-        let mut indices = Vec::with_capacity(closures.len() + 1);
-        if let Def::Function(f) = owner {
-            let sig = FunctionSignature::of(db, f);
-            if sig.is_async() || sig.is_gen() {
-                indices.push(0);
-            }
-        }
-        let mut parent = ancestor;
-        for closure in closures.into_iter().rev() {
-            indices.push(closure_index(parent, closure));
-            parent = closure;
-        }
-        return Some(Parent::Body { owner, closures: indices });
-    }
-    None
-}
-
-/// Whether rustc makes a closure definition of `node`: a closure, an `async` or `gen` block.
-pub(crate) fn is_closure_like(node: ast::Node<'_>) -> bool {
-    match node.kind() {
-        SyntaxKind::CLOSURE_EXPR => true,
-        SyntaxKind::BLOCK_EXPR => ast::BlockExpr::cast(node).is_some_and(|it| {
-            it.async_token().is_some() || it.gen_token().is_some()
-        }),
-        _ => false,
-    }
-}
-
-/// Whether `node` is a definition closures are numbered under: an item, or a closure.
-fn is_closure_parent(node: ast::Node<'_>) -> bool {
-    ast::Item::can_cast(node.kind()) || is_closure_like(node)
-}
-
-/// The disambiguator rustc gives `closure` among the closures of `parent`: closures are
-/// numbered as they are reached, outer before inner, each under the nearest item or closure
-/// around it. One walk of `parent` up to `closure`, not entering another item or closure:
-/// what is inside one is numbered under it.
-pub(crate) fn closure_index(parent: ast::Node<'_>, closure: ast::Node<'_>) -> u32 {
-    let mut index = 0;
-    let mut walk = parent.preorder();
-    walk.next();
-    while let Some(event) = walk.next() {
-        let WalkEvent::Enter(node) = event else { continue };
-        if node == closure {
-            break;
-        }
-        if is_closure_parent(node) {
-            index += u32::from(is_closure_like(node));
-            walk.skip_subtree();
-        }
-    }
-    index
 }
 
 /// A public child `module_children` lists, with what the walks over children test of it.
@@ -357,7 +61,7 @@ fn list_children(cx: &Cx<'_, '_>, def: Def, out: &mut Column<'_, Child>) {
     let child = |name: &Name, def: Def, hidden_reexport: bool| Child {
         name: *name,
         def,
-        trim: !def.is_doc_hidden(cx)
+        trim: !def.is_doc_hidden(cx.db)
             && !matches!(def, Def::TypeAlias(it) if !matches!(it.lookup(db).container, ItemContainerId::ExternBlockId(_))),
         hidden_reexport,
     };
@@ -626,8 +330,8 @@ fn local_names<'f>(
             }
             for id in scope.declarations() {
                 let Some(def) = Def::of(id) else { continue };
-                if !def.is_foreign(cx)
-                    && let Some(name) = def.name(cx)
+                if !def.is_foreign(cx.db)
+                    && let Some(name) = def.name(cx.db)
                 {
                     collect(unique, name, def.ns().unwrap_or(Ns::Type), def);
                 }
@@ -740,7 +444,7 @@ fn visible_parent_map<'f>(cx: &Cx<'_, '_>, frame: &'f Frame, tree: &Tree<'_>) ->
     while let Some(&node) = queue.get(head) {
         head += 1;
         let parent = tree.defs[node];
-        let parent_hidden = parent.is_doc_hidden(cx);
+        let parent_hidden = parent.is_doc_hidden(cx.db);
         for child in tree.children_at(node) {
             if *child.name.symbol() == sym::underscore || parent_hidden || child.hidden_reexport {
                 fallback.push((child.def, parent));

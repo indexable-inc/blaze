@@ -47,6 +47,7 @@ hir-def.workspace = true
 hir-expand.workspace = true
 hir-lint-levels.workspace = true
 hir-ty.workspace = true
+hir-ty-print.workspace = true
 hir-ty-borrowck.workspace = true
 intern.workspace = true
 rustc_abi.workspace = true

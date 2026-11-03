@@ -81,7 +81,6 @@ pub struct QueryCountRow {
     pub reran: u64,
     pub evicted_asked: u64,
     pub evicted: u64,
-    pub refused: u64,
     pub dropped: u64,
 }
 
@@ -139,7 +138,6 @@ pub fn query_counts(rows: &[QueryCountRow]) -> Result<RecordBatch, ArrowError> {
         count(|it| it.reran),
         count(|it| it.evicted_asked),
         count(|it| it.evicted),
-        count(|it| it.refused),
         count(|it| it.dropped),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::QUERY_COUNTS), columns)

@@ -122,6 +122,7 @@ pub(crate) fn offer_inference<'db>(
     super::offer(db, def, Step::Infer, SCHEMA, reads, |facts, out| encode(db, facts, def, result, out));
 }
 
+#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of every read, which hands it the error by value")]
 fn format_error(error: FormatError) -> String {
     // alloc: the reason an answer does not read
     error.to_string()

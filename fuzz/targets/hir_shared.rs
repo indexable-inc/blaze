@@ -176,7 +176,7 @@ impl Build {
         Root { at: self.out.next::<u32>(), words: Vec::new() }
     }
 
-    pub fn finish(mut self, root: Root) -> Valid {
+    pub fn finish(mut self, root: &Root) -> Valid {
         let at = self.out.push_slice(&root.words);
         assert_eq!(at, root.at, "a column written after the root was begun");
         Valid { bytes: self.out.finish(at), columns: self.columns }

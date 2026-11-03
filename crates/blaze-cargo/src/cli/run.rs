@@ -10,6 +10,7 @@ use std::{
 };
 
 use blaze_api::{Artifact, TargetKind};
+use blaze_core::exit::Exit;
 
 use super::{args::Flags, say};
 
@@ -187,7 +188,7 @@ pub fn exec(exec: &Exec, err: &mut dyn Write, told: Told) -> i32 {
                     let _ = err.write_all(say::error(&what, told.color).as_bytes());
                     match ended {
                         say::Ended::Code(code) => code,
-                        say::Ended::Signal(_) => super::FAILED,
+                        say::Ended::Signal(_) => Exit::Failed.code(),
                     }
                 }
             },
@@ -201,7 +202,7 @@ pub fn exec(exec: &Exec, err: &mut dyn Write, told: Told) -> i32 {
 fn never_executed(exec: &Exec, error: &std::io::Error, err: &mut dyn Write, told: Told) -> i32 {
     let what = format!("could not execute process {} (never executed)", exec.shown_at(told.verbose));
     let _ = err.write_all(caused(&what, &[error.to_string()], told.color).as_bytes());
-    super::FAILED
+    Exit::Failed.code()
 }
 
 /// cargo's `display_error` of an error with causes: `Caused by:` and each, indented.

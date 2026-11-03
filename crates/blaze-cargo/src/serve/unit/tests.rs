@@ -1862,7 +1862,7 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     let mode = hir_def::deps::Mode::Serve;
     let mut keep = |lowered: &blaze_lower::Lowered, session: &mut super::deps::Session, served: hir_def::deps::Served| {
         let kept = super::deps::Kept { served, mode };
-        let (puts, _) = super::deps::store(lowered, Some(kept), session, &[], "/w").unwrap();
+        let (puts, _) = super::deps::store(lowered, Some(&kept), session, &[], "/w").unwrap();
         for it in puts {
             store.put(it.put.key, it.put.kind, &it.put.bytes).unwrap();
         }
@@ -1988,7 +1988,7 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
     let served = super::deps::images(&mut first, &[d], build, &mut session, mode).unwrap().expect("`d` is keyed");
     assert_eq!(root_values(&first, d), ["one"]);
     let kept = super::deps::Kept { served, mode };
-    let (puts, _) = super::deps::store(&first, Some(kept), &mut session, &[], "/w").unwrap();
+    let (puts, _) = super::deps::store(&first, Some(&kept), &mut session, &[], "/w").unwrap();
     for it in puts {
         store.put(it.put.key, it.put.kind, &it.put.bytes).unwrap();
     }

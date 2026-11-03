@@ -33,7 +33,7 @@ fn self_in_struct_lit() {
             }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             49..79 '{     ...     }': ()
             59..72 'Self { x: 1 }': S<u32>
             69..70 '1': u32
@@ -54,7 +54,7 @@ fn type_alias_in_struct_lit() {
             SS { x: 1 };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             50..70 '{     ...1 }; }': ()
             56..67 'SS { x: 1 }': S<u32>
             64..65 '1': u32
@@ -130,7 +130,7 @@ fn test(a: u32, b: isize, c: !, d: &str) {
     1.0f32;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             8..9 'a': u32
             16..17 'b': isize
             26..27 'c': !
@@ -161,7 +161,7 @@ fn test() {
     let f: i32 = e;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             10..117 '{     ...= e; }': ()
             20..21 'a': isize
             24..30 '1isize': isize
@@ -192,7 +192,7 @@ fn test() {
     b::c();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             14..19 '{ 1 }': u32
             16..17 '1': u32
             51..56 '{ 1 }': u32
@@ -221,7 +221,7 @@ fn test() {
     <S>::foo();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             40..45 '{ 1 }': i32
             42..43 '1': i32
             59..92 '{     ...o(); }': ()
@@ -252,7 +252,7 @@ fn test() {
     a.c;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             71..153 '{     ...a.c; }': ()
             81..82 'c': C
             85..86 'C': fn C(usize) -> C
@@ -286,7 +286,7 @@ fn test() {
     E::V2;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             51..89 '{     ...:V2; }': ()
             57..75 'E::V1 ...d: 1 }': E
             72..73 '1': u32
@@ -316,7 +316,7 @@ unsafe fn baz(u: MyUnion) {
     let inner = u.bar;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             57..172 '{     ...); } }': ()
             67..68 'u': MyUnion
             71..89 'MyUnio...o: 0 }': MyUnion
@@ -362,7 +362,7 @@ fn test(a: &u32, b: &mut u32, c: *const u32, d: *mut u32) {
     *d;
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             8..9 'a': &'? u32
             17..18 'b': &'? mut u32
             30..31 'c': *const u32
@@ -399,7 +399,7 @@ fn test(a: i32) {
     &raw const a;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             8..9 'a': i32
             16..53 '{     ...t a; }': ()
             22..32 '&raw mut a': *mut i32
@@ -441,7 +441,7 @@ h";
             let c = br#"x"\"yb"#;
         }
         "##,
-        expect![[r##"
+        &expect![[r##"
             18..515 '{     ...     }': ()
             32..36 '5i32': i32
             50..54 '5f16': f16
@@ -492,7 +492,7 @@ fn test(x: SomeType) {
     !"hello";
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             26..27 'x': SomeType
             39..271 '{     ...lo"; }': ()
             49..50 'b': bool
@@ -555,7 +555,7 @@ fn test() -> &mut &f64 {
     &mut &c
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             13..14 'x': u32
             21..23 '{}': ()
             77..230 '{     ...t &c }': &'? mut &'? f64
@@ -601,7 +601,7 @@ impl S {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             33..37 'self': &'? S
             39..60 '{     ...     }': ()
             49..53 'self': &'? S
@@ -644,7 +644,7 @@ impl E {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             86..107 '{     ...     }': ()
             96..100 'Self': S1
             134..158 '{     ...     }': ()
@@ -688,7 +688,7 @@ fn test() -> bool {
     ten < 3
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             5..6 'x': bool
             21..33 '{     0i32 }': i32
             27..31 '0i32': i32
@@ -755,7 +755,7 @@ fn test() {
     1u32 >> 5u8;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             10..47 '{     ...5u8; }': ()
             16..20 '1u32': u32
             16..27 '1u32 << 5u8': u32
@@ -794,7 +794,7 @@ fn test2(a1: *const A, a2: *mut A) {
     a2.b;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             43..44 'a': A
             49..212 '{     ...5.b; }': ()
             59..61 'a1': A
@@ -869,7 +869,7 @@ fn test() {
     let t = A::foo(&&B(B(A(42))));
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             66..70 'self': &'? A<T>
             78..101 '{     ...     }': &'? T
             88..95 '&self.0': &'? T
@@ -924,7 +924,7 @@ fn test(a: A<i32>) {
     let t = A(0 as *mut _).foo(&&B(B(a)));
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             71..75 'self': &'? A<T>
             77..78 'x': &'? A<T>
             93..114 '{     ...     }': &'? T
@@ -969,7 +969,7 @@ fn main(foo: Foo) {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             34..37 'foo': Foo
             44..108 '{     ...   } }': ()
             50..106 'if tru...     }': ()
@@ -1011,7 +1011,7 @@ fn foo() {
     };
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             9..322 '{     ...  }; }': ()
             19..22 '_x1': i32
             25..79 'if tru...     }': i32
@@ -1070,7 +1070,7 @@ fn infer_inherent_method() {
             a.bar(1);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             31..35 'self': A
             37..38 'x': u32
             52..54 '{}': i32
@@ -1108,7 +1108,7 @@ fn test() {
     "foo".foo();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             67..71 'self': &'? str
             80..82 '{}': i32
             96..116 '{     ...o(); }': ()
@@ -1131,7 +1131,7 @@ fn infer_tuple() {
             let f = (e, "d");
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             8..9 'x': &'? str
             17..18 'y': isize
             27..169 '{     ...d"); }': ()
@@ -1186,7 +1186,7 @@ fn infer_array() {
             let y: [u8; 2+2] = [1,2,3,4];
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             8..9 'x': &'? str
             17..18 'y': isize
             27..326 '{     ...,4]; }': ()
@@ -1268,7 +1268,7 @@ fn infer_struct_generics() {
             a3.x;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             35..37 'a1': A<u32>
             47..48 'i': i32
             55..146 '{     ...3.x; }': ()
@@ -1305,7 +1305,7 @@ fn infer_tuple_struct_generics() {
             let x: Option<i64> = None;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             75..183 '{     ...one; }': ()
             81..82 'A': fn A<i32>(i32) -> A<i32>
             81..86 'A(42)': A<i32>
@@ -1338,7 +1338,7 @@ fn infer_function_generics() {
             let x: u64 = id(1);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             9..10 't': T
             20..25 '{ t }': T
             22..23 't': T
@@ -1385,7 +1385,7 @@ fn infer_impl_generics_basic() {
             a.z::<u128>(1);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             73..77 'self': A<X, Y>
             84..106 '{     ...     }': X
             94..98 'self': A<X, Y>
@@ -1438,7 +1438,7 @@ fn infer_impl_generics_with_autoderef() {
             o.as_ref();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             77..81 'self': &'? Option<T>
             97..99 '{}': Option<&'? T>
             110..111 'o': Option<u32>
@@ -1475,7 +1475,7 @@ fn infer_generic_chain() {
             b.x()
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             52..56 'self': A<T2>
             64..86 '{     ...     }': T2
             74..78 'self': A<T2>
@@ -1541,7 +1541,7 @@ fn infer_associated_const() {
             let z = TraitTest::ID;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             51..52 '1': u32
             104..105 '2': u32
             212..213 '5': u32
@@ -1583,7 +1583,7 @@ fn infer_type_alias() {
             let m::Alias::Foo(x) = &e;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             115..116 'x': A<u32, i128>
             123..124 'y': A<&'? str, u128>
             137..138 'z': A<u8, i8>
@@ -1622,7 +1622,7 @@ fn recursive_type_alias() {
         type Bar = A<Bar>;
         fn test(x: Foo) {}
         "#,
-        expect![[r#"
+        &expect![[r#"
             58..59 'x': {unknown}
             66..68 '{}': ()
         "#]],
@@ -1648,7 +1648,7 @@ fn infer_type_param() {
             id::<i128>(1);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             9..10 'x': T
             20..29 '{     x }': T
             26..27 'x': T
@@ -1687,7 +1687,7 @@ fn test() {
     let id = Foo::ASSOC_CONST;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             48..49 '0': u32
             79..82 '101': u32
             94..212 '{     ...NST; }': ()
@@ -1717,7 +1717,7 @@ fn test() {
     let w = GLOBAL_STATIC_MUT;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             28..31 '101': u32
             69..72 '101': u32
             84..279 '{     ...MUT; }': ()
@@ -1744,7 +1744,7 @@ enum Foo {
     B = Foo::A as isize + 1
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             19..21 '15': isize
             31..37 'Foo::A': Foo
             31..46 'Foo::A as isize': isize
@@ -1760,7 +1760,7 @@ enum Foo {
     B = Foo::A as u32 + 1
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             32..34 '15': u32
             44..50 'Foo::A': Foo
             44..57 'Foo::A as u32': u32
@@ -1935,7 +1935,7 @@ fn closure_return() {
             let x = || -> usize { return 1; };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             16..58 '{     ...; }; }': u32
             26..27 'x': impl Fn() -> usize
             30..55 '|| -> ...n 1; }': impl Fn() -> usize
@@ -1954,7 +1954,7 @@ fn closure_return_unit() {
             let x = || { return; };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             16..47 '{     ...; }; }': u32
             26..27 'x': impl Fn()
             30..44 '|| { return; }': impl Fn()
@@ -1972,7 +1972,7 @@ fn closure_return_inferred() {
             let x = || { "test" };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             16..46 '{     ..." }; }': u32
             26..27 'x': impl Fn() -> &'? str
             30..43 '|| { "test" }': impl Fn() -> &'? str
@@ -2007,7 +2007,7 @@ fn test() {
     }
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             70..71 'v': i64
             78..80 '{}': ()
             91..362 '{     ...   } }': ()
@@ -2080,7 +2080,7 @@ fn test() {
     let result = generator.next();
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             37..131 '{     ...t(); }': ()
             47..60 'mut generator': impl Iterator<Item = i8>
             63..93 'gen { ...     }': impl Iterator<Item = i8>
@@ -2109,7 +2109,7 @@ fn test(mut cx: Context<'_>) {
     let result = Pin::new(&mut generator).poll_next(&mut cx);
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             91..97 'mut cx': Context<'?>
             112..239 '{     ...cx); }': ()
             122..135 'mut generator': impl AsyncIterator<Item = {unknown}>
@@ -2144,7 +2144,7 @@ fn test() {
     let result = generator.next();
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             41..58 '{     ... (); }': ()
             47..55 'yield ()': ()
             53..55 '()': ()
@@ -2177,7 +2177,7 @@ fn test(mut cx: Context<'_>) {
     let result = Pin::new(&mut generator).poll_next(&mut cx);
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             103..120 '{     ... (); }': ()
             109..117 'yield ()': ()
             115..117 '()': ()
@@ -2261,7 +2261,7 @@ fn fn_pointer_return() {
             let m = vtable.method;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             47..120 '{     ...hod; }': ()
             57..63 'vtable': Vtable
             66..90 'Vtable...| {} }': Vtable
@@ -2288,7 +2288,7 @@ async fn main() {
     let u = try bikeshed core::ops::ControlFlow<(), _> { () };
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             16..256 '{     ...) }; }': ()
             26..27 'x': i32
             30..43 'unsafe { 92 }': i32
@@ -2356,7 +2356,7 @@ fn main() {
     });
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             83..84 'f': F
             89..91 '{}': ()
             103..231 '{     ... }); }': ()
@@ -2397,7 +2397,7 @@ fn infer_generic_from_later_assignment() {
             }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             59..129 '{     ...   } }': ()
             69..76 'mut end': Option<bool>
             79..83 'None': Option<bool>
@@ -2430,7 +2430,7 @@ fn infer_loop_break_with_val() {
             };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             59..168 '{     ...  }; }': ()
             69..70 'x': Option<bool>
             73..165 'loop {...     }': Option<bool>
@@ -2463,7 +2463,7 @@ fn infer_loop_break_without_val() {
             };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             59..136 '{     ...  }; }': ()
             69..70 'x': ()
             73..133 'loop {...     }': ()
@@ -2495,7 +2495,7 @@ fn infer_labelled_break_with_val() {
             };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             9..335 '{     ...  }; }': ()
             19..21 '_x': impl Fn() -> bool
             24..332 '|| 'ou...     }': impl Fn() -> bool
@@ -2551,7 +2551,7 @@ fn foo() {
     };
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             21..32 '{ loop {} }': T
             23..30 'loop {}': !
             28..30 '{}': ()
@@ -2609,7 +2609,7 @@ fn generic_default() {
             }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             97..99 't1': Thing<()>
             108..110 't2': OtherThing<()>
             124..126 't3': Thing<i32>
@@ -2665,7 +2665,7 @@ fn generic_default_in_struct_literal() {
             let b = OtherThing::Two(1i32);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             99..319 '{     ...32); }': !
             109..110 'x': Thing<!>
             113..133 'Thing ...p {} }': Thing<!>
@@ -2707,7 +2707,7 @@ fn generic_default_depending_on_other_type_arg() {
             Thing::<_> { t: 1u32 };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             56..58 't1': Thing<u32, fn() -> u32>
             72..74 't2': Thing<u128, fn() -> u128>
             83..130 '{     ...2 }; }': ()
@@ -2731,7 +2731,7 @@ fn generic_default_depending_on_other_type_arg_forward() {
             t1;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             56..58 't1': Thing<fn() -> {unknown}, u128>
             67..78 '{     t1; }': ()
             73..75 't1': Thing<fn() -> {unknown}, u128>
@@ -2770,7 +2770,7 @@ fn infer_const_params() {
             let bar = FOO;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             27..49 '{     ...FOO; }': ()
             37..40 'bar': usize
             43..46 'FOO': usize
@@ -2788,7 +2788,7 @@ fn infer_inner_type() {
             let f = s.field;
         }
     "#,
-        expect![[r#"
+        &expect![[r#"
             9..89 '{     ...eld; }': ()
             47..48 's': S
             51..65 'S { field: 0 }': S
@@ -2812,7 +2812,7 @@ fn infer_nested_inner_type() {
             struct S { field: u32 }
         }
     "#,
-        expect![[r#"
+        &expect![[r#"
             9..109 '{     ...32 } }': ()
             15..79 '{     ...     }': ()
             29..30 's': S
@@ -2842,7 +2842,7 @@ fn inner_use_enum_rename() {
             }
         }
     "#,
-        expect![[r#"
+        &expect![[r#"
             34..123 '{     ...   } }': ()
             67..68 'r': Request
             71..78 'R::Info': Request
@@ -2907,7 +2907,7 @@ trait B{}
 struct Astruct;
 impl B for Astruct {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             733..737 'self': Box<[T], A>
             766..798 '{     ...     }': Vec<T, A>
             776..792 'unimpl...ted!()': {unknown}
@@ -3207,7 +3207,7 @@ fn f() {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             72..166 '{     ...   } }': ()
             78..164 'match ...     }': ()
             84..92 'Foo::Bar': fn Bar(i32) -> Foo
@@ -3259,7 +3259,7 @@ fn main() {
     let inner = boxed.into_inner();
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             188..192 'self': &'_ Box<Foo<T>>
             218..220 '{}': &'? T
             242..246 'self': &'_ Box<Foo<T>>
@@ -3701,7 +3701,7 @@ fn func() {
     let x = Box::new([]) as Box<[i32; 0]>;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             99..100 't': T
             113..124 '{ loop {} }': Box<T>
             115..122 'loop {}': !
@@ -3730,7 +3730,7 @@ fn f<T>(t: Ark<T>) {
     Ark::foo(&t) as *const ();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             47..51 'self': &'? Ark<T>
             65..88 '{     ...     }': *const T
             75..82 '&self.0': &'? T
@@ -3987,7 +3987,7 @@ fn main() {
     let [b, c] = a.into();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             50..51 'a': A
             64..86 '{     ...     }': [u8; 2]
             74..80 '[0; 2]': [u8; 2]
@@ -4027,7 +4027,7 @@ fn main() {
     });
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             38..39 'f': F
             44..46 '{}': ()
             74..75 'f': F
@@ -4066,7 +4066,7 @@ fn foo<T: Bar>() {
     T::baz();
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             110..127 '{     ...z(); }': ()
             116..122 'T::baz': fn baz<T>() -> <{unknown} as Foo>::Gat<'?>
             116..124 'T::baz()': {unknown}
@@ -4095,7 +4095,7 @@ fn foo() {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             22..29 '{ 123 }': i32
             24..27 '123': i32
             37..38 's': &'? str
@@ -4135,7 +4135,7 @@ fn foo() {
     let _: fn() -> i32 = || a;
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             9..58 '{     ...| a; }': ()
             19..20 'a': i32
             23..24 '1': i32
@@ -4205,7 +4205,7 @@ fn foo() {
     let _ = LazyLock::force(&VALUES_LAZY_LOCK);
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             73..96 '{     ...     }': LazyLock<T>
             83..90 'loop {}': !
             88..90 '{}': ()
@@ -4294,7 +4294,7 @@ union U {
     field: S2<0>
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             111..125 '{ C as usize }': usize
             113..114 'C': f32
             113..123 'C as usize': usize
@@ -4325,7 +4325,7 @@ enum Enum {
     Variant([(); { 2 }]),
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
 
 "#]],
     );
@@ -4373,7 +4373,7 @@ fn check() {
     let foo_fn = foo;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             199..204 'alias': &'_ u32
             232..245 '{     &1u32 }': &'e u32
             238..243 '&1u32': &'? u32
@@ -4393,7 +4393,7 @@ fn hrtb_fn_ptr() {
 
 fn foo<'b>(f: for <'a> fn(&'a u32, &'b u32)) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             12..13 'f': fn(&'?0.0 u32, &'_ u32)
             46..48 '{}': ()
         "#]],

@@ -57,6 +57,10 @@ pub(crate) struct ImportOp {
     /// The context the name it binds is keyed by (`def_site::import_binding_key`): `None` but
     /// for a `use` a `macro` wrote.
     pub(crate) key: Option<SyntaxContext>,
+    /// The context the path's first token is written with, normalized to macros 2.0
+    /// (`def_site::use_path_context`): where def-site hygiene starts the path. A root context
+    /// but for a `use` a macro wrote.
+    pub(crate) ctxt: SyntaxContext,
 }
 
 impl ImportOp {

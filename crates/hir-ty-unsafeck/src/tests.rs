@@ -74,7 +74,7 @@ fn render(op: &UnsafeOp) -> String {
 fn operations(db: &TestDB) -> Vec<(EditionedFileId, syntax::TextRange, String)> {
     let mut found = Vec::new();
     for def in bodies(db) {
-        let (_, source_map) = Body::with_source_map(db, def);
+        let source_map = Body::source_map(db, def);
         for op in unsafety_check(db, def).ops() {
             match op.lint {
                 UnsafeLint::UnsafeOpInUnsafeFn => assert!(op.in_unsafe_fn, "{op:?}"),

@@ -92,11 +92,13 @@ impl Vtable {
             ids_of: None,
             made: None,
             memory: memory::<I>,
+            used: None,
             verify: None,
             reset: None,
-            sweep: None,
+            weighed: None,
             relocate: None,
             restamp: None,
+            write_key: None,
             drop: drop_table::<I>,
         }
     }
@@ -186,7 +188,9 @@ pub fn input_read<I: Input>(storage: &Storage, id: Id, field: u32) {
     let node = row::<I>(storage, id).first.load(Ordering::Relaxed) + field;
     let seen = storage.color_of(node);
     let durability = ((seen >> 32) as u32 & !FIELD) as u8;
-    local::with(|local| local.read(storage, node, durability, seen as u32));
+    if local::with(|local| local.read(storage, node, durability, seen as u32)) {
+        super::runaway_reads(storage);
+    }
 }
 
 #[cfg(test)]
@@ -240,7 +244,9 @@ pub fn input_singleton<I: Input>(storage: &Storage) -> Option<Id> {
     let node = row.first.load(Ordering::Relaxed);
     let seen = storage.color_of(node);
     let durability = ((seen >> 32) as u32 & !FIELD) as u8;
-    local::with(|local| local.read(storage, node, durability, seen as u32));
+    if local::with(|local| local.read(storage, node, durability, seen as u32)) {
+        super::runaway_reads(storage);
+    }
     None
 }
 
@@ -329,12 +335,9 @@ impl<I: Input, T> Setter for InputSetter<'_, I, T> {
 
 fn memory<I: Input>(storage: &Storage, index: u32) -> MemoryUsage {
     let rows = storage.table::<InputTable<I>>(index).map_or(0, |table| u64::from(table.ids.len()));
-    MemoryUsage {
-        name: I::NAME,
-        rows,
-        row_bytes: rows * size_of::<RowOf<I>>() as u64,
-        value_bytes: rows * size_of::<I::Fields>() as u64,
-    }
+    // The fields are in place in the rows; what they hold beside is not counted.
+    let row_bytes = rows * size_of::<RowOf<I>>() as u64;
+    MemoryUsage { name: I::NAME, rows, used: rows, row_bytes, value_bytes: 0 }
 }
 
 fn drop_table<I: Input>(storage: &mut Storage, index: u32) {

@@ -7,11 +7,11 @@ use base_db::Db;
 use blaze_mem::Frame;
 use hir_def::{
     AssocItemId, AttrDefId, FunctionId, GenericParamId, HasModule, ImplId, ItemContainerId,
-    TraitId,
+    Lookup, TraitId,
     attrs::AttrFlags,
     expr_store::HygieneId,
     hir::generics::GenericParams,
-    nameres::impl_item_name,
+    nameres::{impl_item_name, trait_item_name},
     signatures::{FunctionSignature, TraitFlags, TraitSignature},
     visibility::Visibility,
 };
@@ -36,7 +36,7 @@ use crate::{
     lower::GenericPredicates,
     method_resolution::{
         CandidateId, CandidateSource, InherentImpls, MethodError, MethodResolutionContext,
-        SelfTyKey, TraitValueItems, impl_value_item, inherent_value_item,
+        SelfTyKey, TraitValueItems, inherent_value_item,
         pick_cache::{self, ProbeFacts},
         scope_sets::{ScopeItem, ScopeItems},
         simplified_type_module, with_incoherent_inherent_impls,
@@ -282,19 +282,21 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         self.probe_for_name_with(mode, item_name, HygieneId::ROOT, self_ty, false)
     }
 
-    /// As `probe_for_name` for a method call whose name is written with `hygiene` (the
-    /// expression store's `member_hygiene`): an inherent impl's items are looked up by the
-    /// name keyed for the impl's scope ([`impl_item_name`]), so a method a `macro` names is
-    /// found only by the calls its expansion writes, as rustc's probe compares them with
-    /// `hygienic_eq`.
+    /// As `probe_for_name` for a method call or a path whose last segment is written with
+    /// `hygiene` (the expression store's `member_hygiene`, the context of a path's segment): an
+    /// impl's or a trait's items are looked up by the name keyed for its scope
+    /// ([`impl_item_name`], [`trait_item_name`]), and the traits in scope are those of rustc's
+    /// hygienic walk ([`TraitsInScope::named`]), so an item a `macro` names is found only by the
+    /// names its expansion writes, as rustc's probe compares them with `hygienic_eq`.
     #[instrument(level = "debug", skip(self))]
     pub fn probe_for_written_name(
         &self,
+        mode: Mode,
         item_name: Name,
         hygiene: HygieneId,
         self_ty: Ty<'db>,
     ) -> PickResult<'db> {
-        self.probe_for_name_with(Mode::MethodCall, item_name, hygiene, self_ty, false)
+        self.probe_for_name_with(mode, item_name, hygiene, self_ty, false)
     }
 
     /// As `probe_for_name`, for a path a desugaring wrote: the `new` of `format_args!` is behind
@@ -317,8 +319,12 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         self_ty: Ty<'db>,
         allow_unstable: bool,
     ) -> PickResult<'db> {
-        let scope_items =
-            self.traits_in_scope.named(self.infcx.interner.db, item_name, self.frame);
+        let scope_items = self.traits_in_scope.named(
+            self.infcx.interner.db,
+            item_name,
+            item_hygiene,
+            self.frame,
+        );
         let choice = ProbeForNameChoice {
             private_candidate: None,
             item_name,
@@ -330,9 +336,10 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
             scope_items,
         };
         if item_hygiene != HygieneId::ROOT {
-            // A name a `macro` writes (lowering keeps no other context for a method call) is
-            // looked up by a key that depends on each impl's expansion, which the pick cache's
-            // key does not name: outside the cache's domain the probe is the one path.
+            // A name a `macro` writes (lowering keeps no other context for a method call or a
+            // path's segment) is looked up by a key that depends on each impl's and trait's
+            // expansion, which the pick cache's key does not name: outside the cache's domain the
+            // probe is the one path.
             return self.probe_op(mode, self_ty, choice, &mut ProbeFacts::default());
         }
         pick_cache::pick(self, mode, item_name, self_ty, allow_unstable, scope_items, |facts| {
@@ -786,15 +793,21 @@ trait ProbeChoice<'db>: Sized {
 
     /// Pushes the candidates of the traits in scope.
     fn assemble_extension_candidates_for_traits_in_scope(this: &mut ProbeContext<'_, 'db, Self>);
+
+    /// The context the looked-up name is written with, which an item's privacy is checked from
+    /// the def site of ([`hir_def::nameres::privacy_scope`]): `HygieneId::ROOT` for a probe
+    /// with no written name.
+    fn item_hygiene(&self) -> HygieneId {
+        HygieneId::ROOT
+    }
 }
 
 #[derive(Debug)]
 struct ProbeForNameChoice<'db, 'f> {
     item_name: Name,
-    /// The context `item_name` is written with in a method call, which an inherent impl's items
-    /// are looked up by ([`impl_item_name`], [`inherent_value_item`]); `HygieneId::ROOT` for
-    /// every other probe. A path's probe (`T::f`) still finds an inherent impl's item by its
-    /// text alone ([`impl_value_item`]).
+    /// The context `item_name` is written with in a method call or a path (`T::f`), which an
+    /// impl's and a trait's items are looked up by ([`impl_item_name`], [`inherent_value_item`],
+    /// [`trait_item_name`]); `HygieneId::ROOT` for a probe of a name no source wrote.
     item_hygiene: HygieneId,
 
     /// Some(candidate) if there is a private candidate
@@ -807,7 +820,7 @@ struct ProbeForNameChoice<'db, 'f> {
     unstable_candidates: RefCell<Vec<(CandidateId, Symbol)>>,
     /// Whether such items are as good as the others: the path was not written by the user.
     allow_unstable: bool,
-    /// The items of `item_name` of the traits asked of so far.
+    /// The items of `item_name` (keyed for each trait's scope) of the traits asked of so far.
     trait_items: TraitValueItems<'db, 'f>,
     /// The traits in scope with an item of `item_name`, and those items: the extension
     /// candidates.
@@ -818,6 +831,10 @@ impl<'db, 'f> ProbeChoice<'db> for ProbeForNameChoice<'db, 'f> {
     type Choice = PickResult<'db>;
     type FinalChoice = PickResult<'db>;
 
+    fn item_hygiene(&self) -> HygieneId {
+        self.item_hygiene
+    }
+
     fn with_impl_or_trait_item<'a>(
         this: &mut ProbeContext<'a, 'db, Self>,
         items: ItemsOf,
@@ -825,12 +842,12 @@ impl<'db, 'f> ProbeChoice<'db> for ProbeForNameChoice<'db, 'f> {
     ) {
         let db = this.db();
         let name = this.choice.item_name;
+        let hygiene = this.choice.item_hygiene;
         let item = match items {
-            ItemsOf::Impl(id) if this.mode == Mode::MethodCall => {
-                inherent_value_item(db, id, impl_item_name(db, id, name, this.choice.item_hygiene))
+            ItemsOf::Impl(id) => inherent_value_item(db, id, impl_item_name(db, id, name, hygiene)),
+            ItemsOf::Trait(id) => {
+                this.choice.trait_items.get(db, id, trait_item_name(db, id, name, hygiene))
             }
-            ItemsOf::Impl(id) => impl_value_item(db, id, name),
-            ItemsOf::Trait(id) => this.choice.trait_items.get(db, id, name),
         }
         .filter(|id| this.mode == Mode::Path || matches!(id, CandidateId::FunctionId(_)));
         if let Some(item) = item {
@@ -1182,7 +1199,18 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
             };
             let visibility = candidate_id.assoc_visibility(self.db());
             self.module_dependent |= matches!(visibility, Visibility::Module(..));
-            self.ctx.resolver.is_visible(self.db(), visibility)
+            // Checked from the def site of the method's name (rustc's `push_candidate`, through
+            // `adjust_ident_and_get_scope`); a trait's items are public.
+            let container = match candidate.item {
+                CandidateId::FunctionId(id) => id.lookup(self.db()).container,
+                CandidateId::ConstId(id) => id.lookup(self.db()).container,
+            };
+            let expn = match container {
+                ItemContainerId::ImplId(it) => hir_def::nameres::impl_expansion(self.db(), it),
+                _ => None,
+            };
+            let hygiene = self.choice.item_hygiene();
+            self.ctx.resolver.is_visible_written(self.db(), visibility, hygiene, expn)
         } else {
             true
         };

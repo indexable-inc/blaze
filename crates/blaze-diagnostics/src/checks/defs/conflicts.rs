@@ -505,7 +505,8 @@ fn module_scope<'db>(cx: &Cx<'_, 'db>, scope: &mut Scope, uses: &mut UseTrees<'d
 }
 
 /// The variants of an enum, each in both namespaces, read from its syntax (the front end keeps
-/// one variant per name).
+/// one variant per name and key), each keyed as the front end keys it
+/// (`hir_def::nameres::binding_key_at`): a variant a `macro` names and one it is handed are two.
 fn enum_scope(cx: &Cx<'_, '_>, scope: &mut Scope, module: hir::Module, enum_: hir::Enum) {
     scope.reset(module, "enum");
     let Some(source) = cx.vsema.source(enum_) else { return };
@@ -513,11 +514,12 @@ fn enum_scope(cx: &Cx<'_, '_>, scope: &mut Scope, module: hir::Module, enum_: hi
     let item = Some(ItemId::Adt(hir::Adt::from(enum_).into()));
     for variant in list.variants().filter(|&it| cx.cfg_enabled(it.syntax())) {
         let Some(name) = variant.name() else { continue };
+        let key = hir_def::nameres::binding_key_at(cx.db, source.file_id, name.syntax().text_range());
         let name = scope.intern(name.text());
         let node = variant.syntax();
         let (range, head) = (source.with_value(item_range(node)), source.with_value(head_range(node)));
         for (ns, kind) in [(Ns::Type, "type"), (Ns::Value, "value")] {
-            scope.bindings.push(Binding { name, key: None, ns, origin: Origin::Def, res: None, kind, range, head, item });
+            scope.bindings.push(Binding { name, key, ns, origin: Origin::Def, res: None, kind, range, head, item });
         }
     }
 }

@@ -42,6 +42,33 @@ use crate::{
 
 /// `SourceAnalyzer` is a convenience wrapper which exposes HIR API in terms of
 /// original source files. It should not be used inside the HIR itself.
+/// An item a path's resolution looks up that the ast id map the analysis reads does not hold:
+/// the map is of another tree than the node (a body's anchor tree read against its file's
+/// map). A bug in the analysis, refused rather than answered from the wrong item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotInAstIdMap {
+    /// The item, as `struct Name`.
+    pub item: String,
+    pub file: HirFileId,
+    pub node: syntax::SyntaxNodePtr,
+    /// Whether the map read was a body's anchor's, whose ranges begin at the anchor.
+    pub anchored: bool,
+}
+
+impl std::fmt::Display for NotInAstIdMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let map = if self.anchored { "its body's anchor's ast id map" } else { "its file's ast id map" };
+        write!(
+            f,
+            "`{}` ({:?} at {:?} of {:?}) is not in {map}, which resolving a path in its attribute reads",
+            self.item,
+            self.node.kind(),
+            self.node.text_range(),
+            self.file,
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SourceAnalyzer<'db> {
     pub(crate) file_id: HirFileId,

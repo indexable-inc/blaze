@@ -9,29 +9,38 @@
 //! once the waker gave it back ([`join_pool`]'s `wake`, which puts it in the waker's LIFO slot
 //! when the waker is a worker of that pool).
 //!
-//! A thread on no fiber (a client of the pools) is one job of the clients' member for its life:
-//! its wait parks the thread, checked against every other wait in the one graph, so a cycle
-//! through a client's run and a pool's job is refused as one of two jobs is.
+//! A thread on no fiber (a client of the pools) is one job of a member of its own for its life,
+//! in a scheduler of its own until its jobs meet another's: its wait parks the thread, checked
+//! against every other wait it could close a cycle with, so a cycle through a client's run and
+//! a pool's job is refused as one of two jobs is.
+//!
+//! Each pool holds its scheduler ([`Scheduler`]), which joins another's as their jobs meet
+//! ([`super::domain`]).
 //!
 //! Every call into the scheduler is made with the fiber switched out, on its worker's stack, as
 //! the driver's are ([`super::fiber`]).
 
 use std::{
-    cell::Cell,
+    cell::{Cell, OnceCell},
     panic::{self, AssertUnwindSafe},
     ptr::{self, NonNull},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, Thread},
     time::{Duration, Instant},
 };
 
 use super::{
     CounterId, Cycle, JobId, Suspend, Wait,
+    domain::{Domain, Guard, Scheduler, counter_cell, key_cell, live_job_cell, lock, lock_joined, roots, wait_cell},
     fiber::{
-        Answer, Given, Global, HERE, Here, IdleReason, OwnIo, Panic, SwitchEvent, Taken, UNREGISTERED,
-        carry_stack_limit, check_no_wait, clear, come_on, dispatch_global, global, go_off, go_off_ended, idled,
-        observing, switched, switched_known, switched_unregistered,
+        Answer, Given, HERE, Here, IdleReason, OwnIo, Panic, SwitchEvent, Taken, UNREGISTERED, carry_stack_limit,
+        check_no_wait, clear, come_on, dispatch, go_off, go_off_ended, idled, observing, switched, switched_known,
+        switched_unregistered,
     },
+    ids,
     stack::{FIBER_STACK, Resumed, Stack, Stackful, Yielder},
 };
 use crate::{
@@ -57,12 +66,12 @@ enum Out {
 
 struct Fiber(Stackful<In, Out>, u32);
 
+#[allow(unsafe_code)]
 // SAFETY: as the driver's fibers: moved to another thread only while suspended (idle in a
 // worker's set, or parked in a record), never while it runs. Its stack then holds this module's
 // frames (the `Yielder` and `HostCx`, touched only by the fiber itself, and a `Job: Send`) and the
 // job's frames below a wait, which hold nothing that must not cross threads (the may-suspend
 // check, docs/v2/plan/lanes/may-suspend.md; `NoWait` guards at every wait).
-#[allow(unsafe_code)]
 unsafe impl Send for Fiber {}
 
 /// A parked job of a pool: its fiber and the thread-locals it carries, behind a pool job header
@@ -182,150 +191,195 @@ impl Driven {
     }
 }
 
-/// A pool joins the scheduler: a member of its own placement, whose woken jobs `wake(ctx,
-/// token)` takes back, `token` the address of the job's header (a [`Job`] to queue). `wake` is
-/// called under the scheduler's lock: it must not call into the scheduler.
+/// A pool joins its scheduler `sched`: a member of its own placement, whose woken jobs
+/// `wake(ctx, token)` takes back, `token` the address of the job's header (a [`Job`] to queue).
+/// `wake` is called under the scheduler's lock: it must not call into the scheduler.
 /// `idle(ctx)` says, under the scheduler's lock, whether every worker of the pool sleeps
 /// with nothing queued ([`check_stall`]).
-pub(crate) fn join_pool(wake: fn(usize, usize), idle: fn(usize) -> bool, ctx: usize) -> u32 {
+pub(crate) fn join_pool(sched: &Scheduler, wake: fn(usize, usize), idle: fn(usize) -> bool, ctx: usize) -> u32 {
     carry_stack_limit();
-    let mut g = global();
-    let member = g.world.join_own();
-    set_own(&mut g, member, OwnIo { wake, ctx, idle: Some(idle) });
+    let mut g = sched.lock();
+    let member = g.world.join_own(false);
+    g.own.push((member, OwnIo { wake, ctx, idle: Some(idle) }));
     member
 }
 
-/// Jobs a stall ([`World::stall`]) or a pool's stop ([`World::stop_own`]) woke to fail that
-/// were not told yet: while 0, a wait that ends asks nothing more.
-static FAILING: crate::sync::atomic::AtomicUsize = crate::sync::atomic::AtomicUsize::new(0);
-
-/// A pool's last awake worker found it idle a while with jobs parked: if every pool is idle
-/// and no wait in the graph can end ([`World::stall`]), every waiting job wakes to fail with
-/// the [`super::Stalled`] naming each wait, rather than all of them waiting forever.
+/// A pool's last awake worker found it idle a while with jobs parked: if every pool of its
+/// scheduler `sched` is idle and no wait in its graph can end ([`World::stall`]), every waiting
+/// job wakes to fail with the [`super::Stalled`] naming each wait, rather than all of them
+/// waiting forever. A scheduler holds every wait its jobs could end, and every job that could
+/// end its waits ([`super::domain`]), so no other's can move it.
 ///
 /// The threads on no fiber (the clients) may end what they claimed at any time, so a wait on
 /// one of those is no stall here; [`stall_while_quiet`] is the check for once they are still.
 ///
-/// Whether it woke any: a driven pool's thread ([`crate::pool::block_until`]) runs them next.
-pub(crate) fn check_stall() -> bool {
-    let mut g = global();
-    if !pools_idle(&g) {
-        return false;
+/// Whether it woke any.
+pub(crate) fn check_stall(sched: &Scheduler) -> bool {
+    let mut g = sched.lock();
+    stall(&mut g, false) != 0
+}
+
+/// [`check_stall`] of every scheduler of the process: a driven pool's thread
+/// ([`crate::pool::block_until`]), which may run any of them, runs the jobs it woke next.
+pub(crate) fn check_stall_any() -> bool {
+    let mut woke = false;
+    for root in roots() {
+        let mut g = lock(&root);
+        woke |= stall(&mut g, false) != 0;
     }
-    let clients = g.clients;
-    let woke = g.world.stall(clients, false);
-    woke_failing(&mut g, woke);
-    woke != 0
+    woke
+}
+
+/// Stalls `g`'s scheduler if its pools are idle and its graph stuck: how many woke.
+fn stall(g: &mut Guard<'_>, quiet: bool) -> usize {
+    if !pools_idle(g) {
+        return 0;
+    }
+    let woke = g.world.stall(quiet);
+    woke_failing(g, woke);
+    woke
 }
 
 /// Whether every pool's workers sleep with nothing queued, under the scheduler's lock.
-fn pools_idle(g: &Global) -> bool {
-    g.own.iter().flatten().all(|io| io.idle.is_none_or(|idle| idle(io.ctx)))
+fn pools_idle(g: &Domain) -> bool {
+    g.own.iter().all(|(_, io)| io.idle.is_none_or(|idle| idle(io.ctx)))
 }
 
-fn woke_failing(g: &mut Global, woke: usize) {
+fn woke_failing(g: &mut Guard<'_>, woke: usize) {
     if woke != 0 {
-        FAILING.fetch_add(woke, crate::sync::atomic::Ordering::Release);
-        dispatch_global(g, None);
+        g.cell().failing.fetch_add(woke, Ordering::Release);
+        dispatch(g, None);
     }
 }
 
-/// The pool of `member` stops, and wakes its parked jobs that can never wake now, each to fail
-/// with a [`super::Stopped`] naming its wait, as [`World::stop_own`] says which: their pool
-/// queues them, and its workers run them to their failure. How many woke.
-pub(crate) fn stop_pool(member: u32, reason: super::StopReason) -> usize {
-    let mut g = global();
+/// The pool of `member`, of scheduler `sched`, stops, and wakes its parked jobs that can never
+/// wake now, each to fail with a [`super::Stopped`] naming its wait, as [`World::stop_own`]
+/// says which: their pool queues them, and its workers run them to their failure. How many
+/// woke.
+pub(crate) fn stop_pool(sched: &Scheduler, member: u32, reason: super::StopReason) -> usize {
+    let mut g = sched.lock();
     let woke = g.world.stop_own(member, reason);
     woke_failing(&mut g, woke);
     woke
 }
 
-/// The jobs of the pool of `member` that wait in the graph now, and what on.
-pub(crate) fn waits_of(member: u32) -> super::Waits {
-    global().world.waits_of(member)
+/// `dropper`, a live job of scheduler `theirs` (the thread that stops the pool of `member`, of
+/// scheduler `sched`), waits for the pool's jobs until [`stop_ended`]: the two schedulers join,
+/// a wait that leads to the dropper leads on to the pool's jobs, so one that would close a
+/// cycle through the stop is refused, and a stall sees the dropper as waiting rather than as a
+/// thread that may end what it claimed. `false`, linking nothing, for a job of the pool itself.
+pub(crate) fn stop_begins(sched: &Scheduler, member: u32, dropper: JobId, theirs: &Scheduler) -> bool {
+    let mut g = lock_joined(sched.cell(), || Some(Arc::clone(theirs.cell()))); // clone: a reference count
+    if g.world.home(dropper).0 == member {
+        return false;
+    }
+    g.world.stop_begins(dropper, member);
+    true
 }
 
-/// The job this thread runs in the wait graph, if it joined it: its fiber's job, or the
-/// thread's own as a client. Never joins it: a thread that never claimed or waited holds
-/// nothing a wait could lead to. Not inlined: it reads thread-locals (rule 24).
+/// The wait of [`stop_begins`] is over: the pool stopped, or the stop gave up.
+pub(crate) fn stop_ended(sched: &Scheduler, dropper: JobId) {
+    sched.lock().world.stop_ended(dropper);
+}
+
+/// The jobs of the pool of `member`, of scheduler `sched`, that wait in the graph now, and what
+/// on.
+pub(crate) fn waits_of(sched: &Scheduler, member: u32) -> super::Waits {
+    sched.lock().world.waits_of(member)
+}
+
+/// The job this thread runs in the wait graph, if it joined it, and its scheduler: its fiber's
+/// job, or the thread's own as a client. Never joins it: a thread that never claimed or waited
+/// holds nothing a wait could lead to. Not inlined: it reads thread-locals (rule 24).
 #[inline(never)]
-pub(crate) fn job_in_graph() -> Option<JobId> {
+#[allow(unsafe_code)]
+pub(crate) fn job_in_graph() -> Option<(JobId, Scheduler)> {
     match HERE.get() {
-        Some(here) => (here.job != UNREGISTERED).then_some(here.job),
+        // SAFETY: `here` was stored by the fiber running this code, on this thread, and its
+        // scheduler outlives the job's run.
+        Some(here) => (here.job != UNREGISTERED).then(|| (here.job, unsafe { &*here.sched }.clone())), // clone: a reference count
         // A thread whose locals are going (a pool dropped as its thread ends) is in the graph
         // no more: its client left it as it went.
-        None => CLIENT.try_with(|client| client.job.get()).ok().filter(|&job| job != UNREGISTERED),
+        None => CLIENT
+            .try_with(|client| {
+                let job = client.job.get();
+                (job != UNREGISTERED).then(|| (job, client.sched().clone())) // clone: a reference count
+            })
+            .ok()
+            .flatten(),
     }
 }
 
 /// Whether, once the threads outside the graph are still (the caller says so: the daemon's
 /// loop once nothing can move its build, no IO task running and no effect in flight), no wait
-/// of the graph can end: every pool idle, no driver running, and every waiting job waits on
-/// another job, a counter, or a key a job claimed, a client's included ([`Graph::stuck`]
-/// with `quiet`). A wait on an [`Event`] is never stuck. Reads only.
+/// of any scheduler can end, and one waits: in each scheduler with a live job, every pool idle,
+/// no driver running, and every waiting job waits on another job, a counter, or a key a job
+/// claimed, a client's included ([`Graph::stuck`] with `quiet`). A wait on an [`Event`] is
+/// never stuck. Reads only.
 pub fn stuck_while_quiet() -> bool {
-    let mut g = global();
-    let clients = g.clients;
-    pools_idle(&g) && g.world.stuck(clients, true)
+    let mut stuck = false;
+    for root in roots() {
+        let mut g = lock(&root);
+        if g.world.at_rest() {
+            continue;
+        }
+        if !pools_idle(&g) || !g.world.stuck(true) {
+            return false;
+        }
+        stuck = true;
+    }
+    stuck
 }
 
 /// As [`stuck_while_quiet`], and if so every waiting job wakes to fail with the stall naming
 /// each wait ([`super::Stalled`]): the waits it found, or `None` when nothing was stuck.
 pub fn stall_while_quiet() -> Option<super::Waits> {
-    let mut g = global();
-    if !pools_idle(&g) {
+    if !stuck_while_quiet() {
         return None;
     }
-    let clients = g.clients;
-    let woke = g.world.stall(clients, true);
-    if woke == 0 {
-        return None;
+    let mut waits = Vec::new(); // alloc: a stall's report, once
+    for root in roots() {
+        let mut g = lock(&root);
+        if stall(&mut g, true) != 0 {
+            waits.extend_from_slice(g.world.stuck_waits());
+        }
     }
-    // alloc: a stall's report, once
-    let waits = super::Waits(g.world.stuck_waits().to_vec());
-    woke_failing(&mut g, woke);
-    Some(waits)
+    (!waits.is_empty()).then_some(super::Waits(waits))
 }
 
-/// Every job that waits in the graph now and what on, stuck or not: what a report of a build
-/// that stopped names, as a parked job's spans are on no thread (rule 13).
+/// Every job that waits in the graph now and what on, stuck or not, in every scheduler: what a
+/// report of a build that stopped names, as a parked job's spans are on no thread (rule 13).
 pub fn waits_now() -> super::Waits {
-    global().world.waits()
+    let mut waits = Vec::new(); // alloc: a report, off every hot path
+    for root in roots() {
+        waits.extend(lock(&root).world.waits().0);
+    }
+    super::Waits(waits)
 }
 
-/// A wait of `job` ended: if a stall or its pool's stop ended it, the job fails with that,
-/// here.
+/// A wait of `job`, of scheduler `sched`, ended: if a stall or its pool's stop ended it, the
+/// job fails with that, here.
 #[inline(never)]
-fn fail_if_stalled(job: JobId) {
-    if FAILING.load(crate::sync::atomic::Ordering::Acquire) == 0 {
+fn fail_if_stalled(sched: &Scheduler, job: JobId) {
+    if sched.root().failing.load(Ordering::Acquire) == 0 {
         return;
     }
-    let failed = global().world.take_failed(job);
+    let mut g = sched.lock();
+    let failed = g.world.take_failed(job);
     if let Some((failed, scope)) = failed {
-        FAILING.fetch_sub(1, crate::sync::atomic::Ordering::AcqRel);
+        g.cell().failing.fetch_sub(1, Ordering::AcqRel);
+        drop(g);
         with_scope(|it| it.set(scope.map_or(super::NONE, |it| it.0)));
         panic!("{failed}");
     }
 }
 
-/// The pool stopped, none of its jobs in the graph.
-pub(crate) fn leave_pool(member: u32) {
-    let mut g = global();
-    g.own[(member & !super::OWN) as usize] = None;
+/// The pool of `member` stopped, none of its jobs in the graph.
+pub(crate) fn leave_pool(sched: &Scheduler, member: u32) {
+    let mut g = sched.lock();
+    g.own.retain(|it| it.0 != member);
     g.world.leave_own(member);
 }
-
-fn set_own(g: &mut Global, member: u32, io: OwnIo) {
-    let at = (member & !super::OWN) as usize;
-    if g.own.len() <= at {
-        g.own.resize(at + 1, None);
-    }
-    g.own[at] = Some(io);
-}
-
-/// When a pool job's timed wait is next due, on [`now`]'s clock (`u64::MAX` for none): set under
-/// the scheduler's lock, read by workers without it.
-static DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 #[expect(clippy::disallowed_types, reason = "the process's one origin of the pool jobs' clock, which every pool's timed waits share")]
 static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -336,23 +390,44 @@ pub fn now() -> u64 {
     u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Wakes the pool jobs whose timed waits are due: a worker calls it as it looks for work, and
-/// after it parked for [`until_due`]. Reads no clock while no wait is timed.
-pub(crate) fn fire_due() {
-    let at = DEADLINE.load(Ordering::Acquire);
+/// Wakes the pool jobs of scheduler `sched` whose timed waits are due: a worker calls it as it
+/// looks for work, and after it parked for [`until_due`]. Reads no clock while no wait is timed.
+pub(crate) fn fire_due(sched: &Scheduler) {
+    let at = sched.root().deadline.load(Ordering::Acquire);
     if at == u64::MAX || now() < at {
         return;
     }
-    let mut g = global();
-    g.world.advance_own_clock(now());
-    DEADLINE.store(g.world.next_own_deadline().unwrap_or(u64::MAX), Ordering::Release);
-    dispatch_global(&mut g, None);
+    let mut g = sched.lock();
+    fire(&mut g);
 }
 
-/// How long until a pool job's timed wait is due, if one is: the longest a worker that has
-/// nothing to run may park.
-pub(crate) fn until_due() -> Option<Duration> {
-    let at = DEADLINE.load(Ordering::Acquire);
+fn fire(g: &mut Guard<'_>) {
+    g.world.advance_own_clock(now());
+    let next = g.world.next_own_deadline().unwrap_or(u64::MAX);
+    g.cell().deadline.store(next, Ordering::Release);
+    dispatch(g, None);
+}
+
+/// [`fire_due`] of every scheduler of the process, for a thread that drives pools of any.
+pub(crate) fn fire_due_any() {
+    for root in roots() {
+        let at = root.deadline.load(Ordering::Acquire);
+        if at != u64::MAX && now() >= at {
+            fire(&mut lock(&root));
+        }
+    }
+}
+
+/// How long until a pool job's timed wait of scheduler `sched` is due, if one is: the longest a
+/// worker that has nothing to run may park.
+pub(crate) fn until_due(sched: &Scheduler) -> Option<Duration> {
+    let at = sched.root().deadline.load(Ordering::Acquire);
+    (at != u64::MAX).then(|| Duration::from_nanos(at.saturating_sub(now())))
+}
+
+/// [`until_due`] of every scheduler of the process: the soonest.
+pub(crate) fn until_due_any() -> Option<Duration> {
+    let at = roots().iter().map(|it| it.deadline.load(Ordering::Acquire)).min().unwrap_or(u64::MAX);
     (at != u64::MAX).then(|| Duration::from_nanos(at.saturating_sub(now())))
 }
 
@@ -385,23 +460,24 @@ pub(crate) fn job_begins(given: Given) {
     }
 }
 
-/// This pool worker goes idle (`began`) or wakes, told to the idle observer: idle until the
-/// next timed wait of a pool job is due, or with nothing to run.
-pub(crate) fn idle(began: bool) {
-    let due = DEADLINE.load(Ordering::Acquire);
+/// This pool worker, of scheduler `sched`, goes idle (`began`) or wakes, told to the idle
+/// observer: idle until the next timed wait of a pool job is due, or with nothing to run.
+pub(crate) fn idle(sched: &Scheduler, began: bool) {
+    let due = sched.root().deadline.load(Ordering::Acquire);
     let reason = if due == u64::MAX { IdleReason::Nothing } else { IdleReason::Until(due) };
     idled(core(), reason, began);
 }
 
 /// `job` as the observer numbers it: its generation << 32 | its slot, one job of the process's
-/// life, as its switches name it. Takes the scheduler's lock: for a profiler naming a job it
-/// does not run (a wait's owner), not for every switch.
+/// life, as its switches name it. Takes no lock.
 pub fn observed(job: JobId) -> u64 {
-    global().world.observed(job)
+    u64::from(ids::generation(job)) << 32 | u64::from(job.0)
 }
 
 /// A pool worker's fibers: the jobs it takes run on them.
 pub(crate) struct Host<'a> {
+    /// The pool's scheduler.
+    sched: &'a Scheduler,
     member: u32,
     idle: Vec<Fiber>,
     #[allow(clippy::vec_box, reason = "each record is given to the scheduler as a token by `Box::into_raw`")]
@@ -415,10 +491,11 @@ pub(crate) struct Host<'a> {
 }
 
 impl<'a> Host<'a> {
-    /// The host of worker `core` of the pool of `member`; `parked` counts the pool's parked
-    /// jobs, `ended` the jobs that ended on this worker and `inside` says whether it runs one
-    /// now; all live as long as the pool's workers do.
+    /// The host of worker `core` of the pool of `member`, of scheduler `sched`; `parked` counts
+    /// the pool's parked jobs, `ended` the jobs that ended on this worker and `inside` says
+    /// whether it runs one now; all live as long as the pool's workers do.
     pub(crate) fn new(
+        sched: &'a Scheduler,
         member: u32,
         core: u32,
         parked: &'a crate::sync::atomic::AtomicUsize,
@@ -427,7 +504,7 @@ impl<'a> Host<'a> {
     ) -> Host<'a> {
         CORE.set(core);
         // alloc: the worker's own, once
-        Host { member, idle: Vec::with_capacity(IDLE), spare: Vec::with_capacity(SPARE), parked, ended, inside }
+        Host { sched, member, idle: Vec::with_capacity(IDLE), spare: Vec::with_capacity(SPARE), parked, ended, inside }
     }
 
     /// Runs `job` (one the pool was given, or a parked one given back) on a fiber until it ends
@@ -449,9 +526,7 @@ impl<'a> Host<'a> {
             self.parked.fetch_sub(1, crate::sync::atomic::Ordering::AcqRel);
             let fiber = record.fiber.take().expect("a parked record holds its fiber");
             let answer = come_on(&mut worker, Some(&mut record.taken), record.failed.take());
-            if observing() {
-                switched(&global().world, SwitchEvent::Resumed, record.job, fiber.1, core());
-            }
+            switched(SwitchEvent::Resumed, record.job, fiber.1, core());
             if self.spare.len() < SPARE {
                 self.spare.push(record);
             }
@@ -461,7 +536,7 @@ impl<'a> Host<'a> {
             Some(fiber) => fiber,
             None => {
                 let _making = DriverSpan::open(Driving::Switch);
-                new_fiber(self.member)
+                new_fiber(self.sched, self.member)
             }
         };
         let stray = match come_on(&mut worker, None, None) {
@@ -498,22 +573,24 @@ impl<'a> Host<'a> {
                     return panicked.or(stray).or(left);
                 }
                 Out::Wait(job, on) => {
-                    let mut g = global();
+                    // What the job waits for may be another scheduler's: they join first.
+                    let mut g = lock_joined(self.sched.cell(), || wait_cell(on));
                     if matches!(on, Wait::Until(_)) {
                         g.world.advance_own_clock(now());
                     }
                     let suspended = g.world.suspended(self.member, job, on);
                     if matches!(on, Wait::Until(_)) {
-                        DEADLINE.store(g.world.next_own_deadline().unwrap_or(u64::MAX), Ordering::Release);
+                        let next = g.world.next_own_deadline().unwrap_or(u64::MAX);
+                        g.cell().deadline.store(next, Ordering::Release);
                         if !matches!(suspended, Ok(Suspend::Waiting)) {
-                            dispatch_global(&mut g, None);
+                            dispatch(&mut g, None);
                         }
                     }
                     input = match suspended {
                         Ok(Suspend::Ready) => In::Go(Answer::Ready),
                         Err(cycle) => In::Go(Answer::Cycle(cycle)),
                         Ok(Suspend::Waiting) => {
-                            switched(&g.world, SwitchEvent::Parked(Some(on)), job, fiber.1, core());
+                            switched(SwitchEvent::Parked(Some(on)), job, fiber.1, core());
                             // alloc: a record once per job parked at once, then kept in `spare`
                             let mut record = self.spare.pop().unwrap_or_else(|| {
                                 Box::new(Parked {
@@ -534,7 +611,7 @@ impl<'a> Host<'a> {
                             self.parked.fetch_add(1, crate::sync::atomic::Ordering::AcqRel);
                             let token = Box::into_raw(record).expose_provenance();
                             g.world.set_token(job, token);
-                            dispatch_global(&mut g, None);
+                            dispatch(&mut g, None);
                             return stray;
                         }
                     };
@@ -560,16 +637,17 @@ fn exit(mut fiber: Fiber) {
     }
 }
 
-fn new_fiber(member: u32) -> Fiber {
+fn new_fiber(sched: &Scheduler, member: u32) -> Fiber {
     let stack = Stack::new(FIBER_STACK).unwrap_or_else(|why| panic!("a pool fiber's stack of {FIBER_STACK} bytes: {why}"));
     let limit = stack.limit();
     let number = super::fiber::next_fiber();
-    Fiber(Stackful::new(stack, number, move |yielder, first| body(member, number, limit, yielder, first)), number)
+    let sched = sched.clone(); // clone: a reference count, held by the fiber for its life
+    Fiber(Stackful::new(stack, number, move |yielder, first| body(&sched, member, number, limit, yielder, first)), number)
 }
 
 /// A fiber's life: run each job it is started with, end it in the graph if it joined, report
 /// its end, and wait for the next. `limit` is the lowest usable address of its stack.
-fn body(member: u32, fiber: u32, limit: usize, yielder: &Yielder<In, Out>, first: In) {
+fn body(sched: &Scheduler, member: u32, fiber: u32, limit: usize, yielder: &Yielder<In, Out>, first: In) {
     let mut next = first;
     loop {
         let job = match next {
@@ -577,7 +655,7 @@ fn body(member: u32, fiber: u32, limit: usize, yielder: &Yielder<In, Out>, first
             In::Exit => return,
             In::Go(_) => unreachable!("an idle fiber is only started or ended"),
         };
-        let cx = HostCx { yielder, member, fiber, job: Cell::new(UNREGISTERED), counter: Cell::new(None) };
+        let cx = HostCx { yielder, sched, member, fiber, job: Cell::new(UNREGISTERED), counter: Cell::new(None) };
         enter(&cx);
         stdx::set_fiber_stack_limit(limit);
         // Each job is a reclamation boundary: a value a shared table retires is freed once
@@ -594,13 +672,13 @@ fn body(member: u32, fiber: u32, limit: usize, yielder: &Yielder<In, Out>, first
         take_scope();
         let joined = cx.job.get();
         if joined != UNREGISTERED {
-            let mut g = global();
-            switched(&g.world, SwitchEvent::Ended, joined, fiber, core());
+            let mut g = sched.lock();
+            switched(SwitchEvent::Ended, joined, fiber, core());
             if ran.is_err() {
                 g.world.close_scopes(joined);
             }
             g.world.done(member, joined);
-            dispatch_global(&mut g, None);
+            dispatch(&mut g, None);
         } else {
             switched_unregistered(SwitchEvent::Ran, fiber, core());
         }
@@ -612,6 +690,8 @@ fn body(member: u32, fiber: u32, limit: usize, yielder: &Yielder<In, Out>, first
 /// A pool job's handle on the scheduler, on its fiber's stack.
 struct HostCx<'a> {
     yielder: &'a Yielder<In, Out>,
+    /// The pool's scheduler.
+    sched: &'a Scheduler,
     member: u32,
     fiber: u32,
     /// Its world id once it joined the graph.
@@ -627,9 +707,11 @@ impl HostCx<'_> {
             return job;
         }
         let job = {
-            let mut g = global();
-            let job = g.world.add_own(self.member, 0, self.counter.get());
-            switched(&g.world, SwitchEvent::Started, job, self.fiber, core());
+            // The scope it counts towards may be another scheduler's: they join first.
+            let counter = self.counter.get();
+            let mut g = lock_joined(self.sched.cell(), || counter.map(counter_cell));
+            let job = g.world.add_own(self.member, 0, counter);
+            switched(SwitchEvent::Started, job, self.fiber, core());
             job
         };
         self.job.set(job);
@@ -642,6 +724,7 @@ impl HostCx<'_> {
 fn enter(cx: &HostCx<'_>) {
     HERE.set(Some(Here {
         cx: ptr::from_ref(cx).cast(),
+        sched: ptr::from_ref(cx.sched),
         job: cx.job.get(),
         register: register_thunk,
         wait: wait_thunk,
@@ -680,7 +763,7 @@ unsafe fn wait_thunk(cx: *const (), on: Wait) -> Result<(), Cycle> {
     enter(cx);
     match back {
         In::Go(Answer::Ready) => {
-            fail_if_stalled(job);
+            fail_if_stalled(cx.sched, job);
             Ok(())
         }
         In::Go(Answer::Cycle(cycle)) => Err(cycle),
@@ -695,15 +778,26 @@ unsafe fn relocate_thunk(_: *const ()) {}
 #[allow(unsafe_code)]
 unsafe fn claim_thunk(cx: *const (), key: Key) -> bool {
     // SAFETY: as in `register_thunk`.
-    let job = unsafe { host_cx(cx) }.register();
-    global().world.claim(key, Some(job))
+    let cx = unsafe { host_cx(cx) };
+    let job = cx.register();
+    cx.sched.lock().claim(key, Some(job))
 }
 
 #[allow(unsafe_code)]
 unsafe fn key_done_thunk(_: *const (), key: Key) {
-    let mut g = global();
+    end_flight(key);
+}
+
+/// `key`'s flight ended: its waiters wake, in whichever scheduler has it.
+///
+/// # Panics
+///
+/// Where no scheduler has a flight of `key`.
+fn end_flight(key: Key) {
+    let cell = key_cell(key).unwrap_or_else(|| panic!("key {key:?} done with no flight in any scheduler"));
+    let mut g = lock(&cell);
     g.world.key_done(key);
-    dispatch_global(&mut g, None);
+    dispatch(&mut g, None);
 }
 
 #[allow(unsafe_code)]
@@ -712,13 +806,17 @@ unsafe fn count_thunk(cx: *const (), counter: CounterId) {
     let cx = unsafe { host_cx(cx) };
     match cx.job.get() {
         UNREGISTERED => cx.counter.set(Some(counter)),
-        job => global().world.count_towards(job, counter),
+        // The scope may be another scheduler's: they join first.
+        job => lock_joined(cx.sched.cell(), || Some(counter_cell(counter))).world.count_towards(job, counter),
     }
 }
 
-/// A thread on no fiber, as a job of the clients' member: in the graph from its first claim or
-/// wait to its end.
+/// A thread on no fiber, as the one job of a member of its own, in a scheduler of its own until
+/// its waits join it with another's: in the graph from its first claim or wait to its end.
 struct Client {
+    sched: OnceCell<Scheduler>,
+    /// Its member, once it joined.
+    member: Cell<u32>,
     job: Cell<JobId>,
     woken: AtomicBool,
     thread: Thread,
@@ -728,27 +826,24 @@ impl Drop for Client {
     fn drop(&mut self) {
         let job = self.job.get();
         if job != UNREGISTERED {
-            let mut g = global();
-            let member = clients(&mut g);
+            let member = self.member.get();
+            let mut g = self.sched().lock();
             g.world.done(member, job);
-            dispatch_global(&mut g, None);
+            g.world.leave_own(member);
+            g.own.retain(|it| it.0 != member);
+            dispatch(&mut g, None);
         }
     }
 }
 
 thread_local! {
-    static CLIENT: Client = Client { job: Cell::new(UNREGISTERED), woken: AtomicBool::new(false), thread: thread::current() };
-}
-
-/// The clients' member, joined at the first client's claim or wait.
-fn clients(g: &mut Global) -> u32 {
-    if let Some(member) = g.clients {
-        return member;
-    }
-    let member = g.world.join_own();
-    set_own(g, member, OwnIo { wake: wake_client, ctx: 0, idle: None });
-    g.clients = Some(member);
-    member
+    static CLIENT: Client = Client {
+        sched: OnceCell::new(),
+        member: Cell::new(super::NONE),
+        job: Cell::new(UNREGISTERED),
+        woken: AtomicBool::new(false),
+        thread: thread::current(),
+    };
 }
 
 /// A client's wait ended: `token` is its [`Client`]'s address, which lives until its thread
@@ -763,11 +858,19 @@ fn wake_client(_: usize, token: usize) {
 }
 
 impl Client {
-    fn register(&self, g: &mut Global, member: u32) -> JobId {
+    fn sched(&self) -> &Scheduler {
+        self.sched.get_or_init(|| Scheduler::new(1))
+    }
+
+    /// Its job, which joins the graph of `g` (its scheduler, locked) if it has not.
+    fn register(&self, g: &mut Domain) -> JobId {
         let job = self.job.get();
         if job != UNREGISTERED {
             return job;
         }
+        let member = g.world.join_own(true);
+        g.own.push((member, OwnIo { wake: wake_client, ctx: 0, idle: None }));
+        self.member.set(member);
         let job = g.world.add_own(member, ptr::from_ref(self).expose_provenance(), None);
         self.job.set(job);
         job
@@ -781,9 +884,8 @@ fn client_job() -> JobId {
         if job != UNREGISTERED {
             return job;
         }
-        let mut g = global();
-        let member = clients(&mut g);
-        client.register(&mut g, member)
+        let mut g = client.sched().lock();
+        client.register(&mut g)
     })
 }
 
@@ -792,18 +894,18 @@ fn client_wait(on: Wait) -> Result<(), Cycle> {
     assert!(!matches!(on, Wait::Job(_) | Wait::Until(_)), "a thread on no fiber waits for a key or a counter");
     CLIENT.with(|client| {
         let job = {
-            let mut g = global();
-            let member = clients(&mut g);
-            let job = client.register(&mut g, member);
+            // What it waits for may be another scheduler's: they join first.
+            let mut g = lock_joined(client.sched().cell(), || wait_cell(on));
+            let job = client.register(&mut g);
             client.woken.store(false, Ordering::Relaxed);
-            if g.world.suspended(member, job, on)? == Suspend::Ready {
+            if g.world.suspended(client.member.get(), job, on)? == Suspend::Ready {
                 return Ok(());
             }
             job
         };
         // The thread runs the jobs of the pools it drives meanwhile, else parks.
         crate::pool::block_until(&|| client.woken.load(Ordering::Acquire));
-        fail_if_stalled(job);
+        fail_if_stalled(client.sched(), job);
         Ok(())
     })
 }
@@ -836,7 +938,7 @@ pub fn wait(on: Wait) -> Result<(), Cycle> {
 pub(crate) fn gave_way_on(asked: Key, named: Box<str>, flight: Key, cycle: &Cycle) {
     let Some(&job) = cycle.jobs.first() else { return };
     let to = cycle.jobs.get(1).copied().unwrap_or(job);
-    global().world.gave_way(job, asked, named, flight, to);
+    lock(&live_job_cell(job)).world.gave_way(job, asked, named, flight, to);
     set_retry(true);
 }
 
@@ -851,7 +953,7 @@ pub(crate) fn set_give_way_aside() {
         return;
     }
     let job = job_here();
-    global().world.set_give_way_aside(job);
+    lock(&live_job_cell(job)).world.set_give_way_aside(job);
 }
 
 /// Before this thread's job claims a run ([`crate::pump::Flights::get_or_run`]): if it gave
@@ -869,12 +971,13 @@ pub(crate) fn before_claim() -> Result<(), super::NoProgress> {
     }
     let job = job_here();
     // alloc: a retry after a give-way, rare: the record, kept across the wait unlocked
-    let Some(gave_way) = global().world.give_way_of(job).cloned() else { return Ok(()) };
+    let Some(gave_way) = lock(&live_job_cell(job)).world.give_way_of(job).cloned() else { return Ok(()) };
     let waiting =
         crate::pump::Waiting::begin(crate::wait::WaitKind::Key, &mut |it| gave_way.name_wait(it), || Some(gave_way.owner));
     let waited = wait(Wait::Key(gave_way.flight));
     drop(waiting);
-    let mut g = global();
+    let cell = live_job_cell(job);
+    let mut g = lock(&cell);
     match waited {
         Ok(()) => {
             g.world.forget_give_way(job);
@@ -914,7 +1017,7 @@ pub fn claim(key: Key) -> bool {
         Some(here) => unsafe { (here.claim)(here.cx, key) },
         None => {
             let job = client_job();
-            global().world.claim(key, Some(job))
+            lock(&live_job_cell(job)).claim(key, Some(job))
         }
     }
 }
@@ -923,15 +1026,19 @@ pub fn claim(key: Key) -> bool {
 /// for as it first waits for it), begun inside `scope`, its innermost then
 /// ([`innermost_scope`]): `false` when the key has a flight already.
 pub fn claim_for(key: Key, job: JobId, scope: Option<CounterId>) -> bool {
-    global().world.claim_for(key, job, scope)
+    lock(&live_job_cell(job)).claim_for(key, job, scope)
 }
 
 /// A one-shot event in the wait graph: a key claimed by no job, which jobs wait on (a job on a
 /// fiber switches out; a thread on no fiber parks) and any thread fires, a driver's, an IO
 /// thread or one of no pool. A wait after the fire ends at once. Dropped unfired, it fires: a
 /// wake says only that the event is over, so a waiter looks again at what it waits for. A wait
-/// on it is never a stall: no job holds it, so the graph cannot tell it will not come.
-pub struct Event(Key);
+/// on it is never a stall: no job holds it, so the graph cannot tell it will not come. It has a
+/// scheduler of its own, which joins each waiter's.
+pub struct Event {
+    key: Key,
+    sched: Scheduler,
+}
 
 /// What waits on an [`Event`]: as many as want one, from any thread.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -946,12 +1053,13 @@ impl Event {
         key[..8].copy_from_slice(&EVENTS.fetch_add(1, crate::sync::atomic::Ordering::Relaxed).to_le_bytes());
         key[8..].copy_from_slice(b"an event, of sched::host");
         let key = Key(key);
-        assert!(global().world.claim(key, None), "event key {key:?} is new");
-        Event(key)
+        let sched = Scheduler::new(1);
+        assert!(sched.lock().claim(key, None), "event key {key:?} is new");
+        Event { key, sched }
     }
 
     pub fn waiter(&self) -> EventWait {
-        EventWait(self.0)
+        EventWait(self.key)
     }
 
     /// Ends every wait on it, now and after.
@@ -962,9 +1070,9 @@ impl Event {
 
 impl Drop for Event {
     fn drop(&mut self) {
-        let mut g = global();
-        g.world.key_done(self.0);
-        dispatch_global(&mut g, None);
+        let mut g = self.sched.lock();
+        g.world.key_done(self.key);
+        dispatch(&mut g, None);
     }
 }
 
@@ -986,11 +1094,7 @@ pub fn key_done(key: Key) {
     match HERE.get() {
         // SAFETY: as in `wait`.
         Some(here) => unsafe { (here.key_done)(here.cx, key) },
-        None => {
-            let mut g = global();
-            g.world.key_done(key);
-            dispatch_global(&mut g, None);
-        }
+        None => end_flight(key),
     }
 }
 
@@ -1000,22 +1104,34 @@ pub fn key_done(key: Key) {
 /// that waits for what this job makes gives way, as one whose wait closes the cycle.
 pub fn open_scope() -> CounterId {
     let job = job_here();
-    let counter = global().world.open_scope(job);
+    let counter = lock(&live_job_cell(job)).world.open_scope(job);
+    with_scope(|it| it.set(counter.0));
+    counter
+}
+
+/// [`open_scope`] for jobs of the pool of scheduler `pool`: the scope's job's scheduler joins
+/// the pool's, so a wait on the scope sees the pool's jobs, idle or not, before they join the
+/// graph.
+pub(crate) fn open_scope_on(pool: &Scheduler) -> CounterId {
+    let job = job_here();
+    let cell = live_job_cell(job);
+    let counter = lock_joined(&cell, || Some(Arc::clone(pool.cell()))).world.open_scope(job); // clone: a reference count
     with_scope(|it| it.set(counter.0));
     counter
 }
 
 /// The last job of the scope of `counter` ended.
 pub fn release(counter: CounterId) {
-    let mut g = global();
+    let cell = counter_cell(counter);
+    let mut g = lock(&cell);
     g.world.release(counter);
-    dispatch_global(&mut g, None);
+    dispatch(&mut g, None);
 }
 
 /// This thread's job's innermost scope, of `counter`, is over: its wait on it ended.
 pub fn close_scope(counter: CounterId) {
     let job = job_here();
-    let outer = global().world.close_scope(job, counter);
+    let outer = lock(&live_job_cell(job)).world.close_scope(job, counter);
     with_scope(|it| it.set(outer.map_or(super::NONE, |it| it.0)));
 }
 

@@ -100,14 +100,14 @@ impl BuiltinDeriveExpander {
         } else {
             self.expander()(db, frame, span, tt)
         };
-        let expanded = expanded.map(|it| with_automatically_derived(frame, span, it));
+        let expanded = expanded.map(|it| with_automatically_derived(frame, span, &it));
         // rustc's `CoercePointee` writes its impls itself, with only `#[automatically_derived]`.
         let expanded = match self {
             BuiltinDeriveExpander::CoercePointee => expanded,
             _ => expanded.map(|it| with_item_attrs(frame, tt, it)),
         };
         if from_derive_const(db, id) {
-            expanded.map(|it| as_const_impls(frame, it))
+            expanded.map(|it| as_const_impls(frame, &it))
         } else {
             expanded
         }
@@ -126,7 +126,7 @@ fn from_derive_const(db: &Db, id: MacroCallId) -> bool {
 /// `impl ..` items of a derive's expansion as `const impl ..`.
 fn as_const_impls<'f>(
     frame: &'f Frame,
-    expanded: tt::TopSubtree<&'f Frame>,
+    expanded: &tt::TopSubtree<&'f Frame>,
 ) -> tt::TopSubtree<&'f Frame> {
     let mut builder = tt::TopSubtreeBuilder::new(expanded.top_subtree().delimiter);
     let mut items = expanded.token_trees().iter();
@@ -245,7 +245,7 @@ fn starts_an_impl(mut items: tt::TtIter<'_>) -> bool {
 fn with_automatically_derived<'f>(
     frame: &'f Frame,
     span: Span,
-    expanded: tt::TopSubtree<&'f Frame>,
+    expanded: &tt::TopSubtree<&'f Frame>,
 ) -> tt::TopSubtree<&'f Frame> {
     let is_impl = |element: Option<tt::TtElement<'_>>| {
         matches!(element, Some(tt::TtElement::Leaf(tt::Leaf::Ident(it))) if it.sym == sym::kw_impl)

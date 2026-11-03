@@ -6,7 +6,7 @@ use hir_expand::fixture;
 
 use crate::{builtin_derive::impl_trait, next_solver::DbInterner};
 
-fn check_trait_refs(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: Expect) {
+fn check_trait_refs(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: &Expect) {
     let db = fixture::db(ra_fixture).into_db();
     let def_map = crate_def_map(&db, fixture::test_crate(&db));
 
@@ -24,7 +24,7 @@ fn check_trait_refs(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation
     });
 }
 
-fn check_predicates(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: Expect) {
+fn check_predicates(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: &Expect) {
     let db = fixture::db(ra_fixture).into_db();
     let def_map = crate_def_map(&db, fixture::test_crate(&db));
 
@@ -60,7 +60,7 @@ trait Trait {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct WithGenerics<'a, T: Trait, const N: usize>(&'a [T; N]);
         "#,
-        expect![[r#"
+        &expect![[r#"
                 Simple: Debug
                 Simple: Clone
                 Simple: Copy
@@ -93,7 +93,7 @@ struct Simple<T: ?Sized>(*const T);
 #[derive(CoercePointee)]
 struct MultiGenericParams<'a, T, #[pointee] U: ?Sized, const N: usize>(*const U);
         "#,
-        expect![[r#"
+        &expect![[r#"
                 Simple<#0>: CoerceUnsized<[Simple<#1>]>
                 Simple<#0>: DispatchFromDyn<[Simple<#1>]>
                 MultiGenericParams<#0, #1, #2, #3>: CoerceUnsized<[MultiGenericParams<#0, #1, #4, #3>]>
@@ -111,7 +111,7 @@ use core::marker::Reborrow;
 #[derive(Reborrow)]
 struct Marker<'a, T>(&'a mut T);
         "#,
-        expect![[r#"
+        &expect![[r#"
                 Marker<#0, #1>: Reborrow"#]],
     );
 }
@@ -132,7 +132,7 @@ trait Trait {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct WithGenerics<'a, T: Trait, const N: usize>(&'a [T; N], T::Assoc);
         "#,
-        expect![[r#"
+        &expect![[r#"
 
 
 
@@ -213,7 +213,7 @@ trait Trait {}
 #[derive(Reborrow)]
 struct Marker<'a, T: Trait, const N: usize>(&'a mut [T; N]);
         "#,
-        expect![[r#"
+        &expect![[r#"
                 Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
                 Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
                 Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
@@ -240,7 +240,7 @@ where
     T: Trait<U>,
     U: Trait<U>;
         "#,
-        expect![[r#"
+        &expect![[r#"
             Clause(Binder { value: TraitClause(#0: MetaSized, polarity:Positive), bound_vars: [] })
             Clause(Binder { value: TraitClause(#1: MetaSized, polarity:Positive), bound_vars: [] })
             Clause(Binder { value: TraitClause(#0: Unsize<[#1]>, polarity:Positive), bound_vars: [] })

@@ -143,6 +143,39 @@ impl Errno {
     pub const SPIPE: Errno = Errno(70);
     pub const XDEV: Errno = Errno(75);
     pub const NOTCAPABLE: Errno = Errno(76);
+
+    /// Its POSIX name (`ENOENT`), for those above; wasi-libc's `errno` is WASI's number.
+    pub fn name(self) -> Option<&'static str> {
+        Some(match self {
+            Errno::ACCES => "EACCES",
+            Errno::BADF => "EBADF",
+            Errno::EXIST => "EEXIST",
+            Errno::FAULT => "EFAULT",
+            Errno::FBIG => "EFBIG",
+            Errno::INTR => "EINTR",
+            Errno::INVAL => "EINVAL",
+            Errno::IO => "EIO",
+            Errno::ISDIR => "EISDIR",
+            Errno::LOOP => "ELOOP",
+            Errno::MFILE => "EMFILE",
+            Errno::NAMETOOLONG => "ENAMETOOLONG",
+            Errno::NOENT => "ENOENT",
+            Errno::NOMEM => "ENOMEM",
+            Errno::NOSPC => "ENOSPC",
+            Errno::NOTDIR => "ENOTDIR",
+            Errno::NOTEMPTY => "ENOTEMPTY",
+            Errno::NOTSUP => "ENOTSUP",
+            Errno::OVERFLOW => "EOVERFLOW",
+            Errno::PERM => "EPERM",
+            Errno::PIPE => "EPIPE",
+            Errno::RANGE => "ERANGE",
+            Errno::ROFS => "EROFS",
+            Errno::SPIPE => "ESPIPE",
+            Errno::XDEV => "EXDEV",
+            Errno::NOTCAPABLE => "ENOTCAPABLE",
+            _ => return None,
+        })
+    }
 }
 
 /// WASI's `filetype`.

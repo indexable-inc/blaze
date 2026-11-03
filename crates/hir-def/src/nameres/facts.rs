@@ -1,11 +1,14 @@
 //! Name resolution per module, with facts (`docs/v2/plan/lanes/frontend/nameres.md`).
 //!
-//! The old collector's rules, on a schedule that memoizes per module: each module's round-0
+//! rust-analyzer's `DefCollector` rules, on a schedule that memoizes per module: each module's round-0
 //! declarations are a query (`module_decls`) whose value is an op log; each expansion round
 //! resolves imports per strongly connected component of the round's import graph
 //! (`scc_state`), reading other components only through per-name facts (`ModuleScope::name`);
 //! macro resolution is per module and round (`macro_step`); the crate's `DefMap` is assembled
 //! from the final round's `ModuleScope` handles.
+//!
+//! "The old `X`" in this module's comments names the part of that `DefCollector`
+//! (`nameres/collector.rs`, deleted 2026-11-03) whose rule `X`'s replacement keeps.
 
 // The round schedule (`driver`, `graph`, the round queries) is the differential reference of
 // the name resolution maintainer (`nameres::delta`), which reuses the rules through `collect`,

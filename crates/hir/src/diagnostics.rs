@@ -939,6 +939,8 @@ pub struct UnresolvedPath {
 pub struct PrivateField {
     pub expr: InFile<ExprOrPatPtr>,
     pub field: Field,
+    /// For an `offset_of!`'s field, its position among the fields the call names.
+    pub at: Option<u32>,
 }
 
 pub use hir_ty_unsafeck::{UnsafeLint, UnsafetyReason};
@@ -1164,6 +1166,11 @@ pub enum ObligationCauseCode {
     IfExpressionWithNoElse,
     /// A `return` without a value returns `()`, which must agree with the return type.
     ReturnNoExpression,
+    /// A bound of the `impl_trait`th `impl Trait` of `trait_method`'s return type, which a
+    /// trait impl's type for it must satisfy: rustc's "required by a bound in
+    /// `Trait::method::{anon_assoc#0}`" (`WhereClause` of the trait's RPITIT item). `bound`, the
+    /// bound's syntax, or the `impl Trait`'s.
+    ImplTraitInTraitBound { trait_method: Function, impl_trait: u32, bound: Option<InFile<SyntaxNodePtr>> },
 }
 
 impl From<hir_ty::next_solver::infer::traits::ObligationCauseCode> for ObligationCauseCode {
@@ -1938,6 +1945,58 @@ fn opaque_syntax(db: &Db, function: FunctionId, index: u32) -> Option<InFile<Syn
     Some(ty.map(|it| it.syntax_node_ptr()))
 }
 
+/// The bound of `function`'s `index`th return `impl Trait` (counted as [`opaque_syntax`]
+/// counts) whose trait is `trait_`, as rustc's "required by this bound" points at it: its
+/// trait path. The `impl Trait` whole when no bound of it names `trait_` (a bound through a
+/// trait alias, or an `async fn`'s future).
+fn opaque_bound_syntax(
+    db: &Db,
+    function: FunctionId,
+    index: u32,
+    trait_: hir_def::TraitId,
+) -> Option<InFile<SyntaxNodePtr>> {
+    use hir_def::{
+        expr_store::StoreVisitor,
+        hir::type_ref::{TypeBound, TypeRef, TypeRefId},
+        resolver::{HasResolver as _, TypeNs},
+    };
+    struct Find<'a> {
+        store: &'a ExpressionStore,
+        found: Vec<TypeRefId>,
+    }
+    impl StoreVisitor for Find<'_> {
+        fn on_type(&mut self, ty: TypeRefId) {
+            if let TypeRef::ImplTrait(_) = self.store.type_ref(ty) {
+                self.found.push(ty);
+            }
+            let store = self.store;
+            store.visit_type_ref_children(ty, self);
+        }
+    }
+    let (signature, source_map) = FunctionSignature::with_source_map(db, function);
+    // alloc: error path, the site of a reported error
+    let mut find = Find { store: &signature.store, found: Vec::new() };
+    if let Some(ret_type) = signature.ret_type {
+        find.on_type(ret_type);
+    }
+    let store = &signature.store;
+    let opaque = *find.found.get(index as usize)?;
+    let TypeRef::ImplTrait(bounds) = store.type_ref(opaque) else { return None };
+    let resolver = function.resolver(db);
+    let named = bounds.iter().find_map(|bound| {
+        let (TypeBound::Path(path, _) | TypeBound::ForLifetime(_, path)) = bound else {
+            return None;
+        };
+        let resolved = resolver.resolve_path_in_type_ns_fully(db, store.path(*path))?;
+        let TypeNs::TraitId(it) = resolved else { return None };
+        (it == trait_).then(|| source_map.type_syntax(path.type_ref()).ok()).flatten()
+    });
+    match named {
+        Some(ty) => Some(ty.map(|it| it.syntax_node_ptr())),
+        None => opaque_syntax(db, function, index),
+    }
+}
+
 #[derive(Debug)]
 pub struct ClosureKindMismatch {
     pub span: SpanSyntax,
@@ -2495,7 +2554,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             DiagnosticsCollector { db, krate, edition, style_lints: false, acc, bodies, deferred: None };
         let body = Body::of(db, def);
         if !Body::unmoved_source_map(db, def).diagnostics().is_empty() || store_macro_failed(db, body) {
-            this.collect_store_diagnostics(&Body::with_source_map(db, def).1);
+            this.collect_store_diagnostics(Body::source_map(db, def));
         }
         for (_, block_def_map) in body.blocks(db) {
             for (module, _) in block_def_map.modules(db) {
@@ -2631,6 +2690,11 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             return;
         }
         self.collect_wfcheck(def.into());
+        for &(_, item) in &impl_items.0.items {
+            if let AssocItemId::FunctionId(function) = item {
+                self.collect_impl_trait_in_trait_bounds(function);
+            }
+        }
 
         let ast_id_map = file_id.ast_id_map(self.db);
 
@@ -2732,12 +2796,18 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 AssocItemId::TypeAliasId(it) => TypeAliasSignature::of(self.db, it).ty.is_none(),
             });
             impl_assoc_items_scratch.extend(impl_items.0.items.iter().cloned());
+            // Whether the impl's item implements the trait's: the same kind, and
+            // `def_site::implements` (rustc's `check_trait_item`, hygienic).
+            let implements = |impl_name: Name, impl_item: AssocItemId, name: Name, id: AssocItemId| {
+                discriminant(&impl_item) == discriminant(&id)
+                    && hir_def::nameres::implements(self.db, trait_, impl_item, impl_name, id, name)
+            };
 
             let redundant = impl_assoc_items_scratch
                 .iter()
-                .filter(|(name, id)| {
-                    !trait_items.iter().any(|(impl_name, impl_item)| {
-                        discriminant(impl_item) == discriminant(id) && impl_name == name
+                .filter(|&&(name, id)| {
+                    !trait_items.iter().any(|&(trait_name, trait_item)| {
+                        implements(name, id, trait_name, trait_item)
                     })
                 })
                 .map(|(name, item)| (*name, AssocItem::from(*item)));
@@ -2754,8 +2824,8 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             }
 
             let implemented_here = |name: &Name, id: &AssocItemId| {
-                impl_assoc_items_scratch.iter().any(|(impl_name, impl_item)| {
-                    discriminant(impl_item) == discriminant(id) && impl_name == name
+                impl_assoc_items_scratch.iter().any(|&(impl_name, impl_item)| {
+                    implements(impl_name, impl_item, *name, *id)
                 })
             };
             let mut missing: Vec<_> = required_items
@@ -2852,7 +2922,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             if !missing.is_empty() {
                 if hir_ty::specialization_mode(self.db, self.krate).may_specialize() {
                     missing.retain(|(assoc_name, assoc_item)| {
-                        let AssocItem::Function(_) = assoc_item else {
+                        let AssocItem::Function(Function { id: AnyFunctionId::FunctionId(trait_fn), .. }) =
+                            *assoc_item
+                        else {
                             return true;
                         };
 
@@ -2863,15 +2935,15 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                                 continue;
                             }
 
-                            for (name, item) in &impl_.impl_items(self.db).items {
+                            for &(name, item) in &impl_.impl_items(self.db).items {
                                 let AssocItemId::FunctionId(fn_) = item else {
                                     continue;
                                 };
-                                if name != assoc_name {
+                                if !implements(name, item, *assoc_name, trait_fn.into()) {
                                     continue;
                                 }
 
-                                if FunctionSignature::of(self.db, *fn_).is_default() {
+                                if FunctionSignature::of(self.db, fn_).is_default() {
                                     return false;
                                 }
                             }
@@ -3769,6 +3841,94 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         }
     }
 
+    /// rustc's E0277 and E0271 of `collect_return_position_impl_trait_in_trait_tys`: each bound
+    /// of the trait method's `impl Trait`s that a trait impl's method's types for them do not
+    /// satisfy, at the impl method's return type (its body where it writes none), required by
+    /// that bound in the trait. The rest of its errors are the impl's items' comparison's.
+    fn collect_impl_trait_in_trait_bounds(&mut self, function: FunctionId) {
+        let db = self.db;
+        let Some(crate::ImplTraitInTraitError::Unsatisfied { trait_method, bounds }) =
+            crate::Function::from(function).impl_trait_in_trait_error(db)
+        else {
+            return;
+        };
+        let at = output_syntax(db, function).or_else(|| {
+            let source = hir_def::src::HasSource::source_view(function.lookup(db), db);
+            Some(source.with_value(view::ptr(source.value.body()?.syntax())))
+        });
+        let Some(span) = at.and_then(|at| {
+            Some(InFile::new(at.file_id, AstPtr::<SpanAst>::try_from_raw(at.value)?))
+        }) else {
+            return;
+        };
+        let interner = DbInterner::new_no_crate(db);
+        let trait_fn = hir_def::FunctionId::try_from(trait_method).ok();
+        for (impl_trait, bound) in bounds {
+            let clause = bound.to_next_solver();
+            let trait_of = |trait_: hir_def::TraitId| {
+                trait_fn.and_then(|it| opaque_bound_syntax(db, it, impl_trait, trait_))
+            };
+            let cause = |trait_| ObligationCauseCode::ImplTraitInTraitBound {
+                trait_method,
+                impl_trait,
+                bound: trait_of(trait_),
+            };
+            let diagnostic: AnyDiagnostic<'db> = match clause.kind().skip_binder() {
+                rustc_type_ir::ClauseKind::Trait(trait_predicate) => UnimplementedTrait {
+                    span,
+                    cause: cause(trait_predicate.trait_ref.def_id.0),
+                    trait_predicate: crate::TraitClause::new(
+                        interner,
+                        TypeOwnerId::GenericDefId(function.into()),
+                        trait_predicate,
+                    ),
+                    parent_trait_predicates: Vec::new(), // alloc: empty
+                    parent_impls: Vec::new(),            // alloc: empty
+                    parent_impl_bounds: Vec::new(),      // alloc: empty
+                }
+                .into(),
+                rustc_type_ir::ClauseKind::Projection(projection) => {
+                    let owner = TypeOwnerId::GenericDefId(function.into());
+                    let alias = Type {
+                        owner,
+                        ty: EarlyBinder::bind(
+                            interner,
+                            <hir_ty::next_solver::Ty<'db> as rustc_type_ir::inherent::Ty<_>>::new_alias(
+                                interner,
+                                rustc_type_ir::IsRigid::No,
+                                projection.projection_term.expect_ty(),
+                            ),
+                        ),
+                    };
+                    let term = match projection.term.kind() {
+                        rustc_type_ir::TermKind::Ty(ty) => {
+                            Either::Left(Type { owner, ty: EarlyBinder::bind(interner, ty) })
+                        }
+                        // alloc: error path, a reported goal's constant as rustc prints it
+                        rustc_type_ir::TermKind::Const(ct) => Either::Right(format!("{ct:?}")),
+                    };
+                    let trait_ = projection.trait_def_id(interner).0;
+                    TraitSolverError {
+                        span,
+                        cause: cause(trait_),
+                        kind: TraitSolverErrorKind::ProjectionMismatch {
+                            goal: SolverGoal::Projection { alias: Either::Left(alias), term },
+                            normalized: None,
+                            impl_: None,
+                        },
+                    }
+                    .into()
+                }
+                other => panic!(
+                    "a bound of the `impl Trait`s of `{}` that is neither a trait's nor a \
+                     projection's: {other:?}",
+                    FunctionSignature::of(db, function).name.as_str()
+                ),
+            };
+            self.acc.push(diagnostic);
+        }
+    }
+
     /// rustc's well-formedness errors of an ADT or an impl, reported as the borrow checker's.
     fn collect_wfcheck(&mut self, def: GenericDefId) {
         use hir_ty_wfcheck::Site;
@@ -4119,10 +4279,10 @@ impl<'db> AnyDiagnostic<'db> {
                 let args = CallArgs::new(db, target, args);
                 IncorrectArguments { call_expr: expr_syntax(*call_expr)?, args }.into()
             }
-            &InferenceDiagnostic::PrivateField { expr, field } => {
+            &InferenceDiagnostic::PrivateField { expr, field, at } => {
                 let expr = expr_syntax(expr)?;
                 let field = field.into();
-                PrivateField { expr, field }.into()
+                PrivateField { expr, field, at }.into()
             }
             &InferenceDiagnostic::PrivateAssocItem { id, item } => {
                 let expr_or_pat = expr_or_pat_syntax(id.unpack())?;
@@ -5247,7 +5407,7 @@ impl<'db> Placing<'db> {
     }
 
     fn get(&self) -> &'db hir_def::expr_store::BodySourceMap {
-        self.map.get_or_init(|| &Body::with_source_map(self.db, self.def).1)
+        self.map.get_or_init(|| Body::source_map(self.db, self.def))
     }
 }
 

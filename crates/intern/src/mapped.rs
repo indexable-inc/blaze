@@ -14,7 +14,7 @@ use blaze_format::{Record, SchemaHash};
 use blaze_ids::Hasher;
 use blaze_image::{Builder, Image, SectionId, Stable, bytes_of, cast};
 
-use crate::table::{Jobs, LAYOUT, Live, MAX_ALIGN, ROOT, RestoreError, Shape, Table};
+use crate::table::{Jobs, LAYOUT, Live, MAX_ALIGN, Overlay, ROOT, RestoreError, Shape, Table};
 
 /// The interner of one kind of value: a `static`, its section [`SectionId::interned`]`(tag)`.
 pub struct Mapped<T> {
@@ -80,6 +80,7 @@ impl<T: Record> Mapped<T> {
             align: align_of::<T>(),
             size: size_of::<T>(),
             text: false,
+            overlay: Overlay::Secret,
         }
     }
 

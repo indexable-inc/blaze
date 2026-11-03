@@ -228,21 +228,44 @@ checks nothing. The command that makes the lints' fixes is `blaze check --fix`
 ## Baselines
 
 A lint at `warn` whose findings are being moved off has a baseline,
-`crates/blaze-lints/baselines/<tool>.<lint>.txt`: one `path<TAB>count` line per file with
-findings, sorted. `blaze_lints::baseline::check` takes a run's counts (`baseline::counts` of its
-findings) and names, by lint and file, each count over its baseline and each file the baseline
-does not have; `baseline::bless` lowers the baselines to a run's counts, never raising one or
-adding a file, and is only right for a run over the whole workspace. A file in the directory that
-is not of a clippy or blaze lint blaze knows is an error. A lint whose baseline is empty moves to
-`deny` and its file is deleted.
+`crates/blaze-lints/baselines/<tool>.<lint>.txt`: one `crate<TAB>count` line per package with
+findings, sorted. `blaze_lints::baseline::check` takes a run's counts and names, by lint and
+crate, each count off its baseline either way (over, a crate the baseline does not have, under)
+and each lint with findings and no baseline; `baseline::bless` lowers the baselines to a run's
+counts, never raising one or adding a crate, and deletes one that reaches empty. A file in the
+directory that is not of a clippy or blaze lint blaze knows is an error. A lint whose baseline
+is emptied moves to `deny`.
 
-`blaze check --baselines DIR` (`crates/blaze-cargo/src/cli/baselines.rs`) counts the run's
-`clippy::` and `blaze::` findings by lint and file, a finding that two units of a crate give (its
-lib and its lib test) once, and fails naming each count over the baselines in `DIR` (from the
-checkout's root). `--bless-baselines` lowers them to the run's instead, and `--new-baseline
-LINT[,LINT...]` (given any number of times) starts each `LINT`'s at the run's counts, writing
-none when any is not a lint blaze knows or has a baseline already. Both are only right for a run
-over the whole workspace (`--workspace --all-targets`).
+`blaze check --baselines DIR` (`crates/blaze-cargo/src/cli/baselines.rs`, the one place
+findings are counted) counts the run's `clippy::` and `blaze::` findings by lint and by the
+package of the unit that gave each, a finding that two units of a package give (its lib and its
+lib test) once, and a lint finding with no unit is an error naming it. It fails naming each
+count over the baselines in `DIR` (from the checkout's root) and each lint with findings and no
+baseline; with none over, it fails naming each count under its baseline, which is stale, and
+says to run again with `--bless-baselines`, which lowers them to the run's. A bless while a
+count is over writes nothing. `--new-baseline LINT[,LINT...]` (given any number of times) starts
+each `LINT`'s at the run's counts, writing none when any is not a lint blaze knows, has a
+baseline already, or has no finding. `--baselines` is refused without `--workspace` and one
+`--target`, or with a target selection, since a crate or target the run did not check would
+read as at zero; the directory's `TARGET` file names the target its counts are of, and a run
+for another is refused.
+
+Counts are of one target's cfg: blaze's own are `aarch64-unknown-linux-gnu`'s, over each
+package's default targets (a check of test targets fails in blaze for now, "can't find crate
+for `test`"; the scope grows to `--all-targets` once it passes), and the merge gate's
+`lint-baselines` job (`.github/workflows/blaze.yaml`) checks them with the blaze the change
+builds, so that a change to a lint and to its baseline land together.
+
+None is made yet (2026-11-03): the directory does not exist, and `lint-baselines` fails naming
+each lint with findings and no baseline. blaze cannot finish the whole workspace's check that
+makes them: on the 01:16 tree a run in a 256 GiB arm64 VM panicked after 654 s with "the query
+database's edge array is full (4294967296)" (`crates/blaze-query/src/db/storage.rs:701`) and at
+`crates/hir-ty/src/next_solver/predicate.rs:734`, and 34 crates stopped on `deny` findings
+(`clippy::needless_pass_by_value`, blaze's rust#25860 refusal, `blaze::pure`), so the crates
+that use them were not checked. Once a run finishes, the first baselines are made with
+`blaze check --workspace --target aarch64-unknown-linux-gnu --baselines
+crates/blaze-lints/baselines --new-baseline LINT,...`, naming each lint the run without it
+lists.
 
 ## `blaze check` lints
 

@@ -186,6 +186,9 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             if let Some(why) = &status.history {
                 put!(out, "{}: the profile history: {why}\n", paint(RED, "error"));
             }
+            for bug in &status.bugs {
+                put!(out, "{}: {bug}\n", paint(RED, "error"));
+            }
         }
         Response::Done { ok: true } => {}
         Response::Done { ok: false } => put!(out, "{}\n", paint(RED, "failed")),
@@ -518,7 +521,7 @@ pub fn unchecked_lines(out: &mut String, unchecked: &Unchecked, color: bool) {
         match unchecked.stopped {
             true => put!(
                 out,
-                "{note}: {skipped} unit{} not checked: the build stopped at its first failure (--keep-going checks what does not depend on it)\n",
+                "{note}: {skipped} unit{} not checked: the build stopped at its first failure (--fail-fast; without it what does not depend on it is checked)\n",
                 plural(skipped)
             ),
             false => put!(out, "{note}: {skipped} unit{} not checked, behind what failed:\n", plural(skipped)),
@@ -579,6 +582,16 @@ pub fn unchecked_json(unchecked: &Unchecked) -> String {
         quoted(&mut out, &it.unit);
         out.push_str(", \"checked\": ");
         quoted_list(&mut out, &it.checked);
+        out.push('}');
+    }
+    out.push_str("], \"tests\": [");
+    for (at, it) in unchecked.tests.iter().enumerate() {
+        out.push_str(if at == 0 { "{\"unit\": " } else { ", {\"unit\": " });
+        quoted(&mut out, &it.unit);
+        out.push_str(", \"behind\": ");
+        quoted(&mut out, &it.behind);
+        out.push_str(", \"why\": ");
+        quoted(&mut out, &it.why);
         out.push('}');
     }
     out.push_str("]}\n");

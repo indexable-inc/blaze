@@ -454,10 +454,11 @@ pub fn source_file_range(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option
 }
 
 /// File, line and column of a place in a body, as rustc reports them, found from where the
-/// body is in its file: the code generator also finds them from the body alone.
-#[blaze_query::tracked]
-pub fn source_location_in_file<'db>(
-    db: &'db Db,
+/// body is in its file: the code generator also finds them from the body alone. Not a memo:
+/// what reads it is memoized per body or reads it once, and a memo per span would be kept for
+/// every span a build places.
+pub fn source_location_in_file(
+    db: &Db,
     owner: DefWithBodyId,
     span: MirSpan,
 ) -> Option<(base_db::FileId, u32, u32)> {
@@ -522,7 +523,7 @@ pub fn source_range<'db>(
     owner: DefWithBodyId,
     span: MirSpan,
 ) -> Option<(HirFileId, TextRange)> {
-    match span_source(db, owner, &Body::with_source_map(db, owner).1, span)? {
+    match span_source(db, owner, Body::source_map(db, owner), span)? {
         SpanSource::Range(file_id, range) => Some((file_id, range)),
         SpanSource::Expr(source, expr) => {
             let node = ast::to_node(source.value, source.file_id.root(db));

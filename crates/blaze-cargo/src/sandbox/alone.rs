@@ -13,10 +13,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use blaze_core::exit::Exit;
 use blaze_usercode::confine;
 use serde::{Deserialize, Serialize};
 
-use super::{COULD_NOT, Probe};
+use super::Probe;
 
 /// What [`alone`] gives the test binary it runs again: what to do, as JSON ([`Asked`]).
 const VAR: &str = "BLAZE_SANDBOX_TEST_ALONE";
@@ -49,7 +50,7 @@ impl Job {
             #[cfg(target_os = "linux")]
             Job::Run { spec, program, unshared } => {
                 let (program, also) = (program.as_deref(), super::Also::default());
-                match unshared {
+                match unshared.as_deref() {
                     None => super::linux::run(&spec, program, also),
                     Some(why) => super::linux::run_as(&spec, program, Some(why), also),
                 }
@@ -155,14 +156,14 @@ extern "C" fn take_over() {
     let Some(asked) = std::env::var_os(VAR) else { return };
     let Some(Ok(asked)) = asked.to_str().map(serde_json::from_str::<Asked>) else {
         eprintln!("blaze: `{VAR}` is no job");
-        std::process::exit(COULD_NOT);
+        std::process::exit(Exit::CouldNot.code());
     };
     let answered = serde_json::to_vec(&asked.job.run()).unwrap();
     std::process::exit(match std::fs::write(&asked.answer, answered) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("blaze: {}: {error}", asked.answer.display());
-            COULD_NOT
+            Exit::CouldNot.code()
         }
     });
 }

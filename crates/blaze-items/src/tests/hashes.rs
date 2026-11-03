@@ -1313,3 +1313,36 @@ fn an_error_type_names_its_site_in_a_function() {
     }
 }
 
+
+/// rustc's tests/ui/hygiene/auxiliary/variants.rs: a `macro` writes an enum with a variant it
+/// names and one it is handed, both `Variant`. They are two variants and two keys, each of
+/// which resolves back to its own.
+#[test]
+fn variants_of_one_text_a_macro_writes_have_their_own_keys() {
+    let (db, _) = single(
+        r#"
+#![feature(decl_macro)]
+macro x($type_name:ident, $variant_name:ident) {
+    pub enum $type_name {
+        Variant = 0,
+        $variant_name = 1,
+    }
+}
+x!(MyEnum, Variant);
+"#,
+    );
+    let e = super::items(&db)
+        .into_iter()
+        .find_map(|it| match it {
+            ItemId::Adt(AdtId::EnumId(it)) => Some(it),
+            _ => None,
+        })
+        .expect("`MyEnum`");
+    let variants: Vec<_> = e.enum_variants(&db).variants.values().map(|&(it, _)| it).collect();
+    assert_eq!(variants.len(), 2);
+    let keys: Vec<_> = variants.iter().map(|&it| key::variant_key(&db, it)).collect();
+    assert_ne!(keys[0], keys[1]);
+    for (&variant, &key) in variants.iter().zip(&keys) {
+        assert_eq!(resolve(&db, key), Some(Resolved::Variant(variant)));
+    }
+}

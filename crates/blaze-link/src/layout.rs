@@ -344,8 +344,8 @@ mod tests {
     #[test]
     fn inputs_in_any_order_give_one_order() {
         let functions: Vec<_> = (1..=40).map(|n| (key(n), u64::from(n % 7) * 16 + 8)).collect();
-        let samples: Vec<_> = (1..=40).map(|n| (key(n), u64::from(n * 37 % 11))).collect();
-        let calls: Vec<_> = (1..40).map(|n| (key(n), key(n + 1), u64::from(n * 13 % 9))).collect();
+        let samples: Vec<_> = (1..=40).map(|n| (key(n), u64::from(n) * 37 % 11)).collect();
+        let calls: Vec<_> = (1..40).map(|n| (key(n), key(n + 1), u64::from(n) * 13 % 9)).collect();
         let cold = [key(3), key(17), key(39)];
         let heat = Heat::new(samples.iter().copied(), calls.iter().copied());
         let reversed = Heat::new(samples.iter().rev().copied(), calls.iter().rev().copied());

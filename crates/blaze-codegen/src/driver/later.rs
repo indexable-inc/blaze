@@ -156,7 +156,7 @@ fn stored_one<I, S, L: Lookup + ?Sized>(
         Ok(None) => Ok(None),
         Ok(Some(bytes)) => match stored_function(bytes, key, &node.refs) {
             Ok(Ok(function)) => Ok(Some(function)),
-            Ok(Err(why)) => Err(unfit(key, node.unit.item, &node.described.name, Whence::Store(at), why)),
+            Ok(Err(why)) => Err(unfit(key, node.unit.item, &node.described.name, Whence::Store(at), &why)),
             // alloc: an error
             Err(why) => Err(error(key, node.unit.item, format!("the store's {at:?}: {why}"))),
         },
@@ -180,7 +180,7 @@ fn memoized<I, S>(
     shape: ContentId,
     template: &Template,
 ) -> Result<(CompiledFunction, Vec<Put>), CodegenError> {
-    let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), why);
+    let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), &why);
     let function = template.instantiate(key, &node.refs).map_err(unfit)?;
     // alloc: the store's value of a memo hit, once a function
     Ok((function, vec![put_of(at, template)]))
@@ -226,7 +226,7 @@ fn compiled<B: Prepare>(
         .map_err(|why| error(key, item, why.to_string()))?;
     let kept = memo.put(compiled, template);
     puts.push(put_of(at, kept));
-    let unfit = |why| unfit(key, item, &node.described.name, Whence::Shape(shape), why);
+    let unfit = |why| unfit(key, item, &node.described.name, Whence::Shape(shape), &why);
     let function = kept.instantiate(key, &node.refs).map_err(unfit)?;
     Ok((function, puts, Made::Compiled, shape))
 }
@@ -361,7 +361,7 @@ impl<I, S> Later<I, S> {
     /// gives too.
     pub fn memo_hit(&self, memo: &Memo, key: InstanceKey) -> Option<Result<CompiledFunction, CodegenError>> {
         let (node, template, shape) = self.recorded(memo, key)?;
-        let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), why);
+        let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), &why);
         Some(template.instantiate(key, &node.refs).map_err(unfit))
     }
 

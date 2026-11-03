@@ -106,7 +106,6 @@ pub(crate) fn section_name(class: &Class) -> &str {
         Class::Patch => ".blaze.patch",
         Class::Stubs => ".blaze.stubs",
         Class::Plt => ".plt",
-        Class::Veneers => ".blaze.veneers",
         Class::Rodata => ".rodata",
         Class::RelRo => ".data.rel.ro",
         Class::ThreadVars => ".blaze.thread_vars",

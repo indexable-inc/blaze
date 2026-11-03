@@ -344,7 +344,7 @@ impl Loaded {
     }
 
     /// Whether a run `blaze run` launched still maps the memory.
-    fn running(&self) -> bool {
+    pub(crate) fn running(&self) -> bool {
         !self.launched.pin().is_empty()
     }
 

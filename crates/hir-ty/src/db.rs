@@ -1141,7 +1141,7 @@ pub struct AnonConstId {
 }
 
 impl<'db> AnonConstId<'db> {
-    pub fn new(db: &'db Db, loc: AnonConstLoc, token: TrackedStructToken) -> Self {
+    pub fn new(db: &'db Db, loc: AnonConstLoc, token: &TrackedStructToken) -> Self {
         _ = token;
         AnonConstId::new_(db, loc)
     }
@@ -1328,6 +1328,7 @@ pub mod kinds {
         FN_SIG_WITH_ELIDED_BOUND = 0x243c, "fn_sig_with_elided_bound";
         IMPL_RPITIT_TYS = 0x243d, "impl_rpitit_tys";
         RPITIT_ITEM_BOUNDS = 0x243e, "rpitit_item_bounds";
+        ELIDED_GROUPS = 0x243f, "elided_groups";
 
         // Variance, dyn compatibility, representability.
         VARIANCES_OF = 0x2440, "variances_of_query";
@@ -1350,6 +1351,9 @@ pub mod kinds {
         CRATE_TARGET_ARCH = 0x2458, "crate_target_arch";
         DECLARED_TARGET_FEATURES = 0x2459, "declared_target_features";
         CRATE_TARGET_FEATURES = 0x245a, "crate_target_features";
+        ADT_DTORCK_CONSTRAINT = 0x245b, "adt_dtorck_constraint";
+        BITS_LAYOUT = 0x245c, "bits_layout_query";
+        BIT_WIDTH_OF = 0x245d, "bit_width_of";
         FIELD_ORDER = 0x245e, "FieldOrder";
         FIELD_RANKS = 0x245f, "field_ranks";
 
@@ -1398,6 +1402,9 @@ pub mod kinds {
         // checks run for a crate no other check covers (`hir::check::check_sealed`).
         DECLARES_SEALED = 0x24bc, "declares_sealed";
         SEALED_IN_GRAPH = 0x24bd, "sealed_in_graph";
+        // Which arguments of an impl's trait reference an arbitrary-width integer bound gates
+        // (`arbitrary_ints`), asked by the solver's int marker builtins.
+        INT_GATES = 0x24bf, "int_gates";
 
         // Opaque types.
         IMPL_TYPE_ALIASES = 0x2480, "impl_type_aliases";
@@ -1478,6 +1485,11 @@ pub mod kinds {
         // Goals answered from the crate's own impls (`next_solver/global_goals`).
         AUTO_TRAIT_DEPTH = 0x2500, "auto_trait_depth";
         COPY_CLONE_IMPL = 0x2501, "copy_clone_impl";
+
+        // Signatures, continued (0x2420..0x2440 is full).
+        EXPLICIT_SUPER_CLAUSES = 0x2510, "explicit_super_clauses_of";
+        EXPLICIT_IMPLIED_CLAUSES = 0x2511, "explicit_implied_clauses_of";
+        IMPL_METHOD_HYBRID_PREDICATES = 0x2512, "impl_method_hybrid_predicates";
 
         // Inputs.
         FROZEN_IMPLS = 0x25e0, "FrozenImpls";
@@ -1600,12 +1612,15 @@ pub mod kinds {
         #[test]
         fn every_query_has_a_kind() {
             let declared = declared();
-            for name in &declared {
-                assert!(of(name).is_some(), "`{name}` has no kind in `hir_ty::db::kinds`");
-            }
-            for &(_, name) in ALL {
-                assert!(declared.iter().any(|it| it == name), "`{name}` is no query of hir-ty");
-            }
+            // alloc: test code
+            let unkinded: Vec<&str> = declared.iter().filter(|it| of(it).is_none()).map(String::as_str).collect();
+            // alloc: test code
+            let gone: Vec<&str> =
+                ALL.iter().map(|&(_, name)| name).filter(|name| !declared.iter().any(|it| it == name)).collect();
+            assert!(
+                unkinded.is_empty() && gone.is_empty(),
+                "queries with no kind in `hir_ty::db::kinds`: {unkinded:?}; kinds of no query of hir-ty: {gone:?}"
+            );
         }
     }
 }

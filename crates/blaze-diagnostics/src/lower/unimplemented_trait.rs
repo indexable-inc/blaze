@@ -1,8 +1,9 @@
 //! E0277: a trait bound that does not hold, in rustc's words: the message, label and notes of
 //! the trait's `#[rustc_on_unimplemented]` or `#[diagnostic::on_unimplemented]` (read from the
-//! trait's attributes, `{Self}`, `{this}` (`{this:resolved}`, `{this:path}`) and the trait's
-//! generic names filled in), else "the trait bound `T: Trait` is not satisfied" and "the trait
-//! `Trait` is not implemented for `T`";
+//! trait's attributes, their placeholders filled in as the attribute's lints read them,
+//! `format::FormatArg`: `{Self}`, the trait's generic names and, for the rustc attribute,
+//! `{this}`, `{this:resolved}`, `{this:path}` and `{item_context}`), else "the trait bound
+//! `T: Trait` is not satisfied" and "the trait `Trait` is not implemented for `T`";
 //! "consider annotating `S` with `#[derive(Debug)]`" for a local type and a derivable trait;
 //! "this trait has no implementations"; the "required for `X` to implement `Y`" chain of the
 //! impls that needed the bound, on a local impl's header with "unsatisfied trait bound
@@ -15,7 +16,7 @@
 //! `try_to_add_help_message`), `suggestions.rs` (`note_obligation_cause_code`,
 //! `get_explanation_based_on_obligation`, `can_suggest_derive`, `suggest_derive`),
 //! `on_unimplemented.rs` (`OnUnimplementedDirective::evaluate`, the format string's
-//! arguments), and `compiler/rustc_hir_typeck/src/fn_ctxt/adjust_fulfillment_errors.rs`
+//! arguments, `describe_enclosure`), and `compiler/rustc_hir_typeck/src/fn_ctxt/adjust_fulfillment_errors.rs`
 //! (`blame_specific_arg_if_possible`) (MIT or Apache-2.0).
 //!
 //! What the front end does not give yet (requested in `v2/requests/diagnostics.md` and
@@ -37,7 +38,13 @@ use syntax::{
 
 use crate::{
     cx::{Cx, def_range_view as def_range},
-    lints::code_fact,
+    lints::{
+        code_fact,
+        syntax::attrs::diagnostic::{
+            Mode,
+            format::{FormatArgs, format_filter},
+        },
+    },
     lower::{Found, Phase, obligation_cause},
     model::{Applicability, Diag, MultiSpan, Span},
     print,
@@ -71,7 +78,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnimplementedTrait<'db>) -> 
     let cause = Cause::of(cx, at, |ty| {
         root_self.as_ref().is_some_and(|want| ty == want || ty.strip_references() == *want)
     });
-    let custom = on_unimplemented(cx, main, direct);
+    let custom = on_unimplemented(cx, main, direct, at.value);
     // clone: on the error path, for an error hir found
     let message = custom.message.clone().unwrap_or_else(|| {
         // alloc: the error's text, for an error hir found
@@ -366,7 +373,7 @@ enum Meta {
 }
 
 /// rustc's `OnUnimplementedDirective::evaluate` of the attributes of the trait of `pred`.
-fn on_unimplemented<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>, direct: bool) -> Custom {
+fn on_unimplemented<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>, direct: bool, at: ast::Node<'db>) -> Custom {
     let tr = pred.trait_ref();
     let trait_ = tr.trait_();
     let Some(src) = cx.vsema.source(trait_) else { return Custom::default() };
@@ -380,8 +387,9 @@ fn on_unimplemented<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>, direct:
         if !is_rustc && path != "diagnostic::on_unimplemented" {
             continue;
         }
+        let mode = if is_rustc { Mode::RustcOnUnimplemented } else { Mode::DiagnosticOnUnimplemented };
         let Some(tt) = meta.token_tree() else { continue };
-        let args: &Args = args.get_or_insert_with(|| Args::of(cx, pred));
+        let args: &Args = args.get_or_insert_with(|| Args::of(cx, pred, at));
         let metas = parse_metas(tt.syntax());
         // rustc walks the directive, then its `on(..)`s from the last to the first, each that
         // holds overriding the message and label before it and adding its notes: the first
@@ -410,7 +418,7 @@ fn on_unimplemented<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>, direct:
             }
             for field in fields {
                 let Meta::Value(name, value) = field else { continue };
-                let text = args.format(value);
+                let text = args.format(value, mode);
                 match name.as_str() {
                     "message" => found.message = Some(text),
                     "label" => found.label = Some(text),
@@ -481,8 +489,6 @@ fn parse_metas(tt: ast::Node<'_>) -> Vec<Meta> {
 
 /// What the format strings and conditions of `on_unimplemented` are of.
 struct Args {
-    /// The self type as diagnostics print it, for `{Self}`.
-    self_ty: String,
     /// What `Self = ".."` is compared with: the type with its whole path, its type's generic
     /// form, and its kind (`{union}`).
     self_matches: Vec<String>,
@@ -491,17 +497,20 @@ struct Args {
     /// The trait with its arguments, `Fn(u8)` sugar for a parenthesized one, for
     /// `{this:resolved}` (rustc's `this_resolved`, `print_trait_sugared`).
     this_resolved: String,
-    /// The trait's whole path, for `{this:path}` (rustc's `this_path`, `def_path_str`).
+    /// The trait with its own parameters, `Fn<Args>`, for `{this:path}` (rustc's `this_path`,
+    /// the identity trait ref's `print_only_trait_path`).
     this_path: String,
-    trait_path: String,
-    /// The trait's generic parameters and what they are, for `{T}` and `T = ".."`.
+    /// What the code the bound is of is in, "a function", for `{item_context}`.
+    item_context: &'static str,
+    /// The trait's generic parameters, `Self` first, and what they are, for `{Self}`, `{T}`
+    /// and `T = ".."`.
     generics: Vec<(String, String)>,
     /// Whether the self type is an ADT of the crate being checked (`crate_local`).
     crate_local: bool,
 }
 
 impl Args {
-    fn of<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>) -> Args {
+    fn of<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>, at: ast::Node<'db>) -> Args {
         let tr = pred.trait_ref();
         let trait_ = tr.trait_();
         let self_ty = tr.get_type_argument(0);
@@ -551,30 +560,40 @@ impl Args {
         }
         // alloc: the error's parts, for an error hir found
         let mut generics = Vec::new();
-        let lifetimes = hir::GenericDef::Trait(trait_).lifetime_params(cx.db).len();
+        // alloc: the error's parts, for an error hir found
+        let mut own = Vec::new();
+        let lifetimes = hir::GenericDef::Trait(trait_).lifetime_params(cx.db);
+        for lifetime in &lifetimes {
+            // alloc: the error's text, for an error hir found
+            own.push(lifetime.name(cx.db).as_str().to_owned());
+        }
         for (i, param) in hir::GenericDef::Trait(trait_).type_or_const_params(cx.db).into_iter().enumerate() {
             // alloc: the error's text, for an error hir found
             let name = param.name(cx.db).as_str().to_owned();
-            if name == "Self" {
-                continue;
+            if name != "Self" {
+                // clone: on the error path, for an error hir found
+                own.push(name.clone());
             }
             // The arguments are the self type, then the trait's own, lifetimes last.
-            if lifetimes == 0
+            if (i == 0 || lifetimes.is_empty())
                 && let Some(arg) = tr.get_type_argument(i)
             {
                 generics.push((name, cx.ty(&arg)));
             }
         }
+        // alloc: the error's text, for an error hir found
+        let this = trait_.name(cx.db).as_str().to_owned();
         Args {
-            self_ty: self_ty.as_ref().map(|it| cx.ty(it)).unwrap_or_default(),
             self_matches,
-            // alloc: the error's text, for an error hir found
-            this: trait_.name(cx.db).as_str().to_owned(),
             this_resolved: print::trait_path_sugared(cx, pred),
-            this_path: trait_full_path(cx, trait_)
+            this_path: match own.is_empty() {
+                // clone: on the error path, for an error hir found
+                true => this.clone(),
                 // alloc: the error's text, for an error hir found
-                .unwrap_or_else(|| trait_.name(cx.db).as_str().to_owned()),
-            trait_path: print::trait_path(cx, &tr),
+                false => format!("{this}<{}>", own.join(", ")),
+            },
+            this,
+            item_context: item_context(cx, at),
             generics,
             crate_local,
         }
@@ -590,13 +609,13 @@ impl Args {
             },
             Meta::Value(name, value) => match name.as_str() {
                 "Self" | "_Self" => {
-                    let value = self.format(value);
+                    let value = format_filter(value, &self.generics);
                     self.self_matches.iter().any(|it| *it == value)
                 }
                 _ => self
                     .generics
                     .iter()
-                    .any(|(param, arg)| param == name && *arg == self.format(value)),
+                    .any(|(param, arg)| param == name && *arg == format_filter(value, &self.generics)),
             },
             Meta::List(name, inner) => match name.as_str() {
                 "not" => inner.first().is_some_and(|it| !self.holds(it, direct)),
@@ -607,59 +626,73 @@ impl Args {
         }
     }
 
-    /// rustc's `FormatString::format`: `{Self}`, `{this}` (`{this:name}`), `{this:resolved}`,
-    /// `{this:path}`, `{Trait}` and the trait's generic names filled in, `{{` and `}}` as braces;
-    /// the kinds `Self = ".."` compares with (`{union}`) are left as they are. A format spec
-    /// after `:` is read only for `this`, as rustc's `parse_arg` does.
-    fn format(&self, text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut rest = text;
-        while let Some(at) = rest.find(['{', '}']) {
-            out.push_str(&rest[..at]);
-            let tail = &rest[at..];
-            if tail.starts_with("{{") || tail.starts_with("}}") {
-                out.push_str(&tail[..1]);
-                rest = &tail[2..];
-                continue;
-            }
-            if tail.starts_with('}') {
-                out.push('}');
-                rest = &tail[1..];
-                continue;
-            }
-            let Some(end) = tail.find('}') else {
-                out.push_str(tail);
-                rest = "";
-                break;
-            };
-            let (name, spec) = tail[1..end].split_once(':').unwrap_or((&tail[1..end], ""));
-            match name {
-                "Self" => out.push_str(&self.self_ty),
-                "this" => out.push_str(match spec {
-                    "resolved" => &self.this_resolved,
-                    "path" => &self.this_path,
-                    _ => &self.this,
-                }),
-                "Trait" => out.push_str(&self.trait_path),
-                _ => match self.generics.iter().find(|(param, _)| param == name) {
-                    Some((_, arg)) => out.push_str(arg),
-                    None => out.push_str(&tail[..=end]),
-                },
-            }
-            rest = &tail[end + 1..];
-        }
-        out.push_str(rest);
-        out
+    /// rustc's `FormatString::format` of `text`, an option of an attribute of `mode`: which
+    /// placeholders it fills is `format::FormatArg::of`'s table, shared with the attribute's
+    /// lints.
+    fn format(&self, text: &str, mode: Mode) -> String {
+        let args = FormatArgs {
+            this: &self.this,
+            this_resolved: &self.this_resolved,
+            this_path: &self.this_path,
+            item_context: self.item_context,
+            generic_args: &self.generics,
+            ..FormatArgs::default()
+        };
+        args.format(text, mode)
     }
 }
 
-/// A trait's path with its crate's name, as rustc's `def_path_str` prints it with no trimmed
-/// paths: `core::ops::Fn`.
-fn trait_full_path(cx: &Cx<'_, '_>, trait_: hir::Trait) -> Option<String> {
-    let krate = trait_.module(cx.db).krate(cx.db).display_name(cx.db)?;
-    let path = hir::ModuleDef::Trait(trait_).canonical_path(cx.db, cx.edition)?;
-    // alloc: the error's text, for an error hir found
-    Some(format!("{krate}::{path}"))
+/// rustc's `describe_enclosure` of the body `at` is in (`describe_closure` for a closure or
+/// coroutine), for `{item_context}`: the nearest function, closure, or `async` or `gen` block
+/// around it; "" in a constant, a static or anything else that is not a function's body.
+fn item_context<'db>(cx: &Cx<'_, 'db>, at: ast::Node<'db>) -> &'static str {
+    for node in cx.vsema.ancestors_with_macros(at) {
+        match node.kind() {
+            SyntaxKind::CLOSURE_EXPR => {
+                let Some(closure) = ast::ClosureExpr::cast(node) else { return "" };
+                return match (closure.async_token().is_some(), closure.gen_token().is_some()) {
+                    (true, true) => "an async gen closure",
+                    (true, false) => "an async closure",
+                    (false, true) => "a gen closure",
+                    (false, false) if closure.attrs().any(|it| it.simple_name() == Some("coroutine")) => {
+                        "a coroutine"
+                    }
+                    (false, false) => "a closure",
+                };
+            }
+            SyntaxKind::BLOCK_EXPR => {
+                let Some(block) = ast::BlockExpr::cast(node) else { return "" };
+                match (block.async_token().is_some(), block.gen_token().is_some()) {
+                    (true, true) => return "an async gen block",
+                    (true, false) => return "an async block",
+                    (false, true) => return "a gen block",
+                    // An inline `const { .. }` is a body of its own, an anonymous constant's.
+                    (false, false) if block.const_token().is_some() => return "",
+                    (false, false) => {}
+                }
+            }
+            // A const argument (`[T; N]`, `f::<{ N }>`) is an anonymous constant's body.
+            SyntaxKind::CONST_ARG => return "",
+            SyntaxKind::FN => {
+                let Some(function) = ast::Fn::cast(node) else { return "" };
+                return match (function.async_token().is_some(), function.gen_token().is_some()) {
+                    (true, true) => "an async gen function",
+                    (true, false) => "an async function",
+                    (false, true) => "a gen function",
+                    (false, false) => match node.parent().and_then(|it| it.parent()).map(|it| it.kind()) {
+                        Some(SyntaxKind::TRAIT) => "a trait method",
+                        Some(SyntaxKind::IMPL) => "a method",
+                        _ => "a function",
+                    },
+                };
+            }
+            // A macro call is passed through to the code it expands to.
+            SyntaxKind::MACRO_CALL => {}
+            kind if ast::Item::can_cast(kind) => return "",
+            _ => {}
+        }
+    }
+    ""
 }
 
 /// An ADT's path with its crate's name, as rustc prints it with no trimmed paths.

@@ -314,11 +314,18 @@ fn msan_options_are_read_only_i32s_only_when_set() {
         assert_eq!(sh_flags & elf::SHF_WRITE, elf::SectionFlags(0), "{addr:#x} is read-only, in {:?}", section.name());
     }
 
-    let plain = Sanitize { sanitizers: Sanitizers::MEMORY, ..Sanitize::default() };
-    let mut image = Image::new(name(TO), sanitized(plain, false)).unwrap();
-    let change = Change { added: vec![&start], names: vec![("_start".into(), Target::Direct(key(1)))], ..Change::default() };
-    let error = image.stage(change).unwrap_err();
-    assert!(error.what.contains("__msan_track_origins"), "no option without its setting: {error}");
+    // Each option alone: the other is the one undefined name, so the error names it whatever
+    // order the symbol table's hashes put the two in.
+    let only_origins = Sanitize { sanitizers: Sanitizers::MEMORY, track_origins: 2, ..Sanitize::default() };
+    let only_recover = Sanitize { sanitizers: Sanitizers::MEMORY, recover: Sanitizers::MEMORY, ..Sanitize::default() };
+    for (sanitize, missing, defined) in
+        [(only_origins, "__msan_keep_going", "__msan_track_origins"), (only_recover, "__msan_track_origins", "__msan_keep_going")]
+    {
+        let mut image = Image::new(name(TO), sanitized(sanitize, false)).unwrap();
+        let change = Change { added: vec![&start], names: vec![("_start".into(), Target::Direct(key(1)))], ..Change::default() };
+        let error = image.stage(change).unwrap_err();
+        assert!(error.what.contains(missing) && !error.what.contains(defined), "no option without its setting: {error}");
+    }
 }
 
 #[test]

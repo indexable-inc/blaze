@@ -144,3 +144,173 @@ fn a_nested_impl_traits_value_comes_from_the_outer_ones_bounds() {
     );
     assert_eq!(found, [Ok("Once<u16>".to_owned()), Ok("u16".to_owned())]); // alloc: test
 }
+
+/// rustc's hybrid environment: the bounds of an `impl Trait` nested in another's are proven
+/// with the method's own where clauses too, so the inner `impl Clone` is `T` by `T: Clone`.
+#[test]
+fn a_nested_impl_traits_bounds_are_proven_with_the_methods_where_clauses() {
+    let found = values(
+        "//- minicore: sized, iterator, clone\n\
+         pub struct Once<T>(T);\n\
+         impl<T> Iterator for Once<T> { type Item = T; fn next(&mut self) -> Option<T> { loop {} } }\n\
+         pub trait Tr { fn items<T: Clone>(t: T) -> impl Iterator<Item = impl Clone>; }\n\
+         pub struct S;\n\
+         impl Tr for S { fn items<T: Clone>(t: T) -> Once<T> { Once(t) } }\n",
+        "items",
+    );
+    assert_eq!(found, [Ok("Once<T>".to_owned()), Ok("T".to_owned())]); // alloc: test
+}
+
+/// rustc normalizes both signatures before relating them: an impl that writes its return type
+/// through an associated type of its own gives the type it normalizes to.
+#[test]
+fn an_impl_may_write_its_return_type_through_an_associated_type() {
+    let found = values(
+        "//- minicore: sized\n\
+         pub struct W<T>(T);\n\
+         pub trait Tr { type Out; fn f(&self) -> W<impl Sized>; }\n\
+         pub struct S;\n\
+         impl Tr for S { type Out = W<u8>; fn f(&self) -> Self::Out { W(0) } }\n",
+        "f",
+    );
+    assert_eq!(found, [Ok("u8".to_owned())]); // alloc: test
+    // The item's type is the normalized one, as rustc's `type_of` of it, not the projection.
+    let found = values(
+        "//- minicore: sized\n\
+         pub struct W<T>(T);\n\
+         pub trait Tr { type Out; fn f(&self) -> impl Sized; }\n\
+         pub struct S;\n\
+         impl Tr for S { type Out = W<u8>; fn f(&self) -> Self::Out { W(0) } }\n",
+        "f",
+    );
+    assert_eq!(found, [Ok("W<u8>".to_owned())]); // alloc: test
+}
+
+/// rustc fails the comparison where a signature names an associated type that does not
+/// normalize (`S` implements no `Q`): the impl's type for the item is not that projection.
+#[test]
+fn a_return_type_that_does_not_normalize_gives_no_type() {
+    let found = values(
+        "//- minicore: sized\n\
+         pub trait Q { type X; }\n\
+         pub trait Tr { fn f(&self) -> impl Sized; }\n\
+         pub struct S;\n\
+         impl Tr for S { fn f(&self) -> <S as Q>::X { loop {} } }\n",
+        "f",
+    );
+    assert_eq!(found, [Err(RpititError::Unnormalized)]); // alloc: test
+}
+
+/// A free type alias expands where it is lowered.
+#[test]
+fn an_impl_may_write_its_return_type_through_a_type_alias() {
+    let found = values(
+        "//- minicore: sized\n\
+         pub struct W<T>(T);\n\
+         pub type O = W<u8>;\n\
+         pub trait Tr { fn f(&self) -> W<impl Sized>; }\n\
+         pub struct S;\n\
+         impl Tr for S { fn f(&self) -> O { W(0) } }\n",
+        "f",
+    );
+    assert_eq!(found, [Ok("u8".to_owned())]); // alloc: test
+}
+
+/// An early-bound lifetime of the method (one a where clause names) is the impl item's own.
+#[test]
+fn an_early_bound_lifetime_of_the_method_is_the_impl_items_own() {
+    let found = values(
+        "//- minicore: sized\n\
+         pub struct Iter<'a, T>(&'a T);\n\
+         pub trait Tr { fn g<'a>(&self, x: &'a u8) -> impl Sized + 'a where 'a: 'a; }\n\
+         pub struct S;\n\
+         impl Tr for S { fn g<'a>(&self, x: &'a u8) -> Iter<'a, u8> where 'a: 'a { Iter(x) } }\n",
+        "g",
+    );
+    assert_eq!(found, [Ok("Iter<'a, u8>".to_owned())]); // alloc: test
+}
+
+/// An impl lifetime the trait's signature has at two places of two lifetimes is none of the
+/// trait item's: the error names it as written.
+#[test]
+fn an_uncaptured_lifetime_is_named_as_written() {
+    let found = values(
+        "//- minicore: sized\n\
+         pub struct Iter<'a, T>(&'a T);\n\
+         pub trait Tr { fn g<'b, 'c>(&self, x: &'b u8, y: &'c u8) -> impl Sized; }\n\
+         pub struct S;\n\
+         impl Tr for S { fn g<'a>(&self, x: &'a u8, y: &'a u8) -> Iter<'a, u8> { Iter(x) } }\n",
+        "g",
+    );
+    assert!(
+        matches!(&found[..], [Err(RpititError::UncapturedLifetime { lifetime, .. })] if &**lifetime == "'a"),
+        "{found:?}"
+    );
+}
+
+/// `doesnt-satisfy.rs`: the impl's type must meet the bounds of the trait's `impl Trait`
+/// (rustc's E0277 "required by a bound in `Foo::bar::{anon_assoc#0}`"); each bound that fails
+/// is named with the item it bounds, and `Copy`'s supertrait `Clone`, which it implies, is not.
+#[test]
+fn a_value_that_fails_the_traits_bounds_is_unsatisfied() {
+    let found = values(
+        "//- minicore: sized, copy\n\
+         pub struct NotCopy;\n\
+         pub trait Tr { fn f(&self) -> (impl Sized, impl Copy); }\n\
+         pub struct S;\n\
+         impl Tr for S { fn f(&self) -> (u8, NotCopy) { (0, NotCopy) } }\n",
+        "f",
+    );
+    assert!(
+        matches!(&found[..], [Err(RpititError::Unsatisfied { of, .. }), Err(RpititError::Unsatisfied { .. })] if **of == [1]),
+        "{found:?}"
+    );
+}
+
+/// rustc's `predicates_of` an impl's RPITIT item is the trait item's rebased onto the impl
+/// (`gather_explicit_predicates_of`, `ImplTraitInTraitData::Impl`): the trait method's `T: Copy`,
+/// which the impl's method leaves out, is a where clause of the impl's item, as normalizing the
+/// trait's item to the impl's reads it (`own_clauses_of`).
+#[test]
+fn the_impls_item_has_the_trait_methods_where_clauses() {
+    use rustc_type_ir::{ClauseKind, Interner as _, inherent::IntoKind as _};
+    let db = fixture::db(
+        "//- minicore: sized, copy\n\
+         pub trait Tr { fn f<T: Copy>(&self, t: T) -> impl Copy; }\n\
+         pub struct S;\n\
+         impl Tr for S { fn f<T>(&self, t: T) -> T { t } }\n",
+    )
+    .into_db();
+    blaze_query::db::attach(&db, || {
+        let krate = fixture::test_crate(&db);
+        let impl_fn = crate_def_map(&db, krate)
+            .modules(&db)
+            .flat_map(|(_, module)| module.scope(&db).impls().collect::<Vec<_>>()) // alloc: test
+            .flat_map(|impl_| impl_.impl_items(&db).items.to_vec()) // alloc: test
+            .find_map(|(_, item)| match item {
+                AssocItemId::FunctionId(it) => Some(it),
+                _ => None,
+            })
+            .expect("the impl has `f`");
+        let interner = crate::next_solver::DbInterner::new_no_crate(&db);
+        let item = crate::rpitit::RpititId {
+            function: impl_fn,
+            idx: crate::next_solver::ImplTraitIdx::from_raw(la_arena::RawIdx::from_u32(0)),
+        };
+        let traits: Vec<String> = interner // alloc: test
+            .own_clauses_of(crate::next_solver::SolverDefId::RpititId(item))
+            .skip_binder()
+            .into_iter()
+            .filter_map(|clause| match clause.kind().skip_binder() {
+                ClauseKind::Trait(it) => Some(
+                    hir_def::signatures::TraitSignature::of(&db, it.trait_ref.def_id.0)
+                        .name
+                        .as_str()
+                        .to_owned(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert!(traits.iter().any(|it| it == "Copy"), "{traits:?}");
+    });
+}

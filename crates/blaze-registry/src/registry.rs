@@ -120,7 +120,7 @@ impl Registry {
                 context.auth.clone(),
             )?))
         } else {
-            Files::Git(crate::git_index::GitIndex::new(source, index_dir.clone(), context.clone()))
+            Files::Git(crate::git_index::GitIndex::new(source, &index_dir, context.clone()))
         };
         Ok(Registry {
             src_dir: registry.join("src").join(&name),

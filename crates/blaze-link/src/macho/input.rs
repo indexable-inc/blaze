@@ -595,6 +595,7 @@ struct Input<'a> {
 }
 
 /// A relocation read, before it is put in its atom.
+#[derive(Clone, Copy)]
 struct Fix {
     /// From the start of the Mach-O section.
     at: u64,
@@ -996,6 +997,9 @@ impl Reader<'_> {
         // Both symbols are taken where they are: the bytes may hold more than the addend
         // (the offset of the place from the subtracted symbol), so they don't name an atom.
         let (minus, _) = self.extern_target(r.r_symbolnum, 0, false)?;
+        if let Some(from) = self.in_eh_frame(s, r.r_symbolnum) {
+            return self.eh_frame_delta(s, at, r.r_length, implicit, from, next);
+        }
         let (symbol, addend) = if next.r_extern {
             self.extern_target(next.r_symbolnum, implicit, false)?
         } else {
@@ -1003,6 +1007,52 @@ impl Reader<'_> {
         };
         let apply = if r.r_length == 3 { Apply::Delta64 } else { Apply::Delta32 };
         self.place(s, Fix { at, width: 1 << r.r_length, apply, symbol, addend, minus: Some(minus) })
+    }
+
+    /// When section `s` is `__eh_frame` and nlist entry `index` is defined in it, the entry's
+    /// offset in `s`. The assembler writes a pc-relative pointer of call frame information
+    /// (an FDE's `pc_begin`, its LSDA) as a SUBTRACTOR of such a symbol (`ltmpN` at the
+    /// section's start) and the distance from it to the place in the bytes.
+    fn in_eh_frame(&self, s: usize, index: u32) -> Option<u64> {
+        let input = &self.inputs[s];
+        let nlist = self.nlists.get(index as usize)?;
+        let ordinal = usize::from(nlist.n_sect());
+        (input.eh_frame && nlist.n_type().typ() == macho::N_SECT && ordinal == s + 1)
+            .then(|| nlist.n_value(LE).wrapping_sub(input.addr))
+    }
+
+    /// The SUBTRACTOR (of a symbol at `from` of `__eh_frame` section `s`) and UNSIGNED pair at
+    /// `at` as what it means: `S + bytes - M` is `S + bytes + (at - from) - P` while the
+    /// section is where it was, the pc-relative pointer the CIE's encoding says, and stays so
+    /// only as a `Rel64`/`Rel32`. The linker keeps, drops and moves each record of
+    /// `__eh_frame` on its own ([`crate::native`]'s frames), so a symbol inside the section
+    /// has no address, and the distance from it no meaning, once the records are placed.
+    /// ld64 (`CFISection::cfiParse`) and lld (`EhRelocator::makePcRel`) read the field the
+    /// same way. The target is taken at the atom it lands in, as an implicit pointer's is
+    /// ([`Reader::eh_pointer`]): that atom is the function whose FDE it is.
+    fn eh_frame_delta(
+        &mut self,
+        s: usize,
+        at: u64,
+        length: u8,
+        implicit: i64,
+        from: u64,
+        next: RelocationInfo,
+    ) -> Result<(), String> {
+        if !next.r_extern {
+            // alloc: error path
+            return Err(format!(
+                "{}: a SUBTRACTOR of a symbol in `__eh_frame` paired with an UNSIGNED of section {} \
+                 rather than a symbol, which no assembler writes for call frame information and \
+                 blaze doesn't read",
+                self.place_of(s, at),
+                next.r_symbolnum
+            ));
+        }
+        let shift = at.wrapping_sub(from) as i64;
+        let (symbol, addend) = self.extern_target(next.r_symbolnum, implicit.wrapping_add(shift), true)?;
+        let apply = if length == 3 { Apply::Rel64 } else { Apply::Rel32 };
+        self.place(s, Fix { at, width: 1 << length, apply, symbol, addend, minus: None })
     }
 
     /// The target of an extern relocation to nlist entry `index` plus `offset`. With `anchor`,
@@ -2167,6 +2217,70 @@ pub(crate) mod tests {
             (76, Apply::Rel64, 0, SymbolDef::Section { section: 2, value: 0, size: 16 }),
             (104, Apply::Rel64, 0, SymbolDef::Section { section: 0, value: 0, size: 16 }),
         ]);
+    }
+
+    /// What clang writes for an FDE's `pc_begin` on both CPUs: a SUBTRACTOR of `ltmp1` (the
+    /// start of `__eh_frame`) and an UNSIGNED of the function, the bytes holding `ltmp1`'s
+    /// distance back from the place. The records are placed apart, where `ltmp1` means
+    /// nothing, so the pair is the pc-relative pointer it encodes, to the function's atom.
+    #[test]
+    fn eh_frame_subtractor_of_its_own_section_is_pc_relative() {
+        for (cpu, arch, subtractor, unsigned) in [
+            (macho::CPU_TYPE_ARM64.0, Arch::Aarch64, macho::ARM64_RELOC_SUBTRACTOR.0, macho::ARM64_RELOC_UNSIGNED.0),
+            (macho::CPU_TYPE_X86_64.0, Arch::X86_64, macho::X86_64_RELOC_SUBTRACTOR.0, macho::X86_64_RELOC_UNSIGNED.0),
+        ] {
+            let mut obj = Obj::new(cpu);
+            let text = obj.section("__TEXT", "__text", 0, vec![0; 32], 4, TEXT);
+            let mut eh = Vec::new();
+            eh.put_u32(16);
+            eh.put_u32(0);
+            eh.extend_from_slice(&[1, b'z', b'R', 0, 1, 0x78, 0x10, 1, 0x10, 0, 0, 0]);
+            // FDEs at 20 and 48 (address 32 + each), `pc_begin` 8 bytes in: `_g`, then
+            // `ltmp0 + 16` (`_g` again, named by a local the way an unexported function is).
+            for (at, bytes) in [(20u32, 32 - 60i64), (48, 16 + 32 - 88)] {
+                eh.put_u32(24);
+                eh.put_u32(at + 4);
+                eh.put_u64(bytes as u64);
+                eh.put_u64(16);
+                eh.extend_from_slice(&[0, 0, 0, 0]);
+            }
+            let frame = obj.section("__TEXT", "__eh_frame", 32, eh, 3, EH_FRAME);
+            let ltmp0 = obj.symbol("ltmp0", SECT, text, 0, 0);
+            let ltmp1 = obj.symbol("ltmp1", SECT, frame, 0, 32);
+            obj.symbol("_f", SECT | EXT, text, 0, 0);
+            let g = obj.symbol("_g", SECT | EXT, text, 0, 16);
+            obj.relocate(frame, rel(28, ltmp1, false, 3, true, subtractor));
+            obj.relocate(frame, rel(28, g, false, 3, true, unsigned));
+            obj.relocate(frame, rel(56, ltmp1, false, 3, true, subtractor));
+            obj.relocate(frame, rel(56, ltmp0, false, 3, true, unsigned));
+            let object = obj.read(arch).unwrap();
+            let (g, _) = find(&object, "_g");
+            let eh = &object.sections[2];
+            assert_eq!(eh.what, SectionKind::EhFrame);
+            let [direct, local] = object.section_fixups(eh) else { panic!("{:?}", object.section_fixups(eh)) };
+            assert_eq!(*direct, fixup(28, Apply::Rel64, g, 0));
+            assert_eq!((local.at, local.apply, local.addend, local.minus), (56, Apply::Rel64, 0, None));
+            assert_eq!(object.symbols[local.symbol as usize].def, SymbolDef::Section { section: 1, value: 0, size: 16 });
+
+            // A section's UNSIGNED after it is refused by name, not guessed at.
+            let mut bad = Obj::new(cpu);
+            bad.section("__TEXT", "__text", 0, vec![0; 32], 4, TEXT);
+            let mut eh = Vec::new();
+            eh.put_u32(16);
+            eh.put_u32(0);
+            eh.extend_from_slice(&[1, b'z', b'R', 0, 1, 0x78, 0x10, 1, 0x10, 0, 0, 0]);
+            eh.put_u32(24);
+            eh.put_u32(24);
+            eh.put_u64((16 - 28i64) as u64);
+            eh.put_u64(16);
+            eh.extend_from_slice(&[0, 0, 0, 0]);
+            let frame = bad.section("__TEXT", "__eh_frame", 32, eh, 3, EH_FRAME);
+            let ltmp1 = bad.symbol("ltmp1", SECT, frame, 0, 32);
+            bad.relocate(frame, rel(28, ltmp1, false, 3, true, subtractor));
+            bad.relocate(frame, rel(28, 1, false, 3, false, unsigned));
+            let error = bad.read(arch).unwrap_err();
+            assert!(error.contains("__TEXT,__eh_frame at 0x1c") && error.contains("UNSIGNED of section 1"), "{error}");
+        }
     }
 
     /// An x86-64 object of `n` functions `_f{i}` of 16 bytes, each an atom, a `__data` of `n`

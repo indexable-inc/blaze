@@ -49,26 +49,26 @@ pub(crate) struct Mem<'m, W> {
 
 impl<W: Width> Mem<'_, W> {
     /// `stop`, saying which call it was in.
-    pub(crate) fn named(&self, stop: Stop) -> Stop {
+    pub(crate) fn named(&self, stop: &Stop) -> Stop {
         Stop(format!("{stop}, in `{}`", self.call)) // alloc: error path
     }
 
     /// `ptr + by`, or why it is past every memory.
     fn at(&self, ptr: u64, by: u64) -> Result<u64, Stop> {
-        offset(ptr, by).map_err(|stop| self.named(stop))
+        offset(ptr, by).map_err(|stop| self.named(&stop))
     }
 
     pub(crate) fn get(&self, ptr: u64, len: u64) -> Result<&[u8], Stop> {
-        bytes(self.bytes, ptr, len).map_err(|stop| self.named(stop))
+        bytes(self.bytes, ptr, len).map_err(|stop| self.named(&stop))
     }
 
     pub(crate) fn get_mut(&mut self, ptr: u64, len: u64) -> Result<&mut [u8], Stop> {
-        let at = range(self.bytes.len(), ptr, len).map_err(|stop| self.named(stop))?;
+        let at = range(self.bytes.len(), ptr, len).map_err(|stop| self.named(&stop))?;
         Ok(&mut self.bytes[at])
     }
 
     pub(crate) fn put(&mut self, ptr: u64, bytes: &[u8]) -> Result<(), Stop> {
-        put(self.bytes, ptr, bytes).map_err(|stop| self.named(stop))
+        put(self.bytes, ptr, bytes).map_err(|stop| self.named(&stop))
     }
 
     fn put_u32(&mut self, ptr: u64, value: u32) -> Result<(), Stop> {
@@ -84,7 +84,7 @@ impl<W: Width> Mem<'_, W> {
         let bytes = value.to_le_bytes();
         if W::BYTES < 8 && value >> (8 * W::BYTES) != 0 {
             // alloc: error path
-            return Err(self.named(Stop(format!("was to be given the size {value}, past its {}-bit pointers", 8 * W::BYTES))));
+            return Err(self.named(&Stop(format!("was to be given the size {value}, past its {}-bit pointers", 8 * W::BYTES))));
         }
         self.put(ptr, &bytes[..W::BYTES as usize])
     }

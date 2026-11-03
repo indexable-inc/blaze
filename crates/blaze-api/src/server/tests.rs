@@ -24,7 +24,7 @@ fn config(unix: bool, http: bool) -> Config {
 }
 
 fn status() -> Status {
-    Status { pid: 6, requests: vec![1, 2], views: 3, history: None, memory_bytes: 4, budget_bytes: 5, build: crate::Build::default() }
+    Status { pid: 6, requests: vec![1, 2], views: 3, history: None, memory_bytes: 4, budget_bytes: 5, build: crate::Build::default(), bugs: Vec::new() }
 }
 
 /// The server and a driver played by hand: what it asked for and has not been told of.
@@ -140,7 +140,7 @@ impl Rig {
 
     fn reply(&mut self, conn: Conn, id: u64, response: Response) {
         let mut effects = Vec::new();
-        self.server.reply(Reply { to: RequestRef { conn, id }, response }, &mut effects);
+        self.server.reply(&Reply { to: RequestRef { conn, id }, response }, &mut effects);
         self.took(effects);
     }
 
@@ -874,7 +874,7 @@ fn a_warm_request_and_its_reply_reuse_their_buffers() {
             rig.in_flight.extend(effects.drain(..));
             let to = RequestRef { conn, id };
             let (_, replied) = blaze_alloc_count::measure(|| {
-                rig.server.reply(Reply { to, response: Response::Done { ok: true } }, &mut effects)
+                rig.server.reply(&Reply { to, response: Response::Done { ok: true } }, &mut effects)
             });
             assert!(!warm || replied.allocations <= head, "{unix}: a warm reply: {replied:?}");
             rig.in_flight.extend(effects.drain(..));
@@ -934,7 +934,7 @@ fn a_local_connection_takes_its_replies_from_the_server_never_the_driver() {
     let (mut effects, mut arrived) = (Vec::new(), Vec::new());
     rig.server.send_local(conn, &frame_of(3, Request::Status), &mut effects, &mut arrived);
     assert_eq!(arrived, [asked(conn, 3, Request::Status)]);
-    rig.server.reply(Reply { to: RequestRef { conn, id: 3 }, response: Response::Done { ok: true } }, &mut effects);
+    rig.server.reply(&Reply { to: RequestRef { conn, id: 3 }, response: Response::Done { ok: true } }, &mut effects);
     rig.server.stop(&mut effects);
     assert!(effects.is_empty(), "{effects:?}");
     let mut taken = Vec::new();

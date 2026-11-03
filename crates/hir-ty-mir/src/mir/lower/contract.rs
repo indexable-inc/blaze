@@ -28,7 +28,6 @@ use hir_def::{FunctionId, expr_store::SpecClauseKind};
 use intern::Symbol;
 
 use super::*;
-use crate::mir::type_name;
 
 /// What a body that checks its clauses at run time knows of them: the function, and its first
 /// parameter binding declared `mut`, which an `ensures` cannot be checked against.
@@ -274,7 +273,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     /// `func` as a backtrace names it, or its own name where that spelling is not built.
     fn fn_path(&self, func: FunctionId) -> String {
-        type_name::rustc_function_name(self.db, func, &[]).unwrap_or_else(|| {
+        hir_ty_print::rustc_function_name(self.db, func, &[]).unwrap_or_else(|| {
             hir_def::signatures::FunctionSignature::of(self.db, func).name.as_str().to_owned() // alloc: a name
         })
     }

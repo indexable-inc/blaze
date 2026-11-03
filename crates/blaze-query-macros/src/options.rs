@@ -1,5 +1,5 @@
-//! The options of each attribute (`(returns(ref), lru = 32, ..)`, commas between, a trailing one
-//! allowed). An option the site doesn't take is an error naming it.
+//! The options of each attribute (`(returns(ref), lru, weigh = bytes_of, ..)`, commas between, a
+//! trailing one allowed). An option the site doesn't take is an error naming it.
 
 use proc_macro2::TokenStream;
 use syn::ext::IdentExt;
@@ -28,6 +28,16 @@ impl Site {
     }
 }
 
+/// What `lru` says of a function's values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lru {
+    /// `lru`: kept by their bytes ([`Options::weigh`]) under their tag's budget, the least
+    /// recently verified let go first (`blaze_query::db::budget`).
+    Budgeted,
+    /// `lru = 0`: let go only when asked (`evict_values`, `evict_values_of`).
+    Explicit,
+}
+
 #[derive(Default)]
 pub(crate) struct Options {
     pub(crate) returns: Option<(Ident, Mode)>,
@@ -38,7 +48,8 @@ pub(crate) struct Options {
     pub(crate) cycle_fn: Option<Expr>,
     pub(crate) cycle_initial: Option<Expr>,
     pub(crate) cycle_result: Option<Expr>,
-    pub(crate) lru: Option<(Ident, usize)>,
+    pub(crate) lru: Option<(Ident, Lru)>,
+    pub(crate) weigh: Option<Expr>,
     pub(crate) constructor: Option<Ident>,
     pub(crate) self_ty: Option<Type>,
     pub(crate) mem_tag: Option<Path>,
@@ -132,10 +143,27 @@ impl Options {
                 }
                 "lru" => {
                     allowed(&[Site::TrackedFn])?;
+                    let lru = if input.peek(Token![=]) {
+                        input.parse::<Token![=]>()?;
+                        let lit = input.parse::<LitInt>()?;
+                        if lit.base10_parse::<usize>()? != 0 {
+                            return Err(syn::Error::new(
+                                lit.span(),
+                                "a count of values is no bound on memory: `lru` with `weigh = \
+                                 <fn(&Value) -> usize>` keeps them by their bytes under their \
+                                 tag's budget; `lru = 0` lets them go only when asked",
+                            ));
+                        }
+                        Lru::Explicit
+                    } else {
+                        Lru::Budgeted
+                    };
+                    set(&mut options.lru, &name, (name.clone(), lru))?; // clone: expansion time, an identifier
+                }
+                "weigh" => {
+                    allowed(&[Site::TrackedFn])?;
                     input.parse::<Token![=]>()?;
-                    let lit = input.parse::<LitInt>()?;
-                    let cap = lit.base10_parse::<usize>()?;
-                    set(&mut options.lru, &name, (name.clone(), cap))?; // clone: expansion time, an identifier
+                    set(&mut options.weigh, &name, input.parse::<Expr>()?)?;
                 }
                 "constructor" => {
                     allowed(&[Site::Interned, Site::TrackedStruct])?;
@@ -188,6 +216,22 @@ impl Options {
                 "`cycle_result` is one way out of a cycle and `cycle_initial` with `cycle_fn` the \
                  other: give one",
             ));
+        }
+        match (&self.lru, &self.weigh) {
+            (Some((lru, Lru::Budgeted)), None) => {
+                return Err(syn::Error::new(
+                    lru.span(),
+                    "`lru` keeps values by their bytes: say what one weighs with `weigh = \
+                     <fn(&Value) -> usize>`, the heap bytes dropping it frees",
+                ));
+            }
+            (None | Some((_, Lru::Explicit)), Some(weigh)) => {
+                return Err(syn::Error::new_spanned(
+                    weigh,
+                    "`weigh` is for `lru`: only a function whose values are kept by bytes is weighed",
+                ));
+            }
+            _ => {}
         }
         if let (Some(no_eq), Some(_)) = (&self.no_eq, &self.cycle_fn) {
             return Err(syn::Error::new_spanned(

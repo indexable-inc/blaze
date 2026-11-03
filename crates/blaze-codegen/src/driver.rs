@@ -1150,7 +1150,7 @@ impl Out {
     ) {
         match made {
             Ok(function) => self.push(unit.instance.code, unit.item, function),
-            Err(why) => self.errors.push(unfit(key, unit.item, name, whence, why)),
+            Err(why) => self.errors.push(unfit(key, unit.item, name, whence, &why)),
         }
     }
 
@@ -1308,7 +1308,7 @@ enum Whence {
 }
 
 /// Function `key` (`item`, called `name`) could not be made of the template from `whence`.
-fn unfit(key: InstanceKey, item: ItemKey, name: &str, whence: Whence, why: TemplateError) -> CodegenError {
+fn unfit(key: InstanceKey, item: ItemKey, name: &str, whence: Whence, why: &TemplateError) -> CodegenError {
     let what = match whence {
         // alloc: an error
         Whence::Folded(_) => format!("the body folded for the group of `{name}` ({key:?}, the group's key)"),
@@ -2008,7 +2008,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let owning = tracing::info_span!(target: "blaze", "codegen owners", functions = nodes.len()).entered();
         // Over the columns, whose iterators clone: the owners are read before they are checked.
         let owned = owners::owners(
-            nodes.keys.iter().zip(&nodes.values).map(|(key, node)| owners::Function {
+            &nodes.keys.iter().zip(&nodes.values).map(|(key, node)| owners::Function {
                 key: *key,
                 item: node.unit.item,
                 owner: node.described.owner,
@@ -2017,7 +2017,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 name: &node.described.name,
                 origin: node.described.origin,
             }),
-            statics.keys.iter().zip(&statics.values).map(|(id, node)| owners::StaticOf {
+            &statics.keys.iter().zip(&statics.values).map(|(id, node)| owners::StaticOf {
                 id: *id,
                 unit: InstanceKey(node.described.value),
                 owner: node.described.owner,
@@ -2378,7 +2378,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         for it in flown {
             match it {
                 Flown::Ran(piece) => out.absorb(piece),
-                Flown::Landed((key, own), shape) => self.landed(nodes, key, shape, own, out),
+                Flown::Landed((key, own), shape) => self.landed(nodes, key, shape, own.as_ref().map(|(own, _)| own), out),
             }
         }
         if self.frontend.stopped() {
@@ -2456,11 +2456,11 @@ impl<'a, B: Prepare> Build<'a, B> {
         nodes: &Sorted<InstanceKey, Node<B>>,
         key: InstanceKey,
         shape: ContentId,
-        own: Option<(Shape, B::Prepared)>,
+        own: Option<&Shape>,
         out: &mut Out,
     ) {
         let node = &nodes[&key];
-        if let Some((own, _)) = own {
+        if let Some(own) = own {
             let own = own.key();
             if own != shape {
                 let (name, stored) = (&node.described.name, node.stored());

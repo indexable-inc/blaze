@@ -164,8 +164,16 @@ impl<'db> Filler<'db> {
     /// The alias `ty`, instantiated, with its arguments normalized, normalized, and what it
     /// normalized to normalized.
     fn normalize_alias(&mut self, ty: Ty<'db>) -> Result<Ty<'db>, MirLowerError<'db>> {
-        let ty = ty.try_super_fold_with(self)?;
-        let ty = self.normalized(ty)?;
+        let alias = ty.try_super_fold_with(self)?;
+        let ty = self.normalized(alias)?;
+        // An impl's item for a trait method's `impl Trait` with no value is an error type; why
+        // is the impl's to say.
+        if references_non_lt_error(&ty)
+            && let Some(message) =
+                hir_ty::rpitit::rpitit_value_error(&self.infcx, self.trait_env.param_env, alias)
+        {
+            return Err(MirLowerError::RpititValue(message.into()));
+        }
         // Normalization could introduce infer vars (for example, if the alias cannot be normalized),
         // and we must not have infer vars in the body.
         let ty = ty.replace_infer_with_error(self.infcx.interner);
@@ -530,7 +538,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for EraseAndAnonymize<'db> {
 }
 
 /// The constant behind a promoted `&expr` of `owner`, as the instance with `subst` sees it.
-#[blaze_query::tracked(returns(as_ref), lru = 0)]
+#[blaze_query::tracked(returns(as_ref), lru = 0, mem_tag = Mir)]
 pub fn monomorphized_promoted_mir_body_query<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,

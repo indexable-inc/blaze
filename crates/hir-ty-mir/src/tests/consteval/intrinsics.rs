@@ -2060,6 +2060,7 @@ fn f64s(it: [f64; 2]) -> i128 {
 const NAN32: f32 = f32::from_bits(0x7fc0_0000);
 const NAN64: f64 = f64::from_bits(0x7ff8_0000_0000_0000);
 
+#[expect(clippy::needless_pass_by_value, reason = "a `check_fail` callback, which `check_fail` hands the error by value")]
 fn is_ub(e: ConstEvalError<'_>) -> bool {
     matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_)))
 }

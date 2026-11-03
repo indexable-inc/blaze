@@ -34,8 +34,8 @@ export const rules = [
 	},
 	{
 		id: "blaze-builds-blaze",
-		info: "Build and test blaze with blaze (`blaze build`, `blaze test`), never `cargo build`/`cargo test` or sccache. Where blaze can't build itself yet, fix that.",
-		reason: "\"never use sccache never use rustc\" and \"we should make sure we get blaze to fully build itself! basically blaze sucks until then\" (Andrew, 2026-10-26).",
+		info: "Build, check and test blaze with blaze (`blaze build`, `blaze check`, `blaze test`), never `cargo build`/`cargo test` or sccache. cargo only bootstraps: it builds the `blaze` binary, and every check, test and verdict after that comes from blaze. When blaze fails on blaze (a compile error, a link error, a panic, a hang, a wrong result, too slow, too much memory), that failure is the work: fix blaze, never route around it through cargo. A crate blaze can't check or test yet is a ranked, owned blocker, not a reason to keep using cargo for it.",
+		reason: "\"never use sccache never use rustc\" and \"we should make sure we get blaze to fully build itself! basically blaze sucks until then\" (Andrew, 2026-10-26). \"we should try to do this all in blaze and if things dont work [that] doesnt mean use cargo, means fix blaze\" (Andrew, 2026-11-03): that day every lane test still went through `cargo test` (median 14 min a request, with no skipping of unchanged tests), while blaze's failures on blaze waited for an occasional self-build round.",
 		link: "docs/contributing.md",
 	},
 	{
@@ -115,7 +115,7 @@ export const rules = [
 	},
 	{
 		id: "panics-fail-one-job",
-		info: "A panic inside a job (a query, a codegen unit, a proc-macro evaluation) fails that job's units with a typed error naming the panic and the job; the daemon keeps serving and `--keep-going` keeps building the rest. Formatting an error must not panic: render what needs the database while the database is attached.",
+		info: "A panic inside a job (a query, a codegen unit, a proc-macro evaluation) fails that job's units with a typed error naming the panic and the job; the daemon keeps serving and keep-going (the default; `--fail-fast` opts out) keeps building the rest. Formatting an error must not panic: render what needs the database while the database is attached.",
 		reason: "2026-11-01: a proc-macro evaluation error panicked while being formatted (its type needed the attached database), and the daemon dropped whole self-builds at 84 crates until it was found.",
 	},
 	{
@@ -140,7 +140,7 @@ export const rules = [
 	},
 	{
 		id: "deterministic-output",
-		info: "No output (an object, a diagnostic's order, a store key, a profile row's identity) depends on hash-map iteration order, thread timing, addresses or the wall clock. Hashers have fixed seeds; anything iterated into output is sorted or ordered by construction; a test builds twice and compares bytes.",
+		info: "No output (an object, a diagnostic's order, a store key, a profile row's identity) depends on hash-map iteration order, thread timing, addresses or the wall clock. Hashers have fixed seeds, except a table whose keys an attacker may pick (names, paths, literals), which is keyed by a `blaze_hash::SipKey`: random when nothing persists its layout and nothing output depends on where a key lands, or `blaze_ids::index_key` of its content when an image lays it out; a hot one may instead be adaptive (`blaze_hash::adaptive`): the fixed hash until a lookup walks a run no honest keys make, then a random `SipKey` for good. Anything iterated into output is sorted or ordered by construction; a test builds twice and compares bytes.",
 		reason: "Content-addressed caching and replay need identical bytes from identical inputs; a nondeterministic key shows up as a store refusal or a cache that never hits.",
 	},
 	{
@@ -177,9 +177,14 @@ export const rules = [
 	},
 	{
 		id: "work-in-ix-vms",
-		info: "Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix new`, `ix shell`, `ix rm`), never on the Mac or AWS. Where an ix VM can't do it, stop and say what is missing.",
-		reason: "Andrew, 2026-10-27. It replaced heavy-work-on-dev-host (AWS dev hosts claimed in the host ledger, the Mac for quick checks).",
+		info: "Builds, tests, benchmarks and experiments run on the Mac or in an ix VM (`ix new`, `ix shell`, `ix rm`), never on AWS. Where neither can do it, stop and say what is missing.",
+		reason: "Andrew, 2026-10-27 (ix VMs, no AWS dev hosts); the Mac allowed again 2026-11-01. It replaced heavy-work-on-dev-host (AWS dev hosts claimed in the host ledger).",
 		link: "docs/contributing.md#working-in-parallel",
+	},
+	{
+		id: "fan-out-write-only",
+		info: "Fan out code, not builds. Subagents only read and write code, including the tests for it. They never run a build, check, test, clippy, benchmark or any other expensive step, and never start a daemon or a VM. The main agent waits until every subagent has finished writing, applies all their changes to one tree, and then runs it once: `blaze check` and `blaze test` (the central loop), with keep-going. It hands each failure back to a fresh subagent for the code that broke, with the exact tree, the command and the error, and runs again. Checks that need a variant tree, such as reverting a fix to show its test fails (test-the-cause), are also run by the main agent, as patches.",
+		reason: "\"sub agents should NEVER do tests/check any expensive operation, just write code, and then when all subagents are done writing code the main agent actually tests them (blaze test) and compiles\" (Andrew, 2026-11-03). That night about 20 lanes each built and tested their own snapshot through a shared queue: a median 14 min per request, 312 s of it waiting behind other lanes' compiles. Twenty-one background waiters piled up, and the same crates were rebuilt for every lane. One build of the combined tree, kept warm, does that work once.",
 	},
 	{
 		id: "worktree-per-lane",

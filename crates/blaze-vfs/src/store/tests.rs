@@ -249,6 +249,7 @@ impl Parts {
             spans: &self.spans,
             name_bytes: &self.name_bytes,
             name_index: &self.name_index,
+            name_key: [0, 0],
         }
         .check(blobs)
     }

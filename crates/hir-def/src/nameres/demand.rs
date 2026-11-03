@@ -298,7 +298,7 @@ fn owning_item(
     db: &Db,
     block: AstId<tag::BlockExpr>,
 ) -> Result<ErasedAstId, String> {
-    fn range<'t, N: AstNode<'t>>(it: N) -> TextRange {
+    fn range<'t, N: AstNode<'t> + Copy>(it: N) -> TextRange {
         it.syntax().text_range()
     }
     let mut file = block.file_id;

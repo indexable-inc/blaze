@@ -522,7 +522,7 @@ impl Diag {
     /// `codes`. rustc's `span_suggestions` is this with [`SuggestionStyle::ShowAlways`].
     pub fn suggestions(
         &mut self,
-        span: Span,
+        span: &Span,
         message: impl Into<String>,
         codes: impl IntoIterator<Item = String>,
         applicability: Applicability,

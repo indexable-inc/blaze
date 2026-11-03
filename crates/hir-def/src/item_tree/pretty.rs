@@ -116,7 +116,7 @@ impl Printer<'_> {
 
     fn print_visibility(&mut self, vis: RawVisibilityId) {
         match &self.tree[vis] {
-            RawVisibility::Module(path, _expl) => {
+            RawVisibility::Module(path, _expl, _) => {
                 w!(self, "pub(in {}) ", path.display(self.db, self.edition))
             }
             RawVisibility::Public => w!(self, "pub "),

@@ -78,6 +78,7 @@ enum FnPos {
     Ret,
 }
 
+#[derive(Clone, Copy)]
 enum FfiResult<'db> {
     Safe,
     Phantom(Ty<'db>),

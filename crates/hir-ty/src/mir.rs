@@ -1059,7 +1059,7 @@ impl BinOp {
         )
     }
 
-    pub fn run_compare<T: PartialEq + PartialOrd>(&self, l: T, r: T) -> bool {
+    pub fn run_compare<T: Copy + PartialOrd>(&self, l: T, r: T) -> bool {
         match self {
             BinOp::Ge => l >= r,
             BinOp::Gt => l > r,
@@ -2825,7 +2825,7 @@ impl Budget {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IsSigned {
     Yes,
     No,
@@ -2885,6 +2885,9 @@ pub enum MirLowerError<'db> {
 
     // monomorphization errors:
     GenericArgNotProvided(GenericParamId, StoredGenericArgs),
+    /// A trait method's `impl Trait` normalized to the impl's item for it, which has no value:
+    /// `crate::rpitit::RpititError::message`, naming the impl's method and the item.
+    RpititValue(Box<str>),
 }
 
 impl From<LayoutError> for MirLowerError<'_> {

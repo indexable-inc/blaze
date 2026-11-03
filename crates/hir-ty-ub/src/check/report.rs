@@ -142,7 +142,7 @@ impl<'db> Report<'_, 'db> {
 fn source_range(db: &Db, def: InferBodyId<'_>, span: MirSpan) -> Option<(FileId, TextRange)> {
     let (source_map, self_param_syntax) = match def {
         InferBodyId::DefWithBodyId(def) => {
-            let body = &Body::with_source_map(db, def).1;
+            let body = Body::source_map(db, def);
             (&**body, body.self_param_syntax())
         }
         InferBodyId::AnonConstId(def) => (ExpressionStore::with_source_map(db, def.loc(db).owner).1, None),

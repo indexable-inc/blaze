@@ -83,7 +83,7 @@ struct S;
 impl Tr for S {}
 fn caller() { let _x = S.f(); let _y = S.g(); }
 "#,
-        expect![[r#"
+        &expect![[r#"
             21..25 'self': &'? Self
             41..48 '{ 0u8 }': u8
             43..46 '0u8': u8

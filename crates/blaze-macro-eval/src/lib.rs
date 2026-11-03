@@ -30,6 +30,7 @@ mod protocol;
 mod run;
 mod server;
 mod stream;
+mod turn;
 mod wasm;
 mod wire;
 

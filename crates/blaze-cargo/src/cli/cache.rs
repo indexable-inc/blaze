@@ -14,14 +14,15 @@
 
 use std::{ffi::OsString, path::Path};
 
+use blaze_core::exit::Exit;
 use blaze_gc::{Collector, Config, Inventory};
 
-use super::{FAILED, USAGE, say};
+use super::say;
 
 const USAGE_TEXT: &str = "blaze cache gc [--dry-run] | blaze cache gc --last";
 
 /// `blaze cache`, with the words after it.
-pub fn main(words: Vec<OsString>, color: bool) -> i32 {
+pub fn main(words: &[OsString], color: bool) -> i32 {
     let refused = |what: &str, code: i32| {
         eprint!("{}", say::error(what, color));
         code
@@ -31,7 +32,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
         Some(["gc"]) => (false, false),
         Some(["gc", "--dry-run" | "-n"]) => (true, false),
         Some(["gc", "--last"]) => (false, true),
-        _ => return refused(USAGE_TEXT, USAGE),
+        _ => return refused(USAGE_TEXT, Exit::Usage.code()),
     };
     let done = if last { last_runs() } else { collect(dry_run) };
     match done {
@@ -39,7 +40,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
             print!("{out}");
             0
         }
-        Err(what) => refused(&what, FAILED),
+        Err(what) => refused(&what, Exit::Failed.code()),
     }
 }
 

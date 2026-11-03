@@ -19,12 +19,11 @@
 //! words mean the same in another process. Outside, the bytes are exactly the ones above.
 
 use std::cell::RefCell;
-use std::hash::BuildHasher;
 use std::mem::{offset_of, size_of};
 use std::ops::{Deref, DerefMut};
 
 use blaze_format::{FormatError, Slice, Str, Writer};
-use blaze_hash::{FixedState, HashMap};
+use blaze_hash::{HashMap, LazyKey};
 use std::alloc::Global;
 use cfg::{CfgAtom, CfgExpr};
 use hir_expand::{
@@ -375,6 +374,17 @@ pub(crate) struct WordsBuffers {
 }
 
 const NO_NAME: u32 = u32::MAX;
+
+/// What a name's hash in [`WordsBuffers::by_hash`] is keyed by, drawn at random on first use:
+/// the names are a source's identifiers and strings, so a hash anyone can compute (foldhash's
+/// fixed seed) would let a source pick thousands with one hash, each then walking the chain of
+/// all of them. Only the order names are first seen numbers them, so the bytes written are the
+/// same under any key.
+static TEXT_KEY: LazyKey = LazyKey::new();
+
+fn text_hash(text: &str) -> u64 {
+    TEXT_KEY.get().hash(text.as_bytes())
+}
 /// The spares a thread keeps (writes nest: a buffer's values are written while another's
 /// are), and the words above which a spare is freed rather than kept.
 const SPARE_WORDS: usize = 4;
@@ -507,7 +517,7 @@ impl Words {
     }
 
     fn name(&mut self, text: &str) -> u32 {
-        let hash = FixedState.hash_one(text);
+        let hash = text_hash(text);
         let mut at = self.by_hash.get(&hash).copied().unwrap_or(NO_NAME);
         while at != NO_NAME {
             let (start, len) = self.names[at as usize];
@@ -1308,7 +1318,7 @@ mod tests {
 
     const SCHEMA: blaze_format::SchemaHash = <Root as blaze_format::Record>::SCHEMA;
 
-    fn round_trip<T: Code + PartialEq + std::fmt::Debug>(value: T) {
+    fn round_trip<T: Code + PartialEq + std::fmt::Debug>(value: &T) {
         let mut w = Words::new();
         let first = w.at();
         value.put(&mut w);
@@ -1319,37 +1329,37 @@ mod tests {
         let buffer = blaze_format::Aligned::copy_from(&out.finish(root));
         let root = blaze_format::open::<Root>(&buffer).expect("a buffer just written");
         let mut r = Read::new(&root.words, &buffer).from(root.first);
-        assert_eq!(r.get::<T>().expect("a value just written"), value);
+        assert_eq!(&r.get::<T>().expect("a value just written"), value);
     }
 
     #[test]
     fn values_read_back_as_written() {
-        round_trip(0u8);
-        round_trip(u32::MAX);
-        round_trip(u64::MAX - 1);
-        round_trip(u128::MAX - 7);
-        round_trip(i128::MIN + 3);
-        round_trip('é');
-        round_trip(Some(Box::<str>::from("a name")));
-        round_trip(None::<u32>);
-        round_trip(vec![String::from("x"), String::from("y"), String::from("x")]);
-        round_trip((true, 7u16, Symbol::intern("sym")));
-        round_trip(ModPath::from_segments(
+        round_trip(&0u8);
+        round_trip(&u32::MAX);
+        round_trip(&(u64::MAX - 1));
+        round_trip(&(u128::MAX - 7));
+        round_trip(&(i128::MIN + 3));
+        round_trip(&'é');
+        round_trip(&Some(Box::<str>::from("a name")));
+        round_trip(&None::<u32>);
+        round_trip(&vec![String::from("x"), String::from("y"), String::from("x")]);
+        round_trip(&(true, 7u16, Symbol::intern("sym")));
+        round_trip(&ModPath::from_segments(
             PathKind::Super(2),
             [Name::new_symbol_root(Symbol::intern("a")), Name::new_symbol_root(Symbol::intern("b"))],
         ));
-        round_trip(CfgExpr::All(Box::new([
+        round_trip(&CfgExpr::All(Box::new([
             CfgExpr::Atom(CfgAtom::Flag(Symbol::intern("test"))),
             CfgExpr::Not(Box::new(CfgExpr::Atom(CfgAtom::KeyValue {
                 key: Symbol::intern("target_os"),
                 value: Symbol::intern("linux"),
             }))),
         ])));
-        round_trip(TextRange::new(3.into(), 9.into()));
-        round_trip(SyntaxContext::root(Edition::Edition2021));
-        round_trip(Edition::Edition2024);
+        round_trip(&TextRange::new(3.into(), 9.into()));
+        round_trip(&SyntaxContext::root(Edition::Edition2021));
+        round_trip(&Edition::Edition2024);
         // A field a `macro` names: its text and its context, not the process's id in its symbol.
-        round_trip(Name::new_symbol_root(Symbol::intern("x")).keyed(SyntaxContext::from_u32(5)));
+        round_trip(&Name::new_symbol_root(Symbol::intern("x")).keyed(SyntaxContext::from_u32(5)));
     }
 
     /// A keyed name (a generic parameter or a lifetime a `macro` wrote) reads back with its key,
@@ -1360,7 +1370,7 @@ mod tests {
     fn a_keyed_name_reads_back_with_its_key_relocated() {
         let plain = Name::new_root("T");
         let keyed = plain.keyed(SyntaxContext::from_u32(5));
-        round_trip((keyed, plain));
+        round_trip(&(keyed, plain));
         let value = (keyed, (plain, keyed));
         let mut table = Relocation::new();
         let mut w = Words::new();
@@ -1414,7 +1424,7 @@ mod tests {
         // A collision: two names chained under one hash are still found by their text.
         let mut w = Words::new();
         let (first, second) = (w.name("x"), w.name("y"));
-        let hash = FixedState.hash_one("x");
+        let hash = text_hash("x");
         w.by_hash.insert(hash, second);
         w.same_hash[second as usize] = first;
         assert_eq!(w.name("x"), first);

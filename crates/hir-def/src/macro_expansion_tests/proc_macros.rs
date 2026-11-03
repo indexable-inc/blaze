@@ -313,7 +313,7 @@ use proc_macros::disallow_cfg;
 #[disallow_cfg] #[cfg_attr(false, inline)] fn baz() {}
 #[disallow_cfg] #[cfg_attr(true, inline)] fn qux() {}
     "#,
-        expect![[r#""#]],
+        &expect![[r#""#]],
     );
 }
 

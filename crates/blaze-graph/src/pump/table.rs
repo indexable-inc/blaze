@@ -152,7 +152,8 @@ struct Bucket<V> {
 // SAFETY: a bucket's entries are reached only under its chain's latch, and its waiters only
 // there or by the runner that took them out, which sends each a `V` (hence `V: Send`).
 unsafe impl<V: Send> Send for Bucket<V> {}
-// SAFETY: as above.
+// SAFETY: a `&Bucket` touches its entries only under its chain's latch, and its run words are
+// atomics; a waiter's `V` is handed over by the one runner that took it out (hence `V: Send`).
 unsafe impl<V: Send> Sync for Bucket<V> {}
 
 impl<V> Bucket<V> {

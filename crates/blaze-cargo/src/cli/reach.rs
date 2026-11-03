@@ -8,11 +8,11 @@
 use std::{ffi::OsString, fmt::Write as _};
 
 use blaze_api::{Reach, Request, ResponseRef, ViewRef};
+use blaze_core::exit::Exit;
 use blaze_vfs::View;
 use blaze_ids::ContentId;
 
 use super::{
-    FAILED, USAGE,
     args::{self, Asked},
     daemon::Start,
     observe, say,
@@ -32,8 +32,8 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
 }
 
 fn reach(words: Vec<OsString>, color: bool) -> Result<(), (String, i32)> {
-    let usage = |what: String| (format!("{REACH_USAGE}: {what}"), USAGE);
-    let failed = |what: String| (what, FAILED);
+    let usage = |what: String| (format!("{REACH_USAGE}: {what}"), Exit::Usage.code());
+    let failed = |what: String| (what, Exit::Failed.code());
     let (mut from, mut json) = (None, false);
     for word in words {
         let Some(word) = word.to_str() else {

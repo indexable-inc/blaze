@@ -92,6 +92,11 @@ impl Presence {
     fn keys(&self) -> impl DoubleEndedIterator<Item = (usize, usize)> + '_ {
         self.0.iter_ranked()
     }
+
+    /// The heap its bits and their ranks hold.
+    fn heap_bytes(&self) -> usize {
+        size_of_val(self.0.words()) + size_of_val(self.0.ranks())
+    }
 }
 
 /// How many of `slots` a column of them keeps: up to the last with a value.
@@ -235,6 +240,13 @@ impl<K> Default for TyColumn<K> {
     }
 }
 
+impl<K> TyColumn<K> {
+    /// The heap its places and types hold: a pointer per type, which it does not own.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        size_of_val(&*self.at) + size_of_val(&*self.tys)
+    }
+}
+
 impl<K: DenseKey> TyColumn<K> {
     /// The column of `slots`, which it takes the types out of.
     pub(crate) fn from_dense(frame: &Frame, slots: &mut [Option<StoredTy>]) -> Self {
@@ -352,6 +364,13 @@ impl<K, V> Default for IndexColumn<K, V> {
     }
 }
 
+impl<K, V> IndexColumn<K, V> {
+    /// The heap its keys and rows hold, and what `row` says each row owns.
+    pub(crate) fn heap_bytes(&self, row: impl Fn(&V) -> usize) -> usize {
+        self.present.heap_bytes() + size_of_val(&*self.rows) + self.rows.iter().map(row).sum::<usize>()
+    }
+}
+
 impl<K: DenseKey, V> IndexColumn<K, V> {
     /// The column of `slots`, which it takes the rows out of.
     pub(crate) fn from_dense(slots: &mut [Option<V>]) -> Self {
@@ -427,6 +446,13 @@ pub struct ExprOrPatColumn<V> {
 impl<V> Default for ExprOrPatColumn<V> {
     fn default() -> Self {
         ExprOrPatColumn { exprs: IndexColumn::default(), pats: IndexColumn::default() }
+    }
+}
+
+impl<V> ExprOrPatColumn<V> {
+    /// The heap both its columns hold, and what `row` says each row owns.
+    pub(crate) fn heap_bytes(&self, row: impl Fn(&V) -> usize) -> usize {
+        self.exprs.heap_bytes(&row) + self.pats.heap_bytes(&row)
     }
 }
 
@@ -508,6 +534,14 @@ pub struct FieldColumn {
 }
 
 impl FieldColumn {
+    /// The heap its tags, words and fields hold.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        size_of_val(&*self.tags)
+            + size_of_val(&*self.data)
+            + size_of_val(&*self.fields)
+            + size_of_val(&*self.tuple_fields)
+    }
+
     pub(crate) fn from_dense(slots: &[Option<either::Either<FieldId, TupleFieldId>>]) -> Self {
         let slots = &slots[..used(slots)];
         let tuple_count = slots.iter().filter(|it| matches!(it, Some(either::Either::Right(_)))).count();
@@ -661,6 +695,13 @@ pub struct Csr<K, T> {
 impl<K, T> Default for Csr<K, T> {
     fn default() -> Self {
         Csr { present: Presence::default(), ends: Box::default(), items: Box::default(), key: PhantomData }
+    }
+}
+
+impl<K, T> Csr<K, T> {
+    /// The heap its keys, ends and items hold, not what an item owns.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.present.heap_bytes() + size_of_val(&*self.ends) + size_of_val(&*self.items)
     }
 }
 
@@ -918,6 +959,13 @@ impl<K> Default for IdxSet<K> {
     }
 }
 
+impl<K> IdxSet<K> {
+    /// The heap its words hold, by their length (a frozen set is made at its length).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        size_of_val(self.words.words())
+    }
+}
+
 impl<K: DenseKey> IdxSet<K> {
     /// Adds `key`, returning whether it was not in the set.
     pub(crate) fn insert(&mut self, key: K) -> bool {
@@ -981,6 +1029,11 @@ pub struct ExprOrPatSet {
 }
 
 impl ExprOrPatSet {
+    /// The heap both its sets hold.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.exprs.heap_bytes() + self.pats.heap_bytes()
+    }
+
     #[cfg(test)]
     pub(crate) fn insert(&mut self, node: ExprOrPatIdPacked) -> bool {
         match (node.as_expr(), node.as_pat()) {
@@ -1124,6 +1177,13 @@ impl<K> Default for ModeColumn<K> {
     }
 }
 
+impl<K> ModeColumn<K> {
+    /// The heap its codes hold.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        size_of_val(&*self.codes)
+    }
+}
+
 impl<K: DenseKey> ModeColumn<K> {
     pub(crate) fn from_dense(slots: &[Option<BindingMode>]) -> Self {
         let codes = slots[..used(slots)].iter().map(|mode| mode.map_or(MODE_NONE, mode_code));
@@ -1184,6 +1244,13 @@ pub struct SortedMap<K, V> {
 impl<K, V> Default for SortedMap<K, V> {
     fn default() -> Self {
         SortedMap { entries: Box::default() }
+    }
+}
+
+impl<K, V> SortedMap<K, V> {
+    /// The heap its entries hold, and what `value` says each value owns.
+    pub(crate) fn heap_bytes(&self, value: impl Fn(&V) -> usize) -> usize {
+        size_of_val(&*self.entries) + self.entries.iter().map(|(_, it)| value(it)).sum::<usize>()
     }
 }
 

@@ -169,7 +169,7 @@ impl Client {
         Ok(Client::over(Link::Unix(stream)))
     }
 
-    pub fn http(at: SocketAddr, token: String) -> Result<Client, ClientError> {
+    pub fn http(at: SocketAddr, token: &str) -> Result<Client, ClientError> {
         let stream = TcpStream::connect(at)
             // alloc: error path, a connect that failed.
             .map_err(|error| io::Error::new(error.kind(), format!("{at}: {error}")))?;

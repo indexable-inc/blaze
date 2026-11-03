@@ -3,7 +3,7 @@
 //! an answer is found while its facts hold and refused when one or the solver changed, a goal
 //! with a read that is no fact is never stored, and a lookup with no store allocates nothing.
 
-use std::{collections::BTreeSet, marker::PhantomData, path::Path, sync::Arc};
+use std::{collections::BTreeSet, marker::PhantomData, sync::Arc};
 
 use base_db::{Crate, Db, Env, all_crates};
 use blaze_alloc_count::assert_at_most;
@@ -24,8 +24,8 @@ use parking_lot::Mutex;
 use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
 
 use super::{
-    Answer, FactObject, FactRef, Flushed, GoalFacts, SOLVER_FILES, install, lookup, lookup_goal,
-    offer, offer_goal,
+    Answer, FactObject, FactRef, Flushed, GoalFacts, install, lookup, lookup_goal, offer,
+    offer_goal,
     record::{self, Shape, ShapeRef},
     solver_version,
     stable::{self, Goal},
@@ -613,21 +613,34 @@ fn a_lookup_or_offer_with_no_store_allocates_nothing() {
     offered_with_no_store(&db, Knob::new(&db, 1, true, krate));
 }
 
+/// Rule 18, the solver's code: an edit of the vendored solver's source is another front-end
+/// identity (`blaze_codegen_code::FRONT_END`, as blaze-engine's build script works it out and its
+/// main hands it over as `build`), so another solver version, and an answer kept by the solver
+/// before the edit misses in the goal store of the solver after it, and is found again by the one
+/// that kept it. (The item store: `body_store::tests`,
+/// `an_item_kept_by_one_solver_misses_after_a_solver_source_edit`; that every file of the real
+/// vendored solver is an input of the identity: blaze-cargo's `tests/front_end_identity.rs`.)
 #[test]
-fn the_solver_version_covers_every_patch() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut on_disk = BTreeSet::from([String::from("harness/toolchain")]);
-    for dir in ["vendor/rustc_next_trait_solver", "vendor/rustc_type_ir"] {
-        on_disk.insert(format!("{dir}/PATCHES.md"));
-        for entry in std::fs::read_dir(root.join(dir).join("patches")).unwrap() {
-            let name = entry.unwrap().file_name().into_string().unwrap();
-            on_disk.insert(format!("{dir}/patches/{name}"));
-        }
-    }
-    let listed: BTreeSet<String> = SOLVER_FILES.iter().map(|(name, _)| String::from(*name)).collect();
-    assert_eq!(listed, on_disk, "`SOLVER_FILES` lists the toolchain and every solver patch");
-    for (name, bytes) in SOLVER_FILES {
-        assert_eq!(std::fs::read(root.join(name)).unwrap(), bytes, "{name} as embedded");
-    }
-    assert_ne!(solver_version(&BUILD), solver_version(&OTHER_BUILD));
+fn a_solver_source_edit_changes_the_identity_and_misses_the_goal_store() {
+    let (before, after) = blaze_codegen_code::fixture::front_end_around_a_solver_edit();
+    let (before, after) = (ContentId(before), ContentId(after));
+    assert_ne!(before, after, "an edit of the solver's source is another front-end identity");
+    assert_ne!(solver_version(&before), solver_version(&after));
+
+    let db = db_of(FIXTURE);
+    let krate = local_crate(&db);
+    let knob = Knob::new(&db, 1, true, krate);
+    let memory = Arc::new(Memory::default());
+    let facts = Arc::new(TestFacts::new(knob, true));
+    let kept = install(&db, memory.clone(), facts.clone(), before).unwrap();
+    offered(&db, knob);
+    assert_eq!(kept.flush().unwrap(), Flushed { written: 1, ..Flushed::default() });
+    assert_eq!(looked_up(&db, krate), Some(Answer::Holds));
+    drop(kept);
+    let edited = install(&db, memory.clone(), facts.clone(), after).unwrap();
+    assert_eq!(looked_up(&db, krate), None, "the edited solver finds no answer of the one before it");
+    drop(edited);
+    let again = install(&db, memory.clone(), facts, before).unwrap();
+    assert_eq!(looked_up(&db, krate), Some(Answer::Holds), "the solver that kept it finds it");
+    drop(again);
 }

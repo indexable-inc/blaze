@@ -39,6 +39,7 @@ pub mod busy;
 mod cgroup;
 pub mod create_process;
 pub mod decimal;
+pub mod exit;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the fanotify driver: its system calls and the events it reads")]
 mod fanotify;
@@ -61,6 +62,12 @@ pub mod kqueue;
 mod net;
 #[cfg(unix)]
 mod process;
+/// The children the drivers started and have not reaped, for a stall report to name
+/// ([`children::unreaped`]).
+#[cfg(unix)]
+pub mod children {
+    pub use crate::process::{State, Unreaped, Waiter, unreaped};
+}
 #[allow(unsafe_code, reason = "single system calls and the aligned-copy view, each behind a safe function")]
 mod raw;
 pub mod signal;

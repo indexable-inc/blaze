@@ -16,6 +16,7 @@
 //! Bearer`, and only to the source's own host and port, never to a `diff --base` elsewhere.
 
 use std::{
+    borrow::Cow,
     ffi::OsString,
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
@@ -23,10 +24,11 @@ use std::{
     time::Duration,
 };
 
+use blaze_core::exit::Exit;
 use ix_prof::{Kind, Profile, View, report};
 use regex::Regex;
 
-use super::{FAILED, USAGE, say};
+use super::say;
 
 const PPROF_USAGE: &str = "blaze pprof [--kind cpu|heap|spans|waits] [--type NAME] [--token-file FILE] FILE|URL|--dir IX_PROF ENDPOINT \
                            [top [-cum] [-n N] | peek REGEX | tree [--min FRACTION] [--reverse] | list REGEX [--source DIR] \
@@ -63,10 +65,11 @@ enum Loaded {
 }
 
 impl Loaded {
-    fn view(&self, kind: Kind) -> View {
+    /// The view of `kind` an .ixprof is seen as, or the one a pprof file is.
+    fn view(&self, kind: Kind) -> Cow<'_, View> {
         match self {
-            Loaded::Ixprof(p) => View::of(p, kind),
-            Loaded::Pprof(v) => v.clone(),
+            Loaded::Ixprof(p) => Cow::Owned(View::of(p, kind)),
+            Loaded::Pprof(v) => Cow::Borrowed(v),
         }
     }
 }
@@ -84,11 +87,11 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
 type Refused = (i32, String);
 
 fn usage(what: impl Into<String>) -> Refused {
-    (USAGE, format!("{}\nusage: {PPROF_USAGE}", what.into()))
+    (Exit::Usage.code(), format!("{}\nusage: {PPROF_USAGE}", what.into()))
 }
 
 fn failed(what: impl Into<String>) -> Refused {
-    (FAILED, what.into())
+    (Exit::Failed.code(), what.into())
 }
 
 fn run(words: Vec<OsString>) -> Result<(), Refused> {
@@ -151,10 +154,10 @@ fn run(words: Vec<OsString>) -> Result<(), Refused> {
         return serve(&loaded, &source, rest.get(1).map(String::as_str).unwrap_or("127.0.0.1:0"));
     }
     let view = loaded.view(kind);
-    verb(&loaded, view, kind, ty.as_deref(), &rest, &fetch)
+    verb(&loaded, &view, kind, ty.as_deref(), &rest, &fetch)
 }
 
-fn verb(loaded: &Loaded, view: View, kind: Kind, ty: Option<&str>, rest: &[String], fetch: &Fetch) -> Result<(), Refused> {
+fn verb(loaded: &Loaded, view: &View, kind: Kind, ty: Option<&str>, rest: &[String], fetch: &Fetch) -> Result<(), Refused> {
     let ty_index = view.type_index(ty).ok_or_else(|| {
         let names: Vec<&str> = view.sample_types.iter().map(|it| it.name.as_str()).collect();
         usage(format!("--type {}: the profile's sample types are {names:?}", ty.unwrap_or("")))
@@ -171,31 +174,32 @@ fn verb(loaded: &Loaded, view: View, kind: Kind, ty: Option<&str>, rest: &[Strin
         Regex::new(p).map_err(|why| usage(format!("`{p}` is not a regex: {why}")))
     };
     let out = match asked {
-        "top" => report::top(&view, ty_index, flag("-cum") || flag("--cum"), number("-n", 20)?),
-        "peek" => report::peek(&view, ty_index, &pattern()?),
+        "top" => report::top(view, ty_index, flag("-cum") || flag("--cum"), number("-n", 20)?),
+        "peek" => report::peek(view, ty_index, &pattern()?),
         "tree" => {
             let min: f64 = value("--min").map_or(Ok(0.005), |v| v.parse().map_err(|_| usage(format!("--min {v} is not a fraction"))))?;
-            report::tree(&view, ty_index, min, flag("--reverse"))
+            report::tree(view, ty_index, min, flag("--reverse"))
         }
-        "list" => report::list(&view, ty_index, &pattern()?, value("--source").map(Path::new)),
-        "flame" if flag("--folded") => report::folded(&view, ty_index),
+        "list" => report::list(view, ty_index, &pattern()?, value("--source").map(Path::new)),
+        "flame" if flag("--folded") => report::folded(view, ty_index),
         "flame" => {
             let width = std::env::var("COLUMNS").ok().and_then(|it| it.parse().ok()).unwrap_or(120);
-            report::flame(&view, ty_index, number("--width", width)?, number("--depth", 40)?)
+            report::flame(view, ty_index, number("--width", width)?, number("--depth", 40)?)
         }
         "diff" => {
             let base = value("--base").ok_or_else(|| usage("`diff` takes --base FILE|URL"))?;
-            let base_view = load(base, fetch)?.view(kind);
-            let d = report::diff(&view, &base_view).map_err(failed)?;
+            let base = load(base, fetch)?;
+            let d = report::diff(view, &base.view(kind)).map_err(failed)?;
             let after: Vec<String> = args
                 .iter()
                 .enumerate()
                 .filter(|(i, a)| *a != "--base" && args.get(i.wrapping_sub(1)).is_none_or(|p| p != "--base"))
                 .map(|(_, a)| a.clone())
                 .collect();
-            return verb(&Loaded::Pprof(d.clone()), d, kind, ty, &after, fetch);
+            let diffed = Loaded::Pprof(d);
+            return verb(&diffed, &diffed.view(kind), kind, ty, &after, fetch);
         }
-        "export" => return export(loaded, &view, args),
+        "export" => return export(loaded, view, args),
         other => return Err(usage(format!("no verb `{other}`"))),
     };
     let mut stdout = std::io::stdout().lock();

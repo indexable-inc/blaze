@@ -184,7 +184,16 @@ pub(crate) fn may_name_a_variant(db: &Db, body: &Body, infer: &InferenceResult<'
             return false;
         };
         let AdtId::EnumId(enum_) = def.def_id() else { return false };
-        matches!(enum_.enum_variants(db).variants.get(&binding.name), Some((_, FieldsShape::Unit)))
+        has_unit_variant_named(db, enum_, binding.name)
+    })
+}
+
+/// Whether `enum_` has a unit variant of `name`'s text: rustc's `bindings_with_variant_name`
+/// compares the symbols, not the hygienic keys a variant a `macro` writes is defined under.
+fn has_unit_variant_named(db: &Db, enum_: EnumId, name: hir_expand::name::Name) -> bool {
+    let name = name.unkeyed();
+    enum_.enum_variants(db).variants.iter().any(|(it, &(_, shape))| {
+        shape == FieldsShape::Unit && it.unkeyed() == name
     })
 }
 
@@ -903,12 +912,11 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
                 return;
             };
             let AdtId::EnumId(enum_) = def.def_id() else { return };
-            let variants = &enum_.enum_variants(db).variants;
-            if let Some((_, FieldsShape::Unit)) = variants.get(&body[id].name) {
+            if has_unit_variant_named(db, enum_, body[id].name) {
                 lints.push(MatchLint::BindingWithVariantName(BindingWithVariantName {
                     pat,
                     enum_,
-                    suggest: refutable || variants.len() == 1,
+                    suggest: refutable || enum_.enum_variants(db).variants.len() == 1,
                 }));
             }
         });

@@ -8,6 +8,7 @@ use std::fmt::Write;
 use base_db::Db;
 use blaze_mem::{Tag, frame};
 use hir_def::{Lookup, VariantId, expr_store::ExpressionStore, signatures::FunctionSignature};
+use hir_ty_print::rustc_type_name;
 use rustc_type_ir::inherent::IntoKind;
 
 use crate::{
@@ -19,7 +20,7 @@ use crate::{
 use super::{
     AggregateKind, AsmOperand, AssertKind, BasicBlockId, BinOp, BorrowKind, CastKind, LocalId,
     MirBody, MutBorrowKind, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind,
-    StoredPlace, TerminatorKind, UnOp, transform::Ctx, type_name::rustc_type_name,
+    StoredPlace, TerminatorKind, UnOp, transform::Ctx,
 };
 
 /// `body` as rustc prints the MIR of the function `name`.
@@ -664,7 +665,7 @@ fn bin_op_name(op: &BinOp) -> &'static str {
 pub fn closure_path_suffix(db: &Db, closure: InternedClosureId<'_>) -> Option<String> {
     let loc = closure.loc(db);
     let crate::InferBodyId::DefWithBodyId(owner) = loc.owner else { return None };
-    super::type_name::rustc_closure_suffix(db, owner, loc.expr)
+    hir_ty_print::rustc_closure_suffix(db, owner, loc.expr)
 }
 
 /// The size of a value of a scalar type rustc prints constants of by value.
