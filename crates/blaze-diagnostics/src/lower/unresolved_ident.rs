@@ -78,6 +78,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
             // alloc: the error's label, for an error hir found
             diag.span_label(defined, format!("`{display}` defined here"));
         }
+        // rustc still offers the value of that name to import (`report_with_use_injections`).
+        if let Some(module) = module {
+            let found = imports(cx, module, source, name, None);
+            show_imports(cx, &mut diag, module, found, true);
+        }
         diag
     } else {
         // alloc: the error's text, for an error hir found
@@ -483,6 +488,10 @@ pub(crate) fn typo<'db>(
         return false;
     };
     let (def, is_local) = scope_span(cx, ns, &def);
+    // The name as it is written in this edition (`r#match`), for every text shown or inserted;
+    // `found` stays the stored symbol, which the `_` check below compares.
+    // alloc: the error's text, for an error hir found
+    let shown = found.display_no_db(cx.edition).to_string();
     let found = found.symbol().as_str();
     if let Some(def) = &def
         && def.file == span.file
@@ -494,7 +503,7 @@ pub(crate) fn typo<'db>(
     let mut labelled = false;
     if !is_local && let Some(def) = &def {
         // alloc: the error's text, for an error hir found
-        diag.span_label(def.clone(), format!("similarly named {descr} `{found}` defined here"));
+        diag.span_label(def.clone(), format!("similarly named {descr} `{shown}` defined here"));
         labelled = true;
     }
     let snippet = cx.snippet(span);
@@ -519,7 +528,7 @@ pub(crate) fn typo<'db>(
                 span.clone(),
                 // alloc: the error's text, for an error hir found
                 format!("a {descr} with a similar name exists"),
-                found,
+                shown,
                 Applicability::MaybeIncorrect,
             );
         }

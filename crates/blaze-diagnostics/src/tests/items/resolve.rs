@@ -367,3 +367,33 @@ fn main() {
         )],
     );
 }
+
+#[test]
+fn a_struct_used_as_a_value_still_offers_the_value_to_import() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+mod values {
+    pub const A: u8 = 1;
+}
+
+struct A { b: u8 }
+
+fn main() {
+    let _ = A;
+}
+"#;
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(8, &["E0423", "expected value, found struct `A`", "use crate::values::A;"])],
+    );
+}
+
+#[test]
+fn a_typo_of_a_raw_identifier_suggests_the_raw_identifier() {
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
+fn main() {
+    let r#match = 1;
+    let _ = r#matc;
+}
+"#;
+    assert_reports(&super::ui_fixture(fixture), &[error(4, &["E0425", "r#match"])]);
+}
