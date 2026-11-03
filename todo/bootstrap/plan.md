@@ -62,7 +62,7 @@ wasm too, and the rule stays one rule.
 | Piece | Why it can't go in the seed as is | Seed answer |
 |---|---|---|
 | LLVM (`llvm-sys`, the pinned LLVM) | C++, tens of MB, links into blaze; `blaze-stencil/build.rs` makes stencils with it | The seed has no LLVM. Stencils come prebuilt as data. Release (LLVM) builds come after stage 1. |
-| Wasmtime with Cranelift for proc macros | Cranelift JITs to native code, which a wasm guest can't run | Wasmtime with Pulley (its portable interpreter) in the seed. Not the MIR evaluator: that would be a second macro path (`one-concept-one-home`). |
+| Wasmtime with Cranelift for proc macros | Cranelift JITs to native code, which a wasm guest can't run | Wasmtime with Cranelift emitting Pulley bytecode, run by Pulley, inside the seed. Shown working on wasm32-wasip1 and -threads (lane wasmhost, 2026-11-02) after a 46-line patch: `std` without virtual memory lacks `sys::mmap` upstream. The embedder supplies two TLS functions. Not the MIR evaluator or wasmi: a second macro path (`one-concept-one-home`). |
 | Sandbox (Linux namespaces, macOS seatbelt) | OS-specific syscalls | wasm is the sandbox: build scripts and macros run as wasm modules in the seed. |
 | Daemon, sockets, fibers, live patching (mmap of code) | OS-only | Not in the seed. It is a one-shot batch build. |
 | Threads | `wasm32-wasip1` has none | Single-threaded seed first, then `wasm32-wasip1-threads`. |
@@ -81,14 +81,26 @@ a second compiler in the bootstrap, so the seed profile has none of them. Count 
 | tree-sitter, tree-sitter-{python,rust,toml-ng} | C parsers | out |
 | flecs-c | the site's Flecs runtime | out |
 | libmimalloc-sys | allocator | out: std's allocator |
-| blake3, blake3-servil | SIMD C and asm | pure-Rust build (`pure`) |
+| blake3, blake3-servil | SIMD C and asm | blake3's `wasm32_simd` (Rust simd128, no C); servil is not reached on wasm32. Native builds keep the asm. |
 | zstd-sys | store compression | a pure-Rust zstd (ruzstd), same frame format |
 | ring | TLS for registry fetches | out: the seed builds offline from vendored sources |
-| psm, stacker | stack growth for deep recursion | a wasm answer is needed: stacker does nothing on wasm |
-| wasmtime, wasmtime-internal-{fiber,jit-debug} | small C and asm helpers | gated off for a Pulley-only wasm build; what remains is listed |
+| psm, stacker | stack growth for deep recursion | already not built on wasm: every call goes through `stdx::ensure_sufficient_stack`, a plain call there. The seed gets a big stack instead (below). |
+| wasmtime, wasmtime-internal-{fiber,jit-debug} | small C and asm helpers | none on wasm32: its build script drops the C helpers, signals and mmap there, and fiber/jit-debug come only with `async`/`debug-builtins`, which blaze doesn't enable. |
 
 blaze compiling C itself (owning a C front end) would also remove the host compiler, for every
 C dependency anywhere. That is larger and is not needed for the seed.
+
+Every native build keeps the fastest implementation for its architecture (C zstd, blake3 asm,
+mimalloc, LLVM). Only the seed takes the fastest implementation without C.
+
+## Stack in the seed
+
+The deepest expression nesting over all 21,570 files the seed compiles is 98 levels (32 in blaze's
+own crates); macro expansion and the trait solver stop at `recursion_limit` (512 at most). At the
+release binary's frame sizes that is about 0.4 MiB for expressions and 3 MiB for the solver. The
+seed links with a 64 MiB stack (the linker's `Output.stack`, unset today, so 1 MiB), the runtime
+gives the engine a 192 MiB stack, and on wasm `ensure_sufficient_stack` checks the room left and
+stops with an error naming it, never an overflow into the heap.
 
 ## Steps
 
@@ -122,6 +134,10 @@ C dependency anywhere. That is larger and is not needed for the seed.
 
 - **Seed size.** rust-analyzer-derived front end plus stencils: tens of MB of wasm. Zig's is a
   few MB compressed. Measure it at step 3.
+- **Seed runtime speed.** Pulley ran a call-heavy fib about 13.5x slower than native Cranelift, and inside
+  a wasm guest only about 8% slower again; macros in a seed that itself ran on an interpreter would be
+  interpreted twice (about 100x), so the seed runs under a JIT (Wasmtime) or wasm2c, not an interpreter.
+- **Memory.** The seed must fit wasm32's 4 GiB, or move to wasm64.
 - **Pulley speed** for a whole self-build. Zig's wasm2c path is faster than an interpreter, and
   wasm2c of the seed could be the default runtime.
 - **Who owns stencil generation** once LLVM is gone from the seed: stencils are built with LLVM
