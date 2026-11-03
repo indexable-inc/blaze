@@ -76,7 +76,7 @@ use blaze_ids::{
 };
 use blaze_image::{Builder, Corrupt, Image, Refused, SectionId};
 use blaze_protocol::cbor;
-use blaze_reclaim::{Grace, Guard};
+use blaze_reclaim::{Grace, Guard, Horizon};
 use blaze_vfs::{View, ViewId};
 use serde::{Deserialize, Serialize};
 
@@ -1375,9 +1375,10 @@ struct SpareViews {
 const SPARE_VIEWS: usize = 8;
 
 impl SpareViews {
-    /// Empties those whose grace has passed, keeping up to [`SPARE_VIEWS`] and freeing the rest.
-    fn sweep(&mut self) {
-        while self.held.front().is_some_and(|(grace, _)| grace.passed()) {
+    /// Empties those whose grace `horizon` passed (taken before the lock this is under),
+    /// keeping up to [`SPARE_VIEWS`] and freeing the rest.
+    fn sweep(&mut self, horizon: Horizon) {
+        while self.held.front().is_some_and(|&(grace, _)| horizon.passed(grace)) {
             let Some((_, mut state)) = self.held.pop_front() else { break };
             if self.ready.len() < SPARE_VIEWS {
                 state.reset();
@@ -1386,9 +1387,9 @@ impl SpareViews {
         }
     }
 
-    /// An emptied state, emptying first those whose grace has passed.
-    fn take(&mut self) -> Option<Box<ViewState>> {
-        self.sweep();
+    /// An emptied state, emptying first those whose grace `horizon` passed.
+    fn take(&mut self, horizon: Horizon) -> Option<Box<ViewState>> {
+        self.sweep(horizon);
         self.ready.pop()
     }
 
@@ -1684,7 +1685,8 @@ impl Database {
     /// Its tables are sized like those of the view opened last, if still open: a view of the
     /// same tree then resolves and verifies with no table grown, allocating nothing.
     pub fn open_with(&self, view: View, config: &[u8]) -> ViewId {
-        let spare = self.spare_views.lock().take();
+        let horizon = Horizon::now();
+        let spare = self.spare_views.lock().take(horizon);
         let index = self.views.push_boxed(|index| {
             let mut state = match spare {
                 Some(mut state) => {
@@ -1716,8 +1718,9 @@ impl Database {
     /// Emptied view states ready for the next views opened.
     #[cfg(test)]
     fn ready_views(&self) -> usize {
+        let horizon = Horizon::now();
         let mut spare = self.spare_views.lock();
-        spare.sweep();
+        spare.sweep(horizon);
         spare.ready.len()
     }
 
@@ -2120,15 +2123,17 @@ impl Database {
     /// their grace.
     #[cfg(test)]
     fn held(&self) -> usize {
+        let horizon = Horizon::now();
         let mut spare = self.spare_views.lock();
-        spare.sweep();
+        spare.sweep(horizon);
         spare.held.len() + self.store.held()
     }
 
     /// Frees what the database's tables and store let go of whose grace has passed: the
     /// tables' rows first, as a slot's row holds spans of the store's segments.
     fn collect_retired(&self, task: &Guard) {
-        self.spare_views.lock().sweep();
+        let horizon = Horizon::now();
+        self.spare_views.lock().sweep(horizon);
         self.slots.sweep();
         self.keys.sweep();
         self.inputs.sweep();

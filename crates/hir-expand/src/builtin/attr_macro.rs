@@ -145,7 +145,7 @@ fn global_allocator_expand<'f>(
         return ExpandResult::ok(tt::TopSubtree::from_subtree_in(tt.view(), frame));
     };
     let name = &name;
-    let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
+    let span = span_with_def_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
     let krate = &dollar_crate(span);
     let result = quote::quote_in! { frame, span=>
         #tt
@@ -242,7 +242,7 @@ fn alloc_error_handler_expand<'f>(
         }
     };
     let name = &name;
-    let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
+    let span = span_with_def_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
     let krate = &dollar_crate(span);
     let result = quote::quote_in! { frame, span=>
         #tt

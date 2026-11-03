@@ -19,11 +19,11 @@ use hir_expand::fixture;
 use super::interner::bind_witness_regions;
 use crate::{
     InferBodyId, InferenceResult,
-    db::{InternedCoroutineId, InternedOpaqueTyId},
+    db::InternedCoroutineId,
     mir::{InlinedBody, MirBody, MirEvalError, MirLowerError, MirOptions, MirOwner},
     next_solver::{
         Allocation, Binder, BoundRegionKind, BoundVarKinds, BoundVariableKind, DbInterner,
-        GenericArgs, ParamEnv, Region, StoredGenericArgs, StoredTy, Ty, default_types,
+        ParamEnv, Region, StoredGenericArgs, StoredTy, Ty, default_types,
         infer::{DbInternerInferExt, select::EvaluationResult},
     },
     providers::Mir,
@@ -38,7 +38,6 @@ inventory::submit! {
         monomorphize: no_monomorphize,
         coroutine_witnesses: held_bindings,
         interpret_mir: no_interpret,
-        opaque_of_impl: no_opaque_of_impl,
         own_tests: true,
     }
 }
@@ -86,15 +85,6 @@ fn no_interpret<'db>(
     _: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Allocation<'db>, MirEvalError<'db>> {
     unreachable!("the coroutine witness tests run no MIR")
-}
-
-fn no_opaque_of_impl<'db>(
-    _: &'db Db,
-    _: ParamEnvAndCrate<'db>,
-    _: InternedOpaqueTyId<'db>,
-    _: GenericArgs<'db>,
-) -> Option<Ty<'db>> {
-    unreachable!("the coroutine witness tests reveal no opaque type")
 }
 
 const HELD_ACROSS_AWAIT: &str = r#"
@@ -153,7 +143,7 @@ fn send(db: &Db) -> TraitId {
 #[test]
 fn a_coroutine_is_send_only_when_what_it_holds_across_an_await_is() {
     let db = fixture::db(HELD_ACROSS_AWAIT).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let send = send(&db);
         for (name, expected) in [
             ("holds_rc", EvaluationResult::EvaluatedToErr),

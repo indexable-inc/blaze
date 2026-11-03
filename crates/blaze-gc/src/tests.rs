@@ -110,7 +110,14 @@ fn trash_of(decisions: &[Decision]) -> Vec<String> {
 
 /// Plays the driver: every rename moves, every unlink frees what it names; the run's report.
 pub(crate) fn drive(collector: &mut Collector, mut decisions: Vec<Decision>) -> crate::RunReport {
-    for _ in 0..1000 {
+    for round in 0..1000 {
+        // The driver answers every decision at once and moves no clock: a batch with nothing in
+        // it is a run that waits on what this driver never does (or a caller that took the
+        // record away), never one that ends by going round again.
+        assert!(
+            !decisions.is_empty(),
+            "the run asked for nothing and gave no record after {round} rounds of answers: it waits on a clock or a decision taken before `drive`"
+        );
         for decision in decisions {
             match decision {
                 Decision::Trash { run, path, .. } => collector.trashed(run, &path, Swept::Moved),
@@ -121,7 +128,7 @@ pub(crate) fn drive(collector: &mut Collector, mut decisions: Vec<Decision>) -> 
         }
         decisions = collector.take_decisions();
     }
-    panic!("the run did not end");
+    panic!("the run did not end in 1000 rounds of answers");
 }
 
 fn fate<'a>(report: &'a crate::RunReport, path: &str) -> &'a Fate {
@@ -546,8 +553,10 @@ fn a_workspace_with_a_child_in_its_grace_is_not_swept() {
     let objects =
         vec![workspace("a", 10, T0 - 2 * DAY, false), profile("a", "debug", 10, T0 - 10 * 60 * S)];
     gc.scanned(run, Ok(inventory(objects)));
-    assert!(trash_of(&gc.take_decisions()).is_empty());
-    let report = finish(&mut gc);
+    // The run's decisions, kept: with nothing to rename, they hold its record.
+    let decisions = gc.take_decisions();
+    assert!(trash_of(&decisions).is_empty(), "nothing is renamed: {decisions:?}");
+    let report = drive(&mut gc, decisions);
     assert!(matches!(fate(&report, "/h/build/a"), Fate::Keep(_)));
     assert!(matches!(fate(&report, "/h/build/a/debug"), Fate::Keep(Keep::Grace { .. })));
     assert_eq!(report.swept_objects, 0);

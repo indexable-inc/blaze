@@ -80,7 +80,7 @@ fn with_db(check: impl FnOnce(&base_db::Db)) {
         "//- minicore: sized, copy, clone, phantom_data\n#![feature(blaze_comptime, lang_items)]\n{REFLECT}{BODIES}"
     );
     let db = fixture::db(&fixture).into_db();
-    crate::next_solver::attach_db(&db, || check(&db));
+    blaze_query::db::attach(&db, || check(&db));
 }
 
 #[test]

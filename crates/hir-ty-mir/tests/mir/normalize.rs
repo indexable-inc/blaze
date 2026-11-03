@@ -51,7 +51,7 @@ fn normalize_or_keep_is_each_copy_it_replaced() {
     let fx = fixture::db(TYPES);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let interner = DbInterner::new_with(&db, krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);

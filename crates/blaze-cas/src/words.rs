@@ -20,7 +20,7 @@ pub(crate) const STRETCHES: usize = 40;
 #[cold]
 #[inline(never)]
 #[track_caller]
-pub(crate) fn stop(error: MemError) -> ! {
+pub(crate) fn stop(error: &MemError) -> ! {
     panic!("{error}")
 }
 
@@ -67,25 +67,25 @@ impl<A: Zeroed> Words<A> {
     /// Reserves room for `len` atomics, committing none.
     pub(crate) fn new(len: usize) -> Words<A> {
         let bytes = len.checked_mul(Self::SIZE).unwrap_or_else(|| {
-            stop(MemError::TooLarge { tag: Tag::Store, what: "a table's words", wanted: len })
+            stop(&MemError::TooLarge { tag: Tag::Store, what: "a table's words", wanted: len })
         });
         match Region::reserve_huge(bytes, Tag::Store) {
             Ok(region) => Words { region, len, _of: std::marker::PhantomData },
-            Err(error) => stop(error),
+            Err(error) => stop(&error),
         }
     }
 
     /// Makes `[at, at + len)` readable, every atomic zero; `stretch` names it under a model.
     pub(crate) fn make(&self, _stretch: usize, at: usize, len: usize) {
         let end = at.checked_add(len).filter(|&end| end <= self.len).unwrap_or_else(|| {
-            stop(MemError::Exhausted {
+            stop(&MemError::Exhausted {
                 tag: Tag::Store,
                 reserved: self.region.reserved(),
                 wanted: at.saturating_add(len).saturating_mul(Self::SIZE),
             })
         });
         if let Err(error) = self.region.ensure(end * Self::SIZE) {
-            stop(error)
+            stop(&error)
         }
     }
 

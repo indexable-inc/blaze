@@ -504,7 +504,7 @@ fn an_eager_expansion_replaces_its_nested_calls() {
     let stringify = fn_like(&f, "stringify", BuiltinFnLikeExpander::Stringify);
     let line = fn_like(&f, "line", BuiltinFnLikeExpander::Line);
     let concat = builtin(&f, "concat", |id| MacroDefKind::BuiltInEager(id, EagerExpander::Concat));
-    let resolver = |path: &ModPath| match path.as_ident()?.as_str() {
+    let resolver = |path: &ModPath, _ctxt: span::SyntaxContext| match path.as_ident()?.as_str() {
         "stringify" => Some(stringify),
         "line" => Some(line),
         "concat" => Some(concat),

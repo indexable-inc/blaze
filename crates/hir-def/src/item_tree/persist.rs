@@ -383,7 +383,8 @@ impl ItemTree {
 impl Persist for ItemTree {
     const SCHEMA: blaze_format::SchemaHash = blaze_format::schema_of(&[
         Part::Str("ItemTree"),
-        Part::U64(4),
+        // 5: a keyed name and a path's segment contexts (`ModPath::contexts`) are written.
+        Part::U64(5),
         Part::Schema(<Root as Record>::SCHEMA),
     ]);
     type Ref<'a> = ItemTreeRef<'a>;
@@ -1286,10 +1287,11 @@ use a::{b, c};
         let words = root.words.words.get(&buffer);
         let word_at = |index: u32| offset_in(&words[index as usize], &buffer);
         // The words of the tree's attributes: their count, then the one attribute's path (its
-        // kind, the count of segments, a segment), the input's option and kind, then the token
-        // tree: whether it dropped a top, the count of tokens, the top subtree's tag.
+        // kind, the count of segments, a segment, the tag of no contexts), the input's option
+        // and kind, then the token tree: whether it dropped a top, the count of tokens, the top
+        // subtree's tag.
         assert_eq!(words[root.attrs_at as usize], 1, "the one attribute: {:#?}", tree.attr_list());
-        let count = root.attrs_at + 1 + 3 + 2 + 1;
+        let count = root.attrs_at + 1 + 4 + 2 + 1;
         assert_eq!(words[count as usize], 4, "the flat tokens of `(a, b)`: ( a , b");
         // The top subtree: its tag, two spans of 5 words, its kind, then its length.
         let top_len = count + 1 + 1 + 2 * 5 + 1;

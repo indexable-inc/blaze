@@ -72,7 +72,7 @@ fn check(src: &str) -> Vec<(String, String)> {
     let fx = fixture::db(&fixture_text);
     let file = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let text = db.file_text(file.file_id(&db)).text(&db).to_owned();
         let mut found = Vec::new();
         for def in functions(&db) {

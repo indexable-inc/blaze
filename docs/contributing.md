@@ -391,15 +391,15 @@ the library hashes to the id in its header, and that this id is the pinned one:
   `src/shape.rs`, `src/enc.rs`, `src/table/format.rs`, LLVM) changes what it makes, pin the
   result in the same change with the command the error prints:
 
-      cp <blaze-stencil's OUT_DIR>/stencils.json crates/blaze-stencil/stencils.json
+      cp <blaze-stencil's OUT_DIR>/stencils.json crates/blaze-stencil/stencils.json && cp <blaze-stencil's OUT_DIR>/*.stencils crates/blaze-stencil/prebuilt/
 
-  If nothing the generator reads changed, the output isn't deterministic, which is a bug
-  (rule 22).
-- The seed profile (`blaze-engine --no-default-features --features seed`) has no LLVM. It copies
-  the libraries from the directory `BLAZE_STENCILS` names, for example blaze-stencil's `OUT_DIR`
-  from an LLVM build of the same tree. The variable only says where the files are. A library
-  whose bytes aren't the pinned ones is refused, and the error names the file, the pinned id
-  and the file's own id.
+  The libraries themselves are committed in `crates/blaze-stencil/prebuilt/` (about 570 KB
+  each), and the build also stops when what it made differs from them. If nothing the
+  generator reads changed, the output isn't deterministic, which is a bug (rule 22).
+- The seed profile (`blaze-engine --no-default-features --features seed`) has no LLVM. It
+  includes the committed libraries in `crates/blaze-stencil/prebuilt/`; no variable points
+  elsewhere. A library whose bytes aren't the pinned ones is refused, and the error names the
+  file, the pinned id and the file's own id.
 
 The code identity (`blaze-codegen-code`) is keyed by the pinned ids.
 

@@ -273,7 +273,7 @@ fn instances_with_one_share_key_are_one() {
     use blaze_codegen::backend::Frontend as _;
     let (db, frontend) = frontend(SHARED);
     // A failure's message formats instances, whose types are the database's.
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let policy = policy(OptLevel::O0);
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
@@ -340,7 +340,7 @@ fn equal_share_keys_compile_to_one_shape() {
         let mut policy = policy(OptLevel::O0);
         policy.profile.debuginfo = debuginfo;
         let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let root = frontend.root(function(db, "roots"));
             let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let keyed = |instance: &HirInstance| {
@@ -409,7 +409,7 @@ fn a_key_covers_the_types_of_the_locals_a_debugger_is_told() {
         let mut policy = policy(OptLevel::O0);
         policy.profile.debuginfo = debuginfo;
         let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let root = frontend.root(function(db, "roots"));
             let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let func = function(db, "id");
@@ -447,7 +447,7 @@ fn one_instance_under_two_debuginfo_levels_shares_a_key_only_with_its_shape() {
             let mut policy = policy(OptLevel::O0);
             policy.profile.debuginfo = debuginfo;
             let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
-            hir_ty::attach_db(db, || {
+            blaze_query::db::attach(db, || {
                 let root = frontend.root(function(db, "roots"));
                 let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
                 let mut all = Vec::new(); // alloc: a test's list
@@ -506,7 +506,7 @@ fn a_cached_function_is_new_code_when_what_its_closure_reaches_is() {
     use blaze_codegen::backend::Frontend as _;
     let code = |deep: &str| {
         let (db, frontend) = frontend(&cached_fixture(deep));
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let root = frontend.root(function(db, "cached"));
             let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let described = (frontend.describe(&root, &origin))
@@ -569,7 +569,7 @@ fn a_cached_function_whose_body_blaze_cannot_compile_is_an_error() {
     };
     let refused = cached_reading(deep, "deep()");
     let (db, front) = frontend(&refused);
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let cached = function(db, "cached");
         let compiled = crate::compiled_root(db, cached).as_ref().map(|_| ()).map_err(ToString::to_string);
         named(&compiled.expect_err("the code generator refuses `cached`"));
@@ -580,7 +580,7 @@ fn a_cached_function_whose_body_blaze_cannot_compile_is_an_error() {
     for read in ["unsafe { M }", "(unsafe { M }, deep())"] {
         let impure = cached_reading(deep, read);
         let (db, _) = frontend(&impure);
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let compiled = crate::compiled_root(db, function(db, "cached"));
             if let Err(e) = compiled {
                 panic!("an impure cached function reading `{read}` compiles, uncached: {e}");
@@ -594,7 +594,7 @@ fn a_root_takes_function_items_for_its_type_parameters() {
     use blaze_codegen::backend::Frontend as _;
     let src = "pub fn expand<'a, F>(_: &'a u8) {}\npub fn two<F, G>() {}\npub fn sized<const N: usize, F>() {}\npub fn mac() {}\npub fn other() {}\n";
     let (db, frontend) = frontend(src);
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let [expand, two, sized, mac, other] =
             ["expand", "two", "sized", "mac", "other"].map(|name| function(db, name));
         let root = |func, items: &[_]| frontend.root_with_fn_items(func, items);
@@ -929,7 +929,7 @@ fn a_registry_crate_over_a_path_crate_is_the_workspaces() {
     let (db, frontend) = held_imaged(fixture::db(OVER_A_PATH_CRATE).into_db());
     let root = frontend.root(function(&db, "roots"));
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let describe = |instance: &HirInstance| {
             frontend.describe(instance, &origin).unwrap_or_else(|e| panic!("{instance:?}: {}", e.what))
         };
@@ -968,7 +968,7 @@ fn a_registry_crate_over_a_path_crate_is_the_workspaces() {
     let (db, frontend) = held_as(fixture::db(OVER_A_PATH_CRATE).into_db(), &policy(OptLevel::O0));
     let root = frontend.root(function(&db, "roots"));
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let rooted = frontend.describe(&root, &origin).unwrap_or_else(|e| panic!("{root:?}: {}", e.what));
         for it in &rooted.refs {
             let FrontRef::Function(instance) = it else { continue };
@@ -988,7 +988,7 @@ fn an_asm_function_a_dependencys_generic_asks_for_is_the_images() {
     let (db, frontend) = held_imaged(fixture::db(ASKED_BY_THE_IMAGE).into_db());
     let root = frontend.root(function(&db, "roots"));
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let describe = |instance: &HirInstance| {
             frontend.describe(instance, &origin).unwrap_or_else(|e| panic!("{instance:?}: {}", e.what))
         };
@@ -1235,7 +1235,7 @@ fn runtimes_of(text: &str) -> Result<Vec<String>, String> {
     let krate = fixture::test_crate(&db);
     let mut names: Vec<String> = crate::linked_crates(&db, krate)?
         .into_iter()
-        .map(|it| crate::fncache::crate_name(&db, it))
+        .map(|it| it.named(&db).to_string())
         .filter(|it| it.starts_with("panic_"))
         .collect();
     names.sort_unstable();
@@ -1901,7 +1901,7 @@ pub fn bounded<T: P>(at: &T) -> usize {
     let method = |name: &str| p.trait_items(db).method_by_name(&Name::new_root(name)).expect("`P`'s method");
     let (distance, twice) = (method("distance"), method("twice"));
     let (concrete, bounded) = (function(db, "concrete"), function(db, "bounded"));
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let interner = DbInterner::new_with(db, krate);
         let env = |def: FunctionId| ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate };
         let s = Ty::new_adt(interner, AdtId::StructId(s), GenericArgs::empty());
@@ -1941,7 +1941,7 @@ pub fn roots(x: u32) {
 "#,
     );
     // A failure's message formats instances, whose types are the database's.
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let policy = policy(OptLevel::O0);
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
@@ -2017,7 +2017,7 @@ fn every_pointer_to_dyn_in_a_constant_points_at_its_vtable() {
     use crate::fragment::DataRequest;
     let (db, frontend) = frontend(POINTERS_TO_DYN);
     let word = crate::Target::for_fixtures().word() as u32;
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let cases =
             [("raw", "A"), ("aliased", "B"), ("behind", "C"), ("wrap", "D"), ("raw_slice", "E")];
         for (name, of) in cases {
@@ -2253,7 +2253,7 @@ pub fn id_num() -> (&'static dyn Tr, P) { ID_NUM }
 /// description (a vtable's type), or the error building it stops with.
 fn constant_datas(name: &str) -> Result<Vec<(crate::fragment::DataRequest, String)>, String> {
     let (db, frontend) = frontend(CONSTANT_MEMORY);
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let root = frontend.root(function(db, name));
         frontend.with(|db| {
             let code = built(db, &root, crate::Target::for_fixtures(), false, Build::of(&spec()));
@@ -3019,7 +3019,7 @@ fn an_instance_is_not_compiled_in_a_crate_that_misses_a_specializing_impl_its_as
             .unwrap_or_else(|| panic!("no crate `{name}`"))
     };
     let (k, dep, main) = (named("k"), named("dep"), named("main"));
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         assert!(!loaded_crates(db, k).contains(&dep), "the fixture's premise: `k` names `dep` only through a macro");
         assert!(loaded_crates(db, main).contains(&dep));
     });
@@ -3092,7 +3092,7 @@ fn a_callers_key_holds_what_the_inliner_put_in_a_callee_it_builds_in() {
         let (generic, always) =
             (hir_def::test_items::function(db, dep, "generic"), hir_def::test_items::function(db, dep, "always"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(db)));
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let [caller] = &frontend.with(|hir| called(hir, &root, generic))[..] else { panic!("one `generic::<u8>`") };
             let described = |it: &HirInstance| frontend.describe(it, &origin).unwrap_or_else(|e| panic!("{it:?}: {}", e.what));
             // What the driver closes the key over: each body built in, by its own description.
@@ -3161,7 +3161,7 @@ fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
     let resize = hir_def::test_items::function(db, dep, "resize");
     let origin = frontend.with(|hir| frontend.origin(hir, main));
     let root = frontend.root(function(db, "roots"));
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let described =
             |it: &HirInstance, by: &Origin| frontend.describe(it, by).unwrap_or_else(|e| panic!("{it:?}: {}", e.what));
         // The driver's first walk of the program: everything it reaches, then its dyn facts.
@@ -3340,7 +3340,7 @@ fn a_downstream_impl_changes_its_generic_instances_exec_bound() {
         let root = frontend.root(function(db, "roots"));
         let g = hir_def::test_items::function(db, lib, "g");
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(db)));
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let [instance] = &frontend.with(|hir| called(hir, &root, g))[..] else { panic!("one `g::<D>`") };
             let described = |it: &HirInstance| frontend.describe(it, &origin).unwrap_or_else(|e| panic!("{it:?}: {}", e.what));
             let it = described(instance);
@@ -3380,4 +3380,58 @@ fn a_downstream_impl_changes_its_generic_instances_exec_bound() {
         exec(&derived_own, &written_refs, &written_items),
         "under one description, the written impl's refs alone change the bound"
     );
+}
+
+/// Two functions of a wasm32 crate that return a pair: of 4 and 4 bytes, and of 1 and 4.
+const WASM32_PAIRS: &str = r#"
+//- target_data_layout: e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20
+//- target_arch: wasm32
+//- minicore: sized, copy
+//- /main.rs
+pub fn pair(x: u32) -> (u32, u32) { (x, x ^ 85) }
+pub fn mixed(x: u8) -> (u8, u32) { (x, 7) }
+pub fn copied(x: &[u32; 6]) -> [u32; 6] { *x }
+"#;
+
+/// A wasm32 function that returns a pair returns it as LLVM's code of rustc's does, whatever
+/// blaze was built with: its IR returns the two values (rustc's `PassMode::Pair`), and its wasm
+/// takes the pointer they are written through ahead of its parameters and has no result.
+/// rustc and LLVM of the pinned nightly (2026-10-27, `--target wasm32-wasip1 -O`) give both
+/// `(func (param i32 i32))`, writing the first value at 0 and the second at 4 (`i32.store8`
+/// and `i32.store offset=4` for `mixed`): LLVM demotes a return of more than one value
+/// (`WebAssembly::canLowerReturn`, multivalue returns being only for the `experimental-mv`
+/// ABI). Run with and without hir-ty-codegen's `wasm` feature: that build once returned a pair
+/// through a pointer of the Rust ABI's own (`one_result`), so the IR differed by how blaze was
+/// built.
+#[test]
+fn a_wasm32_pair_is_returned_as_llvm_returns_it_whatever_blaze_was_built_with() {
+    use crate::wasm::{Address, WasmSignature, WasmType};
+    use cranelift_codegen::ir::{ArgumentPurpose, types};
+    let (db, frontend) = frontend(WASM32_PAIRS);
+    let target = crate::Target::of("wasm32-wasip1").expect("wasm32's target");
+    for (name, first) in [("pair", types::I32), ("mixed", types::I8)] {
+        let root = frontend.root(function(db, name));
+        let code = frontend
+            .with(|db| built(db, &root, target, false, Build::of(&spec())))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let super::Built::Ir(pending) = &code else { panic!("{name}: assembled") };
+        let signature = &pending.func().signature;
+        let returned: Vec<_> = signature.returns.iter().map(|it| it.value_type).collect();
+        assert_eq!(returned, [first, types::I32], "{name}: the IR returns the pair's two values");
+        assert!(
+            !signature.params.iter().any(|it| it.purpose == ArgumentPurpose::StructReturn),
+            "{name}: the IR returns the pair through a pointer of its own: {signature}"
+        );
+        let (lowered, _) = crate::wasm::lower(pending.func(), crate::Calls::Direct, Address::of(target))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let llvms = WasmSignature { params: vec![WasmType::I32, WasmType::I32], results: vec![] };
+        assert_eq!(lowered.signature, llvms, "{name}: the wasm signature LLVM gives");
+    }
+    // A copy of 24 bytes, a `memcpy` the build verifies before the copy lowering makes loads
+    // and stores of it (`crate::verified`), and again after: both pass on wasm32. The IR of
+    // dfgalias's bug, refused, is `ir_the_verifier_refuses_is_the_functions_error_before_any_pass`.
+    let copied = frontend.root(function(db, "copied"));
+    frontend
+        .with(|db| built(db, &copied, target, false, Build::of(&spec())))
+        .unwrap_or_else(|e| panic!("copied: {e}"));
 }

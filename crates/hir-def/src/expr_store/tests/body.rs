@@ -1,4 +1,5 @@
 mod block;
+mod hygiene;
 
 use crate::{
     DefWithBodyId, ModuleDefId,

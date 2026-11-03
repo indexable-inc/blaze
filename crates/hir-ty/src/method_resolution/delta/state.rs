@@ -405,14 +405,14 @@ fn tests_read_slots(db: &Db, nodes: &Nodes<'_>) -> Vec<(Box<str>, SlotRead)> {
         .iter()
         .flatten()
         .map(|slot| {
-            let name = hir_def::span_names::crate_name(db, slot.krate(db));
+            let name = slot.krate(db).named(db).to_string();
             let read = Cancelled::catch(std::panic::AssertUnwindSafe(|| slot.slot(db).get(db).map(|_| ())));
             let read = match read {
                 Ok(Ok(())) => SlotRead::Full,
                 Ok(Err(error)) => SlotRead::Error(error),
                 Err(_) => SlotRead::GaveWay,
             };
-            (Box::from(name), read)
+            (name.into_boxed_str(), read)
         })
         .collect()
 }
@@ -459,11 +459,11 @@ impl NodeFailed {
                 "crate `{}` ({krate:?})'s node gave way ({cancelled}) after its work began changing the \
                  crate's impl tables in place, so it can't run again from where it began: the pass \
                  fails, and the next write maintains from empty",
-                hir_def::span_names::crate_name(db, *krate),
+                krate.named(db),
             ),
             NodeFailed::Claim { krate, error } => format!(
                 "crate `{}` ({krate:?})'s node could not claim its directory as it began: {error}",
-                hir_def::span_names::crate_name(db, *krate),
+                krate.named(db),
             ),
         }
     }
@@ -667,7 +667,7 @@ pub(super) fn assert_slot_read_in_warm(db: &Db, krate: Crate) {
         "impls: crate `{}` ({krate:?})'s directory slot was read by a node whose work had begun \
          changing its crate's state: every slot read of a node is in its warm, where a read that \
          gives way runs the node again",
-        hir_def::span_names::crate_name(db, krate),
+        krate.named(db),
     );
 }
 
@@ -697,7 +697,7 @@ fn tests_give_way(db: &Db, krate: Crate, at: GiveWayIn) {
     let wanted = GIVE_WAY.with(|it| it.get());
     let Some((name, here)) = wanted else { return };
     let fires = here == at || (here == GiveWayIn::PanicInWarm && at == GiveWayIn::Warm);
-    if !fires || hir_def::span_names::crate_name(db, krate) != name {
+    if !fires || !krate.rust_name(db).is_ok_and(|it| it.as_str() == name) {
         return;
     }
     GIVE_WAY.with(|it| it.set(None));

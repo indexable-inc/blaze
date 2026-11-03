@@ -12,6 +12,7 @@ use std::{
 };
 
 use blaze_alloc_count::measure;
+use blaze_rng::SplitMix64;
 
 use crate::{
     AppendVec, Arena, Block, Built, Column, Frame, HUGE_PAGE, Handle, MemError, Pool, Region,
@@ -21,27 +22,6 @@ use crate::{
     revision::PublishError,
     scratch, tag, text,
 };
-
-/// xorshift64*: the tests' operations, the same on every run. Not `blaze_ids::rng`, since
-/// `blaze-ids` depends on this crate.
-struct Xorshift64Star(u64);
-
-impl Xorshift64Star {
-    fn new(seed: u64) -> Xorshift64Star {
-        Xorshift64Star(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-}
 
 /// Counts its drops, to check each value is dropped exactly once.
 struct Counted {
@@ -402,13 +382,13 @@ fn apple_silicon_has_no_superpages_for_anonymous_memory() {
 
 #[test]
 fn region_vec_matches_vec_on_random_operations() {
-    let mut rng = Xorshift64Star::new(1);
+    let mut rng = SplitMix64::new(1);
     let mut column = RegionVec::<u64>::new(1 << 20, Tag::Other).expect("reserve");
     let mut model = Vec::new();
     for _ in 0..200_000 {
         match rng.below(10) {
             0..=5 => {
-                let value = rng.next();
+                let value = rng.next_u64();
                 assert_eq!(column.push(value), model.len());
                 model.push(value);
             }
@@ -419,14 +399,14 @@ fn region_vec_matches_vec_on_random_operations() {
                 model.truncate(len);
             }
             8 => {
-                let values: Vec<u64> = (0..rng.below(100)).map(|_| rng.next()).collect();
+                let values: Vec<u64> = (0..rng.below(100)).map(|_| rng.next_u64()).collect();
                 column.extend_from_slice(&values);
                 model.extend_from_slice(&values);
             }
             _ => {
                 if !model.is_empty() {
                     let i = rng.below(model.len() as u64) as usize;
-                    let value = rng.next();
+                    let value = rng.next_u64();
                     column[i] = value;
                     model[i] = value;
                 }
@@ -588,10 +568,10 @@ fn column_matches_a_model_of_options() {
     let column = Column::<u64>::new(1 << 14, Tag::Other).expect("reserve");
     let mut model: Vec<Option<u64>> = Vec::with_capacity(1 << 14);
     let mut blocks: Vec<Block> = Vec::with_capacity(64);
-    let mut rng = Xorshift64Star::new(31);
+    let mut rng = SplitMix64::new(31);
     let ((), used) = measure(|| {
         for _ in 0..4_000 {
-            let value = rng.next();
+            let value = rng.next_u64();
             match rng.below(3) {
                 0 => {
                     let index = column.push(value).expect("room");
@@ -643,11 +623,11 @@ fn column_reads_allocate_nothing() {
 
 #[test]
 fn append_vec_matches_vec_and_never_moves() {
-    let mut rng = Xorshift64Star::new(7);
+    let mut rng = SplitMix64::new(7);
     let column = AppendVec::<u64>::new(1 << 20, Tag::Vfs).expect("reserve");
     let mut model = Vec::new();
     for _ in 0..200_000 {
-        let value = rng.next();
+        let value = rng.next_u64();
         assert_eq!(column.append(value) as usize, model.len());
         model.push(value);
     }
@@ -722,7 +702,7 @@ fn append_vec_appends_and_reads_allocate_nothing() {
 /// moving an element. Refused ones publish nothing.
 #[test]
 fn append_vec_writer_and_bulk_appends_match_vec() {
-    let mut rng = Xorshift64Star::new(23);
+    let mut rng = SplitMix64::new(23);
     let column = AppendVec::<u32>::new(1 << 18, Tag::Vfs).expect("reserve");
     let mut model: Vec<u32> = Vec::new();
     let mut scratch: Vec<u32> = Vec::new();
@@ -732,19 +712,19 @@ fn append_vec_writer_and_bulk_appends_match_vec() {
         for _ in 0..rng.below(8) {
             match rng.below(3) {
                 0 => {
-                    let value = rng.next() as u32;
+                    let value = rng.next_u64() as u32;
                     assert_eq!(writer.append(value) as usize, model.len());
                     model.push(value);
                 }
                 1 => {
                     scratch.clear();
-                    scratch.extend((0..rng.below(100)).map(|_| rng.next() as u32));
+                    scratch.extend((0..rng.below(100)).map(|_| rng.next_u64() as u32));
                     assert_eq!(writer.extend_from_slice(&scratch) as usize, model.len());
                     model.extend_from_slice(&scratch);
                 }
                 _ => {
                     let count = rng.below(100) as usize;
-                    let base = rng.next() as u32;
+                    let base = rng.next_u64() as u32;
                     let at = writer.extend_with(count, |i| base ^ i as u32);
                     assert_eq!(at as usize, model.len());
                     model.extend((0..count).map(|i| base ^ i as u32));
@@ -797,7 +777,7 @@ fn append_vec_writer_appends_allocate_nothing() {
 
 #[test]
 fn frame_vec_matches_vec_and_grows_in_place() {
-    let mut rng = Xorshift64Star::new(2);
+    let mut rng = SplitMix64::new(2);
     let frame = Frame::new(Tag::Infer).expect("reserve");
     let mut vec: Vec<u32, &Frame> = Vec::new_in(&frame);
     let mut model = Vec::new();
@@ -807,7 +787,7 @@ fn frame_vec_matches_vec_and_grows_in_place() {
     for _ in 0..100_000 {
         match rng.below(8) {
             0..=5 => {
-                let value = rng.next() as u32;
+                let value = rng.next_u64() as u32;
                 vec.push(value);
                 model.push(value);
             }
@@ -831,10 +811,10 @@ fn frame_collect_is_the_copies_it_replaced() {
         out.extend(items);
         out
     }
-    let mut rng = Xorshift64Star::new(5);
+    let mut rng = SplitMix64::new(5);
     let frame = Frame::new(Tag::Infer).expect("reserve");
     for len in [0, 1, 7, 64, 1000] {
-        let values: Vec<u64> = (0..len).map(|_| rng.next()).collect();
+        let values: Vec<u64> = (0..len).map(|_| rng.next_u64()).collect();
         let exact = frame::collect(&frame, values.iter().copied());
         let reference = kept(&frame, values.iter().copied());
         assert_eq!(exact.as_slice(), values.as_slice());
@@ -922,7 +902,7 @@ fn two_frame_vecs_growing_interleaved_in_one_task_report_copies_and_one_alone_no
 #[test]
 fn frame_values_are_aligned_and_disjoint() {
     let frame = Frame::new(Tag::Mir).expect("reserve");
-    let mut rng = Xorshift64Star::new(3);
+    let mut rng = SplitMix64::new(3);
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     for _ in 0..10_000 {
         let size = rng.below(300) as usize;
@@ -1193,7 +1173,7 @@ fn frame_matches_a_model_on_random_allocations_grows_shrinks_and_rollbacks() {
         }
     }
 
-    let mut rng = Xorshift64Star::new(17);
+    let mut rng = SplitMix64::new(17);
     let mut frame = Frame::with_reserve(1 << 30, Tag::Mir).expect("reserve");
     let mut live: Vec<Live> = Vec::new();
     // A marker and how many allocations were live when it was taken.
@@ -1282,7 +1262,7 @@ fn frame_matches_a_model_on_random_allocations_grows_shrinks_and_rollbacks() {
 fn frame_peak_folded_lazily_is_the_most_used_after_every_operation() {
     use std::{alloc::Allocator, ptr::NonNull};
 
-    let mut rng = Xorshift64Star::new(41);
+    let mut rng = SplitMix64::new(41);
     let mut frame = Frame::with_reserve(1 << 30, Tag::Mir).expect("reserve");
     let mut live: Vec<(NonNull<u8>, Layout)> = Vec::new();
     let mut marks: Vec<(crate::Marker, usize)> = Vec::new();
@@ -1536,14 +1516,14 @@ fn arena_values_from_many_threads_live_until_reset() {
 fn arena_vec_matches_vec_and_keep_freezes_it() {
     let arena = Arena::new(Tag::Nameres);
     let local = arena.local();
-    let mut rng = Xorshift64Star::new(4);
+    let mut rng = SplitMix64::new(4);
     let mut vec: Vec<u32, _> = Vec::new_in(&local);
     let mut model = Vec::new();
     for _ in 0..100_000 {
         if rng.below(5) == 0 {
             assert_eq!(vec.pop(), model.pop());
         } else {
-            let value = rng.next() as u32;
+            let value = rng.next_u64() as u32;
             vec.push(value);
             model.push(value);
         }
@@ -1698,7 +1678,7 @@ fn limbo_matches_a_model_and_allocates_nothing_once_warm() {
     let pool = Pool::<[u64; 4]>::new(1 << 12, Tag::Infer).expect("reserve");
     let mut cache = pool.cache();
     let mut limbo = pool::Limbo::new(&pool).expect("reserve");
-    let mut rng = Xorshift64Star::new(9);
+    let mut rng = SplitMix64::new(9);
     let mut round = || {
         let mut retired = 0;
         let mut collected = 0;
@@ -1706,7 +1686,7 @@ fn limbo_matches_a_model_and_allocates_nothing_once_warm() {
             if rng.below(3) == 0 {
                 collected += limbo.collect();
             } else {
-                limbo.retire(cache.alloc([rng.next(); 4]));
+                limbo.retire(cache.alloc([rng.next_u64(); 4]));
                 retired += 1;
             }
         }
@@ -1795,14 +1775,14 @@ fn drop_each_value_once() {
 fn pool_matches_box_on_random_operations() {
     let pool = Pool::<[u64; 4]>::new(1 << 16, Tag::Plane).expect("reserve");
     let mut cache = pool.cache();
-    let mut rng = Xorshift64Star::new(5);
+    let mut rng = SplitMix64::new(5);
     let mut live = Vec::new();
     let mut model: Vec<Box<[u64; 4]>> = Vec::new();
     let mut peak = 0;
     for _ in 0..200_000 {
         match rng.below(6) {
             0..=2 => {
-                let value = [rng.next(); 4];
+                let value = [rng.next_u64(); 4];
                 live.push(cache.alloc(value));
                 model.push(Box::new(value));
                 peak = peak.max(live.len());
@@ -1820,7 +1800,7 @@ fn pool_matches_box_on_random_operations() {
             }
             _ if !live.is_empty() => {
                 let i = rng.below(live.len() as u64) as usize;
-                live[i][0] = rng.next();
+                live[i][0] = rng.next_u64();
                 model[i][0] = live[i][0];
             }
             _ => {}
@@ -1941,7 +1921,7 @@ fn stack_chain_pushes_and_pops_of_some_match_a_vec() {
     let stack = Stack::new();
     let mut model: Vec<u32> = Vec::new();
     let mut held: Vec<u32> = (0..ITEMS).collect();
-    let mut rng = Xorshift64Star::new(5);
+    let mut rng = SplitMix64::new(5);
     for _ in 0..50_000 {
         match rng.below(4) {
             0 if !held.is_empty() => {
@@ -2033,13 +2013,13 @@ fn pool_allocates_nothing_once_warm() {
 fn shared_matches_arc_on_random_operations() {
     let pool = Pool::<pool::Counted<[u64; 4]>>::new(1 << 16, Tag::Link).expect("reserve");
     let mut cache = pool.cache();
-    let mut rng = Xorshift64Star::new(11);
+    let mut rng = SplitMix64::new(11);
     let mut live: Vec<pool::Shared<'_, [u64; 4]>> = Vec::new();
     let mut model: Vec<Arc<[u64; 4]>> = Vec::new();
     for _ in 0..100_000 {
         match rng.below(5) {
             0 => {
-                let value = [rng.next(); 4];
+                let value = [rng.next_u64(); 4];
                 live.push(cache.share(value));
                 model.push(Arc::new(value));
             }
@@ -2055,7 +2035,7 @@ fn shared_matches_arc_on_random_operations() {
             }
             3 if !live.is_empty() => {
                 let i = rng.below(live.len() as u64) as usize;
-                let value = rng.next();
+                let value = rng.next_u64();
                 pool::Shared::make_mut(&mut live[i], &mut cache)[1] = value;
                 Arc::make_mut(&mut model[i])[1] = value;
             }
@@ -2258,11 +2238,11 @@ fn slab_matches_a_model_and_detects_stale_handles() {
     let mut slab = Slab::<u64>::new(1 << 16, Tag::Io).expect("reserve");
     let mut model: Vec<(Handle<u64>, u64)> = Vec::new();
     let mut stale: Vec<Handle<u64>> = Vec::new();
-    let mut rng = Xorshift64Star::new(6);
+    let mut rng = SplitMix64::new(6);
     for _ in 0..200_000 {
         match rng.below(5) {
             0..=1 => {
-                let value = rng.next();
+                let value = rng.next_u64();
                 let handle = slab.insert(value);
                 model.push((handle, value));
             }
@@ -2275,7 +2255,7 @@ fn slab_matches_a_model_and_detects_stale_handles() {
             }
             3 if !model.is_empty() => {
                 let i = rng.below(model.len() as u64) as usize;
-                let value = rng.next();
+                let value = rng.next_u64();
                 *slab.get_mut(model[i].0).expect("live") = value;
                 model[i].1 = value;
             }

@@ -188,8 +188,6 @@ dependencies = [
 [[package]]
 name = "arrow-buffer"
 version = "60.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bd46a530bc1a8e763102fc36c1dc0f51f3ffa150c78e7f5658ccb54b1458ade"
 dependencies = [
  "bytes",
  "half",
@@ -511,6 +509,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-ids",
+ "blaze-mem",
 ]
 
 [[package]]
@@ -785,6 +784,7 @@ dependencies = [
  "base-db",
  "blaze-graph",
  "blaze-hash",
+ "blaze-query",
  "either",
  "hir",
  "hir-def",
@@ -952,6 +952,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "stdx",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -995,6 +996,7 @@ dependencies = [
  "blaze-protocol",
  "blaze-radix",
  "blaze-reclaim",
+ "blaze-rng",
  "blaze-serde",
  "blaze-spin",
  "corosensei",
@@ -1397,7 +1399,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-check",
  "blaze-reclaim",
- "blaze-spin",
+ "blaze-rng",
  "crossbeam-channel",
  "hegeltest",
  "libc",
@@ -1466,6 +1468,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "blaze-core",
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
@@ -1520,6 +1523,7 @@ dependencies = [
  "blaze-serde",
  "blaze-vfs",
  "crossbeam-channel",
+ "crossbeam-queue",
  "either",
  "hashbrown 0.17.1",
  "hegeltest",
@@ -1589,6 +1593,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
+ "stdx",
  "tar",
  "tokio",
  "toml",
@@ -3501,6 +3506,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-mem",
+ "blaze-query",
  "either",
  "hir-def",
  "hir-expand",
@@ -3526,6 +3532,7 @@ dependencies = [
  "blaze-ids",
  "blaze-items",
  "blaze-mem",
+ "blaze-query",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -3695,6 +3702,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-mem",
+ "blaze-query",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -3743,6 +3751,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-hash",
  "blaze-ids",
+ "blaze-query",
  "either",
  "hir-def",
  "hir-expand",
@@ -5513,10 +5522,12 @@ dependencies = [
  "arrayvec",
  "bitflags 2.13.2",
  "blaze-alloc-count",
+ "blaze-graph",
  "blaze-mem",
  "derive-where",
  "ena",
  "indexmap",
+ "parking_lot",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
  "rustc-hash",
@@ -6604,6 +6615,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
+ "blaze-phf",
  "hegeltest",
  "intern",
  "rustc_lexer",

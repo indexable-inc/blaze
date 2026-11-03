@@ -45,6 +45,8 @@ mod unwind;
 mod world;
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod fuel;
+#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod long;
 
 /// The user-name namespaces of `exec`'s linker: units, data objects, host functions.
 pub const FUNCS: u32 = 0;

@@ -24,7 +24,7 @@ use blaze_ids::{ContentId, Domain, Hasher};
 use crossbeam_queue::SegQueue;
 use hir_def::{
     ConstId, HasModule,
-    deps::{Held as _, ImageStore, Mode, crate_name},
+    deps::{Held as _, ImageStore, Mode},
     nameres::frozen,
 };
 
@@ -273,7 +273,7 @@ fn unreadable<'db>(
     // alloc: error text
     let said = format!(
         "the kept value of constant `{name}` of crate {} (key {key:?}) does not read: {why}",
-        crate_name(db, krate)
+        krate.named(db)
     );
     ConstEvalError::MirEvalError(MirEvalError::InternalError(said.into_boxed_str()))
 }
@@ -316,7 +316,7 @@ pub fn drain(db: &Db, bases: &HashMap<Crate, ContentId, Global>) -> Result<Drain
             "constant `{}` of crate {} was evaluated to two values (key {key:?}): its value is \
              not a function of what its key covers",
             GeneralConstId::ConstId(pending.def).name(db),
-            crate_name(db, pending.krate)
+            pending.krate.named(db)
         ));
     }
     #[expect(clippy::disallowed_types, reason = "constant write results, set once per filed value: not global")]
@@ -336,7 +336,7 @@ pub fn drain(db: &Db, bases: &HashMap<Crate, ContentId, Global>) -> Result<Drain
             format!(
                 "keeping the value of constant `{}` of crate {} (key {key:?}): {why}",
                 GeneralConstId::ConstId(pending.def).name(db),
-                crate_name(db, pending.krate)
+                pending.krate.named(db)
             )
         })?;
     }

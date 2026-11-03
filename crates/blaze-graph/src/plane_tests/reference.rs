@@ -48,6 +48,8 @@ struct Node {
     task: Option<usize>,
     /// The thread group its task ran on.
     group: Option<u32>,
+    /// It failed open ([`Outcome::FailedOpen`]): under keep-going what waits for it runs.
+    open: bool,
 }
 
 struct Task {
@@ -596,6 +598,12 @@ impl<M: Memo> Plane<M> {
                             blocker = Some(dep);
                         }
                     }
+                    NodeState::Failed { .. } if self.requests[r].keep_going && self.nodes[dep].open => {
+                        let later = |it: usize| (self.nodes[it].done_at, self.nodes[it].seq);
+                        if blocker.is_none_or(|it| later(dep) > later(it)) {
+                            blocker = Some(dep);
+                        }
+                    }
                     NodeState::Failed { .. } => _ = skipped.get_or_insert(dep),
                     NodeState::Skipped { because } => {
                         _ = skipped.get_or_insert(self.index[&NodeId(*because)])
@@ -641,6 +649,7 @@ impl<M: Memo> Plane<M> {
                 blocker,
                 task: None,
                 group: None,
+                open: false,
             };
             if me == self.nodes.len() {
                 self.nodes.push(node);
@@ -756,11 +765,8 @@ impl<M: Memo> Plane<M> {
             if let Some(outcome) = self.memo.settled(key) {
                 self.counts.remembered += 1;
                 self.requests[self.nodes[me].request].stats.cached += 1;
-                let state = match outcome {
-                    Outcome::Built => NodeState::Cached { remote: false },
-                    Outcome::Cached { remote } => NodeState::Cached { remote },
-                    Outcome::Failed { why } => NodeState::Failed { why },
-                };
+                let (state, open) = outcome.state(false);
+                self.nodes[me].open = open;
                 self.deferred.push((me, state));
                 return;
             }
@@ -837,7 +843,11 @@ impl<M: Memo> Plane<M> {
         self.nodes[me].done_at = Some(at);
         self.moved(at, me, state, out);
         let because = self.nodes[me].spec.id.0;
-        if !failed {
+        let r = self.nodes[me].request;
+        if failed {
+            self.requests[r].failed.get_or_insert(me);
+        }
+        if !failed || (self.nodes[me].open && self.requests[r].keep_going) {
             for at_dependent in 0..self.nodes[me].dependents.len() {
                 let dependent = self.nodes[me].dependents[at_dependent];
                 let node = &mut self.nodes[dependent];
@@ -849,8 +859,6 @@ impl<M: Memo> Plane<M> {
             }
             return;
         }
-        let r = self.nodes[me].request;
-        self.requests[r].failed.get_or_insert(me);
         let mut skipping: Vec<usize> = self.nodes[me].dependents.clone();
         if !self.requests[r].keep_going {
             skipping.extend(self.requests[r].nodes.iter().copied());
@@ -913,11 +921,7 @@ impl<M: Memo> Plane<M> {
             self.flight.remove(&key);
         }
         self.free_task(task);
-        let state = match outcome {
-            Outcome::Built => NodeState::Built,
-            Outcome::Cached { remote } => NodeState::Cached { remote },
-            Outcome::Failed { why } => NodeState::Failed { why },
-        };
+        let (state, open) = outcome.state(true);
         let runner = self.tasks[task].runner;
         for member in members {
             if member != runner {
@@ -925,6 +929,7 @@ impl<M: Memo> Plane<M> {
             }
             self.nodes[member].group = group;
             self.nodes[member].task = None;
+            self.nodes[member].open = open;
             touched.push(self.nodes[member].request);
             // Every member is running: a node that leaves a running task is taken out of it.
             debug_assert_eq!(self.nodes[member].state, NodeState::Running);

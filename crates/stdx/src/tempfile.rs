@@ -143,6 +143,8 @@ mod imp {
             // Unlinking the file will *not* remove it per the POSIX specification since it is open.
             // We cannot use `std::fs::remove_file()`, since, while currently using `unlink()`, it does
             // not guarantee it will use it.
+            // SAFETY: `original_path` is a `CString`, so the pointer is to a NUL-terminated string
+            // that lives until the end of this block; `unlink` only reads it.
             if unsafe { libc::unlink(original_path.as_ptr()) } == 0 {
                 path = path_after_unlink(file.as_raw_fd());
                 delete_on_drop = false;

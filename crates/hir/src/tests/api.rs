@@ -69,7 +69,7 @@ fn takes_opaque(o: Opaque) {}
 #[test]
 fn a_variant_s_fields_have_the_type_s_arguments() {
     let db = fixture::db(ITEMS).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let f = func(&db, "takes_e");
         let sig = f.signature(&db).expect("a function has a signature");
         let params = sig.params(&db);
@@ -99,7 +99,7 @@ enum One { A(u32) }
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let layout = |name: &str| {
             let ModuleDef::Adt(adt @ Adt::Enum(_)) = item(&db, name) else {
                 panic!("`{name}` is an enum")
@@ -125,7 +125,7 @@ enum One { A(u32) }
 #[test]
 fn an_array_s_element_whatever_its_length() {
     let db = fixture::db(ITEMS).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let f = func(&db, "takes_s");
         let s = f.signature(&db).unwrap().params(&db).remove(0);
         let (_, field) = s.fields(&db).remove(0);
@@ -138,7 +138,7 @@ fn an_array_s_element_whatever_its_length() {
 #[test]
 fn a_parameter_no_field_or_projection_uses_is_unused() {
     let db = fixture::db(ITEMS).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let unused = |name: &str| -> Vec<String> {
             let ModuleDef::Adt(adt) = item(&db, name) else { panic!("`{name}` is an ADT") };
             adt.unused_params(&db).iter().map(|it| it.name(&db).as_str().to_owned()).collect()
@@ -152,7 +152,7 @@ fn a_parameter_no_field_or_projection_uses_is_unused() {
 #[test]
 fn where_predicates_are_the_written_ones() {
     let db = fixture::db(ITEMS).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let f = func(&db, "bounded");
         let preds = crate::GenericDef::Function(f).where_predicates(&db);
         let traits: Vec<_> = preds
@@ -171,7 +171,7 @@ fn where_predicates_are_the_written_ones() {
 #[test]
 fn a_foreign_type_is_its_alias() {
     let db = fixture::db(ITEMS).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let f = func(&db, "takes_opaque");
         let ty = f.signature(&db).unwrap().params(&db).remove(0);
         let alias = ty.as_foreign(&db).expect("`Opaque` is a foreign type");
@@ -203,7 +203,7 @@ impl Foo for Bar {
 #[test]
 fn an_impl_method_s_signature_is_compared_with_the_trait_s() {
     let db = fixture::db(E0053).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let foo = impl_method(&db, "foo");
         let it = foo.impl_signature_mismatch(&db).expect("`i16` is not `u16`: E0053");
         assert_eq!(it.at, SignatureMismatchAt::Param(0));
@@ -245,7 +245,7 @@ unsafe fn not_safe(x: TokenStream) -> TokenStream { x }
 #[test]
 fn a_proc_macro_s_signature_is_fn_token_stream_to_token_stream() {
     let db = fixture::db(PROC_MACRO).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let at = |name, attribute| {
             func(&db, name).proc_macro_signature_mismatch(&db, attribute).map(|it| it.at)
         };
@@ -279,7 +279,7 @@ fn f() {
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let f = func(&db, "f");
         let crate::AnyFunctionId::FunctionId(id) = f.id else { panic!() };
         let def = hir_def::DefWithBodyId::FunctionId(id);
@@ -307,7 +307,7 @@ fn f(r: &mut S, mut t: (u8, u8)) {
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let f = func(&db, "f");
         let crate::AnyFunctionId::FunctionId(id) = f.id else { panic!() };
         let def = hir_def::DefWithBodyId::FunctionId(id);
@@ -347,7 +347,7 @@ pub fn current() {}
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let note = |def: ModuleDef| {
             let entry = def.deprecation(&db)?;
             Some(entry.deprecation.note.as_ref().map(|it| it.as_str().to_owned()))
@@ -380,7 +380,7 @@ fn main() {
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let found = crate::check::check_workspace(&db, false);
         let skipped: usize = found
             .iter()

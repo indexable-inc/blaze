@@ -711,7 +711,7 @@ fn summarized(stored: InstanceKey, refs: &[Target]) -> InstanceKey {
 }
 
 fn error(unit: InstanceKey, item: ItemKey, what: impl Into<String>) -> CodegenError {
-    CodegenError { unit, item, what: what.into() }
+    CodegenError { unit, item, what: what.into(), front: None }
 }
 
 /// `why`, the refusal of the function called `name`, with its message naming it where it does
@@ -2001,8 +2001,11 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut out = Out::default();
         // alloc: none for a whole build; a lazy one's, sized by its units
         let mut order = Vec::new();
-        let (nodes, statics, root_keys) =
-            self.walk(roots, static_roots, check, later.is_some().then_some(&mut order), &mut out.errors);
+        let (nodes, statics, root_keys) = {
+            let _span = tracing::info_span!(target: "blaze", "codegen walk", roots = roots.len()).entered();
+            self.walk(roots, static_roots, check, later.is_some().then_some(&mut order), &mut out.errors)
+        };
+        let owning = tracing::info_span!(target: "blaze", "codegen owners", functions = nodes.len()).entered();
         // Over the columns, whose iterators clone: the owners are read before they are checked.
         let owned = owners::owners(
             nodes.keys.iter().zip(&nodes.values).map(|(key, node)| owners::Function {
@@ -2028,6 +2031,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let editable: Vec<InstanceKey> =
             nodes.keys.iter().zip(&nodes.values).filter(|(_, node)| node.described.editable).map(|(key, _)| *key).collect();
         symbols_defined_twice(&nodes, &statics, &mut out.errors);
+        drop(owning);
         // Set with `self.last`, refused or not: `tier_up` reads the two together.
         // alloc: per build, sized by its statics' references
         self.static_callees = statics.values().flat_map(|it| it.refs.iter().filter_map(callee)).collect();
@@ -2043,7 +2047,10 @@ impl<'a, B: Prepare> Build<'a, B> {
 
         let lazily = match later {
             None => {
-                self.dev(&nodes, store, &mut out);
+                {
+                    let _span = tracing::info_span!(target: "blaze", "codegen templates", functions = nodes.len()).entered();
+                    self.dev(&nodes, store, &mut out);
+                }
                 if self.frontend.stopped() {
                     // alloc: an error, once
                     return Err(vec![stopped()]);
@@ -2055,7 +2062,10 @@ impl<'a, B: Prepare> Build<'a, B> {
                     .map(|(key, node)| Job { name: *key, unit: node.unit.clone(), spec: &node.spec, node })
                     // alloc: per build, sized by its units
                     .collect();
-                self.release(&nodes, &release, store, &mut out);
+                {
+                    let _span = tracing::info_span!(target: "blaze", "codegen release", functions = release.len()).entered();
+                    self.release(&nodes, &release, store, &mut out);
+                }
                 later::Lazily::default()
             }
             Some(entry) => self.later(&nodes, &statics, &root_keys, entry, &order, store, &mut out),
@@ -2064,8 +2074,12 @@ impl<'a, B: Prepare> Build<'a, B> {
             // alloc: an error, once
             return Err(vec![stopped()]);
         }
-        self.statics(&statics, store, &mut out);
+        {
+            let _span = tracing::info_span!(target: "blaze", "codegen statics", statics = statics.len()).entered();
+            self.statics(&statics, store, &mut out);
+        }
         out.profiled(self.policy.pgo);
+        let _finishing = tracing::info_span!(target: "blaze", "codegen finish", functions = nodes.len()).entered();
 
         let mergeable = |key: &InstanceKey| match nodes.get(key) {
             Some(node) => !node.external(),
@@ -2406,7 +2420,8 @@ impl<'a, B: Prepare> Build<'a, B> {
             .collect();
         let emitted = self.until_stopped(jobs, &mut out.errors, |(key, at, ir)| {
             let node = &nodes[&key];
-            (key, at, self.backend.emit(&node.unit, &node.spec, ir, &node.refs, None))
+            let emitted = self.backend.emit(&node.unit, &node.spec, ir, &node.refs, None);
+            (key, at, emitted.map_err(|why| naming(why, &node.described.name)))
         });
         for (key, at, emitted) in emitted {
             let node = &nodes[&key];
@@ -2522,7 +2537,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                         return;
                     }
                     Err(why) => {
-                        out.errors.push(why);
+                        out.errors.push(naming(why, &node.described.name));
                         return;
                     }
                 };
@@ -3156,7 +3171,10 @@ impl<'a, B: Prepare> Build<'a, B> {
             // alloc: per release compile, sized by its imports
             .collect();
         match list {
-            Ok(list) => self.backend.emit(&job.unit, job.spec, made, refs, Some((imports, list.as_slice()))),
+            Ok(list) => self
+                .backend
+                .emit(&job.unit, job.spec, made, refs, Some((imports, list.as_slice())))
+                .map_err(|why| naming(why, &job.node.described.name)),
             Err(import) => {
                 let named = by_name.get(&import).map_or("a function of no job", |it| &it.node.described.name);
                 // alloc: an error

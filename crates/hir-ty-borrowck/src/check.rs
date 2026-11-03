@@ -3753,15 +3753,15 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
     }
 
     /// A slice or array type as rustc writes it: `[A; 1]`, not the length's representation.
-    fn array_name(&self, ty: Ty<'_>) -> &'f str {
+    fn array_name(&self, ty: Ty<'db>) -> &'f str {
         match ty.kind() {
             TyKind::Array(element, len) => {
                 match hir_ty::consteval::try_const_usize(self.ctx.db, len) {
-                    Some(len) => text!(self, "[{element:?}; {len}]"),
-                    None => text!(self, "[{element:?}; _]"),
+                    Some(len) => text!(self, "[{}; {len}]", self.ctx.shown_ty(&element)),
+                    None => text!(self, "[{}; _]", self.ctx.shown_ty(&element)),
                 }
             }
-            _ => text!(self, "{ty:?}"),
+            _ => text!(self, "{}", self.ctx.shown_ty(&ty)),
         }
     }
 
@@ -3791,7 +3791,7 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
             MoveErrorKind::Destructor(len) => {
                 let base = place.base(len);
                 let ty = self.ctx.place_ty(self.body, base.local, base.projection).ty;
-                text!(self, "cannot move out of type `{ty:?}`, which implements the `Drop` trait")
+                text!(self, "cannot move out of type `{}`, which implements the `Drop` trait", self.ctx.shown_ty(&ty))
             }
             MoveErrorKind::Guard => {
                 text!(self, "cannot move out of {} in pattern guard", self.quoted(place, "value"))

@@ -39,6 +39,7 @@
 
 mod cores;
 pub mod fiber;
+mod giveway;
 #[cfg(all(test, not(blaze_check)))]
 #[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod fiber_tests;
@@ -58,11 +59,18 @@ pub use fiber::{
     on_fiber,
 };
 pub(crate) use fiber::spawner;
-pub(crate) use host::{Host, check_stall, fire_due, idle, job_begins, join_pool, leave_pool, ready, until_due};
-pub use host::{
-    Event, EventWait, claim, claim_for, close_scope, count_towards, innermost_scope, job_here, key_done, now, observed,
-    open_scope, release, stall_while_quiet, stuck_while_quiet, wait, waits_now,
+pub(crate) use host::{
+    Driven, Host, Turn, Turns, check_stall, fire_due, idle, job_begins, job_in_graph, join_pool, leave_pool, ready, stop_pool,
+    swap_core, until_due, waits_of,
 };
+pub(crate) use giveway::{GaveWay, NoProgress};
+#[cfg(test)]
+pub(crate) use giveway::GIVE_WAYS_WITHOUT_PROGRESS;
+pub use host::{
+    Event, EventWait, claim, claim_for, close_scope, count_towards, innermost_scope, job_here, key_done, now, observed, open_scope,
+    release, stall_while_quiet, stuck_while_quiet, wait, waits_now,
+};
+pub(crate) use host::{before_claim, gave_way_on, set_give_way_aside};
 
 use crate::Key;
 use cores::{any_in, first_from, get, set};
@@ -235,6 +243,70 @@ pub struct Cycle {
 pub struct Stalled {
     pub job: JobId,
     pub waits: Vec<(JobId, StallWait)>,
+}
+
+/// Why a stopping pool woke a parked job to fail ([`Stopped`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StopReason {
+    /// Its waits lead to `dropper`, the job of the thread that drops the pool, which waits for
+    /// the pool's jobs to end before it can end anything it holds: neither can ever end.
+    /// `panicking` says that thread is unwinding from a panic (the key's holder panicked).
+    Dropper { dropper: JobId, panicking: bool },
+    /// The pool's drop waited `waited_ns` with jobs parked and none ending, the bound of its
+    /// stop ([`crate::pool::Pool::stop`]): what is still parked fails, so the stop ends.
+    Bound { waited_ns: u64 },
+}
+
+/// A parked job of a pool that stops can never wake: its wait ends with this, for the job to
+/// fail with it, naming its wait, rather than the pool's drop waiting on it forever (rule 15).
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error, off every hot path
+pub struct Stopped {
+    pub job: JobId,
+    pub wait: StallWait,
+    pub reason: StopReason,
+    /// For [`StopReason::Dropper`], the waits from the dropper through this job back to it.
+    pub cycle: Option<Cycle>,
+}
+
+impl fmt::Display for Stopped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "pool stopped: job {} can never wake, so it fails: ", self.job.0)?;
+        say_waits(f, std::slice::from_ref(&(self.job, self.wait)))?;
+        match self.reason {
+            StopReason::Dropper { dropper, panicking } => {
+                write!(f, "; its waits lead to job {}, the thread dropping its pool", dropper.0)?;
+                if panicking {
+                    f.write_str(" as it unwinds from a panic")?;
+                }
+                f.write_str(", which ends what it holds only after the drop, and the drop waits for this job")?;
+                if let Some(cycle) = &self.cycle {
+                    write!(f, " ({cycle})")?;
+                }
+                Ok(())
+            }
+            StopReason::Bound { waited_ns } => write!(
+                f,
+                "; its pool's drop waited {:.1} s with jobs parked and none ending, the bound of its stop",
+                waited_ns as f64 / 1e9
+            ),
+        }
+    }
+}
+
+/// How a job woken to fail fails: a stall's, or its pool's stop's.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error, off every hot path
+pub(crate) enum Failed {
+    Stalled(Stalled),
+    Stopped(Stopped),
+}
+
+impl fmt::Display for Failed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Failed::Stalled(it) => it.fmt(f),
+            Failed::Stopped(it) => it.fmt(f),
+        }
+    }
 }
 
 /// The most waits a [`Stalled`]'s message names.
@@ -1106,6 +1178,17 @@ impl Place {
     }
 }
 
+/// A world id's first generation. Never 0: the profiler numbers a job generation << 32 |
+/// world id, and 0 there is no job (a worker's idle and wake rows), so the process's first
+/// job would read as rows of no job (`host::observed`).
+const FIRST_GENERATION: u32 = 1;
+
+/// The generation after `generation`, at a job's end: wrapping past `u32::MAX` to
+/// [`FIRST_GENERATION`], never to 0.
+fn next_generation(generation: u32) -> u32 {
+    generation.checked_add(1).unwrap_or(FIRST_GENERATION)
+}
+
 /// Every driver of the process: one wait graph ([`graph::Graph`]) over all their jobs, and each
 /// driver's own placement (its member, a [`Place`]). A job has a world id, unique among live
 /// jobs of every driver, and a local id, its index in its member; a wait, a claim and a cycle
@@ -1124,6 +1207,7 @@ pub(crate) struct World {
     /// By member of its own placement, numbered from [`OWN`].
     own: Vec<Option<Own>>,
     /// By world id: bumped at each end, so a [`fiber::Handle`] tells an old job from a new one.
+    /// Never 0 ([`FIRST_GENERATION`]).
     generation: Vec<u32>,
     free: Vec<u32>,
     /// Whether job ids come from [`World::alloc`], and go back to `free` as they end: a
@@ -1136,10 +1220,15 @@ pub(crate) struct World {
     /// The waits of the last stall ([`World::stall`]), and the jobs it woke not yet told.
     stall: Vec<(JobId, StallWait)>,
     stalled: Vec<JobId>,
+    /// The jobs a pool's stop woke to fail ([`World::stop_own`]), not yet told.
+    stopped: Vec<Stopped>,
     /// The timed waits of jobs of members of their own placement, by world id, on the clock
     /// [`World::advance_own_clock`] reads; made at the first.
     own_timers: Option<Wheel<u32>>,
     own_now: u64,
+    /// By world id: each job's last give-way while it may ask again ([`giveway`]), dropped as
+    /// it ends; grown at the first give-way of an id.
+    gave_way: Vec<Option<GaveWay>>,
 }
 
 impl World {
@@ -1156,15 +1245,17 @@ impl World {
             here: Vec::with_capacity(64),
             stall: Vec::new(),
             stalled: Vec::new(),
+            stopped: Vec::new(),
             own_timers: None,
             own_now: 0,
+            gave_way: Vec::new(), // alloc: the world's, for the process's life
         }
     }
 
     /// Every pool is idle, as its caller found under the scheduler's lock: if no driver runs
     /// and no wait in the graph can end by what is in it ([`Graph::stuck`], `clients` the
     /// member of the threads on no fiber, `quiet` whether those threads said they are still),
-    /// every waiting job wakes, to fail with the stall ([`World::take_stall`]). How many woke.
+    /// every waiting job wakes, to fail with the stall ([`World::take_failed`]). How many woke.
     pub(crate) fn stall(&mut self, clients: Option<u32>, quiet: bool) -> usize {
         if !self.stuck(clients, quiet) {
             return 0;
@@ -1204,14 +1295,54 @@ impl World {
         &self.stall
     }
 
-    /// The stall `job` woke for, if it did: told once. The job leaves the scopes it has open
-    /// that no job counts towards, as it unwinds out of them; with them, its innermost scope.
-    pub(crate) fn take_stall(&mut self, job: JobId) -> Option<(Stalled, Option<CounterId>)> {
-        let at = self.stalled.iter().position(|&it| it == job)?;
-        self.stalled.swap_remove(at);
+    /// The stall or pool's stop `job` woke to fail for, if one did: told once. The job leaves
+    /// the scopes it has open that no job counts towards, as it unwinds out of them; with them,
+    /// its innermost scope.
+    pub(crate) fn take_failed(&mut self, job: JobId) -> Option<(Failed, Option<CounterId>)> {
+        let failed = if let Some(at) = self.stalled.iter().position(|&it| it == job) {
+            self.stalled.swap_remove(at);
+            // alloc: a stall's report, once per job it fails
+            Failed::Stalled(Stalled { job, waits: self.stall.clone() })
+        } else {
+            let at = self.stopped.iter().position(|it| it.job == job)?;
+            Failed::Stopped(self.stopped.swap_remove(at))
+        };
         let scope = self.graph.leave_empty_scopes(job);
-        // alloc: a stall's report, once per job it fails
-        Some((Stalled { job, waits: self.stall.clone() }, scope))
+        Some((failed, scope))
+    }
+
+    /// The pool of `member` (of its own placement) stops, and its parked jobs that can never
+    /// wake now wake, each to fail with a [`Stopped`] naming its wait ([`World::take_failed`]):
+    /// for [`StopReason::Dropper`], those whose waits lead to the dropper's job; for
+    /// [`StopReason::Bound`], every one that waits in the graph ([`Graph::unwait_member`]).
+    /// A timed wait is no wait in the graph and is left to its clock. How many woke.
+    pub(crate) fn stop_own(&mut self, member: u32, reason: StopReason) -> usize {
+        let dropper = match reason {
+            StopReason::Dropper { dropper, .. } if self.graph.life(dropper) == Life::Live => Some(dropper),
+            // The thread dropping the pool is no live job: no wait leads to it.
+            StopReason::Dropper { .. } => return 0,
+            StopReason::Bound { .. } => None,
+        };
+        let mut unwaited = Vec::new(); // alloc: a pool's stop, once per round of it
+        self.graph.unwait_member(member, dropper, &mut unwaited);
+        let mut woken = std::mem::take(&mut self.woken);
+        woken.clear();
+        for (job, wait, cycle) in unwaited {
+            woken.push(job.0);
+            self.stopped.push(Stopped { job, wait, reason, cycle });
+        }
+        let count = woken.len();
+        self.woken = woken;
+        self.split(None);
+        count
+    }
+
+    /// The jobs of `member` that wait in the graph now, and what on: what a pool's stop that
+    /// could not end names.
+    pub(crate) fn waits_of(&self, member: u32) -> Waits {
+        let mut waits = Vec::new(); // alloc: a report, off every hot path
+        self.graph.waiting_of(member, &mut waits);
+        Waits(waits)
     }
 
     /// A new member, every core parked.
@@ -1238,14 +1369,14 @@ impl World {
         match self.free.pop() {
             Some(job) => JobId(job),
             None => {
-                self.generation.push(0);
+                self.generation.push(FIRST_GENERATION);
                 JobId((self.generation.len() - 1) as u32)
             }
         }
     }
 
     pub(crate) fn generation(&self, job: JobId) -> u32 {
-        self.generation.get(job.0 as usize).copied().unwrap_or(0)
+        self.generation.get(job.0 as usize).copied().unwrap_or(FIRST_GENERATION)
     }
 
     /// The local id of a live or ended job, and its member.
@@ -1282,7 +1413,7 @@ impl World {
     /// names a core, group or node the shape does not have.
     pub(crate) fn spawn(&mut self, member: u32, local: u32, job: JobId, how: Spawn) {
         if self.generation.len() <= job.0 as usize {
-            self.generation.resize(job.0 as usize + 1, 0);
+            self.generation.resize(job.0 as usize + 1, FIRST_GENERATION);
         }
         let spawner = how.parent.and_then(|parent| {
             let home = self.graph.home(parent);
@@ -1369,7 +1500,7 @@ impl World {
         own.token[local as usize] = token;
         let job = self.alloc();
         if self.generation.len() <= job.0 as usize {
-            self.generation.resize(job.0 as usize + 1, 0);
+            self.generation.resize(job.0 as usize + 1, FIRST_GENERATION);
         }
         self.graph.add(job, Home { member, local }, counter);
         job
@@ -1587,13 +1718,16 @@ impl World {
         woken.clear();
         self.graph.end(job, &mut woken);
         self.woken = woken;
+        if let Some(gave_way) = self.gave_way.get_mut(job.0 as usize) {
+            *gave_way = None;
+        }
         if member & OWN != 0 {
             self.split(None);
             let own = self.own_mut(member);
             own.state[local as usize] = OwnState::Free;
             own.free.push(local);
             let generation = &mut self.generation[job.0 as usize];
-            *generation = generation.wrapping_add(1);
+            *generation = next_generation(*generation);
             if self.recycles {
                 self.free.push(job.0);
             }
@@ -1605,7 +1739,7 @@ impl World {
         self.here = here;
         self.touch(member);
         let generation = &mut self.generation[job.0 as usize];
-        *generation = generation.wrapping_add(1);
+        *generation = next_generation(*generation);
         if self.recycles {
             self.free.push(job.0);
         }
@@ -1637,6 +1771,46 @@ impl World {
                 self.touch(member);
             }
             None => self.split(None),
+        }
+    }
+
+    /// `job` as the observer numbers it: its generation << 32 | its slot, one job of the
+    /// process's life.
+    pub(crate) fn observed(&self, job: JobId) -> u64 {
+        u64::from(self.generation(job)) << 32 | u64::from(job.0)
+    }
+
+    /// `job`, live, gave way: its wait for `flight`, the run of `asked` (which the caller names
+    /// `named`) by `to`, closed a cycle. Its next ask waits for that run to end first
+    /// ([`giveway`]).
+    pub(crate) fn gave_way(&mut self, job: JobId, asked: Key, named: Box<str>, flight: Key, to: JobId) {
+        assert!(self.graph.life(job) == Life::Live, "job {} gave way while not live", job.0);
+        let owner = self.observed(to);
+        let at = job.0 as usize;
+        if self.gave_way.len() <= at {
+            // alloc: the world's, for the process's life, grown to the highest id that gave way
+            self.gave_way.resize(at + 1, None);
+        }
+        let last = self.gave_way[at].take();
+        self.gave_way[at] = Some(GaveWay::after(last, job, giveway::Run { asked, named, flight, to, owner }));
+    }
+
+    /// `job`'s last give-way, if it remembers one.
+    pub(crate) fn give_way_of(&self, job: JobId) -> Option<&GaveWay> {
+        self.gave_way.get(job.0 as usize)?.as_ref()
+    }
+
+    /// A loop caught `job`'s last give-way to run its item again later ([`GaveWay::set_aside`]).
+    pub(crate) fn set_give_way_aside(&mut self, job: JobId) {
+        if let Some(Some(gave_way)) = self.gave_way.get_mut(job.0 as usize) {
+            gave_way.set_aside();
+        }
+    }
+
+    /// `job`'s wait for the run it gave way to ended: it gave way to nothing now.
+    pub(crate) fn forget_give_way(&mut self, job: JobId) {
+        if let Some(gave_way) = self.gave_way.get_mut(job.0 as usize) {
+            *gave_way = None;
         }
     }
 

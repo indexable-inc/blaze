@@ -502,7 +502,6 @@ mod tests {
 
     use base_db::FileId;
     use blaze_hash::HashMap;
-    use hir::attach_db;
     use hir_expand::fixture;
 
     use crate::{
@@ -552,7 +551,7 @@ pub fn next(x: u32) -> u32 {
         let fx = fixture::db(FIXTURE);
         let file = *fx.files().last().expect("src/lib.rs");
         let mut db = fx.into_db();
-        let krate = attach_db(&db, || crate::tests::main_crate(&db));
+        let krate = blaze_query::db::attach(&db, || crate::tests::main_crate(&db));
         let file = file.file_id(&db);
         let before = db.file_text(file).text(&db).to_string();
         let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
@@ -582,7 +581,7 @@ pub fn next(x: u32) -> (r: u32)
 ",
             "from:\n{before}"
         );
-        attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let found = check(&db, krate, &setup, &name_of).expect("the file is named");
             let left: Vec<&str> = found.iter().map(|it| it.diagnostic.message.as_str()).collect();
             assert!(left.is_empty(), "the fixed file lints clean:\n{after}\n{left:#?}");

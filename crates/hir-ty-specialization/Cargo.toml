@@ -19,6 +19,7 @@ rustc_type_ir.workspace = true
 
 # local deps
 base-db.workspace = true
+blaze-query.workspace = true
 blaze-mem.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true

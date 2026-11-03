@@ -442,7 +442,31 @@ pub struct Units {
 }
 
 impl Versioned for Units {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 12");
+    // 13: `CARGO_PRIMARY_PACKAGE` left the plans' variables ([`Units::is_primary`]).
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 13");
+}
+
+impl Units {
+    /// Whether unit `unit` is of a primary package: one a root unit (what the request asked
+    /// for) is of, as cargo's `is_primary_package` has it. Its crates see
+    /// `CARGO_PRIMARY_PACKAGE=1`. It is of the request alone, never in a plan: a record is
+    /// keyed by it only through a crate that read it, so `--workspace` then `-p one` reuses
+    /// every unit `one` depends on (rule 18).
+    pub fn is_primary(&self, unit: usize) -> bool {
+        let pkg = &self.graph.units[unit].pkg_id;
+        self.primary_package(pkg)
+    }
+
+    /// Whether the package whose manifest is `manifest_path` (a crate's `CARGO_MANIFEST_PATH`)
+    /// is primary ([`Units::is_primary`]): how a record's reads, which name a crate by its
+    /// package's manifest, are valued with no front end.
+    pub fn is_primary_manifest(&self, manifest_path: &str) -> bool {
+        self.packages.iter().find(|it| it.manifest_path == manifest_path).is_some_and(|it| self.primary_package(&it.id))
+    }
+
+    fn primary_package(&self, pkg_id: &str) -> bool {
+        self.graph.roots.iter().any(|&root| self.graph.units[root].pkg_id == pkg_id)
+    }
 }
 
 /// What cargo passes and writes for one unit.

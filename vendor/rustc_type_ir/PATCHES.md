@@ -26,16 +26,6 @@ Why: hir-ty's `next_solver/persist.rs` rebuilds these from interned rows and per
 tables, where no `DbInterner` exists. The parts were checked when the value was first made.
 The fields are private (`_use_*_new_instead`), so only this crate can build them.
 
-### 0002-opaque-of-impl
-
-What: `Interner::opaque_of_impl(param_env, opaque, args) -> Option<Ty>`, `None` by default.
-`rustc_next_trait_solver`'s patch `0001-opaque-of-impl` calls it when revealing an opaque type.
-
-Why: hir-ty models a trait method's return-position `impl Trait` as an opaque type of the trait.
-Once its arguments name an impl, its hidden type is the impl method's opaque type, which
-`type_of` of the trait's opaque can't say. rustc lowers the same thing to a projection, so it
-needs no hook.
-
 ### 0003-shared-solver-cache
 
 What: `search_graph::GlobalCache` is rewritten for sharing across threads, and the cache API
@@ -151,18 +141,22 @@ probe clone. The inline lists cost 24 to 40 bytes more per nested goal.
 What: `search_graph::global_cache` (patch `0003-shared-solver-cache`) keeps its chunks, shards,
 writers and probe tables in `blaze_mem::blocks::Slice`s (power-of-two blocks of OS memory, given
 back to their size class when the cache drops) instead of `Box<[T]>`s, and its shard and writer
-locks are `blaze_mem::lock::SpinLock`s instead of `std::sync::Mutex`es. `Cargo.toml` (blaze's)
-depends on `blaze-mem` for it.
+locks are `parking_lot::Mutex`es instead of `std::sync::Mutex`es, taken through
+`blaze_graph::wait::lock`, so a contended one blocks the thread inside a `wait` span naming the
+lock (`WRITER`, `SHARD`). `Cargo.toml` (blaze's) depends on `blaze-mem`, `blaze-graph` and
+`parking_lot` for it.
 
 Why: blaze makes a cache per interner, and drops it when the interner's generation is evicted
 (`hir-ty`'s `next_solver::interner::tls_cache`). In `Box`es a fresh cache made about two dozen
 heap allocations the first time it was used, so re-solving an unchanged body allocated
 (`docs/v2/plan/lanes/mem/db-solver.md`, items 8 and 10). On macOS a `std` mutex boxes a pthread
-mutex the first time it is locked, which cost one more allocation per shard and writer used.
-Blocks come from reserved regions, so a fresh cache's tables cost the global allocator nothing,
-and the blocks of an evicted cache are the next cache's, already backed by pages. Lookups and
-inserts are unchanged; an insert's critical section is a few instructions, so a spin lock that
-yields is enough.
+mutex the first time it is locked, which cost one more allocation per shard and writer used;
+`parking_lot`'s allocates nothing to make or lock. Blocks come from reserved regions, so a
+fresh cache's tables cost the global allocator nothing, and the blocks of an evicted cache are
+the next cache's, already backed by pages. Lookups and inserts are unchanged. (The locks were
+`blaze_mem::lock::SpinLock`s until 2026-11-02, removed after T4: a spin lock has no fairness and
+no named wait, so a waiter on a hot lock could spin out its bound. A raw `lock()` would block in
+the kernel with no span open, a raw block the profile's gate fails on (AGENTS.md rule 13).)
 
 ### 0011-arbitrary-int-lang-items
 

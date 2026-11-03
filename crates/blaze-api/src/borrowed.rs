@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::{
     ApiError, Applicability, Artifact, Basis, BuildScriptRan, Cached, CrateType, Diagnostic,
     Documented, Edited, FactRead, FetchVerb, Hot, Level, Rebuilt, LiveFrame, Memory, Mismatch, Ranked, Reach, Response, Span, Status,
-    Table, TargetKind, TestOutcome, TestResult, Traced, UnitOf, UnitStarted, UnitTarget, Verb,
+    Table, TargetKind, TestOutcome, TestResult, Traced, Unchecked, UnitOf, UnitStarted, UnitTarget, Verb,
     Worked,
 };
 
@@ -33,6 +33,7 @@ pub enum ResponseRef<'a> {
     Fetched { verb: FetchVerb, what: &'a str },
     BuildScript(#[serde(borrow)] BuildScriptRanRef<'a>),
     Work(Worked),
+    Unchecked(Unchecked),
     TestResult(#[serde(borrow)] TestResultRef<'a>),
     Ran {
         code: Option<i32>,
@@ -296,6 +297,7 @@ impl ResponseRef<'_> {
             ResponseRef::Fetched { verb, what } => Response::Fetched { verb, what: owned(what) },
             ResponseRef::BuildScript(it) => Response::BuildScript(it.into_owned()),
             ResponseRef::Work(it) => Response::Work(it),
+            ResponseRef::Unchecked(it) => Response::Unchecked(it),
             ResponseRef::TestResult(it) => Response::TestResult(it.into_owned()),
             ResponseRef::Ran { code, stderr, stdout } => {
                 Response::Ran { code, stderr: bytes(stderr), stdout: bytes(stdout) }

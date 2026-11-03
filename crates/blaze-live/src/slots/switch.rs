@@ -1392,13 +1392,8 @@ mod tests {
     /// finds, over seeded ranges added in place and probes before, among and past them.
     #[test]
     fn a_lasting_hit_is_what_a_scan_finds() {
-        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = move |bound: u64| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed % bound
-        };
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+        let mut next = move |bound: u64| rng.below(bound);
         let mut lasting = Lasting::new(4096).expect("reserved");
         let mut model: Vec<(Range<u64>, u64, Holds)> = Vec::new();
         for number in 1..400u64 {

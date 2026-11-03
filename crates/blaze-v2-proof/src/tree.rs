@@ -116,15 +116,15 @@ fn list(dir: &Path, rel: &str, skip: &[String]) -> io::Result<Listed> {
     let mut listed = Listed { links: Vec::new(), dirs: Vec::new(), files: Vec::new() };
     // alloc: per directory, its files until a task takes them
     let mut files: Vec<(PathBuf, String)> = Vec::new();
-    for entry in fs::read_dir(dir).map_err(|e| named(dir, e))? {
-        let entry = entry.map_err(|e| named(dir, e))?;
+    for entry in fs::read_dir(dir).map_err(|e| named(dir, &e))? {
+        let entry = entry.map_err(|e| named(dir, &e))?;
         let path = entry.path();
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             // alloc: an error
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: a name that is not UTF-8", path.display())));
         };
-        let kind = entry.file_type().map_err(|e| named(&path, e))?;
+        let kind = entry.file_type().map_err(|e| named(&path, &e))?;
         // `os.walk` lists a link to a directory with the directories, so `skip` takes it too.
         if rel.is_empty()
             && skip.iter().any(|it| it == name)
@@ -135,7 +135,7 @@ fn list(dir: &Path, rel: &str, skip: &[String]) -> io::Result<Listed> {
         // alloc: per entry, its path under the root
         let child = if rel.is_empty() { name.to_owned() } else { format!("{rel}/{name}") };
         if kind.is_symlink() {
-            let to = fs::read_link(&path).map_err(|e| named(&path, e))?;
+            let to = fs::read_link(&path).map_err(|e| named(&path, &e))?;
             let Some(to) = to.to_str() else {
                 // alloc: an error
                 return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: a link target that is not UTF-8", path.display())));
@@ -161,7 +161,7 @@ fn hash_files(files: Vec<(PathBuf, String)>) -> io::Result<Vec<Entry>> {
     // alloc: per task, its entries
     let mut entries = Vec::with_capacity(files.len());
     for (path, rel) in files {
-        let (executable, hash) = hash_file(&path).map_err(|e| named(&path, e))?;
+        let (executable, hash) = hash_file(&path).map_err(|e| named(&path, &e))?;
         entries.push(Entry::File { rel, executable, hash });
     }
     Ok(entries)
@@ -201,7 +201,7 @@ fn executable(path: &Path, _: &fs::Metadata) -> bool {
         .is_some_and(|it| ["exe", "bat", "cmd", "com"].iter().any(|ext| it.eq_ignore_ascii_case(ext)))
 }
 
-fn named(path: &Path, error: io::Error) -> io::Error {
+fn named(path: &Path, error: &io::Error) -> io::Error {
     // alloc: an error
     io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }

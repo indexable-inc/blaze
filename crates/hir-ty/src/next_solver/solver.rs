@@ -652,6 +652,27 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                     .or(Some(trait_assoc_id))
                     .map(|def| ImplOrTraitAssocTermId(TermId::ConstId(def)))
             }
+            // rustc's `ImplTraitInTraitData::Impl`: the impl's method, if it has one, gives the
+            // item, as an impl's associated type would; else a specialized impl's; else the
+            // trait's, which has a value only with a default body.
+            TermId::RpititId(trait_rpitit) => {
+                let in_impl = |impl_id: hir_def::ImplId| trait_rpitit.in_impl(db, impl_id);
+                if in_impl(impl_id).is_some()
+                    && crate::specialization::impl_has_unconstrained_params(db, impl_id)
+                {
+                    return FetchEligibleAssocItemResponse::Err(ErrorGuaranteed);
+                }
+                in_impl(impl_id)
+                    .or_else(|| {
+                        let ancestor =
+                            crate::specialization::specialized_ancestor(db, impl_id, |it| {
+                                in_impl(it).is_some()
+                            })?;
+                        in_impl(ancestor)
+                    })
+                    .or(Some(trait_rpitit))
+                    .map(|def| ImplOrTraitAssocTermId(TermId::RpititId(def)))
+            }
         };
         match id {
             Some(id) => FetchEligibleAssocItemResponse::Found(id),

@@ -266,6 +266,43 @@ fn partial_eq_writes_structural_partial_eq_first() {
     }
 }
 
+/// A packed struct's fields are copied out where each field is written but in the derive's
+/// hygiene: `self` and `other` are the derived fn's parameters (the call site's context, not
+/// the field's), or they resolve to nothing (E0424 `self`, E0425 `other`, cranelift-codegen's
+/// `ValueDataPacked`, 2026-11-02). The field names keep their own context.
+#[test]
+fn a_packed_structs_copies_name_self_and_other_in_the_derives_hygiene() {
+    let span = call_site();
+    for text in ["#[repr(packed)] struct P { a: u8, b: u32 }", "#[repr(packed)] struct T(u8, u32);"] {
+        let (_, map) = item(text);
+        let parse = parsed(text);
+        let info = super::parse_adt_from_syntax(adt_view(&parse), &map, span);
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let ExpandResult { value, err } = super::partial_eq_derive(frame, span, info);
+        assert_eq!(err, None, "{text}");
+        let (mut bases, mut fields) = (0, 0);
+        each_leaf(value.iter(), &mut |leaf| {
+            let tt::Leaf::Ident(it) = leaf else { return };
+            match it.sym.as_str() {
+                "self" | "other" => {
+                    assert_eq!(it.span.ctx, span.ctx, "{text}: `{}` in the derive's hygiene", it.sym.as_str());
+                    bases += 1;
+                }
+                "a" | "b" => {
+                    assert_ne!(it.span.ctx, span.ctx, "{text}: the field `{}` keeps its own", it.sym.as_str());
+                    fields += 1;
+                }
+                _ => {}
+            }
+        });
+        // `eq(&self, other: &Self)`, then a copy of each of the two fields out of each.
+        assert!(bases >= 2 + 4, "{text}: {bases} `self`/`other` in {value}");
+        if text.contains('{') {
+            assert_eq!(fields, 4, "{text}: {value}");
+        }
+    }
+}
+
 /// rustc's `PartialEq`, `PartialOrd` and `Ord` derives: the discriminants are compared only
 /// for an enum of several variants (`discriminant_value` needs `Self: Sized`, which a struct
 /// like `struct AbsPath(Utf8Path)` is not), and the match of `self` and `other` has a fallback
@@ -354,7 +391,7 @@ fn reference_from(
     };
     let body = match record_field {
         Some(field) => {
-            let field = tt::Ident { span: tt::Span { ctx: span.ctx, ..field.span }, ..field };
+            // The field name keeps its own context, as `push_fields` writes it.
             let value = value();
             quote! {span => Self { #field : #value } }
         }

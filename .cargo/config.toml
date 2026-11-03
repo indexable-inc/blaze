@@ -15,3 +15,9 @@ CARGO_WORKSPACE_DIR = { value = "", relative = true }
 # The compiler in a browser, `crates/blaze-wasm`: there are no threads to drop syntax trees on.
 [target.wasm32-unknown-unknown]
 rustflags = ["--cfg", "no_async_drops"]
+
+# The wasm64 seed (todo/bootstrap/plan.md): getrandom has no backend for wasm64 WASI, so it
+# takes its `custom` one, which the target's runtime defines over the host's `random_get`
+# (library/wasi_rt/src/rt/random.rs).
+[target.wasm64-blaze-wasip1]
+rustflags = ["--cfg", 'getrandom_backend="custom"']

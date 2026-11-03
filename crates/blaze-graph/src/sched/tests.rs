@@ -819,6 +819,45 @@ fn a_cycle_names_its_jobs_in_wait_order() {
     sched.audit();
 }
 
+/// The world's give-way records, a transcript with no driver: a job that gave way is
+/// remembered by its id with the run it gave way to, named as the caller named it and owned by
+/// the run's job as observed then; another give-way continues the streak, a loop's set-aside
+/// takes one back, a retry whose wait ended forgets it, and the job's end drops it.
+#[test]
+fn a_give_way_is_kept_by_its_job_until_it_ends() {
+    let mut sched = Sched::new(Cores::flat(2).unwrap(), 8);
+    all_busy(&mut sched);
+    let (a, b) = (key(1), key(2));
+    assert!(sched.claim(a, Some(JobId(0))));
+    assert!(sched.claim(b, Some(JobId(1))));
+    assert_eq!(sched.suspended(JobId(0), Wait::Key(b)), Ok(Suspend::Waiting));
+    let cycle = sched.suspended(JobId(1), Wait::Key(a)).expect_err("job 1's wait for a closes the cycle");
+    assert_eq!(cycle.jobs, [JobId(1), JobId(0)]);
+    let world = &mut sched.world;
+    let owner = world.observed(JobId(0));
+    world.gave_way(JobId(1), a, "Chain(a)".into(), a, cycle.jobs[1]);
+    let kept = world.give_way_of(JobId(1)).expect("job 1's give-way").clone();
+    assert_eq!((kept.asked, &*kept.named, kept.flight, kept.to, kept.owner, kept.streak), (a, "Chain(a)", a, JobId(0), owner, 1));
+    assert_eq!(world.give_way_of(JobId(0)), None, "job 0 gave way to nothing");
+    let mut said = String::new();
+    kept.name_wait(&mut said);
+    assert_eq!(said, "a retry after giving way: the run of Chain(a) by job 0");
+    let c = key(3);
+    world.gave_way(JobId(1), c, "Chain(c)".into(), c, JobId(0));
+    assert_eq!(world.give_way_of(JobId(1)).map(|it| (it.flight, it.streak)), Some((c, 2)), "again, to another run");
+    world.set_give_way_aside(JobId(1));
+    assert_eq!(world.give_way_of(JobId(1)).map(|it| it.streak), Some(1), "a loop set one aside");
+    world.gave_way(JobId(1), a, "Chain(a)".into(), a, JobId(0));
+    assert_eq!(world.give_way_of(JobId(1)).map(|it| it.streak), Some(2), "the streak goes on after the set-aside");
+    world.forget_give_way(JobId(1));
+    assert_eq!(world.give_way_of(JobId(1)), None, "its retry's wait ended");
+    world.gave_way(JobId(1), a, "Chain(a)".into(), a, JobId(0));
+    // Job 1 ends, and with it its record: an id given again starts with none.
+    sched.done(JobId(1));
+    assert_eq!(sched.world.give_way_of(JobId(1)), None, "dropped as job 1 ended");
+    sched.audit();
+}
+
 #[test]
 fn a_cycle_through_a_counter_names_the_item() {
     let mut sched = Sched::new(Cores::flat(2).unwrap(), 8);

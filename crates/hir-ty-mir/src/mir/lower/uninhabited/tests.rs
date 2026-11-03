@@ -7,6 +7,7 @@
 //! `tests/mir/uninhabited.rs` hold them.
 
 use blaze_mem::{Frame, Tag, frame};
+use blaze_rng::SplitMix64;
 use la_arena::RawIdx;
 
 use super::*;
@@ -194,23 +195,7 @@ fn a_cycle_reached_from_nowhere_ends() {
 
 // Generated blocks.
 
-/// xorshift64*: the same sequence on every machine.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-}
-
-fn generated<'f>(rng: &mut Rng, frame: &'f Frame, count: usize) -> Vec<FrameBlock<'f>> {
+fn generated<'f>(rng: &mut SplitMix64, frame: &'f Frame, count: usize) -> Vec<FrameBlock<'f>> {
     let mut blocks = Vec::with_capacity(count);
     for at in 0..count {
         let mut statements = Vec::new();
@@ -239,7 +224,7 @@ fn generated<'f>(rng: &mut Rng, frame: &'f Frame, count: usize) -> Vec<FrameBloc
 
 #[test]
 fn the_same_as_rustcs_walk_on_generated_blocks() {
-    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     for _ in 0..2000 {
         frame::task(Tag::Mir, |frame| {
             let count = 1 + rng.below(12) as usize;

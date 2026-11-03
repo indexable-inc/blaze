@@ -9,7 +9,7 @@ use crate::{AnyDiagnostic, Crate};
 /// The `why` of each `TraitItemImport` hir reports for the crate `main`, in order.
 fn reported(fixture: &str) -> Vec<TraitItemImport> {
     let db = fixture::db(fixture).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let main = Crate::all(&db)
             .into_iter()
             .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))

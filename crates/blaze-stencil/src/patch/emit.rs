@@ -10,6 +10,11 @@
 //!   (copied, its tail dropped when the next code follows, each hole patched) or glue, then
 //!   the block's edges, then the trap stubs and the constants.
 //!
+//! Before each piece of code (a stencil, the glue of an instruction, a relay, a trap stub) the
+//! buffer is asked for room ([`Buf::room`]), and writes an island of veneers and constants
+//! there when a branch or constant address would otherwise end up out of reach (AArch64's
+//! `b.cond` and `adr` reach ±1 MiB).
+//!
 //! The code that follows a block's terminator is its first edge with code written after it,
 //! or else the next block: a branch to it is dropped (a `jump`) or falls through (`brif`'s
 //! `Next`).
@@ -27,7 +32,7 @@ use super::{
 use crate::{
     Error, Target,
     arch::{Cx, Glue, Loc},
-    buf::{Buf, Label},
+    buf::{Buf, Island, Label},
     enc,
     shape::{Dst, Op, Shape, Src, Ty},
     table::format::{HoleKind, Reader, Stencil},
@@ -366,7 +371,28 @@ pub(super) fn function<'f, A: Glue>(
     frame: &A::Frame,
     library: &Reader<'_>,
 ) -> Result<(), Error> {
-    Out::<A> { buf, plan, side, func, target, frame, library }.function()
+    let island = island::<A>(library);
+    let fixed = A::bound_fixed(frame);
+    Out::<A> { buf, plan, side, func, target, frame, library, island, fixed }.function()
+}
+
+/// What an island is written with: the library's `jump` stencil, whose one hole is `Next`.
+/// `None` for a library without one (the tests' small ones), which can't write an island.
+fn island<'a, A: Glue>(library: &Reader<'a>) -> Option<Island<'a>> {
+    let stencil = library.stencil(library.find(JUMP.key())?);
+    let mut holes = stencil.holes();
+    let hole = holes.next().filter(|it| it.kind == HoleKind::Next)?;
+    if holes.next().is_some() {
+        return None;
+    }
+    Some(Island {
+        jump: stencil.code,
+        at: u32::from(hole.at),
+        form: hole.form,
+        addend: i64::from(hole.addend),
+        nop: A::NOP,
+        align: ALIGN,
+    })
 }
 
 struct Out<'a, 'f, A: Glue> {
@@ -377,9 +403,18 @@ struct Out<'a, 'f, A: Glue> {
     target: &'a Target,
     frame: &'a A::Frame,
     library: &'a Reader<'a>,
+    island: Option<Island<'a>>,
+    /// The glue's bound of a relay, a landing pad, a back-edge count and a trap stub.
+    fixed: u32,
 }
 
 impl<'f, A: Glue> Out<'_, 'f, A> {
+    /// Room for a piece of `bytes` bytes: an island first, when one is due before it.
+    fn room(&mut self, bytes: u32) -> Result<(), Error> {
+        let (side, library) = (&*self.side, self.library);
+        self.buf.room(bytes, self.island.as_ref(), |label| side.datum(label, library))
+    }
+
     fn cx(&mut self) -> Cx<'_, 'f, A> {
         Cx {
             buf: &mut *self.buf,
@@ -405,6 +440,7 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                         self.stencil(block, inst, sel)?;
                     }
                     Kind::Glue => {
+                        self.room(A::bound(func, self.target, inst))?;
                         self.line(inst);
                         A::inst(&mut self.cx(), inst)?;
                         if inline(func, inst) == 1 {
@@ -445,6 +481,7 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
             return Ok(at);
         }
         let relay = self.relay(inst, n)?;
+        self.room(self.fixed)?;
         A::relay(&mut self.cx(), at, relay, bytes);
         Ok(relay)
     }
@@ -518,6 +555,7 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
         self.put(inst, &stencil, shape, &fill)?;
         for (k, back) in back.into_iter().enumerate() {
             if let Some((to, bytes)) = back {
+                self.room(self.fixed)?;
                 A::relay(&mut self.cx(), fill.dsts[k], to, bytes);
             }
         }
@@ -527,6 +565,7 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
     /// Copies `stencil` and patches its holes from `fill`.
     fn put(&mut self, inst: ir::Inst, stencil: &Stencil<'_>, shape: Shape, fill: &Fill) -> Result<(), Error> {
         let code = if fill.next == Next::Falls { stencil.body() } else { stencil.code };
+        self.room(code.len() as u32)?;
         let at = self.buf.len();
         self.buf.put(code);
         let end = i64::from(self.buf.len());
@@ -554,7 +593,7 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                 HoleKind::TrapOverflow => Some(self.side.trap(self.buf, ir::TrapCode::INTEGER_OVERFLOW)),
                 HoleKind::Const => {
                     let (pool, index, bytes) = self.konst(inst, fill.konst)?;
-                    Some(self.side.konst(self.buf, pool, index, bytes))
+                    Some(self.side.konst(self.buf, pool, index, bytes, (place, hole.form, addend)))
                 }
                 _ => None,
             };
@@ -584,7 +623,7 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                 },
                 HoleKind::Rodata => {
                     let (entry, addend) = hole.rodata();
-                    let to = self.side.rodata(self.buf, entry);
+                    let to = self.side.rodata(self.buf, entry, (place, hole.form, addend));
                     self.buf.fixup(place, hole.form, to, addend);
                     continue;
                 }
@@ -670,6 +709,9 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
             if !edge.own {
                 continue;
             }
+            if edge.landing {
+                self.room(self.fixed)?;
+            }
             self.buf.bind(edge.label);
             if edge.landing {
                 A::landing(&mut self.cx(), term)?;
@@ -687,6 +729,7 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
     /// An edge's back-edge count and moves.
     fn body(&mut self, term: ir::Inst, edge: &Edge) -> Result<(), Error> {
         if edge.back {
+            self.room(self.fixed)?;
             A::count_back_edge(&mut self.cx());
         }
         let (func, plan) = (self.func, self.plan);
@@ -787,34 +830,54 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
         let stencil = self.library.stencil(at);
         self.put(term, &stencil, shape, &fill)?;
         if far {
+            self.room(self.fixed)?;
             A::relay(&mut self.cx(), fill.dsts[0], one.to, bytes);
         }
         Ok(())
     }
 
-    /// The trap stubs, then the constants and the library rodata the code uses, 16-aligned.
+    /// The trap stubs, then the constants and the library rodata the code uses, 16-aligned:
+    /// those no island placed already. Last, an island for the branches back out of reach the
+    /// code ended before serving ([`Buf::settle`]).
     fn finish(&mut self) -> Result<(), Error> {
+        self.area()?;
+        let (side, library) = (&*self.side, self.library);
+        self.buf.settle(self.island.as_ref(), |label| side.datum(label, library))
+    }
+
+    fn area(&mut self) -> Result<(), Error> {
         let mut at = 0;
         while at < self.side.traps.len() {
             let (code, label) = self.side.traps[at];
+            self.room(self.fixed)?;
             self.buf.bind(label);
             self.side.trap_sites.push((self.buf.len(), code));
             A::trap(&mut self.cx(), code);
             at += 1;
         }
-        if self.side.const_order.is_empty() && self.side.rodata.is_empty() {
+        let unplaced = |label: Label| self.buf.offset(label).is_none();
+        let consts = self.side.const_order.iter().filter(|it| unplaced(it.1)).count();
+        let entries = self.side.rodata.iter().filter(|it| unplaced(it.1)).count();
+        if consts + entries == 0 {
             return Ok(());
         }
+        // The area as one piece: an island due before its end comes before it, and places
+        // what it serves itself.
+        self.room(ALIGN + 16 * (consts + entries) as u32)?;
         self.buf.align(ALIGN, A::NOP);
         for at in 0..self.side.const_order.len() {
             let (bytes, label) = self.side.const_order[at];
-            self.buf.bind(label);
-            self.buf.put(&bytes);
+            if self.buf.offset(label).is_none() {
+                self.buf.bind(label);
+                self.buf.put(&bytes);
+            }
         }
         for at in 0..self.side.rodata.len() {
             let (entry, label) = self.side.rodata[at];
-            self.buf.bind(label);
-            self.buf.put(self.library.entry(entry));
+            if self.buf.offset(label).is_none() {
+                self.buf.bind(label);
+                self.buf.put(self.library.entry(entry));
+            }
         }
         Ok(())
     }

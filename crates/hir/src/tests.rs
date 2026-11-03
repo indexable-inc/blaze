@@ -80,7 +80,7 @@ fn main() {
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let workspace = crate::check::workspace_crates(&db);
         assert_eq!(workspace.len(), 1, "only `main` is a workspace member");
         let executed = db.log_executed(|| {
@@ -129,7 +129,7 @@ pub struct E;
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = all_crates(&db)
             .iter()
             .map(|&it| crate::Crate::from(it))
@@ -180,7 +180,7 @@ fn kinds(found: &[crate::AnyDiagnostic<'_>]) -> Vec<String> {
 #[test]
 fn a_check_is_the_same_whatever_order_its_modules_ran_in() {
     let check = |db: &TestDB| {
-        crate::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             crate::check::check_workspace(db, false)
                 .iter()
                 .map(|(_, found)| kinds(found))
@@ -206,7 +206,7 @@ fn a_check_is_the_same_whatever_order_its_modules_ran_in() {
 fn a_check_of_a_crate_is_its_modules_checked_one_by_one() {
     let db = fixture::db(MODULES).into_db();
     let before = set_run_order(RunOrder::Reversed);
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = crate::check::workspace_crates(&db)[0];
         let modules = crate::check::file_modules(&db, krate);
         assert_eq!(modules.len(), 3, "`main`, `a` and `b`; `a::inner` goes with `a`");
@@ -224,7 +224,7 @@ fn a_check_of_a_crate_is_its_modules_checked_one_by_one() {
 #[test]
 fn a_check_of_some_bodies_leaves_the_others_out() {
     let db = fixture::db(MODULES).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = crate::check::workspace_crates(&db)[0];
         let main = crate::DefWithBody::from(function(&db, "main"));
         let only_main = |it: crate::DefWithBody| it == main;
@@ -258,7 +258,7 @@ fn mismatched() -> u32 {
 #[test]
 fn a_build_gets_no_mir_of_a_body_whose_borrow_check_failed() {
     let db = fixture::db(MOVED_TWICE).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let bad = function(&db, "moved_twice");
         match hir_ty_borrowck::checked(&db, bad) {
             Err(Refused::Errors { owner, errors }) => {
@@ -274,13 +274,91 @@ fn a_build_gets_no_mir_of_a_body_whose_borrow_check_failed() {
     });
 }
 
+/// Bodies that each give a different error or lint of the body checks: the borrow check's
+/// (whose messages name types and ADTs), match and unsafety checks, and inference's.
+const ERRORS_OF_EVERY_KIND: &str = r#"
+//- minicore: sized, copy, drop, fn, option
+struct Value {}
+struct Guard<'a>(&'a Value);
+impl Drop for Guard<'_> { fn drop(&mut self) {} }
+struct Owner { v: Value }
+impl Drop for Owner { fn drop(&mut self) {} }
+enum E { A, B }
+fn eat<T>(_: T) {}
+fn read(_: &Value) {}
+unsafe fn danger() {}
+trait D { fn b(&self) -> impl Fn() -> u32; }
+
+fn moved_twice() { let x = Value {}; eat(x); eat(x); }
+fn dropped_later<T: D>(t: T) { let f = t.b(); eat(t); }
+fn dropped_adt() { let x = Value {}; let g = Guard(&x); eat(x); }
+fn dropped_tuple() { let x = Value {}; let g = (Guard(&x), 1u8); eat(x); }
+fn two_mut() { let mut i = 0; let a = &mut i; let b = &mut i; *a = 1; *b = 2; }
+fn shared_then_mut() { let mut s = Value {}; let a = &s; let b = &mut s; read(a); let _ = b; }
+fn not_mut() { let x = 1; let y = &mut x; }
+fn short_lived() { let r; { let s = Value {}; r = &s; } read(r); }
+fn make() -> Value { Value {} }
+fn temporary() { let r: &Value; r = &make(); read(r); }
+fn out_of_drop(o: Owner) -> Value { o.v }
+fn out_of_array(a: [Value; 2]) -> Value { a[0] }
+fn out_of_array_pattern(a: &[Value; 2]) -> Value { let [x, _] = *a; x }
+fn out_of_ref(r: &Value) -> Value { *r }
+fn mut_unused() { let mut s = Value {}; eat(s); }
+fn non_exhaustive(e: E) -> u32 { match e { E::A => 0 } }
+fn unsafe_call() { danger(); }
+fn mismatched() -> u32 { Value {} }
+"#;
+
+/// Every body check of a crate full of errors, run with no database attached to the thread
+/// (as a pool worker runs it), makes its texts with the database in hand: a text that names a
+/// type through `Debug`, which reads the attached database, panics outside a query's run
+/// (`fmt_with_attached_db` in hir-ty) and fails this test. sb-rpitit saw E0505's drop label
+/// say `<AdtDef: no database attached>`.
+#[test]
+fn every_body_check_makes_its_text_with_no_database_attached() {
+    let db = fixture::db(ERRORS_OF_EVERY_KIND).into_db();
+    let mut bodies = Vec::new();
+    for &krate in all_crates(&db).iter() {
+        let def_map = crate_def_map(&db, krate);
+        for (_, module) in def_map.modules(&db) {
+            for def in module.scope(&db).declarations() {
+                if let ModuleDefId::FunctionId(it) = def {
+                    bodies.push(DefWithBodyId::from(it));
+                }
+            }
+        }
+    }
+    let mut codes = Vec::new();
+    for def in bodies {
+        for found in crate::check::check_body(&db, def, true) {
+            if let crate::AnyDiagnostic::BorrowckError(it) = &found {
+                codes.push(it.code);
+            }
+        }
+        let checked = hir_ty_borrowck::borrowck(&db, def);
+        for it in &checked.diagnostics {
+            let texts = std::iter::once(&it.message)
+                .chain(it.labels.iter().map(|(_, text)| text))
+                .chain(it.children.iter().map(|child| &child.message));
+            for text in texts {
+                assert!(!text.contains("database"), "{def:?}: {text}");
+            }
+        }
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    for code in ["E0382", "E0499", "E0502", "E0505", "E0507", "E0508", "E0509", "E0596", "E0597", "E0716"] {
+        assert!(codes.contains(&code), "the fixture gives {code}: {codes:?}");
+    }
+}
+
 /// A diagnostic of code with no syntax of its own is reported at the item whose body the code
 /// is in, never dropped: the place `UnplacedDiagnostic` gets is the item's own node.
 #[test]
 fn an_unplaced_diagnostic_is_at_the_item_of_its_body() {
     use hir_def::{Lookup as _, src::HasSource as _};
     let db = fixture::db("fn f() -> u32 { 1 }").into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = function(&db, "f");
         let DefWithBodyId::FunctionId(func) = def else { panic!("`f` is a function") };
         let (_, source_map) = hir_def::expr_store::Body::with_source_map(&db, def);
@@ -295,7 +373,7 @@ fn an_unplaced_diagnostic_is_at_the_item_of_its_body() {
 #[test]
 fn a_lint_of_the_borrow_checker_lets_the_body_build() {
     let db = fixture::db(MOVED_TWICE).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = function(&db, "mut_unused");
         assert!(
             hir_ty_borrowck::borrowck(&db, def).diagnostics.iter().any(|it| !it.is_error()),
@@ -308,7 +386,7 @@ fn a_lint_of_the_borrow_checker_lets_the_body_build() {
 #[test]
 fn a_body_with_type_errors_is_refused_not_passed() {
     let db = fixture::db(MOVED_TWICE).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = function(&db, "mismatched");
         assert_eq!(
             hir_ty_borrowck::checked(&db, def),
@@ -335,7 +413,7 @@ fn refused(b: bool) {
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = function(&db, "refused");
         let result = hir_ty_borrowck::borrowck(&db, def);
         assert_eq!(result.not_checked, Some(NotChecked::MatchErrors));
@@ -346,7 +424,7 @@ fn refused(b: bool) {
 #[test]
 fn a_check_takes_no_mir_of_another_body() {
     let db = fixture::db(MOVED_TWICE).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let good = function(&db, "moved_once");
         let other = function(&db, "mut_unused");
         let checked = hir_ty_borrowck::checked(&db, good).unwrap();
@@ -366,7 +444,7 @@ fn a_check_takes_no_mir_of_another_body() {
 #[test]
 fn a_live_patch_has_code_before_the_check_that_refuses_it() {
     let db = fixture::db(MOVED_TWICE).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let bad = function(&db, "moved_twice");
         let (unchecked, pending) = hir_ty_borrowck::speculate(bad);
         let executed = db.log_executed(|| {
@@ -409,8 +487,8 @@ pub fn g() {}
         .map(|it| it.file_id(&db))
         .find(|&it| db.file_text(it).text(&db).contains("pub fn g"))
         .unwrap();
-    let f = crate::attach_db(&db, || function(&db, "evicted"));
-    let before = crate::attach_db(&db, || {
+    let f = blaze_query::db::attach(&db, || function(&db, "evicted"));
+    let before = blaze_query::db::attach(&db, || {
         hir_ty_borrowck::borrowck(&db, f);
         let mir = db.mir_body(InferBodyId::DefWithBodyId(f)).unwrap();
         (mir.basic_blocks.len(), mir.locals.len())
@@ -419,7 +497,7 @@ pub fn g() {}
     crate::evict::drop_after_store(&mut db, &[f]);
     db.set_file_text(other, "pub fn g() {}\npub fn h() {}\n");
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let executed = db.log_executed(|| {
             hir_ty_borrowck::borrowck(&db, f);
         });
@@ -509,7 +587,7 @@ fn binding_ty<'db>(db: &'db TestDB, def: DefWithBodyId, name: &str) -> Ty<'db> {
 #[test]
 fn a_future_is_send_only_when_what_it_holds_across_an_await_is() {
     let db = fixture::db(HELD_ACROSS_AWAIT).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (_, ModuleDefId::TraitId(send)) = type_item(&db, "Send") else {
             panic!("`Send` is a trait")
         };
@@ -552,7 +630,7 @@ fn moved_before() {
 #[test]
 fn a_goal_stalled_on_the_body_s_own_future_is_checked_after_inference() {
     let db = fixture::db(SEND_REQUIRED_IN_ITS_BODY).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         for (name, errors) in [("held", 1), ("moved_before", 0)] {
             let body = InferBodyId::DefWithBodyId(function(&db, name));
             let infer = InferenceResult::of(&db, body);
@@ -567,7 +645,7 @@ fn a_goal_stalled_on_the_body_s_own_future_is_checked_after_inference() {
 #[test]
 fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
     let db = fixture::db(SOLVER).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (krate, ModuleDefId::TraitId(tr)) = type_item(&db, "Tr") else {
             panic!("`Tr` is a trait")
         };
@@ -608,7 +686,7 @@ fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
         assert_eq!(implements(warm, tr, &goals), cold, "first asked");
         assert_eq!(implements(warm, tr, &goals), cold, "answered from the cache");
         let elsewhere = std::thread::scope(|scope| {
-            scope.spawn(|| crate::attach_db(&db, || implements(warm, tr, &goals))).join().unwrap()
+            scope.spawn(|| blaze_query::db::attach(&db, || implements(warm, tr, &goals))).join().unwrap()
         });
         assert_eq!(elsewhere, cold, "answered on another thread");
     });
@@ -643,8 +721,8 @@ impl<T> Tr for B<T> where T: Tr {}
         .find(|&it| db.file_text(it).text(&db).contains("impl Tr for A"))
         .unwrap();
     let [first, second, unrelated] =
-        crate::attach_db(&db, || ["first", "second", "unrelated"].map(|it| function(&db, it)));
-    crate::attach_db(&db, || {
+        blaze_query::db::attach(&db, || ["first", "second", "unrelated"].map(|it| function(&db, it)));
+    blaze_query::db::attach(&db, || {
         // `B<A>: Tr` is solved for `first`, then answered for `second` from the shared cache.
         for body in [first, second, unrelated] {
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(body));
@@ -654,7 +732,7 @@ impl<T> Tr for B<T> where T: Tr {}
     // Only the impl's where clause changes: no item, name or body `second` reads directly.
     db.set_file_text(imp, "use super::*;\nimpl Tr for A {}\nimpl<T> Tr for B<T> where T: Other {}\n");
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let executed = db.log_executed(|| {
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(unrelated));
         });
@@ -742,7 +820,7 @@ const MUTABLE_WHILE_SHARED: (&str, &str) =
 /// messages in rustc's order, and the gate refuses it unless all of them are lints.
 fn borrowck_gives(name: &str, expected: &[(&str, &str)]) {
     let db = fixture::db(BORROWCK).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = function(&db, name);
         let found: Vec<(&str, String)> = hir_ty_borrowck::borrowck(&db, def)
             .diagnostics
@@ -916,7 +994,7 @@ fn a_dependency_batch_is_what_the_per_item_lowering_gives() {
             _ => None,
         })
         .collect();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (dep, main) = dep_and_main(&db);
         let (mut batched, mut per_item) = (Vec::new(), Vec::new());
         let (mut dep_variants, mut dep_impls) = (Vec::new(), Vec::new());
@@ -958,7 +1036,7 @@ fn round_trip(cold: &ColdBatch, again: &ColdBatch) -> Aligned {
 #[test]
 fn a_cold_batch_round_trips_with_its_types() {
     let db = signatures_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (dep, _) = dep_and_main(&db);
         let interner = DbInterner::new_with(&db, dep);
 
@@ -996,7 +1074,7 @@ fn a_cold_batch_round_trips_with_its_types() {
 #[test]
 fn a_workspace_crate_has_no_batch() {
     let db = signatures_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (_, main) = dep_and_main(&db);
         let (variants, impls) = signatures(&db, main);
         let executed = db.log_executed(|| {
@@ -1050,7 +1128,7 @@ const P: (&[u16], u8) = (&[1, 2, 3], 4);
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         for name in ["S", "D", "P"] {
             let value = db
@@ -1129,7 +1207,7 @@ fn f(s: &S, v: &mut Vec<u32>) -> u32 {
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         let bodies = bodies(&db);
         assert_eq!(bodies.len(), 4, "`get`, `m`, `opaque` and `f`");

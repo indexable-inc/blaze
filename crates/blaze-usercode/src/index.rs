@@ -505,7 +505,7 @@ pub fn keep(
     store: &mut Store,
     run: &RunKey,
     traced: &Traced,
-    value: Vec<u8>,
+    value: &[u8],
 ) -> Result<Vec<Ticket>, KeepError> {
     keep_in(store, Unit::SHARED, run, traced, value)
 }
@@ -518,7 +518,7 @@ pub fn keep_in(
     unit: Unit,
     run: &RunKey,
     traced: &Traced,
-    value: Vec<u8>,
+    value: &[u8],
 ) -> Result<Vec<Ticket>, KeepError> {
     let mut tickets = Vec::with_capacity(2);
     keep_into(store, unit, run, traced, value, &mut tickets)?;
@@ -533,7 +533,7 @@ pub fn keep_into(
     unit: Unit,
     run: &RunKey,
     traced: &Traced,
-    value: Vec<u8>,
+    value: &[u8],
     tickets: &mut Vec<Ticket>,
 ) -> Result<(), KeepError> {
     let key = result_key(run, traced);
@@ -545,8 +545,7 @@ pub fn keep_into(
         match same {
             Some(true) => return Ok(()),
             Some(false) => {}
-            // clone: the store owns what it keeps, and a slot another took first needs the shape again
-            None => match store.put_in(unit, at, Kind::Run, shape.clone()) {
+            None => match store.put_in(unit, at, Kind::Run, &shape) {
                 Ok(ticket) => {
                     tickets.push(ticket);
                     return Ok(());

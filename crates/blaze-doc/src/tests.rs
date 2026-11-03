@@ -286,7 +286,7 @@ fn load_with(no_deps: bool, dep_for_tests: bool) -> (Db, Model) {
 fn load_text(text: &str, no_deps: bool, dep_for_tests: bool) -> (Db, Model) {
     let mut db = fixture::db(text).into_db();
     let named = |name: &str| {
-        Crate::all(&db).into_iter().find(|it| crate::crate_name(&db, *it) == name).expect(name)
+        Crate::all(&db).into_iter().find(|it| it.base().rust_name(&db).is_ok_and(|it| it.as_str() == name)).expect(name)
     };
     let (fixture, dep) = (named("fixture"), named("dep"));
     let mut test_only = crate::TestOnly::default();
@@ -294,7 +294,7 @@ fn load_text(text: &str, no_deps: bool, dep_for_tests: bool) -> (Db, Model) {
         test_only.insert((fixture, dep));
     }
     let asked = [Asked { krate: fixture, private: false }];
-    let crates = crate::crates_to_document(&db, &asked, no_deps, &test_only);
+    let crates = crate::crates_to_document(&db, &asked, no_deps, &test_only).expect("the fixture's crates are named");
     crate::set_cfg_doc(&mut db, &crates);
     let model = crate::model(&db, crates, test_only);
     (db, model)

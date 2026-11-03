@@ -146,7 +146,7 @@ fn to_def_of_every_node() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let vsema = Semantics::new(&db);
         let mut out = String::new();
         let mut checked = 0u32;
@@ -169,7 +169,7 @@ fn ancestors_ranges_and_scopes_of_every_node() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let vsema = Semantics::new(&db);
         let mut out = String::new();
         for (file, root) in roots(&vsema, file_id) {
@@ -199,7 +199,7 @@ fn types_and_resolutions_of_every_node() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let vsema = Semantics::new(&db);
         let mut out = String::new();
         let (mut exprs, mut paths) = (0u32, 0u32);
@@ -278,7 +278,7 @@ fn descending_every_token() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let vsema = Semantics::new(&db);
         let mut out = String::new();
         let mut into_macros = 0u32;
@@ -305,7 +305,7 @@ fn source_view_of_every_def() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         use std::fmt::Write as _;
         let vsema = Semantics::new(&db);
         let krate = vsema.file_to_module_def(file_id.file_id(&db)).expect("a module").krate(&db);
@@ -396,7 +396,7 @@ pub fn inner() {
     );
     let m = *fx.files().last().expect("m.rs");
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let vsema = Semantics::new(&db);
         assert!(vsema.file_to_module_def(m.file_id(&db)).is_some(), "m.rs is the module `m` of `main`'s block");
         assert!(vsema.find_parent_file(HirFileId::from(m)).is_some(), "the `mod m;` declaring m.rs");
@@ -414,11 +414,53 @@ pub fn inner() {
 }
 
 #[test]
+fn a_path_module_in_another_packages_source_root_is_a_module_of_the_crate_it_is_checked_in() {
+    // `m.rs` is in `b`'s source root, and only `a` declares it (`#[path]` reaching out of `a`'s
+    // directory): a check of `a` maps its syntax to `a`'s module `m`, as rustc compiles it.
+    let fx = fixture::db(
+        r#"
+//- /a/src/main.rs crate:a
+#[path = "../../b/tests/m.rs"]
+mod m;
+pub fn d() {}
+fn main() {}
+//- /b/src/lib.rs crate:b new_source_root:local
+pub fn b() {}
+//- /b/tests/m.rs
+pub fn inner() {
+    crate::d();
+}
+"#,
+    );
+    let main = fx.file_at("/a/src/main.rs");
+    let m = fx.file_at("/b/tests/m.rs");
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let a = Semantics::new(&db).file_to_module_def(main.file_id(&db)).expect("main.rs is `a`'s root").krate(&db);
+        let within = std::sync::Arc::new(blaze_hash::HashSet::from_iter_in([a.base()], std::alloc::Global));
+        let vsema = Semantics::new_within(&db, within);
+        let module = vsema.file_to_module_def(m.file_id(&db)).expect("m.rs is the module `m` of `a`");
+        assert_eq!(module.krate(&db), a);
+        let root = vsema.parse(m).syntax();
+        let path = root
+            .descendants()
+            .filter_map(view::Path::cast)
+            .find(|it| it.qualifier().is_some())
+            .expect("`crate::d`");
+        assert!(vsema.scope(path.syntax()).is_some(), "`crate::d` in m.rs has a scope");
+        assert!(
+            matches!(vsema.resolve_path(path), Some(crate::PathResolution::Def(ModuleDef::Function(_)))),
+            "`crate::d` in m.rs resolves to `a`'s function `d`"
+        );
+    });
+}
+
+#[test]
 fn a_warm_lookup_walk_allocates_nothing() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let vsema = Semantics::new(&db);
         let root = vsema.parse(file_id).syntax();
         let strukt = root.descendants().find_map(view::Struct::cast).expect("`struct Point`");

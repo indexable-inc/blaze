@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use blaze_mem::Tag;
 use blaze_mem::blocks::Slice;
-use blaze_mem::lock::SpinLock;
+use parking_lot::Mutex;
 use derive_where::derive_where;
 use rustc_hash::FxBuildHasher;
 
@@ -123,7 +123,7 @@ impl<X: Cx> GlobalCache<X> {
         let index = self.results.intern(result);
         let depth = u32::try_from(required_depth.0).expect("a solver depth past `u32::MAX`");
         let writers = self.writers.get_or_init(|| table(shard_count(), |_| Writer::new()));
-        let mut claimed = writers[goal as usize & (writers.len() - 1)].0.lock();
+        let mut claimed = blaze_graph::wait::lock(&writers[goal as usize & (writers.len() - 1)].0, WRITER);
         let column = if encountered_overflow { &self.with_overflow } else { &self.success };
         let head = column.get_or_init(goal, || AtomicU32::new(0));
         let latest = head.load(Ordering::Acquire);
@@ -310,13 +310,17 @@ struct Claims {
     nested_goals: Claimed,
 }
 
+/// What a wait for a writer's lock is said to wait on ([`blaze_graph::wait::lock`]): a contended
+/// one blocks the thread inside a `wait` span naming it.
+const WRITER: &str = "the trait solver's global cache writer";
+
 /// One cache line pair each, so writers under neighbouring locks don't share a line.
 #[repr(align(128))]
-struct Writer(SpinLock<Claims>);
+struct Writer(Mutex<Claims>);
 
 impl Writer {
     fn new() -> Writer {
-        Writer(SpinLock::new(Claims { rows: Claimed::EMPTY, nested_goals: Claimed::EMPTY }))
+        Writer(Mutex::new(Claims { rows: Claimed::EMPTY, nested_goals: Claimed::EMPTY }))
     }
 }
 
@@ -349,10 +353,13 @@ struct Interned<T> {
     shards: OnceLock<Slice<Shard>>,
 }
 
+/// What a wait for a shard's lock is said to wait on, as [`WRITER`].
+const SHARD: &str = "the trait solver's global cache shard";
+
 #[repr(align(128))]
 struct Shard {
     /// Held only to look again and insert.
-    lock: SpinLock<Claimed>,
+    lock: Mutex<Claimed>,
     /// How many values the shard has, written under `lock`.
     len: AtomicU32,
     /// Which of `tables` is the one in use.
@@ -363,7 +370,7 @@ struct Shard {
 impl Shard {
     fn new() -> Shard {
         Shard {
-            lock: SpinLock::new(Claimed::EMPTY),
+            lock: Mutex::new(Claimed::EMPTY),
             len: AtomicU32::new(0),
             level: AtomicUsize::new(0),
             tables: [const { OnceLock::new() }; TABLES],
@@ -402,7 +409,7 @@ impl<T: Hash + Eq> Interned<T> {
         {
             return found;
         }
-        let mut claimed = shard.lock.lock();
+        let mut claimed = blaze_graph::wait::lock(&shard.lock, SHARD);
         let mut level = shard.level.load(Ordering::Acquire);
         if let Ok(found) = self.probe(shard.table(level), hash, &value) {
             return found;

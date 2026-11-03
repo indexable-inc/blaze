@@ -57,6 +57,15 @@ impl Unit {
     pub fn runs_here(&self) -> bool {
         runs_here(self.built_for(), &self.profile.name)
     }
+
+    /// Whether the unit builds a proc macro's module, whose expanders the front end gives its
+    /// crate: a `proc-macro` target's `Build` unit. Its `Check` unit (a member's `blaze check`)
+    /// shares that crate but links nothing, and a `--test` one is a test program, so neither
+    /// gives the crate expanders. The one rule the front end's lowering and the daemon's
+    /// "build what the front end applies first" read.
+    pub fn gives_expanders(&self) -> bool {
+        self.mode == Mode::Build && self.target.is_proc_macro()
+    }
 }
 
 /// Whether code built for `built_for` under the profile named `profile` runs on the machine

@@ -46,6 +46,7 @@ mod reads;
 mod run;
 mod say;
 mod script;
+pub(crate) use compile::span_unit;
 pub(crate) use script::compile_of;
 mod test;
 
@@ -922,7 +923,7 @@ fn library_files(dir: &std::path::Path, prefix: &str, into: &mut Vec<SourceFile>
             library_files(&full, &path, into)?;
             continue;
         }
-        let bytes = std::fs::read(&full).map_err(|error| format!("{}: {error}", full.display()))?;
+        let bytes = SourceFile::read(&full, meta.len()).map_err(|error| error.to_string())?;
         #[cfg(unix)]
         let executable = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0;
         #[cfg(not(unix))]
@@ -1109,17 +1110,18 @@ impl Job {
     }
 
     /// Dependency crate `krate`, checked this build with the lint flags `flags`, whose outcome
-    /// `diags` is stored once the front end's images are ([`deps::store`]); `refused` is why
-    /// the outcome can't be stored ([`blaze_diagnostics::cache::encode`]), for the build's
-    /// report ([`deps::served`]).
+    /// `diags` (with whether they break its items) is stored once the front end's images are
+    /// ([`deps::store`]); `refused` is why the outcome can't be stored
+    /// ([`blaze_diagnostics::cache::encode`]), for the build's report ([`deps::served`]).
     pub(crate) fn check_later(
         &self,
         krate: base_db::Crate,
         flags: Vec<String>,
         diags: Vec<blaze_diagnostics::Diag>,
+        items_broken: bool,
         refused: Option<String>,
     ) {
-        self.later.lock().push(deps::Later { krate, flags, diags, refused });
+        self.later.lock().push(deps::Later { krate, flags, diags, items_broken, refused });
     }
 
     pub(crate) fn units(&self) -> &Units {

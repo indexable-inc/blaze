@@ -31,7 +31,7 @@ fn hot(s: &dyn Shape, f: &dyn Fn(u32) -> u32, g: &mut dyn FnMut()) {
 #[test]
 fn calls_on_dyn_receivers_record_their_method() {
     let db = fixture::db(FIXTURE).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let hot = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())

@@ -555,8 +555,9 @@ def links(text):
 
 def link_kind(text, linked=frozenset()):
     """How the builds in `text` reached the program: "spliced" when each link put what changed
-    into the image kept; "first link" when an image new to the build was laid out and the rest
-    were spliced; else "full link: <why>". `linked` holds the images linked before `text`: one
+    into the image kept or left an image nothing it is made of changed ("unchanged"); "first
+    link" when an image new to the build was laid out and the rest were spliced; else "full
+    link: <why>". `linked` holds the images linked before `text`: one
     of them laid out as a first link lost the image kept, which is a full link too.
 
     >>> link_kind("")
@@ -566,6 +567,8 @@ def link_kind(text, linked=frozenset()):
     'first link'
     >>> link_kind("link: target/debug/app (first link)\\n", {"target/debug/app"})
     'full link: target/debug/app was linked before and its image was not kept'
+    >>> link_kind("link: a (spliced)\\nlink: b (unchanged)\\n")
+    'spliced'
     >>> link_kind("link: a (spliced)\\nlink: b (not spliced: exports, debug)\\n")
     'full link: b: exports, debug'
     >>> failed_link("full link: b: exports, debug"), failed_link("first link"), failed_link(None)
@@ -577,10 +580,10 @@ def link_kind(text, linked=frozenset()):
     for image, how in found:
         if how.startswith("first link") and image in linked:
             return f"full link: {image} was linked before and its image was not kept"
-        if not how.startswith(("spliced", "first link")):
+        if not how.startswith(("spliced", "unchanged", "first link")):
             why = re.search(r"not spliced: (.*)", how)
             return f"full link: {image}" + (f": {why[1][:160]}" if why else f" ({how[:160]})")
-    if all(how.startswith("spliced") for _, how in found):
+    if all(how.startswith(("spliced", "unchanged")) for _, how in found):
         return "spliced"
     return "first link"
 

@@ -52,7 +52,11 @@ pub mod attr_resolution;
 mod batch;
 #[cfg(test)]
 mod collector;
-mod def_site;
+pub(crate) mod def_site;
+pub use def_site::{
+    binding_key_at, def_binding_key, import_binding_key, param_name, path_param_name,
+};
+pub use def_site::{assoc_item_is, assoc_item_key, impl_item_name};
 pub mod delta;
 pub mod demand;
 pub mod diagnostics;
@@ -687,11 +691,11 @@ pub(crate) struct DefMapPair<'db> {
     pub(crate) local: LocalDefMap,
 }
 
-/// `krate`'s display name, empty without one: what a span names the crate by, backdated when the
-/// rest of its extra data (version, potential cfg options) changes.
+/// `krate` as a span names it ([`Crate::named`]), backdated when the rest of its extra data
+/// (version, potential cfg options) changes.
 #[blaze_query::tracked(returns(ref))]
 fn crate_display_name(db: &Db, krate: Crate) -> SmolStr {
-    krate.extra_data(db).display_name.as_ref().map(|it| it.crate_name().to_smolstr()).unwrap_or_default()
+    krate.named(db).to_smolstr()
 }
 
 #[blaze_query::tracked(returns(ref))]
@@ -1257,8 +1261,10 @@ impl DefMap {
 
             map.module(db, module).scope(db).dump(db, buf);
 
+            // By text, and modules of one name keyed apart (`Name::keyed`) in the order they
+            // were declared: a stable sort over the children's order.
             for (name, child) in
-                map.module(db, module).children(db).iter().sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
+                map.module(db, module).children(db).iter().sorted_by(|a, b| a.0.cmp_written(b.0))
             {
                 // alloc: a debug dump (the edge)
                 let path = format!("{path}::{}", name.display(db, Edition::LATEST));
@@ -1321,6 +1327,28 @@ impl DefMap {
             path,
             shadow,
             None, // Currently this function isn't used for macro resolution.
+        );
+        (res.resolved_def, res.segment_index, res.prefix_info)
+    }
+
+    /// [`Self::resolve_path_locally`], going on in the def maps around a block (as an import
+    /// does): where def-site hygiene names a block, its lookup is rustc's lexical walk out of it.
+    pub(crate) fn resolve_path_around(
+        &self,
+        local_def_map: &LocalDefMap,
+        db: &Db,
+        original_module: ModuleId,
+        path: &ModPath,
+        shadow: BuiltinShadowMode,
+    ) -> (PerNs, Option<usize>, ResolvePathResultPrefixInfo) {
+        let res = self.resolve_path_fp_with_macro(
+            local_def_map,
+            db,
+            ResolveMode::Other,
+            original_module,
+            path,
+            shadow,
+            None,
         );
         (res.resolved_def, res.segment_index, res.prefix_info)
     }

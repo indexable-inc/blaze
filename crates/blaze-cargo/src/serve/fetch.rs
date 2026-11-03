@@ -118,7 +118,7 @@ impl<H: Http + 'static> Fetcher<H> {
         }
         files.push(SourceFile {
             path: PACKAGE_SOURCE_LOCK.to_owned(),
-            bytes: br#"{"v":1}"#.to_vec(),
+            bytes: blaze_vfs::Bytes::from_static(br#"{"v":1}"#),
             mode: Mode::Regular,
         });
         blaze_ids::names::sort_by_name(&mut files, |it| it.path.as_bytes());
@@ -139,7 +139,8 @@ impl<H: Http + 'static> Fetcher<H> {
         let files = match NOT_IN_INDEX.contains(&answer.status) {
             true => Vec::new(),
             false => {
-                vec![SourceFile { path: name.to_owned(), bytes: answer.body, mode: Mode::Regular }]
+                let bytes = blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, &answer.body);
+                vec![SourceFile { path: name.to_owned(), bytes, mode: Mode::Regular }]
             }
         };
         Ok(Source { files, under: name.to_owned() })

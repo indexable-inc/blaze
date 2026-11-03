@@ -441,7 +441,6 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     for &at in input.roots {
         roots[at] = true;
     }
-    let primary: HashSet<&str, Global> = input.roots.iter().map(|&at| units[at].pkg_id.as_str()).collect();
     let mut per_package: HashMap<&str, PackageFlags, Global> =
         HashMap::with_capacity_in(input.packages.len(), Global);
     let artifact_dir = !matches!(input.intent, Intent::Check { .. } | Intent::Doc { .. });
@@ -554,7 +553,6 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
                 package: package_env,
                 crate_name: &crate_name,
                 bin_name: it.target_kind.is_executable().then(|| target.bin_name.as_deref().unwrap_or(&target.name)),
-                primary: primary.contains(unit.pkg_id.as_str()),
                 tmpdir: test_or_bench.then(|| layout.tmp().display().to_string()),
                 out_dir,
                 bin_exes,

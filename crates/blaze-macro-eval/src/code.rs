@@ -2,7 +2,9 @@
 //! everything the macro's MIR, and so what the evaluator runs, is made from that is known
 //! before it runs. That is the crate's content ID (its data, environment, cfg, workspace and
 //! its dependencies' content IDs, `base_db::Crate::content`), and each file of the source root
-//! of every crate it depends on, itself included, by its path and its text's content ID.
+//! of every crate it depends on, itself included, by its path and its content ID in the
+//! source root (`base_db::Files::file_content`: its text's, or the bytes' of one that is not
+//! UTF-8).
 //!
 //! Files outside those source roots that a crate of the closure reads (`include_str!`,
 //! `include!` of `OUT_DIR`) are known only once the queries that read them ran, so they are
@@ -13,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use base_db::{Crate, Db, FileText, Nonce, SourceRootId};
+use base_db::{Crate, Db, Nonce, SourceRootId};
 use blaze_ids::{ContentId, Hasher};
 
 /// What the code is hashed with: a version of this crate's server and shims, which an
@@ -43,10 +45,7 @@ pub(crate) fn of(db: &Db, krate: Crate) -> ContentId {
         files.extend(root.iter().map(|file| {
             // alloc: as above.
             let path = root.path_for_file(&file).expect("a source root lists only files it has paths of").to_string();
-            let content = match db.has_file_text(file) {
-                true => db.file_text(file).content(db),
-                false => FileText::no_text(),
-            };
+            let content = db.file_content(file);
             (path, content)
         }));
         files.sort_unstable();

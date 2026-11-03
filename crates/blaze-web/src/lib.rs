@@ -254,7 +254,7 @@ fn spawn(roots: Arc<Roots>) -> Result<crossbeam_channel::Sender<Asked>, String> 
     let (to, asked) = crossbeam_channel::unbounded();
     std::thread::Builder::new()
         .name("blaze-web-world".into())
-        .spawn(move || Thread { roots, kept: Kept::default(), world: None }.run(asked))
+        .spawn(move || Thread { roots, kept: Kept::default(), world: None }.run(&asked))
         // alloc: an error path
         .map_err(|e| format!("no thread for the build page's world: {e}"))?;
     Ok(to)
@@ -269,7 +269,7 @@ struct Thread {
 }
 
 impl Thread {
-    fn run(mut self, asked: crossbeam_channel::Receiver<Asked>) {
+    fn run(mut self, asked: &crossbeam_channel::Receiver<Asked>) {
         while let Ok(first) = asked.recv() {
             self.answer(first);
             for next in asked.try_iter().take(BATCH - 1) {

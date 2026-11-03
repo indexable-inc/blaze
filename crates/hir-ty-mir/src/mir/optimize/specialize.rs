@@ -155,7 +155,7 @@ pub fn specialized_mir_body<'db>(
         span_names::of_body_then(db, base.into(), span, |text| write_facts(spec, text)).entered();
     let refused = |why: &str| {
         let name = FunctionSignature::of(db, base).name.as_str();
-        let krate = span_names::crate_name(db, base.krate(db));
+        let krate = base.krate(db).named(db);
         let facts = spec.knowing();
         // alloc: error path
         MirLowerError::ImplementationError(format!(

@@ -352,7 +352,32 @@ pub struct BuildTime(pub bool);
 /// The error of `unit`, saying `what`.
 pub(crate) fn failed(unit: &Unit, what: impl std::fmt::Display) -> CodegenError {
     // alloc: the error's message
-    CodegenError { unit: unit.instance.key(), item: unit.item, what: what.to_string() }
+    CodegenError { unit: unit.instance.key(), item: unit.item, what: what.to_string(), front: None }
+}
+
+/// The error of `instance`, which the front end failed on, saying `why`: named as [`Named`]
+/// names it and carrying its item ([`blaze_codegen::FrontItem`]), so a reader can show what
+/// the front end says of its body. Its `unit` and `item` are `unit`'s, or of no unit for one
+/// failed while it is described. Formatted with `db` attached, as [`undescribed`] is.
+pub(crate) fn failed_in_front(
+    db: &Db,
+    unit: Option<&Unit>,
+    item: Option<ItemKey>,
+    instance: &HirInstance,
+    why: impl std::fmt::Display,
+) -> CodegenError {
+    // alloc: the error's message, its parts kept apart for the reader
+    let (named, why) = blaze_query::db::attach(db, || (Named(db, instance).to_string(), why.to_string()));
+    let front = frontend::item_of(db, &instance.0).ok().map(|id| {
+        // clone: the error's parts, kept beside its message
+        Box::new(blaze_codegen::FrontItem { id, named: named.clone(), why: why.clone() })
+    });
+    CodegenError {
+        unit: unit.map_or(InstanceKey(ContentId::default()), |it| it.instance.key()),
+        item: unit.map(|it| it.item).or(item).unwrap_or(ItemKey(ContentId::default())),
+        what: format!("{named}: {why}"), // alloc: the error's message
+        front,
+    }
 }
 
 /// An instance as an error names it: its path with its arguments, and the crate it is
@@ -363,10 +388,8 @@ impl std::fmt::Display for Named<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Named(db, instance) = *self;
         write!(f, "`{}`", linked::debug_name(db, &instance.0))?;
-        if let Kind::Code(_, env) = &instance.0
-            && let Some(name) = &env.krate.extra_data(db).display_name
-        {
-            write!(f, " (compiled in `{}`)", name.as_str())?;
+        if let Kind::Code(_, env) = &instance.0 {
+            write!(f, " (compiled in `{}`)", env.krate.named(db))?;
         }
         Ok(())
     }
@@ -406,6 +429,7 @@ pub(crate) fn undescribed(
     CodegenError {
         unit: InstanceKey(ContentId::default()),
         item: item.unwrap_or(ItemKey(ContentId::default())),
-        what: hir_ty::attach_db(db, || format!("{instance:?}: {what}")), // alloc: the error's message
+        what: blaze_query::db::attach(db, || format!("{instance:?}: {what}")), // alloc: the error's message
+        front: None,
     }
 }

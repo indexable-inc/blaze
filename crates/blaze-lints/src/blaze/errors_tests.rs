@@ -1,6 +1,6 @@
 //! The lints of errors and order (`error_debug`, `dropped_error`, `untyped_error`,
 //! `hash_order_output`) over fixtures of their own: a `hir_ty` whose `Ty` needs the attached
-//! database to format, and a `main` crate that says what it expects. A line of `main` marked
+//! database to format, a `blaze_query` that attaches it, and a `main` crate that says what it expects. A line of `main` marked
 //! `//~ error_debug` has that lint's finding; `//~^ error_debug` the line above has one.
 
 use crate::tests::lint;
@@ -29,12 +29,16 @@ impl fmt::Display for Ty {
         Ok(())
     }
 }
-pub fn attach_db<R>(f: impl FnOnce() -> R) -> R {
-    f()
+
+//- /blaze_query/lib.rs crate:blaze_query
+pub mod db {
+    pub fn attach<D, R>(_db: &D, f: impl FnOnce() -> R) -> R {
+        f()
+    }
 }
 "#;
 
-const MAIN: &str = "//- /src/lib.rs crate:main deps:hir_ty\n";
+const MAIN: &str = "//- /src/lib.rs crate:main deps:hir_ty,blaze_query\n";
 
 /// What every `main` of these tests starts with: a `Formatter` to `write!` to, a `Path` that
 /// formats with both traits, and a `Holds` that holds `hir_ty`'s `Ty`.
@@ -182,7 +186,7 @@ impl Display for Report {
 }
 
 /// A `format_args!` whose value makes an error (through a call, or a macro that writes both) is
-/// that error's message; one inside a closure handed to `hir_ty::attach_db` may format a `Ty`,
+/// that error's message; one inside a closure handed to `blaze_query::db::attach` may format a `Ty`,
 /// and one that makes no error is none.
 #[test]
 fn error_debug_in_a_message_made_into_an_error() {
@@ -211,7 +215,7 @@ pub fn check(path: &Path, ty: &hir_ty::Ty) -> Result<(), Failed> {
     let _ = Failed::new(format_args!("bad {:?}", path)); //~ error_debug
     let _ = Failed::new(format_args!("bad {}", ty)); //~ error_debug
     let _ = fail!(path); //~ error_debug
-    let _ = hir_ty::attach_db(|| Failed::new(format_args!("bad {}", ty)));
+    let _ = blaze_query::db::attach(&(), || Failed::new(format_args!("bad {}", ty)));
     let _ = Failed::new(format_args!("bad {}", path));
     log(format_args!("{:?} {}", path, ty));
     Ok(())

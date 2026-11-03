@@ -78,7 +78,7 @@ fn function(db: &Db, name: &str) -> DefWithBodyId {
 fn checked(order: RunOrder, reach: bool) -> Vec<String> {
     let db = fixture::db(BODIES).into_db();
     let before = set_run_order(order);
-    let found = crate::attach_db(&db, || {
+    let found = blaze_query::db::attach(&db, || {
         let krate = workspace_crates(&db)[0];
         let plan = Plan::new(&db, &[krate], &every_body);
         if reach {
@@ -116,7 +116,7 @@ fn a_check_is_the_same_whatever_order_its_bodies_ran_in() {
 fn a_check_by_bodies_is_the_collector_walking_each_module_whole() {
     let db = fixture::db(BODIES).into_db();
     let before = set_run_order(RunOrder::Strided(3));
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = workspace_crates(&db)[0];
         let plan = Plan::new(&db, &[krate], &every_body);
         let listed: Vec<DefWithBodyId> = plan.listed().into_iter().rev().collect();
@@ -133,7 +133,7 @@ fn a_check_by_bodies_is_the_collector_walking_each_module_whole() {
 #[test]
 fn a_plan_lists_the_bodies_a_module_meets_at_its_level() {
     let db = fixture::db(BODIES).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = workspace_crates(&db)[0];
         let listed = Plan::new(&db, &[krate], &every_body).listed();
         // `C`, `ST`, both of `T`'s methods, `main`, `_`, the impls' `required` and `method`;
@@ -156,7 +156,7 @@ fn unused() { let _: u32 = true; }
 #[test]
 fn a_type_error_nothing_reaches_still_fails_the_check() {
     let db = fixture::db(UNREACHED).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = workspace_crates(&db)[0];
         let [main, used, unused] = ["main", "used", "unused"].map(|it| function(&db, it));
         let plan = Plan::new(&db, &[krate], &every_body);
@@ -181,7 +181,7 @@ fn reached_bodies_are_checked_before_the_others() {
     for order in [RunOrder::InOrder, RunOrder::Reversed, RunOrder::Strided(2)] {
         let db = fixture::db(FOUR).into_db();
         let before = set_run_order(order);
-        crate::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let krate = workspace_crates(&db)[0];
             let [a, b, c, d] = ["a", "b", "c", "d"].map(|it| function(&db, it));
             let plan = Plan::new(&db, &[krate], &every_body);
@@ -212,7 +212,7 @@ fn main() { dep::there(); }
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = workspace_crates(&db)[0];
         let [main, there] = ["main", "there"].map(|it| function(&db, it));
         let plan = Plan::new(&db, &[krate], &every_body);

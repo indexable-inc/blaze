@@ -22,7 +22,7 @@
 //! index into it is bounds-checked as a `Box<[T]>`'s is.
 
 use std::{
-    alloc::{self, Layout},
+    alloc::{self, Allocator as _, Layout},
     fmt,
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -33,7 +33,7 @@ use std::{
 };
 
 use blaze_bytes::Bytes;
-use blaze_mem::Tag;
+use blaze_mem::{Kept, Tag};
 
 use super::budget;
 
@@ -127,7 +127,9 @@ unsafe impl Send for Block {}
 unsafe impl Sync for Block {}
 
 impl Block {
-    /// A block of `size` bytes ([`room`]); none is allocated for 0.
+    /// A block of `size` bytes ([`room`]); none is allocated for 0. Its bytes are [`Kept`]: a
+    /// tree lives as long as what holds it (a query's result, a lazy node's part), past any
+    /// request, and dies on its own.
     pub(super) fn new(size: usize) -> Block {
         let tag = budget::now();
         if size == 0 {
@@ -136,11 +138,10 @@ impl Block {
         }
         let layout =
             Layout::from_size_align(size, ALIGN).expect("a block of under isize::MAX bytes");
-        // SAFETY: `layout`'s size is not zero (the `return` above); a zero size is undefined
-        // behavior for `alloc`.
-        let ptr = unsafe { alloc::alloc(layout) };
-        let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
-        budget::made(tag, size);
+        let ptr = match Kept(tag).allocate(layout) {
+            Ok(ptr) => ptr.cast::<u8>(),
+            Err(_) => alloc::handle_alloc_error(layout),
+        };
         Block { ptr, size, filled: 0, tag, held: None }
     }
 
@@ -155,8 +156,16 @@ impl Block {
     }
 
     /// The bytes it holds.
+    #[cfg(test)]
     pub(super) fn size(&self) -> usize {
         self.size
+    }
+
+    /// The bytes it holds in memory, which its tag counts: [`Block::size`] rounded up to its
+    /// [`Kept`] block's class.
+    pub(super) fn held(&self) -> usize {
+        let layout = Layout::from_size_align(self.size, ALIGN).expect("as `new` made it");
+        Kept::held(layout).expect("as `new` made it")
     }
 
     /// What its bytes count against.
@@ -252,11 +261,11 @@ impl Drop for Block {
     fn drop(&mut self) {
         if self.size != 0 {
             let layout = Layout::from_size_align(self.size, ALIGN).expect("as `new` made it");
-            // SAFETY: `ptr` was allocated by `new` with `layout` and is freed only here, once;
-            // no column's values need dropping, and no column outlives its tree's block (the
-            // module's invariant). A wrong layout or a second free corrupts the allocator.
-            unsafe { alloc::dealloc(self.ptr.as_ptr(), layout) };
-            budget::freed(self.tag, self.size);
+            // SAFETY: `ptr` was allocated by `new` from `Kept(tag)` with `layout` and is freed
+            // only here, once; no column's values need dropping, and no column outlives its
+            // tree's block (the module's invariant). A wrong layout or a second free corrupts
+            // the allocator.
+            unsafe { Kept(self.tag).deallocate(self.ptr, layout) };
         }
     }
 }
@@ -551,7 +560,7 @@ mod tests {
         .join()
         .expect("the thread ran");
         assert!(block.is_held());
-        assert_eq!(tag::snapshot().get(tag).live, before + block.size() as u64);
+        assert_eq!(tag::snapshot().get(tag).live, before + block.held() as u64);
         let others: Vec<Vec<u64>> = (0..16).map(|_| vec![u64::MAX; 64]).collect();
         assert!(col.iter().enumerate().all(|(n, &it)| it == n as u64 * 7), "overwritten");
         drop(others);

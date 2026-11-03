@@ -28,7 +28,7 @@ fn scalar_names_are_the_arms_they_replace() {
     let fx = fixture::db("fn main() {}");
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         let ints = [IntTy::Isize, IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::I128];
         let uints =

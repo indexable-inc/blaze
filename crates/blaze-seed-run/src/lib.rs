@@ -74,8 +74,9 @@ pub struct Exit {
     pub code: u32,
     /// Its memory's size at the end.
     pub memory_bytes: u64,
-    /// How much of its memory was resident at the end.
-    pub resident_bytes: u64,
+    /// How much of its memory it held at the end: pages in RAM, and on macOS pages the kernel
+    /// paged out (compressed or swapped), which the seed still holds ([`memory::held`]).
+    pub held_bytes: u64,
 }
 
 /// Why a run failed.
@@ -255,8 +256,8 @@ mod unix {
         };
         let size = memory.data_size(&store);
         // SAFETY: the memory's first `size` bytes are mapped, its base page-aligned.
-        let resident = unsafe { memory::resident(memory.data_ptr(&store), size) }
-            .map_err(|why| RunError::Load { step: "measuring the seed's resident memory (mincore)", why: why.to_string() })?; // alloc: error path
-        Ok(Exit { code, memory_bytes: size as u64, resident_bytes: resident })
+        let held = unsafe { memory::held(memory.data_ptr(&store), size) }
+            .map_err(|why| RunError::Load { step: "measuring the memory the seed holds (mincore)", why: why.to_string() })?; // alloc: error path
+        Ok(Exit { code, memory_bytes: size as u64, held_bytes: held })
     }
 }

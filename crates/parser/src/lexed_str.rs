@@ -571,7 +571,7 @@ impl<'a> Converter<'a> {
                     let text = &source[self.offset + 1..][..len - 1];
                     let text = &text[..text.rfind('\'').unwrap()];
                     if let Err(e) = unescape_char(text) {
-                        self.error(err_to_msg(e, Mode::Char));
+                        self.error(err_to_msg(&e, Mode::Char));
                     }
                 }
                 CHAR
@@ -583,7 +583,7 @@ impl<'a> Converter<'a> {
                     let text = &source[self.offset + 2..][..len - 2];
                     let text = &text[..text.rfind('\'').unwrap()];
                     if let Err(e) = unescape_byte(text) {
-                        self.error(err_to_msg(e, Mode::Byte));
+                        self.error(err_to_msg(&e, Mode::Byte));
                     }
                 }
                 BYTE
@@ -596,7 +596,7 @@ impl<'a> Converter<'a> {
                     let text = &text[..text.rfind('"').unwrap()];
                     unescape_str(text, |_, res| {
                         if let Err(e) = res {
-                            self.error(err_to_msg(e, Mode::Str));
+                            self.error(err_to_msg(&e, Mode::Str));
                         }
                     });
                 }
@@ -610,7 +610,7 @@ impl<'a> Converter<'a> {
                     let text = &text[..text.rfind('"').unwrap()];
                     unescape_byte_str(text, |_, res| {
                         if let Err(e) = res {
-                            self.error(err_to_msg(e, Mode::ByteStr));
+                            self.error(err_to_msg(&e, Mode::ByteStr));
                         }
                     });
                 }
@@ -624,7 +624,7 @@ impl<'a> Converter<'a> {
                     let text = &text[..text.rfind('"').unwrap()];
                     unescape_c_str(text, |_, res| {
                         if let Err(e) = res {
-                            self.error(err_to_msg(e, Mode::CStr));
+                            self.error(err_to_msg(&e, Mode::CStr));
                         }
                     });
                 }
@@ -671,7 +671,7 @@ fn can_be_raw(name: &str) -> bool {
     !matches!(name, "" | "_" | "crate" | "self" | "Self" | "super")
 }
 
-fn err_to_msg(error: EscapeError, mode: Mode) -> &'static str {
+fn err_to_msg(error: &EscapeError, mode: Mode) -> &'static str {
     match error {
         EscapeError::ZeroChars => "empty character literal",
         EscapeError::MoreThanOneChar => "character literal may only contain one codepoint",

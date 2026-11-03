@@ -37,7 +37,7 @@ fn f<'a, 'b>(x: &'a u8, y: &'b u8) {}
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
@@ -439,7 +439,7 @@ pub union U {
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let union_id = def_map

@@ -11,7 +11,7 @@ use crate::{InferBodyId, InferenceDiagnostic, InferenceResult, solver_errors::Ty
 /// The inference diagnostics of the function `f` of `fixture`.
 fn diagnostics(fixture: &str) -> Vec<InferenceDiagnostic> {
     let db = fixture::db(fixture).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let function = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
@@ -53,6 +53,22 @@ fn a_field_of_a_type_that_derefs_to_itself_is_e0055() {
     let found = diagnostics(&format!("{SELF_DEREF}fn f() {{ let _ = S.missing; }}"));
     assert!(
         found.iter().any(|it| matches!(it, InferenceDiagnostic::AutoderefRecursionLimit { .. })),
+        "{found:?}",
+    );
+}
+
+#[test]
+fn a_type_with_an_error_derefs_to_nothing_and_is_no_e0055() {
+    // As blaze-codegen-code's `pinned.version` once was, with `pin::Pin` unresolved: the
+    // unresolved path is the error, and a field or method of the error type is no E0055.
+    let found = diagnostics(
+        "//- minicore: deref, sized\n\
+         mod pin {}\n\
+         fn pinned() -> (pin::Pin, u8) { loop {} }\n\
+         fn f() { let (p, _) = pinned(); let _ = p.version; p.refusal(); let _ = (&&p).commit; }",
+    );
+    assert!(
+        !found.iter().any(|it| matches!(it, InferenceDiagnostic::AutoderefRecursionLimit { .. })),
         "{found:?}",
     );
 }

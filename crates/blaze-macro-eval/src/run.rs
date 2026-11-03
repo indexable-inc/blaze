@@ -238,7 +238,7 @@ struct Memory<'a, 'db> {
 /// `error` as the expansion's error. Its types print through the attached database, so it is
 /// rendered with `db` attached: the caller may run outside any attach (the daemon's loop).
 pub(crate) fn stop_of(db: &Db, error: MirEvalError<'_>) -> Stop {
-    hir_ty::attach_db(db, || Stop(describe::describe(db, &error)))
+    blaze_query::db::attach(db, || Stop(describe::describe(db, &error)))
 }
 
 impl Guest for Memory<'_, '_> {

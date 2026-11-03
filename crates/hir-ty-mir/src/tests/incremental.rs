@@ -639,7 +639,7 @@ fn execute_assert_events(
     required: &[(&str, usize)],
     expect: Expect,
 ) {
-    crate::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let events = db.log(f);
         let executed: Vec<String> = events
             .iter()

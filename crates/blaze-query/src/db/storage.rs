@@ -241,6 +241,8 @@ pub struct Storage {
     lru: Mutex<Vec<u32>>,
     /// [`Storage::keep_every_value`].
     keep: bool,
+    /// The rows the last view's sweep read, over every capped function ([`Storage::swept`]).
+    swept: usize,
     /// [`Storage::set_eviction`].
     eviction: Eviction,
     /// The database type of its first function table ([`Storage::check_db`]).
@@ -295,6 +297,7 @@ impl Storage {
             // alloc: none, empty: one entry per `lru` function, pushed once
             lru: Mutex::new(Vec::new()),
             keep: false,
+            swept: 0,
             eviction: Eviction::default(),
             db_type: Mutex::new(None),
         }
@@ -532,12 +535,30 @@ impl Storage {
             return;
         }
         let count = self.lru.get_mut().len();
+        self.swept = 0;
+        if count == 0 {
+            return;
+        }
+        // Named, so a build's time in sweeps is the sweep's, never its writer's self time
+        // (rule 14): each input write opens a view and sweeps here.
+        let span = tracing::info_span!(target: "blaze", "lru sweep", view = self.view, rows = tracing::field::Empty);
+        let _sweep = span.enter();
+        let mut swept = 0;
         for at in 0..count {
             let index = self.lru.get_mut()[at];
             if let Some(sweep) = ingredient::vtable(index).and_then(|it| it.sweep) {
-                sweep(self, index);
+                swept += sweep(self, index);
             }
         }
+        span.record("rows", swept);
+        self.swept = swept;
+    }
+
+    /// The rows the last view's sweep read, over every capped function: what it cost, which
+    /// follows the values held, never the rows made.
+    #[cfg(test)]
+    pub(crate) fn swept(&self) -> usize {
+        self.swept
     }
 
     pub(crate) fn add_lru(&self, index: u32) {

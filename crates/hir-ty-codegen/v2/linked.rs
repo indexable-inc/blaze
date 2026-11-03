@@ -115,16 +115,12 @@ impl HirFrontend<'_> {
 }
 
 fn error(what: String) -> CodegenError {
-    CodegenError { unit: InstanceKey(ContentId::default()), item: ItemKey(ContentId::default()), what }
+    CodegenError { unit: InstanceKey(ContentId::default()), item: ItemKey(ContentId::default()), what, front: None }
 }
 
 fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
-    let named = || match &krate.extra_data(db).display_name {
-        // alloc: an error's name of the crate
-        Some(name) => format!("crate `{name}`"),
-        // alloc: an error's name of the crate
-        None => format!("crate {krate:?}"),
-    };
+    // alloc: an error's name of the crate
+    let named = || format!("crate `{}`", krate.named(db));
     // alloc: per crate linked, its libraries
     let mut libs = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
@@ -485,7 +481,7 @@ fn encode(
 /// What a debugger and a backtrace call an instance: rustc's demangled name of it.
 pub(super) fn debug_name(db: &Db, kind: &Kind) -> String {
     match kind {
-        Kind::Code(instance, _) => hir_ty::attach_db(db, || crate::backtrace_name(db, instance)),
+        Kind::Code(instance, _) => blaze_query::db::attach(db, || crate::backtrace_name(db, instance)),
         Kind::Start(main) => match crate::target_of_crate(db, main.krate(db)) {
             // alloc: per instance described, its debug name
             Ok(target) => target.entry().0.to_owned(),

@@ -546,8 +546,13 @@ impl fmt::Display for Restored {
 /// what blaze-mem has committed and reserved, then each tag holding at least
 /// [`MemoryLine::SHOWN`] or reserving at least [`MemoryLine::SHOWN_RESERVED`], largest first,
 /// with its high-water mark and its regions' reservation. Committed bytes past the tags' sum are held by no tag.
+/// Then the size classes of `blaze_mem::blocks` (kept values: trees, token trees, sources):
+/// what their blocks hold live, what the classes keep warm and have given back cold, and each
+/// class carving at least [`MemoryLine::SHOWN`], most carved first, so the gap between what is
+/// live and what the classes hold is named by class.
 pub struct MemoryLine<'a> {
     pub memory: &'a blaze_mem::tag::Snapshot,
+    pub blocks: &'a blaze_mem::blocks::Snapshot,
     /// The process's resident bytes ([`crate::raw::memory::footprint`]), where the system says.
     pub resident: Option<u64>,
     /// What the process holds through the global allocator ([`blaze_graph::arena::held`]); 0
@@ -558,6 +563,27 @@ pub struct MemoryLine<'a> {
 impl MemoryLine<'_> {
     const SHOWN: u64 = 64 << 20;
     const SHOWN_RESERVED: u64 = 64 << 30;
+    /// The size classes shown at most.
+    const CLASSES_SHOWN: usize = 8;
+}
+
+/// A block size as the memory line says it: `80 B`, `5 KiB`, `1.25 MiB`.
+struct BlockSize(u64);
+
+impl fmt::Display for BlockSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (unit, name) = match self.0 {
+            size if size >= 1 << 30 => (1u64 << 30, "GiB"),
+            size if size >= 1 << 20 => (1 << 20, "MiB"),
+            size if size >= 1 << 10 => (1 << 10, "KiB"),
+            _ => return write!(f, "{} B", self.0),
+        };
+        if self.0 % unit == 0 {
+            write!(f, "{} {name}", self.0 / unit)
+        } else {
+            write!(f, "{:.2} {name}", self.0 as f64 / unit as f64)
+        }
+    }
 }
 
 impl fmt::Display for MemoryLine<'_> {
@@ -602,6 +628,34 @@ impl fmt::Display for MemoryLine<'_> {
                 counters.regions,
             )?;
         }
+        let total = self.blocks.total();
+        if total.carved == 0 {
+            return Ok(());
+        }
+        write!(
+            f,
+            "; blocks live {:.2} GiB, warm {:.2}, cold {:.2} ({:.2} given back in {} trims), carved {:.2}, committed {:.2}",
+            gib(total.live()),
+            gib(total.warm),
+            gib(total.cold),
+            gib(total.given_back),
+            total.trims,
+            gib(total.carved),
+            gib(total.committed),
+        )?;
+        let mut classes = self.blocks.classes;
+        classes.sort_by_key(|class| std::cmp::Reverse(class.carved));
+        for class in classes.iter().take(Self::CLASSES_SHOWN).filter(|class| class.carved >= Self::SHOWN) {
+            write!(
+                f,
+                "; {} blocks live {:.2}, warm {:.2}, cold {:.2}, carved {:.2}",
+                BlockSize(class.size),
+                gib(class.live()),
+                gib(class.warm),
+                gib(class.cold),
+                gib(class.carved),
+            )?;
+        }
         Ok(())
     }
 }
@@ -613,7 +667,8 @@ fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let resident = None;
     let heap = blaze_graph::arena::held();
-    let said = MemoryLine { memory, resident, heap }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
+    let blocks = blaze_mem::blocks::snapshot();
+    let said = MemoryLine { memory, blocks: &blocks, resident, heap }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
     eprintln!("blaze serve: {said}");
     tracing::info!("{said}");
 }
@@ -2184,7 +2239,18 @@ mod tests {
             reserved: 1700 << 30,
             reserved_high_water: 1800 << 30,
         };
-        let said = MemoryLine { memory: &memory, resident: Some(12 << 30), heap: 6 << 30 }.to_string();
+        let mut blocks = blaze_mem::blocks::Snapshot::default();
+        blocks.classes[3] = blaze_mem::blocks::ClassCounters {
+            size: 112,
+            carved: 3 << 29,
+            warm: 1 << 29,
+            cold: 1 << 28,
+            committed: 2 << 30,
+            given_back: 1 << 28,
+            trims: 9,
+        };
+        blocks.classes[10] = blaze_mem::blocks::ClassCounters { size: 5 << 10, carved: 1 << 20, ..Default::default() };
+        let said = MemoryLine { memory: &memory, blocks: &blocks, resident: Some(12 << 30), heap: 6 << 30 }.to_string();
         let query = said.find(&format!("; {} 3.00 (most 3.00, reserved 900 in 400)", MemTag::Query)).expect(&said);
         let infer = said.find(&format!("; {} 1.00 (most 2.00, reserved 0 in 0)", MemTag::Infer)).expect(&said);
         let link = said.find(&format!("; {} 0.00 (most 0.00, reserved 800 in 7000)", MemTag::Link)).expect(&said);
@@ -2197,7 +2263,17 @@ mod tests {
             "{said}"
         );
         assert!(!said.contains(&format!("; {} ", MemTag::Parse)), "{said}");
-        let unknown = MemoryLine { memory: &memory, resident: None, heap: 0 }.to_string();
+        // The classes: live is carved less warm and cold; a class carving little is not shown.
+        assert!(
+            said.ends_with(
+                "; blocks live 0.75 GiB, warm 0.50, cold 0.25 (0.25 given back in 9 trims), carved 1.50, committed 2.00\
+                 ; 112 B blocks live 0.75, warm 0.50, cold 0.25, carved 1.50"
+            ),
+            "{said}"
+        );
+        let none = blaze_mem::blocks::Snapshot::default();
+        let unknown = MemoryLine { memory: &memory, blocks: &none, resident: None, heap: 0 }.to_string();
         assert!(unknown.starts_with("memory: committed 5.00 GiB"), "{unknown}");
+        assert!(!unknown.contains("blocks"), "{unknown}");
     }
 }

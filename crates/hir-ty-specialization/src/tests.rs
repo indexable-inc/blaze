@@ -53,7 +53,7 @@ fn refused(head: &str) -> Vec<(String, Rule)> {
     let fx = fixture::db(&text);
     let _ = fx.only_file();
     let db: Db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let def_map = crate_def_map(&db, krate);
         let mut out = Vec::new();
@@ -134,7 +134,7 @@ impl F for u8 { fn f() {} fn g() {} }
         let fx = fixture::db(&text);
         let _ = fx.only_file();
         let db: Db = fx.into_db();
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let krate = fixture::test_crate(&db);
             let def_map = crate_def_map(&db, krate);
             let mut found = Vec::new();

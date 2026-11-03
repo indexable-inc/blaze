@@ -53,7 +53,7 @@ fn check_mir(
     let fx = fixture::db(ra_fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module = db.module_for_file(file_id.file_id(&db));
         let def_map = module.def_map(&db);
         let scope = &def_map.module(&db, module).scope(&db);
@@ -432,7 +432,7 @@ fn with_box_bodies(level: MirOptLevel, check: impl FnOnce(&base_db::Db, &[&crate
     let fx = fixture::db(BOX);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module = db.module_for_file(file_id.file_id(&db));
         let def_map = module.def_map(&db);
         let scope = &def_map.module(&db, module).scope(&db);
@@ -867,7 +867,7 @@ fn escape_bodies_of(text: &str, options: MirOptions, names: &[&str]) -> Vec<(Str
     let fx = fixture::db(text);
     let file_id = *fx.files().last().unwrap();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module = db.module_for_file(file_id.file_id(&db));
         let def_map = module.def_map(&db);
         let scope = &def_map.module(&db, module).scope(&db);

@@ -111,7 +111,7 @@ daemon = ["blaze-cargo/daemon"]
 # `blaze pprof`.
 pprof = ["blaze-cargo/pprof"]
 # The wasm seed: `--no-default-features --features seed`. Each choice is the fastest with no C:
-# blake3's wasm32 SIMD128 code; stencils prebuilt (`BLAZE_STENCILS`); std's allocator; no
+# blake3's wasm32 SIMD128 code; the committed stencil libraries (blaze-stencil's `prebuilt/`); std's allocator; no
 # network; rsasm as the assembler, which has no LLVM. Native builds keep the defaults above.
 seed = ["blaze-ids/wasm32-simd", "blaze-codegen-code/wasm32-simd", "hir-ty-codegen/rsasm"]
 

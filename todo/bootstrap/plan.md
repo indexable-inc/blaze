@@ -184,12 +184,29 @@ switch). Each fiber holds a native stack of the runner's for its life, reserved 
 committed. A fiber suspended mid-body and dropped is unwound in the host with no guest code run,
 and its shadow stack is leaked, since its frames may be linked from elsewhere.
 
-**One thread.** wasm32-wasip1 starts no thread, so `Pool::new` fails there today, with the
-spawn's error. The design: on a target without threads the pool starts no worker of its own. A
-thread on no fiber whose wait can't end at once (a client's `sched::wait`) runs the pool's queued
-jobs, each on its fiber, through the same worker step, until its wait ends. A wait with nothing
-to run and nothing that can end it is the existing stall error. For this, every blocking wait on
-a client (exec's channel receives) has to become a scheduler wait. That is not built yet.
+**One thread** (built 2026-11-03). The seed starts no thread, so its pools are driven
+(`Pool::driven`, `crates/blaze-graph/src/pool.rs`): `Pool::new` on a target without threads
+starts none, and `Topology::detect` there is one CPU. Each worker's loop, the same `work` every
+native worker runs, runs on a fiber of `sched::stack` (`sched::Driven`). The thread that made
+the pool gives the workers turns whenever it waits on no fiber (`block_until`, under a client's
+`sched::wait`, so `Pool::scope`, `install` and every query wait of it) and as the pool drops,
+until every job given it has run. A worker gives its turn back after each job it ran, and where
+a worker of its own thread would park. The driving thread then sleeps until a job's timed wait
+is due, else asks for a stall; with neither on a target without threads, it panics naming every
+wait of the graph, since no other thread could end it. Queues, fibers, parking, waits, cycles
+and stalls are the native code; only who runs the loop differs (`one-concept-one-home`). Rule
+24 holds by construction: a driven worker and its jobs are on the one thread that drives it.
+
+Proof (2026-11-03): `crates/blaze-graph/tests/driven.rs` and `crates/blaze-query/tests/driven.rs`
+run on native, and their scenarios (`tests/driven/scenarios.rs`, 6 of blaze-graph and 2 of
+blaze-query) also ran built for `wasm64-blaze-wasip1` by blaze and under `blaze-seed-run`, all
+passing: one worker freed by an event wait and by a query waiting on another's flight, a cycle
+of key waits refused, nested scopes, a job of one driven pool waiting on another's, a pool's
+drop running its jobs, and a cross-view query cycle in which exactly one wait gives way.
+
+Still open: every blocking wait on a client has to be a scheduler wait (exec's channel
+receives are not), the seed runner serves no sleep (`poll_oneoff`), so a timed wait stops it,
+and a give-way that unwinds (`Cancelled::throw`) aborts the seed, which is built `panic=abort`.
 
 ## The seed is wasm64, and its runner
 
@@ -330,6 +347,9 @@ compiler, as Zig does, which brings a C compiler back).
 - **Memory.** Settled: the seed is wasm64 (above). How much it touches is measured at step 3.
 - **Pulley speed** for a whole self-build. Zig's wasm2c path is faster than an interpreter, and
   wasm2c of the seed could be the default runtime.
-- **Who owns stencil generation** once LLVM is gone from the seed: stencils are built with LLVM
-  outside the seed and committed as data with their hash, or produced by blaze's own code
-  generator.
+- **Who owns stencil generation** once LLVM is gone from the seed. Built (2026-11-02, lane
+  seedengine): the stencil libraries are made with LLVM by native builds and committed as data
+  in `crates/blaze-stencil/prebuilt/`, pinned by `stencils.json`. The seed includes those bytes;
+  every LLVM build checks it made exactly them, so a generator change commits new libraries in
+  the same change. No variable points the seed elsewhere (`BLAZE_STENCILS` is gone). Whether
+  blaze's own code generator later makes them instead stays open.

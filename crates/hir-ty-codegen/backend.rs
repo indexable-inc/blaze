@@ -581,16 +581,19 @@ pub(super) enum Step {
     Translate,
     /// Lines and variables for a debugger.
     Describe,
+    /// Cranelift's verifier over the IR a function was translated to (`crate::verified`).
+    Verify,
 }
 
 impl Step {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
     const ALL: [(Step, &str); Step::COUNT] = [
         (Step::Infer, "infer"),
         (Step::Mir, "mir"),
         (Step::Monomorphize, "monomorphize"),
         (Step::Translate, "translate"),
         (Step::Describe, "describe"),
+        (Step::Verify, "verify"),
     ];
 }
 
@@ -679,6 +682,7 @@ impl Tally {
             Step::Monomorphize => tracing::info_span!(target: "blaze", "monomorphize"),
             Step::Translate => tracing::info_span!(target: "blaze", "translate"),
             Step::Describe => tracing::info_span!(target: "blaze", "describe"),
+            Step::Verify => tracing::info_span!(target: "blaze", "verify ir"),
         }
         .entered();
         let start = Instant::now();

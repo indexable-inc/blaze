@@ -41,6 +41,7 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         stage: Stage::Over,
         value: None,
         updating: HashSet::new_in(std::alloc::Global),
+        said: HashSet::new_in(std::alloc::Global),
         queries: Vec::new(),
         built: None,
         borrowed: Vec::new(),
@@ -94,8 +95,8 @@ fn a_builds_history_row_names_its_request_its_command_and_its_workspace() {
     assert_eq!(command_line(&Work::Snapshot), "snapshot");
 }
 
-/// A request patched in place is one whose every link was spliced: a first link, or one that
-/// laid out a kept image whole again, makes it placed.
+/// A request patched in place is one whose every link was spliced or left unchanged: a first
+/// link, or one that laid out a kept image whole again, makes it placed.
 #[test]
 fn work_is_placed_whole_when_any_link_was() {
     use crate::serve::work::Full;
@@ -103,10 +104,12 @@ fn work_is_placed_whole_when_any_link_was() {
     assert_eq!(link_kind(&[]), LinkKind::Patched);
     assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::Spliced)]), LinkKind::Patched);
     assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::First)]), LinkKind::Placed);
+    assert_eq!(link_kind(&[link(Linking::Unchanged), link(Linking::Spliced)]), LinkKind::Patched);
     assert_eq!(link_kind(&[link(Linking::Full(Full::NotIncremental))]), LinkKind::Placed);
 
     use blaze_api::LinkHow;
     assert_eq!(Linking::Spliced.how(), LinkHow::Spliced);
+    assert_eq!(Linking::Unchanged.how(), LinkHow::Unchanged);
     assert_eq!(Linking::First.how(), LinkHow::First);
     assert_eq!(Linking::Full(Full::NotIncremental).how(), LinkHow::Full { why: vec!["not incremental".to_owned()] });
 }
@@ -483,4 +486,39 @@ fn a_builds_crate_graph_has_an_edge_for_each_table_a_dependency_is_in() {
     // The script's run, and the test's edge to its own library, are no table's.
     assert_eq!(edges, [(7, "app", "dep", DepKind::Build), (7, "app", "dep", DepKind::Dev), (7, "app", "dep", DepKind::Normal)]);
     assert!(crate_deps(7, &units, &[0]).is_empty(), "a build of the dependency alone has no edge");
+}
+
+#[test]
+fn a_diagnostic_of_no_unit_is_said_once_a_job_and_a_units_each_time() {
+    use crate::serve::tests::{of_graph, unit};
+    let root = "/w";
+    let app = format!("path+file://{root}#app@0.1.0");
+    let graph = blaze_units::schema::UnitGraph {
+        version: 1,
+        units: vec![unit(&app, "custom-build", UnitMode::Build, &[]), unit(&app, "lib", UnitMode::Build, &[])],
+        roots: vec![1],
+    };
+    let units = of_graph(root, String::new(), graph);
+    let of = |unit: Option<UnitOf>, rendered: &str| blaze_api::Diagnostic {
+        level: blaze_api::Level::Error,
+        code: None,
+        unit,
+        facts: Vec::new(),
+        spans: Vec::new(),
+        message: rendered.to_owned(),
+        children: Vec::new(),
+        rendered: rendered.to_owned(),
+        explanation: None,
+    };
+    let report = "error: the front end fails on `std::f` in the toolchain's `std`, ...\n";
+    let line = "error: `app v0.1.0 (build script)` reaches 1 function blaze could not compile, ...\n";
+    let mut said = HashSet::new_in(std::alloc::Global);
+    // The first unit that reaches the toolchain's failed function carries the job's report
+    // and its own error; the second carries the same two.
+    for at in [0, 1] {
+        let report_said = said_once(&mut said, &of(None, report));
+        assert_eq!(report_said, at == 0, "the job's report is said by the first unit only");
+        assert!(said_once(&mut said, &of(unit_of(&units, at), line)), "unit {at}'s own error is always said");
+    }
+    assert!(said_once(&mut said, &of(None, "error: the front end fails on `std::g` ...\n")), "another report is said");
 }

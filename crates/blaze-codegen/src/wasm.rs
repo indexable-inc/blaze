@@ -6,6 +6,7 @@
 //! numbers the module's types and globals, so the places in the body that name one are in the
 //! header rather than relocations.
 
+use blaze_format::leb;
 use serde::{Deserialize, Serialize};
 
 /// A value type, as its byte in the binary format.
@@ -48,7 +49,7 @@ impl Signature {
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.push(0x60);
         for values in [&self.params, &self.results] {
-            uleb(out, values.len() as u64);
+            leb::write_u64(out, values.len() as u64);
             out.extend(values.iter().map(|&it| it as u8));
         }
     }
@@ -112,20 +113,20 @@ impl Code {
         // put in front of it once known.
         let mut header = Vec::with_capacity(64 + body.len());
         self.ty.encode(&mut header);
-        uleb(&mut header, self.types.len() as u64);
+        leb::write_u64(&mut header, self.types.len() as u64);
         for ty in &self.types {
             ty.encode(&mut header);
         }
-        uleb(&mut header, self.type_fixups.len() as u64);
+        leb::write_u64(&mut header, self.type_fixups.len() as u64);
         for &(at, which) in &self.type_fixups {
-            uleb(&mut header, at.into());
-            uleb(&mut header, which.into());
+            leb::write_u64(&mut header, at.into());
+            leb::write_u64(&mut header, which.into());
         }
-        uleb(&mut header, self.stack_pointer.len() as u64);
+        leb::write_u64(&mut header, self.stack_pointer.len() as u64);
         for &at in &self.stack_pointer {
-            uleb(&mut header, at.into());
+            leb::write_u64(&mut header, at.into());
         }
-        uleb(&mut header, self.imports.len() as u64);
+        leb::write_u64(&mut header, self.imports.len() as u64);
         for (name, import) in &self.imports {
             string(&mut header, name);
             string(&mut header, &import.module);
@@ -139,7 +140,8 @@ impl Code {
                 string(&mut header, name);
             }
         }
-        let (len, len_bytes) = uleb_bytes(header.len() as u64);
+        let mut len = [0; leb::MAX_LEN];
+        let len_bytes = leb::put_u64(&mut len, header.len() as u64);
         let mut code = header;
         code.reserve(len_bytes + body.len());
         code.splice(0..0, len[..len_bytes].iter().copied());
@@ -198,27 +200,6 @@ impl Code {
     }
 }
 
-fn uleb(out: &mut Vec<u8>, value: u64) {
-    let (bytes, len) = uleb_bytes(value);
-    out.extend_from_slice(&bytes[..len]);
-}
-
-/// `value` as an unsigned LEB128: its bytes and how many of them there are.
-fn uleb_bytes(mut value: u64) -> ([u8; 10], usize) {
-    let mut bytes = [0; 10];
-    let mut len = 0;
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            bytes[len] = byte;
-            return (bytes, len + 1);
-        }
-        bytes[len] = byte | 0x80;
-        len += 1;
-    }
-}
-
 /// The room to make for `count` items read from `bytes` at `at`: each takes at least a byte,
 /// so a count past the bytes left is cut to them, and a corrupt count reserves no more.
 fn bounded(count: u64, bytes: &[u8], at: usize) -> usize {
@@ -226,7 +207,7 @@ fn bounded(count: u64, bytes: &[u8], at: usize) -> usize {
 }
 
 fn string(out: &mut Vec<u8>, string: &str) {
-    uleb(out, string.len() as u64);
+    leb::write_u64(out, string.len() as u64);
     out.extend(string.as_bytes());
 }
 
@@ -236,26 +217,14 @@ fn byte(bytes: &[u8], at: &mut usize) -> Result<u8, String> {
     Ok(byte)
 }
 
+/// [`leb::read_u64`], its error said as the header's.
 fn read_uleb(bytes: &[u8], at: &mut usize) -> Result<u64, String> {
-    let mut value = 0u64;
-    let mut shift = 0;
-    loop {
-        let byte = byte(bytes, at)?;
-        if shift >= 64 || (shift == 63 && byte & 0x7e != 0) {
-            // alloc: the error's message
-            return Err("wasm: a LEB128 longer than 64 bits".to_owned());
-        }
-        value |= u64::from(byte & 0x7f) << shift;
-        shift += 7;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
+    leb::read_u64(bytes, at).map_err(|error| format!("wasm: {error}")) // alloc: the error's message
 }
 
+/// [`leb::read_u32`], its error said as the header's.
 fn read_u32(bytes: &[u8], at: &mut usize) -> Result<u32, String> {
-    // alloc: the error's message
-    u32::try_from(read_uleb(bytes, at)?).map_err(|_| "wasm: a number past 32 bits".to_owned())
+    leb::read_u32(bytes, at).map_err(|error| format!("wasm: {error}")) // alloc: the error's message
 }
 
 fn read_string(bytes: &[u8], at: &mut usize) -> Result<String, String> {

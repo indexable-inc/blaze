@@ -1128,7 +1128,7 @@ pub(crate) fn trash_between(path: &Path, to: &Path, class: Class, gate: Option<(
 /// unlinked. When the rename back fails too (`from` made again meanwhile), it is
 /// [`Nested::NotBack`], naming both paths: the tree stays at `to`, whose unlink takes the same
 /// leases first and so refuses it while that build runs ([`unlink`]) (review round 7, C1).
-pub fn recheck_renamed(from: &Path, to: &Path, held: &mut Vec<std::fs::File>) -> Result<(), Nested> {
+pub fn recheck_renamed(from: &Path, to: &Path, held: &mut Vec<stdx::file_lock::Locked>) -> Result<(), Nested> {
     let found = match take_nested_leases(to, None, held) {
         Ok(()) => return Ok(()),
         Err(found) => found,
@@ -1253,7 +1253,7 @@ pub fn nested_lease_dirs(tree: &Path, skip: Option<&Path>) -> Result<Vec<PathBuf
 /// (the same lease file, [`lease::verified`], as after the tree's rename) is not taken twice. A
 /// held one, or one that moved, is a [`Nested`] naming its directory; the locks taken before it
 /// stay in `held`, for the caller to drop.
-pub fn take_leases(tree: &Path, dirs: &[PathBuf], held: &mut Vec<std::fs::File>) -> Result<(), Nested> {
+pub fn take_leases(tree: &Path, dirs: &[PathBuf], held: &mut Vec<stdx::file_lock::Locked>) -> Result<(), Nested> {
     for dir in dirs {
         let mut have = false;
         for file in held.iter_mut() {
@@ -1287,7 +1287,7 @@ pub fn take_leases(tree: &Path, dirs: &[PathBuf], held: &mut Vec<std::fs::File>)
 /// it meanwhile (review round 5, B1: a `--target-dir` named inside another build's directory, or
 /// `<root>/build` itself). Run again on the renamed tree, with the locks held, before anything
 /// is unlinked, it covers a lease made inside after the first walk (review round 6, C1).
-pub fn take_nested_leases(tree: &Path, skip: Option<&Path>, held: &mut Vec<std::fs::File>) -> Result<(), Nested> {
+pub fn take_nested_leases(tree: &Path, skip: Option<&Path>, held: &mut Vec<stdx::file_lock::Locked>) -> Result<(), Nested> {
     let dirs = nested_lease_dirs(tree, skip)?;
     take_leases(tree, &dirs, held)
 }
@@ -1383,7 +1383,7 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 /// none for the collector): every other lease in it is taken exclusively first, and one held (a
 /// build that locked a lease in the tree after the rename's walk) refuses the unlink, naming it;
 /// the locks are held through the removal (review round 6, C1).
-pub fn unlink(path: &Path, mut held: Vec<std::fs::File>) -> Result<u64, String> {
+pub fn unlink(path: &Path, mut held: Vec<stdx::file_lock::Locked>) -> Result<u64, String> {
     let name = path.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
     let in_trash = path.parent().is_some_and(|it| it.file_name().is_some_and(|it| it == TRASH) && it.join(TRASH_MARK).is_file());
     if !in_trash || !is_trash_name(&name) {

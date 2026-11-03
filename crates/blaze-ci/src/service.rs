@@ -948,6 +948,7 @@ impl Report {
             | Response::TestReady(_)
             | Response::Fetched { .. }
             | Response::BuildScript(_)
+            | Response::Unchecked(_)
             | Response::Work(_) => {}
             Response::Verified { mismatches } => self.verified = Some(mismatches),
             Response::Error(error) => {

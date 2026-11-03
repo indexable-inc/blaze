@@ -418,25 +418,59 @@ impl Region {
     }
 
     /// Lets the kernel reclaim the pages of `[from, from + len)` (rounded inward to pages)
-    /// while they stay committed; their contents become unspecified. Pages of the reserved
-    /// pool are kept: one given back would be faulted in again on the next touch, which kills
-    /// the process when the pool has none free.
+    /// while they stay reserved; their contents become unspecified, and [`Region::reuse`] makes
+    /// them the process's again before they are touched. Pages of the reserved pool are kept:
+    /// one given back would be faulted in again on the next touch, which kills the process
+    /// when the pool has none free. Returns the bytes given back.
     ///
     /// # Safety
     ///
-    /// Nothing reads the range's contents again before writing them.
-    pub unsafe fn purge(&self, from: usize, len: usize) {
+    /// Nothing reads the range's contents again before writing them, and nothing touches it
+    /// before [`Region::reuse`] is called over it.
+    pub unsafe fn purge(&self, from: usize, len: usize) -> usize {
         let page = os::page_size();
-        let Some(start) = crate::align::checked_align_up(from, page) else { return };
+        let Some(start) = crate::align::checked_align_up(from, page) else { return 0 };
         let mut end = crate::align::align_down(from.saturating_add(len), page).min(self.committed());
         if self.pages == Pages::Reserved {
             end = end.min(huge_unit());
         }
-        if end > start {
-            // SAFETY: `[start, end)` is page-aligned, committed, and the caller says nothing
-            // holds data in it.
-            unsafe { os::purge(self.at(start), end - start) };
+        if end <= start {
+            return 0;
         }
+        // SAFETY: `[start, end)` is page-aligned, committed, and the caller says nothing
+        // holds data in it.
+        unsafe { os::purge(self.at(start), end - start) };
+        end - start
+    }
+
+    /// Makes `[from, from + len)` (rounded out to pages), which [`Region::purge`] may have given
+    /// back in part, the process's again before it is written: macOS counts the pages back
+    /// into the footprint, Windows commits them; elsewhere nothing to do. An error when the
+    /// kernel refuses (Windows' commit limit).
+    ///
+    /// # Panics
+    ///
+    /// When the range passes what is committed, naming both and the region's tag: only pages
+    /// once committed are ever purged.
+    #[track_caller]
+    pub fn reuse(&self, from: usize, len: usize) -> Result<(), MemError> {
+        let page = os::page_size();
+        let start = crate::align::align_down(from, page);
+        let end = crate::align::checked_align_up(from.saturating_add(len), page).unwrap_or(usize::MAX);
+        let committed = self.committed();
+        assert!(
+            end <= committed,
+            "reusing bytes {from} to {} of a {:?} region with {committed} committed: past what it committed",
+            from.saturating_add(len),
+            self.tag,
+        );
+        if end <= start {
+            return Ok(());
+        }
+        // SAFETY: `[start, end)` is page-aligned, inside the committed prefix of this live
+        // reservation (checked just above).
+        unsafe { os::reuse(self.at(start), end - start) }
+            .map_err(|os| MemError::Commit { tag: self.tag, bytes: end - start, os })
     }
 }
 

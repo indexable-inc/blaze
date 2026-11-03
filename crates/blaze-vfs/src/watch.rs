@@ -524,7 +524,7 @@ impl Watcher {
         let below = self.below.len();
         match (pending, completion.done) {
             (Pending::Stamp(number), Done::Stamped(stamps)) => {
-                self.stamped(vfs, number, stamps, effects, &mut out);
+                self.stamped(vfs, number, &stamps, effects, &mut out);
             }
             (Pending::Entries(number, dir), Done::Entries(entries)) => {
                 self.listed(vfs, number, dir, entries, effects);
@@ -610,7 +610,7 @@ impl Watcher {
             out.push(Watched::Lost { path, why });
             match why {
                 Lost::Unnamed => self.relist(vfs, under, effects),
-                _ => self.rescan(vfs, under, effects),
+                _ => self.rescan(vfs, &under, effects),
             }
         }
         let was = self.caught_up;
@@ -653,7 +653,7 @@ impl Watcher {
     /// stamped, and the directories whose stamp moved are listed. The column's names are swept
     /// as they are ([`Batch::names`]); of the head, only what changed since the column held all
     /// of it is added (all of it when the column never did).
-    pub fn rescan(&mut self, vfs: &Vfs, under: FileName, effects: &mut Vec<Effect>) {
+    pub fn rescan(&mut self, vfs: &Vfs, under: &FileName, effects: &mut Vec<Effect>) {
         if self.rel(under.as_str()).is_none() {
             return;
         }
@@ -821,7 +821,7 @@ impl Watcher {
         &mut self,
         vfs: &Vfs,
         number: u64,
-        stamps: Vec<Stamp>,
+        stamps: &[Stamp],
         effects: &mut Vec<Effect>,
         out: &mut Vec<Watched>,
     ) {

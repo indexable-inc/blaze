@@ -636,11 +636,7 @@ fn the_critical_path_is_contiguous_inside_the_build_and_no_longer_than_it(tc: Te
 
 /// `it` in an order `seed` picks.
 fn shuffled<T>(mut it: Vec<T>, seed: u64) -> Vec<T> {
-    let mut state = seed | 1;
-    for i in (1..it.len()).rev() {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        it.swap(i, (state >> 33) as usize % (i + 1));
-    }
+    blaze_ids::rng::SplitMix64::new(seed).shuffle(&mut it);
     it
 }
 

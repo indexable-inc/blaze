@@ -185,6 +185,18 @@ blaze's load does not build, saying what: an artifact dependency (`-Z bindeps`),
 `metabuild`, a target spec file, a target blaze has no data of, and a rustc `-Z` flag in
 `RUSTFLAGS` that `crates/blaze-cargo/src/unstable.rs` refuses.
 
+Under `--keep-going` a failed unit stops only what needs it. A unit that is only checked
+(`blaze check`, or a library a check reaches) and failed only in its functions' bodies or in
+lints, its items (signatures, types, impls) sound, fails open: it stays failed, nothing is
+built or linked from it, and the units that depend on it are still checked against its items,
+so one pass shows their errors too. A unit whose items are broken, or one that is built rather
+than checked, still holds back what depends on it. Which it was is part of the unit's check
+result and its record (`crates/blaze-cargo/src/serve/unit/compile.rs`, `open`); an item
+declared inside a body's block counts as the body's. At the end of a build that failed, blaze
+says on stderr how many units it left unchecked and behind which failure, and which units an
+open failure let through; under `--message-format json` the same comes as one
+`{"reason":"blaze-unchecked",...}` line on stdout (`Response::Unchecked` in `blaze-api`).
+
 The build is the daemon's, and the daemon keeps what it built: its database and its store.
 The next build compiles only the functions an edit changed, and links each program again
 against an image it kept of the last link at that path, so the link writes only what changed
@@ -888,7 +900,7 @@ the same release.
 ## How far a constant's evaluation may go
 
 Every evaluation of a constant, static, array length or other compile-time code has a budget
-of steps (basic blocks run, as rustc counts them) and of memory (its stack and heap together),
+of steps (basic blocks run, every one) and of memory (its stack and heap together),
 1 000 000 000 steps and 1 GiB unless the workspace's root `Cargo.toml` says otherwise:
 
     [workspace.metadata.blaze]
@@ -898,8 +910,12 @@ An evaluation that reaches either stops the build with what it ran out of, where
 the setting to raise, as in ``const eval of `TABLE` exceeded 1000000000 steps at
 src/lib.rs:12:9 (raise `const-eval.steps` under `[workspace.metadata.blaze]`)``. rustc's own
 limit is its `long_running_const_eval` lint, an error at 2 000 000 steps unless the lint is
-allowed (then it only warns, and runs on); the default here is 500 times that, so the budget
-ends a loop that never would rather than refusing code rustc takes.
+allowed (then it only warns, and runs on). blaze fires that lint where rustc does: its steps are
+only the runs of blocks that end in a call or close a loop (rustc's `CtfeLimit` pass), so a
+constant that loops over a few hundred thousand bytes a few times is under it. The budget
+counts every block, 500 times the lint's count, so it ends a loop that never would rather than
+refusing code rustc takes. Each evaluation's `const eval` span in the profile records both
+counts, `blocks` and `steps`.
 
 ## Environment variables
 

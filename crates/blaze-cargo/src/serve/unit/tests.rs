@@ -1156,6 +1156,12 @@ impl ScriptFront {
 }
 
 fn script_front(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> ScriptFront {
+    script_front_for(text, on_core, env, true)
+}
+
+/// [`script_front`] of a request that asks for the script's package (`primary`) or only for
+/// `core`, so the script is not of a primary package.
+fn script_front_for(text: &'static [u8], on_core: bool, env: &[(&str, &str)], primary: bool) -> ScriptFront {
     use blaze_units::{
         query::{BuildConfig, Command, Invocation, Mount, Origin},
         schema::{Strip, Stripped},
@@ -1175,9 +1181,11 @@ fn script_front(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> Scr
         true => vec![UnitDep { index: 0, extern_crate_name: "core".to_owned(), public: None, noprelude: Some(true), nounused: None, dev: false }],
         false => Vec::new(),
     };
+    let mut script_plan = plan("", &[]);
+    script_plan.env = vec![("CARGO_MANIFEST_PATH".to_owned(), "/w/Cargo.toml".to_owned())];
     let units = Units {
-        graph: UnitGraph { version: 1, units: vec![core_unit, script], roots: vec![1] },
-        plans: vec![plan("", &[]), plan("", &[])],
+        graph: UnitGraph { version: 1, units: vec![core_unit, script], roots: vec![if primary { 1 } else { 0 }] },
+        plans: vec![plan("", &[]), script_plan],
         packages: vec![PackagePlan { is_member: false, ..package(core, "core", "/rustc/abc/library/core") }, package(s, "s", "/w")],
         lock: None,
         warnings: Vec::new(),
@@ -1218,6 +1226,7 @@ fn script_front(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> Scr
         unit: compile::KeyedUnit::among(script, |at| Ok(&units.graph.units[at])).unwrap(),
         plan: &units.plans[1],
         run_env: &[],
+        script_check_cfgs: Vec::new(),
         blaze: ContentId::of("blaze v2 cargo test toolchain", b"one blaze"),
         goal: compile::keyed_goal(crate::serve::work::Goal::Build, script),
         color: false,
@@ -1239,6 +1248,45 @@ fn script_front(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> Scr
 /// `compile::fresh` looks.
 fn look(store: &super::reads::tests::Store, base: blaze_cas::Key, env: &[(&str, &str)]) -> Option<blaze_cas::Key> {
     store.find(base, &super::reads::tests::env(env)).map(|it| it.key)
+}
+
+/// A build script that reads `CARGO_PRIMARY_PACKAGE` through `option_env!` and nothing else.
+const PRIMARY_SCRIPT: &[u8] = b"#[rustc_builtin_macro]\nmacro_rules! option_env { () => {} }\n\n\
+fn main() { let _ = option_env!(\"CARGO_PRIMARY_PACKAGE\"); }\n";
+
+/// `CARGO_PRIMARY_PACKAGE` is of the request, not of the unit: `--workspace` makes every member
+/// primary and `-p one` only `one`, so keying every unit by it recompiled every dependency of
+/// `one` after a workspace build (sb3slow, the self-build's link step). A record is keyed by it
+/// only when a crate of its closure read it (rule 18, both ways): a script that never read it
+/// has one base key and one record whether or not its package is primary; one that read it
+/// has the same base key, but is filed by it, and misses once its package's primary-ness moves.
+#[test]
+fn primary_package_keys_only_a_record_whose_code_read_it() {
+    let env = [("FOO", "on")];
+    let vars = super::reads::tests::env(&env);
+    let front = |text, primary| script_front_for(text, true, &env, primary);
+    let reads = |front: &ScriptFront| super::reads::Reads::of(front.lowered.db(), front.lowered.krate(1).unwrap()).unwrap();
+    let mut store = super::reads::tests::Store::default();
+
+    let (asked, other) = (front(SCRIPT, true), front(SCRIPT, false));
+    assert!(asked.units.is_primary(1) && !other.units.is_primary(1));
+    assert_eq!(asked.base, other.base, "a crate that never read it: its key holds no primary-ness");
+    assert_eq!(reads(&asked), super::reads::Reads::named(&["FOO"]));
+    assert_eq!(reads(&other), reads(&asked));
+    let filed = store.keep_for(asked.base, &reads(&asked), &vars, &|it| asked.units.is_primary_manifest(it));
+    let found = store.find_for(other.base, &vars, &|it| other.units.is_primary_manifest(it));
+    assert_eq!(found.map(|it| it.key), Some(filed), "built as primary, found as not");
+
+    let (asked, other) = (front(PRIMARY_SCRIPT, true), front(PRIMARY_SCRIPT, false));
+    assert_eq!(asked.base, other.base, "a crate that read it: its base key holds no primary-ness either");
+    assert_eq!(reads(&asked), super::reads::Reads::primary("/w/Cargo.toml"), "it is filed by it");
+    assert_eq!(reads(&other), reads(&asked));
+    let filed = store.keep_for(asked.base, &reads(&asked), &vars, &|it| asked.units.is_primary_manifest(it));
+    assert_eq!(store.find_for(asked.base, &vars, &|it| asked.units.is_primary_manifest(it)).map(|it| it.key), Some(filed));
+    let found = store.find_for(other.base, &vars, &|it| other.units.is_primary_manifest(it));
+    assert_eq!(found, None, "made as primary, its package no longer primary: a miss");
+    let not = store.keep_for(other.base, &reads(&other), &vars, &|it| other.units.is_primary_manifest(it));
+    assert_ne!(not, filed, "two values, two records");
 }
 
 /// Two runs of the same tree differ in the variables of the process that starts them: the
@@ -1545,7 +1593,7 @@ fn sealed_diags(lowered: &blaze_lower::Lowered, unit: usize) -> (bool, Vec<blaze
     let db = lowered.db();
     let krate = lowered.krate(unit).unwrap();
     let files = blaze_diagnostics::Files::new(lowered.paths(), "/");
-    let in_graph = hir::attach_db(db, || hir_ty::sealed_in_graph(db, krate));
+    let in_graph = blaze_query::db::attach(db, || hir_ty::sealed_in_graph(db, krate));
     let diags = compile::reached_only_diags(db, krate, files, || Ok(blaze_diagnostics::Options::default())).unwrap();
     (in_graph, diags)
 }
@@ -1751,6 +1799,7 @@ fn a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it
             unit: compile::KeyedUnit::among(u, |at| Ok(&front.units.graph.units[at])).unwrap(),
             plan: &front.units.plans[unit],
             run_env: &[],
+            script_check_cfgs: Vec::new(),
             blaze: ContentId::of("blaze v2 cargo test toolchain", b"one blaze"),
             goal: compile::keyed_goal(crate::serve::work::Goal::Build, u),
             color: false,
@@ -1815,7 +1864,7 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
         let kept = super::deps::Kept { served, mode };
         let (puts, _) = super::deps::store(lowered, Some(kept), session, &[], "/w").unwrap();
         for it in puts {
-            store.put(it.put.key, it.put.kind, it.put.bytes).unwrap();
+            store.put(it.put.key, it.put.kind, &it.put.bytes).unwrap();
         }
     };
 
@@ -1941,7 +1990,7 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
     let kept = super::deps::Kept { served, mode };
     let (puts, _) = super::deps::store(&first, Some(kept), &mut session, &[], "/w").unwrap();
     for it in puts {
-        store.put(it.put.key, it.put.kind, it.put.bytes).unwrap();
+        store.put(it.put.key, it.put.kind, &it.put.bytes).unwrap();
     }
     drop((session, first));
 

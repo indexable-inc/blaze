@@ -419,13 +419,6 @@ fn refused(why: String) -> ProcMacroLoadingError {
 }
 
 /// The name of `krate` as its errors and spans say it.
-fn crate_name(db: &Db, krate: Crate) -> Box<str> {
-    match &krate.extra_data(db).display_name {
-        Some(name) => name.to_string().into(), // alloc: once per name asked for
-        None => "<unnamed>".into(),
-    }
-}
-
 /// The macros of `krate`, a proc-macro crate, each run on blaze's MIR evaluator in this
 /// process for a crate built with `toolchain`. An error says why none can run: the crate is no
 /// proc-macro crate, or its `proc_macro` is not the bridge blaze's server speaks. Its expansions
@@ -477,7 +470,7 @@ fn load_on(
     engine: impl FnOnce(&str, Checked) -> Result<(Engine, ContentId), ProcMacroLoadingError>,
 ) -> ProcMacroLoadResult {
     // alloc: once a proc-macro crate, the name its errors say
-    let name = crate_name(db, krate);
+    let name = krate.named(db).to_string().into_boxed_str();
     if !crate_def_map(db, krate).is_proc_macro() {
         return Err(refused(format!("`{name}` is not a proc-macro crate"))); // alloc: error path
     }
@@ -736,7 +729,7 @@ impl Evaluated {
         let library = &*self.library;
         // alloc: once per call, the names its span carries
         let path = format!("{}::{}", library.name, self.name.as_str());
-        let calling = crate_name(db, calling);
+        let calling = calling.named(db).to_string(); // alloc: once per call, as `path`
         let span = run::expand_span(&path, &calling);
         // alloc: once per call, what its progress lines say
         let what = format!("the proc macro `{path}` for `{calling}`");

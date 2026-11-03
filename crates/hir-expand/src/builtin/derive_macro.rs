@@ -91,7 +91,7 @@ impl BuiltinDeriveExpander {
         tt: &tt::TopSubtree,
         span: Span,
     ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-        let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
+        let span = span_with_def_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
         let expanded = if let BuiltinDeriveExpander::Clone = self
             && let MacroCallKind::Derive { ast_id, .. } = &id.loc(db).kind
             && derives_copy(ast_id.to_view(db))
@@ -597,11 +597,16 @@ impl BasicAdtInfo {
 
     /// For a packed struct, a `let` of each field of `self` (or `other`) to a copy out of it, to
     /// the name in `bindings` the patterns of the other derives bind it to.
-    fn write_packed_lets(&self, b: &mut Builder, bindings: &[tt::Ident], other: bool) {
+    ///
+    /// The copy is written where the field is but in the derive's hygiene (`span`'s context):
+    /// an error about it (E0507 for a field that isn't `Copy`) points at the field, as rustc's
+    /// does, while `self` and `other` still resolve to the derived fn's parameters. The field's
+    /// name keeps its own span.
+    fn write_packed_lets(&self, b: &mut Builder, span: Span, bindings: &[tt::Ident], other: bool) {
         let Some(v) = self.shape.variants.first() else { return };
         for i in v.fields() {
             let field = &self.shape.fields[i];
-            let at = field.span;
+            let at = Span { ctx: span.ctx, ..field.span };
             let bound = &bindings[i];
             let index = i - v.start as usize;
             let place = group(at, |b| match v.kind {
@@ -631,7 +636,7 @@ impl BasicAdtInfo {
     ) {
         if self.packed_struct() {
             delimited(b, tt::DelimiterKind::Brace, span, |b| {
-                self.write_packed_lets(b, selfs, false);
+                self.write_packed_lets(b, span, selfs, false);
                 body(b, &self.shape.variants[0]);
             });
             return;
@@ -667,8 +672,8 @@ impl BasicAdtInfo {
     ) {
         if self.packed_struct() {
             delimited(b, tt::DelimiterKind::Brace, span, |b| {
-                self.write_packed_lets(b, selfs, false);
-                self.write_packed_lets(b, others, true);
+                self.write_packed_lets(b, span, selfs, false);
+                self.write_packed_lets(b, span, others, true);
                 body(b, &self.shape.variants[0]);
             });
             return;
@@ -711,20 +716,24 @@ fn parse_adt(
 }
 
 /// Pushes the fields of `list` to `fields`, and says how they are written.
+///
+/// Each field keeps the span the item wrote it with, its syntax context too, as rustc's derives
+/// keep `FieldDef::ident` (`deriving/generic`): a field is the item's name, not one the derive
+/// makes. So the expansion reads it in its own edition (`gen` written in 2021 is a name, though
+/// the derive's def-site context is core's 2024), and what is reported of a field is where it
+/// is written.
 fn push_fields(
     fields: &mut Vec<tt::Ident>,
     call_site: Span,
     tm: &impl SpanMapper,
     list: Option<FieldList<'_>>,
 ) -> Result<FieldsKind, ExpandError> {
-    let at_field = |span: Span| Span { ctx: call_site.ctx, ..span };
     Ok(match list {
         None => FieldsKind::Unit,
         Some(FieldList::RecordFieldList(it)) => {
             fields.reserve(it.fields().count());
             for field in it.fields() {
-                let name = name_to_token(call_site, tm, field.name())?;
-                fields.push(field_name_in_derive(name, call_site));
+                fields.push(name_to_token(call_site, tm, field.name())?);
             }
             FieldsKind::Record
         }
@@ -736,31 +745,13 @@ fn push_fields(
                     .map_or_else(|| field.syntax().text_range(), |ty| ty.syntax().text_range());
                 fields.push(tt::Ident {
                     sym: tuple_field_symbol(i),
-                    span: at_field(tm.span_for(at)),
+                    span: tm.span_for(at),
                     is_raw: tt::IdentIsRaw::No,
                 });
             }
             FieldsKind::Tuple
         }
     })
-}
-
-/// A record field's `name` as the derive writes it: where the item wrote it, in the derive's
-/// context (`call_site`'s), and raw where a keyword could be read in its place.
-///
-/// The derive's context has the edition of the crate that defines the derive (core's), which
-/// may reserve a word the item's edition left free: `gen` written in 2021 (streaming-iterator
-/// 0.1.9's `FromFn`), `async` in 2015. rustc's derives never read their output back, and print
-/// such a name raw by `Ident::is_raw_guess` (reserved in the name's edition); here the output is
-/// parsed, each identifier in its context's edition, so the name is raw wherever any edition
-/// reserves it, which reads as the same field in every edition. A path keyword (`self`,
-/// `crate`, ...) has no raw form (`Symbol::can_be_raw`) and is no field's name.
-fn field_name_in_derive(name: tt::Ident, call_site: Span) -> tt::Ident {
-    let text = name.sym.as_str();
-    let reserved = SyntaxKind::from_keyword(text, Edition::LATEST).is_some()
-        && !matches!(text, "self" | "Self" | "super" | "crate" | "_");
-    let is_raw = if reserved { tt::IdentIsRaw::Yes } else { name.is_raw };
-    tt::Ident { span: Span { ctx: call_site.ctx, ..name.span }, is_raw, ..name }
 }
 
 fn len_u32(len: usize) -> u32 {

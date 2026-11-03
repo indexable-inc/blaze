@@ -32,7 +32,7 @@
 
 use either::Either;
 use hir::{InFile, LangItem, ModuleDef};
-use hir_ty::next_solver::TyKind;
+use hir_ty::next_solver::{AssocTyId, TraitAssocTyId, TyKind};
 use rustc_type_ir::{
     AliasTyKind,
     inherent::{GenericArgs as _, IntoKind as _},
@@ -337,10 +337,16 @@ struct Projection<'db> {
 impl<'db> Projection<'db> {
     fn of(cx: &Cx<'_, 'db>, alias: &hir::Type<'db>) -> Option<Self> {
         let TyKind::Alias(_, alias_ty) = alias.to_next_solver().kind() else { return None };
-        let AliasTyKind::Projection { def_id } = alias_ty.kind else { return None };
+        // A trait method's `impl Trait` is no named associated type: the goal reads as its bounds.
+        let AliasTyKind::Projection {
+            def_id: TraitAssocTyId(AssocTyId::TypeAliasId(assoc)),
+        } = alias_ty.kind
+        else {
+            return None;
+        };
         Some(Projection {
             trait_: alias.as_associated_type_parent_trait(cx.db)?,
-            assoc: hir::TypeAlias::from(def_id.0),
+            assoc: hir::TypeAlias::from(assoc),
             self_ty: alias.derived_from_next_solver(alias_ty.args.type_at(0)),
         })
     }

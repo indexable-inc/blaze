@@ -21,6 +21,8 @@ use std::{
     sync::Arc,
 };
 
+use blaze_mem::{Kept, Tag};
+
 use crate::deps::{Held, ImageBuf};
 
 /// The unit a slab is allocated in. Its alignment bounds the alignment of every element type a
@@ -31,7 +33,9 @@ struct Block([u8; 16]);
 
 const SLAB_ALIGN: usize = align_of::<Block>();
 
-type SlabBytes = Arc<[MaybeUninit<Block>]>;
+/// A slab is kept as long as its store, which a query keeps past any request and drops on its
+/// own: a [`Kept`] block, counted to the tag of the task that lowered it.
+type SlabBytes = Arc<[MaybeUninit<Block>], Kept>;
 
 /// What keeps the elements of a column that does not own them alone.
 #[derive(Clone)]
@@ -262,8 +266,8 @@ impl SlabWriter {
         if blocks == 0 {
             return SlabWriter { slab: None, base: ptr::null_mut(), room: 0, at: 0 };
         }
-        // alloc: the one allocation of a store's `Copy` columns
-        let mut slab: SlabBytes = Arc::new_uninit_slice(blocks);
+        // The one allocation of a store's `Copy` columns, kept with the store.
+        let mut slab: SlabBytes = Arc::new_uninit_slice_in(blocks, Kept::here(Tag::Nameres));
         let base = Arc::get_mut(&mut slab).expect("a new slab is unique").as_mut_ptr().cast::<u8>();
         SlabWriter { slab: Some(slab), base, room: blocks * SLAB_ALIGN, at: 0 }
     }

@@ -718,7 +718,7 @@ mod budget {
             ],
             ..Traced::default()
         };
-        index::keep(&mut store, &run, &traced, b"expansion".to_vec()).unwrap();
+        index::keep(&mut store, &run, &traced, b"expansion").unwrap();
         let passed = [("PATH".to_owned(), "/bin".to_owned())];
         let call: Env = [("CARGO_PKG_NAME".to_owned(), "a".to_owned())].into_iter().collect();
         let mut seen = Seen { passed: &passed, call: &call, made: None, none: inputs::Env::default() };
@@ -764,7 +764,7 @@ mod budget {
         assert_eq!(reads_in(&[], &call, &shape), Ok(reported));
 
         let run = RunKey { code: ContentId::of("blaze v2 test 1", b"reads"), given: ContentId::default() };
-        index::keep(&mut store, &run, &traced, b"expansion".to_vec()).unwrap();
+        index::keep(&mut store, &run, &traced, b"expansion").unwrap();
         let reader = store.reader();
         let guard = blaze_cas::enter();
         let mut seen = Seen { passed: &[], call: &call, made: None, none: inputs::Env::default() };

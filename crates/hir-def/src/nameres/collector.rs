@@ -1292,6 +1292,7 @@ impl<'db> DefCollector<'db> {
         macro_: MacroRulesId,
         export: bool,
     ) {
+        let name = super::def_site::def_binding_name(self.db, ModuleDefId::MacroId(macro_.into()), name);
         // Textual scoping
         self.define_legacy_macro(module_id, name, macro_.into());
 
@@ -1333,6 +1334,7 @@ impl<'db> DefCollector<'db> {
         macro_: Macro2Id,
         vis: &RawVisibility,
     ) {
+        let name = super::def_site::def_binding_name(self.db, ModuleDefId::MacroId(macro_.into()), name);
         let vis = self
             .def_map
             .resolve_visibility(
@@ -1395,7 +1397,7 @@ impl<'db> DefCollector<'db> {
             }
             None => {
                 for (name, it) in root_scope.macros() {
-                    let name: Name = *name;
+                    let name: Name = name.unkeyed();
                     self.def_map.macro_use_prelude.insert(name, (it.def, extern_crate));
                     self.imports.wake_env(name, MACROS);
                 }
@@ -2221,7 +2223,7 @@ impl<'db> DefCollector<'db> {
                         self.def_map.krate,
                         directive.depth,
                         self.def_map.recursion_limit(),
-                        |path| {
+                        |path, _ctxt| {
                             let def = resolver_def_id(path);
                             unresolved.set(unresolved.get() || def.is_none());
                             if let Some(def) = def
@@ -2808,7 +2810,7 @@ impl<'db> DefCollector<'db> {
                         self.def_map.krate,
                         directive.depth,
                         self.def_map.recursion_limit(),
-                        |path| {
+                        |path, _ctxt| {
                             let resolved_res = self.def_map.resolve_path_fp_with_macro(
                                 self.crate_local_def_map.unwrap_or(&self.local_def_map),
                                 self.db,
@@ -3077,9 +3079,11 @@ impl<'db> ModCollector<'_, 'db> {
         let update_def =
             |def_collector: &mut DefCollector<'_>, id, name: &Name, vis, value_ns_ctor_vis| {
                 def_collector.def_map.modules.building()[module_id].scope_mut().declare(id);
+                // A name a `macro` wrote binds a key of its own, as in the facts engine.
+                let name = super::def_site::def_binding_name(db, id, *name);
                 def_collector.update(
                     module_id,
-                    &[(Some(*name), PerNs::from_def(id, vis, value_ns_ctor_vis, None))],
+                    &[(Some(name), PerNs::from_def(id, vis, value_ns_ctor_vis, None))],
                     vis,
                     None,
                 )
@@ -3159,6 +3163,8 @@ impl<'db> ModCollector<'_, 'db> {
                         Some(ImportAlias::Underscore) => None,
                         None => Some(name),
                     };
+                    // Keyed in the module's scope and in the extern prelude (`facts::collect`).
+                    let name = name.map(|it| super::def_site::extern_crate_binding_name(db, id, *it));
 
                     if let Some(resolved) = resolved {
                         let vis = resolve_vis(def_map, local_def_map, &self.item_tree[*visibility]);
@@ -3169,7 +3175,7 @@ impl<'db> ModCollector<'_, 'db> {
                                 // rustc's `introduced_by_item`: renamed, or naming a crate the
                                 // dependencies do not put in the extern prelude.
                                 let from_deps = matches!(
-                                    self.def_collector.local_def_map.extern_prelude.get(name),
+                                    self.def_collector.local_def_map.extern_prelude.get(&name),
                                     Some((_, None))
                                 );
                                 if alias.is_none() && from_deps {
@@ -3178,8 +3184,8 @@ impl<'db> ModCollector<'_, 'db> {
                                 self.def_collector
                                     .local_def_map
                                     .extern_prelude
-                                    .insert(*name, (resolved, Some(id)));
-                                self.def_collector.imports.wake_env(*name, TYPES);
+                                    .insert(name, (resolved, Some(id)));
+                                self.def_collector.imports.wake_env(name, TYPES);
                             }
                             // they also allow `#[macro_use]`
                             if !is_self {
@@ -3194,7 +3200,7 @@ impl<'db> ModCollector<'_, 'db> {
                         self.def_collector.update(
                             module_id,
                             &[(
-                                name.cloned(),
+                                name,
                                 PerNs::types(
                                     resolved.into(),
                                     vis,
@@ -3206,7 +3212,7 @@ impl<'db> ModCollector<'_, 'db> {
                         );
                     } else {
                         if let Some(name) = name {
-                            self.def_collector.unresolved_extern_crates.insert(*name);
+                            self.def_collector.unresolved_extern_crates.insert(name);
                         }
                         self.def_collector.def_map.diagnostics.push(
                             DefDiagnostic::unresolved_extern_crate(
@@ -3568,6 +3574,7 @@ impl<'db> ModCollector<'_, 'db> {
         // A module's id is its parent and name, so a second `mod` of a name (E0428) declares
         // nothing: the first keeps the name, as in rustc's resolver (`facts::collect` too).
         let db = self.def_collector.db;
+        let name = super::def_site::module_binding_name(db, self.tree_id.file_id(), declaration, name);
         if self.def_collector.def_map.module(db, self.module_id).children(db).contains_key(&name) {
             return None;
         }
@@ -3879,7 +3886,7 @@ impl<'db> ModCollector<'_, 'db> {
             self.def_collector.def_map.krate,
             self.macro_depth + 1,
             self.def_collector.def_map.recursion_limit(),
-            |path| {
+            |path, _ctxt| {
                 let def = self.case_one_macro_def(path);
                 if let Some(def) = def
                     && path != &ast_id.path

@@ -541,6 +541,8 @@ mod tests {
         },
     };
 
+    use blaze_ids::rng::SplitMix64;
+
     /// A value that counts its drops.
     #[derive(Debug)]
     struct Counted {
@@ -581,17 +583,6 @@ mod tests {
         flags: Vec<bool>,
     }
 
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 % n
-        }
-    }
-
     fn lens_of(r: &Reference, counted: usize) -> TinyLens {
         TinyLens {
             bytes: r.bytes.len(),
@@ -609,13 +600,13 @@ mod tests {
 
     #[test]
     fn columns_read_back_what_was_written() {
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         let drops = Arc::new(AtomicUsize::new(0));
         let mut made = 0;
         for _ in 0..200 {
             let mut r = Reference::default();
             // Some columns empty between full ones, so every alignment step is crossed.
-            let len = |rng: &mut Rng| match rng.below(3) {
+            let len = |rng: &mut SplitMix64| match rng.below(3) {
                 0 => 0,
                 _ => rng.below(40) as usize,
             };

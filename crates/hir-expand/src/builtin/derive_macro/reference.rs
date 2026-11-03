@@ -66,7 +66,7 @@ impl VariantShape {
         })
     }
 
-    fn field_names(&self, span: Span) -> Vec<tt::Ident> {
+    fn field_names(&self) -> Vec<tt::Ident> {
         match self {
             VariantShape::Struct(s) => s.clone(),
             VariantShape::Tuple(spans) => tuple_field_iterator(spans).collect(),
@@ -110,18 +110,12 @@ impl VariantShape {
         tm: &ExpansionSpanMap,
         value: Option<FieldList>,
     ) -> Result<Self, ExpandError> {
-        // Where a field is written, in the derive's hygiene: what the expansion says of the
-        // field, as copying it out of a packed struct, is reported there, as rustc's is.
-        let at_field = |span: Span| Span { ctx: call_site.ctx, ..span };
         let r = match value {
             None => VariantShape::Unit,
             Some(FieldList::RecordFieldList(it)) => VariantShape::Struct(
                 it.fields()
                     .map(|it| it.name())
-                    .map(|it| {
-                        name_to_token(call_site, tm, it)
-                            .map(|it| super::field_name_in_derive(it, call_site))
-                    })
+                    .map(|it| name_to_token(call_site, tm, it))
                     .collect::<Result<_, _>>()?,
             ),
             Some(FieldList::TupleFieldList(it)) => VariantShape::Tuple(
@@ -130,7 +124,7 @@ impl VariantShape {
                         let at = field
                             .ty()
                             .map_or_else(|| field.syntax().clone(), |ty| ty.syntax().clone());
-                        at_field(tm.span_at(at.text_range().start()))
+                        tm.span_at(at.text_range().start())
                     })
                     .collect(),
             ),
@@ -158,13 +152,13 @@ impl AdtShape {
         )
     }
 
-    fn field_names(&self, span: Span) -> Vec<Vec<tt::Ident>> {
+    fn field_names(&self) -> Vec<Vec<tt::Ident>> {
         match self {
             AdtShape::Struct(s) => {
-                vec![s.field_names(span)]
+                vec![s.field_names()]
             }
             AdtShape::Enum { variants, .. } => {
-                variants.iter().map(|(_, fields)| fields.field_names(span)).collect()
+                variants.iter().map(|(_, fields)| fields.field_names()).collect()
             }
             AdtShape::Union => {
                 never!("using fields of union in derive is always wrong");
@@ -222,7 +216,7 @@ impl BasicAdtInfo {
         span: Span,
         arms: Vec<(tt::TopSubtree, tt::TopSubtree)>,
     ) -> tt::TopSubtree {
-        if let Some(lets) = self.packed_lets("self")
+        if let Some(lets) = self.packed_lets(span, "self")
             && arms.len() == 1
         {
             let (_, body) = arms.into_iter().next().unwrap();
@@ -237,7 +231,10 @@ impl BasicAdtInfo {
 
     /// For a packed struct, a `let` of each field of `base` (`self` or `other`) to a copy out
     /// of it, to the name the patterns of the other derives bind it to.
-    fn packed_lets(&self, base: &str) -> Option<Vec<tt::TopSubtree>> {
+    /// Written where the field is, in the derive's hygiene (`span`'s context), as
+    /// `write_packed_lets` does.
+    fn packed_lets(&self, span: Span, base: &str) -> Option<Vec<tt::TopSubtree>> {
+        let hygiene = |at: Span| Span { ctx: span.ctx, ..at };
         let AdtShape::Struct(shape) = &self.shape else { return None };
         if !self.packed {
             return None;
@@ -246,14 +243,14 @@ impl BasicAdtInfo {
             VariantShape::Struct(fields) => fields
                 .iter()
                 .map(|it| {
-                    let at = it.span;
+                    let at = hygiene(it.span);
                     (it.clone(), quote! {at => #it })
                 })
                 .collect(),
             VariantShape::Tuple(spans) => tuple_field_iterator(spans)
                 .enumerate()
                 .map(|(i, it)| {
-                    let at = it.span;
+                    let at = hygiene(it.span);
                     let index = quote! {at => #i };
                     (it, index)
                 })
@@ -261,8 +258,8 @@ impl BasicAdtInfo {
             VariantShape::Unit => vec![],
         };
         let lets = fields.into_iter().map(|(name, field)| {
-            let at = name.span;
-            let bound = tt::Ident::new(&format!("{}_{base}", name.sym), at);
+            let at = hygiene(name.span);
+            let bound = tt::Ident::new(&format!("{}_{base}", name.sym), name.span);
             let base = tt::Ident::new(base, at);
             quote! {at => let #bound = { #base . #field }; }
         });
@@ -278,7 +275,7 @@ impl BasicAdtInfo {
         fallback: tt::TopSubtree,
     ) -> tt::TopSubtree {
         if let (Some(lets), Some(other_lets)) =
-            (self.packed_lets("self"), self.packed_lets("other"))
+            (self.packed_lets(span, "self"), self.packed_lets(span, "other"))
             && arms.len() == 1
         {
             let (_, _, body) = arms.into_iter().next().unwrap();
@@ -931,7 +928,7 @@ pub(super) fn hash_expand(
             };
         }
         let arms =
-            adt.shape.as_pattern(span, &adt.name).into_iter().zip(adt.shape.field_names(span)).map(
+            adt.shape.as_pattern(span, &adt.name).into_iter().zip(adt.shape.field_names()).map(
                 |(pat, names)| {
                     let expr = {
                         let it = names.iter().map(|it| {
@@ -1028,7 +1025,7 @@ fn partial_eq_impl_expand(
             let discriminants =
                 matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1);
             let (self_patterns, other_patterns) = self_and_other_patterns(adt, name, span);
-            let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span));
+            let arms = izip!(self_patterns, other_patterns, adt.shape.field_names());
             let arms = arms.filter(|(_, _, names)| !discriminants || !names.is_empty());
             let arms: Vec<_> = arms.collect();
             if discriminants {
@@ -1140,7 +1137,7 @@ pub(super) fn ord_expand(
         // variant without fields is then equal.
         let discriminants =
             matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1);
-        let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span));
+        let arms = izip!(self_patterns, other_patterns, adt.shape.field_names());
         let arms = arms.filter(|(_, _, fields)| !discriminants || !fields.is_empty()).map(
             |(pat1, pat2, fields)| {
                 let mut body = quote!(span =>#krate::cmp::Ordering::Equal);
@@ -1207,7 +1204,7 @@ pub(super) fn partial_ord_expand(
             // variant without fields is then equal. A struct compares its fields alone.
             let discriminants =
                 matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1);
-            let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span));
+            let arms = izip!(self_patterns, other_patterns, adt.shape.field_names());
             let arms = arms.filter(|(_, _, fields)| !discriminants || !fields.is_empty()).map(
                 |(pat1, pat2, fields)| {
                     let mut body =

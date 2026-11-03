@@ -258,6 +258,7 @@ impl super::HirFrontend<'_> {
             unit: InstanceKey(blaze_ids::ContentId::default()),
             item: blaze_items::ItemKey(blaze_ids::ContentId::default()),
             what,
+            front: None,
         };
         self.with(|db| reported(db, &self.hashes, built, reports)).map_err(error)
     }

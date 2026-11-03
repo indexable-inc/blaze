@@ -49,7 +49,7 @@ fn code(db: &TestDB, name: &str) -> CodeHash {
 #[track_caller]
 fn ty(db: &TestDB, name: &str) -> ContentId {
     let alias = alias(db, name);
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let ty = db.ty(TyDefId::TypeAliasId(alias)).skip_binder();
         hashes().ty(db, ty).unwrap_or_else(|e| panic!("the type `{name}`: {e}"))
     })
@@ -254,7 +254,7 @@ fn a_constant_is_its_value() {
     let krate = fixture::test_crate(&db);
     let h = hashes();
     let konst = |value: u128| {
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             h.konst(&db, usize_const(&db, Some(value), krate)).unwrap_or_else(|e| panic!("{e}"))
         })
     };

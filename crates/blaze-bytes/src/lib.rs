@@ -1,7 +1,8 @@
 //! A file's bytes and its text, held without a copy (docs/v2/plan/design/frontend.md item 6,
 //! docs/v2/plan/design/restore.md, docs/v2/plan/lanes/frontend/text.md). [`Bytes`] are a heap
-//! `Arc<[u8]>`, a range of something that keeps them in place (the daemon's mapped image), or a
-//! `'static` slice; a [`Text`] is [`Bytes`] checked to be UTF-8 once ([`text_of`]) and lent as
+//! `Arc<[u8]>`, an `Arc<[u8]>` in [`blaze_mem::Kept`] (a fetched source's files: [`Bytes::kept`]),
+//! a range of something that keeps them in place (the daemon's mapped image), or a `'static`
+//! slice; a [`Text`] is [`Bytes`] checked to be UTF-8 once ([`text_of`]) and lent as
 //! `&str`. Cloning either takes one count, never a copy. They sit below the parse tree, so a
 //! file's bytes in the VFS, its text in the database and the source of its tree are one
 //! allocation, or one range of the image, from the disk to the parse.
@@ -16,7 +17,11 @@
 //! its deref is the slice, one load of a pointer and a length. The check is std's, after the
 //! ASCII the bytes start with is skipped 64 bytes at a time.
 
+#![feature(allocator_api)]
+
 use std::{borrow::Borrow, fmt, hash, ops::Deref, str::Utf8Error, sync::Arc};
+
+use blaze_mem::{Kept, Tag};
 
 pub mod le;
 #[cfg(test)]
@@ -39,6 +44,8 @@ pub struct Bytes {
 #[derive(Clone)]
 enum Owner {
     Heap(Arc<[u8]>),
+    /// Bytes kept past any request in their tag's blocks, the count beside them.
+    Kept(#[allow(dead_code)] Arc<[u8], Kept>),
     // dyn: the owner of an image's range, named by the crate that maps it; only ever dropped
     Held(#[allow(dead_code)] Arc<dyn Send + Sync>),
     Static,
@@ -61,6 +68,35 @@ impl Bytes {
         Bytes { bytes, owner: Owner::Held(owner) }
     }
 
+    /// `len` bytes that `write` fills (they start zero), in one [`Kept`] block of `tag` with
+    /// their count: bytes kept past any request that die on their own, as a fetched source's
+    /// files do with the VFS tree that holds them. `write`'s error is returned, and the block
+    /// freed, when it fails.
+    pub fn kept<E>(tag: Tag, len: usize, write: impl FnOnce(&mut [u8]) -> Result<(), E>) -> Result<Bytes, E> {
+        let mut made = Arc::<[u8], Kept>::new_zeroed_slice_in(len, Kept(tag));
+        let place = Arc::get_mut(&mut made).expect("a new `Arc` is its only count");
+        // SAFETY: the slice was made zeroed, and zero is a `u8`; no other count can read it
+        // while it is lent here (`get_mut`).
+        write(unsafe { &mut *(place as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) })?;
+        // SAFETY: as above, every byte is initialized: zeroed, then written by `write`.
+        let shared = unsafe { made.assume_init() };
+        let bytes: *const [u8] = &*shared;
+        // SAFETY: an `Arc`'s allocation never moves and is not written while it is shared (it is
+        // never lent mutably again); this value holds a count of it for as long as it lends it.
+        let bytes = unsafe { &*bytes };
+        Ok(Bytes { bytes, owner: Owner::Kept(shared) })
+    }
+
+    /// A copy of `bytes` kept in `tag`'s blocks ([`Bytes::kept`]).
+    pub fn copy_kept(tag: Tag, bytes: &[u8]) -> Bytes {
+        match Bytes::kept(tag, bytes.len(), |place| {
+            place.copy_from_slice(bytes);
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(made) => made,
+        }
+    }
+
     /// `bytes`, which live as long as the program.
     pub const fn from_static(bytes: &'static [u8]) -> Bytes {
         Bytes { bytes, owner: Owner::Static }
@@ -71,7 +107,7 @@ impl Bytes {
     pub fn shared(&self) -> Option<&Arc<[u8]>> {
         match &self.owner {
             Owner::Heap(shared) => Some(shared),
-            Owner::Held(_) | Owner::Static => None,
+            Owner::Kept(_) | Owner::Held(_) | Owner::Static => None,
         }
     }
 
@@ -136,6 +172,7 @@ impl fmt::Debug for Bytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self.owner {
             Owner::Heap(_) => "heap",
+            Owner::Kept(_) => "kept",
             Owner::Held(_) => "held",
             Owner::Static => "static",
         };
@@ -159,6 +196,13 @@ pub fn text_of(bytes: Bytes) -> Result<Text, Utf8Error> {
 }
 
 impl Text {
+    /// A copy of `text` kept in `tag`'s blocks ([`Bytes::copy_kept`]): text that outlives any
+    /// request and dies on its own, as a syntax tree's source does with the tree.
+    pub fn copy_kept(tag: Tag, text: &str) -> Text {
+        // A copy of a `str`'s bytes is UTF-8.
+        Text { bytes: Bytes::copy_kept(tag, text.as_bytes()) }
+    }
+
     /// `text`, which lives as long as the program.
     pub const fn from_static(text: &'static str) -> Text {
         Text { bytes: Bytes::from_static(text.as_bytes()) }

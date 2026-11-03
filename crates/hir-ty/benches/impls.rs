@@ -89,7 +89,7 @@ fn every_crate(db: &Db, krate: Crate, trait_: TraitId, self_ty: &SimplifiedType<
 /// A database with the fixture's def maps and loaded crates read, which both walks need.
 fn ready() -> Db {
     let db = fixture::db(&fixture()).into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (main, asks) = asks(&db);
         std::hint::black_box((loaded_crates(&db, main).len(), asks.len()));
     });
@@ -98,7 +98,7 @@ fn ready() -> Db {
 
 fn main() {
     let db = ready();
-    let (old, old_found) = hir_ty::attach_db(&db, || {
+    let (old, old_found) = blaze_query::db::attach(&db, || {
         let (main, asks) = asks(&db);
         let started = Instant::now();
         let found: usize = asks.iter().map(|(trait_, ty)| every_crate(&db, main, *trait_, ty)).sum();
@@ -106,7 +106,7 @@ fn main() {
     });
 
     let mut db = ready();
-    let (new, new_found, count) = hir_ty::attach_db(&db, || {
+    let (new, new_found, count) = blaze_query::db::attach(&db, || {
         let (main, asks) = asks(&db);
         let started = Instant::now();
         let found: usize = asks
@@ -118,7 +118,7 @@ fn main() {
     assert_eq!(new_found, old_found, "both walks find the same impls");
 
     db.storage_mut().synthetic_write(Durability::LOW);
-    let warm = hir_ty::attach_db(&db, || {
+    let warm = blaze_query::db::attach(&db, || {
         let (main, asks) = asks(&db);
         let started = Instant::now();
         let found: usize = asks

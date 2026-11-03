@@ -44,7 +44,7 @@ fn function(db: &Db, name: &str) -> FunctionId {
 #[test]
 fn arms_of_a_projection_type_find_their_lub() {
     let db = fixture::db(FIXTURE).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = DefWithBodyId::FunctionId(function(&db, "f"));
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
         assert!(infer.diagnostics().is_empty(), "{:?}", infer.diagnostics());

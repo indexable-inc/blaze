@@ -610,16 +610,16 @@ impl Db {
         f: impl FnOnce(&mut Db) -> R,
     ) -> R {
         self.write(write, |db| {
-            let before = db.files().entry_content(&*db, file);
+            let before = db.files().file_content(&*db, file);
             let aliases = db.files().aliases_of(file);
             let mut was: SmallVec<[ContentId; 2]> = SmallVec::new();
-            was.extend(aliases.iter().map(|&alias| db.files().entry_content(&*db, alias)));
+            was.extend(aliases.iter().map(|&alias| db.files().file_content(&*db, alias)));
             let result = f(db);
-            if db.files().entry_content(&*db, file) != before {
+            if db.files().file_content(&*db, file) != before {
                 db.note(Note::Set(file));
             }
             for (&alias, was) in aliases.iter().zip(was) {
-                if db.files().entry_content(&*db, alias) != was {
+                if db.files().file_content(&*db, alias) != was {
                     db.note(Note::Set(alias));
                 }
             }

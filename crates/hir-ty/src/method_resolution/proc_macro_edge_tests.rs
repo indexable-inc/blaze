@@ -60,7 +60,7 @@ fn called_in(db: &Db, krate: Crate, name: &str) -> Vec<Option<Crate>> {
         })
         .unwrap_or_else(|| panic!("no function `{name}`"));
     let def = DefWithBodyId::FunctionId(func);
-    crate::next_solver::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let body = Body::of(db, def);
         let infer = InferenceResult::of(db, InferBodyId::DefWithBodyId(def));
         body.exprs()

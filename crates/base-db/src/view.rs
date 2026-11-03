@@ -29,7 +29,7 @@ use triomphe::Arc;
 use crate::{AbsPath, AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
 
 use crate::{
-    Db, FileText, Files, FxIndexMap, SourceRoot, SourceRootId, content,
+    Db, FileText, Files, FxIndexMap, IncludedFile, SourceRoot, SourceRootId, content,
     files::{RootContent, Roots, Writer, index_file},
 };
 
@@ -70,7 +70,7 @@ pub struct ViewChange {
     /// Files under the view's base taken out of their source root: the view has them no more.
     pub removed: Vec<FileId>,
     /// Of the files set or added, those whose bytes are not UTF-8: they have no text
-    /// ([`Db::has_file_text`] is false).
+    /// ([`Db::has_file_text`] is false), and their bytes are [`Db::raw_file`].
     pub no_text: Vec<FileId>,
     /// Source roots whose files were added or removed: a crate root may have come or gone.
     pub roots: Vec<SourceRootId>,
@@ -239,7 +239,8 @@ impl Files {
     /// whose blaze-vfs ID is the one it was last set from is not read again (nor its bytes
     /// checked), one whose text is what it has is not written, so setting a view twice writes
     /// nothing. Files under `view.base` that the view lacks are taken out of their source
-    /// root. Bytes that are not UTF-8 are a file with no text. Every file's ID is checked
+    /// root. Bytes that are not UTF-8 are a file with no text whose bytes are kept as its input
+    /// ([`Files::raw_file`]), hashed again only when they change. Every file's ID is checked
     /// against its bytes before anything is written, and a mismatch refuses the whole view.
     pub fn set_view_root(
         &self,
@@ -404,20 +405,20 @@ impl Files {
 
         let mut changed_roots = Roots::new();
         for (write, text) in plan.writes.iter().zip(texts) {
+            let read = &view.files[write.at].bytes;
             let content = match text {
                 Some(_) => contents.next().expect("a text ID for each file with text"),
                 None => {
                     no_text.push(write.id);
-                    FileText::no_text()
+                    IncludedFile::content_of(Ok(&read[..]))
                 }
             };
             if write.added {
                 added.push(write.id);
             }
-            let unchanged = match (&text, self.text_input(write.id)) {
-                (Some(_), Some(input)) => input.content(&*db) == content,
-                (None, None) => true,
-                (Some(_), None) | (None, Some(_)) => false,
+            let unchanged = match &text {
+                Some(_) => self.text_input(write.id).is_some_and(|input| input.content(&*db) == content),
+                None => self.raw_file(write.id).is_some_and(|input| input.content(&*db) == content),
             };
             if unchanged {
                 continue;
@@ -431,13 +432,10 @@ impl Files {
             let file = view.files[write.at].id;
             let text_of = text.as_ref().map(|text| (text, file));
             self.write_aliases(writer, db, write.id, text_of, Some(durability), |alias| set.push(alias));
-            let content = self.write_text(
-                writer,
-                db,
-                write.id,
-                text.map(|text| (text, file, content)),
-                Some(durability),
-            );
+            let content = match text {
+                Some(text) => self.write_text(writer, db, write.id, Some((text, file, content)), Some(durability)),
+                None => self.write_bytes(writer, db, write.id, read, Some(durability)),
+            };
             index_file(writer, write.id, content, &mut changed_roots);
             if !write.added {
                 set.push(write.id);
@@ -547,7 +545,7 @@ impl Files {
                     continue;
                 }
                 let (key, path) = keys[at].take().expect("an added file is put in one root");
-                index.insert(*id, key, path, self.entry_content(&*db, *id));
+                index.insert(*id, key, path, self.file_content(&*db, *id));
             }
             for &id in &gone {
                 if let Some(roots) = writer.in_roots.get_mut(id) {

@@ -821,7 +821,7 @@ fn vtables_whose_types_differ_in_lifetimes_only_are_one() {
     let (db, frontend) = frontend(VTABLES_APART_IN_LIFETIMES);
     let root = frontend.root(function(&db, "root"));
     frontend.with(|db| {
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let facts = super::facts(db, &root, Walking::plain(false))
                 .unwrap_or_else(|e| panic!("{e}"))
                 .expect("the root's facts");
@@ -861,7 +861,7 @@ fn vtables_whose_types_differ_in_binder_names_only_are_one() {
     let (db, frontend) = frontend(VTABLES_APART_IN_BINDERS);
     let root = frontend.root(function(&db, "root"));
     frontend.with(|db| {
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let facts = super::facts(db, &root, Walking::plain(false))
                 .unwrap_or_else(|e| panic!("{e}"))
                 .expect("the root's facts");

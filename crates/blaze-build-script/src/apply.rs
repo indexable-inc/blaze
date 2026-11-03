@@ -186,12 +186,12 @@ where
 {
     if !memo.contains_key(&unit) {
         let node = graph(&unit);
-        fill(unit, node, graph, memo);
+        fill(unit, &node, graph, memo);
     }
     &memo[&unit]
 }
 
-fn fill<U, R, G>(unit: U, node: GraphUnit<U, R>, graph: &G, memo: &mut HashMap<U, BuildScripts<R>, Global>)
+fn fill<U, R, G>(unit: U, node: &GraphUnit<U, R>, graph: &G, memo: &mut HashMap<U, BuildScripts<R>, Global>)
 where
     U: Copy + Eq + Hash,
     R: Copy + Eq + Hash + Ord,
@@ -212,7 +212,7 @@ where
             continue;
         }
         if !memo.contains_key(&dep) {
-            fill(dep, dep_node, graph, memo);
+            fill(dep, &dep_node, graph, memo);
         }
         let of_dep = &memo[&dep];
         if for_host {

@@ -232,7 +232,7 @@ impl Compiler {
             hir_def::nameres::crate_def_map(db, krate);
         }
         let resolved = start.elapsed();
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             for &krate in crates.iter().filter(|it| it.data(db).origin.is_local()) {
                 for function in functions_of(db, krate.into()) {
                     hir_ty::InferenceResult::of(db, hir_def::DefWithBodyId::from(function));
@@ -338,7 +338,11 @@ impl Compiler {
             .copied()
             .find(|it| it.data(db).root_file_id == main)
             .ok_or_else(|| format!("no crate starts at {MAIN}"))?;
-        let package = app.extra_data(db).display_name.as_ref().map_or_else(|| "app".to_owned(), |it| it.to_string());
+        let package = app
+            .rust_name(db)
+            .map_err(|unnamed| format!("the crate at {MAIN} is {unnamed}, with no name for its package"))?
+            .as_str()
+            .to_owned();
         let paths: HashMap<FileId, String> = self.files.iter().map(|(path, &id)| (id, path.clone())).collect();
         let names = move |file: FileId| paths.get(&file).cloned();
         let frontend = HirFrontend::new(

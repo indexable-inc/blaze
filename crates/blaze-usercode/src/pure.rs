@@ -131,7 +131,7 @@ pub fn retract(
     let Some(what) = crate::run::differs_with_stderr(&hit.value, ran) else { return Ok(None) };
     let record = verify::retraction(&run_key(proof, &roots), &unmarked);
     let mut tickets = Vec::new(); // alloc: the record's tickets, once per retraction
-    match index::keep_into(store, blaze_cas::Unit::SHARED, &record.run, &record.traced, record.value, &mut tickets) {
+    match index::keep_into(store, blaze_cas::Unit::SHARED, &record.run, &record.traced, &record.value, &mut tickets) {
         Ok(()) => Ok(Some((what, tickets))),
         Err(error) => {
             let retracted = tickets.first().copied();

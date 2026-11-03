@@ -25,29 +25,12 @@ const HOPS: usize = 1 << 23;
 /// Walks per read a huge mode may have: the bound (0) within 10% of a read.
 const TARGET_WALKS: f64 = 0.1;
 
-/// splitmix64, for the cycle: the same on every run.
-struct SplitMix64(u64);
-
-impl SplitMix64 {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        ((u128::from(self.next()) * n as u128) >> 64) as usize
-    }
-}
-
 /// One cycle through every line (Sattolo's shuffle): line `i` holds the line read after it.
 fn cycle() -> Vec<u32> {
     let mut next: Vec<u32> = (0..LINES as u32).collect();
-    let mut rng = SplitMix64(0x6875_6765);
+    let mut rng = blaze_rng::SplitMix64::new(0x6875_6765);
     for i in (1..LINES).rev() {
-        next.swap(i, rng.below(i));
+        next.swap(i, rng.index(i));
     }
     next
 }

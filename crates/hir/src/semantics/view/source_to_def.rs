@@ -570,8 +570,10 @@ impl<'db> ViewCtx<'db, '_> {
     #[cold]
     fn block_declared_module(&mut self, krate: Option<base_db::Crate>, file: FileId) -> Option<ModuleId> {
         let db = self.db();
-        let relevant = base_db::relevant_crates(db, file);
-        let crates = krate.into_iter().chain(relevant.iter().copied().filter(|_| krate.is_none()));
+        let crates = match krate {
+            Some(krate) => smallvec::smallvec![krate],
+            None => self.s2d.crates_of(file),
+        };
         for krate in crates {
             let def_map = hir_def::nameres::crate_def_map(db, krate);
             let files = def_map.modules(db).filter_map(|(_, data)| data.origin.file_id());

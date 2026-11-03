@@ -108,25 +108,20 @@ fn stored(fixture: &str) -> (Memory, Stored) {
 }
 
 fn names(db: &TestDB, crates: &[Crate]) -> Vec<String> {
-    let mut names: Vec<String> = crates.iter().map(|&it| serve::crate_name(db, it)).collect();
+    let mut names: Vec<String> = crates.iter().map(|&it| it.named(db).to_string()).collect();
     names.sort();
     names
 }
 
-/// hir-ty's two `crate_name`s before they called this one (blaze-diagnostics' was this one's
-/// copy). They named a crate with no display name by its ID, not its root file.
-fn crate_name_reference(db: &Db, krate: Crate) -> String {
-    match &krate.extra_data(db).display_name {
-        Some(name) => name.to_string(),
-        None => format!("{krate:?}"),
-    }
-}
-
 #[test]
-fn a_crate_is_named_in_an_error_as_every_old_copy_named_it() {
+fn a_crate_is_named_in_an_error_by_its_rust_name() {
     let db = fixture::db(FIXTURE).into_db();
     for krate in all(&db) {
-        assert_eq!(crate_name(&db, krate), crate_name_reference(&db, krate));
+        let named = krate.named(&db).to_string();
+        match &krate.extra_data(&db).display_name {
+            Some(name) => assert_eq!(named, name.crate_name().as_str()),
+            None => assert!(named.starts_with("{unnamed crate "), "{named}"),
+        }
     }
 }
 
@@ -266,14 +261,14 @@ fn a_stored_image_is_served_under_the_key_store_filed_it_by() {
         let filed: HashMap<String, ContentId, Global> = stored
             .filed
             .iter()
-            .map(|(&krate, &key)| (serve::crate_name(&db, krate), key))
+            .map(|(&krate, &key)| (krate.named(&db).to_string(), key))
             .collect();
         let mut db = open();
         let crates = all(&db);
         serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
         let raw: &Db = &db;
         for (krate, image) in DepImages::try_get(raw).unwrap().images(raw).iter() {
-            assert_eq!(Some(&image.key()), filed.get(&serve::crate_name(raw, *krate)));
+            assert_eq!(Some(&image.key()), filed.get(&krate.named(raw).to_string()));
         }
         assert!(filed.contains_key("lib"), "{filed:?}");
     }
@@ -530,6 +525,47 @@ fn a_changed_read_misses_the_image_and_the_next_one_is_found() {
     let mut db = reading_db();
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
     assert!(served.hits.contains(&crate_named(&db, "lib")));
+    VALUE.store(0, SeqCst);
+}
+
+/// [`READING`]'s attribute at assoc-item position alone: on a method of an impl, where no
+/// signature's store names the call.
+const READING_IN_IMPL: &str = r#"
+//- proc_macros: reading
+//- /lib.rs crate:lib new_source_root:library
+pub struct S;
+impl S { #[proc_macros::reading] pub fn m() {} }
+"#;
+
+/// A proc macro among an impl's items makes an item the image holds, so what it read files
+/// the image: once that value is another, the image is not served though the crate's key is
+/// the same (rule 18).
+#[test]
+fn a_read_of_a_proc_macro_among_an_impls_items_files_the_image() {
+    let _turn = TURN.lock();
+    VALUE.store(0, SeqCst);
+    let memory = Memory::default();
+    let serve_lib = || {
+        let mut db = reading_db_of(READING_IN_IMPL);
+        let crates = all(&db);
+        let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+        let lib = crate_named(&db, "lib");
+        (db, served, lib)
+    };
+    let fresh = reading_db_of(READING_IN_IMPL);
+    let reads = Reads::of(&fresh, crate_named(&fresh, "lib"), &[]).unwrap();
+    assert_eq!(reads, Reads::for_tests(&[], &[(SHAPE, values_of(SHAPE))]), "the impl's call is read");
+
+    let (db, served, lib) = serve_lib();
+    let stored = store(&db, &served, &memory).unwrap();
+    assert!(stored.written.contains(&lib), "{stored:?}");
+    let (_db, served, lib) = serve_lib();
+    assert!(served.hits.contains(&lib));
+
+    VALUE.store(1, SeqCst);
+    let (_db, served, lib) = serve_lib();
+    assert!(!served.hits.contains(&lib), "served with what the impl's expansion made before");
+    assert!(served.stale.contains(&lib));
     VALUE.store(0, SeqCst);
 }
 
@@ -1297,6 +1333,108 @@ blob
             if what.contains("`include_bytes!`")
                 && what.contains("/registry/lib/src/lib.rs:3")
                 && what.contains("/registry/other/blob.txt")),
+        "{:?}",
+        stored.refused
+    );
+}
+
+/// A dependency whose signature holds what `include_bytes!` reads of a file of its own source
+/// root that is not UTF-8 (`blob.bin`, set by [`binary_db`]).
+const BINARY: &str = r#"
+//- /registry/lib/src/lib.rs crate:lib new_source_root:library
+#[rustc_builtin_macro]
+macro_rules! include_bytes { () => {} }
+pub struct Blob(pub [u8; include_bytes!("blob.bin").len()]);
+"#;
+
+/// [`BINARY`] with `blob.bin`'s bytes `blob`, set as a checkout's loader sets them.
+fn binary_db(blob: &[u8]) -> TestDB {
+    assert!(std::str::from_utf8(blob).is_err(), "premise: the file has no text");
+    let mut db = fixture::db(BINARY).into_db();
+    fixture::set_bytes(&mut db, "/registry/lib/src/blob.bin", blob);
+    db
+}
+
+/// An edit of a file that is not UTF-8 gives its crate another key, as an edit of a source
+/// file does: the bytes `include_bytes!` reads are the ones the key hashes, those the loader
+/// gave the file, never another read of the disk (the fixture's path is on no disk).
+#[test]
+fn an_edit_of_a_file_that_is_not_utf8_gives_a_new_key() {
+    let _turn = TURN.lock();
+    let key_in = |db: &TestDB| {
+        let lib = crate_named(db, "lib");
+        keys(db, &[lib], BUILD)[&lib]
+    };
+    let (before, after): (&[u8], &[u8]) = (&[0xff, 0xfe], &[0xff, 0xfe, 0xfd]);
+    let mut db = binary_db(before);
+    let lib = crate_named(&db, "lib");
+    let key = key_in(&db);
+    let signature = signatures::encode(&db, lib, &mut Vec::new()).unwrap();
+    assert_eq!(key_in(&binary_db(before)), key, "the same bytes, the same key");
+
+    fixture::set_bytes(&mut db, "/registry/lib/src/blob.bin", after);
+    assert_ne!(key_in(&db), key, "an edit of the bytes moves the key");
+    assert_ne!(
+        signatures::encode(&db, lib, &mut Vec::new()).unwrap(),
+        signature,
+        "`include_bytes!` reads the new bytes"
+    );
+    assert_eq!(key_in(&db), key_in(&binary_db(after)));
+    let memory = Memory::default();
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    let stored = store(&db, &served, &memory).unwrap();
+    assert_eq!(stored.refused, Vec::new(), "a file of its own source root is no outside read");
+    assert_eq!(stored.written, vec![lib]);
+}
+
+/// Making a crate's key reads its files and writes nothing (rule 22): what the caches that hash
+/// the files read outside the VFS hold (`blaze-items`' crate facts and a kept proc-macro
+/// expansion's tracked reads, both made from `Files::included_by` and `included_files`) is
+/// the same whether the key was made before or after the crate's expansions, and the bytes
+/// of a file of the VFS are no such file.
+#[test]
+fn a_key_made_before_or_after_the_expansions_leaves_the_same_reads() {
+    let _turn = TURN.lock();
+    let blob: &[u8] = &[0xff, 0xfe];
+    let in_order = |key_first: bool| {
+        let db = binary_db(blob);
+        let lib = crate_named(&db, "lib");
+        let key = || keys(&db, &[lib], BUILD)[&lib];
+        let signature = || signatures::encode(&db, lib, &mut Vec::new()).unwrap();
+        let (key, signature) = match key_first {
+            true => (key(), signature()),
+            false => {
+                let signature = signature();
+                (key(), signature)
+            }
+        };
+        let files = db.files();
+        (key, signature, files.included_by(&db, lib), files.included_files(), files.sources_included_by())
+    };
+    let key_first = in_order(true);
+    assert_eq!(key_first, in_order(false));
+    assert_eq!((&key_first.2, &key_first.3), (&Vec::new(), &Vec::new()), "nothing was read from outside the VFS");
+}
+
+/// A `mod` whose file is not there (rustc's E0583) is refused an image, the refusal naming the
+/// module, where it is declared and the files looked for: the key covers the files that are,
+/// so it would not move once that file appears.
+#[test]
+fn a_module_whose_file_is_not_there_is_refused_an_image() {
+    let _turn = TURN.lock();
+    const MISSING: &str = r#"
+//- /registry/lib/src/lib.rs crate:lib new_source_root:library
+pub struct S;
+pub mod inner { pub mod gone; }
+"#;
+    let (_, stored) = stored(MISSING);
+    assert_eq!(stored.written, Vec::new());
+    assert!(
+        matches!(&stored.refused[..], [(_, Refused::ModuleFileMissing { what })]
+            if what.contains("module `crate::inner::gone` of crate lib")
+                && what.contains("/registry/lib/src/lib.rs:2")
+                && what.contains("inner/gone.rs, inner/gone/mod.rs")),
         "{:?}",
         stored.refused
     );

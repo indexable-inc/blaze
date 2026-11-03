@@ -152,7 +152,7 @@ fn work_out(job: &Job, reader: &UnitReader, compile: usize) -> Result<Purity, Ap
         // The walk from `main` over every instance it reaches: the part of the span above
         // that is not the store's lookups below.
         let span = tracing::info_span!(target: "blaze", "build script proof", steps = tracing::field::Empty).entered();
-        let proof = blaze_query::db::with_fuel(PROOF_FUEL, || hir_ty::attach_db(db, || hir_ty_pure::script_purity(db, main)));
+        let proof = blaze_query::db::with_fuel(PROOF_FUEL, || blaze_query::db::attach(db, || hir_ty_pure::script_purity(db, main)));
         let proof = proof.map(|(purity, steps)| {
             span.record("steps", steps);
             purity

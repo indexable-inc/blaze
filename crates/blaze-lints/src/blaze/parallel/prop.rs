@@ -11,6 +11,7 @@
 //! blaze reads as a carried value though any order gives the same; and a write of `out`
 //! another write overwrites, whose read is dead. Both are misses the notes name.
 
+use blaze_ids::rng::SplitMix64;
 use hegel::generators::{self as gs, Generator as _};
 use hegel::TestCase;
 
@@ -157,9 +158,9 @@ impl Body {
     }
 
     /// Whether every order sampled gives what the order written gives, over inputs sampled
-    /// from `seed`.
+    /// from `seed`, which Hegel shrinks.
     fn order_free(&self, seed: u64) -> bool {
-        let mut rng = Rng(seed | 1);
+        let mut rng = SplitMix64::new(seed);
         let written: Vec<usize> = (0..N).collect();
         for _ in 0..16 {
             let xs: [u64; N] = std::array::from_fn(|_| rng.below(16));
@@ -167,9 +168,7 @@ impl Body {
             let expected = self.run(&xs, out, &written);
             for _ in 0..16 {
                 let mut order = written.clone();
-                for at in (1..N).rev() {
-                    order.swap(at, rng.below(at as u64 + 1) as usize);
-                }
+                rng.shuffle(&mut order);
                 if self.run(&xs, out, &order) != expected {
                     return false;
                 }
@@ -184,18 +183,6 @@ impl Body {
         let fixture = format!("{MINICORE}{STD}{MAIN}{main}");
         let out = lint_with(&fixture, FLAGS, conf("parallel-threshold = 1\n"));
         found(&out).contains(&(at, "parallelizable"))
-    }
-}
-
-/// xorshift64: inputs and orders from a seed Hegel shrinks.
-struct Rng(u64);
-
-impl Rng {
-    fn below(&mut self, bound: u64) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0 % bound
     }
 }
 

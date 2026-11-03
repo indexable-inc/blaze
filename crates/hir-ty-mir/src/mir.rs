@@ -19,6 +19,7 @@ pub(crate) use hir_ty::{
 pub mod budget;
 pub mod checks;
 pub mod const_check;
+mod ctfe_limit;
 pub mod dispatch;
 mod eval;
 pub mod home;
@@ -83,7 +84,6 @@ pub use lower::{
 pub use monomorphization::monomorphized;
 pub use monomorphization::{monomorphized_args, monomorphized_const, monomorphized_ty};
 pub use monomorphization::monomorphized_promoted_mir_body_query;
-pub use monomorphization::opaque_of_impl;
 pub use monomorphization::erase_and_anonymize_regions;
 pub use monomorphization::normalize_or_keep;
 pub use optimize::{

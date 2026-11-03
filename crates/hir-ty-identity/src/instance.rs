@@ -235,7 +235,7 @@ pub fn instance_identity<'db>(
     env: &StoredParamEnvAndCrate,
     compiled: Compiled,
 ) -> &'db Result<CompileIdentity, Unshared> {
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         // Free regions erased, bound ones kept, as every callee's key is
         // (`Walk::instance_callee`): two instances equal but for their regions are one key, and
         // a call of the instance itself is `CALLEE_SELF` whatever regions it was asked with.
@@ -1650,5 +1650,5 @@ fn no_promoted_mir<E: std::fmt::Debug>(db: &Db, owner: InferBodyId<'_>, expr: Ex
         InferBodyId::AnonConstId(_) => "an anonymous constant".to_owned(), // alloc: error path
     };
     // alloc: error path
-    Unshared::NoMir(hir_ty::attach_db(db, || format!("the promoted constant {expr:?} of {owner} has no MIR: {error:?}")))
+    Unshared::NoMir(blaze_query::db::attach(db, || format!("the promoted constant {expr:?} of {owner} has no MIR: {error:?}")))
 }

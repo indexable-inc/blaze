@@ -20,7 +20,7 @@ pub fn wasm_macro(unit: &Unit, plan: &UnitPlan) -> bool {
 }
 
 /// What a crate's root is to be: the file on disk, then `after`, the module named `module`.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Appended {
     pub after: String,
     pub module: &'static str,

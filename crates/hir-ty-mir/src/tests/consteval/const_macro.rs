@@ -106,7 +106,7 @@ const GOAL: usize = <Point as Named>::LEN;
 "
     );
     let (db, file_id, root) = load(&fixture, "Named");
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (krate, func) = expander_of(root, "Named").function(&db).expect("the macro's function");
         let input = crate::mir::MacroArg::Str("pub struct Point { x : i32 , y : i32 }");
         let output = crate::mir::call_const_macro(&db, func, &[input]).unwrap_or_else(|e| {
@@ -217,7 +217,7 @@ pub struct Point;
 ",
     );
     let (db, _, _) = load(&fixture, "Fields");
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let main = *base_db::all_crates(&db).last().expect("the main crate");
         let derives = derives(&db, main);
         assert!(
@@ -256,7 +256,7 @@ fn load(fixture: &str, name: &str) -> (TestDB, EditionedFileId, span::FileId) {
 /// `GOAL` of the last file of `fixture`, whose macro crate has the derive `name`.
 fn goal(fixture: &str, name: &str) -> Vec<u8> {
     let (db, file_id, _) = load(fixture, name);
-    crate::attach_db(&db, || match eval_goal(&db, file_id) {
+    blaze_query::db::attach(&db, || match eval_goal(&db, file_id) {
         Ok(goal) => goal.memory.to_vec(),
         Err(e) => {
             let main = *base_db::all_crates(&db).last().expect("the main crate");

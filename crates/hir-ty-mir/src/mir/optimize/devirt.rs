@@ -342,7 +342,7 @@ fn plan<'db>(
             }
             (seen, Some((unseen, why))) if seen.is_empty() => keep(format!(
                 "the body's crate {} can't name the method of {} for {:?}: {}",
-                hir_def::deps::crate_name(ctx.db, ctx.krate()),
+                ctx.krate().named(ctx.db),
                 object.name,
                 unseen.ty.as_ref(),
                 why.describe()

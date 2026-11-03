@@ -94,7 +94,7 @@ impl Unhashable {
             ),
             Unhashed::Crate(krate) => format!(
                 "blaze-items: what crate `{}` reads of the crates it loads has no hash: {}",
-                crate_name(db, krate),
+                krate.named(db),
                 self.what
             ),
         };
@@ -119,8 +119,8 @@ impl Unhashable {
                 said,
                 " (`{}` was read before the proc macros of `{}` were built, whose calls expand to \
                  nothing until they are; a read of it must wait on that build)",
-                crate_name(db, reader),
-                crate_name(db, pending)
+                reader.named(db),
+                pending.named(db)
             );
         }
         said
@@ -150,11 +150,6 @@ impl Unhashable {
         let (within, error) = form::Cx::new(db).mir_lowering_error(item)?;
         Some((item, within, error))
     }
-}
-
-/// A crate as an error names it: its display name.
-pub(crate) fn crate_name(db: &Db, krate: base_db::Crate) -> &str {
-    krate.extra_data(db).display_name.as_ref().map_or("<unnamed>", |it| it.canonical_name().as_str())
 }
 
 /// `Ok` once every proc macro `krate`'s items can expand is built

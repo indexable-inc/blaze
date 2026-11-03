@@ -9,7 +9,7 @@ use crate::{AnyDiagnostic, ConstEvalFailure};
 /// Each `ConstEvalFailed` of the fixture's crate: the item, whether it is a `static`, and
 /// the failure's reason (`cycle` for a value that needs itself).
 fn failures(db: &TestDB) -> Vec<(String, bool, String)> {
-    crate::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let krate = crate::check::workspace_crates(db)[0];
         crate::check::check_crate(db, krate, false, &crate::check::every_body)
             .iter()

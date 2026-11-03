@@ -17,7 +17,8 @@ use base_db::{Crate, Db, Env};
 use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
 use blaze_ids::ContentId;
-use hir_expand::{MacroCallId, MacroCallKind, MacroDefKind, builtin::include_input_to_file_id};
+use hir_expand::{InFile, MacroCallId, MacroCallKind, MacroDefKind, builtin::include_input_to_file_id};
+use syntax::ast::HasName;
 
 use crate::{
     Lookup,
@@ -30,6 +31,7 @@ use crate::{
     },
     nameres::{
         crate_def_map,
+        diagnostics::DefDiagnosticKind,
         frozen::{self, Frozen, FrozenDefMaps, FrozenLangItems, Mode},
     },
 };
@@ -131,6 +133,10 @@ pub enum Refused {
     /// files ([`refusal`], [`include_refusal`]). A build script's `OUT_DIR` files are in it.
     /// `what` names the module or the macro, where it is, and the file.
     OutsideSourceRoot { what: String },
+    /// A `mod foo;` of it names a file that is not there (rustc's E0583): the key covers the
+    /// files that are, so it would not move when that file appears ([`refusal`]). `what` names
+    /// the module, where it is declared and the files looked for.
+    ModuleFileMissing { what: String },
     /// The crate's key as the database has it when its image would be written is not the one
     /// it was served under: something it is made from changed between the serve and the
     /// store, so the image would be filed under a key that does not name it (rule 18).
@@ -153,6 +159,9 @@ impl std::fmt::Display for Refused {
             }
             Refused::OutsideSourceRoot { what } => {
                 write!(f, "{what}, outside the crate's source root, which its key covers")
+            }
+            Refused::ModuleFileMissing { what } => {
+                write!(f, "{what}, a file its key would not move for once it appears")
             }
             Refused::KeyMoved { served, now } => match now {
                 Some(now) => write!(
@@ -185,16 +194,6 @@ pub struct Stored {
     /// value made from the crate as this database resolved it is filed by
     /// (`blaze_diagnostics::cache`).
     pub filed: HashMap<Crate, ContentId, Global>,
-}
-
-/// The name of `krate` in an error.
-pub fn crate_name(db: &Db, krate: Crate) -> String {
-    match &krate.extra_data(db).display_name {
-        // alloc: error text
-        Some(name) => name.to_string(),
-        // alloc: error text
-        None => format!("of root file {:?}", krate.data(db).root_file_id),
-    }
 }
 
 /// Reads each of `crates` that is [`eligible`] (and its dependencies) from the image `images`
@@ -261,7 +260,7 @@ pub fn serve(
     let mut changed = false;
     for (&(krate, base), found) in order.iter().zip(found) {
         let found = found.into_inner().unwrap_or_else(|| {
-            panic!("`ImageStore::for_each` did not run the task of crate {}", crate_name(db, krate))
+            panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))
         });
         changed |= served.remove(&krate).is_some();
         changed |= maps.remove(&krate).is_some();
@@ -317,7 +316,7 @@ fn fetch(db: &Db, krate: Crate, key: ContentId, images: &dyn ImageStore) -> Fetc
     let found = filed::search(db, krate, key, images, |at| {
         let bytes = images.get(&at).map_err(|why| {
             // alloc: error text
-            format!("reading the image of crate {} (key {at:?}): {why}", crate_name(db, krate))
+            format!("reading the image of crate {} (key {at:?}): {why}", krate.named(db))
         })?;
         Ok(bytes.map(|bytes| (at, bytes)))
     })?;
@@ -331,14 +330,14 @@ fn fetch(db: &Db, krate: Crate, key: ContentId, images: &dyn ImageStore) -> Fetc
 fn open(db: &Db, krate: Crate, filed: ContentId, bytes: ImageBuf) -> Fetched {
     let image = ImageRef::open(bytes.bytes(), filed).map_err(|why| {
         // alloc: error text
-        format!("the image of crate {} (key {filed:?}): {why}", crate_name(db, krate))
+        format!("the image of crate {} (key {filed:?}): {why}", krate.named(db))
     })?;
     if let Some(why) = frozen::unreadable(db, krate, image.part(Part::DefMap)) {
         // alloc: error text
         return Err(format!(
             "the image of crate {} (key {filed:?}) names files that are not the crate's: \
              {why}; the key leaves out an input",
-            crate_name(db, krate)
+            krate.named(db)
         ));
     }
     let parts = image.ranges(bytes.bytes());
@@ -396,7 +395,7 @@ pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored
     let mut stored = Stored::default();
     for (&(krate, _), made) in order.iter().zip(made) {
         let made = made.into_inner().unwrap_or_else(|| {
-            panic!("`ImageStore::for_each` did not run the task of crate {}", crate_name(db, krate))
+            panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))
         });
         match made? {
             Ok(filed) => {
@@ -445,7 +444,7 @@ fn make(
     drop(parts);
     images.put(filed, image).map_err(|why| {
         // alloc: error text
-        format!("keeping the image of crate {} (key {filed:?}): {why}", crate_name(db, krate))
+        format!("keeping the image of crate {} (key {filed:?}): {why}", krate.named(db))
     })?;
     Ok(Ok(filed))
 }
@@ -463,7 +462,8 @@ fn encode(db: &Db, krate: Crate, calls: &mut Vec<MacroCallId>) -> Result<[Vec<u8
 
 /// Why the image of `krate` would leave out an input its key and reads do not cover, if it
 /// would, as far as its def map says, before its image is encoded: a def map that uses the
-/// session's macros, or a module whose file is outside the crate's source root.
+/// session's macros, a module whose file is outside the crate's source root, or a module whose
+/// file is not there.
 ///
 /// The key covers every file of the crate's source root by its path and content, a file with
 /// no text by its bytes ([`super::key`]), and a frozen def map's files are looked up there
@@ -487,12 +487,35 @@ pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
                 let what = format!(
                     "module `{}` of crate {} is the file {}",
                     module_path(db, id),
-                    crate_name(db, krate),
+                    krate.named(db),
                     shown_path(db, file),
                 );
                 return Some(Refused::OutsideSourceRoot { what });
             }
         }
+    }
+    let missing = def_map.diagnostics(db).iter().find_map(|it| match &it.kind {
+        DefDiagnosticKind::UnresolvedModule { ast, candidates } => Some((it.in_module, ast, candidates)),
+        _ => None,
+    });
+    if let Some((parent, ast, candidates)) = missing {
+        let name = match ast.to_node(db).name() {
+            Some(name) => name.text().to_string(), // alloc: error text
+            None => "_".to_owned(),                // alloc: error text
+        };
+        let declared = InFile::new(ast.file_id, ast.to_range(db)).original_node_file_range_rooted(db);
+        let anchor = ast.file_id.original_file_respecting_includes(db).file_id(db);
+        // alloc: why a crate is refused, once per refused crate
+        let what = format!(
+            "module `{}::{name}` of crate {}, declared at {}, has no file: none of {} (from the \
+             directory of {}) is there",
+            module_path(db, parent),
+            krate.named(db),
+            site(db, declared),
+            candidates.join(", "),
+            shown_path(db, anchor),
+        );
+        return Some(Refused::ModuleFileMissing { what });
     }
     None
 }
@@ -532,7 +555,7 @@ pub(super) fn include_refusal(db: &Db, krate: Crate, calls: &[MacroCallId]) -> O
             _ => "include_bytes!",
         };
         // alloc: as above
-        let what = format!("`{name}` of crate {} at {} {read}", crate_name(db, krate), call_site(db, loc));
+        let what = format!("`{name}` of crate {} at {} {read}", krate.named(db), call_site(db, loc));
         Err(Refused::OutsideSourceRoot { what })
     });
     refused.err()
@@ -548,7 +571,11 @@ fn shown_path(db: &Db, file: base_db::FileId) -> String {
 
 /// Where the call `loc` is in a file of its crate: the file's path and the line, from 1.
 fn call_site(db: &Db, loc: &hir_expand::MacroCallLoc) -> String {
-    let range = loc.kind.original_call_range_with_input(db);
+    site(db, loc.kind.original_call_range_with_input(db))
+}
+
+/// Where `range` is: its file's path and the line it starts on, from 1.
+fn site(db: &Db, range: hir_expand::FileRange) -> String {
     let file = range.file_id.file_id(db);
     let start = usize::from(range.range.start());
     let text = db.file_text(file).text(db);

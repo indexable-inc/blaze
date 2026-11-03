@@ -112,7 +112,7 @@ fn check(#[rust_analyzer::rust_fixture] fixture: &str, expected: &[(&str, &str)]
     let fx = fixture::db(fixture);
     let file = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let hir_db: &Db = &db;
         let text = db.file_text(file.file_id(&db)).text(&db);
         let mut bodies = Vec::new();
@@ -556,7 +556,7 @@ fn plain(a: u8) -> u8 { let b = a; b }
     );
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let hir_db: &Db = &db;
         for &krate in all_crates(&db).iter() {
             for (_, module) in crate_def_map(&db, krate).modules(&db) {
@@ -600,7 +600,7 @@ fn refutable_param((1, _): (u8, u8)) {}
     );
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let hir_db: &Db = &db;
         for &krate in all_crates(&db).iter() {
             for (_, module) in crate_def_map(&db, krate).modules(&db) {
@@ -682,7 +682,7 @@ fn mismatched() {
     );
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let hir_db: &Db = &db;
         for &krate in all_crates(&db).iter() {
             for (_, module) in crate_def_map(&db, krate).modules(&db) {

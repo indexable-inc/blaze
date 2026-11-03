@@ -104,7 +104,7 @@ trait Tr {
 "#,
     )
     .into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let tr = trait_(&db, "Tr");
         for (name, expected) in
@@ -147,7 +147,7 @@ impl<T: ?Sized> OnParam for Wrap<T> {}
 "#,
     )
     .into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         for (trait_name, expected) in [
             ("OnStr", true),
@@ -179,7 +179,7 @@ fn plain() {}
 "#,
     )
     .into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         for (name, expected) in [("enables", true), ("plain", false)] {
             let def = CallableIdWrapper(function(&db, name).into());
@@ -202,7 +202,7 @@ fn plain_rpit() -> impl Copy { 0u8 }
 #[test]
 fn an_alias_is_conditionally_const_as_its_trait_or_function_is() {
     let db = fixture::db(CONST_ALIASES).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let item = |trait_name| assoc_type(&db, trait_(&db, trait_name), "Item").into();
         assert!(interner.alias_has_const_conditions(item("Plain")));
@@ -215,7 +215,7 @@ fn an_alias_is_conditionally_const_as_its_trait_or_function_is() {
 #[test]
 fn an_alias_that_writes_no_const_bound_implies_none() {
     let db = fixture::db(CONST_ALIASES).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let plain = assoc_type(&db, trait_(&db, "Plain"), "Item").into();
         let rpit = first_rpit(&db, function(&db, "const_rpit"));
@@ -229,7 +229,7 @@ fn an_alias_that_writes_no_const_bound_implies_none() {
 #[test]
 fn an_alias_implies_the_const_bounds_it_writes() {
     let db = fixture::db(CONST_ALIASES).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let bounded = assoc_type(&db, trait_(&db, "Bounded"), "Item").into();
         let traits: Vec<TraitId> = interner
@@ -251,7 +251,7 @@ type Opaque = impl Sized;
 "#,
     )
     .into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let alias = modules(&db)
             .into_iter()
@@ -293,7 +293,7 @@ fn an_item_is_local_only_to_the_crate_that_defines_it() {
     use rustc_type_ir::inherent::DefId as _;
 
     let db = fixture::db(TWO_CRATES).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (up, mine) = (trait_(&db, "Up"), trait_(&db, "Mine"));
         let main = DbInterner::new_with(&db, function(&db, "here").krate(&db));
         let upstream = DbInterner::new_with(&db, up.krate(&db));
@@ -316,7 +316,7 @@ fn coherence_leaves_a_goal_only_an_upstream_crate_could_implement_ambiguous() {
     use rustc_type_ir::TypingMode;
 
     let db = fixture::db(TWO_CRATES).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let up = trait_(&db, "Up");
         let foreign = foreign_struct(&db);
         for (krate, expected) in [

@@ -1698,10 +1698,10 @@ pub fn macro_call_as_call_id(
     krate: Crate,
     macro_depth: u32,
     recursion_limit: u32,
-    resolver: impl Fn(&ModPath) -> Option<MacroDefId> + Copy,
+    resolver: impl Fn(&ModPath, SyntaxContext) -> Option<MacroDefId> + Copy,
     eager_calls: &mut Vec<EagerCall, impl Allocator>,
 ) -> Result<ExpandResult<Option<MacroCallId>>, UnresolvedMacro> {
-    let def = resolver(path).ok_or(UnresolvedMacro { path: *path })?;
+    let def = resolver(path, call_site).ok_or(UnresolvedMacro { path: *path })?;
 
     let res = match def.kind {
         MacroDefKind::BuiltInEager(..) => expand_eager_macro_input_view(
@@ -1713,7 +1713,7 @@ pub fn macro_call_as_call_id(
             call_site,
             macro_depth,
             recursion_limit,
-            &|path| resolver(path).filter(MacroDefId::is_fn_like),
+            &|path, ctxt| resolver(path, ctxt).filter(MacroDefId::is_fn_like),
             eager_calls,
         ),
         _ if def.is_fn_like() => ExpandResult {

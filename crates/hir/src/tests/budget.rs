@@ -128,7 +128,7 @@ fn descend_into_macros_on_a_warm_file_allocates_nothing() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let at = targets(&db, file_id);
         warm_then_free(&db, "descend_into_macros_exact", |sema| {
             let file = sema.parse(file_id);
@@ -145,7 +145,7 @@ fn resolve_path_through_semantics_on_a_warm_file_allocates_nothing() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let at = targets(&db, file_id);
         warm_then_free(&db, "resolve_path", |sema| {
             let file = sema.parse(file_id);
@@ -162,7 +162,7 @@ fn to_def_on_a_cached_node_allocates_nothing() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let at = targets(&db, file_id);
         warm_then_free(&db, "to_def", |sema| {
             let file = sema.parse(file_id);
@@ -180,7 +180,7 @@ fn to_def_on_a_cached_node_allocates_nothing() {
 #[test]
 fn the_accessors_iterator_forms_allocate_nothing() {
     let db = fixture::db(FIXTURE).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = Crate::all(&db).into_iter().next().expect("a crate");
         let root = krate.root_module(&db);
         let inner = root.children(&db).next().expect("`mod inner`");
@@ -252,7 +252,7 @@ pub mod needles { pub struct Inner; }
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let main = Crate::all(&db)
             .into_iter()
             .find(|it| it.display_name(&db).is_some_and(|it| it.crate_name().as_str() == "main"))

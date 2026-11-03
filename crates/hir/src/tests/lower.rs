@@ -25,7 +25,7 @@ use crate::{
 /// Every diagnostic the check of the workspace found, given to `f`.
 fn check(fixture: &str, f: impl FnOnce(&TestDB, &[AnyDiagnostic<'_>])) {
     let db = fixture::db(fixture).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let found = crate::check::check_workspace(&db, false);
         let found: Vec<_> = found.into_iter().flat_map(|(_, it)| it).collect();
         f(&db, &found);
@@ -269,7 +269,7 @@ type F = for<'x, 'y> fn(&'x u8, &'y u8);
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (_, ModuleDefId::TypeAliasId(alias)) = type_item(&db, "F") else {
             panic!("`F` is a type alias")
         };
@@ -299,7 +299,7 @@ type U = unsafe<'a, 'b> &'a &'b u8;
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (_, ModuleDefId::TypeAliasId(alias)) = type_item(&db, "U") else {
             panic!("`U` is a type alias")
         };
@@ -340,7 +340,7 @@ type G = for<'a> fn(&'a u8, for<'a, 'b> fn(&'a u8, &'b u8));
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (_, ModuleDefId::TypeAliasId(alias)) = type_item(&db, "G") else {
             panic!("`G` is a type alias")
         };
@@ -374,7 +374,7 @@ struct S<T, const N: usize, U, const M: bool>([T; N], U);
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (_, ModuleDefId::AdtId(adt)) = type_item(&db, "S") else { panic!("`S` is an ADT") };
         let def = hir_def::GenericDefId::AdtId(adt);
         let kinds: Vec<_> = hir_def::hir::generics::GenericParams::of(&db, def)
@@ -406,7 +406,7 @@ struct S<A, B = u8, C = u16>(A, B, C);
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (_, ModuleDefId::AdtId(adt)) = type_item(&db, "S") else { panic!("`S` is an ADT") };
         let defaults = db.generic_defaults(hir_def::GenericDefId::AdtId(adt));
         let has: Vec<bool> = (0..4).map(|idx| defaults.get(idx).is_some()).collect();
@@ -423,7 +423,7 @@ struct S<'a, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R>(&'a A, fn(B),
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         use rustc_type_ir::Variance::{Contravariant, Covariant, Invariant};
         let (_, ModuleDefId::AdtId(adt)) = type_item(&db, "S") else { panic!("`S` is an ADT") };
         let variances = db.variances_of(hir_def::GenericDefId::AdtId(adt));
@@ -444,7 +444,7 @@ struct U<P, Q>(P) where P: T<X = Q>;
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let adt = |name| match type_item(&db, name) {
             (_, ModuleDefId::AdtId(it)) => it,
             it => panic!("`{name}` is an ADT, not {it:?}"),
@@ -469,7 +469,7 @@ trait G where Self: D + E {}
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         for name in ["A", "B", "C", "D", "E", "F", "G"] {
             let (krate, ModuleDefId::TraitId(trait_)) = type_item(&db, name) else {
                 panic!("`{name}` is a trait")
@@ -518,7 +518,7 @@ trait Bad: Sized + Sup<Self> {
 "#,
     )
     .into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (_, ModuleDefId::TraitId(id)) = type_item(&db, "Bad") else { panic!("`Bad`") };
         let found: Vec<(String, Vec<String>)> = Trait { id }
             .dyn_compatibility_violation_sites(&db)

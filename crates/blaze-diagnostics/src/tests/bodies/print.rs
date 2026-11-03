@@ -25,7 +25,7 @@ fn each_let(fixture: &str, f: impl Fn(&Cx<'_, '_>, &hir::Type<'_>) -> String) ->
         .zip(paths(fixture))
         .map(|(file, path)| (file.file_id(&db), format!("$DIR/{path}")))
         .collect();
-    hir::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = hir::check::workspace_crates(&db)[0];
         let frame = crate::tests::frame();
         let cx = Cx::new(&db, krate, Files::new(&names, ""), &frame);

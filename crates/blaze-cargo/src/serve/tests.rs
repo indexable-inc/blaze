@@ -54,6 +54,10 @@ const INDEX: &str = "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b5
 /// How many turns a test gives the daemon before it says it hangs.
 const TURNS: usize = 100_000;
 
+/// How long [`Client::wait_for_the_pool`] turns the daemon while the process's worker pool runs
+/// other tests' jobs before it says what it waited for.
+const POOL_WAIT: Duration = Duration::from_secs(120);
+
 fn name(it: &str) -> FileName {
     FileName::new(it).unwrap()
 }
@@ -469,13 +473,13 @@ impl Steps for Fake {
         }
         let source = match fetch.kind {
             FetchKind::IndexFile => Source {
-                files: vec![SourceFile { path: "dep".into(), bytes: b"{}\n".to_vec(), mode: blaze_vfs::Mode::Regular }],
+                files: vec![SourceFile { path: "dep".into(), bytes: blaze_vfs::Bytes::from_static(b"{}\n"), mode: blaze_vfs::Mode::Regular }],
                 under: "dep".into(),
             },
             _ => Source {
                 files: vec![SourceFile {
                     path: "Cargo.toml".into(),
-                    bytes: format!("# {}\n", fetch.what).into_bytes(),
+                    bytes: blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, format!("# {}\n", fetch.what).as_bytes()),
                     mode: blaze_vfs::Mode::Regular,
                 }],
                 under: String::new(),
@@ -490,7 +494,7 @@ impl Steps for Fake {
             return Ok(Library { at: LIBRARY.into(), fingerprint, source: None });
         }
         LIBRARY_READS.set(LIBRARY_READS.get() + 1);
-        let file = SourceFile { path: "core/src/lib.rs".into(), bytes: b"#![no_core]\n".to_vec(), mode: blaze_vfs::Mode::Regular };
+        let file = SourceFile { path: "core/src/lib.rs".into(), bytes: blaze_vfs::Bytes::from_static(b"#![no_core]\n"), mode: blaze_vfs::Mode::Regular };
         Ok(Library { at: LIBRARY.into(), fingerprint, source: Some(Source { files: vec![file], under: String::new() }) })
     }
 
@@ -897,12 +901,12 @@ impl Runs<Fake> for Keeps {
         let off_loop = UNTOLD_WRITER.with_borrow_mut(|writer| {
             writer.as_mut().map(|writer| {
                 let guard = blaze_cas::enter();
-                writer.put(&guard, test_record_key(), blaze_cas::Kind::Query, TEST_RECORD.to_vec()).expect("one value under its key")
+                writer.put(&guard, test_record_key(), blaze_cas::Kind::Query, TEST_RECORD).expect("one value under its key")
             })
         });
         let ticket = match off_loop {
             Some(ticket) => ticket,
-            None => store.put(test_record_key(), blaze_cas::Kind::Query, TEST_RECORD.to_vec()).expect("one value under its key"),
+            None => store.put(test_record_key(), blaze_cas::Kind::Query, TEST_RECORD).expect("one value under its key"),
         };
         if self.tells {
             self.puts.kept([ticket]);
@@ -991,7 +995,7 @@ impl Front<Fake> for FakeFront {
             true => vec![Put { key: shared_key(), kind: blaze_cas::Kind::Query, bytes: SHARED.to_vec() }],
             false => Vec::new(),
         };
-        Ok(Some(Compiled { diagnostics, ok: true, puts, share, outputs, artifact: None, macros: None, links: Vec::new(), misses: Vec::new() }))
+        Ok(Some(Compiled { diagnostics, ok: true, open: false, why: None, puts, share, outputs, artifact: None, macros: None, links: Vec::new(), misses: Vec::new() }))
     }
 
     fn refused(&self, _: usize, what: String) -> Diagnostic {
@@ -1199,6 +1203,36 @@ impl Client {
         }
         panic!("request {id} never ended; it got {:?}", self.of(id));
     }
+
+    /// [`Client::wait`] for a request whose end needs the process's worker pool idle: the
+    /// daemon's stall ([`Daemon::still`]) holds only while the pool runs and queues nothing, and
+    /// the pool is the process's, which the other tests of this binary use at once. Only turns
+    /// with the pool idle count against [`TURNS`]; the rest go on turning, at most
+    /// [`POOL_WAIT`], until the other tests' jobs end.
+    fn wait_for_the_pool(&mut self, daemon: &mut SimDaemon, id: u64) -> Vec<Response> {
+        let pool = blaze_graph::exec::shared();
+        let since = std::time::Instant::now();
+        let (mut idle, mut busy) = (0usize, 0usize);
+        while idle < TURNS {
+            daemon.turn();
+            self.take(daemon);
+            if self.done(id) {
+                return self.of(id);
+            }
+            if pool.idle() {
+                idle += 1;
+                continue;
+            }
+            busy += 1;
+            assert!(
+                since.elapsed() < POOL_WAIT,
+                "request {id} never ended: for {POOL_WAIT:?} the process's worker pool ran other jobs in {busy} turns \
+                 ({idle} turns with it idle); it got {:?}",
+                self.of(id)
+            );
+        }
+        panic!("request {id} never ended in {TURNS} turns with the process's worker pool idle ({busy} with it busy); it got {:?}", self.of(id));
+    }
 }
 
 fn agent() -> Targets {
@@ -1316,7 +1350,7 @@ fn a_build_nothing_can_move_fails_with_the_stall_naming_each_wait() {
     let mut daemon = start(sim, &steps, 3);
     let mut client = dial(&mut daemon);
     let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
-    let got = client.wait(&mut daemon, id);
+    let got = client.wait_for_the_pool(&mut daemon, id);
     LOSES_RUNS.set(false);
 
     assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
@@ -1895,7 +1929,7 @@ fn a_checkout_whose_last_put_another_put_first_answers_once_its_own_are_durable(
         let mut daemon = start(sim, &steps, seed);
         let mut writer = daemon.store_mut().writer();
         let guard = blaze_cas::enter();
-        let first = writer.put(&guard, shared_kept_key(), blaze_cas::Kind::Query, SHARED_KEPT.to_vec()).unwrap();
+        let first = writer.put(&guard, shared_kept_key(), blaze_cas::Kind::Query, SHARED_KEPT).unwrap();
         drop(guard);
         let mut client = dial(&mut daemon);
         for head in ["/v", "/w"] {
@@ -2173,7 +2207,7 @@ fn a_job_still_running_when_the_store_breaks_is_answered_naming_the_store() {
     assert!(daemon.store().broken().is_none(), "the store has not broken yet");
     daemon.driver().fail_syncs(store_dir());
     let key = blaze_cas::Key(ContentId::of("blaze serve tests store breaks", b"a put"));
-    daemon.store_mut().put(key, blaze_cas::Kind::Query, b"a put whose commit fails\n".to_vec()).unwrap();
+    daemon.store_mut().put(key, blaze_cas::Kind::Query, b"a put whose commit fails\n").unwrap();
     daemon.flush_store_for_test();
     for _ in 0..200 {
         if client.done(id) {

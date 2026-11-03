@@ -120,7 +120,7 @@ fn a_crate_linted_with_syntactic_lints_only_infers_nothing() {
 #[test]
 fn a_body_lints_hit_allocates_nothing() {
     let (db, _) = db(TWO);
-    hir::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = body_named(&db, "a");
         let set = LintSet::new(&db, Implemented::CollapsibleIf.bit(), Conf::default());
         assert_eq!(body_lints(&db, def, set).findings.len(), 1);

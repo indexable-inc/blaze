@@ -17,6 +17,7 @@ doctest = false
 arrow-array.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
+blaze-core.workspace = true
 blaze-graph.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true

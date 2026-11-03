@@ -95,7 +95,7 @@ fn run(fixture: &str) -> (Result<(), String>, String) {
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let main = function(&db, "main");
         let (result, output, Plain) = run_function(&db, main, Plain);
         (result.map_err(|e| format!("{e:?}")), output.stdout().into_owned())

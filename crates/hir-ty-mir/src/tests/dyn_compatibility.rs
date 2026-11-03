@@ -60,7 +60,7 @@ fn check_dyn_compatibility<'a>(
         };
         let mut osvs = HashSet::new_in(Global);
         let db = &db;
-        crate::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             _ = dyn_compatibility_with_callback(db, trait_id, &mut |osv| {
                 osvs.insert(match osv {
                     DynCompatibilityViolation::SizedSelf => SizedSelf,

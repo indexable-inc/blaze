@@ -632,11 +632,13 @@ fn column<T>(max: u32) -> RegionVec<T> {
 }
 
 /// [`NodeCold::flags`]: it has a key; it settled (`done_at` holds); its task started as it
-/// (`started_at` holds); its task ran on a thread group (`group` holds).
+/// (`started_at` holds); its task ran on a thread group (`group` holds); it failed open
+/// ([`Outcome::FailedOpen`]): under keep-going what waits for it runs.
 const KEYED: u8 = 1;
 const DONE: u8 = 2;
 const STARTED: u8 = 4;
 const GROUP: u8 = 8;
+const OPEN: u8 = 16;
 
 /// What adding, readying, starting and settling a node read: 64 bytes, one cache line, found
 /// by its slot.
@@ -1664,6 +1666,14 @@ impl<M: Memo> Plane<M> {
                         blocker = dep;
                     }
                 }
+                // A failure that leaves what waits for it to run, under keep-going: as done.
+                NodeState::Failed { .. } if request.keep_going && self.cold[dep as usize].flags & OPEN != 0 => {
+                    if blocker == NONE
+                        || later(&self.rows, &self.cold, dep) > later(&self.rows, &self.cold, blocker)
+                    {
+                        blocker = dep;
+                    }
+                }
                 NodeState::Failed { .. } => _ = skipped.get_or_insert(self.rows[dep as usize].id.0),
                 NodeState::Skipped { because } => _ = skipped.get_or_insert(*because),
                 _ => waiting += 1,
@@ -1871,11 +1881,10 @@ impl<M: Memo> Plane<M> {
             if let Some(outcome) = self.memo.settled(key) {
                 self.counts.remembered += 1;
                 self.requests[r].stats.cached += 1;
-                let state = match outcome {
-                    Outcome::Built => NodeState::Cached { remote: false },
-                    Outcome::Cached { remote } => NodeState::Cached { remote },
-                    Outcome::Failed { why } => NodeState::Failed { why },
-                };
+                let (state, open) = outcome.state(false);
+                if open {
+                    self.cold[m].flags |= OPEN;
+                }
                 self.deferred.push((me, state));
                 return;
             }
@@ -1951,7 +1960,13 @@ impl<M: Memo> Plane<M> {
         self.cold[m].done_at = at;
         self.cold[m].flags |= DONE;
         self.moved(at, me, state, out);
-        if !failed {
+        if failed && self.requests[r].failed == NONE {
+            self.requests[r].failed = me;
+        }
+        // A failure that leaves what waits for it to run ([`Outcome::FailedOpen`]): under
+        // keep-going they are released as after a success, and the request still fails.
+        let open = failed && self.requests[r].keep_going && self.cold[m].flags & OPEN != 0;
+        if !failed || open {
             let mut edge = row.first_out;
             while edge != NONE {
                 let it = self.requests[r].edges[edge as usize];
@@ -1966,10 +1981,6 @@ impl<M: Memo> Plane<M> {
             return;
         }
         let because = row.id.0;
-        let request = &mut self.requests[r];
-        if request.failed == NONE {
-            request.failed = me;
-        }
         let mut skipping = std::mem::take(&mut self.skipping);
         skipping.clear();
         push_dependents(&mut skipping, &self.requests[r].edges, row.first_out);
@@ -2122,11 +2133,7 @@ impl<M: Memo> Plane<M> {
             self.flight.remove(&key);
         }
         self.free_task(task);
-        let mut state = match outcome {
-            Outcome::Built => NodeState::Built,
-            Outcome::Cached { remote } => NodeState::Cached { remote },
-            Outcome::Failed { why } => NodeState::Failed { why },
-        };
+        let (mut state, open) = outcome.state(true);
         let mut member = t.first;
         while member != NONE {
             let m = member as usize;
@@ -2136,6 +2143,9 @@ impl<M: Memo> Plane<M> {
                 self.requests[r as usize].stats.joined += 1;
             }
             let cold = &mut self.cold[m];
+            if open {
+                cold.flags |= OPEN;
+            }
             match group {
                 Some(group) => {
                     cold.group = group;

@@ -1050,7 +1050,9 @@ impl<'db> ExprCollector<'db> {
             "" | "'" => LifetimeRef::Error,
             "'static" => LifetimeRef::Static,
             "'_" => self.fresh_impl_header_lifetime().unwrap_or(LifetimeRef::Placeholder),
-            text => LifetimeRef::Named(Name::new_lifetime(text)),
+            text => LifetimeRef::Named(
+                self.param_name(Name::new_lifetime(text), lifetime.syntax().text_range()),
+            ),
         };
         self.alloc_lifetime_ref(lifetime_ref, LifetimePtr::of(lifetime))
     }
@@ -1251,11 +1253,14 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Type::UnsafeBinderType(inner) => {
                 let lifetimes = match inner.generic_param_list() {
-                    Some(params) => self.store.paths_mut().push_names(
-                        params
+                    Some(params) => {
+                        let names = params
                             .lifetime_params()
-                            .flat_map(|lp| lp.lifetime().map(|lt| Name::new_lifetime(lt.text()))),
-                    ),
+                            .flat_map(|lp| lp.lifetime().map(|lt| self.binder_lifetime_name(lt)));
+                        // alloc: inline up to 4, a binder's lifetimes before they are pushed
+                        let names: SmallVec<[Name; 4]> = names.collect();
+                        self.store.paths_mut().push_names(names)
+                    }
                     None => Names::EMPTY,
                 };
                 let ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
@@ -1653,7 +1658,7 @@ impl<'db> ExprCollector<'db> {
         match binder.generic_param_list() {
             Some(gpl) => gpl
                 .lifetime_params()
-                .flat_map(|lp| lp.lifetime().map(|lt| Name::new_lifetime(lt.text())))
+                .flat_map(|lp| lp.lifetime().map(|lt| self.binder_lifetime_name(lt)))
                 // alloc: a `for<..>` type's binder, once per one written, kept by `FnType.binder`.
                 .collect(),
             None => ThinVec::default(),
@@ -1852,6 +1857,8 @@ impl<'db> ExprCollector<'db> {
                 let receiver = self.collect_expr_opt(e.receiver());
                 let mark = self.collect_args(e.arg_list());
                 let method_name = e.name_ref().map(|nr| nr.as_name()).unwrap_or_else(Name::missing);
+                let hygiene =
+                    e.name_ref().and_then(|it| self.member_hygiene_for(it.syntax().text_range()));
                 let generic_args = e.generic_arg_list().and_then(|it| {
                     self.lower_generic_args(it, &mut ImplTraitLowering::Error)
                 });
@@ -1863,7 +1870,11 @@ impl<'db> ExprCollector<'db> {
                         generic_args,
                     )
                 });
-                self.map_expr(id, syntax_ptr)
+                let id = self.map_expr(id, syntax_ptr);
+                if let Some(hygiene) = hygiene {
+                    self.store.ident_hygiene.insert(id.into(), hygiene);
+                }
+                id
             }
             ast::Expr::MatchExpr(e) => {
                 let expr = self.collect_expr_opt(e.expr());
@@ -1966,13 +1977,18 @@ impl<'db> ExprCollector<'db> {
                             continue;
                         }
 
-                        let Some(name) = field.field_name() else { continue };
-                        let name = name.as_name();
+                        let Some(name_ref) = field.field_name() else { continue };
+                        let name = name_ref.as_name();
 
                         let expr = match field.expr() {
                             Some(e) => self.collect_expr(e),
                             None => self.missing_expr(),
                         };
+                        if let Some(hygiene) =
+                            self.member_hygiene_for(name_ref.syntax().text_range())
+                        {
+                            self.store.field_hygiene.insert(expr.into(), hygiene);
+                        }
                         if self.store.record {
                             let src = self.expander.in_file(AstPtr::<tag::RecordExprField>::of(field));
                             self.store.field_map_back.push((expr, src));
@@ -2000,7 +2016,18 @@ impl<'db> ExprCollector<'db> {
                     Some(kind) => kind.as_name(),
                     _ => Name::missing(),
                 };
-                self.alloc_expr(Expr::Field { expr, name: &name }, syntax_ptr)
+                // A tuple index takes no key, as no positional field does.
+                let hygiene = match e.name_ref() {
+                    Some(it) if name.as_tuple_index().is_none() => {
+                        self.member_hygiene_for(it.syntax().text_range())
+                    }
+                    _ => None,
+                };
+                let id = self.alloc_expr(Expr::Field { expr, name: &name }, syntax_ptr);
+                if let Some(hygiene) = hygiene {
+                    self.store.ident_hygiene.insert(id.into(), hygiene);
+                }
+                id
             }
             ast::Expr::AwaitExpr(e) => {
                 let expr = self.collect_expr_opt(e.expr());
@@ -2606,8 +2633,11 @@ impl<'db> ExprCollector<'db> {
                     }
                     let Some(field_expr) = f.expr() else { continue };
                     let pat = self.collect_expr_as_pat(field_expr);
-                    let Some(name) = f.field_name() else { continue };
-                    let name = name.as_name();
+                    let Some(name_ref) = f.field_name() else { continue };
+                    let name = name_ref.as_name();
+                    if let Some(hygiene) = self.member_hygiene_for(name_ref.syntax().text_range()) {
+                        self.store.field_hygiene.insert(pat.into(), hygiene);
+                    }
                     if self.store.record {
                         let src =
                             self.expander.in_file(AstPtr::<tag::RecordExprField>::of(f).wrap_left());
@@ -3299,7 +3329,7 @@ impl<'db> ExprCollector<'db> {
                     self.store.push_list_statement(Statement::Item(Item::Other));
                     return;
                 };
-                let name = name.as_name();
+                let name = self.macro_binding_name(name);
                 let macro_id = self
                     .def_map
                     .module(self.db, self.def_map.root)
@@ -3315,7 +3345,7 @@ impl<'db> ExprCollector<'db> {
                     self.store.push_list_statement(Statement::Item(Item::Other));
                     return;
                 };
-                let name = name.as_name();
+                let name = self.macro_binding_name(name);
                 let macro_defs_count =
                     self.current_block_legacy_macro_defs_count.entry(name).or_insert(0);
                 let macro_id = self
@@ -3328,6 +3358,16 @@ impl<'db> ExprCollector<'db> {
                 self.collect_macro_def(macro_id);
             }
             ast::Stmt::Item(_item) => self.store.push_list_statement(Statement::Item(Item::Other)),
+        }
+    }
+
+    /// The name a macro defined by a statement of this block binds: keyed by the context it is
+    /// written with, as the block's def map binds it (`def_site::def_binding_name`).
+    fn macro_binding_name(&self, name: ast::Name<'_>) -> Name {
+        let file = self.expander.current_file_id();
+        match crate::nameres::binding_key_at(self.db, file, name.syntax().text_range()) {
+            Some(key) => name.as_name().keyed(key),
+            None => name.as_name(),
         }
     }
 
@@ -3653,8 +3693,11 @@ impl<'db> ExprCollector<'db> {
                     }
                     let Some(ast_pat) = f.pat() else { continue };
                     let pat = self.collect_pat(ast_pat, binding_list);
-                    let Some(name) = f.field_name() else { continue };
-                    let name = name.as_name();
+                    let Some(name_ref) = f.field_name() else { continue };
+                    let name = name_ref.as_name();
+                    if let Some(hygiene) = self.member_hygiene_for(name_ref.syntax().text_range()) {
+                        self.store.field_hygiene.insert(pat.into(), hygiene);
+                    }
                     if self.store.record {
                         let src = self
                             .expander
@@ -4435,6 +4478,36 @@ impl<'db> ExprCollector<'db> {
 
     fn hygiene_id_for(&self, range: TextRange) -> HygieneId {
         self.expander.hygiene_for_range(self.db, range)
+    }
+
+    /// The hygiene of a field's or a method's name written at `range`, where it matters: the
+    /// name's context marks it as a `macro` (2.0)'s or a def-site span's (its normalization to
+    /// macros 2.0 is not the root). `None` for every name a real file or a `macro_rules!`
+    /// writes, which is looked up as written.
+    fn member_hygiene_for(&self, range: TextRange) -> Option<HygieneId> {
+        let hygiene = self.hygiene_id_for(range);
+        let marked = !hygiene.is_root()
+            && !hygiene.syntax_context().normalize_to_macros_2_0(self.db).is_root();
+        marked.then_some(hygiene)
+    }
+
+    /// The name a `for<..>` binder's lifetime `lifetime` binds ([`Self::param_name`]).
+    pub(in crate::expr_store) fn binder_lifetime_name(&self, lifetime: ast::Lifetime<'_>) -> Name {
+        self.param_name(Name::new_lifetime(lifetime.text()), lifetime.syntax().text_range())
+    }
+
+    /// `name`, a generic parameter or a lifetime written at `range`, as its generics bind it and
+    /// a lifetime names it: keyed by its context normalized to macros 2.0
+    /// ([`crate::nameres::param_name`]). As it is in a real file, where no name has a key.
+    pub(in crate::expr_store) fn param_name(&self, name: Name, range: TextRange) -> Name {
+        match self.span_map() {
+            SpanMap::RealSpanMap(_) => name,
+            SpanMap::ExpansionSpanMap(_) => crate::nameres::param_name(
+                self.db,
+                name,
+                self.expander.ctx_for_range(range),
+            ),
+        }
     }
 
     fn with_lifetime_bound_scope<T>(

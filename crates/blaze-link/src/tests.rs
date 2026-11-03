@@ -464,13 +464,8 @@ fn an_incremental_link_puts_the_new_function_in_the_old_slot_and_writes_little()
 /// (which pad alike), keys sharing long prefixes, and equal keys.
 #[test]
 fn the_lineage_order_is_the_keys_byte_order() {
-    let mut seed = 0x2545_f491_4f6c_dd1du64;
-    let mut next = move |below: u64| {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed % below
-    };
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_f491_4f6c_dd1d);
+    let mut next = move |below: u64| rng.below(below);
     for count in [0usize, 1, 2, 17, 1000, 20_000] {
         let keys: Vec<Vec<u8>> = (0..count)
             .map(|_| {

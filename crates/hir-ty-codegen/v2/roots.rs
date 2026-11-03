@@ -485,6 +485,7 @@ pub(super) fn refused(db: &Db, krate: Crate, what: impl std::fmt::Display) -> Co
         unit: InstanceKey(ContentId::default()),
         item: ItemKey(ContentId::default()),
         // alloc: the error's message
-        what: format!("the roots of crate `{}`: {what}", crate::fncache::crate_name(db, krate)),
+        what: format!("the roots of crate `{}`: {what}", krate.named(db)),
+        front: None,
     }
 }

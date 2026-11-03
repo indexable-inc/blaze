@@ -41,7 +41,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for Bytes<'a> {
 }
 
 /// The file: `n` keys and `m` edges. Read by its derive; written by [`Trace`]'s `Serialize`.
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File<'a> {
     version: u64,

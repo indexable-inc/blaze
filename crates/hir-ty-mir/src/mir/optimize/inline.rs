@@ -350,7 +350,7 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
             Ok(it) => it,
             Err(error) => {
                 // A type's `Debug` reads the attached database.
-                hir_ty::attach_db(db, || {
+                blaze_query::db::attach(db, || {
                     tracing::debug!(callee = ?site.callee, ?error, "not inlined: not monomorphized")
                 });
                 return None;

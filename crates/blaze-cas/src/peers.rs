@@ -166,7 +166,7 @@ impl Store {
     }
 
     /// The head of tier `at` of a shared store, read.
-    pub(crate) fn peer_head(&mut self, at: usize, bytes: Vec<u8>, effects: &mut Vec<Effect>) {
+    pub(crate) fn peer_head(&mut self, at: usize, bytes: &[u8], effects: &mut Vec<Effect>) {
         if at == 0 {
             let fresh = bytes.is_empty();
             self.read_head(0, bytes, effects);
@@ -188,7 +188,7 @@ impl Store {
         let head = match bytes.is_empty() {
             // A writer whose directory is made and whose head is not written yet holds nothing.
             true => Head::default(),
-            false => match Head::decode(&bytes) {
+            false => match Head::decode(bytes) {
                 Ok(head) => head,
                 Err(why) => {
                     let file = self.tiers[at].file(HEAD_FILE);
@@ -290,14 +290,14 @@ impl Store {
     }
 
     /// Its own empty head, written at its first opening, came: it looks.
-    pub(crate) fn announced(&mut self, done: Done, effects: &mut Vec<Effect>) {
+    pub(crate) fn announced(&mut self, done: &Done, effects: &mut Vec<Effect>) {
         if matches!(done, Done::Written) {
             self.failures = 0;
             self.start_look(effects);
             return;
         }
         let file = self.tiers[0].file(HEAD_FILE);
-        if self.retry(&file, &done) {
+        if self.retry(&file, done) {
             let tag = self.tags.ask(Op::Announce);
             effects.push(Effect::Write { file, bytes: Head::default().encode(), tag });
         }

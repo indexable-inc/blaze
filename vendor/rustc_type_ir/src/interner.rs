@@ -302,16 +302,6 @@ pub trait Interner:
     ) -> Option<Self::VariancesOf>;
 
     fn type_of(self, def_id: Self::DefId) -> ty::EarlyBinder<Self, Self::Ty>;
-    /// What an opaque type a trait's method returns is, once its arguments name the impl's
-    /// method: that method's opaque type, whose hidden type the trait's own is not.
-    fn opaque_of_impl(
-        self,
-        _param_env: Self::ParamEnv,
-        _def_id: Self::OpaqueTyId,
-        _args: Self::GenericArgs,
-    ) -> Option<Self::Ty> {
-        None
-    }
     fn type_of_opaque_hir_typeck(
         self,
         def_id: Self::LocalOpaqueTyId,

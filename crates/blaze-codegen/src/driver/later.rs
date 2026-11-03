@@ -206,7 +206,7 @@ fn compiled<B: Prepare>(
         let (function, puts) = memoized(node, key, at, shape, template)?;
         return Ok((function, puts, Made::Memo, shape));
     }
-    let emitted = backend.emit(unit, spec, made, &node.refs, None)?;
+    let emitted = backend.emit(unit, spec, made, &node.refs, None).map_err(|why| super::naming(why, &node.described.name))?;
     if emitted.function.key != key {
         // alloc: an error
         return Err(error(key, item, format!("compiled as {:?}", emitted.function.key)));

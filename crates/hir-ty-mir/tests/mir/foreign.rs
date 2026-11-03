@@ -103,7 +103,7 @@ fn with_evaluator(owner: &str, test: impl FnOnce(&TestDB, Evaluator<'_>)) {
     let fx = fixture::db(PROGRAM);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let owner = function(&db, owner);
         let eval = Evaluator::new(&db, owner.into(), None).expect("an evaluator");
         test(&db, eval);

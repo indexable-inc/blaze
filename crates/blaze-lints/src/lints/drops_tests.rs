@@ -8,7 +8,6 @@
 
 use base_db::FileId;
 use blaze_hash::HashMap;
-use hir::attach_db;
 use hir_expand::fixture;
 use std::alloc::Global;
 
@@ -261,7 +260,7 @@ pub(crate) fn fixed(lint_name: &str, main: &str) -> String {
     let fx = fixture::db(&fixture(main));
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let krate = attach_db(&db, || crate::tests::main_crate(&db));
+    let krate = blaze_query::db::attach(&db, || crate::tests::main_crate(&db));
     let file = file.file_id(&db);
     let before = db.file_text(file).text(&db).to_string();
     let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
@@ -273,7 +272,7 @@ pub(crate) fn fixed(lint_name: &str, main: &str) -> String {
     let after = db.file_text(file).text(&db).to_string();
     assert_ne!(after, before, "the fix of `{lint_name}` changed the file");
     assert!(made.applied > 0, "the fix of `{lint_name}` made a suggestion");
-    attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut acc = Vec::new();
         for module in krate.modules(&db) {
             module.diagnostics(&db, &mut acc, false);

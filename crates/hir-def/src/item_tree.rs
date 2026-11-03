@@ -1108,7 +1108,7 @@ impl UseTree {
                 // clone: allocates nothing, a `ModPath` is an interned slice
                 (None, _) => Some((path.clone(), ImportKind::Plain)),
                 (Some(mut prefix), PathKind::Plain) => {
-                    prefix.extend(path.segments().iter().cloned());
+                    prefix.append(path);
                     Some((prefix, ImportKind::Plain))
                 }
                 (Some(mut prefix), PathKind::Super(n)) if n > 0 && prefix.segments().is_empty() => {
@@ -1117,7 +1117,7 @@ impl UseTree {
                         PathKind::Super(m) => {
                             cov_mark::hit!(concat_super_mod_paths);
                             *m += n;
-                            prefix.extend(path.segments().iter().cloned());
+                            prefix.append(path);
                             Some((prefix, ImportKind::Plain))
                         }
                         _ => None,

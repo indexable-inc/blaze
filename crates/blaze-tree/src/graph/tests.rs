@@ -16,16 +16,6 @@ fn reference(len: usize, rank: &[u32], raw: &[Raw]) -> Vec<Vec<Edge>> {
     groups
 }
 
-/// A small deterministic generator, so the cases are the same on every run.
-struct Lcg(u64);
-
-impl Lcg {
-    fn below(&mut self, n: usize) -> usize {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((self.0 >> 33) as usize) % n
-    }
-}
-
 fn laid_out(len: usize, rank: &[u32], raw: &[Raw]) -> Edges {
     let mut raw = raw.to_vec();
     let (mut sorted, mut counts, mut edges) = (Vec::new(), Vec::new(), Edges::default());
@@ -35,18 +25,16 @@ fn laid_out(len: usize, rank: &[u32], raw: &[Raw]) -> Edges {
 
 #[test]
 fn csr_is_cargos_sorted_and_deduplicated_lists() {
-    let mut rng = Lcg(7);
+    let mut rng = blaze_ids::rng::SplitMix64::new(7);
     for len in [1, 2, 5, 33, 200] {
         // A rank that is not the node order, as a feature graph's is not.
         let mut rank: Vec<u32> = (0..len as u32).collect();
-        for i in (1..len).rev() {
-            rank.swap(i, rng.below(i + 1));
-        }
+        rng.shuffle(&mut rank);
         let raw: Vec<Raw> = (0..len * 6)
             .map(|_| Raw {
-                from: NodeId(rng.below(len) as u32),
-                to: Edge::new(NodeId(rng.below(len) as u32), rng.below(4) == 0),
-                tag: rng.below(TAGS) as Tag,
+                from: NodeId(rng.index(len) as u32),
+                to: Edge::new(NodeId(rng.index(len) as u32), rng.index(4) == 0),
+                tag: rng.index(TAGS) as Tag,
             })
             .collect();
         let edges = laid_out(len, &rank, &raw);

@@ -40,10 +40,11 @@ use crate::{
 /// eager expansion appends one per call it expands, in the order it meets them.
 pub type EagerCall = (InFile<(AstPtr<ast::MacroCall>, span::FileAstId<ast::MacroCall>)>, MacroCallId);
 
-/// The resolver of the macro calls inside an eager macro's input. Not a generic: that would copy
+/// The resolver of the macro calls inside an eager macro's input: a call's path and the syntax
+/// context of its first segment, which def-site hygiene reads. Not a generic: that would copy
 /// the recursive eager expander (about 300 lines) into each of its nine callers.
 // dyn: one call per nested macro call, given by hir-def, which hir-expand can't name
-pub type EagerResolver<'a> = &'a dyn Fn(&ModPath) -> Option<MacroDefId>;
+pub type EagerResolver<'a> = &'a dyn Fn(&ModPath, SyntaxContext) -> Option<MacroDefId>;
 
 thread_local! {
     /// The span maps of eager inputs being expanded, one per nesting level, kept emptied.
@@ -267,9 +268,11 @@ fn eager_macro_recur_view<'db>(
         };
 
         let def = match call.path().and_then(|path| {
+            let ctxt = span_map.span_at(path.syntax().text_range().start()).ctx;
             ModPath::from_src_view(db, path, &mut |range| span_map.span_at(range.start()).ctx)
+                .map(|it| (it, ctxt))
         }) {
-            Some(path) => match macro_resolver(&path) {
+            Some((path, ctxt)) => match macro_resolver(&path, ctxt) {
                 Some(def) => def,
                 None => {
                     let edition = krate.data(db).edition;

@@ -75,10 +75,14 @@ use crate::{
 
 type R<T = ()> = Result<T, String>;
 
+/// What a [keyed](Name::keyed) name is written as before its name and context: a text no name
+/// has.
+const KEYED_NAME: &str = "\0";
+
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 17";
+pub const ENCODING: &str = "blaze frozen def map 18";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -176,11 +180,9 @@ pub fn record_difference(
 ) {
     let at = written.iter().zip(frozen).position(|(a, b)| a != b).unwrap_or(written.len());
     // alloc: Check/Verify only, which record differences; never when serving
-    let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
-    // alloc: Check/Verify only, which record differences; never when serving
     let said = format!(
         "the frozen {kind} of `{}` differs from {what}: {} bytes against {}, first at byte {at}",
-        name.as_deref().unwrap_or("?"),
+        krate.named(db),
         written.len(),
         frozen.len(),
     );
@@ -650,8 +652,17 @@ impl Enc<'_> {
         self.str(it.as_str())
     }
 
+    /// A name; a [keyed](Name::keyed) one as the mark `"\0"`, its name and its context, since
+    /// the context id in its symbol is this process's.
     pub fn name(&mut self, it: &Name) -> R {
-        self.symbol(it.symbol())
+        match it.key() {
+            None => self.symbol(it.symbol()),
+            Some(key) => {
+                self.str(KEYED_NAME)?;
+                self.str(it.as_str())?;
+                self.context(key)
+            }
+        }
     }
 
     fn edition(&mut self, it: Edition) {
@@ -1728,6 +1739,16 @@ impl Enc<'_> {
         for name in it.segments() {
             self.name(name)?;
         }
+        // The segments' contexts (`ModPath::contexts`): a 0, or a 1 and one per segment.
+        match it.contexts() {
+            None => self.u8(0),
+            Some(contexts) => {
+                self.u8(1);
+                for &ctxt in contexts {
+                    self.context(ctxt)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2267,7 +2288,13 @@ impl Dec<'_> {
     }
 
     pub fn name(&mut self) -> R<Name> {
-        Ok(Name::new_symbol_root(self.symbol()?))
+        let text = self.str()?;
+        if text != KEYED_NAME {
+            return Ok(Name::new_symbol_root(Symbol::intern(text)));
+        }
+        let name = Name::new_symbol_root(self.symbol()?);
+        let key = self.context()?;
+        Ok(name.keyed(key))
     }
 
     fn edition(&mut self) -> R<Edition> {
@@ -3117,7 +3144,19 @@ impl Dec<'_> {
             it => return Err(format!("path kind {it}")),
         };
         let segments = self.many(Self::name)?;
-        Ok(ModPath::from_segments(kind, segments))
+        match self.u8()? {
+            0 => Ok(ModPath::from_segments(kind, segments)),
+            1 => {
+                // alloc: decode scratch, one path
+                let mut contexts = Vec::with_capacity(segments.len());
+                for _ in 0..segments.len() {
+                    contexts.push(self.context()?);
+                }
+                Ok(ModPath::from_segments_in(kind, segments.into_iter().zip(contexts)))
+            }
+            // alloc: error path
+            it => Err(format!("path contexts tag {it}")),
+        }
     }
 
     fn cfg(&mut self) -> R<CfgExpr> {

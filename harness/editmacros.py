@@ -17,6 +17,7 @@ inline), all fields optional:
 
 import asyncio
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -24,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from blaze_cli import base_env, write  # noqa: E402
-from reachmacros import BUILD, Config, StepFailed, blaze  # noqa: E402
+from reachmacros import BUILD, Config, StepFailed  # noqa: E402
 
 MACRO = """\
 use proc_macro::{TokenStream, TokenTree};
@@ -53,6 +54,13 @@ pub fn answer() -> u32 {
     DERIVED + Thing::hello()
 }
 """
+
+
+def unexpected_cfg(step: str, stderr: str) -> None:
+    """Fails `step` when its stderr warns of a cfg the build script declares
+    (`cargo::rustc-check-cfg=cfg(from_build)`): the run's check-cfgs did not reach the lint."""
+    if re.search(r"unexpected `?cfg`? condition name: `?from_build", stderr):
+        raise StepFailed(f"{step}: `from_build` was called unexpected, though app's build script declares it:\n{stderr}")
 
 
 async def run(config: Config) -> None:
@@ -96,14 +104,31 @@ async def run(config: Config) -> None:
             raise StepFailed(f"edit: `blaze check --replace app::DERIVED=app::SEVEN` exited {process.returncode}:\n{tail}")
         if "can't be told" in stderr:
             raise StepFailed(f"edit: the edit refused to tell its answer:\n{stderr}")
+        unexpected_cfg("edit", stderr)
         if "Replaced" not in stderr:
             raise StepFailed(f"edit: the replace said nothing replaced:\n{stderr}\n{out.decode(errors='replace')}")
         text = (at / "app/src/lib.rs").read_text()
         if "SEVEN + Thing::hello()" not in text or "DERIVED" in text:
             raise StepFailed(f"edit: the derive's const's reference was not rewritten; app/src/lib.rs is:\n{text}")
         print(f"  {stderr.strip().splitlines()[-1]}", flush=True)
-        # The edited workspace still checks: the reference now names the item the edit chose.
-        await blaze("check", config, at, env, "check")
+        # The edited workspace still checks on the same daemon: the reference now names the
+        # item the edit chose, and the proc macro the edit built is loaded again from what that
+        # build kept.
+        check = await asyncio.create_subprocess_exec(
+            config.blaze, "check", cwd=at, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            async with asyncio.timeout(config.timeout_s):
+                _, err = await check.communicate()
+        except TimeoutError:
+            check.kill()
+            await check.wait()
+            raise StepFailed(f"check: `blaze check` did not end in {config.timeout_s}s") from None
+        stderr = err.decode(errors="replace")
+        if check.returncode != 0:
+            tail = "\n".join(stderr.splitlines()[-40:])
+            raise StepFailed(f"check: `blaze check` after the edit, on the same daemon, exited {check.returncode}:\n{tail}")
+        unexpected_cfg("check", stderr)
         passed = True
     finally:
         stop = await asyncio.create_subprocess_exec(

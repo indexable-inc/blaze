@@ -111,6 +111,16 @@ pub(crate) fn put_gave_ways(taken: std::num::NonZeroUsize) {
     GAVE_WAYS.with(|it| it.set(taken.get() as u64));
 }
 
+/// The task running here caught its item's give-way to run that item again later, and goes on
+/// to another item rather than ask again now: what a loop calls when it sets an item aside for
+/// its rerun ([`crate::par`], a test database's loop). The task's next ask still first waits for
+/// the run it gave way to where it can, but the give-way counts toward no bound
+/// (`sched::GaveWay::set_aside`), so a loop of any length whose items each give way to one
+/// run ends, as each item and its rerun can.
+pub fn rerun_later() {
+    sched::set_give_way_aside();
+}
+
 /// Counts a give-way of this task and says it: what a wait outside these flights calls when it
 /// would close a cycle, so a loop ([`crate::par`]) runs its item again as for a flight's own
 /// give-way. A write-once slot given back for its filler's rerun is one: its reader waits for the
@@ -131,6 +141,13 @@ pub fn give_way() -> Cancelled {
 /// its waiters asks again, the first to ask runs the key itself and the others wait for it,
 /// each wait checked again. A waiter gives way only for a cycle its own new wait would close,
 /// so of a cycle exactly one task gives way, and the others go on.
+///
+/// A task that gave way first waits for the run it gave way to before its next ask
+/// (`sched::before_claim`), so it never takes back what it let go of before that run's task
+/// had its turn. That wait is a new edge: if the run's task then asks for a key this task still
+/// holds (the retry is inside an outer run of its own), the run's task closes the cycle and
+/// gives way in turn, cancelling the run this task waited for. Nothing deadlocks, but that run
+/// is work lost.
 ///
 /// A task that asks for a key it runs itself (the run of a key asks, through its own calls,
 /// for the key) is a cycle of the keys themselves, not of the schedule: reposting cannot end
@@ -156,7 +173,14 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
 
     /// The value of `key`: run here by `run` when no one is running it, or waited for.
     /// `Err(Cancelled)` when waiting would close a cycle, or when `run` was cancelled; a run
-    /// this caller waited for that was cancelled is asked again (see [`Flights`]).
+    /// this caller waited for that was cancelled is asked again (see [`Flights`]). A task that
+    /// gave way first waits for the run it gave way to to end (`sched::before_claim`).
+    ///
+    /// # Panics
+    ///
+    /// Where `key` is asked by the task that runs it, or where this task asks again after the
+    /// bound's give-way in a row to a run that waits on what it holds
+    /// (`sched::NoProgress`): neither can ever end.
     pub fn get_or_run(
         &self,
         key: Key,
@@ -166,7 +190,8 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
     }
 
     /// [`Flights::get_or_run`], a wait's span (see [`WaitSpans`]) naming what it waits for by
-    /// what `named` writes, called only while a profiler spans waits.
+    /// what `named` writes. `named` is called while a profiler spans waits, at a give-way (the
+    /// record names the key it gave way to), and for the `NoProgress` panic.
     pub fn get_or_run_named(
         &self,
         key: Key,
@@ -174,6 +199,12 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
         run: impl FnOnce() -> Result<V, Cancelled>,
     ) -> Result<V, Cancelled> {
         sched::miss();
+        if let Err(stuck) = sched::before_claim() {
+            // alloc: the panic's message, once
+            let mut next = String::new();
+            named(&mut next);
+            panic!("{stuck}; it asked for {next} next");
+        }
         let me = task(sched::job_here());
         let claim = loop {
             let waiter = Waiter::new();
@@ -186,7 +217,7 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
             };
             let left = Left { runs: &self.runs, key, waiter: &waiter };
             let waiting = Waiting::begin(crate::wait::WaitKind::Key, &mut named, || Some(observed(runner)));
-            let got = wait(&waiter, flight(number));
+            let got = wait(&waiter, key, flight(number), &mut named);
             drop(waiting);
             drop(left);
             if let Some(value) = got? {
@@ -437,12 +468,20 @@ impl Drop for Waiting {
     }
 }
 
-/// Waits for the run `waiter` is linked into, suspending this task on the run's `flight`: its
-/// value, `None` when it was cancelled, or `Cancelled` when the wait would close a cycle. The
-/// runner writes every waiter's end before it ends the flight, so once the wait is over the
+/// Waits for the run of `key` (which the caller names by `named`) `waiter` is linked into,
+/// suspending this task on the run's `flight`: its value, `None` when it was cancelled, or
+/// `Cancelled` when the wait would close a cycle, which the scheduler remembers for this task's
+/// next ask (`sched::gave_way_on`).
+/// The runner writes every waiter's end before it ends the flight, so once the wait is over the
 /// end is there.
-fn wait<V>(waiter: &Waiter<V>, flight: Key) -> Result<Option<V>, Cancelled> {
-    if waiter.is_running() && sched::wait(Wait::Key(flight)).is_err() {
+fn wait<V>(waiter: &Waiter<V>, key: Key, flight: Key, named: &mut impl FnMut(&mut String)) -> Result<Option<V>, Cancelled> {
+    if waiter.is_running()
+        && let Err(cycle) = sched::wait(Wait::Key(flight))
+    {
+        // alloc: a give-way's record, rare: what the caller names the key, for the bound's error
+        let mut asked = String::new();
+        named(&mut asked);
+        sched::gave_way_on(key, asked.into_boxed_str(), flight, &cycle);
         return Err(give_way());
     }
     Ok(waiter.ended().unwrap_or_else(|| unreachable!("a wait on a run's flight ended before the run wrote its waiters")))

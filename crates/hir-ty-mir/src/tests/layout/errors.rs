@@ -23,7 +23,7 @@ enum Goal {
 "#,
     )
     .into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let goal: EnumId = crate_def_map(&db, krate)
             .modules(&db)

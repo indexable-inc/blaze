@@ -54,13 +54,8 @@ fn a_settled_map_rehashes_without_allocating() {
 #[test]
 #[cfg_attr(blaze_check, ignore = "the plane's workers: not the model checker's threads")]
 fn a_parallel_edit_of_every_entry_is_the_serial_one() {
-    let mut x = 0x9E37_79B9_7F4A_7C15u64;
-    let mut next = || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        x
-    };
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x9E37_79B9_7F4A_7C15);
+    let mut next = || rng.next_u64();
     for round in 0..8u64 {
         let (serial, parallel): (Map<u64>, Map<u64>) = (Map::new(), Map::new());
         let task = blaze_reclaim::enter();

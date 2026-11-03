@@ -1677,7 +1677,9 @@ pub(crate) fn fmt_range(lo: u128, hi: u128, max_hi: u128) -> String {
 
 pub(crate) fn type_name<'db>(db: &'db Db, ty: Ty<'db>) -> String {
     // alloc: error path: the message of a failure.
-    hir_ty_mir::mir::type_name::rustc_type_name(db, ty).unwrap_or_else(|| format!("{ty:?}"))
+    // `Debug` names a type only through the attached database: attach it here, where the
+    // text is made, on whatever worker the check runs.
+    hir_ty_mir::mir::type_name::rustc_type_name(db, ty).unwrap_or_else(|| blaze_query::db::attach(db, || format!("{ty:?}")))
 }
 
 fn variant_name(db: &Db, v: EnumVariantId) -> String {

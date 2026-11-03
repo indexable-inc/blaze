@@ -844,7 +844,8 @@ fn plans_of_a_workspace() {
     let hex = extra(lib);
     assert_eq!(lib.outputs[0], format!("{build}/app/{hex}/out/libapp-{hex}.rlib"));
     assert_eq!(get(&lib.env, "OUT_DIR"), Some(out_dir.as_str()));
-    assert_eq!(get(&lib.env, "CARGO_PRIMARY_PACKAGE"), Some("1"));
+    // Of the request (`Units::is_primary`), never of a plan: a plan is in its record's key.
+    assert_eq!(get(&lib.env, "CARGO_PRIMARY_PACKAGE"), None);
     assert_eq!(get(&lib.env, "CARGO_CRATE_NAME"), Some("app"));
     assert_eq!(get(&lib.env, "CARGO_BIN_NAME"), None);
     assert_eq!(lib.lints, ["--warn=blaze::hot_alloc", "--forbid=unsafe_code", "--warn=unexpected_cfgs"]);

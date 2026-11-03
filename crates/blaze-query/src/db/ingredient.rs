@@ -49,8 +49,9 @@ pub struct Vtable {
     /// Empties a function's provisional row (a cycle's round or its unwinding): only the
     /// thread of the row's cycle calls it.
     pub(crate) reset: Option<unsafe fn(storage: &Storage, ingredient: u32, id: Id)>,
-    /// At a view boundary, with no reader: evicts past the function's `lru` cap.
-    pub(crate) sweep: Option<fn(storage: &mut Storage, ingredient: u32)>,
+    /// At a view boundary, with no reader: evicts past the function's `lru` cap; returns how
+    /// many rows it read.
+    pub(crate) sweep: Option<fn(storage: &mut Storage, ingredient: u32) -> usize>,
     /// Moves each of its rows' edge spans into the compacted array.
     pub(crate) relocate: Option<fn(storage: &mut Storage, ingredient: u32, moved: &mut Relocate)>,
     /// Passes each view stamp its rows hold through `restamp`, storing what it gives: the

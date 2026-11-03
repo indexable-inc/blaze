@@ -24,7 +24,7 @@ use std::{
 
 use blaze_format::SchemaHash;
 use blaze_ids::{ContentId, Fingerprint};
-use blaze_reclaim::{Grace, Guard};
+use blaze_reclaim::{Grace, Guard, Horizon};
 
 use crate::{
     QueryKey, QueryKind, Stored,
@@ -242,13 +242,10 @@ struct Dying {
     checked: Vec<(Grace, MemoId)>,
 }
 
-/// How many of `held` (in the order their graces were started) have passed their grace.
-fn passed<T>(held: &[(Grace, T)]) -> usize {
-    match held.last() {
-        None => 0,
-        Some((newest, _)) if newest.passed() => held.len(),
-        Some(_) => held.iter().take_while(|(grace, _)| grace.passed()).count(),
-    }
+/// How many of `held` (in the order their graces were started) `horizon` passed: one scan of
+/// the reclaim slots for all of them, taken before the lock `held` is under.
+fn passed<T>(held: &[(Grace, T)], horizon: Horizon) -> usize {
+    held.iter().take_while(|&&(grace, _)| horizon.passed(grace)).count()
 }
 
 /// Every memo of the database and every value of a memo.
@@ -767,10 +764,11 @@ impl Store {
     /// those unlinked whose grace has passed (no task that read them from a slot is left, so
     /// no view can gain them any more), and those a view held at the last check.
     pub(crate) fn to_check<A: Allocator>(&self, out: &mut Vec<MemoId, A>) {
+        let horizon = Horizon::now();
         let mut dying = self.dying.lock();
         out.extend_from_slice(&dying.held);
         dying.held.clear();
-        let done = passed(&dying.unlinked);
+        let done = passed(&dying.unlinked, horizon);
         out.extend(dying.unlinked.drain(..done).map(|(_, memo)| memo));
     }
 
@@ -819,8 +817,9 @@ impl Store {
             // Freed outside the lock.
             let mut ready: Vec<MemoId, _> = Vec::new_in(frame);
             {
+                let horizon = Horizon::now();
                 let mut dying = self.dying.lock();
-                let done = passed(&dying.checked);
+                let done = passed(&dying.checked, horizon);
                 ready.extend(dying.checked.drain(..done).map(|(_, memo)| memo));
             }
             if ready.is_empty() {

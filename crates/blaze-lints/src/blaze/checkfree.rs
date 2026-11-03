@@ -121,7 +121,15 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     });
     let body = analysis.body();
     for mir in bodies {
-        for check in checks::checks(db, mir) {
+        let made = match checks::checks(db, mir) {
+            Ok(it) => it,
+            Err(error) => {
+                let message = format!("`{name}` is `#[blaze::checkfree]`, but its checks can't be read: {error}");
+                facts::push(&mut found, LINT, whole, message, None);
+                continue;
+            }
+        };
+        for check in made {
             if check.kind.is_optional() {
                 continue;
             }

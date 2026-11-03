@@ -626,7 +626,7 @@ pub(crate) fn write(values: &[Value], settles: u8) -> Sim {
     let mut store = open(&mut sim);
     assert!(store.ready(), "an empty store opens: {:?}", store.broken());
     for value in values {
-        store.put(value.key, value.kind, value.bytes.clone()).expect("a put of a key put once");
+        store.put(value.key, value.kind, &value.bytes).expect("a put of a key put once");
     }
     let mut effects = Vec::new();
     store.flush(&mut effects);

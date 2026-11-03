@@ -63,9 +63,9 @@ use std::{
 };
 
 use blaze_api::{
-    ApiError, Artifact, ArtifactKind, Diagnostic, Edit, FetchVerb, Level, LinkKind, Mismatch, Response,
-    ServedCrate, ServedPart, Targets, TestOutcome, TestResult, Traced, Ub, UnitOf, UnitStarted, Verb,
-    Worked,
+    ApiError, Artifact, ArtifactKind, Behind, Diagnostic, Edit, FetchVerb, Level, LinkKind, Mismatch,
+    OpenFailure, Response, ServedCrate, ServedPart, Targets, TestOutcome, TestResult, Traced, Ub,
+    Unchecked, UnitOf, UnitStarted, Verb, Worked,
     build::{Builder, JobId, Opened, Work},
 };
 use blaze_cas::{Placed, Store};
@@ -367,8 +367,6 @@ impl<S: Steps> plane::Work for Step<S> {
                 let Readers { this, mut images, .. } = readers;
                 let reader = this.expect("a task that reads is posted with its reader");
                 let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| front.compile(reader, unit, phase, &mut images)));
-                // Why the unit failed, when its compile panicked or erred, for its node.
-                let mut failed_why = None;
                 let compiled = match caught {
                     Ok(it) => it,
                     Err(payload) if payload.is::<blaze_query::db::Cancelled>() || payload.is::<blaze_graph::Cancelled>() => {
@@ -379,10 +377,11 @@ impl<S: Steps> plane::Work for Step<S> {
                         // The images it was relinking may be half written.
                         images.clear();
                         let refused = front.refused(unit, format!("blaze {panic}, making this unit")); // alloc: a panic, once
-                        failed_why = Some(panic.to_string()); // alloc: a panic, once
                         Ok(Some(Compiled {
                             diagnostics: vec![refused], // alloc: a panic, once
                             ok: false,
+                            open: false,
+                            why: Some(panic.to_string()), // alloc: a panic, once
                             puts: Vec::new(),
                             share: Vec::new(),
                             outputs: Vec::new(),
@@ -415,10 +414,11 @@ impl<S: Steps> plane::Work for Step<S> {
                             // alloc: an error, once
                             None => format!("blaze could not make this unit: {}", error.what),
                         };
-                        failed_why = Some(what.clone()); // clone: the node's why beside the unit's error, once
                         Ok(Compiled {
-                            diagnostics: vec![front.refused(unit, what)], // alloc: an error, once
+                            diagnostics: vec![front.refused(unit, what.clone())], // clone: the node's why beside the unit's error, once
                             ok: false,
+                            open: false,
+                            why: Some(what),
                             puts: Vec::new(),
                             share: Vec::new(),
                             outputs: Vec::new(),
@@ -430,11 +430,20 @@ impl<S: Steps> plane::Work for Step<S> {
                     }
                     Err(failed) => Err(failed),
                 };
-                let ok = matches!(&compiled, Ok(it) if it.ok);
+                let (ok, open, why) = match &compiled {
+                    // clone: a unit that failed, once
+                    Ok(it) => (it.ok, it.open, it.why.clone()),
+                    Err(_) => (false, false, None),
+                };
                 let mut did = self.settle(compiled, |it| Value::Compiled(unit, it, images))?;
                 if !ok && matches!(did.outcome, Outcome::Built) {
-                    let why = failed_why.unwrap_or_else(|| "it did not compile".to_owned()); // alloc: a unit that failed, once
-                    did.outcome = Outcome::Failed { why };
+                    let why = why.unwrap_or_else(|| "it did not compile".to_owned()); // alloc: a unit that failed, once
+                    did.outcome = match open {
+                        // Its items are sound: what is checked against them goes on under
+                        // keep-going, and the unit stays failed.
+                        true => Outcome::FailedOpen { why },
+                        false => Outcome::Failed { why },
+                    };
                 }
                 Some(did)
             }
@@ -551,9 +560,7 @@ fn lower_cost_key(checkout: &str) -> Key {
 /// each build script's run, whose cfgs, env and `OUT_DIR` files it is given (`Lowered::ran`).
 /// A build of them builds what they depend on, and nothing that depends on them.
 fn applied_units(units: &[blaze_units::schema::Unit]) -> Vec<u32> {
-    let applied = |unit: &blaze_units::schema::Unit| {
-        unit.mode == UnitMode::RunCustomBuild || (unit.mode == UnitMode::Build && unit.target.is_proc_macro())
-    };
+    let applied = |unit: &blaze_units::schema::Unit| unit.mode == UnitMode::RunCustomBuild || unit.gives_expanders();
     // alloc: once per view of a reach, a place per proc macro or build script
     (0u32..).zip(units).filter(|(_, unit)| applied(unit)).map(|(at, _)| at).collect()
 }
@@ -769,6 +776,15 @@ pub fn invocation(work: &Work, targets: Option<&Targets>, root: &str, env: &[(St
         env: env.to_vec(),     // alloc: an agent's whole environment, once per job
         files: Vec::new(),     // alloc: none, it stays empty
     }
+}
+
+/// Whether a job that said the diagnostics of no unit in `said` says `diagnostic`: one of a
+/// unit always; one of no unit is the job's, which every unit that meets it carries (the
+/// report of a toolchain function the front end failed on, made the same by each, and kept in
+/// each one's record), so only its first. Which unit's copy is said can vary with timing; what
+/// is said, and that it comes before any unit's error that points at it, does not.
+fn said_once(said: &mut HashSet<ContentId, Global>, diagnostic: &blaze_api::Diagnostic) -> bool {
+    diagnostic.unit.is_some() || said.insert(ContentId::of("blaze v2 serve job diagnostic said 1", diagnostic.rendered.as_bytes()))
 }
 
 /// Whether cargo's `args` ask for diagnostics a line each (`--message-format=short` or
@@ -1072,6 +1088,9 @@ struct Build<S: Steps> {
     refused: Option<Refused>,
     /// Each unit's freshness by its place in the plan, once asked ([`Build::is_fresh`]).
     fresh: Vec<Option<bool>>,
+    /// What became of each unit by its place in the plan, as its nodes settle: what the
+    /// build's report of what it left unchecked is made of ([`Build::unchecked`]).
+    verdicts: Vec<Verdict>,
     /// Of a build of only the units a view's front end applies ([`Jobs::next`]): how far it
     /// is, as its nodes settle; none for a build the job ends with.
     applying: Option<Applying>,
@@ -1105,6 +1124,20 @@ impl Refused {
         let at = *self.by.get(unit)?;
         self.whys.get(at as usize).map(String::as_str)
     }
+}
+
+/// What became of a unit of a build ([`Build::verdicts`]).
+#[derive(Clone)] // clone: the build's starting row, every unit unsettled
+enum Verdict {
+    /// Not settled yet, or not part of this build.
+    Unsettled,
+    /// Its last node ended well.
+    Done,
+    /// It failed: `open` when only its bodies or lints did ([`Compiled::open`]), so what
+    /// depends on it was still checked under keep-going; `why` as its node says.
+    Failed { open: bool, why: String },
+    /// It was skipped behind the failure of node `because`.
+    Skipped { because: NodeId },
 }
 
 struct Evaluation {
@@ -1161,6 +1194,87 @@ impl<S: Steps> Build<S> {
         error
     }
 
+    /// `node` settled: its unit's verdict, unless an earlier node of it gave one, or its
+    /// compile did ([`Jobs::compiled`]).
+    fn settled(&mut self, node: NodeId, ok: bool, why: Option<&str>, skipped: Option<NodeId>) {
+        let Some(unit) = self.unit(node) else { return };
+        let at = node.0.wrapping_sub(self.first.0) as usize;
+        let last = self.units.get(at + 1) != Some(&(unit as u32));
+        let Some(verdict) = self.verdicts.get_mut(unit) else { return };
+        if !matches!(verdict, Verdict::Unsettled) {
+            return;
+        }
+        *verdict = match (ok, skipped) {
+            (_, Some(because)) => Verdict::Skipped { because },
+            // alloc: a unit that failed, once
+            (false, None) => Verdict::Failed { open: false, why: why.unwrap_or("it failed").to_owned() },
+            (true, None) if last => Verdict::Done,
+            (true, None) => return,
+        };
+    }
+
+    /// What the build left unchecked behind its failures and what it checked against a unit
+    /// that failed open, from its units' verdicts, in the plan's order; none when it names
+    /// nothing. `stopped`: the build stops at its first failure, so everything after it is
+    /// skipped behind that one.
+    fn unchecked(&self, stopped: bool) -> Option<Unchecked> {
+        let graph = &self.input.units.graph.units;
+        let name = |at: usize| graph.get(at).map(super::unit::span_unit);
+        // Each skipped unit with the unit it is behind (`usize::MAX` for a node of no unit).
+        let mut skipped: Vec<(usize, usize)> = (self.verdicts.iter().enumerate())
+            .filter_map(|(at, it)| match it {
+                Verdict::Skipped { because } => Some((self.unit(*because).unwrap_or(usize::MAX), at)),
+                _ => None,
+            })
+            .collect(); // alloc: once per build that skipped a unit
+        skipped.sort_unstable();
+        let mut behind: Vec<Behind> = Vec::new(); // alloc: none until a unit was skipped
+        let mut last_root = None;
+        for (root, at) in skipped {
+            if last_root.replace(root) != Some(root) {
+                let why = match self.verdicts.get(root) {
+                    Some(Verdict::Failed { why, .. }) => why.clone(), // clone: a failure, once in the report
+                    _ => "it failed".to_owned(),                      // alloc: as above
+                };
+                let unit = name(root).unwrap_or_else(|| "a step of the build that is no unit".to_owned()); // alloc: as above
+                behind.push(Behind { why, unit, units: Vec::new() }); // alloc: one per failure
+            }
+            if let (Some(group), Some(unit)) = (behind.last_mut(), name(at)) {
+                group.units.push(unit);
+            }
+        }
+        let mut open = Vec::new(); // alloc: none until a unit failed open
+        if self.verdicts.iter().any(|it| matches!(it, Verdict::Failed { open: true, .. })) {
+            // Each unit's dependents in the plan, to walk what was checked against a unit.
+            let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); graph.len()]; // alloc: once per build with a unit failed open
+            for (at, unit) in graph.iter().enumerate() {
+                for dep in &unit.dependencies {
+                    if let Some(it) = dependents.get_mut(dep.index as usize) {
+                        it.push(at);
+                    }
+                }
+            }
+            for (failed, _) in self.verdicts.iter().enumerate().filter(|(_, it)| matches!(it, Verdict::Failed { open: true, .. })) {
+                let mut seen = vec![false; graph.len()]; // alloc: once per unit failed open
+                let mut stack = dependents[failed].clone(); // clone: as above
+                while let Some(at) = stack.pop() {
+                    if std::mem::replace(&mut seen[at], true) {
+                        continue;
+                    }
+                    stack.extend_from_slice(&dependents[at]);
+                }
+                let checked = (0..graph.len())
+                    .filter(|&at| seen[at] && matches!(self.verdicts[at], Verdict::Done | Verdict::Failed { .. }))
+                    .filter_map(name)
+                    .collect(); // alloc: once per unit failed open
+                if let Some(unit) = name(failed) {
+                    open.push(OpenFailure { unit, checked });
+                }
+            }
+        }
+        (!behind.is_empty() || !open.is_empty()).then_some(Unchecked { open, behind, stopped })
+    }
+
     /// Whether `node` is its unit's first: the one whose start is the unit's.
     fn begins(&self, node: NodeId) -> bool {
         let at = node.0.wrapping_sub(self.first.0) as usize;
@@ -1204,6 +1318,10 @@ struct Job<S: Steps> {
     value: Option<(NodeId, Value<S>)>,
     /// Index files and git repositories reported as `Updating`, once each.
     updating: HashSet<String, Global>,
+    /// The diagnostics of no unit it said, by their text's content ID: each is the job's
+    /// (a toolchain function every unit that reaches it fails on), said once however many
+    /// units carry it ([`said_once`]).
+    said: HashSet<ContentId, Global>,
     /// Opened by the job and closed as it finishes, but `built`.
     queries: Vec<ViewId>,
     /// The one of `queries` its last view was made ready in: handed to the session as it
@@ -2071,6 +2189,7 @@ impl<S: Steps> Jobs<S> {
             stage: Stage::Over,
             value: None,
             updating: HashSet::new_in(Global),
+            said: HashSet::new_in(Global),
             queries: Vec::new(),  // alloc: once per job
             built: None,
             borrowed: Vec::new(), // alloc: once per job
@@ -2387,7 +2506,7 @@ impl<S: Steps> Jobs<S> {
                 Happened::Post { task, again } => self.post(w, task, again),
                 Happened::Run { id } => self.run_script(w, id),
                 Happened::Panicked { id, panic } => self.panicked(id, &panic),
-                Happened::Settled { id, ok, why } => self.settled(w, id, ok, why),
+                Happened::Settled { id, ok, why, skipped } => self.settled(w, id, ok, why, skipped),
                 Happened::Finished { request, ok, stats } => self.plane_finished(w, request, ok, stats),
             }
         }
@@ -2524,9 +2643,12 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
-    fn settled(&mut self, w: &mut World<'_, S>, node: NodeId, ok: bool, why: Option<String>) {
+    fn settled(&mut self, w: &mut World<'_, S>, node: NodeId, ok: bool, why: Option<String>, skipped: Option<NodeId>) {
         let Some(id) = self.batches.job_of(node) else { return };
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        if let Stage::Units(build) = &mut job.stage {
+            build.settled(node, ok, why.as_deref(), skipped);
+        }
         // Its store settles after the job is over: what it left for the store is put still.
         if job.storing.as_ref().is_some_and(|it| it.node == node) {
             self.stored_kept(w, id, why);
@@ -2623,7 +2745,7 @@ impl<S: Steps> Jobs<S> {
                     job.misses.append(&mut misses);
                     for put in puts {
                         let (key, kind) = (put.key, put.kind);
-                        match w.store.put(put.key, put.kind, put.bytes) {
+                        match w.store.put(put.key, put.kind, &put.bytes) {
                             Ok(ticket) => self.put.add(ticket),
                             Err(mismatch) => {
                                 // alloc: an error, once
@@ -2912,7 +3034,7 @@ impl<S: Steps> Jobs<S> {
                 let put = !puts.is_empty();
                 for super::work::KeptPut { put, what } in puts {
                     let (key, kind) = (put.key, put.kind);
-                    match w.store.put(put.key, put.kind, put.bytes) {
+                    match w.store.put(put.key, put.kind, &put.bytes) {
                         // Each ticket is waited on: a value kept already gets the ticket of the
                         // put that kept it, from any writer's segment, so no one ticket stands
                         // for the rest ([`blaze_cas::Tickets`]).
@@ -3127,6 +3249,7 @@ impl<S: Steps> Jobs<S> {
         // not built. A unit's first node waits for the last of each unit it depends on.
         let mut last = vec![u32::MAX; all.len()]; // alloc: once per build
         let fresh_units = vec![None; all.len()]; // alloc: once per build
+        let verdicts = vec![Verdict::Unsettled; all.len()]; // alloc: once per build
         let mut units_of = Vec::new(); // alloc: once per build, a unit a node
         let (mut names, mut all_deps) = (0, 0);
         for offset in 0..built {
@@ -3259,6 +3382,7 @@ impl<S: Steps> Jobs<S> {
             evaluation,
             refused: None,
             fresh: fresh_units,
+            verdicts,
             applying: applying.then_some(Applying { left: count, failed: false }),
         }));
         if count > 0 {
@@ -3509,6 +3633,18 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         };
+        if let Stage::Units(build) = &mut job.stage
+            && let Some(verdict) = build.verdicts.get_mut(unit)
+        {
+            *verdict = match compiled.ok {
+                true => Verdict::Done,
+                false => Verdict::Failed {
+                    open: compiled.open,
+                    // clone: a unit that failed, once
+                    why: compiled.why.clone().unwrap_or_else(|| "it did not compile".to_owned()),
+                },
+            };
+        }
         if let (Some(macros), Stage::Units(build)) = (compiled.macros.take(), &mut job.stage)
             && let Err(error) = build.writer.macros(unit, macros)
         {
@@ -3538,7 +3674,9 @@ impl<S: Steps> Jobs<S> {
             (ended, ..) => ended,
         };
         for diagnostic in compiled.diagnostics {
-            w.said.push(Said::Report(id, Response::Diagnostic(diagnostic)));
+            if said_once(&mut job.said, &diagnostic) {
+                w.said.push(Said::Report(id, Response::Diagnostic(diagnostic)));
+            }
         }
         if let Some(unit) = ended {
             w.said.push(Said::Report(id, Response::UnitEnded(unit)));
@@ -3561,7 +3699,7 @@ impl<S: Steps> Jobs<S> {
         };
         for put in compiled.puts {
             let kind = put.kind;
-            match w.store.put(put.key, put.kind, put.bytes) {
+            match w.store.put(put.key, put.kind, &put.bytes) {
                 Ok(ticket) => self.put.add(ticket),
                 Err(mismatch) => {
                     let error = mismatched("the store", kind, mismatch);
@@ -3578,7 +3716,7 @@ impl<S: Steps> Jobs<S> {
         // against its hash, so a share torn or lost is a miss, compiled again by whoever asks.
         for put in compiled.share {
             let kind = put.kind;
-            if let Err(mismatch) = w.std.put(put.key, put.kind, put.bytes) {
+            if let Err(mismatch) = w.std.put(put.key, put.kind, &put.bytes) {
                 let error = mismatched("the standard library's shared store", kind, mismatch);
                 job.over.get_or_insert((false, Some(error)));
             }
@@ -3956,6 +4094,12 @@ impl<S: Steps> Jobs<S> {
             let error = ApiError::new(what, Some(root.clone())); // clone: an error, once
             self.end(w, id, false, Some(error));
             return;
+        }
+        // What a failed build left unchecked, before its `Built` and the job's end.
+        if let Stage::Units(build) = &job.stage
+            && let Some(unchecked) = build.unchecked(!keeps_going(&job.work))
+        {
+            w.said.push(Said::Report(id, Response::Unchecked(unchecked)));
         }
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
         let Build { input, front, mut writer, artifacts, evaluation, root, units, .. } = *build;

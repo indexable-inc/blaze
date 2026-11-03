@@ -55,6 +55,8 @@ mod flow_tests;
 #[cfg(test)]
 mod missing_body_tests;
 #[cfg(test)]
+mod rpitit_tests;
+#[cfg(test)]
 mod served;
 
 #[cfg(test)]
@@ -553,7 +555,8 @@ fn check_owner_once<'db>(
         Ok(body) => body,
         Err(error) => {
             // alloc: the owned result, once, when MIR lowering refuses the body
-            result.skipped = Some(format!("{error:?}"));
+            // Rendered with `db` attached: the error's types name themselves only through it.
+            result.skipped = Some(blaze_query::db::attach(db, || format!("{error:?}")));
             return result;
         }
     };
@@ -609,7 +612,7 @@ fn check_owner_once<'db>(
                 }
                 Err(error) => {
                     // alloc: the owned result, once, when MIR lowering refuses a body
-                    result.skipped.get_or_insert_with(|| format!("{what}: {error:?}"));
+                    result.skipped.get_or_insert_with(|| blaze_query::db::attach(db, || format!("{what}: {error:?}")));
                 }
             }
         }

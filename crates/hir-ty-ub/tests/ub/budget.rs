@@ -58,7 +58,7 @@ fn steps_and_site_hits_allocate_nothing() {
     let fx = fixture::db(program!("sized", "fn main() {}\n"));
     let file = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let owner = InferBodyId::DefWithBodyId(main_of(&db, file).into());
         let a = Site { owner, span: MirSpan::Unknown };
         let b = Site { owner, span: MirSpan::SelfParam };

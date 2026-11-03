@@ -47,25 +47,26 @@ pub struct Asked {
 /// The crates `cargo doc` documents for `asked`: those, and unless `no_deps` every library
 /// they depend on, directly or not, but none of the sysroot's and none only tests use. Two
 /// crates of one name keep the one asked for, else as `one_per_name` says, and a crate only
-/// one left out depends on is left out too.
+/// one left out depends on is left out too. A crate with no name is refused: its pages are
+/// filed under its name.
 pub fn crates_to_document(
     db: &Db,
     asked: &[Asked],
     no_deps: bool,
     test_only: &TestOnly,
-) -> Vec<Documented> {
+) -> Result<Vec<Documented>, base_db::UnnamedCrate> {
     let mut out: Vec<Documented> = vec![];
     let mut names = HashSet::new_in(Global);
     let mut seen = HashSet::new_in(Global);
     for it in asked {
-        let name = crate_name(db, it.krate);
+        let name = crate_name(db, it.krate)?;
         if names.insert(name.clone()) {
             seen.insert(it.krate);
             out.push(Documented { krate: it.krate, name, private: it.private, warn: true });
         }
     }
     if no_deps {
-        return out;
+        return Ok(out);
     }
     // Each crate reached, and whether a path to it leads through no proc macro: cargo builds
     // a proc macro and everything it depends on for the host, the rest for the target.
@@ -92,12 +93,11 @@ pub fn crates_to_document(
     }
     let reached = reached
         .into_iter()
-        .map(|(krate, target)| Reached {
-            name: crate_name(db, krate),
-            krate,
-            version: krate.version(db).unwrap_or_default(),
-            target,
+        .map(|(krate, target)| {
+            Ok(Reached { name: crate_name(db, krate)?, krate, version: krate.version(db).unwrap_or_default(), target })
         })
+        .collect::<Result<Vec<_>, base_db::UnnamedCrate>>()?
+        .into_iter()
         .filter(|it| !names.contains(&it.name))
         .collect();
     let kept = one_per_name(reached);
@@ -117,7 +117,7 @@ pub fn crates_to_document(
         name: it.name,
         private: false,
     }));
-    out
+    Ok(out)
 }
 
 fn is_proc_macro(db: &Db, krate: Crate) -> bool {
@@ -186,11 +186,9 @@ fn version_key(version: &str) -> (Vec<u64>, bool, String) {
 }
 
 /// The name code uses for a crate: its library name, `-` as `_`.
-pub fn crate_name(db: &Db, krate: Crate) -> String {
-    krate
-        .display_name(db)
-        .map(|it| it.crate_name().to_string())
-        .unwrap_or_else(|| "unknown".to_owned())
+/// The name `krate`'s pages are filed under: its Rust name ([`base_db::Crate::rust_name`]).
+fn crate_name(db: &Db, krate: Crate) -> Result<String, base_db::UnnamedCrate> {
+    krate.base().rust_name(db).map(|it| it.as_str().to_owned()) // alloc: a documented crate's name, once
 }
 
 fn is_sysroot(db: &Db, krate: Crate) -> bool {

@@ -51,7 +51,7 @@ fn check_fail(
     let fx = fixture::db(ra_fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || match eval_goal(&db, file_id) {
+    blaze_query::db::attach(&db, || match eval_goal(&db, file_id) {
         Ok(_) => panic!("Expected fail, but it succeeded"),
         Err(e) => {
             assert!(
@@ -118,7 +118,7 @@ fn check_answer_in(
     file_id: EditionedFileId,
     check: impl FnOnce(&[u8], &MemoryMap<'_>),
 ) {
-    crate::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let r = match eval_goal(db, file_id) {
             Ok(t) => t,
             Err(e) => {
@@ -2688,7 +2688,7 @@ const GOAL: usize = n::<{ S }>() * 10 + of_s([0; 5]);
     let fx = fixture::db(fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def_map = hir_def::nameres::crate_def_map(&db, fixture::test_crate(&db));
         for (_, module) in def_map.modules(&db) {
             for def in module.scope(&db).declarations() {
@@ -2824,7 +2824,7 @@ fn enums() {
     );
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let r = eval_goal(&db, file_id).unwrap();
         assert_eq!(allocation_as_usize(r), 1);
     })
@@ -2956,7 +2956,7 @@ fn implicit_discriminant_past_the_repr_type_is_an_error() {
     );
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let table = crate::consteval::discriminants::enum_discriminants(&db, enum_in(&db, file_id));
         assert_eq!(table.overflowed(), [1]);
         assert!(table.discriminant(1).is_err() && table.discriminant(2).is_err());
@@ -2977,7 +2977,7 @@ fn duplicate_discriminants_are_found_in_one_pass() {
     );
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let table = crate::consteval::discriminants::enum_discriminants(&db, enum_in(&db, file_id));
         assert!(table.has_duplicates());
         let groups: Vec<Vec<u32>> = table.duplicates().iter().map(|it| it.to_vec()).collect();
@@ -3007,7 +3007,7 @@ fn every_discriminant_and_the_layout_of_a_big_enum_take_one_pass() {
         let db = fx.into_db();
         let e = enum_in(&db, file_id);
         let ids: Vec<_> = e.enum_variants(&db).variants.values().map(|it| it.0).collect();
-        crate::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let start = std::time::Instant::now();
             let executed = db.log_executed(|| {
                 for (index, &variant) in ids.iter().enumerate() {
@@ -3654,6 +3654,30 @@ fn exec_limits() {
     const GOAL: i32 = f(1000);
     "#,
         1000 * 1000,
+    );
+}
+
+/// `long_running_const_eval` counts what rustc's `CtfeLimit` pass counts, a call or a loop's
+/// back edge, not every block: 300,000 turns of a loop of 15 or so blocks each run more than
+/// 2,000,000 blocks but are 300,000 steps, which rustc takes (blaze-profile's `VIEWS` is such a
+/// loop over its SQL).
+#[test]
+fn long_running_lint_counts_loop_turns_not_blocks() {
+    check_number(
+        r#"
+    const GOAL: usize = {
+        let mut i = 0;
+        let mut n = 0;
+        while i < 300_000 {
+            if i % 3 == 0 {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
+    };
+    "#,
+        100_000,
     );
 }
 

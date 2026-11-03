@@ -1,20 +1,21 @@
 //! A MIR lowering error in words a person reads, for the error a build stops with when an item
 //! has no hash ([`crate::Unhashable::describe`]) and for the evaluator's stops: a call with no
 //! function names its callee as written, where it is (`file:line:column`) and why inference
-//! resolved it to nothing; the body of a trait method written without one names the method;
-//! any other error is its `Debug`.
+//! resolved it to nothing; the body of a trait method written without one names the method; a
+//! name that resolves to nothing names itself, where it is and the item whose body has it; any
+//! other error is its `Debug`.
 
 use std::fmt::Write as _;
 
 use base_db::Db;
 use hir_def::{
-    DefWithBodyId, HasModule,
+    DefWithBodyId, ExpressionStoreOwnerId, HasModule,
     signatures::TraitSignature,
     expr_store::{ExpressionStore, pretty::print_expr_hir},
-    hir::{Expr, ExprId, ExprOrPatIdPacked},
+    hir::{Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked},
     span_names,
 };
-use hir_expand::InFile;
+use hir_expand::{InFile, mod_path::ModPath};
 use hir_ty::{
     InferBodyId, InferenceDiagnostic, InferenceResult,
     display::{DisplayTarget, HirDisplay},
@@ -27,7 +28,7 @@ use span::{FileId, TextRange};
 pub fn write(db: &Db, error: &MirLowerError<'_>, out: &mut String) {
     match error {
         MirLowerError::MissingFunctionDefinition(owner, call) => {
-            hir_ty::attach_db(db, || missing_function(db, *owner, *call, out));
+            blaze_query::db::attach(db, || missing_function(db, *owner, *call, out));
         }
         MirLowerError::TraitFunctionDefinition(trait_, name) => {
             let edition = DisplayTarget::from_crate(db, trait_.krate(db)).edition;
@@ -38,8 +39,30 @@ pub fn write(db: &Db, error: &MirLowerError<'_>, out: &mut String) {
                 name.display(db, edition),
             );
         }
+        MirLowerError::UnresolvedName { owner, path, at } => unresolved_name(db, *owner, path.as_ref(), *at, out),
         other => _ = write!(out, "{other:?}"),
     }
+}
+
+/// A path lowering found nothing for (rustc's E0425): the path as written, where it is
+/// (`file:line:column`, in a macro's output where the macro was called) and the item whose body
+/// has it, so a crate whose own diagnostics a build does not show (std, for a program) still
+/// says what failed in words.
+fn unresolved_name(db: &Db, owner: ExpressionStoreOwnerId, path: Option<&ModPath>, at: ExprOrPatId, out: &mut String) {
+    let edition = DisplayTarget::from_crate(db, owner.krate(db)).edition;
+    match path {
+        Some(path) => _ = write!(out, "the name `{}`", path.display(db, edition)),
+        None => out.push_str("a lang item's path"),
+    }
+    let (_, source_map) = ExpressionStore::with_source_map(db, owner);
+    if let Ok(source) = source_map.expr_or_pat_syntax(at) {
+        let range = source.map(|it| it.text_range()).original_node_file_range_rooted(db);
+        _ = write!(out, " at {}", file_place(db, range.file_id.file_id(db), range.range));
+    }
+    if let ExpressionStoreOwnerId::Body(def) = owner {
+        _ = write!(out, " in `{}`", body_path(db, def));
+    }
+    out.push_str(" resolves to nothing (E0425)");
 }
 
 /// The call `call` of `owner`'s body, which lowering found no function for: its callee as

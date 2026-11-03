@@ -15,7 +15,6 @@ doctest = false
 
 [dependencies]
 blaze-reclaim.workspace = true
-blaze-spin.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
 
@@ -30,12 +29,18 @@ blaze-check.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-rng.workspace = true
 hegeltest.workspace = true
 
 # Random reads over 1 GiB on base, transparent and reserved huge pages, in page walks per read
 # against the bound; prints a verdict.
 [[bench]]
 name = "huge"
+harness = false
+
+# The warm take and give of a `Kept` block, on one thread and several, in ns per pair.
+[[bench]]
+name = "kept"
 harness = false
 
 [lints]

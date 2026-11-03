@@ -146,7 +146,7 @@ fn a_put_is_read_at_once_durable_after_a_flush_and_there_after_reopening() {
     ];
     let mut tickets = Vec::new();
     for (key, kind, bytes) in &values {
-        tickets.push(store.put(*key, *kind, bytes.clone()).unwrap());
+        tickets.push(store.put(*key, *kind, bytes).unwrap());
         let entry = store.get(key).unwrap().unwrap();
         assert_eq!((entry.kind, entry.bytes), (*kind, bytes.as_slice()));
         assert_eq!(entry.content, content_of(bytes));
@@ -180,12 +180,12 @@ fn tickets_wait_on_each_segment_where_one_max_of_them_would_not() {
     let mut store = open(&mut sim, "store");
     let mut writer = store.writer();
     let guard = enter();
-    let early = writer.put(&guard, key(1), Kind::Query, b"a writer's put".to_vec()).unwrap();
-    let earlier = writer.put(&guard, key(2), Kind::Query, b"a writer's first".to_vec()).unwrap();
+    let early = writer.put(&guard, key(1), Kind::Query, b"a writer's put").unwrap();
+    let earlier = writer.put(&guard, key(2), Kind::Query, b"a writer's first").unwrap();
     drop(guard);
     flush(&mut sim, &mut store);
     assert!(store.durable(early) && store.durable(earlier));
-    let late = store.put(key(3), Kind::Query, b"the store's own, after".to_vec()).unwrap();
+    let late = store.put(key(3), Kind::Query, b"the store's own, after").unwrap();
     assert!(!store.durable(late));
     // One max is no bound: it stands for the writer's put, durable, and not the store's.
     assert!(store.durable(early.max(late)), "the writer's segment is above the store's own");
@@ -207,16 +207,16 @@ fn tickets_wait_on_each_segment_where_one_max_of_them_would_not() {
 fn a_second_put_keeps_the_first_and_other_bytes_are_a_mismatch() {
     let mut sim = Sim::new(2, quiet());
     let mut store = open(&mut sim, "store");
-    let first = store.put(key(1), Kind::Query, b"one".to_vec()).unwrap();
-    let again = store.put(key(1), Kind::Query, b"one".to_vec()).unwrap();
+    let first = store.put(key(1), Kind::Query, b"one").unwrap();
+    let again = store.put(key(1), Kind::Query, b"one").unwrap();
     assert!(again >= first);
-    let mismatch = store.put(key(1), Kind::Query, b"two".to_vec()).unwrap_err();
+    let mismatch = store.put(key(1), Kind::Query, b"two").unwrap_err();
     assert_eq!(mismatch.kept, content_of(b"one"));
     assert_eq!(mismatch.given, content_of(b"two"));
     flush(&mut sim, &mut store);
-    let durable_again = store.put(key(1), Kind::Query, b"one".to_vec()).unwrap();
+    let durable_again = store.put(key(1), Kind::Query, b"one").unwrap();
     assert!(store.durable(durable_again), "a value already durable needs no wait");
-    assert!(store.put(key(1), Kind::Query, b"two".to_vec()).is_err());
+    assert!(store.put(key(1), Kind::Query, b"two").is_err());
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"one");
 }
 
@@ -225,10 +225,10 @@ fn a_second_put_keeps_the_first_and_other_bytes_are_a_mismatch() {
 fn a_put_of_a_value_in_flight_is_durable_with_its_commit() {
     let mut sim = Sim::new(3, quiet());
     let mut store = open(&mut sim, "store");
-    let ticket = store.put(key(1), Kind::Code, b"code".to_vec()).unwrap();
+    let ticket = store.put(key(1), Kind::Code, b"code").unwrap();
     let mut effects = Vec::new();
     store.flush(&mut effects);
-    let again = store.put(key(1), Kind::Code, b"code".to_vec()).unwrap();
+    let again = store.put(key(1), Kind::Code, b"code").unwrap();
     let durable = drive(&mut sim, &mut store, &mut effects);
     assert!(durable.contains(&ticket));
     assert!(store.durable(again));
@@ -296,7 +296,7 @@ fn a_put_that_lost_its_key_to_another_writers_is_durable_after_a_flush_with_noth
     loser.own.pause = Some(hook);
     let racing = std::thread::spawn(move || {
         let guard = enter();
-        let ticket = loser.put(&guard, key(1), Kind::Query, b"one value".to_vec()).unwrap();
+        let ticket = loser.put(&guard, key(1), Kind::Query, b"one value").unwrap();
         drop(guard);
         ticket
     });
@@ -307,7 +307,7 @@ fn a_put_that_lost_its_key_to_another_writers_is_durable_after_a_flush_with_noth
     assert_eq!(lost.len(), 1, "the loser's put is counted: {lost:?}");
     let lost = lost[0];
     let guard = enter();
-    let won = winner.put(&guard, key(1), Kind::Query, b"one value".to_vec()).unwrap();
+    let won = winner.put(&guard, key(1), Kind::Query, b"one value").unwrap();
     drop(guard);
     flush(&mut sim, &mut store);
     assert!(store.durable(won), "the winner's put is committed");
@@ -334,7 +334,7 @@ fn a_put_that_panics_after_it_is_counted_still_ends_and_its_wait_ends() {
     writer.own.pause = Some(std::sync::Arc::new(|it| assert_ne!(it, PutAt::Written, "a bug of the put's, past its claim")));
     let guard = enter();
     let put = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        writer.put(&guard, key(1), Kind::Query, b"a put that panicked".to_vec())
+        writer.put(&guard, key(1), Kind::Query, b"a put that panicked")
     }));
     drop(guard);
     assert!(put.is_err(), "the put panicked");
@@ -345,7 +345,7 @@ fn a_put_that_panics_after_it_is_counted_still_ends_and_its_wait_ends() {
     assert_eq!(waits.pending(|it| store.durable(it)), None, "the wait on everything put ends after a flush");
     assert!(store.last_puts().is_empty());
     let guard = enter();
-    let next = writer.put(&guard, key(2), Kind::Query, b"after it".to_vec()).unwrap();
+    let next = writer.put(&guard, key(2), Kind::Query, b"after it").unwrap();
     drop(guard);
     flush(&mut sim, &mut store);
     assert!(store.durable(next), "the writer goes on after a panic of its put");
@@ -366,7 +366,7 @@ fn a_put_read_on_another_thread_before_it_ends_is_waited_on_until_a_later_commit
     writer.own.pause = Some(hook);
     let putting = std::thread::spawn(move || {
         let guard = enter();
-        let ticket = writer.put(&guard, key(1), Kind::Query, b"put on another thread".to_vec()).unwrap();
+        let ticket = writer.put(&guard, key(1), Kind::Query, b"put on another thread").unwrap();
         drop(guard);
         ticket
     });
@@ -380,7 +380,7 @@ fn a_put_read_on_another_thread_before_it_ends_is_waited_on_until_a_later_commit
     let counted = waits.iter().collect::<Vec<_>>();
     assert_eq!(counted.len(), 1, "a put whose key was read is counted: {counted:?}");
     let counted = counted[0];
-    let other = store.put(key(2), Kind::Query, b"the loop's own".to_vec()).unwrap();
+    let other = store.put(key(2), Kind::Query, b"the loop's own").unwrap();
     flush(&mut sim, &mut store);
     assert!(store.durable(other), "a commit ran");
     assert!(!store.durable(counted), "a put not ended is not drained, so no commit made it durable");
@@ -415,19 +415,19 @@ fn output_with_a_last_chunk_a_settle_moves() -> Vec<u8> {
 /// chunk: every chunk but the last compresses and is at least [`DEMOTE_FROM`], so a settle
 /// moves them cold once unread for two periods; the last is under [`DEMOTE_FROM`] and stays.
 fn text_output_with_a_short_last_chunk() -> Vec<u8> {
-    output_of(text(441, 2 * CHUNK_FROM), |rest| rest[..100].to_vec())
+    output_of(&text(441, 2 * CHUNK_FROM), |rest| rest[..100].to_vec())
 }
 
 /// Noise up to its first chunk cut past [`CHUNK_FROM`], then `tail(the noise after the cut)`
 /// as its last chunk, shorter than a chunk's least.
 fn output_ending_in(tail: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
-    output_of(noise(2 * CHUNK_FROM, 440), tail)
+    output_of(&noise(2 * CHUNK_FROM, 440), tail)
 }
 
 /// `long` up to its first chunk cut past [`CHUNK_FROM`], then `tail(the rest)` as its last
 /// chunk, shorter than a chunk's least.
-fn output_of(long: Vec<u8>, tail: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
-    let cut = chunk::cuts(&long).map(|it| it.end).find(|&end| end >= CHUNK_FROM).unwrap();
+fn output_of(long: &[u8], tail: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
+    let cut = chunk::cuts(long).map(|it| it.end).find(|&end| end >= CHUNK_FROM).unwrap();
     let tail = tail(&long[cut..]);
     let mut out = long[..cut].to_vec();
     out.extend_from_slice(&tail);
@@ -505,7 +505,7 @@ fn a_chunk_claim_race(
     let mut sim = Sim::new(seed, quiet());
     let mut store = open(&mut sim, "store");
     for n in 0..before {
-        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+        store.put(key(1000 + n), Kind::Query, &noise(64, 1000 + n)).unwrap();
     }
     let chunks = chunk::cuts(&out).count();
     let mut b = store.writer();
@@ -524,7 +524,7 @@ fn a_chunk_claim_race(
     let b_out = out.clone();
     let b_put = std::thread::spawn(move || {
         let guard = enter();
-        let ticket = b.put(&guard, key(1), Kind::Output, b_out).unwrap();
+        let ticket = b.put(&guard, key(1), Kind::Output, &b_out).unwrap();
         drop(guard);
         ticket
     });
@@ -532,7 +532,7 @@ fn a_chunk_claim_race(
     let a_out = out.clone();
     let a_put = std::thread::spawn(move || {
         let guard = enter();
-        let ticket = a.put(&guard, key(2), Kind::Output, a_out).unwrap();
+        let ticket = a.put(&guard, key(2), Kind::Output, &a_out).unwrap();
         drop(guard);
         ticket
     });
@@ -606,7 +606,7 @@ fn a_copy_that_is_a_chunks_only_durable_record_survives_a_settle_and_a_crash() {
     let last = *chunk_keys(&out).last().unwrap();
     let home = store.loc_of(&last);
     // A later pack of the unit, so B's copy's pack may be retired.
-    store.put(key(3), Kind::Output, noise(CHUNK_FROM - 1, 3)).unwrap();
+    store.put(key(3), Kind::Output, &noise(CHUNK_FROM - 1, 3)).unwrap();
     flush(&mut sim, &mut store);
     let unit = store.tiers[0].packs[home.pack as usize].unit;
     assert!(
@@ -701,7 +701,7 @@ fn settle_writing_the_index(sim: &mut Sim, store: &mut Store, chunk: &Key) {
     settle(sim, store);
     settle(sim, store);
     for n in 0..INDEX_AFTER as u64 {
-        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+        store.put(key(1000 + n), Kind::Query, &noise(64, 1000 + n)).unwrap();
     }
     assert!(store.tiers[0].head.index.is_none(), "no index was written before");
     let settled = settle(sim, store);
@@ -738,7 +738,7 @@ fn a_key_a_settle_moves_while_a_later_batch_waits_on_its_maps_is_in_the_index_th
     let put = |mut writer: Writer, n: u64, out: Vec<u8>| {
         std::thread::spawn(move || {
             let guard = enter();
-            let ticket = writer.put(&guard, key(n), Kind::Output, out).unwrap();
+            let ticket = writer.put(&guard, key(n), Kind::Output, &out).unwrap();
             drop(guard);
             ticket
         })
@@ -835,7 +835,7 @@ fn a_record_drained_while_its_key_is_at_a_settles_waiting_record_is_never_writte
     a_gate.wait();
     let a_ticket = a_put.join().unwrap();
     for n in 0..INDEX_AFTER as u64 {
-        store.put(key(2000 + n), Kind::Query, noise(64, 2000 + n)).unwrap();
+        store.put(key(2000 + n), Kind::Query, &noise(64, 2000 + n)).unwrap();
     }
     flush_holding(&mut sim, &mut store, &mut held, batch_map);
     assert!(store.durable(a_ticket), "A's batch is committed");
@@ -904,7 +904,7 @@ fn assert_spots_hold_their_value(store: &Store, key: &Key) {
 /// written (S2). The index left X out, and the crash lost W's put. A claim goes into `prev`
 /// first, so D meets W's spot there: it takes W's ticket (the same value) or is refused
 /// (another), and X stays at W's record.
-fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: Vec<u8>) {
+fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: &[u8]) {
     use std::sync::Arc;
 
     use crate::segment::PutAt;
@@ -913,7 +913,7 @@ fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: Vec<u8
     let mut w = store.writer();
     let mut d = store.writer();
     for n in 0..INDEX_AFTER as u64 {
-        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+        store.put(key(1000 + n), Kind::Query, &noise(64, 1000 + n)).unwrap();
     }
     let x = key(9);
     let w_value = noise(64, 9);
@@ -931,7 +931,7 @@ fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: Vec<u8
     let put = |mut writer: Writer, value: Vec<u8>| {
         std::thread::spawn(move || {
             let guard = enter();
-            let result = writer.put(&guard, x, Kind::Query, value);
+            let result = writer.put(&guard, x, Kind::Query, &value);
             drop(guard);
             result
         })
@@ -943,7 +943,7 @@ fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: Vec<u8
     flush(&mut sim, &mut store);
     let first_index = store.tiers[0].head.index.expect("the flush wrote the index");
     assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in, W still in its put");
-    let d_put = put(d, d_value.clone());
+    let d_put = put(d, d_value.to_vec());
     d_gate.wait();
     w_gate.wait();
     let w_ticket = w_put.join().unwrap().expect("W's put is X's first");
@@ -964,7 +964,7 @@ fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: Vec<u8
     }
     assert_spots_hold_their_value(&store, &x);
     for n in 0..INDEX_AFTER as u64 {
-        store.put(key(2000 + n), Kind::Query, noise(64, 2000 + n)).unwrap();
+        store.put(key(2000 + n), Kind::Query, &noise(64, 2000 + n)).unwrap();
     }
     flush(&mut sim, &mut store);
     assert_ne!(store.tiers[0].head.index, Some(first_index), "the flush wrote the index again, D still in its put");
@@ -976,7 +976,7 @@ fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: Vec<u8
     let store = open(&mut sim, "store");
     assert_eq!(bytes_of(&store, &x), Some(w_value.clone()), "W's durable put of X was lost");
     assert_spots_hold_their_value(&store, &x);
-    match d_value == w_value {
+    match d_value == w_value.as_slice() {
         true => assert_eq!(d_result, Ok(w_ticket), "D's claim met W's spot in prev and took its ticket"),
         false => assert!(matches!(d_result, Err(Mismatch { .. })), "D's put of another value is refused: {d_result:?}"),
     }
@@ -985,22 +985,22 @@ fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: Vec<u8
 
 #[test]
 fn a_key_claimed_after_its_record_in_prev_was_made_durable_keeps_that_record_through_the_end_of_the_swap() {
-    a_key_put_twice_across_an_index_swap(55, true, noise(64, 9));
+    a_key_put_twice_across_an_index_swap(55, true, &noise(64, 9));
 }
 
 #[test]
 fn a_record_drained_after_the_swap_ended_is_the_home_of_the_key_another_writer_claimed_in_it() {
-    a_key_put_twice_across_an_index_swap(54, false, noise(64, 9));
+    a_key_put_twice_across_an_index_swap(54, false, &noise(64, 9));
 }
 
 #[test]
 fn a_second_value_put_across_an_index_swap_while_the_first_is_durable_is_refused() {
-    a_key_put_twice_across_an_index_swap(58, true, noise(64, 10));
+    a_key_put_twice_across_an_index_swap(58, true, &noise(64, 10));
 }
 
 #[test]
 fn a_second_value_put_across_an_index_swap_before_the_first_drains_is_refused() {
-    a_key_put_twice_across_an_index_swap(59, false, noise(64, 10));
+    a_key_put_twice_across_an_index_swap(59, false, &noise(64, 10));
 }
 
 /// Review 11 M1: C loads the view while an index swap lasts and holds before it claims X;
@@ -1018,7 +1018,7 @@ fn a_record_kept_in_a_folded_prev_never_stands_in_for_a_record_of_another_value(
     let mut c = store.writer();
     let mut e = store.writer();
     for n in 0..INDEX_AFTER as u64 {
-        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+        store.put(key(1000 + n), Kind::Query, &noise(64, 1000 + n)).unwrap();
     }
     flush(&mut sim, &mut store);
     assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in");
@@ -1031,7 +1031,7 @@ fn a_record_kept_in_a_folded_prev_never_stands_in_for_a_record_of_another_value(
     let put = |mut writer: Writer, value: Vec<u8>| {
         std::thread::spawn(move || {
             let guard = enter();
-            let result = writer.put(&guard, x, Kind::Query, value);
+            let result = writer.put(&guard, x, Kind::Query, &value);
             drop(guard);
             result
         })
@@ -1072,7 +1072,7 @@ fn a_claim_that_loses_a_folded_prev_to_a_refused_put_is_answered_by_the_delta() 
     let mut store = open(&mut sim, "store");
     let (mut c, mut d, mut e) = (store.writer(), store.writer(), store.writer());
     for n in 0..INDEX_AFTER as u64 {
-        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+        store.put(key(1000 + n), Kind::Query, &noise(64, 1000 + n)).unwrap();
     }
     flush(&mut sim, &mut store);
     assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in");
@@ -1087,7 +1087,7 @@ fn a_claim_that_loses_a_folded_prev_to_a_refused_put_is_answered_by_the_delta() 
     let put = |mut writer: Writer, value: Vec<u8>| {
         std::thread::spawn(move || {
             let guard = enter();
-            let result = writer.put(&guard, x, Kind::Query, value);
+            let result = writer.put(&guard, x, Kind::Query, &value);
             drop(guard);
             result
         })
@@ -1136,7 +1136,7 @@ fn a_claim_that_meets_a_put_between_prev_and_the_delta_fixes_the_deltas_value_be
     let mut store = open(&mut sim, "store");
     let (mut c, mut d, e) = (store.writer(), store.writer(), store.writer());
     for n in 0..INDEX_AFTER as u64 {
-        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+        store.put(key(1000 + n), Kind::Query, &noise(64, 1000 + n)).unwrap();
     }
     flush(&mut sim, &mut store);
     assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in");
@@ -1156,7 +1156,7 @@ fn a_claim_that_meets_a_put_between_prev_and_the_delta_fixes_the_deltas_value_be
     let put = |mut writer: Writer, value: Vec<u8>| {
         std::thread::spawn(move || {
             let guard = enter();
-            let result = writer.put(&guard, x, Kind::Query, value);
+            let result = writer.put(&guard, x, Kind::Query, &value);
             drop(guard);
             result
         })
@@ -1223,7 +1223,7 @@ fn a_move_of_prevs_spot_meets_a_claim_that_lost_to_it(seed: u64, lands: CopyLand
     let mut store = open(&mut sim, "store");
     let (mut w, mut c) = (store.writer(), store.writer());
     for n in 0..INDEX_AFTER as u64 {
-        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+        store.put(key(1000 + n), Kind::Query, &noise(64, 1000 + n)).unwrap();
     }
     let x = key(9);
     let value = noise(64, 9);
@@ -1243,7 +1243,7 @@ fn a_move_of_prevs_spot_meets_a_claim_that_lost_to_it(seed: u64, lands: CopyLand
         let value = value.clone();
         move || {
             let guard = enter();
-            let result = w.put(&guard, x, Kind::Query, value);
+            let result = w.put(&guard, x, Kind::Query, &value);
             drop(guard);
             result
         }
@@ -1257,7 +1257,7 @@ fn a_move_of_prevs_spot_meets_a_claim_that_lost_to_it(seed: u64, lands: CopyLand
         let (value, done) = (value.clone(), c_done.clone());
         move || {
             let guard = enter();
-            let result = c.put(&guard, x, Kind::Query, value);
+            let result = c.put(&guard, x, Kind::Query, &value);
             drop(guard);
             done.wait();
             result
@@ -1343,7 +1343,7 @@ fn a_chunks_copy_moved_while_its_first_claim_is_between_prev_and_the_delta_leave
     let mut store = open(&mut sim, "store");
     let (mut d, p) = (store.writer(), store.writer());
     for n in 0..INDEX_AFTER as u64 {
-        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+        store.put(key(1000 + n), Kind::Query, &noise(64, 1000 + n)).unwrap();
     }
     let out = output_with_a_short_last_chunk();
     let x = chunk_keys(&out)[0];
@@ -1363,7 +1363,7 @@ fn a_chunks_copy_moved_while_its_first_claim_is_between_prev_and_the_delta_leave
     let put = |mut writer: Writer, at: Key, out: Vec<u8>| {
         std::thread::spawn(move || {
             let guard = enter();
-            let result = writer.put(&guard, at, Kind::Output, out);
+            let result = writer.put(&guard, at, Kind::Output, &out);
             drop(guard);
             result
         })
@@ -1403,13 +1403,13 @@ fn a_move_of_prevs_spot_that_finds_the_delta_apart_breaks_the_store() {
     let mut store = open(&mut sim, "store");
     let _other = store.writer();
     for n in 0..INDEX_AFTER as u64 {
-        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+        store.put(key(1000 + n), Kind::Query, &noise(64, 1000 + n)).unwrap();
     }
     // A task open since before the swap: its grace can't pass until this drops.
     let pin = enter();
     flush(&mut sim, &mut store);
     let x = key(9);
-    store.put(x, Kind::Query, noise(64, 9)).unwrap();
+    store.put(x, Kind::Query, &noise(64, 9)).unwrap();
     assert!(store.tiers[0].prev.is_some(), "the index was swapped in");
     let (Some(Place::Segment(_)), Some(Place::Segment(_))) = places_of(&store, &x) else { panic!("X is claimed in both tables") };
     // X's record drained, its move waiting on its maps: the drain checked the tables agree.
@@ -1447,10 +1447,10 @@ fn a_map_that_comes_after_a_lost_move_broke_the_store_changes_nothing() {
     let other = store.unit(writer(1));
     // Each record is longer than a segment chunk: each put rolls the store's segment, so each
     // batch frees a chunk of it.
-    store.put(key(1), Kind::Query, noise(12 << 10, 1)).unwrap();
+    store.put(key(1), Kind::Query, &noise(12 << 10, 1)).unwrap();
     let (mut first, mut second) = (Vec::new(), Vec::new());
     flush_holding(&mut sim, &mut store, &mut first, batch_map);
-    store.put_in(other, key(2), Kind::Query, noise(12 << 10, 2)).unwrap();
+    store.put_in(other, key(2), Kind::Query, &noise(12 << 10, 2)).unwrap();
     flush_holding(&mut sim, &mut store, &mut second, batch_map);
     assert_eq!(store.pending.len(), 2, "both batches wait on their maps");
     let (id, lost) = (store.pending[0].id, store.pending[0].moves[0].to.pack);
@@ -1459,7 +1459,7 @@ fn a_map_that_comes_after_a_lost_move_broke_the_store_changes_nothing() {
     store.tiers[0].packs[lost as usize].retiring = true;
     // A third commit in flight at the break: its steps are asked for and held.
     let head = store.tiers[0].head.clone();
-    store.put(key(3), Kind::Query, noise(64, 3)).unwrap();
+    store.put(key(3), Kind::Query, &noise(64, 3)).unwrap();
     let mut third = Vec::new();
     store.flush(&mut third);
     assert!(!third.is_empty(), "the third commit started");
@@ -1503,7 +1503,7 @@ fn a_map_that_comes_after_a_lost_move_broke_the_store_changes_nothing() {
 fn the_index_names_the_record_of_the_first_move_from_where_its_key_is() {
     let mut sim = Sim::new(50, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Query, noise(64, 1)).unwrap();
+    store.put(key(1), Kind::Query, &noise(64, 1)).unwrap();
     let Place::Segment(at) = store.found_of(&key(1)).place else { panic!("key 1 is in the segment") };
     let mut held = Vec::new();
     flush_holding(&mut sim, &mut store, &mut held, batch_map);
@@ -1532,7 +1532,7 @@ fn a_record_is_counted_dead_once_across_a_reopen_and_a_settle_that_moves_it() {
     let (mut sim, mut store, out, a_gate, a_put) = a_chunk_claim_race(51, 0, output_with_a_last_chunk_a_settle_moves());
     let last = *chunk_keys(&out).last().unwrap();
     let home = store.loc_of(&last);
-    store.put(key(3), Kind::Output, noise(CHUNK_FROM - 1, 3)).unwrap();
+    store.put(key(3), Kind::Output, &noise(CHUNK_FROM - 1, 3)).unwrap();
     a_gate.wait();
     a_put.join().unwrap();
     flush(&mut sim, &mut store);
@@ -1567,7 +1567,7 @@ fn a_pack_a_batch_waiting_on_its_maps_moves_records_into_is_not_retired() {
     let value = |n: u64| if n < 100 { text(n, 12 << 10) } else { noise(16 << 10, n) };
     let keys: Vec<u64> = (0..12).chain(100..116).collect();
     for &n in &keys[..12] {
-        store.put(key(n), Kind::Code, value(n)).unwrap();
+        store.put(key(n), Kind::Code, &value(n)).unwrap();
     }
     flush(&mut sim, &mut store);
     settle(&mut sim, &mut store);
@@ -1575,7 +1575,7 @@ fn a_pack_a_batch_waiting_on_its_maps_moves_records_into_is_not_retired() {
     let settled = settle(&mut sim, &mut store);
     assert_eq!(settled.demoted, 12, "{settled:?}");
     for &n in &keys[12..] {
-        store.put(key(n), Kind::Code, value(n)).unwrap();
+        store.put(key(n), Kind::Code, &value(n)).unwrap();
     }
     let mut held = Vec::new();
     flush_holding(&mut sim, &mut store, &mut held, |what| matches!(what, Mapped::Pack { pack: 1, batch: Some(_), .. }));
@@ -1633,7 +1633,7 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
                     4 if seed % 3 == 2 => (Kind::Code, text(next, 6 << 10)),
                     _ => (Kind::Query, noise(64, next)),
                 };
-                let ticket = store.put(key(next), kind, bytes.clone()).unwrap();
+                let ticket = store.put(key(next), kind, &bytes).unwrap();
                 tickets.insert(ticket, key(next));
                 expected.insert(key(next), bytes);
             }
@@ -1679,8 +1679,8 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
 fn a_flipped_byte_of_a_value_is_never_served() {
     let mut sim = Sim::new(4, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Query, vec![b'a'; 1000]).unwrap();
-    store.put(key(2), Kind::Query, vec![b'b'; 1000]).unwrap();
+    store.put(key(1), Kind::Query, &[b'a'; 1000]).unwrap();
+    store.put(key(2), Kind::Query, &[b'b'; 1000]).unwrap();
     flush(&mut sim, &mut store);
     let loc = store.loc_of(&key(2));
     drop(store);
@@ -1703,7 +1703,7 @@ fn a_flipped_byte_of_a_value_is_never_served() {
 fn a_record_header_that_is_not_whole_stops_the_store_naming_its_pack() {
     let mut sim = Sim::new(5, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Code, vec![7; 100]).unwrap();
+    store.put(key(1), Kind::Code, &[7; 100]).unwrap();
     flush(&mut sim, &mut store);
     drop(store);
     let pack = name("store/pack-000000");
@@ -1721,7 +1721,7 @@ fn a_record_header_that_is_not_whole_stops_the_store_naming_its_pack() {
 fn a_head_of_another_format_is_refused_by_name() {
     let mut sim = Sim::new(6, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Code, vec![1]).unwrap();
+    store.put(key(1), Kind::Code, &[1]).unwrap();
     flush(&mut sim, &mut store);
     let head = name("store/head");
     let mut bytes = sim.contents(&head);
@@ -1746,10 +1746,10 @@ fn near_identical_outputs_share_their_chunks() {
     let mut second = first.clone();
     second.splice(5000..5000, *b"a patched function").for_each(drop);
     second[1 << 20] ^= 1;
-    store.put(key(1), Kind::Output, first.clone()).unwrap();
+    store.put(key(1), Kind::Output, &first).unwrap();
     flush(&mut sim, &mut store);
     let after_first = output_bytes(&store);
-    store.put(key(2), Kind::Output, second.clone()).unwrap();
+    store.put(key(2), Kind::Output, &second).unwrap();
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), first);
     assert_eq!(bytes_of(&store, &key(2)).unwrap(), second, "read from its segment");
     flush(&mut sim, &mut store);
@@ -1767,7 +1767,7 @@ fn a_cold_kind_trains_its_dictionary_and_compresses_what_follows() {
     let mut store = open(&mut sim, "store");
     let count = cold::TRAIN_VALUES as u64 + 40;
     for n in 0..count {
-        store.put(key(n), Kind::Run, run_output(n)).unwrap();
+        store.put(key(n), Kind::Run, &run_output(n)).unwrap();
     }
     assert_eq!(store.problems(), &[] as &[String]);
     assert_eq!(store.tiers[0].dictionaries.len(), 1, "one dictionary for runs");
@@ -1792,8 +1792,8 @@ fn a_large_value_is_a_file_of_its_own_placed_by_sharing_blocks() {
     let mut sim = Sim::new(9, quiet());
     let mut store = open(&mut sim, "store");
     let big = noise(EXTERNAL_FROM + 10, 90);
-    store.put(key(1), Kind::Image, big.clone()).unwrap();
-    store.put(key(2), Kind::Code, b"small".to_vec()).unwrap();
+    store.put(key(1), Kind::Image, &big).unwrap();
+    store.put(key(2), Kind::Code, b"small").unwrap();
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), big);
     flush(&mut sim, &mut store);
     let file = name(&format!("store/{}", disk::external_file(&content_of(&big))));
@@ -1823,7 +1823,7 @@ fn a_large_value_is_a_file_of_its_own_placed_by_sharing_blocks() {
 fn where_blocks_cannot_be_shared_a_place_fails_and_copies_nothing() {
     let mut sim = Sim::new(10, Faults { no_clone: true, ..Faults::default() });
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Query, noise(EXTERNAL_FROM, 100)).unwrap();
+    store.put(key(1), Kind::Query, &noise(EXTERNAL_FROM, 100)).unwrap();
     flush(&mut sim, &mut store);
     let mut effects = Vec::new();
     store.place(&key(1), name("out/q"), &mut effects).unwrap();
@@ -1839,7 +1839,7 @@ fn an_output_is_written_once_and_cloned_to_every_place() {
     let mut store = open(&mut sim, "store");
     let out = noise(CHUNK_FROM as usize + 10, 110);
     let len = out.len() as u64;
-    store.put(key(1), Kind::Output, out.clone()).unwrap();
+    store.put(key(1), Kind::Output, &out).unwrap();
     flush(&mut sim, &mut store);
     let file = name(&format!("store/placed/{:x}", content_of(&out)));
     let mut effects = Vec::new();
@@ -1875,7 +1875,7 @@ fn an_output_is_written_once_and_cloned_to_every_place() {
 fn placed_once(sim: &mut Sim, seed: u64) -> (Store, Vec<u8>, FileName) {
     let mut store = open(sim, "store");
     let out = noise(CHUNK_FROM as usize + 10, seed);
-    store.put(key(1), Kind::Output, out.clone()).unwrap();
+    store.put(key(1), Kind::Output, &out).unwrap();
     flush(sim, &mut store);
     let mut effects = Vec::new();
     store.place(&key(1), name("one/build/a"), &mut effects).unwrap();
@@ -2018,7 +2018,7 @@ fn a_placed_file_let_go_of_while_a_clone_of_it_is_in_flight_goes_after_it() {
     assert_eq!(sim.contents(&name("two/build/a")), out);
     assert!(!sim.exists(&file), "it goes once the clone ends");
     // Let go of for a value of the same bytes, it stays.
-    store.put(key(2), Kind::Output, out.clone()).unwrap();
+    store.put(key(2), Kind::Output, &out).unwrap();
     flush(&mut sim, &mut store);
     place_one(&mut sim, &mut store, "three/build/a");
     store.unplace(&key(1), &key(2), &mut effects);
@@ -2041,7 +2041,7 @@ fn a_place_while_the_open_looks_through_placed_waits_for_the_look_and_is_not_swe
     assert_eq!(sim.lists_held(), 1, "the open's look through placed/ is still going");
     // A new output, whose whole file is to be written while the look goes on.
     let out = noise(CHUNK_FROM as usize + 20, 191);
-    store.put(key(2), Kind::Output, out.clone()).unwrap();
+    store.put(key(2), Kind::Output, &out).unwrap();
     flush(&mut sim, &mut store);
     let file = name(&format!("store/placed/{:x}", content_of(&out)));
     let tag = store.place(&key(2), name("two/build/b"), &mut effects).unwrap();
@@ -2165,7 +2165,7 @@ fn a_place_held_for_the_look_is_refused_when_the_store_breaks_meanwhile() {
     assert_eq!(store.placed(), Vec::new(), "the place waits for the look");
     // Every commit fails at its sync, until the store breaks.
     sim.fail_syncs(name("store"));
-    store.put(key(2), Kind::Output, noise(100, 231)).unwrap();
+    store.put(key(2), Kind::Output, &noise(100, 231)).unwrap();
     flush(&mut sim, &mut store);
     let broken = store.broken().expect("broken").to_string();
     assert!(broken.contains("Input/output error"), "{broken}");
@@ -2182,7 +2182,7 @@ fn a_place_held_for_the_look_is_refused_when_the_store_breaks_meanwhile() {
 fn where_an_output_cannot_be_cloned_its_place_fails_and_copies_nothing() {
     let mut sim = Sim::new(12, Faults { no_clone: true, ..Faults::default() });
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Output, noise(CHUNK_FROM as usize, 120)).unwrap();
+    store.put(key(1), Kind::Output, &noise(CHUNK_FROM as usize, 120)).unwrap();
     flush(&mut sim, &mut store);
     let mut effects = Vec::new();
     store.place(&key(1), name("out/a"), &mut effects).unwrap();
@@ -2197,8 +2197,8 @@ fn where_an_output_cannot_be_cloned_its_place_fails_and_copies_nothing() {
 fn a_layer_is_read_after_the_store_and_never_written() {
     let mut sim = Sim::new(11, quiet());
     let mut base = open(&mut sim, "base");
-    base.put(key(1), Kind::Code, b"from the base".to_vec()).unwrap();
-    base.put(key(2), Kind::Output, noise(400 << 10, 2)).unwrap();
+    base.put(key(1), Kind::Code, b"from the base").unwrap();
+    base.put(key(2), Kind::Output, &noise(400 << 10, 2)).unwrap();
     flush(&mut sim, &mut base);
     drop(base);
     let before = sim.contents(&name("base/head"));
@@ -2209,10 +2209,10 @@ fn a_layer_is_read_after_the_store_and_never_written() {
     });
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"from the base");
     assert_eq!(bytes_of(&store, &key(2)).unwrap(), noise(400 << 10, 2));
-    let ticket = store.put(key(1), Kind::Code, b"from the base".to_vec()).unwrap();
+    let ticket = store.put(key(1), Kind::Code, b"from the base").unwrap();
     assert!(store.durable(ticket));
-    assert!(store.put(key(1), Kind::Code, b"other".to_vec()).is_err());
-    store.put(key(3), Kind::Code, b"mine".to_vec()).unwrap();
+    assert!(store.put(key(1), Kind::Code, b"other").is_err());
+    store.put(key(3), Kind::Code, b"mine").unwrap();
     flush(&mut sim, &mut store);
     assert_eq!(sim.contents(&name("base/head")), before);
     assert!(sim.exists(&name("mine/head")));
@@ -2280,12 +2280,12 @@ fn two_processes_committing_at_once_lose_neither_commit() {
     let mut a = open_shared(&mut sim, 1);
     let mut b = open_shared(&mut sim, 2);
     for n in 0..60 {
-        a.put(key(n), Kind::Code, text(n, 300)).unwrap();
-        b.put(key(1000 + n), Kind::Code, text(1000 + n, 300)).unwrap();
+        a.put(key(n), Kind::Code, &text(n, 300)).unwrap();
+        b.put(key(1000 + n), Kind::Code, &text(1000 + n, 300)).unwrap();
     }
     // One key with its one bytes, put by both before either sees the other's.
-    a.put(key(5000), Kind::Output, text(5000, 300)).unwrap();
-    b.put(key(5000), Kind::Output, text(5000, 300)).unwrap();
+    a.put(key(5000), Kind::Output, &text(5000, 300)).unwrap();
+    b.put(key(5000), Kind::Output, &text(5000, 300)).unwrap();
     let mut effects = Vec::new();
     a.flush(&mut effects);
     b.flush(&mut effects);
@@ -2307,16 +2307,16 @@ fn a_reader_sees_the_others_commit_after_a_miss() {
     let mut sim = Sim::new(14, quiet());
     let mut a = open_shared(&mut sim, 1);
     let mut b = open_shared(&mut sim, 2);
-    b.put(key(1), Kind::Code, b"from b".to_vec()).unwrap();
+    b.put(key(1), Kind::Code, b"from b").unwrap();
     flush(&mut sim, &mut b);
     assert_eq!(bytes_of(&a, &key(1)), None, "not before it looks");
     assert_eq!(get_after_miss(&mut sim, &mut a, &key(1)).unwrap(), b"from b");
     // A writer that came after it opened, and one that moved on past a new index table.
     let mut d = open_shared(&mut sim, 4);
-    d.put(key(2), Kind::Code, b"from d".to_vec()).unwrap();
+    d.put(key(2), Kind::Code, b"from d").unwrap();
     flush(&mut sim, &mut d);
     for n in 10..70 {
-        b.put(key(n), Kind::Query, text(n, 200)).unwrap();
+        b.put(key(n), Kind::Query, &text(n, 200)).unwrap();
     }
     flush(&mut sim, &mut b);
     assert_eq!(get_after_miss(&mut sim, &mut a, &key(2)).unwrap(), b"from d");
@@ -2332,13 +2332,13 @@ fn a_reader_sees_the_others_commit_after_a_miss() {
 fn a_value_another_writer_committed_is_one_entry() {
     let mut sim = Sim::new(15, quiet());
     let mut a = open_shared(&mut sim, 1);
-    a.put(key(1), Kind::Code, b"made once".to_vec()).unwrap();
+    a.put(key(1), Kind::Code, b"made once").unwrap();
     flush(&mut sim, &mut a);
     let mut b = open_shared(&mut sim, 2);
-    let ticket = b.put(key(1), Kind::Code, b"made once".to_vec()).unwrap();
+    let ticket = b.put(key(1), Kind::Code, b"made once").unwrap();
     assert!(b.durable(ticket));
     assert_ne!(b.found_of(&key(1)).tier, 0);
-    assert!(b.put(key(1), Kind::Code, b"other".to_vec()).is_err());
+    assert!(b.put(key(1), Kind::Code, b"other").is_err());
     flush(&mut sim, &mut b);
     assert!(!sim.exists(&writer_file(2, "pack-000000")));
 }
@@ -2347,8 +2347,8 @@ fn a_value_another_writer_committed_is_one_entry() {
 fn a_damaged_value_in_another_writers_store_is_never_served() {
     let mut sim = Sim::new(16, quiet());
     let mut a = open_shared(&mut sim, 1);
-    a.put(key(1), Kind::Query, vec![b'a'; 1000]).unwrap();
-    a.put(key(2), Kind::Query, vec![b'b'; 1000]).unwrap();
+    a.put(key(1), Kind::Query, &[b'a'; 1000]).unwrap();
+    a.put(key(2), Kind::Query, &[b'b'; 1000]).unwrap();
     flush(&mut sim, &mut a);
     let loc = a.loc_of(&key(2));
     drop(a);
@@ -2367,7 +2367,7 @@ fn a_damaged_value_in_another_writers_store_is_never_served() {
 fn another_writers_head_that_cannot_be_read_stops_the_store_naming_it() {
     let mut sim = Sim::new(17, quiet());
     let mut a = open_shared(&mut sim, 1);
-    a.put(key(1), Kind::Code, b"from a".to_vec()).unwrap();
+    a.put(key(1), Kind::Code, b"from a").unwrap();
     flush(&mut sim, &mut a);
     drop(a);
     let head = writer_file(1, HEAD_FILE);
@@ -2431,8 +2431,8 @@ fn a_store_others_can_write_to_is_refused() {
 fn a_pack_others_can_write_to_is_not_read() {
     let mut sim = Sim::new(42, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Code, b"code".to_vec()).unwrap();
-    store.put(key(2), Kind::Query, b"a result".to_vec()).unwrap();
+    store.put(key(1), Kind::Code, b"code").unwrap();
+    store.put(key(2), Kind::Query, b"a result").unwrap();
     flush(&mut sim, &mut store);
     drop(store);
     let pack = name("store/pack-000000");
@@ -2461,7 +2461,7 @@ fn the_store_and_its_files_are_the_users_alone() {
     let dir = root.join("store");
     {
         let mut driven = Driven::open(&root).unwrap();
-        driven.store().put(key(1), Kind::Query, b"kept".to_vec()).unwrap();
+        driven.store().put(key(1), Kind::Query, b"kept").unwrap();
         driven.flush().unwrap();
     }
     assert_eq!(mode(&dir), 0o700);
@@ -2484,19 +2484,19 @@ fn the_index_is_rewritten_into_the_other_slot_and_the_head_flipped() {
     let mut sim = Sim::new(13, quiet());
     let mut store = open(&mut sim, "store");
     for n in 0..INDEX_AFTER as u64 + 5 {
-        store.put(key(n), Kind::Query, n.to_le_bytes().to_vec()).unwrap();
+        store.put(key(n), Kind::Query, &n.to_le_bytes()).unwrap();
     }
     flush(&mut sim, &mut store);
     assert_eq!(store.tiers[0].head.index.unwrap().slot, 0);
     assert_eq!(store.delta_len(), 0, "the new table holds every record");
     for n in 1000..1000 + INDEX_AFTER as u64 {
-        store.put(key(n), Kind::Code, n.to_le_bytes().to_vec()).unwrap();
+        store.put(key(n), Kind::Code, &n.to_le_bytes()).unwrap();
     }
     flush(&mut sim, &mut store);
     let index = store.tiers[0].head.index.unwrap();
     assert_eq!(index.slot, 1);
     assert_eq!(index.count, 2 * INDEX_AFTER as u64 + 5);
-    store.put(key(5000), Kind::Code, b"after".to_vec()).unwrap();
+    store.put(key(5000), Kind::Code, b"after").unwrap();
     flush(&mut sim, &mut store);
     drop(store);
     let store = open(&mut sim, "store");
@@ -2513,7 +2513,7 @@ fn packs_roll_over_when_full() {
     let mut sim = Sim::new(14, quiet());
     let mut store = open(&mut sim, "store");
     for n in 0..80 {
-        store.put(key(n), Kind::Code, noise(10 << 10, n)).unwrap();
+        store.put(key(n), Kind::Code, &noise(10 << 10, n)).unwrap();
     }
     flush(&mut sim, &mut store);
     let packs = store.tiers[0].packs.len();
@@ -2629,11 +2629,11 @@ fn a_fetch_the_remote_knows_is_missing_is_answered_at_once() {
 fn keys_lists_every_key_and_new_keys_what_each_batch_put() {
     let mut sim = Sim::new(17, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Code, b"one".to_vec()).unwrap();
+    store.put(key(1), Kind::Code, b"one").unwrap();
     assert_eq!(store.new_keys(), (0, Vec::new()), "nothing is kept before watching");
     store.watch_keys();
     assert!(store.watching_keys());
-    store.put(key(2), Kind::Code, b"two".to_vec()).unwrap();
+    store.put(key(2), Kind::Code, b"two").unwrap();
     let mut listed = store.keys();
     listed.sort();
     assert_eq!(listed, {
@@ -2648,7 +2648,7 @@ fn keys_lists_every_key_and_new_keys_what_each_batch_put() {
     new.dedup();
     assert!(new.contains(&key(2)), "{new:?}");
     assert_eq!(store.new_keys(), (epoch, Vec::new()), "each key is taken once");
-    store.put(key(3), Kind::Code, b"three".to_vec()).unwrap();
+    store.put(key(3), Kind::Code, b"three").unwrap();
     flush(&mut sim, &mut store);
     let (later, new) = store.new_keys();
     assert!(later > epoch);
@@ -2660,7 +2660,7 @@ fn keys_lists_every_key_and_new_keys_what_each_batch_put() {
 fn a_fetched_value_is_verified_before_it_is_kept() {
     let mut sim = Sim::new(15, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(9), Kind::Code, b"here".to_vec()).unwrap();
+    store.put(key(9), Kind::Code, b"here").unwrap();
     let mut remote = Recorded(Vec::new(), Vec::new());
     let mut effects = Vec::new();
     assert_eq!(store.fetch(&key(9), &mut remote, any, &mut effects), None, "it has it");
@@ -2713,11 +2713,11 @@ fn a_fetched_value_is_verified_before_it_is_kept() {
 fn machine_code_is_never_kept_from_a_fetch_and_a_value_says_its_directory() {
     let mut sim = Sim::new(18, quiet());
     let mut base = open(&mut sim, "base");
-    base.put(key(7), Kind::Machine, b"a layer's code".to_vec()).unwrap();
+    base.put(key(7), Kind::Machine, b"a layer's code").unwrap();
     flush(&mut sim, &mut base);
     drop(base);
     let mut store = open_with(&mut sim, Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40 });
-    store.put(key(8), Kind::Machine, b"my code".to_vec()).unwrap();
+    store.put(key(8), Kind::Machine, b"my code").unwrap();
     let mut remote = Recorded(Vec::new(), Vec::new());
     let mut effects = Vec::new();
     let machine = store.fetch(&key(1), &mut remote, any, &mut effects).unwrap();
@@ -2755,7 +2755,7 @@ fn a_store_that_cannot_write_stops_and_says_where() {
 fn a_driver_may_hand_over_mappings_by_itself() {
     let mut sim = Sim::new(17, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Code, b"mapped".to_vec()).unwrap();
+    store.put(key(1), Kind::Code, b"mapped").unwrap();
     flush(&mut sim, &mut store);
     drop(store);
     let mut effects = Vec::new();
@@ -2771,7 +2771,7 @@ fn a_driver_may_hand_over_mappings_by_itself() {
     for effect in maps {
         let Effect::Map { file, .. } = effect else { unreachable!() };
         let bytes = sim.contents(&file);
-        store.mapped(file, Mapping::copy(&bytes));
+        store.mapped(&file, Mapping::copy(&bytes));
     }
     assert!(store.ready(), "{:?}", store.broken());
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"mapped");
@@ -2785,7 +2785,7 @@ fn every_commit_ends_each_pack_on_a_block() {
     let mut store = open(&mut sim, "store");
     for round in 0..3u64 {
         for n in 0..5 {
-            store.put(key(round * 10 + n), Kind::Code, noise(700 + n as usize * 300, n)).unwrap();
+            store.put(key(round * 10 + n), Kind::Code, &noise(700 + n as usize * 300, n)).unwrap();
         }
         flush(&mut sim, &mut store);
         for pack in &store.tiers[0].packs {
@@ -2808,7 +2808,7 @@ fn every_commit_ends_each_pack_on_a_block() {
 fn a_changed_byte_in_the_zeros_ending_a_commit_stops_the_store_naming_its_pack() {
     let mut sim = Sim::new(19, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Code, vec![7; 100]).unwrap();
+    store.put(key(1), Kind::Code, &[7; 100]).unwrap();
     flush(&mut sim, &mut store);
     drop(store);
     let pack = name("store/pack-000000");
@@ -2829,7 +2829,7 @@ fn an_index_that_does_not_match_its_crc_stops_the_store() {
     let mut sim = Sim::new(20, quiet());
     let mut store = open(&mut sim, "store");
     for n in 0..INDEX_AFTER as u64 {
-        store.put(key(n), Kind::Query, n.to_le_bytes().to_vec()).unwrap();
+        store.put(key(n), Kind::Query, &n.to_le_bytes()).unwrap();
     }
     flush(&mut sim, &mut store);
     assert_eq!(store.tiers[0].head.index.unwrap().slot, 0);
@@ -2857,7 +2857,7 @@ fn a_long_cold_value_is_compressed_without_a_dictionary_over_a_long_window() {
         long.extend(run_output(n));
         n += 1;
     }
-    store.put(key(1), Kind::Debug, long.clone()).unwrap();
+    store.put(key(1), Kind::Debug, &long).unwrap();
     let (form, stored, raw) = store.sizes_of(&key(1));
     assert_eq!(form, Form::Zstd);
     assert!(stored * 4 < raw, "{stored} stored of {raw}");
@@ -2885,7 +2885,7 @@ fn chunks_that_shrink_are_kept_in_lz4_and_the_rest_raw() {
     }
     let mut both = text.clone();
     both.extend(noise(600 << 10, 220));
-    store.put(key(1), Kind::Output, both.clone()).unwrap();
+    store.put(key(1), Kind::Output, &both).unwrap();
     let forms: Vec<Form> = store.tiers[0]
         .delta
         .iter(Held::writer(&store))
@@ -2907,7 +2907,7 @@ fn what_is_unread_for_two_periods_goes_cold_and_what_is_read_stays_hot() {
     let mut sim = Sim::new(30, quiet());
     let mut store = open(&mut sim, "store");
     for n in 0..10 {
-        store.put(key(n), Kind::Code, text(n, 8 << 10)).unwrap();
+        store.put(key(n), Kind::Code, &text(n, 8 << 10)).unwrap();
     }
     flush(&mut sim, &mut store);
     assert_eq!(settle(&mut sim, &mut store).demoted, 0, "one period is not two");
@@ -2919,7 +2919,7 @@ fn what_is_unread_for_two_periods_goes_cold_and_what_is_read_stays_hot() {
     for n in 1..10 {
         assert_eq!(form_of(&store, &key(n)), Form::Zstd, "{n}");
     }
-    let durable = store.put(key(3), Kind::Code, text(3, 8 << 10)).unwrap();
+    let durable = store.put(key(3), Kind::Code, &text(3, 8 << 10)).unwrap();
     assert!(store.durable(durable), "a moved value is as durable as it was");
     drop(store);
     let store = open(&mut sim, "store");
@@ -2934,8 +2934,8 @@ fn what_is_unread_for_two_periods_goes_cold_and_what_is_read_stays_hot() {
 fn a_cold_value_read_in_two_periods_running_comes_back_hot() {
     let mut sim = Sim::new(31, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Code, text(1, 16 << 10)).unwrap();
-    store.put(key(2), Kind::Output, text(2, 16 << 10)).unwrap();
+    store.put(key(1), Kind::Code, &text(1, 16 << 10)).unwrap();
+    store.put(key(2), Kind::Output, &text(2, 16 << 10)).unwrap();
     flush(&mut sim, &mut store);
     settle(&mut sim, &mut store);
     settle(&mut sim, &mut store);
@@ -2958,7 +2958,7 @@ fn a_cold_value_read_in_two_periods_running_comes_back_hot() {
 fn a_value_that_does_not_compress_is_tried_once() {
     let mut sim = Sim::new(32, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Code, noise(8 << 10, 320)).unwrap();
+    store.put(key(1), Kind::Code, &noise(8 << 10, 320)).unwrap();
     flush(&mut sim, &mut store);
     settle(&mut sim, &mut store);
     settle(&mut sim, &mut store);
@@ -2974,7 +2974,7 @@ fn packs_that_are_mostly_moved_out_are_rewritten_and_removed() {
     let mut store = open(&mut sim, "store");
     let value = |n: u64| if n % 2 == 0 { text(n, 12 << 10) } else { noise(4 << 10, n) };
     for n in 0..100 {
-        store.put(key(n), Kind::Code, value(n)).unwrap();
+        store.put(key(n), Kind::Code, &value(n)).unwrap();
     }
     flush(&mut sim, &mut store);
     let before: Vec<FileName> = store.tiers[0].packs.iter().map(|it| it.file.clone()).collect();
@@ -3009,7 +3009,7 @@ fn a_pack_left_behind_by_a_crash_is_removed_at_the_next_open() {
     let mut sim = Sim::new(34, quiet());
     let mut store = open(&mut sim, "store");
     for n in 0..60 {
-        store.put(key(n), Kind::Code, text(n, 12 << 10)).unwrap();
+        store.put(key(n), Kind::Code, &text(n, 12 << 10)).unwrap();
     }
     flush(&mut sim, &mut store);
     settle(&mut sim, &mut store);
@@ -3139,7 +3139,7 @@ fn a_value_of_columns_goes_warm_then_cold_then_comes_back_hot() {
     let mut store = with_columns(&mut sim, false);
     let columns = one_column(false);
     let hot = columns.hot(&column_values(0));
-    store.put(key(1), Kind::Query, hot.clone()).unwrap();
+    store.put(key(1), Kind::Query, &hot).unwrap();
     flush(&mut sim, &mut store);
     for _ in 0..2 {
         assert_eq!(settle(&mut sim, &mut store).demoted, 0);
@@ -3169,7 +3169,7 @@ fn warm_columns_are_read_in_place_and_refused_without_their_encoding() {
     let mut store = with_columns(&mut sim, false);
     let columns = one_column(false);
     let hot = columns.hot(&column_values(3));
-    store.put(key(1), Kind::Query, hot.clone()).unwrap();
+    store.put(key(1), Kind::Query, &hot).unwrap();
     flush(&mut sim, &mut store);
     for _ in 0..3 {
         settle(&mut sim, &mut store);
@@ -3198,7 +3198,7 @@ fn columns_that_do_not_decode_to_the_value_are_not_kept() {
     let mut sim = Sim::new(42, quiet());
     let mut store = with_columns(&mut sim, true);
     let hot = one_column(true).hot(&column_values(5));
-    store.put(key(1), Kind::Query, hot.clone()).unwrap();
+    store.put(key(1), Kind::Query, &hot).unwrap();
     flush(&mut sim, &mut store);
     for _ in 0..3 {
         assert_eq!(settle(&mut sim, &mut store).demoted, 0);
@@ -3214,7 +3214,7 @@ fn a_cold_kind_of_columns_is_put_in_cold_columns() {
     let mut sim = Sim::new(43, quiet());
     let mut store = with_columns(&mut sim, false);
     let hot = one_column(false).hot(&column_values(9));
-    store.put(key(1), Kind::Run, hot.clone()).unwrap();
+    store.put(key(1), Kind::Run, &hot).unwrap();
     assert_eq!(form_of(&store, &key(1)), Form::ColdColumns);
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
     flush(&mut sim, &mut store);
@@ -3245,7 +3245,7 @@ fn a_buffer_given_its_buffer_columns_goes_warm_then_cold_and_reads_back() {
     let mut sim = Sim::new(44, quiet());
     let mut store = with_spans(&mut sim);
     let hot = spans_buffer();
-    store.put(key(1), Kind::Query, hot.clone()).unwrap();
+    store.put(key(1), Kind::Query, &hot).unwrap();
     flush(&mut sim, &mut store);
     for _ in 0..2 {
         assert_eq!(settle(&mut sim, &mut store).demoted, 0);
@@ -3276,7 +3276,7 @@ fn a_cold_kind_of_buffer_is_put_in_its_cold_columns() {
     let mut sim = Sim::new(45, quiet());
     let mut store = with_spans(&mut sim);
     let hot = spans_buffer();
-    store.put(key(1), Kind::Run, hot.clone()).unwrap();
+    store.put(key(1), Kind::Run, &hot).unwrap();
     assert_eq!(form_of(&store, &key(1)), Form::ColdColumns);
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
 }
@@ -3292,9 +3292,9 @@ fn each_crate_version_has_packs_of_its_own_and_keeps_them_across_an_open() {
     assert_ne!(unit_a, unit_b);
     for n in 0..6 {
         let unit = if n % 2 == 0 { unit_a } else { unit_b };
-        store.put_in(unit, key(n), [Kind::Query, Kind::Code, Kind::Debug][n as usize % 3], noise(5000, n)).unwrap();
+        store.put_in(unit, key(n), [Kind::Query, Kind::Code, Kind::Debug][n as usize % 3], &noise(5000, n)).unwrap();
     }
-    store.put(key(10), Kind::Image, noise(3000, 10)).unwrap();
+    store.put(key(10), Kind::Image, &noise(3000, 10)).unwrap();
     flush(&mut sim, &mut store);
     let pack_of = |store: &Store, n: u64| store.loc_of(&key(n)).pack as usize;
     let units: Vec<u32> = (0..6).map(|n| store.tiers[0].packs[pack_of(&store, n)].unit).collect();
@@ -3309,7 +3309,7 @@ fn each_crate_version_has_packs_of_its_own_and_keeps_them_across_an_open() {
     for n in 0..6 {
         assert_eq!(bytes_of(&store, &key(n)).unwrap(), noise(5000, n), "{n}");
     }
-    store.put_in(unit_a, key(20), Kind::Query, noise(100, 20)).unwrap();
+    store.put_in(unit_a, key(20), Kind::Query, &noise(100, 20)).unwrap();
     flush(&mut sim, &mut store);
     assert_eq!(pack_of(&store, 20), pack_of(&store, 0), "a unit appends to its own pack");
     assert_eq!(store.verify(None), Vec::new());
@@ -3320,7 +3320,7 @@ fn a_pack_whose_header_names_another_unit_stops_the_store() {
     let mut sim = Sim::new(51, quiet());
     let mut store = open(&mut sim, "store");
     let unit = store.unit(content_of(b"crate a 1.0.0"));
-    store.put_in(unit, key(1), Kind::Query, noise(100, 1)).unwrap();
+    store.put_in(unit, key(1), Kind::Query, &noise(100, 1)).unwrap();
     flush(&mut sim, &mut store);
     drop(store);
     let pack = name("store/pack-000000");
@@ -3365,7 +3365,7 @@ fn through_the_tiers(column: &[u32], forms: &std::cell::RefCell<Vec<Form>>) -> T
     let mut sim = Sim::new(60, quiet());
     let mut store = with_columns(&mut sim, false);
     let hot = one_column(false).hot(&movable_column(column));
-    store.put(key(1), Kind::Query, hot).unwrap();
+    store.put(key(1), Kind::Query, &hot).unwrap();
     flush(&mut sim, &mut store);
     let mut trip = Trip { len: column.len(), stages: Vec::new() };
     let (form, values) = peek(&store, &key(1));
@@ -3430,7 +3430,7 @@ enum InPlace {
 fn moved_once(column: &[u32]) -> InPlace {
     let mut sim = Sim::new(61, quiet());
     let mut store = with_columns(&mut sim, false);
-    store.put(key(1), Kind::Query, one_column(false).hot(&movable_column(column))).unwrap();
+    store.put(key(1), Kind::Query, &one_column(false).hot(&movable_column(column))).unwrap();
     flush(&mut sim, &mut store);
     for _ in 0..3 {
         settle(&mut sim, &mut store);
@@ -3505,7 +3505,7 @@ fn what_a_task_read_stays_whole_through_every_step_of_commits_and_is_freed_after
                 1 => (Kind::Query, noise(EXTERNAL_FROM + n as usize, n)),
                 _ => (Kind::Query, noise(40 + (n as usize * 53) % 3000, n)),
             };
-            tickets.push(writer.put(&guard, key(n), kind, bytes.clone()).unwrap());
+            tickets.push(writer.put(&guard, key(n), kind, &bytes).unwrap());
             let entry = reader.get(&guard, &key(n)).unwrap().expect("a put is read at once");
             assert_eq!(entry.bytes, bytes.as_slice(), "seed {seed}");
             read.push(entry.bytes);
@@ -3610,7 +3610,7 @@ fn writers_and_readers_on_other_threads_go_on_through_commits_settles_and_index_
                     let n = (i + number * KEYS / WRITERS) % KEYS;
                     let (kind, bytes) = &values[n as usize];
                     let guard = enter();
-                    tickets.push(writer.put(&guard, key(n), *kind, bytes.clone()).unwrap());
+                    tickets.push(writer.put(&guard, key(n), *kind, bytes).unwrap());
                 }
                 tickets
             })
@@ -3670,12 +3670,12 @@ fn hits_and_warm_puts_allocate_nothing() {
         });
     };
     // The first put warms what a thread keeps once: its writer's first chunk is made already.
-    writer.put(&guard, key(0), Kind::Query, values[0].clone()).unwrap();
+    writer.put(&guard, key(0), Kind::Query, &values[0]).unwrap();
     let mut pending: Vec<(Key, Vec<u8>)> = (1..count - 16).map(|n| (key(n), values[n as usize].clone())).collect();
     let before = store.tiers[0].delta.len();
     blaze_alloc_count::assert_at_most(0, "warm puts", || {
         for (key, bytes) in pending.drain(..) {
-            writer.put(&guard, key, Kind::Query, bytes).unwrap();
+            writer.put(&guard, key, Kind::Query, &bytes).unwrap();
         }
     });
     assert!(store.tiers[0].delta.len() > before + DELTA_FIRST / 2, "the puts went past the delta's first level");
@@ -3687,7 +3687,7 @@ fn hits_and_warm_puts_allocate_nothing() {
     let mut rest: Vec<(Key, Vec<u8>)> = (count - 16..count).map(|n| (key(n), values[n as usize].clone())).collect();
     blaze_alloc_count::assert_at_most(0, "warm puts after a commit", || {
         for (key, bytes) in rest.drain(..) {
-            writer.put(&guard, key, Kind::Query, bytes).unwrap();
+            writer.put(&guard, key, Kind::Query, &bytes).unwrap();
         }
     });
     drop(guard);
@@ -3719,7 +3719,7 @@ fn a_pinned_value_is_held_in_place_past_its_task_and_its_store() {
     let mut store = open(&mut sim, "store");
     let values: Vec<Vec<u8>> = (0..8).map(|n| text(n, (8 << 10) + n as usize * 7)).collect();
     for (n, value) in values.iter().enumerate() {
-        store.put(key(n as u64), Kind::Code, value.clone()).unwrap();
+        store.put(key(n as u64), Kind::Code, value).unwrap();
     }
     let aligned = |bytes: &[u8]| (bytes.as_ptr() as usize).is_multiple_of(16);
     let in_segment = store.pinned(&key(0)).unwrap().unwrap();
@@ -3769,8 +3769,8 @@ fn a_module_of_machine_code_is_a_file_of_its_own_that_its_pin_names() {
     let mut sim = Sim::new(34, quiet());
     let mut store = open(&mut sim, "store");
     let code = noise(5000, 34);
-    store.put(key(1), Kind::Machine, code.clone()).unwrap();
-    store.put(key(2), Kind::Code, text(2, 5000)).unwrap();
+    store.put(key(1), Kind::Machine, &code).unwrap();
+    store.put(key(2), Kind::Code, &text(2, 5000)).unwrap();
     assert_eq!(form_of(&store, &key(1)), Form::External);
     let in_segment = store.pinned(&key(1)).unwrap().unwrap();
     assert_eq!(in_segment.file(), None, "no file until its commit writes it");
@@ -3800,19 +3800,19 @@ fn a_module_of_machine_code_is_a_file_of_its_own_that_its_pin_names() {
 fn a_handle_reads_and_puts_beside_the_store_and_its_puts_are_durable_with_a_flush() {
     let mut sim = Sim::new(35, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Query, b"the store's".to_vec()).unwrap();
+    store.put(key(1), Kind::Query, b"the store's").unwrap();
     let root = std::path::PathBuf::from("/state");
     let handle = Handle::new(&mut store, root.clone());
     assert_eq!(handle.read(&key(1), |it| it.bytes.to_vec()).unwrap().unwrap(), b"the store's");
     assert!(handle.has(&key(1)) && !handle.has(&key(2)));
     assert!(handle.read(&key(2), |_| ()).unwrap().is_none());
     let code = noise(3000, 35);
-    let ticket = handle.put(key(2), Kind::Machine, code.clone()).unwrap();
+    let ticket = handle.put(key(2), Kind::Machine, &code).unwrap();
     assert!(!handle.durable(ticket));
     assert_eq!(bytes_of(&store, &key(2)).unwrap(), code);
     assert_eq!(&*handle.pinned(&key(2)).unwrap().unwrap(), code.as_slice());
-    assert_eq!(handle.put(key(2), Kind::Machine, code.clone()), Ok(ticket), "the same bytes again are the first put");
-    assert!(handle.put(key(2), Kind::Machine, b"other".to_vec()).is_err());
+    assert_eq!(handle.put(key(2), Kind::Machine, &code), Ok(ticket), "the same bytes again are the first put");
+    assert!(handle.put(key(2), Kind::Machine, b"other").is_err());
     flush(&mut sim, &mut store);
     assert!(handle.durable(ticket));
     let pinned = handle.pinned(&key(2)).unwrap().unwrap();
@@ -3841,8 +3841,8 @@ fn a_driven_store_keeps_machine_code_as_a_file_on_disk() {
     {
         let mut driven = Driven::open(&root).unwrap();
         let handle = driven.handle();
-        handle.put(key(1), Kind::Machine, code.clone()).unwrap();
-        handle.put(key(2), Kind::Query, b"a query's result".to_vec()).unwrap();
+        handle.put(key(1), Kind::Machine, &code).unwrap();
+        handle.put(key(2), Kind::Query, b"a query's result").unwrap();
         driven.flush().unwrap();
         let pinned = handle.pinned(&key(1)).unwrap().unwrap();
         let file = pinned.file().expect("committed machine code is a file of its own");

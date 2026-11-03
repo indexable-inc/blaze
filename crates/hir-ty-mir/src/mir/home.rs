@@ -238,6 +238,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Named<'db, '_> {
                         ExistentialPredicate::Projection(it) => match it.def_id.0 {
                             TermId::TypeAliasId(alias) => alias.krate(db),
                             TermId::ConstId(konst) => konst.krate(db),
+                            TermId::RpititId(it) => it.function.krate(db),
                         },
                         ExistentialPredicate::AutoTrait(it) => it.0.krate(db),
                     };

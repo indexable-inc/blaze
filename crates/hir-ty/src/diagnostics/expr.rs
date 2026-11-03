@@ -10,9 +10,10 @@ use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, EnumVariantId, HasModule, ItemContainerId,
     Lookup,
     attrs::AttrFlags,
-    expr_store::scope::ExprScopes,
+    expr_store::{ExpressionStore, scope::ExprScopes},
     lang_item::LangItems,
     resolver::{ValueNs, resolver_for_scope},
+    signatures::VariantFields,
 };
 use intern::sym;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
@@ -111,7 +112,7 @@ impl<'db> ExprValidator<'db> {
         }
 
         for (id, expr) in body.exprs() {
-            let missing = record_literal_missing_fields(db, self.infer, id, expr).or_else(|| {
+            let missing = record_literal_missing_fields(db, body, self.infer, id, expr).or_else(|| {
                 Some((record_literal_spread_only(self.infer, id, expr)?, Vec::new()))
             });
             if let Some((variant, missed_fields)) = missing {
@@ -425,6 +426,7 @@ impl<'db> FilterMapNextChecker<'db> {
 
 pub fn record_literal_missing_fields<'db>(
     db: &'db Db,
+    store: &ExpressionStore,
     infer: &InferenceResult<'db>,
     id: ExprId,
     expr: Expr<'_>,
@@ -441,7 +443,14 @@ pub fn record_literal_missing_fields<'db>(
 
     let variant_data = variant_def.fields(db);
 
-    let specified_fields: HashSet<_, Global> = fields.iter().map(|f| &f.name).collect();
+    // Each field as its name is written, keyed for the variant's fields (`name_written`).
+    let specified_fields: HashSet<_, Global> = fields
+        .iter()
+        .map(|f| {
+            let hygiene = store.record_field_hygiene(f.expr);
+            VariantFields::name_written(db, variant_def, f.name, hygiene)
+        })
+        .collect();
     // don't show missing fields if:
     // - has ..expr
     // - or has default value + ..
@@ -479,6 +488,7 @@ fn record_literal_spread_only(
 
 pub fn record_pattern_missing_fields<'db>(
     db: &'db Db,
+    store: &ExpressionStore,
     infer: &InferenceResult<'db>,
     id: PatId,
     pat: Pat<'_>,
@@ -495,7 +505,14 @@ pub fn record_pattern_missing_fields<'db>(
 
     let variant_data = variant_def.fields(db);
 
-    let specified_fields: HashSet<_, Global> = fields.iter().map(|f| &f.name).collect();
+    // Each field as its name is written, keyed for the variant's fields (`name_written`).
+    let specified_fields: HashSet<_, Global> = fields
+        .iter()
+        .map(|f| {
+            let hygiene = store.record_field_hygiene(f.pat);
+            VariantFields::name_written(db, variant_def, f.name, hygiene)
+        })
+        .collect();
     // don't show missing fields if:
     // - in code
     // - or has ..

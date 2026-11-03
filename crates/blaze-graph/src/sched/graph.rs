@@ -703,19 +703,109 @@ impl Graph {
     /// build that stopped names, as a parked job's own spans are on no thread while it waits.
     pub(crate) fn waiting(&self, into: &mut Vec<(JobId, StallWait)>) {
         into.clear();
+        for j in 0..self.jobs.len() {
+            if let Some(wait) = self.wait_of(j as u32) {
+                into.push((JobId(j as u32), wait));
+            }
+        }
+    }
+
+    /// What live job `job` waits for, if it waits in the graph.
+    fn wait_of(&self, job: u32) -> Option<StallWait> {
+        let node = &self.jobs[job as usize];
+        if node.life != Life::Live {
+            return None;
+        }
+        Some(match node.wait {
+            Target::None => return None,
+            Target::Job(other) => StallWait::Job(JobId(other)),
+            Target::Key(entry) => {
+                let claimer = self.key_claimer[entry as usize];
+                let claimer = (claimer != NONE).then_some(JobId(claimer));
+                StallWait::Key { key: self.key_name[entry as usize], claimer }
+            }
+            Target::Counter(counter) => StallWait::Counter(CounterId(counter)),
+        })
+    }
+
+    /// The jobs of `member` that wait in the graph now, by world id, into `into`.
+    pub(crate) fn waiting_of(&self, member: u32, into: &mut Vec<(JobId, StallWait)>) {
+        into.clear();
         for (j, node) in self.jobs.iter().enumerate() {
-            let wait = match node.wait {
-                _ if node.life != Life::Live => continue,
-                Target::None => continue,
-                Target::Job(other) => StallWait::Job(JobId(other)),
-                Target::Key(entry) => {
-                    let claimer = self.key_claimer[entry as usize];
-                    let claimer = (claimer != NONE).then_some(JobId(claimer));
-                    StallWait::Key { key: self.key_name[entry as usize], claimer }
-                }
-                Target::Counter(counter) => StallWait::Counter(CounterId(counter)),
+            if node.home.member == member
+                && let Some(wait) = self.wait_of(j as u32)
+            {
+                into.push((JobId(j as u32), wait));
+            }
+        }
+    }
+
+    /// The jobs of `member` (a pool that stops) whose waits can never end now, unlinked from
+    /// them, each into `into` with its wait and, with `dropper`, the cycle it closes: with
+    /// `dropper` (the live job of the thread that drops the pool, which waits for the pool's
+    /// jobs and holds what it claimed until then), each whose waits lead to it, so a wait of
+    /// `dropper` for the job would close a cycle; with none, each that waits. A wait on a
+    /// counter some job counts towards is left, as [`Graph::wake_all`] leaves it: a scope's
+    /// caller never unwinds while its jobs, borrowing its frame, still run; they are woken
+    /// themselves, and as they end the counter's wait ends as it would.
+    pub(crate) fn unwait_member(
+        &mut self,
+        member: u32,
+        dropper: Option<JobId>,
+        into: &mut Vec<(JobId, StallWait, Option<Cycle>)>,
+    ) {
+        into.clear();
+        let mut waiting = Vec::new(); // alloc: a pool's stop, once per round of it
+        self.waiting_of(member, &mut waiting);
+        for (job, _) in waiting {
+            // An earlier one's unlinking may have cut this one's way to the dropper.
+            let Some(wait) = self.wait_of(job.0) else { continue };
+            if let Target::Counter(counter) = self.jobs[job.0 as usize].wait
+                && self.counter_left[counter as usize] != self.counter_held[counter as usize]
+            {
+                continue;
+            }
+            let cycle = match dropper {
+                Some(dropper) => match self.closes_cycle(dropper.0, Target::Job(job.0)) {
+                    Some(from) => Some(self.cycle(dropper.0, from)),
+                    None => continue,
+                },
+                None => None,
             };
-            into.push((JobId(j as u32), wait));
+            self.unlink(job.0);
+            into.push((job, wait, cycle));
+        }
+    }
+
+    /// `job`, waiting, leaves its wait's list of waiters: its wait is over, ended by no one.
+    fn unlink(&mut self, job: u32) {
+        let target = self.jobs[job as usize].wait;
+        let next = std::mem::replace(&mut self.jobs[job as usize].next, NONE);
+        let mut at = *self.waiters_of(job, target);
+        if at == job {
+            *self.waiters_of(job, target) = next;
+        } else {
+            // A waiter list ends, and the graph holds each job once, so the walk ends.
+            loop {
+                assert!(at != NONE, "job {job} waits for {target:?} but is not on its list of waiters");
+                let after = self.jobs[at as usize].next;
+                if after == job {
+                    self.jobs[at as usize].next = next;
+                    break;
+                }
+                at = after;
+            }
+        }
+        self.jobs[job as usize].wait = Target::None;
+    }
+
+    /// The head of the list of waiters of `target`, which `job` waits for.
+    fn waiters_of(&mut self, job: u32, target: Target) -> &mut u32 {
+        match target {
+            Target::Job(other) => &mut self.jobs[other as usize].waiters,
+            Target::Key(entry) => &mut self.key_waiters[entry as usize],
+            Target::Counter(counter) => &mut self.counter_waiters[counter as usize],
+            Target::None => unreachable!("job {job} unlinked while it waits for nothing"),
         }
     }
 

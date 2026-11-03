@@ -7,9 +7,10 @@ use either::Either;
 use hir_expand::name::{AsName, Name};
 use intern::sym;
 use la_arena::Arena;
+use smallvec::SmallVec;
 use syntax::{
     AstPtr, SyntaxNodePtr, ast as tag,
-    view::{self as ast, HasName, HasTypeBounds},
+    view::{self as ast, AstNode, HasName, HasTypeBounds},
 };
 
 use crate::{
@@ -178,7 +179,7 @@ impl GenericParamsCollector {
 
             match generic_param {
                 ast::GenericParam::TypeParam(type_param) => {
-                    let name = type_param.name().map_or_else(Name::missing, |it| it.as_name());
+                    let name = ec.param_name_of(type_param.name());
                     let default = type_param.default_type().map(|it| {
                         ec.lower_type_ref(it, &mut ImplTraitLowering::Error)
                     });
@@ -199,7 +200,7 @@ impl GenericParamsCollector {
                     });
                 }
                 ast::GenericParam::ConstParam(const_param) => {
-                    let name = const_param.name().map_or_else(Name::missing, |it| it.as_name());
+                    let name = ec.param_name_of(const_param.name());
                     let ty = ec.lower_type_ref_opt(
                         const_param.ty(),
                         &mut ImplTraitLowering::Error,
@@ -249,13 +250,16 @@ impl GenericParamsCollector {
                 // Higher-Ranked Trait Bounds: one run of names, shared by the predicate's bounds.
                 let lifetimes =
                     pred.for_binder().and_then(|it| it.generic_param_list()).map(|param_list| {
-                        ec.store.paths_mut().push_names(param_list.lifetime_params().map(
-                            |lifetime_param| {
+                        // alloc: inline up to 4, a binder's lifetimes before they are pushed
+                        let names: SmallVec<[Name; 4]> = param_list
+                            .lifetime_params()
+                            .map(|lifetime_param| {
                                 lifetime_param
                                     .lifetime()
-                                    .map_or_else(Name::missing, |lt| Name::new_lifetime(lt.text()))
-                            },
-                        ))
+                                    .map_or_else(Name::missing, |lt| ec.binder_lifetime_name(lt))
+                            })
+                            .collect();
+                        ec.store.paths_mut().push_names(names)
                     });
                 let binder = match pred.for_binder().and_then(|it| it.generic_param_list()) {
                     Some(param_list) => self.lower_binder_params(ec, param_list),
@@ -290,7 +294,7 @@ impl GenericParamsCollector {
                 }
                 continue;
             }
-            let name = type_param.name().map_or_else(Name::missing, |it| it.as_name());
+            let name = ec.param_name_of(type_param.name());
             let bounds = type_param
                 .type_bound_list()
                 .iter()
@@ -434,7 +438,9 @@ impl ExprCollector<'_> {
                         ast::UseBoundGenericArg::Lifetime(l) => {
                             UseArgRef::Lifetime(self.lower_lifetime_ref(l))
                         }
-                        ast::UseBoundGenericArg::NameRef(n) => UseArgRef::Name(n.as_name()),
+                        ast::UseBoundGenericArg::NameRef(n) => UseArgRef::Name(
+                            self.param_name(n.as_name(), n.syntax().text_range()),
+                        ),
                     };
                     self.store.paths_mut().use_args.push(arg);
                 }
@@ -452,10 +458,20 @@ impl ExprCollector<'_> {
         let Some(params) = binder.and_then(|it| it.generic_param_list()) else {
             return Names::EMPTY;
         };
-        self.store.paths_mut().push_names(
-            params
-                .lifetime_params()
-                .flat_map(|lp| lp.lifetime().map(|lt| Name::new_lifetime(lt.text()))),
-        )
+        // alloc: inline up to 4, a binder's lifetimes before they are pushed
+        let names: SmallVec<[Name; 4]> = params
+            .lifetime_params()
+            .flat_map(|lp| lp.lifetime().map(|lt| self.binder_lifetime_name(lt)))
+            .collect();
+        self.store.paths_mut().push_names(names)
+    }
+
+    /// The name a type or const parameter named `name` binds ([`Self::param_name`]); missing
+    /// without one.
+    pub(super) fn param_name_of(&self, name: Option<ast::Name<'_>>) -> Name {
+        match name {
+            Some(name) => self.param_name(name.as_name(), name.syntax().text_range()),
+            None => Name::missing(),
+        }
     }
 }

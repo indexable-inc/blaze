@@ -83,7 +83,7 @@ fn fine(e: E) {
 /// The inference diagnostics of the fixture's function `name`, free or in an impl.
 fn diagnostics(name: &str) -> Vec<InferenceDiagnostic> {
     let db = fixture::db(FIXTURE).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut functions = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
             let scope = module.scope(&db);

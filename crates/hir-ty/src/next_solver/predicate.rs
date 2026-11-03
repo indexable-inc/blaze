@@ -1064,7 +1064,7 @@ mod tests {
             well_formed: clause(ClauseKind::WellFormed(types.u8.into())),
             projection: clause(ClauseKind::Projection(ProjectionClause {
                 projection_term: AliasTerm::from_checked_parts(
-                    AliasTermKind::ProjectionTy { def_id: TraitAssocTyId(id(5)) },
+                    AliasTermKind::ProjectionTy { def_id: TraitAssocTyId::from(id::<hir_def::TypeAliasId>(5)) },
                     args,
                 ),
                 term: types.u8.into(),

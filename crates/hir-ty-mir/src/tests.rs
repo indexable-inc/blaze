@@ -20,6 +20,7 @@ mod next_solver_items;
 mod opaque_types;
 mod patterns;
 mod regression;
+mod rpitit;
 mod simple;
 mod trait_aliases;
 mod traits;
@@ -201,7 +202,7 @@ fn check_impl(
     let files = fx.files().to_vec();
     let db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut had_annotations = false;
         let mut mismatches = HashMap::new_in(Global);
         let mut types = HashMap::new_in(Global);
@@ -391,7 +392,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut buf = String::new();
 
         let mut infer_def = |inference_result: &InferenceResult<'_>,
@@ -647,7 +648,7 @@ fn query_cycle_bug() {
     let pos = fx.position();
     let mut db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module = db.module_for_file(pos.file_id.file_id(&db));
         let crate_def_map = module.def_map(&db);
         visit_module(&db, crate_def_map, module, &mut |def| {
@@ -689,7 +690,7 @@ fn query_cycle_bug() {
 
     db.set_file_text(pos.file_id.file_id(&db), new_text);
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module = db.module_for_file(pos.file_id.file_id(&db));
         let crate_def_map = module.def_map(&db);
         visit_module(&db, crate_def_map, module, &mut |def| {

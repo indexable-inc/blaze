@@ -48,16 +48,9 @@ pub struct Served {
     listener: UnixListener,
     open: Arc<AtomicUsize>,
     most: usize,
-    lock: File,
-}
-
-impl Drop for Served {
-    fn drop(&mut self) {
-        // A process another thread starts has the lock's file open too until it runs its
-        // program, and a lock taken with `flock` lasts until every copy is closed or one of them
-        // lets go: closing this copy alone could leave the socket taken for a moment.
-        let _ = self.lock.unlock();
-    }
+    /// Let go of as this drops, though a process another thread starts has the file open too
+    /// until it runs its program ([`stdx::file_lock`]).
+    _lock: stdx::file_lock::Locked,
 }
 
 /// One of the connections a socket serves at a time, until it is dropped.
@@ -95,9 +88,10 @@ impl Served {
         #[cfg(unix)]
         SocketAddr::from_pathname(socket).map_err(|error| too_long(socket, error))?;
         let lock = private_file(OpenOptions::new().write(true).create(true), &lock_of(socket))?;
-        if lock.try_lock().is_err() {
-            return Err(NotServed::Taken);
-        }
+        let lock = match stdx::file_lock::Locked::try_lock(lock)? {
+            Ok(lock) => lock,
+            Err(_held) => return Err(NotServed::Taken),
+        };
         let made_in = with_suffix(socket, ".new");
         match std::fs::remove_dir_all(&made_in) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
@@ -140,7 +134,7 @@ impl Served {
         only_the_user_connects(&made)?;
         std::fs::rename(&made, socket)?;
         std::fs::remove_dir(&made_in)?;
-        Ok(Served { listener, open: Arc::default(), most: MOST_CONNECTIONS, lock })
+        Ok(Served { listener, open: Arc::default(), most: MOST_CONNECTIONS, _lock: lock })
     }
 
     /// The connections made to the socket, one after another, each with its place among

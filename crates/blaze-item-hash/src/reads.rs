@@ -33,7 +33,7 @@ use hir_ty::{
         InherentImpls_in_crate_for_self_ty, TraitImpls_blanket_in_crate_and_deps,
         TraitImpls_for_crate_and_trait, TraitImpls_in_crate_and_deps_for_trait_and_self_ty,
         TraitImpls_in_crate_for_trait_and_self_ty, impl_value_item, in_crate_trait_value_items,
-        scope_sets::module_items_named, trait_value_item,
+        inherent_value_item, scope_sets::module_items_named, trait_value_item,
     },
     next_solver::goal_store::{FactObject, FactRef, GoalFacts},
 };
@@ -247,6 +247,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("impl_value_item", "hir-ty/src/method_resolution.rs", Rule::FieldNamed(Of::Impl)),
     ("in_crate_trait_value_items", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::Name)),
     ("infer_body_query", "hir-ty/src/infer.rs", Rule::OwnStep(Step::Infer)),
+    ("inherent_value_item", "hir-ty/src/method_resolution.rs", Rule::FieldNamed(Of::Impl)),
     ("lang_items", "hir-def/src/lang_item.rs", Rule::OwnCrate(Else::CrateRoot)),
     ("line_literals", "hir-ty-mir/src/mir/location.rs", Rule::OwnBody),
     ("loaded_crates", "hir-ty/src/method_resolution.rs", Rule::OwnCrate(Else::CrateRoot)),
@@ -446,7 +447,9 @@ fn apply(
             krate => krate.map(|krate| whole_crate(db, krate)),
         },
         Rule::FieldNamed(of) => match of {
-            Of::Impl => impl_value_item::arguments(db, key).map(|(it, _)| ItemId::Impl(it)),
+            Of::Impl => impl_value_item::arguments(db, key)
+                .or_else(|| inherent_value_item::arguments(db, key))
+                .map(|(it, _)| ItemId::Impl(it)),
             Of::Trait => trait_value_item::arguments(db, key).map(|(it, _)| ItemId::Trait(it)),
             _ => None,
         }

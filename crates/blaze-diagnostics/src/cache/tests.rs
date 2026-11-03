@@ -134,7 +134,7 @@ fn an_outcome_reads_back_in_another_root() {
     // A registry crate outside the workspace: its files are named whole.
     let here = Paths::new(Some("/reg/lib-1.0.0".into()), Some("/w/target/debug/build/lib-1/out".into()));
     let diags = vec![diag_in("/reg/lib-1.0.0/src/lib.rs", "/w/target/debug/build/lib-1/out")];
-    let bytes = encode(&diags, &here, "/home/a/work").unwrap();
+    let bytes = encode(&diags, false, &here, "/home/a/work").unwrap();
     assert!(!bytes.windows(4).any(|it| it == b"/reg"), "no path of this machine is kept");
     let there = || Paths::new(Some("/cargo/reg/lib-1.0.0/".into()), Some("/x/out".into()));
     let read = decode(&bytes, there, "/home/b/work").unwrap();
@@ -144,7 +144,7 @@ fn an_outcome_reads_back_in_another_root() {
     // A vendored crate below the workspace: named from the root, in both.
     let here = Paths::new(Some("/home/a/work/vendor/lib".into()), None);
     let diags = vec![diag_in("vendor/lib/src/lib.rs", "nothing")];
-    let bytes = encode(&diags, &here, "/home/a/work/").unwrap();
+    let bytes = encode(&diags, false, &here, "/home/a/work/").unwrap();
     let there = || Paths::new(Some("/y/vendor/lib".into()), None);
     assert_eq!(decode(&bytes, there, "/y").unwrap().diags, diags);
     // Read in a checkout where the crate is not below the root, it is named whole.
@@ -156,7 +156,7 @@ fn an_outcome_reads_back_in_another_root() {
 fn an_outcome_naming_another_machine_path_is_refused() {
     let paths = Paths::new(Some("/reg/lib-1.0.0".into()), None);
     let root = "/home/a/work";
-    let refused = |diag: Diag| encode(&[diag], &paths, root).unwrap_err();
+    let refused = |diag: Diag| encode(&[diag], false, &paths, root).unwrap_err();
     // Another crate's file: a macro of the standard library.
     let mut diag = Diag::error(None, "x", span("/reg/lib-1.0.0/src/lib.rs", 0, 1));
     diag.span.primary[0].expansion = Some(Box::new(Expansion {
@@ -178,16 +178,16 @@ fn an_outcome_naming_another_machine_path_is_refused() {
     assert_eq!(refused(Diag::error(None, "a\0b", span("/reg/lib-1.0.0/a.rs", 0, 1))), Refused::Nul);
     // A crate with no package directory keeps no span.
     let none = Paths::new(None, None);
-    let error = encode(&[Diag::error(None, "x", span("/reg/lib-1.0.0/a.rs", 0, 1))], &none, root);
+    let error = encode(&[Diag::error(None, "x", span("/reg/lib-1.0.0/a.rs", 0, 1))], false, &none, root);
     assert!(matches!(error, Err(Refused::MachinePath { .. })));
     // An outcome of no diagnostics holds no path.
-    assert!(encode(&[], &none, root).is_ok());
+    assert!(encode(&[], false, &none, root).is_ok());
 }
 
 #[test]
 fn an_outcome_naming_a_path_the_reader_lacks_is_an_error() {
     let paths = Paths::new(Some("/reg/lib".into()), Some("/out".into()));
-    let bytes = encode(&[diag_in("/reg/lib/src/lib.rs", "/out")], &paths, "/w/root/a").unwrap();
+    let bytes = encode(&[diag_in("/reg/lib/src/lib.rs", "/out")], false, &paths, "/w/root/a").unwrap();
     assert!(decode(&bytes, || Paths::new(Some("/reg/lib".into()), None), "/w").is_err());
     assert!(decode(&bytes, || Paths::new(None, Some("/out".into())), "/w").is_err());
 }
@@ -196,7 +196,7 @@ fn an_outcome_naming_a_path_the_reader_lacks_is_an_error() {
 fn damaged_outcomes_are_refused_within_bounds() {
     let paths = || Paths::new(Some("/reg/lib".into()), Some("/out".into()));
     let diags = vec![diag_in("/reg/lib/src/lib.rs", "/out"), Diag::lint("dead_code", "unused", span("/reg/lib/a.rs", 1, 2))];
-    let bytes = encode(&diags, &paths(), "/w/root/a").unwrap();
+    let bytes = encode(&diags, false, &paths(), "/w/root/a").unwrap();
     assert_eq!(decode(&bytes, paths, "/w").unwrap().diags.len(), 2);
     for len in 0..bytes.len() {
         assert!(decode(&bytes[..len], paths, "/w").is_err(), "cut at {len}");
@@ -208,9 +208,9 @@ fn damaged_outcomes_are_refused_within_bounds() {
             assert!(decode(&damaged, paths, "/w").is_err(), "byte {at} bit {bit}");
         }
     }
-    let empty = encode(&[], &paths(), "/w").unwrap();
+    let empty = encode(&[], false, &paths(), "/w").unwrap();
     let mut failed = empty.clone();
-    failed[4] = 1;
+    failed[4] = (FAILED | ITEMS_SOUND) as u8;
     assert!(decode(&failed, paths, "/w").is_err(), "failed with no diagnostics");
     let mut padded = empty.clone();
     padded.extend_from_slice(b" ");
@@ -225,7 +225,7 @@ fn damaged_outcomes_are_refused_within_bounds() {
 
 #[test]
 fn an_empty_outcome_reads_without_allocating() {
-    let empty = encode(&[], &Paths::new(None, None), "/w").unwrap();
+    let empty = encode(&[], false, &Paths::new(None, None), "/w").unwrap();
     assert_eq!(empty.len(), HEADER + 2);
     let flags = flags(&["--cap-lints", "allow"]);
     let inputs = inputs(&flags);
@@ -233,7 +233,7 @@ fn an_empty_outcome_reads_without_allocating() {
         let _ = key(ContentId([1; 32]), &inputs);
         decode(&empty, || unreachable!("an empty outcome asks for no paths"), "/w")
     });
-    assert_eq!(read, Ok(Outcome { failed: false, diags: Vec::new() }));
+    assert_eq!(read, Ok(Outcome { failed: false, items_broken: false, diags: Vec::new() }));
 }
 
 /// The crates of `fixture` named under `dir`, checked as a build checks them from `root`.
@@ -259,7 +259,7 @@ fn checked_with(
         .zip(fixture.lines().filter_map(|it| it.strip_prefix("//- /")).map(|it| it.split_whitespace().next().unwrap()))
         .map(|(file, path)| (file.file_id(&db), format!("{dir}/{path}")))
         .collect();
-    let diags = hir::attach_db(&db, || {
+    let diags = blaze_query::db::attach(&db, || {
         let lib = hir::Crate::from(crate_named(&db, "lib"));
         crate::check::check_crate(&db, lib, Files::new(&names, root), &Options::default())
     });
@@ -280,11 +280,11 @@ fn a_served_outcome_renders_byte_identical() {
     let (db, names, diags) = checked(&fixture, "/reg/lib-1.0.0", "/home/a/work");
     assert!(diags.iter().any(|it| it.code == Some(Code::Error("E0308".to_owned()))), "{diags:?}");
     let lib = crate_named(&db, "lib");
-    let bytes = encode(&diags, &Paths::of(&db, lib), "/home/a/work").unwrap();
+    let bytes = encode(&diags, false, &Paths::of(&db, lib), "/home/a/work").unwrap();
 
     // The same checkout reads back what it wrote.
     let read = decode(&bytes, || Paths::of(&db, lib), "/home/a/work").unwrap();
-    assert_eq!(read, Outcome::new(diags.clone()));
+    assert_eq!(read, Outcome::new(diags.clone(), false));
     assert_eq!(stderr(&db, &names, "/home/a/work", &read.diags), stderr(&db, &names, "/home/a/work", &diags));
 
     // Another checkout, with the crate at another path, reads what its own check gives.
@@ -361,8 +361,8 @@ fn a_served_dependency_reads_its_outcome_and_bodies_in_a_second_database() {
     let (core_image, lib_image) = imaged(&mut db, &store);
     let (core, lib) = (crate_named(&db, "core"), crate_named(&db, "lib"));
     let checked = [
-        Checked { krate: lib, image: lib_image, inputs, diags: &diags },
-        Checked { krate: core, image: core_image, inputs, diags: &[] },
+        Checked { krate: lib, image: lib_image, inputs, diags: &diags, items_broken: false },
+        Checked { krate: core, image: core_image, inputs, diags: &[], items_broken: false },
     ];
     let kept = super::store(&db, &checked, &Served::default(), root, &store).unwrap();
     assert!(kept.refused.is_empty(), "{:?}", kept.refused);
@@ -384,7 +384,7 @@ fn a_served_dependency_reads_its_outcome_and_bodies_in_a_second_database() {
     assert!(checks.has(lib2) && checks.has(core2));
     assert_eq!((checks.keys[&lib2], checks.keys[&core2]), (kept.keys[&lib], kept.keys[&core]));
     let outcome = read(&second, &checks, lib2, root).unwrap().unwrap();
-    assert_eq!(outcome, Outcome::new(diags.clone()));
+    assert_eq!(outcome, Outcome::new(diags.clone(), false));
 
     // `lib` asked without `core`: no check key for its dependency, so a miss.
     let alone = fresh(&mut second, &[(lib2, inputs)], &store);
@@ -401,7 +401,7 @@ fn a_served_dependency_reads_its_outcome_and_bodies_in_a_second_database() {
     // Asked again under the same keys: the same, without a lookup.
     serve(&mut second, &[(lib2, inputs), (core2, inputs)], &store, &mut stepped).unwrap();
     assert_eq!(stepped.keys, checks.keys);
-    assert_eq!(read(&second, &stepped, lib2, root).unwrap().unwrap(), Outcome::new(diags.clone()));
+    assert_eq!(read(&second, &stepped, lib2, root).unwrap().unwrap(), Outcome::new(diags.clone(), false));
 
     // Other lint flags: the same check keys and bodies, another outcome key, the crate checked.
     let other = self::flags(&["--cap-lints", "warn"]);
@@ -449,8 +449,8 @@ fn a_bodys_process_variable_files_the_outcome_by_its_value() {
     assert!(!diags.is_empty(), "the body's mismatch");
     let (core_image, lib_image) = imaged(&mut db, &store);
     let checked = [
-        Checked { krate: crate_named(&db, "core"), image: core_image, inputs, diags: &[] },
-        Checked { krate: crate_named(&db, "lib"), image: lib_image, inputs, diags: &diags },
+        Checked { krate: crate_named(&db, "core"), image: core_image, inputs, diags: &[], items_broken: false },
+        Checked { krate: crate_named(&db, "lib"), image: lib_image, inputs, diags: &diags, items_broken: false },
     ];
     let kept = super::store(&db, &checked, &Served::default(), root, &store).unwrap();
     assert!(kept.refused.is_empty(), "{:?}", kept.refused);
@@ -477,7 +477,7 @@ fn a_bodies_part_under_its_key_that_does_not_open_is_an_error() {
     let _ = fx.files().to_vec();
     let mut first = fx.into_db();
     let (core_image, lib_image) = imaged(&mut first, &store);
-    let core = [Checked { krate: crate_named(&first, "core"), image: core_image, inputs, diags: &[] }];
+    let core = [Checked { krate: crate_named(&first, "core"), image: core_image, inputs, diags: &[], items_broken: false }];
     let kept = super::store(&first, &core, &Served::default(), "/w", &store).unwrap();
     let core_key = kept.keys[&core[0].krate];
     // `lib` reads nothing, so its part is under its key itself.
@@ -496,7 +496,7 @@ fn fresh(db: &mut Db, crates: &[(Crate, Inputs<'_>)], store: &Memory) -> Served 
 }
 
 /// [`header`] before it read with `blaze_format::cursor`.
-fn header_reference(bytes: &[u8]) -> Result<(bool, u32), &'static str> {
+fn header_reference(bytes: &[u8]) -> Result<(bool, bool, u32), &'static str> {
     let Some((head, body)) = bytes.split_first_chunk::<HEADER>() else {
         return Err("shorter than its header");
     };
@@ -505,8 +505,15 @@ fn header_reference(bytes: &[u8]) -> Result<(bool, u32), &'static str> {
         return Err("not an outcome of this encoding");
     }
     let flags = word(4);
-    if flags & !FAILED != 0 {
+    if flags & !(FAILED | ITEMS_BROKEN | ITEMS_SOUND) != 0 {
         return Err("flags it does not know");
+    }
+    let items = flags & (ITEMS_BROKEN | ITEMS_SOUND);
+    if flags & FAILED != 0 && items != ITEMS_BROKEN && items != ITEMS_SOUND {
+        return Err("a failed check that says not whether its items are broken, or says both");
+    }
+    if flags & FAILED == 0 && items != 0 {
+        return Err("its items' state in a check that did not fail");
     }
     let (count, len) = (word(8), word(12));
     if len as usize != body.len() {
@@ -515,15 +522,15 @@ fn header_reference(bytes: &[u8]) -> Result<(bool, u32), &'static str> {
     if count > len {
         return Err("more diagnostics than bytes");
     }
-    Ok((flags & FAILED != 0, count))
+    Ok((flags & FAILED != 0, flags & ITEMS_BROKEN != 0, count))
 }
 
 #[test]
 fn the_header_reads_as_it_did_before_the_cursor() {
     let paths = || Paths::new(Some("/reg/lib".into()), Some("/out".into()));
     let diags = vec![diag_in("/reg/lib/src/lib.rs", "/out"), Diag::lint("dead_code", "unused", span("/reg/lib/a.rs", 1, 2))];
-    let bytes = encode(&diags, &paths(), "/w/root/a").unwrap();
-    let empty = encode(&[], &paths(), "/w").unwrap();
+    let bytes = encode(&diags, false, &paths(), "/w/root/a").unwrap();
+    let empty = encode(&[], false, &paths(), "/w").unwrap();
     assert_eq!(&bytes[..HEADER], &header_bytes(&bytes)[..]);
     for bytes in [&bytes, &empty] {
         assert_eq!(header(bytes), header_reference(bytes));
@@ -542,8 +549,12 @@ fn the_header_reads_as_it_did_before_the_cursor() {
 
 /// The header [`encode`] wrote before it wrote with `blaze_format::cursor::Put`.
 fn header_bytes(bytes: &[u8]) -> Vec<u8> {
-    let (failed, count) = header_reference(bytes).unwrap();
-    let flags = if failed { FAILED } else { 0 };
+    let (failed, items_broken, count) = header_reference(bytes).unwrap();
+    let flags = match (failed, items_broken) {
+        (true, true) => FAILED | ITEMS_BROKEN,
+        (true, false) => FAILED | ITEMS_SOUND,
+        _ => 0,
+    };
     let len = u32::try_from(bytes.len() - HEADER).unwrap();
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);

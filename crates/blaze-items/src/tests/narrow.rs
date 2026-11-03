@@ -108,7 +108,7 @@ fn impl_function_named(db: &TestDB, name: &str) -> FunctionId {
 
 /// The impl of the trait `trait_`, or the inherent impl with `None`.
 fn impl_of(db: &TestDB, trait_: Option<TraitId>) -> ImplId {
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         impls(db)
             .into_iter()
             .find(|&it| db.impl_trait(it).map(|it| it.skip_binder().def_id.0) == trait_)
@@ -117,7 +117,7 @@ fn impl_of(db: &TestDB, trait_: Option<TraitId>) -> ImplId {
 }
 
 fn infer(db: &TestDB, function: FunctionId) {
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let _ = InferenceResult::of(db, DefWithBodyId::from(function));
     })
 }
@@ -133,7 +133,7 @@ pub struct B;
 "#;
 
 fn destructor_of(db: &TestDB, adt: AdtId) -> Option<ImplId> {
-    hir_ty::attach_db(db, || destructor(db, adt))
+    blaze_query::db::attach(db, || destructor(db, adt))
 }
 
 #[test]
@@ -179,14 +179,15 @@ fn a_method_of_another_name_leaves_the_lookup() {
     let (mut db, impl_file, caller) = method_db();
     let cold = db.log_executed(|| infer(&db, caller));
     assert!(ran(&cold, "infer_body_query"), "{cold:#?}");
-    assert!(ran(&cold, "impl_value_item"), "{cold:#?}");
+    // A method call looks an inherent impl's items up hygienically.
+    assert!(ran(&cold, "inherent_value_item"), "{cold:#?}");
 
     db.set_file_text(
         impl_file,
         "pub struct A;\nimpl A {\n    pub fn m(&self) {}\n    pub fn n(&self) {}\n}\n",
     );
     let warm = db.log_executed(|| infer(&db, caller));
-    assert!(ran(&warm, "impl_value_item"), "{warm:#?}");
+    assert!(ran(&warm, "inherent_value_item"), "{warm:#?}");
     assert!(!ran(&warm, "infer_body_query"), "{warm:#?}");
 }
 
@@ -211,7 +212,7 @@ impl Tr for S {}
 ";
 
 fn impls_of_trait(db: &TestDB, trait_: TraitId) -> usize {
-    hir_ty::attach_db(db, || TraitImpls::in_crate_and_deps_for_trait(db, krate(db), trait_).len())
+    blaze_query::db::attach(db, || TraitImpls::in_crate_and_deps_for_trait(db, krate(db), trait_).len())
 }
 
 #[test]
@@ -247,7 +248,7 @@ fn coherence(db: &TestDB) -> (bool, bool) {
     let tr = trait_named(db, "Tr");
     let trait_impl = impl_of(db, Some(tr));
     let inherent = impl_of(db, None);
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let def_map = crate_def_map(db, krate(db));
         (check_orphan_rules(db, trait_impl), is_inherent_impl_coherent(db, def_map, inherent))
     })
@@ -281,7 +282,7 @@ const LAYOUT: &str = "pub struct S {\n    a: u32,\n    b: u8,\n}\n";
 
 fn size_of_struct(db: &TestDB, name: &str) -> u64 {
     let adt = AdtId::from(struct_named(db, name));
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let interner = DbInterner::new_no_crate(db);
         let args = GenericArgs::identity_for_item(interner, adt.into());
         let env = ParamEnvAndCrate {
@@ -328,7 +329,7 @@ pub fn h<U: B>(_: U) {}
 fn size_under(db: &TestDB, name: &str, function: &str) -> u64 {
     let adt = AdtId::from(struct_named(db, name));
     let function = function_named(db, function);
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let interner = DbInterner::new_no_crate(db);
         let ty = Ty::new_adt(interner, adt, GenericArgs::identity_for_item(interner, adt.into()));
         let env = ParamEnvAndCrate {
@@ -376,7 +377,7 @@ fn warm_layouts_destructors_coherence_and_hidden_types_allocate_nothing() {
     let tr = trait_named(&db, "Tr");
     let (trait_impl, inherent) = (impl_of(&db, Some(tr)), impl_of(&db, None));
     let krate = krate(&db);
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let db = &db;
         let interner = DbInterner::new_no_crate(db);
         let args = GenericArgs::identity_for_item(interner, adt.into());
@@ -474,7 +475,7 @@ fn impl_tables_keep_the_order_impls_are_found_in() {
     let a = SimplifiedType::Adt(AdtId::from(struct_named(&db, "A")).into());
     let b = SimplifiedType::Adt(AdtId::from(struct_named(&db, "B")).into());
     let (t, u) = (trait_named(&db, "T"), trait_named(&db, "U"));
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let trait_of = |it: ImplId| db.impl_trait(it).map(|it| it.skip_binder().def_id.0);
         let all = impls(&db);
         let of = |trait_: Option<TraitId>| {
@@ -533,7 +534,7 @@ fn per_module_buckets_are_the_crate_tables() {
     let a = SimplifiedType::Adt(AdtId::from(struct_named(&db, "A")).into());
     let b = SimplifiedType::Adt(AdtId::from(struct_named(&db, "B")).into());
     let (t, u) = (trait_named(&db, "T"), trait_named(&db, "U"));
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let whole = &**TraitImpls::for_crate(&db, k);
         let inherent = InherentImpls::for_crate(&db, k);
         for trait_ in [t, u] {
@@ -567,7 +568,7 @@ fn an_impl_in_one_module_reruns_only_its_trait_bucket() {
     let (t, u) = (trait_named(&db, "T"), trait_named(&db, "U"));
     let b = SimplifiedType::Adt(AdtId::from(struct_named(&db, "B")).into());
     let read = |db: &TestDB| {
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             (
                 TraitImpls::for_crate_and_trait(db, k, t).blanket_impls(t).len(),
                 TraitImpls::in_crate_for_trait(db, k, u).len(),
@@ -596,7 +597,7 @@ fn an_item_that_is_no_impl_reruns_no_bucket() {
     let t = trait_named(&db, "T");
     let a = SimplifiedType::Adt(AdtId::from(struct_named(&db, "A")).into());
     let read = |db: &TestDB| {
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             _ = TraitImpls::for_crate(db, k);
             _ = InherentImpls::for_crate(db, k);
             (
@@ -642,7 +643,7 @@ fn implements_traits_unique_answers_as_one_at_a_time() {
     let traits = [trait_named(&db, "T"), trait_named(&db, "Au"), trait_named(&db, "T")];
     for name in ["A", "B", "C"] {
         let s = struct_named(&db, name);
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let ty = db.ty(s.into()).instantiate_identity().skip_norm_wip();
             let env = ParamEnvAndCrate {
                 param_env: db.trait_environment(GenericDefId::AdtId(s.into())),
@@ -687,7 +688,7 @@ fn crate_named(db: &TestDB, name: &str) -> Crate {
 
 /// The functions of `krate` whose bodies are lowered to find impls in them.
 fn holders(db: &TestDB, krate: Crate) -> Vec<String> {
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         impl_work(db, krate)
             .into_iter()
             .filter_map(|it| match it {
@@ -762,7 +763,7 @@ fn a_local_body_is_lowered_for_impls_only_when_it_may_hold_one() {
             _ => None,
         })
         .expect("trait `Tr`");
-    let found = hir_ty::attach_db(&db, || TraitImpls::in_crate_for_trait(&db, main, tr).len());
+    let found = blaze_query::db::attach(&db, || TraitImpls::in_crate_for_trait(&db, main, tr).len());
     // `A`, `B` (through `writes!`), `E` and `F`.
     assert_eq!(found, 4);
 }
@@ -813,7 +814,7 @@ fn the_trait_name_index_answers_as_each_trait_alone() {
     let fx = fixture::db(TRAIT_ITEMS);
     let _ = fx.files().to_vec();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut traits = Vec::new();
         for name in ["main", "dep", "other"] {
             traits_in(&db, crate_def_map(&db, crate_named(&db, name)), &mut traits);
@@ -914,7 +915,7 @@ fn a_specializing_impl_takes_the_item_of_its_closest_ancestor_of_its_self_type()
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no function `{name}`"));
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             InferenceResult::of(&db, DefWithBodyId::from(function)).has_type_mismatches()
         })
     };

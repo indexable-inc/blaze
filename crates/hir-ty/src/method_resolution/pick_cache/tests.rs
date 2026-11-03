@@ -149,21 +149,6 @@ fn infer_verified(fixture: &str) -> u64 {
     })
 }
 
-struct XorShift(u64);
-
-impl XorShift {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-}
-
 const TYPES: usize = 6;
 const TRAITS: usize = 5;
 const METHODS: usize = 4;
@@ -176,7 +161,7 @@ const METHODS: usize = 4;
 /// (receiver, name, scope) of another body: hits of every pick kind, ambiguities, private
 /// matches and misses.
 fn generated(seed: u64) -> String {
-    let mut rng = XorShift(seed);
+    let mut rng = blaze_ids::rng::SplitMix64::new(seed);
     let mut text = String::from(
         "//- minicore: sized, copy, clone, deref, option\n//- /main.rs crate:main deps:core\n",
     );
@@ -194,12 +179,12 @@ fn generated(seed: u64) -> String {
     }
     for ty in 0..TYPES {
         for tr in 0..TRAITS {
-            if rng.below(3) == 0 {
+            if rng.index(3) == 0 {
                 writeln!(text, "impl T{tr} for S{ty} {{}}").unwrap();
             }
         }
-        if rng.below(2) == 0 {
-            let m = rng.below(METHODS);
+        if rng.index(2) == 0 {
+            let m = rng.index(METHODS);
             writeln!(text, "impl S{ty} {{ pub fn m{m}(&self) -> u32 {{ 7 }} }}").unwrap();
         }
     }
@@ -220,9 +205,9 @@ fn generated(seed: u64) -> String {
     for body in 0..24 {
         writeln!(text, "fn b{body}() {{").unwrap();
         for _ in 0..6 {
-            let ty = rng.below(TYPES);
-            let m = rng.below(METHODS);
-            match rng.below(7) {
+            let ty = rng.index(TYPES);
+            let m = rng.index(METHODS);
+            match rng.index(7) {
                 0 => writeln!(text, "    let mut s = S{ty}(1); let _ = s.m{m}();").unwrap(),
                 1 => writeln!(text, "    let s = S{ty}(1); let r = &s; let _ = r.m{m}();").unwrap(),
                 2 => writeln!(text, "    let s = S{ty}(1); let r = &&s; let _ = r.m{m}();").unwrap(),

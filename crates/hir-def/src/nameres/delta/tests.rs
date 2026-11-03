@@ -453,12 +453,13 @@ fn renaming_a_variant_reaches_the_globs_of_its_enum() {
 }
 
 /// An edit of a dependency's macro body that keeps the macro's id changes no binding, and
-/// still changes what a call of it in this crate expands to.
+/// still changes what a call of it in this crate expands to. The call passes the name in, since
+/// a `struct S` the `macro` wrote itself would be hygienic, out of reach of the name `S`.
 #[test]
 fn editing_a_dependencys_macro_body_expands_its_calls_again() {
-    const STD: &str = "pub mod prelude {\n    pub mod rust_2018 {\n        pub macro global_asm() {\n            pub struct S;\n        }\n    }\n}\n";
+    const STD: &str = "pub mod prelude {\n    pub mod rust_2018 {\n        pub macro global_asm($name:ident) {\n            pub struct $name;\n        }\n    }\n}\n";
     let mut loaded = Loaded::new(&format!(
-        "//- /lib.rs edition:2018 crate:lib deps:std\nglobal_asm!();\n//- /std.rs crate:std\n{STD}"
+        "//- /lib.rs edition:2018 crate:lib deps:std\nglobal_asm!(S);\n//- /std.rs crate:std\n{STD}"
     ));
     let std = loaded.file("/std.rs");
     let lib = loaded.file("/lib.rs");
@@ -468,7 +469,7 @@ fn editing_a_dependencys_macro_body_expands_its_calls_again() {
         map.module(db, map.root).scope(db).get(&name("S")).take_types().is_some()
     };
     assert!(has_s(&loaded.db), "loaded: the call declares `S`");
-    loaded.db.set_file_text(std, &STD.replace("            pub struct S;\n", ""));
+    loaded.db.set_file_text(std, &STD.replace("            pub struct $name;\n", ""));
     assert!(!has_s(&loaded.db), "the call expands to nothing now");
     let mut failures = String::new();
     check_db(&loaded.db, "a dependency's macro body edited", &Exempt::NONE, false, &mut failures);

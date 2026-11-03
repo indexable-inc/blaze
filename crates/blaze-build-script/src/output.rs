@@ -398,6 +398,7 @@ fn key_value<'a>(
 }
 
 /// The package as a message names it, made only when a message is.
+#[derive(Clone, Copy)]
 struct Descr<'a>(&'a Package);
 
 impl std::fmt::Display for Descr<'_> {

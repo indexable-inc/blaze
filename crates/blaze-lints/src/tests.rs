@@ -115,7 +115,7 @@ pub(crate) fn try_lint_once(
     let mut built = fixture::db(fixture);
     given(&mut built);
     let db = built.into_db();
-    hir::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut linted = None;
         let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
         let mut texts = Vec::new();

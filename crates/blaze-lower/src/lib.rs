@@ -31,6 +31,7 @@
 #![feature(allocator_api)]
 
 mod answer;
+mod code;
 mod const_macros;
 mod crates;
 mod doctests;
@@ -63,6 +64,7 @@ pub use base_db::{Db, ProcMacroLoadingError};
 pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
 pub use self::answer::{SubRequest, SubResponse, answer};
+pub use self::code::{CodeText, code_identity, code_text_of};
 pub use self::crates::{lint_flags, local, target_data};
 pub use self::doctests::DoctestProgram;
 pub use self::harness::{Appended, macros_loaded, wasm_macro};
@@ -124,13 +126,6 @@ pub fn config_differs(kept: &BuildConfig, now: &BuildConfig) -> Option<String> {
 }
 
 /// A crate by the name it was given, for a person, or its id where it has none.
-fn crate_display(db: &Db, krate: Crate) -> String {
-    match &krate.extra_data(db).display_name {
-        Some(name) => name.canonical_name().as_str().to_owned(), // alloc: a name, once per front end let go
-        None => format!("{krate:?}"),                             // alloc: as above
-    }
-}
-
 /// Why units could not be lowered, or a run applied: what, and the path or unit it is about.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct LowerError {
@@ -229,8 +224,9 @@ impl Crates {
         self.units.get(unit)?.krate
     }
 
-    /// Whether unit `unit`'s crate is a proc macro's dylib, whose expanders
-    /// [`Lowered::macros`] sets once it is built.
+    /// Whether unit `unit` builds its crate's proc macros ([`Unit::gives_expanders`]), whose
+    /// expanders [`Lowered::macros`] sets once it is built: never a proc macro's `Check` or
+    /// `--test` unit, though the first shares the crate.
     pub fn is_proc_macro(&self, unit: usize) -> bool {
         self.units.get(unit).is_some_and(|it| it.proc_macro)
     }
@@ -250,7 +246,10 @@ struct Lowering {
     /// Its cfg and env before any run applied.
     cfg: CfgOptions,
     env: Vec<(String, String)>,
-    /// Whether its crate is a proc macro's dylib (a `proc-macro` target built without `--test`).
+    /// Whether it builds its crate's proc macros ([`Unit::gives_expanders`]): the one unit whose
+    /// load gives the crate its expanders ([`Lowered::macros`]). A proc macro's `Check` unit
+    /// shares the `Build` unit's crate and is not it: it links no module, so its load would
+    /// replace the built expanders with an error, in whichever order the two finished.
     proc_macro: bool,
     /// For a unit built to run in the macro host, whether its crate links `proc_macro`, as its
     /// root read when lowered.
@@ -482,7 +481,7 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
             dependents: Vec::new(),
             cfg: CfgOptions::default(),
             env: Vec::new(),
-            proc_macro: compiles && unit.target.is_proc_macro() && !crates::is_test(unit, plan),
+            proc_macro: unit.gives_expanders(),
             macro_host: None,
         });
     }
@@ -687,6 +686,11 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
     ProcMacros::give(db, not_built);
     const_macros::set_macros(db, const_listed);
     base_db::set_process_env(db, config.invocation.env.iter().cloned().collect());
+    // `CARGO_PRIMARY_PACKAGE` is of the request, in no crate's variables: the crates of the
+    // units of its primary packages see it ([`blaze_units::query::Units::is_primary`]).
+    // alloc: once per lowering, the primary units' crates
+    let primary = (lowerings.iter().enumerate()).filter(|(at, _)| units.is_primary(*at)).filter_map(|(_, it)| it.krate).collect();
+    base_db::set_primary_crates(db, primary);
     name_sources(db, workspace_root.dir.as_deref(), &config.library);
 
     Ok(Setup {
@@ -796,7 +800,7 @@ impl Lowered {
                 // alloc: a reason, once per front end let go
                 Some(lowering) => format!("`env!` or `option_env!` in {}", lowering.what),
                 // alloc: as above; a crate of no unit (a const macro's)
-                None => format!("`env!` or `option_env!` in the crate {}", crate_display(db, krate)),
+                None => format!("`env!` or `option_env!` in the crate {}", krate.named(db)),
             };
             Some(blaze_units::query::EnvMoved { name, by, was, now: value.map(str::to_owned) })
         })
@@ -870,6 +874,9 @@ impl Lowered {
     /// read from the view read again and applied as the change it is (O(its files), the
     /// mounts' fixed roots not read again), so the database's memos stay and only what the
     /// change reaches runs again. The runs and proc macros applied stay until applied again.
+    /// Whether or not the view moved, each file outside the VFS that `include_bytes!` or
+    /// `include_str!` read is read again, and those whose bytes moved are set
+    /// ([`Db::reload_included_files`]): such a file changes with no change of the view.
     /// `Ok(false)`, nothing changed, when the view moves the workspace's root or what its
     /// manifest sets, which every crate is made with, or whether a crate of the macro host
     /// links `proc_macro` ([`MacroHost`]), which its cfg is made with: it is to be [`lower`]ed
@@ -896,6 +903,8 @@ impl Lowered {
         // A new job: its units' roots are appended to again, and may be made other than before.
         self.appended.clear();
         if root == self.view {
+            // The view did not move, but a file outside it may have.
+            self.db.reload_included_files(INCLUDED_MOVED);
             return Ok(true);
         }
         let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files, read_view: Cell::new(false) };
@@ -947,6 +956,9 @@ impl Lowered {
             note(paths, db, load.set, &change);
         }
         seed(db)?;
+        // In this batch: one change, one pass. A file outside the VFS moves with no move of the
+        // view, and one inside it may be newly outside: read again whatever the view did.
+        db.reload_included_files(INCLUDED_MOVED);
         self.view = root;
         if removed {
             for lowering in &self.crates.units {
@@ -977,14 +989,23 @@ impl Lowered {
         tables(&mut self.db)
     }
 
-    /// Whether [`Lowered::macros`] would take expanders for unit `unit`: a proc macro's crate.
+    /// Whether [`Lowered::macros`] would take expanders for unit `unit`: the unit that builds a
+    /// proc macro's module ([`Unit::gives_expanders`]).
     pub fn check_macros(&self, unit: usize) -> Result<(), LowerError> {
         let Some(lowering) = self.crates.units.get(unit) else {
             return Err(LowerError::new(format!("the build has no unit {unit}")));
         };
         match (lowering.krate, lowering.proc_macro) {
             (Some(_), true) => Ok(()),
-            _ => Err(LowerError::at("not a proc macro's crate", lowering.what.clone())),
+            _ => Err(LowerError::at(
+                // alloc: error path
+                format!(
+                    "{} builds no proc macro's module, so gives no crate expanders: only a `proc-macro` target's \
+                     build unit does",
+                    lowering.what
+                ),
+                lowering.what.clone(),
+            )),
         }
     }
 
@@ -1069,6 +1090,10 @@ fn checked<'a>(crates: &'a Crates, run: usize, ran: &Ran) -> Result<(&'a Lowerin
         .collect::<Result<Vec<_>, _>>()?;
     Ok((lowering, cfgs))
 }
+
+/// The change [`Lowered::refresh`] writes when a file outside the VFS that `include_bytes!` or
+/// `include_str!` read moved on disk, and the view did not.
+const INCLUDED_MOVED: Trigger<'static> = Trigger::named("files include_bytes! or include_str! read moved on disk");
 
 const IDENTITY: &str = "blaze v2 cargo unit identity 4";
 

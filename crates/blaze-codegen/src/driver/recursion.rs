@@ -519,6 +519,7 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
                      times without reaching them all, the last one `{}`",
                     frontend.spell(instance)
                 ),
+                front: None,
             });
             next.functions.clear();
             next.function_items.clear();
@@ -549,6 +550,7 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
                         spelled(it.head),
                         spelled(it.limit_of)
                     ),
+                    front: None,
                 });
                 continue;
             };
@@ -566,6 +568,7 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
                      deferred past the limit, though it refused nothing",
                     spelled(left as u32)
                 ),
+                front: None,
             });
         }
         false
@@ -607,5 +610,6 @@ fn miscounted<I, F: Frontend<Instance = I>>(frontend: &F, functions: &[(I, Origi
             std::any::type_name::<F>(),
             functions.len(),
         ),
+        front: None,
     }
 }

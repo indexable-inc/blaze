@@ -80,7 +80,7 @@ fn has_host_effect(clauses: &[Clause<'_>]) -> bool {
 #[test]
 fn an_associated_type_and_an_opaque_imply_their_const_bounds() {
     let db = fixture::db(FIXTURE).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let tr = trait_named(&db, "Tr");
         let out = trait_named(&db, "Holder")
             .trait_items(&db)

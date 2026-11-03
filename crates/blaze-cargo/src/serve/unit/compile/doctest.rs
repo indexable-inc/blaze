@@ -14,16 +14,29 @@
 //! - [`Phase::Link`](super::Phase): each example linked to `<runner>.doctests/<id>`, the
 //!   runner to the unit's program, and the verdicts written beside them. A kept image of an
 //!   example is relinked at its own path, so an edit of one example patches that one.
+//!
+//! Each image (an example's, the runner's) is keyed before it is built by all it is made of
+//! ([`base_key`]): the unit's record inputs but its crate's identity, and the code identity of
+//! the image's own crate ([`blaze_lower::code_identity`]), which an edit of another example's
+//! text (a comment no macro sees, in the library) leaves as it was. Its record, filed under
+//! that key and what its code read ([`super::reads`]), names its output and the native inputs
+//! its link read. An image whose record is found is [`Linking::Unchanged`]: not checked, built
+//! or linked, its file the one the store keeps.
 
 use std::path::Path;
 
 use blaze_api::{ApiError, Level};
+use blaze_cas::Key;
 use blaze_doc::doctest::{self as doc, Built, Program, Verdict};
+use blaze_ids::{ContentId, Hasher};
 use blaze_lower::{Appended, DoctestProgram, LowerError, Lowered};
 use parking_lot::Mutex;
 
-use super::{Does, Failed, Image, Job, Linked, Making, Phases, Put, UnitReader, artifact, codegen, lock, say, span_unit};
-use crate::serve::unit::codegen::Makes;
+use super::{
+    Does, Failed, Image, ImageRecord, Job, Linked, Making, Phases, Put, UnitReader, Written, artifact, codegen, header, lock,
+    reads, say, span_unit,
+};
+use crate::serve::{unit::codegen::Makes, work::Linking as How};
 
 /// The id of the runner's crate among a unit's doctest crates: no example's (rustdoc's are a
 /// file's name, flattened, a line and a number).
@@ -65,7 +78,11 @@ pub(crate) fn expand(lowered: &mut Lowered, job: &Job, unit: usize) -> Result<()
         let db = lowered.db();
         let library = hir::Crate::from(krate);
         let examples = doc::examples(db, library);
-        let of = doc::OfLibrary::read(db, library);
+        let of = doc::OfLibrary::read(db, library).map_err(|unnamed| LowerError {
+            // alloc: an error
+            what: format!("the library {unnamed} has no name for its doctests to use it by"),
+            at: Some(at()),
+        })?;
         doc::programs(&of, &examples, codegen::triple(job, u), package_dir)
     };
     let runner = doc::runner(&programs);
@@ -78,6 +95,9 @@ pub(crate) fn expand(lowered: &mut Lowered, job: &Job, unit: usize) -> Result<()
         })
         .collect(); // alloc: once per doctest unit made
     let runner_named = format!("{package_dir}/blaze-doctest-runner.rs"); // alloc: once per doctest unit made
+    // A `test_harness` example is written with the harness its file last had, which lists
+    // its tests again when they are unchanged: then its file is written once.
+    let last = lowered.doctest_harnesses(unit);
     let mut asked: Vec<DoctestProgram<'_>> = programs
         .iter()
         .zip(&named)
@@ -88,7 +108,10 @@ pub(crate) fn expand(lowered: &mut Lowered, job: &Job, unit: usize) -> Result<()
             source: &it.source,
             edition: it.edition,
             test: it.test_harness,
-            appended: None,
+            appended: match it.test_harness {
+                true => last.iter().find(|(id, _)| *id == it.id).map(|(_, appended)| appended),
+                false => None,
+            },
         })
         .collect(); // alloc: once per doctest unit made
     let runner_program = DoctestProgram {
@@ -103,13 +126,16 @@ pub(crate) fn expand(lowered: &mut Lowered, job: &Job, unit: usize) -> Result<()
     let mut made = lowered.doctests(unit, &asked)?;
     // A `test_harness` example is a test crate, as rustdoc's `--test` builds it: its harness
     // (each `#[test]` of it listed for libtest, and a `main` that runs them) is listed from its
-    // crate as just made and appended to its root, as a test crate's is, which is then
-    // written again.
+    // crate as just made and appended to its root, as a test crate's is. Only an example whose
+    // listing differs from the harness it was written with (its first build, or an edit of
+    // its tests) is written again.
     let harnessed = match asked.iter().any(|it| it.test) {
         true => harnesses(lowered, job, unit, &asked, &made).map_err(|what| LowerError { what, at: Some(at()) })?,
         false => Vec::new(),
     };
-    if !harnessed.is_empty() {
+    let stale = asked.iter().zip(&harnessed).any(|(program, listed)| program.appended != listed.as_ref());
+    if stale {
+        let _span = tracing::info_span!(target: "blaze", "doctest harnesses written again", unit = %at()).entered();
         for (program, appended) in asked.iter_mut().zip(&harnessed) {
             program.appended = appended.as_ref();
         }
@@ -162,10 +188,10 @@ fn harnesses(
 pub(crate) struct Generated {
     /// The verdict on each program before it runs, by its index; none for an ignored one.
     verdicts: Vec<Option<Verdict>>,
-    /// The code of each example to link, by its index.
-    examples: Vec<(usize, codegen::Parts)>,
-    /// The runner's code, or why it has none.
-    runner: Result<codegen::Parts, String>,
+    /// The image of each example linked, by its index.
+    examples: Vec<(usize, Code)>,
+    /// The runner's image, or why it has none.
+    runner: Result<Code, String>,
 }
 
 /// [`Phase::Names`](super::Phase) of a `Doctest` unit not kept: no check of its own (the
@@ -196,8 +222,58 @@ enum Example {
     Ignored,
     /// Judged before it runs, and not linked: refused, `compile_fail`, or failed to build.
     Judged(Verdict),
-    /// Built, and its code to link.
-    Built(Verdict, codegen::Parts),
+    /// Built now or before, and its image.
+    Built(Verdict, Code),
+}
+
+/// An image of a `Doctest` unit, as [`Phase::Codegen`](super::Phase) has it.
+enum Code {
+    /// Its code built, to link, and its base key, which its record is filed under once linked.
+    Built(codegen::Parts, Key),
+    /// Made before from the same inputs: its record.
+    Unchanged(Found),
+}
+
+/// The record of an image ([`found`]): its output, in the store, and the native inputs its
+/// link read, each as it was.
+struct Found {
+    output: Key,
+    natives: Vec<(String, ContentId)>,
+}
+
+/// The domain of an image's base key ([`base_key`]).
+const IMAGE: &str = "blaze v2 doctest image 1";
+
+/// What stands for the crate identity among the unit's record inputs in an image's base key
+/// ([`unit_part`]): each image has its own crate's code identity there.
+const NO_IDENTITY: &str = "blaze v2 doctest image without the unit's identity 1";
+
+/// `unit`'s record inputs with no crate identity: what every image of the unit is made with
+/// besides its own crate (its profile, platform, flags, toolchain, blaze and the rest).
+fn unit_part(job: &Job, unit: usize) -> Result<Key, ApiError> {
+    super::with_record_inputs(job, unit, ContentId::of(NO_IDENTITY, b""), |inputs| inputs.key(unit))
+}
+
+/// The base key of the image of `krate` named `name` (an example's id, or the runner's): the
+/// unit's record inputs `part` and the crate's code identity.
+fn base_key(db: &base_db::Db, part: Key, krate: base_db::Crate, name: &str) -> Key {
+    let mut hasher = Hasher::new(IMAGE);
+    hasher.id(&part.0).id(&blaze_lower::code_identity(db, krate)).part(name.as_bytes());
+    Key(hasher.finish())
+}
+
+/// The record of the image of base key `base` in the daemon's store, filed under it or under
+/// what its code read with the values it has now, its output in the store and every native
+/// input as it was: none when there is none. A store that can't be read, or a record that is
+/// not an image's, is the error, naming the key.
+fn found(job: &Job, base: Key) -> Result<Option<Found>, ApiError> {
+    let guard = blaze_cas::enter();
+    let Some((_, entry, _)) = super::filed_in(job, &job.input.store, false, &guard, base)? else { return Ok(None) };
+    match header::outputs_natives(entry.bytes) {
+        Some((outputs, natives)) if outputs.len() == 1 => Ok(Some(Found { output: outputs[0], natives })),
+        // alloc: error path
+        _ => Err(ApiError::new(format!("the record of doctest image key {:x} in the daemon's store names no one output", base.0), None)),
+    }
 }
 
 /// [`Phase::Codegen`](super::Phase) of a `Doctest` unit: each example checked and judged, its
@@ -209,8 +285,9 @@ pub(super) fn generate(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex
     let expanded = expanded(job, unit)?;
     let u = job.unit(unit)?;
     let files = blaze_diagnostics::Files::new(reader.paths(), job.mounted.root());
+    let part = unit_part(job, unit)?;
     let built = blaze_graph::par::map(blaze_graph::par::zip(&expanded.programs, &expanded.crates), |(program, krate)| match *krate {
-        Some(krate) => example(job, reader, unit, files, program, krate),
+        Some(krate) => example(job, reader, unit, part, files, program, krate),
         None => Ok(Example::Ignored),
     });
     if job.cancelled() {
@@ -223,19 +300,29 @@ pub(super) fn generate(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex
         match made? {
             Example::Ignored => verdicts.push(None),
             Example::Judged(verdict) => verdicts.push(Some(verdict)),
-            Example::Built(verdict, parts) => {
+            Example::Built(verdict, code) => {
                 verdicts.push(Some(verdict));
-                examples.push((at, parts));
+                examples.push((at, code));
             }
         }
     }
     let runner = {
         let _span = tracing::info_span!(target: "blaze", "doctest runner", unit = %span_unit(u)).entered();
-        let made = codegen::generate(job, reader, unit, expanded.runner, &Makes::Executable, &job.mounted, None);
-        match made.map_err(|why| ApiError::new(why, Some(span_unit(u))))? {
-            Ok(parts) => Ok(parts),
-            // alloc: error path
-            Err(errors) => Err(format!("blaze can't build the doctests' runner: {}", errors.join("; "))),
+        let base = {
+            let _span = tracing::info_span!(target: "blaze", "doctest image key", function = "the doctests' runner").entered();
+            let base = base_key(reader.db(), part, expanded.runner, RUNNER);
+            found(job, base)?.ok_or(base)
+        };
+        match base {
+            Ok(found) => Ok(Code::Unchanged(found)),
+            Err(base) => {
+                let made = codegen::generate(job, reader, unit, expanded.runner, &Makes::Executable, &job.mounted, None);
+                match made.map_err(|why| ApiError::new(why, Some(span_unit(u))))? {
+                    Ok(parts) => Ok(Code::Built(parts, base)),
+                    // alloc: error path
+                    Err(refused) => Err(format!("blaze can't build the doctests' runner: {}", refused.errors.join("; "))),
+                }
+            }
         }
     };
     if job.cancelled() {
@@ -245,13 +332,15 @@ pub(super) fn generate(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex
     Ok(())
 }
 
-/// One example of `Doctest` unit `unit`, `program` in `krate`: checked, judged as rustdoc
+/// One example of `Doctest` unit `unit`, `program` in `krate`: its image's record found under
+/// its base key (with the unit's record inputs `part`), or else checked, judged as rustdoc
 /// judges it, and its code compiled when it builds and is to be linked. Its span names the
 /// example (`function`) and the unit, and covers all of its work.
 fn example(
     job: &Job,
     reader: &UnitReader,
     unit: usize,
+    part: Key,
     files: blaze_diagnostics::Files<'_>,
     program: &Program,
     krate: base_db::Crate,
@@ -259,9 +348,25 @@ fn example(
     let u = job.unit(unit)?;
     let _span = tracing::info_span!(target: "blaze", "doctest example", unit = %span_unit(u), function = %program.name).entered();
     let db = reader.db();
+    // An example that builds and runs is linked, and its image recorded: one recorded under
+    // the same key builds as it did, and its verdict before it runs is the one it had.
+    let built = program.after_build(Built::Built);
+    let linked = !program.compile_fail && matches!(built, Verdict::Run | Verdict::Passed);
+    let base = {
+        let _span = tracing::info_span!(target: "blaze", "doctest image key", function = %program.name).entered();
+        let base = base_key(db, part, krate, &program.id);
+        match linked {
+            true => found(job, base)?.ok_or(base),
+            false => Err(base),
+        }
+    };
+    let base = match base {
+        Ok(found) => return Ok(Example::Built(built, Code::Unchanged(found))),
+        Err(base) => base,
+    };
     let diags = {
         let _span = tracing::info_span!(target: "blaze", "doctest example check", function = %program.name).entered();
-        crate::serve::unit::checks::Checking::new(db, hir::Crate::from(krate)).check(db, files, &blaze_diagnostics::Options::default())
+        crate::serve::unit::checks::Checking::new(db, hir::Crate::from(krate)).check(db, files, &blaze_diagnostics::Options::default()).diags
     };
     let verdict = match refused(job, files, krate, reader, &diags) {
         Ok(None) => program.after_build(Built::Built),
@@ -279,9 +384,9 @@ fn example(
         return Err(Failed::Again);
     }
     match made {
-        Ok(Ok(parts)) => Ok(Example::Built(verdict, parts)),
+        Ok(Ok(parts)) => Ok(Example::Built(verdict, Code::Built(parts, base))),
         // alloc: a verdict's words, once per example blaze can't build
-        Ok(Err(errors)) => Ok(Example::Judged(Verdict::Failed(format!("blaze can't build the example: {}", errors.join("; "))))),
+        Ok(Err(refused)) => Ok(Example::Judged(Verdict::Failed(format!("blaze can't build the example: {}", refused.errors.join("; "))))),
         Err(why) => Err(ApiError::new(why, Some(span_unit(u))).into()),
     }
 }
@@ -291,9 +396,13 @@ fn example(
 struct Linking {
     at: Option<usize>,
     path: String,
-    parts: codegen::Parts,
+    code: Code,
     kept: Vec<Image>,
 }
+
+/// What [`link`] made of one built image: the link, and where its record is filed (none when
+/// what its code read can't key one, or every slot of its key holds other names).
+type LinkedImage = (Result<codegen::LinkMade, codegen::LinkFailed>, Option<reads::Filing>);
 
 /// The errors `diags` of an example's check, its crate `krate`, rendered as rustc writes them
 /// (`error[E0308]: ..`), the crate's own text standing for the file it is named by; none when
@@ -355,6 +464,8 @@ pub(super) fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Pha
         // alloc: none until a refusal
         diagnostics: Vec::new(),
         ok: true,
+        open: false,
+        why: None,
         made: super::Made::default(),
         nothing: false,
         files: Vec::new(),
@@ -362,6 +473,7 @@ pub(super) fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Pha
         natives: Vec::new(),
         links: Vec::new(),
         macros: None,
+        records: Vec::new(),
     };
     let runner = match runner {
         Ok(it) => it,
@@ -379,17 +491,21 @@ pub(super) fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Pha
     // ([`blaze_graph::par`]), each its own image; the kept links go back once all are made.
     let mut built: Vec<Linking> = Vec::with_capacity(examples.len() + 1); // alloc: as `dir`
     // clone: the runner's path, once
-    built.push(Linking { at: None, path: main.clone(), parts: runner, kept: Vec::new() });
-    for (at, parts) in examples.drain(..) {
+    built.push(Linking { at: None, path: main.clone(), code: runner, kept: Vec::new() });
+    for (at, code) in examples.drain(..) {
         let program = &expanded.programs[at];
         let exe = format!("{dir}/{}{}", program.id, std::env::consts::EXE_SUFFIX); // alloc: once per example linked
-        built.push(Linking { at: Some(at), path: exe, parts, kept: Vec::new() });
+        built.push(Linking { at: Some(at), path: exe, code, kept: Vec::new() });
     }
     for it in &mut built {
-        // alloc: once per image linked, the one link kept at its path
-        it.kept = images.extract_if(.., |kept| kept.path == it.path).collect();
+        if matches!(it.code, Code::Built(..)) {
+            // alloc: once per image linked, the one link kept at its path
+            it.kept = images.extract_if(.., |kept| kept.path == it.path).collect();
+        }
     }
-    let made = blaze_graph::par::map(&mut built, |it| {
+    let env = &job.input.config.invocation.env;
+    let made: Vec<Option<LinkedImage>> = blaze_graph::par::map(&mut built, |it| {
+        let Code::Built(parts, base) = &it.code else { return None };
         if job.cancelled() {
             return None;
         }
@@ -400,8 +516,27 @@ pub(super) fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Pha
         let krate = krate?;
         let name = it.at.map_or("the doctests' runner", |at| expanded.programs[at].name.as_str());
         let _span = tracing::info_span!(target: "blaze", "doctest example link", unit = %span_unit(u), function = %name).entered();
-        let generated = it.parts.over(reader, &job.mounted);
-        Some(codegen::link(job, unit, krate, &it.path, &Makes::Executable, &generated, &mut it.kept))
+        let generated = parts.over(reader, &job.mounted);
+        let linked = codegen::link(job, unit, krate, &it.path, &Makes::Executable, &generated, &mut it.kept);
+        // Filed by what the image's code read, as a unit record is: known now it is built.
+        let filing = match &linked {
+            Ok(_) => {
+                let _span = tracing::info_span!(target: "blaze", "doctest image record", function = %name).entered();
+                let guard = blaze_cas::enter();
+                let filed = reads::Reads::of(reader.db(), krate).and_then(|read| {
+                    reads::file(*base, &read, env, &|manifest| job.units().is_primary_manifest(manifest), |slot| job.input.store.get(&guard, slot).ok().flatten().map(|it| it.bytes))
+                });
+                match filed {
+                    Ok(filing) => filing,
+                    Err(why) => {
+                        tracing::info!(image = %it.path, "doctest image record not kept: {why}");
+                        None
+                    }
+                }
+            }
+            Err(_) => None,
+        };
+        Some((linked, filing))
     });
     for it in &mut built {
         images.append(&mut it.kept);
@@ -410,13 +545,25 @@ pub(super) fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Pha
         return Err(Failed::Again);
     }
     for (it, made) in built.iter().zip(made) {
-        let Some(made) = made else { continue };
+        if let Code::Unchanged(found) = &it.code {
+            // clone: once per image unchanged, its few native inputs
+            making.natives.extend(found.natives.iter().cloned());
+            // alloc: once per image unchanged
+            making.links.push((it.path.clone(), How::Unchanged));
+            making.files.push((it.path.clone(), Written::Kept(found.output), true)); // clone: as above
+            continue;
+        }
+        let Some((made, filing)) = made else { continue };
         match made {
             Ok(linked) => {
+                if let Some(filing) = filing {
+                    // alloc: once per image recorded, its path and few native inputs
+                    making.records.push(ImageRecord { path: it.path.clone(), filing, natives: linked.read.clone() });
+                }
                 making.natives.extend(linked.read);
                 // alloc: once per image linked
                 making.links.push((it.path.clone(), linked.how));
-                making.files.push((it.path.clone(), linked.bytes, true)); // clone: as above
+                making.files.push((it.path.clone(), Written::Bytes(linked.bytes), true)); // clone: as above
             }
             Err(failed) => match it.at {
                 // alloc: a verdict's words, once per example that fails to link
@@ -426,6 +573,7 @@ pub(super) fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Pha
                     making.ok = false;
                     making.nothing = true;
                     making.files.clear();
+                    making.records.clear();
                     phases.linked = Some(Linked::Made(Box::new(making)));
                     return Ok(());
                 }
@@ -439,11 +587,12 @@ pub(super) fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Pha
         }
     }
     // alloc: once per doctest unit linked
-    making.files.push((format!("{dir}/{}", doc::VERDICTS), lines.into_bytes(), false));
+    making.files.push((format!("{dir}/{}", doc::VERDICTS), Written::Bytes(lines.into_bytes()), false));
     // Moved, not copied: the store keeps them as they are.
     let subject = super::unit_subject(job, u);
     let mut used = Vec::new(); // alloc: once per doctest unit linked
-    for Linking { parts, .. } in &mut built {
+    for Linking { code, .. } in &mut built {
+        let Code::Built(parts, _) = code else { continue };
         let puts = std::mem::take(&mut parts.built.puts);
         making.puts.extend(puts.into_iter().map(|it| Put { key: it.key, kind: it.kind, bytes: it.bytes }));
         for mut miss in std::mem::take(&mut parts.built.misses) {

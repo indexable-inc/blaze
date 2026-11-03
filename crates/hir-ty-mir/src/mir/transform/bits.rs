@@ -303,36 +303,38 @@ fn leaf<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Result<'db, Leaf<'db>> {
                     Leaf::Enum { tag: enum_tag(ctx, ty)? }
                 }
             }
-            _ => return Err(not_packable(ty)),
+            _ => return Err(not_packable(ctx, ty)),
         },
-        _ => return Err(not_packable(ty)),
+        _ => return Err(not_packable(ctx, ty)),
     })
 }
 
-fn not_packable<'db>(ty: Ty<'db>) -> MirLowerError<'db> {
+/// The errors here name their types with the database attached: a type's `Debug` names it
+/// only through it, and the lowering may run on a worker with none.
+fn not_packable<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> MirLowerError<'db> {
     // alloc: error path
-    MirLowerError::ImplementationError(format!(
-        "a field of a `#[blaze::bits]` struct has type `{ty:?}`, which `bits_layout` refuses"
-    ))
+    MirLowerError::ImplementationError(blaze_query::db::attach(ctx.db, || {
+        format!("a field of a `#[blaze::bits]` struct has type `{ty:?}`, which `bits_layout` refuses")
+    }))
 }
 
 /// The integer type of the tag of the fieldless enum `ty`, which its values are transmutes of.
 fn enum_tag<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Result<'db, Ty<'db>> {
     let layout = ctx.layout_of(ty).ok_or_else(|| {
         // alloc: error path
-        MirLowerError::ImplementationError(format!(
-            "the enum `{ty:?}` in a `#[blaze::bits]` struct has no layout"
-        ))
+        MirLowerError::ImplementationError(blaze_query::db::attach(ctx.db, || {
+            format!("the enum `{ty:?}` in a `#[blaze::bits]` struct has no layout")
+        }))
     })?;
     match layout.backend_repr {
         BackendRepr::Scalar(scalar) => match scalar.primitive() {
             Primitive::Int(integer, signed) => Ok(int_ty(ctx, integer, signed)),
-            _ => Err(not_packable(ty)),
+            _ => Err(not_packable(ctx, ty)),
         },
         // alloc: error path
-        _ => Err(MirLowerError::ImplementationError(format!(
-            "the enum `{ty:?}` in a `#[blaze::bits]` struct is not laid out as its tag"
-        ))),
+        _ => Err(MirLowerError::ImplementationError(blaze_query::db::attach(ctx.db, || {
+            format!("the enum `{ty:?}` in a `#[blaze::bits]` struct is not laid out as its tag")
+        }))),
     }
 }
 
@@ -945,7 +947,7 @@ fn f(mut p: P, q: Q) -> bool {
         );
         let file_ids = fx.files().to_vec();
         let db = fx.into_db();
-        crate::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let file_id = *file_ids.last().unwrap();
             let module_id = db.module_for_file(file_id.file_id(&db));
             let def_map = module_id.def_map(&db);

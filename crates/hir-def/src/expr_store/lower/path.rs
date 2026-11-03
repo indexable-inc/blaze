@@ -17,6 +17,7 @@ use hir_expand::{
 };
 use intern::sym;
 use smallvec::SmallVec;
+use span::SyntaxContext;
 use syntax::{
     AstPtr, ast as tag,
     view::{self as ast, AstNode, HasGenericArgs, HasTypeBounds},
@@ -62,6 +63,13 @@ fn lower_path_on_stacks(
 ) -> Option<PathIdx> {
     let mut kind = PathKind::Plain;
     let mut type_anchor = None;
+    let root = SyntaxContext::root(span::Edition::Edition2015);
+    // Every segment a real file writes has a root context: only an expansion's are read.
+    let in_expansion = collector.expander.current_file_id().macro_file().is_some();
+    // Each segment's context normalized to macros 2.0 (`ModPath::contexts`), pushed with it
+    // (last first, as the segments are).
+    // alloc: none for up to 8 segments, on the stack
+    let mut contexts: SmallVec<[SyntaxContext; 8]> = SmallVec::new();
     #[cfg(test)]
     let mut ast_segments = Vec::new(); // alloc: tests only, for `SEGMENT_LOWERING_MAP`
     #[cfg(test)]
@@ -84,6 +92,7 @@ fn lower_path_on_stacks(
     loop {
         let Some(segment) = path.segment() else {
             collector.stacks.path_segments.push(Name::missing());
+            contexts.push(root);
             // We can end up here if for `path::`
             match qualifier(path) {
                 Some(it) => {
@@ -133,6 +142,13 @@ fn lower_path_on_stacks(
                     collector.stacks.path_generic_args.push(slot(args));
                 }
                 push_segment(segment, &mut collector.stacks.path_segments, name);
+                contexts.push(match in_expansion {
+                    true => collector
+                        .expander
+                        .ctx_for_range(name_ref.syntax().text_range())
+                        .normalize_to_macros_2_0(collector.db),
+                    false => root,
+                });
             }
             ast::PathSegmentKind::SelfTypeKw => {
                 push_segment(
@@ -140,6 +156,7 @@ fn lower_path_on_stacks(
                     &mut collector.stacks.path_segments,
                     Name::new_symbol_root(sym::Self_),
                 );
+                contexts.push(root);
             }
             ast::PathSegmentKind::Type { type_ref, trait_ref } => {
                 debug_assert!(path.qualifier().is_none()); // this can only occur at the first segment
@@ -170,6 +187,7 @@ fn lower_path_on_stacks(
                         kind = mod_path.kind;
 
                         collector.stacks.path_segments.extend(mod_path.segments().iter().cloned().rev());
+                        contexts.extend((0..num_segments).rev().map(|i| mod_path.context_of(i, root)));
                         #[cfg(test)]
                         {
                             ast_segments_offset = mod_path.segments().len();
@@ -228,6 +246,7 @@ fn lower_path_on_stacks(
         };
     }
     collector.stacks.path_segments[s0..].reverse();
+    contexts.reverse();
     let segment_count = collector.stacks.path_segments.len() - s0;
     if collector.stacks.path_generic_args.len() > g0 || type_anchor.is_some() {
         collector.stacks.path_generic_args.resize(g0 + segment_count, 0);
@@ -274,7 +293,8 @@ fn lower_path_on_stacks(
         *last_segment_args = 0;
     }
 
-    let mod_path = ModPath::from_segments(kind, collector.stacks.path_segments.drain(s0..));
+    let mod_path =
+        ModPath::from_segments_in(kind, collector.stacks.path_segments.drain(s0..).zip(contexts));
 
     if let Some(old_lifetimes_constrained_by_input) = old_lifetimes_constrained_by_input {
         // The lifetime arguments of the last segment, copied out of the columns so the

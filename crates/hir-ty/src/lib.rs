@@ -30,6 +30,7 @@ pub mod intrinsic;
 mod lower;
 pub mod next_solver;
 mod opaques;
+pub mod rpitit;
 mod representability;
 mod specialization;
 mod target_feature;
@@ -135,7 +136,6 @@ pub use lower::{
     persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
     predicate_sources, supertraits_cycle, with_elided_regions,
 };
-pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
 pub use opaques::{rpit_hidden_types, tait_hidden_types};
 pub use specialization::{
     SpecializationMode, impl_unconstrained_params, specialization_mode, specialized_ancestor,

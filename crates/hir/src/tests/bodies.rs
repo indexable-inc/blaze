@@ -53,7 +53,7 @@ fn fixture() -> (TestDB, Vec<EditionedFileId>) {
 
 /// Infers and borrow-checks every body of [`BODIES`], and what ran doing it.
 fn check_all(db: &TestDB) -> Vec<String> {
-    crate::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         db.log_executed(|| {
             for name in BODIES {
                 let f = function(db, name);
@@ -87,7 +87,7 @@ fn rerun_after(from: &str, to: &str) -> (usize, usize, Vec<String>) {
 #[test]
 fn a_warm_check_of_every_body_allocates_nothing() {
     let (db, _) = fixture();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let bodies = BODIES.map(|name| function(&db, name));
         blaze_alloc_count::assert_at_most(0, "a warm check of every body", || {
             for f in bodies {
@@ -172,7 +172,7 @@ fn a_trait_use_reinfers_no_body_of_another_module() {
         "pub fn edited()",
         "pub trait Local {\n    fn local(&self) {}\n}\nuse core::clone::Clone as _;\npub fn edited()",
     );
-    let outside_b = crate::attach_db(&db, || {
+    let outside_b = blaze_query::db::attach(&db, || {
         db.log_executed(|| {
             for name in ["main", "reader"] {
                 InferenceResult::of(&db, InferBodyId::DefWithBodyId(function(&db, name)));
@@ -195,7 +195,7 @@ fn a_changed_signature_reinfers_its_callers() {
     );
     let executed = check_all(&db);
     assert_eq!(count(&executed, "infer_body_query"), 1, "`reader`, which calls `get`: {executed:#?}");
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let reader = function(&db, "reader");
         let result = InferenceResult::of(&db, InferBodyId::DefWithBodyId(reader));
         assert!(result.has_type_mismatches(), "`reader` returns the `u64` of `get` as `u32`");
@@ -231,13 +231,13 @@ fn main() {
     );
     let files = fx.files().to_vec();
     let mut db = fx.into_db();
-    let main = crate::attach_db(&db, || {
+    let main = blaze_query::db::attach(&db, || {
         let main = function(&db, "main");
         InferenceResult::of(&db, InferBodyId::DefWithBodyId(main));
         main
     });
     edit(&mut db, &files, "pub fn unused() -> u32 {\n    2", "pub fn unused() -> u32 {\n    let z = 2;\n    z");
-    let executed = crate::attach_db(&db, || {
+    let executed = blaze_query::db::attach(&db, || {
         db.log_executed(|| {
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(main));
         })

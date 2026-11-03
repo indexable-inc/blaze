@@ -383,13 +383,8 @@ mod tests {
 
     #[test]
     fn work_that_keeps_moving_within_the_bound_never_stalls() {
-        let mut rng = 0x2545_f491_4f6c_dd1du64;
-        let mut next = move || {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng
-        };
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_f491_4f6c_dd1d);
+        let mut next = move || rng.next_u64();
         for _ in 0..64 {
             let mut watchdog = Watchdog::new(Duration::from_secs(10));
             let (mut now, mut progress) = (0, Progress::default());

@@ -82,33 +82,62 @@ pub struct Scale {
     ns_per_tick: f64,
 }
 
+/// Tries [`paired`] makes at most: each is a few hundred nanoseconds.
+const PAIRINGS: usize = 16;
+/// A pairing whose reads of the counter are this close (in ns) is taken at once.
+const PAIRED_NS: f64 = 2_000.0;
+
+/// A tick, the [`Instant`] and the [`mono_ns`] read together: the tightest of up to
+/// [`PAIRINGS`] tries, each bracketed by two reads of the counter, and the tick the middle of
+/// its bracket. A thread preempted between two reads (for milliseconds on a loaded machine)
+/// would pair a tick with clocks read that much later, and every row read back with the pair
+/// would be off by it.
+fn paired(ns_per_tick: f64) -> (u64, Instant, i64) {
+    let mut best: Option<(u64, (u64, Instant, i64))> = None;
+    for _ in 0..PAIRINGS {
+        let first = ticks();
+        let (at, mono) = (Instant::now(), mono_ns());
+        let width = ticks().wrapping_sub(first);
+        if best.is_none_or(|(tightest, _)| width < tightest) {
+            best = Some((width, (first.wrapping_add(width / 2), at, mono)));
+        }
+        if width as f64 * ns_per_tick <= PAIRED_NS {
+            break;
+        }
+    }
+    best.expect("PAIRINGS is at least one").1
+}
+
 impl Scale {
     pub fn now() -> Scale {
         let (first, began) = origin();
-        let (ticks, at) = (ticks(), Instant::now());
         #[cfg(target_arch = "aarch64")]
-        let ns_per_tick = {
+        {
             _ = (first, began);
-            1e9 / frequency().max(1) as f64
-        };
+            let ns_per_tick = 1e9 / frequency().max(1) as f64;
+            let (ticks, at, mono) = paired(ns_per_tick);
+            Scale { ticks, at, mono, ns_per_tick }
+        }
         #[cfg(target_arch = "x86_64")]
-        let ns_per_tick = {
+        {
+            // Brackets judged at a nanosecond a tick, before the rate is measured: a TSC of a
+            // GHz or more ticks faster, so a bracket taken is at most that wide.
+            let (mut ticks, mut at, mut mono) = paired(1.0);
             // A pairing read less than 100 µs after the origin's would be off by its own
             // skew (tens of ns) over too short a time: wait out the rest of the 100 µs, once.
-            let (ticks, at) = if at.duration_since(began).as_micros() < 100 {
+            if at.duration_since(began).as_micros() < 100 {
                 blaze_graph::spin::busy(std::time::Duration::from_micros(100).saturating_sub(began.elapsed()));
-                (self::ticks(), Instant::now())
-            } else {
-                (ticks, at)
-            };
-            at.duration_since(began).as_nanos() as f64 / ticks.wrapping_sub(first).max(1) as f64
-        };
+                (ticks, at, mono) = paired(1.0);
+            }
+            let ns_per_tick = at.duration_since(began).as_nanos() as f64 / ticks.wrapping_sub(first).max(1) as f64;
+            Scale { ticks, at, mono, ns_per_tick }
+        }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let ns_per_tick = {
+        {
             _ = (first, began);
-            1.0
-        };
-        Scale { ticks, at, mono: mono_ns(), ns_per_tick }
+            let (ticks, at, mono) = paired(1.0);
+            Scale { ticks, at, mono, ns_per_tick: 1.0 }
+        }
     }
 
     /// `ticks` on the schema's clock ([`mono_ns`]), in nanoseconds. A tick read after
@@ -136,25 +165,34 @@ mod tests {
 
     #[test]
     fn ticks_read_back_as_the_instants_they_were_read_at() {
-        let before = Instant::now();
-        let tick = ticks();
+        // The instant read between two ticks reads back between them, give or take the
+        // pairing's own error: however long the thread was preempted in between.
+        let (first, read, last) = (ticks(), Instant::now(), ticks());
         blaze_graph::spin::busy(std::time::Duration::from_millis(2));
         let scale = Scale::now();
-        let at = scale.instant(tick);
-        let off = at.max(before).duration_since(at.min(before));
-        assert!(off.as_micros() < 200, "a tick read back {off:?} from when it was read");
-        let later = ticks();
-        assert!(later > tick, "the counter goes forward");
+        let slack = std::time::Duration::from_micros(50);
+        let (from, to) = (scale.instant(first), scale.instant(last));
+        assert!(
+            from <= read + slack && read <= to + slack,
+            "an instant read between two ticks reads back between them: {:?} before, {:?} after",
+            read.saturating_duration_since(to),
+            from.saturating_duration_since(read)
+        );
+        assert!(ticks() > first, "the counter goes forward");
     }
 
     #[test]
     fn ticks_map_onto_the_monotonic_clock() {
-        let before = mono_ns();
-        let tick = ticks();
+        // As above, on the schema's clock: the monotonic clock read between two ticks maps
+        // between them, give or take 50 µs.
+        let (first, read, last) = (ticks(), mono_ns(), ticks());
         blaze_graph::spin::busy(std::time::Duration::from_millis(2));
         let scale = Scale::now();
-        let off = (scale.mono(tick) - before).abs();
-        assert!(off < 200_000, "a tick mapped {off} ns from the clock read beside it");
-        assert!(scale.mono(ticks()) >= scale.mono(tick));
+        let (from, to) = (scale.mono(first), scale.mono(last));
+        assert!(
+            from - 50_000 <= read && read <= to + 50_000,
+            "a clock read between two ticks maps between them: {from} <= {read} <= {to} (ns, 50 µs either way)"
+        );
+        assert!(scale.mono(ticks()) >= scale.mono(first));
     }
 }

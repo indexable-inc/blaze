@@ -293,15 +293,6 @@ pub trait HirDatabase: sealed::Sealed {
         trait_env: Option<ParamEnvAndCrate<'db>>,
     ) -> Result<Allocation<'db>, MirEvalError<'db>>;
 
-    /// The opaque type of the impl's method that `opaque`, the `impl Trait` a trait's method
-    /// returns, is with `args`, once they name the impl (`hir_ty_mir::opaque_of_impl`).
-    fn opaque_of_impl<'db>(
-        &'db self,
-        env: ParamEnvAndCrate<'db>,
-        opaque: InternedOpaqueTyId<'db>,
-        args: GenericArgs<'db>,
-    ) -> Option<Ty<'db>>;
-
     // endregion:mir
 
     fn layout_of_adt(
@@ -763,16 +754,6 @@ impl HirDatabase for Db {
         trait_env: Option<ParamEnvAndCrate<'db>>,
     ) -> Result<Allocation<'db>, MirEvalError<'db>> {
         (providers::mir().interpret_mir)(self, body, trait_env)
-    }
-
-    #[inline]
-    fn opaque_of_impl<'db>(
-        &'db self,
-        env: ParamEnvAndCrate<'db>,
-        opaque: InternedOpaqueTyId<'db>,
-        args: GenericArgs<'db>,
-    ) -> Option<Ty<'db>> {
-        (providers::mir().opaque_of_impl)(self, env, opaque, args)
     }
 
     #[inline]
@@ -1345,6 +1326,8 @@ pub mod kinds {
         CONST_PARAM_TY_ERRORS = 0x243a, "const_param_ty_errors";
         INHERENT_ASSOC_TYPES = 0x243b, "inherent_assoc_types";
         FN_SIG_WITH_ELIDED_BOUND = 0x243c, "fn_sig_with_elided_bound";
+        IMPL_RPITIT_TYS = 0x243d, "impl_rpitit_tys";
+        RPITIT_ITEM_BOUNDS = 0x243e, "rpitit_item_bounds";
 
         // Variance, dyn compatibility, representability.
         VARIANCES_OF = 0x2440, "variances_of_query";
@@ -1406,6 +1389,7 @@ pub mod kinds {
         RELEVANT_IMPLS = 0x247d, "relevant_impls";
         MODULE_TRAIT_SET = 0x247e, "module_trait_set";
         MODULE_ITEMS_NAMED = 0x247f, "module_items_named";
+        INHERENT_VALUE_ITEM = 0x24be, "inherent_value_item";
         // `#[blaze::sealed]`, for hir-ty-coherence: a sealed trait's closure, and the
         // reservation impls coherence reads beside the tables.
         SEALED_CLOSURE = 0x24ba, "sealed_closure_query";

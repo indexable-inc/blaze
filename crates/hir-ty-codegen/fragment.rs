@@ -1645,15 +1645,9 @@ impl<'db> Recorder<'db> {
         self.data(DataRequest::Text(parts))
     }
 
+    /// [`Target::frontend_config`] of the function's target.
     pub(super) fn target_config(&self) -> cranelift_codegen::isa::TargetFrontendConfig {
-        let config = self.isa.frontend_config();
-        // The ISA is only there for its calling convention: WebAssembly's pointers are 32 bits.
-        #[cfg(feature = "wasm")]
-        let config = cranelift_codegen::isa::TargetFrontendConfig {
-            pointer_width: target_lexicon::PointerWidth::U32,
-            ..config
-        };
-        config
+        self.target.frontend_config(self.isa)
     }
 
     /// Puts what `body` asks for among what this function asks for, and gives `body` as it

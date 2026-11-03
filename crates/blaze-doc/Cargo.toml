@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 base-db.workspace = true
+blaze-query.workspace = true
 blaze-graph.workspace = true
 blaze-hash.workspace = true
 either.workspace = true

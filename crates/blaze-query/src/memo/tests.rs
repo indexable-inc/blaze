@@ -111,24 +111,31 @@ fn a_tasks_edges_are_one_range_of_its_threads_segment() {
     let store = Store::new();
     let code = store.code(SCHEMA, ContentId([1; 32]));
     let barrier = Barrier::new(2);
-    let made: Vec<Vec<MemoId>> = std::thread::scope(|scope| {
+    let made: Vec<(u32, Vec<MemoId>)> = std::thread::scope(|scope| {
         let spawned: Vec<_> = (0..2u64)
             .map(|thread| {
                 let (store, barrier) = (&store, &barrier);
                 scope.spawn(move || {
-                    // Both threads alive at once, so each holds a lane of its own.
+                    // Each thread takes its lane, then waits for the other to have taken its
+                    // own: a lane is given back when its thread ends, so a thread that took its
+                    // lane only after the other had made its memos and ended would take the
+                    // same one, and copy on into the other's open segment.
+                    let lane = crate::segment::lane();
                     barrier.wait();
-                    (0..50)
+                    let memos = (0..50)
                         .map(|n| {
                             let n = thread * 50 + n;
                             store.make(key(n), Fingerprint(u128::from(n)), code, &edges(n), &n.to_le_bytes())
                         })
-                        .collect::<Vec<MemoId>>()
+                        .collect::<Vec<MemoId>>();
+                    (lane, memos)
                 })
             })
             .collect();
         spawned.into_iter().map(|it| it.join().expect("a thread")).collect()
     });
+    assert_ne!(made[0].0, made[1].0, "two threads alive at once hold two lanes");
+    let made: Vec<Vec<MemoId>> = made.into_iter().map(|(_, memos)| memos).collect();
     let task = blaze_reclaim::enter();
     for (thread, memos) in made.iter().enumerate() {
         for (at, &memo) in memos.iter().enumerate() {

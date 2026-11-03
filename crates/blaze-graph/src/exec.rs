@@ -1264,20 +1264,25 @@ fn run_io<R: Runner>(run: Ran<R>) {
     let ctx = run.run().ctx;
     match catch_unwind(AssertUnwindSafe(|| measured(&ctx.runner, run.live()))) {
         Ok((Ok(did), measure)) => run.done(did, Some(measure), None),
-        Ok((Err(Cancelled), _)) => _ = ctx.io.send(Some(run)),
+        Ok((Err(Cancelled), _)) => {
+            // This IO thread's job goes on to whatever run is next, not the same ask again.
+            crate::pump::rerun_later();
+            _ = ctx.io.send(Some(run));
+        }
         Err(panic) if panic.is::<frame::Cancelled>() => _ = ctx.io.send(Some(run)),
         Err(panic) => run.done(Did::failed(panicked(&*panic)), None, None),
     }
 }
 
 /// `rx.recv()`, said as a wait on the channel `name` ([`crate::wait`]) only when nothing is
-/// there yet: a receive that finds a message costs a `try_recv`.
+/// there yet: a receive that finds a message costs a `try_recv`. On a target without threads
+/// (the seed) the wait gives the pools this thread drives turns ([`pool::recv`]).
 fn recv_said<T>(rx: &Receiver<T>, name: &'static str) -> Result<T, crossbeam_channel::RecvError> {
     match rx.try_recv() {
         Ok(it) => Ok(it),
         Err(crossbeam_channel::TryRecvError::Disconnected) => Err(crossbeam_channel::RecvError),
         Err(crossbeam_channel::TryRecvError::Empty) => {
-            crate::wait::wait(crate::wait::WaitOn::Channel(name), None, || rx.recv())
+            crate::wait::wait(crate::wait::WaitOn::Channel(name), None, || pool::recv(rx, name))
         }
     }
 }

@@ -124,6 +124,18 @@ pub(crate) fn making_parent<T>(path: &Path, mut make: impl FnMut() -> io::Result
     }
 }
 
+/// The file at `path` cut (or grown with zeros) to `len` bytes: made, with its directories,
+/// where it is missing. Opened by its name each time, never through a descriptor kept from an
+/// earlier request: the name may be another file by now (a build directory removed and made
+/// again by `blaze clean` and the next build).
+pub(crate) fn truncate(path: &Path, len: u64) -> io::Result<()> {
+    let open = || OpenOptions::new().write(true).create(true).truncate(false).open(path);
+    making_parent(path, open)
+        .and_then(|file| file.set_len(len))
+        // alloc: an error path.
+        .map_err(|error| io::Error::new(error.kind(), format!("cutting {} to {len} bytes: {error}", path.display())))
+}
+
 /// `bytes` as the whole of `path`: written to a temporary file next to it, synced, renamed over
 /// it, and the directory synced, so the new name survives a crash.
 #[cfg(any(unix, target_os = "wasi"))]

@@ -10,7 +10,7 @@ use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 
 use super::{
-    Full, KeptImage, LinkCause, Linked, Linking, Mounted, OutputFields, PgoFlag, StaticRow, codegen_backend,
+    Full, KeptImage, Laid, LinkCause, Linked, Linking, Mounted, OutputFields, PgoFlag, StaticRow, codegen_backend,
     function_rows, kept_image, linking, pgo, read_profile, sanitize, static_rows,
 };
 use blaze_codegen::InstanceKey;
@@ -329,13 +329,14 @@ fn an_output_that_changed_names_the_fields_that_differ() {
 #[test]
 fn how_a_link_went_is_first_only_with_nothing_kept() {
     let exports = OutputFields::between(&shared(&["f"]), &shared(&[]));
-    assert_eq!(linking(None, true, true), Linking::First);
-    assert_eq!(linking(Some(OutputFields::default()), false, true), Linking::Spliced);
-    assert_eq!(linking(Some(OutputFields::default()), true, true), Linking::First, "a kept image never laid out");
-    assert_eq!(linking(Some(OutputFields::default()), true, false), Linking::Full(Full::NotIncremental));
-    assert_eq!(linking(Some(exports), true, true), Linking::Full(Full::Output(exports)));
+    assert_eq!(linking(None, Laid::Whole, true), Linking::First);
+    assert_eq!(linking(Some(OutputFields::default()), Laid::Patched, true), Linking::Spliced);
+    assert_eq!(linking(Some(OutputFields::default()), Laid::Nothing, true), Linking::Unchanged);
+    assert_eq!(linking(Some(OutputFields::default()), Laid::Whole, true), Linking::First, "a kept image never laid out");
+    assert_eq!(linking(Some(OutputFields::default()), Laid::Whole, false), Linking::Full(Full::NotIncremental));
+    assert_eq!(linking(Some(exports), Laid::Whole, true), Linking::Full(Full::Output(exports)));
     assert_eq!(Linking::Full(Full::Output(exports)).to_string(), "not spliced: the output changed: exports");
-    assert!(Linking::First.placed() && !Linking::Spliced.placed());
+    assert!(Linking::First.placed() && !Linking::Spliced.placed() && !Linking::Unchanged.placed());
 }
 
 /// The image kept at a path is the one the link stages against, taken out of the kept images;
@@ -371,4 +372,25 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     let error = kept_image(&mut images, unnamed, &other, None).err().expect("a path the linker can't name");
     assert!(matches!(error, LinkCause::Unnamed), "{error}");
     assert_eq!(images.len(), 2, "a link that fails before staging leaves the kept images as they were");
+}
+
+/// A link blaze-link refused for want of room names the image, what overflowed and the command
+/// that links it from scratch; any other refusal names no such command.
+#[test]
+fn a_link_out_of_room_names_the_image_and_how_to_link_it_whole() {
+    let refused = |refusal| blaze_link::LinkError {
+        function: None,
+        what: "Patch needs 70000000 bytes and has room for 67108864: link the image from scratch".to_owned(),
+        refusal,
+    };
+    let failed = |refusal| super::LinkFailed {
+        image: "/w/target/debug/app".to_owned(),
+        cause: LinkCause::Linker { step: super::LinkStep::Stage, error: refused(refusal) },
+    }
+    .to_string();
+    let no_room = failed(Some(blaze_link::Refusal::NoRoom { need: 70_000_000, room: 67_108_864 }));
+    assert!(no_room.starts_with("linking `/w/target/debug/app`: staging the change: "), "{no_room}");
+    assert!(no_room.contains("Patch needs 70000000 bytes and has room for 67108864"), "{no_room}");
+    assert!(no_room.contains("`blaze stop`"), "{no_room}");
+    assert!(!failed(None).contains("`blaze stop`"));
 }

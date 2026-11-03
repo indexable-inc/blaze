@@ -3,16 +3,17 @@
 // BLAKE3 hash of its bytes with the id field zeroed (`format::Writer::finish`). blaze-stencil's
 // build script holds every library it includes to it: a library the pinned LLVM makes (the
 // `llvm-stencils` feature) must be the pinned one, so a change to what the generator makes is a
-// change to the pin in the same tree; and a library copied from `BLAZE_STENCILS` (the seed
-// profile, which has no LLVM) is refused unless its bytes are the pinned ones. blaze-codegen-code
-// includes this file to key the code identity by the pin. Std only and no `use`, so it includes
-// into any build script.
+// change to the pin in the same tree; and the libraries committed in `prebuilt/` beside this
+// file, which the seed profile (no LLVM) includes, must be the pinned ones in every build.
+// blaze-codegen-code includes this file to key the code identity by the pin. Std only and no
+// `use`, so it includes into any build script.
 
 /// The pin, in blaze-stencil's directory.
 pub(crate) const PIN_FILE: &str = "stencils.json";
-/// The variable naming the directory the seed profile copies its libraries from: where the
-/// bytes are, never which bytes they are, which the pin says.
-pub(crate) const PREBUILT: &str = "BLAZE_STENCILS";
+/// The directory, in blaze-stencil's, of the pinned libraries as committed data
+/// (todo/bootstrap/plan.md, "Who owns stencil generation"): the seed profile, which has no
+/// LLVM, includes these bytes; a build with LLVM checks that what it made is them.
+pub(crate) const PREBUILT: &str = "prebuilt";
 
 /// Each library's file and its pinned id, in the pin's order. `json` is one object of
 /// `"<file>": "<64 lowercase hex digits>"`, each file named once, its strings with no escape.

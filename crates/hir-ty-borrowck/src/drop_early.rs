@@ -205,7 +205,7 @@ pub fn drop_point(db: &Db, def: DefWithBodyId, mir: &MirBody<'_>, binding: Bindi
 pub fn check(db: &Db, def: DefWithBodyId, point: &DropPoint, mode: Mode) -> Result<BorrowckResult, String> {
     let drops = [EarlyDrop { block: point.block, statement: point.statement, binding: point.binding }];
     let _span = tracing::info_span!(target: "blaze", "borrowck.drop_early", def = ?def, binding = ?point.binding).entered();
-    let body = hir_ty_mir::mir::lower_with_early_drops(db, def, &drops).map_err(|it| format!("{it:?}"))?; // alloc: error path
+    let body = hir_ty_mir::mir::lower_with_early_drops(db, def, &drops).map_err(|it| blaze_query::db::attach(db, || format!("{it:?}")))?; // alloc: error path
     Ok(crate::borrowck_rewritten(db, def, &body, mode))
 }
 
@@ -227,6 +227,7 @@ pub(crate) fn add_notes(db: &Db, def: DefWithBodyId, mode: Mode, result: &mut Bo
     let Ok(mir) = db.mir_body(InferBodyId::DefWithBodyId(def)) else { return };
     let body = Body::of(db, def);
     let store: &ExpressionStore = &body;
+    let krate = hir_def::HasModule::krate(&def, db);
     for binding in bindings {
         let point = match drop_point(db, def, mir, binding) {
             Ok(it) => it,
@@ -261,7 +262,8 @@ pub(crate) fn add_notes(db: &Db, def: DefWithBodyId, mode: Mode, result: &mut Bo
                 level: Sublevel::Note,
                 // alloc: error path, the note's text
                 message: format!(
-                    "`{name}`, a `{ty:?}`, is dropped only where its scope ends; dropped after its last use, it ends the borrow sooner"
+                    "`{name}`, a `{}`, is dropped only where its scope ends; dropped after its last use, it ends the borrow sooner",
+                    crate::names::shown_ty(db, krate, &ty)
                 ),
                 spans,
                 labels,

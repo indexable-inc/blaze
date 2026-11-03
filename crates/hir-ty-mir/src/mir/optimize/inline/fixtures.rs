@@ -36,7 +36,7 @@ fn optimized<T>(
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let func = function(&db, name);
         let body = db
             .optimized_mir_body(func.into(), options(level))

@@ -1597,7 +1597,7 @@ fn object_lifetime_default<'db>(
     param: TypeParamId,
     substs: &[GenericArg<'db>],
 ) -> Option<Region<'db>> {
-    match generics.object_lifetime_default(param)? {
+    match generics.object_lifetime_default(interner.db(), param)? {
         ObjectLifetimeDefault::Static => Some(Region::new_static(interner)),
         ObjectLifetimeDefault::Param(lifetime) => {
             let (index, late_bound) = generics.lifetime_param_idx(lifetime, false);

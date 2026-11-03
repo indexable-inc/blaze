@@ -256,7 +256,8 @@ impl<'db> RegionName<DbInterner<'db>> for EarlyParamRegion {
     fn get_name(&self, interner: DbInterner<'db>) -> Option<Symbol> {
         let params = hir_def::hir::generics::GenericParams::of(interner.db, self.id.parent);
         let param = &params[self.id.local_id];
-        let name = *param.name.symbol();
+        // As written: a macros 2.0 parameter's key is not part of its name.
+        let name = *param.name.unkeyed().symbol();
         (name != intern::sym::tick_underscore && !param.is_fresh()).then_some(Symbol(name))
     }
 

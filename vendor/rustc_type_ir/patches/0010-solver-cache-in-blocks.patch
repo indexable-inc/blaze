@@ -9,7 +9,7 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
  
 +use blaze_mem::Tag;
 +use blaze_mem::blocks::Slice;
-+use blaze_mem::lock::SpinLock;
++use parking_lot::Mutex;
  use derive_where::derive_where;
  use rustc_hash::FxBuildHasher;
  
@@ -43,7 +43,7 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
 -            .lock()
 -            .unwrap_or_else(PoisonError::into_inner);
 +        let writers = self.writers.get_or_init(|| table(shard_count(), |_| Writer::new()));
-+        let mut claimed = writers[goal as usize & (writers.len() - 1)].0.lock();
++        let mut claimed = blaze_graph::wait::lock(&writers[goal as usize & (writers.len() - 1)].0, WRITER);
          let column = if encountered_overflow { &self.with_overflow } else { &self.success };
          let head = column.get_or_init(goal, || AtomicU32::new(0));
          let latest = head.load(Ordering::Acquire);
@@ -74,21 +74,18 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
      }
  }
  
-@@ -301,11 +312,11 @@
- 
- /// One cache line pair each, so writers under neighbouring locks don't share a line.
- #[repr(align(128))]
--struct Writer(Mutex<Claims>);
-+struct Writer(SpinLock<Claims>);
- 
- impl Writer {
-     fn new() -> Writer {
--        Writer(Mutex::new(Claims { rows: Claimed::EMPTY, nested_goals: Claimed::EMPTY }))
-+        Writer(SpinLock::new(Claims { rows: Claimed::EMPTY, nested_goals: Claimed::EMPTY }))
-     }
+@@ -299,6 +310,10 @@
+     nested_goals: Claimed,
  }
  
-@@ -337,24 +348,24 @@
++/// What a wait for a writer's lock is said to wait on ([`blaze_graph::wait::lock`]): a contended
++/// one blocks the thread inside a `wait` span naming it.
++const WRITER: &str = "the trait solver's global cache writer";
++
+ /// One cache line pair each, so writers under neighbouring locks don't share a line.
+ #[repr(align(128))]
+ struct Writer(Mutex<Claims>);
+@@ -335,9 +350,12 @@
      values: Chunked<OnceLock<(u64, T)>>,
      /// The first index no shard has claimed.
      next: AtomicU64,
@@ -96,12 +93,13 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
 +    shards: OnceLock<Slice<Shard>>,
  }
  
++/// What a wait for a shard's lock is said to wait on, as [`WRITER`].
++const SHARD: &str = "the trait solver's global cache shard";
++
  #[repr(align(128))]
  struct Shard {
      /// Held only to look again and insert.
--    lock: Mutex<Claimed>,
-+    lock: SpinLock<Claimed>,
-     /// How many values the shard has, written under `lock`.
+@@ -346,7 +364,7 @@
      len: AtomicU32,
      /// Which of `tables` is the one in use.
      level: AtomicUsize,
@@ -110,14 +108,7 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
  }
  
  impl Shard {
-     fn new() -> Shard {
-         Shard {
--            lock: Mutex::new(Claimed::EMPTY),
-+            lock: SpinLock::new(Claimed::EMPTY),
-             len: AtomicU32::new(0),
-             level: AtomicUsize::new(0),
-             tables: [const { OnceLock::new() }; TABLES],
-@@ -362,7 +373,7 @@
+@@ -360,7 +378,7 @@
      }
  
      fn table(&self, level: usize) -> &[AtomicU32] {
@@ -126,16 +117,16 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
      }
  }
  
-@@ -393,7 +404,7 @@
+@@ -391,7 +409,7 @@
          {
              return found;
          }
 -        let mut claimed = shard.lock.lock().unwrap_or_else(PoisonError::into_inner);
-+        let mut claimed = shard.lock.lock();
++        let mut claimed = blaze_graph::wait::lock(&shard.lock, SHARD);
          let mut level = shard.level.load(Ordering::Acquire);
          if let Ok(found) = self.probe(shard.table(level), hash, &value) {
              return found;
-@@ -417,7 +428,7 @@
+@@ -415,7 +433,7 @@
      }
  
      fn shard(&self, hash: u64) -> &Shard {
@@ -144,7 +135,7 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
          &shards[(hash >> 48) as usize & (shards.len() - 1)]
      }
  
-@@ -494,6 +505,22 @@
+@@ -492,6 +510,22 @@
          sorted.dedup();
          assert_eq!(sorted.len(), indices.len());
          assert_eq!(interned.find(&1), None);

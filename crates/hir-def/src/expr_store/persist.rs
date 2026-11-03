@@ -122,7 +122,7 @@ blaze_format::record! {
     /// are in memory, each id a raw `u32`, the side tables in the words from `side` and
     /// `ty_side` on.
     #[derive(Clone, Copy)]
-    pub(crate) struct StoreRoot: 6 {
+    pub(crate) struct StoreRoot: 7 {
         pub(crate) expr_kind: Slice<u8>,
         pub(crate) expr_data: Slice<u32>,
         pub(crate) pat_kind: Slice<u8>,
@@ -159,6 +159,9 @@ blaze_format::record! {
         pub(crate) macro_calls: Slice<u64>,
         /// The packed id and the syntax context, by packed id in increasing order.
         pub(crate) ident_hygiene: Slice<IdPair>,
+        /// The packed id of a record field's expression or pattern and the syntax context of
+        /// its name, by packed id in increasing order.
+        pub(crate) field_hygiene: Slice<IdPair>,
         /// The block and its edition, by block in increasing order.
         pub(crate) block_editions: Slice<IdPair>,
         pub(crate) overflow_inheriting: Slice<u32>,
@@ -839,6 +842,7 @@ struct StoreColumns {
     block_scopes: Column,
     macro_calls: Column,
     ident_hygiene: Column,
+    field_hygiene: Column,
     block_editions: Column,
     overflow_inheriting: Column,
     spec_clauses: Column,
@@ -933,6 +937,11 @@ impl StoreColumns {
             a: packed_bits(id),
             b: hygiene_bits(hygiene),
         });
+        let hygiene = expr_only.map_or(&[][..], |it| &*it.field_hygiene);
+        let field_hygiene = push_mapped(out, pairs, hygiene, |&(id, hygiene)| IdPair {
+            a: packed_bits(id),
+            b: hygiene_bits(hygiene),
+        });
         let editions = expr_only.map_or(&[][..], |it| &*it.block_editions);
         let block_editions = push_mapped(out, pairs, editions, |&(block, edition)| IdPair {
             a: raw(block),
@@ -992,6 +1001,7 @@ impl StoreColumns {
             block_scopes,
             macro_calls,
             ident_hygiene,
+            field_hygiene,
             block_editions,
             overflow_inheriting,
             spec_clauses,
@@ -1033,6 +1043,7 @@ impl StoreColumns {
             block_scopes: self.block_scopes.slice(field(offset_of!(StoreRoot, block_scopes))),
             macro_calls: self.macro_calls.slice(field(offset_of!(StoreRoot, macro_calls))),
             ident_hygiene: self.ident_hygiene.slice(field(offset_of!(StoreRoot, ident_hygiene))),
+            field_hygiene: self.field_hygiene.slice(field(offset_of!(StoreRoot, field_hygiene))),
             block_editions: self.block_editions.slice(field(offset_of!(StoreRoot, block_editions))),
             overflow_inheriting: (self.overflow_inheriting)
                 .slice(field(offset_of!(StoreRoot, overflow_inheriting))),
@@ -1080,6 +1091,7 @@ pub struct ExpressionStoreRef<'a> {
     block_scopes: &'a [u64],
     macro_calls: &'a [u64],
     ident_hygiene: &'a [IdPair],
+    field_hygiene: &'a [IdPair],
     block_editions: &'a [IdPair],
     overflow_inheriting: &'a [u32],
     spec_clauses: &'a [IdPair],
@@ -1121,6 +1133,7 @@ impl<'a> ExpressionStoreRef<'a> {
             block_scopes: root.block_scopes.follow(buffer)?,
             macro_calls: root.macro_calls.follow(buffer)?,
             ident_hygiene: root.ident_hygiene.follow(buffer)?,
+            field_hygiene: root.field_hygiene.follow(buffer)?,
             block_editions: root.block_editions.follow(buffer)?,
             overflow_inheriting: root.overflow_inheriting.follow(buffer)?,
             spec_clauses: root.spec_clauses.follow(buffer)?,
@@ -1180,6 +1193,7 @@ impl<'a> ExpressionStoreRef<'a> {
                 && self.binding_owners.is_empty()
                 && self.block_scopes.is_empty()
                 && self.ident_hygiene.is_empty()
+                && self.field_hygiene.is_empty()
                 && self.block_editions.is_empty()
                 && self.overflow_inheriting.is_empty()
                 && self.spec_clauses.is_empty()
@@ -1214,6 +1228,15 @@ impl<'a> ExpressionStoreRef<'a> {
                 ExprOrPatId::PatId(pat) => raw(pat) < pats,
             };
             ensure(id, pair, buffer, "ident hygiene of an id past its arena")?;
+            ensure(pair.b != u32::MAX, pair, buffer, "a syntax context of u32::MAX")?;
+        }
+        ascending(self.field_hygiene, |it| it.a, buffer, "field hygiene out of order")?;
+        for pair in self.field_hygiene {
+            let id = match packed_of(pair.a).unpack() {
+                ExprOrPatId::ExprId(expr) => raw(expr) < exprs,
+                ExprOrPatId::PatId(pat) => raw(pat) < pats,
+            };
+            ensure(id, pair, buffer, "field hygiene of an id past its arena")?;
             ensure(pair.b != u32::MAX, pair, buffer, "a syntax context of u32::MAX")?;
         }
         ascending(self.block_editions, |it| it.a, buffer, "block editions out of order")?;
@@ -1495,8 +1518,8 @@ impl<'a> ExpressionStoreRef<'a> {
 
         let expr_only = match self.has_exprs() {
             false => None,
-            // alloc: once per decoded store, as `finish` boxes it.
-            true => Some(Box::new(ExpressionOnlyStore {
+            // Once per decoded store, kept as `finish` keeps it.
+            true => Some(ExpressionOnlyStore::kept(ExpressionOnlyStore {
                 kinds: kinds_of(&columns.expr_kind),
                 columns,
                 bindings,
@@ -1505,6 +1528,10 @@ impl<'a> ExpressionStoreRef<'a> {
                 // alloc: the decode's one copy of the column.
                 block_scopes: self.block_scopes().collect(),
                 ident_hygiene: (self.ident_hygiene.iter())
+                    .map(|pair| (packed_of(pair.a), hygiene_of(pair.b)))
+                    // alloc: the decode's one copy of the column.
+                    .collect(),
+                field_hygiene: (self.field_hygiene.iter())
                     .map(|pair| (packed_of(pair.a), hygiene_of(pair.b)))
                     // alloc: the decode's one copy of the column.
                     .collect(),
@@ -1591,7 +1618,8 @@ impl Persist for ExpressionStore {
         // 9: a fn pointer type keeps its `#[rustc_splat]` input.
         // 10: `for const` and `x.[f]` (`Expr::ComptimeFor`, `Expr::ReflectedField`).
         // 11: blaze_verify's clause groups (`ExpressionStore::spec_clauses`).
-        Part::U64(11),
+        // 12: a keyed name and a path's segment contexts (`ModPath::contexts`) are written.
+        Part::U64(12),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1667,7 +1695,8 @@ impl Persist for Body {
         // 9: a fn pointer type keeps its `#[rustc_splat]` input.
         // 10: `for const` and `x.[f]` (`Expr::ComptimeFor`, `Expr::ReflectedField`).
         // 11: blaze_verify's clause groups (`ExpressionStore::spec_clauses`).
-        Part::U64(11),
+        // 12: a keyed name and a path's segment contexts (`ModPath::contexts`) are written.
+        Part::U64(12),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -2912,6 +2941,42 @@ async fn asynchronous(a: u32, (b, c): (u32, u32)) -> u32 { a + b + c }
 fn main() {}
 "#,
         );
+    }
+
+    /// The hygiene of the field and method names a `macro` (2.0) writes (record literal and
+    /// pattern fields in `field_hygiene`, field accesses and method calls in `ident_hygiene`)
+    /// reads back as written; the caller's `$x` has none.
+    #[test]
+    fn member_hygiene_round_trips() {
+        let (db, defs) = bodies(
+            r#"
+#![feature(decl_macro)]
+macro m($x:ident) {{
+    struct S { $x: u32, x: i32 }
+    impl S { fn f(&self) {} }
+    let s = S { $x: 0, x: 1 };
+    let S { $x: a, x: b } = &s;
+    s.f();
+    s.x
+}}
+fn main() { let _ = m!(x); }
+"#,
+        );
+        let body = Body::of(&db, defs[0]);
+        let buffer = Aligned::copy_from(&blaze_format::to_bytes(&*body));
+        let decoded = Body::read(&buffer).expect("a body just written").decode().expect("decoded");
+        let marked = |body: &Body| {
+            let fields = body.exprs().filter(|&(id, _)| !body.record_field_hygiene(id).is_root());
+            let pats = body.pats().filter(|&(id, _)| !body.record_field_hygiene(id).is_root());
+            let members = body.exprs().filter(|(id, expr)| {
+                matches!(expr, Expr::Field { .. } | Expr::MethodCall { .. })
+                    && !body.member_hygiene(*id).is_root()
+            });
+            (fields.count(), pats.count(), members.count())
+        };
+        // `x: 1`, `x: b`, and `s.f()` with `s.x`.
+        assert_eq!(marked(&body), (1, 1, 2));
+        assert_eq!(marked(&decoded), (1, 1, 2));
     }
 
     /// `bytes` with the word at `at` replaced by `word`.

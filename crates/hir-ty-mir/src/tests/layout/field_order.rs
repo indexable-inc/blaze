@@ -104,7 +104,7 @@ impl Fx {
     /// The layout of the struct, enum or type alias `name`.
     fn layout(&self, name: &str) -> Layout {
         let db = &self.db;
-        crate::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let interner = DbInterner::new_no_crate(db);
             let (ty, def, krate) = match self.declarations().into_iter().find_map(|it| match it {
                 ModuleDefId::TypeAliasId(t) if TypeAliasSignature::of(db, t).name.as_str() == name => {
@@ -141,7 +141,7 @@ impl Fx {
     fn stdout(&self) -> String {
         let db = &self.db;
         let main = self.function("main");
-        crate::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let env = ParamEnvAndCrate {
                 param_env: db.trait_environment(main.into()),
                 krate: main.krate(db),
@@ -270,7 +270,7 @@ fn once(g: &Goal) -> u64 {{
     );
     let f = fx(&source, "");
     let db = &f.db;
-    let ranked = crate::attach_db(db, || {
+    let ranked = blaze_query::db::attach(db, || {
         let mut heat = Heat::new();
         heat.add_body(db, f.function("sum").into(), 1_000_000);
         heat.add_body(db, f.function("once").into(), 1_000);

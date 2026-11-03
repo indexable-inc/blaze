@@ -857,18 +857,16 @@ impl blaze_codegen::driver::Lookup for Reading<'_> {
     }
 }
 
-/// Whether `unit`'s link maps the dependency image: a dev executable, which runs on the
-/// daemon's code memory and takes edits ([`policy`] made it live), and is neither a test, a
-/// wasm macro nor a doctest's program (each runs as a process of its own). The one place a
-/// build decides it: codegen's front end splits ownership by it
+/// Whether a unit's link maps the dependency image: a dev executable, which runs on the
+/// daemon's code memory and takes edits. [`policy`] makes a unit live only when it
+/// [`runs_in_process`] (a binary's build for the host: no test, wasm macro or doctest's
+/// program, each of which runs as a process of its own), so the mode and what the unit makes
+/// say it. The one place a build decides it: codegen's front end splits ownership by it
 /// ([`HirFrontend::with_image`]) and the link makes the dev run by it ([`Parts::image`]).
-fn links_image(job: &Job, unit: usize, makes: &Makes, policy: &Policy) -> Result<bool, String> {
-    let u = job.unit(unit).map_err(|it| it.what)?;
-    Ok(policy.mode == BuildMode::Live
-        && *makes == Makes::Executable
-        && !job.graph.has(unit as u32, flag::TEST)
-        && !wasm_macro(job, unit)
-        && u.mode != Mode::Doctest)
+///
+/// [`runs_in_process`]: super::run::inproc::runs_in_process
+fn links_image(makes: &Makes, policy: &Policy) -> bool {
+    policy.mode == BuildMode::Live && *makes == Makes::Executable
 }
 
 /// `krate`'s functions, built as `unit`, compiled from its roots (the unit's own crate, or one
@@ -885,7 +883,7 @@ pub(crate) fn generate<'db>(
     mounted: &Arc<Mounted>,
     // dyn: `HirFrontend::with_checks` takes it; called once a level of the walk
     checks: Option<&'db dyn BodyChecks>,
-) -> Result<Result<Parts, Vec<String>>, String> {
+) -> Result<Result<Parts, Refused>, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let toolchain = toolchain(job, unit)?;
     // The process's code generator compiles for one toolchain: the first unit sets it up, and
@@ -903,7 +901,7 @@ pub(crate) fn generate<'db>(
     let policy = Policy { heap_to_stack, ..policy(job, unit, toolchain)? };
     // A cancelled job's build stops within a function: its caller posts it again.
     let build_time = build_time(job, unit);
-    let image = links_image(job, unit, makes, &policy)?;
+    let image = links_image(makes, &policy);
     let frontend =
         frontend(reader, mounted, build_time).with_policy(&policy).with_image(image).with_stop(&job.input.cancelled);
     let frontend = match checks {
@@ -912,7 +910,7 @@ pub(crate) fn generate<'db>(
     };
     let roots = match frontend.roots(krate, root_kind(u, makes, wasm_macro(job, unit))?) {
         Ok(it) => it,
-        Err(error) => return Ok(Err(vec![error.what])),
+        Err(error) => return Ok(Err(refused(reader, mounted.root(), vec![error]))),
     };
     let origin = origin(job, unit, u)?;
     let asked: Vec<(HirInstance, Origin)> = roots.roots.iter().map(|it| (it.clone(), origin)).collect();
@@ -944,9 +942,167 @@ pub(crate) fn generate<'db>(
             if let Some(put) = profile {
                 unput_profile(job, put);
             }
-            Ok(Err(errors.into_iter().map(|it| it.what).collect()))
+            Ok(Err(refused(reader, mounted.root(), errors)))
         }
     }
+}
+
+/// Why a unit's code was not built ([`generate`]): each function blaze could not compile, as
+/// the code generator names it (`name: why`), in its order; and, of those the front end failed
+/// on in a crate of the toolchain (std's, which no unit checks), the report the job says once
+/// however many units reach the function, which each unit's own error points to.
+pub(crate) struct Refused {
+    pub(crate) errors: Vec<String>,
+    pub(crate) toolchain: Vec<ToolchainFailed>,
+}
+
+/// An item of a toolchain crate the front end failed on, with one reason: the job's report of
+/// it, made of the item alone so that every unit that reaches it makes the same one, and which
+/// of the unit's [`Refused::errors`] are its instances.
+pub(crate) struct ToolchainFailed {
+    /// Its index in [`Refused::errors`] and the instance as the error names it, each one.
+    instances: Vec<(usize, String)>,
+    /// The item by its path, and its crate by name.
+    path: String,
+    krate: String,
+    /// What failed, as the code generator says it.
+    why: String,
+    /// The front end's own errors of the item's body
+    /// ([`blaze_diagnostics::check::check_one_body`]), and the text of each file they point
+    /// into, as the database has it.
+    diags: Vec<blaze_diagnostics::Diag>,
+    sources: Vec<(String, String)>,
+}
+
+impl Refused {
+    /// Each function's line in the unit's error, `name: why`: a toolchain function's names it
+    /// and points at its report, said once a job ([`ToolchainFailed::report`]).
+    pub(crate) fn lines(&self) -> impl Iterator<Item = String> + '_ {
+        self.errors.iter().enumerate().map(|(at, error)| {
+            let of = self.toolchain.iter().find_map(|it| Some((it, it.instances.iter().find(|(i, _)| *i == at)?)));
+            match of {
+                Some((failed, (_, named))) => failed.line(named),
+                None => error.clone(), // clone: the error path, a line of a unit's error
+            }
+        })
+    }
+}
+
+impl ToolchainFailed {
+    /// The unit's line of its instance `named`.
+    fn line(&self, named: &str) -> String {
+        // alloc: the error path, a line of a unit's error
+        format!(
+            "{named}: the front end fails on `{}` in the toolchain's `{}`; the error above, said once a build, says why",
+            self.path, self.krate,
+        )
+    }
+
+    /// The job's report of the item: an error of no unit, its text the item, its crate and why,
+    /// then each of the front end's errors of its body as rustc writes them, each its child.
+    /// Its files' text is added to `sources`, and what the database had none of is read
+    /// through `mounted`. The same for every unit that reaches the item, so the job, which says
+    /// a diagnostic of no unit once, says it once.
+    pub(crate) fn report(
+        &self,
+        sources: &mut blaze_diagnostics::emit::Sources,
+        mounted: &Mounted,
+        style: blaze_diagnostics::emit::Style,
+        color: bool,
+    ) -> Result<blaze_api::Diagnostic, String> {
+        for (name, text) in &self.sources {
+            // clone: a file of the error path, once per unit that reaches the item
+            sources.add(name, Some(text.clone()));
+        }
+        mounted.add_sources(sources, &self.diags);
+        let after = match self.diags.len() {
+            0 => "the front end reports no error of its body, so the fault is blaze's",
+            1 => "the front end's error of its body follows",
+            _ => "the front end's errors of its body follow",
+        };
+        // alloc: the error path, once per unit that reaches the item
+        let message = format!(
+            "the front end fails on `{}` in the toolchain's `{}`, so blaze can't compile it and no \
+             unit that calls it is built (said once a build): {}\n  {after}",
+            self.path, self.krate, self.why,
+        );
+        let mut report = super::say::refused(message, None, color);
+        for diag in &self.diags {
+            let it = blaze_diagnostics::api::diagnostic(diag, sources, style, None).map_err(|why| {
+                // alloc: the error path
+                format!("{why}, in the front end's error `{}` of `{}` in `{}`", diag.message, self.path, self.krate)
+            })?;
+            report.rendered.push_str(&it.rendered);
+            report.children.push(it);
+        }
+        Ok(report)
+    }
+}
+
+/// The code generator's `errors` as a unit's [`Refused`]: each item of a toolchain crate the
+/// front end failed on has its body checked for the report of it (names relative to `root`).
+fn refused(reader: &UnitReader, root: &str, errors: Vec<blaze_codegen::CodegenError>) -> Refused {
+    let db = reader.db();
+    let files = blaze_diagnostics::Files::new(reader.paths(), root);
+    let mut toolchain: Vec<ToolchainFailed> = Vec::new(); // alloc: none until a toolchain item failed
+    for (at, error) in errors.iter().enumerate() {
+        let Some(front) = &error.front else { continue };
+        let krate = front.id.krate(db);
+        if !krate.data(db).origin.is_lang() {
+            continue;
+        }
+        // clone: the error path, the instance's name in its unit's line
+        let named = front.named.clone();
+        let path = blaze_query::db::attach(db, || blaze_items::key::path(db, front.id));
+        if let Some(failed) = toolchain.iter_mut().find(|it| it.path == path && it.why == front.why) {
+            failed.instances.push((at, named));
+            continue;
+        }
+        let body = match front.id {
+            blaze_items::ItemId::Function(it) => Some(hir_def::DefWithBodyId::FunctionId(it)),
+            blaze_items::ItemId::Const(it) => Some(hir_def::DefWithBodyId::ConstId(it)),
+            blaze_items::ItemId::Static(it) => Some(hir_def::DefWithBodyId::StaticId(it)),
+            _ => None,
+        };
+        let diags = body.map_or_else(Vec::new, |def| blaze_diagnostics::check::check_one_body(db, def, files));
+        let sources = texts(reader, root, &diags);
+        let krate = match &krate.extra_data(db).display_name {
+            Some(name) => name.canonical_name().as_str().to_owned(), // alloc: the error path
+            None => format!("{krate:?}"), // alloc: the error path, a crate with no name
+        };
+        // clone: the error path, the reason the report says
+        let why = front.why.clone();
+        // alloc: the error path, the item's instances in the unit, most often one
+        let instances = vec![(at, named)];
+        toolchain.push(ToolchainFailed { instances, path, krate, why, diags, sources });
+    }
+    Refused { errors: errors.into_iter().map(|it| it.what).collect(), toolchain }
+}
+
+/// The text of each file `diags` point into, by its name in them (relative to `root`), as the
+/// database has it: the text their spans were made against. A name the database has no file of
+/// is left out, for the mounts to read ([`Mounted::add_sources`]).
+fn texts(reader: &UnitReader, root: &str, diags: &[blaze_diagnostics::Diag]) -> Vec<(String, String)> {
+    if diags.is_empty() {
+        return Vec::new(); // alloc: empty, allocates nothing
+    }
+    let db = reader.db();
+    let names = blaze_diagnostics::emit::Sources::default().unread(diags);
+    let mut found: Vec<(&str, base_db::FileId)> = reader
+        .paths()
+        .iter()
+        .filter(|&(&file, _)| db.has_file_text(file))
+        .map(|(&file, path)| (blaze_diagnostics::Files::relative(path, root), file))
+        .filter(|(name, _)| names.contains(name))
+        .collect(); // alloc: the error path, the few files of a failed body's errors
+    // The first file of a name by ID, whatever order the map is in.
+    found.sort_by_key(|&(name, file)| (name, file.index()));
+    found.dedup_by(|a, b| a.0 == b.0);
+    found
+        .into_iter()
+        // alloc: the error path, a file's text, once per file of a failed body's errors
+        .map(|(name, file)| (name.to_owned(), db.file_text(file).text(db).to_string()))
+        .collect()
 }
 
 /// An image kept linked at one path, and what is in it, so the next link of it is a change.
@@ -1032,7 +1188,7 @@ pub(crate) fn renamed(old: Vec<String>, new: &mut Vec<&str>) -> (Vec<String>, Ve
 /// ([`blaze_build_script::apply::Compile`]), in cargo's order ([`Graph::links`]).
 ///
 /// [`Graph::links`]: super::graph::Graph::links
-fn given(job: &Job, unit: u32) -> Result<Compile, String> {
+pub(crate) fn given(job: &Job, unit: u32) -> Result<Compile, String> {
     let units = job.units();
     let u = job.unit(unit as usize).map_err(|it| it.what)?;
     let runs = job.graph.links(unit);
@@ -1177,6 +1333,15 @@ pub(crate) enum LinkCause {
 impl std::fmt::Display for LinkCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // blaze-link refuses a change it has no room for and never lays the image out whole
+            // in its place; the image is the daemon's, kept in memory, so the way to a whole
+            // link is to let the daemon go.
+            LinkCause::Linker { step, error } if error.no_room().is_some() => write!(
+                f,
+                "{}: {error}. The image is kept by the daemon: `blaze stop` lets it go, and the next build links it \
+                 from scratch",
+                step.name()
+            ),
             LinkCause::Linker { step, error } => write!(f, "{}: {error}", step.name()),
             LinkCause::Native(error) => write!(f, "{}: {}", error.path.display(), error.error),
             LinkCause::NativeGone(path) => write!(f, "{}: the native library is gone", path.display()),
@@ -1321,12 +1486,12 @@ fn link_at(
         Err(_) => Ok(()),
     };
     images.push(KeptImage { path: path.to_owned(), kept: linked });
-    let (bytes, read, table, full, told) = made?;
+    let (bytes, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
     let how = match relaid && changed.is_some_and(OutputFields::is_empty) {
         true => Linking::Full(Full::Layout),
-        false => linking(changed, full, output.incremental),
+        false => linking(changed, laid, output.incremental),
     };
     let restart = match told {
         super::run::inproc::Told::Restart { why } => Some(why),
@@ -1376,19 +1541,30 @@ pub(crate) fn kept_image(
     Ok((fresh, changed, relaid))
 }
 
+/// What [`relink`] did to an image: staged nothing (it was given what its last link was, so
+/// its file is the one it has), patched it, or laid it out whole
+/// ([`blaze_link::Staged::full`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Laid {
+    Nothing,
+    Patched,
+    Whole,
+}
+
 /// How a link went: `changed` is the fields of the output that differ from the kept image's
-/// (`None` when no image was kept), `full` whether blaze-link laid the image out whole
-/// ([`blaze_link::Staged::full`]). A kept image of the same output laid out whole is one whose
-/// first link failed (nothing was laid out to patch) or one that keeps no room.
-pub(crate) fn linking(changed: Option<OutputFields>, full: bool, incremental: bool) -> Linking {
-    match (changed, full) {
+/// (`None` when no image was kept), `laid` what blaze-link did to it. A kept image of the same
+/// output laid out whole is one whose first link failed (nothing was laid out to patch) or one
+/// that keeps no room.
+pub(crate) fn linking(changed: Option<OutputFields>, laid: Laid, incremental: bool) -> Linking {
+    match (changed, laid) {
         (Some(changed), _) if !changed.is_empty() => Linking::Full(Full::Output(changed)),
-        (_, false) => Linking::Spliced,
-        (_, true) if !incremental => match changed {
+        (_, Laid::Nothing) => Linking::Unchanged,
+        (_, Laid::Patched) => Linking::Spliced,
+        (_, Laid::Whole) if !incremental => match changed {
             Some(_) => Linking::Full(Full::NotIncremental),
             None => Linking::First,
         },
-        (_, true) => Linking::First,
+        (_, Laid::Whole) => Linking::First,
     }
 }
 
@@ -1509,7 +1685,7 @@ pub(crate) fn function_rows(
 
 /// [`link`]'s change of `linked` to what `generated` built, with the crates' `global_asm!`
 /// objects `assembled` and the native inputs `located`, laid out by `heat` where the image is
-/// laid out whole, and whether blaze-link laid it out whole ([`blaze_link::Staged::full`]).
+/// laid out whole, and what was done to the image ([`Laid`]).
 /// Its columns are written only once the image has taken the change, so after an error they
 /// still say what the image holds.
 #[expect(clippy::too_many_arguments, reason = "the link's inputs, each its own")]
@@ -1524,7 +1700,7 @@ fn relink(
     side: &LinkInputs,
     heat: Option<&blaze_link::Heat>,
     linked: &mut Linked,
-) -> Result<(Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>, bool, super::run::inproc::Told), LinkCause> {
+) -> Result<(Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>, Laid, super::run::inproc::Told), LinkCause> {
     let built = generated.built;
     // Each native input by the hash of its contents, through the process's table of files by
     // their `stat`: one `stat` for a library the image already has, read only when it is new.
@@ -1619,7 +1795,7 @@ fn relink(
         linked.names = kept_names;
         let bytes = linked.image.file().map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error })?;
         let table = tests_table(test, path, generated, side, linked)?;
-        return Ok((bytes, read, table, false, super::run::inproc::Told::Nothing));
+        return Ok((bytes, read, table, Laid::Nothing, super::run::inproc::Told::Nothing));
     }
     // clone: the names gone, a few a link, which an image that refuses the change still has
     let gone_names = unnamed.clone();
@@ -1667,7 +1843,10 @@ fn relink(
         None => (Vec::new(), None),
     };
     let made = linked.image.stage(change).map_err(|error| LinkCause::Linker { step: LinkStep::Stage, error }).and_then(|staged| {
-        let full = staged.full();
+        let laid = match staged.full() {
+            true => Laid::Whole,
+            false => Laid::Patched,
+        };
         match linked.output.dev_run {
             // A dev executable's file is its code memory's image part, which its runs map.
             Some(dev_run) => super::run::inproc::commit(
@@ -1679,17 +1858,17 @@ fn relink(
                 dev_run.cells,
                 refused.as_deref(),
             )
-            .map(|(bytes, told)| (bytes, full, told))
+            .map(|(bytes, told)| (bytes, laid, told))
             // alloc: error path
             .map_err(|what| LinkCause::Given(format!("{path}: {what}"))),
             None => linked
                 .image
                 .bytes(staged)
-                .map(|bytes| (bytes, full, super::run::inproc::Told::Nothing))
+                .map(|bytes| (bytes, laid, super::run::inproc::Told::Nothing))
                 .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error }),
         }
     });
-    let (bytes, full, told) = match made {
+    let (bytes, laid, told) = match made {
         Ok(made) => made,
         Err(cause) => {
             // Every name the image may still hold: one it never took is unnamed harmlessly.
@@ -1707,7 +1886,7 @@ fn relink(
     linked.assumed = assumed;
     linked.given = Some(given);
     let table = tests_table(test, path, generated, side, linked)?;
-    Ok((bytes, read, table, full, told))
+    Ok((bytes, read, table, laid, told))
 }
 
 /// A test binary's table, by which its tests are selected and which only its link numbers;

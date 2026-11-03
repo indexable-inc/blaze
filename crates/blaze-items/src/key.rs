@@ -743,7 +743,17 @@ pub fn def_key<'db>(db: &'db Db, def: SolverDefId<'db>) -> ItemKey {
         SolverDefId::InternedOpaqueTyId(it) => opaque_ty_key(db, it),
         SolverDefId::EnumVariantId(it) => variant_key(db, it),
         SolverDefId::Ctor(ctor) => ctor_key(db, ctor),
+        SolverDefId::RpititId(it) => rpitit_key(db, it),
     }
+}
+
+/// The key of a trait's or impl's item for a method's `impl Trait`: under its method's, by
+/// index, apart from the method's opaque type at the same index.
+pub fn rpitit_key(db: &Db, rpitit: hir_ty::rpitit::RpititId) -> ItemKey {
+    let parent = item_key(db, ItemId::Function(rpitit.function));
+    let mut h = Hasher::new(KEY_DOMAIN);
+    h.id(&parent.0).part(b"rpitit").update(&rpitit.idx.into_raw().into_u32().to_le_bytes());
+    under(&parent, true, h.finish())
 }
 
 /// A lang item's target by key: as the `SolverDefId` it is, a macro by its item key.
@@ -880,9 +890,9 @@ fn module_path<'db>(
                 None => write("{block}"),
             }
         }
-        None => match &module.krate(db).extra_data(db).display_name {
-            Some(name) => write(name.crate_name().symbol().as_str()),
-            None => write("{crate}"),
+        None => match module.krate(db).rust_name(db) {
+            Ok(name) => write(name.as_str()),
+            Err(unnamed) => write(&unnamed.to_string()), // alloc: a path's crate segment, for a crate with no name
         },
     }
 }
@@ -1129,7 +1139,7 @@ impl ClashingCrate {
         let extra = krate.extra_data(db);
         let data = krate.data(db);
         ClashingCrate {
-            name: crate::hash::crate_name(db, krate).to_owned(), // alloc: an error's, once
+            name: krate.named(db).to_string(), // alloc: an error's, once
             version: extra.version.clone(), // clone: an error's, once
             origin: format!("{:?}", data.origin), // alloc: an error's, once
             kind: if data.target_kind == data.manifest_kind {

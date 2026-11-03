@@ -6,6 +6,7 @@
 //! arms and say the same about falling through.
 
 use blaze_mem::{Frame, Tag, frame};
+use blaze_rng::SplitMix64;
 
 use super::*;
 
@@ -206,26 +207,6 @@ fn old_sort<'t>(
 
 // Generated arms.
 
-/// xorshift64*: the same sequence on every machine.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-
-    fn chance(&mut self, percent: u64) -> bool {
-        self.below(100) < percent
-    }
-}
-
 /// What the value at a place is, which decides what a pattern there asks.
 #[derive(Clone, Copy)]
 enum Kind {
@@ -263,17 +244,17 @@ impl<'t> Gen<'t> {
     /// a wildcard.
     fn pattern(
         &self,
-        rng: &mut Rng,
+        rng: &mut SplitMix64,
         place: Vec<Step, &'t Frame>,
         kind: Kind,
         depth: u32,
         pairs: &mut Vec<Pair<'t>, &'t Frame>,
     ) {
         let none = || Vec::new_in(self.frame);
-        if rng.chance(20) {
+        if rng.chance(0.2) {
             return;
         }
-        if depth > 0 && rng.chance(15) {
+        if depth > 0 && rng.chance(0.15) {
             let count = 2 + rng.below(2) as usize;
             let mut each = Vec::with_capacity_in(count, self.frame);
             for _ in 0..count {
@@ -288,12 +269,12 @@ impl<'t> Gen<'t> {
         let ask = match kind {
             Kind::Int => {
                 let lo = rng.below(self.span) as u128;
-                match rng.chance(35) {
+                match rng.chance(0.35) {
                     true => Ask::Range(lo, lo + rng.below(self.span / 2 + 1) as u128 + 1),
                     false => Ask::Int(lo),
                 }
             }
-            Kind::Bool => Ask::Bool(rng.chance(50)),
+            Kind::Bool => Ask::Bool(rng.chance(0.5)),
             Kind::Equal => Ask::Equal(&self.literals[rng.below(self.literals.len() as u64) as usize], false),
             Kind::Slice => {
                 let len = rng.below(3);
@@ -304,7 +285,7 @@ impl<'t> Gen<'t> {
                         self.pattern(rng, element, Kind::Int, depth - 1, &mut inside);
                     }
                 }
-                pairs.push(Pair { place, ask: Ask::Len { len, or_more: rng.chance(40) }, inside });
+                pairs.push(Pair { place, ask: Ask::Len { len, or_more: rng.chance(0.4) }, inside });
                 return;
             }
         };
@@ -312,14 +293,14 @@ impl<'t> Gen<'t> {
     }
 
     /// An arm: a tuple of `fields` fields, each with a pattern or a wildcard.
-    fn arm(&self, rng: &mut Rng, arm: usize, fields: u32) -> Candidate<'t> {
+    fn arm(&self, rng: &mut SplitMix64, arm: usize, fields: u32) -> Candidate<'t> {
         let mut pairs = Vec::new_in(self.frame);
         for field in 0..fields {
             let place = self.place(&[], Step::Field(field));
             self.pattern(rng, place, Self::kind(field), 2, &mut pairs);
         }
         radix::sort_by_key(&mut pairs, or_last);
-        Candidate { arm, pairs, guarded: rng.chance(15), then: None }
+        Candidate { arm, pairs, guarded: rng.chance(0.15), then: None }
     }
 }
 
@@ -358,7 +339,7 @@ fn the_stacked_run_reaches_what_the_old_run_reached() {
     let literals = literals();
     for seed in 1..=3000u64 {
         frame::task(Tag::Mir, |frame| {
-            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut rng = SplitMix64::new(seed);
             let span = [3, 8, 40][rng.below(3) as usize];
             let generator = Gen { frame, literals, span };
             let fields = 1 + rng.below(3) as u32;

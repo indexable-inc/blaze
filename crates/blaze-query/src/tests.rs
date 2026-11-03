@@ -1248,14 +1248,12 @@ fn marks_are_a_bit_a_memo() {
 const LAYERS: u32 = 6;
 const WIDTH: u32 = 400;
 
-/// The three children in the next layer of node `i` of `layer`, picked by a hash of the node.
+/// The three children in the next layer of node `i` of `layer`, picked by draws seeded with the node.
 fn children(layer: u32, i: u32) -> impl Iterator<Item = (u32, u32)> {
-    let mut x = (u64::from(layer) << 32 | u64::from(i)).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut rng = blaze_ids::rng::SplitMix64::new(u64::from(layer) << 32 | u64::from(i));
     (0..3).filter_map(move |_| {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        (layer + 1 < LAYERS).then_some((layer + 1, (x % u64::from(WIDTH)) as u32))
+        let child = rng.below(u64::from(WIDTH)) as u32;
+        (layer + 1 < LAYERS).then_some((layer + 1, child))
     })
 }
 
@@ -1341,17 +1339,15 @@ fn marked(db: &Database, views: bool, roots: &[MemoId], capacity: usize, how: Ma
 fn parallel_marking_reaches_what_serial_marking_does() {
     let (db, all) = layered();
     let end = db.store.end() as usize;
-    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_F491_4F6C_DD1D);
     let (mut reached_some, mut hot_some) = (false, false);
     for round in 0..24u64 {
         let roots: Vec<MemoId> = all
             .iter()
             .copied()
             .filter(|_| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                round % 4 != 0 && x % (round + 2) == 0
+                let draw = rng.next_u64();
+                round % 4 != 0 && draw % (round + 2) == 0
             })
             .collect();
         let views = round % 2 == 1;
@@ -1401,13 +1397,8 @@ fn a_parallel_mark_allocates_nothing_on_its_caller() {
 /// of the radix sort's insertion and parallel cut-offs.
 #[test]
 fn keys_sort_for_the_image_as_by_comparison() {
-    let mut x = 0x2545_F491_4F6C_DD1Du64;
-    let mut next = || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        x
-    };
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_F491_4F6C_DD1D);
+    let mut next = || rng.next_u64();
     for len in [0usize, 1, 2, 63, 64, 65, 1000, 70_000, 150_000] {
         let mut keys: Vec<QueryKey> = (0..len)
             .map(|_| {

@@ -5,6 +5,12 @@
 //!
 //! Left to the daemon, as blaze's own: `CARGO`, `RUSTC` and `RUSTDOC` (the programs cargo names),
 //! the dynamic library search path, and the jobserver.
+//!
+//! `CARGO_PRIMARY_PACKAGE` is no part of a plan: it is of the request, not of the unit
+//! ([`crate::query::Units::is_primary`]). A plan is in its unit's record key whole, and
+//! `--workspace` then `-p one` would otherwise key every dependency of `one` anew. The front
+//! end gives it to the crates of primary units (`base_db::set_primary_crates`), and a record is
+//! keyed by it only when a crate read it (rule 18).
 
 use std::path::Path;
 
@@ -92,7 +98,6 @@ pub(super) struct CompileEnv<'a> {
     pub crate_name: &'a str,
     /// `CARGO_BIN_NAME`, of an executable.
     pub bin_name: Option<&'a str>,
-    pub primary: bool,
     /// `CARGO_TARGET_TMPDIR`, of a test or bench target.
     pub tmpdir: Option<String>,
     /// The `OUT_DIR` of the unit's build script's run.
@@ -113,9 +118,6 @@ pub(super) fn compile_env(it: CompileEnv<'_>, config_env: &[(String, String)]) -
     }
     for (name, path) in it.bin_exes {
         env.set(name, path);
-    }
-    if it.primary {
-        env.set("CARGO_PRIMARY_PACKAGE", "1");
     }
     if let Some(dir) = it.tmpdir {
         env.set("CARGO_TARGET_TMPDIR", dir);

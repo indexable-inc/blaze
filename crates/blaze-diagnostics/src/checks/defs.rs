@@ -84,6 +84,19 @@ pub(crate) fn scopes(cx: &Cx<'_, '_>) -> Vec<hir::Module> {
     scopes
 }
 
+/// [`conflicts`] of the blocks of body `def` alone, each with the modules written in it: a name
+/// defined twice in one of them (E0428 and its kin), for the check of that one body
+/// ([`crate::check::check_one_body`]).
+pub(crate) fn block_conflicts(cx: &Cx<'_, '_>, def: hir_def::DefWithBodyId) -> Vec<Found> {
+    let body = Body::of(cx.db, def);
+    // alloc: the error path, the scopes of one body that failed
+    let mut scopes = Vec::new();
+    for (_, def_map) in body.blocks(cx.db) {
+        scopes.extend(def_map.modules(cx.db).map(|(id, _)| hir::Module::from(id)));
+    }
+    conflicts::check(cx, &scopes)
+}
+
 /// Whether `module` is the scope of a block, rustc's anonymous module.
 pub(crate) fn is_block(cx: &Cx<'_, '_>, module: hir::Module) -> bool {
     module.nearest_non_block_module(cx.db) != module

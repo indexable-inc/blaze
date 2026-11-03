@@ -466,7 +466,7 @@ pub(crate) enum ItemWithBounds<'db> {
 }
 impl_from!(impl<'db> TypeAliasId, InternedOpaqueTyId<'db> for ItemWithBounds<'db>);
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
 pub(crate) struct ItemBounds {
     bounds: StoredEarlyBinder<StoredClauses>,
     non_self_bounds_start: u32,
@@ -481,9 +481,37 @@ impl ItemBounds {
         let def_id = match def_id {
             SolverDefId::TypeAliasId(def_id) => def_id.into(),
             SolverDefId::InternedOpaqueTyId(def_id) => def_id.into(),
-            _ => panic!("unexpected SolverDefId"),
+            SolverDefId::RpititId(rpitit) => {
+                return crate::rpitit::rpitit_item_bounds(db, rpitit.function, rpitit.idx);
+            }
+            _ => panic!("item bounds asked of {def_id:?}, which is no alias"),
         };
         ItemBounds::of(db, def_id)
+    }
+
+    /// The bounds of an RPITIT ([`crate::rpitit`]): the trait's are its opaque type's, with
+    /// that type and each other of its method's own the trait's items; an impl's has none of
+    /// its own, as rustc's synthesized impl item has none.
+    pub(crate) fn of_rpitit(db: &Db, rpitit: crate::rpitit::RpititId) -> ItemBounds {
+        let interner = DbInterner::new_with(db, rpitit.function.krate(db));
+        match rpitit.side(db) {
+            crate::rpitit::RpititSide::Trait(_) => {
+                let opaque = ItemBounds::of(db, rpitit.opaque(db).into());
+                let clauses = crate::rpitit::opaques_to_rpitits(
+                    interner,
+                    rpitit.function,
+                    opaque.bounds.get().skip_binder(),
+                );
+                ItemBounds {
+                    bounds: StoredEarlyBinder::bind(interner, clauses.store()),
+                    non_self_bounds_start: opaque.non_self_bounds_start,
+                }
+            }
+            crate::rpitit::RpititSide::Impl { .. } => ItemBounds {
+                bounds: StoredEarlyBinder::bind(interner, Clauses::empty().store()),
+                non_self_bounds_start: 0,
+            },
+        }
     }
 
     #[inline]

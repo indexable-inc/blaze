@@ -71,7 +71,7 @@ fn a_built_mir_body_is_read_without_allocating() {
     let fx = fixture::db(WORK);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let func = function(&db, "work");
         let first = db.mir_body(func.into()).expect("the MIR of `work`");
         let again = assert_at_most(0, "a memoized `mir_body`", || {
@@ -87,7 +87,7 @@ fn an_optimized_mir_body_is_read_without_allocating() {
     let _ = fx.only_file();
     let db = fx.into_db();
     let options = MirOptions::at(MirOptLevel::Debug);
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let func = function(&db, "work");
         let first = db.optimized_mir_body(func.into(), options).expect("the MIR of `work`");
         let again = assert_at_most(0, "a memoized `optimized_mir_body`", || {
@@ -102,7 +102,7 @@ fn an_evaluated_constant_is_read_without_allocating() {
     let fx = fixture::db(WORK);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let goal = constant(&db, "GOAL");
         let first = db.const_eval(goal, GenericArgs::empty(), None).expect("evaluating `GOAL`");
         assert_eq!(&*first.memory, &5050u32.to_le_bytes());
@@ -118,7 +118,7 @@ fn storage_conflicts_allocate_their_result_only() {
     let fx = fixture::db(WORK);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let func = function(&db, "work");
         let options = MirOptions::at(MirOptLevel::Debug);
         let body = db.optimized_mir_body(func.into(), options).expect("the body");
@@ -146,7 +146,7 @@ fn warm_optimizations_allocate_nothing() {
     let fx = fixture::db(WORK);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = body_of(&db, "work");
         let runtime = db.runtime_mir_body(def).expect("the runtime body").clone();
         budget::with_passes(&db, def, |passes| {
@@ -171,7 +171,7 @@ fn warm_ub_checks_allocate_nothing_without_sites() {
     let fx = fixture::db(WORK);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = body_of(&db, "work");
         let runtime = db.runtime_mir_body(def).expect("the runtime body").clone();
         budget::with_passes(&db, def, |passes| {
@@ -193,7 +193,7 @@ fn warm_runtime_analyses_allocate_nothing() {
     let fx = fixture::db(WORK);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = body_of(&db, "work");
         let built = db.mir_body(def).expect("the built body").clone();
         budget::with_passes(&db, def, |passes| {
@@ -213,7 +213,7 @@ fn run_passes_allocates_the_kept_body_only() {
     let fx = fixture::db(WORK);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = body_of(&db, "plain");
         let built = db.mir_body(def).expect("the built body").clone();
         let warm = budget::run_passes(&db, &built).expect("the passes");
@@ -233,7 +233,7 @@ fn optimize_allocates_the_kept_body_only() {
     let fx = fixture::db(WORK);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = body_of(&db, "work");
         let options = MirOptions::at(MirOptLevel::Release);
         let runtime = db.runtime_mir_body(def).expect("the runtime body").clone();
@@ -269,7 +269,7 @@ const TWENTY: u32 = run(20);
     let fx = fixture::db(LOOPS);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let eval = |name| {
             measure(|| {
                 db.const_eval(constant(&db, name), GenericArgs::empty(), None)
@@ -319,7 +319,7 @@ pub fn many() -> u32 {
     let fx = fixture::db(CONSTANTS);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let few = monomorphize_beyond_the_copy(&db, "few");
         let many = monomorphize_beyond_the_copy(&db, "many");
         // Beyond the copy only the inference context is built, the same for both: a constant
@@ -346,7 +346,7 @@ fn lowering_extra(n: usize) -> (u64, u64) {
     let fx = fixture::db(&straight(n));
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = body_of(&db, "straight");
         let warm = budget::lower(&db, def).expect("the body");
         // The block's tail `x`: the path with the deepest scope chain of the body.
@@ -375,7 +375,7 @@ fn type_names_allocate_the_name_only() {
     let fx = fixture::db(WORK);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let func = function(&db, "make");
         let body = db.mir_body(func.into()).expect("the body");
         let ty = body.locals[return_slot()].ty.as_ref();

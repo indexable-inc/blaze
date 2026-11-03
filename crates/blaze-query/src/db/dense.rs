@@ -465,7 +465,7 @@ mod tests {
                 for reader in 0..READERS {
                     let (column, start, grown, raced) = (&column, &start, &grown, &raced);
                     scope.spawn(move || {
-                        let mut word = ((round * READERS + reader) as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9) | 1;
+                        let mut rng = blaze_ids::rng::SplitMix64::new((round * READERS + reader) as u64);
                         let (mut last, mut moved) = (0, 0);
                         start.wait();
                         while grown.load(Ordering::Acquire) < GROWERS {
@@ -485,10 +485,7 @@ mod tests {
                                 "round {round}: place {} read {newest}",
                                 len - 1
                             );
-                            word ^= word << 13;
-                            word ^= word >> 7;
-                            word ^= word << 17;
-                            let at = (word as usize) % len;
+                            let at = rng.index(len);
                             let got = column.get_checked(at).map_or(0, |it| it.load(Ordering::Acquire));
                             assert!(got == 0 || got == at as u64 + 1, "round {round}: place {at} read {got}");
                         }

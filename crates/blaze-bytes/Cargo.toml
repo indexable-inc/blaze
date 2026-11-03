@@ -13,6 +13,9 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[dependencies]
+blaze-mem.workspace = true
+
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-ids.workspace = true

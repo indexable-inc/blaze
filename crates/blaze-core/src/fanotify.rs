@@ -327,7 +327,7 @@ impl Fanotify {
                         crate::cgroup::kernel()
                     ),
                 ),
-                _ => named(error, "fanotify_init"),
+                _ => named(&error, "fanotify_init"),
             });
         }
         // SAFETY: the call returned a descriptor of its own.
@@ -337,7 +337,7 @@ impl Fanotify {
             None => Room::new()?,
         };
         // alloc: the error of a watch that failed.
-        canonical(root, &mut room.root).map_err(|error| named(error, &format!("resolving {}", root.display())))?;
+        canonical(root, &mut room.root).map_err(|error| named(&error, &format!("resolving {}", root.display())))?;
         room.dir.clear();
         room.dir.push_str(dir.as_str());
         let mut watch = Fanotify { fd, room };
@@ -432,7 +432,7 @@ impl Fanotify {
                 Ok(listed) => Ok(Visit::List(listed)),
                 Err(error) if top && first => Err(match gone(&error) {
                     // alloc: the error of a watch that failed.
-                    true => named(error, &format!("opening {}", path.to_string_lossy())),
+                    true => named(&error, &format!("opening {}", path.to_string_lossy())),
                     false => error,
                 }),
                 Err(error) if gone(&error) => Ok(Visit::Skip),
@@ -503,7 +503,7 @@ fn learn_one(
     };
     let raw = opened.as_raw_fd();
     // alloc: the error of a watch that failed.
-    let fsid = fsid(raw).map_err(|error| named(error, &format!("statfs of {}", path.to_string_lossy())))?;
+    let fsid = fsid(raw).map_err(|error| named(&error, &format!("statfs of {}", path.to_string_lossy())))?;
     let handle = handle_of(raw).map_err(|error| match error.raw_os_error() {
         Some(libc::EOPNOTSUPP) => io::Error::new(
             io::ErrorKind::Unsupported,
@@ -794,11 +794,11 @@ fn canonical(root: &Path, into: &mut PathBuf) -> io::Result<()> {
 fn keep_eperm(error: io::Error, what: &str) -> io::Error {
     match error.raw_os_error() {
         Some(libc::EPERM) => error,
-        _ => named(error, what),
+        _ => named(&error, what),
     }
 }
 
-fn named(error: io::Error, what: &str) -> io::Error {
+fn named(error: &io::Error, what: &str) -> io::Error {
     // alloc: the error of a watch that failed.
     io::Error::new(error.kind(), format!("{what}: {error}"))
 }

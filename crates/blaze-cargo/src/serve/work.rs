@@ -51,6 +51,7 @@
 
 use std::sync::{Arc, atomic::AtomicBool};
 
+use blaze_vfs::Bytes;
 use blaze_api::{ApiError, Artifact, Diagnostic, Edit, Edited, Reach, Response, Table, TestResult, Ub};
 use blaze_cas::Store;
 use blaze_core::{Completion, Effect, Tag};
@@ -72,11 +73,30 @@ pub struct Source {
     pub under: String,
 }
 
+/// A file of a fetched or read source. Its bytes are [`Bytes::kept`] in [`blaze_mem::Tag::Vfs`]
+/// where they are read in (a `.crate`'s, a checkout's, the standard library's): they become the
+/// VFS tree's with no copy and live as long as it holds them.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SourceFile {
     pub path: String,
-    pub bytes: Vec<u8>,
+    pub bytes: Bytes,
     pub mode: Mode,
+}
+
+impl SourceFile {
+    /// The file at `at`, read whole into a [`Bytes::kept`] block of the size its metadata gives
+    /// (`len`): an error naming it when it is shorter or longer by the time it is read.
+    pub fn read(at: &std::path::Path, len: u64) -> std::io::Result<Bytes> {
+        use std::io::Read as _;
+        let named = |error: std::io::Error| std::io::Error::new(error.kind(), format!("{}: {error}", at.display()));
+        let mut file = std::fs::File::open(at).map_err(named)?;
+        let len = usize::try_from(len).map_err(|_| named(std::io::Error::other("a file past the address space")))?;
+        let bytes = Bytes::kept(blaze_mem::Tag::Vfs, len, |place| file.read_exact(place)).map_err(named)?;
+        match file.read(&mut [0])? {
+            0 => Ok(bytes),
+            _ => Err(named(std::io::Error::other(format!("grew past its {len} bytes while it was read")))),
+        }
+    }
 }
 
 /// What a job's work is, as far as its units' work differs by it.
@@ -207,6 +227,16 @@ pub struct Compiled {
     /// No error among the diagnostics and nothing else failed: what depends on it goes on, as
     /// cargo's.
     pub ok: bool,
+    /// A unit only checked (`checks_only`) failed (`ok` false) only in its bodies and lints,
+    /// its items sound ([`blaze_diagnostics::CrateCheck::items_broken`] false): its node fails
+    /// open ([`blaze_graph::Outcome::FailedOpen`]), so under keep-going what is checked against
+    /// its items still is, while it stays failed. Never true when `ok` is, for a unit whose
+    /// code is built or run, nor for a failure of codegen, a refusal or a panic.
+    pub open: bool,
+    /// Why it failed, for its node and the build's report of what it left unchecked: its
+    /// errors (in its items, or only in its bodies or lints), or blaze's own failure to make
+    /// it. None when `ok`, or when nothing more is known than that it failed.
+    pub why: Option<String>,
     pub puts: Vec<Put>,
     /// What the loop puts into the standard library's shared store ([`JobInput::std`]): a std
     /// unit's record and every output it names, once made here; nothing for any other unit.
@@ -292,14 +322,16 @@ pub enum Linking {
     First,
     /// What changed was placed into the room the kept image keeps.
     Spliced,
+    /// Nothing it is given changed: the kept image's file as it was, nothing staged.
+    Unchanged,
     /// The image was laid out whole again although one was kept.
     Full(Full),
 }
 
 impl Linking {
-    /// The image was laid out whole, rather than patched.
+    /// The image was laid out whole, rather than patched or kept as it was.
     pub(crate) fn placed(self) -> bool {
-        !matches!(self, Linking::Spliced)
+        !matches!(self, Linking::Spliced | Linking::Unchanged)
     }
 
     /// As [`blaze_api::Worked::links`] says it.
@@ -307,6 +339,7 @@ impl Linking {
         match self {
             Linking::First => blaze_api::LinkHow::First,
             Linking::Spliced => blaze_api::LinkHow::Spliced,
+            Linking::Unchanged => blaze_api::LinkHow::Unchanged,
             // alloc: a name a field that differs, for a link that was not spliced
             Linking::Full(Full::Output(fields)) => {
                 blaze_api::LinkHow::Full { why: fields.names().map(str::to_owned).collect() }
@@ -324,6 +357,7 @@ impl std::fmt::Display for Linking {
         match self {
             Linking::First => f.write_str("first link"),
             Linking::Spliced => f.write_str("spliced"),
+            Linking::Unchanged => f.write_str("unchanged"),
             Linking::Full(Full::Output(fields)) => write!(f, "not spliced: the output changed: {fields}"),
             Linking::Full(Full::NotIncremental) => f.write_str("not spliced: the output keeps no room"),
             Linking::Full(Full::Layout) => f.write_str("not spliced: the profile its code is laid out by changed"),

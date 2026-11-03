@@ -2974,6 +2974,33 @@ mod tests {
         assert!(WasmSignature::of_format(&funcref).is_err());
     }
 
+    /// A function of more than one result writes them through a pointer ahead of its
+    /// parameters, each where LLVM's struct of them has it, aligned to its size: what LLVM's
+    /// wasm32 makes of rustc's pair (`(u8, u32)` at 0 and 4, `(u32, u64)` at 0 and 8, the
+    /// pinned nightly's `-O` code of the same functions), and of an `i128`, in two halves.
+    #[test]
+    fn several_results_are_written_through_a_first_pointer_at_llvms_offsets() {
+        let returning = |returns: &[Type]| {
+            let mut sig = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+            sig.params.push(ir::AbiParam::new(types::I32));
+            sig.returns.extend(returns.iter().map(|&it| ir::AbiParam::new(it)));
+            sig
+        };
+        let through = |returns: &[Type]| match Returned::of(&returning(returns)).unwrap() {
+            Returned::Through(places) => places.to_vec(),
+            other => panic!("{returns:?} returned as {other:?}"),
+        };
+        assert_eq!(through(&[types::I8, types::I32]), [(0, Class::Word(8)), (4, Class::Word(32))]);
+        assert_eq!(through(&[types::I32, types::I64]), [(0, Class::Word(32)), (8, Class::Long)]);
+        assert_eq!(through(&[types::F32, types::F32]), [(0, Class::F32), (4, Class::F32)]);
+        assert_eq!(through(&[types::I128]), [(0, Class::Pair)]);
+        for address in [Address::Bits32, Address::Bits64] {
+            let signature = WasmSignature::of(&returning(&[types::I8, types::I32]), address).unwrap();
+            assert_eq!(signature, WasmSignature { params: vec![address.wasm(), WasmType::I32], results: vec![] });
+        }
+        assert_eq!(Returned::of(&returning(&[types::I64])).unwrap(), Returned::Value(Class::Long));
+    }
+
     #[test]
     fn a_header_with_an_export_is_not_a_compiled_function() {
         let function = function();

@@ -322,7 +322,7 @@ pub fn keep(
     let mut retracted = None;
     for put in puts {
         let from = tickets.len();
-        let kept = index::keep_into(store, Unit::SHARED, &put.run, &put.traced, put.value, &mut tickets);
+        let kept = index::keep_into(store, Unit::SHARED, &put.run, &put.traced, &put.value, &mut tickets);
         // The record's own ticket, the first its put made. [`keeps`] gives at most one
         // durable put, so the `max` folds at most one ticket: no tickets of two segments are
         // compared (a record that dedupes gets the ticket of another segment's put). Every

@@ -24,7 +24,8 @@ use hir_ty::{
     db::HirDatabase,
     next_solver::{
         AliasTy, Clause, DbInterner, GenericArg, GenericArgKind, GenericArgs, ParamEnv, Region,
-        RegionExt as _, StoredRegion, StoredTy, TraitAssocTyId, Ty, TyKind, infer::InferCtxt,
+        RegionExt as _, StoredRegion, StoredTy, TermId, TraitAssocTyId, Ty, TyKind,
+        infer::InferCtxt,
     },
 };
 
@@ -785,7 +786,7 @@ fn required<'db, A: Allocator + Copy>(
         TyKind::Alias(_, alias)
             if let rustc_type_ir::AliasTyKind::Projection { def_id: TraitAssocTyId(item) } =
                 alias.kind
-                && let ItemContainerId::TraitId(trait_) = item.lookup(db).container =>
+                && let ItemContainerId::TraitId(trait_) = TermId::from(item).container(db) =>
         {
             predicate_needs(db, trait_.into(), alias.args.as_slice(), &mut needs);
         }

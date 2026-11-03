@@ -331,7 +331,7 @@ fn a_template_kept_by_one_blaze_build_is_read_by_the_next() {
     let template = b"the bytes of one dev template".to_vec();
     {
         let mut driven = blaze_cas::Driven::open(&root).unwrap();
-        driven.store().put(key(built), blaze_cas::Kind::Code, template.clone()).unwrap();
+        driven.store().put(key(built), blaze_cas::Kind::Code, &template).unwrap();
         driven.flush().unwrap();
     }
     let mut driven = blaze_cas::Driven::open(&root).unwrap();

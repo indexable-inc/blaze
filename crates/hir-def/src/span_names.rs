@@ -176,10 +176,10 @@ pub fn with_crate(db: &Db, krate: Crate, span: tracing::Span) -> tracing::Span {
 /// read different bodies as work done again: `serde v1.0.219 (lib)`, its `cfg(test)` copy
 /// `serde v1.0.219 (lib-test)`, the proc macros' wasm copy `serde v1.0.219 (lib, wasm)`, a
 /// `--target` copy `serde v1.0.219 (lib, x86_64-unknown-linux-gnu)`, and each version apart.
-/// No version for a crate with none; `{crate}` for the name of one with none.
+/// No version for a crate with none; [`Crate::named`] for the name.
 pub fn write_crate_label(db: &Db, krate: Crate, out: &mut String) {
     let (data, extra) = (krate.data(db), krate.extra_data(db));
-    out.push_str(crate_name(db, krate));
+    _ = write!(out, "{}", krate.named(db));
     if let Some(version) = &extra.version {
         out.push_str(" v");
         out.push_str(version);
@@ -217,14 +217,6 @@ fn kind_label(kind: TargetKind, manifest: TargetKind) -> &'static str {
     }
 }
 
-/// `krate`'s display name, `{crate}` for one with none: the name in its label.
-pub fn crate_name(db: &Db, krate: Crate) -> &str {
-    match &krate.extra_data(db).display_name {
-        Some(name) => name.crate_name().symbol().as_str(),
-        None => "{crate}",
-    }
-}
-
 /// The first segment of a path in `krate`: its name, or for a build script, whose crate cargo
 /// names `build_script_build` in every package, `build_script[<package>]`.
 fn write_crate(db: &Db, krate: Crate, out: &mut String) {
@@ -240,7 +232,7 @@ fn write_crate(db: &Db, krate: Crate, out: &mut String) {
             out.push_str(package.as_str());
             out.push(']');
         }
-        _ => out.push_str(crate_name(db, krate)),
+        _ => _ = write!(out, "{}", krate.named(db)),
     }
 }
 

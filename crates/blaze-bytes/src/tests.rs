@@ -154,3 +154,31 @@ fn bytes_and_text_go_between_threads_and_stay_small() {
     send_sync::<Text>();
     assert!(size_of::<Text>() <= 40, "{}", size_of::<Text>());
 }
+
+/// Bytes made in place hold what was written, live in their tag's blocks rather than the global
+/// heap, and a write that fails gives its block back.
+#[test]
+fn kept_bytes_hold_what_was_written_and_a_failed_write_frees_its_block() {
+    use blaze_mem::Tag;
+    // `Vfs`: no other test of the crate counts to it.
+    let live = || blaze_mem::tag::snapshot().get(Tag::Vfs).live;
+    std::thread::spawn(move || {
+        let before = live();
+        let written = Bytes::kept(Tag::Vfs, 5000, |place| {
+            place.iter_mut().enumerate().for_each(|(at, byte)| *byte = at as u8);
+            Ok::<(), ()>(())
+        })
+        .expect("the write succeeds");
+        assert!(written.iter().enumerate().all(|(at, &byte)| byte == at as u8), "the bytes as written");
+        assert!(written.shared().is_none(), "not a global-heap `Arc<[u8]>`");
+        assert!(live() >= before + 5000, "counted to the tag");
+        let failed = Bytes::kept(Tag::Vfs, 4000, |_| Err("short read"));
+        assert_eq!(failed.err(), Some("short read"));
+        assert_at_most(0, "a warm kept copy", || drop(Bytes::copy_kept(Tag::Vfs, &written)));
+        drop(written);
+        before
+    })
+    .join()
+    .map(|before| assert_eq!(live(), before, "every block freed, the failed one too"))
+    .expect("the thread ran");
+}

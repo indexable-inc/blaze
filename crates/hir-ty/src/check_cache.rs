@@ -24,7 +24,7 @@ use std::alloc::Global;
 use blaze_ids::{ContentId, Domain, Hasher};
 use hir_def::{
     DefWithBodyId, HasModule,
-    deps::{Held as _, ImageBuf, body_key, crate_name},
+    deps::{Held as _, ImageBuf, body_key},
     expr_store::Body,
 };
 
@@ -87,7 +87,7 @@ pub fn set_served(db: &mut Db, parts: HashMap<Crate, ImageBuf, Global>) {
             panic!(
                 "the bodies part of crate {} does not open: {why}; `set_served` takes parts \
                  `open` accepted",
-                crate_name(db, krate)
+                krate.named(db)
             );
         }
     }
@@ -243,6 +243,6 @@ fn corrupt(db: &Db, krate: Crate, def: Option<DefWithBodyId>, why: &str) -> ! {
     panic!(
         "the bodies part of crate {} is corrupt{what}: {why}; its bytes were checked against \
          their key, so the key or the encoding is wrong, and the body is not inferred instead",
-        crate_name(db, krate)
+        krate.named(db)
     )
 }

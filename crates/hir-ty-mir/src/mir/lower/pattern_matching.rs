@@ -607,6 +607,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
                     let unresolved_name = || MirLowerError::UnresolvedName {
                         owner: self.owner.expression_store_owner(self.db),
                         path: p.mod_path().copied(),
+                        at: pattern.into(),
                     };
                     // A path that starts at a type, `<T>::C`, is one only inference resolves.
                     let associated = match self.infer.assoc_resolutions_for_pat(pattern) {
@@ -1026,8 +1027,10 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
             AdtPatternShape::Record { args } => {
                 let mut it = Vec::with_capacity_in(args.len(), self.frame);
                 for x in args {
-                    let field_id =
-                        variant_data.field(&x.name).ok_or(MirLowerError::UnresolvedField)?;
+                    let hygiene = self.store.record_field_hygiene(x.pat);
+                    let field_id = variant_data
+                        .field_written(self.db, v, &x.name, hygiene)
+                        .ok_or(MirLowerError::UnresolvedField)?;
                     it.push((PlaceElem::Field(field_id.into()), x.pat));
                 }
                 self.pattern_match_adt(

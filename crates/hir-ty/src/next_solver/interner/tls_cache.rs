@@ -18,8 +18,10 @@
 use super::DbInterner;
 use base_db::{Crate, Db, Nonce};
 use blaze_hash::FixedState;
-use blaze_mem::{Cache, Pool, Pooled, Tag, lock::SpinLock, pool::Limbo};
+use blaze_mem::{Cache, Pool, Pooled, Tag, pool::Limbo};
 use blaze_query::db::View;
+use blaze_reclaim::Horizon;
+use parking_lot::Mutex;
 use rustc_type_ir::search_graph::GlobalCache;
 use std::{
     cell::Cell,
@@ -108,9 +110,13 @@ struct Shared<'p, K, S, T> {
     generations: Box<[AtomicPtr<Generation<K, S, T>>]>,
     /// Where generations are made, each published from [`Pooled::into_raw`].
     pool: &'p Pool<Generation<K, S, T>>,
-    /// Locked only to make or replace a generation. Not `std`'s mutex, which on macOS boxes a
-    /// pthread mutex on its first lock: a table's first miss would allocate.
-    slots: SpinLock<Slots<'p, Generation<K, S, T>>>,
+    /// Locked only to make or replace a generation, for its field updates: a slot taken from
+    /// the cache, the swap, the retired one's grace and the limbo's binary search. Every new
+    /// interner of every worker takes it, so nothing slow runs under it: the value is made, the
+    /// reclaim slots scanned ([`Horizon::now`]) and the passed generations dropped outside.
+    /// Taken through [`blaze_graph::wait::lock`]: a contended one blocks the thread (an OS
+    /// wait in `parking_lot`, not a fiber's park) inside a `wait` span naming [`LOCK`].
+    slots: Mutex<Slots<'p, Generation<K, S, T>>>,
 }
 
 /// A table's way into its pool: the cache it makes generations from, and the limbo holding
@@ -133,6 +139,22 @@ fn pool<G>() -> Pool<G> {
 /// How many generations past their grace a `replace` takes out of its table's limbo, to drop
 /// once it has let go of the lock: more than the one it retires, so the limbo drains.
 const PASSED: usize = 64;
+
+/// What a wait for a table's lock is said to wait on.
+const LOCK: &str = "the trait solver's cache table";
+
+/// Checks, in a debug build, that a holder of a table's lock scanned no reclaim slot since it
+/// took the lock and the count was `scans`: T4 (v2-selfbuild2.md) was that scan, once per
+/// step of the limbo's binary search, under the lock every new interner takes.
+#[inline]
+fn held_for_field_updates(scans: u64) {
+    debug_assert_eq!(
+        blaze_reclaim::scans(),
+        scans,
+        "a replace scanned the reclaim slots while holding the lock of {LOCK}: take the \
+         `Horizon` before locking"
+    );
+}
 
 /// A slot and the generation it was seen to hold.
 type Held<K, S, T> = (usize, *mut Generation<K, S, T>);
@@ -216,7 +238,7 @@ where
             // alloc: setup, once per table and process.
             generations: (0..len).map(|_| AtomicPtr::new(ptr::null_mut())).collect(),
             pool,
-            slots: SpinLock::new(Slots {
+            slots: Mutex::new(Slots {
                 cache: pool.cache(),
                 limbo: Limbo::new(pool)
                     .unwrap_or_else(|error| panic!("the trait solver's cache: {error}")),
@@ -325,16 +347,23 @@ where
         key: K,
         state: S,
     ) -> Result<&T, Option<&T>> {
-        let mut slots = self.slots.lock();
-        let made = slots
-            .cache
-            .alloc(Generation {
-                key,
-                state,
-                referenced: AtomicBool::new(true),
-                value: T::default(),
-            })
-            .into_raw();
+        // The slow parts before the lock: the value made, and the one scan of every reclaim slot
+        // (a line per thread and per parked task) that says which retired generations passed.
+        // The scan only where this replace will retire a generation, and so take passed ones:
+        // never into an empty slot, nor into one another thread has changed already (a swap
+        // that loses after this load still pays one).
+        let retiring = match NonNull::new(held) {
+            None => None,
+            Some(held) => match self.generations[at].load(Ordering::Acquire) {
+                now if now == held.as_ptr() => Some((held, Horizon::now())),
+                won => return Err(self.won(won, key, state)),
+            },
+        };
+        let generation =
+            Generation { key, state, referenced: AtomicBool::new(true), value: T::default() };
+        let mut slots = blaze_graph::wait::lock(&self.slots, LOCK);
+        let scans = blaze_reclaim::scans();
+        let made = slots.cache.alloc(generation).into_raw();
         if let Err(won) = self.generations[at].compare_exchange(
             held,
             made.as_ptr(),
@@ -343,21 +372,20 @@ where
         ) {
             // SAFETY: `made` came from `into_raw` of this pool just now and was never published.
             slots.cache.recycle(unsafe { Pooled::from_raw(self.pool, made) });
+            held_for_field_updates(scans);
             drop(slots);
-            return Err(self
-                .get(won)
-                .filter(|won| won.key == key && won.state == state)
-                .map(|won| &won.value));
+            return Err(self.won(won, key, state));
         }
         self.hints[at].store(hint, Ordering::Release);
-        let passed = NonNull::new(held).map(|held| {
+        let passed = retiring.map(|(held, horizon)| {
             // SAFETY: every generation in a slot was published from `into_raw` of this table's
             // pool, and the swap above unlinked `held`: one swap alone can, so this is the one
             // place that takes it back; the limbo lets it go only after every task that may
             // have loaded it has ended.
             slots.limbo.retire(unsafe { Pooled::from_raw(self.pool, held) });
-            slots.limbo.take_passed::<PASSED>()
+            slots.limbo.take_passed::<PASSED>(horizon)
         });
+        held_for_field_updates(scans);
         drop(slots);
         // The generations past their grace are dropped with the lock let go: a crate's cache is
         // hundreds of megabytes of maps, and every other thread's first use of a scope waits on
@@ -368,10 +396,16 @@ where
         Ok(unsafe { &(*made.as_ptr()).value })
     }
 
+    /// What another thread put in a slot first (`won`), if it is the value of `key` in `state`:
+    /// two threads making one key at once both pick the same slot.
+    fn won(&self, won: *mut Generation<K, S, T>, key: K, state: S) -> Option<&T> {
+        self.get(won).filter(|won| won.key == key && won.state == state).map(|won| &won.value)
+    }
+
     /// Unlinks every generation, and drops those past their grace with the lock let go, as
     /// `replace` does.
     fn clear(&self) {
-        let mut slots = self.slots.lock();
+        let mut slots = blaze_graph::wait::lock(&self.slots, LOCK);
         for (hint, slot) in self.hints.iter().zip(&self.generations) {
             hint.store(EMPTY, Ordering::Release);
             if let Some(held) = NonNull::new(slot.swap(ptr::null_mut(), Ordering::AcqRel)) {
@@ -383,7 +417,9 @@ where
         // Each batch taken moves the limbo's head past it, so this ends once the limbo holds
         // none past its grace: at most its length over `PASSED` rounds.
         loop {
-            let passed = self.slots.lock().limbo.take_passed::<PASSED>();
+            let horizon = Horizon::now();
+            let passed =
+                blaze_graph::wait::lock(&self.slots, LOCK).limbo.take_passed::<PASSED>(horizon);
             if passed.is_empty() {
                 break;
             }
@@ -792,9 +828,8 @@ mod tests {
     static SLOW_DROPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static SLOW_OTHER_MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    /// Rounds a wait of this test yields before it gives up: under the bound of the table's
-    /// spin lock (`blaze_spin`'s `1 << 24`), so a drop under the lock fails here, naming it,
-    /// before the waiter's spin panics.
+    /// Rounds a wait of this test yields before it gives up: a drop under the table's lock
+    /// leaves the other thread parked on it, so the drop's wait fails here, naming it.
     const SLOW_ROUNDS: u32 = 1 << 22;
 
     /// Yields until `done`, at most `SLOW_ROUNDS` rounds; whether it was.
@@ -855,6 +890,137 @@ mod tests {
             }
         });
         assert!(SLOW_OTHER_MADE.load(Ordering::Acquire));
+    }
+
+    /// Runs the test `name` of this module alone, in a process of its own (this test binary,
+    /// asked for that one test with [`CHILD`] set), and fails with its output when it fails:
+    /// for a test that leaves the process changed for every test after it.
+    fn in_own_process(name: &str) {
+        let path = module_path!().split_once("::").map_or(module_path!(), |(_, rest)| rest);
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let out = std::process::Command::new(&exe)
+            .args([&format!("{path}::{name}"), "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap_or_else(|why| panic!("running {} for `{name}`: {why}", exe.display()));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        println!("{stdout}{stderr}");
+        // libtest's summary for exactly this one test: a filter that matched none says
+        // "0 passed" and exits 0. Under `blaze test` the fork server takes its socket's variable
+        // out of the environment before any test runs, and a run attached in process loses
+        // `BLAZE_INPROC` at its start hook, so this child is libtest's `main` either way.
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "`{name}` in its own process: {}\n{stdout}\n{stderr}",
+            out.status
+        );
+    }
+
+    /// Set in the process [`in_own_process`] runs a test in.
+    const CHILD: &str = "BLAZE_TLS_CACHE_TEST_CHILD";
+
+    /// T4 (v2-selfbuild2.md; the backtrace in /tmp/sb-printer/logs/spin-bt.txt): building
+    /// rustc_type_ir and hir-def, three workers' first use of an interner's cache waited on the
+    /// query table's lock for `1 << 24` spin rounds and panicked, while the rest of the build
+    /// went on taking that lock. Its holders were never stuck: each replace held it for
+    /// `take_passed`, whose binary search over the limbo asked `Grace::passed`, a scan of every
+    /// reclaim slot, at each step, and with a parked task pinning an old epoch no grace passes,
+    /// so the limbo only grows. A slot per parked task and a step per doubling of the limbo:
+    /// the lock was held for milliseconds by every new interner of 64 workers, and a waiter
+    /// that kept losing it spun out its bound.
+    ///
+    /// This parks `PARKED` tasks (as fibers waiting on keys carry their reclaim slots), fills
+    /// the limbo, and has `WORKERS` threads make a new key each, as every query that solves
+    /// does, until they made `KEYS` or `RUN` is over, whichever comes first. Every one must get
+    /// the table each time within `LONGEST`. The first parked task pins the epoch, so nothing
+    /// retired passes: `KEYS` keeps the run inside the pool however fast the machine is. Run in
+    /// a process of its own: the slots it adds stay in every later scan of the process.
+    #[test]
+    fn a_replace_holds_the_tables_lock_for_no_scan_of_the_parked_tasks() {
+        if std::env::var_os(CHILD).is_none() {
+            in_own_process("a_replace_holds_the_tables_lock_for_no_scan_of_the_parked_tasks");
+            return;
+        }
+        a_replace_holds_the_tables_lock_for_no_scan_of_the_parked_tasks_here();
+    }
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a stress test's wall-clock bound and its measure of the longest wait"
+    )]
+    fn a_replace_holds_the_tables_lock_for_no_scan_of_the_parked_tasks_here() {
+        use std::time::{Duration, Instant};
+
+        const PARKED: usize = 1 << 16;
+        const RETIRED: u32 = 1 << 16;
+        const WORKERS: usize = 16;
+        const KEYS: usize = 400_000;
+        const RUN: Duration = Duration::from_secs(20);
+        const LONGEST: Duration = Duration::from_secs(1);
+        const BITS: u32 = 9;
+        // Every key made retires a generation, and none passes: the filled limbo, the keys, the
+        // table's slots and the workers' last ones fit the pool, so the run never meets
+        // "pool full".
+        const _: () = assert!(RETIRED as usize + KEYS + (1 << BITS) + WORKERS < super::POOLED as usize);
+
+        let table = table::<std::sync::atomic::AtomicBool>(BITS);
+        // One task parked first pins the epoch every grace after it waits for.
+        let pin = |count: usize| -> Vec<std::num::NonZeroUsize> {
+            (0..count)
+                .map(|_| {
+                    let task = blaze_reclaim::enter();
+                    let parked = blaze_reclaim::park().expect("a thread in a task parks it");
+                    // The task went with its slot: this thread is in none, so no guard ends it.
+                    std::mem::forget(task);
+                    parked
+                })
+                .collect()
+        };
+        let mut parked = pin(1);
+        // A limbo long enough for its binary search to take 16 steps.
+        let filled = Instant::now();
+        let query = key();
+        for state in 0..RETIRED {
+            let task = blaze_reclaim::enter();
+            table.of(&task, query, state);
+        }
+        parked.extend(pin(PARKED - 1));
+        let filled = filled.elapsed();
+        println!("filled the limbo with {RETIRED} and parked {PARKED} tasks in {filled:?}");
+
+        let started = Instant::now();
+        let until = started + RUN;
+        let made = AtomicUsize::new(0);
+        let longest: Vec<Duration> = thread::scope(|scope| {
+            let workers: Vec<_> = (0..WORKERS)
+                .map(|_| {
+                    let (table, made) = (&table, &made);
+                    scope.spawn(move || {
+                        let mut longest = Duration::ZERO;
+                        while Instant::now() < until && made.fetch_add(1, Ordering::Relaxed) < KEYS {
+                            let task = blaze_reclaim::enter();
+                            let asked = Instant::now();
+                            table.of(&task, key(), 0);
+                            longest = longest.max(asked.elapsed());
+                        }
+                        longest
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|it| it.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+                .collect()
+        });
+        for slot in parked {
+            blaze_reclaim::end_parked(slot);
+        }
+        let worst = longest.iter().max().copied().unwrap_or_default();
+        let made = made.into_inner().min(KEYS);
+        let took = started.elapsed();
+        println!("{made} new keys by {WORKERS} threads in {took:?}; the longest wait {worst:?}");
+        assert!(worst < LONGEST, "a new key waited {worst:?} for the table, past {LONGEST:?}");
     }
 
     /// The cache before the table: per thread, the last `KEPT` queries' goals, all dropped

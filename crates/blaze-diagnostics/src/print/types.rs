@@ -15,7 +15,7 @@ use hir_ty::{
     GenericPredicates, ImplTraitId, InferBodyId, TyDefId,
     db::{InternedClosure, InternedOpaqueTyId},
     next_solver::{
-        Binder, BoundExistentialPredicates, CallableIdWrapper, Clause, ClauseKind,
+        AssocTyId, Binder, BoundExistentialPredicates, CallableIdWrapper, Clause, ClauseKind,
         ExistentialProjection, FnSig, GenericArg, GenericArgs, ParamTy, Region, RegionExt as _, TermId, TermKind,
         Term, TraitClause, TraitIdWrapper, TraitRef, Ty, TyKind, Tys,
     },
@@ -198,9 +198,14 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 }
             }
             TyKind::Alias(_, alias) => match alias.kind {
-                AliasTyKind::Projection { def_id } => {
-                    self.print_def_path(Def::TypeAlias(def_id.0), alias.args.as_slice())
-                }
+                AliasTyKind::Projection { def_id } => match def_id.0 {
+                    AssocTyId::TypeAliasId(it) => {
+                        self.print_def_path(Def::TypeAlias(it), alias.args.as_slice())
+                    }
+                    // rustc's `pretty_print_rpitit`: a trait method's `impl Trait` prints as
+                    // its bounds, whose arguments are its opaque type's.
+                    AssocTyId::RpititId(it) => self.print_opaque(it.opaque(self.db), alias.args),
+                },
                 AliasTyKind::Free { def_id } => {
                     self.print_def_path(Def::TypeAlias(def_id.0), alias.args.as_slice())
                 }
@@ -736,6 +741,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         let generic: GenericDefId = match item {
             TermId::TypeAliasId(it) => it.into(),
             TermId::ConstId(it) => it.into(),
+            TermId::RpititId(it) => it.function.into(),
         };
         let parent_count = hir_ty::generics::generics(self.db, generic).len_parent();
         let args = projection.args.as_slice();
@@ -765,6 +771,8 @@ fn term_name(cx: &Cx<'_, '_>, item: TermId) -> hir_expand::name::Name {
     let def = match item {
         TermId::TypeAliasId(it) => Def::TypeAlias(it),
         TermId::ConstId(it) => Def::Const(it),
+        // A trait method's `impl Trait`, which no `dyn` type binds, by its method.
+        TermId::RpititId(it) => Def::Function(it.function),
     };
     def.name(cx).expect("an associated item is named")
 }

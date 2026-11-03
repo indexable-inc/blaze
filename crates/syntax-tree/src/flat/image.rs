@@ -526,7 +526,7 @@ mod tests {
     }
 
     /// Reading a tree allocates its slots, not a copy of its columns: the stored bytes'
-    /// owner and one block (for the kept hashes), and for an outline its lazy nodes and slots,
+    /// owner (and one `Kept` block, for the kept hashes), and for an outline its lazy nodes and slots,
     /// and per parsed part its tree's two, the part and its errors.
     #[test]
     fn a_tree_reads_in_place() {
@@ -535,8 +535,8 @@ mod tests {
             let (bytes, at) = stored(&tree, 0);
             let (read, used) = blaze_alloc_count::measure(|| read(&tree, &bytes, at));
             let read = read.expect("a tree");
-            let block = usize::from(!read.kept.elements.is_empty());
-            assert_eq!(used.allocations as usize, 1 + block, "seed {seed}: {} bytes", used.bytes);
+            // The stored bytes' owner; the block (for the kept hashes) is `Kept`.
+            assert_eq!(used.allocations as usize, 1, "seed {seed}: {} bytes", used.bytes);
             assert!((used.bytes as usize) < 64 + read.kept.elements.len() * 16, "seed {seed}");
         }
     }

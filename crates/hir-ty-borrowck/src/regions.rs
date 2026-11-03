@@ -2088,7 +2088,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 let parts = mem::collect(
                     self.ctx.frame,
                     args.iter().filter_map(|it| {
-                        let field = fields.field(&it.name)?;
+                        let hygiene = self.ctx.store.record_field_hygiene(it.pat);
+                        let field = fields.field_written(self.ctx.db, variant, &it.name, hygiene)?;
                         Some((it.pat, types[field].ty().instantiate(interner, adt_args)))
                     }),
                 );
@@ -2466,8 +2467,12 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 }
             }
         }
+        // In the form `alias_outlives` looks them up in: regions erased, rigid or not alike.
         for ty in aliases.iter_mut() {
-            *ty = rustc_type_ir::fold_regions(interner, *ty, |_, _| Region::new_static(interner));
+            *ty = unrigid(
+                interner,
+                rustc_type_ir::fold_regions(interner, *ty, |_, _| Region::new_static(interner)),
+            );
         }
         self.env_aliases = aliases;
     }
@@ -3011,7 +3016,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                     }
                     let mut clauses = self.scratch.clauses.take();
                     clauses.extend(
-                        GenericPredicates::query_all(self.ctx.db, def_id.0.into())
+                        GenericPredicates::query_all(self.ctx.db, def_id.0.predicates_owner())
                             .iter_instantiated(self.interner(), alias.args.as_slice())
                             .map(|it| it.skip_norm_wip())
                             .filter(|it| {
@@ -4012,8 +4017,13 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         }
         let Some(rv) = self.region_rv(region) else { return };
         let interner = self.interner();
+        // Regions erased, and rigid or not alike: the solver marking the alias in the body
+        // rigid says nothing of which type it is, and the bounds name it as lowered.
         let erase = |ty: Ty<'db>| {
-            rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner))
+            unrigid(
+                interner,
+                rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner)),
+            )
         };
         let erased = erase(ty);
         let in_env = self.env_aliases.contains(&erased);
@@ -6325,7 +6335,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 continue;
             }
             let kind = rustc_type_ir::AliasTyKind::Projection {
-                def_id: hir_ty::next_solver::TraitAssocTyId(assoc),
+                def_id: hir_ty::next_solver::TraitAssocTyId::from(assoc),
             };
             let bounds = rustc_type_ir::Interner::item_bounds(interner, alias_def_id(kind));
             for clause in bounds.iter_instantiated(interner, trait_ref.args.as_slice()) {
@@ -7146,7 +7156,13 @@ fn elided_lifetimes(
         TypeRef::Array(it) => count(it.ty),
         TypeRef::Never | TypeRef::TypeParam(_) => Some(0),
         TypeRef::Path(path) => {
-            let params = match resolver.resolve_path_in_type_ns_fully(db, path)? {
+            let hygiene = store.type_path_hygiene(ty);
+            let (resolution, remaining, ..) =
+                resolver.resolve_path_in_type_ns_hygienic(db, path, hygiene)?;
+            if remaining.is_some() {
+                return None;
+            }
+            let params = match resolution {
                 TypeNs::AdtId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
                 TypeNs::TypeAliasId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
                 TypeNs::BuiltinType(_) | TypeNs::GenericParam(_) => 0,
@@ -7843,6 +7859,9 @@ mod dropped_bound_tests;
 
 #[cfg(test)]
 mod closure_bound_tests;
+
+#[cfg(test)]
+mod opaque_bound_tests;
 
 #[cfg(test)]
 mod tests {

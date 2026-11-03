@@ -461,7 +461,7 @@ fn open_disks(image: &Image<Mapping>) -> Result<Disks, DisksUnused> {
     let range = image.whole_range(&placed).map_err(DisksUnused::Corrupt)?;
     // clone: a count of the mapping, once per start.
     let section = Section::new(image.owner().clone(), range).ok_or(DisksUnused::Outside)?;
-    Disks::open(section).map_err(DisksUnused::Malformed)
+    Disks::open(&section).map_err(DisksUnused::Malformed)
 }
 
 #[cfg(test)]

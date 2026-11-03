@@ -94,7 +94,9 @@ rsasm = ["dep:rsasm"]
 # The LLVM producer of wasm32 code (`llvm.rs` `Machine::create_for`), for an LLVM built with
 # the WebAssembly target; the pinned one (llvm.json) is not yet.
 llvm-wasm = ["llvm", "inkwell/target-webassembly"]
-# The compiler as a WebAssembly module itself: see `crates/blaze-wasm`.
+# The compiler as a WebAssembly module itself: see `crates/blaze-wasm`. It decides only what is
+# about that program, where it runs (`Target::host`) and that it links what it compiles into the
+# page's table (`Target::calls`), never anything of a target's code (`target.rs` tests).
 wasm = []
 
 [lints]

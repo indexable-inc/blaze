@@ -426,16 +426,6 @@ fn function_name(db: &Db, func: FunctionId, args: GenericArgs<'_>) -> String {
         .unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned())
 }
 
-pub(crate) fn crate_name(db: &Db, krate: Crate) -> String {
-    // alloc: the name of a static or a message; a lookup compares `crate_name_str`
-    crate_name_str(db, krate).to_owned()
-}
-
-/// [`crate_name`], borrowed.
-fn crate_name_str(db: &Db, krate: Crate) -> &str {
-    krate.extra_data(db).display_name.as_ref().map_or("?", |it| it.as_str())
-}
-
 /// What the walk goes through: the functions and statics compiled, and what has no code of
 /// ours, by its name.
 #[derive(PartialEq, Eq, Hash)]
@@ -817,7 +807,7 @@ impl<'db> Walk<'db> {
                 let ItemContainerId::ImplId(id) = func.lookup(db).container else { return false };
                 hasher_of(db, db.impl_self_ty(id).skip_binder()).is_some()
             }
-            base_db::CrateOrigin::Lang(_) => crate_name_str(db, krate) == "hashbrown",
+            base_db::CrateOrigin::Lang(_) => krate.rust_name(db).is_ok_and(|it| it.as_str() == "hashbrown"),
             _ => false,
         }
     }
@@ -1340,7 +1330,7 @@ pub(crate) fn static_name(db: &Db, id: StaticId) -> String {
         }
     }
     // alloc: a static's name, a leaf's key or what a message says
-    let mut path = String::from(crate_name_str(db, id.krate(db)));
+    let mut path = id.krate(db).named(db).to_string();
     for name in modules.iter().rev() {
         path.push_str("::");
         path.push_str(name.as_str());

@@ -493,7 +493,7 @@ fn none<'a, 'b>(_: &'a u8, _: &'b u8) -> impl Sized + use<> {}
             .expect("`Tr` has `A`");
         let of_projection = opt_alias_variances(
             interner,
-            AliasTermKind::ProjectionTy { def_id: TraitAssocTyId(assoc) },
+            AliasTermKind::ProjectionTy { def_id: TraitAssocTyId::from(assoc) },
         );
         assert_eq!(of_projection, None);
     }

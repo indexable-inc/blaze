@@ -40,7 +40,7 @@ use crate::{
     item_tree::{ImportAlias, ImportKind},
     nameres::{
         BuildingScope, BuiltinShadowMode, DefMap, DiagnosticsByModule, LocalDefMap, ModuleData,
-        ModuleOrigin, ModuleScope, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot,
+        ModuleOrigin, ModuleScope, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot, def_site,
         diagnostics::DefDiagnostic,
         path_resolution::{PathRead, ReachedFixedPoint, ResolvePathResult},
         trait_items::trait_item_per_ns,
@@ -755,7 +755,8 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
         let mut reads = |read: PathRead| match read {
             PathRead::Slot(module, name) if local_to(module) => {
                 if held(db, check, upstream, module, path, importer) {
-                    let ns = if Some(name) == last { ALL_NS } else { TYPES };
+                    // A segment may be read keyed (`def_site`): the last one by its text.
+                    let ns = if Some(name.unkeyed()) == last { ALL_NS } else { TYPES };
                     keys.push((WaitOn::Slot(module, name), ns));
                 }
             }
@@ -878,6 +879,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
         // clone: a `RawVisibility` is a `Copy` path and a tag.
         let raw_vis = directive.op.visibility.clone();
         let source = directive.op.source;
+        let key = directive.op.key;
         // clone: an `ImportAlias` is a tag and a `Copy` name.
         let alias = directive.op.alias.clone();
         let path = directive.op.path;
@@ -899,6 +901,8 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                         }
                     },
                 };
+                // A name a `macro` wrote binds a key of its own (`def_site`).
+                let name = name.map(|it| key.map_or(it, |key| it.keyed(key)));
 
                 if kind == ImportKind::TypeOnly {
                     def.values = None;
@@ -950,7 +954,12 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                         } else if m.krate(self.db) != self.def_map.krate {
                             cov_mark::hit!(glob_across_crates);
                             // glob import from other crate => we can just import everything once
-                            let scope = &m.def_map(self.db).module(self.db, m).scope(self.db);
+                            let db = self.db;
+                            let source_map = m.def_map(db);
+                            let scope = &source_map.module(db, m).scope(db);
+                            // Each name as the glob binds it (`def_site::glob_imported_name`).
+                            let expn = source_map.module_expansion(db, m);
+                            let glob_ctxt = def_site::glob_context(db, glob);
 
                             // Module scoped macros is included
                             let start = self.held.len();
@@ -958,8 +967,12 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                                 scope
                                     .resolutions()
                                     // only keep visible names...
-                                    .map(|(n, res)| {
-                                        (n, res.filter_visibility(|v| v.is_visible_from_other_crate()))
+                                    .filter_map(|(n, res)| {
+                                        let n = match n {
+                                            Some(n) => Some(def_site::glob_imported_name(db, n, expn, glob_ctxt)?),
+                                            None => None,
+                                        };
+                                        Some((n, res.filter_visibility(|v| v.is_visible_from_other_crate())))
                                     })
                                     .filter(|(_, res)| !res.is_none()),
                             );
@@ -1061,11 +1074,16 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     /// What a glob of `importer` takes of `source`, a module of this crate's map: every name of
     /// its scope as it is now that `importer` can see, with the glob's visibility.
     fn pull_glob(&mut self, source: ModuleId, importer: ModuleId, vis: Visibility, glob: GlobId) {
-        let scope = if source.block(self.db) == self.def_map.block_id() {
-            self.def_map.module(self.db, source).scope(self.db)
+        let db = self.db;
+        let source_map = if source.block(db) == self.def_map.block_id() {
+            &self.def_map
         } else {
-            source.def_map(self.db).module(self.db, source).scope(self.db)
+            source.def_map(db)
         };
+        let scope = source_map.module(db, source).scope(db);
+        // Each name as the glob binds it (`def_site::glob_imported_name`).
+        let expn = source_map.module_expansion(db, source);
+        let glob_ctxt = def_site::glob_context(db, glob);
 
         // Module scoped macros is included
         let start = self.held.len();
@@ -1073,13 +1091,17 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             scope
                 .resolutions()
                 // only keep visible names...
-                .map(|(n, res)| {
-                    (
+                .filter_map(|(n, res)| {
+                    let n = match n {
+                        Some(n) => Some(def_site::glob_imported_name(db, n, expn, glob_ctxt)?),
+                        None => None,
+                    };
+                    Some((
                         n,
                         res.filter_visibility(|v| {
-                            v.is_visible_from_def_map(self.db, &self.def_map, importer)
+                            v.is_visible_from_def_map(db, &self.def_map, importer)
                         }),
-                    )
+                    ))
                 })
                 .filter(|(_, res)| !res.is_none()),
         );
@@ -1237,6 +1259,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             self.held.push((name, res));
         }
         let resolutions = held..self.held.len();
+        let expn = self.def_map.module_expansion(self.db, module_id);
 
         // Propagating adds no glob edge, so the list read as it goes is the list as it was.
         let mut edge = first_edge;
@@ -1252,9 +1275,18 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             // Each name is held at the narrower of the import's visibility and its own, so the
             // importer takes only the names whose own visibility it sees, as `pull_glob` does.
             let from = self.held.len();
+            let glob_ctxt = def_site::glob_context(self.db, glob);
             // clone: a `Range` of two indices.
             for at in resolutions.clone() {
                 let (name, res) = self.held[at];
+                // The name as this importer's glob binds it (`def_site::glob_imported_name`).
+                let name = match name {
+                    Some(name) => match def_site::glob_imported_name(self.db, name, expn, glob_ctxt) {
+                        Some(it) => Some(it),
+                        None => continue,
+                    },
+                    None => None,
+                };
                 let res = res.filter_visibility(|it| it.is_visible_from_def_map(self.db, &self.def_map, importer));
                 if !res.is_none() {
                     self.held.push((name, res));

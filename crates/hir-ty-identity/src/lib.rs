@@ -372,16 +372,6 @@ pub(crate) fn name_of(db: &Db, subject: Subject) -> String {
     }
 }
 
-/// A crate as an error names it: its name, or, for one with none, its content key
-/// ([`key::crate_key`]), never the database's id, which is no content and would put a number of
-/// one process into a key or a binary (an error's text is written into both).
-pub(crate) fn crate_named(db: &Db, krate: base_db::Crate) -> String {
-    match krate.extra_data(db).display_name.as_ref() {
-        Some(name) => name.to_string(),
-        None => format!("the unnamed crate {}", key::crate_key(db, krate)), // alloc: an error's name
-    }
-}
-
 fn item_path(db: &Db, def: DefWithBodyId) -> String {
     format!("`{}`", key::path(db, ItemId::of_body(db, def))) // alloc: an error's name
 }

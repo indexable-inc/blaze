@@ -46,7 +46,7 @@
 //! be leased (review C8).
 
 use std::{
-    fs::{File, OpenOptions, TryLockError},
+    fs::{File, OpenOptions},
     io::{Read as _, Seek as _, Write as _},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -54,6 +54,7 @@ use std::{
 };
 
 use crossbeam_queue::SegQueue;
+use stdx::file_lock::Locked;
 
 /// The lease's file in its directory.
 pub const LEASE: &str = ".blaze-lease";
@@ -122,7 +123,7 @@ pub fn releases() -> u64 {
 /// long as the file is kept, its holder `holder` (`blaze serve pid 123`) written into it:
 /// `Err(holder)` while another collector holds it, whose area this one then leaves alone,
 /// naming who holds it ([`collector_holder`], review N15).
-pub fn collector_lock(area: &Path, holder: &str) -> Result<Result<File, String>, String> {
+pub fn collector_lock(area: &Path, holder: &str) -> Result<Result<Locked, String>, String> {
     std::fs::create_dir_all(area).map_err(|error| format!("making {}: {error}", area.display()))?;
     let path = area.join(COLLECTOR);
     let file = OpenOptions::new()
@@ -132,12 +133,11 @@ pub fn collector_lock(area: &Path, holder: &str) -> Result<Result<File, String>,
         .truncate(false)
         .open(&path)
         .map_err(|error| format!("opening {}: {error}", path.display()))?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(Err(collector_holder(area))),
-        Err(TryLockError::Error(error)) => return Err(format!("locking {}: {error}", path.display())),
-    }
-    let mut file = file;
+    let mut file = match Locked::try_lock(file) {
+        Ok(Ok(file)) => file,
+        Ok(Err(_held)) => return Ok(Err(collector_holder(area))),
+        Err(error) => return Err(format!("locking {}: {error}", path.display())),
+    };
     let failed = |error: std::io::Error| format!("writing {}'s holder: {error}", path.display());
     file.set_len(0).map_err(failed)?;
     file.rewind().map_err(failed)?;
@@ -175,10 +175,11 @@ pub fn take_used() -> Option<PathBuf> {
     USED.pop()
 }
 
-/// A shared lock on a directory's lease, held until dropped.
+/// A shared lock on a directory's lease, held until dropped: let go of then even while a child
+/// another thread spawns still has the file open ([`Locked`]).
 #[derive(Debug)]
 pub struct Lease {
-    _file: File,
+    _file: Locked,
     dir: PathBuf,
 }
 
@@ -199,15 +200,15 @@ impl Lease {
         let mut short = None;
         while attempts < ATTEMPTS {
             std::fs::create_dir_all(dir).map_err(|error| format!("making {}: {error}", dir.display()))?;
-            let Some(mut file) = open_or_make(dir)? else {
+            let Some(file) = open_or_make(dir)? else {
                 attempts += 1;
                 continue;
             };
-            if !lock_shared(&mut file, dir)? {
+            let Some(mut file) = lock_shared(file, dir)? else {
                 // Renamed away while it waited: made afresh.
                 attempts += 1;
                 continue;
-            }
+            };
             match verified(&mut file, dir)? {
                 Check::Own => return Ok(Lease::new(file, dir)),
                 // Collected, and maybe made again, between the open and the lock.
@@ -237,12 +238,12 @@ impl Lease {
         }
         for _ in 0..ATTEMPTS {
             std::fs::create_dir_all(dir).map_err(|error| format!("making {}: {error}", dir.display()))?;
-            let Some(mut file) = open_or_make(dir)? else { continue };
-            match file.try_lock_shared() {
-                Ok(()) => {}
-                Err(TryLockError::WouldBlock) => return Ok(Err(Wait::Busy)),
-                Err(TryLockError::Error(error)) => return Err(format!("locking {}: {error}", lease_of(dir).display())),
-            }
+            let Some(file) = open_or_make(dir)? else { continue };
+            let mut file = match Locked::try_lock_shared(file) {
+                Ok(Ok(file)) => file,
+                Ok(Err(_held)) => return Ok(Err(Wait::Busy)),
+                Err(error) => return Err(format!("locking {}: {error}", lease_of(dir).display())),
+            };
             match verified(&mut file, dir)? {
                 Check::Own => return Ok(Ok(Lease::new(file, dir))),
                 Check::NotOwn => {}
@@ -263,7 +264,7 @@ impl Lease {
         ))
     }
 
-    fn new(file: File, dir: &Path) -> Lease {
+    fn new(file: Locked, dir: &Path) -> Lease {
         Lease { _file: file, dir: dir.to_path_buf() }
     }
 
@@ -278,23 +279,23 @@ impl Drop for Lease {
     }
 }
 
-/// The shared lock on `file`, `dir`'s lease, waiting at most [`SHARED_WAIT`]: `false` when,
+/// The shared lock on `file`, `dir`'s lease, waiting at most [`SHARED_WAIT`]: `None` when,
 /// while it waited, the file stopped being `dir`'s lease (the collector renamed the directory),
 /// so the caller makes it afresh rather than wait out the bound. For a thread that may wait (the
 /// daemon's start); a pool thread takes [`Lease::try_hold`].
 #[allow(clippy::disallowed_methods, reason = "a bounded wait on another process's lock, which has no wake to park on")]
-fn lock_shared(file: &mut File, dir: &Path) -> Result<bool, String> {
+fn lock_shared(mut file: File, dir: &Path) -> Result<Option<Locked>, String> {
     let _span = tracing::info_span!(target: "blaze", "waits on the gc lease", dir = %dir.display()).entered();
     let until = Instant::now() + SHARED_WAIT;
     let mut spin = blaze_spin::SpinWait::new();
     loop {
-        match file.try_lock_shared() {
-            Ok(()) => return Ok(true),
-            Err(TryLockError::WouldBlock) => {}
-            Err(TryLockError::Error(error)) => return Err(format!("locking {}: {error}", lease_of(dir).display())),
+        match Locked::try_lock_shared(file) {
+            Ok(Ok(locked)) => return Ok(Some(locked)),
+            Ok(Err(back)) => file = back,
+            Err(error) => return Err(format!("locking {}: {error}", lease_of(dir).display())),
         }
-        if !same_file(file, dir)? {
-            return Ok(false);
+        if !same_file(&file, dir)? {
+            return Ok(None);
         }
         if Instant::now() >= until {
             return Err(format!(
@@ -353,17 +354,16 @@ fn whole_nonce(file: &mut File, dir: &Path) -> Result<Option<String>, String> {
 /// not abandoned yet.
 fn repair(dir: &Path) -> Result<bool, String> {
     let path = lease_of(dir);
-    let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
+    let file = match OpenOptions::new().read(true).write(true).open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(format!("opening {}: {error}", path.display())),
     };
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(false),
-        Err(TryLockError::Error(error)) => return Err(format!("locking {}: {error}", path.display())),
+    match Locked::try_lock(file) {
+        Ok(Ok(mut file)) => rewrite_abandoned(&mut file, dir),
+        Ok(Err(_held)) => Ok(false),
+        Err(error) => Err(format!("locking {}: {error}", path.display())),
     }
-    rewrite_abandoned(&mut file, dir)
 }
 
 /// With `dir`'s lease held exclusively (by `file` or another handle of this process), writes a
@@ -503,8 +503,8 @@ fn nonce() -> String {
 #[derive(Debug)]
 pub enum Taken {
     /// Taken, and verified to be the directory's own: no one uses the directory while this is
-    /// held.
-    Exclusive(File),
+    /// held, and it is let go of when dropped ([`Locked`]).
+    Exclusive(Locked),
     /// Someone holds it shared.
     Held,
     /// The lease locked is no longer the directory's ([`verified`]): it was renamed away, and
@@ -517,16 +517,17 @@ pub enum Taken {
 /// Takes `dir`'s lease exclusively, never waiting, and checks it is still `dir`'s.
 pub fn take_exclusive(dir: &Path) -> Result<Taken, String> {
     let path = lease_of(dir);
-    let mut file = match File::open(&path) {
+    let file = match File::open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Taken::Missing),
         Err(error) => return Err(format!("opening {}: {error}", path.display())),
     };
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(Taken::Held),
-        Err(TryLockError::Error(error)) => return Err(format!("locking {}: {error}", path.display())),
-    }
+    // Locked from here: the probe's lock ([`held`]) and one that moved are let go of as they drop.
+    let mut file = match Locked::try_lock(file) {
+        Ok(Ok(file)) => file,
+        Ok(Err(_held)) => return Ok(Taken::Held),
+        Err(error) => return Err(format!("locking {}: {error}", path.display())),
+    };
     match verified(&mut file, dir)? {
         Check::Own => Ok(Taken::Exclusive(file)),
         Check::NotOwn => Ok(Taken::Moved),

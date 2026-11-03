@@ -222,8 +222,8 @@ fn fields_of(db: &Db, item: ItemId) -> Option<ContentId> {
                 variant_names(db, &mut h, variant.into());
             }
         }
-        ItemId::Trait(it) => member_names(&mut h, &it.trait_items(db).items),
-        ItemId::Impl(it) => member_names(&mut h, &it.impl_items(db).items),
+        ItemId::Trait(it) => member_names(db, &mut h, &it.trait_items(db).items),
+        ItemId::Impl(it) => member_names(db, &mut h, &it.impl_items(db).items),
         ItemId::Function(_)
         | ItemId::Const(_)
         | ItemId::Static(_)
@@ -233,25 +233,31 @@ fn fields_of(db: &Db, item: ItemId) -> Option<ContentId> {
     Some(h.finish())
 }
 
-/// A variant's field names in order, and whether each has a default (`field: T = value`),
-/// which a struct expression's `..` reads.
+/// A variant's field names in order, whether each has a default (`field: T = value`), which a
+/// struct expression's `..` reads, and whether each is keyed by a `macro`'s context (which a
+/// field's lookup compares). The key's context is this process's, so only that it has one is
+/// hashed; which `macro` wrote it is of the signature's hash.
 fn variant_names(db: &Db, h: &mut Hasher, variant: VariantId) {
     let fields = variant.fields(db).fields();
     h.update(&(fields.len() as u64).to_le_bytes());
     for (_, field) in fields.iter() {
-        h.part(field.name.as_str().as_bytes()).update(&[field.default_value.is_some() as u8]);
+        let flags = field.default_value.is_some() as u8 | (field.name.key().is_some() as u8) << 1;
+        h.part(field.name.as_str().as_bytes()).update(&[flags]);
     }
 }
 
-fn member_names(h: &mut Hasher, items: &[(Name, AssocItemId)]) {
+/// An impl's or trait's items in order: the kind, the name and, as of a field, whether the
+/// name is keyed (`hir_def::nameres::assoc_item_key`), which a method call's lookup compares.
+fn member_names(db: &Db, h: &mut Hasher, items: &[(Name, AssocItemId)]) {
     h.update(&(items.len() as u64).to_le_bytes());
-    for (name, item) in items {
+    for &(name, item) in items {
         let kind = match item {
             AssocItemId::FunctionId(_) => 0u8,
             AssocItemId::ConstId(_) => 1,
             AssocItemId::TypeAliasId(_) => 2,
         };
-        h.update(&[kind]).part(name.as_str().as_bytes());
+        let keyed = (hir_def::nameres::assoc_item_key(db, item).is_some() as u8) << 2;
+        h.update(&[kind | keyed]).part(name.as_str().as_bytes());
     }
 }
 

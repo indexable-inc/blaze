@@ -280,7 +280,7 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
         }
         diagnostic.child(
             Sublevel::Note,
-            text!(self, "if `{def:?}` implemented `Clone`, you could clone the value"),
+            text!(self, "if `{}` implemented `Clone`, you could clone the value", self.ctx.shown_adt(adt)),
             &[PartSpan::Def(adt)],
             &[
                 (PartSpan::Def(adt), "consider implementing `Clone` for this type"),
@@ -503,11 +503,13 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
         let label = match self.describe(borrowed) {
             Some(borrowed) => text!(
                 self,
-                "here, drop of {what} needs exclusive access to `{borrowed}`, because the type `{dropped:?}` implements the `Drop` trait"
+                "here, drop of {what} needs exclusive access to `{borrowed}`, because the type `{}` implements the `Drop` trait",
+                self.ctx.shown_ty(&dropped)
             ),
             None => text!(
                 self,
-                "here is drop of {what}; whose type `{dropped:?}` implements the `Drop` trait"
+                "here is drop of {what}; whose type `{}` implements the `Drop` trait",
+                self.ctx.shown_ty(&dropped)
             ),
         };
         diagnostic.label(PartSpan::At(drop), label);
@@ -635,6 +637,7 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
                 true => self.ctx.bindings.get(&place.local).copied(),
                 false => None,
             };
+            let ty = text!(self, "{}", self.ctx.shown_ty(&ty));
             type_no_copy(diagnostic, binding, partial, self.quoted(place, "value"), ty);
         }
     }
@@ -702,12 +705,12 @@ pub(super) fn type_no_copy<'f>(
     binding: Option<hir_def::hir::BindingId>,
     partial: bool,
     place: &str,
-    ty: Ty<'_>,
+    ty: &str,
 ) {
     let what = if partial { "partial move" } else { "move" };
     let text = text!(
         diagnostic,
-        "{what} occurs because {place} has type `{ty:?}`, which does not implement the `Copy` trait"
+        "{what} occurs because {place} has type `{ty}`, which does not implement the `Copy` trait"
     );
     match binding {
         Some(binding) => diagnostic.label(PartSpan::At(MirSpan::BindingId(binding)), text),

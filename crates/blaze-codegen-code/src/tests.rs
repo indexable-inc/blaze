@@ -240,14 +240,13 @@ fn the_stencils_are_inputs_by_their_pin_and_the_seed_keys_no_llvm() {
 
     let mut seed = env();
     seed.vars.insert(SEED_FEATURE.to_owned(), Some(String::new()));
-    // Neither is read in the seed: no LLVM is checked, and the bytes are blaze-stencil's to check.
+    // No LLVM is read in the seed; the stencil libraries are blaze-stencil's committed files,
+    // keyed by the pin as in every build.
     seed.llvm_prefix = Some(workspace.above().join("no-llvm").to_str().unwrap().to_owned());
-    seed.stencils_dir = Some("/prebuilt".to_owned());
     let worked = work_out(&workspace.read().unwrap(), &seed).expect("the seed checks no LLVM prefix");
     assert!(of_kind(&worked, "llvm").is_empty(), "{}", worked.listing());
     assert!(!worked.rerun_env.iter().any(|it| it == LLVM_PREFIX));
     assert!(worked.llvm_prefix.is_none());
-    assert_eq!(worked.stencils_dir.as_deref(), Some(Path::new("/prebuilt")));
     assert_eq!(of_kind(&worked, "stencils"), of_kind(&repinned, "stencils"));
 
     workspace.write("crates/blaze-stencil/stencils.json", "{ \"x86_64.stencils\": \"44\" }\n");

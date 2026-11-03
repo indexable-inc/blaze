@@ -95,7 +95,14 @@ impl Stack {
             debug_assert_ne!(pair[0], NONE);
             links.link(pair[0]).store(pair[1], Ordering::Relaxed);
         }
-        debug_assert_ne!(last, NONE);
+        self.push_chain(items[0], last, links);
+    }
+
+    /// Pushes the chain from `first` to `last` with one compare-and-swap, `first` on top: items
+    /// none on any stack, held by the caller alone, each linked to the next through `links`
+    /// already (`last`'s link is set here).
+    pub(crate) fn push_chain(&self, first: u32, last: u32, links: &impl Links) {
+        debug_assert!(first != NONE && last != NONE);
         let link = links.link(last);
         let mut head = self.head.load(Ordering::Relaxed);
         loop {
@@ -103,7 +110,7 @@ impl Stack {
             // Release: as for `push`, for every item of the chain.
             match self.head.compare_exchange_weak(
                 head,
-                pack(tag(head).wrapping_add(1), items[0]),
+                pack(tag(head).wrapping_add(1), first),
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {

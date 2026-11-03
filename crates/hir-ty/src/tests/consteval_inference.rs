@@ -161,7 +161,7 @@ fn the_consteval_constants_infer_with_no_error() {
     let mut failed = String::new();
     for (what, text) in FIXTURES {
         let db = fixture::db(text).into_db();
-        crate::next_solver::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let mut owners = Vec::new();
             for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
                 for def in module.scope(&db).declarations() {

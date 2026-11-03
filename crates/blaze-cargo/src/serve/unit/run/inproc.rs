@@ -9,14 +9,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use blaze_codegen::plan::{Mode as BuildMode, Policy};
+use blaze_codegen::plan::Policy;
 use blaze_core::Command;
 use blaze_hash::SharedMap;
 use blaze_ids::ContentId;
 use blaze_inproc::frame::{Frame, Kind, kinds};
 use blaze_inproc::host::{self, Host, Program, Session, Started};
 use blaze_inproc::{CodeMemory, CodeRange, Format};
-use blaze_lazy::Purpose;
 use blaze_link::{DevRun, Image, Staged};
 use blaze_live::patch::{Answer, Message, MessageView};
 use blaze_units::schema::Mode;
@@ -71,9 +70,7 @@ pub(crate) fn runs_in_process(job: &Job, unit: usize, policy: &Policy) -> Result
     if Format::host().is_none() || codegen::triple(job, u) != job.input.config.host {
         return Ok(false);
     }
-    // clone: once per unit's policy, a few hundred bytes
-    let live = Policy { mode: BuildMode::Live, ..policy.clone() };
-    if blaze_lazy::allow(&Purpose { profile: &u.profile.name, policy: &live, output: None }).is_err() {
+    if super::allows_live(&u.profile.name, policy).is_err() {
         return Ok(false);
     }
     for dep in job.graph.closure(unit as u32).into_iter().skip(1) {

@@ -478,9 +478,15 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     steps_left: u64,
     /// The most bytes of stack and heap together the evaluation has held.
     memory_peak: u64,
-    /// [`Self::steps_left`] once [`LINT_TERMINATOR_LIMIT`] steps are spent, when the evaluation
-    /// is of a constant's or static's initializer; `u64::MAX`, which it never is, otherwise.
-    lint_mark: u64,
+    /// The steps of `long_running_const_eval` spent, counted only in the evaluation of a
+    /// constant's or static's initializer ([`Self::limits_frames`]), which the lint is of; it
+    /// fires at [`LINT_TERMINATOR_LIMIT`]. A step is a run of a block rustc counts
+    /// ([`ctfe_limit`](super::ctfe_limit)): a call or a loop's back edge, not every block
+    /// [`Self::steps_left`] counts.
+    lint_steps: u64,
+    /// [`ctfe_limit::counted_blocks`](super::ctfe_limit::counted_blocks) of each body run in
+    /// an evaluation the lint is of, by the body's address.
+    counted_blocks: HashMap<usize, Arc<[u64]>, std::alloc::Global>,
     /// The `-C overflow-checks` of the crate a run's code is compiled as, which a body that
     /// inherits its checks takes ([`Self::set_inherited_overflow_checks`]). Unset, such a body
     /// checks, as a constant's evaluation does.
@@ -727,15 +733,6 @@ type Result<'db, T> = std::result::Result<T, MirEvalError<'db>>;
 /// (`rustc_const_eval`'s `LINT_TERMINATOR_LIMIT`).
 pub const LINT_TERMINATOR_LIMIT: u64 = 2_000_000;
 
-/// [`Evaluator::lint_mark`] of an evaluation with `steps` of budget: only a constant's or
-/// static's initializer (`limits_frames`) is const evaluation, which the lint is of.
-fn lint_mark(limits_frames: bool, steps: u64) -> u64 {
-    match steps.checked_sub(LINT_TERMINATOR_LIMIT) {
-        Some(mark) if limits_frames => mark,
-        _ => u64::MAX,
-    }
-}
-
 #[derive(Debug)]
 struct Locals<'db> {
     ptr: ArenaMap<LocalId, Interval>,
@@ -763,6 +760,20 @@ pub fn interpret_mir<'db>(
     body: &'db MirBody<'db>,
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<'db, (Result<'db, Allocation<'db>>, MirOutput)> {
+    // What an evaluation spent, over its runs: `blocks` of the budget (every block run) and
+    // `steps` of `long_running_const_eval` (the calls and loop turns rustc counts, 2,000,000 at
+    // most without an `#[allow]`), so a profile says which constant took the time and in which
+    // unit it would hit a limit.
+    let span = tracing::info_span!(
+        target: "blaze",
+        "const eval",
+        body = %evaluated(db, body.owner),
+        blocks = tracing::field::Empty,
+        steps = tracing::field::Empty,
+        runs = tracing::field::Empty,
+    )
+    .entered();
+    let (mut blocks, mut steps, mut runs) = (0u64, 0u64, 0u32);
     let ty = body.locals[return_slot()].ty.as_ref();
     let mut read_statics = HashSet::new_in(std::alloc::Global);
     loop {
@@ -776,12 +787,16 @@ pub fn interpret_mir<'db>(
         // The evaluator only asks of it, so it comes back as it went in.
         evaluator.read_statics = Some(mem::take(&mut read_statics));
         let it = evaluator.evaluate(body, ty);
+        blocks += evaluator.budget.steps - evaluator.steps_left;
+        steps += evaluator.lint_steps;
+        runs += 1;
         read_statics = evaluator.read_statics.take().unwrap_or_default();
         if let Some(read) = evaluator.missing_static.take()
             && read_statics.insert(read)
         {
             continue;
         }
+        span.record("blocks", blocks).record("steps", steps).record("runs", runs);
         return Ok((it, MirOutput { stdout: evaluator.stdout, stderr: evaluator.stderr }));
     }
 }
@@ -1009,7 +1024,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             budget,
             steps_left: budget.steps,
             memory_peak: 0,
-            lint_mark: lint_mark(limits_frames, budget.steps),
+            lint_steps: 0,
+            counted_blocks: HashMap::new_in(std::alloc::Global),
             inherited_overflow_checks: None,
             layout_cache: RefCell::new(Default::default()),
             projected_ty_cache: RefCell::new(Default::default()),
@@ -1389,19 +1405,26 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
     }
 
+    /// A step of `long_running_const_eval` in an evaluation the lint is of, in `current`, the
+    /// body running: [`Self::long_running`] once it is the [`LINT_TERMINATOR_LIMIT`]th.
+    fn lint_step(&mut self, current: InferBodyId<'db>) -> Result<'db, ()> {
+        self.lint_steps += 1;
+        if self.lint_steps == LINT_TERMINATOR_LIMIT { self.long_running(current) } else { Ok(()) }
+    }
+
     /// rustc's `long_running_const_eval` once [`LINT_TERMINATOR_LIMIT`] steps are spent (its
-    /// `increment_const_eval_counter`), at the level in force where the outermost frame of a
-    /// body of the evaluation's crate is (`best_lint_scope`), or at the crate's root when no
-    /// frame is of it. An error level stops the evaluation; any other goes on.
+    /// `increment_const_eval_counter` at each `ConstEvalCounter`, [`ctfe_limit`](super::ctfe_limit)),
+    /// at the level in force where the outermost frame of a body of the evaluation's crate is
+    /// (`best_lint_scope`), or at the crate's root when no frame is of it. An error level stops the evaluation; any other goes on.
     #[cold]
-    fn long_running(&self, current: &StackFrame<'db>) -> Result<'db, ()> {
+    fn long_running(&self, current: InferBodyId<'db>) -> Result<'db, ()> {
         let db = self.db;
         let lint = LintId::LONG_RUNNING_CONST_EVAL;
         let local = self
             .code_stack
             .iter()
-            .chain(std::iter::once(current))
             .map(|frame| frame.locals.body.owner)
+            .chain(std::iter::once(current))
             .find(|owner| owner.module(db).krate(db) == self.crate_id);
         let level = match local {
             Some(InferBodyId::DefWithBodyId(owner)) => hir_lint_levels::lint_level(db, owner, lint),
@@ -1424,17 +1447,22 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         block: &mut BasicBlockId,
     ) -> std::result::Result<Ran<'db>, Raised<'db>> {
         let body = frame.locals.body;
+        // Looked up once per run of the frame (a call or a return ends it), and only in an
+        // evaluation the lint is of.
+        let counted = self.limits_frames.then(|| self.counted_blocks(body));
         loop {
             let current_block = &body.basic_blocks[*block];
             if let Some(it) = self.steps_left.checked_sub(1) {
                 self.steps_left = it;
-                if it == self.lint_mark {
-                    self.long_running(frame).map_err(|error| Raised { error, statement: None })?;
-                }
             } else {
                 let error =
                     MirEvalError::OverBudget { spent: Budget::Steps(self.budget.steps), at: None };
                 return Err(Raised { error, statement: None });
+            }
+            if let Some(counted) = &counted
+                && super::ctfe_limit::counts(counted, *block)
+            {
+                self.lint_step(body.owner).map_err(|error| Raised { error, statement: None })?;
             }
             for (i, statement) in current_block.statements.iter().enumerate() {
                 self.exec_statement(statement, &mut frame.locals)
@@ -1964,6 +1992,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.stack_allocations[i].tracked = live;
         locals.ptr.insert(local, Interval { addr: self.with_prov(interval.addr, prov), ..interval });
         Ok(())
+    }
+
+    /// The blocks of `body` that are steps of `long_running_const_eval`, made once per body.
+    fn counted_blocks(&mut self, body: &'db MirBody<'db>) -> Arc<[u64]> {
+        let key = std::ptr::from_ref(body) as usize;
+        // clone: an `Arc`
+        self.counted_blocks
+            .entry(key)
+            // alloc: once per body an evaluation runs, reused for each of its calls
+            .or_insert_with(|| super::ctfe_limit::counted_blocks(body).into())
+            .clone()
     }
 
     /// The locals of `body` with storage statements, which are live only from a `StorageLive`.
@@ -5648,7 +5687,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 Either::Right((impl_, method)) => {
                     let derive = impl_.loc(self.db).trait_.name();
                     let self_ty = generic_args.as_slice().first().copied();
-                    let shown = crate::attach_db(self.db, || format!("{self_ty:?}")); // alloc: error path
+                    let shown = blaze_query::db::attach(self.db, || format!("{self_ty:?}")); // alloc: error path
                     not_supported!(
                         "`{}::{}` of `{shown}`, which `#[derive({})]` implements: builtin derives \
                          are recorded unexpanded in this database, so the method has no body",

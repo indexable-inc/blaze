@@ -1095,6 +1095,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             .ok_or_else(|| MirLowerError::UnresolvedName {
                                 owner: self.owner.expression_store_owner(self.db),
                                 path: p.mod_path().copied(),
+                                at: expr_id.into(),
                             })?;
                         self.resolver.reset_to_guard(resolver_guard);
                         result
@@ -1655,6 +1656,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         MirLowerError::UnresolvedName {
                             owner: self.owner.expression_store_owner(self.db),
                             path: path.mod_path().copied(),
+                            at: expr_id.into(),
                         }
                     })?;
                 let subst = match self.expr_ty_without_adjust(expr_id).kind() {
@@ -1669,8 +1671,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         operands.resize_with(count, || None);
                         let declared = self.declared_locals();
                         for RecordLitField { name, expr } in fields.iter() {
-                            let field_id =
-                                variant_fields.field(name).ok_or(MirLowerError::UnresolvedField)?;
+                            let hygiene = self.store.record_field_hygiene(*expr);
+                            let field_id = variant_fields
+                                .field_written(self.db, variant_id, name, hygiene)
+                                .ok_or(MirLowerError::UnresolvedField)?;
                             let Some((op, c)) = self.lower_expr_to_some_operand(*expr, current)?
                             else {
                                 return Ok(None);
@@ -1739,8 +1743,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         let [RecordLitField { name, expr }] = fields else {
                             not_supported!("Union record literal with more than one field");
                         };
-                        let local_id =
-                            variant_fields.field(name).ok_or(MirLowerError::UnresolvedField)?;
+                        let hygiene = self.store.record_field_hygiene(*expr);
+                        let local_id = variant_fields
+                            .field_written(self.db, variant_id, name, hygiene)
+                            .ok_or(MirLowerError::UnresolvedField)?;
                         let place = place.project(PlaceElem::Field(local_id.into()));
                         self.lower_expr_to_place(*expr, place, current)
                     }
@@ -2538,6 +2544,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 let unresolved_name = || MirLowerError::UnresolvedName {
                     owner: self.owner.expression_store_owner(self.db),
                     path: c.mod_path().copied(),
+                    at: (*loc).into(),
                 };
                 let pr = self
                     .resolver

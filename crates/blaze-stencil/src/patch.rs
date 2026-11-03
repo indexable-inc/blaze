@@ -42,6 +42,7 @@ use crate::{
     arch::{Area, Cx, Glue, Loc},
     buf::{self, Buf, Label},
     code::{CallSite, CodeRef, Handler, Rule, SlotsRef, UnwindKind, UnwindRef},
+    enc,
     shape::{Dst, Op, Shape, Src, Ty},
     table::{Library, format::Reader},
 };
@@ -363,10 +364,15 @@ pub(crate) struct Side<'f> {
     /// not placed.
     pool_of: Vec<u32, &'f Frame>,
     imm_of: Vec<u32, &'f Frame>,
-    /// In the order first used, for a deterministic layout.
+    /// In the order first used, for a deterministic layout; a constant again under a new
+    /// label when a use is out of reach of where an island placed it.
     const_order: Vec<([u8; 16], Label), &'f Frame>,
-    /// The library rodata entries placed, with their labels, in the order first used.
+    /// The library rodata entries placed, with their labels, in the order first used (an
+    /// entry again under a new label as a constant is).
     rodata: Vec<(u32, Label), &'f Frame>,
+    /// By label: the index of its constant in `const_order`, or of its entry in `rodata` with
+    /// [`RODATA`] set; `NONE` for a label of neither. What an island places by label.
+    data_of: Vec<u32, &'f Frame>,
     /// The parallel moves of the edge being written.
     moves: Vec<emit::Move, &'f Frame>,
     calls: Vec<CallSite, &'f Frame>,
@@ -375,6 +381,9 @@ pub(crate) struct Side<'f> {
     /// Windows' unwind information, when the glue writes it ([`Cx::windows_info`]).
     info: Vec<u8, &'f Frame>,
 }
+
+/// In [`Side::data_of`]: the index is into the rodata entries.
+const RODATA: u32 = 1 << 31;
 
 /// By raw trap code: a label, `NONE` for none.
 struct TrapOf([u32; 256]);
@@ -398,6 +407,7 @@ impl<'f> Side<'f> {
             imm_of: Vec::new_in(frame),
             const_order: Vec::new_in(frame),
             rodata: Vec::new_in(frame),
+            data_of: Vec::new_in(frame),
             moves: Vec::new_in(frame),
             calls: Vec::new_in(frame),
             handlers: Vec::new_in(frame),
@@ -453,33 +463,68 @@ impl<'f> Side<'f> {
         }
     }
 
-    /// The label of the constant `bytes` in the constant area, placed once per handle: the
+    /// The label of the constant `bytes` for the field of `form` at `at` (with `addend`): the
     /// pool's `index` when `pool` (the pool keeps one handle per distinct bytes), else the
-    /// immediate's.
-    fn konst(&mut self, buf: &mut Buf<'_>, pool: bool, index: u32, bytes: [u8; 16]) -> Label {
+    /// immediate's. Placed once per handle in the constant area, unless an island placed it
+    /// already out of this field's reach: then it takes a new label, placed again.
+    fn konst(
+        &mut self,
+        buf: &mut Buf<'_>,
+        pool: bool,
+        index: u32,
+        bytes: [u8; 16],
+        (at, form, addend): (u32, enc::Form, i64),
+    ) -> Label {
         let table = if pool { &mut self.pool_of } else { &mut self.imm_of };
-        let at = index as usize;
-        if table.len() <= at {
-            table.resize(at + 1, NONE);
+        let i = index as usize;
+        if table.len() <= i {
+            table.resize(i + 1, NONE);
         }
-        if table[at] != NONE {
-            return Label(table[at]);
+        if table[i] != NONE && !buf.placed_out_of_reach(at, form, Label(table[i]), addend) {
+            return Label(table[i]);
         }
         let label = buf.label();
-        table[at] = label.0;
+        table[i] = label.0;
+        let order = self.const_order.len() as u32;
         self.const_order.push((bytes, label));
+        self.datum_at(label, order);
         label
     }
 
-    /// The label of library rodata entry `entry`, placed once. A function uses a few entries
+    /// The label of library rodata entry `entry` for the field of `form` at `at`, placed once
+    /// unless out of that field's reach, as [`Side::konst`]. A function uses a few entries
     /// (float masks and bounds), so a scan of the ones placed beats a map.
-    fn rodata(&mut self, buf: &mut Buf<'_>, entry: u32) -> Label {
-        if let Some(&(_, label)) = self.rodata.iter().find(|it| it.0 == entry) {
+    fn rodata(&mut self, buf: &mut Buf<'_>, entry: u32, (at, form, addend): (u32, enc::Form, i64)) -> Label {
+        if let Some(&(_, label)) = self.rodata.iter().rev().find(|it| it.0 == entry)
+            && !buf.placed_out_of_reach(at, form, label, addend)
+        {
             return label;
         }
         let label = buf.label();
+        let order = self.rodata.len() as u32;
         self.rodata.push((entry, label));
+        self.datum_at(label, order | RODATA);
         label
+    }
+
+    fn datum_at(&mut self, label: Label, index: u32) {
+        let at = label.0 as usize;
+        if self.data_of.len() <= at {
+            self.data_of.resize(at + 1, NONE);
+        }
+        self.data_of[at] = index;
+    }
+
+    /// The bytes of the constant or rodata entry of `label`, which an island places.
+    fn datum<'s>(&'s self, label: Label, library: &Reader<'s>) -> Option<&'s [u8]> {
+        match *self.data_of.get(label.0 as usize)? {
+            NONE => None,
+            index if index & RODATA != 0 => {
+                let (entry, _) = self.rodata.get((index & !RODATA) as usize)?;
+                Some(library.entry(*entry))
+            }
+            index => self.const_order.get(index as usize).map(|(bytes, _)| &bytes[..]),
+        }
     }
 
     /// The call sites with their handlers, now that every edge's label is bound.

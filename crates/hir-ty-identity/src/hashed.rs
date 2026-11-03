@@ -42,7 +42,7 @@ pub enum Hashed {
 
 /// The edges code identity hashes of `of`'s value, in its walk's order, as a body that reads
 /// the static or the constant hashes them; or why the value has no identity. Run attached to
-/// `db` (`hir_ty::attach_db`).
+/// `db` (`blaze_query::db::attach`).
 pub fn value_edges(db: &Db, of: ValueOf) -> Result<Vec<Hashed>, String> {
     let krate = match of {
         ValueOf::Static(id) => id.krate(db),

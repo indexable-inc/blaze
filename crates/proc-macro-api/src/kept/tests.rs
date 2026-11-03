@@ -320,7 +320,7 @@ fn two_daemons_in_one_process_each_read_their_own_store_and_shell() {
     let (_other, second) = daemon(&mut sim, "other", "/other/bin");
 
     let key = blaze_cas::Key(ContentId::of(LIBRARY, b"kept by the first daemon"));
-    one.put(key, blaze_cas::Kind::Run, b"an expansion".to_vec()).unwrap();
+    one.put(key, blaze_cas::Kind::Run, b"an expansion").unwrap();
     let guard = blaze_cas::enter();
     assert!(first.expansions.store.has(&guard, &key));
     assert!(!second.expansions.store.has(&guard, &key), "the second daemon read the first's store");
@@ -475,7 +475,7 @@ fn a_record_readable_before_its_put_fails_still_moves_the_epoch() {
     for n in 0..index::MOST_SHAPES {
         let at = index::slot(&record.run, n);
         let other = [b"another shape ".as_slice(), &n.to_le_bytes()].concat(); // alloc: a test's slot
-        store.put(at, blaze_cas::Kind::Run, other).unwrap();
+        store.put(at, blaze_cas::Kind::Run, &other).unwrap();
     }
     let at = keeping.retractions_now();
     keeping.put(super::Put::of(record, "retraction".to_owned()));

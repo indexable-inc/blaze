@@ -185,6 +185,7 @@ impl<'db> Generics<'db> {
     /// and for `for<'b> T: 'a`.
     pub(crate) fn object_lifetime_default(
         &self,
+        db: &Db,
         param: TypeParamId,
     ) -> Option<ObjectLifetimeDefault> {
         use hir_def::hir::type_ref::{LifetimeRef, TypeBound, TypeRef};
@@ -207,7 +208,10 @@ impl<'db> Generics<'db> {
                         && path.segments().len() == 1
                         && path.segments().first().is_some_and(|it| it.args_and_bindings.is_none())
                         && path.mod_path().and_then(|it| it.as_ident()).is_some_and(|name| {
-                            owner.params.find_type_by_name(name, owner.def) == Some(param)
+                            // As the path's lookup names it: by its macros 2.0 key.
+                            let hygiene = owner.store.type_path_hygiene(target);
+                            let name = hir_def::nameres::path_param_name(db, *name, hygiene);
+                            owner.params.find_type_by_name(&name, owner.def) == Some(param)
                         })
                 }
                 _ => false,

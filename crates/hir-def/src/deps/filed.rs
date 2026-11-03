@@ -12,7 +12,7 @@ use crate::{
     deps::{
         mode,
         reads::{self, READS_DOMAIN, Reads, SLOTS},
-        serve::{ImageStore, Refused, crate_name},
+        serve::{ImageStore, Refused},
         signatures,
     },
     expr_store::{Body, ExpressionStore},
@@ -106,7 +106,7 @@ impl<'db> Walk<'db> {
     /// is not in an image.
     fn scope(&mut self, scope: &'db ItemScope, named: bool) {
         if named {
-            self.calls.extend(scope.all_macro_calls());
+            self.calls.extend(signatures::scope_calls(self.db, scope));
         }
         // alloc: setup: the items of one scope, once per check kept
         let mut items = Vec::new();
@@ -190,7 +190,7 @@ pub(super) fn search<T>(
         served(Vec::new());
         return Ok(Ok(it));
     }
-    let name = || crate_name(db, krate);
+    let name = || krate.named(db);
     let mut kept = false;
     for n in 0..SLOTS {
         let at = reads::slot(key, n);
@@ -220,6 +220,12 @@ pub(super) fn search<T>(
             for name in reads.names().0 {
                 db.files().env_is_read(krate, name);
             }
+            let closure = krate.transitive_deps(db);
+            for &at in reads.primary() {
+                if let Some(&by) = closure.get(at as usize) {
+                    db.files().env_is_read(by, base_db::PRIMARY_PACKAGE);
+                }
+            }
             served(expansions);
             return Ok(Ok(it));
         }
@@ -241,7 +247,7 @@ fn keep_reads(
 ) -> Result<Option<Refused>, String> {
     let error = |what: &str, why: String| {
         // alloc: error text
-        format!("{what} the reads of crate {} (key {key:?}): {why}", crate_name(db, krate))
+        format!("{what} the reads of crate {} (key {key:?}): {why}", krate.named(db))
     };
     for n in 0..SLOTS {
         let at = reads::slot(key, n);

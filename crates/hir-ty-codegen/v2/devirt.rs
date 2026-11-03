@@ -275,7 +275,7 @@ fn program_name(db: &Db, kind: RootKind, krate: Crate) -> Box<str> {
         RootKind::Library => "the library",
     };
     // alloc: once a program, its name in messages
-    format!("{what} of crate `{}`", crate::fncache::crate_name(db, krate)).into_boxed_str()
+    format!("{what} of crate `{}`", krate.named(db)).into_boxed_str()
 }
 
 fn refused(db: &Db, krate: Crate, kind: RootKind, what: impl std::fmt::Display) -> CodegenError {
@@ -284,6 +284,7 @@ fn refused(db: &Db, krate: Crate, kind: RootKind, what: impl std::fmt::Display) 
         item: ItemKey(ContentId::default()),
         // alloc: the error's message
         what: format!("the dyn facts of {}: {what}", program_name(db, kind, krate)),
+        front: None,
     }
 }
 
@@ -440,7 +441,7 @@ fn object(
             Some(last) if last.id == target.id && last.ty == target.ty => {}
             Some(last) if last.id == target.id => {
                 // alloc: the error's message
-                return Err(hir_ty::attach_db(db, || {
+                return Err(blaze_query::db::attach(db, || {
                     format!("{:?} and {:?} have one content ID {:?}", last.ty, target.ty, target.id)
                 }));
             }
@@ -449,7 +450,7 @@ fn object(
     }
     let open = found.open.as_deref().or(everything);
     let digest = devirt::object_digest(&trait_id, &args_id, &kept, open);
-    let name = hir_ty::attach_db(db, || {
+    let name = blaze_query::db::attach(db, || {
         let trait_name = TraitSignature::of(db, key.trait_).name.as_str().to_owned();
         match after_self.is_empty() {
             true => format!("dyn {trait_name}"),

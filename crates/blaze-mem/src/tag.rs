@@ -234,29 +234,90 @@ pub fn allocated(tag: Tag, bytes: usize) {
 /// A task's bytes a thread adds to a tag's `allocated` before folding them into the tag's line.
 const FOLD_AT: u64 = 1 << 20;
 
-/// What the thread's tasks added to each tag's `allocated` and is not on the tag's line yet:
-/// folded in at [`FOLD_AT`], at a [`snapshot`] the thread takes, and when the thread ends.
-struct Pending([Cell<u64>; Tag::COUNT]);
+/// What the thread counted and has not added to the shared lines yet, in one thread-local so
+/// a kept value's take or give reaches all of it at once: each tag's `allocated` bytes (its
+/// tasks' and its kept values', folded in at [`FOLD_AT`]), each tag's freed bytes (taken off
+/// its line at [`FREES_FOLD_AT`]), and the net blocks given to each of `blocks`' classes' warm
+/// and cold stacks (folded into the class's counts at its `GATHER`). All of it is folded at a
+/// [`snapshot`] the thread takes (the classes' at `blocks::snapshot`) and when the thread
+/// ends.
+pub(crate) struct Gathered {
+    allocated: [Cell<u64>; Tag::COUNT],
+    freed: [Cell<usize>; Tag::COUNT],
+    /// By class: blocks given to its warm stack less those taken off it.
+    pub(crate) warm: [Cell<i32>; crate::blocks::CLASS_COUNT],
+    /// By class: blocks given to its cold stack less those taken off it.
+    pub(crate) cold: [Cell<i32>; crate::blocks::CLASS_COUNT],
+}
 
-impl Pending {
-    fn fold(&self) {
-        for (pending, line) in self.0.iter().zip(&LINES) {
-            let bytes = pending.replace(0);
+impl Gathered {
+    fn fold_tags(&self) {
+        for (tag, (allocated, freed)) in Tag::ALL.into_iter().zip(self.allocated.iter().zip(&self.freed)) {
+            let bytes = allocated.replace(0);
             if bytes != 0 {
-                line.allocated.fetch_add(bytes, Ordering::Relaxed);
+                line(tag).allocated.fetch_add(bytes, Ordering::Relaxed);
             }
+            sub(tag, freed.replace(0));
         }
+    }
+
+    /// `bytes` more handed out to `tag`: what to add to its line now (0 while gathered).
+    #[inline]
+    pub(crate) fn allocated(&self, tag: Tag, bytes: u64) -> u64 {
+        let gathered = &self.allocated[tag.index()];
+        let sum = gathered.get() + bytes;
+        if sum < FOLD_AT {
+            gathered.set(sum);
+            return 0;
+        }
+        gathered.set(0);
+        sum
+    }
+
+    /// `bytes` of `tag` freed: what to take off its line now (0 while gathered).
+    #[inline]
+    pub(crate) fn freed(&self, tag: Tag, bytes: usize) -> usize {
+        let gathered = &self.freed[tag.index()];
+        let sum = gathered.get() + bytes;
+        if sum < FREES_FOLD_AT {
+            gathered.set(sum);
+            return 0;
+        }
+        gathered.set(0);
+        sum
     }
 }
 
-impl Drop for Pending {
+impl Drop for Gathered {
     fn drop(&mut self) {
-        self.fold();
+        self.fold_tags();
+        crate::blocks::fold_thread(self);
     }
 }
 
 thread_local! {
-    static PENDING: Pending = const { Pending([const { Cell::new(0) }; Tag::COUNT]) };
+    static GATHERED: Gathered = const {
+        Gathered {
+            allocated: [const { Cell::new(0) }; Tag::COUNT],
+            freed: [const { Cell::new(0) }; Tag::COUNT],
+            warm: [const { Cell::new(0) }; crate::blocks::CLASS_COUNT],
+            cold: [const { Cell::new(0) }; crate::blocks::CLASS_COUNT],
+        }
+    };
+}
+
+/// `f` of the thread's gathered counts; `None` on a thread being torn down, which has nothing
+/// gathered left: its caller adds straight to the lines.
+#[inline]
+pub(crate) fn gathered<R>(f: impl FnOnce(&Gathered) -> R) -> Option<R> {
+    GATHERED.try_with(f).ok()
+}
+
+/// Adds `bytes` to `tag`'s `allocated` line: what a [`Gathered`] handed back to fold.
+pub(crate) fn add_allocated(tag: Tag, bytes: u64) {
+    if bytes != 0 {
+        line(tag).allocated.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 /// What a frame copied to grow blocks: a block that grows while it is not the frame's last
@@ -303,22 +364,12 @@ pub fn task_ended(tag: Tag, peak: usize, copied: Copied) {
     if peak > line.task_peak.load(Ordering::Relaxed) {
         line.task_peak.fetch_max(peak, Ordering::Relaxed);
     }
-    let full = PENDING.try_with(|pending| {
-        let gathered = &pending.0[tag.index()];
-        let bytes = gathered.get() + peak;
-        if bytes < FOLD_AT {
-            gathered.set(bytes);
-            return 0;
-        }
-        gathered.set(0);
-        bytes
-    });
     // A thread being torn down has no pending counts left: the bytes go straight to the line.
-    let bytes = full.unwrap_or(peak);
-    if bytes != 0 {
-        line.allocated.fetch_add(bytes, Ordering::Relaxed);
-    }
+    add_allocated(tag, gathered(|it| it.allocated(tag, peak)).unwrap_or(peak));
 }
+
+/// Bytes of frees a thread gathers for a tag before taking them off its line.
+const FREES_FOLD_AT: usize = 256 << 10;
 
 pub(crate) fn committed(bytes: usize) {
     let now = COMMITTED.now.fetch_add(as_u64(bytes), Ordering::Relaxed) + as_u64(bytes);
@@ -424,7 +475,7 @@ impl Snapshot {
 /// The counters now. Another thread's tasks' bytes reach `allocated` up to [`FOLD_AT`] per tag
 /// late; the calling thread's are folded in first.
 pub fn snapshot() -> Snapshot {
-    let _ = PENDING.try_with(Pending::fold);
+    let _ = gathered(Gathered::fold_tags);
     let mut tags = [Counters::default(); Tag::COUNT];
     for (counters, line) in tags.iter_mut().zip(&LINES) {
         *counters = Counters {

@@ -45,7 +45,13 @@ impl<'db> RecursionLimitErrors<'db> {
     /// Notes the walk at `span` stopped at `ty`, once per span. The type is resolved now: the
     /// walk may be in a snapshot that is rolled back.
     pub(crate) fn report(&self, infcx: &InferCtxt<'db>, span: Span, ty: Ty<'db>) {
-        let ty = infcx.deeply_resolve_ignoring_regions(ty).replace_infer_with_error(infcx.interner);
+        let ty = infcx.deeply_resolve_ignoring_regions(ty);
+        // A walk stopped at a type with an error in it follows that error, which is reported
+        // where it was made (rustc's `report_autoderef_recursion_limit_error`).
+        if ty.references_non_lt_error() {
+            return;
+        }
+        let ty = ty.replace_infer_with_error(infcx.interner);
         let mut errors = self.0.borrow_mut();
         if !errors.iter().any(|&(at, _)| at == span) {
             // alloc: an error path, unallocated until a walk first reaches the limit
@@ -404,6 +410,17 @@ where
     fn overloaded_deref_ty(&mut self, ty: Ty<'db>) -> Option<Ty<'db>> {
         debug!("overloaded_deref_ty({:?})", ty);
         let interner = self.interner();
+
+        // An error type derefs to nothing (rustc's `overloaded_deref_ty` stops at any type that
+        // references an error): the solver holds every goal of it, `<{error} as Deref>::Target`
+        // included, so the walk would deref it to itself until the recursion limit and report
+        // E0055 on top of the error it stands for. Only the error type itself: blaze's types
+        // during inference may hold a `'{region error}` where rustc's have none (a closure's
+        // signature), and those deref as any other; one with an error inside derefs to another
+        // type, so its walk ends as any other's does.
+        if ty.is_ty_error() {
+            return None;
+        }
 
         // <ty as Deref>, or whatever the equivalent trait is that we've been asked to walk.
         let AutoderefTraits { trait_, trait_target } = self.autoderef_traits()?;

@@ -12,7 +12,7 @@
 //! (a crate function that panics inside, or a toolchain one [`PANICKING`] does not name, as
 //! `Vec::remove`, is not found here; the LLVM backend's check reads the module).
 
-use base_db::{CrateOrigin, Db};
+use base_db::{CrateOrigin, Db, UnnamedCrate};
 use hir_def::{FunctionId, HasModule as _, signatures::FunctionSignature};
 
 use super::{AssertKind, BinOp, MirBody, MirSpan, TerminatorKind};
@@ -68,22 +68,45 @@ impl CheckKind {
     }
 }
 
+/// A call of a toolchain function [`PANICKING`] names, in a crate with no name: the check is
+/// said by the function's path, which starts at its crate's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnnamedPanicking {
+    /// The function's path under its crate (`panicking::panic_fmt`).
+    pub path: String,
+    pub krate: UnnamedCrate,
+}
+
+impl std::fmt::Display for UnnamedPanicking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a call of `{}` of {}, a toolchain crate with no name: a check is said by its function's \
+             path, which starts at the crate's name",
+            self.path, self.krate
+        )
+    }
+}
+
 /// The checks `body` makes, in the order of its blocks.
-pub fn checks(db: &Db, body: &MirBody<'_>) -> Vec<Check> {
+pub fn checks(db: &Db, body: &MirBody<'_>) -> Result<Vec<Check>, UnnamedPanicking> {
     // alloc: the checks of one body, a handful, returned to the caller
     let mut out = Vec::new();
     for (_, block) in body.basic_blocks.iter() {
         let Some(terminator) = &block.terminator else { continue };
         let kind = match &terminator.kind {
             TerminatorKind::Assert { msg, .. } => Some(assert_kind(msg)),
-            TerminatorKind::Call { func, .. } => func.fn_item().and_then(|(f, _)| panicking(db, f)).map(CheckKind::Panics),
+            TerminatorKind::Call { func, .. } => match func.fn_item() {
+                Some((f, _)) => panicking(db, f)?.map(CheckKind::Panics),
+                None => None,
+            },
             _ => None,
         };
         let Some(kind) = kind else { continue };
         let (span, inlined) = source_span(body, terminator.span);
         out.push(Check { span, kind, inlined });
     }
-    out
+    Ok(out)
 }
 
 fn assert_kind(msg: &AssertKind) -> CheckKind {
@@ -115,11 +138,11 @@ const PANICKING: &[(&str, &[&str])] = &[
 ];
 
 /// The path of `f` when it is a toolchain function [`PANICKING`] names, as an error names it.
-fn panicking(db: &Db, f: FunctionId) -> Option<String> {
+fn panicking(db: &Db, f: FunctionId) -> Result<Option<String>, UnnamedPanicking> {
     let module = f.module(db).to_db(db);
     let krate = module.krate(db);
     if !matches!(krate.data(db).origin, CrateOrigin::Lang(_)) {
-        return None;
+        return Ok(None);
     }
     let name = FunctionSignature::of(db, f).name.as_str();
     // The module right under the crate root that `f` is in (`panicking` of `core::panicking`).
@@ -133,16 +156,18 @@ fn panicking(db: &Db, f: FunctionId) -> Option<String> {
         }
         at = parent;
     }
-    let top = top?;
+    let Some(top) = top else { return Ok(None) };
     let top = top.as_str();
     let listed = PANICKING.iter().any(|(m, names)| *m == top && (names.is_empty() || names.contains(&name)));
     let index = matches!(name, "index" | "index_mut");
     let slice_fail = top == "slice" && name.ends_with("_fail");
     if !(listed || index || slice_fail) {
-        return None;
+        return Ok(None);
     }
-    let crate_name = krate.extra_data(db).display_name.as_ref().map_or("std", |it| it.crate_name().symbol().as_str());
-    Some(format!("{crate_name}::{top}::{name}"))
+    match krate.rust_name(db) {
+        Ok(crate_name) => Ok(Some(format!("{crate_name}::{top}::{name}"))),
+        Err(krate) => Err(UnnamedPanicking { path: format!("{top}::{name}"), krate }),
+    }
 }
 
 /// `span` placed in the body's own source, and whether it came from an inlined callee: an

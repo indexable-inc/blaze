@@ -184,3 +184,30 @@ fn replacing_a_function_with_one_importing_from_another_module_moves_the_import(
         .unwrap();
     assert_eq!(puts(&image), (Some(&import("env_b")), 1));
 }
+
+/// A wasm module keeps no room: its code is reached by index and its file written whole each
+/// link. `target::output` makes every wasm output whole-linked even where room is asked, and an
+/// image asked to keep room is refused when it is made, naming it, rather than refusing the
+/// first function an edit adds "for want of room" (the seed's "does not fit in Text (17763019
+/// of 17763019 bytes used): link the image from scratch", which no command could do).
+#[test]
+fn a_wasm_image_is_laid_out_whole_each_link() {
+    for triple in ["wasm32-wasip1", "wasm64-blaze-wasip1"] {
+        let output = crate::target::output(triple, None, crate::Debug::Lines, true).unwrap();
+        assert!(!output.incremental, "{triple}");
+    }
+    let error = Image::new(name(TO), Output { incremental: true, ..wasm() }).err().expect("an incremental wasm image");
+    assert!(error.what.contains("an incremental Wasm image"), "{}", error.what);
+    assert!(error.what.contains(TO), "{}", error.what);
+
+    let (start, f, g) = (entry(), calling(F, "env"), calling(G, "env"));
+    let mut image = Image::new(name(TO), wasm()).unwrap();
+    let mut disk = Disk::default();
+    disk.link(&mut image, program(&[&start, &f])).unwrap();
+    let edit = Change { added: vec![&g], removed: vec![key(F)], ..Change::default() };
+    let staged = image.stage(edit).unwrap();
+    assert!(staged.full(), "every link of a wasm image is a whole layout");
+    let mut effects = Vec::new();
+    image.commit(staged, &mut effects).unwrap();
+    assert_eq!(disk.run(&mut image, effects), Ok(2));
+}

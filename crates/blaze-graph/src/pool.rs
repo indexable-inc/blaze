@@ -35,6 +35,13 @@
 //!
 //! Every job runs as a task of [`crate::pump`]'s stack, so a wait inside it pumps this pool.
 //!
+//! On a target without threads (the wasm64 seed, todo/bootstrap/plan.md "One thread") a pool
+//! starts no thread: each worker's loop, the same `work` as every worker's, runs on a fiber that
+//! the thread that made the pool drives ([`Pool::driven`], [`block_until`]). That thread, as it
+//! waits on no fiber (a client's [`crate::sched::wait`]), gives each worker a turn of one job at
+//! a time until its wait ends; where a worker of its own thread would park, a driven one gives
+//! its turn back, and its thread looks at the clock's next due wait, then for a stall.
+//!
 //! A job allocates nothing once its thread is warm (docs/v2/plan/lanes/mem/core/plane.md). Its
 //! closure goes in a cell of 128, 512 or 2048 bytes from one of three process-wide
 //! [`blaze_mem::Pool`]s, through a cache of the thread that submits it, and its cell goes back
@@ -82,10 +89,21 @@ const ROUNDS: u32 = 4;
 /// How many pairs a [`Victims::TwoChoices`] thief draws in a group before it walks the group.
 const CHOICES: u32 = 2;
 
+/// Whether the target starts threads: a pool on one without ([`Pool::new`] there) is driven by
+/// the thread that made it ([`Pool::driven`]). wasm without the atomics feature is such a target
+/// (the seed); once the seed has threads, its pools start them as native ones do.
+const THREADS: bool = !cfg!(all(target_family = "wasm", not(target_feature = "atomics")));
+
 /// How long a pool sleeps, idle with jobs parked, before it asks the scheduler whether they
 /// are stalled ([`crate::sched::check_stall`]).
 #[cfg(not(blaze_check))]
 const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a pool's stop waits with jobs parked and none ending before it fails what is still
+/// parked, and as long again, with no job ending after that, before it gives up: what a drop
+/// waits at most past the pool's last progress ([`Pool::stop`]).
+#[cfg(not(blaze_check))]
+pub const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What the queues hold: a pointer to a job's [`Header`], which says how to run it. One pointer
 /// (8 bytes on 64-bit targets), so a line of a deque's buffer holds eight jobs there.
@@ -656,6 +674,15 @@ struct Shared {
     /// Its jobs parked on a wait now: its workers stop only once there are none. Under
     /// `blaze_check` jobs run on their worker's stack and never park, so it stays 0.
     parked: AtomicUsize,
+    /// The thread that stops the pool ([`Pool::stop`]), set before `stop`: its workers wake it
+    /// as they sleep on jobs parked, and as they end.
+    #[cfg(not(blaze_check))]
+    stopper: OnceLock<Thread>,
+    /// Its stop gave up ([`Unstopped`]): its workers end though jobs are parked.
+    #[cfg(not(blaze_check))]
+    abandoned: AtomicBool,
+    /// Its workers whose loop returned: what its stopper waits for.
+    left: AtomicUsize,
     #[cfg(test)]
     critical: AtomicUsize,
 }
@@ -704,7 +731,37 @@ impl Stealing {
 pub struct Pool {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
+    /// Whether it was stopped ([`Pool::stop`]), so its drop stops it no more.
+    stopped: bool,
+    /// Its workers when it has no thread of its own ([`Pool::driven`]).
+    #[cfg(not(blaze_check))]
+    driven: Option<Box<Drivers>>,
     topology: Topology,
+}
+
+/// The workers of a pool with no thread of its own, each its loop on a fiber
+/// ([`crate::sched::Driven`]): given turns by the thread that made the pool, the one thread that
+/// lists it in [`DRIVEN`], from the pool's making to its drop.
+#[cfg(not(blaze_check))]
+struct Drivers {
+    workers: RefCell<Box<[crate::sched::Driven]>>,
+    /// The thread that made the pool, the one that drives it.
+    owner: std::thread::ThreadId,
+}
+
+// SAFETY: a pool is shared and sent as any (a process's pool is a static), but its `Drivers` are
+// touched only on the thread that made it: through that thread's own `DRIVEN` list, and by the
+// pool's drop, which refuses any other thread before it reads them (`Drivers::end`).
+#[cfg(not(blaze_check))]
+unsafe impl Send for Drivers {}
+// SAFETY: as above.
+#[cfg(not(blaze_check))]
+unsafe impl Sync for Drivers {}
+
+#[cfg(not(blaze_check))]
+thread_local! {
+    /// The pools this thread drives ([`Drivers`]), in the order they were made.
+    static DRIVEN: RefCell<Vec<*const Drivers>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A worker's own: on its thread's stack for as long as the thread works.
@@ -755,6 +812,9 @@ impl Pool {
     /// A worker per CPU of `topology`, bound to it when `bind` (pinned on Linux, a QoS class on
     /// macOS; an error elsewhere). An error when a thread cannot be started or bound: the pool
     /// is not made smaller. Its workers steal as [`Stealing::DEFAULT`] says.
+    ///
+    /// On a target without threads it is [`Pool::driven`]: it starts none, and `bind` is an
+    /// error, there being no thread of a worker's own to bind.
     pub fn new(topology: &Topology, bind: bool) -> io::Result<Pool> {
         Pool::with_stealing(topology, bind, Stealing::DEFAULT)
     }
@@ -762,7 +822,34 @@ impl Pool {
     /// As [`Pool::new`], its workers stealing as `stealing` says: for a bench that compares
     /// [`Victims`], or a run that replays a seed.
     pub fn with_stealing(topology: &Topology, bind: bool, stealing: Stealing) -> io::Result<Pool> {
+        Pool::make(topology, bind, stealing, THREADS)
+    }
+
+    /// A pool that starts no thread: a worker per CPU of `topology`, each running the loop every
+    /// worker runs, on a fiber the calling thread drives. The calling thread runs its jobs
+    /// whenever it waits on no fiber ([`crate::sched::wait`], so [`Pool::scope`],
+    /// [`Pool::install`] and every query wait of it), a job at a time until its wait ends, and
+    /// as the pool is dropped, until every job given it has run. What [`Pool::new`] makes on a
+    /// target without threads, the wasm64 seed (todo/bootstrap/plan.md, "One thread"); on any
+    /// other, the same pool as the seed's, for a test.
+    ///
+    /// Only the thread that made it drives it: a job queued from another thread waits for that
+    /// thread's next wait, which the queueing unparks.
+    #[cfg(not(blaze_check))]
+    pub fn driven(topology: &Topology) -> io::Result<Pool> {
+        Pool::make(topology, false, Stealing::DEFAULT, false)
+    }
+
+    /// A pool whose workers have threads of their own when `threaded`, else are driven by the
+    /// calling thread ([`Pool::driven`]).
+    fn make(topology: &Topology, bind: bool, stealing: Stealing, threaded: bool) -> io::Result<Pool> {
         radix::set_ambient(ambient);
+        if !threaded && bind {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "binding a driven pool's workers to CPUs: they have no thread of their own (a target without threads)",
+            ));
+        }
         if topology.cpus.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a worker pool of no CPU"));
         }
@@ -830,6 +917,11 @@ impl Pool {
             #[cfg(not(blaze_check))]
             member: AtomicU32::new(0),
             parked: AtomicUsize::new(0),
+            #[cfg(not(blaze_check))]
+            stopper: OnceLock::new(),
+            #[cfg(not(blaze_check))]
+            abandoned: AtomicBool::new(false),
+            left: AtomicUsize::new(0),
             #[cfg(test)]
             critical: AtomicUsize::new(0),
         });
@@ -838,6 +930,12 @@ impl Pool {
             crate::sched::join_pool(wake_parked, pool_idle, Arc::as_ptr(&shared).expose_provenance()),
             Ordering::Relaxed,
         );
+        if !threaded {
+            #[cfg(not(blaze_check))]
+            return Ok(Pool::drive(shared, deques, topology, stealing));
+            #[cfg(blaze_check)]
+            unreachable!("the model checker's targets have threads");
+        }
         let (ready_tx, ready_rx) = crossbeam_channel::unbounded::<io::Result<()>>();
         let mut threads = Vec::with_capacity(deques.len());
         let mut failed = None;
@@ -853,6 +951,8 @@ impl Pool {
                     _ = shared.slots[index].thread.set(thread::current());
                     let ok = bound.is_ok();
                     _ = ready.send(bound);
+                    // clone: a reference count, once per worker thread
+                    let after = Arc::clone(&shared);
                     if ok {
                         let group = shared.slots[index].group as usize;
                         work(&Local {
@@ -864,8 +964,12 @@ impl Pool {
                             lifo: Cell::new(0),
                             seed: Cell::new(worker_seed(stealing.seed, index)),
                             victims: stealing.victims,
-                        });
+                        }, None);
                     }
+                    // Its loop returned, or never began: the stopper waits for each ([`Pool::stop`]).
+                    after.left.fetch_add(1, Ordering::SeqCst);
+                    #[cfg(not(blaze_check))]
+                    after.unpark_stopper();
                 });
             match spawned {
                 Ok(handle) => threads.push(handle),
@@ -884,7 +988,14 @@ impl Pool {
             }
         }
         // clone: the pool keeps the topology it was made of, once
-        let pool = Pool { shared, threads, topology: topology.clone() };
+        let pool = Pool {
+            shared,
+            threads,
+            stopped: false,
+            #[cfg(not(blaze_check))]
+            driven: None,
+            topology: topology.clone(),
+        };
         match failed {
             Some(why) => {
                 drop(pool);
@@ -892,6 +1003,47 @@ impl Pool {
             }
             None => Ok(pool),
         }
+    }
+
+    /// The pool of `shared`, its workers on fibers this thread drives ([`Pool::driven`]).
+    #[cfg(not(blaze_check))]
+    fn drive(shared: Arc<Shared>, deques: Vec<Worker<Job>>, topology: &Topology, stealing: Stealing) -> Pool {
+        let me = thread::current();
+        let workers = deques
+            .into_iter()
+            .enumerate()
+            .map(|(index, deque)| {
+                // clone: setup, once per worker
+                let (cpu, shared) = (topology.cpus[index], Arc::clone(&shared));
+                // A job queued from another thread unparks the driving one, as a parked worker
+                // of its own thread would be.
+                // clone: a reference count, once per worker
+                _ = shared.slots[index].thread.set(me.clone());
+                crate::sched::Driven::new(move |turns| {
+                    let group = shared.slots[index].group as usize;
+                    work(
+                        &Local {
+                            shared,
+                            index,
+                            group,
+                            node: cpu.node,
+                            deque,
+                            lifo: Cell::new(0),
+                            seed: Cell::new(worker_seed(stealing.seed, index)),
+                            victims: stealing.victims,
+                        },
+                        Some(turns),
+                    );
+                })
+            })
+            // alloc: made once with the pool
+            .collect::<Box<[_]>>();
+        // alloc: made once with the pool, its address listed until it drops
+        let drivers = Box::new(Drivers { workers: RefCell::new(workers), owner: me.id() });
+        // alloc: once per driven pool
+        DRIVEN.with_borrow_mut(|it| it.push(ptr::from_ref(&*drivers)));
+        // clone: the pool keeps the topology it was made of, once
+        Pool { shared, threads: Vec::new(), stopped: false, driven: Some(drivers), topology: topology.clone() }
     }
 
     pub fn topology(&self) -> &Topology {
@@ -1149,31 +1301,250 @@ fn ambient(with: &mut dyn FnMut(&dyn radix::Workers)) -> bool {
     with_local(|local| with(&Here(&*local.shared))).is_some()
 }
 
-impl Drop for Pool {
-    /// Stops the workers once they find nothing more to run, and joins them.
-    fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::SeqCst);
-        for slot in &self.shared.slots {
-            if let Some(thread) = slot.thread.get() {
-                thread.unpark();
+impl Pool {
+    /// Stops the pool: its workers run every job given it and every parked one once woken,
+    /// then end, and are joined. Bounded (rule 15), as its drop is with [`STOP_BOUND`]:
+    ///
+    /// - a parked job whose waits lead to the calling thread, which holds what it claimed until
+    ///   this returns (a key its panic left held), can never wake: it wakes at once, to fail with
+    ///   a [`crate::sched::Stopped`] naming its wait and the cycle;
+    /// - once the pool has gone `bound` with jobs parked and none ending, a parked job resumed
+    ///   or a worker running a job's code, every job still parked in the wait graph fails so;
+    /// - if as long again goes by with no job ending after that, the stop gives up.
+    ///
+    /// A job whose code runs holds its worker, and the stop waits for it as for any job: the
+    /// bound is on waits, which only the scheduler can end.
+    ///
+    /// # Errors
+    ///
+    /// [`Unstopped`] when it gave up, naming every wait still parked. Its workers end, though
+    /// jobs are parked, and the pool's queues are leaked: a parked job may still be woken into
+    /// them.
+    pub fn stop(mut self, bound: std::time::Duration) -> Result<(), Unstopped> {
+        self.end(bound)
+    }
+
+    /// Stops the pool, once: [`Pool::stop`], and its drop.
+    fn end(&mut self, bound: std::time::Duration) -> Result<(), Unstopped> {
+        if std::mem::replace(&mut self.stopped, true) {
+            return Ok(());
+        }
+        let shared = &*self.shared;
+        #[cfg(not(blaze_check))]
+        {
+            _ = shared.stopper.set(thread::current());
+        }
+        shared.stop.store(true, Ordering::SeqCst);
+        shared.unpark_workers();
+        #[cfg(not(blaze_check))]
+        if let Some(drivers) = self.driven.take() {
+            let ended = drivers.end(shared, bound);
+            if ended.is_err() {
+                // Its workers end at their next turn, which its thread still gives them: their
+                // fibers and queues live on.
+                shared.abandoned.store(true, Ordering::SeqCst);
+                std::mem::forget(drivers);
+                std::mem::forget(Arc::clone(&self.shared));
+            } else {
+                crate::sched::leave_pool(shared.member.load(Ordering::Relaxed));
             }
+            return ended;
         }
         let me = thread::current().id();
-        let mut joined = true;
+        // A pool stopped by a job of its own cannot wait for the worker that runs the job.
+        let own = self.threads.iter().any(|it| it.thread().id() == me);
+        #[cfg(not(blaze_check))]
+        {
+            // Each worker's loop returns before its thread ends, and it wakes this one as it does.
+            let others = self.threads.len() - usize::from(own);
+            let ended = || shared.left.load(Ordering::SeqCst) >= others;
+            let waited = stop_bounded(shared, bound, &ended, &|recheck, until| {
+                if recheck() {
+                    return;
+                }
+                let left = until.saturating_sub(crate::sched::now());
+                crate::wait::wait(crate::wait::WaitOn::Channel("a stopping pool's workers"), None, || {
+                    thread::park_timeout(std::time::Duration::from_nanos(left));
+                });
+            });
+            if let Err(unstopped) = waited {
+                shared.abandoned.store(true, Ordering::SeqCst);
+                shared.unpark_workers();
+                // Its member stays in the scheduler, which may wake a parked job into its queues
+                // after this: they live on, as do its workers until they see the stop gave up.
+                std::mem::forget(Arc::clone(&self.shared));
+                self.threads.clear();
+                return Err(unstopped);
+            }
+        }
         for handle in self.threads.drain(..) {
-            // A pool dropped by a job of its own cannot wait for the worker that runs the job.
-            if handle.thread().id() == me {
-                joined = false;
-            } else {
+            if handle.thread().id() != me {
                 _ = handle.join();
             }
         }
         #[cfg(not(blaze_check))]
-        if joined {
-            crate::sched::leave_pool(self.shared.member.load(Ordering::Relaxed));
+        if !own {
+            crate::sched::leave_pool(shared.member.load(Ordering::Relaxed));
         }
         #[cfg(blaze_check)]
-        let _ = joined;
+        let _ = (own, bound);
+        Ok(())
+    }
+}
+
+/// A pool's stop that did not end within its bound ([`Pool::stop`]): what is still parked, and
+/// what it waits for.
+#[derive(Clone, Debug)] // clone: an error, off every hot path
+pub struct Unstopped {
+    /// How long it waited with no job ending, after it had failed every job parked then.
+    pub waited_ns: u64,
+    /// The pool's jobs still parked.
+    pub parked: usize,
+    /// Its workers that run a job's code.
+    pub working: usize,
+    /// What each of its jobs that waits in the wait graph waits for (a timed wait is in none).
+    #[cfg(not(blaze_check))]
+    pub waits: crate::sched::Waits,
+}
+
+impl std::fmt::Display for Unstopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a pool's stop gave up: {:.1} s went by with no job ending after it failed every job parked, and {} of its jobs \
+             are still parked and {} of its workers run a job's code; its workers end and its queues are leaked",
+            self.waited_ns as f64 / 1e9,
+            self.parked,
+            self.working
+        )?;
+        #[cfg(not(blaze_check))]
+        write!(f, ": {}", self.waits)?;
+        Ok(())
+    }
+}
+
+impl std::error::Error for Unstopped {}
+
+/// What a pool's stop does next ([`StopClock::advance_clock`]).
+#[cfg(not(blaze_check))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StopStep {
+    /// Wait for the pool to move, until this time at the latest.
+    Wait { until: u64 },
+    /// It went its bound with jobs parked and none moving: every job still parked fails.
+    FailParked { waited_ns: u64 },
+    /// Failing them moved nothing within the bound: the stop gives up.
+    GiveUp { waited_ns: u64 },
+}
+
+/// The bound of a pool's stop (rule 15), a sans-IO core (rule 12): told the time on the
+/// injected clock and whether the pool moved since it was last told, it says what the stop does
+/// next. The bound runs from the pool's last progress.
+#[cfg(not(blaze_check))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StopClock {
+    bound: u64,
+    since: u64,
+    /// It failed what was parked, and nothing moved since.
+    failed: bool,
+}
+
+#[cfg(not(blaze_check))]
+impl StopClock {
+    pub(crate) fn new(now: u64, bound: std::time::Duration) -> StopClock {
+        StopClock { bound: u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX), since: now, failed: false }
+    }
+
+    pub(crate) fn advance_clock(&mut self, now: u64, moved: bool) -> StopStep {
+        if moved {
+            self.since = now;
+            self.failed = false;
+        }
+        let due = self.since.saturating_add(self.bound);
+        if now < due {
+            return StopStep::Wait { until: due };
+        }
+        let waited_ns = now - self.since;
+        self.since = now;
+        if std::mem::replace(&mut self.failed, true) {
+            StopStep::GiveUp { waited_ns }
+        } else {
+            StopStep::FailParked { waited_ns }
+        }
+    }
+}
+
+/// The stopping pool of `shared`'s wait for `ended` (its workers' end), bounded as
+/// [`Pool::stop`] says: `wait(recheck, until)` waits for the pool to move, until `until` on
+/// [`crate::sched::now`]'s clock at the latest, calling `recheck` (true once `ended`) as it
+/// can; `recheck` wakes the parked jobs whose waits lead to this thread.
+#[cfg(not(blaze_check))]
+fn stop_bounded(
+    shared: &Shared,
+    bound: std::time::Duration,
+    ended: &dyn Fn() -> bool,
+    wait: &dyn Fn(&dyn Fn() -> bool, u64),
+) -> Result<(), Unstopped> {
+    use crate::sched::StopReason;
+    let member = shared.member.load(Ordering::Relaxed);
+    let dropper = crate::sched::job_in_graph();
+    let panicking = thread::panicking();
+    let recheck = || {
+        if ended() {
+            return true;
+        }
+        // Looked for as the pool goes idle with jobs parked: a job parks only as its worker
+        // goes on to the next, and a worker with none wakes this thread.
+        if let Some(dropper) = dropper
+            && shared.parked.load(Ordering::Acquire) != 0
+            && !shared.any_work()
+        {
+            crate::sched::stop_pool(member, StopReason::Dropper { dropper, panicking });
+        }
+        false
+    };
+    let mut clock = StopClock::new(crate::sched::now(), bound);
+    let mut seen = shared.progress();
+    loop {
+        if recheck() {
+            return Ok(());
+        }
+        let progress = shared.progress();
+        let moved = progress != seen || shared.busy();
+        seen = progress;
+        match clock.advance_clock(crate::sched::now(), moved) {
+            StopStep::Wait { until } => wait(&recheck, until),
+            StopStep::FailParked { waited_ns } => {
+                crate::sched::stop_pool(member, StopReason::Bound { waited_ns });
+            }
+            StopStep::GiveUp { waited_ns } => {
+                return Err(Unstopped {
+                    waited_ns,
+                    parked: shared.parked.load(Ordering::Acquire),
+                    working: shared.slots.iter().filter(|slot| slot.inside.load(Ordering::Relaxed)).count(),
+                    waits: crate::sched::waits_of(member),
+                });
+            }
+        }
+    }
+}
+
+impl Drop for Pool {
+    /// Stops the pool as [`Pool::stop`] does with [`STOP_BOUND`]; a stop that gave up panics
+    /// with its [`Unstopped`], unless the thread is unwinding already.
+    fn drop(&mut self) {
+        #[cfg(not(blaze_check))]
+        let ended = self.end(STOP_BOUND);
+        #[cfg(blaze_check)]
+        let ended = self.end(std::time::Duration::MAX);
+        if let Err(unstopped) = ended {
+            if thread::panicking() {
+                // A second panic would abort: the first goes on up, and this says what was left.
+                eprintln!("{unstopped}");
+            } else {
+                panic!("{unstopped}");
+            }
+        }
         if let Some(panic) = self.shared.stray.lock_said("the pool's stray panic").take()
             && !thread::panicking()
         {
@@ -1328,6 +1699,34 @@ fn take(next: &AtomicPtr<Header>) -> Option<Job> {
 }
 
 impl Shared {
+    fn unpark_workers(&self) {
+        for slot in &self.slots {
+            if let Some(thread) = slot.thread.get() {
+                thread.unpark();
+            }
+        }
+    }
+
+    #[cfg(not(blaze_check))]
+    fn unpark_stopper(&self) {
+        if let Some(thread) = self.stopper.get() {
+            thread.unpark();
+        }
+    }
+
+    /// What a stop counts as the pool's progress: the jobs ended, and those parked.
+    #[cfg(not(blaze_check))]
+    fn progress(&self) -> (u64, usize) {
+        let ended = self.slots.iter().map(|slot| slot.ended.load(Ordering::Relaxed)).sum();
+        (ended, self.parked.load(Ordering::Acquire))
+    }
+
+    /// Whether a worker runs a job's code or a job is queued: the pool moves.
+    #[cfg(not(blaze_check))]
+    fn busy(&self) -> bool {
+        self.slots.iter().any(|slot| slot.inside.load(Ordering::Relaxed)) || self.any_work()
+    }
+
     fn push(&self, near: Option<u32>, job: Job) {
         self.push_to(self.place(near, false), job);
     }
@@ -1465,10 +1864,7 @@ fn xorshift(mut x: u32) -> u32 {
 /// The first state of worker `index`'s draws under the pool's `seed`: SplitMix64's finalizer
 /// over both, so neighbouring workers and seeds draw apart; odd, so never xorshift's dead 0.
 fn worker_seed(seed: u64, index: usize) -> u32 {
-    let mut z = seed ^ (index as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
+    let z = blaze_rng::mix(seed ^ (index as u64).wrapping_add(1).wrapping_mul(blaze_rng::GAMMA));
     (z as u32) | 1
 }
 
@@ -1655,8 +2051,9 @@ impl Local {
     }
 
     /// Parks until woken, unless `ended` or there is work: a job queued after this says it
-    /// sleeps wakes it. Whether it was woken to search, as its waker counted it.
-    fn sleep(&self, ended: &impl Fn() -> bool) -> bool {
+    /// sleeps wakes it. Whether it was woken to search, as its waker counted it. `park` is how:
+    /// [`Local::park`] for a worker of its own thread, a turn given back for a driven one.
+    fn sleep(&self, ended: &impl Fn() -> bool, park: impl FnOnce()) -> bool {
         let shared = &*self.shared;
         let (slot, group) = (&shared.slots[self.index], &shared.groups[self.group]);
         slot.sleeping.store(true, Ordering::SeqCst);
@@ -1664,6 +2061,23 @@ impl Local {
         shared.idle.0.fetch_add(SLEEPING, Ordering::SeqCst);
         fence(Ordering::SeqCst);
         if !ended() && !shared.any_work() {
+            park();
+        }
+        if slot.sleeping.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+            group.sleepers.fetch_sub(1, Ordering::SeqCst);
+            shared.idle.0.fetch_sub(SLEEPING, Ordering::SeqCst);
+            false
+        } else {
+            true
+        }
+    }
+
+    /// A worker of its own thread parks, marked asleep ([`Local::sleep`]), until a job queued
+    /// wakes it or a timed wait is due; the last to sleep with jobs parked checks for a stall.
+    fn park(&self, ended: &impl Fn() -> bool) {
+        let shared = &*self.shared;
+        let slot = &shared.slots[self.index];
+        {
             #[cfg(not(blaze_check))]
             {
                 // A timed wait of any pool's job ends only as a worker looks at the clock.
@@ -1675,7 +2089,7 @@ impl Local {
                     // wait, so after a while with none, the scheduler checks for a stall.
                     thread::park_timeout(due.map_or(STALL_AFTER, |due| due.min(STALL_AFTER)));
                     if slot.sleeping.load(Ordering::SeqCst) && !ended() && !shared.any_work() {
-                        crate::sched::check_stall();
+                        _ = crate::sched::check_stall();
                     }
                 } else if let Some(due) = due {
                     thread::park_timeout(due);
@@ -1687,14 +2101,10 @@ impl Local {
                 crate::sched::fire_due();
             }
             #[cfg(blaze_check)]
-            thread::park();
-        }
-        if slot.sleeping.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-            group.sleepers.fetch_sub(1, Ordering::SeqCst);
-            shared.idle.0.fetch_sub(SLEEPING, Ordering::SeqCst);
-            false
-        } else {
-            true
+            {
+                let _ = (slot, ended);
+                thread::park();
+            }
         }
     }
 }
@@ -1731,6 +2141,11 @@ fn wake_parked(shared: usize, token: usize) {
     if let Some(job) = push_next(shared, None, Job(header)) {
         shared.push(None, job);
     }
+    if shared.stop.load(Ordering::SeqCst) {
+        // A stopping pool's workers may have ended but the one a wake would go to: each awake
+        // one takes it.
+        shared.unpark_workers();
+    }
 }
 
 /// Whether every worker of the pool at `shared` (an exposed `Shared` address) sleeps with
@@ -1742,8 +2157,52 @@ fn pool_idle(shared: usize) -> bool {
     shared.idle.0.load(Ordering::SeqCst) / SLEEPING == shared.slots.len() as u64 && !shared.any_work()
 }
 
-fn work(local: &Local) {
-    LOCAL.set(local);
+/// What the thread that drives a driven worker had of a worker's thread-locals as it gave the
+/// worker its turn: put back as the worker gives the turn back, so that thread is the worker only
+/// during the turn (it may be another pool's worker, or a client of this pool).
+struct Outer {
+    local: Cell<*const Local>,
+    core: Cell<u32>,
+}
+
+/// Gives a driven worker's turn back to its thread with `turn`, that thread's own thread-locals
+/// put back for it, and takes them again at the next turn.
+#[cfg(not(blaze_check))]
+fn hand_back(local: &Local, outer: &Outer, turns: &crate::sched::Turns<'_>, turn: crate::sched::Turn) {
+    LOCAL.set(outer.local.get());
+    let mine = crate::sched::swap_core(outer.core.get());
+    turns.give(turn);
+    outer.local.set(LOCAL.replace(local));
+    outer.core.set(crate::sched::swap_core(mine));
+}
+
+/// A worker's loop, on its own thread or (`turns`) on a fiber its pool's thread drives
+/// ([`Pool::driven`]): the same loop either way, but that a driven worker gives the turn back
+/// after each job it ran and where a worker of its own thread would park.
+fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
+    #[cfg(not(blaze_check))]
+    let outer = Outer { local: Cell::new(LOCAL.replace(local)), core: Cell::new(crate::sched::swap_core(u32::MAX)) };
+    #[cfg(blaze_check)]
+    let outer = Outer { local: Cell::new(LOCAL.replace(local)), core: Cell::new(u32::MAX) };
+    // A driven worker gives its thread the turn after a job, and where it would park.
+    #[cfg(not(blaze_check))]
+    let ran = || {
+        if let Some(turns) = turns {
+            hand_back(local, &outer, turns, crate::sched::Turn::Ran);
+        }
+    };
+    #[cfg(blaze_check)]
+    let ran = || debug_assert!(turns.is_none(), "the model checker's pools have threads");
+    let park = |ended: &dyn Fn() -> bool| match turns {
+        #[cfg(not(blaze_check))]
+        Some(turns) => {
+            crate::sched::idle(true);
+            hand_back(local, &outer, turns, crate::sched::Turn::Idle);
+            crate::sched::idle(false);
+            crate::sched::fire_due();
+        }
+        _ => local.park(&ended),
+    };
     let shared = &*local.shared;
     #[cfg(not(blaze_check))]
     let mut runner = crate::sched::Host::new(
@@ -1772,6 +2231,7 @@ fn work(local: &Local) {
             }
             search = None;
             local.run(&mut runner, job);
+            ran();
             continue;
         }
         if searching || local.begin_search() {
@@ -1779,12 +2239,14 @@ fn work(local: &Local) {
             if let Some(job) = local.search(ROUNDS) {
                 search = None;
                 local.run(&mut runner, job);
+                ran();
                 continue;
             }
         }
         if let Some(job) = local.later() {
             search = None;
             local.run(&mut runner, job);
+            ran();
             continue;
         }
         if shared.stop.load(Ordering::SeqCst) {
@@ -1796,21 +2258,222 @@ fn work(local: &Local) {
                 }
                 continue;
             }
+            // It sleeps until no job is parked: a parked job's wake queues it and wakes the
+            // workers ([`wake_parked`]), and a worker that ends wakes the others. Its stopper
+            // looks, as it is woken, for parked jobs that can never wake, and fails them, or
+            // gives up past its bound ([`Pool::stop`]), so this sleep ends.
             #[cfg(not(blaze_check))]
-            if shared.parked.load(Ordering::Acquire) != 0 {
-                // A parked job's wake queues it and wakes a sleeper; once it was the last, no
-                // one wakes this worker to see so.
-                thread::park_timeout(std::time::Duration::from_millis(1));
+            if shared.parked.load(Ordering::Acquire) != 0 && !shared.abandoned.load(Ordering::SeqCst) {
+                shared.unpark_stopper();
+                search = None;
+                let drained =
+                    || shared.parked.load(Ordering::Acquire) == 0 || shared.abandoned.load(Ordering::SeqCst);
+                searching = local.sleep(&drained, || park(&drained));
                 continue;
             }
             break;
         }
         search = None;
-        searching = local.sleep(&|| shared.stop.load(Ordering::SeqCst));
+        let ended = || shared.stop.load(Ordering::SeqCst);
+        searching = local.sleep(&ended, || park(&ended));
     }
     drop(search);
     drop(runner);
-    LOCAL.set(ptr::null());
+    // The others may sleep until the last parked job resumed, which none is told of but by
+    // this.
+    shared.unpark_workers();
+    LOCAL.set(outer.local.get());
+    #[cfg(not(blaze_check))]
+    crate::sched::swap_core(outer.core.get());
+}
+
+/// Blocks this thread, on no fiber, until `until` holds: a client's wait
+/// ([`crate::sched::wait`]), or a driven pool's drop. A thread that drives pools
+/// ([`Pool::driven`]) gives their workers turns meanwhile, a job each at a time, looking at
+/// `until` after each; when none has a job, it sleeps until the next timed wait of a job is due,
+/// else asks the scheduler for a stall, which wakes every stuck job to fail naming its wait. A
+/// thread that drives none parks, for its waker to unpark.
+///
+/// # Panics
+///
+/// On a target without threads, when no pool has a job, no wait is due and no stall was found:
+/// nothing that could make `until` hold is left to run, and no other thread can. The panic
+/// names every wait of the graph.
+pub(crate) fn block_until(until: &dyn Fn() -> bool) {
+    #[cfg(not(blaze_check))]
+    block(until, None);
+    #[cfg(blaze_check)]
+    while !until() {
+        thread::park();
+    }
+}
+
+/// [`block_until`], and returns by `deadline` (on [`crate::sched::now`]'s clock) at the latest,
+/// whether `until` holds or not: a stopping pool's bounded wait ([`stop_bounded`]).
+#[cfg(not(blaze_check))]
+fn block(until: &dyn Fn() -> bool, deadline: Option<u64>) {
+    // How long until the deadline, if one: `Some(ZERO)` once it is past.
+    let left = || deadline.map(|at| std::time::Duration::from_nanos(at.saturating_sub(crate::sched::now())));
+    let rest = |wait: std::time::Duration| {
+        if THREADS {
+            thread::park_timeout(wait);
+        } else {
+            // Nothing but the clock can wake the one thread of a target without them.
+            thread::sleep(wait);
+        }
+    };
+    loop {
+        if until() || left().is_some_and(|it| it.is_zero()) {
+            return;
+        }
+        match drive_round() {
+            // A client of pools with threads of their own: its waker unparks it.
+            Round::None if THREADS => match left() {
+                Some(left) => thread::park_timeout(left),
+                None => thread::park(),
+            },
+            Round::Ran => {}
+            Round::None | Round::Idle => {
+                if until() {
+                    return;
+                }
+                if let Some(due) = crate::sched::until_due() {
+                    let _idle = DriverSpan::open(Driving::Idle);
+                    rest(left().map_or(due, |left| due.min(left)));
+                    crate::sched::fire_due();
+                    continue;
+                }
+                if crate::sched::check_stall() {
+                    continue;
+                }
+                if let Some(left) = left() {
+                    let _idle = DriverSpan::open(Driving::Idle);
+                    rest(left);
+                    continue;
+                }
+                assert!(
+                    THREADS,
+                    "the one thread of a target without threads waits, and nothing can end its wait: no driven pool has a \
+                     job, no job's wait is due and no stall was found ({})",
+                    crate::sched::waits_now()
+                );
+                // Another thread may queue a job (which unparks this one) or end the wait.
+                let _idle = DriverSpan::open(Driving::Idle);
+                thread::park();
+            }
+        }
+    }
+}
+
+/// `rx.recv()` on a thread on no fiber, for the channel `name`. Where the target has threads,
+/// the receive itself. On one without (the seed), only a job of a pool this thread drives can
+/// send what it waits for, so the thread gives those pools turns until a message, or the end of
+/// every sender, is there ([`block_until`]); a receive that blocked would stop the one thread.
+///
+/// # Panics
+///
+/// On a target without threads, called on a fiber (a job): its thread is already a pool's
+/// worker, whose turn can't drive the pools; the panic names the channel. And as
+/// [`block_until`] does, when nothing left could send.
+pub(crate) fn recv<T>(
+    rx: &crossbeam_channel::Receiver<T>,
+    name: &'static str,
+) -> Result<T, crossbeam_channel::RecvError> {
+    if THREADS {
+        return rx.recv();
+    }
+    assert!(
+        crate::sched::fiber::current_job().is_none(),
+        "a job on the one thread of a target without threads receives from the channel `{name}`: only the \
+         thread that drives the pools may wait on a channel there"
+    );
+    let got = Cell::new(None);
+    block_until(&|| match rx.try_recv() {
+        Ok(it) => {
+            got.set(Some(Ok(it)));
+            true
+        }
+        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            got.set(Some(Err(crossbeam_channel::RecvError)));
+            true
+        }
+        Err(crossbeam_channel::TryRecvError::Empty) => false,
+    });
+    got.into_inner().unwrap_or_else(|| unreachable!("`block_until` returns once the channel `{name}` answered"))
+}
+
+/// What a round of turns of the pools a thread drives came to.
+#[cfg(not(blaze_check))]
+enum Round {
+    /// The thread drives no pool.
+    None,
+    /// A worker ran a job.
+    Ran,
+    /// Every worker found nothing to run, or had ended.
+    Idle,
+}
+
+/// A turn of every worker not ended of every pool this thread drives, but of a pool whose
+/// workers are in a turn already, further down this thread's stack: a pool dropped by a job of
+/// another driven pool drives its own and the others while that job waits for its end.
+#[cfg(not(blaze_check))]
+fn drive_round() -> Round {
+    let mut round = Round::None;
+    let mut at = 0;
+    while let Some(drivers) = DRIVEN.with_borrow(|it| it.get(at).copied()) {
+        at += 1;
+        // SAFETY: a pool's `Drivers` are listed from its making until its drop has ended them,
+        // on this thread, which is the only one that reads the list.
+        let drivers = unsafe { &*drivers };
+        let Ok(mut workers) = drivers.workers.try_borrow_mut() else { continue };
+        if matches!(round, Round::None) {
+            round = Round::Idle;
+        }
+        for worker in workers.iter_mut().filter(|it| !it.ended()) {
+            if worker.turn() == crate::sched::Turn::Ran {
+                round = Round::Ran;
+            }
+        }
+    }
+    round
+}
+
+#[cfg(not(blaze_check))]
+impl Drivers {
+    /// The pool of `shared` stopped: runs its workers until every job given it has run and
+    /// each loop returned, then this thread drives it no more; bounded by `bound` as
+    /// [`Pool::stop`] says.
+    ///
+    /// # Errors
+    ///
+    /// [`Unstopped`] when the stop gave up: this thread still lists the pool, to give its
+    /// workers the turns they end at.
+    ///
+    /// # Panics
+    ///
+    /// On a thread other than the one that made the pool, naming both: only that one drives it.
+    /// Inside one of its own jobs, which the drop would wait for.
+    fn end(&self, shared: &Shared, bound: std::time::Duration) -> Result<(), Unstopped> {
+        let me = std::thread::current().id();
+        assert!(
+            me == self.owner,
+            "a driven pool made on thread {:?} was dropped on thread {me:?}: only the thread that made it drives it",
+            self.owner
+        );
+        assert!(
+            self.workers.try_borrow_mut().is_ok(),
+            "a driven pool was dropped by one of its own jobs: its drop waits for every job given it, that one too, so drop \
+             it outside its jobs"
+        );
+        let ended = || self.workers.borrow().iter().all(crate::sched::Driven::ended);
+        stop_bounded(shared, bound, &ended, &|recheck, until| {
+            crate::wait::wait(crate::wait::WaitOn::Channel("a driven pool's last jobs"), None, || {
+                block(recheck, Some(until));
+            });
+        })?;
+        DRIVEN.with_borrow_mut(|it| it.retain(|&at| !ptr::eq(at, self)));
+        Ok(())
+    }
 }
 
 /// Binds the calling worker to `cpu`, and its frames' chunks to the CPU's NUMA node
@@ -1863,7 +2526,10 @@ mod tests {
     use crossbeam_channel::{bounded, unbounded};
     use parking_lot::Mutex;
 
-    use super::{Class, Group, Header, Job, Pending, Placed, Pool, STALL_AFTER, Slot, group, searching, sleeping};
+    use super::{
+        Class, Group, Header, Job, Pending, Placed, Pool, STALL_AFTER, STOP_BOUND, Slot, StopClock, StopStep, group, searching,
+        sleeping,
+    };
     use crate::{
         Cancelled, Key,
         pump::Flights,
@@ -2514,6 +3180,53 @@ mod tests {
     /// A panic's message, as a job's `done` gets it.
     fn message(panic: &(dyn std::any::Any + Send)) -> String {
         panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned())).unwrap_or_default()
+    }
+
+    /// The hung test of 2026-11-03 (hung-9554, 80 minutes): a thread claims a key, a job of its
+    /// pool parks on it, and the thread panics, dropping the pool as it unwinds with the key
+    /// still held. The drop waits for the job, the job for the key, and the thread ends the key
+    /// only after the drop. The job must wake at once to fail naming the key and its holder,
+    /// and the drop end.
+    #[test]
+    fn a_panic_while_holding_a_key_ends_the_pool_promptly_with_an_error_naming_the_key() {
+        use crate::sched::{self, Wait};
+        let key = Key([0x5e; 32]);
+        let (tx, rx) = unbounded::<Result<(), String>>();
+        let began = std::time::Instant::now();
+        let holder = std::thread::spawn(move || {
+            let pool = Pool::new(&groups_of(1, 2), false).unwrap();
+            assert!(sched::claim(key), "the key is new");
+            pool.submit(
+                None,
+                move || _ = sched::wait(Wait::Key(key)),
+                move |it| _ = tx.send(it.map_err(|panic| message(&*panic))),
+            );
+            until("the job to park on the key", || pool.parked() == 1);
+            panic!("the key's holder panics, and its pool drops as it unwinds");
+        });
+        let joined = holder.join();
+        let took = began.elapsed();
+        assert!(joined.is_err(), "the holder's own panic goes on up");
+        let failed = rx.recv_timeout(LONG).expect("the parked job ended").expect_err("the parked job fails");
+        let hex: String = key.0.iter().map(|byte| format!("{byte:02x}")).collect();
+        for name in ["pool stopped", &hex, "the thread dropping its pool", "unwinds from a panic"] {
+            assert!(failed.contains(name), "the failure names `{name}`: {failed}");
+        }
+        assert!(took < Duration::from_secs(10), "the drop ended in {took:?}, not at its bound ({STOP_BOUND:?})");
+    }
+
+    /// The stop's bound as a transcript on its injected clock: progress moves it; at the bound
+    /// what is parked fails; it gives up only when a bound goes by with nothing moving after that.
+    #[test]
+    fn a_stop_fails_what_is_parked_at_its_bound_and_gives_up_only_when_that_moved_nothing() {
+        let mut clock = StopClock::new(100, Duration::from_nanos(50));
+        assert_eq!(clock.advance_clock(120, false), StopStep::Wait { until: 150 });
+        assert_eq!(clock.advance_clock(140, true), StopStep::Wait { until: 190 }, "progress moves the bound");
+        assert_eq!(clock.advance_clock(190, false), StopStep::FailParked { waited_ns: 50 });
+        assert_eq!(clock.advance_clock(200, true), StopStep::Wait { until: 250 }, "the failed jobs ending is progress");
+        assert_eq!(clock.advance_clock(250, false), StopStep::FailParked { waited_ns: 50 }, "what parked since fails too");
+        assert_eq!(clock.advance_clock(299, false), StopStep::Wait { until: 300 });
+        assert_eq!(clock.advance_clock(300, false), StopStep::GiveUp { waited_ns: 50 });
     }
 
     /// A job that waits inside a scope, resumes and panics there, a job of the scope still
@@ -3604,7 +4317,7 @@ mod model {
         let shared = shared.clone();
         thread::spawn(move || {
             _ = shared.slots[index].thread.set(thread::current());
-            work(&local(&shared, index, deque));
+            work(&local(&shared, index, deque), None);
         })
     }
 

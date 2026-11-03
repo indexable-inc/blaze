@@ -173,7 +173,7 @@ fn checked_from(
         let proc_macros = sysroot.next().expect("a fixture with proc macros has their crate's file");
         names.insert(proc_macros, format!("{prefix}auxiliary/proc_macros.rs"));
     }
-    let diags = hir::attach_db(&db, || {
+    let diags = blaze_query::db::attach(&db, || {
         hir::check::workspace_crates(&db)
             .into_iter()
             .flat_map(|krate| crate::check::check_crate(&db, krate, Files::new(&names, ""), options))

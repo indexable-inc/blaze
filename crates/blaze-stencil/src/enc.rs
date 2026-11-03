@@ -104,6 +104,23 @@ impl Form {
         )
     }
 
+    /// How far the field of a PC-relative form reaches, and what stands in for a target past
+    /// it; `None` for an absolute form.
+    pub const fn reach(self) -> Option<Reach> {
+        const fn r(back: i64, ahead: i64, far: Far) -> Option<Reach> {
+            Some(Reach { back, ahead, far })
+        }
+        match self {
+            Form::Rel32 => r(i32::MIN as i64, i32::MAX as i64, Far::Never),
+            Form::A64Jump26 => r(-(1 << 27), (1 << 27) - 4, Far::Veneer),
+            Form::A64CondBr19 => r(-(1 << 20), (1 << 20) - 4, Far::Veneer),
+            Form::A64TestBr14 => r(-(1 << 15), (1 << 15) - 4, Far::Veneer),
+            Form::A64AdrLo21 => r(-(1 << 20), (1 << 20) - 1, Far::Place),
+            Form::A64LdrLit19 => r(-(1 << 20), (1 << 20) - 4, Far::Place),
+            _ => None,
+        }
+    }
+
     /// Bytes of code the field is in, from its offset: the field itself on x86-64, the
     /// instruction on AArch64.
     pub const fn bytes(self) -> u8 {
@@ -113,6 +130,29 @@ impl Form {
             _ => 4,
         }
     }
+}
+
+/// The values a PC-relative field takes, `S + A - P` in `back..=ahead` (in its step, which
+/// [`check`] has), and what the buffer does for a target past them (`crate::buf`'s islands).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Reach {
+    pub back: i64,
+    pub ahead: i64,
+    pub far: Far,
+}
+
+/// What stands in for a target a field does not reach.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Far {
+    /// A branch: it goes to a veneer, an unconditional jump within its reach that jumps the
+    /// rest of the way (AArch64 `b.cond`, `cbz`, `tbz`, and `b` itself, chained).
+    Veneer,
+    /// A PC-relative address or load of data: the data is placed within its reach (AArch64
+    /// `adr`, `ldr` (literal)).
+    Place,
+    /// Nothing: the field reaches farther than a function's code goes (x86-64 `rel32`, ±2
+    /// GiB), and a value past it is refused.
+    Never,
 }
 
 /// A value that does not fit the field of its form.
@@ -254,7 +294,12 @@ fn a64(form: Form, insn: u32, value: i64) -> Option<u32> {
     }
 }
 
-const fn sign_extend(value: i64, bits: u32) -> i64 {
+/// `value`'s low `bits` bits, sign-extended; all of `value` for `bits` of 0 or 64 and more.
+/// The one copy: the encoders, the patch scan and the tests read fields with it.
+pub(crate) const fn sign_extend(value: i64, bits: u32) -> i64 {
+    if bits == 0 || bits >= 64 {
+        return value;
+    }
     let shift = 64 - bits;
     (value << shift) >> shift
 }
@@ -440,6 +485,21 @@ mod tests {
                     | Form::A64LdrLit19
             );
             assert_eq!(form.pc_relative(), expected, "{form:?}");
+        }
+    }
+
+    /// A PC-relative form's reach is exactly what [`write`] takes: its least and greatest
+    /// value, the bounds above.
+    #[test]
+    fn the_reach_of_each_pc_relative_form_is_its_bounds() {
+        for Bounds { form, min, max, .. } in BOUNDS {
+            match form.reach() {
+                Some(reach) => {
+                    assert!(form.pc_relative(), "{form:?}");
+                    assert_eq!((reach.back, reach.ahead), (min, max), "{form:?}");
+                }
+                None => assert!(!form.pc_relative(), "{form:?}"),
+            }
         }
     }
 

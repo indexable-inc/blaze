@@ -94,7 +94,7 @@ fn adt_named(db: &TestDB, krate: Crate, name: &str) -> AdtId {
 }
 
 fn has_type_mismatches(db: &TestDB, function: FunctionId) -> bool {
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         InferenceResult::of(db, DefWithBodyId::from(function)).has_type_mismatches()
     })
 }
@@ -122,7 +122,7 @@ fn unconstrained_params_are_as_before_in_declaration_order() {
     let _ = fx.only_file();
     let db = fx.into_db();
     let main = crate_named(&db, "main");
-    let found: Vec<Vec<u32>> = hir_ty::attach_db(&db, || {
+    let found: Vec<Vec<u32>> = blaze_query::db::attach(&db, || {
         impls(&db, main)
             .into_iter()
             .map(|impl_| {
@@ -197,7 +197,7 @@ fn an_alias_without_impl_trait_infers_no_body() {
     let db = fx.into_db();
     let plain = type_alias_named(&db, crate_named(&db, "main"), "Plain");
     let executed = db.log_executed(|| {
-        hir_ty::attach_db(&db, || assert_eq!(tait_hidden_types(&db, plain).values().count(), 0))
+        blaze_query::db::attach(&db, || assert_eq!(tait_hidden_types(&db, plain).values().count(), 0))
     });
     assert_eq!(runs(&executed, "infer_body_query"), 0, "{executed:#?}");
 }
@@ -209,7 +209,7 @@ fn an_alias_with_impl_trait_takes_its_hidden_type_from_its_defining_body() {
     let db = fx.into_db();
     let opaque = type_alias_named(&db, crate_named(&db, "main"), "Opaque");
     let executed = db.log_executed(|| {
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let hidden: Vec<_> = tait_hidden_types(&db, opaque)
                 .values()
                 .map(|it| it.get().skip_binder())
@@ -242,16 +242,16 @@ fn orphan_rules_normalize_only_a_header_with_an_alias() {
     let db = fx.into_db();
     let impls = impls(&db, crate_named(&db, "main"));
     let answers: Vec<bool> =
-        hir_ty::attach_db(&db, || impls.iter().map(|&it| check_orphan_rules(&db, it)).collect());
+        blaze_query::db::attach(&db, || impls.iter().map(|&it| check_orphan_rules(&db, it)).collect());
     assert_eq!(answers, [true, true, true, false]);
 
     let fx = fixture::db(ORPHAN);
     let _ = fx.files().to_vec();
     let db = fx.into_db();
     let impls = self::impls(&db, crate_named(&db, "main"));
-    let plain = db.log_executed(|| hir_ty::attach_db(&db, || assert!(check_orphan_rules(&db, impls[2]))));
+    let plain = db.log_executed(|| blaze_query::db::attach(&db, || assert!(check_orphan_rules(&db, impls[2]))));
     assert_eq!(runs(&plain, "trait_environment_query"), 0, "{plain:#?}");
-    let alias = db.log_executed(|| hir_ty::attach_db(&db, || assert!(check_orphan_rules(&db, impls[1]))));
+    let alias = db.log_executed(|| blaze_query::db::attach(&db, || assert!(check_orphan_rules(&db, impls[1]))));
     assert!(runs(&alias, "trait_environment_query") >= 1, "{alias:#?}");
 }
 
@@ -277,7 +277,7 @@ fn is_freeze_walks_every_variant() {
     let main = crate_named(&db, "main");
     let names = ["UnsafeCell", "Cell", "Plain", "Shared", "Wrap", "U", "Empty", "Never"];
     let adts = names.map(|name| adt_named(&db, main, name));
-    let answers = hir_ty::attach_db(&db, || {
+    let answers = blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, main);
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
         adts.map(|adt| {

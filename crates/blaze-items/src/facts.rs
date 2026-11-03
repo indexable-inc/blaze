@@ -144,7 +144,7 @@ pub fn asker(seen_by: Crate, kind: blaze_query::QueryKind) -> Option<Crate> {
 
 /// [`value`] with its asker as [`asker`] keeps it: `Some` exactly for a fact asked by a crate.
 pub(crate) fn value_as(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, Unhashable> {
-    hir_ty::attach_db(db, || value_in(db, seen_by, fact))
+    blaze_query::db::attach(db, || value_in(db, seen_by, fact))
 }
 
 fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, Unhashable> {

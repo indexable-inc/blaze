@@ -9,6 +9,7 @@ use std::{
 };
 
 use base_db::{Crate, Db, all_crates};
+use blaze_ids::rng::SplitMix64;
 use hir_def::{
     AdtId, FunctionId, HasModule, ModuleDefId, TraitId,
     nameres::crate_def_map,
@@ -29,23 +30,6 @@ use crate::{
     },
 };
 
-/// splitmix64: a fixed sequence per seed, so a failing seed reproduces.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-}
-
 /// A key as the table sees one: never 0 (empty), never with the pending bit.
 fn key_of(bits: u64) -> GoalKey {
     GoalKey((bits >> 1) | 1)
@@ -60,15 +44,15 @@ fn the_table_agrees_with_a_locked_map_under_eight_threads() {
     let table = Table::<u64>::default();
     let reference = Mutex::new(HashMap::new());
     let keys: Vec<GoalKey> = {
-        let mut rng = Rng(7);
-        (0..20_000).map(|_| key_of(rng.next())).collect()
+        let mut rng = SplitMix64::new(7);
+        (0..20_000).map(|_| key_of(rng.next_u64())).collect()
     };
     let start = Barrier::new(8);
     thread::scope(|scope| {
         for worker in 0..8u64 {
             let (table, reference, keys, start) = (&table, &reference, &keys, &start);
             scope.spawn(move || {
-                let mut rng = Rng(worker);
+                let mut rng = SplitMix64::new(worker);
                 start.wait();
                 for _ in 0..6_000 {
                     let key = keys[rng.below(keys.len() as u64) as usize];
@@ -156,10 +140,10 @@ where
 /// A crate of `count` random ADTs over the prelude's: fields of every shape the walk steps
 /// through, derived and written `Clone`/`Copy` impls, negative and explicit auto-trait impls.
 fn generated(seed: u64, count: usize) -> String {
-    let mut rng = Rng(seed);
+    let mut rng = SplitMix64::new(seed);
     let mut text = PRELUDE.to_owned();
     for i in 0..count {
-        let any = |rng: &mut Rng| rng.below(count as u64);
+        let any = |rng: &mut SplitMix64| rng.below(count as u64);
         let mut fields = Vec::new();
         for _ in 0..=rng.below(3) {
             let earlier = (i > 0).then(|| rng.below(i as u64));

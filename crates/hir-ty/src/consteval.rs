@@ -325,16 +325,19 @@ pub enum CreateConstError {
     TargetLayoutNotAvailable,
 }
 
+/// The constant `path`, written with `hygiene` (its first segment's, which a generic parameter
+/// is looked up by), names.
 pub(crate) fn path_to_const<'a, 'db: 'a>(
     db: &'db Db,
     resolver: &Resolver<'db>,
     generics: &impl Fn() -> &'a Generics<'db>,
     forbid_params_after: Option<u32>,
     path: Path<'_>,
+    hygiene: HygieneId,
 ) -> Result<Const<'db>, CreateConstError> {
     let interner = DbInterner::new_no_crate(db);
     let resolution = resolver
-        .resolve_path_in_value_ns_fully(db, path, HygieneId::ROOT)
+        .resolve_path_in_value_ns_fully(db, path, hygiene)
         .ok_or(CreateConstError::DoesNotResolve)?;
     let no_generics = |def| crate::generics::generics(db, def).has_no_params();
     let konst = match resolution {
@@ -390,9 +393,11 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
     mismatched_literal_as_anon_const: bool,
 ) -> Result<Const<'db>, CreateConstError> {
     let mut expr = store.expr(expr_id);
+    let mut path_expr = expr_id;
     if let Expr::Block { statements, tail: Some(tail), .. } = expr
         && statements.is_empty()
     {
+        path_expr = tail;
         // rustc unwraps *one* layer of blocks, so we do too (this impacts whether the const can use generic parameters.
         // Anon consts sometimes cannot while bare paths can). mGCA allows arbitrarily many blocks, but we don't implement
         // it yet.
@@ -414,7 +419,14 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
         },
         Expr::Path(path)
             if let konst =
-                path_to_const(interner.db, resolver, generics, forbid_params_after, path)
+                path_to_const(
+                    interner.db,
+                    resolver,
+                    generics,
+                    forbid_params_after,
+                    path,
+                    store.expr_path_hygiene(path_expr),
+                )
                 && !matches!(
                     konst,
                     Err(CreateConstError::DoesNotResolve

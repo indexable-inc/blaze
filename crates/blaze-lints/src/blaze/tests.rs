@@ -925,7 +925,7 @@ pub mod sched {
     /// The diagnostics of the lints in the crate `linted` of `fixture`, each as rustc writes it.
     fn lint_crate(fixture: &str, linted: &str) -> String {
         let db = fixture::db(fixture).into_db();
-        hir::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let krate = hir::Crate::all(&db)
                 .into_iter()
                 .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == linted))

@@ -74,7 +74,7 @@ fn release_adds_nothing(fixture: &str, functions: &[&str]) {
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         for name in functions {
             let func = function(&db, name);
             let body = |level| {

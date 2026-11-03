@@ -1,5 +1,5 @@
 //! `error_debug`: an error's message that formats a value with `{:?}`, or formats a value whose
-//! formatting needs the attached database outside `hir_ty::attach_db` (AGENTS.md rule 15:
+//! formatting needs the attached database outside `blaze_query::db::attach` (AGENTS.md rule 15:
 //! formatting an error must not panic; the 2026-11-01 macro-eval panic).
 //!
 //! An error's message is one of:
@@ -13,8 +13,8 @@
 //!
 //! In one, a placeholder `{:?}` is a finding, whatever it formats: an error says what it is about
 //! in words. A placeholder of any trait whose value needs the attached database is a finding
-//! unless the `format_args!` is inside a closure handed to `hir_ty::attach_db`,
-//! `attach_db_allow_change` or `with_attached_db`. A value needs it when its type is an ADT of
+//! unless the `format_args!` is inside a closure handed to `blaze_query::db::attach` or
+//! `blaze_query::db::with_attached_db`. A value needs it when its type is an ADT of
 //! `hir_ty` (its `next_solver` types included), or has one as a generic argument, or is an ADT
 //! of outside the standard library a field of which (three ADTs deep) does.
 //!
@@ -121,9 +121,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                 continue;
             }
             let message = format!(
-                "the message of error `{error_name}` formats `{shown}`, which needs the attached database, outside `hir_ty::attach_db`"
+                "the message of error `{error_name}` formats `{shown}`, which needs the attached database, outside `blaze_query::db::attach`"
             );
-            let panics = "formatting it outside `hir_ty::attach_db` panics: render what needs the database while it is attached";
+            let panics = "formatting it outside `blaze_query::db::attach` panics: render what needs the database while it is attached";
             let note = match ty.strip_references().as_adt() == Some(held) {
                 true => panics.to_owned(),
                 false => format!("it holds `hir_ty`'s `{}`; {panics}", held.name(db).as_str()),
@@ -225,8 +225,8 @@ fn message_of<'db>(
     None
 }
 
-/// Whether the `format_args!` `id` is inside a closure handed to `hir_ty::attach_db`,
-/// `attach_db_allow_change` or `with_attached_db`.
+/// Whether the `format_args!` `id` is inside a closure handed to `blaze_query::db::attach` or
+/// `blaze_query::db::with_attached_db`.
 fn is_attached(db: &Db, body: &Body, infer: &InferenceResult<'_>, parents: &Parents, id: ExprId) -> bool {
     let mut closure = None;
     for up in parents.up(id, ATTACH_DEPTH) {
@@ -247,8 +247,8 @@ fn is_attached(db: &Db, body: &Body, infer: &InferenceResult<'_>, parents: &Pare
 
 fn is_attach(db: &Db, f: hir_def::FunctionId) -> bool {
     let name = &FunctionSignature::of(db, f).name;
-    matches!(name.as_str(), "attach_db" | "attach_db_allow_change" | "with_attached_db")
-        && facts::crate_is(db, hir::Crate::from(f.krate(db)), "hir_ty")
+    matches!(name.as_str(), "attach" | "with_attached_db")
+        && facts::crate_is(db, hir::Crate::from(f.krate(db)), "blaze_query")
 }
 
 /// The ADT of `hir_ty` that formatting `ty` reads the attached database for, if one is: `ty`'s
@@ -380,13 +380,13 @@ fn check_owner<'t>(
                 continue;
             }
             let message = format!(
-                "the message of error `{error_name}` formats field `{}` (`{}`), which needs the attached database, outside `hir_ty::attach_db`",
+                "the message of error `{error_name}` formats field `{}` (`{}`), which needs the attached database, outside `blaze_query::db::attach`",
                 field.name(db).as_str(),
                 ty.display(db, target)
             );
             let span = cx.span(range);
             cx.blaze(Lint::ErrorDebug, attr.syntax(), span, message)
-                .note("formatting it outside `hir_ty::attach_db` panics: render what needs the database into the error when it is made")
+                .note("formatting it outside `blaze_query::db::attach` panics: render what needs the database into the error when it is made")
                 .help(Lint::ErrorDebug.help())
                 .help(format!("for further information visit {}", Lint::ErrorDebug.docs_url()));
         }

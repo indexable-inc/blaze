@@ -9,7 +9,7 @@ use crate::{AnyDiagnostic, Crate};
 /// The text of each visibility hir reports for the crate `main` with its error, sorted.
 fn reported(fixture: &str) -> Vec<(String, &'static str)> {
     let db = fixture::db(fixture).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let main = Crate::all(&db)
             .into_iter()
             .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))

@@ -20,7 +20,7 @@ use hir_ty::{
     consteval::try_const_usize,
     db::HirDatabase,
     layout::{enum_variant_ids, struct_flags},
-    next_solver::{AliasTy, DbInterner, ParamEnv, TermKind, Ty, TyKind},
+    next_solver::{AliasTy, AssocTyId, DbInterner, ParamEnv, TermKind, Ty, TyKind},
 };
 use hir_ty_mir::mir::MirBody;
 use rustc_type_ir::{
@@ -78,7 +78,12 @@ pub(crate) fn is_marked(db: &Db, ty: Ty<'_>) -> bool {
         TyKind::Param(param) => AttrFlags::query_type_or_const_param(db, param.id.into())
             .contains(AttrFlags::LINEAR),
         TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id }, .. }) => {
-            AttrFlags::query(db, AttrDefId::TypeAliasId(def_id.0)).contains(AttrFlags::LINEAR)
+            match def_id.0 {
+                AssocTyId::TypeAliasId(alias) => AttrFlags::query(db, AttrDefId::TypeAliasId(alias))
+                    .contains(AttrFlags::LINEAR),
+                // A trait method's `impl Trait` has no attributes of its own.
+                AssocTyId::RpititId(_) => false,
+            }
         }
         TyKind::Dynamic(predicates, ..) => predicates.principal_def_id().is_some_and(|it| {
             AttrFlags::query(db, AttrDefId::TraitId(it.0)).contains(AttrFlags::LINEAR)

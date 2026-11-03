@@ -13,7 +13,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use hegel::{TestCase, generators as gs};
 
 use super::{Flights, NotHeld, sharded::Sharded};
-use crate::{Cancelled, Key};
+use crate::{Cancelled, Key, sched::JobId};
 
 const ACTORS: usize = 3;
 const KEYS: usize = 3;
@@ -149,6 +149,8 @@ struct World<'d> {
     told: Cell<[Option<Do>; ACTORS]>,
     /// Each actor's last ask, which a holder told to let go may still be parked in.
     asked: Cell<[Option<Do>; ACTORS]>,
+    /// Each actor's job of the scheduler.
+    jobs: Vec<JobId>,
 }
 
 /// Says on `left` that an actor's thread ended, however it ended.
@@ -167,14 +169,15 @@ impl<'d> World<'d> {
         design: &'d (dyn Design + 'd),
         left: &Sender<(&'static str, usize)>,
     ) -> World<'d> {
-        let (mut to_all, mut heard) = (Vec::new(), Vec::new());
+        let (mut to_all, mut heard, mut jobs) = (Vec::new(), Vec::new(), Vec::new());
         for actor in 0..ACTORS {
             let (to, todo) = unbounded::<Do>();
             let (say, said) = unbounded::<Heard>();
+            let (began, job) = unbounded::<JobId>();
             let gone = Gone(left.clone(), name, actor);
             scope.spawn(move || {
                 let _gone = gone;
-                _ = crate::sched::job_here();
+                _ = began.send(crate::sched::job_here());
                 let mut held: Vec<Option<Release<'d>>> = (0..KEYS).map(|_| None).collect();
                 for step in todo {
                     let heard = match step {
@@ -200,8 +203,9 @@ impl<'d> World<'d> {
             });
             to_all.push(to);
             heard.push(said);
+            jobs.push(job.recv_timeout(LONG).unwrap_or_else(|_| hung(format!("{name} actor {actor} never began"))));
         }
-        World { name, design, to: to_all, heard, told: Cell::new([None; ACTORS]), asked: Cell::new([None; ACTORS]) }
+        World { name, design, to: to_all, heard, told: Cell::new([None; ACTORS]), asked: Cell::new([None; ACTORS]), jobs }
     }
 
     fn tell(&self, actor: usize, todo: Do) {
@@ -243,33 +247,116 @@ impl<'d> World<'d> {
             std::thread::yield_now();
         }
     }
+
+    /// Waits until `actor`'s job waits in the scheduler for a flight of `holder`'s (the run it
+    /// gave way to), not linked to the run of `asks`, which has `linked` waiters; failing if it
+    /// said something, or waits for anything else.
+    fn parked(&self, actor: usize, holder: usize, asks: usize, linked: usize) {
+        let until = Instant::now() + LONG;
+        let (job, holder) = (self.jobs[actor], self.jobs[holder]);
+        loop {
+            if let Ok(heard) = self.heard[actor].try_recv() {
+                panic!("{} actor {actor}'s ask was to wait for the run it gave way to, and it said {heard:?}", self.name);
+            }
+            let waits = crate::sched::waits_now().0.into_iter().find(|(it, _)| *it == job);
+            if let Some((_, on)) = waits {
+                let on_the_run = matches!(on, crate::sched::StallWait::Key { claimer: Some(it), .. } if it == holder);
+                let waiters = self.design.waiters(key(asks));
+                assert!(
+                    on_the_run && waiters == linked,
+                    "{} actor {actor}'s ask was to wait for the run it gave way to, by job {holder:?}, before asking for key \
+                     {asks}; it waits for {on:?}, and key {asks}'s run has {waiters} waiters, not {linked}",
+                    self.name
+                );
+                return;
+            }
+            if Instant::now() >= until {
+                hung(format!("{} actor {actor}'s retry never waited for the run it gave way to in {LONG:?}", self.name));
+            }
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// What each actor is doing, as the steps so far say.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Expect {
     holder: [Option<usize>; KEYS],
     /// The key each actor's ask waits for.
     waits: [Option<usize>; ACTORS],
+    /// The key whose run each actor last gave way to, while that run is held and the actor
+    /// has not asked since: its next ask waits for that run to end first
+    /// (`sched::before_claim`), unless that wait would close a cycle.
+    gave_way: [Option<usize>; ACTORS],
+    /// An actor's ask waiting, before it claims anything, for the run of the key it gave way
+    /// to, and the ask it makes once that run ends.
+    retry: [Option<(usize, Do)>; ACTORS],
 }
 
 impl Expect {
     /// Whether `actor`'s wait for `at` would close a cycle: who runs `at` waits, through runs
-    /// held and waits, for `actor`.
+    /// held, waits and retries, for `actor`.
     fn closes_cycle(&self, actor: usize, at: usize) -> bool {
         let mut runner = self.holder[at];
         for _ in 0..=ACTORS {
             match runner {
                 Some(it) if it == actor => return true,
-                Some(it) => runner = self.waits[it].and_then(|at| self.holder[at]),
+                Some(it) => runner = self.waits_for(it).and_then(|at| self.holder[at]),
                 None => return false,
             }
         }
         false
     }
 
+    /// The key whose run `actor` waits for: its ask's, or its retry's.
+    fn waits_for(&self, actor: usize) -> Option<usize> {
+        self.waits[actor].or(self.retry[actor].map(|(at, _)| at))
+    }
+
+    fn idle(&self, actor: usize) -> bool {
+        self.waits_for(actor).is_none()
+    }
+
     fn waiting_on(&self, at: usize) -> usize {
         self.waits.iter().filter(|it| **it == Some(at)).count()
+    }
+
+    /// The run `actor`'s ask waits for first, as its retry after giving way: the key it gave way
+    /// to, while that run is held and the wait closes no cycle.
+    fn retry_waits_for(&self, actor: usize) -> Option<usize> {
+        self.gave_way[actor].filter(|&at| self.holder[at].is_some() && !self.closes_cycle(actor, at))
+    }
+
+    /// Lets go of `at`: who waited for its run are woken, and who retried after giving way to it
+    /// go on to their asks.
+    fn release(&mut self, at: usize) {
+        self.holder[at] = None;
+        for gave_way in &mut self.gave_way {
+            if *gave_way == Some(at) {
+                *gave_way = None;
+            }
+        }
+        for waits in &mut self.waits {
+            if *waits == Some(at) {
+                *waits = None;
+            }
+        }
+        for retry in &mut self.retry {
+            if retry.is_some_and(|(it, _)| it == at) {
+                *retry = None;
+            }
+        }
+    }
+
+    /// What an actor's ask did, as heard: it waits for the key's run, or gave way to it.
+    fn asked(&mut self, actor: usize, at: usize, said: Option<Heard>) {
+        // Any ask takes the retry: only a give-way of its own leaves the next ask one.
+        self.gave_way[actor] = None;
+        match said {
+            None => self.waits[actor] = Some(at),
+            Some(Heard::Asked(Err(Cancelled))) => self.gave_way[actor] = Some(at),
+            Some(_) => {}
+        }
     }
 }
 
@@ -319,6 +406,46 @@ fn the_table_answers_as_the_sharded_design_did(tc: TestCase) {
             running.retain(|it| *it != ended);
         }
         std::panic::resume_unwind(failed);
+    });
+    watch.end();
+}
+
+/// Both designs after a give-way, step by step, through both of the retry's branches: actor 0
+/// holds key 0, actor 1 holds key 1 and waits for key 0, and actor 0's ask of key 1 gives way.
+/// Its next ask's wait for that run would close the cycle, so it goes on and asks at once; once
+/// actor 0 lets go of key 0 and actor 1 waits for nothing, actor 0's next ask after giving way
+/// waits for actor 1's run of key 1, and asks only once that run ends.
+#[test]
+fn a_retry_after_giving_way_waits_for_that_run_unless_the_wait_closes_a_cycle() {
+    let table = Flights::<u32>::new();
+    let sharded = Sharded::<u32>::new();
+    let (left, _gone) = unbounded();
+    let watch = Watch::start();
+    std::thread::scope(|scope| {
+        let worlds = [World::new(scope, "table", &table, &left), World::new(scope, "sharded", &sharded, &left)];
+        let mut expect = Expect::default();
+        let steps = [
+            (0, Do::Hold(0)),
+            (1, Do::Hold(1)),
+            (1, Do::Ask(0, 3)),
+            (0, Do::Ask(1, 4)),
+            (0, Do::Ask(2, 5)),
+            (0, Do::Ask(1, 6)),
+            (0, Do::Release(0, None)),
+            (0, Do::Ask(2, 7)),
+            (1, Do::Release(1, Some(8))),
+        ];
+        let mut retried = Vec::new();
+        for (step, (actor, todo)) in steps.into_iter().enumerate() {
+            if matches!(todo, Do::Ask(..)) {
+                retried.push((step, expect.gave_way[actor].is_some(), expect.retry_waits_for(actor).is_some()));
+            }
+            apply(&worlds, &mut expect, actor, todo, &watch, format_args!("step {step}"));
+        }
+        // Step 3 gave way; step 4's retry was refused (a cycle), step 7's waited.
+        assert_eq!(retried, [(2, false, false), (3, false, false), (4, true, false), (5, false, false), (7, true, true)]);
+        assert_eq!((expect.holder, expect.waits, expect.gave_way), ([None; KEYS], [None; ACTORS], [None; ACTORS]));
+        assert!(expect.retry.iter().all(Option::is_none));
     });
     watch.end();
 }
@@ -414,76 +541,125 @@ fn check(tc: &TestCase, worlds: &[World<'_>; 2], watch: &Watch) {
     let mut expect = Expect::default();
     let steps = 1 + below(tc, 40);
     for step in 0..steps {
-        let idle: Vec<usize> = (0..ACTORS).filter(|it| expect.waits[*it].is_none()).collect();
+        let idle: Vec<usize> = (0..ACTORS).filter(|it| expect.idle(*it)).collect();
         let actor = idle[below(tc, idle.len())];
         let at = below(tc, KEYS);
         let value = 1 + step as u32;
+        // Two retries waiting for one run would race for their asks as it ends: one at a time.
+        let racing = expect
+            .retry_waits_for(actor)
+            .is_some_and(|it| expect.retry.iter().any(|retry| retry.is_some_and(|(at, _)| at == it)));
         let todo = match (below(tc, 4), expect.holder[at] == Some(actor)) {
             (_, true) => Do::Release(at, tc.draw(gs::booleans()).then_some(value)),
-            (0, false) => Do::Ask(at, value),
+            (0, false) if !racing => Do::Ask(at, value),
             (1, false) => Do::IfIdle(at, value),
             _ => Do::Hold(at),
         };
-        let mut heard = Vec::new();
-        for world in worlds {
-            watch.at(format_args!("step {step} of {steps}, {}: told actor {actor} {todo:?}, hearing it or counting its ask's link", world.name));
-            world.tell(actor, todo);
-            let said = match todo {
-                Do::Ask(at, _) if expect.holder[at].is_some() && !expect.closes_cycle(actor, at) => {
-                    world.linked_or_heard(at, expect.waiting_on(at) + 1, actor)
-                }
-                _ => Some(world.hear(actor)),
-            };
-            let mut woken = Vec::new();
-            if let Do::Release(at, value) = todo {
-                for other in (0..ACTORS).filter(|it| expect.waits[*it] == Some(at)) {
-                    watch.at(format_args!("step {step} of {steps}, {}: {todo:?} by actor {actor}, hearing woken actor {other}", world.name));
-                    let said = match world.hear(other) {
-                        Heard::Asked(Ok(_)) if value.is_none() => Heard::AskedAfterCancel,
-                        it => it,
-                    };
-                    woken.push((other, said));
-                }
-            }
-            watch.at(format_args!("step {step} of {steps}, {}: after {todo:?} by actor {actor}, counting the runs", world.name));
-            heard.push((said, woken, world.design.running()));
-        }
-        assert_eq!(heard[0], heard[1], "step {step}: {todo:?}");
-        let (said, woken, _) = &heard[0];
-        match (todo, said) {
-            (Do::Ask(at, _), None) => expect.waits[actor] = Some(at),
-            (Do::Hold(at), Some(Heard::Held(true))) => expect.holder[at] = Some(actor),
-            (Do::Release(at, _), _) => {
-                expect.holder[at] = None;
-                for (other, _) in woken {
-                    expect.waits[*other] = None;
-                }
-            }
-            _ => {}
-        }
+        apply(worlds, &mut expect, actor, todo, watch, format_args!("step {step} of {steps}"));
     }
     // A holder whose own ask waits hears nothing until that ask ends, so each key let go is
     // one held by an actor that waits for none; with no cycle among the waits, one always is.
-    while let Some(at) = (0..KEYS).find(|&at| expect.holder[at].is_some_and(|holder| expect.waits[holder].is_none())) {
-        let holder = expect.holder[at].take().expect("a held key");
-        for world in worlds {
-            watch.at(format_args!("the case's end, {}: actor {holder} lets go of key {at}", world.name));
-            world.tell(holder, Do::Release(at, None));
-            assert_eq!(world.hear(holder), Heard::Released);
-            for other in (0..ACTORS).filter(|it| expect.waits[*it] == Some(at)) {
-                world.hear(other);
-            }
-        }
-        for waits in &mut expect.waits {
-            if *waits == Some(at) {
-                *waits = None;
-            }
-        }
+    while let Some(at) = (0..KEYS).find(|&at| expect.holder[at].is_some_and(|holder| expect.idle(holder))) {
+        let holder = expect.holder[at].expect("a held key");
+        apply(worlds, &mut expect, holder, Do::Release(at, None), watch, format_args!("the case's end"));
     }
     assert_eq!(expect.holder, [None; KEYS], "the case's end: every key held is let go");
+    assert!(expect.retry.iter().all(Option::is_none), "the case's end: every retry asked");
     for world in worlds {
         watch.at(format_args!("the case's end, {}: counting the runs left", world.name));
         assert_eq!(world.design.running(), 0);
+    }
+}
+
+/// Tells `actor` to do `todo` in both worlds, hears what came of it (and of every ask it woke),
+/// checks both said the same, and moves `expect` on.
+fn apply(worlds: &[World<'_>; 2], expect: &mut Expect, actor: usize, todo: Do, watch: &Watch, when: std::fmt::Arguments<'_>) {
+    let retry = match todo {
+        Do::Ask(..) => expect.retry_waits_for(actor),
+        _ => None,
+    };
+    // As each world will be once a key is let go: who its retries' asks meet.
+    let after = match todo {
+        Do::Release(at, _) => {
+            let mut after = expect.clone();
+            after.release(at);
+            Some(after)
+        }
+        _ => None,
+    };
+    let mut heard = Vec::new();
+    for world in worlds {
+        watch.at(format_args!("{when}, {}: told actor {actor} {todo:?}, hearing it or counting its ask's link", world.name));
+        world.tell(actor, todo);
+        let said = match todo {
+            Do::Ask(asks, _) if retry.is_some() => {
+                let gave_way = retry.expect("a retry");
+                let holder = expect.holder[gave_way].expect("a retry waits for a run held");
+                world.parked(actor, holder, asks, expect.waiting_on(asks));
+                None
+            }
+            Do::Ask(at, _) if expect.holder[at].is_some() && !expect.closes_cycle(actor, at) => {
+                world.linked_or_heard(at, expect.waiting_on(at) + 1, actor)
+            }
+            _ => Some(world.hear(actor)),
+        };
+        let mut woken = Vec::new();
+        if let (Do::Release(at, value), Some(after)) = (todo, &after) {
+            let waited: Vec<usize> = (0..ACTORS).filter(|it| expect.waits[*it] == Some(at)).collect();
+            for &other in &waited {
+                watch.at(format_args!("{when}, {}: {todo:?} by actor {actor}, hearing woken actor {other}", world.name));
+                let said = match world.hear(other) {
+                    Heard::Asked(Ok(_)) if value.is_none() => Heard::AskedAfterCancel,
+                    it => it,
+                };
+                woken.push((other, Some(said)));
+            }
+            for other in (0..ACTORS).filter(|it| expect.retry[*it].is_some_and(|(it, _)| it == at)) {
+                let Some((_, Do::Ask(asks, _))) = expect.retry[other] else { unreachable!("a retry is of an ask") };
+                watch.at(format_args!("{when}, {}: {todo:?} by actor {actor}, actor {other}'s retry asks for key {asks}", world.name));
+                let said = if asks == at && value.is_none() && !waited.is_empty() {
+                    // It asks again with the asks the cancel woke: whichever asks first runs it.
+                    Some(match world.hear(other) {
+                        Heard::Asked(Ok(_)) => Heard::AskedAfterCancel,
+                        it => it,
+                    })
+                } else if after.holder[asks].is_some() && !after.closes_cycle(other, asks) {
+                    world.linked_or_heard(asks, after.waiting_on(asks) + 1, other)
+                } else {
+                    Some(world.hear(other))
+                };
+                woken.push((other, said));
+            }
+        }
+        watch.at(format_args!("{when}, {}: after {todo:?} by actor {actor}, counting the runs", world.name));
+        heard.push((said, woken, world.design.running()));
+    }
+    assert_eq!(heard[0], heard[1], "{when}: {todo:?} by actor {actor}");
+    let (said, woken, _) = &heard[0];
+    match (todo, said) {
+        (Do::Ask(at, _), _) => match retry {
+            Some(waits) => {
+                expect.gave_way[actor] = None;
+                expect.retry[actor] = Some((waits, todo));
+            }
+            None => expect.asked(actor, at, *said),
+        },
+        (Do::Hold(at), Some(Heard::Held(true))) => expect.holder[at] = Some(actor),
+        (Do::Release(at, _), _) => {
+            let retried: Vec<(usize, usize)> = (0..ACTORS)
+                .filter_map(|it| match expect.retry[it] {
+                    Some((key, Do::Ask(asks, _))) if key == at => Some((it, asks)),
+                    _ => None,
+                })
+                .collect();
+            expect.release(at);
+            for (other, said) in woken {
+                if let Some(&(_, asks)) = retried.iter().find(|(it, _)| it == other) {
+                    expect.asked(*other, asks, *said);
+                }
+            }
+        }
+        _ => {}
     }
 }
 

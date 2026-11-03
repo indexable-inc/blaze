@@ -178,8 +178,7 @@ impl Site {
     }
 
     /// Sends the page what the world says, until it closes or goes away.
-    fn follow(&self, stream: TcpStream, accept: &str) -> io::Result<()> {
-        let mut writer = stream.try_clone()?;
+    fn follow(&self, mut writer: TcpStream, accept: &str) -> io::Result<()> {
         // alloc: the edge, once per page
         let head = format!(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
@@ -189,7 +188,7 @@ impl Site {
         let following = self.graphs.follow().map_err(io::Error::other)?;
         // The page's side is read on a thread of its own, which writes nothing: a frame of
         // its would land inside one of this thread's.
-        let reader = stream.try_clone()?;
+        let reader = writer.try_clone()?;
         let closed = std::thread::Builder::new()
             .name("blaze-web-socket".into())
             .spawn(move || read_until_closed(reader))?;

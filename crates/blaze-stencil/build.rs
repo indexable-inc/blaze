@@ -12,10 +12,13 @@
 //!   ones. The build writes the pin of what it made beside them (`OUT_DIR/stencils.json`); when
 //!   a change to the generator changes a library, the build stops naming each id and the
 //!   command that pins what it made, so the tree's pin is always what its generator makes.
+//!   The libraries are also committed, as data, in `prebuilt/` (todo/bootstrap/plan.md, "Who
+//!   owns stencil generation"), and what the pinned LLVM made must be those bytes too, so the
+//!   build stops naming the command that commits what it made.
 //! - Without it (the seed profile, todo/bootstrap/plan.md, which has no LLVM) the libraries are
-//!   copied from the directory `BLAZE_STENCILS` names, such as the `OUT_DIR` of a build with
-//!   `llvm-stencils`. The variable says only where the bytes are: a library whose bytes are not
-//!   the pinned ones is refused, naming its file, the pinned id and its own.
+//!   the committed ones in `prebuilt/`. Nothing in the environment says where they are: a
+//!   library whose bytes are not the pinned ones is refused, naming its file, the pinned id and
+//!   its own.
 //!
 //! The shape set, the hole forms and the library format are the crate's own files, included
 //! here so the generator and the patcher read one definition. They use nothing but `std`,
@@ -46,8 +49,9 @@ mod pin;
 mod shape;
 
 /// What this build script is made of and reads, relative to this crate (cargo also reruns it
-/// when a build-dependency changes): the generator, the files it includes, and the pin.
-const READS: [&str; 7] = [
+/// when a build-dependency changes): the generator, the files it includes, the pin and the
+/// committed libraries.
+const READS: [&str; 8] = [
     "build.rs",
     "gen",
     "pin.rs",
@@ -55,6 +59,7 @@ const READS: [&str; 7] = [
     "src/enc.rs",
     "src/table/format.rs",
     pin::PIN_FILE,
+    pin::PREBUILT,
 ];
 
 fn main() {
@@ -77,10 +82,31 @@ fn refuse(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1)
 }
 
+/// blaze-stencil's directory, absolute.
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+}
+
 /// The pin's path, absolute, as errors name it.
 fn pin_path() -> PathBuf {
-    PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
-        .join(pin::PIN_FILE)
+    manifest_dir().join(pin::PIN_FILE)
+}
+
+/// The directory of the committed libraries ([`pin::PREBUILT`]), absolute.
+fn prebuilt_dir() -> PathBuf {
+    manifest_dir().join(pin::PREBUILT)
+}
+
+/// The committed library of `variant`: its path and its bytes, once their id is checked to be
+/// the one its header says.
+#[cfg(not(feature = "llvm-stencils"))]
+fn committed(variant: Variant) -> (PathBuf, Vec<u8>, [u8; 32]) {
+    let path = prebuilt_dir().join(variant.file());
+    let bytes = fs::read(&path).unwrap_or_else(|e| {
+        refuse(format_args!("blaze-stencil's committed stencil library {}: {e}", path.display()))
+    });
+    let id = checked_id(&path, variant, &bytes);
+    (path, bytes, id)
 }
 
 /// Each variant's pinned id, in [`Variant::ALL`]'s order: the pin names every variant's file
@@ -155,7 +181,7 @@ fn made(out: &Path) {
     let made_pin = out.join(pin::PIN_FILE);
     fs::write(&made_pin, pin::pin_text(&made))
         .unwrap_or_else(|e| refuse(format_args!("{}: {e}", made_pin.display())));
-    let differ = match pinned() {
+    let mut differ: Vec<String> = match pinned() {
         Ok(pinned) => pinned
             .iter()
             .zip(&made)
@@ -168,52 +194,64 @@ fn made(out: &Path) {
                     pin::pin_hex(got)
                 )
             })
-            .collect::<Vec<String>>()
-            .join("; "),
-        Err(e) => e,
+            .collect(),
+        Err(e) => vec![e],
     };
+    // The committed libraries, which the seed includes, must be what was made too. A missing
+    // or broken one is a difference like a changed one: the command below commits what was made.
+    for (variant, (_, got)) in Variant::ALL.iter().zip(&made) {
+        let path = prebuilt_dir().join(variant.file());
+        let id = fs::read(&path).map_err(|e| e.to_string()).and_then(|bytes| {
+            let reader = format::Reader::new(&bytes).map_err(|e| e.to_string())?;
+            let (said, hashed) = (reader.id(), reader.hashed_id(blaze_ids::b3::hash));
+            if said == hashed && reader.variant() == *variant {
+                Ok(hashed)
+            } else {
+                Err(format!("its header says {:?} {}", reader.variant(), pin::pin_hex(&said)))
+            }
+        });
+        match id {
+            Ok(id) if id == *got => {}
+            Ok(id) => differ.push(format!(
+                "{} is committed as {} and made as {}",
+                path.display(),
+                pin::pin_hex(&id),
+                pin::pin_hex(got)
+            )),
+            Err(e) => differ.push(format!("{} is not the library made ({e})", path.display())),
+        }
+    }
     if !differ.is_empty() {
         let host = env::var("HOST").unwrap_or_else(|e| format!("<HOST: {e}>"));
+        let files: Vec<String> =
+            Variant::ALL.iter().map(|variant| out.join(variant.file()).display().to_string()).collect();
         refuse(format_args!(
             "the stencil libraries the pinned LLVM made from this tree on {host} are not the ones {} \
-             pins: {differ}. If the change to what the generator makes is meant, pin what it made: \
-             `cp {} {}`. If nothing it reads changed, the generator's output is not deterministic \
-             (AGENTS.md rule 22): {host} makes other bytes than the host that made the pin",
+             pins and {} holds: {}. If the change to what the generator makes is meant, pin and \
+             commit what it made: `cp {} {} && cp {} {}/`. If nothing it reads changed, the \
+             generator's output is not deterministic (AGENTS.md rule 22): {host} makes other bytes \
+             than the host that made the pin",
             pin_path().display(),
+            prebuilt_dir().display(),
+            differ.join("; "),
             made_pin.display(),
-            pin_path().display()
+            pin_path().display(),
+            files.join(" "),
+            prebuilt_dir().display()
         ));
     }
 }
 
-/// The pinned libraries copied from [`pin::PREBUILT`]'s directory into `out`, each refused
-/// unless its bytes are the pinned ones.
+/// The committed libraries ([`pin::PREBUILT`]) written to `out`, each refused unless its bytes
+/// are the pinned ones.
 #[cfg(not(feature = "llvm-stencils"))]
 fn prebuilt(out: &Path, pinned: &[(Variant, [u8; 32])]) {
-    let var = pin::PREBUILT;
-    println!("cargo:rerun-if-env-changed={var}");
-    let dir = env::var_os(var).filter(|it| !it.is_empty()).unwrap_or_else(|| {
-        let names: Vec<&str> = pinned.iter().map(|(variant, _)| variant.file()).collect();
-        refuse(format_args!(
-            "blaze-stencil is built without its `llvm-stencils` feature (the seed profile), so its \
-             stencil libraries come prebuilt, and {var} is unset: set it to a directory holding {}, \
-             such as blaze-stencil's OUT_DIR in a build of this tree with `llvm-stencils`; {} pins \
-             which bytes they must be",
-            names.join(", "),
-            pin_path().display()
-        ))
-    });
-    let dir = PathBuf::from(dir);
     for (variant, want) in pinned {
-        let (from, to) = (dir.join(variant.file()), out.join(variant.file()));
-        println!("cargo:rerun-if-changed={}", from.display());
-        let bytes = fs::read(&from)
-            .unwrap_or_else(|e| refuse(format_args!("{var}: {}: {e}", from.display())));
-        let id = checked_id(&from, *variant, &bytes);
+        let (from, bytes, id) = committed(*variant);
         if id != *want {
             refuse(format_args!(
-                "{var}: {} is not the library {} pins: its id is {}, and the pinned one is {}; point \
-                 {var} at the libraries a build of this tree with `llvm-stencils` made",
+                "{} is not the library {} pins: its id is {}, and the pinned one is {}; a build of \
+                 this tree with `llvm-stencils` says how to commit the pinned libraries",
                 from.display(),
                 pin_path().display(),
                 pin::pin_hex(&id),
@@ -221,7 +259,8 @@ fn prebuilt(out: &Path, pinned: &[(Variant, [u8; 32])]) {
             ));
         }
         // The bytes checked, never the file again: what is included is what was checked.
+        let to = out.join(variant.file());
         fs::write(&to, &bytes)
-            .unwrap_or_else(|e| refuse(format_args!("{var}: writing {}: {e}", to.display())));
+            .unwrap_or_else(|e| refuse(format_args!("writing {}: {e}", to.display())));
     }
 }
