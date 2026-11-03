@@ -246,6 +246,12 @@ impl<'db> Machine<'db> for Provenance {
     fn function(&mut self, _: u64) -> Option<()> {
         Some(())
     }
+    /// A vtable pointer has provenance, as rustc's `GlobalAlloc::VTable` does: a constant
+    /// says which of its words are vtables, and its id says of which type and trait.
+    #[inline(always)]
+    fn vtable(&mut self, _: u64) -> Option<()> {
+        Some(())
+    }
     #[inline(always)]
     fn freeze(&mut self, _: u64) {}
     #[inline(always)]

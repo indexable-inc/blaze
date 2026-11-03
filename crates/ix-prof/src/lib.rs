@@ -228,7 +228,7 @@ pub(crate) fn with_recorder(f: impl FnOnce(&mut core::Recorder)) {
 /// Starts the profiler; it stops, and writes its profile, when the guard drops.
 ///
 /// Every step that can fail (binding the endpoint, the sampler, the ticker and server
-/// threads, writing `http.addr`) runs before the session is published and recording turned
+/// threads, writing `http.endpoint`) runs before the session is published and recording turned
 /// on, and a failure stops whatever had started: an `Err` leaves no thread running, nothing
 /// recording and no session, so a later `start` begins clean.
 pub fn start(config: Config) -> Result<Guard, Error> {
@@ -429,8 +429,9 @@ fn retract(session: &Session, token: &str) {
 
 /// Makes `dir` and its missing parents, mode 0700, and opens it checked
 /// ([`endpoint::PrivateDir::open`]): a profile, and the endpoint's token, are for this user
-/// only, so a directory that is a link, someone else's, or open to group or other is refused,
-/// never used and never changed.
+/// only, so a directory that is a link, someone else's, open to group or other, with an ACL
+/// (on macOS, inherited from a parent another user owns), or on a volume that ignores ownership
+/// or is a network one, is refused, never used and never changed.
 fn private_dir(dir: &std::path::Path) -> Result<endpoint::PrivateDir, String> {
     let mut b = std::fs::DirBuilder::new();
     b.recursive(true);

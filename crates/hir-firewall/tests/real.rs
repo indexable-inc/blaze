@@ -75,7 +75,8 @@ fn an_edit_of_each_function_of_the_harness_projects_reaches_only_it() {
         for package in &project.packages {
             let krate = krate(&lowered.1, &lowered.0, package).unwrap_or_else(|error| panic!("{error}"));
             let names = Arc::clone(lowered.0.paths());
-            let codegen = Codegen::dev(package, names).unwrap_or_else(|error| panic!("{error}"));
+            let host = blaze_lower::target_data(hir_ty_codegen::Target::host()).unwrap_or_else(|error| panic!("{error}"));
+            let codegen = Codegen::dev(package, names, &host).unwrap_or_else(|error| panic!("{error}"));
             let report = harness(lowered.0.served_db(), krate, codegen, project.stride)
                 .unwrap_or_else(|error| panic!("{}: `{package}`: {error}", project.dir));
             eprintln!("{}: `{package}`: {report}", project.dir);

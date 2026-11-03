@@ -19,7 +19,7 @@ Three parts were asked for; two are built, one is designed here and not built:
 ## Using it
 
 ```sh
-mkdir -p target/layout                 # opt in: links now write address maps there
+mkdir -p -m 700 target/layout          # opt in: links write address maps there; IX_PROF needs 0700
 blaze build --release                  # links once more (the key changed), writes the map
 IX_PROF=target/layout ./target/release/app <workload>   # writes app-<pid>.ixprof there
 blaze build --release                  # relinks laid out by the profile

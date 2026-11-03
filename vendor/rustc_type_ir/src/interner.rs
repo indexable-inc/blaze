@@ -569,6 +569,13 @@ pub trait Interner:
 
     fn trait_is_fundamental(self, def_id: Self::TraitId) -> bool;
 
+    /// blaze: whether no crate but the trait's own may implement it (`#[blaze::sealed]`), so a
+    /// trait-ref of it never has a downstream or cousin implementor in coherence.
+    fn trait_is_sealed(self, def_id: Self::TraitId) -> bool {
+        let _ = def_id;
+        false
+    }
+
     /// Returns `true` if this is an `unsafe trait`.
     fn trait_is_unsafe(self, trait_def_id: Self::TraitId) -> bool;
 

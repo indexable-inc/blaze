@@ -92,6 +92,19 @@ pub(super) fn run_as(
     alone(Job::Run { spec: spec.clone(), program, unshared: Some(unshared) })
 }
 
+/// [`run_as`], and also what it and the sandbox wrote, which is not written to this test's
+/// stderr.
+#[cfg(target_os = "linux")]
+pub(super) fn run_as_said(
+    spec: &super::Spec,
+    program: Option<&[OsString]>,
+    unshared: String,
+) -> (Result<i32, String>, String) {
+    let program = program.map(<[OsString]>::to_vec);
+    // clone: once per sandbox a test makes, the job it is sent as.
+    said(Job::Run { spec: spec.clone(), program, unshared: Some(unshared) })
+}
+
 /// [`run`], and also what it and the sandbox wrote, which is not written to this test's stderr.
 #[cfg(target_os = "linux")]
 pub(super) fn run_said(spec: &super::Spec, program: Option<&[OsString]>) -> (Result<i32, String>, String) {

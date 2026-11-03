@@ -260,7 +260,11 @@ fn policy(heap_to_stack: bool) -> Policy {
     static TOOLCHAIN: std::sync::OnceLock<blaze_codegen::settings::Toolchain> = std::sync::OnceLock::new();
     let toolchain = TOOLCHAIN.get_or_init(|| {
         let target = crate::Target::for_fixtures().triple();
-        let toolchain = crate::v2::toolchain(target, &[], Runs::Elsewhere).expect("the fixture's toolchain");
+        // The fixture's own code generator: nothing it makes is kept past the process.
+        let code = crate::v2::CodegenCode(blaze_ids::ContentId::of("blaze v2 edits fixture code", b""));
+        let target_data = crate::v2::toolchain::fixture_target_data(target);
+        let toolchain =
+            crate::v2::toolchain_for(&code, target, &target_data, &[], Runs::Elsewhere).expect("the fixture's toolchain");
         crate::v2::select(&toolchain).expect("the fixture's code generator");
         toolchain
     });
@@ -302,7 +306,7 @@ fn build(
     let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), build_time).with_policy(&policy);
     let krate = fixture::test_crate(db);
     let roots = frontend.roots(krate, RootKind::Library).map_err(|it| it.what)?;
-    let origin = frontend.with(|hir, _| frontend.origin(hir, krate));
+    let origin = frontend.with(|hir| frontend.origin(hir, krate));
     let asked: Vec<_> = roots.roots.iter().map(|it| (it.clone(), origin)).collect();
     let backends = Backends::default();
     driver::Build::new(&backends, &frontend, &policy, memo)

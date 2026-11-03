@@ -8,9 +8,12 @@ fn here(flags: &[&str]) -> Result<Toolchain, String> {
     runs(Target::host(), flags, Runs::Here)
 }
 
+/// The code generator these tests make toolchains as: no program hands one over to a test.
+const CODE: CodegenCode = CodegenCode(ContentId([7; 32]));
+
 fn runs(target: &str, flags: &[&str], runs: Runs) -> Result<Toolchain, String> {
     let flags: Vec<String> = flags.iter().map(|it| (*it).to_owned()).collect();
-    toolchain(target, &flags, runs)
+    toolchain_for(&CODE, target, &fixture_target_data(target), &flags, runs)
 }
 
 /// Whether blaze emits code for the machine the tests run on.
@@ -33,18 +36,64 @@ fn no_flags_is_the_targets_baseline() {
     assert_eq!(it.id, of(LINUX, &[]).unwrap().id, "one identity for one blaze");
 }
 
-/// The code under a code hash is what this blaze makes of it: a store kept across blaze builds
-/// (one `BLAZE_HOME` the self-build reuses) held another build's template under the key of
-/// one this build made, and the put of this build's was refused as other bytes.
+/// The code under a code hash is what this code generator makes of it: another code generator
+/// is another toolchain, and so a store kept across blaze builds holds no other generator's
+/// template under the key of this one's. A blaze build with the code generator's code
+/// unchanged (an edit to the CLI) is the same toolchain: its id reads no executable.
 #[test]
-fn another_blaze_build_is_another_toolchain() {
+fn another_code_generator_is_another_toolchain() {
     assert!(NIGHTLY.starts_with("nightly-") && !NIGHTLY.contains(char::is_whitespace), "{NIGHTLY:?}");
-    let this = build_of(&std::env::current_exe().unwrap()).unwrap();
-    assert_eq!(build().unwrap(), this);
-    assert_eq!(of(LINUX, &[]).unwrap().id, temporary_executable_id(&this));
-    let mut other = this;
-    other.0[0] ^= 1;
-    assert_ne!(temporary_executable_id(&other), temporary_executable_id(&this));
+    let this = of(LINUX, &[]).unwrap();
+    assert_eq!(this.id, id_of(&CODE, &fixture_target_data(LINUX)));
+    let mut other = CODE;
+    other.0.0[0] ^= 1;
+    let flags: [String; 0] = [];
+    let elsewhere = toolchain_for(&other, LINUX, &fixture_target_data(LINUX), &flags, Runs::Elsewhere).unwrap();
+    assert_ne!(elsewhere.id, this.id);
+    assert_eq!(Toolchain { id: this.id, ..elsewhere }, this, "the code is the id alone");
+}
+
+/// C3 of the review: the data layout the front end lays a unit's types out by is read from
+/// data past the code generator's packages (blaze-units' recorded target spec), so the code
+/// identity does not cover it: the toolchain's id does. Two target datas differing in their
+/// layout alone are two toolchains, and a toolchain is made only of its own target's data.
+#[test]
+fn another_data_layout_is_another_toolchain() {
+    let flags: [String; 0] = [];
+    let this = toolchain_for(&CODE, LINUX, &fixture_target_data(LINUX), &flags, Runs::Elsewhere).unwrap();
+    let mut other = fixture_target_data(LINUX);
+    other.data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128".into();
+    let relaid = toolchain_for(&CODE, LINUX, &other, &flags, Runs::Elsewhere).unwrap();
+    assert_ne!(relaid.id, this.id, "the data layout is in the toolchain's id");
+    assert_eq!(Toolchain { id: this.id, ..relaid }, this, "the layout is the id alone");
+    let why = toolchain_for(&CODE, LINUX, &fixture_target_data("aarch64-unknown-linux-gnu"), &flags, Runs::Elsewhere)
+        .unwrap_err();
+    assert!(why.contains(LINUX) && why.contains("aarch64-unknown-linux-gnu"), "{why}");
+}
+
+/// A process makes no toolchain before its code generator's code identity is handed over, and
+/// takes no second, other one: no key falls back to the executable's bytes.
+#[test]
+fn the_code_identity_is_handed_over_once() {
+    // This test binary's one hand-over: every other test names its code itself.
+    let code = CodegenCode(ContentId([9; 32]));
+    match code_or_unset() {
+        None => {
+            assert!(toolchain(LINUX, &fixture_target_data(LINUX), &[], Runs::Elsewhere).unwrap_err().contains("BLAZE_CODEGEN_CODE"));
+            set_code(code).unwrap();
+        }
+        Some(it) => assert_eq!(it, code),
+    }
+    set_code(code).unwrap();
+    let mut other = code;
+    other.0.0[1] ^= 1;
+    let refused = set_code(other).unwrap_err();
+    assert!(refused.contains(&format!("{:x}", code.0)) && refused.contains(&format!("{:x}", other.0)), "{refused}");
+    assert_eq!(toolchain(LINUX, &fixture_target_data(LINUX), &[], Runs::Elsewhere).unwrap().id, id_of(&code, &fixture_target_data(LINUX)));
+}
+
+fn code_or_unset() -> Option<CodegenCode> {
+    code().ok()
 }
 
 #[test]
@@ -232,4 +281,63 @@ fn the_versions_are_the_ones_blaze_is_built_with() {
         }
         None => assert!(!cfg!(feature = "llvm")),
     }
+}
+
+/// Rule 23 and the point of the code identity: a dev template one blaze build kept is read by
+/// the next after a restart of the store, when the next differs from it only outside the code
+/// generator (its CLI), and by no build whose code generator differs. The two blaze builds are
+/// `blaze_codegen_code`'s made-up workspace before and after each edit, their codes worked out
+/// as blaze-engine's build script works them out.
+#[test]
+fn a_template_kept_by_one_blaze_build_is_read_by_the_next() {
+    use blaze_codegen::settings::{DebugInfo, Panic, Pgo, Sanitize, Spec};
+    let workspace = blaze_codegen_code::fixture::Workspace::new("restart", false);
+    let built = workspace.code();
+    workspace.write("crates/cli/src/main.rs", "fn main() { println!(\"another CLI\") }\n");
+    let cli_edited = workspace.code();
+    workspace.write("crates/front/src/lib.rs", "pub fn lower() { /* another front end */ }\n");
+    let codegen_edited = workspace.code();
+
+    let stored = blaze_codegen::InstanceKey(ContentId::of("blaze v2 toolchain test instance", b"main"));
+    let key = |code: [u8; 32]| {
+        let toolchain = toolchain_for(&CodegenCode(ContentId(code)), LINUX, &fixture_target_data(LINUX), &[], Runs::Elsewhere).unwrap();
+        let spec = Spec {
+            toolchain,
+            backend: blaze_codegen::Backend::Stencil,
+            overflow_checks: true,
+            debug_assertions: true,
+            panic: Panic::Unwind,
+            debuginfo: DebugInfo::None,
+            fold: false,
+            counted: true,
+            mir_inline: false,
+            sanitize: Sanitize::default(),
+            pgo: Pgo::None,
+            proc_macro_bridge: false,
+            heap_to_stack: false,
+            report: false,
+            fuel: false,
+        };
+        blaze_codegen::kernel::template(&stored, &spec.settings(), &spec.toolchain.id)
+    };
+    // Rule 22: one key for one code, whenever it is worked out.
+    assert_eq!(key(built), key(built));
+    assert_eq!(key(cli_edited), key(built), "a blaze rebuilt with only its CLI edited keys templates alike");
+    assert_ne!(key(codegen_edited), key(built), "a blaze whose code generator changed keys templates apart");
+
+    let root = std::env::temp_dir().join(format!("blaze-codegen-code-restart-store-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let template = b"the bytes of one dev template".to_vec();
+    {
+        let mut driven = blaze_cas::Driven::open(&root).unwrap();
+        driven.store().put(key(built), blaze_cas::Kind::Code, template.clone()).unwrap();
+        driven.flush().unwrap();
+    }
+    let mut driven = blaze_cas::Driven::open(&root).unwrap();
+    let got = driven.store().get(&key(cli_edited)).unwrap().expect("the store came back without the template the last blaze build kept");
+    assert_eq!(got.bytes, template.as_slice());
+    assert!(driven.store().get(&key(codegen_edited)).unwrap().is_none());
+    drop(driven);
+    std::fs::remove_dir_all(&root).unwrap();
 }

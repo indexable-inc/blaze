@@ -14,8 +14,12 @@
 //!   package, its `OUT_DIR`, the target directory, the workspace, blaze's tools and launcher
 //!   ([`Place::roots`]), so the same script of the same package in another checkout is found
 //!   (not on Windows, where a run has no roots).
-//! - The jobserver's variables ([`RUN_ONLY`]) are of this run alone, as they are not in
-//!   cargo's fingerprint: neither given nor traced.
+//! - The jobserver's variable ([`RUN_ONLY`], `CARGO_MAKEFLAGS`) is of this run alone, as it is
+//!   not in cargo's fingerprint: neither given nor traced. make's own ([`MAKE_FLAGS`]:
+//!   `MAKEFLAGS`, `MFLAGS`, passed through from a build started under make) carry its flags
+//!   and its variable overrides (`make CFLAGS=-O3`) as well, which a script that runs make
+//!   honours: they are traced as any variable passed through, by their value without the
+//!   jobserver's parts ([`make_flags`]).
 //! - **Elided** (#1296): a script that provably only prints constant cargo directives is not
 //!   compiled or run; what it prints is known from its source ([`inert`]). In verify mode it
 //!   is run as well, and the two must agree ([`verify_elided`]).
@@ -35,10 +39,17 @@ use crate::{
     roots::{Role, RoleSet, RootMap},
     rule::CargoRule,
     run::{self, Mode, OutFile, Value},
+    trace::ALL_ENV_NAME,
 };
 
 /// Variables of one run alone: a script's jobserver, which another run is given another of.
-pub const RUN_ONLY: &[&str] = &["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"];
+pub const RUN_ONLY: &[&str] = &["CARGO_MAKEFLAGS"];
+
+/// make's variables, passed through from a build started under make: its flags and variable
+/// overrides, which a script that runs make honours, and the jobserver of make's run, which is
+/// of that run alone. What is traced and checked of them is their value without the
+/// jobserver's parts ([`make_flags`]).
+pub const MAKE_FLAGS: &[&str] = &["MAKEFLAGS", "MFLAGS"];
 
 /// What a script's run needs that the unit doesn't say.
 #[derive(Debug)]
@@ -61,13 +72,34 @@ pub struct Place {
 #[derive(Debug)]
 pub struct Prepared {
     pub spec: run::Spec,
-    /// What the script sees: the environment [`crate::inputs::Disk`] answers a check with,
-    /// so a traced variable is compared with what a run now would see.
+    /// The environment a check of its inputs sees, the one [`crate::inputs::Disk`] answers it
+    /// with: what the script sees but the names given ([`Prepared::given`], whose values the
+    /// key has) and of the run alone ([`RUN_ONLY`]), sorted by name and each once, as
+    /// [`crate::inputs::Env`] keeps it. What [`keyed`] leaves of a trace is what this
+    /// environment gives, so a run that read the whole environment (every traced run does, as
+    /// a sandbox passes it on whole to what it starts) is found again under the key it was
+    /// kept under.
     pub env: Vec<(OsString, OsString)>,
     /// The names given, which are left out of what is traced: the key has them already.
     pub given: Vec<OsString>,
     /// What the key was made of: `made.finish()` is `spec.key.given`.
     pub made: Given,
+}
+
+impl Prepared {
+    /// The script's whole environment, as it is started in it (its command's), given names
+    /// and make's jobserver too: what a pure key's variables have the values of, on keep as on
+    /// find ([`script_env`]). A pure key has no given part, so [`Prepared::env`], which leaves
+    /// the given names out, would keep each of them as not set and never be found again.
+    pub fn script_env(&self) -> &[(OsString, OsString)] {
+        &self.spec.command.env
+    }
+}
+
+/// The environment `unit`'s script sees, started in `inherited`: what [`prepare`] starts its
+/// run in ([`Prepared::script_env`]), and what a pure key's find reads its variables from.
+pub fn script_env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Vec<(OsString, OsString)>, Error> {
+    Ok(blaze_build_script::env(unit, inherited)?.vars)
 }
 
 /// `unit`'s run, in a build started with `inherited` (cargo's environment once started:
@@ -101,6 +133,7 @@ pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -
     let key = RunKey { code: place.code, given: given.finish() };
     roots.bind(bound);
     let vars: Vec<(OsString, OsString)> = env.vars.into_iter().collect(); // alloc: setup, the script's environment
+    let checked = checked_env(&vars, &names);
     let command = Command {
         program: unit.script.clone(), // clone: setup, the command owns its program
         args: Vec::new(), // alloc: none, an empty list
@@ -118,17 +151,157 @@ pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -
     };
     // clone: setup, the run owns its OUT_DIR
     let spec = run::Spec { key, command, out_dir: Some(unit.out_dir.clone()), mode: place.mode, roots };
-    Ok(Prepared { spec, env: vars, given: names, made: given })
+    Ok(Prepared { spec, env: checked, given: names, made: given })
+}
+
+/// `vars`, the script's environment, as a check of its inputs sees it ([`Prepared::env`]):
+/// without the names `given` and of the run alone, sorted by name, each name once, make's
+/// variables without their jobserver ([`make_flags`]).
+fn checked_env(vars: &[(OsString, OsString)], given: &[OsString]) -> Vec<(OsString, OsString)> {
+    let mut checked: Vec<(OsString, OsString)> = vars
+        .iter()
+        .filter(|(name, _)| !run_only(name) && !given.contains(name))
+        .cloned() // clone: setup, the check's environment, once per run prepared
+        .collect(); // alloc: as above
+    // As `inputs::Env::new` keeps it: sorted stably by name, the first of a name kept. The
+    // first is the one the sandbox's trace has too, so make's are stripped after.
+    checked.sort_by(|a, b| a.0.cmp(&b.0));
+    checked.dedup_by(|later, first| later.0 == first.0);
+    checked.retain_mut(|(name, value)| match make_flag(name) {
+        true => match make_flags(value) {
+            Some(kept) => {
+                *value = kept;
+                true
+            }
+            None => false,
+        },
+        false => true,
+    });
+    checked
 }
 
 fn run_only(name: &OsStr) -> bool {
     RUN_ONLY.iter().any(|it| name == *it)
 }
 
+fn make_flag(name: &OsStr) -> bool {
+    MAKE_FLAGS.iter().any(|it| name == *it)
+}
+
+/// `value`, of one of [`MAKE_FLAGS`], without what names one run's jobserver: the words `-j`,
+/// `-j<N>`, `--jobs`, `--jobs=<N>`, `--jobserver-auth=..` and `--jobserver-fds=..`, which
+/// cargo's fingerprint ignores as well. What follows the word `--` is make's variable
+/// overrides, kept as they are. `None` when nothing else is left: a build started under make
+/// with no flag of its own is as one started outside make. A value that is not UTF-8 is kept
+/// whole (make writes text; one that is not is then keyed with its jobserver, which only misses).
+pub fn make_flags(value: &OsStr) -> Option<OsString> {
+    let Some(text) = value.to_str() else { return Some(value.to_owned()) }; // alloc: setup, once per run prepared
+    let mut kept: Vec<&str> = Vec::new(); // alloc: setup, once per run prepared under make
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if rest.is_empty() {
+            break;
+        }
+        // A word ends at whitespace that is not escaped (make writes `\ ` for a space in one).
+        let mut escaped = false;
+        let end = rest
+            .char_indices()
+            .find(|&(_, c)| {
+                let ends = !escaped && c.is_ascii_whitespace();
+                escaped = !escaped && c == '\\';
+                ends
+            })
+            .map_or(rest.len(), |(at, _)| at);
+        let (word, after) = rest.split_at(end);
+        if word == "--" {
+            kept.push(rest);
+            break;
+        }
+        if !jobserver(word) {
+            kept.push(word);
+        }
+        rest = after;
+    }
+    (!kept.is_empty()).then(|| kept.join(" ").into()) // alloc: setup, as above
+}
+
+/// Whether `word` of make's flags is of its jobserver: how many jobs, and where their tokens are.
+fn jobserver(word: &str) -> bool {
+    let jobs = |count: &str| count.bytes().all(|it| it.is_ascii_digit());
+    word.strip_prefix("-j").is_some_and(jobs)
+        || word == "--jobs"
+        || word.strip_prefix("--jobs=").is_some_and(jobs)
+        || word.starts_with("--jobserver-auth=")
+        || word.starts_with("--jobserver-fds=")
+}
+
+/// A variable's value as an error may show it: whether it is set and its length, never the
+/// value, which can be a secret passed through to the script.
+fn shown(value: Option<&OsStr>) -> String {
+    // alloc: error path
+    value.map_or_else(|| "unset".to_owned(), |it| format!("a value of {} bytes", it.len()))
+}
+
 /// What is traced of a run of `prepared`, without what its key has already and what is of
-/// that run alone: what the run's result is kept under.
-pub fn keyed(prepared: &Prepared, traced: &mut Traced) {
+/// that run alone: what the run's result is kept under. The whole environment, when it was
+/// read, is the one a check sees ([`Prepared::env`]): its entries are what is left once the
+/// given names and those of the run alone are taken out, and its names' hash
+/// ([`ALL_ENV_NAME`]) is made again over them, so a check that hashes [`Prepared::env`] whole
+/// makes the same key (rule 18: one input, one value, on both sides). make's variables are
+/// kept by their value without the jobserver ([`make_flags`]), as the check has them.
+///
+/// What is left must be what [`Prepared::env`] says, each variable read by its value there
+/// (or not set) and, when the whole environment was read, every one of it: a trace that holds
+/// another value, or misses one, would be kept under a key no check makes again, and is an
+/// error naming the variable rather than a run that is never found.
+pub fn keyed(prepared: &Prepared, traced: &mut Traced) -> Result<(), Error> {
     traced.env.retain(|(name, _)| !run_only(name) && !prepared.given.contains(name));
+    for (name, value) in &mut traced.env {
+        if make_flag(name) {
+            *value = value.take().and_then(|it| make_flags(&it));
+        }
+    }
+    let whole = traced.env.iter().any(|it| it.0 == ALL_ENV_NAME);
+    if whole {
+        // A make variable left with nothing is not set, as the check's environment has it:
+        // what read the whole environment did not read it.
+        traced.env.retain(|(name, value)| value.is_some() || !make_flag(name));
+    }
+    let checked = |name: &OsStr| {
+        prepared.env.binary_search_by(|it| it.0.as_os_str().cmp(name)).ok().map(|at| prepared.env[at].1.as_os_str())
+    };
+    for (name, value) in traced.env.iter().filter(|it| it.0 != ALL_ENV_NAME) {
+        if value.as_deref() != checked(name) {
+            // alloc: error path
+            return Err(Error(format!(
+                "{} was traced reading `{}` as {}, and a check of it reads {}: its \
+                 result would be kept under a key no check makes (rule 18, a bug in blaze; \
+                 the values are not shown, as a variable can hold a secret)",
+                prepared.spec.command.program.display(),
+                name.display(),
+                shown(value.as_deref()),
+                shown(checked(name))
+            )));
+        }
+    }
+    if whole {
+        // About a hundred names on each side, once per run kept: no order of the trace assumed.
+        let missing = prepared.env.iter().find(|(name, _)| !traced.env.iter().any(|it| it.0 == *name));
+        if let Some((name, _)) = missing {
+            // alloc: error path
+            return Err(Error(format!(
+                "{} read its whole environment, and its trace has no `{}`, which a check of \
+                 it reads: its result would be kept under a key no check makes (rule 18, a bug in blaze)",
+                prepared.spec.command.program.display(),
+                name.display()
+            )));
+        }
+        if let Some(all) = traced.env.iter_mut().find(|it| it.0 == ALL_ENV_NAME) {
+            all.1 = Some(crate::trace::names_hash(&prepared.env).into());
+        }
+    }
+    Ok(())
 }
 
 /// What cargo watches of `unit`'s run that ended as `exit` did: its `rerun-if-changed` and
@@ -271,8 +444,192 @@ mod tests {
             ],
             ..Traced::default()
         };
-        keyed(&prepared, &mut traced);
+        keyed(&prepared, &mut traced).unwrap();
         assert_eq!(traced.env, vec![("CC".into(), None)]);
+    }
+
+    /// A trace that says another value than the check's environment has, or misses a variable
+    /// of it when the whole environment was read, is refused naming the variable: kept, it
+    /// would be under a key no check makes, and the run would never be found again.
+    #[test]
+    fn a_trace_that_disagrees_with_the_check_is_refused_naming_the_variable() {
+        let prepared = prepare(&unit(), &inherited("/a"), &place()).unwrap();
+        let mut other = Traced { env: vec![("PATH".into(), Some("/elsewhere".into()))], ..Traced::default() };
+        let error = keyed(&prepared, &mut other).unwrap_err();
+        assert!(error.0.contains("`PATH`") && error.0.contains("a value of 10 bytes"), "{error:?}");
+        // A value can be a secret: the error names its length, never its bytes.
+        assert!(!error.0.contains("/elsewhere"), "{error:?}");
+        // The whole environment read, every variable of the check's there but `HOME`.
+        let mut env = vec![(OsString::from(ALL_ENV_NAME), Some(OsString::from("h")))];
+        env.extend(prepared.env.iter().filter(|it| it.0 != "HOME").map(|(name, value)| (name.clone(), Some(value.clone()))));
+        let mut short = Traced { env, ..Traced::default() };
+        let error = keyed(&prepared, &mut short).unwrap_err();
+        assert!(error.0.contains("no `HOME`"), "{error:?}");
+    }
+
+    #[test]
+    fn make_flags_are_kept_without_their_jobserver() {
+        let kept = |value: &str| make_flags(OsStr::new(value)).map(|it| it.into_string().unwrap());
+        assert_eq!(kept("-j8 --jobserver-auth=3,4"), None);
+        assert_eq!(kept(" -j --jobserver-fds=3,4 -j"), None);
+        assert_eq!(kept("--jobs=4 --jobserver-auth=fifo:/tmp/GMfifo1"), None);
+        assert_eq!(kept("k -j8 --jobserver-auth=3,4"), Some("k".into()));
+        assert_eq!(kept("k -j8 --jobserver-auth=3,4 -- CFLAGS=-O3"), Some("k -- CFLAGS=-O3".into()));
+        // Overrides are kept as they are, a `-j` among them too; an escaped space is in its word.
+        assert_eq!(kept(" -- CFLAGS=-O3\\ -j2  X=1"), Some("-- CFLAGS=-O3\\ -j2  X=1".into()));
+        assert_eq!(kept("-I/a\\ b -j3"), Some("-I/a\\ b".into()));
+        assert_eq!(kept("-jx"), Some("-jx".into()));
+    }
+
+    /// make's variables carry its variable overrides (`make CFLAGS=-O3`), which a script that
+    /// runs make honours: they are traced and checked by their value without the jobserver, so
+    /// another jobserver finds the run kept and another override does not. A script that
+    /// names one in `rerun-if-env-changed` has that value recorded.
+    #[cfg(not(windows))] // Windows has no roots, and the check here goes through them.
+    #[test]
+    fn make_flags_are_inputs_without_their_jobserver() {
+        use crate::{inputs::Disk, rule};
+
+        let make = |flags: &str| {
+            let mut env = inherited("/a");
+            env.push(("MAKEFLAGS".into(), flags.into()));
+            env.push(("CARGO_MAKEFLAGS".into(), flags.into()));
+            prepare(&unit(), &env, &place()).unwrap()
+        };
+        let first = make("k -j8 --jobserver-auth=3,4 -- CFLAGS=-O3");
+        assert!(first.env.iter().any(|it| it.0 == "MAKEFLAGS" && it.1 == "k -- CFLAGS=-O3"), "{:?}", first.env);
+        assert!(!first.env.iter().any(|it| it.0 == "CARGO_MAKEFLAGS"));
+        let store = kept_whole(&first);
+        assert!(finds(&store, &make("k -j4 --jobserver-auth=5,6 -- CFLAGS=-O3")), "another jobserver misses");
+        assert!(!finds(&store, &make("k -j8 --jobserver-auth=3,4 -- CFLAGS=-O0")), "another override finds");
+        assert!(!finds(&store, &make("-j8 --jobserver-auth=3,4")), "no override finds the run given one");
+        // Only the jobserver: as a build outside make.
+        let outside = kept_whole(&prepare(&unit(), &inherited("/a"), &place()).unwrap());
+        assert!(finds(&outside, &make("-j8 --jobserver-auth=3,4")));
+        // Cargo's rule records what the check has of it.
+        let mut traced = Traced { untraceable: vec![blaze_core::Untraceable::Clock], ..Traced::default() };
+        let watched = CargoRule { env: vec!["MAKEFLAGS".into(), "CARGO_MAKEFLAGS".into()], ..CargoRule::default() };
+        rule::widen(&mut traced, &watched, &mut Disk::new(first.env.clone())).unwrap();
+        assert_eq!(traced.env, vec![("CARGO_MAKEFLAGS".into(), None), ("MAKEFLAGS".into(), Some("k -- CFLAGS=-O3".into()))]);
+    }
+
+    /// The store a run of `prepared` that read its whole environment leaves, as `Run::complete`
+    /// keeps it: its shape in the run's first slot, and its result.
+    #[cfg(not(windows))]
+    fn kept_whole(prepared: &Prepared) -> Vec<(blaze_cas::Key, Vec<u8>)> {
+        use crate::{
+            index::{self, Shape},
+            inputs::Disk,
+            trace::{self, ALL_ENV, Line, Seen},
+        };
+
+        // The run, as the sandbox reports it: the whole environment it was started with.
+        let lines = [Line::new(Seen::Env, "", ALL_ENV)];
+        let mut traced = trace::assemble(&lines, None, &mut Disk::new(prepared.spec.command.env.clone())).unwrap();
+        keyed(prepared, &mut traced).unwrap();
+        let roots = prepared.spec.roots.view();
+        let (marked, stored) = roots.kept(&traced, &elided(b"cargo:rustc-cfg=x\n".to_vec())).unwrap();
+        vec![
+            (index::slot(&prepared.spec.key, 0), Shape::of(&marked.local).encode()),
+            (index::result_key(&prepared.spec.key, &marked.local), stored.encode()),
+        ]
+    }
+
+    /// Whether a check of `prepared`, as the daemon makes it, finds a run in `store`.
+    #[cfg(not(windows))]
+    fn finds(store: &[(blaze_cas::Key, Vec<u8>)], prepared: &Prepared) -> bool {
+        use crate::{
+            index::{self, Found},
+            inputs::Disk,
+            roots::Rooted,
+        };
+
+        let get = |key: &blaze_cas::Key| {
+            Ok::<_, blaze_cas::Corrupt>(store.iter().find(|it| it.0 == *key).map(|it| it.1.as_slice()))
+        };
+        let mut disk = Disk::new(prepared.env.clone());
+        let found = index::search(get, &prepared.spec.key, &mut Rooted::new(prepared.spec.roots.view(), &mut disk));
+        match found {
+            Ok(Found::Hit { .. }) => true,
+            Ok(Found::Miss { .. }) => false,
+            Err(error) => panic!("checking the run: {error:?}"),
+        }
+    }
+
+    /// A pure key has no given part: its variables (what cargo gives the script, `TARGET`,
+    /// `OUT_DIR`) are kept by their values, read from the script's whole environment on keep
+    /// as on find. Kept from the trimmed environment a sandboxed run's own key is checked
+    /// with, every given variable would be kept as not set: never found by the next build's
+    /// lookup, and two runs given other values would collide on one key.
+    #[cfg(not(windows))] // Windows has no roots.
+    #[test]
+    fn a_pure_key_kept_by_a_sandboxed_run_is_found_by_the_next_lookup() {
+        use blaze_cas::{Config, Store};
+        use blaze_core::{FileName, run_until_idle, sim::Faults, sim::Sim};
+
+        use crate::{
+            inputs::Disk,
+            pure::{self, Proof},
+        };
+
+        let mut sim = Sim::new(11, Faults::default());
+        let mut effects = Vec::new();
+        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+        let mut store = Store::open(config, &mut effects);
+        run_until_idle(&mut sim, &mut effects, |completion, effects| {
+            store.complete(completion, effects);
+        });
+        assert!(store.ready());
+        let proof = Proof {
+            identity: ContentId::of("blaze v2 test 1", b"pure script"),
+            env: vec!["OUT_DIR".into(), "TARGET".into()],
+            reads: false,
+            writes: false,
+            prints: true,
+        };
+        let value = elided(b"cargo:rustc-cfg=x\n".to_vec());
+        // Kept as the daemon keeps it when the sandboxed run ends: from its Start.
+        let prepared = prepare(&unit(), &inherited("/a"), &place()).unwrap();
+        let mut disk = Disk::new(prepared.script_env().to_vec());
+        pure::keep(&mut store, &proof, prepared.spec.roots.view(), Vec::new(), &mut disk, &value).unwrap();
+        // The next build's lookup, before anything is compiled: the script's environment made
+        // again, under the run's roots.
+        let roots = place().roots.with(Role::Package, &unit().package.manifest_dir).with(Role::OutDir, &unit().out_dir);
+        let reader = store.reader();
+        let guard = blaze_cas::enter();
+        let find = |unit: &Unit| {
+            let mut disk = Disk::new(script_env(unit, &inherited("/a")).unwrap());
+            pure::find(&reader, &guard, &proof, roots.view(), &mut disk).unwrap()
+        };
+        assert_eq!(find(&unit()), Some(value), "a pure key kept by a run is not found by the next build");
+        let mut other = unit();
+        other.target = "aarch64-unknown-linux-gnu".into();
+        assert_eq!(find(&other), None, "a given variable the script reads is not in its pure key");
+    }
+
+    /// What a run that read the whole environment (every traced run: a sandbox passes it on
+    /// whole to what the script starts, `$RUSTC` for `autocfg`) is kept under, as a run's
+    /// completion keeps it, is what a check of the next build makes: a no-op rebuild reuses
+    /// it rather than running it again. Before, the check hashed the given variables
+    /// (`OUT_DIR`, `TARGET`, ...) into the key and the kept trace did not, so every build ran
+    /// every script again, and a script whose `OUT_DIR` names are random (`autocfg`'s probe
+    /// crates) failed with the store's mismatch.
+    #[cfg(not(windows))] // Windows has no roots, and the check here goes through them.
+    #[test]
+    fn a_rerun_that_read_the_whole_environment_finds_the_result_it_kept() {
+        let mut env = inherited("/a");
+        env.push(("CARGO_MAKEFLAGS".into(), "-j8 --jobserver-auth=3,4".into()));
+        let first = prepare(&unit(), &env, &place()).unwrap();
+        let store = kept_whole(&first);
+        // The next build: prepared again, another jobserver, checked as the daemon checks it.
+        let mut again_env = inherited("/a");
+        again_env.push(("CARGO_MAKEFLAGS".into(), "-j8 --jobserver-auth=5,6".into()));
+        let again = prepare(&unit(), &again_env, &place()).unwrap();
+        assert_eq!(again.spec.key, first.spec.key);
+        assert!(finds(&store, &again), "a no-op rebuild misses its kept run");
+        // A variable passed through that changed is still an input of the whole environment.
+        let moved = prepare(&unit(), &inherited("/b"), &place()).unwrap();
+        assert!(!finds(&store, &moved), "a changed PATH finds the run of another");
     }
 
     #[test]

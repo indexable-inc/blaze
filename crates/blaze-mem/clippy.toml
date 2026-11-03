@@ -44,6 +44,7 @@ disallowed-types = [
     { path = "hir_ty_share::ShareDef", replacement = "hir_ty_identity::Subject", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
     { path = "hir_ty_share::BodyOptions", replacement = "hir_ty_identity::Compiled", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
     { path = "hir_ty_share::OptionsSet", replacement = "hir_ty_identity::OptionsSet", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
+    { path = "hir_ty_codegen::home::Homes", reason = "one home rule (AGENTS.md rules 18, 26, 27): the crate an instance is compiled in is `hir_ty_mir::mir::home::env_of`, which a codegen `Instance` reaches through `Instance::home_env`; there is no per-task state to thread", allow-invalid = true },
 ]
 
 disallowed-methods = [
@@ -64,6 +65,10 @@ disallowed-methods = [
     { path = "std::process::exit", reason = "return a typed error from `main`, so destructors and the profile's flush run" },
     { path = "std::mem::forget", replacement = "std::mem::ManuallyDrop::new", reason = "says what it keeps from being dropped" },
     { path = "hir_ty_share::share_key", replacement = "hir_ty_identity::instance_identity", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
+    { path = "hir_ty_codegen::home::Homes::home", reason = "one home rule (AGENTS.md rules 18, 26, 27): codegen's copy missed the lang-item, feature and macro-only-dependency checks; a codegen `Instance` gets its environment from `Instance::home_env(db, asked)`, which calls `hir_ty_mir::mir::home::env_of`. No machine fix: those take no `&mut self` and different arguments", allow-invalid = true },
+    { path = "hir_ty_pure::home::env_of", reason = "one home rule (AGENTS.md rules 18, 26, 27): the rule lives in the front end; in hir-ty-pure call `walk::home_env(db, env, instance)`, elsewhere `hir_ty_mir::mir::home::env_of(db, env, code, args)`. No machine fix: that takes the crate of the instance's code and its arguments, not an instance", allow-invalid = true },
+    { path = "hir_ty_pure::home::home", reason = "one home rule (AGENTS.md rules 18, 26, 27): the rule lives in the front end; call `hir_ty_mir::mir::home::home(db, asker, code, args)`. No machine fix: that takes the crate of the instance's code and its arguments, not an instance", allow-invalid = true },
+    { path = "hir_ty_pure::home::stands_for", replacement = "hir_ty_mir::mir::home::stands_for", reason = "one home rule (AGENTS.md rules 18, 26, 27): the rule lives in the front end", allow-invalid = true },
 ]
 
 disallowed-macros = [

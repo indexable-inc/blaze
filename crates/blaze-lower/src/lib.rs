@@ -41,7 +41,7 @@ mod tests;
 use std::{cell::Cell, collections::HashMap, fmt};
 use std::alloc::Global;
 
-use base_db::FileSetConfig;
+use base_db::{FileSetConfig, Trigger};
 use base_db::{
     AbsPathBuf, ConstEvalBudget, ContentId, Crate, CrateWorkspaceData, Env, FileId, FileSet,
     LibraryRoots, LocalRoots, SourceRoot, SourceRootId, VfsPath, ViewChange, ViewFile, ViewRoot,
@@ -62,7 +62,7 @@ pub use base_db::{Db, ProcMacroLoadingError};
 pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
 pub use self::answer::{SubRequest, SubResponse, answer};
-pub use self::crates::{lint_flags, local};
+pub use self::crates::{lint_flags, local, target_data};
 pub use self::harness::{Appended, macros_loaded, wasm_macro};
 
 /// What [`lower`] lowers.
@@ -81,15 +81,22 @@ pub struct Lower<'a, T> {
 
 /// The part of `now` a front end lowered from `kept` (with the same units) would read
 /// differently, by name; `None` when [`Lowered::refresh`] can move it to `now`. A front end
-/// reads the mounts, the host, the library's and the stores' paths, the checkout's root, and
-/// the process environment (the database's `ProcessEnv`, the dependency images' reads of it
-/// and the goal and item stores' modes). It never reads the command, its arguments, the
-/// working directory or cargo's config files: those only make the plan, whose units the
-/// caller compares whole, so `build` then `build --keep-going` or `-v` lowers into the same
-/// front end. Every field is named here, so a field added to [`BuildConfig`] is a decision.
+/// reads the mounts, the host, the library's and the stores' paths and the checkout's root. It
+/// never reads the command, its arguments, the working directory or cargo's config files:
+/// those only make the plan, whose units the caller compares whole, so `build` then
+/// `build --keep-going` or `-v` lowers into the same front end. Every field is named here, so a
+/// field added to [`BuildConfig`] is a decision.
+///
+/// The process environment is not compared whole: a front end is keyed by the variables it
+/// read, as it read them. Its crates' `env!` and `option_env!` reads are
+/// [`Lowered::env_moved`]'s; what the daemon read of the environment into what it keeps with
+/// the front end (its stores' modes) is the daemon's own (`blaze_units::query::EnvReads`).
+/// Comparing it whole let a kept front end go on every variable a shell or systemd sets per
+/// run (`SHLVL`, `OLDPWD`, `TERM_SESSION_ID`, `INVOCATION_ID`), so a no-op build lowered all
+/// again: 86 s in place of about 1 s.
 pub fn config_differs(kept: &BuildConfig, now: &BuildConfig) -> Option<String> {
     let BuildConfig { invocation, mounts, host, library, std, builds } = kept;
-    let blaze_units::query::Invocation { command: _, args: _, root, cwd: _, env, files: _ } = invocation;
+    let blaze_units::query::Invocation { command: _, args: _, root, cwd: _, env: _, files: _ } = invocation;
     if mounts != &now.mounts {
         return Some("its mounts".to_owned()); // alloc: a reason, once per front end let go
     }
@@ -108,33 +115,14 @@ pub fn config_differs(kept: &BuildConfig, now: &BuildConfig) -> Option<String> {
     if root != &now.invocation.root {
         return Some("its checkout's root".to_owned()); // alloc: a reason, once per front end let go
     }
-    if env != &now.invocation.env {
-        // Named, never its value: a variable may hold a secret.
-        let named = first_difference(env, &now.invocation.env).unwrap_or("");
-        // alloc: a reason, once per front end let go
-        return Some(format!("its process environment (`{named}`)"));
-    }
     None
 }
 
-/// The name of the first variable of two sorted environments that one has and the other has
-/// not, or has with another value.
-fn first_difference<'a>(a: &'a [(String, String)], b: &'a [(String, String)]) -> Option<&'a str> {
-    let (mut a, mut b) = (a.iter().peekable(), b.iter().peekable());
-    loop {
-        match (a.peek(), b.peek()) {
-            (None, None) => return None,
-            (Some((name, _)), None) | (None, Some((name, _))) => return Some(name),
-            (Some((x, u)), Some((y, v))) => match x.cmp(y) {
-                std::cmp::Ordering::Less => return Some(x),
-                std::cmp::Ordering::Greater => return Some(y),
-                std::cmp::Ordering::Equal if u != v => return Some(x),
-                std::cmp::Ordering::Equal => {
-                    a.next();
-                    b.next();
-                }
-            },
-        }
+/// A crate by the name it was given, for a person, or its id where it has none.
+fn crate_display(db: &Db, krate: Crate) -> String {
+    match &krate.extra_data(db).display_name {
+        Some(name) => name.canonical_name().as_str().to_owned(), // alloc: a name, once per front end let go
+        None => format!("{krate:?}"),                             // alloc: as above
     }
 }
 
@@ -271,8 +259,44 @@ pub fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, Lower
 }
 
 /// [`lower`] into `db`, a build's database just made and never written ([`Db::new`], or
-/// [`Db::logged`] for a harness that counts what each request executes).
-pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
+/// [`Db::logged`] for a harness that counts what each request executes): every input written
+/// as one change, one batch, so the maintainers run once over all of it. From then on the
+/// database takes its writes only in batches ([`Db::require_batches`]): each later change of
+/// the build ([`Lowered::ran`], [`Lowered::refresh`], ...) is one.
+pub fn lower_into<T: blaze_query::Tree>(mut db: Db, lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
+    let setup = db.batch(Trigger::named("the build lowered"), |db| lower_writes(db, lower))?;
+    db.require_batches();
+    let Setup { unit_count, lowerings, sets, loads, view, workspace_root, const_macros } = setup;
+    let paths = paths_of(&db, sets);
+    Ok(Lowered {
+        db,
+        applied: (0..unit_count).map(|_| Vec::new()).collect(),
+        crates: std::sync::Arc::new(Crates { units: lowerings, sets }),
+        paths: std::sync::Arc::new(paths),
+        identities: blaze_hash::HashMap::new_in(Global),
+        appended: blaze_hash::HashMap::new_in(Global),
+        loads,
+        view,
+        workspace_root,
+        const_macros,
+    })
+}
+
+/// What [`lower_writes`] made beside the inputs it wrote.
+struct Setup {
+    unit_count: usize,
+    lowerings: Vec<Lowering>,
+    /// [`Crates::sets`].
+    sets: usize,
+    loads: Vec<Load>,
+    view: ContentId,
+    workspace_root: crates::Root,
+    const_macros: Vec<const_macros::Loaded>,
+}
+
+/// The writes of [`lower_into`], in its batch: the crate graph, source roots and files of
+/// `lower.units`, and what the database is told of the build.
+fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Result<Setup, LowerError> {
     let Lower { units, config, files, root, host_cpu } = lower;
     let unit_count = units.graph.units.len();
     if units.plans.len() != unit_count {
@@ -365,12 +389,11 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     excluded.sort_unstable();
 
     let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files, read_view: Cell::new(false) };
-    let mut db = db;
-    ProcMacros::init_default(&mut db, Durability::HIGH);
+    ProcMacros::init_default(db, Durability::HIGH);
     // rustc compiles, checks and evaluates what a builtin derive expands to: the impls it
     // writes have bodies, which recording them without expanding (rust-analyzer's fast path)
     // leaves out.
-    hir_def::nameres::set_expand_builtin_derives(&mut db, true);
+    hir_def::nameres::set_expand_builtin_derives(db, true);
     for (index, &is_library) in library.iter().enumerate() {
         let source_root = match is_library {
             true => SourceRoot::new_library(FileSet::default()),
@@ -387,8 +410,8 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             .map(|it| SourceRootId(it as u32))
             .collect()
     };
-    _ = LibraryRoots::builder(roots(true)).durability(Durability::MEDIUM).new(&mut db);
-    _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(&mut db);
+    _ = LibraryRoots::builder(roots(true)).durability(Durability::MEDIUM).new(db);
+    _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(db);
 
     let mut loaded = Vec::new();
     let mut read = Vec::with_capacity(loads.len());
@@ -406,7 +429,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
         tree.read_view.set(false);
         tree.walk(load, &skipped, &mut loaded)?;
         let built: Vec<AbsPathBuf> = skipped.iter().map(|it| abs(it)).collect::<Result<_, _>>()?;
-        set_files(&mut db, load, &built, set, library.len(), &loaded)?;
+        set_files(db, load, &built, set, library.len(), &loaded)?;
         read.push(Load { dir: load.clone(), set, skipped, built, view: tree.read_view.get() });
     }
 
@@ -414,9 +437,9 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     let const_ast_root = match const_ast_set {
         Some(set) => {
             let loaded = const_macros::const_ast_files(&const_ast_dir);
-            set_files(&mut db, &const_ast_dir, &[], set, library.len(), &loaded)?;
+            set_files(db, &const_ast_dir, &[], set, library.len(), &loaded)?;
             let root = VfsPath::from(abs(&format!("{const_ast_dir}/lib.rs"))?);
-            db.source_root(SourceRootId(set as u32)).source_root(&db).file_for_path(&root).copied()
+            db.source_root(SourceRootId(set as u32)).source_root(&*db).file_for_path(&root).copied()
         }
         None => None,
     };
@@ -496,7 +519,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
                             .filter(|(load, _)| files::rest(&file, load).is_some())
                             .max_by_key(|(load, _)| load.len())
                             .map_or(other, |(_, set)| SourceRootId(*set as u32));
-                        let macros_root = db.source_root(file_set).source_root(&db).file_for_path(&file_path).copied();
+                        let macros_root = db.source_root(file_set).source_root(&*db).file_for_path(&file_path).copied();
                         let cx = const_macros::Cx {
                             units,
                             whats: &whats,
@@ -510,7 +533,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
                             proc_macro_cwd: abs(&crates::proc_macro_cwd(&workspace_root, package))?,
                             durability,
                         };
-                        let (made, listed) = const_macros::make(&mut db, &mut const_plan, group, cx, &mut all)?;
+                        let (made, listed) = const_macros::make(db, &mut const_plan, group, cx, &mut all)?;
                         let krate = made.krate;
                         const_listed.push((krate, listed));
                         const_made.push(made);
@@ -527,7 +550,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             .filter(|(load, _)| files::rest(&src, load).is_some())
             .max_by_key(|(load, _)| load.len())
             .map_or(other, |(_, set)| SourceRootId(*set as u32));
-        let root_file = db.source_root(set).source_root(&db).file_for_path(&src_path).copied();
+        let root_file = db.source_root(set).source_root(&*db).file_for_path(&src_path).copied();
         let Some(root_file) = root_file else {
             return Err(LowerError::at(
                 format!("the root file `{src}` of {what} is not among its package's files"),
@@ -603,7 +626,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
                     })?;
                 }
                 // clone: as `made_of`
-                let krate = Crate::create(&mut db, made_of, extra.clone(), workspace.clone(), cfg.clone(), env.clone(), durability);
+                let krate = Crate::create(db, made_of, extra.clone(), workspace.clone(), cfg.clone(), env.clone(), durability);
                 made_of_root.push(Made { data, aliased, extra, workspace, cfg: cfg.clone(), env, durability, runs, krate });
                 all.push(krate);
                 krate
@@ -614,26 +637,22 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
         lowering.cfg = cfg;
         lowering.env = plan.env.clone();
     }
-    base_db::set_all_crates_with_durability(&mut db, all, Durability::MEDIUM);
+    base_db::set_all_crates_with_durability(db, all, Durability::MEDIUM);
 
     let not_built = lowerings
         .iter()
         .filter(|it| it.proc_macro)
         .filter_map(|it| it.krate)
         .map(|krate| (krate, Err(base_db::ProcMacroLoadingError::NotYetBuilt)));
-    ProcMacros::give(&mut db, not_built);
-    const_macros::set_macros(&mut db, const_listed);
-    base_db::set_process_env(&mut db, config.invocation.env.iter().cloned().collect());
-    name_sources(&mut db, workspace_root.dir.as_deref(), &config.library);
+    ProcMacros::give(db, not_built);
+    const_macros::set_macros(db, const_listed);
+    base_db::set_process_env(db, config.invocation.env.iter().cloned().collect());
+    name_sources(db, workspace_root.dir.as_deref(), &config.library);
 
-    let paths = paths_of(&db, library.len());
-    Ok(Lowered {
-        db,
-        applied: (0..unit_count).map(|_| Vec::new()).collect(),
-        crates: std::sync::Arc::new(Crates { units: lowerings, sets: library.len() }),
-        paths: std::sync::Arc::new(paths),
-        identities: blaze_hash::HashMap::new_in(Global),
-        appended: blaze_hash::HashMap::new_in(Global),
+    Ok(Setup {
+        unit_count,
+        lowerings,
+        sets: library.len(),
         loads: read,
         view: root,
         workspace_root,
@@ -661,6 +680,20 @@ impl Lowered {
     /// [`Crates::krate`].
     pub fn krate(&self, unit: usize) -> Option<Crate> {
         self.crates.krate(unit)
+    }
+
+    /// Runs `f`'s writes as one change, `trigger` ([`Db::batch`]): the maintainers run once
+    /// when it ends, over everything it wrote. A write of `f` that is itself a change
+    /// ([`Lowered::ran`], [`Lowered::macros`], ...) is part of this one. Its database takes
+    /// writes only in batches, so a change made of several writes is one of these.
+    pub fn batch<R>(&mut self, trigger: Trigger<'_>, f: impl FnOnce(&mut Lowered) -> R) -> R {
+        Db::batch_in(self, |lowered| &mut lowered.db, trigger, f)
+    }
+
+    /// `foo v0.1.0 (lib)`: unit `unit` as an error or a profile names it; empty for a unit the
+    /// build lacks.
+    pub fn what(&self, unit: usize) -> &str {
+        self.crates.units.get(unit).map_or("", |it| it.what.as_str())
     }
 
     /// What every task reads: each unit's crate. Made once by [`lower`] and never written.
@@ -705,6 +738,30 @@ impl Lowered {
         Some(identity_of(&self.db, krate, &mut self.identities))
     }
 
+    /// The first variable of the process that a crate of the front end read through `env!` or
+    /// `option_env!` ([`base_db::process_env_reads`], sorted by crate and name) whose value in
+    /// `now`, a request's environment, is not the one the database holds, with the crate that
+    /// read it: why the front end does not take a build for `now`. `None` whatever else of
+    /// `now` differs, and [`Lowered::refresh`] then sets `now` as the process's variables, which
+    /// runs no maintainer.
+    pub fn env_moved(&self, now: &[(String, String)]) -> Option<blaze_units::query::EnvMoved> {
+        let db = &self.db;
+        base_db::process_env_reads(db).into_iter().find_map(|(krate, name)| {
+            let was = base_db::process_env_var(db, &name);
+            let value = blaze_units::query::env_var(now, &name);
+            if was.as_deref() == value {
+                return None;
+            }
+            let by = match self.crates.units.iter().find(|it| it.krate == Some(krate)) {
+                // alloc: a reason, once per front end let go
+                Some(lowering) => format!("`env!` or `option_env!` in {}", lowering.what),
+                // alloc: as above; a crate of no unit (a const macro's)
+                None => format!("`env!` or `option_env!` in the crate {}", crate_display(db, krate)),
+            };
+            Some(blaze_units::query::EnvMoved { name, by, was, now: value.map(str::to_owned) })
+        })
+    }
+
     /// The run of build script unit `run` applied to every unit that depends on it directly:
     /// its `rustc-cfg`s added to their cfgs, its `rustc-env`s to their env, `OUT_DIR` set, and
     /// the files it left in `OUT_DIR` put into the front end's files (its package's source
@@ -712,10 +769,25 @@ impl Lowered {
     /// what it applied before, files it no longer left included.
     ///
     /// A write: `&mut self` means no task holds a reference to read through, so nothing is
-    /// cancelled or waited for here; tasks that read after it read the run applied.
+    /// cancelled or waited for here; tasks that read after it read the run applied. One change:
+    /// its files, cfgs and envs are one batch, and inside [`Lowered::batch`] part of that one.
     pub fn ran(&mut self, run: usize, ran: &Ran) -> Result<(), LowerError> {
         let crates = self.crates.clone();
         let (lowering, cfgs) = checked(&crates, run, ran)?;
+        let trigger = Trigger::of("a build script's run applied", &lowering.what);
+        self.batch(trigger, |this| this.apply_run(run, ran, &crates, lowering, cfgs))
+    }
+
+    /// [`Lowered::ran`]'s writes, in its batch: `run` checked against `crates`, its unit
+    /// `lowering`, its cfgs `cfgs`.
+    fn apply_run(
+        &mut self,
+        run: usize,
+        ran: &Ran,
+        crates: &Crates,
+        lowering: &Lowering,
+        cfgs: Vec<CfgAtom>,
+    ) -> Result<(), LowerError> {
         let out_dir = &ran.out_dir;
         let mut loaded = Vec::with_capacity(ran.files.len());
         for (path, bytes) in &ran.files {
@@ -774,6 +846,11 @@ impl Lowered {
         seed: impl FnOnce(&Db) -> Result<(), LowerError>,
     ) -> Result<bool, LowerError> {
         let Lower { units, config, files, root, .. } = lower;
+        // The request's variables, which the caller checked moved none a crate read
+        // ([`Lowered::env_moved`]): a later read reads them, and no maintainer runs. Its own
+        // batch: the database takes writes only in batches, and this one notes nothing.
+        let vars: Env = config.invocation.env.iter().cloned().collect();
+        self.db.batch(Trigger::named("the process environment set"), |db| base_db::set_process_env(db, vars));
         // A new job: its units' roots are appended to again, and may be made other than before.
         self.appended.clear();
         if root == self.view {
@@ -784,26 +861,36 @@ impl Lowered {
             return Ok(false);
         }
         self.identities.clear();
+        self.db.admit_parses();
+        // One change: the view's files, the seeds and the const macros they list, one batch.
+        self.batch(Trigger::named("the view moved"), |this| this.refresh_writes(&tree, root, seed))?;
+        Ok(true)
+    }
+
+    /// [`Lowered::refresh`]'s writes, in its batch: the view `root` read through `tree`.
+    fn refresh_writes<T: blaze_query::Tree>(
+        &mut self,
+        tree: &files::Mounts<'_, T>,
+        root: ContentId,
+        seed: impl FnOnce(&Db) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
         let sets = self.crates.sets;
         let mut loaded = Vec::new();
         let mut removed = false;
-        let (loads, paths) = (&mut self.loads, &mut self.paths);
-        self.db.admit_parses();
-        self.db.batch(|db| {
-            for load in loads.iter_mut() {
-                if !load.view {
-                    continue;
-                }
-                loaded.clear();
-                tree.read_view.set(false);
-                tree.walk(&load.dir, &load.skipped, &mut loaded)?;
-                load.view = tree.read_view.get();
-                let change = set_files(db, &load.dir, &load.built, load.set, sets, &loaded)?;
-                removed |= !change.removed.is_empty();
-                note(paths, db, load.set, &change);
+        let (loads, paths, db) = (&mut self.loads, &mut self.paths, &mut self.db);
+        for load in loads.iter_mut() {
+            if !load.view {
+                continue;
             }
-            seed(db)
-        })?;
+            loaded.clear();
+            tree.read_view.set(false);
+            tree.walk(&load.dir, &load.skipped, &mut loaded)?;
+            load.view = tree.read_view.get();
+            let change = set_files(db, &load.dir, &load.built, load.set, sets, &loaded)?;
+            removed |= !change.removed.is_empty();
+            note(paths, db, load.set, &change);
+        }
+        seed(db)?;
         self.view = root;
         if removed {
             for lowering in &self.crates.units {
@@ -824,7 +911,7 @@ impl Lowered {
             }
         }
         const_macros::set_macros(&mut self.db, listed);
-        Ok(true)
+        Ok(())
     }
 
     /// The front end's tables by owner and name: how many each holds and their bytes, as
@@ -858,28 +945,31 @@ impl Lowered {
             macros
         });
         self.identities.clear();
-        ProcMacros::give(&mut self.db, [(krate, macros)]);
+        let trigger = Trigger::of("a proc macro's expanders loaded", &self.crates.units[unit].what);
+        Db::batch_in(&mut self.db, |db| db, trigger, |db| ProcMacros::give(db, [(krate, macros)]));
         Ok(())
     }
 
-    /// The crates of `units` and their dependencies that are dependencies of the build
+    /// `crates` and their dependencies that are dependencies of the build
     /// ([`hir_def::deps::eligible`]) read from the images `images` keeps, by `build`, the blaze
     /// reading them ([`hir_def::deps::serve`]): under [`hir_def::deps::Mode::Serve`] an image
-    /// replaces resolving its crate. Only units every run of whose closure is applied may be
-    /// named, so nothing a later write changes reaches a crate served; one depending on a proc
-    /// macro not built yet is not eligible. An image that does not read is an error naming its
-    /// crate. A write, as [`Lowered::ran`] is.
+    /// replaces resolving its crate. Only crates of units every run of whose closure is applied
+    /// may be named; one depending on a proc macro not built yet is not eligible. A crate served
+    /// before whose key a later write moved (a run applied again with other cfgs, env or
+    /// `OUT_DIR` files, a proc macro built into other code) is fetched again under its new key,
+    /// and loses its image when there is none, so its caller serves again after every such
+    /// write. An image that does not read is an error naming its crate. A write, as
+    /// [`Lowered::ran`] is.
     pub fn serve_deps(
         &mut self,
-        units: &[u32],
+        crates: &[Crate],
         build: ContentId,
         // dyn: the driver's store, one call per crate per front end
         images: &dyn hir_def::deps::ImageStore,
         mode: hir_def::deps::Mode,
     ) -> Result<hir_def::deps::Served, LowerError> {
-        // alloc: setup, once per front end
-        let crates: Vec<Crate> = units.iter().filter_map(|&unit| self.crates.krate(unit as usize)).collect();
-        hir_def::deps::serve(&mut self.db, &crates, build, images, mode).map_err(LowerError::new)
+        let trigger = Trigger::named("the dependencies' images served");
+        self.db.batch(trigger, |db| hir_def::deps::serve(db, crates, build, images, mode)).map_err(LowerError::new)
     }
 
     /// The images of the crates `served` keyed and found none of, written to `images` from

@@ -125,7 +125,7 @@ fn check(edits: &[Edit], after: &BTreeMap<String, String>) -> (TestDB, Applied) 
     // the write's maintainers parse the files, and each file's parse is the seed's own tree.
     let (mut next, files) = self::view(GRAPH, &PATHS);
     let seeds: Vec<_> = made.seeds().collect();
-    next.batch(|next| {
+    next.batch(base_db::Trigger::named("the test's edit and seeds"), |next| {
         for seed in &seeds {
             let path = view.path(seed.file).expect("a seed names a file of the view");
             assert_eq!(files.path(seed.file), Some(path), "the same file in the next front end");

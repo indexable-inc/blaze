@@ -534,7 +534,11 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             Ok(Then::Exit(0))
         }
         Command::Run => {
-            let exec = run::pick(&artifacts, &asked.flags).and_then(|it| run::planned(it, &asked.program, &place.cwd));
+            let exec = run::pick(&artifacts, &asked.flags).and_then(|it| {
+                let mut exec = run::planned(it, &asked.program, &place.cwd)?;
+                run::launch(it, &mut exec)?;
+                Ok(exec)
+            });
             match exec {
                 Ok(exec) => {
                     if !shown.quiet {

@@ -21,8 +21,8 @@ use crate::{
     UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 32;
-const RESPONSES: usize = 39;
+const REQUESTS: usize = 33;
+const RESPONSES: usize = 40;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -299,6 +299,7 @@ impl Gen {
             },
             29 => Request::Gc { dry_run: self.yes() },
             30 => Request::Rebuilt { all: self.yes(), cwd: self.maybe_text(), item: self.maybe_text() },
+            31 => Request::Launch { program: self.text(), pid: self.u32() },
             _ => Request::Stop,
         }
     }
@@ -684,6 +685,7 @@ impl Gen {
             35 => Response::UnitBegan(self.unit_of()),
             36 => Response::TestReady(self.artifact()),
             37 => Response::Rebuilt(self.rebuilt(depth)),
+            38 => Response::Launched { live: self.yes(), env: self.many(depth, |g| (g.text(), g.text())) },
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }  // alloc: test and fuzz reference only
             }
@@ -815,7 +817,8 @@ fn request_index(request: &Request) -> usize {
         Request::Hot { .. } => 28,
         Request::Gc { .. } => 29,
         Request::Rebuilt { .. } => 30,
-        Request::Stop => 31,
+        Request::Launch { .. } => 31,
+        Request::Stop => 32,
     }
 }
 
@@ -860,7 +863,8 @@ fn response_index(response: &Response) -> usize {
         Response::UnitBegan(_) => 35,
         Response::TestReady(_) => 36,
         Response::Rebuilt(_) => 37,
-        Response::Of { .. } => 38,
+        Response::Launched { .. } => 38,
+        Response::Of { .. } => 39,
     }
 }
 

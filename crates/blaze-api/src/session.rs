@@ -744,11 +744,17 @@ impl Session {
                 let hot = (cx.hot)(top, since)?;
                 answer(out, req, Response::Hot(hot));
             }
-            Request::Explore { .. } | Request::Live | Request::Sql { .. } | Request::Gc { .. } | Request::Rebuilt { .. } => {
+            Request::Explore { .. }
+            | Request::Live
+            | Request::Sql { .. }
+            | Request::Gc { .. }
+            | Request::Rebuilt { .. }
+            | Request::Launch { .. } => {
                 return Err(ApiError::new(
-                    "the explorer, the live feed, live SQL, the collector and the last build's \
-                     reasons are answered by the daemon's loop, which holds their servers, feeds, \
-                     collector and reasons; this one handed the request on instead",
+                    "the explorer, the live feed, live SQL, the collector, the last build's \
+                     reasons and the dev runs' launches are answered by the daemon's loop, which \
+                     holds their servers, feeds, collector, reasons and programs; this one handed \
+                     the request on instead",
                     Some(request_name(&request).to_owned()),
                 ));
             }
@@ -1087,6 +1093,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Sql { .. } => "blaze debug sql --live",
         Request::Gc { .. } => "blaze cache gc",
         Request::Rebuilt { .. } => "blaze why",
+        Request::Launch { .. } => "blaze run",
         _ => "a request",
     }
 }

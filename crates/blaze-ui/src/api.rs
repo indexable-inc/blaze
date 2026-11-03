@@ -272,6 +272,14 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             put!(out, "{} {} at {}\n", status("Linked"), it.target.name, it.executable.as_deref().unwrap_or(&it.path));
         }
         Response::Rebuilt(rebuilt) => crate::why::lines(out, rebuilt),
+        Response::Launched { live, env } => {
+            let how = if *live { "on the daemon's code memory" } else { "from its file" };
+            put!(out, "{} {how}", status("Launched"));
+            for (name, _) in env {
+                put!(out, " {name}");
+            }
+            out.push('\n');
+        }
     }
 }
 

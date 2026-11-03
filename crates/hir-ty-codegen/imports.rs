@@ -252,7 +252,7 @@ fn build(
         // of this target graph and loaded the target with `?`, so a target that fails reaches
         // it as that error.
         let target = super::target_of_crate(db, env.as_ref(db).krate).ok()?;
-        let mut cg = Recorder::new(db, &**super::isa_for(target).ok()?, target, instance.checked);
+        let mut cg = Recorder::new(db, &**super::isa_for(target).ok()?, target, instance.checked, None);
         cg.unlocated = true;
         // clone: once per export in the process, moved into the closure that builds it
         let args = instance.args.clone();

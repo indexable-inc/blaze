@@ -33,14 +33,14 @@ use corosensei::{
 use super::{
     CounterId, Cycle, JobId, Suspend, Wait,
     fiber::{
-        Answer, Global, HERE, Here, IdleReason, MAX_CARRIED, OwnIo, Panic, Stackful, SwitchEvent, Taken, UNREGISTERED,
+        Answer, Given, Global, HERE, Here, IdleReason, MAX_CARRIED, OwnIo, Panic, Stackful, SwitchEvent, Taken, UNREGISTERED,
         carry_stack_limit, check_no_wait, clear, come_on, dispatch_global, global, go_off, go_off_ended, idled,
         observing, switched, switched_known, switched_unregistered,
     },
 };
 use crate::{
     Key,
-    pool::{Header, Job},
+    pool::{DriverSpan, Driving, Header, Job},
 };
 
 /// A pool fiber's stack above its guard page; `stdx::ensure_sufficient_stack` grows past it.
@@ -214,14 +214,14 @@ fn core() -> u32 {
     CORE.get()
 }
 
-/// A pool job begins on this thread's fiber, given to the pool while `spawner` ran
+/// A pool job begins on this thread's fiber, given to the pool as `given` says
 /// ([`super::fiber::spawner`]): its lifetime starts here, not at the claim or wait that joins
 /// it to the graph later, if ever. Nothing on a thread that is no pool worker's fiber, or for a
 /// job already in the graph.
 #[inline]
-pub(crate) fn job_begins(spawner: u64) {
+pub(crate) fn job_begins(given: Given) {
     if observing() && HERE.get().is_some_and(|here| here.job == UNREGISTERED) {
-        switched_unregistered(SwitchEvent::Began { spawner }, 0, core());
+        switched_unregistered(SwitchEvent::Began { given }, 0, core());
     }
 }
 
@@ -288,7 +288,10 @@ impl<'a> Host<'a> {
         }
         let fiber = match self.idle.pop() {
             Some(fiber) => fiber,
-            None => new_fiber(self.member),
+            None => {
+                let _making = DriverSpan::open(Driving::Switch);
+                new_fiber(self.member)
+            }
         };
         let stray = match come_on(&mut worker, None, None) {
             Answer::Raise(panic) => Some(panic),
@@ -309,6 +312,7 @@ impl<'a> Host<'a> {
             match out {
                 Out::Done(panicked) => {
                     let left = go_off_ended(worker);
+                    let _switch = DriverSpan::open(Driving::Switch);
                     if self.idle.len() < IDLE {
                         self.idle.push(fiber);
                     } else {
@@ -345,6 +349,8 @@ impl<'a> Host<'a> {
                                 })
                             });
                             record.failed = go_off(&mut record.taken, worker);
+                            // The job's spans went with it: what is left is the driver's.
+                            let _switch = DriverSpan::open(Driving::Switch);
                             record.job = job;
                             record.generation = g.world.generation(job);
                             record.fiber = Some(fiber);
@@ -406,6 +412,8 @@ fn body(member: u32, fiber: u32, limit: usize, yielder: &Yielder<In, Out>, first
             job.run();
         }));
         stdx::set_fiber_stack_limit(0);
+        // The job's span closed as its closure returned: its end in the graph is the driver's.
+        let ending = DriverSpan::open(Driving::Switch);
         clear();
         take_scope();
         let joined = cx.job.get();
@@ -420,6 +428,7 @@ fn body(member: u32, fiber: u32, limit: usize, yielder: &Yielder<In, Out>, first
         } else {
             switched_unregistered(SwitchEvent::Ran, fiber, core());
         }
+        drop(ending);
         next = yielder.suspend(Out::Done(ran.err()));
     }
 }

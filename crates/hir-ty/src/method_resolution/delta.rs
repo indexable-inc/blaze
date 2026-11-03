@@ -28,14 +28,13 @@ mod state;
 mod tests;
 
 use base_db::{Crate, Db, Maintainer, Reads, Written};
-use blaze_mem::Tag;
 use hir_def::{ImplId, TraitId, nameres::delta::LastWrite as NameresWrite};
 use hir_expand::name::Name;
 
 pub use self::{
     head::{Head, HeadDef},
     publish::{
-        CANDIDATE_SET_DOMAIN, CandidateSlice, IMPL_SET_DOMAIN, ImplIdentities, ImplSlices,
+        CANDIDATE_SET_DOMAIN, CandidateSlice, DirectorySlot, IMPL_SET_DOMAIN, ImplIdentities, ImplSlices,
         InherentSlice, SliceDirectory, TraitImplsSlice, candidate_set_hash, impl_identity,
         impl_set_hash, install_identities,
     },
@@ -77,35 +76,31 @@ pub struct ImplsDelta {
     pub traits_changed: Vec<TraitId>,
 }
 
-/// The impls maintainer's reads, in two steps across every crate at once: first what each
-/// crate's run reads of the crate, its impls, derives and traits ([`state::warm`]), then the
-/// body parts of the modules it reads, which the crates' def maps the first step read name
-/// ([`state::warm_bodies`]).
+/// The impls maintainer's reads. Step 0 reads nothing: its apply gives each crate first
+/// maintained its directory's slot ([`state::prepare`]). Step 1 runs every crate's work as one
+/// node per crate on the database's workers ([`state::run_nodes`]), each begun once its
+/// dependencies have begun, with no barrier between crates.
 fn read_step(db: &Db, written: &Written<'_>, reads: &mut Reads) {
-    let step = reads.step();
-    let warm = db.lend_state::<NameresWrite, _>(|last| {
-        db.lend_state::<State, _>(|state| match step {
-            0 => state::warm(db, state, last, written),
-            _ => state::warm_bodies(db, state, last, written),
-        })
-    });
-    reads.each(Tag::Infer, warm, state::warm_one);
-    if step == 0 {
+    if reads.step() == 0 {
         reads.again();
+        return;
     }
+    db.lend_state::<NameresWrite, _>(|last| {
+        db.lend_state::<State, _>(|state| state::run_nodes(db, state, last, written))
+    });
 }
 
-/// The impls maintainer's apply, after the second step's reads: one write's delta applied to
-/// every crate not frozen, in dependency order, over the memos the reads made.
+/// The impls maintainer's apply: step 0's the slots of the crates first maintained, registered
+/// with one write; step 1's the end of each crate's work, in dependency order: the state shared
+/// across crates, and the slices of crates published before ([`state::finish`]).
 fn apply_step(db: &mut Db, written: &Written<'_>, reads: &Reads) {
     if reads.step() == 0 {
+        db.with_state::<State, _>(|db, state| state::prepare(db, state, written));
         return;
     }
     let mut out = db.with_state::<LastWrite, _>(|_, it| std::mem::take(&mut it.crates));
     out.clear();
-    db.with_state::<NameresWrite, _>(|db, last| {
-        db.with_state::<State, _>(|db, state| state::run(db, state, last, written, &mut out))
-    });
+    db.with_state::<State, _>(|db, state| state::finish(db, state, &mut out));
     db.with_state::<LastWrite, _>(|_, it| it.crates = out);
 }
 

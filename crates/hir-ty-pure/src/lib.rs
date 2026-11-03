@@ -24,7 +24,6 @@
 pub mod effect_attrs;
 pub mod effects;
 mod function;
-mod home;
 mod identity;
 mod memory;
 pub mod models;

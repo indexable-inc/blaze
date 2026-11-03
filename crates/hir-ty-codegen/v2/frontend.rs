@@ -36,11 +36,10 @@ use super::{
     undescribed,
 };
 use crate::{
-    Instance, InstanceDef, exported_static, exported_symbol, fncache, home::Homes, linked_symbol,
+    Instance, InstanceDef, exported_static, exported_symbol, fncache, linked_symbol,
 };
 
-/// The build's database, `Sync` and shared by reference by every task. Nothing here locks:
-/// each call has its own [`Homes`], which lives as long as the task's work on one instance.
+/// The build's database, `Sync` and shared by reference by every task. Nothing here locks.
 pub struct Databases<'db> {
     db: &'db Db,
 }
@@ -52,8 +51,8 @@ impl<'db> Databases<'db> {
 
     /// Runs `work` with the database attached to its thread, which any formatted type or
     /// constant (an error's message, a panic's) needs, on whichever worker the task is.
-    pub(crate) fn with<T>(&self, work: impl FnOnce(&Db, &mut Homes) -> T) -> T {
-        hir_ty::attach_db(self.db, || work(self.db, &mut Homes::default()))
+    pub(crate) fn with<T>(&self, work: impl FnOnce(&Db) -> T) -> T {
+        hir_ty::attach_db(self.db, || work(self.db))
     }
 }
 
@@ -232,15 +231,15 @@ impl Asked {
     }
 }
 
-/// Every [`Build::options`] `build` gives a body of each crate of the graph, compiled in its
-/// own crate or in another, as an instance is in the crate [`Homes`] picks for it.
+/// Every [`Build::options`] `build` gives a body of each crate of the graph, of an instance
+/// compiled once or per instance. Where the instance is worked out (its home,
+/// `hir_ty_mir::mir::home`) changes none of them.
 fn asked_of(db: &Db, crates: &[Crate], build: Build) -> Asked {
     let mut asked = Asked::default();
-    for (at, &written) in crates.iter().enumerate() {
+    for &written in crates {
         let lang = written.data(db).origin.is_lang();
-        let elsewhere = crates.get(usize::from(at == 0)).copied().filter(|it| *it != written);
-        for compiling in [Some(written), elsewhere].into_iter().flatten() {
-            asked.push(lang, build.options(db, written, compiling));
+        for generic in [false, true] {
+            asked.push(lang, build.options(db, written, generic));
         }
     }
     asked
@@ -353,7 +352,7 @@ impl<'db> HirFrontend<'db> {
     /// A function that is not generic, as a root of the build: `main`, a test, an exported
     /// function.
     pub fn root(&self, func: FunctionId) -> HirInstance {
-        self.databases.with(|db, homes| root_in(db, homes, func))
+        self.databases.with(|db| root_in(db, func))
     }
 
     /// A root of `func` whose type parameters are, in order, the function items `items` (each
@@ -362,7 +361,7 @@ impl<'db> HirFrontend<'db> {
     /// names `func` when it has a const parameter or a type parameter count other than
     /// `items.len()`.
     pub fn root_with_fn_items(&self, func: FunctionId, items: &[FunctionId]) -> Result<HirInstance, String> {
-        self.databases.with(|db, homes| root_with_fn_items_in(db, homes, func, items))
+        self.databases.with(|db| root_with_fn_items_in(db, func, items))
     }
 
     /// The C `main` of a program whose `fn main` is `main`.
@@ -373,21 +372,20 @@ impl<'db> HirFrontend<'db> {
     /// The allocator shim of the program of `krate`, with the `#[global_allocator]`'s
     /// functions it calls: roots of a program with a `main`, and of a `cdylib`.
     pub fn allocator_shim(&self, krate: Crate) -> Result<Vec<HirInstance>, CodegenError> {
-        self.with(|db, _| {
+        self.with(|db| {
             super::allocator::shim(db, krate, |func| self.root(func))
                 // alloc: the error's message
                 .map_err(|what| undescribed(db, &krate, None, format!("its allocator shim: {what}")))
         })
     }
 
-    pub(crate) fn with<T>(&self, work: impl FnOnce(&Db, &mut Homes) -> T) -> T {
+    pub(crate) fn with<T>(&self, work: impl FnOnce(&Db) -> T) -> T {
         self.databases.with(work)
     }
 
     fn described(
         &self,
         db: &Db,
-        homes: &mut Homes,
         instance: &HirInstance,
         requester: &Origin,
     ) -> Result<Described<HirInstance, HirStatic>, CodegenError> {
@@ -423,7 +421,7 @@ impl<'db> HirFrontend<'db> {
         let cold = cold_of(db, &instance.0);
         let overflow_checks = if generic { written_checks(db, &instance.0) } else { None };
         let symbol = symbol_of(db, &instance.0).map_err(fail)?;
-        let mut refs = refs::walk(db, instance, walking, homes).map_err(fail)?;
+        let mut refs = refs::walk(db, instance, walking).map_err(fail)?;
         if owner == Owner::Dependency {
             for it in &mut refs {
                 if let FrontRef::Function(HirInstance(Kind::Asm(_, image))) = it {
@@ -433,11 +431,15 @@ impl<'db> HirFrontend<'db> {
         }
         // alloc: `Described::built_in` owns its list, which the memo's is borrowed from
         let built_in = refs::built_in(db, instance, walking).map_err(fail)?.to_vec();
+        // Written in a workspace crate: the complement of what a caller may build in
+        // (`always_inlinable_callee`), so nothing patchable is ever built in.
+        let editable = crate_of(db, &instance.0).is_some_and(|krate| krate.data(db).origin.is_local());
         Ok(Described {
             item,
             code,
             args,
             origin,
+            editable,
             overflow_checks,
             address: if symbol.is_some() { Address::Significant } else { Address::Free },
             symbol,
@@ -573,14 +575,13 @@ impl<'db> HirFrontend<'db> {
     fn described_static(
         &self,
         db: &Db,
-        homes: &mut Homes,
         value: &HirStatic,
     ) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
         let hashes = &self.hashes;
         let item = hashes
             .item(db, ItemId::Static(value.0))
             .map_err(|what| undescribed(db, &super::StaticNamed(db, value.0), None, what))?;
-        let held = super::statics::value(db, homes, hashes, value.0)
+        let held = super::statics::value(db, hashes, value.0)
             .map_err(|what| undescribed(db, &super::StaticNamed(db, value.0), Some(item), what))?;
         Ok(DescribedStatic {
             item,
@@ -608,20 +609,20 @@ impl Frontend for HirFrontend<'_> {
         instance: &HirInstance,
         requester: &Origin,
     ) -> Result<Described<HirInstance, HirStatic>, CodegenError> {
-        self.with(|db, homes| self.described(db, homes, instance, requester))
+        self.with(|db| self.described(db, instance, requester))
     }
 
     fn describe_static(
         &self,
         value: &HirStatic,
     ) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
-        self.with(|db, homes| self.described_static(db, homes, value))
+        self.with(|db| self.described_static(db, value))
     }
 
     fn reached(&self, functions: &[(HirInstance, Origin)], statics: &[HirStatic]) {
         self.devirt.reached(functions, statics);
         let Some(checks) = self.checks else { return };
-        let bodies: Vec<DefWithBodyId> = self.with(|db, _| {
+        let bodies: Vec<DefWithBodyId> = self.with(|db| {
             (functions.iter().filter_map(|(instance, _)| body_of(db, instance)))
                 .chain(statics.iter().map(|it| DefWithBodyId::StaticId(it.0)))
                 // alloc: once a level of the walk, sized by it
@@ -636,11 +637,11 @@ impl Frontend for HirFrontend<'_> {
 
     fn counted(&self, functions: &[(HirInstance, Origin)]) -> Vec<Counted> {
         // alloc: once a level of the walk, sized by it
-        self.with(|db, _| functions.iter().map(|(instance, _)| counted(db, &instance.0)).collect())
+        self.with(|db| functions.iter().map(|(instance, _)| counted(db, &instance.0)).collect())
     }
 
     fn spell(&self, instance: &HirInstance) -> String {
-        self.with(|db, _| spelled(db, &instance.0))
+        self.with(|db| spelled(db, &instance.0))
     }
 
     fn past_recursion_limit(
@@ -651,7 +652,7 @@ impl Frontend for HirFrontend<'_> {
         head: &HirInstance,
         limit_of: &HirInstance,
     ) -> CodegenError {
-        self.with(|db, _| past_recursion_limit(db, instance, depth, limit, head, limit_of))
+        self.with(|db| past_recursion_limit(db, instance, depth, limit, head, limit_of))
     }
     fn closed(&self) -> Result<bool, CodegenError> {
         self.devirt.closed(self)
@@ -677,8 +678,7 @@ fn counted(db: &Db, kind: &Kind) -> Counted {
 fn heads_own_path(db: &Db, kind: &Kind) -> bool {
     let Kind::Code(instance, _) = kind else { return false };
     let InstanceDef::Fn(func) = instance.def else { return false };
-    let generic = instance.args.as_ref().iter().any(|arg| arg.region().is_none());
-    !generic
+    !instance.is_generic()
         && !AttrFlags::query(db, func.into()).intersects(AttrFlags::IS_INLINE | AttrFlags::RUSTC_FORCE_INLINE)
 }
 
@@ -893,18 +893,17 @@ impl HirInstance {
     }
 }
 
-/// [`HirFrontend::root`] in a task's `homes`. Each lifetime parameter is erased, as in the
+/// [`HirFrontend::root`], given the database. Each lifetime parameter is erased, as in the
 /// instance a call names, so the root and the call are one instance.
-pub(crate) fn root_in(db: &Db, homes: &mut Homes, func: FunctionId) -> HirInstance {
+pub(crate) fn root_in(db: &Db, func: FunctionId) -> HirInstance {
     let interner = DbInterner::new_no_crate(db);
     let erased = Region::new_erased(interner);
-    rooted(db, homes, func, GenericArgs::for_item(interner, func.into(), |_, _, _, _| erased.into()))
+    rooted(db, func, GenericArgs::for_item(interner, func.into(), |_, _, _, _| erased.into()))
 }
 
 /// [`HirFrontend::root_with_fn_items`].
 fn root_with_fn_items_in(
     db: &Db,
-    homes: &mut Homes,
     func: FunctionId,
     items: &[FunctionId],
 ) -> Result<HirInstance, String> {
@@ -938,15 +937,15 @@ fn root_with_fn_items_in(
             items.len()
         ));
     }
-    Ok(rooted(db, homes, func, args))
+    Ok(rooted(db, func, args))
 }
 
 /// The root of `func` instantiated with `args`, in the empty environment of its crate.
-fn rooted<'db>(db: &'db Db, homes: &mut Homes, func: FunctionId, args: GenericArgs<'db>) -> HirInstance {
+fn rooted<'db>(db: &'db Db, func: FunctionId, args: GenericArgs<'db>) -> HirInstance {
     let krate = func.krate(db);
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate }.store();
     let instance = Instance { def: InstanceDef::Fn(func), args: args.store(), checked: false };
-    let env = homes.home(db, &instance, &env);
+    let env = instance.home_env(db, &env);
     HirInstance(Kind::Code(instance, env))
 }
 
@@ -1151,6 +1150,9 @@ fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String
                 // The body has no code identity: the function has no code either (rule 3).
                 // clone: the error owns its text; the query keeps its own
                 Err(fncache::Uncached::Refused(why)) => return Err(why.clone()),
+                // The body reaches what blaze can't compile: the function has no code either.
+                // alloc: the error's message
+                Err(fncache::Uncached::Uncompiled(it)) => return Err(it.to_string()),
             };
             Ok(CodeHash(hasher.finish()))
         }
@@ -1192,19 +1194,7 @@ fn args_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<ContentId, Strin
 /// arguments other than regions, as every shim does.
 fn generic(kind: &Kind) -> bool {
     let Kind::Code(instance, _) = kind else { return false };
-    match instance.def {
-        InstanceDef::Fn(_)
-        | InstanceDef::Closure(_)
-        | InstanceDef::Coroutine(_)
-        | InstanceDef::CoroutineByMove(_) => {
-            instance.args.as_ref().iter().any(|arg| arg.region().is_none())
-        }
-        InstanceDef::DropGlue
-        | InstanceDef::CallOnceShim
-        | InstanceDef::VtableShim(_)
-        | InstanceDef::FnPointerShim
-        | InstanceDef::ReifyShim { .. } => true,
-    }
+    instance.is_generic()
 }
 
 /// The crate an instance's code is written in, for one that is not generic.
@@ -1329,7 +1319,7 @@ fn written_checks(db: &Db, kind: &Kind) -> Option<bool> {
 pub(super) fn symbol_of(db: &Db, kind: &Kind) -> Result<Option<String>, String> {
     Ok(match kind {
         Kind::Code(instance, _) => match instance.def {
-            InstanceDef::Fn(func) if instance.args.as_ref().iter().all(|it| it.region().is_some()) => {
+            InstanceDef::Fn(func) if !instance.is_generic() => {
                 exported_symbol(db, func).or_else(|| linked_symbol(db, func))
             }
             _ => None,

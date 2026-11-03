@@ -1123,6 +1123,18 @@ fn an_imaged_crate_s_checked_reads_leave_out_what_its_image_covers() {
 /// is kept, not fetched again, and one whose key changed is fetched again and, when missing,
 /// loses its image.
 #[test]
+fn a_serve_that_finds_nothing_writes_nothing() {
+    let mut db = fixture::db(FIXTURE).into_db();
+    let crates = all(&db);
+    let passes = db.maintain_passes();
+    let served = serve(&mut db, &crates, BUILD, &Memory::default(), Mode::Serve).unwrap();
+    assert_eq!(served.hits, Vec::new());
+    assert_eq!(db.maintain_passes(), passes, "a cold store's misses change nothing a maintainer reads");
+    let raw: &Db = &db;
+    assert!(DepImages::try_get(raw).is_none(), "nothing served, nothing given");
+}
+
+#[test]
 fn serving_a_crate_at_a_time_adds_to_what_was_served() {
     let (memory, _) = stored(FIXTURE);
     let mut db = fixture::db(FIXTURE).into_db();

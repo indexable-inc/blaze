@@ -648,7 +648,8 @@ impl Target {
         };
         let (pic, tls) = self.addressing();
         // `isa` leaves Cranelift's `probestack_size_log2` at its default: a page of 4 KiB.
-        Some(blaze_stencil::Target { arch, os, cpu, pic, tls, probe_stack: true, probe_log2: 12 })
+        // Code counts nothing unless its unit's spec says it does (`Spec::counted`).
+        Some(blaze_stencil::Target { arch, os, cpu, pic, tls, probe_stack: true, probe_log2: 12, counts: false })
     }
 
     /// The settings of Cranelift's ISA that the [`cpu`](Self::cpu) rustc compiles for has:

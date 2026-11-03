@@ -29,6 +29,8 @@
 //! - **`cfg:<key>=<value>,<flag>`**, **`env:<KEY>=<value>`**, **`crate-attr:<attr>`**.
 //! - **`new_source_root:local|library`**: this file and those after it are a new source root.
 //! - **`library`**: the crate is not a workspace member.
+//! - **`lang`**: the crate is the standard library's (origin `Lang`) whatever its name, as a
+//!   build's `panic_unwind` and `panic_abort` are.
 //!
 //! The fixture's own metadata, at its top in this order: `//- toolchain: nightly|stable`,
 //! `//- target_data_layout: <layout>`, `//- target_arch: <arch>`,
@@ -530,7 +532,7 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
 
     // Setting the crate graph maintains every crate's def map, which reads the proc macros: one
     // write sets both, so the maintainers run once and see the fixture's.
-    let crates_id_map = db.batch(|db| {
+    let crates_id_map = db.batch(base_db::Trigger::named("the fixture's crate graph and proc macros"), |db| {
         let crates_id_map = graph.set_in_db(db);
         macros.build_in(db, &crates_id_map);
         crates_id_map
@@ -691,7 +693,8 @@ impl FileMeta {
             invalid => panic!("invalid source root kind '{invalid}'"),
         });
         let current = introduce_new_source_root.unwrap_or(current);
-        let krate = f.krate.map(|it| parse_crate(it, current, f.library));
+        assert!(!f.lang || f.krate.is_some(), "`lang` is for a file with `crate:`: {}", f.path);
+        let krate = f.krate.map(|it| parse_crate(it, current, f.library, f.lang));
         let meta = FileMeta {
             path: f.path,
             deps: f.deps,
@@ -708,8 +711,8 @@ impl FileMeta {
 
 /// `crate:` metadata: `name`, `name@0.0.1,http://example.com`, `bin:name`,
 /// `bin:name@0.0.1,http://example.com`, and any of these after `r#` for a crate named like a
-/// language crate that is not one.
-fn parse_crate(crate_str: String, current: SourceRootKind, library: bool) -> CrateMeta {
+/// language crate that is not one. `lang` makes any crate a language crate.
+fn parse_crate(crate_str: String, current: SourceRootKind, library: bool, lang: bool) -> CrateMeta {
     let (crate_str, not_lang) = match crate_str.strip_prefix("r#") {
         Some(rest) => (rest.to_owned(), true),
         None => (crate_str, false),
@@ -740,19 +743,19 @@ fn parse_crate(crate_str: String, current: SourceRootKind, library: bool) -> Cra
         None => (TargetKind::Lib { is_proc_macro: false }, name),
     };
     let not_member = library || current == SourceRootKind::Library;
-    let lang = match not_lang {
+    let by_name = match not_lang {
         true => LangCrateOrigin::Other,
         false => LangCrateOrigin::from(&*name),
     };
-    let origin = match lang {
-        LangCrateOrigin::Other => {
+    let origin = match by_name {
+        LangCrateOrigin::Other if !lang => {
             let name = Symbol::intern(&name);
             match not_member {
                 true => CrateOrigin::Library { repo, name },
                 false => CrateOrigin::Local { repo, name: Some(name) },
             }
         }
-        lang => CrateOrigin::Lang(lang),
+        it => CrateOrigin::Lang(it),
     };
     CrateMeta { name, origin, version, target_kind }
 }

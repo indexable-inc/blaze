@@ -22,11 +22,10 @@ use hir_ty::db::HirDatabase;
 use super::{Walking, walk};
 use crate::{
     Instance, InstanceDef,
-    home::Homes,
     v2::{
         BuildTime, Built, Databases, HashSource, HirFrontend, HirInstance, HirStatic, Kind,
         backend::{built, compiled_in},
-        build::{self, Build},
+        build::Build,
         by_id::ById,
         places::{self, Placer, Ref, place_requests},
     },
@@ -109,14 +108,13 @@ type Reached = Vec<(HirInstance, Vec<Ref>)>;
 fn walked(
     frontend: &HirFrontend,
     db: &Db,
-    homes: &mut Homes,
     instance: &HirInstance,
 ) -> Vec<Ref> {
-    let first = walk(db, instance, Walking::plain(false), homes).unwrap_or_else(|e| panic!("{e}"));
-    let again = walk(db, instance, Walking::plain(false), homes).unwrap_or_else(|e| panic!("again: {e}"));
+    let first = walk(db, instance, Walking::plain(false)).unwrap_or_else(|e| panic!("{e}"));
+    let again = walk(db, instance, Walking::plain(false)).unwrap_or_else(|e| panic!("again: {e}"));
     assert_eq!(first, again, "{instance:?} walks two ways");
     let elsewhere = frontend
-        .with(|db, homes| walk(db, instance, Walking::plain(false), homes))
+        .with(|db| walk(db, instance, Walking::plain(false)))
         .unwrap_or_else(|e| panic!("in another database: {e}"));
     assert_eq!(first, elsewhere, "{instance:?} walks otherwise in another database");
     let distinct: HashSet<&Ref, Global> = first.iter().collect();
@@ -128,7 +126,6 @@ fn walked(
 /// walk has not listed.
 fn placed(
     db: &Db,
-    homes: &mut Homes,
     spec: &Spec,
     instance: &HirInstance,
     walked: &[Ref],
@@ -138,15 +135,14 @@ fn placed(
         "overflow checks {checked}, debug assertions {}, panic {:?}",
         spec.debug_assertions, spec.panic
     );
-    let mut code = build::with(Build::of(spec), || built(db, instance, crate::Target::for_fixtures(), checked))
-        .and_then(|it| it)
+    let mut code = built(db, instance, crate::Target::for_fixtures(), checked, Build::of(spec))
         .unwrap_or_else(|e| panic!("{instance:?} with {setting}: {e}"));
     let requests = match &mut code {
         Built::Ir(pending) => &mut pending.wants.requests,
         Built::Assembled(_, requests) => requests,
     };
     let mut placer = Placer::listed(walked.to_vec());
-    place_requests(db, homes, &HashSource::ById(ById), compiled_in(db, instance), &mut placer, requests).unwrap_or_else(|e| {
+    place_requests(db, &HashSource::ById(ById), compiled_in(db, instance), &mut placer, requests).unwrap_or_else(|e| {
         panic!("{instance:?} with {setting} asks for what its walk has not: {e}")
     });
 }
@@ -156,15 +152,15 @@ fn placed(
 /// reaches walks empty.
 fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
     let specs = specs();
-    frontend.with(|db, homes| {
+    frontend.with(|db| {
         let mut seen = HashSet::new_in(Global);
         seen.insert(root.clone());
         let mut queue = vec![root];
         let mut reached = Reached::new();
         while let Some(instance) = queue.get(reached.len()).cloned() {
-            let walk_of = walked(frontend, db, homes, &instance);
+            let walk_of = walked(frontend, db, &instance);
             for spec in &specs {
-                placed(db, homes, spec, &instance, &walk_of);
+                placed(db, spec, &instance, &walk_of);
             }
             for it in &walk_of {
                 let FrontRef::Function(next) = it else { continue };
@@ -174,7 +170,7 @@ fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
                             queue.push(next.clone());
                         }
                     }
-                    Kind::Asm(..) => assert_eq!(walk(db, next, Walking::plain(false), homes), Ok(Vec::new())),
+                    Kind::Asm(..) => assert_eq!(walk(db, next, Walking::plain(false)), Ok(Vec::new())),
                     Kind::Start(_) | Kind::Allocator(_) => (),
                 }
             }
@@ -398,7 +394,7 @@ fn a_derived_method_is_reached_where_derives_are_expanded() {
 
     let (db, frontend) = frontend(DERIVED);
     let root = frontend.root(function(db, "roots"));
-    let refused = frontend.with(|db, homes| walk(db, &root, Walking::plain(false), homes)).expect_err("the call of `clone`");
+    let refused = frontend.with(|db| walk(db, &root, Walking::plain(false))).expect_err("the call of `clone`");
     assert!(refused.contains("`Clone::clone` of") && refused.contains("#[derive(Clone)]"), "{refused}");
 }
 
@@ -609,12 +605,27 @@ fn extern_and_variadic_calls_list_their_symbols() {
         return;
     }
     let [assembly] = assembly[..] else { panic!("{walked:?}") };
-    frontend.with(|db, homes| {
-        assert_eq!(walk(db, assembly, Walking::plain(false), homes), Ok(Vec::new()));
-        let mut code = built(db, assembly, crate::Target::for_fixtures(), false).expect("the assembly");
-        let Built::Assembled(_, requests) = &mut code else { panic!("IR of assembly") };
-        place_requests(db, homes, &HashSource::ById(ById), None, &mut Placer::listed(Vec::new()), requests)
-            .expect("assembly that names nothing");
+    frontend.with(|db| {
+        assert_eq!(walk(db, assembly, Walking::plain(false)), Ok(Vec::new()));
+        let code = built(db, assembly, crate::Target::for_fixtures(), false, Build::WALK);
+        // Only the pinned LLVM's assembler assembles `asm!`.
+        #[cfg(feature = "llvm")]
+        {
+            let mut code = code.expect("the assembly");
+            let Built::Assembled(_, requests) = &mut code else { panic!("IR of assembly") };
+            place_requests(db, &HashSource::ById(ById), None, &mut Placer::listed(Vec::new()), requests)
+                .expect("assembly that names nothing");
+        }
+        // A blaze without LLVM refuses it, naming the block's target and the missing assembler,
+        // never assembling it some other way.
+        #[cfg(not(feature = "llvm"))]
+        {
+            let Err(e) = code else { panic!("a blaze without LLVM assembled `asm!`") };
+            assert!(
+                e.contains("inline assembly for x86_64-") && e.contains("built without LLVM") && e.contains("--features llvm"),
+                "{e}"
+            );
+        }
     });
 }
 
@@ -716,7 +727,7 @@ fn a_constant_lists_the_functions_it_points_at() {
 fn assembly_walks_empty() {
     let (_, frontend) = frontend(PLAIN);
     let assembly = HirInstance(Kind::Asm("nop".to_owned(), false));
-    frontend.with(|db, homes| assert_eq!(walk(db, &assembly, Walking::plain(false), homes), Ok(Vec::new())));
+    frontend.with(|db| assert_eq!(walk(db, &assembly, Walking::plain(false)), Ok(Vec::new())));
 }
 
 const BROKEN: &str = r#"
@@ -729,7 +740,7 @@ pub fn broken() -> u32 { "not a number" }
 fn a_body_that_does_not_lower_is_an_error_naming_the_instance() {
     let (db, frontend) = frontend(BROKEN);
     let root = frontend.root(function(&db, "broken"));
-    let walked = frontend.with(|db, homes| walk(db, &root, Walking::plain(false), homes));
+    let walked = frontend.with(|db| walk(db, &root, Walking::plain(false)));
     let error = walked.expect_err("the walk of a body with a type error");
     assert!(error.contains(&format!("{root:?}")), "{error}");
 }
@@ -758,7 +769,7 @@ fn vtables_whose_types_differ_in_lifetimes_only_are_one() {
     use rustc_type_ir::{TypeVisitableExt as _, inherent::IntoKind as _};
     let (db, frontend) = frontend(VTABLES_APART_IN_LIFETIMES);
     let root = frontend.root(function(&db, "root"));
-    frontend.with(|db, _| {
+    frontend.with(|db| {
         hir_ty::attach_db(db, || {
             let facts = super::facts(db, &root, Walking::plain(false))
                 .unwrap_or_else(|e| panic!("{e}"))
@@ -798,7 +809,7 @@ pub fn root() -> u32 {
 fn vtables_whose_types_differ_in_binder_names_only_are_one() {
     let (db, frontend) = frontend(VTABLES_APART_IN_BINDERS);
     let root = frontend.root(function(&db, "root"));
-    frontend.with(|db, _| {
+    frontend.with(|db| {
         hir_ty::attach_db(db, || {
             let facts = super::facts(db, &root, Walking::plain(false))
                 .unwrap_or_else(|e| panic!("{e}"))

@@ -65,9 +65,9 @@ pub(crate) fn of(
 
 /// What the code of `instance` is: its body's identity, its arguments' identity, and the facts
 /// its monomorphized body reads past its body's identity: each local's type, and each
-/// constant's and static's value. Asked from `env`, worked out in its home (`crate::home`).
+/// constant's and static's value. Asked from `env`, worked out in its home (`crate::walk::home_env`).
 pub(crate) fn content(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> &Result<ContentId, String> {
-    content_in(db, crate::home::env_of(db, &env, &instance), instance)
+    content_in(db, crate::walk::home_env(db, &env, &instance), instance)
 }
 
 /// [`content`] in `env`, the instance's home.
@@ -242,9 +242,19 @@ impl<'db> Facts<'db> {
                     self.h.update(&(*address as u64).to_le_bytes()).part(bytes);
                 }
                 self.h.update(&(map.vtable.tys().len() as u64).to_le_bytes());
-                for ty in map.vtable.tys() {
+                // Each id's type, and the `dyn` type it is a vtable for.
+                for (ty, dyn_ty) in map.vtable.entries() {
                     let id = self.ty_id(ty)?;
                     self.h.id(&id);
+                    match dyn_ty {
+                        Some(dyn_ty) => {
+                            let id = self.ty_id(dyn_ty)?;
+                            self.h.update(&[1]).id(&id);
+                        }
+                        None => {
+                            self.h.update(&[0]);
+                        }
+                    }
                 }
                 self.h.update(&(map.type_ids.len() as u64).to_le_bytes());
                 for ty in &map.type_ids {

@@ -416,8 +416,9 @@ fn int_const<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, bound: Bound) -> Operand {
         Bound::Zero => 0,
         Bound::MinusOne => u128::MAX,
         // The least value at the type's width, sign-extended: `i8`'s `0x80`, and `i3`'s
-        // `0xFC` in the `i8` it is stored as (`#![blaze::arbitrary_ints]`).
-        Bound::Min => (-(1i128 << (value_bits(ctx, ty) - 1))) as u128,
+        // `0xFC` in the `i8` it is stored as (`#![blaze::arbitrary_ints]`). Negated as a
+        // `u128`, so `i128`'s (`1 << 127`, its own negation) does not overflow.
+        Bound::Min => (1u128 << (value_bits(ctx, ty) - 1)).wrapping_neg(),
     };
     int_value(ctx, ty, value)
 }

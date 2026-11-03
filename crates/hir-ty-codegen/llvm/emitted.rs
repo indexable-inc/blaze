@@ -1124,6 +1124,13 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 Symbol::Data(index) => ModuleRelocTarget::user(1, index),
             });
         }
+        // Never an outside symbol: LLVM gave a second object one of the module's names.
+        if let Some(symbol) = Symbol::uniqued(name) {
+            // alloc: the error's message
+            return Err(Unhandled::Duplicate(format!(
+                "the code refers to `{name}`, the name LLVM gave a second object named `{symbol}`"
+            )));
+        }
         let names = default_libcall_names();
         if let Some(libcall) = LibCall::all_libcalls().iter().find(|&&it| names(it) == name) {
             return Ok(ModuleRelocTarget::LibCall(*libcall));

@@ -839,7 +839,7 @@ impl Crate {
         env: Env,
         durability: Durability,
     ) -> Crate {
-        db.batch(|db| {
+        db.write("Crate::create", |db| {
             let root = root_path(&*db, data.root_file_id);
             let lints = LintOptions::default();
             let content =
@@ -855,7 +855,7 @@ impl Crate {
     }
 
     pub fn set_data(self, db: &mut Db, data: BuiltCrateData) {
-        db.write_crates(|db| {
+        db.write_crates("Crate::set_data", |db| {
             self.set_data_field(db).to(data);
             db.set_crate_attr_files(self, false, None);
             refresh_contents(db, self);
@@ -863,35 +863,35 @@ impl Crate {
     }
 
     pub fn set_extra_data(self, db: &mut Db, extra: ExtraCrateData) {
-        db.write_crates(|db| {
+        db.write_crates("Crate::set_extra_data", |db| {
             self.set_extra_data_field(db).to(extra);
             refresh_contents(db, self);
         })
     }
 
     pub fn set_workspace_data(self, db: &mut Db, workspace: Arc<CrateWorkspaceData>) {
-        db.write_crates(|db| {
+        db.write_crates("Crate::set_workspace_data", |db| {
             self.set_workspace_data_field(db).to(workspace);
             refresh_contents(db, self);
         })
     }
 
     pub fn set_cfg_options(self, db: &mut Db, cfg: CfgOptions) {
-        db.write_crates(|db| {
+        db.write_crates("Crate::set_cfg_options", |db| {
             self.set_cfg_options_field(db).to(cfg);
             refresh_contents(db, self);
         })
     }
 
     pub fn set_env(self, db: &mut Db, env: Env) {
-        db.write_crates(|db| {
+        db.write_crates("Crate::set_env", |db| {
             self.set_env_field(db).to(env);
             refresh_contents(db, self);
         })
     }
 
     pub fn set_lint_options(self, db: &mut Db, options: LintOptions) {
-        db.write_crates(|db| {
+        db.write_crates("Crate::set_lint_options", |db| {
             self.set_lint_options_field(db).to(options);
             refresh_contents(db, self);
         })
@@ -1500,7 +1500,7 @@ impl CrateGraphBuilder {
     /// not compare an input's new value with its old one). A crate whose fields, root path and
     /// dependencies' content IDs are what its content ID was made from is not hashed again.
     pub fn set_in_db(self, db: &mut Db) -> CratesIdMap {
-        db.write_crates(|db| self.set_in_db_inner(db))
+        db.write_crates("CrateGraphBuilder::set_in_db", |db| self.set_in_db_inner(db))
     }
 
     fn set_in_db_inner(self, db: &mut Db) -> CratesIdMap {

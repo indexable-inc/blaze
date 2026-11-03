@@ -816,11 +816,23 @@ fn std_key(
         library,
         triple: triple.to_owned(),
         profile: base.name.clone(),
-        // As each unit of `triple` is built (`units`): an `unwind` profile aborts where the
-        // target does.
-        panic: match for_macros || (base.panic == "unwind" && target_aborts(triple)?) {
-            true => "abort".to_owned(),
-            false => base.panic.clone(),
+        // Built to unwind, as the toolchain's sysroot is, whatever the profile says: a program
+        // that aborts links it with `panic_abort` (rustc's `RequiredPanicStrategy` lets a crate
+        // built to unwind into one), and the build's tests, benches and build scripts, which
+        // unwind under any profile (cargo's `PanicSetting::AlwaysUnwind`), link the same std.
+        // A std built to abort under a profile's `abort` was linked by an unwinding test, which
+        // hir-ty-codegen's `linked_crates` refuses (#1611). Only where nothing unwinds is it
+        // built to abort: the wasm macros, and a target that aborts. A `-Zbuild-std` with
+        // neither `std` nor `panic_unwind` (`core`, `alloc`) is built with the profile's
+        // `panic`, as cargo builds it: no crate of it defines `rust_eh_personality`, which a
+        // `core` built to unwind names from its landing pads (#1611 round 3, L9). The key names
+        // it, so a std built to abort is never another's (rule 18).
+        panic: if for_macros || target_aborts(triple)? {
+            "abort".to_owned()
+        } else if !crates.iter().any(|it| it == "std" || it == "panic_unwind") {
+            base.panic.clone()
+        } else {
+            "unwind".to_owned()
         },
         opt_level: base.opt_level.clone(),
         debug_assertions: base.debug_assertions,
@@ -866,14 +878,21 @@ fn runs_as_keyed(
     }
 }
 
-/// Whether the test `unit` runs in libtest's harness: its target's `harness`.
+/// Whether the test `unit` runs in libtest's harness: its target's `harness`. A library's unit
+/// is the package's one library target, whatever crate types its unit names.
 fn harness_of(unit: &Unit, packages: &BySpec<'_>) -> bool {
     let Some((_, package)) = packages.get(unit.pkg_id.as_str()) else { return false };
     package.manifest.targets.iter().any(|target| {
-        target.name == unit.target.name && target.harness && kind_name(&target.kind) == unit.target.kind.first().map(String::as_str)
+        target.name == unit.target.name
+            && target.harness
+            && match kind_name(&target.kind) {
+                None => unit.target.is_lib(),
+                Some(kind) => unit.target.kind.first().map(String::as_str) == Some(kind),
+            }
     })
 }
 
+/// The unit graph's kind of a target, or `None` for a library, whose kinds are its crate types.
 fn kind_name(kind: &TargetKind) -> Option<&'static str> {
     Some(match kind {
         TargetKind::Lib(_) => return None,

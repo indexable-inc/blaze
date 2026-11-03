@@ -4,10 +4,14 @@
 //! once the crates are resolved. This is its store: the job's [`blaze_cas::Reader`] to read
 //! from, in place, and the puts it asks for, handed to the loop, which alone writes the store.
 //!
-//! - A front end freshly lowered is served the crates of the units every run of whose closure
-//!   is applied then, and each run applied serves those it made ready ([`serve`], adding to
-//!   what was served): nothing a later run changes reaches them, and a crate that depends on a
-//!   proc macro not built yet is not eligible.
+//! - A front end is served the crates of the units every run of whose closure is applied as
+//!   its job is lowered, and each batch of runs and proc macros applied serves those it made
+//!   ready or a loaded proc macro reaches ([`serve`], adding to what was served); a crate that
+//!   depends on a proc macro not built yet is not eligible. A front end kept across builds is
+//!   served at the same points as one freshly lowered: its [`Session`] keeps the key each crate
+//!   was last served or resolved under, and a serve asks the store again only of a crate whose
+//!   key moved, so a run applied again with other output (a variable only a build script
+//!   reads, such as `CC`, changed) takes a served crate's stale image away (rule 18).
 //! - Its images are written once the head's next build lowers into the front end kept
 //!   ([`store`]): every unit of the build it was kept from has compiled, so what each crate
 //!   resolves to is memoized already.
@@ -30,6 +34,7 @@ use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_lower::Lowered;
+use blaze_units::query::EnvReads;
 use hir_def::deps::{Held, ImageBuf, ImageStore, Mode, Served};
 use hir_ty::{body_store, next_solver::goal_store};
 use parking_lot::Mutex;
@@ -48,9 +53,12 @@ pub(crate) struct Kept {
 }
 
 impl Kept {
-    /// What a later [`serve`] of the same front end served, added: a crate's latest key holds.
+    /// What a later [`serve`] of the same front end served, added: a crate's latest key holds,
+    /// and a crate keyed again is a hit or stale only as that serve found it.
     fn add(&mut self, more: Served) {
         let Served { keys, hits, stale } = more;
+        self.served.hits.retain(|it| !keys.contains_key(it));
+        self.served.stale.retain(|it| !keys.contains_key(it));
         self.served.keys.extend(keys);
         self.served.hits.extend(hits);
         self.served.hits.sort_unstable();
@@ -75,11 +83,13 @@ pub(crate) fn ready(job: &Job, waits: &graph::Waits) -> Vec<u32> {
     (0..job.graph.len() as u32).filter(|&unit| waits.ready(unit)).collect() // alloc: setup, once per front end
 }
 
-/// The eligible crates of `units` (and their dependencies), served from the store through
-/// `session`, adding to what `kept` holds of earlier serves of the front end: their images,
-/// then their check outcomes and checked bodies, then their constants' values. Called with the
-/// front end exclusive (no task reads it), once for the units ready when it is lowered and once
-/// per batch of runs applied, with the units they made ready.
+/// The eligible crates of `units` (and their dependencies) whose key moved since the front
+/// end's database was last served ([`images`]), served from the store through `session`,
+/// adding to what `kept` holds of this job's earlier serves: their images, then their check
+/// outcomes and checked bodies, then their constants' values; nothing when no key moved.
+/// Called with the front end exclusive (no task reads it), in every job, freshly lowered or
+/// kept: once for the units ready when it is lowered, and once per batch of runs and proc
+/// macros applied, with the units they made ready and those a loaded macro reaches.
 pub(crate) fn serve(
     lowered: &mut Lowered,
     job: &Job,
@@ -87,10 +97,11 @@ pub(crate) fn serve(
     session: &mut Session,
     kept: &mut Option<Kept>,
 ) -> Result<(), ApiError> {
-    let mode = mode_in(&job.input.config.invocation.env)?;
+    let mode = mode_in(&mut session.env, &job.input.config.invocation.env)?;
     let build = build()?;
-    let served = lowered.serve_deps(units, build, &*session.images, mode).map_err(super::lower_error)?;
-    debug_assert!(session.images.take_puts().is_empty(), "serving puts nothing");
+    // alloc: once per serve, one entry per unit's crate
+    let crates: Vec<Crate> = units.iter().filter_map(|&unit| job.crates.krate(unit as usize)).collect();
+    let Some(served) = images(lowered, &crates, build, session, mode)? else { return Ok(()) };
     match kept {
         Some(kept) => kept.add(served),
         None => *kept = Some(Kept { served, mode }),
@@ -99,7 +110,7 @@ pub(crate) fn serve(
         return Err(ApiError::new("the dependencies' checks are served while a task still reads them", None));
     };
     let db = lowered.db();
-    let flags = imaged(db, job, units.iter().map(|&unit| unit as usize))?;
+    let flags = imaged(job, units.iter().map(|&unit| unit as usize), &session.keyed)?;
     let options = Options::default();
     let asked: Vec<(Crate, cache::Inputs<'_>)> =
         flags.iter().map(|(krate, flags)| (*krate, cache::Inputs::of(db, flags, &options))).collect(); // alloc: once per serve
@@ -116,12 +127,55 @@ pub(crate) fn serve(
     Ok(())
 }
 
-/// Each crate of `units` read from an image, once, with the lint flags its unit is checked
-/// with, as `compile`'s `make` gives them to the check: what its outcome is keyed by.
-fn imaged(db: &Db, job: &Job, units: impl Iterator<Item = usize>) -> Result<Vec<(Crate, Vec<String>)>, ApiError> {
+/// The images of `crates`' eligible crates and their dependencies whose key ([`hir_def::deps::keys`])
+/// is not the one `session` last served or resolved them under, served through `session` by
+/// `build` in `mode` ([`Lowered::serve_deps`]): what that serve did of those crates alone, or
+/// `None`, nothing written, when no key moved. A crate whose key moved loses the image it was
+/// read from: it is read from the image under its new key, or resolved. A crate whose key did
+/// not move is asked of the store again only as a dependency of one whose key did, and is not
+/// imaged again.
+pub(crate) fn images(
+    lowered: &mut Lowered,
+    crates: &[Crate],
+    build: ContentId,
+    session: &mut Session,
+    mode: Mode,
+) -> Result<Option<Served>, ApiError> {
+    let keys = {
+        let _span = tracing::info_span!(target: "blaze", "dependency image keys", crates = crates.len()).entered();
+        hir_def::deps::keys(lowered.db(), crates, build)
+    };
+    let mut moved: Vec<Crate> =
+        keys.iter().filter(|&(krate, key)| session.keyed.get(krate) != Some(key)).map(|(&krate, _)| krate).collect(); // alloc: once per serve, one per crate whose key moved
+    if moved.is_empty() {
+        return Ok(None);
+    }
+    moved.sort_unstable();
+    let served = lowered.serve_deps(&moved, build, &*session.images, mode).map_err(super::lower_error)?;
+    debug_assert!(session.images.take_puts().is_empty(), "serving puts nothing");
+    session.keyed.extend(keys);
+    let Served { keys, hits, stale } = served;
+    let of_moved = |krate: &Crate| moved.binary_search(krate).is_ok();
+    // alloc: once per serve that moved a key, one entry per crate whose key moved
+    Ok(Some(Served {
+        keys: keys.into_iter().filter(|(krate, _)| of_moved(krate)).collect(),
+        hits: hits.into_iter().filter(of_moved).collect(),
+        stale: stale.into_iter().filter(of_moved).collect(),
+    }))
+}
+
+/// Each crate of `units` that `keyed` has a key of (an eligible dependency), once, with the lint
+/// flags its unit is checked with, as `compile`'s `make` gives them to the check: what its
+/// outcome is keyed by. One read from no image is among them, so [`cache::serve`] forgets what
+/// it was served under an image it lost.
+fn imaged(
+    job: &Job,
+    units: impl Iterator<Item = usize>,
+    keyed: &HashMap<Crate, ContentId, Global>,
+) -> Result<Vec<(Crate, Vec<String>)>, ApiError> {
     let mut crates: Vec<(Crate, usize)> = units
         .filter_map(|unit| Some((job.crates.krate(unit)?, unit)))
-        .filter(|&(krate, _)| cache::image_key(db, krate).is_some())
+        .filter(|(krate, _)| keyed.contains_key(krate))
         .collect(); // alloc: once per serve
     crates.sort_by_key(|it| it.0);
     crates.dedup_by_key(|it| it.0);
@@ -140,6 +194,21 @@ pub(crate) struct Session {
     /// Why [`hir_def::deps::store`] wrote no image of each crate it last refused, for the
     /// report of the builds that read the database after ([`served`]).
     refused: HashMap<Crate, String, Global>,
+    /// What the session and its serves read of the requests' environment (its stores' modes):
+    /// the front end it is kept with serves a later request only while each has the value
+    /// read (`super::env_moved`).
+    env: EnvReads,
+    /// The key ([`hir_def::deps::keys`]) each eligible crate of the database was last served or
+    /// resolved under, over every job of the front end it is kept with: [`images`] serves
+    /// again exactly the crates whose key moved since.
+    keyed: HashMap<Crate, ContentId, Global>,
+}
+
+impl Session {
+    /// [`Session::env`].
+    pub(crate) fn env_read(&self) -> &EnvReads {
+        &self.env
+    }
 }
 
 /// The session of `lowered`'s database over `store`, its goal store and item store installed
@@ -152,7 +221,8 @@ pub(crate) fn session(
     macros: &Arc<blaze_macro_eval::Macros>,
     env: &[(String, String)],
 ) -> Result<Session, ApiError> {
-    let items_mode = items_in(env)?;
+    let mut read = EnvReads::default();
+    let items_mode = items_in(&mut read, env)?;
     // alloc: setup, once per database; clone: an `Arc` each
     let images = Arc::new(Images::new(store.clone(), Arc::clone(macros)));
     // dyn: the goal store keeps both for the database's life; called once per database
@@ -174,14 +244,14 @@ pub(crate) fn session(
         }
     };
     let checks = Arc::new(cache::Served::default()); // alloc: setup, once per database
-    Ok(Session { installed, items, images, checks, refused: HashMap::new_in(Global) })
+    Ok(Session { installed, items, images, checks, refused: HashMap::new_in(Global), env: read, keyed: HashMap::new_in(Global) })
 }
 
 /// What the job's `BLAZE_ITEM_STORE` asks of the item store: unset serves what it holds,
 /// `verify` runs each step it holds as well and stops the build on a difference, `off`
 /// installs none; any other value is an error naming it.
-fn items_in(env: &[(String, String)]) -> Result<Option<body_store::Mode>, ApiError> {
-    match env.iter().find(|(name, _)| name == ITEMS).map(|(_, value)| value.as_str()) {
+fn items_in(read: &mut EnvReads, env: &[(String, String)]) -> Result<Option<body_store::Mode>, ApiError> {
+    match read.var(env, ITEMS, "the item store's mode").map_err(|why| ApiError::new(why, None))? {
         None => Ok(Some(body_store::Mode::Serve)),
         Some("verify") => Ok(Some(body_store::Mode::Verify)),
         Some("off") => Ok(None),
@@ -222,8 +292,8 @@ impl Session {
 /// What the job's `BLAZE_DEP_IMAGES` asks done with an image: unset serves it, `check`
 /// resolves its crate as well, `verify` writes again what was read; any other value is an
 /// error naming it.
-fn mode_in(env: &[(String, String)]) -> Result<Mode, ApiError> {
-    match env.iter().find(|(name, _)| name == IMAGES).map(|(_, value)| value.as_str()) {
+fn mode_in(read: &mut EnvReads, env: &[(String, String)]) -> Result<Mode, ApiError> {
+    match read.var(env, IMAGES, "the dependency images' mode").map_err(|why| ApiError::new(why, None))? {
         None => Ok(Mode::Serve),
         Some("check") => Ok(Mode::Check),
         Some("verify") => Ok(Mode::Verify),
@@ -503,21 +573,27 @@ pub(crate) fn served(db: &Db, job: &Job, session: &Session) -> Result<Vec<Served
     Ok(lines)
 }
 
-/// The identity of the blaze reading and writing images: its own code with the pinned nightly
-/// it compiles against, which decides what a crate resolves to. Never a constant: a fixed
-/// name-resolution bug must not go on serving the def maps the bug made.
-fn build() -> Result<ContentId, ApiError> {
+/// The identity of the blaze reading and writing images, the goal and item stores, kept
+/// proc-macro expansions and unit records: the hash of its whole executable
+/// ([`crate::serve::build_id`]), which decides what a crate resolves to, what a macro expands
+/// to and what a unit's record holds. Never a constant: a fixed name-resolution bug must not
+/// go on serving the def maps the bug made. Not the code generator's code identity
+/// (`Toolchain::id`), which covers only the code generator's packages: these values are made
+/// by code past them too (blaze-item-hash, blaze-macro-eval, blaze-cargo itself), so each keeps
+/// every byte of blaze in its key until it has a content identity of the code that makes it.
+pub(crate) fn build() -> Result<ContentId, ApiError> {
     #[expect(
         clippy::disallowed_types,
         reason = "the identity of the running blaze executable, hashed once per process"
     )]
     static BUILD: std::sync::OnceLock<Result<ContentId, String>> = std::sync::OnceLock::new();
     let worked_out = BUILD.get_or_init(|| {
-        let host = crate::toolchain::host()
-            .ok_or("blaze has no target triple for this machine's architecture and system")?;
-        hir_ty_codegen::v2::toolchain(host, &[], hir_ty_codegen::v2::Runs::Elsewhere).map(|it| it.id)
+        // alloc: an error, once a process
+        let exe = std::env::current_exe().map_err(|why| format!("the path of blaze itself: {why}"))?;
+        // alloc: an error, once a process
+        crate::serve::build_id(&exe).map_err(|why| format!("{why:#}"))
     });
-    worked_out.clone().map_err(|why| ApiError::new(format!("the identity dependency images are keyed by: {why}"), None))
+    worked_out.clone().map_err(|why| ApiError::new(format!("the identity of the blaze executable: {why}"), None))
 }
 
 /// The store as [`hir_def::deps`] and the goal store read and write it.
@@ -608,4 +684,4 @@ fn on_pool(count: usize, task: &(dyn Fn(usize) + Sync)) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

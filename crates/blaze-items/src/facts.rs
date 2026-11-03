@@ -39,6 +39,7 @@ use hir_def::{
     hir::{ClosureKind, ExprId},
     item_scope::ItemScope,
     lang_item::lang_items,
+    signatures::{TraitFlags, TraitSignature},
 };
 use hir_expand::{
     AstId, HirFileId, MacroCallId,
@@ -47,7 +48,7 @@ use hir_expand::{
 };
 use hir_ty::{
     InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, all_super_traits,
-    check_orphan_rules,
+    check_orphan_rules, sealed_bounds,
     consteval::ConstEvalError,
     db::{AnonConstId, HirDatabase, InternedClosure, InternedClosureId},
     generics::generics,
@@ -681,13 +682,19 @@ fn write_evaluated<'db>(
             let mut vtables = Vec::with_capacity_in(map.vtable.tys().len(), frame);
             if !map.vtable.is_empty() {
                 h.update(&(hir_ty::mir::VTableMap::FIRST_ID as u64).to_le_bytes());
-                for ty in map.vtable.tys() {
-                    vtables.push(ty_hash(db, owner, ty)?);
+                for (ty, dyn_ty) in map.vtable.entries() {
+                    let dyn_ty = dyn_ty.map(|it| ty_hash(db, owner, it)).transpose()?;
+                    vtables.push((ty_hash(db, owner, ty)?, dyn_ty));
                 }
             }
             h.update(&(vtables.len() as u64).to_le_bytes());
-            for it in vtables.iter() {
-                h.id(it);
+            // Each id's type, and the `dyn` type it is a vtable for.
+            for (ty, dyn_ty) in vtables.iter() {
+                h.id(ty);
+                match dyn_ty {
+                    Some(it) => h.update(&[1]).id(it),
+                    None => h.update(&[0]),
+                };
             }
             h.update(&(map.type_ids.len() as u64).to_le_bytes());
             for it in &map.type_ids {
@@ -827,10 +834,30 @@ fn write_coherence(db: &Db, h: &mut Hasher, imp: ImplId) -> Result<(), Unhashabl
         Some(trait_ref) => {
             let trait_ = trait_ref.skip_binder().def_id.0;
             h.part(b"trait").update(&[check_orphan_rules(db, imp) as u8]);
+            let has_self_ty = self_ty.is_some();
             match self_ty {
                 Some(self_ty) => h.id(&implements_value(db, IMPLEMENTS, trait_, self_ty)?),
                 None => h.part(b"blanket").id(&all_impls_value(db, trait_)?),
             };
+            // blaze's `#[blaze::sealed]` (hir-ty-coherence): whether the trait is sealed, and
+            // for an impl over a sealed bound, every impl of the bound's trait (its closure,
+            // which the orphan result above reads) and of the impl's own trait. Added only where
+            // they apply, so every other impl's fact is as it was. These cover the orphan
+            // result, not hir-ty-coherence's overlap check, which is not stored through this
+            // fact: that check also reads the impls of every trait named in a candidate's where
+            // clauses, and the reservation impls (`reservation_impls`), which no part hashes. If
+            // the overlap result is ever stored here, hash those too (the crate fact would do).
+            if TraitSignature::of(db, trait_).flags.contains(TraitFlags::SEALED) {
+                h.part(b"sealed trait");
+            }
+            let mut relaxed = false;
+            for (_, sealed) in sealed_bounds(db, imp) {
+                h.part(b"sealed bound").id(&all_impls_value(db, sealed)?);
+                relaxed = true;
+            }
+            if relaxed && has_self_ty {
+                h.part(b"relaxed").id(&all_impls_value(db, trait_)?);
+            }
         }
         None => {
             let def_map = imp.lookup(db).container.def_map(db);

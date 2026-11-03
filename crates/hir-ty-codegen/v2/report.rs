@@ -259,7 +259,7 @@ impl super::HirFrontend<'_> {
             item: blaze_items::ItemKey(blaze_ids::ContentId::default()),
             what,
         };
-        self.with(|db, _| reported(db, &self.hashes, built, reports)).map_err(error)
+        self.with(|db| reported(db, &self.hashes, built, reports)).map_err(error)
     }
 }
 

@@ -117,15 +117,11 @@ pub use backend::{Backend, builds_edits, links_own, sections_of_their_own};
 mod copies;
 mod debuginfo;
 pub use debuginfo::Sidecar;
-pub mod counted;
 mod f16_f128;
-pub mod flight;
 mod float_pair;
 mod fncache;
 mod fragment;
 mod frame_map;
-mod home;
-pub use home::body_file;
 #[cfg(feature = "llvm")]
 mod imports;
 #[cfg(feature = "llvm")]
@@ -222,18 +218,6 @@ macro_rules! refused {
         // alloc: the refusal's message
         return Err(CodegenError::Refused(format!($($arg)*)))
     };
-}
-
-/// What a crate is by what is written in it and what it is built on: a BLAKE3 hash, all of it.
-/// The names made from it are what another machine's store is asked for code by, so it is
-/// as hard to find two crates of one id as two files of one hash.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ContentId(pub [u8; 32]);
-
-impl fmt::Display for ContentId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
-    }
 }
 
 /// Where cargo keeps the sources it fetched of registries and of git, as what is stored names
@@ -387,12 +371,6 @@ pub trait SymbolResolver {
     }
     /// rustc's `StableCrateId` of a crate, which its symbols carry.
     fn stable_crate_id(&self, krate: Crate) -> Option<u64>;
-    /// What stands for a crate that is not rustc's alone to build, the same wherever the
-    /// same sources are built on the same crates.
-    fn content_id(&self, krate: Crate) -> Option<ContentId> {
-        _ = krate;
-        None
-    }
     /// Where cargo keeps the sources it fetched on this machine, when the crates of the
     /// program tell: [`CARGO_HOME`] stands for it in what is stored.
     fn cargo_home(&self) -> Option<String> {
@@ -742,6 +720,48 @@ impl blaze_query::db::NamesIds for Instance {
     }
 }
 
+impl Instance {
+    /// Whether it is compiled per instance: a function, closure or coroutine that is
+    /// `hir_ty_mir::mir::home::is_generic`, or a shim. One that is not is compiled once, in its
+    /// own crate, as rustc does (`hir_ty_mir::mir::home::env_of` gives it that crate's
+    /// environment). A vtable shim is generic here, for keying (its origin is the asker's),
+    /// but one of a non-generic method is worked out in that method's crate (`env_of`'s
+    /// `own_crate`, given the method's crate as its code).
+    fn is_generic(&self) -> bool {
+        match self.def {
+            InstanceDef::Fn(_)
+            | InstanceDef::Closure(_)
+            | InstanceDef::Coroutine(_)
+            | InstanceDef::CoroutineByMove(_) => hir_ty_mir::mir::home::is_generic(self.args.as_ref()),
+            InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::VtableShim(_)
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => true,
+        }
+    }
+
+    /// The environment the instance is compiled in when a function compiled in `asked` asks
+    /// for it: `hir_ty_mir::mir::home::env_of`, the one rule purity's walk and identity use
+    /// too. Not generic, it is its own crate's: rustc compiles it there once, whoever calls it.
+    /// Generic, rustc instantiates it in the asker, and it is compiled in its home asked from
+    /// `asked`, a crate that answers every question its code asks as the asker does.
+    fn home_env(&self, db: &Db, asked: &StoredParamEnvAndCrate) -> StoredParamEnvAndCrate {
+        let code = match self.def {
+            InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => Some(func.krate(db)),
+            InstanceDef::Closure(id) => Some(InternedClosureId::from_id(id).loc(db).owner.krate(db)),
+            InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+                Some(InternedCoroutineId::from_id(id).loc(db).owner.krate(db))
+            }
+            InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => None,
+        };
+        hir_ty_mir::mir::home::env_of(db, asked, code, self.args.as_ref())
+    }
+}
+
 impl InstanceDef {
     /// Whose MIR the instance runs: `None` for a shim, which has none.
     fn mir_owner<'db>(self) -> Option<MirOwner<'db>> {
@@ -938,8 +958,6 @@ fn rows_of(db: &Db, compiled: &CompiledFunction) -> Vec<Row> {
 #[blaze_query::tracked(returns(ref))]
 fn compiled_root(db: &Db, func: FunctionId) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
-    counted::compiles(func.krate(db));
-    let _flight = flight::Flight::root(db, func);
     tier::for_build(|| root_code(db, func, false)).map(Produced::code)
 }
 
@@ -982,14 +1000,14 @@ fn backtrace_name(db: &Db, instance: &Instance) -> String {
         }
         InstanceDef::DropGlue => ty()
             .and_then(|ty| hir_ty_mir::mir::type_name::rustc_symbol_type(db, ty))
-            // alloc: the backtrace name, owned by later.rs, flight.rs, watch.rs and v2's callers
+            // alloc: the backtrace name, owned by later.rs, watch.rs and v2's callers
             .map(|ty| format!("core::ptr::drop_glue::<{ty}>")),
         InstanceDef::CallOnceShim
         | InstanceDef::VtableShim(_)
         | InstanceDef::FnPointerShim
         | InstanceDef::ReifyShim { .. } => None,
     };
-    // alloc: the backtrace name, owned by later.rs, flight.rs, watch.rs and v2's callers
+    // alloc: the backtrace name, owned by later.rs, watch.rs and v2's callers
     name.unwrap_or_else(|| callee_name(db, instance.def).to_owned())
 }
 
@@ -1005,7 +1023,7 @@ fn root_code(db: &Db, func: FunctionId, tier: bool) -> Result<Produced> {
     let body = body_for_abi(abi, Cow::Borrowed(body))?;
     let args = GenericArgs::new_from_slice(&[]).store();
     let checked = crate_checks_overflow(db, func.krate(db)).unwrap_or(false);
-    compile_as(db, env, Some(&*body), track_caller(db, func), checked, tier, |fx| {
+    compile_as(db, env, Some(&*body), track_caller(db, func), checked, tier, None, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
@@ -1018,110 +1036,221 @@ fn root_code(db: &Db, func: FunctionId, tier: bool) -> Result<Produced> {
 /// in turn, but not through a proc macro, which is a library of the compiler's. A dependency
 /// nothing names is not linked, nor its constructors, `#[used]` statics or allocator.
 ///
-/// One panic runtime (a `#![panic_runtime]` crate) at most, as rustc's `inject_panic_runtime`
-/// and `dependency_format` choose it: std and test depend on both `panic_unwind` and
-/// `panic_abort` and name neither, and the standard library's crates are taken to name every
-/// dependency, so a runtime reached only through them is linked only where it is the one the
-/// program's strategy names (`panic_unwind` for `panic = "unwind"`, `panic_abort` for
-/// `"abort"`), unless a crate of the program names a runtime itself. Both runtimes define
-/// `__rust_start_panic` and `__rust_panic_cleanup` under the same symbols: linking both let
-/// each symbol resolve to either, so a `catch_unwind` began an unwind with `panic_unwind`
-/// and cleaned it up with `panic_abort`, whose cleanup is `unreachable!()` (#1611).
+/// One panic runtime (a `#![panic_runtime]` crate), as rustc's `inject_panic_runtime`,
+/// `activate_injected_dep` and `dependency_format::verify_ok` choose it. std and test depend on
+/// both `panic_unwind` and `panic_abort` and name neither, and the standard library's crates are
+/// taken to name every dependency, so a runtime reached only through them is an offer: the
+/// program links the one its strategy names (`panic_unwind` for `panic = "unwind"`,
+/// `panic_abort` for `"abort"`). A runtime a crate of the program names itself (`extern crate
+/// panic_abort;`, or a runtime of its own) replaces every offer. Either way the runtime must be
+/// built with the program's strategy, and two named are an error, each naming the crate that
+/// named it.
+///
+/// Then rustc's `RequiredPanicStrategy` (`dependency_format::verify_ok`): every other crate
+/// linked but the compiler's builtins that requires a strategy has the program's. A panic
+/// runtime requires its own and a crate built to abort requires `abort`; any other may be linked
+/// either way, so a program that aborts links the standard library built to unwind, as the
+/// toolchain's sysroot has it, with `panic_abort`. rustc also has a crate built to unwind that
+/// makes a call that may unwind from foreign code (`has_ffi_unwind_calls`) require `unwind`;
+/// that reads every body of every linked crate, so blaze does not check it. It holds of the
+/// standard library (the sysroot's, built to unwind, links into every program rustc builds that
+/// aborts), so a program that aborts links a crate built to unwind only from the standard
+/// library: any other is refused, naming it, never linked unchecked. Cargo's unit graphs make
+/// none (a profile's `panic` is uniform but in what always unwinds: tests, benches, build
+/// scripts). rustc's `IncompatiblePanicInDropStrategy` can't fail:
+/// blaze refuses `-Zpanic-in-drop`, so every crate has the default. Both toolchain runtimes define
+/// `__rust_start_panic` and `__rust_panic_cleanup` under the same symbols: linking both let each
+/// symbol resolve to either, so a `catch_unwind` began an unwind with `panic_unwind` and
+/// cleaned it up with `panic_abort`, whose cleanup is `unreachable!()` (#1611).
 fn linked_crates(db: &Db, krate: Crate) -> std::result::Result<HashSet<Crate, Global>, String> {
+    use hir_def::nameres::named::{is_compiler_builtins, is_panic_runtime, named_dependencies};
     let program = krate;
     let mut linked = HashSet::new_in(Global);
-    // Panic runtimes only the standard library's crates depend on: candidates for the one the
-    // program's strategy names. Few: std's and test's two.
+    // Panic runtimes only the standard library's crates depend on, and those a crate of the
+    // program names. Few: std's and test's two, and what the program names.
     // alloc: once per program linked, setup
     let mut offered: Vec<Crate> = Vec::new();
+    // Each runtime a crate of the program names, with the first crate that names it.
+    // alloc: once per program linked, setup
+    let mut named: Vec<(Crate, Crate)> = Vec::new();
     // alloc: once per program linked, setup
     let mut stack: Vec<Crate> = vec![krate];
-    let walk = |stack: &mut Vec<Crate>, linked: &mut HashSet<Crate, Global>, offered: &mut Vec<Crate>| {
+    let walk = |stack: &mut Vec<Crate>,
+                linked: &mut HashSet<Crate, Global>,
+                offered: &mut Vec<Crate>,
+                named: &mut Vec<(Crate, Crate)>| {
         while let Some(krate) = stack.pop() {
             if !linked.insert(krate) {
                 continue;
             }
             let lang = krate.data(db).origin.is_lang();
-            for &dep in hir_def::nameres::named::named_dependencies(db, krate).iter() {
+            for &dep in named_dependencies(db, krate).iter() {
                 if dep.data(db).target_kind.is_proc_macro() {
                     continue;
                 }
-                if lang && is_panic_runtime(db, dep) {
-                    if !offered.contains(&dep) {
-                        offered.push(dep);
+                if is_panic_runtime(db, dep) {
+                    if lang {
+                        if !offered.contains(&dep) {
+                            offered.push(dep);
+                        }
+                        continue;
                     }
-                    continue;
+                    if !named.iter().any(|&(it, _)| it == dep) {
+                        named.push((dep, krate));
+                    }
                 }
                 stack.push(dep);
             }
         }
     };
-    walk(&mut stack, &mut linked, &mut offered);
-    if offered.is_empty() {
+    walk(&mut stack, &mut linked, &mut offered, &mut named);
+    if offered.is_empty() && named.is_empty() {
         return Ok(linked);
     }
-    // A runtime a crate of the program names itself (`extern crate panic_abort;`) replaces
-    // the injected one, as rustc's `activate_injected_dep` has it. A runtime of no toolchain
-    // crate named beside the injected one makes their symbols defined twice, which codegen
-    // refuses naming them.
-    let named: Vec<Crate> = offered
-        .iter()
-        .copied()
-        .filter(|it| linked.contains(it))
-        // alloc: once per program linked, at most the toolchain's two runtimes
-        .collect();
-    match named.as_slice() {
-        [] => {}
-        [_] => return Ok(linked),
-        [a, b, ..] => {
-            let mut names = [fncache::crate_name(db, *a), fncache::crate_name(db, *b)];
+    let strategy = panic_strategy(db, program)?;
+    let name = |it: Crate| fncache::crate_name(db, it);
+    // The crate that named the runtime, for the errors: the one to edit.
+    let mut named_by = None;
+    let runtime = match named.as_slice() {
+        [] => {
+            let wanted = match strategy {
+                PanicStrategy::Unwind => "panic_unwind",
+                PanicStrategy::Abort => "panic_abort",
+            };
+            let Some(&runtime) = offered.iter().find(|&&it| fncache::crate_name(db, it) == wanted) else {
+                let mut names: Vec<String> = offered.iter().map(|&it| fncache::crate_name(db, it)).collect();
+                names.sort_unstable();
+                // alloc: the error's message
+                return Err(format!(
+                    "the program of crate `{}` panics by `{strategy}`, and the standard library \
+                     depends on no panic runtime `{wanted}` (only {names:?})",
+                    fncache::crate_name(db, program)
+                ));
+            };
+            runtime
+        }
+        &[(runtime, by)] => {
+            named_by = Some(by);
+            runtime
+        }
+        &[a, b, ..] => {
+            let mut names = [(name(a.0), name(a.1)), (name(b.0), name(b.1))];
             names.sort_unstable();
-            let [first, second] = names;
+            let [(first, first_by), (second, second_by)] = names;
             // alloc: the error's message
             return Err(format!(
-                "the program of crate `{}` names two panic runtimes, `{first}` and `{second}`: \
-                 a program links one",
-                fncache::crate_name(db, program)
+                "the program of crate `{}` names two panic runtimes, `{first}` (named by crate \
+                 `{first_by}`) and `{second}` (named by crate `{second_by}`): a program links one",
+                name(program)
             ));
         }
-    }
-    let wanted = panic_runtime_of(db, program)?;
-    let Some(&runtime) = offered.iter().find(|&&it| fncache::crate_name(db, it) == wanted) else {
-        let mut names: Vec<String> = offered.iter().map(|&it| fncache::crate_name(db, it)).collect();
-        names.sort_unstable();
+    };
+    // rustc's `BadPanicStrategy`: the runtime is built with the strategy it implements.
+    let built = panic_strategy(db, runtime)?;
+    if built != strategy {
+        let by = match named_by {
+            // alloc: the error's message
+            Some(by) => format!(" (named by crate `{}`)", name(by)),
+            None => String::new(), // alloc: none, an empty string
+        };
         // alloc: the error's message
         return Err(format!(
-            "the program of crate `{}` panics by `{wanted}`, and the standard library depends on \
-             no panic runtime of that name (only {names:?})",
-            fncache::crate_name(db, program)
+            "the program of crate `{}` panics by `{strategy}`, and it links the panic runtime \
+             `{}`{by}, built to panic by `{built}`: a program's panic runtime is built with its \
+             panic strategy",
+            name(program),
+            name(runtime)
         ));
-    };
+    }
+    // A named runtime is linked by the walk; an offered one is linked now, with what it names.
     stack.push(runtime);
-    walk(&mut stack, &mut linked, &mut offered);
+    walk(&mut stack, &mut linked, &mut offered, &mut named);
+    // rustc's `RequiredPanicStrategy`, of every crate linked: the doc says what requires what.
+    // alloc: the error's names, none for a program that links
+    let mut refused: Vec<String> = Vec::new();
+    let mut found = None;
+    // Crates built to unwind, not the standard library's, in a program that aborts: the
+    // FFI-unwind arm blaze does not check (the doc).
+    // alloc: the error's names, none for a program that links
+    let mut unchecked: Vec<String> = Vec::new();
+    for &it in &linked {
+        if it == program || it == runtime || is_compiler_builtins(db, it) {
+            continue;
+        }
+        let built = panic_strategy(db, it)?;
+        let required = is_panic_runtime(db, it) || built == PanicStrategy::Abort;
+        if required && built != strategy {
+            refused.push(name(it));
+            found = Some(built);
+        } else if strategy == PanicStrategy::Abort && built == PanicStrategy::Unwind && !it.data(db).origin.is_lang() {
+            unchecked.push(name(it));
+        }
+    }
+    let crates = |names: &mut Vec<String>| {
+        names.sort_unstable();
+        match names.as_slice() {
+            // alloc: the error's message
+            [one] => format!("crate `{one}`"),
+            // alloc: the error's message
+            many => format!("crates `{}`", many.join("`, `")),
+        }
+    };
+    if let Some(found) = found {
+        let crates = crates(&mut refused);
+        // alloc: the error's message
+        return Err(format!(
+            "the program of crate `{}` panics by `{strategy}`, and it links {crates}, built to \
+             panic by `{found}`: a crate built to panic by `{found}` is linked only into a \
+             program that panics by `{found}`",
+            name(program)
+        ));
+    }
+    if !unchecked.is_empty() {
+        let crates = crates(&mut unchecked);
+        // alloc: the error's message
+        return Err(format!(
+            "the program of crate `{}` panics by `abort`, and it links {crates}, built to panic \
+             by `unwind` and not the standard library's: blaze does not check a crate built to \
+             unwind for calls that may unwind out of foreign code (rustc's \
+             `has_ffi_unwind_calls`), so a program that aborts links one only from the standard \
+             library",
+            name(program)
+        ));
+    }
     Ok(linked)
 }
 
-/// Whether `krate` is a panic runtime: `#![panic_runtime]` on its root.
-fn is_panic_runtime(db: &Db, krate: Crate) -> bool {
-    let root = hir_def::nameres::crate_def_map(db, krate).crate_root(db);
-    AttrFlags::has_word(db, hir_def::AttrDefId::ModuleId(root), "panic_runtime")
+/// A crate's `-C panic`, rustc's `PanicStrategy`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PanicStrategy {
+    Unwind,
+    Abort,
 }
 
-/// The crate name of the panic runtime the program of `krate` links, by its `-C panic` (its
-/// `cfg(panic = "..")`), as rustc's `inject_panic_runtime` names it.
-fn panic_runtime_of(db: &Db, krate: Crate) -> std::result::Result<&'static str, String> {
+impl fmt::Display for PanicStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PanicStrategy::Unwind => "unwind",
+            PanicStrategy::Abort => "abort",
+        })
+    }
+}
+
+/// The panic strategy `krate` is built with: its `cfg(panic = "..")`, which its `-C panic`
+/// sets.
+fn panic_strategy(db: &Db, krate: Crate) -> std::result::Result<PanicStrategy, String> {
     let cfg = krate.cfg_options(db);
     let strategy = |value: intern::Symbol| cfg.check_atom(&cfg::CfgAtom::KeyValue { key: intern::sym::panic, value });
     if strategy(intern::sym::abort) {
-        return Ok("panic_abort");
+        return Ok(PanicStrategy::Abort);
     }
     if strategy(intern::Symbol::intern("unwind")) {
-        return Ok("panic_unwind");
+        return Ok(PanicStrategy::Unwind);
     }
     // alloc: the error's message
     Err(format!(
-        "the program of crate `{}` has a panic strategy that names no panic runtime: its cfg \
-         has neither `panic = \"unwind\"` nor `panic = \"abort\"`",
+        "crate `{}` has a panic strategy that names no panic runtime: its cfg has neither \
+         `panic = \"unwind\"` nor `panic = \"abort\"`",
         fncache::crate_name(db, krate)
     ))
 }
@@ -1136,8 +1265,6 @@ fn compiled_instance<'db>(
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "blaze", "compiled_instance").entered();
-    counted::compiles(env.krate);
-    let _flight = flight::Flight::instance(db, &instance, &env);
     tier::for_build(|| instance_code(db, instance, env, Detach::No, None)).map(Produced::code)
 }
 
@@ -1178,7 +1305,7 @@ fn instance_code(
     }
     let body = match instance.def {
         InstanceDef::DropGlue => {
-            return compile_as(db, env, None, false, instance.checked, shim, |fx| {
+            return compile_as(db, env, None, false, instance.checked, shim, unit, |fx| {
                 let ty = ty();
                 fx.drop_glue(ty)?;
                 if dumps_clif() {
@@ -1188,23 +1315,23 @@ fn instance_code(
             });
         }
         InstanceDef::CallOnceShim => {
-            return compile_as(db, env, None, false, instance.checked, shim, |fx| {
+            return compile_as(db, env, None, false, instance.checked, shim, unit, |fx| {
                 fx.call_once_shim(ty())
             });
         }
         InstanceDef::VtableShim(func) => {
             let args = instance.args.as_ref();
-            return compile_as(db, env, None, false, instance.checked, shim, |fx| {
+            return compile_as(db, env, None, false, instance.checked, shim, unit, |fx| {
                 fx.vtable_shim(func, args)
             });
         }
         InstanceDef::FnPointerShim => {
-            return compile_as(db, env, None, false, instance.checked, shim, |fx| {
+            return compile_as(db, env, None, false, instance.checked, shim, unit, |fx| {
                 fx.fn_pointer_shim(ty())
             });
         }
         InstanceDef::ReifyShim { receiver } => {
-            return compile_as(db, env, None, false, instance.checked, shim, |fx| {
+            return compile_as(db, env, None, false, instance.checked, shim, unit, |fx| {
                 fx.reify_shim(ty(), receiver)
             });
         }
@@ -1238,7 +1365,7 @@ fn instance_code(
         }
         _ => None,
     };
-    let compiled = compile_as(db, env, Some(body), tracked, instance.checked, tier, |fx| {
+    let compiled = compile_as(db, env, Some(body), tracked, instance.checked, tier, unit, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
@@ -1551,17 +1678,19 @@ fn rustc_inlines(level: MirOptLevel, lang: bool, optimized: bool) -> bool {
     level == MirOptLevel::Release && (lang || optimized)
 }
 
-/// What a body of `written` is asked with in a function compiled in `compiling`: what the v2
-/// unit's settings say ([`v2::build::Build::options`]) when `build` is a unit's, else what
-/// v1 reads of the crate and the environment ([`mir_options_of`]).
+/// What a body of `written` is asked with, `generic` where it is an instance compiled per
+/// instance ([`Instance::is_generic`]): what the v2 unit's settings say
+/// ([`v2::build::Build::options`]) when `build` is a unit's, else what v1 reads of the crate
+/// and the environment ([`mir_options_of`]). Never the crate the instance is worked out in
+/// (its home): that is a choice of sharing, which no store key names.
 fn body_options(
     db: &Db,
     build: Option<v2::build::Build>,
     written: Crate,
-    compiling: Crate,
+    generic: bool,
 ) -> Result<MirOptions> {
     match build {
-        Some(build) => Ok(build.options(db, written, compiling)),
+        Some(build) => Ok(build.options(db, written, generic)),
         None => mir_options_of(db, written),
     }
 }
@@ -1570,7 +1699,7 @@ fn body_options(
 /// generic parameters. The database does not keep it: nothing but compiling the instance
 /// reads it, and what was compiled is kept.
 ///
-/// `build` is the v2 unit's settings the body is read under ([`v2::build::building`] in the
+/// `build` is the v2 unit's settings the body is read under (`v2::backend::built`'s `build` in the
 /// IR builder, [`v2::build::Build::WALK`] for the walk), `None` in v1.
 fn instance_body<'db>(
     db: &'db Db,
@@ -1585,7 +1714,7 @@ fn instance_body<'db>(
     };
     let Some(owner) = instance.def.mir_owner() else { unsupported!("the body of a shim") };
     let written = owner.written_in(db).module(db).krate(db);
-    let options = body_options(db, build, written, env.krate)?;
+    let options = body_options(db, build, written, instance.is_generic())?;
     let body = tally
         .step(Step::Mir, || db.mir(owner, MirStage::compiled(owner, options)))
         .and_then(|it| filled(it, &args, &env));
@@ -1772,7 +1901,8 @@ type Walked = Vec<(Instance, StoredParamEnvAndCrate)>;
 fn compiled_static(db: &Db, id: StaticId) -> Result<CompiledStatic> {
     let checked = crate_checks_overflow(db, id.krate(db)).unwrap_or(false);
     let target = target_of_crate(db, id.krate(db))?;
-    let mut cg = Recorder::new(db, &**isa_for(target)?, target, checked);
+    // A query keyed by the static alone: its value is no unit's.
+    let mut cg = Recorder::new(db, &**isa_for(target)?, target, checked, None);
     let env =
         ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate: id.krate(db) };
     let mut value = None;
@@ -2185,11 +2315,13 @@ fn compile<'db>(
     checked: bool,
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<CompiledFunction> {
-    compile_as(db, env, body, tracked, checked, false, fill).map(Produced::code)
+    compile_as(db, env, body, tracked, checked, false, None, fill).map(Produced::code)
 }
 
 /// Builds the IR of one function and compiles it with Cranelift, or, for a compile at a level
-/// above 1 (`tier`), leaves it to LLVM to compile once the database is let go of.
+/// above 1 (`tier`), leaves it to LLVM to compile once the database is let go of. `unit` is
+/// the v2 unit's settings it is built under, as its caller was asked for them; `None` in v1.
+#[allow(clippy::too_many_arguments)]
 fn compile_as<'db>(
     db: &'db Db,
     env: ParamEnvAndCrate<'db>,
@@ -2197,11 +2329,12 @@ fn compile_as<'db>(
     tracked: bool,
     checked: bool,
     tier: bool,
+    unit: Option<v2::build::Build>,
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<Produced> {
     let target = target_of_crate(db, env.krate)?;
     let isa = &**isa_for(target)?;
-    let mut cg = Recorder::new(db, isa, target, checked);
+    let mut cg = Recorder::new(db, isa, target, checked, unit);
     let tally = backend::Tally::global();
     let mut ctx = tally.step(Step::Translate, || {
         let mut ctx = build(&mut cg, env, body, tracked, fill)?;
@@ -2264,10 +2397,6 @@ fn compile_as<'db>(
     spare::keep_context(ctx);
     let (source, variables) = described(&mut cg, env, body)?;
     let (requests, layouts) = cg.finish();
-    // What a build compiled, which a compile at a level above 1 is not part of.
-    if !tier {
-        counted::compiled();
-    }
     Ok(Produced::Code(CompiledFunction {
         requests,
         code,
@@ -2572,8 +2701,7 @@ fn built_in_body(
     // Not built in, never built for a guessed target: the compile asking for the body is of
     // `at.krate` and loaded its target with `?`, so a target that fails reaches it as that error.
     let target = target_of_crate(db, at.krate).ok()?;
-    let mut cg = Recorder::new(db, &**isa_for(target).ok()?, target, instance.checked);
-    cg.unit = unit;
+    let mut cg = Recorder::new(db, &**isa_for(target).ok()?, target, instance.checked, unit);
     cg.unlocated = true;
     let args = instance.args;
     let mut ctx = build(&mut cg, at, Some(&*body), false, |fx| {
@@ -2856,7 +2984,9 @@ fn tail_call_refused(
 /// Cranelift's own or blaze's WebAssembly: Cranelift makes a tail call only under its
 /// `tail` convention, which no Rust function has (a call and a return in its place would
 /// grow the stack `become` promises not to), and the WebAssembly lowering has no
-/// `return_call` yet. The copy-and-patch stencils and LLVM (`musttail`) make it.
+/// `return_call` yet. The copy-and-patch stencils and LLVM (`musttail`) make it, and v2's
+/// plan gives native code to no other (`blaze_codegen::plan::Policy::choose`), so a native
+/// refusal here is a tiered run's Cranelift tier (`blaze_stencil::tier`), or v1's compile.
 fn refuse_tail_calls(func: &ir::Function, target: &'static Target) -> Result<()> {
     let convention = func.signature.call_conv;
     if !target.is_wasm() && convention.supports_tail_calls() {
@@ -2879,7 +3009,8 @@ fn refuse_tail_calls(func: &ir::Function, target: &'static Target) -> Result<()>
             false => unsupported!(
                 "a tail call (`become`) in code Cranelift's native back end makes: it \
                  guarantees one only under its `tail` convention, never the target's \
-                 `{convention}`; `become` builds with the copy-and-patch stencils or LLVM"
+                 `{convention}`; `become` builds with the copy-and-patch stencils or LLVM, \
+                 the only native back ends of v2's plan (`Policy::choose`)"
             ),
         }
     }
@@ -2971,6 +3102,10 @@ enum Lowered {
 /// The pointers of one constant, and the data objects made for what they point to.
 struct Relocations<'a, 'db> {
     map: &'a MemoryMap<'db>,
+    /// The type of the constant whose value this relocates, for an error to name.
+    of: Ty<'db>,
+    /// Which constant it is, for an error to name (rule 16).
+    whose: ConstOf<'db>,
     in_static: bool,
     /// The data object of each allocation made so far, by start.
     defined: HashMap<usize, Defined<'db>, Global>,
@@ -2992,9 +3127,14 @@ struct Relocations<'a, 'db> {
 
 impl<'db> Relocations<'_, 'db> {
     /// The alignment to give the data object made for the memory at `start`: what const eval
-    /// made it with, or where it does not say, the most a value could need.
-    fn align_of(&self, start: usize) -> u64 {
-        self.map.align_at(start).map_or(16, |align| align as u64)
+    /// made it with. A literal's map (`Simple`) is the bytes of a string or byte string, of
+    /// alignment 1. `None` where const eval recorded none, which the caller refuses: a guess
+    /// could under-align a pointee that needs more (`#[repr(align(64))]`), as rustc never does.
+    fn align_of(&self, start: usize) -> Option<u64> {
+        match self.map {
+            MemoryMap::Simple(_) => Some(1),
+            MemoryMap::Empty | MemoryMap::Complex(_) => self.map.align_at(start).map(|align| align as u64),
+        }
     }
 
     /// Whether the word at `at` is a pointer with provenance. A map of a literal's reference
@@ -3494,17 +3634,61 @@ pub(crate) fn promoted_constants<'a, 'db>(
     own.chain(inlined)
 }
 
-/// The error of a promoted constant whose MIR does not build, naming it and the body it is of.
-pub(crate) fn no_promoted_mir(db: &Db, promoted: Promoted<'_>, error: impl std::fmt::Debug) -> CodegenError {
-    let owner = match promoted.owner {
+/// The body `owner` as an error names it: its item's path in backticks, or "an anonymous
+/// constant".
+fn body_path(db: &Db, owner: InferBodyId<'_>) -> String {
+    match owner {
         InferBodyId::DefWithBodyId(def) => {
             format!("`{}`", blaze_items::key::path(db, blaze_items::ItemId::of_body(db, def))) // alloc: an error's text
         }
         InferBodyId::AnonConstId(_) => "an anonymous constant".to_owned(), // alloc: an error's text
-    };
+    }
+}
+
+/// Which constant a value [`FunctionCx::allocation_blob`] relocates is, for its errors to
+/// name by path (rule 16), not only by type.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ConstOf<'db> {
+    /// A named constant, a static, or an anonymous constant.
+    Item(GeneralConstId<'db>),
+    /// A promoted constant of a body.
+    Promoted(Promoted<'db>),
+    /// A value the MIR of a body holds in place (a literal's allocation), in the body being
+    /// built (`None`: of no body).
+    InPlace(Option<InferBodyId<'db>>),
+}
+
+impl ConstOf<'_> {
+    /// The constant as an error names it: "the constant `krate::m::C`", "the promoted
+    /// constant ExprId(3) of `krate::f`".
+    fn describe(self, db: &Db) -> String {
+        use blaze_items::{ItemId, key::path};
+        match self {
+            ConstOf::Item(GeneralConstId::ConstId(id)) => {
+                format!("the constant `{}`", path(db, ItemId::Const(id))) // alloc: an error's text
+            }
+            ConstOf::Item(GeneralConstId::StaticId(id)) => {
+                format!("the static `{}`", path(db, ItemId::Static(id))) // alloc: an error's text
+            }
+            ConstOf::Item(GeneralConstId::AnonConstId(_)) => {
+                "an anonymous constant".to_owned() // alloc: an error's text
+            }
+            ConstOf::Promoted(promoted) => hir_ty::attach_db(db, || {
+                // alloc: an error's text
+                format!("the promoted constant {:?} of {}", promoted.expr, body_path(db, promoted.owner))
+            }),
+            // alloc: an error's text
+            ConstOf::InPlace(Some(owner)) => format!("a constant value in {}", body_path(db, owner)),
+            ConstOf::InPlace(None) => "a constant value of no body".to_owned(), // alloc: an error's text
+        }
+    }
+}
+
+/// The error of a promoted constant whose MIR does not build, naming it and the body it is of.
+pub(crate) fn no_promoted_mir(db: &Db, promoted: Promoted<'_>, error: impl std::fmt::Debug) -> CodegenError {
     // alloc: the error's message
     CodegenError::Refused(hir_ty::attach_db(db, || {
-        format!("the promoted constant {:?} of {owner} has no MIR: {error:?}", promoted.expr)
+        format!("{} has no MIR: {error:?}", ConstOf::Promoted(promoted).describe(db))
     }))
 }
 
@@ -4957,7 +5141,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(None);
         };
         let ty = allocation.ty;
-        let Ok(blob) = self.allocation_blob(allocation, false) else { return Ok(None) };
+        let Ok(blob) = self.allocation_blob(allocation, ConstOf::Promoted(promoted), false) else { return Ok(None) };
         if blob.bytes.len() != layout.size.bytes_usize()
             || !plain && !self.is_plain_value(&blob.bytes, 0, ty)
         {
@@ -6075,8 +6259,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         self.valtree_blob(ty, value.value)?
                     }
                     ConstKind::Alias(_, unevaluated) => {
-                        let allocation = self.eval_const(unevaluated)?;
-                        self.allocation_blob(allocation, false)?
+                        let (allocation, whose) = self.eval_named_const(unevaluated)?;
+                        self.allocation_blob(allocation, whose, false)?
                     }
                     kind => unsupported!("constant {kind:?}"),
                 };
@@ -6090,7 +6274,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 {
                     return Ok((addr, ty));
                 }
-                let blob = self.allocation_blob(allocation, false)?;
+                let blob = self.allocation_blob(allocation, self.in_place(), false)?;
                 Ok((self.blob_or_immediate(ty, blob)?, ty))
             }
             OperandKind::Static(id) => {
@@ -6127,7 +6311,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             && (flags.contains(StaticFlags::MUTABLE)
                 || is_thread_local(db, id)
                 || !self.is_freeze(allocation.ty));
-        Ok((self.allocation_blob(allocation, true)?, writable))
+        Ok((self.allocation_blob(allocation, ConstOf::Item(GeneralConstId::StaticId(id)), true)?, writable))
     }
 
     /// Whether `ty` is known to have no `UnsafeCell` outside of indirections.
@@ -6221,6 +6405,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn eval_const(&mut self, unevaluated: AliasConst<'db>) -> Result<Allocation<'db>> {
+        self.eval_named_const(unevaluated).map(|it| it.0)
+    }
+
+    /// [`Self::eval_const`], with the constant it evaluated: a trait's constant resolved to
+    /// its impl's.
+    fn eval_named_const(
+        &mut self,
+        unevaluated: AliasConst<'db>,
+    ) -> Result<(Allocation<'db>, ConstOf<'db>)> {
         let db = self.cg.db;
         let args = unevaluated.args;
         let frontend = |def: GeneralConstId<'db>, e: ConstEvalError<'db>| {
@@ -6233,10 +6426,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
             | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => {
                 let (id, args) = lookup_impl_const(&self.infcx, self.env.param_env, id, args);
-                db.const_eval(id, args, Some(self.env)).map_err(|e| frontend(id.into(), e))
+                let allocation = db.const_eval(id, args, Some(self.env)).map_err(|e| frontend(id.into(), e))?;
+                Ok((allocation, ConstOf::Item(id.into())))
             }
             AliasConstKind::Anon { def_id: AnonConstIdWrapper(id) } => {
-                db.anon_const_eval(id, args, Some(self.env)).map_err(|e| frontend(id.into(), e))
+                let allocation =
+                    db.anon_const_eval(id, args, Some(self.env)).map_err(|e| frontend(id.into(), e))?;
+                Ok((allocation, ConstOf::Item(id.into())))
             }
             AliasConstKind::InherentSelf { .. } => {
                 unsupported!("the inherent constant {unevaluated:?} in Self form after type check")
@@ -6399,10 +6595,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// `in_static` says the value is a static's, where memory behind a mutable pointer can be
-    /// written to.
+    /// written to; `whose` names the constant in its errors.
     fn allocation_blob(
         &mut self,
         allocation: Allocation<'db>,
+        whose: ConstOf<'db>,
         in_static: bool,
     ) -> Result<ConstBlob> {
         let AllocationData { ty, memory, memory_map } = &*allocation;
@@ -6429,6 +6626,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let mut map = Relocations {
             map: memory_map,
+            of: *ty,
+            whose,
             in_static,
             defined: HashMap::new_in(Global),
             walking: Vec::new(), // alloc: empty until a pointer is followed
@@ -6474,10 +6673,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(id) = blob.usize_at(offset, word) else {
                     unsupported!("constant pointer out of bounds");
                 };
-                let fn_ty = map.map.vtable_ty(id).ok();
-                let fn_ty =
-                    fn_ty.filter(|it| matches!(it.kind(), TyKind::FnDef(..) | TyKind::Closure(..)));
-                let fn_ty = match fn_ty {
+                let fn_ty = match map.map.function_of(id) {
                     Some(fn_ty) if !walk.raw || map.provenance(walk.word(offset)) => fn_ty,
                     _ if walk.raw || id == 0 => return Ok(()),
                     _ => unsupported!(
@@ -6489,10 +6685,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 blob.bytes[offset..offset + word].fill(0);
                 blob.fn_relocs.push((offset as u32, target));
             }
-            // A `DynMetadata` holds a vtable as const eval's id into its table of types, as a
-            // `&dyn` does (`ptr::metadata`, reflection's `trait_info_of`). The id names the
-            // type only, so the trait is the `dyn` the `DynMetadata` is of; one of no `dyn`
-            // (`type_id_vtable`'s `DynMetadata<*const ()>`) cannot say which vtable it is.
+            // A `DynMetadata` holds a vtable as const eval's id of it, as a `&dyn` does
+            // (`ptr::metadata`, reflection's `trait_info_of`), which the walk by provenance
+            // relocates: the id names the type and the trait, also for a `DynMetadata` of no
+            // `dyn` (`type_id_vtable`'s `DynMetadata<*const ()>`).
             TyKind::Adt(def, args)
                 if self
                     .interner
@@ -6502,33 +6698,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             {
                 // `_vtable_ptr`, its first field.
                 let at = offset + self.layout(ty)?.fields.offset(0).bytes_usize();
-                let Some(id) = blob.usize_at(at, word) else {
-                    unsupported!("constant `{ty:?}` out of bounds");
-                };
                 let dyn_ty = self.normalized(args.type_at(0), ty)?;
-                let Ok(erased) = map.map.vtable_ty(id) else {
-                    if walk.raw {
-                        return Ok(());
-                    }
-                    unsupported!(
-                        "a `{}` in a constant whose vtable const eval did not make",
-                        self.spell(ty)
-                    );
-                };
-                if !matches!(dyn_ty.kind(), TyKind::Dynamic(..)) {
-                    // FIXME(comptime): const eval's vtable ids should carry the trait (rustc's
-                    // `GlobalAlloc::VTable(ty, dyn_ty)`), for this one to be emitted too.
-                    unsupported!(
-                        "a `{}` in a constant, the vtable of `{}` for a trait the constant's \
-                         type does not name: const eval's vtable ids name the type only \
-                         (`type_id_vtable`, `trait_info_of_trait_type_id`)",
-                        self.spell(ty),
-                        self.spell(erased)
-                    );
-                }
-                let trait_ref = self.principal(dyn_ty, erased);
-                let vtable = self.vtable(erased, trait_ref)?;
-                blob.point_to(at, vtable, 0, word);
+                let dyn_ty = matches!(dyn_ty.kind(), TyKind::Dynamic(..)).then_some(dyn_ty);
+                self.vtable_word(blob, walk, at, ty, dyn_ty, map)?;
             }
             // Const eval gives a `TypeId` as an id into its table of types, which the hash rustc
             // gives the type replaces once the object is stitched.
@@ -6622,11 +6794,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// The union `ty` at `offset` in `blob`. Const eval does not say which of its fields it
-    /// holds: its provenance says which words are pointers, which the walk by provenance after
+    /// holds: its provenance says which words are pointers and vtables, and its ids which
+    /// function or which type's vtable for which trait, which the walk by provenance after
     /// this one relocates. One whose fields but one are empty (`MaybeUninit<T>`'s `value`,
     /// besides `()`) holds that one or nothing, which is walked as memory reached through a
-    /// raw pointer: a word is a pointer only with provenance, a vtable only where it has none.
-    /// A map without provenance (a literal's) holds no union.
+    /// raw pointer: a word is a pointer or a vtable only with provenance. A map without
+    /// provenance (a literal's) holds no union.
     fn relocate_union(
         &mut self,
         blob: &mut ConstBlob,
@@ -6657,6 +6830,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
+    /// A value the MIR of the body being built holds in place, as [`ConstOf`] names it.
+    fn in_place(&self) -> ConstOf<'db> {
+        ConstOf::InPlace(self.body.map(|it| it.owner))
+    }
+
     /// `ty` as an error spells it: by its path, cut short.
     fn spell(&self, ty: Ty<'db>) -> String {
         use hir_ty::display::HirDisplay as _;
@@ -6678,8 +6856,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
     /// The pointer of type `ty` to `pointee` at `offset` in `blob`, a reference or a raw
     /// pointer: both are relocated as rustc relocates every pointer, by its provenance, the
-    /// metadata's too. A vtable in the metadata is for the `dyn` at the tail of the pointee,
-    /// normalized, as const eval's vtable ids name the type only. The memory pointed to is
+    /// metadata's too: a vtable is the one const eval's id names, of a type for a trait, which
+    /// the walk by provenance relocates; the type here only checks it. The memory pointed to is
     /// walked as the pointee's type, for a raw pointer only where a value of it fits (one past
     /// the end, or cast from another type, it need not), and then by its provenance.
     #[allow(clippy::too_many_arguments, reason = "the walk's state, passed down as `relocate`'s")]
@@ -6709,45 +6887,37 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.normalize(it)
         });
         let tail = self.normalized(tail, ty)?;
-        let wide = matches!(tail.kind(), TyKind::Str | TyKind::Slice(_) | TyKind::Dynamic(..));
         // A slice's length is a number.
         if !walk.raw && matches!(tail.kind(), TyKind::Str | TyKind::Slice(_)) {
             map.number(walk.kept, offset + word, word);
         }
-        // A function cast to a thin raw pointer keeps const eval's id for it.
-        if raw
-            && !wide
-            && provenance
-            && let Ok(fn_ty) = map.map.vtable_ty(addr)
-            && matches!(fn_ty.kind(), TyKind::FnDef(..) | TyKind::Closure(..))
-        {
-            let target = self.fn_item(fn_ty)?;
-            blob.bytes[offset..offset + word].fill(0);
-            blob.fn_relocs.push((offset as u32, target));
-            return Ok(());
-        }
-        // Const eval gives a vtable as an id into its table of types.
+        // Const eval gives a vtable as its id of the concrete type and the trait, which the
+        // walk by provenance relocates; the pointee is walked as that concrete type.
         let mut erased = None;
         if let TyKind::Dynamic(..) = tail.kind() {
-            // Behind a raw pointer the type may be a cast's: a vtable has no provenance, and a
-            // word with it (a pointer, a function) is no vtable.
-            if walk.raw && map.tracks_provenance() && map.provenance(walk.word(offset + word)) {
+            let Some(concrete) = self.vtable_word(blob, walk, offset + word, ty, Some(tail), map)?
+            else {
+                return Ok(());
+            };
+            erased = Some(concrete);
+        }
+        // A raw pointer whose provenance is a function or a vtable keeps const eval's id of it
+        // (a function cast to a pointer, a `&dyn`'s metadata transmuted to a `*const ()`):
+        // rustc keeps a raw pointer to either in a constant's value, so it points at that
+        // function or vtable, which the id names. A reference holding one is refused below as
+        // dangling: it has no memory const eval kept.
+        if raw && provenance {
+            if let Some(fn_ty) = map.map.function_of(addr) {
+                let target = self.fn_item(fn_ty)?;
+                blob.bytes[offset..offset + word].fill(0);
+                blob.fn_relocs.push((offset as u32, target));
                 return Ok(());
             }
-            let id = blob.usize_at(offset + word, word);
-            let Some(concrete) = id.and_then(|id| map.map.vtable_ty(id).ok()) else {
-                if walk.raw {
-                    return Ok(());
-                }
-                unsupported!(
-                    "a `{}` in a constant whose vtable const eval did not make",
-                    self.spell(ty)
-                );
-            };
-            let trait_ref = self.principal(tail, concrete);
-            let vtable = self.vtable(concrete, trait_ref)?;
-            blob.point_to(offset + word, vtable, 0, word);
-            erased = Some(concrete);
+            if let Some((concrete, dyn_ty)) = map.map.vtable_of(addr) {
+                let vtable = self.vtable_by_id(concrete, dyn_ty, offset, walk.kept)?;
+                blob.point_to(offset, vtable, 0, word);
+                return Ok(());
+            }
         }
         if let Some((id, at)) = map.map.static_at(addr) {
             let target = self.cg.static_data(id);
@@ -6822,6 +6992,60 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
+    /// The concrete type of the vtable whose id is the word at `at` of `blob`, the metadata of
+    /// a `ty`, a pointer to `dyn_ty` or a `DynMetadata` of it (`None`: of no `dyn`): what const
+    /// eval's id names where its provenance says the word is a vtable, as rustc's
+    /// `GlobalAlloc::VTable(ty, dyn_ty)`. The walk by provenance relocates the word from the id,
+    /// which names the trait; the type is only checked against it, as rustc's validity check
+    /// refuses a vtable of another trait than the pointer's (`wrong trait in wide pointer
+    /// vtable`). Behind a raw pointer, whose type may be a cast's, a word that is no vtable is
+    /// `None`, and the trait is not checked; elsewhere either is an error naming the type.
+    #[allow(clippy::too_many_arguments, reason = "the walk's state, passed down as `relocate`'s")]
+    fn vtable_word(
+        &self,
+        blob: &ConstBlob,
+        walk: Walk,
+        at: usize,
+        ty: Ty<'db>,
+        dyn_ty: Option<Ty<'db>>,
+        map: &Relocations<'_, 'db>,
+    ) -> Result<Option<Ty<'db>>> {
+        let id = blob.usize_at(at, self.cg.target.word());
+        let entry = id.and_then(|id| map.map.vtable_of(id)).filter(|_| map.provenance(walk.word(at)));
+        let Some((concrete, of)) = entry else {
+            if walk.raw {
+                return Ok(None);
+            }
+            unsupported!(
+                "a `{}` in a constant whose metadata (at {at} of {:x?}) is no vtable const eval \
+                 made: its word is {}",
+                self.spell(ty),
+                walk.kept,
+                match id.map(|id| map.map.vtable_ty(id)) {
+                    Some(Ok(_)) if !map.provenance(walk.word(at)) =>
+                        "an id with no provenance, a vtable made a number",
+                    Some(Ok(_)) => "the id of a function",
+                    _ => "no id const eval gave",
+                }
+            );
+        };
+        if let Some(dyn_ty) = dyn_ty
+            && !walk.raw
+            && !hir_ty::mir::same_vtable_trait(DbInterner::new_with(self.cg.db, self.env.krate), of, dyn_ty)
+        {
+            unsupported!(
+                "a `{}` in {} holds the vtable of `{}` for `{}`, where its type says \
+                 `{}`: rustc refuses a vtable of another trait in a constant's value",
+                self.spell(ty),
+                map.whose.describe(self.cg.db),
+                self.spell(concrete),
+                self.spell(of),
+                self.spell(dyn_ty)
+            );
+        }
+        Ok(Some(concrete))
+    }
+
     /// The data object of the allocation const eval kept at `start`, `memory`, its pointers
     /// relocated: walked as `by` says, a type at an offset, where it is reached by a pointer
     /// of a type, then by its provenance. One allocation is one data object however many
@@ -6849,6 +7073,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                  const eval's memory of a constant points in no circle"
             );
         }
+        let Some(align) = map.align_of(start) else {
+            unsupported!(
+                "the memory {} (of `{}`) points to (const eval kept it at {start:#x}, {} \
+                 bytes) has no alignment const eval recorded: blaze does not guess one, which \
+                 could under-align it",
+                map.whose.describe(self.cg.db),
+                self.spell(map.of),
+                memory.len()
+            );
+        };
         let mut target = ConstBlob {
             // alloc: the pointee's bytes, owned by the blob `define_data` keeps
             bytes: memory.to_vec(),
@@ -6856,7 +7090,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             relocs: Vec::new(),
             // alloc: empty until a function pointer is found in it, then owned by the blob
             fn_relocs: Vec::new(),
-            align: map.align_of(start),
+            align,
             // alloc: empty until a `TypeId` is found in it, then owned by the blob
             type_ids: Vec::new(),
         };
@@ -6954,9 +7188,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let differs = Self::first_difference(&first.blob, &target);
             unsupported!(
                 "one allocation of a constant (at {start:#x}) is reached as {} and as {}, which \
-                 relocate it differently ({differs}): one type says a word is a vtable, a \
-                 function or a `TypeId` that the other does not, and const eval's ids name no \
-                 trait to say which is right",
+                 relocate it differently ({differs}): one type says a word is a `TypeId` or a \
+                 reference to nothing that the other does not, which no provenance says",
                 name(first.by),
                 name(by)
             );
@@ -7059,19 +7292,25 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             let Some(addr) = target.usize_at(at, word) else { continue };
-            if let Ok(of) = map.map.vtable_ty(addr) {
-                if !matches!(of.kind(), TyKind::FnDef(..) | TyKind::Closure(..)) {
-                    unsupported!(
-                        "the vtable of `{}` in a constant's memory (at {at} of {kept:x?}) \
-                         that no type of the constant says is a `dyn` pointer's: const eval's \
-                         vtable ids name the type only, not the trait",
-                        self.spell(of)
-                    );
-                }
+            // A vtable: its id names the concrete type and the `dyn` type, as rustc's
+            // `GlobalAlloc::VTable(ty, dyn_ty)`, whatever type the word is reached as.
+            if let Some((concrete, dyn_ty)) = map.map.vtable_of(addr) {
+                let vtable = self.vtable_by_id(concrete, dyn_ty, at, kept)?;
+                target.point_to(at, vtable, 0, word);
+                continue;
+            }
+            if let Some(of) = map.map.function_of(addr) {
                 let func = self.fn_item(of)?;
                 target.bytes[at..at + word].fill(0);
                 target.fn_relocs.push((at as u32, func));
                 continue;
+            }
+            if let Ok(of) = map.map.vtable_ty(addr) {
+                unsupported!(
+                    "the word at {at} of a constant's memory ({kept:x?}) is const eval's id of \
+                     `{}`, which is no function and names no trait of a vtable",
+                    self.spell(of)
+                );
             }
             if let Some((id, offset)) = map.map.static_at(addr) {
                 let data = self.cg.static_data(id);
@@ -7090,6 +7329,28 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
+    /// The data object of the vtable const eval's id names, of `concrete` for `dyn_ty`, held by
+    /// the word at `at` of the memory at `kept` (`None`: the constant's value): rustc's
+    /// `GlobalAlloc::VTable(ty, dyn_ty)`. One for what is no `dyn` type is an error.
+    fn vtable_by_id(
+        &mut self,
+        concrete: Ty<'db>,
+        dyn_ty: Ty<'db>,
+        at: usize,
+        kept: Option<usize>,
+    ) -> Result<DataId> {
+        if !matches!(dyn_ty.kind(), TyKind::Dynamic(..)) {
+            unsupported!(
+                "the vtable of `{}` in a constant's memory (at {at} of {kept:x?}) is for `{}`, \
+                 which is no `dyn` type",
+                self.spell(concrete),
+                self.spell(dyn_ty)
+            );
+        }
+        let trait_ref = self.principal(dyn_ty, concrete);
+        self.vtable(concrete, trait_ref)
+    }
+
     /// The offsets in `blob` of the words already relocated, sorted: pointers, functions and
     /// the words of a `TypeId`, which hold const eval's id for its type.
     fn relocated(blob: &ConstBlob, word: usize) -> Vec<u32> {
@@ -7106,8 +7367,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// Refuses a word of `blob` left equal to one of const eval's ids of a function or a
-    /// vtable: a pointer no type of the constant and no provenance said was there, which would
-    /// be emitted as a number. The ids are far from any number a program plausibly holds
+    /// vtable: a pointer no type of the constant and no provenance said was there (every
+    /// function and vtable const eval makes has provenance), which would be emitted as a
+    /// number. The ids are far from any number a program plausibly holds
     /// (`VTableMap::FIRST_ID`).
     fn refuse_ids_left(
         &self,
@@ -7137,9 +7399,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         "it is in the union `{}`, whose field holding it const eval does not say",
                         self.spell(union)
                     ),
-                    None => "a vtable behind a pointer cast to another type (`&&dyn Tr as \
-                             *const _ as *const u8`) needs const eval's vtable ids to name the \
-                             trait"
+                    None => "it has no provenance, so const eval did not make it a pointer: a \
+                             number equal to an id, or a function or vtable pointer made a number"
                         .to_owned(), // alloc: error path
                 };
                 unsupported!(

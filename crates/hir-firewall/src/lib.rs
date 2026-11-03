@@ -264,12 +264,14 @@ impl Harness {
             range: TextRange::new(site.range.start(), site.range.end() + grown),
         };
 
-        db.set_file_text(site.vfs, &edited_text);
+        let name = &self.bodies[at].name;
+        db.batch(base_db::Trigger::of("hir-firewall's edit of a body", name), |db| db.set_file_text(site.vfs, &edited_text));
         let after_edit = self.pass(db, Some(at))?;
         self.judge(db, &edited, &after_edit, false, report);
         self.judge_code(db, &edited, &self.base, &after_edit, false, site.is_const, report);
 
-        db.set_file_text(site.vfs, &before);
+        let name = &self.bodies[at].name;
+        db.batch(base_db::Trigger::of("hir-firewall's edit of a body undone", name), |db| db.set_file_text(site.vfs, &before));
         edited.range = site.range;
         let after_undo = self.pass(db, Some(at))?;
         self.judge(db, &edited, &after_undo, true, report);

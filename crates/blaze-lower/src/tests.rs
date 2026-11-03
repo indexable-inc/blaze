@@ -827,11 +827,19 @@ fn an_appended_root_is_its_crates_text_until_the_next_job() {
     assert_eq!(append(&mut built.lowered, LIB_TEST, Some(recorded.clone())), Ok(0), "already so");
     assert_eq!(append(&mut built.lowered, LIB_TEST, None), Ok(0), "no harness: left as it is");
     assert_eq!(built.lowered.identity(LIB_TEST), with);
-    let Err(error) = append(&mut built.lowered, LIB, Some(harness("pub fn other() {}"))) else {
-        panic!("the file on disk was appended to")
-    };
+    // A refusal is its unit's alone: given with the lib, whose root is the file on disk, the
+    // test's root is made all the same.
+    let again = harness("pub fn main() {} pub fn again() {}");
+    let both = built.lowered.append_roots([LIB as u32, LIB_TEST as u32], |_, asked, _| {
+        let after = if asked == LIB { harness("pub fn other() {}") } else { again.clone() };
+        Ok(Some(Appended { after, module: "__harness" }))
+    });
+    let Err(refused) = both else { panic!("the file on disk was appended to") };
+    let [(unit, error)] = &refused[..] else { panic!("the lib alone is refused: {refused:?}") };
+    assert_eq!(*unit, LIB, "the refusal names the unit it is of");
     assert!(error.what.contains("can't have a module appended"), "{error}");
     assert_eq!(text_of(&built.lowered, disk_file), disk, "nothing written");
+    assert_eq!(text_of(&built.lowered, root), format!("{disk}{again}"), "the test's root is made all the same");
 
     // Given again (its proc macros loaded), a unit makes its root again.
     let expanded = harness("pub fn main() {} pub fn expanded() {}");
@@ -1385,9 +1393,14 @@ fn a_kept_front_end_is_lowered_into_whatever_the_plan_alone_reads() {
     now.invocation.cwd = "/w/sub".to_owned();
     now.invocation.files = vec![("/home/.cargo/config.toml".to_owned(), b"[build]".to_vec())];
     assert_eq!(crate::config_differs(&kept, &now), None);
-    now.invocation.env = vec![("SECRET_TOKEN".to_owned(), "hunter2".to_owned())];
-    let why = crate::config_differs(&kept, &now).expect("another environment is another front end");
-    assert!(why.contains("`SECRET_TOKEN`") && !why.contains("hunter2"), "{why}");
+    // The environment is keyed by what the front end read of it (`Lowered::env_moved`), never
+    // whole: a shell's or systemd's per-run variables keep it.
+    now.invocation.env = vec![
+        ("INVOCATION_ID".to_owned(), "77aa".to_owned()),
+        ("SECRET_TOKEN".to_owned(), "hunter2".to_owned()),
+        ("SHLVL".to_owned(), "3".to_owned()),
+    ];
+    assert_eq!(crate::config_differs(&kept, &now), None);
     let mut now = kept.clone();
     now.host = format!("{HOST}-other");
     assert_eq!(crate::config_differs(&kept, &now).as_deref(), Some("its host"));

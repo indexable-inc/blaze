@@ -36,6 +36,23 @@ pub struct LinkInputs {
     pub debug_names: Vec<(InstanceKey, String)>,
 }
 
+/// What the running code of a live image assumes of one item of a workspace crate, which no
+/// patch can change under it ([`HirFrontend::live_assumed`]).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Assumed {
+    /// A function's interface hash: its signature and what its body leaks into it (an
+    /// `impl Trait` return's hidden type), which its callers' code is built against.
+    Signature(ContentId),
+    /// A type's layout hash: how a value made before an edit is laid out.
+    Layout(ContentId),
+    /// An item blaze can't hash, by why: what code assumes of it is not known, so it is the
+    /// same only for as long as the reason is.
+    Unhashable(ContentId),
+}
+
+/// The domain of [`Assumed::Unhashable`]'s hash of a reason.
+const UNHASHABLE_DOMAIN: &str = "blaze v2 live assumed unhashable 1";
+
 /// The start of a span table's encoding (`blaze_link::position`'s `MAGIC`).
 const SPAN_TABLE_MAGIC: [u8; 8] = *b"BZSPANS1";
 
@@ -45,12 +62,53 @@ impl HirFrontend<'_> {
     /// written, the blocks in the order of their modules, without those whose `cfg(..)` the
     /// crate leaves out. A form blaze can't link is an error naming it.
     pub fn linked(&self, krate: Crate) -> Result<Vec<NativeLib>, CodegenError> {
-        self.with(|db, _| linked(db, krate)).map_err(error)
+        self.with(|db| linked(db, krate)).map_err(error)
+    }
+
+    /// What the code of a live image built from `krate` assumes of its items, by key, sorted:
+    /// each function's signature and each type's layout ([`Assumed`]). Only a workspace
+    /// crate's code is patched (`Described::editable`), so another crate assumes nothing: an
+    /// edit never reaches it. A later link whose assumptions differ can't be patched into a
+    /// program running the earlier one.
+    pub fn live_assumed(&self, krate: Crate) -> Vec<(ItemKey, Assumed)> {
+        let _span = tracing::info_span!(target: "blaze", "live assumed").entered();
+        self.with(|db| {
+            if !krate.data(db).origin.is_local() {
+                return Vec::new(); // alloc: none, empty
+            }
+            let columns = blaze_items::crate_hashes(db, krate);
+            // alloc: per live link, a row per function and type of a workspace crate
+            let mut rows = Vec::with_capacity(columns.len() + columns.unhashable().len());
+            for (at, key) in columns.keys().iter().enumerate() {
+                let hashes = columns.row(at);
+                match (hashes.kind, hashes.layout) {
+                    (blaze_items::ItemKind::Fn, _) => rows.push((*key, Assumed::Signature(hashes.interface.0))),
+                    (_, Some(layout)) => rows.push((*key, Assumed::Layout(layout.0))),
+                    _ => {}
+                }
+            }
+            for (key, why) in columns.unhashable() {
+                let why = ContentId::of(UNHASHABLE_DOMAIN, why.what.as_bytes());
+                rows.push((*key, Assumed::Unhashable(why)));
+            }
+            rows.sort_unstable();
+            rows
+        })
+    }
+
+    /// The path of the item `key` names, for a message; its key when no crate of the build
+    /// has it.
+    pub fn item_path(&self, key: ItemKey) -> String {
+        self.with(|db| match blaze_items::resolve(db, key) {
+            Some(Resolved::Item(id)) => blaze_items::key::path(db, id),
+            // alloc: a message's name of an item
+            _ => format!("{key:?}"),
+        })
     }
 
     /// The span tables `built`'s code names and its debug names.
     pub fn link_inputs(&self, built: &Built) -> Result<LinkInputs, CodegenError> {
-        let spans = self.with(|db, _| span_tables(db, &self.hashes, built)).map_err(error)?;
+        let spans = self.with(|db| span_tables(db, &self.hashes, built)).map_err(error)?;
         // clone: per link, the names the link is given; the build keeps its own
         Ok(LinkInputs { spans, debug_names: built.debug_names.clone() })
     }

@@ -500,6 +500,13 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// after it loses none of it (persisted-state-round-trips). Called once per kept front
     /// end, while no task reads it; one already stored hands back no puts.
     fn store_kept(&self, kept: &mut Self::KeptFront) -> Result<Vec<KeptPut>, ApiError>;
+    /// On the loop: `blaze run`'s start of the built program at `program` as process `pid`
+    /// ([`blaze_api::Request::Launch`]): the variables it runs on the daemon's code memory
+    /// with, or `None` for a program that is no dev executable and runs its file.
+    fn launch(&self, program: &str, pid: u32) -> Result<Option<Vec<(String, String)>>, ApiError> {
+        let _ = (program, pid);
+        Ok(None)
+    }
     /// On the loop, once at start: the queries of the daemon's database.
     fn register(&self, db: &mut Database) {
         blaze_units::query::register(db);
@@ -528,6 +535,10 @@ pub struct FrontEnd<S: Steps> {
     /// head's last front end leaves for the store is put before that build answers
     /// ([`Steps::store_kept`]), not here.
     pub puts: Vec<Put>,
+    /// Why the lowering made the front end anew where it could have lowered into the head's
+    /// last one, for `blaze why`: a variable that front end read moved. Handed to the job's
+    /// misses.
+    pub misses: Vec<blaze_kernel::Miss>,
 }
 
 /// The readers a task is posted with: of its job's front end, and for a reach, of the front it
@@ -585,11 +596,13 @@ pub trait Writer<S: Steps>: Send + 'static {
     fn waiting(&self) -> bool;
     /// Every write asked for, applied as one, in the order asked, if no reader is alive:
     /// `Ok(true)` once applied (or none waited), `Ok(false)` while a reader is, asking again
-    /// costing one load. An error ends the job. A write that panics (a maintainer's panic
-    /// included) is caught by [`applying`] and kept for [`Writer::broke`]; the others are
-    /// applied, and the front end is never kept ([`Writer::keep`] fails).
+    /// costing one load. A write that fails (its error, or a panic, a maintainer's included,
+    /// caught by [`applying`]) is kept for [`Writer::broke`] as a failure of its unit; the
+    /// others are applied, and the front end is never kept ([`Writer::keep`] fails). An error
+    /// is the writer's own, owned by no unit's write (the dependencies' serve, which leaves the
+    /// front end partly served), and ends the job, with or without keep-going.
     fn apply(&mut self) -> Result<bool, ApiError>;
-    /// A write [`Writer::apply`] applied that panicked, taken, one a call.
+    /// A write [`Writer::apply`] applied that failed or panicked, taken, one a call.
     fn broke(&mut self) -> Option<Broke>;
     /// On a worker, the writer handed to the tables' task as the front end's last use: its
     /// tables (name, elements, bytes), measured with it exclusive; an
@@ -619,22 +632,58 @@ pub trait Writer<S: Steps>: Send + 'static {
     fn keep(self) -> Result<S::KeptFront, ApiError>;
 }
 
-/// A write to a job's front end that panicked: the unit it was for (a proc macro's load, or a
-/// build script's run) and the panic. The job fails with it, and every unit that depends on
-/// that one is refused, while keep-going builds the rest (`Jobs::apply_writes`).
+/// A write to a job's front end that failed or panicked: the unit it was for (a proc macro's
+/// load, or a build script's run) and how it broke. The job fails with it, and every unit that
+/// depends on that one is refused, naming it, while keep-going builds the rest
+/// (`Jobs::apply_writes`).
 #[derive(Debug)]
 pub struct Broke {
     pub unit: usize,
     /// What the write was: "a proc macro's load", "a build script's run".
     pub what: &'static str,
-    pub panic: super::plane::Panic,
+    pub how: Broken,
+    /// Whether the unit itself is refused too: the write was part of making it (its harness,
+    /// its dependencies served), not of what it made (a run's output, a proc macro's load).
+    pub itself: bool,
+}
+
+/// How a write [`Broke`].
+#[derive(Clone, Debug)]
+pub enum Broken {
+    /// It panicked as it was applied.
+    Panicked(super::plane::Panic),
+    /// It was applied and refused with this error.
+    Failed(ApiError),
+}
+
+impl std::fmt::Display for Broken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Broken::Panicked(panic) => write!(f, "the daemon {panic}"),
+            Broken::Failed(ApiError { at: Some(at), what }) => write!(f, "it failed at {at}: {what}"),
+            Broken::Failed(ApiError { at: None, what }) => write!(f, "it failed: {what}"),
+        }
+    }
+}
+
+impl Broke {
+    /// `error`, the failure of the write `what` for unit `unit`.
+    pub fn failed(unit: usize, what: &'static str, error: ApiError) -> Broke {
+        Broke { unit, what, how: Broken::Failed(error), itself: false }
+    }
 }
 
 /// `write`, the write `what` for unit `unit`, applied on the loop: its panic as a [`Broke`]
 /// instead of unwinding the loop, which would end every request the daemon serves.
 pub fn applying<T>(unit: usize, what: &'static str, write: impl FnOnce() -> T) -> Result<T, Broke> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(write))
-        .map_err(|payload| Broke { unit, what, panic: super::plane::panicked(&*payload) })
+        .map_err(|payload| Broke { unit, what, how: Broken::Panicked(super::plane::panicked(&*payload)), itself: false })
+}
+
+/// `write`, the write `what` for unit `unit`, applied on the loop: its error or its panic as a
+/// [`Broke`] of that unit, never the job's.
+pub fn applying_fallible(unit: usize, what: &'static str, write: impl FnOnce() -> Result<(), ApiError>) -> Result<(), Broke> {
+    applying(unit, what, write)?.map_err(|error| Broke::failed(unit, what, error))
 }
 
 /// One job's front end, its units lowered: shared by the job's tasks, read only.

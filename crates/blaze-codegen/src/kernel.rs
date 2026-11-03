@@ -10,10 +10,11 @@
 //! `DevTemplate` is a [`Step`] the kernel keys, not a [`blaze_kernel::Compute`] it runs. The
 //! driver computes and puts it.
 //!
-//! Its code is [`crate::settings::Toolchain::id`] (the pinned nightly and the blaze
-//! executable's hash) until lane identity gives the step a code identity of its own. Once it
-//! does, `Settings` drops the executable's hash, and a blaze that changed no codegen code
-//! reads the templates the last one kept.
+//! Its code is [`crate::settings::Toolchain::id`]: the pinned nightly and the code generator's
+//! code identity (`hir_ty_codegen::v2::code`, of the packages it is built from, never the
+//! executable's bytes), so a blaze that changed no code generator package reads the templates
+//! the last one kept. Lane identity's CodeId of the step's code replaces the package-grained
+//! identity once const eval answers `fn_info`.
 
 use blaze_cas::{Key, Kind};
 use blaze_ids::ContentId;
@@ -48,7 +49,8 @@ impl Step for DevTemplate {
     }
 }
 
-/// The step's code: the toolchain's id (`Spec::toolchain.id`), until lane identity gives it its own.
+/// The step's code: the toolchain's id (`Spec::toolchain.id`, of the code generator's code),
+/// until lane identity gives it its own.
 pub fn code(toolchain: &ContentId) -> CodeId {
     CodeId(*toolchain)
 }

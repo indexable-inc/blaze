@@ -2366,6 +2366,11 @@ impl<'db> Interner for DbInterner<'db> {
         trait_data.flags.contains(TraitFlags::FUNDAMENTAL)
     }
 
+    /// blaze: `#[blaze::sealed]` (`rustc_type_ir` patch `0013-sealed-traits`).
+    fn trait_is_sealed(self, trait_: Self::TraitId) -> bool {
+        TraitSignature::of(self.db(), trait_.0).flags.contains(TraitFlags::SEALED)
+    }
+
     fn delay_bug(self, _msg: impl ToString) -> Self::ErrorGuaranteed {
         ErrorGuaranteed
     }
@@ -3380,10 +3385,9 @@ mod tls_db {
                 bytes[..4].copy_from_slice(&round.to_le_bytes());
                 let key = Key(bytes);
                 let (tx, rx) = crossbeam_channel::unbounded::<Result<(), String>>();
-                let waiting = Arc::new(AtomicUsize::new(0));
                 let held = flights.get_or_run(key, || {
                     for (at, db) in dbs.iter().enumerate() {
-                        let (db, flights, waiting) = (db.clone(), flights.clone(), waiting.clone());
+                        let (db, flights) = (db.clone(), flights.clone());
                         let tx = tx.clone();
                         pool.submit(
                             None,
@@ -3391,7 +3395,6 @@ mod tls_db {
                                 let mine = Arc::as_ptr(&db).addr();
                                 let wait = || {
                                     assert_eq!(attached_here(), Some(mine));
-                                    waiting.fetch_add(1, Ordering::SeqCst);
                                     assert_eq!(flights.get_or_run(key, || panic!("the test holds the key")), Ok(round));
                                     assert_eq!(attached_here(), Some(mine), "a job resumed with another's database");
                                 };
@@ -3405,10 +3408,11 @@ mod tls_db {
                             move |it| _ = tx.send(it.map_err(|_| format!("job {at} of round {round} panicked"))),
                         );
                     }
+                    // Linked as the run's waiters, not only about to ask: a job that asked after the
+                    // run ended would find the key idle and run it.
                     blaze_graph::spin::SpinWait::within("both jobs to wait", std::time::Duration::from_secs(60), || {
-                        waiting.load(Ordering::SeqCst) >= 2
+                        flights.waiters(key) >= 2
                     });
-                    blaze_graph::spin::busy(std::time::Duration::from_millis(2));
                     Ok(round)
                 });
                 assert_eq!(held, Ok(round));

@@ -234,13 +234,17 @@ pub fn serve(
     let mut lang_items = copied(FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db)));
     // alloc: setup, as above
     let mut stale = Vec::new();
+    // Whether what the database was given changes: an image served, or one served before
+    // taken away. A serve that found nothing new (a cold store) writes nothing, so it costs
+    // no maintenance pass.
+    let mut changed = false;
     for (&(krate, base), found) in order.iter().zip(found) {
         let found = found.into_inner().unwrap_or_else(|| {
             panic!("`ImageStore::for_each` did not run the task of crate {}", crate_name(db, krate))
         });
-        served.remove(&krate);
-        maps.remove(&krate);
-        lang_items.remove(&krate);
+        changed |= served.remove(&krate).is_some();
+        changed |= maps.remove(&krate).is_some();
+        changed |= lang_items.remove(&krate).is_some();
         let (bytes, parts, filed) = match found? {
             Found::Hit { bytes, parts, filed } => (bytes, parts, filed),
             Found::Miss { stale: true } => {
@@ -254,8 +258,12 @@ pub fn serve(
         lang_items.insert(krate, Frozen { bytes: part(Part::LangItems), mode });
         served.insert(krate, Image { base, key: filed, bytes, parts, mode });
         hits.push(krate);
+        changed = true;
     }
     hits.sort_unstable_by_key(|krate| keys[krate]);
+    if !changed {
+        return Ok(Served { keys, hits, stale });
+    }
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
     set_images(db, served);

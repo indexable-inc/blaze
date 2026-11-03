@@ -1406,6 +1406,14 @@ pub mod kinds {
         RELEVANT_IMPLS = 0x247d, "relevant_impls";
         MODULE_TRAIT_SET = 0x247e, "module_trait_set";
         MODULE_ITEMS_NAMED = 0x247f, "module_items_named";
+        // `#[blaze::sealed]`, for hir-ty-coherence: a sealed trait's closure, and the
+        // reservation impls coherence reads beside the tables.
+        SEALED_CLOSURE = 0x24ba, "sealed_closure_query";
+        RESERVATION_IMPLS = 0x24bb, "reservation_impls";
+        // Whether a crate, or one it depends on, declares a sealed trait: whether the sealed
+        // checks run for a crate no other check covers (`hir::check::check_sealed`).
+        DECLARES_SEALED = 0x24bc, "declares_sealed";
+        SEALED_IN_GRAPH = 0x24bd, "sealed_in_graph";
 
         // Opaque types.
         IMPL_TYPE_ALIASES = 0x2480, "impl_type_aliases";
@@ -1497,6 +1505,7 @@ pub mod kinds {
         IMPL_IDENTITIES = 0x25e6, "ImplIdentities";
         SERVED_BODIES = 0x25e7, "ServedBodies";
         KEPT_CONSTS = 0x25e8, "KeptConsts";
+        DIRECTORY_SLOT = 0x25e9, "DirectorySlot";
 
         // Interned ids.
         INTERNED_OPAQUE_TY = 0x25f0, "InternedOpaqueTyId";

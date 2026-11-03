@@ -950,6 +950,9 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
     fn scalar_kind(&self, ty: Ty<'db>) -> Option<(Kind, u8)> {
         let int = |signed: bool, bits: Option<u64>| {
             let size = match bits {
+                // An arbitrary-width integer (`u3`, `u12`) is not whole bytes, which [`Scalar`]
+                // computes in: the lint knows nothing of it rather than compute it as `u8`.
+                Some(bits) if bits % 8 != 0 => return None,
                 Some(bits) => (bits / 8) as u8,
                 None => self.owner.pointer_size?,
             };

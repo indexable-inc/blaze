@@ -290,6 +290,10 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
             out.push(it.diag);
             continue;
         };
+        // The compiler's own code: what blaze appended to the root is linted at no level.
+        if cx.in_appended(at.file_id, at.value.text_range()) {
+            continue;
+        }
         let levels = match it.phase <= Phase::Resolve {
             true => &mut early,
             false => &mut late,

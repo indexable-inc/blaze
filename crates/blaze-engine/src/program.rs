@@ -20,6 +20,14 @@ pub fn main() -> ExitCode {
         version: pin::OURS,
         line: env!("BLAZE_VERSION_LINE"),
     });
+    // What every stored template is keyed by: the code generator's code, which build.rs worked
+    // out, never this executable's bytes (`hir_ty_codegen::v2::code`).
+    if let Err(why) = hir_ty_codegen::v2::CodegenCode::from_hex(env!("BLAZE_CODEGEN_CODE"))
+        .and_then(hir_ty_codegen::v2::set_code)
+    {
+        eprintln!("error: {why}");
+        return ExitCode::FAILURE;
+    }
     if as_rustc::is_me() {
         as_rustc::command();
     }

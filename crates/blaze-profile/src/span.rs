@@ -902,6 +902,11 @@ span_kinds! {
         /// time is inside one (`blaze_graph::pool::span_jobs`). `job` names the job, so a span
         /// is laid on the job it ran in by its row, never by when it began.
         Job = "job" { kind: Name => Function, job: u64 => OfJob }
+        /// A pool worker's own work between jobs, `doing` it (also its `function`): `search`
+        /// for a job, `idle` with none, or the fiber driver's `switch` between two
+        /// (`blaze_graph::pool::Driving`). With the `job` spans, a worker's every moment is
+        /// inside one.
+        Worker = "worker" { doing: Name => Function }
         /// A proc-macro crate's wasm module made ready to instantiate, `module` what names it
         /// (`the wasm module of the proc-macro crate `serde_derive``): from the process's memo,
         /// the store (its lookup and `Module::deserialize`), or a compile.

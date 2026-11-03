@@ -86,7 +86,7 @@ outermost first. `?` marks a nullable column.
 | module_from | dict? | where a `macro module` got its wasm module's machine code: memo (this process had it), store (the daemon's own store) or compiled; null for a load that did not end (refused or failed) |
 | code_bytes | u64? | the bytes of a `macro module`'s machine code, as the store keeps it; null for one from the memo |
 
-The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`), `hold` (`what`, `holder`), `job` (`kind`, `job`) and `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
+The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`), `hold` (`what`, `holder`), `job` (`kind`, `job`), `worker` (`doing` in `function`: a pool worker's `search`, `idle` or `switch` between jobs) and `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
 
 A `macro expand` span is one run of a proc macro: `function` is the macro's path (`serde_derive::Serialize`), `crate` the crate the call is in. A unit's phase spans (`unit names`, `unit bodies`, `unit codegen`, `unit link`, `unit store`) carry the unit in `unit` as `serde v1.0.219 (build script)`; their `crate` is the target's name, `build-script-build` for every build script. A `scope` wait names the span its caller opened the scope in: `scope 13 of unit codegen serde v1.0.219 (build script)`.
 
@@ -303,6 +303,7 @@ them, each a block that bypasses `blaze_graph::wait`.
 | by_job | u64? | for `started` and `ran`, the job that gave it to the pool; for `ready`, the job that woke it |
 | since_ns | i64? | for `started` and `ran`, when the job began on its fiber |
 | began_as | u64? | for `started`, its number before it joined the graph, which its `job` span and its spawned jobs' `by_job` name until then |
+| queued_ns | i64? | for `started` and `ran`, how long the job waited for a core, from its pool's submit to `since_ns`; null when the pool did not say when it was given |
 
 A switch costs one ring row. A job's `ended` row is of the build it last worked for, though its
 code let go of the build before it ended.
@@ -487,12 +488,22 @@ On 2026-10-31, rel2's release build of blaze-engine (74 s) had 66.9% uncovered; 
 `b2-home-rel`, with the phase spans below, had 0.1% (0.18 s of 134 s).
 
 The gate `blaze_profile::gate::check` holds a profiled build to that bar for each worker and each
-wait. It fails when a worker spends 1% or more of the wall time outside every span while it
-runs a job (from the job's `started` or `resumed` switch to its next switch) or before its first
-switch (`uncovered_per_worker`); the time the pool says it was idle or between jobs counts as
-said. Every job a pool runs opens a `job` span, its `function` the type of the job's closure,
-closed as the job parks and opened again where it resumes (`blaze_graph::pool::span_jobs`), so
-a worker's run of a job is never outside a span. It also fails on every perf sample blocked in a mutex, condition
+wait. It fails when a worker spends 1% or more of the wall time outside every span, every run of a
+job and every idle stretch (`uncovered_per_worker`; idle is from an `idle` switch to the worker's
+next, one begun before the build included). Every job a pool runs opens a `job` span, its
+`function` the type of the job's closure (`blaze_graph::pool::span_jobs`). The span moves with the
+job and is one row, written on the thread where it closes, so a worker's run of a job counts as
+covered from its switch rows: from a `started` or `resumed` switch to the worker's next, and from
+a job's begin (`since_ns`) to its `started` or `ran`. The worker's own work between jobs is a
+`worker` span: `search` for the next job, `idle` while it sleeps, `switch` for the fiber driver's
+part of a park or an end. Before the `worker` spans (2026-11-02) the earlier view counted the time
+before a worker's first switch in the build and after its last as uncovered and missed spans begun
+on another thread: the 47.9% (self-build b1) and 57.5% (hf b5) it reported were mostly that. On
+hf's profile from that day the view below gives 1.1% mean and 3.2% at most for b1, 3.5% and 10.1%
+for b5. What is left is stretches with neither a switch row nor a span. On a busy worker they
+recur every flush (`history::EVERY`, 5 s): rows a ring (`flight::CAP` rows a thread) wrote over
+before the flush read them, which the flush counts (`Flushed::skipped`) and the history does not
+keep; that is the lead, not yet tested. It also fails on every perf sample blocked in a mutex, condition
 variable, `kevent` or `read` while no wait span is open on its thread (`raw_blocks`, which names
 the stack), and on every `wait` span without `awaits`. Its verdict names the build's `tree` and `blaze`, the exact tree and
 binary measured, and a history with no such build is an error naming it. Its test runs on a
@@ -521,11 +532,15 @@ The build's top-level phases each have a span:
   `crate`;
 - the database's `maintain` and one `maintainer` span per pass, named in `function`;
   `apply_bodies` is the method-resolution delta's body pass; the impls maintainer has `impls
-  modules` (its serial walk of every crate's modules), then per crate `impls crate` (with
-  `crate`) and its phases `impls apply_impls`, `impls rekey`, `impls relang`, `impls publish`
-  and the rest;
+  register` (the directory slots of the crates first maintained, one write), `impls nodes` (its
+  one node per crate) and in it `impls node` per crate (with `krate` and `predicted_ns`), whose
+  `impls warm` fans the crate's reads out and whose `impls crate` (with `krate`) holds the phases
+  `impls apply_impls`, `impls rekey`, `impls relang` and the rest, then `impls publish new` for a
+  crate first maintained; its apply has `impls publish` per crate;
 - `Db::run_all`: `run_all` over the batch and `run_all task` per task, both naming the caller's
   file and line in `function`;
+- the name-resolution maintainer's reads per crate: `nameres crate` (its region run to the
+  cutoff) and `nameres records`, each with `crate`;
 - release codegen: `release summarize`, `release emit` and `llvm compile`, beside the existing
   per-function `mir`, `translate` and `monomorphize`;
 - the daemon loop's `loop turn`, opened only for a turn with completions or ready work.
@@ -565,7 +580,7 @@ same rows give the same bytes. Findings that save less than 1% of the wall time 
 | `redone` | one query key (`name`, `crate`, `function`) run more than once in the build | its extra running / mean parallelism |
 | `reran`, `evicted` | `query_counts.reran` and `evicted_asked`, costed at the query's CPU per run from its spans | runs x CPU per run / mean parallelism |
 | `missed` | the `misses` rows by step and cause, except `first` | unknown |
-| `shed` | `live bytes` fell by more than half (and more than 256 MiB) between the end of the build before and the start of this one | unknown |
+| `shed` | the daemon's `live bytes` coming into the build (the build before's last value, or this build's first) against the least during it: a fall of more than 1 GiB, or of more than half of 256 MiB or more. What it let go is computed again | unknown |
 
 The estimates are not additive. Each says what fixing that one thing alone would save, so a
 wait and the owner's serial work under it can both count the same stretch of the path.

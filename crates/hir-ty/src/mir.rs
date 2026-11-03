@@ -2482,12 +2482,25 @@ impl<'db> PlaceTy<'db> {
     }
 }
 
+/// Const eval's ids of what a pointer it makes points to outside memory: a function (its fn
+/// item or closure type) and a vtable. A vtable's id names its concrete type and the `dyn`
+/// type it is a vtable for, as rustc's `GlobalAlloc::VTable(ty, dyn_ty)` does, so the
+/// metadata word of a wide pointer says which trait's vtable it is wherever it is copied
+/// (behind a pointer cast to another type, in a union), not only where a type says so. A
+/// function's id, and a type's that a vtable id of no trait was asked for (a panic's
+/// payload), name no `dyn`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)] // clone: inside a constant's `ComplexMemoryMap`
 pub struct VTableMap<'db> {
     /// Hashed by `blaze_hash::FixedHasher` through `BuildHasherDefault`, the hasher
     /// `rustc_type_ir` can visit.
-    ty_to_id: HashMap<Ty<'db>, usize, std::hash::BuildHasherDefault<blaze_hash::FixedHasher>>,
+    ty_to_id: HashMap<
+        (Ty<'db>, Option<Ty<'db>>),
+        usize,
+        std::hash::BuildHasherDefault<blaze_hash::FixedHasher>,
+    >,
     id_to_ty: Vec<Ty<'db>>,
+    /// The `dyn` type of each id that is a vtable's, in the order of [`Self::id_to_ty`].
+    id_to_dyn: Vec<Option<Ty<'db>>>,
 }
 
 impl<'db> VTableMap<'db> {
@@ -2499,13 +2512,26 @@ impl<'db> VTableMap<'db> {
     /// The id of the first type: the `n`th of [`VTableMap::tys`] has id `FIRST_ID + n`.
     pub const FIRST_ID: usize = VTableMap::OFFSET;
 
-    /// One hash of `ty` per call, a hit or a new id alike.
+    /// The id of `ty` naming no trait: a function's (its fn item or closure type). One hash
+    /// of `ty` per call, a hit or a new id alike.
     pub fn id(&mut self, ty: Ty<'db>) -> usize {
-        match self.ty_to_id.entry(ty) {
+        self.intern(ty, None)
+    }
+
+    /// The id of the vtable of `ty` for `dyn_ty`, a `dyn` type: rustc's
+    /// `GlobalAlloc::VTable(ty, dyn_ty)`.
+    pub fn vtable_id(&mut self, ty: Ty<'db>, dyn_ty: Ty<'db>) -> usize {
+        self.intern(ty, Some(dyn_ty))
+    }
+
+    /// The id of `ty` with `dyn_ty`, [`Self::vtable_id`]'s or [`Self::id`]'s as `dyn_ty` says.
+    pub fn intern(&mut self, ty: Ty<'db>, dyn_ty: Option<Ty<'db>>) -> usize {
+        match self.ty_to_id.entry((ty, dyn_ty)) {
             std::collections::hash_map::Entry::Occupied(it) => *it.get(),
             std::collections::hash_map::Entry::Vacant(slot) => {
                 let id = self.id_to_ty.len() + VTableMap::OFFSET;
                 self.id_to_ty.push(ty);
+                self.id_to_dyn.push(dyn_ty);
                 slot.insert(id);
                 id
             }
@@ -2518,20 +2544,88 @@ impl<'db> VTableMap<'db> {
         self.id_to_ty.iter().copied()
     }
 
+    /// Each id's type and the `dyn` type it is a vtable for (`None` for a function's), in
+    /// the order of their ids, as [`Self::tys`].
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = (Ty<'db>, Option<Ty<'db>>)> + '_ {
+        self.id_to_ty.iter().copied().zip(self.id_to_dyn.iter().copied())
+    }
+
+    /// The type `id` names: a function's, or the concrete type of a vtable.
     pub fn ty(&self, id: usize) -> Result<Ty<'db>, MirEvalError<'db>> {
         id.checked_sub(VTableMap::OFFSET)
             .and_then(|id| self.id_to_ty.get(id).copied())
             .ok_or(MirEvalError::InvalidVTableId(id))
     }
 
+    /// The type `id` names and the `dyn` type it is a vtable for, if it is an id.
+    pub fn entry(&self, id: usize) -> Option<(Ty<'db>, Option<Ty<'db>>)> {
+        let index = id.checked_sub(VTableMap::OFFSET)?;
+        Some((*self.id_to_ty.get(index)?, *self.id_to_dyn.get(index)?))
+    }
+
+    /// The concrete type and the `dyn` type of the vtable `id`, if it is a vtable's.
+    pub fn vtable(&self, id: usize) -> Option<(Ty<'db>, Ty<'db>)> {
+        let (ty, dyn_ty) = self.entry(id)?;
+        Some((ty, dyn_ty?))
+    }
+
     pub fn shrink_to_fit(&mut self) {
         self.id_to_ty.shrink_to_fit();
+        self.id_to_dyn.shrink_to_fit();
         self.ty_to_id.shrink_to_fit();
     }
 
     pub fn is_empty(&self) -> bool {
         self.id_to_ty.is_empty() && self.ty_to_id.is_empty()
     }
+}
+
+/// Whether a vtable made for the `dyn` type `vtable_dyn` is one of `expected_dyn`, as rustc's
+/// `check_vtable_for_type` decides it (`InvalidVTableTrait` where it is not): their lists of
+/// predicates without auto traits, each with its binder's regions and every free region
+/// erased, are equal as sets. The full trait ref counts, not only the trait: a `Tr<u8>`
+/// vtable is no `Tr<u16>` one, nor an `Iterator<Item = u8>` one an `Iterator<Item = u16>`
+/// one, and its methods would dispatch to another impl. Regions do not count:
+/// `dyn for<'a> Tr<fn(&'a u8)>` and `dyn Tr<fn(&'static u8)>` share vtables, as in rustc.
+/// Both types come normalized (const eval's ids and the walks' types are). The one rule for
+/// const eval's upcast, the code generator's and compile identity's wrong-trait refusals.
+/// A type that is no `dyn` matches only itself.
+pub fn same_vtable_trait<'db>(
+    interner: DbInterner<'db>,
+    vtable_dyn: Ty<'db>,
+    expected_dyn: Ty<'db>,
+) -> bool {
+    same_predicates(interner, vtable_dyn, expected_dyn, false)
+}
+
+/// Whether two `dyn` types are one, regions aside: their predicates, auto traits included,
+/// are equal as sets ([`same_vtable_trait`]'s erasure). rustc's `data_a == data_b` in
+/// `unsize_into_ptr`, where a cast between them keeps its vtable unchecked (MIR building makes
+/// such casts); any other `dyn`-to-`dyn` cast checks it.
+pub fn same_dyn_type<'db>(interner: DbInterner<'db>, a: Ty<'db>, b: Ty<'db>) -> bool {
+    same_predicates(interner, a, b, true)
+}
+
+fn same_predicates<'db>(interner: DbInterner<'db>, a: Ty<'db>, b: Ty<'db>, auto_traits: bool) -> bool {
+    use crate::next_solver::{BoundExistentialPredicate, BoundExistentialPredicates};
+    use rustc_type_ir::ExistentialPredicate;
+    let (TyKind::Dynamic(a_bounds, _), TyKind::Dynamic(b_bounds, _)) = (a.kind(), b.kind()) else {
+        return a == b;
+    };
+    let erased = |predicate: BoundExistentialPredicate<'db>| match predicate.skip_binder() {
+        ExistentialPredicate::AutoTrait(_) if !auto_traits => None,
+        ExistentialPredicate::AutoTrait(_)
+        | ExistentialPredicate::Trait(_)
+        | ExistentialPredicate::Projection(_) => Some(crate::providers::erase_regions_in(
+            interner,
+            interner.instantiate_bound_regions_with_erased(predicate),
+        )),
+    };
+    // A handful of predicates each, so a scan with no allocation.
+    let within = |of: BoundExistentialPredicates<'db>, all: BoundExistentialPredicates<'db>| {
+        of.iter().filter_map(erased).all(|it| all.iter().filter_map(erased).any(|other| other == it))
+    };
+    within(a_bounds, b_bounds) && within(b_bounds, a_bounds)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, blaze_query::Value)] // clone: an error a query answers with, copied out of its memo

@@ -77,6 +77,11 @@ impl<T> Tagged<T> {
     }
 
     /// Every value, by slot.
+    pub fn iter(&self) -> impl Iterator<Item = (Handle<T>, &T)> {
+        self.slab.iter()
+    }
+
+    /// Every value, by slot.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Handle<T>, &mut T)> {
         self.slab.iter_mut()
     }

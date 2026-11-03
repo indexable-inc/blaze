@@ -1,25 +1,29 @@
-//! Single flight across builds: each function a build misses in the store is compiled by one
-//! build of the process, whichever asks first. A build that reaches it while that compile is
-//! under way waits for it; one that reaches it after takes the shape the memo keeps its
-//! template under, and prepares nothing. Two proc macros of a job that both reach `syn`'s
-//! parser compile it once (docs/v2/plan/lanes/compile-time-sched/notes.md).
+//! Single flight across builds, one function at a time: each function a build misses in the
+//! store is compiled by one build of the process, whichever asks first. A build that asks for it
+//! while that compile is under way goes on with its other functions and then waits for that one
+//! function; one that asks after takes the shape the memo keeps its template under, and prepares
+//! nothing. Two proc macros of a job that both reach `syn`'s parser compile it once
+//! (docs/v2/plan/lanes/compile-time-sched/notes.md).
 //!
-//! A claim is held from the store miss until its build lands the compile ([`Claims::land`]) or
-//! lets it go ([`Claims::release`], and on drop). A build lets go of every claim it holds
-//! before it waits for another's, so no two builds wait on each other's claims. A claim let go
-//! of is taken by the next build that asks, which compiles it.
+//! A function's compile is a run of the scheduler's ([`pump::Flights`]) under its flight key,
+//! from the moment a build asks for it until it lands ([`Flights::ask`]): one function, never a
+//! batch, so a build that waits for it waits for its compile alone, and the landing is there the
+//! moment the run ends. A run that ends without one (its compile failed, or it unwound) lets the
+//! function go: a build that waited for it asks again, and compiles it if no build has it. A
+//! build holds no function while it waits for another's ([`Flights::ask`] never waits, and a
+//! build waits only once its own runs ended), so no two builds wait on each other's functions.
 //!
-//! The claims a build takes between two releases are one round, held as a run of the
-//! scheduler's ([`pump::Flights::hold`]) from its first claim to its release. A build that
-//! waits for a function of another round parks its job on that round's run: its thread runs
-//! other work meanwhile (the owner's own compiles, on the pool), the scheduler sees who waits
-//! for whom, and the wait is a span naming the function and the build that owns it.
+//! What a build does with each of its functions (ask, wait, take a landing, ask again, or give
+//! up after [`ASKS`]) is decided by [`Plan`], a state machine that reads no table and waits for
+//! nothing (rule 12): the driver does the asking and waiting and tells it what each found.
 //!
-//! The table is lock-free ([`SharedByHash`]): a claim is one insert of each function, a landing
-//! and a release one compare-and-swap of each, and a wait reads with no lock and writes no
-//! shared memory, so builds claiming at once never wait on each other's batches. A store hit
-//! touches nothing. Kept in the [`Memo`] whose templates the shapes name: a landing outlives
-//! no template.
+//! A wait parks its job on the run's flight in the scheduler: its thread runs other work
+//! meanwhile, the scheduler sees who waits for whom (a wait that would close a cycle gives way),
+//! and the wait is a span naming the function, its key and the job that compiles it.
+//!
+//! The landings are a lock-free table ([`SharedByHash`]): a landing is one insert, a look one
+//! read, and a store hit touches nothing. Kept in the [`Memo`] whose templates the shapes name:
+//! a landing outlives no template.
 //!
 //! A release build's summaries fly the same way, by their store key: the summary a build made
 //! is kept here before it lands, so a build that waited for it or asks after takes it and
@@ -29,67 +33,46 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use blaze_graph::{Cancelled, Key, pump};
-use blaze_hash::{Operation, SharedByHash, SharedMap};
+use blaze_hash::SharedByHash;
 use blaze_ids::ContentId;
 
 use crate::{InstanceKey, summary::Summary};
 
-/// A function by the key its compiled code is stored under.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Flight {
-    /// Being compiled in the round of this number.
-    Flying(u64),
-    /// Compiled: its template is in the memo under this shape.
-    Landed(ContentId),
-}
-
 #[derive(Default)]
 pub struct Flights {
-    table: SharedByHash<InstanceKey, Flight>,
-    /// Round numbers, each once.
-    rounds: AtomicU64,
-    /// Each round's run in the scheduler, held from its first claim to its release: what a
-    /// wait for one of its functions parks on.
-    held: pump::Flights<()>,
-    /// The build that holds each round under way, by its number, for the spans of the waits.
-    owners: SharedMap<u64, String>,
+    /// Each function landed, by its flight key: the shape its template is kept under in the memo.
+    landed: SharedByHash<InstanceKey, ContentId>,
+    /// The compile under way of each function, by its flight key: what a wait for it parks on,
+    /// and the landing it ends on (`None` for none).
+    runs: pump::Flights<Option<ContentId>>,
+    /// The build whose run of each function is under way, by its flight key: what a wait for
+    /// it names.
+    running: SharedByHash<InstanceKey, Arc<str>>,
+    /// The compile under way of each shape (a dev compile's IR), so two functions of one shape
+    /// compile it once, whichever builds they are of.
+    shapes: pump::Flights<()>,
     /// Each summary landed, by its flight key.
     summaries: SharedByHash<InstanceKey, Summary>,
 }
 
-/// What a build is told of a function it asks for.
+/// What a build's ask of a function found ([`Flights::ask`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Asked {
-    /// This build compiles it.
-    Ours,
-    /// Another build is compiling it: wait for it ([`Flights::wait`]).
+pub enum Asked<R> {
+    /// This build ran it: what its run made (and landed, when it gave a landing).
+    Ran(R),
+    /// Another build compiles it now: wait for it ([`Flights::wait`]) once this build's own
+    /// runs ended.
     Theirs,
     /// Compiled already, its template in the memo under this shape.
     Landed(ContentId),
 }
 
-/// The claims of one build: `owner` names it in the spans of the waits for its rounds.
-pub struct Claims<'f> {
-    flights: &'f Flights,
-    owner: &'f str,
-    /// The round under way, its number in `round`, while `run` holds it.
-    round: u64,
-    run: Option<pump::Held<'f, ()>>,
-    held: Vec<InstanceKey>,
-}
-
-/// What fills a round's key after its number: 24 bytes, the type says.
-const ROUND_TAG: &[u8; 24] = b"a codegen memo round....";
-
-/// The scheduler's key of round `number`'s run: no content hash's.
-fn round_key(number: u64) -> Key {
-    let mut key = [0u8; 32];
-    key[..8].copy_from_slice(&number.to_le_bytes());
-    key[8..].copy_from_slice(ROUND_TAG);
-    Key(key)
+/// The scheduler's key of a flight key's run: its bytes.
+fn run_key(key: InstanceKey) -> Key {
+    Key(key.0.0)
 }
 
 impl Flights {
@@ -97,81 +80,102 @@ impl Flights {
         Flights::default()
     }
 
-    /// The claims of the build `owner` names, none held yet.
-    pub fn claims<'f>(&'f self, owner: &'f str) -> Claims<'f> {
-        // alloc: none until a claim is held
-        Claims { flights: self, owner, round: 0, run: None, held: Vec::new() }
+    /// Runs `run` for the function under flight key `key` here, for the build `owner` names,
+    /// unless it landed or another build runs it now; never waits. `run` gives what lands (the shape its template is kept
+    /// under in the memo, which `run` put there; `None` when it made none) and what the caller
+    /// keeps. The landing is in the table before the run ends, so a build that waited for it
+    /// or asks after takes it, and no function compiles twice while one compile of it lands.
+    pub fn ask<R>(&self, key: InstanceKey, owner: &Arc<str>, run: impl FnOnce() -> (Option<ContentId>, R)) -> Asked<R> {
+        if let Some(shape) = self.landed.pin().get(&key) {
+            return Asked::Landed(*shape);
+        }
+        let (mut made, mut found) = (None, None);
+        let ran = self.runs.run_if_idle(run_key(key), || {
+            // Landed by a run that ended since the look above.
+            if let Some(shape) = self.landed.pin().get(&key) {
+                found = Some(*shape);
+                return Ok(Some(*shape));
+            }
+            // clone: the owner's name, shared, for the waits on this run
+            self.running.pin().insert(key, Arc::clone(owner));
+            let ran = Running { running: &self.running, key };
+            let (landing, it) = run();
+            drop(ran);
+            if let Some(shape) = landing {
+                // Only this run writes `key` now: no other is under way, and each before it
+                // ended unlanded (else the look above found it).
+                let landed = self.landed.pin();
+                let kept = landed.get_or_insert(key, shape);
+                assert_eq!(*kept, shape, "flight key {key:?} landed twice, as {kept:?} and as {shape:?}");
+            }
+            made = Some(it);
+            Ok(landing)
+        });
+        match (ran, made, found) {
+            (None, ..) => Asked::Theirs,
+            (Some(_), Some(made), _) => Asked::Ran(made),
+            (Some(_), None, Some(shape)) => Asked::Landed(shape),
+            (Some(_), None, None) => unreachable!("a run of flight key {key:?} that ended neither ran nor found a landing"),
+        }
     }
 
-    /// Waits until each of `keys` landed or was let go of: its shape, or `None` for one let go
-    /// of, which the waiting build asks for again. `None` overall once `stopped` says the
-    /// waiting build stopped, which it looks at before each wait. Each wait parks this job on
-    /// the run of the round that claimed the function, until the round's build lets go of it;
+    /// Waits for the function under flight key `key`, which another build ran when this one
+    /// asked: its landing, or `None` when that run ended without one (its compile failed, or it
+    /// unwound), and the caller asks again. The wait parks this job on the run, a span naming
+    /// what `named` writes, given the name of the build that runs it, and the job that runs it;
     /// a wait that would close a cycle of jobs gives way, unwinding with [`Cancelled`], so the
     /// task is posted again.
-    pub fn wait(&self, keys: &[InstanceKey], stopped: impl Fn() -> bool) -> Option<Vec<Option<ContentId>>> {
-        loop {
-            let (mut first, mut count) = (None, 0usize);
-            {
-                let table = self.table.pin();
-                for key in keys {
-                    if let Some(Flight::Flying(round)) = table.get(key) {
-                        count += 1;
-                        first.get_or_insert((*key, *round));
-                    }
-                }
-            }
-            let Some((key, round)) = first else { break };
-            if stopped() {
-                return None;
-            }
-            let named = |it: &mut String| {
-                use std::fmt::Write as _;
-                let owners = self.owners.pin();
-                let owner = owners.get(&round).map_or("a build whose round ended", String::as_str);
-                _ = write!(it, "codegen: {count} functions {owner} compiles (round {round}), first {key:?}");
-            };
-            // A round's run is held before its first claim and ends after its release, so one
-            // over by now runs nothing here, and its functions are read again.
-            if self.held.get_or_run_named(round_key(round), named, || Ok(())).is_err() {
-                // alloc: a give-way's payload, once per task that gives way
-                std::panic::resume_unwind(Box::new(Cancelled));
-            }
+    pub fn wait(&self, key: InstanceKey, mut named: impl FnMut(&mut String, &str)) -> Option<ContentId> {
+        if let Some(shape) = self.landed.pin().get(&key) {
+            return Some(*shape);
         }
-        let table = self.table.pin();
-        let shape = |key: &InstanceKey| match table.get(key) {
-            Some(Flight::Landed(shape)) => Some(*shape),
-            _ => None,
+        let named = |it: &mut String| {
+            let running = self.running.pin();
+            named(it, running.get(&key).map_or("a build whose run of it ended", |owner| &**owner));
         };
-        // alloc: per wait, sized by what it waited for
-        Some(keys.iter().map(shape).collect())
+        // No run under way: it ended, and its landing (or none) is in the table.
+        match self.runs.get_or_run_named(run_key(key), named, || Ok(self.landed.pin().get(&key).copied())) {
+            Ok(landing) => landing,
+            // alloc: a give-way's payload, once per task that gives way
+            Err(Cancelled) => std::panic::resume_unwind(Box::new(Cancelled)),
+        }
+    }
+
+    /// Runs `run`, the compile of `shape`, here, unless another runs now: then waits for it,
+    /// a span naming what `named` writes and the job that compiles it, and runs nothing. `run`
+    /// puts what it compiled in the memo before it returns, so a waiter reads it there.
+    pub fn shape(&self, shape: ContentId, named: impl FnMut(&mut String), run: impl FnOnce()) {
+        let ran = self.shapes.get_or_run_named(Key(shape.0), named, || {
+            run();
+            Ok(())
+        });
+        if ran.is_err() {
+            // alloc: a give-way's payload, once per task that gives way
+            std::panic::resume_unwind(Box::new(Cancelled));
+        }
     }
 
     /// How many functions have landed.
     pub fn landed(&self) -> usize {
-        self.table.pin().values().filter(|it| matches!(it, Flight::Landed(_))).count()
+        self.landed.pin().len()
     }
 
-    /// Keeps each of `made`, a summary under the flight key a build claimed it by, for the
-    /// builds that take it once the build lands it. Only the build that claimed a key keeps
-    /// under it, and [`Flights::retain`] drops a summary with its landing, so a key holds a
-    /// summary already only when a build claims it again; an equal one is one, and the keys
-    /// of other ones are given back, never written over (rule 18), the kept one staying.
+    /// Keeps `summary`, made under the flight key `key` a build runs, for the builds that take
+    /// it once it lands. Only a run of `key` keeps under it, and [`Flights::retain`] drops a
+    /// summary with its landing, so `key` holds a summary already only when a build runs it
+    /// again; an equal one is one, and another is refused (`false`), never written over (rule
+    /// 18), the kept one staying.
+    pub fn keep_summary(&self, key: InstanceKey, summary: Summary) -> bool {
+        match self.summaries.pin().try_insert(key, summary) {
+            Ok(_) => true,
+            Err(it) => *it.current == it.not_inserted,
+        }
+    }
+
+    /// [`Flights::keep_summary`] of each of `made`: the keys of those refused.
     pub fn keep_summaries(&self, made: Vec<(InstanceKey, Summary)>) -> Vec<InstanceKey> {
-        // alloc: empty, allocates nothing unless a summary is refused
-        let mut refused = Vec::new();
-        if made.is_empty() {
-            return refused;
-        }
-        let summaries = self.summaries.pin();
-        for (key, summary) in made {
-            if let Err(it) = summaries.try_insert(key, summary)
-                && *it.current != it.not_inserted
-            {
-                refused.push(key);
-            }
-        }
-        refused
+        // alloc: per batch of summaries, sized by those refused
+        made.into_iter().filter_map(|(key, summary)| (!self.keep_summary(key, summary)).then_some(key)).collect()
     }
 
     /// The summary kept under each of `keys`, landed: `None` for one no build kept.
@@ -183,320 +187,132 @@ impl Flights {
     }
 
     /// Keeps only the landings whose shape `kept` keeps, and the summaries of those kept: the
-    /// memo's collection, between builds.
+    /// memo's collection, between builds, when no function's run is under way.
     pub(crate) fn retain(&mut self, kept: impl Fn(&ContentId) -> bool) {
-        let table = self.table.pin();
-        table.retain(|_, it| match it {
-            Flight::Landed(shape) => kept(shape),
-            Flight::Flying(_) => true,
-        });
-        self.summaries.pin().retain(|key, _| matches!(table.get(key), Some(Flight::Landed(_))));
+        let table = self.landed.pin();
+        table.retain(|_, shape| kept(shape));
+        self.summaries.pin().retain(|key, _| table.contains_key(key));
     }
 }
 
-impl Claims<'_> {
-    /// Asks for each of `keys`, each once: this build's to compile when no build has it, else
-    /// another's under way, else landed.
-    pub fn claim(&mut self, keys: &[InstanceKey]) -> Vec<Asked> {
-        if self.run.is_none() {
-            self.begin();
-        }
-        let build = self.round;
-        let table = self.flights.table.pin();
+/// A run's entry in [`Flights::running`], taken out as the run ends, unwound or not.
+struct Running<'f> {
+    running: &'f SharedByHash<InstanceKey, Arc<str>>,
+    key: InstanceKey,
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.running.pin().remove(&self.key);
+    }
+}
+
+/// How often a build asks for one function before it gives up on it: each ask after the first
+/// follows a run of another build's that ended unlanded, which its waiter saw. Far more than the
+/// builds of a job, so only a livelock reaches it, and it ends in an error naming the function
+/// rather than an open loop (rule 15).
+pub const ASKS: u32 = 256;
+
+/// What an ask of an item found ([`Plan::asked`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Found {
+    /// This build ran it: done, whatever its run made.
+    Ran,
+    /// Another build runs it now.
+    Theirs,
+    /// Landed under this shape.
+    Landed(ContentId),
+}
+
+/// What a build does next with one of its items, by its index ([`Plan::take_decisions`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Decision {
+    /// Ask for it ([`Flights::ask`]): run it here unless it landed or another build runs it.
+    Ask(usize),
+    /// Wait for another build's run of it ([`Flights::wait`]).
+    Wait(usize),
+    /// Take its landing, under this shape: nothing of it is prepared or compiled here.
+    Take(usize, ContentId),
+    /// Give it up, an error naming it: asked `asks` times, each time another build ran it and
+    /// let it go unlanded.
+    GiveUp { at: usize, asks: u32 },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Step {
+    Asking,
+    Waiting,
+    Done,
+}
+
+/// What one build does with each of its items (functions, summaries, groups) of the memo's
+/// flights, as decisions: a synchronous state machine that reads no table, compiles nothing and
+/// waits for nothing (rule 12). The driver asks and waits, and tells it what each found
+/// ([`Plan::asked`], [`Plan::waited`]); it hands back what to do next
+/// ([`Plan::take_decisions`]). Every item ends run here, taken from another build's landing, or
+/// given up after [`ASKS`] asks, so a build's flights end (rule 15).
+pub struct Plan {
+    /// Of each item: where it is, and how often it was asked for.
+    steps: Vec<(Step, u32)>,
+    decisions: Vec<Decision>,
+}
+
+impl Plan {
+    /// A plan of `len` items, each to be asked for first.
+    pub fn new(len: usize) -> Plan {
         // alloc: per batch of store misses, sized by it
-        let mut asked = Vec::with_capacity(keys.len());
-        for key in keys {
-            asked.push(match table.try_insert(*key, Flight::Flying(build)) {
-                Ok(_) => {
-                    self.held.push(*key);
-                    Asked::Ours
-                }
-                Err(it) => match *it.current {
-                    Flight::Flying(round) if round == build => Asked::Ours,
-                    Flight::Flying(_) => Asked::Theirs,
-                    Flight::Landed(shape) => Asked::Landed(shape),
-                },
-            });
-        }
-        asked
+        Plan { steps: vec![(Step::Asking, 0); len], decisions: (0..len).map(Decision::Ask).collect() }
     }
 
-    /// Begins a round: its run held in the scheduler before any function is claimed in it, so
-    /// a build that finds one of them claimed always finds the run to wait on.
-    fn begin(&mut self) {
-        self.round = self.flights.rounds.fetch_add(1, Ordering::Relaxed);
-        let (round, owner) = (self.round, self.owner);
-        let run = self.flights.held.hold_named(round_key(round), |it| {
-            use std::fmt::Write as _;
-            _ = write!(it, "codegen round {round} of {owner}");
-        });
-        self.run = Some(run.expect("a round's number is its own"));
-        // alloc: once a round, its owner's name for the spans of the waits on it
-        self.flights.owners.pin().insert(self.round, self.owner.to_owned());
+    /// What to do next, in the order decided; empty once every item is done.
+    pub fn take_decisions(&mut self) -> Vec<Decision> {
+        std::mem::take(&mut self.decisions)
     }
 
-    /// Lands each of `landed`, a function this build claimed and compiled into the memo under
-    /// its shape, for every build that waits for it or asks after.
-    pub fn land(&mut self, landed: &[(InstanceKey, ContentId)]) {
-        if landed.is_empty() {
-            return;
-        }
-        let (table, flying) = (self.flights.table.pin(), Flight::Flying(self.round));
-        for (key, shape) in landed {
-            let landing = |it: Option<(&InstanceKey, &Flight)>| match it {
-                Some((_, it)) if *it == flying => Operation::Insert(Flight::Landed(*shape)),
-                _ => Operation::Abort(()),
-            };
-            _ = table.compute(*key, landing);
-        }
+    /// Whether every item is done: run, taken or given up.
+    pub fn done(&self) -> bool {
+        self.steps.iter().all(|it| it.0 == Step::Done)
     }
 
-    /// Lets go of every claim this build holds and has not landed (a compile that failed, or
-    /// that a stopped build never began), and ends the round: each build waiting on it reads
-    /// its functions again, asking again for one let go of.
-    pub fn release(&mut self) {
-        if !self.held.is_empty() {
-            let (table, flying) = (self.flights.table.pin(), Flight::Flying(self.round));
-            for key in self.held.drain(..) {
-                _ = table.remove_if(&key, |_, it| *it == flying);
+    /// Item `at`, asked for, found `found`.
+    pub fn asked(&mut self, at: usize, found: Found) {
+        let (step, asks) = &mut self.steps[at];
+        assert_eq!(*step, Step::Asking, "item {at} told of an ask while not asked for");
+        *asks += 1;
+        match found {
+            Found::Ran => *step = Step::Done,
+            Found::Theirs => {
+                *step = Step::Waiting;
+                self.decisions.push(Decision::Wait(at));
+            }
+            Found::Landed(shape) => {
+                *step = Step::Done;
+                self.decisions.push(Decision::Take(at, shape));
             }
         }
-        if let Some(run) = self.run.take() {
-            self.flights.owners.pin().remove(&self.round);
-            run.end(&());
-        }
     }
-}
 
-impl Drop for Claims<'_> {
-    fn drop(&mut self) {
-        self.release();
+    /// Item `at`, waited for, ended as `landing`: taken, or asked for again when the run let it
+    /// go, unless it was asked for [`ASKS`] times.
+    pub fn waited(&mut self, at: usize, landing: Option<ContentId>) {
+        let (step, asks) = &mut self.steps[at];
+        assert_eq!(*step, Step::Waiting, "item {at} told of a wait while not waited for");
+        match landing {
+            Some(shape) => {
+                *step = Step::Done;
+                self.decisions.push(Decision::Take(at, shape));
+            }
+            None if *asks >= ASKS => {
+                *step = Step::Done;
+                self.decisions.push(Decision::GiveUp { at, asks: *asks });
+            }
+            None => {
+                *step = Step::Asking;
+                self.decisions.push(Decision::Ask(at));
+            }
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use parking_lot::Mutex;
-
-    use super::*;
-
-    fn key(n: u8) -> InstanceKey {
-        InstanceKey(ContentId([n; 32]))
-    }
-
-    fn shape(n: u8) -> ContentId {
-        ContentId([n ^ 0x80; 32])
-    }
-
-    #[test]
-    fn a_round_key_is_its_number_then_the_tag_and_each_round_its_own() {
-        let Key(first) = round_key(1);
-        assert_eq!(first[..8], 1u64.to_le_bytes());
-        assert_eq!(&first[8..], ROUND_TAG);
-        let Key(last) = round_key(u64::MAX);
-        assert_eq!(last[..8], u64::MAX.to_le_bytes());
-        assert_ne!(first, last);
-    }
-
-    #[test]
-    fn the_first_to_ask_compiles_and_the_rest_are_told() {
-        let flights = Flights::new();
-        let mut first = flights.claims("a test's build");
-        let mut second = flights.claims("a test's build");
-        assert_eq!(first.claim(&[key(1), key(2)]), [Asked::Ours, Asked::Ours]);
-        assert_eq!(first.claim(&[key(1)]), [Asked::Ours], "a build's own claim is its own");
-        assert_eq!(second.claim(&[key(1), key(3)]), [Asked::Theirs, Asked::Ours]);
-        first.land(&[(key(1), shape(1))]);
-        assert_eq!(second.claim(&[key(1)]), [Asked::Landed(shape(1))]);
-        assert_eq!(flights.landed(), 1);
-    }
-
-    #[test]
-    fn a_claim_let_go_of_is_the_next_askers() {
-        let flights = Flights::new();
-        let mut first = flights.claims("a test's build");
-        assert_eq!(first.claim(&[key(1)]), [Asked::Ours]);
-        drop(first);
-        let mut second = flights.claims("a test's build");
-        assert_eq!(second.claim(&[key(1)]), [Asked::Ours]);
-        second.release();
-        assert_eq!(flights.wait(&[key(1)], || false), Some(vec![None]));
-    }
-
-    #[test]
-    fn a_landing_outlives_no_template_the_memo_drops() {
-        let mut flights = Flights::new();
-        let mut claims = flights.claims("a test's build");
-        claims.claim(&[key(1), key(2)]);
-        claims.land(&[(key(1), shape(1)), (key(2), shape(2))]);
-        drop(claims);
-        flights.retain(|it| *it == shape(2));
-        let mut again = flights.claims("a test's build");
-        assert_eq!(again.claim(&[key(1), key(2)]), [Asked::Ours, Asked::Landed(shape(2))]);
-    }
-
-    fn summary(n: u8) -> Summary {
-        Summary {
-            key: key(n),
-            size: u32::from(n),
-            hint: crate::summary::Hint::None,
-            calls: Vec::new(),
-            addressed: Vec::new(),
-            params: 0,
-            unused: Vec::new(),
-            attrs: crate::summary::Attrs::default(),
-            body: crate::summary::Attrs::default(),
-            external: true,
-        }
-    }
-
-    /// A second summary under one flight key is one when equal, and refused when other: the
-    /// kept one stays (rule 18).
-    #[test]
-    fn another_summary_under_a_kept_key_is_refused() {
-        let flights = Flights::new();
-        assert!(flights.keep_summaries(vec![(key(1), summary(1))]).is_empty());
-        assert!(flights.keep_summaries(vec![(key(1), summary(1))]).is_empty(), "an equal summary is one");
-        assert_eq!(flights.keep_summaries(vec![(key(1), summary(2)), (key(2), summary(2))]), [key(1)]);
-        assert_eq!(flights.summaries(&[key(1), key(2)]), [Some(summary(1)), Some(summary(2))]);
-    }
-
-    /// A summary kept and landed is every later asker's, and goes with its landing.
-    #[test]
-    fn a_landed_summary_is_taken_and_collected_with_its_landing() {
-        let mut flights = Flights::new();
-        let mut claims = flights.claims("a test's build");
-        assert_eq!(claims.claim(&[key(1), key(2)]), [Asked::Ours, Asked::Ours]);
-        flights.keep_summaries(vec![(key(1), summary(1)), (key(2), summary(2))]);
-        claims.land(&[(key(1), key(1).0), (key(2), key(2).0)]);
-        drop(claims);
-        let mut later = flights.claims("a test's build");
-        assert_eq!(later.claim(&[key(1)]), [Asked::Landed(key(1).0)]);
-        assert_eq!(flights.summaries(&[key(1), key(3)]), [Some(summary(1)), None]);
-        drop(later);
-        flights.retain(|it| *it == key(2).0);
-        assert_eq!(flights.summaries(&[key(1), key(2)]), [None, Some(summary(2))]);
-    }
-
-    #[test]
-    fn a_waiter_wakes_for_the_landing_and_a_stopped_one_gives_up() {
-        let flights = &Flights::new();
-        let mut owner = flights.claims("a test's build");
-        owner.claim(&[key(1), key(2)]);
-        let (asked, told) = crossbeam_channel::unbounded();
-        std::thread::scope(|scope| {
-            let waiter = scope.spawn(move || {
-                let mut theirs = flights.claims("a test's build");
-                assert_eq!(theirs.claim(&[key(1), key(2)]), [Asked::Theirs, Asked::Theirs]);
-                asked.send(()).unwrap();
-                flights.wait(&[key(1), key(2)], || false)
-            });
-            told.recv().unwrap();
-            blaze_graph::spin::busy(Duration::from_millis(20));
-            owner.land(&[(key(1), shape(1))]);
-            owner.release();
-            assert_eq!(waiter.join().unwrap(), Some(vec![Some(shape(1)), None]));
-        });
-        let mut held = flights.claims("a test's build");
-        held.claim(&[key(3)]);
-        assert_eq!(flights.wait(&[key(3)], || true), None);
-    }
-
-    /// On a pool of one worker, a build waits for a function another build's round claimed
-    /// while that build, a job parked before it lands, is woken: the landing can run only on the
-    /// worker the wait is on, so the wait ends only if it parks its job rather than its thread
-    /// (with the thread held, as by a lock's condition, it never ends). Each build claims,
-    /// lands and lets go in its own job, as a build's compile does.
-    #[test]
-    fn a_build_waiting_for_another_rounds_function_leaves_its_thread_to_that_round() {
-        const LONG: Duration = Duration::from_secs(60);
-        let flights = std::sync::Arc::new(Flights::new());
-        let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
-        let go = blaze_graph::sched::Event::new();
-        let on = go.waiter();
-        let (claimed_tx, claimed) = crossbeam_channel::unbounded::<()>();
-        let (owned_tx, owned) = crossbeam_channel::unbounded::<Result<(), String>>();
-        {
-            let flights = std::sync::Arc::clone(&flights);
-            pool.submit(
-                None,
-                move || {
-                    let mut owner = flights.claims("the owner");
-                    assert_eq!(owner.claim(&[key(1)]), [Asked::Ours]);
-                    claimed_tx.send(()).unwrap();
-                    on.wait().expect("an event's wait closes no cycle");
-                    owner.land(&[(key(1), shape(1))]);
-                    owner.release();
-                },
-                move |it| _ = owned_tx.send(it.map_err(|_| "the owner's build panicked".to_owned())),
-            );
-        }
-        claimed.recv_timeout(LONG).expect("the owner claims its function");
-        let (asking_tx, asking) = crossbeam_channel::unbounded::<()>();
-        let (waited_tx, waited) = crossbeam_channel::unbounded();
-        {
-            let flights = std::sync::Arc::clone(&flights);
-            pool.submit(
-                None,
-                move || {
-                    let mut theirs = flights.claims("the waiter");
-                    assert_eq!(theirs.claim(&[key(1)]), [Asked::Theirs]);
-                    theirs.release();
-                    asking_tx.send(()).unwrap();
-                    flights.wait(&[key(1)], || false)
-                },
-                move |it| _ = waited_tx.send(it.map_err(|_| "the waiting build panicked".to_owned())),
-            );
-        }
-        asking.recv_timeout(LONG).expect("the waiter runs once the owner parks");
-        go.fire();
-        let waited = waited.recv_timeout(LONG).expect("the waiter parks its job, so the owner lands on the one worker");
-        assert_eq!(waited, Ok(Some(vec![Some(shape(1))])));
-        assert_eq!(owned.recv_timeout(LONG).expect("the owner's build ends"), Ok(()));
-    }
-
-    /// Builds that each hold a claim the other waits for: each lets go of or lands its own
-    /// before it waits, so both end, and every function is compiled once between them.
-    #[test]
-    fn builds_waiting_on_each_other_both_end_and_compile_each_once() {
-        let flights = Flights::new();
-        let compiled = Mutex::new(Vec::new());
-        let barrier = std::sync::Barrier::new(2);
-        std::thread::scope(|scope| {
-            for order in [[1u8, 2], [2, 1]] {
-                let (flights, compiled, barrier) = (&flights, &compiled, &barrier);
-                scope.spawn(move || {
-                    let mut claims = flights.claims("a test's build");
-                    let mut missing: Vec<InstanceKey> = order.iter().map(|it| key(*it)).collect();
-                    // Each first claims the one the other claims second.
-                    claims.claim(&missing[..1]);
-                    barrier.wait();
-                    while !missing.is_empty() {
-                        let asked = claims.claim(&missing);
-                        let mut theirs = Vec::new();
-                        let mut landed = Vec::new();
-                        for (key, asked) in missing.iter().zip(asked) {
-                            match asked {
-                                Asked::Ours => {
-                                    compiled.lock().push(*key);
-                                    landed.push((*key, shape(key.0.0[0])));
-                                }
-                                Asked::Theirs => theirs.push(*key),
-                                Asked::Landed(_) => {}
-                            }
-                        }
-                        claims.land(&landed);
-                        claims.release();
-                        let waited = flights.wait(&theirs, || false).unwrap();
-                        missing = theirs.into_iter().zip(waited).filter(|it| it.1.is_none()).map(|it| it.0).collect();
-                    }
-                });
-            }
-        });
-        let mut compiled = compiled.into_inner();
-        compiled.sort();
-        assert_eq!(compiled, [key(1), key(2)]);
-    }
-}
+mod tests;

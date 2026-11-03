@@ -58,6 +58,7 @@ cov-mark.workspace = true
 expect-test.workspace = true
 hegeltest.workspace = true
 blaze-alloc-count.workspace = true
+blaze-format.workspace = true
 blaze-units = { workspace = true, features = ["query"] }
 hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }

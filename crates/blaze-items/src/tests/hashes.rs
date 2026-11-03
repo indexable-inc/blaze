@@ -1045,6 +1045,12 @@ fn mir_that_fails_to_lower_is_named_in_the_error() {
     let ItemId::Function(func) = id else { panic!("`f` is {id:?}") };
     let owner = hir_ty::InferBodyId::DefWithBodyId(DefWithBodyId::from(func));
     let lowering = hir_ty::db::HirDatabase::mir_body(&db, owner).expect_err("`f`'s MIR fails to lower");
+    assert!(
+        matches!(lowering, hir_ty::mir::MirLowerError::MissingFunctionDefinition(..)),
+        "a call of a name that does not resolve has no function: {lowering:?}"
+    );
     let said = err.describe(&db);
-    assert!(said.ends_with(&format!("MIR that failed to lower ({lowering:?})")), "{said}");
+    assert!(said.contains("MIR that failed to lower (the call of `g` at "), "the callee is named as written: {said}");
+    assert!(said.contains(":1:17 has no function: "), "the call's place is given: {said}");
+    assert!(said.ends_with("its name resolves to nothing)"), "inference's reason is given: {said}");
 }

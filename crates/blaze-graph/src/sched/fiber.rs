@@ -36,7 +36,7 @@ use std::{
     ptr,
     sync::{
         Arc, Once,
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle, Thread},
     time::{Duration, Instant},
@@ -287,14 +287,26 @@ thread_local! {
     pub(crate) static GLOBAL_TAKEN: Cell<u64> = const { Cell::new(0) };
 }
 
+/// The job that took the scheduler's lock last, as the profiler numbers it ([`spawner`]); 0
+/// for none or no profiler. A wait for the lock names it as its owner: the holder, unless it
+/// let go between the waiter's failed try and the read, when it is the job that held it last.
+static HOLDER: AtomicU64 = AtomicU64::new(0);
+
 /// The process's scheduler, locked: always before a driver's own lock.
 pub(super) fn global() -> MutexGuard<'static, Global> {
     #[cfg(test)]
     GLOBAL_TAKEN.with(|it| it.set(it.get() + 1));
-    match GLOBAL.try_lock() {
+    let held = match GLOBAL.try_lock() {
         Some(held) => held,
-        None => crate::wait::wait(crate::wait::WaitOn::Lock("the scheduler"), None, || GLOBAL.lock()),
+        None => {
+            let owner = HOLDER.load(Ordering::Relaxed);
+            crate::wait::wait(crate::wait::WaitOn::Lock("the scheduler"), (owner != 0).then_some(owner), || GLOBAL.lock())
+        }
+    };
+    if observing() {
+        HOLDER.store(spawner().spawner, Ordering::Relaxed);
     }
+    held
 }
 
 /// Does what the scheduler decided, for every member whose jobs it changed: a member of its
@@ -897,9 +909,9 @@ pub struct Switch {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SwitchEvent {
     /// A pool job begins on its fiber, before anything joins it to the graph: its `job` is
-    /// [`UNREGISTERED`] and its `fiber` 0. `spawner` is what [`observe_spawner`]'s reader said
-    /// as the job was given to the pool, 0 for none. Told with no lock held.
-    Began { spawner: u64 },
+    /// [`UNREGISTERED`] and its `fiber` 0. `given` is what [`observe_spawner`]'s reader said
+    /// as the job was given to the pool. Told with no lock held.
+    Began { given: Given },
     /// The job joined the graph (a pool job at its first claim or wait, after its `Began`), or
     /// its first run on the fiber driver.
     Started,
@@ -960,21 +972,31 @@ pub(super) fn switched_known(event: SwitchEvent, job: JobId, generation: u32, fi
     }
 }
 
-#[expect(clippy::disallowed_types, reason = "the process's one profiler hook, set once, read with no lock at every pool submit")]
-static SPAWNER: std::sync::OnceLock<fn() -> u64> = std::sync::OnceLock::new();
-
-/// Has `running` say, as a pool job is given to the pool, the observer's number for the job
-/// running on this thread: the new job's spawner, told in its [`SwitchEvent::Began`]. Once a
-/// process; a second is refused.
-pub fn observe_spawner(running: fn() -> u64) -> Result<(), fn() -> u64> {
-    SPAWNER.set(running)
+/// How a pool job was given to the pool, as the profiler says it ([`observe_spawner`]): told in
+/// its [`SwitchEvent::Began`], so its wait for a core is in the record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Given {
+    /// The job running where it was given, as the observer numbers it; 0 for none.
+    pub spawner: u64,
+    /// When, on the observer's clock; 0 when not said.
+    pub at: u64,
 }
 
-/// The job running on this thread, as [`observe_spawner`]'s reader numbers it; 0 when none is
-/// set or none runs.
+#[expect(clippy::disallowed_types, reason = "the process's one profiler hook, set once, read with no lock at every pool submit")]
+static SPAWNER: std::sync::OnceLock<fn() -> Given> = std::sync::OnceLock::new();
+
+/// Has `given` say, as a pool job is given to the pool, the observer's number for the job
+/// running on this thread (the new job's spawner) and its clock: told in the job's
+/// [`SwitchEvent::Began`]. Once a process; a second is refused.
+pub fn observe_spawner(given: fn() -> Given) -> Result<(), fn() -> Given> {
+    SPAWNER.set(given)
+}
+
+/// The job running on this thread and the time, as [`observe_spawner`]'s reader says them;
+/// zeros when none is set.
 #[inline]
-pub(crate) fn spawner() -> u64 {
-    SPAWNER.get().map_or(0, |running| running())
+pub(crate) fn spawner() -> Given {
+    SPAWNER.get().map_or(Given::default(), |given| given())
 }
 
 /// A worker going idle or waking, as the idle observer ([`observe_idle`]) is told it: on the

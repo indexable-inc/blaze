@@ -147,6 +147,8 @@ pub struct StillWait {
     pub on: Option<u32>,
     /// What the loop holds it back for ([`Jobs::holding`]).
     pub held: Option<&'static str>,
+    /// What a loop task that runs and is held for nothing waits on ([`Jobs::run_wait`]).
+    pub run: Option<String>,
 }
 
 impl fmt::Display for Still {
@@ -166,6 +168,9 @@ impl fmt::Display for Still {
             }
             if let Some(held) = it.held {
                 write!(f, ", held: {held}")?;
+            }
+            if let Some(run) = &it.run {
+                write!(f, ", {run}")?;
             }
         }
         if self.waits.len() > STILL_NAMED {
@@ -1329,14 +1334,17 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // alloc: a stall, once
         let mut waits = Vec::new();
         let jobs = &self.jobs;
-        self.plane.unsettled(|it| {
+        let plane = &self.plane;
+        plane.unsettled(|it| {
+            let held = jobs.holding(it.id);
             waits.push(StillWait {
                 request: it.request.0,
                 node: it.id.0,
                 name: it.name.to_owned(), // alloc: a stall, once per node it names
                 state: it.state.clone(),
                 on: it.on.map(|on| on.0),
-                held: jobs.holding(it.id),
+                held,
+                run: (held.is_none() && plane.loop_runs(it.id)).then(|| jobs.run_wait(it.id)),
             });
         });
         if waits.is_empty() {
@@ -1533,6 +1541,18 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                         self.server.reply(Reply { to: from, response: blaze_api::Response::Done { ok: false } }, &mut self.effects);
                     }
                 },
+                // `blaze run` of a dev executable: the programs are the steps' (review: the
+                // file it may write is the launch's, once per run).
+                Out::Pass(Arrived::Request { from, request: Request::Launch { program, pid } }) => {
+                    let (response, ok) = match self.steps.launch(&program, pid) {
+                        Ok(Some(env)) => (blaze_api::Response::Launched { live: true, env }, true),
+                        // alloc: none, empty
+                        Ok(None) => (blaze_api::Response::Launched { live: false, env: Vec::new() }, true),
+                        Err(error) => (blaze_api::Response::Error(error), false),
+                    };
+                    self.server.reply(Reply { to: from, response }, &mut self.effects);
+                    self.server.reply(Reply { to: from, response: blaze_api::Response::Done { ok } }, &mut self.effects);
+                }
                 Out::Pass(Arrived::Request { from, request: Request::Sql { sql, last_s } }) => {
                     let mut replies = std::mem::take(&mut self.replies);
                     self.observe.query(from, sql, last_s, &mut replies);

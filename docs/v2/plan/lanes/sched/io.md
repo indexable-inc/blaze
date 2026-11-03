@@ -27,7 +27,7 @@ reads are not I/O and are left out.
 |---|---|---|---|
 | Host file reads in `Front::compile` (profile-use file, native libraries) | `blaze-cargo` serve/unit/codegen.rs | cargo | a driver read (`Effect::ReadAll`) and `Wait::Key` |
 | Linker toolchain discovery: `cc`/`xcrun`/`vswhere`/`reg` runs, sysroot and SDK reads, `-l` search directory listings, linker scripts, archive sniffing | `blaze-link` target.rs | link | discovery once per daemon as an input (it is cached per process already); per-link reads and listings as driver requests |
-| External assembler (`asm!` via `cc` when LLVM is absent or `BLAZE_ASSEMBLER=cc`) | `hir-ty-codegen` asm.rs | codegen | a driver spawn (`Effect::Spawn`) and its files as driver requests |
+| External assembler (`asm!` via `cc` when LLVM is absent or `BLAZE_ASSEMBLER=cc`) | `hir-ty-codegen` asm.rs | codegen | gone (2026-11-02): only the pinned LLVM assembles, in process ([toolchain-c.md](../../toolchain-c.md), slice 1) |
 | `include_bytes!`/`include_str!` of a path outside the VFS | `base-db` files.rs | db | a VFS input (mounted by the loop), never a read in a query |
 | Proc-macro "OS" file opens, readlink, readdir | `blaze-macro-eval` os/files.rs | usercode | driver reads; the macro's thread suspends on them |
 | Rustup toolchain directory scan in `sysroot()` | `blaze-cargo` toolchain.rs | cargo | an input fixed at daemon start (and see own-nightly below) |
@@ -101,7 +101,7 @@ Linking itself is in-process: objects come from memory and the image goes back t
 
 | path:line | call | what it does | task |
 |---|---|---|---|
-| `crates/hir-ty-codegen/asm.rs:1675-1720` | `create_dir_all`, `Command::new(..).spawn`/`wait`, `read`, `remove_file` | assembles `asm!` with the host C compiler into a temporary `.o` | `Front::compile`, when `BLAZE_ASSEMBLER=cc` or blaze has no LLVM |
+| `crates/hir-ty-codegen/asm.rs:1675-1720` | `create_dir_all`, `Command::new(..).spawn`/`wait`, `read`, `remove_file` | assembled `asm!` with the host C compiler into a temporary `.o`; gone 2026-11-02 ([toolchain-c.md](../../toolchain-c.md), slice 1) | none |
 | `crates/hir-ty-codegen/llvm.rs:1157` | `eprintln!` | an LLVM warning to stderr, unconditional | `Front::compile` |
 
 LLVM writes objects to memory (`crates/hir-ty-codegen/llvm.rs:419`, `:986-1002`), not files.

@@ -26,6 +26,7 @@ pub mod html;
 pub mod load;
 pub mod path;
 pub mod report;
+pub mod sim;
 pub mod trace;
 
 #[cfg(test)]
@@ -55,12 +56,14 @@ pub struct SwitchIn {
     pub since_ns: Option<i64>,
     /// `switches.began_as`: a `started` job's number before it joined the graph.
     pub began_as: Option<u64>,
+    /// `switches.queued_ns`: how long a `started` or `ran` job waited for a core before it began.
+    pub queued_ns: Option<i64>,
 }
 
 impl SwitchIn {
     /// A row of `event` and nothing past the switch's own columns.
     pub fn of(process: u32, thread: u32, t_ns: i64, event: Event, job: u64, fiber: u32, core: u32) -> SwitchIn {
-        SwitchIn { process, thread, t_ns, event, job, fiber, core, by: None, since_ns: None, began_as: None }
+        SwitchIn { process, thread, t_ns, event, job, fiber, core, by: None, since_ns: None, began_as: None, queued_ns: None }
     }
 }
 
@@ -181,6 +184,10 @@ pub struct SpanIn {
 /// The name of a span that is a wait (`blaze_graph::wait`'s spans).
 pub const WAIT_SPAN: &str = "wait";
 
+/// The name of a pool worker's span of its own work between jobs (`blaze_graph::pool::Driving`):
+/// no job's, and no thread lane's either, as a worker's idle is no thread's running.
+pub const WORKER_SPAN: &str = <crate::span::Worker as crate::span::Span>::NAME;
+
 impl SpanIn {
     pub fn end_ns(&self) -> i64 {
         self.start_ns + self.dur_ns.max(0)
@@ -256,6 +263,7 @@ impl Input {
                     by: it.by,
                     since_ns: it.since_ns,
                     began_as: it.began_as,
+                    queued_ns: it.queued_ns,
                 })
             })
             // alloc: the dump's switches, once a dump
@@ -560,6 +568,9 @@ pub struct Lane {
     /// The lane of the job that gave it to the pool, when its `started` or `ran` row names one
     /// the model has.
     pub spawner: Option<usize>,
+    /// How long it waited for a core before it began, from its pool's submit: its `started` or
+    /// `ran` row's `queued_ns`. `None` when the row does not say.
+    pub queued_ns: Option<i64>,
     /// End to end, from its lifetime's start to its end.
     pub intervals: Vec<Interval>,
     /// The spans laid on it ([`Model::spans`]), by start.
@@ -716,6 +727,46 @@ pub struct Anomalies {
     pub spans_of_no_lane: u64,
 }
 
+/// A pool worker: a thread whose switches put a job on it or say it idled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Worker {
+    pub process: u32,
+    pub thread: u32,
+    /// Its stretches with nothing to run, from an `idle` row to its next `woke` or `idle` row,
+    /// in order. One its first row ends (a `woke`) was idle since before the build: from the
+    /// build's start. One no row ends lasts to the build's end.
+    pub idle: Vec<(i64, i64)>,
+}
+
+impl Worker {
+    pub fn idle_ns(&self) -> i64 {
+        self.idle.iter().map(|it| it.1 - it.0).sum()
+    }
+}
+
+/// The workers' idle time while a job was runnable and waited for a core: at each instant, the
+/// fewer of the workers idle and the jobs queued (after a `ready` row or a move, or from a pool
+/// submit to the job's start), so a worker idle beside queued work counts once per job.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IdleWithWork {
+    pub workers: u32,
+    pub wall_ns: i64,
+    /// All the workers' idle time.
+    pub idle_ns: i64,
+    pub with_work_ns: i64,
+    /// Whether any `started` or `ran` row said its job's queued time: without, the waits from
+    /// a submit to a start are not in `with_work_ns`.
+    pub submits_said: bool,
+}
+
+impl IdleWithWork {
+    /// Of the workers x wall, from 0 to 1.
+    pub fn share(&self, ns: i64) -> f64 {
+        let capacity = f64::from(self.workers) * self.wall_ns as f64;
+        if capacity > 0.0 { ns as f64 / capacity } else { 0.0 }
+    }
+}
+
 /// A build's time, job by job.
 #[derive(Clone, Debug)]
 pub struct Model {
@@ -728,6 +779,8 @@ pub struct Model {
     /// among the rows ([`Anomalies::orphans`]).
     pub parent: Vec<Option<usize>>,
     pub waits: Vec<Wait>,
+    /// The pool workers, by (process, thread).
+    pub workers: Vec<Worker>,
     pub events: Vec<EventIn>,
     /// Each event's lane: its job's, else its span's, else its thread's; `None` on a thread
     /// with no lane.
@@ -745,6 +798,7 @@ impl Model {
         let bounds = bounds(build, build_row, &switches, &spans)?;
         switches.sort_by_key(|it| (it.process, it.t_ns, it.event.rank()));
         let threads = thread_rows(&switches);
+        let workers = workers(&switches, bounds);
         let mut builder = Builder {
             bounds,
             threads,
@@ -763,7 +817,7 @@ impl Model {
         builder.job_lanes(&switches);
         let ready_by = std::mem::take(&mut builder.ready_by);
         let spawned_by = std::mem::take(&mut builder.spawned_by);
-        let mut model = builder.finish(build, spans);
+        let mut model = builder.finish(build, spans, workers);
         for (lane, by) in spawned_by {
             let process = model.lanes[lane].id.process();
             model.lanes[lane].spawner = model.job_lane(process, by).filter(|&it| it != lane);
@@ -829,6 +883,45 @@ impl Model {
         }
     }
 
+    /// [`IdleWithWork`] over the build.
+    pub fn idle_with_work(&self) -> IdleWithWork {
+        let (start, end) = (self.bounds.start_ns, self.bounds.end_ns);
+        // alloc: once a report
+        let mut steps: Vec<(i64, i32, i32)> = Vec::new();
+        let mut step = |from: i64, to: i64, idle: i32, queued: i32| {
+            let (from, to) = (from.max(start), to.min(end));
+            if to > from {
+                steps.push((from, idle, queued));
+                steps.push((to, -idle, -queued));
+            }
+        };
+        let mut idle_ns = 0;
+        for worker in &self.workers {
+            idle_ns += worker.idle_ns();
+            for &(from, to) in &worker.idle {
+                step(from, to, 1, 0);
+            }
+        }
+        let mut submits_said = false;
+        for lane in self.lanes.iter().filter(|it| it.id.job().is_some()) {
+            if let (Begin::Started, Some(queued)) = (lane.begin, lane.queued_ns) {
+                submits_said = true;
+                step(lane.begin_ns() - queued, lane.begin_ns(), 0, 1);
+            }
+            for it in lane.intervals.iter().filter(|it| matches!(it.state, State::Queued { .. })) {
+                step(it.from_ns, it.to_ns, 0, 1);
+            }
+        }
+        steps.sort_unstable();
+        let (mut idle, mut queued, mut at, mut with_work_ns) = (0i64, 0i64, start, 0i64);
+        for (t, d_idle, d_queued) in steps {
+            with_work_ns += idle.min(queued).max(0) * (t - at);
+            (idle, queued, at) = (idle + i64::from(d_idle), queued + i64::from(d_queued), t);
+        }
+        let workers = u32::try_from(self.workers.len()).unwrap_or(u32::MAX);
+        IdleWithWork { workers, wall_ns: self.bounds.wall_ns(), idle_ns, with_work_ns, submits_said }
+    }
+
     /// The outermost span `span` is inside, itself included.
     pub fn root_of(&self, mut span: usize) -> usize {
         let mut fuel = self.spans.len();
@@ -859,6 +952,47 @@ fn thread_rows(switches: &[SwitchIn]) -> Threads {
         rows.sort_unstable();
     }
     threads
+}
+
+/// The pool workers of `switches` (sorted by time) and their idle stretches.
+fn workers(switches: &[SwitchIn], bounds: Bounds) -> Vec<Worker> {
+    // A BTreeMap: the workers come out in order.
+    // alloc: once a model
+    let mut workers: std::collections::BTreeMap<(u32, u32), (Vec<(i64, i64)>, Option<i64>, bool)> = std::collections::BTreeMap::new();
+    for it in switches {
+        let on_worker = matches!(it.event, Event::Idle | Event::Woke | Event::Started | Event::Resumed | Event::Ran);
+        if !on_worker {
+            continue;
+        }
+        // alloc: a worker's stretches, once a worker a model
+        let (idle, open, seen) = workers.entry((it.process, it.thread)).or_default();
+        match it.event {
+            Event::Idle => {
+                if let Some(from) = open.replace(it.t_ns) {
+                    idle.push((from, it.t_ns));
+                }
+            }
+            Event::Woke => match open.take() {
+                Some(from) => idle.push((from, it.t_ns)),
+                // Its first row: it slept since before the build.
+                None if !*seen => idle.push((bounds.start_ns, it.t_ns)),
+                None => {}
+            },
+            _ => {}
+        }
+        *seen = true;
+    }
+    workers
+        .into_iter()
+        .map(|((process, thread), (mut idle, open, _))| {
+            if let Some(from) = open {
+                idle.push((from, bounds.end_ns.max(from)));
+            }
+            idle.retain(|it| it.1 > it.0);
+            Worker { process, thread, idle }
+        })
+        // alloc: once a model
+        .collect()
 }
 
 fn bounds(build: u64, row: Option<(i64, i64)>, switches: &[SwitchIn], spans: &[SpanIn]) -> Result<Bounds, TimeError> {
@@ -944,6 +1078,7 @@ impl Builder {
                 self.began_as.push(((process, began_as), lane));
             }
         }
+        let queued_ns = first.filter(|it| matches!(it.event, Event::Started | Event::Ran)).and_then(|it| it.queued_ns);
         let mut end = End::RecordEnd;
         let mut at = first.map_or(self.bounds.start_ns, |it| it.t_ns);
         let mut doing = Doing::Nothing;
@@ -1049,12 +1184,12 @@ impl Builder {
         }
         let fiber = rows.iter().find(|it| matches!(it.event, Event::Started | Event::Resumed | Event::Ran)).map(|it| it.fiber);
         // alloc: a lane's sums, once a lane a model
-        let mut lane = Lane { id, fiber, begin, end, spawner: None, intervals, spans: Vec::new(), before: Vec::new() };
+        let mut lane = Lane { id, fiber, begin, end, spawner: None, queued_ns, intervals, spans: Vec::new(), before: Vec::new() };
         lane.sum();
         self.lanes.push(lane);
     }
 
-    fn finish(self, build: u64, spans: Vec<SpanIn>) -> Model {
+    fn finish(self, build: u64, spans: Vec<SpanIn>, workers: Vec<Worker>) -> Model {
         let count = spans.len();
         // alloc: once a model
         let mut jobs: HashMap<(u32, u64), usize, Global> = HashMap::new_in(Global);
@@ -1074,6 +1209,7 @@ impl Builder {
             parent: vec![None; count],
             spans,
             waits: self.waits,
+            workers,
             // alloc: none until laid
             events: Vec::new(),
             event_lane: Vec::new(),
@@ -1088,6 +1224,8 @@ impl Builder {
 enum Laid {
     Job(usize),
     Thread { process: u32, thread: u32 },
+    /// A pool worker's own span ([`WORKER_SPAN`]) or one under it: on no lane.
+    Worker,
 }
 
 impl Model {
@@ -1119,6 +1257,7 @@ impl Model {
             let span = &self.spans[i];
             let thread = Laid::Thread { process: span.process, thread: span.thread };
             let it = match (self.parent[i].and_then(|p| laid[p]), span.job) {
+                _ if span.name == WORKER_SPAN => Laid::Worker,
                 (Some(parent), _) => parent,
                 (None, Some(job)) => match self.job_lane(span.process, job) {
                     Some(lane) => Laid::Job(lane),
@@ -1144,6 +1283,7 @@ impl Model {
                 }
                 // alloc: a thread lane's spans, once a lane a model
                 Laid::Thread { process, thread } => threads.entry((process, thread)).or_default().push(i),
+                Laid::Worker => {}
             }
         }
         for ((process, thread), spans) in threads {
@@ -1219,7 +1359,7 @@ impl Model {
         }
         let id = LaneId::Thread { process, thread };
         let mut lane =
-            Lane { id, fiber: None, begin: Begin::FirstSpan, end: End::LastSpan, spawner: None, intervals, spans, before: Vec::new() };
+            Lane { id, fiber: None, begin: Begin::FirstSpan, end: End::LastSpan, spawner: None, queued_ns: None, intervals, spans, before: Vec::new() };
         lane.sum();
         self.lanes.push(lane);
     }

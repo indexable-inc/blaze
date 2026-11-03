@@ -60,7 +60,8 @@ struct Pin {
 
 struct Component {
     package: &'static str,
-    /// The target it is for: the host's. Every package blaze pins is of one target, so its files
+    /// The target it is for: the host's, or wasm32-wasip1 for the C runtime blaze's linker links
+    /// proc macros' modules with (wasi-libc). Every package blaze pins is of one target, so its files
     /// are all named `<package>-<version>-<target>`.
     target: &'static str,
     pin: Pin,
@@ -758,6 +759,7 @@ mod tests {
                 "rustc-x86_64-unknown-linux-gnu",
                 "cargo-x86_64-unknown-linux-gnu",
                 "rust-std-x86_64-unknown-linux-gnu",
+                "rust-std-wasm32-wasip1",
             ]
         );
         assert!(
@@ -767,7 +769,7 @@ mod tests {
         assert!(Release::read(PINS, "riscv64gc-unknown-linux-gnu").is_none());
         for host in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
         {
-            assert_eq!(Release::read(PINS, host).unwrap().components.len(), 3, "{host}");
+            assert_eq!(Release::read(PINS, host).unwrap().components.len(), 4, "{host}");
         }
     }
 

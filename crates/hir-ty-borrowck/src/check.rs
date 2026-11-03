@@ -213,6 +213,7 @@ pub(super) fn check<'o, 'f, 'db>(
         });
     let mut regions = phase(Phase::Constraints, || regions::build(ctx, body, &cfg, requirements));
     let count = ctx.infcx.num_region_vars();
+    phase(Phase::Constraints, || regions::answer_placeholders(ctx.frame, &mut regions, count));
     let (live, drops) = phase(Phase::Liveness, || {
         liveness::region_liveness(ctx, body, &cfg, &decoded, &moves, &regions, count)
     });
@@ -889,6 +890,15 @@ struct MoveReported<'f, 'o> {
     used: PlaceKey<'f>,
     diagnostic: Draft<'f>,
     error: UseOfMoved<'o>,
+}
+
+/// `Checker::binder_assumed` used up its rounds, one per placeholder it could add and one
+/// more: each round adds one or ends, so this is a bug in it, never a verdict.
+#[derive(Debug, Clone, Copy)]
+struct BinderUnsettled {
+    rounds: usize,
+    placeholders: usize,
+    held: usize,
 }
 
 struct Checker<'a, 'f, 'o, 'db> {
@@ -2151,6 +2161,9 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
             Some(hir_def::CallableDefId::FunctionId(it)) => Some(hir_def::GenericDefId::FunctionId(it)),
             _ => None,
         };
+        // An anonymous lifetime of a fn pointer's or closure's `for<'a>` by its position, `'1`,
+        // as rustc names one, the same in the bound and in the source type written out.
+        let numbered = owner.is_none();
         let name = |region: Option<Region<'db>>| -> &'f str {
             let Some(region) = region else { return "'_" };
             match region.kind() {
@@ -2167,6 +2180,7 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                                 .map(|(_, it)| text!(self, "{}", it.name.as_str()))
                         })
                         .unwrap_or("'_"),
+                    _ if numbered => text!(self, "'{}", bound.var.as_usize() + 1),
                     _ => "'_",
                 },
                 _ => "'_",
@@ -2209,7 +2223,29 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                 "`{}`",
                 hir_def::signatures::FunctionSignature::of(db, it).name.as_str()
             ),
-            _ => text!(self, "`{}`", fn_ptr(dropped.source)),
+            // A fn pointer or closure by the expression coerced, with its type.
+            _ => {
+                let expr = match dropped.span {
+                    MirSpan::ExprId(expr) => Some(expr),
+                    _ => None,
+                };
+                let what = expr.and_then(|expr| {
+                    match regions::path_binding(self.ctx, self.body, expr) {
+                        Some(binding) => {
+                            Some(text!(self, "`{}`", self.ctx.store[binding].name.as_str()))
+                        }
+                        None => matches!(
+                            self.ctx.store.expr(expr),
+                            hir_def::hir::Expr::Closure { .. }
+                        )
+                        .then_some("the closure"),
+                    }
+                });
+                match what {
+                    Some(what) => text!(self, "{what}, a `{}`,", fn_ptr(dropped.source)),
+                    None => text!(self, "`{}`", fn_ptr(dropped.source)),
+                }
+            }
         };
         text!(
             self,
@@ -2223,6 +2259,14 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
     /// The universal regions made to outlive what the signature does not say they outlive,
     /// and the type parameters made to outlive what they are not known to.
     fn report_region_errors(&mut self) {
+        if let Some(rounds) = self.regions.answers_unsettled {
+            let message = text!(
+                self,
+                "answering what the body's regions are made to outlive of higher-ranked fn \
+                 pointers' placeholders did not settle in {rounds} rounds, so none is answered"
+            );
+            self.report("", MirSpan::Unknown, message);
+        }
         if !self.regions.check_universals {
             return;
         }
@@ -2251,6 +2295,26 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                         .filter(|&it| !self.regions.knows(longer, it)),
                 ),
             }
+            // What a higher-ranked relate's more general side implies of its placeholders.
+            if !failing.is_empty() && !self.regions.placeholder_bounds.is_empty() {
+                match self.binder_assumed(longer) {
+                    Ok(assumed) => failing.retain(|&shorter| {
+                        !assumed.contains(&shorter)
+                            && !self.binder_outlives_assumed(longer, shorter)
+                    }),
+                    // Nothing is assumed: its errors stand, with this one saying why.
+                    Err(BinderUnsettled { rounds, placeholders, held }) => {
+                        let message = text!(
+                            self,
+                            "the bounds a higher-ranked fn pointer's signature implies of its \
+                             placeholders did not settle for the universal region `'{}`: \
+                             {rounds} rounds took {held} of {placeholders} placeholders",
+                            universals[longer].0
+                        );
+                        self.report("", MirSpan::Unknown, message);
+                    }
+                }
+            }
             let placeholder = kind == UniversalKind::Placeholder;
             if failing.is_empty() || in_closure && !placeholder && self.propagate(longer, &failing)
             {
@@ -2258,8 +2322,13 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
             }
             let shorter = failing[0];
             let (shorter_rv, shorter_kind) = universals[shorter];
-            let path =
-                regions::constraint_path(self.regions, self.region_count, longer_rv, shorter_rv);
+            let path = regions::constraint_path_through(
+                self.regions,
+                self.region_count,
+                longer_rv,
+                shorter_rv,
+                |rv| self.values.passes_on(longer_rv, rv),
+            );
             let Some(blamed) = regions::blame(&path) else { continue };
             // A bound a signature's `for<'a>` implies, lost where it is related with a more
             // general signature: rustc's soundness hole rust-lang/rust#25860, refused.
@@ -2357,6 +2426,7 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                 let kind = universals[universal].1;
                 if kind == UniversalKind::FnBody
                     || self.regions.type_outlives_known(test.ty, universal)
+                    || self.binder_type_assumed(test, universal)
                 {
                     continue;
                 }
@@ -2418,6 +2488,112 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                 break;
             }
         }
+    }
+
+    /// The placeholders `longer` outlives by what the more general side of a higher-ranked
+    /// relate implies of them (`Regions::placeholder_bounds`), which every call of the fn
+    /// pointer proves; for those placeholders only, never as a fact of the body. With
+    /// `'r: 'x` assumed, `longer: 'x` holds where `longer` outlives `'r`
+    /// (`Checker::binder_bound_rests`).
+    ///
+    /// The least such set, grown from none: a placeholder enters only on a bound that rests on
+    /// regions `longer` is known to outlive or on placeholders already in. Two placeholders whose
+    /// bounds name each other do not vouch for each other: the nested
+    /// `for<'i> fn(&'i &'o (), &'o &'i ())` implies `'i: 'o` and `'o: 'i`, which say only that
+    /// the two are one lifetime, nothing of `longer`, and taking them as proof turned any
+    /// lifetime into `'static` (rustc refuses that program at the coercion). Each round adds a
+    /// placeholder or ends, so it has one round per placeholder and one more; past that it is
+    /// `BinderUnsettled`.
+    fn binder_assumed(&self, longer: usize) -> Result<FVec<'f, usize>, BinderUnsettled> {
+        let regions = self.regions;
+        let universals = &regions.universals;
+        let frame = self.ctx.frame;
+        let mut candidates: FVec<'f, usize> = Vec::new_in(frame);
+        candidates.extend((0..universals.len()).filter(|&it| {
+            universals[it].1 == UniversalKind::Placeholder
+                && regions.placeholder_bounds.iter().any(|bound| bound.1 == universals[it].0)
+        }));
+        let mut held: FVec<'f, usize> = Vec::new_in(frame);
+        let fuel = candidates.len() + 1;
+        for _ in 0..fuel {
+            let before = held.len();
+            for &placeholder in candidates.iter() {
+                if held.contains(&placeholder) {
+                    continue;
+                }
+                let rv = universals[placeholder].0;
+                if regions
+                    .placeholder_bounds
+                    .iter()
+                    .filter(|bound| bound.1 == rv)
+                    .any(|&(sup, _)| self.binder_bound_rests(longer, sup, placeholder, &held))
+                {
+                    held.push(placeholder);
+                }
+            }
+            if held.len() == before {
+                return Ok(held);
+            }
+        }
+        Err(BinderUnsettled { rounds: fuel, placeholders: candidates.len(), held: held.len() })
+    }
+
+    /// Whether `longer` outlives `sup`, the longer side of a bound `sup: 'x` assumed of the
+    /// placeholder `placeholder` (`'x`), on what is known and the placeholders `held` so far:
+    /// - `sup` is one with a universal region (`'r` itself, or a variable equal to it) that
+    ///   `longer` is known to outlive, or with a placeholder of `held`;
+    /// - or `sup` is a region of the body, one with no universal region, and each universal
+    ///   region it is made to outlive is one of those, or `'x` itself, which `sup: 'x` gives.
+    ///
+    /// A universal region's own requirements are checked where it is the longer one.
+    fn binder_bound_rests(
+        &self,
+        longer: usize,
+        sup: regions::Rv,
+        placeholder: usize,
+        held: &[usize],
+    ) -> bool {
+        let regions = self.regions;
+        let universals = &regions.universals;
+        let rests = |it: usize| match universals[it].1 {
+            UniversalKind::Placeholder => held.contains(&it),
+            _ => regions.knows(longer, it),
+        };
+        let mut members = (0..universals.len()).filter(|&it| {
+            let rv = universals[it].0;
+            rv < self.region_count && self.values.same_component(rv, sup)
+        });
+        match members.next() {
+            Some(first) => rests(first) || members.any(rests),
+            None => self.values.universals_of(sup).all(|it| it == placeholder || rests(it)),
+        }
+    }
+
+    /// Whether the placeholder `longer` outlives `shorter` by what the more general side of a
+    /// higher-ranked relate implies of it: `'x: sub` is assumed and `sub` is made to outlive
+    /// `shorter`, not by way of `'x` itself (`binder_assumed` for the other way).
+    fn binder_outlives_assumed(&self, longer: usize, shorter: usize) -> bool {
+        let regions = self.regions;
+        let (longer_rv, kind) = regions.universals[longer];
+        kind == UniversalKind::Placeholder
+            && regions.placeholder_bounds.iter().filter(|it| it.0 == longer_rv).any(|&(_, sub)| {
+                sub == regions.static_rv
+                    || self.values.universals_of(sub).any(|it| it == shorter)
+                        && !self.values.universals_of(sub).any(|it| it == longer)
+            })
+    }
+
+    /// Whether the type test `test`, of what a higher-ranked relate proves of its less general
+    /// side, holds for `universal` by a type bound the more general side implies of a region
+    /// that is not its placeholder (`Regions::binder_type_bounds`): `T: 'static` of
+    /// `for<'x> fn(&'static T, &'x ())`. Of that relate's type tests only.
+    fn binder_type_assumed(&self, test: &regions::TypeTest<'db>, universal: usize) -> bool {
+        self.regions.dropped_type_bound(test.ty, test.lower, test.span).is_some()
+            && self.regions.binder_type_bounds.iter().any(|&(span, ty, region)| {
+                span == test.span
+                    && ty == test.ty
+                    && self.values.universals_of(region).any(|it| it == universal)
+            })
     }
 
     /// rustc's `try_propagate_universal_region_error`, for every universal region `longer`

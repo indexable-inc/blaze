@@ -193,8 +193,6 @@ crates = ["blaze-engine"]
 [crates.hir-ty-mir]
 "hir_ty_mir::tests::consteval::arbitrary_ints_casts" = { owner = "v2-uint", cause = "panics at crates/hir-ty-mir/src/tests/consteval.rs: Error in evaluating goal: Type inference result contains errors" }
 "hir_ty_mir::tests::consteval::arbitrary_ints_overflow_at_their_width" = { owner = "v2-uint", cause = "panics at crates/hir-ty-mir/src/tests/consteval.rs: assertion `left == right` failed: Bytes differ. In decimal form: actual = -3, expected = 5" }
-"hir_ty_mir::tests::consteval::hir_eval::generated_programs_match" = { owner = "unowned", cause = "panics under hir_ty providers during const eval; tail truncated, likely the same consteval path as the promoted-division test but unverified" }
-"hir_ty_mir::tests::consteval::intrinsics::a_promoted_division_by_minus_one_of_every_width" = { owner = "v2-uint", cause = "i128 negate overflow at transform/asserts.rs:420 `-(1i128 << (value_bits - 1))` (v2-uint's Bound::Min); noted by v2-relocate.md:131" }
 "hir_ty_mir::tests::display_source_code::render_dyn_for_ty" = { owner = "v2-no-fallback-front-ty-next1", cause = "expect-test type dump moved: `dyn Trait + 'static` now prints the elided reference lifetime (ty-next1 01551)" }
 "hir_ty_mir::tests::display_source_code::render_dyn_ty_independent_of_order" = { owner = "v2-no-fallback-front-ty-next1", cause = "expect-test type dump moved: `dyn Trait + 'static` now prints the elided reference lifetime (ty-next1 01551)" }
 "hir_ty_mir::tests::display_source_code::render_dyn_ty_under_enclosing_binder" = { owner = "v2-no-fallback-front-ty-next1", cause = "expect-test type dump moved: `dyn Trait + 'static` now prints the elided reference lifetime (ty-next1 01551)" }

@@ -1,30 +1,34 @@
 // blaze: the one LLVM blaze links (crates/hir-ty-codegen/llvm.json), checked before anything of
 // LLVM is run or linked. vendor/llvm-sys/build.rs includes this file and every LLVM consumer in
-// blaze links LLVM through llvm-sys, so none can skip it; llvm-sys's `pin` test target is this
-// file too. Std only and no `use`, so it includes into any build script.
+// blaze links LLVM through llvm-sys, so none can skip it; llvm-sys's `pin` test target
+// (tests/pin.rs) includes it with its tests, and blaze-codegen-code includes it to key the code
+// identity by the pin. Its tests live in tests/pin.rs, not here: one of them writes and runs an
+// `llvm-config` script, which can fail with ETXTBSY while another test thread forks, so it must
+// stay in a binary of its own and out of every includer's. Std only and no `use`, so it includes
+// into any build script.
 
 /// The one variable naming the prefix: no other `LLVM_SYS_*_PREFIX`, no `PATH`, no Homebrew.
-const PIN_PREFIX: &str = "LLVM_SYS_231_PREFIX";
+pub(crate) const PIN_PREFIX: &str = "LLVM_SYS_231_PREFIX";
 /// What `.github/scripts/llvm.py build` writes into each prefix it makes: its version and commit.
-const PIN_MARKER: &str = "blaze-llvm.json";
+pub(crate) const PIN_MARKER: &str = "blaze-llvm.json";
 /// The pin, from llvm-sys's manifest directory.
-const PIN_JSON: &str = "../../crates/hir-ty-codegen/llvm.json";
+pub(crate) const PIN_JSON: &str = "../../crates/hir-ty-codegen/llvm.json";
 
 /// The LLVM llvm.json pins.
 #[derive(Debug, PartialEq, Eq)]
-struct Pin {
-    version: String,
-    commit: String,
+pub(crate) struct Pin {
+    pub(crate) version: String,
+    pub(crate) commit: String,
 }
 
 impl Pin {
-    fn parse(json: &str) -> Result<Pin, String> {
+    pub(crate) fn parse(json: &str) -> Result<Pin, String> {
         Ok(Pin { version: pin_field(json, "version")?, commit: pin_field(json, "commit")? })
     }
 
     /// The one message that stops the build: what was `found`, the pin and the fix. One line,
     /// as `cargo::error=` takes.
-    fn refusal(&self, found: &str) -> String {
+    pub(crate) fn refusal(&self, found: &str) -> String {
         format!(
             "blaze links only the LLVM crates/hir-ty-codegen/llvm.json pins (LLVM {}, commit {}), \
              and {found}. Build inside `nix develop`, which sets {PIN_PREFIX} to the flake's \
@@ -72,7 +76,7 @@ fn pinned_llvm_config() -> Option<std::path::PathBuf> {
 /// `prefix`'s `llvm-config` when `prefix` is the pinned build (its marker names the pinned
 /// version and commit, and its `llvm-config` says that version), else what was found there.
 /// `exe` is the executable suffix of the host, which runs `llvm-config`.
-fn pin_check(
+pub(crate) fn pin_check(
     pin: &Pin,
     prefix: Option<&std::ffi::OsStr>,
     exe: &str,
@@ -140,7 +144,7 @@ fn pin_said(config: &std::path::Path) -> Result<String, String> {
 
 /// The string value of `"key": "value"` in `json`. The keys asked for are top-level and unique
 /// in llvm.json and the marker, and their values hold no quote or escape.
-fn pin_field(json: &str, key: &str) -> Result<String, String> {
+pub(crate) fn pin_field(json: &str, key: &str) -> Result<String, String> {
     let quoted = format!("\"{key}\"");
     let mut from = 0;
     while let Some(at) = json[from..].find(&quoted) {
@@ -163,120 +167,19 @@ fn pin_field(json: &str, key: &str) -> Result<String, String> {
     Err(format!("no \"{key}\""))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const LLVM_JSON: &str = include_str!("../../crates/hir-ty-codegen/llvm.json");
-
-    fn pin() -> Pin {
-        Pin::parse(LLVM_JSON).expect("llvm.json parses")
-    }
-
-    #[test]
-    fn reads_the_pin() {
-        let pin = pin();
-        assert_eq!(pin.version.split('.').count(), 3, "{pin:?}");
-        assert!(pin.version.split('.').all(|it| it.parse::<u32>().is_ok()), "{pin:?}");
-        assert_eq!(pin.commit.len(), 40, "{pin:?}");
-        assert!(pin.commit.bytes().all(|b| b.is_ascii_hexdigit()), "{pin:?}");
-    }
-
-    #[test]
-    fn field_skips_a_key_used_as_a_value() {
-        let json = r#"{"ref": "version", "version" : "1.2.3", "commit":"abc"}"#;
-        assert_eq!(pin_field(json, "version").as_deref(), Ok("1.2.3"));
-        assert_eq!(pin_field(json, "commit").as_deref(), Ok("abc"));
-        assert_eq!(pin_field(json, "ref").as_deref(), Ok("version"));
-    }
-
-    #[test]
-    fn field_refuses_what_it_cannot_read() {
-        assert_eq!(pin_field("{}", "commit"), Err("no \"commit\"".to_owned()));
-        assert!(pin_field(r#"{"commit": 1}"#, "commit").is_err());
-        assert!(pin_field(r#"{"commit": "ab"#, "commit").is_err());
-        assert!(pin_field(r#"{"commit": "a\"b"}"#, "commit").is_err());
-    }
-
-    #[test]
-    fn refusal_names_the_pin_and_the_fix_on_one_line() {
-        let pin = pin();
-        let message = pin.refusal("something else");
-        for needle in [
-            pin.version.as_str(),
-            pin.commit.as_str(),
-            "something else",
-            "nix develop",
-            PIN_PREFIX,
-            ".github/workflows/llvm.yaml",
-        ] {
-            assert!(message.contains(needle), "{needle} not in {message}");
-        }
-        assert!(!message.contains('\n'), "{message}");
-    }
-
-    #[test]
-    fn refuses_an_unset_prefix() {
-        let unset = format!("{PIN_PREFIX} is unset");
-        assert_eq!(pin_check(&pin(), None, ""), Err(unset.clone()));
-        assert_eq!(pin_check(&pin(), Some(std::ffi::OsStr::new("")), ""), Err(unset));
-    }
-
-    /// One test for every prefix on disk, run in order: a script written and run while another
-    /// test thread forks can fail with ETXTBSY.
-    #[test]
-    fn checks_a_prefix_on_disk() {
-        let pin = pin();
-        let dir = std::env::temp_dir().join(format!("blaze-llvm-pin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("bin")).unwrap();
-        let check = || pin_check(&pin, Some(dir.as_os_str()), "");
-        let marker = |version: &str, commit: &str| {
-            let json = format!(
-                "{{\n  \"version\": \"{version}\",\n  \"repo\": \"r\",\n  \"ref\": \"x\",\n  \
-                 \"commit\": \"{commit}\",\n  \"target\": \"t\"\n}}\n"
-            );
-            std::fs::write(dir.join(PIN_MARKER), json).unwrap();
-        };
-
-        let err = check().unwrap_err();
-        assert!(err.contains("no LLVM with a working bin/llvm-config"), "{err}");
-        assert!(err.contains(PIN_MARKER), "{err}");
-
-        marker(&pin.version, "0000000000000000000000000000000000000000");
-        let err = check().unwrap_err();
-        assert!(err.contains("at commit 0000000000000000000000000000000000000000"), "{err}");
-
-        marker("1.0.0", &pin.commit);
-        let err = check().unwrap_err();
-        assert!(err.contains("LLVM 1.0.0"), "{err}");
-
-        marker(&pin.version, &pin.commit);
-        let err = check().unwrap_err();
-        assert!(err.contains("did not run"), "{err}");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let config = dir.join("bin").join("llvm-config");
-            let says = |version: &str| {
-                std::fs::write(&config, format!("#!/bin/sh\necho {version}\n")).unwrap();
-                std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o755)).unwrap();
-            };
-
-            says(&pin.version);
-            assert_eq!(check(), Ok(config.clone()));
-
-            says("22.1.0");
-            let err = check().unwrap_err();
-            assert!(err.contains("says LLVM 22.1.0"), "{err}");
-
-            says(&pin.version);
-            std::fs::remove_file(dir.join(PIN_MARKER)).unwrap();
-            let err = check().unwrap_err();
-            assert!(err.contains(&format!("a stock LLVM {}", pin.version)), "{err}");
-        }
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
+/// The `sha256` llvm.json pins for `target`'s release, or `None` when it has no release for
+/// it. A target's entry is an object of strings that hold no brace.
+#[cfg_attr(not(test), allow(dead_code, reason = "llvm-sys's build script keys nothing by it; blaze-codegen-code does"))]
+pub(crate) fn pin_sha256(json: &str, target: &str) -> Result<Option<String>, String> {
+    let targets = json.find("\"targets\"").ok_or("no \"targets\"")?;
+    let quoted = format!("\"{target}\"");
+    let Some(at) = json[targets..].find(&quoted) else { return Ok(None) };
+    let rest = json[targets + at + quoted.len()..].trim_start();
+    let entry = rest
+        .strip_prefix(':')
+        .map(str::trim_start)
+        .and_then(|it| it.strip_prefix('{'))
+        .ok_or_else(|| format!("\"{target}\" is not an object"))?;
+    let end = entry.find('}').ok_or_else(|| format!("\"{target}\" has no closing brace"))?;
+    pin_field(&entry[..end], "sha256").map(Some).map_err(|e| format!("\"{target}\": {e}"))
 }

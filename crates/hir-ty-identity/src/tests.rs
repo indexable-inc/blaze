@@ -600,3 +600,136 @@ fn a_vtable_of_a_dropped_temporary_is_no_part_of_a_constant() {
     .into_db();
     step(&db, "f");
 }
+
+/// The associated constant named `name` of the crate's impls: what `f` reads by projection.
+#[track_caller]
+fn impl_const(db: &Db, name: &str) -> hir_def::ConstId {
+    let found: Vec<hir_def::ConstId> = hir_def::test_items::impls(db, fixture::test_crate(db))
+        .into_iter()
+        .flat_map(|imp| imp.impl_items(db).items.to_vec())
+        .filter_map(|(_, item)| match item {
+            hir_def::AssocItemId::ConstId(it)
+                if hir_def::signatures::ConstSignature::of(db, it).name.as_ref().is_some_and(|it| it.as_str() == name) =>
+            {
+                Some(it)
+            }
+            _ => None,
+        })
+        .collect();
+    match found[..] {
+        [one] => one,
+        _ => panic!("{} associated constants named `{name}`", found.len()),
+    }
+}
+
+/// What the code generator reads of the evaluated value of the impl's constant `name`, field by
+/// field, for a test to check two builds differ where it means them to and nowhere else.
+#[derive(Debug, PartialEq, Eq)]
+struct Evaluated {
+    bytes: Vec<u8>,
+    /// Each piece's address, bytes, alignment and the words in it with provenance.
+    pieces: Vec<(usize, Vec<u8>, Option<usize>, Vec<usize>)>,
+    value_pointers: Vec<usize>,
+    /// Each static's memory: where it is, its size.
+    statics: Vec<(usize, usize)>,
+}
+
+fn evaluated(db: &Db, name: &str) -> Evaluated {
+    use hir_ty::db::HirDatabase as _;
+    let id = impl_const(db, name);
+    hir_ty::attach_db(db, || {
+        let value = db.const_eval(id, GenericArgs::empty(), None).unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
+        let map = &value.memory_map;
+        let (pieces, statics) = match map {
+            hir_ty::MemoryMap::Complex(complex) => (
+                (complex.memory.iter())
+                    .map(|(&at, bytes)| (at, bytes.to_vec(), map.align_at(at), map.pointers_in(at..at + bytes.len()).to_vec()))
+                    .collect(),
+                complex.statics.iter().map(|it| (it.start, it.size)).collect(),
+            ),
+            _ => (Vec::new(), Vec::new()),
+        };
+        Evaluated { bytes: value.memory.to_vec(), pieces, value_pointers: map.value_pointers().to_vec(), statics }
+    })
+}
+
+/// A constant that points at one of two statics a body named before it (review C1). The
+/// constant's bytes are equal either way, the one static at one address, and the code generator
+/// relocates its pointer to `A` in one build and to `B` in the other: `f`'s code id must tell
+/// them apart. A static met again used to hash nothing, so it did not.
+#[test]
+fn a_constant_pointing_at_one_of_two_statics_named_before_names_which() {
+    let case = |which: &str| {
+        program(
+            "/src/lib.rs",
+            &format!(
+                "pub static A: u32 = 1;\npub static B: u32 = 2;\n\
+                 pub trait Get {{ const P: &'static u32; }}\npub struct K;\n\
+                 impl Get for K {{ const P: &'static u32 = &{which}; }}\n\
+                 pub fn f() -> u32 {{ let a = &A; let b = &B; *a + *b + *<K as Get>::P }}\n"
+            ),
+        )
+    };
+    let (a, b) = (case("A"), case("B"));
+    assert_eq!(evaluated(&a, "P"), evaluated(&b, "P"), "the constant's value is the same bytes either way");
+    assert_eq!(step(&a, "f"), step(&case("A"), "f"), "built twice");
+    assert_ne!(step(&a, "f"), step(&b, "f"), "which static the constant points at is in `f`'s code id");
+}
+
+/// Two builds of a constant whose value differs only in whether one word is a pointer with
+/// provenance or an equal number (review C2): the code generator relocates the one and emits
+/// the other as it is, so `f`'s code id must differ.
+#[test]
+fn a_word_a_pointer_in_one_build_and_an_equal_number_in_another_is_two_code_ids() {
+    let case = |union: &str| {
+        program(
+            "/src/lib.rs",
+            &format!(
+                "pub static SX: u8 = 5;\npub union U {{ pub p: *const u8, pub n: usize }}\n\
+                 pub trait Get {{ const P: (&'static u8, U); }}\npub struct K;\n\
+                 impl Get for K {{ const P: (&'static u8, U) = (&SX, {union}); }}\n\
+                 pub fn f() {{ let _x = <K as Get>::P; }}\n"
+            ),
+        )
+    };
+    let pointer = case("U { p: &SX as *const u8 }");
+    let before = evaluated(&pointer, "P");
+    let address = usize::from_le_bytes(before.bytes[..8].try_into().expect("a word"));
+    let number = case(&format!("U {{ n: {address:#x} }}"));
+    let after = evaluated(&number, "P");
+    assert_eq!((&before.bytes, &before.pieces, &before.statics), (&after.bytes, &after.pieces, &after.statics));
+    assert_ne!(before.value_pointers, after.value_pointers, "one word has provenance in one build only");
+    assert_eq!(step(&pointer, "f"), step(&case("U { p: &SX as *const u8 }"), "f"), "built twice");
+    assert_ne!(step(&pointer, "f"), step(&number, "f"), "which words are pointers is in `f`'s code id");
+}
+
+/// Two builds of a constant whose one piece of memory differs only in its alignment, at the
+/// same address with the same bytes (review C2): the code generator emits its data object with
+/// that alignment, so `f`'s code id must differ. Six bytes kept first put the piece at an
+/// address that is a multiple of 8 either way.
+#[test]
+fn a_piece_aligned_otherwise_at_the_same_address_is_two_code_ids() {
+    let case = |init: &str| {
+        let ty = "(&'static u8, &'static u8, &'static u8, &'static u8, &'static u8, &'static u8, *const u8)";
+        let value = format!("(&1u8, &2u8, &3u8, &4u8, &5u8, &6u8, {init})");
+        program(
+            "/src/lib.rs",
+            &format!(
+                "pub trait Get {{ const P: {ty}; }}\npub struct K;\n\
+                 impl Get for K {{ const P: {ty} = {value}; }}\n\
+                 pub fn f() {{ let _x = <K as Get>::P; }}\n"
+            ),
+        )
+    };
+    let bytes = case("&[0u8; 8] as *const [u8; 8] as *const u8");
+    let word = case("&0u64 as *const u64 as *const u8");
+    let (before, after) = (evaluated(&bytes, "P"), evaluated(&word, "P"));
+    let without_align = |it: &Evaluated| {
+        let pieces: Vec<_> = it.pieces.iter().map(|(at, bytes, _, pointers)| (*at, bytes.clone(), pointers.clone())).collect();
+        (it.bytes.clone(), pieces, it.value_pointers.clone(), it.statics.clone())
+    };
+    assert_eq!(without_align(&before), without_align(&after), "the values differ in alignment only");
+    assert_ne!(before, after, "one piece's alignment differs");
+    assert_eq!(step(&bytes, "f"), step(&case("&[0u8; 8] as *const [u8; 8] as *const u8"), "f"), "built twice");
+    assert_ne!(step(&bytes, "f"), step(&word, "f"), "a piece's alignment is in `f`'s code id");
+}

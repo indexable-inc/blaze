@@ -1209,7 +1209,7 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
 /// Runs `run` on the scheduler's pool near `near` (on a fast group when it is critical).
 #[allow(clippy::needless_pass_by_value, reason = "posting transfers the run's sole ownership to the pool job")]
 fn post<R: Runner>(ctx: &Ctx<R>, near: Option<u32>, critical: bool, run: Ran<R>) {
-    run.run().spawner.store(crate::sched::spawner(), Ordering::Relaxed);
+    run.run().spawner.store(crate::sched::spawner().spawner, Ordering::Relaxed);
     // SAFETY: the slot's header is its first field (`Run` is `repr(C)`) and runs `run_pooled`;
     // the slot stays in the scheduler's pool, unmoved, until its `Done` is taken, and `run`,
     // moved here, was its one name.
@@ -1226,7 +1226,7 @@ fn post<R: Runner>(ctx: &Ctx<R>, near: Option<u32>, critical: bool, run: Ran<R>)
 unsafe fn run_pooled<R: Runner>(header: NonNull<Header>) {
     let run = Ran(header.cast::<Run<R>>());
     let (ctx, critical) = (run.run().ctx, run.live().critical);
-    crate::sched::job_begins(run.run().spawner.load(Ordering::Relaxed));
+    crate::sched::job_begins(crate::sched::Given { spawner: run.run().spawner.load(Ordering::Relaxed), at: 0 });
     let span = pool::JobSpan::begin(std::any::type_name::<R>());
     let result = catch_unwind(AssertUnwindSafe(|| measured(&ctx.runner, run.live())));
     drop(span);

@@ -7,7 +7,7 @@
 //! same walk lists the body's [`Edge`]s, what it can run beyond its own code, in body order.
 
 use base_db::Db;
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{Blake3Hasher, HashMap, HashSet};
 use blaze_ids::Hasher;
 use blaze_items::{ItemId, interface_hash, item_key, key};
 use blaze_query::db::FromId;
@@ -306,14 +306,18 @@ impl<'a, 'db> Facts<'a, 'db> {
         }
     }
 
-    /// A static: its key, its flags and its value, which a compute step reads: the code the
-    /// value points to is the step's too.
+    /// A static: its key, every time it is met (two values whose bytes are equal can point at
+    /// two statics, and the code generator relocates each to its own), then, the first time,
+    /// its flags and its value, which a compute step reads: the code the value points to is the
+    /// step's too.
     pub(crate) fn static_use(&mut self, id: StaticId) {
-        if !self.seen_statics.insert(id) {
-            return;
-        }
         let db = self.cx.db;
         self.h.update(&[5]).id(&item_key(db, ItemId::Static(id)).0);
+        if !self.seen_statics.insert(id) {
+            self.h.update(&[0]);
+            return;
+        }
+        self.h.update(&[1]);
         let signature = StaticSignature::of(db, id);
         let thread_local = AttrFlags::query(db, id.into()).contains(AttrFlags::THREAD_LOCAL);
         self.h.update(&[signature.flags.bits(), thread_local as u8]);
@@ -349,10 +353,12 @@ impl<'a, 'db> Facts<'a, 'db> {
             }
             MemoryMap::Complex(map) => map,
         };
-        self.h.update(&[2]).update(&(map.memory.iter().len() as u64).to_le_bytes());
-        for (address, bytes) in map.memory.iter() {
-            self.h.update(&(*address as u64).to_le_bytes()).part(bytes);
-        }
+        // Each piece's address, bytes and alignment, where the statics' memory is, and which
+        // words are pointers with provenance: the code generator relocates every such word
+        // (behind a raw pointer or in a union, it alone says a word is a pointer), and emits
+        // each piece with its alignment.
+        self.h.update(&[2]);
+        map.hash_content(&mut Blake3Hasher(&mut self.h));
         self.h.update(&(map.type_ids.len() as u64).to_le_bytes());
         for type_id in &map.type_ids {
             match type_id {
@@ -365,9 +371,9 @@ impl<'a, 'db> Facts<'a, 'db> {
                 }
             }
         }
+        // Which static each range of memory is (`hash_content` has where): named on every use.
         self.h.update(&(map.statics.len() as u64).to_le_bytes());
         for memory in &map.statics {
-            self.h.update(&(memory.start as u64).to_le_bytes()).update(&(memory.size as u64).to_le_bytes());
             self.static_use(memory.id);
         }
         let pointees = map.vtable.tys();
@@ -375,61 +381,69 @@ impl<'a, 'db> Facts<'a, 'db> {
         if pointees.len() == 0 {
             return;
         }
-        // One table holds function pointers and vtables, and a function item's or closure's id
-        // is both its pointer and its vtable (`&index as &dyn Handler` stores `FnDef(index)`,
-        // as `index as fn(_)` does), so every value with a pointee is walked for the `dyn`s
-        // its ids are vtables of.
+        // A word holding one of const eval's ids that the code generator would emit as a number
+        // (no provenance, and no type reaching it says it is one) is refused, as it refuses it,
+        // with its words. Only a value whose table has entries is walked: one with none holds no
+        // id, and any other word the code generator refuses in it (a dangling pointer) is taken
+        // here, the safe way to differ, as a refused value has no code to reuse.
         let walked = VtableWalk::new(self.cx, &value.memory_map).and_then(|mut walk| {
             walk.walk(&value.memory, At { kept: None, raw: false }, 0, ty)?;
             walk.ids_left(&value.memory, ty)?;
-            Ok((walk.found, walk.word))
+            Ok(walk.word)
         });
-        let (found, word) = match walked {
+        let word = match walked {
             Ok(it) => it,
             Err(why) => {
                 let db = self.cx.db;
                 return self.fail(|| format!("uses {}, whose vtables can't be looked for: {why}", holder.describe(db, ty))); // alloc: error path
             }
         };
-        for (index, pointee) in pointees.enumerate() {
+        let held = held_ids(value, map, word);
+        // Each id names its type and, for a vtable, the `dyn` type it is for, as rustc's
+        // `GlobalAlloc::VTable(ty, dyn_ty)`: the code generator emits the vtable of that type for
+        // that `dyn` wherever a word with provenance holds the id, whatever type reaches it.
+        for (index, (pointee, dyn_ty)) in map.vtable.entries().enumerate() {
             let id = VTableMap::FIRST_ID + index;
             let function = matches!(pointee.kind(), TyKind::FnDef(..) | TyKind::Closure(..));
-            if function {
-                // What its pointer runs, used as a pointer or not.
-                self.pointee(pointee);
-            }
-            match found.get(&id) {
-                Some(dyns) => {
-                    self.h.update(&[2]).update(&(dyns.len() as u64).to_le_bytes());
-                    for &dyn_ty in dyns {
-                        self.vtable(pointee, dyn_ty);
-                    }
-                }
-                // A function item or closure no `dyn` names: a function pointer only.
-                // FIXME(comptime): one made a `dyn` in a union of two non-empty fields or a
-                // coroutine's capture is hashed as a pointer only, as its `dyn` is at no place
-                // the walk types; refuse it or find its trait there.
+            match dyn_ty {
+                // What a function pointer runs, used as one or not.
                 None if function => {
-                    self.h.update(&[2]).update(&0u64.to_le_bytes());
+                    self.h.update(&[0]);
+                    self.pointee(pointee);
                 }
-                // An id no word of the value holds: a vtable a temporary of the evaluation made
-                // (const eval keeps its whole table), which nothing can emit.
-                None if !holds_word(value, map, word, id) => {
+                // An id no pointer of the value holds: a vtable a temporary of the evaluation
+                // made (const eval keeps its whole table), which nothing can emit.
+                _ if held.binary_search(&id).is_err() => {
                     self.h.update(&[3]);
                 }
-                // A vtable a word of the value holds at no place whose type names its trait:
-                // one in a union of two non-empty fields, a coroutine's capture, an unsafe binder or a `DynMetadata` of
-                // no `dyn`. Its trait is not known, so the code its slots run
-                // is not either (rule 3).
+                Some(dyn_ty) => {
+                    let dyn_ty = match self.cx.deeply_normalize(dyn_ty) {
+                        Ok(it) => crate::instance::erased(self.cx.interner, it),
+                        Err(why) => {
+                            let db = self.cx.db;
+                            return self.fail(|| {
+                                // alloc: error path
+                                format!(
+                                    "uses {} holding a vtable of `{pointee:?}` for `{dyn_ty:?}`, which does not normalize: {why}",
+                                    holder.describe(db, ty)
+                                )
+                            });
+                        }
+                    };
+                    self.h.update(&[2]);
+                    self.vtable(pointee, dyn_ty);
+                }
+                // A pointer holding the id of a type that is no function and names no trait,
+                // which the code generator refuses too.
                 None => {
                     let db = self.cx.db;
-                    self.fail(|| {
+                    return self.fail(|| {
                         // alloc: error path
                         format!(
-                            "uses {} holding a vtable of `{pointee:?}` at no place whose type names its trait",
+                            "uses {} holding const eval's id of `{pointee:?}`, which is no function and names no trait of a vtable",
                             holder.describe(db, ty)
                         )
-                    })
+                    });
                 }
             }
         }
@@ -729,14 +743,24 @@ impl<'db> Holder<'db> {
     }
 }
 
-/// Whether `id` is a word, at any offset, of the value's own bytes or of a piece of memory it
-/// points to: where the code generator could find it to emit a vtable.
-fn holds_word(value: &AllocationData<'_>, map: &ComplexMemoryMap<'_>, word: usize, id: usize) -> bool {
-    let full = id.to_le_bytes();
-    let bytes = &full[..word];
-    std::iter::once(&value.memory[..])
-        .chain(map.memory.iter().map(|(_, it)| &it[..]))
-        .any(|memory| memory.windows(word).any(|it| it == bytes))
+/// What every word with provenance of the value's own bytes and of the pieces of memory it
+/// points to holds that may be one of const eval's ids, sorted, once each: where the code
+/// generator, which relocates every such word, emits an id. One pass over the words, so a table
+/// of many vtables costs a search each, not a pass each.
+fn held_ids(value: &AllocationData<'_>, map: &ComplexMemoryMap<'_>, word: usize) -> Vec<usize> {
+    let read = |memory: &[u8], at: usize| {
+        let bytes = memory.get(at..at + word)?;
+        Some(bytes.iter().rev().fold(0, |value, &byte| value << 8 | usize::from(byte)))
+    };
+    let in_value = value.memory_map.value_pointers().iter().filter_map(|&at| read(&value.memory, at));
+    let in_memory = map.memory.iter().flat_map(|(&start, memory)| {
+        value.memory_map.pointers_in(start..start + memory.len()).iter().filter_map(move |&addr| read(memory, addr - start))
+    });
+    // alloc: one value's held ids, dropped with its facts
+    let mut ids: Vec<usize> = in_value.chain(in_memory).filter(|&it| it >= VTableMap::FIRST_ID).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// The most places [`VtableWalk`] looks at in one value: past it the walk stops with an error,
@@ -807,11 +831,9 @@ fn memory_holding<'m>(map: &'m MemoryMap<'_>, addr: usize) -> Option<(usize, &'m
     })
 }
 
-/// The `dyn` each vtable in a constant's value is made for, found by walking the value with its
-/// type: a vtable is the metadata of a pointer to `dyn`, and is for the `dyn` that pointer's type
-/// names at its own place, as the code generator's `relocate` (hir-ty-codegen) pairs them. The
-/// constant's own type says nothing of a `dyn` behind another `dyn` (a `&dyn Debug` holding a
-/// `W(&'static dyn Display)`), and const eval's table of vtables names each type only.
+/// The places the code generator's `relocate` (hir-ty-codegen) walks a constant's value by type,
+/// for [`VtableWalk::ids_left`]. Which `dyn` a vtable is for is not found here: const eval's id
+/// names it (`MemoryMap::vtable_of`), as the code generator reads it.
 ///
 /// It follows what `relocate` follows, under its rules: references and raw pointers, each place
 /// a pointer reaches walked once as the type it reaches it as (a raw one's pointee only where its
@@ -822,22 +844,16 @@ fn memory_holding<'m>(map: &'m MemoryMap<'_>, addr: usize) -> Option<(usize, &'m
 /// field of a union whose other fields are empty, and `DynMetadata`. Behind a raw pointer or in a
 /// union, where the type may be a cast's, a pointer without provenance is a number and a vtable
 /// with it no vtable. A union of two or more non-empty fields, a coroutine's captures and memory
-/// a static owns are not walked (a static is its own facts). A vtable found for two traits is
-/// hashed once for each.
+/// a static owns are not walked (a static is its own facts).
 ///
 /// After the walk, [`VtableWalk::ids_left`] refuses what the code generator's `refuse_ids_left`
-/// refuses: a word holding a vtable's or function's id that a type reaching it does not say is
-/// one. A vtable left unpaired is refused by the caller, unless no word of the value holds it (a
-/// dead temporary's) or it is a function item's or closure's, which is hashed as a function
-/// pointer only (the FIXME in `allocation`).
+/// refuses: a word holding a vtable's or function's id without provenance that a type reaching
+/// it does not say is one.
 struct VtableWalk<'a, 'db> {
     cx: &'a Cx<'db>,
     map: &'a MemoryMap<'db>,
     dl: &'db TargetDataLayout,
     word: usize,
-    /// Each vtable id's `dyn` types, deeply normalized with their free regions erased, in the
-    /// order the walk first met them, which the value and its type fix.
-    found: HashMap<usize, SmallVec<[Ty<'db>; 1]>, Global>,
     /// The places walked behind a pointer, by the start of the memory they are in. A value that
     /// points at one place many times (a DAG of references) is walked there once.
     reached: HashSet<(usize, Reach<'db>), Global>,
@@ -847,6 +863,12 @@ struct VtableWalk<'a, 'db> {
     /// Whether a value of each type can hold a pointer at all.
     pointers: HashMap<Ty<'db>, bool, Global>,
     places: u32,
+    /// The words with provenance a walk by type relocated where the walk by provenance would
+    /// not see them as it does: references to nothing, as the code generator's `handled`.
+    relocated: Vec<PointerAt>,
+    /// Memory an empty slice with provenance points into, which the code generator reaches by
+    /// that provenance only, by its start.
+    by_provenance: Vec<(usize, &'a [u8])>,
 }
 
 impl<'a, 'db> VtableWalk<'a, 'db> {
@@ -860,14 +882,14 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
             map,
             dl,
             word: dl.pointer_size().bytes_usize(),
-            // alloc: one value's vtables, dropped with the walk
-            found: HashMap::new_in(Global),
             // alloc: one value's places behind pointers, dropped with the walk
             reached: HashSet::new_in(Global),
             reaches: Vec::new(), // alloc: one value's places behind pointers, dropped with the walk
             // alloc: one entry per distinct type in the value, dropped with the walk
             pointers: HashMap::new_in(Global),
             places: 0,
+            relocated: Vec::new(), // alloc: one value's references to nothing, almost always none
+            by_provenance: Vec::new(), // alloc: one value's empty slices into kept memory, almost always none
         })
     }
 
@@ -924,13 +946,24 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         match ty.kind() {
             TyKind::Pat(base, _) => self.walk(bytes, at, offset, base)?,
             TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => self.pointer(bytes, at, offset, ty, pointee)?,
+            // `_vtable_ptr`, its first field, is a vtable whose id names its `dyn`, checked as the
+            // code generator's `DynMetadata` arm checks it: no pointee.
             TyKind::Adt(def, args) if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) => {
-                // `_vtable_ptr`, its first field.
                 let place = offset + self.layout(ty)?.fields.offset(0).bytes_usize();
-                let id = self.word_at(bytes, place, ty)?;
                 let dyn_ty = self.cx.normalize(args.type_at(0));
-                if matches!(dyn_ty.kind(), TyKind::Dynamic(..)) && self.map.vtable_ty(id).is_ok() {
-                    self.pair(id, dyn_ty)?;
+                let dyn_ty = matches!(dyn_ty.kind(), TyKind::Dynamic(..)).then_some(dyn_ty);
+                self.vtable_word(bytes, at, place, ty, dyn_ty)?;
+            }
+            // A function pointer is const eval's id of a function, or null; one that is neither,
+            // where a type can be trusted, the code generator refuses.
+            TyKind::FnPtr(..) => {
+                let id = self.word_at(bytes, offset, ty)?;
+                if !at.raw && id != 0 && self.map.function_of(id).is_none() {
+                    return Err(format!(
+                        // alloc: error path
+                        "a `{ty:?}` in it (at {offset} of {:x?}) whose value is no function const eval made",
+                        at.kept
+                    ));
                 }
             }
             TyKind::Adt(def, args) => {
@@ -1028,25 +1061,21 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         // `relocate_pointer` finds it: a `&Wrap<dyn Handler>` carries the vtable of the
         // concrete type at its tail for `dyn Handler`.
         let tail = hir_ty::layout::struct_tail_erasing_lifetimes(self.cx.db, pointee, |it| self.cx.normalize(it));
-        let wide = matches!(tail.kind(), TyKind::Str | TyKind::Slice(_) | TyKind::Dynamic(..));
         let mut concrete = None;
         if matches!(tail.kind(), TyKind::Dynamic(..)) {
-            // Behind a raw pointer, a metadata word with provenance (a pointer, a function) is
-            // no vtable.
-            if at.raw && self.tracks_provenance() && self.provenance(at.word(offset + self.word)) {
-                return Ok(());
-            }
-            let id = self.word_at(bytes, offset + self.word, ty)?;
-            // A raw pointer's metadata can be any id (a dangling `*const dyn Tr`).
-            let Ok(of) = self.map.vtable_ty(id) else { return Ok(()) };
-            self.pair(id, tail)?;
+            // The metadata is a vtable const eval made, its id with provenance, as the code
+            // generator's `vtable_word` takes it; else the pointer is not followed behind a raw
+            // pointer (it is a number there), and refused elsewhere, as the code generator
+            // refuses it.
+            let Some(of) = self.vtable_word(bytes, at, offset + self.word, ty, Some(tail))? else { return Ok(()) };
             concrete = Some(of);
-        } else if raw
-            && !wide
-            && provenance
-            && self.map.vtable_ty(addr).is_ok_and(|it| matches!(it.kind(), TyKind::FnDef(..) | TyKind::Closure(..)))
-        {
-            // A function cast to a thin raw pointer keeps its id.
+        }
+        // A raw pointer whose provenance is a function or a vtable keeps const eval's id of it (a
+        // function cast to a pointer, a `&dyn`'s metadata transmuted to a `*const ()`), which the
+        // code generator's `relocate_pointer` relocates to that function or vtable, as rustc keeps
+        // a raw pointer to either in a constant's value. What the id names is hashed by
+        // `Facts::allocation`; a vtable for no `dyn` type is refused by `ids_left`.
+        if raw && provenance && (self.map.function_of(addr).is_some() || self.map.vtable_of(addr).is_some()) {
             return Ok(());
         }
         if self.map.static_at(addr).is_some() {
@@ -1062,12 +1091,42 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
             _ => None,
         };
         let holding = if raw { memory_holding(self.map, addr) } else { self.map.memory_at(addr) };
-        let Some((start, memory)) = holding else { return Ok(()) };
-        // A reference to nothing (no bytes, or an empty slice) is walked by no type: the code
-        // generator makes it its alignment, or points it into the memory by provenance.
-        if !raw && (memory.is_empty() || (matches!(walked.kind(), TyKind::Str | TyKind::Slice(_)) && len == Some(0))) {
+        // A reference to nothing (no bytes, an empty slice, or a value of no size const eval
+        // kept no memory for) is walked by no type: the code generator points an empty slice
+        // with provenance into the memory it is in, which only that provenance reaches, and
+        // makes any other its alignment, which its walk by provenance leaves alone.
+        let empty = match holding {
+            _ if raw => false,
+            Some((_, memory)) if memory.is_empty() => true,
+            _ if matches!(walked.kind(), TyKind::Str | TyKind::Slice(_)) => len == Some(0),
+            Some(_) => false,
+            None => self.layout(walked).is_ok_and(|it| it.is_sized() && it.size.bytes() == 0),
+        };
+        if empty {
+            self.relocated.push(at.word(offset));
+            if provenance
+                && self.tracks_provenance()
+                && let Some((start, memory)) = self.map.kept_around(addr)
+                && !memory.is_empty()
+            {
+                self.by_provenance.push((start, memory));
+            }
             return Ok(());
         }
+        let Some((start, memory)) = holding else {
+            // A pointer with provenance to memory const eval did not keep is a dangling one,
+            // which the code generator refuses, as rustc refuses it in a constant's value: also a
+            // reference holding a function's or vtable's id (a raw pointer's is taken above), as
+            // `relocate_pointer` refuses it. A static's memory is returned for above.
+            if provenance && self.tracks_provenance() {
+                return Err(format!(
+                    // alloc: error path
+                    "a `{ty:?}` in it (at {addr:#x}) points to memory const eval did not keep: rustc refuses a \
+                     dangling pointer in a constant's value"
+                ));
+            }
+            return Ok(());
+        };
         let reach = Reach {
             ty: walked,
             pointee,
@@ -1083,6 +1142,53 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         }
         self.reaches.push((start, memory, reach));
         self.reach(start, memory, reach)
+    }
+
+    /// The concrete type of the vtable whose id is the word at `place` of `bytes`, the metadata
+    /// of a `ty`, a pointer to `dyn_ty` or a `DynMetadata` of it (`None`: of no `dyn`), as the
+    /// code generator's `vtable_word` reads it, refusing what it refuses with its words: where a
+    /// type can be trusted (not behind a raw pointer or in a union), a word that is no vtable
+    /// const eval made with provenance, and a vtable of another trait than the type's (by the
+    /// full trait ref, `hir_ty::mir::same_vtable_trait`, the code generator's rule), as
+    /// rustc's `wrong trait in wide pointer vtable`. Behind a raw pointer such a word is `None`,
+    /// left to [`VtableWalk::ids_left`].
+    fn vtable_word(
+        &self,
+        bytes: &[u8],
+        at: At,
+        place: usize,
+        ty: Ty<'db>,
+        dyn_ty: Option<Ty<'db>>,
+    ) -> Result<Option<Ty<'db>>, String> {
+        let id = self.word_at(bytes, place, ty).ok();
+        let provenance = self.provenance(at.word(place));
+        let entry = id.and_then(|id| self.map.vtable_of(id)).filter(|_| provenance);
+        let Some((concrete, of)) = entry else {
+            if at.raw {
+                return Ok(None);
+            }
+            let word = match id.map(|id| self.map.vtable_ty(id)) {
+                Some(Ok(_)) if !provenance => "an id with no provenance, a vtable made a number",
+                Some(Ok(_)) => "the id of a function",
+                _ => "no id const eval gave",
+            };
+            return Err(format!(
+                // alloc: error path
+                "a `{ty:?}` in it whose metadata (at {place} of {:x?}) is no vtable const eval made: its word is {word}",
+                at.kept
+            ));
+        };
+        if let Some(dyn_ty) = dyn_ty
+            && !at.raw
+            && !hir_ty::mir::same_vtable_trait(self.cx.interner, of, dyn_ty)
+        {
+            return Err(format!(
+                // alloc: error path
+                "a `{ty:?}` in it holds the vtable of `{concrete:?}` for `{of:?}`, where its type says `{dyn_ty:?}`: \
+                 rustc refuses a vtable of another trait in a constant's value"
+            ));
+        }
+        Ok(Some(concrete))
     }
 
     /// The memory at `start` as `reach` walks it, as the code generator's `walk_allocation`
@@ -1198,42 +1304,94 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         Ok(place.map(|(offset, _)| (offset, layout.size.bytes_usize())))
     }
 
-    /// `dyn_ty` is a trait the vtable `id` is for. Kept once per `dyn`, its lifetimes aside: two
-    /// spellings of one `dyn` (`dyn Debug + 'static`, `dyn Debug + '_`) are one vtable.
-    fn pair(&mut self, id: usize, dyn_ty: Ty<'db>) -> Result<(), String> {
-        let normalized = self
-            .cx
-            .deeply_normalize(dyn_ty)
-            .map_err(|why| format!("`{dyn_ty:?}` does not normalize: {why}"))?; // alloc: error path
-        let dyn_ty = crate::instance::erased(self.cx.interner, normalized);
-        let dyns = self.found.entry(id).or_default();
-        if !dyns.contains(&dyn_ty) {
-            dyns.push(dyn_ty);
-        }
-        Ok(())
-    }
-
     /// Refuses a word left equal to one of const eval's ids of a function or a vtable, as the
     /// code generator's `refuse_ids_left` refuses it: a word without provenance in the value's
     /// bytes, or in memory a pointer reaches, that the walk by type there (the value's own type,
     /// or each type a pointer reaches the memory as) does not relocate, and that no type of that
     /// memory says is a number. It is a vtable behind a pointer cast to another type (`&&dyn Tr
-    /// as *const _ as *const u8`), or one in a union of two non-empty fields: const eval's ids
-    /// name its type only, so its trait, and the code its slots run, is not known, and the code
-    /// generator stops there too. Memory that only a word's provenance reaches is not looked at:
-    /// a vtable in it is paired at no place, which the caller refuses.
+    /// as *const _ as *const u8`), one in a union of two non-empty fields, or a number equal to
+    /// an id: the code generator would emit it as a number, so it stops there.
+    ///
+    /// Memory only a word's provenance reaches is looked at too, as the code generator's walk by
+    /// provenance (`relocate_by_provenance`) reaches it from each word with provenance of the
+    /// value and of the memory reached: no type says anything of it, so every such word in it is
+    /// refused. On the way, a word with provenance pointing at no memory const eval kept (a
+    /// dangling pointer) and a vtable for what is no `dyn` type are refused, as the code
+    /// generator refuses them.
     fn ids_left(&mut self, value: &[u8], ty: Ty<'db>) -> Result<(), String> {
         if !self.tracks_provenance() {
             return Ok(());
         }
+        let map = self.map;
         let own = Reach { ty, pointee: ty, at: 0, raw: false, len: None, tail: None };
         let reaches = std::mem::take(&mut self.reaches);
         let mut groups: Vec<(Option<usize>, &[u8], SmallVec<[Reach<'db>; 2]>)> = Vec::new(); // alloc: the memories a value's pointers reach, once per value with a vtable
         groups.push((None, value, SmallVec::from_slice(&[own])));
+        // Each group's index by the start of its memory, and the words a walk by type relocated,
+        // so a value of many pieces and pointers costs a lookup per word, not a scan.
+        let mut group_at: HashMap<usize, usize, Global> = HashMap::new_in(Global); // alloc: one value's groups by start, dropped with the walk
+        let mut relocated: HashSet<PointerAt, Global> = HashSet::new_in(Global); // alloc: one value's references to nothing, almost always none
+        for &word in &self.relocated {
+            relocated.insert(word);
+        }
         for &(start, memory, reach) in &reaches {
-            match groups.iter_mut().find(|it| it.0 == Some(start)) {
-                Some(group) => group.2.push(reach),
-                None => groups.push((Some(start), memory, SmallVec::from_slice(&[reach]))),
+            match group_at.get(&start) {
+                Some(&index) => groups[index].2.push(reach),
+                None => {
+                    group_at.insert(start, groups.len());
+                    groups.push((Some(start), memory, SmallVec::from_slice(&[reach])));
+                }
+            }
+        }
+        for &(start, memory) in &self.by_provenance {
+            if !group_at.contains_key(&start) {
+                group_at.insert(start, groups.len());
+                groups.push((Some(start), memory, SmallVec::new()));
+            }
+        }
+        // Each memory is a group once, so this ends after at most one look at each.
+        let mut next = 0;
+        while let Some(&(kept, memory, _)) = groups.get(next) {
+            next += 1;
+            let pointers = match kept {
+                Some(start) => map.pointers_in(start..start + memory.len()),
+                None => map.value_pointers(),
+            };
+            for &pointer in pointers {
+                let x = pointer - kept.unwrap_or(0);
+                if relocated.contains(&At { kept, raw: false }.word(x)) {
+                    continue;
+                }
+                let Ok(addr) = self.word_at(memory, x, ty) else { continue };
+                if let Some((concrete, dyn_ty)) = map.vtable_of(addr) {
+                    if !matches!(dyn_ty.kind(), TyKind::Dynamic(..)) {
+                        return Err(format!(
+                            // alloc: error path
+                            "the vtable of `{concrete:?}` in its memory (at {x} of {kept:x?}) is for `{dyn_ty:?}`, \
+                             which is no `dyn` type"
+                        ));
+                    }
+                    continue;
+                }
+                // A function's id, or another type's, which `Facts::allocation` refuses; a static.
+                if map.vtable_ty(addr).is_ok() || map.static_at(addr).is_some() {
+                    continue;
+                }
+                match memory_holding(map, addr) {
+                    Some((start, piece)) => {
+                        if !group_at.contains_key(&start) {
+                            group_at.insert(start, groups.len());
+                            groups.push((Some(start), piece, SmallVec::new()));
+                        }
+                    }
+                    None => {
+                        return Err(format!(
+                            // alloc: error path
+                            "a pointer in it (at {x} of {kept:x?}) to memory const eval did not keep ({addr:#x}): rustc \
+                             refuses a dangling pointer in a constant's value"
+                        ));
+                    }
+                }
             }
         }
         for (kept, memory, of) in &groups {
@@ -1245,25 +1403,36 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
             // alloc: the words to look at, almost always none
             let candidates: SmallVec<[usize; 4]> = candidates.collect();
             for x in candidates {
-                for &reach in of {
-                    if self.leaf_reach(*kept, memory, reach, x)? == Leaf::Word(x) || self.number(*kept, memory, of, x)? {
-                        continue;
-                    }
-                    let id = self.word_at(memory, x, reach.ty)?;
-                    let pointee = self.map.vtable_ty(id).map_err(|error| format!("{error:?}"))?; // alloc: error path
-                    let place = match kept {
-                        Some(start) => format!("the memory const eval kept at {start:#x}, reached as `{:?}`", reach.ty), // alloc: error path
-                        None => format!("its value, of `{ty:?}`"), // alloc: error path
-                    };
-                    let behind = if reach.raw { " behind a raw pointer" } else { "" };
-                    return Err(format!(
-                        // alloc: error path
-                        "the word at {x} of {place}{behind} is const eval's id of `{pointee:?}` (a function or a \
-                         vtable), which no type there says is a pointer: a vtable behind a pointer cast to \
-                         another type (`&&dyn Tr as *const _ as *const u8`) needs const eval's vtable ids \
-                         to name the trait, as the code generator says"
-                    ));
+                if self.number(*kept, memory, of, x)? {
+                    continue;
                 }
+                let mut unrelocated = None;
+                for &reach in of {
+                    if self.leaf_reach(*kept, memory, reach, x)? != Leaf::Word(x) {
+                        unrelocated = Some(reach);
+                        break;
+                    }
+                }
+                if unrelocated.is_none() && !of.is_empty() {
+                    continue;
+                }
+                let id = self.word_at(memory, x, ty)?;
+                let pointee = self.map.vtable_ty(id).map_err(|error| format!("{error:?}"))?; // alloc: error path
+                let place = match (kept, unrelocated) {
+                    (Some(start), Some(reach)) => {
+                        format!("the memory const eval kept at {start:#x}, reached as `{:?}`", reach.ty) // alloc: error path
+                    }
+                    (Some(start), None) => format!("the memory const eval kept at {start:#x}, which only provenance reaches"), // alloc: error path
+                    (None, _) => format!("its value, of `{ty:?}`"), // alloc: error path
+                };
+                let behind = if unrelocated.is_some_and(|it| it.raw) { " behind a raw pointer" } else { "" };
+                return Err(format!(
+                    // alloc: error path
+                    "the word at {x} of {place}{behind} is const eval's id of `{pointee:?}` (a function or a \
+                     vtable), which no type there says is a pointer: it has no provenance, so const eval did not \
+                     make it a pointer: a number equal to an id, or a function or vtable pointer made a \
+                     number, as the code generator says"
+                ));
             }
         }
         Ok(())
@@ -1403,29 +1572,22 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                     let tail =
                         hir_ty::layout::struct_tail_erasing_lifetimes(db, pointee, |it| self.cx.normalize(it));
                     match tail.kind() {
-                        TyKind::Dynamic(..) => {
-                            let cast = at.raw && self.tracks_provenance() && self.provenance(at.word(meta));
-                            let id = self.word_at(bytes, meta, ty)?;
-                            if !cast && self.map.vtable_ty(id).is_ok() { Leaf::Word(meta) } else { Leaf::None }
-                        }
+                        // The code generator relocates a vtable word by its provenance only.
+                        TyKind::Dynamic(..) => self.vtable_leaf(bytes, at, meta, ty)?,
                         TyKind::Str | TyKind::Slice(_) if !at.raw => Leaf::Number(meta, meta + word),
                         _ => Leaf::None,
                     }
                 }
             }
+            // A function's id, as the code generator's `function_of` takes it: also without
+            // provenance where a type can be trusted.
             TyKind::FnPtr(..) if in_word(base) => {
-                let id = self.word_at(bytes, base, ty)?;
-                let function =
-                    self.map.vtable_ty(id).is_ok_and(|it| matches!(it.kind(), TyKind::FnDef(..) | TyKind::Closure(..)));
+                let function = self.map.function_of(self.word_at(bytes, base, ty)?).is_some();
                 if function && (!at.raw || self.provenance(at.word(base))) { Leaf::Word(base) } else { Leaf::None }
             }
-            TyKind::Adt(def, args) if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) => {
+            TyKind::Adt(def, _) if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) => {
                 let place = base + self.layout(ty)?.fields.offset(0).bytes_usize();
-                let dyn_ty = self.cx.normalize(args.type_at(0));
-                let paired = in_word(place)
-                    && matches!(dyn_ty.kind(), TyKind::Dynamic(..))
-                    && self.map.vtable_ty(self.word_at(bytes, place, ty)?).is_ok();
-                if paired { Leaf::Word(place) } else { Leaf::None }
+                if in_word(place) { self.vtable_leaf(bytes, at, place, ty)? } else { Leaf::None }
             }
             // A `TypeId`'s words hold const eval's id of its type, which the code generator
             // writes rustc's hash over.
@@ -1508,6 +1670,17 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         Ok(leaf)
     }
 
+    /// What a vtable word (a `dyn` pointer's metadata, a `DynMetadata`'s first field) at `place`
+    /// is: one the code generator relocates, a vtable const eval made with its provenance, or
+    /// else none. Without provenance, where a type can be trusted, [`VtableWalk::vtable_word`]
+    /// refused it already, and behind a raw pointer [`VtableWalk::ids_left`] refuses it, as the
+    /// code generator's `refuse_ids_left` does.
+    fn vtable_leaf(&self, bytes: &[u8], at: At, place: usize, ty: Ty<'db>) -> Result<Leaf, String> {
+        let id = self.word_at(bytes, place, ty)?;
+        let vtable = self.provenance(at.word(place)) && self.map.vtable_of(id).is_some();
+        Ok(if vtable { Leaf::Word(place) } else { Leaf::None })
+    }
+
     /// Whether a value of `ty`, normalized at its top, can hold a pointer, and so a vtable. A
     /// type met again while it is being looked at (only an ill-formed one, as a type that holds
     /// itself without a pointer has no size) counts as holding one, so the walk looks.
@@ -1524,7 +1697,7 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
     fn holds_pointer_level(&mut self, ty: Ty<'db>) -> bool {
         let (db, lang) = (self.cx.db, self.cx.interner.lang_items());
         match ty.kind() {
-            TyKind::Ref(..) | TyKind::RawPtr(..) => true,
+            TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(..) => true,
             TyKind::Adt(def, _) if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) => true,
             TyKind::Adt(def, args) => variants(db, def.def_id()).into_iter().any(|variant| {
                 db.field_types(variant).iter().any(|(_, field)| {

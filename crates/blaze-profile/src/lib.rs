@@ -287,10 +287,27 @@ fn carry_with_fiber_jobs() {
         fiber::carry(fiber::Carried { take: flight::take_open, put: flight::put_open });
         _ = fiber::observe(observed);
         _ = fiber::observe_idle(idled);
-        _ = fiber::observe_spawner(flight::running_job);
+        _ = fiber::observe_spawner(given);
         _ = pump::span_waits(pump::WaitSpans { begin: wait_began, end: wait_ended, held: hold_began });
-        _ = pool::span_jobs(pool::JobSpans { began: job_began, ended: job_ended });
+        _ = pool::span_jobs(pool::JobSpans { began: job_began, ended: job_ended, driving: worker_began, drove: worker_ended });
     });
+}
+
+/// The job running on this thread and the time, as a pool job is given to the pool: its
+/// spawner, and the start of its wait for a core.
+fn given() -> blaze_graph::sched::Given {
+    blaze_graph::sched::Given { spawner: flight::running_job(), at: clock::ticks() }
+}
+
+/// Opens and enters the span of a pool worker's own work between jobs ([`span::Worker`]),
+/// `doing` what it does (`search`, `idle`, `switch`): its id for [`worker_ended`].
+fn worker_began(doing: &'static str) -> u64 {
+    span::open_raw(span::Worker { doing: span::Name::kept(doing) })
+}
+
+/// Closes the span [`worker_began`] opened, on the thread that opened it.
+fn worker_ended(span: u64) {
+    span::close_raw(span);
 }
 
 /// Opens and enters the span of a job of `kind` beginning on this thread ([`span::Job`]), named
@@ -364,7 +381,7 @@ fn observed(switch: blaze_graph::sched::Switch) {
     use blaze_graph::sched::{SwitchEvent, Wait};
     use flight::{Switched, WaitedOn};
     let (event, waited) = match switch.event {
-        SwitchEvent::Began { spawner } => return flight::job_begins(spawner),
+        SwitchEvent::Began { given } => return flight::job_begins(given.spawner, given.at),
         SwitchEvent::Started => (Switched::Started, None),
         SwitchEvent::Ready => (Switched::Ready, None),
         SwitchEvent::Resumed => (Switched::Resumed, None),

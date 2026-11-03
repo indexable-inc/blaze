@@ -106,12 +106,18 @@ pub struct Spec {
     /// Directories it sees as they are and may change, its changes seen by it alone and gone
     /// when it ends.
     pub overlays: Vec<PathBuf>,
-    /// Directories it writes for real.
+    /// Directories it writes for real. On Linux one may be a regular file with one link, which
+    /// it writes and nothing beside; macOS makes each a directory and refuses a file that is
+    /// there.
     #[serde(default)]
     pub writable: Vec<PathBuf>,
     /// Directories it sees as they are and may not write, though they are below one of the
     /// sandbox's empty directories (a workspace or target directory under `/tmp`): the rest of
-    /// the machine is seen read-only anyway.
+    /// the machine is seen read-only anyway. One may be a regular file (the launcher a build
+    /// script runs through) or a Unix socket it connects to (a test's fork server's); on Linux
+    /// it is seen alone, nothing beside it in its directory is, and a pipe or a device is
+    /// refused. A file below a temporary directory on macOS is passed through as it is, but
+    /// its directory lists it as an empty directory.
     #[serde(default)]
     pub readable: Vec<PathBuf>,
     /// The file written as it ends with what it reached outside ([`Line`]), or nothing.

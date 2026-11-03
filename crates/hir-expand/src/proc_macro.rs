@@ -232,7 +232,7 @@ impl ProcMacros {
     /// macros' expanders, so one resolved before its list was given must resolve again, and a
     /// set that is not noted leaves it naming none.
     pub fn give(db: &mut Db, given: impl IntoIterator<Item = (Crate, ProcMacroLoadResult)>) {
-        db.batch(|db| {
+        db.batch(base_db::Trigger::named("ProcMacros::give"), |db| {
             let all = ProcMacros::try_get(db).unwrap_or_else(|| ProcMacros::new(db, Default::default()));
             let mut by_crate = all.by_crate(db).clone();
             for (krate, macros) in given {

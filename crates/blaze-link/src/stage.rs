@@ -1747,8 +1747,34 @@ impl<'a> Stage<'a> {
         }
     }
 
+    /// Removes the GOT cells and PLT stubs of what this stage removed and did not put back.
+    /// A cell is the linker's own, made for the fixups that reach its target through it
+    /// ([`Stage::needs`]), and owned by no function or unit: nothing else removes it, so the
+    /// cell of a removed function (the old key of a function filled anew) would outlive it
+    /// and keep referring to it. What still reaches the target itself, through a cell or
+    /// directly, is [`Stage::dangling`]'s to name.
+    pub fn cells_of_removed(&mut self) {
+        let mut cells: FrameVec<'a, PieceId> = Vec::new_in(self.arena);
+        for id in self.removed.iter() {
+            let piece = self.new.any(*id).expect("a removed piece");
+            for sym in std::iter::once(piece.sym).chain(piece.defines().iter().copied()) {
+                if self.new.home(sym).is_some() || !matches!(self.new.def(sym), Def::None) {
+                    continue;
+                }
+                for user in self.new.refs(sym).filter_map(|it| self.new.piece(it)) {
+                    if matches!(user.what(), What::Got { target, .. } | What::Plt { target } if target == sym) {
+                        cells.push(user.id);
+                    }
+                }
+            }
+        }
+        for id in cells {
+            self.unmake(id);
+        }
+    }
+
     /// Fails when a removed function or static is still referred to, directly or through
-    /// its slot.
+    /// its slot, naming it (a function by its path) and what refers to it.
     pub fn dangling(&self) -> Result<(), LinkError> {
         for slot in self.emptied.iter() {
             if self.new.cell(*slot).is_some() {
@@ -1760,9 +1786,10 @@ impl<'a> Stage<'a> {
                     function_of(caller),
                     // alloc: error path
                     format!(
-                        "{} is removed with nothing put in its slot, and {} still calls it",
-                        self.symbols.describe(slot_sym),
-                        self.symbols.describe(caller.sym),
+                        "{} is removed with nothing put in its slot, and {} in the image `{}` still calls it",
+                        self.named(slot_sym),
+                        self.piece_referrer(caller),
+                        self.name,
                     ),
                 ));
             }
@@ -1778,15 +1805,55 @@ impl<'a> Stage<'a> {
                         function_of(user),
                         // alloc: error path
                         format!(
-                            "{} is removed, and {} still refers to it",
-                            self.symbols.describe(sym),
-                            self.symbols.describe(user.sym),
+                            "{} is removed, and {} in the image `{}` still refers to it",
+                            self.named(sym),
+                            self.piece_referrer(user),
+                            self.name,
                         ),
                     ));
                 }
             }
         }
         Ok(())
+    }
+
+    /// A symbol as an error names it: a function by its path (the debug name codegen gave
+    /// it, in this link or an earlier one) and its key, anything else as
+    /// [`Symbols::describe`] says it.
+    fn named(&self, sym: Sym) -> String {
+        match self.symbols.key(sym) {
+            SymKey::Body(id) | SymKey::Slot(id) => {
+                let name = self.new.debug_name(id).or_else(|| self.old.debug_name(id));
+                // alloc: error path
+                format!(
+                    "the function `{}` ({:?})",
+                    name.map_or("(no debug name)", |it| self.symbols.str(it)),
+                    self.symbols.instance(id)
+                )
+            }
+            _ => self.symbols.describe(sym),
+        }
+    }
+
+    /// What a piece is, as an error names what refers to something: a function by its path,
+    /// a native section by its input, a GOT cell or PLT stub by its target.
+    fn piece_referrer(&self, piece: PieceRef<'_>) -> String {
+        match piece.what() {
+            What::Native { obj, section, .. } | What::NativeFrame { obj, section, .. } => {
+                let input = self.new.inputs.iter().find(|it| self.symbols.find_id(&it.id) == Some(obj.native));
+                // alloc: error path
+                format!(
+                    "section {section} of member {} of the native input `{}`",
+                    obj.member,
+                    input.map_or("(an input no longer on the link line)", |it| &*it.name)
+                )
+            }
+            // alloc: error path
+            What::Got { target, .. } => format!("the GOT cell of {}", self.named(target)),
+            // alloc: error path
+            What::Plt { target } => format!("the PLT stub of {}", self.named(target)),
+            _ => self.named(piece.sym),
+        }
     }
 }
 

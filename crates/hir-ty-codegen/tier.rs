@@ -816,7 +816,7 @@ fn build_body(
             .map_err(|e| self::refused(db, instance, e))
             .ok()?;
         let isa = super::isa_for(target).map_err(|e| self::refused(db, instance, e)).ok()?;
-        let mut cg = Recorder::new(db, &**isa, target, instance.checked);
+        let mut cg = Recorder::new(db, &**isa, target, instance.checked, None);
         cg.unlocated = true;
         let args = instance.args;
         let mut ctx =

@@ -54,7 +54,7 @@ fn reading_the_roots_features_builds_no_def_map() {
     let mut db = fx.into_db();
     let krate = db.fetch_test_crate();
     let text = format!("#![feature(deref_patterns)]\n{}", db.file_text(root).text(&db));
-    let (forced, deref, executed) = db.batch(|db| {
+    let (forced, deref, executed) = db.batch(base_db::Trigger::named("the test's edit"), |db| {
         db.set_file_text(root, &text);
         let view: &Db = db;
         let mut read = (false, false);

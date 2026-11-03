@@ -64,6 +64,10 @@ pub struct Target {
     pub probe_stack: bool,
     /// log2 of the probe interval: Cranelift's `probestack_size_log2`.
     pub probe_log2: u8,
+    /// Whether the code counts its calls and back edges into its counter cells
+    /// (`Name::Counter`), as a tiered run's does to choose what to compile again. Code built
+    /// to keep (a `blaze build`'s, a test's) counts nothing and names no counter cell.
+    pub counts: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

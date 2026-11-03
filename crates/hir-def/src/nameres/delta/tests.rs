@@ -426,7 +426,7 @@ fn a_write_that_walks_keeps_the_logs_it_compared_before() {
     let mut loaded =
         Loaded::new("//- /lib.rs\nmod foo;\n//- /foo/mod.rs\npub mod bar;\n//- /foo/bar.rs\npub struct B;\n");
     let (lib, foo) = (loaded.file("/lib.rs"), loaded.file("/foo/mod.rs"));
-    loaded.db.batch(|db| {
+    loaded.db.batch(base_db::Trigger::named("the test's edit"), |db| {
         db.set_file_text(lib, "pub struct S;\nmod foo;\n");
         db.set_file_text(foo, "");
     });

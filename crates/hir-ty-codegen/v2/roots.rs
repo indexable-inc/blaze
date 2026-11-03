@@ -40,7 +40,7 @@ use hir_ty::db::HirDatabase;
 use intern::sym;
 
 use super::{HirFrontend, HirInstance, HirStatic, Kind, frontend::root_in};
-use crate::{compile_time_only, home::Homes};
+use crate::compile_time_only;
 
 /// What a unit makes, as its roots are chosen.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -130,8 +130,8 @@ impl Listed {
         self.roots.iter().position(|it| *it == instance).expect("a root seen is listed")
     }
 
-    fn function(&mut self, db: &Db, homes: &mut Homes, func: FunctionId) -> usize {
-        self.instance(root_in(db, homes, func))
+    fn function(&mut self, db: &Db, func: FunctionId) -> usize {
+        self.instance(root_in(db, func))
     }
 
     fn static_(&mut self, value: HirStatic) {
@@ -146,28 +146,28 @@ impl HirFrontend<'_> {
     /// blaze can't is an error naming it.
     pub fn roots(&self, krate: Crate, kind: RootKind) -> Result<Roots, CodegenError> {
         self.devirt.makes(kind, krate);
-        self.with(|db, homes| {
+        self.with(|db| {
             let mut listed = Listed::default();
             // alloc: once a unit, the tests cargo is given (empty but for a harness)
             let mut tests = Vec::new();
             match kind {
-                RootKind::Executable => self.program(db, homes, krate, true, &mut listed)?,
+                RootKind::Executable => self.program(db, krate, true, &mut listed)?,
                 RootKind::Test if harness::tested(db, krate) => {
-                    tests = harness::roots(self, db, homes, krate, &mut listed)?;
-                    self.program(db, homes, krate, false, &mut listed)?;
+                    tests = harness::roots(self, db, krate, &mut listed)?;
+                    self.program(db, krate, false, &mut listed)?;
                 }
-                RootKind::Test => self.program(db, homes, krate, true, &mut listed)?,
-                RootKind::Shared => self.program(db, homes, krate, false, &mut listed)?,
-                RootKind::Library => library(db, homes, krate, &mut listed),
+                RootKind::Test => self.program(db, krate, true, &mut listed)?,
+                RootKind::Shared => self.program(db, krate, false, &mut listed)?,
+                RootKind::Library => library(db, krate, &mut listed),
             }
             if !tests.is_empty() {
-                let outside = outside::of(self, db, homes, &listed.roots, &tests)
+                let outside = outside::of(self, db, &listed.roots, &tests)
                     .map_err(|what| refused(db, krate, what))?;
                 for (test, outside) in tests.iter_mut().zip(outside) {
                     test.outside = outside;
                 }
             }
-            let checked = checked(db, homes, krate, kind, &listed);
+            let checked = checked(db, krate, kind, &listed);
             Ok(Roots { roots: listed.roots, statics: listed.statics, tests, checked })
         })
     }
@@ -177,7 +177,7 @@ impl HirFrontend<'_> {
     /// every instance an edit of one of its bodies can change. For a harness that counts what
     /// an edit compiles again (`crates/hir-firewall`); a build starts from [`Self::roots`].
     pub fn every_function(&self, krate: Crate) -> Vec<HirInstance> {
-        self.with(|db, homes| {
+        self.with(|db| {
             let mut listed = Listed::default();
             for (_, data) in crate_def_map(db, krate).modules(db) {
                 let scope = data.scope(db);
@@ -185,7 +185,7 @@ impl HirFrontend<'_> {
                     if let ModuleDefId::FunctionId(func) = def
                         && compiled(db, func)
                     {
-                        listed.function(db, homes, func);
+                        listed.function(db, func);
                     }
                 }
                 for imp in scope.impls() {
@@ -193,7 +193,7 @@ impl HirFrontend<'_> {
                         if let AssocItemId::FunctionId(func) = item
                             && compiled(db, func)
                         {
-                            listed.function(db, homes, func);
+                            listed.function(db, func);
                         }
                     }
                 }
@@ -209,7 +209,6 @@ impl HirFrontend<'_> {
     fn program(
         &self,
         db: &Db,
-        homes: &mut Homes,
         krate: Crate,
         entry: bool,
         listed: &mut Listed,
@@ -217,7 +216,7 @@ impl HirFrontend<'_> {
         if entry && let Some(main) = entry_fn(db, krate).map_err(|what| refused(db, krate, what))? {
             listed.instance(HirInstance(Kind::Start(main)));
         }
-        let shim = super::allocator::shim(db, krate, |func| root_in(db, homes, func))
+        let shim = super::allocator::shim(db, krate, |func| root_in(db, func))
             // alloc: the error's message
             .map_err(|what| refused(db, krate, format!("its allocator shim: {what}")))?;
         for instance in shim {
@@ -231,7 +230,7 @@ impl HirFrontend<'_> {
             .collect();
         linked.sort_unstable_by_key(|it| blaze_query::db::AsId::as_id(it));
         for linked in linked {
-            add_kept(db, homes, linked, listed);
+            add_kept(db, linked, listed);
         }
         Ok(())
     }
@@ -245,7 +244,7 @@ impl HirFrontend<'_> {
 /// functions of its impls rustc takes; then `lang_start`, the C `main`, last. Roots of the
 /// build it leaves out (the allocator shim, other crates' kept symbols, a harness's tests,
 /// which rustc reaches from the harness's `main`) follow them in the build's order.
-fn checked(db: &Db, homes: &mut Homes, krate: Crate, kind: RootKind, listed: &Listed) -> Vec<Checked> {
+fn checked(db: &Db, krate: Crate, kind: RootKind, listed: &Listed) -> Vec<Checked> {
     let start = listed.roots.iter().find_map(|it| match it.0 {
         Kind::Start(main) => Some(main),
         _ => None,
@@ -253,7 +252,6 @@ fn checked(db: &Db, homes: &mut Homes, krate: Crate, kind: RootKind, listed: &Li
     let kept = kept::kept(db, krate);
     let mut order = Order {
         db,
-        homes,
         listed,
         library: kind == RootKind::Library,
         start,
@@ -275,7 +273,6 @@ fn checked(db: &Db, homes: &mut Homes, krate: Crate, kind: RootKind, listed: &Li
 /// The walk of [`checked`] over a crate's items.
 struct Order<'a> {
     db: &'a Db,
-    homes: &'a mut Homes,
     listed: &'a Listed,
     library: bool,
     /// The entry: the function the C `main` runs.
@@ -290,8 +287,8 @@ impl Order<'_> {
     fn root(&mut self, func: FunctionId) -> Option<Checked> {
         let rooted = Some(func) == self.start
             || self.kept.contains(&func)
-            || (self.library && compiled(self.db, func) && self.listed.seen.contains(&root_in(self.db, self.homes, func)));
-        rooted.then(|| Checked::Function(root_in(self.db, self.homes, func)))
+            || (self.library && compiled(self.db, func) && self.listed.seen.contains(&root_in(self.db, func)));
+        rooted.then(|| Checked::Function(root_in(self.db, func)))
     }
 
     /// The items `module` declares, in order, with the modules it declares and the items in
@@ -358,10 +355,10 @@ impl Order<'_> {
 }
 
 /// What `krate` keeps by name, as roots.
-fn add_kept(db: &Db, homes: &mut Homes, krate: Crate, listed: &mut Listed) {
+fn add_kept(db: &Db, krate: Crate, listed: &mut Listed) {
     let kept = kept::kept(db, krate);
     for &func in &kept.functions {
-        listed.function(db, homes, func);
+        listed.function(db, func);
     }
     for &value in &kept.statics {
         listed.static_(HirStatic(value));
@@ -400,7 +397,7 @@ fn entry_fn(db: &Db, krate: Crate) -> Result<Option<FunctionId>, &'static str> {
 /// kept symbols. Each not generic: a generic is compiled by the crate that instantiates it.
 /// What rustc's reachable set has past these (a private function a public generic calls) is
 /// compiled by the program that reaches it.
-fn library(db: &Db, homes: &mut Homes, krate: Crate, listed: &mut Listed) {
+fn library(db: &Db, krate: Crate, listed: &mut Listed) {
     let def_map = crate_def_map(db, krate);
     let local = |module: ModuleId| module.krate(db) == krate;
     let mut adts = HashSet::new_in(Global);
@@ -428,7 +425,7 @@ fn library(db: &Db, homes: &mut Homes, krate: Crate, listed: &mut Listed) {
                 && local(func.module(db))
                 && compiled(db, func)
             {
-                listed.function(db, homes, func);
+                listed.function(db, func);
             }
         }
     }
@@ -453,12 +450,12 @@ fn library(db: &Db, homes: &mut Homes, krate: Crate, listed: &mut Listed) {
                 let AssocItemId::FunctionId(func) = item else { continue };
                 let public = trait_.is_some() || item.assoc_visibility(db).is_public();
                 if public && compiled(db, func) {
-                    listed.function(db, homes, func);
+                    listed.function(db, func);
                 }
             }
         }
     }
-    add_kept(db, homes, krate, listed);
+    add_kept(db, krate, listed);
 }
 
 /// Whether `func` is generic over a type or a constant, its own or its impl's or trait's.

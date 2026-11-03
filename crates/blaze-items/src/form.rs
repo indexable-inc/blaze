@@ -754,14 +754,15 @@ impl<'db> Cx<'db> {
     /// elsewhere in the item, an anonymous constant of a type).
     pub(crate) fn mir_error(&self, id: ItemId) -> Option<String> {
         let (within, error) = self.mir_lowering_error(id)?;
-        Some(match within {
-            // alloc: the error a build stops with, once
-            None => format!("{error:?}"),
-            // alloc: as above
-            Some(Nested::Closure(_)) => format!("a closure in it: {error:?}"),
-            // alloc: as above
-            Some(Nested::Coroutine(_)) => format!("a coroutine in it: {error:?}"),
-        })
+        // alloc: the error a build stops with, once
+        let mut said = String::new();
+        match within {
+            None => {}
+            Some(Nested::Closure(_)) => said.push_str("a closure in it: "),
+            Some(Nested::Coroutine(_)) => said.push_str("a coroutine in it: "),
+        }
+        crate::lowering::write(self.db, &error, &mut said);
+        Some(said)
     }
 
     /// [`Self::mir_error`] as data: the lowering error, and the body in the item it was in
@@ -2592,8 +2593,17 @@ impl<'db> Cx<'db> {
                     }
                 }
                 f.len(map.vtable.tys().len());
-                for ty in map.vtable.tys() {
+                // Each id's type, and the `dyn` type it is a vtable for: which trait's vtable
+                // a word is, wherever it is copied.
+                for (ty, dyn_ty) in map.vtable.entries() {
                     self.ty_in(f, ty);
+                    match dyn_ty {
+                        Some(dyn_ty) => {
+                            f.u8(1);
+                            self.ty_in(f, dyn_ty);
+                        }
+                        None => f.u8(0),
+                    }
                 }
                 f.len(map.statics.len());
                 for it in &map.statics {

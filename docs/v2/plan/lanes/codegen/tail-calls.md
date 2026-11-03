@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: lane tailcall: `become` (explicit_tail_calls) as a guaranteed tail call through the front end, the MIR evaluator, the stencils and LLVM, with Cranelift's native code and wasm refusing it by name.
+summary: lane tailcall: `become` (explicit_tail_calls) as a guaranteed tail call through the front end, the MIR evaluator, the stencils and LLVM; dev code is stencils, which make one, and wasm refuses it by name.
 date: 2026-11-02
 ---
 # Explicit tail calls (`become`)
@@ -23,7 +23,8 @@ place.
 | IR builder | `FunctionCx::tail_call` in `crates/hir-ty-codegen/mod.rs`: a `return_call` / `return_call_indirect` under the target's default convention, described below. `v2/refs.rs` lists the one callee, never built in. |
 | Stencils | `return_call` between functions of SystemV, AppleAarch64 and WindowsFastcall on x86-64 and AArch64 (`crates/blaze-stencil/src/tests/func/tail.rs`). |
 | LLVM | `musttail` call then `ret` (`crates/hir-ty-codegen/llvm/lower.rs`, `Lowering::tail_call`), through the caller's own function type, ABI attributes copied from the caller. |
-| Cranelift native, wasm | Refused by name in `emit_with` (`refuse_tail_calls`): Cranelift tail-calls only under its `tail` convention, which no Rust function has; the wasm lowering has no `return_call` yet. |
+| Plan | Nothing special (2026-11-02): `Policy::choose` (`crates/blaze-codegen/src/plan.rs`) gives native code at 0 and 1 to stencils, a live build's first tier too, so `become` builds as any other code. The LLVM-with-no-passes stopgap, `Described::tail_calls` and `PlanError::TailCallsNeedLlvm` are gone. |
+| Cranelift native, wasm | Refused by name in `emit_with` (`refuse_tail_calls`): Cranelift tail-calls only under its `tail` convention, which no Rust function has; the wasm lowering has no `return_call` yet. The plan never sends native code there; the check stays for a tiered run's Cranelift tier (`blaze_stencil::tier`, to be removed under rule 8), v1's compile and wasm. |
 | Fold (#1292) | A function with a `return_call` is not folded: the thunk's plain call would leave a frame under every hop. |
 
 ## The IR contract
@@ -48,10 +49,8 @@ What the IR builder hands a back end, and what each back end relies on:
 
 ## Gaps (typed errors today)
 
-- **Dev builds.** The dev profile still compiles with Cranelift's native back end, which
-  refuses `become`; stencils are reached only by `Mode::Tiered`, which the CLI doesn't set
-  yet. A program with `become` builds in release (LLVM) and errors in dev. This closes when
-  dev moves to stencils (rule 8).
+- **A tiered run's Cranelift tier** (`blaze_stencil::tier::Tier::Cranelift`) refuses a hot
+  function with `become` when it tiers up; the tier goes under rule 8.
 - **`become` through a vtable** (`become obj.method(..)` on `dyn Trait`): the callee takes a
   thin receiver where the caller has a fat pointer, so the parameter lists differ. The stencils
   accept it when the callee's stack arguments fit the caller's area; LLVM's verifier refuses
@@ -86,8 +85,9 @@ What the IR builder hands a back end, and what each back end relies on:
   refusal; the self call survives O3.
 - `harness/wholeprogram.py '{"cases": ["tail_calls"]}'`: an interpreter of ten million steps
   on a 64 KiB stack, a `countdown` returning through memory, rustc's `drop-order.rs`,
-  `indirect.rs` and `callee_is_track_caller.rs`, output as the pinned nightly prints it; with
-  `"profile": "release"` (LLVM) it runs, and in dev the build has to fail naming the tail call.
+  `indirect.rs` and `callee_is_track_caller.rs`, output as the pinned nightly prints it, in
+  dev and with `"profile": "release"` alike.
+- `crates/blaze-codegen/src/plan.rs`, `a_tail_call_at_a_cranelift_level_is_llvms_with_no_passes`.
 - `crates/blaze-diagnostics/src/tests/lints/mir/tail_calls.rs`: the refusals with rustc's
   messages (`become_needs_matching_signatures_and_abis`, `what_become_refuses`, ...), E0597 for
   a borrow of a local, and the `#[track_caller]` warning.

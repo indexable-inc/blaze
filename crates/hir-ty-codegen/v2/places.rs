@@ -38,7 +38,6 @@ use super::{
 use crate::{
     ConstBlob, Instance, InstanceDef, erase_regions,
     fragment::{DataRequest, FuncRequest, FuncTarget, Requests, TextPart},
-    home::Homes,
     link_name, static_link_name,
 };
 
@@ -50,7 +49,6 @@ pub(crate) const PERSONALITY: &str = crate::unwind::PERSONALITY;
 /// The reference a function request of the IR builder is.
 pub(crate) fn func_ref(
     db: &Db,
-    homes: &mut Homes,
     target: &FuncTarget,
 ) -> Result<Ref, String> {
     match target {
@@ -60,7 +58,7 @@ pub(crate) fn func_ref(
             // alloc: the error's message
             Err(format!("a call of rustc's `{path}`, which a build without rustc has none of"))
         }
-        FuncTarget::Instance(instance, env) => instance_ref(db, homes, instance, env),
+        FuncTarget::Instance(instance, env) => instance_ref(db, instance, env),
         // clone: only a call of an `asm!` block's function, whose `Kind::Asm` owns its text
         FuncTarget::Asm(text) => Ok(FrontRef::Function(HirInstance(Kind::Asm(text.clone(), false)))),
     }
@@ -70,20 +68,18 @@ pub(crate) fn func_ref(
 /// every asker agrees on, or the symbol of a function that has no body of Rust.
 pub(crate) fn call_ref<'db>(
     db: &'db Db,
-    homes: &mut Homes,
     def: InstanceDef,
     args: GenericArgs<'db>,
     env: &StoredParamEnvAndCrate,
 ) -> Result<Ref, String> {
     let interner = DbInterner::new_with(db, env.krate);
     let instance = Instance { def, args: erase_regions(interner, args).store(), checked: false };
-    instance_ref(db, homes, &instance, env)
+    instance_ref(db, &instance, env)
 }
 
 /// As [`call_ref`], of an instance as the IR builder holds it.
 pub(crate) fn instance_ref(
     db: &Db,
-    homes: &mut Homes,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> Result<Ref, String> {
@@ -97,7 +93,7 @@ pub(crate) fn instance_ref(
     {
         return bodyless(db, func, instance.args.as_ref(), env).map(FrontRef::Extern);
     }
-    let env = homes.home(db, &instance, env);
+    let env = instance.home_env(db, env);
     Ok(FrontRef::Function(HirInstance(Kind::Code(instance, env))))
 }
 
@@ -341,7 +337,6 @@ fn unlisted(db: &Db, it: &Ref, refs: &[Ref]) -> String {
 /// code makes them, `None` for assembly.
 pub(crate) fn place_requests<A: Allocator>(
     db: &Db,
-    homes: &mut Homes,
     hashes: &HashSource,
     krate: Option<Crate>,
     placer: &mut Placer<'_, A>,
@@ -351,7 +346,7 @@ pub(crate) fn place_requests<A: Allocator>(
     for request in &requests.funcs {
         let place = match &request.target {
             FuncTarget::Symbol(symbol) => placer.symbol(symbol)?,
-            target => placer.place_named(func_ref(db, homes, target)?, |it, refs| unlisted(db, it, refs))?,
+            target => placer.place_named(func_ref(db, target)?, |it, refs| unlisted(db, it, refs))?,
         };
         funcs.push(place);
     }

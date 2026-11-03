@@ -30,7 +30,8 @@ impl<'db> Features<'db> {
     /// wherever they see the same impls: the same `#![recursion_limit]`, and the same answer
     /// from everything of [`inherent::Features`] below. Its one reader keys a query by the
     /// lowest crate that sees what the query solves in place of the crate that asked
-    /// (`hir_ty_pure`'s summaries, its `stands_for`); a feature the solver starts reading is added
+    /// (`hir_ty_mir::mir::home::stands_for`, which code generation and build-script purity
+    /// both key by); a feature the solver starts reading is added
     /// here, or such a key misses it (rule 18).
     pub fn solve_alike(db: &Db, a: Crate, b: Crate) -> bool {
         if a == b {

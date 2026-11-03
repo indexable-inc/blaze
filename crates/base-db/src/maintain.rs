@@ -9,6 +9,14 @@
 //! maintainer makes itself are not noted and run no maintenance: what a maintainer sets is its
 //! own output, not a change to the program.
 //!
+//! One change is one batch: a pass costs every maintainer's reads over the crates the change
+//! reaches (seconds on a large workspace), so a writer that makes one change with many writes
+//! (a build script's run setting the cfg and env of each crate it reaches) batches them. Each
+//! batch names its [`Trigger`], and the `maintain` span of its pass carries it (`function` the
+//! kind of change, `unit` what it is of), so a profile says which write ran which pass. A
+//! database that takes its writes only in batches ([`Db::require_batches`], every build's:
+//! blaze-lower sets it) refuses a write method called outside one, naming the write.
+//!
 //! A maintainer runs in two phases, a step at a time ([`Maintainer`]): its reads, on `&Db`,
 //! name what the step reads as batches of [`Reads`], which run as one batch on the database's
 //! workers; then its apply, on `&mut Db`, diffs what they computed and sets inputs. Apply reads
@@ -38,6 +46,34 @@ use span::FileId;
 
 use crate::{Crate, Db, IncludedFile, SourceRoot, SourceRootId};
 
+/// What a [`Db::batch`] writes: the one change its maintenance pass is for, which the pass's
+/// `maintain` span names (`function` is `what`, `unit` is `of`). A write method called outside
+/// a batch is its own, triggered by the method's name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Trigger<'a> {
+    /// The kind of change, the same for every change of that kind: `"build script runs
+    /// applied"`, or a write method's path (`"Crate::set_cfg_options"`).
+    pub what: &'static str,
+    /// What it is of: the units, crates or files it writes, as a person reads them; empty when
+    /// `what` says it all.
+    pub of: &'a str,
+}
+
+impl Trigger<'static> {
+    /// A change `what` says all of.
+    pub const fn named(what: &'static str) -> Trigger<'static> {
+        Trigger { what, of: "" }
+    }
+}
+
+impl<'a> Trigger<'a> {
+    /// A change of kind `what` of `of`.
+    pub const fn of(what: &'static str, of: &'a str) -> Trigger<'a> {
+        Trigger { what, of }
+    }
+}
+
+pub mod nodes;
 #[cfg(test)]
 mod tests;
 
@@ -256,8 +292,12 @@ pub(crate) struct Maintenance {
     maintaining: bool,
     /// Whether [`Db::report_work`] keeps its records ([`Db::keep_maintained`]).
     keep: bool,
+    /// Whether a write method outside a [`Db::batch`] is refused ([`Db::require_batches`]).
+    batches_only: bool,
     /// The passes run since the records were last taken.
     passes: u32,
+    /// The passes run since the database was made ([`Db::maintain_passes`]).
+    passes_ever: u64,
     maintained: Vec<Maintained>,
 }
 
@@ -392,31 +432,78 @@ impl Db {
     }
 
     /// Runs `f` with maintenance held back, then runs each maintainer once over everything `f`
-    /// wrote. Every write method outside a batch is its own batch; a batch inside another, or
-    /// inside a maintainer, is part of the one around it.
-    pub fn batch<R>(&mut self, f: impl FnOnce(&mut Db) -> R) -> R {
-        self.maintenance.depth += 1;
-        let ran = panic::catch_unwind(AssertUnwindSafe(|| f(self)));
-        self.maintenance.depth -= 1;
+    /// wrote, the pass named by `trigger`: one change, one pass. A batch inside another, or
+    /// inside a maintainer, is part of the one around it, and its trigger is the outer one's.
+    pub fn batch<R>(&mut self, trigger: Trigger<'_>, f: impl FnOnce(&mut Db) -> R) -> R {
+        Db::batch_in(self, |db| db, trigger, f)
+    }
+
+    /// [`Db::batch`] for a writer that owns its database beside other state its writes update
+    /// (a lowered front end's paths and runs): `f` gets the owner, and `db` finds the database
+    /// in it.
+    pub fn batch_in<T: ?Sized, R>(
+        owner: &mut T,
+        db: fn(&mut T) -> &mut Db,
+        trigger: Trigger<'_>,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        db(owner).maintenance.depth += 1;
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| f(owner)));
+        let db = db(owner);
+        db.maintenance.depth -= 1;
         match ran {
             Ok(result) => {
-                if self.maintenance.depth == 0 && !self.maintenance.maintaining {
-                    self.maintain();
+                if db.maintenance.depth == 0 && !db.maintenance.maintaining {
+                    db.maintain(trigger);
                 }
                 result
             }
             Err(panic) => {
                 // The inputs may be half written: what is maintained no longer follows them.
-                self.forget_maintained_state();
+                db.forget_maintained_state();
                 panic::resume_unwind(panic)
             }
         }
     }
 
+    /// From now on, a write method called outside a [`Db::batch`] (or a maintainer) panics,
+    /// naming the write, where it would run every maintainer for itself alone. A build's
+    /// database takes every write this way (blaze-lower sets it once its crate graph is
+    /// written), so no change of a build pays a pass per input it sets.
+    pub fn require_batches(&mut self) {
+        self.maintenance.batches_only = true;
+    }
+
+    /// How many maintenance passes ran since the database was made: one per batch that wrote
+    /// something, and one per write method outside a batch that did.
+    pub fn maintain_passes(&self) -> u64 {
+        self.maintenance.passes_ever
+    }
+
+    /// Runs `f` as the write method `write`: inside a batch, part of it; outside one, a batch
+    /// of its own, named by `write`, unless the database takes writes only in batches
+    /// ([`Db::require_batches`]).
+    ///
+    /// # Panics
+    ///
+    /// Outside a batch and a maintainer, on a database that takes writes only in batches.
+    pub(crate) fn write<R>(&mut self, write: &'static str, f: impl FnOnce(&mut Db) -> R) -> R {
+        let maintenance = &self.maintenance;
+        if maintenance.batches_only && maintenance.depth == 0 && !maintenance.maintaining {
+            panic!(
+                "`{write}` wrote the database outside a `Db::batch`: this database takes every write \
+                 in a batch that names its change (`Db::require_batches`), so that one change runs \
+                 the maintainers once, not once per input it sets; wrap the change's writes in one \
+                 `Db::batch`"
+            );
+        }
+        self.batch(Trigger::named(write), f)
+    }
+
     /// Notes that an input of the crate graph changed that base-db does not set itself (a
     /// crate's proc macros), as a write: outside a [`Db::batch`] the maintainers run now.
     pub fn note_crates_changed(&mut self) {
-        self.batch(|db| db.note(Note::Crates));
+        self.write("Db::note_crates_changed", |db| db.note(Note::Crates));
     }
 
     /// Notes that `krate` was given proc macros in place of those it had, as a write: outside a
@@ -424,7 +511,7 @@ impl Db {
     /// other crates' maintained state warm: a crate's list reaches only its own def map, and
     /// the crates depending on it through that.
     pub fn note_proc_macros(&mut self, krate: Crate) {
-        self.batch(|db| db.note(Note::ProcMacros(krate)));
+        self.write("Db::note_proc_macros", |db| db.note(Note::ProcMacros(krate)));
     }
 
     /// Records what `maintainer` did for `krate` in this pass, while [`Db::keep_maintained`] is
@@ -499,10 +586,11 @@ impl Db {
         }
     }
 
-    /// Runs `f` as a write of crate inputs: the crate graph's content ID (of every crate's
-    /// data, cfg, env and dependencies) before and after tells whether it changed anything.
-    pub(crate) fn write_crates<R>(&mut self, f: impl FnOnce(&mut Db) -> R) -> R {
-        self.batch(|db| {
+    /// Runs `f` as the write method `write` of crate inputs ([`Db::write`]): the crate graph's
+    /// content ID (of every crate's data, cfg, env and dependencies) before and after tells
+    /// whether it changed anything.
+    pub(crate) fn write_crates<R>(&mut self, write: &'static str, f: impl FnOnce(&mut Db) -> R) -> R {
+        self.write(write, |db| {
             let before = crate::all_crates_content(&*db);
             let result = f(db);
             if crate::all_crates_content(&*db) != before {
@@ -512,10 +600,16 @@ impl Db {
         })
     }
 
-    /// Runs `f` as a write of `file`'s text input, noted when its content ID changed, and of
-    /// its aliases' ([`crate::Files::alias`]), which every write of it writes too.
-    pub(crate) fn write_file<R>(&mut self, file: FileId, f: impl FnOnce(&mut Db) -> R) -> R {
-        self.batch(|db| {
+    /// Runs `f` as the write method `write` of `file`'s text input ([`Db::write`]), noted when
+    /// its content ID changed, and of its aliases' ([`crate::Files::alias`]), which every write
+    /// of it writes too.
+    pub(crate) fn write_file<R>(
+        &mut self,
+        write: &'static str,
+        file: FileId,
+        f: impl FnOnce(&mut Db) -> R,
+    ) -> R {
+        self.write(write, |db| {
             let before = db.files().entry_content(&*db, file);
             let aliases = db.files().aliases_of(file);
             let mut was: SmallVec<[ContentId; 2]> = SmallVec::new();
@@ -533,8 +627,9 @@ impl Db {
         })
     }
 
-    /// Runs every maintainer once over the pending writes, then clears them.
-    fn maintain(&mut self) {
+    /// Runs every maintainer once over the pending writes, then clears them: the pass of the
+    /// change `trigger`.
+    fn maintain(&mut self, trigger: Trigger<'_>) {
         if self.maintenance.pending.is_empty() {
             return;
         }
@@ -545,9 +640,11 @@ impl Db {
         }
         self.maintenance.pending.normalize();
         self.maintenance.passes = self.maintenance.passes.saturating_add(1);
+        self.maintenance.passes_ever += 1;
         let pending = std::mem::replace(&mut self.maintenance.pending, Pending::empty());
         self.maintenance.maintaining = true;
-        let _span = tracing::info_span!(target: "blaze", "maintain").entered();
+        let _span =
+            tracing::info_span!(target: "blaze", "maintain", function = trigger.what, unit = trigger.of).entered();
         let ran = panic::catch_unwind(AssertUnwindSafe(|| {
             let written = pending.written();
             for maintainer in all {

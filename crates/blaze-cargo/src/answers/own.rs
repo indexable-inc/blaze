@@ -364,7 +364,13 @@ pub fn answered(args: &[OsString], stdin: &[u8], vars: Vars<'_>) -> Option<Answe
     {
         let verbose = args.iter().any(|it| matches!(*it, "-v" | "-vV" | "--verbose"));
         let text = if verbose {
-            target::rustc_verbose_version(toolchain.host)
+            // Which blaze answers: its code generator's code identity, which blaze-codegen-code
+            // keys the code of a blaze this one builds by (as `rustc -vV`'s commit keys rustc),
+            // so a blaze built by blaze is not taken for one rustc or another blaze built. Tools
+            // read `release:` and `host:`, which stay rustc's. A process handed no identity has
+            // no answer.
+            let code = hir_ty_codegen::v2::code().ok()?;
+            format!("{}blaze-identity: {:x}\n", target::rustc_verbose_version(toolchain.host), code.0)
         } else {
             format!("rustc {}\n", target::rustc_version())
         };
@@ -643,6 +649,23 @@ mod tests {
         assert_eq!(Vars::Only(&only).get("PATH"), None);
     }
 
+    /// This test binary's code identity: `-vV` names it.
+    fn hand_over_code() {
+        let code = hir_ty_codegen::v2::CodegenCode::from_hex(&"5a".repeat(32)).unwrap();
+        hir_ty_codegen::v2::set_code(code).unwrap();
+    }
+
+    /// blaze as `rustc` says which blaze it is in its `-vV`, after what rustc says, and only
+    /// once handed its code identity.
+    #[test]
+    fn the_verbose_version_names_which_blaze_answers() {
+        hand_over_code();
+        let said = answered(&[OsString::from("-vV")], &[], Vars::Only(&[])).expect("an answer");
+        let said = String::from_utf8(said.stdout).unwrap();
+        let rustc = target::rustc_verbose_version(Toolchain::ours().unwrap().host);
+        assert_eq!(said, format!("{rustc}blaze-identity: {}\n", "5a".repeat(32)));
+    }
+
     /// servo's `[env]` has `RUSTC_BOOTSTRAP` a list of its crates, which every build script
     /// that asks `rustc --version` (libc's, rustversion's) is run with.
     #[test]
@@ -652,6 +675,7 @@ mod tests {
             answered(&args, &[], Vars::Only(&[("RUSTC_BOOTSTRAP", bootstrap)]))
         };
         let servo = "crown,script,mozjs_sys";
+        hand_over_code();
         for args in ["--version", "-vV"] {
             assert!(told(args, servo).is_some(), "{args}");
             assert_eq!(told(args, servo), told(args, "1"), "{args}");

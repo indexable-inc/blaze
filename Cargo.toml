@@ -173,10 +173,19 @@ dissimilar.opt-level = 3
 miniz_oxide.opt-level = 3
 # fence::model's three_threads_two_slots explores ~2^24 states, too many for an unoptimized build.
 blaze-inproc.opt-level = 3
+# blaze-engine's build script hashes the code generator's sources (blaze-codegen-code), which
+# reruns on every edit of them: optimized, as a build dependency is not by default.
+blake3.opt-level = 3
+blaze-codegen-code.opt-level = 3
 
 [profile.release]
 # Set this to 1 or 2 to get more useful backtraces in debugger.
 debug = 0
+
+# As in `profile.dev.package`: build dependencies are built at opt-level 0 otherwise.
+[profile.release.package]
+blake3.opt-level = 3
+blaze-codegen-code.opt-level = 3
 
 [profile.dev-rel]
 inherits = "release"
@@ -229,6 +238,7 @@ hir-ty-verus = { path = "crates/hir-ty-verus", version = "0.0.0" }
 hir-ty-pure = { path = "crates/hir-ty-pure", version = "0.0.0" }
 hir-ty-suspend = { path = "crates/hir-ty-suspend", version = "0.0.0" }
 hir-ty-share = { path = "crates/hir-ty-share", version = "0.0.0" }
+hir-ty-coherence = { path = "crates/hir-ty-coherence", version = "0.0.0" }
 hir-ty-specialization = { path = "crates/hir-ty-specialization", version = "0.0.0" }
 hir-ty-ub = { path = "crates/hir-ty-ub", version = "0.0.0" }
 hir-ty-wfcheck = { path = "crates/hir-ty-wfcheck", version = "0.0.0" }
@@ -264,6 +274,7 @@ blaze-gc = { path = "crates/blaze-gc" }
 blaze-check = { path = "crates/blaze-check" }
 blaze-spin = { path = "crates/blaze-spin" }
 blaze-codegen = { path = "crates/blaze-codegen" }
+blaze-codegen-code = { path = "crates/blaze-codegen-code" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-format = { path = "crates/blaze-format" }

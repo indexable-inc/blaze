@@ -26,6 +26,7 @@ mod interned;
 mod local;
 mod provenance;
 mod row;
+mod slot;
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -43,6 +44,7 @@ pub use id::{AsId, FromId, FromIdIn, Id};
 pub use input::Setter;
 pub use interned::NamesIds;
 pub use provenance::{Cause, Outcome, Provenance};
+pub use slot::{Filled, Slot, SlotClaim, SlotError, SlotName, SlotRefused};
 pub use storage::{Database, Durability, Hook, Storage, View};
 pub use value::Value;
 

@@ -24,6 +24,7 @@ pub const TARGETS: [Target; 4] = [
         tls: TlsModel::ElfGd,
         probe_stack: true,
         probe_log2: 12,
+        counts: true,
     },
     Target {
         arch: blaze_codegen::Arch::Aarch64,
@@ -33,6 +34,7 @@ pub const TARGETS: [Target; 4] = [
         tls: TlsModel::ElfGd,
         probe_stack: true,
         probe_log2: 12,
+        counts: true,
     },
     Target {
         arch: blaze_codegen::Arch::Aarch64,
@@ -42,6 +44,7 @@ pub const TARGETS: [Target; 4] = [
         tls: TlsModel::MachO,
         probe_stack: true,
         probe_log2: 12,
+        counts: true,
     },
     Target {
         arch: blaze_codegen::Arch::X86_64,
@@ -51,6 +54,7 @@ pub const TARGETS: [Target; 4] = [
         tls: TlsModel::Coff,
         probe_stack: true,
         probe_log2: 12,
+        counts: true,
     },
 ];
 
