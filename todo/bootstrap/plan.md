@@ -66,7 +66,29 @@ wasm too, and the rule stays one rule.
 | Sandbox (Linux namespaces, macOS seatbelt) | OS-specific syscalls | wasm is the sandbox: build scripts and macros run as wasm modules in the seed. |
 | Daemon, sockets, fibers, live patching (mmap of code) | OS-only | Not in the seed. It is a one-shot batch build. |
 | Threads | `wasm32-wasip1` has none | Single-threaded seed first, then `wasm32-wasip1-threads`. |
-| C dependencies (cc-rs build scripts) | need a C compiler | The bootstrap needs a C compiler, as Zig's needs one for wasm2c output. Each C dependency of blaze gets listed and kept to a minimum. |
+| C dependencies (cc-rs build scripts) | need a host C compiler | The seed has no C: see below. |
+
+## The seed has no C
+
+`blaze` (package in `crates/blaze-engine`) reaches 13 crates whose build scripts compile C, C++
+or assembly through cc-rs, which runs whatever `cc` is on the host. A host C compiler would be
+a second compiler in the bootstrap, so the seed profile has none of them. Count from Cargo.lock,
+2026-11-02:
+
+| Crate | What its C is for | In the seed |
+|---|---|---|
+| llvm-sys | C++ wrappers around LLVM | out: the seed has no LLVM |
+| tree-sitter, tree-sitter-{python,rust,toml-ng} | C parsers | out |
+| flecs-c | the site's Flecs runtime | out |
+| libmimalloc-sys | allocator | out: std's allocator |
+| blake3, blake3-servil | SIMD C and asm | pure-Rust build (`pure`) |
+| zstd-sys | store compression | a pure-Rust zstd (ruzstd), same frame format |
+| ring | TLS for registry fetches | out: the seed builds offline from vendored sources |
+| psm, stacker | stack growth for deep recursion | a wasm answer is needed: stacker does nothing on wasm |
+| wasmtime, wasmtime-internal-{fiber,jit-debug} | small C and asm helpers | gated off for a Pulley-only wasm build; what remains is listed |
+
+blaze compiling C itself (owning a C front end) would also remove the host compiler, for every
+C dependency anywhere. That is larger and is not needed for the seed.
 
 ## Steps
 
