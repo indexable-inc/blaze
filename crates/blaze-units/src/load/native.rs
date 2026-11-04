@@ -57,11 +57,41 @@ const RESERVED: &[&str] = &[
     "MFLAGS",
     "SDKROOT",
     "SOURCE_DATE_EPOCH",
+    "MACOSX_DEPLOYMENT_TARGET",
+    // What the `cc` and `pkg-config` crates and build systems read to pick and drive the
+    // compiler: an input named so would swap the toolchain a script builds C with.
+    "CC",
+    "CXX",
+    "AR",
+    "CFLAGS",
+    "CXXFLAGS",
+    "CPPFLAGS",
+    "LDFLAGS",
 ];
 
 /// Prefixes no input's variable may start with, for the same reasons as [`RESERVED`]: `RUST`
-/// covers `RUSTC`, `RUSTDOC`, `RUSTFLAGS` and `RUSTDOCFLAGS`; `LD_` and `DYLD_` the loaders'.
-const RESERVED_PREFIXES: &[&str] = &["CARGO_", "DEP_", "RUST", "BLAZE_", "__BLAZE", "LD_", "DYLD_"];
+/// covers `RUSTC`, `RUSTDOC`, `RUSTFLAGS` and `RUSTDOCFLAGS`; `LD_` and `DYLD_` the loaders';
+/// `PKG_CONFIG` every `PKG_CONFIG*`; `CC_`, `CXX_`, `AR_`, `CFLAGS_`, `CXXFLAGS_`, `LDFLAGS_`,
+/// `TARGET_` and `HOST_` the `cc` crate's per-target spellings (`CC_x86_64-...`, `TARGET_CC`,
+/// `HOST_CFLAGS`).
+const RESERVED_PREFIXES: &[&str] = &[
+    "CARGO_",
+    "DEP_",
+    "RUST",
+    "BLAZE_",
+    "__BLAZE",
+    "LD_",
+    "DYLD_",
+    "PKG_CONFIG",
+    "CC_",
+    "CXX_",
+    "AR_",
+    "CFLAGS_",
+    "CXXFLAGS_",
+    "LDFLAGS_",
+    "TARGET_",
+    "HOST_",
+];
 
 /// One build script run of the graph: its package's name, the platform it is built for (none
 /// for the host) and its features.

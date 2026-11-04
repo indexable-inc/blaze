@@ -183,14 +183,10 @@ impl Steps for Real {
 
     fn native(
         &self,
-        units: &blaze_units::query::Units,
+        input: &blaze_units::query::NativeInput,
         cancelled: &std::sync::atomic::AtomicBool,
-    ) -> Result<Vec<crate::serve::native::NativeDir>, ApiError> {
-        if units.native.is_empty() {
-            return Ok(Vec::new());
-        }
+    ) -> Result<std::path::PathBuf, ApiError> {
         let Some(native) = &self.native else {
-            let input = &units.native[0];
             return Err(ApiError::new(
                 format!(
                     "pinned native input `{}` is laid out under blaze's home, and the daemon has none: \
@@ -201,11 +197,7 @@ impl Steps for Real {
             ));
         };
         let fetcher = self.fetcher.pinned();
-        units
-            .native
-            .iter()
-            .map(|input| crate::serve::native::ensure(input, native, &fetcher, &self.native_verified, cancelled))
-            .collect()
+        crate::serve::native::ensure(input, native, &fetcher, &self.native_verified, cancelled)
     }
 
     fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError> {

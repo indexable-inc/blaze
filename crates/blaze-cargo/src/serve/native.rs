@@ -39,7 +39,7 @@ use std::{
 use blaze_api::ApiError;
 use blaze_fetch::{
     tree,
-    unpack::{self, Modes, Rules, Twice},
+    unpack::{self, Modes, NameRules, Rules, Twice},
 };
 use blaze_units::query::NativeInput;
 use parking_lot::Mutex;
@@ -113,18 +113,19 @@ fn refused(input: &NativeInput, what: &str) -> ApiError {
 }
 
 /// `input` laid out under `native` (`<home>/native`), fetched through `fetcher` when it is not
-/// there already; a wait for another process stops once `cancelled` is set.
+/// there already: its directory. A wait for another process stops once `cancelled` is set.
+/// The daemon asks it once a digest at a time (one task a digest, every job joining it), so
+/// the file lock is only ever waited on for another process.
 pub(crate) fn ensure(
     input: &NativeInput,
     native: &Path,
     fetcher: &blaze_fetch::Fetcher,
     verified: &Verified,
     cancelled: &AtomicBool,
-) -> Result<NativeDir, ApiError> {
+) -> Result<PathBuf, ApiError> {
     let dir = dir_of(native, &input.sha256);
-    let done = |dir: PathBuf| NativeDir { input: input.clone(), dir }; // clone: once an input a job
     if laid_out(input, &dir, verified)? {
-        return Ok(done(dir));
+        return Ok(dir);
     }
     let failed_io = |what: &str, error: io::Error| refused(input, &format!("{what}: {error}"));
     fs::create_dir_all(native).map_err(|e| failed_io(&format!("creating {}", native.display()), e))?;
@@ -138,7 +139,7 @@ pub(crate) fn ensure(
     let _lock = lock_within(input, lock, &lock_path, cancelled)?;
     // One that held the lock before may have laid it out.
     if laid_out(input, &dir, verified)? {
-        return Ok(done(dir));
+        return Ok(dir);
     }
     let _span = tracing::info_span!(
         target: "blaze",
@@ -168,7 +169,7 @@ pub(crate) fn ensure(
     }
     verified.0.lock().insert(input.sha256.clone()); // clone: once a digest a daemon
     tracing::info!(target: "blaze", input = %input.name, dir = %dir.display(), "laid out pinned native input");
-    Ok(done(dir))
+    Ok(dir)
 }
 
 /// The archive at `archive` unpacked into `part`, held to `digest` as it is read, marked,
@@ -180,18 +181,14 @@ fn lay_out(input: &NativeInput, digest: &blaze_fetch::Digest, archive: &Path, pa
     let mut unpacked = {
         let mut xz = lzma_rust2::XzReader::new_mem_limit(BufReader::with_capacity(1 << 20, &mut raw), false, XZ_MEMORY_KIB);
         let rules = Rules {
-            top: None,
+            names: NameRules { top: None, fold: true, twice: Twice::Refuse, reserved: &[MARK], most_path: MOST_PATH },
             links: true,
-            fold: true,
-            twice: Twice::Refuse,
             modes: Modes::ReadOnly,
-            reserved: &[MARK],
             skip: &[],
             include: &every,
             sync: true,
             most_entries: MOST_ENTRIES,
             most_bytes: MOST_BYTES,
-            most_path: MOST_PATH,
         };
         let unpacked = unpack::unpack(&mut xz, part, &rules).map_err(|e| e.to_string())?;
         // The rest of the stream, so its checks (its index, its check of what was read) run.
@@ -300,9 +297,22 @@ fn laid_out(input: &NativeInput, dir: &Path, verified: &Verified) -> Result<bool
     if verified.0.lock().contains(&input.sha256) {
         return Ok(true);
     }
-    let _span = tracing::info_span!(target: "blaze", "check pinned native input layout", input = %input.name, dir = %dir.display()).entered();
+    // Every byte of the layout hashed again, once a digest a daemon: the span says how many
+    // and how long, so a slow first build names it. The hash is the check; nothing cheaper
+    // (sizes, times) stands in for it.
+    let span = tracing::info_span!(
+        target: "blaze",
+        "check pinned native input layout",
+        input = %input.name,
+        dir = %dir.display(),
+        files = tracing::field::Empty,
+        bytes = tracing::field::Empty,
+    );
+    let _entered = span.enter();
     let want = tree::parse(listing).map_err(|e| changed(format!("{} lists nothing blaze reads: {e}", mark_path.display())))?;
     let got = unpack::walk(dir, &[MARK], true).map_err(|e| changed(format!("in {}, {e}", dir.display())))?;
+    span.record("files", got.len() as u64);
+    span.record("bytes", got.iter().map(|it| it.len).sum::<u64>());
     if let Some((path, how)) = unpack::first_difference(&got, &want) {
         return Err(changed(format!("{} {how}", dir.join(path).display())));
     }
@@ -333,19 +343,23 @@ fn lock_within(input: &NativeInput, lock: File, path: &Path, cancelled: &AtomicB
             Err(error) => return Err(refused(input, &format!("locking {}: {error}", path.display()))),
         }
         if cancelled.load(Ordering::Acquire) {
-            return Err(refused(input, &format!("cancelled while another blaze held {} laying it out", path.display())));
+            return Err(refused(input, &format!("cancelled while another process held {} laying it out", path.display())));
         }
         let waited = start.elapsed();
         if waited >= LOCK_WAIT {
             return Err(refused(
                 input,
-                &format!("another blaze has held {} for {waited:?} laying it out; it is still not done", path.display()),
+                &format!(
+                    "another process (another blaze daemon; this one lays out a digest once) has held {} for {waited:?} \
+                     laying it out; it is still not done",
+                    path.display()
+                ),
             ));
         }
         span.get_or_insert_with(|| {
             tracing::info_span!(
                 target: "blaze",
-                "waits for another blaze laying out a pinned native input",
+                "waits for another process laying out a pinned native input",
                 input = %input.name,
                 lock = %path.display(),
             )

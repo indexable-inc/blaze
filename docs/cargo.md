@@ -604,14 +604,18 @@ pin file and the package (`crates/blaze-units/src/load/native.rs`). `env` may no
 cargo or blaze sets, or a loader, shell, make, compiler driver or reproducible build reads:
 `OUT_DIR`, `TARGET`, `HOST`, `NUM_JOBS`, `OPT_LEVEL`, `DEBUG`, `PROFILE`, `CARGO`, `PATH`,
 `HOME`, `TMP`, `TEMP`, `TMPDIR`, `SHELL`, `BASH_ENV`, `ENV`, `IFS`, `MAKEFLAGS`, `MFLAGS`,
-`SDKROOT`, `SOURCE_DATE_EPOCH`, or any starting `CARGO_`, `DEP_`, `RUST` (`RUSTC`,
-`RUSTFLAGS`, `RUSTDOCFLAGS`, ...), `BLAZE_`, `__BLAZE`, `LD_` or `DYLD_`. Two inputs may not give
-one script the same variable.
+`SDKROOT`, `SOURCE_DATE_EPOCH`, `MACOSX_DEPLOYMENT_TARGET`, `CC`, `CXX`, `AR`, `CFLAGS`,
+`CXXFLAGS`, `CPPFLAGS`, `LDFLAGS`, or any starting `CARGO_`, `DEP_`, `RUST` (`RUSTC`,
+`RUSTFLAGS`, `RUSTDOCFLAGS`, ...), `BLAZE_`, `__BLAZE`, `LD_`, `DYLD_`, `PKG_CONFIG`, or the
+`cc` crate's per-target `CC_`, `CXX_`, `AR_`, `CFLAGS_`, `CXXFLAGS_`, `LDFLAGS_`, `TARGET_`,
+`HOST_`. Two inputs may not give one script the same variable.
 
 Before any of the build's units is lowered (or a trace's or verify's view is read), the
 daemon lays out each input the build needs, on an IO thread
-(`crates/blaze-cargo/src/serve/native.rs`); jobs asking the same inputs share one layout task,
-and a wait for another process laying out the same digest stops when the job is cancelled. The
+(`crates/blaze-cargo/src/serve/native.rs`): one layout task a digest, shared by every job
+asking it whatever it names the input, so the daemon never waits on its own lock; a wait for
+another process laying out the same digest stops once every job waiting on it is cancelled or
+ended (one job's cancel never fails another that joined it). The
 archive is got through blaze-fetch by its sha256, from the store when it has it and else
 downloaded, checked and kept there, then unpacked into `<BLAZE_HOME>/native/sha256-<hex>`
 (`~/.blaze/native/...` when `BLAZE_HOME` is unset), read-only, one directory per digest. The
@@ -620,15 +624,19 @@ made under a lock in a directory beside the final one (what a stopped layout lef
 removed first), every file and directory synced, its mark `.blaze-native` written last and
 synced, and renamed into place whole, so a directory there is whole. The mark holds the digest
 and a listing of every file and link with its kind, BLAKE3 and length; the first time a daemon
-hands a layout to a build script it walks it against that listing, and a layout with no mark
+hands a layout to a build script it walks it against that listing, hashing every byte again
+(a span, `check pinned native input layout`, says how many files and bytes and how long), and a
+layout with no mark
 for its digest, a file changed, added, removed or made writable is refused naming the file and
 how to remove the layout (`chmod -R u+w <dir> && rm -rf <dir>`), never used or written over.
 
 The archive (a `.tar.xz`, as `llvm.py pack` writes) goes through blaze-fetch's one checked
 unpacker (`crates/blaze-fetch/src/unpack.rs`, which a registry's `.crate` goes through too): it
 must be one top directory, which is stripped; an entry with an absolute path, a `..`, a `\` or
-a NUL, a device, FIFO or sparse file, two entries that are one name to a case- and
-normalization-insensitive disk (APFS), an entry under a file or link, an entry named as the mark
+a NUL, a device, FIFO or sparse file, two entries that are one name under Unicode's
+canonical caseless match (NFD, then full case folding from CaseFolding.txt, then NFD; meant to
+cover what a case- and normalization-insensitive disk such as APFS takes as one, which uses its
+own tables), an entry under a file or link, an entry named as the mark
 in any case, a symbolic link whose target leaves the layout or passes through another link
 (names compared the same way), a link the disk resolves outside the layout or to nothing, or a
 hard link to anything but a file written before it fails the layout, and so do more than 2^20
