@@ -92,26 +92,29 @@ pub(super) struct Liveness {
 
 /// rustc's `live_symbols_and_ignored_derived_traits`, with the self-assignments it lints.
 pub(super) fn live(k: &Crate<'_, '_, '_>, seeds: Seeds) -> (Liveness, Vec<Found>) {
-    let len = k.defs.len();
-    let mut m = Mark {
-        k,
-        worklist: seeds.worklist,
-        scanned: [DefSet::new(len), DefSet::new(len)],
-        live: Live { live: DefSet::new(len), ..Live::default() },
-        propagated: false,
-        in_pat: false,
-        ignore_variants: Vec::new(), // alloc: setup, one stack for the whole walk
-        repr_all_live: false,
-        repr_simd: false,
-        self_assigns: HashSet::new_in(Global),
-        found: Vec::new(), // alloc: the pass's output, once per crate
-    };
+    let mut m = Mark::new(k, seeds.worklist, None);
     let mut unsolved = seeds.unsolved;
     m.mark_with_unsolved(&mut unsolved);
     let pre_deferred = m.live.snapshot();
     m.worklist.extend(seeds.deferred);
     m.mark_with_unsolved(&mut unsolved);
     (Liveness { pre_deferred, last: m.live }, m.found)
+}
+
+/// blaze: what the definitions of `from` (the code a configuration does not use) refer to, as
+/// (referrer, referred) pairs, each referrer the definition whose walk names the other: the
+/// same walk as [`live`], every name it resolves recorded, a pattern's too, before rustc's
+/// rules decide what is live. A `#[cfg]` that leaves an item out of a configuration is sound
+/// only when nothing that stays there names it (`crate::reach`). The self-assignments it
+/// finds are [`live`]'s to report, and dropped here.
+pub(super) fn references(k: &Crate<'_, '_, '_>, from: Vec<WorkItem>) -> Vec<(DefIdx, DefIdx)> {
+    // alloc: setup, the pairs of one configuration's unused code, once per crate observed
+    let mut m = Mark::new(k, from, Some(Vec::new()));
+    m.mark_live_symbols();
+    let mut edges = m.edges.take().unwrap_or_default();
+    edges.sort_unstable();
+    edges.dedup();
+    edges
 }
 
 struct Mark<'k, 'c, 'a, 'db> {
@@ -127,15 +130,52 @@ struct Mark<'k, 'c, 'a, 'db> {
     repr_simd: bool,
     self_assigns: HashSet<InFile<SyntaxNodePtr>, Global>,
     found: Vec<Found>,
+    /// The definition being walked, for [`Mark::edges`].
+    current: DefIdx,
+    /// blaze: every name the walk resolves, by the definition it is walked in ([`references`]);
+    /// none for rustc's pass ([`live`]).
+    edges: Option<Vec<(DefIdx, DefIdx)>>,
+}
+
+impl<'k, 'c, 'a, 'db> Mark<'k, 'c, 'a, 'db> {
+    fn new(k: &'k Crate<'c, 'a, 'db>, worklist: Vec<WorkItem>, edges: Option<Vec<(DefIdx, DefIdx)>>) -> Self {
+        let len = k.defs.len();
+        Mark {
+            k,
+            worklist,
+            scanned: [DefSet::new(len), DefSet::new(len)],
+            live: Live { live: DefSet::new(len), ..Live::default() },
+            propagated: false,
+            in_pat: false,
+            ignore_variants: Vec::new(), // alloc: setup, one stack for the whole walk
+            repr_all_live: false,
+            repr_simd: false,
+            self_assigns: HashSet::new_in(Global),
+            found: Vec::new(), // alloc: the pass's output, once per crate
+            current: 0,
+            edges,
+        }
+    }
 }
 
 impl<'db> Mark<'_, '_, '_, 'db> {
+    /// blaze: `def` is named in the definition being walked ([`references`]).
+    fn record(&mut self, def: DefIdx) {
+        let current = self.current;
+        if let Some(edges) = &mut self.edges
+            && def != current
+        {
+            edges.push((current, def));
+        }
+    }
+
     /// rustc's `own_comes_from_allow_expect`.
     fn own(&self, def: DefIdx) -> bool {
         self.propagated && self.k.allow_or_lang(def) == Some(true)
     }
 
     fn check_def_id(&mut self, def: DefIdx) {
+        self.record(def);
         let own = self.own(def);
         if self.k.defs[def].kind != Kind::Field {
             self.worklist.push(WorkItem { id: def, propagated: self.propagated, own });
@@ -146,6 +186,7 @@ impl<'db> Mark<'_, '_, '_, 'db> {
     }
 
     fn insert_def_id(&mut self, def: DefIdx) {
+        self.record(def);
         if !self.own(def) {
             self.live.live.insert(def);
         }
@@ -153,6 +194,18 @@ impl<'db> Mark<'_, '_, '_, 'db> {
 
     /// rustc's `handle_res`: in a pattern, only a constant or a type alias it names is used.
     fn handle_res(&mut self, res: Res) {
+        // A name a pattern resolves to is no use of it to rustc, and still a name the code
+        // can't compile without.
+        match res {
+            Res::Def(def) => self.record(def),
+            Res::Variant(variant) => {
+                self.record(variant);
+                if let Parent::Def(adt) = self.k.defs[variant].parent {
+                    self.record(adt);
+                }
+            }
+            Res::SelfCtor | Res::None => {}
+        }
         match res {
             Res::Def(def) => {
                 let in_pat_used =
@@ -212,6 +265,7 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             if !self.scanned[work.propagated as usize].insert(work.id) {
                 continue;
             }
+            self.current = work.id;
             self.visit(work.id);
         }
     }

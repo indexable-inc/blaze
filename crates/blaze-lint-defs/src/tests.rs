@@ -52,12 +52,15 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 83);
+    assert_eq!(blaze_lints().len(), 86);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
         blaze_lints().iter().filter(|it| !it.is_externally_loaded).map(|it| it.name).collect();
-    assert_eq!(built, ["blaze::const_impure", "blaze::vecreport"]);
+    assert_eq!(
+        built,
+        ["blaze::const_impure", "blaze::dead", "blaze::test_only", "blaze::cfg_only", "blaze::vecreport"]
+    );
     let general = group("blaze::general").expect("blaze's general group");
     let internal = group("blaze::internal").expect("blaze's internal group");
     let pedantic = group("blaze::pedantic_perf").expect("blaze's pedantic_perf group");
@@ -165,6 +168,7 @@ fn counts_are_rustcs() {
             "blaze::general",
             "blaze::pedantic_perf",
             "blaze::internal",
+            "blaze::reach",
         ]
     );
     assert_eq!(group("unused").unwrap().lints.len(), 24);
