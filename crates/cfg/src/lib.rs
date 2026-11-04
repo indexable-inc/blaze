@@ -108,6 +108,12 @@ impl CfgOptions {
         self.enabled.insert(atom);
     }
 
+    /// Every atom set, in no order: `true` (every set's, which no `#[cfg]` can name) left
+    /// out. A caller that writes or compares them sorts them.
+    pub fn atoms(&self) -> impl Iterator<Item = &CfgAtom> {
+        self.enabled.iter().filter(|it| !matches!(it, CfgAtom::Flag(sym) if *sym == sym::true_))
+    }
+
     pub fn get_cfg_keys(&self) -> impl Iterator<Item = &Symbol> {
         self.enabled.iter().map(|it| match it {
             CfgAtom::Flag(key) => key,

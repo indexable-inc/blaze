@@ -4443,9 +4443,13 @@ impl<S: Steps> Jobs<S> {
         }
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
         let Build { input, front, mut writer, artifacts, evaluation, root, units, .. } = *build;
+        // A lint over every configuration denied (`blaze::dead` at `deny`) fails the build as
+        // a unit's denied lint does.
+        let mut denied = false;
         match writer.finished(ok, &units) {
             Ok(warnings) => {
                 for warning in warnings {
+                    denied |= warning.level == blaze_api::Level::Error;
                     w.said.push(Said::Report(id, Response::Diagnostic(warning)));
                 }
             }
@@ -4454,6 +4458,7 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         }
+        let (ok, runs, pack) = (ok && !denied, runs && !denied, pack && !denied);
         let served = match writer.served() {
             Ok(it) => it,
             Err(error) => {

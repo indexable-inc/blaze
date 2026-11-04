@@ -44,13 +44,28 @@ pub(super) fn report(k: &Crate<'_, '_, '_>, liveness: &Liveness) -> Vec<Found> {
         if k.executable == Some(true) {
             let pre = &liveness.pre_deferred;
             let unused_pub = |def: DefIdx| k.reach.is_reachable(def) && !pre.contains(def);
-            Report { k, lint: Lint::PubInBinary, live: pre, found: &mut found, dead: &mut dead }
+            Report { k, lint: Lint::PubInBinary, live: pre, found: &mut found, dead: &mut dead, seen: None }
                 .module(module, unused_pub);
         }
-        Report { k, lint: Lint::DeadCode, live: &liveness.last, found: &mut found, dead: &mut dead }
+        Report { k, lint: Lint::DeadCode, live: &liveness.last, found: &mut found, dead: &mut dead, seen: None }
             .module(module, |_| true);
     }
     found
+}
+
+/// blaze: what [`report`] would report as `dead_code` (the same items, not under a parent
+/// already reported, its fields by rustc's rules), each with its level, and no diagnostic
+/// made: what one configuration says of the crate for the lints over every configuration
+/// (`crate::reach`).
+pub(super) fn reported(k: &Crate<'_, '_, '_>, liveness: &Liveness) -> Vec<(DefIdx, LevelPlus)> {
+    let mut found = Vec::new(); // alloc: empty, nothing is pushed to it in this mode
+    let mut dead = Vec::new(); // alloc: setup, one buffer reused for every module
+    let mut seen = Vec::new(); // alloc: the pass's output, once per crate observed
+    for module in 0..k.defs.modules.len() {
+        Report { k, lint: Lint::DeadCode, live: &liveness.last, found: &mut found, dead: &mut dead, seen: Some(&mut seen) }
+            .module(module, |_| true);
+    }
+    seen
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,6 +102,8 @@ struct Report<'r, 'c, 'a, 'db> {
     found: &'r mut Vec<Found>,
     /// The dead items of one group, reused from group to group.
     dead: &'r mut Vec<DeadItem>,
+    /// blaze: where [`reported`] keeps what would be linted, instead of linting it.
+    seen: Option<&'r mut Vec<(DefIdx, LevelPlus)>>,
 }
 
 impl Report<'_, '_, '_, '_> {
@@ -240,6 +257,10 @@ impl Report<'_, '_, '_, '_> {
         let defs = k.defs;
         let Some(first) = dead_codes.first() else { return };
         let Some(at) = defs[first.def].node else { return };
+        if let Some(seen) = &mut self.seen {
+            seen.extend(dead_codes.iter().map(|it| (it.def, it.level)));
+            return;
+        }
         // alloc: the edge from here on: a lint that fires, its spans, text and notes.
         let spans: Vec<Span> = dead_codes.iter().filter_map(|it| self.ident_or_def_span(it.def)).collect();
         if spans.len() != dead_codes.len() {

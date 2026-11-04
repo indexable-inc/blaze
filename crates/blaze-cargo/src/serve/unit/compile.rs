@@ -1271,7 +1271,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
 /// mount's file there, not a path under a mount's directory: `target/` is under the
 /// workspace's, and the view has none of its outputs. A file the database has no text of is
 /// left out, and [`assemble`] names it as unread.
-fn unmounted(reader: &UnitReader, mounted: &Mounted, diags: &[Diag]) -> Vec<(String, String)> {
+pub(super) fn unmounted(reader: &UnitReader, mounted: &Mounted, diags: &[Diag]) -> Vec<(String, String)> {
     let db = reader.db();
     let names: Vec<&str> = blaze_diagnostics::emit::Sources::default()
         .unread(diags)
@@ -1325,7 +1325,10 @@ fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> 
 
 /// `diags`, the check's, with what clippy's lints and blaze's find in the unit's crate under
 /// `cargo clippy`, at the levels of its lint flags and attributes, before rustc's closing lines,
-/// which are made again to count them.
+/// which are made again to count them. `dead_code` is left out: `blaze::dead` says it once
+/// the job's units end, over every configuration of the package ([`super::configs`]), so an
+/// item another configuration uses is never called dead here. What drops it is the unit's own
+/// plan (it is linted), which its record's key covers.
 #[expect(clippy::too_many_arguments, reason = "the crate, where its files are named from, its plan and the check's")]
 fn linted(
     db: &base_db::Db,
@@ -1358,6 +1361,7 @@ fn linted(
         .map_err(|why| ApiError::new(why.to_string(), at()))?;
     let end = diags.iter().rposition(|it| !closing(it)).map_or(0, |at| at + 1);
     diags.truncate(end);
+    diags.retain(|it| it.lint_name() != Some("dead_code"));
     diags.extend(found.into_iter().map(|it| it.diagnostic));
     let closing = blaze_diagnostics::emit::summary(diags.iter());
     diags.extend(closing);
@@ -1909,7 +1913,7 @@ fn macros_built(db: &base_db::Db, krate: base_db::Crate, u: &Unit) -> Result<(),
 }
 
 /// `unit`'s crate in the front end.
-fn crate_of(job: &Job, unit: usize, u: &Unit) -> Result<base_db::Crate, ApiError> {
+pub(super) fn crate_of(job: &Job, unit: usize, u: &Unit) -> Result<base_db::Crate, ApiError> {
     job.crates.krate(unit).ok_or_else(|| {
         // alloc: error path
         ApiError::new(format!("unit {unit} (`{}`) has no crate in the front end", u.target.name), None)
@@ -1919,7 +1923,7 @@ fn crate_of(job: &Job, unit: usize, u: &Unit) -> Result<base_db::Crate, ApiError
 /// The lint flags of `unit`'s check, and the options they give it in `db`
 /// ([`blaze_diagnostics::cache::Inputs::options`], the same a kept outcome of it is keyed by):
 /// an error for flags that name no lint blaze has, whether or not a check runs.
-fn options(job: &Job, db: &base_db::Db, unit: usize, u: &Unit) -> Result<(Vec<String>, Options), ApiError> {
+pub(super) fn options(job: &Job, db: &base_db::Db, unit: usize, u: &Unit) -> Result<(Vec<String>, Options), ApiError> {
     let flags = unit_lint_flags(job, unit)?;
     let options = blaze_diagnostics::cache::Inputs::of(db, &flags)
         .options()

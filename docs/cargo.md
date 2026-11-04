@@ -1155,6 +1155,14 @@ checked, not linted. `--fix` makes every machine-applicable suggestion of the ch
 again up to four times, and writes the files only when no check of it has an error the first
 did not; `--fix` checks every target when none is named.
 
+Once every unit ends, `blaze check` lints each workspace package's items over every
+configuration it checked (the lib, the lib as a test, each bin, test, bench and example):
+`blaze::dead` when none uses an item (in place of rustc's `dead_code`, which a linted crate's
+own check leaves out), `blaze::test_only` when only the tests do (`--fix` adds `#[cfg(test)]`)
+and `blaze::cfg_only` when only some features or platforms do (with the narrowest exact
+`#[cfg]`). The group `blaze::reach` sets all three; they warn by default. None is given when a
+unit failed. See [the plan](v2/plan/multiconfig-check.md).
+
 `--baselines DIR` holds the run's `clippy::` and `blaze::` findings, counted by lint and crate
 (the package of the unit that gave each; a finding a crate's lib and its lib test both give
 counts once), to the baselines checked in under `DIR`: one file per lint,

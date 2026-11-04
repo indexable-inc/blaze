@@ -671,8 +671,10 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// On the loop, once every task of the job's build has ended and before it is kept: what
     /// the build's front end found wrong only once all of it ran (a dependency's image that
     /// differs from what its crate resolves to, under `BLAZE_DEP_IMAGES=check`; a profile blaze
-    /// made that applied to nothing), as the build's error, or its warnings to say. `ok`:
-    /// whether the build succeeded; `built`: its nodes' units, a unit once a node.
+    /// made that applied to nothing), as the build's error, or its warnings to say, with what
+    /// `blaze check` lints over every configuration of a package at once (`blaze::dead`; an
+    /// error of those fails the build). `ok`: whether the build succeeded; `built`: its nodes'
+    /// units, a unit once a node.
     fn finished(&mut self, ok: bool, built: &[u32]) -> Result<Vec<blaze_api::Diagnostic>, ApiError> {
         let _ = (ok, built);
         Ok(Vec::new())
