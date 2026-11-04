@@ -1475,7 +1475,12 @@ impl Store {
         'kinds: for group in demote.chunk_by(|a, b| a.1.kind == b.1.kind) {
             let kind = group[0].1.kind;
             if self.dictionary_of(kind).is_none() {
-                for &(_, loc, _) in group.iter().filter(|(_, loc, _)| loc.form == Form::Raw) {
+                // Long records are not sampled, as `put` does not sample them: a few would fill the
+                // samples with too few values and give the kind up.
+                let long = cold::LONG_FROM as u64;
+                for &(_, loc, _) in
+                    group.iter().filter(|(_, loc, _)| loc.form == Form::Raw && loc.raw < long)
+                {
                     // The samples are full (and trained, or gave up) or the kind gave up: a
                     // copy would be kept as no sample.
                     if !self.training[kind.code() as usize].wants_samples() {
@@ -3215,7 +3220,7 @@ impl Store {
         self.training[kind.code() as usize] = Training { given_up: true, ..Training::default() };
         // alloc: a problem reported
         self.problems.push(format!(
-            "the {} values are kept raw, and those under {DEMOTE_FROM} bytes stay raw, until the store is opened again: no dictionary is trained: {why}",
+            "the {} values under {DEMOTE_FROM} bytes stay raw until the store is opened again: no dictionary is trained: {why}",
             kind.name()
         ));
     }
