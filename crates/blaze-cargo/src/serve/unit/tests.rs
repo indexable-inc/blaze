@@ -135,6 +135,7 @@ fn build(dir: &std::path::Path) -> Units {
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     }
 }
 
@@ -792,6 +793,7 @@ fn a_pack_is_of_the_packages_binary_or_else_its_library() {
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     };
     let units = with(vec![
         unit(dep, target("dep", "lib", "/w/dep/src/lib.rs"), Mode::Check, &[]),
@@ -982,6 +984,7 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     };
     let config = BuildConfig {
         invocation: Invocation {
@@ -1216,6 +1219,7 @@ fn script_front_for(text: &'static [u8], on_core: bool, env: &[(&str, &str)], pr
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     };
     let config = BuildConfig {
         invocation: Invocation {
@@ -1486,6 +1490,7 @@ fn script_lib_front(lib: &[u8]) -> blaze_lower::Lowered {
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     };
     let config = BuildConfig {
         invocation: Invocation {
@@ -1591,6 +1596,7 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     };
     let config = BuildConfig {
         invocation: Invocation {

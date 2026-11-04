@@ -439,11 +439,45 @@ pub struct Units {
     /// `[workspace.metadata.blaze]`: every member's tests run sandboxed but those
     /// [`TestSandbox`] takes out.
     pub sandboxed_tests: bool,
+    /// The pinned native inputs (`[workspace.metadata.blaze.native.<name>]`, docs/cargo.md,
+    /// "Pinned native inputs") some build script run of this graph is given: one per input and
+    /// target, sorted by name then target. The daemon fetches and lays out each before any
+    /// script runs.
+    pub native: Vec<NativeInput>,
 }
 
 impl Versioned for Units {
     // 13: `CARGO_PRIMARY_PACKAGE` left the plans' variables ([`Units::is_primary`]).
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 13");
+    // 14: the pinned native inputs ([`Units::native`]).
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 14");
+}
+
+/// One pinned native input for one target: an archive named by its digest, which blaze fetches,
+/// unpacks read-only under its home, and hands to the build scripts of `packages` in the
+/// variable `env` (docs/cargo.md, "Pinned native inputs").
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct NativeInput {
+    /// The table's name, `llvm` of `[workspace.metadata.blaze.native.llvm]`.
+    pub name: String,
+    /// The target triple whose archive this is: the platform of the script runs that get it.
+    pub target: String,
+    /// The variable the scripts read the unpacked directory from.
+    pub env: String,
+    /// The packages, by name, whose build scripts are given it; sorted.
+    pub packages: Vec<String>,
+    /// Where the archive is downloaded from: `https://`.
+    pub url: String,
+    /// The archive's sha256, 64 lowercase hex digits, as the pin file says.
+    pub sha256: String,
+    /// The pin file the URL and digest were read from, absolute: what errors name.
+    pub pin: String,
+}
+
+impl NativeInput {
+    /// Whether the build script of the package named `package` is given this input.
+    pub fn gives(&self, package: &str) -> bool {
+        self.packages.binary_search_by(|it| it.as_str().cmp(package)).is_ok()
+    }
 }
 
 impl Units {

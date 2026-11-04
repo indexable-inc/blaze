@@ -206,6 +206,7 @@ fn units() -> Units {
         finished: "`dev` profile [unoptimized + debuginfo]".to_owned(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     }
 }
 

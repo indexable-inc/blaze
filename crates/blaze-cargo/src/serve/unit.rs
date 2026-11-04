@@ -450,7 +450,8 @@ fn env_seen(moved: &EnvMoved) -> (blaze_kernel::Seen, blaze_kernel::Seen) {
 /// The first part of two plans' units that differs, by name. Every field is named, so one
 /// added to [`Units`] is named here too.
 fn units_differ(kept: &Units, now: &Units) -> &'static str {
-    let Units { graph, plans, packages, lock, warnings, target_dir, build_dir, finished, link_dirs, sandboxed_tests } = kept;
+    let Units { graph, plans, packages, lock, warnings, target_dir, build_dir, finished, link_dirs, sandboxed_tests, native } =
+        kept;
     if graph != &now.graph {
         "the unit graph"
     } else if plans != &now.plans {
@@ -471,6 +472,8 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         "the build-script link directories"
     } else if sandboxed_tests != &now.sandboxed_tests {
         "whether tests run sandboxed"
+    } else if native != &now.native {
+        "the pinned native inputs"
     } else {
         "nothing compared"
     }
