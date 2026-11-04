@@ -76,17 +76,29 @@ fn calls_200_mib_apart_go_through_thunks() {
         let change = Change {
             added: vec![&one, &big, &three],
             names: vec![("_start".into(), Target::Direct(key(1)))],
-            debug_names: vec![(key(1), "one".into()), (key(2), "big".into()), (key(3), "three".into())],
+            debug_names: vec![
+                (key(1), "one".into()),
+                (key(2), "big".into()),
+                (key(3), "three".into()),
+            ],
             ..Change::default()
         };
-        disk.link(&mut image, change).unwrap_or_else(|it| panic!("incremental {incremental}: {it}"));
+        disk.link(&mut image, change)
+            .unwrap_or_else(|it| panic!("incremental {incremental}: {it}"));
         let linked = Linked::of(disk.file(TO));
         let (a, c) = (linked.symbol("one"), linked.symbol("three"));
         assert!(c - a > 200 * MIB as u64, "incremental {incremental}: 200 MiB between them");
         for (from, n, debug) in [(a, 3, "three"), (c, 1, "one")] {
             let via = bl(&linked, from);
-            assert!(via.abs_diff(from) < 1 << 27, "incremental {incremental}: the `bl` at {from:#x} reaches {via:#x}");
-            assert_eq!(thunk(&linked, via), callee(&image, &linked, n, debug), "incremental {incremental}: from {from:#x}");
+            assert!(
+                via.abs_diff(from) < 1 << 27,
+                "incremental {incremental}: the `bl` at {from:#x} reaches {via:#x}"
+            );
+            assert_eq!(
+                thunk(&linked, via),
+                callee(&image, &linked, n, debug),
+                "incremental {incremental}: from {from:#x}"
+            );
         }
         if !incremental {
             continue;
@@ -116,7 +128,8 @@ fn calls_200_mib_apart_go_through_thunks() {
 
 #[test]
 fn an_image_with_islands_is_the_same_whatever_order_its_functions_came_in() {
-    let (one, big, three) = (caller(1, Target::Direct(key(3))), filler(2), caller(3, Target::Direct(key(1))));
+    let (one, big, three) =
+        (caller(1, Target::Direct(key(3))), filler(2), caller(3, Target::Direct(key(1))));
     let link = |added: Vec<&CompiledFunction>| {
         let mut image = Image::new(name(TO), a64(false)).unwrap();
         let mut disk = Disk::default();

@@ -22,9 +22,9 @@ use blaze_cas::{Corrupt, Key, Kind, Mismatch, Store, Ticket};
 use blaze_core::{Traced, Untraceable};
 use blaze_format::cursor::{Put, Reader};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_items::CodeHash;
+use std::alloc::Global;
 
 use crate::{
     Given, Reached, RunKey, RunKind,
@@ -198,12 +198,16 @@ fn sorted(hashes: &[CodeHash]) -> Vec<CodeHash> {
 /// compares, then the rare runs of one prefix by the whole hash.
 fn set_order(hashes: &[CodeHash], order: &mut Vec<u64>) {
     let count = u32::try_from(hashes.len()).expect("a test reaches fewer than 2^32 functions");
-    order.extend((0..count).map(|at| (u64::from(prefix(&hashes[at as usize])) << 32) | u64::from(at)));
+    order.extend(
+        (0..count).map(|at| (u64::from(prefix(&hashes[at as usize])) << 32) | u64::from(at)),
+    );
     let hash = |it: &u64| &hashes[*it as u32 as usize];
     if order.len() < SMALL {
         order.sort_unstable_by(|a, b| hash(a).cmp(hash(b)));
     } else {
-        blaze_mem::scratch::with_u64s(|scratch| radix::sort_copy_by_key_in(order, |it| (*it >> 32) as u32, scratch));
+        blaze_mem::scratch::with_u64s(|scratch| {
+            radix::sort_copy_by_key_in(order, |it| (*it >> 32) as u32, scratch)
+        });
         let mut start = 0;
         while start < order.len() {
             let mut end = start + 1;
@@ -367,7 +371,8 @@ pub enum Why {
 
 impl Why {
     /// The explanation, with a code hash named by `name_of` when it knows the function.
-    pub fn describe(&self, name_of: &dyn Fn(&CodeHash) -> Option<String>) -> String { // dyn: the edge: an explanation for people
+    pub fn describe(&self, name_of: &dyn Fn(&CodeHash) -> Option<String>) -> String {
+        // dyn: the edge: an explanation for people
         let named = |hash: &CodeHash| name_of(hash).unwrap_or_else(|| format!("code {}", hash.0)); // alloc: the edge: an explanation for people
         match self {
             Why::New => "new".to_owned(), // alloc: the edge: an explanation for people
@@ -403,7 +408,10 @@ pub enum Decision {
 pub enum SelectError<E> {
     Corrupt(Corrupt),
     /// A value under a key of ours that is not what we keep there: a key of another schema.
-    NotOurs { key: Key, why: String },
+    NotOurs {
+        key: Key,
+        why: String,
+    },
     Inputs(E),
 }
 
@@ -468,7 +476,9 @@ fn find<P: Passes + ?Sized, I: Inputs>(
 ) -> Result<bool, SelectError<I::Error>> {
     match index::search(|key| store.get(key), run, inputs) {
         Ok(Found::Hit { value, .. }) if value == PASS => Ok(true),
-        Ok(Found::Hit { key, .. }) => Err(SelectError::NotOurs { key, why: "not a test's pass".to_owned() }), // alloc: error path
+        Ok(Found::Hit { key, .. }) => {
+            Err(SelectError::NotOurs { key, why: "not a test's pass".to_owned() })
+        } // alloc: error path
         Ok(Found::Miss { .. }) => Ok(false),
         Err(FindError::Corrupt(corrupt)) => Err(corrupt.into()),
         Err(FindError::NotAShape { key, why }) => Err(SelectError::NotOurs { key, why }),
@@ -495,7 +505,8 @@ fn explain<P: Passes + ?Sized, I: Inputs>(
         return Ok(Why::Attributes);
     }
     let Some(bytes) = store.get(&last.reached)? else { return Ok(Why::NoPass) };
-    let before = decode_reached(bytes).map_err(|why| SelectError::NotOurs { key: last.reached, why })?;
+    let before =
+        decode_reached(bytes).map_err(|why| SelectError::NotOurs { key: last.reached, why })?;
     if let Some(hash) = test.reached.iter().find(|it| before.binary_search(*it).is_err()) {
         return Ok(Why::Changed(*hash));
     }
@@ -503,7 +514,9 @@ fn explain<P: Passes + ?Sized, I: Inputs>(
     if let Some(hash) = before.iter().find(|it| now.binary_search(*it).is_err()) {
         return Ok(Why::Dropped(*hash));
     }
-    let Some(traced) = last.traced().map_err(|why| SelectError::NotOurs { key, why })? else { return Ok(Why::NoPass) };
+    let Some(traced) = last.traced().map_err(|why| SelectError::NotOurs { key, why })? else {
+        return Ok(Why::NoPass);
+    };
     let now = Shape::of(&traced).values(inputs).map_err(SelectError::Inputs)?;
     Ok(changed_input(&traced, &now).map_or(Why::NoPass, Why::Read))
 }
@@ -551,7 +564,10 @@ pub enum RecordError {
     /// The store has a value of a pass's key with other bytes: never kept over.
     Mismatch(Mismatch),
     /// The last entry of the test's history is not one.
-    NotOurs { key: Key, why: String },
+    NotOurs {
+        key: Key,
+        why: String,
+    },
 }
 
 impl fmt::Display for RecordError {
@@ -580,7 +596,10 @@ impl From<Corrupt> for RecordError {
 /// read is not all known. One that read the clock or random numbers is kept, as libtest's
 /// result of it would be taken: a test whose result depends on them is flaky either way.
 pub fn keepable(traced: &Traced) -> bool {
-    !traced.untraceable.iter().any(|it| matches!(it, Untraceable::Network | Untraceable::Descriptor))
+    !traced
+        .untraceable
+        .iter()
+        .any(|it| matches!(it, Untraceable::Network | Untraceable::Descriptor))
 }
 
 /// Records how `test` ran: its pass, when it passed and that can be kept, and an entry of its
@@ -605,7 +624,11 @@ pub fn record<P: Passes + ?Sized>(
     if kept && let Some(traced) = traced.as_deref() {
         let run = RunKey { code: test.identity(), given };
         // alloc: the store's `put` owns the bytes it keeps.
-        tickets.push(store.put(index::result_key(&run, traced), PASS.to_vec()).map_err(RecordError::Mismatch)?);
+        tickets.push(
+            store
+                .put(index::result_key(&run, traced), PASS.to_vec())
+                .map_err(RecordError::Mismatch)?,
+        );
         let mut shape = Shape::of(traced).encode();
         let mut n = 0;
         loop {
@@ -639,7 +662,17 @@ pub fn record<P: Passes + ?Sized>(
         (true, Some(traced)) => trace::encode(&Report::Ran(Some(traced.into_owned()))),
         _ => Vec::new(), // alloc: empty, allocates nothing
     };
-    let entry = || Entry { passed: ran.passed, kept, attrs: test.attrs.id(), reached, took: ran.took, traced: &report }.encode();
+    let entry = || {
+        Entry {
+            passed: ran.passed,
+            kept,
+            attrs: test.attrs.id(),
+            reached,
+            took: ran.took,
+            traced: &report,
+        }
+        .encode()
+    };
     let mut bytes = entry();
     let mut n = last(&*store, given, &test.name)
         .map_err(|error| match error {

@@ -38,12 +38,6 @@ use blaze_dbsp::{Arrangement, Pos, ReadIndex, Work};
 use blaze_hash::{HashMap, HashSet};
 use blaze_mem::Tag;
 use blaze_query::db::{Cancelled, SlotClaim, SlotError};
-use parking_lot::Mutex;
-use std::{
-    alloc::Global,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
-};
 use hir_def::{
     BuiltinDeriveImplId, HasModule, ImplId, ModuleDefId, ModuleId, TraitId,
     builtin_derive::BuiltinDeriveImplTrait,
@@ -56,13 +50,21 @@ use hir_def::{
 };
 use hir_expand::name::Name;
 use intern::Symbol;
+use parking_lot::Mutex;
 use smallvec::SmallVec;
+use std::{
+    alloc::Global,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 
 use super::{
     ImplsDelta,
     head::Head,
     key::{ImplKey, Reads, assoc_names, derive_key, derive_module, impl_key, impl_reads},
-    publish::{self, CandidateRows, DirectorySlot, InherentRows, Published, SliceDirectory, TraitRows},
+    publish::{
+        self, CandidateRows, DirectorySlot, InherentRows, Published, SliceDirectory, TraitRows,
+    },
     read::{BodyPart, body_part},
 };
 use crate::method_resolution::{frozen, macros_writing_impls};
@@ -144,6 +146,9 @@ struct Scratch {
     /// The crates' work, from a pass's nodes ([`run_nodes`]) to its end ([`finish`]).
     jobs: Vec<Job>,
     slots: Vec<(Crate, DirectorySlot)>,
+    /// The impls of the crates the pass resets ([`reset`]), whose read sets go in one
+    /// [`forget_reset`] once every crate's job is out.
+    reset: Vec<ImplId>,
 }
 
 /// One crate's buffers, kept from one write to the next: what its work in a run uses, and what
@@ -245,12 +250,18 @@ pub(crate) fn prepare(db: &mut Db, state: &mut State, written: &Written<'_>) {
         if frozen::served(&*db, krate) || state.crates.contains_key(&krate) {
             continue;
         }
-        let slot = DirectorySlot::new(&*db, krate, blaze_query::db::Slot::empty(publish::slot_name(&*db, krate)));
-        state.crates.insert(krate, CrateState { published: Published::unpublished(slot), ..CrateState::default() });
+        let durability = base_db::crate_durability(&*db, krate);
+        let empty = blaze_query::db::Slot::empty(publish::slot_name(&*db, krate));
+        let slot = DirectorySlot::new(&*db, durability, krate, empty);
+        state.crates.insert(
+            krate,
+            CrateState { published: Published::unpublished(slot), ..CrateState::default() },
+        );
         slots.push((krate, slot));
     }
     {
-        let _span = tracing::info_span!(target: "blaze", "impls register", count = slots.len()).entered();
+        let _span =
+            tracing::info_span!(target: "blaze", "impls register", count = slots.len()).entered();
         publish::register_slots(db, &slots);
     }
     slots.clear();
@@ -268,6 +279,8 @@ fn cost_key(db: &Db, krate: Crate) -> u64 {
 /// workers; the jobs kept for [`finish`].
 pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &Written<'_>) {
     let crates = base_db::all_crates(db);
+    let waking =
+        tracing::info_span!(target: "blaze", "impls woken", count = last.crates.len()).entered();
     let scratch = &mut state.scratch;
     scratch.deltas.clear();
     scratch.names.clear();
@@ -289,14 +302,24 @@ pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &
     if changed {
         scratch.woken.extend(state.wild.iter().copied());
     }
+    drop(waking);
     let mut jobs = std::mem::take(&mut state.scratch.jobs);
     jobs.clear();
-    for &krate in crates.iter() {
-        if frozen::served(db, krate) {
-            continue;
+    {
+        let _span =
+            tracing::info_span!(target: "blaze", "impls start", count = crates.len()).entered();
+        let mut reset_impls = std::mem::take(&mut state.scratch.reset);
+        reset_impls.clear();
+        for &krate in crates.iter() {
+            if frozen::served(db, krate) {
+                continue;
+            }
+            let delta = state.scratch.deltas.get(&krate).copied();
+            jobs.push(start_crate(state, last, krate, delta, &mut reset_impls));
         }
-        let delta = state.scratch.deltas.get(&krate).copied();
-        jobs.push(start_crate(state, last, krate, delta));
+        forget_reset(state, &reset_impls);
+        reset_impls.clear();
+        state.scratch.reset = reset_impls;
     }
     let _span = tracing::info_span!(target: "blaze", "impls nodes", count = jobs.len()).entered();
     // alloc: once per pass, a node's index and cost key per crate maintained
@@ -307,7 +330,11 @@ pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &
     let (by_crate, of) = (&index, &jobs);
     let plan = Plan::new(&predicted, move |node| {
         let krate = of[node as usize].krate;
-        krate.data(db).dependencies.iter().filter_map(move |dep| by_crate.get(&dep.crate_id).copied())
+        krate
+            .data(db)
+            .dependencies
+            .iter()
+            .filter_map(move |dep| by_crate.get(&dep.crate_id).copied())
     })
     .unwrap_or_else(|error| {
         let krate = jobs[error.node() as usize].krate;
@@ -332,7 +359,9 @@ pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &
         };
         let mut order = nodes.plan.lock().order().to_vec(); // alloc: once per pass, the nodes' order
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            db.run_each(Tag::Infer, &mut order, |db, &mut node| run_node(db, &shared, &nodes, node));
+            db.run_each(Tag::Infer, &mut order, |db, &mut node| {
+                run_node(db, &shared, &nodes, node)
+            });
         }))
     };
     // A node that could not run again is the cause of whatever followed it (its dependents'
@@ -406,7 +435,9 @@ fn tests_read_slots(db: &Db, nodes: &Nodes<'_>) -> Vec<(Box<str>, SlotRead)> {
         .flatten()
         .map(|slot| {
             let name = slot.krate(db).named(db).to_string();
-            let read = Cancelled::catch(std::panic::AssertUnwindSafe(|| slot.slot(db).get(db).map(|_| ())));
+            let read = Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+                slot.slot(db).get(db).map(|_| ())
+            }));
             let read = match read {
                 Ok(Ok(())) => SlotRead::Full,
                 Ok(Err(error)) => SlotRead::Error(error),
@@ -421,7 +452,11 @@ fn tests_read_slots(db: &Db, nodes: &Nodes<'_>) -> Vec<(Box<str>, SlotRead)> {
 #[cfg(test)]
 #[inline(never)]
 fn tests_record_failed_pass(before: Vec<(Box<str>, SlotRead)>, after: Vec<(Box<str>, SlotRead)>) {
-    let reads = before.into_iter().zip(after).map(|((name, before), (_, after))| (name, before, after)).collect();
+    let reads = before
+        .into_iter()
+        .zip(after)
+        .map(|((name, before), (_, after))| (name, before, after))
+        .collect();
     FAILED_PASS.with(|it| *it.borrow_mut() = reads);
 }
 
@@ -475,7 +510,8 @@ impl NodeFailed {
 fn run_node<'a>(db: &'a Db, shared: &Shared<'_>, nodes: &'a Nodes<'a>, node: u32) {
     // Declared before the plan's lock is taken: dropped (on an unwind) only after it is let go.
     let gave = blaze_graph::pump::gave_way();
-    let mut begun = Begun { db, nodes, entries: SmallVec::new(), ran: 0, job: None, changing: false, gave };
+    let mut begun =
+        Begun { db, nodes, entries: SmallVec::new(), ran: 0, job: None, changing: false, gave };
     let refused = {
         let mut plan = nodes.plan.lock();
         let Begin::Run { first } = plan.begin(node) else { return };
@@ -529,7 +565,8 @@ impl Begun<'_> {
         while self.ran < self.entries.len() {
             let node = self.entries[self.ran].0;
             self.changing = false;
-            self.job = Some(self.nodes.jobs[node as usize].lock().take().expect("a node's job runs once"));
+            self.job =
+                Some(self.nodes.jobs[node as usize].lock().take().expect("a node's job runs once"));
             let started = Instant::now();
             {
                 let db = self.db;
@@ -564,9 +601,14 @@ impl Begun<'_> {
                     // A give-way here can't be run again; the loop reruns the item all the
                     // same (it gave way), finds the node begun and returns, and the pass names
                     // it once the loop is done.
-                    if let Some(&cancelled @ Cancelled::WouldWaitOnItself { .. }) = payload.downcast_ref::<Cancelled>() {
+                    if let Some(&cancelled @ Cancelled::WouldWaitOnItself { .. }) =
+                        payload.downcast_ref::<Cancelled>()
+                    {
                         let krate = job.krate;
-                        self.nodes.failed.lock().get_or_insert(NodeFailed::GaveWayChanging { krate, cancelled });
+                        self.nodes
+                            .failed
+                            .lock()
+                            .get_or_insert(NodeFailed::GaveWayChanging { krate, cancelled });
                     }
                     std::panic::resume_unwind(payload);
                 }
@@ -641,7 +683,11 @@ struct Working(Option<&'static AtomicU64>);
 impl Working {
     fn enter() -> Working {
         let me = u64::from(blaze_graph::sched::job_here().0) + 1;
-        Working(WORKING.iter().find(|it| it.compare_exchange(0, me, Ordering::Relaxed, Ordering::Relaxed).is_ok()))
+        Working(
+            WORKING.iter().find(|it| {
+                it.compare_exchange(0, me, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            }),
+        )
     }
 }
 
@@ -738,8 +784,15 @@ pub(crate) fn finish(db: &mut Db, state: &mut State, out: &mut Vec<ImplsDelta>) 
 }
 
 /// Takes `krate`'s state out for its work, forgetting what it held first when name resolution
-/// maintains it from empty (`fresh`).
-fn start_crate(state: &mut State, last: &LastWrite, krate: Crate, delta: Option<usize>) -> Job {
+/// maintains it from empty (`fresh`): its impls go on `reset_impls`, whose read sets and owners
+/// the caller forgets once every crate's job is out ([`forget_reset`]).
+fn start_crate(
+    state: &mut State,
+    last: &LastWrite,
+    krate: Crate,
+    delta: Option<usize>,
+    reset_impls: &mut Vec<ImplId>,
+) -> Job {
     let fresh = delta.is_some_and(|at| last.crates[at].fresh);
     let Some(mut crate_state) = state.crates.remove(&krate) else {
         panic!("impls: crate {krate:?} has no state: step 0 ([`prepare`]) gives every crate one");
@@ -753,7 +806,7 @@ fn start_crate(state: &mut State, last: &LastWrite, krate: Crate, delta: Option<
     let mut scratch = std::mem::take(&mut crate_state.scratch);
     scratch.start();
     if fresh {
-        crate_state = reset(state, crate_state, &mut scratch);
+        crate_state = reset(crate_state, &mut scratch, reset_impls);
         let (traits, heads, names) = crate_state.published.keys();
         scratch.trait_keys.extend(traits);
         scratch.head_keys.extend(heads);
@@ -766,14 +819,31 @@ fn start_crate(state: &mut State, last: &LastWrite, krate: Crate, delta: Option<
 fn drop_gone(state: &mut State, crates: &[Crate]) {
     // alloc: a crate graph change, once
     let live: HashSet<Crate, Global> = crates.iter().copied().collect();
-    let gone: Vec<Crate> =
-        state.crates.keys().copied().filter(|it| !live.contains(it)).collect(); // alloc: as above
+    let gone: Vec<Crate> = state.crates.keys().copied().filter(|it| !live.contains(it)).collect(); // alloc: as above
     for krate in gone {
         let Some(crate_state) = state.crates.remove(&krate) else { continue };
         for imp in crate_state.impls.keys() {
             forget_reads(state, *imp);
             state.owner.remove(imp);
         }
+    }
+}
+
+/// Forgets the read sets and owners of the impls of every crate the pass reset, at once: a proc
+/// macro or build script reaching most crates resets most impls, and their read sets are most
+/// of the index, which a sweep drops in one pass ([`ReadIndex::forget_many`]) on the loop's
+/// thread while no crate's node runs yet. Nothing between the resets and here reads the index
+/// or the owners: the impls the write woke were read from them first.
+fn forget_reset(state: &mut State, impls: &[ImplId]) {
+    if impls.is_empty() {
+        return;
+    }
+    let _span = tracing::info_span!(target: "blaze", "impls reset", count = impls.len()).entered();
+    state.by_name.forget_many(impls.iter().copied());
+    state.by_def.forget_many(impls.iter().copied());
+    for imp in impls {
+        state.wild.remove(imp);
+        state.owner.remove(imp);
     }
 }
 
@@ -881,12 +951,10 @@ fn replay(state: &mut State, scratch: &mut CrateScratch, krate: Crate) {
 }
 
 /// Forgets what a crate held, keeping its published inputs and buffers: a crate maintained
-/// from empty sets every slice it had anew, emptied where it has no rows now.
-fn reset(state: &mut State, old: CrateState, scratch: &mut CrateScratch) -> CrateState {
-    for imp in old.impls.keys() {
-        forget_reads(state, *imp);
-        state.owner.remove(imp);
-    }
+/// from empty sets every slice it had anew, emptied where it has no rows now. Its impls go on
+/// `reset_impls`, for [`forget_reset`].
+fn reset(old: CrateState, scratch: &mut CrateScratch, reset_impls: &mut Vec<ImplId>) -> CrateState {
+    reset_impls.extend(old.impls.keys().copied());
     scratch.keys_changed.extend(old.impls.keys().copied());
     scratch.traits_changed.extend(old.assoc.keys().copied());
     CrateState { published: old.published, ..CrateState::default() }
@@ -903,9 +971,10 @@ fn is_trait_impl(db: &Db, scratch: &mut CrateScratch, module: ModuleId, imp: Imp
         scratch.kinds.extend(impls.trait_impls.iter().map(|&it| (it, true)));
         scratch.kinds.extend(impls.inherent_impls.iter().map(|&it| (it, false)));
     }
-    *scratch.kinds.get(&imp).unwrap_or_else(|| {
-        panic!("impls: {imp:?} is not among the impls of its module {module:?}")
-    })
+    *scratch
+        .kinds
+        .get(&imp)
+        .unwrap_or_else(|| panic!("impls: {imp:?} is not among the impls of its module {module:?}"))
 }
 
 fn apply_impls(
@@ -1246,7 +1315,13 @@ fn rows(scratch: &mut CrateScratch, crate_state: &mut CrateState, fresh: bool) {
 }
 
 /// Sets every slice whose rows changed, then the directory's new keys and body modules.
-fn publish(db: &mut Db, scratch: &mut CrateScratch, crate_state: &mut CrateState, krate: Crate, work: &mut Work) {
+fn publish(
+    db: &mut Db,
+    scratch: &mut CrateScratch,
+    crate_state: &mut CrateState,
+    krate: Crate,
+    work: &mut Work,
+) {
     let published = &mut crate_state.published;
     for (trait_, rows) in scratch.trait_rows.drain(..) {
         work.slices += u64::from(published.set_trait(db, krate, trait_, rows));
@@ -1457,7 +1532,13 @@ fn warm(db: &Db, shared: &Shared<'_>, job: &mut Job) {
         keys.extend(crate_state.impls.keys().map(|&it| Warm::Impl(it)));
     } else {
         let owner = shared.owner;
-        keys.extend(shared.woken.iter().filter(|imp| owner.get(*imp) == Some(&krate)).map(|&it| Warm::Impl(it)));
+        keys.extend(
+            shared
+                .woken
+                .iter()
+                .filter(|imp| owner.get(*imp) == Some(&krate))
+                .map(|&it| Warm::Impl(it)),
+        );
     }
     if shared.crates_changed || shared.changed {
         // A trait the write removed leaves the wild ones in the work, before they are read again.
@@ -1467,9 +1548,15 @@ fn warm(db: &Db, shared: &Shared<'_>, job: &mut Job) {
                     && !delta.traits.iter().any(|&(t, w)| t == *it && w > 0)
             })
         };
-        keys.extend(crate_state.wild_traits.iter().filter(|it| !gone(it)).map(|&it| Warm::Trait(it)));
+        keys.extend(
+            crate_state.wild_traits.iter().filter(|it| !gone(it)).map(|&it| Warm::Trait(it)),
+        );
     }
-    if job.fresh || shared.crates_changed || delta.is_some_and(touches_traits) || crate_state.lang.is_none() {
+    if job.fresh
+        || shared.crates_changed
+        || delta.is_some_and(touches_traits)
+        || crate_state.lang.is_none()
+    {
         keys.extend(crate_state.derives.keys().map(|&it| Warm::Derive(it)));
     }
     db.run_all(Tag::Infer, keys.len(), |db, at| warm_one(db, &keys[at]));

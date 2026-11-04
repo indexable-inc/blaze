@@ -55,7 +55,9 @@ impl List {
             at += 1;
             let len = match leb::read_u32(module, &mut at) {
                 Ok(len) => len,
-                Err(error) => return Err(format!("has a section at {at} whose size can't be read: {error}")), // alloc: error path
+                Err(error) => {
+                    return Err(format!("has a section at {at} whose size can't be read: {error}"));
+                } // alloc: error path
             };
             let Some(payload) = module.get(at..at + len as usize) else {
                 return Err(format!("has a section at {at} of {len} bytes, past its end")); // alloc: error path
@@ -65,7 +67,9 @@ impl List {
                 continue;
             }
             let mut name_at = 0;
-            let name = leb::read_u32(payload, &mut name_at).ok().and_then(|n| payload.get(name_at..name_at + n as usize));
+            let name = leb::read_u32(payload, &mut name_at)
+                .ok()
+                .and_then(|n| payload.get(name_at..name_at + n as usize));
             if name != Some(SECTION.as_bytes()) {
                 continue;
             }
@@ -89,7 +93,8 @@ impl List {
     fn entries(bytes: &[u8]) -> Result<List, String> {
         let mut list = List::default();
         let mut at = 0;
-        let bad = |at: usize, what: &str| format!("has a `{SECTION}` section whose entry at {at} {what}"); // alloc: error path
+        let bad =
+            |at: usize, what: &str| format!("has a `{SECTION}` section whose entry at {at} {what}"); // alloc: error path
         while at < bytes.len() {
             let (Some(heap_base), Some(count)) = (word(bytes, at), word(bytes, at + 36)) else {
                 return Err(bad(at, "is cut short"));
@@ -99,7 +104,13 @@ impl List {
                 return Err(bad(at, "has no records"));
             }
             if !list.entries.is_empty() && heap_base != list.heap_base {
-                return Err(bad(at, &format!("says the heap starts at {heap_base}, another says {}", list.heap_base)));
+                return Err(bad(
+                    at,
+                    &format!(
+                        "says the heap starts at {heap_base}, another says {}",
+                        list.heap_base
+                    ),
+                ));
             }
             list.heap_base = heap_base;
             let start = list.records.len();
@@ -109,7 +120,10 @@ impl List {
                     return Err(bad(at, "is cut short"));
                 };
                 if u64::from(addr) + u64::from(len) > u64::from(heap_base) {
-                    return Err(bad(at, &format!("has {len} bytes at {addr}, past the heap's start {heap_base}")));
+                    return Err(bad(
+                        at,
+                        &format!("has {len} bytes at {addr}, past the heap's start {heap_base}"),
+                    ));
                 }
                 list.records.push((addr, len));
             }
@@ -145,7 +159,11 @@ impl Statics {
     /// What `list` watches before it is resolved: nothing, and resolved only when it lists
     /// nothing.
     pub(crate) fn unresolved(list: &List) -> Statics {
-        Statics { heap_base: list.heap_base, resolved: list.entries.is_empty(), ..Statics::default() }
+        Statics {
+            heap_base: list.heap_base,
+            resolved: list.entries.is_empty(),
+            ..Statics::default()
+        }
     }
 
     /// The entries of `list` of the crates `krate` (the proc-macro crate the module was built
@@ -171,7 +189,8 @@ impl Statics {
                 None => stack.extend(it.data(db).dependencies.iter().map(|dep| dep.crate_id)),
             }
         }
-        let mut statics = Statics { heap_base: list.heap_base, resolved: true, ..Statics::default() };
+        let mut statics =
+            Statics { heap_base: list.heap_base, resolved: true, ..Statics::default() };
         for (item, records) in &list.entries {
             let prefix = *item.0.first_chunk().expect("a key is 32 bytes");
             let Some(&of) = crates.get(&prefix) else {
@@ -215,7 +234,10 @@ impl Statics {
         for &(addr, len) in &self.records {
             let Some(bytes) = memory.get(addr as usize..addr as usize + len as usize) else {
                 // alloc: error path
-                return Err(format!("lists {len} bytes at {addr}, past its memory of {}", memory.len()));
+                return Err(format!(
+                    "lists {len} bytes at {addr}, past its memory of {}",
+                    memory.len()
+                ));
             };
             out.extend_from_slice(bytes);
         }
@@ -242,9 +264,10 @@ impl Statics {
             offset += len as usize;
             let first = (addr.next_multiple_of(4) - addr) as usize;
             let words = record.get(first..).unwrap_or_default().chunks_exact(4);
-            if words.map(|it| u32::from_le_bytes(*it.first_chunk().expect("4 bytes"))).any(|word| {
-                word >= self.heap_base && (word as usize) < memory_len
-            }) {
+            if words
+                .map(|it| u32::from_le_bytes(*it.first_chunk().expect("4 bytes")))
+                .any(|word| word >= self.heap_base && (word as usize) < memory_len)
+            {
                 return true;
             }
         }
@@ -254,7 +277,11 @@ impl Statics {
     /// Where `bytes` of watched static `id`, as [`Statics::read`] gives them, are written: each
     /// record's address and its part of the bytes. `None` when `id` is not watched or the bytes
     /// are not its size.
-    pub(crate) fn places<'b>(&self, id: StaticId, bytes: &'b [u8]) -> Option<impl Iterator<Item = (u32, &'b [u8])> + use<'_, 'b>> {
+    pub(crate) fn places<'b>(
+        &self,
+        id: StaticId,
+        bytes: &'b [u8],
+    ) -> Option<impl Iterator<Item = (u32, &'b [u8])> + use<'_, 'b>> {
         let at = self.watched.iter().position(|it| it.id == id)?;
         (self.span(at).len() == bytes.len()).then(|| {
             let mut offset = 0;

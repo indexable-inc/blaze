@@ -1,10 +1,10 @@
 //! The harness over random programs: functions calling the ones before them, methods, struct
 //! literals and closures; an edit of each body reaches only it.
 
-use hegel::{Hegel, Settings, TestCase};
 use hegel::generators as gs;
-use hir_firewall::Harness;
+use hegel::{Hegel, Settings, TestCase};
 use hir_expand::fixture;
+use hir_firewall::Harness;
 
 /// One operand of a function of `x` that may call the `functions` before it and use the
 /// `structs` there are.
@@ -58,8 +58,11 @@ fn reaches_only_the_edited_body(tc: &TestCase) {
 
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
 fn run_cases(cases: u64, mut property: impl FnMut(&TestCase)) {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(move |tc: TestCase| property(&tc)).settings(Settings::new().test_cases(cases).database(None)).run();
+    let cases =
+        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
+    Hegel::new(move |tc: TestCase| property(&tc))
+        .settings(Settings::new().test_cases(cases).database(None))
+        .run();
 }
 
 /// `HEGEL_TEST_CASES=<n>` runs it longer.

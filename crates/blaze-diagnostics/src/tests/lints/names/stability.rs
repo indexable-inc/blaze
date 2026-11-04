@@ -52,7 +52,9 @@ fn unit_and_tuple_struct() {
 fn deprecation_lint_nested() {
     let source = include_str!("stability/deprecation-lint-nested.rs");
     let expected = include_str!("stability/deprecation-lint-nested.stderr");
-    let fixture = format!("//- minicore: fmt\n//- /deprecation-lint-nested.rs crate:other:main edition:2015\n{source}");
+    let fixture = format!(
+        "//- minicore: fmt\n//- /deprecation-lint-nested.rs crate:other:main edition:2015\n{source}"
+    );
     assert_eq!(ui(&fixture, Mode::Other), expected);
 }
 
@@ -217,14 +219,20 @@ pub mod prelude {
 fn deprecation_lint_2() {
     let source = include_str!("stability/deprecation-lint-2.rs");
     let expected = include_str!("stability/deprecation-lint-2.stderr");
-    assert_eq!(ui(&with_deprecation_lint("deprecation-lint-2.rs", source, "", ""), Mode::Other), expected);
+    assert_eq!(
+        ui(&with_deprecation_lint("deprecation-lint-2.rs", source, "", ""), Mode::Other),
+        expected
+    );
 }
 
 #[test]
 fn deprecation_lint_3() {
     let source = include_str!("stability/deprecation-lint-3.rs");
     let expected = include_str!("stability/deprecation-lint-3.stderr");
-    assert_eq!(ui(&with_deprecation_lint("deprecation-lint-3.rs", source, "", ""), Mode::Other), expected);
+    assert_eq!(
+        ui(&with_deprecation_lint("deprecation-lint-3.rs", source, "", ""), Mode::Other),
+        expected
+    );
 }
 
 #[test]
@@ -391,8 +399,11 @@ impl Tr for S {
 fn main() {}
 "#,
     );
-    let messages: Vec<String> =
-        checked.messages().into_iter().filter(|it| it.contains("`#[deprecated]` annotation")).collect();
+    let messages: Vec<String> = checked
+        .messages()
+        .into_iter()
+        .filter(|it| it.contains("`#[deprecated]` annotation"))
+        .collect();
     assert_eq!(
         messages,
         [
@@ -420,10 +431,14 @@ fn main() {
 }
 "#,
     );
-    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
+    let messages: Vec<String> =
+        checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
     assert_eq!(
         messages,
-        ["deprecated: use of deprecated function `e`: use h", "deprecated: use of deprecated function `old::g`"]
+        [
+            "deprecated: use of deprecated function `e`: use h",
+            "deprecated: use of deprecated function `old::g`"
+        ]
     );
 }
 
@@ -438,7 +453,13 @@ fn an_unstable_trait_impl_of_stable_types_and_traits_has_no_effect() {
     let no_effect = ["`#[unstable]`", "no effect"];
     assert_reports(
         &stderr,
-        &[error(25, &no_effect), error(33, &no_effect), error(37, &no_effect), error(44, &no_effect), error(1, &["stability attribute"])],
+        &[
+            error(25, &no_effect),
+            error(33, &no_effect),
+            error(37, &no_effect),
+            error(44, &no_effect),
+            error(1, &["stability attribute"]),
+        ],
     );
 }
 
@@ -468,8 +489,12 @@ impl T for W<S> {}
 fn main() {}
 "#,
     );
-    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.contains("has no effect")).collect();
-    assert_eq!(messages, ["ineffective_unstable_trait_impl: an `#[unstable]` annotation here has no effect"]);
+    let messages: Vec<String> =
+        checked.messages().into_iter().filter(|it| it.contains("has no effect")).collect();
+    assert_eq!(
+        messages,
+        ["ineffective_unstable_trait_impl: an `#[unstable]` annotation here has no effect"]
+    );
 }
 
 #[test]
@@ -489,7 +514,8 @@ fn main() {
 }
 "#,
     );
-    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
+    let messages: Vec<String> =
+        checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
     assert_eq!(
         messages,
         [
@@ -522,7 +548,8 @@ fn main() {
 }
 "#,
     );
-    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
+    let messages: Vec<String> =
+        checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
     assert_eq!(
         messages,
         [
@@ -548,7 +575,8 @@ fn main() {
 }
 "#,
     );
-    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("E0658")).collect();
+    let messages: Vec<String> =
+        checked.messages().into_iter().filter(|it| it.starts_with("E0658")).collect();
     assert_eq!(messages, ["E0658: use of unstable library feature `fé`"]);
 }
 
@@ -570,6 +598,7 @@ fn main() {
 }
 "#,
     );
-    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
+    let messages: Vec<String> =
+        checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
     assert_eq!(messages, ["deprecated: use of deprecated function `dep::f`: n"]);
 }

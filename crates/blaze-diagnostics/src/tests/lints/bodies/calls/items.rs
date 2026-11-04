@@ -24,18 +24,31 @@ fn prelude(extra: &str) -> String {
 /// `run-pass` and none has `//@ compile-flags`), core being minicore with `flags`, std the
 /// prelude of [`prelude`] with `extra` and `std_items`, and the library features of std's
 /// `library` ([`crate::tests::library_features`]).
-fn ui_std(name: &str, (flags, library): (&str, &[&str]), extra: &str, std_items: &str, source: &str) -> String {
+fn ui_std(
+    name: &str,
+    (flags, library): (&str, &[&str]),
+    extra: &str,
+    std_items: &str,
+    source: &str,
+) -> String {
     let (library, deps) = match library {
         [] => (String::new(), String::new()),
-        _ => (crate::tests::library_features(library), format!(",{}", crate::tests::LIBRARY_FEATURES)),
+        _ => (
+            crate::tests::library_features(library),
+            format!(",{}", crate::tests::LIBRARY_FEATURES),
+        ),
     };
     let fixture = format!(
         "//- minicore: {flags}\n//- /std.rs crate:std\n#![feature(lang_items, rustc_attrs)]\n{}{std_items}\n{library}\
          //- /{name} crate:other:main edition:2015 deps:std{deps}\n{source}",
         prelude(extra)
     );
-    let stderr = crate::tests::checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()))
-        .stderr_with(Style { ui_testing: true, ..Style::default() });
+    let stderr = crate::tests::checked_with(
+        &fixture,
+        "$DIR/",
+        &compiletest(Mode::Other, &Options::default()),
+    )
+    .stderr_with(Style { ui_testing: true, ..Style::default() });
     crate::tests::normalized(&stderr)
 }
 
@@ -46,7 +59,16 @@ macro_rules! ui {
             let name = concat!(stringify!($test), ".rs");
             let source = include_str!(concat!("items/ui/", stringify!($test), ".rs"));
             let expected = include_str!(concat!("items/ui/", stringify!($test), ".stderr"));
-            assert_eq!(ui_std(name, ($group::FLAGS, $group::LIBRARY), $group::PRELUDE, $group::ITEMS, source), expected);
+            assert_eq!(
+                ui_std(
+                    name,
+                    ($group::FLAGS, $group::LIBRARY),
+                    $group::PRELUDE,
+                    $group::ITEMS,
+                    source
+                ),
+                expected
+            );
         }
     };
     ($test:ident, $file:literal, $group:ident) => {
@@ -54,7 +76,16 @@ macro_rules! ui {
         fn $test() {
             let source = include_str!(concat!("items/ui/", $file, ".rs"));
             let expected = include_str!(concat!("items/ui/", $file, ".stderr"));
-            assert_eq!(ui_std(concat!($file, ".rs"), ($group::FLAGS, $group::LIBRARY), $group::PRELUDE, $group::ITEMS, source), expected);
+            assert_eq!(
+                ui_std(
+                    concat!($file, ".rs"),
+                    ($group::FLAGS, $group::LIBRARY),
+                    $group::PRELUDE,
+                    $group::ITEMS,
+                    source
+                ),
+                expected
+            );
         }
     };
 }
@@ -484,7 +515,10 @@ ui!(atomic_ordering_update, "lint-invalid-atomic-ordering-update", atomic);
 fn atomic_ordering_false_positive() {
     let name = "lint-invalid-atomic-ordering-false-positive.rs";
     let source = include_str!("items/ui/lint-invalid-atomic-ordering-false-positive.rs");
-    assert_eq!(ui_std(name, (atomic::FLAGS, atomic::LIBRARY), atomic::PRELUDE, atomic::ITEMS, source), "");
+    assert_eq!(
+        ui_std(name, (atomic::FLAGS, atomic::LIBRARY), atomic::PRELUDE, atomic::ITEMS, source),
+        ""
+    );
 }
 
 /// A `drop` of a value with side effects that is a whole arm of a `match` is kept, and one
@@ -522,7 +556,10 @@ LL | #![warn(dropping_copy_types)]
 warning: 1 warning emitted
 
 ";
-    assert_eq!(ui_std("arm.rs", (mem::FLAGS, mem::LIBRARY), mem::PRELUDE, mem::ITEMS, source), expected);
+    assert_eq!(
+        ui_std("arm.rs", (mem::FLAGS, mem::LIBRARY), mem::PRELUDE, mem::ITEMS, source),
+        expected
+    );
 }
 
 /// The bytes are read through an immutable `let` and a `const`, not a `let mut`.

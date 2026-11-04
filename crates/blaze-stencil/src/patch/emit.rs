@@ -41,7 +41,8 @@ use crate::{
 /// The alignment of a function's code: its constants are 16-aligned in it.
 pub const ALIGN: u32 = 16;
 
-const JUMP: Shape = Shape { op: Op::Jump, ty: Ty::I8, aux: 0, srcs: [Src::None; 3], dst: Dst::None };
+const JUMP: Shape =
+    Shape { op: Op::Jump, ty: Ty::I8, aux: 0, srcs: [Src::None; 3], dst: Dst::None };
 
 /// The one reservation of a function: bytes, labels and fixups of the buffer, and lines.
 pub(super) struct Size {
@@ -135,7 +136,8 @@ pub(super) fn edges(
                 edge(plan, func, target, block, term, *table.normal_return(), false)?;
                 for item in table.items() {
                     match item {
-                        ir::ExceptionTableItem::Tag(_, call) | ir::ExceptionTableItem::Default(call) => {
+                        ir::ExceptionTableItem::Tag(_, call)
+                        | ir::ExceptionTableItem::Default(call) => {
                             edge(plan, func, target, block, term, call, true)?;
                         }
                         ir::ExceptionTableItem::Context(_) => {}
@@ -143,7 +145,8 @@ pub(super) fn edges(
                 }
             }
             None => {
-                for &call in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                for &call in
+                    data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
                 {
                     edge(plan, func, target, block, term, call, false)?;
                 }
@@ -187,7 +190,14 @@ fn edge(
                 BlockArg::TryCallRet(_) | BlockArg::TryCallExn(_) => true,
             }
     });
-    plan.edges.push(Edge { block, call, label: Label(NONE), own: landing || back || moves, back, landing });
+    plan.edges.push(Edge {
+        block,
+        call,
+        label: Label(NONE),
+        own: landing || back || moves,
+        back,
+        landing,
+    });
     Ok(())
 }
 
@@ -219,7 +229,13 @@ fn follows(plan: &Plan<'_>, func: &ir::Function, block: ir::Block, term: ir::Ins
 }
 
 /// Complements a `BrIcmp` whose taken edge follows and whose other edge does not.
-fn orient(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, block: ir::Block, term: ir::Inst) {
+fn orient(
+    plan: &mut Plan<'_>,
+    func: &ir::Function,
+    library: &Reader<'_>,
+    block: ir::Block,
+    term: ir::Inst,
+) {
     let sel = plan.sels[term.as_u32() as usize];
     if sel.kind != Kind::Stencil || sel.shape.op != Op::BrIcmp {
         return;
@@ -270,7 +286,8 @@ pub(super) fn size<A: Glue>(
 ) -> Result<Size, Error> {
     let fixed = A::bound_fixed(frame) as usize;
     let jump = library.find(JUMP.key()).map_or(0, |at| library.stencil(at).code.len());
-    let len = |shape: Shape| library.find(shape.key()).map_or(0, |at| library.stencil(at).code.len());
+    let len =
+        |shape: Shape| library.find(shape.key()).map_or(0, |at| library.stencil(at).code.len());
     let mut bytes = fixed;
     let mut fixups = 0usize;
     let mut consts = 0usize;
@@ -287,7 +304,9 @@ pub(super) fn size<A: Glue>(
             match plan.sels[i].kind {
                 Kind::Stencil => {
                     let sel = plan.sels[i];
-                    let at = library.find(sel.shape.key()).ok_or_else(|| missing(inst, sel.shape, library))?;
+                    let at = library
+                        .find(sel.shape.key())
+                        .ok_or_else(|| missing(inst, sel.shape, library))?;
                     plan.sels[i].stencil = at;
                     let stencil = library.stencil(at);
                     bytes += stencil.code.len();
@@ -305,7 +324,8 @@ pub(super) fn size<A: Glue>(
                         fixups += usize::from(hole.kind.is_place());
                     }
                     if plan.relays {
-                        bytes += fixed * (usize::from(sel.nargs) + func.dfg.inst_results(inst).len());
+                        bytes +=
+                            fixed * (usize::from(sel.nargs) + func.dfg.inst_results(inst).len());
                     }
                 }
                 Kind::Glue => {
@@ -331,7 +351,9 @@ pub(super) fn size<A: Glue>(
             }
             let Some(ty) = ty_of(func.dfg.value_type(param)) else { continue };
             let konst = match arg {
-                BlockArg::Value(value) => plan.konst[func.dfg.resolve_aliases(value).as_u32() as usize],
+                BlockArg::Value(value) => {
+                    plan.konst[func.dfg.resolve_aliases(value).as_u32() as usize]
+                }
                 BlockArg::TryCallRet(_) | BlockArg::TryCallExn(_) => Konst::None,
             };
             let one = materialize(konst, ty).map_or(0, |(shape, _)| len(shape)).max(len(copy(ty)));
@@ -496,7 +518,8 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
         let mut fill = Fill { offset: sel.offset, trap: sel.trap, konst: sel.konst, ..Fill::NONE };
         if shape.op.info().branches {
             let edges = plan.edges_of(inst);
-            let (taken, other) = if sel.swapped { (edges[1], edges[0]) } else { (edges[0], edges[1]) };
+            let (taken, other) =
+                if sel.swapped { (edges[1], edges[0]) } else { (edges[0], edges[1]) };
             fill.target = Some(taken.label);
             if self.after(block, inst) != Some(other.label) {
                 fill.next = Next::To(other.label);
@@ -513,14 +536,21 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                             let slot = plan.slot[arg.as_u32() as usize];
                             if slot == NONE {
                                 // alloc: the error's message, once per failed compile.
-                                return Err(Error::at(inst, format!("operand {arg} of `{shape}` has no slot")));
+                                return Err(Error::at(
+                                    inst,
+                                    format!("operand {arg} of `{shape}` has no slot"),
+                                ));
                             }
-                            fill.srcs[n] = self.near(inst, plan.base + slot, shape.arg(n).slot(), n as u32)?;
+                            fill.srcs[n] =
+                                self.near(inst, plan.base + slot, shape.arg(n).slot(), n as u32)?;
                         }
                         Src::Imm => {
                             let Konst::Int(value) = plan.konst[arg.as_u32() as usize] else {
                                 // alloc: the error's message, once per failed compile.
-                                return Err(Error::at(inst, format!("operand {arg} of `{shape}` is no constant")));
+                                return Err(Error::at(
+                                    inst,
+                                    format!("operand {arg} of `{shape}` is no constant"),
+                                ));
                             };
                             // The stencil's operand type, narrower than the value's for a shift
                             // amount (an `i8` it masks).
@@ -563,7 +593,13 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
     }
 
     /// Copies `stencil` and patches its holes from `fill`.
-    fn put(&mut self, inst: ir::Inst, stencil: &Stencil<'_>, shape: Shape, fill: &Fill) -> Result<(), Error> {
+    fn put(
+        &mut self,
+        inst: ir::Inst,
+        stencil: &Stencil<'_>,
+        shape: Shape,
+        fill: &Fill,
+    ) -> Result<(), Error> {
         let code = if fill.next == Next::Falls { stencil.body() } else { stencil.code };
         self.room(code.len() as u32)?;
         let at = self.buf.len();
@@ -590,7 +626,9 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                     })?;
                     Some(self.side.trap(self.buf, code))
                 }
-                HoleKind::TrapOverflow => Some(self.side.trap(self.buf, ir::TrapCode::INTEGER_OVERFLOW)),
+                HoleKind::TrapOverflow => {
+                    Some(self.side.trap(self.buf, ir::TrapCode::INTEGER_OVERFLOW))
+                }
                 HoleKind::Const => {
                     let (pool, index, bytes) = self.konst(inst, fill.konst)?;
                     Some(self.side.konst(self.buf, pool, index, bytes, (place, hole.form, addend)))
@@ -611,9 +649,11 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                 HoleKind::Imm1 => imm(hole.form, fill.imms[1], addend),
                 HoleKind::Imm2 => imm(hole.form, fill.imms[2], addend),
                 // A confined access adds its offset in 32 bits, which wrap.
-                HoleKind::Offset => {
-                    imm(hole.form, (fill.offset, if shape.confined().is_some() { 32 } else { 64 }), addend)
-                }
+                HoleKind::Offset => imm(
+                    hole.form,
+                    (fill.offset, if shape.confined().is_some() { 32 } else { 64 }),
+                    addend,
+                ),
                 HoleKind::Next => match fill.next {
                     Next::Falls => end + addend - i64::from(place),
                     Next::To(to) => {
@@ -627,7 +667,9 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                     self.buf.fixup(place, hole.form, to, addend);
                     continue;
                 }
-                HoleKind::Target | HoleKind::Trap | HoleKind::TrapOverflow | HoleKind::Const => continue,
+                HoleKind::Target | HoleKind::Trap | HoleKind::TrapOverflow | HoleKind::Const => {
+                    continue;
+                }
             };
             self.buf.patch(place, hole.form, value).map_err(|e| {
                 // alloc: the error's message, once per failed compile.
@@ -642,10 +684,20 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
     /// access records nothing, as in Cranelift.
     ///
     /// [`Code::traps`]: crate::code::Code::traps
-    fn faults(&mut self, inst: ir::Inst, stencil: &Stencil<'_>, at: u32, len: usize, shape: Shape) -> Result<(), Error> {
+    fn faults(
+        &mut self,
+        inst: ir::Inst,
+        stencil: &Stencil<'_>,
+        at: u32,
+        len: usize,
+        shape: Shape,
+    ) -> Result<(), Error> {
         let Some(flags) = self.func.dfg.insts[inst].memflags() else {
             // alloc: the error's message, once per failed compile.
-            return Err(Error::at(inst, format!("`{shape}` accesses memory and the instruction has no flags")));
+            return Err(Error::at(
+                inst,
+                format!("`{shape}` accesses memory and the instruction has no flags"),
+            ));
         };
         let Some(code) = self.func.dfg.mem_flags[flags].trap_code() else { return Ok(()) };
         for fault in stencil.faults() {
@@ -660,17 +712,24 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
     /// index and its 16 bytes.
     fn konst(&self, inst: ir::Inst, konst: KonstRef) -> Result<(bool, u32, [u8; 16]), Error> {
         let (pool, index, data) = match konst {
-            KonstRef::Pool(handle) => (true, handle.as_u32(), self.func.dfg.constants.get(handle).as_slice()),
+            KonstRef::Pool(handle) => {
+                (true, handle.as_u32(), self.func.dfg.constants.get(handle).as_slice())
+            }
             KonstRef::Immediate(imm) => match self.func.dfg.immediates.get(imm) {
                 Some(data) => (false, imm.as_u32(), data.as_slice()),
                 // alloc: the error's message, once per failed compile.
                 None => return Err(Error::at(inst, format!("{imm} is not in the function"))),
             },
-            KonstRef::None => return Err(Error::at(inst, "a `Const` hole of an instruction with no constant")),
+            KonstRef::None => {
+                return Err(Error::at(inst, "a `Const` hole of an instruction with no constant"));
+            }
         };
         if data.len() > 16 {
             // alloc: the error's message, once per failed compile.
-            return Err(Error::at(inst, format!("a constant of {} bytes, more than a `Const` hole's 16", data.len())));
+            return Err(Error::at(
+                inst,
+                format!("a constant of {} bytes, more than a `Const` hole's 16", data.len()),
+            ));
         }
         let mut bytes = [0u8; 16];
         bytes[..data.len()].copy_from_slice(data);
@@ -751,9 +810,16 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                     let value = func.dfg.resolve_aliases(value);
                     match plan.slot[value.as_u32() as usize] {
                         NONE => match plan.konst[value.as_u32() as usize] {
-                            konst @ (Konst::Int(_) | Konst::F32(_) | Konst::F64(_)) => From::Konst(konst),
+                            konst @ (Konst::Int(_) | Konst::F32(_) | Konst::F64(_)) => {
+                                From::Konst(konst)
+                            }
                             // alloc: the error's message, once per failed compile.
-                            _ => return Err(Error::at(term, format!("block argument {value} has no place"))),
+                            _ => {
+                                return Err(Error::at(
+                                    term,
+                                    format!("block argument {value} has no place"),
+                                ));
+                            }
                         },
                         slot => From::Slot(plan.base + slot),
                     }
@@ -766,7 +832,9 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                 BlockArg::TryCallExn(k) => match plan.payload(term, k as usize) {
                     Loc::Slot(slot) => From::Slot(slot),
                     // alloc: the error's message, once per failed compile.
-                    _ => return Err(Error::at(term, format!("exception payload {k} has no place"))),
+                    _ => {
+                        return Err(Error::at(term, format!("exception payload {k} has no place")));
+                    }
                 },
             };
             if from != From::Slot(to) {
@@ -818,7 +886,10 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
             From::Konst(konst) => {
                 let Some((shape, imm)) = materialize(konst, one.ty) else {
                     // alloc: the error's message, once per failed compile.
-                    return Err(Error::at(term, format!("a constant block argument of {}", one.ty.name())));
+                    return Err(Error::at(
+                        term,
+                        format!("a constant block argument of {}", one.ty.name()),
+                    ));
                 };
                 fill.imms[0] = (imm, u32::from(shape.ty.bytes()) * 8);
                 shape
@@ -826,7 +897,8 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
         };
         let far = one.to >= A::NEAR[usize::from(bytes == 16)];
         fill.dsts[0] = if far { self.relay(term, 3)? } else { one.to };
-        let at = self.library.find(shape.key()).ok_or_else(|| missing(term, shape, self.library))?;
+        let at =
+            self.library.find(shape.key()).ok_or_else(|| missing(term, shape, self.library))?;
         let stencil = self.library.stencil(at);
         self.put(term, &stencil, shape, &fill)?;
         if far {

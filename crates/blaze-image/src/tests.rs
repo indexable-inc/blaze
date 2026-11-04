@@ -22,12 +22,7 @@ fn noise(len: usize, seed: u64) -> Vec<u8> {
 
 /// Sections of 3 groups and a bit, an empty one, one group exactly, and a few bytes.
 fn contents() -> Vec<(SectionId, Vec<u8>)> {
-    vec![
-        (A, noise(3 * 4096 + 100, 1)),
-        (B, Vec::new()),
-        (C, noise(4096, 2)),
-        (D, noise(37, 3)),
-    ]
+    vec![(A, noise(3 * 4096 + 100, 1)), (B, Vec::new()), (C, noise(4096, 2)), (D, noise(37, 3))]
 }
 
 fn build(shift: u32, sections: &[(SectionId, Vec<u8>)]) -> Vec<u8> {
@@ -61,7 +56,10 @@ fn sections_read_back_whole_and_by_group() {
         for _ in 0..50 {
             let at = rng.below(section.len + 1);
             let len = rng.below(section.len - at + 1);
-            assert_eq!(image.range(&section, at, len).unwrap(), &bytes[at as usize..(at + len) as usize]);
+            assert_eq!(
+                image.range(&section, at, len).unwrap(),
+                &bytes[at as usize..(at + len) as usize]
+            );
         }
     }
     assert!(image.verify().is_empty());
@@ -87,8 +85,16 @@ fn open_reads_only_the_spine() {
         let bytes = build(shift, &sections);
         let image = open(bytes);
         let spine_len = (HEADER + sections.len() * SECTION_ENTRY + 4).next_multiple_of(8) as u64;
-        assert_eq!(image.touched.end.load(Relaxed), spine_len, "2^{shift}: read to the spine's end");
-        assert_eq!(image.touched.bytes.load(Relaxed), HEADER as u64 + spine_len, "the header, then the spine");
+        assert_eq!(
+            image.touched.end.load(Relaxed),
+            spine_len,
+            "2^{shift}: read to the spine's end"
+        );
+        assert_eq!(
+            image.touched.bytes.load(Relaxed),
+            HEADER as u64 + spine_len,
+            "the header, then the spine"
+        );
         for section in image.sections() {
             for group in 0..section.groups {
                 assert!(!image.is_checked(section, group));
@@ -105,7 +111,10 @@ fn a_read_checks_only_its_groups() {
     let image = open(build(PAGE, &sections));
     let section = image.section(A, schema_a()).unwrap();
     let before = image.touched.bytes.load(Relaxed);
-    assert_eq!(image.range(&section, 5 * 4096 + 10, 8).unwrap(), &sections[0].1[5 * 4096 + 10..][..8]);
+    assert_eq!(
+        image.range(&section, 5 * 4096 + 10, 8).unwrap(),
+        &sections[0].1[5 * 4096 + 10..][..8]
+    );
     let read = image.touched.bytes.load(Relaxed) - before;
     assert_eq!(read, 4096 + 4096 + 4 + 8, "the group, the table's group, the entry and the bytes");
     for group in 0..section.groups {
@@ -115,7 +124,11 @@ fn a_read_checks_only_its_groups() {
     assert!(image.is_checked(&section, 6) && image.is_checked(&section, 7));
     let again = image.touched.bytes.load(Relaxed);
     image.range(&section, 5 * 4096, 4096).unwrap();
-    assert_eq!(image.touched.bytes.load(Relaxed) - again, 4096, "a checked group is read, not checked again");
+    assert_eq!(
+        image.touched.bytes.load(Relaxed) - again,
+        4096,
+        "a checked group is read, not checked again"
+    );
 }
 
 /// Every group of every section, corrupted alone, fails on its first read naming its section
@@ -142,7 +155,11 @@ fn every_corrupted_group_is_found_and_named() {
                         assert_eq!(image.group(section, at).unwrap_err(), error, "fails again");
                         assert!(image.is_bad(section, at));
                         let text = error.to_string();
-                        assert!(text.contains(target.id.name()) && text.contains(&format!("group {group}")), "{text}");
+                        assert!(
+                            text.contains(target.id.name())
+                                && text.contains(&format!("group {group}")),
+                            "{text}"
+                        );
                     } else {
                         read.unwrap();
                     }
@@ -213,7 +230,9 @@ fn a_torn_write_is_the_old_image_or_refused() {
         sections[0].1.extend_from_slice(&noise(5 * 4096, 13));
         build(PAGE, &sections)
     };
-    for cut in (0..new.len()).step_by(4096).chain([1, HEADER - 1, HEADER, HEADER + 1, new.len() - 1]) {
+    for cut in
+        (0..new.len()).step_by(4096).chain([1, HEADER - 1, HEADER, HEADER + 1, new.len() - 1])
+    {
         let error = Image::open(new[..cut].to_vec()).err();
         assert!(error.is_some(), "the new image cut at {cut} of {} opened", new.len());
     }
@@ -243,7 +262,11 @@ fn an_image_written_over_in_place_never_reads_old_bytes() {
                 match image.group(&section, group) {
                     Ok(read) => {
                         let at = group as usize * 4096;
-                        assert_eq!(read, &contents[at..at + read.len()], "cut {cut}: {id} group {group}");
+                        assert_eq!(
+                            read,
+                            &contents[at..at + read.len()],
+                            "cut {cut}: {id} group {group}"
+                        );
                     }
                     Err(error) => {
                         assert_eq!((error.section, error.group), (*id, group));
@@ -259,9 +282,15 @@ fn an_image_written_over_in_place_never_reads_old_bytes() {
 #[test]
 fn sections_are_refused_by_schema_or_absence() {
     let image = open(build(PAGE, &contents()));
-    assert_eq!(image.section(SectionId::DB_EDGES, schema_a()), Err(Refused::Missing { id: SectionId::DB_EDGES }));
+    assert_eq!(
+        image.section(SectionId::DB_EDGES, schema_a()),
+        Err(Refused::Missing { id: SectionId::DB_EDGES })
+    );
     let other = schema("test section a 2");
-    assert_eq!(image.section(A, other), Err(Refused::Schema { id: A, found: schema_a(), wanted: other }));
+    assert_eq!(
+        image.section(A, other),
+        Err(Refused::Schema { id: A, found: schema_a(), wanted: other })
+    );
 }
 
 #[test]

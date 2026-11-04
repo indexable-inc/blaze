@@ -10,13 +10,13 @@ use std::sync::Arc as StdArc;
 use base_db::{Crate, Db};
 use blaze_format::cursor::{Put, Reader};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::Frame;
 use hir_def::{
     ModuleDefId,
     nameres::frozen::{Dec, Enc, Frozen, Mode, check_frozen},
 };
 use rustc_type_ir::{FloatTy, IntTy, Mutability, UintTy, fast_reject::SimplifiedType as S};
+use std::alloc::Global;
 
 use super::{InherentImpls, InherentImplsBuilder, TraitImpls, TraitImplsBuilder};
 use crate::{
@@ -42,7 +42,7 @@ pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
             it.set_maps(db).with_durability(Durability::HIGH).to(maps);
         }
         None => {
-            _ = FrozenImpls::builder(maps).durability(Durability::HIGH).new(db);
+            _ = FrozenImpls::new(db, Durability::HIGH, maps);
         }
     }
 }

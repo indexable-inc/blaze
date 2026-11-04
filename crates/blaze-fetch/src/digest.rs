@@ -285,6 +285,10 @@ impl Hashing {
             Other::Sha256(it) => Digest::new(Algo::Sha256, &it.finish()),
             Other::Sha512(it) => Digest::new(Algo::Sha512, &sha2::Digest::finalize(it)),
         };
-        Hashed { digest: digest.expect("each hasher's output is its algorithm's length"), blake3, len: self.len }
+        Hashed {
+            digest: digest.expect("each hasher's output is its algorithm's length"),
+            blake3,
+            len: self.len,
+        }
     }
 }

@@ -480,7 +480,14 @@ LL | #![warn(semicolon_in_expressions_from_macros)]
 
 "#;
     // A core with `Future`, as rustc has std: the test's `async fn`s are lowered with it.
-    let stderr = ui_core_as(Mode::Other, "semicolon-in-expressions-from-macros.rs", "2018", "future", source, &Options::default());
+    let stderr = ui_core_as(
+        Mode::Other,
+        "semicolon-in-expressions-from-macros.rs",
+        "2018",
+        "future",
+        source,
+        &Options::default(),
+    );
     assert_eq!(stderr, expected);
 }
 
@@ -584,7 +591,10 @@ LL | #[warn(incomplete_include)]
 warning: 2 warnings emitted
 
 "#;
-    assert_reports(&ui_fixture(Mode::Other, fixture, &Options::default()), &[warning(5, &[]), warning(4, &[])]);
+    assert_reports(
+        &ui_fixture(Mode::Other, fixture, &Options::default()),
+        &[warning(5, &[]), warning(4, &[])],
+    );
 }
 
 #[test]
@@ -709,10 +719,6 @@ fn main() {}
     let fixture = format!("{TEST_CRATES}{}{source}", library_features(&["cfg_eval"]));
     assert_reports(
         &ui_fixture(Mode::Other, &fixture, &Options::default()),
-        &[
-            warning(12, &[]),
-            warning(29, &[]),
-            warning(34, &[]),
-        ],
+        &[warning(12, &[]), warning(29, &[]), warning(34, &[])],
     );
 }

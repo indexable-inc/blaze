@@ -26,7 +26,8 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Scratch {
-        let dir = std::env::temp_dir().join(format!("blaze-as-rustc-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("blaze-as-rustc-{name}-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Scratch(dir)
@@ -71,13 +72,26 @@ fn probes_read() {
     assert_eq!((probe.extra_filename, &probe.cfg_flags[..]), ("-x", &[][..]));
     let rustix = ["--crate-type=rlib", "--emit=metadata", "-o", "/o/f", "-"];
     assert_eq!(Probe::of(&rustix).unwrap().name().unwrap(), "rust_out");
-    assert_eq!(Probe::of(&["--crate-type=lib", "--emit=metadata", "my-probe.rs"]).unwrap().name().unwrap(), "my_probe");
+    assert_eq!(
+        Probe::of(&["--crate-type=lib", "--emit=metadata", "my-probe.rs"]).unwrap().name().unwrap(),
+        "my_probe"
+    );
     // The lint flags are the check's, read from the whole command line.
     assert!(
-        Probe::of(&["-Dwarnings", "-A", "dead_code", "--check-cfg", "cfg(x)", "--crate-type=lib", "--emit=metadata", "-"])
-            .is_ok()
+        Probe::of(&[
+            "-Dwarnings",
+            "-A",
+            "dead_code",
+            "--check-cfg",
+            "cfg(x)",
+            "--crate-type=lib",
+            "--emit=metadata",
+            "-"
+        ])
+        .is_ok()
     );
-    let not_a_library = |asked: &[&str]| Probe::of(asked).unwrap_err().downcast::<Refused>().unwrap();
+    let not_a_library =
+        |asked: &[&str]| Probe::of(asked).unwrap_err().downcast::<Refused>().unwrap();
     assert_eq!(
         not_a_library(&["--crate-type=bin", "--emit=metadata", "-"]),
         Refused::NotALibrary { crate_type: Some("bin".to_owned()) }
@@ -133,7 +147,10 @@ fn the_verbose_version_says_which_blaze_this_is() {
     let no_library = || -> anyhow::Result<probe::Library> { panic!("a question reads no library") };
     let verbose = answer(&args(&["-vV"]), &[], no_library).unwrap();
     let verbose = String::from_utf8(verbose.stdout).unwrap();
-    assert!(verbose.ends_with(&format!("\n{}{code}\n", blaze_codegen_code::BLAZE_IDENTITY)), "{verbose}");
+    assert!(
+        verbose.ends_with(&format!("\n{}{code}\n", blaze_codegen_code::BLAZE_IDENTITY)),
+        "{verbose}"
+    );
     let rustc = target::rustc_verbose_version(blaze_cargo::toolchain::host().unwrap());
     assert!(verbose.starts_with(&rustc), "{verbose}");
     assert_eq!(blaze_codegen_code::check_compiler("blaze", verbose.clone()), Ok(verbose));
@@ -145,7 +162,8 @@ fn autocfg_probes() {
     let scratch = Scratch::new("autocfg");
     let asked = |name: &str| {
         let out = scratch.path();
-        ["--crate-name", name, "--crate-type=lib", "--out-dir", out, "--emit=llvm-ir", "-"].map(str::to_owned)
+        ["--crate-name", name, "--crate-type=lib", "--out-dir", out, "--emit=llvm-ir", "-"]
+            .map(str::to_owned)
     };
     let i128 = asked("autocfg_0123_1");
     let i128: Vec<&str> = i128.iter().map(String::as_str).collect();
@@ -168,7 +186,15 @@ fn autocfg_probes() {
 #[test]
 fn type_error_fails_as_rustc() {
     let scratch = Scratch::new("type-error");
-    let asked = ["--crate-name", "probe", "--crate-type=lib", "--emit=metadata", "--out-dir", scratch.path(), "-"];
+    let asked = [
+        "--crate-name",
+        "probe",
+        "--crate-type=lib",
+        "--emit=metadata",
+        "--out-dir",
+        scratch.path(),
+        "-",
+    ];
     let outcome = said(&asked, "pub fn f() -> u32 { \"x\" }\n");
     assert_eq!(outcome.code, 1);
     let stderr = String::from_utf8(outcome.stderr).unwrap();
@@ -265,5 +291,8 @@ fn unanswerable_is_an_error() {
     let refused = |asked: &[&str]| answer(&args(asked), b"", checkout).unwrap_err().to_string();
     assert_eq!(refused(&["--emit=metadata"]), "no input filename given");
     assert!(refused(&["--emit=link", "-"]).contains("--emit=link"));
-    assert!(refused(&["-Z", "no-such-option", "--crate-type=lib", "--emit=metadata", "-"]).contains("no-such-option"));
+    assert!(
+        refused(&["-Z", "no-such-option", "--crate-type=lib", "--emit=metadata", "-"])
+            .contains("no-such-option")
+    );
 }

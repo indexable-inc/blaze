@@ -68,10 +68,7 @@ pub fn use_tree_to_view<'db>(
 
 /// Every `UseTree` of this import as a view, by the index the item tree gives it: the import
 /// lowered again.
-pub fn use_trees_view<'db>(
-    db: &'db Db,
-    use_ast_id: AstId<ast::Use>,
-) -> Arena<view::UseTree<'db>> {
+pub fn use_trees_view<'db>(db: &'db Db, use_ast_id: AstId<ast::Use>) -> Arena<view::UseTree<'db>> {
     // Note: The AST unwraps are fine, since if they fail we should have never obtained `index`.
     let use_tree = use_ast_id.to_view(db).use_tree().expect("missing `use_tree`");
     let mut span_map = None;

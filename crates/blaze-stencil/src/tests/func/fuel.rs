@@ -99,8 +99,12 @@ fn calls(func: &ir::Function, index: u32) -> usize {
         .blocks()
         .flat_map(|block| func.layout.block_insts(block))
         .filter(|&inst| {
-            let ir::InstructionData::Call { func_ref, .. } = func.dfg.insts[inst] else { return false };
-            let ir::ExternalName::User(name) = func.dfg.ext_funcs[func_ref].name else { return false };
+            let ir::InstructionData::Call { func_ref, .. } = func.dfg.insts[inst] else {
+                return false;
+            };
+            let ir::ExternalName::User(name) = func.dfg.ext_funcs[func_ref].name else {
+                return false;
+            };
             let name = &func.params.user_named_funcs()[name];
             (name.namespace, name.index) == (HOST, index)
         })
@@ -166,7 +170,11 @@ fn a_loop_stops_at_its_budget_at_the_same_tick_on_every_run() {
         assert_eq!(plenty, Run { result: 100, ticks: 102, outs: 0, left: 1_000 - 102 }, "{name}");
         assert_eq!(run(&exec, 100, 1_000), plenty, "{name}: a second run");
         let short = run(&exec, 100, 10);
-        assert_eq!(short, Run { result: 100, ticks: 102, outs: 1, left: DISARMED - (102 - 11) }, "{name}");
+        assert_eq!(
+            short,
+            Run { result: 100, ticks: 102, outs: 1, left: DISARMED - (102 - 11) },
+            "{name}"
+        );
         assert_eq!(run(&exec, 100, 10), short, "{name}: a second run");
         let exact = run(&exec, 100, 102);
         assert_eq!(exact.outs, 0, "{name}: a budget of exactly the ticks it takes is enough");

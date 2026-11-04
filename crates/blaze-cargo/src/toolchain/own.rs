@@ -185,7 +185,8 @@ pub fn toolchains() -> Option<PathBuf> {
 
 /// The user's home directory.
 fn user_home() -> Option<PathBuf> {
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).filter(|it| !it.is_empty())?;
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var_os(var).filter(|it| !it.is_empty())?;
     Some(PathBuf::from(home))
 }
 
@@ -369,7 +370,8 @@ impl Source {
         let missing = || anyhow::anyhow!("{file} is not there");
         match self {
             Source::Web { http, base } => {
-                let bytes = super::read_from(http, base, file, offset).await?.ok_or_else(missing)?;
+                let bytes =
+                    super::read_from(http, base, file, offset).await?.ok_or_else(missing)?;
                 Ok(Body::Web { bytes, at: 0 })
             }
             Source::Dir(dir) => {
@@ -388,7 +390,10 @@ impl Source {
 /// What is read of a file, given on in pieces of [`PIECE`] bytes.
 enum Body {
     /// The bytes the server sent, of which the first `at` are given.
-    Web { bytes: Vec<u8>, at: usize },
+    Web {
+        bytes: Vec<u8>,
+        at: usize,
+    },
     File(File),
 }
 
@@ -501,7 +506,8 @@ async fn download(
         None => Ok(()),
     };
     // alloc: once a file
-    let pinned = blaze_fetch::Digest::parse(&format!("sha256:{}", pin.sha256)).map_err(anyhow::Error::new)?;
+    let pinned = blaze_fetch::Digest::parse(&format!("sha256:{}", pin.sha256))
+        .map_err(anyhow::Error::new)?;
     let mut written = std::fs::OpenOptions::new().create(true).append(true).open(part)?;
     // The pin's algorithm and BLAKE3 in one pass, as blaze-fetch checks every download.
     let mut hasher = blaze_fetch::Hashing::new(pinned.algo());
@@ -543,10 +549,13 @@ async fn download(
             Ok(()) if tries + 1 == TRIES => {
                 // alloc: error path, the last failure, as below.
                 let gave_up = super::GaveUp { file: file.to_owned(), tries: TRIES };
-                return Err(anyhow::anyhow!("it ended at {have} of its {} bytes", pin.bytes).context(gave_up));
+                return Err(anyhow::anyhow!("it ended at {have} of its {} bytes", pin.bytes)
+                    .context(gave_up));
             }
             // alloc: error path, the last failure.
-            Err(e) if tries + 1 == TRIES => return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES })),
+            Err(e) if tries + 1 == TRIES => {
+                return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES }));
+            }
             _ => tries += 1,
         }
         tokio::time::sleep(Duration::from_secs(tries.into())).await;

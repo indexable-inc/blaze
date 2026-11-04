@@ -48,7 +48,9 @@ pub(super) fn after_calls(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
         if b.in_external_macro(call) {
             continue;
         }
-        let (Some(call_span), Some(next_span)) = (b.mir_span(it.call), b.mir_span(it.next)) else { continue };
+        let (Some(call_span), Some(next_span)) = (b.mir_span(it.call), b.mir_span(it.next)) else {
+            continue;
+        };
         // alloc: the lint's text, for a lint found
         let message = format!("unreachable {}", it.descr);
         // clone: for a lint found
@@ -57,7 +59,10 @@ pub(super) fn after_calls(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
         // clone: for a lint found
         diag.span_label(call_span.clone(), "any code following this expression is unreachable");
         // alloc: the lint's text, for a lint found
-        diag.span_note(call_span, format!("this expression has type `{}`, which is uninhabited", b.ty(it.ty.as_ref())));
+        diag.span_note(
+            call_span,
+            format!("this expression has type `{}`, which is uninhabited", b.ty(it.ty.as_ref())),
+        );
         found.push(b.lint(diag, Phase::Mir, next));
     }
     found
@@ -80,12 +85,13 @@ fn lint(b: &BodyCx<'_, '_, '_>, unreachable: &Unreachable) -> Option<Found> {
 }
 
 /// What rustc calls what is unreachable, where it points and the node it lints at.
-fn place(b: &BodyCx<'_, '_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span, InFile<SyntaxNodePtr>)> {
+fn place(
+    b: &BodyCx<'_, '_, '_>,
+    what: &UnreachableAt,
+) -> Option<(&'static str, Span, InFile<SyntaxNodePtr>)> {
     let store = b.store();
     Some(match *what {
-        UnreachableAt::Expr(expr) => {
-            ("expression", b.expr_span(expr)?, b.expr_node(expr)?)
-        }
+        UnreachableAt::Expr(expr) => ("expression", b.expr_span(expr)?, b.expr_node(expr)?),
         UnreachableAt::Call(expr) => {
             let node = b.expr_node(expr)?;
             let span = match store.expr(expr) {
@@ -111,7 +117,11 @@ fn place(b: &BodyCx<'_, '_, '_>, what: &UnreachableAt) -> Option<(&'static str, 
         }
         UnreachableAt::IfBlock(if_expr) => {
             let Expr::If { condition, then_branch, .. } = store.expr(if_expr) else { return None };
-            ("block in `if` or `while` expression", b.expr_span(then_branch)?, b.expr_node(condition)?)
+            (
+                "block in `if` or `while` expression",
+                b.expr_span(then_branch)?,
+                b.expr_node(condition)?,
+            )
         }
         UnreachableAt::LetInit(let_expr) => {
             let Expr::Let { expr, .. } = store.expr(let_expr) else { return None };
@@ -121,7 +131,10 @@ fn place(b: &BodyCx<'_, '_, '_>, what: &UnreachableAt) -> Option<(&'static str, 
 }
 
 /// A statement as rustc spans it: an expression statement with its `;`, a `let` with its `;`.
-fn statement_node(b: &BodyCx<'_, '_, '_>, statement: Statement<'_>) -> Option<InFile<SyntaxNodePtr>> {
+fn statement_node(
+    b: &BodyCx<'_, '_, '_>,
+    statement: Statement<'_>,
+) -> Option<InFile<SyntaxNodePtr>> {
     let (node, is_let) = match statement {
         Statement::Expr { expr, .. } => (b.expr_node(expr)?, false),
         Statement::Let { pat, .. } => (b.pat_node(pat)?, true),

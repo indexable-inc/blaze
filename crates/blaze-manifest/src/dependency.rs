@@ -48,7 +48,8 @@ pub struct Artifact {
 impl Artifact {
     pub fn parse(kinds: &[String], lib: bool, target: Option<&str>) -> anyhow::Result<Artifact> {
         for kind in kinds {
-            if !matches!(kind.as_str(), "bin" | "cdylib" | "staticlib") && !kind.starts_with("bin:") {
+            if !matches!(kind.as_str(), "bin" | "cdylib" | "staticlib") && !kind.starts_with("bin:")
+            {
                 bail!("'{kind}' is not a valid artifact specifier");
             }
         }
@@ -198,8 +199,9 @@ mod tests {
 
     #[test]
     fn an_artifact_takes_cargo_s_kinds() {
-        let artifact = Artifact::parse(&kinds(&["bin:tool", "cdylib", "staticlib"]), true, Some("target"))
-            .unwrap();
+        let artifact =
+            Artifact::parse(&kinds(&["bin:tool", "cdylib", "staticlib"]), true, Some("target"))
+                .unwrap();
         assert_eq!(artifact.kinds, ["bin:tool", "cdylib", "staticlib"]);
         assert!(artifact.lib);
         assert_eq!(artifact.target.as_deref(), Some("target"));
@@ -220,7 +222,10 @@ mod tests {
         assert_eq!(error(&["bin", "bin", "bin"], None), "Found 2 duplicate binary artifacts");
         assert_eq!(error(&["bin"], Some("")), "target was empty");
         assert_eq!(error(&["bin"], Some(" ")), "target was empty");
-        assert_eq!(error(&["bin"], Some(" a.json ")), "`.json` target specs require -Zjson-target-spec");
+        assert_eq!(
+            error(&["bin"], Some(" a.json ")),
+            "`.json` target specs require -Zjson-target-spec"
+        );
         Artifact::parse(&kinds(&["bin"]), false, Some("x86_64-unknown-linux-gnu")).unwrap();
     }
 
@@ -246,7 +251,10 @@ mod tests {
     }
 
     fn config(files: Mem, flags: &[&str]) -> anyhow::Result<crate::Config<Mem>> {
-        let env = [("CARGO_HOME".to_owned(), format!("{ROOT}/home")), ("BLAZE_HOME".to_owned(), format!("{ROOT}/blaze"))];
+        let env = [
+            ("CARGO_HOME".to_owned(), format!("{ROOT}/home")),
+            ("BLAZE_HOME".to_owned(), format!("{ROOT}/blaze")),
+        ];
         let mut config = crate::Config::load_with(Path::new(ROOT), env, files)?;
         config.cli_unstable(&kinds(flags))?;
         Ok(config)
@@ -264,8 +272,12 @@ mod tests {
         let table = "[unstable]\nbindeps = true\nbuild-std = [\"std,core\", \"alloc\"]\n";
         let read = config(files(table, "artifact = \"bin\""), &[]).unwrap();
         assert!(read.bindeps());
-        assert_eq!(read.unstable().build_std.as_deref(), Some(&kinds(&["std", "core", "alloc"])[..]));
-        let read = config(files(table, "artifact = \"bin\""), &["bindeps=no", "build_std=core"]).unwrap();
+        assert_eq!(
+            read.unstable().build_std.as_deref(),
+            Some(&kinds(&["std", "core", "alloc"])[..])
+        );
+        let read =
+            config(files(table, "artifact = \"bin\""), &["bindeps=no", "build_std=core"]).unwrap();
         assert!(!read.bindeps());
         assert_eq!(read.unstable().build_std.as_deref(), Some(&kinds(&["core"])[..]));
         let read = config(files("", "artifact = \"bin\""), &["unstable-options"]).unwrap();
@@ -278,23 +290,31 @@ mod tests {
             config(files("", "artifact = \"bin\""), flags).map(drop).unwrap_err().to_string()
         };
         assert_eq!(error(&["minimal-versions"]), "blaze does not read `-Z minimal-versions` yet");
-        assert_eq!(error(&["bindeps=maybe"]), "flag -Zbindeps expected `no` or `yes`, found: `maybe`");
+        assert_eq!(
+            error(&["bindeps=maybe"]),
+            "flag -Zbindeps expected `no` or `yes`, found: `maybe`"
+        );
     }
 
     #[test]
     fn an_artifact_dependency_needs_bindeps() {
         let error = metadata(files("", "artifact = \"bin\""), &[]).unwrap_err();
-        assert!(format!("{error:#}").contains("`artifact = …` requires `-Z bindeps` (b)"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("`artifact = …` requires `-Z bindeps` (b)"),
+            "{error:#}"
+        );
         let error = metadata(files("", "lib = true"), &[]).unwrap_err();
         assert!(
-            format!("{error:#}").contains("'lib' specifier cannot be used without an 'artifact = …' value (b)"),
+            format!("{error:#}")
+                .contains("'lib' specifier cannot be used without an 'artifact = …' value (b)"),
             "{error:#}"
         );
     }
 
     #[test]
     fn with_bindeps_cargo_metadata_says_the_artifact() {
-        let json = metadata(files("", "artifact = [\"bin\"], target = \"target\""), &["bindeps"]).unwrap();
+        let json =
+            metadata(files("", "artifact = [\"bin\"], target = \"target\""), &["bindeps"]).unwrap();
         assert!(
             json.contains(r#""features":[],"artifact":{"kinds":["bin"],"lib":false,"target":"target"},"target":null"#),
             "{json}"
@@ -317,11 +337,18 @@ mod tests {
                 .file(&format!("{ROOT}/src/lib.rs"), "")
         };
         let error = metadata(ws(""), &[]).unwrap_err();
-        assert!(format!("{error:#}").contains("feature `codegen-backend` is required"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("feature `codegen-backend` is required"),
+            "{error:#}"
+        );
         metadata(ws(""), &["codegen-backend"]).unwrap();
         metadata(ws("[unstable]\ncodegen-backend = true\n"), &[]).unwrap();
-        let error = metadata(ws("[unstable]\ncodegen-backend = true\n"), &["codegen-backend=no"]).unwrap_err();
-        assert!(format!("{error:#}").contains("feature `codegen-backend` is required"), "{error:#}");
+        let error = metadata(ws("[unstable]\ncodegen-backend = true\n"), &["codegen-backend=no"])
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("feature `codegen-backend` is required"),
+            "{error:#}"
+        );
     }
 
     fn feature_dep(name: &str, optional: bool, kind: DepKind) -> Dependency {
@@ -332,7 +359,9 @@ mod tests {
     }
 
     fn table(list: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
-        list.iter().map(|(k, v)| ((*k).to_owned(), v.iter().map(|it| (*it).to_owned()).collect())).collect()
+        list.iter()
+            .map(|(k, v)| ((*k).to_owned(), v.iter().map(|it| (*it).to_owned()).collect()))
+            .collect()
     }
 
     /// The unused optional dependency an "is not included in any feature" error names.
@@ -363,13 +392,16 @@ mod tests {
                 if new == old {
                     return;
                 }
-                let (Some(named), Some(old_named)) = (unused_named(&new), unused_named(&old)) else {
+                let (Some(named), Some(old_named)) = (unused_named(&new), unused_named(&old))
+                else {
                     panic!("{features:?}: `{new}` against the old `{old}`");
                 };
                 let at = |name: &str| deps.iter().position(|it| it.name_in_toml() == name).unwrap();
                 assert!(at(named) < at(old_named), "{features:?}: `{new}` against the old `{old}`");
             }
-            (new, old) => panic!("{features:?}: {:?} against the old {:?}", new.map(drop), old.map(drop)),
+            (new, old) => {
+                panic!("{features:?}: {:?} against the old {:?}", new.map(drop), old.map(drop))
+            }
         }
     }
 
@@ -383,7 +415,14 @@ mod tests {
             feature_dep("d", false, Normal),
         ];
         agree(&table(&[]), &[]);
-        agree(&table(&[("default", &["a", "x"]), ("x", &["dep:b", "d/std"]), ("c", &["dep:c", "a?/foo"])]), &deps);
+        agree(
+            &table(&[
+                ("default", &["a", "x"]),
+                ("x", &["dep:b", "d/std"]),
+                ("c", &["dep:c", "a?/foo"]),
+            ]),
+            &deps,
+        );
         agree(&table(&[("a", &["stdd"]), ("std", &[])]), &[]);
         agree(&table(&[("f", &["dep:a"]), ("g", &["a"])]), &deps[..1]);
         agree(&table(&[("f", &["d"])]), &deps[3..]);
@@ -421,8 +460,12 @@ mod tests {
     fn the_feature_map_is_the_old_one_on_any_table(tc: hegel::TestCase) {
         use hegel::generators as gs;
         let deps: Vec<(usize, bool, u8)> = tc.draw(
-            gs::vecs(gs::tuples!(gs::integers().max_value(4), gs::booleans(), gs::integers().max_value(3)))
-                .max_size(5),
+            gs::vecs(gs::tuples!(
+                gs::integers().max_value(4),
+                gs::booleans(),
+                gs::integers().max_value(3)
+            ))
+            .max_size(5),
         );
         let features: BTreeMap<usize, Vec<(usize, u8, usize)>> = tc.draw(
             gs::btree_maps(

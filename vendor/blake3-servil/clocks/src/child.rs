@@ -62,7 +62,11 @@ impl Run {
             max_rss_bytes: runs.iter().map(|r| r.max_rss_bytes).max().flatten(),
             storage_read_bytes: sum(|r| r.storage_read_bytes),
             major_faults: sum(|r| r.major_faults),
-            counts: runs.iter().map(|r| r.counts).reduce(|a, b| a.zip(b).map(|(a, b)| a.plus(b))).flatten(),
+            counts: runs
+                .iter()
+                .map(|r| r.counts)
+                .reduce(|a, b| a.zip(b).map(|(a, b)| a.plus(b)))
+                .flatten(),
         }
     }
 }
@@ -98,12 +102,18 @@ pub(crate) fn running_cpu_ns() -> u64 {
 #[cfg(unix)]
 fn watch_until<T>(pid: i32, exited: impl FnOnce() -> T) -> T {
     use std::sync::atomic::{AtomicBool, Ordering};
-    assert_eq!(RUNNING.swap(pid, Ordering::SeqCst), 0, "clocks::child::run runs one child at a time");
+    assert_eq!(
+        RUNNING.swap(pid, Ordering::SeqCst),
+        0,
+        "clocks::child::run runs one child at a time"
+    );
     let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let watcher = scope.spawn(|| {
             while !done.load(Ordering::SeqCst) {
-                std::thread::park_timeout(std::time::Duration::from_nanos(crate::load::until_due_ns().max(1_000_000)));
+                std::thread::park_timeout(std::time::Duration::from_nanos(
+                    crate::load::until_due_ns().max(1_000_000),
+                ));
                 if !done.load(Ordering::SeqCst) {
                     crate::load::tick();
                 }
@@ -207,10 +217,16 @@ mod imp {
         const SC_CLK_TCK: i32 = 2;
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return 0 };
         // After the command's closing parenthesis: state, then fields 4 on.
-        let fields: Vec<&str> = stat[stat.rfind(')').expect("/proc/PID/stat names the command") + 1..].split_whitespace().collect();
-        let ticks: u64 = fields[11].parse::<u64>().expect("utime") + fields[12].parse::<u64>().expect("stime");
+        let fields: Vec<&str> = stat
+            [stat.rfind(')').expect("/proc/PID/stat names the command") + 1..]
+            .split_whitespace()
+            .collect();
+        let ticks: u64 =
+            fields[11].parse::<u64>().expect("utime") + fields[12].parse::<u64>().expect("stime");
         // Sound: a plain query.
-        ticks * 1_000_000_000 / u64::try_from(unsafe { sysconf(SC_CLK_TCK) }).expect("sysconf(_SC_CLK_TCK) is positive")
+        ticks * 1_000_000_000
+            / u64::try_from(unsafe { sysconf(SC_CLK_TCK) })
+                .expect("sysconf(_SC_CLK_TCK) is positive")
     }
 
     pub fn finish(child: std::process::Child, started: std::time::Instant, started_ns: u64) -> Run {
@@ -278,7 +294,8 @@ mod imp {
         });
         let mut words = [0u64; 64];
         // Sound: `words` is writable and longer than rusage_info_v6.
-        let usage = (unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V6, words.as_mut_ptr()) } == 0).then_some(words);
+        let usage = (unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V6, words.as_mut_ptr()) } == 0)
+            .then_some(words);
         let (status, rusage_words) = rusage::reap(pid);
         super::stop_watching();
         let ns = crate::imp::mach_to_ns;
@@ -286,7 +303,11 @@ mod imp {
             let (time, ptime) = (w[USER_TIME] + w[SYSTEM_TIME], w[USER_PTIME] + w[SYSTEM_PTIME]);
             Counts {
                 p: Level { cycles: w[PCYCLES], instructions: w[PINSTRUCTIONS], time_ns: ns(ptime) },
-                e: Level { cycles: w[CYCLES] - w[PCYCLES], instructions: w[INSTRUCTIONS] - w[PINSTRUCTIONS], time_ns: ns(time - ptime) },
+                e: Level {
+                    cycles: w[CYCLES] - w[PCYCLES],
+                    instructions: w[INSTRUCTIONS] - w[PINSTRUCTIONS],
+                    time_ns: ns(time - ptime),
+                },
             }
         });
         Run {
@@ -326,14 +347,18 @@ mod tests {
     #[test]
     fn a_child_is_timed_and_counted() {
         let _one = one();
-        let ok = run(std::process::Command::new("sh").args(["-c", "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done"]));
+        let ok = run(std::process::Command::new("sh")
+            .args(["-c", "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done"]));
         assert!(ok.success, "{ok:?}");
         let cpu = ok.cpu_ns.expect("unix counts CPU time");
         assert!(cpu > 0 && cpu <= ok.wall_ns + 20_000_000, "{ok:?}");
         assert!(ok.max_rss_bytes.unwrap() > 100_000, "{ok:?}");
         if let Some(counts) = ok.counts {
             let ns = counts.p.time_ns + counts.e.time_ns;
-            assert!(ns * 2 >= cpu && ns <= cpu * 2, "the per-kind times add up to the CPU time: {ok:?}");
+            assert!(
+                ns * 2 >= cpu && ns <= cpu * 2,
+                "the per-kind times add up to the CPU time: {ok:?}"
+            );
         }
         assert!(!run(std::process::Command::new("sh").args(["-c", "exit 3"])).success);
     }
@@ -349,12 +374,24 @@ mod tests {
         // One process spinning 3 s (a grandchild's CPU time would reach
         // this process only when the child reaps it; Time::HiRes, since
         // whole seconds would stop it anywhere from 2 s on).
-        let child = run(std::process::Command::new("perl").args(["-e", "use Time::HiRes qw(time); my $t = time; 1 while time - $t < 3"]));
-        assert!(child.wall_ns > 2_200_000_000, "the child ran long enough to span windows: {child:?}");
+        let child = run(std::process::Command::new("perl")
+            .args(["-e", "use Time::HiRes qw(time); my $t = time; 1 while time - $t < 3"]));
+        assert!(
+            child.wall_ns > 2_200_000_000,
+            "the child ran long enough to span windows: {child:?}"
+        );
         let windows = crate::load::windows();
-        let during: Vec<_> = windows[before..].iter().filter(|w| w.end_ns > child.started_ns && w.start_ns < child.started_ns + child.wall_ns).collect();
+        let during: Vec<_> = windows[before..]
+            .iter()
+            .filter(|w| {
+                w.end_ns > child.started_ns && w.start_ns < child.started_ns + child.wall_ns
+            })
+            .collect();
         assert!(during.len() >= 2, "windows closed while it ran: {windows:?}");
-        assert!(during.iter().all(|w| w.end_ns - w.start_ns < 2 * crate::load::WINDOW_NS), "{during:?}");
+        assert!(
+            during.iter().all(|w| w.end_ns - w.start_ns < 2 * crate::load::WINDOW_NS),
+            "{during:?}"
+        );
         assert!(
             during.iter().all(|w| w.other_milli_cpus < background + 500),
             "the child's own CPU is this process's (other load before it: {background}): {during:?}"
@@ -370,12 +407,20 @@ mod tests {
         let _one = one();
         let background = background_milli_cpus();
         let before = crate::load::windows().len();
-        let mut sibling = std::process::Command::new("perl").args(["-e", "my $t = time; 1 while time - $t < 4"]).spawn().expect("perl");
+        let mut sibling = std::process::Command::new("perl")
+            .args(["-e", "my $t = time; 1 while time - $t < 4"])
+            .spawn()
+            .expect("perl");
         let child = run(std::process::Command::new("sleep").arg("3"));
         sibling.kill().ok();
         sibling.wait().expect("the sibling");
         let windows = crate::load::windows();
-        let during: Vec<_> = windows[before..].iter().filter(|w| w.end_ns > child.started_ns && w.start_ns < child.started_ns + child.wall_ns).collect();
+        let during: Vec<_> = windows[before..]
+            .iter()
+            .filter(|w| {
+                w.end_ns > child.started_ns && w.start_ns < child.started_ns + child.wall_ns
+            })
+            .collect();
         assert!(
             during.iter().any(|w| w.other_milli_cpus >= background + 700),
             "a spinning sibling is other load (other load before it: {background}): {during:?}"
@@ -394,13 +439,24 @@ mod tests {
         let _one = one();
         let background = background_milli_cpus();
         let before = crate::load::windows().len();
-        let child = run(std::process::Command::new(std::env::current_exe().expect("the test binary"))
-            .args(["--exact", "child::tests::exiting_threads_helper", "--test-threads=1", "--quiet"])
-            .env("CLOCKS_EXITING_THREADS_HELPER", "1")
-            .stdout(std::process::Stdio::null()));
+        let child =
+            run(std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args([
+                    "--exact",
+                    "child::tests::exiting_threads_helper",
+                    "--test-threads=1",
+                    "--quiet",
+                ])
+                .env("CLOCKS_EXITING_THREADS_HELPER", "1")
+                .stdout(std::process::Stdio::null()));
         assert!(child.success, "{child:?}");
         let windows = crate::load::windows();
-        let during: Vec<_> = windows[before..].iter().filter(|w| w.end_ns > child.started_ns && w.start_ns < child.started_ns + child.wall_ns).collect();
+        let during: Vec<_> = windows[before..]
+            .iter()
+            .filter(|w| {
+                w.end_ns > child.started_ns && w.start_ns < child.started_ns + child.wall_ns
+            })
+            .collect();
         assert!(!during.is_empty(), "{windows:?}");
         assert!(
             during.iter().all(|w| w.other_milli_cpus < background + 500),
@@ -415,7 +471,8 @@ mod tests {
         if std::env::var_os("CLOCKS_EXITING_THREADS_HELPER").is_none() {
             return;
         }
-        let threads: Vec<_> = (0..4).map(|_| std::thread::spawn(|| crate::busy_work(300_000_000))).collect();
+        let threads: Vec<_> =
+            (0..4).map(|_| std::thread::spawn(|| crate::busy_work(300_000_000))).collect();
         for thread in threads {
             thread.join().unwrap();
         }
@@ -440,7 +497,15 @@ mod tests {
         };
         let sum = Run::sum(&[run(10, 5, Some(3), true), run(20, 7, Some(4), true)]);
         assert_eq!(
-            (sum.started_ns, sum.wall_ns, sum.cpu_ns, sum.max_rss_bytes, sum.storage_read_bytes, sum.major_faults, sum.success),
+            (
+                sum.started_ns,
+                sum.wall_ns,
+                sum.cpu_ns,
+                sum.max_rss_bytes,
+                sum.storage_read_bytes,
+                sum.major_faults,
+                sum.success
+            ),
             (10, 30, Some(7), Some(7), Some(2), None, true)
         );
         assert_eq!(Run::sum(&[run(1, 1, None, true), run(1, 1, Some(1), false)]).cpu_ns, None);
@@ -451,7 +516,8 @@ mod tests {
     fn a_reaped_childs_cpu_time_is_this_processs() {
         let _one = one();
         let before = crate::process_cpu_ns();
-        let child = run(std::process::Command::new("sh").args(["-c", "i=0; while [ $i -lt 50000 ]; do i=$((i+1)); done"]));
+        let child = run(std::process::Command::new("sh")
+            .args(["-c", "i=0; while [ $i -lt 50000 ]; do i=$((i+1)); done"]));
         let after = crate::process_cpu_ns();
         assert!(after - before >= child.cpu_ns.unwrap(), "{before} {after} {child:?}");
     }

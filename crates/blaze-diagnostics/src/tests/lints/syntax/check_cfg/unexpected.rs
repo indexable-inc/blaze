@@ -45,7 +45,8 @@ fn no_values() {}
 fn main() {}
 "##;
 
-const DIAGNOTICS_FLAGS: &[&str] = &[r#"cfg(feature,values("foo"))"#, "cfg(no_values)", r#"cfg(quote,values("quote"))"#];
+const DIAGNOTICS_FLAGS: &[&str] =
+    &[r#"cfg(feature,values("foo"))"#, "cfg(no_values)", r#"cfg(quote,values("quote"))"#];
 
 #[test]
 fn diagnotics_rustc() {
@@ -139,7 +140,10 @@ warning: 7 warnings emitted
 
 "##;
     let options = flags(DIAGNOTICS_FLAGS, &[], false);
-    assert_eq!(ui_cfg("", "diagnotics.rs", "edition:2015 cfg:rustc", DIAGNOTICS, &options), expected);
+    assert_eq!(
+        ui_cfg("", "diagnotics.rs", "edition:2015 cfg:rustc", DIAGNOTICS, &options),
+        expected
+    );
 }
 
 #[test]
@@ -247,7 +251,10 @@ warning: 7 warnings emitted
 
 "##;
     let options = flags(DIAGNOTICS_FLAGS, &[], true);
-    assert_eq!(ui_cfg("", "diagnotics.rs", "edition:2015 cfg:cargo", DIAGNOTICS, &options), expected);
+    assert_eq!(
+        ui_cfg("", "diagnotics.rs", "edition:2015 cfg:cargo", DIAGNOTICS, &options),
+        expected
+    );
 }
 
 #[test]
@@ -345,7 +352,10 @@ warning: 2 warnings emitted
 
 "#;
     let options = flags(&[r#"cfg(feature,values("serde","full"))"#], &[r#"feature="rand""#], false);
-    assert_eq!(ui_cfg("", "unexpected-cfg-value.rs", "edition:2015 cfg:feature=rand", source, &options), expected);
+    assert_eq!(
+        ui_cfg("", "unexpected-cfg-value.rs", "edition:2015 cfg:feature=rand", source, &options),
+        expected
+    );
 }
 
 #[test]
@@ -398,7 +408,16 @@ warning: 2 warnings emitted
 
 "#;
     let options = flags(&["cfg()"], &["unknown_but_active_cfg"], false);
-    assert_eq!(ui_cfg("", "allow-same-level.rs", "edition:2015 cfg:unknown_but_active_cfg", source, &options), expected);
+    assert_eq!(
+        ui_cfg(
+            "",
+            "allow-same-level.rs",
+            "edition:2015 cfg:unknown_but_active_cfg",
+            source,
+            &options
+        ),
+        expected
+    );
 }
 
 #[test]
@@ -568,8 +587,12 @@ LL | #[cfg(test = "foo")]
 warning: 2 warnings emitted
 
 "#;
-    let options = flags(&["cfg(values,simple,mixed,empty)", "cfg(test)", "cfg(feature)"], &[], false);
-    assert_eq!(ui_cfg("", "no-expected-values.rs", "edition:2015 cfg:simple", source, &options), expected);
+    let options =
+        flags(&["cfg(values,simple,mixed,empty)", "cfg(test)", "cfg(feature)"], &[], false);
+    assert_eq!(
+        ui_cfg("", "no-expected-values.rs", "edition:2015 cfg:simple", source, &options),
+        expected
+    );
 }
 
 #[test]
@@ -763,7 +786,16 @@ warning: 3 warnings emitted
 "#;
     let options = flags(&["cfg(feature,values())"], &[], false);
     let header = "edition:2015 deps:cfg_macro cfg:rustc";
-    assert_eq!(ui_cfg(CFG_MACRO, "report-in-external-macros.rs", header, REPORT_IN_EXTERNAL_MACROS, &options), expected);
+    assert_eq!(
+        ui_cfg(
+            CFG_MACRO,
+            "report-in-external-macros.rs",
+            header,
+            REPORT_IN_EXTERNAL_MACROS,
+            &options
+        ),
+        expected
+    );
 }
 
 #[test]
@@ -810,7 +842,16 @@ warning: 3 warnings emitted
 "#;
     let options = flags(&["cfg(feature,values())"], &[], true);
     let header = "edition:2015 deps:cfg_macro cfg:cargo";
-    assert_eq!(ui_cfg(CFG_MACRO, "report-in-external-macros.rs", header, REPORT_IN_EXTERNAL_MACROS, &options), expected);
+    assert_eq!(
+        ui_cfg(
+            CFG_MACRO,
+            "report-in-external-macros.rs",
+            header,
+            REPORT_IN_EXTERNAL_MACROS,
+            &options
+        ),
+        expected
+    );
 }
 
 /// What `cfg-select.rs` has of core: `cfg_select!` in the prelude.
@@ -943,8 +984,10 @@ fn raw_names_are_shown_as_their_edition_writes_them() {
             "unexpected `cfg` condition name: `raw`",
         ]
     );
-    let helps: Vec<&str> =
-        checked.diags[1].children.iter().map(|it| it.message.as_str()).collect();
-    assert_eq!(helps[0], "expected names are: `r#async`, `edition2015`, `edition2021`, and `r#true` and 33 more");
+    let helps: Vec<&str> = checked.diags[1].children.iter().map(|it| it.message.as_str()).collect();
+    assert_eq!(
+        helps[0],
+        "expected names are: `r#async`, `edition2015`, `edition2021`, and `r#true` and 33 more"
+    );
     assert_eq!(checked.diags[0].suggestions[0].substitutions[0][0].1, "r#true");
 }

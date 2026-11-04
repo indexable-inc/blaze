@@ -3,8 +3,8 @@
 //! checks them all again, counting what ran.
 
 use hir_expand::EditionedFileId;
-use hir_ty::{InferBodyId, InferenceResult};
 use hir_expand::fixture;
+use hir_ty::{InferBodyId, InferenceResult};
 
 use super::{TestDB, count, function};
 
@@ -107,7 +107,8 @@ fn a_body_edit_reinfers_only_that_body() {
 
 #[test]
 fn a_body_edit_that_types_the_same_reinfers_only_that_body() {
-    let (infer, _, executed) = rerun_after("let y = 3;\n    y", "let y = 3;\n    let z = y;\n    z");
+    let (infer, _, executed) =
+        rerun_after("let y = 3;\n    y", "let y = 3;\n    let z = y;\n    z");
     assert_eq!(infer, 1, "only `sibling`: {executed:#?}");
 }
 
@@ -194,7 +195,11 @@ fn a_changed_signature_reinfers_its_callers() {
         "pub fn get(&self) -> u64 {\n        self.0 as u64",
     );
     let executed = check_all(&db);
-    assert_eq!(count(&executed, "infer_body_query"), 1, "`reader`, which calls `get`: {executed:#?}");
+    assert_eq!(
+        count(&executed, "infer_body_query"),
+        1,
+        "`reader`, which calls `get`: {executed:#?}"
+    );
     blaze_query::db::attach(&db, || {
         let reader = function(&db, "reader");
         let result = InferenceResult::of(&db, InferBodyId::DefWithBodyId(reader));
@@ -204,10 +209,8 @@ fn a_changed_signature_reinfers_its_callers() {
 
 #[test]
 fn a_removed_impl_reinfers_its_reader() {
-    let (infer, _, executed) = rerun_after(
-        "impl Shared {\n    pub fn get(&self) -> u32 {\n        self.0\n    }\n}",
-        "",
-    );
+    let (infer, _, executed) =
+        rerun_after("impl Shared {\n    pub fn get(&self) -> u32 {\n        self.0\n    }\n}", "");
     assert_eq!(infer, 1, "`reader`, whose `get` is gone: {executed:#?}");
 }
 
@@ -236,7 +239,12 @@ fn main() {
         InferenceResult::of(&db, InferBodyId::DefWithBodyId(main));
         main
     });
-    edit(&mut db, &files, "pub fn unused() -> u32 {\n    2", "pub fn unused() -> u32 {\n    let z = 2;\n    z");
+    edit(
+        &mut db,
+        &files,
+        "pub fn unused() -> u32 {\n    2",
+        "pub fn unused() -> u32 {\n    let z = 2;\n    z",
+    );
     let executed = blaze_query::db::attach(&db, || {
         db.log_executed(|| {
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(main));

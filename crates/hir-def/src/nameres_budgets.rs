@@ -6,12 +6,12 @@ use std::hint::black_box;
 
 use base_db::{Crate, relevant_crates};
 use blaze_alloc_count::assert_at_most;
+use hir_expand::fixture;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
 use intern::Symbol;
-use hir_expand::fixture;
 
 use crate::{
     DefWithBodyId, ModuleDefId, ModuleId,

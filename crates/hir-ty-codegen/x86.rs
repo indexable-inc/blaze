@@ -230,8 +230,8 @@ pub(super) fn lower(name: &str) -> Option<Lowered> {
             // alloc: the stub's text, the output
             text: format!("round{} xmm0, xmm1, {{imm}}", &op[op.len() - 2..]),
             args: vec![Some(x0), Some(x1), None], // alloc: the lowering's registers, the output
-            results: vec![x0], // alloc: the lowering's registers, the output
-            clobbers: Vec::new(), // alloc: empty, allocates nothing
+            results: vec![x0],                    // alloc: the lowering's registers, the output
+            clobbers: Vec::new(),                 // alloc: empty, allocates nothing
         }),
         // AVX's and AVX2's, of three operands.
         "avx.max.pd.256"
@@ -518,12 +518,7 @@ impl<'db> FunctionCx<'_, 'db> {
     /// x86-64, each the instruction LLVM selects (Cranelift's x64 rules give `minps`, `maxps`,
     /// `packsswb`, `packuswb`, `packssdw`, `pmaddwd`, `pavgb` and `pavgw` with SSE2 alone),
     /// storing the result at `dst`. False for any other, which the caller lowers.
-    pub(super) fn x86_vector(
-        &mut self,
-        name: &str,
-        args: &[Operand],
-        dst: Value,
-    ) -> Result<bool> {
+    pub(super) fn x86_vector(&mut self, name: &str, args: &[Operand], dst: Value) -> Result<bool> {
         if self.cg.target.arch != Arch::X86_64 {
             return Ok(false);
         }

@@ -5,10 +5,10 @@
 use std::ops::Range;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{
     mir::{
@@ -233,7 +233,8 @@ pub(super) fn inline_call<'db>(
             .iter()
             .map(|it| InlinedSpan { scope: scope_base + it.scope, span: it.span }),
     );
-    let mut spans = Spans { scope, base, own: HashMap::new_in(Global), spans: &mut body.inlined.spans };
+    let mut spans =
+        Spans { scope, base, own: HashMap::new_in(Global), spans: &mut body.inlined.spans };
     body.inlined.scopes.extend(callee.inlined.scopes.iter().map(|it| InlinedScope {
         callee: site.nested[it.callee as usize],
         call_site: spans.map(it.call_site),
@@ -267,9 +268,7 @@ pub(super) fn inline_call<'db>(
         };
         if let Some(kind) = replaced {
             terminator.kind = kind;
-        } else if !is_cleanup
-            && let Some(unwind @ None) = terminator.kind.unwind_mut()
-        {
+        } else if !is_cleanup && let Some(unwind @ None) = terminator.kind.unwind_mut() {
             // Unwinding out of the callee is unwinding out of the call. In a cleanup block no
             // unwind edge is one that terminates, and stays one.
             *unwind = cleanup;

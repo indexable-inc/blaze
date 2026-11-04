@@ -11,41 +11,41 @@
 
 mod alloc;
 mod arc_clone_only_borrowed;
-mod bounds_check_in_loop;
-mod bounded_heap_field;
-mod box_large_new;
-mod boxed_recursive_node;
 mod blocking_in_async;
 mod blocking_on_pool;
 mod bool_param;
 mod borrow_workaround;
 #[cfg(test)]
 mod borrow_workaround_tests;
+mod bounded_heap_field;
+mod bounds_check_in_loop;
+mod box_large_new;
+mod boxed_recursive_node;
 mod checkfree;
-mod effects;
-#[cfg(test)]
-mod effects_tests;
 mod clone;
 mod cold_error;
 mod collect_then_consume;
 #[cfg(test)]
 mod correctness_general_tests;
-mod dispatch;
 mod deep_drop_at_exit;
+mod dispatch;
 mod dos_hasher_on_input;
 mod dropped_error;
 mod dyn_fn_param;
 mod dyn_in_hot_field;
+mod effects;
+#[cfg(test)]
+mod effects_tests;
 mod enum_vec_padded;
 mod error_debug;
 #[cfg(test)]
 mod errors_tests;
 mod exempt;
-mod false_sharing;
-mod fmt_allocates;
 pub(crate) mod facts;
+mod false_sharing;
 mod fiber;
 mod fixed_key_lookup;
+mod fmt_allocates;
 mod front_vec_ops;
 mod frozen_collection;
 mod general_facts;
@@ -58,13 +58,13 @@ mod hash_twice;
 mod hashmap;
 mod held_across_wait;
 mod implicit_allocator;
-mod jagged_vec;
 mod intern_candidate;
+mod jagged_vec;
 mod key_ignores_field;
+mod large_move;
 mod lenient_deserialize;
 #[cfg(test)]
 mod lenient_deserialize_tests;
-mod large_move;
 mod lock_across_query;
 mod loops;
 mod missing_size_hint;
@@ -75,13 +75,13 @@ mod packable;
 mod panic_in_drop;
 mod parallel;
 mod per_item;
-mod pod_serialized_by_field;
 #[cfg(test)]
 mod perf_a_tests;
 #[cfg(test)]
-mod perf_tests;
-#[cfg(test)]
 mod perf_general_tests;
+#[cfg(test)]
+mod perf_tests;
+mod pod_serialized_by_field;
 #[cfg(test)]
 mod profile_tests;
 mod profiled;
@@ -268,7 +268,8 @@ pub(crate) const HOT: &[Lint] = &[
 
 /// The lints a function the profile shows hot is linted with besides those on where it is
 /// (`blaze::profile_hot`): the hot lints, which are `allow` outside hot code.
-pub(crate) const PROFILE_RAISES: &[Lint] = &[Lint::HotClone, Lint::HotAlloc, Lint::HotAllocCall, Lint::HotDyn];
+pub(crate) const PROFILE_RAISES: &[Lint] =
+    &[Lint::HotClone, Lint::HotAlloc, Lint::HotAllocCall, Lint::HotDyn];
 
 /// The perf lints whose findings in a profile-hot function say so, or are given
 /// `blaze::profile_hot`'s level where their own is `allow` by default.
@@ -588,7 +589,6 @@ impl Lint {
         }
     }
 
-
     /// The lint's bit in [`crate::lints::On`], above every clippy lint's.
     pub(crate) const fn bit(self) -> crate::lints::On {
         crate::lints::On::bit(crate::lints::BLAZE_BITS + self as usize)
@@ -697,7 +697,9 @@ impl Lint {
             Lint::DefaultHasher => {
                 "write the hasher out: `blaze_hash::HashMap` for `std::collections::HashMap` (and `HashSet`), `with_hasher(blaze_hash::FixedState)` for another crate's collection, or `#[expect(blaze::default_hasher, reason = \"..\")]` on a random seed kept for HashDoS"
             }
-            Lint::Parallelizable => "run the iterations with rayon's parallel iterators or blaze's pool",
+            Lint::Parallelizable => {
+                "run the iterations with rayon's parallel iterators or blaze's pool"
+            }
             Lint::SerialDependence => {
                 "make the dependence a reduction to run the iterations in parallel, or keep it serial"
             }
@@ -710,11 +712,15 @@ impl Lint {
             Lint::WallClock => {
                 "read time from the injected clock (`advance_clock(now)`) in a core, or say why this reads the wall clock with `#[expect(blaze::wall_clock, reason = \"..\")]`"
             }
-            Lint::UntypedError => "return an error enum of what can fail, each variant naming its item",
+            Lint::UntypedError => {
+                "return an error enum of what can fail, each variant naming its item"
+            }
             Lint::DroppedError => {
                 "hand the error on with `?` or keep it as the new error's source, or say why with `#[expect(blaze::dropped_error, reason = \"..\")]`"
             }
-            Lint::HashOrderOutput => "sort what comes out, or keep it in a `BTreeMap` or an ordered `Vec`",
+            Lint::HashOrderOutput => {
+                "sort what comes out, or keep it in a `BTreeMap` or an ordered `Vec`"
+            }
             Lint::HeldAcrossWait => {
                 "end the value before the call, or carry it with the job (`blaze_query::carry`) and read the thread-local again after the wait"
             }
@@ -724,7 +730,9 @@ impl Lint {
             Lint::BlockingOnPool => {
                 "wait through the scheduler (`blaze_graph::sched::wait`, an `Event`, a `Wait::Key`), or move the blocking call to a driver thread"
             }
-            Lint::UnnamedWait => "name what is awaited (the key, the lock's data, the channel's message) where the wait is written",
+            Lint::UnnamedWait => {
+                "name what is awaited (the key, the lock's data, the channel's message) where the wait is written"
+            }
             Lint::SharedCollectionLock => {
                 "share a map as `papaya::HashMap`; take the results of parallel items from `blaze_graph::par`, in order, not from a locked `Vec`"
             }
@@ -761,7 +769,9 @@ impl Lint {
             Lint::SeqcstUnexplained => {
                 "take the weaker ordering the operation needs (a load `Acquire`, a store `Release`, a read-modify-write `AcqRel`), or say why it needs one total order with `// seqcst: <why>` on its line or the line above"
             }
-            Lint::LargeMove => "pass by reference or box the large variant, so a move copies a pointer",
+            Lint::LargeMove => {
+                "pass by reference or box the large variant, so a move copies a pointer"
+            }
             Lint::CollectThenConsume => {
                 "use the iterator where the collection is used, and drop the `collect` and its allocation"
             }
@@ -843,22 +853,54 @@ impl Lint {
             Lint::HotMarkedCold => {
                 "take `#[cold]` / `#[inline(never)]` off: the optimizer lays this function out as unlikely and keeps it out of line, where the profile shows it is called often"
             }
-            Lint::PushWithoutReserve => "make it with `with_capacity(n)` for the loop's count, so it allocates once",
-            Lint::ScratchInLoop => "make it once before the loop and `.clear()` it each round, so it keeps its capacity",
-            Lint::BoxedRecursiveNode => "keep the nodes in a `Vec` (an arena) and link them by `u32` indices; or say why with `#[expect(blaze::boxed_recursive_node, reason = \"..\")]`",
-            Lint::WideIndex => "store the index as a `u32` (or a newtype over one) and widen it with `as usize` where it indexes",
-            Lint::BoundedHeapField => "hold it inline: an array (`[T; N]`, `arrayvec::ArrayVec`) or a small string (`arrayvec::ArrayString`, `smol_str`), sized for the bound",
-            Lint::EnumVecPadded => "keep one `Vec` per variant, or the values packed as bytes, so each takes its own size; or say why with `#[expect(blaze::enum_vec_padded, reason = \"..\")]`",
-            Lint::DeepDropAtExit => "`std::mem::forget` it at the end of `main`, or flush and `std::process::exit(0)`; the operating system frees it at once",
-            Lint::DynFnParam => "take the closure as `impl Fn(..)` (a type parameter), so the call is direct and inlinable",
-            Lint::BoxLargeNew => "build it in the heap: `vec![..].into_boxed_slice()`, `Box::new_uninit()` and a write, or `Box::default()`",
-            Lint::PodSerializedByField => "derive `bytemuck::Pod` (or zerocopy's traits) and move slices of it as bytes",
-            Lint::Checkfree => "prove the index or the arithmetic in range before the loop (`assert!(n <= v.len())`, `get`, `checked_*`, iterators), or take `#[blaze::checkfree]` off",
-            Lint::Nopanic => "check the index or the arithmetic (`get`, `checked_*`, `wrapping_*`), mark the callee proven by hand `#[blaze::nopanic(trusted = \"why\")]`, or take `#[blaze::nopanic]` off",
-            Lint::Noalloc => "allocate from the task's frame (`Vec::new_in(frame)`), mark the callee proven by hand `#[blaze::noalloc(trusted = \"why\")]`, or take `#[blaze::noalloc]` off",
-            Lint::Nonblocking => "wait through the scheduler and do IO on a driver thread, mark the callee proven by hand `#[blaze::nonblocking(trusted = \"why\")]`, or take `#[blaze::nonblocking]` off",
-            Lint::Pure => "read the outside world only through the arguments (pass the value in, take a type parameter for a `dyn` or a function pointer), mark a callee proven by hand `#[blaze::pure(trusted = \"why\")]`, or take `#[blaze::pure]` off",
-            Lint::Packable => "mark it `#[blaze::bits]` to store its `bool`, enum and small-integer fields at their bit widths, after checking that nothing borrows a field (`&s.f`, `&mut s.f`): a packed field has no address; or say why with `#[expect(blaze::packable, reason = \"..\")]`",
+            Lint::PushWithoutReserve => {
+                "make it with `with_capacity(n)` for the loop's count, so it allocates once"
+            }
+            Lint::ScratchInLoop => {
+                "make it once before the loop and `.clear()` it each round, so it keeps its capacity"
+            }
+            Lint::BoxedRecursiveNode => {
+                "keep the nodes in a `Vec` (an arena) and link them by `u32` indices; or say why with `#[expect(blaze::boxed_recursive_node, reason = \"..\")]`"
+            }
+            Lint::WideIndex => {
+                "store the index as a `u32` (or a newtype over one) and widen it with `as usize` where it indexes"
+            }
+            Lint::BoundedHeapField => {
+                "hold it inline: an array (`[T; N]`, `arrayvec::ArrayVec`) or a small string (`arrayvec::ArrayString`, `smol_str`), sized for the bound"
+            }
+            Lint::EnumVecPadded => {
+                "keep one `Vec` per variant, or the values packed as bytes, so each takes its own size; or say why with `#[expect(blaze::enum_vec_padded, reason = \"..\")]`"
+            }
+            Lint::DeepDropAtExit => {
+                "`std::mem::forget` it at the end of `main`, or flush and `std::process::exit(0)`; the operating system frees it at once"
+            }
+            Lint::DynFnParam => {
+                "take the closure as `impl Fn(..)` (a type parameter), so the call is direct and inlinable"
+            }
+            Lint::BoxLargeNew => {
+                "build it in the heap: `vec![..].into_boxed_slice()`, `Box::new_uninit()` and a write, or `Box::default()`"
+            }
+            Lint::PodSerializedByField => {
+                "derive `bytemuck::Pod` (or zerocopy's traits) and move slices of it as bytes"
+            }
+            Lint::Checkfree => {
+                "prove the index or the arithmetic in range before the loop (`assert!(n <= v.len())`, `get`, `checked_*`, iterators), or take `#[blaze::checkfree]` off"
+            }
+            Lint::Nopanic => {
+                "check the index or the arithmetic (`get`, `checked_*`, `wrapping_*`), mark the callee proven by hand `#[blaze::nopanic(trusted = \"why\")]`, or take `#[blaze::nopanic]` off"
+            }
+            Lint::Noalloc => {
+                "allocate from the task's frame (`Vec::new_in(frame)`), mark the callee proven by hand `#[blaze::noalloc(trusted = \"why\")]`, or take `#[blaze::noalloc]` off"
+            }
+            Lint::Nonblocking => {
+                "wait through the scheduler and do IO on a driver thread, mark the callee proven by hand `#[blaze::nonblocking(trusted = \"why\")]`, or take `#[blaze::nonblocking]` off"
+            }
+            Lint::Pure => {
+                "read the outside world only through the arguments (pass the value in, take a type parameter for a `dyn` or a function pointer), mark a callee proven by hand `#[blaze::pure(trusted = \"why\")]`, or take `#[blaze::pure]` off"
+            }
+            Lint::Packable => {
+                "mark it `#[blaze::bits]` to store its `bool`, enum and small-integer fields at their bit widths, after checking that nothing borrows a field (`&s.f`, `&mut s.f`): a packed field has no address; or say why with `#[expect(blaze::packable, reason = \"..\")]`"
+            }
             Lint::BorrowWorkaround => {
                 "look it up once, `if let Some(found) = map.get(&k)`, and use `found` in the branch; or say why with `#[expect(blaze::borrow_workaround, reason = \"..\")]`"
             }
@@ -903,7 +945,11 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             // `MaybeIncorrect`: `HashMap::new()` and `with_capacity` are `RandomState`'s only, and
             // the type may meet a signature that names std's map; the uses change with it.
             // alloc: the fix's one part
-            diagnostic.multipart_suggestion("choose blaze's fixed-seed hasher", vec![part], Applicability::MaybeIncorrect);
+            diagnostic.multipart_suggestion(
+                "choose blaze's fixed-seed hasher",
+                vec![part],
+                Applicability::MaybeIncorrect,
+            );
         }
         diagnostic
             .help(Lint::DefaultHasher.help())
@@ -914,7 +960,9 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if cx.on_blaze(Lint::FiberBoundary)
         && let Some(message) = fiber::check(cx, node)
         && let Some(range) = cx.range(
-            ast::ExternCrate::cast(node).and_then(|it| it.name_ref()).map_or(node, |it| it.syntax()),
+            ast::ExternCrate::cast(node)
+                .and_then(|it| it.name_ref())
+                .map_or(node, |it| it.syntax()),
         )
     {
         let span = cx.span(range);
@@ -963,7 +1011,12 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if let Some(record) = ast::RecordExpr::cast(node) {
         struct_update::check(cx, record);
     }
-    if matches!(node.kind(), syntax::SyntaxKind::RECORD_FIELD | syntax::SyntaxKind::TUPLE_FIELD | syntax::SyntaxKind::STATIC) {
+    if matches!(
+        node.kind(),
+        syntax::SyntaxKind::RECORD_FIELD
+            | syntax::SyntaxKind::TUPLE_FIELD
+            | syntax::SyntaxKind::STATIC
+    ) {
         shared_collection_lock::check_declaration(cx, node);
     }
     unrecorded_span::check(cx, node);
@@ -1036,7 +1089,8 @@ impl<'db> Known<'db> {
         let db = cx.db();
         let clone = cx.lang_trait(hir::LangItem::Clone).and_then(|it| {
             let id = TraitId::from(it);
-            let clone_fn = id.trait_items(db).method_by_name(&hir::Name::new_symbol_root(sym::clone));
+            let clone_fn =
+                id.trait_items(db).method_by_name(&hir::Name::new_symbol_root(sym::clone));
             Some((id, clone_fn?))
         });
         Known {
@@ -1131,9 +1185,17 @@ fn check_body(cx: &mut Cx<'_, '_>) {
                 None => format!("this call to `{}`", hir::Function::from(callee).name(db).as_str()),
             };
             if on_alloc && reaches(false) {
-                push(Lint::HotAlloc, range, format!("{} reaches the global allocator", call()), None);
+                push(
+                    Lint::HotAlloc,
+                    range,
+                    format!("{} reaches the global allocator", call()),
+                    None,
+                );
             } else if on_alloc_call && reaches(true) && !reaches(false) {
-                let message = format!("{} reaches the global allocator through the workspace's own code", call());
+                let message = format!(
+                    "{} reaches the global allocator through the workspace's own code",
+                    call()
+                );
                 let note = "`hot_alloc` finds the allocation in the function of the workspace that \
                             makes it; a hot function promises that nothing it calls allocates";
                 push(Lint::HotAllocCall, range, message, Some(note.to_owned()));
@@ -1142,15 +1204,21 @@ fn check_body(cx: &mut Cx<'_, '_>) {
                 && let Some(made) = alloc::makes_global(&k, callee, infer.expr_ty(id))
             {
                 let made = hir::Adt::from(made).name(db);
-                let message = format!("{} makes a `{}` of the global allocator", call(), made.as_str());
+                let message =
+                    format!("{} makes a `{}` of the global allocator", call(), made.as_str());
                 let note = "it allocates from the global heap once it grows: name its allocator \
                             (`Vec::new_in(alloc)`), grow a buffer the caller keeps, or say why it \
                             needs the global heap with `// alloc: <why>`";
                 push(Lint::HotAlloc, range, message, Some(note.to_owned()));
             }
             if on_map
-                && let Some(message) =
-                    hashmap::check_construct(&k, || body_item(db, analysis), callee, infer.expr_ty(id), turbofish)
+                && let Some(message) = hashmap::check_construct(
+                    &k,
+                    || body_item(db, analysis),
+                    callee,
+                    infer.expr_ty(id),
+                    turbofish,
+                )
             {
                 push(Lint::DefaultHasher, range, message, None);
             }

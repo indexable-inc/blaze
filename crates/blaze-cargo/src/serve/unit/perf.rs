@@ -47,7 +47,8 @@ pub(crate) fn write_map(job: &Job, path: &str, image: &Image, built: &Built) -> 
     let mut identities = built.identities.clone();
     identities.sort_unstable();
     // alloc: once per link that keeps a code map, the build's names by key
-    let mut names: Vec<(&InstanceKey, &str)> = built.debug_names.iter().map(|it| (&it.0, it.1.as_str())).collect();
+    let mut names: Vec<(&InstanceKey, &str)> =
+        built.debug_names.iter().map(|it| (&it.0, it.1.as_str())).collect();
     names.sort_unstable();
     // alloc: once per link that keeps a code map, the image's functions, by key
     let mut placed: Vec<(InstanceKey, u64, u64)> = image.functions();

@@ -129,14 +129,17 @@ fn count() -> *const Cell<u32> {
 }
 "#;
 
-const FLAGS: &str = "-A clippy::all --allow=blaze::general --deny=blaze::thread_local_in_waiting_fn";
+const FLAGS: &str =
+    "-A clippy::all --allow=blaze::general --deny=blaze::thread_local_in_waiting_fn";
 
 /// The lines of `src/lib.rs` with a finding of the lint in `out`, in order.
 fn found(out: &str) -> Vec<u32> {
     let mut found = Vec::new();
     let mut ours = false;
     for line in out.lines() {
-        if let Some(message) = line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: ")) {
+        if let Some(message) =
+            line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: "))
+        {
             ours = message.contains("which may park the fiber at `");
             continue;
         }
@@ -161,7 +164,11 @@ fn expected(source: &str) -> Vec<u32> {
 /// the output.
 #[track_caller]
 fn check(items: &str) -> String {
-    let source = format!("{}{}", MAIN.split_once('\n').map_or("", |(_, rest)| rest), items.trim_start_matches('\n'));
+    let source = format!(
+        "{}{}",
+        MAIN.split_once('\n').map_or("", |(_, rest)| rest),
+        items.trim_start_matches('\n')
+    );
     let fixture = format!("{MINICORE}{CRATES}{MAIN}{}", items.trim_start_matches('\n'));
     let out = lint(&fixture, FLAGS);
     assert_eq!(found(&out), expected(&source), "the findings of:\n{source}\nwere:\n{out}");
@@ -198,7 +205,10 @@ pub fn waits_itself(db: &Db) -> u32 {
         ),
         "the finding names the static, the function and the call that parks:\n{out}"
     );
-    assert!(out.contains("the thread-local `main::COUNT` is read through `LocalKey::get`"), "{out}");
+    assert!(
+        out.contains("the thread-local `main::COUNT` is read through `LocalKey::get`"),
+        "{out}"
+    );
     assert!(out.contains("`#[inline(never)]` on `fn waits_itself` does not help"), "{out}");
 }
 

@@ -243,16 +243,19 @@ fn an_urgent_run_does_not_wait_for_a_stale_answer() {
     // The test config's run bound is 60 s.
     gc.advance_clock(T0 + S + 61 * S);
     match gc.take_decisions().as_slice() {
-        [Decision::Record { report }] => assert!(matches!(
-            report.outcome,
-            Outcome::Stopped { why: Stop::Deadline { .. }, .. }
-        )),
+        [Decision::Record { report }] => {
+            assert!(matches!(report.outcome, Outcome::Stopped { why: Stop::Deadline { .. }, .. }))
+        }
         other => panic!("{other:?}"),
     }
     // A gap later, the next slice waits for the stale scan's answer.
     gc.advance_clock(T0 + S + 61 * S + 30 * S);
     assert!(gc.take_decisions().is_empty() && !gc.running());
-    assert_eq!(gc.next_deadline(), Some(T0 + S + 61 * S + 60 * S), "until the answer is given up on");
+    assert_eq!(
+        gc.next_deadline(),
+        Some(T0 + S + 61 * S + 60 * S),
+        "until the answer is given up on"
+    );
     // Free space falls to the floor: an urgent run starts at once, stale answer or not.
     gc.volume(0, volume(500));
     assert!(gc.below_floor());
@@ -385,7 +388,11 @@ fn a_build_held_during_a_paced_slice_is_released_within_its_hold() {
     assert!(
         matches!(
             report.outcome,
-            Outcome::Stopped { phase: Phase::Scan, why: Stop::Preempted { by: Trigger::Urgent }, .. }
+            Outcome::Stopped {
+                phase: Phase::Scan,
+                why: Stop::Preempted { by: Trigger::Urgent },
+                ..
+            }
         ),
         "{:?}",
         report.outcome

@@ -1,9 +1,9 @@
 //! `file!()` is the name the build gives the file, and a constant of it is evaluated again when
 //! the build names files differently.
 
+use hir_expand::fixture;
 use hir_ty::{db::HirDatabase, next_solver::GenericArgs};
 use hir_ty_mir::mir::location::name_sources;
-use hir_expand::fixture;
 
 use crate::{constant, db::TestDB};
 
@@ -65,7 +65,9 @@ fn each_file_gets_its_own_name() {
     let file = fx.only_file();
     let mut db = fx.into_db();
     let named = file.file_id(&db);
-    name_sources(&mut db, "build", move |_, _, file| (file == named).then(|| "src/lib.rs".to_owned()));
+    name_sources(&mut db, "build", move |_, _, file| {
+        (file == named).then(|| "src/lib.rs".to_owned())
+    });
     assert_eq!(goal(&db), "src/lib.rs");
 }
 
@@ -79,7 +81,10 @@ fn file_is_named_as_the_crate_of_its_code_names_it() {
     let mut db = fx.into_db();
     let ours = fixture::test_crate(&db);
     name_sources(&mut db, "build", move |_, krate, _| {
-        Some(if krate == ours { "r/../library/rt/src/lib.rs" } else { "another crate's name" }.to_owned())
+        Some(
+            if krate == ours { "r/../library/rt/src/lib.rs" } else { "another crate's name" }
+                .to_owned(),
+        )
     });
     assert_eq!(goal(&db), "r/../library/rt/src/lib.rs");
 }

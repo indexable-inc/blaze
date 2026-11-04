@@ -72,11 +72,7 @@ impl<'a> Parser<'a> {
     }
 
     fn expect(&mut self, expected: &Tok, what: &str) -> GrammarResult<()> {
-        if self.eat(expected) {
-            Ok(())
-        } else {
-            Err(self.error(what))
-        }
+        if self.eat(expected) { Ok(()) } else { Err(self.error(what)) }
     }
 
     fn expect_newline(&mut self) -> GrammarResult<()> {
@@ -220,18 +216,10 @@ impl<'a> Parser<'a> {
                     "Nothing was imported from grammar `{name}`"
                 )));
             }
-            let alias = if self.eat(&Tok::To) {
-                Some(self.name_token()?)
-            } else {
-                None
-            };
+            let alias = if self.eat(&Tok::To) { Some(self.name_token()?) } else { None };
             ImportNames::Single { name, alias }
         };
-        Ok(ImportStmt {
-            path,
-            relative,
-            names,
-        })
+        Ok(ImportStmt { path, relative, names })
     }
 
     fn rule_def(&mut self) -> GrammarResult<RuleDef> {
@@ -247,9 +235,7 @@ impl<'a> Parser<'a> {
         };
         self.advance();
         if modifiers.expand1 && name.starts_with('_') {
-            return Err(GrammarError::new(
-                "Inlined rules (_rule) cannot use the ?rule modifier.",
-            ));
+            return Err(GrammarError::new("Inlined rules (_rule) cannot use the ?rule modifier."));
         }
         let mut params = Vec::new();
         if self.eat(&Tok::LBrace) {
@@ -271,13 +257,7 @@ impl<'a> Parser<'a> {
         self.colon()?;
         let body = self.expansions()?;
         self.expect_newline()?;
-        Ok(RuleDef {
-            name,
-            params,
-            priority,
-            modifiers,
-            body,
-        })
+        Ok(RuleDef { name, params, priority, modifiers, body })
     }
 
     fn term_def(&mut self) -> GrammarResult<TermDef> {
@@ -291,11 +271,7 @@ impl<'a> Parser<'a> {
         self.colon()?;
         let body = self.expansions()?;
         self.expect_newline()?;
-        Ok(TermDef {
-            name,
-            priority,
-            body,
-        })
+        Ok(TermDef { name, priority, body })
     }
 
     fn priority(&mut self) -> GrammarResult<Option<i64>> {
@@ -376,10 +352,9 @@ impl<'a> Parser<'a> {
         let pos = self.pos();
         match self.advance() {
             Some(Tok::Number(n)) if (0..=REPEAT_LIMIT as i64).contains(&n) => Ok(n as u32),
-            Some(Tok::Number(n)) => Err(self.error_at(
-                pos,
-                &format!("Bad Range for repetition ({n} isn't allowed)"),
-            )),
+            Some(Tok::Number(n)) => {
+                Err(self.error_at(pos, &format!("Bad Range for repetition ({n} isn't allowed)")))
+            }
             _ => Err(self.error_at(pos, &format!("Expecting a number after '{after}'"))),
         }
     }
@@ -395,11 +370,7 @@ impl<'a> Parser<'a> {
                     _ => (1, None),
                 };
                 self.advance();
-                Ok(Expr::Repeat {
-                    inner: Box::new(atom),
-                    min,
-                    max,
-                })
+                Ok(Expr::Repeat { inner: Box::new(atom), min, max })
             }
             Some(Tok::Tilde) => {
                 self.advance();
@@ -420,11 +391,7 @@ impl<'a> Parser<'a> {
                 } else {
                     min
                 };
-                Ok(Expr::Repeat {
-                    inner: Box::new(atom),
-                    min,
-                    max: Some(max),
-                })
+                Ok(Expr::Repeat { inner: Box::new(atom), min, max: Some(max) })
             }
             _ => Ok(atom),
         }
@@ -450,11 +417,7 @@ impl<'a> Parser<'a> {
                 match self.peek() {
                     Some(Tok::RBra) => {
                         self.advance();
-                        Ok(Expr::Repeat {
-                            inner: Box::new(inner),
-                            min: 0,
-                            max: Some(1),
-                        })
+                        Ok(Expr::Repeat { inner: Box::new(inner), min: 0, max: Some(1) })
                     }
                     Some(Tok::RPar) => Err(self.error("Unmatched closing parenthesis")),
                     _ => Err(self.error_at(pos, "Unclosed parenthesis")),
@@ -532,12 +495,7 @@ impl<'a> Parser<'a> {
 /// Parse grammar text into its statements.
 pub fn parse_grammar(text: &str) -> GrammarResult<Vec<Statement>> {
     let tokens = tokenize(text)?;
-    let mut parser = Parser {
-        tokens,
-        i: 0,
-        text,
-        depth: 0,
-    };
+    let mut parser = Parser { tokens, i: 0, text, depth: 0 };
     parser.parse_grammar()
 }
 
@@ -546,16 +504,8 @@ pub fn parse_grammar(text: &str) -> GrammarResult<Vec<Statement>> {
 fn atom_text(atom: &Expr) -> String {
     match atom {
         Expr::Symbol(symbol) => symbol.name().to_string(),
-        Expr::Literal(Pattern {
-            kind: PatternKind::Str,
-            value,
-            ..
-        }) => format!("\"{value}\""),
-        Expr::Literal(Pattern {
-            kind: PatternKind::Re,
-            value,
-            ..
-        }) => format!("/{value}/"),
+        Expr::Literal(Pattern { kind: PatternKind::Str, value, .. }) => format!("\"{value}\""),
+        Expr::Literal(Pattern { kind: PatternKind::Re, value, .. }) => format!("/{value}/"),
         Expr::Template { name, .. } => name.clone(),
         Expr::Alternatives(_) | Expr::Repeat { .. } => "group".to_string(),
     }

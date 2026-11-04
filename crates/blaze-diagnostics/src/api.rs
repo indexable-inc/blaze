@@ -46,7 +46,11 @@ pub fn diagnostic(
         rendered: emit::written(diag, sources, style)?,
         unit,
         // alloc: the API's owned explanation, of a diagnostic written
-        explanation: diag.code.as_ref().and_then(|code| codes::explanation(code.as_str())).map(str::to_owned),
+        explanation: diag
+            .code
+            .as_ref()
+            .and_then(|code| codes::explanation(code.as_str()))
+            .map(str::to_owned),
     })
 }
 
@@ -72,8 +76,8 @@ fn child(child: &Child, sources: &Sources) -> Result<Diagnostic, Unplaced> {
         // clone: the API's owned message, of a diagnostic written
         message: child.message.clone(),
         spans: spans(&child.span, sources)?,
-        children: Vec::new(), // alloc: empty, allocates nothing
-        facts: Vec::new(),    // alloc: empty, allocates nothing
+        children: Vec::new(),    // alloc: empty, allocates nothing
+        facts: Vec::new(),       // alloc: empty, allocates nothing
         rendered: String::new(), // alloc: empty, allocates nothing
         unit: None,
         explanation: None,
@@ -101,8 +105,8 @@ fn suggestion(suggestion: &Suggestion, sources: &Sources) -> Result<Diagnostic, 
         // clone: the API's owned message, of a suggestion written
         message: suggestion.message.clone(),
         spans,
-        children: Vec::new(), // alloc: empty, allocates nothing
-        facts: Vec::new(),    // alloc: empty, allocates nothing
+        children: Vec::new(),    // alloc: empty, allocates nothing
+        facts: Vec::new(),       // alloc: empty, allocates nothing
         rendered: String::new(), // alloc: empty, allocates nothing
         unit: None,
         explanation: None,
@@ -156,7 +160,10 @@ mod tests {
     }
 
     fn sources() -> Sources {
-        Sources::of([("src/main.rs".to_owned(), "fn main() {\n    let x: u32 = \"a\";\n}\n".to_owned())])
+        Sources::of([(
+            "src/main.rs".to_owned(),
+            "fn main() {\n    let x: u32 = \"a\";\n}\n".to_owned(),
+        )])
     }
 
     #[test]
@@ -182,10 +189,13 @@ mod tests {
             .iter()
             .map(|s| (s.line, s.column, s.end_line, s.end_column, s.primary, s.label.as_deref()))
             .collect();
-        assert_eq!(placed, [
-            (2, 18, 2, 21, true, Some("expected `u32`, found `&str`")),
-            (2, 12, 2, 15, false, Some("expected due to this")),
-        ]);
+        assert_eq!(
+            placed,
+            [
+                (2, 18, 2, 21, true, Some("expected `u32`, found `&str`")),
+                (2, 12, 2, 15, false, Some("expected due to this")),
+            ]
+        );
         assert!(it.rendered.starts_with("error[E0308]: mismatched types\n"), "{}", it.rendered);
         assert_eq!(it.explanation.as_deref(), Some(include_str!("emit/codes/E0308.md")));
     }
@@ -197,7 +207,10 @@ mod tests {
         diag.suggestion(span(29, 32), "use a number", "1", Applicability::MaybeIncorrect);
         let it = diagnostic(&diag, &sources(), Style::default(), None).unwrap();
         assert_eq!(it.children.len(), 2);
-        assert_eq!((it.children[0].level, it.children[0].message.as_str()), (blaze_api::Level::Note, "a note"));
+        assert_eq!(
+            (it.children[0].level, it.children[0].message.as_str()),
+            (blaze_api::Level::Note, "a note")
+        );
         assert!(it.children[0].spans.is_empty());
         let help = &it.children[1];
         assert_eq!((help.level, help.message.as_str()), (blaze_api::Level::Help, "use a number"));
@@ -213,13 +226,19 @@ mod tests {
         let mut diag = Diag::error(Some("E0061"), "this function takes 1 argument", span(29, 32));
         diag.fact(fact, "the signature of `f`");
         let it = diagnostic(&diag, &sources(), Style::default(), None).unwrap();
-        assert_eq!(it.facts, [FactRead { key: fact.key(), what: "the signature of `f`".to_owned() }]);
+        assert_eq!(
+            it.facts,
+            [FactRead { key: fact.key(), what: "the signature of `f`".to_owned() }]
+        );
     }
 
     #[test]
     fn a_span_of_a_file_not_read_or_past_its_end_is_an_error_naming_the_file() {
         let mut unread = Diag::error(None, "unused", span(1, 2));
-        unread.span_label(Span::new("out/gen.rs", TextRange::new(TextSize::from(5), TextSize::from(9))), "here");
+        unread.span_label(
+            Span::new("out/gen.rs", TextRange::new(TextSize::from(5), TextSize::from(9))),
+            "here",
+        );
         let mut sources = sources();
         sources.add("out/gen.rs", None);
         assert_eq!(
@@ -229,6 +248,9 @@ mod tests {
         let past = Diag::error(None, "unused", span(40, 90));
         let why = diagnostic(&past, &sources, Style::default(), None).unwrap_err();
         assert_eq!(why, Unplaced::PastEnd { file: "src/main.rs".to_owned(), byte: 40, len: 36 });
-        assert_eq!(why.to_string(), "a diagnostic's span at byte 40 of `src/main.rs`, which is 36 bytes long");
+        assert_eq!(
+            why.to_string(),
+            "a diagnostic's span at byte 40 of `src/main.rs`, which is 36 bytes long"
+        );
     }
 }

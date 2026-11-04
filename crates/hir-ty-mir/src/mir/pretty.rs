@@ -623,7 +623,9 @@ impl<'db> Printer<'_, '_, 'db> {
                 self.operand(found)
             ),
             // alloc: printing MIR for people, the edge
-            AssertKind::NullPointerDereference => "\"null pointer dereference occurred\"".to_owned(),
+            AssertKind::NullPointerDereference => {
+                "\"null pointer dereference occurred\"".to_owned()
+            }
             // alloc: printing MIR for people, the edge
             AssertKind::NullReferenceConstructed => "\"null reference produced\"".to_owned(),
             // alloc: printing MIR for people, the edge
@@ -685,10 +687,7 @@ fn scalar_width(ty: Ty<'_>) -> Option<usize> {
 
 /// Where rustc says an `impl` is written, which it names one by in its MIR: at the derive that
 /// wrote it, or where the `impl` starts. The file and the offset in it.
-pub fn impl_written_at(
-    db: &Db,
-    id: hir_def::ImplId,
-) -> (base_db::FileId, syntax::TextSize) {
+pub fn impl_written_at(db: &Db, id: hir_def::ImplId) -> (base_db::FileId, syntax::TextSize) {
     use hir_def::src::HasSource;
     use hir_expand::{InFile, MacroCallKind};
     let source: InFile<_> = id.lookup(db).ast_ptr(db);

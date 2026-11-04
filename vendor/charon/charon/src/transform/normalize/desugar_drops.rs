@@ -10,10 +10,7 @@ fn is_noop_destruct(glue: &FnPtr) -> bool {
     match glue.kind.as_ref() {
         FnPtrKind::Trait(tref, _) => matches!(
             &tref.kind,
-            TraitRefKind::BuiltinOrAuto {
-                builtin_data: BuiltinImplData::NoopDestruct,
-                ..
-            }
+            TraitRefKind::BuiltinOrAuto { builtin_data: BuiltinImplData::NoopDestruct, .. }
         ),
         _ => false,
     }
@@ -23,13 +20,8 @@ impl<'a> UllbcStatementTransformCtx<'a> {
     /// Transform a Drop to a Call that calls the drop_glue method.
     /// If we cannot desugar this drop, we just leave it unchanged.
     fn transform_drop_to_call(&mut self, term: &mut Terminator) {
-        if let TerminatorKind::Drop {
-            kind: DropKind::Precise,
-            place,
-            fn_ptr,
-            target,
-            on_unwind,
-        } = &mut term.kind
+        if let TerminatorKind::Drop { kind: DropKind::Precise, place, fn_ptr, target, on_unwind } =
+            &mut term.kind
         {
             // check if this drop is noop
             if is_noop_destruct(fn_ptr) {

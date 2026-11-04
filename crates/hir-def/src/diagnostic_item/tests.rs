@@ -1,7 +1,7 @@
 use base_db::{Crate, all_crates};
+use hir_expand::fixture;
 use intern::Symbol;
 use syntax::view::HasName;
-use hir_expand::fixture;
 
 use super::{crate_diagnostic_items, diagnostic_items};
 use crate::{
@@ -69,9 +69,7 @@ pub fn mine() {}
 fn crate_named(db: &TestDB, name: &str) -> Crate {
     *all_crates(db)
         .iter()
-        .find(|it| {
-            it.extra_data(db).display_name.as_ref().is_some_and(|it| it.to_string() == name)
-        })
+        .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.to_string() == name))
         .unwrap_or_else(|| panic!("no crate {name}"))
 }
 

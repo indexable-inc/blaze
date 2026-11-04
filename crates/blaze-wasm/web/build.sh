@@ -1,8 +1,7 @@
 #!/bin/sh
 # Builds what the page loads into `pkg/`: the compiler as wasm32, and the source of `core`.
-# `core` comes from blaze's own library/ at the repo root. Serve this directory afterwards, with any static server:
-#
-#     python3 -m http.server -d crates/blaze-wasm/web 8377
+# `core` comes from blaze's own library/ at the repo root. `check.mjs` runs the page's demos
+# without a browser; `build-site.sh` puts the page into the website.
 set -eu
 cd "$(dirname "$0")/.."
 target=../../target

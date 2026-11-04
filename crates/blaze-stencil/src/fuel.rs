@@ -52,7 +52,10 @@ pub struct Runtime {
 impl Runtime {
     /// blaze's runtime: [`NAMESPACE`]'s [`CELL`] and [`OUT`].
     pub fn blaze() -> Self {
-        Self { cell: ir::UserExternalName::new(NAMESPACE, CELL), out: ir::UserExternalName::new(NAMESPACE, OUT) }
+        Self {
+            cell: ir::UserExternalName::new(NAMESPACE, CELL),
+            out: ir::UserExternalName::new(NAMESPACE, OUT),
+        }
     }
 }
 
@@ -68,36 +71,45 @@ pub struct Metered {
 /// block at or before it in layout order, as [`crate::tier::instrument`] counts them). Every
 /// cycle of the control flow graph has such an edge, so metered code can't run without
 /// ticking. `call_conv` is the convention of the runtime's functions (the target's C one).
-pub fn meter(func: &mut ir::Function, runtime: &Runtime, call_conv: CallConv) -> Result<Metered, String> {
+pub fn meter(
+    func: &mut ir::Function,
+    runtime: &Runtime,
+    call_conv: CallConv,
+) -> Result<Metered, String> {
     let name = func.name.clone();
     // alloc: an error
     let fail = |what: &str| format!("metering {name} for fuel: {what}");
     let Some(entry) = func.layout.entry_block() else {
         return Err(fail("a function with no blocks"));
     };
-    let heads = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |temp| -> Result<SmallVec<[ir::Block; 8]>, String> {
-        let order = temp.alloc_slice_fill_with(func.dfg.num_blocks(), |_| u32::MAX);
-        for (at, block) in func.layout.blocks().enumerate() {
-            order[block.as_u32() as usize] = at as u32;
-        }
-        let head = temp.alloc_slice_fill_with(func.dfg.num_blocks(), |_| false);
-        for block in func.layout.blocks() {
-            let Some(last) = func.layout.last_inst(block) else { continue };
-            let from = order[block.as_u32() as usize];
-            let data = &func.dfg.insts[last];
-            for call in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
-                let target = call.block(&func.dfg.value_lists);
-                if target == entry {
-                    return Err(fail("a branch to the entry block"));
-                }
-                if order[target.as_u32() as usize] <= from {
-                    head[target.as_u32() as usize] = true;
+    let heads = blaze_mem::frame::task(
+        blaze_mem::Tag::Codegen,
+        |temp| -> Result<SmallVec<[ir::Block; 8]>, String> {
+            let order = temp.alloc_slice_fill_with(func.dfg.num_blocks(), |_| u32::MAX);
+            for (at, block) in func.layout.blocks().enumerate() {
+                order[block.as_u32() as usize] = at as u32;
+            }
+            let head = temp.alloc_slice_fill_with(func.dfg.num_blocks(), |_| false);
+            for block in func.layout.blocks() {
+                let Some(last) = func.layout.last_inst(block) else { continue };
+                let from = order[block.as_u32() as usize];
+                let data = &func.dfg.insts[last];
+                for call in
+                    data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    let target = call.block(&func.dfg.value_lists);
+                    if target == entry {
+                        return Err(fail("a branch to the entry block"));
+                    }
+                    if order[target.as_u32() as usize] <= from {
+                        head[target.as_u32() as usize] = true;
+                    }
                 }
             }
-        }
-        // alloc: inline up to 8 loop heads
-        Ok(func.layout.blocks().filter(|block| head[block.as_u32() as usize]).collect())
-    })?;
+            // alloc: inline up to 8 loop heads
+            Ok(func.layout.blocks().filter(|block| head[block.as_u32() as usize]).collect())
+        },
+    )?;
 
     let mut cell_sig = ir::Signature::new(call_conv);
     cell_sig.returns.push(ir::AbiParam::new(types::I64));
@@ -147,7 +159,13 @@ pub fn meter(func: &mut ir::Function, runtime: &Runtime, call_conv: CallConv) ->
 /// Ends `block` (empty of its own instructions, which moved to `rest`) with a tick:
 /// `c = *cell; *cell = c - 1; brif c, rest, out`, where `out` (at the end of the layout)
 /// calls the runtime's `out(cell)` and goes on to `rest`.
-fn tick(cursor: &mut FuncCursor<'_>, block: ir::Block, rest: ir::Block, cell: ir::Value, out_fn: ir::FuncRef) {
+fn tick(
+    cursor: &mut FuncCursor<'_>,
+    block: ir::Block,
+    rest: ir::Block,
+    cell: ir::Value,
+    out_fn: ir::FuncRef,
+) {
     let flags = ir::MemFlagsData::trusted();
     cursor.goto_bottom(block);
     let count = cursor.ins().load(types::I64, flags, cell, 0);
@@ -160,4 +178,3 @@ fn tick(cursor: &mut FuncCursor<'_>, block: ir::Block, rest: ir::Block, cell: ir
     cursor.ins().call(out_fn, &[cell]);
     cursor.ins().jump(rest, &[]);
 }
-

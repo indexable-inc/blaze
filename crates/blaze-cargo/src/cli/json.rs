@@ -12,8 +12,8 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use blaze_api::{
-    Applicability, Artifact, Basis, BuildScriptRanRef, CrateType, DiagnosticRef, SpanRef, TestOutcome, TestResult,
-    UnitOfRef, UnitTarget, UnitTargetRef,
+    Applicability, Artifact, Basis, BuildScriptRanRef, CrateType, DiagnosticRef, SpanRef,
+    TestOutcome, TestResult, UnitOfRef, UnitTarget, UnitTargetRef,
 };
 use blaze_hash::FixedState;
 use std::alloc::Global;
@@ -180,30 +180,36 @@ struct TargetFields<'s, K, C> {
 /// A target as cargo's `SerializedTarget` writes it. `required-features` is written only for a
 /// target that has some, which [`UnitTarget`] does not say.
 pub fn target(out: &mut String, target: &UnitTarget) {
-    target_with(out, TargetFields {
-        kinds: target.kinds(),
-        crate_types: target.crate_types.iter().copied(),
-        name: &target.name,
-        src_path: &target.src_path,
-        edition: &target.edition,
-        doc: target.doc,
-        doctest: target.doctest,
-        test: target.test,
-    });
+    target_with(
+        out,
+        TargetFields {
+            kinds: target.kinds(),
+            crate_types: target.crate_types.iter().copied(),
+            name: &target.name,
+            src_path: &target.src_path,
+            edition: &target.edition,
+            doc: target.doc,
+            doctest: target.doctest,
+            test: target.test,
+        },
+    );
 }
 
 /// [`target`] of one read in place.
 pub fn target_ref(out: &mut String, target: UnitTargetRef<'_>) {
-    target_with(out, TargetFields {
-        kinds: target.kinds(),
-        crate_types: target.crate_types.iter(),
-        name: target.name,
-        src_path: target.src_path,
-        edition: target.edition,
-        doc: target.doc,
-        doctest: target.doctest,
-        test: target.test,
-    });
+    target_with(
+        out,
+        TargetFields {
+            kinds: target.kinds(),
+            crate_types: target.crate_types.iter(),
+            name: target.name,
+            src_path: target.src_path,
+            edition: target.edition,
+            doc: target.doc,
+            doctest: target.doctest,
+            test: target.test,
+        },
+    );
 }
 
 fn target_with<'s>(
@@ -350,7 +356,13 @@ pub fn build_finished(out: &mut String, success: bool) {
 /// `CompilerMessage { rendered, #[serde(flatten)] other: BTreeMap, code: Option<DiagnosticCode> }`:
 /// `rendered` first, then every other field sorted by key (at every depth, as `serde_json::Value`
 /// maps are), then the outermost `code` last.
-pub fn compiler_message(out: &mut String, unit: UnitOfRef<'_>, diagnostic: DiagnosticRef<'_>, ansi: bool, sources: &mut Sources) {
+pub fn compiler_message(
+    out: &mut String,
+    unit: UnitOfRef<'_>,
+    diagnostic: DiagnosticRef<'_>,
+    ansi: bool,
+    sources: &mut Sources,
+) {
     let dir = unit.manifest_path.rsplit_once(['/', '\\']).map_or("", |(dir, _)| dir);
     out.push_str(r#"{"reason":"compiler-message","package_id":"#);
     quote(out, unit.package_id);
@@ -389,7 +401,14 @@ fn code(out: &mut String, diagnostic: DiagnosticRef<'_>) {
 }
 
 /// rustc's `Diagnostic`: `$message_type` on the outermost only, `rendered` `null` on children.
-fn diagnostic_json(out: &mut String, diagnostic: DiagnosticRef<'_>, outermost: bool, order: Order, sources: &mut Sources, dir: &str) {
+fn diagnostic_json(
+    out: &mut String,
+    diagnostic: DiagnosticRef<'_>,
+    outermost: bool,
+    order: Order,
+    sources: &mut Sources,
+    dir: &str,
+) {
     let spans = |out: &mut String, sources: &mut Sources| {
         out.push('[');
         for (at, span) in diagnostic.spans.iter().enumerate() {
@@ -529,7 +548,13 @@ fn span_json(out: &mut String, span: SpanRef<'_>, order: Order, sources: &mut So
 /// rustc's `DiagnosticSpanLine`s of `span` (`SourceMap::span_to_lines`): each line it covers,
 /// highlighted from its start column on the first and to its end column on the last, in
 /// 1-based columns of characters. `[]` when the span is outside the file as it is on disk.
-fn span_text(out: &mut String, span: SpanRef<'_>, order: Order, sources: &Sources, file: Option<u32>) {
+fn span_text(
+    out: &mut String,
+    span: SpanRef<'_>,
+    order: Order,
+    sources: &Sources,
+    file: Option<u32>,
+) {
     let (first, last) = (span.line as usize, span.end_line as usize);
     let lines = file.map_or(0, |file| sources.line_count(file));
     out.push('[');

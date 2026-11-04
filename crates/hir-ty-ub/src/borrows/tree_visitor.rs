@@ -53,13 +53,22 @@ where
     NodeContinue: Fn(&NodeAppArgs<'_, T>) -> ContinueTraversal,
     NodeApp: FnMut(NodeAppArgs<'_, T>) -> Result<(), Err>,
 {
-    fn should_continue_at(&mut self, idx: UniIndex, rel_pos: AccessRelatedness) -> ContinueTraversal {
+    fn should_continue_at(
+        &mut self,
+        idx: UniIndex,
+        rel_pos: AccessRelatedness,
+    ) -> ContinueTraversal {
         let args = NodeAppArgs { idx, rel_pos, nodes: self.this.nodes, data: self.this.data };
         (self.f_continue)(&args)
     }
 
     fn propagate_at(&mut self, idx: UniIndex, rel_pos: AccessRelatedness) -> Result<(), Err> {
-        (self.f_propagate)(NodeAppArgs { idx, rel_pos, nodes: self.this.nodes, data: self.this.data })
+        (self.f_propagate)(NodeAppArgs {
+            idx,
+            rel_pos,
+            nodes: self.this.nodes,
+            data: self.this.data,
+        })
     }
 
     /// The accessed node, then its parents (all local), pushing the cousins (and, unless
@@ -157,8 +166,8 @@ impl<'tree, T> TreeVisitor<'tree, T> {
         f_propagate: impl FnMut(NodeAppArgs<'_, T>) -> Result<(), Err>,
     ) -> Result<UniIndex, Err> {
         let mut visit = Visit { this: &mut self, f_continue, f_propagate };
-        let root =
-            visit.go_upwards_from_accessed(start_idx, ChildrenVisitMode::VisitChildrenOfAccessed)?;
+        let root = visit
+            .go_upwards_from_accessed(start_idx, ChildrenVisitMode::VisitChildrenOfAccessed)?;
         visit.finish_foreign_accesses()?;
         Ok(root)
     }
@@ -187,7 +196,11 @@ impl<'tree, T> TreeVisitor<'tree, T> {
         f_propagate: impl FnMut(NodeAppArgs<'_, T>) -> Result<(), Err>,
     ) -> Result<(), Err> {
         self.stack.clear();
-        self.stack.push((start_idx, AccessRelatedness::ForeignAccess, RecursionState::BeforeChildren));
+        self.stack.push((
+            start_idx,
+            AccessRelatedness::ForeignAccess,
+            RecursionState::BeforeChildren,
+        ));
         let mut visit = Visit { this: &mut self, f_continue, f_propagate };
         visit.finish_foreign_accesses()
     }

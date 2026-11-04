@@ -69,9 +69,7 @@ macro_rules! tuples {
         $crate::generators::tuples11($g1, $g2, $g3, $g4, $g5, $g6, $g7, $g8, $g9, $g10, $g11)
     };
     ($g1:expr, $g2:expr, $g3:expr, $g4:expr, $g5:expr, $g6:expr, $g7:expr, $g8:expr, $g9:expr, $g10:expr, $g11:expr, $g12:expr $(,)?) => {
-        $crate::generators::tuples12(
-            $g1, $g2, $g3, $g4, $g5, $g6, $g7, $g8, $g9, $g10, $g11, $g12,
-        )
+        $crate::generators::tuples12($g1, $g2, $g3, $g4, $g5, $g6, $g7, $g8, $g9, $g10, $g11, $g12)
     };
     ($g1:expr, $g2:expr, $g3:expr, $g4:expr, $g5:expr, $g6:expr, $g7:expr, $g8:expr, $g9:expr, $g10:expr, $g11:expr, $g12:expr, $($rest:tt)+) => {
         compile_error!(
@@ -187,21 +185,8 @@ impl DefaultGenerator for () {
 }
 
 impl_tuple!(Tuple1Generator, tuples1, 1, (0, gen1, G1, T1));
-impl_tuple!(
-    Tuple2Generator,
-    tuples2,
-    2,
-    (0, gen1, G1, T1),
-    (1, gen2, G2, T2)
-);
-impl_tuple!(
-    Tuple3Generator,
-    tuples3,
-    3,
-    (0, gen1, G1, T1),
-    (1, gen2, G2, T2),
-    (2, gen3, G3, T3)
-);
+impl_tuple!(Tuple2Generator, tuples2, 2, (0, gen1, G1, T1), (1, gen2, G2, T2));
+impl_tuple!(Tuple3Generator, tuples3, 3, (0, gen1, G1, T1), (1, gen2, G2, T2), (2, gen3, G3, T3));
 impl_tuple!(
     Tuple4Generator,
     tuples4,

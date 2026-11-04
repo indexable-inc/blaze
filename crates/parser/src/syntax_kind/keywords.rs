@@ -120,7 +120,9 @@ const CONTEXTUAL: &[(&str, SyntaxKind, Option<Edition>)] = &[
     ("requires", REQUIRES_KW, None),
 ];
 
-const fn names<const N: usize, T: Copy, U: Copy>(table: &[(&'static str, T, U)]) -> [&'static str; N] {
+const fn names<const N: usize, T: Copy, U: Copy>(
+    table: &[(&'static str, T, U)],
+) -> [&'static str; N] {
     assert!(table.len() == N);
     let mut names = [""; N];
     let mut i = 0;
@@ -476,17 +478,27 @@ mod tests {
                 idents.push(format!("{}{}", &name[..=i], &name[i..]));
             }
         }
-        idents.extend(["", "_", "a", "x", "self_", "Self_", "macro_rules!", "union_", "unions"].map(String::from));
+        idents.extend(
+            ["", "_", "a", "x", "self_", "Self_", "macro_rules!", "union_", "unions"]
+                .map(String::from),
+        );
         idents.push("a".repeat(100));
         for ident in &idents {
             for edition in EDITIONS {
-                assert_eq!(strict(ident, edition), strict_by_match(ident, edition), "{ident:?} {edition:?}");
+                assert_eq!(
+                    strict(ident, edition),
+                    strict_by_match(ident, edition),
+                    "{ident:?} {edition:?}"
+                );
                 assert_eq!(
                     contextual(ident, edition),
                     contextual_by_match(ident, edition),
                     "{ident:?} {edition:?}"
                 );
-                assert_eq!(SyntaxKind::from_keyword(ident, edition), strict_by_match(ident, edition));
+                assert_eq!(
+                    SyntaxKind::from_keyword(ident, edition),
+                    strict_by_match(ident, edition)
+                );
                 for text in [format!(" {ident} = x;\n"), format!(" {ident}")] {
                     assert_eq!(
                         strict_in(text.as_bytes(), 1, ident.len(), edition),

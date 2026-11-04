@@ -6,8 +6,8 @@ use std::{cell::RefCell, convert::Infallible, ops::ControlFlow};
 use base_db::Db;
 use blaze_mem::Frame;
 use hir_def::{
-    AssocItemId, AttrDefId, FunctionId, GenericParamId, HasModule, ImplId, ItemContainerId,
-    Lookup, TraitId,
+    AssocItemId, AttrDefId, FunctionId, GenericParamId, HasModule, ImplId, ItemContainerId, Lookup,
+    TraitId,
     attrs::AttrFlags,
     expr_store::HygieneId,
     hir::generics::GenericParams,
@@ -319,12 +319,8 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         self_ty: Ty<'db>,
         allow_unstable: bool,
     ) -> PickResult<'db> {
-        let scope_items = self.traits_in_scope.named(
-            self.infcx.interner.db,
-            item_name,
-            item_hygiene,
-            self.frame,
-        );
+        let scope_items =
+            self.traits_in_scope.named(self.infcx.interner.db, item_name, item_hygiene, self.frame);
         let choice = ProbeForNameChoice {
             private_candidate: None,
             item_name,
@@ -451,7 +447,8 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
             && let Some(errors) = self.errors
         {
             self.infcx.probe(|_| {
-                let ty = &steps.steps.last().expect("reached the recursion limit in 0 steps").self_ty;
+                let ty =
+                    &steps.steps.last().expect("reached the recursion limit in 0 steps").self_ty;
                 let ty = self
                     .infcx
                     .instantiate_query_response_and_region_obligations(

@@ -108,7 +108,13 @@ impl<P: Plain> Loc<'_, P> {
         self.rmw(at, "compare_exchange", success, failure, |old| (old == current).then_some(new))
     }
 
-    fn fetch(&self, at: At, what: &'static str, order: Ordering, f: impl FnOnce(u64) -> u64) -> Option<u64> {
+    fn fetch(
+        &self,
+        at: At,
+        what: &'static str,
+        order: Ordering,
+        f: impl FnOnce(u64) -> u64,
+    ) -> Option<u64> {
         self.rmw(at, what, order, Ordering::Relaxed, |old| Some(f(old))).map(unwrap_either)
     }
 
@@ -179,10 +185,15 @@ pub fn fence(order: Ordering) {
     }
     let at = Location::caller();
     let done = if order == Ordering::SeqCst {
-        rt::op(at, "fence", |_| Ok(Op { obj: FENCE, kind: Kind::Rmw }), |rt| {
-            rt.fence(order);
-            Ok(())
-        })
+        rt::op(
+            at,
+            "fence",
+            |_| Ok(Op { obj: FENCE, kind: Kind::Rmw }),
+            |rt| {
+                rt.fence(order);
+                Ok(())
+            },
+        )
     } else {
         rt::with(|rt| {
             rt.note(at, "fence");
@@ -556,7 +567,12 @@ impl AtomicBool {
     }
 
     #[track_caller]
-    pub fn fetch_update<F>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> Result<bool, bool>
+    pub fn fetch_update<F>(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        mut f: F,
+    ) -> Result<bool, bool>
     where
         F: FnMut(bool) -> Option<bool>,
     {

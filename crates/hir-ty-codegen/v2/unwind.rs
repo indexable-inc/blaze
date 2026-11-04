@@ -8,8 +8,7 @@ use cranelift_codegen::{
     gimli::{
         self, RunTimeEndian,
         write::{
-            Address, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry,
-            FrameTable,
+            Address, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry, FrameTable,
         },
     },
     isa::TargetIsa,
@@ -78,7 +77,10 @@ impl Common {
 /// [`Common`] of `isa`'s architecture: Cranelift's CIE reads the architecture and none of the
 /// ISA's flags, so every ISA of one architecture (each target's, each feature set's) has one.
 // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
-#[expect(clippy::disallowed_types, reason = "the CIE of each architecture, made once a process: it reads nothing but the architecture")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the CIE of each architecture, made once a process: it reads nothing but the architecture"
+)]
 fn common(isa: &dyn TargetIsa) -> Result<&'static Common, String> {
     static COMMON: [std::sync::OnceLock<Result<Common, String>>; 2] =
         [std::sync::OnceLock::new(), std::sync::OnceLock::new()];

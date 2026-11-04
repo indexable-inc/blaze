@@ -38,25 +38,42 @@ pub(super) fn read(bytes: &[u8]) -> Result<Found, Error> {
     let count = word(16)?;
     let commands = range(HEADER, u64::from(word(20)?), "the load commands")?;
     if commands.end > bytes.len() as u64 {
-        return Err(bad(&format!("load commands to {:#x}, past the {:#x} bytes read", commands.end, bytes.len())));
+        return Err(bad(&format!(
+            "load commands to {:#x}, past the {:#x} bytes read",
+            commands.end,
+            bytes.len()
+        )));
     }
-    #[allow(clippy::reversed_empty_ranges, reason = "the span starts empty, widened to each segment's start and end")]
-    let mut found =
-        Found { header: 0, span: u64::MAX..0, code: Vec::new(), reserved: Vec::new(), other: Vec::new() };
+    #[allow(
+        clippy::reversed_empty_ranges,
+        reason = "the span starts empty, widened to each segment's start and end"
+    )]
+    let mut found = Found {
+        header: 0,
+        span: u64::MAX..0,
+        code: Vec::new(),
+        reserved: Vec::new(),
+        other: Vec::new(),
+    };
     let mut header = None;
     let mut at = HEADER;
     for _ in 0..count {
         let cmd = u32_at(bytes, at).ok_or_else(|| bad("a short load command"))?;
         let size = u64::from(u32_at(bytes, at + 4).ok_or_else(|| bad("a short load command"))?);
-        if size < 8 || !size.is_multiple_of(8) || at.checked_add(size).is_none_or(|end| end > commands.end) {
+        if size < 8
+            || !size.is_multiple_of(8)
+            || at.checked_add(size).is_none_or(|end| end > commands.end)
+        {
             return Err(bad(&format!("a load command of {size} bytes at {at:#x}")));
         }
         if cmd == LC_SEGMENT_64 {
             if size < SEGMENT {
                 return Err(bad(&format!("an LC_SEGMENT_64 of {size} bytes")));
             }
-            let field = |offset: u64| u64_at(bytes, at + offset).ok_or_else(|| bad("a short segment"));
-            let (vmaddr, vmsize, fileoff, filesize) = (field(24)?, field(32)?, field(40)?, field(48)?);
+            let field =
+                |offset: u64| u64_at(bytes, at + offset).ok_or_else(|| bad("a short segment"));
+            let (vmaddr, vmsize, fileoff, filesize) =
+                (field(24)?, field(32)?, field(40)?, field(48)?);
             let initprot = u32_at(bytes, at + 60).ok_or_else(|| bad("a short segment"))?;
             let memory = range(vmaddr, vmsize, "a segment")?;
             range(fileoff, filesize, "a segment's file bytes")?;
@@ -69,7 +86,9 @@ pub(super) fn read(bytes: &[u8]) -> Result<Found, Error> {
                 }
                 if initprot & VM_PROT_EXECUTE != 0 {
                     if initprot & VM_PROT_WRITE != 0 {
-                        return Err(bad(&format!("the segment at {vmaddr:#x} is writable and executable")));
+                        return Err(bad(&format!(
+                            "the segment at {vmaddr:#x} is writable and executable"
+                        )));
                     }
                     if filesize != vmsize {
                         return Err(bad(&format!(
@@ -80,7 +99,9 @@ pub(super) fn read(bytes: &[u8]) -> Result<Found, Error> {
                     found.code.push(Segment { offset: fileoff, linked: vmaddr, len: filesize });
                 } else if initprot == 0 {
                     if filesize != 0 {
-                        return Err(bad(&format!("the segment of no access at {vmaddr:#x} has file bytes")));
+                        return Err(bad(&format!(
+                            "the segment of no access at {vmaddr:#x} has file bytes"
+                        )));
                     }
                     found.reserved.push(memory);
                 } else {

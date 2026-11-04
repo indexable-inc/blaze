@@ -90,10 +90,7 @@ impl<'a> Shrinker<'a> {
     /// the improvement cap had been spent one step at a time.
     pub(super) async fn replace_int(&mut self, i: usize, candidate: &BigInt) -> ShrinkResult<bool> {
         let accepted = self
-            .replace(&HashMap::from_iter([(
-                i,
-                ChoiceValue::Integer(candidate.clone()),
-            )]))
+            .replace(&HashMap::from_iter([(i, ChoiceValue::Integer(candidate.clone()))]))
             .await?;
         if accepted {
             self.lower_common_node_offset().await?;
@@ -194,17 +191,12 @@ impl<'a> Shrinker<'a> {
     }
 
     async fn binary_search_node_towards_zero(&mut self, i: usize) -> Result<(), PassExit> {
-        let (ic, _) = self.current_nodes[i]
-            .data
-            .as_integer()
-            .ok_or(PassExit::NodeGone)?;
+        let (ic, _) = self.current_nodes[i].data.as_integer().ok_or(PassExit::NodeGone)?;
         let ic = ic.clone();
         let target = ic.clamped_shrink_towards();
 
-        self.try_at_distance(i, &ic, &target, &BigInt::from(0))
-            .await?;
-        self.try_at_distance(i, &ic, &target, &BigInt::from(1))
-            .await?;
+        self.try_at_distance(i, &ic, &target, &BigInt::from(0)).await?;
+        self.try_at_distance(i, &ic, &target, &BigInt::from(1)).await?;
 
         let base = self.distance_from(i, &target).ok_or(PassExit::NodeGone)?;
         let n_bits = base.bits();
@@ -271,8 +263,7 @@ impl<'a> Shrinker<'a> {
                     let ok = if sub > base {
                         false
                     } else {
-                        self.try_at_distance(i, &ic, &target, &(&base - &sub))
-                            .await?
+                        self.try_at_distance(i, &ic, &target, &(&base - &sub)).await?
                     };
                     search.record(ok);
                 }
@@ -361,11 +352,7 @@ impl<'a> Shrinker<'a> {
                     let on_low_side = prev_i < target_i;
                     let mut search = BinSearchDownBig::new(BigInt::from(0), prev_dist.clone());
                     while let Some(d) = search.probe() {
-                        let new_i = if on_low_side {
-                            &target_i - &d
-                        } else {
-                            &target_i + &d
-                        };
+                        let new_i = if on_low_side { &target_i - &d } else { &target_i + &d };
                         let new_j = &prev_j + (&prev_i - &new_i);
                         let ok = self.replace_two(i, &new_i, j, &new_j).await?;
                         search.record(ok);
@@ -494,8 +481,7 @@ impl<'a> Shrinker<'a> {
                         Some((i, ic.clone()))
                     })
                     .collect();
-                self.shrink_stalled_duplicate_subgroups(&value, &members)
-                    .await?;
+                self.shrink_stalled_duplicate_subgroups(&value, &members).await?;
                 continue;
             }
             let simplest = self.current_nodes[valid[0]].data.simplest_value()?;
@@ -566,11 +552,8 @@ impl<'a> Shrinker<'a> {
             valid: &[usize],
             candidate: &BigInt,
         ) -> ShrinkResult<bool> {
-            let current_valid: Vec<usize> = valid
-                .iter()
-                .copied()
-                .filter(|&i| i < sh.current_nodes.len())
-                .collect();
+            let current_valid: Vec<usize> =
+                valid.iter().copied().filter(|&i| i < sh.current_nodes.len()).collect();
             if current_valid.len() < 2 {
                 return Ok(false);
             }
@@ -583,10 +566,8 @@ impl<'a> Shrinker<'a> {
 
         let simplest = ic.simplest();
         if simplest != *value {
-            let replacements: HashMap<usize, ChoiceValue> = valid
-                .iter()
-                .map(|&i| (i, ChoiceValue::Integer(simplest.clone())))
-                .collect();
+            let replacements: HashMap<usize, ChoiceValue> =
+                valid.iter().map(|&i| (i, ChoiceValue::Integer(simplest.clone()))).collect();
             self.replace(&replacements).await?;
         }
 

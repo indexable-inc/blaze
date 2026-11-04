@@ -4,8 +4,8 @@
 
 use base_db::FileId;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_expand::fixture;
+use std::alloc::Global;
 
 use crate::{
     check::{Setup, check},
@@ -250,7 +250,10 @@ pub(super) fn fixed(lint_name: &str, main: &str) -> String {
     names.insert(file, "src/lib.rs".to_owned());
     let name_of = |file: FileId| names.get(&file).cloned();
     let flags: Vec<String> = only(lint_name).split_whitespace().map(str::to_owned).collect();
-    let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf::default() };
+    let setup = Setup {
+        command_line: CommandLine::parse(&flags).expect("the flags read"),
+        conf: Conf::default(),
+    };
     let made = fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
     let after = db.file_text(file).text(&db).to_string();
     assert_ne!(after, before, "the fix of `{lint_name}` changed the file");

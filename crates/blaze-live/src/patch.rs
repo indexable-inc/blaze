@@ -21,8 +21,8 @@
 // The descriptor and the jump table's header are the dev runtime's (`blaze_inproc_rt::live`):
 // every dev executable reads them, to find its execution log, whatever it depends on.
 pub use blaze_inproc_rt::live::{
-    ARCH_AARCH64, ARCH_X86_64, DESCRIPTOR, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, STUBS_SECTION_ELF,
-    STUBS_SECTION_MACHO, exec, slot_stub_bytes, stub_slot,
+    ARCH_AARCH64, ARCH_X86_64, DESCRIPTOR, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor,
+    STUBS_SECTION_ELF, STUBS_SECTION_MACHO, exec, slot_stub_bytes, stub_slot,
 };
 
 /// The content hash of a function's code, as the commit wrote it into the code memory: its

@@ -63,10 +63,8 @@ impl<'db> From<TypeError<DbInterner<'db>>> for UnsizeFailed {
     }
 }
 
-pub(super) type UnsizeResult<'db, 'f> = Result<
-    InferOk<'db, (Vec<Adjustment, &'f blaze_mem::Frame>, Ty<'db>)>,
-    UnsizeFailed,
->;
+pub(super) type UnsizeResult<'db, 'f> =
+    Result<InferOk<'db, (Vec<Adjustment, &'f blaze_mem::Frame>, Ty<'db>)>, UnsizeFailed>;
 
 const SLOTS: usize = 32;
 
@@ -248,7 +246,9 @@ where
             // function items to drop the unsafe qualifier.
             TyKind::FnDef(..) => self.coerce_from_fn_item(a, b),
             // We permit coercion of fn pointers to drop the unsafe qualifier.
-            TyKind::FnPtr(a_sig_tys, a_hdr) => self.coerce_from_fn_pointer(a_sig_tys.with(a_hdr), b),
+            TyKind::FnPtr(a_sig_tys, a_hdr) => {
+                self.coerce_from_fn_pointer(a_sig_tys.with(a_hdr), b)
+            }
             // Non-capturing closures are coercible to function pointers or unsafe function
             // pointers. It cannot convert closures that require unsafe.
             TyKind::Closure(closure_def_id_a, args_a) => {
@@ -402,14 +402,15 @@ where
             return false;
         }
         let trait_ref = TraitRef::new(interner, coerce_unsized.into(), [source, target]);
-        interner.for_each_relevant_impl(trait_ref, |_| std::ops::ControlFlow::Break(())).is_continue()
+        interner
+            .for_each_relevant_impl(trait_ref, |_| std::ops::ControlFlow::Break(()))
+            .is_continue()
     }
 
     /// The memo's key for the pair, if R3's outcome for it is a function of the two types.
     fn unsize_key(&self, source: Ty<'db>, target: Ty<'db>) -> Option<(Ty<'db>, Ty<'db>)> {
-        let memoizable = |ty: Ty<'db>| {
-            !ty.has_non_region_infer() && !ty.references_error() && !ty.has_aliases()
-        };
+        let memoizable =
+            |ty: Ty<'db>| !ty.has_non_region_infer() && !ty.references_error() && !ty.has_aliases();
         if !memoizable(source) || !memoizable(target) {
             return None;
         }

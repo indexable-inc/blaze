@@ -22,7 +22,13 @@ fn a_named_return_type_is_a_pattern_and_a_type() {
     let text = "fn f(x: u32) -> (r: u32) ensures r > x, { x + 1 }";
     let (tree, errors) = parse_lines(text, Edition::CURRENT);
     assert_eq!(errors, Vec::<String>::new(), "{text}: {tree:#?}");
-    assert!(has_run(&tree, &["RET_TYPE", "THIN_ARROW \"->\"", "WHITESPACE \" \"", "L_PAREN \"(\"", "IDENT_PAT"]), "{tree:#?}");
+    assert!(
+        has_run(
+            &tree,
+            &["RET_TYPE", "THIN_ARROW \"->\"", "WHITESPACE \" \"", "L_PAREN \"(\"", "IDENT_PAT"]
+        ),
+        "{tree:#?}"
+    );
     let (tree, errors) = parse_lines("fn f() -> (a::B) {}", Edition::CURRENT);
     assert_eq!(errors, Vec::<String>::new(), "{tree:#?}");
     assert!(has_run(&tree, &["L_PAREN \"(\"", "PATH_TYPE"]), "{tree:#?}");

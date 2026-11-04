@@ -87,7 +87,11 @@ fn a_sparse_region_reads_zero_everywhere_and_counts_only_what_its_owner_commits(
     region.ensure(100).expect("commit");
     assert!(region.committed() >= 100);
     if !cfg!(windows) {
-        assert!(region.committed() < 1 << 20, "a commit of 100 bytes counted {}", region.committed());
+        assert!(
+            region.committed() < 1 << 20,
+            "a commit of 100 bytes counted {}",
+            region.committed()
+        );
     }
     // SAFETY: committed just now; this test owns the region.
     unsafe { region.at(0).as_ptr().write(9) };
@@ -203,7 +207,9 @@ fn a_huge_region_past_one_huge_page_commits_whole_ones_and_keeps_its_bytes() {
 
 #[test]
 fn huge_regions_grow_from_many_threads_at_once() {
-    let region = Arc::new(Region::reserve_pages(256 << 20, Pages::Transparent, Tag::Other).expect("reserve"));
+    let region = Arc::new(
+        Region::reserve_pages(256 << 20, Pages::Transparent, Tag::Other).expect("reserve"),
+    );
     let threads: Vec<_> = (0..8)
         .map(|t| {
             let region = Arc::clone(&region);
@@ -262,7 +268,8 @@ fn anon_huge_kib(addr: usize) -> u64 {
     for line in smaps.lines() {
         let range = line.split_whitespace().next().and_then(|range| range.split_once('-'));
         if let Some((start, end)) = range
-            && let (Ok(start), Ok(end)) = (usize::from_str_radix(start, 16), usize::from_str_radix(end, 16))
+            && let (Ok(start), Ok(end)) =
+                (usize::from_str_radix(start, 16), usize::from_str_radix(end, 16))
         {
             inside = (start..end).contains(&addr);
         } else if inside && let Some(kib) = line.strip_prefix("AnonHugePages:") {
@@ -287,7 +294,8 @@ fn touch_sparsely(base: *mut u8, bytes: usize) {
 /// unadvised range gets huge pages, so the only one that tells an opt-out from none.
 #[cfg(target_os = "linux")]
 fn thp_always() -> bool {
-    std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").is_ok_and(|it| it.contains("[always]"))
+    std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+        .is_ok_and(|it| it.contains("[always]"))
 }
 
 #[cfg(target_os = "linux")]
@@ -298,7 +306,8 @@ fn a_base_page_region_touched_sparsely_has_no_huge_pages_on_linux() {
     touch_sparsely(region.base().as_ptr(), 64 << 20);
     let kib = anon_huge_kib(region.base().as_ptr().addr());
     assert_eq!(
-        kib, 0,
+        kib,
+        0,
         "a base-page region touched once per 2 MiB has {kib} KiB on huge pages (host THP \
          `always`: {}): it is not advised MADV_NOHUGEPAGE",
         thp_always()
@@ -344,14 +353,24 @@ fn unadvised_memory_follows_the_process_opt_out_on_linux() {
     let bytes = 64 << 20;
     // SAFETY: a fresh anonymous mapping, unmapped below.
     let base = unsafe {
-        libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        libc::mmap(
+            std::ptr::null_mut(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
     };
     assert_ne!(base, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
     touch_sparsely(base.cast(), bytes);
     let kib = anon_huge_kib(base.addr());
     // SAFETY: the mapping made above, no longer used.
     unsafe { libc::munmap(base, bytes) };
-    assert_eq!(kib, 0, "an unadvised mapping has {kib} KiB on huge pages under the process policy {thp}");
+    assert_eq!(
+        kib, 0,
+        "an unadvised mapping has {kib} KiB on huge pages under the process policy {thp}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -383,7 +402,10 @@ fn a_reserved_region_takes_pool_pages_or_names_the_pool() {
         Ok(region) => region,
         Err(error) => {
             assert_eq!(total, 0, "a pool of {total} pages is there: {error}");
-            assert!(error.to_string().contains("nr_hugepages"), "the error names the pool: {error}");
+            assert!(
+                error.to_string().contains("nr_hugepages"),
+                "the error names the pool: {error}"
+            );
             return;
         }
     };
@@ -406,7 +428,11 @@ fn a_reserved_region_takes_pool_pages_or_names_the_pool() {
     region.ensure(3 * HUGE_PAGE).expect("take it again");
     assert!(filled(&region, 0, 2 * HUGE_PAGE), "the kept pages kept their bytes");
     // SAFETY: committed again just now.
-    assert_eq!(unsafe { region.at(2 * HUGE_PAGE + 5).as_ptr().read() }, 0, "a page made again is zeroed");
+    assert_eq!(
+        unsafe { region.at(2 * HUGE_PAGE + 5).as_ptr().read() },
+        0,
+        "a page made again is zeroed"
+    );
     // SAFETY: nothing reads the purged range before writing it; pool pages are kept.
     unsafe { region.purge(0, 3 * HUGE_PAGE) };
     assert!(filled(&region, HUGE_PAGE, 2 * HUGE_PAGE), "a purge keeps the pool's pages");
@@ -431,7 +457,11 @@ fn a_reserved_region_takes_pool_pages_or_names_the_pool() {
         thread.join().expect("grower");
     }
     // SAFETY: committed by the growers, who wrote it.
-    assert_eq!(unsafe { region.at(3 * HUGE_PAGE - 1).as_ptr().read() }, 1, "no grower mapped over another's");
+    assert_eq!(
+        unsafe { region.at(3 * HUGE_PAGE - 1).as_ptr().read() },
+        1,
+        "no grower mapped over another's"
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -736,7 +766,11 @@ fn append_vec_readers_see_a_written_prefix_while_one_writer_appends() {
                         let published = column.as_slice();
                         assert!(published.len() >= seen, "the length only grows");
                         for (i, pair) in published.iter().enumerate().skip(seen) {
-                            assert_eq!(*pair, [i as u64, !(i as u64)], "a published value is whole");
+                            assert_eq!(
+                                *pair,
+                                [i as u64, !(i as u64)],
+                                "a published value is whole"
+                            );
                         }
                         seen = published.len();
                     }
@@ -900,10 +934,16 @@ fn frame_collect_is_the_copies_it_replaced() {
         let exact = frame::collect(&frame, values.iter().copied());
         let reference = kept(&frame, values.iter().copied());
         assert_eq!(exact.as_slice(), values.as_slice());
-        assert_eq!((exact.as_slice(), exact.capacity()), (reference.as_slice(), reference.capacity()));
+        assert_eq!(
+            (exact.as_slice(), exact.capacity()),
+            (reference.as_slice(), reference.capacity())
+        );
         let filtered = frame::collect(&frame, values.iter().copied().filter(|it| it % 3 == 0));
         let reference = kept(&frame, values.iter().copied().filter(|it| it % 3 == 0));
-        assert_eq!((filtered.as_slice(), filtered.capacity()), (reference.as_slice(), reference.capacity()));
+        assert_eq!(
+            (filtered.as_slice(), filtered.capacity()),
+            (reference.as_slice(), reference.capacity())
+        );
     }
     let warm = Frame::new(Tag::Infer).expect("reserve");
     drop(frame::collect(&warm, 0..16u32));
@@ -943,7 +983,11 @@ fn two_frame_vecs_growing_interleaved_in_one_task_report_copies_and_one_alone_no
         }
         assert_eq!(a.len(), 10_000);
     });
-    assert_eq!(alone, tag::Copied::default(), "a vector growing alone is the frame's last block and grows in place");
+    assert_eq!(
+        alone,
+        tag::Copied::default(),
+        "a vector growing alone is the frame's last block and grows in place"
+    );
 
     let line_before = tag::snapshot().get(Tag::Infer);
     let mut last_capacity = 0;
@@ -957,11 +1001,17 @@ fn two_frame_vecs_growing_interleaved_in_one_task_report_copies_and_one_alone_no
         assert!(a.iter().zip(&b).enumerate().all(|(i, (&a, &b))| a == i as u64 && b == i as u64));
         last_capacity = a.capacity().min(b.capacity());
     });
-    assert!(interleaved.copies >= 2, "each vector moved when it grew under the other: {interleaved:?}");
+    assert!(
+        interleaved.copies >= 2,
+        "each vector moved when it grew under the other: {interleaved:?}"
+    );
     // The last move of the vector below copied at least half its final capacity.
     assert!(interleaved.bytes >= (last_capacity / 2 * size_of::<u64>()) as u64, "{interleaved:?}");
     let line_after = tag::snapshot().get(Tag::Infer);
-    assert!(line_after.grow_copies - line_before.grow_copies >= interleaved.copies, "the tag's line counts them too");
+    assert!(
+        line_after.grow_copies - line_before.grow_copies >= interleaved.copies,
+        "the tag's line counts them too"
+    );
     assert!(line_after.grow_copied - line_before.grow_copied >= interleaved.bytes);
 
     let mut frame = Frame::new(Tag::Infer).expect("reserve");
@@ -978,7 +1028,11 @@ fn two_frame_vecs_growing_interleaved_in_one_task_report_copies_and_one_alone_no
     let before = tag::copied_on_thread();
     frame.reset();
     assert_eq!(frame.copied(), tag::Copied::default(), "a reset starts the count again");
-    assert_eq!(tag::copied_on_thread().copies - before.copies, copied.copies, "a reset reports the frame's copies");
+    assert_eq!(
+        tag::copied_on_thread().copies - before.copies,
+        copied.copies,
+        "a reset reports the frame's copies"
+    );
 }
 
 #[test]
@@ -1126,7 +1180,8 @@ fn frame_task_allocates_nothing_once_warm() {
 fn nest(depth: usize) {
     frame::task(Tag::Infer, |_| {
         let pattern = |i: usize| (depth ^ i) as u8;
-        let kept = frame::current(|frame| std::ptr::from_mut(frame.alloc_slice_fill_with(1024, pattern)));
+        let kept =
+            frame::current(|frame| std::ptr::from_mut(frame.alloc_slice_fill_with(1024, pattern)));
         if depth > 1 {
             nest(depth - 1);
         }
@@ -1170,7 +1225,10 @@ fn frame_inner_task_starts_in_the_rest_of_the_outer_chunk() {
             assert_eq!(inner.committed(), 0, "a small inner task takes no block of its own");
             assert!(inner.contains(std::ptr::from_ref(value).cast()));
             let pushed = outer.alloc(3u64);
-            assert!(outer.committed() > held, "the outer frame takes another block, not the lent bytes");
+            assert!(
+                outer.committed() > held,
+                "the outer frame takes another block, not the lent bytes"
+            );
             assert_eq!((*value, *pushed), (2, 3));
         });
     });
@@ -1186,8 +1244,13 @@ fn frame_outer_task_grows_while_an_inner_task_allocates() {
             for i in 16..100_000 {
                 types.push(i);
             }
-            let more = frame::current(|frame| std::ptr::from_mut(frame.alloc_slice_fill_with(4096, |i| !(i as u32))));
-            assert!(mine.iter().enumerate().all(|(i, &v)| v == i as u32), "the outer frame's growth leaves the inner task's bytes alone");
+            let more = frame::current(|frame| {
+                std::ptr::from_mut(frame.alloc_slice_fill_with(4096, |i| !(i as u32)))
+            });
+            assert!(
+                mine.iter().enumerate().all(|(i, &v)| v == i as u32),
+                "the outer frame's growth leaves the inner task's bytes alone"
+            );
             // SAFETY: in the inner task's frame, alive until it ends; nothing else refers to it.
             let more = unsafe { &*more };
             assert!(more.iter().enumerate().all(|(i, &v)| v == !(i as u32)));
@@ -1423,13 +1486,19 @@ fn frame_measure_counts_inner_tasks_on_top_of_outer_and_allocates_nothing() {
                         inner.alloc_slice_copy(&[0u8; 50_000]);
                     })
                 });
-                assert!((50_000..54_096).contains(&inner), "an inner measure counts its task: {inner}");
+                assert!(
+                    (50_000..54_096).contains(&inner),
+                    "an inner measure counts its task: {inner}"
+                );
             })
         })
     };
     run();
     let ((), bytes) = blaze_alloc_count::assert_at_most(0, "a warm measure of nested tasks", run);
-    assert!((60_000..68_192).contains(&bytes), "the inner task's bytes on top of the outer's: {bytes}");
+    assert!(
+        (60_000..68_192).contains(&bytes),
+        "the inner task's bytes on top of the outer's: {bytes}"
+    );
     let ((), none) = frame::measure(|| ());
     assert_eq!(none, 0);
 }
@@ -1524,12 +1593,19 @@ fn frame_task_past_the_thread_shelf_reserves_from_the_cap() {
         frame::set_cap(None);
         left
     });
-    assert_eq!(capped.join().expect("the capped task"), 0, "a span on the shelf holds none of the cap");
+    assert_eq!(
+        capped.join().expect("the capped task"),
+        0,
+        "a span on the shelf holds none of the cap"
+    );
 }
 
 #[test]
 fn chunks_refuse_a_numa_node_past_the_last() {
-    assert!(matches!(chunks::set_thread_node(Some(chunks::MAX_NODES)), Err(MemError::TooLarge { .. })));
+    assert!(matches!(
+        chunks::set_thread_node(Some(chunks::MAX_NODES)),
+        Err(MemError::TooLarge { .. })
+    ));
     assert_eq!(chunks::thread_node(), None);
     chunks::set_thread_node(Some(3)).expect("a node in range");
     assert_eq!(chunks::thread_node(), Some(3));
@@ -2594,7 +2670,8 @@ fn scratch_allocates_nothing_once_warm() {
 // Text
 
 /// What `value` feeds a hasher, to check a text type hashes as its borrowed form does.
-fn hashed(value: &(impl std::hash::Hash + ?Sized)) -> Vec<u8> { // alloc: a test's record of hashed bytes
+fn hashed(value: &(impl std::hash::Hash + ?Sized)) -> Vec<u8> {
+    // alloc: a test's record of hashed bytes
     struct Bytes(Vec<u8>); // alloc: a test's record of hashed bytes
     impl std::hash::Hasher for Bytes {
         fn finish(&self) -> u64 {
@@ -2615,7 +2692,11 @@ fn a_frame_string_stays_utf8_across_pushes_pops_and_truncation() {
         let mut text = text::String::new_in(frame);
         for ch in ['a', 'é', '日', '🦀'] {
             text.push(ch);
-            assert!(std::str::from_utf8(text.as_bytes()).is_ok(), "after pushing {ch:?}: {:?}", text.as_bytes());
+            assert!(
+                std::str::from_utf8(text.as_bytes()).is_ok(),
+                "after pushing {ch:?}: {:?}",
+                text.as_bytes()
+            );
         }
         text.push_str("本");
         assert_eq!(text, "aé日🦀本");
@@ -2623,7 +2704,10 @@ fn a_frame_string_stays_utf8_across_pushes_pops_and_truncation() {
         assert_eq!(text.pop(), Some('本'));
         assert_eq!(text.pop(), Some('🦀'));
         assert_eq!(text, "aé日");
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| text.truncate(2))).is_err(), "byte 2 is inside 'é'");
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| text.truncate(2))).is_err(),
+            "byte 2 is inside 'é'"
+        );
         assert_eq!(text, "aé日", "a refused truncate leaves the text whole");
         text.truncate(3);
         assert_eq!(text, "aé");
@@ -2649,8 +2733,16 @@ fn a_frame_string_is_a_map_key_found_by_str() {
         assert_eq!(units.get("syn"), Some(&1), "looked up by &str through Borrow<str>");
         assert_eq!(units.get("proc-macro2"), None);
         let key = frame::string(frame, "serde");
-        assert_eq!(hashed(&key), hashed("serde"), "it hashes as str does, so a hash map finds it by &str too");
-        assert_eq!(key, *units.keys().nth(1).expect("three keys"), "ordered as str is: quote, serde, syn");
+        assert_eq!(
+            hashed(&key),
+            hashed("serde"),
+            "it hashes as str does, so a hash map finds it by &str too"
+        );
+        assert_eq!(
+            key,
+            *units.keys().nth(1).expect("three keys"),
+            "ordered as str is: quote, serde, syn"
+        );
     });
 }
 
@@ -2661,7 +2753,10 @@ fn format_in_writes_into_the_allocator_it_is_given_and_allocates_nothing_global_
             let before = frame.used();
             let unit = crate::format_in!(frame, "{}-{:03}", "unit", 7);
             assert_eq!(unit, "unit-007");
-            assert!(frame.contains(unit.as_ptr()) && frame.used() > before, "the text is the frame's");
+            assert!(
+                frame.contains(unit.as_ptr()) && frame.used() > before,
+                "the text is the frame's"
+            );
             let plain = crate::format_in!(frame, "no arguments");
             assert_eq!(plain, "no arguments");
             let name = "syn";
@@ -2672,7 +2767,10 @@ fn format_in_writes_into_the_allocator_it_is_given_and_allocates_nothing_global_
     work();
     let (len, used) = measure(work);
     assert_eq!(len, 8);
-    assert_eq!(used.allocations, 0, "format_in! into a warm task's frame calls no global allocator");
+    assert_eq!(
+        used.allocations, 0,
+        "format_in! into a warm task's frame calls no global allocator"
+    );
 }
 
 #[cfg(unix)]
@@ -2684,7 +2782,15 @@ fn a_frame_path_joins_and_pops_as_std_does() {
         let lib = src.join("lib.rs");
         assert_eq!(lib, Path::new("/work/src/lib.rs"));
         assert!(frame.contains(lib.as_os_str().as_encoded_bytes().as_ptr()));
-        for (base, more) in [("a", "b"), ("a/", "b"), ("", "b"), ("a", "/b"), ("/", "b"), ("a", ""), ("a/b", "../c")] {
+        for (base, more) in [
+            ("a", "b"),
+            ("a/", "b"),
+            ("", "b"),
+            ("a", "/b"),
+            ("/", "b"),
+            ("a", ""),
+            ("a/b", "../c"),
+        ] {
             let mut ours = frame::path(frame, base);
             ours.push(more);
             let reference = Path::new(base).join(more); // alloc: std's join, to compare with

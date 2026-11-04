@@ -76,7 +76,8 @@ impl Stream {
         let value = match timeout {
             Some(timeout) => libc::timeval {
                 tv_sec: timeout.as_secs().min(i32::MAX as u64) as libc::time_t,
-                tv_usec: timeout.subsec_micros().max(u32::from(timeout.is_zero())) as libc::suseconds_t,
+                tv_usec: timeout.subsec_micros().max(u32::from(timeout.is_zero()))
+                    as libc::suseconds_t,
             },
             None => libc::timeval { tv_sec: 0, tv_usec: 0 },
         };
@@ -128,7 +129,9 @@ impl Stream {
             }
             self.take_rights(&message)?;
             if message.msg_flags & libc::MSG_CTRUNC != 0 {
-                return Err(Error::new(format!("more than {MOST_FDS} descriptors came in one message")));
+                return Err(Error::new(format!(
+                    "more than {MOST_FDS} descriptors came in one message"
+                )));
             }
             return Ok(read as usize);
         }
@@ -187,7 +190,8 @@ impl Stream {
         let mut control = [0u64; 2 + MOST_FDS];
         let mut fds = fds;
         while !bytes.is_empty() {
-            let mut iov = libc::iovec { iov_base: bytes.as_ptr().cast_mut().cast(), iov_len: bytes.len() };
+            let mut iov =
+                libc::iovec { iov_base: bytes.as_ptr().cast_mut().cast(), iov_len: bytes.len() };
             // SAFETY: a zeroed `msghdr` is a valid empty one; its fields are set below.
             let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
             message.msg_iov = &raw mut iov;
@@ -213,7 +217,13 @@ impl Stream {
                 // SAFETY: `header` is the first header; its data is `data_len` bytes inside `space`.
                 let data = unsafe { libc::CMSG_DATA(header) };
                 // SAFETY: the header data is `data_len` bytes inside the writable buffer.
-                unsafe { std::ptr::copy_nonoverlapping(fds.as_ptr().cast::<u8>(), data, data_len as usize) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        fds.as_ptr().cast::<u8>(),
+                        data,
+                        data_len as usize,
+                    )
+                };
             }
             #[cfg(target_os = "linux")]
             let flags = libc::MSG_NOSIGNAL;
@@ -253,7 +263,8 @@ impl Stream {
             if sent == 1 {
                 return Ok(());
             }
-            if sent < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            if sent < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
                 continue;
             }
             return Err(os("ringing the daemon"));
@@ -364,14 +375,18 @@ impl Listener {
             .to_str()
             .ok_or_else(|| Error::new(format!("{} is not UTF-8", path.display())))?
             .to_owned();
-        let listener = UnixListener::bind(&path).map_err(|it| Error::new(format!("{address}: {it}")))?;
+        let listener =
+            UnixListener::bind(&path).map_err(|it| Error::new(format!("{address}: {it}")))?;
         Ok((Listener { listener, path }, address))
     }
 
     /// The next connection, from a process of this user, and its process ID.
     pub fn accept(&self) -> Result<(Stream, u32), Error> {
         loop {
-            let (stream, _) = self.listener.accept().map_err(|it| Error::new(format!("accepting a run process: {it}")))?;
+            let (stream, _) = self
+                .listener
+                .accept()
+                .map_err(|it| Error::new(format!("accepting a run process: {it}")))?;
             let fd = OwnedFd::from(stream);
             match peer(&fd) {
                 Ok(pid) => return Ok((Stream::new(fd)?, pid)),
@@ -392,13 +407,22 @@ fn peer(fd: &OwnedFd) -> Result<u32, Error> {
         let mut len = size_of::<libc::ucred>() as libc::socklen_t;
         // SAFETY: `fd` is a connected socket; `cred` and `len` are live and writable.
         let got = unsafe {
-            libc::getsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &raw mut len)
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &raw mut len,
+            )
         };
         if got != 0 {
             return Err(os("reading a run process's credentials"));
         }
         if cred.uid != me {
-            return Err(Error::new(format!("a connection from process {} of user {}, refused", cred.pid, cred.uid)));
+            return Err(Error::new(format!(
+                "a connection from process {} of user {}, refused",
+                cred.pid, cred.uid
+            )));
         }
         Ok(cred.pid as u32)
     }
@@ -417,7 +441,15 @@ fn peer(fd: &OwnedFd) -> Result<u32, Error> {
         let mut pid: libc::pid_t = 0;
         let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
         // SAFETY: as above; `pid` and `len` are live and writable.
-        let got = unsafe { libc::getsockopt(fd.as_raw_fd(), SOL_LOCAL, LOCAL_PEERPID, (&raw mut pid).cast(), &raw mut len) };
+        let got = unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                SOL_LOCAL,
+                LOCAL_PEERPID,
+                (&raw mut pid).cast(),
+                &raw mut len,
+            )
+        };
         if got != 0 {
             return Err(os("reading a run process's process"));
         }
@@ -426,7 +458,8 @@ fn peer(fd: &OwnedFd) -> Result<u32, Error> {
 }
 
 pub fn connect(address: &str) -> Result<Stream, Error> {
-    let stream = UnixStream::connect(address).map_err(|it| Error::new(format!("connecting to the daemon at {address}: {it}")))?;
+    let stream = UnixStream::connect(address)
+        .map_err(|it| Error::new(format!("connecting to the daemon at {address}: {it}")))?;
     Stream::new(OwnedFd::from(stream))
 }
 

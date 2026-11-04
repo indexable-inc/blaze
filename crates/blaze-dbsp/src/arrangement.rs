@@ -75,7 +75,8 @@ impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash> Arrangement<K, S,
             Some(offset) => {
                 let entry = &mut rows.entries[start + offset];
                 let before = entry.weight;
-                entry.weight = before.checked_add(w).expect("an arrangement weight overflows `i32`");
+                entry.weight =
+                    before.checked_add(w).expect("an arrangement weight overflows `i32`");
                 let after = entry.weight;
                 if after == 0 {
                     rows.entries.remove(start + offset);

@@ -4,7 +4,6 @@ use std::ops::ControlFlow;
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir_def::{GenericDefId, HasModule, ImplId, TraitId, TypeAliasId};
 use rustc_abi::{Float, HasDataLayout, Integer, IntegerType, Primitive, ReprOptions};
 use rustc_type_ir::{
@@ -17,6 +16,7 @@ use rustc_type_ir::{
     solve::SizedTraitKind,
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 use stdx::impl_from;
 
 use crate::{
@@ -415,8 +415,7 @@ pub(crate) fn adt_sizedness_constraint<'db>(
     if !matches!(adt_id, hir_def::AdtId::StructId(_)) {
         return None;
     }
-    if crate::representability::representability(interner.db, adt_id)
-        == Representability::Infinite
+    if crate::representability::representability(interner.db, adt_id) == Representability::Infinite
     {
         return None;
     }
@@ -474,10 +473,7 @@ pub(crate) struct ItemBounds {
 
 impl ItemBounds {
     #[inline]
-    pub(crate) fn of_solver_def<'db>(
-        db: &'db Db,
-        def_id: SolverDefId<'db>,
-    ) -> &'db ItemBounds {
+    pub(crate) fn of_solver_def<'db>(db: &'db Db, def_id: SolverDefId<'db>) -> &'db ItemBounds {
         let def_id = match def_id {
             SolverDefId::TypeAliasId(def_id) => def_id.into(),
             SolverDefId::InternedOpaqueTyId(def_id) => def_id.into(),
@@ -578,10 +574,7 @@ impl ItemBounds {
 }
 
 #[blaze_query::tracked]
-pub(crate) fn impl_super_outlives(
-    db: &Db,
-    impl_: ImplId,
-) -> StoredEarlyBinder<StoredClauses> {
+pub(crate) fn impl_super_outlives(db: &Db, impl_: ImplId) -> StoredEarlyBinder<StoredClauses> {
     let interner = DbInterner::new_with(db, impl_.krate(db));
     let trait_ref = db.impl_trait(impl_).expect("invalid impl passed to trait solver");
     let result = trait_ref.map_bound(|trait_ref| {

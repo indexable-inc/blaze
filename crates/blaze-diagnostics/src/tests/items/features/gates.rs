@@ -188,7 +188,14 @@ fn main() {
 "#;
     assert_reports(
         &ui("feature-gate-associated_const_equality.rs", "2015", source),
-        &[error(10, &["E0658", "associated const equality is incomplete", "`#![feature(gca_min_const_items)]`"])],
+        &[error(
+            10,
+            &[
+                "E0658",
+                "associated const equality is incomplete",
+                "`#![feature(gca_min_const_items)]`",
+            ],
+        )],
     );
 }
 

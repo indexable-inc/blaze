@@ -7,7 +7,10 @@ pub(crate) fn id(n: u32) -> FnId {
 }
 
 pub(crate) fn bound(n: u32, version: u32) -> Bound {
-    Bound(ContentId::of("blaze v2 testsel test bound 1", &[n.to_le_bytes(), version.to_le_bytes()].concat()))
+    Bound(ContentId::of(
+        "blaze v2 testsel test bound 1",
+        &[n.to_le_bytes(), version.to_le_bytes()].concat(),
+    ))
 }
 
 fn version(n: u32, v: u32) -> Version {
@@ -29,12 +32,24 @@ fn the_lookup_finds_what_a_map_finds() {
 #[test]
 fn a_table_that_is_not_one_is_refused() {
     let fns = vec![version(0, 0), version(1, 0)];
-    assert_eq!(Image::new(fns.clone(), vec![2], ContentId::default()).err(), Some(TableError::NoFunction { slot: 0, function: 2 }));
-    assert_eq!(Image::new(fns.clone(), vec![1, 1], ContentId::default()).err(), Some(TableError::TwoSlots { function: 1 }));
-    assert_eq!(Image::new(vec![version(0, 0), version(0, 1)], vec![], ContentId::default()).err(), Some(TableError::Twice(id(0))));
+    assert_eq!(
+        Image::new(fns.clone(), vec![2], ContentId::default()).err(),
+        Some(TableError::NoFunction { slot: 0, function: 2 })
+    );
+    assert_eq!(
+        Image::new(fns.clone(), vec![1, 1], ContentId::default()).err(),
+        Some(TableError::TwoSlots { function: 1 })
+    );
+    assert_eq!(
+        Image::new(vec![version(0, 0), version(0, 1)], vec![], ContentId::default()).err(),
+        Some(TableError::Twice(id(0)))
+    );
     let image = Image::new(fns, vec![1], ContentId::default()).unwrap();
     assert_eq!(image.reached(&[5]).err(), Some(TableError::NotInTable(5)));
-    assert_eq!(image.executed(2, &[0]).err(), Some(TableError::OtherBinary { record: 2, table: 1 }));
+    assert_eq!(
+        image.executed(2, &[0]).err(),
+        Some(TableError::OtherBinary { record: 2, table: 1 })
+    );
 }
 
 #[test]
@@ -46,7 +61,11 @@ fn an_emptied_slot_is_counted_and_a_hit_on_it_refused() {
     assert_eq!(image.executed(3, &[2, 0]).unwrap().fns, image.executed(3, &[0, 2]).unwrap().fns);
     assert_eq!(image.executed(3, &[0, 2]).unwrap().fns.len(), 2);
     let whole = Image::new(fns.clone(), vec![0, 2, 1], ContentId::default()).unwrap();
-    assert_ne!(image.unlogged(), whole.unlogged(), "function 2 is in no slot once its slot is emptied");
+    assert_ne!(
+        image.unlogged(),
+        whole.unlogged(),
+        "function 2 is in no slot once its slot is emptied"
+    );
 }
 
 #[test]
@@ -56,14 +75,22 @@ fn the_unlogged_hash_is_of_what_has_no_slot_in_any_order() {
     let b = Image::new(vec![version(2, 0), version(0, 0), version(1, 0)], vec![1], beside).unwrap();
     assert_eq!(a.unlogged(), b.unlogged());
     // A logged function's edit leaves it; an unlogged one's, or the code beside, does not.
-    let logged = Image::new(vec![version(0, 1), version(1, 0), version(2, 0)], vec![0], beside).unwrap();
+    let logged =
+        Image::new(vec![version(0, 1), version(1, 0), version(2, 0)], vec![0], beside).unwrap();
     assert_eq!(a.unlogged(), logged.unlogged());
-    let unlogged = Image::new(vec![version(0, 0), version(1, 1), version(2, 0)], vec![0], beside).unwrap();
+    let unlogged =
+        Image::new(vec![version(0, 0), version(1, 1), version(2, 0)], vec![0], beside).unwrap();
     assert_ne!(a.unlogged(), unlogged.unlogged());
-    let other = Image::new(vec![version(0, 0), version(1, 0), version(2, 0)], vec![0], ContentId::default()).unwrap();
+    let other = Image::new(
+        vec![version(0, 0), version(1, 0), version(2, 0)],
+        vec![0],
+        ContentId::default(),
+    )
+    .unwrap();
     assert_ne!(a.unlogged(), other.unlogged());
     // Moving a function behind a slot changes what is unlogged.
-    let moved = Image::new(vec![version(0, 0), version(1, 0), version(2, 0)], vec![0, 1], beside).unwrap();
+    let moved =
+        Image::new(vec![version(0, 0), version(1, 0), version(2, 0)], vec![0, 1], beside).unwrap();
     assert_ne!(a.unlogged(), moved.unlogged());
 }
 
@@ -101,8 +128,12 @@ fn sets_are_sorted_round_trip_and_name_what_changed() {
 
 /// The unlogged hash as it was first written: 64-byte compares, a call per identity and bound.
 fn unlogged_reference(fns: &[Version], slot_fn: &[u32], beside: ContentId) -> ContentId {
-    let mut outside: Vec<&Version> =
-        fns.iter().enumerate().filter(|(at, _)| !slot_fn.contains(&(*at as u32))).map(|it| it.1).collect();
+    let mut outside: Vec<&Version> = fns
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| !slot_fn.contains(&(*at as u32)))
+        .map(|it| it.1)
+        .collect();
     outside.sort_unstable();
     let mut hasher = Hasher::new(UNLOGGED_DOMAIN);
     hasher.id(&beside).update(&(outside.len() as u64).to_le_bytes());
@@ -168,7 +199,8 @@ fn sets_of_ranks_are_sets_of_versions() {
 
 #[test]
 fn a_record_keys_by_what_it_executed_only_when_whole() {
-    let image = Image::new(vec![version(0, 0), version(1, 0)], vec![0, 1], ContentId::default()).unwrap();
+    let image =
+        Image::new(vec![version(0, 0), version(1, 0)], vec![0, 1], ContentId::default()).unwrap();
     let whole = Record::Complete { slots: 2, hits: vec![1] };
     assert_eq!(image.of_record(&whole), Some(Ok(Set::of(image.unlogged(), vec![version(1, 0)]))));
     assert_eq!(image.of_record(&Record::incomplete("killed")), None);

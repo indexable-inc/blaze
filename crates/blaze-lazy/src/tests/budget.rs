@@ -50,7 +50,10 @@ impl Answers for Kept {
 
 impl Kept {
     fn new() -> Kept {
-        Kept(Arc::new(Last { answer: Mutex::new((0, Kind(0), [0; READY_LEN], 0)), arrived: Condvar::new() }))
+        Kept(Arc::new(Last {
+            answer: Mutex::new((0, Kind(0), [0; READY_LEN], 0)),
+            arrived: Condvar::new(),
+        }))
     }
 
     /// The answer to frame `seq`, once it comes: its kind and bytes.
@@ -58,7 +61,8 @@ impl Kept {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut answer = self.0.answer.lock();
         while answer.0 != seq {
-            let left = deadline.checked_duration_since(Instant::now()).expect("an answer within a minute");
+            let left =
+                deadline.checked_duration_since(Instant::now()).expect("an answer within a minute");
             self.0.arrived.wait_for(&mut answer, left);
         }
         (answer.1, answer.2, answer.3)
@@ -91,10 +95,15 @@ fn an_ask_of_a_published_function_allocates_nothing() {
     runner.frame(0, ASK_KIND, 1, &wire::ask(1, 0)).unwrap();
     assert_eq!(kept.wait(1).0, READY_KIND);
     let asked = wire::ask(2, 0);
-    assert_at_most(0, "an ask of a published function", || runner.frame(0, ASK_KIND, 2, &asked).unwrap());
+    assert_at_most(0, "an ask of a published function", || {
+        runner.frame(0, ASK_KIND, 2, &asked).unwrap()
+    });
     let (kind, bytes, len) = kept.wait(2);
     assert_eq!((kind, len), (READY_KIND, READY_LEN));
-    assert_eq!(Frame::decode(&bytes).unwrap(), Frame::Ready { request: 2, lazy: 0, target: target_of(0) });
+    assert_eq!(
+        Frame::decode(&bytes).unwrap(),
+        Frame::Ready { request: 2, lazy: 0, target: target_of(0) }
+    );
     runner.close();
 }
 
@@ -104,10 +113,15 @@ fn a_first_ask_of_a_warm_runner_allocates_nothing() {
     runner.frame(0, ASK_KIND, 1, &wire::ask(1, 0)).unwrap();
     kept.wait(1);
     let asked = wire::ask(2, 1);
-    assert_at_most(0, "a first ask, the runner warm", || runner.frame(0, ASK_KIND, 2, &asked).unwrap());
+    assert_at_most(0, "a first ask, the runner warm", || {
+        runner.frame(0, ASK_KIND, 2, &asked).unwrap()
+    });
     let (kind, bytes, _) = kept.wait(2);
     assert_eq!(kind, READY_KIND);
-    assert_eq!(Frame::decode(&bytes).unwrap(), Frame::Ready { request: 2, lazy: 1, target: target_of(1) });
+    assert_eq!(
+        Frame::decode(&bytes).unwrap(),
+        Frame::Ready { request: 2, lazy: 1, target: target_of(1) }
+    );
     runner.close();
 }
 
@@ -158,10 +172,15 @@ fn a_lone_hit_of_a_warm_runner_allocates_nothing() {
     assert_eq!(kept.wait(1).0, READY_KIND);
     let asked = wire::ask(2, 1);
     super::hit::pause();
-    assert_at_most(0, "a lone hit, answered by the reading thread", || runner.frame(0, ASK_KIND, 2, &asked).unwrap());
+    assert_at_most(0, "a lone hit, answered by the reading thread", || {
+        runner.frame(0, ASK_KIND, 2, &asked).unwrap()
+    });
     let (kind, bytes, _) = kept.wait(2);
     assert_eq!(kind, READY_KIND);
-    assert_eq!(Frame::decode(&bytes).unwrap(), Frame::Ready { request: 2, lazy: 1, target: target_of(1) });
+    assert_eq!(
+        Frame::decode(&bytes).unwrap(),
+        Frame::Ready { request: 2, lazy: 1, target: target_of(1) }
+    );
     assert_eq!(runner.close().compiles, 2);
 }
 
@@ -183,7 +202,14 @@ fn the_fetchers_answer_of_a_published_function_allocates_nothing() {
         fetcher.target(LazyId(2))
     });
     fetcher.ask(Waiter { seq: 100, ..to }, 2, &mut out);
-    assert_eq!(out, [Action::Answer { to: Waiter { seq: 100, ..to }, lazy: 2, outcome: Outcome::Ready(0x1000) }]);
+    assert_eq!(
+        out,
+        [Action::Answer {
+            to: Waiter { seq: 100, ..to },
+            lazy: 2,
+            outcome: Outcome::Ready(0x1000)
+        }]
+    );
 }
 
 /// Asks of functions not compiled yet, four clients each, then their answers: once the slab,
@@ -201,7 +227,10 @@ fn a_warm_round_of_asks_and_answers_allocates_nothing() {
         while let Some((id, _)) = fetcher.next() {
             fetcher.done(id, Ok(0x1000 + u64::from(id.0)), out);
         }
-        let answered = out.iter().filter(|it| matches!(it, Action::Answer { outcome: Outcome::Ready(_), .. })).count();
+        let answered = out
+            .iter()
+            .filter(|it| matches!(it, Action::Answer { outcome: Outcome::Ready(_), .. }))
+            .count();
         out.clear();
         answered
     };
@@ -220,8 +249,14 @@ fn frames_encode_and_decode_in_place() {
     Frame::Failed { request: 7, lazy: 3, why: "no" }.encode(&mut failed);
     assert_at_most(0, "the frames", || {
         assert_eq!(Frame::decode(&ask).unwrap(), Frame::Ask { request: 7, lazy: 3 });
-        assert_eq!(Frame::decode(&ready).unwrap(), Frame::Ready { request: 7, lazy: 3, target: 0x4000 });
-        assert_eq!(Frame::decode(&failed).unwrap(), Frame::Failed { request: 7, lazy: 3, why: "no" });
+        assert_eq!(
+            Frame::decode(&ready).unwrap(),
+            Frame::Ready { request: 7, lazy: 3, target: 0x4000 }
+        );
+        assert_eq!(
+            Frame::decode(&failed).unwrap(),
+            Frame::Failed { request: 7, lazy: 3, why: "no" }
+        );
         (wire::ask(8, 4), wire::ready(8, 4, 1))
     });
 }
@@ -230,10 +265,12 @@ fn frames_encode_and_decode_in_place() {
 fn the_plans_lookups_allocate_nothing() {
     let functions: Vec<Function> = (0..64).map(function).collect();
     let plan = Plan::new(&functions, &[], &[]).unwrap();
-    let reached: Vec<CodeHash> = (0..64).step_by(3).map(|n| CodeHash(id("blaze-lazy test code", n))).collect();
+    let reached: Vec<CodeHash> =
+        (0..64).step_by(3).map(|n| CodeHash(id("blaze-lazy test code", n))).collect();
     let keys: Vec<InstanceKey> = (0..64).map(key).collect();
     let calls = compiled(0, &[1, 2, 3], &[4]);
-    let (mut ids, mut callees, mut seen) = (Vec::with_capacity(64), Vec::with_capacity(8), plan.scratch());
+    let (mut ids, mut callees, mut seen) =
+        (Vec::with_capacity(64), Vec::with_capacity(8), plan.scratch());
     let ((), used) = measure(|| {
         for (n, key) in keys.iter().enumerate() {
             assert_eq!(plan.id(key), Some(LazyId(n as u32)));

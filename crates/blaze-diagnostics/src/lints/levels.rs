@@ -98,21 +98,36 @@ impl CommandLine {
                     let kind = kind.split_once('=').map_or(kind, |(kind, _)| kind);
                     if !EMIT_KINDS.contains(&kind) {
                         // alloc: an error's text
-                        let expected: Vec<String> = EMIT_KINDS.iter().map(|it| format!("`{it}`")).collect();
+                        let expected: Vec<String> =
+                            EMIT_KINDS.iter().map(|it| format!("`{it}`")).collect();
                         // alloc: as above
-                        return Err(format!("unknown emission type: `{kind}` - expected one of: {}", expected.join(", ")));
+                        return Err(format!(
+                            "unknown emission type: `{kind}` - expected one of: {}",
+                            expected.join(", ")
+                        ));
                     }
                     emit.push(kind);
                 }
             }
         }
-        flags.codegen = emit.is_empty() || emit.iter().any(|&it| it != "metadata" && it != "dep-info");
+        flags.codegen =
+            emit.is_empty() || emit.iter().any(|&it| it != "metadata" && it != "dep-info");
         Ok(flags)
     }
 }
 
 /// rustc's `--emit` kinds, in its order (`OutputType`'s shorthands).
-const EMIT_KINDS: [&str; 9] = ["asm", "llvm-bc", "dep-info", "link", "llvm-ir", "metadata", "mir", "obj", "thin-link-bitcode"];
+const EMIT_KINDS: [&str; 9] = [
+    "asm",
+    "llvm-bc",
+    "dep-info",
+    "link",
+    "llvm-ir",
+    "metadata",
+    "mir",
+    "obj",
+    "thin-link-bitcode",
+];
 
 impl Said<'_, '_, '_> {
     /// `diag` of `lint` at `spec` as rustc's `emit_lint_base` emits it: nothing when it is
@@ -120,13 +135,20 @@ impl Said<'_, '_, '_> {
     /// a lint given there; else at its level, with the future-incompatible warning and link
     /// and the notes on where its level came from. A lint of the future-incompatibility
     /// report (`report_in_deps`) allowed or expected is kept for the report alone, a warning.
-    fn finish(&mut self, lcx: &LevelCx<'_, '_>, lint: &'static Lint, spec: Spec, mut diag: Diag) -> Option<Diag> {
+    fn finish(
+        &mut self,
+        lcx: &LevelCx<'_, '_>,
+        lint: &'static Lint,
+        spec: Spec,
+        mut diag: Diag,
+    ) -> Option<Diag> {
         let reported = lint.future_incompatible.is_some_and(|it| it.report_in_deps);
         if spec.level == Level::Allow && !reported {
             return None;
         }
         if diag.span.primary.iter().any(attrs::external) {
-            let incompatible = lint.future_incompatible.is_some_and(|it| it.reason.edition().is_none());
+            let incompatible =
+                lint.future_incompatible.is_some_and(|it| it.reason.edition().is_none());
             if !incompatible && !lint.report_in_external_macro {
                 return None;
             }
@@ -173,7 +195,9 @@ impl Said<'_, '_, '_> {
             Source::Default => {
                 let note = match lcx.store.group_of(lint) {
                     // alloc: a note of a lint that fires
-                    Some(group) => format!("`#[{shown}({name})]` (part of `#[{shown}({group})]`) on by default"),
+                    Some(group) => format!(
+                        "`#[{shown}({name})]` (part of `#[{shown}({group})]`) on by default"
+                    ),
                     // alloc: as above
                     None => format!("`#[{shown}({name})]` on by default"),
                 };
@@ -184,15 +208,25 @@ impl Said<'_, '_, '_> {
                 let hyphens = name.replace('_', "-");
                 if &**given == name {
                     // alloc: a note of a lint that fires
-                    once(diag, Sublevel::Note, format!("requested on the command line with `{flag} {hyphens}`"));
+                    once(
+                        diag,
+                        Sublevel::Note,
+                        format!("requested on the command line with `{flag} {hyphens}`"),
+                    );
                 } else {
                     let given = given.replace('_', "-");
                     // alloc: as above
-                    once(diag, Sublevel::Note, format!("`{flag} {hyphens}` implied by `{flag} {given}`"));
+                    once(
+                        diag,
+                        Sublevel::Note,
+                        format!("`{flag} {hyphens}` implied by `{flag} {given}`"),
+                    );
                     if matches!(flagged, Level::Warn | Level::Deny) {
                         let help = match lint.id() == LintId::DEAD_CODE {
                             // alloc: as above
-                            true => format!("to override `{flag} {given}` add `#[expect({name})]` or `#[allow({name})]`"),
+                            true => format!(
+                                "to override `{flag} {given}` add `#[expect({name})]` or `#[allow({name})]`"
+                            ),
                             // alloc: as above
                             false => format!("to override `{flag} {given}` add `#[allow({name})]`"),
                         };
@@ -204,10 +238,19 @@ impl Said<'_, '_, '_> {
                 if let Some(reason) = reason {
                     diag.note(reason.as_str());
                 }
-                diag.sub(Sublevel::Note, "the lint level is defined here", MultiSpan::of(self.cx.span(*at)), true);
+                diag.sub(
+                    Sublevel::Note,
+                    "the lint level is defined here",
+                    MultiSpan::of(self.cx.span(*at)),
+                    true,
+                );
                 if attr.as_str() != name {
                     // alloc: a note of a lint that fires
-                    once(diag, Sublevel::Note, format!("`#[{shown}({name})]` implied by `#[{shown}({attr})]`"));
+                    once(
+                        diag,
+                        Sublevel::Note,
+                        format!("`#[{shown}({name})]` implied by `#[{shown}({attr})]`"),
+                    );
                 }
             }
         }
@@ -224,7 +267,10 @@ impl Said<'_, '_, '_> {
 /// The nodes of `walk` the builder (`early`, or the HIR's) reads attributes of, as rustc's
 /// walk of the crate comes to them. A node without costs a read of the tree's two columns,
 /// kind and `Tree::attrs`; only the rest are looked at.
-fn owners<'w, 'db>(walk: &'w Walk<'db>, early: bool) -> impl Iterator<Item = InFile<ast::Node<'db>>> + 'w {
+fn owners<'w, 'db>(
+    walk: &'w Walk<'db>,
+    early: bool,
+) -> impl Iterator<Item = InFile<ast::Node<'db>>> + 'w {
     walk.trees.iter().flat_map(move |tree| {
         tree.with_attrs(move |kind| front::may_be_owner(kind, early))
             .filter(move |&node| front::owns(node, early))
@@ -239,7 +285,12 @@ fn owners<'w, 'db>(walk: &'w Walk<'db>, early: bool) -> impl Iterator<Item = InF
 /// the `#[expect]`s nothing fulfilled after everything, unless `aborted`. When `aborted`,
 /// what is of [`Phase::Late`] is dropped. What more than one of rustc's builders says is here
 /// as many times, for `-Z deduplicate-diagnostics=no`: see [`builder::When`].
-pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, aborted: bool) -> Vec<Diag> {
+pub(crate) fn decide(
+    cx: &Cx<'_, '_>,
+    cmd: &CommandLine,
+    found: Vec<Found>,
+    aborted: bool,
+) -> Vec<Diag> {
     let walk = cx.walk();
     let mut lcx = LevelCx::new(cx.db, cx.krate.base(), &cmd.lints);
     let mut said = Said::new(cx);
@@ -265,10 +316,15 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
     if aborted {
         found.retain(|it| it.phase != Phase::Late);
     }
-    let pre_at = found.iter().position(|it| it.phase != Phase::Parse || it.diag.is_lint()).unwrap_or(found.len());
+    let pre_at = found
+        .iter()
+        .position(|it| it.phase != Phase::Parse || it.diag.is_lint())
+        .unwrap_or(found.len());
     let early_at = found
         .iter()
-        .position(|it| it.phase > Phase::Resolve || (it.phase == Phase::Resolve && it.diag.is_lint()))
+        .position(|it| {
+            it.phase > Phase::Resolve || (it.phase == Phase::Resolve && it.diag.is_lint())
+        })
         .unwrap_or(found.len());
     let hir_at = found.iter().position(|it| it.phase > Phase::Resolve).unwrap_or(found.len());
     let mut out = Vec::with_capacity(found.len() + extra + late.expectations.len());
@@ -327,7 +383,11 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
         if said.is_fulfilled(expectation.id) {
             continue;
         }
-        let mut diag = Diag::lint(unfulfilled.name, "this lint expectation is unfulfilled", cx.span(expectation.key));
+        let mut diag = Diag::lint(
+            unfulfilled.name,
+            "this lint expectation is unfulfilled",
+            cx.span(expectation.key),
+        );
         if let Some(reason) = expectation.reason {
             diag.note(reason.as_str());
         }
@@ -517,7 +577,9 @@ fn main() {}
 
     #[test]
     fn a_lint_may_fire_where_an_attribute_or_the_command_line_does_not_allow_it() {
-        let ids = |names: &[&str]| -> Vec<LintId> { names.iter().map(|it| registry::declared(it).unwrap().id()).collect() };
+        let ids = |names: &[&str]| -> Vec<LintId> {
+            names.iter().map(|it| registry::declared(it).unwrap().id()).collect()
+        };
         with_cx(LEVELS_FIXTURE, &["-W", "unused-results", "-A", "dead-code"], |cx| {
             for id in ids(&[
                 "missing_docs",
@@ -529,7 +591,12 @@ fn main() {}
             ]) {
                 assert!(cx.lint_may_fire(id), "{} may fire", id.lint().name);
             }
-            for id in ids(&["unused_qualifications", "unsafe_code", "variant_size_differences", "dead_code"]) {
+            for id in ids(&[
+                "unused_qualifications",
+                "unsafe_code",
+                "variant_size_differences",
+                "dead_code",
+            ]) {
                 assert!(!cx.lint_may_fire(id), "{} is allowed everywhere", id.lint().name);
             }
         });
@@ -545,12 +612,18 @@ fn main() {}
     /// the map can give.
     #[test]
     fn what_may_fire_holds_every_level_given() {
-        for args in [&[][..], &["-D", "warnings"], &["-W", "rust-2018-idioms"], &["--cap-lints", "warn"]] {
+        for args in
+            [&[][..], &["-D", "warnings"], &["-W", "rust-2018-idioms"], &["--cap-lints", "warn"]]
+        {
             with_cx(LEVELS_FIXTURE, args, |cx| {
                 for (name, at) in fns(cx) {
                     for lint in registry::all() {
                         if cx.lint_level(lint.id(), at) != Level::Allow {
-                            assert!(cx.lint_may_fire(lint.id()), "{} at `{name}` with {args:?}", lint.name);
+                            assert!(
+                                cx.lint_may_fire(lint.id()),
+                                "{} at `{name}` with {args:?}",
+                                lint.name
+                            );
                         }
                     }
                 }
@@ -576,19 +649,24 @@ fn main() {}
                     }
                 }
             });
-            blaze_alloc_count::assert_at_most(0, "whether a lint may fire, and the walk again", || {
-                for other in registry::all() {
-                    cx.lint_may_fire(other.id());
-                }
-                cx.walk();
-            });
+            blaze_alloc_count::assert_at_most(
+                0,
+                "whether a lint may fire, and the walk again",
+                || {
+                    for other in registry::all() {
+                        cx.lint_may_fire(other.id());
+                    }
+                    cx.walk();
+                },
+            );
         });
     }
 
     /// A crate of one file with `n` functions, each with two lint attributes, in modules of ten
     /// with one of their own, under a crate-level one.
     fn attributed_fns(n: usize) -> String {
-        let mut out = String::from("//- /main.rs crate:main edition:2021\n#![warn(missing_docs)]\n");
+        let mut out =
+            String::from("//- /main.rs crate:main edition:2021\n#![warn(missing_docs)]\n");
         for m in 0..n.div_ceil(10) {
             out.push_str(&format!("#[deny(unreachable_pub)]\nmod m{m} {{\n"));
             for i in m * 10..n.min(m * 10 + 10) {
@@ -630,7 +708,10 @@ fn main() {}
         let (small, large) = (level_map_build_allocations(4), level_map_build_allocations(400));
         // Under ten tables (the sets' columns, the node table, the kept sources), each doubling
         // at most eight times from 4 functions to 400: one per node would be 396 more.
-        assert!(large <= small + 80, "the level map's build: {small} allocations at 4 functions, {large} at 400");
+        assert!(
+            large <= small + 80,
+            "the level map's build: {small} allocations at 4 functions, {large} at 400"
+        );
     }
 
     #[test]
@@ -653,15 +734,28 @@ fn main() {}
         };
         assert_eq!(
             levels_of_fns(fixture, &[], lint),
-            named(&[("allowed", Level::Allow), ("denied", Level::Deny), ("expected", Level::Expect), ("main", Level::Deny)])
+            named(&[
+                ("allowed", Level::Allow),
+                ("denied", Level::Deny),
+                ("expected", Level::Expect),
+                ("main", Level::Deny)
+            ])
         );
         assert_eq!(
             levels_of_fns(fixture, &["--cap-lints", "warn"], lint),
-            named(&[("allowed", Level::Allow), ("denied", Level::Warn), ("expected", Level::Expect), ("main", Level::Warn)])
+            named(&[
+                ("allowed", Level::Allow),
+                ("denied", Level::Warn),
+                ("expected", Level::Expect),
+                ("main", Level::Warn)
+            ])
         );
         let plain = "//- /main.rs crate:main edition:2021\nfn main() {}\n";
         assert_eq!(levels_of_fns(plain, &[], lint), named(&[("main", Level::Allow)]));
-        assert_eq!(levels_of_fns(plain, &["-F", "unsafe-op-in-unsafe-fn"], lint), named(&[("main", Level::Forbid)]));
+        assert_eq!(
+            levels_of_fns(plain, &["-F", "unsafe-op-in-unsafe-fn"], lint),
+            named(&[("main", Level::Forbid)])
+        );
     }
 
     /// The check's levels and the front end's query are one rule: at every function of the level
@@ -679,12 +773,19 @@ fn main() {}
                 for (_, module) in def_map.modules(cx.db) {
                     for def in module.scope(cx.db).declarations() {
                         let hir_def::ModuleDefId::FunctionId(id) = def else { continue };
-                        let owner = hir_def::ExpressionStoreOwnerId::Body(hir_def::DefWithBodyId::FunctionId(id));
+                        let owner = hir_def::ExpressionStoreOwnerId::Body(
+                            hir_def::DefWithBodyId::FunctionId(id),
+                        );
                         let node = hir_lint_levels::query::owner_node(cx.db, owner);
                         let at = InFile::new(node.file_id, ast::ptr(node.value));
                         let front = hir_lint_levels::lint_levels_on(cx.db, owner, ());
                         for lint in registry::all() {
-                            assert_eq!(map.level(lint.id(), at), front.level(lint.id()), "{} at {at:?}", lint.name);
+                            assert_eq!(
+                                map.level(lint.id(), at),
+                                front.level(lint.id()),
+                                "{} at {at:?}",
+                                lint.name
+                            );
                         }
                         asked += 1;
                     }

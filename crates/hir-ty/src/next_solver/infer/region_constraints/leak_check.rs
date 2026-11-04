@@ -472,7 +472,8 @@ impl Sccs {
     }
 
     fn successors(&self, scc: usize) -> &[u32] {
-        &self.successors[self.successor_starts[scc] as usize..self.successor_starts[scc + 1] as usize]
+        &self.successors
+            [self.successor_starts[scc] as usize..self.successor_starts[scc + 1] as usize]
     }
 }
 

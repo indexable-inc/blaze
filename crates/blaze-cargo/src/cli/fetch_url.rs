@@ -51,10 +51,24 @@ pub fn main(words: &[OsString], color: bool) -> i32 {
     };
     let request = match source {
         Source::Url { url, digest } => {
-            Request::FetchUrl { url: Some(url), repo: None, rev: None, digest: digest.to_string(), most_bytes, out } // alloc: once a request
+            Request::FetchUrl {
+                url: Some(url),
+                repo: None,
+                rev: None,
+                digest: digest.to_string(),
+                most_bytes,
+                out,
+            } // alloc: once a request
         }
         Source::Git { repo, rev, digest } => {
-            Request::FetchUrl { url: None, repo: Some(repo), rev: Some(rev), digest: digest.to_string(), most_bytes, out } // alloc: once a request
+            Request::FetchUrl {
+                url: None,
+                repo: Some(repo),
+                rev: Some(rev),
+                digest: digest.to_string(),
+                most_bytes,
+                out,
+            } // alloc: once a request
         }
     };
     let mut stored = None;

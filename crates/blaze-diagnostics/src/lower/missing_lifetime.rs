@@ -334,7 +334,9 @@ pub(crate) fn path_missing<'db>(cx: &Cx<'_, 'db>, path: ast::Path<'db>) -> Optio
             continue;
         }
         let list = segment.generic_arg_list();
-        if list.is_some_and(|it| it.generic_args().any(|arg| matches!(arg, ast::GenericArg::LifetimeArg(_)))) {
+        if list.is_some_and(|it| {
+            it.generic_args().any(|arg| matches!(arg, ast::GenericArg::LifetimeArg(_)))
+        }) {
             return None;
         }
         return Some(match list.and_then(|it| Some((it, it.l_angle_token()?))) {
@@ -553,8 +555,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetime) -> Vec<Found> {
             if let Some(ret) = ret_type(sig) {
                 let mut upto = Lifetimes { until: Some(this.range), ..Lifetimes::default() };
                 walk(cx, ret.syntax(), &mut upto);
-                let reached = upto.reached
-                    || upto.missing.last().is_some_and(|it| it.range == this.range);
+                let reached =
+                    upto.reached || upto.missing.last().is_some_and(|it| it.range == this.range);
                 let earlier_path = upto.missing[..upto.missing.len().saturating_sub(1)]
                     .iter()
                     .any(|it| matches!(it.kind, Kind::Comma | Kind::Brackets));
@@ -572,8 +574,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetime) -> Vec<Found> {
                 // alloc: the error's parts, for an error hir found
                 false => vec![this],
             };
-            let first_path =
-                refs.iter().find(|it| matches!(it.kind, Kind::Comma | Kind::Brackets));
+            let first_path = refs.iter().find(|it| matches!(it.kind, Kind::Comma | Kind::Brackets));
             if first_path.is_some_and(|it| it.range != this.range) {
                 // alloc: empty, allocates nothing
                 return Vec::new();
@@ -618,7 +619,10 @@ pub(crate) fn report<'db>(
             n => n.to_string(),
         };
         // alloc: the error's text, for an error hir found
-        diag.span_label(span(lt.range), format!("expected {expected} lifetime parameter{}", s(lt.count)));
+        diag.span_label(
+            span(lt.range),
+            format!("expected {expected} lifetime parameter{}", s(lt.count)),
+        );
     }
 
     let ribs = ribs(rib_at);
@@ -664,10 +668,14 @@ pub(crate) fn report<'db>(
         }
         if num_params == 0 || elided_len == 0 {
             diag.help(match num_params {
-                0 => "this function's return type contains a borrowed value, but there is no \
-                      value for it to be borrowed from",
-                _ => "this function's return type contains a borrowed value with an elided \
-                      lifetime, but the lifetime cannot be derived from the arguments",
+                0 => {
+                    "this function's return type contains a borrowed value, but there is no \
+                      value for it to be borrowed from"
+                }
+                _ => {
+                    "this function's return type contains a borrowed value with an elided \
+                      lifetime, but the lifetime cannot be derived from the arguments"
+                }
             });
             if in_scope.is_empty() {
                 maybe_static = true;
@@ -747,7 +755,9 @@ pub(crate) fn report<'db>(
             let post = match maybe_static {
                 true => {
                     let owned = match &refs[..] {
-                        [lt] if lt.kind != Kind::Ampersand => ", or if you will only have owned values",
+                        [lt] if lt.kind != Kind::Ampersand => {
+                            ", or if you will only have owned values"
+                        }
                         _ => "",
                     };
                     // alloc: the error's text, for an error hir found

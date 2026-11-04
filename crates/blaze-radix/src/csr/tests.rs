@@ -36,8 +36,11 @@ fn reference(rows: usize, pairs: &[(u32, u32)]) -> (Vec<u32>, Vec<u32>) {
 fn rows_and_pairs(tc: &TestCase) -> (usize, Vec<(u32, u32)>) {
     let rows: usize = tc.draw(gs::integers().min_value(1).max_value(79));
     let pairs = tc.draw(
-        gs::vecs(gs::tuples!(gs::integers::<u32>().max_value(rows as u32 - 1), gs::integers::<u32>()))
-            .max_size(399),
+        gs::vecs(gs::tuples!(
+            gs::integers::<u32>().max_value(rows as u32 - 1),
+            gs::integers::<u32>()
+        ))
+        .max_size(399),
     );
     (rows, pairs)
 }
@@ -51,7 +54,8 @@ fn build_is_the_reference_counting_sort(tc: TestCase) {
     assert_eq!(csr.items(), &items[..]);
     assert_eq!(csr.rows(), rows);
     for row in 0..rows {
-        let want: Vec<u32> = pairs.iter().filter(|it| it.0 as usize == row).map(|it| it.1).collect();
+        let want: Vec<u32> =
+            pairs.iter().filter(|it| it.0 as usize == row).map(|it| it.1).collect();
         assert_eq!(csr.row(row), &want[..]);
         assert_eq!(csr.get(row), Some(&want[..]));
     }
@@ -104,7 +108,8 @@ fn no_rows_and_no_pairs() {
 #[test]
 fn items_that_are_not_copy_are_placed_once() {
     let words = ["b", "a", "c", "d"];
-    let csr = Csr::build(2, words.iter().enumerate().map(|(at, it)| ((at % 2) as u32, it.to_string())));
+    let csr =
+        Csr::build(2, words.iter().enumerate().map(|(at, it)| ((at % 2) as u32, it.to_string())));
     assert_eq!(csr.row(0), ["b", "c"]);
     assert_eq!(csr.row(1), ["a", "d"]);
 }
@@ -162,15 +167,30 @@ fn dedup_keeps_each_rows_first_of_a_run() {
 /// Once its columns and cursors have the room, a rebuild (and a graph's) allocates nothing.
 #[test]
 fn a_warm_rebuild_allocates_nothing() {
-    let pairs: Vec<(u32, u32)> = (0..10_000u32).map(|at| (at.wrapping_mul(2_654_435_761) % 500, at)).collect();
+    let pairs: Vec<(u32, u32)> =
+        (0..10_000u32).map(|at| (at.wrapping_mul(2_654_435_761) % 500, at)).collect();
     let (mut csr, mut cursors) = (Csr::new(), Vec::new());
     csr.rebuild(500, pairs.iter().copied(), &mut cursors);
     let (mut graph, mut by_target) = (Csr::new(), Csr::new());
-    graph.rebuild_graph(500, pairs.iter().map(|&(s, t)| (s, t % 500)), &mut by_target, &mut cursors);
+    graph.rebuild_graph(
+        500,
+        pairs.iter().map(|&(s, t)| (s, t % 500)),
+        &mut by_target,
+        &mut cursors,
+    );
     blaze_alloc_count::assert_at_most(0, "a warm CSR rebuild", || {
         for round in 0..20u32 {
-            csr.rebuild(500, pairs.iter().map(|&(row, it)| ((row + round) % 500, it)), &mut cursors);
-            graph.rebuild_graph(500, pairs.iter().map(|&(s, t)| (s, (t + round) % 500)), &mut by_target, &mut cursors);
+            csr.rebuild(
+                500,
+                pairs.iter().map(|&(row, it)| ((row + round) % 500, it)),
+                &mut cursors,
+            );
+            graph.rebuild_graph(
+                500,
+                pairs.iter().map(|&(s, t)| (s, (t + round) % 500)),
+                &mut by_target,
+                &mut cursors,
+            );
         }
     });
     assert_eq!(csr.len(), pairs.len());
@@ -184,7 +204,10 @@ struct Scratch<'a>(&'a Cell<usize>);
 // SAFETY: every call is `System`'s, which upholds `Allocator`'s contract; the count is a side
 // table that no block depends on.
 unsafe impl Allocator for Scratch<'_> {
-    fn allocate(&self, layout: std::alloc::Layout) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
+    fn allocate(
+        &self,
+        layout: std::alloc::Layout,
+    ) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> {
         self.0.set(self.0.get() + 1);
         std::alloc::System.allocate(layout)
     }
@@ -199,7 +222,8 @@ unsafe impl Allocator for Scratch<'_> {
 /// on the heap.
 #[test]
 fn build_in_puts_the_cursors_in_the_scratch() {
-    let pairs: Vec<(u32, u32)> = (0..2_000u32).map(|at| (at.wrapping_mul(2_654_435_761) % 300, at)).collect();
+    let pairs: Vec<(u32, u32)> =
+        (0..2_000u32).map(|at| (at.wrapping_mul(2_654_435_761) % 300, at)).collect();
     let asked = Cell::new(0);
     let csr = blaze_alloc_count::assert_at_most(2, "a CSR built with scratch cursors", || {
         Csr::build_in(300, pairs.iter().copied(), Scratch(&asked))
@@ -212,14 +236,21 @@ fn build_in_puts_the_cursors_in_the_scratch() {
 /// are the global ones, and ask the heap for nothing.
 #[test]
 fn a_csr_in_an_allocator_is_the_global_one() {
-    let pairs: Vec<(u32, u32)> = (0..2_000u32).map(|at| (at.wrapping_mul(2_654_435_761) % 300, at)).collect();
+    let pairs: Vec<(u32, u32)> =
+        (0..2_000u32).map(|at| (at.wrapping_mul(2_654_435_761) % 300, at)).collect();
     let asked = Cell::new(0);
     let (csr, graph) = blaze_alloc_count::assert_at_most(0, "a CSR in its own allocator", || {
         let mut cursors = Vec::new_in(Scratch(&asked));
         let mut csr = Csr::new_in(Scratch(&asked));
         csr.rebuild(300, pairs.iter().copied(), &mut cursors);
-        let (mut graph, mut by_target) = (Csr::new_in(Scratch(&asked)), Csr::new_in(Scratch(&asked)));
-        graph.rebuild_graph(300, pairs.iter().map(|&(s, t)| (s, t % 300)), &mut by_target, &mut cursors);
+        let (mut graph, mut by_target) =
+            (Csr::new_in(Scratch(&asked)), Csr::new_in(Scratch(&asked)));
+        graph.rebuild_graph(
+            300,
+            pairs.iter().map(|&(s, t)| (s, t % 300)),
+            &mut by_target,
+            &mut cursors,
+        );
         graph.dedup_rows();
         (csr, graph)
     });

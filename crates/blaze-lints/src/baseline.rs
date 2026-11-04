@@ -24,14 +24,30 @@ pub struct Baseline {
 #[derive(Debug, PartialEq, Eq)]
 pub enum BaselineError {
     /// A line that is not `crate<TAB>count`, by its number.
-    Line { file: String, line: usize, text: String },
+    Line {
+        file: String,
+        line: usize,
+        text: String,
+    },
     /// A crate written twice, or out of order.
-    Order { file: String, line: usize, krate: String },
+    Order {
+        file: String,
+        line: usize,
+        krate: String,
+    },
     /// A file of the baselines' directory that is not `<tool>.<lint>.txt` of a clippy or blaze
     /// lint this crate knows.
-    Lint { file: String },
-    Read { file: String, error: String },
-    Write { file: String, error: String },
+    Lint {
+        file: String,
+    },
+    Read {
+        file: String,
+        error: String,
+    },
+    Write {
+        file: String,
+        error: String,
+    },
 }
 
 impl std::fmt::Display for BaselineError {
@@ -41,7 +57,10 @@ impl std::fmt::Display for BaselineError {
                 write!(f, "{file}:{line}: `{text}` is not `crate<TAB>count` with a count above 0")
             }
             BaselineError::Order { file, line, krate } => {
-                write!(f, "{file}:{line}: `{krate}` is not after the crate above it: a baseline is sorted, each crate once")
+                write!(
+                    f,
+                    "{file}:{line}: `{krate}` is not after the crate above it: a baseline is sorted, each crate once"
+                )
             }
             BaselineError::Lint { file } => {
                 write!(f, "{file}: not `<tool>.<lint>.txt` of a clippy or blaze lint blaze knows")
@@ -78,10 +97,16 @@ impl Off {
 impl std::fmt::Display for Off {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Off::Grew { krate, was, now } => write!(f, "`{krate}`: {now} findings, over the baseline's {was}"),
-            Off::New { krate, now } => write!(f, "`{krate}`: {now} findings, in a crate the baseline does not have"),
+            Off::Grew { krate, was, now } => {
+                write!(f, "`{krate}`: {now} findings, over the baseline's {was}")
+            }
+            Off::New { krate, now } => {
+                write!(f, "`{krate}`: {now} findings, in a crate the baseline does not have")
+            }
             Off::Unbaselined { now } => write!(f, "{now} findings, and the lint has no baseline"),
-            Off::Shrank { krate, was, now } => write!(f, "`{krate}`: {now} findings, under the baseline's {was}"),
+            Off::Shrank { krate, was, now } => {
+                write!(f, "`{krate}`: {now} findings, under the baseline's {was}")
+            }
         }
     }
 }
@@ -92,14 +117,22 @@ impl Baseline {
         let mut counts = BTreeMap::new();
         let mut last: Option<&str> = None;
         for (at, line) in text.lines().enumerate() {
-            let line_error = || BaselineError::Line { file: name.to_owned(), line: at + 1, text: line.to_owned() };
+            let line_error = || BaselineError::Line {
+                file: name.to_owned(),
+                line: at + 1,
+                text: line.to_owned(),
+            };
             let (krate, count) = line.split_once('\t').ok_or_else(line_error)?;
             let count: u32 = count.parse().ok().filter(|it| *it > 0).ok_or_else(line_error)?;
             if krate.is_empty() {
                 return Err(line_error());
             }
             if last.is_some_and(|it| it >= krate) {
-                return Err(BaselineError::Order { file: name.to_owned(), line: at + 1, krate: krate.to_owned() });
+                return Err(BaselineError::Order {
+                    file: name.to_owned(),
+                    line: at + 1,
+                    krate: krate.to_owned(),
+                });
             }
             last = Some(krate);
             counts.insert(krate.to_owned(), count);
@@ -176,7 +209,12 @@ pub fn target_of(dir: &Path) -> Result<Option<String>, BaselineError> {
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(BaselineError::Read { file: path.display().to_string(), error: error.to_string() }),
+        Err(error) => {
+            return Err(BaselineError::Read {
+                file: path.display().to_string(),
+                error: error.to_string(),
+            });
+        }
     };
     let target = text.strip_suffix('\n').unwrap_or(&text);
     if target.is_empty() || target.contains(char::is_whitespace) {
@@ -207,8 +245,10 @@ pub fn lint_of(name: &str) -> Option<String> {
 /// The baselines in `dir`, by lint (`clippy::disallowed_types`); none when `dir` does not exist.
 pub fn read(dir: &Path) -> Result<BTreeMap<String, Baseline>, BaselineError> {
     let shown = |path: &Path| path.display().to_string();
-    let read_error =
-        |path: &Path, error: std::io::Error| BaselineError::Read { file: shown(path), error: error.to_string() };
+    let read_error = |path: &Path, error: std::io::Error| BaselineError::Read {
+        file: shown(path),
+        error: error.to_string(),
+    };
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
@@ -235,12 +275,15 @@ pub fn check(dir: &Path, counts: &Counts) -> Result<Vec<(String, Off)>, Baseline
     let baselines = read(dir)?;
     let none = BTreeMap::new();
     // alloc: the run's and the baselines' lint names, once a run
-    let lints: std::collections::BTreeSet<&String> = baselines.keys().chain(counts.keys()).collect();
+    let lints: std::collections::BTreeSet<&String> =
+        baselines.keys().chain(counts.keys()).collect();
     let mut off = Vec::new();
     for lint in lints {
         let now = counts.get(lint).unwrap_or(&none);
         match baselines.get(lint) {
-            Some(baseline) => off.extend(baseline.off(now).into_iter().map(|it| (lint.clone(), it))),
+            Some(baseline) => {
+                off.extend(baseline.off(now).into_iter().map(|it| (lint.clone(), it)))
+            }
             None => {
                 let now = now.values().sum::<u32>();
                 if now > 0 {
@@ -273,7 +316,10 @@ pub fn bless(dir: &Path, counts: &Counts) -> Result<Vec<(String, Blessed)>, Base
             continue;
         }
         let path = dir.join(file_name(&lint));
-        let write_error = |error: std::io::Error| BaselineError::Write { file: path.display().to_string(), error: error.to_string() };
+        let write_error = |error: std::io::Error| BaselineError::Write {
+            file: path.display().to_string(),
+            error: error.to_string(),
+        };
         if blessed.counts.is_empty() {
             std::fs::remove_file(&path).map_err(write_error)?;
             done.push((lint, Blessed::Emptied));
@@ -310,7 +356,10 @@ mod tests {
     fn a_line_that_does_not_read_or_a_crate_out_of_order_is_an_error_naming_it() {
         for (text, line) in [("a\t0\n", 1), ("a\t1\nb 2\n", 2), ("\t1\n", 1)] {
             let error = Baseline::parse("x.txt", text).unwrap_err();
-            assert!(matches!(&error, BaselineError::Line { line: at, .. } if *at == line), "{text:?}: {error}");
+            assert!(
+                matches!(&error, BaselineError::Line { line: at, .. } if *at == line),
+                "{text:?}: {error}"
+            );
         }
         for text in ["b\t1\na\t1\n", "a\t1\na\t2\n"] {
             let error = Baseline::parse("x.txt", text).unwrap_err();
@@ -339,7 +388,8 @@ mod tests {
 
     #[test]
     fn a_run_is_checked_against_and_blesses_the_baselines_of_a_directory() {
-        let dir = std::env::temp_dir().join(format!("blaze-lints-baselines-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("blaze-lints-baselines-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let types = dir.join("clippy.disallowed_types.txt");
         std::fs::write(&types, "a\t3\nb\t2\n").unwrap();
@@ -355,7 +405,10 @@ mod tests {
         assert_eq!(
             check(&dir, &counts).unwrap(),
             [
-                ("blaze::wall_clock".to_owned(), Off::Shrank { krate: "c".to_owned(), was: 1, now: 0 }),
+                (
+                    "blaze::wall_clock".to_owned(),
+                    Off::Shrank { krate: "c".to_owned(), was: 1, now: 0 }
+                ),
                 ("clippy::disallowed_methods".to_owned(), Off::Unbaselined { now: 9 }),
                 (types_lint.clone(), Off::Grew { krate: "a".to_owned(), was: 3, now: 4 }),
                 (types_lint.clone(), Off::Shrank { krate: "b".to_owned(), was: 2, now: 1 }),
@@ -363,7 +416,10 @@ mod tests {
         );
         assert_eq!(
             bless(&dir, &counts).unwrap(),
-            [("blaze::wall_clock".to_owned(), Blessed::Emptied), (types_lint.clone(), Blessed::Lowered)]
+            [
+                ("blaze::wall_clock".to_owned(), Blessed::Emptied),
+                (types_lint.clone(), Blessed::Lowered)
+            ]
         );
         assert_eq!(std::fs::read_to_string(&types).unwrap(), "a\t3\nb\t1\n");
         assert!(!clock.exists(), "a baseline lowered to nothing is deleted");

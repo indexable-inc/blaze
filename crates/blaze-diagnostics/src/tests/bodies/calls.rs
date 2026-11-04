@@ -16,7 +16,8 @@ use crate::{
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`),
 /// under compiletest's flags.
 fn ui_core(name: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
+    let fixture =
+        format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
     ui_fixture(&fixture)
 }
 
@@ -95,10 +96,7 @@ fn a_cast_of_a_reference_borrows_too_much_or_is_not_dereferenced() {
 ";
     assert_reports(
         &ui_core("E0606.rs", "sized", source),
-        &[
-            error(2, &["`&u8`", "`u8`"]),
-            error(3, &["`&u8`", "`u8`"]),
-        ],
+        &[error(2, &["`&u8`", "`u8`"]), error(3, &["`&u8`", "`u8`"])],
     );
 }
 
@@ -162,7 +160,10 @@ fn a_cast_to_an_unsized_type_is_to_a_reference() {
     let _foo = &[1_usize, 2] as [usize]; //~ ERROR E0620
 }
 ";
-    assert_reports(&ui_core("E0620.rs", "sized, slice", source), &[error(2, &["`&[usize; 2]`", "`[usize]`"])]);
+    assert_reports(
+        &ui_core("E0620.rs", "sized, slice", source),
+        &[error(2, &["`&[usize; 2]`", "`[usize]`"])],
+    );
 }
 
 #[test]
@@ -235,7 +236,15 @@ macro_rules! println {
     }};
 }
 "#;
-    assert_eq!(ui_std("enum-drop-cast-error.rs", "sized, drop, fmt", ("pub use crate::println;", println), source), stderr);
+    assert_eq!(
+        ui_std(
+            "enum-drop-cast-error.rs",
+            "sized, drop, fmt",
+            ("pub use crate::println;", println),
+            source
+        ),
+        stderr
+    );
 }
 
 #[test]
@@ -282,7 +291,10 @@ fn main() {
     assert_eq!(d, 0);
 }
 "#;
-    assert_reports(&ui_fixture(fixture), &[error(9, &["`FieldLessWithNonExhaustiveVariant`", "`u8`"])]);
+    assert_reports(
+        &ui_fixture(fixture),
+        &[error(9, &["`FieldLessWithNonExhaustiveVariant`", "`u8`"])],
+    );
 }
 
 #[test]
@@ -419,7 +431,10 @@ fn main() {
 }
 ";
     let std_items = "pub use core::ops;";
-    assert_reports(&ui_std("assign-non-lval-needs-deref.rs", "add", ("", std_items), source), &[error(15, &[])]);
+    assert_reports(
+        &ui_std("assign-non-lval-needs-deref.rs", "add", ("", std_items), source),
+        &[error(15, &[])],
+    );
 }
 
 #[test]
@@ -583,9 +598,7 @@ fn main() {
 "##;
     assert_reports(
         &ui_core("imm-ref-trait-object.rs", MIN_OF_A_DYN_ITERATOR, source),
-        &[
-            error(2, &["`&dyn Iterator<Item = &u64>`", "`min`"]),
-        ],
+        &[error(2, &["`&dyn Iterator<Item = &u64>`", "`min`"])],
     );
 }
 
@@ -604,9 +617,7 @@ fn main() {
 "##;
     assert_reports(
         &ui_core("mutability-mismatch-arg.rs", MIN_OF_A_DYN_ITERATOR, source),
-        &[
-            error(3, &["`&dyn Iterator<Item = &u64>`", "`min`"]),
-        ],
+        &[error(3, &["`&dyn Iterator<Item = &u64>`", "`min`"])],
     );
 }
 

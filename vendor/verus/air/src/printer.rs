@@ -193,7 +193,11 @@ impl Printer {
     }
 
     pub(crate) fn filter_to_node(&self, filter: &Option<Ident>) -> Node {
-        if let Some(filter) = filter { nodes!({ str_to_node(filter) }) } else { Node::List(vec![]) }
+        if let Some(filter) = filter {
+            nodes!({ str_to_node(filter) })
+        } else {
+            Node::List(vec![])
+        }
     }
 
     fn rounding_mode_to_node(&self, r: &RoundingMode) -> Node {

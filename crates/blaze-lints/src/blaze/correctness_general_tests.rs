@@ -8,8 +8,7 @@ use crate::{
     tests::lint,
 };
 
-const MINICORE: &str =
-    "//- minicore: sized, copy, clone, option, result, fn, iterator, iterators, slice, deref, drop, index, future, builtin_impls\n";
+const MINICORE: &str = "//- minicore: sized, copy, clone, option, result, fn, iterator, iterators, slice, deref, drop, index, future, builtin_impls\n";
 
 const CRATES: &str = r#"
 //- /std/lib.rs crate:std
@@ -121,7 +120,11 @@ impl Counted {
 }
 "#,
     );
-    assert_eq!(out.matches("this `Relaxed` store of `Slot::ready` publishes it").count(), 1, "{out}");
+    assert_eq!(
+        out.matches("this `Relaxed` store of `Slot::ready` publishes it").count(),
+        1,
+        "{out}"
+    );
     assert_eq!(out.matches("this load of `Slot::ready` guards other data").count(), 1, "{out}");
     assert!(!out.contains("Counted::done"), "a flag that guards nothing is fine:\n{out}");
 }
@@ -158,7 +161,11 @@ pub fn keep_some(lines: std::io::Lines<u8>, out: &mut Vec<u8>) {
 }
 "#,
     );
-    assert_eq!(out.matches("grows a collection once per round of a loop that reads input").count(), 1, "{out}");
+    assert_eq!(
+        out.matches("grows a collection once per round of a loop that reads input").count(),
+        1,
+        "{out}"
+    );
 }
 
 #[test]
@@ -192,7 +199,10 @@ fn dos_hasher_on_input_yields_to_blaze_internal() {
     };
     assert_eq!(level(&[]), Level::Warn);
     assert_eq!(level(&["--warn=blaze::internal"]), Level::Allow);
-    assert_eq!(level(&["--warn=blaze::internal", "--warn=blaze::dos_hasher_on_input"]), Level::Warn);
+    assert_eq!(
+        level(&["--warn=blaze::internal", "--warn=blaze::dos_hasher_on_input"]),
+        Level::Warn
+    );
     assert_eq!(level(&["--allow=blaze::internal"]), Level::Warn);
     // A lint that doesn't yield keeps its default.
     let levels = Levels::new(&CommandLine::parse(&["--warn=blaze::internal".to_owned()]).unwrap());

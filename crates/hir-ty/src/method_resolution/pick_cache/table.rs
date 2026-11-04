@@ -118,12 +118,8 @@ where
         let hint = key.hint();
         // The box is what the limbo frees after a grace.
         // alloc: a miss, once per key and state, after a probe made the value.
-        let made = Box::into_raw(Box::new(Entry {
-            key,
-            state,
-            referenced: AtomicBool::new(true),
-            value,
-        }));
+        let made =
+            Box::into_raw(Box::new(Entry { key, state, referenced: AtomicBool::new(true), value }));
         loop {
             let (at, held) = match self.victim(hint, &key, state) {
                 Ok(won) => {
@@ -134,10 +130,7 @@ where
                 Err(slot) => slot,
             };
             let slot = &self.slots[at];
-            if slot
-                .entry
-                .compare_exchange(held, made, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
+            if slot.entry.compare_exchange(held, made, Ordering::AcqRel, Ordering::Acquire).is_err()
             {
                 // Another thread changed the slot first: look again.
                 continue;

@@ -111,11 +111,15 @@ fn a_type_relative_value_path_records_its_qualifier() {
         for (name, expected) in cases {
             let def = DefWithBodyId::FunctionId(function(&db, name));
             let body = Body::of(&db, def);
-            let mut paths = body.exprs().filter(|(_, it)| matches!(it, Expr::Path(_))).map(|(id, _)| id);
+            let mut paths =
+                body.exprs().filter(|(_, it)| matches!(it, Expr::Path(_))).map(|(id, _)| id);
             let path = paths.next().unwrap_or_else(|| panic!("{name}: no path expression"));
             assert!(paths.next().is_none(), "{name}: more than one path expression");
             let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
-            assert!(infer.value_resolution(ExprOrPatId::ExprId(path)).is_some(), "{name}: unresolved");
+            assert!(
+                infer.value_resolution(ExprOrPatId::ExprId(path)).is_some(),
+                "{name}: unresolved"
+            );
             let got = infer.qualifier_resolution(ExprOrPatId::ExprId(path));
             let ok = match (&expected, got) {
                 (Expected::Adt(adt), Some((TypeNs::AdtId(AdtId::StructId(it)), 1))) => {

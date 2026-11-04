@@ -14,9 +14,9 @@ mod naming_tests;
 mod pick_cache;
 mod probe;
 #[cfg(test)]
-mod relevant_tests;
-#[cfg(test)]
 mod proc_macro_edge_tests;
+#[cfg(test)]
+mod relevant_tests;
 pub mod scope_sets;
 
 use std::{hash::BuildHasher, ops::Range};
@@ -33,7 +33,6 @@ use tracing::{debug, instrument};
 
 use base_db::{Crate, Db};
 use blaze_hash::FixedState;
-use std::alloc::Global;
 use hir_def::{
     AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
     GenericParamId, HasModule, ImplId, ItemContainerId, MacroId, ModuleDefId, ModuleId, TraitId,
@@ -54,6 +53,7 @@ use rustc_type_ir::{
     inherent::{BoundExistentialPredicates, IntoKind},
     try_visit,
 };
+use std::alloc::Global;
 use stdx::impl_from;
 use syntax::{SyntaxKind, T, TextSize};
 use triomphe::Arc;
@@ -708,7 +708,9 @@ pub fn impl_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<CandidateId
 #[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn inherent_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<CandidateId> {
     impl_.impl_items(db).items.iter().find_map(|&(item_name, item)| match item {
-        AssocItemId::FunctionId(it) if hir_def::nameres::assoc_item_is(db, item_name, item, name) => {
+        AssocItemId::FunctionId(it)
+            if hir_def::nameres::assoc_item_is(db, item_name, item, name) =>
+        {
             Some(it.into())
         }
         AssocItemId::ConstId(it) if hir_def::nameres::assoc_item_is(db, item_name, item, name) => {
@@ -724,13 +726,11 @@ pub fn inherent_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<Candida
 /// ([`hir_def::nameres::assoc_item_is`], rustc's `find_by_ident_and_namespace`), so a trait a
 /// `macro` writes may have methods `f` and `$f`, and each call finds the one its context names.
 #[blaze_query::tracked(returns(copy), mem_tag = Infer)]
-pub fn trait_value_item(
-    db: &Db,
-    trait_: TraitId,
-    name: Name,
-) -> Option<CandidateId> {
+pub fn trait_value_item(db: &Db, trait_: TraitId, name: Name) -> Option<CandidateId> {
     trait_.trait_items(db).items.iter().find_map(|&(item_name, item)| match item {
-        AssocItemId::FunctionId(it) if hir_def::nameres::assoc_item_is(db, item_name, item, name) => {
+        AssocItemId::FunctionId(it)
+            if hir_def::nameres::assoc_item_is(db, item_name, item, name) =>
+        {
             Some(it.into())
         }
         AssocItemId::ConstId(it) if hir_def::nameres::assoc_item_is(db, item_name, item, name) => {
@@ -813,12 +813,7 @@ impl<'db, 'f> TraitValueItems<'db, 'f> {
         TraitValueItems { runs: Vec::new_in(frame) }
     }
 
-    pub fn get(
-        &mut self,
-        db: &'db Db,
-        trait_: TraitId,
-        name: Name,
-    ) -> Option<CandidateId> {
+    pub fn get(&mut self, db: &'db Db, trait_: TraitId, name: Name) -> Option<CandidateId> {
         let module = trait_.module(db);
         if module.block(db).is_some() {
             return trait_value_item(db, trait_, name);
@@ -1033,7 +1028,8 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
             // A proc-macro crate's impls and its dependencies' are never its user's
             // (`Crate::loads_only_macros`): a derive built for `wasm32-wasip1` brings its own
             // `alloc` and `std`, whose impls would stand beside the user's.
-            if unnamed.iter().any(|it| std::ptr::eq(*it, dep)) || dep.crate_id.loads_only_macros(db) {
+            if unnamed.iter().any(|it| std::ptr::eq(*it, dep)) || dep.crate_id.loads_only_macros(db)
+            {
                 continue;
             }
             // The same of the dependency: the crates of its tests and benches are among its own.
@@ -1110,7 +1106,12 @@ impl CratesThatName {
 
     /// The places in [`loaded_crates`], ascending, of the crates that can name both
     /// `trait_crate` and, given, `self_crate`.
-    fn holders<'f>(&self, frame: &'f Frame, trait_crate: Crate, self_crate: Option<Crate>) -> Ones<'f> {
+    fn holders<'f>(
+        &self,
+        frame: &'f Frame,
+        trait_crate: Crate,
+        self_crate: Option<Crate>,
+    ) -> Ones<'f> {
         let Some(row) = self.row(trait_crate) else { return Ones::new(&[]) };
         let holders = frame.alloc_slice_copy(row);
         if let Some(self_crate) = self_crate {
@@ -1469,10 +1470,7 @@ fn macro_resolution(db: &Db, krate: Crate, name: &Symbol) -> String {
 /// `const` or `static`. An `impl Trait` type is found as well, which costs a lowering and
 /// nothing else.
 #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-fn impls_in_bodies(
-    db: &Db,
-    file: base_db::EditionedFileId,
-) -> Box<[(TextSize, BodyMark)]> {
+fn impls_in_bodies(db: &Db, file: base_db::EditionedFileId) -> Box<[(TextSize, BodyMark)]> {
     blaze_mem::frame::current(|frame| {
         let text = db.file_text(file.file_id(db)).text(db);
         let lexed = syntax::LexedStr::new(file.edition(db), text);
@@ -1764,14 +1762,20 @@ impl ImplWork {
 #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn crates_containing_incoherent_inherent_impls(db: &Db, krate: Crate) -> Box<[Crate]> {
     blaze_mem::frame::current(|frame| {
-        let _p = tracing::info_span!(target: "blaze", "crates_containing_incoherent_inherent_impls").entered();
+        let _p =
+            tracing::info_span!(target: "blaze", "crates_containing_incoherent_inherent_impls")
+                .entered();
         // We assume that only sysroot crates contain `#[rustc_has_incoherent_inherent_impls]`
         // impls, since this is an internal feature and only std uses it. The sysroot of a
         // proc macro's crate is never its user's (`Crate::loads_only_macros`): a macro built
         // for `wasm32-wasip1` has its own `alloc`, whose `[T]::sort` is not the user's.
         let mut lang = Vec::new_in(frame);
         lang.extend(
-            krate.transitive_loaded_deps(db).iter().copied().filter(|krate| krate.data(db).origin.is_lang()),
+            krate
+                .transitive_loaded_deps(db)
+                .iter()
+                .copied()
+                .filter(|krate| krate.data(db).origin.is_lang()),
         );
         // alloc: the memo's value, once at its length.
         lang.iter().copied().collect()
@@ -1992,7 +1996,10 @@ impl<'db, 'f, V: Copy> SelfTyRunsBuilder<'db, 'f, V> {
     fn columns(self) -> (SelfTys<'db>, Runs<V>) {
         let order = order_by_hash(self.frame, &self.self_tys);
         let rank = ranks(self.frame, order);
-        (SelfTys::in_order(&self.self_tys, order), Runs::from_groups(self.frame, rank, &self.values))
+        (
+            SelfTys::in_order(&self.self_tys, order),
+            Runs::from_groups(self.frame, rank, &self.values),
+        )
     }
 }
 
@@ -2060,10 +2067,7 @@ impl<'db> InherentImpls<'db> {
     }
 
     #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-    pub fn for_block(
-        db: &'db Db,
-        block: BlockIdLt<'db>,
-    ) -> Option<Box<InherentImpls<'db>>> {
+    pub fn for_block(db: &'db Db, block: BlockIdLt<'db>) -> Option<Box<InherentImpls<'db>>> {
         blaze_mem::frame::current(|frame| {
             let _p = tracing::info_span!("inherent_impls_in_block_query").entered();
 
@@ -2299,9 +2303,7 @@ impl<'db> TraitImpls<'db> {
         t: usize,
     ) -> impl Iterator<Item = (&SimplifiedType<'db>, (&[ImplId], &[BuiltinDeriveImplId]))> + '_
     {
-        self.rows(t).map(|r| {
-            (&self.self_tys.self_tys[r], (self.impls.run(r), self.derives.run(r)))
-        })
+        self.rows(t).map(|r| (&self.self_tys.self_tys[r], (self.impls.run(r), self.derives.run(r))))
     }
 }
 
@@ -2340,11 +2342,7 @@ impl<'db> TraitImpls<'db> {
     /// impl of another trait, or anything else added anywhere, leaves this as it was. A frozen
     /// crate's is read from its frozen table.
     #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-    pub fn for_crate_and_trait(
-        db: &'db Db,
-        krate: Crate,
-        trait_: TraitId,
-    ) -> TraitImpls<'db> {
+    pub fn for_crate_and_trait(db: &'db Db, krate: Crate, trait_: TraitId) -> TraitImpls<'db> {
         blaze_mem::frame::current(|frame| {
             let mut builder = TraitImplsBuilder::new(frame);
             if frozen::served(db, krate) {
@@ -2357,10 +2355,7 @@ impl<'db> TraitImpls<'db> {
     }
 
     #[blaze_query::tracked(returns(as_deref), mem_tag = Infer)]
-    pub fn for_block(
-        db: &'db Db,
-        block: BlockIdLt<'db>,
-    ) -> Option<Box<TraitImpls<'db>>> {
+    pub fn for_block(db: &'db Db, block: BlockIdLt<'db>) -> Option<Box<TraitImpls<'db>>> {
         blaze_mem::frame::current(|frame| {
             let _p = tracing::info_span!("inherent_impls_in_block_query").entered();
 
@@ -2394,8 +2389,7 @@ impl<'db> TraitImpls<'db> {
             let self_crate = simplified_type_module(db, &self_ty.0).map(|it| it.krate(db));
             for at in crates_that_name(db, krate).holders(frame, trait_.krate(db), self_crate) {
                 let impls = Self::for_crate_and_trait(db, loaded[at], trait_);
-                let (impls, builtin_derive_impls) =
-                    impls.for_trait_and_self_ty(trait_, &self_ty.0);
+                let (impls, builtin_derive_impls) = impls.for_trait_and_self_ty(trait_, &self_ty.0);
                 found.extend(impls.iter().map(|&it| AnyImplId::from(it)));
                 found.extend(builtin_derive_impls.iter().map(|&it| AnyImplId::from(it)));
             }
@@ -2406,11 +2400,7 @@ impl<'db> TraitImpls<'db> {
 
     /// The blanket impls of one trait in `krate` and its dependencies.
     #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-    pub fn blanket_in_crate_and_deps(
-        db: &'db Db,
-        krate: Crate,
-        trait_: TraitId,
-    ) -> Box<[ImplId]> {
+    pub fn blanket_in_crate_and_deps(db: &'db Db, krate: Crate, trait_: TraitId) -> Box<[ImplId]> {
         blaze_mem::frame::current(|frame| {
             let mut found = Vec::new_in(frame);
             let loaded = loaded_crates(db, krate);
@@ -2455,11 +2445,7 @@ impl<'db> TraitImpls<'db> {
     /// The impls of one trait in `krate` alone, without the built-in derives, in the order
     /// [`Self::for_trait`] gives them: the blanket impls first.
     #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-    pub fn in_crate_for_trait(
-        db: &'db Db,
-        krate: Crate,
-        trait_: TraitId,
-    ) -> Box<[ImplId]> {
+    pub fn in_crate_for_trait(db: &'db Db, krate: Crate, trait_: TraitId) -> Box<[ImplId]> {
         blaze_mem::frame::current(|frame| {
             let mut found = Vec::new_in(frame);
             Self::for_crate_and_trait(db, krate, trait_).for_trait(trait_, |impls| {
@@ -2930,11 +2916,14 @@ mod inert_attribute_tests {
         };
         let runs: Vec<(Symbol, bool, Vec<Symbol>)> =
             defs.iter().map(|(n, w, c)| (n.clone(), w, c.to_vec())).collect();
-        assert_eq!(runs, [
-            (s("a"), false, vec![s("x"), s("y")]),
-            (s("b"), true, vec![]),
-            (s("c"), false, vec![s("z")]),
-        ]);
+        assert_eq!(
+            runs,
+            [
+                (s("a"), false, vec![s("x"), s("y")]),
+                (s("b"), true, vec![]),
+                (s("c"), false, vec![s("z")]),
+            ]
+        );
     }
 }
 

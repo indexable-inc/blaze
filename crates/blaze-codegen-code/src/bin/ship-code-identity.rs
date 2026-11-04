@@ -19,10 +19,14 @@ struct Request {
 }
 
 fn request(text: &str) -> Result<Request, String> {
-    let value: serde_json::Value = serde_json::from_str(text).map_err(|why| format!("the request `{text}` is no JSON: {why}"))?;
-    let object = value.as_object().ok_or_else(|| format!("the request `{text}` is no JSON object"))?;
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|why| format!("the request `{text}` is no JSON: {why}"))?;
+    let object =
+        value.as_object().ok_or_else(|| format!("the request `{text}` is no JSON object"))?;
     if let Some(unknown) = object.keys().find(|it| !matches!(it.as_str(), "program" | "into")) {
-        return Err(format!("the request has the field `{unknown}`, and takes only `program` and `into`"));
+        return Err(format!(
+            "the request has the field `{unknown}`, and takes only `program` and `into`"
+        ));
     }
     let path = |name: &str| {
         object
@@ -35,7 +39,9 @@ fn request(text: &str) -> Result<Request, String> {
 }
 
 fn shipped(request: &Request) -> Result<Vec<PathBuf>, String> {
-    let canonical = |path: &Path| std::fs::canonicalize(path).map_err(|why| format!("{}: {why}", path.display()));
+    let canonical = |path: &Path| {
+        std::fs::canonicalize(path).map_err(|why| format!("{}: {why}", path.display()))
+    };
     if canonical(&request.program)? == canonical(&request.into)? {
         return Err(format!(
             "{} is the program's own directory in its checkout: a shipped tree there would stand in \
@@ -46,7 +52,8 @@ fn shipped(request: &Request) -> Result<Vec<PathBuf>, String> {
     let workspace = Workspace::read(&request.program)?;
     let mut written = Vec::new();
     for &identity in IDENTITIES {
-        let text = ship(&workspace, identity).map_err(|why| format!("{} ({}): {why}", identity.what, identity.env))?;
+        let text = ship(&workspace, identity)
+            .map_err(|why| format!("{} ({}): {why}", identity.what, identity.env))?;
         let path = request.into.join(identity.shipped);
         std::fs::write(&path, text).map_err(|why| format!("writing {}: {why}", path.display()))?;
         written.push(path);
@@ -58,7 +65,10 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let done = match &args[..] {
         [text] => request(text).and_then(|it| shipped(&it)),
-        _ => Err(format!("takes one JSON value, `{{\"program\": DIR, \"into\": DIR}}`, and was given {} arguments", args.len())),
+        _ => Err(format!(
+            "takes one JSON value, `{{\"program\": DIR, \"into\": DIR}}`, and was given {} arguments",
+            args.len()
+        )),
     };
     match done {
         Ok(written) => {

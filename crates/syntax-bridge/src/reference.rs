@@ -380,9 +380,7 @@ impl SynToken {
     }
 }
 
-impl<SpanMap, OnEvent, A: Allocator + Clone> SrcToken<Converter<SpanMap, OnEvent, A>>
-    for SynToken
-{
+impl<SpanMap, OnEvent, A: Allocator + Clone> SrcToken<Converter<SpanMap, OnEvent, A>> for SynToken {
     fn kind(&self, _ctx: &Converter<SpanMap, OnEvent, A>) -> SyntaxKind {
         match self {
             SynToken::Ordinary(token) => token.kind(),

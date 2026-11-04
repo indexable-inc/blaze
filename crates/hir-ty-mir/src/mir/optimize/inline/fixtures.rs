@@ -5,12 +5,12 @@
 //! of the one copy of hir-ty-mir the tests call.
 
 use hir_def::FunctionId;
+use hir_expand::fixture;
 use hir_ty::{InferBodyId, db::HirDatabase};
 use hir_ty_mir::mir::{
     CallerLocation, InlinedBody, MirBody, MirOptLevel, MirOptions, MirSpan, TerminatorKind,
     caller_location,
 };
-use hir_expand::fixture;
 
 use crate::{db::TestDB, function};
 

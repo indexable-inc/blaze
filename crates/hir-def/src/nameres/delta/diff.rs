@@ -20,7 +20,13 @@ use crate::{
 pub(super) type Changed = (Key, bool);
 
 /// The keys of `module` that differ between `old` and `new` (`None`: no such module).
-pub(super) fn keys(db: &Db, module: ModuleId, old: Option<&ModuleData>, new: Option<&ModuleData>, out: &mut Vec<Changed>) {
+pub(super) fn keys(
+    db: &Db,
+    module: ModuleId,
+    old: Option<&ModuleData>,
+    new: Option<&ModuleData>,
+    out: &mut Vec<Changed>,
+) {
     match (old, new) {
         (None, None) => {}
         (None, Some(_)) => out.push(((module, None), false)),
@@ -77,7 +83,8 @@ impl Items {
     /// Adds `scope`'s, the module at `pos`.
     pub(super) fn add(&mut self, scope: &ItemScope, pos: &Pos) {
         self.impls.extend((0u32..).zip(scope.impls()).map(|(at, it)| (it, pos.child(at))));
-        self.derive_impls.extend((0u32..).zip(scope.builtin_derive_impls()).map(|(at, it)| (it, pos.child(at))));
+        self.derive_impls
+            .extend((0u32..).zip(scope.builtin_derive_impls()).map(|(at, it)| (it, pos.child(at))));
         self.traits.extend(scope.declarations().filter_map(|it| match it {
             ModuleDefId::TraitId(it) => Some(it),
             _ => None,
@@ -170,7 +177,13 @@ pub(super) fn update_positions(state: &mut CrateState) -> Vec<ModuleId> {
 }
 
 /// The items of `modules` (of one group, at `pos`) as `rows` has them.
-pub(super) fn items_of(db: &Db, rows: &ModulesMap, modules: &[ModuleId], pos: &Pos, into: &mut Items) {
+pub(super) fn items_of(
+    db: &Db,
+    rows: &ModulesMap,
+    modules: &[ModuleId],
+    pos: &Pos,
+    into: &mut Items,
+) {
     let base = pos.child(0);
     for (at, &module) in (0u32..).zip(modules) {
         if let Some(row) = rows.get(&module) {

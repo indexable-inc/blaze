@@ -14,7 +14,12 @@ const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
 /// A line cargo writes at `level` saying `message`, of `unit`.
-pub(crate) fn cargo(level: Level, message: String, unit: Option<UnitOf>, color: bool) -> Diagnostic {
+pub(crate) fn cargo(
+    level: Level,
+    message: String,
+    unit: Option<UnitOf>,
+    color: bool,
+) -> Diagnostic {
     let rendered = rendered(level, &message, color);
     Diagnostic {
         level,
@@ -39,7 +44,7 @@ pub(crate) fn rendered(level: Level, message: &str, color: bool) -> String {
         Level::FailureNote => {
             return match color {
                 true => format!("{BOLD}{message}{RESET}\n"), // alloc: a diagnostic's text, once
-                false => format!("{message}\n"), // alloc: as above
+                false => format!("{message}\n"),             // alloc: as above
             };
         }
     };

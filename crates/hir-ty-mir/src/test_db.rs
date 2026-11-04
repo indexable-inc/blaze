@@ -3,10 +3,10 @@
 use base_db::{Db, all_crates, relevant_crates};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{ModuleId, nameres::crate_def_map};
 use hir_expand::EditionedFileId;
 use span::FileId;
+use std::alloc::Global;
 use syntax::TextRange;
 use test_utils::extract_annotations;
 

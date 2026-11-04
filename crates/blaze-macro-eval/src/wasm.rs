@@ -46,16 +46,16 @@ use proc_macro_api::kept::{Keeps, Put, put};
 use span::{Edition, Span};
 use wasmtime::InstancePre;
 
-pub use self::{
-    code::Loads,
-    glue::{MODULE as GLUE_MODULE, wasm_glue},
-};
 use self::{
     abi::Mismatch,
     code::{Codes, module_id},
     engine::Engines,
     host::{Cx, Host, Watch},
     statics::{List, Statics},
+};
+pub use self::{
+    code::Loads,
+    glue::{MODULE as GLUE_MODULE, wasm_glue},
 };
 use crate::{
     guest::Stop,
@@ -91,8 +91,12 @@ impl fmt::Display for LoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LoadError::Compile(why) => write!(f, "does not compile: {why}"),
-            LoadError::Serialize(why) => write!(f, "compiled, but its machine code can't be kept: {why}"),
-            LoadError::Cached(why) => write!(f, "has machine code in the store that can't be used: {why}"),
+            LoadError::Serialize(why) => {
+                write!(f, "compiled, but its machine code can't be kept: {why}")
+            }
+            LoadError::Cached(why) => {
+                write!(f, "has machine code in the store that can't be used: {why}")
+            }
             LoadError::NotLocal { origin: Origin::Own, kind } => write!(
                 f,
                 "has a {} value in the daemon's store under its machine code's key, where only the \
@@ -143,7 +147,10 @@ impl Modules {
 
 impl fmt::Debug for Modules {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Modules").field("code", &self.engines.code).field("loads", &self.loads()).finish()
+        f.debug_struct("Modules")
+            .field("code", &self.engines.code)
+            .field("loads", &self.loads())
+            .finish()
     }
 }
 
@@ -176,7 +183,12 @@ impl Library {
     /// The module `bytes`, of the crate `what` names, loaded with the daemon's `modules` from
     /// the store its expansions are kept in (`keeps`); a module it compiled is left for that
     /// store's owner to publish. Keeping nothing, it compiles and keeps nothing.
-    pub(crate) fn load(modules: &Modules, keeps: &Keeps, bytes: &[u8], what: &str) -> Result<Library, LoadError> {
+    pub(crate) fn load(
+        modules: &Modules,
+        keeps: &Keeps,
+        bytes: &[u8],
+        what: &str,
+    ) -> Result<Library, LoadError> {
         let store = match keeps {
             Keeps::In(keeping) => Some(&keeping.expansions.store),
             Keeps::Nothing(_) => None,
@@ -200,9 +212,12 @@ impl Library {
         let loaded = codes.load(engines, id, bytes, store, what)?;
         abi::check(&loaded.module).map_err(LoadError::Mismatch)?;
         // alloc: error path
-        let linker = host::linker(&engines.engine).map_err(|e| LoadError::Link(format!("{e:#}")))?;
+        let linker =
+            host::linker(&engines.engine).map_err(|e| LoadError::Link(format!("{e:#}")))?;
         // alloc: error path
-        let pre = linker.instantiate_pre(&loaded.module).map_err(|e| LoadError::Link(format!("{e:#}")))?;
+        let pre = linker
+            .instantiate_pre(&loaded.module)
+            .map_err(|e| LoadError::Link(format!("{e:#}")))?;
         let list = List::parse(bytes).map_err(LoadError::Statics)?;
         // alloc: once a module loaded
         let statics = Arc::new(Statics::unresolved(&list));
@@ -214,7 +229,8 @@ impl Library {
     /// aside. Until then, a module whose list names any runs nothing.
     pub(crate) fn watch(&mut self, db: &Db, krate: Crate) -> Result<(), LoadError> {
         // alloc: once a module loaded
-        self.statics = Arc::new(Statics::resolve(db, krate, &self.list).map_err(LoadError::Statics)?);
+        self.statics =
+            Arc::new(Statics::resolve(db, krate, &self.list).map_err(LoadError::Statics)?);
         Ok(())
     }
 
@@ -227,7 +243,10 @@ impl Library {
     /// crate's code and the module's id, so a module the code generator made otherwise from the
     /// same source (a fix of a backend, a stencil or LLVM) runs other code.
     pub(crate) fn runs(&self, code: ContentId) -> ContentId {
-        blaze_ids::Hasher::new("the code a proc-macro crate's macros run in its wasm module 1").part(&code.0).part(&self.id.0).finish()
+        blaze_ids::Hasher::new("the code a proc-macro crate's macros run in its wasm module 1")
+            .part(&code.0)
+            .part(&self.id.0)
+            .finish()
     }
 
     /// Runs the macro at `index` (of `run::functions`) on the one expansion of `expansions`,
@@ -315,22 +334,23 @@ impl Library {
         let env = env.clone();
         // alloc: the call's directory, given to the expansion's thread once per expansion
         let cwd = cwd.to_owned();
-        let (ran, used, watch) = thread::run(db, move |link: &thread::Link<(Result<Ran, Stop>, host::Used, Watch)>| {
-            let mut cx = Cx::new(link, server, Os::wasm_in(&env, &cwd));
-            let (output, used) = host::expand(&pre, &mut cx, index, &input, &mut watch);
-            let Cx { server, os, .. } = cx;
-            let ran = output.map(|output| Ran {
-                output,
-                asked: server.asked,
-                tracked: server.tracked,
-                emitted: server.emitted,
-                // alloc: once per expansion, what it read, given to the key
-                seen: os.seen().map(|(seen, what)| (seen, what.to_owned())).collect(),
-                unkeyable: os.unkeyable().map(str::to_owned),
-                statics: Vec::new(),
-            });
-            (ran, used, watch)
-        })?;
+        let (ran, used, watch) =
+            thread::run(db, move |link: &thread::Link<(Result<Ran, Stop>, host::Used, Watch)>| {
+                let mut cx = Cx::new(link, server, Os::wasm_in(&env, &cwd));
+                let (output, used) = host::expand(&pre, &mut cx, index, &input, &mut watch);
+                let Cx { server, os, .. } = cx;
+                let ran = output.map(|output| Ran {
+                    output,
+                    asked: server.asked,
+                    tracked: server.tracked,
+                    emitted: server.emitted,
+                    // alloc: once per expansion, what it read, given to the key
+                    seen: os.seen().map(|(seen, what)| (seen, what.to_owned())).collect(),
+                    unkeyable: os.unkeyable().map(str::to_owned),
+                    statics: Vec::new(),
+                });
+                (ran, used, watch)
+            })?;
         spent.steps = used.fuel;
         spent.peak_bytes = used.peak_bytes;
         spent.over = used.over;

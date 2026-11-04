@@ -3,8 +3,8 @@
 
 use base_db::EditionedFileId;
 use blaze_alloc_count::assert_at_most;
-use syntax::{SyntaxKind, SyntaxNodePtr, TextRange, view};
 use hir_expand::fixture;
+use syntax::{SyntaxKind, SyntaxNodePtr, TextRange, view};
 
 use super::db::TestDB;
 use crate::{Adt, Crate, ModuleDef, Variant, semantics::view::Semantics};
@@ -224,8 +224,18 @@ fn the_accessors_iterator_forms_allocate_nothing() {
             )
         };
         let expected = warm(&db);
-        let (children, decls, impls, _legacy, fields, variant_fields, shape_fields, items, impl_items, modules) =
-            expected;
+        let (
+            children,
+            decls,
+            impls,
+            _legacy,
+            fields,
+            variant_fields,
+            shape_fields,
+            items,
+            impl_items,
+            modules,
+        ) = expected;
         assert_eq!((children, decls, impls), (1, 3, 1), "`inner` declares Point, Shape, Area");
         assert_eq!((fields, variant_fields, shape_fields), (2, 2, 3));
         assert_eq!((items, impl_items, modules), (1, 1, 2));
@@ -269,9 +279,12 @@ pub mod needles { pub struct Inner; }
         assert_eq!(again, first);
         // The same items in the same order on every search.
         let order = |db: &TestDB| {
-            main.query_external_importables(db, &hir_def::import_map::Query::new("needle".to_owned()))
-                .map(|(item, _)| item)
-                .collect::<Vec<_>>()
+            main.query_external_importables(
+                db,
+                &hir_def::import_map::Query::new("needle".to_owned()),
+            )
+            .map(|(item, _)| item)
+            .collect::<Vec<_>>()
         };
         assert_eq!(order(&db), order(&db));
     });
@@ -280,15 +293,23 @@ pub mod needles { pub struct Inner; }
 #[test]
 fn kmerge2_is_kmerge_by() {
     use itertools::Itertools as _;
-    let cases: [(&[u32], &[u32]); 6] =
-        [(&[], &[]), (&[1, 3], &[]), (&[], &[2]), (&[1, 3, 5], &[2, 3, 4]), (&[2, 2], &[2, 2]), (&[5], &[1, 2, 9])];
+    let cases: [(&[u32], &[u32]); 6] = [
+        (&[], &[]),
+        (&[1, 3], &[]),
+        (&[], &[2]),
+        (&[1, 3, 5], &[2, 3, 4]),
+        (&[2, 2], &[2, 2]),
+        (&[5], &[1, 2, 9]),
+    ];
     for (left, right) in cases {
         // Tag each item with its side, so a tie's order is checked too.
         let tagged = |side: u8, items: &'static [u32]| items.iter().map(move |&it| (it, side));
         let less = |a: &(u32, u8), b: &(u32, u8)| a.0 < b.0;
         let ours: Vec<_> =
-            crate::semantics::kmerge2([tagged(0, left), tagged(1, right)].into_iter(), less).collect();
-        let theirs: Vec<_> = [tagged(0, left), tagged(1, right)].into_iter().kmerge_by(less).collect();
+            crate::semantics::kmerge2([tagged(0, left), tagged(1, right)].into_iter(), less)
+                .collect();
+        let theirs: Vec<_> =
+            [tagged(0, left), tagged(1, right)].into_iter().kmerge_by(less).collect();
         assert_eq!(ours, theirs, "{left:?} and {right:?}");
     }
 }
@@ -303,6 +324,7 @@ fn recycle_keeps_the_allocation() {
     assert_eq!(lent.as_ptr().cast::<u8>(), ptr, "the same allocation");
     assert!(lent.capacity() >= 16 && lent.is_empty());
     lent.push(&local);
-    let back: Vec<&'static str> = assert_at_most(0, "recycle back", || crate::scratch::recycle(lent));
+    let back: Vec<&'static str> =
+        assert_at_most(0, "recycle back", || crate::scratch::recycle(lent));
     assert_eq!(back.as_ptr().cast::<u8>(), ptr);
 }

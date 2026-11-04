@@ -44,8 +44,8 @@ use crate::{
 };
 
 use super::{
-    AliasTermKind, AssocTyId, ClauseKind, TraitAssocTyId, DbInterner, GenericArgs, ImplTraitIdx, Region, RegionKind,
-    StoredVariancesOf, Ty, TyKind, VariancesOf,
+    AliasTermKind, AssocTyId, ClauseKind, DbInterner, GenericArgs, ImplTraitIdx, Region,
+    RegionKind, StoredVariancesOf, TraitAssocTyId, Ty, TyKind, VariancesOf,
     generics::{Generics, generics},
 };
 
@@ -68,7 +68,10 @@ pub(crate) fn opt_alias_variances<'db>(
     match kind {
         AliasTermKind::OpaqueTy { def_id } => Some(variances_of_opaque(interner, def_id.0)),
         AliasTermKind::ProjectionTy { def_id: TraitAssocTyId(AssocTyId::RpititId(rpitit)) } => {
-            Some(rustc_type_ir::Interner::variances_of(interner, super::SolverDefId::RpititId(rpitit)))
+            Some(rustc_type_ir::Interner::variances_of(
+                interner,
+                super::SolverDefId::RpititId(rpitit),
+            ))
         }
         AliasTermKind::ProjectionTy { .. }
         | AliasTermKind::InherentTy { .. }
@@ -334,9 +337,9 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collector<'_, 'db> {
 mod tests {
     use base_db::{Crate, Db};
     use hir_def::{FunctionId, GenericParamId, ModuleDefId, nameres::crate_def_map};
+    use hir_expand::fixture;
     use hir_expand::name::Name;
     use rustc_type_ir::Variance;
-    use hir_expand::fixture;
 
     use super::{opt_alias_variances, variances_of_opaque};
     use crate::{
@@ -393,9 +396,9 @@ mod tests {
             .zip(variances.iter())
             .map(|((param, data), variance)| {
                 let name = match param {
-                    GenericParamId::LifetimeParamId(_) => Some(
-                        data.map_or_else(|| "'_".to_owned(), |it| it.name.as_str().to_owned()),
-                    ),
+                    GenericParamId::LifetimeParamId(_) => {
+                        Some(data.map_or_else(|| "'_".to_owned(), |it| it.name.as_str().to_owned()))
+                    }
                     _ => None,
                 };
                 (name, variance)

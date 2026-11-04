@@ -28,19 +28,11 @@ pub struct Pattern {
 
 impl Pattern {
     pub fn str(value: impl Into<String>) -> Self {
-        Pattern {
-            kind: PatternKind::Str,
-            value: value.into(),
-            flags: String::new(),
-        }
+        Pattern { kind: PatternKind::Str, value: value.into(), flags: String::new() }
     }
 
     pub fn re(value: impl Into<String>) -> Self {
-        Pattern {
-            kind: PatternKind::Re,
-            value: value.into(),
-            flags: String::new(),
-        }
+        Pattern { kind: PatternKind::Re, value: value.into(), flags: String::new() }
     }
 
     pub fn with_flags(mut self, flags: &str) -> Self {

@@ -71,7 +71,8 @@ impl HyperHttp {
             clippy::disallowed_types,
             reason = "the process's one HTTP client: its runtime and connection pool are shared by every fetch"
         )]
-        static SHARED: std::sync::OnceLock<Result<Arc<HyperHttp>, String>> = std::sync::OnceLock::new();
+        static SHARED: std::sync::OnceLock<Result<Arc<HyperHttp>, String>> =
+            std::sync::OnceLock::new();
         let shared = SHARED.get_or_init(|| {
             HyperHttp::new(Duration::from_secs(30)).map(Arc::new).map_err(|e| format!("{e:#}"))
         });
@@ -104,7 +105,14 @@ impl HyperHttp {
         headers: &[(&str, &str)],
         bounds: Bounds,
     ) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.fetch(Method::GET, url, headers, Bytes::new(), bounds, None))
+        self.runtime.block_on(self.client.fetch(
+            Method::GET,
+            url,
+            headers,
+            Bytes::new(),
+            bounds,
+            None,
+        ))
     }
 }
 
@@ -192,8 +200,12 @@ impl Requests {
                 let encoded = headers.iter().find(|(name, _)| name == "content-encoding");
                 // A server's answer, not a lost connection: asking again gets the same, so it is
                 // no `Transport` error and never tried again.
-                if let Some((_, encoding)) = encoded.filter(|(_, it)| !it.eq_ignore_ascii_case("identity")) {
-                    anyhow::bail!("{said} sent its body as `{encoding}`, which was not asked for, so none of it was kept");
+                if let Some((_, encoding)) =
+                    encoded.filter(|(_, it)| !it.eq_ignore_ascii_case("identity"))
+                {
+                    anyhow::bail!(
+                        "{said} sent its body as `{encoding}`, which was not asked for, so none of it was kept"
+                    );
                 }
                 let mut sent = 0u64;
                 while let Some(chunk) = self.next(&mut body, &said).await? {
@@ -263,8 +275,20 @@ impl Http for HyperHttp {
         self.send(Method::GET, url, headers, Vec::new())
     }
 
-    fn stream(&self, url: &str, headers: &[(&str, &str)], sink: Sink<'_>) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.fetch(Method::GET, url, headers, Bytes::new(), Bounds::NONE, Some(sink)))
+    fn stream(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        sink: Sink<'_>,
+    ) -> anyhow::Result<Response> {
+        self.runtime.block_on(self.client.fetch(
+            Method::GET,
+            url,
+            headers,
+            Bytes::new(),
+            Bounds::NONE,
+            Some(sink),
+        ))
     }
 
     fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
@@ -347,9 +371,12 @@ mod tests {
     fn a_stalled_transfer_says_no_credential() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let to = format!("http://127.0.0.1:{port}/b?X-Amz-Credential=me@example&X-Amz-Signature=secret");
+        let to =
+            format!("http://127.0.0.1:{port}/b?X-Amz-Credential=me@example&X-Amz-Signature=secret");
         let answers = [
-            format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
             "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc".to_owned(),
         ];
         std::thread::Builder::new()

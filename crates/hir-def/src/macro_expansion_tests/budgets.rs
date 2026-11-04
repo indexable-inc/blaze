@@ -1,8 +1,8 @@
 //! Allocation budgets of the expansion queries' memo hits: once a call is expanded, reading its
 //! expansion, argument, span map and ast id map again allocates nothing.
 
-use hir_expand::{HirFileId, MacroCallId, MacroCallKind};
 use hir_expand::fixture;
+use hir_expand::{HirFileId, MacroCallId, MacroCallKind};
 
 use super::builtin_errors::macro_calls;
 use crate::test_db::TestDB;

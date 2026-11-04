@@ -44,7 +44,7 @@
 // alloc: only with `KeyHashing`, which folds a key's own words: no SipHash.
 use std::collections::HashMap;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, Tag, frame};
 use either::Either;
@@ -323,10 +323,7 @@ const _: () = assert!(size_of::<AnyImpl>() == 8);
 /// an interface hash, holding what bodies leak, may reach. A built-in derive impl has no item
 /// of its own: it is what the derive writes for its type, so it is its key (which names the
 /// trait) and the type's signature.
-pub(crate) fn impl_signature(
-    db: &Db,
-    imp: AnyImpl,
-) -> Result<SignatureHash, Unhashable> {
+pub(crate) fn impl_signature(db: &Db, imp: AnyImpl) -> Result<SignatureHash, Unhashable> {
     match imp {
         AnyImpl::Impl(it) => hash::signature_hash(db, ItemId::Impl(it)),
         AnyImpl::BuiltinDerive(it) => {
@@ -537,7 +534,8 @@ impl<S: Copy + Ord, T: Copy> Runs<S, T> {
     /// The columns of `rows`, which it sorts.
     fn new(rows: &mut [(Option<S>, ItemKey, T)]) -> Self {
         rows.sort_unstable_by_key(|&(at, key, _)| (at, key));
-        let opens = |row: usize| rows[row].0.is_some() && (row == 0 || rows[row - 1].0 != rows[row].0);
+        let opens =
+            |row: usize| rows[row].0.is_some() && (row == 0 || rows[row - 1].0 != rows[row].0);
         let runs = (0..rows.len()).filter(|&row| opens(row)).count();
         let mut searched = Vec::with_capacity(runs);
         let mut starts = Vec::with_capacity(runs + 1);
@@ -626,11 +624,7 @@ impl<T: Copy> Keyed<T> {
 /// The impls of `trait_` in `krate`, by simplified self type (the blanket ones as their own
 /// run, first), then key.
 #[blaze_query::tracked(returns(ref))]
-fn trait_impls_in(
-    db: &Db,
-    krate: Crate,
-    trait_: TraitId,
-) -> Runs<SimplifiedType, AnyImpl> {
+fn trait_impls_in(db: &Db, krate: Crate, trait_: TraitId) -> Runs<SimplifiedType, AnyImpl> {
     frame::task(Tag::Other, |frame| {
         let mut found: Vec<_, &Frame> = Vec::new_in(frame);
         TraitImpls::for_crate_and_trait(db, krate, trait_).for_trait(trait_, |impls| match impls {
@@ -708,22 +702,14 @@ fn inherent_modules_of(db: &Db, krate: Crate, self_ty: SimplifiedType) -> Box<[M
 /// The inherent impls of `module` for `self_ty`, sorted by key: equal unless one for that
 /// type is added there or removed.
 #[blaze_query::tracked(returns(ref))]
-fn module_inherent_impls_of(
-    db: &Db,
-    module: ModuleId,
-    self_ty: SimplifiedType,
-) -> Keyed<ImplId> {
+fn module_inherent_impls_of(db: &Db, module: ModuleId, self_ty: SimplifiedType) -> Keyed<ImplId> {
     Keyed::of(inherent_impls_in_module(db, module).run(Some(self_ty)).iter())
 }
 
 /// The inherent impls for `self_ty` of the crates `krate` sees ([`loaded_crates`]), sorted by
 /// key. Reads, in each crate, only the modules with impls for that type.
 #[blaze_query::tracked(returns(ref))]
-pub(crate) fn inherent_impls_of(
-    db: &Db,
-    krate: Crate,
-    self_ty: SimplifiedType,
-) -> Keyed<ImplId> {
+pub(crate) fn inherent_impls_of(db: &Db, krate: Crate, self_ty: SimplifiedType) -> Keyed<ImplId> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
         for &seen in loaded_crates(db, krate) {
@@ -977,11 +963,13 @@ fn assoc_names(
     frame: &Frame,
 ) -> ScopeNames {
     let mut rows: Vec<_, &Frame> = Vec::with_capacity_in(items.len(), frame);
-    rows.extend(name_hashes(items.iter().map(|(name, _)| name.as_str())).into_iter().zip(items).map(
-        |(name, &(_, item))| {
-            (name, key::item_key(db, ItemId::from(item)), vis(db, item.assoc_visibility(db)))
-        },
-    ));
+    rows.extend(
+        name_hashes(items.iter().map(|(name, _)| name.as_str())).into_iter().zip(items).map(
+            |(name, &(_, item))| {
+                (name, key::item_key(db, ItemId::from(item)), vis(db, item.assoc_visibility(db)))
+            },
+        ),
+    );
     rows.sort_unstable_by_key(|&(name, key, _)| (name, key));
     let opens = |row: usize| row == 0 || rows[row - 1].0 != rows[row].0;
     let runs = (0..rows.len()).filter(|&row| opens(row)).count();

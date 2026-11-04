@@ -77,7 +77,8 @@ fn body() -> Valid {
 fn valid() -> &'static [Valid] {
     static VALID: OnceLock<Vec<Valid>> = OnceLock::new();
     VALID.get_or_init(|| {
-        let empty = Body { store: ExpressionStore::empty_owned(), params: Box::new([]), self_param: None };
+        let empty =
+            Body { store: ExpressionStore::empty_owned(), params: Box::new([]), self_param: None };
         vec![Valid { bytes: blaze_format::to_bytes(&empty), columns: Vec::new() }, body()]
     })
 }
@@ -103,7 +104,10 @@ mod tests {
         for (at, valid) in super::valid().iter().enumerate() {
             let body = super::decode(&Aligned::copy_from(&valid.bytes))
                 .unwrap_or_else(|error| panic!("valid body {at} does not decode: {error}"));
-            assert!(blaze_format::to_bytes(&body) == valid.bytes, "valid body {at} is written as other bytes");
+            assert!(
+                blaze_format::to_bytes(&body) == valid.bytes,
+                "valid body {at} is written as other bytes"
+            );
         }
     }
 }

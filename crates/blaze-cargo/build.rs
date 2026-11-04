@@ -26,7 +26,8 @@ fn linux_interpose() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
     }
-    let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("libblaze_sandbox_interpose.so");
+    let out =
+        PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("libblaze_sandbox_interpose.so");
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
     let status = std::process::Command::new(&cc)
         .args(["-shared", "-fPIC", "-O2", "-Wall"])

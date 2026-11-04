@@ -9,11 +9,7 @@ use crate::common::{
 
 pub fn expand_main(attr: TokenStream, item: TokenStream) -> TokenStream {
     let main_args: SettingsAttrArgs = if attr.is_empty() {
-        SettingsAttrArgs {
-            settings: None,
-            profile: None,
-            settings_args: Vec::new(),
-        }
+        SettingsAttrArgs { settings: None, profile: None, settings_args: Vec::new() }
     } else {
         match syn::parse2(attr) {
             Ok(args) => args,

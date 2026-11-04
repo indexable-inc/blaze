@@ -22,15 +22,12 @@ use std::{
     },
 };
 
+use crate::{FileId, VfsPath};
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, scratch};
 use blaze_query::db::{Durability, Setter};
-use crate::{FileId, VfsPath};
 
-use crate::{
-    Db, InputId, SourceRoot, content,
-    table::Table,
-};
+use crate::{Db, InputId, SourceRoot, content, table::Table};
 
 pub(crate) const BUCKETS: usize = 64;
 
@@ -168,14 +165,11 @@ impl Named {
             // alloc: the 64 bucket inputs, made once per database.
             let buckets: Box<[PathBucket]> = (0..BUCKETS)
                 .map(|bucket| {
-                    PathBucket::builder(InputId(self.content(bucket)))
-                        .durability(Durability::MEDIUM)
-                        .new(&*db)
+                    PathBucket::new(&*db, Durability::MEDIUM, InputId(self.content(bucket)))
                 })
                 .collect(); // alloc: as above.
             let table = PathTable(self.table.clone()); // clone: a refcount, once per database.
-            self.input =
-                Some(NamedPaths::builder(table, buckets).durability(Durability::HIGH).new(db));
+            self.input = Some(NamedPaths::new(db, Durability::HIGH, table, buckets));
             return;
         };
         while dirty != 0 {

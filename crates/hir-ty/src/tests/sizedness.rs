@@ -10,8 +10,8 @@ use hir_def::{
     nameres::crate_def_map,
     signatures::{FunctionSignature, TraitSignature, TypeAliasSignature},
 };
-use rustc_type_ir::inherent::{Clause as _, IntoKind as _};
 use hir_expand::fixture;
+use rustc_type_ir::inherent::{Clause as _, IntoKind as _};
 
 use crate::{
     GenericPredicates,
@@ -45,7 +45,9 @@ fn trait_named(db: &Db, name: &str) -> TraitId {
     declarations(db)
         .into_iter()
         .find_map(|def| match def {
-            ModuleDefId::TraitId(it) if TraitSignature::of(db, it).name.as_str() == name => Some(it),
+            ModuleDefId::TraitId(it) if TraitSignature::of(db, it).name.as_str() == name => {
+                Some(it)
+            }
             _ => None,
         })
         .unwrap_or_else(|| panic!("no trait `{name}` in the fixture"))

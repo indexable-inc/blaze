@@ -101,7 +101,10 @@ mod tests {
         for (at, valid) in super::valid().iter().enumerate() {
             let map = super::decode(&Aligned::copy_from(&valid.bytes))
                 .unwrap_or_else(|error| panic!("valid source map {at} does not decode: {error}"));
-            assert!(blaze_format::to_bytes(&map) == valid.bytes, "valid source map {at} is written as other bytes");
+            assert!(
+                blaze_format::to_bytes(&map) == valid.bytes,
+                "valid source map {at} is written as other bytes"
+            );
         }
     }
 }

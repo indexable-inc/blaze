@@ -12,8 +12,9 @@ use blaze_vfs::{Mode, Op};
 use parking_lot::Mutex;
 
 use super::{
-    GITHUB_RETRIES, Post, Posts, batches, listen, load, post, save, waited,
+    GITHUB_RETRIES, Post, Posts, batches, listen,
     listen::{Listener, Seen},
+    load, post, save, waited,
 };
 use crate::{
     CheckRun, CheckStatus, Checkout, Event,
@@ -29,7 +30,9 @@ fn temp(name: &str) -> std::path::PathBuf {
 
 fn cost(op: &Op) -> usize {
     match op {
-        Op::Write { path, bytes, .. } | Op::Edit { path, bytes, .. } => path.len() + bytes.len() + super::OP_OVERHEAD,
+        Op::Write { path, bytes, .. } | Op::Edit { path, bytes, .. } => {
+            path.len() + bytes.len() + super::OP_OVERHEAD
+        }
         Op::Delete { path } => path.len() + super::OP_OVERHEAD,
         Op::Rename { from, to } => from.len() + to.len() + super::OP_OVERHEAD,
     }
@@ -48,7 +51,9 @@ fn no_ops_are_one_empty_batch_and_small_ops_one_batch() {
 
 #[test]
 fn batches_stay_under_the_bound_and_keep_the_order() {
-    let ops: Vec<Op> = (0..50).map(|n| Op::Write { path: format!("f{n:02}"), bytes: vec![n; 100], mode: Mode::Regular }).collect();
+    let ops: Vec<Op> = (0..50)
+        .map(|n| Op::Write { path: format!("f{n:02}"), bytes: vec![n; 100], mode: Mode::Regular })
+        .collect();
     let cut = batches(ops.clone(), 500).unwrap();
     assert!(cut.len() > 1);
     for batch in &cut {
@@ -87,7 +92,10 @@ fn a_file_too_large_for_one_request_is_written_then_appended() {
         }
     }
     assert_eq!(rebuilt, bytes);
-    assert_eq!(flat.last(), Some(&Op::Write { path: "small".to_owned(), bytes: vec![7], mode: Mode::Regular }));
+    assert_eq!(
+        flat.last(),
+        Some(&Op::Write { path: "small".to_owned(), bytes: vec![7], mode: Mode::Regular })
+    );
     for batch in &cut {
         assert!(batch.iter().map(cost).sum::<usize>() <= 1000, "{batch:?}");
     }
@@ -217,7 +225,9 @@ fn a_warm_webhook_delivery_allocates_only_the_event_it_hands_on() {
         let mut stream = Wire { input: bytes, at: 0, written };
         listen::exchange(&mut stream, &shared, &mut parser, &mut answer);
     };
-    let answered = |status: u16, said: &str| http::response(status, &listen_headers(), format!("{said}\n").as_bytes());
+    let answered = |status: u16, said: &str| {
+        http::response(status, &listen_headers(), format!("{said}\n").as_bytes())
+    };
 
     for n in 0..8 {
         exchange(&wire("push", &format!("warm-{n}"), &push_body(n)), &mut written);
@@ -254,12 +264,19 @@ fn a_warm_webhook_delivery_allocates_only_the_event_it_hands_on() {
 fn a_workers_warm_reads_allocate_only_what_each_response_owns() {
     use blaze_api::{Envelope, Response, TestOutcome, TestResult, frames};
 
-    let done = |id: u64| frames::encode(&Envelope::new(id, Response::Done { ok: id % 2 == 0 })).unwrap();
+    let done =
+        |id: u64| frames::encode(&Envelope::new(id, Response::Done { ok: id % 2 == 0 })).unwrap();
     let batch: Vec<u8> = (0..32).flat_map(|id| done(id)).collect();
     let mut incoming = frames::Frames::new();
     let mut seen: Vec<u64> = Vec::with_capacity(64);
     incoming.push(&batch);
-    assert_eq!(super::worker::drain(&mut incoming, |envelope| { seen.push(envelope.id); true }), Ok(true));
+    assert_eq!(
+        super::worker::drain(&mut incoming, |envelope| {
+            seen.push(envelope.id);
+            true
+        }),
+        Ok(true)
+    );
     assert_eq!(seen, (0..32).collect::<Vec<u64>>());
     seen.clear();
     incoming.push(&batch);
@@ -281,18 +298,27 @@ fn a_workers_warm_reads_allocate_only_what_each_response_owns() {
         outside: false,
         executable: 0,
     };
-    incoming.push(&frames::encode(&Envelope::new(40, Response::TestResult(result.clone()))).unwrap());
+    incoming
+        .push(&frames::encode(&Envelope::new(40, Response::TestResult(result.clone()))).unwrap());
     let mut kept = None;
-    blaze_alloc_count::assert_at_most(3, "a test result: its binary, name and output, handed to the service", || {
-        super::worker::drain(&mut incoming, |envelope| {
-            kept = Some(envelope);
-            true
-        })
-    });
+    blaze_alloc_count::assert_at_most(
+        3,
+        "a test result: its binary, name and output, handed to the service",
+        || {
+            super::worker::drain(&mut incoming, |envelope| {
+                kept = Some(envelope);
+                true
+            })
+        },
+    );
     assert_eq!(kept.map(|it| (it.id, it.body)), Some((40, Response::TestResult(result))));
 
     incoming.push(&done(41));
-    assert_eq!(super::worker::drain(&mut incoming, |_| false), Ok(false), "a worker gone stops the reader");
+    assert_eq!(
+        super::worker::drain(&mut incoming, |_| false),
+        Ok(false),
+        "a worker gone stops the reader"
+    );
 }
 
 #[test]
@@ -337,7 +363,12 @@ impl Checks for Flaky {
 }
 
 fn run_check() -> CheckRun {
-    CheckRun { name: "blaze/check".to_owned(), commit: "c".to_owned(), status: CheckStatus::Queued, summary: String::new() }
+    CheckRun {
+        name: "blaze/check".to_owned(),
+        commit: "c".to_owned(),
+        status: CheckStatus::Queued,
+        summary: String::new(),
+    }
 }
 
 #[test]
@@ -410,7 +441,8 @@ fn updates_of_different_runs_are_all_sent_in_order() {
     }
     drop(posts);
     post(&github, &receive, &service, Duration::ZERO);
-    let statuses = [(5, CheckStatus::Failure), (4, CheckStatus::Failure), (6, CheckStatus::Failure)];
+    let statuses =
+        [(5, CheckStatus::Failure), (4, CheckStatus::Failure), (6, CheckStatus::Failure)];
     assert_eq!(github.lock().updated, statuses);
 }
 
@@ -440,7 +472,14 @@ impl Checks for Slow {
 }
 
 /// Lanes as `serve` makes them, over fakes that share their counters.
-fn slow_lanes(wait: Duration) -> (Posts, Arc<std::sync::atomic::AtomicUsize>, Arc<Mutex<Vec<(u64, CheckStatus)>>>, crossbeam_channel::Receiver<Input>) {
+fn slow_lanes(
+    wait: Duration,
+) -> (
+    Posts,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<Mutex<Vec<(u64, CheckStatus)>>>,
+    crossbeam_channel::Receiver<Input>,
+) {
     let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -448,7 +487,8 @@ fn slow_lanes(wait: Duration) -> (Posts, Arc<std::sync::atomic::AtomicUsize>, Ar
     let mut lanes = Vec::new();
     for _ in 0..super::POST_LANES {
         let (to_lane, posts) = crossbeam_channel::unbounded();
-        let fake = Slow { wait, in_flight: in_flight.clone(), most: most.clone(), calls: calls.clone() };
+        let fake =
+            Slow { wait, in_flight: in_flight.clone(), most: most.clone(), calls: calls.clone() };
         let service = service.clone();
         thread::spawn(move || post(&Mutex::new(fake), &posts, &service, Duration::ZERO));
         lanes.push(to_lane);
@@ -466,7 +506,10 @@ fn the_runs_of_a_job_post_at_once_each_on_its_lane() {
     }
     let started = std::time::Instant::now();
     for _ in 0..runs {
-        assert!(matches!(inputs.recv_timeout(Duration::from_secs(5)), Ok(Input::Created { result: Ok(_), .. })));
+        assert!(matches!(
+            inputs.recv_timeout(Duration::from_secs(5)),
+            Ok(Input::Created { result: Ok(_), .. })
+        ));
     }
     assert!(most.load(std::sync::atomic::Ordering::SeqCst) > 1, "every creation was sent alone");
     assert!(started.elapsed() < Duration::from_millis(50) * runs as u32, "{:?}", started.elapsed());
@@ -481,14 +524,22 @@ fn a_runs_posts_stay_in_order_on_its_lane() {
         for run in 0..3 * super::POST_LANES as u64 {
             posts.send(update(run, run, status));
         }
-        let sent = (statuses.iter().position(|it| *it == status).unwrap() + 1) * 3 * super::POST_LANES;
-        blaze_spin::SpinWait::within("the batch's posts", Duration::from_secs(60), || calls.lock().len() >= sent);
+        let sent =
+            (statuses.iter().position(|it| *it == status).unwrap() + 1) * 3 * super::POST_LANES;
+        blaze_spin::SpinWait::within("the batch's posts", Duration::from_secs(60), || {
+            calls.lock().len() >= sent
+        });
     }
     drop(posts);
     let calls = calls.lock();
     for run in 0..3 * super::POST_LANES as u64 {
-        let seen: Vec<CheckStatus> = calls.iter().filter(|(id, _)| *id == run).map(|(_, status)| *status).collect();
-        assert!(seen.windows(2).all(|pair| statuses.iter().position(|it| *it == pair[0]) < statuses.iter().position(|it| *it == pair[1])), "{run}: {seen:?}");
+        let seen: Vec<CheckStatus> =
+            calls.iter().filter(|(id, _)| *id == run).map(|(_, status)| *status).collect();
+        assert!(
+            seen.windows(2).all(|pair| statuses.iter().position(|it| *it == pair[0])
+                < statuses.iter().position(|it| *it == pair[1])),
+            "{run}: {seen:?}"
+        );
         assert_eq!(seen.last(), Some(&CheckStatus::Failure), "{run}: {seen:?}");
     }
 }
@@ -497,8 +548,11 @@ fn a_runs_posts_stay_in_order_on_its_lane() {
 fn a_large_file_keeps_its_buffer_for_the_first_piece() {
     let bytes = vec![3u8; 2500];
     let pointer = bytes.as_ptr();
-    let cut = batches(vec![Op::Write { path: "big".to_owned(), bytes, mode: Mode::Regular }], 1000).unwrap();
-    let Some(Op::Write { bytes, .. }) = cut.into_iter().flatten().next() else { panic!("no write first") };
+    let cut = batches(vec![Op::Write { path: "big".to_owned(), bytes, mode: Mode::Regular }], 1000)
+        .unwrap();
+    let Some(Op::Write { bytes, .. }) = cut.into_iter().flatten().next() else {
+        panic!("no write first")
+    };
     assert_eq!(bytes.as_ptr(), pointer, "the first piece is the file's own buffer, not a copy");
 }
 
@@ -552,13 +606,18 @@ fn needs_loopback_a_delivery_is_checked_answered_and_handed_on_once() {
     assert_eq!(status, 401);
 
     let other = body.replace("o/r", "x/y");
-    let (status, said) = deliver(at, "d3", &sign(secret.expose(), other.as_bytes()), other.as_bytes());
+    let (status, said) =
+        deliver(at, "d3", &sign(secret.expose(), other.as_bytes()), other.as_bytes());
     assert_eq!(status, 403);
     assert!(said.contains("x/y"), "{said}");
-    assert!(inputs.recv_timeout(Duration::from_millis(200)).is_err(), "only the first was handed on");
+    assert!(
+        inputs.recv_timeout(Duration::from_millis(200)).is_err(),
+        "only the first was handed on"
+    );
 }
 
-fn loopback_listener() -> (std::net::SocketAddr, Arc<Secret>, crossbeam_channel::Receiver<Input>, Arc<Listener>) {
+fn loopback_listener()
+-> (std::net::SocketAddr, Arc<Secret>, crossbeam_channel::Receiver<Input>, Arc<Listener>) {
     let path = temp(&format!("webhook-secret-{:?}", thread::current().id()));
     std::fs::write(&path, "It's a Secret to Everybody\n").unwrap();
     let secret = Arc::new(Secret::read(&path).unwrap());
@@ -573,7 +632,10 @@ fn loopback_listener() -> (std::net::SocketAddr, Arc<Secret>, crossbeam_channel:
 }
 
 fn push_body(n: usize) -> String {
-    format!(r#"{{"ref":"refs/heads/b{n}","after":"{:040x}","repository":{{"full_name":"o/r"}}}}"#, n + 1)
+    format!(
+        r#"{{"ref":"refs/heads/b{n}","after":"{:040x}","repository":{{"full_name":"o/r"}}}}"#,
+        n + 1
+    )
 }
 
 #[test]
@@ -608,17 +670,22 @@ fn needs_loopback_deliveries_at_once_are_each_answered_by_a_kept_handler() {
 #[test]
 fn needs_loopback_a_connection_over_the_most_open_is_answered_503() {
     let (at, secret, inputs, shared) = loopback_listener();
-    let held: Vec<TcpStream> = (0..listen::MOST_CONNECTIONS).map(|_| TcpStream::connect(at).unwrap()).collect();
+    let held: Vec<TcpStream> =
+        (0..listen::MOST_CONNECTIONS).map(|_| TcpStream::connect(at).unwrap()).collect();
     let open = |count: usize, what: &str| {
         blaze_spin::SpinWait::within(what, Duration::from_secs(60), || shared.open() == count);
     };
     open(listen::MOST_CONNECTIONS, "the listener to take every held connection");
     let body = push_body(0);
-    let (status, said) = deliver(at, "over", &sign(secret.expose(), body.as_bytes()), body.as_bytes());
+    let (status, said) =
+        deliver(at, "over", &sign(secret.expose(), body.as_bytes()), body.as_bytes());
     assert_eq!(status, 503, "{said}");
     drop(held);
     open(0, "the listener to let go of the held connections");
-    assert_eq!(deliver(at, "after", &sign(secret.expose(), body.as_bytes()), body.as_bytes()).0, 202);
+    assert_eq!(
+        deliver(at, "after", &sign(secret.expose(), body.as_bytes()), body.as_bytes()).0,
+        202
+    );
     assert!(matches!(inputs.recv_timeout(Duration::from_secs(5)), Ok(Input::Event(_))));
 }
 

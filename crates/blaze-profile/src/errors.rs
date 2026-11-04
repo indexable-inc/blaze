@@ -8,7 +8,8 @@
 //! names functions blaze could not compile ([`REFUSED_SAYS`]) is a row a function named.
 
 use arrow_array::{
-    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array, types::UInt32Type,
+    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    types::UInt32Type,
 };
 use arrow_schema::ArrowError;
 
@@ -176,7 +177,9 @@ pub fn rows(said: Said<'_>, of: Of<'_>, out: &mut Vec<ErrorRow>) {
     let kind = Kind::of(first);
     if kind != Kind::Refused {
         let function = match kind {
-            Kind::DerivePanic | Kind::AttrPanic | Kind::MacroPanic => said.detail.and_then(proc_macro),
+            Kind::DerivePanic | Kind::AttrPanic | Kind::MacroPanic => {
+                said.detail.and_then(proc_macro)
+            }
             _ => None,
         };
         out.push(row(kind.name(), function.as_deref(), said.detail));
@@ -266,7 +269,8 @@ pub fn from_log(log: &str) -> Vec<ErrorRow> {
                 let (krate, rest) = unit.split_once('`').unwrap_or((unit, ""));
                 let target = rest.trim_start().strip_prefix('(').and_then(|it| it.split_once(')'));
                 // alloc: a row an error a build said
-                let unit = target.map_or_else(|| krate.to_owned(), |(target, _)| format!("{krate} ({target})"));
+                let unit = target
+                    .map_or_else(|| krate.to_owned(), |(target, _)| format!("{krate} ({target})"));
                 for row in &mut out[unowned..] {
                     // alloc: a row an error a build said
                     row.krate = Some(krate.to_owned());
@@ -277,7 +281,11 @@ pub fn from_log(log: &str) -> Vec<ErrorRow> {
                 continue;
             }
             let from = start + (line.len() - message.len());
-            open = Some(Open { said: Said { code, message, ..Said::default() }, from, end: start + line.len() });
+            open = Some(Open {
+                said: Said { code, message, ..Said::default() },
+                from,
+                end: start + line.len(),
+            });
             continue;
         }
         if line.is_empty() || !(line.starts_with(' ') || gutter(line)) {
@@ -297,7 +305,9 @@ pub fn from_log(log: &str) -> Vec<ErrorRow> {
                 it.said.file = file.or(Some(place));
                 it.said.line = line.and_then(|it| it.parse().ok());
             }
-        } else if let Some(note) = trimmed.strip_prefix("= help: ").or_else(|| trimmed.strip_prefix("= note: ")) {
+        } else if let Some(note) =
+            trimmed.strip_prefix("= help: ").or_else(|| trimmed.strip_prefix("= note: "))
+        {
             it.said.detail.get_or_insert(note.strip_prefix("message: ").unwrap_or(note));
         }
     }
@@ -406,7 +416,9 @@ blaze time: 279376.8 ms: client 279376.7 (100%), unaccounted 0.0 (0%)
 ";
 
     fn kinds(rows: &[ErrorRow]) -> Vec<(&str, Option<&str>, Option<&str>)> {
-        rows.iter().map(|it| (it.kind.as_str(), it.unit.as_deref(), it.function.as_deref())).collect()
+        rows.iter()
+            .map(|it| (it.kind.as_str(), it.unit.as_deref(), it.function.as_deref()))
+            .collect()
     }
 
     #[test]
@@ -424,14 +436,32 @@ blaze time: 279376.8 ms: client 279376.7 (100%), unaccounted 0.0 (0%)
                 ("daemon-panic", None, None),
             ]
         );
-        assert_eq!(rows[1].detail.as_deref(), Some("trait Float method is_sign_positive for [f16]: the impl found has no method"));
+        assert_eq!(
+            rows[1].detail.as_deref(),
+            Some("trait Float method is_sign_positive for [f16]: the impl found has no method")
+        );
         assert_eq!(rows[1].krate.as_deref(), Some("libm"));
-        assert!(rows[1].message.starts_with("`build-script-build` reaches 3 functions"), "{}", rows[1].message);
+        assert!(
+            rows[1].message.starts_with("`build-script-build` reaches 3 functions"),
+            "{}",
+            rows[1].message
+        );
         assert_eq!(rows[2].detail.as_deref(), Some("a body blaze does not lower"));
         let derive = &rows[3];
-        assert_eq!((derive.file.as_deref(), derive.line), (Some("crates/blaze-protocol/src/lib.rs"), Some(49)));
-        assert!(derive.detail.as_deref().is_some_and(|it| it.starts_with("the proc macro `Deserialize`")));
-        assert_eq!((rows[4].file.as_deref(), rows[4].line), (Some("crates/blaze-core/src/threads.rs"), Some(396)));
+        assert_eq!(
+            (derive.file.as_deref(), derive.line),
+            (Some("crates/blaze-protocol/src/lib.rs"), Some(49))
+        );
+        assert!(
+            derive
+                .detail
+                .as_deref()
+                .is_some_and(|it| it.starts_with("the proc macro `Deserialize`"))
+        );
+        assert_eq!(
+            (rows[4].file.as_deref(), rows[4].line),
+            (Some("crates/blaze-core/src/threads.rs"), Some(396))
+        );
         assert_eq!(rows[4].detail.as_deref(), Some("required by a bound"));
     }
 
@@ -439,21 +469,42 @@ blaze time: 279376.8 ms: client 279376.7 (100%), unaccounted 0.0 (0%)
     fn a_said_error_with_a_code_is_of_that_code() {
         let mut out = Vec::new();
         let of = Of { build_id: 7, t_ns: Some(5), krate: Some("app"), unit: Some("app (lib)") };
-        rows(Said { code: Some("E0411"), message: "cannot find type `Self`", ..Said::default() }, of, &mut out);
-        rows(Said { code: Some("unused_must_use"), message: "unused result", ..Said::default() }, of, &mut out);
+        rows(
+            Said { code: Some("E0411"), message: "cannot find type `Self`", ..Said::default() },
+            of,
+            &mut out,
+        );
+        rows(
+            Said { code: Some("unused_must_use"), message: "unused result", ..Said::default() },
+            of,
+            &mut out,
+        );
         rows(Said { message: "something new", ..Said::default() }, of, &mut out);
         assert_eq!(
-            out.iter().map(|it| (it.build_id, it.kind.as_str(), it.krate.as_deref())).collect::<Vec<_>>(),
-            [(7, "E0411", Some("app")), (7, "unused_must_use", Some("app")), (7, "uncoded", Some("app"))]
+            out.iter()
+                .map(|it| (it.build_id, it.kind.as_str(), it.krate.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (7, "E0411", Some("app")),
+                (7, "unused_must_use", Some("app")),
+                (7, "uncoded", Some("app"))
+            ]
         );
     }
 
     #[test]
     fn every_kind_has_its_own_name() {
-        let names: std::collections::BTreeSet<&str> = Kind::ALL.iter().map(|it| it.name()).collect();
+        let names: std::collections::BTreeSet<&str> =
+            Kind::ALL.iter().map(|it| it.name()).collect();
         assert_eq!(names.len(), Kind::ALL.len());
         for kind in Kind::ALL {
-            assert!(schema::ERRORS.columns.iter().any(|it| it.name == "kind" && it.doc.contains(kind.name())), "{kind:?}");
+            assert!(
+                schema::ERRORS
+                    .columns
+                    .iter()
+                    .any(|it| it.name == "kind" && it.doc.contains(kind.name())),
+                "{kind:?}"
+            );
         }
     }
 

@@ -431,7 +431,10 @@ fn guarded() -> Box<Big> {
 "#;
 
 /// The optimized bodies of `names` in [`BOX`] at `level`, given to `check` with the database.
-fn with_box_bodies(level: MirOptLevel, check: impl FnOnce(&base_db::Db, &[&crate::mir::MirBody<'_>])) {
+fn with_box_bodies(
+    level: MirOptLevel,
+    check: impl FnOnce(&base_db::Db, &[&crate::mir::MirBody<'_>]),
+) {
     let _tracing = setup_tracing();
     let fx = fixture::db(BOX);
     let file_id = fx.only_file();
@@ -444,13 +447,18 @@ fn with_box_bodies(level: MirOptLevel, check: impl FnOnce(&base_db::Db, &[&crate
             scope
                 .declarations()
                 .find_map(|it| match it {
-                    ModuleDefId::FunctionId(it) if FunctionSignature::of(&db, it).name.as_str() == name => Some(it),
+                    ModuleDefId::FunctionId(it)
+                        if FunctionSignature::of(&db, it).name.as_str() == name =>
+                    {
+                        Some(it)
+                    }
                     _ => None,
                 })
                 .expect("no such function")
         };
         let options = MirOptions::at(level);
-        let bodies = ["array", "guarded", "nested"].map(|name| db.optimized_mir_body(func(name).into(), options).unwrap());
+        let bodies = ["array", "guarded", "nested"]
+            .map(|name| db.optimized_mir_body(func(name).into(), options).unwrap());
         check(&db, &bodies);
     })
 }
@@ -491,11 +499,17 @@ fn box_new_of_a_64k_array_builds_it_in_the_box() {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(repeats, [true], "the array is built through the box's pointer, {level:?}:\n{shown}");
+            assert_eq!(
+                repeats,
+                [true],
+                "the array is built through the box's pointer, {level:?}:\n{shown}"
+            );
             let big_locals = body
                 .locals
                 .iter()
-                .filter(|(_, it)| matches!(it.ty.as_ref().kind(), crate::next_solver::TyKind::Array(..)))
+                .filter(|(_, it)| {
+                    matches!(it.ty.as_ref().kind(), crate::next_solver::TyKind::Array(..))
+                })
                 .count();
             assert_eq!(big_locals, 0, "no local holds the array, {level:?}:\n{shown}");
             // `Big([0; 1024])`: the array is built in the box's field, no `Big` or array local.
@@ -538,9 +552,15 @@ fn a_panicking_argument_frees_the_box_and_unwinds_the_same() {
             let shown = print_mir_body(db, body, "guarded");
             let adt_name = |ty: crate::next_solver::Ty<'_>| match ty.kind() {
                 TyKind::Adt(adt, _) => Some(match adt.def_id() {
-                    hir_def::AdtId::StructId(it) => hir_def::signatures::StructSignature::of(db, it).name.as_str().to_owned(),
-                    hir_def::AdtId::UnionId(it) => hir_def::signatures::UnionSignature::of(db, it).name.as_str().to_owned(),
-                    hir_def::AdtId::EnumId(it) => hir_def::signatures::EnumSignature::of(db, it).name.as_str().to_owned(),
+                    hir_def::AdtId::StructId(it) => {
+                        hir_def::signatures::StructSignature::of(db, it).name.as_str().to_owned()
+                    }
+                    hir_def::AdtId::UnionId(it) => {
+                        hir_def::signatures::UnionSignature::of(db, it).name.as_str().to_owned()
+                    }
+                    hir_def::AdtId::EnumId(it) => {
+                        hir_def::signatures::EnumSignature::of(db, it).name.as_str().to_owned()
+                    }
                 }),
                 _ => None,
             };
@@ -557,11 +577,17 @@ fn a_panicking_argument_frees_the_box_and_unwinds_the_same() {
             let names: Vec<&str> = calls.iter().map(|it| it.0.as_str()).collect();
             assert_eq!(names, ["box_new_uninit", "make"], "{level:?}:\n{shown}");
             let (_, into, free) = &calls[1];
-            assert_eq!(into.projection.as_slice(), [ProjectionElem::Deref], "`make` returns into the box, {level:?}:\n{shown}");
+            assert_eq!(
+                into.projection.as_slice(),
+                [ProjectionElem::Deref],
+                "`make` returns into the box, {level:?}:\n{shown}"
+            );
             let free = free.expect("`make` unwinds to a cleanup");
             let free = &body.basic_blocks[free];
             assert!(free.is_cleanup, "{level:?}:\n{shown}");
-            let TerminatorKind::Drop { place, target, .. } = &free.terminator.as_ref().unwrap().kind else {
+            let TerminatorKind::Drop { place, target, .. } =
+                &free.terminator.as_ref().unwrap().kind
+            else {
                 panic!("the cleanup of `make` frees the box first, {level:?}:\n{shown}");
             };
             let boxed = body.locals[place.local].ty.as_ref();
@@ -574,7 +600,8 @@ fn a_panicking_argument_frees_the_box_and_unwinds_the_same() {
             );
             // Then on to the guard's drop, where `make` unwound before.
             let guard = &body.basic_blocks[*target];
-            let TerminatorKind::Drop { place, .. } = &guard.terminator.as_ref().unwrap().kind else {
+            let TerminatorKind::Drop { place, .. } = &guard.terminator.as_ref().unwrap().kind
+            else {
                 panic!("after the free, the guard is dropped, {level:?}:\n{shown}");
             };
             let guard_local = place.local;
@@ -866,7 +893,11 @@ fn escape_bodies(options: MirOptions, names: &[&str]) -> Vec<(String, Vec<String
 }
 
 /// [`escape_bodies`] of `text`, a variant of [`ESCAPE`].
-fn escape_bodies_of(text: &str, options: MirOptions, names: &[&str]) -> Vec<(String, Vec<String>, u32)> {
+fn escape_bodies_of(
+    text: &str,
+    options: MirOptions,
+    names: &[&str],
+) -> Vec<(String, Vec<String>, u32)> {
     let _tracing = setup_tracing();
     let fx = fixture::db(text);
     let file_id = *fx.files().last().unwrap();
@@ -879,7 +910,11 @@ fn escape_bodies_of(text: &str, options: MirOptions, names: &[&str]) -> Vec<(Str
             scope
                 .declarations()
                 .find_map(|it| match it {
-                    ModuleDefId::FunctionId(it) if FunctionSignature::of(&db, it).name.as_str() == name => Some(it),
+                    ModuleDefId::FunctionId(it)
+                        if FunctionSignature::of(&db, it).name.as_str() == name =>
+                    {
+                        Some(it)
+                    }
                     _ => None,
                 })
                 .expect("no such function")
@@ -915,14 +950,17 @@ fn calls_new(calls: &[String]) -> bool {
 fn a_returned_box_stays_on_the_heap_and_the_option_turns_the_pass_off() {
     let names = ["sum_small", "box_sum", "moved_out", "rc_sum", "boxed"];
     for level in [MirOptLevel::Debug, MirOptLevel::Release] {
-        for options in [MirOptions::at(level), MirOptions { ub_checks: true, ..MirOptions::at(level) }] {
+        for options in
+            [MirOptions::at(level), MirOptions { ub_checks: true, ..MirOptions::at(level) }]
+        {
             let on = escape_bodies(options, &names);
             for (name, (shown, calls, moved)) in names.iter().zip(&on) {
                 assert_eq!(calls_new(calls), *name == "boxed", "{name} with {options:?}:\n{shown}");
                 assert_eq!(*moved == 0, *name == "boxed", "{name} with {options:?}:\n{shown}");
             }
         }
-        let off = escape_bodies(MirOptions { heap_to_stack: false, ..MirOptions::at(level) }, &names);
+        let off =
+            escape_bodies(MirOptions { heap_to_stack: false, ..MirOptions::at(level) }, &names);
         for (name, (shown, calls, moved)) in names.iter().zip(&off) {
             assert!(calls_new(calls), "{name} at {level:?} with heap_to_stack off:\n{shown}");
             assert_eq!(*moved, 0, "{name} at {level:?} with heap_to_stack off:\n{shown}");
@@ -940,16 +978,25 @@ fn an_inlined_body_allocates_again_in_its_caller() {
     let text = ESCAPE
         .replace("fn box_sum() -> u64 {", "#[inline]\nfn box_sum() -> u64 {")
         .replace("    measured(box_sum);\n", "    out(box_sum());\n");
-    assert!(text.contains("#[inline]\nfn box_sum") && text.contains("out(box_sum());"), "ESCAPE changed:\n{text}");
+    assert!(
+        text.contains("#[inline]\nfn box_sum") && text.contains("out(box_sum());"),
+        "ESCAPE changed:\n{text}"
+    );
     let options = MirOptions { inline: true, ..MirOptions::at(MirOptLevel::Release) };
     let bodies = escape_bodies_of(&text, options, &["main", "box_sum"]);
     let (shown, calls, moved) = &bodies[0];
-    assert!(!calls.iter().any(|it| it == "box_sum"), "the premise: `main` inlines `box_sum`:\n{shown}");
+    assert!(
+        !calls.iter().any(|it| it == "box_sum"),
+        "the premise: `main` inlines `box_sum`:\n{shown}"
+    );
     let allocates = calls.iter().any(|it| matches!(it.as_str(), "new" | "alloc_bytes" | "malloc"));
     assert!(allocates, "`main` makes `box_sum`'s box on the heap:\n{shown}");
     assert_eq!(*moved, 0, "`main` moved something into its frame:\n{shown}");
     let (shown, calls, moved) = &bodies[1];
-    assert!(!calls_new(calls) && *moved != 0, "`box_sum` on its own keeps its box on the heap:\n{shown}");
+    assert!(
+        !calls_new(calls) && *moved != 0,
+        "`box_sum` on its own keeps its box on the heap:\n{shown}"
+    );
 }
 
 /// Two runs of the pass over the same source print the same bodies.

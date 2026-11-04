@@ -72,12 +72,7 @@ where
     source.value.name().map_or_else(|| default.to_owned(), |name| name.text().to_owned())
 }
 
-pub fn print_body_hir(
-    db: &Db,
-    body: &Body,
-    owner: DefWithBodyId,
-    edition: Edition,
-) -> String {
+pub fn print_body_hir(db: &Db, body: &Body, owner: DefWithBodyId, edition: Edition) -> String {
     let header = match owner {
         // alloc: printing, the edge (tests and the IDE).
         DefWithBodyId::FunctionId(it) => format!("fn {}", item_name(db, it, "<missing>")),
@@ -125,11 +120,7 @@ pub fn print_body_hir(
     p.buf
 }
 
-pub fn print_variant_body_hir(
-    db: &Db,
-    owner: VariantId,
-    edition: Edition,
-) -> String {
+pub fn print_variant_body_hir(db: &Db, owner: VariantId, edition: Edition) -> String {
     let header = match owner {
         // alloc: printing, the edge (tests and the IDE).
         VariantId::StructId(it) => format!("struct {}", item_name(db, it, "<missing>")),
@@ -217,12 +208,7 @@ pub fn print_signature(db: &Db, owner: GenericDefId, edition: Edition) -> String
     }
 }
 
-pub fn print_path(
-    db: &Db,
-    store: &ExpressionStore,
-    path: Path<'_>,
-    edition: Edition,
-) -> String {
+pub fn print_path(db: &Db, store: &ExpressionStore, path: Path<'_>, edition: Edition) -> String {
     let mut p = Printer {
         db,
         store,
@@ -350,11 +336,7 @@ pub fn print_function(
     p.buf
 }
 
-fn print_where_clauses(
-    db: &Db,
-    generic_params: &GenericParams,
-    p: &mut Printer<'_>,
-) {
+fn print_where_clauses(db: &Db, generic_params: &GenericParams, p: &mut Printer<'_>) {
     if !generic_params.where_predicates.is_empty() {
         w!(p, "\nwhere\n");
         p.indented(|p| {
@@ -374,8 +356,7 @@ fn print_where_clauses(
                                 }
                                 w!(p, "{}", lifetime.display(db, p.edition));
                             }
-                            for (i, (_, param)) in
-                                generic_params.binder_params(*binder).enumerate()
+                            for (i, (_, param)) in generic_params.binder_params(*binder).enumerate()
                             {
                                 if i != 0 || !names.is_empty() {
                                     w!(p, ", ");
@@ -404,11 +385,7 @@ fn print_where_clauses(
     }
 }
 
-fn print_generic_params(
-    db: &Db,
-    generic_params: &GenericParams,
-    p: &mut Printer<'_>,
-) {
+fn print_generic_params(db: &Db, generic_params: &GenericParams, p: &mut Printer<'_>) {
     if !generic_params.is_empty() {
         w!(p, "<");
         let mut first = true;

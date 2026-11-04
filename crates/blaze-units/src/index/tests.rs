@@ -48,18 +48,28 @@ fn lines() {
     let bad = parse_line(br#"{"name":"a","vers":"1.0.0","deps":[{"name":"b","req":"not a req"}],"cksum":"00","rust_version":"1.60"}"#).unwrap();
     assert_eq!(bad.status, Status::Invalid);
     assert_eq!(bad.entry.rust_version.as_ref().unwrap().to_string(), "1.60");
-    assert_eq!(status(&format!("{{{base},\"pubtime\":\"2025-11-12T19:30:12-04\"}}")), Status::Invalid);
-    assert_eq!(status(&format!("{{{base},\"pubtime\":\"2025-02-29T19:30:12Z\"}}")), Status::Invalid);
+    assert_eq!(
+        status(&format!("{{{base},\"pubtime\":\"2025-11-12T19:30:12-04\"}}")),
+        Status::Invalid
+    );
+    assert_eq!(
+        status(&format!("{{{base},\"pubtime\":\"2025-02-29T19:30:12Z\"}}")),
+        Status::Invalid
+    );
     assert_eq!(status(&format!("{{{base},\"rust_version\":\"1.70-beta\"}}")), Status::Invalid);
     assert_eq!(status(&format!("{{{base},\"rust_version\":\"^1.70\"}}")), Status::Invalid);
     assert_eq!(status(r#"{"name":"a","vers":"1.0.0","cksum":"00"}"#), Status::Invalid);
     assert_eq!(status(&format!("{{{base},\"cksum\":\"01\"}}")), Status::Invalid);
     assert_eq!(
-        status(&format!("{{{base},\"deps\":[{{\"name\":\"b\",\"req\":\"1\",\"target\":\"cfg(\"}}]}}")),
+        status(&format!(
+            "{{{base},\"deps\":[{{\"name\":\"b\",\"req\":\"1\",\"target\":\"cfg(\"}}]}}"
+        )),
         Status::Invalid
     );
     assert_eq!(
-        status(&format!("{{{base},\"deps\":[{{\"name\":\"b\",\"req\":\"1\",\"artifact\":[\"rlib\"]}}]}}")),
+        status(&format!(
+            "{{{base},\"deps\":[{{\"name\":\"b\",\"req\":\"1\",\"artifact\":[\"rlib\"]}}]}}"
+        )),
         Status::Invalid
     );
     // A wrong `v` does not keep the version from being read.
@@ -116,7 +126,10 @@ fn a_line_of_serde_s_entry_reads_as_cargo_reads_it() {
     assert_eq!((dep.name_in_toml.as_str(), dep.package.as_str()), ("b2", "b"));
     assert_eq!(dep.features, ["x"]);
     assert_eq!(dep.kind, DepKind::Build);
-    assert_eq!(dep.registry.map(|it| it.url().to_string()).as_deref(), Some("sparse+https://example.com/index/"));
+    assert_eq!(
+        dep.registry.map(|it| it.url().to_string()).as_deref(),
+        Some("sparse+https://example.com/index/")
+    );
     assert!(parse_line(br#"{"name":"a","vers":"one"}"#).is_err());
 }
 
@@ -135,7 +148,10 @@ fn a_file_s_lines_are_parsed_only_when_a_version_matches() {
     assert_eq!(lines.parsed_count(), 0);
     let found = |min: &str| -> Vec<(String, Status)> {
         let min = Version::parse(min).unwrap();
-        lines.matching(|it| *it >= min).map(|it| (it.entry.version.to_string(), it.status)).collect()
+        lines
+            .matching(|it| *it >= min)
+            .map(|it| (it.entry.version.to_string(), it.status))
+            .collect()
     };
     assert_eq!(found("1.2.0"), [("1.2.0".to_owned(), Status::Yanked)]);
     assert_eq!(lines.parsed_count(), 1);
@@ -182,7 +198,8 @@ fn a_config_json_reads_as_cargo_reads_it() {
     assert_eq!(config.dl, "https://dl.example.com");
     assert_eq!(config.api.as_deref(), Some("https://api.example.com"));
     assert!(config.auth_required);
-    let plain: RegistryConfig = serde_json::from_str(r#"{"dl":"https://dl.example.com","api":null}"#).unwrap();
+    let plain: RegistryConfig =
+        serde_json::from_str(r#"{"dl":"https://dl.example.com","api":null}"#).unwrap();
     assert_eq!((plain.api, plain.auth_required), (None, false));
     assert!(serde_json::from_str::<RegistryConfig>(r#"{"api":"x"}"#).is_err());
 }
@@ -192,7 +209,10 @@ fn strings(pieces: &[&str], len: usize) -> Vec<String> {
     let mut out = vec![String::new()];
     let mut last = vec![String::new()];
     for _ in 0..len {
-        last = last.iter().flat_map(|it| pieces.iter().map(move |piece| format!("{it}{piece}"))).collect();
+        last = last
+            .iter()
+            .flat_map(|it| pieces.iter().map(move |piece| format!("{it}{piece}")))
+            .collect();
         out.extend(last.iter().cloned());
     }
     out
@@ -236,7 +256,9 @@ mod v1_rust_version {
 
     pub(super) fn parse(value: &str) -> anyhow::Result<(u64, Option<u64>, Option<u64>)> {
         let (major, minor, patch, pre, build) = match Version::parse(value) {
-            Ok(it) => (it.major, Some(it.minor), Some(it.patch), !it.pre.is_empty(), !it.build.is_empty()),
+            Ok(it) => {
+                (it.major, Some(it.minor), Some(it.patch), !it.pre.is_empty(), !it.build.is_empty())
+            }
             Err(_) => {
                 let mut req = match VersionReq::parse(value) {
                     Ok(req) => req,
@@ -272,10 +294,11 @@ mod v1_rust_version {
 
 #[test]
 fn a_rust_version_reads_as_v1_read_it() {
-    let mut cases: Vec<String> = ["1.70", "1", "1.70.0", " 1.70", "1.70 ", "^1.70", "=1.70", ">=1", "1.x", "1.*"]
-        .iter()
-        .map(|it| (*it).to_owned())
-        .collect();
+    let mut cases: Vec<String> =
+        ["1.70", "1", "1.70.0", " 1.70", "1.70 ", "^1.70", "=1.70", ">=1", "1.x", "1.*"]
+            .iter()
+            .map(|it| (*it).to_owned())
+            .collect();
     cases.extend(strings(&["1", "7", ".", "-", "+", "^", "b", "*", " ", ","], 4));
     for case in &cases {
         let old = v1_rust_version::parse(case).ok();
@@ -331,8 +354,16 @@ fn an_artifact_is_refused_as_the_index_refused_it() {
             .collect();
         lists.extend(longer);
     }
-    let targets =
-        [None, Some(""), Some(" "), Some("target"), Some(" target "), Some("x86_64-unknown-linux-gnu"), Some("a.json"), Some(" a.json ")];
+    let targets = [
+        None,
+        Some(""),
+        Some(" "),
+        Some("target"),
+        Some(" target "),
+        Some("x86_64-unknown-linux-gnu"),
+        Some("a.json"),
+        Some(" a.json "),
+    ];
     for list in &lists {
         for target in targets {
             assert_eq!(

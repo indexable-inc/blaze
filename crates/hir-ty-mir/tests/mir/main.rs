@@ -20,9 +20,9 @@ mod operands;
 mod references;
 mod scalar_names;
 mod source_maps;
+mod source_names;
 #[path = "../../src/mir/optimize/specialize/fixtures.rs"]
 mod specialize;
-mod source_names;
 mod stages;
 mod storage;
 mod tail_call;
@@ -32,9 +32,9 @@ mod uninhabited;
 mod unwind;
 
 use hir_def::{ConstId, FunctionId};
+use hir_expand::fixture;
 use hir_ty::db::HirDatabase;
 use hir_ty_mir::mir::{MirOptions, print_mir_body};
-use hir_expand::fixture;
 
 use db::TestDB;
 

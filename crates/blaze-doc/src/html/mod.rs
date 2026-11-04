@@ -6,11 +6,7 @@
 //! The stylesheet and script are this crate's own (`static/`); the page structure, class names
 //! and ids follow rustdoc's so links into rustdoc's docs and readers' habits carry over.
 
-use std::{
-    fmt::Write as _,
-    io,
-    path::Path,
-};
+use std::{fmt::Write as _, io, path::Path};
 
 use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
@@ -85,7 +81,8 @@ pub fn pages(model: &Model) -> Pages {
     };
     let names: HashSet<&str, Global> = model.crates.iter().map(|it| it.name.as_str()).collect();
     let page = |path: String, text: String| Page { path, bytes: text.into_bytes() };
-    let mut files = vec![page(statics.css.clone(), CSS.to_owned()), page(statics.js.clone(), JS.to_owned())];
+    let mut files =
+        vec![page(statics.css.clone(), CSS.to_owned()), page(statics.js.clone(), JS.to_owned())];
 
     let jobs: Vec<(usize, usize)> = model
         .crates
@@ -145,7 +142,8 @@ pub fn write(model: &Model, out: &Path) -> io::Result<Written> {
     }
     let earlier = std::fs::read_to_string(out.join("crates.js")).ok();
     let names: Vec<&str> = model.crates.iter().map(|it| it.name.as_str()).collect();
-    let list = crates_list(earlier.as_deref(), |name| out.join(name).join("index.html").exists(), &names);
+    let list =
+        crates_list(earlier.as_deref(), |name| out.join(name).join("index.html").exists(), &names);
     std::fs::write(out.join("crates.js"), list)?;
     Ok(written)
 }
@@ -1089,17 +1087,15 @@ impl<'a> Writer<'a> {
     fn trait_body(&self, item: &Item) -> String {
         let mut out = String::new();
         let groups: [(&str, &str, fn(&Member) -> bool); 5] = [
-            (
-                "required-associated-types",
-                "Required Associated Types",
-                |m: &Member| m.kind == Kind::AssocType && !m.provided,
-            ),
-            (
-                "provided-associated-types",
-                "Provided Associated Types",
-                |m: &Member| m.kind == Kind::AssocType && m.provided,
-            ),
-            ("associated-constants", "Associated Constants", |m: &Member| m.kind == Kind::AssocConst),
+            ("required-associated-types", "Required Associated Types", |m: &Member| {
+                m.kind == Kind::AssocType && !m.provided
+            }),
+            ("provided-associated-types", "Provided Associated Types", |m: &Member| {
+                m.kind == Kind::AssocType && m.provided
+            }),
+            ("associated-constants", "Associated Constants", |m: &Member| {
+                m.kind == Kind::AssocConst
+            }),
             ("required-methods", "Required Methods", |m: &Member| m.kind == Kind::TyMethod),
             ("provided-methods", "Provided Methods", |m: &Member| m.kind == Kind::Method),
         ];

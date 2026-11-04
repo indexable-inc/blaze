@@ -14,9 +14,9 @@
 
 extern crate rustc_parse_format;
 
+extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 pub extern crate rustc_abi;
 pub extern crate rustc_abi as layout;
-extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 
 pub mod attrs;
 pub mod builtin_type;
@@ -51,8 +51,8 @@ pub mod src;
 
 pub mod find_path;
 pub mod import_map;
-pub mod visibility;
 pub mod test_items;
+pub mod visibility;
 
 #[cfg(test)]
 mod alloc_budgets;
@@ -293,10 +293,7 @@ impl StructId {
         VariantFields::of(db, self.into())
     }
 
-    pub fn fields_with_source_map(
-        self,
-        db: &Db,
-    ) -> (&VariantFields, &ExpressionStoreSourceMap) {
+    pub fn fields_with_source_map(self, db: &Db) -> (&VariantFields, &ExpressionStoreSourceMap) {
         let r = VariantFields::with_source_map(db, self.into());
         (&r.0, &r.1)
     }
@@ -310,10 +307,7 @@ impl UnionId {
         VariantFields::of(db, self.into())
     }
 
-    pub fn fields_with_source_map(
-        self,
-        db: &Db,
-    ) -> (&VariantFields, &ExpressionStoreSourceMap) {
+    pub fn fields_with_source_map(self, db: &Db) -> (&VariantFields, &ExpressionStoreSourceMap) {
         let r = VariantFields::with_source_map(db, self.into());
         (&r.0, &r.1)
     }
@@ -366,10 +360,7 @@ impl ImplId {
     }
 
     #[inline]
-    pub fn impl_items_with_diagnostics(
-        self,
-        db: &Db,
-    ) -> &(ImplItems, DefDiagnostics) {
+    pub fn impl_items_with_diagnostics(self, db: &Db) -> &(ImplItems, DefDiagnostics) {
         ImplItems::of(db, self)
     }
 }
@@ -461,10 +452,7 @@ impl EnumVariantId {
         self.loc(db).index(db)
     }
 
-    pub fn fields_with_source_map(
-        self,
-        db: &Db,
-    ) -> (&VariantFields, &ExpressionStoreSourceMap) {
+    pub fn fields_with_source_map(self, db: &Db) -> (&VariantFields, &ExpressionStoreSourceMap) {
         let r = VariantFields::with_source_map(db, self.into());
         (&r.0, &r.1)
     }
@@ -713,10 +701,7 @@ impl<'db> ModuleIdLt<'db> {
         }
     }
 
-    pub(crate) fn local_def_map(
-        self,
-        db: &'db Db,
-    ) -> (&'db DefMap, &'db LocalDefMap) {
+    pub(crate) fn local_def_map(self, db: &'db Db) -> (&'db DefMap, &'db LocalDefMap) {
         match self.block(db) {
             Some(block) => (block_def_map(db, block), self.only_local_def_map(db)),
             None => {
@@ -774,8 +759,7 @@ impl ModuleId {
     pub fn extern_prelude<'db>(
         self,
         db: &'db Db,
-    ) -> impl DoubleEndedIterator<Item = (&'db Name, (ModuleId, Option<ExternCrateId>))> + 'db
-    {
+    ) -> impl DoubleEndedIterator<Item = (&'db Name, (ModuleId, Option<ExternCrateId>))> + 'db {
         crate_local_def_map(db, self.krate(db)).local(db).extern_prelude()
     }
 
@@ -965,7 +949,8 @@ impl AdtId {
             AdtId::UnionId(it) => (Some(VariantId::UnionId(it)), None),
             AdtId::EnumId(it) => (None, Some(it.enum_variants(db).variants.values())),
         };
-        one.into_iter().chain(all.into_iter().flatten().map(|&(it, _)| VariantId::EnumVariantId(it)))
+        one.into_iter()
+            .chain(all.into_iter().flatten().map(|&(it, _)| VariantId::EnumVariantId(it)))
     }
 }
 
@@ -988,7 +973,9 @@ impl MacroId {
         use hir_expand::name::{AsName as _, Name};
         use src::HasSource as _;
         use syntax::view::HasName as _;
-        let of = |name: Option<syntax::view::Name<'_>>| name.map_or_else(Name::missing, |it| it.as_name());
+        let of = |name: Option<syntax::view::Name<'_>>| {
+            name.map_or_else(Name::missing, |it| it.as_name())
+        };
         match self {
             MacroId::Macro2Id(it) => of(it.lookup(db).source_view(db).value.name()),
             MacroId::MacroRulesId(it) => of(it.lookup(db).source_view(db).value.name()),
@@ -997,7 +984,10 @@ impl MacroId {
                 let source = loc.source_view(db);
                 match loc.kind {
                     ProcMacroKind::CustomDerive => attrs::AttrFlags::derive_info(db, self)
-                        .map_or_else(|| of(source.value.name()), |info| Name::new_symbol_root(info.trait_name)),
+                        .map_or_else(
+                            || of(source.value.name()),
+                            |info| Name::new_symbol_root(info.trait_name),
+                        ),
                     ProcMacroKind::Bang | ProcMacroKind::Attr => of(source.value.name()),
                 }
             }
@@ -1230,7 +1220,9 @@ impl_from!(
 /// This is used for queries that operate on expression stores generically,
 /// such as `expr_scopes`.
 // NOTE: This type cannot be `blaze_query::Supertype` as its variants are overlapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord /* !blaze_query::Supertype */)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord /* !blaze_query::Supertype */,
+)]
 pub enum ExpressionStoreOwnerId {
     Signature(GenericDefId),
     /// A body, something with a root expression.
@@ -1425,7 +1417,16 @@ impl_from!(
 );
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Supertype, blaze_query::Value,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    blaze_query::Supertype,
+    blaze_query::Value,
 )]
 pub enum VariantId {
     EnumVariantId(EnumVariantId),
@@ -1447,10 +1448,7 @@ impl VariantId {
         VariantFields::of(db, self)
     }
 
-    pub fn fields_with_source_map(
-        self,
-        db: &Db,
-    ) -> (&VariantFields, &ExpressionStoreSourceMap) {
+    pub fn fields_with_source_map(self, db: &Db) -> (&VariantFields, &ExpressionStoreSourceMap) {
         let r = VariantFields::with_source_map(db, self);
         (&r.0, &r.1)
     }
@@ -1845,10 +1843,7 @@ impl Complete {
 
 // return: macro call id and include file id
 #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-pub fn include_macro_invoc(
-    db: &Db,
-    krate: Crate,
-) -> Box<[(MacroCallId, EditionedFileId)]> {
+pub fn include_macro_invoc(db: &Db, krate: Crate) -> Box<[(MacroCallId, EditionedFileId)]> {
     blaze_mem::frame::current(|frame| {
         let mut found = Vec::new_in(frame);
         found.extend(
@@ -1872,7 +1867,6 @@ mod loc_hash_tests {
     };
 
     use blaze_hash::{FixedState, HashSet};
-    use std::alloc::Global;
     use blaze_query::db::FromId;
     use hir_expand::{
         EditionedFileId, HirFileId, InFile, MacroCallId, MacroCallStyles,
@@ -1885,6 +1879,7 @@ mod loc_hash_tests {
     };
     use intern::Symbol;
     use span::{Edition, ErasedFileAstId, FileAstId};
+    use std::alloc::Global;
     use syntax::ast;
 
     use super::*;
@@ -1929,7 +1924,9 @@ mod loc_hash_tests {
 
     fn expanders() -> Vec<MacroExpander> {
         let mut all: Vec<_> = (0..8)
-            .map(|bits| MacroExpander::Declarative { styles: MacroCallStyles::from_bits_retain(bits) })
+            .map(|bits| MacroExpander::Declarative {
+                styles: MacroCallStyles::from_bits_retain(bits),
+            })
             .collect();
         all.extend(BuiltinFnLikeExpander::ALL.iter().map(|&it| MacroExpander::BuiltIn(it)));
         all.extend(BuiltinAttrExpander::ALL.iter().map(|&it| MacroExpander::BuiltInAttr(it)));
@@ -2021,12 +2018,10 @@ mod loc_hash_tests {
         locs.push(MacroRulesLoc { container: query_id(6), ..base });
         locs.extend(ast_ids().into_iter().skip(1).map(|id| MacroRulesLoc { id, ..base }));
         locs.extend(expanders().into_iter().map(|expander| MacroRulesLoc { expander, ..base }));
-        locs.extend(
-            (1..8).map(|bits| MacroRulesLoc {
-                flags: MacroRulesLocFlags::from_bits_retain(bits),
-                ..base
-            }),
-        );
+        locs.extend((1..8).map(|bits| MacroRulesLoc {
+            flags: MacroRulesLocFlags::from_bits_retain(bits),
+            ..base
+        }));
         locs.push(MacroRulesLoc { edition: Edition::Edition2021, ..base });
         check(&locs);
 

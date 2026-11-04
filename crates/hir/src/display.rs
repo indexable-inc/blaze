@@ -291,8 +291,12 @@ fn write_impl_header<'db>(impl_: ImplId, f: &mut HirFormatter<'_, 'db>) -> Resul
     let impl_data = ImplSignature::of(db, impl_);
     if let Some(target_trait) = &impl_data.target_trait {
         f.write_char(' ')?;
-        hir_display_with_store(impl_data.store.path(target_trait.path), impl_.into(), &impl_data.store)
-            .hir_fmt(f)?;
+        hir_display_with_store(
+            impl_data.store.path(target_trait.path),
+            impl_.into(),
+            &impl_data.store,
+        )
+        .hir_fmt(f)?;
         f.write_str(" for")?;
     }
 
@@ -644,14 +648,14 @@ impl<'db> HirDisplay<'db> for TypeParam {
         let ty = self.ty(f.db).ty.skip_binder();
         let all = GenericPredicates::query_all(f.db, self.id.parent());
         crate::scratch::with_clauses(|predicates| {
-            predicates.extend(all.iter_identity().map(Unnormalized::skip_norm_wip).filter(
-                |wc| match wc.kind().skip_binder() {
+            predicates.extend(all.iter_identity().map(Unnormalized::skip_norm_wip).filter(|wc| {
+                match wc.kind().skip_binder() {
                     ClauseKind::Trait(tr) => tr.self_ty() == ty,
                     ClauseKind::Projection(proj) => proj.self_ty() == ty,
                     ClauseKind::TypeOutlives(to) => to.0 == ty,
                     _ => false,
-                },
-            ));
+                }
+            }));
 
             match param_data {
                 TypeOrConstParamData::TypeParamData(p) => match p.provenance {
@@ -797,11 +801,7 @@ fn write_where_clause<'db>(def: GenericDefId, f: &mut HirFormatter<'_, 'db>) -> 
     Ok(true)
 }
 
-fn has_disaplayable_predicates(
-    db: &Db,
-    params: &GenericParams,
-    store: &ExpressionStore,
-) -> bool {
+fn has_disaplayable_predicates(db: &Db, params: &GenericParams, store: &ExpressionStore) -> bool {
     params.where_predicates().iter().any(|pred| {
         !matches!(
             pred,

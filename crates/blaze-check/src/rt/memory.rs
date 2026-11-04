@@ -45,7 +45,10 @@ impl Store {
 
     /// A load that happens before `clock` read it. Every lane is compared (a vector compare).
     fn read_before(&self, clock: &Clock) -> bool {
-        self.loaded.iter().zip(clock.0).fold(false, |any, (&at, now)| any | ((at != UNSEEN) & (at <= now)))
+        self.loaded
+            .iter()
+            .zip(clock.0)
+            .fold(false, |any, (&at, now)| any | ((at != UNSEEN) & (at <= now)))
     }
 }
 
@@ -71,7 +74,12 @@ pub(crate) struct Cell {
 
 impl Cell {
     pub(crate) fn new() -> Cell {
-        Cell { write: Stamp::INIT, write_at: None, reads: Clock::ZERO, reads_at: [None; MAX_THREADS] }
+        Cell {
+            write: Stamp::INIT,
+            write_at: None,
+            reads: Clock::ZERO,
+            reads_at: [None; MAX_THREADS],
+        }
     }
 }
 
@@ -145,7 +153,13 @@ impl Runtime {
     }
 
     /// An atomic load: which store it reads is a branch (Miri's `fetch_store`).
-    pub(crate) fn load(&mut self, obj: u32, ord: Ordering, at: At, real: u64) -> Result<u64, String> {
+    pub(crate) fn load(
+        &mut self,
+        obj: u32,
+        ord: Ordering,
+        at: At,
+        real: u64,
+    ) -> Result<u64, String> {
         let thread = self.current();
         self.atomic_access(obj, thread, at, real)?;
         let seq_cst = ord == Ordering::SeqCst;
@@ -169,7 +183,8 @@ impl Runtime {
             // A thread that yielded doesn't read again an old store it read before the yield,
             // so a loop that waits for a newer one ends (loom's `is_seen_before_yield`).
             let seen = store.loaded[thread];
-            let stale = index != newest && seen != UNSEEN && th.last_yield.is_some_and(|it| seen <= it);
+            let stale =
+                index != newest && seen != UNSEEN && th.last_yield.is_some_and(|it| seen <= it);
             if include && !stale {
                 candidates.push(index as u16);
             }
@@ -206,7 +221,14 @@ impl Runtime {
     }
 
     /// An atomic store, last in modification order (Miri's `store_impl`).
-    pub(crate) fn store(&mut self, obj: u32, value: u64, ord: Ordering, at: At, real: u64) -> Result<(), String> {
+    pub(crate) fn store(
+        &mut self,
+        obj: u32,
+        value: u64,
+        ord: Ordering,
+        at: At,
+        real: u64,
+    ) -> Result<(), String> {
         let thread = self.current();
         self.atomic_access(obj, thread, at, real)?;
         let th = &self.threads[thread];
@@ -370,10 +392,18 @@ impl Runtime {
 
     /// A non-atomic access of the bytes `addr..addr + len` (`cell::read`, `write`, `free`),
     /// checked as a cell's against every span of them, to the byte.
-    pub(crate) fn bytes_access(&mut self, addr: usize, len: usize, at: At, kind: Bytes) -> Result<(), String> {
+    pub(crate) fn bytes_access(
+        &mut self,
+        addr: usize,
+        len: usize,
+        at: At,
+        kind: Bytes,
+    ) -> Result<(), String> {
         let Some(end) = addr.checked_add(len) else {
             // alloc: a finding's or an error's text, made once, when the model stops
-            return Err(format!("`cell::{kind:?}` at {at} of {len} bytes at {addr:#x} wraps the address space"));
+            return Err(format!(
+                "`cell::{kind:?}` at {at} of {len} bytes at {addr:#x} wraps the address space"
+            ));
         };
         if len == 0 {
             return Ok(());
@@ -414,7 +444,11 @@ impl Runtime {
                 let mut shadow = Cell::new();
                 shadow.write = Stamp { thread: thread as u8, at: clock.get(thread) };
                 shadow.write_at = Some(at);
-                self.bytes.replace(addr, end, Span { start: addr, end, shadow, freed: kind == Bytes::Free });
+                self.bytes.replace(
+                    addr,
+                    end,
+                    Span { start: addr, end, shadow, freed: kind == Bytes::Free },
+                );
             }
         }
         Ok(())
@@ -422,7 +456,13 @@ impl Runtime {
 }
 
 impl Cell {
-    fn read(&mut self, thread: Tid, clock: &Clock, at: At, what: &impl Fn() -> String) -> Result<(), String> {
+    fn read(
+        &mut self,
+        thread: Tid,
+        clock: &Clock,
+        at: At,
+        what: &impl Fn() -> String,
+    ) -> Result<(), String> {
         if !self.write.before(clock) {
             // alloc: a finding's or an error's text, made once, when the model stops
             return Err(format!(
@@ -438,7 +478,13 @@ impl Cell {
         Ok(())
     }
 
-    fn write(&mut self, thread: Tid, clock: &Clock, at: At, what: &impl Fn() -> String) -> Result<(), String> {
+    fn write(
+        &mut self,
+        thread: Tid,
+        clock: &Clock,
+        at: At,
+        what: &impl Fn() -> String,
+    ) -> Result<(), String> {
         if !self.write.before(clock) {
             // alloc: a finding's or an error's text, made once, when the model stops
             return Err(format!(
@@ -450,7 +496,8 @@ impl Cell {
             ));
         }
         if !self.reads.le(clock) {
-            let other = clock.behind(&self.reads).expect("a read not before the clock has a thread");
+            let other =
+                clock.behind(&self.reads).expect("a read not before the clock has a thread");
             // alloc: a finding's or an error's text, made once, when the model stops
             return Err(format!(
                 "data race on {}: a write at {at} by thread {thread} races with the read at {} by \
@@ -553,7 +600,10 @@ impl ByteMap {
         }
         for &(gap, gap_end) in &self.scratch {
             let index = self.spans.partition_point(|it| it.start < gap);
-            self.spans.insert(index, Span { start: gap, end: gap_end, shadow: Cell::new(), freed: false });
+            self.spans.insert(
+                index,
+                Span { start: gap, end: gap_end, shadow: Cell::new(), freed: false },
+            );
         }
         let (from, to) = self.range(start, end);
         for span in &mut self.spans[from..to] {
@@ -590,7 +640,9 @@ mod tests {
                 let end = start + 1 + rng.index(64 - start);
                 let write = rng.coin();
                 let kind = if write { Bytes::Write } else { Bytes::Read };
-                assert!(rt.bytes_access(BASE + start, end - start, Location::caller(), kind).is_ok());
+                assert!(
+                    rt.bytes_access(BASE + start, end - start, Location::caller(), kind).is_ok()
+                );
                 let now = rt.threads[0].clock.get(0);
                 for byte in &mut bytes[start..end] {
                     *byte = match (write, *byte) {

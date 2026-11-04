@@ -205,7 +205,8 @@ pub(crate) fn parse<'a>(
         if sections.iter().any(|it: &Section| it.id == section.id) {
             return bad("a second section of one id");
         }
-        if section.first != next || section.groups.checked_add(next).is_none_or(|end| end > groups) {
+        if section.first != next || section.groups.checked_add(next).is_none_or(|end| end > groups)
+        {
             return bad("groups that do not follow the section before");
         }
         if section.at != group * (1 + u64::from(section.first))

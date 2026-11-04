@@ -20,23 +20,24 @@ use rustc_type_ir::inherent::IntoKind as _;
 use syntax::{
     TextRange,
     view::{
-        self as ast, AstNode as _, HasArgList as _, HasGenericArgs as _, HasGenericParams as _, HasName as _,
-        HasTypeBounds as _, Node,
+        self as ast, AstNode as _, HasArgList as _, HasGenericArgs as _, HasGenericParams as _,
+        HasName as _, HasTypeBounds as _, Node,
     },
 };
 
 use super::binary_operator_cannot_be_applied::code_fact;
-use stdx::list::Join;
 use crate::{
     cx::Cx,
     lower::{Found, Phase},
     model::{Applicability, Diag, MultiSpan, Span},
 };
+use stdx::list::Join;
 
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::MismatchedArgCount) -> Vec<Found> {
     let node = cx.node_view(d.call_expr);
     let inputs = Inputs::Count { expected: d.expected, is_fn_trait_call: d.is_fn_trait_call };
-    let Some(call) = node.value.left().and_then(|it| CallCx::new(cx, node.file_id, it, inputs)) else {
+    let Some(call) = node.value.left().and_then(|it| CallCx::new(cx, node.file_id, it, inputs))
+    else {
         let span = cx.span_of_ptr(d.call_expr);
         let mut diag = Diag::error(
             Some(if d.is_fn_trait_call { "E0057" } else { "E0061" }),
@@ -138,7 +139,11 @@ struct ArgMatrix {
 }
 
 impl ArgMatrix {
-    fn new(provided: usize, expected: usize, mut compat: impl FnMut(usize, usize) -> Compat) -> ArgMatrix {
+    fn new(
+        provided: usize,
+        expected: usize,
+        mut compat: impl FnMut(usize, usize) -> Compat,
+    ) -> ArgMatrix {
         let mut cells = Vec::with_capacity(provided * expected);
         for i in 0..provided {
             cells.extend((0..expected).map(|j| compat(i, j)));
@@ -269,7 +274,9 @@ impl ArgMatrix {
         }
         if permutation_found {
             // alloc: the error's parts, for an error hir found
-            return Some(Issue::Permutation(permutation.into_iter().map(Option::flatten).collect()));
+            return Some(Issue::Permutation(
+                permutation.into_iter().map(Option::flatten).collect(),
+            ));
         }
         None
     }
@@ -317,7 +324,9 @@ impl ArgMatrix {
                     let mut idxs: Vec<usize> = args.iter().filter_map(|&a| a).collect();
                     // alloc: the error's parts, for an error hir found
                     let mut real: Vec<Option<(usize, usize)>> = vec![None; provided_count];
-                    for (src, dst) in args.iter().enumerate().filter_map(|(src, dst)| dst.map(|dst| (src, dst))) {
+                    for (src, dst) in
+                        args.iter().enumerate().filter_map(|(src, dst)| dst.map(|dst| (src, dst)))
+                    {
                         let src_input = self.provided[src];
                         let dst_input = self.provided[dst];
                         let dst_arg = self.expected[dst];
@@ -406,32 +415,60 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
     ) -> Option<CallCx<'a, 'b, 'db>> {
         let at = |range: TextRange| cx.span(InFile::new(file, range));
         let call_range = call.syntax().text_range();
-        let (callee_expr, method_name, callable, is_method, call_name, full_call, error, args) = match call {
-            ast::Expr::CallExpr(it) => {
-                let callee = it.expr()?;
-                let call_name = match callee {
-                    ast::Expr::PathExpr(path) => match path.path().and_then(|it| cx.vsema.resolve_path(it)) {
-                        Some(PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Struct(_)))) => "struct",
-                        Some(PathResolution::Def(hir::ModuleDef::EnumVariant(_))) => "enum variant",
+        let (callee_expr, method_name, callable, is_method, call_name, full_call, error, args) =
+            match call {
+                ast::Expr::CallExpr(it) => {
+                    let callee = it.expr()?;
+                    let call_name = match callee {
+                        ast::Expr::PathExpr(path) => {
+                            match path.path().and_then(|it| cx.vsema.resolve_path(it)) {
+                                Some(PathResolution::Def(hir::ModuleDef::Adt(
+                                    hir::Adt::Struct(_),
+                                ))) => "struct",
+                                Some(PathResolution::Def(hir::ModuleDef::EnumVariant(_))) => {
+                                    "enum variant"
+                                }
+                                _ => "function",
+                            }
+                        }
                         _ => "function",
-                    },
-                    _ => "function",
-                };
-                let callable = cx.vsema.resolve_expr_as_callable(callee);
-                let full = callee.syntax().text_range();
-                (Some(callee), None, callable, false, call_name, full, call_range, it.arg_list())
-            }
-            ast::Expr::MethodCallExpr(it) => {
-                let name = it.name_ref()?;
-                let start = name.syntax().text_range().start();
-                let end = it.generic_arg_list().map_or(name.syntax().text_range().end(), |it| it.syntax().text_range().end());
-                let callable = cx.vsema.resolve_method_call_as_callable(it);
-                let full = TextRange::new(start, end);
-                let error = TextRange::new(start, call_range.end());
-                (it.receiver(), Some(name), callable, true, "method", full, error, it.arg_list())
-            }
-            _ => return None,
-        };
+                    };
+                    let callable = cx.vsema.resolve_expr_as_callable(callee);
+                    let full = callee.syntax().text_range();
+                    (
+                        Some(callee),
+                        None,
+                        callable,
+                        false,
+                        call_name,
+                        full,
+                        call_range,
+                        it.arg_list(),
+                    )
+                }
+                ast::Expr::MethodCallExpr(it) => {
+                    let name = it.name_ref()?;
+                    let start = name.syntax().text_range().start();
+                    let end =
+                        it.generic_arg_list().map_or(name.syntax().text_range().end(), |it| {
+                            it.syntax().text_range().end()
+                        });
+                    let callable = cx.vsema.resolve_method_call_as_callable(it);
+                    let full = TextRange::new(start, end);
+                    let error = TextRange::new(start, call_range.end());
+                    (
+                        it.receiver(),
+                        Some(name),
+                        callable,
+                        true,
+                        "method",
+                        full,
+                        error,
+                        it.arg_list(),
+                    )
+                }
+                _ => return None,
+            };
         let mut provided = args
             .into_iter()
             .flat_map(|it| it.args())
@@ -456,7 +493,11 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
                 }
                 // Only a call of a value through the `Fn` traits has its arguments tupled
                 // (`TupleArgumentsFlag::TupleArguments`), never a method call.
-                let through_fn_trait = !is_method && matches!(callable.as_ref().map(|it| it.kind()), Some(CallableKind::FnImpl(_)));
+                let through_fn_trait = !is_method
+                    && matches!(
+                        callable.as_ref().map(|it| it.kind()),
+                        Some(CallableKind::FnImpl(_))
+                    );
                 (provided.len(), through_fn_trait)
             }
         };
@@ -530,13 +571,15 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
     /// wrong type, the types compared, which rustc reports as that argument's "mismatched types"
     /// rather than as the call's error.
     pub(super) fn single_mismatch(&self) -> bool {
-        let full = ArgMatrix::new(self.provided.len(), self.expected.len(), |p, e| self.compat(p, e));
+        let full =
+            ArgMatrix::new(self.provided.len(), self.expected.len(), |p, e| self.compat(p, e));
         let (errors, _) = full.find_errors();
         matches!(errors[..], [ArgError::Invalid(_, _, Compat::Incompatible { compared: true })])
     }
 
     pub(super) fn report(&self) -> Diag {
-        let full = ArgMatrix::new(self.provided.len(), self.expected.len(), |p, e| self.compat(p, e));
+        let full =
+            ArgMatrix::new(self.provided.len(), self.expected.len(), |p, e| self.compat(p, e));
         // clone: on the error path, for an error hir found
         let (mut errors, matched) = full.clone().find_errors();
 
@@ -554,7 +597,8 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
 
         if let [ArgError::Extra(idx)] = errors[..]
             && !self.remove_idx_is_perfect(&full, idx)
-            && let Some(i) = (0..self.provided.len()).find(|&i| self.remove_idx_is_perfect(&full, i))
+            && let Some(i) =
+                (0..self.provided.len()).find(|&i| self.remove_idx_is_perfect(&full, i))
         {
             // alloc: the error's parts, for an error hir found
             errors = vec![ArgError::Extra(i)];
@@ -596,7 +640,9 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
         let message = match text {
             SuggestionText::None => None,
             // alloc: the error's text, for an error hir found
-            SuggestionText::Provide(plural) => Some(format!("provide the argument{}", if plural { "s" } else { "" })),
+            SuggestionText::Provide(plural) => {
+                Some(format!("provide the argument{}", if plural { "s" } else { "" }))
+            }
             SuggestionText::Remove(plural) => {
                 diag.multipart_suggestion(
                     // alloc: the error's text, for an error hir found
@@ -613,7 +659,12 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
         if let Some(message) = message {
             let code = self.suggestion_code(&matched);
             // clone: on the error path, for an error hir found
-            diag.suggestion_verbose(self.args_span.clone(), message, code, Applicability::HasPlaceholders);
+            diag.suggestion_verbose(
+                self.args_span.clone(),
+                message,
+                code,
+                Applicability::HasPlaceholders,
+            );
         }
         diag
     }
@@ -628,16 +679,15 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
             return None;
         }
         let (wrapped, after) = self.provided[mismatch..].split_at(fields.len());
-        let wrapped_fit = wrapped
-            .iter()
-            .zip(&fields)
-            .all(|((provided, _), field)| provided.as_ref().is_some_and(|it| it.could_unify_with(self.cx.db, field)));
-        let after_fit = self.expected[mismatch + 1..].iter().zip(after).all(|(expected, (provided, _))| {
-            match (provided, expected) {
+        let wrapped_fit = wrapped.iter().zip(&fields).all(|((provided, _), field)| {
+            provided.as_ref().is_some_and(|it| it.could_unify_with(self.cx.db, field))
+        });
+        let after_fit = self.expected[mismatch + 1..].iter().zip(after).all(
+            |(expected, (provided, _))| match (provided, expected) {
                 (Some(p), Some(e)) => self.coerces(p, e),
                 _ => false,
-            }
-        });
+            },
+        );
         if !wrapped_fit || !after_fit || fields.len() == 1 {
             return None;
         }
@@ -645,7 +695,12 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
         let (_, hi) = wrapped.last()?;
         let mut diag = Diag::error(
             Some(self.code),
-            takes_message(self.call_name, self.c_variadic, self.expected.len(), self.provided.len()),
+            takes_message(
+                self.call_name,
+                self.c_variadic,
+                self.expected.len(),
+                self.provided.len(),
+            ),
             // clone: on the error path, for an error hir found
             self.full_call_span.clone(),
         );
@@ -681,16 +736,22 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
         // alloc: the error's parts, for an error hir found
         let mut suggestions = vec![];
         let mut errors = errors.iter().peekable();
-        let mut only_extras_so_far = errors.peek().is_some_and(|first| matches!(first, ArgError::Extra(0)));
+        let mut only_extras_so_far =
+            errors.peek().is_some_and(|first| matches!(first, ArgError::Extra(0)));
         let mut prev_extra_idx: Option<usize> = None;
         while let Some(error) = errors.next() {
             only_extras_so_far &= matches!(error, ArgError::Extra(_));
             match error {
                 ArgError::Invalid(provided, expected, Compat::Incompatible { compared: true }) => {
-                    if let (Some(p), Some(e)) = (&self.provided[*provided].0, &self.expected[*expected]) {
+                    if let (Some(p), Some(e)) =
+                        (&self.provided[*provided].0, &self.expected[*expected])
+                    {
                         let (p, e) = (self.ty(p), self.ty(e));
                         // alloc: clone: the error's parts, for an error hir found
-                        diag.span_label(self.provided[*provided].1.clone(), format!("expected `{e}`, found `{p}`"));
+                        diag.span_label(
+                            self.provided[*provided].1.clone(),
+                            format!("expected `{e}`, found `{p}`"),
+                        );
                     }
                 }
                 ArgError::Invalid(..) => {}
@@ -700,13 +761,25 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
                         // alloc: the error's text, for an error hir found
                         self.known(provided_ty).map_or_else(String::new, |it| format!(" of type `{}`", self.ty(it)));
                     // alloc: the error's text, for an error hir found
-                    let number = if self.provided.len() == 1 { String::new() } else { format!(" #{}", idx + 1) };
+                    let number = if self.provided.len() == 1 {
+                        String::new()
+                    } else {
+                        format!(" #{}", idx + 1)
+                    };
                     // alloc: clone: the error's parts, for an error hir found
-                    labels.push((provided_span.clone(), format!("unexpected argument{number}{ty_name}")));
+                    labels.push((
+                        provided_span.clone(),
+                        format!("unexpected argument{number}{ty_name}"),
+                    ));
                     if self.provided.len() == 1
                         && let Some(span) = self.expect_for_unwrap(provided_ty)
                     {
-                        diag.suggestion_verbose(span, "did you mean to use `expect`?", "expect", Applicability::MaybeIncorrect);
+                        diag.suggestion_verbose(
+                            span,
+                            "did you mean to use `expect`?",
+                            "expect",
+                            Applicability::MaybeIncorrect,
+                        );
                         continue;
                     }
                     // clone: on the error path, for an error hir found
@@ -747,22 +820,34 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
                     {
                         missing.push(*next);
                     }
-                    let span_of = |first: usize, last: usize| match (self.provided.get(first), self.provided.get(last)) {
+                    let span_of = |first: usize, last: usize| match (
+                        self.provided.get(first),
+                        self.provided.get(last),
+                    ) {
                         (Some((_, first)), Some((_, last))) => first.to(last),
                         _ => self.args_span.clone(), // clone: on the error path, for an error hir found
                     };
                     let tys = |idxs: &[usize]| -> Option<Vec<String>> {
                         // alloc: the error's parts, for an error hir found
-                        idxs.iter().map(|&i| self.known(&self.expected[i]).map(|it| self.ty(it))).collect()
+                        idxs.iter()
+                            .map(|&i| self.known(&self.expected[i]).map(|it| self.ty(it)))
+                            .collect()
                     };
                     match missing[..] {
                         [idx] => {
                             // clone: on the error path, for an error hir found
-                            let span = self.provided.get(idx).map_or_else(|| self.args_span.clone(), |(_, it)| it.clone());
+                            let span = self
+                                .provided
+                                .get(idx)
+                                .map_or_else(|| self.args_span.clone(), |(_, it)| it.clone());
                             // alloc: the error's text, for an error hir found
-                            let rendered = tys(&[idx]).map_or_else(String::new, |it| format!(" of type `{}`", it[0]));
+                            let rendered = tys(&[idx])
+                                .map_or_else(String::new, |it| format!(" of type `{}`", it[0]));
                             // alloc: the error's text, for an error hir found
-                            labels.push((span, format!("argument #{}{rendered} is missing", idx + 1)));
+                            labels.push((
+                                span,
+                                format!("argument #{}{rendered} is missing", idx + 1),
+                            ));
                             text = match text {
                                 SuggestionText::None => SuggestionText::Provide(false),
                                 SuggestionText::Provide(_) => SuggestionText::Provide(true),
@@ -774,7 +859,10 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
                                 // alloc: the error's text, for an error hir found
                                 tys(&[a, b]).map_or_else(String::new, |it| format!(" of type `{}` and `{}`", it[0], it[1]));
                             // alloc: the error's text, for an error hir found
-                            labels.push((span_of(a, b), format!("two arguments{rendered} are missing")));
+                            labels.push((
+                                span_of(a, b),
+                                format!("two arguments{rendered} are missing"),
+                            ));
                             text = provide_plural(text);
                         }
                         [a, b, c] => {
@@ -784,7 +872,10 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
                                 format!(" of type `{}`, `{}`, and `{}`", it[0], it[1], it[2])
                             });
                             // alloc: the error's text, for an error hir found
-                            labels.push((span_of(a, c), format!("three arguments{rendered} are missing")));
+                            labels.push((
+                                span_of(a, c),
+                                format!("three arguments{rendered} are missing"),
+                            ));
                             text = provide_plural(text);
                         }
                         _ => {
@@ -795,8 +886,15 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
                         }
                     }
                 }
-                ArgError::Swap(first_provided, second_provided, first_expected, second_expected) => {
-                    for (provided, expected) in [(first_provided, first_expected), (second_provided, second_expected)] {
+                ArgError::Swap(
+                    first_provided,
+                    second_provided,
+                    first_expected,
+                    second_expected,
+                ) => {
+                    for (provided, expected) in
+                        [(first_provided, first_expected), (second_provided, second_expected)]
+                    {
                         labels.push(self.expected_found(*provided, *expected));
                     }
                     text = match text {
@@ -821,7 +919,10 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
     /// rustc's `label_generic_mismatches`: on each argument that fixes a generic parameter the
     /// parameters left without an argument also have.
     fn label_generic_mismatches(&self, diag: &mut Diag, matched: &[Option<usize>]) {
-        let Some(CallableKind::Function(function)) = self.callable.as_ref().map(|it| it.kind()) else { return };
+        let Some(CallableKind::Function(function)) = self.callable.as_ref().map(|it| it.kind())
+        else {
+            return;
+        };
         let Some(source) = self.cx.vsema.source(function) else { return };
         let Some((params, _)) = self.param_info(source.file_id, source.value) else { return };
         for (idx, param) in params.iter().enumerate() {
@@ -866,9 +967,12 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
     fn expected_found(&self, provided: usize, expected: usize) -> (Span, String) {
         let (provided_ty, span) = &self.provided[provided];
         // alloc: the error's text, for an error hir found
-        let expected = self.expected[expected].as_ref().map_or_else(|| "_".to_owned(), |it| self.ty(it));
+        let expected =
+            self.expected[expected].as_ref().map_or_else(|| "_".to_owned(), |it| self.ty(it));
         // alloc: the error's text, for an error hir found
-        let found = self.known(provided_ty).map_or_else(String::new, |it| format!(", found `{}`", self.ty(it)));
+        let found = self
+            .known(provided_ty)
+            .map_or_else(String::new, |it| format!(", found `{}`", self.ty(it)));
         // alloc: clone: the error's parts, for an error hir found
         (span.clone(), format!("expected `{expected}`{found}"))
     }
@@ -884,16 +988,25 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
         let lang = hir_def::lang_item::lang_items(self.cx.db, self.cx.krate.base());
         let is_option = lang.Option.is_some_and(|it| hir::Enum::from(it) == adt);
         let is_result = || {
-            let core = lang.Sized.map(|it| hir::Trait::from(it).module(self.cx.db).krate(self.cx.db));
-            core == Some(adt.module(self.cx.db).krate(self.cx.db)) && *adt.name(self.cx.db).symbol() == sym::Result
+            let core =
+                lang.Sized.map(|it| hir::Trait::from(it).module(self.cx.db).krate(self.cx.db));
+            core == Some(adt.module(self.cx.db).krate(self.cx.db))
+                && *adt.name(self.cx.db).symbol() == sym::Result
         };
-        let str_ref = hir::BuiltinType::str().ty(self.cx.db).add_reference(self.cx.db, hir::Mutability::Shared);
-        ((is_option || is_result()) && self.known(provided).is_some_and(|it| self.coerces(it, &str_ref)))
-            .then(|| self.at(name.syntax().text_range()))
+        let str_ref = hir::BuiltinType::str()
+            .ty(self.cx.db)
+            .add_reference(self.cx.db, hir::Mutability::Shared);
+        ((is_option || is_result())
+            && self.known(provided).is_some_and(|it| self.coerces(it, &str_ref)))
+        .then(|| self.at(name.syntax().text_range()))
     }
 
     /// rustc's `append_arguments_changes`.
-    fn append_arguments_changes(&self, matched: &[Option<usize>], suggestions: &mut Vec<(Span, String)>) {
+    fn append_arguments_changes(
+        &self,
+        matched: &[Option<usize>],
+        suggestions: &mut Vec<(Span, String)>,
+    ) {
         let mut prev: i64 = -1;
         for (expected, provided) in matched.iter().enumerate() {
             if let Some(provided) = provided {
@@ -904,7 +1017,8 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
             if let Some((_, arg_span)) = self.provided.get(idx) {
                 prev += 1;
                 let dominated = suggestions.iter().any(|(span, _)| {
-                    (span.lo <= arg_span.lo && arg_span.hi <= span.hi) || (arg_span.lo < span.hi && span.lo < arg_span.hi)
+                    (span.lo <= arg_span.lo && arg_span.hi <= span.hi)
+                        || (arg_span.lo < span.hi && span.lo < arg_span.hi)
                 });
                 if !dominated {
                     // clone: on the error path, for an error hir found
@@ -988,7 +1102,9 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
             };
             if let Some((fallback, _)) = &multiline {
                 // clone: on the error path, for an error hir found
-                code += &span.and_then(|it| self.indentation_before(&it)).unwrap_or_else(|| fallback.clone());
+                code += &span
+                    .and_then(|it| self.indentation_before(&it))
+                    .unwrap_or_else(|| fallback.clone());
             }
             code += &text;
         }
@@ -1025,28 +1141,46 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
 
     /// rustc's `label_fn_like`: where the callee is defined, with its parameters left without an
     /// argument, and how their generic types tie them to the others.
-    fn label_fn_like(&self, diag: &mut Diag, expected_idx: Option<usize>, matched: &[Option<usize>]) {
+    fn label_fn_like(
+        &self,
+        diag: &mut Diag,
+        expected_idx: Option<usize>,
+        matched: &[Option<usize>],
+    ) {
         let Some(callable) = &self.callable else { return };
         match callable.kind() {
-            CallableKind::Function(function) => self.label_function(diag, function, expected_idx, matched),
+            CallableKind::Function(function) => {
+                self.label_function(diag, function, expected_idx, matched)
+            }
             CallableKind::TupleStruct(it) => {
                 if let Some(source) = self.cx.vsema.source(it)
                     && let Some(name) = source.value.name()
                 {
-                    diag.span_note(self.cx.span(source.with_value(name.syntax().text_range())), "tuple struct defined here");
+                    diag.span_note(
+                        self.cx.span(source.with_value(name.syntax().text_range())),
+                        "tuple struct defined here",
+                    );
                 }
             }
             CallableKind::TupleEnumVariant(it) => {
                 if let Some(source) = self.cx.vsema.source(it)
                     && let Some(name) = source.value.name()
                 {
-                    diag.span_note(self.cx.span(source.with_value(name.syntax().text_range())), "tuple variant defined here");
+                    diag.span_note(
+                        self.cx.span(source.with_value(name.syntax().text_range())),
+                        "tuple variant defined here",
+                    );
                 }
             }
             CallableKind::Closure(_) => {
-                let param = expected_idx.and_then(|it| callable.params().into_iter().nth(it)).and_then(|it| self.cx.vsema.source(it));
+                let param = expected_idx
+                    .and_then(|it| callable.params().into_iter().nth(it))
+                    .and_then(|it| self.cx.vsema.source(it));
                 if let Some(param) = param {
-                    diag.span_note(self.cx.span(param.map(|it| it.syntax().text_range())), "closure parameter defined here");
+                    diag.span_note(
+                        self.cx.span(param.map(|it| it.syntax().text_range())),
+                        "closure parameter defined here",
+                    );
                 } else if let Some(span) = self.closure_span(callable) {
                     diag.span_note(span, "closure defined here");
                 }
@@ -1060,7 +1194,13 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
         }
     }
 
-    fn label_function(&self, diag: &mut Diag, function: hir::Function, expected_idx: Option<usize>, matched: &[Option<usize>]) {
+    fn label_function(
+        &self,
+        diag: &mut Diag,
+        function: hir::Function,
+        expected_idx: Option<usize>,
+        matched: &[Option<usize>],
+    ) {
         let db = self.cx.db;
         let Some(source) = self.cx.vsema.source(function) else { return };
         let Some(name) = source.value.name() else { return };
@@ -1081,9 +1221,14 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
 
     /// rustc's `get_hir_param_info`: the parameters past the receiver of a method call, each with
     /// the position among the function's generic parameters of the one that is its whole type.
-    fn param_info(&self, file: HirFileId, function: ast::Fn<'_>) -> Option<(Vec<ParamInfo>, Vec<(Span, String)>)> {
+    fn param_info(
+        &self,
+        file: HirFileId,
+        function: ast::Fn<'_>,
+    ) -> Option<(Vec<ParamInfo>, Vec<(Span, String)>)> {
         let at = |node: Node<'_>| self.cx.span(InFile::new(file, node.text_range()));
-        let generics = || function.generic_param_list().into_iter().flat_map(|it| it.generic_params());
+        let generics =
+            || function.generic_param_list().into_iter().flat_map(|it| it.generic_params());
         let generic_names: Vec<(Span, String)> = generics()
             .map(|it| {
                 let name = match it {
@@ -1092,7 +1237,9 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
                     // alloc: the error's text, for an error hir found
                     ast::GenericParam::ConstParam(it) => it.name().map(|it| it.text().to_string()),
                     // alloc: the error's text, for an error hir found
-                    ast::GenericParam::LifetimeParam(it) => it.lifetime().map(|it| it.text().to_string()),
+                    ast::GenericParam::LifetimeParam(it) => {
+                        it.lifetime().map(|it| it.text().to_string())
+                    }
                 };
                 (at(it.syntax()), name.unwrap_or_default())
             })
@@ -1119,7 +1266,11 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
             && let Some(self_param) = list.self_param()
         {
             // alloc: the error's text, for an error hir found
-            params.push(ParamInfo { generic: None, span: at(self_param.syntax()), display: "`self`".to_owned() });
+            params.push(ParamInfo {
+                generic: None,
+                span: at(self_param.syntax()),
+                display: "`self`".to_owned(),
+            });
         }
         for param in list.params().filter(|it| it.dotdotdot_token().is_none()) {
             let idx = params.len();
@@ -1172,7 +1323,9 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
                     }
                     match param.generic {
                         // alloc: empty, allocates nothing
-                        Some(generic) => mismatched.push(Mismatched { idx, generic, deps: Vec::new() }),
+                        Some(generic) => {
+                            mismatched.push(Mismatched { idx, generic, deps: Vec::new() })
+                        }
                         // alloc: clone: the error's parts, for an error hir found
                         None => spans.labels.push((param.span.clone(), String::new())),
                     }
@@ -1197,36 +1350,60 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
         }
         let sort = |idx: usize| {
             // alloc: the error's text, for an error hir found
-            self.expected[idx].as_ref().map_or_else(|| "_".to_owned(), |it| crate::print::sort_string(self.cx, it))
+            self.expected[idx]
+                .as_ref()
+                .map_or_else(|| "_".to_owned(), |it| crate::print::sort_string(self.cx, it))
         };
         for param in &mismatched {
             // clone: on the error path, for an error hir found
             let span = params[param.idx].span.clone();
             let deps = param.deps.iter().map(|&dep| &params[dep].display);
-            match (!param.deps.is_empty()).then(|| stdx::list::list(deps, Join::AndNoSerialComma, false)) {
+            match (!param.deps.is_empty())
+                .then(|| stdx::list::list(deps, Join::AndNoSerialComma, false))
+            {
                 Some(deps) => spans
                     .labels
                     // alloc: the error's text, for an error hir found
-                    .push((span, format!("this parameter needs to match the {} type of {deps}", sort(param.deps[0])))),
+                    .push((
+                        span,
+                        format!(
+                            "this parameter needs to match the {} type of {deps}",
+                            sort(param.deps[0])
+                        ),
+                    )),
                 None => spans.labels.push((span, String::new())), // alloc: empty, allocates nothing
             }
         }
         for (idx, (param, deps)) in params.iter().zip(&dependants).enumerate() {
             if !deps.is_empty() {
-                let list = stdx::list::list(deps.iter().map(|&dep| &params[mismatched[dep].idx].display), Join::AndNoSerialComma, false);
+                let list = stdx::list::list(
+                    deps.iter().map(|&dep| &params[mismatched[dep].idx].display),
+                    Join::AndNoSerialComma,
+                    false,
+                );
                 let s = if deps.len() != 1 { "s" } else { "" };
                 // alloc: clone: the error's parts, for an error hir found
-                spans.labels.push((param.span.clone(), format!("{list} need{s} to match the {} type of this parameter", sort(idx))));
+                spans.labels.push((
+                    param.span.clone(),
+                    format!("{list} need{s} to match the {} type of this parameter", sort(idx)),
+                ));
             }
         }
         for ((span, name), uses) in generics.iter().zip(&mut generic_uses) {
             radix::sort(uses);
             uses.dedup();
             if !uses.is_empty() {
-                let list = stdx::list::list(uses.iter().map(|&idx| &params[idx].display), Join::AndNoSerialComma, false);
+                let list = stdx::list::list(
+                    uses.iter().map(|&idx| &params[idx].display),
+                    Join::AndNoSerialComma,
+                    false,
+                );
                 let quantifier = if uses.len() == 2 { "both" } else { "all" };
                 // alloc: clone: the error's parts, for an error hir found
-                spans.labels.push((span.clone(), format!("{list} {quantifier} reference this parameter `{name}`")));
+                spans.labels.push((
+                    span.clone(),
+                    format!("{list} {quantifier} reference this parameter `{name}`"),
+                ));
             }
         }
     }
@@ -1262,7 +1439,10 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
         match callee {
             ast::Expr::ClosureExpr(it) => Some(InFile::new(self.file, it)),
             ast::Expr::PathExpr(path) => {
-                let Some(PathResolution::Local(local)) = self.cx.vsema.resolve_path(path.path()?) else { return None };
+                let Some(PathResolution::Local(local)) = self.cx.vsema.resolve_path(path.path()?)
+                else {
+                    return None;
+                };
                 let source = local.primary_source_view(self.cx.db);
                 let pat = source.source.value.left()?;
                 let stmt = pat.syntax().parent().and_then(ast::LetStmt::cast)?;
@@ -1278,10 +1458,13 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
     /// The `Fn` bound that makes a callee of a type parameter callable: rustc's "callable
     /// defined here" on the clause of the enclosing item.
     fn callable_bound(&self) -> Option<Span> {
-        let callee_ty = self.cx.vsema.type_of_expr(self.callee_expr?)?.adjusted().strip_references();
+        let callee_ty =
+            self.cx.vsema.type_of_expr(self.callee_expr?)?.adjusted().strip_references();
         let param = callee_ty.as_type_param(self.cx.db)?;
         let source = self.cx.vsema.source(param.merge())?;
-        let Either::Left(ast::TypeOrConstParam::Type(type_param)) = source.value else { return None };
+        let Either::Left(ast::TypeOrConstParam::Type(type_param)) = source.value else {
+            return None;
+        };
         let type_param = source.with_value(type_param);
         let name = type_param.value.name()?.text();
         let fn_traits: Vec<hir::Trait> = [LangItem::Fn, LangItem::FnMut, LangItem::FnOnce]
@@ -1297,7 +1480,8 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
             )
         };
         let inline = type_param.value.type_bound_list().into_iter().flat_map(|it| it.bounds());
-        let owner = type_param.value.syntax().ancestors().find_map(ast::AnyHasGenericParams::cast)?;
+        let owner =
+            type_param.value.syntax().ancestors().find_map(ast::AnyHasGenericParams::cast)?;
         let where_bounds = owner
             .where_clause()
             .into_iter()
@@ -1325,6 +1509,9 @@ fn a_or_an(s: &str) -> &'static str {
         first = next;
     }
     // alloc: the error's text, for an error hir found
-    if ["a", "e", "i", "o", "u", "&"].contains(&first.to_lowercase().to_string().as_str()) { "an" } else { "a" }
+    if ["a", "e", "i", "o", "u", "&"].contains(&first.to_lowercase().to_string().as_str()) {
+        "an"
+    } else {
+        "a"
+    }
 }
-

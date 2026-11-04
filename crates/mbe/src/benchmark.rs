@@ -2,8 +2,8 @@
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use intern::Symbol;
+use std::alloc::Global;
 use stdx::itertools::Itertools;
 use syntax::view::{self as ast, AstNode as _, HasName as _};
 use syntax_bridge::{

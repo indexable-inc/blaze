@@ -14,9 +14,8 @@ use blaze_format::cursor::Reader;
 use blaze_ids::ContentId;
 
 use crate::{
-    BundleId, BundleSpec, Client, Download, Downloaded, Endpoint, GotBundle, Locked, Manifest, Public, Published,
-    Record, Secrets, Server, Signed, Trust, client, http,
-    record_key,
+    BundleId, BundleSpec, Client, Download, Downloaded, Endpoint, GotBundle, Locked, Manifest,
+    Public, Published, Record, Secrets, Server, Signed, Trust, client, http, record_key,
     sign::tests::publisher,
     tls::clear::Clears,
     wire::{self, BODY_MOST, CHUNKED_FROM, SendWindow},
@@ -197,8 +196,14 @@ impl World {
         let mut world = World::bare(seed);
         let listen = Tag(RAW);
         world.effects.push(Effect::Listen { at: at(), tag: listen });
-        world.raw =
-            Some(Raw { listen, next: 0, conns: Vec::new(), accepted: 0, requests: Vec::new(), answer: Box::new(answer) });
+        world.raw = Some(Raw {
+            listen,
+            next: 0,
+            conns: Vec::new(),
+            accepted: 0,
+            requests: Vec::new(),
+            answer: Box::new(answer),
+        });
         world
     }
 
@@ -267,7 +272,8 @@ impl World {
         let mut fetched = self.mine.fetched();
         let mut bundles = self.client.bundles();
         if let Some(download) = &mut self.download {
-            bundles = download.bundles(bundles, &mut self.mine, &mut self.client, &mut self.effects);
+            bundles =
+                download.bundles(bundles, &mut self.mine, &mut self.client, &mut self.effects);
             fetched = download.fetched(fetched);
         }
         self.fetched.extend(fetched);
@@ -281,7 +287,8 @@ impl World {
     }
 
     fn how(&self, key: &Key) -> &Fetched {
-        let found: Vec<&Fetched> = self.fetched.iter().filter(|(it, _)| it == key).map(|(_, how)| how).collect();
+        let found: Vec<&Fetched> =
+            self.fetched.iter().filter(|(it, _)| it == key).map(|(_, how)| how).collect();
         assert_eq!(found.len(), 1, "{key:?} fetched {} times: {:?}", found.len(), self.fetched);
         found[0]
     }
@@ -345,17 +352,26 @@ fn values_fetched_from_the_cache_are_kept_as_they_were_published() {
         for (key, kind, bytes) in values() {
             world.seed(key, kind, &bytes);
         }
-        let mut asked: Vec<Public> = values().iter().map(|(key, kind, _)| public(*key, *kind)).collect();
+        let mut asked: Vec<Public> =
+            values().iter().map(|(key, kind, _)| public(*key, *kind)).collect();
         asked.push(public(key(99), Kind::Query));
         world.fetch(&asked);
         for (key, _, bytes) in values() {
-            assert!(matches!(world.how(&key), Fetched::Kept(_)), "seed {seed}: {:?}", world.how(&key));
+            assert!(
+                matches!(world.how(&key), Fetched::Kept(_)),
+                "seed {seed}: {:?}",
+                world.how(&key)
+            );
             assert_eq!(world.kept(&key), Some(bytes), "seed {seed}");
         }
         assert_eq!(world.how(&key(99)), &Fetched::Missing);
         world.fetched.clear();
         world.fetch(&asked);
-        assert_eq!(world.fetched, vec![(key(99), Fetched::Missing)], "seed {seed}: what is kept is not asked again");
+        assert_eq!(
+            world.fetched,
+            vec![(key(99), Fetched::Missing)],
+            "seed {seed}: what is kept is not asked again"
+        );
     }
 }
 
@@ -412,25 +428,34 @@ fn keys_a_full_response_defers_are_asked_again() {
             .collect();
         send(response(200, &fetch_answer(&items)))
     });
-    let asked: Vec<Public> = (0..3).map(|n| public(key(n), if n == 0 { Kind::Code } else { Kind::Query })).collect();
+    let asked: Vec<Public> =
+        (0..3).map(|n| public(key(n), if n == 0 { Kind::Code } else { Kind::Query })).collect();
     world.fetch(&asked);
     assert_eq!(world.kept(&key(0)).as_deref(), Some(&b"the only value"[..]));
     assert_eq!(world.how(&key(1)), &Fetched::Missing);
     assert_eq!(world.how(&key(2)), &Fetched::Missing);
-    let named: Vec<usize> = world.requests().iter().map(|(_, body)| wire::parse_fetch_ask(body).unwrap().len()).collect();
+    let named: Vec<usize> = world
+        .requests()
+        .iter()
+        .map(|(_, body)| wire::parse_fetch_ask(body).unwrap().len())
+        .collect();
     assert_eq!(named, vec![3, 2, 1], "each deferred key is asked again, and only those");
 }
 
 /// A world whose raw server answers every fetch with `items(keys)`, once: a key refused is
 /// not asked of it again.
 fn answered(seed: u64, items: impl Fn(&[Key]) -> Vec<(Key, Item)> + 'static) -> World {
-    World::raw(seed, move |_, body| send(response(200, &fetch_answer(&items(&wire::parse_fetch_ask(body).unwrap())))))
+    World::raw(seed, move |_, body| {
+        send(response(200, &fetch_answer(&items(&wire::parse_fetch_ask(body).unwrap()))))
+    })
 }
 
 #[test]
 fn a_value_signed_by_a_key_not_pinned_is_refused_naming_its_key() {
     let bytes = b"bytes from anyone".to_vec();
-    let mut world = answered(12, move |keys| vec![(keys[0], Item::Found(signed_by(2, keys[0], Kind::Code, &bytes), bytes.clone()))]);
+    let mut world = answered(12, move |keys| {
+        vec![(keys[0], Item::Found(signed_by(2, keys[0], Kind::Code, &bytes), bytes.clone()))]
+    });
     world.fetch(&[public(key(0), Kind::Code)]);
     let why = world.refused(&key(0));
     assert!(why.contains(&format!("{:x}", key(0).0)) && why.contains("does not pin"), "{why}");
@@ -445,7 +470,9 @@ fn a_value_signed_by_a_key_not_pinned_is_refused_naming_its_key() {
 fn a_fetched_value_verified_across_checkouts_is_refused_before_it_is_kept() {
     let unmarked = Key(ContentId::of("blaze-global test", b"unmarked"));
     let bytes = blaze_usercode::index::verified_value(&unmarked, b"an expansion");
-    let mut world = answered(16, move |keys| vec![(keys[0], Item::Found(signed_by(1, keys[0], Kind::Run, &bytes), bytes.clone()))]);
+    let mut world = answered(16, move |keys| {
+        vec![(keys[0], Item::Found(signed_by(1, keys[0], Kind::Run, &bytes), bytes.clone()))]
+    });
     world.fetch(&[public(key(0), Kind::Run)]);
     let why = world.refused(&key(0));
     assert!(why.contains("verified across checkouts"), "{why}");
@@ -460,12 +487,22 @@ fn a_value_verified_across_checkouts_is_refused_before_it_is_published() {
     let secrets = Secrets::new();
     let unmarked = Key(ContentId::of("blaze-global test", b"unmarked"));
     let bytes = blaze_usercode::index::verified_value(&unmarked, b"an expansion");
-    let refused = world.client.publish(&public(key(0), Kind::Run), bytes, &publisher(1), &secrets, &mut world.effects).unwrap_err();
+    let refused = world
+        .client
+        .publish(&public(key(0), Kind::Run), bytes, &publisher(1), &secrets, &mut world.effects)
+        .unwrap_err();
     assert_eq!(refused.key, key(0));
     let why = refused.to_string();
-    assert!(why.contains(&format!("{:x}", key(0).0)) && why.contains("verified across checkouts"), "{why}");
+    assert!(
+        why.contains(&format!("{:x}", key(0).0)) && why.contains("verified across checkouts"),
+        "{why}"
+    );
     world.run();
-    assert!(world.published.iter().all(|it| it.key != key(0)), "sent to the cache: {:?}", world.published);
+    assert!(
+        world.published.iter().all(|it| it.key != key(0)),
+        "sent to the cache: {:?}",
+        world.published
+    );
 }
 
 #[test]
@@ -496,7 +533,9 @@ fn a_value_that_is_not_the_one_its_signed_record_names_is_refused() {
 #[test]
 fn a_signed_record_of_another_key_is_not_taken_for_the_key_asked() {
     let bytes = b"another key's value".to_vec();
-    let mut world = answered(15, move |keys| vec![(keys[0], Item::Found(signed_by(1, key(77), Kind::Code, &bytes), bytes.clone()))]);
+    let mut world = answered(15, move |keys| {
+        vec![(keys[0], Item::Found(signed_by(1, key(77), Kind::Code, &bytes), bytes.clone()))]
+    });
     world.fetch(&[public(key(0), Kind::Code)]);
     assert!(world.refused(&key(0)).contains("a record of"), "{}", world.refused(&key(0)));
 }
@@ -511,47 +550,107 @@ fn damaged_truncated_reordered_and_oversized_frames_are_refused() {
         noise(100, key.0.0[0].into())
     }
     let good = |keys: &[Key]| -> Vec<u8> {
-        let items: Vec<(Key, Item)> =
-            keys.iter().map(|key| (*key, Item::Found(signed_by(1, *key, Kind::Code, &value(key)), value(key)))).collect();
+        let items: Vec<(Key, Item)> = keys
+            .iter()
+            .map(|key| (*key, Item::Found(signed_by(1, *key, Kind::Code, &value(key)), value(key))))
+            .collect();
         fetch_answer(&items)
     };
     let cases: Vec<(&str, Damage, &str)> = vec![
-        ("a magic of another body", |_, mut body| { body[0] = b'X'; send(response(200, &body)) }, "magic"),
-        ("another version", |_, mut body| { body[6] = 9; send(response(200, &body)) }, "version 9"),
+        (
+            "a magic of another body",
+            |_, mut body| {
+                body[0] = b'X';
+                send(response(200, &body))
+            },
+            "magic",
+        ),
+        (
+            "another version",
+            |_, mut body| {
+                body[6] = 9;
+                send(response(200, &body))
+            },
+            "version 9",
+        ),
         ("cut short", |_, body| send(response(200, &body[..body.len() - 7])), "truncated"),
-        ("answers in another order", |keys, _| {
-            let mut reversed = keys.to_vec();
-            reversed.reverse();
-            let items: Vec<(Key, Item)> = reversed.into_iter().map(|key| (key, Item::Missing)).collect();
-            send(response(200, &fetch_answer(&items)))
-        }, "in place of"),
-        ("fewer answers", |keys, _| {
-            let items: Vec<(Key, Item)> = keys[1..].iter().map(|key| (*key, Item::Missing)).collect();
-            send(response(200, &fetch_answer(&items)))
-        }, "answers for"),
-        ("an unknown answer", |_, mut body| { body[12] = 7; send(response(200, &body)) }, "unknown answer 7"),
-        ("a body longer than allowed", |_, _| {
-            send(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", BODY_MOST + 1).into_bytes())
-        }, "more than"),
-        ("chunked", |_, _| send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec()), "chunked"),
+        (
+            "answers in another order",
+            |keys, _| {
+                let mut reversed = keys.to_vec();
+                reversed.reverse();
+                let items: Vec<(Key, Item)> =
+                    reversed.into_iter().map(|key| (key, Item::Missing)).collect();
+                send(response(200, &fetch_answer(&items)))
+            },
+            "in place of",
+        ),
+        (
+            "fewer answers",
+            |keys, _| {
+                let items: Vec<(Key, Item)> =
+                    keys[1..].iter().map(|key| (*key, Item::Missing)).collect();
+                send(response(200, &fetch_answer(&items)))
+            },
+            "answers for",
+        ),
+        (
+            "an unknown answer",
+            |_, mut body| {
+                body[12] = 7;
+                send(response(200, &body))
+            },
+            "unknown answer 7",
+        ),
+        (
+            "a body longer than allowed",
+            |_, _| {
+                send(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", BODY_MOST + 1)
+                        .into_bytes(),
+                )
+            },
+            "more than",
+        ),
+        (
+            "chunked",
+            |_, _| send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec()),
+            "chunked",
+        ),
         ("not HTTP", |_, _| send(b"SSH-2.0-OpenSSH\r\n\r\n".to_vec()), "HTTP/1.1"),
         ("a hang-up", |_, _| send_and_hang_up(Vec::new()), "hung up"),
-        ("a hang-up mid-response", |_, body| {
-            let mut bytes = response(200, &body);
-            bytes.truncate(bytes.len() / 2);
-            send_and_hang_up(bytes)
-        }, "hung up"),
-        ("an error status", |_, _| send(response(503, b"the cache's store is not open yet")), "503"),
-        ("a count of pieces past the body", |_, mut body| {
-            let at = 12 + 33 + crate::sign::SIGNED_LEN;
-            body[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-            send(response(200, &body))
-        }, "truncated"),
-        ("a piece longer than allowed", |_, mut body| {
-            let at = 12 + 33 + crate::sign::SIGNED_LEN + 4 + 1;
-            body[at..at + 4].copy_from_slice(&((wire::PIECE_MOST + 1) as u32).to_le_bytes());
-            send(response(200, &body))
-        }, "allowed"),
+        (
+            "a hang-up mid-response",
+            |_, body| {
+                let mut bytes = response(200, &body);
+                bytes.truncate(bytes.len() / 2);
+                send_and_hang_up(bytes)
+            },
+            "hung up",
+        ),
+        (
+            "an error status",
+            |_, _| send(response(503, b"the cache's store is not open yet")),
+            "503",
+        ),
+        (
+            "a count of pieces past the body",
+            |_, mut body| {
+                let at = 12 + 33 + crate::sign::SIGNED_LEN;
+                body[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+                send(response(200, &body))
+            },
+            "truncated",
+        ),
+        (
+            "a piece longer than allowed",
+            |_, mut body| {
+                let at = 12 + 33 + crate::sign::SIGNED_LEN + 4 + 1;
+                body[at..at + 4].copy_from_slice(&((wire::PIECE_MOST + 1) as u32).to_le_bytes());
+                send(response(200, &body))
+            },
+            "allowed",
+        ),
     ];
     for (n, (what, damage, says)) in cases.into_iter().enumerate() {
         let mut world = World::raw(100 + n as u64, move |_, body| {
@@ -567,7 +666,10 @@ fn damaged_truncated_reordered_and_oversized_frames_are_refused() {
                 Fetched::Refused(why) => {
                     refused += 1;
                     assert!(why.contains(says), "{what}: {why:?} does not say {says:?}");
-                    assert!(why.contains(&format!("{:x}", key.0)), "{what}: {why:?} does not name the key");
+                    assert!(
+                        why.contains(&format!("{:x}", key.0)),
+                        "{what}: {why:?} does not name the key"
+                    );
                     assert_eq!(world.kept(&key), None, "{what}");
                 }
                 Fetched::Kept(_) => assert_eq!(world.kept(&key), Some(value(&key)), "{what}"),
@@ -583,12 +685,15 @@ fn damaged_truncated_reordered_and_oversized_frames_are_refused() {
 /// exactly its value, or not kept; never kept with other bytes.
 #[test]
 fn no_damage_makes_a_value_kept_with_other_bytes() {
-    let values: Vec<(Key, Vec<u8>)> = (0..4).map(|n| (key(n), noise(if n == 3 { 3 * CHUNKED_FROM } else { 50 }, n))).collect();
+    let values: Vec<(Key, Vec<u8>)> =
+        (0..4).map(|n| (key(n), noise(if n == 3 { 3 * CHUNKED_FROM } else { 50 }, n))).collect();
     let good = {
         let values = values.clone();
         let items: Vec<(Key, Item)> = values
             .iter()
-            .map(|(key, bytes)| (*key, Item::Found(signed_by(1, *key, Kind::Code, bytes), bytes.clone())))
+            .map(|(key, bytes)| {
+                (*key, Item::Found(signed_by(1, *key, Kind::Code, bytes), bytes.clone()))
+            })
             .collect();
         fetch_answer(&items)
     };
@@ -607,8 +712,12 @@ fn no_damage_makes_a_value_kept_with_other_bytes() {
         world.fetch(&asked);
         for (key, bytes) in &values {
             match world.how(key) {
-                Fetched::Kept(_) => assert_eq!(world.kept(key).as_ref(), Some(bytes), "round {round}"),
-                Fetched::Refused(_) | Fetched::Missing => assert_eq!(world.kept(key), None, "round {round}"),
+                Fetched::Kept(_) => {
+                    assert_eq!(world.kept(key).as_ref(), Some(bytes), "round {round}")
+                }
+                Fetched::Refused(_) | Fetched::Missing => {
+                    assert_eq!(world.kept(key), None, "round {round}")
+                }
             }
         }
     }
@@ -635,7 +744,12 @@ fn what_the_builders_publish_any_machine_fetches() {
     secrets.publisher(&publisher(1));
     let mut tags = Vec::new();
     for (key, kind, bytes) in values() {
-        tags.push(world.client.publish(&public(key, kind), bytes, &publisher(1), &secrets, &mut world.effects).unwrap());
+        tags.push(
+            world
+                .client
+                .publish(&public(key, kind), bytes, &publisher(1), &secrets, &mut world.effects)
+                .unwrap(),
+        );
     }
     world.run();
     let mut answered: Vec<Tag> = world.published.iter().map(|it| it.tag).collect();
@@ -655,12 +769,41 @@ fn the_cache_refuses_a_publish_no_pinned_key_signed_and_keeps_one_value_a_key() 
     let mut world = World::new(19);
     let secrets = Secrets::new();
     let value = b"a value".to_vec();
-    world.client.publish(&public(key(0), Kind::Code), value.clone(), &publisher(2), &secrets, &mut world.effects).unwrap();
-    world.client.publish(&public(key(1), Kind::Code), value.clone(), &publisher(1), &secrets, &mut world.effects).unwrap();
+    world
+        .client
+        .publish(
+            &public(key(0), Kind::Code),
+            value.clone(),
+            &publisher(2),
+            &secrets,
+            &mut world.effects,
+        )
+        .unwrap();
+    world
+        .client
+        .publish(
+            &public(key(1), Kind::Code),
+            value.clone(),
+            &publisher(1),
+            &secrets,
+            &mut world.effects,
+        )
+        .unwrap();
     world.run();
-    world.client.publish(&public(key(1), Kind::Code), b"another".to_vec(), &publisher(1), &secrets, &mut world.effects).unwrap();
+    world
+        .client
+        .publish(
+            &public(key(1), Kind::Code),
+            b"another".to_vec(),
+            &publisher(1),
+            &secrets,
+            &mut world.effects,
+        )
+        .unwrap();
     world.run();
-    let result = |key: Key, n: usize| world.published.iter().filter(|it| it.key == key).nth(n).unwrap().result.clone();
+    let result = |key: Key, n: usize| {
+        world.published.iter().filter(|it| it.key == key).nth(n).unwrap().result.clone()
+    };
     assert!(result(key(0), 0).unwrap_err().contains("does not pin"));
     assert_eq!(result(key(1), 0), Ok(()));
     assert!(result(key(1), 1).unwrap_err().contains("another value"));
@@ -684,7 +827,13 @@ fn a_value_holding_a_secret_is_never_published() {
     for (n, bytes) in holding.into_iter().enumerate() {
         let refused = world
             .client
-            .publish(&public(key(n as u64), Kind::Output), bytes, &publisher(1), &secrets, &mut world.effects)
+            .publish(
+                &public(key(n as u64), Kind::Output),
+                bytes,
+                &publisher(1),
+                &secrets,
+                &mut world.effects,
+            )
             .unwrap_err();
         assert_eq!(refused.key, key(n as u64));
         assert!(!refused.why.contains(token) && !refused.why.contains(&seed_hex), "{refused}");
@@ -700,7 +849,10 @@ fn the_server_refuses_requests_that_are_not_ones() {
     let cases: Vec<(Vec<u8>, &str)> = vec![
         (b"GET /v1/fetch HTTP/1.1\r\nContent-Length: 0\r\n\r\n".to_vec(), "405"),
         (b"POST /v2/everything HTTP/1.1\r\nContent-Length: 0\r\n\r\n".to_vec(), "404"),
-        (format!("POST /v1/fetch HTTP/1.1\r\nContent-Length: {}\r\n\r\n", 1 << 30).into_bytes(), "413"),
+        (
+            format!("POST /v1/fetch HTTP/1.1\r\nContent-Length: {}\r\n\r\n", 1 << 30).into_bytes(),
+            "413",
+        ),
         (b"POST /v1/publish HTTP/1.1\r\n\r\n".to_vec(), "411"),
         (b"POST /v1/fetch HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc".to_vec(), "400"),
         (b"POST /v1/publish HTTP/1.1\r\nContent-Length: 4\r\n\r\nBLZG".to_vec(), "400"),
@@ -714,7 +866,10 @@ fn the_server_refuses_requests_that_are_not_ones() {
         let answer = world.sim.peer_received(conn);
         let head = http::response_head(&answer, u64::MAX).unwrap().unwrap();
         assert_eq!(head.status.to_string(), status, "{}", String::from_utf8_lossy(&answer));
-        assert!(head.close && world.sim.peer_hung_up_on(conn), "a refused request ends its connection");
+        assert!(
+            head.close && world.sim.peer_hung_up_on(conn),
+            "a refused request ends its connection"
+        );
     }
 }
 
@@ -793,11 +948,22 @@ fn built(name: &str, _: &str) -> Option<Vec<String>> {
 fn a_bundle_holds_the_crates_io_packages_a_build_builds() {
     let locked = Locked::parse(lock(), built).unwrap();
     let names: Vec<&str> = locked.iter().map(|it| it.name.as_str()).collect();
-    assert_eq!(names, ["libc", "serde"], "workspace, git, other registries and packages not built are not in it");
+    assert_eq!(
+        names,
+        ["libc", "serde"],
+        "workspace, git, other registries and packages not built are not in it"
+    );
     assert_eq!(locked[1].features, ["derive", "std"]);
     assert_eq!(locked[1].checksum[..2], [0x5f, 0x0e]);
-    let no_checksum = lock().replace("checksum = \"875b3680cb2f8f71bdcf9a30f38d48282f5d3c95cbf9b3fa57269bb5d5c06828\"\n", "");
-    assert!(Locked::parse(&no_checksum, built).unwrap_err().contains("libc 0.2.170 of crates.io has no checksum"));
+    let no_checksum = lock().replace(
+        "checksum = \"875b3680cb2f8f71bdcf9a30f38d48282f5d3c95cbf9b3fa57269bb5d5c06828\"\n",
+        "",
+    );
+    assert!(
+        Locked::parse(&no_checksum, built)
+            .unwrap_err()
+            .contains("libc 0.2.170 of crates.io has no checksum")
+    );
     let bad = lock().replace("5f0e2c6e", "5f0e2c6z");
     assert!(Locked::parse(&bad, built).unwrap_err().contains("not 64 hex digits"));
     assert!(Locked::parse("[[package]\n", built).unwrap_err().contains("not TOML"));
@@ -835,7 +1001,9 @@ fn a_bundle_is_named_by_everything_its_build_is_a_function_of() {
 }
 
 fn manifest(entries: &[(Key, Kind, Vec<u8>)]) -> Manifest {
-    let records = entries.iter().map(|(key, kind, bytes)| (public(*key, *kind), Record::of(*key, *kind, bytes)));
+    let records = entries
+        .iter()
+        .map(|(key, kind, bytes)| (public(*key, *kind), Record::of(*key, *kind, bytes)));
     Manifest::sign(BundleId::of(&spec()), records, &publisher(1))
 }
 
@@ -871,7 +1039,10 @@ fn a_cold_build_is_one_download() {
     let mut world = World::new(22);
     let secrets = Secrets::new();
     for (key, kind, bytes) in values() {
-        world.client.publish(&public(key, kind), bytes, &publisher(1), &secrets, &mut world.effects).unwrap();
+        world
+            .client
+            .publish(&public(key, kind), bytes, &publisher(1), &secrets, &mut world.effects)
+            .unwrap();
     }
     world.run();
     let manifest = manifest(&values());
@@ -916,7 +1087,13 @@ fn the_cache_keeps_no_manifest_listing_what_it_lacks() {
 
 #[test]
 fn a_manifest_no_pinned_key_signed_is_refused_and_nothing_is_fetched() {
-    let unsigned = Manifest::sign(BundleId::of(&spec()), values().iter().map(|(key, kind, bytes)| (public(*key, *kind), Record::of(*key, *kind, bytes))), &publisher(2));
+    let unsigned = Manifest::sign(
+        BundleId::of(&spec()),
+        values()
+            .iter()
+            .map(|(key, kind, bytes)| (public(*key, *kind), Record::of(*key, *kind, bytes))),
+        &publisher(2),
+    );
     let mut world = World::raw(24, move |path, _| {
         assert_eq!(path, client::BUNDLE_PATH, "nothing it lists is fetched");
         let mut body = Vec::new();
@@ -925,7 +1102,8 @@ fn a_manifest_no_pinned_key_signed_is_refused_and_nothing_is_fetched() {
         unsigned.encode(&mut body);
         send(response(200, &body))
     });
-    world.download = Some(Download::start(BundleId::of(&spec()), &mut world.client, &mut world.effects));
+    world.download =
+        Some(Download::start(BundleId::of(&spec()), &mut world.client, &mut world.effects));
     world.run();
     let done = world.download.take().unwrap();
     let why = done.done().unwrap().clone().unwrap_err();
@@ -964,7 +1142,10 @@ fn a_value_a_manifest_lists_is_checked_against_its_listed_record() {
     world.run();
     let why = world.download.take().unwrap().done().unwrap().clone().unwrap_err();
     assert!(why.contains("not the one its bundle's manifest lists"), "{why}");
-    assert!(why.contains(&format!("{} of its {} values were not kept", values().len(), values().len())), "{why}");
+    assert!(
+        why.contains(&format!("{} of its {} values were not kept", values().len(), values().len())),
+        "{why}"
+    );
     for (key, _, _) in values() {
         assert_eq!(world.kept(&key), None);
     }

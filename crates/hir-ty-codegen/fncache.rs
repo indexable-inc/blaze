@@ -38,24 +38,19 @@ use std::sync::LazyLock;
 
 use base_db::{Crate, Db, LangCrateOrigin};
 use blaze_hash::{FixedState, HashMap, HashSet};
-use std::alloc::Global;
 use blaze_query::db::{AsId, FromId};
 use cranelift_codegen::ir::{InstBuilder, Value, types};
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, VariantId,
-    signatures::{
-        FunctionSignature, StaticSignature, StructSignature, TraitSignature,
-    },
+    signatures::{FunctionSignature, StaticSignature, StructSignature, TraitSignature},
 };
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
+use std::alloc::Global;
 
 use hir_ty::{
     InferBodyId,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
-    mir::{
-        AggregateKind, MirSpan, Operand, OperandKind, Rvalue, StatementKind,
-        TerminatorKind,
-    },
+    mir::{AggregateKind, MirSpan, Operand, OperandKind, Rvalue, StatementKind, TerminatorKind},
     next_solver::{DbInterner, GenericArgs, ParamEnv, Ty, TyKind},
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
@@ -63,8 +58,8 @@ use hir_ty_mir::mir::purity::{is_const_pure, operands, raw_use};
 
 use super::{
     CodegenError, CompiledFunction, ConstBlob, DataRequest, FuncTarget, FunctionCx, Instance,
-    InstanceDef, MEM, Requests, Result, compiled_instance, compiled_root, compiled_static,
-    Target, is_thread_local, link_name_for,
+    InstanceDef, MEM, Requests, Result, Target, compiled_instance, compiled_root, compiled_static,
+    is_thread_local, link_name_for,
 };
 
 /// The function whose instance names how the arguments and the result are written: reached
@@ -78,8 +73,7 @@ const FORMAT: u32 = 2;
 /// `#[blaze::pure]` check takes it (docs/v2/plan/design/code-identity.md).
 const CACHED_CODE_DOMAIN: &str = "blaze v2 cached code 1";
 /// Whether `BLAZE_FN_CACHE_TRACE` asks for what the walk goes through, read once a process.
-static TRACE: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some());
+static TRACE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some());
 
 /// Whether `func` is the function a cached function asks for the code of its body.
 pub(super) fn is_code(db: &Db, func: FunctionId) -> bool {
@@ -100,10 +94,7 @@ pub(super) fn cached_closure(db: &Db, func: FunctionId) -> Option<blaze_query::d
 }
 
 #[blaze_query::tracked]
-fn cached_closure_of<'db>(
-    db: &'db Db,
-    func: FunctionId,
-) -> Option<InternedClosureId<'db>> {
+fn cached_closure_of<'db>(db: &'db Db, func: FunctionId) -> Option<InternedClosureId<'db>> {
     let body = db.mir_body(func.into()).ok()?;
     body.basic_blocks.iter().find_map(|(_, block)| {
         let TerminatorKind::Call { func: callee, .. } = &block.terminator.as_ref()?.kind else {
@@ -169,7 +160,10 @@ pub(super) fn cache_code(
     let (trouble, counted) = arguments_trouble(db, &closure, &env);
     let target = super::target_of_crate(db, env.as_ref(db).krate).map_err(|e| {
         // alloc: the error's message
-        Uncached::Refused(format!("`{}` (`#[blaze::cache]`) has no target: {e}", cached_name(db, &closure)))
+        Uncached::Refused(format!(
+            "`{}` (`#[blaze::cache]`) has no target: {e}",
+            cached_name(db, &closure)
+        ))
     })?;
     let mut walk = Walk::new(db, target, counted);
     // clone: the root node owns its key; a stored param env is a reference count
@@ -208,14 +202,13 @@ pub(super) fn cache_code(
         subject: hir_ty_identity::Subject::Body(hir_ty_mir::mir::dispatch::Body::Closure(id)),
         args: closure.args.clone(), // clone: the query's key, a reference count
     };
-    let code = hir_ty_identity::code_id(db, &root, &env)
-        .map_err(|why| {
-            // alloc: the error's message
-            Uncached::Refused(format!(
-                "`{}` (`#[blaze::cache]`) has no code identity for its body: {why}",
-                cached_name(db, &closure)
-            ))
-        })?;
+    let code = hir_ty_identity::code_id(db, &root, &env).map_err(|why| {
+        // alloc: the error's message
+        Uncached::Refused(format!(
+            "`{}` (`#[blaze::cache]`) has no code identity for its body: {why}",
+            cached_name(db, &closure)
+        ))
+    })?;
     // The nightly: what is outside the checkout is linked as its pre-built std, whose code a
     // nightly can change.
     let mut hasher = blaze_ids::Hasher::new(CACHED_CODE_DOMAIN);
@@ -807,7 +800,9 @@ impl<'db> Walk<'db> {
                 let ItemContainerId::ImplId(id) = func.lookup(db).container else { return false };
                 hasher_of(db, db.impl_self_ty(id).skip_binder()).is_some()
             }
-            base_db::CrateOrigin::Lang(_) => krate.rust_name(db).is_ok_and(|it| it.as_str() == "hashbrown"),
+            base_db::CrateOrigin::Lang(_) => {
+                krate.rust_name(db).is_ok_and(|it| it.as_str() == "hashbrown")
+            }
             _ => false,
         }
     }
@@ -1143,12 +1138,7 @@ fn gives_address(db: &Db, func: FunctionId, own: bool) -> Option<&'static str> {
 /// Whether a call of `func` is to stay a call, not have the callee built in where it is
 /// called: the walk knows what it does by the function called, and a body built into its
 /// caller is not called. `own` is whether the caller is code of the workspace.
-pub(super) fn kept_a_call(
-    db: &Db,
-    func: FunctionId,
-    args: GenericArgs<'_>,
-    own: bool,
-) -> bool {
+pub(super) fn kept_a_call(db: &Db, func: FunctionId, args: GenericArgs<'_>, own: bool) -> bool {
     gives_address(db, func, own).is_some()
         || makes_seed(db, func)
         || seeded_order(db, func, args).is_some()
@@ -1176,11 +1166,7 @@ fn makes_seed(db: &Db, func: FunctionId) -> bool {
 /// What a function of std's `HashMap` or `HashSet` of `RandomState` does that tells the order
 /// of its entries, which the seed decides, or gives the seed itself. What only looks up,
 /// inserts or counts gives the same whatever the seed.
-fn seeded_order(
-    db: &Db,
-    func: FunctionId,
-    args: GenericArgs<'_>,
-) -> Option<&'static str> {
+fn seeded_order(db: &Db, func: FunctionId, args: GenericArgs<'_>) -> Option<&'static str> {
     if !matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std)) {
         return None;
     }
@@ -1386,11 +1372,7 @@ fn describe(db: &Db, node: &Node) -> String {
 }
 
 /// File, line and column of a place in a body, the file relative to the workspace.
-pub(super) fn location(
-    db: &Db,
-    owner: InferBodyId<'_>,
-    span: MirSpan,
-) -> Option<String> {
+pub(super) fn location(db: &Db, owner: InferBodyId<'_>, span: MirSpan) -> Option<String> {
     let InferBodyId::DefWithBodyId(owner) = owner else { return None };
     let (file, line, column) = super::source_location(db, owner, span)?;
     let root = db.file_source_root(file).source_root_id(db);

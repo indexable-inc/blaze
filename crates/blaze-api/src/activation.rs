@@ -95,7 +95,8 @@ pub fn systemd(listen: Listen<'_>, own: u32, want: &str) -> Result<i32, Activati
         )));
     };
     // alloc: error path, a daemon that cannot start.
-    let pid = decimal(pid).ok_or_else(|| ActivationError::new(format!("LISTEN_PID={pid:?} is no process ID")))?;
+    let pid = decimal(pid)
+        .ok_or_else(|| ActivationError::new(format!("LISTEN_PID={pid:?} is no process ID")))?;
     if pid != u64::from(own) {
         // alloc: error path, a daemon that cannot start.
         return Err(ActivationError::new(format!(
@@ -103,10 +104,13 @@ pub fn systemd(listen: Listen<'_>, own: u32, want: &str) -> Result<i32, Activati
         )));
     }
     // alloc: error path, a daemon that cannot start.
-    let count = decimal(fds).ok_or_else(|| ActivationError::new(format!("LISTEN_FDS={fds:?} is no count")))?;
+    let count = decimal(fds)
+        .ok_or_else(|| ActivationError::new(format!("LISTEN_FDS={fds:?} is no count")))?;
     match count {
         // alloc: error path, a daemon that cannot start.
-        0 => return Err(ActivationError::new("systemd passed no socket (LISTEN_FDS=0)".to_owned())),
+        0 => {
+            return Err(ActivationError::new("systemd passed no socket (LISTEN_FDS=0)".to_owned()));
+        }
         1 => {}
         n => {
             let last = u64::from(FIRST_FD.unsigned_abs()).saturating_add(n - 1);
@@ -168,7 +172,9 @@ pub fn launchd(said: Launchd, want: &str) -> Result<(), ActivationError> {
                 .to_owned()
         }
         // alloc: error path, as above.
-        Launchd::NoSuchSocket => format!("the launchd job that started it has no socket named {want} in its plist's Sockets"),
+        Launchd::NoSuchSocket => format!(
+            "the launchd job that started it has no socket named {want} in its plist's Sockets"
+        ),
         // alloc: error path, as above.
         Launchd::Already => format!("launchd's socket {want} was taken already in this process"),
         // alloc: error path, as above.

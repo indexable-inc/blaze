@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use blaze_mem::Tag;
 use blaze_mem::blocks::Slice;
-use parking_lot::Mutex;
 use derive_where::derive_where;
+use parking_lot::Mutex;
 use rustc_hash::FxBuildHasher;
 
 use super::{AvailableDepth, Cx, NestedGoals, RequiredDepth};
@@ -153,9 +153,11 @@ impl<X: Cx> GlobalCache<X> {
         let goal = self.goals.intern(input);
         let index = self.results.intern(result);
         let depth = u32::try_from(required_depth.0).expect("a solver depth past `u32::MAX`");
-        let writers =
-            self.writers.get_or_init(|| table("writer locks", self.sharing.shards(), |_| Writer::new()));
-        let mut claimed = blaze_graph::wait::lock(&writers[goal as usize & (writers.len() - 1)].0, WRITER);
+        let writers = self
+            .writers
+            .get_or_init(|| table("writer locks", self.sharing.shards(), |_| Writer::new()));
+        let mut claimed =
+            blaze_graph::wait::lock(&writers[goal as usize & (writers.len() - 1)].0, WRITER);
         let column = if encountered_overflow { &self.with_overflow } else { &self.success };
         let head = column.get_or_init(goal, || AtomicU32::new(0));
         let latest = head.load(Ordering::Acquire);
@@ -204,7 +206,8 @@ impl<X: Cx> GlobalCache<X> {
         mut candidate_is_applicable: impl FnMut(&NestedGoals<X>) -> bool,
     ) -> Option<CacheData<'a, X>> {
         let goal = self.goals.find(&input)?;
-        if let Some(row) = self.success.get(goal).and_then(|head| self.row(head.load(Ordering::Acquire)))
+        if let Some(row) =
+            self.success.get(goal).and_then(|head| self.row(head.load(Ordering::Acquire)))
             && available_depth.cache_entry_is_applicable(RequiredDepth(row.depth as usize))
         {
             let nested_goals = self.nested_goals_of(row);
@@ -259,7 +262,12 @@ impl<X: Cx> GlobalCache<X> {
     /// The row `plus_one` names, `None` for 0.
     fn row(&self, plus_one: u32) -> Option<&Row<X>> {
         let raw = plus_one.checked_sub(1)?;
-        Some(self.rows.get(raw).and_then(OnceLock::get).expect("a row named before it was published"))
+        Some(
+            self.rows
+                .get(raw)
+                .and_then(OnceLock::get)
+                .expect("a row named before it was published"),
+        )
     }
 
     fn nested_goals_of(&self, row: &Row<X>) -> &NestedGoals<X> {
@@ -440,12 +448,17 @@ impl Shard {
     }
 
     fn table(&self, level: usize) -> &[AtomicU32] {
-        self.tables[level].get_or_init(|| table("probe table", TABLE << level, |_| AtomicU32::new(0)))
+        self.tables[level]
+            .get_or_init(|| table("probe table", TABLE << level, |_| AtomicU32::new(0)))
     }
 
     /// The bytes of its probe tables.
     fn held(&self) -> usize {
-        self.tables.iter().filter_map(OnceLock::get).map(|it| it.len() * size_of::<AtomicU32>()).sum()
+        self.tables
+            .iter()
+            .filter_map(OnceLock::get)
+            .map(|it| it.len() * size_of::<AtomicU32>())
+            .sum()
     }
 }
 
@@ -461,7 +474,12 @@ fn home(hash: u64) -> usize {
 
 impl<T> Interned<T> {
     const fn new(sharing: Sharing) -> Self {
-        Interned { sharing, values: Chunked::new(), next: AtomicU64::new(0), shards: OnceLock::new() }
+        Interned {
+            sharing,
+            values: Chunked::new(),
+            next: AtomicU64::new(0),
+            shards: OnceLock::new(),
+        }
     }
 
     /// The bytes of its values' chunks, its shards and their probe tables.
@@ -492,7 +510,8 @@ impl<T: Hash + Eq> Interned<T> {
     fn intern(&self, value: T) -> u32 {
         let hash = hash_of(&value);
         let shard = self.shard(hash);
-        if let Ok(found) = self.probe(shard.table(shard.level.load(Ordering::Acquire)), hash, &value)
+        if let Ok(found) =
+            self.probe(shard.table(shard.level.load(Ordering::Acquire)), hash, &value)
         {
             return found;
         }
@@ -520,7 +539,8 @@ impl<T: Hash + Eq> Interned<T> {
     }
 
     fn shard(&self, hash: u64) -> &Shard {
-        let shards = self.shards.get_or_init(|| table("shards", self.sharing.shards(), |_| Shard::new()));
+        let shards =
+            self.shards.get_or_init(|| table("shards", self.sharing.shards(), |_| Shard::new()));
         &shards[shard_of(hash, shards.len())]
     }
 
@@ -612,7 +632,10 @@ mod tests {
             for it in 0..3000u64 {
                 interned.intern(it * 31);
             }
-            assert_eq!(interned.find(&(2999 * 31)).map(|index| *interned.get(index)), Some(2999 * 31));
+            assert_eq!(
+                interned.find(&(2999 * 31)).map(|index| *interned.get(index)),
+                Some(2999 * 31)
+            );
         };
         fill();
         blaze_alloc_count::assert_at_most(0, "a fresh solver cache table", fill);

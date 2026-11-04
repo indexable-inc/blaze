@@ -13,11 +13,18 @@ const SCHEMA: SchemaHash = SchemaHash(ContentId([0x57; 32]));
 static ON_DISK: &[u8] = b"the bytes a cold pack holds";
 
 fn key(n: u64) -> QueryKey {
-    QueryKey { kind: QueryKind(0x2f00), input: ContentId::of("blaze v2 db memo test 1", &n.to_le_bytes()) }
+    QueryKey {
+        kind: QueryKind(0x2f00),
+        input: ContentId::of("blaze v2 db memo test 1", &n.to_le_bytes()),
+    }
 }
 
 fn edges(n: u64) -> Vec<EdgeRecord> {
-    (0..3).map(|i| EdgeRecord::new(key(1000 + n * 3 + i), Fingerprint(u128::from(n) << 64 | u128::from(i)))).collect()
+    (0..3)
+        .map(|i| {
+            EdgeRecord::new(key(1000 + n * 3 + i), Fingerprint(u128::from(n) << 64 | u128::from(i)))
+        })
+        .collect()
 }
 
 fn read(records: &[EdgeRecord]) -> Vec<Edge> {
@@ -125,7 +132,13 @@ fn a_tasks_edges_are_one_range_of_its_threads_segment() {
                     let memos = (0..50)
                         .map(|n| {
                             let n = thread * 50 + n;
-                            store.make(key(n), Fingerprint(u128::from(n)), code, &edges(n), &n.to_le_bytes())
+                            store.make(
+                                key(n),
+                                Fingerprint(u128::from(n)),
+                                code,
+                                &edges(n),
+                                &n.to_le_bytes(),
+                            )
                         })
                         .collect::<Vec<MemoId>>();
                     (lane, memos)
@@ -160,7 +173,8 @@ fn a_segment_is_freed_whole_once_nothing_in_it_is_held() {
     let store = Store::new();
     let code = store.code(SCHEMA, ContentId([1; 32]));
     // 168 bytes of edges each: the first 16 KiB segment holds 97, the second the rest.
-    let memos: Vec<MemoId> = (0..200).map(|n| store.make(key(n), Fingerprint(1), code, &edges(n), &[])).collect();
+    let memos: Vec<MemoId> =
+        (0..200).map(|n| store.make(key(n), Fingerprint(1), code, &edges(n), &[])).collect();
     assert_eq!(store.segments().0, 2);
     let task = blaze_reclaim::enter();
     let first = store.edges(&task, memos[0]).as_ptr();
@@ -168,7 +182,8 @@ fn a_segment_is_freed_whole_once_nothing_in_it_is_held() {
     assert_eq!(last_of_first, first.wrapping_add(96 * 3), "memo 96 is the first segment's last");
     drop(task);
 
-    let (kept, rest): (Vec<MemoId>, Vec<MemoId>) = memos.iter().partition(|&&memo| memo == memos[96]);
+    let (kept, rest): (Vec<MemoId>, Vec<MemoId>) =
+        memos.iter().partition(|&&memo| memo == memos[96]);
     store.unlinked(&rest);
     until(&store, "freeing all but one memo", |store| store.dying() == 0);
     assert_eq!(store.segments().0, 2, "memo 96 holds the first segment; the second is open");
@@ -193,7 +208,11 @@ fn a_slot_holds_three_memos_in_itself_and_more_in_a_list() {
     assert_eq!(many.key(), Some(&b"the key's bytes"[..]));
     let shared = many.share_key();
     drop(many);
-    assert_eq!(shared.as_ref().map(Span::bytes), Some(&b"the key's bytes"[..]), "a shared key outlives its slot");
+    assert_eq!(
+        shared.as_ref().map(Span::bytes),
+        Some(&b"the key's bytes"[..]),
+        "a shared key outlives its slot"
+    );
     assert!(Slot::empty().memos().is_empty());
 }
 
@@ -216,7 +235,10 @@ fn a_store_read_allocates_nothing() {
                 store.stored(&task, memo),
             )
         });
-    assert_eq!((fingerprint, inline, bytes, edge_len), (Fingerprint(4), Some(7), Some(&b"read me"[..]), 3));
+    assert_eq!(
+        (fingerprint, inline, bytes, edge_len),
+        (Fingerprint(4), Some(7), Some(&b"read me"[..]), 3)
+    );
     assert_eq!((at, stored), (key(4), Stored::Memory));
 }
 
@@ -341,7 +363,9 @@ mod model {
     impl One {
         fn evict(&self) {
             let task = blaze_reclaim::enter();
-            self.history.record(ValueOp::Evict, |_| self.store.evict(&task, self.memo).then_some(Held::Evicted));
+            self.history.record(ValueOp::Evict, |_| {
+                self.store.evict(&task, self.memo).then_some(Held::Evicted)
+            });
         }
 
         fn refill(&self, version: u8) {
@@ -357,7 +381,9 @@ mod model {
         fn to_disk(&self) {
             let task = blaze_reclaim::enter();
             let Some((was, bytes)) = self.store.in_memory(&task, self.memo) else { return };
-            let Held::Memory(version) = where_is(bytes) else { panic!("`Store::in_memory` gave a mapped value") };
+            let Held::Memory(version) = where_is(bytes) else {
+                panic!("`Store::in_memory` gave a mapped value")
+            };
             self.history.record(ValueOp::ToDisk(version), |_| {
                 // SAFETY: a static outlives the store.
                 let moved = unsafe { self.store.to_disk(&task, self.memo, was, ON_DISK, DISK) };
@@ -466,7 +492,11 @@ mod model {
                 thread::spawn(move || {
                     let memo = store.make_shared(key(1), Fingerprint(7), code, &[], b"m7", SHARED);
                     let task = blaze_reclaim::enter();
-                    assert_eq!(store.bytes(&task, memo), Some(&b"m7"[..]), "a shared value read whole");
+                    assert_eq!(
+                        store.bytes(&task, memo),
+                        Some(&b"m7"[..]),
+                        "a shared value read whole"
+                    );
                     memo
                 })
             };
@@ -520,7 +550,11 @@ mod model {
             reader.join().expect("the reader");
             sweeper.join().expect("the sweeper");
             segments.sweep();
-            assert_eq!(segments.count(), 1, "the sealed segment and the big one are freed; the open one stays");
+            assert_eq!(
+                segments.count(),
+                1,
+                "the sealed segment and the big one are freed; the open one stays"
+            );
             drop(next);
             segments.sweep();
             assert_eq!(segments.count(), 1, "an open segment stays while its lane may copy in");

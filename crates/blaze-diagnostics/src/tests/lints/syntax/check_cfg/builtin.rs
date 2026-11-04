@@ -28,7 +28,12 @@ fn a_cfg_rustc_sets_is_refused_on_the_command_line() {
         (r#"sanitize="cfi""#, r#"sanitize="cfi""#, "sanitize", "-Z sanitizer"),
         ("proc_macro", "proc_macro", "proc_macro", "--crate-type proc-macro"),
         (r#"panic="abort""#, r#"panic="abort""#, "panic", "-C panic"),
-        (r#"target_feature="sse3""#, r#"target_feature="sse3""#, "target_feature", "-C target-feature"),
+        (
+            r#"target_feature="sse3""#,
+            r#"target_feature="sse3""#,
+            "target_feature",
+            "-C target-feature",
+        ),
         ("unix", "unix", "unix", "--target"),
         ("windows", "windows", "windows", "--target"),
         (r#"target_os="linux""#, r#"target_os="linux""#, "target_os", "--target"),
@@ -38,7 +43,12 @@ fn a_cfg_rustc_sets_is_refused_on_the_command_line() {
         ("target_thread_local", "target_thread_local", "target_thread_local", "--target"),
         (r#"relocation_model="a""#, r#"relocation_model="a""#, "relocation_model", "--target"),
         (r#"fmt_debug="shallow""#, r#"fmt_debug="shallow""#, "fmt_debug", "-Z fmt-debug"),
-        ("target_has_reliable_f16", "target_has_reliable_f16", "target_has_reliable_f16", "--target"),
+        (
+            "target_has_reliable_f16",
+            "target_has_reliable_f16",
+            "target_has_reliable_f16",
+            "--target",
+        ),
     ];
     for (cfg, shown, name, flag) in cases {
         let options = flags(&[], &[cfg], false);
@@ -49,9 +59,20 @@ fn a_cfg_rustc_sets_is_refused_on_the_command_line() {
 
 #[test]
 fn a_cfg_rustc_sets_another_way_is_not_refused() {
-    for cfg in ["test", "unix=\"x\"", "target_os", r#"panic="other""#, r#"feature="std""#, "debug_assertions=\"x\""] {
+    for cfg in [
+        "test",
+        "unix=\"x\"",
+        "target_os",
+        r#"panic="other""#,
+        r#"feature="std""#,
+        "debug_assertions=\"x\"",
+    ] {
         let options = flags(&[], &[cfg], false);
-        assert_eq!(ui_cfg("", "disallowed-cli-cfgs.rs", "edition:2015", SOURCE, &options), "", "--cfg {cfg}");
+        assert_eq!(
+            ui_cfg("", "disallowed-cli-cfgs.rs", "edition:2015", SOURCE, &options),
+            "",
+            "--cfg {cfg}"
+        );
     }
 }
 

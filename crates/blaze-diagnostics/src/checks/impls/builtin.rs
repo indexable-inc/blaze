@@ -20,11 +20,11 @@
 //! diagnostics.rs` (MIT or Apache-2.0).
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use either::Either;
 use hir_def::lang_item::{LangItems, lang_items};
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::view::{
     self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _,
     HasTypeBounds as _,
@@ -54,7 +54,12 @@ impl<'a, 'b, 'db> Builtin<'a, 'b, 'db> {
     }
 
     /// rustc's `builtin::check_trait` of one impl of `trait_`.
-    pub(super) fn check(&mut self, impl_: hir::Impl, origin: &Origin<'db>, trait_: hir::Trait) -> Vec<Found> {
+    pub(super) fn check(
+        &mut self,
+        impl_: hir::Impl,
+        origin: &Origin<'db>,
+        trait_: hir::Trait,
+    ) -> Vec<Found> {
         let id = hir_def::TraitId::from(trait_);
         let self_ty = impl_.self_ty(self.cx.db);
         // rustc skips an impl whose header has an error in it (`error_reported`).
@@ -77,7 +82,12 @@ impl<'a, 'b, 'db> Builtin<'a, 'b, 'db> {
     }
 
     /// `visit_implementation_of_copy`.
-    fn copy(&mut self, impl_: hir::Impl, origin: &Origin<'db>, self_ty: &hir::Type<'db>) -> Vec<Found> {
+    fn copy(
+        &mut self,
+        impl_: hir::Impl,
+        origin: &Origin<'db>,
+        self_ty: &hir::Type<'db>,
+    ) -> Vec<Found> {
         let cx = self.cx;
         let db = cx.db;
         if impl_.is_negative(db) {
@@ -97,7 +107,11 @@ impl<'a, 'b, 'db> Builtin<'a, 'b, 'db> {
             // alloc: empty, allocates nothing
             let Some(span) = origin.self_ty_span(cx) else { return Vec::new() };
             // clone: the error's span
-            let mut diag = Diag::error(Some("E0206"), "the trait `Copy` cannot be implemented for this type", span.clone());
+            let mut diag = Diag::error(
+                Some("E0206"),
+                "the trait `Copy` cannot be implemented for this type",
+                span.clone(),
+            );
             diag.span_label(span, "type is not a structure or enumeration");
             diag.fact(origin.coherence(cx), "the header of the impl");
             // alloc: the error
@@ -108,7 +122,10 @@ impl<'a, 'b, 'db> Builtin<'a, 'b, 'db> {
             // alloc: empty, allocates nothing
             let Some(span) = origin.self_ty_span(cx) else { return Vec::new() };
             // alloc: the error
-            return vec![Found::new(infringing_fields_error(cx, origin, span, adt, &infringing), Phase::Items)];
+            return vec![Found::new(
+                infringing_fields_error(cx, origin, span, adt, &infringing),
+                Phase::Items,
+            )];
         }
         // alloc: empty, allocates nothing
         let Some(dtor) = self.destructor(adt) else { return Vec::new() };
@@ -121,9 +138,9 @@ impl<'a, 'b, 'db> Builtin<'a, 'b, 'db> {
             span.clone(),
         );
         diag.span_label(span, "`Copy` not allowed on types with destructors");
-        let drop_fn = dtor.items_iter(db).find(|item| {
-            matches!(item, hir::AssocItem::Function(f) if f.name(db).as_str() == "drop")
-        });
+        let drop_fn = dtor.items_iter(db).find(
+            |item| matches!(item, hir::AssocItem::Function(f) if f.name(db).as_str() == "drop"),
+        );
         let at = match drop_fn {
             Some(item) => assoc_def_span(cx, item),
             None => ImplAt::of(cx, dtor).map(|it| it.span(cx)),
@@ -167,14 +184,20 @@ struct Infringing<'db> {
 
 /// `all_fields_implement_trait` for `Copy`: each field of each variant whose type in the
 /// impl's environment is not `Copy`.
-fn infringing_fields<'db>(cx: &Cx<'_, 'db>, adt: hir::Adt, self_ty: &hir::Type<'db>) -> Vec<Infringing<'db>> {
+fn infringing_fields<'db>(
+    cx: &Cx<'_, 'db>,
+    adt: hir::Adt,
+    self_ty: &hir::Type<'db>,
+) -> Vec<Infringing<'db>> {
     let db = cx.db;
     let infringing = |(field, ty): (hir::Field, hir::Type<'db>)| {
         (!ty.contains_unknown() && !ty.is_copy(db)).then_some(Infringing { field, ty })
     };
     match adt {
         // alloc: empty unless a field is not `Copy`
-        hir::Adt::Struct(_) | hir::Adt::Union(_) => self_ty.fields(db).into_iter().filter_map(infringing).collect(),
+        hir::Adt::Struct(_) | hir::Adt::Union(_) => {
+            self_ty.fields(db).into_iter().filter_map(infringing).collect()
+        }
         hir::Adt::Enum(it) => {
             let params: SmallVec<[hir::TypeParam; 4]> = hir::GenericDef::Adt(adt)
                 .type_or_const_params(db)
@@ -214,7 +237,8 @@ fn infringing_fields_error<'db>(
     infringing: &[Infringing<'db>],
 ) -> Diag {
     let db = cx.db;
-    let mut diag = Diag::error(Some("E0204"), "the trait `Copy` cannot be implemented for this type", span);
+    let mut diag =
+        Diag::error(Some("E0204"), "the trait `Copy` cannot be implemented for this type", span);
     let mut seen = HashSet::new_in(Global);
     // alloc: on the error path (E0204)
     let mut params = Vec::new();
@@ -235,7 +259,10 @@ fn infringing_fields_error<'db>(
             params.push(param);
         }
         // alloc: the error's fact
-        diag.fact(Fact::Field { ty: adt_key, field: field.index() as u32 }, format!("the type of a field of `{}`", cx.def_path(hir::ModuleDef::Adt(adt))));
+        diag.fact(
+            Fact::Field { ty: adt_key, field: field.index() as u32 },
+            format!("the type of a field of `{}`", cx.def_path(hir::ModuleDef::Adt(adt))),
+        );
     }
     if let Origin::Written(at) = origin {
         for param in params {
@@ -245,7 +272,10 @@ fn infringing_fields_error<'db>(
     if let Some(copy) = lang_items(db, cx.krate.base()).Copy {
         for Infringing { ty, .. } in infringing {
             // alloc: the error's fact
-            diag.fact_opt(cx.implements_fact(copy.into(), ty), format!("whether `{}` is `Copy`", cx.ty(ty)));
+            diag.fact_opt(
+                cx.implements_fact(copy.into(), ty),
+                format!("whether `{}` is `Copy`", cx.ty(ty)),
+            );
         }
     }
     diag.fact(origin.coherence(cx), "the header of the impl");
@@ -348,7 +378,10 @@ fn drop_impl<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, self_ty: &hir::Type<'db>) 
     }
     diag.fact(Fact::DropCheck(at.key(cx)), "the header of the `Drop` impl");
     // alloc: the error's fact
-    diag.fact(Fact::Signature(cx.key(ItemId::Adt(adt.into()))), format!("the generics of `{}`", cx.def_path(hir::ModuleDef::Adt(adt))));
+    diag.fact(
+        Fact::Signature(cx.key(ItemId::Adt(adt.into()))),
+        format!("the generics of `{}`", cx.def_path(hir::ModuleDef::Adt(adt))),
+    );
     // alloc: the error
     vec![Found::new(diag, Phase::Items)]
 }
@@ -362,11 +395,17 @@ enum NotUnique {
 /// `uses_unique_generic_params` of the self type's arguments, in order: each lifetime a
 /// parameter of the impl (`'_` is a fresh one), each type and const one of its parameters,
 /// none twice.
-fn not_unique_param<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, self_ty: &hir::Type<'db>) -> Option<NotUnique> {
+fn not_unique_param<'db>(
+    cx: &Cx<'_, 'db>,
+    at: &ImplAt<'db>,
+    self_ty: &hir::Type<'db>,
+) -> Option<NotUnique> {
     let db = cx.db;
     let mut types = self_ty.type_arguments();
     let written = match at.node.value.self_ty() {
-        Some(ast::Type::PathType(ty)) => ty.path().and_then(|it| it.segment()).and_then(|it| it.generic_arg_list()),
+        Some(ast::Type::PathType(ty)) => {
+            ty.path().and_then(|it| it.segment()).and_then(|it| it.generic_arg_list())
+        }
         _ => None,
     };
     // A self type written as an alias gives its type arguments only.
@@ -378,9 +417,11 @@ fn not_unique_param<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, self_ty: &hir::Type
         _ => false,
     };
     let is_const_param = |name: &str| {
-        at.node.value.generic_param_list().iter().flat_map(|it| it.generic_params()).any(|it| match it {
-            ast::GenericParam::ConstParam(it) => it.name().is_some_and(|it| it.text() == name),
-            _ => false,
+        at.node.value.generic_param_list().iter().flat_map(|it| it.generic_params()).any(|it| {
+            match it {
+                ast::GenericParam::ConstParam(it) => it.name().is_some_and(|it| it.text() == name),
+                _ => false,
+            }
         })
     };
     let mut seen_lifetimes: SmallVec<[ast::Lifetime<'db>; 4]> = SmallVec::new();
@@ -397,7 +438,8 @@ fn not_unique_param<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, self_ty: &hir::Type
             None => Some(NotUnique::NotParam(cx.ty(&ty))),
         }
     };
-    let mut args = written.filter(|_| !by_alias).into_iter().flat_map(|it| it.generic_args()).peekable();
+    let mut args =
+        written.filter(|_| !by_alias).into_iter().flat_map(|it| it.generic_args()).peekable();
     if args.peek().is_none() {
         return types.find_map(&mut type_arg);
     }
@@ -418,7 +460,9 @@ fn not_unique_param<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, self_ty: &hir::Type
                         // alloc: the error's argument
                         "'static" => Some(NotUnique::NotParam("'static".to_owned())),
                         // alloc: the error's argument
-                        text if seen_lifetimes.iter().any(|it| it.text() == text) => Some(NotUnique::Duplicate(text.to_owned())),
+                        text if seen_lifetimes.iter().any(|it| it.text() == text) => {
+                            Some(NotUnique::Duplicate(text.to_owned()))
+                        }
                         _ => {
                             fresh = true;
                             None

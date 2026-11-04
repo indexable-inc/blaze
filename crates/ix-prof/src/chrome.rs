@@ -104,7 +104,11 @@ pub fn to_chrome(p: &Profile) -> String {
         ]));
     }
     for s in &p.cpu_samples {
-        let leaf = p.frames_of(s.stack).first().and_then(|f| p.frames.get(*f as usize)).map_or("?", |f| f.function.as_str());
+        let leaf = p
+            .frames_of(s.stack)
+            .first()
+            .and_then(|f| p.frames.get(*f as usize))
+            .map_or("?", |f| f.function.as_str());
         events.push(obj([
             ("cat", str(if s.on_cpu { "cpu" } else { "off-cpu" })),
             ("name", str(leaf)),
@@ -117,7 +121,10 @@ pub fn to_chrome(p: &Profile) -> String {
     }
     obj([
         ("displayTimeUnit", str("ns")),
-        ("otherData", obj([("program", str(&p.meta.program)), ("producer", str(&p.meta.producer))])),
+        (
+            "otherData",
+            obj([("program", str(&p.meta.program)), ("producer", str(&p.meta.producer))]),
+        ),
         ("traceEvents", Json::Arr(events)),
     ])
     .to_text()

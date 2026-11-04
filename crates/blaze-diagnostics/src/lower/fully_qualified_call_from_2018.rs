@@ -31,16 +31,17 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::FullyQualifiedCallFrom2018<'
     let at = d.expr_or_pat.map(|it| it.syntax_node_ptr());
     let span = cx.span_of(at);
     let node = cx.node_view(d.expr_or_pat);
-    let name = d.item.name(db).expect("a path hir lints as ambiguous is to a function, which is named");
+    let name =
+        d.item.name(db).expect("a path hir lints as ambiguous is to a function, which is named");
     let name = name.as_str();
     // alloc: the lint's text, for a path hir found
     let message = format!("trait-associated function `{name}` will become ambiguous in Rust 2021");
 
     let trait_ = match d.item.container(db) {
         AssocItemContainer::Trait(it) => it,
-        AssocItemContainer::Impl(imp) => {
-            imp.trait_(db).expect("a path hir lints as ambiguous is to an item of a trait or a trait's impl")
-        }
+        AssocItemContainer::Impl(imp) => imp
+            .trait_(db)
+            .expect("a path hir lints as ambiguous is to an item of a trait or a trait's impl"),
     };
     let trait_path = trait_path_or_bare_name(cx, node.value.syntax(), trait_);
     let lifetimes = GenericDef::Trait(trait_).lifetime_params(db).len();
@@ -91,7 +92,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::FullyQualifiedCallFrom2018<'
 fn placeholders(lifetimes: usize, types: usize) -> String {
     // alloc: the lint's suggestion, for a path hir found
     let mut out = String::new();
-    for (index, it) in std::iter::repeat_n("'_", lifetimes).chain(std::iter::repeat_n("_", types)).enumerate() {
+    for (index, it) in
+        std::iter::repeat_n("'_", lifetimes).chain(std::iter::repeat_n("_", types)).enumerate()
+    {
         if index > 0 {
             out.push_str(", ");
         }

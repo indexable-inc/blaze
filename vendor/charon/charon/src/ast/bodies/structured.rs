@@ -18,8 +18,7 @@ generate_index_type!(BlockId);
 pub type ExprBody = GExprBody<Block>;
 
 /// A sequence of statements.
-#[derive(Debug, Clone, Eq)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, Eq, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 #[serde_state(state_implements = DedupSerializerState)] // Avoid corecursive impls due to perfect derive
 pub struct Block {
     pub span: Span,
@@ -30,8 +29,7 @@ pub struct Block {
 }
 
 /// A statement, which can contain nested statements inside loops or switchers.
-#[derive(Debug, Clone, Eq)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, Eq, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 pub struct Statement {
     pub span: Span,
     /// An integer uniquely identifying this statement.
@@ -43,9 +41,18 @@ pub struct Statement {
     pub comments_before: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum StatementKind {
     /// Assigns an `Rvalue` to a `Place`. e.g. `let y = x;` could become
     /// `y := move x` which is represented as `Assign(y, Rvalue::Use(Operand::Move(x)))`.
@@ -163,11 +170,7 @@ impl PartialEq for Block {
 
 impl Block {
     pub fn new(span: Span, statements: Vec<Statement>) -> Self {
-        Block {
-            span,
-            id: BlockId::fresh(),
-            statements,
-        }
+        Block { span, id: BlockId::fresh(), statements }
     }
 
     pub fn new_unreachable(span: Span) -> Self {
@@ -178,11 +181,8 @@ impl Block {
         if seq.is_empty() {
             None
         } else {
-            let span = seq
-                .iter()
-                .map(|st| st.span)
-                .reduce(|a, b| meta::combine_span(&a, &b))
-                .unwrap();
+            let span =
+                seq.iter().map(|st| st.span).reduce(|a, b| meta::combine_span(&a, &b)).unwrap();
             Some(Block::new(span, seq))
         }
     }
@@ -200,11 +200,7 @@ impl Block {
     }
 
     pub fn then_opt(self, other: Option<Statement>) -> Self {
-        if let Some(other) = other {
-            self.then(other)
-        } else {
-            self
-        }
+        if let Some(other) = other { self.then(other) } else { self }
     }
 
     /// Apply a function to all the statements, in a top-down manner.
@@ -274,11 +270,7 @@ impl Block {
                 (self.enter_stmt)(x)
             }
         }
-        BlockVisitor {
-            exit_blk,
-            enter_stmt,
-        }
-        .visit_by_val_infallible(self);
+        BlockVisitor { exit_blk, enter_stmt }.visit_by_val_infallible(self);
     }
 }
 
@@ -292,12 +284,7 @@ impl BlockId {
 
 impl Statement {
     pub fn new(span: Span, kind: StatementKind) -> Self {
-        Statement {
-            span,
-            id: StatementId::fresh(),
-            kind,
-            comments_before: vec![],
-        }
+        Statement { span, id: StatementId::fresh(), kind, comments_before: vec![] }
     }
 
     pub fn into_box(self) -> Box<Self> {

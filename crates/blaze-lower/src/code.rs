@@ -75,7 +75,12 @@ pub fn code_identity(db: &Db, krate: Crate) -> ContentId {
         let data = at.data(db);
         if !deps_known {
             stack.push((at, true));
-            stack.extend(data.dependencies.iter().filter(|it| !known.contains_key(&it.crate_id)).map(|it| (it.crate_id, false)));
+            stack.extend(
+                data.dependencies
+                    .iter()
+                    .filter(|it| !known.contains_key(&it.crate_id))
+                    .map(|it| (it.crate_id, false)),
+            );
             continue;
         }
         let mut hasher = Hasher::new(CODE_IDENTITY);
@@ -117,7 +122,8 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
     // alloc: once per workspace crate keyed in a revision, a file of its source root each
     let mut files: Vec<(&str, base_db::FileId, Option<CodeText>)> = Vec::new();
     for file in set.iter() {
-        let Some(path) = set.path_for_file(&file).and_then(|it| it.as_path()).map(|it| it.as_str()) else {
+        let Some(path) = set.path_for_file(&file).and_then(|it| it.as_path()).map(|it| it.as_str())
+        else {
             return whole(&mut hasher);
         };
         let code = match path.ends_with(".rs") {
@@ -132,7 +138,8 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
     files.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let strict = files.iter().any(|it| it.2.is_some_and(|code| code.shadows));
     hasher.update(&[1, u8::from(strict)]);
-    hasher.opt_part(set.path_for_file(&root_file).and_then(|it| it.as_path()).map(|it| it.as_str()));
+    hasher
+        .opt_part(set.path_for_file(&root_file).and_then(|it| it.as_path()).map(|it| it.as_str()));
     hasher.update(&(files.len() as u64).to_le_bytes());
     for (path, file, code) in &files {
         let appended = match db.has_file_text(*file) {
@@ -187,7 +194,12 @@ pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
             WalkEvent::Leave(NodeOrToken::Token(_)) => {}
         }
     }
-    CodeText { inert: walk.inert.finish(text), strict: walk.strict.finish(text), shadows: walk.shadows, whole: walk.whole }
+    CodeText {
+        inert: walk.inert.finish(text),
+        strict: walk.strict.finish(text),
+        shadows: walk.shadows,
+        whole: walk.whole,
+    }
 }
 
 /// A file's text hashed with some comments as their shape: the text since the last one, then
@@ -222,7 +234,9 @@ impl Masked {
         self.hasher.update(&(comment.matches('\n').count() as u64).to_le_bytes());
         if block {
             let last = comment.rsplit('\n').next().unwrap_or(comment);
-            self.hasher.update(&(last.len() as u64).to_le_bytes()).update(&(last.chars().count() as u64).to_le_bytes());
+            self.hasher
+                .update(&(last.len() as u64).to_le_bytes())
+                .update(&(last.chars().count() as u64).to_le_bytes());
         }
         self.from = end;
     }
@@ -251,7 +265,13 @@ impl Walk<'_> {
     fn enter(&mut self, node: &SyntaxNode) {
         let (mut inert, mut strict) = self.seen.last().copied().unwrap_or((false, false));
         let kind = node.kind();
-        if matches!(kind, SyntaxKind::TOKEN_TREE | SyntaxKind::MACRO_CALL | SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF) {
+        if matches!(
+            kind,
+            SyntaxKind::TOKEN_TREE
+                | SyntaxKind::MACRO_CALL
+                | SyntaxKind::MACRO_RULES
+                | SyntaxKind::MACRO_DEF
+        ) {
             (inert, strict) = (true, true);
         }
         if !inert {
@@ -267,7 +287,10 @@ impl Walk<'_> {
             SyntaxKind::USE => self.shadows |= use_shadows(node),
             SyntaxKind::EXTERN_CRATE => self.shadows |= macro_use_extern(node),
             SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => {
-                let name = node.children().find(|it| it.kind() == SyntaxKind::NAME).map(|it| it.text().to_string()); // alloc: a macro's name, once per macro definition
+                let name = node
+                    .children()
+                    .find(|it| it.kind() == SyntaxKind::NAME)
+                    .map(|it| it.text().to_string()); // alloc: a macro's name, once per macro definition
                 self.shadows |= name.is_some_and(|it| SHADOWABLE.contains(&it.as_str()));
             }
             // `mod x;` given to an attribute that is not inert: the attribute may be given
@@ -305,22 +328,85 @@ impl Walk<'_> {
 }
 
 /// The standard derives, and the prelude's attribute macros, that a crate can shadow.
-const SHADOWABLE: &[&str] =
-    &["Clone", "Copy", "Debug", "Default", "Eq", "PartialEq", "Ord", "PartialOrd", "Hash", "derive", "test", "bench"];
+const SHADOWABLE: &[&str] = &[
+    "Clone",
+    "Copy",
+    "Debug",
+    "Default",
+    "Eq",
+    "PartialEq",
+    "Ord",
+    "PartialOrd",
+    "Hash",
+    "derive",
+    "test",
+    "bench",
+];
 
 /// The standard derives.
-const DERIVES: &[&str] = &["Clone", "Copy", "Debug", "Default", "Eq", "PartialEq", "Ord", "PartialOrd", "Hash"];
+const DERIVES: &[&str] =
+    &["Clone", "Copy", "Debug", "Default", "Eq", "PartialEq", "Ord", "PartialOrd", "Hash"];
 
 /// The compiler's attributes that give their item to no macro, and that no crate can shadow
 /// (a macro of one of these names used as an attribute is ambiguous, an error).
 const INERT: &[&str] = &[
-    "doc", "cfg", "allow", "warn", "deny", "forbid", "expect", "deprecated", "must_use", "inline", "cold", "track_caller",
-    "repr", "non_exhaustive", "path", "macro_use", "macro_export", "no_mangle", "export_name", "link_section", "link",
-    "link_name", "link_ordinal", "used", "automatically_derived", "target_feature", "ignore", "should_panic", "no_std",
-    "no_core", "no_implicit_prelude", "recursion_limit", "type_length_limit", "crate_type", "crate_name", "feature",
-    "windows_subsystem", "no_main", "no_builtins", "naked", "optimize", "coverage", "instruction_set", "debugger_visualizer",
-    "collapse_debuginfo", "may_dangle", "fundamental", "marker", "unstable", "stable", "rustc_const_stable",
-    "rustc_const_unstable", "const_trait", "do_not_recommend", "on_unimplemented", "panic_handler", "lang",
+    "doc",
+    "cfg",
+    "allow",
+    "warn",
+    "deny",
+    "forbid",
+    "expect",
+    "deprecated",
+    "must_use",
+    "inline",
+    "cold",
+    "track_caller",
+    "repr",
+    "non_exhaustive",
+    "path",
+    "macro_use",
+    "macro_export",
+    "no_mangle",
+    "export_name",
+    "link_section",
+    "link",
+    "link_name",
+    "link_ordinal",
+    "used",
+    "automatically_derived",
+    "target_feature",
+    "ignore",
+    "should_panic",
+    "no_std",
+    "no_core",
+    "no_implicit_prelude",
+    "recursion_limit",
+    "type_length_limit",
+    "crate_type",
+    "crate_name",
+    "feature",
+    "windows_subsystem",
+    "no_main",
+    "no_builtins",
+    "naked",
+    "optimize",
+    "coverage",
+    "instruction_set",
+    "debugger_visualizer",
+    "collapse_debuginfo",
+    "may_dangle",
+    "fundamental",
+    "marker",
+    "unstable",
+    "stable",
+    "rustc_const_stable",
+    "rustc_const_unstable",
+    "const_trait",
+    "do_not_recommend",
+    "on_unimplemented",
+    "panic_handler",
+    "lang",
 ];
 
 /// The tools whose attributes (`rustfmt::skip`) are inert.
@@ -349,7 +435,13 @@ impl Seen {
 /// an `impl`'s), which apply to all of it.
 fn attrs(node: &SyntaxNode) -> impl Iterator<Item = ast::Attr> {
     let lists = node.children().filter(|it| {
-        matches!(it.kind(), SyntaxKind::ITEM_LIST | SyntaxKind::ASSOC_ITEM_LIST | SyntaxKind::EXTERN_ITEM_LIST | SyntaxKind::STMT_LIST)
+        matches!(
+            it.kind(),
+            SyntaxKind::ITEM_LIST
+                | SyntaxKind::ASSOC_ITEM_LIST
+                | SyntaxKind::EXTERN_ITEM_LIST
+                | SyntaxKind::STMT_LIST
+        )
     });
     node.children().chain(lists.flat_map(|it| it.children())).filter_map(ast::Attr::cast)
 }
@@ -361,7 +453,9 @@ fn attr_seen(attr: &ast::Attr) -> Seen {
 fn meta_seen(meta: &ast::Meta) -> Seen {
     match meta {
         ast::Meta::CfgMeta(_) => Seen::No,
-        ast::Meta::CfgAttrMeta(it) => it.metas().fold(Seen::No, |seen, it| seen.max(meta_seen(&it))),
+        ast::Meta::CfgAttrMeta(it) => {
+            it.metas().fold(Seen::No, |seen, it| seen.max(meta_seen(&it)))
+        }
         ast::Meta::UnsafeMeta(it) => it.meta().map_or(Seen::Yes, |it| meta_seen(&it)),
         ast::Meta::PathMeta(it) => path_seen(it.path().as_ref(), None),
         ast::Meta::KeyValueMeta(it) => path_seen(it.path().as_ref(), None),
@@ -409,7 +503,10 @@ fn derives_seen(args: &ast::TokenTree) -> Seen {
     for element in args.syntax().children_with_tokens() {
         match element {
             NodeOrToken::Token(token) => match token.kind() {
-                SyntaxKind::L_PAREN | SyntaxKind::R_PAREN | SyntaxKind::WHITESPACE | SyntaxKind::COMMENT => {}
+                SyntaxKind::L_PAREN
+                | SyntaxKind::R_PAREN
+                | SyntaxKind::WHITESPACE
+                | SyntaxKind::COMMENT => {}
                 SyntaxKind::COMMA => end(&mut path),
                 _ => path.push_str(token.text()),
             },
@@ -452,7 +549,10 @@ fn use_shadows(node: &SyntaxNode) -> bool {
         // The path from the outermost tree in: its first segment is where the names come from.
         let mut first = None;
         let mut last = None;
-        for at in std::iter::once(tree.clone()).chain(tree.ancestors().skip(1)).take_while(|it| it.kind() != SyntaxKind::USE) {
+        for at in std::iter::once(tree.clone())
+            .chain(tree.ancestors().skip(1))
+            .take_while(|it| it.kind() != SyntaxKind::USE)
+        {
             if at.kind() != SyntaxKind::USE_TREE {
                 continue;
             }
@@ -465,7 +565,8 @@ fn use_shadows(node: &SyntaxNode) -> bool {
             }
         }
         let from_outside = !first.as_deref().is_some_and(own_or_std);
-        let renamed = tree.children().find(|it| it.kind() == SyntaxKind::RENAME).map(|it| path_text(&it));
+        let renamed =
+            tree.children().find(|it| it.kind() == SyntaxKind::RENAME).map(|it| path_text(&it));
         let name = match &renamed {
             Some(rename) => rename.strip_prefix("as").map(str::to_owned),
             None => last,
@@ -476,13 +577,15 @@ fn use_shadows(node: &SyntaxNode) -> bool {
 
 /// Whether the `extern crate` item `node` takes another crate's macros with `#[macro_use]`.
 fn macro_use_extern(node: &SyntaxNode) -> bool {
-    let name = node.children().find(|it| it.kind() == SyntaxKind::NAME_REF).map(|it| path_text(&it));
+    let name =
+        node.children().find(|it| it.kind() == SyntaxKind::NAME_REF).map(|it| path_text(&it));
     let macro_use = attrs(node).any(|attr| {
-        attr.meta().and_then(|meta| match meta {
-            ast::Meta::PathMeta(it) => it.path(),
-            _ => None,
-        })
-        .is_some_and(|path| path_text(path.syntax()) == "macro_use")
+        attr.meta()
+            .and_then(|meta| match meta {
+                ast::Meta::PathMeta(it) => it.path(),
+                _ => None,
+            })
+            .is_some_and(|path| path_text(path.syntax()) == "macro_use")
     });
     macro_use && !name.is_some_and(|it| matches!(it.as_str(), "std" | "core" | "alloc"))
 }
@@ -490,14 +593,23 @@ fn macro_use_extern(node: &SyntaxNode) -> bool {
 /// Whether the `include_str` or `include_bytes` at `token` is a call with one string literal
 /// naming a file that is not Rust: `include_str!("../README.md")`.
 fn reads_other_than_rust(token: &SyntaxToken) -> bool {
-    let mut next = std::iter::successors(token.next_token(), SyntaxToken::next_token).filter(|it| !it.kind().is_trivia());
+    let mut next = std::iter::successors(token.next_token(), SyntaxToken::next_token)
+        .filter(|it| !it.kind().is_trivia());
     let shape = [next.next(), next.next(), next.next()];
     let [Some(bang), Some(open), Some(literal)] = shape else { return false };
-    if bang.kind() != SyntaxKind::BANG || !matches!(open.kind(), SyntaxKind::L_PAREN | SyntaxKind::L_BRACK | SyntaxKind::L_CURLY) {
+    if bang.kind() != SyntaxKind::BANG
+        || !matches!(open.kind(), SyntaxKind::L_PAREN | SyntaxKind::L_BRACK | SyntaxKind::L_CURLY)
+    {
         return false;
     }
-    let Some(value) = ast::String::cast(literal).and_then(|it| it.value().ok().map(|it| it.into_owned())) else { return false };
+    let Some(value) =
+        ast::String::cast(literal).and_then(|it| it.value().ok().map(|it| it.into_owned()))
+    else {
+        return false;
+    };
     let close = next.find(|it| it.kind() != SyntaxKind::COMMA);
-    let closed = close.is_some_and(|it| matches!(it.kind(), SyntaxKind::R_PAREN | SyntaxKind::R_BRACK | SyntaxKind::R_CURLY));
+    let closed = close.is_some_and(|it| {
+        matches!(it.kind(), SyntaxKind::R_PAREN | SyntaxKind::R_BRACK | SyntaxKind::R_CURLY)
+    });
     closed && !value.ends_with(".rs")
 }

@@ -38,18 +38,36 @@ fn a_static_definition_changes_with_every_field_it_covers() {
         ("its item", Static { item: ItemKey(id(9)), ..base() }),
         ("its instance", Static { instance: id(9), ..base() }),
         ("its alignment", Static { align: 16, ..base() }),
-        ("its value", Static { init: Init::Bytes { bytes: vec![8; 16], relocs: crate::Relocs::new() }, ..base() }),
+        (
+            "its value",
+            Static {
+                init: Init::Bytes { bytes: vec![8; 16], relocs: crate::Relocs::new() },
+                ..base()
+            },
+        ),
         (
             "its relocations",
-            Static { init: Init::Bytes { bytes: vec![7; 16], relocs: relocs(Target::Data(id(5))) }, ..base() },
+            Static {
+                init: Init::Bytes { bytes: vec![7; 16], relocs: relocs(Target::Data(id(5))) },
+                ..base()
+            },
         ),
         (
             "what a relocation names",
-            Static { init: Init::Bytes { bytes: vec![7; 16], relocs: relocs(Target::Data(id(6))) }, ..base() },
+            Static {
+                init: Init::Bytes { bytes: vec![7; 16], relocs: relocs(Target::Data(id(6))) },
+                ..base()
+            },
         ),
         ("zeroed", Static { init: Init::Zeroed { size: 16 }, ..base() }),
-        ("its data's bytes", Static { data: vec![Data::new(4, vec![1, 2, 3, 5], crate::Relocs::new())], ..base() }),
-        ("its data's alignment", Static { data: vec![Data::new(8, vec![1, 2, 3, 4], crate::Relocs::new())], ..base() }),
+        (
+            "its data's bytes",
+            Static { data: vec![Data::new(4, vec![1, 2, 3, 5], crate::Relocs::new())], ..base() },
+        ),
+        (
+            "its data's alignment",
+            Static { data: vec![Data::new(8, vec![1, 2, 3, 4], crate::Relocs::new())], ..base() },
+        ),
         ("no data", Static { data: Vec::new(), ..base() }),
         ("its mutability", Static { mutable: true, ..base() }),
         ("its thread-locality", Static { thread_local: true, ..base() }),
@@ -74,10 +92,18 @@ fn a_static_definition_changes_with_every_field_it_covers() {
     assert_ne!(one, with("f", vec![ValType::I32, ValType::I32]), "an import's arity");
     let mut renamed = import("f", vec![ValType::I32]);
     renamed.0 = "other".to_owned();
-    assert_ne!(one, static_definition(&Static { imports: vec![renamed], ..base() }), "an import's extern");
+    assert_ne!(
+        one,
+        static_definition(&Static { imports: vec![renamed], ..base() }),
+        "an import's extern"
+    );
     let mut module = import("f", vec![ValType::I32]);
     module.1.module = "wasi".to_owned();
-    assert_ne!(one, static_definition(&Static { imports: vec![module], ..base() }), "an import's module");
+    assert_ne!(
+        one,
+        static_definition(&Static { imports: vec![module], ..base() }),
+        "an import's module"
+    );
 }
 
 #[test]

@@ -15,7 +15,10 @@ impl<'a> Os<'a> {
         let name = g.read_c_str(addr, NAME_MAX)?;
         let Ok(name) = std::str::from_utf8(name) else {
             // alloc: the message of an expansion that can't be keyed (error path)
-            let why = format!("read the variable {:?}, whose name is not UTF-8", String::from_utf8_lossy(name));
+            let why = format!(
+                "read the variable {:?}, whose name is not UTF-8",
+                String::from_utf8_lossy(name)
+            );
             self.unkeyable.get_or_insert(why);
             return ok(ret, 0);
         };
@@ -23,7 +26,9 @@ impl<'a> Os<'a> {
             return ok(ret, value);
         }
         self.trace.note(Noted::Seen(Seen::Env), name);
-        let Some((name, value)) = self.env.iter().find(|it| it.0 == name) else { return ok(ret, 0) };
+        let Some((name, value)) = self.env.iter().find(|it| it.0 == name) else {
+            return ok(ret, 0);
+        };
         self.bytes.clear();
         self.bytes.extend_from_slice(value.as_bytes());
         self.bytes.push(0);
@@ -98,5 +103,7 @@ pub(super) fn sets(g: &impl Guest, verb: &str, addr: u64, putenv: bool) -> Stop 
     // alloc: error path
     let name = String::from_utf8_lossy(name);
     // alloc: error path
-    Stop(format!("{verb} the environment variable `{name}`, which would change it for the whole compiler"))
+    Stop(format!(
+        "{verb} the environment variable `{name}`, which would change it for the whole compiler"
+    ))
 }

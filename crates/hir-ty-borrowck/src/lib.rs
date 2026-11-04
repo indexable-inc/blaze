@@ -24,8 +24,8 @@ mod check;
 mod constraints;
 mod dataflow;
 mod decode;
-mod dropck;
 pub mod drop_early;
+mod dropck;
 mod flow;
 mod gate;
 mod inference;
@@ -65,7 +65,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::cell::RefCell;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_ids::radix;
 use hir_def::{
     DefWithBodyId, HasModule,
@@ -519,9 +519,10 @@ fn check_owner<'db>(
     // errors are a reason to check again.
     if alpha.skipped.is_some()
         || alpha.not_checked.is_some()
-        || !alpha.diagnostics.iter().any(|it| {
-            it.is_error() && it.code != hir_ty_linear::LinearDiagnostic::CODE
-        })
+        || !alpha
+            .diagnostics
+            .iter()
+            .any(|it| it.is_error() && it.code != hir_ty_linear::LinearDiagnostic::CODE)
     {
         return alpha;
     }
@@ -612,7 +613,9 @@ fn check_owner_once<'db>(
                 }
                 Err(error) => {
                     // alloc: the owned result, once, when MIR lowering refuses a body
-                    result.skipped.get_or_insert_with(|| blaze_query::db::attach(db, || format!("{what}: {error:?}")));
+                    result.skipped.get_or_insert_with(|| {
+                        blaze_query::db::attach(db, || format!("{what}: {error:?}"))
+                    });
                 }
             }
         }
@@ -626,11 +629,8 @@ fn check_owner_once<'db>(
     let mut diagnostics: FVec<'_, FVec<'_, Option<BorrowckDiagnostic>>> = Vec::new_in(frame);
     // rustc's `buffered_move_errors`, one for the function and the closures in it: the body,
     // the error's place as rustc has it and where the error is, by the moves it is about.
-    let mut move_errors: FMap<
-        '_,
-        FVec<'_, usize>,
-        (usize, (LocalId, FVec<'_, PlaceElem>), usize),
-    > = mem::map(frame);
+    let mut move_errors: FMap<'_, FVec<'_, usize>, (usize, (LocalId, FVec<'_, PlaceElem>), usize)> =
+        mem::map(frame);
     let scan = timings::phase(timings::Phase::Setup, || {
         scan::Scan::new(frame, store, infer, DbInterner::new_with(db, owner.krate(db)))
     });
@@ -647,15 +647,8 @@ fn check_owner_once<'db>(
             }
             let mut found = Vec::new_in(frame);
             let mut moved = Vec::new_in(frame);
-            let (count, needs, used_mut_upvars) = check::check(
-                &ctx,
-                frame,
-                body,
-                &requirements,
-                &mut_upvars,
-                &mut found,
-                &mut moved,
-            );
+            let (count, needs, used_mut_upvars) =
+                check::check(&ctx, frame, body, &requirements, &mut_upvars, &mut found, &mut moved);
             if ctx.tainted.get() {
                 return Err(NotChecked::Unproven);
             }
@@ -709,26 +702,32 @@ fn check_owner_once<'db>(
         };
         hir_ty_linear::check_body(db, body, kind, &mut linear);
     }
-    result.diagnostics.extend(linear.into_iter().map(|it| BorrowckDiagnostic {
-        code: hir_ty_linear::LinearDiagnostic::CODE,
-        span: it.span,
-        message: it.message,
-        at_signature: false,
-        // alloc: error path, a linear error's labels
-        labels: it.labels.into_iter().map(|(span, label)| (PartSpan::At(span), label)).collect(),
-        children: it
-            .notes
-            .into_iter()
-            .map(|message| Child {
-                level: Sublevel::Note,
-                message,
-                spans: Vec::new(),  // alloc: empty
-                labels: Vec::new(), // alloc: empty
-            })
-            .collect(), // alloc: error path, a linear error's notes
-        suggestions: Vec::new(), // alloc: empty
-        dropped_at_scope_end: None,
-        drop_check: None,
+    result.diagnostics.extend(linear.into_iter().map(|it| {
+        BorrowckDiagnostic {
+            code: hir_ty_linear::LinearDiagnostic::CODE,
+            span: it.span,
+            message: it.message,
+            at_signature: false,
+            // alloc: error path, a linear error's labels
+            labels: it
+                .labels
+                .into_iter()
+                .map(|(span, label)| (PartSpan::At(span), label))
+                .collect(),
+            children: it
+                .notes
+                .into_iter()
+                .map(|message| Child {
+                    level: Sublevel::Note,
+                    message,
+                    spans: Vec::new(),  // alloc: empty
+                    labels: Vec::new(), // alloc: empty
+                })
+                .collect(), // alloc: error path, a linear error's notes
+            suggestions: Vec::new(), // alloc: empty
+            dropped_at_scope_end: None,
+            drop_check: None,
+        }
     }));
     if debugging(db, owner) {
         if let Some(skipped) = &result.skipped {
@@ -1052,9 +1051,9 @@ impl<'a, 'db> Ctx<'a, 'db> {
 
     /// The place `local.projection` in the body's place column, made if new.
     pub(crate) fn place(&self, local: LocalId, projection: &[PlaceElem]) -> places::PlaceId {
-        self.places.borrow_mut().intern(local, projection, |ty, elem| {
-            ty.projection_ty(&self.infcx, elem, self.env)
-        })
+        self.places
+            .borrow_mut()
+            .intern(local, projection, |ty, elem| ty.projection_ty(&self.infcx, elem, self.env))
     }
 
     pub(crate) fn project(&self, ty: PlaceTy<'db>, elem: &PlaceElem) -> PlaceTy<'db> {

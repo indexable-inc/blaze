@@ -985,10 +985,9 @@ mod tests {
 
     fn shape(element: &SyntaxElement) -> Shape {
         match element {
-            SyntaxElement::Node(node) => Shape::Node(
-                node.kind(),
-                node.children_with_tokens().map(|it| shape(&it)).collect(),
-            ),
+            SyntaxElement::Node(node) => {
+                Shape::Node(node.kind(), node.children_with_tokens().map(|it| shape(&it)).collect())
+            }
             SyntaxElement::Token(token) => Shape::Token(token.kind(), token.text().to_owned()),
         }
     }

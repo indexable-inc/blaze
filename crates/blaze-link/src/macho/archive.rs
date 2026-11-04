@@ -91,7 +91,10 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
             // alloc: error path
             let shown = String::from_utf8_lossy(symbol.name());
             // alloc: error path
-            format!("{name}: the index puts {shown} at offset {}, which is no member", symbol.offset().0)
+            format!(
+                "{name}: the index puts {shown} at offset {}, which is no member",
+                symbol.offset().0
+            )
         })?;
         let raw = symbol.name();
         let (Ok(nth), Ok(len)) = (u32::try_from(index.len()), u32::try_from(raw.len())) else {
@@ -188,7 +191,9 @@ pub(super) mod tests {
     use crate::model::Archive;
 
     fn header(out: &mut Vec<u8>, name: &str, size: usize) {
-        out.extend_from_slice(format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).as_bytes());
+        out.extend_from_slice(
+            format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).as_bytes(),
+        );
     }
 
     /// A BSD member: a `#1/<len>` name padded with NULs to 8 bytes, as Apple's `ar` writes.
@@ -216,7 +221,11 @@ pub(super) mod tests {
     }
 
     /// `members` with a `__.SYMDEF` of `entries` (string offset into `strings`, member index).
-    pub(in crate::macho) fn bsd_raw(members: &[(&str, &[u8])], mut strings: Vec<u8>, entries: &[(u32, usize)]) -> Vec<u8> {
+    pub(in crate::macho) fn bsd_raw(
+        members: &[(&str, &[u8])],
+        mut strings: Vec<u8>,
+        entries: &[(u32, usize)],
+    ) -> Vec<u8> {
         strings.resize(strings.len().next_multiple_of(4), 0);
         let symdef_name = "__.SYMDEF SORTED";
         let symdef_padded = (symdef_name.len() + 1).next_multiple_of(8);
@@ -256,7 +265,11 @@ pub(super) mod tests {
     }
 
     fn index(archive: &Archive) -> Vec<(String, u32)> {
-        archive.index.iter().map(|&(name, member)| (archive.name(name).to_owned(), member)).collect()
+        archive
+            .index
+            .iter()
+            .map(|&(name, member)| (archive.name(name).to_owned(), member))
+            .collect()
     }
 
     #[test]
@@ -313,21 +326,34 @@ pub(super) mod tests {
         for round in 0..64 {
             let count = 1 + below(20) as usize;
             let names: Vec<String> = (0..count)
-                .map(|i| if below(2) == 0 { format!("m{i}.o") } else { format!("member_with_a_long_name_{round}_{i}.o") })
+                .map(|i| {
+                    if below(2) == 0 {
+                        format!("m{i}.o")
+                    } else {
+                        format!("member_with_a_long_name_{round}_{i}.o")
+                    }
+                })
                 .collect();
-            let datas: Vec<Vec<u8>> = (0..count).map(|i| vec![i as u8; 1 + below(40) as usize]).collect();
+            let datas: Vec<Vec<u8>> =
+                (0..count).map(|i| vec![i as u8; 1 + below(40) as usize]).collect();
             let symbols: Vec<(String, usize)> =
                 (0..below(50)).map(|i| (format!("_s{i}"), below(count as u64) as usize)).collect();
-            let members: Vec<(&str, &[u8])> =
-                names.iter().zip(&datas).map(|(name, data)| (name.as_str(), data.as_slice())).collect();
-            let entries: Vec<(&str, usize)> = symbols.iter().map(|(name, at)| (name.as_str(), *at)).collect();
+            let members: Vec<(&str, &[u8])> = names
+                .iter()
+                .zip(&datas)
+                .map(|(name, data)| (name.as_str(), data.as_slice()))
+                .collect();
+            let entries: Vec<(&str, usize)> =
+                symbols.iter().map(|(name, at)| (name.as_str(), *at)).collect();
             let bytes = bsd(&members, &entries);
-            let archive = read("libseeded.a", &bytes).unwrap_or_else(|e| panic!("round {round}: {e}"));
+            let archive =
+                read("libseeded.a", &bytes).unwrap_or_else(|e| panic!("round {round}: {e}"));
             assert_eq!(member_names(&archive), names, "round {round}");
             for (member, data) in archive.members.iter().zip(&datas) {
                 assert_eq!(&bytes[member.bytes.clone()], data.as_slice(), "round {round}");
             }
-            let want: Vec<(String, u32)> = symbols.iter().map(|(name, at)| (core(name), *at as u32)).collect();
+            let want: Vec<(String, u32)> =
+                symbols.iter().map(|(name, at)| (core(name), *at as u32)).collect();
             assert_eq!(index(&archive), want, "round {round}");
             // Every name in the one arena: the members' and the index's, nothing else.
             let bytes_named: usize = names.iter().map(String::len).sum::<usize>()
@@ -359,7 +385,10 @@ pub(super) mod tests {
         }
         let archive = read("libsame.a", &bytes).unwrap();
         assert_eq!(archive.index.len(), 640);
-        assert!(archive.index.iter().all(|it| *it == archive.index[0]), "one `Name` for one string");
+        assert!(
+            archive.index.iter().all(|it| *it == archive.index[0]),
+            "one `Name` for one string"
+        );
         assert_eq!(archive.name(archive.index[0].0), core(&long));
         assert_eq!(archive.names.bytes(), "a.o".len() + core(&long).len());
     }

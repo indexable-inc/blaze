@@ -8,11 +8,11 @@ use std::cmp::Ordering;
 
 use serde::de::{self, Deserialize, DeserializeSeed, IntoDeserializer as _, Visitor};
 
+use super::check::{DEEPEST, item};
 use super::{
     ARRAY, BYTES, Error, MAP, NAN, NEGATIVE, NULL, RAW, SIMPLE, TEXT, UNSIGNED, check, from_half,
     half_of, key_order,
 };
-use super::check::{DEEPEST, item};
 
 /// The value of type `T` that `bytes` encode: one item in the core deterministic encoding,
 /// or the first offence against it.

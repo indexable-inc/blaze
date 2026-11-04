@@ -3,8 +3,8 @@
 
 use base_db::{Crate, Db, RunOrder, all_crates, relevant_crates, set_run_order};
 use hir_expand::{InFile, files::FilePosition};
-use span::FileId;
 use itertools::Itertools;
+use span::FileId;
 use syntax::view::{self as ast, AstNode};
 
 use crate::{

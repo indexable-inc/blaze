@@ -54,11 +54,7 @@ pub enum Unshared {
     /// as it passes up a call, from the subjects themselves, never by comparing names (two
     /// bodies can have one path: methods of `impl Foo<u8>` and `impl Foo<u16>`), so a caller
     /// several calls away names its own callee and the body at the end, never the chain between.
-    UnknownIntrinsic {
-        name: String,
-        body: String,
-        through: Through,
-    },
+    UnknownIntrinsic { name: String, body: String, through: Through },
     /// An intrinsic whose code is made for the one instance ([`Class::PerInstance`]).
     PerInstance(String),
     /// No options to key the body with: `hir_ty_identity::Compiled` is empty for its crate.
@@ -116,7 +112,10 @@ impl Unshared {
     /// and of every caller.
     pub fn is_per_instance(&self) -> bool {
         match self {
-            Unshared::Recursive | Unshared::Shim(_) | Unshared::PerInstance(_) | Unshared::TooDeep { .. } => true,
+            Unshared::Recursive
+            | Unshared::Shim(_)
+            | Unshared::PerInstance(_)
+            | Unshared::TooDeep { .. } => true,
             Unshared::UnknownIntrinsic { .. }
             | Unshared::NoOptions
             | Unshared::NoMir(_)
@@ -141,16 +140,23 @@ impl fmt::Display for Unshared {
                 write!(f, "it calls {body}, which calls the unclassified intrinsic `{name}`")
             }
             Unshared::UnknownIntrinsic { name, body, through: Through::Reaches(callee) } => {
-                write!(f, "it calls {callee}, which reaches {body}, which calls the unclassified intrinsic `{name}`")
+                write!(
+                    f,
+                    "it calls {callee}, which reaches {body}, which calls the unclassified intrinsic `{name}`"
+                )
             }
-            Unshared::PerInstance(name) => write!(f, "it calls `{name}`, whose code is per instance"),
+            Unshared::PerInstance(name) => {
+                write!(f, "it calls `{name}`, whose code is per instance")
+            }
             Unshared::NoOptions => f.write_str("no MIR options were given for its crate"),
             Unshared::NoMir(what) => write!(f, "its MIR: {what}"),
             Unshared::NoLayout(what) => write!(f, "a layout: {what}"),
             Unshared::NoContent(what) => write!(f, "no content: {what}"),
             Unshared::ConstEval(what) => write!(f, "a constant: {what}"),
             Unshared::Unhashable(what) => f.write_str(what),
-            Unshared::Shape(what) => write!(f, "its body has {what}, whose type the key does not read"),
+            Unshared::Shape(what) => {
+                write!(f, "its body has {what}, whose type the key does not read")
+            }
             Unshared::TooDeep { depth, limit } => write!(
                 f,
                 "its arguments nest {depth} deep, past the {limit} compile identity looks into: \
@@ -159,4 +165,3 @@ impl fmt::Display for Unshared {
         }
     }
 }
-

@@ -9,7 +9,7 @@
 #       `blaze check --workspace` with the release on Linux x86-64 and macOS,
 #       the lint baselines (crates/blaze-lints/baselines) with the blaze the tree builds, on
 #       Linux AArch64,
-#       `harness/imports.py` and `harness/rustcsites.py`. No `cargo fmt --check`: fmt.yaml
+#       `harness/imports.py` and `harness/rustcsites.py`. No `blaze fmt --check`: fmt.yaml
 #       formats main after each push instead.
 #   push to main: the build and the unit tests on Linux x86-64, Linux AArch64 and macOS, which
 #       write the caches every other run reads, and the same `blaze check --workspace`. One runs at a time: the next push waits, and a

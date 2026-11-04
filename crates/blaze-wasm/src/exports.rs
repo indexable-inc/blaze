@@ -76,7 +76,7 @@ pub unsafe extern "C" fn blaze_set_pack(ptr: *mut u8, len: usize) -> bool {
     PAGE.with_borrow_mut(|page| {
         let pack = serde_json::from_slice(&bytes).map_err(|e| e.to_string());
         drop(bytes);
-        match pack.and_then(|pack| page.compiler.set_pack(pack, crate::macros::expand)) {
+        match pack.and_then(|pack| page.compiler.set_pack(pack)) {
             Ok(()) => true,
             Err(e) => {
                 page.report = e;

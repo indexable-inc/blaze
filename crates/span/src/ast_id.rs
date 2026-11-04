@@ -39,9 +39,9 @@ use std::{
 };
 
 use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use blaze_ids::{bits::BitArray, radix};
 use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
+use std::alloc::Global;
 use syntax::{
     AstNode, AstPtr, FlatTree, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast, view::NodeId,
 };
@@ -732,7 +732,12 @@ impl AstIdMap {
             + size_of_val(&*bodies.by_slot)
             + size_of_val(&*bodies.ats)
             + size_of_val(&*bodies.ids)
-            + bodies.ids.iter().filter_map(|it| it.get()).map(|it| size_of_val(&**it)).sum::<usize>()
+            + bodies
+                .ids
+                .iter()
+                .filter_map(|it| it.get())
+                .map(|it| size_of_val(&**it))
+                .sum::<usize>()
     }
 }
 
@@ -798,7 +803,10 @@ fn sort_entries(entries: &mut [Entry]) {
         radix::sort_copy_by_key_in(
             entries,
             |&[a, b, c, d]| {
-                (u128::from(a) << 96) | (u128::from(b) << 64) | (u128::from(c) << 32) | u128::from(d)
+                (u128::from(a) << 96)
+                    | (u128::from(b) << 64)
+                    | (u128::from(c) << 32)
+                    | u128::from(d)
             },
             scratch.take(),
         );
@@ -1050,10 +1058,20 @@ fn find_node(tree: &FlatTree, mut at: u32, kind: SyntaxKind, range: TextRange) -
 enum Step<P> {
     /// The block a found item is in, which holds no item found before it: its id is made
     /// before the item's.
-    Block { at: u32, parent: Option<P> },
-    Item { at: u32, kind: ErasedFileAstIdKind, parent: Option<P> },
+    Block {
+        at: u32,
+        parent: Option<P>,
+    },
+    Item {
+        at: u32,
+        kind: ErasedFileAstIdKind,
+        parent: Option<P>,
+    },
     /// A fn's body, left to a walk of its own.
-    Body { at: u32, parent: Option<P> },
+    Body {
+        at: u32,
+        parent: Option<P>,
+    },
 }
 
 /// Walks the nodes under `root` that may have ids, parents before children: by walking the
@@ -1302,8 +1320,8 @@ impl AstIdMap {
                     Some(entries.len() as u32 - 1)
                 }
                 Step::Body { at, parent } => {
-                    let owner =
-                        parent.map_or(ROOT_ERASED_FILE_AST_ID, |it| entry_id(&entries[it as usize]));
+                    let owner = parent
+                        .map_or(ROOT_ERASED_FILE_AST_ID, |it| entry_id(&entries[it as usize]));
                     found.push((at, owner));
                     None
                 }
@@ -1407,7 +1425,9 @@ impl AstIdMap {
                 }
                 let kind = kind_of(tree, it);
                 let range = tree.range(it);
-                if elided.get(next).is_some_and(|ptr| ptr.kind() == kind && ptr.text_range() == range)
+                if elided
+                    .get(next)
+                    .is_some_and(|ptr| ptr.kind() == kind && ptr.text_range() == range)
                 {
                     next += 1;
                     it = tree.end(it);
@@ -1568,8 +1588,8 @@ mod tests {
     };
 
     use blaze_hash::{FixedState, HashMap, HashSet};
-    use std::alloc::Global;
     use blaze_ids::rng::SplitMix64;
+    use std::alloc::Global;
     use syntax::{
         AstNode, AstPtr, Edition, Parse, SourceFile, SyntaxKind, SyntaxNode, SyntaxNodePtr,
         TextRange, TextSize,
@@ -1861,7 +1881,10 @@ fn foo() {
                 }
             });
             let got: HashMap<_, _, Global> = ids(&map).into_iter().collect();
-            assert!(got == want.into_iter().collect::<HashMap<_, _, Global>>(), "{path}: `ptrs` differ");
+            assert!(
+                got == want.into_iter().collect::<HashMap<_, _, Global>>(),
+                "{path}: `ptrs` differ"
+            );
         }
     }
 
@@ -1991,7 +2014,11 @@ fn foo() {
 
     #[test]
     fn relative_without_a_fn_body() {
-        only_the_item_without("fn f() { struct A; }\nstruct B;\n", SyntaxKind::FN, SyntaxKind::BLOCK_EXPR);
+        only_the_item_without(
+            "fn f() { struct A; }\nstruct B;\n",
+            SyntaxKind::FN,
+            SyntaxKind::BLOCK_EXPR,
+        );
     }
 
     #[test]
@@ -2016,7 +2043,8 @@ fn foo() {
     /// With nothing left out, it is the map `relative_to_view` makes.
     #[test]
     fn relative_to_is_relative_without_nothing() {
-        let text: Arc<str> = "struct A;\nimpl T for A {\n    fn c() { m!(); fn d() { n!() } }\n}\n".into();
+        let text: Arc<str> =
+            "struct A;\nimpl T for A {\n    fn c() { m!(); fn d() { n!() } }\n}\n".into();
         let file = full_of(&text);
         let map = AstIdMap::from_view(file.root());
         let anchor =
@@ -2098,7 +2126,8 @@ fn foo() {
             let full = full_of(&text);
             let outline = outline_of(&text);
             for map in [AstIdMap::from_view(full.root()), AstIdMap::from_view(outline.root())] {
-                let ids: Vec<ErasedFileAstId> = stored(&map).into_iter().map(|(_, id)| id).collect();
+                let ids: Vec<ErasedFileAstId> =
+                    stored(&map).into_iter().map(|(_, id)| id).collect();
                 let ptrs: Vec<SyntaxNodePtr> = full.root().descendants().map(view::ptr).collect();
                 let look = || {
                     for &ptr in &ptrs {
@@ -2161,8 +2190,7 @@ fn foo() {
         let mut rng = SplitMix64::new(1);
         for len in [0usize, 1, 2, 3, 7, 8, 9, 100, 1000, 5000] {
             // Few distinct keys, so most are shared by many entries.
-            let keys: Vec<u32> =
-                (0..len).map(|_| rng.below(len as u64 / 2 + 1) as u32).collect();
+            let keys: Vec<u32> = (0..len).map(|_| rng.below(len as u64 / 2 + 1) as u32).collect();
             let index = super::Index::new(len, |it| keys[it]);
             assert!(index.slots.len() * 3 > len * 4, "{len} entries fill the table past 3/4");
             for key in 0..len as u32 + 10 {
@@ -2194,7 +2222,8 @@ fn foo() {
             for map in [AstIdMap::from_view(full.root()), AstIdMap::from_view(outline.root())] {
                 let stored = stored(&map);
                 let by_ptr: HashMap<_, _, Global> = stored.iter().copied().collect();
-                let by_id: HashMap<_, _, Global> = stored.iter().map(|&(ptr, id)| (id, ptr)).collect();
+                let by_id: HashMap<_, _, Global> =
+                    stored.iter().map(|&(ptr, id)| (id, ptr)).collect();
                 assert_eq!(by_ptr.len(), stored.len(), "{path}: a node is kept twice");
                 assert_eq!(by_id.len(), stored.len(), "{path}: an id is kept twice");
                 for node in full.root().descendants() {
@@ -2442,7 +2471,8 @@ fn foo() {
                 // In the order they begin, none in another: what `relative_without_view` elides.
                 let bodies: Vec<SyntaxNodePtr> = (0..map.bodies.len())
                     .map(|body| {
-                        let tree = map.bodies.tree.as_deref().expect("a map with bodies keeps them");
+                        let tree =
+                            map.bodies.tree.as_deref().expect("a map with bodies keeps them");
                         let kind = super::kind_of(tree, map.bodies.ats[body]);
                         SyntaxNodePtr::from_parts(kind, map.bodies.range(body))
                     })
@@ -2473,7 +2503,9 @@ fn foo() {
                     let elided: Vec<SyntaxNodePtr> = bodies
                         .iter()
                         .copied()
-                        .filter(|it| range.contains_range(it.text_range()) && it.text_range() != range)
+                        .filter(|it| {
+                            range.contains_range(it.text_range()) && it.text_range() != range
+                        })
                         .collect();
                     if elided.is_empty() {
                         continue;
@@ -2491,14 +2523,13 @@ fn foo() {
                     let in_elided = |it: SyntaxNodePtr| {
                         elided.iter().any(|e| e.text_range().contains_range(it.text_range()))
                     };
-                    let want = all
-                        .iter()
-                        .filter(|&&(it, _)| under(it) && !in_elided(it))
-                        .map(|&(it, id)| {
+                    let want = all.iter().filter(|&&(it, _)| under(it) && !in_elided(it)).map(
+                        |&(it, id)| {
                             let (start, end) = (it.text_range().start(), it.text_range().end());
                             let moved = TextRange::new(shift(start), shift(end));
                             (SyntaxNodePtr::from_parts(it.kind(), moved), id)
-                        });
+                        },
+                    );
                     let what = format!("{path}: {ptr:?} without its bodies");
                     assert!(got.bodies.len() == 0, "{what}: a body is kept");
                     let want = by_node(want.collect(), &what);

@@ -174,7 +174,8 @@ impl<'a> Table<'a> {
         if !slots.is_power_of_two() || slots < LEAST_SLOTS {
             return Err("its header gives an impossible number of slots");
         }
-        let len = slots.checked_mul(1 + ROW as u64).and_then(|it| it.checked_add(INDEX_HEADER as u64));
+        let len =
+            slots.checked_mul(1 + ROW as u64).and_then(|it| it.checked_add(INDEX_HEADER as u64));
         if len != Some(bytes.len() as u64) {
             return Err("its length is not what its header says");
         }
@@ -190,14 +191,25 @@ impl<'a> Table<'a> {
 
     /// What [`Table::new`] found, to view the same bytes again without checking them again.
     pub(crate) fn shape(&self) -> Shape {
-        Shape { slots: self.control.len(), groups_mask: self.groups_mask, count: self.count, lanes: self.lanes }
+        Shape {
+            slots: self.control.len(),
+            groups_mask: self.groups_mask,
+            count: self.count,
+            lanes: self.lanes,
+        }
     }
 
     /// The table `shape` was taken from; `bytes` must be the bytes it was taken from.
     pub(crate) fn again(bytes: &'a [u8], shape: Shape) -> Table<'a> {
         let (control, rows) = bytes[INDEX_HEADER..].split_at(shape.slots);
         assert_eq!(rows.len(), shape.slots * ROW, "the bytes a table's shape was taken from");
-        Table { control, rows, groups_mask: shape.groups_mask, count: shape.count, lanes: shape.lanes }
+        Table {
+            control,
+            rows,
+            groups_mask: shape.groups_mask,
+            count: shape.count,
+            lanes: shape.lanes,
+        }
     }
 
     /// How many records it holds.
@@ -243,10 +255,12 @@ impl<'a> Table<'a> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, Key, Result<Loc, &'static str>)> + 'a {
         let table = *self;
         let control: &'a [u8] = self.control;
-        control.iter().enumerate().filter(|(_, control)| **control != EMPTY).map(move |(slot, _)| {
-            let row = table.row(slot);
-            (slot as u64, Key(id_at(row, 0)), decode_row(row))
-        })
+        control.iter().enumerate().filter(|(_, control)| **control != EMPTY).map(
+            move |(slot, _)| {
+                let row = table.row(slot);
+                (slot as u64, Key(id_at(row, 0)), decode_row(row))
+            },
+        )
     }
 }
 
@@ -382,8 +396,8 @@ pub(crate) fn paths() -> Vec<(&'static str, Matcher)> {
 mod tests {
     use std::collections::HashSet;
 
-    use blaze_ids::rng::SplitMix64 as Rng;
     use blaze_ids::ContentId;
+    use blaze_ids::rng::SplitMix64 as Rng;
 
     use super::*;
 
@@ -544,8 +558,10 @@ mod tests {
     fn placing_by_group_answers_as_placing_by_key_did() {
         let mut rng = Rng::new(61);
         let prefix = rng.next_u64();
-        let mut sets: Vec<Vec<(Key, Loc)>> =
-            [0, 1, 17, 896, 897, 5000, 60_000].into_iter().map(|count| random_entries(count, 60 + count as u64)).collect();
+        let mut sets: Vec<Vec<(Key, Loc)>> = [0, 1, 17, 896, 897, 5000, 60_000]
+            .into_iter()
+            .map(|count| random_entries(count, 60 + count as u64))
+            .collect();
         sets.push(with_locs((0..2000).map(|_| clustered_key(&mut rng, prefix)).collect()));
         let absent: Vec<Key> = (0..2000).map(|_| random_key(&mut rng)).collect();
         for entries in &sets {
@@ -648,7 +664,10 @@ mod tests {
     #[test]
     fn nibble_lanes_inverts_the_narrowed_mask() {
         let mut rng = Rng::new(32);
-        for lanes in [0, 1, 0x8000, 0xffff, 0x5555, 0xaaaa].into_iter().chain((0..2000).map(|_| rng.next_u64() as u16)) {
+        for lanes in [0, 1, 0x8000, 0xffff, 0x5555, 0xaaaa]
+            .into_iter()
+            .chain((0..2000).map(|_| rng.next_u64() as u16))
+        {
             let nibbles = (0..GROUP)
                 .filter(|&lane| lanes & (1 << lane) != 0)
                 .fold(0u64, |mask, lane| mask | (0xf << (4 * lane)));

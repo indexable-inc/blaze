@@ -6,7 +6,6 @@ use either::Either;
 use hir_def::{
     AdtId, AssocItemId, GenericDefId, GenericParamId, HasModule, ImplId, Lookup, TraitId,
     TypeAliasId, TypeParamId,
-    nameres::{assoc_item_binding_name, impl_item_name, trait_item_name, written_name},
     expr_store::{
         ExpressionStore, HygieneId,
         path::{
@@ -17,6 +16,7 @@ use hir_def::{
     hir::generics::{
         GenericParamDataRef, TypeOrConstParamData, TypeParamData, TypeParamProvenance,
     },
+    nameres::{assoc_item_binding_name, impl_item_name, trait_item_name, written_name},
     resolver::{ResolveValueResult, Resolver, TypeNs, ValueNs},
     signatures::{TraitFlags, TraitSignature},
     type_ref::{TypeRef, TypeRefId},
@@ -30,10 +30,10 @@ use rustc_type_ir::{
 use crate::{
     GenericArgsProhibitedReason, IncorrectGenericsLenKind, PathGenericsSource,
     PathLoweringDiagnostic, Span, TyDefId, ValueTyDefId,
-    lower::diagnostics::{AssocTypeFailure, AssocTypeQself},
     db::HirDatabase,
     generics::{Generics, ObjectLifetimeDefault, generics},
     infer::unify::InferenceTable,
+    lower::diagnostics::{AssocTypeFailure, AssocTypeQself},
     lower::{
         AssocTypeShorthandResolution, ForbidParamsAfterReason, GenericPredicateSource,
         LifetimeElisionKind, PathDiagnosticCallbackData, const_param_ty,
@@ -124,7 +124,8 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
     /// ([`Path::segment_hygiene`]): what an associated item it names is looked up by.
     #[inline]
     fn current_segment_hygiene(&self) -> HygieneId {
-        self.path.segment_hygiene(self.current_segment_idx.min(self.segments.len().saturating_sub(1)))
+        self.path
+            .segment_hygiene(self.current_segment_idx.min(self.segments.len().saturating_sub(1)))
     }
 
     #[inline]
@@ -200,9 +201,17 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
 
     /// The error type of the associated type of the current segment that `qself` does not
     /// resolve for `failure`.
-    fn assoc_type_not_resolved(&mut self, qself: AssocTypeQself, failure: AssocTypeFailure) -> Ty<'db> {
+    fn assoc_type_not_resolved(
+        &mut self,
+        qself: AssocTypeQself,
+        failure: AssocTypeFailure,
+    ) -> Ty<'db> {
         let segment = self.current_segment_u32();
-        self.on_diagnostic(PathLoweringDiagnostic::AssocTypeNotResolved { segment, qself, failure });
+        self.on_diagnostic(PathLoweringDiagnostic::AssocTypeNotResolved {
+            segment,
+            qself,
+            failure,
+        });
         self.ctx.types.types.error
     }
 
@@ -247,8 +256,12 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         let segment = self.current_or_prev_segment;
                         let trait_id = trait_ref.def_id.0;
                         let db = self.ctx.db;
-                        let name =
-                            trait_item_name(db, trait_id, *segment.name, self.current_segment_hygiene());
+                        let name = trait_item_name(
+                            db,
+                            trait_id,
+                            *segment.name,
+                            self.current_segment_hygiene(),
+                        );
                         let found = trait_id.trait_items(db).associated_type_named(db, name);
 
                         tracing::debug!(?found);
@@ -322,11 +335,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
     }
 
     /// Generic arguments on `segments`, one error.
-    fn prohibit_generic_args(
-        &mut self,
-        segments: Vec<u32>,
-        reason: GenericArgsProhibitedReason,
-    ) {
+    fn prohibit_generic_args(&mut self, segments: Vec<u32>, reason: GenericArgsProhibitedReason) {
         if !segments.is_empty() {
             let segments = segments.into_boxed_slice();
             self.on_diagnostic(PathLoweringDiagnostic::GenericArgsProhibited { segments, reason });
@@ -570,10 +579,11 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     param,
                     written_name(db, *assoc_name, hygiene),
                 );
-                let assoc_type = match self.resolved_shorthand(AssocTypeQself::Param(param), resolution) {
-                    Ok(it) => it,
-                    Err(error) => return error,
-                };
+                let assoc_type =
+                    match self.resolved_shorthand(AssocTypeQself::Param(param), resolution) {
+                        Ok(it) => it,
+                        Err(error) => return error,
+                    };
                 assoc_type
                     .get_with(|(assoc_type, trait_args)| (*assoc_type, trait_args.as_ref()))
                     .skip_binder()
@@ -645,7 +655,12 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
     /// parameters as `ty`'s arguments give them. An impl of `ty` itself is matched, or one of
     /// its type with the impl's parameters in their order (`impl<T> Foo<T>`); an alias with
     /// parameters of its own is not.
-    fn inherent_associated_type(&self, ty: Ty<'db>, name: &Name, hygiene: HygieneId) -> Option<Ty<'db>> {
+    fn inherent_associated_type(
+        &self,
+        ty: Ty<'db>,
+        name: &Name,
+        hygiene: HygieneId,
+    ) -> Option<Ty<'db>> {
         let (db, interner) = (self.ctx.db, self.ctx.interner);
         let (adt, args) = ty.as_adt()?;
         // `name` keyed for each impl's items (rustc's `adjust_ident_and_get_scope` in
@@ -1340,11 +1355,7 @@ fn check_generic_args_len<'db>(
 
 /// Whether `def` is a function with late-bound lifetimes, named or left out of its parameters:
 /// rustc's `Generics::has_late_bound_regions`.
-fn has_late_bound_lifetimes(
-    db: &Db,
-    def: GenericDefId,
-    def_generics: &Generics<'_>,
-) -> bool {
+fn has_late_bound_lifetimes(db: &Db, def: GenericDefId, def_generics: &Generics<'_>) -> bool {
     let GenericDefId::FunctionId(function) = def else { return false };
     def_generics
         .iter_self_late_bound()

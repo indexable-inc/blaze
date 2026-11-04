@@ -169,7 +169,9 @@ impl<'t> Retarget<'_, 't> {
             (self.to)(*def).as_deref() != Some(to.as_str()) && !(self.carries)(&to, *def)
         });
         if let Some(def) = dropped {
-            let name = def.name(self.db).map_or_else(|| "an item".to_owned(), |it| format!("`{}`", it.as_str()));
+            let name = def
+                .name(self.db)
+                .map_or_else(|| "an item".to_owned(), |it| format!("`{}`", it.as_str()));
             return Err(format!(
                 "`{written}` also imports {name} of another namespace, which `{to}` does not name: \
                  split the import by hand"

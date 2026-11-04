@@ -12,13 +12,13 @@ use crate::{
     infer::PatAdjust,
     mir::{
         CastKind, FieldIndex, LocalId, MutBorrowKind, Operand, OperandKind, Place, PlaceTy,
-        normalize_or_keep,
         lower::{
-            AssignTarget, Assigned, BasicBlockId, BinOp, BindingId, BorrowKind, Expr,
-            MemoryMap, MirLowerCtx, MirLowerError, MirSpan, Pat, PatId, PlaceElem, ProjectionElem,
+            AssignTarget, Assigned, BasicBlockId, BinOp, BindingId, BorrowKind, Expr, MemoryMap,
+            MirLowerCtx, MirLowerError, MirSpan, Pat, PatId, PlaceElem, ProjectionElem,
             ResolveValueResult, Result, Rvalue, SwitchTargets, TerminatorKind, Ty, TyKind, ValueNs,
             VariantId,
         },
+        normalize_or_keep,
     },
 };
 use crate::{

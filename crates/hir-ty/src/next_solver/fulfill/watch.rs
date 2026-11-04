@@ -13,7 +13,9 @@
 //! ready. Each visit still runs `goal_remains_stalled` first, so the obligations evaluated,
 //! their order and every effect are rustc's loop's.
 
-use rustc_next_trait_solver::solve::{GoalEvaluation, GoalStalledOn, HasChanged, SolverDelegateEvalExt};
+use rustc_next_trait_solver::solve::{
+    GoalEvaluation, GoalStalledOn, HasChanged, SolverDelegateEvalExt,
+};
 use rustc_type_ir::{
     Interner,
     solve::{Certainty, GoalStalledOnOpaques, NoSolution, TyOrConstInferVar},
@@ -98,8 +100,7 @@ impl Watches {
 
     /// Bytes its buffers hold room for.
     pub(super) fn held(&self) -> usize {
-        (self.ready.capacity() + self.watched.capacity() + self.dead.capacity())
-            * size_of::<u64>()
+        (self.ready.capacity() + self.watched.capacity() + self.dead.capacity()) * size_of::<u64>()
             + self.heads.iter().map(|heads| heads.capacity() * size_of::<u32>()).sum::<usize>()
             + self.opaque_rows.capacity() * size_of::<u32>()
             + self.nodes.capacity() * size_of::<Node>()

@@ -48,14 +48,17 @@ use blaze_ids::ContentId;
 use blaze_lower::{Lower, Lowered, Ran};
 use blaze_query::{Config, Database, MemTree};
 use blaze_units::{
-    query::{self, BuildConfig, Command, FetchKind, Invocation, Mount, Origin, Plan, Planned, Units},
+    query::{
+        self, BuildConfig, Command, FetchKind, Invocation, Mount, Origin, Plan, Planned, Units,
+    },
     schema::Mode,
     stdlib,
 };
 use blaze_vfs::View;
 use cranelift_codegen::ir;
 use hir_ty_codegen::v2::{
-    Backends, BuildTime, Databases, HashSource, HirFrontend, HirInstance, ItemHashes, Lowering, Runs, lowered,
+    Backends, BuildTime, Databases, HashSource, HirFrontend, HirInstance, ItemHashes, Lowering,
+    Runs, lowered,
 };
 use serde::Deserialize;
 
@@ -110,9 +113,11 @@ fn coverage() {
     let text = if input.trim_start().starts_with('{') {
         input
     } else {
-        std::fs::read_to_string(&input).unwrap_or_else(|error| panic!("BLAZE_STENCIL_COVERAGE: {input}: {error}"))
+        std::fs::read_to_string(&input)
+            .unwrap_or_else(|error| panic!("BLAZE_STENCIL_COVERAGE: {input}: {error}"))
     };
-    let input: Input = serde_json::from_str(&text).unwrap_or_else(|error| panic!("BLAZE_STENCIL_COVERAGE: {error}"));
+    let input: Input = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("BLAZE_STENCIL_COVERAGE: {error}"));
     let (policy, stencils) = policy().unwrap_or_else(|error| panic!("{error}"));
     let mut tally = Tallies::default();
     let out = input.out.as_deref();
@@ -131,8 +136,17 @@ fn coverage() {
         let (lowered, units) = lower(project).unwrap_or_else(|error| panic!("{error}"));
         let crates = crates(&units, &lowered, input.members_only);
         eprintln!("{}: {} crates to survey", project.dir, crates.len());
-        survey(lowered.db(), lowered.paths(), &crates, &policy, &stencils, &mut tally, out, input.trace)
-            .unwrap_or_else(|error| panic!("{}: {error}", project.dir));
+        survey(
+            lowered.db(),
+            lowered.paths(),
+            &crates,
+            &policy,
+            &stencils,
+            &mut tally,
+            out,
+            input.trace,
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", project.dir));
     }
     let table = tally.table();
     eprintln!("{table}");
@@ -213,7 +227,10 @@ impl Row {
 
 impl Tally {
     fn is_clean(&self) -> bool {
-        self.gaps.is_empty() && self.refused.is_empty() && self.unlowered.is_empty() && self.unreached.is_empty()
+        self.gaps.is_empty()
+            && self.refused.is_empty()
+            && self.unlowered.is_empty()
+            && self.unreached.is_empty()
     }
 
     fn function(&mut self, name: &str, errors: &[blaze_stencil::Error]) {
@@ -226,7 +243,9 @@ impl Tally {
         let mut refused: HashMap<String, usize> = HashMap::new();
         for error in errors {
             match error.gap {
-                Some(gap) => *gaps.entry((gap.opcode.to_string(), ty_name(gap.ty))).or_default() += 1,
+                Some(gap) => {
+                    *gaps.entry((gap.opcode.to_string(), ty_name(gap.ty))).or_default() += 1
+                }
                 None => *refused.entry(error.what.clone()).or_default() += 1,
             }
         }
@@ -271,9 +290,16 @@ impl Tally {
             self.compiled,
             self.functions - self.compiled
         );
-        let _ = writeln!(out, "| opcode | type | functions | instructions | e.g. |\n|---|---|---:|---:|---|");
+        let _ = writeln!(
+            out,
+            "| opcode | type | functions | instructions | e.g. |\n|---|---|---:|---:|---|"
+        );
         for ((opcode, ty), row) in sorted(&self.gaps) {
-            let _ = writeln!(out, "| `{opcode}` | {ty} | {} | {} | `{}` |", row.functions, row.instructions, row.example);
+            let _ = writeln!(
+                out,
+                "| `{opcode}` | {ty} | {} | {} | `{}` |",
+                row.functions, row.instructions, row.example
+            );
         }
         if !self.refused.is_empty() {
             let _ = writeln!(out, "\n| other refusal | functions | e.g. |\n|---|---:|---|");
@@ -310,7 +336,9 @@ fn message(what: &str) -> String {
 /// `rows`, most functions first, then most instructions.
 fn sorted<K>(rows: &BTreeMap<K, Row>) -> Vec<(&K, &Row)> {
     let mut rows: Vec<_> = rows.iter().collect();
-    rows.sort_by(|a, b| b.1.functions.cmp(&a.1.functions).then(b.1.instructions.cmp(&a.1.instructions)));
+    rows.sort_by(|a, b| {
+        b.1.functions.cmp(&a.1.functions).then(b.1.instructions.cmp(&a.1.instructions))
+    });
     rows
 }
 
@@ -323,21 +351,28 @@ fn ty_name(ty: ir::Type) -> String {
 /// code differs in its glue, not in its opcodes.
 fn policy() -> Result<(Policy, blaze_stencil::Target), String> {
     let target = hir_ty_codegen::Target::of(hir_ty_codegen::Target::host())?;
-    let mut stencils = target.stencil().ok_or_else(|| format!("{} has no stencils", target.triple()))?;
+    let mut stencils =
+        target.stencil().ok_or_else(|| format!("{} has no stencils", target.triple()))?;
     stencils.pic = false;
     let library = blaze_stencil::library_id(&stencils).map_err(|error| error.to_string())?;
     // The survey's own code generator: nothing it compiles is kept past the process.
-    let code = hir_ty_codegen::v2::CodegenCode(blaze_ids::ContentId::of("blaze-stencil coverage survey code", b""));
+    let code = hir_ty_codegen::v2::CodegenCode(blaze_ids::ContentId::of(
+        "blaze-stencil coverage survey code",
+        b"",
+    ));
     let host = hir_ty_codegen::Target::host();
     let target_data = blaze_lower::target_data(host).map_err(|it| it.to_string())?;
-    let mut toolchain = hir_ty_codegen::v2::toolchain_for(&code, host, &target_data, &[], Runs::Here)?;
+    let mut toolchain =
+        hir_ty_codegen::v2::toolchain_for(&code, host, &target_data, &[], Runs::Here)?;
     hir_ty_codegen::v2::select(&toolchain)?;
     toolchain.relocation = Relocation::Static;
     toolchain.stencils = Some(blaze_format::hex::encode(&library));
     // Std's shipped layer is opt-level 3, which a plan refuses in a blaze without LLVM; every
     // unit here is compiled by copy-and-patch whatever its level (`tier_spec`), so the plan
     // is told of an LLVM it never reaches.
-    toolchain.llvm.get_or_insert_with(|| "none: the stencil survey compiles every unit by copy-and-patch".to_owned());
+    toolchain.llvm.get_or_insert_with(|| {
+        "none: the stencil survey compiles every unit by copy-and-patch".to_owned()
+    });
     let policy = Policy {
         toolchain,
         profile: Profile {
@@ -375,9 +410,17 @@ fn tier_spec(mut spec: Spec) -> Spec {
 /// Every crate to survey, once each, with the origin its code is asked as: the members'
 /// crates of every kind (libraries, binaries, tests, build scripts, proc macros) and, unless
 /// `members_only`, the standard library's.
-fn crates(units: &Units, lowered: &Lowered, members_only: bool) -> Vec<(Crate, PlanOrigin, String)> {
-    let members: HashMap<&str, &str> =
-        units.packages.iter().filter(|it| it.is_member).map(|it| (it.id.as_str(), it.name.as_str())).collect();
+fn crates(
+    units: &Units,
+    lowered: &Lowered,
+    members_only: bool,
+) -> Vec<(Crate, PlanOrigin, String)> {
+    let members: HashMap<&str, &str> = units
+        .packages
+        .iter()
+        .filter(|it| it.is_member)
+        .map(|it| (it.id.as_str(), it.name.as_str()))
+        .collect();
     let mut out: Vec<(Crate, PlanOrigin, String)> = Vec::new();
     for (unit, it) in units.graph.units.iter().enumerate() {
         if it.mode == Mode::RunCustomBuild {
@@ -419,7 +462,8 @@ fn survey(
         Some(names.get(&file).cloned().unwrap_or_else(|| format!("file{}.rs", file.index())))
     }));
     let build_time = BuildTime::default();
-    let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), build_time).with_policy(policy);
+    let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), build_time)
+        .with_policy(policy);
     let backends = Backends::default();
     let memo = Memo::new();
     let requester = requester(crates);
@@ -429,7 +473,10 @@ fn survey(
         let (before, compiled) = (tally.all.functions, tally.all.compiled);
         eprintln!("[{}/{}] {name}: surveying", n + 1, crates.len());
         let surveyed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            survey_crate(&frontend, &backends, &memo, policy, stencils, &requester, *krate, *origin, &mut seen, tally, trace)
+            survey_crate(
+                &frontend, &backends, &memo, policy, stencils, &requester, *krate, *origin,
+                &mut seen, tally, trace,
+            )
         }));
         let (roots, reached) = match surveyed {
             Ok(Ok(counts)) => counts,
@@ -477,7 +524,8 @@ fn survey_crate(
     tally: &mut Tallies,
     trace: bool,
 ) -> Result<(usize, usize), String> {
-    let roots: Vec<(HirInstance, PlanOrigin)> = frontend.every_function(krate).into_iter().map(|it| (it, origin)).collect();
+    let roots: Vec<(HirInstance, PlanOrigin)> =
+        frontend.every_function(krate).into_iter().map(|it| (it, origin)).collect();
     let build = Build::new(backends, frontend, policy, memo);
     let reached = match build.reach(&roots, &[]) {
         Ok(reached) => vec![reached],
@@ -487,7 +535,9 @@ fn survey_crate(
                 match build.reach(std::slice::from_ref(root), &[]) {
                     Ok(reached) => each.push(reached),
                     Err(errors) => {
-                        let name = frontend.describe(&root.0, requester).map_or_else(|_| format!("{:?}", root.0), |it| it.name);
+                        let name = frontend
+                            .describe(&root.0, requester)
+                            .map_or_else(|_| format!("{:?}", root.0), |it| it.name);
                         let what = errors.first().map_or("no error given", |it| it.what.as_str());
                         tally.all.unreached(&name, what);
                     }
@@ -530,7 +580,8 @@ fn survey_crate(
             }
             match lowered(frontend, &unit, &spec, instance, refs) {
                 Ok(Lowering::Ir { func, .. }) => {
-                    let errors = blaze_stencil::survey(&func, stencils).map_err(|error| error.to_string())?;
+                    let errors = blaze_stencil::survey(&func, stencils)
+                        .map_err(|error| error.to_string())?;
                     tally.function(&described.name, &errors, dev);
                 }
                 Ok(Lowering::Asm(_) | Lowering::Allocator(_)) => {}
@@ -550,7 +601,11 @@ fn write_out(out: Option<&str>, table: &str) {
 /// Whose code asks for each instance: a member's when there is one, as a generic is compiled
 /// as a member of a dev build asks for it.
 fn requester(crates: &[(Crate, PlanOrigin, String)]) -> PlanOrigin {
-    crates.iter().map(|it| it.1).find(|it| matches!(it, PlanOrigin::Member(_))).unwrap_or(PlanOrigin::Std)
+    crates
+        .iter()
+        .map(|it| it.1)
+        .find(|it| matches!(it, PlanOrigin::Member(_)))
+        .unwrap_or(PlanOrigin::Std)
 }
 
 /// Every root the test reads, in one tree.
@@ -580,23 +635,33 @@ fn library() -> Result<&'static Library, String> {
 
 /// Every file under `dir` that `keep` keeps, by its `/`-separated path, but under `.git`, a
 /// top-level `target*` directory (build output: `target`, `target-cargo`) and `skipped`.
-fn read_tree(dir: &Path, keep: &dyn Fn(&str) -> bool, skipped: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
+fn read_tree(
+    dir: &Path,
+    keep: &dyn Fn(&str) -> bool,
+    skipped: &[&str],
+) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut files = Vec::new();
     let mut dirs = vec![(dir.to_path_buf(), String::new())];
     while let Some((at, under)) = dirs.pop() {
-        let entries = std::fs::read_dir(&at).map_err(|error| format!("{}: {error}", at.display()))?;
+        let entries =
+            std::fs::read_dir(&at).map_err(|error| format!("{}: {error}", at.display()))?;
         for entry in entries {
             let entry = entry.map_err(|error| format!("{}: {error}", at.display()))?;
-            let name = entry.file_name().into_string().map_err(|it| format!("{}: {it:?} is not UTF-8", at.display()))?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|it| format!("{}: {it:?} is not UTF-8", at.display()))?;
             let path = if under.is_empty() { name.clone() } else { format!("{under}/{name}") };
-            let metadata = std::fs::metadata(entry.path()).map_err(|error| format!("{}: {error}", entry.path().display()))?;
+            let metadata = std::fs::metadata(entry.path())
+                .map_err(|error| format!("{}: {error}", entry.path().display()))?;
             if metadata.is_dir() {
                 let output = under.is_empty() && name.starts_with("target");
                 if name != ".git" && !output && !skipped.contains(&path.as_str()) {
                     dirs.push((entry.path(), path));
                 }
             } else if keep(&path) {
-                let bytes = std::fs::read(entry.path()).map_err(|error| format!("{}: {error}", entry.path().display()))?;
+                let bytes = std::fs::read(entry.path())
+                    .map_err(|error| format!("{}: {error}", entry.path().display()))?;
                 files.push((path, bytes));
             }
         }
@@ -605,7 +670,8 @@ fn read_tree(dir: &Path, keep: &dyn Fn(&str) -> bool, skipped: &[&str]) -> Resul
 }
 
 fn root_of(files: &[(String, Vec<u8>)]) -> ContentId {
-    let files: Vec<(&str, &[u8])> = files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
+    let files: Vec<(&str, &[u8])> =
+        files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
     tree().root(&files)
 }
 
@@ -624,9 +690,15 @@ fn host() -> Result<&'static str, String> {
 
 /// The units of the workspace at `dir` as `blaze build` plans them, each package it needs
 /// mounted from where cargo fetched it.
-fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str) -> Result<(Units, BuildConfig), String> {
+fn plan(
+    db: &Database,
+    dir: &str,
+    view: ContentId,
+    cargo_home: &str,
+) -> Result<(Units, BuildConfig), String> {
     let library = library()?;
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set, and cargo reads it".to_owned())?;
+    let home =
+        std::env::var("HOME").map_err(|_| "HOME is not set, and cargo reads it".to_owned())?;
     let mut env = vec![("CARGO_HOME".to_owned(), cargo_home.to_owned()), ("HOME".to_owned(), home)];
     env.sort();
     let config_toml = format!("{cargo_home}/config.toml");
@@ -659,7 +731,11 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str) -> Result<(
             sources: "/s/sources".to_owned(),
         };
         let opened = db.open_with(View { root: view }, &config.encode());
-        let planned = db.pin().get::<Plan>(opened, &()).map_err(|error| format!("planning {dir}: {error:?}"))?.get();
+        let planned = db
+            .pin()
+            .get::<Plan>(opened, &())
+            .map_err(|error| format!("planning {dir}: {error:?}"))?
+            .get();
         let needs = match planned {
             Planned::Ready(units) => return Ok((units, config)),
             Planned::Failed(error) => return Err(format!("planning {dir}: {}", error.what)),
@@ -667,10 +743,16 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str) -> Result<(
         };
         for fetch in needs {
             if fetched.contains(&fetch.at) {
-                return Err(format!("planning {dir} needs {} again once it is mounted at {}", fetch.what, fetch.at));
+                return Err(format!(
+                    "planning {dir} needs {} again once it is mounted at {}",
+                    fetch.what, fetch.at
+                ));
             }
             if matches!(fetch.kind, FetchKind::IndexFile) {
-                return Err(format!("planning {dir} reads the index file {}: its Cargo.lock does not pin {}", fetch.url, fetch.what));
+                return Err(format!(
+                    "planning {dir} reads the index file {}: its Cargo.lock does not pin {}",
+                    fetch.url, fetch.what
+                ));
             }
             let at = Path::new(&fetch.at);
             if !at.is_dir() {
@@ -680,7 +762,11 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str) -> Result<(
                 ));
             }
             let files = read_tree(at, &|_: &str| true, &[])?;
-            mounts.push(Mount { at: fetch.at.clone(), origin: Origin::Root(root_of(&files)), under: String::new() });
+            mounts.push(Mount {
+                at: fetch.at.clone(),
+                origin: Origin::Root(root_of(&files)),
+                under: String::new(),
+            });
             fetched.push(fetch.at);
         }
     }
@@ -689,14 +775,26 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str) -> Result<(
 /// The run of build-script unit `unit` as `blaze build` left it: `output` beside its
 /// `OUT_DIR`, and the files in `OUT_DIR`.
 fn ran(units: &Units, unit: usize) -> Result<Ran, String> {
-    let out_dir = units.plans[unit].out_dir.clone().ok_or_else(|| format!("build script run {unit} has no OUT_DIR"))?;
-    let output_at = Path::new(&out_dir).parent().map(|it| it.join("output")).ok_or_else(|| format!("{out_dir} has no parent"))?;
+    let out_dir = units.plans[unit]
+        .out_dir
+        .clone()
+        .ok_or_else(|| format!("build script run {unit} has no OUT_DIR"))?;
+    let output_at = Path::new(&out_dir)
+        .parent()
+        .map(|it| it.join("output"))
+        .ok_or_else(|| format!("{out_dir} has no parent"))?;
     let output = std::fs::read(&output_at).map_err(|error| {
-        format!("no build script's run at {}: {error}; build the project with `blaze build` first", output_at.display())
+        format!(
+            "no build script's run at {}: {error}; build the project with `blaze build` first",
+            output_at.display()
+        )
     })?;
     let mut ran = Ran { out_dir: out_dir.clone(), ..Ran::default() };
     for line in String::from_utf8_lossy(&output).lines() {
-        let Some(directive) = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:")) else { continue };
+        let Some(directive) = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:"))
+        else {
+            continue;
+        };
         let Some((key, value)) = directive.split_once('=') else { continue };
         match key {
             "rustc-cfg" => ran.cfgs.push(value.to_owned()),
@@ -722,36 +820,60 @@ fn lower(project: &Project) -> Result<(Lowered, Units), String> {
     let started = Instant::now();
     let files = read_tree(Path::new(dir), &|_: &str| true, &[])?;
     let bytes: usize = files.iter().map(|it| it.1.len()).sum();
-    eprintln!("{dir}: read {} files, {} MiB, in {:.0?}", files.len(), bytes >> 20, started.elapsed());
+    eprintln!(
+        "{dir}: read {} files, {} MiB, in {:.0?}",
+        files.len(),
+        bytes >> 20,
+        started.elapsed()
+    );
     let view = root_of(&files);
     let mut db = Database::new(Config { tree: Some(tree.clone()), dir: None, tags: 0 });
     query::register(&mut db);
     let (units, config) = plan(&db, dir, view, cargo_home)?;
-    let lower = Lower { units: &units, config: &config, files: &**tree, root: view, host_cpu: None };
-    let mut lowered = blaze_lower::lower_into(Db::logged(), lower).map_err(|error| format!("lowering {dir}: {error}"))?;
-    eprintln!("{dir}: planned {} units and lowered them in {:.0?}", units.graph.units.len(), started.elapsed());
+    let lower =
+        Lower { units: &units, config: &config, files: &**tree, root: view, host_cpu: None };
+    let mut lowered = blaze_lower::lower_into(Db::logged(), lower)
+        .map_err(|error| format!("lowering {dir}: {error}"))?;
+    eprintln!(
+        "{dir}: planned {} units and lowered them in {:.0?}",
+        units.graph.units.len(),
+        started.elapsed()
+    );
     for (unit, it) in units.graph.units.iter().enumerate() {
         if it.mode == Mode::RunCustomBuild && !project.unbuilt {
             let run = ran(&units, unit)?;
-            lowered.ran(unit, &run).map_err(|error| format!("applying build script run {unit} of {dir}: {error}"))?;
+            lowered
+                .ran(unit, &run)
+                .map_err(|error| format!("applying build script run {unit} of {dir}: {error}"))?;
         }
     }
-    let toolchain = ContentId::of("blaze v2 stencil coverage toolchain 1", library()?.commit.as_bytes());
-    let keeping = blaze_macro_eval::Macros::nothing("the stencil coverage test runs every expansion");
-    let modules = blaze_macro_eval::Modules::new().map_err(|why| format!("no Wasmtime engine for the proc macros: {why}"))?;
+    let toolchain =
+        ContentId::of("blaze v2 stencil coverage toolchain 1", library()?.commit.as_bytes());
+    let keeping =
+        blaze_macro_eval::Macros::nothing("the stencil coverage test runs every expansion");
+    let modules = blaze_macro_eval::Modules::new()
+        .map_err(|why| format!("no Wasmtime engine for the proc macros: {why}"))?;
     for unit in 0..units.graph.units.len() {
         if !lowered.crates().is_proc_macro(unit) {
             continue;
         }
         let name = &units.graph.units[unit].target.name;
-        let krate = lowered.krate(unit).ok_or_else(|| format!("proc macro `{name}` has no crate"))?;
+        let krate =
+            lowered.krate(unit).ok_or_else(|| format!("proc macro `{name}` has no crate"))?;
         let macros = match project.unbuilt {
             // No build linked its module: blaze's MIR evaluator, the wasm modules' reference
             // engine, runs the same crate, and the table notes it.
             true => blaze_macro_eval::load(lowered.db(), krate, toolchain, &keeping),
             false => {
                 let bytes = module(&units, unit, name)?;
-                blaze_macro_eval::load_wasm(lowered.db(), krate, toolchain, &keeping, &modules, &bytes)
+                blaze_macro_eval::load_wasm(
+                    lowered.db(),
+                    krate,
+                    toolchain,
+                    &keeping,
+                    &modules,
+                    &bytes,
+                )
             }
         };
         lowered.macros(unit, macros).map_err(|error| format!("the macros of `{name}`: {error}"))?;

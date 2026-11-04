@@ -40,7 +40,9 @@ impl fmt::Display for AccessCause {
             AccessCause::Reborrow(_) => f.write_str("reborrow"),
             AccessCause::Dealloc => f.write_str("deallocation"),
             // A protector's end can never cause UB: what it would invalidate was UB already.
-            AccessCause::FnExit(_) => unreachable!("protector accesses can never be the source of UB"),
+            AccessCause::FnExit(_) => {
+                unreachable!("protector accesses can never be the source of UB")
+            }
         }
     }
 }
@@ -150,7 +152,12 @@ pub struct Event {
 }
 
 /// Miri: `HistoryData::extend`.
-fn extend_history(out: &mut Vec<Event>, history: History, tag_name: &str, show_initial_state: bool) {
+fn extend_history(
+    out: &mut Vec<Event>,
+    history: History,
+    tag_name: &str,
+    show_initial_state: bool,
+) {
     let History { tag, created, events } = history;
     let this = format!("the {tag_name} tag {tag:?}");
     let note = if show_initial_state {
@@ -295,7 +302,9 @@ impl AliasError {
 impl fmt::Display for AliasError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.title)?;
-        for help in [HELP_EXPERIMENTAL, HELP_SEE].into_iter().chain(self.details.iter().map(String::as_str)) {
+        for help in
+            [HELP_EXPERIMENTAL, HELP_SEE].into_iter().chain(self.details.iter().map(String::as_str))
+        {
             write!(f, "\n  = help: {help}")?;
         }
         Ok(())
@@ -322,7 +331,8 @@ pub(super) fn build_error(
     );
     let (kind, details, conflicting_tag_name) = match error_kind {
         TransitionError::ChildAccessForbidden(perm) => {
-            let conflicting_tag_name = if accessed_is_conflicting { "accessed" } else { "conflicting" };
+            let conflicting_tag_name =
+                if accessed_is_conflicting { "accessed" } else { "conflicting" };
             let mut details = Vec::new();
             if !accessed_is_conflicting {
                 details.push(format!(
@@ -402,7 +412,12 @@ impl Tree {
     }
 
     /// Names a tag for reports and the tree printer. Miri: `Tree::give_pointer_debug_name`.
-    pub(super) fn give_pointer_debug_name(&mut self, tag: BorTag, nth_parent: u8, name: &str) -> bool {
+    pub(super) fn give_pointer_debug_name(
+        &mut self,
+        tag: BorTag,
+        nth_parent: u8,
+        name: &str,
+    ) -> bool {
         let Some(tag) = self.nth_parent(tag, nth_parent) else { return false };
         let idx = self.index_of(tag);
         self.nodes.debug[idx.index()].add_name(name);
@@ -423,7 +438,14 @@ impl Tree {
                 "This allocation does not contain named tags. Use `miri_print_borrow_state(_, true)` to also print unnamed tags.\n",
             );
         }
-        DisplayRepr::print(&main_tree, &wildcard_subtrees, &DEFAULT_FORMATTER, &ranges, !show_unnamed, &mut out);
+        DisplayRepr::print(
+            &main_tree,
+            &wildcard_subtrees,
+            &DEFAULT_FORMATTER,
+            &ranges,
+            !show_unnamed,
+            &mut out,
+        );
         out
     }
 }
@@ -524,7 +546,12 @@ impl DisplayRepr {
         assert!(v.is_empty());
         return Some(root);
 
-        fn extraction_aux(tree: &Tree, idx: UniIndex, show_unnamed: bool, acc: &mut Vec<DisplayRepr>) {
+        fn extraction_aux(
+            tree: &Tree,
+            idx: UniIndex,
+            show_unnamed: bool,
+            acc: &mut Vec<DisplayRepr>,
+        ) {
             let name = tree.nodes.debug[idx.index()].name.clone();
             let mut children_sorted = tree.nodes.children(idx).to_vec();
             radix::sort_by_key(&mut children_sorted, |&idx| tree.nodes.tag(idx).get());
@@ -533,7 +560,8 @@ impl DisplayRepr {
                     extraction_aux(tree, child_idx, show_unnamed, acc);
                 }
             } else {
-                let rperm = tree.locations.iter_all().map(|(_, loc)| loc.perms.get(idx).copied()).collect();
+                let rperm =
+                    tree.locations.iter_all().map(|(_, loc)| loc.perms.get(idx).copied()).collect();
                 let mut children = Vec::new();
                 for child_idx in children_sorted {
                     extraction_aux(tree, child_idx, show_unnamed, &mut children);
@@ -640,7 +668,11 @@ impl DisplayRepr {
                 fmt.join_middle
             });
             line.push_str(fmt.join_default);
-            line.push_str(if tree.children.is_empty() { fmt.join_default } else { fmt.join_haschild });
+            line.push_str(if tree.children.is_empty() {
+                fmt.join_default
+            } else {
+                fmt.join_haschild
+            });
             line.push_str(fmt.join_default);
             line.push_str(fmt.join_default);
             line.push_str(&fmt.print_tag(tree.tag, &tree.name));

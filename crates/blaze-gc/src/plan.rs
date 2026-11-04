@@ -335,7 +335,11 @@ impl fmt::Display for NoSpace {
             }
         }
         if !self.skipped.is_empty() {
-            write!(f, "; not collected, as another collector holds them: {}", self.skipped.join(", "))?;
+            write!(
+                f,
+                "; not collected, as another collector holds them: {}",
+                self.skipped.join(", ")
+            )?;
         }
         Ok(())
     }
@@ -437,11 +441,15 @@ pub enum Swept {
     Leased,
     /// The lease of `dir`, a build dir inside it, was held: a build uses that (review round 5,
     /// B1).
-    NestedLeased { dir: String },
+    NestedLeased {
+        dir: String,
+    },
     /// It was renamed into trash, but a lease inside was then found held and the rename back
     /// failed (`why` names both): it stays in trash, and no unlink takes it while that lease is
     /// held (review round 8, M1).
-    LeftInTrash { why: String },
+    LeftInTrash {
+        why: String,
+    },
     /// It was not there, or the lease taken was no longer its own (it was renamed away).
     Gone,
     /// A lease was taken in this process after the rename was asked for: the driver's gate
@@ -688,7 +696,8 @@ impl RunReport {
                 "{:>10}  {}  {}\n",
                 size_text(verdict.bytes),
                 verdict.path,
-                serde_json::to_string(&verdict.fate).unwrap_or_else(|error| format!("(unprintable: {error})"))
+                serde_json::to_string(&verdict.fate)
+                    .unwrap_or_else(|error| format!("(unprintable: {error})"))
             ));
         }
         out
@@ -1396,7 +1405,7 @@ impl Collector {
             area: self.config.areas[at].clone(),
             free_bytes: volume.free_bytes,
             floor_bytes: levels.floor(&volume),
-            kept: kept.to_vec(), // alloc: each held build's own copy
+            kept: kept.to_vec(),           // alloc: each held build's own copy
             skipped: self.skipped.clone(), // clone: each held build's own copy
         })
     }
@@ -1655,7 +1664,9 @@ impl Collector {
                 return true;
             }
             // alloc: a problem reported
-            notes.push(format!("run {run}'s last scan or step was never answered; given up at {now} ns"));
+            notes.push(format!(
+                "run {run}'s last scan or step was never answered; given up at {now} ns"
+            ));
             false
         });
         // An urgent run goes first, and does not wait for a stale answer: a build waits for it.
@@ -2364,10 +2375,11 @@ impl Collector {
             // The roots again, as they are now: a pin, hold, head or use since the mark keeps it.
             let marked_at = run.marked_at;
             let step = run.sweep[at].clone(); // clone: one step, checked while the run is borrowed apart
-            let keep =
-                self.rooted(&step.path, step.class, step.checkout.as_deref(), false, step.recent).or_else(
-                    || self.touched_after(&step.path, marked_at).then_some(Keep::UsedAfterMark),
-                );
+            let keep = self
+                .rooted(&step.path, step.class, step.checkout.as_deref(), false, step.recent)
+                .or_else(|| {
+                    self.touched_after(&step.path, marked_at).then_some(Keep::UsedAfterMark)
+                });
             let run = self.run.as_mut().expect("the run pumped");
             if let Some(keep) = keep {
                 tracing::info!(target: "blaze", path = %step.path, "gc keeps what was rooted after the mark");
@@ -2377,7 +2389,10 @@ impl Collector {
                 continue;
             }
             let area = &self.config.areas[usize::from(step.area)];
-            let to = format!("{area}/{TRASH}/{}", trash_name(run.started_ns, collector_tag(run.id, run.seq), &step.path));
+            let to = format!(
+                "{area}/{TRASH}/{}",
+                trash_name(run.started_ns, collector_tag(run.id, run.seq), &step.path)
+            );
             run.seq += 1;
             run.sweep[at].trash = Some(to.clone()); // clone: the step keeps where it went
             run.bytes_asked = run.bytes_asked.saturating_add(step.bytes);
@@ -2429,7 +2444,9 @@ impl Collector {
             Swept::NestedLeased { dir } => Some(Keep::NestedLeasedAtSweep { dir }),
             Swept::LeftInTrash { why } => {
                 // alloc: a problem reported
-                current.problems.push(format!("{path} is in trash, not moved back for a build inside it: {why}"));
+                current.problems.push(format!(
+                    "{path} is in trash, not moved back for a build inside it: {why}"
+                ));
                 Some(Keep::LeftInTrash { why })
             }
             Swept::Gone => Some(Keep::Gone),

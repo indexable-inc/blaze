@@ -539,13 +539,7 @@ impl String {
 ";
     assert_reports(
         &ui_only(fixture, code("E0023")),
-        &[
-            error(11, &[]),
-            error(12, &[]),
-            error(13, &[]),
-            error(14, &[]),
-            error(15, &[]),
-        ],
+        &[error(11, &[]), error(12, &[]), error(13, &[]), error(14, &[]), error(15, &[])],
     );
 }
 
@@ -569,7 +563,8 @@ fn a_tuple_variant_pattern_of_wildcards_suggests_a_rest() {
     }
 }
 ";
-    let stderr = "error[E0023]: this pattern has 2 fields, but the corresponding tuple variant has 3 fields
+    let stderr =
+        "error[E0023]: this pattern has 2 fields, but the corresponding tuple variant has 3 fields
   --> $DIR/match-pattern-field-mismatch.rs:10:22
    |
 LL |         Rgb(usize, usize, usize),
@@ -598,7 +593,8 @@ For more information about this error, try `rustc --explain E0023`.
 #[test]
 fn an_empty_tuple_struct_pattern_of_another_type_suggests_no_parentheses() {
     // tests/ui/pattern/issue-67037-pat-tup-scrut-ty-diff-less-fields.rs
-    let fixture = "//- /issue-67037-pat-tup-scrut-ty-diff-less-fields.rs crate:other:main edition:2015
+    let fixture =
+        "//- /issue-67037-pat-tup-scrut-ty-diff-less-fields.rs crate:other:main edition:2015
 // Regression test for #67037.
 //
 // In type checking patterns, E0023 occurs when the tuple pattern and the expected
@@ -621,7 +617,8 @@ fn main() {
     //~^ ERROR this pattern has 0 fields, but the corresponding tuple struct has 1 field
 }
 ";
-    let stderr = "error[E0023]: this pattern has 0 fields, but the corresponding tuple struct has 1 field
+    let stderr =
+        "error[E0023]: this pattern has 0 fields, but the corresponding tuple struct has 1 field
   --> $DIR/issue-67037-pat-tup-scrut-ty-diff-less-fields.rs:19:9
    |
 LL | struct P<T>(T); // 1 type parameter wanted
@@ -659,7 +656,8 @@ fn main() {
 //~| ERROR: `..` patterns are not allowed here
 //~| ERROR: this pattern has 2 fields, but the corresponding tuple struct has 3 fields
 ";
-    let stderr = "error[E0023]: this pattern has 2 fields, but the corresponding tuple struct has 3 fields
+    let stderr =
+        "error[E0023]: this pattern has 2 fields, but the corresponding tuple struct has 3 fields
   --> $DIR/issue-72574-2.rs:6:16
    |
 LL | struct Binder(i32, i32, i32);
@@ -725,7 +723,8 @@ fn main() {
     //~^ ERROR invalid left-hand side of assignment
 }
 ";
-    let stderr = "error[E0023]: this pattern has 3 fields, but the corresponding tuple struct has 2 fields
+    let stderr =
+        "error[E0023]: this pattern has 3 fields, but the corresponding tuple struct has 2 fields
   --> $DIR/tuple_struct_destructure_fail.rs:28:17
    |
 LL | struct TupleStruct<S, T>(S, T);
@@ -1012,7 +1011,8 @@ LL |     let UnitStruct { .. } = us;
 }
 
 /// tests/ui/pattern/rfc-3627-match-ergonomics-2024/experimental/mut-ref-mut.rs
-const MUT_REF_MUT: &str = "//@ revisions: stable2021 classic2021 structural2021 classic2024 structural2024
+const MUT_REF_MUT: &str =
+    "//@ revisions: stable2021 classic2021 structural2021 classic2024 structural2024
 //@[stable2021] edition: 2021
 //@[classic2021] edition: 2021
 //@[structural2021] edition: 2021
@@ -1051,8 +1051,9 @@ pub fn main() {
 
 #[test]
 fn a_mutable_binding_by_reference_is_behind_the_mut_ref_feature() {
-    let fixture =
-        format!("//- /mut-ref-mut.rs crate:other:main edition:2024 cfg:structural2024\n{MUT_REF_MUT}");
+    let fixture = format!(
+        "//- /mut-ref-mut.rs crate:other:main edition:2024 cfg:structural2024\n{MUT_REF_MUT}"
+    );
     let note = "   |
    = note: see issue #123076 <https://github.com/rust-lang/rust/issues/123076> for more information
    = help: add `#![feature(mut_ref)]` to the crate attributes to enable
@@ -1137,7 +1138,8 @@ pub fn main() {
 
 /// The errors of `ref-mut-inside-shared-ref-pat.rs` all its revisions but `stable2021` give,
 /// before the one of `&[x]` only the classic ones give.
-const REF_MUT_INSIDE_SHARED_REF_PAT_ERRORS: &str = "error[E0596]: cannot borrow as mutable inside an `&` pattern
+const REF_MUT_INSIDE_SHARED_REF_PAT_ERRORS: &str =
+    "error[E0596]: cannot borrow as mutable inside an `&` pattern
   --> $DIR/ref-mut-inside-shared-ref-pat.rs:16:31
    |
 LL |     if let Some(&Some(ref mut x)) = &mut Some(Some(0)) {

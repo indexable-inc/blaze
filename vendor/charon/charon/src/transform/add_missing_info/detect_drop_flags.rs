@@ -65,11 +65,7 @@ impl GatherCandidates<'_> {
             }
 
             let terminator = &self.body.body[block_id].terminator;
-            if let TerminatorKind::Drop {
-                kind: DropKind::Precise,
-                place,
-                ..
-            } = &terminator.kind
+            if let TerminatorKind::Drop { kind: DropKind::Precise, place, .. } = &terminator.kind
                 && !dropped_places.contains(place)
             {
                 dropped_places.push(place.clone());
@@ -117,9 +113,7 @@ impl VisitBody for GatherCandidates<'_> {
                 FlagStatus::Unknown => {
                     *status = FlagStatus::Candidate { dropped_places };
                 }
-                FlagStatus::Candidate {
-                    dropped_places: candidates,
-                } => {
+                FlagStatus::Candidate { dropped_places: candidates } => {
                     candidates.retain(|place| dropped_places.contains(place));
                     if dropped_places.is_empty() {
                         *status = FlagStatus::Discarded;
@@ -146,10 +140,7 @@ impl AnalysisState {
         [false, true]
             .into_iter()
             .cartesian_product([false, true])
-            .map(|(flag_value, place_is_initialized)| Self {
-                flag_value,
-                place_is_initialized,
-            })
+            .map(|(flag_value, place_is_initialized)| Self { flag_value, place_is_initialized })
     }
 
     fn is_consistent(self) -> bool {
@@ -160,11 +151,7 @@ impl AnalysisState {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum AnalysisNode {
     Root,
-    State {
-        block: BlockId,
-        flag: LocalId,
-        state: AnalysisState,
-    },
+    State { block: BlockId, flag: LocalId, state: AnalysisState },
     Invalid(LocalId),
 }
 
@@ -264,18 +251,15 @@ impl<'a, 'b> CheckFlagCorrectness<'a, 'b> {
         let updates = body.body.map_ref(|_| HashMap::new());
         let mut graph = DiGraphMap::new();
         graph.add_node(AnalysisNode::Root);
-        let mut analysis = Self {
-            flags,
-            updates,
-            graph,
-        };
+        let mut analysis = Self { flags, updates, graph };
         analysis.compute_updates(body);
         analysis.build_graph(body);
-        for flag in Dfs::new(&analysis.graph, AnalysisNode::Root)
-            .iter(&analysis.graph)
-            .filter_map(|node| match node {
-                AnalysisNode::Invalid(flag) => Some(flag),
-                AnalysisNode::Root | AnalysisNode::State { .. } => None,
+        for flag in
+            Dfs::new(&analysis.graph, AnalysisNode::Root).iter(&analysis.graph).filter_map(|node| {
+                match node {
+                    AnalysisNode::Invalid(flag) => Some(flag),
+                    AnalysisNode::Root | AnalysisNode::State { .. } => None,
+                }
             })
         {
             analysis.flags.swap_remove(&flag);
@@ -285,11 +269,7 @@ impl<'a, 'b> CheckFlagCorrectness<'a, 'b> {
     /// Summarize how each block changes each candidate flag and its associated place.
     fn compute_updates(&mut self, body: &ExprBody) {
         for (block_id, block) in body.body.iter_enumerated() {
-            ComputeUpdates {
-                analysis: self,
-                block_id,
-            }
-            .visit(block);
+            ComputeUpdates { analysis: self, block_id }.visit(block);
         }
     }
 
@@ -319,26 +299,16 @@ impl<'a, 'b> CheckFlagCorrectness<'a, 'b> {
 
         for (block_id, block) in body.body.iter_enumerated() {
             for (&flag, place) in self.flags.iter() {
-                let update = self.updates[block_id]
-                    .get(&flag)
-                    .copied()
-                    .unwrap_or_default();
+                let update = self.updates[block_id].get(&flag).copied().unwrap_or_default();
                 for initial_state in AnalysisState::all() {
-                    let source = AnalysisNode::State {
-                        block: block_id,
-                        flag,
-                        state: initial_state,
-                    };
+                    let source =
+                        AnalysisNode::State { block: block_id, flag, state: initial_state };
                     let state = update.apply(initial_state);
                     if let Some(successors) = Self::block_successors(block, flag, place, state) {
                         for (target, state) in successors {
                             self.graph.add_edge(
                                 source,
-                                AnalysisNode::State {
-                                    block: target,
-                                    flag,
-                                    state,
-                                },
+                                AnalysisNode::State { block: target, flag, state },
                                 (),
                             );
                         }
@@ -368,43 +338,24 @@ impl<'a, 'b> CheckFlagCorrectness<'a, 'b> {
                 return None;
             }
             let (true_branch, false_branch) = data.as_if()?;
-            let branch = if state.flag_value {
-                true_branch
-            } else {
-                false_branch
-            };
+            let branch = if state.flag_value { true_branch } else { false_branch };
             Some(vec![(branches[branch], state)])
         } else {
             Some(match &block.terminator.kind {
-                TerminatorKind::Call {
-                    dest,
-                    target,
-                    on_unwind,
-                    ..
-                } => {
+                TerminatorKind::Call { dest, target, on_unwind, .. } => {
                     let mut after_return = state;
                     if place.is_subplace(dest) {
                         after_return.place_is_initialized = true;
                     }
                     vec![(*target, after_return), (*on_unwind, state)]
                 }
-                TerminatorKind::Drop {
-                    place: dropped,
-                    target,
-                    on_unwind,
-                    ..
-                } => {
+                TerminatorKind::Drop { place: dropped, target, on_unwind, .. } => {
                     if place.is_subplace(dropped) {
                         state.place_is_initialized = false;
                     }
                     vec![(*target, state), (*on_unwind, state)]
                 }
-                _ => block
-                    .terminator
-                    .targets()
-                    .into_iter()
-                    .map(|target| (target, state))
-                    .collect(),
+                _ => block.terminator.targets().into_iter().map(|target| (target, state)).collect(),
             })
         }
     }
@@ -418,13 +369,7 @@ impl UllbcPass for Transform {
 
     fn transform_body(&self, _ctx: &mut TransformCtx, body: &mut ExprBody) {
         if !body.body.iter().any(|block| {
-            matches!(
-                block.terminator.kind,
-                TerminatorKind::Drop {
-                    kind: DropKind::Precise,
-                    ..
-                }
-            )
+            matches!(block.terminator.kind, TerminatorKind::Drop { kind: DropKind::Precise, .. })
         }) {
             return;
         }
@@ -443,10 +388,7 @@ impl UllbcPass for Transform {
 
         // Identify booleans that are used like drop flags, and find out what place they track.
         let flag_statuses = {
-            let mut visitor = GatherCandidates {
-                body,
-                flag_statuses,
-            };
+            let mut visitor = GatherCandidates { body, flag_statuses };
             for block in &body.body {
                 visitor.visit(block);
             }

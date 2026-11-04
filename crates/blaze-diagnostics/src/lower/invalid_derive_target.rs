@@ -17,7 +17,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InvalidDeriveTarget) -> Vec<Found>
     let file = d.range.file_id;
     let root = cx.root(file);
     let message = "`derive` may only be applied to `struct`s, `enum`s and `union`s";
-    let Some(attr) = root.covering_element(d.range.value).ancestors().find_map(ast::Attr::cast) else {
+    let Some(attr) = root.covering_element(d.range.value).ancestors().find_map(ast::Attr::cast)
+    else {
         let diag = Diag::error(Some("E0774"), message, cx.span(d.range));
         // alloc: the error's parts, for an error hir found
         return vec![Found::new(diag, Phase::Expand)];

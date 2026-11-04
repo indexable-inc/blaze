@@ -38,7 +38,10 @@ impl SpinWait {
 
     /// One more round: `false` once the wait has spun and yielded its bound, when the caller
     /// should park on something that wakes it.
-    #[allow(clippy::disallowed_methods, reason = "the one bounded spin, which the ban points every other spin to")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the one bounded spin, which the ban points every other spin to"
+    )]
     pub fn spin(&mut self) -> bool {
         if self.round >= SPINS + YIELDS {
             return false;
@@ -63,7 +66,10 @@ impl SpinWait {
     /// One more round of spinning, never yielding, the rounds doubling to the longest: for a
     /// spin its caller caps by the clock (a window after a wake, in which what it waits for is
     /// likely), which then parks on something that wakes it.
-    #[allow(clippy::disallowed_methods, reason = "the one bounded spin, which the ban points every other spin to")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the one bounded spin, which the ban points every other spin to"
+    )]
     pub fn relax(&mut self) {
         let round = self.round.min(SPINS - 1);
         for _ in 0..1u32 << round {
@@ -80,7 +86,10 @@ impl SpinWait {
         let mut rounds = 0u32;
         while !done() {
             rounds += 1;
-            assert!(rounds < LIMIT, "a wait for {what} spun and yielded {LIMIT} rounds: the step it waits for is stuck");
+            assert!(
+                rounds < LIMIT,
+                "a wait for {what} spun and yielded {LIMIT} rounds: the step it waits for is stuck"
+            );
             if !spin.spin() {
                 thread::yield_now();
             }
@@ -90,7 +99,10 @@ impl SpinWait {
     /// Waits until `done`, as [`SpinWait::until`] does, for at most `long` of the wall clock: for
     /// a test or a tool waiting on another thread's progress, which may take longer than a step.
     /// Past `long` it panics naming `what`.
-    #[allow(clippy::disallowed_methods, reason = "a test's or a tool's limit on the wall clock, which no core reads")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's or a tool's limit on the wall clock, which no core reads"
+    )]
     pub fn within(what: &str, long: Duration, mut done: impl FnMut() -> bool) {
         let until = Instant::now() + long;
         let mut spin = SpinWait::new();
@@ -106,7 +118,10 @@ impl SpinWait {
 /// Keeps this thread busy for `long`, as a job computing that long would: for a test or a
 /// bench that needs a run under way on its thread for a while, which a sleep would fake by
 /// holding the thread idle.
-#[allow(clippy::disallowed_methods, reason = "a test's or a bench's wall-clock work, which no core reads")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's or a bench's wall-clock work, which no core reads"
+)]
 pub fn busy(long: Duration) {
     let until = Instant::now() + long;
     while Instant::now() < until {

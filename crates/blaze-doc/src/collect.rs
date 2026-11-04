@@ -5,12 +5,12 @@ use std::cell::RefCell;
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use either::Either;
 use hir::{
     AssocItem, Crate, HasAttrs, HasCrate, HasVisibility, Impl, InFile, ModuleDef, Visibility,
     view::HasSourceView,
 };
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, T, TextRange, TextSize,
     view::{self as ast, AstNode},
@@ -609,18 +609,14 @@ impl Builder<'_> {
             ModuleDef::Const(it) => it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
             ModuleDef::Static(it) => it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
             ModuleDef::Trait(it) => it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
-            ModuleDef::TypeAlias(it) => {
-                it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new))
-            }
+            ModuleDef::TypeAlias(it) => it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
             ModuleDef::Macro(it) => it.source_view(db).map(|s| {
                 s.map(|it| match it {
                     Either::Left(mac) => ast::AnyHasAttrs::new(mac),
                     Either::Right(func) => ast::AnyHasAttrs::new(func),
                 })
             }),
-            ModuleDef::EnumVariant(it) => {
-                it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new))
-            }
+            ModuleDef::EnumVariant(it) => it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
             ModuleDef::BuiltinType(_) => None,
         };
         let span = match (def, node) {
@@ -857,17 +853,15 @@ impl Builder<'_> {
         }
         out.text(if has_where { "\n{\n" } else { " {\n" });
         let groups: [(&str, &str, fn(&Member) -> bool); 5] = [
-            (
-                "Required associated type",
-                "Required associated types",
-                |m: &Member| m.kind == Kind::AssocType && !m.provided,
-            ),
-            (
-                "Provided associated type",
-                "Provided associated types",
-                |m: &Member| m.kind == Kind::AssocType && m.provided,
-            ),
-            ("Associated constant", "Associated constants", |m: &Member| m.kind == Kind::AssocConst),
+            ("Required associated type", "Required associated types", |m: &Member| {
+                m.kind == Kind::AssocType && !m.provided
+            }),
+            ("Provided associated type", "Provided associated types", |m: &Member| {
+                m.kind == Kind::AssocType && m.provided
+            }),
+            ("Associated constant", "Associated constants", |m: &Member| {
+                m.kind == Kind::AssocConst
+            }),
             ("Required method", "Required methods", |m: &Member| m.kind == Kind::TyMethod),
             ("Provided method", "Provided methods", |m: &Member| m.kind == Kind::Method),
         ];
@@ -1027,9 +1021,9 @@ impl Builder<'_> {
             }
         }
         let source = match hir_def::ImplId::try_from(imp) {
-            Ok(_) => imp
-                .source_view(db)
-                .and_then(|src| self.files.span(db, src.map(|it| it.syntax()))),
+            Ok(_) => {
+                imp.source_view(db).and_then(|src| self.files.span(db, src.map(|it| it.syntax())))
+            }
             Err(_) => None,
         };
         let docs = self.doc(imp, None);

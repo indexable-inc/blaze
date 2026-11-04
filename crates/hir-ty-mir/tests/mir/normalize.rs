@@ -3,6 +3,7 @@
 //! info's `normalize` and `tail` (every type, through the solver).
 
 use hir_def::ModuleDefId;
+use hir_expand::fixture;
 use hir_ty::{
     InferBodyId, TyDefId,
     db::HirDatabase,
@@ -14,8 +15,6 @@ use hir_ty::{
 };
 use hir_ty_mir::mir::normalize_or_keep;
 use rustc_type_ir::inherent::IntoKind;
-use hir_expand::fixture;
-
 
 const TYPES: &str = r#"
 //- minicore: sized, copy
@@ -35,7 +34,9 @@ pub fn f(x: <u32 as Tr>::Out, w: W<<u8 as Tr>::Out>) -> <u8 as Tr>::Out { let _ 
 
 /// Debug info's copy: every type through the solver, the type itself where it fails.
 fn through_the_solver<'db>(infcx: &InferCtxt<'db>, env: ParamEnv<'db>, ty: Ty<'db>) -> Ty<'db> {
-    ObligationCtxt::new(infcx).structurally_normalize_ty(&ObligationCause::dummy(), env, ty).unwrap_or(ty)
+    ObligationCtxt::new(infcx)
+        .structurally_normalize_ty(&ObligationCause::dummy(), env, ty)
+        .unwrap_or(ty)
 }
 
 /// The code generator's, lowering's and the interpreter's: an alias only.
@@ -59,7 +60,9 @@ fn normalize_or_keep_is_each_copy_it_replaced() {
         let mut tys = Vec::new();
         for def in hir_def::test_items::declarations(&db, krate) {
             match def {
-                ModuleDefId::TypeAliasId(it) => tys.push(db.ty(TyDefId::TypeAliasId(it)).skip_binder()),
+                ModuleDefId::TypeAliasId(it) => {
+                    tys.push(db.ty(TyDefId::TypeAliasId(it)).skip_binder())
+                }
                 ModuleDefId::FunctionId(it) => {
                     let body = db
                         .mir_body(InferBodyId::DefWithBodyId(it.into()))

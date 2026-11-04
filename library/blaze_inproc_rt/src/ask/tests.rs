@@ -14,7 +14,11 @@ use crate::Access;
 
 fn temp_dir() -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
-    std::env::temp_dir().join(format!("bza-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)))
+    std::env::temp_dir().join(format!(
+        "bza-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn asks_for(pid: u32) -> Run {
@@ -44,7 +48,12 @@ fn both() -> Both {
     drop(listener);
     let _ = std::fs::remove_dir(&dir);
     let run = Arc::new(asks_for(pid));
-    Both { reader: Reader::new(Channel::new(daemon), run.clone()), sender: Sender::new(run.clone()), run, hook }
+    Both {
+        reader: Reader::new(Channel::new(daemon), run.clone()),
+        sender: Sender::new(run.clone()),
+        run,
+        hook,
+    }
 }
 
 /// Answers each ask of kind `k` with kind `k + 1` and its body reversed, until the run hangs
@@ -72,7 +81,9 @@ impl Watchdog {
     fn new(what: &'static str) -> Watchdog {
         let (done, seen) = crossbeam_channel::bounded::<()>(0);
         std::thread::spawn(move || {
-            if seen.recv_timeout(Duration::from_secs(60)) == Err(crossbeam_channel::RecvTimeoutError::Timeout) {
+            if seen.recv_timeout(Duration::from_secs(60))
+                == Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            {
                 eprintln!("{what}: deadlocked");
                 std::process::abort();
             }
@@ -88,14 +99,20 @@ fn an_asker_spins_about_one_wake_up_and_no_longer() {
     let index = claim(&words).unwrap();
     let generation = ask(&words, index, Kind(7), b"x");
     let start = Instant::now();
-    assert_eq!(answered_within(&words, index, generation, ASKER_SPIN), Err(state(generation, ASKED)));
+    assert_eq!(
+        answered_within(&words, index, generation, ASKER_SPIN),
+        Err(state(generation, ASKED))
+    );
     let spun = start.elapsed();
     assert!(spun >= ASKER_SPIN && spun < Duration::from_millis(100), "{spun:?}");
     assert_eq!(take(&words, 0, &mut Vec::new()).unwrap().map(|it| it.0), Some(index));
     answer_into(&words, seq(index, generation), Kind(8), b"y").unwrap();
     let start = Instant::now();
     assert_eq!(answered_within(&words, index, generation, Duration::from_secs(60)), Ok(()));
-    assert!(start.elapsed() < Duration::from_secs(1), "an answer already there ends the spin at once");
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "an answer already there ends the spin at once"
+    );
 }
 
 #[test]
@@ -114,16 +131,24 @@ fn many_threads_asking_at_once_each_get_their_own_answer() {
                 for n in 0..ASKS as u16 {
                     let len = rng.index(MOST_BODY + 1);
                     let body: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
-                    let answered = request(&run.words, hook, Kind(0x200 + 2 * n), &body, &mut out).unwrap();
+                    let answered =
+                        request(&run.words, hook, Kind(0x200 + 2 * n), &body, &mut out).unwrap();
                     assert_eq!(answered, (Kind(0x201 + 2 * n), len));
-                    assert!(out[..len].iter().eq(body.iter().rev()), "thread {thread} got another's answer");
+                    assert!(
+                        out[..len].iter().eq(body.iter().rev()),
+                        "thread {thread} got another's answer"
+                    );
                 }
             });
         }
     });
     drop(hook);
     assert_eq!(daemon.join().unwrap(), THREADS * ASKS);
-    assert_eq!(Words::word(&run.words, W_USED).load(Ordering::SeqCst), 0, "a slot was never given back");
+    assert_eq!(
+        Words::word(&run.words, W_USED).load(Ordering::SeqCst),
+        0,
+        "a slot was never given back"
+    );
 }
 
 /// The asks a signal handler makes: the test's one run, for the handler to find.
@@ -178,7 +203,9 @@ fn a_signal_handler_that_asks_inside_its_threads_ask_is_answered_first() {
         frame.seq
     };
     sender.send(Kind(0x301), second, b"reldnah").unwrap();
-    blaze_spin::SpinWait::within("the handler's answer", Duration::from_secs(60), || HANDLED.load(Ordering::SeqCst) != 0);
+    blaze_spin::SpinWait::within("the handler's answer", Duration::from_secs(60), || {
+        HANDLED.load(Ordering::SeqCst) != 0
+    });
     assert_eq!(HANDLED.load(Ordering::SeqCst), 1, "the handler's answer");
     sender.send(Kind(0x201), first, b"daerht").unwrap();
     let (got, out) = thread.join().unwrap();
@@ -242,7 +269,8 @@ fn an_ask_whose_length_is_past_its_slot_is_refused() {
     let Both { mut reader, run, hook, .. } = both();
     let index = claim(&run.words).unwrap();
     ask(&run.words, index, Kind(5), b"x");
-    Words::word(&run.words, base(index) + S_ASK).store(5 | (MOST_BODY as u64 + 1) << 16, Ordering::Relaxed);
+    Words::word(&run.words, base(index) + S_ASK)
+        .store(5 | (MOST_BODY as u64 + 1) << 16, Ordering::Relaxed);
     sys::ring(&hook, 0).unwrap();
     let error = reader.recv().unwrap_err();
     assert!(error.what.contains("past"), "{error}");

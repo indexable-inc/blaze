@@ -115,10 +115,7 @@ impl<'a> Shrinker<'a> {
                 let Some(follower) = self.node_after_enclosing_span(i - 1, end) else {
                     continue;
                 };
-                if self
-                    .consider_with_node_nudged(&attempt, follower - (end - start))
-                    .await?
-                {
+                if self.consider_with_node_nudged(&attempt, follower - (end - start)).await? {
                     break;
                 }
             }
@@ -158,10 +155,7 @@ impl<'a> Shrinker<'a> {
                 .collect(),
             ChoiceData::Boolean(bc, b) => alloc::vec![ChoiceData::Boolean(bc.clone(), !b)],
             ChoiceData::String(sc, cps) if cps.len() > sc.min_size => {
-                alloc::vec![ChoiceData::String(
-                    sc.clone(),
-                    cps[..cps.len() - 1].to_vec()
-                )]
+                alloc::vec![ChoiceData::String(sc.clone(), cps[..cps.len() - 1].to_vec())]
             }
             _ => Vec::new(),
         };
@@ -191,9 +185,7 @@ impl<'a> Shrinker<'a> {
             for span in self.current_spans.iter() {
                 if span.end > span.start
                     && span.discarded
-                    && discarded
-                        .last()
-                        .is_none_or(|&(_, prev_end)| span.start >= prev_end)
+                    && discarded.last().is_none_or(|&(_, prev_end)| span.start >= prev_end)
                 {
                     discarded.push((span.start, span.end));
                 }
@@ -283,11 +275,8 @@ impl<'a> Shrinker<'a> {
     /// strictly shorter, we splice the descendant's nodes in place of the
     /// ancestor's and ask the predicate whether that's still interesting.
     pub(crate) async fn pass_to_descendant(&mut self) -> ShrinkResult<()> {
-        let spans: Vec<(usize, usize, u64)> = self
-            .current_spans
-            .iter()
-            .map(|s| (s.start, s.end, s.label))
-            .collect();
+        let spans: Vec<(usize, usize, u64)> =
+            self.current_spans.iter().map(|s| (s.start, s.end, s.label)).collect();
 
         let mut by_label: alloc::collections::BTreeMap<u64, Vec<usize>> =
             alloc::collections::BTreeMap::new();
@@ -392,10 +381,8 @@ impl<'a> Shrinker<'a> {
                 let n = child_indices.len();
                 let snapshot_nodes = self.current_nodes.clone();
 
-                let cached_keys: Vec<crate::native::core::NodesSortKey<'_>> = endpoints
-                    .iter()
-                    .map(|&(s, e)| sort_key(&snapshot_nodes[s..e]))
-                    .collect();
+                let cached_keys: Vec<crate::native::core::NodesSortKey<'_>> =
+                    endpoints.iter().map(|&(s, e)| sort_key(&snapshot_nodes[s..e])).collect();
 
                 shrink_ordering::<crate::native::core::NodesSortKey<'_>, _, _>(
                     n,

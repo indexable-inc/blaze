@@ -31,7 +31,11 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidRangePatType<'db>) ->
     let end = |pat: Option<ast::Pat<'_>>, at: &Option<(hir::Type<'db>, bool)>| {
         let (pat, (ty, fail)) = (pat?, at.as_ref()?);
         // clone: a type handle, on the error path, for an error hir found
-        Some(End { span: cx.span(InFile::new(file, pat.syntax().text_range())), ty: ty.clone(), fail: *fail })
+        Some(End {
+            span: cx.span(InFile::new(file, pat.syntax().text_range())),
+            ty: ty.clone(),
+            fail: *fail,
+        })
     };
     let lhs = end(range.start(), &d.lhs);
     let rhs = end(range.end(), &d.rhs);
@@ -55,7 +59,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidRangePatType<'db>) ->
     for end in std::iter::once(first).chain(second) {
         let label = match end.fail {
             // alloc: the error's text, for an error hir found
-            true => format!("this is of type `{}` but it should be `char` or numeric", cx.ty(&end.ty)),
+            true => {
+                format!("this is of type `{}` but it should be `char` or numeric", cx.ty(&end.ty))
+            }
             // alloc: the error's text, for an error hir found
             false => format!("this is of type `{}`", cx.ty(&end.ty)),
         };

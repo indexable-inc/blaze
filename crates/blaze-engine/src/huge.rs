@@ -20,7 +20,10 @@ pub(crate) fn huge_pages_for_mimalloc() -> std::io::Result<()> {
     // SAFETY: each sets an option word mimalloc reads when it next maps a segment; mimalloc
     // documents options as settable from any thread at any time.
     unsafe {
-        libmimalloc_sys::mi_option_set_enabled(libmimalloc_sys::mi_option_large_os_pages, transparent);
+        libmimalloc_sys::mi_option_set_enabled(
+            libmimalloc_sys::mi_option_large_os_pages,
+            transparent,
+        );
         libmimalloc_sys::mi_option_set(libmimalloc_sys::mi_option_reserve_huge_os_pages, 0);
         libmimalloc_sys::mi_option_set(libmimalloc_sys::mi_option_reserve_huge_os_pages_at, -1);
     }
@@ -45,7 +48,11 @@ mod tests {
         if chosen == Pages::Transparent {
             assert!(enabled(), "transparent huge pages are chosen, so mimalloc maps on them");
         }
-        assert_eq!(enabled(), chosen == Pages::Transparent, "mimalloc's huge pages follow the choice, set either way");
+        assert_eq!(
+            enabled(),
+            chosen == Pages::Transparent,
+            "mimalloc's huge pages follow the choice, set either way"
+        );
         if std::env::var_os(huge::VAR).is_some_and(|it| it == "off") {
             assert_eq!(chosen, Pages::Base);
             assert!(!enabled(), "BLAZE_HUGE_PAGES=off leaves mimalloc on base pages");

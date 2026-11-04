@@ -2,8 +2,8 @@ use parking_lot::Mutex;
 
 use blaze_format::Aligned;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir_expand::fixture;
+use std::alloc::Global;
 
 use super::*;
 use crate::{
@@ -588,7 +588,10 @@ fn checking_finds_a_difference_and_serves_the_image() {
         let f = function_f(&db);
         let served = served_function(&db, f).unwrap();
         let lowered = &FunctionSignature::with_source_map(&db, f).0;
-        assert_ne!(*served, **lowered, "the image's `f` is `g`, a u8; the file's `f` returns a u16");
+        assert_ne!(
+            *served, **lowered,
+            "the image's `f` is `g`, a u8; the file's `f` returns a u16"
+        );
         let differences = frozen::differences();
         match mode {
             Mode::Check => assert!(

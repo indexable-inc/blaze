@@ -103,7 +103,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         let Some(first) = tied.first() else { continue };
         let Some(range) = facts::mir_range(analysis, point.call.span) else { continue };
         let message = match &*tied {
-            [_] => format!("{first}, is tied to this thread and held across a call that may park the fiber"),
+            [_] => format!(
+                "{first}, is tied to this thread and held across a call that may park the fiber"
+            ),
             _ => format!(
                 "{} values tied to this thread are held across a call that may park the fiber: {}",
                 tied.len(),
@@ -124,8 +126,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 impl<'db> Walk<'_, 'db> {
     fn tie(&self, held: &HeldLocal) -> Option<Tie> {
         let ty = self.analysis.ty(held.ty.as_ref());
-        if facts::holds(self.db, &ty, HOLDS_DEPTH, &mut |adt| facts::adt_is(self.db, adt, "blaze_graph", "NoWait"))
-            .is_some()
+        if facts::holds(self.db, &ty, HOLDS_DEPTH, &mut |adt| {
+            facts::adt_is(self.db, adt, "blaze_graph", "NoWait")
+        })
+        .is_some()
         {
             return Some(Tie::NoWait);
         }
@@ -191,7 +195,9 @@ impl<'db> Walk<'_, 'db> {
             Tie::NoWait => format!("{what}, a `NoWait` region that must not wait"),
             Tie::Lent(by) => format!("{what}, lent by `{by}` from this thread's storage"),
             Tie::GivesBack(adt) => {
-                format!("{what}, a `{adt}` whose drop gives back to a thread-local through the `LocalKey` it holds")
+                format!(
+                    "{what}, a `{adt}` whose drop gives back to a thread-local through the `LocalKey` it holds"
+                )
             }
         }
     }

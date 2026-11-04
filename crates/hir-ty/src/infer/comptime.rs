@@ -21,8 +21,7 @@ use super::{
     expr::ExprIsRead, pat::PatOrigin,
 };
 use crate::next_solver::{
-    Clauses, GenericArgs, IsRigid, ParamEnv, PlaceholderType, TraitRef,
-    Ty, TyKind,
+    Clauses, GenericArgs, IsRigid, ParamEnv, PlaceholderType, TraitRef, Ty, TyKind,
     infer::traits::{Obligation, ObligationCause},
 };
 

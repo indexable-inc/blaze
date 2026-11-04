@@ -5,6 +5,7 @@
 //! defaults, variances, unused parameters, supertraits).
 
 use hir_def::ModuleDefId;
+use hir_expand::fixture;
 use hir_ty::{
     TyDefId,
     db::HirDatabase,
@@ -14,7 +15,6 @@ use rustc_type_ir::{
     Binder, BoundRegionKind, BoundVarIndexKind, RegionKind, TraitRef, TyKind, UintTy,
     inherent::IntoKind as _,
 };
-use hir_expand::fixture;
 
 use super::{db::TestDB, type_item};
 use crate::{
@@ -33,9 +33,7 @@ fn check(fixture: &str, f: impl FnOnce(&TestDB, &[AnyDiagnostic<'_>])) {
 }
 
 /// The kind of each `MissingLifetimes`, and what each of its sites is.
-fn missing_lifetimes(
-    found: &[AnyDiagnostic<'_>],
-) -> Vec<(MissingLifetimeKind, Vec<&'static str>)> {
+fn missing_lifetimes(found: &[AnyDiagnostic<'_>]) -> Vec<(MissingLifetimeKind, Vec<&'static str>)> {
     found
         .iter()
         .filter_map(|it| match it {
@@ -390,10 +388,7 @@ struct S<T, const N: usize, U, const M: bool>([T; N], U);
                 db.const_param_ty(id).kind()
             })
             .collect();
-        assert!(
-            matches!(kinds[..], [TyKind::Uint(UintTy::Usize), TyKind::Bool]),
-            "{kinds:?}"
-        );
+        assert!(matches!(kinds[..], [TyKind::Uint(UintTy::Usize), TyKind::Bool]), "{kinds:?}");
     });
 }
 

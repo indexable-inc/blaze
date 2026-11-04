@@ -160,7 +160,8 @@ mod tests {
         let interned: Vec<Vec<&'static str>> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..8)
                 .map(|_| {
-                    scope.spawn(|| names.iter().map(|it| InternedString::new(it).as_str()).collect())
+                    scope
+                        .spawn(|| names.iter().map(|it| InternedString::new(it).as_str()).collect())
                 })
                 .collect();
             workers.into_iter().map(|it| it.join().unwrap()).collect()
@@ -181,7 +182,11 @@ mod tests {
             InternedString::new("a-hit")
         });
         assert_eq!(first, again);
-        let again = blaze_alloc_count::assert_at_most(0, "crates.io's source id", crate::SourceId::crates_io);
+        let again = blaze_alloc_count::assert_at_most(
+            0,
+            "crates.io's source id",
+            crate::SourceId::crates_io,
+        );
         assert!(source.full_eq(again));
     }
 }

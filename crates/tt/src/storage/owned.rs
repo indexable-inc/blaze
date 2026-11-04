@@ -3,12 +3,7 @@
 #![allow(unsafe_code)]
 
 use blaze_mem::Kept;
-use std::{
-    alloc::Allocator,
-    mem::ManuallyDrop,
-    ops::Deref,
-    ptr::NonNull,
-};
+use std::{alloc::Allocator, mem::ManuallyDrop, ops::Deref, ptr::NonNull};
 
 use span::Span;
 

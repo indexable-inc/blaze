@@ -50,7 +50,10 @@ impl Stack {
     pub fn new(bytes: usize) -> io::Result<Stack> {
         let layout = Layout::from_size_align(bytes.next_multiple_of(16), 16).map_err(|why| {
             // alloc: the error of a fiber not made, once
-            io::Error::new(io::ErrorKind::InvalidInput, format!("a fiber's stack of {bytes} bytes: {why}"))
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a fiber's stack of {bytes} bytes: {why}"),
+            )
         })?;
         if layout.size() == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a fiber's stack of 0 bytes"));
@@ -141,8 +144,14 @@ unsafe extern "C" fn entry<I, O>(arg: usize) {
     let (body, input) = unsafe {
         let fiber = (*inner).fiber;
         (
-            (*inner).body.take().unwrap_or_else(|| panic!("fiber {fiber} was started with no body")),
-            (*inner).input.take().unwrap_or_else(|| panic!("fiber {fiber} was started with no value")),
+            (*inner)
+                .body
+                .take()
+                .unwrap_or_else(|| panic!("fiber {fiber} was started with no body")),
+            (*inner)
+                .input
+                .take()
+                .unwrap_or_else(|| panic!("fiber {fiber} was started with no value")),
         )
     };
     body(&yielder, input);
@@ -153,7 +162,11 @@ pub struct Stackful<I, O>(ManuallyDrop<Box<Inner<I, O>>>);
 
 impl<I, O> Stackful<I, O> {
     /// `fiber` is its number, named in this layer's panics.
-    pub fn new(stack: Stack, fiber: u32, body: impl FnOnce(&Yielder<I, O>, I) + 'static) -> Stackful<I, O>
+    pub fn new(
+        stack: Stack,
+        fiber: u32,
+        body: impl FnOnce(&Yielder<I, O>, I) + 'static,
+    ) -> Stackful<I, O>
     where
         I: 'static,
         O: 'static,
@@ -200,14 +213,19 @@ impl<I, O> Stackful<I, O> {
                 SUSPENDED => {
                     (*inner).state = State::Suspended;
                     Resumed::Yield(
-                        (*inner).output.take().unwrap_or_else(|| panic!("fiber {fiber} suspended with no value")),
+                        (*inner)
+                            .output
+                            .take()
+                            .unwrap_or_else(|| panic!("fiber {fiber} suspended with no value")),
                     )
                 }
                 RETURNED => {
                     (*inner).state = State::Done;
                     Resumed::Return
                 }
-                other => panic!("fiber {fiber}: the host's `fiber_resume` answered {other}, neither 0 nor 1"),
+                other => panic!(
+                    "fiber {fiber}: the host's `fiber_resume` answered {other}, neither 0 nor 1"
+                ),
             }
         }
     }

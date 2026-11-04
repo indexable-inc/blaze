@@ -48,7 +48,10 @@ pub(crate) struct Cell {
     /// Its id in the process ([`ids::take_domain`]): the order two are locked in to join.
     id: u32,
     /// The scheduler it joined, set once, under both locks: its world is there from then on.
-    #[expect(clippy::disallowed_types, reason = "set once as two schedulers join, read with no lock by every lock")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "set once as two schedulers join, read with no lock by every lock"
+    )]
     parent: std::sync::OnceLock<Arc<Cell>>,
     /// The union's rank: the smaller joins the bigger, so a chain is at most log2 of the
     /// schedulers long.
@@ -163,7 +166,11 @@ impl Guard<'_> {
             return false;
         }
         let claimed = self.domain.world.claim(key, by);
-        assert!(claimed, "key {key:?} has a flight in scheduler {} that the process's index did not have", self.cell.id);
+        assert!(
+            claimed,
+            "key {key:?} has a flight in scheduler {} that the process's index did not have",
+            self.cell.id
+        );
         true
     }
 
@@ -173,7 +180,11 @@ impl Guard<'_> {
             return false;
         }
         let claimed = self.domain.world.claim_for(key, job, scope);
-        assert!(claimed, "key {key:?} has a flight in scheduler {} that the process's index did not have", self.cell.id);
+        assert!(
+            claimed,
+            "key {key:?} has a flight in scheduler {} that the process's index did not have",
+            self.cell.id
+        );
         true
     }
 
@@ -231,7 +242,9 @@ fn index(key: Key) -> &'static Shard {
     let shards = INDEX.get_or_init(|| {
         // alloc: the index, once, each shard with room for a few flights so that a warm
         // process's flights allocate nothing (about 40 KiB)
-        (0..SHARDS).map(|_| Mutex::new(blaze_hash::HashMap::with_capacity_in(4, std::alloc::Global))).collect()
+        (0..SHARDS)
+            .map(|_| Mutex::new(blaze_hash::HashMap::with_capacity_in(4, std::alloc::Global)))
+            .collect()
     });
     let hash = std::hash::BuildHasher::hash_one(&blaze_hash::FixedState, key);
     &shards[(hash >> 57) as usize % SHARDS]
@@ -263,8 +276,9 @@ pub(super) fn live_job_cell(job: JobId) -> Arc<Cell> {
 /// Where `counter` is in none: it is not live.
 pub(super) fn counter_cell(counter: CounterId) -> Arc<Cell> {
     let id = ids::counter_domain(counter);
-    ids::domain(id)
-        .unwrap_or_else(|| panic!("counter {} is in no live scheduler (its word says {id}): it is not live", counter.0))
+    ids::domain(id).unwrap_or_else(|| {
+        panic!("counter {} is in no live scheduler (its word says {id}): it is not live", counter.0)
+    })
 }
 
 /// The scheduler that has what `on` waits for now, if one has: a key's flight, a counter, a
@@ -288,7 +302,11 @@ fn take(cell: &Cell) -> MutexGuard<'_, Domain> {
         Some(held) => held,
         None => {
             let owner = cell.holder.load(Ordering::Relaxed);
-            crate::wait::wait(crate::wait::WaitOn::Lock("the scheduler"), (owner != 0).then_some(owner), || cell.core.lock())
+            crate::wait::wait(
+                crate::wait::WaitOn::Lock("the scheduler"),
+                (owner != 0).then_some(owner),
+                || cell.core.lock(),
+            )
         }
     };
     if observing() {
@@ -319,7 +337,10 @@ pub(super) fn lock(cell: &Arc<Cell>) -> Guard<'_> {
 /// # Panics
 ///
 /// Past [`FUEL`] joins that each found `other` moved on.
-pub(super) fn lock_joined<'a>(mine: &'a Arc<Cell>, other: impl Fn() -> Option<Arc<Cell>>) -> Guard<'a> {
+pub(super) fn lock_joined<'a>(
+    mine: &'a Arc<Cell>,
+    other: impl Fn() -> Option<Arc<Cell>>,
+) -> Guard<'a> {
     for _ in 0..FUEL {
         let guard = lock(mine);
         let Some(theirs) = other() else { return guard };
@@ -329,7 +350,10 @@ pub(super) fn lock_joined<'a>(mine: &'a Arc<Cell>, other: impl Fn() -> Option<Ar
         drop(guard);
         join(mine, &theirs);
     }
-    panic!("scheduler {} joined another {FUEL} times and still was not joined with what it waits on", mine.id);
+    panic!(
+        "scheduler {} joined another {FUEL} times and still was not joined with what it waits on",
+        mine.id
+    );
 }
 
 /// `a` and `b` are one scheduler from now on: the root of smaller rank (the higher id on a
@@ -350,7 +374,8 @@ fn join(a: &Arc<Cell>, b: &Arc<Cell>) {
         if first.parent.get().is_some() || second.parent.get().is_some() {
             continue;
         }
-        let (rank_first, rank_second) = (first.rank.load(Ordering::Relaxed), second.rank.load(Ordering::Relaxed));
+        let (rank_first, rank_second) =
+            (first.rank.load(Ordering::Relaxed), second.rank.load(Ordering::Relaxed));
         let (big, small, big_domain, small_domain) = if rank_first >= rank_second {
             (first, second, &mut *held_first, &mut *held_second)
         } else {
@@ -364,7 +389,10 @@ fn join(a: &Arc<Cell>, b: &Arc<Cell>) {
         assert!(set.is_ok(), "scheduler {} joined twice", small.id);
         return;
     }
-    panic!("schedulers {} and {} were each joined into a third {FUEL} times as they joined", a.id, b.id);
+    panic!(
+        "schedulers {} and {} were each joined into a third {FUEL} times as they joined",
+        a.id, b.id
+    );
 }
 
 /// `small`'s state moves into `big`'s, both locked: its world, wakers, failures not yet told

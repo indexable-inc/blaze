@@ -52,7 +52,7 @@ pub(crate) fn place<'db>(
         None if local == hir_ty_mir::mir::return_slot() => "the return value".to_owned(), // alloc: error path
         None => match body.param_locals.iter().position(|&it| it == local) {
             Some(at) => format!("parameter {}", at + 1), // alloc: error path
-            None => "a temporary".to_owned(), // alloc: error path
+            None => "a temporary".to_owned(),            // alloc: error path
         },
     };
     let interner = hir_ty::next_solver::DbInterner::new_with(db, body.owner.krate(db));
@@ -127,7 +127,8 @@ fn field_name(db: &Db, variant: VariantId, index: u32) -> Option<String> {
 
 /// Whether the `return` `expr` is the one a `?` lowers to.
 pub(crate) fn is_try<'db>(db: &'db Db, body: &MirBody<'db>, expr: ExprId) -> bool {
-    let (_, source_map) = ExpressionStore::with_source_map(db, body.owner.expression_store_owner(db));
+    let (_, source_map) =
+        ExpressionStore::with_source_map(db, body.owner.expression_store_owner(db));
     source_map
         .expr_syntax(expr)
         .is_ok_and(|it| it.value.syntax_node_ptr().kind() == syntax::SyntaxKind::TRY_EXPR)

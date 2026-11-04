@@ -63,12 +63,7 @@ impl<'a> SubstVisitor<'a> {
         self_ref: Option<&'a TraitRefKind>,
         explicits_only: bool,
     ) -> Self {
-        Self {
-            generics,
-            self_ref,
-            explicits_only,
-            had_error: false,
-        }
+        Self { generics, self_ref, explicits_only, had_error: false }
     }
 
     pub fn visit<T: TyVisitable>(mut self, mut x: T) -> Result<T, GenericsMismatch> {
@@ -76,11 +71,7 @@ impl<'a> SubstVisitor<'a> {
             return Ok(x);
         }
         x.visit_vars(&mut self);
-        if self.had_error {
-            Err(GenericsMismatch)
-        } else {
-            Ok(x)
-        }
+        if self.had_error { Err(GenericsMismatch) } else { Ok(x) }
     }
 
     /// Returns the value for this variable, if any.
@@ -120,12 +111,7 @@ impl VarsVisitor for SubstVisitor<'_> {
         self.process_var(v, |id| self.generics.types.get(id).cloned())
     }
     fn visit_const_generic_var(&mut self, v: ConstGenericDbVar) -> Option<ConstantExprKind> {
-        self.process_var(v, |id| {
-            self.generics
-                .const_generics
-                .get(id)
-                .map(|c| c.kind().clone())
-        })
+        self.process_var(v, |id| self.generics.const_generics.get(id).map(|c| c.kind().clone()))
     }
     fn visit_clause_var(&mut self, v: ClauseDbVar) -> Option<ClauseReplacement> {
         if self.explicits_only {
@@ -240,20 +226,14 @@ pub trait TyVisitable: Sized + AstVisitable {
                 self.v.visit_metadata_value(value);
             }
         }
-        Wrap {
-            v,
-            depth: DeBruijnId::zero(),
-        }
-        .visit(self);
+        Wrap { v, depth: DeBruijnId::zero() }.visit(self);
     }
 
     /// Substitute the generic variables inside `self` by replacing them with the provided values.
     /// Note: if `self` is an item that comes from a `TraitDecl`, you must use
     /// `substitute_with_self` or `substitute_inner_binder`, otherwise you'll get panics.
     fn substitute(self, generics: &GenericArgs) -> Self {
-        SubstVisitor::new(generics, None, false)
-            .visit(self)
-            .unwrap()
+        SubstVisitor::new(generics, None, false).visit(self).unwrap()
     }
     /// Substitute the generic variables inside `self` by replacing them with the provided values.
     /// This is appropriate when substituting an inner binder.
@@ -366,11 +346,7 @@ pub trait TyVisitable: Sized + AstVisitable {
                 &mut self,
                 value: &mut WithCachedTypeInfo<T>,
             ) -> ControlFlow<Self::Break> {
-                if value
-                    .type_info()
-                    .max_de_bruijn_id()
-                    .is_none_or(|max| max < self.depth)
-                {
+                if value.type_info().max_de_bruijn_id().is_none_or(|max| max < self.depth) {
                     Continue(())
                 } else {
                     self.visit_inner(value)
@@ -385,11 +361,7 @@ pub trait TyVisitable: Sized + AstVisitable {
                 Continue(())
             }
         }
-        Wrap {
-            f,
-            depth: DeBruijnId::zero(),
-        }
-        .visit(self)
+        Wrap { f, depth: DeBruijnId::zero() }.visit(self)
     }
 
     /// Whether this value mentions any region var of its environment.
@@ -423,11 +395,7 @@ pub trait TyVisitable: Sized + AstVisitable {
             }
         }
 
-        HasEscapingRegionVar {
-            binder_depth: DeBruijnId::ZERO,
-        }
-        .visit(self)
-        .is_break()
+        HasEscapingRegionVar { binder_depth: DeBruijnId::ZERO }.visit(self).is_break()
     }
 
     /// Collect the regions contained in `self`.
@@ -454,9 +422,7 @@ pub trait TyVisitable: Sized + AstVisitable {
                 }
             }
         }
-        CollectRegions::default()
-            .visit_by_val_infallible(self)
-            .regions
+        CollectRegions::default().visit_by_val_infallible(self).regions
     }
 
     /// Replace all the regions by the output of the provided function. Binders levels are handled
@@ -512,37 +478,21 @@ pub struct Substituted<'a, T> {
 
 impl<'a, T> Substituted<'a, T> {
     pub fn new(val: &'a T, generics: &'a GenericArgs) -> Self {
-        Self {
-            val,
-            generics,
-            trait_self: None,
-        }
+        Self { val, generics, trait_self: None }
     }
     pub fn new_for_trait(
         val: &'a T,
         generics: &'a GenericArgs,
         trait_self: &'a TraitRefKind,
     ) -> Self {
-        Self {
-            val,
-            generics,
-            trait_self: Some(trait_self),
-        }
+        Self { val, generics, trait_self: Some(trait_self) }
     }
     pub fn new_for_trait_ref(val: &'a T, tref: &'a TraitRef) -> Self {
-        Self {
-            val,
-            generics: &tref.trait_decl_ref.generics,
-            trait_self: Some(&tref.kind),
-        }
+        Self { val, generics: &tref.trait_decl_ref.generics, trait_self: Some(&tref.kind) }
     }
 
     pub fn rebind<U>(&self, val: &'a U) -> Substituted<'a, U> {
-        Substituted {
-            val,
-            generics: self.generics,
-            trait_self: self.trait_self,
-        }
+        Substituted { val, generics: self.generics, trait_self: self.trait_self }
     }
 
     pub fn substitute(&self) -> T
@@ -557,10 +507,9 @@ impl<'a, T> Substituted<'a, T> {
     {
         match self.trait_self {
             None => self.val.clone().try_substitute(self.generics),
-            Some(trait_self) => self
-                .val
-                .clone()
-                .try_substitute_with_self(self.generics, trait_self),
+            Some(trait_self) => {
+                self.val.clone().try_substitute_with_self(self.generics, trait_self)
+            }
         }
     }
 
@@ -592,17 +541,11 @@ where
     }
 
     pub fn as_ref(&self) -> ItemBinder<ItemId, &T> {
-        ItemBinder {
-            item_id: self.item_id,
-            val: &self.val,
-        }
+        ItemBinder { item_id: self.item_id, val: &self.val }
     }
 
     pub fn map_bound<U>(self, f: impl FnOnce(T) -> U) -> ItemBinder<ItemId, U> {
-        ItemBinder {
-            item_id: self.item_id,
-            val: f(self.val),
-        }
+        ItemBinder { item_id: self.item_id, val: f(self.val) }
     }
 
     fn assert_item_id(&self, item_id: ItemId) {
