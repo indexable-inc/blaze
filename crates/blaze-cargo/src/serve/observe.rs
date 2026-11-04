@@ -348,6 +348,12 @@ pub fn keep_history(
                         tracing::warn!("{why}");
                         eprintln!("blaze serve: {why}");
                     }
+                    // The recorder's rows outlive a crash from here on: the next daemon writes
+                    // what this one had not flushed. One that can't be kept is said, not fatal.
+                    if let Err(error) = history.persist_recorder() {
+                        tracing::warn!("{error}");
+                        _ = failed_to.send(error.to_string());  // alloc: error path, once a daemon
+                    }
                     _ = opened_to.send(Ok(history.next_build()));
                     // Off the daemon's start path: builds that end meanwhile wait in `rows`.
                     now.set(Step::Restoring, 0);

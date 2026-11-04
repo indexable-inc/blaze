@@ -163,10 +163,15 @@ pub trait Value: Copy + fmt::Debug + PartialEq {
     fn number(word: u64) -> Option<u64>;
     /// The word of a text cell read back from a table (0: none of these is named so).
     fn of_text(text: &str) -> u64;
+    /// Whether its word is a [`Sym`] of the process that wrote it: the flight recorder's
+    /// postmortem gives each such word of a dead process a number of this one
+    /// ([`SYM_COLUMNS`]).
+    const SYM: bool = false;
 }
 
 impl Value for Name {
     const TEXT: bool = true;
+    const SYM: bool = true;
 
     #[inline]
     fn word(self) -> u64 {
@@ -219,6 +224,7 @@ impl Value for u64 {
 /// A field that may go unsaid: `None` is the word 0.
 impl<T: Value> Value for Option<T> {
     const TEXT: bool = T::TEXT;
+    const SYM: bool = T::SYM;
 
     #[inline]
     fn word(self) -> u64 {
@@ -739,6 +745,9 @@ macro_rules! span_kinds {
 
         pub const GENERIC_COLUMNS: [schema::Column; GENERIC] = [$( <col::$G as Column>::SCHEMA ),*];
         pub const TYPED_COLUMNS: [schema::Column; TYPED] = [$( <col::$T as Column>::SCHEMA ),*];
+        /// Which columns, generic then typed, hold a [`Sym`] ([`Value::SYM`]).
+        pub const SYM_COLUMNS: [bool; COLUMNS] =
+            [$( <<col::$G as Column>::Value as Value>::SYM, )* $( <<col::$T as Column>::Value as Value>::SYM, )*];
         /// Every column, generic then typed, as `batches.rs` writes it.
         pub static CELLS: [Cells; COLUMNS] = [$( Cells::of::<col::$G>(), )* $( Cells::of::<col::$T>(), )*];
 

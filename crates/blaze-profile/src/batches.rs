@@ -118,13 +118,14 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
     let (mut thread_keys, mut name_keys, mut target_keys, mut kind_keys) =
         (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in spans {
-        let meta = flight::meta(row.site);
-        let name = meta.map_or("?", |it| it.name());
+        // A site of this process, or of a dead one whose rows a postmortem read back.
+        let meta = flight::site_text(row.site);
+        let name = meta.map_or("?", |it| it.name);
         thread_keys.push(threads.key(u64::from(row.thread_name), || {
             flight::name(row.thread_name).unwrap_or_else(|| "?".into())
         }));
         name_keys.push(names.key(u64::from(row.site), || name));
-        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target())));
+        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target)));
         // A rust-analyzer query's span is named for its query.
         kind_keys.push(name.ends_with("_query").then(|| kinds.key(u64::from(row.site), || name)));
     }
@@ -317,11 +318,11 @@ pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, 
     let (mut thread_keys, mut level_keys, mut target_keys, mut name_keys) =
         (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in events {
-        let meta = flight::meta(row.site);
+        let meta = flight::site_text(row.site);
         thread_keys.push(threads.key(u64::from(row.thread_name), || flight::name(row.thread_name).unwrap_or_else(|| "?".into())));
-        level_keys.push(levels.key(u64::from(row.site), || meta.map_or("?", |it| it.level().as_str())));
-        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target())));
-        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name())));
+        level_keys.push(levels.key(u64::from(row.site), || meta.map_or("?", |it| it.level)));
+        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target)));
+        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name)));
     }
     // alloc: a batch's messages, once a read
     let messages: Vec<Option<std::sync::Arc<str>>> = events.iter().map(|it| flight::name(it.message)).collect();
@@ -405,13 +406,13 @@ pub fn folded(folds: &[FoldRow], process: Process<'_>) -> Result<RecordBatch, Ar
     // alloc: a batch's keys, once a read
     let (mut parent_keys, mut parent_target_keys) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in folds {
-        let meta = flight::meta(row.site);
+        let meta = flight::site_text(row.site);
         thread_keys.push(threads.key(u64::from(row.thread_name), || flight::name(row.thread_name).unwrap_or_else(|| "?".into())));
-        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name())));
-        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target())));
-        let parent = (row.parent_site != 0).then(|| flight::meta(row.parent_site));
-        parent_keys.push(parent.map(|meta| parents.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.name()))));
-        parent_target_keys.push(parent.map(|meta| parent_targets.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.target()))));
+        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name)));
+        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target)));
+        let parent = (row.parent_site != 0).then(|| flight::site_text(row.parent_site));
+        parent_keys.push(parent.map(|meta| parents.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.name))));
+        parent_target_keys.push(parent.map(|meta| parent_targets.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.target))));
     }
     // alloc: a batch's list of columns, once a read
     let columns: Vec<ArrayRef> = vec![

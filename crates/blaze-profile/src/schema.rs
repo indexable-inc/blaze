@@ -392,7 +392,7 @@ pub const BUILDS: Table = Table {
         col("started_ns", Type::I64, "when the daemon took it"),
         opt("dur_ns", Type::I64, "how long it ran; null while it runs"),
         opt("started_unix_ns", Type::I64, "when it was taken, on the wall clock"),
-        col("outcome", Type::Dict, "ok, failed, cancelled, stalled or running"),
+        col("outcome", Type::Dict, "ok, failed, cancelled, stalled, running or crashed (its daemon died while it ran; written by the postmortem of the daemon's flight recorder)"),
         opt("hits", Type::U64, "nodes the memo settled without running them"),
         opt("misses", Type::U64, "nodes that ran their task"),
         opt("joined", Type::U64, "nodes that took a task another node ran"),

@@ -162,6 +162,21 @@ impl Scale {
         let ago = self.ns(self.ticks.wrapping_sub(ticks));
         self.at.checked_sub(std::time::Duration::from_nanos(ago)).unwrap_or(self.at)
     }
+
+    /// What maps ticks onto the schema's clock, as plain numbers another process can read: a
+    /// tick, the [`mono_ns`] read with it, and the bits of the nanoseconds a tick lasts. The
+    /// flight recorder's mapping keeps it ([`crate::flight`]'s postmortem), so the rows of a
+    /// process that died read back on the clock it wrote them on.
+    pub(crate) fn line(&self) -> [u64; 3] {
+        [self.ticks, self.mono as u64, self.ns_per_tick.to_bits()]
+    }
+
+    /// The scale of a [`Scale::line`] another process kept. Its [`Scale::instant`] is
+    /// meaningless (an `Instant` is of one process), so only [`Scale::mono`], [`Scale::ns`] and
+    /// [`Scale::ticks_in`] are read of it.
+    pub(crate) fn of_line([ticks, mono, ns_per_tick]: [u64; 3]) -> Scale {
+        Scale { ticks, at: Instant::now(), mono: mono as i64, ns_per_tick: f64::from_bits(ns_per_tick) }
+    }
 }
 
 #[cfg(test)]

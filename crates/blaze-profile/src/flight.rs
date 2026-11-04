@@ -16,6 +16,17 @@
 //! from its start to its close in a slot of the ring of the thread that made it. Its id names
 //! that ring and slot, so a span closed on another thread finds it. The row is written to the
 //! ring of the thread that closes it.
+//!
+//! A ring's rows live in a [`Store`]: on the heap at first, and in a file once the daemon's
+//! history persists the recorder ([`persist`]): `flight-<pid>.map` in the history's
+//! directory, which also holds every callsite's name, target and level, the names rows hold,
+//! threads' names, the clock's base and the builds running. The kernel keeps a dead process's
+//! pages, so the next history to open there (or `blaze slow`) decodes the rows past the last
+//! flush (each store keeps how far the history wrote, [`flushed`]), writes them as rows of the
+//! dead process, marks its running builds `crashed`, and deletes the file
+//! (`flight/postmortem.rs`). Recording stays as it was: a thread writes its own store with
+//! plain atomics, no system call and no allocation; a ring a thread holds as the recorder is
+//! persisted moves to the file as that thread next writes, by that thread.
 
 use std::{
     cell::{Cell, RefCell},
@@ -81,6 +92,8 @@ const ALLOCS_MAX: u64 = (1 << ALLOCS_BITS) - 1;
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock()
 }
+
+pub mod postmortem;
 
 // --- Callsites --------------------------------------------------------------------------
 
@@ -158,12 +171,93 @@ pub(crate) fn register(meta: &'static Meta) -> Option<u16> {
     let held = meta.fields().field(HELD_FIELD).is_some();
     _ = SITES[at].set(Site { meta, fields, held });
     *taken += 1;
+    // Under `TAKEN`: the mapping's site records have one writer at a time.
+    postmortem::site_registered(at as u16 + 1, meta);
     Some(at as u16 + 1)
 }
 
 /// The callsite of `site`.
 pub fn meta(site: u16) -> Option<&'static Meta> {
     Some(SITES.get(usize::from(site).checked_sub(1)?)?.get()?.meta)
+}
+
+/// What a writer of a table names a site by: its callsite's name, target and level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SiteText {
+    pub name: &'static str,
+    pub target: &'static str,
+    /// As `tracing::Level::as_str` says it: `TRACE` to `ERROR`.
+    pub level: &'static str,
+}
+
+/// The name, target and level of `site`: a callsite of this process ([`meta`]), or one of a
+/// process that died, whose rows the postmortem read back ([`foreign_site`]). The one way a
+/// writer of a table names a row's site.
+#[inline]
+pub fn site_text(site: u16) -> Option<SiteText> {
+    match usize::from(site).checked_sub(FOREIGN_FROM) {
+        None => meta(site).map(|it| SiteText { name: it.name(), target: it.target(), level: it.level().as_str() }),
+        Some(at) => FOREIGN.get(at)?.get().copied(),
+    }
+}
+
+/// Sites from here on are of processes that died: past every site of this process.
+const FOREIGN_FROM: usize = 1 << SITE_BITS;
+/// The distinct callsites of dead processes one process may name. Each is leaked (one
+/// `SiteText` and its text), deduped by its text, so a daemon that recovers the same blaze's
+/// rows after each crash names its sites once.
+const FOREIGN_MAX: usize = 1 << 13;
+const _: () = assert!(FOREIGN_FROM + FOREIGN_MAX <= u16::MAX as usize, "a foreign site is a u16");
+
+/// The sites of dead processes, read with no lock by a writer of a table.
+static FOREIGN: [OnceLock<SiteText>; FOREIGN_MAX] = [const { OnceLock::new() }; FOREIGN_MAX];
+/// The [`FOREIGN`] slots of each hash of a text ([`foreign_key`]), and how many are taken.
+// alloc: none until a postmortem names a site; grows to the distinct sites of dead processes
+static FOREIGN_BY_TEXT: Mutex<(usize, Option<HashMap<u64, Vec<u16>, Global>>)> = Mutex::new((0, None));
+
+fn foreign_key(name: &str, target: &str, level: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = FixedHasher::default();
+    (name, target, level).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The site of this process that names a dead process's callsite: the same site for the same
+/// name, target and level, for the process's life. `None` past [`FOREIGN_MAX`] distinct ones.
+pub(crate) fn foreign_site(name: &str, target: &str, level: &str) -> Option<u16> {
+    let level = match level {
+        "TRACE" => "TRACE",
+        "DEBUG" => "DEBUG",
+        "INFO" => "INFO",
+        "WARN" => "WARN",
+        _ => "ERROR",
+    };
+    let key = foreign_key(name, target, level);
+    let mut guard = lock(&FOREIGN_BY_TEXT);
+    let (taken, by_text) = &mut *guard;
+    let bucket = by_text.get_or_insert_with(|| HashMap::new_in(Global)).entry(key).or_default();
+    let same = |site: &u16| {
+        site_text(*site).is_some_and(|it| it.name == name && it.target == target && it.level == level)
+    };
+    if let Some(&site) = bucket.iter().find(|it| same(it)) {
+        return Some(site);
+    }
+    if *taken >= FOREIGN_MAX {
+        return None;
+    }
+    let text = SiteText {
+        // alloc: once per distinct callsite of a dead process, for the process's life
+        name: Box::leak(name.into()),
+        // alloc: as above
+        target: Box::leak(target.into()),
+        level,
+    };
+    _ = FOREIGN[*taken].set(text);
+    let site = (FOREIGN_FROM + *taken) as u16;
+    *taken += 1;
+    // alloc: a site's place in its bucket, once per distinct callsite of a dead process
+    bucket.push(site);
+    Some(site)
 }
 
 // --- Names ------------------------------------------------------------------------------
@@ -249,7 +343,22 @@ impl Names {
             let full = std::mem::replace(&mut names.current, Generation { epoch, ..Generation::default() });
             names.previous = full;
         }
-        names.current.add(shard, name)
+        let id = names.current.add(shard, name);
+        // Under the shard's lock, so the mapping logs a shard's names in the order given.
+        postmortem::named(shard, id, name);
+        id
+    }
+
+    /// Every name a shard holds now, oldest generation first, to `each`, under the shard's
+    /// lock: what the mapping logs as it is made ([`postmortem`]).
+    fn each(&self, shard: usize, mut each: impl FnMut(Sym, &str)) {
+        let names = lock(&self.0[shard]);
+        let Some(names) = names.as_ref() else { return };
+        for generation in [&names.previous, &names.current] {
+            for (at, name) in generation.names.iter().enumerate() {
+                each(sym(shard, generation.epoch, at), &**name);
+            }
+        }
     }
 
     /// The string of `sym`, an interned (not kept) name: none once its generation was let go.
@@ -268,7 +377,29 @@ pub(crate) fn intern_kept(name: &str) -> Sym {
     if let Some(&id) = kept.ids.get(name) {
         return id;
     }
-    kept.add(0, name)
+    let id = kept.add(0, name);
+    postmortem::named(SHARDS, id, name);
+    id
+}
+
+/// Names of rows a postmortem read back from a process that died ([`postmortem`]): epoch 0 as
+/// [`KEPT`], shard 1 (kept names are all shard 0), for as long as one postmortem writes them.
+/// `None` between postmortems.
+static RECOVERED: Mutex<Option<Generation>> = Mutex::new(None);
+/// The shard bits of a [`RECOVERED`] name.
+const RECOVERED_SHARD: usize = 1;
+/// Names one postmortem may give: the index bits of a [`Sym`].
+const RECOVERED_MAX: usize = (1 << 20) - 1;
+
+/// A number of this process for `name`, a name of a dead process's rows, while its postmortem
+/// runs; `None` past [`RECOVERED_MAX`].
+fn recovered(name: &str) -> Option<Sym> {
+    let mut recovered = lock(&RECOVERED);
+    let recovered = recovered.get_or_insert_with(Generation::default);
+    if let Some(&id) = recovered.ids.get(name) {
+        return Some(id);
+    }
+    (recovered.names.len() < RECOVERED_MAX).then(|| recovered.add(RECOVERED_SHARD, name))
 }
 
 /// The string of `sym`: none for 0, and for a name of a generation let go (counted).
@@ -277,7 +408,10 @@ pub fn name(sym: Sym) -> Option<std::sync::Arc<str>> {
         return None;
     }
     let epoch = sym >> 4 & (EPOCHS - 1);
-    let found = if epoch == 0 {
+    let found = if epoch == 0 && (sym & 0xf) as usize == RECOVERED_SHARD {
+        // clone: a refcount
+        lock(&RECOVERED).as_ref().and_then(|it| it.get(sym).cloned())
+    } else if epoch == 0 {
         // clone: a refcount
         lock(&KEPT).as_ref().and_then(|it| it.get(sym).cloned())
     } else {
@@ -1376,86 +1510,48 @@ impl Opened {
     }
 }
 
-pub(crate) struct Ring {
-    /// Its number, in span ids and in [`BY_NUMBER`].
-    number: u16,
+/// Owners of a ring a [`Store`] names, the latest: as many as a postmortem reads back.
+const OWNERS_KEPT: usize = 64;
+/// Bytes of a [`Store`] before its rows.
+const STORE_HEAD: usize = 4096;
+
+/// A ring's rows and what a reader needs to read them: its head, the rows, and the threads
+/// that wrote them. On the heap until the process's history persists the recorder; then in a
+/// file the history's directory holds ([`postmortem`]), so the rows outlive a crash. Never
+/// freed either way: a reader that loaded a ring's store before it moved reads the old one
+/// whole.
+#[repr(C)]
+pub(crate) struct Store {
     /// Rows ever written.
     head: AtomicU64,
-    /// Spans ever closed and work noted ([`moved`]): what [`progress`] sums.
-    spans: AtomicU64,
-    /// Spans its thread made and could not record: past [`SLOTS_OPEN`] open at once.
-    lost: AtomicU64,
-    /// Spans its threads made, for their ids.
-    made: AtomicU64,
-    /// Spans the thread is inside, the first [`OPEN_MAX`] of them in `entered`.
-    depth: AtomicU32,
-    entered: [AtomicU64; OPEN_MAX],
-    /// The slots of the spans its thread made and has not closed, [`CHUNK`] a chunk: null
-    /// until the thread first needs one there, then never freed (rings live as long as the
-    /// process), so a published chunk may be read with no lock.
-    open: [AtomicPtr<Slot>; SLOTS_OPEN / CHUNK],
-    /// Which slots hold a span, a bit each: set by the ring's thread as it takes one, cleared
-    /// by the thread that closes the span, after it freed the slot.
-    taken: [AtomicU64; SLOTS_OPEN / 64],
-    /// Whether a live thread holds it.
-    live: AtomicBool,
-    /// Threads that have held it: a span closed by the thread that began it closes on the
-    /// same ring with the same lease. A ring an ended thread left passes to the next thread,
-    /// so the number alone does not say which thread.
-    lease: AtomicU64,
-    /// The thread that holds it now or held it last: its tid and name, as [`Owner`] has them,
-    /// read with no lock by a reader holding another ring's `owners`.
-    current: AtomicU64,
+    /// The rows the history has written to its files: what a postmortem leaves out
+    /// ([`flushed`]).
+    flushed: AtomicU64,
+    /// The ring's number.
+    number: AtomicU64,
+    /// Of `owners`, how many are said.
+    owners_len: AtomicU64,
+    /// The last [`OWNERS_KEPT`] of the ring's owners ([`Owner`]): the row each wrote from, and
+    /// its tid << 32 | its name. Written by [`claim`] beside the ring's `owners`, for a
+    /// postmortem, which has no other way to say whose rows they are.
+    owners: [[AtomicU64; 2]; OWNERS_KEPT],
+    _pad: [u64; (STORE_HEAD - 32 - OWNERS_KEPT * 16) / 8],
     /// [`WORDS`] words a row.
-    words: Box<[AtomicU64]>,
-    /// What takes longest on this ring's threads: its sketches ([`crate::hot`]), written as
-    /// each span closes here.
-    hot: Box<[AtomicU64]>,
-    owners: Mutex<Vec<Owner>>,
-    /// What the sampler needs of the thread, under the lock the thread takes to leave.
-    pub(crate) sampled: Mutex<crate::sampler::Thread>,
+    words: [AtomicU64; WORDS * CAP],
 }
 
-impl Ring {
-    fn new(number: u16) -> Ring {
-        // Zeroed by the allocator, not written: a page of the ring is committed only once
-        // rows reach it, so a thread that records little holds little.
-        // alloc: once per thread that records, its ring for the process's life
-        let words = Box::<[AtomicU64]>::new_zeroed_slice(WORDS * CAP);
-        // SAFETY: all-zero bytes are a valid `AtomicU64`.
-        let words = unsafe { words.assume_init() };
-        Ring {
-            number,
-            head: AtomicU64::new(0),
-            spans: AtomicU64::new(0),
-            lost: AtomicU64::new(0),
-            made: AtomicU64::new(0),
-            depth: AtomicU32::new(0),
-            entered: [const { AtomicU64::new(0) }; OPEN_MAX],
-            open: [const { AtomicPtr::new(std::ptr::null_mut()) }; SLOTS_OPEN / CHUNK],
-            taken: [const { AtomicU64::new(0) }; SLOTS_OPEN / 64],
-            live: AtomicBool::new(true),
-            lease: AtomicU64::new(0),
-            current: AtomicU64::new(0),
-            words,
-            hot: crate::hot::record::cells(),
-            // alloc: once per thread, as it first records
-            owners: Mutex::new(Vec::new()),
-            sampled: Mutex::new(crate::sampler::Thread::default()),
-        }
-    }
+const _: () = assert!(std::mem::offset_of!(Store, words) == STORE_HEAD, "a store's rows start at STORE_HEAD");
+const _: () = assert!(std::mem::align_of::<Store>() <= 8, "a store is placed at any 8-byte boundary of a mapping");
 
-    /// Writes `row` as the ring's next: its place in the ring, counted from the ring's making.
-    #[inline]
-    fn put(&self, row: [u64; WORDS]) -> u64 {
-        let i = self.head.load(Ordering::Relaxed);
-        let at = (i as usize & (CAP - 1)) * WORDS;
-        fence(Ordering::Release);
-        for (word, value) in self.words[at..at + WORDS].iter().zip(row) {
-            word.store(value, Ordering::Relaxed);
-        }
-        self.head.store(i + 1, Ordering::Release);
-        i
+impl Store {
+    /// A store on the heap, all zero: a page of its rows is committed only once rows reach
+    /// it, so a thread that records little holds little.
+    fn heap() -> &'static Store {
+        // alloc: once per ring, its rows for the process's life (a ring that moves to the
+        // mapping leaves it behind, for a reader that loaded it)
+        let store = Box::<Store>::new_zeroed();
+        // SAFETY: all-zero bytes are a valid `Store`: atomics and integers.
+        Box::leak(unsafe { store.assume_init() })
     }
 
     /// The rows from index `from` that are whole now, each with its index, into `into`; the
@@ -1482,6 +1578,166 @@ impl Ring {
         }
         into.truncate(kept);
         head
+    }
+
+    /// Copies `self` into `to`, which no one reads yet: rows, owners and the flushed mark,
+    /// then the head last, with release.
+    fn copy_to(&self, to: &Store) {
+        let head = self.head.load(Ordering::Acquire);
+        let rows = usize::try_from(head).unwrap_or(usize::MAX).min(CAP);
+        for (from, into) in self.words[..rows * WORDS].iter().zip(&to.words[..rows * WORDS]) {
+            into.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        for (from, into) in self.owners.iter().zip(&to.owners) {
+            into[0].store(from[0].load(Ordering::Relaxed), Ordering::Relaxed);
+            into[1].store(from[1].load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        to.owners_len.store(self.owners_len.load(Ordering::Relaxed), Ordering::Relaxed);
+        to.number.store(self.number.load(Ordering::Relaxed), Ordering::Relaxed);
+        to.flushed.store(self.flushed.load(Ordering::Relaxed), Ordering::Relaxed);
+        to.head.store(head, Ordering::Release);
+    }
+
+    /// Writes the last [`OWNERS_KEPT`] of `owners` for a postmortem.
+    fn mirror(&self, owners: &[Owner]) {
+        let kept = &owners[owners.len().saturating_sub(OWNERS_KEPT)..];
+        for (owner, into) in kept.iter().zip(&self.owners) {
+            into[0].store(owner.from, Ordering::Relaxed);
+            into[1].store(u64::from(owner.tid) << 32 | u64::from(owner.name), Ordering::Relaxed);
+        }
+        self.owners_len.store(kept.len() as u64, Ordering::Release);
+    }
+}
+
+pub(crate) struct Ring {
+    /// Its number, in span ids and in [`BY_NUMBER`].
+    number: u16,
+    /// Its rows: written by its thread alone, read by any ([`Store`]).
+    store: AtomicPtr<Store>,
+    /// A store to move to, set by [`persist`] while a thread holds the ring: the ring's thread
+    /// moves its rows there as it next writes one ([`Ring::move_store`]), so only the writer
+    /// writes a ring. Null for none.
+    moving: AtomicPtr<Store>,
+    /// Spans ever closed and work noted ([`moved`]): what [`progress`] sums.
+    spans: AtomicU64,
+    /// Spans its thread made and could not record: past [`SLOTS_OPEN`] open at once.
+    lost: AtomicU64,
+    /// Spans its threads made, for their ids.
+    made: AtomicU64,
+    /// Spans the thread is inside, the first [`OPEN_MAX`] of them in `entered`.
+    depth: AtomicU32,
+    entered: [AtomicU64; OPEN_MAX],
+    /// The slots of the spans its thread made and has not closed, [`CHUNK`] a chunk: null
+    /// until the thread first needs one there, then never freed (rings live as long as the
+    /// process), so a published chunk may be read with no lock.
+    open: [AtomicPtr<Slot>; SLOTS_OPEN / CHUNK],
+    /// Which slots hold a span, a bit each: set by the ring's thread as it takes one, cleared
+    /// by the thread that closes the span, after it freed the slot.
+    taken: [AtomicU64; SLOTS_OPEN / 64],
+    /// Whether a live thread holds it.
+    live: AtomicBool,
+    /// Threads that have held it: a span closed by the thread that began it closes on the
+    /// same ring with the same lease. A ring an ended thread left passes to the next thread,
+    /// so the number alone does not say which thread.
+    lease: AtomicU64,
+    /// The thread that holds it now or held it last: its tid and name, as [`Owner`] has them,
+    /// read with no lock by a reader holding another ring's `owners`.
+    current: AtomicU64,
+    /// What takes longest on this ring's threads: its sketches ([`crate::hot`]), written as
+    /// each span closes here.
+    hot: Box<[AtomicU64]>,
+    owners: Mutex<Vec<Owner>>,
+    /// What the sampler needs of the thread, under the lock the thread takes to leave.
+    pub(crate) sampled: Mutex<crate::sampler::Thread>,
+}
+
+impl Ring {
+    fn new(number: u16) -> Ring {
+        Ring::with_store(number, Store::heap())
+    }
+
+    /// A ring whose rows go to `store`, which no other ring has.
+    fn with_store(number: u16, store: &'static Store) -> Ring {
+        store.number.store(u64::from(number), Ordering::Relaxed);
+        Ring {
+            number,
+            store: AtomicPtr::new(std::ptr::from_ref(store).cast_mut()),
+            moving: AtomicPtr::new(std::ptr::null_mut()),
+            spans: AtomicU64::new(0),
+            lost: AtomicU64::new(0),
+            made: AtomicU64::new(0),
+            depth: AtomicU32::new(0),
+            entered: [const { AtomicU64::new(0) }; OPEN_MAX],
+            open: [const { AtomicPtr::new(std::ptr::null_mut()) }; SLOTS_OPEN / CHUNK],
+            taken: [const { AtomicU64::new(0) }; SLOTS_OPEN / 64],
+            live: AtomicBool::new(true),
+            lease: AtomicU64::new(0),
+            current: AtomicU64::new(0),
+            hot: crate::hot::record::cells(),
+            // alloc: once per thread, as it first records
+            owners: Mutex::new(Vec::new()),
+            sampled: Mutex::new(crate::sampler::Thread::default()),
+        }
+    }
+
+    /// Its store, as a reader loads it.
+    #[inline]
+    fn store(&self) -> &'static Store {
+        // SAFETY: `store` always holds a store made by `Store::heap` or by the mapping
+        // (`postmortem::Mapping::store`), published with release; neither is ever freed or
+        // unmapped (both live as long as the process), and a store is only written through
+        // atomics.
+        unsafe { &*self.store.load(Ordering::Acquire) }
+    }
+
+    /// Its store, as its writer loads it: the thread that holds the ring set it itself
+    /// ([`Ring::move_store`]) or took the ring after it was set, under [`RINGS`]'s lock.
+    #[inline]
+    fn store_mine(&self) -> &'static Store {
+        // SAFETY: as in `Ring::store`; the writer's own earlier store, or the lock it took
+        // the ring under, orders the pointer's write before this load.
+        unsafe { &*self.store.load(Ordering::Relaxed) }
+    }
+
+    /// Writes `row` as the ring's next: its place in the ring, counted from the ring's making
+    /// (a move to the mapping keeps the head, so the place stays the same across it).
+    #[inline]
+    fn put(&self, row: [u64; WORDS]) -> u64 {
+        if !self.moving.load(Ordering::Relaxed).is_null() {
+            self.move_store();
+        }
+        let store = self.store_mine();
+        let i = store.head.load(Ordering::Relaxed);
+        let at = (i as usize & (CAP - 1)) * WORDS;
+        fence(Ordering::Release);
+        for (word, value) in store.words[at..at + WORDS].iter().zip(row) {
+            word.store(value, Ordering::Relaxed);
+        }
+        store.head.store(i + 1, Ordering::Release);
+        i
+    }
+
+    /// Moves the ring's rows to the store [`persist`] left in `moving`: by the ring's writer,
+    /// once, as it next writes a row. A reader that loaded the old store reads it whole; the
+    /// next read loads the new one, at the same head.
+    #[cold]
+    #[inline(never)]
+    fn move_store(&self) {
+        let to = self.moving.swap(std::ptr::null_mut(), Ordering::Acquire);
+        if to.is_null() {
+            return;
+        }
+        // SAFETY: `to` is a mapped store `persist` made for this ring alone and published
+        // with release (the acquire swap above pairs with it); it is never unmapped.
+        let to: &'static Store = unsafe { &*to };
+        self.store_mine().copy_to(to);
+        self.store.store(std::ptr::from_ref(to).cast_mut(), Ordering::Release);
+    }
+
+    /// The rows from index `from` that are whole now, each with its index, into `into`; the
+    /// index to read from next.
+    fn read(&self, from: u64, into: &mut Vec<(u64, [u64; WORDS])>) -> u64 {
+        self.store().read(from, into)
     }
 
     /// Takes a free slot for a span its thread makes, the lowest free one, allocating its
@@ -1671,8 +1927,15 @@ fn claim() -> Option<&'static Ring> {
             Some(ring) => ring,
             None if rings.len() < RINGS_MAX => {
                 let number = rings.len() as u16 + 1;
+                // In the mapping once the history persisted the recorder ([`persist`]), and
+                // never on the heap after that: past the mapping's rings, no ring.
+                let ring = match postmortem::store_for(number) {
+                    postmortem::StoreFor::Heap => Ring::new(number),
+                    postmortem::StoreFor::Mapped(store) => Ring::with_store(number, store),
+                    postmortem::StoreFor::Full => return None,
+                };
                 // alloc: once per thread past those that ended, kept for the process's life
-                let ring: &'static Ring = Box::leak(Box::new(Ring::new(number)));
+                let ring: &'static Ring = Box::leak(Box::new(ring));
                 rings.push(ring);
                 _ = BY_NUMBER[usize::from(number) - 1].set(ring);
                 ring
@@ -1680,7 +1943,10 @@ fn claim() -> Option<&'static Ring> {
             None => return None,
         };
         drop(rings);
-        let head = ring.head.load(Ordering::Relaxed);
+        // A store `persist` left for the ring's last thread, which ended before it wrote again.
+        ring.move_store();
+        let store = ring.store_mine();
+        let head = store.head.load(Ordering::Relaxed);
         let mut owners = lock(&ring.owners);
         owners.push(Owner { from: head, tid, name });
         // An owner whose rows were all written over names none.
@@ -1688,6 +1954,7 @@ fn claim() -> Option<&'static Ring> {
         while owners.len() > 1 && owners[1].from <= oldest {
             owners.remove(0);
         }
+        store.mirror(&owners);
         drop(owners);
         ring.lease.fetch_add(1, Ordering::Relaxed);
         ring.current.store(u64::from(tid) << 32 | u64::from(name), Ordering::Release);
@@ -2646,6 +2913,30 @@ pub fn read(cursor: &mut Cursor, into: &mut Read) {
     });
 }
 
+/// Notes that the rows before `cursor` are written to the history's files, `at_ns` the read
+/// that took them: what a postmortem of this process leaves out, so no row is written twice.
+/// Nothing until the recorder is persisted ([`persist`]).
+pub fn flushed(cursor: &Cursor, at_ns: i64) {
+    if !postmortem::persisted() {
+        return;
+    }
+    for ring in lock(&RINGS).iter() {
+        if let Some(&next) = cursor.next.get(usize::from(ring.number) - 1) {
+            ring.store().flushed.store(next, Ordering::Release);
+        }
+    }
+    postmortem::flushed_at(at_ns);
+}
+
+/// Backs the rings, and all a reader needs to decode them (callsites, names, threads' names,
+/// the clock), with a file of this process in the history's directory `dir`, so the rows the
+/// history has not written yet outlive a crash: the next history to open there writes them
+/// ([`postmortem`]). `blaze` and `process` are what the history names this process's builds
+/// and rows with. Once a process; a ring held by a thread moves to the file as it next writes.
+pub fn persist(dir: &std::path::Path, blaze: &str, process: &str) -> Result<(), postmortem::PostmortemError> {
+    postmortem::persist(dir, blaze, process)
+}
+
 /// Takes into `into` every row of the last `window` the rings still hold.
 pub fn window(window: Duration, into: &mut Read) {
     let since = clock::mono_ns() - window.as_nanos() as i64;
@@ -2677,153 +2968,165 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
         let owners = lock(&ring.owners);
         for &(i, row) in &scratch {
             let Some(by) = Ring::owner(&owners, i) else { continue };
-            match row[4] >> 62 {
-                KIND_SPAN => {
-                    let allocs = row[4] & ALLOCS_MAX;
-                    into.spans.push(SpanRow {
-                        build: (row[6] >> 32) as u32,
-                        // The thread that closed it, until a `THREAD_COL` names the one that
-                        // made it.
-                        thread: by.tid,
-                        thread_name: by.name,
-                        span_id: row[2],
-                        parent: row[3],
-                        depth: (row[4] >> (62 - SITE_BITS - DEPTH_BITS) & ((1 << DEPTH_BITS) - 1)) as u16,
-                        site: (row[4] >> (62 - SITE_BITS) & ((1 << SITE_BITS) - 1)) as u16,
-                        start_ns: scale.mono(row[1]),
-                        dur_ns: scale.ns(row[0].wrapping_sub(row[1])) as i64,
-                        alloc: (allocs != 0).then(|| Allocated { bytes: row[7], count: allocs - 1 }),
-                        copied: counting_copies.then_some(FrameCopied::default()),
-                        krate: (row[5] >> 32) as u32,
-                        function: row[5] as u32,
-                        unit: row[6] as u32,
-                        self_cpu_ns: None,
-                        typed: [0; TYPED],
-                        folded_spans: 0,
-                        folded_ns: 0,
-                    });
-                }
-                KIND_PLOT if row[4] & 0xff == SWITCH_ROW => {
-                    let Some(event) = Switched::of(row[4] >> 8 & 0xff) else { continue };
-                    let queued = (row[4] >> QUEUED_LOW_SHIFT & ((1 << QUEUED_LOW_BITS) - 1)) | (row[6] >> 32) << QUEUED_LOW_BITS;
-                    into.switches.push(SwitchRow {
-                        build: row[6] as u32,
-                        thread: by.tid,
-                        thread_name: by.name,
-                        t_ns: scale.mono(row[0]),
-                        event,
-                        job: row[1],
-                        fiber: row[3] as u32,
-                        core: (row[3] >> 32) as u32,
-                        waited: WaitedOn::of(row[4] >> 16 & 0xff).map(|on| (on, row[2])),
-                        by: (row[5] != 0).then_some(row[5]),
-                        since_ns: (row[7] != 0).then(|| scale.mono(row[7])),
-                        began_as: (event == Switched::Started && row[2] != 0).then_some(row[2]),
-                        queued_ns: queued.checked_sub(1).map(|it| scale.ns(it) as i64),
-                    });
-                }
-                KIND_PLOT if row[4] & 0xff == EVENT_ROW => into.events.push(EventRow {
-                    build: row[6] as u32,
-                    thread: by.tid,
-                    thread_name: by.name,
-                    t_ns: scale.mono(row[0]),
-                    job: row[1],
-                    span: row[2],
-                    site: (row[4] >> 8 & ((1 << SITE_BITS) - 1)) as u16,
-                    message: row[5] as Sym,
-                    event_id: event_id(ring.number, i),
-                }),
-                KIND_PLOT if row[4] & 0xff == EVENT_FIELDS_ROW => {
-                    // Written right after its event's row, by the same thread: the event read
-                    // last, unless the ring wrote over that row first.
-                    let Some(event) = into.events.last().filter(|it| it.event_id == row[3]) else { continue };
-                    let (build, t_ns, site) = (event.build, event.t_ns, event.site);
-                    let mut ordinal = into.fields.iter().rev().take_while(|it| it.event_id == row[3]).count() as u16;
-                    for (place, &word) in COL_WORDS.iter().enumerate() {
-                        let slot = row[4] >> (FIELD_SLOT_SHIFT + FIELD_SLOT_BITS * place as u32) & ((1 << FIELD_SLOT_BITS) - 1);
-                        let Some(value) = FieldValue::of(slot & 0b111, row[word]) else { continue };
-                        into.fields.push(FieldRow { build, t_ns, event_id: row[3], site, index: (slot >> 3) as u8, ordinal, value });
-                        ordinal += 1;
-                    }
-                }
-                KIND_PLOT if row[4] & 0xff == SPAN_COPIED_ROW => {
-                    // Written right after its span's row, by the same thread: the span read
-                    // last, unless the ring wrote over that row first.
-                    if let Some(span) = into.spans.last_mut()
-                        && span.span_id == row[3]
-                    {
-                        span.copied = (row[5] & UNCOUNTED == 0).then_some(FrameCopied { copies: row[1], bytes: row[2] });
-                    }
-                }
-                KIND_PLOT if row[4] & 0xff == SPAN_COLS_ROW => {
-                    // As a copied row: right after its span's, or after that one's other rows.
-                    if let Some(span) = into.spans.last_mut()
-                        && span.span_id == row[3]
-                    {
-                        for (place, &word) in COL_WORDS.iter().enumerate() {
-                            match row[4] >> (8 * (place + 1)) & 0xff {
-                                CPU_COL => span.self_cpu_ns = row[word].checked_sub(1),
-                                FOLDED_COL => span.folded_spans = row[word],
-                                FOLDED_TICKS_COL => span.folded_ns = scale.ns(row[word]) as i64,
-                                THREAD_COL => {
-                                    span.thread = (row[word] >> 32) as u32;
-                                    span.thread_name = row[word] as Sym;
-                                }
-                                col => {
-                                    if let Some(typed) = usize::try_from(col).ok().and_then(|it| span.typed.get_mut(it)) {
-                                        *typed = row[word];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                KIND_PLOT if row[4] & 0xff == FOLD_ROW => into.folds.push(FoldRow {
-                    build: (row[6] >> 32) as u32,
-                    thread: by.tid,
-                    thread_name: by.name,
-                    site: (row[4] >> 8 & ((1 << SITE_BITS) - 1)) as u16,
-                    parent_site: (row[4] >> FOLD_PARENT_SHIFT & ((1 << SITE_BITS) - 1)) as u16,
-                    root: row[4] & FOLD_ROOT != 0,
-                    from_ns: scale.mono(row[1]),
-                    to_ns: scale.mono(row[0]),
-                    spans: row[4] >> FOLD_SPANS_SHIFT & FOLD_SPANS_MAX,
-                    dur_ns: scale.ns(row[2]) as i64,
-                    max_dur_ns: scale.ns(row[3]) as i64,
-                    self_cpu_ns: (row[4] & FOLD_CPU != 0).then_some(row[5]),
-                    alloc: (row[4] & FOLD_ALLOCS != 0).then(|| Allocated { bytes: row[7], count: row[6] & 0xffff_ffff }),
-                }),
-                KIND_PLOT if row[4] & 0xff == FIBER_STACK_ROW => {
-                    let fiber = Some(((row[4] >> 8) as u32, row[7]));
-                    let (build, t_ns) = (row[6] as u32, scale.mono(row[0]));
-                    into.counters.extend(
-                        [
-                            (Plot::FiberStackReserved, row[1]),
-                            (Plot::FiberStackDeepest, row[2]),
-                            (Plot::FiberStackTouched, row[3]),
-                            (Plot::FiberStackGrown, row[5]),
-                        ]
-                        .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber }),
-                    );
-                }
-                KIND_PLOT => {
-                    let Some(plot) = Plot::of(row[4] & 0xff) else { continue };
-                    into.counters.push(CounterRow {
-                        build: row[6] as u32,
-                        plot,
-                        t_ns: scale.mono(row[0]),
-                        value: row[1],
-                        fiber: None,
-                    });
-                }
-                KIND_MARK => into.ends.push(BuildEnd { build: row[1], t_ns: scale.mono(row[0]), thread: by.tid }),
-                _ => {}
-            }
+            decode(into, (by.tid, by.name), event_id(ring.number, i), &row, &scale, counting_copies);
         }
     }
     into.lost = lost;
     into.names_forgotten = NAMES_FORGOTTEN.load(Ordering::Relaxed);
     into.scratch = scratch;
+}
+
+/// One row of a ring into the tables of `into`: `by` the tid and name of the thread that
+/// wrote it, `id` the row's [`event_id`] (its ring's number and its place there), `scale` the
+/// clock of the process that did, `counting_copies` whether it counted frame copies
+/// ([`count_frame_copies`]). A row that follows a span's (its copies, its typed columns) or an
+/// event's (its fields) fills in the span or event `into` read last. The one decoder of rows:
+/// [`take`] reads this process's rings with it, the postmortem a dead process's
+/// ([`postmortem`]).
+fn decode(into: &mut Read, by: (u32, Sym), id: u64, row: &[u64; WORDS], scale: &clock::Scale, counting_copies: bool) {
+    let (tid, thread_name) = by;
+    match row[4] >> 62 {
+        KIND_SPAN => {
+            let allocs = row[4] & ALLOCS_MAX;
+            into.spans.push(SpanRow {
+                build: (row[6] >> 32) as u32,
+                // The thread that closed it, until a `THREAD_COL` names the one that
+                // made it.
+                thread: tid,
+                thread_name,
+                span_id: row[2],
+                parent: row[3],
+                depth: (row[4] >> (62 - SITE_BITS - DEPTH_BITS) & ((1 << DEPTH_BITS) - 1)) as u16,
+                site: (row[4] >> (62 - SITE_BITS) & ((1 << SITE_BITS) - 1)) as u16,
+                start_ns: scale.mono(row[1]),
+                dur_ns: scale.ns(row[0].wrapping_sub(row[1])) as i64,
+                alloc: (allocs != 0).then(|| Allocated { bytes: row[7], count: allocs - 1 }),
+                copied: counting_copies.then_some(FrameCopied::default()),
+                krate: (row[5] >> 32) as u32,
+                function: row[5] as u32,
+                unit: row[6] as u32,
+                self_cpu_ns: None,
+                typed: [0; TYPED],
+                folded_spans: 0,
+                folded_ns: 0,
+            });
+        }
+        KIND_PLOT if row[4] & 0xff == SWITCH_ROW => {
+            let Some(event) = Switched::of(row[4] >> 8 & 0xff) else { return };
+            let queued = (row[4] >> QUEUED_LOW_SHIFT & ((1 << QUEUED_LOW_BITS) - 1)) | (row[6] >> 32) << QUEUED_LOW_BITS;
+            into.switches.push(SwitchRow {
+                build: row[6] as u32,
+                thread: tid,
+                thread_name,
+                t_ns: scale.mono(row[0]),
+                event,
+                job: row[1],
+                fiber: row[3] as u32,
+                core: (row[3] >> 32) as u32,
+                waited: WaitedOn::of(row[4] >> 16 & 0xff).map(|on| (on, row[2])),
+                by: (row[5] != 0).then_some(row[5]),
+                since_ns: (row[7] != 0).then(|| scale.mono(row[7])),
+                began_as: (event == Switched::Started && row[2] != 0).then_some(row[2]),
+                queued_ns: queued.checked_sub(1).map(|it| scale.ns(it) as i64),
+            });
+        }
+        KIND_PLOT if row[4] & 0xff == EVENT_ROW => into.events.push(EventRow {
+            build: row[6] as u32,
+            thread: tid,
+            thread_name,
+            t_ns: scale.mono(row[0]),
+            job: row[1],
+            span: row[2],
+            site: (row[4] >> 8 & ((1 << SITE_BITS) - 1)) as u16,
+            message: row[5] as Sym,
+            event_id: id,
+        }),
+        KIND_PLOT if row[4] & 0xff == EVENT_FIELDS_ROW => {
+            // Written right after its event's row, by the same thread: the event read
+            // last, unless the ring wrote over that row first.
+            let Some(event) = into.events.last().filter(|it| it.event_id == row[3]) else { return };
+            let (build, t_ns, site) = (event.build, event.t_ns, event.site);
+            let mut ordinal = into.fields.iter().rev().take_while(|it| it.event_id == row[3]).count() as u16;
+            for (place, &word) in COL_WORDS.iter().enumerate() {
+                let slot = row[4] >> (FIELD_SLOT_SHIFT + FIELD_SLOT_BITS * place as u32) & ((1 << FIELD_SLOT_BITS) - 1);
+                let Some(value) = FieldValue::of(slot & 0b111, row[word]) else { continue };
+                into.fields.push(FieldRow { build, t_ns, event_id: row[3], site, index: (slot >> 3) as u8, ordinal, value });
+                ordinal += 1;
+            }
+        }
+        KIND_PLOT if row[4] & 0xff == SPAN_COPIED_ROW => {
+            // Written right after its span's row, by the same thread: the span read
+            // last, unless the ring wrote over that row first.
+            if let Some(span) = into.spans.last_mut()
+                && span.span_id == row[3]
+            {
+                span.copied = (row[5] & UNCOUNTED == 0).then_some(FrameCopied { copies: row[1], bytes: row[2] });
+            }
+        }
+        KIND_PLOT if row[4] & 0xff == SPAN_COLS_ROW => {
+            // As a copied row: right after its span's, or after that one's other rows.
+            if let Some(span) = into.spans.last_mut()
+                && span.span_id == row[3]
+            {
+                for (place, &word) in COL_WORDS.iter().enumerate() {
+                    match row[4] >> (8 * (place + 1)) & 0xff {
+                        CPU_COL => span.self_cpu_ns = row[word].checked_sub(1),
+                        FOLDED_COL => span.folded_spans = row[word],
+                        FOLDED_TICKS_COL => span.folded_ns = scale.ns(row[word]) as i64,
+                        THREAD_COL => {
+                            span.thread = (row[word] >> 32) as u32;
+                            span.thread_name = row[word] as Sym;
+                        }
+                        col => {
+                            if let Some(typed) = usize::try_from(col).ok().and_then(|it| span.typed.get_mut(it)) {
+                                *typed = row[word];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        KIND_PLOT if row[4] & 0xff == FOLD_ROW => into.folds.push(FoldRow {
+            build: (row[6] >> 32) as u32,
+            thread: tid,
+            thread_name,
+            site: (row[4] >> 8 & ((1 << SITE_BITS) - 1)) as u16,
+            parent_site: (row[4] >> FOLD_PARENT_SHIFT & ((1 << SITE_BITS) - 1)) as u16,
+            root: row[4] & FOLD_ROOT != 0,
+            from_ns: scale.mono(row[1]),
+            to_ns: scale.mono(row[0]),
+            spans: row[4] >> FOLD_SPANS_SHIFT & FOLD_SPANS_MAX,
+            dur_ns: scale.ns(row[2]) as i64,
+            max_dur_ns: scale.ns(row[3]) as i64,
+            self_cpu_ns: (row[4] & FOLD_CPU != 0).then_some(row[5]),
+            alloc: (row[4] & FOLD_ALLOCS != 0).then(|| Allocated { bytes: row[7], count: row[6] & 0xffff_ffff }),
+        }),
+        KIND_PLOT if row[4] & 0xff == FIBER_STACK_ROW => {
+            let fiber = Some(((row[4] >> 8) as u32, row[7]));
+            let (build, t_ns) = (row[6] as u32, scale.mono(row[0]));
+            into.counters.extend(
+                [
+                    (Plot::FiberStackReserved, row[1]),
+                    (Plot::FiberStackDeepest, row[2]),
+                    (Plot::FiberStackTouched, row[3]),
+                    (Plot::FiberStackGrown, row[5]),
+                ]
+                .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber }),
+            );
+        }
+        KIND_PLOT => {
+            let Some(plot) = Plot::of(row[4] & 0xff) else { return };
+            into.counters.push(CounterRow {
+                build: row[6] as u32,
+                plot,
+                t_ns: scale.mono(row[0]),
+                value: row[1],
+                fiber: None,
+            });
+        }
+        KIND_MARK => into.ends.push(BuildEnd { build: row[1], t_ns: scale.mono(row[0]), thread: tid }),
+        _ => {}
+    }
 }
 
 // --- Threads now ------------------------------------------------------------------------
