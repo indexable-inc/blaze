@@ -62,7 +62,7 @@ def build(ws, env, step):
         raise SystemExit(f"{step}: the build failed:\n{said[-3000:]}")
     if not worked(ran.stdout):
         raise SystemExit(f"{step}: the build printed no `blaze-work` line:\n{said[-3000:]}")
-    return links(ran.stdout, "uapp")
+    return [str(it) for it in links(ran.stdout, "uapp")]
 
 
 def main():

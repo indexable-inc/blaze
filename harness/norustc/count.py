@@ -7,7 +7,9 @@ where each step began and ended, how it ended, and what it printed, for classify
 
 setup.sh prepares `$NR_ROOT` (default ~/no-rustc) first. NR_PATH_PREFIX goes in front of
 PATH and NR_ENV (JSON) is added to the environment, for a project that needs native
-libraries. docs/no-rustc.md has what these counted.
+libraries. docs/no-rustc.md has what these counted. A step ends when its command returns and
+the counted toolchains have gone quiet; v1 also waited for `blaze status` to say `ready`, but
+v2 has no load state, and a build that returns is done.
 """
 import json, os, shutil, subprocess, sys, time
 
@@ -86,28 +88,18 @@ def main():
                 return
             time.sleep(1)
 
-    def ready(limit=1800):
-        began = time.time()
-        while time.time() - began < limit:
-            out = subprocess.run(["blaze-engine", "cargo", "status"], cwd=ws, env=env, capture_output=True, text=True).stdout
-            if ": ready" in out:
-                return out
-            time.sleep(2)
-        return "not ready"
-
-    def step(label, argv, wait_ready=False, edits=()):
+    def step(label, argv, edits=()):
         if edits:
             apply(ws, edits)
         began = time.time()
         run = subprocess.run(PIN + argv, cwd=ws, env=env, capture_output=True, text=True)
         returned = time.time()
-        status = ready() if wait_ready and run.returncode == 0 else ""
         quiet()
         ended = time.time()
         err = run.stderr.splitlines()
         notes = [l for l in err if "blaze" in l or "Finished" in l or "error" in l.lower()][-25:]
         row = dict(step=label, argv=argv, began=began, returned=returned, ended=ended, code=run.returncode,
-                   secs=round(returned - began, 1), notes=notes, status=status[-2000:])
+                   secs=round(returned - began, 1), notes=notes)
         with open(steps_out, "a") as out:
             out.write(json.dumps(row) + "\n")
         with open(f"{L}/logs/{name}.{label}.stderr", "w") as out:
@@ -124,14 +116,14 @@ def main():
 
     if base == "bun":
         crate = ["-p", "bun_collections"]
-        step("cold", ["blaze", "test", "--no-run", *crate], wait_ready=True)
+        step("cold", ["blaze", "test", "--no-run", *crate])
         step("noop", ["blaze", "test", "--no-run", *crate])
         step("generic", ["blaze", "test", "--no-run", *crate], edits=edits["generic"])
         step("generic2", ["blaze", "test", "--no-run", *crate],
              edits=[(edits["generic"][0][0], edits["generic"][0][1], edits["generic"][0][1] + "\n        let _nr_again = 2u32;")])
     else:
         cr = ["blaze"]
-        step("cold", cr + ["build", *build], wait_ready=True)
+        step("cold", cr + ["build", *build])
         step("noop", cr + ["build", *build])
         step("body", cr + ["build", *build], edits=edits["body"])
         step("body2", cr + ["build", *build], edits=again)
@@ -143,14 +135,14 @@ def main():
         step("broken", cr + ["build", *build], edits=broken)
         step("fixed", cr + ["build", *build], edits=fixed)
         if test is not None:
-            step("test-cold", cr + ["test", "--no-run", *test], wait_ready=True)
+            step("test-cold", cr + ["test", "--no-run", *test])
             step("test-edit", cr + ["test", "--no-run", *test], edits=[(opening_file, opening, opening + "\n    let _nr_t = 3u32;")])
             lib = edits["leaf"][0][0] if "leaf" in edits else opening_file
             step("test-added", cr + ["test", "--no-run", *test], edits=[(lib, None, "\n#[test]\nfn nr_added_test() {}\n")])
             step("doctest", cr + ["test", "--doc", *test])
             step("doctest2", cr + ["test", "--doc", *test])
         step("check", cr + ["check", *build])
-    subprocess.run(["blaze-engine", "cargo", "stop"], cwd=ws, env=env)
+    subprocess.run(["blaze", "stop"], cwd=ws, env=env)
     print("DONE", name, flush=True)
 
 

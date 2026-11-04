@@ -38,16 +38,19 @@ blaze's own cold build, so the check runs nothing of rustc's, and it asserts no 
 """
 
 import asyncio
-import json
 import os
 import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast, get_args
+from typing import Literal, get_args
 
 from typed_input import fail, parse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import Failed, artifact, worked  # noqa: E402
 
 SCRIPT = "storerevisions.py"
 Case = Literal[
@@ -193,10 +196,6 @@ CASES: dict[Case, tuple[str, str, str]] = {
 assert all(FILES[file].count(old) == 1 for file, old, _ in CASES.values())
 
 
-class Failed(Exception):
-    """A step that went wrong, said whole."""
-
-
 @dataclass(frozen=True)
 class Env:
     blaze: Path
@@ -248,23 +247,6 @@ def edit(ws: Path, file: str, old: str, new: str) -> None:
     path.write_text(text.replace(old, new))
 
 
-def messages(said: str, reason: str) -> list[dict[str, object]]:
-    """The `--message-format=json` lines of `reason` in what a build printed."""
-    out: list[dict[str, object]] = []
-    for line in said.splitlines():
-        if line.startswith("{") and reason in line:
-            try:
-                parsed: object = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed, dict):
-                continue
-            message = cast(dict[str, object], parsed)
-            if message.get("reason") == reason:
-                out.append(message)
-    return out
-
-
 @dataclass(frozen=True)
 class Built:
     printed: tuple[str, str]
@@ -288,25 +270,19 @@ async def build(env: Env, ws: Path, seed: Path | None, label: str, exe: str) -> 
     blaze = str(env.blaze)
     try:
         said = await run(f"{label}: the build", [blaze, "build", "--message-format=json"], ws, variables, BUILD_SECS)
-        programs = [m["executable"] for m in messages(said, "compiler-artifact")
-                    if m.get("executable") and isinstance(target := m.get("target"), dict)
-                    and cast(dict[str, object], target).get("name") == exe]
-        if not programs:
+        program = artifact(said, exe)
+        if program is None:
             raise Failed(f"{label}: the build names no executable of {exe}:\n{said[-3000:]}")
-        program = str(programs[-1])
         printed = (await run(f"{label}: the program", [program], ws, variables, RUN_SECS),
                    await run(f"{label}: the program with an argument", [program, "second"], ws, variables, RUN_SECS))
-        worked = messages(said, "blaze-work")
-        if len(worked) != 1:
-            raise Failed(f"{label}: {len(worked)} `blaze-work` lines; a build says what it did once:\n{said[-3000:]}")
+        work = worked(said)
+        if len(work) != 1:
+            raise Failed(f"{label}: {len(work)} `blaze-work` lines; a build says what it did once:\n{said[-3000:]}")
     finally:
         # `blaze stop` makes what the daemon keeps durable before it ends, so a copy of the
         # store taken after it holds all of this build.
         await run(f"{label}: stopping the daemon", [blaze, "stop"], ws, variables, IDLE_SECS)
-    found, compiled = worked[0].get("found"), worked[0].get("compiled")
-    if not isinstance(found, int) or not isinstance(compiled, int):
-        raise Failed(f"{label}: the `blaze-work` line has no counts: {worked[0]}")
-    return Built(printed, found, compiled, store)
+    return Built(printed, work[0].found, work[0].compiled, store)
 
 
 async def case(env: Env, name: Case, a: Path, only_a: Path, std_only: Path, original: Built,

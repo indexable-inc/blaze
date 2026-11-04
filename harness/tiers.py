@@ -19,6 +19,10 @@ daemon. Three checks:
 3. BLAZE_TIER=off changes nothing: under a daemon started with it, nothing is sampled, no
    function leaves level 1, and the output is the build from nothing's.
 
+Every build is the daemon's (it prints a `blaze-work` line under `--message-format=json`);
+v1's wait until a build said `[blaze]` is gone, as v2 serves the first build. v1's worker logs
+(`tier: off`, the edit-to-binary time) are not read: v2 has no workers.
+
 Python 3.13, stdlib only. Every step has a timeout; a failure names the step.
 """
 
@@ -33,6 +37,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+sys.path.insert(0, str(HERE))
+from storelib import worked  # noqa: E402
+
 BUILD_TIMEOUT = 900
 # How long the program runs, and how long a level may take to be reached in it.
 RUN_SECONDS = int(os.environ.get("TIERS_SECONDS", "30"))
@@ -62,19 +69,19 @@ async def run(step: str, cmd: list[str], cwd: Path, env: dict[str, str]) -> str:
 
 
 async def build(step: str, cwd: Path, env: dict[str, str]) -> str:
-    return await run(step, ["blaze", "build", "--locked"], cwd, env)
+    """`blaze build --message-format=json`; a build with no `blaze-work` line was not the
+    daemon's, and fails the step."""
+    said = await run(step, ["blaze", "build", "--locked", "--message-format=json"], cwd, env)
+    if not worked(said):
+        tail = "\n".join(said.strip().splitlines()[-30:])
+        raise StepError(f"{step}: the build printed no `blaze-work` line\n  output tail:\n{tail}")
+    return said
 
 
 async def serve(project: Path, env: dict[str, str]) -> None:
-    """Builds until the daemon serves the build, then once more after an edit: the first edit
-    after a daemon starts writes the whole object again."""
+    """Builds (the first build starts the daemon and is served by it), then once more after an
+    edit: the first edit after a daemon starts writes the whole object again."""
     await build("first build", project, env)
-    for _ in range(120):
-        if "[blaze]" in await build("wait for the daemon", project, env):
-            break
-        await asyncio.sleep(0.5)
-    else:
-        raise StepError("wait for the daemon: no build said `[blaze]` in 120 tries")
     source = project / "src" / "main.rs"
     source.write_text(source.read_text() + "\n// the daemon's first edit\n")
     await build("first edit", project, env)
@@ -152,7 +159,7 @@ def live_dir(binary: Path) -> Path | None:
 
 async def main() -> None:
     bin_dir = Path(os.environ["BLAZE_BIN"]).resolve().parent
-    # Short: a worker's socket is in the daemon's home, and macOS takes 104 bytes of path.
+    # Short: the daemon's socket is in its home, and macOS takes 104 bytes of path.
     work = Path(tempfile.mkdtemp(prefix="rjt-", dir="/tmp" if Path("/tmp").is_dir() else None))
     try:
         shutil.copytree(ROOT / "crates" / "blaze-live", work / "crates" / "blaze-live")
@@ -203,9 +210,7 @@ async def main() -> None:
             await asyncio.sleep(0.05)
         if not demoted():
             raise StepError("edit of next_age: the daemon did not send it back to level 1; events:\n  " + "\n  ".join(program.events[-10:]))
-        log = "".join(p.read_text(errors="replace") for p in (work / "home-tiered").rglob("log"))
-        took = re.findall(r"change: 1 files\n(?:.*\n)*?edit-to-binary: (\S+)", log)
-        print(f"edit demoted next_age: {demoted()[0]} (daemon edit-to-binary {took[-1] if took else '?'})")
+        print(f"edit demoted next_age: {demoted()[0]}")
         await program.wait_for("next_age hot again and promoted again", lambda levels: levels.get("next_age", 0) >= 2)
         print(f"promoted again once hot: {program.levels}")
         await finish(program, tasks)
@@ -224,9 +229,6 @@ async def main() -> None:
         live = live_dir(binary)
         if live is not None and (live / "sample").exists():
             raise StepError(f"BLAZE_TIER=off: the daemon asked the program to sample ({live / 'sample'})")
-        logs = "".join(p.read_text(errors="replace") for p in (work / "home-off").rglob("log"))
-        if "tier: off" not in logs:
-            raise StepError("BLAZE_TIER=off: the worker did not say tiering is off")
         same_as_scratch("output with BLAZE_TIER=off", program.checksums, await scratch(len(program.checksums)))
         print(f"BLAZE_TIER=off: nothing sampled, nothing tiered, {len(program.checksums)} checksums, all the build from nothing's")
     finally:

@@ -105,10 +105,11 @@ HARNESSES = [
     ("core", ["live_types.py", arg({"blaze": BLAZE_CLI})], {}, on("linux-x86_64"), 1),
     # A program on a nightly feature (allocator_api) builds and takes live edits the same way.
     ("core", ["live_e2e.py", arg({"blaze": BLAZE_CLI, "program": "live-alloc"})], {}, on("linux-x86_64"), 1),
-    # Apple's linker leaves no more room than it is told, and gives a newer macOS chained fixups.
-    ("core", ["headerpad.py"], {}, on("macos"), 1),
-    # bun links with `-no_compact_unwind`, which leaves `__eh_frame` alone to the unwinder.
-    ("core", ["nocompact.py"], {}, on("macos"), 1),
+    # The Mach-O image blaze's linker writes and splices: load commands in their room, chained
+    # fixups for macOS 14, one link a build.
+    ("core", ["machoimage.py"], {}, on("macos"), 1),
+    # A panic unwinds through spliced code, also once the unwind tables outgrow their room.
+    ("core", ["unwindsplice.py"], {}, on("macos"), 1),
     # `blaze` hands Windows builds to cargo, so there the daemon links nothing to test.
     ("core", ["unreached.py"], {}, on("linux", "macos"), 1),
     ("core", ["anonstatics.py"], {}, on("linux", "macos"), 1),
@@ -175,8 +176,9 @@ FAST = {
     "scriptenv.py": (70, ()),
     "live_e2e.py": (16, ()),
     "live_types.py": (9, ()),
-    "headerpad.py": (18, ()),
-    "nocompact.py": (12, ()),
+    # v1's seconds of headerpad.py and nocompact.py, which these replaced: not measured yet.
+    "machoimage.py": (18, ()),
+    "unwindsplice.py": (12, ()),
     "unreached.py": (9, ()),
     "anonstatics.py": (9, ()),
     "artifactedits.py": (40, ()),

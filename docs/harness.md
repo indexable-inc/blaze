@@ -259,24 +259,24 @@ written from cargo again, and a change to one is a change to what blaze expects.
 | `selects.py` | blaze runs no build script and no proc macro the selection does not need: `blaze build -p app`, `blaze test -p app --no-run` and `blaze build --workspace`, each in an empty home on a fresh copy, run only the scripts and macros of what was asked for. Linux |
 | `debuginfo.py` | Programs built by `blaze build` (dev profile) in empty homes: backtraces held to the panic sites the harness writes, `llvm-dwarfdump --verify`, gdb stopping and stepping, locals, and perf unwinding by `.eh_frame`; a program followed through edits, rebuilt after each; each `debug` setting of the profile followed, and the same executable from a home that built another setting first as from a fresh one. Linux |
 | `staticcallbacks.py` | A `LazyLock` static whose initializer calls an `#[inline(always)]` helper of a dependency: an edit of a sibling of the helper, then of the helper itself, under one daemon, each printing the value its source states (astral-experiments/blaze#83, #87) |
-| `latelisted.py` | What a file named by `include!` through a build script's variable declares is listed in its crate though the daemon reads the file only once the names are resolved, as bun's generated bindings are: an edit that adds a function then patches a few functions, not every one the file declares |
+| `latelisted.py` | What a file named by `include!` through a build script's variable declares is listed in its crate though the daemon reads the file only once the names are resolved, as bun's generated bindings are: an edit that adds a function then compiles a few functions (`compiled` of its `blaze-work` line), not every one the file declares |
 | `libraryfetch.py` | The release's `library-<digest>.tar.xz`, made by `library.py archive` and served locally, is installed from once (`BLAZE_LIBRARY_FROM`) with blaze's digest; a lying or missing archive is an error and nothing is kept |
 | `loadretry.py` | A refused load reports changed flags and recovers after configuration files are removed or rewritten, without restarting the daemon (#597). Both configuration filenames, inherited configuration, and a source error said again under the same daemon are checked |
 | `scriptenv.py` | A build script that says it reads `SDK_DIR` and fails without it (cef-dll-sys's shape) is given the command's value, with a fresh daemon and with one started without it, and another value or none reruns it; a path dependency that is a workspace of its own is given what the build's root manifest names in `build-script-env` ([#720](https://github.com/indexable-inc/blaze/issues/720)) |
 | `unreached.py` | Edits under `blaze` that call instances of another crate's generic function the executable did not reach when it was linked: each is spliced, or laid out in full where a splice declines, as each build's `blaze-work` line says (`--message-format=json`). Linux and macOS; not run on Windows, where `blaze` has been run by hand only |
 | `anonstatics.py` | Edits under `blaze` that reach, through code rustc inlined at opt-level 1, a `static mut` inside a `const _: () = { .. }` of a crate rustc built (the shape of objc2's `declare_class!` ivar offsets, which winit's frame function reads): the daemon serves each build and refers to rustc's static, found under its `_` segment (v1's mixed model: under v2 no crate is rustc's). Linux and macOS; not run on Windows, where `blaze` has been run by hand only |
 | `artifactedits.py [case ...] [--release]` | An edit of a dependency reaches the file `blaze build` says it built ([#730](https://github.com/indexable-inc/blaze/issues/730)): a workspace of a library and a `bin`, `cdylib`, `dylib` or `staticlib` over it, built cold, unchanged, after a body edit that changes no behaviour (`std::hint::black_box`), one that does, and the edits taken back. A build that exits 0 has written the artifact, with bytes other than the build's before after each edit, and it computes what the source says (run, loaded with ctypes, or linked into a C program); one that cannot write it fails naming the kind (`dylib` today, #262). `staticlib-native` is a `staticlib` whose build script compiles C it links `static`: the C program is linked with the archive alone, which has to bundle it. `flags` is a program built with #731's rustflags (`-Z threads=8` with `RUSTC_BOOTSTRAP=1`, `--cfg tokio_unstable`, `-C target-cpu`, `-C force-frame-pointers=yes`, lld on AArch64 Linux), built and spliced by blaze. Linux and macOS |
-| `testselect.py` | `blaze test` with `BLAZE_TESTS=affected` on a library's unit tests and an integration test of it, edited a step at a time: the tests that run are those whose code or what it calls changed, also through a library of the workspace both link (built without `cfg(test)`, which the daemon takes over from rustc), one added, one given `#[ignore]`, one that reads a file (only when the file changed, which `-v` names, from what the sandbox recorded), one that downcasts a `dyn Any` (only when what it calls changed), one in a private module named as a public function beside it (the harness names it through the module) and one that failed (until it passes); `BLAZE_TESTS=all` runs every test. Its workspace opts into sandboxed tests, so every test runs sandboxed: one that writes into the package leaves it as it was, and the harness fails where the sandbox can't be made (`BLAZE_SANDBOX=off` checks the unsandboxed path, where the hermetic tests are still kept); a package that has not opted in keeps its hermetic tests' passes all the same and runs its bench every time. Linux and macOS. v1's: `BLAZE_TESTS` and `BLAZE_TESTS_FROM` are read by no v2 crate; v2 runs only the tests an edit reached under `blaze test --reached` (`crates/blaze-cargo/src/cli/args.rs`), which the harness does not use yet |
-| `hermetic.py` | Every kind of reason a test is not hermetic, told from the code it reaches with nothing opted into: a library with a test of each kind (files, the environment, the network, a process started, `process::exit`, foreign code, assembly, a function pointer made of data, an atomic static, a `static mut`; the clock, a `HashMap`'s seed and a thread, which don't block) and pure ones. `blaze test --why --json` prints a sorted line a test, each with its kind and a call chain from the test, and `target/blaze/tests.ndjson` and `tests.summary.json` say the same; a second `blaze test` runs only the tests that are not hermetic; an edit three calls below a pure test runs it again and no other pure test; `--why` ranks the reasons. Linux and macOS. v1's: v2's `blaze test` takes cargo's flags and its own `--reached` and `--ub*`, not `--why` or `--json`, and writes no `tests.ndjson` |
-| `sandboxbench.py` | What the sandbox of a test costs: a trivial program bare and in `blaze sandbox` (with and without a record), and a generated 600-test library, opted into sandboxed tests, under `blaze test` with `BLAZE_SANDBOX=off`, sandboxed under `all` and `affected`, and as a process per test, bare and sandboxed; medians of alternated rounds, pinned to `--cpus`. Linux and macOS. `all` and `affected` are v1's `BLAZE_TESTS`, which no v2 crate reads |
+| `testselect.py` | `blaze test` with `BLAZE_TESTS=affected` on a library's unit tests and an integration test of it, edited a step at a time: the tests that run are those whose code or what it calls changed, also through a library of the workspace both link (built without `cfg(test)`, which the daemon takes over from rustc), one added, one given `#[ignore]`, one that reads a file (only when the file changed, which `-v` names, from what the sandbox recorded), one that downcasts a `dyn Any` (only when what it calls changed), one in a private module named as a public function beside it (the harness names it through the module) and one that failed (until it passes); `BLAZE_TESTS=all` runs every test. Its workspace opts into sandboxed tests, so every test runs sandboxed: one that writes into the package leaves it as it was, and the harness fails where the sandbox can't be made (`BLAZE_SANDBOX=off` checks the unsandboxed path, where the hermetic tests are still kept); a package that has not opted in keeps its hermetic tests' passes all the same and runs its bench every time. Every `blaze test` runs with `--message-format=json`, and one without a `blaze-work` line was not served by the daemon. Linux and macOS. v1's: `BLAZE_TESTS` and `BLAZE_TESTS_FROM` are read by no v2 crate; v2 runs only the tests an edit reached under `blaze test --reached` (`crates/blaze-cargo/src/cli/args.rs`), which the harness does not use yet |
+| `hermetic.py` | Every kind of reason a test is not hermetic, told from the code it reaches with nothing opted into: a library with a test of each kind (files, the environment, the network, a process started, `process::exit`, foreign code, assembly, a function pointer made of data, an atomic static, a `static mut`; the clock, a `HashMap`'s seed and a thread, which don't block) and pure ones. `blaze test --why --json` prints a sorted line a test, each with its kind and a call chain from the test, and `target/blaze/tests.ndjson` and `tests.summary.json` say the same; a second `blaze test` runs only the tests that are not hermetic; an edit three calls below a pure test runs it again and no other pure test; `--why` ranks the reasons. The first `--why --json` runs with `--message-format=json` too, and has to print a `blaze-work` line (the daemon served it). Linux and macOS. v1's: v2's `blaze test` takes cargo's flags and its own `--reached` and `--ub*`, not `--why` or `--json`, and writes no `tests.ndjson` |
+| `sandboxbench.py` | What the sandbox of a test costs: a trivial program bare and in `blaze sandbox` (with and without a record), and a generated 600-test library, opted into sandboxed tests, under `blaze test` with `BLAZE_SANDBOX=off`, sandboxed under `all` and `affected`, and as a process per test, bare and sandboxed; medians of alternated rounds, pinned to `--cpus`. The first `blaze test --message-format=json` has to print a `blaze-work` line, and its `compiler-artifact` names the tests' program. Linux and macOS. `all` and `affected` are v1's `BLAZE_TESTS`, which no v2 crate reads |
 | `doctestonce.py` | `blaze test --doc` on a workspace of three libraries, each step held to what `STEPS` states: the workspace is loaded once for all of them, each library's passed count and failed examples in order, the exit status and the packages named as failed (every example passing, two failing under `--fail-fast`, by default and with `--no-fail-fast`, one failing with it), and no example left to rustdoc. Linux and macOS |
-| `blaze_cli.py` | `blaze` on seven real projects, 22 flag combinations, and 11 daemon lifecycle checks, each held to blaze's own run from nothing (`blaze_cli.Scratch`: a fresh home, store and `target-scratch`) and to what it states: every build but `broken` exits 0, every test passes by its own verdict, each flag case exits as its source says. Needs the network and about 20 minutes; not in CI |
+| `blaze_cli.py` | `blaze` on seven real projects, 22 flag combinations, and the daemon's lifecycle checks (one daemon by its lock `<home>/v2/serve.lock`, reused, shared by a worktree, gone when idle; v1's worker, write-in-place and `ready` checks are gone with v1), each held to blaze's own run from nothing (`blaze_cli.Scratch`: a fresh home, store and `target-scratch`) and to what it states: every build but `broken` exits 0, every test passes by its own verdict, each flag case exits as its source says. Needs the network and about 20 minutes; not in CI |
 | `live_e2e.py` | Edits of a running program that links `blaze-live`, each applied as a patch; then another program built meanwhile, a start again from the executable, and a panic that unwinds through the patched code. Linux x86-64 and macOS AArch64 |
 | `live_types.py` | A running program's component types changed as a game changes them, on the daemon's own base: `V2` added beside `V1` with a derive, a static id cache and a trait impl, the code moved to it with the values converted and a static new in the edit, `V1` deleted, each a patch whose answer matches blaze's build of the same stage from nothing and whose statics keep their values; then a field of `V2` changed, which restarts naming `struct V2`. One typed JSON input (`blaze`, `env`, `keep`, `tmp`). Linux x86-64 and macOS AArch64 ([live.md](live.md#types)) |
 | `live_latency.py` | Edit-to-running time of live edits on `harness/live`, `demo/life`, `harness/live-bevy` and `harness/live-egui`, one edit at a time through `blaze build`, with one typed JSON input (`blaze`, `program`, `edits`, `json`, `machine`, `tmp`). Writes p50 to p99 and every sample, with the machine and its battery, to the input's `json`. Measures; checks nothing; macOS on AArch64 ([live.md](live.md#latency-under-typing), superseded) |
-| `spaces.py` | A two-crate workspace under a directory whose name has spaces, `$$`, `#` and quotes, built and edited with `blaze build`; every edit has to be applied by the daemon against rustc's symbols ([#14](https://github.com/indexable-inc/blaze/issues/14)) |
-| `nocompact.py` | A program linked with `-no_compact_unwind`, as bun is, which has `__eh_frame` and no `__unwind_info`: its edits are spliced, and the unwinder finds the frame of the edited function where its symbol now is, behind the program's frames and, once a thousand new functions outgrow that room, with all of them moved into the header's ([#33](https://github.com/indexable-inc/blaze/issues/33)). macOS on AArch64 |
-| `headerpad.py` | A program whose unwind table does not fit the room its link leaves after the load commands: the first link is told the room the unwind information of its objects wants and is linked once ([#173](https://github.com/indexable-inc/blaze/issues/173)), the edits after it are spliced, and a restarted daemon starts from the room kept beside the executable ([#13](https://github.com/indexable-inc/blaze/issues/13)). It is built for macOS 14, as nix's shell builds, which Apple's linker gives chained fixups unless told not to ([#30](https://github.com/indexable-inc/blaze/issues/30)). How each build linked it is what its `blaze-work` line says. macOS on AArch64 |
+| `spaces.py` | A two-crate workspace under a directory whose name has spaces, `$$`, `#` and quotes, built and edited with `blaze build`; every build has to be the daemon's (a `blaze-work` line) and the program has to print what the source says ([#14](https://github.com/indexable-inc/blaze/issues/14)) |
+| `unwindsplice.py` | A panic unwinds through spliced code: a function the edits change panics under `catch_unwind` with a guard on its frame, and after every edit the guard is dropped and the panic caught; every edit after the first is spliced, as each build's `blaze-work` line says, and the last adds a thousand functions, which outgrow the room kept for their unwind information, and a new frame the panic unwinds through: spliced or laid out in full saying why. v1's `nocompact.py` ([#33](https://github.com/indexable-inc/blaze/issues/33)), whose `-no_compact_unwind` reaches no linker under blaze's own. macOS on AArch64 |
+| `machoimage.py` | The Mach-O executable the daemon links and splices, read from the file with the standard library: its load commands end before its first section's bytes after the first link, every splice and an edit that adds a library the image did not load (`LC_LOAD_DYLIB`); `LC_BUILD_VERSION` says macOS 14.0, as the build asked, and it is fixed up by chains, as ld-prime gives that macOS ([#30](https://github.com/indexable-inc/blaze/issues/30)); it has `__unwind_info`; each build links it once ([#173](https://github.com/indexable-inc/blaze/issues/173)), every edit after the first is spliced, and a daemon started anew links it once. v1's `headerpad.py` ([#13](https://github.com/indexable-inc/blaze/issues/13)), whose `-headerpad` reaches no linker under blaze's own. macOS on AArch64 |
 | `tiers.py` | Tiers ([tiers.md](tiers.md)): `demo/lifebench` running under the daemon reaches levels 2 and 3 with output identical to blaze's build from nothing with `BLAZE_TIER=off`, an edit of a tiered function demotes it and is applied at once, and `BLAZE_TIER=off` changes nothing. macOS on AArch64 (any native blaze, which has LLVM); it exits 0 elsewhere |
 | `tierbench.py` | The benchmark table of [tiers.md](tiers.md): `demo/lifebench` at level 1, 2 and 3 under a daemon and as cargo builds it (release, and `-O3` with the dev profile's checks), in interleaved rounds, the steady rate of each; `--together` runs a round's builds at once, for a loaded machine. Measures; checks nothing; not in CI |
 
@@ -307,23 +307,24 @@ and do not gate. All of them were written against v1, and none has measured v2 y
 `blaze build` and the daemon through the command line but lean on v1's settings and output:
 `bench.py` picks the backend by the profile ([Under LLVM](#under-llvm)) and tells a step that
 finished by `blaze_cli.how_built`;
-`testselectbench.py` and `sandboxbench.py` set `BLAZE_TESTS`, `spare.py` and `memsplit.py`
-measure v1's spare worker (`BLAZE_SPARE`), and `coldprof.py` and `realbench.py` set
+`testselectbench.py` and `sandboxbench.py` set `BLAZE_TESTS`, `memsplit.py`
+measures v1's spare worker (`BLAZE_SPARE`), and `coldprof.py` and `realbench.py` set
 `BLAZE_IDLE_SECS`, none of which a v2 crate reads.
 `testselectbench.py` runs `bench.py`'s projects' tests under a daemon with `BLAZE_TESTS=all` and
 `affected`, before and after `bench.py`'s `leaf` edit: the wall time, the tests run and skipped,
 and how many run every time and why, from what the daemon wrote beside each test program. It
-exits 1 when a build after the daemon first served one went to cargo (#84): ripgrep's and
-helix-core's edits are the daemon's to build.
+exits 1 when a `blaze test --message-format=json` printed no `blaze-work` line, that is, the
+daemon did not serve it (#84).
 `memsplit.py` says what each process of the daemon holds (the daemon, the project's worker, the
 spare) and of what kind of page, once ready, once the daemon has built its own base and after
 edits, with `--env` to try an allocator setting
 ([research/daemon-memory.md](research/daemon-memory.md#2026-10-23-the-own-base-and-the-allocator)).
 `spare.py` starts a daemon with a tiny project, then builds one of `bench.py`'s projects under it
-from an empty target directory and again once cargo has built it, each until the daemon is
-ready, for builds of blaze given as `--variant LABEL:BIN[:VAR=VALUE...]` in interleaved
-rounds: the second project's cold and warm start and what the daemon's processes hold before and
-after, which is how the spare worker's default was chosen ([cargo.md](cargo.md#what-a-build-does)).
+from an empty target directory and again once it has built it, for builds of blaze given as
+`--variant LABEL:BIN[:VAR=VALUE...]` in interleaved rounds: the second project's cold and warm
+start and what the daemon (found by its lock) holds before and after. Under v1 it chose the spare
+worker's default ([cargo.md](cargo.md#what-a-build-does)); v2 has no spare workers and no wait
+until ready, so it measures the build and the memory alone.
 `heap.py` gives a heap profile's bytes to the salsa query whose value or record holds them, and to
 blaze's own structures; `heapfold.py` makes of a profile on macOS what `jeprof --collapsed` makes
 of it on Linux, for `heap.py` to read ([research/daemon-memory.md](research/daemon-memory.md)); `heap.py --syntax`
@@ -333,12 +334,14 @@ project's cold start, own base, edits and warm start as phases with the times th
 ended, and `cpufold.py --phases` cuts a `perf` profile of the run by them, with what salsa was
 revalidating and who asked ([research/lean-frontend.md](research/lean-frontend.md)). `realbench.py` times
 `blaze build` against `cargo build` on ripgrep, just and nushell (cold, no-op and
-three kinds of edit); the numbers are in [results.md](results.md#11-real-projects). `coldprof.py`
-times a cold `blaze build` of a real project until the daemon is ready and its first
-edit, from an empty or a filled store, with every line the daemon logged and the cores busy
-along the way: the readiness check of [#11](https://github.com/indexable-inc/blaze/issues/11),
-whose numbers are in [cargo.md](cargo.md#what-a-build-does). With `--max-wait S` it fails when
-the daemon was ready more than S seconds after the command returned; `--until TEXT` waits for a
+three kinds of edit), each `blaze build` row saying from its `blaze-work` line how the daemon
+linked it; the numbers are in [results.md](results.md#11-real-projects). `coldprof.py`
+times a cold `blaze build` of a real project and its first
+edit, from an empty or a filled store, with every line the daemon logged (`<home>/v2/serve.log`)
+and the cores busy along the way; it fails when the build fails. v1's readiness check
+([#11](https://github.com/indexable-inc/blaze/issues/11), `--max-wait S`, whose numbers are in
+[cargo.md](cargo.md#what-a-build-does)) is gone: v2 has no workers to get ready, and `realbench.py`
+no longer times a "ready" either. `--until TEXT` waits for a
 line the daemon logs, and `--memory` follows what its processes hold. `warmstart.py PROJECT`
 times a start on a warm store with nothing of rustc's ([#41](https://github.com/indexable-inc/blaze/issues/41)):
 a first checkout on an empty store, a second on the store it filled, that daemon stopped and
@@ -346,14 +349,18 @@ started, and once more, each followed by a body edit and its undoing; it keeps w
 said in `WORK/said-STEP.txt` and exits 1 when a program's output is not what blaze's run of its checkout from nothing prints
 ([research/warm-start.md](research/warm-start.md)). Their docstrings say how to run them.
 `bench.py` on real projects, with `benchreport.py`, is also what writes the benchmark
-tables and the README's numbers: [benchmarks.md](benchmarks.md). Besides the edits `bench.py` times repeated cold builds
+tables and the README's numbers: [benchmarks.md](benchmarks.md). It runs every blaze build
+under `--message-format=json` and reads how it linked, what it compiled and its steps' times
+from the `blaze-work` line (`links`, `compiled`, `steps_us`), and the daemon's pid from its lock.
+Besides the edits `bench.py` times repeated cold builds
 against fresh cargo with an empty and with a warm store (`--cold-runs`), the same steps under
 the fastest cargo setups (`--setups`: mold, wild, `-Zthreads=8`, cg_clif and `cargo check`) and
 the test suites under both (`--tests`). v2 has no runtime bench yet: benchmarks.md's runtime
 table is v1's `runbench.py`'s last result. `abbench.py` runs two or more builds of blaze against each other on `bench.py`'s
-edits, in interleaved rounds: an edit's wall time, the daemon's own time and its workers'
-cycles and instructions (counters.py; the cold start's on macOS alone), the cold start, and the
-workers' peak memory. It is how the release build's
+edits, in interleaved rounds: an edit's wall time, its steps' times from the `blaze-work`
+line's `steps_us`, the daemon's cycles and instructions (counters.py; the cold start's on macOS
+alone), the cold start, and the daemon's peak memory. v1's edit-to-binary time, from a worker's
+log, has no v2 counterpart and is gone. It is how the release build's
 profile was chosen ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)), and with `--train` it
 is the training of its PGO. `hotpatch.py` times an edit of a running program under Dioxus's
 subsecond against `blaze build` and `cargo build` with a restart; its program is
@@ -391,7 +398,8 @@ zed's libraries are in `.#bench-zed`, since every library directory slows each l
 ### The v2 proof
 
 `harness/v2/` proves blaze v2 ([v2/proof.md](v2/plan/lanes/proof.md)). Every script takes one typed JSON
-value with an `engine`, `{"kind": "v1" | "v2", "blaze": PATH}`, and drives blaze only through
+value with an `engine`, `{"kind": "v2", "blaze": PATH}` (`Engine.of` refuses `"v1"`, whose
+worker logs and `ready` lines v2 doesn't have), and drives blaze only through
 the `blaze` command line and `engine.py`. It was written to run against v1 first and v2 later,
 unchanged; since 2026-10-30 there is only v2, so `"kind": "v2"` is the one that has a blaze to
 run. One thing stops it on v2 today: `Engine.env` sets `BLAZE_BACKEND` for every command (and
@@ -431,7 +439,8 @@ harness/v2/<script>.py '<json>'`. They are not in CI yet.
 | `budgets.py` | The targets of [v2/plan/targets.md](v2/plan/goals/targets.md) as rows, each with the number measured, the budget and today's figure: edit to result, signature and formatting edits, no-op, warm start, memory against cargo, dev and release code speed, a big crate, the cold build's core use and critical path, CI for a small PR. [v2/plan/data.md](v2/plan/design/data.md)'s rows: bytes per token, node, expression, statement, memo, edge and relocation, memory per thousand lines, and cache misses per edit |
 
 The fixtures and adapters beside them are `fixture.py` (the oracle's workspace, a pure function
-of a state), `engine.py` (the v1 and v2 adapters, and cargo for fetching) and `report.py` (the
+of a state), `engine.py` (the v2 adapter, the v1 one kept only for `proof.py`'s selftest of its log reader, and
+cargo for fetching) and `report.py` (the
 result's shape).
 
 ## The fuzzer
@@ -599,10 +608,10 @@ commits (`.github/scripts/downstream.py`, from astral-experiments/blaze#38, #41,
 | `uv-archive-fixtures` | uv's 39 ZIP extraction cases alone |
 | `uv-lock-edit`, `ty-semantic-edit` | a diagnostic and its test's expected text edited, then the diagnostic restored: the test passes, passes, then fails printing the edited text, so an executable the edit did not reach fails it |
 
-Each has to print blaze's `Finished` line, so a run that built nothing does not pass. It tests a
-release (`-f blaze=canary`, the default, `stable` or a version), or with `-f build-run=<id>` the
-`blaze-linux-x64` build of a `focused.yaml` or train run: the way to try a branch on them before
-it lands. Build scripts and proc macros run in blaze's sandbox, as for any user.
+Each runs under `--message-format=json-render-diagnostics` and has to print blaze's `blaze-work`
+message, so a run that built nothing does not pass. It tests a release (`-f blaze=canary`, the
+default, `stable` or a version), or with `-f build-run=<id>` the `blaze-linux-x64` build of a
+`focused.yaml` or train run: the way to try a branch on them before it lands. Build scripts and proc macros run in blaze's sandbox, as for any user.
 
 ### The release train
 

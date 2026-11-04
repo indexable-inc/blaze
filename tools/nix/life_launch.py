@@ -10,7 +10,7 @@ Started by the `blaze-life` wrapper in flake.nix, which passes everything in BLA
   PATH, LIBS   toolchain (and linker) on PATH, and the GUI libraries to dlopen
 
 The source is copied to a writable temporary directory. With live edits, the copy is built once
-by cargo and the blaze-engine daemon, and started. From then on the window's editor sends each edit's
+by the blaze-engine daemon, and started. From then on the window's editor sends each edit's
 text straight to the daemon, which builds it from memory and patches the running window; the
 editor writes the copy's src/main.rs after that, and nothing here runs again. Without live edits
 (they are macOS on AArch64 only) the prebuilt window runs, and the edited copy is not used.
@@ -29,7 +29,6 @@ import tempfile
 from pathlib import Path
 
 BUILD_TIMEOUT = 1800  # the first build compiles eframe and its dependencies
-READY_TIMEOUT = 600  # the daemon loads the workspace after the first build
 
 
 class StepError(Exception):
@@ -98,12 +97,9 @@ def prepare(work: Path) -> Path:
 async def daemon_session(life: Path, run_env: dict[str, str], target: Path) -> None:
     build = ["blaze", "build", "--locked"]
     print("blaze: building the demo (the first build compiles eframe, a few minutes)", file=sys.stderr)
+    # The daemon serves every build, the first one too (no cargo fallback): its link is the one
+    # a running program takes patches against, so there is nothing to wait for after it.
     await run("first build", build, BUILD_TIMEOUT, life, run_env)
-    # The daemon loads the workspace after that build; until it has, a build is cargo's. A build
-    # it served says `[blaze]`, and that one is the link a running program takes patches against.
-    async with asyncio.timeout(READY_TIMEOUT):
-        while "[blaze]" not in await run("wait for the daemon", build, BUILD_TIMEOUT, life, run_env):
-            await asyncio.sleep(0.5)
     main_rs = life / "src" / "main.rs"
     print(f"blaze: type in the editor on the right ({main_rs}); the window changes as you type", file=sys.stderr)
     window = await asyncio.create_subprocess_exec(str(target / "debug" / "life"), cwd=life, env=run_env)

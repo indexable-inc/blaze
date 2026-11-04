@@ -7,16 +7,18 @@
 
 Each DIR holds a `blaze` and the program it runs from next to itself (`blaze-engine`). A round
 goes through the builds in turn, in an order that rotates from round to round; each build gets a copy of the project and a home and store of its own that live for the
-whole run, and in its turn it stops any daemon of its own, starts one from nothing, waits until
-it is warm (the cold start), and makes every edit `--runs` times and takes it back. So a machine
+whole run, and in its turn it stops any daemon of its own, starts one from nothing with its
+first build (the cold start), and makes every edit `--runs` times and takes it back. So a machine
 that is busier for a while is busier for all of them alike, and every number is a median over
 `rounds x runs` samples.
 
-An edit is timed three ways: the wall time of `blaze build`, the daemon's own
-`edit-to-binary`, and the CPU cycles and instructions the daemon's workers spent on it (counters.py:
-Linux's counters in user mode, macOS's totals), which a loaded machine moves much less than the
-wall time; the cold start's are macOS's alone (Linux keeps no lifetime count of a process). Memory is the most the workers have
-held at once (VmHWM on Linux, the lifetime peak physical footprint on macOS), read at the end
+An edit is timed by the wall time of `blaze build`, the steps the daemon timed itself (the
+`steps_us` of the build's `blaze-work` line under `--message-format=json`), and the CPU cycles
+and instructions the daemon spent on it (counters.py: Linux's counters in user mode, macOS's
+totals), which a loaded machine moves much less than the wall time; the cold start's are macOS's
+alone (Linux keeps no lifetime count of a process). v1's `edit-to-binary`, a line of its
+workers' logs, has no counterpart in v2. Memory is the most the daemon has
+held (VmHWM on Linux, the lifetime peak physical footprint on macOS), read at the end
 of each turn. Plain cargo never builds here: bench.py compares against cargo, this compares
 builds of blaze. `--env NAME=KEY=VALUE` sets a variable for one build only (an allocator
 option, for example); the same DIR may be given under two names with different variables.
@@ -26,8 +28,8 @@ option, for example); the same DIR may be given under two names with different v
 import json, os, platform, re, shutil, statistics, sys, tempfile, time
 
 import blaze_cli, counters
-from bench import PROJECTS, Daemon, cold_steps, daemon_steps, options, write_edit
-from blaze_cli import Side, base_env, fetch, how_built, wait_warm
+from bench import JSON, PROJECTS, Daemon, cold_steps, daemon_steps, options, write_edit
+from blaze_cli import Side, base_env, fetch, how_built
 
 DARWIN = platform.system() == "Darwin"
 
@@ -78,52 +80,50 @@ class Build:
         self.samples.setdefault(kind, []).append(sample)
 
     def turn(self, kinds, runs, pause):
-        """Starts a daemon from nothing, waits for it to be warm, then makes every edit."""
+        """Starts a daemon from nothing with the first build, then makes every edit."""
         side, build = self.side, self.spec.get("build", [])
         side.cargo("stop")
         # A home, and with it its store, from nothing: the cold start is a first start.
         shutil.rmtree(self.home, ignore_errors=True)
         daemon = Daemon(side)
-        took, ran = side.cargo("build", *build)
+        took, ran = side.cargo("build", *build, JSON)
         if ran.returncode != 0:
             raise SystemExit(f"{self.name}: the first build failed:\n{ran.stderr[-3000:]}")
-        warm, states = wait_warm(side, self.ws)
-        if states != ["ready"]:
-            raise SystemExit(f"{self.name}: the daemon did not get ready: {states}")
-        pids = [pid for pid, _ in daemon.workers()]
-        said = daemon.said()
+        # v2's first build is the daemon's, with nothing left to load after it; the daemon
+        # does the work itself, with no workers.
+        warm, pid = 0.0, daemon.pid()
+        if pid is None:
+            raise SystemExit(f"{self.name}: no daemon runs after the first build (no {self.home}/v2/serve.lock)")
+        pids = [pid]
         cold = counters.lifetime(pids)
         self.add("cold", wall_s=round(took + warm, 3), first_build_s=round(took, 3), warm_s=round(warm, 3),
-                 steps_s=cold_steps(said), cycles=cold.cycles, instructions=cold.instructions, **Usage.total(pids))
-        # The workers, and what they start, counted from here on.
+                 steps_s=cold_steps(ran.stdout), cycles=cold.cycles, instructions=cold.instructions, **Usage.total(pids))
+        # The daemon, and what it starts, counted from here on.
         meter = counters.Meter()
         for pid in pids:
             meter.follow(pid)
 
-        def timed_build(kind, edit):
+        def timed_build(kind):
             time.sleep(pause)
             before, counted = Usage.total(pids), meter.snapshot()
-            took, ran = side.cargo("build", *build)
+            took, ran = side.cargo("build", *build, JSON)
             after, counted = Usage.total(pids), meter.since(counted)
             built = how_built(ran.stderr)
             if ran.returncode != 0 or built != "daemon":
                 raise SystemExit(f"{self.name} {kind}: built by {built} (exit {ran.returncode}):\n{ran.stderr[-2000:]}")
-            said = daemon.said(1 if edit else 0)
-            e2b = re.findall(r"^edit-to-binary: (\S+)$", said, re.M)
-            self.add(kind, wall_s=took, edit_to_binary_s=sum(map(seconds, e2b)) if e2b else None,
-                     steps_ms=daemon_steps(said), cycles=counted.cycles, instructions=counted.instructions,
+            self.add(kind, wall_s=took, steps_ms=daemon_steps(ran.stdout), cycles=counted.cycles, instructions=counted.instructions,
                      cpu_s=after["cpu_s"] - before["cpu_s"])
 
         for kind in kinds:
             for _ in range(runs):
                 if kind == "no-op":
-                    timed_build(kind, False)
+                    timed_build(kind)
                     continue
                 changes = self.spec["edits"][kind]
                 write_edit(self.ws, changes, False)
-                timed_build(kind, True)
+                timed_build(kind)
                 write_edit(self.ws, changes, True)
-                timed_build(kind + " back", True)
+                timed_build(kind + " back")
         meter.close()
         self.add("memory", peak_mb=Usage.total(pids)["peak_mb"])
         if self.train:
@@ -132,22 +132,14 @@ class Build:
             side.cargo("stop")
 
 
-def end_for_profile(side, workers):
-    """Ends the daemon so that its workers exit by themselves. `stop` kills the workers, and a
-    killed process never writes the counters of an instrumented (PGO) build; a worker whose
-    daemon is gone sees its input end and exits, which writes them."""
-    _, status = side.cargo("status")
-    daemon = re.search(r"^daemon: pid (\d+),", status.stdout, re.M)
-    if daemon:
-        os.kill(int(daemon[1]), 9)
+def end_for_profile(side, pids):
+    """Ends the daemon so that it exits by itself: a killed process never writes the counters
+    of an instrumented (PGO) build, and v2's `blaze stop` has the daemon write its image and
+    exit, which writes them. Waits, at most 120 s, until it is gone."""
+    side.cargo("stop")
     began = time.time()
-    while any(blaze_cli.alive(pid) for pid in workers) and time.time() - began < 120:
+    while any(blaze_cli.alive(pid) for pid in pids) and time.time() - began < 120:
         time.sleep(0.2)
-
-
-def seconds(text):
-    number, unit = re.match(r"([0-9.]+)(ns|µs|ms|s)", text).groups()
-    return float(number) * {"ns": 1e-9, "µs": 1e-6, "ms": 1e-3, "s": 1.0}[unit]
 
 
 def summary(builds):

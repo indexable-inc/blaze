@@ -12,8 +12,9 @@ a `HashMap`'s seed and a thread, which don't block) and pure tests beside them (
 through three calls, a sort, formatting, a `LazyLock`, a thread-local, and a function chosen
 once and kept in a static as memchr chooses its code by the CPU). Steps:
 
-- `blaze test --why --json` runs no test and prints a line a test: each test is hermetic as
-  its kind says, its reasons have that kind with a chain that starts at the test, and the
+- `blaze test --why --json` (with `--message-format=json`, whose `blaze-work` line says the
+  daemon served it) runs no test and prints a line a test: each test is hermetic as its kind
+  says, its reasons have that kind with a chain that starts at the test, and the
   lines are sorted; `tests.ndjson` has the same lines, `tests.summary.json` the counts.
 - `blaze test` runs every test, then again only those that are not hermetic.
 - an edit to the function three calls below a pure test runs it again, and no other pure test.
@@ -28,9 +29,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import worked  # noqa: E402
+
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 TIMEOUT = 900
 LIB = r"""use std::sync::LazyLock;
@@ -262,6 +265,22 @@ def run(cmd, ws, env, *args):
     return ran.returncode, ran.stdout, ran.stderr
 
 
+def apart(out):
+    """`--why --json`'s lines in what `blaze test --message-format=json` printed on stdout, as
+    text: every line but blaze's and cargo's messages (those with a `reason`)."""
+    kept = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            parsed = None
+        if not (isinstance(parsed, dict) and "reason" in parsed):
+            kept.append(line + "\n")
+    return "".join(kept)
+
+
 def lines_right(lines):
     """What is wrong with the `--why --json` lines, or None."""
     names = [it["name"] for it in lines]
@@ -317,14 +336,12 @@ def main():
         print(f"{what:44} {verdict}", flush=True)
 
     try:
-        deadline = time.monotonic() + 300
-        while True:
-            code, out, err = run(cmd, ws, env, "--why", "--json")
-            if code == 0 and "[blaze]" in err and out.strip():
-                break
-            if time.monotonic() > deadline:
-                raise SystemExit(f"never served by the daemon:\n{err[-3000:]}")
-            time.sleep(0.5)
+        # The first `blaze test` starts the daemon and is served by it: nothing to wait for.
+        code, said, err = run(cmd, ws, env, "--why", "--json", "--message-format=json")
+        out = apart(said)
+        if code != 0 or not worked(said) or not out.strip():
+            raise SystemExit(f"not served by the daemon (exit {code}, no `blaze-work` line or no lines):\n"
+                             f"{(said + err)[-3000:]}")
         lines = [json.loads(it) for it in out.splitlines() if it.strip()]
         verdict = lines_right(lines) or "ok"
         if verdict != "ok":

@@ -18,7 +18,8 @@ returns, and after the edit is taken back. After each build:
   - after each edit, the artifact's sha256 differs from the build before: an artifact left as
     it was is STALE, whatever the build said;
   - a build that does not exit 0 names the kind of artifact it does not write (a refusal), and
-    is only right where the case expects one.
+    is only right where the case expects one;
+  - a build that exits 0 is the daemon's: it prints a `blaze-work` line (`--message-format=json`).
 
 `flags` is a program built with the rustflags of #731: `-Z threads=8` (RUSTC_BOOTSTRAP=1),
 `--cfg tokio_unstable`, `-C target-cpu` of the host's family, `-C force-frame-pointers=yes` and,
@@ -37,6 +38,9 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import worked  # noqa: E402
+
 TIMEOUT = 900
 AARCH64 = platform.machine().lower() in ("arm64", "aarch64")
 DLL = ".dylib" if sys.platform == "darwin" else ".so"
@@ -185,7 +189,7 @@ def run_case(name, root, env, release):
     env = dict(env, **extra, CARGO_TARGET_DIR=os.path.join(root, f"{name}-target"))
     profile = "release" if release else "debug"
     artifact = os.path.join(env["CARGO_TARGET_DIR"], profile, file)
-    args = ["blaze", "build", *(["--release"] if release else [])]
+    args = ["blaze", "build", "--message-format=json", *(["--release"] if release else [])]
     wrong, before = [], None
     for what, edit, want in STEPS:
         if edit:
@@ -200,7 +204,7 @@ def run_case(name, root, env, release):
         if ran.returncode != 0:
             kind = "dylib" if name == "dylib" else name
             names_it = f"`{kind}`" in said or (name == "flags" and "flag" in said)
-            if expect == "refused" and names_it and "building with cargo" not in said:
+            if expect == "refused" and names_it:
                 verdict = "refused, saying why"
             elif names_it:
                 verdict = f"REFUSED: {said.splitlines()[-1][:200]}"
@@ -210,8 +214,8 @@ def run_case(name, root, env, release):
             verdict = f"SUCCESS WITH NO ARTIFACT: {file} is not there"
         elif edit and now == before:
             verdict = f"STALE: {file} is the bytes of the build before ({now[:12]})"
-        elif "[blaze]" not in said:
-            verdict = f"NOT BLAZE'S BUILD: {said[-300:]}"
+        elif not worked(ran.stdout):
+            verdict = f"NOT BLAZE'S BUILD (no `blaze-work` line): {said[-300:]}"
         else:
             got = computed(name, artifact, scratch)
             want = f"{want} true" if name == "flags" else str(want)

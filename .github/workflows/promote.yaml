@@ -159,8 +159,8 @@ jobs:
           path: ${{ runner.temp }}/${{ matrix.os }}.json
           if-no-files-found: ignore
       # What blaze recorded, for a failure that a span has to name first (AGENTS.md rule 16): the
-      # daemon's span history (`blaze debug sql` and DuckDB read it, docs/profiling.md) and each
-      # worker's log, from blaze's root (~/.cache/blaze) and, on Linux, its runtime directory.
+      # daemon's span history (`blaze debug sql` and DuckDB read it, docs/profiling.md) and its
+      # log (`v2/serve.log`), from blaze's root (~/.cache/blaze).
       - name: what blaze recorded
         if: failure()
         run: |
@@ -168,9 +168,7 @@ jobs:
           mkdir -p "$out"
           # Parquet and logs only: the verdict reads every .json among the artifacts as results.
           [ ! -d "$HOME/.cache/blaze/v2/profile" ] || rsync -a --include='*/' --include='*.parquet' --exclude='*' "$HOME/.cache/blaze/v2/profile/" "$out/profile/"
-          for workers in "$HOME/.cache/blaze/workers" "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/blaze/workers"; do
-            [ ! -d "$workers" ] || rsync -a --include='*/' --include=log --exclude='*' "$workers/" "$out/workers/"
-          done
+          [ ! -f "$HOME/.cache/blaze/v2/serve.log" ] || cp "$HOME/.cache/blaze/v2/serve.log" "$out/serve.log"
           du -sh "$out"
       - if: failure()
         uses: actions/upload-artifact@v7

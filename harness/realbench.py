@@ -12,9 +12,9 @@ report gives the median, min and max.
   cold        per run, in this order: `cargo build` with an empty target directory;
               `blaze build` with an empty target directory, no daemon and an empty
               store; the same with the store filled beforehand by a blaze build of the same
-              commit in another checkout (WORK/<project>/b). For blaze two times: until
-              the command returns (cargo's build through the wrapper) and until the daemon
-              says the checkout is ready (loaded, and every program built once by it).
+              commit in another checkout (WORK/<project>/b). The command returns once the
+              daemon built it (v1 also timed until its worker said the checkout was ready;
+              v2 has no workers, and nothing goes on after the command returns).
   noop        `cargo build` and `blaze build` with nothing changed.
   edits       main: a statement added to the body of the program's own `main`;
               lib: the same in a function of a library of the workspace the program uses;
@@ -24,19 +24,26 @@ report gives the median, min and max.
               `--version` and with a small real command line, and their stdout, stderr and
               exit status must be the same.
 
-`--pause S` waits S seconds once the daemon is ready, before the no-op and the edits, as a
-person would before the first edit: what the daemon does by itself once ready is then over.
+`--pause S` waits S seconds after the setup build, before the no-op and the edits, as a
+person would before the first edit.
+
+Every `blaze build` timed runs with `--message-format=json`, and the row says how the daemon
+served it from its `blaze-work` line: `daemon, patched` or `daemon, placed` (how the request
+linked), or `NOT SERVED` when it printed none.
 
 Every warm `blaze build` (no-op and edits) runs with BLAZE_PROFILE, and the row keeps
 where the time of its median run went: the client's breakdown of its wall time into steps of
-the client, the daemon and the worker, plus the time outside the client (cargo, process
+the client and the daemon, plus the time outside the client (cargo, process
 start). `--table FILE` prints the results table and that breakdown table.
 
 Results go to WORK/realbench.json (rows replaced per project) and a table on stdout.
 """
-import asyncio, json, os, re, shutil, statistics, subprocess, sys, time
+import asyncio, json, os, shutil, statistics, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import worked  # noqa: E402
+
 ROOT = os.path.dirname(HERE)
 BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine")
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
@@ -122,47 +129,16 @@ async def run(argv, cwd, env, step, timeout=STEP_SECS, check=True):
     return took, proc.returncode, out, err
 
 
-def how_built(stderr):
-    """Whether the daemon built it, or why cargo did (as `blaze_cli.py` reads it)."""
-    reason = re.search(r"^blaze: (?:bug: )?(.*?); (building with cargo|this is `cargo \w+`)(?:, which .*)?$", stderr, re.M)
-    if reason:
-        return "cargo: " + reason[1]
-    kept = re.search(r"^blaze: (.*); nothing has changed since cargo built$", stderr, re.M)
-    if kept:
-        return "unchanged"
-    return "daemon" if "[blaze]" in stderr else "cargo"
+# A `blaze build` timed, with the `blaze-work` line `how_built` reads.
+BUILD = ["blaze", "build", "--message-format=json"]
 
 
-def checking(root):
-    """Whether the `cargo check` that `blaze` starts after cargo built runs below root."""
-    for pid in filter(str.isdigit, os.listdir("/proc")):
-        try:
-            words = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
-            if b"check" in words[1:2] and os.readlink(f"/proc/{pid}/cwd").startswith(root):
-                return True
-        except OSError:
-            pass
-    return False
-
-
-async def wait_ready(ws, env, began, step):
-    """Seconds from `began` until the daemon says `ws` is ready; then waits for the
-    background `cargo check` too, so that it does not run under the next timing."""
-    async with asyncio.timeout(STEP_SECS):
-        while True:
-            _, _, out, _ = await run(["blaze", "status"], ws, env, step, check=False)
-            states = re.findall(rf"^    {re.escape(ws)}: (.*)$", out, re.M)
-            if states and not any(s.startswith("loading") for s in states):
-                ready = time.monotonic() - began
-                if not all(s == "ready" for s in states):
-                    raise RuntimeError(f"{step}: daemon did not load {ws}: {states}")
-                break
-            if re.search(r"^daemon: not running$", out, re.M) and time.monotonic() - began > 30:
-                raise RuntimeError(f"{step}: no daemon: {out[-800:]}")
-            await asyncio.sleep(0.1)
-        while checking(ws):
-            await asyncio.sleep(0.25)
-    return ready
+def how_built(stdout):
+    """How the daemon served a `blaze build --message-format=json`, from its `blaze-work` line:
+    how the request linked (`patched` or `placed`). A build without one was not served. (v1
+    read here why cargo built instead; v2 has no cargo to fall back to.)"""
+    works = worked(stdout)
+    return f"daemon, {works[-1].link}" if works else "NOT SERVED"
 
 
 async def traced(argv, cwd, env, step, trace):
@@ -231,7 +207,8 @@ async def project(name, spec, work, runs, parts, pause=0.0):
         await run(["blaze", "stop"], cwd, env, f"{name} stop", check=False)
 
     async def blaze_cold(label, seed, i, cwd=ws, target=tr):
-        """A build in a new home with no daemon: its store empty, or a copy of `seed`'s."""
+        """A build in a new home with no daemon: its store empty, or a copy of `seed`'s. Its
+        seconds, how it was built and its environment."""
         home = os.path.join(top, f"home-{label}-{i}")
         shutil.rmtree(home, ignore_errors=True)
         os.makedirs(home, mode=0o700)
@@ -239,32 +216,31 @@ async def project(name, spec, work, runs, parts, pause=0.0):
             shutil.copytree(seed, store_of(home), symlinks=True)
         shutil.rmtree(target, ignore_errors=True)
         env = base_env(home, target)
-        began = time.monotonic()
-        took, _, _, err = await run(["blaze", "build"], cwd, env, f"{name} {label} {i} build")
-        ready = await wait_ready(cwd, env, began, f"{name} {label} {i} ready")
-        print(f"  {label:16} run {i}: build {took:7.2f}s  ready {ready:7.2f}s  ({how_built(err)})", flush=True)
-        return took, ready, env
+        took, _, out, _ = await run(BUILD, cwd, env, f"{name} {label} {i} build")
+        how = how_built(out)
+        print(f"  {label:16} run {i}: build {took:7.2f}s  ({how})", flush=True)
+        return took, how, env
 
     if "cold" in parts:
         # The warm store: one blaze build of the same commit in the other checkout.
-        _, ready_b, env_b = await blaze_cold("store-fill", None, 0, cwd=other, target=os.path.join(top, "t-b"))
+        fill_b, _, env_b = await blaze_cold("store-fill", None, 0, cwd=other, target=os.path.join(top, "t-b"))
         await stop(env_b, other)
-        cargo_t, cold_b, cold_r, warm_b, warm_r = [], [], [], [], []
+        cargo_t, cold_b, cold_h, warm_b, warm_h = [], [], [], [], []
         for i in range(1, runs + 1):
             shutil.rmtree(tc, ignore_errors=True)
             took, _, _, _ = await run(["cargo", "build"], ws, cargo_env, f"{name} cargo cold {i}")
             cargo_t.append(took)
             print(f"  {'cargo cold':16} run {i}: {took:7.2f}s", flush=True)
-            b, r, env = await blaze_cold("empty-store", None, i)
-            cold_b.append(b); cold_r.append(r)
+            b, h, env = await blaze_cold("empty-store", None, i)
+            cold_b.append(b); cold_h.append(h)
             await stop(env, ws)
             shutil.rmtree(env["BLAZE_HOME"], ignore_errors=True)
-            b, r, env = await blaze_cold("warm-store", warm_store, i)
-            warm_b.append(b); warm_r.append(r)
+            b, h, env = await blaze_cold("warm-store", warm_store, i)
+            warm_b.append(b); warm_h.append(h)
             if i < runs:
                 await stop(env, ws)
-        row["cold"] = dict(cargo=summary(cargo_t), blaze_build=summary(cold_b), blaze_ready=summary(cold_r),
-                           warm_store_build=summary(warm_b), warm_store_ready=summary(warm_r), store_fill_ready=round(ready_b, 3))
+        row["cold"] = dict(cargo=summary(cargo_t), blaze_build=summary(cold_b), blaze_built=cold_h,
+                           warm_store_build=summary(warm_b), warm_store_built=warm_h, store_fill_build=round(fill_b, 3))
         shutil.rmtree(os.path.join(top, "t-b"), ignore_errors=True)
     # The daemon of the last warm-store run serves what follows; start one if there is none.
     env = base_env(os.path.join(top, "home-main"), tr)
@@ -273,9 +249,7 @@ async def project(name, spec, work, runs, parts, pause=0.0):
     else:
         os.makedirs(env["BLAZE_HOME"], mode=0o700, exist_ok=True)
         await run(["cargo", "build"], ws, cargo_env, f"{name} cargo setup")
-        began = time.monotonic()
         await run(["blaze", "build"], ws, env, f"{name} blaze setup")
-        await wait_ready(ws, env, began, f"{name} ready")
     await run(["cargo", "build"], ws, cargo_env, f"{name} cargo settle")
     await asyncio.sleep(pause)
     # The linker each side's program was linked with.
@@ -286,8 +260,8 @@ async def project(name, spec, work, runs, parts, pause=0.0):
     if "noop" in parts:
         c, r, built, spent = [], [], [], []
         for i in range(1, runs + 1):
-            took, _, _, err, steps = await traced(["blaze", "build"], ws, env, f"{name} noop blaze {i}", trace)
-            r.append(took); built.append(how_built(err)); spent.append(steps)
+            took, _, out, _, steps = await traced(BUILD, ws, env, f"{name} noop blaze {i}", trace)
+            r.append(took); built.append(how_built(out)); spent.append(steps)
             took, _, _, _ = await run(["cargo", "build"], ws, cargo_env, f"{name} noop cargo {i}")
             c.append(took)
             print(f"  {'no-op':16} run {i}: blaze {r[-1]:6.2f}s ({built[-1]})  cargo {took:6.2f}s", flush=True)
@@ -302,8 +276,8 @@ async def project(name, spec, work, runs, parts, pause=0.0):
             try:
                 for i in range(1, runs + 1):
                     open(file, "w").write(edit_text(kind, spec, pristine, i))
-                    took, _, _, err, steps = await traced(["blaze", "build"], ws, env, f"{name} {kind} blaze {i}", trace)
-                    r.append(took); built.append(how_built(err)); spent.append(steps)
+                    took, _, out, _, steps = await traced(BUILD, ws, env, f"{name} {kind} blaze {i}", trace)
+                    r.append(took); built.append(how_built(out)); spent.append(steps)
                     took, _, _, _ = await run(["cargo", "build"], ws, cargo_env, f"{name} {kind} cargo {i}")
                     c.append(took)
                     a, b = await outputs(ws, tr, spec, f"{name} {kind} run"), await outputs(ws, tc, spec, f"{name} {kind} run")
@@ -336,10 +310,8 @@ def table(rows):
             continue
         cold = row.get("cold")
         if cold:
-            lines.append(f"| {label} | cold, empty store: command returns | {cell(cold['cargo'])} | {cell(cold['blaze_build'])} | {ratio(cold['cargo'], cold['blaze_build'])} | cargo (wrapper) |")
-            lines.append(f"| | cold, empty store: daemon ready | | {cell(cold['blaze_ready'])} | {ratio(cold['cargo'], cold['blaze_ready'])} | |")
-            lines.append(f"| | cold, warm store: command returns | | {cell(cold['warm_store_build'])} | {ratio(cold['cargo'], cold['warm_store_build'])} | cargo (wrapper) |")
-            lines.append(f"| | cold, warm store: daemon ready | | {cell(cold['warm_store_ready'])} | {ratio(cold['cargo'], cold['warm_store_ready'])} | |")
+            lines.append(f"| {label} | cold, empty store | {cell(cold['cargo'])} | {cell(cold['blaze_build'])} | {ratio(cold['cargo'], cold['blaze_build'])} | {', '.join(sorted(set(cold.get('blaze_built', []))))} |")
+            lines.append(f"| | cold, warm store | | {cell(cold['warm_store_build'])} | {ratio(cold['cargo'], cold['warm_store_build'])} | {', '.join(sorted(set(cold.get('warm_store_built', []))))} |")
         if "noop" in row:
             n = row["noop"]
             lines.append(f"| | no-op | {cell(n['cargo'])} | {cell(n['blaze'])} | {ratio(n['cargo'], n['blaze'])} | {', '.join(sorted(set(n['built'])))} |")

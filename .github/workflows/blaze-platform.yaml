@@ -338,12 +338,13 @@ jobs:
           HARNESSES: ${{ inputs.harnesses }}
         run: |
           uv run --frozen --no-dev python harness/focused.py run "{\"harnesses\": $HARNESSES}"
-      # What the daemons said when a harness failed (each harness keeps its daemon's log in a
-      # temporary directory of its own), and the report of a process that crashed on macOS.
+      # What the daemons said when a harness failed (each harness's daemon logs in a temporary
+      # home of its own: `serve.log` there or in its `v2/`), and the report of a process that
+      # crashed on macOS.
       - name: Daemon logs
         if: failure()
         run: |
-          find "${TMPDIR:-/tmp}" /tmp -maxdepth 2 -name daemon.log 2>/dev/null | sort -u | while read -r log; do
+          find "${TMPDIR:-/tmp}" /tmp -maxdepth 5 -name serve.log 2>/dev/null | sort -u | while read -r log; do
             echo "::group::$log"; tail -n 60 "$log"; echo "::endgroup::"
           done
           for report in "$HOME"/Library/Logs/DiagnosticReports/blaze-engine*; do
