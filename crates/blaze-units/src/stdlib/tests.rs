@@ -115,6 +115,26 @@ fn a_feature_of_no_cfg_changes_none() {
     assert!(cfgs.iter().any(|it| it == "target_feature=\"sse2\""), "{cfgs:?}");
 }
 
+/// Apple's M1 to M3 are aliases in LLVM (`apple-m1` of `apple-a14`), which
+/// `rustc --print target-cpus` leaves out and `-C target-cpu` takes: each has its CPU's
+/// features, `apple-m1`'s the target's own (it is the target's CPU); a name of no CPU is
+/// refused, naming it.
+#[test]
+fn an_llvm_alias_of_a_cpu_is_that_cpu() {
+    let triple = "aarch64-apple-darwin";
+    let cfg = |cpu: &str| {
+        target_cfg(triple, &CfgArgs { target_cpu: Some(cpu.to_owned()), ..CfgArgs::default() })
+    };
+    let aliases = [("apple-m1", "apple-a14"), ("apple-m2", "apple-a15"), ("apple-m3", "apple-a16")];
+    for (alias, cpu) in aliases {
+        assert_eq!(cfg(alias).unwrap(), cfg(cpu).unwrap(), "{alias}");
+    }
+    assert_eq!(cfg("apple-m1").unwrap(), target_cfg(triple, &CfgArgs::default()).unwrap());
+    assert!(cfg("apple-m4").unwrap().contains(&"target_feature=\"sme\"".to_owned()));
+    let refused = cfg("apple-m99").unwrap_err();
+    assert!(refused.contains("apple-m99") && refused.contains(triple), "{refused}");
+}
+
 #[test]
 fn the_features_that_change_no_cfg_are_told() {
     let triple = "x86_64-unknown-linux-gnu";

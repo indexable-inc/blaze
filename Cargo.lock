@@ -1904,6 +1904,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "target-features",
  "toml",
  "url",
 ]
@@ -3790,6 +3791,7 @@ dependencies = [
  "span",
  "stdx",
  "syntax",
+ "target-features",
  "target-lexicon",
  "tracing",
  "triomphe",

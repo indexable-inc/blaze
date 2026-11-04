@@ -269,6 +269,16 @@ pub enum PlanError {
     /// build's or a tiered run's), and the target has no stencil library
     /// ([`Toolchain::stencils`]).
     NoStencils { origin: Origin, level: OptLevel, target: String },
+    /// The code must be stencils (the first tier of a live build's or a tiered run's, or every
+    /// level of `codegen-backend = "stencil"`), and the toolchain's CPU lacks `off`, a feature
+    /// of the target's baseline CPU, whose code the stencils are ([`Toolchain::lacks_baseline`]).
+    StencilsNeedBaseline {
+        origin: Origin,
+        level: OptLevel,
+        target: String,
+        cpu: String,
+        off: String,
+    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -286,6 +296,14 @@ impl std::fmt::Display for PlanError {
                 "{origin:?} is compiled at opt-level {level:?}, whose native code starts as \
                  copy-and-patch stencils, and {target} has no stencil library: native code is \
                  never Cranelift's (AGENTS.md rule 8)"
+            ),
+            PlanError::StencilsNeedBaseline { origin, level, target, cpu, off } => write!(
+                f,
+                "{origin:?} is compiled at opt-level {level:?} as copy-and-patch stencils (a live \
+                 build's or a tiered run's first tier, or `codegen-backend = \"stencil\"`), which \
+                 are the code of {target}'s baseline CPU, and `-C target-cpu={cpu}` has no `{off}` \
+                 of it: build this CPU's code without `--live`, tiering or the stencil backend \
+                 (LLVM compiles it), or for a CPU that has `{off}`"
             ),
         }
     }
@@ -363,6 +381,17 @@ impl Policy {
             false => Backend::Cranelift { speed: !member },
             true => level.backend(llvm).ok_or(PlanError::NoLlvm { origin: *origin, level })?,
         };
+        // Stencils are the code of the target's baseline CPU: a CPU that lacks one of its
+        // features (`-C target-cpu=apple-a7`, which has no LSE) can't run them, and its code at a
+        // stencil level is LLVM's at that level, made for its CPU as rustc's is. Which backend
+        // is a function of the toolchain, a part of the key, never of a failure.
+        let lacks = self.toolchain.lacks_baseline();
+        let backend = match (backend, lacks) {
+            (Backend::Stencil, Some(_)) if llvm && !profile.stencils => {
+                Backend::Llvm { opt: if level == OptLevel::O0 { 0 } else { 1 } }
+            }
+            (backend, _) => backend,
+        };
         let live = self.mode == Mode::Live;
         let spec = Spec {
             // A `Spec` owns its toolchain (an interface across crates); could be an interned ID.
@@ -408,6 +437,18 @@ impl Policy {
                 origin: *origin,
                 level: asked,
                 target: self.toolchain.target.clone(),
+            });
+        }
+        if let (true, Some(off)) = (stencils, lacks) {
+            return Err(PlanError::StencilsNeedBaseline {
+                origin: *origin,
+                level: asked,
+                // clone: an error names the target, the CPU and the feature
+                target: self.toolchain.target.clone(),
+                // clone: an error names the CPU
+                cpu: self.toolchain.cpu.clone(),
+                // alloc: an error names the feature
+                off: off.to_owned(),
             });
         }
         if counted {
@@ -579,6 +620,28 @@ mod tests {
         let mut folding = wasm(OptLevel::O0);
         folding.fold = true;
         assert!(folding.choose(&member(), None).unwrap().first.fold);
+    }
+
+    /// A CPU that lacks a feature of the baseline CPU the stencils are made for runs no
+    /// stencil: its code at a stencil level is LLVM's at that level, and code that must be
+    /// stencils (a live build's first tier) is an error naming the CPU and the feature.
+    #[test]
+    fn a_cpu_without_the_baselines_features_is_llvms_below_its_levels() {
+        let lacking = |level, mode| {
+            let mut policy = policy(level, mode);
+            policy.toolchain.cpu = "cortex-a35".to_owned();
+            policy.toolchain.features = vec!["-lse".to_owned()];
+            policy
+        };
+        let o0 = lacking(OptLevel::O0, Mode::Output).choose(&member(), None).unwrap();
+        assert_eq!(o0.first.backend, Backend::Llvm { opt: 0 });
+        let o1 = lacking(OptLevel::O1, Mode::Output).choose(&member(), None).unwrap();
+        assert_eq!(o1.first.backend, Backend::Llvm { opt: 1 });
+        let live = lacking(OptLevel::O0, Mode::Live).choose(&member(), None);
+        let live = live.unwrap_err().to_string();
+        assert!(live.contains("cortex-a35") && live.contains("`lse`"), "{live}");
+        let plus = policy(OptLevel::O0, Mode::Output);
+        assert_eq!(plus.choose(&member(), None).unwrap().first.backend, Backend::Stencil);
     }
 
     #[test]

@@ -50,6 +50,7 @@ include = [
   "tools/astlog/scan.py",
   "tools/devirt/*.py",
   "tools/layout",
+  "tools/cpus.py",
   "tools/similar",
   "tools/typed-input",
   "tools/v2",
@@ -89,6 +90,7 @@ include = [
   "tools/astlog/scan.py",
   "tools/devirt",
   "tools/layout",
+  "tools/cpus.py",
   "tools/typed-input",
   "tools/v2",
 ]

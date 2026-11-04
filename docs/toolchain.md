@@ -109,7 +109,8 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    and the flake.
 2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
    target specs depend on the host rustc was built for; the three are merged into
-   `crates/blaze-units/src/stdlib/rustc.json`.
+   `crates/blaze-units/src/stdlib/rustc.json`, and `tools/cpus.py` writes the CPU table
+   (`target_features::cpus`) from it.
 3. The pull request `toolchain: pin nightly-YYYY-MM-DD` is opened, or updated when one is open,
    which runs the merge gate, and the release train is started on the branch and on
    `toolchain/base`, the main commit the branch is on, to compare with. (main's own trains are

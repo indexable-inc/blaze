@@ -174,8 +174,9 @@ installs the nightly with rustup. Each step names itself when it fails.
 What it leaves to a person, and prints at the end:
 
 1. `python3 harness/answers.py --write` on x86-64 Linux, AArch64 Linux and arm64 macOS, since
-   the target specs depend on the host rustc was built for; commit
-   `crates/blaze-units/src/stdlib/rustc.json`.
+   the target specs depend on the host rustc was built for; then
+   `uv run --frozen python tools/cpus.py '{"write": true}'` for the CPU table
+   (`crates/target-features/src/cpus/table.rs`); commit both.
 2. `cargo build -p blaze-engine --release`, fixing what the new `rustc_abi` and standard library
    ask for, and mirroring by hand what changed in rustc: the Rust ABI, vtables, `TypeId`,
    symbol names, new intrinsics and lang items. The move to `nightly-2026-10-25` needed
@@ -400,7 +401,10 @@ no zlib, zstd, libxml2 or terminfo, on the release's runners (Ubuntu 22.04 for a
 macOS 13 as the deployment target, the static CRT on Windows). For a target `llvm.json` has no
 archive for, run the workflow for it and add the `targets` entry its summary prints. To move the pin, change
 `ref`, `commit` and `version` in `llvm.json`, run the workflow, and write the `targets` its
-summary prints (`llvm.py pin`). LLVM's own release archives do not do: the macOS ones hold
+summary prints (`llvm.py pin`), then write the new LLVM's CPU aliases (`apple-m1` of `apple-a14`, which
+`-C target-cpu` takes and `rustc --print target-cpus` leaves out) with
+`uv run --frozen python tools/cpus.py '{"write": true, "fetch_llvm": true}'`, which writes
+crates/target-features/llvm_cpus.json and the CPU table (`target_features::cpus`) from it. LLVM's own release archives do not do: the macOS ones hold
 bitcode, and the Linux ones need zlib, zstd and libxml2.
 
 ### The stencil pin

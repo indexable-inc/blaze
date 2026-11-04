@@ -19,6 +19,10 @@
 //! the target spec's facts and every `target_feature="..."` line made once. [`target_cfg`] is
 //! then a binary search for the triple, a few word operations per `-C target-feature`, and the
 //! copy of the output; it reads no lock (a `OnceLock` once set is one atomic load).
+//!
+//! The CPUs of `-C target-cpu` and the features each has are `target_features::cpus`'s, the one
+//! table of them (`tools/cpus.py` writes it from `cpus` and `cpu_features` here and the pinned
+//! LLVM's aliases of those CPUs, such as `apple-m1` of `apple-a14`).
 
 use std::{borrow::Cow, collections::BTreeMap};
 
@@ -74,11 +78,8 @@ struct RawTarget {
     /// those that need it.
     #[serde(default)]
     features_off: BTreeMap<String, Vec<String>>,
-    /// Each CPU of `-C target-cpu`, by the index of its `target_feature`s in `cpu_features`.
-    #[serde(default)]
-    cpus: BTreeMap<String, usize>,
-    #[serde(default)]
-    cpu_features: Vec<Vec<String>>,
+    // `cpus` and `cpu_features` are read by `tools/cpus.py` into `target_features::cpus`,
+    // which is what blaze reads of CPUs.
     /// The cfgs besides `target_feature` a feature has: wasm's `atomics`, `target_has_threads`.
     #[serde(default)]
     feature_cfgs: BTreeMap<String, Vec<String>>,
@@ -202,8 +203,6 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
         features,
         llvm_features,
         features_off,
-        cpus,
-        cpu_features,
         feature_cfgs,
         other_features,
     } = raw;
@@ -216,7 +215,8 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
             names.extend(turned.iter().map(String::as_str));
         }
     }
-    names.extend(cpu_features.iter().flatten().map(String::as_str));
+    let cpus = target_features::cpus::of(triple);
+    names.extend(cpus.iter().flat_map(|it| it.sets().iter().copied().flatten().copied()));
     names.extend(feature_cfgs.keys().map(String::as_str));
     names.sort_unstable();
     names.dedup();
@@ -281,11 +281,24 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
             pulls[usize::from(index(needed))].insert(at);
         }
     }
-    let cpus = cpus
+    // Each CPU of the target, sorted by name, for the binary search of `tuned`.
+    let cpus: Box<[(Box<str>, Option<Features>)]> = cpus
         .iter()
-        .map(|(name, at)| {
-            (name.clone().into_boxed_str(), cpu_features.get(*at).map(|it| set(it.as_slice())))
+        .flat_map(|it| {
+            let set = move |at: u16| it.sets().get(usize::from(at)).copied();
+            it.names().iter().map(move |&(name, at)| (name, set(at)))
         })
+        .map(|(name, of)| {
+            let set = of.map(|list| {
+                let mut bits = Features::default();
+                for &feature in list {
+                    bits.insert(index(feature));
+                }
+                bits
+            });
+            (Box::<str>::from(name), set)
+        })
+        // alloc: a target's columns, compiled once per process
         .collect();
     let feature_cfgs = feature_cfgs
         .iter()
@@ -461,7 +474,12 @@ impl Compiled {
         let mut have = match cpu {
             Some((name, _)) => {
                 let at = self.cpus.binary_search_by(|(it, _)| (**it).cmp(name)).map_err(|_| {
-                    format!("`-C target-cpu={name}` is no CPU blaze knows of target `{triple}`")
+                    target_features::cpus::UnknownCpu {
+                        triple: triple.to_owned(),
+                        cpu: name.to_owned(),
+                        known_target: target_features::cpus::of(triple).is_some(),
+                    }
+                    .to_string()
                 })?;
                 self.cpus[at].1.ok_or_else(|| {
                     format!("blaze's data of target `{triple}` lists no features of CPU `{name}`")
