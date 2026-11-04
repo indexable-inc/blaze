@@ -8,9 +8,14 @@ use std::time::{Duration, Instant};
 
 pub fn run(path: &str) -> Result<(), String> {
     // HARNESS_NATIVE_SHOT_BACKING: device pixels a point (2, a Retina display, unless set; 1 for a standard one).
-    let backing = std::env::var("HARNESS_NATIVE_SHOT_BACKING").ok().and_then(|s| s.parse::<f32>().ok()).filter(|b| *b > 0.0).unwrap_or(2.0);
+    let backing = std::env::var("HARNESS_NATIVE_SHOT_BACKING")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|b| *b > 0.0)
+        .unwrap_or(2.0);
     let (w, h) = (1280.0_f32, 800.0_f32);
-    let mut renderer = Renderer::new(objc2_metal::MTLCreateSystemDefaultDevice().ok_or("no Metal device")?);
+    let mut renderer =
+        Renderer::new(objc2_metal::MTLCreateSystemDefaultDevice().ok_or("no Metal device")?);
     let mut app = App::new(Arc::new(|| {}))?;
     app.persist = false;
     app.set_gpu_clock(renderer.gpu_clock());
@@ -47,40 +52,69 @@ pub fn run(path: &str) -> Result<(), String> {
     }
     // HARNESS_NATIVE_SHOT_CHROME `strip,title_x`: a title-bar strip as the window would report it (points), so the title
     // bar and its subtitle show; HARNESS_NATIVE_SHOT_UNFOCUSED: drawn as a window that is not key (the title dimmed).
-    if let Some(c) = std::env::var("HARNESS_NATIVE_SHOT_CHROME").ok().map(|s| s.split(',').filter_map(|n| n.trim().parse::<f32>().ok()).collect::<Vec<_>>()).filter(|v| v.len() == 2) {
+    if let Some(c) = std::env::var("HARNESS_NATIVE_SHOT_CHROME")
+        .ok()
+        .map(|s| s.split(',').filter_map(|n| n.trim().parse::<f32>().ok()).collect::<Vec<_>>())
+        .filter(|v| v.len() == 2)
+    {
         app.set_chrome(crate::app::Chrome { strip: c[0], title_x: c[1] });
     }
     if std::env::var_os("HARNESS_NATIVE_SHOT_UNFOCUSED").is_some() {
         app.focused = false;
     }
     // HARNESS_NATIVE_SHOT_ZOOM: steps of cmd-= (negative: cmd--) from the default zoom.
-    let zoom: i32 = std::env::var("HARNESS_NATIVE_SHOT_ZOOM").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let zoom: i32 =
+        std::env::var("HARNESS_NATIVE_SHOT_ZOOM").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     for _ in 0..zoom.unsigned_abs() {
         app.step_zoom(zoom.signum());
     }
-    let secs = std::env::var("HARNESS_NATIVE_SHOT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2.5);
+    let secs =
+        std::env::var("HARNESS_NATIVE_SHOT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2.5);
     // Pointer input (window points): clicks `x,y;x,y` one every 0.4 s from 1 s in, and a drag `x0,y0,x1,y1` at 0.8 s.
-    let nums = |s: &str| s.split(',').filter_map(|n| n.trim().parse::<f32>().ok()).collect::<Vec<_>>();
-    let mut clicks: Vec<(f32, f32, f32)> = std::env::var("HARNESS_NATIVE_SHOT_CLICK").unwrap_or_default().split(';').map(nums).filter(|v| v.len() == 2).enumerate().map(|(i, v)| (1.0 + 0.4 * i as f32, v[0], v[1])).collect();
-    let mut drag = std::env::var("HARNESS_NATIVE_SHOT_DRAG").ok().map(|s| nums(&s)).filter(|v| v.len() == 4);
+    let nums =
+        |s: &str| s.split(',').filter_map(|n| n.trim().parse::<f32>().ok()).collect::<Vec<_>>();
+    let mut clicks: Vec<(f32, f32, f32)> = std::env::var("HARNESS_NATIVE_SHOT_CLICK")
+        .unwrap_or_default()
+        .split(';')
+        .map(nums)
+        .filter(|v| v.len() == 2)
+        .enumerate()
+        .map(|(i, v)| (1.0 + 0.4 * i as f32, v[0], v[1]))
+        .collect();
+    let mut drag =
+        std::env::var("HARNESS_NATIVE_SHOT_DRAG").ok().map(|s| nums(&s)).filter(|v| v.len() == 4);
     let mut up_next = false;
     // HARNESS_NATIVE_SHOT_HOVER `x,y,t`: the pointer moves to (x, y) at t seconds (a hover mid-spring for a shot just after).
-    let mut hover = std::env::var("HARNESS_NATIVE_SHOT_HOVER").ok().map(|s| nums(&s)).filter(|v| v.len() == 3);
+    let mut hover =
+        std::env::var("HARNESS_NATIVE_SHOT_HOVER").ok().map(|s| nums(&s)).filter(|v| v.len() == 3);
     // HARNESS_NATIVE_SHOT_KEY `k,t`: Command-k at t seconds, into this offscreen app only (`w,2.4`: archive the selected
     // object, which kills its session). With a `+`, the keys as a binding names them: `cmd+shift+t,1.5`, `none+down,2`
     // (`none+` a key with no modifiers: a tree arrow, the palette's Return), dispatched as the window would.
     // HARNESS_NATIVE_SHOT_TYPE `text,t`: `text` typed at t seconds, into this offscreen app only (the palette's query
     // when it is open, the Archive's search when it has the keyboard).
-    let mut typed = std::env::var("HARNESS_NATIVE_SHOT_TYPE").ok().and_then(|s| s.rsplit_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?))));
+    let mut typed = std::env::var("HARNESS_NATIVE_SHOT_TYPE").ok().and_then(|s| {
+        s.rsplit_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?)))
+    });
     // Several as `k,t;k,t` (rapid cmd+] presses).
-    let mut keys: Vec<(String, f32)> = std::env::var("HARNESS_NATIVE_SHOT_KEY").unwrap_or_default().split(';').filter_map(|s| s.split_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?)))).collect();
+    let mut keys: Vec<(String, f32)> = std::env::var("HARNESS_NATIVE_SHOT_KEY")
+        .unwrap_or_default()
+        .split(';')
+        .filter_map(|s| {
+            s.split_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?)))
+        })
+        .collect();
     // HARNESS_NATIVE_SHOT_SEQ `t0,t1`: every frame from t0 to t1 seconds also written, as `<path>-<ms>.png` (time is then
     // counted in frames of 1/60 s, so a slow readback does not skip animation).
-    let seq = std::env::var("HARNESS_NATIVE_SHOT_SEQ").ok().map(|s| nums(&s)).filter(|v| v.len() == 2);
+    let seq =
+        std::env::var("HARNESS_NATIVE_SHOT_SEQ").ok().map(|s| nums(&s)).filter(|v| v.len() == 2);
     let mut frames = 0u32;
     // HARNESS_NATIVE_SHOT_WHEEL `x,y,dy,t`: a trackpad swipe of `dy` points (negative: toward the end) over (x, y) from t
     // seconds: a began, changed events over 8 frames, an ended.
-    let mut wheel = std::env::var("HARNESS_NATIVE_SHOT_WHEEL").ok().map(|s| nums(&s)).filter(|v| v.len() == 4).map(|v| (v, 0usize));
+    let mut wheel = std::env::var("HARNESS_NATIVE_SHOT_WHEEL")
+        .ok()
+        .map(|s| nums(&s))
+        .filter(|v| v.len() == 4)
+        .map(|v| (v, 0usize));
     let mut at = (0.0f32, 0.0f32);
     let (left, none) = (crate::term::Button::Left, crate::app::KeyMods::default());
     let start = Instant::now();
@@ -100,7 +134,10 @@ pub fn run(path: &str) -> Result<(), String> {
                 1..=8 => (4, v[2] / 8.0),
                 _ => (8, 0.0),
             };
-            app.scroll_wheel(crate::app::Wheel { dx: 0.0, dy, precise: true, phase, momentum: 0 }, none);
+            app.scroll_wheel(
+                crate::app::Wheel { dx: 0.0, dy, precise: true, phase, momentum: 0 },
+                none,
+            );
             *n += 1;
             if *n > 9 {
                 wheel = None;
@@ -131,11 +168,19 @@ pub fn run(path: &str) -> Result<(), String> {
             up_next = true;
         }
         let r = &renderer;
-        let draw = app.frame((w, h), backing, 1.0 / 60.0, &mut |x, y, gw, gh, b| r.upload_atlas(x, y, gw, gh, b));
+        let draw = app.frame((w, h), backing, 1.0 / 60.0, &mut |x, y, gw, gh, b| {
+            r.upload_atlas(x, y, gw, gh, b)
+        });
         if seq.as_ref().is_some_and(|v| t >= v[0] && t <= v[1]) {
             renderer.render(&draw, Dest::Texture(tex.clone()));
             let px = renderer.read(&tex);
-            write_png(&format!("{path}-{:05}.png", (t * 1000.0).round() as u32), &app, &px, (w * backing) as u32, (h * backing) as u32)?;
+            write_png(
+                &format!("{path}-{:05}.png", (t * 1000.0).round() as u32),
+                &app,
+                &px,
+                (w * backing) as u32,
+                (h * backing) as u32,
+            )?;
             eprintln!("harness-native: seq t={t:.3} {}", app.probe());
         }
         if t >= secs {
@@ -203,7 +248,14 @@ fn press(app: &mut App, spec: &str) {
         app.shortcut(code, ch, c.mods())
     } else {
         let text = ch.map(String::from).unwrap_or_default();
-        app.key(&crate::term::KeyIn { code, text: &text, unshifted: ch, mods: c.mods(), action: crate::term::KeyAction::Press, composing: false });
+        app.key(&crate::term::KeyIn {
+            code,
+            text: &text,
+            unshifted: ch,
+            mods: c.mods(),
+            action: crate::term::KeyAction::Press,
+            composing: false,
+        });
         crate::app::Outcome::Done
     };
     eprintln!("harness-native: shot key {spec}: {out:?}");

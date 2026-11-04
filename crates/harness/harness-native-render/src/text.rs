@@ -41,6 +41,9 @@ pub struct TypeLook {
     pub item: f32,
     pub indent: f32,
     pub heading_tracking: f32,
+    /// Every character its own glyph: no ligatures or contextual alternates (`liga`, `calt` off), so code's `//` and `->`
+    /// read as typed. Off in the app (its fonts' own way); on in videos.
+    pub plain: bool,
 }
 
 /// Identity of a (font, size) pair, stable across layouts: the PostScript name and the size.
@@ -149,7 +152,8 @@ pub struct Hole {
 pub const HOLE: char = '\u{00A0}';
 
 /// Text's fonts by (bold, italic): Inter, installed or den's own ([`bundled`]). Bold is Inter's semibold (600).
-const TEXT_FONTS: [[&str; 2]; 2] = [["Inter-Regular", "Inter-Italic"], ["Inter-SemiBold", "Inter-SemiBoldItalic"]];
+const TEXT_FONTS: [[&str; 2]; 2] =
+    [["Inter-Regular", "Inter-Italic"], ["Inter-SemiBold", "Inter-SemiBoldItalic"]];
 /// The text font's medium weight (500): Inter's Medium, installed or den's own.
 const MEDIUM_FONT: &str = "Inter-Medium";
 /// The Inter faces den ships (Inter 4.1, SIL OFL 1.1, fonts/inter), by PostScript name: a machine with no Inter of its
@@ -167,12 +171,18 @@ fn bundled(name: &str) -> Option<&'static [u8]> {
 
 /// Code's face, by PostScript name, the first installed: `$HARNESS_MONO` when set, else Berkeley Mono (installed under its
 /// owner's licence; never bundled), JetBrains Mono, SF Mono, Menlo; else the system's fixed-pitch font.
-const CODE_FONTS: [&str; 4] = ["BerkeleyMono-Regular", "JetBrainsMono-Regular", "SFMono-Regular", "Menlo-Regular"];
+const CODE_FONTS: [&str; 4] =
+    ["BerkeleyMono-Regular", "JetBrainsMono-Regular", "SFMono-Regular", "Menlo-Regular"];
 
 /// Code's font at `size` (code's scale already applied), its bold or slanted face when it has one.
 fn code_font(size: f32, weight: u16, italic: bool) -> Font {
     let env = std::env::var("HARNESS_MONO").ok();
-    let regular = env.iter().map(String::as_str).chain(CODE_FONTS).find_map(|n| Font::named(n, size)).unwrap_or_else(|| Font::fixed(size));
+    let regular = env
+        .iter()
+        .map(String::as_str)
+        .chain(CODE_FONTS)
+        .find_map(|n| Font::named(n, size))
+        .unwrap_or_else(|| Font::fixed(size));
     styled(regular, size, weight, italic)
 }
 
@@ -213,11 +223,23 @@ fn styled(regular: Font, size: f32, weight: u16, italic: bool) -> Font {
 /// 2.304 (SIL OFL 1.1, fonts/jetbrains-mono) and Symbols Nerd Font Mono 3.5.1 (fonts/nerd-symbols). Berkeley Mono is
 /// used when installed and never bundled.
 const TERM_BUNDLED: [(&str, &[u8]); 5] = [
-    ("JetBrainsMono-Regular.ttf", include_bytes!("../fonts/jetbrains-mono/JetBrainsMono-Regular.ttf")),
+    (
+        "JetBrainsMono-Regular.ttf",
+        include_bytes!("../fonts/jetbrains-mono/JetBrainsMono-Regular.ttf"),
+    ),
     ("JetBrainsMono-Bold.ttf", include_bytes!("../fonts/jetbrains-mono/JetBrainsMono-Bold.ttf")),
-    ("JetBrainsMono-Italic.ttf", include_bytes!("../fonts/jetbrains-mono/JetBrainsMono-Italic.ttf")),
-    ("JetBrainsMono-BoldItalic.ttf", include_bytes!("../fonts/jetbrains-mono/JetBrainsMono-BoldItalic.ttf")),
-    ("SymbolsNerdFontMono-Regular.ttf", include_bytes!("../fonts/nerd-symbols/SymbolsNerdFontMono-Regular.ttf")),
+    (
+        "JetBrainsMono-Italic.ttf",
+        include_bytes!("../fonts/jetbrains-mono/JetBrainsMono-Italic.ttf"),
+    ),
+    (
+        "JetBrainsMono-BoldItalic.ttf",
+        include_bytes!("../fonts/jetbrains-mono/JetBrainsMono-BoldItalic.ttf"),
+    ),
+    (
+        "SymbolsNerdFontMono-Regular.ttf",
+        include_bytes!("../fonts/nerd-symbols/SymbolsNerdFontMono-Regular.ttf"),
+    ),
 ];
 
 /// The Nerd Font symbols face and the colour emoji face, by PostScript name.
@@ -230,13 +252,18 @@ const EMOJI_FONT: &str = "AppleColorEmoji";
 pub fn register_term_fonts() {
     static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     DONE.get_or_init(|| {
-        let dir = std::env::var_os("HOME").map_or_else(std::env::temp_dir, std::path::PathBuf::from).join("Library/Caches/harness-native/fonts");
+        let dir = std::env::var_os("HOME")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
+            .join("Library/Caches/harness-native/fonts");
         let mut paths = Vec::new();
         for (name, bytes) in TERM_BUNDLED {
             let p = dir.join(name);
-            let same = std::fs::metadata(&p).is_ok_and(|m| m.len() == bytes.len() as u64) && std::fs::read(&p).is_ok_and(|b| b == bytes);
+            let same = std::fs::metadata(&p).is_ok_and(|m| m.len() == bytes.len() as u64)
+                && std::fs::read(&p).is_ok_and(|b| b == bytes);
             if !same {
-                if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&p, bytes)) {
+                if let Err(e) =
+                    std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&p, bytes))
+                {
                     eprintln!("harness-native: cannot write bundled font {}: {e}", p.display());
                     continue;
                 }
@@ -275,7 +302,12 @@ fn be_u16(t: &[u8], at: usize) -> Option<u16> {
 
 fn face_metrics(f: &Font) -> FaceMetrics {
     let size = f.size();
-    let upem = f.table_bytes(b"head").or_else(|| f.table_bytes(b"bhed")).and_then(|h| be_u16(&h, 18)).filter(|&u| u > 0).map_or(1000.0, f32::from);
+    let upem = f
+        .table_bytes(b"head")
+        .or_else(|| f.table_bytes(b"bhed"))
+        .and_then(|h| be_u16(&h, 18))
+        .filter(|&u| u > 0)
+        .map_or(1000.0, f32::from);
     let k = size / upem;
     let hhea = f.table_bytes(b"hhea");
     let os2 = f.table_bytes(b"OS/2");
@@ -283,9 +315,14 @@ fn face_metrics(f: &Font) -> FaceMetrics {
     let (ascent, descent, leading) = (|| {
         let ct = (f.ascent(), f.descent().abs(), f.leading().max(0.0));
         let Some(h) = hhea.as_deref() else { return ct };
-        let (ha, hd, hg) = (be_i16(h, 4).unwrap_or(0.0), be_i16(h, 6).unwrap_or(0.0), be_i16(h, 8).unwrap_or(0.0));
+        let (ha, hd, hg) =
+            (be_i16(h, 4).unwrap_or(0.0), be_i16(h, 6).unwrap_or(0.0), be_i16(h, 8).unwrap_or(0.0));
         let Some(o) = os2.as_deref() else { return (ha * k, -hd * k, hg * k) };
-        let (oa, od, og) = (be_i16(o, 68).unwrap_or(0.0), be_i16(o, 70).unwrap_or(0.0), be_i16(o, 72).unwrap_or(0.0));
+        let (oa, od, og) = (
+            be_i16(o, 68).unwrap_or(0.0),
+            be_i16(o, 70).unwrap_or(0.0),
+            be_i16(o, 72).unwrap_or(0.0),
+        );
         let typo = be_u16(o, 62).is_some_and(|s| s & (1 << 7) != 0);
         if typo {
             return (oa * k, -od * k, og * k);
@@ -299,14 +336,26 @@ fn face_metrics(f: &Font) -> FaceMetrics {
         let (wa, wd) = (be_u16(o, 74).map_or(0.0, f32::from), be_u16(o, 76).map_or(0.0, f32::from));
         (wa * k, wd * k, 0.0)
     })();
-    let cap = os2.as_deref().filter(|o| be_u16(o, 0).is_some_and(|v| v >= 2)).and_then(|o| be_i16(o, 88)).map_or_else(|| f.cap_height(), |c| c * k);
+    let cap = os2
+        .as_deref()
+        .filter(|o| be_u16(o, 0).is_some_and(|v| v >= 2))
+        .and_then(|o| be_i16(o, 88))
+        .map_or_else(|| f.cap_height(), |c| c * k);
     let (underline_pos, underline_thick) = post.as_deref().map_or((None, None), |p| {
         let (pos, thick) = (be_i16(p, 8).unwrap_or(0.0), be_i16(p, 10).unwrap_or(0.0));
         let broken = thick == 0.0;
         ((!(broken && pos == 0.0)).then_some(pos * k), (!broken).then_some(thick * k))
     });
     let advance = (32u8..127).map(|c| f.advance(f.glyph(char::from(c))) as f32).fold(0.0, f32::max);
-    FaceMetrics { advance: if advance > 0.0 { advance } else { size * 0.6 }, ascent, descent, leading, cap, underline_pos, underline_thick }
+    FaceMetrics {
+        advance: if advance > 0.0 { advance } else { size * 0.6 },
+        ascent,
+        descent,
+        leading,
+        cap,
+        underline_pos,
+        underline_thick,
+    }
 }
 
 impl Fonts {
@@ -339,7 +388,17 @@ impl Fonts {
     /// `id`'s metrics (an unknown id reads as zeros).
     #[must_use]
     pub fn term_metrics(&self, id: FontId) -> FaceMetrics {
-        let Some(f) = self.font(id) else { return FaceMetrics { advance: 0.0, ascent: 0.0, descent: 0.0, leading: 0.0, cap: 0.0, underline_pos: None, underline_thick: None } };
+        let Some(f) = self.font(id) else {
+            return FaceMetrics {
+                advance: 0.0,
+                ascent: 0.0,
+                descent: 0.0,
+                leading: 0.0,
+                cap: 0.0,
+                underline_pos: None,
+                underline_thick: None,
+            };
+        };
         face_metrics(f)
     }
 
@@ -480,7 +539,8 @@ impl Line {
         if mine.is_empty() {
             return;
         }
-        let (mut above, mut below) = (self.baseline - self.top, self.top + self.height - self.baseline);
+        let (mut above, mut below) =
+            (self.baseline - self.top, self.top + self.height - self.baseline);
         for h in mine {
             above = above.max(h.ascent + h.pad);
             below = below.max(h.descent + h.pad);
@@ -533,7 +593,9 @@ impl Slide {
     #[must_use]
     pub fn shows(&self, x0: f32, x1: f32) -> f32 {
         let c = (x0 + x1) * 0.5;
-        let edge = |d: f32, fade: f32| if fade > 0.0 { (d / fade).clamp(0.0, 1.0) } else { f32::from(u8::from(d >= 0.0)) };
+        let edge = |d: f32, fade: f32| {
+            if fade > 0.0 { (d / fade).clamp(0.0, 1.0) } else { f32::from(u8::from(d >= 0.0)) }
+        };
         edge(c - self.clip[0], self.fade[0]) * edge(self.clip[1] - c, self.fade[1])
     }
 }
@@ -543,14 +605,22 @@ impl Slide {
 /// in markdown text (text with a code line height) a blank line between paragraphs `blank` of the text's line (when
 /// positive) to whole points, unless a card is beside it (its padding reaches into it): code, or a card's end marked by
 /// an empty range in `code` (a quote's, `Rich::code_ranges`); else the text's line.
-fn box_height(units: &[u16], code: &[(usize, usize)], style: Style, code_line: f32, blank: f32, s: usize) -> f32 {
+fn box_height(
+    units: &[u16],
+    code: &[(usize, usize)],
+    style: Style,
+    code_line: f32,
+    blank: f32,
+    s: usize,
+) -> f32 {
     let in_code = |i: usize| code.iter().any(|&(a, b)| (a..b).contains(&i));
     if code_line > 0.0 && in_code(s) {
         return code_line;
     }
     let carded = |i: usize| code.iter().any(|&(a, b)| (a..b).contains(&i) || (a == b && a == i));
     // The line before ends on its break at `s - 1`, its last character (a card's, when one ends there) at `s - 2`.
-    let lone_break = units.get(s) == Some(&10) && !(1..=2).any(|k| s >= k && carded(s - k)) && !carded(s + 1);
+    let lone_break =
+        units.get(s) == Some(&10) && !(1..=2).any(|k| s >= k && carded(s - k)) && !carded(s + 1);
     if code_line > 0.0 && blank > 0.0 && lone_break {
         return (style.line * blank).round().max(1.0);
     }
@@ -625,7 +695,14 @@ impl Fonts {
     /// Fonts that set type in the proportions of `look`.
     #[must_use]
     pub fn new(look: TypeLook) -> Self {
-        Self { by_id: HashMap::new(), ui: HashMap::new(), faces: HashMap::new(), look, shaper: shaper::Fonts::default(), term_families: TermFamilies::default() }
+        Self {
+            by_id: HashMap::new(),
+            ui: HashMap::new(),
+            faces: HashMap::new(),
+            look,
+            shaper: shaper::Fonts::default(),
+            term_families: TermFamilies::default(),
+        }
     }
 
     /// Set type in the proportions of `look` from now on (a scene reload): faces made for the old ones are made again.
@@ -640,7 +717,9 @@ impl Fonts {
         // A variable font's instances share one PostScript name: where each is set on its axes tells them apart.
         let mut axes = f.variations();
         axes.sort_by_key(|a| a.0);
-        let id = axes.into_iter().fold(fnv(&f.post_script_name(), f.size()), |h, (tag, v)| (h ^ (u64::from(tag) << 32 | u64::from(v.to_bits()))).wrapping_mul(0x0100_0000_01b3));
+        let id = axes.into_iter().fold(fnv(&f.post_script_name(), f.size()), |h, (tag, v)| {
+            (h ^ (u64::from(tag) << 32 | u64::from(v.to_bits()))).wrapping_mul(0x0100_0000_01b3)
+        });
         self.by_id.entry(id).or_insert_with(|| f.clone());
         id
     }
@@ -673,7 +752,13 @@ impl Fonts {
     }
 
     fn ui_font(&mut self, size: f32, bold: bool) -> Font {
-        self.ui.entry((size.to_bits(), bold)).or_insert_with(|| text_font(TEXT_FONTS[usize::from(bold)][0], size).unwrap_or_else(|| Font::system(size, bold))).clone()
+        self.ui
+            .entry((size.to_bits(), bold))
+            .or_insert_with(|| {
+                text_font(TEXT_FONTS[usize::from(bold)][0], size)
+                    .unwrap_or_else(|| Font::system(size, bold))
+            })
+            .clone()
     }
 
     /// The size a markdown heading of `level` is set at (4 to 6 as 3).
@@ -722,8 +807,21 @@ struct Attrs {
 
 /// The typesetter over `text` (`len` UTF-16 units) in `font`, tracked, with `runs` in their faces (code untracked) and
 /// each of `holes` a no-break space as wide as the hole.
-fn typesetter(fonts: &mut Fonts, text: &str, len: usize, runs: &[Run], holes: &[Hole], style: Style, font: &Font) -> Typesetter {
-    let mut attrs = Attrs { fonts: vec![font.clone()], font: vec![0; len], kern: vec![fonts.look.tracking * style.size; len], code: vec![false; len] };
+fn typesetter(
+    fonts: &mut Fonts,
+    text: &str,
+    len: usize,
+    runs: &[Run],
+    holes: &[Hole],
+    style: Style,
+    font: &Font,
+) -> Typesetter {
+    let mut attrs = Attrs {
+        fonts: vec![font.clone()],
+        font: vec![0; len],
+        kern: vec![fonts.look.tracking * style.size; len],
+        code: vec![false; len],
+    };
     for r in runs.iter().filter(|r| r.start < r.end.min(len)) {
         let f = fonts.face_font(style.size, r.face);
         let i = attrs.fonts.len() as u16;
@@ -733,12 +831,14 @@ fn typesetter(fonts: &mut Fonts, text: &str, len: usize, runs: &[Run], holes: &[
             attrs.kern[r.start..r.end.min(len)].fill(0.0);
             attrs.code[r.start..r.end.min(len)].fill(true);
         } else if let Face::Heading(level) = r.face {
-            attrs.kern[r.start..r.end.min(len)].fill(fonts.look.heading_tracking * fonts.heading_size(level));
+            attrs.kern[r.start..r.end.min(len)]
+                .fill(fonts.look.heading_tracking * fonts.heading_size(level));
         }
     }
     for h in holes.iter().filter(|h| h.start < h.end.min(len)) {
         // The space is as wide as the hole: its own advance in the face it stands in, plus a kern for the rest.
-        let face = runs.iter().rev().find(|r| r.start <= h.start && h.start < r.end).map(|r| r.face);
+        let face =
+            runs.iter().rev().find(|r| r.start <= h.start && h.start < r.end).map(|r| r.face);
         let kern = h.width - fonts.advance_of(style.size, style.bold, face, HOLE);
         attrs.kern[h.start..h.end.min(len)].fill(kern);
     }
@@ -844,11 +944,16 @@ fn breaks(u: u16) -> bool {
 fn is_mark(c: char) -> bool {
     use icu_properties::props::{GeneralCategory, GeneralCategoryGroup};
     let u = u32::from(c);
-    u >= 0x300 && !matches!(u, 0xFE00..=0xFE0F | 0xE0100..=0xE01EF) && GeneralCategoryGroup::Mark.contains(icu_properties::CodePointMapData::<GeneralCategory>::new().get(c))
+    u >= 0x300
+        && !matches!(u, 0xFE00..=0xFE0F | 0xE0100..=0xE01EF)
+        && GeneralCategoryGroup::Mark
+            .contains(icu_properties::CodePointMapData::<GeneralCategory>::new().get(c))
 }
 
 fn key_of(units: &[u16]) -> u64 {
-    units.iter().fold(0xcbf2_9ce4_8422_2325, |h, &u| (h ^ u64::from(u)).wrapping_mul(0x0100_0000_01b3))
+    units
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |h, &u| (h ^ u64::from(u)).wrapping_mul(0x0100_0000_01b3))
 }
 
 impl Shaped {
@@ -939,17 +1044,36 @@ impl Para {
 impl Shaped {
     /// `text` shaped for [`Layout::wrap`]: as [`Layout::rich_with`] sets it, at any width.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(fonts: &mut Fonts, text: &str, runs: &[Run], code: &[(usize, usize)], holes: &[Hole], style: Style, code_line: f32) -> Self {
+    pub fn new(
+        fonts: &mut Fonts,
+        text: &str,
+        runs: &[Run],
+        code: &[(usize, usize)],
+        holes: &[Hole],
+        style: Style,
+        code_line: f32,
+    ) -> Self {
         Self::after(fonts, None, text, runs, code, holes, style, code_line)
     }
 
     /// [`Shaped::new`], keeping each piece `prev` shaped that the text still has as it was (a reply streaming in shapes
     /// only its last paragraph again; a displayed formula's indent moving with the width, only the formula's paragraph).
     #[allow(clippy::too_many_arguments)]
-    pub fn after(fonts: &mut Fonts, prev: Option<&Shaped>, text: &str, runs: &[Run], code: &[(usize, usize)], holes: &[Hole], style: Style, code_line: f32) -> Self {
+    pub fn after(
+        fonts: &mut Fonts,
+        prev: Option<&Shaped>,
+        text: &str,
+        runs: &[Run],
+        code: &[(usize, usize)],
+        holes: &[Hole],
+        style: Style,
+        code_line: f32,
+    ) -> Self {
         let mut sh = Self::unbroken(fonts, text, runs, code, holes, style, code_line);
         let mut kept: HashMap<u64, Vec<Rc<Piece>>> = HashMap::new();
-        if let Some(prev) = prev.filter(|p| (p.style.size, p.style.bold, p.look) == (style.size, style.bold, fonts.look)) {
+        if let Some(prev) = prev.filter(|p| {
+            (p.style.size, p.style.bold, p.look) == (style.size, style.bold, fonts.look)
+        }) {
             for (_, pc) in &prev.pieces {
                 kept.entry(pc.key).or_default().push(pc.clone());
             }
@@ -974,15 +1098,42 @@ impl Shaped {
 
     /// What the text's lines are measured from, its pieces not yet shaped.
     #[allow(clippy::too_many_arguments)]
-    fn unbroken(fonts: &mut Fonts, text: &str, runs: &[Run], code: &[(usize, usize)], holes: &[Hole], style: Style, code_line: f32) -> Self {
+    fn unbroken(
+        fonts: &mut Fonts,
+        text: &str,
+        runs: &[Run],
+        code: &[(usize, usize)],
+        holes: &[Hole],
+        style: Style,
+        code_line: f32,
+    ) -> Self {
         let font = fonts.ui_font(style.size, style.bold);
         let units: Vec<u16> = text.encode_utf16().collect();
         let mut seen: HashMap<Face, Metrics> = HashMap::new();
-        let faces = runs.iter().map(|r| *seen.entry(r.face).or_insert_with(|| Metrics::of(&fonts.face_font(style.size, r.face)))).collect();
+        let faces = runs
+            .iter()
+            .map(|r| {
+                *seen
+                    .entry(r.face)
+                    .or_insert_with(|| Metrics::of(&fonts.face_font(style.size, r.face)))
+            })
+            .collect();
         let (mut code, mut holes) = (code.to_vec(), holes.to_vec());
         code.sort_unstable();
         holes.sort_by_key(|h| h.start);
-        Self { units, pieces: Vec::new(), runs: runs.to_vec(), faces, base: Metrics::of(&font), code, items: Vec::new(), holes, style, code_line, look: fonts.look }
+        Self {
+            units,
+            pieces: Vec::new(),
+            runs: runs.to_vec(),
+            faces,
+            base: Metrics::of(&font),
+            code,
+            items: Vec::new(),
+            holes,
+            style,
+            code_line,
+            look: fonts.look,
+        }
     }
 
     /// The text with a line beginning at one of `items` (a list item's start, `Rich::items`) the look's `item` of a line
@@ -996,8 +1147,18 @@ impl Shaped {
 
     /// The runs and holes of the text's units `a..z`, counted from `a`.
     fn within(&self, a: usize, z: usize) -> (Vec<Run>, Vec<Hole>) {
-        let runs = self.runs.iter().filter(|r| r.start < z && r.end > a).map(|r| Run { start: r.start.max(a) - a, end: r.end.min(z) - a, face: r.face }).collect();
-        let holes = self.holes.iter().filter(|h| (a..z).contains(&h.start)).map(|h| Hole { start: h.start - a, end: h.end.min(z) - a, ..*h }).collect();
+        let runs = self
+            .runs
+            .iter()
+            .filter(|r| r.start < z && r.end > a)
+            .map(|r| Run { start: r.start.max(a) - a, end: r.end.min(z) - a, face: r.face })
+            .collect();
+        let holes = self
+            .holes
+            .iter()
+            .filter(|h| (a..z).contains(&h.start))
+            .map(|h| Hole { start: h.start - a, end: h.end.min(z) - a, ..*h })
+            .collect();
         (runs, holes)
     }
 
@@ -1017,14 +1178,26 @@ impl Shaped {
     }
 
     /// The typesetter over `units`, with `runs` and `holes`.
-    fn typesetter(&self, fonts: &mut Fonts, units: &[u16], runs: &[Run], holes: &[Hole]) -> Typesetter {
+    fn typesetter(
+        &self,
+        fonts: &mut Fonts,
+        units: &[u16],
+        runs: &[Run],
+        holes: &[Hole],
+    ) -> Typesetter {
         let text = String::from_utf16(units).expect("no pair of surrogates is split");
         let font = fonts.ui_font(self.style.size, self.style.bold);
         typesetter(fonts, &text, units.len(), runs, holes, self.style, &font)
     }
 
     /// The piece over the text's units `a..z`: one of `kept` when it is the same and in the same context, else shaped.
-    fn piece(&self, fonts: &mut Fonts, kept: &HashMap<u64, Vec<Rc<Piece>>>, a: usize, z: usize) -> Rc<Piece> {
+    fn piece(
+        &self,
+        fonts: &mut Fonts,
+        kept: &HashMap<u64, Vec<Rc<Piece>>>,
+        a: usize,
+        z: usize,
+    ) -> Rc<Piece> {
         let (x, y) = self.context(a, z);
         let units = self.units[x..y].to_vec();
         let (runs, holes) = self.within(x, y);
@@ -1032,8 +1205,15 @@ impl Shaped {
         let key = key_of(&units) ^ lead as u64;
         // A hole in the context shapes the piece by where it is, not by how wide it is (a displayed formula's indent, which
         // moves with the width, leaves the paragraphs either side as they were).
-        let shapes = |h: &Hole| (h.start, h.end, (lead..lead + len).contains(&h.start).then_some(h.width.to_bits()));
-        let same = |pc: &&Rc<Piece>| (pc.lead, pc.len) == (lead, len) && pc.units == units && pc.runs == runs && pc.holes.iter().map(shapes).eq(holes.iter().map(shapes));
+        let shapes = |h: &Hole| {
+            (h.start, h.end, (lead..lead + len).contains(&h.start).then_some(h.width.to_bits()))
+        };
+        let same = |pc: &&Rc<Piece>| {
+            (pc.lead, pc.len) == (lead, len)
+                && pc.units == units
+                && pc.runs == runs
+                && pc.holes.iter().map(shapes).eq(holes.iter().map(shapes))
+        };
         if let Some(pc) = kept.get(&key).and_then(|v| v.iter().find(same)) {
             return pc.clone();
         }
@@ -1046,7 +1226,18 @@ impl Shaped {
             start += n;
         }
         let seams = (0..=units.len()).map(|_| Cell::new(0)).collect();
-        Rc::new(Piece { units, lead, len, runs, holes, key, ts, paras, seams, broken: RefCell::new(None) })
+        Rc::new(Piece {
+            units,
+            lead,
+            len,
+            runs,
+            holes,
+            key,
+            ts,
+            paras,
+            seams,
+            broken: RefCell::new(None),
+        })
     }
 
     /// What lines broken `width` wide from the start of the piece at the text's unit `at` (`pc`) are made of beyond the
@@ -1055,16 +1246,36 @@ impl Shaped {
     fn breaks_key(&self, at: usize, pc: &Piece, width: f64, bands: &[Band]) -> u64 {
         let z = at + pc.len;
         let mix = |h: u64, v: u64| (h ^ v).wrapping_mul(0x0100_0000_01b3);
-        let mut h = [width.to_bits(), u64::from(self.style.line.to_bits()), u64::from(self.code_line.to_bits())].into_iter().fold(0xcbf2_9ce4_8422_2325, mix);
+        let mut h = [
+            width.to_bits(),
+            u64::from(self.style.line.to_bits()),
+            u64::from(self.code_line.to_bits()),
+        ]
+        .into_iter()
+        .fold(0xcbf2_9ce4_8422_2325, mix);
         for &(a, b) in self.code.iter().filter(|&&(a, b)| a < z && b > at) {
             h = mix(mix(h, (a.max(at) - at) as u64), (b.min(z) - at) as u64);
         }
         for band in bands.iter().filter(|b| b.lo < z && b.hi > at) {
-            h = [(band.lo.max(at) - at) as u64, (band.hi.min(z) - at) as u64, u64::from(band.width.to_bits())].into_iter().fold(mix(h, 0xb4d), mix);
+            h = [
+                (band.lo.max(at) - at) as u64,
+                (band.hi.min(z) - at) as u64,
+                u64::from(band.width.to_bits()),
+            ]
+            .into_iter()
+            .fold(mix(h, 0xb4d), mix);
         }
         let first = self.holes.partition_point(|x| x.start < at);
         for x in self.holes[first..].iter().take_while(|x| x.start < z) {
-            h = [(x.start - at) as u64, u64::from(x.width.to_bits()), u64::from(x.ascent.to_bits()), u64::from(x.descent.to_bits()), u64::from(x.pad.to_bits())].into_iter().fold(h, mix);
+            h = [
+                (x.start - at) as u64,
+                u64::from(x.width.to_bits()),
+                u64::from(x.ascent.to_bits()),
+                u64::from(x.descent.to_bits()),
+                u64::from(x.pad.to_bits()),
+            ]
+            .into_iter()
+            .fold(h, mix);
         }
         h
     }
@@ -1072,9 +1283,18 @@ impl Shaped {
     /// The box of a line starting at the text's unit `s`, its top at `top`: its height, baseline and optical middle. A
     /// list item's room ([`Shaped::spaced`]) is the top of its box, its words set in the rest.
     fn frame(&self, s: usize, top: f32) -> (f32, f32, f32) {
-        let height = box_height(&self.units, &self.code, self.style, self.code_line, self.look.blank, s);
-        let above = if self.code_line > 0.0 && self.items.binary_search(&s).is_ok() { (self.style.line * self.look.item).round() } else { 0.0 };
-        let asked = self.runs.iter().position(|r| (r.start..r.end).contains(&s)).map_or(self.base, |i| self.faces[i]);
+        let height =
+            box_height(&self.units, &self.code, self.style, self.code_line, self.look.blank, s);
+        let above = if self.code_line > 0.0 && self.items.binary_search(&s).is_ok() {
+            (self.style.line * self.look.item).round()
+        } else {
+            0.0
+        };
+        let asked = self
+            .runs
+            .iter()
+            .position(|r| (r.start..r.end).contains(&s))
+            .map_or(self.base, |i| self.faces[i]);
         let baseline = top + above + asked.baseline(height);
         (height + above, baseline, baseline - asked.rise)
     }
@@ -1113,7 +1333,19 @@ impl Shaped {
         for g in &mut glyphs {
             g.idx = at(g.idx);
         }
-        let mut l = Line { start: at(s), end: at(e), top, height, baseline, mid, width, glyphs, hard_break: pc.units[e - 1] == 10, set, base };
+        let mut l = Line {
+            start: at(s),
+            end: at(e),
+            top,
+            height,
+            baseline,
+            mid,
+            width,
+            glyphs,
+            hard_break: pc.units[e - 1] == 10,
+            set,
+            base,
+        };
         l.fit_holes(&self.holes);
         l
     }
@@ -1121,7 +1353,15 @@ impl Shaped {
     /// The line from the text's unit `s` as the typesetter sets it when it runs past the end of its piece (the text's units
     /// `a..end`): a line wider than the width takes the white space after it and a line end (a formula wider than the
     /// column takes the newlines after it), which may lie past the context the piece was typeset with.
-    fn across(&self, fonts: &mut Fonts, a: usize, s: usize, end: usize, width: f64, top: f32) -> Line {
+    fn across(
+        &self,
+        fonts: &mut Fonts,
+        a: usize,
+        s: usize,
+        end: usize,
+        width: f64,
+        top: f32,
+    ) -> Line {
         let len = self.units.len();
         let mut z = end;
         while z < len && hangs(self.units[z]) && !breaks(self.units[z]) {
@@ -1143,7 +1383,19 @@ impl Shaped {
                     g.idx += x;
                 }
                 let (height, baseline, mid) = self.frame(s, top);
-                let mut l = Line { start: s, end: e, top, height, baseline, mid, width: read.width, glyphs: read.glyphs, hard_break: self.units[e - 1] == 10, set: OnceCell::from(set), base: x };
+                let mut l = Line {
+                    start: s,
+                    end: e,
+                    top,
+                    height,
+                    baseline,
+                    mid,
+                    width: read.width,
+                    glyphs: read.glyphs,
+                    hard_break: self.units[e - 1] == 10,
+                    set: OnceCell::from(set),
+                    base: x,
+                };
                 l.fit_holes(&self.holes);
                 return l;
             }
@@ -1158,7 +1410,11 @@ impl Piece {
     /// measured from a line start other than the paragraph's (a tab stop is counted from the start of its line), and no
     /// hole is in it (the caret after a kerned space is part-way into the kern, which a hole is measured from).
     fn span(&self, p: &Para, s: usize, e: usize) -> Option<(usize, usize)> {
-        if !p.ltr || e > p.end || (s > p.start && self.units[s..e].contains(&9)) || self.holes.iter().any(|h| (s..e).contains(&h.start)) {
+        if !p.ltr
+            || e > p.end
+            || (s > p.start && self.units[s..e].contains(&9))
+            || self.holes.iter().any(|h| (s..e).contains(&h.start))
+        {
             return None;
         }
         let (a, b) = (p.cut[s - p.start], p.cut[e - p.start]);
@@ -1169,7 +1425,8 @@ impl Piece {
     /// there (a paragraph's own ends are no cut), for a line of `glyphs` glyphs.
     fn trusted(&self, p: &Para, s: usize, e: usize, glyphs: usize) -> bool {
         (s == p.start || e == p.end || glyphs >= REACH)
-            && (s == p.start || self.seams[s].get() & (Seam::STARTS | Seam::STARTS_NOT) == Seam::STARTS)
+            && (s == p.start
+                || self.seams[s].get() & (Seam::STARTS | Seam::STARTS_NOT) == Seam::STARTS)
             && (e == p.end || self.seams[e].get() & (Seam::ENDS | Seam::ENDS_NOT) == Seam::ENDS)
     }
 
@@ -1179,13 +1436,16 @@ impl Piece {
     /// the cuts not yet shown sound are to blame, or both when both were.
     fn learn(&self, p: &Para, s: usize, e: usize, a: usize, b: usize, read: &Read) {
         let long = b - a >= REACH;
-        let (shows_head, shows_tail) = (s > p.start && (long || e == p.end), e < p.end && (long || s == p.start));
+        let (shows_head, shows_tail) =
+            (s > p.start && (long || e == p.end), e < p.end && (long || s == p.start));
         if !shows_head && !shows_tail {
             return;
         }
         let (glyphs, width) = self.cut(p, a, b);
         let key = |g: &Glyph| (g.font, g.id, g.idx, g.x.to_bits(), g.y.to_bits());
-        let same = width.to_bits() == read.width.to_bits() && glyphs.len() == read.glyphs.len() && glyphs.iter().zip(&read.glyphs).all(|(g, h)| key(g) == key(h));
+        let same = width.to_bits() == read.width.to_bits()
+            && glyphs.len() == read.glyphs.len()
+            && glyphs.iter().zip(&read.glyphs).all(|(g, h)| key(g) == key(h));
         let (head, tail) = (&self.seams[s], &self.seams[e]);
         if same {
             if shows_head {
@@ -1196,7 +1456,10 @@ impl Piece {
             }
             return;
         }
-        let (head_shown, tail_shown) = (!shows_head || head.get() & Seam::STARTS != 0, !shows_tail || tail.get() & Seam::ENDS != 0);
+        let (head_shown, tail_shown) = (
+            !shows_head || head.get() & Seam::STARTS != 0,
+            !shows_tail || tail.get() & Seam::ENDS != 0,
+        );
         let both = head_shown && tail_shown;
         if shows_head && (both || !head_shown) {
             head.set(head.get() | Seam::STARTS_NOT);
@@ -1209,9 +1472,17 @@ impl Piece {
     /// Glyphs `a..b` of paragraph `p` as a line of their own, and the width they take.
     fn cut(&self, p: &Para, a: usize, b: usize) -> (Vec<Glyph>, f32) {
         let x0 = p.xs.get(a).copied().unwrap_or(0.0);
-        let glyphs = p.glyphs[a..b].iter().zip(&p.xs[a..b]).map(|(g, &x)| Glyph { x: (x - x0) as f32, ..*g }).collect();
+        let glyphs = p.glyphs[a..b]
+            .iter()
+            .zip(&p.xs[a..b])
+            .map(|(g, &x)| Glyph { x: (x - x0) as f32, ..*g })
+            .collect();
         let full: f64 = p.adv[a..b].iter().sum();
-        let trailing: f64 = (a..b).rev().take_while(|&k| hangs(self.units[p.glyphs[k].idx])).map(|k| p.adv[k]).sum();
+        let trailing: f64 = (a..b)
+            .rev()
+            .take_while(|&k| hangs(self.units[p.glyphs[k].idx]))
+            .map(|k| p.adv[k])
+            .sum();
         (glyphs, (full - trailing) as f32)
     }
 }
@@ -1237,14 +1508,31 @@ impl Layout {
 
     /// [`Layout::new`] with `runs` set in their faces. A line starting inside one of the UTF-16 ranges `code` is
     /// `code_line` points tall (when positive) instead of the style's; a line that wraps inside one is code too.
-    pub fn rich(fonts: &mut Fonts, text: &str, runs: &[Run], code: &[(usize, usize)], style: Style, code_line: f32, max_w: f32) -> Self {
+    pub fn rich(
+        fonts: &mut Fonts,
+        text: &str,
+        runs: &[Run],
+        code: &[(usize, usize)],
+        style: Style,
+        code_line: f32,
+        max_w: f32,
+    ) -> Self {
         Self::rich_with(fonts, text, runs, code, &[], style, code_line, max_w)
     }
 
     /// [`Layout::rich`] with room left for each of `holes`: where a hole stands in the text is a no-break space made as wide
     /// as the hole, and a line that holds one is as tall as the hole needs.
     #[allow(clippy::too_many_arguments)]
-    pub fn rich_with(fonts: &mut Fonts, text: &str, runs: &[Run], code: &[(usize, usize)], holes: &[Hole], style: Style, code_line: f32, max_w: f32) -> Self {
+    pub fn rich_with(
+        fonts: &mut Fonts,
+        text: &str,
+        runs: &[Run],
+        code: &[(usize, usize)],
+        holes: &[Hole],
+        style: Style,
+        code_line: f32,
+        max_w: f32,
+    ) -> Self {
         let shaped = Rc::new(Shaped::new(fonts, text, runs, code, holes, style, code_line));
         Self::wrap(fonts, &shaped, max_w)
     }
@@ -1288,9 +1576,17 @@ impl Layout {
                 }
                 let p = &pc.paras[pi];
                 let width = band_width(bands, start, outer);
-                let e = if s == p.start && p.full <= width - FITS { p.end } else { (s + pc.ts.suggest_line_break(s, width)).min(pc.units.len()) };
+                let e = if s == p.start && p.full <= width - FITS {
+                    p.end
+                } else {
+                    (s + pc.ts.suggest_line_break(s, width)).min(pc.units.len())
+                };
                 crossed |= e > pc.lead + pc.len;
-                let l = if e > pc.lead + pc.len { sh.across(fonts, at, start, at + pc.len, width, top) } else { sh.line(base, pc, p, s, e, top) };
+                let l = if e > pc.lead + pc.len {
+                    sh.across(fonts, at, start, at + pc.len, width, top)
+                } else {
+                    sh.line(base, pc, p, s, e, top)
+                };
                 top += l.height;
                 start = l.end;
                 lines.push(l);
@@ -1303,7 +1599,19 @@ impl Layout {
         if len == 0 || sh.units.last() == Some(&10) {
             let top = lines.last().map_or(0.0, |l| l.top + l.height);
             let baseline = top + sh.base.baseline(sh.style.line);
-            lines.push(Line { start: len, end: len, top, height: sh.style.line, baseline, mid: baseline - sh.base.rise, width: 0.0, glyphs: Vec::new(), hard_break: false, set: OnceCell::new(), base: 0 });
+            lines.push(Line {
+                start: len,
+                end: len,
+                top,
+                height: sh.style.line,
+                baseline,
+                mid: baseline - sh.base.rise,
+                width: 0.0,
+                glyphs: Vec::new(),
+                hard_break: false,
+                set: OnceCell::new(),
+                base: 0,
+            });
         }
         Self {
             lines,
@@ -1335,7 +1643,13 @@ impl Layout {
 
     /// The text broken again as this layout was (its width and bands), with its slides: what a layout drawn this frame
     /// is, made again from what was kept of it.
-    pub fn again(fonts: &mut Fonts, shaped: &Rc<Shaped>, max_w: f32, bands: &[Band], slides: Vec<Slide>) -> Self {
+    pub fn again(
+        fonts: &mut Fonts,
+        shaped: &Rc<Shaped>,
+        max_w: f32,
+        bands: &[Band],
+        slides: Vec<Slide>,
+    ) -> Self {
         let lay = Self::wrap_with(fonts, shaped, max_w, bands);
         lay.set_slides(slides);
         lay
@@ -1382,21 +1696,41 @@ impl Layout {
         if let Some(set) = l.set.get() {
             return Some(set);
         }
-        let (at, pc) = &self.shaped.pieces[self.shaped.pieces.partition_point(|(at, _)| *at <= l.start).checked_sub(1)?];
+        let (at, pc) = &self.shaped.pieces
+            [self.shaped.pieces.partition_point(|(at, _)| *at <= l.start).checked_sub(1)?];
         Some(&**l.set.get_or_init(|| pc.ts.line(l.start + pc.lead - at, l.end - l.start)))
     }
 
     /// The layout as the typesetter alone sets it, typesetting the text and every line afresh: what [`Layout::wrap`] must match.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    fn typeset(fonts: &mut Fonts, text: &str, runs: &[Run], code: &[(usize, usize)], holes: &[Hole], style: Style, code_line: f32, max_w: f32) -> Self {
+    fn typeset(
+        fonts: &mut Fonts,
+        text: &str,
+        runs: &[Run],
+        code: &[(usize, usize)],
+        holes: &[Hole],
+        style: Style,
+        code_line: f32,
+        max_w: f32,
+    ) -> Self {
         Self::typeset_with(fonts, text, runs, code, holes, style, code_line, max_w, &[])
     }
 
     /// [`Layout::typeset`] with `bands`: what [`Layout::wrap_with`] must match.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    fn typeset_with(fonts: &mut Fonts, text: &str, runs: &[Run], code: &[(usize, usize)], holes: &[Hole], style: Style, code_line: f32, max_w: f32, bands: &[Band]) -> Self {
+    fn typeset_with(
+        fonts: &mut Fonts,
+        text: &str,
+        runs: &[Run],
+        code: &[(usize, usize)],
+        holes: &[Hole],
+        style: Style,
+        code_line: f32,
+        max_w: f32,
+        bands: &[Band],
+    ) -> Self {
         let font = fonts.ui_font(style.size, style.bold);
         let len: usize = text.encode_utf16().count();
         let mut lines = Vec::new();
@@ -1408,10 +1742,14 @@ impl Layout {
             let mut start = 0usize;
             let mut top = 0.0f32;
             while start < len {
-                let n = ts.suggest_line_break(start, band_width(bands, start, width)).min(len - start);
+                let n =
+                    ts.suggest_line_break(start, band_width(bands, start, width)).min(len - start);
                 let line = ts.line(start, n);
                 let height = box_height(&units, code, style, code_line, fonts.look.blank, start);
-                let asked = runs.iter().find(|r| (r.start..r.end).contains(&start)).map_or_else(|| font.clone(), |r| fonts.face_font(style.size, r.face));
+                let asked = runs
+                    .iter()
+                    .find(|r| (r.start..r.end).contains(&start))
+                    .map_or_else(|| font.clone(), |r| fonts.face_font(style.size, r.face));
                 let mut l = make_line(line, &asked, start, start + n, top, height);
                 l.hard_break = text.encode_utf16().nth(start + n - 1) == Some(10);
                 l.fit_holes(&shaped.holes);
@@ -1424,9 +1762,34 @@ impl Layout {
         if len == 0 || ends_nl {
             let top = lines.last().map_or(0.0, |l| l.top + l.height);
             let baseline = top + Metrics::of(&font).baseline(style.line);
-            lines.push(Line { start: len, end: len, top, height: style.line, baseline, mid: baseline - optical_rise(&font), width: 0.0, glyphs: Vec::new(), hard_break: false, set: OnceCell::new(), base: 0 });
+            lines.push(Line {
+                start: len,
+                end: len,
+                top,
+                height: style.line,
+                baseline,
+                mid: baseline - optical_rise(&font),
+                width: 0.0,
+                glyphs: Vec::new(),
+                hard_break: false,
+                set: OnceCell::new(),
+                base: 0,
+            });
         }
-        Self { lines, line_h: style.line, code_line, len, size: style.size, tail: 0.0, sliver: fonts.look.sliver, holes: shaped.holes.clone(), shaped, wrap_w: max_w, bands: bands.to_vec(), slides: RefCell::default() }
+        Self {
+            lines,
+            line_h: style.line,
+            code_line,
+            len,
+            size: style.size,
+            tail: 0.0,
+            sliver: fonts.look.sliver,
+            holes: shaped.holes.clone(),
+            shaped,
+            wrap_w: max_w,
+            bands: bands.to_vec(),
+            slides: RefCell::default(),
+        }
     }
 
     /// Make room for `h` points under line `li`: the lines after it move down, and the room is the gap between.
@@ -1500,7 +1863,9 @@ impl Layout {
 
     fn unmoved(&self, li: usize, idx: usize) -> f32 {
         let l = &self.lines[li];
-        if let Some(h) = self.holes.iter().find(|h| h.end == idx && h.start >= l.start && h.start < l.end) {
+        if let Some(h) =
+            self.holes.iter().find(|h| h.end == idx && h.start >= l.start && h.start < l.end)
+        {
             return self.unmoved(li, h.start) + h.width;
         }
         match self.set_line(li) {
@@ -1534,11 +1899,30 @@ fn optical_rise(font: &Font) -> f32 {
 /// The set line `set` as a [`Line`], its baseline and optical middle from `font` ([`Metrics`]).
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn make_line(set: Rc<SetLine>, font: &Font, start: usize, end: usize, top: f32, height: f32) -> Line {
+fn make_line(
+    set: Rc<SetLine>,
+    font: &Font,
+    start: usize,
+    end: usize,
+    top: f32,
+    height: f32,
+) -> Line {
     let Read { glyphs, width, .. } = set.read();
     let baseline = top + Metrics::of(font).baseline(height);
     let mid = baseline - optical_rise(font);
-    Line { start, end, top, height, baseline, mid, width, glyphs, hard_break: false, set: OnceCell::from(set), base: 0 }
+    Line {
+        start,
+        end,
+        top,
+        height,
+        baseline,
+        mid,
+        width,
+        glyphs,
+        hard_break: false,
+        set: OnceCell::from(set),
+        base: 0,
+    }
 }
 
 // ---- glyph atlas ---------------------------------------------------------------------------------------------------
@@ -1602,7 +1986,14 @@ pub struct GlyphCache {
 impl GlyphCache {
     #[must_use]
     pub fn new(size: u32) -> Self {
-        Self { size, packer: Packer::new(size, size), map: HashMap::default(), full: false, hits: 0, misses: 0 }
+        Self {
+            size,
+            packer: Packer::new(size, size),
+            map: HashMap::default(),
+            full: false,
+            hits: 0,
+            misses: 0,
+        }
     }
 
     /// Whether a glyph was left out for want of room since the last [`GlyphCache::clear`].
@@ -1641,7 +2032,10 @@ impl GlyphCache {
             return *e;
         }
         self.misses += 1;
-        let e = self.place(font::raster_glyph(fonts.font(font)?, glyph, scale, f64::from(sub) / f64::from(SUBPX)), upload);
+        let e = self.place(
+            font::raster_glyph(fonts.font(font)?, glyph, scale, f64::from(sub) / f64::from(SUBPX)),
+            upload,
+        );
         if e.is_some() || !self.full {
             self.map.insert(key, e);
         }
@@ -1650,7 +2044,14 @@ impl GlyphCache {
 
     /// The atlas entry for a coverage mask drawn elsewhere (an icon), `w` by `h` pixels under `key`; uploaded on first
     /// use as white, so it tints like a plain glyph.
-    pub fn mask(&mut self, key: (FontId, u16, u32, u32), w: u32, h: u32, alpha: &[u8], upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) -> Option<AtlasGlyph> {
+    pub fn mask(
+        &mut self,
+        key: (FontId, u16, u32, u32),
+        w: u32,
+        h: u32,
+        alpha: &[u8],
+        upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8]),
+    ) -> Option<AtlasGlyph> {
         if let Some(e) = self.map.get(&key) {
             return *e;
         }
@@ -1669,7 +2070,17 @@ impl GlyphCache {
     /// pixels from a cell's bottom-left corner (y up): a glyph constrained into a terminal cell
     /// ([`nerd_rules::Constraint`]). Its `left` and `top` are from that corner.
     #[allow(clippy::too_many_arguments)]
-    pub fn get_placed(&mut self, fonts: &Fonts, font: FontId, glyph: u16, sx: f64, sy: f64, tx: f64, ty: f64, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) -> Option<AtlasGlyph> {
+    pub fn get_placed(
+        &mut self,
+        fonts: &Fonts,
+        font: FontId,
+        glyph: u16,
+        sx: f64,
+        sy: f64,
+        tx: f64,
+        ty: f64,
+        upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8]),
+    ) -> Option<AtlasGlyph> {
         let mut h: u64 = 0x9e37_79b9_7f4a_7c15;
         for v in [sx, sy, tx, ty] {
             h = (h.rotate_left(13) ^ v.to_bits()).wrapping_mul(0x0100_0000_01b3);
@@ -1703,7 +2114,11 @@ impl GlyphCache {
     }
 
     /// A bitmap given room in the atlas and uploaded there; one that draws nothing takes no room.
-    fn place(&mut self, b: font::Bitmap, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) -> Option<AtlasGlyph> {
+    fn place(
+        &mut self,
+        b: font::Bitmap,
+        upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8]),
+    ) -> Option<AtlasGlyph> {
         if b.w == 0 || b.h == 0 {
             return Some(AtlasGlyph { x: 0, y: 0, w: 0, h: 0, left: 0, top: 0, colour: false });
         }
@@ -1715,5 +2130,3 @@ impl GlyphCache {
         Some(AtlasGlyph { x, y, w: b.w, h: b.h, left: b.left, top: b.top, colour: b.colour })
     }
 }
-
-

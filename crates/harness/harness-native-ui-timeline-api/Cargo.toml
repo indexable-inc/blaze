@@ -1,0 +1,12 @@
+[package]
+name = "harness-native-ui-timeline-api"
+description = "A timeline as data: Cues that move one member of a node's components between two values over a stretch of the frame clock"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+harness-native-flecs = { path = "../harness-native-flecs" }
+harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }
+hyperion-api-layouts = { path = "../vendor/hyperion-api-layouts" }

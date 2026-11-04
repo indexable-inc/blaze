@@ -2,26 +2,33 @@
 //! den-native's window.rs. Frames come from a `CAMetalDisplayLink`, paused whenever the app is idle; the daemon's threads
 //! wake it through the main queue.
 use crate::app::{App, Chrome, KeyMods, MenuLine, Outcome};
-use crate::term::{self, Button, KeyAction};
 use crate::gpu::{self, Dest, Renderer};
 use crate::single::{self, Ask};
+use crate::term::{self, Button, KeyAction};
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSMenu, NSMenuItem,
-    NSPasteboard, NSPasteboardTypeString, NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
+    NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSMenu, NSMenuItem, NSPasteboard,
+    NSPasteboardTypeString, NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions,
+    NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+    NSVisualEffectView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedSRGB};
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSAttributedStringKey, NSNotFound, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRangePointer, NSRect, NSRunLoop,
-    NSRunLoopCommonModes, NSSize, NSString, NSUInteger,
+    NSArray, NSAttributedString, NSAttributedStringKey, NSNotFound, NSNotification, NSObject,
+    NSObjectProtocol, NSPoint, NSRange, NSRangePointer, NSRect, NSRunLoop, NSRunLoopCommonModes,
+    NSSize, NSString, NSUInteger,
 };
 use objc2_metal::MTLCreateSystemDefaultDevice;
-use objc2_quartz_core::{CAFrameRateRange, CAMetalDisplayLink, CAMetalDisplayLinkDelegate, CAMetalDisplayLinkUpdate, CAMetalLayer, kCAGravityTopLeft};
+use objc2_quartz_core::{
+    CAFrameRateRange, CAMetalDisplayLink, CAMetalDisplayLinkDelegate, CAMetalDisplayLinkUpdate,
+    CAMetalLayer, kCAGravityTopLeft,
+};
 use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -106,7 +113,12 @@ fn wake_from_any_thread() -> Arc<dyn Fn() + Send + Sync> {
         // Only unpause: the frame drains the message and draws on if it changed anything (`daemon`), else sleeps again.
         DispatchQueue::main().exec_async(move || {
             with(|st| {
-                framelog::wake(st.link.isPaused(), st.window.occlusionState().contains(objc2_app_kit::NSWindowOcclusionState::Visible));
+                framelog::wake(
+                    st.link.isPaused(),
+                    st.window
+                        .occlusionState()
+                        .contains(objc2_app_kit::NSWindowOcclusionState::Visible),
+                );
                 st.link.setPaused(false);
             });
         });
@@ -489,11 +501,21 @@ impl HarnessView {
     fn send_key(&self, event: &NSEvent, text: Option<&str>, action: KeyAction) {
         let m = mods_of(event.modifierFlags());
         let text = text.map(str::to_owned).unwrap_or_else(|| {
-            let typed = if m.alt { event.charactersIgnoringModifiers() } else { event.characters() };
+            let typed =
+                if m.alt { event.charactersIgnoringModifiers() } else { event.characters() };
             typed.map(|s| s.to_string()).unwrap_or_default()
         });
-        let unshifted = event.charactersByApplyingModifiers(NSEventModifierFlags::empty()).and_then(|s| s.to_string().chars().next());
-        let k = term::KeyIn { code: event.keyCode(), text: &text, unshifted, mods: m, action, composing: false };
+        let unshifted = event
+            .charactersByApplyingModifiers(NSEventModifierFlags::empty())
+            .and_then(|s| s.to_string().chars().next());
+        let k = term::KeyIn {
+            code: event.keyCode(),
+            text: &text,
+            unshifted,
+            mods: m,
+            action,
+            composing: false,
+        };
         with(|st| st.app.key(&k));
         wake();
     }
@@ -533,7 +555,9 @@ impl HarnessView {
             menu.addItem(&it);
         };
         let e = with(|st| st.app.object_at(x, y)).flatten()?;
-        let (archived, pinned, object) = with(|st| (st.app.is_archived(e), st.app.is_pinned(e), st.app.is_object(e))).unwrap_or_default();
+        let (archived, pinned, object) =
+            with(|st| (st.app.is_archived(e), st.app.is_pinned(e), st.app.is_object(e)))
+                .unwrap_or_default();
         if !object {
             return None;
         }
@@ -573,7 +597,12 @@ impl HarnessView {
 
     fn frame(&self, update: &CAMetalDisplayLinkUpdate) {
         let entered = objc2_quartz_core::CACurrentMediaTime();
-        self.frame_into(Dest::Drawable(update.drawable()), entered, update.targetTimestamp(), update.targetPresentationTimestamp());
+        self.frame_into(
+            Dest::Drawable(update.drawable()),
+            entered,
+            update.targetTimestamp(),
+            update.targetPresentationTimestamp(),
+        );
     }
 
     /// One frame drawn into `dest`, for the display time `t` (presented at `present`); `entered` when the clock called.
@@ -583,22 +612,40 @@ impl HarnessView {
         let points = self.bounds().size;
         let backing = self.convertSizeToBacking(points).width / points.width.max(1.0);
         // The keys were loaded again (the user's keys.flecs changed): the menu bar follows.
-        let menu = with(|st| (st.app.keys_gen() != st.menu_gen).then(|| {
-            st.menu_gen = st.app.keys_gen();
-            st.app.menu()
-        }))
+        let menu = with(|st| {
+            (st.app.keys_gen() != st.menu_gen).then(|| {
+                st.menu_gen = st.app.keys_gen();
+                st.app.menu()
+            })
+        })
         .flatten();
         if let Some(m) = menu {
-            NSApplication::sharedApplication(self.mtm()).setMainMenu(Some(&main_menu(self.mtm(), &m, Some(self))));
+            NSApplication::sharedApplication(self.mtm()).setMainMenu(Some(&main_menu(
+                self.mtm(),
+                &m,
+                Some(self),
+            )));
         }
         with(|st| {
             let dt = st.last.map_or(1.0 / 120.0, |l| (t - l).clamp(0.0, 0.1)) as f32;
             st.last = Some(t);
             let renderer = &st.renderer;
-            let draw = st.app.frame((points.width as f32, points.height as f32), backing as f32, dt, &mut |x, y, w, h, b| renderer.upload_atlas(x, y, w, h, b));
+            let draw = st.app.frame(
+                (points.width as f32, points.height as f32),
+                backing as f32,
+                dt,
+                &mut |x, y, w, h, b| renderer.upload_atlas(x, y, w, h, b),
+            );
             let built = objc2_quartz_core::CACurrentMediaTime();
             st.renderer.render(&draw, dest);
-            framelog::note(entered, t, present, built, objc2_quartz_core::CACurrentMediaTime(), f32::from_bits(st.renderer.gpu_clock().load(Ordering::Relaxed)));
+            framelog::note(
+                entered,
+                t,
+                present,
+                built,
+                objc2_quartz_core::CACurrentMediaTime(),
+                f32::from_bits(st.renderer.gpu_clock().load(Ordering::Relaxed)),
+            );
             if st.app.title != st.title {
                 st.title.clone_from(&st.app.title);
                 st.window.setTitle(&NSString::from_str(&st.title));
@@ -606,7 +653,9 @@ impl HarnessView {
             let tip = st.app.tooltip();
             if tip != st.tip {
                 st.tip = tip;
-                self.setToolTip((!st.tip.is_empty()).then(|| NSString::from_str(&st.tip)).as_deref());
+                self.setToolTip(
+                    (!st.tip.is_empty()).then(|| NSString::from_str(&st.tip)).as_deref(),
+                );
             }
             let lights = st.app.lights();
             if (lights - st.lights).abs() > 1e-3 || (lights == 0.0) != (st.lights == 0.0) {
@@ -657,12 +706,19 @@ fn bench_clock(view: &Retained<HarnessView>, hz: f64) {
             let size = st.layer.drawableSize();
             let (w, h) = (size.width.max(1.0) as usize, size.height.max(1.0) as usize);
             let mut tex = tex.borrow_mut();
-            if tex.as_ref().is_none_or(|t| objc2_metal::MTLTexture::width(&**t) != w || objc2_metal::MTLTexture::height(&**t) != h) {
+            if tex.as_ref().is_none_or(|t| {
+                objc2_metal::MTLTexture::width(&**t) != w
+                    || objc2_metal::MTLTexture::height(&**t) != h
+            }) {
                 *tex = Some(st.renderer.offscreen(w, h));
             }
             // At the rate the link is asked for (the calm rate while only a dot breathes), as the link would call.
             let want = f64::from(st.link.preferredFrameRateRange().preferred).clamp(1.0, hz);
-            (st.link.isPaused() || objc2_quartz_core::CACurrentMediaTime() - last.get() < 1.0 / want - 0.5 / hz, tex.clone().unwrap())
+            (
+                st.link.isPaused()
+                    || objc2_quartz_core::CACurrentMediaTime() - last.get() < 1.0 / want - 0.5 / hz,
+                tex.clone().unwrap(),
+            )
         }) else {
             return;
         };
@@ -674,7 +730,9 @@ fn bench_clock(view: &Retained<HarnessView>, hz: f64) {
         view.frame_into(Dest::Texture(texture), now, now + 1.0 / hz, now + 2.0 / hz);
     });
     // SAFETY: the block runs on the main thread (a main-run-loop timer) and touches only main-thread state.
-    let timer = unsafe { objc2_foundation::NSTimer::timerWithTimeInterval_repeats_block(1.0 / hz, true, &block) };
+    let timer = unsafe {
+        objc2_foundation::NSTimer::timerWithTimeInterval_repeats_block(1.0 / hz, true, &block)
+    };
     // SAFETY: the main run loop, common modes.
     unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
 }
@@ -701,10 +759,17 @@ mod framelog {
         }
     }
     pub fn note(entered: f64, target: f64, present: f64, built: f64, rendered: f64, gpu_ms: f32) {
-        let log = LOG.get_or_init(|| std::env::var_os("HARNESS_NATIVE_FRAMELOG").and_then(|p| std::fs::File::create(p).ok()).map(|f| Mutex::new(std::io::BufWriter::new(f))));
+        let log = LOG.get_or_init(|| {
+            std::env::var_os("HARNESS_NATIVE_FRAMELOG")
+                .and_then(|p| std::fs::File::create(p).ok())
+                .map(|f| Mutex::new(std::io::BufWriter::new(f)))
+        });
         if let Some(l) = log {
             let mut w = l.lock().unwrap();
-            let _ = writeln!(w, "{entered:.6} {target:.6} {present:.6} {built:.6} {rendered:.6} {gpu_ms:.3}");
+            let _ = writeln!(
+                w,
+                "{entered:.6} {target:.6} {present:.6} {built:.6} {rendered:.6} {gpu_ms:.3}"
+            );
             let _ = w.flush();
         }
     }
@@ -714,12 +779,16 @@ mod framelog {
 fn is_dark(view: &NSView) -> bool {
     // SAFETY: the appearance names are valid static strings.
     let (aqua, dark) = unsafe { (NSAppearanceNameAqua, NSAppearanceNameDarkAqua) };
-    view.effectiveAppearance().bestMatchFromAppearancesWithNames(&NSArray::from_slice(&[aqua, dark])).is_some_and(|n| &*n == dark)
+    view.effectiveAppearance()
+        .bestMatchFromAppearancesWithNames(&NSArray::from_slice(&[aqua, dark]))
+        .is_some_and(|n| &*n == dark)
 }
 
 /// Show the traffic lights at `alpha` (they live on the sidebar: Dia's), hidden outright once they are gone.
 fn set_lights(window: &NSWindow, alpha: f32) {
-    for kind in [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton] {
+    for kind in
+        [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton]
+    {
         if let Some(b) = window.standardWindowButton(kind) {
             b.setAlphaValue(f64::from(alpha));
             b.setHidden(alpha <= 0.0);
@@ -746,7 +815,9 @@ fn chrome(window: &NSWindow) -> Chrome {
     let height = window.frame().size.height;
     let strip = (height - window.contentLayoutRect().size.height).max(0.0);
     let mut right: f64 = 0.0;
-    for kind in [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton] {
+    for kind in
+        [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton]
+    {
         let Some(b) = window.standardWindowButton(kind) else { continue };
         // In window coordinates: origin at the bottom left, `height` tall.
         let r = b.convertRect_toView(b.bounds(), None);
@@ -764,7 +835,10 @@ fn chrome(window: &NSWindow) -> Chrome {
     if std::env::var_os("HARNESS_NATIVE_CHROME_LOG").is_some() {
         eprintln!("harness-native: chrome strip={strip} lights_right={right}");
     }
-    Chrome { strip: strip as f32, title_x: if right > 0.0 { (right + TITLE_GAP) as f32 } else { 0.0 } }
+    Chrome {
+        strip: strip as f32,
+        title_x: if right > 0.0 { (right + TITLE_GAP) as f32 } else { 0.0 },
+    }
 }
 
 /// `HARNESS_NATIVE_CHROME_TEST`: resize this app's own window (no focus taken), logging the title bar after it, so a
@@ -772,7 +846,8 @@ fn chrome(window: &NSWindow) -> Chrome {
 /// a Space (and the screen); `windowChromeChanged:` handles its exit the same way.
 fn chrome_test(_window: &NSWindow) {
     fn later(secs: f64, f: fn(&NSWindow)) {
-        let when = dispatch2::DispatchTime::try_from(std::time::Duration::from_secs_f64(secs)).expect("a short delay");
+        let when = dispatch2::DispatchTime::try_from(std::time::Duration::from_secs_f64(secs))
+            .expect("a short delay");
         let _ = DispatchQueue::main().after(when, move || {
             let w = with(|st| st.window.clone());
             if let Some(w) = w {
@@ -796,9 +871,21 @@ fn no_activate() -> bool {
 
 fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(INITIAL.0, INITIAL.1));
-    let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable | NSWindowStyleMask::Resizable | NSWindowStyleMask::FullSizeContentView;
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::Resizable
+        | NSWindowStyleMask::FullSizeContentView;
     // SAFETY: a fresh window with a valid rect and style.
-    let window = unsafe { NSWindow::initWithContentRect_styleMask_backing_defer(NSWindow::alloc(mtm), rect, style, NSBackingStoreType::Buffered, false) };
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            rect,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
     // SAFETY: the state keeps its own reference; AppKit must not release it on close as well.
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(&NSString::from_str("harness"));
@@ -809,7 +896,9 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     window.setOpaque(false);
     window.setBackgroundColor(Some(&NSColor::clearColor()));
     let view = HarnessView::new(mtm, rect);
-    view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+    view.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
 
     let renderer = Renderer::new(MTLCreateSystemDefaultDevice().ok_or("no Metal device")?);
     let layer = CAMetalLayer::new();
@@ -819,21 +908,37 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     // Not opaque: the drawable's alpha (premultiplied, as every pipeline blends) lets the vibrancy through.
     layer.setOpaque(false);
     // SAFETY: kCGColorSpaceExtendedSRGB is a valid static colour space name.
-    layer.setColorspace(CGColorSpace::with_name(Some(unsafe { kCGColorSpaceExtendedSRGB })).as_deref());
+    layer.setColorspace(
+        CGColorSpace::with_name(Some(unsafe { kCGColorSpaceExtendedSRGB })).as_deref(),
+    );
     // SAFETY: kCAGravityTopLeft is a valid static gravity name.
     layer.setContentsGravity(unsafe { kCAGravityTopLeft });
     view.setLayer(Some(&layer));
     view.setWantsLayer(true);
-    let options = NSTrackingAreaOptions::MouseEnteredAndExited | NSTrackingAreaOptions::MouseMoved | NSTrackingAreaOptions::ActiveInKeyWindow | NSTrackingAreaOptions::InVisibleRect;
+    let options = NSTrackingAreaOptions::MouseEnteredAndExited
+        | NSTrackingAreaOptions::MouseMoved
+        | NSTrackingAreaOptions::ActiveInKeyWindow
+        | NSTrackingAreaOptions::InVisibleRect;
     // SAFETY: the view owns the area and outlives it; no user info.
-    let area = unsafe { NSTrackingArea::initWithRect_options_owner_userInfo(NSTrackingArea::alloc(), NSRect::ZERO, options, Some(&view), None) };
+    let area = unsafe {
+        NSTrackingArea::initWithRect_options_owner_userInfo(
+            NSTrackingArea::alloc(),
+            NSRect::ZERO,
+            options,
+            Some(&view),
+            None,
+        )
+    };
     view.addTrackingArea(&area);
 
     let link = CAMetalDisplayLink::initWithMetalLayer(CAMetalDisplayLink::alloc(), &layer);
     link.setDelegate(Some(ProtocolObject::from_ref(&*view)));
     link.setPreferredFrameRateRange(LIVE);
     link.setPreferredFrameLatency(1.0);
-    let bench = std::env::var("HARNESS_NATIVE_BENCH_HZ").ok().and_then(|s| s.parse::<f64>().ok()).filter(|hz| *hz > 0.0);
+    let bench = std::env::var("HARNESS_NATIVE_BENCH_HZ")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|hz| *hz > 0.0);
     if let Some(hz) = bench {
         bench_clock(&view, hz);
     } else {
@@ -850,9 +955,27 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
         app.select_session(sid);
     }
     // The menu bar, from the keys' actions and bindings (rebuilt in `frame` when they are loaded again).
-    NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu(mtm, &app.menu(), Some(&*view))));
+    NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu(
+        mtm,
+        &app.menu(),
+        Some(&*view),
+    )));
     let menu_gen = app.keys_gen();
-    STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new(), lights: 1.0, tip: String::new(), calm: false, menu_gen }));
+    STATE.with(|s| {
+        *s.borrow_mut() = Some(State {
+            app,
+            renderer,
+            layer,
+            link,
+            window: window.clone(),
+            last: None,
+            title: String::new(),
+            lights: 1.0,
+            tip: String::new(),
+            calm: false,
+            menu_gen,
+        })
+    });
     // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.
     let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), rect);
     // HARNESS_NATIVE_MATERIAL=sidebar|under|hud: the vibrancy material under the sidebar's tint plate.
@@ -863,8 +986,14 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     });
     effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
     // HARNESS_NATIVE_VIBRANCY=active: always the active material (captures of a window that never takes the keyboard).
-    effect.setState(if std::env::var("HARNESS_NATIVE_VIBRANCY").as_deref() == Ok("active") { NSVisualEffectState::Active } else { NSVisualEffectState::FollowsWindowActiveState });
-    effect.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+    effect.setState(if std::env::var("HARNESS_NATIVE_VIBRANCY").as_deref() == Ok("active") {
+        NSVisualEffectState::Active
+    } else {
+        NSVisualEffectState::FollowsWindowActiveState
+    });
+    effect.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
     effect.addSubview(&view);
     window.setContentView(Some(&effect));
     with(|st| st.app.dark = is_dark(&view));
@@ -873,19 +1002,45 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     // SAFETY: the view outlives the window's notifications (both live until the app quits); the selectors take one
     // NSNotification.
     unsafe {
-        center.addObserver_selector_name_object(&view, sel!(windowDidBecomeKey:), Some(objc2_app_kit::NSWindowDidBecomeKeyNotification), Some(&window));
-        center.addObserver_selector_name_object(&view, sel!(windowDidResignKey:), Some(objc2_app_kit::NSWindowDidResignKeyNotification), Some(&window));
+        center.addObserver_selector_name_object(
+            &view,
+            sel!(windowDidBecomeKey:),
+            Some(objc2_app_kit::NSWindowDidBecomeKeyNotification),
+            Some(&window),
+        );
+        center.addObserver_selector_name_object(
+            &view,
+            sel!(windowDidResignKey:),
+            Some(objc2_app_kit::NSWindowDidResignKeyNotification),
+            Some(&window),
+        );
         // AppKit lays the title bar (and the traffic lights) out again after these.
-        for name in [objc2_app_kit::NSWindowDidResizeNotification, objc2_app_kit::NSWindowDidEnterFullScreenNotification, objc2_app_kit::NSWindowDidExitFullScreenNotification] {
-            center.addObserver_selector_name_object(&view, sel!(windowChromeChanged:), Some(name), Some(&window));
+        for name in [
+            objc2_app_kit::NSWindowDidResizeNotification,
+            objc2_app_kit::NSWindowDidEnterFullScreenNotification,
+            objc2_app_kit::NSWindowDidExitFullScreenNotification,
+        ] {
+            center.addObserver_selector_name_object(
+                &view,
+                sel!(windowChromeChanged:),
+                Some(name),
+                Some(&window),
+            );
         }
     }
     window.center();
     // `HARNESS_NATIVE_FRAME=x,y,w,h` (points, from the main screen's top left): where the window goes, for measuring the
     // frame clock in a corner no other window covers (an occluded window's display link stops calling).
-    if let Some([x, y, w, h]) = std::env::var("HARNESS_NATIVE_FRAME").ok().and_then(|v| v.split(',').map(|p| p.trim().parse::<f64>().ok()).collect::<Option<Vec<_>>>()).and_then(|v| <[f64; 4]>::try_from(v).ok()) {
+    if let Some([x, y, w, h]) = std::env::var("HARNESS_NATIVE_FRAME")
+        .ok()
+        .and_then(|v| {
+            v.split(',').map(|p| p.trim().parse::<f64>().ok()).collect::<Option<Vec<_>>>()
+        })
+        .and_then(|v| <[f64; 4]>::try_from(v).ok())
+    {
         let top = objc2_app_kit::NSScreen::mainScreen(mtm).map_or(0.0, |s| s.frame().size.height);
-        window.setFrame_display(NSRect::new(NSPoint::new(x, top - y - h), NSSize::new(w, h)), false);
+        window
+            .setFrame_display(NSRect::new(NSPoint::new(x, top - y - h), NSSize::new(w, h)), false);
     }
     window.makeFirstResponder(Some(&view));
     if no_activate() {
@@ -942,12 +1097,28 @@ impl AppDelegate {
     }
 }
 
-fn item(mtm: MainThreadMarker, title: &str, action: objc2::runtime::Sel, key: &str) -> Retained<NSMenuItem> {
+fn item(
+    mtm: MainThreadMarker,
+    title: &str,
+    action: objc2::runtime::Sel,
+    key: &str,
+) -> Retained<NSMenuItem> {
     // SAFETY: a fresh item with a valid selector; the target is the responder chain.
-    unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), &NSString::from_str(title), Some(action), &NSString::from_str(key)) }
+    unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            Some(action),
+            &NSString::from_str(key),
+        )
+    }
 }
 
-fn submenu(mtm: MainThreadMarker, title: &str, items: &[Retained<NSMenuItem>]) -> Retained<NSMenuItem> {
+fn submenu(
+    mtm: MainThreadMarker,
+    title: &str,
+    items: &[Retained<NSMenuItem>],
+) -> Retained<NSMenuItem> {
     let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(title));
     for i in items {
         menu.addItem(i);
@@ -960,7 +1131,11 @@ fn submenu(mtm: MainThreadMarker, title: &str, items: &[Retained<NSMenuItem>]) -
 
 /// The menu bar from the keys' menus (`App::menu`): each action an item, its key equivalent its binding's; an item with
 /// a selector sends it up the responder chain, the others run their action through `target`'s `runAction:`.
-fn main_menu(mtm: MainThreadMarker, bars: &[(String, Vec<MenuLine>)], target: Option<&HarnessView>) -> Retained<NSMenu> {
+fn main_menu(
+    mtm: MainThreadMarker,
+    bars: &[(String, Vec<MenuLine>)],
+    target: Option<&HarnessView>,
+) -> Retained<NSMenu> {
     let bar = NSMenu::new(mtm);
     for (title, lines) in bars {
         let mut items = Vec::new();
@@ -969,15 +1144,21 @@ fn main_menu(mtm: MainThreadMarker, bars: &[(String, Vec<MenuLine>)], target: Op
                 items.push(NSMenuItem::separatorItem(mtm));
             }
             let sel = l.selector.as_deref().map_or(sel!(runAction:), sel_of);
-            let (key, mask) = l.key.as_ref().map_or((String::new(), NSEventModifierFlags::empty()), |(k, m)| {
-                let mut f = NSEventModifierFlags::empty();
-                for (on, flag) in [(m.cmd, NSEventModifierFlags::Command), (m.shift, NSEventModifierFlags::Shift), (m.alt, NSEventModifierFlags::Option), (m.ctrl, NSEventModifierFlags::Control)] {
-                    if on {
-                        f |= flag;
+            let (key, mask) =
+                l.key.as_ref().map_or((String::new(), NSEventModifierFlags::empty()), |(k, m)| {
+                    let mut f = NSEventModifierFlags::empty();
+                    for (on, flag) in [
+                        (m.cmd, NSEventModifierFlags::Command),
+                        (m.shift, NSEventModifierFlags::Shift),
+                        (m.alt, NSEventModifierFlags::Option),
+                        (m.ctrl, NSEventModifierFlags::Control),
+                    ] {
+                        if on {
+                            f |= flag;
+                        }
                     }
-                }
-                (k.clone(), f)
-            });
+                    (k.clone(), f)
+                });
             let it = item(mtm, &l.title, sel, &key);
             it.setKeyEquivalentModifierMask(mask);
             if l.selector.is_none() {
@@ -1024,7 +1205,12 @@ pub fn dump_menu(bars: &[(String, Vec<MenuLine>)]) -> String {
             }
             let m = it.keyEquivalentModifierMask();
             let mut keys = String::new();
-            for (flag, g) in [(NSEventModifierFlags::Control, '\u{2303}'), (NSEventModifierFlags::Option, '\u{2325}'), (NSEventModifierFlags::Shift, '\u{21E7}'), (NSEventModifierFlags::Command, '\u{2318}')] {
+            for (flag, g) in [
+                (NSEventModifierFlags::Control, '\u{2303}'),
+                (NSEventModifierFlags::Option, '\u{2325}'),
+                (NSEventModifierFlags::Shift, '\u{21E7}'),
+                (NSEventModifierFlags::Command, '\u{2318}'),
+            ] {
                 if m.contains(flag) {
                     keys.push(g);
                 }
@@ -1036,8 +1222,15 @@ pub fn dump_menu(bars: &[(String, Vec<MenuLine>)]) -> String {
                 "-" => "\u{2212}".into(),
                 k => k.to_uppercase(),
             };
-            let action = it.action().map(|s| s.name().to_string_lossy().into_owned()).unwrap_or_default();
-            out += &format!("  {:<18} {:<8} {}{}\n", it.title(), keys, action, if action == "runAction:" { format!(" (tag {})", it.tag()) } else { String::new() });
+            let action =
+                it.action().map(|s| s.name().to_string_lossy().into_owned()).unwrap_or_default();
+            out += &format!(
+                "  {:<18} {:<8} {}{}\n",
+                it.title(),
+                keys,
+                action,
+                if action == "runAction:" { format!(" (tag {})", it.tag()) } else { String::new() }
+            );
         }
     }
     out
@@ -1071,7 +1264,11 @@ pub fn run(listener: Option<std::os::unix::net::UnixListener>, select: Option<u6
         single::serve(l, asked);
     }
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(if no_activate() { NSApplicationActivationPolicy::Accessory } else { NSApplicationActivationPolicy::Regular });
+    app.setActivationPolicy(if no_activate() {
+        NSApplicationActivationPolicy::Accessory
+    } else {
+        NSApplicationActivationPolicy::Regular
+    });
     force_appearance(&app);
     let delegate = AppDelegate::new(mtm);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));

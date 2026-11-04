@@ -1,0 +1,9 @@
+[package]
+name = "harness-native-blaze"
+description = "blaze's wordmark set on fire, live: the letters drop in, the fire catches left to right, and on the way out they burn to embers; and its soundtrack, synthesised from the same timeline (ported from indexable-inc/anim)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]

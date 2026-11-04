@@ -408,6 +408,47 @@ float4 line_fs(LineV v, ConstantBuffer<Frame> frame, StructuredBuffer<LineInst> 
 // the pixel, so its coverage is exactly 0 or 1 and a line that leaves one cell meets the next with no seam. Arcs,
 // diagonals and the powerline curves are distances (in pixels) antialiased over the distance's own screen derivative.
 
+struct ImageInst
+{
+    float4 rect;     // x, y, w, h (points)
+    float4 size;     // the texture's width and height (texels), opacity, 1 to filter it smoothly (a glow) rather than fetch texels
+    float4 clip;     // the band it shows in, as a panel's
+};
+
+struct ImageV
+{
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+    float y : TEXCOORD1;
+    nointerpolation uint inst : TEXCOORD2;
+};
+
+[shader("vertex")]
+ImageV image_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer<Frame> frame, StructuredBuffer<ImageInst> insts)
+{
+    ImageInst m = insts[iid];
+    float2 c = CORNERS[vid];
+    float2 pt = m.rect.xy + c * m.rect.zw;
+    ImageV o;
+    o.pos = float4(to_ndc(pt, frame.view), 0, 1);
+    o.uv = c;
+    o.y = pt.y;
+    o.inst = iid;
+    return o;
+}
+
+// Pixel art: the texel under the fragment, fetched (never filtered), so each one is a crisp block with no seam between
+// neighbours at any size or offset.
+[shader("fragment")]
+float4 image_fs(ImageV v, ConstantBuffer<Frame> frame, StructuredBuffer<ImageInst> insts, Texture2D<float4> tex, SamplerState smp)
+{
+    ImageInst m = insts[v.inst];
+    int2 at = clamp(int2(floor(v.uv * m.size.xy)), int2(0, 0), int2(m.size.xy) - 1);
+    float4 t = m.size.w > 0.5 ? tex.SampleLevel(smp, v.uv, 0) : tex.Load(int3(at, 0));
+    float a = t.a * m.size.z * in_band(v.y, m.clip, m.clip.zw, frame.scale);
+    return float4(t.rgb * a, a);
+}
+
 struct SpriteInst
 {
     int4 rect;       // the cell: x, y, w, h (device pixels)

@@ -13,7 +13,11 @@ fn path() -> PathBuf {
 }
 
 fn read() -> Map<String, Value> {
-    std::fs::read(path()).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v.as_object().cloned()).unwrap_or_default()
+    std::fs::read(path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
 }
 
 /// The value at `key`, if the file has it.
@@ -36,7 +40,10 @@ fn write(m: Map<String, Value>) {
         Ok(b) => b,
         Err(e) => return eprintln!("harness-native: {}: {e}", p.display()),
     };
-    if let Err(e) = std::fs::create_dir_all(p.parent().unwrap_or(&p)).and_then(|()| std::fs::write(&tmp, body)).and_then(|()| std::fs::rename(&tmp, &p)) {
+    if let Err(e) = std::fs::create_dir_all(p.parent().unwrap_or(&p))
+        .and_then(|()| std::fs::write(&tmp, body))
+        .and_then(|()| std::fs::rename(&tmp, &p))
+    {
         eprintln!("harness-native: write {}: {e}", p.display());
     }
 }
@@ -48,7 +55,9 @@ pub fn ids(key: &str) -> Option<std::collections::BTreeSet<u64>> {
 
 /// The strings listed at `key` (`closed`, `pinned`), or None when the file has no such key.
 pub fn keys(key: &str) -> Option<std::collections::BTreeSet<String>> {
-    get(key).and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()))
+    get(key).and_then(|v| {
+        v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+    })
 }
 
 /// Drop `keys` from the file (when it has any of them), keeping every other key.

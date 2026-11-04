@@ -57,11 +57,33 @@ pub struct Constraint {
 }
 
 impl Constraint {
-    pub const NONE: Self = Self { size: Size::None, height: Height::Cell, max_w: 2, align_x: Align::None, align_y: Align::None, pad_top: 0.0, pad_left: 0.0, pad_right: 0.0, pad_bottom: 0.0, rel_w: 1.0, rel_h: 1.0, rel_x: 0.0, rel_y: 0.0, max_xy: 0.0 };
+    pub const NONE: Self = Self {
+        size: Size::None,
+        height: Height::Cell,
+        max_w: 2,
+        align_x: Align::None,
+        align_y: Align::None,
+        pad_top: 0.0,
+        pad_left: 0.0,
+        pad_right: 0.0,
+        pad_bottom: 0.0,
+        rel_w: 1.0,
+        rel_h: 1.0,
+        rel_x: 0.0,
+        rel_y: 0.0,
+        max_xy: 0.0,
+    };
     /// A symbol from a fallback font: shrunk to fit its cells (Ghostty's `Renderer.addGlyph`).
     pub const FIT: Self = Self { size: Size::Fit, ..Self::NONE };
     /// An emoji: fills its cells, centred, with a sliver of room each side (Ghostty's `SharedGrid.renderGlyph`).
-    pub const EMOJI: Self = Self { size: Size::Cover, align_x: Align::Center, align_y: Align::Center, pad_left: 0.025, pad_right: 0.025, ..Self::NONE };
+    pub const EMOJI: Self = Self {
+        size: Size::Cover,
+        align_x: Align::Center,
+        align_y: Align::Center,
+        pad_left: 0.025,
+        pad_right: 0.025,
+        ..Self::NONE
+    };
 
     fn does_anything(&self) -> bool {
         self.size != Size::None || self.align_x != Align::None || self.align_y != Align::None
@@ -76,17 +98,28 @@ impl Constraint {
         if self.size == Size::Stretch {
             // Stretched glyphs meet across cells: scale them to the grid, not the face, and with no negative padding.
             let m = Metrics { face_w: m.cell_w, face_h: m.cell_h, face_y: 0.0, ..*m };
-            let c = Self { pad_bottom: self.pad_bottom.max(0.0), pad_top: self.pad_top.max(0.0), pad_left: self.pad_left.max(0.0), pad_right: self.pad_right.max(0.0), ..*self };
+            let c = Self {
+                pad_bottom: self.pad_bottom.max(0.0),
+                pad_top: self.pad_top.max(0.0),
+                pad_left: self.pad_left.max(0.0),
+                pad_right: self.pad_right.max(0.0),
+                ..*self
+            };
             return c.inner(glyph, &m, width);
         }
         self.inner(glyph, m, width)
     }
 
     fn inner(&self, glyph: Rect, m: &Metrics, width: u8) -> Rect {
-        let min_w = if self.size == Size::Stretch && m.face_w > 0.9 * m.face_h { 1 } else { self.max_w.min(width) };
+        let min_w = if self.size == Size::Stretch && m.face_w > 0.9 * m.face_h {
+            1
+        } else {
+            self.max_w.min(width)
+        };
         let gw = glyph.w / self.rel_w;
         let gh = glyph.h / self.rel_h;
-        let mut group = Rect { w: gw, h: gh, x: glyph.x - gw * self.rel_x, y: glyph.y - gh * self.rel_y };
+        let mut group =
+            Rect { w: gw, h: gh, x: glyph.x - gw * self.rel_x, y: glyph.y - gh * self.rel_y };
         let (fx, fy) = self.factors(group, m, min_w);
         let (cx, cy) = (group.x + group.w / 2.0, group.y + group.h / 2.0);
         group.w *= fx;
@@ -95,7 +128,12 @@ impl Constraint {
         group.y = cy - group.h / 2.0;
         group.y = self.aligned_y(group, m);
         group.x = self.aligned_x(group, m, min_w);
-        Rect { w: fx * glyph.w, h: fy * glyph.h, x: group.x + group.w * self.rel_x, y: group.y + group.h * self.rel_y }
+        Rect {
+            w: fx * glyph.w,
+            h: fy * glyph.h,
+            x: group.x + group.w * self.rel_x,
+            y: group.y + group.h * self.rel_y,
+        }
     }
 
     fn factors(&self, group: Rect, m: &Metrics, min_w: u8) -> (f64, f64) {
@@ -168,7 +206,9 @@ impl Constraint {
             Align::Start => start,
             Align::End => start.max(end),
             Align::Center => start.max((start + end) / 2.0),
-            Align::Center1 => start.max((start + (m.face_w - group.w - self.pad_right * m.face_w)) / 2.0),
+            Align::Center1 => {
+                start.max((start + (m.face_w - group.w - self.pad_right * m.face_w)) / 2.0)
+            }
         }
     }
 }
@@ -211,7 +251,15 @@ mod tests {
     use super::*;
 
     /// Ghostty's own expectations (Glyph.zig "Constraints" test: JetBrains Mono at 12 pt, 96 DPI).
-    const M: Metrics = Metrics { cell_w: 10.0, cell_h: 22.0, face_w: 9.6, face_h: 21.12, face_y: 0.2, icon_h: 21.12, icon_h1: 44.48 / 3.0 };
+    const M: Metrics = Metrics {
+        cell_w: 10.0,
+        cell_h: 22.0,
+        face_w: 9.6,
+        face_h: 21.12,
+        face_y: 0.2,
+        icon_h: 21.12,
+        icon_h1: 44.48 / 3.0,
+    };
 
     fn close(a: Rect, b: Rect) {
         for (x, y) in [(a.w, b.w), (a.h, b.h), (a.x, b.x), (a.y, b.y)] {
@@ -222,9 +270,15 @@ mod tests {
     #[test]
     fn nerd_default_and_stretch() {
         let c = nerd(0xEA61).unwrap();
-        assert_eq!((c.size, c.height, c.align_x, c.align_y), (Size::FitCover1, Height::Icon, Align::Center1, Align::Center1));
+        assert_eq!(
+            (c.size, c.height, c.align_x, c.align_y),
+            (Size::FitCover1, Height::Icon, Align::Center1, Align::Center1)
+        );
         let g = Rect { w: 9.015625, h: 13.015625, x: 3.015625, y: 3.76525 };
-        close(c.constrain(g, &M, 1), Rect { w: 7.2125, h: 10.4125, x: 0.8125, y: 5.950695224719102 });
+        close(
+            c.constrain(g, &M, 1),
+            Rect { w: 7.2125, h: 10.4125, x: 0.8125, y: 5.950695224719102 },
+        );
         close(c.constrain(g, &M, 2), Rect { w: g.w, h: g.h, x: 1.015625, y: 4.7483690308988775 });
         let s = nerd(0xE0C0).unwrap();
         let g = Rect { w: 16.796875, h: 16.46875, x: -0.796875, y: 1.7109375 };
@@ -235,7 +289,10 @@ mod tests {
 
     #[test]
     fn emoji_and_symbol() {
-        close(Constraint::EMOJI.constrain(Rect { w: 20.0, h: 20.0, x: 0.46, y: 1.0 }, &M, 2), Rect { w: 18.72, h: 18.72, x: 0.44, y: 1.4 });
+        close(
+            Constraint::EMOJI.constrain(Rect { w: 20.0, h: 20.0, x: 0.46, y: 1.0 }, &M, 2),
+            Rect { w: 18.72, h: 18.72, x: 0.44, y: 1.4 },
+        );
         let sq = Rect { w: 10.272, h: 10.272, x: 2.864, y: 5.304 };
         close(Constraint::FIT.constrain(sq, &M, 1), Rect { w: 9.6, h: 9.6, x: 0.0, y: 5.64 });
         close(Constraint::FIT.constrain(sq, &M, 2), sq);

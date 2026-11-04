@@ -29,7 +29,7 @@ state (`harness-vt`).
 5. **Keys** (`harness-native/scene/20-keys.flecs`): bindings are data, see below.
 
 Rust owns only: the terminal grid (thousands of cells a frame, never entities), key dispatch, the layout solver,
-springs, drawing, the daemon link. Everything a designer would tweak lives in script.
+springs, drawing (shared with harness-video in `harness-native-render`: Metal, text, the paint pass), the daemon link. Everything a designer would tweak lives in script.
 
 ## The primitive vocabulary (SwiftUI's, as components)
 
@@ -51,6 +51,9 @@ springs, drawing, the daemon link. Everything a designer would tweak lives in sc
 | Tooltip | `Tooltip: {text: "..."}` on any node (system tooltip; nearest ancestor's wins) |
 | Scrolling | `ui.Scroll` (clips, shifts by `ScrollState`); the tree's inertia (harness-native-scroll-physics), knob and edge fades are in `harness-native/src/app/sidebar.rs` |
 | Motion | `MatchedGeometry {id}` (selection pill), `Transition: {kind: Opacity/Slide/Scale/Move}`, `Animate`, `HoverAmt`/`HoverLift` springs; spring params are tokens |
+| Pose / timeline | `Pose: {dx, dy, shrink, fade, cut}` (0 at rest; draw folds it into the subtree, layout ignores it); a `Cue` child animates any member by path over the clock (`harness-native-ui-timeline`, used by `harness-video`) |
+| Text motion, code colour | `GlyphsIn: {at, per, dur, by, ease}` (glyph-by-glyph arrival), `Caret: {at, until, blink, ink}`, `Highlight: {file}` (tree-sitter, inks from `code_ink.<capture>` tokens) |
+| Pixel art | `Picture: {handle}` + `Pixelated`, `Frames: {count, fps}` for a sheet; `BlazeMark: {start, exit}` for the live fire wordmark (`harness-native-blaze`). Drawn as one texture, texels fetched not filtered: never a panel per cell (those seam when scaled) |
 | Clip | `Clip` (the sidebar fold lays out at full width and clips; never relayout at in-between widths) |
 
 New UI need not covered here: add a primitive (component + prim prefab + a gallery example under

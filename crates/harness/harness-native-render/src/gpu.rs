@@ -6,15 +6,15 @@
 //! shader elements, mascots and 3D scenes are gone. Per-frame CPU-written buffers are rings of [`FRAMES`]
 //! slots gated by a semaphore; the tiny uniforms go by setBytes.
 pub use crate::draw::*;
-use objc2_quartz_core::CAMetalDrawable as _;
-use crate::pack::{GlyphInst, LineInst, PanelInst, SpriteInst};
+use crate::pack::{GlyphInst, ImageInst, LineInst, PanelInst, SpriteInst};
+use block2::RcBlock;
 use bytemuck::Pod;
 use dispatch2::{DispatchData, DispatchRetained, DispatchSemaphore, DispatchTime};
-use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::*;
+use objc2_quartz_core::CAMetalDrawable as _;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
@@ -27,7 +27,11 @@ include!(concat!(env!("OUT_DIR"), "/harness_bindings.rs"));
 
 /// Slot of an entry point's parameter, from the table build.rs read out of the generated MSL.
 fn slot(entry: &str, param: &str) -> usize {
-    BINDINGS.iter().find(|b| b.0 == entry && b.1 == param).unwrap_or_else(|| panic!("no binding {entry}.{param}")).3 as usize
+    BINDINGS
+        .iter()
+        .find(|b| b.0 == entry && b.1 == param)
+        .unwrap_or_else(|| panic!("no binding {entry}.{param}"))
+        .3 as usize
 }
 
 pub type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -52,12 +56,13 @@ pub struct Renderer {
     glyph: Pso,
     line: Pso,
     sprite: Pso,
+    image: Pso,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     pub atlas: Tex,
     /// The brand marks' Slug curves and bands (icons.rs), uploaded once.
     curves: Buf,
     bands: Buf,
-    rings: [Option<Ring>; 4],
+    rings: [Option<Ring>; 5],
     slot: usize,
     sem: DispatchRetained<DispatchSemaphore>,
     /// The last finished command buffer's GPU time (GPUEndTime - GPUStartTime), milliseconds as f32 bits: two reads in
@@ -71,7 +76,10 @@ fn s(x: &str) -> Retained<NSString> {
 
 fn pipeline(dev: &Dev, lib: &Retained<ProtocolObject<dyn MTLLibrary>>, vs: &str, fs: &str) -> Pso {
     let desc = MTLRenderPipelineDescriptor::new();
-    let f = |n: &str| lib.newFunctionWithName(&s(n)).unwrap_or_else(|| panic!("shader entry {n} missing from the metallib"));
+    let f = |n: &str| {
+        lib.newFunctionWithName(&s(n))
+            .unwrap_or_else(|| panic!("shader entry {n} missing from the metallib"))
+    };
     desc.setVertexFunction(Some(&f(vs)));
     desc.setFragmentFunction(Some(&f(fs)));
     // SAFETY: attachment 0 always exists.
@@ -83,7 +91,8 @@ fn pipeline(dev: &Dev, lib: &Retained<ProtocolObject<dyn MTLLibrary>>, vs: &str,
     att.setSourceAlphaBlendFactor(MTLBlendFactor::One);
     att.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
     att.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-    dev.newRenderPipelineStateWithDescriptor_error(&desc).unwrap_or_else(|e| panic!("pipeline {vs}/{fs}: {e}"))
+    dev.newRenderPipelineStateWithDescriptor_error(&desc)
+        .unwrap_or_else(|e| panic!("pipeline {vs}/{fs}: {e}"))
 }
 
 impl Renderer {
@@ -98,14 +107,32 @@ impl Renderer {
         sd.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);
         let sampler = dev.newSamplerStateWithDescriptor(&sd).expect("sampler");
         // SAFETY: a plain 2D descriptor of a supported format and a positive size.
-        let ad = unsafe { MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(MTLPixelFormat::RGBA8Unorm, ATLAS_SIZE as usize, ATLAS_SIZE as usize, false) };
+        let ad = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                ATLAS_SIZE as usize,
+                ATLAS_SIZE as usize,
+                false,
+            )
+        };
         ad.setUsage(MTLTextureUsage::ShaderRead);
         let atlas = dev.newTextureWithDescriptor(&ad).expect("atlas");
         let marks = crate::icons::marks();
         let fixed = |bytes: &[u8]| {
-            let b = dev.newBufferWithLength_options(bytes.len().max(256), MTLResourceOptions::StorageModeShared).expect("outline buffer");
+            let b = dev
+                .newBufferWithLength_options(
+                    bytes.len().max(256),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("outline buffer");
             // SAFETY: the buffer holds at least bytes.len() bytes of CPU-visible memory no GPU work uses yet.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr().cast::<u8>(), bytes.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    b.contents().as_ptr().cast::<u8>(),
+                    bytes.len(),
+                )
+            };
             b
         };
         let curves = fixed(bytemuck::cast_slice(&marks.curves));
@@ -115,13 +142,14 @@ impl Renderer {
             glyph: pipeline(&dev, &lib, "glyph_vs", "glyph_fs"),
             line: pipeline(&dev, &lib, "line_vs", "line_fs"),
             sprite: pipeline(&dev, &lib, "sprite_vs", "sprite_fs"),
+            image: pipeline(&dev, &lib, "image_vs", "image_fs"),
             dev,
             queue,
             sampler,
             atlas,
             curves,
             bands,
-            rings: [None, None, None, None],
+            rings: [None, None, None, None, None],
             slot: 0,
             sem: DispatchSemaphore::new(FRAMES as isize),
             gpu_ms: std::sync::Arc::default(),
@@ -140,16 +168,63 @@ impl Renderer {
     /// Upload glyph pixels (premultiplied RGBA) into the atlas (new texels only, so frames in flight never see them
     /// change).
     pub fn upload_atlas(&self, x: u32, y: u32, w: u32, h: u32, bytes: &[u8]) {
-        let region = MTLRegion { origin: MTLOrigin { x: x as usize, y: y as usize, z: 0 }, size: MTLSize { width: w as usize, height: h as usize, depth: 1 } };
+        let region = MTLRegion {
+            origin: MTLOrigin { x: x as usize, y: y as usize, z: 0 },
+            size: MTLSize { width: w as usize, height: h as usize, depth: 1 },
+        };
         debug_assert_eq!(bytes.len(), (w * h * 4) as usize);
         // SAFETY: bytes holds w*h tightly packed RGBA texels and stays alive for the call; the region lies inside the atlas.
-        unsafe { self.atlas.replaceRegion_mipmapLevel_withBytes_bytesPerRow(region, 0, NonNull::new(bytes.as_ptr().cast_mut().cast::<c_void>()).unwrap(), w as usize * 4) };
+        unsafe {
+            self.atlas.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region,
+                0,
+                NonNull::new(bytes.as_ptr().cast_mut().cast::<c_void>()).unwrap(),
+                w as usize * 4,
+            )
+        };
+    }
+
+    /// A picture's texture: `w` by `h` texels of straight RGBA8.
+    fn picture(&self, w: usize, h: usize, px: &[u8]) -> Tex {
+        // SAFETY: a plain 2D descriptor of a supported format and a positive size.
+        let d = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                w.max(1),
+                h.max(1),
+                false,
+            )
+        };
+        d.setUsage(MTLTextureUsage::ShaderRead);
+        let t = self.dev.newTextureWithDescriptor(&d).expect("picture texture");
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize { width: w, height: h, depth: 1 },
+        };
+        assert_eq!(px.len(), w * h * 4, "picture texels");
+        // SAFETY: px holds w*h tightly packed RGBA texels and stays alive for the call; the region is the whole texture.
+        unsafe {
+            t.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region,
+                0,
+                NonNull::new(px.as_ptr().cast_mut().cast::<c_void>()).unwrap(),
+                w * 4,
+            )
+        };
+        t
     }
 
     /// An offscreen destination (for screenshots), readable by [`Self::read`].
     pub fn offscreen(&self, w: usize, h: usize) -> Tex {
         // SAFETY: a plain 2D descriptor of a supported format and a positive size.
-        let d = unsafe { MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(PIXEL_FORMAT, w.max(1), h.max(1), false) };
+        let d = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                PIXEL_FORMAT,
+                w.max(1),
+                h.max(1),
+                false,
+            )
+        };
         d.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
         d.setStorageMode(MTLStorageMode::Shared);
         self.dev.newTextureWithDescriptor(&d).expect("target texture")
@@ -159,12 +234,24 @@ impl Renderer {
         let need = std::mem::size_of_val(items).max(256);
         if self.rings[which].as_ref().is_none_or(|r| r.cap < need) {
             let cap = need.next_power_of_two();
-            let bufs = (0..FRAMES).map(|_| self.dev.newBufferWithLength_options(cap, MTLResourceOptions::StorageModeShared).expect("ring buffer")).collect();
+            let bufs = (0..FRAMES)
+                .map(|_| {
+                    self.dev
+                        .newBufferWithLength_options(cap, MTLResourceOptions::StorageModeShared)
+                        .expect("ring buffer")
+                })
+                .collect();
             self.rings[which] = Some(Ring { bufs, cap });
         }
         let buf = self.rings[which].as_ref().unwrap().bufs[slot].clone();
         // SAFETY: the buffer holds at least `need` bytes of CPU-visible memory, and the semaphore guarantees the GPU is done with this slot.
-        unsafe { std::ptr::copy_nonoverlapping(bytemuck::cast_slice::<T, u8>(items).as_ptr(), buf.contents().as_ptr().cast::<u8>(), std::mem::size_of_val(items)) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytemuck::cast_slice::<T, u8>(items).as_ptr(),
+                buf.contents().as_ptr().cast::<u8>(),
+                std::mem::size_of_val(items),
+            )
+        };
         buf
     }
 
@@ -176,6 +263,14 @@ impl Renderer {
         let gb = self.ring(1, ring_slot, &draw.glyphs);
         let lb = self.ring(2, ring_slot, &draw.lines);
         let sb = self.ring(3, ring_slot, &draw.sprites);
+        let ib = self.ring(4, ring_slot, &draw.images);
+        // A texture per picture, filled now: small, and alive until the command buffer that reads it is done with it.
+        let texs: Vec<Tex> = draw
+            .images
+            .iter()
+            .zip(&draw.texels)
+            .map(|(m, px)| self.picture(m.size[0] as usize, m.size[1] as usize, px))
+            .collect();
         let Some(cmd) = self.queue.commandBuffer() else {
             self.sem.signal();
             return;
@@ -193,7 +288,12 @@ impl Renderer {
         let c = draw.clear;
         let a = f64::from(c[3]);
         // Premultiplied, as every pipeline's blend and the layer's compositing take colour.
-        ca.setClearColor(MTLClearColor { red: f64::from(c[0]) * a, green: f64::from(c[1]) * a, blue: f64::from(c[2]) * a, alpha: a });
+        ca.setClearColor(MTLClearColor {
+            red: f64::from(c[0]) * a,
+            green: f64::from(c[1]) * a,
+            blue: f64::from(c[2]) * a,
+            alpha: a,
+        });
         if let Some(enc) = cmd.renderCommandEncoderWithDescriptor(&rp) {
             let fb = bytemuck::bytes_of(&draw.frame);
             for sg in &draw.segs {
@@ -201,31 +301,90 @@ impl Renderer {
                     continue;
                 }
                 let (pso, vs, fs, buf, stride) = match sg.kind {
-                    SegKind::Panel => (&self.panel, "panel_vs", "panel_fs", &pb, std::mem::size_of::<PanelInst>()),
-                    SegKind::Glyph => (&self.glyph, "glyph_vs", "glyph_fs", &gb, std::mem::size_of::<GlyphInst>()),
-                    SegKind::Line => (&self.line, "line_vs", "line_fs", &lb, std::mem::size_of::<LineInst>()),
-                    SegKind::Sprite => (&self.sprite, "sprite_vs", "sprite_fs", &sb, std::mem::size_of::<SpriteInst>()),
+                    SegKind::Panel => {
+                        (&self.panel, "panel_vs", "panel_fs", &pb, std::mem::size_of::<PanelInst>())
+                    }
+                    SegKind::Glyph => {
+                        (&self.glyph, "glyph_vs", "glyph_fs", &gb, std::mem::size_of::<GlyphInst>())
+                    }
+                    SegKind::Line => {
+                        (&self.line, "line_vs", "line_fs", &lb, std::mem::size_of::<LineInst>())
+                    }
+                    SegKind::Sprite => (
+                        &self.sprite,
+                        "sprite_vs",
+                        "sprite_fs",
+                        &sb,
+                        std::mem::size_of::<SpriteInst>(),
+                    ),
+                    SegKind::Image => {
+                        (&self.image, "image_vs", "image_fs", &ib, std::mem::size_of::<ImageInst>())
+                    }
                 };
                 enc.setRenderPipelineState(pso);
                 // SAFETY: the pointers are valid for the lengths given; setBytes copies them. Buffers, textures and the
                 // sampler are live and bound to slots the shader declares; the draw reads `count` instances from the
                 // bound offset, inside the ring buffer.
                 unsafe {
-                    enc.setVertexBytes_length_atIndex(NonNull::new(fb.as_ptr().cast_mut().cast()).unwrap(), fb.len(), slot(vs, "frame"));
+                    enc.setVertexBytes_length_atIndex(
+                        NonNull::new(fb.as_ptr().cast_mut().cast()).unwrap(),
+                        fb.len(),
+                        slot(vs, "frame"),
+                    );
                     if sg.kind != SegKind::Sprite {
-                        enc.setFragmentBytes_length_atIndex(NonNull::new(fb.as_ptr().cast_mut().cast()).unwrap(), fb.len(), slot(fs, "frame"));
+                        enc.setFragmentBytes_length_atIndex(
+                            NonNull::new(fb.as_ptr().cast_mut().cast()).unwrap(),
+                            fb.len(),
+                            slot(fs, "frame"),
+                        );
                     }
-                    enc.setVertexBuffer_offset_atIndex(Some(buf), sg.first as usize * stride, slot(vs, "insts"));
+                    enc.setVertexBuffer_offset_atIndex(
+                        Some(buf),
+                        sg.first as usize * stride,
+                        slot(vs, "insts"),
+                    );
                     match sg.kind {
-                        SegKind::Panel | SegKind::Line | SegKind::Sprite => enc.setFragmentBuffer_offset_atIndex(Some(buf), sg.first as usize * stride, slot(fs, "insts")),
+                        SegKind::Panel | SegKind::Line | SegKind::Sprite => enc
+                            .setFragmentBuffer_offset_atIndex(
+                                Some(buf),
+                                sg.first as usize * stride,
+                                slot(fs, "insts"),
+                            ),
+                        SegKind::Image => {
+                            enc.setFragmentBuffer_offset_atIndex(
+                                Some(buf),
+                                sg.first as usize * stride,
+                                slot(fs, "insts"),
+                            );
+                            enc.setFragmentTexture_atIndex(
+                                Some(&texs[sg.first as usize]),
+                                slot(fs, "tex"),
+                            );
+                        }
                         SegKind::Glyph => {
                             enc.setFragmentTexture_atIndex(Some(&self.atlas), slot(fs, "atlas"));
-                            enc.setFragmentSamplerState_atIndex(Some(&self.sampler), slot(fs, "smp"));
-                            enc.setFragmentBuffer_offset_atIndex(Some(&self.curves), 0, slot(fs, "curves"));
-                            enc.setFragmentBuffer_offset_atIndex(Some(&self.bands), 0, slot(fs, "bands"));
+                            enc.setFragmentSamplerState_atIndex(
+                                Some(&self.sampler),
+                                slot(fs, "smp"),
+                            );
+                            enc.setFragmentBuffer_offset_atIndex(
+                                Some(&self.curves),
+                                0,
+                                slot(fs, "curves"),
+                            );
+                            enc.setFragmentBuffer_offset_atIndex(
+                                Some(&self.bands),
+                                0,
+                                slot(fs, "bands"),
+                            );
                         }
                     }
-                    enc.drawPrimitives_vertexStart_vertexCount_instanceCount(MTLPrimitiveType::TriangleStrip, 0, 4, sg.count as usize);
+                    enc.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                        MTLPrimitiveType::TriangleStrip,
+                        0,
+                        4,
+                        sg.count as usize,
+                    );
                 }
             }
             enc.endEncoding();
@@ -253,9 +412,19 @@ impl Renderer {
     pub fn read(&self, t: &Tex) -> Vec<u8> {
         let (w, h) = (t.width(), t.height());
         let mut v = vec![0u16; w * h * 4];
-        let region = MTLRegion { origin: MTLOrigin { x: 0, y: 0, z: 0 }, size: MTLSize { width: w, height: h, depth: 1 } };
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize { width: w, height: h, depth: 1 },
+        };
         // SAFETY: the buffer is w*h*8 bytes, one RGBA16Float texel per 8 bytes, and the texture is CPU readable (shared).
-        unsafe { t.getBytes_bytesPerRow_fromRegion_mipmapLevel(NonNull::new(v.as_mut_ptr().cast()).unwrap(), w * 8, region, 0) };
+        unsafe {
+            t.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::new(v.as_mut_ptr().cast()).unwrap(),
+                w * 8,
+                region,
+                0,
+            )
+        };
         v.into_iter().map(|h| (half_to_f32(h).clamp(0.0, 1.0) * 255.0).round() as u8).collect()
     }
 }
@@ -267,7 +436,13 @@ fn half_to_f32(h: u16) -> f32 {
     let frac = f32::from(h & 0x3ff);
     match exp {
         0 => sign * frac * 2f32.powi(-24),
-        31 => if frac == 0.0 { sign * f32::INFINITY } else { f32::NAN },
+        31 => {
+            if frac == 0.0 {
+                sign * f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
         _ => sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
     }
 }

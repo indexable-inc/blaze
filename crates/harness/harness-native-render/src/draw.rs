@@ -1,6 +1,8 @@
 //! What one frame draws, as plain data: the view flattens the world into a [`Draw`] and gpu.rs draws it. Nothing here touches
 //! a GPU. Copied from den-native's draw.rs (github.com/andrewgazelka/den) and stripped to panels, glyphs and lines.
-use crate::pack::{Frame, GlyphInst, LineInst, PanelInst, SpriteInst};
+use std::rc::Rc;
+
+use crate::pack::{Frame, GlyphInst, ImageInst, LineInst, PanelInst, SpriteInst};
 
 pub const ATLAS_SIZE: u32 = 2048;
 
@@ -12,6 +14,8 @@ pub enum SegKind {
     Line,
     /// Indices into [`Draw::sprites`]: procedural cells (box drawing, blocks, braille, sextants, powerline).
     Sprite,
+    /// One index into [`Draw::images`] (each binds its own texture, so a run is never more than one).
+    Image,
 }
 
 /// A run of consecutive instances of one kind, drawn in order.
@@ -31,6 +35,9 @@ pub struct Draw {
     pub glyphs: Vec<GlyphInst>,
     pub lines: Vec<LineInst>,
     pub sprites: Vec<SpriteInst>,
+    /// Pictures and their straight RGBA8 texels (`size` wide and high), one texture each.
+    pub images: Vec<ImageInst>,
+    pub texels: Vec<Rc<[u8]>>,
     /// Paint order: runs of instances by kind.
     pub segs: Vec<Seg>,
 }
@@ -39,6 +46,7 @@ impl Draw {
     fn push_seg(&mut self, kind: SegKind, index: usize) {
         if let Some(last) = self.segs.last_mut()
             && last.kind == kind
+            && kind != SegKind::Image
             && (last.first + last.count) as usize == index
         {
             last.count += 1;
@@ -65,5 +73,13 @@ impl Draw {
     pub fn sprite(&mut self, s: SpriteInst) {
         self.sprites.push(s);
         self.push_seg(SegKind::Sprite, self.sprites.len() - 1);
+    }
+
+    /// A picture: `texels` (straight RGBA8, `size[0]` by `size[1]`) over `img.rect`.
+    pub fn image(&mut self, img: ImageInst, texels: Rc<[u8]>) {
+        debug_assert_eq!(texels.len(), img.size[0] as usize * img.size[1] as usize * 4);
+        self.images.push(img);
+        self.texels.push(texels);
+        self.push_seg(SegKind::Image, self.images.len() - 1);
     }
 }
