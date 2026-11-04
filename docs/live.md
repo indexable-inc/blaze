@@ -42,7 +42,7 @@ and answers as it answers `blaze build` (`ok patch=... ms=N`, `ok unchanged`, `e
 over before it was built is answered `ok superseded`. The editor writes the file afterwards;
 the worker sees the same text it built and builds nothing for the write. `blaze build`
 is still the first build and link, and works as before. The Game of Life demo
-(`demo/life`) does this on every key, and `harness/live_latency.py socket` times it.
+(`demo/life`) did this on every key, and `harness/live_latency.py socket` timed it (that mode is gone: today's `live_latency.py` takes one JSON input and times edits through `blaze build` only).
 
 ## Applying a patch
 
@@ -186,8 +186,8 @@ point into a patch), and so are two statics written the same in one place.
 each type with an id handed out from a shared pool and kept in a static of its own, as
 flecs_ecs does, and gives it four edits: add `V2` with its derive, id static and trait impl;
 move the code to `V2`, converting the values, with a static new in the edit; delete `V1`;
-change a field of `V2`. The first three are patches whose answers match rustc's build of the
-same text (`V2` keeps id 1 through all three), and the fourth restarts naming `struct V2`.
+change a field of `V2`. The first three are patches whose answers match blaze's build of the
+same text from nothing (`V2` keeps id 1 through all three), and the fourth restarts naming `struct V2`.
 On Linux x86-64 on the daemon's own base each takes about 90 to 190 ms from the build's start
 to applied.
 
@@ -231,7 +231,9 @@ which blaze does not touch. Measured on 2026-10-20 on an M-series Mac:
 
 ## Latency under typing
 
-`harness/live_latency.py` times an edit from the keystroke to the running program having code
+`harness/live_latency.py`, as it was then (its socket, burst and replay modes are gone; today it
+takes one JSON input, `{"blaze", "program", "edits", "json"}`, and times edits through `blaze
+build` only, [harness.md](harness.md#timing)), timed an edit from the keystroke to the running program having code
 at least as new, on four programs that link `blaze-live`: `harness/live` (probe, a generic
 function and a struct), `demo/life` (the Game of Life, headless), `harness/live-bevy` (bevy
 0.20, 600 lines of generic systems, components and messages) and `harness/live-egui` (egui

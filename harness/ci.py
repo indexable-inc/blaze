@@ -100,11 +100,11 @@ HARNESSES = [
     ("core", ["scriptenv.py"], {}, on("linux", "macos"), 2),
     # Its program of writable statics of its own crates on macOS too, where anim's `HOME` was refused.
     ("core", ["coldbuild.py", "statics"], {}, on("macos"), None),
-    ("core", ["live_e2e.py"], {}, on("linux-x86_64"), 1),
+    ("core", ["live_e2e.py", arg({"blaze": BLAZE_CLI})], {}, on("linux-x86_64"), 1),
     # A type added beside another, the code moved to it and the old one deleted, each a patch.
-    ("core", ["live_types.py"], {}, on("linux-x86_64"), 1),
+    ("core", ["live_types.py", arg({"blaze": BLAZE_CLI})], {}, on("linux-x86_64"), 1),
     # A program on a nightly feature (allocator_api) builds and takes live edits the same way.
-    ("core", ["live_e2e.py"], {"LIVE_PROGRAM": "live-alloc"}, on("linux-x86_64"), 1),
+    ("core", ["live_e2e.py", arg({"blaze": BLAZE_CLI, "program": "live-alloc"})], {}, on("linux-x86_64"), 1),
     # Apple's linker leaves no more room than it is told, and gives a newer macOS chained fixups.
     ("core", ["headerpad.py"], {}, on("macos"), 1),
     # bun links with `-no_compact_unwind`, which leaves `__eh_frame` alone to the unwinder.
@@ -176,7 +176,6 @@ FAST = {
     "scriptenv.py": (70, ()),
     "live_e2e.py": (16, ()),
     "live_types.py": (9, ()),
-    "LIVE_PROGRAM=live-alloc live_e2e.py": (16, ()),
     "headerpad.py": (18, ()),
     "nocompact.py": (12, ()),
     "unreached.py": (9, ()),
