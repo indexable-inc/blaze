@@ -133,6 +133,9 @@ pub struct Grid {
     picks: HashMap<u64, Pick>,
     /// Shaped runs by a hash of their font and cells.
     runs: HashMap<u64, Rc<[RunGlyph]>>,
+    /// Shaped runs found in `runs` and shaped anew, since this grid was made (F3's overlay, src/app/stats.rs).
+    pub shape_hits: u64,
+    pub shape_misses: u64,
     blink: Blink,
     /// The cursor is blinking: the window has to keep drawing.
     pub animating: bool,
@@ -201,6 +204,8 @@ impl Grid {
             emoji: fonts.emoji_font(size),
             picks: HashMap::new(),
             runs: HashMap::new(),
+            shape_hits: 0,
+            shape_misses: 0,
             blink: Blink::default(),
             animating: false,
         }
@@ -255,8 +260,10 @@ impl Grid {
             key = fnv_mix(fnv_mix(key, c.as_bytes()), &[0xff]);
         }
         if let Some(r) = self.runs.get(&key) {
+            self.shape_hits += 1;
             return r.clone();
         }
+        self.shape_misses += 1;
         if self.runs.len() > 8192 {
             self.runs.clear();
         }

@@ -369,9 +369,11 @@ impl App {
         let Some(parser) = map.get_mut(&key) else { return };
         parser.set_scrollback(want);
         let shown = parser.scrollback();
+        let history = if self.stats_shown() { parser.history() } else { 0 };
         let snap = term::snapshot(parser, &term::DARK);
         parser.set_scrollback(0);
         drop(map);
+        self.stats_history(t, history);
         let lift = if st.frac > 0.0 && shown == want { (1.0 - st.frac) * self.grid.ch } else { 0.0 };
         st.top = g.y - lift;
         st.shift = shown as i64;
@@ -405,7 +407,7 @@ impl App {
         }
         if self.grid.animating {
             // The cursor fades on the app clock: keep drawing.
-            self.poke();
+            self.poke_why("cursor blink");
         }
     }
 
@@ -731,7 +733,7 @@ impl App {
     /// tree's, natural text editing in the terminal's); a key none takes goes to the palette's or the Archive's search, or
     /// (handing the keyboard back from the tree) to the focused terminal's program in its own encoding.
     pub fn key(&mut self, k: &term::KeyIn<'_>) {
-        self.poke();
+        self.poke_why("key");
         if k.action != KeyAction::Release {
             if let Some(c) = crate::keys::Chord::of(k.code, k.unshifted, k.mods)
                 && self.dispatch(&c) != super::Outcome::None

@@ -25,6 +25,13 @@ impl<'a> WorldRef<'a> {
         Self { w, _world: PhantomData }
     }
 
+    /// How many entities are alive (flecs's own included): the entity index's count, no query.
+    #[must_use]
+    pub fn alive_count(self) -> usize {
+        // SAFETY: the world is live for 'a; this reads the entity index header.
+        unsafe { sys::ecs_get_entities(self.w.as_ptr()).alive_count as usize }
+    }
+
     /// A view of a world another image made (a module gets the host's at init).
     ///
     /// # Safety

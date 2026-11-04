@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -163,19 +163,43 @@ pub struct Link {
     /// The run outputs being followed, by (run, stage): a generation each one's reader threads check, so an unwatch (or a
     /// new watch of the same output) ends the old readers.
     run_watch: Arc<Mutex<HashMap<(u64, Option<u32>), u64>>>,
+    /// Trivially cheap counters F3's overlay (src/app/stats.rs) reads: the last `list` round trip (microseconds, 0 before
+    /// the first), the daemon's pid (asked once each time the link comes up; 0 unknown), and the bytes each attach
+    /// stream (by session id) and each followed run output (by run and stage) has carried.
+    rtt_us: Arc<AtomicU64>,
+    pid: Arc<AtomicU32>,
+    bytes: Arc<Mutex<HashMap<u64, Arc<AtomicU64>>>>,
+    run_bytes: Arc<Mutex<HashMap<(u64, Option<u32>), Arc<AtomicU64>>>>,
 }
 
 impl Link {
     pub fn start(tx: Sender<Msg>, wake: Wake) -> Self {
         let (poke, poked) = std::sync::mpsc::channel::<()>();
-        let link = Self { tx: tx.clone(), wake: wake.clone(), streams: Arc::default(), poke, run_watch: Arc::default() };
+        let link = Self {
+            tx: tx.clone(),
+            wake: wake.clone(),
+            streams: Arc::default(),
+            poke,
+            run_watch: Arc::default(),
+            rtt_us: Arc::default(),
+            pid: Arc::default(),
+            bytes: Arc::default(),
+            run_bytes: Arc::default(),
+        };
+        let (rtt_us, pid) = (link.rtt_us.clone(), link.pid.clone());
         std::thread::Builder::new()
             .name("harness-list".into())
             .spawn(move || {
                 let mut up = None;
                 loop {
+                    let asked = std::time::Instant::now();
                     let state = match request(&json!({"op": "list"})) {
                         Ok(v) => {
+                            rtt_us.store(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
+                            if up != Some(LinkState::Up) {
+                                let p = request(&json!({"op": "info"})).ok().and_then(|v| v["pid"].as_u64()).unwrap_or(0);
+                                pid.store(p as u32, Ordering::Relaxed);
+                            }
                             let sessions = v["sessions"].as_array().cloned().unwrap_or_default();
                             let _ = tx.send(Msg::List(sessions));
                             // The recent shell runs, beside the sessions they ran in.
@@ -216,6 +240,27 @@ impl Link {
         link
     }
 
+    /// The last `list` round trip to the daemon, milliseconds (None before the first answer).
+    pub fn rtt_ms(&self) -> Option<f32> {
+        let us = self.rtt_us.load(Ordering::Relaxed);
+        (us > 0).then(|| us as f32 / 1000.0)
+    }
+
+    /// The daemon's pid, as its `info` said when the link last came up.
+    pub fn daemon_pid(&self) -> Option<u32> {
+        Some(self.pid.load(Ordering::Relaxed)).filter(|&p| p != 0)
+    }
+
+    /// The bytes session `id`'s attach streams have carried since launch.
+    pub fn session_bytes(&self, id: u64) -> u64 {
+        self.bytes.lock().unwrap().get(&id).map_or(0, |c| c.load(Ordering::Relaxed))
+    }
+
+    /// The bytes run `r{run}`'s output (its stage `stage`) has carried since launch.
+    pub fn run_bytes(&self, run: u64, stage: Option<u32>) -> u64 {
+        self.run_bytes.lock().unwrap().get(&(run, stage)).map_or(0, |c| c.load(Ordering::Relaxed))
+    }
+
     pub fn attached(&self, id: u64) -> bool {
         self.streams.lock().unwrap().contains_key(&id)
     }
@@ -235,6 +280,7 @@ impl Link {
         let generation = GEN.fetch_add(1, Ordering::Relaxed);
         self.streams.lock().unwrap().insert(id, (generation, w));
         let (tx, wake, streams) = (self.tx.clone(), self.wake.clone(), self.streams.clone());
+        let counted = self.bytes.lock().unwrap().entry(id).or_default().clone();
         std::thread::Builder::new()
             .name(format!("harness-attach-{id}"))
             .spawn(move || {
@@ -248,6 +294,7 @@ impl Link {
                 while let Ok(Some((t, body))) = read_frame(&mut s) {
                     match t {
                         T_DATA => {
+                            counted.fetch_add(body.len() as u64, Ordering::Relaxed);
                             let _ = tx.send(Msg::Data { id, bytes: body });
                         }
                         T_EXIT => {
@@ -315,6 +362,7 @@ impl Link {
         let generation = GEN.fetch_add(1, Ordering::Relaxed);
         self.run_watch.lock().unwrap().insert((run, stage), generation);
         let (tx, wake, watches) = (self.tx.clone(), self.wake.clone(), self.run_watch.clone());
+        let counted = self.run_bytes.lock().unwrap().entry((run, stage)).or_default().clone();
         let current = move || watches.lock().unwrap().get(&(run, stage)) == Some(&generation);
         std::thread::Builder::new()
             .name(format!("harness-run-r{run}"))
@@ -322,6 +370,7 @@ impl Link {
                 let live = || current();
                 let send = |err: bool, data: &str| {
                     if !data.is_empty() {
+                        counted.fetch_add(data.len() as u64, Ordering::Relaxed);
                         let _ = tx.send(Msg::RunData { run, stage, err, bytes: data.as_bytes().to_vec() });
                         wake();
                     }

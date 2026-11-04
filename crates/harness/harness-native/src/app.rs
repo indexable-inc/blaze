@@ -33,6 +33,8 @@ mod fold;
 mod sidebar;
 mod archive;
 mod keys;
+mod stats;
+pub use stats::TICK as STATS_TICK;
 pub use keys::{MenuLine, Outcome};
 pub use sidebar::Wheel;
 
@@ -194,6 +196,8 @@ pub struct App {
     side_x: harness_native_api::spring::Spring,
     /// The traffic lights shown over the folded sidebar while the pointer rests in their corner (Dia's): 0 to 1.
     corner_x: harness_native_api::spring::Spring,
+    /// F3's debug overlay (src/app/stats.rs) and the last poke's reason.
+    stats: stats::Stats,
 }
 
 /// The fill of the theme's role `name` (`running`: `hn.Theme.running`).
@@ -249,6 +253,7 @@ impl App {
         crate::pane::register(&world);
         crate::look::register(&world);
         archive::register(&world);
+        stats::register(&world);
         crate::keys::register(&world);
         world.component::<HoverLift>().writable();
         world.component::<Bump>();
@@ -366,8 +371,16 @@ impl App {
             keymap: crate::keys::Keymap::default(),
             key_file,
             keys_gen: 0,
+            stats: stats::Stats::default(),
         };
         app.load_keys()?;
+        // F3's overlay as it was left (native.json `stats`), or HARNESS_NATIVE_STATS=1|0 over that.
+        let stats = match std::env::var("HARNESS_NATIVE_STATS").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => crate::prefs::get("stats").and_then(|v| v.as_bool()).unwrap_or(false),
+        };
+        app.set_stats(stats);
         Ok(app)
     }
 
@@ -375,9 +388,20 @@ impl App {
         ZOOMS[self.zoom]
     }
 
-    /// Something changed: draw a few frames.
+    /// Something changed: draw a few frames (the line that asked is the reason F3's overlay shows).
+    #[track_caller]
     pub fn poke(&mut self) {
+        self.poke_as(stats::Why::At(std::panic::Location::caller()));
+    }
+
+    /// [`poke`](Self::poke) with a reason tag (`daemon`, `key`, `layout`) for F3's overlay.
+    pub fn poke_why(&mut self, tag: &'static str) {
+        self.poke_as(stats::Why::Tag(tag));
+    }
+
+    fn poke_as(&mut self, why: stats::Why) {
         self.pending = self.pending.max(3);
+        self.stats.note(why);
     }
 
     /// Whether the window may stop drawing until the next event.
@@ -1065,6 +1089,7 @@ impl App {
     pub fn frame(&mut self, points: (f32, f32), backing: f32, dt: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) -> Draw {
         self.time += dt;
         self.pending = self.pending.saturating_sub(1);
+        self.stats_begin();
         self.reload_keys_if_changed();
         let z = self.zoom();
         let view = (points.0 / z, points.1 / z);
@@ -1095,21 +1120,21 @@ impl App {
         if self.world.try_get::<&model::Inbox>(|i| i.applied) != before {
             // The daemon said something: the view follows in this frame.
             self.sync_view();
-            self.poke();
+            self.poke_why("daemon");
         }
         for _ in 0..3 {
             if self.typeset() == 0 {
                 break;
             }
             self.world.progress_time(0.0);
-            self.poke();
+            self.poke_why("layout");
         }
         self.actions();
         harness_native_ui_input::end_frame(self.world.world_ref());
         self.pointer.went_down = false;
         self.pointer.went_up = false;
         if self.world.try_get::<&Clock>(|c| c.moving).unwrap_or(false) {
-            self.poke();
+            self.poke_why("animation");
         }
         self.sync_terms();
         let mut d = Draw {
@@ -1126,6 +1151,7 @@ impl App {
         if self.layouts.len() > 4096 {
             self.layouts.clear();
         }
+        self.stats_end(&d);
         d
     }
 
@@ -1357,6 +1383,11 @@ impl App {
                 continue;
             }
             let rect = [laid.x, laid.y, laid.w, laid.h];
+            // F3's sparkline: bars, not a plate.
+            if e.has(stats::StatsSpark::id()) {
+                self.emit_spark(d, e, rect, p.alpha);
+                continue;
+            }
             let (np, ng) = (d.panels.len(), d.glyphs.len());
             // A HoverLift node: how far its row's hover and its bump have moved it (read before the drawing borrows self).
             let motion = e.try_cloned::<&HoverLift>().map(|m| {

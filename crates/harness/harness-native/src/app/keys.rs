@@ -40,6 +40,7 @@ const HANDLERS: &[(&str, Handler)] = &[
         a.step_zoom(step.signum());
     }),
     ("ZoomReset", |a, _, _| a.step_zoom(0)),
+    ("ToggleStats", |a, _, _| a.toggle_stats()),
     ("PrevObject", |a, _, _| {
         if !a.go_back() {
             a.step_object(-1);

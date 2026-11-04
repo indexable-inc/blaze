@@ -60,6 +60,9 @@ pub struct Renderer {
     rings: [Option<Ring>; 4],
     slot: usize,
     sem: DispatchRetained<DispatchSemaphore>,
+    /// The last finished command buffer's GPU time (GPUEndTime - GPUStartTime), milliseconds as f32 bits: two reads in
+    /// the completion handler the frame already has. F3's overlay (src/app/stats.rs) reads it.
+    gpu_ms: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 fn s(x: &str) -> Retained<NSString> {
@@ -121,7 +124,13 @@ impl Renderer {
             rings: [None, None, None, None],
             slot: 0,
             sem: DispatchSemaphore::new(FRAMES as isize),
+            gpu_ms: std::sync::Arc::default(),
         }
+    }
+
+    /// Where the last frame's GPU time lands (milliseconds as f32 bits).
+    pub fn gpu_clock(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+        self.gpu_ms.clone()
     }
 
     pub fn device(&self) -> &Dev {
@@ -224,8 +233,12 @@ impl Renderer {
         if let Some(d) = &drawable {
             cmd.presentDrawable(ProtocolObject::from_ref(&**d));
         }
-        let sem = self.sem.clone();
-        let done = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+        let (sem, gpu_ms) = (self.sem.clone(), self.gpu_ms.clone());
+        let done = RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            // SAFETY: Metal hands the completed command buffer, alive for the handler.
+            let cb = unsafe { cb.as_ref() };
+            let ms = ((cb.GPUEndTime() - cb.GPUStartTime()) * 1000.0) as f32;
+            gpu_ms.store(ms.max(0.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
             sem.signal();
         });
         // SAFETY: Metal copies the block.
