@@ -16,7 +16,7 @@ use std::{
     io::{self, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::mpsc;

@@ -443,7 +443,7 @@ impl std::error::Error for PostmortemError {
     }
 }
 
-fn io_error(path: &Path, doing: &'static str) -> impl FnOnce(io::Error) -> PostmortemError + '_ {
+fn io_error<'a>(path: &'a Path, doing: &'static str) -> impl FnOnce(io::Error) -> PostmortemError + 'a {
     // alloc: an error
     move |error| PostmortemError::Io { path: path.to_owned(), doing, error }
 }

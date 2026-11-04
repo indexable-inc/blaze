@@ -76,9 +76,6 @@ impl fmt::Display for ReadingError {
                     path.display()
                 )
             }
-            ReadingError::Pin(error) => {
-                write!(f, "pinning the history to read its last open spans: {error}")
-            }
             ReadingError::History(error) => {
                 write!(f, "pinning the history to read its last open spans: {error}")
             }

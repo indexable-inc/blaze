@@ -161,7 +161,7 @@ impl Requests {
                 );
             }
             // Held to `bounds.most` by the client, as sent (nothing is decoded).
-            while let Some(piece) = body(&mut answer, &said).await? {
+            while let Some(piece) = next_piece(&mut answer, &said).await? {
                 sink(&piece).with_context(|| format!("keeping the body of {said}"))?;
             }
             return Ok(Response { status, headers, body: Vec::new() });
@@ -174,10 +174,9 @@ impl Requests {
         let room = usize::try_from(most).unwrap_or(usize::MAX);
         // alloc: one per answer, its body for the caller.
         let mut bytes = Vec::new();
-        while let Some(piece) = body(&mut answer, &said).await? {
+        while let Some(piece) = next_piece(&mut answer, &said).await? {
             let left = room.saturating_sub(bytes.len());
-            // Stage 0 (blaze 0.20261030.1) finds no `len` on `[u8]` in this body; Vec's own works.
-            if Vec::len(&piece) > left {
+            if piece.len() > left {
                 if !streamed {
                     // The client holds the body to `most` itself; past it is its bug, said here.
                     let refused =
@@ -220,7 +219,7 @@ async fn next(answer: &mut Answer, url: &str) -> anyhow::Result<Event> {
 }
 
 /// The next piece of `answer`'s body, `None` at its end; `said` is the address that answered.
-async fn body(answer: &mut Answer, said: &str) -> anyhow::Result<Option<Vec<u8>>> {
+async fn next_piece(answer: &mut Answer, said: &str) -> anyhow::Result<Option<Vec<u8>>> {
     match next(answer, said).await? {
         Event::Body { bytes, .. } => Ok(Some(bytes)),
         Event::Done { .. } => Ok(None),
