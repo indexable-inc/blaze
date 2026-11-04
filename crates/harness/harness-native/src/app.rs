@@ -94,6 +94,12 @@ pub struct App {
     tried: HashMap<u64, f32>,
     /// The session a spawn made, to select once the list shows it.
     spawned: Arc<Mutex<Option<u64>>>,
+    /// The session selected when the app last ran (~/.harness/native.json), selected once the daemon's first list is in.
+    restore: Option<Option<u64>>,
+    /// What was last written to native.json.
+    saved: Option<Option<u64>>,
+    /// Remember the selected object in native.json (not for the offscreen shot).
+    pub persist: bool,
     pub focused: bool,
     pub title: String,
 }
@@ -213,6 +219,9 @@ impl App {
             wheel: 0.0,
             tried: HashMap::new(),
             spawned: Arc::default(),
+            restore: Some(crate::saved::selected()),
+            saved: None,
+            persist: true,
             focused: true,
             title: "harness".into(),
         })
@@ -294,12 +303,20 @@ impl App {
     fn sync_view(&mut self) {
         let w = self.world.world_ref();
         let rows = model::tree(w);
+        // Once the daemon's first list is in: the object selected when the app last ran, if it is still there.
+        let up = w.lookup(model::LOCAL).target(model::Link::id(), 0).is_some_and(|t| *t.id() == *w.component_id::<model::Up>());
+        if up && let Some(last) = self.restore.take() {
+            if let Some(e) = last.and_then(|sid| self.entity_of(sid)) {
+                model::select(w, Some(e));
+            }
+        }
         // Nothing selected (or it went): the first running object, else the first.
-        if self.selected().is_none() && !rows.is_empty() {
+        if self.restore.is_none() && self.selected().is_none() && !rows.is_empty() {
             let first = rows.iter().find(|(e, _)| self.status_of(*e) == "running").or(rows.first()).map(|(e, _)| *e);
             model::select(w, first);
         }
-        let pending = *self.spawned.lock().unwrap();
+        // A spawn's or a deep link's session, once the list has it (and after the restore, which it overrides).
+        let pending = (*self.spawned.lock().unwrap()).filter(|_| self.restore.is_none());
         if let Some(sid) = pending {
             if let Some(e) = self.entity_of(sid) {
                 model::select(w, Some(e));
@@ -408,6 +425,47 @@ impl App {
         }
         self.title = window;
         self.sync_palette();
+        self.save_selected();
+    }
+
+    /// Write the selected object's session id to native.json when it changed.
+    fn save_selected(&mut self) {
+        if !self.persist || self.restore.is_some() {
+            return;
+        }
+        let now = self.selected().and_then(|e| self.session_of(e));
+        if self.saved != Some(now) {
+            if let Err(e) = crate::saved::set_selected(now) {
+                eprintln!("harness-native: {e}");
+            }
+            self.saved = Some(now);
+        }
+    }
+
+    /// The tree row under `(x, y)` (window points): its object.
+    pub fn object_at(&self, x: f32, y: f32) -> Option<u64> {
+        let (x, y) = (x / self.zoom(), y / self.zoom());
+        let w = self.world.world_ref();
+        let mut hit = None;
+        w.entity_from_id(self.ids.tree).each_child(|c| {
+            if hit.is_none() && c.try_cloned::<&Laid>().is_some_and(|l| l.contains(x, y)) {
+                hit = c.try_cloned::<&Action>().and_then(|a| a.name.as_str().strip_prefix("select:").and_then(|s| s.parse::<u64>().ok()));
+            }
+        });
+        hit.filter(|&e| w.entity_from_id(e).is_alive())
+    }
+
+    /// The context menu's Kill on object `e` (no asking).
+    pub fn kill_object(&mut self, e: u64) {
+        if !self.world.entity_from_id(e).is_alive() {
+            return;
+        }
+        if self.selected() == Some(e) {
+            self.kill();
+        } else if let Some(sid) = self.session_of(e) {
+            self.link.kill(sid);
+        }
+        self.poke();
     }
 
     /// The palette's entries for its query: new objects, then each object, then a few commands.
@@ -416,7 +474,8 @@ impl App {
         let mut out: Vec<(String, &'static str, String, String, Do)> = vec![
             ("new-claude".into(), kind_glyph("claude"), "New claude".into(), "\u{2318}T".into(), Do::New("claude")),
             ("new-codex".into(), kind_glyph("codex"), "New codex".into(), "\u{2318}\u{21E7}T".into(), Do::New("codex")),
-            ("new-shell".into(), kind_glyph("shell"), "New shell".into(), String::new(), Do::New("shell")),
+            ("new-cursor".into(), kind_glyph("cursor"), "New cursor".into(), String::new(), Do::New("cursor")),
+            ("new-sh".into(), kind_glyph("shell"), "New sh".into(), String::new(), Do::New("shell")),
         ];
         for (i, e) in self.objects().into_iter().enumerate() {
             let o = w.entity_from_id(e);
@@ -925,7 +984,7 @@ impl App {
         }
         let at = self.selected().and_then(|s| objs.iter().position(|&e| e == s)).map_or(0, |i| i as i64);
         let n = objs.len() as i64;
-        self.select(Some(objs[((at + by) % n + n) as usize % objs.len()]));
+        self.select(Some(objs[(at + by).rem_euclid(n) as usize]));
     }
 
     pub fn step_zoom(&mut self, by: i32) {
