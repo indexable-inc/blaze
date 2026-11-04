@@ -1,0 +1,16 @@
+[package]
+name = "harness-native-ui-timeline"
+description = "Applies a timeline's Cues at a time: each cued member of each node set through flecs reflection"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+harness-native-flecs = { path = "../harness-native-flecs" }
+harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
+harness-native-ui-timeline-api = { path = "../harness-native-ui-timeline-api" }
+hyperion-ecs = { path = "../vendor/hyperion-ecs", features = ["meta"] }
+
+[lints.rust]
+unsafe_code = "allow"

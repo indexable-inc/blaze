@@ -19,7 +19,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-env-changed=SLANGC");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
-        panic!("harness-native is macOS only (AppKit + Metal)");
+        panic!("harness-native-render is macOS only (AppKit + Metal)");
     }
     for name in SHADERS {
         slang(&out, name);

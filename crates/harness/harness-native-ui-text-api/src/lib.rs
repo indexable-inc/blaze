@@ -62,6 +62,19 @@ pub struct Picture {
     pub handle: ScriptString,
 }
 
+/// A `Picture` drawn as pixel art: each of its pixels a crisp cell of the node's size over its width and height, never
+/// smoothed (CSS's `image-rendering: pixelated`). A tag.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Pixelated;
+
+/// A `Picture` that is a sheet of `count` frames of equal height stacked downwards, played at `fps` from the frame clock
+/// and looped.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Frames {
+    pub count: u32,
+    pub fps: f32,
+}
+
 /// Words that are code from `file` (a path or a name: its kind says the language): the host colours each stretch in its
 /// role's ink, as it colours a code card.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
@@ -94,6 +107,8 @@ hyperion_api_layouts::api_layouts! {
     "Icon" => alias Icon,
     "Mark" => alias Mark,
     "Picture" => alias Picture,
+    "Pixelated" => alias Pixelated,
+    "Frames" => alias Frames,
     "Highlight" => alias Highlight,
     "LineNumbers" => alias LineNumbers,
     "TextRange" => alias TextRange,
@@ -109,6 +124,8 @@ pub fn register(world: &World) {
     world.component::<Icon>().writable();
     world.component::<Mark>().writable();
     world.component::<Picture>().writable();
+    world.component::<Pixelated>().writable();
+    world.component::<Frames>().writable();
     world.component::<Highlight>().writable();
     world.component::<LineNumbers>().writable();
     world.component::<TextRange>().writable();

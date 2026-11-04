@@ -750,6 +750,7 @@ dependencies = [
  "harness-native-ecs",
  "harness-native-flecs",
  "harness-native-model",
+ "harness-native-render",
  "harness-native-scroll-physics",
  "harness-native-ui-draw",
  "harness-native-ui-draw-api",
@@ -842,6 +843,39 @@ dependencies = [
  "harness-native-flecs",
  "harness-vt",
  "serde_json",
+]
+
+[[package]]
+name = "harness-native-render"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "bytemuck",
+ "dispatch2",
+ "harfrust",
+ "harness-native-api",
+ "harness-native-flecs",
+ "harness-native-ui-draw",
+ "harness-native-ui-draw-api",
+ "harness-native-ui-layout",
+ "harness-native-ui-layout-api",
+ "harness-native-ui-look-api",
+ "harness-native-ui-motion-api",
+ "harness-native-ui-node-api",
+ "harness-native-ui-text-api",
+ "icu_properties",
+ "icu_segmenter",
+ "libc",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-text",
+ "objc2-foundation",
+ "objc2-metal",
+ "objc2-quartz-core",
+ "png",
+ "read-fonts",
+ "unicode-bidi",
 ]
 
 [[package]]
@@ -989,6 +1023,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-native-ui-timeline"
+version = "0.1.0"
+dependencies = [
+ "harness-native-flecs",
+ "harness-native-ui-node-api",
+ "harness-native-ui-timeline-api",
+ "hyperion-ecs",
+]
+
+[[package]]
+name = "harness-native-ui-timeline-api"
+version = "0.1.0"
+dependencies = [
+ "harness-native-flecs",
+ "hyperion-api-layouts",
+]
+
+[[package]]
 name = "harness-native-ui-view"
 version = "0.1.0"
 dependencies = [
@@ -998,6 +1050,31 @@ dependencies = [
  "harness-native-ui-motion-api",
  "harness-native-ui-node-api",
  "harness-native-ui-text-api",
+]
+
+[[package]]
+name = "harness-video"
+version = "0.1.0"
+dependencies = [
+ "harness-native-api",
+ "harness-native-ecs",
+ "harness-native-flecs",
+ "harness-native-render",
+ "harness-native-ui-draw",
+ "harness-native-ui-draw-api",
+ "harness-native-ui-input",
+ "harness-native-ui-input-api",
+ "harness-native-ui-layout",
+ "harness-native-ui-layout-api",
+ "harness-native-ui-motion",
+ "harness-native-ui-node-api",
+ "harness-native-ui-prims",
+ "harness-native-ui-timeline",
+ "harness-native-ui-timeline-api",
+ "hyperion-ecs",
+ "hyperion-flecs-c",
+ "objc2-metal",
+ "png",
 ]
 
 [[package]]

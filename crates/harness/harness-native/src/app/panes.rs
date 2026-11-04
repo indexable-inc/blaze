@@ -394,7 +394,7 @@ impl App {
             time: self.time,
             marked: marked.as_deref(),
         };
-        term::draw(d, &mut self.grid, &mut self.fonts, &mut self.cache, &snap, &paint, upload);
+        term::draw(d, &mut self.grid, &mut self.paint.fonts, &mut self.paint.cache, &snap, &paint, upload);
         if lift > 0.0 {
             let band = [g.y, g.y + g.h];
             for p in &mut d.panels[np..] {

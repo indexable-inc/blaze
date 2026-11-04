@@ -1,22 +1,15 @@
 //! harness-native: the harness as a native macOS app (AppKit, Metal, flecs), on den's native stack. See README.md.
 mod app;
-mod atlas;
-mod boxdraw;
-mod draw;
+use harness_native_render::{boxdraw, draw, gpu, pack, text};
 mod gallery;
-mod gpu;
-mod icons;
 mod keys;
 mod link;
 mod look;
-mod pack;
 mod pane;
 mod prefs;
 mod shot;
 mod single;
-mod slug;
 mod term;
-mod text;
 mod window;
 
 fn main() {

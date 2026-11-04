@@ -302,7 +302,7 @@ impl App {
             Some((t, why)) => format!("{why}  {:.1}s ago", (now - t).as_secs_f32()),
             None => format!("{}", s.why),
         };
-        let glyph = (self.cache.hits, self.cache.misses);
+        let glyph = (self.paint.cache.hits, self.paint.cache.misses);
         let shape = (self.grid.shape_hits, self.grid.shape_misses);
         let d = |a: (u64, u64), b: (u64, u64)| (a.0.saturating_sub(b.0), a.1.saturating_sub(b.1));
         let (glyph_hit, shape_hit) = (rate(d(glyph, s.prev.glyph)), rate(d(shape, s.prev.shape)));
@@ -363,7 +363,7 @@ impl App {
                 ("panels", n(s.draws[0])),
                 ("glyphs", n(s.draws[1])),
                 ("sprites", n(s.draws[2])),
-                ("atlas", Prop::Float(f64::from(self.cache.fill()) * 100.0)),
+                ("atlas", Prop::Float(f64::from(self.paint.cache.fill()) * 100.0)),
                 ("glyph_hit", Prop::Str(&glyph_hit)),
                 ("shape_hit", Prop::Str(&shape_hit)),
                 ("term", Prop::Str(&term.0)),

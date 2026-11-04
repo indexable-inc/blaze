@@ -88,14 +88,14 @@ impl App {
         let (px, py) = (cfg.padding_x, cfg.padding_y);
         let pad = [px.map_or(DEFAULT_PAD[0], |p| p.0), px.map_or(DEFAULT_PAD[1], |p| p.1), py.map_or(DEFAULT_PAD[2], |p| p.0), py.map_or(DEFAULT_PAD[3], |p| p.1)];
         let families = crate::text::TermFamilies { regular: cfg.font_family.clone(), bold: cfg.font_family_bold.clone(), italic: cfg.font_family_italic.clone(), bold_italic: cfg.font_family_bold_italic.clone() };
-        let refont = self.fonts.set_term_families(families) || size != self.look.size;
+        let refont = self.paint.fonts.set_term_families(families) || size != self.look.size;
         self.look.size = size;
         if pad != self.look.pad {
             self.look.pad = pad;
             self.chrome_laid = None;
         }
         if refont {
-            self.grid = Grid::new(&mut self.fonts, self.look.size, self.grid.scale);
+            self.grid = Grid::new(&mut self.paint.fonts, self.look.size, self.grid.scale);
         }
         let themed = [cfg.light.background.is_some(), cfg.dark.background.is_some()];
         self.tint_tokens(themed);

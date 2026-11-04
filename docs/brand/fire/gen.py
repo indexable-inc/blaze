@@ -8,6 +8,8 @@
                                                   # header-{dark,light}-still.webp, its first frame
     uv run docs/brand/fire/gen.py --preview DIR   # instead, DIR/preview-{dark,light}.png: four
                                                   # frames on GitHub's backgrounds, to look at
+    uv run docs/brand/fire/gen.py --sheet PNG     # instead, the dark frames at one pixel a cell, stacked downwards
+                                                  # (harness-video's launch scene draws it as pixel art)
 
 Everything is drawn on a coarse grid of cells and scaled up by whole pixels, so it stays crisp.
 The letters are drawn by hand below. The fire is a cellular automaton: each frame a cell takes
@@ -213,8 +215,8 @@ def simulate(width, height, solid, sources):
     return frames
 
 
-def render(theme):
-    """The frames, the rows above what the flames ever reach cropped."""
+def render(theme, scale=SCALE):
+    """The frames, the rows above what the flames ever reach cropped, at `scale` pixels a cell."""
     word, word_w, word_h = letters()
     width, height = word_w + 2 * SIDE + 1, ABOVE + word_h + BELOW
     ox, oy = SIDE, ABOVE
@@ -243,7 +245,7 @@ def render(theme):
         images.append(img)
     top = min(img.getbbox()[1] for img in images)
     box = (0, top, width, height)
-    return [img.crop(box).resize(((box[2] - box[0]) * SCALE, (box[3] - box[1]) * SCALE), Image.NEAREST)
+    return [img.crop(box).resize(((box[2] - box[0]) * scale, (box[3] - box[1]) * scale), Image.NEAREST)
             for img in images]
 
 
@@ -254,6 +256,16 @@ def hex_rgba(c):
 def main():
     args = sys.argv[1:]
     preview = args[args.index("--preview") + 1] if "--preview" in args else None
+    if "--sheet" in args:
+        out = args[args.index("--sheet") + 1]
+        images = render("dark", scale=1)
+        w, h = images[0].size
+        sheet = Image.new("RGBA", (w, h * len(images)), (0, 0, 0, 0))
+        for i, img in enumerate(images):
+            sheet.alpha_composite(img, (0, h * i))
+        sheet.save(out)
+        print(f"{out}: {len(images)} frames of {w}x{h} cells at {FPS} fps")
+        return
     for theme in THEMES:
         images = render(theme)
         w, h = images[0].size

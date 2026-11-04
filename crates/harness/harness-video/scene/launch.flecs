@@ -1,0 +1,231 @@
+// blaze's launch video: 10 seconds, 1920 by 1080 at 60 fps, for X/Twitter.
+//
+//   cd crates/harness && cargo run --release -p harness-video -- harness-video/scene/launch.flecs blaze-launch.mp4
+//
+// Three slides on one ground, each in and out on its own cues:
+//   0.0 to 3.8   the fire logo pops in, "Rebuild Rust in milliseconds." types on, the cargo line rises in
+//   3.8 to 7.9   a race per project from the README's table (Linux x86-64): both bars start together, each runs as long as its build
+//                took (cargo's 2.4 s stand for its time, blaze's are that share of it), its time and speed-up land at the end
+//   7.9 to 10.0  the logo small, the install line and where to read more
+//
+// Motion is data: a `Cue` child moves one member of its node (`Pose.fade`, `Pose.dy`, `Size.w.value`...) between two
+// values over a stretch of the clock. The `cue.*` templates below are the few moves this video makes, by name.
+
+// ---- the moves ----
+@tree ChildOf
+cue {
+  // Fade in over `dur` from `at`.
+  template FadeIn {
+    prop at: f32 = 0
+    prop dur: f32 = 0.4
+    Cue: {member: "Pose.fade", from: 1, to: 0, at: $at, dur: $dur, ease: Out}
+  }
+  // Fade out over `dur` from `at`.
+  template FadeOut {
+    prop at: f32 = 0
+    prop dur: f32 = 0.35
+    Cue: {member: "Pose.fade", from: 0, to: 1, at: $at, dur: $dur, ease: In}
+  }
+  // Rise `by` points into place over `dur` from `at` (pair it with a FadeIn).
+  template Rise {
+    prop at: f32 = 0
+    prop dur: f32 = 0.5
+    prop by: f32 = 14
+    Cue: {member: "Pose.dy", from: $by, to: 0, at: $at, dur: $dur, ease: Spring}
+  }
+  // Drift `by` points up out of place over `dur` from `at` (pair it with a FadeOut).
+  template Lift {
+    prop at: f32 = 0
+    prop dur: f32 = 0.35
+    prop by: f32 = -14
+    Cue: {member: "Pose.dy", from: 0, to: $by, at: $at, dur: $dur, ease: In}
+  }
+  // Grow from `1 - from` of its size to its size, overshooting a little.
+  template Pop {
+    prop at: f32 = 0
+    prop dur: f32 = 0.7
+    prop from: f32 = 0.35
+    Cue: {member: "Pose.shrink", from: $from, to: 0, at: $at, dur: $dur, ease: Back}
+  }
+  // Type its words on, evenly, over `dur` from `at`.
+  template Type {
+    prop at: f32 = 0
+    prop dur: f32 = 0.8
+    Cue: {member: "Pose.cut", from: 1, to: 0, at: $at, dur: $dur, ease: Linear}
+  }
+  // Grow its width from 0 to `to` points over `dur` from `at`, evenly (a build running).
+  template Run {
+    prop at: f32 = 0
+    prop dur: f32 = 1
+    prop to: f32 = 100
+    Cue: {member: "Size.w.value", from: 0, to: $to, at: $at, dur: $dur, ease: Linear}
+  }
+}
+
+// ---- the parts ----
+@tree ChildOf
+launch_part {
+  // The README's fire logo (docs/brand/fire/gen.py --sheet): 32 frames of 43 by 23 cells at 16 fps, crisp at any size.
+  prefab Logo : ui.Node {
+    Picture: {handle: "media/blaze-fire.png"}
+    Pixelated
+    Frames: {count: 32, fps: 16}
+    Size: {w: {kind: Fixed, value: 43 * $logo_cell, min: 0, max: 0}, h: {kind: Fixed, value: 23 * $logo_cell, min: 0, max: 0}}
+  }
+
+  // A slide: the whole frame, its parts in a centred column.
+  prefab Slide : ui.Column {
+    Flex: {axis: Column, gap: 18, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Percent, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 1, min: 0, max: 0}}
+  }
+
+  prefab Hero : ui.Words, Strong {
+    TextStyle: {size: $size_hero, line: $line_hero, code_line: 0, role: 0, bold: 1, weight: 0}
+  }
+  prefab Title : ui.Words, Strong {
+    TextStyle: {size: $size_title, line: $line_title, code_line: 0, role: 0, bold: 1, weight: 0}
+  }
+  prefab Lead : ui.Words, Muted {
+    TextStyle: {size: $size_lead, line: $line_lead, code_line: 0, role: 0, bold: 0, weight: 0}
+  }
+  prefab RowText : ui.Words, Ink {
+    TextStyle: {size: $size_row, line: $line_row, code_line: 0, role: 0, bold: 0, weight: 500}
+  }
+  prefab Code : ui.Words, Strong {
+    TextStyle: {size: $size_code, line: $line_code, code_line: 0, role: 9, bold: 0, weight: 0}
+  }
+
+  // One build's bar and, at its tip, its time (faded in when the bar stops).
+  prefab Bar : ui.Row {
+    Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+    bar : ui.Node {
+      Fill: $tone_cargo
+      Shape: {radius: $bar_radius, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $bar_h, min: 0, max: 0}}
+    }
+    took : launch_part.RowText {}
+  }
+
+  // A project's race: its name, then cargo's bar over blaze's.
+  prefab Race : ui.Row {
+    Flex: {axis: Row, gap: 16, align: Center, justify: Start, wrap: false}
+    name : launch_part.RowText {
+      Size: {w: {kind: Fixed, value: $name_w, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    bars : ui.Column {
+      Flex: {axis: Column, gap: 4, align: Start, justify: Start, wrap: false}
+      Size: {w: {kind: Fixed, value: $bar_w + $tip_room, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      cargo : launch_part.Bar {}
+      blaze : launch_part.Bar { bar { Fill: $tone_accent } }
+    }
+  }
+
+  // A legend's swatch and words.
+  prefab Key : ui.Row {
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    swatch : ui.Node {
+      Fill: $tone_cargo
+      Shape: {radius: $bar_radius, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Fixed, value: 22, min: 0, max: 0}, h: {kind: Fixed, value: $bar_h, min: 0, max: 0}}
+    }
+    words : launch_part.Code {}
+  }
+}
+
+// ---- the video ----
+// The race: both bars start at `go`; cargo's runs `run` seconds, blaze's its share (blaze ms / cargo ms) of that.
+const go = 4.45
+const run = 2.4
+
+@tree ChildOf
+launch : ui.ZStack {
+  Video: {width: 960, height: 540, fps: 60, seconds: 10, scale: 2}
+  Fill: $tone_ground
+  Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Fixed, value: 960, min: 0, max: 0}, h: {kind: Fixed, value: 540, min: 0, max: 0}}
+
+  intro : launch_part.Slide {
+    cue.FadeOut leave(at: 3.45)
+    cue.Lift drift(at: 3.45)
+
+    logo : launch_part.Logo {
+      cue.FadeIn show(at: 0.15, dur: 0.45)
+      cue.Pop grow(at: 0.15)
+    }
+    hero : launch_part.Hero {
+      Text: {s: "Rebuild Rust in milliseconds."}
+      cue.Type typed(at: 0.9, dur: 0.85)
+    }
+    lead : launch_part.Lead {
+      Text: {s: "Type blaze wherever you'd type cargo."}
+      cue.FadeIn show(at: 2.0, dur: 0.5)
+      cue.Rise rise(at: 2.0)
+    }
+  }
+
+  race : launch_part.Slide {
+    Flex: {axis: Column, gap: 22, align: Center, justify: Center, wrap: false}
+    cue.FadeIn show(at: 3.8)
+    cue.Rise rise(at: 3.8)
+    cue.FadeOut leave(at: 7.55)
+    cue.Lift drift(at: 7.55)
+
+    title : launch_part.Title { Text: {s: "Edit one function, then build"} }
+    keys : ui.Row {
+      Flex: {axis: Row, gap: 28, align: Center, justify: Center, wrap: false}
+      cargo : launch_part.Key { words { Text: {s: "cargo build"} } }
+      blaze : launch_part.Key { swatch { Fill: $tone_accent }; words { Text: {s: "blaze build"} } }
+    }
+    rows : ui.Column {
+      Flex: {axis: Column, gap: 14, align: Start, justify: Start, wrap: false}
+      // README "How fast": ripgrep 508 ms / 56 ms (9.1x), nushell 1.25 s / 236 ms (5.3x), helix 2.15 s / 116 ms (19x),
+      // bun 9.11 s / 451 ms (20x).
+      ripgrep : launch_part.Race {
+        name { Text: {s: "ripgrep"} }
+        bars {
+          cargo { bar { cue.Run grow(at: $go, dur: $run, to: $bar_w) }; took { Text: {s: "508 ms"}; cue.FadeIn show(at: $go + $run, dur: 0.25) } }
+          blaze { bar { cue.Run grow(at: $go, dur: $run * 56 / 508, to: $bar_w * 56 / 508) }; took { Text: {s: "56 ms   9.1× faster"}; cue.FadeIn show(at: $go + $run * 56 / 508, dur: 0.25) } }
+        }
+      }
+      nushell : launch_part.Race {
+        name { Text: {s: "nushell"} }
+        bars {
+          cargo { bar { cue.Run grow(at: $go, dur: $run, to: $bar_w) }; took { Text: {s: "1.25 s"}; cue.FadeIn show(at: $go + $run, dur: 0.25) } }
+          blaze { bar { cue.Run grow(at: $go, dur: $run * 236 / 1250, to: $bar_w * 236 / 1250) }; took { Text: {s: "236 ms   5.3× faster"}; cue.FadeIn show(at: $go + $run * 236 / 1250, dur: 0.25) } }
+        }
+      }
+      helix : launch_part.Race {
+        name { Text: {s: "helix"} }
+        bars {
+          cargo { bar { cue.Run grow(at: $go, dur: $run, to: $bar_w) }; took { Text: {s: "2.15 s"}; cue.FadeIn show(at: $go + $run, dur: 0.25) } }
+          blaze { bar { cue.Run grow(at: $go, dur: $run * 116 / 2150, to: $bar_w * 116 / 2150) }; took { Text: {s: "116 ms   19× faster"}; cue.FadeIn show(at: $go + $run * 116 / 2150, dur: 0.25) } }
+        }
+      }
+      bun : launch_part.Race {
+        name { Text: {s: "bun"} }
+        bars {
+          cargo { bar { cue.Run grow(at: $go, dur: $run, to: $bar_w) }; took { Text: {s: "9.11 s"}; cue.FadeIn show(at: $go + $run, dur: 0.25) } }
+          blaze { bar { cue.Run grow(at: $go, dur: $run * 451 / 9110, to: $bar_w * 451 / 9110) }; took { Text: {s: "451 ms   20× faster"}; cue.FadeIn show(at: $go + $run * 451 / 9110, dur: 0.25) } }
+        }
+      }
+    }
+  }
+
+  outro : launch_part.Slide {
+    Flex: {axis: Column, gap: 22, align: Center, justify: Center, wrap: false}
+    cue.FadeIn show(at: 7.9, dur: 0.45)
+    cue.Rise rise(at: 7.9)
+
+    logo : launch_part.Logo {
+      Size: {w: {kind: Fixed, value: 43 * $logo_cell_small, min: 0, max: 0}, h: {kind: Fixed, value: 23 * $logo_cell_small, min: 0, max: 0}}
+    }
+    install : ui.Box, Plate {
+      Padding: {l: 22, r: 22, t: 14, b: 14}
+      line : launch_part.Code { Text: {s: "curl -fsSL https://ix.dev/blaze | sh"} }
+    }
+    more : launch_part.Lead {
+      Text: {s: "github.com/indexable-inc/blaze"}
+      cue.FadeIn show(at: 8.5, dur: 0.5)
+    }
+  }
+}

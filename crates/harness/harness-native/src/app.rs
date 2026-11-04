@@ -5,24 +5,23 @@
 //!
 //! The frame loop is den's (den-native ui/native.rs): write `Viewport`, `PointerState` and `Paint`, typeset, `progress`,
 //! typeset again while sizes move, then turn the painted nodes into Metal instances (`emit`).
-use crate::draw::{ATLAS_SIZE, Draw};
+use crate::draw::Draw;
+use harness_native_render::paint::{Painter, panel_from};
 use crate::link::Link;
-use crate::pack::{Frame, GlyphInst, PanelInst};
+use crate::pack::Frame;
 use crate::term::{self, Button, Grid, KeyAction, MouseAct, Sel};
 use crate::pane::TermNode;
 use harness_vt::MouseTracking;
-use crate::text::{Face, Fonts, GlyphCache, Layout, SUBPX, Style, TypeLook};
+use crate::text::{Layout, TypeLook};
 use harness_native_api::spring::{Spring, Tune};
 use harness_native_api::{APP, Clock, HoverAmt, moving, settle};
 use harness_native_flecs::prelude::*;
 use harness_native_model::{self as model, Msg};
 use harness_native_ui_draw_api::{Paint, PaintKind};
 use harness_native_ui_input_api::{Action, Activated, Hovered, PointerState, Pressed};
-use harness_native_ui_layout::typeset;
-use harness_native_ui_layout_api::{Intrinsic, Size, SizeKind, Sizing, Viewport};
-use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, Shape, TextStyle};
+use harness_native_ui_layout_api::{Size, SizeKind, Sizing, Viewport};
+use harness_native_ui_look_api::{Fill, Rgba, Shape, TextStyle};
 use harness_native_ui_node_api::{Laid, Level};
-use harness_native_ui_text_api::{Icon, Mark, OneLine, Text, Truncate, TruncateMode};
 use harness_native_ui_view::{self as view, View, for_each};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
@@ -139,9 +138,8 @@ pub struct Bump {
 
 pub struct App {
     pub world: World,
-    fonts: Fonts,
-    cache: GlyphCache,
-    layouts: HashMap<(String, u32, u32, bool, u8, u32), Rc<Layout>>,
+    /// Fonts, glyph atlas, layouts and pictures, and the paint pass shared with harness-video (harness-native-render).
+    paint: Painter,
     terms: model::Terms,
     /// The parsers of runs and stages being read, by entity id.
     run_terms: model::Terms,
@@ -251,10 +249,6 @@ fn tilde(p: &str) -> String {
     }
 }
 
-fn set_of(s: &TextStyle) -> Style {
-    let size = if s.size > 0.0 { s.size } else { 14.0 };
-    Style { size, bold: s.bold != 0, line: if s.line > 0.0 { s.line } else { (size * 1.3).round() } }
-}
 
 impl App {
     pub fn new(wake: Wake) -> Result<Self, String> {
@@ -349,13 +343,11 @@ impl App {
         let bar_title = bar.part("title").map_or(0, View::id);
         let bar_sub = bar.part("sub").map_or(0, View::id);
         let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), archive_row: archive_row.id(), palette: None, bar: bar.id(), bar_title, bar_sub };
-        let mut fonts = Fonts::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
-        let grid = Grid::new(&mut fonts, TERM_SIZE, 2.0);
+        let mut paint = Painter::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
+        let grid = Grid::new(&mut paint.fonts, TERM_SIZE, 2.0);
         let mut app = Self {
             world,
-            fonts,
-            cache: GlyphCache::new(ATLAS_SIZE),
-            layouts: HashMap::new(),
+            paint,
             terms,
             run_terms,
             watching: HashMap::new(),
@@ -1100,7 +1092,7 @@ impl App {
         let scale = backing * z;
         if self.grid.scale != scale {
             // Cells are whole device pixels: new metrics at a new scale (the pane's grid may change size with them).
-            self.grid = Grid::new(&mut self.fonts, self.look.size, scale);
+            self.grid = Grid::new(&mut self.paint.fonts, self.look.size, scale);
         }
         self.step_sidebar(dt);
         self.lay_chrome(z);
@@ -1149,12 +1141,8 @@ impl App {
             ..Draw::default()
         };
         self.emit(&mut d, scale, upload);
-        if self.cache.overflowed() {
-            self.cache.clear();
+        if self.paint.end_frame() {
             self.poke();
-        }
-        if self.layouts.len() > 4096 {
-            self.layouts.clear();
         }
         self.stats_end(&d);
         d
@@ -1271,40 +1259,11 @@ impl App {
 
     /// Size every `Text` node with the typesetter; how many changed.
     fn typeset(&mut self) -> usize {
-        let wanted = typeset::wanted(self.world.world_ref());
-        let sizes: Vec<Intrinsic> = wanted
-            .iter()
-            .map(|t| {
-                let one = self.layout(&t.text, &t.style, 1.0e5);
-                let w = one.lines.iter().map(|l| l.width).fold(0.0, f32::max).ceil();
-                let at = t.at.unwrap_or(w);
-                let lay = if t.one_line || at + 0.5 >= w { one } else { self.layout(&t.text, &t.style, at) };
-                let st = set_of(&t.style);
-                let h = lay.lines.last().map_or(st.line, |l| l.top + l.height).max(st.line);
-                let [base, last] = [lay.lines.first(), lay.lines.last()].map(|l| l.map_or(0.0, |l| l.baseline));
-                Intrinsic { w, h, at, base, last }
-            })
-            .collect();
-        typeset::apply(self.world.world_ref(), &wanted, &sizes)
+        self.paint.typeset(self.world.world_ref())
     }
 
     fn layout(&mut self, text: &str, style: &TextStyle, width: f32) -> Rc<Layout> {
-        let st = set_of(style);
-        let code = style.role == 9;
-        let medium = !code && !st.bold && style.weight == 500;
-        let key = (text.to_owned(), st.size.to_bits(), st.line.to_bits(), st.bold, u8::from(code) | u8::from(medium) << 1, width.to_bits());
-        if let Some(l) = self.layouts.get(&key) {
-            return l.clone();
-        }
-        let lay = Rc::new(if code {
-            Layout::in_face(&mut self.fonts, text, Face::Code, st, width)
-        } else if medium {
-            Layout::in_face(&mut self.fonts, text, Face::Medium, st, width)
-        } else {
-            Layout::new(&mut self.fonts, text, st, width)
-        });
-        self.layouts.insert(key, lay.clone());
-        lay
+        self.paint.layout(text, style, width)
     }
 
     /// What was activated this frame: a row selects its object, a palette entry runs.
@@ -1405,85 +1364,29 @@ impl App {
                 self.emit_spark(d, e, rect, p.alpha);
                 continue;
             }
-            let (np, ng) = (d.panels.len(), d.glyphs.len());
             // A HoverLift node: how far its row's hover and its bump have moved it (read before the drawing borrows self).
             let motion = e.try_cloned::<&HoverLift>().map(|m| {
                 let hover = e.parent().and_then(|r| r.try_cloned::<&HoverAmt>()).map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
                 let bump = e.try_cloned::<&Bump>().map_or(0.0, |b| b.spring.x);
                 (-(m.lift * hover + m.kick_lift * bump), (1.0 + (m.scale - 1.0) * hover + m.kick_scale * bump).max(0.1))
             });
-            match p.kind {
-                PaintKind::Plate => {
-                    let fill = e.try_cloned::<&Fill>().unwrap_or_default();
-                    let edge = e.try_cloned::<&Edge>().unwrap_or_default();
-                    let mut shape = e.try_cloned::<&Shape>().unwrap_or_default();
-                    if shape.n <= 0.0 {
-                        shape.n = 4.0;
-                    }
-                    let (fc, ec) = if dark { (fill.dark, edge.dark) } else { (fill.light, edge.light) };
-                    let mut panel = panel_from(rgba(fc), rgba(ec), shape, rect, p.alpha);
-                    if let Some(l) = e.try_cloned::<&Lift>() {
-                        panel.fx = [l.blur, l.alpha, 0.0, 0.0];
-                        panel.fx2[0] = l.dy;
-                    }
-                    if fc.a > 0.0 || ec.a > 0.0 || panel.fx[1] > 0.0 {
-                        d.panel(panel);
-                    }
-                    let wash = |c: Rgba, r: [f32; 4], radius: f32, a: f32| panel_from(rgba(c), [0.0; 4], Shape { radius, n: shape.n, border: 0.0, feather: 0.0 }, r, p.alpha * a);
-                    let hover = e.try_cloned::<&HoverLook>().zip(e.try_cloned::<&HoverAmt>().map(|h| h.spring.x.clamp(0.0, 1.0)));
-                    if let Some((l, h)) = hover.filter(|(_, h)| *h > 0.004) {
-                        let r = [rect[0] - l.pad, rect[1] - l.pad, rect[2] + 2.0 * l.pad, rect[3] + 2.0 * l.pad];
-                        d.panel(wash(if dark { l.dark } else { l.light }, r, if l.radius < 0.0 { shape.radius + l.pad } else { l.radius }, h));
-                    }
-                    if let Some(l) = e.try_cloned::<&PressLook>().filter(|_| held == Some(id)) {
-                        d.panel(wash(if dark { l.dark } else { l.light }, rect, shape.radius, 1.0));
-                    }
-                    if is_term {
-                        self.emit_term(id, d, sc, upload);
-                    }
+            let at = match self.paint.node(d, e, &p, laid, dark, held == Some(id), sc, upload) {
+                Ok(at) => at,
+                Err(err) => {
+                    eprintln!("harness-native: paint: {err}");
+                    continue;
                 }
-                PaintKind::Glyphs => {
-                    let Some(text) = e.try_cloned::<&Text>() else { continue };
-                    let style = e.try_cloned::<&TextStyle>().unwrap_or_default();
-                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
-                    let truncate = e.try_cloned::<&Truncate>().map(|t| t.mode).or_else(|| e.has(OneLine::id()).then_some(TruncateMode::Tail));
-                    let lay = if let Some(mode) = truncate {
-                        // One line, never wrapped: cut with an ellipsis (at its end, middle or start) to the width layout gave it.
-                        let room = laid.w.max(1.0) + 0.5;
-                        let cut = typeset::elide(text.s.as_str(), mode, room, |t| self.layout(t, &style, 1.0e5).lines.iter().map(|l| l.width).fold(0.0, f32::max));
-                        self.layout(&cut, &style, 1.0e5)
-                    } else {
-                        self.layout(text.s.as_str(), &style, laid.w.max(1.0) + 0.5)
-                    };
-                    emit_layout(d, &self.fonts, &mut self.cache, &lay, (laid.x, laid.y), ink, p.alpha, sc, upload);
+            };
+            let (np, ng) = (at.panels, at.glyphs);
+            let turn = (p.kind == PaintKind::Icon).then(|| crate::look::turn(e)).flatten();
+            if is_term && p.kind == PaintKind::Plate {
+                self.emit_term(id, d, sc, upload);
+            }
+            // A disclosure chevron turns about its middle.
+            if let Some(turn) = turn {
+                for g in &mut d.glyphs[ng..] {
+                    g.clip[2] = turn;
                 }
-                PaintKind::Icon => {
-                    // A ui.Symbol: its glyph (a Nerd Font icon) set by the typesetter, centred in its rect.
-                    let Some(icon) = e.try_cloned::<&Icon>() else { continue };
-                    let turn = crate::look::turn(e);
-                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
-                    // 14 in a 16 box, as SF Symbols sit in a sidebar row.
-                    let style = TextStyle { size: laid.h.min(laid.w + 2.0) * 0.875, line: laid.h, ..TextStyle::default() };
-                    let lay = self.layout(icon.glyph.as_str(), &style, 1.0e5);
-                    let gw = lay.lines.iter().map(|l| l.width).fold(0.0, f32::max);
-                    emit_layout(d, &self.fonts, &mut self.cache, &lay, (laid.x + (laid.w - gw) * 0.5, laid.y), ink, p.alpha, sc, upload);
-                    // A disclosure chevron turns about its middle.
-                    if let Some(turn) = turn {
-                        for g in &mut d.glyphs[ng..] {
-                            g.clip[2] = turn;
-                        }
-                    }
-                }
-                PaintKind::Mark => {
-                    // A ui.Icon: its vector mark (icons.rs) drawn from its outline, optically sized in its box.
-                    let Some(mark) = e.try_cloned::<&Mark>().and_then(|m| crate::icons::mark(m.name.as_str())) else { continue };
-                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
-                    let side = laid.w.min(laid.h);
-                    let (r, uv) = crate::icons::place(mark, laid.x + (laid.w - side) * 0.5, laid.y + (laid.h - side) * 0.5, side);
-                    let col = [ink[0], ink[1], ink[2], ink[3] * p.alpha];
-                    d.glyph(GlyphInst { rect: r, uv, col_d: col, col_l: col, anim: [-1.0e9, 30.0, 0.0, 1.0], kind: [0.0, 0.0, 0.0, 1.0], band: mark.band, gdata: mark.gdata, ..GlyphInst::default() });
-                }
-                PaintKind::Picture | PaintKind::Ribbon => {}
             }
             // A HoverLift node: its glyphs risen and scaled about its centre by its row's hover and its bump.
             if let Some((dy, k)) = motion {
@@ -1492,24 +1395,7 @@ impl App {
                     g.rect = [cx + (g.rect[0] - cx) * k, cy + (g.rect[1] - cy) * k + dy, g.rect[2] * k, g.rect[3] * k];
                 }
             }
-            // A transition's scale: what this node drew, scaled about its corner.
-            if (p.scale - 1.0).abs() > 1e-4 && p.scale > 0.0 {
-                let (ox, oy, k) = (laid.x, laid.y, p.scale);
-                for panel in &mut d.panels[np..] {
-                    panel.rect = [ox + (panel.rect[0] - ox) * k, oy + (panel.rect[1] - oy) * k, panel.rect[2] * k, panel.rect[3] * k];
-                }
-                for g in &mut d.glyphs[ng..] {
-                    g.rect = [ox + (g.rect[0] - ox) * k, oy + (g.rect[1] - oy) * k, g.rect[2] * k, g.rect[3] * k];
-                }
-            }
             if p.clipped {
-                let band = [p.clip_y, p.clip_y + p.clip_h];
-                for panel in &mut d.panels[np..] {
-                    panel.clip[..2].copy_from_slice(&band);
-                }
-                for glyph in &mut d.glyphs[ng..] {
-                    glyph.clip[..2].copy_from_slice(&band);
-                }
                 // Cut to the tree's band: soft at an edge with more of the tree beyond it.
                 if let Some(fade) = self.tree_fade(&p) {
                     for panel in &mut d.panels[np..] {
@@ -1714,51 +1600,5 @@ impl RowLooks {
 fn set_if(v: View<'_>, fill: Fill) {
     if v.entity().try_cloned::<&Fill>() != Some(fill) {
         v.set(fill);
-    }
-}
-
-/// den's `panel_from`: a plate of `fill` with `edge` and `shape` at `alpha`.
-fn panel_from(fill: [f32; 4], edge: [f32; 4], shape: Shape, rect: [f32; 4], alpha: f32) -> PanelInst {
-    PanelInst {
-        rect,
-        fill_d: fill,
-        fill_l: fill,
-        edge_d: edge,
-        edge_l: edge,
-        shape: [shape.radius, shape.n, shape.border, shape.feather],
-        fx: [0.0; 4],
-        fx2: [0.0, alpha, 0.0, 0.0],
-        lens: [0.0; 4],
-        fx3: [0.0; 4],
-        clip: [0.0; 4],
-    }
-}
-
-/// A layout's glyphs at `(ox, oy)` in `ink`, snapped to the device pixel grid with den's subpixel steps.
-#[allow(clippy::too_many_arguments)]
-fn emit_layout(d: &mut Draw, fonts: &Fonts, cache: &mut GlyphCache, lay: &Layout, (ox, oy): (f32, f32), ink: [f32; 4], alpha: f32, sc: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
-    let asz = cache.size as f32;
-    let mut col = ink;
-    col[3] *= alpha;
-    for line in &lay.lines {
-        for g in &line.glyphs {
-            let base_px = ((oy + line.baseline - g.y) * sc).round();
-            let xp = (ox + g.x) * sc;
-            let ix = xp.floor();
-            let sub = (((xp - ix) * SUBPX as f32).floor() as u32).min(SUBPX - 1);
-            let Some(e) = cache.get(fonts, g.font, g.id, sc, sub, upload) else { continue };
-            if e.w == 0 {
-                continue;
-            }
-            d.glyph(GlyphInst {
-                rect: [(ix + e.left as f32) / sc, (base_px - e.top as f32) / sc, e.w as f32 / sc, e.h as f32 / sc],
-                uv: [e.x as f32 / asz, e.y as f32 / asz, (e.x + e.w) as f32 / asz, (e.y + e.h) as f32 / asz],
-                col_d: col,
-                col_l: col,
-                anim: [-1.0e9, 30.0, 0.0, 1.0],
-                kind: [f32::from(u8::from(e.colour)), 0.0, 0.0, 0.0],
-                ..Default::default()
-            });
-        }
     }
 }
