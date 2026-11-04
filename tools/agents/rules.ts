@@ -295,6 +295,14 @@ export const rules = [
 		link: "docs/contributing.md#where-new-code-goes",
 	},
 	{
+		id: "library-over-language",
+		skill: "compiler-correctness",
+		line: "Build a feature as a library on the language that exists; when no library can express it, add the smallest general primitive, never an ad hoc language feature.",
+		info: "Before adding an attribute, intrinsic or special case to the compiler, write the feature as library code on what the language already has: traits, generics, const eval, compile-time reflection (`core::mem::type_info`), allocators, effects and the purity proof. When it cannot be written that way, the language is missing a primitive: add the smallest general one that makes the library possible (nightly's API where one exists, otherwise an opt-in blaze extension), and keep the set of primitives small. The compiler proves and exposes facts (purity, code identity, layout, reflection); policy (caching, storage, hash formats, how code is executed) lives in libraries anyone can read or replace. Example: `Canonical` is library code over `type_info`, and `#[blaze::cache]` lowers to a call on a library `Executor`; the compiler generates neither the hashing nor the caching.",
+		reason: "Andrew, 2026-11-03, designing `#[blaze::pinned]`: \"you don't need to add ad hoc language features when you can just do things with [the] existing language, and if you can't you probably do not have a powerful enough language and you need to improve the primitives\".",
+		link: "docs/contributing.md#where-new-code-goes",
+	},
+	{
 		id: "no-mcp",
 		skill: "docs-and-scripts",
 		line: "No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in deterministic CBOR.",
