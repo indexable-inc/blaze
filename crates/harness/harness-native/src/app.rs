@@ -8,7 +8,8 @@
 use crate::draw::{ATLAS_SIZE, Draw};
 use crate::link::Link;
 use crate::pack::{Frame, GlyphInst, PanelInst};
-use crate::term::{self, Grid, Mods, Sel};
+use crate::term::{self, Button, Grid, KeyAction, MouseAct, Sel};
+use harness_vt::MouseTracking;
 use crate::text::{Face, Fonts, GlyphCache, Layout, SUBPX, Style, TypeLook};
 use harness_native_api::spring::Tune;
 use harness_native_api::{APP, Clock, HoverAmt, moving, settle};
@@ -39,12 +40,15 @@ const ZOOMS: [f32; 9] = [0.67, 0.75, 0.85, 0.92, 1.0, 1.1, 1.25, 1.4, 1.6];
 /// The window's ground under the sidebar.
 const GROUND: [f32; 4] = [0.043, 0.043, 0.047, 1.0];
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KeyMods {
-    pub cmd: bool,
-    pub shift: bool,
-    pub ctrl: bool,
-    pub alt: bool,
+pub use crate::term::Mods as KeyMods;
+
+/// What a press-and-drag selects by: cells, words (double click) or lines (triple click).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Unit {
+    #[default]
+    Cell,
+    Word,
+    Line,
 }
 
 /// What a palette entry does.
@@ -89,7 +93,27 @@ pub struct App {
     term_rect: Option<[f32; 4]>,
     sel: Option<Sel>,
     selecting: bool,
+    /// The unit a drag selects by, and the span the press selected (a drag keeps it whole).
+    unit: Unit,
+    anchor: ((i64, u16), (i64, u16)),
+    /// The program's mouse button held down (its mouse mode is on), and the cell last reported.
+    report: Option<Button>,
+    reported: Option<(u16, u16)>,
+    /// Wheel lines not yet sent as keys or reports.
     wheel: f32,
+    /// The fraction of a row scrolled back past the model's whole rows (smooth trackpad scrolling).
+    scroll_frac: f32,
+    /// Where the last frame drew the grid's first row (layout points; above the pane when a fraction of a row is
+    /// scrolled) and how many rows back that viewport was.
+    term_top: f32,
+    term_shift: i64,
+    /// The keyboard encoder, and the terminal modes and sizes input reads (from the last snapshot).
+    keys: term::Keys,
+    input: term::Input,
+    /// Keys whose press went to the program, so it hears their releases (kitty's event types).
+    pressed: Vec<u16>,
+    /// An input method's uncommitted text, drawn at the cursor.
+    marked: Option<String>,
     /// Session ids attached since launch: an ended one is attached again only when it is still running.
     tried: HashMap<u64, f32>,
     /// The session a spawn made, to select once the list shows it.
@@ -210,7 +234,18 @@ impl App {
             term_rect: None,
             sel: None,
             selecting: false,
+            unit: Unit::Cell,
+            anchor: ((0, 0), (0, 0)),
+            report: None,
+            reported: None,
             wheel: 0.0,
+            scroll_frac: 0.0,
+            term_top: 0.0,
+            term_shift: 0,
+            keys: term::Keys::new(),
+            input: term::Input::default(),
+            pressed: Vec::new(),
+            marked: None,
             tried: HashMap::new(),
             spawned: Arc::default(),
             focused: true,
@@ -282,6 +317,9 @@ impl App {
     fn select(&mut self, e: Option<u64>) {
         if e != self.selected() {
             self.sel = None;
+            self.scroll_frac = 0.0;
+            self.report = None;
+            self.pressed.clear();
             model::select(self.world.world_ref(), e);
         }
         self.poke();
@@ -734,80 +772,268 @@ impl App {
     fn emit_term(&mut self, d: &mut Draw, sc: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
         let Some(rect) = self.term_rect else { return };
         let Some(sid) = self.selected().and_then(|e| self.session_of(e)) else { return };
-        let scroll = self.scroll();
+        // A fraction of a row back: the viewport one row further back, lifted by what is left of that row.
+        let want = self.scroll() + usize::from(self.scroll_frac > 0.0);
         let mut map = self.terms.borrow_mut();
         let Some(parser) = map.get_mut(&sid) else { return };
-        parser.set_scrollback(scroll);
-        let scroll = parser.scrollback();
+        parser.set_scrollback(want);
+        let shown = parser.scrollback();
         let snap = term::snapshot(parser, &term::DARK);
         parser.set_scrollback(0);
         drop(map);
-        let paint = term::Paint { origin: (rect[0], rect[1]), scale: sc, focused: self.focused && self.palette.is_none(), sel: self.sel, scroll, theme: &term::DARK, time: self.time };
+        let lift = if self.scroll_frac > 0.0 && shown == want { (1.0 - self.scroll_frac) * self.grid.ch } else { 0.0 };
+        self.input = snap.input;
+        self.term_top = rect[1] - lift;
+        self.term_shift = shown as i64;
+        let (np, ng) = (d.panels.len(), d.glyphs.len());
+        let paint = term::Paint {
+            origin: (rect[0], self.term_top),
+            scale: sc,
+            focused: self.focused && self.palette.is_none(),
+            sel: self.sel,
+            scroll: shown,
+            theme: &term::DARK,
+            time: self.time,
+            marked: self.marked.as_deref(),
+        };
         term::draw(d, &mut self.grid, &mut self.fonts, &mut self.cache, &snap, &paint, upload);
+        if lift > 0.0 {
+            let band = [rect[1], rect[1] + rect[3]];
+            for p in &mut d.panels[np..] {
+                p.clip[..2].copy_from_slice(&band);
+            }
+            for g in &mut d.glyphs[ng..] {
+                g.clip[..2].copy_from_slice(&band);
+            }
+        }
     }
 
     // ---- input ----
 
-    /// The pointer moved to `(x, y)` (window points).
-    pub fn pointer_move(&mut self, x: f32, y: f32) {
+    fn set_pointer(&mut self, x: f32, y: f32) {
         let z = self.zoom();
         self.pointer.x = x / z;
         self.pointer.y = y / z;
-        if self.selecting {
-            let scroll = self.scroll() as i64;
-            if let (Some(s), Some(c)) = (self.sel.as_mut(), cell_at(self.term_rect, &self.grid, self.pointer.x, self.pointer.y, 0)) {
-                s.b = (c.0 - scroll, c.1);
+    }
+
+    /// The viewport cell under the pointer (row, column), clamped to the grid when `clamp`, else only within the pane.
+    fn pointer_cell(&self, clamp: bool) -> Option<(i64, u16)> {
+        let r = self.term_rect?;
+        let (x, y) = (self.pointer.x, self.pointer.y);
+        if !clamp && (x < r[0] - 4.0 || y < r[1] - 4.0 || x > r[0] + r[2] + 4.0 || y > r[1] + r[3] + 4.0) {
+            return None;
+        }
+        let (cols, rows) = self.input.size;
+        let col = ((x - r[0]) / self.grid.cw).floor().clamp(0.0, f32::from(cols.max(1) - 1)) as u16;
+        let row = ((y - self.term_top) / self.grid.ch).floor().clamp(0.0, f32::from(rows.max(1) - 1)) as i64;
+        Some((row, col))
+    }
+
+    /// The pointer's cell as a mouse report addresses it (viewport column and row).
+    fn report_cell(&self) -> Option<(u16, u16)> {
+        self.pointer_cell(true).map(|(r, c)| (c, r as u16))
+    }
+
+    /// Whether the pointer goes to the program: it turned a mouse mode on, and Shift is not held to select instead.
+    fn reporting(&self, m: KeyMods) -> bool {
+        self.input.modes.mouse != MouseTracking::None && !m.shift && self.palette.is_none()
+    }
+
+    fn report_mouse(&mut self, b: Button, act: MouseAct, m: KeyMods) {
+        let Some((col, row)) = self.report_cell() else { return };
+        if act == MouseAct::Motion && self.reported == Some((col, row)) {
+            return;
+        }
+        self.reported = Some((col, row));
+        let bytes = term::mouse(b, act, col, row, m, &self.input.modes);
+        if !bytes.is_empty() {
+            self.send(&bytes);
+        }
+    }
+
+    /// The pointer moved to `(x, y)` (window points).
+    pub fn pointer_move(&mut self, x: f32, y: f32, m: KeyMods) {
+        self.set_pointer(x, y);
+        if let Some(b) = self.report {
+            self.report_mouse(b, MouseAct::Motion, m);
+        } else if self.selecting {
+            if let Some((vr, col)) = self.pointer_cell(true) {
+                let at = (vr - self.term_shift, col);
+                let span = self.unit_span(at, self.unit);
+                let (a0, a1) = self.anchor;
+                self.sel = Some(if span.0 < a0 { Sel { a: a1, b: span.0 } } else { Sel { a: a0, b: span.1 } });
             }
+        } else if self.input.modes.mouse == MouseTracking::Any && self.reporting(m) && self.pointer_cell(false).is_some() {
+            self.report_mouse(Button::None, MouseAct::Motion, m);
         }
         self.poke();
     }
 
-    pub fn pointer_down(&mut self, x: f32, y: f32) {
-        self.pointer_move(x, y);
-        self.pointer.down = true;
-        self.pointer.went_down = true;
-        if self.palette.is_none()
-            && let Some(c) = cell_at(self.term_rect, &self.grid, self.pointer.x, self.pointer.y, 0)
-        {
-            let scroll = self.scroll() as i64;
-            let at = (c.0 - scroll, c.1);
-            self.sel = Some(Sel { a: at, b: at });
-            self.selecting = true;
+    /// A button went down at `(x, y)`: the `clicks`th in a row.
+    pub fn pointer_down(&mut self, x: f32, y: f32, b: Button, clicks: isize, m: KeyMods) {
+        self.set_pointer(x, y);
+        self.poke();
+        if b == Button::Left {
+            self.pointer.down = true;
+            self.pointer.went_down = true;
         }
+        if self.palette.is_some() {
+            return;
+        }
+        let Some((vr, col)) = self.pointer_cell(false) else { return };
+        if self.reporting(m) {
+            self.sel = None;
+            self.report = Some(b);
+            self.reported = None;
+            self.report_mouse(b, MouseAct::Press, m);
+            return;
+        }
+        if b != Button::Left {
+            return;
+        }
+        if m.alt && !m.cmd {
+            self.click_move(vr, col);
+            return;
+        }
+        let at = (vr - self.term_shift, col);
+        self.unit = match clicks {
+            ..=1 => Unit::Cell,
+            2 => Unit::Word,
+            _ => Unit::Line,
+        };
+        self.anchor = self.unit_span(at, self.unit);
+        self.sel = Some(Sel { a: self.anchor.0, b: self.anchor.1 });
+        self.selecting = true;
     }
 
-    pub fn pointer_up(&mut self) {
-        self.pointer.down = false;
-        self.pointer.went_up = true;
-        if self.selecting {
+    pub fn pointer_up(&mut self, x: f32, y: f32, b: Button, m: KeyMods) {
+        self.set_pointer(x, y);
+        if b == Button::Left {
+            self.pointer.down = false;
+            self.pointer.went_up = true;
+        }
+        if self.report == Some(b) {
+            self.report = None;
+            self.report_mouse(b, MouseAct::Release, m);
+        } else if self.selecting && b == Button::Left {
             self.selecting = false;
-            if self.sel.is_some_and(|s| s.a == s.b) {
+            if self.unit == Unit::Cell && self.sel.is_some_and(|s| s.a == s.b) {
                 self.sel = None;
             }
         }
         self.poke();
     }
 
-    /// A scroll of `dy` points (positive: back into the history).
-    pub fn wheel(&mut self, dy: f32, precise: bool) {
-        let lines = if precise { dy / self.grid.ch } else { dy };
-        self.wheel += lines;
-        let n = self.wheel.trunc();
-        if n == 0.0 {
+    /// Option-click: move the cursor to viewport cell `(row, col)` with arrow keys (along the line in a shell, which
+    /// wraps a long prompt; up/down then across in a full-screen program).
+    fn click_move(&mut self, row: i64, col: u16) {
+        if self.term_shift != 0 {
             return;
         }
-        self.wheel -= n;
-        let alt = self.with_parser(|p, _| (p.alternate_screen(), p.application_cursor())).unwrap_or((false, false));
-        if alt.0 {
-            // A full-screen program: the wheel is its arrow keys, as Terminal's alternate scroll does.
-            let key = if n > 0.0 { 126 } else { 125 };
-            let bytes = term::encode_key(key, "", "", Mods::default(), alt.1).repeat(n.abs() as usize);
+        let modes = self.input.modes;
+        let (crow, ccol) = (i64::from(self.input.cursor.0), i64::from(self.input.cursor.1));
+        let cols = i64::from(self.input.size.0);
+        let col = i64::from(col);
+        let mut out = Vec::new();
+        let mut step = |code: u16, n: i64, keys: &mut term::Keys| out.extend(keys.press(code, &modes).repeat(n.unsigned_abs() as usize));
+        if modes.alt_screen {
+            step(if row > crow { term::DOWN } else { term::UP }, row - crow, &mut self.keys);
+            step(if col > ccol { term::RIGHT } else { term::LEFT }, col - ccol, &mut self.keys);
+        } else {
+            let d = (row - crow) * cols + (col - ccol);
+            step(if d > 0 { term::RIGHT } else { term::LEFT }, d, &mut self.keys);
+        }
+        self.sel = None;
+        self.send(&out);
+    }
+
+    /// Screen row `s` (negative: history) as the terminal holds it.
+    fn row_at(&self, s: i64) -> Option<harness_vt::Row> {
+        self.with_parser(|p, _| {
+            p.set_scrollback(usize::try_from(-s).unwrap_or(0));
+            let n = p.scrollback() as i64;
+            let (rows, _) = p.rows();
+            p.set_scrollback(0);
+            usize::try_from(s + n).ok().and_then(|i| rows.into_iter().nth(i))
+        })
+        .flatten()
+    }
+
+    /// The span a press at screen cell `at` selects by `unit`: the cell, its word, or its line (soft wraps followed).
+    fn unit_span(&self, at: (i64, u16), unit: Unit) -> ((i64, u16), (i64, u16)) {
+        match unit {
+            Unit::Cell => (at, at),
+            Unit::Word => self
+                .row_at(at.0)
+                .map(|row| {
+                    let cells: Vec<&str> = row.cells.iter().map(|c| c.text.as_str()).collect();
+                    let (a, b) = term::word_span(&cells, usize::from(at.1));
+                    ((at.0, a as u16), (at.0, b as u16))
+                })
+                .unwrap_or((at, at)),
+            Unit::Line => {
+                let (mut r0, mut r1) = (at.0, at.0);
+                for _ in 0..256 {
+                    if !self.row_at(r0 - 1).is_some_and(|r| r.wrapped) {
+                        break;
+                    }
+                    r0 -= 1;
+                }
+                for _ in 0..256 {
+                    if !self.row_at(r1).is_some_and(|r| r.wrapped) {
+                        break;
+                    }
+                    r1 += 1;
+                }
+                ((r0, 0), (r1, self.input.size.0.saturating_sub(1)))
+            }
+        }
+    }
+
+    /// Command-A: everything, history and screen.
+    fn select_all(&mut self) {
+        let (cols, rows) = self.input.size;
+        if rows == 0 {
+            return;
+        }
+        self.unit = Unit::Cell;
+        self.sel = Some(Sel { a: (-(self.input.history as i64), 0), b: (i64::from(rows) - 1, cols.saturating_sub(1)) });
+    }
+
+    /// A scroll of `dy` (points when `precise`, else lines; positive: back into the history). The primary screen
+    /// scrolls its history by the pixel; a program with a mouse mode gets wheel reports, a full-screen one arrows.
+    pub fn wheel(&mut self, dy: f32, precise: bool, m: KeyMods) {
+        let lines = if precise { dy / self.grid.ch } else { dy };
+        let modes = self.input.modes;
+        let report = self.reporting(m);
+        if report || modes.alt_screen {
+            self.wheel += lines;
+            let n = self.wheel.trunc();
+            if n == 0.0 {
+                return;
+            }
+            self.wheel -= n;
+            let count = n.abs() as usize;
+            let bytes = if report {
+                let (col, row) = self.report_cell().unwrap_or((0, 0));
+                term::mouse(if n > 0.0 { Button::WheelUp } else { Button::WheelDown }, MouseAct::Press, col, row, m, &modes).repeat(count)
+            } else {
+                self.keys.press(if n > 0.0 { term::UP } else { term::DOWN }, &modes).repeat(count)
+            };
             self.send(&bytes);
             return;
         }
-        let max = self.with_parser(|p, _| p.history());
-        let next = (self.scroll() as f32 + n).clamp(0.0, max.unwrap_or(0) as f32) as usize;
-        self.set_scroll(next);
+        let max = self.input.history as f32;
+        let s = (self.scroll() as f32 + self.scroll_frac + lines).clamp(0.0, max);
+        let s = if precise { s } else { s.round() };
+        let whole = s.floor();
+        self.scroll_frac = s - whole;
+        self.set_scroll(whole as usize);
+    }
+
+    fn to_bottom(&mut self) {
+        self.scroll_frac = 0.0;
+        self.set_scroll(0);
     }
 
     fn send(&mut self, bytes: &[u8]) {
@@ -816,23 +1042,76 @@ impl App {
         }
     }
 
-    /// A key typed: into the palette when it is open, else the terminal.
-    pub fn key(&mut self, code: u16, chars: &str, bare: &str, m: KeyMods) {
+    /// A key: into the palette when it is open, else natural text editing or the program's own encoding.
+    pub fn key(&mut self, k: &term::KeyIn<'_>) {
         self.poke();
         if self.palette.is_some() {
-            return self.palette_key(code, chars);
-        }
-        if chars.chars().next().is_some_and(|c| ('\u{F700}'..='\u{F8FF}').contains(&c)) && !matches!(code, 96..=126) {
+            if k.action != KeyAction::Release {
+                self.palette_key(k.code, k.text);
+            }
             return;
         }
-        let app_cursor = self.with_parser(|p, _| p.application_cursor()).unwrap_or(false);
-        let bytes = term::encode_key(code, chars, bare, Mods { shift: m.shift, ctrl: m.ctrl, alt: m.alt }, app_cursor);
+        if k.action == KeyAction::Release {
+            // Only keys whose press the program heard; the encoder sends nothing unless kitty's event types are on.
+            if let Some(i) = self.pressed.iter().position(|&c| c == k.code) {
+                self.pressed.swap_remove(i);
+                let bytes = self.keys.encode(k, &self.input.modes);
+                self.send(&bytes);
+            }
+            return;
+        }
+        if let Some(bytes) = term::natural_edit(k.code, k.unshifted, k.mods) {
+            self.sel = None;
+            self.to_bottom();
+            self.send(bytes);
+            return;
+        }
+        let bytes = self.keys.encode(k, &self.input.modes);
         if bytes.is_empty() {
             return;
         }
+        if !self.pressed.contains(&k.code) {
+            self.pressed.push(k.code);
+        }
         self.sel = None;
-        self.set_scroll(0);
+        self.to_bottom();
         self.send(&bytes);
+    }
+
+    /// Text an input method, the emoji picker or dictation committed: sent as typed.
+    pub fn commit_text(&mut self, text: &str) {
+        self.marked = None;
+        self.poke();
+        if let Some(p) = self.palette.as_mut() {
+            p.query.push_str(text);
+            p.at = 0;
+            return;
+        }
+        self.sel = None;
+        self.to_bottom();
+        self.send(text.as_bytes());
+    }
+
+    /// An input method's uncommitted text (None: none).
+    pub fn set_marked(&mut self, text: Option<String>) {
+        self.marked = text.filter(|t| !t.is_empty());
+        self.poke();
+    }
+
+    pub fn marked(&self) -> Option<&str> {
+        self.marked.as_deref()
+    }
+
+    /// Where typed text goes (window points): the cell after the cursor and any marked text, for the input method's
+    /// candidate window.
+    pub fn caret_rect(&self) -> Option<[f32; 4]> {
+        let rect = self.term_rect?;
+        let (r, c) = self.input.cursor;
+        let z = self.zoom();
+        let col = f32::from(c) + self.marked.as_deref().map_or(0, term::columns) as f32;
+        let x = rect[0] + col * self.grid.cw;
+        let y = self.term_top + (i64::from(r) + self.term_shift) as f32 * self.grid.ch;
+        Some([x * z, y * z, self.grid.cw * z, self.grid.ch * z])
     }
 
     fn palette_key(&mut self, code: u16, chars: &str) {
@@ -866,8 +1145,17 @@ impl App {
     /// A Command shortcut: whether it was one of the app's.
     pub fn shortcut(&mut self, key: &str, code: u16, m: KeyMods) -> bool {
         self.poke();
+        if self.palette.is_none()
+            && let Some(bytes) = term::natural_edit(code, key.chars().next(), m)
+        {
+            self.sel = None;
+            self.to_bottom();
+            self.send(bytes);
+            return true;
+        }
         let k = key.to_lowercase();
         match (k.as_str(), m.shift) {
+            ("a", false) => self.select_all(),
             ("]", _) | ("}", _) => self.step_object(1),
             ("[", _) | ("{", _) => self.step_object(-1),
             ("t", false) => self.spawn("claude"),
@@ -954,20 +1242,10 @@ impl App {
         self.select(next);
     }
 
-    /// The text of the terminal's selection, for the pasteboard.
+    /// The text of the terminal's selection, for the pasteboard (None: nothing selected, so Command-C does nothing).
     pub fn copy(&self) -> Option<String> {
         let sel = self.sel?;
-        let scroll = self.scroll() as i64;
-        self.with_parser(|p, _| {
-            let rows = i64::from(p.size().1);
-            let ((r0, c0), (r1, c1)) = sel.ordered();
-            let (r0, r1) = ((r0 + scroll).clamp(0, rows - 1) as u16, (r1 + scroll).clamp(0, rows - 1) as u16);
-            p.set_scrollback(scroll as usize);
-            let text = p.contents_between(r0, c0, r1, c1.saturating_add(1));
-            p.set_scrollback(0);
-            text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n")
-        })
-        .filter(|s| !s.is_empty())
+        self.with_parser(|p, _| term::selection_text(p, sel.ordered())).filter(|s| !s.is_empty())
     }
 
     pub fn paste(&mut self, text: &str) {
@@ -978,8 +1256,8 @@ impl App {
             self.poke();
             return;
         }
-        let bracketed = self.with_parser(|p, _| p.bracketed_paste()).unwrap_or(false);
-        self.set_scroll(0);
+        let bracketed = self.input.modes.bracketed_paste;
+        self.to_bottom();
         self.send(&term::paste(text, bracketed));
     }
 
@@ -993,17 +1271,6 @@ impl App {
         self.palette = Some(Palette { query: String::new(), at: 0 });
         self.poke();
     }
-}
-
-/// The cell under `(x, y)` (layout points) in the terminal at `rect`: its row on the screen and column.
-fn cell_at(rect: Option<[f32; 4]>, grid: &Grid, x: f32, y: f32, _: i64) -> Option<(i64, u16)> {
-    let r = rect?;
-    if x < r[0] - 4.0 || y < r[1] - 4.0 || x > r[0] + r[2] + 4.0 || y > r[1] + r[3] + 4.0 {
-        return None;
-    }
-    let col = ((x - r[0]) / grid.cw).floor().max(0.0) as u16;
-    let row = ((y - r[1]) / grid.ch).floor().max(0.0) as i64;
-    Some((row, col))
 }
 
 /// Whether every character of `q` comes in `s`, in order.

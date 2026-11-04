@@ -2,18 +2,22 @@
 //! den-native's window.rs. Frames come from a `CAMetalDisplayLink`, paused whenever the app is idle; the daemon's threads
 //! wake it through the main queue.
 use crate::app::{App, KeyMods};
+use crate::term::{self, Button, KeyAction};
 use crate::gpu::{self, Dest, Renderer};
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSMenu, NSMenuItem,
-    NSPasteboard, NSPasteboardTypeString, NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSPasteboard, NSPasteboardTypeString, NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedSRGB};
-use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString};
+use objc2_foundation::{
+    NSArray, NSAttributedString, NSAttributedStringKey, NSNotFound, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRangePointer, NSRect, NSRunLoop,
+    NSRunLoopCommonModes, NSSize, NSString, NSUInteger,
+};
 use objc2_metal::MTLCreateSystemDefaultDevice;
 use objc2_quartz_core::{CAFrameRateRange, CAMetalDisplayLink, CAMetalDisplayLinkDelegate, CAMetalDisplayLinkUpdate, CAMetalLayer, kCAGravityTopLeft};
 use std::cell::{OnceCell, RefCell};
@@ -35,6 +39,28 @@ struct State {
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     static DELEGATE: OnceCell<Retained<AppDelegate>> = const { OnceCell::new() };
+    /// The key event the input method is interpreting, and whether text was being composed when it came: the
+    /// NSTextInputClient calls during `interpretKeyEvents` take it when they consume it.
+    static IME_KEY: RefCell<Option<(Retained<NSEvent>, bool)>> = const { RefCell::new(None) };
+}
+
+fn composing() -> bool {
+    with(|st| st.app.marked().is_some()).unwrap_or(false)
+}
+
+/// The string an NSTextInputClient call carries (an NSString or an NSAttributedString).
+fn text_of(obj: &AnyObject) -> String {
+    if let Some(a) = obj.downcast_ref::<NSAttributedString>() {
+        a.string().to_string()
+    } else if let Some(s) = obj.downcast_ref::<NSString>() {
+        s.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn not_found() -> NSRange {
+    NSRange::new(NSNotFound as NSUInteger, 0)
 }
 
 /// Run `f` on the window's state, unless it is in use (an event during a frame).
@@ -112,18 +138,44 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            let chars = event.characters().map(|s| s.to_string()).unwrap_or_default();
-            let bare = event.charactersIgnoringModifiers().map(|s| s.to_string()).unwrap_or_default();
             let m = mods_of(event.modifierFlags());
-            with(|st| st.app.key(event.keyCode(), &chars, &bare, m));
+            let was = composing();
+            // Control, Option (as Meta), Command and the function keys go straight to the encoder; typing goes
+            // through the input method (dead keys, IMEs), which calls back into NSTextInputClient below.
+            if !was && (m.ctrl || m.alt || m.cmd || term::is_function_key(event.keyCode())) {
+                self.send_key(event, None, if event.isARepeat() { KeyAction::Repeat } else { KeyAction::Press });
+            } else {
+                IME_KEY.with(|k| *k.borrow_mut() = Some((event.retain(), was)));
+                self.interpretKeyEvents(&NSArray::from_slice(&[event]));
+                // No text and no preedit came of it (return, tab, backspace, escape): the key itself, unless the
+                // input method was composing and so owned it.
+                if let Some((ev, was)) = IME_KEY.with(|k| k.borrow_mut().take())
+                    && !was
+                    && !composing()
+                {
+                    self.send_key(&ev, None, if ev.isARepeat() { KeyAction::Repeat } else { KeyAction::Press });
+                }
+            }
             wake();
+        }
+
+        #[unsafe(method(keyUp:))]
+        fn key_up(&self, event: &NSEvent) {
+            if !composing() {
+                self.send_key(event, None, KeyAction::Release);
+            }
         }
 
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> bool {
             let m = mods_of(event.modifierFlags());
             let key = event.charactersIgnoringModifiers().map(|s| s.to_string()).unwrap_or_default();
-            let took = m.cmd && !m.ctrl && !matches!(key.as_str(), "c" | "v" | "q" | "h" | "m") && with(|st| st.app.shortcut(&key, event.keyCode(), m)).unwrap_or(false);
+            // Control-Command-Space: the emoji picker, which types through insertText.
+            let picker = m.cmd && m.ctrl && key == " ";
+            if picker {
+                NSApplication::sharedApplication(self.mtm()).orderFrontCharacterPalette(None);
+            }
+            let took = picker || (m.cmd && !m.ctrl && !matches!(key.as_str(), "c" | "v" | "q" | "h" | "m") && with(|st| st.app.shortcut(&key, event.keyCode(), m)).unwrap_or(false));
             if took {
                 wake();
                 true
@@ -136,34 +188,57 @@ define_class!(
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
-            let p = self.local(event);
-            with(|st| st.app.pointer_down(p.x as f32, p.y as f32));
-            wake();
+            self.pointer_down(event, Button::Left);
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            self.pointer_down(event, Button::Right);
+        }
+
+        #[unsafe(method(otherMouseDown:))]
+        fn other_mouse_down(&self, event: &NSEvent) {
+            self.pointer_down(event, Button::Middle);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            self.pointer_up(event, Button::Left);
+        }
+
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, event: &NSEvent) {
+            self.pointer_up(event, Button::Right);
+        }
+
+        #[unsafe(method(otherMouseUp:))]
+        fn other_mouse_up(&self, event: &NSEvent) {
+            self.pointer_up(event, Button::Middle);
         }
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
-            let p = self.local(event);
-            with(|st| st.app.pointer_move(p.x as f32, p.y as f32));
-            wake();
+            self.pointer_move(event);
         }
 
-        #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, _event: &NSEvent) {
-            with(|st| st.app.pointer_up());
-            wake();
+        #[unsafe(method(rightMouseDragged:))]
+        fn right_mouse_dragged(&self, event: &NSEvent) {
+            self.pointer_move(event);
+        }
+
+        #[unsafe(method(otherMouseDragged:))]
+        fn other_mouse_dragged(&self, event: &NSEvent) {
+            self.pointer_move(event);
         }
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
-            let p = self.local(event);
-            with(|st| st.app.pointer_move(p.x as f32, p.y as f32));
-            wake();
+            self.pointer_move(event);
         }
 
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, _event: &NSEvent) {
-            with(|st| st.app.pointer_move(-1.0e4, -1.0e4));
+            with(|st| st.app.pointer_move(-1.0e4, -1.0e4, KeyMods::default()));
             wake();
         }
 
@@ -171,9 +246,10 @@ define_class!(
         fn scroll_wheel(&self, event: &NSEvent) {
             let precise = event.hasPreciseScrollingDeltas();
             let dy = event.scrollingDeltaY() as f32;
+            let m = mods_of(event.modifierFlags());
             with(|st| {
                 let z = st.app.zoom();
-                st.app.wheel(if precise { dy / z } else { dy }, precise);
+                st.app.wheel(if precise { dy / z } else { dy }, precise, m);
             });
             wake();
         }
@@ -217,6 +293,80 @@ define_class!(
         }
     }
 
+    // The input method's client: preedit (marked) text, committed text (IMEs, dead keys, the emoji picker, dictation)
+    // and where the candidate window goes. The terminal has no text storage to offer, so ranges are the preedit's.
+    unsafe impl NSTextInputClient for HarnessView {
+        #[unsafe(method(insertText:replacementRange:))]
+        fn insert_text(&self, string: &AnyObject, _replacement: NSRange) {
+            let text = text_of(string);
+            match IME_KEY.with(|k| k.borrow_mut().take()) {
+                // A plain keystroke that typed its own text: encode it as that key (the kitty protocol may want it).
+                Some((ev, false)) if !composing() => self.send_key(&ev, Some(&text), if ev.isARepeat() { KeyAction::Repeat } else { KeyAction::Press }),
+                _ => {
+                    with(|st| st.app.commit_text(&text));
+                }
+            }
+            wake();
+        }
+
+        #[unsafe(method(doCommandBySelector:))]
+        fn do_command(&self, _selector: objc2::runtime::Sel) {
+            // Left for keyDown: the key event itself is encoded once interpretKeyEvents returns.
+        }
+
+        #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
+        fn set_marked_text(&self, string: &AnyObject, _selected: NSRange, _replacement: NSRange) {
+            IME_KEY.with(|k| k.borrow_mut().take());
+            let text = text_of(string);
+            with(|st| st.app.set_marked(Some(text)));
+            wake();
+        }
+
+        #[unsafe(method(unmarkText))]
+        fn unmark_text(&self) {
+            with(|st| st.app.set_marked(None));
+            wake();
+        }
+
+        #[unsafe(method(selectedRange))]
+        fn selected_range(&self) -> NSRange {
+            not_found()
+        }
+
+        #[unsafe(method(markedRange))]
+        fn marked_range(&self) -> NSRange {
+            with(|st| st.app.marked().map(|m| NSRange::new(0, m.encode_utf16().count()))).flatten().unwrap_or_else(not_found)
+        }
+
+        #[unsafe(method(hasMarkedText))]
+        fn has_marked_text(&self) -> bool {
+            composing()
+        }
+
+        #[unsafe(method_id(attributedSubstringForProposedRange:actualRange:))]
+        fn attributed_substring(&self, _range: NSRange, _actual: NSRangePointer) -> Option<Retained<NSAttributedString>> {
+            None
+        }
+
+        #[unsafe(method_id(validAttributesForMarkedText))]
+        fn valid_attributes(&self) -> Retained<NSArray<NSAttributedStringKey>> {
+            NSArray::new()
+        }
+
+        #[unsafe(method(firstRectForCharacterRange:actualRange:))]
+        fn first_rect(&self, _range: NSRange, _actual: NSRangePointer) -> NSRect {
+            let [x, y, w, h] = with(|st| st.app.caret_rect()).flatten().unwrap_or_default();
+            let local = NSRect::new(NSPoint::new(f64::from(x), f64::from(y)), NSSize::new(f64::from(w), f64::from(h)));
+            let in_window = self.convertRect_toView(local, None);
+            self.window().map_or(NSRect::ZERO, |w| w.convertRectToScreen(in_window))
+        }
+
+        #[unsafe(method(characterIndexForPoint:))]
+        fn character_index(&self, _point: NSPoint) -> NSUInteger {
+            NSNotFound as NSUInteger
+        }
+    }
+
     unsafe impl CAMetalDisplayLinkDelegate for HarnessView {
         #[unsafe(method(metalDisplayLink:needsUpdate:))]
         fn needs_update(&self, _link: &CAMetalDisplayLink, update: &CAMetalDisplayLinkUpdate) {
@@ -234,6 +384,41 @@ impl HarnessView {
 
     fn local(&self, event: &NSEvent) -> NSPoint {
         self.convertPoint_fromView(event.locationInWindow(), None)
+    }
+
+    /// Hand key `event` to the app: `text` what the input method typed for it, else the event's own characters
+    /// (with Option as Meta, the key's character without Option's symbol).
+    fn send_key(&self, event: &NSEvent, text: Option<&str>, action: KeyAction) {
+        let m = mods_of(event.modifierFlags());
+        let text = text.map(str::to_owned).unwrap_or_else(|| {
+            let typed = if m.alt { event.charactersIgnoringModifiers() } else { event.characters() };
+            typed.map(|s| s.to_string()).unwrap_or_default()
+        });
+        let unshifted = event.charactersByApplyingModifiers(NSEventModifierFlags::empty()).and_then(|s| s.to_string().chars().next());
+        let k = term::KeyIn { code: event.keyCode(), text: &text, unshifted, mods: m, action, composing: false };
+        with(|st| st.app.key(&k));
+        wake();
+    }
+
+    fn pointer_down(&self, event: &NSEvent, b: Button) {
+        let p = self.local(event);
+        let m = mods_of(event.modifierFlags());
+        with(|st| st.app.pointer_down(p.x as f32, p.y as f32, b, event.clickCount(), m));
+        wake();
+    }
+
+    fn pointer_up(&self, event: &NSEvent, b: Button) {
+        let p = self.local(event);
+        let m = mods_of(event.modifierFlags());
+        with(|st| st.app.pointer_up(p.x as f32, p.y as f32, b, m));
+        wake();
+    }
+
+    fn pointer_move(&self, event: &NSEvent) {
+        let p = self.local(event);
+        let m = mods_of(event.modifierFlags());
+        with(|st| st.app.pointer_move(p.x as f32, p.y as f32, m));
+        wake();
     }
 
     fn sync_size(&self) {
@@ -312,7 +497,11 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     // SAFETY: the main run loop and the common modes (frames keep coming during live resize and tracking).
     unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
 
-    let app = App::new(wake_from_any_thread())?;
+    let mut app = App::new(wake_from_any_thread())?;
+    // Open on one daemon session (scripts and end-to-end checks), as the shot's HARNESS_NATIVE_SHOT_SELECT does.
+    if let Some(sid) = std::env::var("HARNESS_NATIVE_SELECT").ok().and_then(|s| s.parse().ok()) {
+        app.select_session(sid);
+    }
     STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new() }));
     window.setContentView(Some(&view));
     // The view hears the window's key changes (focus for the cursor).
