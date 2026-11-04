@@ -824,7 +824,7 @@ impl Crate {
     /// path, and its disambiguator is the crate's own data and cfg. A dependency is its
     /// crate's ID, its name and a byte each of prelude, sysroot and private. Its
     /// [`LintOptions`] follow, each flag's lint and level and then the cap.
-    pub const DOMAIN: &'static str = "blaze v2 crate 5";
+    pub const DOMAIN: &'static str = "blaze v2 crate 6";
 
     pub fn data<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db BuiltCrateData {
         self.data_field(db)
@@ -994,6 +994,7 @@ impl Crate {
             None => hasher.update(&[0]),
             Some(cfg) => hasher.update(&[1]).id(&cfg_options_content(cfg)),
         };
+        extra.built_for.hash_into(&mut hasher);
         hasher.id(&workspace.content()).id(&cfg_options_content(cfg)).id(&env.content());
         content::len(&mut hasher, lints.opts.len());
         for (lint, level) in &lints.opts {
