@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_ids::bits::{BitSlice, BitSliceMut, words_for};
 use blaze_mem::scratch;
 use hir_def::{GenericParamId, TraitId};
@@ -239,7 +239,8 @@ impl<'db> InferenceTable<'db> {
         }
 
         obligations_for_self_ty.retain_mut(|obligation| {
-            obligation.predicate = self.infer_ctxt.deeply_resolve_ignoring_regions(obligation.predicate);
+            obligation.predicate =
+                self.infer_ctxt.deeply_resolve_ignoring_regions(obligation.predicate);
             !obligation.predicate.has_placeholders()
         });
         obligations_for_self_ty
@@ -617,9 +618,9 @@ impl<'db> InferenceTable<'db> {
 
     /// Whether a trait error that `emit_trait_errors` reports has been found so far.
     pub(super) fn has_trait_errors(&self) -> bool {
-        self.trait_errors
-            .iter()
-            .any(|error| SolverDiagnostic::from_fulfillment_error(&self.infer_ctxt, error).is_some())
+        self.trait_errors.iter().any(|error| {
+            SolverDiagnostic::from_fulfillment_error(&self.infer_ctxt, error).is_some()
+        })
     }
 
     fn emit_trait_errors(&mut self, diagnostics: &mut impl Extend<InferenceDiagnostic>) {
@@ -702,19 +703,21 @@ pub(super) mod resolve_completely {
         ) -> Self {
             let mut spans_emitted_type_must_be_known_for = frame_set(frame);
             spans_emitted_type_must_be_known_for.extend(
-                vars_emitted_type_must_be_known_for.into_iter().filter_map(|term| match term.kind() {
-                    TermKind::Ty(ty) => match ty.kind() {
-                        TyKind::Infer(InferTy::TyVar(vid)) => {
-                            Some(table.infer_ctxt.type_var_span(vid))
-                        }
-                        _ => None,
-                    },
-                    TermKind::Const(ct) => match ct.kind() {
-                        ConstKind::Infer(InferConst::Var(vid)) => {
-                            table.infer_ctxt.const_var_span(vid)
-                        }
-                        _ => None,
-                    },
+                vars_emitted_type_must_be_known_for.into_iter().filter_map(|term| {
+                    match term.kind() {
+                        TermKind::Ty(ty) => match ty.kind() {
+                            TyKind::Infer(InferTy::TyVar(vid)) => {
+                                Some(table.infer_ctxt.type_var_span(vid))
+                            }
+                            _ => None,
+                        },
+                        TermKind::Const(ct) => match ct.kind() {
+                            ConstKind::Infer(InferConst::Var(vid)) => {
+                                table.infer_ctxt.const_var_span(vid)
+                            }
+                            _ => None,
+                        },
+                    }
                 }),
             );
 
@@ -746,9 +749,8 @@ pub(super) mod resolve_completely {
             ty: Ty<'db>,
         ) -> Option<crate::solver_errors::NamedTerm> {
             let ty = self.table.resolve_vars_if_possible(ty);
-            ty.has_non_region_infer().then(|| {
-                crate::solver_errors::NamedTerm::new(&self.table.infer_ctxt, ty.into())
-            })
+            ty.has_non_region_infer()
+                .then(|| crate::solver_errors::NamedTerm::new(&self.table.infer_ctxt, ty.into()))
         }
 
         pub(crate) fn resolve_completely_with_default<T>(&mut self, value_ref: &mut T, default: T)
@@ -1001,20 +1003,20 @@ pub(super) mod resolve_completely {
                 return value;
             }
             let error = self.ctx.types.regions.error;
-            rustc_type_ir::fold_regions(self.ctx.table.interner(), value, |region, _| {
-                match region.kind() {
-                    RegionKind::ReLateParam(late)
-                        if matches!(
-                            late.scope,
-                            SolverDefId::InternedClosureId(_)
-                                | SolverDefId::InternedCoroutineId(_)
-                                | SolverDefId::InternedCoroutineClosureId(_)
-                        ) =>
-                    {
-                        error
-                    }
-                    _ => region,
+            rustc_type_ir::fold_regions(self.ctx.table.interner(), value, |region, _| match region
+                .kind()
+            {
+                RegionKind::ReLateParam(late)
+                    if matches!(
+                        late.scope,
+                        SolverDefId::InternedClosureId(_)
+                            | SolverDefId::InternedCoroutineId(_)
+                            | SolverDefId::InternedCoroutineClosureId(_)
+                    ) =>
+                {
+                    error
                 }
+                _ => region,
             })
         }
     }

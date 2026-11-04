@@ -16,7 +16,8 @@ struct Repo {
 impl Repo {
     fn new(name: &str) -> Repo {
         let unique = REPOS.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("blaze-ci-{name}-{}-{unique}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("blaze-ci-{name}-{}-{unique}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let repo = Repo { dir };
@@ -28,7 +29,14 @@ impl Repo {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.dir)
-            .args(["-c", "user.name=blaze", "-c", "user.email=blaze@example.com", "-c", "commit.gpgsign=false"])
+            .args([
+                "-c",
+                "user.name=blaze",
+                "-c",
+                "user.email=blaze@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
             .args(args)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("HOME", &self.dir)
@@ -37,7 +45,11 @@ impl Repo {
             .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
-        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
@@ -48,7 +60,8 @@ impl Repo {
     }
 
     fn mode(&self, path: &str, mode: u32) {
-        std::fs::set_permissions(self.dir.join(path), std::fs::Permissions::from_mode(mode)).unwrap();
+        std::fs::set_permissions(self.dir.join(path), std::fs::Permissions::from_mode(mode))
+            .unwrap();
     }
 
     fn commit(&self, message: &str) -> String {
@@ -58,7 +71,10 @@ impl Repo {
     }
 
     fn clone_of(&self) -> Git {
-        Git { dir: self.dir.clone(), remote: "https://github.com/indexable-inc/blaze.git".to_owned() }
+        Git {
+            dir: self.dir.clone(),
+            remote: "https://github.com/indexable-inc/blaze.git".to_owned(),
+        }
     }
 }
 
@@ -127,7 +143,11 @@ fn needs_git_ops_from_nothing_write_every_file_sorted() {
     let ops = repo.clone_of().ops(None, &first).unwrap();
     assert_eq!(
         ops,
-        vec![write("a.txt", b"one\n"), write("dir/b.rs", b"fn main() {}\n"), write_as("run.sh", RUN, Mode::Executable)],
+        vec![
+            write("a.txt", b"one\n"),
+            write("dir/b.rs", b"fn main() {}\n"),
+            write_as("run.sh", RUN, Mode::Executable)
+        ],
     );
 }
 
@@ -165,7 +185,11 @@ fn needs_git_ops_from_nothing_of_a_later_commit_are_its_whole_tree() {
     let ops = repo.clone_of().ops(None, &second).unwrap();
     assert_eq!(
         ops,
-        vec![write("a.txt", b"one more\n"), write("c.txt", b"\0binary\xff\n"), write("run.sh", RUN)],
+        vec![
+            write("a.txt", b"one more\n"),
+            write("c.txt", b"\0binary\xff\n"),
+            write("run.sh", RUN)
+        ],
     );
 }
 
@@ -180,7 +204,12 @@ fn needs_git_a_symlink_is_written_as_one_with_its_target() {
     assert_eq!(git.ops(Some(&second), &third).unwrap(), vec![link.clone()]);
     assert_eq!(
         git.ops(None, &third).unwrap(),
-        vec![write("a.txt", b"one more\n"), write("c.txt", b"\0binary\xff\n"), link, write("run.sh", RUN)],
+        vec![
+            write("a.txt", b"one more\n"),
+            write("c.txt", b"\0binary\xff\n"),
+            link,
+            write("run.sh", RUN)
+        ],
     );
 }
 
@@ -248,7 +277,10 @@ fn a_shown_command_hides_a_urls_user_and_password() {
         shown(&["fetch", "https://x-access-token:abc@github.com/o/r.git", "main"]),
         "git fetch https://***@github.com/o/r.git main",
     );
-    assert_eq!(shown(&["fetch", "https://github.com/o/r.git"]), "git fetch https://github.com/o/r.git");
+    assert_eq!(
+        shown(&["fetch", "https://github.com/o/r.git"]),
+        "git fetch https://github.com/o/r.git"
+    );
 }
 
 #[test]

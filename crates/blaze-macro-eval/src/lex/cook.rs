@@ -28,8 +28,16 @@ pub(super) enum Kind {
     Ident(Symbol, IdentKind),
     /// With its leading `'`.
     Lifetime(Symbol, IdentKind),
-    Literal { kind: LitKind, symbol: Symbol, suffix: Option<Symbol> },
-    Doc { kind: DocKind, inner: bool, data: Symbol },
+    Literal {
+        kind: LitKind,
+        symbol: Symbol,
+        suffix: Option<Symbol>,
+    },
+    Doc {
+        kind: DocKind,
+        inner: bool,
+        data: Symbol,
+    },
     Eof,
 }
 
@@ -158,12 +166,10 @@ impl<'s, 'e> Lexer<'s, 'e> {
                 }
                 rustc_lexer::TokenKind::BlockComment { doc_style, terminated } => {
                     if !terminated {
-                        return Err(self.fatal(
-                            match doc_style {
-                                Some(_) => "unterminated block doc-comment",
-                                None => "unterminated block comment",
-                            },
-                        ));
+                        return Err(self.fatal(match doc_style {
+                            Some(_) => "unterminated block doc-comment",
+                            None => "unterminated block comment",
+                        }));
                     }
                     let Some(doc_style) = doc_style else {
                         self.lint_unicode_text_flow(start);
@@ -175,8 +181,7 @@ impl<'s, 'e> Lexer<'s, 'e> {
                     self.cook_doc_comment(content, DocKind::Block, doc_style)
                 }
                 // `FrontmatterAllowed::No` makes none; rustc skips one as whitespace.
-                rustc_lexer::TokenKind::Frontmatter { .. }
-                | rustc_lexer::TokenKind::Whitespace => {
+                rustc_lexer::TokenKind::Frontmatter { .. } | rustc_lexer::TokenKind::Whitespace => {
                     preceded_by_whitespace = true;
                     continue;
                 }
@@ -188,7 +193,9 @@ impl<'s, 'e> Lexer<'s, 'e> {
                     }
                     Kind::Ident(sym, IdentKind::Raw)
                 }
-                rustc_lexer::TokenKind::ForcedKeywordIdent if self.edition >= Edition::Edition2021 => {
+                rustc_lexer::TokenKind::ForcedKeywordIdent
+                    if self.edition >= Edition::Edition2021 =>
+                {
                     self.emitted.forced_keywords += 1;
                     Kind::Ident(nfc_normalize(self.str_from(start + 2)), IdentKind::ForcedKeyword)
                 }
@@ -256,9 +263,7 @@ impl<'s, 'e> Lexer<'s, 'e> {
                     let ident_start = start + 3;
                     if self.edition >= Edition::Edition2021 {
                         if self.cursor.as_str().starts_with('\'') {
-                            self.error(
-                                "character literal may only contain one codepoint",
-                            );
+                            self.error("character literal may only contain one codepoint");
                         }
                         let name = self.str_from(ident_start);
                         if !can_be_raw(name) {
@@ -359,8 +364,7 @@ impl<'s, 'e> Lexer<'s, 'e> {
     /// `#` and what follows.
     fn maybe_report_guarded_str(&mut self, start: u32) -> Result<Kind, Fatal> {
         let edition2024 = self.edition >= Edition::Edition2024;
-        let mut cursor =
-            Cursor::new(&self.src[start as usize..], FrontmatterAllowed::No);
+        let mut cursor = Cursor::new(&self.src[start as usize..], FrontmatterAllowed::No);
         let (is_string, unterminated) = match cursor.guarded_double_quoted_string() {
             Some(rustc_lexer::GuardedStr { n_hashes: _, terminated, token_len }) => {
                 if edition2024 {
@@ -375,12 +379,10 @@ impl<'s, 'e> Lexer<'s, 'e> {
             if unterminated {
                 return Err(self.fatal("unterminated double quote string"));
             }
-            self.error(
-                match is_string {
-                    true => "invalid string literal",
-                    false => "reserved multi-hash token is forbidden",
-                },
-            );
+            self.error(match is_string {
+                true => "invalid string literal",
+                false => "reserved multi-hash token is forbidden",
+            });
             Ok(Kind::Literal {
                 kind: LitKind::Err,
                 symbol: Symbol::intern(self.str_from(start)),
@@ -394,12 +396,10 @@ impl<'s, 'e> Lexer<'s, 'e> {
 
     fn cook_doc_comment(&mut self, content: &str, kind: DocKind, doc_style: DocStyle) -> Kind {
         let errors = &mut self.emitted.errors;
-        doc_comment_errors(content, kind == DocKind::Block, |e| errors.push(e.message.into_owned()));
-        Kind::Doc {
-            kind,
-            inner: doc_style == DocStyle::Inner,
-            data: Symbol::intern(content),
-        }
+        doc_comment_errors(content, kind == DocKind::Block, |e| {
+            errors.push(e.message.into_owned())
+        });
+        Kind::Doc { kind, inner: doc_style == DocStyle::Inner, data: Symbol::intern(content) }
     }
 
     /// `cook_lexer_literal`, a fatal error stopping the lexer.
@@ -425,7 +425,8 @@ impl<'s, 'e> Lexer<'s, 'e> {
         if contains_text_flow_control_chars(self.str_from(start + 2)) {
             self.emitted.lints.push((
                 Lint::TextDirectionCodepointInComment,
-                "unicode codepoint changing visible direction of text present in comment".to_owned(), // alloc: error path
+                "unicode codepoint changing visible direction of text present in comment"
+                    .to_owned(), // alloc: error path
             ));
         }
     }

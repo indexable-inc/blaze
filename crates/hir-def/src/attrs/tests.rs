@@ -2,6 +2,7 @@ use std::{convert::Infallible, ops::ControlFlow};
 
 use base_db::Db;
 use either::Either;
+use hir_expand::fixture;
 use hir_expand::{
     HirFileId, Lookup,
     attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr_view},
@@ -13,7 +14,6 @@ use syntax::{
     AstNode, AstPtr, Parse, SourceFile, ast,
     view::{self, AstNode as _, HasAttrs as _, HasName as _, Typed},
 };
-use hir_expand::fixture;
 
 use super::{
     AttrFlags, Completions, CrateAttrFlags, DocAtom, DocWord, LinkKey, LinkKind, LinkModifier,
@@ -52,9 +52,8 @@ macro_rules! check_name_set {
             assert_eq!($Enum::of(text), Some(member), "{text}");
             assert_eq!($Enum::of(&text.to_owned()), Some(member), "{text}");
         }
-        let model = |name: &str| {
-            $Enum::TEXTS.iter().position(|it| *it == name).map(|at| $Enum::ALL[at])
-        };
+        let model =
+            |name: &str| $Enum::TEXTS.iter().position(|it| *it == name).map(|at| $Enum::ALL[at]);
         for &text in $Enum::TEXTS {
             let near = [
                 text[..text.len() - 1].to_owned(),
@@ -245,8 +244,12 @@ fn old_match_attr_flags(
                     "blaze" if &*second_segment == "bits" => {
                         attr_flags.insert(AttrFlags::BLAZE_BITS)
                     }
-                    "blaze" if &*second_segment == "nopanic" => attr_flags.insert(AttrFlags::NOPANIC),
-                    "blaze" if &*second_segment == "noalloc" => attr_flags.insert(AttrFlags::NOALLOC),
+                    "blaze" if &*second_segment == "nopanic" => {
+                        attr_flags.insert(AttrFlags::NOPANIC)
+                    }
+                    "blaze" if &*second_segment == "noalloc" => {
+                        attr_flags.insert(AttrFlags::NOALLOC)
+                    }
                     "blaze" if &*second_segment == "nonblocking" => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
@@ -432,7 +435,9 @@ fn gating_flags(root: view::Node<'_>, meta: &ast::Meta) -> AttrFlags {
     let optimize_none = match meta {
         ast::Meta::TokenTreeMeta(meta) if path.is1("optimize") => {
             meta.token_tree().is_some_and(|tt| {
-                tt.syntax().children_with_tokens().any(|it| it.as_token().is_some_and(|it| it.text() == "none"))
+                tt.syntax()
+                    .children_with_tokens()
+                    .any(|it| it.as_token().is_some_and(|it| it.text() == "none"))
             })
         }
         _ => false,
@@ -694,7 +699,10 @@ fn gated_queries_read_what_the_source_says() {
     assert!(AttrFlags::is_rustc_nounwind(&db, by_name("d")));
     assert!(AttrFlags::has_word(&db, by_name("e").into(), "rustc_comptime"));
     assert!(AttrFlags::has_word(&db, by_name("f").into(), "panic_handler"));
-    assert_eq!(sym(AttrFlags::diagnostic_item(&db, by_name("g").into())).as_deref(), Some("g_item"));
+    assert_eq!(
+        sym(AttrFlags::diagnostic_item(&db, by_name("g").into())).as_deref(),
+        Some("g_item")
+    );
     assert_eq!(
         sym(AttrFlags::export_name(&db, by_name("h").into())).as_deref(),
         Some("via_cfg_attr")
@@ -708,7 +716,10 @@ fn gated_queries_read_what_the_source_says() {
     let o = AttrFlags::query(&db, by_name("o").into());
     assert!(o.contains(AttrFlags::COLD | AttrFlags::RUSTC_NO_MIR_INLINE));
     assert!(AttrFlags::query(&db, by_name("p").into()).contains(AttrFlags::COLD));
-    assert!(!AttrFlags::query(&db, by_name("plain").into()).intersects(AttrFlags::COLD | AttrFlags::RUSTC_NO_MIR_INLINE));
+    assert!(
+        !AttrFlags::query(&db, by_name("plain").into())
+            .intersects(AttrFlags::COLD | AttrFlags::RUSTC_NO_MIR_INLINE)
+    );
 
     for (name, func) in &functions {
         let owner = AttrDefId::from(*func);
@@ -722,9 +733,15 @@ fn gated_queries_read_what_the_source_says() {
         ] {
             assert_eq!(read(&db, owner), symbol_attr(&db, owner, query), "{query} of {name}");
         }
-        for word in
-            ["rustc_nounwind", "rustc_comptime", "panic_handler", "no_builtins", "inline", "cold", "rustc_no_mir_inline"]
-        {
+        for word in [
+            "rustc_nounwind",
+            "rustc_comptime",
+            "panic_handler",
+            "no_builtins",
+            "inline",
+            "cold",
+            "rustc_no_mir_inline",
+        ] {
             assert_eq!(
                 AttrFlags::has_word(&db, owner, word),
                 AttrFlags::has_word_in_source(&db, owner, word),
@@ -990,7 +1007,9 @@ fn old_parse_repr_tt(tt: &ast::TokenTree) -> Option<rustc_abi::ReprOptions> {
                             BuiltinInt::I32 => IntegerType::Fixed(Integer::I32, true),
                             BuiltinInt::I64 => IntegerType::Fixed(Integer::I64, true),
                             BuiltinInt::I128 => IntegerType::Fixed(Integer::I128, true),
-                            BuiltinInt::Bits(_) => unreachable!("a suffix reads no arbitrary width"),
+                            BuiltinInt::Bits(_) => {
+                                unreachable!("a suffix reads no arbitrary width")
+                            }
                         },
                         Either::Right(bu) => match bu {
                             BuiltinUint::Usize => IntegerType::Pointer(false),
@@ -999,7 +1018,9 @@ fn old_parse_repr_tt(tt: &ast::TokenTree) -> Option<rustc_abi::ReprOptions> {
                             BuiltinUint::U32 => IntegerType::Fixed(Integer::I32, false),
                             BuiltinUint::U64 => IntegerType::Fixed(Integer::I64, false),
                             BuiltinUint::U128 => IntegerType::Fixed(Integer::I128, false),
-                            BuiltinUint::Bits(_) => unreachable!("a suffix reads no arbitrary width"),
+                            BuiltinUint::Bits(_) => {
+                                unreachable!("a suffix reads no arbitrary width")
+                            }
                         },
                     });
                 ReprOptions { int, ..Default::default() }
@@ -1130,9 +1151,14 @@ fn link_attrs_read_as_the_string_match_did() {
         corpus.push(format!("#[link(name = \"a\", {key}(unix))]"));
         corpus.push(format!("#[link(name = \"a\", {key} = 1)]"));
     }
-    let kinds = LinkKind::TEXTS
-        .iter()
-        .chain(&["Static", "dylib_", "raw_dylib", "", "framewor", "link-arg"]);
+    let kinds = LinkKind::TEXTS.iter().chain(&[
+        "Static",
+        "dylib_",
+        "raw_dylib",
+        "",
+        "framewor",
+        "link-arg",
+    ]);
     for kind in kinds {
         corpus.push(format!("#[link(name = \"a\", kind = \"{kind}\")]"));
     }
@@ -1340,7 +1366,11 @@ pub struct Plain;
         let mut found = 0;
         for &owner in &owners {
             let flag = AttrFlags::has_word(&db, owner, word);
-            assert_eq!(flag, AttrFlags::has_word_in_source(&db, owner, word), "{word} on {owner:?}");
+            assert_eq!(
+                flag,
+                AttrFlags::has_word_in_source(&db, owner, word),
+                "{word} on {owner:?}"
+            );
             found += usize::from(flag);
         }
         let want = match word {
@@ -1387,8 +1417,10 @@ pub fn f() {}
         }
     }
     let (strukt, trait_, func) = (strukt.unwrap(), trait_.unwrap(), func.unwrap());
-    let field =
-        FieldId { parent: VariantId::StructId(strukt), local_id: Idx::from_raw(RawIdx::from_u32(0)) };
+    let field = FieldId {
+        parent: VariantId::StructId(strukt),
+        local_id: Idx::from_raw(RawIdx::from_u32(0)),
+    };
     let krate = db.fetch_test_crate();
     let the_fn = Symbol::intern("the_fn");
     let lookups = || {
@@ -1454,9 +1486,11 @@ pub mod m { #![doc(hidden)] #[must_use] pub fn b() -> u8 { 0 } }
         let mut live = Vec::new();
         for_each_field(&db, variant, Tree::Live, |_, cfg_options, field| {
             let mut flags = AttrFlags::empty();
-            expand_cfg_attr_view(field.value.attrs(), || cfg_options, |attr, _| {
-                match_attr_flags(&mut flags, attr)
-            });
+            expand_cfg_attr_view(
+                field.value.attrs(),
+                || cfg_options,
+                |attr, _| match_attr_flags(&mut flags, attr),
+            );
             live.push(flags);
         });
         for (at, flags) in live.into_iter().enumerate() {
@@ -1772,8 +1806,8 @@ fn match_attr_flags_allocates_nothing() {
 
 mod stability {
     use hir_expand::Lookup;
-    use intern::Symbol;
     use hir_expand::fixture;
+    use intern::Symbol;
 
     use crate::{
         AdtId, AttrDefId, DefWithBodyId, FieldId, ModuleDefId, ModuleId, VariantId,
@@ -1907,7 +1941,11 @@ pub struct U;
     #[test]
     fn a_core_without_staged_api_is_not_forced_unstable() {
         let db = fixture::db("//- /lib.rs crate:core\npub struct S;\n").into_db();
-        assert_eq!(stability(&db, def(&db, "S")), None, "a fixture's `core` is not `rustc_private`");
+        assert_eq!(
+            stability(&db, def(&db, "S")),
+            None,
+            "a fixture's `core` is not `rustc_private`"
+        );
     }
 
     /// The item `name` declared in any block of `function`'s body, nested or from a macro.
@@ -2047,8 +2085,8 @@ pub mod m {
 
 mod sanitize {
     use hir_expand::Lookup;
-    use syntax::view::HasName;
     use hir_expand::fixture;
+    use syntax::view::HasName;
 
     use crate::{
         AssocItemId, DefWithBodyId, FunctionId, ModuleDefId,
@@ -2227,7 +2265,10 @@ fn an_effect_attribute_changes_no_signature() {
 
     let said = |func: FunctionId, word| AttrFlags::effect_attr(&db, func.into(), word);
     assert_eq!(said(marked, EffectWord::Nopanic), Some(PureAttr::Checked));
-    assert_eq!(said(marked, EffectWord::Noalloc), Some(PureAttr::Trusted(Symbol::intern("the caller's frame"))));
+    assert_eq!(
+        said(marked, EffectWord::Noalloc),
+        Some(PureAttr::Trusted(Symbol::intern("the caller's frame")))
+    );
     assert!(matches!(said(marked, EffectWord::Nonblocking), Some(PureAttr::Malformed(_))));
     for word in [EffectWord::Nopanic, EffectWord::Noalloc, EffectWord::Nonblocking] {
         assert_eq!(said(plain, word), None);

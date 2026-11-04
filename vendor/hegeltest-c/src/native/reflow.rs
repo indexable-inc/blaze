@@ -109,9 +109,7 @@ impl Group {
     /// Whether this group contains no nested groups, so that it can be
     /// folded back into a line of text.
     fn is_shallow(&self) -> bool {
-        self.items
-            .iter()
-            .all(|item| item.iter().all(|node| matches!(node, Node::Leaf(_))))
+        self.items.iter().all(|item| item.iter().all(|node| matches!(node, Node::Leaf(_))))
     }
 
     /// The group as it was written; only called on shallow groups.
@@ -158,11 +156,7 @@ impl Parser {
         if repr.contains('\n') {
             return None;
         }
-        let mut parser = Parser {
-            chars: repr.chars().collect(),
-            pos: 0,
-            depth: 0,
-        };
+        let mut parser = Parser { chars: repr.chars().collect(), pos: 0, depth: 0 };
         let nodes = parser.parse_item()?;
         if parser.pos != parser.chars.len() {
             return None;
@@ -257,14 +251,7 @@ impl Parser {
             }
         }
         self.depth -= 1;
-        Some(Group {
-            prefix,
-            open,
-            close,
-            padded,
-            items,
-            separators,
-        })
+        Some(Group { prefix, open, close, padded, items, separators })
     }
 
     /// Lex a string or character literal, including its quotes. A backslash
@@ -340,11 +327,7 @@ fn emit_nodes(printer: &mut Printer, target: Target, nodes: &[Node]) -> Result<(
             Node::Leaf(text) => printer.text(target, text)?,
             Node::Group(group) => {
                 let open = group.open_text();
-                let indent = if group.padded {
-                    BLOCK_INDENT
-                } else {
-                    open.chars().count()
-                };
+                let indent = if group.padded { BLOCK_INDENT } else { open.chars().count() };
                 printer.begin_group(target, indent, &open)?;
                 if group.padded {
                     printer.breakable(target, " ")?;

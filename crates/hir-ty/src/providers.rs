@@ -22,10 +22,7 @@ use crate::{
     InferBodyId,
     db::{InternedClosureId, InternedCoroutineId},
     mir::{InlinedBody, MirBody, MirEvalError, MirLowerError, MirOptions, MirOwner, MirStage},
-    next_solver::{
-        Allocation, DbInterner, Region, StoredGenericArgs, StoredTy, Ty,
-        default_types,
-    },
+    next_solver::{Allocation, DbInterner, Region, StoredGenericArgs, StoredTy, Ty, default_types},
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
 
@@ -69,14 +66,25 @@ inventory::collect!(Mir);
 
 /// The linked MIR table.
 pub fn mir() -> &'static Mir {
-    #[expect(clippy::disallowed_types, reason = "the process's one MIR provider table: selected from the linked providers")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the process's one MIR provider table: selected from the linked providers"
+    )]
     static ONE: std::sync::OnceLock<&'static Mir> = std::sync::OnceLock::new();
     ONE.get_or_init(|| {
         let mut tested = inventory::iter::<Mir>().filter(|it| it.own_tests);
         let Some(first) = tested.next() else { return one::<Mir>("hir-ty-mir") };
-        assert!(tested.next().is_none(), "two test builds of `{}` are linked", std::any::type_name::<Mir>());
+        assert!(
+            tested.next().is_none(),
+            "two test builds of `{}` are linked",
+            std::any::type_name::<Mir>()
+        );
         let libraries = inventory::iter::<Mir>().filter(|it| !it.own_tests).count();
-        assert!(libraries <= 1, "two `{}` are linked beside a test build", std::any::type_name::<Mir>());
+        assert!(
+            libraries <= 1,
+            "two `{}` are linked beside a test build",
+            std::any::type_name::<Mir>()
+        );
         first
     })
 }
@@ -211,7 +219,14 @@ fn mir_loop3<'db, A, B, C>(_: &'db Db, _: blaze_query::db::Id, _: A, _: B, _: C)
     Err(MirLowerError::Loop)
 }
 
-fn mir_loop4<'db, A, B, C, D>(_: &'db Db, _: blaze_query::db::Id, _: A, _: B, _: C, _: D) -> Built<'db> {
+fn mir_loop4<'db, A, B, C, D>(
+    _: &'db Db,
+    _: blaze_query::db::Id,
+    _: A,
+    _: B,
+    _: C,
+    _: D,
+) -> Built<'db> {
     Err(MirLowerError::Loop)
 }
 
@@ -563,8 +578,10 @@ mod tests {
         // `for<'a> fn(&'a u8, &'r u16)`.
         let fn_ptr = |r| {
             let bound = Region::new_anon_bound(interner, INNERMOST, BoundVar::from_u32(0));
-            let sig = interner
-                .mk_fn_sig_safe_rust_abi([shared(bound, types.u8), shared(r, types.u16)], types.unit);
+            let sig = interner.mk_fn_sig_safe_rust_abi(
+                [shared(bound, types.u8), shared(r, types.u16)],
+                types.unit,
+            );
             Ty::new_fn_ptr(
                 interner,
                 rustc_type_ir::Binder::bind_with_vars(sig, BoundVarKinds::new_from_slice(&[anon])),

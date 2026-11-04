@@ -891,7 +891,9 @@ struct CountTooLarge(f32);
 
 fn main() {}
 "#;
-    let fixture = format!("//- /scalable-vector-count.rs crate:other:main edition:2015 cfg:target_arch=aarch64\n{source}");
+    let fixture = format!(
+        "//- /scalable-vector-count.rs crate:other:main edition:2015 cfg:target_arch=aarch64\n{source}"
+    );
     assert_reports(
         &ui_fixture_as(Mode::Other, &fixture, &Options::default()),
         &[

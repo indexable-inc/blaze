@@ -63,7 +63,10 @@ pub fn lowered(
         let refused = |what: &str| {
             let name = super::linked::debug_name(db, &instance.0);
             // alloc: an error
-            failed(unit, format!("{name}: {what}, which the compiled tier of proc macros does not run"))
+            failed(
+                unit,
+                format!("{name}: {what}, which the compiled tier of proc macros does not run"),
+            )
         };
         // Refused before it is built: building a naked function assembles it, and the refusal
         // is the tier's whether or not anything here assembles.
@@ -105,9 +108,14 @@ pub fn lowered(
 fn check(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
     let refuse = |what: String| {
         // alloc: an error
-        failed(unit, format!("the IR of a unit {what}: the compiled tier of proc macros takes \
+        failed(
+            unit,
+            format!(
+                "the IR of a unit {what}: the compiled tier of proc macros takes \
                               copy-and-patch's IR (Backend::Stencil) of code that counts no \
-                              calls, folds nothing and is static"))
+                              calls, folds nothing and is static"
+            ),
+        )
     };
     if spec.backend != Backend::Stencil {
         // alloc: an error

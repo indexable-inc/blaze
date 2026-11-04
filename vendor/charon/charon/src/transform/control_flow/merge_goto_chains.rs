@@ -45,11 +45,7 @@ impl UllbcPass for Transform {
         // Merge blocks with a single antecedent into their antecedent.
         for mut id in body.body.indices() {
             // Go up the chain to find the first parent into which we can merge.
-            while let Antecedents::One {
-                id: antecedent_id,
-                is_goto: true,
-            } = antecedents[id]
-            {
+            while let Antecedents::One { id: antecedent_id, is_goto: true } = antecedents[id] {
                 id = antecedent_id;
             }
             // While the current block is a straight goto, merge the target block back into this
@@ -69,10 +65,7 @@ impl UllbcPass for Transform {
         // Skip over trivial gotos.
         let mut visited = HashSet::default(); // detect and skip loops
         for id in body.body.indices() {
-            if body.body[id]
-                .targets()
-                .into_iter()
-                .any(|t| body.body[t].as_trivial_goto().is_some())
+            if body.body[id].targets().into_iter().any(|t| body.body[t].as_trivial_goto().is_some())
             {
                 // Merge any forward goto chains that start here.
                 let mut source = body.body[id].take();

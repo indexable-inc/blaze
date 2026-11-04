@@ -355,7 +355,7 @@ mod tests {
 
     use blaze_bytes::Bytes;
     use blaze_ids::rng::SplitMix64;
-    use blaze_mem::{Tag, frame, tag};
+    use blaze_mem::{frame, tag, Tag};
 
     use super::{room, Block, Col};
     use crate::{FlatTree, FlatTreeBuilder, SyntaxKind};
@@ -437,7 +437,10 @@ mod tests {
             assert!(pair[0].end <= pair[1].start, "seed {seed}: columns overlap: {pair:?}");
         }
         for it in &spans {
-            assert!(inside.start <= it.start && it.end <= inside.end, "seed {seed}: {it:?} outside");
+            assert!(
+                inside.start <= it.start && it.end <= inside.end,
+                "seed {seed}: {it:?} outside"
+            );
         }
         assert_eq!(block.filled, block.size(), "seed {seed}: the block is filled to the byte");
     }

@@ -6,10 +6,9 @@
 
 use charon_lib::ast::{
     AttrInfo, BuiltinAdt, DeBruijnVar, Field, FieldId, GenericArgs as CArgs, GenericParams,
-    IntTy as CIntTy, IntegerTy, IntegerValue, PtrMetadata, RefKind,
-    Region as CRegion, RegionId, ScalarTy, SeqHashMap, Span, Ty as CTy, TyKind as CTyKind,
-    TypeDecl, TypeDeclId, TypeDeclKind, TypeDeclRef, TypeSource, TypeVarId, UIntTy as CUIntTy,
-    Variant, VariantId as CVariantId,
+    IntTy as CIntTy, IntegerTy, IntegerValue, PtrMetadata, RefKind, Region as CRegion, RegionId,
+    ScalarTy, SeqHashMap, Span, Ty as CTy, TyKind as CTyKind, TypeDecl, TypeDeclId, TypeDeclKind,
+    TypeDeclRef, TypeSource, TypeVarId, UIntTy as CUIntTy, Variant, VariantId as CVariantId,
 };
 use charon_lib::ids::IndexVec;
 use hir_def::{AdtId, HasModule as _, VariantId, item_tree::FieldsShape};

@@ -47,12 +47,17 @@ pub(super) fn assemble(target: &'static Target, text: &str) -> Result<Vec<u8>, S
         ObjectFormat::Coff => (Format::Coff, output::coff::build),
         ObjectFormat::Wasm => {
             // alloc: the error's message
-            return Err(format!("inline assembly for {}: wasm objects have no assembly", target.triple()));
+            return Err(format!(
+                "inline assembly for {}: wasm objects have no assembly",
+                target.triple()
+            ));
         }
     };
     let arch = arch::lookup(cpu)
         // alloc: the error's message
-        .ok_or_else(|| format!("inline assembly for {}: rsasm is built without `{cpu}`", target.triple()))?;
+        .ok_or_else(|| {
+            format!("inline assembly for {}: rsasm is built without `{cpu}`", target.triple())
+        })?;
     let dialect = arch.default_dialect();
     // A Mach-O object's deployment target (`LC_BUILD_VERSION`) comes from an LLVM triple with a
     // version (`Options::with_target_triple("arm64-apple-macosx11.0.0")`), which `Target` does
@@ -79,7 +84,11 @@ fn said(asm: &Assembler) -> String {
             out.push_str("; ");
         }
         let at = (!diagnostic.span.is_dummy())
-            .then(|| asm.source_map().lookup(diagnostic.span.lo).map(|file| file.line_col(diagnostic.span.lo)))
+            .then(|| {
+                asm.source_map()
+                    .lookup(diagnostic.span.lo)
+                    .map(|file| file.line_col(diagnostic.span.lo))
+            })
             .flatten();
         _ = match at {
             Some(at) => write!(out, "{NAME}:{}:{}: error: {}", at.line, at.col, diagnostic.msg),

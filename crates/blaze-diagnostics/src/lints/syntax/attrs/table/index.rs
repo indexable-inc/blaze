@@ -142,7 +142,14 @@ mod tests {
             }
         }
         assert!(misses > BUILTINS.len());
-        let none: [&[&str]; 6] = [&[], &[""], &["diagnostic"], &["diagnostic", ""], &["no_such_attribute"], &["inline", "inline"]];
+        let none: [&[&str]; 6] = [
+            &[],
+            &[""],
+            &["diagnostic"],
+            &["diagnostic", ""],
+            &["no_such_attribute"],
+            &["inline", "inline"],
+        ];
         for path in none {
             assert_eq!(of(path), None, "{path:?}");
             assert_eq!(by_search(path), None, "{path:?}");

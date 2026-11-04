@@ -446,7 +446,9 @@ impl<'db> FunctionCx<'_, 'db> {
                 Intrinsic::Floor if self.x86() => {
                     self.float_libcall("floorf", types::F32, &[wide])?
                 }
-                Intrinsic::Ceil if self.x86() => self.float_libcall("ceilf", types::F32, &[wide])?,
+                Intrinsic::Ceil if self.x86() => {
+                    self.float_libcall("ceilf", types::F32, &[wide])?
+                }
                 Intrinsic::Trunc if self.x86() => {
                     self.float_libcall("truncf", types::F32, &[wide])?
                 }
@@ -557,7 +559,8 @@ impl<'db> FunctionCx<'_, 'db> {
         if held.is_empty() {
             return Ok(());
         }
-        let mut predecessors: HashMap<BasicBlockId, usize, std::alloc::Global> = HashMap::new_in(std::alloc::Global);
+        let mut predecessors: HashMap<BasicBlockId, usize, std::alloc::Global> =
+            HashMap::new_in(std::alloc::Global);
         for (_, block) in body.basic_blocks.iter() {
             if let Some(terminator) = &block.terminator {
                 for to in terminator.kind.successors().into_iter().chain(terminator.kind.unwind()) {
@@ -565,7 +568,8 @@ impl<'db> FunctionCx<'_, 'db> {
                 }
             }
         }
-        let mut follows: HashMap<BasicBlockId, BasicBlockId, std::alloc::Global> = HashMap::new_in(std::alloc::Global);
+        let mut follows: HashMap<BasicBlockId, BasicBlockId, std::alloc::Global> =
+            HashMap::new_in(std::alloc::Global);
         for (id, block) in body.basic_blocks.iter() {
             let next = match block.terminator.as_ref().map(|it| &it.kind) {
                 Some(TerminatorKind::Goto { target })
@@ -585,7 +589,8 @@ impl<'db> FunctionCx<'_, 'db> {
             }
             id
         };
-        let mut made_in: HashMap<LocalId, BasicBlockId, std::alloc::Global> = HashMap::new_in(std::alloc::Global);
+        let mut made_in: HashMap<LocalId, BasicBlockId, std::alloc::Global> =
+            HashMap::new_in(std::alloc::Global);
         // alloc: only an x86-64 body with an `f16b` local; one list reused across its blocks
         let mut mentioned = Vec::new();
         for (id, block) in body.basic_blocks.iter() {

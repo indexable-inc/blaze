@@ -168,7 +168,9 @@ impl Punct {
 pub(super) enum Kind {
     /// An identifier or a keyword, `_`, `true` and `false` included (rustc's `Ident`); `raw`
     /// when written `r#`.
-    Ident { raw: bool },
+    Ident {
+        raw: bool,
+    },
     Lifetime,
     Literal(Lit),
     DocComment,
@@ -270,7 +272,10 @@ pub(super) struct Tokens<'t> {
 impl<'t> Tokens<'t> {
     /// The tokens of `def`; `span` gives the edition of the span at an offset and whether it
     /// has the root context.
-    pub(super) fn of(def: ast::Macro<'t>, span: &impl Fn(TextSize) -> (Edition, bool)) -> Option<Tokens<'t>> {
+    pub(super) fn of(
+        def: ast::Macro<'t>,
+        span: &impl Fn(TextSize) -> (Edition, bool),
+    ) -> Option<Tokens<'t>> {
         let node = def.syntax();
         let mut tokens =
             // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
@@ -278,7 +283,9 @@ impl<'t> Tokens<'t> {
         // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
         let mut scratch = Vec::new();
         match def {
-            ast::Macro::MacroRules(it) => tokens.top = tokens.group(it.token_tree()?, span, &mut scratch).tts,
+            ast::Macro::MacroRules(it) => {
+                tokens.top = tokens.group(it.token_tree()?, span, &mut scratch).tts
+            }
             ast::Macro::MacroDef(it) => {
                 let body = it.body()?;
                 match it.args() {
@@ -288,11 +295,21 @@ impl<'t> Tokens<'t> {
                     Some(args) => {
                         let args = tokens.group(args, span, &mut scratch);
                         let body = tokens.group(body, span, &mut scratch);
-                        let between = TextRange::new(args.close.range.end(), body.open.range.start());
+                        let between =
+                            TextRange::new(args.close.range.end(), body.open.range.start());
                         let (edition, root) = span(between.start());
-                        let arrow = Token { kind: Kind::Punct(Punct::FatArrow), range: between, edition, root };
+                        let arrow = Token {
+                            kind: Kind::Punct(Punct::FatArrow),
+                            range: between,
+                            edition,
+                            root,
+                        };
                         let start = tokens.tts.len();
-                        tokens.tts.extend([Tt::Delimited(args), Tt::Token(arrow), Tt::Delimited(body)]);
+                        tokens.tts.extend([
+                            Tt::Delimited(args),
+                            Tt::Token(arrow),
+                            Tt::Delimited(body),
+                        ]);
                         tokens.top = Ids::of(&tokens.tts, start);
                     }
                 }
@@ -369,7 +386,8 @@ impl<'t> Tokens<'t> {
             }
             if kind.is_punct() && kind != SyntaxKind::UNDERSCORE {
                 for (offset, c) in t.text().char_indices() {
-                    let at = TextRange::at(at.start() + TextSize::from(offset as u32), TextSize::of(c));
+                    let at =
+                        TextRange::at(at.start() + TextSize::from(offset as u32), TextSize::of(c));
                     let Some(punct) = Punct::of(c) else {
                         scratch.push(Tt::Token(token(Kind::Other, at)));
                         glue = false;
@@ -400,10 +418,17 @@ impl<'t> Tokens<'t> {
             };
             scratch.push(Tt::Token(token(kind, at)));
         }
-        let open = open.unwrap_or_else(|| token(Kind::Open(delim), TextRange::empty(range.start())));
+        let open =
+            open.unwrap_or_else(|| token(Kind::Open(delim), TextRange::empty(range.start())));
         let close = close.unwrap_or_else(|| {
             // A macro file's span map has no piece at its end: the context is its last byte's.
-            let (edition, root) = span(range.end().checked_sub(TextSize::from(1)).filter(|_| !range.is_empty()).unwrap_or(range.start()));
+            let (edition, root) = span(
+                range
+                    .end()
+                    .checked_sub(TextSize::from(1))
+                    .filter(|_| !range.is_empty())
+                    .unwrap_or(range.start()),
+            );
             Token { kind: Kind::Close(delim), range: TextRange::empty(range.end()), edition, root }
         });
         let start = self.tts.len();
@@ -422,7 +447,9 @@ fn delim_of(kind: SyntaxKind) -> Delim {
 
 fn lit_of(kind: SyntaxKind, text: &str) -> Lit {
     match kind {
-        SyntaxKind::STRING if text.len() >= 2 && text.starts_with('"') && text.ends_with('"') => Lit::Str,
+        SyntaxKind::STRING if text.len() >= 2 && text.starts_with('"') && text.ends_with('"') => {
+            Lit::Str
+        }
         SyntaxKind::INT_NUMBER if unsuffixed_usize(text) => Lit::Int,
         _ => Lit::Other,
     }
@@ -443,7 +470,9 @@ fn unsuffixed_usize(text: &str) -> bool {
             continue;
         }
         let Some(digit) = c.to_digit(radix) else { return false };
-        let Some(next) = value.checked_mul(radix as usize).and_then(|it| it.checked_add(digit as usize)) else {
+        let Some(next) =
+            value.checked_mul(radix as usize).and_then(|it| it.checked_add(digit as usize))
+        else {
             return false;
         };
         value = next;

@@ -2,6 +2,7 @@
 
 use std::{cmp, iter};
 
+use blaze_hash::FixedState;
 use hashbrown::hash_map::Entry::{Occupied, Vacant};
 use hir_def::{
     AdtId, LocalFieldId, VariantId,
@@ -15,7 +16,6 @@ use hir_def::{
 };
 use rustc_abi::HasDataLayout as _;
 use rustc_ast_ir::Mutability;
-use blaze_hash::FixedState;
 use rustc_type_ir::{
     TypeVisitableExt as _,
     inherent::{IntoKind as _, Ty as _},
@@ -24,12 +24,11 @@ use span::Edition;
 use tracing::{debug, trace};
 
 use crate::{
-    db::HirDatabase,
     BindingMode, InferenceDiagnostic, Span,
+    db::HirDatabase,
     infer::{
         AllowTwoPhase, ByRef, Expectation, InferenceContext, InferenceTables, PatAdjust,
-        PatAdjustment, StructPathDef, StructPathFound,
-        expr::ExprIsRead, function_struct_path_def,
+        PatAdjustment, StructPathDef, StructPathFound, expr::ExprIsRead, function_struct_path_def,
     },
     next_solver::{
         Const, ConstExt, IsRigid, TraitRef, Ty, TyKind, Tys,
@@ -465,20 +464,22 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             Pat::Bind { id: var_id, subpat } => {
                 self.infer_bind_pat(pat, var_id, subpat, expected, pat_info)
             }
-            Pat::TupleStruct { args: subpats, ellipsis: ddpos, .. } => match opt_path_res
-                .unwrap()
-            {
-                Ok(ResolvedPat { ty, kind: ResolvedPatKind::TupleStruct { variant } }) => self
-                    .infer_tuple_struct_pat(pat, subpats, ddpos, ty, variant, expected, pat_info),
-                Err(()) => {
-                    let ty_err = self.types.types.error;
-                    for &subpat in subpats {
-                        self.infer_pat(subpat, ty_err, pat_info);
+            Pat::TupleStruct { args: subpats, ellipsis: ddpos, .. } => {
+                match opt_path_res.unwrap() {
+                    Ok(ResolvedPat { ty, kind: ResolvedPatKind::TupleStruct { variant } }) => self
+                        .infer_tuple_struct_pat(
+                            pat, subpats, ddpos, ty, variant, expected, pat_info,
+                        ),
+                    Err(()) => {
+                        let ty_err = self.types.types.error;
+                        for &subpat in subpats {
+                            self.infer_pat(subpat, ty_err, pat_info);
+                        }
+                        ty_err
                     }
-                    ty_err
+                    Ok(pr) => panic!("tuple struct pattern resolved to {pr:?}"),
                 }
-                Ok(pr) => panic!("tuple struct pattern resolved to {pr:?}"),
-            },
+            }
             Pat::Record { args: fields, ellipsis: has_rest_pat, .. } => {
                 match opt_path_res.unwrap() {
                     Ok(ResolvedPat { ty, kind: ResolvedPatKind::Struct { variant } }) => self
@@ -585,7 +586,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         // this check out of this branch. Alternatively, this loop could be implemented with
         // autoderef and this check removed. For now though, don't break code compiling on
         // stable with lots of `&`s and a low recursion limit, if anyone's done that.
-        if pat_adjustments.len_of(&pat) < self.resolver.top_level_def_map().recursion_limit() as usize
+        if pat_adjustments.len_of(&pat)
+            < self.resolver.top_level_def_map().recursion_limit() as usize
         {
             // Preserve the smart pointer type for THIR lowering and closure upvar analysis.
             pat_adjustments

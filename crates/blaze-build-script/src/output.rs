@@ -342,7 +342,10 @@ fn older_than_new_syntax(package: &Package) -> Result<Option<String>, Unfilled> 
     let Some(written) = package.rust_version.as_deref() else { return Ok(None) };
     let Some((major, minor, patch)) = rust_version(written) else {
         // alloc: error path.
-        return Err(Unfilled::RustVersion { package: package.descr(), rust_version: written.to_owned() });
+        return Err(Unfilled::RustVersion {
+            package: package.descr(),
+            rust_version: written.to_owned(),
+        });
     };
     let compatible = major == 1 && (minor.unwrap_or(0), patch.unwrap_or(0)) >= (77, 0);
     if compatible {

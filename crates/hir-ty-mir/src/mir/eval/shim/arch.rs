@@ -1,7 +1,9 @@
 //! The intrinsics of LLVM that `core::arch` calls for AES, CRC-32, carry-less multiplication
-//! and SHA (`llvm.x86.*`, `llvm.aarch64.*`), as the instructions compute them: their results are
-//! fully defined, so a constant computes what the program does at run time on a target that has
-//! them.
+//! and SHA (`llvm.x86.*`, `llvm.aarch64.*`), and x86's gathers (`X86Gather`), as the
+//! instructions compute them: their results are fully defined, so a constant computes what the
+//! program does at run time on a target that has them.
+
+use hir_ty::intrinsic::X86Gather;
 
 use super::*;
 
@@ -224,6 +226,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         args: &[IntervalAndTy<'db>],
         destination: Interval,
     ) -> Result<'db, ()> {
+        if let Some(gather) = X86Gather::of(name) {
+            return self.exec_x86_gather(name, gather, args, destination);
+        }
         let args = Args {
             name,
             args: args
@@ -362,9 +367,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             "aarch64.crypto.aese" => {
                 Bytes::from_slice(&sub_bytes(shift_rows(xor(state(0)?, state(1)?), false), &SBOX))
             }
-            "aarch64.crypto.aesd" => {
-                Bytes::from_slice(&sub_bytes(shift_rows(xor(state(0)?, state(1)?), true), &INV_SBOX))
-            }
+            "aarch64.crypto.aesd" => Bytes::from_slice(&sub_bytes(
+                shift_rows(xor(state(0)?, state(1)?), true),
+                &INV_SBOX,
+            )),
             "aarch64.crypto.aesmc" => Bytes::from_slice(&mix_columns(state(0)?, false)),
             "aarch64.crypto.aesimc" => Bytes::from_slice(&mix_columns(state(0)?, true)),
             "aarch64.crc32b" | "aarch64.crc32h" | "aarch64.crc32w" | "aarch64.crc32x"
@@ -379,9 +385,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     "w" => 4,
                     _ => 8,
                 };
-                Bytes::from_slice(&crc32(poly, int(arg(0)?) as u32, int(arg(1)?), bytes).to_le_bytes())
+                Bytes::from_slice(
+                    &crc32(poly, int(arg(0)?) as u32, int(arg(1)?), bytes).to_le_bytes(),
+                )
             }
-            "aarch64.neon.pmull64" => Bytes::from_slice(&clmul(int(arg(0)?), int(arg(1)?)).to_le_bytes()),
+            "aarch64.neon.pmull64" => {
+                Bytes::from_slice(&clmul(int(arg(0)?), int(arg(1)?)).to_le_bytes())
+            }
             "aarch64.crypto.sha1c" | "aarch64.crypto.sha1p" | "aarch64.crypto.sha1m" => {
                 let f: fn(u32, u32, u32) -> u32 = match name {
                     "aarch64.crypto.sha1c" => ch,
@@ -391,7 +401,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let e = int(arg(1)?) as u32;
                 from_words(arm_sha1_hash(words(&state(0)?), e, words(&state(2)?), f))
             }
-            "aarch64.crypto.sha1h" => Bytes::from_slice(&(int(arg(0)?) as u32).rotate_left(30).to_le_bytes()),
+            "aarch64.crypto.sha1h" => {
+                Bytes::from_slice(&(int(arg(0)?) as u32).rotate_left(30).to_le_bytes())
+            }
             "aarch64.crypto.sha1su0" => {
                 let (x, y, z) = (words(&state(0)?), words(&state(1)?), words(&state(2)?));
                 let t = [x[2], x[3], y[0], y[1]];
@@ -430,6 +442,83 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             _ => not_supported!("the LLVM intrinsic `llvm.{name}` in const evaluation"),
         };
         destination.write_from_bytes(self, &result[..destination.size])
+    }
+
+    /// The gather `llvm.{name}` of `(src, base, offsets, mask, scale)`: each lane the mask
+    /// enables read, as the instruction reads it with no alignment, from `base + offsets[i] *
+    /// scale` with `base`'s provenance; each other lane `src`'s, its memory not read; the lanes
+    /// past those gathered zero. A lane read carries what its bytes carry (whether they are
+    /// initialized, a pointer's provenance), as a gather of `core::intrinsics::simd` does.
+    fn exec_x86_gather(
+        &mut self,
+        name: &str,
+        gather: X86Gather,
+        args: &[IntervalAndTy<'db>],
+        destination: Interval,
+    ) -> Result<'db, ()> {
+        let [src, base, offsets, mask, scale] = args else {
+            return Err(MirEvalError::InternalError(
+                // alloc: error path
+                format!("llvm.{name} takes 5 arguments, not {}", args.len()).into(),
+            ));
+        };
+        let src_bytes = src.interval.size;
+        let Some(lanes) = gather.lanes(src_bytes as u32, offsets.interval.size as u32) else {
+            not_supported!(
+                "`llvm.{name}` of {src_bytes} bytes of lanes by {} bytes of indices",
+                offsets.interval.size
+            );
+        };
+        if destination.size != src_bytes {
+            return Err(MirEvalError::InternalError(
+                // alloc: error path
+                format!("llvm.{name} gives {src_bytes} bytes, not {}", destination.size).into(),
+            ));
+        }
+        let scale = int(self.read_scalar(scale.interval)?);
+        if !matches!(scale, 1 | 2 | 4 | 8) {
+            not_supported!("`llvm.{name}` of scale {scale}");
+        }
+        let enabled: smallvec::SmallVec<[bool; 16]> = {
+            let mask = self.read_scalar(mask.interval)?;
+            let lane = gather.lane as usize;
+            (0..lanes as usize)
+                .map(|i| match gather.vector_mask {
+                    true => mask.get(i * lane + lane - 1).is_some_and(|it| it & 0x80 != 0),
+                    false => mask.get(i / 8).is_some_and(|it| it >> (i % 8) & 1 != 0),
+                })
+                .collect() // alloc: inline up to 16 lanes, the most there are
+        };
+        let indices = Bytes::from_slice(self.read_scalar(offsets.interval)?);
+        let base = self.read_pointer(base.interval.addr)?;
+        let (bytes, shadow) = self.read_shadowed(src.interval.addr, src_bytes)?;
+        let (mut out, mut out_shadow) = (Bytes::from_slice(bytes), shadow);
+        let (lane, index) = (gather.lane as usize, gather.index as usize);
+        for (i, enabled) in enabled.into_iter().enumerate() {
+            if !enabled {
+                continue;
+            }
+            let at = &indices[i * index..(i + 1) * index];
+            let offset = match index {
+                4 => i64::from(i32::from_le_bytes(at.try_into().unwrap())),
+                _ => i64::from_le_bytes(at.try_into().unwrap()),
+            };
+            let delta = offset.wrapping_mul(scale as i64);
+            let addr = base.map(|it| it.wrapping_add(delta as usize)).aligned(1);
+            let (bytes, shadow) = self.read_shadowed(addr, lane)?;
+            out[i * lane..(i + 1) * lane].copy_from_slice(bytes);
+            if M::CHECKS {
+                out_shadow.put(i * lane, &shadow);
+            }
+        }
+        let gathered = lanes as usize * lane;
+        if gathered < src_bytes {
+            out[gathered..].fill(0);
+            if M::CHECKS {
+                out_shadow.put(gathered, &M::Shadow::init(src_bytes - gathered));
+            }
+        }
+        self.write_shadowed(destination.addr, &out, &out_shadow)
     }
 }
 

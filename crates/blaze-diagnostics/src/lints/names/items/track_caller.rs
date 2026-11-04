@@ -26,15 +26,24 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, enabled: bool) -> Op
     let (_, attr) = walk::attr(cx, f, "track_caller")?;
     let file = item.node.file_id;
     let span = |range| cx.span(hir::InFile::new(file, range));
-    let mut diag = Diag::lint("ungated_async_fn_track_caller", "`#[track_caller]` on async functions is a no-op", span(attr));
-    diag.span_label(span(item_range_view(f.syntax())), "this function will not propagate the caller location");
+    let mut diag = Diag::lint(
+        "ungated_async_fn_track_caller",
+        "`#[track_caller]` on async functions is a no-op",
+        span(attr),
+    );
+    diag.span_label(
+        span(item_range_view(f.syntax())),
+        "this function will not propagate the caller location",
+    );
     if let Some(issue) = crate::lints::syntax::attrs::features::table::issue(FEATURE) {
         // alloc: a lint that fires
         diag.note(format!("see issue #{issue} <https://github.com/rust-lang/rust/issues/{issue}> for more information"));
     }
     diag.help(format!("add `#![feature({FEATURE})]` to the crate attributes to enable")); // alloc: a lint that fires
     // alloc: a lint that fires
-    diag.note(format!("this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"));
+    diag.note(format!(
+        "this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"
+    ));
     if let Some((id, name)) = super::item_id(cx, item) {
         diag.fact(Fact::Signature(cx.key(id)), format!("the attributes of `{name}`")); // alloc: a lint that fires
     }

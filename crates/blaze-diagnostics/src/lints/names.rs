@@ -60,7 +60,8 @@ mod tests {
             with_cx(&quiet_crate(fns), &["-A", "dead-code"], |cx| {
                 let effective = super::effective::Effective::of(cx);
                 cx.lint_may_fire(crate::lints::registry::LintId::DEAD_CODE);
-                let found = assert_at_most(0, "dead_code, allowed", || super::dead::lints(cx, &effective));
+                let found =
+                    assert_at_most(0, "dead_code, allowed", || super::dead::lints(cx, &effective));
                 assert!(found.is_empty());
             });
         }
@@ -73,7 +74,8 @@ mod tests {
         for fns in [4, 400] {
             with_cx(&quiet_crate(fns), &["--cap-lints", "allow"], |cx| {
                 cx.lint_may_fire(crate::lints::registry::LintId::DEAD_CODE);
-                let found = assert_at_most(0, "the item lints, capped", || super::items::before_abort(cx));
+                let found =
+                    assert_at_most(0, "the item lints, capped", || super::items::before_abort(cx));
                 assert!(found.is_empty());
             });
         }

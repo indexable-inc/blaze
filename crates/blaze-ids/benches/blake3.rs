@@ -28,7 +28,9 @@ fn main() {
     ),
 )))]
 fn main() {
-    eprintln!("blake3-servil builds for x86-64 Linux and AArch64 Linux and macOS only; this target has official BLAKE3 alone");
+    eprintln!(
+        "blake3-servil builds for x86-64 Linux and AArch64 Linux and macOS only; this target has official BLAKE3 alone"
+    );
     std::process::exit(1);
 }
 
@@ -103,7 +105,9 @@ mod run {
     impl Table {
         fn row(&mut self, shape: &str, bytes: usize, (ours, theirs): (f64, f64)) {
             let ratio = ours / theirs;
-            let rate = |ns: f64| if bytes == 0 { String::new() } else { format!("{:.2} GB/s", bytes as f64 / ns) };
+            let rate = |ns: f64| {
+                if bytes == 0 { String::new() } else { format!("{:.2} GB/s", bytes as f64 / ns) }
+            };
             println!(
                 "{shape:<44} {ours:>12.1} ns {theirs:>12.1} ns  x{ratio:<6.3} {:>12} {:>12}",
                 rate(ours),
@@ -117,7 +121,10 @@ mod run {
 
     pub(super) fn main() {
         println!("backend in use: {}", blaze_ids::b3::BACKEND);
-        println!("{:<44} {:>15} {:>15}  {:<7} {:>12} {:>12}", "shape", "blake3-servil", "blake3", "ratio", "servil", "official");
+        println!(
+            "{:<44} {:>15} {:>15}  {:<7} {:>12} {:>12}",
+            "shape", "blake3-servil", "blake3", "ratio", "servil", "official"
+        );
         let mut table = Table { lost: Vec::new() };
         let mut rng = SplitMix64::new(0xb1a3e);
         let mut bytes = vec![0u8; 64 * MIB];
@@ -126,7 +133,10 @@ mod run {
 
         for len in [0, 8, 32, 64, 65, 100, 256, 512, 1024, 4096] {
             let input = &bytes[..len];
-            assert_eq!(servil::derive_key_with(&key, input), official::derive_key_with(&key, input));
+            assert_eq!(
+                servil::derive_key_with(&key, input),
+                official::derive_key_with(&key, input)
+            );
             let times = pair(
                 || {
                     black_box(servil::derive_key_with(&key, black_box(input)));

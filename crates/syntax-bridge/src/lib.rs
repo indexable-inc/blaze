@@ -458,7 +458,8 @@ where
                     }
                     let leaf: tt::Leaf = match kind {
                         k if k.is_any_identifier() => {
-                            let (is_raw, name) = tt::IdentIsRaw::split_from_symbol(token.to_text(conv));
+                            let (is_raw, name) =
+                                tt::IdentIsRaw::split_from_symbol(token.to_text(conv));
                             let sym = intern_name(name, token.name_hash(conv));
                             tt::Ident { sym, span: conv.span_for(abs_range), is_raw }.into()
                         }
@@ -746,7 +747,8 @@ impl<'t> LexedTokens<'t> {
         let len = self.lexed.text_len(self.pos);
         let text = &self.text[self.offset..self.offset + len];
         let kind = self.lexed.kind(self.pos);
-        let name_hash = parser::LexedStr::has_name_hash(kind).then(|| self.lexed.name_hashes()[self.name]);
+        let name_hash =
+            parser::LexedStr::has_name_hash(kind).then(|| self.lexed.name_hashes()[self.name]);
         Some(RawToken { kind, text, name_hash })
     }
 
@@ -1603,7 +1605,7 @@ impl TtTreeSink<'_> {
             }
             None => {
                 // alloc: an error's message.
-        self.error("illegal float literal".to_owned());
+                self.error("illegal float literal".to_owned());
                 self.inner.start_node(SyntaxKind::ERROR);
                 self.inner.token(SyntaxKind::FLOAT_NUMBER, text);
                 self.token_map.push(self.text_pos + TextSize::of(text), span);

@@ -118,11 +118,7 @@ impl<'db> ExprCollector<'db> {
 
     // This is in separate functions because historically, changes in format_args lowering have forced us to change this
     // function but not its caller, and for some time support both versions.
-    fn collect_format_args_impl(
-        &mut self,
-        syntax_ptr: ExprPtr,
-        fmt: FormatArgs,
-    ) -> ExprId {
+    fn collect_format_args_impl(&mut self, syntax_ptr: ExprPtr, fmt: FormatArgs) -> ExprId {
         let lang_items = self.lang_items();
 
         // Create a list of all _unique_ (argument, format trait) combinations.
@@ -176,8 +172,7 @@ impl<'db> ExprCollector<'db> {
                             lang_items.FormatArguments,
                             sym::from_str,
                         );
-                        let sym =
-                            if incomplete_lit.is_empty() { *sym } else { Symbol::intern(s) };
+                        let sym = if incomplete_lit.is_empty() { *sym } else { Symbol::intern(s) };
                         let s = self.store.alloc_literal_expr(Literal::String(sym));
                         let from_str = self
                             .alloc_expr(Expr::Call { callee: from_str, args: &[s] }, syntax_ptr);
@@ -309,11 +304,8 @@ impl<'db> ExprCollector<'db> {
             //     super let args = (&arg0, &arg1, &…);
             let args_name = self.generate_new_name();
             let args_path = self.store.push_name_path(args_name);
-            let args_binding = self.alloc_binding(
-                args_name,
-                BindingAnnotation::Unannotated,
-                HygieneId::ROOT,
-            );
+            let args_binding =
+                self.alloc_binding(args_name, BindingAnnotation::Unannotated, HygieneId::ROOT);
             let args_pat = self.alloc_pat_desugared(Pat::Bind { id: args_binding, subpat: None });
             self.add_definition_to_binding(args_binding, args_pat);
             let elements = self.store.list_mark();
@@ -552,12 +544,7 @@ impl<'db> ExprCollector<'db> {
     /// ```text
     ///     <core::fmt::Argument>::new_…(arg)
     /// ```
-    fn make_argument(
-        &mut self,
-        arg_ptr: Option<ExprPtr>,
-        arg: ExprId,
-        ty: ArgumentType,
-    ) -> ExprId {
+    fn make_argument(&mut self, arg_ptr: Option<ExprPtr>, arg: ExprId, ty: ArgumentType) -> ExprId {
         use ArgumentType::*;
         use FormatTrait::*;
 

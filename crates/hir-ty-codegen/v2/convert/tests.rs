@@ -78,7 +78,18 @@ fn convert(code: Code, requests: &Requests) -> Result<blaze_codegen::CompiledFun
     let resolve = Resolve { func: &func, data: &data, symbol: &symbol, body: &body };
     blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
         let none = &crate::v2::wasm::Header::default();
-        function(frame, key(), Arch::X86_64, isa, code, requests, &resolve, &[span(0), span(1)], None, none)
+        function(
+            frame,
+            key(),
+            Arch::X86_64,
+            isa,
+            code,
+            requests,
+            &resolve,
+            &[span(0), span(1)],
+            None,
+            none,
+        )
     })
 }
 
@@ -99,9 +110,11 @@ fn a_warm_conversion_allocates_only_what_it_keeps() {
     let requests = requests();
     convert(make(), &requests).expect("converted");
     let code = make();
-    let compiled = blaze_alloc_count::assert_at_most(5, "a warm conversion: its relocations and its lines", || {
-        convert(code, &requests)
-    })
+    let compiled = blaze_alloc_count::assert_at_most(
+        5,
+        "a warm conversion: its relocations and its lines",
+        || convert(code, &requests),
+    )
     .expect("converted");
     assert_eq!(compiled.relocs.len(), 1);
     assert_eq!(compiled.lines.len(), 2);
@@ -149,7 +162,10 @@ fn data_points_only_at_data_before_it() {
     }
     // The outer constant: the inner one at 0 with its addend, the callee at 8.
     let outer = &compiled.data[1];
-    assert_eq!(*outer.relocs.get(0).expect("the inner constant").target, Target::Data(compiled.data[0].id));
+    assert_eq!(
+        *outer.relocs.get(0).expect("the inner constant").target,
+        Target::Data(compiled.data[0].id)
+    );
     assert_eq!(outer.relocs.addend(0), 2);
     assert_eq!(*outer.relocs.get(1).expect("the callee").target, callee());
     // The location of nowhere: its name, then the location pointing at it.
@@ -213,14 +229,20 @@ fn what_v2_has_no_target_for_is_an_error() {
 fn a_functions_writable_data_is_its_instances_own() {
     let bytes = b"slot\0\0\0\0";
     let mut writable = requests();
-    writable.datas[0] =
-        DataRequest::Blob { blob: blob(bytes, Vec::new(), Vec::new()), identity: DataIdentity::Writable };
+    writable.datas[0] = DataRequest::Blob {
+        blob: blob(bytes, Vec::new(), Vec::new()),
+        identity: DataIdentity::Writable,
+    };
     let compiled = convert(loading(&[0]), &writable).expect("converted");
     let slot = &compiled.data[0];
-    let owned = blaze_codegen::Data::owned(&key().0, 0, 8, bytes.to_vec(), blaze_codegen::Relocs::new());
+    let owned =
+        blaze_codegen::Data::owned(&key().0, 0, 8, bytes.to_vec(), blaze_codegen::Relocs::new());
     assert!(slot.writable);
     assert_eq!(*slot, owned);
-    assert_ne!(slot.id, blaze_codegen::Data::new(8, bytes.to_vec(), blaze_codegen::Relocs::new()).id);
+    assert_ne!(
+        slot.id,
+        blaze_codegen::Data::new(8, bytes.to_vec(), blaze_codegen::Relocs::new()).id
+    );
     assert_eq!(compiled.relocs.targets(), [Target::Data(slot.id)]);
 }
 
@@ -233,11 +255,18 @@ fn a_statics_writable_data_is_its_own() {
     let requests = Requests {
         funcs: Vec::new(),
         datas: vec![
-            DataRequest::Blob { blob: blob(bytes, Vec::new(), Vec::new()), identity: DataIdentity::Writable },
-            DataRequest::Blob { blob: blob(bytes, Vec::new(), Vec::new()), identity: DataIdentity::Shared },
+            DataRequest::Blob {
+                blob: blob(bytes, Vec::new(), Vec::new()),
+                identity: DataIdentity::Writable,
+            },
+            DataRequest::Blob {
+                blob: blob(bytes, Vec::new(), Vec::new()),
+                identity: DataIdentity::Shared,
+            },
         ],
     };
-    let init = blob(&[0; 16], vec![(0, DataId::from_u32(0), 0), (8, DataId::from_u32(1), 0)], Vec::new());
+    let init =
+        blob(&[0; 16], vec![(0, DataId::from_u32(0), 0), (8, DataId::from_u32(1), 0)], Vec::new());
     let func = |_: u32, _: &FuncRequest| Ok(callee());
     let data = |_: u32, _: &DataRequest| Ok(DataTarget::Own);
     let symbol = |name: &str| Ok(Target::Extern(name.to_owned()));
@@ -265,7 +294,8 @@ fn a_statics_writable_data_is_its_own() {
 fn a_coverage_relocation_is_at_the_functions_own_array() {
     let namespace = crate::llvm::sanitize::COVERAGE;
     let at = |array| reloc(1 + 8 * array, binemit::Reloc::X86PCRel4, namespace, array);
-    let compiled = convert(code(&(0..3).map(at).collect::<Vec<_>>(), Vec::new()), &requests()).expect("converted");
+    let compiled = convert(code(&(0..3).map(at).collect::<Vec<_>>(), Vec::new()), &requests())
+        .expect("converted");
     let targets: Vec<_> = compiled.relocs.iter().map(|it| (it.target.clone(), it.addend)).collect();
     let own = |array| (Target::Coverage(array), -4);
     assert_eq!(targets, vec![own(0), own(1), own(2)]);

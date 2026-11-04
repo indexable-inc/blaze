@@ -136,7 +136,13 @@ pub(crate) fn ident(text: &str) -> Result<Symbol, ()> {
 /// A doc comment as rustc's `FromInternal` gives it to a client: `#`, `!` for an inner one,
 /// and `[doc = "data"]` with each character of `data` `escape_debug`ged, every token `Alone`
 /// at `span`. The comment's form is not kept.
-pub(crate) fn desugar_doc(_kind: DocKind, inner: bool, data: &Symbol, span: Span, out: &mut Vec<Tree>) {
+pub(crate) fn desugar_doc(
+    _kind: DocKind,
+    inner: bool,
+    data: &Symbol,
+    span: Span,
+    out: &mut Vec<Tree>,
+) {
     // alloc: a doc comment taken apart, once per doc comment a client reads
     let mut escaped = String::with_capacity(data.as_str().len());
     for ch in data.as_str().chars() {
@@ -148,7 +154,12 @@ pub(crate) fn desugar_doc(_kind: DocKind, inner: bool, data: &Symbol, span: Span
     }
     // alloc: as above
     let stream = Stream::of(vec![
-        Tree::Ident { sym: Symbol::intern("doc"), kind: crate::stream::IdentKind::Normal, span, spacing: Spacing::Alone },
+        Tree::Ident {
+            sym: Symbol::intern("doc"),
+            kind: crate::stream::IdentKind::Normal,
+            span,
+            spacing: Spacing::Alone,
+        },
         Tree::Punct { ch: b'=', spacing: Spacing::Alone, span },
         Tree::Literal {
             kind: LitKind::Str,
@@ -395,7 +406,10 @@ impl<'s, 'e> Reader<'s, 'e> {
                     let spacing = if i == last { spacing } else { Spacing::Joint };
                     let span = match split {
                         true => Span {
-                            range: TextRange::at(span.range.start() + TextSize::from(i as u32), TextSize::from(1)),
+                            range: TextRange::at(
+                                span.range.start() + TextSize::from(i as u32),
+                                TextSize::from(1),
+                            ),
                             ..span
                         },
                         false => span,

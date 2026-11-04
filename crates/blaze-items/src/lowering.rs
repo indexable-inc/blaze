@@ -10,9 +10,9 @@ use std::fmt::Write as _;
 use base_db::Db;
 use hir_def::{
     DefWithBodyId, ExpressionStoreOwnerId, HasModule,
-    signatures::TraitSignature,
     expr_store::{ExpressionStore, pretty::print_expr_hir},
     hir::{Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked},
+    signatures::TraitSignature,
     span_names,
 };
 use hir_expand::{InFile, mod_path::ModPath};
@@ -39,7 +39,9 @@ pub fn write(db: &Db, error: &MirLowerError<'_>, out: &mut String) {
                 name.display(db, edition),
             );
         }
-        MirLowerError::UnresolvedName { owner, path, at } => unresolved_name(db, *owner, path.as_ref(), *at, out),
+        MirLowerError::UnresolvedName { owner, path, at } => {
+            unresolved_name(db, *owner, path.as_ref(), *at, out)
+        }
         other => _ = write!(out, "{other:?}"),
     }
 }
@@ -48,7 +50,13 @@ pub fn write(db: &Db, error: &MirLowerError<'_>, out: &mut String) {
 /// (`file:line:column`, in a macro's output where the macro was called) and the item whose body
 /// has it, so a crate whose own diagnostics a build does not show (std, for a program) still
 /// says what failed in words.
-fn unresolved_name(db: &Db, owner: ExpressionStoreOwnerId, path: Option<&ModPath>, at: ExprOrPatId, out: &mut String) {
+fn unresolved_name(
+    db: &Db,
+    owner: ExpressionStoreOwnerId,
+    path: Option<&ModPath>,
+    at: ExprOrPatId,
+    out: &mut String,
+) {
     let edition = DisplayTarget::from_crate(db, owner.krate(db)).edition;
     match path {
         Some(path) => _ = write!(out, "the name `{}`", path.display(db, edition)),
@@ -123,7 +131,13 @@ pub fn owner_path(db: &Db, owner: InferBodyId<'_>) -> String {
             let loc = it.loc(db);
             // alloc: error path
             let mut path = String::new();
-            span_names::write_inner_path(db, loc.owner, loc.expr, span_names::InnerBody::Const, &mut path);
+            span_names::write_inner_path(
+                db,
+                loc.owner,
+                loc.expr,
+                span_names::InnerBody::Const,
+                &mut path,
+            );
             path
         }
     }
@@ -142,7 +156,9 @@ pub fn body_path(db: &Db, def: DefWithBodyId) -> String {
 pub fn place(db: &Db, owner: InferBodyId<'_>, span: MirSpan) -> String {
     let (_, source_map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
     let source: Option<InFile<TextRange>> = match span {
-        MirSpan::ExprId(it) | MirSpan::ExprEnd(it) => source_map.expr_syntax(it).ok().map(|it| it.map(|it| it.text_range())),
+        MirSpan::ExprId(it) | MirSpan::ExprEnd(it) => {
+            source_map.expr_syntax(it).ok().map(|it| it.map(|it| it.text_range()))
+        }
         MirSpan::PatId(it) => source_map.pat_syntax(it).ok().map(|it| it.map(|it| it.text_range())),
         MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown | MirSpan::Inlined(_) => None,
     };

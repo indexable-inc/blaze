@@ -23,7 +23,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnionExprMustHaveExactlyOneField) 
         Some(path) => cx.span(InFile::new(node.file_id, path.syntax().text_range())),
         None => cx.span_of_ptr(d.expr),
     };
-    let mut diag = Diag::error(Some("E0784"), "union expressions should have exactly one field", span);
+    let mut diag =
+        Diag::error(Some("E0784"), "union expressions should have exactly one field", span);
     if let Some(hir::Variant::Union(union)) = cx.vsema.resolve_variant(record) {
         // alloc: the error's text, for an error hir found
         let name = union.name(cx.db).display(cx.db, cx.edition).to_string();

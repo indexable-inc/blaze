@@ -36,7 +36,10 @@ impl Driven {
         }
         if !store.ready() {
             // alloc: the error of a store that cannot open
-            return Err(format!("the store in {} did not open: its driver went idle first", at.display()));
+            return Err(format!(
+                "the store in {} did not open: its driver went idle first",
+                at.display()
+            ));
         }
         // alloc: setup, once a store
         Ok(Driven { driver, store, root: root.to_owned() })

@@ -44,34 +44,35 @@ where
     let span = at.cause.span();
     let mut stalled_goals = Vec::new(); // alloc: empty unless a normalization is ambiguous
     let value = {
-        let mut folder = NormalizationFolder::new(infcx, universes, |alias_term: AliasTerm<'db>| {
-            let infer_term = infcx.next_term_var_of_alias_kind(alias_term, span);
-            let goal: Goal<'db, Predicate<'db>> = Goal::new(
-                interner,
-                at.param_env,
-                ProjectionClause { projection_term: alias_term, term: infer_term },
-            );
-            let result = match delegate.evaluate_root_goal(goal, span, None) {
-                Ok(result) => result,
-                Err(NoSolution) => {
-                    return Err(PredicateObligation::new(
-                        interner,
-                        *at.cause,
-                        goal.param_env,
-                        goal.predicate,
-                    ));
-                }
-            };
-            let normalized = infcx.deeply_resolve_ignoring_regions(infer_term);
-            let normalization_was_ambiguous = match result.certainty {
-                Certainty::Yes => NormalizationWasAmbiguous::No,
-                Certainty::Maybe(_) => {
-                    stalled_goals.push(result.goal);
-                    NormalizationWasAmbiguous::Yes
-                }
-            };
-            Ok((normalized, normalization_was_ambiguous))
-        });
+        let mut folder =
+            NormalizationFolder::new(infcx, universes, |alias_term: AliasTerm<'db>| {
+                let infer_term = infcx.next_term_var_of_alias_kind(alias_term, span);
+                let goal: Goal<'db, Predicate<'db>> = Goal::new(
+                    interner,
+                    at.param_env,
+                    ProjectionClause { projection_term: alias_term, term: infer_term },
+                );
+                let result = match delegate.evaluate_root_goal(goal, span, None) {
+                    Ok(result) => result,
+                    Err(NoSolution) => {
+                        return Err(PredicateObligation::new(
+                            interner,
+                            *at.cause,
+                            goal.param_env,
+                            goal.predicate,
+                        ));
+                    }
+                };
+                let normalized = infcx.deeply_resolve_ignoring_regions(infer_term);
+                let normalization_was_ambiguous = match result.certainty {
+                    Certainty::Yes => NormalizationWasAmbiguous::No,
+                    Certainty::Maybe(_) => {
+                        stalled_goals.push(result.goal);
+                        NormalizationWasAmbiguous::Yes
+                    }
+                };
+                Ok((normalized, normalization_was_ambiguous))
+            });
         value.try_fold_with(&mut folder)?
     };
     let obligations = stalled_goals

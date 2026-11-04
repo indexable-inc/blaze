@@ -96,9 +96,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, adt: ast::Adt<'t>) {
         vec![(insert, fix)],
         Applicability::MachineApplicable,
     );
-    diagnostic
-        .help(LINT.help())
-        .help(format!("for further information visit {}", LINT.docs_url()));
+    diagnostic.help(LINT.help()).help(format!("for further information visit {}", LINT.docs_url()));
 }
 
 /// The `#[derive(..)]` attribute naming serde's `Deserialize`, and where the path is written.
@@ -116,8 +114,9 @@ fn deserialize_derive<'t>(cx: &Cx<'_, 't>, adt: ast::Adt<'t>) -> Option<Derive<'
         check::derive_paths(attr).into_iter().zip(macros).find_map(|((path, _), found)| {
             let found = found?;
             let krate = found.module(db).krate(db);
-            (found.name(db).as_str() == "Deserialize" && DERIVE_CRATES.iter().any(|it| facts::crate_is(db, krate, it)))
-                .then_some(Derive { attr, path })
+            (found.name(db).as_str() == "Deserialize"
+                && DERIVE_CRATES.iter().any(|it| facts::crate_is(db, krate, it)))
+            .then_some(Derive { attr, path })
         })
     })
 }
@@ -158,7 +157,8 @@ fn flattens(fields: ast::RecordFieldList<'_>) -> bool {
 /// `word` as one of its items (`deny_unknown_fields`, `rename = ".."`'s `rename`).
 fn says<'t>(attrs: impl Iterator<Item = ast::Attr<'t>>, word: &str) -> bool {
     attrs.filter_map(|it| it.meta()).flat_map(|it| it.skip_cfg_attrs()).any(|meta| {
-        meta.as_simple_call().is_some_and(|(name, tt)| name == "serde" && words(tt).any(|it| it == word))
+        meta.as_simple_call()
+            .is_some_and(|(name, tt)| name == "serde" && words(tt).any(|it| it == word))
     })
 }
 
@@ -172,7 +172,8 @@ fn words<'t>(tt: ast::TokenTree<'t>) -> impl Iterator<Item = &'t str> {
             None
         }
         NodeOrToken::Token(token)
-            if token.kind().is_trivia() || matches!(token.kind(), SyntaxKind::L_PAREN | SyntaxKind::R_PAREN) =>
+            if token.kind().is_trivia()
+                || matches!(token.kind(), SyntaxKind::L_PAREN | SyntaxKind::R_PAREN) =>
         {
             None
         }

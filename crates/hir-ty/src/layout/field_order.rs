@@ -33,9 +33,7 @@ use hir_def::{
     signatures::{EnumSignature, StructFlags, StructSignature, UnionSignature},
 };
 use hir_expand::name::Name;
-use rustc_abi::{
-    FieldsShape, NicheOptimizations, ReprFlags, ReprOptions, Size, TargetDataLayout,
-};
+use rustc_abi::{FieldsShape, NicheOptimizations, ReprFlags, ReprOptions, Size, TargetDataLayout};
 use rustc_index::{IndexSlice, IndexVec};
 
 use crate::layout::{
@@ -121,7 +119,7 @@ pub struct FieldOrder {
 pub fn install(db: &mut Db, plan: Option<Arc<FieldOrderPlan>>) {
     match FieldOrder::try_get(db) {
         None => {
-            _ = FieldOrder::builder(plan).durability(Durability::HIGH).new(db);
+            _ = FieldOrder::new(db, Durability::HIGH, plan);
         }
         Some(input) => {
             if *input.plan(db) != plan {
@@ -477,21 +475,11 @@ pub(crate) fn hot_first<'a, 'b>(
             let ranked = &hot.variants[v.0][..cmp::min(h, sharing[v.0])];
             let order = match placed[v.0] {
                 Some((order, offsets)) if !ranked.is_empty() => {
-                    let variant_start = if niche.is_some_and(|(at, _)| at == v.0) {
-                        Size::ZERO
-                    } else {
-                        start
-                    };
+                    let variant_start =
+                        if niche.is_some_and(|(at, _)| at == v.0) { Size::ZERO } else { start };
                     let niche_at = niche.and_then(|(at, offset)| (at == v.0).then_some(offset));
-                    let chosen = variant_order(
-                        order,
-                        offsets,
-                        own,
-                        ranked,
-                        niche_at,
-                        variant_start,
-                        frame,
-                    );
+                    let chosen =
+                        variant_order(order, offsets, own, ranked, niche_at, variant_start, frame);
                     moved |= chosen.raw != order;
                     chosen
                 }
@@ -592,9 +580,7 @@ fn fill(
         }
         let fits = |&f: &RustcFieldIdx| {
             let layout = fields[f];
-            layout.size > Size::ZERO
-                && layout.size <= gap
-                && at.align_to(layout.align.abi) == at
+            layout.size > Size::ZERO && layout.size <= gap && at.align_to(layout.align.abi) == at
         };
         let Some(i) = cold.iter().position(fits) else { break };
         let f = cold.remove(i);

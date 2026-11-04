@@ -8,7 +8,9 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, assert_reports, checked_with, compiletest, error, items::ui_core, normalized, ui},
+    tests::{
+        Mode, assert_reports, checked_with, compiletest, error, items::ui_core, normalized, ui,
+    },
 };
 
 #[test]
@@ -459,13 +461,17 @@ where
 
 fn main() {}
 "#;
-    assert_reports(&ui_core("bare-path.rs", "2015", "send, sized", source), &[error(14, &[]), error(16, &[])]);
+    assert_reports(
+        &ui_core("bare-path.rs", "2015", "send, sized", source),
+        &[error(14, &[]), error(16, &[])],
+    );
 }
 
 /// [`ui_core`] of a revision: `--cfg {revision}`, as compiletest passes it.
 fn ui_revision(name: &str, revision: &str, flags: &str, source: &str) -> String {
-    let fixture =
-        format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015 cfg:{revision}\n{source}");
+    let fixture = format!(
+        "//- minicore: {flags}\n//- /{name} crate:other:main edition:2015 cfg:{revision}\n{source}"
+    );
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
@@ -546,5 +552,8 @@ pub struct Registry {
 
 fn main() {}
 "#;
-    assert_reports(&super::ui_fixture(fixture), &[error(3, &["E0107", "type alias takes 3 generic arguments but 2"])]);
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(3, &["E0107", "type alias takes 3 generic arguments but 2"])],
+    );
 }

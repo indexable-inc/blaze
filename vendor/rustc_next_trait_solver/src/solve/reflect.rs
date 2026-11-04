@@ -50,11 +50,7 @@ pub(super) fn reflect_trait_holds<I: Interner>(
     self_ty: I::Ty,
 ) -> ReflectAnswer<I> {
     let yes_if = |holds: bool| {
-        if holds {
-            ReflectAnswer::Holds
-        } else {
-            ReflectAnswer::Fails
-        }
+        if holds { ReflectAnswer::Holds } else { ReflectAnswer::Fails }
     };
     match item {
         SolverTraitLangItem::ReflectStruct => match self_ty.kind() {
@@ -153,10 +149,7 @@ where
                     cx,
                     ty::PlaceholderType::new(
                         universe,
-                        ty::BoundTy {
-                            var: ty::BoundVar::from_usize(index),
-                            kind: var.kind,
-                        },
+                        ty::BoundTy { var: ty::BoundVar::from_usize(index), kind: var.kind },
                     ),
                 );
                 let env = self.env_with_reflected_member(param_env, member, var.domain, container);

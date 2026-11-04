@@ -36,9 +36,9 @@ use std::{
 };
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{MemError, Slab, Tag as MemTag};
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
+use std::alloc::Global;
 
 use crate::{
     Address, Command, Completion, Confine, Conn, Cursor, Done, Driver, Effect, FileName, IoError,
@@ -429,7 +429,14 @@ impl Kqueue {
     }
 
     /// `ident` of `filter` registered as `owner`'s, with the next wait.
-    fn register(&mut self, owner: Owner, ident: usize, filter: i16, flags: u16, fflags: u32) -> u64 {
+    fn register(
+        &mut self,
+        owner: Owner,
+        ident: usize,
+        filter: i16,
+        flags: u16,
+        fflags: u32,
+    ) -> u64 {
         let id = self.owners.own(owner);
         self.change(ident, filter, flags, fflags, 0, id);
         id
@@ -496,7 +503,9 @@ impl Kqueue {
             Effect::Recv { conn, most, into, tag } => {
                 match self.connection(conn) {
                     Ok(connection) => connection.recvs.push_back((tag, most, into)),
-                    Err(error) => self.ready.push(Completion { tag, done: Done::unread(into, error) }),
+                    Err(error) => {
+                        self.ready.push(Completion { tag, done: Done::unread(into, error) })
+                    }
                 }
                 self.serve_recvs(conn_id(conn));
                 Ok(())
@@ -504,7 +513,9 @@ impl Kqueue {
             Effect::Send { conn, bytes, tag } => {
                 match self.connection(conn) {
                     Ok(connection) => connection.sends.push_back((tag, bytes, 0)),
-                    Err(error) => self.ready.push(Completion { tag, done: Done::unsent(bytes, error) }),
+                    Err(error) => {
+                        self.ready.push(Completion { tag, done: Done::unsent(bytes, error) })
+                    }
                 }
                 self.serve_sends(conn_id(conn));
                 Ok(())
@@ -648,8 +659,13 @@ impl Kqueue {
         }
         if let Some(fd) = stdin {
             set_nonblocking(fd)?;
-            let id =
-                self.register(Owner::Input(spawn), fd as usize, libc::EVFILT_WRITE, libc::EV_ADD, 0);
+            let id = self.register(
+                Owner::Input(spawn),
+                fd as usize,
+                libc::EVFILT_WRITE,
+                libc::EV_ADD,
+                0,
+            );
             self.spawns.get_mut(spawn).expect("followed as it is made").ids.push(id);
         }
         let (pid, flags) = (pid as usize, libc::EV_ADD | libc::EV_ONESHOT);
@@ -914,7 +930,9 @@ impl Kqueue {
                     Done::Sent(std::mem::take(bytes))
                 }
                 false => match connection.socket.write(&bytes[*put..]) {
-                    Ok(0) => Done::unsent(std::mem::take(bytes), "the connection took no more bytes"),
+                    Ok(0) => {
+                        Done::unsent(std::mem::take(bytes), "the connection took no more bytes")
+                    }
                     Ok(n) => {
                         *put += n;
                         continue;
@@ -949,7 +967,8 @@ impl Kqueue {
         }
         for (send, bytes, _) in connection.sends {
             // alloc: an error path.
-            let done = Done::unsent(bytes, format_args!("{conn:?} hung up before all of it was sent"));
+            let done =
+                Done::unsent(bytes, format_args!("{conn:?} hung up before all of it was sent"));
             self.ready.push(Completion { tag: send, done });
         }
         shut?;
@@ -961,7 +980,8 @@ impl Kqueue {
     /// next timer is due, for events, and acts on them; then fires the timers due.
     fn wait(&mut self, left: Option<Duration>) {
         let now = wheel::ticks(self.start.elapsed());
-        let until_timer = self.timers.next_deadline().map(|due| Duration::from_nanos(due.saturating_sub(now)));
+        let until_timer =
+            self.timers.next_deadline().map(|due| Duration::from_nanos(due.saturating_sub(now)));
         let left = match (left, until_timer) {
             (Some(left), Some(until_timer)) => Some(left.min(until_timer)),
             (left, until_timer) => left.or(until_timer),
@@ -1099,7 +1119,8 @@ impl Kqueue {
                 self.disown(id);
                 let Some(connecting) = self.connecting.remove(connecting) else { return };
                 // alloc: an error path.
-                let done = Done::Failed(IoError(format!("connecting to {:?}: {error}", connecting.at)));
+                let done =
+                    Done::Failed(IoError(format!("connecting to {:?}: {error}", connecting.at)));
                 self.ready.push(Completion { tag: connecting.tag, done });
             }
             Owner::Read(conn) => {
@@ -1236,7 +1257,10 @@ impl Driver for Kqueue {
         let ended = out[before..]
             .iter()
             .filter(|it| {
-                !matches!(it.done, Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. })
+                !matches!(
+                    it.done,
+                    Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }
+                )
             })
             .count();
         self.in_flight -= ended;
@@ -1412,20 +1436,36 @@ mod tests {
         let mut driver = Kqueue::new(&root, 1).unwrap();
         let big: Vec<u8> = (0..1u32 << 20).map(|n| n as u8).collect();
         let script = "cat; echo err >&2; exit 7";
-        let limited = Box::new(Command { memory: Some(1 << 30), ..*command("/bin/echo", &["hi"], b"") });
+        let limited =
+            Box::new(Command { memory: Some(1 << 30), ..*command("/bin/echo", &["hi"], b"") });
         let mut on = command("/bin/echo", &["hi"], b"");
-        on.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new() };
-        let seen = run(&mut driver, vec![
-            Effect::Spawn { command: command("/bin/sh", &["-c", script], b"hello"), tag: Tag(1) },
-            Effect::Spawn { command: command("/bin/sh", &["-c", "kill -TERM $$"], b""), tag: Tag(2) },
-            Effect::Spawn { command: command("/bin/sleep", &["60"], b""), tag: Tag(3) },
-            Effect::Kill { tag: Tag(3) },
-            Effect::Spawn { command: on, tag: Tag(4) },
-            Effect::Spawn { command: limited, tag: Tag(5) },
-            // More input than a pipe holds, read back while it is written.
-            Effect::Spawn { command: command("/bin/cat", &[], &big), tag: Tag(6) },
-            Effect::Kill { tag: Tag(99) },
-        ]);
+        on.sandbox = Sandbox::On {
+            read: Vec::new(),
+            write: Vec::new(),
+            network: false,
+            trace: false,
+            services: Vec::new(),
+        };
+        let seen = run(
+            &mut driver,
+            vec![
+                Effect::Spawn {
+                    command: command("/bin/sh", &["-c", script], b"hello"),
+                    tag: Tag(1),
+                },
+                Effect::Spawn {
+                    command: command("/bin/sh", &["-c", "kill -TERM $$"], b""),
+                    tag: Tag(2),
+                },
+                Effect::Spawn { command: command("/bin/sleep", &["60"], b""), tag: Tag(3) },
+                Effect::Kill { tag: Tag(3) },
+                Effect::Spawn { command: on, tag: Tag(4) },
+                Effect::Spawn { command: limited, tag: Tag(5) },
+                // More input than a pipe holds, read back while it is written.
+                Effect::Spawn { command: command("/bin/cat", &[], &big), tag: Tag(6) },
+                Effect::Kill { tag: Tag(99) },
+            ],
+        );
         let one = exit(&seen[&1]);
         assert_eq!((one.code, one.signal), (Some(7), None));
         assert_eq!((one.stdout.as_slice(), one.stderr.as_slice()), (&b"hello"[..], &b"err\n"[..]));
@@ -1434,7 +1474,11 @@ mod tests {
         assert_eq!((two.code, two.signal), (None, Some(libc::SIGTERM)));
         let three = exit(&seen[&3]);
         assert_eq!((three.code, three.signal), (None, Some(libc::SIGKILL)));
-        assert!(matches!(&seen[&4], Done::Failed(why) if why.0.contains("Confine")), "{:?}", seen[&4]);
+        assert!(
+            matches!(&seen[&4], Done::Failed(why) if why.0.contains("Confine")),
+            "{:?}",
+            seen[&4]
+        );
         let five = exit(&seen[&5]);
         assert_eq!((five.code, five.stdout.as_slice()), (Some(0), &b"hi\n"[..]));
         let six = exit(&seen[&6]);
@@ -1483,11 +1527,18 @@ mod tests {
         let root = dir("confine");
         let mut driver = Kqueue::new(&root, 1).unwrap().confined(Arc::new(Recording));
         let mut traced = command("/bin/echo", &["hi"], b"");
-        traced.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true, services: Vec::new() };
+        traced.sandbox = Sandbox::On {
+            read: Vec::new(),
+            write: Vec::new(),
+            network: false,
+            trace: true,
+            services: Vec::new(),
+        };
         let seen = run(&mut driver, vec![Effect::Spawn { command: traced, tag: Tag(1) }]);
         let exit = exit(&seen[&1]);
         assert_eq!((exit.code, exit.stdout.as_slice()), (Some(0), &b"hi\n"[..]));
-        let wanted = Traced { files: vec![(PathBuf::from("/etc/hosts"), None)], ..Traced::default() };
+        let wanted =
+            Traced { files: vec![(PathBuf::from("/etc/hosts"), None)], ..Traced::default() };
         assert_eq!(exit.traced, Some(wanted));
         // Its scratch directory is gone.
         let left = std::fs::read_dir(root.join(".blaze-spawn")).unwrap().count();
@@ -1505,42 +1556,52 @@ mod tests {
         ];
         let (mut server, mut client) = (None, None);
         let mut ends = Vec::new();
-        run_until_idle(&mut driver, &mut effects, |done, effects| {
-            match (done.tag.0, done.done) {
-                (1, Done::Accepted { conn }) => {
-                    server = Some(conn);
-                    effects.push(Effect::Recv { conn, most: 64, into: Vec::new(), tag: Tag(3) });
-                }
-                (2, Done::Connected { conn }) => {
-                    client = Some(conn);
-                    effects.push(Effect::Send { conn, bytes: b"ping".to_vec(), tag: Tag(4) });
-                }
-                (3, Done::Read(bytes)) => {
-                    assert_eq!(bytes, b"ping");
-                    let (server, client) = (server.unwrap(), client.unwrap());
-                    effects.push(Effect::Send { conn: server, bytes: b"pong".to_vec(), tag: Tag(5) });
-                    effects.push(Effect::Recv { conn: client, most: 64, into: Vec::new(), tag: Tag(6) });
-                }
-                (6, Done::Read(bytes)) => {
-                    assert_eq!(bytes, b"pong");
-                    effects.push(Effect::Hangup { conn: client.unwrap(), tag: Tag(7) });
-                    effects.push(Effect::Recv { conn: server.unwrap(), most: 64, into: Vec::new(), tag: Tag(8) });
-                }
-                (8, Done::Read(bytes)) => {
-                    assert!(bytes.is_empty(), "{bytes:?}");
-                    effects.push(Effect::Hangup { conn: server.unwrap(), tag: Tag(9) });
-                    effects.push(Effect::Unlisten { tag: Tag(1) });
-                }
-                (tag @ (4 | 5), Done::Sent(bytes)) if bytes.is_empty() => ends.push(tag),
-                (tag @ (7 | 9), Done::HungUp) | (tag @ 1, Done::Unlistened) => ends.push(tag),
-                (tag, other) => panic!("{tag}: {other:?}"),
+        run_until_idle(&mut driver, &mut effects, |done, effects| match (done.tag.0, done.done) {
+            (1, Done::Accepted { conn }) => {
+                server = Some(conn);
+                effects.push(Effect::Recv { conn, most: 64, into: Vec::new(), tag: Tag(3) });
             }
+            (2, Done::Connected { conn }) => {
+                client = Some(conn);
+                effects.push(Effect::Send { conn, bytes: b"ping".to_vec(), tag: Tag(4) });
+            }
+            (3, Done::Read(bytes)) => {
+                assert_eq!(bytes, b"ping");
+                let (server, client) = (server.unwrap(), client.unwrap());
+                effects.push(Effect::Send { conn: server, bytes: b"pong".to_vec(), tag: Tag(5) });
+                effects.push(Effect::Recv {
+                    conn: client,
+                    most: 64,
+                    into: Vec::new(),
+                    tag: Tag(6),
+                });
+            }
+            (6, Done::Read(bytes)) => {
+                assert_eq!(bytes, b"pong");
+                effects.push(Effect::Hangup { conn: client.unwrap(), tag: Tag(7) });
+                effects.push(Effect::Recv {
+                    conn: server.unwrap(),
+                    most: 64,
+                    into: Vec::new(),
+                    tag: Tag(8),
+                });
+            }
+            (8, Done::Read(bytes)) => {
+                assert!(bytes.is_empty(), "{bytes:?}");
+                effects.push(Effect::Hangup { conn: server.unwrap(), tag: Tag(9) });
+                effects.push(Effect::Unlisten { tag: Tag(1) });
+            }
+            (tag @ (4 | 5), Done::Sent(bytes)) if bytes.is_empty() => ends.push(tag),
+            (tag @ (7 | 9), Done::HungUp) | (tag @ 1, Done::Unlistened) => ends.push(tag),
+            (tag, other) => panic!("{tag}: {other:?}"),
         });
         ends.sort();
         assert_eq!(ends, [1, 4, 5, 7, 9]);
         assert_ne!(server, client);
         assert_eq!(driver.in_flight(), 0);
-        assert!(driver.conns.is_empty() && driver.listens.is_empty() && driver.connecting.is_empty());
+        assert!(
+            driver.conns.is_empty() && driver.listens.is_empty() && driver.connecting.is_empty()
+        );
         assert!(driver.owners.slab.is_empty(), "every registration ends with what it was of");
     }
 
@@ -1567,17 +1628,23 @@ mod tests {
     fn what_names_nothing_fails() {
         let root = dir("nothing");
         let mut driver = Kqueue::new(&root, 1).unwrap();
-        let seen = run(&mut driver, vec![
-            Effect::Unwatch { tag: Tag(1) },
-            Effect::Unlisten { tag: Tag(2) },
-            Effect::Recv { conn: Conn(77), most: 8, into: b"kept".to_vec(), tag: Tag(3) },
-            Effect::Hangup { conn: Conn(77), tag: Tag(4) },
-            Effect::Connect { at: Address::Unix(name("nobody")), tag: Tag(5) },
-            Effect::Kill { tag: Tag(6) },
-        ]);
+        let seen = run(
+            &mut driver,
+            vec![
+                Effect::Unwatch { tag: Tag(1) },
+                Effect::Unlisten { tag: Tag(2) },
+                Effect::Recv { conn: Conn(77), most: 8, into: b"kept".to_vec(), tag: Tag(3) },
+                Effect::Hangup { conn: Conn(77), tag: Tag(4) },
+                Effect::Connect { at: Address::Unix(name("nobody")), tag: Tag(5) },
+                Effect::Kill { tag: Tag(6) },
+            ],
+        );
         assert_eq!(seen.keys().copied().collect::<Vec<_>>(), [1, 2, 3, 4, 5]);
         assert!(matches!(&seen[&3], Done::Broken { buffer, .. } if buffer == b"kept"), "{seen:?}");
-        assert!(seen.iter().all(|(tag, it)| *tag == 3 || matches!(it, Done::Failed(_))), "{seen:?}");
+        assert!(
+            seen.iter().all(|(tag, it)| *tag == 3 || matches!(it, Done::Failed(_))),
+            "{seen:?}"
+        );
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1605,7 +1672,10 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(driver.poll(&mut out, Duration::from_millis(20)), 0);
         let waited = began.elapsed();
-        assert!(waited >= Duration::from_millis(19) && waited < Duration::from_secs(5), "{waited:?}");
+        assert!(
+            waited >= Duration::from_millis(19) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
         assert_eq!(driver.in_flight(), 1);
     }
 
@@ -1614,16 +1684,18 @@ mod tests {
         let root = dir("map");
         let mut driver = Kqueue::new(&root, 2).unwrap();
         let file = name("store/pack");
-        let seen = run(&mut driver, vec![Effect::Write {
-            file: file.clone(),
-            bytes: b"packed".to_vec(),
-            tag: Tag(1),
-        }]);
+        let seen = run(
+            &mut driver,
+            vec![Effect::Write { file: file.clone(), bytes: b"packed".to_vec(), tag: Tag(1) }],
+        );
         assert_eq!(seen[&1], Done::Written);
-        let seen = run(&mut driver, vec![
-            Effect::Map { file, tag: Tag(2) },
-            Effect::Map { file: name("missing"), tag: Tag(3) },
-        ]);
+        let seen = run(
+            &mut driver,
+            vec![
+                Effect::Map { file, tag: Tag(2) },
+                Effect::Map { file: name("missing"), tag: Tag(3) },
+            ],
+        );
         match &seen[&2] {
             Done::Mapped(mapping) => assert_eq!(mapping.bytes(), b"packed"),
             other => panic!("{other:?}"),
@@ -1645,8 +1717,10 @@ mod tests {
                 seen.push(match done.done {
                     Done::Stat(Some(meta)) => format!("stat {} {}", meta.len, meta.dir),
                     Done::Listed(entries) => {
-                        let entries: Vec<_> =
-                            entries.iter().map(|(name, meta)| (name.as_str(), meta.len, meta.dir)).collect();
+                        let entries: Vec<_> = entries
+                            .iter()
+                            .map(|(name, meta)| (name.as_str(), meta.len, meta.dir))
+                            .collect();
                         format!("listed {entries:?}")
                     }
                     Done::Failed(_) => "failed".to_owned(),
@@ -1667,13 +1741,25 @@ mod tests {
                     12 => Effect::Stat { file: name("out/l"), tag: Tag(13) },
                     13 => Effect::ReadAll { file: name("missing"), tag: Tag(14) },
                     14 => Effect::Read { file: name("missing"), at: 0, len: 1, tag: Tag(15) },
-                    15 => Effect::WriteAt { file: file.clone(), at: 6, bytes: b"!".to_vec(), tag: Tag(16) },
+                    15 => Effect::WriteAt {
+                        file: file.clone(),
+                        at: 6,
+                        bytes: b"!".to_vec(),
+                        tag: Tag(16),
+                    },
                     16 => Effect::ReadAll { file: file.clone(), tag: Tag(17) },
                     17 => Effect::Mode { file: file.clone(), mode: 0o600, tag: Tag(18) },
-                    18 => Effect::Rename { from: file.clone(), to: name("vfs/moved"), tag: Tag(19) },
+                    18 => {
+                        Effect::Rename { from: file.clone(), to: name("vfs/moved"), tag: Tag(19) }
+                    }
                     19 => Effect::List { dir: name("vfs"), tag: Tag(20) },
                     20 => Effect::List { dir: name("missing"), tag: Tag(21) },
-                    21 => Effect::WriteAt { file: name("missing"), at: 0, bytes: vec![1], tag: Tag(22) },
+                    21 => Effect::WriteAt {
+                        file: name("missing"),
+                        at: 0,
+                        bytes: vec![1],
+                        tag: Tag(22),
+                    },
                     _ => return,
                 };
                 effects.push(next);
@@ -1693,7 +1779,11 @@ mod tests {
         assert_eq!(kqueue[16], format!("{:?}", Done::Read(b"onet\0\0!".to_vec())));
         assert_eq!(kqueue[17], format!("{:?}", Done::Moded));
         assert_eq!(kqueue[18], format!("{:?}", Done::Renamed));
-        assert!(kqueue[19].starts_with("listed ") && kqueue[19].contains("moved"), "{}", kqueue[19]);
+        assert!(
+            kqueue[19].starts_with("listed ") && kqueue[19].contains("moved"),
+            "{}",
+            kqueue[19]
+        );
         assert!(!kqueue[19].contains("journal"), "{}", kqueue[19]);
         assert_eq!((kqueue[20].as_str(), kqueue[21].as_str()), ("failed", "failed"));
         for it in [ours, theirs] {
@@ -1710,7 +1800,11 @@ mod tests {
         let file = name("log");
         let n = 3 * FILES as u64 + 7;
         let effects = (0..n)
-            .map(|at| Effect::Append { file: file.clone(), bytes: at.to_le_bytes().to_vec(), tag: Tag(at) })
+            .map(|at| Effect::Append {
+                file: file.clone(),
+                bytes: at.to_le_bytes().to_vec(),
+                tag: Tag(at),
+            })
             .collect();
         let seen = run(&mut driver, effects);
         assert_eq!(seen.len() as u64, n);
@@ -1739,11 +1833,18 @@ mod tests {
             driver.submit(&mut effects);
             let deadline = Instant::now() + Duration::from_secs(10);
             while driver.files.len() < N {
-                assert!(Instant::now() < deadline, "the threads handed back {} of {N}", driver.files.len());
+                assert!(
+                    Instant::now() < deadline,
+                    "the threads handed back {} of {N}",
+                    driver.files.len()
+                );
                 std::thread::yield_now();
             }
             let triggers = driver.notify.triggers.load(Ordering::Relaxed);
-            assert_eq!(triggers, batch, "batch {batch}: {triggers} triggers in all for {N} hand-backs each");
+            assert_eq!(
+                triggers, batch,
+                "batch {batch}: {triggers} triggers in all for {N} hand-backs each"
+            );
             let mut out = Vec::with_capacity(N);
             poll_for(&mut driver, &mut out, N);
             assert_eq!(out.len(), N);
@@ -1779,7 +1880,10 @@ mod tests {
     fn a_watch_hears_a_file_written_under_it_then_ends() {
         let root = dir("watch");
         let mut driver = Kqueue::new(&root, 1).unwrap();
-        run(&mut driver, vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }]);
+        run(
+            &mut driver,
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+        );
         driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
         let mut heard = Vec::new();
         let mut asked_end = false;
@@ -1827,7 +1931,10 @@ mod tests {
     fn a_flush_is_told_after_the_changes_made_before_it() {
         let root = dir("flush");
         let mut driver = Kqueue::new(&root, 1).unwrap();
-        run(&mut driver, vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }]);
+        run(
+            &mut driver,
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+        );
         driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
         for round in 0..20u64 {
             let file = format!("src/edit-{round}");
@@ -1851,7 +1958,8 @@ mod tests {
             assert!(flushed, "round {round}: the flush never came");
             assert!(heard.contains(&name(&file)), "round {round}: {heard:?}");
         }
-        let mut effects = vec![Effect::Flush { watch: Tag(8), tag: Tag(9) }, Effect::Unwatch { tag: Tag(7) }];
+        let mut effects =
+            vec![Effect::Flush { watch: Tag(8), tag: Tag(9) }, Effect::Unwatch { tag: Tag(7) }];
         let mut refused = false;
         run_until_idle(&mut driver, &mut effects, |it, _| match (it.tag.0, it.done) {
             (9, Done::Failed(_)) => refused = true,
@@ -1870,7 +1978,10 @@ mod tests {
     fn a_flush_its_watch_ends_before_fails_before_the_end() {
         let root = dir("flush-end");
         let mut driver = Kqueue::new(&root, 1).unwrap();
-        run(&mut driver, vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }]);
+        run(
+            &mut driver,
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+        );
         let mut effects = vec![
             Effect::Watch { dir: name("src"), tag: Tag(7) },
             Effect::Flush { watch: Tag(7), tag: Tag(8) },
@@ -1926,7 +2037,10 @@ mod tests {
     fn a_journal_resumes_from_its_cursor_through_the_driver() {
         let root = dir("journal");
         let mut driver = Kqueue::new(&root, 1).unwrap();
-        run(&mut driver, vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }]);
+        run(
+            &mut driver,
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+        );
         driver.submit(&mut vec![Effect::Journal {
             dir: name("src"),
             since: crate::Cursor::None,
@@ -1962,20 +2076,30 @@ mod tests {
     fn stamps_and_entries_are_the_file_systems() {
         let root = dir("stamps");
         let mut driver = Kqueue::new(&root, 2).unwrap();
-        run(&mut driver, vec![
-            Effect::Write { file: name("src/lib.rs"), bytes: b"fn f() {}".to_vec(), tag: Tag(1) },
-            Effect::Write { file: name("src/deep/mod.rs"), bytes: Vec::new(), tag: Tag(2) },
-        ]);
+        run(
+            &mut driver,
+            vec![
+                Effect::Write {
+                    file: name("src/lib.rs"),
+                    bytes: b"fn f() {}".to_vec(),
+                    tag: Tag(1),
+                },
+                Effect::Write { file: name("src/deep/mod.rs"), bytes: Vec::new(), tag: Tag(2) },
+            ],
+        );
         std::os::unix::fs::symlink("lib.rs", root.join("src/link")).unwrap();
         let mut names = crate::Names::default();
         for it in ["src/lib.rs", "src/deep", "src/link", "src/missing", "src/lib.rs/under"] {
             assert!(names.push_str(it));
         }
-        let seen = run(&mut driver, vec![
-            Effect::Stamp { files: Arc::new(names.clone()), tag: Tag(3) },
-            Effect::Entries { dir: name("src"), tag: Tag(4) },
-            Effect::Entries { dir: name("missing"), tag: Tag(5) },
-        ]);
+        let seen = run(
+            &mut driver,
+            vec![
+                Effect::Stamp { files: Arc::new(names.clone()), tag: Tag(3) },
+                Effect::Entries { dir: name("src"), tag: Tag(4) },
+                Effect::Entries { dir: name("missing"), tag: Tag(5) },
+            ],
+        );
         let stamps = crate::fs::stamps(&root, &names).unwrap();
         assert_eq!(seen[&3], Done::Stamped(stamps.clone()));
         assert!(stamps[0].is_file() && stamps[0].size == 9, "{stamps:?}");
@@ -2045,7 +2169,10 @@ mod tests {
                         let owner = any_owner(&mut rng);
                         let (id, old_id) = (owners.own(owner), old.own(owner));
                         assert_ne!(id, TRIGGER, "seed {seed}");
-                        assert!(made.iter().all(|it| it.0 != id), "seed {seed}: {id:#x} issued twice");
+                        assert!(
+                            made.iter().all(|it| it.0 != id),
+                            "seed {seed}: {id:#x} issued twice"
+                        );
                         made.push((id, old_id, true));
                     }
                     3 | 4 if !made.is_empty() => {
@@ -2087,7 +2214,12 @@ mod tests {
         let mut driver = Kqueue::new(&root, 1).unwrap();
         let connecting = |driver: &mut Kqueue, tag| {
             let fd = net::stream_socket(libc::AF_UNIX).unwrap();
-            driver.connecting.insert(Connecting { tag, fd, at: Address::Unix(name("x")), unix: true })
+            driver.connecting.insert(Connecting {
+                tag,
+                fd,
+                at: Address::Unix(name("x")),
+                unix: true,
+            })
         };
         let first = connecting(&mut driver, Tag(1));
         let ended = driver.owners.own(Owner::Connecting(first));
@@ -2136,7 +2268,10 @@ mod tests {
         let root = dir("budget-files");
         let mut driver = Kqueue::new(&root, 1).unwrap();
         let file = name("f");
-        run(&mut driver, vec![Effect::Write { file: file.clone(), bytes: b"bytes".to_vec(), tag: Tag(1) }]);
+        run(
+            &mut driver,
+            vec![Effect::Write { file: file.clone(), bytes: b"bytes".to_vec(), tag: Tag(1) }],
+        );
         let (mut effects, mut out) = (Vec::with_capacity(3), Vec::with_capacity(16));
         for round in 0..WARM + ROUNDS {
             if round == WARM {
@@ -2153,7 +2288,10 @@ mod tests {
                 poll_for(&mut driver, &mut out, 3);
             });
             if round >= WARM {
-                assert_eq!(used.allocations, 0, "round {round}: a warm Sync, Stat and Read, on the driver's thread");
+                assert_eq!(
+                    used.allocations, 0,
+                    "round {round}: a warm Sync, Stat and Read, on the driver's thread"
+                );
             }
             out.sort_by_key(|it| it.tag);
             assert!(
@@ -2188,7 +2326,10 @@ mod tests {
         let root = dir("budget-times");
         let mut driver = Kqueue::new(&root, 1).unwrap();
         let file = name("f");
-        run(&mut driver, vec![Effect::Write { file: file.clone(), bytes: b"bytes".to_vec(), tag: Tag(1) }]);
+        run(
+            &mut driver,
+            vec![Effect::Write { file: file.clone(), bytes: b"bytes".to_vec(), tag: Tag(1) }],
+        );
         let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(4));
         for round in 0..WARM + ROUNDS {
             if round == WARM {
@@ -2202,13 +2343,19 @@ mod tests {
                 poll_for(&mut driver, &mut out, 1);
             });
             if round >= WARM {
-                assert_eq!(used.allocations, 0, "round {round}: a warm set of times, on the driver's thread");
+                assert_eq!(
+                    used.allocations, 0,
+                    "round {round}: a warm set of times, on the driver's thread"
+                );
             }
             assert_eq!(out.as_slice(), [Completion { tag: Tag(round), done: Done::Timed }]);
             out.clear();
         }
         let threads = driver.notify.file_allocations.load(Ordering::Relaxed);
-        assert_eq!(threads, 0, "the file thread: {threads} allocations over {ROUNDS} warm sets of times");
+        assert_eq!(
+            threads, 0,
+            "the file thread: {threads} allocations over {ROUNDS} warm sets of times"
+        );
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2239,7 +2386,10 @@ mod tests {
         const WARM: u32 = 2;
         let root = dir("budget-watch");
         let mut driver = Kqueue::new(&root, 1).unwrap();
-        run(&mut driver, vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }]);
+        run(
+            &mut driver,
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
+        );
         let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(64));
         let (src, edited, path) = (name("src"), name("src/edit"), root.join("src/edit"));
         let mut on_driver = 0;
@@ -2281,7 +2431,10 @@ mod tests {
             assert_eq!(driver.in_flight(), 0);
         }
         assert_eq!(on_driver, 0, "four warm watch cycles, on the driver's thread");
-        assert_eq!(driver.watch_overhead, 0, "the watches' callbacks, beyond what Done::Changed carries");
+        assert_eq!(
+            driver.watch_overhead, 0,
+            "the watches' callbacks, beyond what Done::Changed carries"
+        );
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2325,7 +2478,10 @@ mod tests {
                 poll_for(&mut driver, &mut out, 2);
             });
             if round >= 8 {
-                assert_eq!(used.allocations, 0, "round {round}: a warm send and receive, their buffers reused");
+                assert_eq!(
+                    used.allocations, 0,
+                    "round {round}: a warm send and receive, their buffers reused"
+                );
             }
             out.sort_by_key(|it| it.tag);
             match &mut out[..] {
@@ -2339,8 +2495,14 @@ mod tests {
             }
             out.clear();
         }
-        assert!(sending.capacity() >= 4 && receiving.capacity() >= 64, "the buffers keep their room");
-        effects.extend([Effect::Hangup { conn: client, tag: Tag(20) }, Effect::Hangup { conn: server, tag: Tag(21) }]);
+        assert!(
+            sending.capacity() >= 4 && receiving.capacity() >= 64,
+            "the buffers keep their room"
+        );
+        effects.extend([
+            Effect::Hangup { conn: client, tag: Tag(20) },
+            Effect::Hangup { conn: server, tag: Tag(21) },
+        ]);
         driver.submit(&mut effects);
         poll_for(&mut driver, &mut out, 2);
         assert!(out.iter().all(|it| it.done == Done::HungUp), "{out:?}");
@@ -2371,7 +2533,8 @@ mod tests {
         driver.submit(&mut effects);
         poll_for(&mut driver, &mut out, 2);
         assert!(
-            out.iter().all(|it| matches!(&it.done, Done::Broken { buffer, .. } if buffer.is_empty())),
+            out.iter()
+                .all(|it| matches!(&it.done, Done::Broken { buffer, .. } if buffer.is_empty())),
             "stale: {out:?}"
         );
         out.clear();

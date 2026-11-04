@@ -6,10 +6,7 @@ use crate::ast::*;
 use crate::transform::{TransformCtx, ctx::TransformPass};
 
 enum FoundName<'a> {
-    Unique {
-        long: &'a [PathElem],
-        ids: Vec<ItemId>,
-    },
+    Unique { long: &'a [PathElem], ids: Vec<ItemId> },
     Multiple,
 }
 
@@ -21,10 +18,7 @@ fn register_short_name_candidate<'a>(
 ) {
     match short_names.entry(short) {
         Entry::Occupied(mut e) => match e.get_mut() {
-            FoundName::Unique {
-                long: found_long,
-                ids,
-            } => {
+            FoundName::Unique { long: found_long, ids } => {
                 if *found_long == long {
                     ids.push(id)
                 } else {
@@ -34,10 +28,7 @@ fn register_short_name_candidate<'a>(
             FoundName::Multiple => {}
         },
         Entry::Vacant(e) => {
-            e.insert(FoundName::Unique {
-                long,
-                ids: vec![id],
-            });
+            e.insert(FoundName::Unique { long, ids: vec![id] });
         }
     }
 }
@@ -58,9 +49,7 @@ impl TransformPass for Transform {
                 .rfind(|(_, elem)| matches!(elem, PathElem::Impl(ImplElem::Trait(..), ..)))
             {
                 name_slice = &name.name[i..];
-                let trunc_name = Name {
-                    name: name_slice.to_vec(),
-                };
+                let trunc_name = Name { name: name_slice.to_vec() };
                 ctx.translated.short_names.insert(id, trunc_name);
             }
 
@@ -95,9 +84,7 @@ impl TransformPass for Transform {
         for (short, found) in short_names {
             if let FoundName::Unique { ids, .. } = found {
                 for id in ids {
-                    let mut short_name = Name {
-                        name: vec![short.clone()],
-                    };
+                    let mut short_name = Name { name: vec![short.clone()] };
                     if let [.., mono @ PathElem::Instantiated(..)] =
                         ctx.translated.item_names[&id].name.as_slice()
                     {
@@ -118,11 +105,7 @@ fn trait_impl_short_name(
         item_names: &SeqHashMap<ItemId, Name>,
         generics: &GenericArgs,
     ) -> Vec<String> {
-        generics
-            .types
-            .iter()
-            .filter_map(|t| ty_to_idents(item_names, t))
-            .collect()
+        generics.types.iter().filter_map(|t| ty_to_idents(item_names, t)).collect()
     }
 
     fn ty_to_idents(item_names: &SeqHashMap<ItemId, Name>, ty: &Ty) -> Option<String> {

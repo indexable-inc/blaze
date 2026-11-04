@@ -2,11 +2,11 @@
 
 use base_db::Db;
 use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_mem::frame::Frame;
 use hir_expand::mod_path::{ModPath, PathKind};
 use intern::{Symbol, sym};
+use std::alloc::Global;
 
 use crate::{
     DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, VariantId,
@@ -132,8 +132,7 @@ fn upvars_mentioned_impl(
             return None;
         }
         // alloc: the memo's map, exact
-        let mut result =
-            HashMap::with_capacity_in(visitor.closures.len(), Global);
+        let mut result = HashMap::with_capacity_in(visitor.closures.len(), Global);
         result.extend(visitor.closures.drain(..));
         // alloc: the memo's box, once per body with a capture
         Some(Box::new(result))

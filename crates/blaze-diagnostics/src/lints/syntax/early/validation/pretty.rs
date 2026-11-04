@@ -586,9 +586,11 @@ mod tests {
         let parse = SourceFile::parse(text, Edition::Edition2021);
         let pred = parse.root().descendants().find_map(ast::WherePred::cast).unwrap();
         let mut out = String::with_capacity(256);
-        blaze_alloc_count::assert_at_most(0, "a where predicate printed into a buffer with room", || {
-            where_predicate(&mut out, pred, Edition::Edition2021)
-        });
+        blaze_alloc_count::assert_at_most(
+            0,
+            "a where predicate printed into a buffer with room",
+            || where_predicate(&mut out, pred, Edition::Edition2021),
+        );
         assert_eq!(out, "for<'a> &'a T: Iterator<Item = [u8; N + 1]> + ?Sized + 'static");
     }
 

@@ -16,12 +16,14 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MixedDerefPatterns) -> Vec<Found> 
     let deref = cx.span_of_ptr(d.deref_pat);
     let normal = cx.span_of_ptr(d.normal_pat);
     // clone: the error's spans, the edge
-    let mut diag = Diag::error(None, "mix of deref patterns and normal constructors", deref.clone());
+    let mut diag =
+        Diag::error(None, "mix of deref patterns and normal constructors", deref.clone());
     diag.primary(normal.clone()); // clone: as above
     // The deref pattern's type is the smart pointer's: after the implicit derefs of an
     // implicit deref pattern (a literal matching a `String`), as rustc's `DeconstructedPat`.
     // The error stands without its labels if inference has no type for the pattern.
-    if let Some(ty) = cx.vsema.type_of_pat(cx.node_view(d.deref_pat).value).map(|it| it.adjusted()) {
+    if let Some(ty) = cx.vsema.type_of_pat(cx.node_view(d.deref_pat).value).map(|it| it.adjusted())
+    {
         let ty = cx.ty(&ty);
         diag.span_label(deref, format!("matches on the result of dereferencing `{ty}`")); // alloc: a label, the edge
         diag.span_label(normal, format!("matches directly on `{ty}`")); // alloc: as above

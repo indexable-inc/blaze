@@ -22,7 +22,8 @@ pub fn store_key(key: &ImageKey) -> Key {
 
 impl Shelf for Store {
     fn get_image(&self, key: &ImageKey) -> Result<Option<&[u8]>, PremapError> {
-        let entry = self.get(&store_key(key)).map_err(|it| PremapError::of(format_args!("{it}")))?;
+        let entry =
+            self.get(&store_key(key)).map_err(|it| PremapError::of(format_args!("{it}")))?;
         match entry {
             None => Ok(None),
             Some(entry) if entry.kind != Kind::Output => Err(PremapError::of(format_args!(

@@ -77,7 +77,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplIncorrectSafety) -> Vec<F
     };
     diag.fact(at.coherence(cx), "the header of the impl");
     // alloc: the error's text, for an error hir found
-    diag.fact(Fact::Signature(cx.key(ItemId::Trait(trait_.into()))), format!("whether `{printed}` is unsafe"));
+    diag.fact(
+        Fact::Signature(cx.key(ItemId::Trait(trait_.into()))),
+        format!("whether `{printed}` is unsafe"),
+    );
     // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Items)]
 }
@@ -95,5 +98,6 @@ fn add_unsafe(diag: &mut Diag, span: &crate::model::Span) {
 /// of an `unsafe` one; hir has no other safety error of it) or an `unsafe` negative impl
 /// (E0198).
 fn validations(node: syntax::view::Impl<'_>, d: &hir::TraitImplIncorrectSafety) -> bool {
-    node.trait_().is_none() || d.should_be_safe && node.unsafe_token().is_some() && node.excl_token().is_some()
+    node.trait_().is_none()
+        || d.should_be_safe && node.unsafe_token().is_some() && node.excl_token().is_some()
 }

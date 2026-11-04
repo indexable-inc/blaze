@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use blaze_inproc::frame::{Frame, Kind, kinds};
 use blaze_live::patch::Answer;
-use blaze_live::patch::ask::{self, ANSWER, ANSWERED, NO_PATCH, NO_TIERS, PATCH, PATCH_ASK, TIERS_ASK};
+use blaze_live::patch::ask::{
+    self, ANSWER, ANSWERED, NO_PATCH, NO_TIERS, PATCH, PATCH_ASK, TIERS_ASK,
+};
 use crossbeam_queue::SegQueue;
 
 use super::{ARENA, CELLS_PER_FUNCTION, Patch, answer, dev_run};
@@ -31,7 +33,11 @@ fn a_dev_executable_reserves_the_arena_and_only_a_tiered_run_cells() {
     assert_eq!((plain.arena, plain.cells, plain.fixed), (ARENA, 0, 0));
     let tiered = dev_run(Some(1000));
     assert_eq!((tiered.arena, tiered.cells, tiered.fixed), (ARENA, 1000 * CELLS_PER_FUNCTION, 0));
-    assert_eq!(dev_run(Some(u64::MAX)).cells, u64::MAX, "saturates, so the link refuses it by size");
+    assert_eq!(
+        dev_run(Some(u64::MAX)).cells,
+        u64::MAX,
+        "saturates, so the link refuses it by size"
+    );
 }
 
 #[test]
@@ -43,7 +49,8 @@ fn a_run_behind_the_newest_patch_gets_it_and_one_at_it_gets_none() {
         assert_eq!(ask::read_piece(&body), Ok((3, 7, &b"patch 3"[..])));
     }
     for at_or_past in [3, 4] {
-        let (kind, body) = answered(&ask(PATCH_ASK, &ask::patch_ask(at_or_past, 0)), &patch).0.unwrap();
+        let (kind, body) =
+            answered(&ask(PATCH_ASK, &ask::patch_ask(at_or_past, 0)), &patch).0.unwrap();
         assert_eq!((kind, body.len()), (NO_PATCH, 0), "at {at_or_past}");
     }
     let (kind, _) = answered(&ask(PATCH_ASK, &ask::patch_ask(0, 0)), &Patch::default()).0.unwrap();
@@ -83,7 +90,8 @@ fn an_answer_is_taken_and_what_was_not_applied_kept_as_a_failure() {
     let (kind, failures) = answered(&ask(ANSWER, &declined), &patch);
     assert_eq!(kind.unwrap().0, ANSWERED);
     assert_eq!(failures, ["process 41 did not apply generation 2: a layout changed"]);
-    let back = Answer::RolledBack { generation: 3, to: 2, why: "panicked at a.rs:1:2: x".into() }.encode();
+    let back =
+        Answer::RolledBack { generation: 3, to: 2, why: "panicked at a.rs:1:2: x".into() }.encode();
     let (_, failures) = answered(&ask(ANSWER, &back), &patch);
     assert_eq!(failures, ["process 41 rolled generation 3 back to 2: panicked at a.rs:1:2: x"]);
     let (kind, failures) = answered(&ask(ANSWER, &[1, 2, 3]), &patch);

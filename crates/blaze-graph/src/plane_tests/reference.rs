@@ -9,8 +9,8 @@
 use std::{cmp::Reverse, collections::BTreeSet};
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_protocol::events::{Event, Level, NodeState, Record};
+use std::alloc::Global;
 
 use crate::{
     machine::{Error, NodeId, Outcome, Pool, Spec},
@@ -453,7 +453,11 @@ impl<M: Memo> Plane<M> {
     /// and that task runs on for the rest. Once what it runs is done the request finishes,
     /// not ok. It takes no more [`PlaneInput::Add`] or [`PlaneInput::Close`]; a second cancel
     /// does nothing.
-    pub(crate) fn cancel(&mut self, at_ns: u64, request: RequestId) -> Result<Vec<PlaneOutput>, Error> {
+    pub(crate) fn cancel(
+        &mut self,
+        at_ns: u64,
+        request: RequestId,
+    ) -> Result<Vec<PlaneOutput>, Error> {
         let at = at_ns.max(self.last_ns);
         let r = self.open_request(request)?;
         let mut out = Vec::new();
@@ -471,9 +475,9 @@ impl<M: Memo> Plane<M> {
                     let me = self.requests[r].nodes[at_node];
                     let skip = match self.nodes[me].state {
                         NodeState::Waiting | NodeState::Ready => true,
-                        NodeState::Running => self.nodes[me]
-                            .task
-                            .is_some_and(|task| self.tasks[task].runner != me),
+                        NodeState::Running => {
+                            self.nodes[me].task.is_some_and(|task| self.tasks[task].runner != me)
+                        }
                         _ => false,
                     };
                     if skip {
@@ -598,7 +602,9 @@ impl<M: Memo> Plane<M> {
                             blocker = Some(dep);
                         }
                     }
-                    NodeState::Failed { .. } if self.requests[r].keep_going && self.nodes[dep].open => {
+                    NodeState::Failed { .. }
+                        if self.requests[r].keep_going && self.nodes[dep].open =>
+                    {
                         let later = |it: usize| (self.nodes[it].done_at, self.nodes[it].seq);
                         if blocker.is_none_or(|it| later(dep) > later(it)) {
                             blocker = Some(dep);
@@ -700,8 +706,8 @@ impl<M: Memo> Plane<M> {
         if node.priority == priority {
             return;
         }
-        let ready = node.state == NodeState::Ready
-            && node.task.is_some_and(|it| !self.tasks[it].running);
+        let ready =
+            node.state == NodeState::Ready && node.task.is_some_and(|it| !self.tasks[it].running);
         if ready {
             let (r, p) = (node.request, pool_at(self.tasks[node.task.expect("a task")].pool));
             let entry = self.entry(me);

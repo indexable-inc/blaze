@@ -560,9 +560,7 @@ fn resolve_impl_trait_item<'db>(
             infcx: &infcx,
             resolver,
             param_env: param_env.param_env,
-            traits_in_scope: TraitsInScope::Set(TraitSet::collect(
-                traits_in_scope.iter().copied(),
-            )),
+            traits_in_scope: TraitsInScope::Set(TraitSet::collect(traits_in_scope.iter().copied())),
             edition: krate.data(db).edition,
             features,
             call_span: hir_ty::Span::Dummy,
@@ -584,12 +582,7 @@ fn resolve_impl_trait_item<'db>(
     as_module_def_if_namespace_matches(resolution, ns)
 }
 
-fn resolve_field(
-    db: &Db,
-    def: Variant,
-    name: Name,
-    ns: Option<Namespace>,
-) -> Option<DocLinkDef> {
+fn resolve_field(db: &Db, def: Variant, name: Name, ns: Option<Namespace>) -> Option<DocLinkDef> {
     if let Some(Namespace::Types | Namespace::Macros) = ns {
         return None;
     }

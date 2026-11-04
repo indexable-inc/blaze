@@ -1141,14 +1141,27 @@ fn force_warn_mutable_transmutes() {
 /// `tests/ui/transmute/transmute-bool-u8.rs`: `#![allow(unnecessary_transmutes)]` on the crate.
 #[test]
 fn transmute_bool_u8() {
-    check("transmute-bool-u8.rs", "sized", TRANSMUTE, include_str!("values/ui/transmute-bool-u8.rs"), "");
+    check(
+        "transmute-bool-u8.rs",
+        "sized",
+        TRANSMUTE,
+        include_str!("values/ui/transmute-bool-u8.rs"),
+        "",
+    );
 }
 
 #[test]
 fn lint_enum_intrinsics_non_enums() {
     let source = include_str!("values/ui/lint-enum-intrinsics-non-enums.rs");
     let library = &["variant_count"];
-    let actual = ui(Ui { name: "lint-enum-intrinsics-non-enums.rs", core: "sized, discriminant", std: Some(("", DISCRIMINANT)), library, source, ..Ui::default() });
+    let actual = ui(Ui {
+        name: "lint-enum-intrinsics-non-enums.rs",
+        core: "sized, discriminant",
+        std: Some(("", DISCRIMINANT)),
+        library,
+        source,
+        ..Ui::default()
+    });
     assert_eq!(actual, include_str!("values/ui/lint-enum-intrinsics-non-enums.stderr"));
 }
 
@@ -1191,7 +1204,14 @@ fn unnecessary_transmutation() {
 fn invalid_value() {
     let source = include_str!("values/ui/invalid_value.rs");
     let library = &["pattern_type_macro"];
-    let actual = ui(Ui { name: "invalid_value.rs", core: "sized, option, result, send, non_null, non_zero, pat, manually_drop, fn", std: Some(("", UNINIT)), library, source, ..Ui::default() });
+    let actual = ui(Ui {
+        name: "invalid_value.rs",
+        core: "sized, option, result, send, non_null, non_zero, pat, manually_drop, fn",
+        std: Some(("", UNINIT)),
+        library,
+        source,
+        ..Ui::default()
+    });
     assert_reports(
         &actual,
         &[
@@ -1253,8 +1273,16 @@ fn invalid_value() {
 #[test]
 fn const_item_interior_mutations_const_cell() {
     let source = include_str!("values/ui/const-item-interior-mutations-const-cell.rs");
-    let library = &["once_cell_try", "once_cell_try_insert", "sync_unsafe_cell", "unsafe_cell_access"];
-    let actual = ui(Ui { name: "const-item-interior-mutations-const-cell.rs", core: "sized, copy, option, result, fn, add, deref", std: Some(("", CELLS)), library, source, ..Ui::default() });
+    let library =
+        &["once_cell_try", "once_cell_try_insert", "sync_unsafe_cell", "unsafe_cell_access"];
+    let actual = ui(Ui {
+        name: "const-item-interior-mutations-const-cell.rs",
+        core: "sized, copy, option, result, fn, add, deref",
+        std: Some(("", CELLS)),
+        library,
+        source,
+        ..Ui::default()
+    });
     assert_eq!(actual, include_str!("values/ui/const-item-interior-mutations-const-cell.stderr"));
 }
 
@@ -1264,7 +1292,14 @@ fn const_item_interior_mutations_const_cell() {
 fn const_item_interior_mutations_const() {
     let source = include_str!("values/ui/const-item-interior-mutations-const.rs");
     let library = &["lock_value_accessors", "once_cell_try", "once_cell_try_insert"];
-    let actual = ui(Ui { name: "const-item-interior-mutations-const.rs", core: "sized, copy, option, result, fn, eq, drop, fmt", std: Some(("", SYNC)), library, source, ..Ui::default() });
+    let actual = ui(Ui {
+        name: "const-item-interior-mutations-const.rs",
+        core: "sized, copy, option, result, fn, eq, drop, fmt",
+        std: Some(("", SYNC)),
+        library,
+        source,
+        ..Ui::default()
+    });
     assert_eq!(actual, include_str!("values/ui/const-item-interior-mutations-const.stderr"));
 }
 

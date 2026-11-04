@@ -20,26 +20,25 @@ use std::cmp::Ordering;
 
 use base_db::{Crate, Db};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_query::db::{AsId, FromId};
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup as _, ModuleDefId,
-    ModuleIdLt, StaticId,
+    AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup as _,
+    ModuleDefId, ModuleIdLt, StaticId,
     attrs::AttrFlags,
     find_path::{FindPathConfig, PrefixKind, find_path},
     item_scope::ItemInNs,
     lang_item::{LangItems, lang_items},
     nameres::crate_def_map,
     signatures::{
-        EnumSignature, FunctionSignature, StaticFlags, StaticSignature, StructSignature, TraitSignature,
-        UnionSignature,
+        EnumSignature, FunctionSignature, StaticFlags, StaticSignature, StructSignature,
+        TraitSignature, UnionSignature,
     },
 };
 use hir_expand::{mod_path::PathKind, name::Name};
 use hir_ty::{
-    InferBodyId,
-    display::{DisplayTarget, HirDisplay as _}, MemoryMap, ParamEnvAndCrate, PointerCast,
+    InferBodyId, MemoryMap, ParamEnvAndCrate, PointerCast,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
+    display::{DisplayTarget, HirDisplay as _},
     drop::is_freeze,
     intrinsic::{Intrinsic, SimdOp},
     next_solver::{
@@ -50,8 +49,8 @@ use hir_ty::{
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::{
-    AssertKind, BasicBlockId, BinOp, CastKind, MirBody, MirLowerError, MirSpan, Operand, OperandKind, Rvalue,
-    StatementKind, StoredPlace, TerminatorKind,
+    AssertKind, BasicBlockId, BinOp, CastKind, MirBody, MirLowerError, MirSpan, Operand,
+    OperandKind, Rvalue, StatementKind, StoredPlace, TerminatorKind,
     dispatch::{
         self, Body, Call, Callee, DropStep, LONGEST, UnsizeStep, clone_parts, variants,
         vtable_methods, within_longest,
@@ -64,6 +63,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind as _},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{
     Abs, Effects, Impure, Proof, Purity, allowed_env, effect_attrs,
@@ -243,7 +243,10 @@ pub fn script_proof(db: &Db, main: FunctionId) -> ScriptProof {
                 let args = GenericArgs::new_from_slice(&[GenericArg::from(output)]);
                 walk.call(report, args, Spread::Opaque, None);
             }
-            None => walk.refuse(Rule::Unchecked, "returns a value, but the toolchain has no `Termination::report`"),
+            None => walk.refuse(
+                Rule::Unchecked,
+                "returns a value, but the toolchain has no `Termination::report`",
+            ),
         }
         refused = walk.own.take();
         // Its sites are roots even when it refused: their summaries were asked for, so their
@@ -284,7 +287,11 @@ pub fn script_proof(db: &Db, main: FunctionId) -> ScriptProof {
 /// whatever was cached: a cold, warm or busy database takes the same steps and runs out or not
 /// alike. It runs on every path, before any verdict, so the asks it makes and `prove` does not
 /// (a refused script's) are steps on every database too.
-fn walk_steps<'a>(db: &Db, stored: &StoredParamEnvAndCrate, roots: impl Iterator<Item = &'a Instance>) -> u32 {
+fn walk_steps<'a>(
+    db: &Db,
+    stored: &StoredParamEnvAndCrate,
+    roots: impl Iterator<Item = &'a Instance>,
+) -> u32 {
     // An ask: the environment an instance is asked from, the instance, and whether `prove` asks
     // it from the script's (so its callees are asked from there as well).
     type Ask = (StoredParamEnvAndCrate, Instance, bool);
@@ -344,7 +351,8 @@ fn prove<'db>(db: &'db Db, cx: &Cx<'db>, roots: &[(Instance, String)]) -> Purity
                         env.extend(read);
                     }
                     Applied::Deferred | Applied::Refused(_) => {
-                        let what = format!("{}: its argument is not known", leaf_said(db, deferred.func)); // alloc: an impure script's reason, once
+                        let what =
+                            format!("{}: its argument is not known", leaf_said(db, deferred.func)); // alloc: an impure script's reason, once
                         return Purity::Impure(Impure { what, through: vec![name.clone()] }); // clone: as above
                     }
                 }
@@ -447,8 +455,17 @@ fn callees_of<'db>(
 /// The environment `instance` is worked out in, asked from `env`: its own crate's where it is
 /// not generic, else its home's (`hir_ty_mir::mir::home::env_of`), the one rule the code
 /// generator compiles it by too, so a script's summary describes the body that runs.
-pub(crate) fn home_env(db: &Db, env: &StoredParamEnvAndCrate, instance: &Instance) -> StoredParamEnvAndCrate {
-    hir_ty_mir::mir::home::env_of(db, env, Some(def_crate(db, instance.def)), instance.args.as_ref())
+pub(crate) fn home_env(
+    db: &Db,
+    env: &StoredParamEnvAndCrate,
+    instance: &Instance,
+) -> StoredParamEnvAndCrate {
+    hir_ty_mir::mir::home::env_of(
+        db,
+        env,
+        Some(def_crate(db, instance.def)),
+        instance.args.as_ref(),
+    )
 }
 
 /// The crate whose code `def` is.
@@ -465,7 +482,11 @@ pub(crate) fn def_crate(db: &Db, def: Def) -> Crate {
 /// What the instance does, asked from `env`: worked out in its home ([`home_env`]), so every
 /// build script that reaches it shares one summary. A body instance is a step of the walk's
 /// bound, if one is set (`blaze_query::db::with_steps`), however often it is asked for.
-pub(crate) fn summary<'db>(db: &'db Db, env: StoredParamEnvAndCrate, instance: Instance) -> &'db Summary {
+pub(crate) fn summary<'db>(
+    db: &'db Db,
+    env: StoredParamEnvAndCrate,
+    instance: Instance,
+) -> &'db Summary {
     if let Def::Body(body) = instance.def {
         blaze_query::db::step(|| step_key(body, &instance.args), || name_of(db, &instance));
     }
@@ -487,7 +508,10 @@ fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
 /// What the instance does, in `env`. A cycle of instances starts from the empty summary and
 /// iterates to its fixpoint: each local's value only rises, in a lattice three high.
 #[blaze_query::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::default())]
-#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
 pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Summary {
     let Some(body) = body_of(db, &env, &instance) else { return Summary::default() };
     match body {
@@ -696,21 +720,29 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Summary {
         out.impure(Impure { what, through: Vec::new() }); // alloc: empty, allocates nothing
     }
     // Memory the walk cannot follow, or state no argument reaches, is any memory.
-    let refused = walk.kinds.kinds.intersect(EffectSet::of(&[Rule::Unchecked, Rule::Open, Rule::MutableState]));
+    let refused = walk.kinds.kinds.intersect(EffectSet::of(&[
+        Rule::Unchecked,
+        Rule::Open,
+        Rule::MutableState,
+    ]));
     let mut fold = Fold::new(std::mem::take(&mut walk.kinds));
     let mut callees = Vec::with_capacity(walk.sites.len()); // alloc: the summary's callees, once per instance
     let mut sites = Vec::with_capacity(walk.sites.len()); // alloc: the summary's effect sites, once per instance
     let mut facts = Vec::with_capacity(walk.sites.len()); // alloc: one site's memory facts each, once per instance
     for (at, site) in walk.sites.iter().enumerate() {
         let (instance, spread) = match &site.reached {
-            Reached::Walk(instance, spread) | Reached::Leaf(instance, spread) => (instance, *spread),
+            Reached::Walk(instance, spread) | Reached::Leaf(instance, spread) => {
+                (instance, *spread)
+            }
         };
         sites.push(EffectSite { instance: instance.clone(), span: site.span, given: site.given }); // clone: reference counts
         let at = at as u32;
         let memory = match instance.def {
             Def::Leaf(func, leaf) => {
                 let (kinds, does) = effects::leaf_kinds(leaf);
-                fold.row(db, func, kinds, EffectSet::EMPTY, at, || format!("calls {}, which {does}", fn_name(db, func))); // alloc: a witness's text
+                fold.row(db, func, kinds, EffectSet::EMPTY, at, || {
+                    format!("calls {}, which {does}", fn_name(db, func))
+                }); // alloc: a witness's text
                 memory::leaf_memory(leaf)
             }
             Def::Body(def) => {
@@ -829,7 +861,15 @@ impl Fold {
 
     /// A call of the body `def` with `args`, whose summary is `callee`, at site `at`, from a
     /// body of a workspace crate when `workspace`.
-    fn callee(&mut self, db: &Db, def: Body, args: GenericArgs<'_>, callee: &Summary, workspace: bool, at: u32) {
+    fn callee(
+        &mut self,
+        db: &Db,
+        def: Body,
+        args: GenericArgs<'_>,
+        callee: &Summary,
+        workspace: bool,
+        at: u32,
+    ) {
         let func = match def {
             Body::Fn(func) => Some(func),
             Body::Closure(_) | Body::Coroutine(_) | Body::CoroutineByMove(_) => None,
@@ -887,14 +927,20 @@ pub(crate) fn never_returns(db: &Db, func: FunctionId) -> bool {
 fn assertion(msg: &AssertKind) -> &'static str {
     match msg {
         AssertKind::BoundsCheck { .. } => "checks an index against a length, which panics past it",
-        AssertKind::Overflow(..) | AssertKind::OverflowNeg(_) => "checks arithmetic for overflow, which panics on it",
+        AssertKind::Overflow(..) | AssertKind::OverflowNeg(_) => {
+            "checks arithmetic for overflow, which panics on it"
+        }
         AssertKind::DivisionByZero(_) => "checks a divisor, which panics on zero",
         AssertKind::RemainderByZero(_) => "checks the divisor of a remainder, which panics on zero",
-        AssertKind::MisalignedPointerDereference { .. } => "checks a pointer's alignment, which panics when it is not",
+        AssertKind::MisalignedPointerDereference { .. } => {
+            "checks a pointer's alignment, which panics when it is not"
+        }
         AssertKind::NullPointerDereference | AssertKind::NullReferenceConstructed => {
             "checks a pointer for null, which panics on it"
         }
-        AssertKind::InvalidEnumConstruction(_) => "checks an enum's value, which panics when it is invalid",
+        AssertKind::InvalidEnumConstruction(_) => {
+            "checks an enum's value, which panics when it is invalid"
+        }
     }
 }
 
@@ -923,7 +969,14 @@ impl Out {
 
     /// Applies `leaf`, the function `func`, to `args`; `through` names the callee it was
     /// deferred from.
-    fn leaf(&mut self, db: &Db, func: FunctionId, leaf: Leaf, args: &[Abs], through: Option<&Instance>) {
+    fn leaf(
+        &mut self,
+        db: &Db,
+        func: FunctionId,
+        leaf: Leaf,
+        args: &[Abs],
+        through: Option<&Instance>,
+    ) {
         let at = |i: usize| args.get(i).copied().unwrap_or(Abs::Unknown);
         match apply_leaf(leaf, args) {
             Applied::Done { effects, env, .. } => {
@@ -969,9 +1022,10 @@ impl Out {
         self.env.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         self.deferred.sort_by(|a, b| {
             tag(a.leaf).cmp(&tag(b.leaf)).then_with(|| {
-                a.args.iter().zip(&b.args).fold(Ordering::Equal, |order, (a, b)| {
-                    order.then_with(|| abs_order(*a, *b))
-                })
+                a.args
+                    .iter()
+                    .zip(&b.args)
+                    .fold(Ordering::Equal, |order, (a, b)| order.then_with(|| abs_order(*a, *b)))
             })
         });
         Summary {
@@ -1020,7 +1074,10 @@ pub(crate) fn name_of(db: &Db, instance: &Instance) -> String {
             format!("a closure in {}", parent(InternedClosureId::from_id(id).loc(db).owner)) // alloc: an impure script's reason
         }
         Def::Body(Body::Coroutine(id) | Body::CoroutineByMove(id)) => {
-            format!("an `async` block in {}", parent(InternedCoroutineId::from_id(id).loc(db).owner)) // alloc: an impure script's reason
+            format!(
+                "an `async` block in {}",
+                parent(InternedCoroutineId::from_id(id).loc(db).owner)
+            ) // alloc: an impure script's reason
         }
     }
 }
@@ -1039,13 +1096,21 @@ pub(crate) fn fn_name(db: &Db, func: FunctionId) -> String {
 pub(crate) fn fn_item_path(db: &Db, func: FunctionId) -> String {
     let name = FunctionSignature::of(db, func).name.as_str();
     let path = match func.lookup(db).container {
-        ItemContainerId::ImplId(imp) if db.impl_trait(imp).is_none() => match db.impl_self_ty(imp).skip_binder().kind() {
-            TyKind::Adt(adt, _) => Some(format!("{}::{name}", item_path(db, ModuleDefId::AdtId(adt.def_id())))), // alloc: an impure script's reason
-            _ => None,
-        },
+        ItemContainerId::ImplId(imp) if db.impl_trait(imp).is_none() => {
+            match db.impl_self_ty(imp).skip_binder().kind() {
+                TyKind::Adt(adt, _) => {
+                    Some(format!("{}::{name}", item_path(db, ModuleDefId::AdtId(adt.def_id()))))
+                } // alloc: an impure script's reason
+                _ => None,
+            }
+        }
         ItemContainerId::ImplId(_) => None,
-        ItemContainerId::TraitId(trait_) => Some(format!("{}::{name}", item_path(db, ModuleDefId::TraitId(trait_)))), // alloc: an impure script's reason
-        ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => Some(item_path(db, ModuleDefId::FunctionId(func))),
+        ItemContainerId::TraitId(trait_) => {
+            Some(format!("{}::{name}", item_path(db, ModuleDefId::TraitId(trait_))))
+        } // alloc: an impure script's reason
+        ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => {
+            Some(item_path(db, ModuleDefId::FunctionId(func)))
+        }
     };
     let path = path.or_else(|| {
         let args = GenericArgs::identity_for_item(DbInterner::new_no_crate(db), func.into());
@@ -1063,15 +1128,24 @@ fn item_path(db: &Db, item: ModuleDefId) -> String {
     let crate_name = krate.extra_data(db).display_name.as_ref().map(|it| it.crate_name().as_str());
     let root = crate_def_map(db, krate).root_module_id();
     let namespace = match item {
-        ModuleDefId::FunctionId(_) | ModuleDefId::ConstId(_) | ModuleDefId::StaticId(_) => ItemInNs::Values(item),
+        ModuleDefId::FunctionId(_) | ModuleDefId::ConstId(_) | ModuleDefId::StaticId(_) => {
+            ItemInNs::Values(item)
+        }
         _ => ItemInNs::Types(item),
     };
-    let config = FindPathConfig { prefer_no_std: false, prefer_prelude: false, prefer_absolute: false, allow_unstable: true };
+    let config = FindPathConfig {
+        prefer_no_std: false,
+        prefer_prelude: false,
+        prefer_absolute: false,
+        allow_unstable: true,
+    };
     let mut segments: Vec<&str> = Vec::new(); // alloc: an impure script's reason
     segments.extend(crate_name);
     let found = find_path(db, namespace, root, PrefixKind::ByCrate, true, config);
     match &found {
-        Some(path) if path.kind == PathKind::Crate => segments.extend(path.segments().iter().map(|it| it.as_str())),
+        Some(path) if path.kind == PathKind::Crate => {
+            segments.extend(path.segments().iter().map(|it| it.as_str()))
+        }
         _ => {
             // Not reachable from the root: the modules it is in, outermost first.
             let mut modules = Vec::new(); // alloc: an impure script's reason
@@ -1080,9 +1154,16 @@ fn item_path(db: &Db, item: ModuleDefId) -> String {
                 modules.extend(it.name(db));
                 at = it.containing_module(db).map(ModuleIdLt::to_static);
             }
-            let names: Vec<String> = modules.iter().rev().map(|it| it.as_str().to_owned()).collect(); // alloc: an impure script's reason
+            let names: Vec<String> =
+                modules.iter().rev().map(|it| it.as_str().to_owned()).collect(); // alloc: an impure script's reason
             let own = item_name(db, item);
-            return segments.iter().map(|it| (*it).to_owned()).chain(names).chain(own).collect::<Vec<_>>().join("::"); // alloc: an impure script's reason
+            return segments
+                .iter()
+                .map(|it| (*it).to_owned())
+                .chain(names)
+                .chain(own)
+                .collect::<Vec<_>>()
+                .join("::"); // alloc: an impure script's reason
         }
     }
     segments.join("::") // alloc: an impure script's reason
@@ -1221,7 +1302,8 @@ impl<'a, 'db> Walk<'a, 'db> {
                     let flow = self.call_site(func, id);
                     self.flows[id.into_raw().into_u32() as usize] = flow;
                 }
-                TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => {
+                TerminatorKind::Drop { place, .. }
+                | TerminatorKind::DropAndReplace { place, .. } => {
                     self.origin = Origin::Drop(id);
                     let ty = self.place_ty(place);
                     self.drop_glue(ty);
@@ -1260,7 +1342,9 @@ impl<'a, 'db> Walk<'a, 'db> {
             _ => None,
         });
         match callee {
-            Some((CallableDefId::FunctionId(f), args)) => self.call(f, args, Spread::Direct, Some(at)),
+            Some((CallableDefId::FunctionId(f), args)) => {
+                self.call(f, args, Spread::Direct, Some(at))
+            }
             Some(_) => {
                 self.call_kind(Some(at), CallKind::Ctor);
                 Flow::Join
@@ -1278,9 +1362,17 @@ impl<'a, 'db> Walk<'a, 'db> {
     }
 
     /// A walked instance at a site; its returned value flows as `spread` gives.
-    fn walk(&mut self, def: Def, args: GenericArgs<'db>, spread: Spread, call: Option<BasicBlockId>) -> Flow {
+    fn walk(
+        &mut self,
+        def: Def,
+        args: GenericArgs<'db>,
+        spread: Spread,
+        call: Option<BasicBlockId>,
+    ) -> Flow {
         if !within_longest(args) {
-            self.refuse_with(Rule::Unchecked, || format!("reaches an instance whose type arguments are past {LONGEST} types long")); // alloc: an impure script's reason
+            self.refuse_with(Rule::Unchecked, || {
+                format!("reaches an instance whose type arguments are past {LONGEST} types long")
+            }); // alloc: an impure script's reason
             return Flow::Unknown;
         }
         let instance = Instance { def, args: args.store() };
@@ -1290,10 +1382,18 @@ impl<'a, 'db> Walk<'a, 'db> {
     }
 
     /// What calling `f` with `args` runs, as the code generator dispatches it.
-    fn call(&mut self, f: FunctionId, args: GenericArgs<'db>, spread: Spread, at: Option<BasicBlockId>) -> Flow {
+    fn call(
+        &mut self,
+        f: FunctionId,
+        args: GenericArgs<'db>,
+        spread: Spread,
+        at: Option<BasicBlockId>,
+    ) -> Flow {
         let db = self.cx.db;
         if !within_longest(args) {
-            self.refuse_with(Rule::Unchecked, || format!("calls {} with type arguments past {LONGEST} types long", fn_name(db, f))); // alloc: an impure script's reason
+            self.refuse_with(Rule::Unchecked, || {
+                format!("calls {} with type arguments past {LONGEST} types long", fn_name(db, f))
+            }); // alloc: an impure script's reason
             return Flow::Unknown;
         }
         match dispatch::call(&self.cx.infcx, self.cx.env, f, args) {
@@ -1306,7 +1406,9 @@ impl<'a, 'db> Walk<'a, 'db> {
                 Flow::Unknown
             }
             Call::UnknownIntrinsic(error) => {
-                self.refuse_with(Rule::Unchecked, || format!("calls an intrinsic the walk does not know: {error}")); // alloc: an impure script's reason
+                self.refuse_with(Rule::Unchecked, || {
+                    format!("calls an intrinsic the walk does not know: {error}")
+                }); // alloc: an impure script's reason
                 Flow::Unknown
             }
             // `const_eval_select(args, const_fn, runtime_fn)` calls `runtime_fn` with the fields
@@ -1319,7 +1421,10 @@ impl<'a, 'db> Walk<'a, 'db> {
                 Flow::Unknown
             }
             Call::ConstEvalSelect(None) => {
-                self.refuse(Rule::Unchecked, "calls `const_eval_select` with a run-time function not known");
+                self.refuse(
+                    Rule::Unchecked,
+                    "calls `const_eval_select` with a run-time function not known",
+                );
                 Flow::Unknown
             }
             Call::Intrinsic(intrinsic) => {
@@ -1330,7 +1435,9 @@ impl<'a, 'db> Walk<'a, 'db> {
                 }
                 self.intrinsic(f, args, intrinsic, spread)
             }
-            Call::Closure(body, parent) => self.walk(Def::Body(body), parent, compose(spread, Spread::Closure), at),
+            Call::Closure(body, parent) => {
+                self.walk(Def::Body(body), parent, compose(spread, Spread::Closure), at)
+            }
             Call::FnItem(CallableDefId::FunctionId(g), g_args) => {
                 self.call(g, g_args, compose(spread, Spread::Tuple { from: 1 }), at)
             }
@@ -1339,13 +1446,20 @@ impl<'a, 'db> Walk<'a, 'db> {
                 Flow::Unknown
             }
             Call::AsyncClosure => {
-                self.refuse(Rule::Unchecked, "calls an `async` closure, which the walk does not follow");
+                self.refuse(
+                    Rule::Unchecked,
+                    "calls an `async` closure, which the walk does not follow",
+                );
                 Flow::Unknown
             }
             Call::Method(Err(why)) => {
                 let receiver = self.cx.shown(args.type_at(0));
                 self.refuse_with(open_or_unchecked(args), || {
-                    format!("calls {} for `{receiver}`, which no impl's method is found for: {}", fn_name(db, f), why.describe()) // alloc: an impure script's reason
+                    format!(
+                        "calls {} for `{receiver}`, which no impl's method is found for: {}",
+                        fn_name(db, f),
+                        why.describe()
+                    ) // alloc: an impure script's reason
                 });
                 Flow::Unknown
             }
@@ -1378,7 +1492,9 @@ impl<'a, 'db> Walk<'a, 'db> {
                 Flow::Unknown
             }
             Callee::Derived(..) => {
-                self.refuse_with(Rule::Unchecked, || format!("calls a derived {}, which blaze does not build", fn_name(db, f))); // alloc: an impure script's reason
+                self.refuse_with(Rule::Unchecked, || {
+                    format!("calls a derived {}, which blaze does not build", fn_name(db, f))
+                }); // alloc: an impure script's reason
                 Flow::Unknown
             }
             Callee::CloneBuiltin(_) => {
@@ -1401,7 +1517,13 @@ impl<'a, 'db> Walk<'a, 'db> {
     }
 
     /// A call of the function `g` itself: a leaf or transfer of the models, or its body.
-    fn function(&mut self, g: FunctionId, args: GenericArgs<'db>, spread: Spread, at: Option<BasicBlockId>) -> Flow {
+    fn function(
+        &mut self,
+        g: FunctionId,
+        args: GenericArgs<'db>,
+        spread: Spread,
+        at: Option<BasicBlockId>,
+    ) -> Flow {
         let db = self.cx.db;
         match model_of(db, g) {
             Some(Model::Leaf(leaf)) => {
@@ -1437,7 +1559,9 @@ impl<'a, 'db> Walk<'a, 'db> {
             return Flow::Unknown;
         }
         if !FunctionSignature::of(db, g).has_body() {
-            self.refuse_with(Rule::Unchecked, || format!("calls {}, which has no body", fn_name(db, g))); // alloc: an impure script's reason
+            self.refuse_with(Rule::Unchecked, || {
+                format!("calls {}, which has no body", fn_name(db, g))
+            }); // alloc: an impure script's reason
             return Flow::Unknown;
         }
         if EFFECTS.iter().any(|effect| effects::trusted(db, g, effect).is_some()) {
@@ -1460,7 +1584,10 @@ impl<'a, 'db> Walk<'a, 'db> {
                 TyKind::Closure(id, closure_args) => {
                     let closure = closure_args.as_closure();
                     if pure && self.shares_mutable(closure.tupled_upvars_ty()) {
-                        let what = format!("gives {} a closure that captures state with interior mutability", fn_name(db, g)); // alloc: a witness's text, once
+                        let what = format!(
+                            "gives {} a closure that captures state with interior mutability",
+                            fn_name(db, g)
+                        ); // alloc: a witness's text, once
                         self.observe(EffectSet::one(Rule::MutableState), &what);
                     }
                     let parent = GenericArgs::new_from_slice(closure.parent_args());
@@ -1486,7 +1613,9 @@ impl<'a, 'db> Walk<'a, 'db> {
         fields.iter().any(|field| {
             let field = cx.normalize(field);
             let shared = match field.kind() {
-                TyKind::Ref(_, pointee, rustc_type_ir::Mutability::Not) => !is_freeze(&cx.infcx, pointee, cx.env.param_env),
+                TyKind::Ref(_, pointee, rustc_type_ir::Mutability::Not) => {
+                    !is_freeze(&cx.infcx, pointee, cx.env.param_env)
+                }
                 _ => false,
             };
             shared || !is_freeze(&cx.infcx, field, cx.env.param_env)
@@ -1494,7 +1623,13 @@ impl<'a, 'db> Walk<'a, 'db> {
     }
 
     /// An intrinsic but `const_eval_select`, which [`dispatch::call`] follows.
-    fn intrinsic(&mut self, f: FunctionId, args: GenericArgs<'db>, intrinsic: Intrinsic, spread: Spread) -> Flow {
+    fn intrinsic(
+        &mut self,
+        f: FunctionId,
+        args: GenericArgs<'db>,
+        intrinsic: Intrinsic,
+        spread: Spread,
+    ) -> Flow {
         use Intrinsic as I;
         let db = self.cx.db;
         match intrinsic {
@@ -1509,7 +1644,9 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             _ if pure_intrinsic(intrinsic) => Flow::Unknown,
             _ => {
-                self.refuse_with(Rule::Foreign, || format!("calls the intrinsic {}, which is not pure", fn_name(db, f))); // alloc: an impure script's reason
+                self.refuse_with(Rule::Foreign, || {
+                    format!("calls the intrinsic {}, which is not pure", fn_name(db, f))
+                }); // alloc: an impure script's reason
                 Flow::Unknown
             }
         }
@@ -1522,7 +1659,12 @@ impl<'a, 'db> Walk<'a, 'db> {
             return self.refuse(Rule::Unchecked, "clones a closure whose captures are not known");
         };
         for part in parts {
-            self.call(clone, GenericArgs::new_from_slice(&[GenericArg::from(part)]), Spread::Opaque, None);
+            self.call(
+                clone,
+                GenericArgs::new_from_slice(&[GenericArg::from(part)]),
+                Spread::Opaque,
+                None,
+            );
             self.drop_glue(part);
         }
     }
@@ -1537,11 +1679,16 @@ impl<'a, 'db> Walk<'a, 'db> {
                 DropStep::Drop(drop, args) => {
                     self.call(drop, args, Spread::Opaque, None);
                 }
-                DropStep::NoDropTrait => self.refuse(Rule::Unchecked, "drops a value, but the toolchain has no `Drop::drop`"),
+                DropStep::NoDropTrait => self.refuse(
+                    Rule::Unchecked,
+                    "drops a value, but the toolchain has no `Drop::drop`",
+                ),
                 DropStep::Unknown(ty) => {
                     let rule = if ty.has_param() { Rule::Open } else { Rule::Unchecked };
                     let ty = self.cx.shown(ty);
-                    self.refuse_with(rule, || format!("drops `{ty}`, whose drop glue the walk does not know")) // alloc: an impure script's reason
+                    self.refuse_with(rule, || {
+                        format!("drops `{ty}`, whose drop glue the walk does not know")
+                    }) // alloc: an impure script's reason
                 }
             }
         }
@@ -1564,25 +1711,35 @@ impl<'a, 'db> Walk<'a, 'db> {
                 match self.operand_ty(operand).map(|it| it.kind()) {
                     Some(TyKind::Closure(id, args)) => {
                         let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
-                        self.walk(Def::Body(Body::Closure(id.0.as_id())), parent, Spread::Opaque, None);
+                        self.walk(
+                            Def::Body(Body::Closure(id.0.as_id())),
+                            parent,
+                            Spread::Opaque,
+                            None,
+                        );
                     }
-                    _ => self.refuse(Rule::Unchecked, "makes a function pointer of a closure not known"),
+                    _ => self
+                        .refuse(Rule::Unchecked, "makes a function pointer of a closure not known"),
                 }
             }
             CastKind::PointerCoercion(PointerCast::Unsize) => match self.operand_ty(operand) {
                 Some(from) => self.unsize(from, to.as_ref()),
                 None => self.refuse(Rule::Unchecked, "unsizes the address of a static"),
             },
-            CastKind::DynStar => self.refuse(Rule::Unchecked, "makes a `dyn*`, which the walk does not follow"),
-            CastKind::PointerFromExposedAddress => {
-                self.refuse(Rule::Address, "casts a number to a pointer, an address made from a number")
+            CastKind::DynStar => {
+                self.refuse(Rule::Unchecked, "makes a `dyn*`, which the walk does not follow")
             }
+            CastKind::PointerFromExposedAddress => self.refuse(
+                Rule::Address,
+                "casts a number to a pointer, an address made from a number",
+            ),
             // Where the layout is the toolchain's own (a hash of a pointer for a map's bucket, a
             // `Debug` of one), the rows say which uses observe it; in a workspace crate any
             // cast of a pointer to a number does.
-            CastKind::PointerExposeAddress if self.workspace => {
-                self.observe(EffectSet::one(Rule::Address), "casts a pointer to a number, which observes its address")
-            }
+            CastKind::PointerExposeAddress if self.workspace => self.observe(
+                EffectSet::one(Rule::Address),
+                "casts a pointer to a number, which observes its address",
+            ),
             CastKind::Transmute => match self.operand_ty(operand) {
                 Some(from) => self.transmute(from, to.as_ref()),
                 None => self.refuse(Rule::Unchecked, "transmutes the address of a static"),
@@ -1638,10 +1795,15 @@ impl<'a, 'db> Walk<'a, 'db> {
     /// through: it packs a `&'static str`'s length into its `NonNull<rt::Argument>`, a pointer
     /// to arguments holding function pointers, and makes no code.
     fn transmute(&mut self, from: Ty<'db>, to: Ty<'db>) {
-        let pointer = |ty: Ty<'db>| matches!(ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..) | TyKind::FnPtr(..));
+        let pointer = |ty: Ty<'db>| {
+            matches!(ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..) | TyKind::FnPtr(..))
+        };
         let number = |ty: Ty<'db>| matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_));
         if self.workspace && pointer(self.cx.normalize(from)) && number(self.cx.normalize(to)) {
-            self.observe(EffectSet::one(Rule::Address), "transmutes a pointer to a number, which observes its address");
+            self.observe(
+                EffectSet::one(Rule::Address),
+                "transmutes a pointer to a number, which observes its address",
+            );
         }
         let made = if self.pointerless(from) {
             self.code(to, Reach::Own)
@@ -1665,15 +1827,21 @@ impl<'a, 'db> Walk<'a, 'db> {
                 UnsizeStep::Vtable(concrete, dyn_ty) => self.vtable(concrete, dyn_ty),
                 UnsizeStep::NotStruct(from) => {
                     let from = self.cx.shown(from);
-                    self.refuse_with(Rule::Unchecked, || format!("unsizes `{from}`, which is not a struct")) // alloc: an impure script's reason
+                    self.refuse_with(Rule::Unchecked, || {
+                        format!("unsizes `{from}`, which is not a struct")
+                    }) // alloc: an impure script's reason
                 }
                 UnsizeStep::NoFields(from) => {
                     let from = self.cx.shown(from);
-                    self.refuse_with(Rule::Unchecked, || format!("unsizes `{from}`, a struct without fields")) // alloc: an impure script's reason
+                    self.refuse_with(Rule::Unchecked, || {
+                        format!("unsizes `{from}`, a struct without fields")
+                    }) // alloc: an impure script's reason
                 }
                 UnsizeStep::Unfollowed(from, to) => {
                     let (from, to) = (self.cx.shown(from), self.cx.shown(to));
-                    self.refuse_with(Rule::Unchecked, || format!("unsizes `{from}` to `{to}`, which the walk does not follow")) // alloc: an impure script's reason
+                    self.refuse_with(Rule::Unchecked, || {
+                        format!("unsizes `{from}` to `{to}`, which the walk does not follow")
+                    }) // alloc: an impure script's reason
                 }
             }
         }
@@ -1699,7 +1867,9 @@ impl<'a, 'db> Walk<'a, 'db> {
                 if matches!(konst.kind(), ConstKind::Alias(..)) && self.code(ty, Reach::Raw) {
                     match evaluate(cx.db, &cx.infcx, cx.env, konst) {
                         Ok(value) => self.allocation(&value, ty),
-                        Err(error) => self.refuse_with(Rule::Unchecked, || format!("uses a constant that holds pointers: {error}")), // alloc: an impure script's reason
+                        Err(error) => self.refuse_with(Rule::Unchecked, || {
+                            format!("uses a constant that holds pointers: {error}")
+                        }), // alloc: an impure script's reason
                     }
                 }
             }
@@ -1732,19 +1902,26 @@ impl<'a, 'db> Walk<'a, 'db> {
             return;
         }
         if signature.flags.contains(StaticFlags::MUTABLE) {
-            return self.refuse_with(Rule::MutableState, || format!("reads or writes `{}`, a `static mut`", name())); // alloc: an impure script's reason
+            return self.refuse_with(Rule::MutableState, || {
+                format!("reads or writes `{}`, a `static mut`", name())
+            }); // alloc: an impure script's reason
         }
         if AttrFlags::query(db, id.into()).contains(AttrFlags::THREAD_LOCAL) {
-            return self.refuse_with(Rule::MutableState, || format!("reads `{}`, a thread-local", name())); // alloc: an impure script's reason
+            return self
+                .refuse_with(Rule::MutableState, || format!("reads `{}`, a thread-local", name())); // alloc: an impure script's reason
         }
         let ty = db.type_for_static(id).skip_binder();
         if !is_freeze(&cx.infcx, ty, cx.env.param_env) {
-            return self.refuse_with(Rule::MutableState, || format!("reads `{}`, a static with interior mutability", name())); // alloc: an impure script's reason
+            return self.refuse_with(Rule::MutableState, || {
+                format!("reads `{}`, a static with interior mutability", name())
+            }); // alloc: an impure script's reason
         }
         if self.code(ty, Reach::Raw) {
             match db.const_eval_static(id) {
                 Ok(value) => self.allocation(&value, ty),
-                Err(error) => self.refuse_with(Rule::Unchecked, || format!("reads `{}`, whose value does not evaluate: {error:?}", name())), // alloc: an impure script's reason
+                Err(error) => self.refuse_with(Rule::Unchecked, || {
+                    format!("reads `{}`, whose value does not evaluate: {error:?}", name())
+                }), // alloc: an impure script's reason
             }
         }
     }
@@ -1857,8 +2034,12 @@ impl<'a, 'db> Walk<'a, 'db> {
             TyKind::RawPtr(pointee, _) => {
                 self.scan(pointee, reach, seen, dyns) | (reach == Reach::Raw)
             }
-            TyKind::Ref(_, pointee, _) | TyKind::Pat(pointee, _) => self.scan(pointee, reach, seen, dyns),
-            TyKind::Array(element, _) | TyKind::Slice(element) => self.scan(element, reach, seen, dyns),
+            TyKind::Ref(_, pointee, _) | TyKind::Pat(pointee, _) => {
+                self.scan(pointee, reach, seen, dyns)
+            }
+            TyKind::Array(element, _) | TyKind::Slice(element) => {
+                self.scan(element, reach, seen, dyns)
+            }
             TyKind::Tuple(fields) => {
                 fields.iter().fold(false, |any, it| self.scan(it, reach, seen, dyns) | any)
             }
@@ -1900,11 +2081,17 @@ impl<'a, 'db> Walk<'a, 'db> {
         match pointee.kind() {
             TyKind::Dynamic(..) => true,
             TyKind::Slice(_) | TyKind::Str | TyKind::Foreign(_) => false,
-            TyKind::Tuple(fields) => fields.iter().last().is_some_and(|tail| self.vtable_metadata(tail)),
+            TyKind::Tuple(fields) => {
+                fields.iter().last().is_some_and(|tail| self.vtable_metadata(tail))
+            }
             TyKind::Adt(def, args) => match def.def_id() {
-                AdtId::StructId(id) => cx.db.field_types(id.into()).iter().last().is_some_and(|(_, tail)| {
-                    self.vtable_metadata(tail.ty().instantiate(cx.interner, args).skip_norm_wip())
-                }),
+                AdtId::StructId(id) => {
+                    cx.db.field_types(id.into()).iter().last().is_some_and(|(_, tail)| {
+                        self.vtable_metadata(
+                            tail.ty().instantiate(cx.interner, args).skip_norm_wip(),
+                        )
+                    })
+                }
                 AdtId::EnumId(_) | AdtId::UnionId(_) => false,
             },
             _ => true,

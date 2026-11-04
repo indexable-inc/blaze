@@ -31,7 +31,9 @@ use syntax::view::{self as ast, HasAttrs};
 
 use crate::{
     expr_store::{ExprPtr, HygieneId, lower::ExprCollector},
-    hir::{BindingAnnotation, CaptureBy, ClosureKind, Expr, ExprId, Literal, Pat, Statement, Unsafe},
+    hir::{
+        BindingAnnotation, CaptureBy, ClosureKind, Expr, ExprId, Literal, Pat, Statement, Unsafe,
+    },
 };
 
 use super::Awaitable;
@@ -149,11 +151,8 @@ impl<'db> ExprCollector<'db> {
         );
         let checker = self.generate_new_name();
         // clone: a name, its symbol's count
-        let checker_binding = self.alloc_binding(
-            checker.clone(),
-            BindingAnnotation::Unannotated,
-            HygieneId::ROOT,
-        );
+        let checker_binding =
+            self.alloc_binding(checker.clone(), BindingAnnotation::Unannotated, HygieneId::ROOT);
         let checker_pat = self.alloc_pat_desugared(Pat::Bind { id: checker_binding, subpat: None });
         self.add_definition_to_binding(checker_binding, checker_pat);
 
@@ -287,9 +286,8 @@ impl<'db> ExprCollector<'db> {
         if self.contract_ensures.is_none() {
             return value;
         }
-        let value = value.unwrap_or_else(|| {
-            self.alloc_expr_desugared_with_ptr(Expr::Tuple { exprs: &[] }, ptr)
-        });
+        let value = value
+            .unwrap_or_else(|| self.alloc_expr_desugared_with_ptr(Expr::Tuple { exprs: &[] }, ptr));
         Some(self.contract_checked_return(value, ptr))
     }
 

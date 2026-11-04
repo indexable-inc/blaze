@@ -21,9 +21,7 @@ pub use trait_impl::*;
 pub use type_decl::*;
 
 /// A translated item.
-#[derive(Debug)]
-#[derive(EnumAsInner)]
-#[derive(Drive, DriveMut, DriveTwo)]
+#[derive(Debug, EnumAsInner, Drive, DriveMut, DriveTwo)]
 #[expect(clippy::large_enum_variant)]
 pub enum ItemByVal {
     Type(TypeDecl),
@@ -34,9 +32,7 @@ pub enum ItemByVal {
 }
 
 /// A reference to a translated item.
-#[derive(Debug, Copy, Clone)]
-#[derive(EnumAsInner)]
-#[derive(Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Copy, Clone, EnumAsInner, Drive, DriveMut, DriveTwo)]
 pub enum ItemRef<'ctx> {
     Type(&'ctx TypeDecl),
     Fun(&'ctx FunDecl),
@@ -46,9 +42,7 @@ pub enum ItemRef<'ctx> {
 }
 
 /// A mutable reference to a translated item.
-#[derive(Debug)]
-#[derive(EnumAsInner)]
-#[derive(Drive, DriveMut, DriveTwo)]
+#[derive(Debug, EnumAsInner, Drive, DriveMut, DriveTwo)]
 pub enum ItemRefMut<'ctx> {
     Type(&'ctx mut TypeDecl),
     Fun(&'ctx mut FunDecl),

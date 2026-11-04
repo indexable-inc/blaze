@@ -505,20 +505,25 @@ impl Pen<'_> {
         let build = self.build;
         let Some(now) = build.busy_at(now_ns) else { return };
         let of = build.cores_of.max(1);
-        self.fit(out, DIM, |it| it.push_str("cores"), |it| {
-            for at in 0..SPARK {
-                let back = (SPARK - 1 - at) as u64 * 500_000_000;
-                it.push(match now_ns.checked_sub(back).and_then(|it| build.busy_at(it)) {
-                    Some(busy) => {
-                        let level =
-                            (u64::from(busy) * 7 + u64::from(of) * 50) / (u64::from(of) * 100);
-                        BLOCKS[level.min(7) as usize]
-                    }
-                    None => ' ',
-                });
-            }
-            put!(it, " {}.{}/{of} busy", now / 100, now % 100 / 10);
-        });
+        self.fit(
+            out,
+            DIM,
+            |it| it.push_str("cores"),
+            |it| {
+                for at in 0..SPARK {
+                    let back = (SPARK - 1 - at) as u64 * 500_000_000;
+                    it.push(match now_ns.checked_sub(back).and_then(|it| build.busy_at(it)) {
+                        Some(busy) => {
+                            let level =
+                                (u64::from(busy) * 7 + u64::from(of) * 50) / (u64::from(of) * 100);
+                            BLOCKS[level.min(7) as usize]
+                        }
+                        None => ' ',
+                    });
+                }
+                put!(it, " {}.{}/{of} busy", now / 100, now % 100 / 10);
+            },
+        );
     }
 
     /// The step under way and what it does, and the crates under way.
@@ -528,34 +533,40 @@ impl Pen<'_> {
         // Between one step's end and the next one's start, the step that ended.
         let step = build.running().last().or_else(|| build.steps.last());
         let word = step.map_or("Waiting", |it| it.step.word());
-        self.fit(out, GREEN, |it| put!(it, "{word:>12}"), |it| {
-            const AND: &str = " \u{b7} ";
-            match step {
-                Some(step) => put!(it, "{} {}", step.what(), since(step.began_ns)),
-                None => put!(it, "for the daemon {}", since(0)),
-            }
-            // The step's own count says more than the totals: what it is doing now.
-            if let Some(step) = step
-                && let Some(progress) = &step.progress
-            {
-                put!(it, "{AND}{}", Count(progress, step.step));
-            }
-            // With a graph, the tree's last line counts the crates.
-            let crates = build.crates.len();
-            if crates > 0 && build.graph.is_empty() {
-                put!(it, "{AND}{}/{crates} crates", build.index.ended);
-            }
-            // A crate whose total is not known yet counts in the done and not in the total.
-            let fns = build.fns();
-            if fns.total > 0 && build.index.unknown == 0 {
-                put!(it, "{AND}{}/{} fns", fns.done, fns.total);
-            } else if fns.done > 0 {
-                put!(it, "{AND}{} fns", fns.done);
-            }
-            if let Some(longest) = step.and_then(|it| it.progress.as_ref()?.longest.as_deref()) {
-                put!(it, "{AND}longest {longest}");
-            }
-        });
+        self.fit(
+            out,
+            GREEN,
+            |it| put!(it, "{word:>12}"),
+            |it| {
+                const AND: &str = " \u{b7} ";
+                match step {
+                    Some(step) => put!(it, "{} {}", step.what(), since(step.began_ns)),
+                    None => put!(it, "for the daemon {}", since(0)),
+                }
+                // The step's own count says more than the totals: what it is doing now.
+                if let Some(step) = step
+                    && let Some(progress) = &step.progress
+                {
+                    put!(it, "{AND}{}", Count(progress, step.step));
+                }
+                // With a graph, the tree's last line counts the crates.
+                let crates = build.crates.len();
+                if crates > 0 && build.graph.is_empty() {
+                    put!(it, "{AND}{}/{crates} crates", build.index.ended);
+                }
+                // A crate whose total is not known yet counts in the done and not in the total.
+                let fns = build.fns();
+                if fns.total > 0 && build.index.unknown == 0 {
+                    put!(it, "{AND}{}/{} fns", fns.done, fns.total);
+                } else if fns.done > 0 {
+                    put!(it, "{AND}{} fns", fns.done);
+                }
+                if let Some(longest) = step.and_then(|it| it.progress.as_ref()?.longest.as_deref())
+                {
+                    put!(it, "{AND}longest {longest}");
+                }
+            },
+        );
         if !build.graph.is_empty() {
             self.tree(now_ns, out, scratch);
             return;
@@ -581,16 +592,21 @@ impl Pen<'_> {
             let krate = &build.crates[row];
             let last = at + 1 == shown && running == shown;
             let branch = if last { "\u{2514}\u{2500}" } else { "\u{251c}\u{2500}" };
-            self.fit(out, CYAN, |it| put!(it, "{branch:>14}"), |it| {
-                it.push_str(&krate.name);
-                // A compile under way knows how many it did, and not yet of how many.
-                match (krate.fns.total, krate.fns.done) {
-                    (0, 0) => {}
-                    (0, done) => put!(it, "  {done} fns"),
-                    (total, done) => put!(it, "  {done}/{total} fns"),
-                }
-                put!(it, "  {}", since(krate.began_ns));
-            });
+            self.fit(
+                out,
+                CYAN,
+                |it| put!(it, "{branch:>14}"),
+                |it| {
+                    it.push_str(&krate.name);
+                    // A compile under way knows how many it did, and not yet of how many.
+                    match (krate.fns.total, krate.fns.done) {
+                        (0, 0) => {}
+                        (0, done) => put!(it, "  {done} fns"),
+                        (total, done) => put!(it, "  {done}/{total} fns"),
+                    }
+                    put!(it, "  {}", since(krate.began_ns));
+                },
+            );
             let under = if last { "" } else { "\u{2502}" };
             self.functions(out, &krate.name, now_ns, |it| put!(it, "{under:>13}"));
         }
@@ -698,7 +714,9 @@ impl Pen<'_> {
                     deps.push((krate(dep).busy_ns(now_ns), place as u32, dep));
                 }
             }
-            radix::sort_copy_by_key(deps, |&(busy, place, _)| radix::pack_64(!busy, u64::from(place)));
+            radix::sort_copy_by_key(deps, |&(busy, place, _)| {
+                radix::pack_64(!busy, u64::from(place))
+            });
             // Deeper than this, a chain goes on at the same indent.
             let indent = match last {
                 Some(last) if indent.depth < Indent::MOST => indent.with(last),

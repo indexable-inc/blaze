@@ -34,9 +34,9 @@
 
 use blaze_codegen::{CompiledFunction, Init, InstanceKey, RelocKind, Static, Target};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::names;
 use blaze_items::{CodeHash, ItemKey};
+use std::alloc::Global;
 
 use crate::{LazyId, MOST_LAZY};
 
@@ -65,7 +65,9 @@ pub enum PlanError {
 impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlanError::Unknown(key) => write!(f, "the entry {key:?} is not among the build's functions"),
+            PlanError::Unknown(key) => {
+                write!(f, "the entry {key:?} is not among the build's functions")
+            }
             PlanError::TooMany(count) => {
                 write!(f, "{count} lazy functions, more than one session holds ({MOST_LAZY})")
             }
@@ -90,7 +92,11 @@ pub struct Plan {
 impl Plan {
     /// The plan of a build whose walk described `functions` (in the walk's order, which is
     /// deterministic), whose entry is `entry` and whose statics are `statics`.
-    pub fn new(functions: &[Function], entry: &[InstanceKey], statics: &[Static]) -> Result<Plan, PlanError> {
+    pub fn new(
+        functions: &[Function],
+        entry: &[InstanceKey],
+        statics: &[Static],
+    ) -> Result<Plan, PlanError> {
         let mut ahead: HashMap<InstanceKey, Ahead, Global> = HashMap::new_in(Global);
         for key in entry {
             if !functions.iter().any(|it| it.key == *key) {
@@ -203,11 +209,10 @@ impl Plan {
 fn is_call(function: &CompiledFunction, at: u32, kind: RelocKind) -> bool {
     match kind {
         RelocKind::Call26 => true,
-        RelocKind::PcRel32 => {
-            at.checked_sub(1)
-                .and_then(|it| function.code.get(it as usize))
-                .is_some_and(|op| matches!(op, 0xe8 | 0xe9))
-        }
+        RelocKind::PcRel32 => at
+            .checked_sub(1)
+            .and_then(|it| function.code.get(it as usize))
+            .is_some_and(|op| matches!(op, 0xe8 | 0xe9)),
         _ => false,
     }
 }
@@ -218,8 +223,10 @@ fn named_functions(value: &Static) -> impl Iterator<Item = InstanceKey> + '_ {
         Init::Bytes { relocs, .. } => Some(relocs),
         Init::Zeroed { .. } => None,
     };
-    own.into_iter().flatten().chain(value.data.iter().flat_map(|it| it.relocs.iter())).filter_map(|it| match it.target {
-        Target::Function(key) | Target::Direct(key) => Some(*key),
-        _ => None,
-    })
+    own.into_iter().flatten().chain(value.data.iter().flat_map(|it| it.relocs.iter())).filter_map(
+        |it| match it.target {
+            Target::Function(key) | Target::Direct(key) => Some(*key),
+            _ => None,
+        },
+    )
 }

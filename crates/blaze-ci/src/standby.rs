@@ -35,12 +35,19 @@ pub enum Input {
 #[derive(PartialEq, Eq, Debug)]
 pub enum Action {
     /// Ask the primary once the clock reads `at`.
-    Poll { at: u64 },
+    Poll {
+        at: u64,
+    },
     Latest,
-    Restore { id: String },
+    Restore {
+        id: String,
+    },
     Promote,
     /// Stop with `code`, saying `why`.
-    Exit { code: i32, why: String },
+    Exit {
+        code: i32,
+        why: String,
+    },
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -83,16 +90,21 @@ impl Standby {
             }
             Input::Latest(Ok(id)) => Action::Restore { id },
             // alloc: error path
-            Input::Latest(Err(why)) => self.stop(1, format!("finding the newest snapshot failed: {why}")),
+            Input::Latest(Err(why)) => {
+                self.stop(1, format!("finding the newest snapshot failed: {why}"))
+            }
             Input::Restored(Ok(())) => Action::Promote,
             // alloc: error path
-            Input::Restored(Err(why)) => self.stop(1, format!("restoring the snapshot failed: {why}")),
+            Input::Restored(Err(why)) => {
+                self.stop(1, format!("restoring the snapshot failed: {why}"))
+            }
             Input::Promoted(Ok(())) => {
                 // alloc: once, at the takeover
                 let last = self.last_miss.clone().unwrap_or_default();
                 self.stop(
                     0,
-                    format!( // alloc: once, at the takeover
+                    format!(
+                        // alloc: once, at the takeover
                         "the primary missed {} polls in a row (last: {last}); the newest snapshot \
                          is restored and promoted",
                         self.misses
@@ -100,7 +112,9 @@ impl Standby {
                 )
             }
             // alloc: error path
-            Input::Promoted(Err(why)) => self.stop(1, format!("promoting the restored VM failed: {why}")),
+            Input::Promoted(Err(why)) => {
+                self.stop(1, format!("promoting the restored VM failed: {why}"))
+            }
         }
     }
 
@@ -168,9 +182,13 @@ pub fn run(config: &StandbyConfig) -> Result<(i32, String), ConfigError> {
             }
             Action::Latest => Input::Latest(snapshot::run_for_id(&config.latest).map_err(said)),
             Action::Restore { id } => Input::Restored(
-                snapshot::run(&snapshot::substitute(&config.restore, "id", &id)).map(drop).map_err(said),
+                snapshot::run(&snapshot::substitute(&config.restore, "id", &id))
+                    .map(drop)
+                    .map_err(said),
             ),
-            Action::Promote => Input::Promoted(snapshot::run(&config.promote).map(drop).map_err(said)),
+            Action::Promote => {
+                Input::Promoted(snapshot::run(&config.promote).map(drop).map_err(said))
+            }
             Action::Exit { code, why } => return Ok((code, why)),
         };
         action = standby.step(now(), input);
@@ -227,7 +245,11 @@ mod tests {
     fn each_failed_step_of_the_takeover_exits_1_naming_it() {
         let cases = [
             (vec![], Input::Latest(Err("no snapshots".to_owned())), "newest snapshot"),
-            (vec![Input::Latest(Ok("s".to_owned()))], Input::Restored(Err("disk".to_owned())), "restoring"),
+            (
+                vec![Input::Latest(Ok("s".to_owned()))],
+                Input::Restored(Err("disk".to_owned())),
+                "restoring",
+            ),
             (
                 vec![Input::Latest(Ok("s".to_owned())), Input::Restored(Ok(()))],
                 Input::Promoted(Err("address".to_owned())),

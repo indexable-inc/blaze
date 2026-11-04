@@ -228,6 +228,12 @@ pub fn module_trait_set(db: &Db, module: ModuleId) -> TraitSet {
 #[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn module_items_named(db: &Db, module: ModuleId, name: Name) -> ScopeItems {
     blaze_mem::frame::current(|frame| {
-        ScopeItems::of_traits(db, module_trait_set(db, module).traits(), name, HygieneId::ROOT, frame)
+        ScopeItems::of_traits(
+            db,
+            module_trait_set(db, module).traits(),
+            name,
+            HygieneId::ROOT,
+            frame,
+        )
     })
 }

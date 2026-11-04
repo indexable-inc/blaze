@@ -274,7 +274,9 @@ use Glob::*; //~ ERROR `use` associated items of traits is unstable
 fn main() {}
 "#;
     let name = "feature-gate-import-trait-associated-functions.rs";
-    let fixture = format!("//- minicore: sized, default, option\n{STD_HASH_MAP}//- /{name} crate:other:main edition:2018 deps:std\n{source}");
+    let fixture = format!(
+        "//- minicore: sized, default, option\n{STD_HASH_MAP}//- /{name} crate:other:main edition:2018 deps:std\n{source}"
+    );
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     let unstable = |line| error(line, &["`use` associated items of traits"]);
     assert_reports(
@@ -304,5 +306,8 @@ fn main() {
     hold("d");
 }
 "#;
-    assert_reports(&super::ui_fixture(fixture), &[error(2, &["E0425", "`try_hold`", "`gc::lease`"])]);
+    assert_reports(
+        &super::ui_fixture(fixture),
+        &[error(2, &["E0425", "`try_hold`", "`gc::lease`"])],
+    );
 }

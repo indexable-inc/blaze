@@ -129,9 +129,7 @@ impl<'pm, 'ctx> MutabilityShapeBuilder<'pm, 'ctx> {
         // The first half of the trait params correspond to the original item clauses so we can
         // pass them unmodified.
         shape_contents.trait_refs = shape_params.identity_args().trait_refs;
-        shape_contents
-            .trait_refs
-            .truncate(target_params.trait_clauses.len());
+        shape_contents.trait_refs.truncate(target_params.trait_clauses.len());
 
         let shape_args = builder.extracted;
         let shape = Binder::new(BinderKind::Other, shape_params, shape_contents);
@@ -201,15 +199,11 @@ impl<'pm, 'ctx> VisitAstMut for MutabilityShapeBuilder<'pm, 'ctx> {
             // Add the target predicates (properly substituted) to the new item params.
             let num_clauses_before_merge = self.params.trait_clauses.len();
             self.params.merge_predicates_from(
-                target_params
-                    .clone()
-                    .substitute_explicits(&shifted_generics),
+                target_params.clone().substitute_explicits(&shifted_generics),
             );
 
             // Record the trait arguments in the output `GenericArgs`.
-            self.extracted
-                .trait_refs
-                .extend(shifted_generics.trait_refs);
+            self.extracted.trait_refs.extend(shifted_generics.trait_refs);
 
             // Replace each trait ref with a clause var.
             for (target_clause_id, tref) in generics.trait_refs.iter_mut_enumerated() {
@@ -278,13 +272,7 @@ impl<'a> PartialMonomorphizer<'a> {
             .translated
             .type_decls
             .iter()
-            .filter(|tdecl| {
-                tdecl
-                    .generics
-                    .regions
-                    .iter()
-                    .any(|r| r.mutability.is_mutable())
-            })
+            .filter(|tdecl| tdecl.generics.regions.iter().any(|r| r.mutability.is_mutable()))
             .map(|tdecl| tdecl.def_id)
             .collect();
 
@@ -380,26 +368,23 @@ impl<'a> PartialMonomorphizer<'a> {
         // Create a new type id.
         let new_params = shape.params.clone();
         let key: (ItemId, MutabilityShape) = (id, shape);
-        let new_id = *self
-            .partial_mono_shapes
-            .entry(key.clone())
-            .or_insert_with(|| {
-                let new_id = match id {
-                    ItemId::Type(_) => {
-                        let new_id = self.ctx.translated.type_decls.reserve_slot();
-                        self.infected_types.insert(new_id);
-                        new_id.into()
-                    }
-                    ItemId::Fun(_) => self.ctx.translated.fun_decls.reserve_slot().into(),
-                    ItemId::Global(_) => self.ctx.translated.global_decls.reserve_slot().into(),
-                    ItemId::TraitDecl(_) => self.ctx.translated.trait_decls.reserve_slot().into(),
-                    ItemId::TraitImpl(_) => self.ctx.translated.trait_impls.reserve_slot().into(),
-                };
-                self.generic_params.insert(new_id, new_params);
-                self.reverse_shape_map.insert(new_id, key);
-                self.to_process.push_back(new_id);
-                new_id
-            });
+        let new_id = *self.partial_mono_shapes.entry(key.clone()).or_insert_with(|| {
+            let new_id = match id {
+                ItemId::Type(_) => {
+                    let new_id = self.ctx.translated.type_decls.reserve_slot();
+                    self.infected_types.insert(new_id);
+                    new_id.into()
+                }
+                ItemId::Fun(_) => self.ctx.translated.fun_decls.reserve_slot().into(),
+                ItemId::Global(_) => self.ctx.translated.global_decls.reserve_slot().into(),
+                ItemId::TraitDecl(_) => self.ctx.translated.trait_decls.reserve_slot().into(),
+                ItemId::TraitImpl(_) => self.ctx.translated.trait_impls.reserve_slot().into(),
+            };
+            self.generic_params.insert(new_id, new_params);
+            self.reverse_shape_map.insert(new_id, key);
+            self.to_process.push_back(new_id);
+            new_id
+        });
 
         let fmt_ctx = self.ctx.into_fmt();
         trace!(
@@ -409,11 +394,7 @@ impl<'a> PartialMonomorphizer<'a> {
             new_id.with_ctx(&fmt_ctx),
             shape_args.with_ctx(&fmt_ctx),
         );
-        Some(DeclRef {
-            id: new_id,
-            generics: Box::new(shape_args),
-            trait_ref: None,
-        })
+        Some(DeclRef { id: new_id, generics: Box::new(shape_args), trait_ref: None })
     }
 
     /// Traverse the item, replacing any type instantiations we don't want with references to
@@ -443,18 +424,12 @@ impl<'a> PartialMonomorphizer<'a> {
 
         let name_ref = &mut decl_mut.item_meta().name;
         *name_ref = mem::take::<crate::ast::Name>(name_ref).instantiate(shape.clone());
-        self.ctx
-            .translated
-            .item_names
-            .insert(new_id, decl.as_ref().item_meta().name.clone());
+        self.ctx.translated.item_names.insert(new_id, decl.as_ref().item_meta().name.clone());
         if let (ItemId::TraitDecl(orig_trait_id), ItemId::TraitDecl(new_trait_id)) =
             (*orig_id, new_id)
         {
             let names = self.ctx.translated.assoc_item_names[orig_trait_id].clone();
-            self.ctx
-                .translated
-                .assoc_item_names
-                .insert(new_trait_id, names);
+            self.ctx.translated.assoc_item_names.insert(new_trait_id, names);
         }
 
         decl

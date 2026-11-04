@@ -84,7 +84,8 @@ where
             Some(owned.functions[at].1)
         }
         Target::Static { item, instance } => {
-            let at = owned.statics.binary_search_by(|it| (it.0, it.1).cmp(&(*item, *instance))).ok()?;
+            let at =
+                owned.statics.binary_search_by(|it| (it.0, it.1).cmp(&(*item, *instance))).ok()?;
             Some(owned.statics[at].2)
         }
         Target::Data(_)
@@ -97,16 +98,22 @@ where
     };
     // clone: the columns' iterators, a few pointers each; a refusal reads them again
     let (dependency_functions, dependency_statics) = (functions.clone(), statics.clone());
-    let checked: Vec<Checked<'a>> = (dependency_functions.filter(|it| it.owner == Owner::Dependency))
-        .map(|it| Checked { unit: it.key, item: it.item, refs: it.refs, named: Named::Function(it.name, it.origin) })
-        .chain(dependency_statics.filter(|it| it.owner == Owner::Dependency).map(|it| Checked {
-            unit: it.unit,
-            item: it.id.0,
-            refs: it.refs,
-            named: Named::Static(it.symbol, it.origin),
-        }))
-        // alloc: per build, the dependency's code, a few words each
-        .collect();
+    let checked: Vec<Checked<'a>> = (dependency_functions
+        .filter(|it| it.owner == Owner::Dependency))
+    .map(|it| Checked {
+        unit: it.key,
+        item: it.item,
+        refs: it.refs,
+        named: Named::Function(it.name, it.origin),
+    })
+    .chain(dependency_statics.filter(|it| it.owner == Owner::Dependency).map(|it| Checked {
+        unit: it.unit,
+        item: it.id.0,
+        refs: it.refs,
+        named: Named::Static(it.symbol, it.origin),
+    }))
+    // alloc: per build, the dependency's code, a few words each
+    .collect();
     // alloc: the refusals, none for a build that has none
     let found: Vec<(&Checked<'a>, &Target)> = par::filter_map(&checked, |it| {
         Some((it, it.refs.iter().find(|target| owner_of(*target) == Some(Owner::Workspace))?))
@@ -119,7 +126,10 @@ where
             }
             Target::Static { item, instance } => {
                 // clone: an iterator over the build's columns, on an error
-                statics.clone().find(|s| s.id == (*item, *instance)).map(|s| Named::Static(s.symbol, s.origin))
+                statics
+                    .clone()
+                    .find(|s| s.id == (*item, *instance))
+                    .map(|s| Named::Static(s.symbol, s.origin))
             }
             _ => None,
         };

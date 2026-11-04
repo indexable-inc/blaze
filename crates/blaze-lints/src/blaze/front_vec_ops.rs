@@ -15,7 +15,9 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 
-use super::{Finding, Lint, alloc::written_callee, exempt, facts, hash_order_output::local_of, loops};
+use super::{
+    Finding, Lint, alloc::written_callee, exempt, facts, hash_order_output::local_of, loops,
+};
 use crate::check::Cx;
 
 const LINT: Lint = Lint::FrontVecOps;
@@ -48,7 +50,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let db = cx.db();
     let body = analysis.body();
     let infer = analysis.infer();
-    let Some(vec) = cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern("Vec")) else { return found };
+    let Some(vec) = cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern("Vec")) else {
+        return found;
+    };
     let mut parents = None;
     for (id, expr) in body.exprs() {
         let Expr::MethodCall { receiver, args, .. } = expr else { continue };
@@ -88,7 +92,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             true => ", and the loop also pushes to it: it is used as a queue",
             false => "",
         };
-        let message = format!("{op} on a `Vec` inside a loop shifts every other element each time{queue}");
+        let message =
+            format!("{op} on a `Vec` inside a loop shifts every other element each time{queue}");
         let note = "a loop of these is quadratic in the length; `std::collections::VecDeque` takes from and adds at \
                     either end in constant time (`pop_front`, `push_front`, `push_back`)"
             .to_owned(); // alloc: a message's part
@@ -102,7 +107,9 @@ fn peel(body: &Body, expr: ExprId) -> ExprId {
     let mut at = expr;
     for _ in 0..8 {
         match body.expr(at) {
-            Expr::Ref { expr, .. } | Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Deref } => at = expr,
+            Expr::Ref { expr, .. } | Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Deref } => {
+                at = expr
+            }
             _ => break,
         }
     }

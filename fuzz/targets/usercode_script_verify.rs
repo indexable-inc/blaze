@@ -88,13 +88,23 @@ fn seeds() -> Vec<Vec<u8>> {
         elide(&root, &files).expect("a script of the forms elision reads")
     };
     let outputs = [
-        elided("fn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n    println!(\"cargo:rustc-cfg=foo\");\n}\n"),
+        elided(
+            "fn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n    println!(\"cargo:rustc-cfg=foo\");\n}\n",
+        ),
         elided("fn main() { print!(\"cargo:a=1\\ncargo:b=é\\ncargo:c=\"); print!(\"3\\n\"); }"),
         b"cargo:a=1\ncargo:b=2\n".to_vec(),
     ];
     let mut seeds = Vec::new();
     for output in &outputs {
-        for (op, at, value) in [(0, 0, 0), (1, 13, b'3'), (2, 5, b'\n'), (3, 10, 0), (4, 12, 0), (5, 10, 0), (6, 0, b'x')] {
+        for (op, at, value) in [
+            (0, 0, 0),
+            (1, 13, b'3'),
+            (2, 5, b'\n'),
+            (3, 10, 0),
+            (4, 12, 0),
+            (5, 10, 0),
+            (6, 0, b'x'),
+        ] {
             seeds.push([&[op, at, 0, value][..], &output[..]].concat());
         }
     }

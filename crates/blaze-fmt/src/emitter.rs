@@ -7,8 +7,8 @@ pub(crate) use self::files_with_backup::*;
 pub(crate) use self::json::*;
 pub(crate) use self::modified_lines::*;
 pub(crate) use self::stdout::*;
-use crate::config::{Config, EmitMode};
 use crate::FileName;
+use crate::config::{Config, EmitMode};
 use std::io::{self, Write};
 use std::path::Path;
 

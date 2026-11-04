@@ -14,8 +14,8 @@ use la_arena::RawIdx;
 
 use hir_ty::mir::{
     AggregateKind, AsmOperand, BasicBlock, BasicBlockId, BorrowKind, LocalId, MirBody, MirSpan,
-    Operand, OperandKind, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind,
-    StoredPlace, Terminator, TerminatorKind,
+    Operand, OperandKind, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace,
+    Terminator, TerminatorKind,
 };
 
 use crate::{
@@ -376,8 +376,11 @@ impl<'f> Decoder<'_, 'f, '_> {
             if self.places[at].local == NONE {
                 let start = self.elems.len() as u32;
                 self.elems.extend_from_slice(projection);
-                self.places[at] =
-                    Interned { local: raw(place.local) as u32, start, end: self.elems.len() as u32 };
+                self.places[at] = Interned {
+                    local: raw(place.local) as u32,
+                    start,
+                    end: self.elems.len() as u32,
+                };
             }
         }
         id

@@ -65,7 +65,13 @@ impl Case {
         let home = self.root.join("home2");
         fs::create_dir_all(&home).unwrap();
         // clone: the case's paths, shared by the second home
-        Case { root: self.root.clone(), dir: self.dir.clone(), home, cache: self.cache.clone(), owns_root: false }
+        Case {
+            root: self.root.clone(),
+            dir: self.dir.clone(),
+            home,
+            cache: self.cache.clone(),
+            owns_root: false,
+        }
     }
 
     fn write(&self, path: &str, text: &str) {
@@ -107,7 +113,10 @@ impl Case {
                     stderr.join().unwrap()
                 );
             }
-            #[allow(clippy::disallowed_methods, reason = "std has no timed wait on a child, and a daemon it starts may hold its pipes open past its exit")]
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "std has no timed wait on a child, and a daemon it starts may hold its pipes open past its exit"
+            )]
             thread::sleep(Duration::from_millis(50));
         };
         Out { ok: status.success(), stdout: stdout.join().unwrap(), stderr: stderr.join().unwrap() }
@@ -139,7 +148,9 @@ impl Case {
     /// The daemon `home`'s log last says is listening, killed: one a test left hung or broken.
     fn kill_daemon(&self) {
         let Ok(log) = fs::read_to_string(self.home.join("v2/serve.log")) else { return };
-        let Some(pid) = log.rsplit("(pid ").next().and_then(|it| it.split(')').next()) else { return };
+        let Some(pid) = log.rsplit("(pid ").next().and_then(|it| it.split(')').next()) else {
+            return;
+        };
         if pid.bytes().all(|b| b.is_ascii_digit()) && !pid.is_empty() {
             let _ = Command::new("kill").args(["-KILL", pid]).status();
         }
@@ -241,8 +252,11 @@ fn a_second_home_on_one_machine_compiles_no_std_crate() {
 
 /// `out`'s `Compiling` lines are `package`'s alone: no std crate, vendored ones included.
 fn compiled_only(out: &Out, package: &str, who: &str) {
-    let compiled: Vec<&str> =
-        out.stderr.lines().filter_map(|line| line.trim_start().strip_prefix("Compiling ")).collect();
+    let compiled: Vec<&str> = out
+        .stderr
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("Compiling "))
+        .collect();
     assert!(
         compiled.len() == 1 && compiled[0].starts_with(&format!("{package} ")),
         "{who} compiled more than {package}:\n{}",
@@ -259,7 +273,11 @@ fn holds_no_std(case: &Case, sub: &str) {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|name| name.starts_with("libcore-"))
         .collect();
-    assert!(core.is_empty(), "std's outputs are the daemon's, yet {} holds {core:?}", deps.display());
+    assert!(
+        core.is_empty(),
+        "std's outputs are the daemon's, yet {} holds {core:?}",
+        deps.display()
+    );
 }
 
 /// A registry crate's build script (zmij 1.0.21's) was run before its link wrote it: `could not
@@ -358,7 +376,11 @@ fn a_cfg_its_build_script_declares_is_expected() {
     let case = Case::new("a_cfg_its_build_script_declares_is_expected");
     let out = case.ok_in("", &["run"]);
     assert_eq!(out.stdout, "declared\n");
-    assert!(!out.stderr.contains("unexpected `cfg`"), "a cfg the build script declares warned:\n{}", out.stderr);
+    assert!(
+        !out.stderr.contains("unexpected `cfg`"),
+        "a cfg the build script declares warned:\n{}",
+        out.stderr
+    );
 }
 
 /// `str::split_ascii_whitespace` (cc's build-time flag parsing, so every build script using cc):
@@ -547,7 +569,11 @@ fn a_serde_attribute_blaze_serde_derive_lacks_is_an_error_naming_it() {
     let out = case.blaze_in("", &["build"]);
     assert!(!out.ok, "a derive with an attribute it does not read built:\n{}", out.stderr);
     let said = "`#[serde(rename = \"other\")]` on the container `Renamed` (";
-    assert!(out.stderr.contains(said), "the error does not name the attribute and item:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains(said),
+        "the error does not name the attribute and item:\n{}",
+        out.stderr
+    );
     assert!(out.stderr.contains("main.rs:2:"), "the error does not say where:\n{}", out.stderr);
 }
 
@@ -607,12 +633,20 @@ fn generated_test_finds_planted_bug() {
     let out = case.blaze_in("", &["test"]);
     let said = format!("{}{}", out.stdout, out.stderr);
     assert!(!out.ok, "the planted bug was not found:\n{said}");
-    assert!(said.contains("test double_contract ... FAILED"), "`double`'s test did not fail:\n{said}");
+    assert!(
+        said.contains("test double_contract ... FAILED"),
+        "`double`'s test did not fail:\n{said}"
+    );
     assert!(said.contains("test count_contract ... ok"), "`count`'s test did not pass:\n{said}");
     assert!(!said.contains("halve_contract"), "`skip` generated a test:\n{said}");
     let named = "`#[blaze::contract_test]` on `double`: `ensures r > x` does not hold";
     assert!(said.contains(named), "the failure does not name the function and clause:\n{said}");
-    for line in ["fn double_contract_case() {", "    let x: u32 = 0;", "    let r = double(x.clone());", "    assert!(r > x);"] {
+    for line in [
+        "fn double_contract_case() {",
+        "    let x: u32 = 0;",
+        "    let r = double(x.clone());",
+        "    assert!(r > x);",
+    ] {
         assert!(said.contains(line), "the case to paste lacks `{line}`:\n{said}");
     }
 }

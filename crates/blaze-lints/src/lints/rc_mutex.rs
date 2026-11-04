@@ -41,7 +41,8 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, path: ast::PathType<'t>, outer: Std
     }
     let Some(range) = cx.range(path.syntax()) else { return std };
     let span = cx.span(range);
-    let message = format!("`{}` locks a `{lock}` an `Rc` keeps on one thread", path.syntax().text());
+    let message =
+        format!("`{}` locks a `{lock}` an `Rc` keeps on one thread", path.syntax().text());
     cx.lint(LINT, path.syntax(), span, message)
         .help("on one thread, `Rc<RefCell<_>>`; shared across threads, `Arc<Mutex<_>>`");
     std

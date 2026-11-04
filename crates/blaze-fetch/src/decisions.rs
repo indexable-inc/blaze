@@ -23,7 +23,11 @@ pub struct Policy {
 impl Default for Policy {
     /// Four tries, half a second, then one, then two: cargo's `net.retry` of 3 in count.
     fn default() -> Policy {
-        Policy { tries: 4, first_wait: Duration::from_millis(500), most_wait: Duration::from_secs(10) }
+        Policy {
+            tries: 4,
+            first_wait: Duration::from_millis(500),
+            most_wait: Duration::from_secs(10),
+        }
     }
 }
 
@@ -77,7 +81,14 @@ pub struct Attempts {
 
 impl Attempts {
     pub fn new(policy: Policy) -> Attempts {
-        Attempts { policy, now: Duration::ZERO, tried: 0, wait_until: None, last: None, asked: false }
+        Attempts {
+            policy,
+            now: Duration::ZERO,
+            tried: 0,
+            wait_until: None,
+            last: None,
+            asked: false,
+        }
     }
 
     pub fn advance_clock(&mut self, now: Duration) {
@@ -127,7 +138,10 @@ pub enum Verdict {
     Matches,
     /// `actual` is in the pin's algorithm, to be printed so it can be pasted, as Nix prints
     /// `got:` under `specified:`.
-    Mismatch { expected: Digest, actual: Digest },
+    Mismatch {
+        expected: Digest,
+        actual: Digest,
+    },
 }
 
 pub fn verdict(expected: &Digest, got: &Hashed) -> Verdict {

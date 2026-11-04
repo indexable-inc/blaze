@@ -1,10 +1,9 @@
 //! Defining `SolverContext` for next-trait-solver.
 
-use std::{fmt::Debug, mem, ops::ControlFlow};
 use blaze_hash::hash_map::Entry;
+use std::{fmt::Debug, mem, ops::ControlFlow};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{
     AssocItemId,
     nameres::implements,
@@ -25,6 +24,7 @@ use rustc_type_ir::{
     transmute::Answer,
 };
 use smallvec::smallvec;
+use std::alloc::Global;
 use tracing::debug;
 
 use crate::{
@@ -124,8 +124,9 @@ impl<'db> SolverContext<'db> {
                             }
                         }
                         Some(SolverTraitLangItem::Copy | SolverTraitLangItem::Clone) => {
-                            let self_ty = self
-                                .deeply_resolve_ignoring_regions(trait_pred.self_ty().skip_binder());
+                            let self_ty = self.deeply_resolve_ignoring_regions(
+                                trait_pred.self_ty().skip_binder(),
+                            );
                             // Unlike `Sized` traits, which always prefer the built-in impl,
                             // `Copy`/`Clone` may be shadowed by a param-env candidate which
                             // could force a lifetime error or guide inference. While that's
@@ -748,8 +749,8 @@ impl<'db> SolverDelegate for SolverContext<'db> {
             predicates: Vec::new(), // alloc: overflow report, error path
             recursion_limit: self.interner.recursion_limit().min(16),
         };
-        let _ = self
-            .with_disabled_next_solver_overflow_fcw(|| self.visit_proof_tree(goal, &mut chain));
+        let _ =
+            self.with_disabled_next_solver_overflow_fcw(|| self.visit_proof_tree(goal, &mut chain));
         self.push_next_solver_overflow(NextSolverOverflow {
             goal: goal.predicate,
             span,
@@ -817,7 +818,8 @@ impl<'db> ProofTreeVisitor<'db> for OverflowedGoalChain<'db> {
 const SCANNED: usize = 16;
 
 fn says_nothing(constraint: RegionConstraint<'_>) -> bool {
-    let unknown = |error: Region<'_>, other: Region<'_>| error.is_error() && !other.is_placeholder();
+    let unknown =
+        |error: Region<'_>, other: Region<'_>| error.is_error() && !other.is_placeholder();
     match constraint {
         RegionConstraint::Outlives(outlives) => match outlives.0.as_region() {
             Some(longer) => unknown(longer, outlives.1) || unknown(outlives.1, longer),

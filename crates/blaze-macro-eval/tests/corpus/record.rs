@@ -12,7 +12,9 @@ use std::{
 };
 
 use base_db::{ContentId, Crate, Db, Env};
-use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
+use hir_expand::proc_macro::{
+    Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
+};
 use parking_lot::Mutex;
 use span::Span;
 use tt::TopSubtree;
@@ -24,9 +26,9 @@ pub(crate) enum Outcome {
 }
 
 impl Outcome {
-    fn of(result: &Result<TopSubtree, ProcMacroExpansionError>) -> Outcome {
+    fn of(result: &Result<Expanded, ProcMacroExpansionError>) -> Outcome {
         match result {
-            Ok(tree) => Outcome::Expanded(tree.copy()),
+            Ok(expanded) => Outcome::Expanded(expanded.tree.copy()),
             Err(ProcMacroExpansionError::Panic(message)) => Outcome::Panicked(message.clone()),
             Err(ProcMacroExpansionError::System(why)) => Outcome::Failed(why.clone()),
         }
@@ -71,14 +73,16 @@ impl Call {
     /// What the call is about: the name of the item a derive or an attribute is on, the first
     /// identifier a function-like macro is given.
     pub(crate) fn subject(&self) -> Option<String> {
-        let mut idents = self.subtree.as_token_trees().iter_flat_tokens().filter_map(|it| match it {
-            tt::TokenTree::Leaf(tt::Leaf::Ident(ident)) => Some(ident.sym.as_str().to_owned()),
-            _ => None,
-        });
+        let mut idents =
+            self.subtree.as_token_trees().iter_flat_tokens().filter_map(|it| match it {
+                tt::TokenTree::Leaf(tt::Leaf::Ident(ident)) => Some(ident.sym.as_str().to_owned()),
+                _ => None,
+            });
         if self.kind == ProcMacroKind::Bang {
             return idents.next();
         }
-        let item = |it: &str| matches!(it, "struct" | "enum" | "union" | "fn" | "trait" | "type" | "mod");
+        let item =
+            |it: &str| matches!(it, "struct" | "enum" | "union" | "fn" | "trait" | "type" | "mod");
         idents.by_ref().find(|it| item(it))?;
         idents.next()
     }
@@ -154,7 +158,12 @@ impl Recorder {
     }
 
     /// [`Recorder::wrap`], its calls run ahead or not as `ahead` says.
-    pub(crate) fn wrap_ahead(krate: &str, eval: ProcMacro, records: &Records, ahead: Ahead) -> ProcMacro {
+    pub(crate) fn wrap_ahead(
+        krate: &str,
+        eval: ProcMacro,
+        records: &Records,
+        ahead: Ahead,
+    ) -> ProcMacro {
         let ProcMacro { name, kind, expander, disabled } = eval;
         let recorder = Recorder {
             krate: krate.into(),
@@ -167,7 +176,12 @@ impl Recorder {
         ProcMacro { name, kind, expander: Arc::new(recorder), disabled }
     }
 
-    fn run(&self, db: &Db, calling: Option<Crate>, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+    fn run(
+        &self,
+        db: &Db,
+        calling: Option<Crate>,
+        call: ProcMacroCall<'_>,
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let start = Instant::now();
         let expanded = match calling {
             Some(krate) => self.eval.expand_in(db, krate, call),
@@ -195,7 +209,11 @@ impl Recorder {
 
 impl fmt::Debug for Recorder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Recorder").field("krate", &self.krate).field("name", &self.name).field("eval", &self.eval).finish()
+        f.debug_struct("Recorder")
+            .field("krate", &self.krate)
+            .field("name", &self.name)
+            .field("eval", &self.eval)
+            .finish()
     }
 }
 
@@ -223,19 +241,29 @@ impl ProcMacroExpander for Recorder {
         self.eval.code()
     }
 
-    fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+    fn expand(
+        &self,
+        db: &Db,
+        call: ProcMacroCall<'_>,
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         self.run(db, None, call)
     }
 
-    fn expand_in(&self, db: &Db, calling_crate: Crate, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+    fn expand_in(
+        &self,
+        db: &Db,
+        calling_crate: Crate,
+        call: ProcMacroCall<'_>,
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         self.run(db, Some(calling_crate), call)
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
-        (other as &dyn Any)
-            .downcast_ref::<Recorder>()
-            .is_some_and(|other| {
-                Arc::ptr_eq(&self.records, &other.records) && self.krate == other.krate && self.name == other.name && self.kind == other.kind
-            })
+        (other as &dyn Any).downcast_ref::<Recorder>().is_some_and(|other| {
+            Arc::ptr_eq(&self.records, &other.records)
+                && self.krate == other.krate
+                && self.name == other.name
+                && self.kind == other.kind
+        })
     }
 }

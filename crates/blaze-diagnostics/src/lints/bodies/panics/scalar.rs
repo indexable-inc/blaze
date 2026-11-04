@@ -20,7 +20,10 @@ use rustc_type_ir::FloatTy;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
     /// `isize` and `usize` are `pointer_sized`.
-    Int { signed: bool, pointer_sized: bool },
+    Int {
+        signed: bool,
+        pointer_sized: bool,
+    },
     Bool,
     Char,
     Float(FloatTy),
@@ -95,7 +98,9 @@ fn signed_max(size: u8) -> i128 {
 /// operation on operands it does not take).
 pub(super) fn binary_op(op: &BinOp, l: Scalar, r: Scalar) -> Option<Output> {
     match l.kind {
-        Kind::Char if r.kind == Kind::Char => Some(Output::One(Scalar::from_bool(compare(op, l.bits.cmp(&r.bits))?))),
+        Kind::Char if r.kind == Kind::Char => {
+            Some(Output::One(Scalar::from_bool(compare(op, l.bits.cmp(&r.bits))?)))
+        }
         Kind::Bool if r.kind == Kind::Bool => bool_op(op, l, r),
         Kind::Float(ty) if r.kind == l.kind => float_op(op, ty, l, r),
         Kind::Int { .. } => int_op(op, l, r),
@@ -187,7 +192,8 @@ fn int_op(op: &BinOp, l: Scalar, r: Scalar) -> Option<Output> {
     if r.kind != l.kind || r.size != l.size {
         return None;
     }
-    let with_overflow = matches!(op, BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow);
+    let with_overflow =
+        matches!(op, BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow);
     let output = |value: Scalar, overflowed: bool| match with_overflow {
         true => Output::Pair(value, overflowed),
         false => Output::One(value),
@@ -240,8 +246,12 @@ fn int_op(op: &BinOp, l: Scalar, r: Scalar) -> Option<Output> {
 pub(super) fn unary_op(op: UnOp, value: Scalar) -> Option<Scalar> {
     match (value.kind, op) {
         (Kind::Bool, UnOp::Not) => Some(Scalar::from_bool(value.bits == 0)),
-        (Kind::Float(_), UnOp::Neg) => Some(value.with(value.bits ^ (1 << (u32::from(value.size) * 8 - 1)))),
-        (Kind::Int { signed: true, .. }, UnOp::Neg) => Some(value.with(value.int().wrapping_neg() as u128)),
+        (Kind::Float(_), UnOp::Neg) => {
+            Some(value.with(value.bits ^ (1 << (u32::from(value.size) * 8 - 1))))
+        }
+        (Kind::Int { signed: true, .. }, UnOp::Neg) => {
+            Some(value.with(value.int().wrapping_neg() as u128))
+        }
         (Kind::Int { .. }, UnOp::Not) => Some(value.with(!value.bits)),
         _ => None,
     }
@@ -281,7 +291,9 @@ pub(super) fn float_cast(value: Scalar, kind: Kind, size: u8) -> Option<Scalar> 
         _ => return None,
     };
     let bits = match kind {
-        Kind::Int { signed: true, .. } => (float as i128).clamp(signed_min(size), signed_max(size)) as u128,
+        Kind::Int { signed: true, .. } => {
+            (float as i128).clamp(signed_min(size), signed_max(size)) as u128
+        }
         Kind::Int { signed: false, .. } => (float as u128).min(truncate(u128::MAX, size)),
         Kind::Float(FloatTy::F32) => u128::from((float as f32).to_bits()),
         Kind::Float(FloatTy::F64) => u128::from(float.to_bits()),

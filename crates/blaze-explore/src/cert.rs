@@ -92,8 +92,12 @@ pub enum CertError {
 impl std::fmt::Display for CertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CertError::Make(why) => write!(f, "the explorer's certificate could not be made: {why}"),
-            CertError::Take(why) => write!(f, "the explorer's certificate is not one WebTransport takes: {why}"),
+            CertError::Make(why) => {
+                write!(f, "the explorer's certificate could not be made: {why}")
+            }
+            CertError::Take(why) => {
+                write!(f, "the explorer's certificate is not one WebTransport takes: {why}")
+            }
         }
     }
 }
@@ -121,7 +125,8 @@ impl Cert {
     pub fn make(validity: Validity) -> Result<Cert, CertError> {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
         // alloc: once a certificate, every 12 days
-        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned(), "localhost".to_owned()])?;
+        let mut params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned(), "localhost".to_owned()])?;
         let mut name = rcgen::DistinguishedName::new();
         name.push(rcgen::DnType::CommonName, "blaze explore");
         params.distinguished_name = name;
@@ -139,7 +144,8 @@ impl Cert {
     pub fn identity(&self) -> Result<wtransport::Identity, CertError> {
         use wtransport::tls::{Certificate, CertificateChain, PrivateKey};
         // clone: once a certificate, every 12 days
-        let certificate = Certificate::from_der(self.der.clone()).map_err(|why| CertError::Take(why.to_string()))?;
+        let certificate = Certificate::from_der(self.der.clone())
+            .map_err(|why| CertError::Take(why.to_string()))?;
         // clone: as above
         let key = PrivateKey::from_der_pkcs8(self.key_der.clone());
         Ok(wtransport::Identity::new(CertificateChain::single(certificate), key))
@@ -148,7 +154,10 @@ impl Cert {
 
 impl std::fmt::Debug for Cert {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Cert").field("validity", &self.validity).field("hash", &self.hash).finish_non_exhaustive()
+        f.debug_struct("Cert")
+            .field("validity", &self.validity)
+            .field("hash", &self.hash)
+            .finish_non_exhaustive()
     }
 }
 
@@ -180,7 +189,10 @@ mod tests {
             now += step;
             if let Some(validity) = rotation.due(now) {
                 let left = rotation.current().not_after_s.saturating_sub(now);
-                assert!(left >= DAY_S - BACKDATE_S - step, "made anew {left} s before the old one expired");
+                assert!(
+                    left >= DAY_S - BACKDATE_S - step,
+                    "made anew {left} s before the old one expired"
+                );
                 assert!(validity.contains(now));
                 rotation.rotated(validity);
                 made.push(now);
@@ -192,7 +204,10 @@ mod tests {
         assert_eq!(made.len(), 5, "made at the start and on days 12, 24, 36 and 48: {made:?}");
         for pair in made.windows(2) {
             let gap = pair[1] - pair[0];
-            assert!((ROTATE_AFTER_S - BACKDATE_S..ROTATE_AFTER_S - BACKDATE_S + step).contains(&gap), "{gap}");
+            assert!(
+                (ROTATE_AFTER_S - BACKDATE_S..ROTATE_AFTER_S - BACKDATE_S + step).contains(&gap),
+                "{gap}"
+            );
         }
     }
 
@@ -210,7 +225,8 @@ mod tests {
     fn a_clock_that_jumps_is_caught_at_the_next_check() {
         let mut rotation = Rotation::new(T0);
         let woke = T0 + 20 * DAY_S;
-        let validity = rotation.due(woke).expect("a machine that slept 20 days needs a new certificate");
+        let validity =
+            rotation.due(woke).expect("a machine that slept 20 days needs a new certificate");
         rotation.rotated(validity);
         assert!(rotation.current().contains(woke));
         let back = woke - 3600;

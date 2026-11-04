@@ -232,7 +232,9 @@ impl<'a> Header<'a> {
 
     /// Each extern it names and what that is imported as: the name, the module, the field and
     /// the type.
-    pub(super) fn imports(&self) -> impl Iterator<Item = (&'a str, &'a str, &'a str, Sig<'a>)> + 'a {
+    pub(super) fn imports(
+        &self,
+    ) -> impl Iterator<Item = (&'a str, &'a str, &'a str, Sig<'a>)> + 'a {
         let header = &self.code[..self.body as usize];
         let mut r = self.reader(self.imports);
         let count = r.count().expect(CHECKED);
@@ -327,8 +329,7 @@ mod tests {
             };
             let (ty, types) = (encoded(&ty), [encoded(&Signature::default()), encoded(&call)]);
             let types = [types[0].as_slice(), types[1].as_slice()];
-            let parts =
-                Parts { ty: &ty, types: &types, type_fixups: &code.type_fixups, export };
+            let parts = Parts { ty: &ty, types: &types, type_fixups: &code.type_fixups, export };
             assert_eq!(parts.encode(&body), code.encode(&body));
         }
     }

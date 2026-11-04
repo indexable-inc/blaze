@@ -35,14 +35,42 @@ pub static PINNED: [(Script, &str, &[(&str, &str)]); 5] = [
         Script::CompilerBuiltins,
         "compiler_builtins",
         &[
-            ("compiler-builtins/compiler-builtins/build.rs", "979ca625fb14be73bc07c761f21d37c8cd562a077ba5da3aac5165063fc6e189"),
-            ("compiler-builtins/libm/configure.rs", "dd98992599d656cec2ccfc9bcb85116b3eaa698d1109e19b49c89431b4d064c9"),
+            (
+                "compiler-builtins/compiler-builtins/build.rs",
+                "979ca625fb14be73bc07c761f21d37c8cd562a077ba5da3aac5165063fc6e189",
+            ),
+            (
+                "compiler-builtins/libm/configure.rs",
+                "dd98992599d656cec2ccfc9bcb85116b3eaa698d1109e19b49c89431b4d064c9",
+            ),
         ],
     ),
-    (Script::Libc, "libc", &[("vendor/libc-0.2.191/build.rs", "9eb10374afeb9cd3215c832b538db85b93f04b88de43f9e5d193b98da6c81100")]),
-    (Script::Object, "object", &[("vendor/object-0.39.1/build.rs", "4872405dc10050f2ce4c3e81150a88f1e81fa4ff327c2337e80cabf84446000b")]),
-    (Script::Std, "std", &[("std/build.rs", "3be73c2bf16ec86c52fb2d8973c92f1b0ef3c61f9412e8e647f7c71086f00871")]),
-    (Script::Test, "test", &[("test/build.rs", "70ac360f5b21e655e46643be153bc59cc8a89f7fc822683c76badef8545a1fc6")]),
+    (
+        Script::Libc,
+        "libc",
+        &[(
+            "vendor/libc-0.2.191/build.rs",
+            "9eb10374afeb9cd3215c832b538db85b93f04b88de43f9e5d193b98da6c81100",
+        )],
+    ),
+    (
+        Script::Object,
+        "object",
+        &[(
+            "vendor/object-0.39.1/build.rs",
+            "4872405dc10050f2ce4c3e81150a88f1e81fa4ff327c2337e80cabf84446000b",
+        )],
+    ),
+    (
+        Script::Std,
+        "std",
+        &[("std/build.rs", "3be73c2bf16ec86c52fb2d8973c92f1b0ef3c61f9412e8e647f7c71086f00871")],
+    ),
+    (
+        Script::Test,
+        "test",
+        &[("test/build.rs", "70ac360f5b21e655e46643be153bc59cc8a89f7fc822683c76badef8545a1fc6")],
+    ),
 ];
 
 /// The script of std's package `package` whose root file is at `root` (its compile's
@@ -54,23 +82,24 @@ where
     R: FnMut(&str) -> Result<B, String>,
 {
     let Some((script, _, files)) = PINNED.iter().find(|it| it.1 == package) else {
-        return Err(format!( // alloc: error path, the one the build stops with
+        return Err(format!(
+            // alloc: error path, the one the build stops with
             "the standard library's `{package}` has a build script ({root}), and blaze has the output of \
              none of that package's (`PINNED` in crates/blaze-units/src/stdlib/scripts.rs): std's own \
              scripts are never compiled, so each is ported there"
         ));
     };
     let first = files[0].0;
-    let library = root
-        .strip_suffix(first)
-        .filter(|it| it.ends_with('/'))
-        .ok_or_else(|| format!("std's `{package}` build script is {root}, and blaze's port is of library/{first}"))?; // alloc: error path, the one the build stops with
+    let library = root.strip_suffix(first).filter(|it| it.ends_with('/')).ok_or_else(|| {
+        format!("std's `{package}` build script is {root}, and blaze's port is of library/{first}")
+    })?; // alloc: error path, the one the build stops with
     for (path, want) in files.iter() {
         let at = format!("{library}{path}"); // alloc: once per file of a std script, once per build
         let bytes = read(&at)?;
         let got = blaze_format::hex::encode(&blaze_ids::b3::hash(bytes.as_ref()));
         if got != *want {
-            return Err(format!( // alloc: error path, the one the build stops with
+            return Err(format!(
+                // alloc: error path, the one the build stops with
                 "{at} has BLAKE3 hash {got}, and blaze gives the output of std's `{package}` build script \
                  whose library/{path} has {want} (`PINNED` in crates/blaze-units/src/stdlib/scripts.rs): \
                  the nightly bump ports the script again"
@@ -83,7 +112,11 @@ where
 /// What a run of `script` prints to stdout, started in `cwd` (its package's directory, as
 /// cargo starts it) with `vars`, its whole environment sorted by name, each name once
 /// (`blaze_build_script::Env::vars`). Where the script would panic, the error says why.
-pub fn printed(script: Script, vars: &[(OsString, OsString)], cwd: &Path) -> Result<Vec<u8>, String> {
+pub fn printed(
+    script: Script,
+    vars: &[(OsString, OsString)],
+    cwd: &Path,
+) -> Result<Vec<u8>, String> {
     let vars = Vars(vars);
     let mut out = String::with_capacity(4096);
     match script {
@@ -102,11 +135,42 @@ pub fn printed(script: Script, vars: &[(OsString, OsString)], cwd: &Path) -> Res
 pub fn restricted_std(arch: &str, os: &str, vendor: &str, env: &str) -> bool {
     let listed = matches!(
         os,
-        "linux" | "android" | "netbsd" | "dragonfly" | "openbsd" | "freebsd" | "solaris" | "illumos"
-            | "macos" | "ios" | "tvos" | "watchos" | "visionos" | "windows" | "fuchsia" | "motor"
-            | "hermit" | "trusty" | "l4re" | "redox" | "haiku" | "vxworks" | "espidf" | "vita"
-            | "aix" | "nto" | "qnx" | "xous" | "hurd" | "uefi" | "teeos" | "zkvm" | "rtems"
-            | "nuttx" | "cygwin" | "vexos"
+        "linux"
+            | "android"
+            | "netbsd"
+            | "dragonfly"
+            | "openbsd"
+            | "freebsd"
+            | "solaris"
+            | "illumos"
+            | "macos"
+            | "ios"
+            | "tvos"
+            | "watchos"
+            | "visionos"
+            | "windows"
+            | "fuchsia"
+            | "motor"
+            | "hermit"
+            | "trusty"
+            | "l4re"
+            | "redox"
+            | "haiku"
+            | "vxworks"
+            | "espidf"
+            | "vita"
+            | "aix"
+            | "nto"
+            | "qnx"
+            | "xous"
+            | "hurd"
+            | "uefi"
+            | "teeos"
+            | "zkvm"
+            | "rtems"
+            | "nuttx"
+            | "cygwin"
+            | "vexos"
     ) || (vendor == "fortanix" && env == "sgx")
         || matches!(arch, "wasm32" | "wasm64")
         || os.starts_with("solid")
@@ -182,7 +246,8 @@ impl<'a> Vars<'a> {
     /// it, and blaze answers only for its own rustc.
     fn no_wrapper(&self) -> Result<(), String> {
         match self.os("RUSTC_WRAPPER") {
-            Some(it) if !it.is_empty() => Err(format!( // alloc: error path, the one the build stops with
+            Some(it) if !it.is_empty() => Err(format!(
+                // alloc: error path, the one the build stops with
                 "`RUSTC_WRAPPER` is {}, which the script would start, and blaze answers only as its own rustc",
                 it.to_string_lossy()
             )),
@@ -218,7 +283,9 @@ fn port_std(vars: &Vars<'_>, out: &mut String) -> Result<(), String> {
     }
     say!(out, "cargo::rustc-check-cfg=cfg(no_global_oom_handling)");
     say!(out, "cargo:rustc-check-cfg=cfg(restricted_std)");
-    if restricted_std(arch, os, vendor, env) && !vars.var("RUSTC_BOOTSTRAP_SYNTHETIC_TARGET").is_ok() {
+    if restricted_std(arch, os, vendor, env)
+        && !vars.var("RUSTC_BOOTSTRAP_SYNTHETIC_TARGET").is_ok()
+    {
         say!(out, "cargo:rustc-cfg=restricted_std");
     }
     say!(out, "cargo:rustc-check-cfg=cfg(backtrace_in_libstd)");
@@ -320,7 +387,10 @@ fn port_compiler_builtins(vars: &Vars<'_>, cwd: &Path, out: &mut String) -> Resu
     let mut cargo_features = Vec::new(); // alloc: once per std script run: the script's own list
     for (name, value) in vars.0 {
         let (Some(name), Some(_)) = (name.to_str(), value.to_str()) else {
-            return Err(format!("the variable `{}` is not unicode, and the script reads `env::vars()`", name.to_string_lossy())); // alloc: error path, the one the build stops with
+            return Err(format!(
+                "the variable `{}` is not unicode, and the script reads `env::vars()`",
+                name.to_string_lossy()
+            )); // alloc: error path, the one the build stops with
         };
         if let Some(feature) = name.strip_prefix("CARGO_FEATURE_") {
             cargo_features.push(feature.to_lowercase().replace('_', "-"));
@@ -351,7 +421,8 @@ fn port_compiler_builtins(vars: &Vars<'_>, cwd: &Path, out: &mut String) -> Resu
     // `configure::emit`.
     let opt = !matches!(opt_level, "0" | "1");
     let thumb = split[0].starts_with("thumb");
-    let thumb1_only = matches!(split[0], "thumbv4t" | "thumbv5te" | "thumbv6" | "thumbv6m" | "thumbv8m.base");
+    let thumb1_only =
+        matches!(split[0], "thumbv4t" | "thumbv5te" | "thumbv6" | "thumbv6m" | "thumbv8m.base");
     let eabihf = abi == Some("eabihf");
     let x86_no_sse2 = arch == "x86" && !features.contains(&"sse2");
     let assert_no_panic = vars.flag("ENSURE_NO_PANIC")?;
@@ -363,7 +434,8 @@ fn port_compiler_builtins(vars: &Vars<'_>, cwd: &Path, out: &mut String) -> Resu
             (false, false) => true,
         };
         if !holds {
-            return Err(format!( // alloc: error path, the one the build stops with
+            return Err(format!(
+                // alloc: error path, the one the build stops with
                 "the target features of `{triple}` ({features:?}) are not its thumb mode's, which the script asserts"
             ));
         }
@@ -390,7 +462,10 @@ fn port_compiler_builtins(vars: &Vars<'_>, cwd: &Path, out: &mut String) -> Resu
         };
         for size in sizes {
             for ordering in ["relax", "acq", "rel", "acq_rel"] {
-                say!(out, "cargo::rustc-check-cfg=cfg(__aarch64_{op}{size}_{ordering}, values(\"optimized-c\"))");
+                say!(
+                    out,
+                    "cargo::rustc-check-cfg=cfg(__aarch64_{op}{size}_{ordering}, values(\"optimized-c\"))"
+                );
             }
         }
     }
@@ -406,9 +481,13 @@ fn port_compiler_builtins(vars: &Vars<'_>, cwd: &Path, out: &mut String) -> Resu
     {
         say!(out, "cargo:rustc-cfg=feature=\"mem\"");
     }
-    let mem_unaligned = arch.contains("x86_64") || arch.contains("x86") || arch.contains("aarch64") || arch.contains("bpf");
+    let mem_unaligned = arch.contains("x86_64")
+        || arch.contains("x86")
+        || arch.contains("aarch64")
+        || arch.contains("bpf");
     set_cfg(out, verbose, "mem_unaligned", mem_unaligned);
-    let kernel_user_helpers = split[0] == "armv4t" || split[0] == "armv5te" || triple == "arm-linux-androideabi";
+    let kernel_user_helpers =
+        split[0] == "armv4t" || split[0] == "armv5te" || triple == "arm-linux-androideabi";
     set_cfg(out, verbose, "kernel_user_helpers", kernel_user_helpers);
     let mut maybe_build_c = os != "emscripten";
     if os == "openbsd" {
@@ -517,7 +596,13 @@ const ALLOWED_CFGS: [Cfg; 23] = [
 
 /// libc's `CHECK_CFG_EXTRA`.
 const CHECK_CFG_EXTRA: [(&str, &[&str]); 3] = [
-    ("target_os", &["switch", "aix", "ohos", "hurd", "rtems", "visionos", "nuttx", "cygwin", "qurt", "qnx", "helenos"]),
+    (
+        "target_os",
+        &[
+            "switch", "aix", "ohos", "hurd", "rtems", "visionos", "nuttx", "cygwin", "qurt", "qnx",
+            "helenos",
+        ],
+    ),
     ("target_env", &["illumos", "wasi", "aix", "ohos", "nto71_iosock"]),
     ("target_arch", &["loongarch64", "mips32r6", "mips64r6", "csky"]),
 ];
@@ -576,17 +661,18 @@ fn port_libc(vars: &Vars<'_>, out: &mut String) -> Result<(), String> {
     }
 
     if target_os == "freebsd" {
-        let which: i32 = if let Var::Set(version) = vars.var("CARGO_CFG_LIBC_UNSTABLE_FREEBSD_VERSION") {
-            let version: i32 = version
+        let which: i32 =
+            if let Var::Set(version) = vars.var("CARGO_CFG_LIBC_UNSTABLE_FREEBSD_VERSION") {
+                let version: i32 = version
                 .parse()
                 .map_err(|_| format!("`CARGO_CFG_LIBC_UNSTABLE_FREEBSD_VERSION` is {version}, which the script unwraps as a number"))?; // alloc: error path, the one the build stops with
-            say!(out, "cargo:warning=setting FreeBSD version to {version}");
-            version
-        } else if libc_ci {
-            return Err("under `LIBC_CI` the script starts `freebsd-version`, which blaze has no answer of".to_owned()); // alloc: error path, the one the build stops with
-        } else {
-            12
-        };
+                say!(out, "cargo:warning=setting FreeBSD version to {version}");
+                version
+            } else if libc_ci {
+                return Err("under `LIBC_CI` the script starts `freebsd-version`, which blaze has no answer of".to_owned()); // alloc: error path, the one the build stops with
+            } else {
+                12
+            };
         cfgs.push(match which {
             x if x < 10 => return Err("FreeBSD older than 10 is not supported".to_owned()), // alloc: error path, the one the build stops with
             10 => Cfg::Freebsd10,
@@ -599,7 +685,10 @@ fn port_libc(vars: &Vars<'_>, out: &mut String) -> Result<(), String> {
     }
 
     if target_os == "emscripten" {
-        return Err("for emscripten the script starts `emcc -dumpversion`, which blaze has no answer of".to_owned()); // alloc: error path, the one the build stops with
+        return Err(
+            "for emscripten the script starts `emcc -dumpversion`, which blaze has no answer of"
+                .to_owned(),
+        ); // alloc: error path, the one the build stops with
     }
 
     if target_os == "vxworks" && vxworks_version(vars).is_some_and(|it| it < (25, 9)) {
@@ -655,16 +744,23 @@ fn port_libc(vars: &Vars<'_>, out: &mut String) -> Result<(), String> {
     if vars.var("RUST_LIBC_UNSTABLE_GNU_FILE_OFFSET_BITS").is_ok()
         || vars.var("CARGO_CFG_LIBC_UNSTABLE_GNU_FILE_OFFSET_BITS").is_ok()
     {
-        say!(out, "cargo:warning=glibc file offset can no longer be set independently of `gnu_time_bits`");
+        say!(
+            out,
+            "cargo:warning=glibc file offset can no longer be set independently of `gnu_time_bits`"
+        );
     }
     let gnu32_timebits = match gnu_time_bits {
         None => "32",
         Some(bits @ ("64" | "32")) => bits,
-        Some(_) => return Err("Invalid value for libc_unstable_gnu_time_bits. Must be 32, 64, or unset.".to_owned()), // alloc: error path, the one the build stops with
+        Some(_) => {
+            return Err("Invalid value for libc_unstable_gnu_time_bits. Must be 32, 64, or unset."
+                .to_owned());
+        } // alloc: error path, the one the build stops with
     };
 
-    let gnu32_already_time64 =
-        target_arch == "riscv32" || target_arch == "x86_64" || !matches!(target_os, "linux" | "windows" | "hurd");
+    let gnu32_already_time64 = target_arch == "riscv32"
+        || target_arch == "x86_64"
+        || !matches!(target_os, "linux" | "windows" | "hurd");
     let gnu = target_env == "gnu";
     let gnu32_time64 = gnu && ptr_width == "32" && (gnu32_timebits == "64" || time64);
     if gnu32_time64 && !gnu32_already_time64 {
@@ -715,25 +811,41 @@ fn port_libc(vars: &Vars<'_>, out: &mut String) -> Result<(), String> {
 fn libc_valid(list: &[Cfg], env: &str, os: &str, ptr_width: &str) -> Result<(), String> {
     for cfg in list {
         let holds = match cfg {
-            Cfg::LibcDenyWarnings | Cfg::LibcElfv2 | Cfg::LibcPauthtest | Cfg::EspidfPicolibc | Cfg::EspidfTime32 => true,
-            Cfg::EmscriptenOldStatAbi | Cfg::EmscriptenFsblkcntIs32bit | Cfg::EmscriptenSigsetLarge | Cfg::EmscriptenNfdsIsULong => {
-                os == "emscripten"
-            }
-            Cfg::Freebsd10 | Cfg::Freebsd11 | Cfg::Freebsd12 | Cfg::Freebsd13 | Cfg::Freebsd14 | Cfg::Freebsd15 => os == "freebsd",
+            Cfg::LibcDenyWarnings
+            | Cfg::LibcElfv2
+            | Cfg::LibcPauthtest
+            | Cfg::EspidfPicolibc
+            | Cfg::EspidfTime32 => true,
+            Cfg::EmscriptenOldStatAbi
+            | Cfg::EmscriptenFsblkcntIs32bit
+            | Cfg::EmscriptenSigsetLarge
+            | Cfg::EmscriptenNfdsIsULong => os == "emscripten",
+            Cfg::Freebsd10
+            | Cfg::Freebsd11
+            | Cfg::Freebsd12
+            | Cfg::Freebsd13
+            | Cfg::Freebsd14
+            | Cfg::Freebsd15 => os == "freebsd",
             Cfg::VxworksLt25_09 => os == "vxworks",
             Cfg::GnuFileOffsetBits64 => env == "gnu" && ptr_width == "32",
-            Cfg::GnuTimeBits64 => env == "gnu" && ptr_width == "32" && list.contains(&Cfg::GnuFileOffsetBits64),
+            Cfg::GnuTimeBits64 => {
+                env == "gnu" && ptr_width == "32" && list.contains(&Cfg::GnuFileOffsetBits64)
+            }
             Cfg::LinuxTimeBits64 => os == "linux",
             Cfg::MuslV1_2 => matches!(env, "musl" | "ohos"),
             Cfg::Musl32Time64 | Cfg::MuslRedirTime64 => {
                 matches!(env, "musl" | "ohos") && ptr_width == "32" && list.contains(&Cfg::MuslV1_2)
             }
             Cfg::Uclibc32Time64 => {
-                env == "uclibc" && ptr_width == "32" && (os != "linux" || list.contains(&Cfg::LinuxTimeBits64))
+                env == "uclibc"
+                    && ptr_width == "32"
+                    && (os != "linux" || list.contains(&Cfg::LinuxTimeBits64))
             }
         };
         if !holds {
-            return Err(format!("{cfg:?} set on target_os {os:?}, target_env {env:?}, pointer width {ptr_width:?}")); // alloc: error path, the one the build stops with
+            return Err(format!(
+                "{cfg:?} set on target_os {os:?}, target_env {env:?}, pointer width {ptr_width:?}"
+            )); // alloc: error path, the one the build stops with
         }
     }
     Ok(())

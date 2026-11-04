@@ -6,6 +6,7 @@
 
 use std::{cell::RefCell, io::Write as _, ops::Range};
 
+use crate::VfsPath;
 use blaze_format::cursor::Put;
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{
@@ -13,7 +14,6 @@ use blaze_mem::{
     scratch::{self, Scratch},
 };
 use cfg::{CfgAtom, CfgOptions};
-use crate::VfsPath;
 
 /// A content ID as an input holds it. Only base-db makes one, from the value the input is set
 /// with, so an input's ID and value never disagree.
@@ -96,7 +96,11 @@ thread_local! {
 
 /// `ContentId::of(domain, input)` for each input, in the frame: the domain's key derived once
 /// for all of them, the hasher's buffers and the result's the thread's.
-pub(crate) fn hash_many<'f>(domain: &'static str, inputs: &[&[u8]], frame: &'f Frame) -> &'f [ContentId] {
+pub(crate) fn hash_many<'f>(
+    domain: &'static str,
+    inputs: &[&[u8]],
+    frame: &'f Frame,
+) -> &'f [ContentId] {
     if inputs.is_empty() {
         return &[];
     }
@@ -114,6 +118,7 @@ pub(crate) fn hash_ranges<'f>(
     ranges: &[Range<usize>],
     frame: &'f Frame,
 ) -> &'f [ContentId] {
-    let inputs = frame.alloc_slice_from_iter(ranges.iter().map(|range| &buf[range.start..range.end]));
+    let inputs =
+        frame.alloc_slice_from_iter(ranges.iter().map(|range| &buf[range.start..range.end]));
     hash_many(domain, inputs, frame)
 }

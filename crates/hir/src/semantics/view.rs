@@ -18,14 +18,11 @@ use std::{cell::RefCell, fmt, ptr, sync::Arc};
 
 use base_db::{Db, toolchain_channel};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
-use hir_def::{
-    expr_store::ExprOrPatSource,
-        nameres::ModuleOrigin,
-};
+use hir_def::{expr_store::ExprOrPatSource, nameres::ModuleOrigin};
 use hir_expand::{AstId, EditionedFileId, ExpandResult, HirFileId, MacroCallId};
 use hir_ty::next_solver::AnyImplId;
 use span::FileId;
+use std::alloc::Global;
 use syntax::{
     AstPtr, FlatTree, SyntaxNodePtr,
     view::{self as ast, AstNode as _, Node, Token, Typed},

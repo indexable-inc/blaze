@@ -316,7 +316,9 @@ impl<K: Eq + Hash, V, S: BuildHasher + Default, A: Allocator + Default> FromIter
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher + Default, A: Allocator + Default> FromIterator<T> for Set<T, S, A> {
+impl<T: Eq + Hash, S: BuildHasher + Default, A: Allocator + Default> FromIterator<T>
+    for Set<T, S, A>
+{
     #[inline]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         Set::from_iter_in(iter, A::default())
@@ -394,7 +396,8 @@ where
     A: Allocator + Default,
 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        <hashbrown::HashMap<K, V, S, A> as serde::Deserialize<'de>>::deserialize(deserializer).map(Map)
+        <hashbrown::HashMap<K, V, S, A> as serde::Deserialize<'de>>::deserialize(deserializer)
+            .map(Map)
     }
 }
 

@@ -72,11 +72,8 @@ impl TerminalDef {
     /// its [`placeholder`] marker, above every other terminal in
     /// priority so that the lexers read it as itself wherever it starts.
     pub fn placeholder(name: &str) -> GrammarResult<TerminalDef> {
-        let pattern = Pattern {
-            kind: PatternKind::Str,
-            value: placeholder(name),
-            flags: String::new(),
-        };
+        let pattern =
+            Pattern { kind: PatternKind::Str, value: placeholder(name), flags: String::new() };
         TerminalDef::new(name.to_string(), Some(pattern), i64::MAX)
     }
 
@@ -108,15 +105,7 @@ impl TerminalDef {
             }
             None => (None, None, 0, Some(0)),
         };
-        Ok(TerminalDef {
-            name,
-            pattern,
-            regexp,
-            parsed,
-            priority,
-            min_width,
-            max_width,
-        })
+        Ok(TerminalDef { name, pattern, regexp, parsed, priority, min_width, max_width })
     }
 }
 
@@ -413,10 +402,7 @@ impl Compiler {
             alternatives.push(self.prepare_sequence(name, &alt.items)?);
         }
         let id = self.rule_id(name);
-        self.rules[id] = Some(Rule {
-            name: name.to_string(),
-            alternatives,
-        });
+        self.rules[id] = Some(Rule { name: name.to_string(), alternatives });
         Ok(())
     }
 }
@@ -514,19 +500,14 @@ pub fn compile(built: &BuiltGrammar, start: &[&str]) -> GrammarResult<Grammar> {
         instantiations: 0,
     };
     for (name, body, priority) in &built.term_defs {
-        let pattern = body
-            .as_ref()
-            .map(|body| terminal_pattern(name, body))
-            .transpose()?;
+        let pattern = body.as_ref().map(|body| terminal_pattern(name, body)).transpose()?;
         compiler.add_terminal(name.clone(), pattern, *priority);
     }
     for (name, params, body, _) in &built.rule_defs {
         if params.is_empty() {
             compiler.pending.push((name.clone(), body.clone()));
         } else {
-            compiler
-                .templates
-                .insert(name.clone(), (params.clone(), body.clone()));
+            compiler.templates.insert(name.clone(), (params.clone(), body.clone()));
         }
     }
     let mut next = 0;
@@ -537,9 +518,7 @@ pub fn compile(built: &BuiltGrammar, start: &[&str]) -> GrammarResult<Grammar> {
     }
     for (name, &id) in &compiler.rule_ids {
         if compiler.rules[id].is_none() {
-            return Err(GrammarError::new(format!(
-                "Template '{name}' is used without arguments"
-            )));
+            return Err(GrammarError::new(format!("Template '{name}' is used without arguments")));
         }
     }
     let rules: Vec<Rule> = compiler.rules.into_iter().map(|r| r.unwrap()).collect();

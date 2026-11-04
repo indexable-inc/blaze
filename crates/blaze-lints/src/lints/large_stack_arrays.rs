@@ -78,9 +78,12 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
             size_text(FIBER_STACK)
         ),
     };
-    let message = format!("this array in {owner} takes {} of the stack, over {why}", size_text(size));
+    let message =
+        format!("this array in {owner} takes {} of the stack, over {why}", size_text(size));
     cx.lint(LINT, expr.syntax(), span, message)
-        .help(format!("make it on the heap: `vec!{snippet}.into_boxed_slice()`, or keep it in a `static`"))
+        .help(format!(
+            "make it on the heap: `vec!{snippet}.into_boxed_slice()`, or keep it in a `static`"
+        ))
         .note("a fiber's stack is fixed: what one frame takes, every frame it calls has less of");
 }
 
@@ -90,7 +93,11 @@ fn owner<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> Option<String> {
     for it in written_ancestors(cx, node).skip(1) {
         match it.kind() {
             K::CONST | K::STATIC | K::CONST_ARG => return None,
-            K::BLOCK_EXPR if ast::BlockExpr::cast(it).is_some_and(|it| it.const_token().is_some()) => return None,
+            K::BLOCK_EXPR
+                if ast::BlockExpr::cast(it).is_some_and(|it| it.const_token().is_some()) =>
+            {
+                return None;
+            }
             K::CLOSURE_EXPR => {
                 let f = written_ancestors(cx, it).find_map(ast::Fn::cast).and_then(|f| f.name());
                 return Some(match f {
@@ -100,14 +107,18 @@ fn owner<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> Option<String> {
             }
             K::FN => {
                 let name = ast::Fn::cast(it).and_then(|f| f.name());
-                return Some(name.map_or_else(|| "this function".to_owned(), |it| format!("`{}`", it.text())));
+                return Some(
+                    name.map_or_else(
+                        || "this function".to_owned(),
+                        |it| format!("`{}`", it.text()),
+                    ),
+                );
             }
             _ => {}
         }
     }
     None
 }
-
 
 /// The limit in bytes: `array-size-threshold` from `clippy.toml`, else [`DEFAULT_LIMIT`]. Read by
 /// `blaze::box_large_new`, which leaves sizes past it to this lint.
@@ -158,7 +169,10 @@ pub fn in_closure() -> u8 {
         assert_eq!(found.matches(FOUND).count(), 3, "{found}");
         assert!(found.contains("this array in `big` takes 1 MiB of the stack, over 16 KiB: 1/1024 of a pool fiber's stack (`blaze_graph::sched::FIBER_STACK`, 16 MiB)"), "{found}");
         assert!(found.contains("this array in `listed` takes 32 KiB"), "{found}");
-        assert!(found.contains("this array in a closure in `in_closure` takes 20000 bytes"), "{found}");
+        assert!(
+            found.contains("this array in a closure in `in_closure` takes 20000 bytes"),
+            "{found}"
+        );
         assert!(found.contains("`vec![0u8; 1 << 20].into_boxed_slice()`"), "{found}");
     }
 
@@ -177,7 +191,11 @@ pub fn of_t<T: Copy>(x: T) -> T {
 }
 "#,
         );
-        assert_eq!(found.matches(FOUND).count(), 0, "a layout the front end can't compute is no finding:\n{found}");
+        assert_eq!(
+            found.matches(FOUND).count(),
+            0,
+            "a layout the front end can't compute is no finding:\n{found}"
+        );
     }
 
     #[test]
@@ -201,9 +219,14 @@ pub fn f() -> u64 {
 
     #[test]
     fn array_size_threshold_in_clippy_toml_sets_the_limit() {
-        let conf = crate::conf::Conf { table: "array-size-threshold = 64".parse().unwrap(), ..Default::default() };
+        let conf = crate::conf::Conf {
+            table: "array-size-threshold = 64".parse().unwrap(),
+            ..Default::default()
+        };
         let found = crate::tests::lint_with(
-            &super::super::more_rules_tests::fixture("pub fn f() -> u8 { let buf = [0u8; 100]; buf[0] }\n"),
+            &super::super::more_rules_tests::fixture(
+                "pub fn f() -> u8 { let buf = [0u8; 100]; buf[0] }\n",
+            ),
             "-A clippy::all -W clippy::large_stack_arrays",
             conf,
         );

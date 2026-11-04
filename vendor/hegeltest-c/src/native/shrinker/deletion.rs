@@ -110,10 +110,7 @@ impl<'a> Shrinker<'a> {
         value: ChoiceValue,
         expected_len: usize,
     ) -> ShrinkResult<bool> {
-        if self
-            .replace(&HashMap::from_iter([(idx, value.clone())]))
-            .await?
-        {
+        if self.replace(&HashMap::from_iter([(idx, value.clone())])).await? {
             return Ok(true);
         }
 
@@ -193,10 +190,8 @@ impl<'a> Shrinker<'a> {
                 &current_val + BigInt::from(1)
             };
             let mut lowered = self.current_nodes.clone();
-            lowered[i] = ChoiceNode::new(
-                ChoiceData::Integer(ic.clone(), towards),
-                lowered[i].was_forced,
-            );
+            lowered[i] =
+                ChoiceNode::new(ChoiceData::Integer(ic.clone(), towards), lowered[i].was_forced);
 
             let (_, actual_nodes, actual_spans) =
                 self.run_test_fn(super::ShrinkRun::Full(&lowered)).await?;
@@ -326,8 +321,7 @@ impl<'a> Shrinker<'a> {
         repeats: usize,
     ) -> ShrinkResult<bool> {
         let original = self.current_nodes.clone();
-        self.run_node_program(&original, i, program_len, repeats)
-            .await
+        self.run_node_program(&original, i, program_len, repeats).await
     }
 
     /// Apply the "delete n consecutive nodes" program `repeats` times at
@@ -412,10 +406,7 @@ impl<'a> Shrinker<'a> {
 /// of payload.
 fn grams_match(a: &[ChoiceNode], b: &[ChoiceNode]) -> bool {
     a.iter().zip(b).all(|(x, y)| {
-        matches!(
-            (&x.data, &y.data),
-            (ChoiceData::Clone(_), ChoiceData::Clone(_))
-        ) || x == y
+        matches!((&x.data, &y.data), (ChoiceData::Clone(_), ChoiceData::Clone(_))) || x == y
     })
 }
 

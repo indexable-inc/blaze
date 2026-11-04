@@ -17,9 +17,7 @@ fn emitting_test_case() -> (RunHandle, TestCase) {
     let settings = Settings::new().database(None);
     let c_settings = SettingsHandle::build(&settings, None, None);
     let run = RunHandle::start(&c_settings, None).expect("the engine starts");
-    let c_tc = run
-        .next_test_case()
-        .expect("the engine schedules at least one case");
+    let c_tc = run.next_test_case().expect("the engine schedules at least one case");
     let tc = TestCase::new(Arc::new(c_tc), true, current_output_sink());
     (run, tc)
 }
@@ -38,9 +36,7 @@ fn debug_is_non_exhaustive() {
 fn a_clone_can_draw_from_another_thread() {
     let (_run, tc) = emitting_test_case();
     let worker = tc.clone();
-    std::thread::spawn(move || worker.draw(gs::integers::<i64>()))
-        .join()
-        .unwrap();
+    std::thread::spawn(move || worker.draw(gs::integers::<i64>())).join().unwrap();
     tc.draw(gs::booleans());
 }
 
@@ -97,9 +93,7 @@ fn assume_code_unwinds_as_assume_failed() {
         std::panic::catch_unwind(|| raise_for_rc(hegel_c::hegel_result_t::HEGEL_E_ASSUME))
             .unwrap_err();
     assert!(
-        payload
-            .downcast_ref::<crate::control::AssumeFailed>()
-            .is_some(),
+        payload.downcast_ref::<crate::control::AssumeFailed>().is_some(),
         "expected an AssumeFailed control unwind"
     );
 }
@@ -127,10 +121,7 @@ fn drive_to_overrun(tc: &TestCase) {
             let _: i64 = tc.draw(gs::integers::<i64>());
         }
     }));
-    assert!(
-        result.is_err(),
-        "drawing should eventually overrun the budget"
-    );
+    assert!(result.is_err(), "drawing should eventually overrun the budget");
 }
 
 /// A generator that reports how many spans were open on the instance while
@@ -160,10 +151,7 @@ fn every_draw_runs_its_generator_inside_one_span() {
     assert_eq!(tc.open_span_depth(), 0);
     assert_eq!(tc.draw(SpanDepthProbe), 1);
     assert_eq!(tc.open_span_depth(), 0);
-    assert_eq!(
-        tc.draw_and_print(SpanDepthProbe, &mut PrettyPrinter::noop()),
-        1
-    );
+    assert_eq!(tc.draw_and_print(SpanDepthProbe, &mut PrettyPrinter::noop()), 1);
     assert_eq!(tc.open_span_depth(), 0);
     assert_eq!(tc.draw_silent(gs::vecs(SpanDepthProbe).min_size(1))[0], 2);
     assert_eq!(tc.open_span_depth(), 0);
@@ -241,10 +229,7 @@ fn collection_more_after_finished_stays_false() {
 fn collection_reject_live_and_after_finished() {
     let (_run, tc) = emitting_test_case();
     let mut collection = Collection::new(&tc, 1, Some(3));
-    assert!(
-        collection.more(),
-        "min_size 1 guarantees a first element before any rejection"
-    );
+    assert!(collection.more(), "min_size 1 guarantees a first element before any rejection");
     tc.draw(gs::booleans());
     collection.reject(Some("rejected by the test"));
     while collection.more() {

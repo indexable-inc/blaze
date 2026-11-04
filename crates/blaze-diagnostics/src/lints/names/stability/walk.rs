@@ -46,7 +46,9 @@ use std::ops::ControlFlow;
 
 use cfg::CfgOptions;
 use either::Either;
-use hir::{Adt, HasVisibility as _, HirFileId, InFile, ModuleDef, PathResolution, view::ModuleSourceView};
+use hir::{
+    Adt, HasVisibility as _, HirFileId, InFile, ModuleDef, PathResolution, view::ModuleSourceView,
+};
 use hir_def::attrs::stability::{DeprecatedSince, DeprecationEntry, Stability};
 use hir_expand::name::AsName as _;
 use intern::Symbol;
@@ -57,8 +59,7 @@ use syntax::{
 };
 
 use super::{
-    Site,
-    attr,
+    Site, attr,
     def::{Def, ItemLike, trait_item},
     lookup::Index,
     target::{self, Attribute, GenericParamKind, MethodKind, Target},
@@ -211,13 +212,21 @@ pub(super) fn walk(cx: &Cx<'_, '_>) -> Vec<Found> {
         extern_types: None,
         reported: Reported::default(),
     };
-    let ctx = Ctx { owner: ROOT, module: 0, container: Container::Free, body: false, derive: false };
+    let ctx =
+        Ctx { owner: ROOT, module: 0, container: Container::Free, body: false, derive: false };
     // With none, a `#![cfg]` removes the crate's contents and attributes.
     if let Some(&root) = tree.nodes.first() {
         if tree.attrs[0] {
             let deprecated = walker.deprecated(root);
             for (meta, written) in &deprecated {
-                walker.deprecated_attr(Target::Crate, InFile::new(file, root), meta, written, ROOT, false);
+                walker.deprecated_attr(
+                    Target::Crate,
+                    InFile::new(file, root),
+                    meta,
+                    written,
+                    ROOT,
+                    false,
+                );
             }
         }
         walker.tree(tree, ctx);
@@ -227,7 +236,15 @@ pub(super) fn walk(cx: &Cx<'_, '_>) -> Vec<Found> {
 
 impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
     fn finish(self) -> Vec<Found> {
-        let Reported { missing, escapes, macro_unstable, macro_deprecated, mut items, useless, mut bodies } = self.reported;
+        let Reported {
+            missing,
+            escapes,
+            macro_unstable,
+            macro_deprecated,
+            mut items,
+            useless,
+            mut bodies,
+        } = self.reported;
         items.sort_by_key(|(key, _)| *key);
         bodies.sort_by_key(|(key, _)| *key);
         let count = missing.len()
@@ -256,7 +273,10 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
             return check << 31;
         }
         let it = self.owners[owner as usize];
-        (u64::from(it.module) << 32) | (check << 31) | (u64::from(it.list) << 29) | u64::from(owner + 1)
+        (u64::from(it.module) << 32)
+            | (check << 31)
+            | (u64::from(it.list) << 29)
+            | u64::from(owner + 1)
     }
 
     /// Keeps what the check of `used` found, by the pass that reports it.
@@ -284,7 +304,12 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
 
     /// The tree of `file`, which `node` of `t` brings in. With none its uses can't be checked,
     /// and that is an error at `node`.
-    fn tree_of(&mut self, file: HirFileId, t: &Tree<'db>, node: Node<'db>) -> Option<&'a Tree<'db>> {
+    fn tree_of(
+        &mut self,
+        file: HirFileId,
+        t: &Tree<'db>,
+        node: Node<'db>,
+    ) -> Option<&'a Tree<'db>> {
         let walk = self.walk;
         let found = walk.tree(file);
         if found.is_none() {
@@ -321,7 +346,11 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         let mut j = from;
         loop {
             j = next(t, j);
-            let here = t.nodes.get(j).copied().filter(|&it| outer.is_none_or(|(parent, range)| inside(parent, range, it)));
+            let here = t
+                .nodes
+                .get(j)
+                .copied()
+                .filter(|&it| outer.is_none_or(|(parent, range)| inside(parent, range, it)));
             while let Some((&item, rest)) = replaced.split_first()
                 && here.is_none_or(|it| item.text_range().start() < it.text_range().start())
             {
@@ -372,7 +401,14 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         {
             let deprecated = self.deprecated(node);
             for (meta, written) in &deprecated {
-                self.deprecated_attr(target, InFile::new(t.file, node), meta, written, ctx.owner, false);
+                self.deprecated_attr(
+                    target,
+                    InFile::new(t.file, node),
+                    meta,
+                    written,
+                    ctx.owner,
+                    false,
+                );
             }
         }
         match kind {
@@ -433,7 +469,10 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
 
     fn owner(&mut self, node: InFile<SyntaxNodePtr>, ctx: Ctx, is_use: bool) -> u32 {
         let id = self.owners.len();
-        assert!(id < OWNERS, "more item-likes in one crate than the stability checks' order keys hold");
+        assert!(
+            id < OWNERS,
+            "more item-likes in one crate than the stability checks' order keys hold"
+        );
         self.owners.push(Owner { node, module: ctx.module, list: ctx.container.list(), is_use });
         id as u32
     }
@@ -448,10 +487,18 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         {
             let deprecated = self.deprecated(node);
             for (meta, written) in &deprecated {
-                self.deprecated_attr(target, InFile::new(t.file, node), meta, written, owner, of_trait_impl);
+                self.deprecated_attr(
+                    target,
+                    InFile::new(t.file, node),
+                    meta,
+                    written,
+                    owner,
+                    of_trait_impl,
+                );
             }
         }
-        let list = |kind: SyntaxKind, container: Container| Some((kind, Ctx { container, ..inner }));
+        let list =
+            |kind: SyntaxKind, container: Container| Some((kind, Ctx { container, ..inner }));
         match item {
             ast::Item::Module(module) => self.module(t, j, module, inner),
             ast::Item::Impl(imp) => {
@@ -462,12 +509,20 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
                 let list = list(SyntaxKind::ASSOC_ITEM_LIST, Container::Impl { of_trait });
                 self.run(t, j + 1, Some(node), inner, list)
             }
-            ast::Item::Trait(_) => {
-                self.run(t, j + 1, Some(node), inner, list(SyntaxKind::ASSOC_ITEM_LIST, Container::Trait))
-            }
-            ast::Item::ExternBlock(_) => {
-                self.run(t, j + 1, Some(node), inner, list(SyntaxKind::EXTERN_ITEM_LIST, Container::Foreign))
-            }
+            ast::Item::Trait(_) => self.run(
+                t,
+                j + 1,
+                Some(node),
+                inner,
+                list(SyntaxKind::ASSOC_ITEM_LIST, Container::Trait),
+            ),
+            ast::Item::ExternBlock(_) => self.run(
+                t,
+                j + 1,
+                Some(node),
+                inner,
+                list(SyntaxKind::EXTERN_ITEM_LIST, Container::Foreign),
+            ),
             ast::Item::Struct(_) | ast::Item::Enum(_) | ast::Item::Union(_) => {
                 let after = self.children(t, j, inner);
                 self.derives(t, j, ctx);
@@ -477,7 +532,13 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         }
     }
 
-    fn module(&mut self, t: &'a Tree<'db>, j: usize, module: ast::Module<'db>, inner: Ctx) -> usize {
+    fn module(
+        &mut self,
+        t: &'a Tree<'db>,
+        j: usize,
+        module: ast::Module<'db>,
+        inner: Ctx,
+    ) -> usize {
         let cx = self.cx;
         let node = t.nodes[j];
         let contents = Ctx { module: self.modules, ..inner };
@@ -496,7 +557,14 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
                     if file.attrs[0] {
                         let deprecated = self.deprecated(root);
                         for (meta, written) in &deprecated {
-                            self.deprecated_attr(Target::Mod, InFile::new(file.file, root), meta, written, inner.owner, false);
+                            self.deprecated_attr(
+                                Target::Mod,
+                                InFile::new(file.file, root),
+                                meta,
+                                written,
+                                inner.owner,
+                                false,
+                            );
                         }
                     }
                     self.tree(file, contents);
@@ -518,7 +586,12 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
                 Some(it) if it.syntax() == meta.syntax() => written.syntax().text_range(),
                 _ => meta.syntax().text_range(),
             };
-            let found = super::macro_escape(cx, InFile::new(file, range), written.kind().is_inner(), t.ptr(node));
+            let found = super::macro_escape(
+                cx,
+                InFile::new(file, range),
+                written.kind().is_inner(),
+                t.ptr(node),
+            );
             self.reported.escapes.push(found);
         }
         after
@@ -589,10 +662,9 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
             let name = mac.name(cx.db);
             let name = name.as_str();
             let found = attr::each(node, self.cfg, |meta, _| {
-                match meta
-                    .path()
-                    .filter(|it| it.segment().and_then(|it| it.name_ref()).is_some_and(|it| it.text() == name))
-                {
+                match meta.path().filter(|it| {
+                    it.segment().and_then(|it| it.name_ref()).is_some_and(|it| it.text() == name)
+                }) {
                     Some(path) => ControlFlow::Break(path),
                     None => ControlFlow::Continue(()),
                 }
@@ -625,7 +697,14 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         });
     }
 
-    fn derive(&mut self, t: &'a Tree<'db>, node: Node<'db>, meta: ast::Meta<'db>, written: ast::Attr<'db>, ctx: Ctx) {
+    fn derive(
+        &mut self,
+        t: &'a Tree<'db>,
+        node: Node<'db>,
+        meta: ast::Meta<'db>,
+        written: ast::Attr<'db>,
+        ctx: Ctx,
+    ) {
         let cx = self.cx;
         let macros = cx.vsema.resolve_derive_macro(meta).unwrap_or_default();
         if macros.iter().any(Option::is_some) {
@@ -636,7 +715,9 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
             let at = t.ptr(node);
             for (mac, range) in macros.into_iter().zip(ranges) {
                 if let Some(mac) = mac {
-                    self.check_macro(mac, InFile::new(t.file, range), at, ctx.derive, || derive_text(written, range));
+                    self.check_macro(mac, InFile::new(t.file, range), at, ctx.derive, || {
+                        derive_text(written, range)
+                    });
                 }
             }
         }
@@ -646,7 +727,10 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
             if file.is_macro()
                 && let Some(tree) = self.tree_of(file, t, node)
             {
-                self.tree(tree, Ctx { derive: true, body: false, container: Container::Free, ..ctx });
+                self.tree(
+                    tree,
+                    Ctx { derive: true, body: false, container: Container::Free, ..ctx },
+                );
             }
         }
     }
@@ -657,7 +741,13 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
     /// (`CheckTraitImplStable`), unless an `#[unstable_feature_bound]` names the same feature,
     /// and is not linted when the trait does not resolve. Kept before what the walk of the
     /// impl finds: rustc lints it before it visits what is in the impl.
-    fn ineffective_unstable(&mut self, t: &'a Tree<'db>, j: usize, imp: ast::Impl<'db>, owner: u32) {
+    fn ineffective_unstable(
+        &mut self,
+        t: &'a Tree<'db>,
+        j: usize,
+        imp: ast::Impl<'db>,
+        owner: u32,
+    ) {
         let cx = self.cx;
         let node = t.nodes[j];
         const INEFFECTIVE: LintId = LintId::named("ineffective_unstable_trait_impl");
@@ -665,15 +755,25 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
             return;
         }
         let Some(range) = attr::stability_range(node, self.cfg) else { return };
-        let Some(stability) = ItemLike::at(cx, InFile::new(t.file, node)).and_then(|it| it.stability(cx.db)) else {
+        let Some(stability) =
+            ItemLike::at(cx, InFile::new(t.file, node)).and_then(|it| it.stability(cx.db))
+        else {
             return;
         };
-        if !stability.is_unstable() || attr::unstable_feature_bound(node, self.cfg, &stability.feature) {
+        if !stability.is_unstable()
+            || attr::unstable_feature_bound(node, self.cfg, &stability.feature)
+        {
             return;
         }
-        let (Some(ast::Type::PathType(trait_ty)), Some(self_ty)) = (imp.trait_(), imp.self_ty()) else { return };
+        let (Some(ast::Type::PathType(trait_ty)), Some(self_ty)) = (imp.trait_(), imp.self_ty())
+        else {
+            return;
+        };
         let Some(trait_path) = trait_ty.path() else { return };
-        if !matches!(cx.vsema.resolve_path(trait_path), Some(PathResolution::Def(ModuleDef::Trait(_)))) {
+        if !matches!(
+            cx.vsema.resolve_path(trait_path),
+            Some(PathResolution::Def(ModuleDef::Trait(_)))
+        ) {
             return;
         }
         let mut header = Header { stable: true, defs: SmallVec::new() };
@@ -686,7 +786,12 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
             return;
         }
         let key = self.item_key(owner, 1);
-        let found = super::ineffective_unstable_impl(cx, InFile::new(t.file, range), t.ptr(node), &header.defs);
+        let found = super::ineffective_unstable_impl(
+            cx,
+            InFile::new(t.file, range),
+            t.ptr(node),
+            &header.defs,
+        );
         self.reported.items.push((key, found));
     }
 
@@ -694,7 +799,13 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
     /// `t` with none), a type of an impl's header or what a macro there expands to. What rustc's
     /// HIR does not have of them is passed over: attributes, a macro call's own path, and the
     /// bodies of anon consts.
-    fn header_nodes(&mut self, t: &'a Tree<'db>, from: usize, range: Option<TextRange>, header: &mut Header) {
+    fn header_nodes(
+        &mut self,
+        t: &'a Tree<'db>,
+        from: usize,
+        range: Option<TextRange>,
+        header: &mut Header,
+    ) {
         let walk = self.walk;
         let mut k = from;
         while header.stable && k < t.nodes.len() {
@@ -725,7 +836,9 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
                     k = after(t, k);
                     continue;
                 }
-                SyntaxKind::PATH if node.parent().is_none_or(|it| it.kind() != SyntaxKind::PATH) => {
+                SyntaxKind::PATH
+                    if node.parent().is_none_or(|it| it.kind() != SyntaxKind::PATH) =>
+                {
                     if let Some(path) = ast::Path::cast(node) {
                         self.header_path(t, path, None, header);
                     }
@@ -745,11 +858,20 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
     /// when that is known: the stability of what rustc's HIR path resolves to. A type-relative
     /// path's is that of the type before it; `Self` is the impl, whose stability is the
     /// `#[unstable]` itself; the trait of a `<Type as Trait>` is a segment, not looked up.
-    fn header_path(&mut self, t: &Tree<'db>, path: ast::Path<'db>, res: Option<PathResolution<'db>>, header: &mut Header) {
+    fn header_path(
+        &mut self,
+        t: &Tree<'db>,
+        path: ast::Path<'db>,
+        res: Option<PathResolution<'db>>,
+        header: &mut Header,
+    ) {
         let cx = self.cx;
         let qualifier = path.qualifier();
         if qualifier.is_none()
-            && path.segment().and_then(|it| it.kind()).is_some_and(|it| matches!(it, ast::PathSegmentKind::SelfTypeKw))
+            && path
+                .segment()
+                .and_then(|it| it.kind())
+                .is_some_and(|it| matches!(it, ast::PathSegmentKind::SelfTypeKw))
         {
             header.stable = false;
             return;
@@ -761,8 +883,10 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         if let Some(qualifier) = qualifier {
             let (relative, qualifier_res) = type_relative(cx, qualifier, &res);
             if relative {
-                if !matches!(qualifier.segment().and_then(|it| it.kind()), Some(ast::PathSegmentKind::Type { .. }))
-                    && !matches!(qualifier_res, Some(None))
+                if !matches!(
+                    qualifier.segment().and_then(|it| it.kind()),
+                    Some(ast::PathSegmentKind::Type { .. })
+                ) && !matches!(qualifier_res, Some(None))
                 {
                     self.header_path(t, qualifier, qualifier_res.flatten(), header);
                 }
@@ -837,7 +961,10 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
                     let found = super::deprecated_macro(cx, mac, depr, in_effect, path, site);
                     self.reported.macro_deprecated.push(found);
                 }
-                None => self.reported.missing.push(Found::new(super::unknown_current(cx, span), Phase::Resolve)),
+                None => self
+                    .reported
+                    .missing
+                    .push(Found::new(super::unknown_current(cx, span), Phase::Resolve)),
             }
         }
     }
@@ -847,7 +974,10 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         let db = cx.db;
         match value.kind() {
             SyntaxKind::PATH => {
-                if value.parent().is_some_and(|it| matches!(it.kind(), SyntaxKind::PATH | SyntaxKind::USE_TREE)) {
+                if value
+                    .parent()
+                    .is_some_and(|it| matches!(it.kind(), SyntaxKind::PATH | SyntaxKind::USE_TREE))
+                {
                     return;
                 }
                 if let Some(path) = ast::Path::cast(value) {
@@ -913,9 +1043,14 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
             if report {
                 let suggestion = used.expr.then(|| InFile::new(used.at.file_id, used.span));
                 let current = self.index.current;
-                if let Some(found) =
-                    super::deprecated(cx, used.def, entry.deprecation, current, used.site(used.span), suggestion)
-                {
+                if let Some(found) = super::deprecated(
+                    cx,
+                    used.def,
+                    entry.deprecation,
+                    current,
+                    used.site(used.span),
+                    suggestion,
+                ) {
                     self.emit(used, found);
                 }
             }
@@ -942,7 +1077,9 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
     /// unstable re-export.
     fn unstable(&mut self, used: &Use) -> Option<&'db Stability> {
         let stability = self.index.foreign_stability(used.def)?;
-        if !self.index.denied(stability, used.at.file_id, used.whole) || self.is_unstable_reexport(used.owner) {
+        if !self.index.denied(stability, used.at.file_id, used.whole)
+            || self.is_unstable_reexport(used.owner)
+        {
             return None;
         }
         Some(stability)
@@ -950,10 +1087,13 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
 
     /// `is_unstable_reexport`: the item-like is a `use` that is itself unstable.
     fn is_unstable_reexport(&mut self, owner: u32) -> bool {
-        if owner == ROOT || !self.owners[owner as usize].is_use || !self.index.staged(self.cx.krate) {
+        if owner == ROOT || !self.owners[owner as usize].is_use || !self.index.staged(self.cx.krate)
+        {
             return false;
         }
-        self.index.local_stability(self.owners[owner as usize].node).is_some_and(Stability::is_unstable)
+        self.index
+            .local_stability(self.owners[owner as usize].node)
+            .is_some_and(Stability::is_unstable)
     }
 
     /// Whether a use of `def` can be reported: it is deprecated or has a stability rustc
@@ -978,7 +1118,8 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         };
         let span = cx.span(InFile::new(file, path.syntax().text_range()));
         // alloc: on the error path, for the message
-        let message = format!("blaze can't check the stability of `{}`: {why}", written(path.syntax()));
+        let message =
+            format!("blaze can't check the stability of `{}`: {why}", written(path.syntax()));
         self.reported.missing.push(Found::new(Diag::error(None, message, span), Phase::Items));
     }
 
@@ -998,7 +1139,10 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         let db = cx.db;
         let qualifier = path.qualifier();
         if qualifier.is_none()
-            && path.segment().and_then(|it| it.kind()).is_some_and(|it| matches!(it, ast::PathSegmentKind::SelfTypeKw))
+            && path
+                .segment()
+                .and_then(|it| it.kind())
+                .is_some_and(|it| matches!(it, ast::PathSegmentKind::SelfTypeKw))
         {
             return;
         }
@@ -1018,7 +1162,9 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
                 let def = trait_item(db, def);
                 let value_ns = matches!(
                     parent_kind,
-                    Some(SyntaxKind::PATH_EXPR | SyntaxKind::PATH_PAT | SyntaxKind::TUPLE_STRUCT_PAT)
+                    Some(
+                        SyntaxKind::PATH_EXPR | SyntaxKind::PATH_PAT | SyntaxKind::TUPLE_STRUCT_PAT
+                    )
                 );
                 Some(if value_ns { Def::value(db, def) } else { Def::Item(def) })
             }
@@ -1027,16 +1173,30 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         let main = match def {
             Some(def) => {
                 let whole = path.syntax().text_range();
-                let last = path.segment().and_then(|it| it.name_ref()).map_or(whole, |it| it.syntax().text_range());
+                let last = path
+                    .segment()
+                    .and_then(|it| it.name_ref())
+                    .map_or(whole, |it| it.syntax().text_range());
                 let at = parent.unwrap_or(path.syntax());
                 let used = Use {
                     def,
                     owner: ctx.owner,
                     at: InFile::new(file, ast::ptr(at)),
-                    span: if relative && parent_kind == Some(SyntaxKind::PATH_TYPE) { whole } else { last },
+                    span: if relative && parent_kind == Some(SyntaxKind::PATH_TYPE) {
+                        whole
+                    } else {
+                        last
+                    },
                     whole,
-                    phase: if relative && in_body(path.syntax(), ctx) { Phase::Bodies } else { Phase::Items },
-                    expr: matches!(parent_kind, Some(SyntaxKind::PATH_EXPR | SyntaxKind::RECORD_EXPR)),
+                    phase: if relative && in_body(path.syntax(), ctx) {
+                        Phase::Bodies
+                    } else {
+                        Phase::Items
+                    },
+                    expr: matches!(
+                        parent_kind,
+                        Some(SyntaxKind::PATH_EXPR | SyntaxKind::RECORD_EXPR)
+                    ),
                     stability_only,
                     derive: ctx.derive,
                 };
@@ -1046,8 +1206,10 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         };
         let Some(qualifier) = qualifier else { return };
         if relative {
-            if !matches!(qualifier.segment().and_then(|it| it.kind()), Some(ast::PathSegmentKind::Type { .. }))
-                && !matches!(qualifier_res, Some(None))
+            if !matches!(
+                qualifier.segment().and_then(|it| it.kind()),
+                Some(ast::PathSegmentKind::Type { .. })
+            ) && !matches!(qualifier_res, Some(None))
             {
                 self.path(file, qualifier, ctx, stability_only, qualifier_res.flatten());
             }
@@ -1084,7 +1246,9 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         }
         let segment = qualifier.segment();
         let name = segment.as_ref().and_then(|it| it.name_ref()).map(|it| it.syntax().text_range());
-        let range = name.or(segment.map(|it| it.syntax().text_range())).unwrap_or(qualifier.syntax().text_range());
+        let range = name
+            .or(segment.map(|it| it.syntax().text_range()))
+            .unwrap_or(qualifier.syntax().text_range());
         let used = Use {
             def: Def::Item(def),
             owner: ctx.owner,
@@ -1099,7 +1263,13 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         let Some(stability) = self.unstable(&used) else { return };
         let cx = self.cx;
         let found = match through {
-            Some(message) => super::deprecated_through(cx, used.def, message, self.index.current, main.site(main.span)),
+            Some(message) => super::deprecated_through(
+                cx,
+                used.def,
+                message,
+                self.index.current,
+                main.site(main.span),
+            ),
             None => super::unstable(cx, used.def, None, stability, used.site(range)),
         };
         if let Some(found) = found {
@@ -1116,7 +1286,9 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         let Some(path) = tree.path() else { return };
         if let Some(list) = tree.use_tree_list() {
             let root_only = path.qualifier().is_none()
-                && path.segment().is_some_and(|it| it.coloncolon_token().is_some() && it.name_ref().is_none());
+                && path
+                    .segment()
+                    .is_some_and(|it| it.coloncolon_token().is_some() && it.name_ref().is_none());
             if list.use_trees().next().is_none() && !root_only {
                 self.use_path(file, tree, path, None, ctx);
             }
@@ -1130,10 +1302,13 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         }
         let Some(per_ns) = cx.vsema.resolve_path_per_ns(path) else { return };
         let def_of = |it: Option<PathResolution<'_>>| match it {
-            Some(PathResolution::Def(def)) if !matches!(def, ModuleDef::BuiltinType(_)) => Some(def),
+            Some(PathResolution::Def(def)) if !matches!(def, ModuleDef::BuiltinType(_)) => {
+                Some(def)
+            }
             _ => None,
         };
-        let (types, values, macros) = (def_of(per_ns.type_ns), def_of(per_ns.value_ns), def_of(per_ns.macro_ns));
+        let (types, values, macros) =
+            (def_of(per_ns.type_ns), def_of(per_ns.value_ns), def_of(per_ns.macro_ns));
         let mut defs: SmallVec<[Def; 3]> = SmallVec::new();
         match (types, values) {
             (Some(ty), Some(val)) if ty == val && matches!(Def::value(db, val), Def::Ctor(_)) => {
@@ -1152,7 +1327,14 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
 
     /// The check of a `use` path resolving to `def` (when it is checked), and of its parent
     /// segments, those of the trees it is nested in after its own.
-    fn use_path(&mut self, file: HirFileId, tree: ast::UseTree<'db>, path: ast::Path<'db>, def: Option<Def>, ctx: Ctx) {
+    fn use_path(
+        &mut self,
+        file: HirFileId,
+        tree: ast::UseTree<'db>,
+        path: ast::Path<'db>,
+        def: Option<Def>,
+        ctx: Ctx,
+    ) {
         let cx = self.cx;
         let def = match def {
             Some(def) => def,
@@ -1289,12 +1471,19 @@ impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
         let cx = self.cx;
         let db = cx.db;
         let Some(name) = arg.name_ref() else { return };
-        let Some(path) =
-            arg.syntax().ancestors().skip(1).find(|it| it.kind() == SyntaxKind::PATH).and_then(ast::Path::cast)
+        let Some(path) = arg
+            .syntax()
+            .ancestors()
+            .skip(1)
+            .find(|it| it.kind() == SyntaxKind::PATH)
+            .and_then(ast::Path::cast)
         else {
             return;
         };
-        let Some(PathResolution::Def(ModuleDef::Trait(trait_))) = cx.vsema.resolve_path(path) else { return };
+        let Some(PathResolution::Def(ModuleDef::Trait(trait_))) = cx.vsema.resolve_path(path)
+        else {
+            return;
+        };
         let name = name.as_name();
         let found = trait_.items_with_supertraits(db).into_iter().find_map(|it| match it {
             hir::AssocItem::TypeAlias(it) if it.name(db) == name => Some(it),
@@ -1407,7 +1596,9 @@ fn inside<'t>(parent: Node<'t>, outer: TextRange, node: Node<'t>) -> bool {
     let it = node.text_range();
     outer.start() <= it.start()
         && (it.start() < outer.end()
-            || (it.is_empty() && it.start() == outer.end() && node.ancestors().any(|it| it == parent)))
+            || (it.is_empty()
+                && it.start() == outer.end()
+                && node.ancestors().any(|it| it == parent)))
 }
 
 /// The items of `t` an attribute macro replaces that are in `parent` (all of them with none),
@@ -1479,7 +1670,8 @@ fn type_relative<'db>(
 /// path it qualifies.
 fn is_anchor_trait(path: ast::Path<'_>) -> bool {
     let Some(ty) = path.syntax().parent().and_then(ast::PathType::cast) else { return false };
-    let Some(segment) = ty.syntax().ancestors().skip(1).take(2).find_map(ast::PathSegment::cast) else {
+    let Some(segment) = ty.syntax().ancestors().skip(1).take(2).find_map(ast::PathSegment::cast)
+    else {
         return false;
     };
     matches!(segment.kind(), Some(ast::PathSegmentKind::Type { trait_ref: Some(it), .. }) if it == ty)

@@ -8,15 +8,10 @@ mod generics;
 mod path;
 mod spec;
 
-use std::{
-    cell::RefCell,
-    mem,
-    sync::Arc,
-};
+use std::{cell::RefCell, mem, sync::Arc};
 
 use base_db::{Db, FxIndexSet};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use cfg::CfgOptions;
 use either::Either;
 use hir_expand::{
@@ -31,6 +26,7 @@ use itertools::Itertools;
 use rustc_abi::ExternAbi;
 use smallvec::SmallVec;
 use span::{AstIdMap, RealSpanMap, SyntaxContext};
+use std::alloc::Global;
 use syntax::{
     AstPtr, FlatTree, SyntaxNodePtr, ast as tag,
     view::{
@@ -48,10 +44,10 @@ use crate::{
     UnresolvedMacro,
     attrs::AttrFlags,
     expr_store::{
-        Body, BodySourceMap, ExprPtr, ExprRoot, ExpressionStore, ExpressionStoreBuilder,
-        ComptimeForm, ExpressionStoreDiagnostics, ExpressionStoreSourceMap, HygieneId, LabelPtr, LifetimePtr,
-        ListMark, Lists, MacroCallPtr, MissingBodyItemKind, PatPtr, SelfParamPtr, StoreVisitor,
-        TypePtr,
+        Body, BodySourceMap, ComptimeForm, ExprPtr, ExprRoot, ExpressionStore,
+        ExpressionStoreBuilder, ExpressionStoreDiagnostics, ExpressionStoreSourceMap, HygieneId,
+        LabelPtr, LifetimePtr, ListMark, Lists, MacroCallPtr, MissingBodyItemKind, PatPtr,
+        SelfParamPtr, StoreVisitor, TypePtr,
         body::Param,
         expander::Expander,
         path::{
@@ -313,10 +309,7 @@ pub fn lower_generic_params(
     where_clause: Option<tag::WhereClause>,
     mode: LoweringMode,
 ) -> (ExpressionStore, GenericParams, ExpressionStoreSourceMap) {
-    let top = param_list
-        .as_ref()
-        .map(top_of)
-        .or_else(|| where_clause.as_ref().map(top_of));
+    let top = param_list.as_ref().map(top_of).or_else(|| where_clause.as_ref().map(top_of));
     let param_list = param_list.zip(top.as_ref()).map(|(it, top)| view_of(&it, top));
     let where_clause = where_clause.zip(top.as_ref()).map(|(it, top)| view_of(&it, top));
     lower_generic_params_view(db, module, def, file_id, param_list, where_clause, mode)
@@ -382,8 +375,7 @@ pub(crate) fn lower_impl(
         expr_collector.lower_type_ref_opt_disallow_impl_trait(impl_syntax.value.self_ty());
     let trait_ = impl_syntax.value.trait_().and_then(|it| match it {
         ast::Type::PathType(path_type) => {
-            let path = expr_collector
-                .lower_path_type(path_type, &mut ImplTraitLowering::Opaque)?;
+            let path = expr_collector.lower_path_type(path_type, &mut ImplTraitLowering::Opaque)?;
             Some(TraitRef { path: expr_collector.alloc_path(path, TypePtr::of(it)) })
         }
         _ => None,
@@ -589,7 +581,8 @@ pub(crate) fn lower_function(
                 ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => false,
             }
         });
-    collector.update_to_late_bound_lifetimes(&expr_collector.named_lifetime_store, return_captures_all);
+    collector
+        .update_to_late_bound_lifetimes(&expr_collector.named_lifetime_store, return_captures_all);
     let generics = collector.finish();
 
     let return_type = if fn_.value.async_token().is_some() || fn_.value.gen_token().is_some() {
@@ -641,7 +634,10 @@ pub struct ExprCollector<'db> {
     local_def_map: &'db LocalDefMap,
     module: ModuleId,
     lowering_mode: LoweringMode,
-    #[expect(clippy::disallowed_types, reason = "crate language items, set once per expression collector: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "crate language items, set once per expression collector: not global"
+    )]
     lang_items: std::cell::OnceCell<&'db LangItems>,
     pub store: ExpressionStoreBuilder,
     pub named_lifetime_store: NamedLifetimeStore,
@@ -951,7 +947,8 @@ impl NamedLifetimeStore {
     /// `is_late_bound_map`): one without `use<..>` written in edition 2024 or later, or in a
     /// function of a trait or a trait impl (`in_trait_or_impl`, asked only when it decides).
     fn return_opaque_captures_all(&self, in_trait_or_impl: impl FnOnce() -> bool) -> bool {
-        self.return_opaque_2024_without_use || (self.return_opaque_without_use && in_trait_or_impl())
+        self.return_opaque_2024_without_use
+            || (self.return_opaque_without_use && in_trait_or_impl())
     }
 }
 
@@ -967,7 +964,10 @@ impl<'db> ExprCollector<'db> {
 
     /// With `maps`, what is collected is a part of `current_file_id` lowered as a tree of its
     /// own, and these are the maps of that part ([`Expander::within`]).
-    #[expect(clippy::disallowed_types, reason = "crate language items, set once per expression collector: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "crate language items, set once per expression collector: not global"
+    )]
     pub fn with_maps(
         db: &'db Db,
         module: ModuleId,
@@ -1194,17 +1194,18 @@ impl<'db> ExprCollector<'db> {
                             continue;
                         }
                         if splatted.is_none()
-                            && ast::HasAttrs::attrs(&it)
-                                .any(|attr| attr.simple_name().is_some_and(|it| it == "rustc_splat"))
+                            && ast::HasAttrs::attrs(&it).any(|attr| {
+                                attr.simple_name().is_some_and(|it| it == "rustc_splat")
+                            })
                         {
                             splatted = Some(inputs);
                         }
                         inputs += 1;
                         let type_ref = self.lower_type_ref_opt(it.ty(), impl_trait_lower_fn);
                         let name = match it.pat() {
-                            Some(ast::Pat::IdentPat(it)) => Some(
-                                it.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing),
-                            ),
+                            Some(ast::Pat::IdentPat(it)) => {
+                                Some(it.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing))
+                            }
                             _ => None,
                         };
                         self.stacks.fn_params.push((name, type_ref));
@@ -1409,7 +1410,10 @@ impl<'db> ExprCollector<'db> {
     fn note_return_opaque(&mut self, opaque: ast::ImplTraitType<'_>) {
         if !matches!(
             self.named_lifetime_store.lifetime_bound_scope,
-            Some(LifetimeBoundScope::Return | LifetimeBoundScope::ImplTrait { is_argument_scope: false })
+            Some(
+                LifetimeBoundScope::Return
+                    | LifetimeBoundScope::ImplTrait { is_argument_scope: false }
+            )
         ) {
             return;
         }
@@ -2649,7 +2653,9 @@ impl<'db> ExprCollector<'db> {
                     return Some(self.missing_pat());
                 };
                 let mod_path = self.store.path_at(path).mod_path();
-                if mod_path.is_some_and(|it| !self.path_is_destructuring_assignment(it, FieldsShape::Tuple)) {
+                if mod_path.is_some_and(|it| {
+                    !self.path_is_destructuring_assignment(it, FieldsShape::Tuple)
+                }) {
                     return None;
                 }
                 let arg_list = e.arg_list()?;
@@ -2715,8 +2721,9 @@ impl<'db> ExprCollector<'db> {
                         self.store.field_hygiene.insert(pat.into(), hygiene);
                     }
                     if self.store.record {
-                        let src =
-                            self.expander.in_file(AstPtr::<tag::RecordExprField>::of(f).wrap_left());
+                        let src = self
+                            .expander
+                            .in_file(AstPtr::<tag::RecordExprField>::of(f).wrap_left());
                         self.store.pat_field_map_back.push((pat, src));
                     }
                     self.store.push_list_field_pat(RecordFieldPat { name, pat });
@@ -2883,11 +2890,8 @@ impl<'db> ExprCollector<'db> {
                 // `{ let <name>: <ty> = <expr>; <name> }`
                 let name = self.generate_new_name();
                 let type_ref = self.lower_type_ref_disallow_impl_trait(ty);
-                let binding = self.alloc_binding(
-                    name,
-                    BindingAnnotation::Unannotated,
-                    HygieneId::ROOT,
-                );
+                let binding =
+                    self.alloc_binding(name, BindingAnnotation::Unannotated, HygieneId::ROOT);
                 let pat = self.alloc_pat_desugared(Pat::Bind { id: binding, subpat: None });
                 self.add_definition_to_binding(binding, pat);
                 let tail_expr = self.store.alloc_name_path_expr(name);
@@ -3091,14 +3095,10 @@ impl<'db> ExprCollector<'db> {
         let operand = self.collect_expr_opt(e.expr());
         let try_branch = self.store.alloc_path_expr(try_branch);
         let try_branch = self.map_expr(try_branch, syntax_ptr);
-        let expr =
-            self.alloc_expr(Expr::Call { callee: try_branch, args: &[operand] }, syntax_ptr);
+        let expr = self.alloc_expr(Expr::Call { callee: try_branch, args: &[operand] }, syntax_ptr);
         let continue_name = self.generate_new_name();
-        let continue_binding = self.alloc_binding(
-            continue_name,
-            BindingAnnotation::Unannotated,
-            HygieneId::ROOT,
-        );
+        let continue_binding =
+            self.alloc_binding(continue_name, BindingAnnotation::Unannotated, HygieneId::ROOT);
         let continue_bpat =
             self.alloc_pat_desugared(Pat::Bind { id: continue_binding, subpat: None });
         self.add_definition_to_binding(continue_binding, continue_bpat);
@@ -3208,16 +3208,15 @@ impl<'db> ExprCollector<'db> {
                     );
                     // The latest `macro_rules!` of that name before the call, which is not
                     // the last one of the block when a later statement defines it again.
-                    let shadowing = path.as_ident().filter(|_| origin == Hygienic::Here).and_then(
-                        |name| {
+                    let shadowing =
+                        path.as_ident().filter(|_| origin == Hygienic::Here).and_then(|name| {
                             let seen = *self.current_block_legacy_macro_defs_count.get(name)?;
                             let defs = self
                                 .def_map
                                 .module(self.db, self.def_map.root)
                                 .legacy_macro_in_scope(self.db, name)?;
                             defs.get(seen.checked_sub(1)?).copied()
-                        },
-                    );
+                        });
                     if shadowing.is_some() {
                         return shadowing;
                     }
@@ -3342,9 +3341,7 @@ impl<'db> ExprCollector<'db> {
                     }
                     expansion.statements().for_each(|stmt| this.collect_stmt(stmt));
                     expansion.expr().and_then(|expr| match expr {
-                        ast::Expr::MacroExpr(mac) => {
-                            this.collect_macro_as_stmt(mac, as_expr)
-                        }
+                        ast::Expr::MacroExpr(mac) => this.collect_macro_as_stmt(mac, as_expr),
                         expr => this.maybe_collect_expr(expr),
                     })
                 }
@@ -4285,10 +4282,14 @@ impl<'db> ExprCollector<'db> {
         };
         let e = m.macro_call()?;
         let macro_ptr = MacroCallPtr::of(e);
-        let (exp, _) =
-            self.collect_macro_call(e, macro_ptr, true, |this, expansion: Option<ast::Expr<'db>>| {
+        let (exp, _) = self.collect_macro_call(
+            e,
+            macro_ptr,
+            true,
+            |this, expansion: Option<ast::Expr<'db>>| {
                 expansion.and_then(|it| this.expand_macros_to_string(it))
-            })?;
+            },
+        )?;
         Some((exp, false))
     }
 
@@ -4338,7 +4339,9 @@ impl<'db> ExprCollector<'db> {
         {
             use crate::builtin_type::BuiltinType;
             match BuiltinType::arbitrary_by_text(suffix) {
-                Some(BuiltinType::Uint(it)) => return Literal::Uint(int.value().unwrap_or(0), Some(it)),
+                Some(BuiltinType::Uint(it)) => {
+                    return Literal::Uint(int.value().unwrap_or(0), Some(it));
+                }
                 Some(BuiltinType::Int(it)) => {
                     return Literal::Int(int.value().unwrap_or(0) as i128, Some(it));
                 }
@@ -4361,7 +4364,9 @@ impl<'db> ExprCollector<'db> {
             return true;
         }
         let node = self.expander.in_file(node);
-        self.store.diagnostics.push(ExpressionStoreDiagnostics::ComptimeWithoutFeature { node, form });
+        self.store
+            .diagnostics
+            .push(ExpressionStoreDiagnostics::ComptimeWithoutFeature { node, form });
         false
     }
 
@@ -4620,11 +4625,9 @@ impl<'db> ExprCollector<'db> {
     pub(in crate::expr_store) fn param_name(&self, name: Name, range: TextRange) -> Name {
         match self.span_map() {
             SpanMap::RealSpanMap(_) => name,
-            SpanMap::ExpansionSpanMap(_) => crate::nameres::param_name(
-                self.db,
-                name,
-                self.expander.ctx_for_range(range),
-            ),
+            SpanMap::ExpansionSpanMap(_) => {
+                crate::nameres::param_name(self.db, name, self.expander.ctx_for_range(range))
+            }
         }
     }
 
@@ -4683,10 +4686,7 @@ impl<'db> ExprCollector<'db> {
         return Some(res);
 
         #[blaze_query::tracked(returns(deref), cycle_result = get_constrained_lifetimes_cycle_result)]
-        fn get_constrained_lifetimes(
-            db: &Db,
-            type_alias_id: TypeAliasId,
-        ) -> Box<[u32]> {
+        fn get_constrained_lifetimes(db: &Db, type_alias_id: TypeAliasId) -> Box<[u32]> {
             let TypeAliasSignature { generic_params, store, ty, .. } =
                 TypeAliasSignature::of(db, type_alias_id);
             let &Some(ty) = ty else { return Default::default() };
@@ -4750,8 +4750,9 @@ fn is_plain_path(path: Path<'_>) -> bool {
 /// all of a body is.
 #[inline]
 pub(in crate::expr_store) fn may_have_attrs<'t>(owner: &impl ast::HasAttrs<'t>) -> bool {
-    let leads =
-        |node: ast::Node<'t>| node.first_child().is_some_and(|it| ast::AnyAttr::can_cast(it.kind()));
+    let leads = |node: ast::Node<'t>| {
+        node.first_child().is_some_and(|it| ast::AnyAttr::can_cast(it.kind()))
+    };
     leads(owner.syntax()) || owner.inner_attributes_node().is_some_and(leads)
 }
 

@@ -4,8 +4,8 @@
 
 use base_db::Db;
 use hir_def::hir::Expr;
-use hir_ty::{InferBodyId, InferenceResult};
 use hir_expand::fixture;
+use hir_ty::{InferBodyId, InferenceResult};
 
 use super::{db::TestDB, kinds};
 use crate::{
@@ -77,8 +77,7 @@ fn a_variant_s_fields_have_the_type_s_arguments() {
         let ModuleDef::Adt(Adt::Enum(e)) = item(&db, "E") else { panic!("`E` is an enum") };
         let a = e.variants(&db).into_iter().find(|it| it.name(&db).as_str() == "A").unwrap();
         let fields = params[0].variant_fields(&db, a);
-        let shown: Vec<_> =
-            fields.iter().map(|(_, ty)| show(&db, ty, target(&db, f))).collect();
+        let shown: Vec<_> = fields.iter().map(|(_, ty)| show(&db, ty, target(&db, f))).collect();
         assert_eq!(shown, ["Vec<T>"]);
 
         let round = params[0].derived_from_next_solver(params[0].to_next_solver());
@@ -117,7 +116,10 @@ enum One { A(u32) }
         assert!(sizes.iter().all(|&it| tag <= it && it <= size), "{sizes:?} in {size}");
         assert_eq!(direct.enum_tag_size(), Some(1));
 
-        assert!(layout("Niche").direct_tag_variant_sizes().is_none(), "a niche holds `Niche`'s tag");
+        assert!(
+            layout("Niche").direct_tag_variant_sizes().is_none(),
+            "a niche holds `Niche`'s tag"
+        );
         assert!(layout("One").direct_tag_variant_sizes().is_none(), "one variant has no tag");
     });
 }
@@ -157,7 +159,15 @@ fn where_predicates_are_the_written_ones() {
         let preds = crate::GenericDef::Function(f).where_predicates(&db);
         let traits: Vec<_> = preds
             .iter()
-            .map(|it| it.as_trait().expect("a trait bound").trait_ref().trait_().name(&db).as_str().to_owned())
+            .map(|it| {
+                it.as_trait()
+                    .expect("a trait bound")
+                    .trait_ref()
+                    .trait_()
+                    .name(&db)
+                    .as_str()
+                    .to_owned()
+            })
             .collect();
         assert_eq!(traits, ["Copy", "Tr", "Sized"], "the written ones, then the implicit `Sized`");
         for pred in &preds {

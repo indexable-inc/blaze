@@ -73,7 +73,11 @@ pub(crate) fn key(n: u32) -> InstanceKey {
 }
 
 pub(crate) fn function(n: u32) -> Function {
-    Function { key: key(n), code: CodeHash(id("blaze-lazy test code", n)), item: ItemKey(id("blaze-lazy test item", n)) }
+    Function {
+        key: key(n),
+        code: CodeHash(id("blaze-lazy test code", n)),
+        item: ItemKey(id("blaze-lazy test item", n)),
+    }
 }
 
 /// A compiled x86-64 function calling each of `callees` (`call rel32`) and taking the
@@ -83,12 +87,22 @@ pub(crate) fn compiled(n: u32, callees: &[u32], addressed: &[u32]) -> CompiledFu
     let mut relocs = Vec::new();
     for &callee in callees {
         code.push(0xe8);
-        relocs.push(blaze_codegen::Relocation { at: code.len() as u32, kind: RelocKind::PcRel32, target: Target::Function(key(callee)), addend: -4 });
+        relocs.push(blaze_codegen::Relocation {
+            at: code.len() as u32,
+            kind: RelocKind::PcRel32,
+            target: Target::Function(key(callee)),
+            addend: -4,
+        });
         code.extend_from_slice(&[0; 4]);
     }
     for &other in addressed {
         code.extend_from_slice(&[0x48, 0x8d, 0x05]);
-        relocs.push(blaze_codegen::Relocation { at: code.len() as u32, kind: RelocKind::PcRel32, target: Target::Function(key(other)), addend: -4 });
+        relocs.push(blaze_codegen::Relocation {
+            at: code.len() as u32,
+            kind: RelocKind::PcRel32,
+            target: Target::Function(key(other)),
+            addend: -4,
+        });
         code.extend_from_slice(&[0; 4]);
     }
     code.push(0xc3);

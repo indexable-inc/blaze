@@ -29,9 +29,12 @@ pub mod wire;
 
 use std::{io::Write as _, time::Duration};
 
-pub use queue::{Binary, Config, Failure, Finished, Job, Lines, Loaded, Mode, OUTSIDE, Outcome, Queue, Trace};
+pub use queue::{
+    Binary, Config, Failure, Finished, Job, Lines, Loaded, Mode, OUTSIDE, Outcome, Queue, Trace,
+};
 pub use select::{
-    Attrs, Decision, Filter, Ignored, Input, Passes, ShouldPanic, Suite, Test, Wanted, Why, changed_input,
+    Attrs, Decision, Filter, Ignored, Input, Passes, ShouldPanic, Suite, Test, Wanted, Why,
+    changed_input,
 };
 pub use wire::Executed;
 
@@ -119,7 +122,9 @@ pub fn report(binary: &str, finished: &Finished) -> Option<Report> {
         _ = match failure {
             Failure::Code(_) => Ok(()),
             Failure::Signal(signal) => write!(output, "\n[blaze: ended by signal {signal}]\n"),
-            Failure::TimedOut(after) => write!(output, "\n[blaze: killed after its timeout of {after:?}]\n"),
+            Failure::TimedOut(after) => {
+                write!(output, "\n[blaze: killed after its timeout of {after:?}]\n")
+            }
             Failure::Lost(why) => write!(output, "\n[blaze: {why}]\n"),
         };
     }
@@ -136,7 +141,7 @@ pub fn report(binary: &str, finished: &Finished) -> Option<Report> {
 pub fn report_unrun(binary: &str, name: &str, outcome: Reported, took: Option<Duration>) -> Report {
     Report {
         binary: binary.to_owned(), // alloc: the API's report owns its names (the edge)
-        name: name.to_owned(), // alloc: the API's report owns its names (the edge)
+        name: name.to_owned(),     // alloc: the API's report owns its names (the edge)
         outcome,
         output: Vec::new(), // alloc: empty, allocates nothing
         millis: took.map_or(0, millis),

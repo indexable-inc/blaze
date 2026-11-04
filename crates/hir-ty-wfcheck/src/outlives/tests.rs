@@ -4,10 +4,10 @@
 
 pub(crate) mod db;
 
-use hir_ty::db::HirDatabase;
 use base_db::{Db, all_crates};
 use hir_def::{AdtId, ModuleDefId, nameres::crate_def_map};
 use hir_expand::fixture;
+use hir_ty::db::HirDatabase;
 
 use super::*;
 use crate::{Site, wfcheck};
@@ -90,7 +90,8 @@ fn required_reference<'db>(
         TyKind::Alias(_, alias)
             if let rustc_type_ir::AliasTyKind::Projection { def_id: TraitAssocTyId(item) } =
                 alias.kind
-                && let ItemContainerId::TraitId(trait_) = hir_ty::next_solver::TermId::from(item).container(db) =>
+                && let ItemContainerId::TraitId(trait_) =
+                    hir_ty::next_solver::TermId::from(item).container(db) =>
         {
             let clauses = GenericPredicates::query_all(db, trait_.into())
                 .iter_instantiated(interner, alias.args.as_slice())
@@ -324,7 +325,11 @@ fn global_predicates_leave_out_only_what_holds() {
                 trait_predicates(&db, frame, ty, &mut predicates);
                 globals += predicates.iter().filter(|it| it.is_global()).count();
                 let mut expected = Vec::new();
-                prove_needs_reference(&Wfcx::new(frame, &db, adt.into()), &predicates, &mut expected);
+                prove_needs_reference(
+                    &Wfcx::new(frame, &db, adt.into()),
+                    &predicates,
+                    &mut expected,
+                );
                 let mut actual = Vec::new();
                 prove_needs(&Wfcx::new(frame, &db, adt.into()), &predicates, &mut actual);
                 let mut rest = expected.iter().copied();

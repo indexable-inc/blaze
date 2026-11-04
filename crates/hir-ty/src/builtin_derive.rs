@@ -5,8 +5,8 @@ use std::ops::ControlFlow;
 use base_db::Db;
 use blaze_mem::Frame;
 use hir_def::{
-    AdtId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, HasModule, TraitId,
-    TypeOrConstParamId, TypeParamId,
+    AdtId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, HasModule, TraitId, TypeOrConstParamId,
+    TypeParamId,
     attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplTrait,
     hir::generics::{GenericParams, TypeOrConstParamData},
@@ -131,11 +131,10 @@ pub fn impl_trait<'db>(
                 loc.adt,
                 GenericArgs::identity_for_item(interner, loc.adt.into()),
             );
-            EarlyBinder::bind(interner, TraitRef::new_from_args(
+            EarlyBinder::bind(
                 interner,
-                trait_id.into(),
-                trait_args(loc.trait_, self_ty),
-            ))
+                TraitRef::new_from_args(interner, trait_id.into(), trait_args(loc.trait_, self_ty)),
+            )
         }
         BuiltinDeriveImplTrait::CoerceUnsized | BuiltinDeriveImplTrait::DispatchFromDyn => {
             let generic_params = GenericParams::of(db, loc.adt.into());
@@ -146,11 +145,10 @@ pub fn impl_trait<'db>(
                 coerce_pointee_params(interner, loc, generic_params, trait_id)
             else {
                 // Malformed derive.
-                return EarlyBinder::bind(interner, TraitRef::new(
+                return EarlyBinder::bind(
                     interner,
-                    trait_id.into(),
-                    [self_ty, self_ty],
-                ));
+                    TraitRef::new(interner, trait_id.into(), [self_ty, self_ty]),
+                );
             };
             let changed_args = replace_pointee(interner, pointee_param_idx, new_param_ty, args);
             let changed_self_ty = Ty::new_adt(interner, loc.adt, changed_args);
@@ -381,7 +379,8 @@ fn extend_assoc_type_bounds<'db>(
         type Result = ();
 
         fn visit_ty(&mut self, t: Ty<'db>) -> Self::Result {
-            if let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) = t.kind() {
+            if let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) = t.kind()
+            {
                 self.assoc_type_bounds.push(
                     TraitRef::new_from_args(
                         self.interner,

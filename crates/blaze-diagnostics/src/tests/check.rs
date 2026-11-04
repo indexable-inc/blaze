@@ -56,7 +56,11 @@ fn main() {
 "#,
     );
     assert_reports(&checked.stderr_with(Style::default()), &[error(4, &["`a`", "`S`"])]);
-    let late = checked.messages().into_iter().filter(|it| it.starts_with("dead_code:")).collect::<Vec<_>>();
+    let late = checked
+        .messages()
+        .into_iter()
+        .filter(|it| it.starts_with("dead_code:"))
+        .collect::<Vec<_>>();
     assert!(late.is_empty(), "late lints after an error: {late:?}");
 }
 
@@ -69,9 +73,7 @@ fn unused() {}
 fn main() {}
 "#,
     );
-    assert_eq!(checked.messages(), [
-        "dead_code: function `unused` is never used",
-    ]);
+    assert_eq!(checked.messages(), ["dead_code: function `unused` is never used",]);
 }
 
 /// #1638: a diagnostic in a file `include!` read from outside every source root names the file
@@ -83,7 +85,9 @@ fn a_diagnostic_in_a_file_included_from_outside_every_root_names_its_path() {
     let code = dir.join("code.rs");
     std::fs::write(&code, "fn more() {}\n").expect("code.rs");
     let path = code.to_str().expect("a UTF-8 temporary path").to_owned();
-    let checked = checked(&format!("\n//- minicore: include\n//- /main.rs crate:other:main\ninclude!({path:?});\nfn main() {{}}\n"));
+    let checked = checked(&format!(
+        "\n//- minicore: include\n//- /main.rs crate:other:main\ninclude!({path:?});\nfn main() {{}}\n"
+    ));
     std::fs::remove_dir_all(&dir).expect("the temporary directory");
     assert_eq!(checked.messages(), ["dead_code: function `more` is never used"]);
     let span = checked.diags[0].span.primary_span().expect("the lint's span");
@@ -115,7 +119,9 @@ fn an_early_fatal_error_stops_every_later_pass() {
 
 fn main() { let _x: u32 = "a"; }
 "#;
-    assert_eq!(ui("invalid_digit_type.rs", "2015", source), r#"error[E0539]: malformed `recursion_limit` attribute input
+    assert_eq!(
+        ui("invalid_digit_type.rs", "2015", source),
+        r#"error[E0539]: malformed `recursion_limit` attribute input
   --> $DIR/invalid_digit_type.rs:1:4
    |
 LL | #![recursion_limit = 123]
@@ -133,7 +139,8 @@ LL + #![recursion_limit = "N"]
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0539`.
-"#);
+"#
+    );
 }
 
 /// What deciding lint levels says of an attribute after the fatal error (`unknown_lints`, which
@@ -145,7 +152,9 @@ fn what_lint_attributes_say_after_a_fatal_error_is_not_written() {
 #[allow(this_lint_does_not_exist)]
 fn main() {}
 "#;
-    assert_eq!(ui("invalid_digit_type.rs", "2015", source), r#"error[E0539]: malformed `recursion_limit` attribute input
+    assert_eq!(
+        ui("invalid_digit_type.rs", "2015", source),
+        r#"error[E0539]: malformed `recursion_limit` attribute input
   --> $DIR/invalid_digit_type.rs:1:4
    |
 LL | #![recursion_limit = 123]
@@ -163,7 +172,8 @@ LL + #![recursion_limit = "N"]
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0539`.
-"#);
+"#
+    );
 }
 
 /// The module blaze appends to a crate root (a wasm proc macro's glue, a test harness) is the
@@ -182,9 +192,19 @@ pub mod __appended {
     }
 }
 "#;
-    let unsafe_code = |messages: Vec<String>| messages.into_iter().filter(|it| it.starts_with("unsafe_code")).count();
-    assert_eq!(unsafe_code(checked(fixture).messages()), 1, "the module written in the file is linted");
-    assert_eq!(unsafe_code(checked_appending(fixture, "__appended").messages()), 0, "the appended module is not");
+    let unsafe_code = |messages: Vec<String>| {
+        messages.into_iter().filter(|it| it.starts_with("unsafe_code")).count()
+    };
+    assert_eq!(
+        unsafe_code(checked(fixture).messages()),
+        1,
+        "the module written in the file is linted"
+    );
+    assert_eq!(
+        unsafe_code(checked_appending(fixture, "__appended").messages()),
+        0,
+        "the appended module is not"
+    );
 }
 
 /// fixspan: a span in the module blaze appends to a crate root (a test harness) is of the root's
@@ -203,10 +223,18 @@ pub mod __appended {
 }
 "#;
     let named = |checked: &super::Checked| {
-        let diag = checked.diags.iter().find(|it| it.message == "can't find crate for `missing`").expect("the E0463 of `missing`");
+        let diag = checked
+            .diags
+            .iter()
+            .find(|it| it.message == "can't find crate for `missing`")
+            .expect("the E0463 of `missing`");
         diag.span.primary[0].file.clone()
     };
-    assert_eq!(named(&checked(fixture)), "lib.rs", "a root that is the file on disk is named by its path");
+    assert_eq!(
+        named(&checked(fixture)),
+        "lib.rs",
+        "a root that is the file on disk is named by its path"
+    );
     let appending = checked_appending(fixture, "__appended");
     let file = named(&appending);
     assert_ne!(file, "lib.rs", "a root with an appended module is not the file at its path");

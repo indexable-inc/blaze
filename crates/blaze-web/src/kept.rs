@@ -125,8 +125,8 @@ impl Kept {
             Some(at) => at,
             None => {
                 if self.workspaces.len() >= KEPT {
-                    let oldest = (0..self.workspaces.len())
-                        .min_by_key(|&it| self.workspaces[it].build());
+                    let oldest =
+                        (0..self.workspaces.len()).min_by_key(|&it| self.workspaces[it].build());
                     if let Some(oldest) = oldest {
                         self.workspaces.remove(oldest);
                     }

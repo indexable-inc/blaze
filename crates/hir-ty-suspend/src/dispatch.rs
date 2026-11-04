@@ -11,7 +11,6 @@
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_query::db::AsId;
 use hir_def::{
     CallableDefId, FieldId, FunctionId, GenericParamId, ItemContainerId, VariantId,
@@ -40,6 +39,7 @@ use hir_ty_mir::mir::{
 };
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 /// How deep a builtin derive's calls on its fields are followed inline: past it, a chain of
 /// derived types nested that deep is reported.
@@ -158,7 +158,10 @@ impl<'db> Cx<'db> {
 
 /// The arguments of the function `func` with every lifetime erased; `None` when it has a type
 /// or const parameter, its impl's or trait's included.
-pub(crate) fn concrete_args<'db>(interner: DbInterner<'db>, func: FunctionId) -> Option<GenericArgs<'db>> {
+pub(crate) fn concrete_args<'db>(
+    interner: DbInterner<'db>,
+    func: FunctionId,
+) -> Option<GenericArgs<'db>> {
     let mut generic = false;
     let args = GenericArgs::fill_rest(interner, func.into(), std::iter::empty(), |_, id, _| {
         generic |= !matches!(id, GenericParamId::LifetimeParamId(_));
@@ -225,9 +228,12 @@ impl<'a, 'db> Scan<'a, 'db> {
                     continue;
                 }
                 let from = match rvalue {
-                    Rvalue::Use(operand) | Rvalue::Cast(CastKind::PointerCoercion(PointerCast::UnsafeFnPointer), operand, _) => {
-                        operand
-                    }
+                    Rvalue::Use(operand)
+                    | Rvalue::Cast(
+                        CastKind::PointerCoercion(PointerCast::UnsafeFnPointer),
+                        operand,
+                        _,
+                    ) => operand,
                     _ => continue,
                 };
                 if let OperandKind::Copy(from) | OperandKind::Move(from) = &from.kind {
@@ -297,7 +303,9 @@ impl<'a, 'db> Scan<'a, 'db> {
         }
         match dispatch::call(&self.cx.infcx, self.cx.env, f, args) {
             Call::DropGlue(ty) => self.drop_glue(ty, &mut HashSet::new_in(Global), out),
-            Call::ConstEvalSelect(Some((CallableDefId::FunctionId(g), g_args))) => self.call(g, g_args, out),
+            Call::ConstEvalSelect(Some((CallableDefId::FunctionId(g), g_args))) => {
+                self.call(g, g_args, out)
+            }
             // No other intrinsic calls code.
             Call::ConstEvalSelect(_) | Call::Intrinsic(_) | Call::UnknownIntrinsic(_) => {}
             Call::Closure(def, parent) => self.walk(def, parent, out),
@@ -312,7 +320,13 @@ impl<'a, 'db> Scan<'a, 'db> {
     }
 
     /// A call of `f` past the dispatch on intrinsics, drop glue and `Fn*`.
-    fn method(&mut self, f: FunctionId, args: GenericArgs<'db>, callee: Callee<'db>, out: &mut SmallVec<[Target; 2]>) {
+    fn method(
+        &mut self,
+        f: FunctionId,
+        args: GenericArgs<'db>,
+        callee: Callee<'db>,
+        out: &mut SmallVec<[Target; 2]>,
+    ) {
         match callee {
             Callee::Poll(def, parent) => self.walk(def, parent, out),
             Callee::Virtual => {
@@ -354,7 +368,8 @@ impl<'a, 'db> Scan<'a, 'db> {
         self.derive_depth += 1;
         for variant in variants(cx.db, def.def_id()) {
             for (_, field) in cx.db.field_types(variant).iter() {
-                let field = cx.normalize(field.ty().instantiate(cx.interner, adt_args).skip_norm_wip());
+                let field =
+                    cx.normalize(field.ty().instantiate(cx.interner, adt_args).skip_norm_wip());
                 // alloc: inline up to four arguments, a derive's call per field
                 let replaced: SmallVec<[GenericArg<'db>; 4]> = args
                     .iter()
@@ -380,7 +395,12 @@ impl<'a, 'db> Scan<'a, 'db> {
     }
 
     /// Drop glue of `ty`: its `Drop` impl's `drop`, then its fields'.
-    fn drop_glue(&mut self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>, Global>, out: &mut SmallVec<[Target; 2]>) {
+    fn drop_glue(
+        &mut self,
+        ty: Ty<'db>,
+        seen: &mut HashSet<Ty<'db>, Global>,
+        out: &mut SmallVec<[Target; 2]>,
+    ) {
         let mut steps = SmallVec::new();
         dispatch::drop_glue(&self.cx.infcx, self.cx.env, ty, seen, &mut steps);
         for step in steps {
@@ -404,7 +424,9 @@ impl<'a, 'db> Scan<'a, 'db> {
                 }
             }
             CastKind::PointerCoercion(PointerCast::ClosureFnPointer(_)) => {
-                if let Some(TyKind::Closure(id, args)) = self.operand_ty(operand).map(|it| it.kind()) {
+                if let Some(TyKind::Closure(id, args)) =
+                    self.operand_ty(operand).map(|it| it.kind())
+                {
                     let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
                     let mut targets = SmallVec::new();
                     self.walk(Body::Closure(id.0.as_id()), parent, &mut targets);
@@ -414,7 +436,13 @@ impl<'a, 'db> Scan<'a, 'db> {
             CastKind::PointerCoercion(PointerCast::Unsize) => {
                 if let Some(from) = self.operand_ty(operand) {
                     let mut steps = SmallVec::new();
-                    dispatch::unsized_vtables(&self.cx.infcx, self.cx.env, from, to.as_ref(), &mut steps);
+                    dispatch::unsized_vtables(
+                        &self.cx.infcx,
+                        self.cx.env,
+                        from,
+                        to.as_ref(),
+                        &mut steps,
+                    );
                     for step in steps {
                         if let UnsizeStep::Vtable(concrete, dyn_ty) = step {
                             self.vtable(concrete, dyn_ty, span);
@@ -435,7 +463,11 @@ impl<'a, 'db> Scan<'a, 'db> {
             [] => only_into_marked(self.cx, self.body, place.local),
             _ => self.marked_field(place).is_some(),
         };
-        self.out.reified.push(Reified { span, targets: targets.into_iter().collect(), into_marked });
+        self.out.reified.push(Reified {
+            span,
+            targets: targets.into_iter().collect(),
+            into_marked,
+        });
     }
 
     /// The vtable of `concrete` for `dyn_ty`: its drop, and every method of the principal
@@ -444,20 +476,34 @@ impl<'a, 'db> Scan<'a, 'db> {
         let mut drop = SmallVec::new();
         self.drop_glue(concrete, &mut HashSet::new_in(Global), &mut drop);
         if !drop.is_empty() {
-            self.out.slots.push(Slot { span, concrete, method: None, targets: drop.into_iter().collect() });
+            self.out.slots.push(Slot {
+                span,
+                concrete,
+                method: None,
+                targets: drop.into_iter().collect(),
+            });
         }
         for (func, args) in vtable_methods(self.cx.interner, concrete, dyn_ty) {
             let mut targets = SmallVec::new();
             self.call(func, args, &mut targets);
             if !targets.is_empty() {
-                self.out.slots.push(Slot { span, concrete, method: Some(func), targets: targets.into_iter().collect() });
+                self.out.slots.push(Slot {
+                    span,
+                    concrete,
+                    method: Some(func),
+                    targets: targets.into_iter().collect(),
+                });
             }
         }
     }
 }
 
 /// The field marked `#[blaze::may_suspend]` that `place` ends in, if it ends in one.
-pub(crate) fn marked_field<'db>(cx: &Cx<'db>, body: &MirBody<'db>, place: &StoredPlace) -> Option<FieldId> {
+pub(crate) fn marked_field<'db>(
+    cx: &Cx<'db>,
+    body: &MirBody<'db>,
+    place: &StoredPlace,
+) -> Option<FieldId> {
     let (ProjectionElem::Field(field), parent) = place.projection.as_slice().split_last()? else {
         return None;
     };

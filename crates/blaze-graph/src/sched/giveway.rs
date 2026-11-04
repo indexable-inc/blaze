@@ -177,7 +177,13 @@ mod tests {
     }
 
     fn run(asked: u8, flight: u8, to: JobId) -> Run {
-        Run { asked: key(asked), named: format!("Chain({asked})").into(), flight: key(flight), to, owner: u64::from(to.0) }
+        Run {
+            asked: key(asked),
+            named: format!("Chain({asked})").into(),
+            flight: key(flight),
+            to,
+            owner: u64::from(to.0),
+        }
     }
 
     /// A transcript of one job's give-ways, with no scheduler: a give-way to a new run starts a
@@ -197,10 +203,20 @@ mod tests {
         let stuck = last.refused().expect_err("the bound's give-way in a row");
         assert_eq!(
             stuck,
-            NoProgress { asked: key(1), named: "Chain(1)".into(), job: Y, to: X, give_ways: GIVE_WAYS_WITHOUT_PROGRESS }
+            NoProgress {
+                asked: key(1),
+                named: "Chain(1)".into(),
+                job: Y,
+                to: X,
+                give_ways: GIVE_WAYS_WITHOUT_PROGRESS
+            }
         );
         let said = stuck.to_string();
-        assert!(said.contains("job 2 gave way 64 times") && said.contains("Chain(1) (key 0101010101010101) by job 1"), "{said}");
+        assert!(
+            said.contains("job 2 gave way 64 times")
+                && said.contains("Chain(1) (key 0101010101010101) by job 1"),
+            "{said}"
+        );
     }
 
     /// The streak is the job's: a give-way to another run goes on with it, so give-ways

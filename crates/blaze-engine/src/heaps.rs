@@ -32,9 +32,9 @@ use std::{
 use blaze_graph::arena::Holders;
 use blaze_mem::Tag;
 use libmimalloc_sys::{
-    mi_collect, mi_free, mi_heap_delete, mi_heap_malloc_aligned, mi_heap_new, mi_heap_realloc_aligned, mi_heap_t,
-    mi_heap_zalloc_aligned, mi_malloc, mi_malloc_aligned, mi_process_info, mi_realloc_aligned, mi_theap_t,
-    mi_zalloc, mi_zalloc_aligned,
+    mi_collect, mi_free, mi_heap_delete, mi_heap_malloc_aligned, mi_heap_new,
+    mi_heap_realloc_aligned, mi_heap_t, mi_heap_zalloc_aligned, mi_malloc, mi_malloc_aligned,
+    mi_process_info, mi_realloc_aligned, mi_theap_t, mi_zalloc, mi_zalloc_aligned,
 };
 
 unsafe extern "C" {
@@ -48,7 +48,11 @@ unsafe extern "C" {
     fn mi_heap_theap(heap: *mut mi_heap_t) -> *mut mi_theap_t;
     fn mi_theap_malloc(theap: *mut mi_theap_t, size: usize) -> *mut c_void;
     fn mi_theap_zalloc(theap: *mut mi_theap_t, size: usize) -> *mut c_void;
-    fn mi_theap_malloc_aligned(theap: *mut mi_theap_t, size: usize, alignment: usize) -> *mut c_void;
+    fn mi_theap_malloc_aligned(
+        theap: *mut mi_theap_t,
+        size: usize,
+        alignment: usize,
+    ) -> *mut c_void;
     /// Collects `theap`, a theap of the calling thread's: takes in the blocks other threads freed
     /// into its pages, gives each page left empty back to its arena (`force`: retired ones too,
     /// and full pages visited), and purges the arenas' free pages now rather than after
@@ -99,7 +103,8 @@ fn heap_of(ptr: *const u8) -> *mut mi_heap_t {
 fn check_page_map(heap: *mut mi_heap_t) {
     for size in [48, 1000, 64 << 10, 1 << 20, 64 << 20] {
         // SAFETY: a heap of ours and the main heap; each block is freed below, unused.
-        let blocks = unsafe { [mi_heap_malloc_aligned(heap, size, 16), mi_malloc_aligned(size, 16)] };
+        let blocks =
+            unsafe { [mi_heap_malloc_aligned(heap, size, 16), mi_malloc_aligned(size, 16)] };
         for block in blocks {
             if block.is_null() {
                 continue;
@@ -125,7 +130,8 @@ fn check_page_map(heap: *mut mi_heap_t) {
 pub(crate) struct Heaps;
 
 /// Each tag's heap, made on its first allocation.
-static HEAPS: [AtomicPtr<mi_heap_t>; Tag::COUNT] = [const { AtomicPtr::new(ptr::null_mut()) }; Tag::COUNT];
+static HEAPS: [AtomicPtr<mi_heap_t>; Tag::COUNT] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; Tag::COUNT];
 
 /// [`check_page_map`] ran: once, as the first tag heap is made.
 static CHECKED: Once = Once::new();
@@ -247,7 +253,8 @@ const _: () = assert!(usize::BITS == 64, "a slot packs a 56-bit address and a ta
 #[inline(always)]
 fn first_slot(heap: *mut mi_heap_t) -> usize {
     // Fibonacci hashing of the address, past the bits its alignment fixes.
-    ((heap.addr() >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - SLOTS.trailing_zeros())) as usize
+    ((heap.addr() >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        >> (usize::BITS - SLOTS.trailing_zeros())) as usize
 }
 
 /// Says `heap` is `tag`'s in the table [`holder`] reads; `false` where its address does not
@@ -289,7 +296,12 @@ fn make(tag: Tag) -> Option<*mut mi_heap_t> {
     }
     // Before any heap is filed, so no free is taken off a tag by an unchecked read.
     CHECKED.call_once(|| check_page_map(made));
-    match HEAPS[tag.index()].compare_exchange(ptr::null_mut(), made, Ordering::AcqRel, Ordering::Acquire) {
+    match HEAPS[tag.index()].compare_exchange(
+        ptr::null_mut(),
+        made,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
         Ok(_) => {
             if !file(made, tag) {
                 unnamed(made);
@@ -430,7 +442,13 @@ impl Holders for Heaps {
     }
 
     #[inline]
-    unsafe fn realloc_for(&self, into: Option<Tag>, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    unsafe fn realloc_for(
+        &self,
+        into: Option<Tag>,
+        ptr: *mut u8,
+        layout: Layout,
+        new_size: usize,
+    ) -> *mut u8 {
         // SAFETY: the caller upholds `realloc`'s contract. mimalloc keeps a block that still
         // fits where it is, on its heap; one that moves goes to `into`'s heap (never deleted)
         // or the thread's default one.
@@ -491,12 +509,23 @@ mod tests {
     #[test]
     fn the_page_map_names_each_blocks_heap_as_mimalloc_does() {
         let heaps = Heaps;
-        for (size, align) in [(24, 8), (40, 16), (4096, 8), (3000, 4096), (100, 64 << 10), (5 << 20, 4 << 20), (70 << 20, 16)] {
+        for (size, align) in [
+            (24, 8),
+            (40, 16),
+            (4096, 8),
+            (3000, 4096),
+            (100, 64 << 10),
+            (5 << 20, 4 << 20),
+            (70 << 20, 16),
+        ] {
             let layout = Layout::from_size_align(size, align).expect("a valid layout");
             // SAFETY: a valid layout; the block is freed once, with it.
             unsafe {
                 let block = heaps.alloc_for(Tag::Parse, layout, size % 2 == 0);
-                assert!(!block.is_null() && block.addr() % align == 0, "{size} B aligned to {align}");
+                assert!(
+                    !block.is_null() && block.addr() % align == 0,
+                    "{size} B aligned to {align}"
+                );
                 assert_eq!(heap_of(block), mi_heap_of(block.cast()), "{size} B aligned to {align}");
                 assert_eq!(heaps.holder(block), Some(Tag::Parse), "{size} B aligned to {align}");
                 heaps.dealloc(block, layout);
@@ -513,7 +542,8 @@ mod tests {
     fn a_give_back_purges_the_pages_a_thread_freed_at_once() {
         const BLOCK: usize = 4 << 10;
         const BLOCKS: usize = 64 << 10; // 256 MiB
-        let (freed, asked, settled) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2), std::sync::Barrier::new(2));
+        let (freed, asked, settled) =
+            (std::sync::Barrier::new(2), std::sync::Barrier::new(2), std::sync::Barrier::new(2));
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 let mut blocks = Vec::with_capacity(BLOCKS);
@@ -537,11 +567,13 @@ mod tests {
                 settled.wait();
             });
             freed.wait();
-            let before = blaze_cargo::raw::memory::own_footprint().expect("the footprint is readable");
+            let before =
+                blaze_cargo::raw::memory::own_footprint().expect("the footprint is readable");
             blaze_mem::tag::give_back_heap();
             asked.wait();
             settled.wait();
-            let after = blaze_cargo::raw::memory::own_footprint().expect("the footprint is readable");
+            let after =
+                blaze_cargo::raw::memory::own_footprint().expect("the footprint is readable");
             let given = before.saturating_sub(after);
             assert!(
                 given >= (BLOCK * BLOCKS / 2) as u64,

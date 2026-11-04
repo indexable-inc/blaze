@@ -85,8 +85,12 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
                         0 => UserExternalName::new(namespace::PLACE, place(places, name.index)?),
                         1 => data.name(name.index)?,
                         fragment::INLINED => UserExternalName::new(namespace::BUILT_IN, 0),
-                        blaze_stencil::fuel::NAMESPACE => UserExternalName::new(namespace::FUEL, name.index),
-                        crate::wasm::INSTRUCTION => UserExternalName::new(namespace::WASM_INSTRUCTION, name.index),
+                        blaze_stencil::fuel::NAMESPACE => {
+                            UserExternalName::new(namespace::FUEL, name.index)
+                        }
+                        crate::wasm::INSTRUCTION => {
+                            UserExternalName::new(namespace::WASM_INSTRUCTION, name.index)
+                        }
                         // alloc: the error's message
                         other => return Err(format!("a name in the unknown namespace {other}")),
                     };
@@ -172,7 +176,11 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
 }
 
 /// The canonical bytes of a static's value, as [`of`] has a function's data.
-pub(crate) fn value(blob: &ConstBlob, requests: &Requests, places: &Places) -> Result<Vec<u8>, String> {
+pub(crate) fn value(
+    blob: &ConstBlob,
+    requests: &Requests,
+    places: &Places,
+) -> Result<Vec<u8>, String> {
     blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
         let data = Data::of(places, requests, frame)?;
         // alloc: the static's key bytes, returned to its caller
@@ -259,7 +267,11 @@ impl Hasher for Out<'_> {
 
 fn place(places: &Places, index: u32) -> Result<u32, String> {
     // alloc: the error's message
-    places.funcs.get(index as usize).copied().ok_or_else(|| format!("function {index} has no place"))
+    places
+        .funcs
+        .get(index as usize)
+        .copied()
+        .ok_or_else(|| format!("function {index} has no place"))
 }
 
 /// What each data request is in a shape: a place, or the number of the object among the
@@ -318,7 +330,9 @@ impl<'f> Data<'f> {
                 DataPlace::Own => {
                     let (blob, tag) = match &requests.datas[index] {
                         DataRequest::Blob { blob, identity: DataIdentity::Writable } => (blob, 5),
-                        DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => (blob, 4),
+                        DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => {
+                            (blob, 4)
+                        }
                         // alloc: the error's message
                         _ => return Err(format!("data {index} is its own but has no blob")),
                     };

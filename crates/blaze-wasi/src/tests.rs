@@ -6,7 +6,10 @@ use crate::{Embed, FUNCTIONS, Stop, System, W32, W64, Width, link};
 struct Nothing;
 
 impl Embed for Nothing {
-    fn with<R>(_: &mut Caller<'_, Self>, _: impl FnOnce(&mut [u8], &mut dyn System) -> Result<R, Stop>) -> wasmtime::Result<R> {
+    fn with<R>(
+        _: &mut Caller<'_, Self>,
+        _: impl FnOnce(&mut [u8], &mut dyn System) -> Result<R, Stop>,
+    ) -> wasmtime::Result<R> {
         Err(wasmtime::Error::msg("no guest"))
     }
 }

@@ -69,8 +69,14 @@ pub enum WaitKind {
 
 impl WaitKind {
     /// Every kind, each at its [`WaitKind::index`].
-    pub const ALL: [WaitKind; 6] =
-        [WaitKind::Key, WaitKind::Lock, WaitKind::Channel, WaitKind::Io, WaitKind::Child, WaitKind::Scope];
+    pub const ALL: [WaitKind; 6] = [
+        WaitKind::Key,
+        WaitKind::Lock,
+        WaitKind::Channel,
+        WaitKind::Io,
+        WaitKind::Child,
+        WaitKind::Scope,
+    ];
 
     pub const fn index(self) -> usize {
         self as usize

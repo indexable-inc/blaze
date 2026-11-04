@@ -45,7 +45,13 @@ fn linked() -> Vec<u8> {
     let mut image = Image::new(name(TO), macos()).unwrap();
     let change = Change {
         natives: vec![
-            Native { id: id(100), name: "/x/eh_fde.o", bytes: &object, kind: NativeKind::Object, order: 0 },
+            Native {
+                id: id(100),
+                name: "/x/eh_fde.o",
+                bytes: &object,
+                kind: NativeKind::Object,
+                order: 0,
+            },
             Native {
                 id: id(101),
                 name: "/sdk/usr/lib/libSystem.tbd",
@@ -92,8 +98,15 @@ fn an_fde_whose_pc_begin_subtracts_a_symbol_of_eh_frame_links_and_unwinds() {
     // so `_middle` is as far before the entry, `_main`, as it is in the object. The entry is
     // LC_MAIN's offset in the file, which `__TEXT` maps from its start.
     let input = object::File::parse(OBJECT).unwrap();
-    let at = |name: &str| input.symbols().find(|it| it.name() == Ok(name)).unwrap_or_else(|| panic!("no {name}")).address();
-    let text = file.segments().find(|it| it.name() == Ok(Some("__TEXT"))).expect("a __TEXT segment");
+    let at = |name: &str| {
+        input
+            .symbols()
+            .find(|it| it.name() == Ok(name))
+            .unwrap_or_else(|| panic!("no {name}"))
+            .address()
+    };
+    let text =
+        file.segments().find(|it| it.name() == Ok(Some("__TEXT"))).expect("a __TEXT segment");
     assert_eq!(text.file_range().0, 0, "__TEXT maps the file from its start");
     let middle = text.address() + file.entry() - (at("_main") - at("_middle"));
     assert_eq!(fde_targets(&file), [middle], "the one FDE covers `_middle`");
@@ -113,5 +126,10 @@ fn an_fde_whose_pc_begin_subtracts_a_symbol_of_eh_frame_links_and_unwinds() {
     let status = std::process::Command::new(&program).status().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     // `_main` returns which of bit 0 (`_middle` seen) and bit 1 (`_main` seen) the walk missed.
-    assert_eq!(status.code(), Some(0), "{}: {status}: 1 is `_middle` missed, 2 `_main`", program.display());
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "{}: {status}: 1 is `_middle` missed, 2 `_main`",
+        program.display()
+    );
 }

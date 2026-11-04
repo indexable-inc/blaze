@@ -8,7 +8,11 @@ use blaze_core::{
 use super::*;
 
 pub(crate) fn opened(sim: &mut Sim) -> blaze_cas::Store {
-    let config = blaze_cas::Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 40 };
+    let config = blaze_cas::Config {
+        dir: FileName::new("store").unwrap(),
+        layers: Vec::new(),
+        tags: 1 << 40,
+    };
     let mut effects = Vec::new();
     let mut store = blaze_cas::Store::open(config, &mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
@@ -42,14 +46,21 @@ fn macros_of(store: &blaze_cas::Store, path: &str) -> Arc<blaze_macro_eval::Macr
 fn each_daemons_images_work_out_an_expansions_reads_with_its_own_macros_and_none_without() {
     let mut sim = Sim::new(1, Faults::default());
     let store = opened(&mut sim);
-    let traced = blaze_core::Traced { env: vec![("PATH".into(), Some("/one/bin".into()))], ..blaze_core::Traced::default() };
+    let traced = blaze_core::Traced {
+        env: vec![("PATH".into(), Some("/one/bin".into()))],
+        ..blaze_core::Traced::default()
+    };
     let shape = blaze_usercode::index::Shape::of(&traced).encode();
     let reported = blaze_usercode::index::VALUES.traced(&traced);
     let call = Env::default();
     let one = Images::new(store.reader(), macros_of(&store, "/one/bin"));
     let other = Images::new(store.reader(), macros_of(&store, "/other/bin"));
     assert_eq!(one.reads_now(&call, &shape), Ok(reported));
-    assert_ne!(other.reads_now(&call, &shape), Ok(reported), "one daemon's images read another's shell");
+    assert_ne!(
+        other.reads_now(&call, &shape),
+        Ok(reported),
+        "one daemon's images read another's shell"
+    );
     let refused = Images::new(store.reader(), no_macros()).reads_now(&call, &shape).unwrap_err();
     assert!(refused.contains("not kept here"), "{refused}");
 }
@@ -89,13 +100,19 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
 
 #[test]
 fn blaze_dep_images_is_check_verify_or_unset() {
-    let env = |value: &str| vec![("PATH".to_owned(), "/bin".to_owned()), (IMAGES.to_owned(), value.to_owned())];
+    let env = |value: &str| {
+        vec![("PATH".to_owned(), "/bin".to_owned()), (IMAGES.to_owned(), value.to_owned())]
+    };
     let mode_in = |env: &[(String, String)]| mode_in(&mut EnvReads::default(), env);
     assert_eq!(mode_in(&[]).unwrap(), Mode::Serve);
     assert_eq!(mode_in(&env("check")).unwrap(), Mode::Check);
     assert_eq!(mode_in(&env("verify")).unwrap(), Mode::Verify);
     let error = mode_in(&env("off")).unwrap_err();
-    assert!(error.what.starts_with("BLAZE_DEP_IMAGES=off is not a value blaze takes"), "{}", error.what);
+    assert!(
+        error.what.starts_with("BLAZE_DEP_IMAGES=off is not a value blaze takes"),
+        "{}",
+        error.what
+    );
 }
 
 #[test]
@@ -132,7 +149,10 @@ fn a_task_that_would_wait_on_itself_runs_again_and_another_panic_goes_on() {
 #[test]
 fn the_goal_note_names_every_count_that_kept_goals_out() {
     let plain = goal_store::Flushed { written: 3, kept: 5, ..goal_store::Flushed::default() };
-    assert_eq!(flushed(&plain).message, "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full");
+    assert_eq!(
+        flushed(&plain).message,
+        "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full"
+    );
     let out = goal_store::Flushed {
         slots_full: 1,
         inexpressible: vec![("impl_datum", 4), ("crate_env", 2)],
@@ -156,7 +176,11 @@ fn blaze_item_store_is_verify_off_or_unset() {
     assert_eq!(items_in(&env("verify")).unwrap(), Some(body_store::Mode::Verify));
     assert_eq!(items_in(&env("off")).unwrap(), None);
     let error = items_in(&env("check")).unwrap_err();
-    assert!(error.what.starts_with("BLAZE_ITEM_STORE=check is not a value blaze takes"), "{}", error.what);
+    assert!(
+        error.what.starts_with("BLAZE_ITEM_STORE=check is not a value blaze takes"),
+        "{}",
+        error.what
+    );
 }
 
 /// The stores' modes are read through the session's [`EnvReads`], so the front end kept with
@@ -169,9 +193,11 @@ fn the_stores_modes_are_noted_read() {
     mode_in(&mut read, &first).unwrap();
     let names: Vec<_> = read.names().map(|(name, _)| name).collect();
     assert_eq!(names, [IMAGES, ITEMS]);
-    let unrelated = vec![(ITEMS.to_owned(), "verify".to_owned()), ("SHLVL".to_owned(), "2".to_owned())];
+    let unrelated =
+        vec![(ITEMS.to_owned(), "verify".to_owned()), ("SHLVL".to_owned(), "2".to_owned())];
     assert_eq!(read.moved(&unrelated), None);
-    let images = vec![(IMAGES.to_owned(), "check".to_owned()), (ITEMS.to_owned(), "verify".to_owned())];
+    let images =
+        vec![(IMAGES.to_owned(), "check".to_owned()), (ITEMS.to_owned(), "verify".to_owned())];
     assert_eq!(read.moved(&images).map(|it| it.name), Some(IMAGES.to_owned()));
 }
 
@@ -179,7 +205,10 @@ fn the_stores_modes_are_noted_read() {
 fn the_note_adds_the_item_store_counts_after_the_goals() {
     let goals = goal_store::Flushed { written: 3, kept: 5, ..goal_store::Flushed::default() };
     let alone = noted(Some(&Flushes { goals, items: None }), None).unwrap();
-    assert_eq!(alone.message, "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full");
+    assert_eq!(
+        alone.message,
+        "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full"
+    );
     let items = body_store::Flushed {
         written: 2,
         kept: 9,

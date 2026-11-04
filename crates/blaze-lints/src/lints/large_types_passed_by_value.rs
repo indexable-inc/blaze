@@ -87,7 +87,8 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if inputs.len() != types.len() {
         return;
     }
-    let limit = u64::try_from(cx.conf().int("pass-by-value-size-limit", 256)).expect("a count, checked as the configuration loads");
+    let limit = u64::try_from(cx.conf().int("pass-by-value-size-limit", 256))
+        .expect("a count, checked as the configuration loads");
     // A trait's method is checked by `check_trait_item`, outside its body: its patterns are
     // not looked at.
     let in_body = owner != Owner::Trait && function.body().is_some();
@@ -96,8 +97,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         if !candidate {
             continue;
         }
-        let aggregate =
-            ty.as_adt().is_some() || ty.as_array_element(db).is_some() || !ty.tuple_fields(db).is_empty();
+        let aggregate = ty.as_adt().is_some()
+            || ty.as_array_element(db).is_some()
+            || !ty.tuple_fields(db).is_empty();
         if !aggregate {
             continue;
         }

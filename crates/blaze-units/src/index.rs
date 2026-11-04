@@ -10,7 +10,6 @@ use std::str::FromStr;
 
 use anyhow::{Context as _, bail};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_resolve::{
     DepKind, Dependency, IndexSummary, InternedString, PackageId, Platform, RustVersion, SourceId,
     Summary,
@@ -18,6 +17,7 @@ use blaze_resolve::{
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
+use std::alloc::Global;
 
 pub use blaze_manifest::dependency::Artifact;
 
@@ -277,7 +277,10 @@ pub struct Lines {
     raw: Vec<u8>,
     versions: Vec<Version>,
     spans: Vec<Range<usize>>,
-    #[expect(clippy::disallowed_types, reason = "each line parsed the first time a query matches its version: per index file, not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "each line parsed the first time a query matches its version: per index file, not global"
+    )]
     parsed: Vec<std::cell::OnceCell<Option<IndexLine>>>,
 }
 
@@ -318,7 +321,9 @@ impl Lines {
     ) -> impl Iterator<Item = &'s IndexLine> + 's {
         self.versions.iter().enumerate().filter(move |(_, version)| matches(version)).filter_map(
             move |(at, _)| {
-                self.parsed[at].get_or_init(|| parse_line(&self.raw[self.spans[at].clone()]).ok()).as_ref()
+                self.parsed[at]
+                    .get_or_init(|| parse_line(&self.raw[self.spans[at].clone()]).ok())
+                    .as_ref()
             },
         )
     }

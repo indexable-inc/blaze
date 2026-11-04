@@ -65,7 +65,10 @@ pub const PARTS: usize = 7;
 
 /// The parts of `def`'s identity, each hashed on its own and named, in the order
 /// [`identity`] hashes them: two identities that differ name the part they differ in.
-pub fn identity_parts(db: &Db, def: DefWithBodyId) -> Result<[(&'static str, ContentId); PARTS], &'static str> {
+pub fn identity_parts(
+    db: &Db,
+    def: DefWithBodyId,
+) -> Result<[(&'static str, ContentId); PARTS], &'static str> {
     if inputs::build(db).is_none() {
         return Err("no front-end build is set");
     }

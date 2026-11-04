@@ -29,11 +29,16 @@ fn the_first_to_ask_runs_and_the_rest_are_told() {
     let flights = Flights::new();
     let ran = flights.ask(key(1), &owner(), || {
         // Another build asks while this run is under way: told it is theirs, never run.
-        let other = std::thread::scope(|scope| scope.spawn(|| flights.ask(key(1), &owner(), || panic!("ran twice"))).join());
+        let other = std::thread::scope(|scope| {
+            scope.spawn(|| flights.ask(key(1), &owner(), || panic!("ran twice"))).join()
+        });
         (Some(shape(1)), other.unwrap())
     });
     assert_eq!(ran, Asked::Ran(Asked::<()>::Theirs));
-    assert_eq!(flights.ask(key(1), &owner(), || panic!("ran a landed function")), Asked::<()>::Landed(shape(1)));
+    assert_eq!(
+        flights.ask(key(1), &owner(), || panic!("ran a landed function")),
+        Asked::<()>::Landed(shape(1))
+    );
     assert_eq!(flights.wait(key(1), named), Some(shape(1)));
     assert_eq!(flights.landed(), 1);
 }
@@ -43,7 +48,11 @@ fn a_run_that_lands_nothing_lets_the_function_go() {
     let flights = Flights::new();
     assert_eq!(flights.ask(key(1), &owner(), || (None, 7)), Asked::Ran(7));
     assert_eq!(flights.wait(key(1), named), None, "nothing under way and nothing landed");
-    assert_eq!(flights.ask(key(1), &owner(), || (Some(shape(1)), 8)), Asked::Ran(8), "the next to ask runs it");
+    assert_eq!(
+        flights.ask(key(1), &owner(), || (Some(shape(1)), 8)),
+        Asked::Ran(8),
+        "the next to ask runs it"
+    );
     assert_eq!(flights.landed(), 1);
 }
 
@@ -94,7 +103,10 @@ fn a_landed_summary_is_taken_and_collected_with_its_landing() {
         });
         assert_eq!(ran, Asked::Ran(()));
     }
-    assert_eq!(flights.ask(key(1), &owner(), || panic!("ran a landed summary")), Asked::<()>::Landed(key(1).0));
+    assert_eq!(
+        flights.ask(key(1), &owner(), || panic!("ran a landed summary")),
+        Asked::<()>::Landed(key(1).0)
+    );
     assert_eq!(flights.summaries(&[key(1), key(3)]), [Some(summary(1)), None]);
     flights.retain(|it| *it == key(2).0);
     assert_eq!(flights.summaries(&[key(1), key(2)]), [None, Some(summary(2))]);
@@ -121,13 +133,20 @@ fn a_waiter_wakes_for_its_function_alone() {
             });
         });
         let waiter = scope.spawn(move || {
-            blaze_graph::spin::SpinWait::within("the owner to run", LONG, || flights.runs.running() == 1);
-            assert_eq!(flights.ask(key(1), &owner(), || panic!("ran a function under way")), Asked::<()>::Theirs);
+            blaze_graph::spin::SpinWait::within("the owner to run", LONG, || {
+                flights.runs.running() == 1
+            });
+            assert_eq!(
+                flights.ask(key(1), &owner(), || panic!("ran a function under way")),
+                Asked::<()>::Theirs
+            );
             asked.send(()).unwrap();
             let got = flights.wait(key(1), named);
             landed.send(()).unwrap();
             assert_eq!(got, Some(shape(1)));
-            blaze_graph::spin::SpinWait::within("the owner's second run to end", LONG, || flights.runs.running() == 0);
+            blaze_graph::spin::SpinWait::within("the owner's second run to end", LONG, || {
+                flights.runs.running() == 0
+            });
             assert_eq!(flights.wait(key(2), named), None, "let go of, unlanded");
         });
         waiter.join().unwrap();
@@ -142,7 +161,8 @@ fn a_waiter_wakes_for_its_function_alone() {
 #[test]
 fn a_build_waiting_for_another_builds_function_leaves_its_thread_to_that_compile() {
     let flights = std::sync::Arc::new(Flights::new());
-    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     let go = blaze_graph::sched::Event::new();
     let on = go.waiter();
     let (running_tx, running) = crossbeam_channel::unbounded::<()>();
@@ -169,7 +189,10 @@ fn a_build_waiting_for_another_builds_function_leaves_its_thread_to_that_compile
         pool.submit(
             None,
             move || {
-                assert_eq!(flights.ask(key(1), &owner(), || panic!("ran a function under way")), Asked::<()>::Theirs);
+                assert_eq!(
+                    flights.ask(key(1), &owner(), || panic!("ran a function under way")),
+                    Asked::<()>::Theirs
+                );
                 asking_tx.send(()).unwrap();
                 flights.wait(key(1), named)
             },
@@ -178,14 +201,20 @@ fn a_build_waiting_for_another_builds_function_leaves_its_thread_to_that_compile
     }
     asking.recv_timeout(LONG).expect("the waiter runs once the owner parks");
     go.fire();
-    let waited = waited.recv_timeout(LONG).expect("the waiter parks its job, so the owner lands on the one worker");
+    let waited = waited
+        .recv_timeout(LONG)
+        .expect("the waiter parks its job, so the owner lands on the one worker");
     assert_eq!(waited, Ok(Some(shape(1))));
     assert_eq!(owned.recv_timeout(LONG).expect("the owner's build ends"), Ok(Asked::Ran(())));
 }
 
 /// One build's loop over its functions as the driver runs it: each asked for, each another
 /// build runs waited for once its own ran, each let go of asked for again.
-fn build_of(flights: &Flights, keys: &[InstanceKey], compile: impl Fn(InstanceKey) -> Option<ContentId>) -> Vec<Decision> {
+fn build_of(
+    flights: &Flights,
+    keys: &[InstanceKey],
+    compile: impl Fn(InstanceKey) -> Option<ContentId>,
+) -> Vec<Decision> {
     let mut plan = Plan::new(keys.len());
     let mut seen = Vec::new();
     loop {
@@ -255,7 +284,11 @@ fn a_plan_replays_a_transcript_of_asks_and_waits() {
     let transcript: &[(&[Told], &[Decision])] = &[
         (&[], &[Ask(0), Ask(1), Ask(2)]),
         (
-            &[Told::Asked(0, Found::Ran), Told::Asked(1, Found::Theirs), Told::Asked(2, Found::Landed(shape(2)))],
+            &[
+                Told::Asked(0, Found::Ran),
+                Told::Asked(1, Found::Theirs),
+                Told::Asked(2, Found::Landed(shape(2))),
+            ],
             &[Wait(1), Take(2, shape(2))],
         ),
         (&[Told::Waited(1, None)], &[Ask(1)]),
@@ -309,7 +342,8 @@ fn plans_of_builds_interleaved_at_random_end_with_one_landing_each() {
         let mut running: Vec<Option<usize>> = vec![None; KEYS];
         let mut plans: Vec<Plan> = (0..BUILDS).map(|_| Plan::new(KEYS)).collect();
         // Of each build: its decisions to go, and the run or wait it is in.
-        let mut queues: Vec<std::collections::VecDeque<Decision>> = vec![Default::default(); BUILDS];
+        let mut queues: Vec<std::collections::VecDeque<Decision>> =
+            vec![Default::default(); BUILDS];
         let mut busy: Vec<Option<Decision>> = vec![None; BUILDS];
         let mut runs = vec![0usize; KEYS];
         for step in 0.. {
@@ -317,7 +351,8 @@ fn plans_of_builds_interleaved_at_random_end_with_one_landing_each() {
             for (plan, queue) in plans.iter_mut().zip(&mut queues) {
                 queue.extend(plan.take_decisions());
             }
-            let live: Vec<usize> = (0..BUILDS).filter(|it| busy[*it].is_some() || !queues[*it].is_empty()).collect();
+            let live: Vec<usize> =
+                (0..BUILDS).filter(|it| busy[*it].is_some() || !queues[*it].is_empty()).collect();
             if live.is_empty() {
                 break;
             }
@@ -334,13 +369,18 @@ fn plans_of_builds_interleaved_at_random_end_with_one_landing_each() {
                     plans[build].asked(at, Found::Ran);
                 }
                 // A wait ends once nothing runs the key.
-                Some(Decision::Wait(at)) if running[at].is_none() => plans[build].waited(at, landed[at]),
+                Some(Decision::Wait(at)) if running[at].is_none() => {
+                    plans[build].waited(at, landed[at])
+                }
                 Some(waiting) => busy[build] = Some(waiting),
                 None => match queues[build].pop_front().expect("a live build has a decision") {
                     Decision::Ask(at) => match (landed[at], running[at]) {
                         (Some(shape), _) => plans[build].asked(at, Found::Landed(shape)),
                         (None, Some(other)) => {
-                            assert_ne!(other, build, "seed {seed}: a build asked for a key it runs");
+                            assert_ne!(
+                                other, build,
+                                "seed {seed}: a build asked for a key it runs"
+                            );
                             plans[build].asked(at, Found::Theirs);
                         }
                         (None, None) => {
@@ -358,7 +398,11 @@ fn plans_of_builds_interleaved_at_random_end_with_one_landing_each() {
         assert!(plans.iter().all(Plan::done), "seed {seed}");
         for at in 0..KEYS {
             if fails[at] {
-                assert!(runs[at] >= 1 && runs[at] <= BUILDS, "seed {seed}: key {at} failing ran {} times", runs[at]);
+                assert!(
+                    runs[at] >= 1 && runs[at] <= BUILDS,
+                    "seed {seed}: key {at} failing ran {} times",
+                    runs[at]
+                );
             } else {
                 assert_eq!(runs[at], 1, "seed {seed}: key {at} compiled {} times", runs[at]);
             }

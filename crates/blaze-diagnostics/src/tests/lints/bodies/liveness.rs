@@ -9,9 +9,13 @@ use crate::{
 /// [`ui`] of a UI test that needs core's items: core is minicore with `flags`
 /// (`crates/test-utils/src/minicore.rs`).
 fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}");
+    let fixture =
+        format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}");
     let options = compiletest(Mode::Other, &Options::default());
-    normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
+    normalized(
+        &checked_with(&fixture, "$DIR/", &options)
+            .stderr_with(Style { ui_testing: true, ..Style::default() }),
+    )
 }
 
 #[test]
@@ -98,7 +102,10 @@ LL |     x = 4;
 error: aborting due to 4 previous errors
 
 "#;
-    assert_eq!(ui_core("liveness-dead.rs", "2015", "clone, unary_ops, builtin_impls", source), stderr);
+    assert_eq!(
+        ui_core("liveness-dead.rs", "2015", "clone, unary_ops, builtin_impls", source),
+        stderr
+    );
 }
 
 #[test]
@@ -124,10 +131,7 @@ fn main() {
 "#;
     assert_reports(
         &ui("issue-117284-arg-in-macro.rs", "2015", source),
-        &[
-            error(4, &["`var`"]),
-            error(16, &["`a`"]),
-        ],
+        &[error(4, &["`var`"]), error(16, &["`a`"])],
     );
 }
 
@@ -281,7 +285,10 @@ LL | #![warn(unused)]
 warning: 1 warning emitted
 
 "#;
-    assert_eq!(ui("unused-variable-with-raw-identifier-in-struct-pattern.rs", "2015", source), stderr);
+    assert_eq!(
+        ui("unused-variable-with-raw-identifier-in-struct-pattern.rs", "2015", source),
+        stderr
+    );
 }
 
 #[test]
@@ -384,7 +391,17 @@ LL |         Foo { foo, .. } => {
 warning: 3 warnings emitted
 
 "#;
-    assert_eq!(crate::tests::ui_core_as(Mode::RunPass, "try-removing-the-field.rs", "2015", "copy", source, &Options::default()), stderr);
+    assert_eq!(
+        crate::tests::ui_core_as(
+            Mode::RunPass,
+            "try-removing-the-field.rs",
+            "2015",
+            "copy",
+            source,
+            &Options::default()
+        ),
+        stderr
+    );
 }
 
 #[test]
@@ -665,7 +682,12 @@ warning: 1 warning emitted
 
 "#;
     assert_eq!(
-        ui_run_pass("issue-49588-non-shorthand-field-patterns-in-pattern-macro.rs", "2015", source, &Options::default()),
+        ui_run_pass(
+            "issue-49588-non-shorthand-field-patterns-in-pattern-macro.rs",
+            "2015",
+            source,
+            &Options::default()
+        ),
         stderr
     );
 }

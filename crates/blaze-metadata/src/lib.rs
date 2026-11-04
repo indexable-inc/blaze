@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_manifest::config::RegistryConfig;
 use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::files::Disk;
@@ -42,6 +41,7 @@ use blaze_resolve::{
     QueryKind, Registry, ResolveVersion, RustVersion, SourceId, Summary, query_pinned,
 };
 use blaze_units::read::{self as summary, Package};
+use std::alloc::Global;
 
 pub use blaze_units::Read;
 
@@ -220,9 +220,10 @@ pub fn metadata_no_deps(asked: &Asked<'_>) -> Result<String> {
 pub fn metadata_locked(asked: &Asked<'_>) -> Result<String> {
     let relock =
         Relock { command: "metadata", locked: Some("--locked"), respect_source_config: true };
-    let made = resolving_with(asked, as_asked(asked), Some(relock), |resolved, serialized, ids, _| {
-        described(asked, &resolved, serialized, ids)
-    })?;
+    let made =
+        resolving_with(asked, as_asked(asked), Some(relock), |resolved, serialized, ids, _| {
+            described(asked, &resolved, serialized, ids)
+        })?;
     Ok(made.json)
 }
 
@@ -557,7 +558,9 @@ fn with_lock<R>(
 
 /// The metadata of `asked`, and what of it a build of its members reads ([`Made`]).
 fn made(asked: &Asked<'_>) -> Result<Made> {
-    resolving(asked, as_asked(asked), |resolved, serialized, ids| described(asked, &resolved, serialized, ids))
+    resolving(asked, as_asked(asked), |resolved, serialized, ids| {
+        described(asked, &resolved, serialized, ids)
+    })
 }
 
 /// Resolves the workspace of `asked` again after its manifests changed, as `cargo remove`

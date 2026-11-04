@@ -10,15 +10,12 @@
 
 use blaze_items::{Fact, ItemId};
 use hir_def::{AdtId, EnumId, Lookup, ModuleDefId, hir::ExprId};
-use hir_ty::next_solver::{
-    GenericArgs, Ty, TyKind,
-    infer::select::EvaluationResult,
-};
+use hir_ty::next_solver::{GenericArgs, Ty, TyKind, infer::select::EvaluationResult};
 use rustc_type_ir::{Mutability, inherent::IntoKind as _};
 
 use super::{between, can_be_used_for_suggestions, for_loop, source_callsite};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -98,7 +95,10 @@ impl LatePass for ForLoopsOverFallibles {
             ),
             None => diag.suggestion_with_style(
                 // alloc: the lint's diagnostic
-                vec![(start_span.clone(), format!("while let {var}(")), (end_span.clone(), ") = ".to_owned())],
+                vec![
+                    (start_span.clone(), format!("while let {var}(")),
+                    (end_span.clone(), ") = ".to_owned()),
+                ],
                 "to check pattern in a loop use `while let`",
                 Applicability::MaybeIncorrect,
                 SuggestionStyle::ShowCode,
@@ -155,7 +155,11 @@ fn next_receiver(
 
 /// rustc's `suggest_question_mark`: the body's value is a `Result`, and what the loop's
 /// `Result` holds implements `IntoIterator`.
-fn suggest_question_mark<'db>(b: &BodyCx<'_, '_, 'db>, solver: &util::Solver<'db>, args: GenericArgs<'db>) -> bool {
+fn suggest_question_mark<'db>(
+    b: &BodyCx<'_, '_, 'db>,
+    solver: &util::Solver<'db>,
+    args: GenericArgs<'db>,
+) -> bool {
     let lang_items = solver.interner().lang_items();
     let Some(into_iterator) = lang_items.IntoIterator else { return false };
     let result: Option<EnumId> = lang_items.ResultOk.map(|it| it.lookup(b.db()).parent);
@@ -165,5 +169,6 @@ fn suggest_question_mark<'db>(b: &BodyCx<'_, '_, 'db>, solver: &util::Solver<'db
         return false;
     }
     let Some(ty): Option<Ty<'db>> = args.types().next() else { return false };
-    solver.infcx.type_implements_trait(into_iterator, [ty], solver.env) <= EvaluationResult::EvaluatedToOkModuloOpaqueTypes
+    solver.infcx.type_implements_trait(into_iterator, [ty], solver.env)
+        <= EvaluationResult::EvaluatedToOkModuloOpaqueTypes
 }

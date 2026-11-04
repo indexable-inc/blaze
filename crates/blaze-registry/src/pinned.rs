@@ -2,7 +2,11 @@
 //! what [`blaze_fetch::Fetcher`] downloads and checks out through, here because blaze-fetch is
 //! under this crate and cannot name its client.
 
-use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use blaze_fetch::{Digest, Failure, Policy, redact, scrub};
 use blaze_source::{GitReference, SourceId};
@@ -40,9 +44,15 @@ impl blaze_fetch::Net for Net {
             Ok(answer) => {
                 let refused = HttpNotSuccessful::new(&redact(url), &answer);
                 let said = scrub(&refused.to_string()); // alloc: error path
-                Err(if refused.is_spurious() { Failure::Transient(said) } else { Failure::Permanent(said) })
+                Err(if refused.is_spurious() {
+                    Failure::Transient(said)
+                } else {
+                    Failure::Permanent(said)
+                })
             }
-            Err(e) if e.downcast_ref::<Transport>().is_some() => Err(Failure::Transient(scrub(&format!("{e:#}")))), // alloc: error path
+            Err(e) if e.downcast_ref::<Transport>().is_some() => {
+                Err(Failure::Transient(scrub(&format!("{e:#}"))))
+            } // alloc: error path
             Err(e) => Err(Failure::Permanent(scrub(&format!("{e:#}")))), // alloc: error path
         }
     }
@@ -89,20 +99,27 @@ impl blaze_fetch::Git for Git {
     /// Every error is [`scrub`]bed: git's and the URL parser's messages carry the repository's
     /// address, credentials and all.
     fn checkout(&self, repo: &str, rev: &str, scratch: &Path) -> Result<PathBuf, String> {
-        let url = url::Url::parse(repo).map_err(|e| format!("`{}` is not a URL: {e}", redact(repo)))?; // alloc: error path
+        let url =
+            url::Url::parse(repo).map_err(|e| format!("`{}` is not a URL: {e}", redact(repo)))?; // alloc: error path
         // alloc: once a checkout
-        let id = SourceId::for_git(&url, GitReference::Rev(rev.to_owned())).map_err(|e| scrub(&format!("{e:#}")))?; // alloc: error path
+        let id = SourceId::for_git(&url, GitReference::Rev(rev.to_owned()))
+            .map_err(|e| scrub(&format!("{e:#}")))?; // alloc: error path
         let mut context = Context::new(scratch.to_owned(), Arc::clone(&self.http)); // alloc: once a checkout
         context.net = self.net;
         // A checkout for blaze-fetch prints nothing: the daemon's stderr is serve.log, and git's
         // progress lines name the repository's address (whatever the caller's `net` says).
         context.net.retry.quiet = true;
-        let checkout = crate::git::fetch(&context, id, Some(rev)).map_err(|e| scrub(&format!("{e:#}")))?; // alloc: error path
+        let checkout =
+            crate::git::fetch(&context, id, Some(rev)).map_err(|e| scrub(&format!("{e:#}")))?; // alloc: error path
         if !checkout.rev.eq_ignore_ascii_case(rev) {
             return Err(format!("asked for {rev}, and the checkout is of {}", checkout.rev)); // alloc: error path
         }
         if !checkout.root.starts_with(scratch) {
-            return Err(format!("the checkout is at {}, outside its scratch directory {}", checkout.root.display(), scratch.display())); // alloc: error path
+            return Err(format!(
+                "the checkout is at {}, outside its scratch directory {}",
+                checkout.root.display(),
+                scratch.display()
+            )); // alloc: error path
         }
         Ok(checkout.root)
     }

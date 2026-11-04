@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use ast_merge_langs::Lang;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use snafu::ResultExt as _;
+use std::alloc::Global;
 use tree_sitter::StreamingIterator as _;
 
 use crate::corpus::{Corpus, NodeRef, Value};

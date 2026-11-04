@@ -10,8 +10,8 @@
 use std::mem::{offset_of, size_of};
 
 use blaze_format::{
-    ALIGN, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, open_verified, read_verified,
-    schema_of,
+    ALIGN, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, open_verified,
+    read_verified, schema_of,
 };
 use blaze_ids::ContentId;
 
@@ -66,8 +66,11 @@ mod records {
 }
 
 /// The schema of a pack's buffer; the values' own is in its root.
-pub const PACK_SCHEMA: SchemaHash =
-    schema_of(&[Part::Str("blaze v2 hashcons pack"), Part::U64(1), Part::Schema(<PackRoot as Record>::SCHEMA)]);
+pub const PACK_SCHEMA: SchemaHash = schema_of(&[
+    Part::Str("blaze v2 hashcons pack"),
+    Part::U64(1),
+    Part::Schema(<PackRoot as Record>::SCHEMA),
+]);
 
 impl<T: Consed + Persist> HashCons<T> {
     /// Every value, as one buffer: [`HashCons::sorted`]'s order, so equal interners write equal
@@ -106,7 +109,9 @@ impl<T: Consed + Persist> HashCons<T> {
         let at = out.next::<PackRoot>();
         let entries = match entries.is_empty() {
             true => Slice::EMPTY,
-            false => Slice::between(at + offset_of!(PackRoot, entries) as u64, first, entries.len()),
+            false => {
+                Slice::between(at + offset_of!(PackRoot, entries) as u64, first, entries.len())
+            }
         };
         let written = out.push(&PackRoot { schema: T::SCHEMA, entries });
         debug_assert_eq!(written, at);
@@ -142,26 +147,43 @@ impl<T: Load> HashCons<T> {
 
     /// [`HashCons::load_pack`] of bytes from outside this process, after checking they are
     /// the buffer `key` names.
-    pub fn load_pack_verified(&self, buffer: &[u8], key: ContentId, parts: T::Parts) -> Result<usize, FormatError> {
+    pub fn load_pack_verified(
+        &self,
+        buffer: &[u8],
+        key: ContentId,
+        parts: T::Parts,
+    ) -> Result<usize, FormatError> {
         let root = open_verified::<PackRoot>(buffer, PACK_SCHEMA, key)?;
         self.load_entries(root, buffer, parts)
     }
 
-    fn load_entries(&self, root: &PackRoot, buffer: &[u8], parts: T::Parts) -> Result<usize, FormatError> {
+    fn load_entries(
+        &self,
+        root: &PackRoot,
+        buffer: &[u8],
+        parts: T::Parts,
+    ) -> Result<usize, FormatError> {
         if root.schema != T::SCHEMA {
             return Err(FormatError::Schema { found: root.schema, wanted: T::SCHEMA });
         }
         let entries = root.entries.follow(buffer)?;
         let mut last: Option<ContentId> = None;
         for entry in entries {
-            let at = (entry as *const PackEntry as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
+            let at =
+                (entry as *const PackEntry as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
             if last.is_some_and(|last| last >= entry.content) {
-                return Err(FormatError::Invalid { at, what: "a pack whose values are not in content ID order" });
+                return Err(FormatError::Invalid {
+                    at,
+                    what: "a pack whose values are not in content ID order",
+                });
             }
             let value = T::load(T::read(entry.bytes.follow(buffer)?)?, parts);
             let content = content_of(&value);
             if content != entry.content {
-                return Err(FormatError::Invalid { at, what: "a pack value whose content ID is not its entry's" });
+                return Err(FormatError::Invalid {
+                    at,
+                    what: "a pack value whose content ID is not its entry's",
+                });
             }
             self.intern_content(content, value);
             last = Some(entry.content);

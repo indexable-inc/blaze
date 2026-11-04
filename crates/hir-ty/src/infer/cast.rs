@@ -371,8 +371,7 @@ impl<'db> CastCheck<'db> {
             } else {
                 unreachable!(
                     "could not cast from reference to array to pointer to array ({:?} to {:?})",
-                    self.expr_ty,
-                    array_ptr_type
+                    self.expr_ty, array_ptr_type
                 );
             }
 
@@ -419,8 +418,7 @@ impl<'db> CastCheck<'db> {
                 Some(&dst_kind),
             ));
         };
-        let failure =
-            |error| CastFailure::with_kinds(error, Some(&src_kind), Some(&dst_kind));
+        let failure = |error| CastFailure::with_kinds(error, Some(&src_kind), Some(&dst_kind));
 
         match (&src_kind, &dst_kind) {
             // thin -> fat? report invalid cast (don't complain about vtable kinds)
@@ -485,16 +483,18 @@ impl<'db> CastCheck<'db> {
                         // Check that `SrcAuto` (+auto traits implied by `Src`) is a superset of `DstAuto`.
                         // Emit an FCW otherwise.
                         let mut src_auto = Vec::new_in(ctx.frame);
-                        src_auto.extend(src_tty.auto_traits().into_iter().chain(
-                            crate::utils::all_super_traits(ctx.db, src_principal.0)
-                                .iter()
-                                .filter(|&&trait_| {
-                                    TraitSignature::of(ctx.db, trait_)
-                                        .flags
-                                        .contains(TraitFlags::AUTO)
-                                })
-                                .map(|&trait_| TraitIdWrapper(trait_)),
-                        ));
+                        src_auto.extend(
+                            src_tty.auto_traits().into_iter().chain(
+                                crate::utils::all_super_traits(ctx.db, src_principal.0)
+                                    .iter()
+                                    .filter(|&&trait_| {
+                                        TraitSignature::of(ctx.db, trait_)
+                                            .flags
+                                            .contains(TraitFlags::AUTO)
+                                    })
+                                    .map(|&trait_| TraitIdWrapper(trait_)),
+                            ),
+                        );
 
                         let mut added = dst_tty
                             .auto_traits()

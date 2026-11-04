@@ -81,10 +81,7 @@ fn remove_unused_locals<Body: BodyVisitable>(body: &mut GExprBody<Body>) {
     // Compute the set of used locals.
     // We always register the return variable and the input arguments.
     let mut visitor = LocalsUsageVisitor {
-        used_locals: body
-            .locals
-            .locals
-            .map_ref(|local| body.locals.is_return_or_arg(local.index)),
+        used_locals: body.locals.locals.map_ref(|local| body.locals.is_return_or_arg(local.index)),
     };
     body.drive_body(&mut visitor);
     let used_locals = visitor.used_locals;

@@ -1,6 +1,9 @@
 //! Wrappers over [`make`] constructors
 
-#![expect(clippy::needless_pass_by_value, reason = "rust-analyzer's owned-node builder API; goes with the handles as format moves to views")]
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "rust-analyzer's owned-node builder API; goes with the handles as format moves to views"
+)]
 
 use either::Either;
 

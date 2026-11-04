@@ -8,9 +8,9 @@
 use base_db::Crate;
 use blaze_dbsp::{Closure, Pos, ReadIndex};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir_expand::name::Name;
 use span::FileId;
+use std::alloc::Global;
 use syntax::ast;
 use triomphe::Arc;
 
@@ -153,7 +153,10 @@ impl CrateState {
         rows.reserve(self.rows.len());
         for group in self.groups.values() {
             for &module in &group.modules {
-                let row = self.rows.get(&module).unwrap_or_else(|| panic!("nameres delta: no row of {module:?}"));
+                let row = self
+                    .rows
+                    .get(&module)
+                    .unwrap_or_else(|| panic!("nameres delta: no row of {module:?}"));
                 // clone: a published row (a scope input's id), once per change of the module tree
                 rows.insert(module, row.clone());
             }
@@ -248,7 +251,9 @@ pub(super) fn clone_op(op: &DeclOp) -> DeclOp {
             DeclOp::MacroUsePrelude { name, mac, extern_crate }
         }
         // clone: as above
-        DeclOp::ExportedDerive { mac, helpers } => DeclOp::ExportedDerive { mac: *mac, helpers: helpers.clone() },
+        DeclOp::ExportedDerive { mac, helpers } => {
+            DeclOp::ExportedDerive { mac: *mac, helpers: helpers.clone() }
+        }
         &DeclOp::ProcMacroFn { func, mac } => DeclOp::ProcMacroFn { func, mac },
         &DeclOp::NotIntroducing(it) => DeclOp::NotIntroducing(it),
         DeclOp::Diagnostic(it) => DeclOp::Diagnostic(copy_diagnostic(it)),

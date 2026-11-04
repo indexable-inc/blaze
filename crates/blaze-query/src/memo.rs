@@ -33,7 +33,10 @@ use crate::{
         atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence},
         read_bytes,
     },
-    table::{COLLECT_AT, EDGE_RECORD, Edit, EdgeRecord, Free, FxMap, Generations, Ids, Map, Rows, ShortLock},
+    table::{
+        COLLECT_AT, EDGE_RECORD, EdgeRecord, Edit, Free, FxMap, Generations, Ids, Map, Rows,
+        ShortLock,
+    },
 };
 
 /// A memo: its row in the store's hot and cold columns.
@@ -106,7 +109,8 @@ impl MemoHot {
         fence(Ordering::Acquire);
         let again = self.seen.load(Ordering::Relaxed);
         let word = self.value.load(Ordering::Acquire);
-        (seen == again && seen == word && word != 0 && seen != LOCKED).then_some((bytes.cast_const(), len))
+        (seen == again && seen == word && word != 0 && seen != LOCKED)
+            .then_some((bytes.cast_const(), len))
     }
 }
 
@@ -191,7 +195,15 @@ unsafe impl Sync for ValueRow {}
 impl ValueRow {
     fn new(span: Span, memory: bool, id: ContentId, shared: bool) -> ValueRow {
         let (bytes, len, segment) = span.into_raw();
-        ValueRow { bytes, len, segment, id, memory, shared, names: AtomicU32::new(u32::from(shared)) }
+        ValueRow {
+            bytes,
+            len,
+            segment,
+            id,
+            memory,
+            shared,
+            names: AtomicU32::new(u32::from(shared)),
+        }
     }
 
     fn bytes(&self) -> &[u8] {
@@ -341,7 +353,14 @@ impl Store {
         self.ids.end()
     }
 
-    fn put_value(&self, frees: &mut Frees, span: Span, memory: bool, id: ContentId, shared: bool) -> u64 {
+    fn put_value(
+        &self,
+        frees: &mut Frees,
+        span: Span,
+        memory: bool,
+        id: ContentId,
+        shared: bool,
+    ) -> u64 {
         let row = self.value_ids.claim(&mut frees.values);
         let generation = self.generations.bump(row);
         // SAFETY: claimed just now and not yet published.
@@ -357,7 +376,13 @@ impl Store {
 
     /// The word of the shared row of `bytes`, with a name taken on it for the memo about to
     /// name it: the row of an equal value made before (its bytes compared), or a new one.
-    fn take_shared(&self, task: &Guard, shared: Shared, fingerprint: Fingerprint, bytes: &[u8]) -> u64 {
+    fn take_shared(
+        &self,
+        task: &Guard,
+        shared: Shared,
+        fingerprint: Fingerprint,
+        bytes: &[u8],
+    ) -> u64 {
         let key = shared_key(shared.schema, fingerprint);
         loop {
             if let Some(&word) = self.shared.get(task, &key) {
@@ -377,14 +402,20 @@ impl Store {
                 let mut names = value.names.load(Ordering::Relaxed);
                 while names != DEAD {
                     debug_assert!(names < DEAD - 1, "2^32 memos naming one value");
-                    match value.names.compare_exchange_weak(names, names + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                    match value.names.compare_exchange_weak(
+                        names,
+                        names + 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
                         Ok(_) => return word,
                         Err(now) => names = now,
                     }
                 }
             }
             let span = self.bytes.copy(bytes, blaze_format::ALIGN);
-            let made = self.frees(|frees| self.put_value(frees, span, true, ContentId::default(), true));
+            let made =
+                self.frees(|frees| self.put_value(frees, span, true, ContentId::default(), true));
             // What the published word replaced: none, or a dead row's (dead stays dead).
             let mut replaced = None;
             let mut ours = false;
@@ -416,7 +447,14 @@ impl Store {
 
     /// The memo's word, from the row it names: `value` is 0, a row this thread just put, or a
     /// shared row it took a name on.
-    fn add(&self, key: QueryKey, fingerprint: Fingerprint, code: u32, edges: Span, value: u64) -> MemoId {
+    fn add(
+        &self,
+        key: QueryKey,
+        fingerprint: Fingerprint,
+        code: u32,
+        edges: Span,
+        value: u64,
+    ) -> MemoId {
         let (bytes, value_len) = match value_row(value) {
             Some(row) => {
                 // SAFETY: as the comment says, the memo about to name the row keeps it.
@@ -593,7 +631,11 @@ impl Store {
             if seen == LOCKED || seen == hot.value.load(Ordering::Acquire) {
                 return;
             }
-            if hot.seen.compare_exchange(seen, LOCKED, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            if hot
+                .seen
+                .compare_exchange(seen, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
                 continue;
             }
             // Release: `LOCKED` is visible before any of the copy's stores.
@@ -617,8 +659,14 @@ impl Store {
     }
 
     /// The value in memory and the word naming it, for a cold write to swap out later.
-    pub(crate) fn in_memory<'g>(&'g self, task: &'g Guard, memo: MemoId) -> Option<(u64, &'g [u8])> {
-        self.value(task, memo).filter(|(_, value)| value.memory).map(|(word, value)| (word, value.bytes()))
+    pub(crate) fn in_memory<'g>(
+        &'g self,
+        task: &'g Guard,
+        memo: MemoId,
+    ) -> Option<(u64, &'g [u8])> {
+        self.value(task, memo)
+            .filter(|(_, value)| value.memory)
+            .map(|(word, value)| (word, value.bytes()))
     }
 
     pub(crate) fn stored(&self, task: &Guard, memo: MemoId) -> Stored {
@@ -641,7 +689,10 @@ impl Store {
         }
         // Release: this memo's reads of the row happen before the sweep that sees no name.
         let was = value.names.fetch_sub(1, Ordering::Release);
-        debug_assert!(was != 0 && was != DEAD, "a shared row let go of by a memo that did not name it");
+        debug_assert!(
+            was != 0 && was != DEAD,
+            "a shared row let go of by a memo that did not name it"
+        );
         true
     }
 
@@ -650,7 +701,12 @@ impl Store {
     /// row is let go of by its name instead.
     fn swap_value(&self, task: &Guard, memo: MemoId, was: u64, now: u64) -> bool {
         // SeqCst: see `refresh`.
-        let swapped = self.hot(task, memo).value.compare_exchange(was, now, Ordering::SeqCst, Ordering::Acquire);
+        let swapped = self.hot(task, memo).value.compare_exchange(
+            was,
+            now,
+            Ordering::SeqCst,
+            Ordering::Acquire,
+        );
         let (gone, unlinked) = match swapped {
             Ok(_) => (value_row(was), true),
             Err(_) => (value_row(now), false),
@@ -707,7 +763,14 @@ impl Store {
     /// # Safety
     ///
     /// `bytes` are in a mapping kept, unchanged, as long as the store lives.
-    pub(crate) unsafe fn to_disk(&self, task: &Guard, memo: MemoId, was: u64, bytes: &[u8], id: ContentId) -> bool {
+    pub(crate) unsafe fn to_disk(
+        &self,
+        task: &Guard,
+        memo: MemoId,
+        was: u64,
+        bytes: &[u8],
+        id: ContentId,
+    ) -> bool {
         // SAFETY: the caller's contract.
         let span = unsafe { Span::mapped(bytes) };
         let now = self.frees(|frees| self.put_value(frees, span, false, id, false));
@@ -718,7 +781,11 @@ impl Store {
     /// producer and edges.
     pub(crate) fn same(&self, task: &Guard, a: MemoId, other: &Store, b: MemoId) -> bool {
         let (x, y) = (self.hot(task, a), other.hot(task, b));
-        let codes = if ptr::eq(self, other) { x.code == y.code } else { self.parts(x.code) == other.parts(y.code) };
+        let codes = if ptr::eq(self, other) {
+            x.code == y.code
+        } else {
+            self.parts(x.code) == other.parts(y.code)
+        };
         x.fingerprint == y.fingerprint && codes && self.edges(task, a) == other.edges(task, b)
     }
 
@@ -825,7 +892,8 @@ impl Store {
             if ready.is_empty() {
                 return;
             }
-            let (mut pinned, mut free): (Vec<MemoId, _>, Vec<MemoId, _>) = (Vec::new_in(frame), Vec::new_in(frame));
+            let (mut pinned, mut free): (Vec<MemoId, _>, Vec<MemoId, _>) =
+                (Vec::new_in(frame), Vec::new_in(frame));
             {
                 let pins = self.pins.lock();
                 for &memo in &ready {
@@ -869,7 +937,10 @@ impl Store {
                 let value = unsafe { values.get(row) };
                 // Acquire: every memo's reads of the row happen before its retirement. A name
                 // taken meanwhile fails this exchange; none can be taken after it.
-                let dead = value.names.compare_exchange(0, DEAD, Ordering::Acquire, Ordering::Relaxed).is_ok();
+                let dead = value
+                    .names
+                    .compare_exchange(0, DEAD, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok();
                 if dead { Edit::Remove } else { Edit::Keep }
             },
             // Removed: unlinked from `shared` now. A dead word a maker replaced first is
@@ -973,8 +1044,14 @@ impl Store {
             return Slot { key, list: None, len, inline };
         }
         // SAFETY: `u32`s have no padding: every byte of the slice is initialized.
-        let bytes = unsafe { std::slice::from_raw_parts(memos.as_ptr().cast::<u8>(), size_of_val(memos)) };
-        Slot { key, list: Some(self.keys.copy(bytes, align_of::<MemoId>())), len, inline: [0; INLINE] }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(memos.as_ptr().cast::<u8>(), size_of_val(memos)) };
+        Slot {
+            key,
+            list: Some(self.keys.copy(bytes, align_of::<MemoId>())),
+            len,
+            inline: [0; INLINE],
+        }
     }
 }
 
@@ -1006,7 +1083,9 @@ impl Slot {
             Some(list) => {
                 let bytes = list.bytes();
                 // SAFETY: `len` `u32`s copied in at a 4-byte boundary by `Store::slot`.
-                unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<MemoId>(), self.len as usize) }
+                unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr().cast::<MemoId>(), self.len as usize)
+                }
             }
             None => &self.inline[..self.len as usize],
         }

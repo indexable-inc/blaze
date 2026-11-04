@@ -21,9 +21,15 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn names(area: &Path) -> Vec<String> {
-    let found =
-        fs::scan(&[area.to_string_lossy().into_owned()], None, u32::MAX, None, &crate::plan::Clock::default(), &mut fs::Sizes::new())
-            .unwrap_or_else(|why| panic!("{why}"));
+    let found = fs::scan(
+        &[area.to_string_lossy().into_owned()],
+        None,
+        u32::MAX,
+        None,
+        &crate::plan::Clock::default(),
+        &mut fs::Sizes::new(),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
     found.objects.into_iter().filter(|it| it.class == Class::Trash).map(|it| it.path).collect()
 }
 
@@ -159,7 +165,10 @@ impl Holder {
             }
         });
         let mut holder = Holder { child, lines };
-        holder.wait_for(&format!("the child of {test} to take the lease of {}", dir.display()), |line| line.ends_with(HELD));
+        holder.wait_for(
+            &format!("the child of {test} to take the lease of {}", dir.display()),
+            |line| line.ends_with(HELD),
+        );
         holder
     }
 
@@ -177,11 +186,15 @@ impl Holder {
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     _ = self.child.kill();
                     _ = self.child.wait();
-                    panic!("waiting for {step}: nothing in {CHILD_WAIT:?}, so the child was killed; it printed {seen:?}");
+                    panic!(
+                        "waiting for {step}: nothing in {CHILD_WAIT:?}, so the child was killed; it printed {seen:?}"
+                    );
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     let status = self.child.wait();
-                    panic!("waiting for {step}: the child's output ended ({status:?}); it printed {seen:?}");
+                    panic!(
+                        "waiting for {step}: the child's output ended ({status:?}); it printed {seen:?}"
+                    );
                 }
             }
         }
@@ -200,7 +213,9 @@ impl Holder {
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     _ = self.child.kill();
                     _ = self.child.wait();
-                    panic!("waiting for the lease holder to end after its stdin closed: nothing in {CHILD_WAIT:?}, so it was killed");
+                    panic!(
+                        "waiting for the lease holder to end after its stdin closed: nothing in {CHILD_WAIT:?}, so it was killed"
+                    );
                 }
             }
         }
@@ -233,7 +248,11 @@ fn a_lease_taken_between_the_walk_and_the_lock_moves_the_tree_back() {
         }
     });
     assert_eq!(swept, Swept::NestedLeased { dir: inner.to_string_lossy().into_owned() });
-    assert!(inner.join(lease::LEASE).is_file() && !to.exists(), "the tree is back at {}", dir.display());
+    assert!(
+        inner.join(lease::LEASE).is_file() && !to.exists(),
+        "the tree is back at {}",
+        dir.display()
+    );
     holder.expect("the child ran").release();
     assert_eq!(fs::trash(&dir, &to, Class::Workspace, None), Swept::Moved);
     std::fs::remove_dir_all(&area).unwrap();
@@ -268,7 +287,10 @@ fn a_tree_that_cannot_go_back_stays_in_trash_and_is_not_unlinked_while_leased() 
     assert!(to.is_dir() && dir.join("new").is_file());
     let moved_inner = to.join("debug").join("other-target");
     let refused = fs::unlink(&to, Vec::new()).unwrap_err();
-    assert!(refused.contains(&moved_inner.display().to_string()) && refused.contains("holds its lease"), "{refused}");
+    assert!(
+        refused.contains(&moved_inner.display().to_string()) && refused.contains("holds its lease"),
+        "{refused}"
+    );
     assert!(moved_inner.join(lease::LEASE).is_file());
     holder.expect("the child ran").release();
     fs::unlink(&to, Vec::new()).unwrap_or_else(|why| panic!("{why}"));
@@ -289,8 +311,9 @@ fn a_target_dir_inside_cargo_home_or_the_daemons_state_is_never_removed_or_marke
     for dir in [cargo.join("git"), root.join("v2"), machine.join("std"), root.join("build")] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    let protected = fs::Protected::new(Some(home.clone()), Some(cargo.clone()), None, &root, Some(&machine))
-        .unwrap_or_else(|why| panic!("{why}"));
+    let protected =
+        fs::Protected::new(Some(home.clone()), Some(cargo.clone()), None, &root, Some(&machine))
+            .unwrap_or_else(|why| panic!("{why}"));
     let refused = |dir: &Path| protected.refuses(dir).unwrap_or_else(|why| panic!("{why}"));
     for dir in [
         cargo.join("git"),

@@ -91,7 +91,9 @@ fn unwrap_call<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>) -> Option<(&'t str, ast
             if !matches!(name.text(), "unwrap" | "expect") {
                 return None;
             }
-            let PathResolution::Def(hir::ModuleDef::Function(f)) = cx.path(path)? else { return None };
+            let PathResolution::Def(hir::ModuleDef::Function(f)) = cx.path(path)? else {
+                return None;
+            };
             let db = cx.db();
             if !f.module(db).krate(db).origin(db).is_lang() {
                 return None;
@@ -108,7 +110,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
         return;
     }
     let Some((method, receiver)) = unwrap_call(cx, expr) else { return };
-    let Some(have) = cx.ty(receiver).and_then(|it| utils::option_or_result(cx, &it)) else { return };
+    let Some(have) = cx.ty(receiver).and_then(|it| utils::option_or_result(cx, &it)) else {
+        return;
+    };
     let Some(Owner::Fn(f)) = owner(cx, expr.syntax()) else { return };
     let Some(want) = returns(cx, f).and_then(|it| utils::option_or_result(cx, &it)) else { return };
     let Some(range) = cx.range(expr.syntax()) else { return };
@@ -125,10 +129,13 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
     }
     match (have, want) {
         ("Option", "Result") => {
-            diagnostic.help(format!("`{written}.ok_or(..)?` returns an error saying what was missing"));
+            diagnostic
+                .help(format!("`{written}.ok_or(..)?` returns an error saying what was missing"));
         }
         ("Result", "Option") => {
-            diagnostic.help(format!("`{written}.ok()?` returns `None`; the error is dropped, so say why in a comment"));
+            diagnostic.help(format!(
+                "`{written}.ok()?` returns `None`; the error is dropped, so say why in a comment"
+            ));
         }
         _ if method == "unwrap" => {
             diagnostic.suggestion(
@@ -139,7 +146,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
             );
         }
         _ => {
-            diagnostic.help(format!("`{written}?` returns the failure; put what `expect` says into the error"));
+            diagnostic.help(format!(
+                "`{written}?` returns the failure; put what `expect` says into the error"
+            ));
         }
     }
 }
@@ -173,7 +182,10 @@ pub async fn h() -> Option<u8> {
 "#,
         );
         assert_eq!(found.matches(FOUND).count(), 5, "{found}");
-        assert!(found.contains("`unwrap` of the `Result` `parse()` in `f`, which returns a `Result`"), "{found}");
+        assert!(
+            found.contains("`unwrap` of the `Result` `parse()` in `f`, which returns a `Result`"),
+            "{found}"
+        );
         assert!(found.contains("`find().ok_or(..)?`"), "{found}");
         assert!(found.contains("find()?"), "{found}");
     }

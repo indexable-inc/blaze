@@ -58,8 +58,8 @@ use std::{
 
 use blaze_core::exit::Exit;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_usercode::trace::Seen;
+use std::alloc::Global;
 
 use super::{Also, Recorder, Spec, tidy};
 
@@ -153,7 +153,10 @@ fn profile(writes: usize, lives: usize, sockets: usize, services: usize, network
         _ = writeln!(text, "(allow network-outbound (remote unix-socket {dir}))");
     }
     for at in 0..sockets {
-        _ = writeln!(text, "(allow network-outbound (remote unix-socket (path-literal (param \"SOCKET{at}\"))))");
+        _ = writeln!(
+            text,
+            "(allow network-outbound (remote unix-socket (path-literal (param \"SOCKET{at}\"))))"
+        );
     }
     text.push_str("(deny mach-lookup)\n(allow mach-lookup");
     for service in MACH_SERVICES.iter().chain(network.then_some(&RESOLVER_SERVICE)) {
@@ -260,7 +263,8 @@ fn library() -> Result<PathBuf, String> {
     let caches = caches
         .or_else(|| std::env::home_dir().map(|it| it.join(".cache")))
         .ok_or("no XDG_CACHE_HOME or home directory to keep the sandbox's library in")?;
-    let dir = caches.join("blaze/sandbox").join(crate::content::hex(&blaze_ids::b3::hash(LIBRARY)[..12]));
+    let dir =
+        caches.join("blaze/sandbox").join(crate::content::hex(&blaze_ids::b3::hash(LIBRARY)[..12]));
     let file = dir.join("libblaze_sandbox.dylib");
     // The name is that of the contents it should have; what is there is still compared, so a
     // file left half written, or changed since, is written again.
@@ -436,7 +440,10 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             let path = live.path.to_str().filter(|it| !it.contains(['\t', '\n']));
             let path = path.ok_or_else(|| {
                 // alloc: the error, once, and no sandbox is made.
-                format!("the live record {} is not a path the library can be told", live.path.display())
+                format!(
+                    "the live record {} is not a path the library can be told",
+                    live.path.display()
+                )
             })?;
             _ = writeln!(config, "V\t{path}");
             spellings(&live.path)
@@ -457,7 +464,10 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
     let sockets: Vec<String> = spec
         .readable
         .iter()
-        .filter(|it| std::fs::metadata(it).is_ok_and(|it| std::os::unix::fs::FileTypeExt::is_socket(&it.file_type())))
+        .filter(|it| {
+            std::fs::metadata(it)
+                .is_ok_and(|it| std::os::unix::fs::FileTypeExt::is_socket(&it.file_type()))
+        })
         .flat_map(|it| spellings(it))
         // alloc: once per run, as above.
         .collect();
@@ -467,8 +477,11 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             return Err(format!("the Mach service {service:?} can't be named in a profile"));
         }
     }
-    let profile = c(profile(writes.len(), lives.len(), sockets.len(), also.services.len(), also.network).as_bytes());
-    let mut params = Vec::with_capacity(2 * (writes.len() + lives.len() + sockets.len() + also.services.len()));
+    let profile =
+        c(profile(writes.len(), lives.len(), sockets.len(), also.services.len(), also.network)
+            .as_bytes());
+    let mut params =
+        Vec::with_capacity(2 * (writes.len() + lives.len() + sockets.len() + also.services.len()));
     let mut name = String::with_capacity(16);
     for (kind, values) in [("WRITE", &writes), ("LIVE", &lives), ("SOCKET", &sockets)] {
         for (at, it) in values.iter().enumerate() {
@@ -505,8 +518,15 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
     // The program's own `DYLD_INSERT_LIBRARIES` loads after the library, which takes it away
     // again before the program starts.
     let theirs: Option<&std::ffi::OsStr> = match also.env {
-        Some(given) => given.iter().find(|(name, _)| name == "DYLD_INSERT_LIBRARIES").map(|it| it.1.as_os_str()),
-        None => spec.env.iter().find(|(name, _)| name == "DYLD_INSERT_LIBRARIES").map(|it| std::ffi::OsStr::new(&it.1)),
+        Some(given) => given
+            .iter()
+            .find(|(name, _)| name == "DYLD_INSERT_LIBRARIES")
+            .map(|it| it.1.as_os_str()),
+        None => spec
+            .env
+            .iter()
+            .find(|(name, _)| name == "DYLD_INSERT_LIBRARIES")
+            .map(|it| std::ffi::OsStr::new(&it.1)),
     };
     let mut insert_var = OsString::from("DYLD_INSERT_LIBRARIES=");
     insert_var.push(library.as_os_str());
@@ -646,7 +666,8 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             }
         };
         if left {
-            let why = "processes of the run still ran after it ended, so what they read is not known";
+            let why =
+                "processes of the run still ran after it ended, so what they read is not known";
             recorder.reached(Seen::Incomplete, "", why);
         }
         if let Some(file) = &spec.record {
@@ -676,7 +697,10 @@ fn group_ended(group: libc::pid_t) -> bool {
         {
             return true;
         }
-        #[allow(clippy::disallowed_methods, reason = "the group's timer: macOS has no event for a process group's end, only each known pid's")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the group's timer: macOS has no event for a process group's end, only each known pid's"
+        )]
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     false
@@ -686,8 +710,7 @@ fn group_ended(group: libc::pid_t) -> bool {
 /// another's now, which only makes the record say it is not whole when it is.
 fn still_runs(pid: libc::pid_t) -> bool {
     // Signal 0 sends nothing: it only asks whether the process is there.
-    raw::kill(pid, 0) == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    raw::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Gives `recorder` what the processes of a run appended to `raw` (`macos_interpose.c` says
@@ -718,7 +741,9 @@ fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
                 loaded.insert(nonce);
                 continue;
             }
-            (Some("S"), Some(pid), None, None) if pid.parse::<libc::pid_t>().is_ok_and(|it| it > 0) => {
+            (Some("S"), Some(pid), None, None)
+                if pid.parse::<libc::pid_t>().is_ok_and(|it| it > 0) =>
+            {
                 if still_runs(pid.parse().unwrap_or_default()) {
                     // alloc: once per process left running, and the record is not whole.
                     let why = format!(
@@ -739,7 +764,9 @@ fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
                 lost.get_or_insert(why);
                 continue;
             }
-            (Some(letter), Some(test), Some(what), None) => Seen::of(letter).map(|it| (it, test, what)),
+            (Some(letter), Some(test), Some(what), None) => {
+                Seen::of(letter).map(|it| (it, test, what))
+            }
             _ => None,
         };
         match seen {
@@ -803,7 +830,8 @@ mod tests {
         };
         let mut recorder = Recorder::new(&spec, &["/dev"]);
         assert_eq!(super::merge(raw, &mut recorder), None);
-        let kept = |seen: Seen, what: &str| recorder.lines().any(|it| it.seen == seen && it.what == what);
+        let kept =
+            |seen: Seen, what: &str| recorder.lines().any(|it| it.seen == seen && it.what == what);
         assert!(kept(Seen::Env, "HOME") && kept(Seen::Untraceable, "clock"));
         let dir = std::env::temp_dir().join(format!("blaze-macos-merge-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -818,7 +846,10 @@ mod tests {
         assert_eq!(lines[2], "W\ta::b\t/Users/u/.config/x");
         assert_eq!(lines[3], "N\ta::c\t1.1.1.1:443");
         assert_eq!(lines[4], "X\t\tthe sandbox's record ends in a line cut short");
-        assert!(lines[5].starts_with("X\t\tthe sandbox's record has a line that is not one"), "{text}");
+        assert!(
+            lines[5].starts_with("X\t\tthe sandbox's record has a line that is not one"),
+            "{text}"
+        );
         assert!(lines[6].starts_with("X\ta::c\t/bin/sh ran without the recorder"), "{text}");
         assert_eq!(lines[7], "X\ta::d\ta path or a name with a tab or a line break in it");
     }
@@ -842,7 +873,10 @@ mod tests {
         assert_eq!(super::merge(&raw, &mut recorder), None);
         let lines: Vec<_> = recorder.lines().collect();
         let here = format!("process {} of the run left its process group", std::process::id());
-        assert!(lines.iter().any(|it| it.seen == Seen::Incomplete && it.what.starts_with(&here)), "{lines:?}");
+        assert!(
+            lines.iter().any(|it| it.seen == Seen::Incomplete && it.what.starts_with(&here)),
+            "{lines:?}"
+        );
         let gone = format!("process {gone_pid} ");
         assert!(!lines.iter().any(|it| it.what.starts_with(&gone)), "{lines:?}");
     }
@@ -852,7 +886,10 @@ mod tests {
         let closed = super::profile(2, 1, 1, 0, false);
         assert!(closed.contains("(subpath (param \"WRITE1\"))"), "{closed}");
         assert!(closed.contains("(literal (param \"LIVE0\"))"), "{closed}");
-        assert!(closed.contains("(remote unix-socket (path-literal (param \"SOCKET0\")))"), "{closed}");
+        assert!(
+            closed.contains("(remote unix-socket (path-literal (param \"SOCKET0\")))"),
+            "{closed}"
+        );
         assert!(closed.contains("(remote ip \"localhost:*\")"), "{closed}");
         assert!(!closed.contains("\"*:*\"") && !closed.contains("mDNSResponder"), "{closed}");
         assert!(!closed.contains("com.apple.dnssd.service"), "{closed}");
@@ -869,7 +906,9 @@ mod tests {
     fn each_mach_name_given_is_one_more_lookup_and_no_other_is_allowed() {
         let profile = super::profile(0, 0, 0, 2, false);
         let denied = profile.find("(deny mach-lookup)").expect("other lookups are refused");
-        let allowed = profile[denied..].find("(allow mach-lookup").expect("the profile's own are allowed") + denied;
+        let allowed =
+            profile[denied..].find("(allow mach-lookup").expect("the profile's own are allowed")
+                + denied;
         // The allowed list is the profile's last form.
         let list = &profile[allowed..];
         assert!(list.ends_with(")\n"), "{profile}");
@@ -905,7 +944,8 @@ mod tests {
         let names = std::fs::read_dir(&dir).unwrap().count();
         let now = std::time::SystemTime::now();
         assert!(now > std::time::UNIX_EPOCH);
-        std::fs::write(std::path::Path::new(&dir).join("seen"), format!("{value} {names}")).unwrap();
+        std::fs::write(std::path::Path::new(&dir).join("seen"), format!("{value} {names}"))
+            .unwrap();
     }
 
     /// A run of `blaze sandbox --v2` with the library in its program: its variables read by
@@ -927,9 +967,13 @@ mod tests {
         std::fs::write(out.join("a"), "").unwrap();
         let spec = blaze_usercode::confine::Spec {
             program: exe.clone(),
-            args: ["sandbox::macos::tests::helper_reads_a_variable_lists_and_reads_the_clock", "--exact", "--test-threads=1"]
-                .map(OsString::from)
-                .to_vec(),
+            args: [
+                "sandbox::macos::tests::helper_reads_a_variable_lists_and_reads_the_clock",
+                "--exact",
+                "--test-threads=1",
+            ]
+            .map(OsString::from)
+            .to_vec(),
             env: vec![
                 ("BLAZE_SANDBOX_TEST_HELPER".into(), out.clone().into()),
                 ("BLAZE_SANDBOX_TEST_VAR".into(), "v".into()),
@@ -944,6 +988,7 @@ mod tests {
             live: dir.join("live"),
             report: dir.join("report"),
             not_inputs: vec![exe],
+            given: None,
         };
         assert_eq!(crate::sandbox::alone::launch(&spec), 0);
         assert_eq!(std::fs::read_to_string(out.join("seen")).unwrap(), "v 1");
@@ -952,7 +997,8 @@ mod tests {
         assert_eq!(used, text.len(), "{text}");
         assert_eq!(lines[0], trace::Line::new(Seen::Env, "", trace::ALL_ENV));
         assert!(!lines.iter().any(|it| it.seen == Seen::Incomplete), "{text}");
-        let has = |seen: Seen, what: &str| lines.iter().any(|it| it.seen == seen && it.what == what);
+        let has =
+            |seen: Seen, what: &str| lines.iter().any(|it| it.seen == seen && it.what == what);
         assert!(has(Seen::Env, "BLAZE_SANDBOX_TEST_VAR"), "{text}");
         assert!(has(Seen::Untraceable, "clock"), "{text}");
         let listed = std::fs::canonicalize(&out).unwrap();

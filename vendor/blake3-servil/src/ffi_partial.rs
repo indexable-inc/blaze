@@ -55,7 +55,11 @@ fn hash_chunks_with_partial<const W: usize>(
     out: &mut [u8],
 ) {
     let n = whole.len();
-    assert!((1..W).contains(&n) && (1..CHUNK_LEN).contains(&partial.len()) && out.len() >= (n + 1) * OUT_LEN);
+    assert!(
+        (1..W).contains(&n)
+            && (1..CHUNK_LEN).contains(&partial.len())
+            && out.len() >= (n + 1) * OUT_LEN
+    );
     // The partial chunk zero-padded to a whole one, so its lane reads
     // within bounds after its last block; the lanes past it read it too.
     let mut padded = [0u8; CHUNK_LEN];
@@ -69,8 +73,13 @@ fn hash_chunks_with_partial<const W: usize>(
         iv: core::array::from_fn(|i| [IV[i]; W]),
         rot16: rotation(2),
         rot8: rotation(1),
-        ctr: [core::array::from_fn(|j| (counter + j as u64) as u32), core::array::from_fn(|j| ((counter + j as u64) >> 32) as u32)],
-        lens: core::array::from_fn(|b| core::array::from_fn(|j| if b == last && j == n { last_len } else { 64 })),
+        ctr: [
+            core::array::from_fn(|j| (counter + j as u64) as u32),
+            core::array::from_fn(|j| ((counter + j as u64) >> 32) as u32),
+        ],
+        lens: core::array::from_fn(|b| {
+            core::array::from_fn(|j| if b == last && j == n { last_len } else { 64 })
+        }),
         flags: core::array::from_fn(|b| {
             let mut f = flags;
             if b == 0 {
@@ -101,14 +110,44 @@ fn hash_chunks_with_partial<const W: usize>(
 
 /// [`hash_chunks_with_partial`] on four lanes: 1 to 3 whole chunks.
 /// Unsafe: the CPU must have SSE4.1.
-pub unsafe fn hash_chunks_with_partial_sse41(whole: &[&[u8; CHUNK_LEN]], partial: &[u8], key: &CVWords, counter: u64, flags: u8, out: &mut [u8]) {
-    hash_chunks_with_partial::<4>(blake3_servil_partial_sse41, whole, partial, key, counter, flags, out)
+pub unsafe fn hash_chunks_with_partial_sse41(
+    whole: &[&[u8; CHUNK_LEN]],
+    partial: &[u8],
+    key: &CVWords,
+    counter: u64,
+    flags: u8,
+    out: &mut [u8],
+) {
+    hash_chunks_with_partial::<4>(
+        blake3_servil_partial_sse41,
+        whole,
+        partial,
+        key,
+        counter,
+        flags,
+        out,
+    )
 }
 
 /// [`hash_chunks_with_partial`] on eight lanes: 1 to 7 whole chunks.
 /// Unsafe: the CPU must have AVX2.
-pub unsafe fn hash_chunks_with_partial_avx2(whole: &[&[u8; CHUNK_LEN]], partial: &[u8], key: &CVWords, counter: u64, flags: u8, out: &mut [u8]) {
-    hash_chunks_with_partial::<8>(blake3_servil_partial_avx2, whole, partial, key, counter, flags, out)
+pub unsafe fn hash_chunks_with_partial_avx2(
+    whole: &[&[u8; CHUNK_LEN]],
+    partial: &[u8],
+    key: &CVWords,
+    counter: u64,
+    flags: u8,
+    out: &mut [u8],
+) {
+    hash_chunks_with_partial::<8>(
+        blake3_servil_partial_avx2,
+        whole,
+        partial,
+        key,
+        counter,
+        flags,
+        out,
+    )
 }
 
 #[cfg(test)]
@@ -158,8 +197,14 @@ mod test {
     fn test_partial_kernels_against_portable() {
         let mut input = [0u8; 8 * CHUNK_LEN];
         crate::test::paint_test_input(&mut input);
-        let kernels: [(usize, unsafe fn(&[&[u8; CHUNK_LEN]], &[u8], &CVWords, u64, u8, &mut [u8]), bool); 2] =
-            [(4, hash_chunks_with_partial_sse41, crate::platform::sse41_detected()), (8, hash_chunks_with_partial_avx2, crate::platform::avx2_detected())];
+        let kernels: [(
+            usize,
+            unsafe fn(&[&[u8; CHUNK_LEN]], &[u8], &CVWords, u64, u8, &mut [u8]),
+            bool,
+        ); 2] = [
+            (4, hash_chunks_with_partial_sse41, crate::platform::sse41_detected()),
+            (8, hash_chunks_with_partial_avx2, crate::platform::avx2_detected()),
+        ];
         for (w, kernel, present) in kernels {
             if !present {
                 continue;
@@ -171,13 +216,33 @@ mod test {
                             continue;
                         }
                         for counter in [0, (1 << 32) - 2] {
-                            let chunks: std::vec::Vec<&[u8; CHUNK_LEN]> = input.chunks_exact(CHUNK_LEN).take(whole).map(|c| c.try_into().unwrap()).collect();
+                            let chunks: std::vec::Vec<&[u8; CHUNK_LEN]> = input
+                                .chunks_exact(CHUNK_LEN)
+                                .take(whole)
+                                .map(|c| c.try_into().unwrap())
+                                .collect();
                             let rest = &input[whole * CHUNK_LEN..][..partial];
                             let mut out = [0u8; 8 * OUT_LEN];
                             // Sound: the CPU has the kernel's instructions.
-                            unsafe { kernel(&chunks, rest, crate::IV, counter, crate::KEYED_HASH, &mut out) };
-                            for (i, chunk) in input[..whole * CHUNK_LEN + partial].chunks(CHUNK_LEN).enumerate() {
-                                let mut state = crate::ChunkState::new(crate::IV, counter + i as u64, crate::KEYED_HASH, crate::platform::Platform::SSE41);
+                            unsafe {
+                                kernel(
+                                    &chunks,
+                                    rest,
+                                    crate::IV,
+                                    counter,
+                                    crate::KEYED_HASH,
+                                    &mut out,
+                                )
+                            };
+                            for (i, chunk) in
+                                input[..whole * CHUNK_LEN + partial].chunks(CHUNK_LEN).enumerate()
+                            {
+                                let mut state = crate::ChunkState::new(
+                                    crate::IV,
+                                    counter + i as u64,
+                                    crate::KEYED_HASH,
+                                    crate::platform::Platform::SSE41,
+                                );
                                 state.update(chunk);
                                 assert_eq!(
                                     &out[i * OUT_LEN..][..OUT_LEN],

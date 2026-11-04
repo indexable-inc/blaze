@@ -17,14 +17,16 @@
 use blaze_hash::hash_map::Entry;
 
 use blaze_graph::par;
-use blaze_ids::radix;
 use blaze_hash::HashMap;
+use blaze_ids::radix;
 use std::alloc::Global;
 
 use super::code::{Header, NOTHING, Sig};
 use super::leb::{self, PADDED, padded_uleb};
 use super::reader::{MAGIC, Reader, Wasm as _};
-use super::{FUNCTIONS, HEAP, MEMORY_BASE, STACK_POINTER, TABLE, Wasm, heap_base, in_memory, initial_pages};
+use super::{
+    FUNCTIONS, HEAP, MEMORY_BASE, STACK_POINTER, TABLE, Wasm, heap_base, in_memory, initial_pages,
+};
 use crate::model::{Class, Placed, Region, SymbolKind, View};
 use crate::output::OutputKind;
 
@@ -76,14 +78,17 @@ pub(super) fn init_functions(placed: &Placed<'_>, memory64: bool) -> Result<Vec<
     for bytes in arrays() {
         if bytes.len() % width != 0 {
             // alloc: error path
-            return Err(format!("an init array of {} bytes, not of {width}-byte slots", bytes.len()));
+            return Err(format!(
+                "an init array of {} bytes, not of {width}-byte slots",
+                bytes.len()
+            ));
         }
         let mut push = |slot: u64| -> Result<(), String> {
-            let function = slot
-                .checked_sub(1)
-                .ok_or("an init function that is an undefined weak function")?;
+            let function =
+                slot.checked_sub(1).ok_or("an init function that is an undefined weak function")?;
             // alloc: error path
-            let function = u32::try_from(function).map_err(|_| format!("the init array's slot {slot}, past the table"))?;
+            let function = u32::try_from(function)
+                .map_err(|_| format!("the init array's slot {slot}, past the table"))?;
             functions.push(function);
             Ok(())
         };
@@ -208,25 +213,28 @@ fn functions<'a>(placed: &'a Placed<'a>, across: &'a mut Vec<u8>) -> Result<Vec<
             // alloc: error path
             .map_err(|e| format!("the function {}: {e}", name.unwrap_or("?")))
     };
-    let failure = par::find_map_first(par::zip(&mut units[lead..], placed.functions), |(unit, function)| {
-        let result = (|| {
-            let name = function.name.as_deref();
-            let (bytes, at, size) = piece(function)?;
-            *unit = Unit { addr: function.addr, name, header: None };
-            if let Some(held) = bytes.slice(at, size) {
-                unit.header = Some(parse(held, name)?);
-            }
-            Ok::<(), String>(())
-        })();
-        result.err()
-    });
+    let failure =
+        par::find_map_first(par::zip(&mut units[lead..], placed.functions), |(unit, function)| {
+            let result = (|| {
+                let name = function.name.as_deref();
+                let (bytes, at, size) = piece(function)?;
+                *unit = Unit { addr: function.addr, name, header: None };
+                if let Some(held) = bytes.slice(at, size) {
+                    unit.header = Some(parse(held, name)?);
+                }
+                Ok::<(), String>(())
+            })();
+            result.err()
+        });
     if let Some(error) = failure {
         return Err(error);
     }
     // The functions across pages: their bytes one after another in `across`, then their headers.
     if par::any(&units[lead..], |it| it.header.is_none()) {
         across.clear();
-        for (_, function) in units[lead..].iter().zip(placed.functions).filter(|it| it.0.header.is_none()) {
+        for (_, function) in
+            units[lead..].iter().zip(placed.functions).filter(|it| it.0.header.is_none())
+        {
             let (bytes, at, size) = piece(function)?;
             let start = across.len();
             // alloc: once per link with code in pages, the functions across their page boundaries
@@ -235,14 +243,20 @@ fn functions<'a>(placed: &'a Placed<'a>, across: &'a mut Vec<u8>) -> Result<Vec<
         }
         let across: &'a [u8] = across;
         let mut start = 0;
-        for (unit, function) in units[lead..].iter_mut().zip(placed.functions).filter(|it| it.0.header.is_none()) {
+        for (unit, function) in
+            units[lead..].iter_mut().zip(placed.functions).filter(|it| it.0.header.is_none())
+        {
             let size = function.size as usize;
             unit.header = Some(parse(&across[start..start + size], unit.name)?);
             start += size;
         }
     }
     let ctors_units = placed.regions.iter().filter(is_ctors);
-    let ctors_units = ctors_units.map(|region| Unit { addr: region.addr, name: Some("__wasm_call_ctors"), header: None });
+    let ctors_units = ctors_units.map(|region| Unit {
+        addr: region.addr,
+        name: Some("__wasm_call_ctors"),
+        header: None,
+    });
     if ordered {
         for (slot, unit) in units.iter_mut().zip(ctors_units) {
             *slot = unit;
@@ -250,7 +264,9 @@ fn functions<'a>(placed: &'a Placed<'a>, across: &'a mut Vec<u8>) -> Result<Vec<
     } else {
         units.extend(ctors_units);
         radix::sort_copy_by_key(&mut units, |it| it.addr);
-        if let Some(pair) = par::find_map_first(par::windows(&units, 2), |it| (it[0].addr == it[1].addr).then_some(it)) {
+        if let Some(pair) = par::find_map_first(par::windows(&units, 2), |it| {
+            (it[0].addr == it[1].addr).then_some(it)
+        }) {
             // alloc: error path
             return Err(format!("two functions at {} in the code space", pair[0].addr));
         }
@@ -305,7 +321,8 @@ fn check(placed: &Placed<'_>) -> Result<(), String> {
     }
     if let Some(addr) = placed.rebase.first() {
         // alloc: error path
-        let region = placed.regions.iter().find(|it| (it.addr..it.addr + it.size.max(1)).contains(addr));
+        let region =
+            placed.regions.iter().find(|it| (it.addr..it.addr + it.size.max(1)).contains(addr));
         let how = placed.rebase.len();
         // alloc: error path
         return Err(match region {
@@ -387,7 +404,11 @@ struct Imported<'a> {
 }
 
 /// What each import is imported as, as the core says (its type encoded into `arena`).
-fn imports<'a>(placed: &'a Placed<'a>, arena: &'a [u8], spans: &[(usize, usize)]) -> Vec<Imported<'a>> {
+fn imports<'a>(
+    placed: &'a Placed<'a>,
+    arena: &'a [u8],
+    spans: &[(usize, usize)],
+) -> Vec<Imported<'a>> {
     let mut imports = Vec::with_capacity(spans.len());
     imports.extend(placed.imports.iter().zip(spans).map(|(import, &(start, end))| {
         let wasm = import.wasm.as_ref().expect("checked when the spans were made");
@@ -480,7 +501,9 @@ fn target_features(payloads: &[u8]) -> Result<Vec<u8>, String> {
     }
     if let Some(feature) = used.iter().find(|it| disallowed.binary_search(it).is_ok()) {
         // alloc: error path
-        return Err(format!("the target feature `{feature}` is used by one object and disallowed by another"));
+        return Err(format!(
+            "the target feature `{feature}` is used by one object and disallowed by another"
+        ));
     }
     // A module is one thread with no shared memory, where the stage makes a `#[thread_local]`
     // static plain data (stage.rs): code built for threads is refused, not given that.
@@ -609,7 +632,8 @@ fn piece<'a>(units: &[Unit<'a>], first: u32, ctors: usize) -> Result<Piece<'a>, 
         piece.fixup_starts.push(piece.fixup_types.len() as u32);
         if let Some(name) = unit.name {
             let index = u64::from(first + at as u32);
-            piece.name_bytes += leb::uleb_len(index) + leb::uleb_len(name.len() as u64) + name.len();
+            piece.name_bytes +=
+                leb::uleb_len(index) + leb::uleb_len(name.len() as u64) + name.len();
             piece.names += 1;
         }
         let Some(header) = unit.header else {
@@ -742,7 +766,8 @@ fn code_piece(place: &mut [u8], units: &[Unit<'_>], piece: &Piece<'_>, ctors: &[
             continue;
         };
         body.copy_from_slice(header.body());
-        let types = &piece.fixup_types[piece.fixup_starts[index] as usize..piece.fixup_starts[index + 1] as usize];
+        let types = &piece.fixup_types
+            [piece.fixup_starts[index] as usize..piece.fixup_starts[index + 1] as usize];
         for ((fixup, _), &ty) in header.type_fixups().zip(types) {
             body[fixup as usize..][..PADDED].copy_from_slice(&padded_uleb(ty));
         }
@@ -775,7 +800,12 @@ fn ulebs_into(place: &mut [u8], values: impl Iterator<Item = u64>) {
 
 /// `__wasm_call_ctors`' body, when the image has one: a call of each init function, each of
 /// which must be `fn()`.
-fn ctors(placed: &Placed<'_>, memory64: bool, units: &[Unit<'_>], imports: &[Imported<'_>]) -> Result<Vec<u8>, String> {
+fn ctors(
+    placed: &Placed<'_>,
+    memory64: bool,
+    units: &[Unit<'_>],
+    imports: &[Imported<'_>],
+) -> Result<Vec<u8>, String> {
     if !placed.regions.iter().any(|it| it.class == Class::Synthetic(FUNCTIONS)) {
         return Ok(ctors_body(&[]));
     }
@@ -876,7 +906,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     // pieces' types interned in order after the imports', so each type's index is where one
     // pass over the imports and then the functions in order first meets it.
     let ctors_len = ctors.as_ref().map_or(0, Vec::len);
-    let mut pieces: Vec<Result<Piece<'_>, String>> = Vec::with_capacity(units.len().div_ceil(PIECE));
+    let mut pieces: Vec<Result<Piece<'_>, String>> =
+        Vec::with_capacity(units.len().div_ceil(PIECE));
     par::extend(&mut pieces, par::enumerate(par::chunks(&units, PIECE)), |(at, units)| {
         piece(units, imported + (at * PIECE) as u32, ctors_len)
     });
@@ -894,7 +925,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         for it in piece.function_types.iter_mut().chain(&mut piece.fixup_types) {
             *it = remap[*it as usize];
         }
-        piece.function_bytes = piece.function_types.iter().map(|&it| leb::uleb_len(it.into())).sum();
+        piece.function_bytes =
+            piece.function_types.iter().map(|&it| leb::uleb_len(it.into())).sum();
     });
 
     // Memory: the stack, the data, then the heap from `__heap_base`.
@@ -942,7 +974,10 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     let mut globals: Vec<(&str, bool, u64)> = Vec::with_capacity(2 + placed.exports.len());
     globals.push(("__stack_pointer", true, wasm.stack));
     globals.push(("__memory_base", false, 0));
-    debug_assert_eq!((globals[STACK_POINTER as usize].0, globals[MEMORY_BASE as usize].0), ("__stack_pointer", "__memory_base"));
+    debug_assert_eq!(
+        (globals[STACK_POINTER as usize].0, globals[MEMORY_BASE as usize].0),
+        ("__stack_pointer", "__memory_base")
+    );
     let mut exports: Vec<(&str, u8, u32)> = Vec::with_capacity(2 + placed.exports.len());
     let mut named = HashMap::with_capacity_in(2 + placed.exports.len(), Global);
     export(&mut named, &mut exports, "memory", EXPORT_MEMORY, 0, false)?;
@@ -983,7 +1018,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         }
     }
     // alloc: once per link, the functions whose headers export them, found in parallel
-    let exported: Vec<(usize, &str)> = par::filter_map(par::enumerate(&units), |(at, unit)| Some((at, unit.header?.export()?)));
+    let exported: Vec<(usize, &str)> =
+        par::filter_map(par::enumerate(&units), |(at, unit)| Some((at, unit.header?.export()?)));
     for (at, name) in exported {
         export(&mut named, &mut exports, name, EXPORT_FUNCTION, imported + at as u32, true)?;
     }
@@ -999,8 +1035,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     by_addr.extend(regions.filter(|(_, it)| is_custom(it)).map(|(index, it)| (it.addr, index)));
     radix::sort_copy_by_key(&mut by_addr, |&(addr, index)| radix::pack_64(addr, index as u64));
     let mut groups: Vec<(&str, bool)> = Vec::with_capacity(customs);
-    let mut group_of: HashMap<&str, u32, Global> =
-        HashMap::with_capacity_in(customs, Global);
+    let mut group_of: HashMap<&str, u32, Global> = HashMap::with_capacity_in(customs, Global);
     let mut parts: Vec<(u32, usize)> = Vec::with_capacity(customs);
     for &(_, index) in &by_addr {
         let Class::Named { name, .. } = &placed.regions[index].class else { continue };
@@ -1021,7 +1056,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     let mut segment_headers: Vec<([u8; 24], usize)> = Vec::with_capacity(segments.len());
     segment_headers.extend(segments.iter().map(|&(_, addr, bytes)| {
         let mut header = [0; 24];
-        let (opcode, offset) = if wasm.memory64 { (0x42, addr as i64) } else { (0x41, (addr as u32 as i32).into()) };
+        let (opcode, offset) =
+            if wasm.memory64 { (0x42, addr as i64) } else { (0x41, (addr as u32 as i32).into()) };
         header[1] = opcode;
         let mut len = 2 + leb::sleb_into(&mut header[2..], offset);
         header[len] = 0x0b;
@@ -1030,8 +1066,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     }));
     let data_bytes: usize =
         segments.iter().zip(&segment_headers).map(|(it, header)| header.1 + it.2.len()).sum();
-    let part_bytes =
-        |run: &[(u32, usize)]| run.iter().map(|it| placed.len(it.1)).sum::<usize>();
+    let part_bytes = |run: &[(u32, usize)]| run.iter().map(|it| placed.len(it.1)).sum::<usize>();
 
     // The merged custom sections' payloads, each made from its parts one after the other in
     // one reused buffer, `producers` first.
@@ -1083,7 +1118,11 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     out.extend_from_slice(MAGIC);
 
     let list = types.list.len() as u64;
-    section(out, id::TYPE, leb::uleb_len(list) + types.list.iter().map(|it| it.len()).sum::<usize>());
+    section(
+        out,
+        id::TYPE,
+        leb::uleb_len(list) + types.list.iter().map(|it| it.len()).sum::<usize>(),
+    );
     leb::uleb(out, list);
     for ty in &types.list {
         out.extend_from_slice(ty);
@@ -1183,9 +1222,11 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
 
     // The name section: the functions' names (the defined ones' by piece), then the globals'
     // and the segments'.
-    let mut small = Vec::with_capacity(16 * (globals.len() + segments.len()) + 64 * placed.imports.len());
+    let mut small =
+        Vec::with_capacity(16 * (globals.len() + segments.len()) + 64 * placed.imports.len());
     let mut scratch = Vec::with_capacity(small.capacity());
-    let import_names = placed.imports.iter().enumerate().map(|(index, it)| (index as u32, it.name.as_str()));
+    let import_names =
+        placed.imports.iter().enumerate().map(|(index, it)| (index as u32, it.name.as_str()));
     for (index, name) in import_names {
         leb::uleb(&mut scratch, index.into());
         leb::name(&mut scratch, name);
@@ -1193,7 +1234,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     let names = placed.imports.len() as u64 + pieces.iter().map(|it| it.names).sum::<u64>();
     let entries = scratch.len() + pieces.iter().map(|it| it.name_bytes).sum::<usize>();
     let names_payload = leb::uleb_len(names) + entries;
-    let function_names = if names == 0 { 0 } else { 1 + leb::uleb_len(names_payload as u64) + names_payload };
+    let function_names =
+        if names == 0 { 0 } else { 1 + leb::uleb_len(names_payload as u64) + names_payload };
     let global_names = globals.iter().enumerate().map(|(at, it)| (at as u32, it.0));
     let mut map_scratch = Vec::with_capacity(small.capacity());
     name_map(&mut small, &mut map_scratch, 7, global_names);
@@ -1237,7 +1279,9 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         Run::Head(range) => place.copy_from_slice(&head[range]),
         Run::Copy(bytes) => place.copy_from_slice(bytes),
         Run::Zeros(_) => {}
-        Run::Functions(at) => ulebs_into(place, pieces[at].function_types.iter().map(|&it| it.into())),
+        Run::Functions(at) => {
+            ulebs_into(place, pieces[at].function_types.iter().map(|&it| it.into()))
+        }
         Run::Elements(range) => ulebs_into(place, range),
         Run::Code(at) => code_piece(place, piece_units(at), &pieces[at], &ctors),
         Run::Names(at) => names_piece(place, piece_units(at), imported + (at * PIECE) as u32),
@@ -1350,7 +1394,10 @@ mod tests {
                 let Some(at) = self.regions.iter().position(|it| it.class == class) else {
                     return Err(format!("the writer filled {class:?}, which has no region"));
                 };
-                assert!(bytes.len() as u64 <= self.regions[at].capacity, "{class:?} outgrew its room");
+                assert!(
+                    bytes.len() as u64 <= self.regions[at].capacity,
+                    "{class:?} outgrew its room"
+                );
                 self.regions[at].size = bytes.len() as u64;
                 self.contents[at] = bytes.contiguous().into_owned();
             }
@@ -1498,7 +1545,9 @@ mod tests {
     }
 
     fn names(r: &mut Reader<'_>) -> Vec<(u32, String)> {
-        (0..r.count().unwrap()).map(|_| (r.uleb32().unwrap(), r.name().unwrap().to_owned())).collect()
+        (0..r.count().unwrap())
+            .map(|_| (r.uleb32().unwrap(), r.name().unwrap().to_owned()))
+            .collect()
     }
 
     #[test]
@@ -1509,7 +1558,8 @@ mod tests {
         let sections = sections(&module);
         let ids: Vec<u8> = sections.iter().map(|it| it.0).collect();
         assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 0, 0, 0]);
-        let customs: Vec<&str> = sections.iter().filter(|it| it.0 == 0).map(|it| it.1.as_str()).collect();
+        let customs: Vec<&str> =
+            sections.iter().filter(|it| it.0 == 0).map(|it| it.1.as_str()).collect();
         assert_eq!(customs, ["my_section", "name", "producers"]);
 
         // Types, deduplicated: the import's, `fn()`, then the indirect call's.
@@ -1542,8 +1592,14 @@ mod tests {
 
         let mut r = Reader::new(find(&sections, 7, ""));
         assert_eq!(r.count().unwrap(), 2);
-        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()), ("memory", EXPORT_MEMORY, 0));
-        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()), ("_start", EXPORT_FUNCTION, 3));
+        assert_eq!(
+            (r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()),
+            ("memory", EXPORT_MEMORY, 0)
+        );
+        assert_eq!(
+            (r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()),
+            ("_start", EXPORT_FUNCTION, 3)
+        );
         assert!(r.is_done());
 
         let mut element = vec![1, 0];
@@ -1593,8 +1649,14 @@ mod tests {
             names(&mut Reader::new(subsections[&1])),
             owned(&[(0, "fd_write"), (1, "__wasm_call_ctors"), (2, "init"), (3, "_start")])
         );
-        assert_eq!(names(&mut Reader::new(subsections[&7])), owned(&[(0, "__stack_pointer"), (1, "__memory_base")]));
-        assert_eq!(names(&mut Reader::new(subsections[&9])), owned(&[(0, ".rodata"), (1, ".data")]));
+        assert_eq!(
+            names(&mut Reader::new(subsections[&7])),
+            owned(&[(0, "__stack_pointer"), (1, "__memory_base")])
+        );
+        assert_eq!(
+            names(&mut Reader::new(subsections[&9])),
+            owned(&[(0, ".rodata"), (1, ".data")])
+        );
         assert_eq!(subsections.keys().copied().collect::<Vec<_>>(), [1, 7, 9]);
 
         // The producers sections as one, `language` first.
@@ -1635,13 +1697,22 @@ mod tests {
         // The seed's runner's exports: `__stack_pointer` and the table, after the memory.
         let mut r = Reader::new(find(&sections, 7, ""));
         assert_eq!(r.count().unwrap(), 4);
-        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()), ("memory", EXPORT_MEMORY, 0));
-        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()), ("__stack_pointer", EXPORT_GLOBAL, STACK_POINTER));
+        assert_eq!(
+            (r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()),
+            ("memory", EXPORT_MEMORY, 0)
+        );
+        assert_eq!(
+            (r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()),
+            ("__stack_pointer", EXPORT_GLOBAL, STACK_POINTER)
+        );
         assert_eq!(
             (r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()),
             ("__indirect_function_table", EXPORT_TABLE, TABLE)
         );
-        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()), ("_start", EXPORT_FUNCTION, 3));
+        assert_eq!(
+            (r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()),
+            ("_start", EXPORT_FUNCTION, 3)
+        );
         assert!(r.is_done());
         // The element segment's offset is the 32-bit table's: `i32.const 1`.
         let mut element = vec![1, 0];
@@ -1667,7 +1738,9 @@ mod tests {
     }
 
     fn on_threads<R: Send>(threads: usize, run: impl FnOnce() -> R + Send) -> R {
-        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(threads), false).unwrap().install(run)
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(threads), false)
+            .unwrap()
+            .install(run)
     }
 
     #[test]
@@ -1814,7 +1887,12 @@ mod tests {
         let init = image.functions[0].addr;
         image.exports = vec![
             Export { name: "init".to_owned(), addr: init, size: 4, kind: SymbolKind::Function },
-            Export { name: "__heap_base".to_owned(), addr: DATA + 16, size: 0, kind: SymbolKind::Other },
+            Export {
+                name: "__heap_base".to_owned(),
+                addr: DATA + 16,
+                size: 0,
+                kind: SymbolKind::Other,
+            },
         ];
         let module = image.module().unwrap();
         let sections = sections(&module);
@@ -1861,8 +1939,14 @@ mod tests {
         let sections = sections(&module);
         let mut r = Reader::new(find(&sections, 7, ""));
         assert_eq!(r.count().unwrap(), 2);
-        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()), ("memory", EXPORT_MEMORY, 0));
-        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()), ("_start", EXPORT_FUNCTION, 4));
+        assert_eq!(
+            (r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()),
+            ("memory", EXPORT_MEMORY, 0)
+        );
+        assert_eq!(
+            (r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()),
+            ("_start", EXPORT_FUNCTION, 4)
+        );
         let mut r = Reader::new(find(&sections, 10, ""));
         r.count().unwrap();
         let len = r.uleb32().unwrap() as usize;

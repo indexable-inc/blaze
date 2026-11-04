@@ -13,10 +13,7 @@ fn expand(input: proc_macro2::TokenStream) -> String {
 fn expand_error(input: proc_macro2::TokenStream) -> String {
     let f: syn::ItemFn = syn::parse2(input).unwrap();
     let output = expand_composite(f).to_string();
-    assert!(
-        output.contains("compile_error !"),
-        "expected a compile error, got: {output}"
-    );
+    assert!(output.contains("compile_error !"), "expected a compile error, got: {output}");
     output
 }
 
@@ -72,10 +69,7 @@ fn test_body_keeps_test_case_assertion() {
             tc.draw(gs::just(BinTree::Leaf()))
         }
     });
-    assert_contains_tokens(
-        &out,
-        quote! { ::hegel::__assert_is_test_case::<TestCase>() },
-    );
+    assert_contains_tokens(&out, quote! { ::hegel::__assert_is_test_case::<TestCase>() });
 }
 
 #[test]
@@ -174,10 +168,7 @@ fn test_generic_args_are_supported() {
             tc.draw(&inner)
         }
     });
-    assert_contains_tokens(
-        &out,
-        quote! { struct WrappedCompositeGenerator<G: Generator<i64> > },
-    );
+    assert_contains_tokens(&out, quote! { struct WrappedCompositeGenerator<G: Generator<i64> > });
     assert_contains_tokens(&out, quote! { inner: G });
     assert_contains_tokens(&out, quote! { ::core::marker::PhantomData });
 }
@@ -189,10 +180,7 @@ fn test_generic_used_only_in_return_type_is_carried_by_marker() {
             T::default()
         }
     });
-    assert_contains_tokens(
-        &out,
-        quote! { struct DefaultedCompositeGenerator<T: Default> },
-    );
+    assert_contains_tokens(&out, quote! { struct DefaultedCompositeGenerator<T: Default> });
     assert_contains_tokens(&out, quote! { fn() -> (T,) });
 }
 
@@ -217,10 +205,7 @@ fn test_mut_arg_binding_stays_in_body_fn() {
             count
         }
     });
-    assert_contains_tokens(
-        &out,
-        quote! { fn counted(count: usize) -> CountedCompositeGenerator },
-    );
+    assert_contains_tokens(&out, quote! { fn counted(count: usize) -> CountedCompositeGenerator });
     assert_contains_tokens(&out, quote! { mut count: usize });
 }
 
@@ -283,8 +268,5 @@ fn test_non_identifier_arg_pattern_is_rejected() {
             tc.draw(gs::integers::<i32>().min_value(lo).max_value(hi))
         }
     });
-    assert!(
-        out.contains("plain identifiers"),
-        "error should require identifier parameters: {out}"
-    );
+    assert!(out.contains("plain identifiers"), "error should require identifier parameters: {out}");
 }

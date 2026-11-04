@@ -86,7 +86,10 @@ pub fn build(entries: &[(SymbolId, Def)]) -> Result<Vec<u8>, PremapError> {
                 break;
             }
             if slot[..32] == id.0.0 {
-                return Err(PremapError::of(format_args!("the symbol {:?} is in the image twice", id.0)));
+                return Err(PremapError::of(format_args!(
+                    "the symbol {:?} is in the image twice",
+                    id.0
+                )));
             }
             at = (at + 1) & mask;
         }
@@ -109,10 +112,16 @@ pub fn set_debug(table: &mut [u8], id: &SymbolId, debug: u32) -> Result<(), Prem
 /// or is defined strongly.
 pub fn set_reached_directly(table: &mut [u8], id: &SymbolId) -> Result<(), PremapError> {
     let Some(slot) = TableView::trusted(table).find(&id.0) else {
-        return Err(PremapError::of(format_args!("the image reaches {:?} directly and does not define it", id.0)));
+        return Err(PremapError::of(format_args!(
+            "the image reaches {:?} directly and does not define it",
+            id.0
+        )));
     };
     if strength_of(table[slot * SLOT + 53]) != Some(Strength::Weak) {
-        return Err(PremapError::of(format_args!("the image reaches {:?} directly and defines it strongly, not weakly", id.0)));
+        return Err(PremapError::of(format_args!(
+            "the image reaches {:?} directly and defines it strongly, not weakly",
+            id.0
+        )));
     }
     table[slot * SLOT + 54] = 1;
     Ok(())
@@ -120,7 +129,10 @@ pub fn set_reached_directly(table: &mut [u8], id: &SymbolId) -> Result<(), Prema
 
 fn set_ref(table: &mut [u8], id: &SymbolId, at: usize, value: u32) -> Result<(), PremapError> {
     let Some(slot) = TableView::trusted(table).find(&id.0) else {
-        return Err(PremapError::of(format_args!("the image has no symbol {:?} to give its content", id.0)));
+        return Err(PremapError::of(format_args!(
+            "the image has no symbol {:?} to give its content",
+            id.0
+        )));
     };
     table[slot * SLOT + at..slot * SLOT + at + 4].copy_from_slice(&value.to_le_bytes());
     Ok(())
@@ -142,8 +154,14 @@ impl<'a> TableView<'a> {
     /// Checks every slot once: a power-of-two count of whole slots, every kind and strength
     /// one there is, every ref within the `contents` and `debug` records the image has, every
     /// ID in the slot a probe from its start reaches without passing an empty one.
-    pub fn parse_with(bytes: &'a [u8], contents: usize, debug: usize) -> Result<TableView<'a>, PremapError> {
-        let bad = |what: std::fmt::Arguments<'_>| Err(PremapError::of(format_args!("the image's symbol table {what}")));
+    pub fn parse_with(
+        bytes: &'a [u8],
+        contents: usize,
+        debug: usize,
+    ) -> Result<TableView<'a>, PremapError> {
+        let bad = |what: std::fmt::Arguments<'_>| {
+            Err(PremapError::of(format_args!("the image's symbol table {what}")))
+        };
         if bytes.len() % SLOT != 0 {
             return bad(format_args!("is {} bytes, not whole slots", bytes.len()));
         }
@@ -162,7 +180,11 @@ impl<'a> TableView<'a> {
                 continue;
             }
             used += 1;
-            if kind_of(slot[52]).is_none() || strength_of(slot[53]).is_none() || slot[54] > 1 || slot[55] != 0 {
+            if kind_of(slot[52]).is_none()
+                || strength_of(slot[53]).is_none()
+                || slot[54] > 1
+                || slot[55] != 0
+            {
                 return bad(format_args!("has slot {at} of no kind there is"));
             }
             if slot[54] == 1 && strength_of(slot[53]) != Some(Strength::Weak) {
@@ -170,7 +192,9 @@ impl<'a> TableView<'a> {
             }
             let refs = refs_of(slot);
             if refs.content as usize > contents || refs.debug as usize > debug {
-                return bad(format_args!("has slot {at} referring past the image's contents or debug names"));
+                return bad(format_args!(
+                    "has slot {at} referring past the image's contents or debug names"
+                ));
             }
             let id: [u8; 32] = slot[..32].try_into().expect("32 bytes");
             if view.find(&ContentId(id)) != Some(at) {

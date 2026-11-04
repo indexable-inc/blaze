@@ -54,7 +54,9 @@ pub fn read(stdout: &str) -> Option<Said> {
                 None => unread(said),
             },
             _ => match field.strip_prefix("fact.") {
-                Some(key) => said.facts.push(Fact { key: key.to_owned(), text: Text::marked(text) }), // alloc: as above
+                Some(key) => {
+                    said.facts.push(Fact { key: key.to_owned(), text: Text::marked(text) })
+                } // alloc: as above
                 None => unread(said),
             },
         }

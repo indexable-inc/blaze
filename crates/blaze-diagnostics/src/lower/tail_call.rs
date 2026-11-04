@@ -84,7 +84,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TailCallRefused) -> Vec<Found> {
                         ]
                     }
                 };
-                diag.multipart_suggestion("try using the method directly", parts, Applicability::MaybeIncorrect);
+                diag.multipart_suggestion(
+                    "try using the method directly",
+                    parts,
+                    Applicability::MaybeIncorrect,
+                );
             }
             diag
         }
@@ -160,7 +164,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TailCallRefused) -> Vec<Found> {
         NotNormalized(ty) => {
             let ty = print::solver_ty(cx, ty.as_ref());
             // alloc: the error's text, for a refused tail call
-            let message = format!("blaze could not normalize `{ty}` in the signatures of this tail call");
+            let message =
+                format!("blaze could not normalize `{ty}` in the signatures of this tail call");
             let mut diag = Diag::error(None, message, become_span);
             diag.note("rustc's `check_tail_calls` normalizes both signatures, which a body with no type error allows");
             diag

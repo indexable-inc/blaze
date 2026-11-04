@@ -328,9 +328,9 @@ where
         if arbitrary_width
             && ecx.cx().is_trait_lang_item(goal.predicate.def_id(), SolverTraitLangItem::Copy)
         {
-            return ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
-                ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
-            });
+            return ecx
+                .probe_builtin_trait_candidate(BuiltinImplSource::Misc)
+                .enter(|ecx| ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes));
         }
 
         ecx.probe_and_evaluate_goal_for_constituent_tys(
@@ -968,8 +968,9 @@ where
                         goal.predicate.trait_ref.args.type_at(1),
                     )?;
                     if let ty::Infer(ty::TyVar(_)) = source.kind() {
-                        return ecx
-                            .evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS);
+                        return ecx.evaluate_added_goals_and_make_canonical_response(
+                            Certainty::AMBIGUOUS,
+                        );
                     }
                     if !int_marker_holds::<I>(marker, self_ty, Some(source)) {
                         return Err(NoSolution.into());

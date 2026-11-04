@@ -94,7 +94,8 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     };
     for it in over {
         let span = cx.span(it.range);
-        let message = format!("{} has a stack frame of {}, over {why}", it.what, size_text(it.size));
+        let message =
+            format!("{} has a stack frame of {}, over {why}", it.what, size_text(it.size));
         let diagnostic = cx.lint(LINT, node, span, message);
         diagnostic.note(format!("its largest locals: {}", it.largest.join(", ")));
         diagnostic.note(
@@ -140,14 +141,22 @@ fn find<'t>(cx: &Cx<'_, 't>, function: ast::Fn<'t>, name: ast::Name<'t>, limit: 
             Some(expr) => (analysis.expr_range(expr), format!("this closure in `{named}`")),
         };
         let Some(range) = range else { continue };
-        let largest = frame.largest.iter().map(|&(local, size)| say_local(cx, analysis, mir, local, size)).collect();
+        let largest = frame
+            .largest
+            .iter()
+            .map(|&(local, size)| say_local(cx, analysis, mir, local, size))
+            .collect();
         over.push(Over { range, what, size: frame.size, largest });
     }
     over
 }
 
 /// The frame of `mir`, a body of `analysis`'s function: `None` when a local's layout is unknown.
-fn frame<'db>(cx: &Cx<'db, '_>, analysis: &hir::BodyAnalysis<'db>, mir: &MirBody<'db>) -> Option<Frame> {
+fn frame<'db>(
+    cx: &Cx<'db, '_>,
+    analysis: &hir::BodyAnalysis<'db>,
+    mir: &MirBody<'db>,
+) -> Option<Frame> {
     let db = cx.db();
     // alloc: the sized locals of one body
     let mut sized: Vec<(LocalId, u64, u64)> = Vec::with_capacity(mir.locals.len());
@@ -157,12 +166,15 @@ fn frame<'db>(cx: &Cx<'db, '_>, analysis: &hir::BodyAnalysis<'db>, mir: &MirBody
             sized.push((local, layout.size(), layout.align().max(1)));
         }
     }
-    sized.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.into_raw().into_u32().cmp(&b.0.into_raw().into_u32())));
+    sized.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| a.0.into_raw().into_u32().cmp(&b.0.into_raw().into_u32()))
+    });
     let locals: Vec<LocalId> = sized.iter().map(|it| it.0).collect(); // alloc: as `sized`
     let named = |local: LocalId| mir.binding_locals.iter().any(|(_, &it)| it == local);
     let storage = mir.frame_storage_conflicts(&locals, named);
     // alloc: as `sized`
-    let members: Vec<(usize, u64)> = sized.iter().enumerate().map(|(at, &(_, size, _))| (at, size)).collect();
+    let members: Vec<(usize, u64)> =
+        sized.iter().enumerate().map(|(at, &(_, size, _))| (at, size)).collect();
     let size = blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |scratch| {
         let conflicts = storage.matrix_in(sized.len(), scratch);
         let shared = share_greedily(&members, &conflicts, scratch);
@@ -192,7 +204,9 @@ fn say_local<'db>(
 ) -> String {
     let db = cx.db();
     match mir.binding_locals.iter().find(|&(_, &it)| it == local) {
-        Some((binding, _)) => format!("`{}` ({})", analysis.body()[binding].name.as_str(), size_text(size)),
+        Some((binding, _)) => {
+            format!("`{}` ({})", analysis.body()[binding].name.as_str(), size_text(size))
+        }
         None => {
             let ty = analysis.ty(mir.locals[local].ty.as_ref());
             let target = cx.krate().to_display_target(db);
@@ -200,7 +214,6 @@ fn say_local<'db>(
         }
     }
 }
-
 
 /// The limit in bytes: `stack-size-threshold` from `clippy.toml`, else [`DEFAULT_LIMIT`]. Read by
 /// `blaze::box_large_new`, which leaves sizes past it to this lint.
@@ -289,7 +302,10 @@ pub fn sized() {
 }
 "#,
         );
-        assert!(!found.contains("`generic` has a stack frame"), "a layout the front end can't compute is no finding:\n{found}");
+        assert!(
+            !found.contains("`generic` has a stack frame"),
+            "a layout the front end can't compute is no finding:\n{found}"
+        );
         assert!(found.contains("`sized` has a stack frame of"), "{found}");
     }
 
@@ -313,14 +329,22 @@ pub fn outer() {
         );
         assert!(found.contains("`handed` has a stack frame of "), "{found}");
         assert!(found.contains("this closure in `outer` has a stack frame of "), "{found}");
-        assert!(!found.contains("warning: `outer` has a stack frame"), "the closure's locals are its own frame:\n{found}");
+        assert!(
+            !found.contains("warning: `outer` has a stack frame"),
+            "the closure's locals are its own frame:\n{found}"
+        );
     }
 
     #[test]
     fn stack_size_threshold_in_clippy_toml_sets_the_limit() {
-        let conf = crate::conf::Conf { table: "stack-size-threshold = 1024".parse().unwrap(), ..Default::default() };
+        let conf = crate::conf::Conf {
+            table: "stack-size-threshold = 1024".parse().unwrap(),
+            ..Default::default()
+        };
         let found = crate::tests::lint_with(
-            &super::super::more_rules_tests::fixture("pub fn keep<T>(_: &T) {}\npub fn f() { let buf = [0u8; 4096]; keep(&buf); }\n"),
+            &super::super::more_rules_tests::fixture(
+                "pub fn keep<T>(_: &T) {}\npub fn f() { let buf = [0u8; 4096]; keep(&buf); }\n",
+            ),
             "-A clippy::all -W clippy::large_stack_frames",
             conf,
         );

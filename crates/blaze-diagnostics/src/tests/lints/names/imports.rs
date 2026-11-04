@@ -21,7 +21,11 @@ fn messages(fixture: &str, args: &[&str], lint: &str) -> Vec<String> {
     let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
     let options = Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() };
     let prefix = format!("{lint}: ");
-    checked_with(fixture, "", &options).messages().into_iter().filter(|it| it.starts_with(&prefix)).collect()
+    checked_with(fixture, "", &options)
+        .messages()
+        .into_iter()
+        .filter(|it| it.starts_with(&prefix))
+        .collect()
 }
 
 #[test]
@@ -63,7 +67,9 @@ fn unused_import_through_a_glob_of_an_allowed_module() {
 fn unused_macro_use() {
     let source = include_str!("imports/unused-macro-use.rs");
     let expected = include_str!("imports/unused-macro-use.stderr");
-    let fixture = format!("//- minicore: panic\n//- /unused-macro-use.rs crate:other:main edition:2015\n{source}");
+    let fixture = format!(
+        "//- minicore: panic\n//- /unused-macro-use.rs crate:other:main edition:2015\n{source}"
+    );
     assert_eq!(ui_fixture(&fixture), expected);
 }
 
@@ -196,7 +202,10 @@ fn main() {{
 }}
 "
     );
-    assert_eq!(messages(&fixture, &[], "unused_imports"), ["unused_imports: unused import: `dep::f`"]);
+    assert_eq!(
+        messages(&fixture, &[], "unused_imports"),
+        ["unused_imports: unused import: `dep::f`"]
+    );
 }
 
 #[test]
@@ -230,7 +239,10 @@ use dep::m::*;
 fn main() {{}}
 "
     );
-    assert_eq!(messages(&unused, &[], "unused_imports"), ["unused_imports: unused import: `dep::m::*`"]);
+    assert_eq!(
+        messages(&unused, &[], "unused_imports"),
+        ["unused_imports: unused import: `dep::m::*`"]
+    );
 }
 
 #[test]
@@ -281,7 +293,10 @@ fn main() {
     let _ = f;
 }
 ";
-    assert_eq!(messages(fixture, &["-W", "unused_qualifications"], "unused_qualifications"), Vec::<String>::new());
+    assert_eq!(
+        messages(fixture, &["-W", "unused_qualifications"], "unused_qualifications"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -299,7 +314,10 @@ fn main() {
     let _: S<u8> = S(0);
 }
 ";
-    assert_eq!(messages(fixture, &["-W", "unused_qualifications"], "unused_qualifications"), Vec::<String>::new());
+    assert_eq!(
+        messages(fixture, &["-W", "unused_qualifications"], "unused_qualifications"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -313,7 +331,10 @@ fn main() {
     a::f();
 }
 ";
-    assert_eq!(messages(fixture, &["-W", "unused_qualifications"], "unused_qualifications"), Vec::<String>::new());
+    assert_eq!(
+        messages(fixture, &["-W", "unused_qualifications"], "unused_qualifications"),
+        Vec::<String>::new()
+    );
     assert_eq!(messages(fixture, &[], "unused_imports"), ["unused_imports: unused import: `a::f`"]);
 }
 
@@ -335,7 +356,10 @@ fn main() {
     0u8.m();
 }
 ";
-    assert_eq!(messages(fixture, &[], "unused_imports"), ["unused_imports: unused import: `a::Unused`"]);
+    assert_eq!(
+        messages(fixture, &[], "unused_imports"),
+        ["unused_imports: unused import: `a::Unused`"]
+    );
 }
 
 /// A crate built for the host and for the target is two crates with one root file: each sees

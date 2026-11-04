@@ -132,7 +132,9 @@ pub(super) fn isa_of(target: &Target) -> Isa {
     match target.arch {
         blaze_codegen::Arch::X86_64 => Isa::X86_64,
         blaze_codegen::Arch::Aarch64 => Isa::Aarch64,
-        blaze_codegen::Arch::Wasm32 | blaze_codegen::Arch::Wasm64 => panic!("wasm has no stencils to compare"),
+        blaze_codegen::Arch::Wasm32 | blaze_codegen::Arch::Wasm64 => {
+            panic!("wasm has no stencils to compare")
+        }
     }
 }
 
@@ -157,7 +159,9 @@ pub(super) fn ir_ty(ty: Ty) -> ir::Type {
 }
 
 fn ty_of(ty: ir::Type) -> Ty {
-    TYS.into_iter().find(|it| ir_ty(*it) == ty).unwrap_or_else(|| panic!("{ty} is not a type the generator makes"))
+    TYS.into_iter()
+        .find(|it| ir_ty(*it) == ty)
+        .unwrap_or_else(|| panic!("{ty} is not a type the generator makes"))
 }
 
 /// The signature: one to six parameters, and results that fit the convention's return
@@ -276,9 +280,11 @@ impl Gen<'_, '_> {
         self.switch_to(entry);
         for _ in 0..1 + self.below(3) {
             let size = self.pick(&[16u32, 32, 64]);
-            let slot = self
-                .b
-                .create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, size, 4));
+            let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
+                ir::StackSlotKind::ExplicitSlot,
+                size,
+                4,
+            ));
             let addr = self.b.ins().stack_addr(types::I64, slot, 0);
             let zero = self.b.ins().iconst(types::I64, 0);
             for at in (0..size).step_by(8) {
@@ -352,7 +358,8 @@ impl Gen<'_, '_> {
         let mut args = Vec::with_capacity(carried.len() + 1);
         for (ty, _) in carried {
             let value = if self.chance(2) {
-                let same: Vec<Variable> = carried.iter().filter(|(it, _)| it == ty).map(|(_, var)| *var).collect();
+                let same: Vec<Variable> =
+                    carried.iter().filter(|(it, _)| it == ty).map(|(_, var)| *var).collect();
                 let var = self.pick(&same);
                 self.b.use_var(var)
             } else {
@@ -371,7 +378,14 @@ impl Gen<'_, '_> {
     }
 
     /// Fills `block` with a region of `n` and jumps to `join`.
-    fn arm(&mut self, block: ir::Block, depth: u32, n: usize, join: ir::Block, carried: &[(Ty, Variable)]) {
+    fn arm(
+        &mut self,
+        block: ir::Block,
+        depth: u32,
+        n: usize,
+        join: ir::Block,
+        carried: &[(Ty, Variable)],
+    ) {
         self.switch_to(block);
         self.region(depth + 1, n);
         let args = self.edge_args(carried);
@@ -441,7 +455,8 @@ impl Gen<'_, '_> {
             let case = self.pick(&cases);
             entries.insert(at, case);
         }
-        let calls: Vec<ir::BlockCall> = entries.iter().map(|case| self.b.func.dfg.block_call(*case, &[])).collect();
+        let calls: Vec<ir::BlockCall> =
+            entries.iter().map(|case| self.b.func.dfg.block_call(*case, &[])).collect();
         let default_call = self.b.func.dfg.block_call(default, &[]);
         let jt = self.b.create_jump_table(ir::JumpTableData::new(default_call, &calls));
         self.b.ins().br_table(index, jt);
@@ -483,7 +498,8 @@ impl Gen<'_, '_> {
     }
 
     fn ret(&mut self) {
-        let tys: Vec<ir::Type> = self.b.func.signature.returns.iter().map(|ret| ret.value_type).collect();
+        let tys: Vec<ir::Type> =
+            self.b.func.signature.returns.iter().map(|ret| ret.value_type).collect();
         let mut values = Vec::with_capacity(tys.len());
         for (k, ty) in tys.into_iter().enumerate() {
             let value = if k == 0 && self.digest { self.digest() } else { self.arg(ty_of(ty)) };
@@ -527,7 +543,11 @@ impl Gen<'_, '_> {
                 self.b.ins().bitcast(types::I64, MemFlagsData::new(), value)
             }
             _ => {
-                let ints = if matches!(ty, Ty::F32x4 | Ty::F64x2) { self.canon_bits(ty, value) } else { value };
+                let ints = if matches!(ty, Ty::F32x4 | Ty::F64x2) {
+                    self.canon_bits(ty, value)
+                } else {
+                    value
+                };
                 let wide = if ty.lanes() == 2 {
                     ints
                 } else {
@@ -649,7 +669,8 @@ impl Gen<'_, '_> {
         };
         let base = if atomic { at } else { self.rng.below(u64::from(at) + 1) as u32 };
         let addr = self.b.ins().stack_addr(types::I64, slot, base as i32);
-        let flags = if aligned { MemFlagsData::trusted() } else { MemFlagsData::new().with_notrap() };
+        let flags =
+            if aligned { MemFlagsData::trusted() } else { MemFlagsData::new().with_notrap() };
         (addr, (at - base) as i32, flags)
     }
 
@@ -747,7 +768,14 @@ impl Gen<'_, '_> {
                 let amount = self.arg_imm(by);
                 self.binary(opcode, ty, x, amount);
             }
-            Op::Ineg | Op::Iabs | Op::Bitrev | Op::Clz | Op::Cls | Op::Ctz | Op::Bswap | Op::Popcnt => {
+            Op::Ineg
+            | Op::Iabs
+            | Op::Bitrev
+            | Op::Clz
+            | Op::Cls
+            | Op::Ctz
+            | Op::Bswap
+            | Op::Popcnt => {
                 let opcode = match op {
                     Op::Ineg => Opcode::Ineg,
                     Op::Iabs => Opcode::Iabs,
@@ -854,7 +882,11 @@ impl Gen<'_, '_> {
                 let a = self.arg(ty);
                 let b = self.arg_imm(ty);
                 let c = self.b.ins().icmp(cc, a, b);
-                let value = if self.chance(2) { self.b.ins().select(c, a, b) } else { self.b.ins().select(c, b, a) };
+                let value = if self.chance(2) {
+                    self.b.ins().select(c, a, b)
+                } else {
+                    self.b.ins().select(c, b, a)
+                };
                 self.def(ty, value);
             }
             Op::Fma => {
@@ -989,7 +1021,11 @@ impl Gen<'_, '_> {
             }
             Op::VanyTrue | Op::VallTrue => {
                 let v = self.arg(ty);
-                let value = if op == Op::VanyTrue { self.b.ins().vany_true(v) } else { self.b.ins().vall_true(v) };
+                let value = if op == Op::VanyTrue {
+                    self.b.ins().vany_true(v)
+                } else {
+                    self.b.ins().vall_true(v)
+                };
                 self.def(Ty::I8, value);
             }
             Op::VhighBits => {

@@ -42,12 +42,7 @@ impl VisitorWithItemRef for BuildGraphVisitor<'_> {
         item_id: ItemId,
         args: &GenericArgs,
     ) -> ControlFlow<<Self as Visitor>::Break> {
-        let GenericArgs {
-            regions,
-            types,
-            const_generics,
-            trait_refs,
-        } = args;
+        let GenericArgs { regions, types, const_generics, trait_refs } = args;
         self.visit(regions)?;
         self.visit(types)?;
         self.visit(const_generics)?;

@@ -411,7 +411,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash # -eo pipefail: a failing promote.py fails the step through the tee
-        run: python3 -I .github/scripts/promote.py metadata '{"out": "latest.json"}' | tee -a "$GITHUB_STEP_SUMMARY"
+        run: |
+          python3 -I .github/scripts/promote.py metadata '{"out": "latest.json"}' | tee -a "$GITHUB_STEP_SUMMARY"
       # The token R2 takes latest.json with: Object Read & Write on the bucket blaze-releases
       # alone (docs/release.md, "latest.json"). Checked here, after the pointers moved, so a
       # missing secret fails the run without holding a release back.

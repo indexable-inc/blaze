@@ -23,8 +23,9 @@ pub type ExprBody = GExprBody<BodyContents>;
 
 /// A "basic block", which contains a linear sequence of statements, followed by a terminator, which
 /// is where non-linear control-flow happens.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::rename("Block"))]
 pub struct BlockData {
     pub statements: Vec<Statement>,
@@ -33,8 +34,9 @@ pub struct BlockData {
 }
 
 /// Where a block runs relative to unwinding.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo,
+)]
 pub enum UnwindKind {
     /// A non-unwind block; it may start unwinding.
     Regular,
@@ -46,8 +48,9 @@ pub enum UnwindKind {
 }
 
 /// A statement.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo,
+)]
 pub struct Statement {
     pub span: Span,
     pub kind: StatementKind,
@@ -56,9 +59,18 @@ pub struct Statement {
     pub comments_before: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum StatementKind {
     Assign(Place, Rvalue),
     /// A call. For now, we don't support dynamic calls (i.e. to a function pointer in memory).
@@ -93,9 +105,18 @@ pub enum StatementKind {
     Nop,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum TerminatorKind {
     Goto {
         target: BlockId,
@@ -168,8 +189,9 @@ pub enum TerminatorKind {
 }
 
 /// A terminator: instruction to execute at the end of a block, which may jump to other blocks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo,
+)]
 pub struct Terminator {
     pub span: Span,
     pub kind: TerminatorKind,
@@ -226,11 +248,7 @@ impl ExprBody {
 impl BlockData {
     /// Build a block that's just a goto terminator.
     pub fn new_goto(span: Span, target: BlockId, kind: UnwindKind) -> Self {
-        BlockData {
-            statements: vec![],
-            terminator: Terminator::goto(span, target),
-            kind,
-        }
+        BlockData { statements: vec![], terminator: Terminator::goto(span, target), kind }
     }
     pub fn as_goto(&self) -> Option<BlockId> {
         self.terminator.kind.as_goto().copied()
@@ -238,20 +256,14 @@ impl BlockData {
 
     /// Whether this block has a goto terminator, with only no-op statements.
     pub fn as_trivial_goto(&self) -> Option<BlockId> {
-        self.as_goto().filter(|_| {
-            self.statements
-                .iter()
-                .all(|st| matches!(st.kind, StatementKind::Nop))
-        })
+        self.as_goto()
+            .filter(|_| self.statements.iter().all(|st| matches!(st.kind, StatementKind::Nop)))
     }
 
     /// Whether this block has a return terminator, with only no-op or storage dead statements.
     pub fn is_trivial_return(&self) -> bool {
         self.terminator.kind.is_return()
-            && self
-                .statements
-                .iter()
-                .all(|st| st.kind.is_storage_dead() || st.kind.is_nop())
+            && self.statements.iter().all(|st| st.kind.is_storage_dead() || st.kind.is_nop())
     }
 
     pub fn as_abort(&self) -> Option<AbortKind> {
@@ -296,11 +308,7 @@ impl BlockData {
     pub fn transform<F: FnMut(&mut Statement) -> Vec<Statement>>(&mut self, mut f: F) {
         self.transform_sequences_fwd(|slice| {
             let new_statements = f(&mut slice[0]);
-            if new_statements.is_empty() {
-                vec![]
-            } else {
-                vec![(0, new_statements)]
-            }
+            if new_statements.is_empty() { vec![] } else { vec![(0, new_statements)] }
         });
     }
 
@@ -384,21 +392,13 @@ impl UnwindKind {
 
 impl Statement {
     pub fn new(span: Span, kind: StatementKind) -> Self {
-        Statement {
-            span,
-            kind,
-            comments_before: vec![],
-        }
+        Statement { span, kind, comments_before: vec![] }
     }
 }
 
 impl Terminator {
     pub fn new(span: Span, kind: TerminatorKind) -> Self {
-        Terminator {
-            span,
-            kind,
-            comments_before: vec![],
-        }
+        Terminator { span, kind, comments_before: vec![] }
     }
     pub fn goto(span: Span, target: BlockId) -> Self {
         Self::new(span, TerminatorKind::Goto { target })
@@ -421,11 +421,7 @@ impl Terminator {
     }
 
     pub fn into_block(self, kind: UnwindKind) -> BlockData {
-        BlockData {
-            statements: vec![],
-            terminator: self,
-            kind,
-        }
+        BlockData { statements: vec![], terminator: self, kind }
     }
 
     pub fn targets(&self) -> SmallVec<[BlockId; 2]> {
@@ -434,29 +430,16 @@ impl Terminator {
                 smallvec![*target]
             }
             TerminatorKind::Switch { branches, .. } => branches.iter().copied().collect(),
-            TerminatorKind::InlineAsm {
-                fallthrough,
-                labels,
-                on_unwind,
-                ..
-            } => fallthrough
+            TerminatorKind::InlineAsm { fallthrough, labels, on_unwind, .. } => fallthrough
                 .iter()
                 .copied()
                 .chain(labels.iter().copied())
                 .chain([*on_unwind])
                 .collect(),
-            TerminatorKind::Call {
-                target, on_unwind, ..
-            }
-            | TerminatorKind::Drop {
-                target, on_unwind, ..
-            }
-            | TerminatorKind::DropEmptyBox {
-                target, on_unwind, ..
-            }
-            | TerminatorKind::Assert {
-                target, on_unwind, ..
-            } => smallvec![*target, *on_unwind],
+            TerminatorKind::Call { target, on_unwind, .. }
+            | TerminatorKind::Drop { target, on_unwind, .. }
+            | TerminatorKind::DropEmptyBox { target, on_unwind, .. }
+            | TerminatorKind::Assert { target, on_unwind, .. } => smallvec![*target, *on_unwind],
             TerminatorKind::Panic { on_unwind, .. } => smallvec![*on_unwind],
             TerminatorKind::UndefinedBehavior
             | TerminatorKind::UnwindTerminate
@@ -472,28 +455,13 @@ impl Terminator {
                 smallvec![target]
             }
             TerminatorKind::Switch { branches, .. } => branches.iter_mut().collect(),
-            TerminatorKind::InlineAsm {
-                fallthrough,
-                labels,
-                on_unwind,
-                ..
-            } => fallthrough
-                .iter_mut()
-                .chain(labels.iter_mut())
-                .chain([on_unwind])
-                .collect(),
-            TerminatorKind::Call {
-                target, on_unwind, ..
+            TerminatorKind::InlineAsm { fallthrough, labels, on_unwind, .. } => {
+                fallthrough.iter_mut().chain(labels.iter_mut()).chain([on_unwind]).collect()
             }
-            | TerminatorKind::Drop {
-                target, on_unwind, ..
-            }
-            | TerminatorKind::DropEmptyBox {
-                target, on_unwind, ..
-            }
-            | TerminatorKind::Assert {
-                target, on_unwind, ..
-            } => smallvec![target, on_unwind],
+            TerminatorKind::Call { target, on_unwind, .. }
+            | TerminatorKind::Drop { target, on_unwind, .. }
+            | TerminatorKind::DropEmptyBox { target, on_unwind, .. }
+            | TerminatorKind::Assert { target, on_unwind, .. } => smallvec![target, on_unwind],
             TerminatorKind::Panic { on_unwind, .. } => smallvec![on_unwind],
             TerminatorKind::UndefinedBehavior
             | TerminatorKind::UnwindTerminate
@@ -510,15 +478,9 @@ impl Terminator {
                 smallvec![*target]
             }
             TerminatorKind::Switch { branches, .. } => branches.iter().copied().collect(),
-            TerminatorKind::InlineAsm {
-                fallthrough,
-                labels,
-                ..
-            } => fallthrough
-                .iter()
-                .copied()
-                .chain(labels.iter().copied())
-                .collect(),
+            TerminatorKind::InlineAsm { fallthrough, labels, .. } => {
+                fallthrough.iter().copied().chain(labels.iter().copied()).collect()
+            }
             TerminatorKind::Call { target, .. }
             | TerminatorKind::Drop { target, .. }
             | TerminatorKind::DropEmptyBox { target, .. }
@@ -556,17 +518,11 @@ impl StmtLoc {
     }
 
     pub fn block_start(block: BlockId) -> Self {
-        StmtLoc {
-            block,
-            statement: 0,
-        }
+        StmtLoc { block, statement: 0 }
     }
 
     pub fn after(self) -> Self {
-        StmtLoc {
-            block: self.block,
-            statement: self.statement + 1,
-        }
+        StmtLoc { block: self.block, statement: self.statement + 1 }
     }
 }
 
@@ -596,11 +552,7 @@ pub struct BodyBuilder {
 }
 
 fn mk_block(span: Span, term: TerminatorKind, kind: UnwindKind) -> BlockData {
-    BlockData {
-        statements: vec![],
-        terminator: Terminator::new(span, term),
-        kind,
-    }
+    BlockData { statements: vec![], terminator: Terminator::new(span, term), kind }
 }
 
 impl BodyBuilder {
@@ -617,12 +569,7 @@ impl BodyBuilder {
             terminator: Terminator::new(span, TerminatorKind::Return),
             kind: UnwindKind::Regular,
         });
-        Self {
-            span,
-            body,
-            current_block,
-            unwind_block: None,
-        }
+        Self { span, body, current_block, unwind_block: None }
     }
 
     /// Finalize the builder by returning the built body.
@@ -671,27 +618,17 @@ impl BodyBuilder {
     }
 
     pub fn call(&mut self, dest: Place, call: Call) {
-        let next_block = self.body.body.push(mk_block(
-            self.span,
-            TerminatorKind::Return,
-            UnwindKind::Regular,
-        ));
-        let term = TerminatorKind::Call {
-            target: next_block,
-            call,
-            dest,
-            on_unwind: self.unwind_block(),
-        };
+        let next_block =
+            self.body.body.push(mk_block(self.span, TerminatorKind::Return, UnwindKind::Regular));
+        let term =
+            TerminatorKind::Call { target: next_block, call, dest, on_unwind: self.unwind_block() };
         self.current_block().terminator.kind = term;
         self.current_block = next_block;
     }
 
     pub fn insert_drop(&mut self, place: Place, fn_ptr: FnPtr) {
-        let next_block = self.body.body.push(mk_block(
-            self.span,
-            TerminatorKind::Return,
-            UnwindKind::Regular,
-        ));
+        let next_block =
+            self.body.body.push(mk_block(self.span, TerminatorKind::Return, UnwindKind::Regular));
         let term = TerminatorKind::Drop {
             kind: DropKind::Precise,
             place,

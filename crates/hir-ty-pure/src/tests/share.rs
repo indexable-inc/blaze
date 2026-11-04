@@ -139,9 +139,8 @@ pub(super) fn keys_agree(db: &Db, script: Crate) {
 pub(super) fn keys_agree_from(db: &Db, asker: Crate, root: Instance) {
     let env = env(asker);
     for instance in reached_from(db, asker, root) {
-        let at = || {
-            format!("{} (home {:?})", name_of(db, &instance), home_of(db, asker, &instance))
-        };
+        let at =
+            || format!("{} (home {:?})", name_of(db, &instance), home_of(db, asker, &instance));
         let (through, own) = (
             summary(db, env.clone(), instance.clone()),
             summary_in(db, env.clone(), instance.clone()),
@@ -291,12 +290,7 @@ fn a_script_that_solves_differently_keeps_its_own_summaries_of_generics() {
             .filter(|it| matches!(def_crate(&db, it.def).data(&db).origin, CrateOrigin::Lang(_)))
         {
             let want = (!is_generic(instance.args.as_ref())).then(|| def_crate(&db, instance.def));
-            assert_eq!(
-                home_of(&db, c, instance),
-                want,
-                "the home of {}",
-                name_of(&db, instance)
-            );
+            assert_eq!(home_of(&db, c, instance), want, "the home of {}", name_of(&db, instance));
         }
         keys_agree(&db, c);
     });

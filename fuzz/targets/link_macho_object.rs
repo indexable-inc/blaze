@@ -18,10 +18,12 @@ use std::time::Duration;
 use blaze_codegen::Arch;
 use blaze_fuzzer::Target;
 use blaze_link::{Format, NativeKind};
-use object::write::{Object as Builder, Relocation, StandardSection, Symbol, SymbolId, SymbolSection};
+use object::write::{
+    Object as Builder, Relocation, StandardSection, Symbol, SymbolId, SymbolSection,
+};
 use object::{
-    Architecture, BinaryFormat, Endianness, RelocationFlags, SectionFlags, SectionKind, SymbolFlags, SymbolKind,
-    SymbolScope, macho,
+    Architecture, BinaryFormat, Endianness, RelocationFlags, SectionFlags, SectionKind,
+    SymbolFlags, SymbolKind, SymbolScope, macho,
 };
 
 const TARGET: Target = Target {
@@ -73,8 +75,9 @@ fn check_case(data: &[u8], case: usize) {
     let (aligned, at) = copy_at(data, 0, 0);
     let aligned = &aligned[at..][..data.len()];
     let bound = blaze_fuzz::allowed(data.len());
-    let (largest, read) =
-        blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::MachO, arch, OBJECT, aligned));
+    let (largest, read) = blaze_fuzz::largest_allocation(|| {
+        blaze_link::fuzz_read(Format::MachO, arch, OBJECT, aligned)
+    });
     assert!(
         largest <= bound,
         "allocation bound: a {arch:?} read of {} bytes asked for {largest} bytes at once, past {bound}",
@@ -119,16 +122,29 @@ fn seeds() -> Vec<Vec<u8>> {
 fn named() -> Vec<(&'static str, Arch, Vec<u8>)> {
     let x86 = object(Architecture::X86_64, true);
     let arm = object(Architecture::Aarch64, true);
-    let both = fat(&[(macho::CPU_TYPE_X86_64.0, 3, &x86[..]), (macho::CPU_TYPE_ARM64.0, 0, &arm[..])]);
+    let both =
+        fat(&[(macho::CPU_TYPE_X86_64.0, 3, &x86[..]), (macho::CPU_TYPE_ARM64.0, 0, &arm[..])]);
     vec![
         ("an x86-64 object of every section and relocation read", Arch::X86_64, x86),
         ("an AArch64 object of every section and relocation read", Arch::Aarch64, arm),
         ("an x86-64 object without subsections", Arch::X86_64, object(Architecture::X86_64, false)),
-        ("an AArch64 object without subsections", Arch::Aarch64, object(Architecture::Aarch64, false)),
+        (
+            "an AArch64 object without subsections",
+            Arch::Aarch64,
+            object(Architecture::Aarch64, false),
+        ),
         ("a universal file of both, its x86-64 slice", Arch::X86_64, both.clone()),
         ("a universal file of both, its AArch64 slice", Arch::Aarch64, both),
-        ("an x86-64 object of linker options only", Arch::X86_64, options(macho::CPU_TYPE_X86_64.0)),
-        ("an AArch64 object of linker options only", Arch::Aarch64, options(macho::CPU_TYPE_ARM64.0)),
+        (
+            "an x86-64 object of linker options only",
+            Arch::X86_64,
+            options(macho::CPU_TYPE_X86_64.0),
+        ),
+        (
+            "an AArch64 object of linker options only",
+            Arch::Aarch64,
+            options(macho::CPU_TYPE_ARM64.0),
+        ),
     ]
 }
 
@@ -151,7 +167,9 @@ fn object(arch: Architecture, subsections: bool) -> Vec<u8> {
     }
     let text = b.section_id(StandardSection::Text);
     let code: Vec<u8> = if x86 {
-        let mut code = vec![0xe8, 0, 0, 0, 0, 0x48, 0x8d, 0x05, 0, 0, 0, 0, 0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3];
+        let mut code = vec![
+            0xe8, 0, 0, 0, 0, 0x48, 0x8d, 0x05, 0, 0, 0, 0, 0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3,
+        ];
         code.resize(32, 0x90);
         code.push(0xc3);
         code.resize(48, 0x90);
@@ -175,7 +193,8 @@ fn object(arch: Architecture, subsections: bool) -> Vec<u8> {
     };
     b.append_section_data(text, &code, 16);
     if x86 {
-        let frame = b.add_section(b"__TEXT".to_vec(), b"__eh_frame".to_vec(), SectionKind::ReadOnlyData);
+        let frame =
+            b.add_section(b"__TEXT".to_vec(), b"__eh_frame".to_vec(), SectionKind::ReadOnlyData);
         b.section_mut(frame).flags = SectionFlags::MachO { flags: EH_FRAME, reserved2: 0 };
         let mut eh = Vec::new();
         eh.extend_from_slice(&16u32.to_le_bytes());
@@ -195,7 +214,8 @@ fn object(arch: Architecture, subsections: bool) -> Vec<u8> {
     b.append_section_bss(bss, 16, 8);
     let strings = b.section_id(StandardSection::ReadOnlyString);
     b.append_section_data(strings, b"hello\0", 1);
-    let unwind = b.add_section(b"__LD".to_vec(), b"__compact_unwind".to_vec(), SectionKind::Metadata);
+    let unwind =
+        b.add_section(b"__LD".to_vec(), b"__compact_unwind".to_vec(), SectionKind::Metadata);
     b.section_mut(unwind).flags = SectionFlags::MachO { flags: macho::S_ATTR_DEBUG, reserved2: 0 };
     let mut entry = vec![0; 8];
     entry.extend_from_slice(&20u32.to_le_bytes());
@@ -232,7 +252,8 @@ fn object(arch: Architecture, subsections: bool) -> Vec<u8> {
 
     let mut relocate = |section, offset, symbol: SymbolId, r_type, r_pcrel, r_length, addend| {
         let flags = RelocationFlags::MachO { r_type, r_pcrel, r_length };
-        b.add_relocation(section, Relocation { offset, symbol, addend, flags }).expect("a Mach-O relocation");
+        b.add_relocation(section, Relocation { offset, symbol, addend, flags })
+            .expect("a Mach-O relocation");
     };
     if x86 {
         relocate(text, 1, g, macho::X86_64_RELOC_BRANCH, true, 2, -4);
@@ -327,7 +348,10 @@ mod tests {
     #[test]
     fn seeds_read() {
         for (what, arch, bytes) in named() {
-            assert!(blaze_link::fuzz_read(Format::MachO, arch, OBJECT, &bytes), "seed `{what}` is refused");
+            assert!(
+                blaze_link::fuzz_read(Format::MachO, arch, OBJECT, &bytes),
+                "seed `{what}` is refused"
+            );
         }
     }
 }

@@ -36,7 +36,11 @@ fn main() -> ExitCode {
     };
 
     match std::env::current_exe() {
-        Ok(exe) => check("current_exe", same(&exe, &expected), format!("{} (expected {})", exe.display(), expected.display())),
+        Ok(exe) => check(
+            "current_exe",
+            same(&exe, &expected),
+            format!("{} (expected {})", exe.display(), expected.display()),
+        ),
         Err(error) => check("current_exe", false, error.to_string()),
     }
     match blaze_inproc::runtime::attach() {

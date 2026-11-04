@@ -49,7 +49,11 @@ fn busy_waits_are_the_reference_schedule() {
                 1 => busy::MOST_NS - rng.below(busy::CAP_NS * 2).min(busy::MOST_NS),
                 _ => rng.below(busy::MOST_NS),
             };
-            assert_eq!(busy::next(tried, waited), reference(tried, waited), "seed {seed}: {tried} tries, {waited} ns");
+            assert_eq!(
+                busy::next(tried, waited),
+                reference(tried, waited),
+                "seed {seed}: {tried} tries, {waited} ns"
+            );
         }
     }
 }

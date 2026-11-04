@@ -84,11 +84,7 @@ const FOLD_DATA_DOMAIN: &str = "blaze v2 fold data 1";
 
 /// What a name of `function`'s IR is: namespace 0 its function requests, 1 its data
 /// requests. `None` for a callee still to be inlined, and for data [`masked`] refuses.
-pub(crate) fn name(
-    function: &Function,
-    refs: &Refs,
-    name: &ir::UserExternalName,
-) -> Option<Name> {
+pub(crate) fn name(function: &Function, refs: &Refs, name: &ir::UserExternalName) -> Option<Name> {
     let index = name.index as usize;
     match name.namespace {
         0 => function.places.funcs.get(index).map(|&it| Name::Place(it)),
@@ -294,7 +290,10 @@ fn canon(func: &ir::Function, names: Names<'_>, words: &mut Words) -> Option<u32
             // A `become`'s `return_call` would go out from the merged body, which its thunk
             // called with a plain call: the thunk's frame would stay under every hop of the
             // chain, and `become` promises a constant stack. Such a function is not folded.
-            if matches!(func.dfg.insts[inst].opcode(), Opcode::ReturnCall | Opcode::ReturnCallIndirect) {
+            if matches!(
+                func.dfg.insts[inst].opcode(),
+                Opcode::ReturnCall | Opcode::ReturnCallIndirect
+            ) {
                 return None;
             }
             size += 1;
@@ -505,7 +504,10 @@ impl Canon<'_> {
             InstructionData::UnaryImm { opcode, imm } => match opcode {
                 Opcode::Iconst => {
                     let value = u128::from(imm.bits() as u64);
-                    self.constant(Constant::Int { bits: ctrl.bits() as u8, value }, Site::Inst(inst));
+                    self.constant(
+                        Constant::Int { bits: ctrl.bits() as u8, value },
+                        Site::Inst(inst),
+                    );
                 }
                 // Sign-extended from the type's width, as the printer shows it.
                 _ if ctrl.bits() != 0 => self.plain(&imm.sign_extend_from_width(ctrl.bits())),
@@ -653,7 +655,9 @@ impl Canon<'_> {
             }
             Kind::Sig => self.plain(&func.dfg.signatures[ir::SigRef::from_u32(raw)]),
             Kind::Slot => self.plain(&func.sized_stack_slots[ir::StackSlot::from_u32(raw)]),
-            Kind::Pool => self.bytes(func.dfg.constants.get(ir::Constant::from_u32(raw)).as_slice()),
+            Kind::Pool => {
+                self.bytes(func.dfg.constants.get(ir::Constant::from_u32(raw)).as_slice())
+            }
         }
         Some(())
     }
@@ -832,7 +836,9 @@ fn body(
                 let args = SmallVec::<[ir::Value; 8]>::from_slice(body.dfg.inst_args(inst));
                 match opcode {
                     Opcode::Call => body.replace(inst).call_indirect(sig, param, &args[..]),
-                    Opcode::ReturnCall => body.replace(inst).return_call_indirect(sig, param, &args[..]),
+                    Opcode::ReturnCall => {
+                        body.replace(inst).return_call_indirect(sig, param, &args[..])
+                    }
                     // alloc: an error
                     other => return Err(format!("{other} of a varying function")),
                 };
@@ -957,7 +963,9 @@ fn thunk(
     let block = thunk.dfg.make_block();
     thunk.layout.append_block(block);
     let mut args: Vec<ir::Value> = Vec::with_capacity(member.signature.params.len() + made.len());
-    args.extend(member.signature.params.iter().map(|it| thunk.dfg.append_block_param(block, it.value_type)));
+    args.extend(
+        member.signature.params.iter().map(|it| thunk.dfg.append_block_param(block, it.value_type)),
+    );
     let mut cursor = FuncCursor::new(&mut thunk).at_bottom(block);
     for it in made {
         args.push(match it {
@@ -1064,7 +1072,9 @@ mod tests {
     }
 
     fn signature() -> ir::Signature {
-        let mut sig = ir::Signature::new(crate::isa_for(crate::Target::for_host()).unwrap().default_call_conv());
+        let mut sig = ir::Signature::new(
+            crate::isa_for(crate::Target::for_host()).unwrap().default_call_conv(),
+        );
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I64));
         sig
@@ -1138,12 +1148,15 @@ mod tests {
         let (a, b) = (grow(8, 0, 1, false), grow(8, 0, 1, true));
         let (a, b) = (masked_ir(&a, PLAIN).unwrap(), masked_ir(&b, PLAIN).unwrap());
         assert_eq!(a, b);
-        assert_eq!(a.constants, vec![
-            Constant::Int { bits: 64, value: 8 },
-            Constant::Place(0),
-            Constant::Place(1),
-            Constant::Data(ContentId([7; 32])),
-        ]);
+        assert_eq!(
+            a.constants,
+            vec![
+                Constant::Int { bits: 64, value: 8 },
+                Constant::Place(0),
+                Constant::Place(1),
+                Constant::Data(ContentId([7; 32])),
+            ]
+        );
         assert_eq!(a.size, 10);
     }
 
@@ -1286,7 +1299,9 @@ mod tests {
                 let ty = dfg.ctrl_typevar(inst);
                 match ty.is_invalid() {
                     true => self.text.push_str(&format!(" = {opcode} #{}", self.constants.len())),
-                    false => self.text.push_str(&format!(" = {opcode}.{ty} #{}", self.constants.len())),
+                    false => {
+                        self.text.push_str(&format!(" = {opcode}.{ty} #{}", self.constants.len()))
+                    }
                 }
                 self.constants.push(constant);
             }
@@ -1457,10 +1472,12 @@ mod tests {
                     func.import_signature(ir::Signature::new(call_conv));
                 }
                 1 => {
-                    let name = func.declare_imported_user_function(ir::UserExternalName::new(0, 77));
+                    let name =
+                        func.declare_imported_user_function(ir::UserExternalName::new(0, 77));
                     let signature = func.import_signature(ir::Signature::new(call_conv));
                     let name = ir::ExternalName::user(name);
-                    let data = ir::ExtFuncData { name, signature, colocated: false, patchable: false };
+                    let data =
+                        ir::ExtFuncData { name, signature, colocated: false, patchable: false };
                     func.import_function(data);
                 }
                 2 => {
@@ -1506,10 +1523,8 @@ mod tests {
             sig.returns.push(AbiParam::new(types::I64));
             sig
         };
-        let mut func = ir::Function::with_name_signature(
-            ir::UserFuncName::default(),
-            sig_of(1 + d.below(3)),
-        );
+        let mut func =
+            ir::Function::with_name_signature(ir::UserFuncName::default(), sig_of(1 + d.below(3)));
         let mut user = |func: &mut ir::Function, d: &mut Draws| {
             let namespace = if d.below(48) == 0 { 2 } else { d.below(2) };
             let name = ir::UserExternalName::new(namespace, d.below(4));
@@ -1556,7 +1571,8 @@ mod tests {
         for _ in 0..2 {
             z.dummy(&mut func);
             let size = 8 * (1 + d.below(3));
-            let data = ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, size, d.below(4) as u8);
+            let data =
+                ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, size, d.below(4) as u8);
             slots.push(func.create_sized_stack_slot(data));
         }
         let mut blocks = Vec::new();
@@ -1576,7 +1592,8 @@ mod tests {
                 values.push(func.dfg.append_block_param(block, types::I64));
             }
         }
-        let pick = |d: &mut Draws, values: &[ir::Value]| values[d.below(values.len() as u32) as usize];
+        let pick =
+            |d: &mut Draws, values: &[ir::Value]| values[d.below(values.len() as u32) as usize];
         let flags = |d: &mut Draws| {
             let trusted = ir::MemFlagsData::trusted();
             [ir::MemFlagsData::new(), trusted, trusted.with_readonly()][d.below(3) as usize]
@@ -1633,12 +1650,16 @@ mod tests {
                     }
                     8 => {
                         let (callee, params) = funcs[d.below(3) as usize];
-                        let args: Vec<ir::Value> = (0..params).map(|_| pick(&mut d, &values)).collect();
+                        let args: Vec<ir::Value> =
+                            (0..params).map(|_| pick(&mut d, &values)).collect();
                         let call = cursor.ins().call(callee, &args);
                         if d.below(4) == 0 {
                             let slot = slots[d.below(2) as usize];
-                            let entry =
-                                ir::UserStackMapEntry { ty: types::I64, slot, offset: 8 * d.below(2) };
+                            let entry = ir::UserStackMapEntry {
+                                ty: types::I64,
+                                slot,
+                                offset: 8 * d.below(2),
+                            };
                             cursor.func.dfg.append_user_stack_map_entry(call, entry);
                         }
                         Some(cursor.func.dfg.first_result(call))
@@ -1662,8 +1683,9 @@ mod tests {
                         None
                     }
                     14 => {
-                        let code = [ir::TrapCode::INTEGER_OVERFLOW, ir::TrapCode::HEAP_OUT_OF_BOUNDS]
-                            [d.below(2) as usize];
+                        let code =
+                            [ir::TrapCode::INTEGER_OVERFLOW, ir::TrapCode::HEAP_OUT_OF_BOUNDS]
+                                [d.below(2) as usize];
                         cursor.ins().trapnz(pick(&mut d, &values), code);
                         None
                     }
@@ -1687,7 +1709,8 @@ mod tests {
                 }
                 1 => {
                     let condition = pick(&mut d, &values);
-                    let (then, otherwise) = (args(&mut d, &values, wants), args(&mut d, &values, wants));
+                    let (then, otherwise) =
+                        (args(&mut d, &values, wants), args(&mut d, &values, wants));
                     cursor.ins().brif(condition, next, &then, next, &otherwise);
                 }
                 2 => {
@@ -1731,7 +1754,8 @@ mod tests {
             let got = masked_ir(&base, PLAIN);
             assert_eq!(want.is_some(), got.is_some(), "seed {seed}");
             let renumbered = random(seed, None, Some(seed ^ 0x5eed));
-            if let (Some((text, _)), Some((renumbered, _))) = (&want, text::masked(&renumbered, &names))
+            if let (Some((text, _)), Some((renumbered, _))) =
+                (&want, text::masked(&renumbered, &names))
             {
                 assert_eq!(*text, renumbered, "seed {seed}: the noise changed the function");
             }
@@ -1750,7 +1774,11 @@ mod tests {
                 let (a, b) = (got.as_ref().unwrap(), ours.as_ref().unwrap());
                 assert_eq!(*constants_a, a.constants, "seed {seed}");
                 assert_eq!(*constants_b, b.constants, "seed {seed}");
-                assert_eq!(text_a == text_b, a.shape == b.shape, "seed {seed}:\n{text_a}\n{text_b}");
+                assert_eq!(
+                    text_a == text_b,
+                    a.shape == b.shape,
+                    "seed {seed}:\n{text_a}\n{text_b}"
+                );
                 if text_a == text_b { equal += 1 } else { other += 1 }
             }
         }
@@ -1841,7 +1869,10 @@ mod tests {
         let forms = Forms::new();
         let (ma, mb) = (Masking::of(&forms, &ma), Masking::of(&forms, &mb));
         let found = groups(
-            &[(key(1), key(1), settings, ma, &refs_a[..]), (key(2), key(2), settings, mb, &refs_b[..])],
+            &[
+                (key(1), key(1), settings, ma, &refs_a[..]),
+                (key(2), key(2), settings, mb, &refs_b[..]),
+            ],
             &limits,
         );
         let group = &found[0];
@@ -1964,7 +1995,9 @@ mod tests {
         assert_eq!(group.varying, vec![0]);
         // The static differs, but the group was made with it equal.
         let members: [Member<'_>; 2] = [(&a, PLAIN, &refs[..]), (&b, PLAIN, &other[..])];
-        let Err(why) = build(group, &members, pointer) else { panic!("a member unlike the group was built") };
+        let Err(why) = build(group, &members, pointer) else {
+            panic!("a member unlike the group was built")
+        };
         assert!(why.contains("varies"), "{why}");
         assert!(build(group, &members[..1], pointer).is_err());
     }

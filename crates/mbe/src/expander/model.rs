@@ -8,8 +8,8 @@ mod transcriber;
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use span::Span;
+use std::alloc::Global;
 use syntax_bridge::to_matcher_input;
 use tt::{DelimSpan, iter::TtIter};
 

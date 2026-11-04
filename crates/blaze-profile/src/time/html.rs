@@ -81,11 +81,17 @@ pub fn page(model: &Model, path: &Path, top: usize) -> String {
 fn events(model: &Model, out: &mut String) {
     const EVENTS_SHOWN: usize = 500;
     let shown = model.events.len().min(EVENTS_SHOWN);
-    _ = writeln!(out, "<h2>Events</h2><p>The first {shown} of the build's {} warn, error and info events.</p>", model.events.len());
+    _ = writeln!(
+        out,
+        "<h2>Events</h2><p>The first {shown} of the build's {} warn, error and info events.</p>",
+        model.events.len()
+    );
     if shown == 0 {
         return;
     }
-    out.push_str("<table><tr><th>at</th><th>level</th><th>on</th><th>target</th><th>message</th></tr>\n");
+    out.push_str(
+        "<table><tr><th>at</th><th>level</th><th>on</th><th>target</th><th>message</th></tr>\n",
+    );
     for (it, lane) in model.events.iter().zip(&model.event_lane).take(shown) {
         let on = match lane {
             // alloc: a cell, once an event a report
@@ -137,12 +143,17 @@ fn cores(model: &Model, out: &mut String) {
         util.cores,
         100.0 * util.ratio()
     );
-    _ = writeln!(out, "<svg width=\"{WIDTH}\" height=\"{height}\" viewBox=\"0 0 {WIDTH} {height}\">");
-    let x = |t: i64| (t - model.bounds.start_ns) as f64 / model.bounds.wall_ns().max(1) as f64 * WIDTH;
+    _ = writeln!(
+        out,
+        "<svg width=\"{WIDTH}\" height=\"{height}\" viewBox=\"0 0 {WIDTH} {height}\">"
+    );
+    let x =
+        |t: i64| (t - model.bounds.start_ns) as f64 / model.bounds.wall_ns().max(1) as f64 * WIDTH;
     // alloc: once a report
     let mut all = std::collections::BTreeMap::<i64, (i64, i64)>::new();
     for it in &busy {
-        let row = keys.iter().position(|key| *key == (it.process, it.core)).unwrap_or(0) as f64 + 2.0;
+        let row =
+            keys.iter().position(|key| *key == (it.process, it.core)).unwrap_or(0) as f64 + 2.0;
         let span = (it.t1_ns - it.t0_ns).max(1);
         let total = all.entry(it.t0_ns).or_insert((it.t1_ns, 0));
         total.1 += it.running_ns;
@@ -198,7 +209,10 @@ fn critical(model: &Model, path: &Path, top: usize, out: &mut String) {
     }
     _ = writeln!(out, "<svg width=\"{WIDTH}\" height=\"18\" viewBox=\"0 0 {WIDTH} 18\">");
     for (p, it) in pixels.iter().enumerate() {
-        let Some((k, _)) = it.iter().enumerate().filter(|it| *it.1 > 0).max_by_key(|it| *it.1) else { continue };
+        let Some((k, _)) = it.iter().enumerate().filter(|it| *it.1 > 0).max_by_key(|it| *it.1)
+        else {
+            continue;
+        };
         _ = writeln!(
             out,
             "<rect x=\"{:.1}\" y=\"0\" width=\"{:.2}\" height=\"18\" fill=\"{}\"/>",
@@ -225,11 +239,19 @@ fn units(model: &Model, top: usize, out: &mut String) {
         shown.len(),
         rows.len()
     );
-    _ = writeln!(out, "<svg width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">");
+    _ = writeln!(
+        out,
+        "<svg width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">"
+    );
     for (i, row) in shown.iter().enumerate() {
         let y = i as f64 * BAR;
         let mut x = LABEL;
-        _ = write!(out, "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"11\" text-anchor=\"end\" fill=\"currentColor\">", LABEL - 6.0, y + BAR - 3.0);
+        _ = write!(
+            out,
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"11\" text-anchor=\"end\" fill=\"currentColor\">",
+            LABEL - 6.0,
+            y + BAR - 3.0
+        );
         escape(&row.key, out);
         out.push_str("</text>\n");
         for (ns, color, name) in segments(row) {
@@ -237,9 +259,19 @@ fn units(model: &Model, top: usize, out: &mut String) {
                 continue;
             }
             let w = ns as f64 / most * WIDTH;
-            _ = write!(out, "<rect x=\"{x:.2}\" y=\"{y:.1}\" width=\"{w:.2}\" height=\"{:.1}\" fill=\"{color}\"><title>", BAR - 2.0);
+            _ = write!(
+                out,
+                "<rect x=\"{x:.2}\" y=\"{y:.1}\" width=\"{w:.2}\" height=\"{:.1}\" fill=\"{color}\"><title>",
+                BAR - 2.0
+            );
             let mut tip = String::new();
-            _ = write!(tip, "{}: {name} {:.1} s of {:.1} s", row.key, ns as f64 / 1e9, row.wall_ns as f64 / 1e9);
+            _ = write!(
+                tip,
+                "{}: {name} {:.1} s of {:.1} s",
+                row.key,
+                ns as f64 / 1e9,
+                row.wall_ns as f64 / 1e9
+            );
             escape(&tip, out);
             out.push_str("</title></rect>\n");
             x += w;
@@ -250,7 +282,8 @@ fn units(model: &Model, top: usize, out: &mut String) {
 
 /// A row's time in the bars' order: covered and uncovered running, then each kind of waiting.
 fn segments(row: &Row) -> [(i64, &'static str, &'static str); 6] {
-    let Totals { running_ns, parked_ns, queued_ns, parked_or_queued_ns, unrecorded_ns } = row.totals;
+    let Totals { running_ns, parked_ns, queued_ns, parked_or_queued_ns, unrecorded_ns } =
+        row.totals;
     [
         (running_ns - row.uncovered_ns, COVERED, "running under a child span"),
         (row.uncovered_ns, UNCOVERED, "running, uncovered"),

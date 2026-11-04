@@ -24,7 +24,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedExternCrate) -> Vec<Foun
     let name = name.text();
     let span = cx.span(InFile::new(node.file_id, item_range(node.value.syntax())));
     // alloc: the error's text, for an error hir found
-    let mut diag = Diag::error(Some("E0463"), format!("can't find crate for `{name}`"), span.clone());
+    let mut diag =
+        Diag::error(Some("E0463"), format!("can't find crate for `{name}`"), span.clone());
     if name == PROFILER_RUNTIME {
         diag.note("the compiler may have been built without the profiler runtime");
     } else if name.starts_with("rustc_") {

@@ -39,17 +39,17 @@ pub(in crate::nameres) mod tests;
 use base_db::{Crate, Db, Reads, Written};
 use blaze_dbsp::{Pos, ReadIndex, Weight, Work};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_mem::{Frame, Tag};
 use hir_expand::name::Name;
+use std::alloc::Global;
 
+#[cfg(test)]
+pub(in crate::nameres) use self::publish::Slices;
 pub(in crate::nameres) use self::publish::{
     input_children, input_legacy_macro, input_name, input_scope, input_traits, published,
     published_module, published_modules, published_records,
 };
 pub(in crate::nameres) use self::state::State;
-#[cfg(test)]
-pub(in crate::nameres) use self::publish::Slices;
 use self::{
     diff::{Changed, Items},
     input::Delta,
@@ -242,8 +242,8 @@ impl CrateRun {
         let served = frozen::is_served(db, krate);
         let mut old = state.crates.remove(&krate);
         let modules_changed = &state.pass.modules_changed;
-        let deps_changed =
-            !modules_changed.is_empty() || earlier.iter().any(|it| it.fresh || !it.bindings.is_empty());
+        let deps_changed = !modules_changed.is_empty()
+            || earlier.iter().any(|it| it.fresh || !it.bindings.is_empty());
         let mut wakes = Vec::new(); // alloc: empty, allocates nothing
         if let Some(cs) = &mut old
             && !served
@@ -360,8 +360,9 @@ fn finish_crate(
             publish::enter(db, krate, None);
         }
         if written.crates {
-            let delta = run_served
-                .unwrap_or_else(|| panic!("nameres delta: crate {krate:?}'s served delta was not read"));
+            let delta = run_served.unwrap_or_else(|| {
+                panic!("nameres delta: crate {krate:?}'s served delta was not read")
+            });
             last.push(delta);
         }
         return;
@@ -501,7 +502,12 @@ fn wake_enum_globs(
             }
         }
         ModuleDefId::TraitId(it) => {
-            out.extend(index.readers((crate::Lookup::lookup(&it, db).container, Some(reads::trait_import()))));
+            out.extend(
+                index.readers((
+                    crate::Lookup::lookup(&it, db).container,
+                    Some(reads::trait_import()),
+                )),
+            );
         }
         _ => {}
     }
@@ -645,8 +651,15 @@ fn region_order(cs: &CrateState, region: &HashSet<ModuleId, Global>) -> Vec<Modu
     order
 }
 
-fn readers_outside(cs: &CrateState, region: &HashSet<ModuleId, Global>, key: Key, into: &mut HashSet<ModuleId, Global>) {
-    into.extend(cs.reads.readers(key).filter(|it| !region.contains(it) && cs.groups.contains_key(it)));
+fn readers_outside(
+    cs: &CrateState,
+    region: &HashSet<ModuleId, Global>,
+    key: Key,
+    into: &mut HashSet<ModuleId, Global>,
+) {
+    into.extend(
+        cs.reads.readers(key).filter(|it| !region.contains(it) && cs.groups.contains_key(it)),
+    );
 }
 
 /// The rows of the region's modules and of the groups gone taken out of `rows`, which is then
@@ -670,7 +683,11 @@ fn split(
     (rows, old)
 }
 
-fn join(mut outside: ModulesMap, old: HashMap<ModuleId, ModuleData, Global>, work: &mut Work) -> ModulesMap {
+fn join(
+    mut outside: ModulesMap,
+    old: HashMap<ModuleId, ModuleData, Global>,
+    work: &mut Work,
+) -> ModulesMap {
     work.moved += old.len() as u64;
     outside.extend(old);
     outside
@@ -756,7 +773,8 @@ fn publish_scopes(
                 scope.censor_non_proc_macros(krate);
             }
             let mut slot = cs.inputs.get(&module).copied();
-            work.slices += u64::from(publish::set_scope(db, &mut slot, module, scope, children));
+            work.slices +=
+                u64::from(publish::set_scope(db, krate, &mut slot, module, scope, children));
             let input = slot.expect("nameres delta: `set_scope` makes the input");
             cs.inputs.insert(module, input);
             if !censored {
@@ -782,7 +800,10 @@ fn publish_scopes(
         }
         for &group in &ran {
             let (out, modules) = run.outs.remove(&group).unwrap_or_default();
-            let g = cs.groups.get_mut(&group).expect("nameres delta: the region is of the crate's groups");
+            let g = cs
+                .groups
+                .get_mut(&group)
+                .expect("nameres delta: the region is of the crate's groups");
             for module in &g.modules {
                 if !run.group_of.contains_key(module) {
                     cs.inputs.remove(module);
@@ -847,8 +868,18 @@ fn publish_scopes(
 /// The second step's job of a crate: each group of the region's share of the records, on the
 /// crate as its first step published it, and the crate's resolution where a part changed.
 fn read_records(db: &Db, _: &Written<'_>, scoped: &mut Scoped) {
-    let Scoped { krate, cs, ran, rows_changed, records_changed, data_changed, env_changed, proc_macro, assembled, .. } =
-        scoped;
+    let Scoped {
+        krate,
+        cs,
+        ran,
+        rows_changed,
+        records_changed,
+        data_changed,
+        env_changed,
+        proc_macro,
+        assembled,
+        ..
+    } = scoped;
     let krate = *krate;
     let _span = crate::span_names::with_crate(
         db,
@@ -867,7 +898,10 @@ fn read_records(db: &Db, _: &Written<'_>, scoped: &mut Scoped) {
         let shares = assemble::shares(db, cs, &view, &local, ran, run_reads);
         cs.rows = assemble::rows_of(view);
         for (&group, share) in ran.iter().zip(shares) {
-            let g = cs.groups.get_mut(&group).expect("nameres delta: the region is of the crate's groups");
+            let g = cs
+                .groups
+                .get_mut(&group)
+                .expect("nameres delta: the region is of the crate's groups");
             *records_changed |= g.records != share;
             g.records = share;
         }
@@ -899,20 +933,24 @@ fn read_records(db: &Db, _: &Written<'_>, scoped: &mut Scoped) {
         }
     }
 
-    if cs.resolution.is_none() || *rows_changed || *records_changed || *data_changed || *env_changed {
+    if cs.resolution.is_none() || *rows_changed || *records_changed || *data_changed || *env_changed
+    {
         let root = cs.root;
         let root_input = proc_macro.then(|| publish::scope_id(cs.inputs[&root]));
-        let (data, session_macros) = cs.data.as_ref().expect("nameres delta: the crate data is made with a run");
+        let (data, session_macros) =
+            cs.data.as_ref().expect("nameres delta: the crate data is made with a run");
         *assembled = Some(publish::Assembled {
             root,
-            modules: (*rows_changed || cs.resolution.is_none()).then(|| assemble::modules(cs, root_input)),
+            modules: (*rows_changed || cs.resolution.is_none())
+                .then(|| assemble::modules(cs, root_input)),
             local: cs.env.local_def_map(),
             // clone: one count of the crate's shared data
             data: data.clone(),
             prelude: cs.prelude,
             macro_use_prelude: assemble::macro_use_prelude(krate, cs),
             session_macros: *session_macros,
-            records: (*records_changed || cs.resolution.is_none()).then(|| assemble::records(db, cs)),
+            records: (*records_changed || cs.resolution.is_none())
+                .then(|| assemble::records(db, cs)),
         });
     }
 }
@@ -920,7 +958,9 @@ fn read_records(db: &Db, _: &Written<'_>, scoped: &mut Scoped) {
 /// The second step's apply of a crate: its resolution set, its state put back, and what changed
 /// of it for the impls maintainer.
 fn finish_records(db: &mut Db, state: &mut State, scoped: Scoped) -> CrateDelta {
-    let Scoped { krate, mut cs, delta, cold, old_items, emit, changed, mut work, assembled, .. } = scoped;
+    let Scoped {
+        krate, mut cs, delta, cold, old_items, emit, changed, mut work, assembled, ..
+    } = scoped;
     carry_maintaining();
     let _maintaining = Maintaining { before: replace_maintaining(Some(krate)) };
     if let Some(assembled) = assembled {
@@ -930,7 +970,8 @@ fn finish_records(db: &mut Db, state: &mut State, scoped: Scoped) -> CrateDelta 
     }
     work.keys += changed.len() as u64;
 
-    let mut crate_delta = touched_only(db, krate, &cs, &delta).unwrap_or_else(|| empty_delta(krate));
+    let mut crate_delta =
+        touched_only(db, krate, &cs, &delta).unwrap_or_else(|| empty_delta(krate));
     crate_delta.fresh = cold;
     let mut new_items = Items::default();
     for group in &emit {
@@ -953,8 +994,18 @@ fn finish_records(db: &mut Db, state: &mut State, scoped: Scoped) -> CrateDelta 
 /// Puts a group's name-free inserts (`places` in its new log) into its module's published
 /// scope, where a run would put them: a round-0 op of a list is replayed before any expansion
 /// adds to it, so its index is the number of the same ops before it in the log.
-fn apply_direct(db: &mut Db, cs: &CrateState, group: ModuleId, places: &[u32], old_items: &mut Items, work: &mut Work) {
-    let input = *cs.inputs.get(&group).unwrap_or_else(|| panic!("nameres delta: no scope input of {group:?}"));
+fn apply_direct(
+    db: &mut Db,
+    cs: &CrateState,
+    group: ModuleId,
+    places: &[u32],
+    old_items: &mut Items,
+    work: &mut Work,
+) {
+    let input = *cs
+        .inputs
+        .get(&group)
+        .unwrap_or_else(|| panic!("nameres delta: no scope input of {group:?}"));
     // clone: the module's scope, which the inserts change, once per module a write inserts into
     let mut scope = ItemScope::clone(input.scope(db));
     old_items.add(&scope, &Pos::root());
@@ -962,9 +1013,13 @@ fn apply_direct(db: &mut Db, cs: &CrateState, group: ModuleId, places: &[u32], o
     for &at in places {
         let at = at as usize;
         let before = &log[..at];
-        let index = |same: fn(&DeclOp) -> bool| before.iter().filter(|op| same(op) && op.target() == Some(group)).count();
+        let index = |same: fn(&DeclOp) -> bool| {
+            before.iter().filter(|op| same(op) && op.target() == Some(group)).count()
+        };
         match log[at] {
-            DeclOp::DefineImpl { module, imp, is_trait_impl, is_reservation } if module == group => {
+            DeclOp::DefineImpl { module, imp, is_trait_impl, is_reservation }
+                if module == group =>
+            {
                 let at = index(|op| matches!(op, DeclOp::DefineImpl { .. }));
                 insert_impl(&mut scope, at, imp, is_trait_impl, is_reservation);
             }
@@ -988,9 +1043,17 @@ fn apply_direct(db: &mut Db, cs: &CrateState, group: ModuleId, places: &[u32], o
 }
 
 /// `scope` with `imp` at `at` of its impls, its bits as `define_impl` in order makes them.
-fn insert_impl(scope: &mut ItemScope, at: usize, imp: ImplId, is_trait_impl: bool, is_reservation: bool) {
+fn insert_impl(
+    scope: &mut ItemScope,
+    at: usize,
+    imp: ImplId,
+    is_trait_impl: bool,
+    is_reservation: bool,
+) {
     let tail: Vec<(ImplId, bool, bool)> = (at..scope.impls.len())
-        .map(|it| (scope.impls[it], scope.trait_impl.contains(it), scope.reservation_impl.contains(it)))
+        .map(|it| {
+            (scope.impls[it], scope.trait_impl.contains(it), scope.reservation_impl.contains(it))
+        })
         .collect(); // alloc: the impls after `at`, once per impl inserted
     scope.impls.truncate(at);
     scope.define_impl(imp, is_trait_impl, is_reservation);
@@ -1003,20 +1066,42 @@ fn insert_impl(scope: &mut ItemScope, at: usize, imp: ImplId, is_trait_impl: boo
 /// its published inputs: the cold run, which the tests compare a maintained map with. Its
 /// scopes are being built (`ModulesSlot::Building`), its records in the map.
 #[cfg(test)]
-fn cold(db: &Db, frame: &Frame, krate: Crate) -> (crate::nameres::DefMap, crate::nameres::LocalDefMap) {
+fn cold(
+    db: &Db,
+    frame: &Frame,
+    krate: Crate,
+) -> (crate::nameres::DefMap, crate::nameres::LocalDefMap) {
     use crate::nameres::{DefMap, DiagnosticsByModule, ModulesSlot, OwnedRecords};
 
     let root = queries::crate_root(db, krate);
     let mut cs = CrateState::new(root);
-    let none = Written { set: &[], added: &[], removed: &[], roots: &[], crates: true, included: &[], proc_macros: &[] };
+    let none = Written {
+        set: &[],
+        added: &[],
+        removed: &[],
+        roots: &[],
+        crates: true,
+        included: &[],
+        proc_macros: &[],
+    };
     input::read(db, krate, &mut cs, &none, true, false);
     let mut region: HashSet<ModuleId, Global> = cs.groups.keys().copied().collect();
     let mut work = Work::default();
-    let Cutoff { mut out, mut outside, order, .. } =
-        cutoff(db, frame, krate, &cs, &mut Scratch::default(), &[], &mut region, ModulesMap::new(), &mut work);
+    let Cutoff { mut out, mut outside, order, .. } = cutoff(
+        db,
+        frame,
+        krate,
+        &cs,
+        &mut Scratch::default(),
+        &[],
+        &mut region,
+        ModulesMap::new(),
+        &mut work,
+    );
     for &group in &order {
         let (share, modules) = out.outs.remove(&group).unwrap_or_default();
-        let g = cs.groups.get_mut(&group).expect("nameres delta: the region is of the crate's groups");
+        let g =
+            cs.groups.get_mut(&group).expect("nameres delta: the region is of the crate's groups");
         g.out = share;
         g.modules = modules;
     }
@@ -1034,9 +1119,13 @@ fn cold(db: &Db, frame: &Frame, krate: Crate) -> (crate::nameres::DefMap, crate:
     let shares = assemble::shares(db, &cs, &view, &local, &order, &mut Vec::new());
     cs.rows = assemble::rows_of(view);
     for (&group, share) in order.iter().zip(shares) {
-        cs.groups.get_mut(&group).expect("nameres delta: the region is of the crate's groups").records = share;
+        cs.groups
+            .get_mut(&group)
+            .expect("nameres delta: the region is of the crate's groups")
+            .records = share;
     }
-    let OwnedRecords { names, diagnostics, derive_helpers_in_scope, .. } = assemble::records(db, &cs);
+    let OwnedRecords { names, diagnostics, derive_helpers_in_scope, .. } =
+        assemble::records(db, &cs);
     let mut modules = cs.ordered_rows();
     if queries::crate_data(db, krate).proc_macro {
         modules[root].scope_mut().censor_non_proc_macros(krate);
@@ -1104,7 +1193,8 @@ fn empty_delta(krate: Crate) -> CrateDelta {
 /// log changed), as the state has them: `None` when there are none.
 fn touched_only(db: &Db, krate: Crate, cs: &CrateState, delta: &Delta) -> Option<CrateDelta> {
     let direct = delta.direct.iter().map(|(it, _)| it);
-    let mut groups: Vec<ModuleId> = delta.touched.iter().chain(&delta.seeds).chain(direct).copied().collect(); // alloc: the groups a write read again
+    let mut groups: Vec<ModuleId> =
+        delta.touched.iter().chain(&delta.seeds).chain(direct).copied().collect(); // alloc: the groups a write read again
     groups.sort_by_key(|it| cs.groups.get_index_of(it));
     groups.dedup();
     let mut out = empty_delta(krate);

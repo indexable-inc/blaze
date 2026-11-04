@@ -38,14 +38,17 @@ pub use capture::{
     Read, ReadKind, Reads, capture_reads, for_span_text, replay_reads, unshareable_reads,
 };
 pub use counts::{Counts, take as take_counts};
-/// The most reads one query run held and the most pending rows one task held, process-wide:
-/// what the query stack's runaway bounds are set against (the daemon's memory line says them).
-pub use local::{HighWater as StackHighWater, high_water as stack_high_water};
 pub use function::completed;
 pub use id::{AsId, FromId, FromIdIn, Id};
 pub use input::Setter;
 pub use interned::NamesIds;
-pub use provenance::{Cause, Outcome, Provenance};
+/// The most reads one query run held and the most pending rows one task held, process-wide:
+/// what the query stack's runaway bounds are set against (the daemon's memory line says them).
+pub use local::{HighWater as StackHighWater, high_water as stack_high_water};
+pub use provenance::{
+    Cause, LOG_MOST, Logged, LoggedRun, Outcome, Provenance, RowNamer, Taken, log_runs, name_rows,
+    take_log_in,
+};
 pub use slot::{Filled, Slot, SlotClaim, SlotError, SlotName, SlotRefused};
 pub use storage::{Database, Durability, Hook, Storage, View};
 pub use value::Value;
@@ -56,9 +59,7 @@ pub mod plumbing {
     pub use blaze_mem::Tag;
 
     pub use super::{
-        function::{
-            CycleKind, Function, MAX_ROUNDS, evict_values, evict_values_of, fetch,
-        },
+        function::{CycleKind, Function, MAX_ROUNDS, evict_values, evict_values_of, fetch},
         ingredient::{Ingredient, Kind, Vtable},
         input::{
             Input, InputSetter, input_fields, input_new, input_new_singleton, input_read,
@@ -316,13 +317,19 @@ fn out_of_steps(steps: u64, key: u128, at: impl FnOnce() -> String) -> ! {
 /// here, and a panic in it leaves the key named by its number (rule 17).
 #[cold]
 #[inline(never)]
-pub(crate) fn out_of_fuel<F: function::Function>(db: &F::Db, steps: u64, index: u32, key: F::Key) -> ! {
+pub(crate) fn out_of_fuel<F: function::Function>(
+    db: &F::Db,
+    steps: u64,
+    index: u32,
+    key: F::Key,
+) -> ! {
     let depth = local::with(|local| local.frames.len());
     let id = key.as_id();
     let fuel = local::with(|local| local.fuel.take());
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut value = String::new(); // alloc: an error's text, once per bound that trips
-        attach(db, || function::write_key_text(&mut value, id, |out| F::write_key(key, out))).then_some(value)
+        attach(db, || function::write_key_text(&mut value, id, |out| F::write_key(key, out)))
+            .then_some(value)
     }));
     local::with(|local| local.fuel = fuel);
     let value = match written {
@@ -471,7 +478,8 @@ pub(crate) fn noted(storage: &Storage, note: local::Note) {
 #[cold]
 #[inline(never)]
 fn name_most_reads(storage: &Storage, held: u64) {
-    let top = local::with(|local| local.frames.last().map(|it| (it.ingredient, Id::from_u32(it.id))));
+    let top =
+        local::with(|local| local.frames.last().map(|it| (it.ingredient, Id::from_u32(it.id))));
     let Some((ingredient, id)) = top else { return };
     local::name_most_reads(held, || {
         let barrier = local::barrier();
@@ -573,7 +581,7 @@ fn unwind_runaway(storage: &Storage, stuck: Stuck) -> ! {
 
 /// Row `id` of ingredient `index`'s key as its type shows it ([`ingredient::Vtable`]'s
 /// `write_key`), or its ID.
-fn key_text(storage: &Storage, index: u32, id: Id) -> String {
+pub(crate) fn key_text(storage: &Storage, index: u32, id: Id) -> String {
     let write = ingredient::vtable(index).and_then(|it| it.write_key);
     let written = write.map(|write| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -585,7 +593,7 @@ fn key_text(storage: &Storage, index: u32, id: Id) -> String {
     match written {
         Some(Ok(text)) => text,
         Some(Err(_)) => format!("{id:?} (its key's `Debug` failed)"), // alloc: as above
-        None => format!("{id:?}"),                                     // alloc: as above
+        None => format!("{id:?}"),                                    // alloc: as above
     }
 }
 
@@ -633,17 +641,48 @@ pub fn owner_is(storage: &Storage, id: Id, ingredient: &'static ingredient::Ingr
     storage.owner(id) == Some(ingredient.index())
 }
 
-/// The running query made a read the engine can't see: it runs again in every view, and its
-/// captures give `None`.
-pub fn report_untracked_read<D: Database>(db: &D) {
+/// A read the engine can't see, named: what was read and why no tracked read stands for it.
+/// The only way a value comes to run again in every view ([`report_untracked_read`]). It has no
+/// default and no "unknown" form: a caller that can't say what it read has no value to make
+/// untracked, and one that can names it here, so the trace of a row that reruns every view
+/// says why.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Untracked {
+    /// What was read and why it can't be a tracked read (`"the absence of the
+    /// `SourceNames` singleton"`).
+    pub what: &'static str,
+}
+
+/// The running query made the read `why` names, which the engine can't see: it runs again in
+/// every view, at durability `LOW`, and its captures give `None`. The read is told to the trace
+/// (`blaze_query` target), naming the query, and the run's first such read to the run log
+/// ([`log_runs`]), so the profile's `provenance` table names what makes a row rerun.
+pub fn report_untracked_read<D: Database>(db: &D, why: Untracked) {
     let storage = db.storage();
-    local::with(|local| {
-        if let Some(frame) = local.recording(storage) {
-            frame.untracked = true;
-            frame.unshareable = true;
-            frame.changed = frame.changed.max(storage.view_bits());
-        }
+    let query = local::with(|local| {
+        let frame = local.recording(storage)?;
+        let first = !frame.untracked;
+        frame.untracked = true;
+        frame.unshareable = true;
+        frame.changed = frame.changed.max(storage.view_bits());
+        Some((frame.ingredient, frame.node, first))
     });
+    if let Some((index, node, first)) = query {
+        if first && provenance::logging() {
+            storage.run_log.log(
+                storage.key_of(node),
+                0,
+                storage.view_bits(),
+                Logged::UntrackedRead(why.what),
+            );
+        }
+        tracing::debug!(
+            target: "blaze_query",
+            query = ingredient::name(index),
+            untracked = why.what,
+            "an untracked read: it runs again in every view"
+        );
+    }
 }
 
 /// Unwinds with [`Cancelled::PendingWrite`] if a writer stopped readers.

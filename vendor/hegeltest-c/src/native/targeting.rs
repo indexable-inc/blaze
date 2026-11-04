@@ -49,11 +49,7 @@ pub(crate) struct TargetingState {
 
 impl TargetingState {
     pub fn new() -> Self {
-        Self {
-            best_targets: HashMap::default(),
-            nd_targets: HashMap::default(),
-            version: 0,
-        }
+        Self { best_targets: HashMap::default(), nd_targets: HashMap::default(), version: 0 }
     }
 
     /// Record the observations from a Valid run. The first observation for
@@ -66,13 +62,8 @@ impl TargetingState {
                 Some(best) => score > best.score,
             };
             if should_record {
-                self.best_targets.insert(
-                    label.clone(),
-                    BestTarget {
-                        score,
-                        choices: choices.to_vec(),
-                    },
-                );
+                self.best_targets
+                    .insert(label.clone(), BestTarget { score, choices: choices.to_vec() });
                 self.version += 1;
             }
         }
@@ -109,14 +100,11 @@ impl TargetingState {
     /// Move `label` onto an adopted winner's fresh-batch node view. The
     /// reference only ever rises, and always from a fresh unselected batch.
     pub(crate) fn adopt_nd(&mut self, label: &str, nodes: Vec<ChoiceNode>, median: f64) {
-        let target = self
-            .nd_targets
-            .entry(String::from(label))
-            .or_insert(NdTarget {
-                nodes: Vec::new(),
-                reference: f64::NEG_INFINITY,
-                dead: false,
-            });
+        let target = self.nd_targets.entry(String::from(label)).or_insert(NdTarget {
+            nodes: Vec::new(),
+            reference: f64::NEG_INFINITY,
+            dead: false,
+        });
         target.nodes = nodes;
         target.reference = target.reference.max(median);
         target.dead = false;
@@ -160,18 +148,11 @@ impl TargetingSchedule {
     pub fn new(max_test_cases: u64) -> Self {
         let next_at = if max_test_cases < INTERLEAVED_TARGETING_MIN_BUDGET {
             let small_example_cap = (max_test_cases / 10).min(50);
-            (max_test_cases / 2)
-                .max(small_example_cap.saturating_add(1))
-                .max(10)
+            (max_test_cases / 2).max(small_example_cap.saturating_add(1)).max(10)
         } else {
             TARGETING_WARM_UP
         };
-        Self {
-            max_test_cases,
-            next_at: Some(next_at),
-            spent: 0,
-            version_at_last_pass: None,
-        }
+        Self { max_test_cases, next_at: Some(next_at), spent: 0, version_at_last_pass: None }
     }
 
     fn interleaved(&self) -> bool {
@@ -318,10 +299,8 @@ impl Optimiser<'_, '_> {
         }
         let mut current_choices: Vec<ChoiceValue> = trial.nodes.iter().map(|n| n.value()).collect();
         let mut current_nodes = trial.nodes;
-        let mut current_score = *trial
-            .target_observations
-            .get(target)
-            .unwrap_or(&f64::NEG_INFINITY);
+        let mut current_score =
+            *trial.target_observations.get(target).unwrap_or(&f64::NEG_INFINITY);
         let mut improvements: usize = 0;
 
         let mut nodes_examined: HashSet<usize> = HashSet::default();
@@ -412,10 +391,7 @@ impl Optimiser<'_, '_> {
         if trial.status < Status::Valid {
             return Ok(false);
         }
-        let new_score = *trial
-            .target_observations
-            .get(target)
-            .unwrap_or(&f64::NEG_INFINITY);
+        let new_score = *trial.target_observations.get(target).unwrap_or(&f64::NEG_INFINITY);
         if new_score < *current_score {
             return Ok(false);
         }

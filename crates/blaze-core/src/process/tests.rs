@@ -43,7 +43,12 @@ fn a_child_is_listed_until_its_one_reap_and_said_exited_while_unreaped() {
         "{it}"
     );
     let said = it.to_string();
-    for named in [format!("pid {pid}"), "exited and not reaped".to_owned(), "0x5ca1ab1e".to_owned(), "/bin/sh".to_owned()] {
+    for named in [
+        format!("pid {pid}"),
+        "exited and not reaped".to_owned(),
+        "0x5ca1ab1e".to_owned(),
+        "/bin/sh".to_owned(),
+    ] {
         assert!(said.contains(&named), "it says {named:?}: {said}");
     }
     let exit = started.finish.exited(pid, Vec::new(), Vec::new()).unwrap();

@@ -78,7 +78,13 @@ impl Tracker {
     }
 
     /// rustc's `before_match_loc`: a position at `dot` is processed, the step's last if `last`.
-    pub(super) fn before_loc(&mut self, matcher: &Matcher, dot: u32, sep_matched: bool, last: bool) {
+    pub(super) fn before_loc(
+        &mut self,
+        matcher: &Matcher,
+        dot: u32,
+        sep_matched: bool,
+        last: bool,
+    ) {
         if self.remaining.is_none() || (last && matcher.locs[dot as usize] != Loc::Eof) {
             self.remaining = Some(At { rule: self.rule, dot, sep_matched });
         }
@@ -144,10 +150,13 @@ impl Tracker {
                 (Cow::Owned(ident_descr(&ident, ident.span.ctx.edition(db))), ident.span)
             }
             // alloc: an error's text, when no rule matches.
-            Some(TtElement::Leaf(tt::Leaf::Literal(lit))) => (Cow::Owned(format!("`{lit}`")), lit.span),
-            Some(TtElement::Subtree(subtree, _)) => {
-                (Cow::Borrowed(delimiter_descr(subtree.delimiter.kind, false)), subtree.delimiter.open)
+            Some(TtElement::Leaf(tt::Leaf::Literal(lit))) => {
+                (Cow::Owned(format!("`{lit}`")), lit.span)
             }
+            Some(TtElement::Subtree(subtree, _)) => (
+                Cow::Borrowed(delimiter_descr(subtree.delimiter.kind, false)),
+                subtree.delimiter.open,
+            ),
             None => {
                 let &(kind, span) = self.closes.last().expect("the input ends in a group");
                 (Cow::Borrowed(delimiter_descr(kind, true)), span)
@@ -238,7 +247,9 @@ fn missing_comma(db: &Db, frame: &Frame, rules: &[Rule], input: &tt::TopSubtree)
         let end = match (&left, &right) {
             (_, TtElement::Leaf(tt::Leaf::Punct(comma))) if comma.char == ',' => continue,
             (TtElement::Leaf(left), TtElement::Leaf(right))
-                if is_word(db, left) && is_word(db, right) && !joined(*left.span(), *right.span()) =>
+                if is_word(db, left)
+                    && is_word(db, right)
+                    && !joined(*left.span(), *right.span()) =>
             {
                 *left.span()
             }
@@ -252,7 +263,11 @@ fn missing_comma(db: &Db, frame: &Frame, rules: &[Rule], input: &tt::TopSubtree)
     // alloc: the input with the comma, only when no rule matches.
     let mut builder = tt::TopSubtreeBuilder::new(input.top_subtree().delimiter);
     builder.extend_with_tt(before);
-    builder.push(tt::Leaf::Punct(tt::Punct { char: ',', spacing: tt::Spacing::Alone, span: comma }));
+    builder.push(tt::Leaf::Punct(tt::Punct {
+        char: ',',
+        spacing: tt::Spacing::Alone,
+        span: comma,
+    }));
     builder.extend_with_tt(after);
     let with_comma = builder.build();
     let mut buffers = Buffers::new_in(frame);
@@ -285,7 +300,11 @@ fn joined(left: Span, right: Span) -> bool {
 fn describe(db: &Db, matcher: &Matcher, at: At) -> (Cow<'static, str>, Option<Span>) {
     let dot = at.dot;
     let group = |pick: fn(&Group) -> u32| {
-        matcher.groups.iter().find(|it| pick(it) == dot).expect("a delimiter's location has its group")
+        matcher
+            .groups
+            .iter()
+            .find(|it| pick(it) == dot)
+            .expect("a delimiter's location has its group")
     };
     match matcher.locs[dot as usize] {
         Loc::Literal(it) => {
@@ -319,11 +338,17 @@ fn describe(db: &Db, matcher: &Matcher, at: At) -> (Cow<'static, str>, Option<Sp
         Loc::Subtree(_) => (Cow::Borrowed("delimiter"), None),
         Loc::Open => {
             let group = group(|it| it.open);
-            (Cow::Borrowed(delimiter_descr(group.delimiter.kind, false)), Some(group.delimiter.open))
+            (
+                Cow::Borrowed(delimiter_descr(group.delimiter.kind, false)),
+                Some(group.delimiter.open),
+            )
         }
         Loc::Close => {
             let group = group(|it| it.close);
-            (Cow::Borrowed(delimiter_descr(group.delimiter.kind, true)), Some(group.delimiter.close))
+            (
+                Cow::Borrowed(delimiter_descr(group.delimiter.kind, true)),
+                Some(group.delimiter.close),
+            )
         }
         Loc::RepStart(_) => (Cow::Borrowed("sequence start"), None),
         Loc::RepEnd(rep) => {
@@ -358,7 +383,9 @@ fn separator_descr(db: &Db, separator: &Separator) -> (String, Span) {
             (puncts_descr(puncts), puncts[0].span.cover(puncts[puncts.len() - 1].span))
         }
         // alloc: an error's text, when no rule matches.
-        Separator::Lifetime(quote, name) => (format!("`'{}`", name.sym), quote.span.cover(name.span)),
+        Separator::Lifetime(quote, name) => {
+            (format!("`'{}`", name.sym), quote.span.cover(name.span))
+        }
     }
 }
 

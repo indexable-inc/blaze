@@ -11,7 +11,7 @@
 use blaze_items::Fact;
 use hir::{InFile, view::ModuleSourceView};
 use syntax::{
-    NodeOrToken, SyntaxKind, TextRange, TextSize, T,
+    NodeOrToken, SyntaxKind, T, TextRange, TextSize,
     view::{self as ast, AstNode, HasAttrs},
 };
 
@@ -38,7 +38,11 @@ pub(super) fn krate(cx: &Cx<'_, '_>) -> Vec<Found> {
         return Vec::new(); // alloc: empty, allocates nothing
     }
     let Some(range) = tokens_range(source_file.syntax()) else { return Vec::new() }; // alloc: empty, allocates nothing
-    let mut diag = Diag::lint("missing_docs", "missing documentation for the crate", cx.span(InFile::new(file, range)));
+    let mut diag = Diag::lint(
+        "missing_docs",
+        "missing documentation for the crate",
+        cx.span(InFile::new(file, range)),
+    );
     diag.fact(Fact::Name(cx.module_key(root)), "the attributes of the crate");
     vec![Found::lint(diag, Phase::Late, InFile::new(file, ast::ptr(source_file.syntax())))] // alloc: the lint that fires
 }
@@ -70,10 +74,16 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effectiv
     };
     // `mod m;`: its inner attributes, `//!` and `#![doc ..]`, are in its own file.
     let file_doc = || match node {
-        ast::Item::Module(it) if list.is_none() => module_file_has_doc(cx, item.node.with_value(it)),
+        ast::Item::Module(it) if list.is_none() => {
+            module_file_has_doc(cx, item.node.with_value(it))
+        }
         _ => false,
     };
-    if exported && !has_doc(cx, node, list.map(|it| it.syntax()), list) && !file_doc() && !hidden_impl() {
+    if exported
+        && !has_doc(cx, node, list.map(|it| it.syntax()), list)
+        && !file_doc()
+        && !hidden_impl()
+    {
         found.push(lint(cx, item.syntax(), desc));
     }
     if !matches!(node, ast::Item::Struct(_) | ast::Item::Union(_) | ast::Item::Enum(_)) {
@@ -85,7 +95,9 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effectiv
             SyntaxKind::VARIANT => {
                 let Some(variant) = ast::Variant::cast(own.value) else { continue };
                 let def = cx.vsema.to_def2(own.with_value(variant));
-                let exported = def.is_some_and(|it| effective.is_exported(Def::Item(hir::ModuleDef::EnumVariant(it))));
+                let exported = def.is_some_and(|it| {
+                    effective.is_exported(Def::Item(hir::ModuleDef::EnumVariant(it)))
+                });
                 if exported && !has_doc(cx, variant, None, None) {
                     found.push(lint(cx, own, ("a", "variant")));
                 }
@@ -108,7 +120,8 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effectiv
 fn lint(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>, (article, desc): (&str, &str)) -> Found {
     let span = cx.span(node.with_value(def_span(node.value)));
     // alloc: the firing lint's message
-    let mut diag = Diag::lint("missing_docs", format!("missing documentation for {article} {desc}"), span);
+    let mut diag =
+        Diag::lint("missing_docs", format!("missing documentation for {article} {desc}"), span);
     let at = node.map(ast::ptr);
     crate::lints::code_fact(cx, &mut diag, at);
     Found::lint(diag, Phase::Late, at)
@@ -116,9 +129,16 @@ fn lint(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>, (article, desc): (&str, &s
 
 /// rustc's `has_doc`: a doc comment or `#[doc = ..]` on `owner` (or, inner, in `inner`, and
 /// as attributes of `list`, the module's item list `inner` is), or a `#[doc(hidden)]`.
-fn has_doc<'t>(cx: &Cx<'_, '_>, owner: impl HasAttrs<'t>, inner: Option<ast::Node<'t>>, list: Option<ast::ItemList<'t>>) -> bool {
-    let outer_comment = owner.syntax().children().any(|it| is_doc_comment(it, T![outer_doc_comment]));
-    let inner_comment = inner.is_some_and(|it| it.children().any(|it| is_doc_comment(it, T![inner_doc_comment])));
+fn has_doc<'t>(
+    cx: &Cx<'_, '_>,
+    owner: impl HasAttrs<'t>,
+    inner: Option<ast::Node<'t>>,
+    list: Option<ast::ItemList<'t>>,
+) -> bool {
+    let outer_comment =
+        owner.syntax().children().any(|it| is_doc_comment(it, T![outer_doc_comment]));
+    let inner_comment =
+        inner.is_some_and(|it| it.children().any(|it| is_doc_comment(it, T![inner_doc_comment])));
     if outer_comment || inner_comment {
         return true;
     }
@@ -155,7 +175,10 @@ fn is_doc_comment(node: ast::Node<'_>, kind: SyntaxKind) -> bool {
 
 /// From the first token of a file to the end of its last: the span of the crate.
 fn tokens_range(node: ast::Node<'_>) -> Option<TextRange> {
-    let mut tokens = node.descendants_with_tokens().filter_map(NodeOrToken::into_token).filter(|it| !it.kind().is_trivia());
+    let mut tokens = node
+        .descendants_with_tokens()
+        .filter_map(NodeOrToken::into_token)
+        .filter(|it| !it.kind().is_trivia());
     let first: TextSize = tokens.next()?.text_range().start();
     let last = node
         .descendants_with_tokens()
@@ -185,7 +208,9 @@ fn describe(item: &Item<'_>) -> Option<(&'static str, &'static str)> {
         ast::Item::Const(_) if assoc => ("an", "associated constant"),
         ast::Item::Const(_) => ("a", "constant"),
         ast::Item::TypeAlias(_) if assoc => ("an", "associated type"),
-        ast::Item::TypeAlias(_) if matches!(item.container, Container::Extern(_)) => ("a", "foreign type"),
+        ast::Item::TypeAlias(_) if matches!(item.container, Container::Extern(_)) => {
+            ("a", "foreign type")
+        }
         ast::Item::TypeAlias(_) => ("a", "type alias"),
         ast::Item::Static(_) => ("a", "static"),
         ast::Item::Struct(_) => ("a", "struct"),

@@ -6,10 +6,7 @@ fn is_noop_destruct(glue: &FnPtr) -> bool {
     match glue.kind.as_ref() {
         FnPtrKind::Trait(tref, _) => matches!(
             &tref.kind,
-            TraitRefKind::BuiltinOrAuto {
-                builtin_data: BuiltinImplData::NoopDestruct,
-                ..
-            }
+            TraitRefKind::BuiltinOrAuto { builtin_data: BuiltinImplData::NoopDestruct, .. }
         ),
         _ => false,
     }

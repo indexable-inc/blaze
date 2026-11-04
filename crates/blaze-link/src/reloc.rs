@@ -45,7 +45,12 @@ impl Bad {
     pub(crate) fn reach(self) -> bool {
         matches!(
             self,
-            Bad::Signed32(_) | Bad::Unsigned32(_) | Bad::Branch { .. } | Bad::Adrp(_) | Bad::Adr(_) | Bad::TpRange(_)
+            Bad::Signed32(_)
+                | Bad::Unsigned32(_)
+                | Bad::Branch { .. }
+                | Bad::Adrp(_)
+                | Bad::Adr(_)
+                | Bad::TpRange(_)
         )
     }
 }
@@ -118,7 +123,12 @@ pub(crate) struct Ctx {
 /// The [`Apply`] a codegen relocation is written as, by the kind of target it has and
 /// whether it is in a function's code (`in_code`) or in data. A thread-local kind is valid
 /// only on the format and arch whose TLS model it belongs to.
-pub(crate) fn of_kind(kind: RelocKind, format: Format, arch: Arch, in_code: bool) -> Result<Apply, String> {
+pub(crate) fn of_kind(
+    kind: RelocKind,
+    format: Format,
+    arch: Arch,
+    in_code: bool,
+) -> Result<Apply, String> {
     if arch.is_wasm() {
         return crate::wasm::codegen_apply(kind, in_code);
     }
@@ -149,7 +159,9 @@ pub(crate) fn of_kind(kind: RelocKind, format: Format, arch: Arch, in_code: bool
         (RelocKind::TpLo12, Elf, A64) => Apply::A64TpLo12,
         (RelocKind::SectionRel32, Pe, _) => Apply::SecRel32,
         // alloc: error path
-        (kind, format, arch) => return Err(format!("a {kind:?} relocation in {format:?} {arch:?} code")),
+        (kind, format, arch) => {
+            return Err(format!("a {kind:?} relocation in {format:?} {arch:?} code"));
+        }
     })
 }
 
@@ -166,7 +178,13 @@ pub(crate) const WASM_FUNCTION_INDEX_I32: u32 = 26;
 /// Whether a wasm relocation type is one the core gives a table slot (the function's index
 /// + 1) rather than an address.
 pub(crate) const fn wasm_is_table_slot(r_type: u32) -> bool {
-    matches!(r_type, WASM_TABLE_INDEX_SLEB | WASM_TABLE_INDEX_I32 | WASM_TABLE_INDEX_SLEB64 | WASM_TABLE_INDEX_I64)
+    matches!(
+        r_type,
+        WASM_TABLE_INDEX_SLEB
+            | WASM_TABLE_INDEX_I32
+            | WASM_TABLE_INDEX_SLEB64
+            | WASM_TABLE_INDEX_I64
+    )
 }
 
 /// How many bytes from the place an [`Apply`] writes.
@@ -298,7 +316,9 @@ pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Bad
                 Some(tp) => u64::try_from(tp + a).map_err(|_| Bad::SecRelNotTls)?,
                 None => {
                     let tls = tls()?;
-                    sa.checked_sub(tls.addr).filter(|it| *it <= tls.size).ok_or(Bad::SecRelNotTls)?
+                    sa.checked_sub(tls.addr)
+                        .filter(|it| *it <= tls.size)
+                        .ok_or(Bad::SecRelNotTls)?
                 }
             };
             put(field, fits_u32(at)?.to_le_bytes())
@@ -351,9 +371,10 @@ pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Bad
             let imm = ((sa >> (16 * u64::from(group))) & 0xffff) as u32;
             write32(field, (insn & !(0xffff << 5)) | (imm << 5));
         }
-        Apply::A64GotPage21 | Apply::A64TlsIePage21 | Apply::A64TlsDescPage21 | Apply::TlvPage21 => {
-            a64_adrp(field, ga, p)?
-        }
+        Apply::A64GotPage21
+        | Apply::A64TlsIePage21
+        | Apply::A64TlsDescPage21
+        | Apply::TlvPage21 => a64_adrp(field, ga, p)?,
         Apply::A64GotLo12 | Apply::A64TlsIeLo12 | Apply::A64TlsDescLo12 | Apply::TlvLo12 => {
             a64_lo12(field, ga, 3)?
         }
@@ -518,7 +539,10 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bl), 0x9400_0000 | (0x8000 >> 2));
         let mut back = 0x9400_0000u32.to_le_bytes();
         apply(Apply::A64Call26, &ctx(Arch::Aarch64, 0x8000, 0, 0x1_0000), &mut back).unwrap();
-        assert_eq!(u32::from_le_bytes(back), 0x9400_0000 | (((-0x8000i32 >> 2) as u32) & 0x3ff_ffff));
+        assert_eq!(
+            u32::from_le_bytes(back),
+            0x9400_0000 | (((-0x8000i32 >> 2) as u32) & 0x3ff_ffff)
+        );
         let mut too_far = 0x9400_0000u32.to_le_bytes();
         assert!(apply(Apply::A64Call26, &ctx(Arch::Aarch64, 1 << 28, 0, 0), &mut too_far).is_err());
 
@@ -623,7 +647,8 @@ mod tests {
         assert_eq!(far, Bad::Branch { offset: 1 << 28, bits: 26 });
         assert!(far.to_string().contains("reach of 0x8000000"));
         let mut ldr = 0xf940_0020u32.to_le_bytes();
-        let odd = apply(Apply::A64Lo12 { shift: u8::MAX }, &ctx(Arch::Aarch64, 0x5674, 0, 0), &mut ldr);
+        let odd =
+            apply(Apply::A64Lo12 { shift: u8::MAX }, &ctx(Arch::Aarch64, 0x5674, 0, 0), &mut ldr);
         assert!(odd.unwrap_err().to_string().contains("8-byte access"));
         let mut field = [0u8; 4];
         let no_tls = apply(Apply::X86TpOff32, &ctx(Arch::X86_64, 0, 0, 0), &mut field);

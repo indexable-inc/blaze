@@ -15,9 +15,9 @@
 //! the parser's own words, always an error (`docs/v2/requests/diagnostics.md`).
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::radix;
 use hir::{HirFileId, InFile};
+use std::alloc::Global;
 use syntax::{
     Edition, LexedStr, SyntaxError, SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _},
@@ -260,7 +260,10 @@ fn lower_file(
     }
     for error in literals {
         // alloc: the error's text, for an error hir found
-        found.push(Found::new(Diag::error(None, error.to_string(), f.at(error.range())), Phase::Parse));
+        found.push(Found::new(
+            Diag::error(None, error.to_string(), f.at(error.range())),
+            Phase::Parse,
+        ));
     }
     radix::sort_by_key(&mut parser_errors, |it| u32::from(it.range().start()));
     radix::sort_by_key(&mut validation, |it| u32::from(it.range().start()));
@@ -298,7 +301,11 @@ impl File<'_, '_, '_> {
                 let node = self.tree.covering_element(range);
                 match node.kind() {
                     SyntaxKind::DYN_TRAIT_TYPE => Some(Found::new(
-                        Diag::error(Some("E0224"), "at least one trait is required for an object type", at),
+                        Diag::error(
+                            Some("E0224"),
+                            "at least one trait is required for an object type",
+                            at,
+                        ),
                         Phase::Items,
                     )),
                     _ => None,
@@ -450,8 +457,11 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
         }
         tok.kind.is_literal()
             || tok.kind == SyntaxKind::LIFETIME_IDENT
-            || ["(", "{", "[", "!", "-", "*", "|", "||", "&", "&&", "..", "...", "..=", "<", "<<", "::", "#"]
-                .contains(&s)
+            || [
+                "(", "{", "[", "!", "-", "*", "|", "||", "&", "&&", "..", "...", "..=", "<", "<<",
+                "::", "#",
+            ]
+            .contains(&s)
     }
 
     /// rustc's `Token::can_begin_item`.
@@ -526,9 +536,10 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
                 fatal("E0767", "unterminated C string", after_prefix)
             }
             "Invalid raw string literal" => (self.raw_string_error(range), true),
-            "Missing digits after the integer base prefix" => {
-                (Diag::error(Some("E0768"), "no valid digits found for number", self.at(range)), false)
-            }
+            "Missing digits after the integer base prefix" => (
+                Diag::error(Some("E0768"), "no valid digits found for number", self.at(range)),
+                false,
+            ),
             "Missing digits after the exponent symbol" => (
                 Diag::error(None, "expected at least one digit in exponent", self.at(range)),
                 false,
@@ -549,7 +560,8 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
             _ => "unterminated block comment",
         };
         let start = range.start();
-        let mut diag = Diag::error(Some("E0758"), msg, self.at(TextRange::new(start, self.eof().end())));
+        let mut diag =
+            Diag::error(Some("E0758"), msg, self.at(TextRange::new(start, self.eof().end())));
         // alloc: the error's parts, for an error hir found
         let mut opens = Vec::new();
         let mut last_nested = None;
@@ -618,7 +630,10 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
         diag.span_label(here, "unterminated raw string");
         if hashes > 0 {
             // alloc: the error's text, for an error hir found
-            diag.note(format!("this raw string should be terminated with `\"{}`", "#".repeat(hashes)));
+            diag.note(format!(
+                "this raw string should be terminated with `\"{}`",
+                "#".repeat(hashes)
+            ));
         }
         if let Some(offset) = possible {
             let lo = start + to_size(offset);
@@ -655,7 +670,10 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
                 }
                 diag.span_label(self.at(unmatched.found_span), "mismatched closing delimiter");
                 if let Some(candidate) = unmatched.candidate {
-                    diag.span_label(self.at(candidate), "closing delimiter possibly meant for this");
+                    diag.span_label(
+                        self.at(candidate),
+                        "closing delimiter possibly meant for this",
+                    );
                 }
                 if let Some(unclosed) = unmatched.unclosed {
                     diag.span_label(self.at(unclosed), "unclosed delimiter");
@@ -884,7 +902,12 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
         if token.is_some_and(|it| self.src(it) == ";") {
             // clone: on the error path, for an error hir found
             let mut diag = Diag::error(None, "expected item, found `;`", span.clone());
-            diag.suggestion_verbose(span, "remove this semicolon", "", Applicability::MachineApplicable);
+            diag.suggestion_verbose(
+                span,
+                "remove this semicolon",
+                "",
+                Applicability::MachineApplicable,
+            );
             if let Some(name) = prev.and_then(|it| self.item_ending_at(it.range.end())) {
                 // alloc: the error's text, for an error hir found
                 diag.help(format!("{name} declarations are not followed by a semicolon"));
@@ -1019,8 +1042,14 @@ fn same_delimiter(open: SyntaxKind, close: SyntaxKind) -> bool {
     matches!(
         (open, close),
         (SyntaxKind::L_PAREN | SyntaxKind::R_PAREN, SyntaxKind::R_PAREN | SyntaxKind::L_PAREN)
-            | (SyntaxKind::L_CURLY | SyntaxKind::R_CURLY, SyntaxKind::R_CURLY | SyntaxKind::L_CURLY)
-            | (SyntaxKind::L_BRACK | SyntaxKind::R_BRACK, SyntaxKind::R_BRACK | SyntaxKind::L_BRACK)
+            | (
+                SyntaxKind::L_CURLY | SyntaxKind::R_CURLY,
+                SyntaxKind::R_CURLY | SyntaxKind::L_CURLY
+            )
+            | (
+                SyntaxKind::L_BRACK | SyntaxKind::R_BRACK,
+                SyntaxKind::R_BRACK | SyntaxKind::L_BRACK
+            )
     )
 }
 
@@ -1158,7 +1187,10 @@ impl Trees<'_, '_, '_, '_> {
         {
             let more = self.info.open.len() - SHOWN;
             // alloc: the error's text, for an error hir found
-            diag.span_label(file.at(span), format!("another {more} unclosed delimiters begin from here"));
+            diag.span_label(
+                file.at(span),
+                format!("another {more} unclosed delimiters begin from here"),
+            );
         }
         if let Some(&(delim, _)) = self.info.open.last() {
             self.suspicious_mismatch_block(&mut diag, delim);
@@ -1236,8 +1268,12 @@ impl Trees<'_, '_, '_, '_> {
                 "...as it matches this but it has different indentation",
             );
             if delim == SyntaxKind::L_CURLY || delim == SyntaxKind::R_CURLY {
-                if let Some(&empty) = info.empty_blocks.iter().find(|it| block.contains_range(**it)) {
-                    diag.span_label(file.at(empty), "block is empty, you might have not meant to close it");
+                if let Some(&empty) = info.empty_blocks.iter().find(|it| block.contains_range(**it))
+                {
+                    diag.span_label(
+                        file.at(empty),
+                        "block is empty, you might have not meant to close it",
+                    );
                 }
             }
         } else if let Some(&(open, close)) = info.matching_blocks.last()

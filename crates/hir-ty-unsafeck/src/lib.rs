@@ -21,8 +21,8 @@ use std::mem;
 use base_db::{Crate, Db};
 use either::Either;
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId,
-    GenericDefId, HasModule, ItemContainerId, Lookup, TraitId, VariantId,
+    AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId, GenericDefId,
+    HasModule, ItemContainerId, Lookup, TraitId, VariantId,
     attrs::AttrFlags,
     expr_store::{Body, ExpressionStore, ExpressionStoreSourceMap, path::Path},
     hir::{
@@ -34,6 +34,7 @@ use hir_def::{
     signatures::{FunctionSignature, StaticFlags, StaticSignature, VariantFields},
     type_ref::Rawness,
 };
+use hir_lint_levels::{Level, LintId};
 use hir_ty::{
     Adjust, AutoBorrow, BindingMode, ByRef, ExplicitDropMethodUseKind, InferenceDiagnostic,
     InferenceResult, OverloadedDeref, TargetFeatureIsSafeInTarget, TargetFeatures, Unsafety,
@@ -48,7 +49,6 @@ use hir_ty::{
     },
     target_feature_is_safe_in_target,
 };
-use hir_lint_levels::{Level, LintId};
 use rustc_type_ir::inherent::IntoKind;
 use span::Edition;
 
@@ -367,9 +367,13 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
     /// (`expect` is not).
     fn unsafe_op_in_unsafe_fn_allowed(&self) -> bool {
         const UNSAFE_OP_IN_UNSAFE_FN: LintId = LintId::named("unsafe_op_in_unsafe_fn");
-        let level =
-            hir_lint_levels::lint_level_at(self.db, self.owner, self.hir_context, UNSAFE_OP_IN_UNSAFE_FN)
-                .expect("`hir_context` is only ever an expression with syntax");
+        let level = hir_lint_levels::lint_level_at(
+            self.db,
+            self.owner,
+            self.hir_context,
+            UNSAFE_OP_IN_UNSAFE_FN,
+        )
+        .expect("`hir_context` is only ever an expression with syntax");
         level == Level::Allow
     }
 
@@ -407,9 +411,8 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             return self.walk_expr_in(current);
         }
         let (db, owner) = (self.db, self.owner);
-        let source_map = *self
-            .source_map
-            .get_or_insert_with(|| ExpressionStore::with_source_map(db, owner).1);
+        let source_map =
+            *self.source_map.get_or_insert_with(|| ExpressionStore::with_source_map(db, owner).1);
         let outer = self.hir_context;
         if source_map.expr_syntax(current).is_ok() {
             self.hir_context = Some(current);

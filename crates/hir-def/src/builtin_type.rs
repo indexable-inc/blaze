@@ -229,7 +229,9 @@ impl AsName for BuiltinType {
                 BuiltinInt::I32 => Name::new_symbol_root(sym::i32),
                 BuiltinInt::I64 => Name::new_symbol_root(sym::i64),
                 BuiltinInt::I128 => Name::new_symbol_root(sym::i128),
-                BuiltinInt::Bits(w) => Name::new_symbol_root(Symbol::intern(IntTy::Bits(*w).name_str())),
+                BuiltinInt::Bits(w) => {
+                    Name::new_symbol_root(Symbol::intern(IntTy::Bits(*w).name_str()))
+                }
             },
             BuiltinType::Uint(it) => match it {
                 BuiltinUint::Usize => Name::new_symbol_root(sym::usize),
@@ -372,7 +374,8 @@ mod tests {
                 text[1..].to_owned(),
             ]);
         }
-        texts.extend(["", "i", "u", "f", "i256", "f80", "Self", "String", "self"].map(String::from));
+        texts
+            .extend(["", "i", "u", "f", "i256", "f80", "Self", "String", "self"].map(String::from));
         texts
     }
 
@@ -384,7 +387,8 @@ mod tests {
             assert_eq!(BuiltinType::by_name(name), Some(*ty), "{name:?}");
         }
         let texts = texts();
-        let symbols = texts.iter().map(|it| Symbol::intern(it)).chain([sym::self_, sym::Integer::get(8)]);
+        let symbols =
+            texts.iter().map(|it| Symbol::intern(it)).chain([sym::self_, sym::Integer::get(8)]);
         for symbol in symbols {
             let name = Name::new_symbol_root(symbol);
             let linear = all.iter().find_map(|(n, ty)| (*n == name).then_some(*ty));
@@ -399,7 +403,9 @@ mod tests {
         let u3 = BuiltinType::arbitrary_by_text("u3");
         assert_eq!(u3.map(|it| it.to_string()).as_deref(), Some("u3"));
         assert_eq!(BuiltinType::by_name(&Name::new_symbol_root(Symbol::intern("u3"))), None);
-        for text in ["u0", "u8", "i16", "u32", "i64", "u128", "u129", "u03", "u", "x3", "u3a", "u1000"] {
+        for text in
+            ["u0", "u8", "i16", "u32", "i64", "u128", "u129", "u03", "u", "x3", "u3a", "u1000"]
+        {
             assert_eq!(BuiltinType::arbitrary_by_text(text), None, "{text}");
         }
         for bits in (1..=127).filter(|it| ![8, 16, 32, 64].contains(it)) {

@@ -13,15 +13,15 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use base_db::Crate;
 use blaze_mem::{Frame, Tag, frame};
+use hegel::generators as gs;
+use hegel::{Hegel, Settings, TestCase};
+use hir_expand::fixture;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
 use intern::Symbol;
 use span::Edition;
-use hir_expand::fixture;
 
 use crate::{
     nameres::{
@@ -54,7 +54,8 @@ fn crates() -> (TestDB, Crate, Crate) {
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set (a long
 /// run).
 fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
+    let cases =
+        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
     Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 
@@ -104,24 +105,44 @@ impl Builder {
     fn import(&mut self, module: u32, kind: PathKind, segments: &[&str]) {
         let path = path(kind, segments);
         let binds = path.segments().last().copied();
-        self.raw_import(module, ShapeImport { path, binds, is_glob: false, is_prelude: false, hygienic: false });
+        self.raw_import(
+            module,
+            ShapeImport { path, binds, is_glob: false, is_prelude: false, hygienic: false },
+        );
     }
 
     fn import_as(&mut self, module: u32, kind: PathKind, segments: &[&str], alias: &str) {
-        let import =
-            ShapeImport { path: path(kind, segments), binds: Some(name(alias)), is_glob: false, is_prelude: false, hygienic: false };
+        let import = ShapeImport {
+            path: path(kind, segments),
+            binds: Some(name(alias)),
+            is_glob: false,
+            is_prelude: false,
+            hygienic: false,
+        };
         self.raw_import(module, import);
     }
 
     /// `use path::*;`.
     fn glob(&mut self, module: u32, kind: PathKind, segments: &[&str]) {
-        let import = ShapeImport { path: path(kind, segments), binds: None, is_glob: true, is_prelude: false, hygienic: false };
+        let import = ShapeImport {
+            path: path(kind, segments),
+            binds: None,
+            is_glob: true,
+            is_prelude: false,
+            hygienic: false,
+        };
         self.raw_import(module, import);
     }
 
     /// `#[prelude_import] use path::*;`.
     fn prelude_import(&mut self, module: u32, kind: PathKind, segments: &[&str]) {
-        let import = ShapeImport { path: path(kind, segments), binds: None, is_glob: true, is_prelude: true, hygienic: false };
+        let import = ShapeImport {
+            path: path(kind, segments),
+            binds: None,
+            is_glob: true,
+            is_prelude: true,
+            hygienic: false,
+        };
         self.raw_import(module, import);
     }
 
@@ -265,8 +286,11 @@ fn pearce_equals_tarjan() {
     run_cases(1024, |tc| {
         let nodes: u32 = tc.draw(gs::integers().min_value(1).max_value(47));
         let edges: Vec<(u32, u32)> = tc.draw(
-            gs::vecs(gs::tuples!(gs::integers().max_value(nodes - 1), gs::integers().max_value(nodes - 1)))
-                .max_size(159),
+            gs::vecs(gs::tuples!(
+                gs::integers().max_value(nodes - 1),
+                gs::integers().max_value(nodes - 1)
+            ))
+            .max_size(159),
         );
         task(|frame| {
             let partition = components(frame, &ImportGraph::from_edges(frame, nodes, &edges));
@@ -288,7 +312,10 @@ fn pearce_equals_tarjan() {
                 ImportGraph::from_edges(frame, nodes, &shuffled),
                 ImportGraph::from_edges(frame, nodes, &edges)
             );
-            assert_eq!(components(frame, &ImportGraph::from_edges(frame, nodes, &shuffled)), partition);
+            assert_eq!(
+                components(frame, &ImportGraph::from_edges(frame, nodes, &shuffled)),
+                partition
+            );
         })
     });
 }
@@ -606,7 +633,11 @@ fn pick(bytes: &mut Bytes<'_>) -> Name {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Def {
     Module(u32),
-    Enum { id: u32, container: u32, imported: bool },
+    Enum {
+        id: u32,
+        container: u32,
+        imported: bool,
+    },
     /// Any other item, a variant too: a path stops at it.
     Item,
 }
@@ -660,7 +691,8 @@ fn world(bytes: &[u8], this: Crate, other: Crate) -> World {
                 let id = variants.len() as u32;
                 let len = 1 + r.next(2);
                 variants.push((0..len).map(|_| pick(&mut r)).collect());
-                decls[module as usize].push((item, Def::Enum { id, container: module, imported: false }));
+                decls[module as usize]
+                    .push((item, Def::Enum { id, container: module, imported: false }));
             } else {
                 decls[module as usize].push((item, Def::Item));
             }
@@ -696,7 +728,9 @@ fn world(bytes: &[u8], this: Crate, other: Crate) -> World {
             };
             let len = r.next(4);
             let segments: Vec<Name> = (0..len).map(|_| pick(&mut r)).collect();
-            b.modules[module as usize].other_paths.push((ModPath::from_segments(kind, segments), false));
+            b.modules[module as usize]
+                .other_paths
+                .push((ModPath::from_segments(kind, segments), false));
         }
     }
     World { shape: b.build(), names, decls, variants }
@@ -732,7 +766,9 @@ impl<'w> Model<'w> {
     }
 
     fn get(&self, module: u32, binding: &Name) -> Vec<Def> {
-        self.scopes[module as usize].get(binding).map_or_else(Vec::new, |it| it.iter().copied().collect())
+        self.scopes[module as usize]
+            .get(binding)
+            .map_or_else(Vec::new, |it| it.iter().copied().collect())
     }
 
     fn read(&mut self, reader: u32, read: u32) {
@@ -921,7 +957,10 @@ fn partition_allocations_do_not_grow_with_edges() {
     let small = chain(this, 16);
     let large = chain(this, 4096);
     task(|frame| {
-        assert!(import_graph(frame, &large).edge_count() > 100 * import_graph(frame, &small).edge_count());
+        assert!(
+            import_graph(frame, &large).edge_count()
+                > 100 * import_graph(frame, &small).edge_count()
+        );
     });
     // The first call interns the test harness's name, and reserves the task's frame.
     partition_of(&small);
@@ -950,12 +989,17 @@ fn a_hygienic_path_reads_every_module_around_it() {
     let deep = b.module(inner, "d");
     let opaque = b.module(a, "o");
     let under = b.module(opaque, "u");
-    for (module, kind, hygienic) in
-        [(inner, PathKind::Super(1), true), (deep, PathKind::Plain, true), (under, PathKind::Super(1), false)]
-    {
+    for (module, kind, hygienic) in [
+        (inner, PathKind::Super(1), true),
+        (deep, PathKind::Plain, true),
+        (under, PathKind::Super(1), false),
+    ] {
         let path = path(kind, &["x"]);
         let binds = path.segments().last().copied();
-        b.raw_import(module, ShapeImport { path, binds, is_glob: false, is_prelude: false, hygienic });
+        b.raw_import(
+            module,
+            ShapeImport { path, binds, is_glob: false, is_prelude: false, hygienic },
+        );
     }
     let mut shape = b.build();
     shape.modules[opaque as usize].opaque = true;

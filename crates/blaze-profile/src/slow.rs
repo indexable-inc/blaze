@@ -45,8 +45,12 @@ pub use render::{text, thread_line};
 /// waits the record never ends are their own blind spot (`unended_wait`). 3: a build whose
 /// daemon died is reported, to that daemon's last row, with `build.died`. 4: a build past
 /// `time::load::SPAN_BUDGET` spans is modelled from its spans at or past a floor, said by the
-/// blind spot `spans_cut`.
-pub const VERSION: u32 = 4;
+/// blind spot `spans_cut`. 5: past the bound, the critical path's lanes are read again under
+/// the floor and the job and wait spans under it are summed in `spans_cut`'s evidence (a floor
+/// past which only unended spans are read is the bound, so no build is refused for its size); a
+/// park whose wait span was under the floor is classed `<kind> wait under the read floor`, not an
+/// unnamed wait; the workers' CPU counts every span, read or not.
+pub const VERSION: u32 = 5;
 
 /// The build the report is of, as its `builds` row says.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -112,10 +116,26 @@ pub struct Facts {
     /// The build's misses rows, by step and cause.
     pub misses: Vec<MissGroup>,
     pub query_counts: Vec<QueryCount>,
+    /// Each thread's spans' CPU in the build's window, counted in DuckDB over every span.
+    pub thread_cpu: Vec<ThreadCpu>,
     pub memory: Memory,
     pub recorder: Recorder,
     /// Which of the build's spans the model read ([`crate::time::load::SPAN_BUDGET`]).
     pub spans: crate::time::SpanCut,
+}
+
+/// A thread's spans' CPU over the build's window ([`Facts::thread_cpu`]): counted where every
+/// span is, so a model that read only some of them ([`crate::time::SpanCut`]) judges its workers
+/// by all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThreadCpu {
+    pub process: u32,
+    pub thread: u32,
+    /// Its spans' `self_cpu_ns`, summed.
+    pub cpu_ns: i64,
+    /// Its spans with a `self_cpu_ns`, and those without.
+    pub counted: u64,
+    pub uncounted: u64,
 }
 
 /// What the flight recorder itself dropped or summed over the build's window, from its own
@@ -324,16 +344,30 @@ impl Fix {
     /// The fix in words.
     pub fn says(self) -> &'static str {
         match self {
-            Fix::Parallelise => "parallelise it: it ran serially on the critical path while workers sat idle",
+            Fix::Parallelise => {
+                "parallelise it: it ran serially on the critical path while workers sat idle"
+            }
             Fix::GiveCpu => {
                 "give it CPU: it was on a core, or blocked outside any `wait` span, yet got little CPU; check its worker's QoS class, the host's load, and blocking calls no `wait` span names"
             }
-            Fix::ShortenWait => "shorten what it waits on, or start that sooner: the owner's work is what held the build up",
-            Fix::WakeWorkers => "run runnable work at once: jobs sat queued for a core while workers were idle",
-            Fix::KeyForReuse => "key it so its first run is reused: the same key ran more than once in one build",
-            Fix::KeepInMemory => "keep it in memory: values were evicted, then asked for and computed again",
-            Fix::KeepAcrossBuilds => "keep the lowered database across requests: the daemon let it go between builds",
-            Fix::ExplainMiss => "find why each was computed again (`blaze why`) and key it so it is reused",
+            Fix::ShortenWait => {
+                "shorten what it waits on, or start that sooner: the owner's work is what held the build up"
+            }
+            Fix::WakeWorkers => {
+                "run runnable work at once: jobs sat queued for a core while workers were idle"
+            }
+            Fix::KeyForReuse => {
+                "key it so its first run is reused: the same key ran more than once in one build"
+            }
+            Fix::KeepInMemory => {
+                "keep it in memory: values were evicted, then asked for and computed again"
+            }
+            Fix::KeepAcrossBuilds => {
+                "keep the lowered database across requests: the daemon let it go between builds"
+            }
+            Fix::ExplainMiss => {
+                "find why each was computed again (`blaze why`) and key it so it is reused"
+            }
             Fix::ReadOnce => {
                 "read each row once a run: hoist reads out of loops over items, or read one query that gathers them; each read costs the run a query stack entry and its verify a check"
             }
@@ -437,8 +471,19 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
             .then_with(|| a.subject.cmp(&b.subject))
     });
     blind.retain(|it| it.hidden_ns >= MIN_HIDDEN_NS || it.hidden_ns == 0);
-    blind.sort_by(|a, b| b.hidden_ns.cmp(&a.hidden_ns).then(a.kind.cmp(&b.kind)).then_with(|| a.subject.cmp(&b.subject)));
-    Report { version: VERSION, build: facts.build.clone(), summary: ctx.summary(smaller, cut_ns), findings, blind_spots: blind }
+    blind.sort_by(|a, b| {
+        b.hidden_ns
+            .cmp(&a.hidden_ns)
+            .then(a.kind.cmp(&b.kind))
+            .then_with(|| a.subject.cmp(&b.subject))
+    });
+    Report {
+        version: VERSION,
+        build: facts.build.clone(),
+        summary: ctx.summary(smaller, cut_ns),
+        findings,
+        blind_spots: blind,
+    }
 }
 
 /// Integer seconds to a tenth, for evidence.
@@ -472,7 +517,13 @@ impl<'a> Ctx<'a> {
         let (start, end) = (model.bounds.start_ns, model.bounds.end_ns);
         let named: HashSet<(u32, u32), Global> = {
             let mut it = HashSet::new_in(Global);
-            it.extend(facts.threads.iter().filter(|it| it.name.starts_with("blaze-work")).map(|it| (it.process, it.thread)));
+            it.extend(
+                facts
+                    .threads
+                    .iter()
+                    .filter(|it| it.name.starts_with("blaze-work"))
+                    .map(|it| (it.process, it.thread)),
+            );
             it
         };
         // A worker: a thread a pool job ran on, or one named as the pool names its threads.
@@ -504,8 +555,10 @@ impl<'a> Ctx<'a> {
         let (workers, running): (Vec<_>, Vec<_>) = workers.into_iter().unzip();
 
         let path_ran = crate::time::path::segments(model, path);
-        let lost: i64 = path.links.iter().filter(|it| it.kind == LinkKind::Unrecorded).map(Link::dur_ns).sum();
-        let path_trusted = matches!(path.reached, Reached::BuildStart) && lost * 5 < path.len_ns().max(1);
+        let lost: i64 =
+            path.links.iter().filter(|it| it.kind == LinkKind::Unrecorded).map(Link::dur_ns).sum();
+        let path_trusted =
+            matches!(path.reached, Reached::BuildStart) && lost * 5 < path.len_ns().max(1);
         Ctx { model, path, facts, workers, running, busy, path_ran, path_trusted }
     }
 
@@ -581,8 +634,10 @@ impl<'a> Ctx<'a> {
         for (name, mut group) in groups {
             group.spans.sort_unstable();
             group.spans.dedup();
-            let own_running: i64 = group.spans.iter().map(|&i| model.span_time[i].own.running_ns).sum();
-            let own_cpu: i64 = group.spans.iter().map(|&i| model.spans[i].self_cpu_ns.unwrap_or(0).max(0)).sum();
+            let own_running: i64 =
+                group.spans.iter().map(|&i| model.span_time[i].own.running_ns).sum();
+            let own_cpu: i64 =
+                group.spans.iter().map(|&i| model.spans[i].self_cpu_ns.unwrap_or(0).max(0)).sum();
             let counted = group.spans.iter().any(|&i| model.spans[i].self_cpu_ns.is_some());
             let busy = (group.busy_ns as f64 / group.ns.max(1) as f64).max(1.0);
             let ratio = if own_running > 0 { own_cpu as f64 / own_running as f64 } else { 1.0 };
@@ -603,7 +658,12 @@ impl<'a> Ctx<'a> {
                 100.0 * (1.0 - busy / workers as f64).max(0.0)
             ));
             if counted {
-                evidence.push(format!("its spans ran {} on a core and counted {} of CPU ({:.0}%)", s(own_running), s(own_cpu), 100.0 * ratio));
+                evidence.push(format!(
+                    "its spans ran {} on a core and counted {} of CPU ({:.0}%)",
+                    s(own_running),
+                    s(own_cpu),
+                    100.0 * ratio
+                ));
             }
             let owner = self.owner(name, subjects.first().map_or("", |it| it.0.as_str()));
             // alloc: a finding's subject
@@ -629,7 +689,10 @@ impl<'a> Ctx<'a> {
                     fix: Fix::Parallelise,
                     saves_ns: (group.ns as f64 * (1.0 - busy / workers as f64)) as i64,
                     estimate: Estimate::CriticalPath,
-                    title: format!("serial: `{name}` ran {} on the critical path while most workers were idle", s(group.ns)),
+                    title: format!(
+                        "serial: `{name}` ran {} on the critical path while most workers were idle",
+                        s(group.ns)
+                    ),
                     subject,
                     owner,
                     evidence,
@@ -640,14 +703,11 @@ impl<'a> Ctx<'a> {
 
     /// Workers the OS gave much less CPU per running second than the others.
     fn starved_workers(&self, out: &mut Vec<Finding>) {
-        let model = self.model;
         let mut cpu: HashMap<(u32, u32), i64, Global> = HashMap::new_in(Global);
         let mut counted = false;
-        for it in &model.spans {
-            if let Some(ns) = it.self_cpu_ns {
-                counted = true;
-                *cpu.entry((it.process, it.thread)).or_default() += ns.max(0);
-            }
+        for it in self.facts.thread_cpu.iter().filter(|it| it.counted > 0) {
+            counted = true;
+            *cpu.entry((it.process, it.thread)).or_default() += it.cpu_ns.max(0);
         }
         if !counted {
             return;
@@ -682,7 +742,10 @@ impl<'a> Ctx<'a> {
         let mut saves = 0.0;
         for &(from, to, _, lane) in &self.path_ran {
             let Some(interval) = self.model.lanes[lane].at_or_before(to) else { continue };
-            let State::Running { thread, .. } = self.model.lanes[lane].intervals[interval].state else { continue };
+            let State::Running { thread, .. } = self.model.lanes[lane].intervals[interval].state
+            else {
+                continue;
+            };
             let key = (self.model.lanes[lane].id.process(), thread);
             if let Some(it) = starved.iter().find(|it| self.workers[it.0] == key) {
                 saves += (to - from) as f64 * (1.0 - it.3 / reference);
@@ -707,7 +770,12 @@ impl<'a> Ctx<'a> {
                 names.join(", "),
                 if more > 0 { format!(" and {more} more") } else { String::new() }
             ),
-            format!("they carried {:.0}% of the workers' running time ({} of {})", pct(carried, all), s(carried), s(all)),
+            format!(
+                "they carried {:.0}% of the workers' running time ({} of {})",
+                pct(carried, all),
+                s(carried),
+                s(all)
+            ),
         ];
         if saves < 1.0 {
             evidence.push("none of the critical path ran on them".to_owned());
@@ -719,7 +787,10 @@ impl<'a> Ctx<'a> {
             estimate: Estimate::CriticalPath,
             subject: "workers".to_owned(),
             owner: Some("blaze_graph::pool".to_owned()),
-            title: format!("starved workers: {} workers ran at a fraction of the others' CPU rate", starved.len()),
+            title: format!(
+                "starved workers: {} workers ran at a fraction of the others' CPU rate",
+                starved.len()
+            ),
             evidence,
         });
     }
@@ -739,6 +810,8 @@ impl<'a> Ctx<'a> {
             of: Vec<(String, i64)>,
             known: u64,
             named: bool,
+            /// Its waits' spans were under the floor the model read from ([`crate::time::SpanCut`]).
+            under_floor: bool,
             moved: bool,
         }
         // alloc: once a report
@@ -758,10 +831,14 @@ impl<'a> Ctx<'a> {
         // could not cross, and a wake's latency, are links of their own.
         // alloc: once a report
         let mut path_of_wait: Vec<Vec<(i64, i64)>> = vec![Vec::new(); model.waits.len()];
-        let (path_from, path_to) = (self.path.start_ns().unwrap_or(0), self.path.end_ns().unwrap_or(0));
+        let (path_from, path_to) =
+            (self.path.start_ns().unwrap_or(0), self.path.end_ns().unwrap_or(0));
         for link in &self.path.links {
             if let Some(w) = link.wakes {
-                let clipped = stretches[w].iter().map(|&(from, to)| (from.max(path_from), to.min(path_to))).filter(|it| it.1 > it.0);
+                let clipped = stretches[w]
+                    .iter()
+                    .map(|&(from, to)| (from.max(path_from), to.min(path_to)))
+                    .filter(|it| it.1 > it.0);
                 path_of_wait[w].extend(clipped);
             }
             if matches!(link.kind, LinkKind::Waited | LinkKind::Wake)
@@ -781,10 +858,19 @@ impl<'a> Ctx<'a> {
             // A wait with no `awaits` is classed by its kind alone: its value says nothing a
             // reader can act on, and one row per value would bury the rest.
             let named = wait.span.and_then(|it| model.spans[it].awaits.as_deref()).is_some();
-            let (class, of) = match named {
-                true => by_package(report::wait_class(model, wait)),
+            // A wait span holds its park, so a park as long as the floor had its span read: one
+            // shorter, with none, may have had one the model did not read.
+            let floor = self.facts.spans.floor_ns;
+            let under_floor = !named
+                && floor > 0
+                && wait.resumed_ns.is_some_and(|end| end - wait.parked_ns < floor);
+            let kind = wait.on.map_or("span", |it| it.name());
+            let (class, of) = match (named, under_floor) {
+                (true, _) => by_package(report::wait_class(model, wait)),
                 // alloc: a row's key
-                false => (format!("{} wait with no wait span", wait.on.map_or("span", |it| it.name())), None),
+                (false, true) => (format!("{kind} wait under the read floor"), None),
+                // alloc: a row's key
+                (false, false) => (format!("{kind} wait with no wait span"), None),
             };
             if wait.resumed_ns.is_none() {
                 unended.count += 1;
@@ -802,6 +888,7 @@ impl<'a> Ctx<'a> {
             class.on_path.append(&mut path_of_wait[w]);
             class.stretches.append(&mut stretches[w]);
             class.named |= named;
+            class.under_floor |= under_floor;
             class.moved |= wait.on == Some(crate::flight::WaitedOn::Moved);
             if let Some(lane) = wait.waker.lane() {
                 class.known += 1;
@@ -843,7 +930,13 @@ impl<'a> Ctx<'a> {
                 false => evidence.push(format!("woken by: {}", list(&owners))),
                 true => evidence.push("no wait of it names who woke it".to_owned()),
             }
-            if !class.named {
+            if class.under_floor {
+                evidence.push(format!(
+                    "their wait spans, if they opened any, were under the {} floor the model read from: what such waits were on is summed under `spans_cut`",
+                    s(self.facts.spans.floor_ns)
+                ));
+            }
+            if !class.named && !class.under_floor {
                 match self.facts.recorder.spans_lost {
                     Some(0) => evidence.push("the recorder lost no span in the build's window: the wait opened none".to_owned()),
                     Some(lost) => evidence.push(format!(
@@ -861,7 +954,7 @@ impl<'a> Ctx<'a> {
                 });
                 continue;
             }
-            if class.known == 0 && class.ns >= JUDGED_NS {
+            if class.named && class.known == 0 && class.ns >= JUDGED_NS {
                 blind.push(BlindSpot {
                     kind: BlindKind::OwnerlessWait,
                     hidden_ns: class.ns,
@@ -878,13 +971,18 @@ impl<'a> Ctx<'a> {
                 (false, true) => (0, Estimate::CriticalPath),
                 (false, false) => ((wall as f64 * idle) as i64, Estimate::IdleCores),
             };
-            let owner = self.owner(WAIT_SPAN, &name).or_else(|| owners.first().and_then(|it| file_in(&it.0)));
+            let owner = self
+                .owner(WAIT_SPAN, &name)
+                .or_else(|| owners.first().and_then(|it| file_in(&it.0)));
             out.push(Finding {
                 kind: Kind::Wait,
                 fix: Fix::ShortenWait,
                 saves_ns: saves,
                 estimate,
-                title: format!("waits on `{name}`: {} held up", s(if on_path > 0 { on_path } else { wall })),
+                title: format!(
+                    "waits on `{name}`: {} held up",
+                    s(if on_path > 0 { on_path } else { wall })
+                ),
                 subject: name,
                 owner,
                 evidence,
@@ -932,7 +1030,10 @@ impl<'a> Ctx<'a> {
             estimate: Estimate::CriticalPath,
             subject: "queued for a core".to_owned(),
             owner: Some("blaze_graph::pool".to_owned()),
-            title: format!("queued: the critical path waited {} for a core while its work was runnable", s(on_path)),
+            title: format!(
+                "queued: the critical path waited {} for a core while its work was runnable",
+                s(on_path)
+            ),
             evidence: vec![format!("{} of queued time over all jobs", s(all))],
         });
     }
@@ -942,16 +1043,24 @@ impl<'a> Ctx<'a> {
         let model = self.model;
         let queries: HashSet<&str, Global> = {
             let mut it = HashSet::new_in(Global);
-            it.extend(self.facts.span_kinds.iter().filter(|it| it.query_kind.is_some()).map(|it| it.name.as_str()));
+            it.extend(
+                self.facts
+                    .span_kinds
+                    .iter()
+                    .filter(|it| it.query_kind.is_some())
+                    .map(|it| it.name.as_str()),
+            );
             it
         };
-        let mut keys: HashMap<(&str, Option<&str>, &str), (u64, i64, i64), Global> = HashMap::new_in(Global);
+        let mut keys: HashMap<(&str, Option<&str>, &str), (u64, i64, i64), Global> =
+            HashMap::new_in(Global);
         for (i, it) in model.spans.iter().enumerate() {
             let Some(function) = it.function.as_deref() else { continue };
             if !(it.name.ends_with("_query") || queries.contains(it.name.as_str())) {
                 continue;
             }
-            let entry = keys.entry((it.name.as_str(), it.krate.as_deref(), function)).or_insert((0, 0, 0));
+            let entry =
+                keys.entry((it.name.as_str(), it.krate.as_deref(), function)).or_insert((0, 0, 0));
             let running = model.span_time[i].totals.running_ns;
             if entry.0 == 0 {
                 entry.2 = running;
@@ -959,7 +1068,8 @@ impl<'a> Ctx<'a> {
             entry.0 += 1;
             entry.1 += running;
         }
-        let mut by_query: HashMap<&str, (u64, u64, i64, Vec<(String, i64)>), Global> = HashMap::new_in(Global);
+        let mut by_query: HashMap<&str, (u64, u64, i64, Vec<(String, i64)>), Global> =
+            HashMap::new_in(Global);
         for ((name, krate, function), (runs, running, first)) in keys {
             if runs < 2 {
                 continue;
@@ -969,7 +1079,13 @@ impl<'a> Ctx<'a> {
             it.1 += runs - 1;
             it.2 += running - first;
             // alloc: an example, once a key a report
-            it.3.push((format!("{}{function} x{runs}", krate.map_or(String::new(), |it| format!("{it}: "))), running - first));
+            it.3.push((
+                format!(
+                    "{}{function} x{runs}",
+                    krate.map_or(String::new(), |it| format!("{it}: "))
+                ),
+                running - first,
+            ));
         }
         let parallelism = self.parallelism();
         for (name, (keys, extra, ns, mut examples)) in by_query {
@@ -979,7 +1095,10 @@ impl<'a> Ctx<'a> {
                 fix: Fix::KeyForReuse,
                 saves_ns: (ns as f64 / parallelism) as i64,
                 estimate: Estimate::ThreadTime,
-                title: format!("redone: `{name}` ran {extra} extra times over {keys} keys, {} of running", s(ns)),
+                title: format!(
+                    "redone: `{name}` ran {extra} extra times over {keys} keys, {} of running",
+                    s(ns)
+                ),
                 // alloc: a finding's subject
                 subject: name.to_owned(),
                 owner: self.owner(name, ""),
@@ -999,11 +1118,19 @@ impl<'a> Ctx<'a> {
             let kind = self.facts.span_kinds.iter().find(|kind| {
                 kind.query_kind.as_deref() == Some(it.query.as_str())
                     || kind.name == it.query
-                    || it.query.strip_suffix(kind.name.as_str()).is_some_and(|rest| rest.ends_with("::"))
-                    || kind.name.strip_suffix("_query").is_some_and(|name| it.query.rsplit("::").next() == Some(name))
+                    || it
+                        .query
+                        .strip_suffix(kind.name.as_str())
+                        .is_some_and(|rest| rest.ends_with("::"))
+                    || kind
+                        .name
+                        .strip_suffix("_query")
+                        .is_some_and(|name| it.query.rsplit("::").next() == Some(name))
             });
-            let per_run = kind.filter(|it| it.runs > 0).map(|it| it.self_cpu_ns as f64 / it.runs as f64);
-            let cost = |runs: u64| per_run.map_or(0, |per| (per * runs as f64 / parallelism) as i64);
+            let per_run =
+                kind.filter(|it| it.runs > 0).map(|it| it.self_cpu_ns as f64 / it.runs as f64);
+            let cost =
+                |runs: u64| per_run.map_or(0, |per| (per * runs as f64 / parallelism) as i64);
             let estimate = if per_run.is_some() { Estimate::ThreadTime } else { Estimate::Unknown };
             let per = per_run.map_or_else(
                 || "its spans count no CPU, so its cost is not known".to_owned(),
@@ -1035,7 +1162,10 @@ impl<'a> Ctx<'a> {
                     fix: Fix::KeyForReuse,
                     saves_ns: cost(it.reran),
                     estimate,
-                    title: format!("reran: `{}` ran {} times in a view its row had already run in", it.query, it.reran),
+                    title: format!(
+                        "reran: `{}` ran {} times in a view its row had already run in",
+                        it.query, it.reran
+                    ),
                     // clone: a finding's subject
                     subject: it.query.clone(),
                     owner: Some("blaze_query".to_owned()),
@@ -1148,20 +1278,28 @@ impl<'a> Ctx<'a> {
                 fix: "between_spans: put a span over the thread's work there; cut or no_end: the recorder's ring lost switches, so keep more or flush sooner".to_owned(),
             });
         }
-        // Workers running a job inside no span.
+        // Workers running a job inside no span. Past the bound, a job whose root span was under
+        // the floor has none in the model: it is not judged, only counted for `spans_cut`.
+        let cut = &self.facts.spans;
         let mut uncovered = 0i64;
+        let (mut unread_jobs, mut unread_ns) = (0u64, 0i64);
         // alloc: once a report
         let mut lanes: Vec<(String, i64)> = Vec::new();
         for (l, lane) in model.lanes.iter().enumerate() {
             if lane.id.job().is_none() {
                 continue;
             }
-            let roots: i64 = lane
+            let mut roots = lane
                 .spans
                 .iter()
                 .filter(|&&i| model.parent[i].is_none_or(|p| model.span_time[p].lane != Some(l)))
-                .map(|&i| model.span_time[i].totals.running_ns)
-                .sum();
+                .peekable();
+            if cut.floor_ns > 0 && roots.peek().is_none() {
+                unread_jobs += 1;
+                unread_ns += lane.totals().running_ns;
+                continue;
+            }
+            let roots: i64 = roots.map(|&i| model.span_time[i].totals.running_ns).sum();
             let it = (lane.totals().running_ns - roots).max(0);
             if it > 0 {
                 uncovered += it;
@@ -1187,7 +1325,7 @@ impl<'a> Ctx<'a> {
         // CPU the spans did not count.
         let running: i64 = self.running.iter().flatten().map(|it| it.1 - it.0).sum();
         let cpu: i64 = self.facts.span_kinds.iter().map(|it| it.self_cpu_ns).sum();
-        let uncounted = model.spans.iter().filter(|it| it.self_cpu_ns.is_none()).count();
+        let uncounted: u64 = self.facts.thread_cpu.iter().map(|it| it.uncounted).sum();
         if running > 0 && cpu * 2 < running {
             let mut evidence = vec![format!(
                 "the pool's switches say workers ran {}; spans counted {} of CPU ({:.0}%)",
@@ -1256,25 +1394,76 @@ impl<'a> Ctx<'a> {
                 fix: "behind: make the history's flush faster or its backlog larger; wrapped: a bigger `flight::CAP` or a shorter drain; spans: find what held its open slots".to_owned(),
             });
         }
-        let cut = self.facts.spans;
         if cut.floor_ns > 0 {
+            // alloc: a blind spot's evidence
+            let mut evidence = vec![format!(
+                "{} spans not read for the whole build, {} between them (a nested span's time is its parent's too)",
+                cut.cut(),
+                s(cut.cut_ns)
+            )];
+            if let Some(it) = cut.path {
+                let unread = match it.lanes_unread {
+                    0 => String::new(),
+                    // alloc: a cell
+                    n => format!(
+                        "; {n} lanes on the final path were not, and hold the spans past the floor alone"
+                    ),
+                };
+                evidence.push(format!(
+                    "the {} lanes the critical path crossed were read again down to {:.3} s: {} spans more{unread}",
+                    it.lanes,
+                    it.floor_ns as f64 / 1e9,
+                    it.spans
+                ));
+            }
+            for total in &cut.totals {
+                // alloc: a line of evidence's parts
+                let most: Vec<String> = cut
+                    .groups
+                    .iter()
+                    .filter(|it| it.name == total.name)
+                    .take(EXAMPLES)
+                    .map(|it| {
+                        format!(
+                            "{} ({} spans, {} summed, longest {})",
+                            cut_label(it),
+                            it.spans,
+                            s(it.dur_ns),
+                            s(it.max_ns)
+                        )
+                    })
+                    .collect();
+                evidence.push(format!(
+                    "{} `{}` spans under the floor, summed in DuckDB: {} in all, the longest {}, {} of CPU; most time: {}",
+                    total.spans,
+                    total.name,
+                    s(total.dur_ns),
+                    s(total.max_ns),
+                    s(total.self_cpu_ns),
+                    if most.is_empty() { "none named".to_owned() } else { most.join(", ") }
+                ));
+            }
+            if unread_jobs > 0 {
+                evidence.push(format!(
+                    "{unread_jobs} jobs ran {} with no span read (their root span was under the floor): not judged for running inside no span",
+                    s(unread_ns)
+                ));
+            }
+            evidence.push("a park whose wait span was under the floor is classed `<kind> wait under the read floor`, not as an unnamed wait".to_owned());
+            evidence.push("the spans by name count every span, read or not, and those the recorder folded (`folded`); the workers' CPU counts every span".to_owned());
             out.push(BlindSpot {
                 kind: BlindKind::SpansCut,
                 hidden_ns: 0,
                 subject: "spans".to_owned(),
                 title: format!(
-                    "the model read {} of the build's {} spans, past its bound of {}: those under {:.3} s it did not",
+                    "the model read {} of the build's {} spans, past its bound of {}: those under {:.3} s only on the critical path's lanes, the job and wait spans among them summed",
                     cut.read,
                     cut.spans,
                     crate::time::load::SPAN_BUDGET,
                     cut.floor_ns as f64 / 1e9
                 ),
-                evidence: vec![
-                    format!("{} spans not read, {} between them (a nested span's time is its parent's too)", cut.cut(), s(cut.cut_ns)),
-                    "every root job and wait span was read; a span's time under the floor is its parent's own, and a park inside a nested wait under it reads as an unnamed wait".to_owned(),
-                    "the spans by name count every span, read or not, and the ones the recorder folded (`folded`)".to_owned(),
-                ],
-                fix: "for the short spans, query the build's `spans` and `folded` (`span_sums`) with `blaze debug sql`; the floor is set by the spans long enough that the recorder keeps a row each, so reading more takes a model that holds more spans (`time::load::SPAN_BUDGET`)".to_owned(),
+                evidence,
+                fix: "to see one span under the floor, query the build's `spans` and `folded` (`span_sums`) with `blaze debug sql`, filtered on a group's name and subject above".to_owned(),
             });
         }
         let a = model.anomalies;
@@ -1299,15 +1488,21 @@ impl<'a> Ctx<'a> {
                 subject: "critical path".to_owned(),
                 title: format!("the critical path stopped at its bound of {steps} steps"),
                 evidence: Vec::new(),
-                fix: "the walk's bound is the model's intervals: report it as a bug in time::path".to_owned(),
+                fix: "the walk's bound is the model's intervals: report it as a bug in time::path"
+                    .to_owned(),
             }),
             Reached::LaneStart { lane } if start_gap * 20 > self.wall() => out.push(BlindSpot {
                 kind: BlindKind::PathCut,
                 hidden_ns: start_gap,
                 subject: "critical path".to_owned(),
-                title: format!("the critical path stops {} after the build's start, at the start of {}", s(start_gap), model.lanes[lane].id),
+                title: format!(
+                    "the critical path stops {} after the build's start, at the start of {}",
+                    s(start_gap),
+                    model.lanes[lane].id
+                ),
                 evidence: vec!["the record names no job that gave it to the pool".to_owned()],
-                fix: "write `by_job` on the `started` or `ran` row of every job given to the pool".to_owned(),
+                fix: "write `by_job` on the `started` or `ran` row of every job given to the pool"
+                    .to_owned(),
             }),
             _ => {}
         }
@@ -1327,11 +1522,13 @@ impl<'a> Ctx<'a> {
             .collect();
         let mut phases: HashMap<&str, i64, Global> = HashMap::new_in(Global);
         for &(from, to, span, _) in &self.path_ran {
-            let name = span.map_or("inside no span", |it| model.spans[model.root_of(it)].name.as_str());
+            let name =
+                span.map_or("inside no span", |it| model.spans[model.root_of(it)].name.as_str());
             *phases.entry(name).or_default() += to - from;
         }
         // alloc: once a report
-        let mut path_by_phase: Vec<Named> = phases.into_iter().map(|(name, ns)| Named { name: name.to_owned(), ns }).collect();
+        let mut path_by_phase: Vec<Named> =
+            phases.into_iter().map(|(name, ns)| Named { name: name.to_owned(), ns }).collect();
         path_by_phase.sort_by(|a, b| b.ns.cmp(&a.ns).then_with(|| a.name.cmp(&b.name)));
         path_by_phase.truncate(6);
         let reached = match self.path.reached {
@@ -1400,7 +1597,9 @@ impl Steps {
                 Some(&last) if last == t => *steps.level.last_mut().unwrap_or(&mut 0) = level,
                 _ => {
                     let before = match (steps.at.last(), steps.level.last(), steps.before.last()) {
-                        (Some(&last), Some(&was), Some(&acc)) => acc + i128::from(was) * i128::from(t - last),
+                        (Some(&last), Some(&was), Some(&acc)) => {
+                            acc + i128::from(was) * i128::from(t - last)
+                        }
                         _ => 0,
                     };
                     steps.at.push(t);
@@ -1461,15 +1660,43 @@ fn doing_at(model: &Model, lane: usize, t: i64) -> String {
     }
 }
 
+/// A group of job or wait spans under the floor ([`crate::time::CutGroup`]) as a reader says it:
+/// `job of hir_def::nameres::collect in hir_def`, `wait on summary_in(serde)`.
+fn cut_label(group: &crate::time::CutGroup) -> String {
+    let what = match (group.name.as_str(), group.subject.as_deref()) {
+        // alloc: a label
+        (crate::time::JOB_SPAN, Some(function)) => format!("job of {}", code_in(function)),
+        // alloc: a label
+        (WAIT_SPAN, Some(awaits)) => format!("wait on {awaits}"),
+        // alloc: a label
+        (name, Some(subject)) => format!("{name} {subject}"),
+        // alloc: a label
+        (name, None) => format!("{name} of nothing named"),
+    };
+    match &group.krate {
+        // alloc: a label
+        Some(krate) => format!("{what} in {krate}"),
+        None => what,
+    }
+}
+
 /// `class` with the package and version it names taken out, and them: `scope of unit codegen
 /// serde v1.0.214 (build script)` is `scope of unit codegen (build script)`, of `serde v1.0.214`.
 fn by_package(class: String) -> (String, Option<String>) {
     let words: Vec<&str> = class.split(' ').collect();
-    let version = |it: &str| it.strip_prefix('v').is_some_and(|it| it.starts_with(|c: char| c.is_ascii_digit()) && it.contains('.'));
+    let version = |it: &str| {
+        it.strip_prefix('v')
+            .is_some_and(|it| it.starts_with(|c: char| c.is_ascii_digit()) && it.contains('.'))
+    };
     match words.iter().skip(1).position(|it| version(it)).map(|it| it + 1) {
         Some(at) => {
             let of = format!("{} {}", words[at - 1], words[at]);
-            let rest: Vec<&str> = words.iter().enumerate().filter(|(i, _)| *i + 1 != at && *i != at).map(|it| *it.1).collect();
+            let rest: Vec<&str> = words
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i + 1 != at && *i != at)
+                .map(|it| *it.1)
+                .collect();
             (rest.join(" "), Some(of))
         }
         None => (class, None),
@@ -1490,7 +1717,16 @@ fn subject_of(model: &Model, mut span: usize) -> Option<&str> {
 /// The first path in a type name that is not the scheduler's or the query engine's plumbing:
 /// `hir_def::nameres::facts::collect::expand_all` out of a pool job's closure type.
 fn code_in(function: &str) -> &str {
-    const PLUMBING: [&str; 8] = ["blaze_graph::", "blaze_query::", "base_db::db::", "core::", "std::", "alloc::", "{{closure}}", "impl "];
+    const PLUMBING: [&str; 8] = [
+        "blaze_graph::",
+        "blaze_query::",
+        "base_db::db::",
+        "core::",
+        "std::",
+        "alloc::",
+        "{{closure}}",
+        "impl ",
+    ];
     function
         .split(['<', '>', ',', ' ', '&', '(', ')'])
         .map(|it| it.trim_end_matches("::{{closure}}").trim_matches(':'))

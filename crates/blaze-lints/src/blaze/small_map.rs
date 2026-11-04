@@ -28,7 +28,10 @@ use hir::{HasVisibility as _, HirDisplay as _};
 use hir_def::{
     ConstId, DefWithBodyId, EnumVariantId, FieldId,
     expr_store::{Body, scope::ExprScopes},
-    hir::{Array, BinaryOp, BindingAnnotation, Expr, ExprId, Literal, Pat, Statement, UnaryOp, type_ref::Mutability},
+    hir::{
+        Array, BinaryOp, BindingAnnotation, Expr, ExprId, Literal, Pat, Statement, UnaryOp,
+        type_ref::Mutability,
+    },
     nameres::crate_def_map,
     resolver::{ValueNs, resolver_for_scope},
     signatures::FunctionSignature,
@@ -114,7 +117,9 @@ fn map_name(db: &Db, ty: &hir::Type<'_>) -> Option<hir::Name> {
     let adt = ty.strip_references().as_adt()?;
     let name = adt.name(db);
     let krate = adt.module(db).krate(db);
-    MAPS.iter().any(|(it, names)| names.contains(&name.as_str()) && facts::crate_is(db, krate, it)).then_some(name)
+    MAPS.iter()
+        .any(|(it, names)| names.contains(&name.as_str()) && facts::crate_is(db, krate, it))
+        .then_some(name)
 }
 
 /// What a body's walk knows.
@@ -165,7 +170,9 @@ impl Walk<'_, '_> {
     /// array of at most `max` entries with constant keys. `set` says each entry is a key.
     fn built_small(&self, init: ExprId, set: bool, max: u64) -> Option<Vec<Key>> {
         let from_array = |array: ExprId| -> Option<Vec<Key>> {
-            let Expr::Array(Array::ElementList { elements }) = self.body.expr(array) else { return None };
+            let Expr::Array(Array::ElementList { elements }) = self.body.expr(array) else {
+                return None;
+            };
             if elements.len() as u64 > max {
                 return None;
             }
@@ -185,7 +192,9 @@ impl Walk<'_, '_> {
             Expr::Call { args: [], .. } => EMPTY.contains(&self.name(init)?).then(Vec::new),
             Expr::Call { args: [arg], .. } => match self.name(init)? {
                 "with_capacity" => match self.body.expr(*arg) {
-                    Expr::Literal(Literal::Int(n, _)) => (*n >= 0 && (*n as u128) <= u128::from(max)).then(Vec::new),
+                    Expr::Literal(Literal::Int(n, _)) => {
+                        (*n >= 0 && (*n as u128) <= u128::from(max)).then(Vec::new)
+                    }
                     Expr::Literal(Literal::Uint(n, _)) => (*n <= u128::from(max)).then(Vec::new),
                     _ => None,
                 },
@@ -194,7 +203,10 @@ impl Walk<'_, '_> {
                 _ => None,
             },
             Expr::MethodCall { receiver, args: [], .. } if self.name(init)? == "collect" => {
-                let Expr::MethodCall { receiver: array, args: [], .. } = self.body.expr(receiver) else { return None };
+                let Expr::MethodCall { receiver: array, args: [], .. } = self.body.expr(receiver)
+                else {
+                    return None;
+                };
                 (self.name(receiver)? == "into_iter").then(|| from_array(array)).flatten()
             }
             _ => None,
@@ -248,7 +260,9 @@ fn fields_in(db: &Db, def: DefWithBodyId, out: &mut HashMap<FieldId, FieldUse, G
     for (id, expr) in body.exprs() {
         match expr {
             Expr::Field { .. } => {
-                let Some(either::Either::Left(field)) = infer.field_resolution(id) else { continue };
+                let Some(either::Either::Left(field)) = infer.field_resolution(id) else {
+                    continue;
+                };
                 if is_map(id).is_none() {
                     continue;
                 }
@@ -267,7 +281,9 @@ fn fields_in(db: &Db, def: DefWithBodyId, out: &mut HashMap<FieldId, FieldUse, G
                     let Some(name) = is_map(it.expr) else { continue };
                     let entry = out.entry(FieldId { parent: variant, local_id }).or_default();
                     match walk.built_small(it.expr, name.as_str().ends_with("Set"), KEPT as u64) {
-                        Some(keys) => keys.into_iter().for_each(|key| add_key(&mut entry.keys, key)),
+                        Some(keys) => {
+                            keys.into_iter().for_each(|key| add_key(&mut entry.keys, key))
+                        }
                         None => entry.blocked = true,
                     }
                 }
@@ -285,7 +301,8 @@ fn fields_in(db: &Db, def: DefWithBodyId, out: &mut HashMap<FieldId, FieldUse, G
                     if !matches!(body.pat(arg.pat), Pat::Wild)
                         && let Some(local_id) = shape.field(&arg.name)
                     {
-                        out.entry(FieldId { parent: variant, local_id }).or_default().blocked = true;
+                        out.entry(FieldId { parent: variant, local_id }).or_default().blocked =
+                            true;
                     }
                 }
             }
@@ -321,7 +338,9 @@ fn field_use(walk: &Walk<'_, '_>, at: ExprId) -> Option<Option<Key>> {
                         let (f, _) = written_callee(walk.infer, walk.body, next)?;
                         let name = FunctionSignature::of(walk.db, f).name.as_str();
                         let krate = hir::Function::from(f).module(walk.db).krate(walk.db);
-                        let core = ["core", "std", "alloc"].iter().any(|it| facts::crate_is(walk.db, krate, it));
+                        let core = ["core", "std", "alloc"]
+                            .iter()
+                            .any(|it| facts::crate_is(walk.db, krate, it));
                         let formats = name.starts_with("debug") || name == "fmt" || name == "hash";
                         return (core && formats).then_some(None);
                     }
@@ -361,7 +380,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     for (block, expr) in body.exprs() {
         let Expr::Block { statements, .. } = expr else { continue };
         for statement in statements.iter() {
-            let Statement::Let { pat, initializer: Some(init), else_branch: None, .. } = statement else { continue };
+            let Statement::Let { pat, initializer: Some(init), else_branch: None, .. } = statement
+            else {
+                continue;
+            };
             let Pat::Bind { id: local, subpat: None } = body.pat(pat) else { continue };
             if matches!(body[local].mode, BindingAnnotation::Ref | BindingAnnotation::RefMut) {
                 continue;
@@ -379,7 +401,11 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                 }
                 match field_use(&walk, id) {
                     Some(Some(key)) if walk.runs_once(id, block) => add_key(&mut keys, key),
-                    Some(None) if !matches!(walk.parents.of_expr(id).map(|it| body.expr(it)), Some(Expr::Ref { .. })) => {}
+                    Some(None)
+                        if !matches!(
+                            walk.parents.of_expr(id).map(|it| body.expr(it)),
+                            Some(Expr::Ref { .. })
+                        ) => {}
                     _ => {
                         small = false;
                         break;
@@ -408,7 +434,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 
 /// A struct's private map fields that hold a few constant keys across the crate.
 pub(super) fn check_struct<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
-    if !cx.on_blaze(LINT) || cx.expansion().is_some() || !cx.is_written(item.syntax()) || cx.is_in_test(item.syntax())
+    if !cx.on_blaze(LINT)
+        || cx.expansion().is_some()
+        || !cx.is_written(item.syntax())
+        || cx.is_in_test(item.syntax())
     {
         return;
     }

@@ -127,7 +127,11 @@ impl<T: Record> Mapped<T> {
     /// Makes the values of `image`'s section this interner's, read in place. Must run before
     /// any value is interned; the image stays mapped until the process exits. On an error no
     /// value was restored, so no section naming these IDs may be used.
-    pub fn restore<S: Stable>(&'static self, image: Arc<Image<S>>, jobs: Jobs<'_>) -> Result<(), RestoreError> {
+    pub fn restore<S: Stable>(
+        &'static self,
+        image: Arc<Image<S>>,
+        jobs: Jobs<'_>,
+    ) -> Result<(), RestoreError> {
         // alloc: once a restore, so the image outlives every ID read from it
         let image: &'static Arc<Image<S>> = Box::leak(Box::new(image));
         Table::restore_into(&self.table, Self::shape(), image, self.section(), self.schema(), jobs)
@@ -167,7 +171,8 @@ mod tests {
     fn values_keep_their_ids_across_an_image() {
         static PATHS: Mapped<u32> = Mapped::new(1);
         static RESTORED: Mapped<u32> = Mapped::new(1);
-        let values: Vec<Vec<u32>> = (0..500u32).map(|n| (0..n % 7).map(|k| n * 31 + k).collect()).collect();
+        let values: Vec<Vec<u32>> =
+            (0..500u32).map(|n| (0..n % 7).map(|k| n * 31 + k).collect()).collect();
         let ids: Vec<Id<u32>> = values.iter().map(|it| PATHS.intern(it)).collect();
         for (value, &id) in values.iter().zip(&ids) {
             assert_eq!(PATHS.get(id), &value[..]);
@@ -187,7 +192,10 @@ mod tests {
         }
         let new = RESTORED.intern(&[u32::MAX; 3]);
         assert!(!live.contains(new.id()), "a new value never takes a live ID");
-        assert_eq!(RESTORED.restore(image_of(&PATHS, &live), &crate::serial), Err(RestoreError::Started { section: RESTORED.section() }));
+        assert_eq!(
+            RESTORED.restore(image_of(&PATHS, &live), &crate::serial),
+            Err(RestoreError::Started { section: RESTORED.section() })
+        );
     }
 
     #[test]

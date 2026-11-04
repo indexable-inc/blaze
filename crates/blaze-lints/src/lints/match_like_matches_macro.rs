@@ -41,10 +41,9 @@ pub(super) fn check_match<'t>(cx: &mut Cx<'_, 't>, expr: ast::MatchExpr<'t>) {
     }
     let without_last = arms.clone().take(count - 1);
     let (Some(first), Some(last)) = (arms.clone().next(), arms.clone().last()) else { return };
-    let (Some(b0), Some(b1)) = (
-        first.expr().and_then(find_bool_lit),
-        last.expr().and_then(find_bool_lit),
-    ) else {
+    let (Some(b0), Some(b1)) =
+        (first.expr().and_then(find_bool_lit), last.expr().and_then(find_bool_lit))
+    else {
         return;
     };
     if b0 == b1 {
@@ -103,20 +102,16 @@ pub(super) fn check_if_let<'t>(cx: &mut Cx<'_, 't>, expr: ast::IfExpr<'t>) {
     if !cx.on(LINT) || !cx.conf().meets(msrvs::MATCHES_MACRO) {
         return;
     }
-    let (
-        Some(ast::Expr::LetExpr(let_expr)),
-        Some(then),
-        Some(ast::ElseBranch::Block(otherwise)),
-    ) = (expr.condition(), expr.then_branch(), expr.else_branch())
+    let (Some(ast::Expr::LetExpr(let_expr)), Some(then), Some(ast::ElseBranch::Block(otherwise))) =
+        (expr.condition(), expr.then_branch(), expr.else_branch())
     else {
         return;
     };
     let Some(range) = cx.range(expr.syntax()) else { return };
     let (Some(pat), Some(scrutinee)) = (let_expr.pat(), let_expr.expr()) else { return };
-    let (Some(b0), Some(b1)) = (
-        find_bool_lit(ast::Expr::BlockExpr(then)),
-        find_bool_lit(ast::Expr::BlockExpr(otherwise)),
-    ) else {
+    let (Some(b0), Some(b1)) =
+        (find_bool_lit(ast::Expr::BlockExpr(then)), find_bool_lit(ast::Expr::BlockExpr(otherwise)))
+    else {
         return;
     };
     if b0 == b1 || is_some_wild(pat) {

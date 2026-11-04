@@ -123,7 +123,9 @@ impl CountMin {
     pub fn cells_of(key: u64) -> [usize; ROWS] {
         let hash = mix(key);
         let (h1, h2) = (hash as u32 as usize, (hash >> 32) as usize | 1);
-        std::array::from_fn(|row| row * COLUMNS + (h1.wrapping_add(row.wrapping_mul(h2)) & (COLUMNS - 1)))
+        std::array::from_fn(|row| {
+            row * COLUMNS + (h1.wrapping_add(row.wrapping_mul(h2)) & (COLUMNS - 1))
+        })
     }
 
     /// Adds `value` under `key`: its estimate after.
@@ -270,10 +272,16 @@ impl TopKeys {
     }
 
     /// The entries of `cells`, each `(key, estimate, exact)`, as they are now.
-    pub fn entries_in(cells: &(impl Counters + ?Sized)) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+    pub fn entries_in(
+        cells: &(impl Counters + ?Sized),
+    ) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
         let len = (cells.get(LEN) as usize).min(TOP);
         (0..len).map(move |it| {
-            (cells.get(Self::at(it, KEY)), cells.get(Self::at(it, ESTIMATE)), cells.get(Self::at(it, EXACT)))
+            (
+                cells.get(Self::at(it, KEY)),
+                cells.get(Self::at(it, ESTIMATE)),
+                cells.get(Self::at(it, EXACT)),
+            )
         })
     }
 

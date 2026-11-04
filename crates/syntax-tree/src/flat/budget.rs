@@ -78,7 +78,11 @@ mod tests {
             let text = live(tag) - made;
             drop(probe);
             assert!(text >= 2000, "the text kept in the tag");
-            assert_eq!(made, before + size + text, "the block's and the text's bytes, added as they were made");
+            assert_eq!(
+                made,
+                before + size + text,
+                "the block's and the text's bytes, added as they were made"
+            );
             drop(tree);
             live(tag)
         })

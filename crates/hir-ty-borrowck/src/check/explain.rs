@@ -39,8 +39,16 @@ pub(super) enum LaterUse {
 /// rustc's `BorrowExplanation`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Explanation {
-    UsedLater { kind: LaterUse, at: PartSpan, path: Option<PartSpan> },
-    UsedLaterInLoop { kind: LaterUse, at: PartSpan, path: Option<PartSpan> },
+    UsedLater {
+        kind: LaterUse,
+        at: PartSpan,
+        path: Option<PartSpan>,
+    },
+    UsedLaterInLoop {
+        kind: LaterUse,
+        at: PartSpan,
+        path: Option<PartSpan>,
+    },
     /// `binding` is the variable dropped, when the drop is the end of its scope in the
     /// item's own body ([`super::Draft::dropped_at_scope_end`]).
     UsedLaterWhenDropped {
@@ -126,9 +134,10 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
                 binding: self.scope_end_drop(local, at),
             },
             Some((_, _, DefUse::Def)) | None => {
-                let universal = self.values.universals_of(region).any(|it| {
-                    self.regions.universals[it].1 != regions::UniversalKind::FnBody
-                });
+                let universal = self
+                    .values
+                    .universals_of(region)
+                    .any(|it| self.regions.universals[it].1 != regions::UniversalKind::FnBody);
                 match universal {
                     true => Explanation::MustBeValidFor,
                     false => Explanation::Unexplained,
@@ -257,7 +266,9 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
             return None;
         }
         match &data.terminator.as_ref()?.kind {
-            TerminatorKind::Drop { place, .. } if place.local == local && place.projection.is_empty() => {
+            TerminatorKind::Drop { place, .. }
+                if place.local == local && place.projection.is_empty() =>
+            {
                 Some(binding)
             }
             _ => None,
@@ -322,9 +333,11 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
             |point| {
                 let location = self.cfg.location(point);
                 (location.statement == 0
-                    && self.cfg.predecessors(location.block).iter().any(|&pred| {
-                        self.dominators.dominates(location.block, pred)
-                    })
+                    && self
+                        .cfg
+                        .predecessors(location.block)
+                        .iter()
+                        .any(|&pred| self.dominators.dominates(location.block, pred))
                     && self.reaches(from, location, &mut seen, &mut stack))
                 .then_some(location)
             },
@@ -497,7 +510,8 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
             matches!(&it.kind, OperandKind::Copy(place) | OperandKind::Move(place)
                 if place.local == local && place.projection.as_slice().is_empty())
         })?;
-        let capture = self.ctx.infer.closures_data.get(&expr)?.min_captures.values().flatten().nth(at)?;
+        let capture =
+            self.ctx.infer.closures_data.get(&expr)?.min_captures.values().flatten().nth(at)?;
         let source = capture.info.sources.first()?.final_source();
         let span = match source.unpack() {
             ExprOrPatId::ExprId(it) => MirSpan::ExprId(it),
@@ -567,7 +581,9 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
                 match place.projection.as_slice().is_empty()
                     && self.ctx.local_name(place.local).is_none()
                 {
-                    true => PartSpan::At(super::temporary_span(self.body, place.local).unwrap_or(span)),
+                    true => {
+                        PartSpan::At(super::temporary_span(self.body, place.local).unwrap_or(span))
+                    }
                     false => PartSpan::At(span),
                 }
             }

@@ -224,7 +224,10 @@ const CORPUS: &[(&str, &str)] = &[
         "pub struct P(pub *const &'static u32);\nunsafe impl Sync for P {}\n\
          static S: (&'static [&'static u32], P) = { let a: &'static [&'static u32] = &[&1, &2, &3]; (a, P(&a[1] as *const &'static u32)) };",
     ),
-    ("sltail", "static S: &Wrap<[&(dyn Tr + Sync)]> = &Wrap(1, [&A(5) as &(dyn Tr + Sync), &A(6)]);"),
+    (
+        "sltail",
+        "static S: &Wrap<[&(dyn Tr + Sync)]> = &Wrap(1, [&A(5) as &(dyn Tr + Sync), &A(6)]);",
+    ),
     (
         "stack",
         "#[repr(C)] pub struct Two(pub [u8; 2], pub [u8; 0]);\n\
@@ -237,7 +240,10 @@ const CORPUS: &[(&str, &str)] = &[
         "static W: &(dyn Fn() -> u32 + Sync) = &{ let t: (u8, &'static (dyn Tr + Sync)) = (1, &B(1, 2)); move || t.1.f() + t.0 as u32 };",
     ),
     ("c_plain", "static W: &(dyn Handler + Sync) = &index;"),
-    ("enumniche", "pub struct S(pub Option<&'static (dyn Tr + Sync)>, pub Option<&'static (dyn Tr + Sync)>);\nstatic E: S = S(None, Some(&A(3)));"),
+    (
+        "enumniche",
+        "pub struct S(pub Option<&'static (dyn Tr + Sync)>, pub Option<&'static (dyn Tr + Sync)>);\nstatic E: S = S(None, Some(&A(3)));",
+    ),
     (
         "pknest",
         "pub struct Wrap8<X: ?Sized>(pub u8, pub X);\n\
@@ -403,7 +409,11 @@ fn check_item(db: &TestDB, item: &Item, found: &mut Found) {
                 let _ = write!(why, "codegen refuses it: {e}");
             }
             if let Err(e) = &hashed {
-                let _ = write!(why, "{}identity refuses it: {e}", if why.is_empty() { "" } else { "; " });
+                let _ = write!(
+                    why,
+                    "{}identity refuses it: {e}",
+                    if why.is_empty() { "" } else { "; " }
+                );
             }
             found.refused.push(format!("{}: {why}", item.name));
             return;
@@ -448,9 +458,12 @@ fn check_item(db: &TestDB, item: &Item, found: &mut Found) {
     let names = |g: hir_def::FunctionId, g_args: &StoredGenericArgs| {
         calls.iter().any(|(f, args)| {
             (*f == g && plain(args) == plain(g_args))
-                || crate::impl_method(db, env, *f, args.as_ref()).is_ok_and(|(callee, callee_args)| {
-                    callee == either::Either::Left(g) && erased(interner, callee_args).store() == plain(g_args)
-                })
+                || crate::impl_method(db, env, *f, args.as_ref()).is_ok_and(
+                    |(callee, callee_args)| {
+                        callee == either::Either::Left(g)
+                            && erased(interner, callee_args).store() == plain(g_args)
+                    },
+                )
         })
     };
     let fn_item = |ty: hir_ty::next_solver::Ty<'_>| match ty.kind() {
@@ -459,7 +472,9 @@ fn check_item(db: &TestDB, item: &Item, found: &mut Found) {
             // A constructor is hashed by its key and arguments, as identity's `callable` does.
             CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => true,
         },
-        TyKind::Closure(id, _) => closures.contains(&Body::Closure(blaze_query::db::AsId::as_id(&id.0))),
+        TyKind::Closure(id, _) => {
+            closures.contains(&Body::Closure(blaze_query::db::AsId::as_id(&id.0)))
+        }
         _ => false,
     };
 
@@ -487,7 +502,10 @@ fn check_item(db: &TestDB, item: &Item, found: &mut Found) {
                 DataRequest::Blob { blob, .. } => {
                     if !walked.contains(&data.as_u32()) {
                         walked.push(data.as_u32());
-                        blobs.push((format!("data {} (pointed to at {offset} of {at})", data.as_u32()), blob));
+                        blobs.push((
+                            format!("data {} (pointed to at {offset} of {at})", data.as_u32()),
+                            blob,
+                        ));
                     }
                 }
                 DataRequest::Vtable { ty, trait_ref, .. } => {
@@ -530,8 +548,12 @@ fn check_item(db: &TestDB, item: &Item, found: &mut Found) {
             };
             if !hashed {
                 let target = match target {
-                    FuncTarget::Instance(instance, _) => format!("{:?} {:?}", instance.def, instance.args.as_ref()),
-                    FuncTarget::Symbol(it) | FuncTarget::Path(it) | FuncTarget::Asm(it) => it.clone(),
+                    FuncTarget::Instance(instance, _) => {
+                        format!("{:?} {:?}", instance.def, instance.args.as_ref())
+                    }
+                    FuncTarget::Symbol(it) | FuncTarget::Path(it) | FuncTarget::Asm(it) => {
+                        it.clone()
+                    }
                 };
                 found.misses.push(format!(
                     "{}: at {offset} of {at}, the function {target} is emitted but not hashed (identity calls {:?}, closures {:?})",
@@ -552,7 +574,10 @@ fn check_item(db: &TestDB, item: &Item, found: &mut Found) {
 fn every_vtable_and_function_a_value_relocates_to_is_hashed() {
     let mut found = Found::default();
     for (case, text) in CORPUS {
-        let db = fixture::db(&format!("//- minicore: {MINICORE}\n//- /src/lib.rs crate:kernel\n{PRELUDE}\n{text}\n")).into_db();
+        let db = fixture::db(&format!(
+            "//- minicore: {MINICORE}\n//- /src/lib.rs crate:kernel\n{PRELUDE}\n{text}\n"
+        ))
+        .into_db();
         let items = items(&db, case);
         assert!(!items.is_empty(), "{case}: no constant or static");
         blaze_query::db::attach(&db, || {
@@ -569,7 +594,11 @@ fn every_vtable_and_function_a_value_relocates_to_is_hashed() {
     }
     // A fixture that doesn't type-check is refused by both sides and would check nothing.
     let broken: Vec<_> = found.refused.iter().filter(|it| it.contains("HasErrors")).collect();
-    assert!(broken.is_empty(), "corpus cases that don't type-check:\n{}", broken.iter().map(|it| it.as_str()).collect::<Vec<_>>().join("\n"));
+    assert!(
+        broken.is_empty(),
+        "corpus cases that don't type-check:\n{}",
+        broken.iter().map(|it| it.as_str()).collect::<Vec<_>>().join("\n")
+    );
     assert!(
         found.misses.is_empty(),
         "{} emitted but not hashed:\n{}",
@@ -586,8 +615,10 @@ fn every_vtable_and_function_a_value_relocates_to_is_hashed() {
 
 /// The relocate lane's own fixtures (`v2::tests`), each a whole crate: its constants and
 /// statics are checked as the corpus's are.
-const FIXTURES: &[(&str, &str)] =
-    &[("pointers_to_dyn", super::tests::POINTERS_TO_DYN), ("constant_memory", super::tests::CONSTANT_MEMORY)];
+const FIXTURES: &[(&str, &str)] = &[
+    ("pointers_to_dyn", super::tests::POINTERS_TO_DYN),
+    ("constant_memory", super::tests::CONSTANT_MEMORY),
+];
 
 /// An edit of a case's source: every `from` in it becomes `to`. An edit whose `from` a case
 /// does not hold is not made to it. In `to`, [`ADDRESS`] is the first word of the case's `P`
@@ -633,15 +664,35 @@ const UNRELATED: &str = "\npub fn unrelated_to_any_value() -> u32 { 1 }\n";
 /// Edits made to every case that holds what they change: the impls behind the vtables (the
 /// code their slots run, and what that calls), and code no value reaches.
 const EDITS: &[Edit] = &[
-    edit("impl Tr for A", "impl Tr for A { fn f(&self) -> u32 { self.0 } }", "impl Tr for A { fn f(&self) -> u32 { self.0 + 1 } }"),
-    edit("impl Tr for B", "fn f(&self) -> u32 { self.0 + self.1 }", "fn f(&self) -> u32 { self.0 * self.1 }"),
-    edit("impl Tr for C", "impl Tr for C { fn f(&self) -> u32 { self.0 } }", "impl Tr for C { fn f(&self) -> u32 { self.0 + 3 } }"),
-    edit("impl Tr for G", "impl Tr for G { fn f(&self) -> u32 { self.0 } }", "impl Tr for G { fn f(&self) -> u32 { self.0 + 7 } }"),
+    edit(
+        "impl Tr for A",
+        "impl Tr for A { fn f(&self) -> u32 { self.0 } }",
+        "impl Tr for A { fn f(&self) -> u32 { self.0 + 1 } }",
+    ),
+    edit(
+        "impl Tr for B",
+        "fn f(&self) -> u32 { self.0 + self.1 }",
+        "fn f(&self) -> u32 { self.0 * self.1 }",
+    ),
+    edit(
+        "impl Tr for C",
+        "impl Tr for C { fn f(&self) -> u32 { self.0 } }",
+        "impl Tr for C { fn f(&self) -> u32 { self.0 + 3 } }",
+    ),
+    edit(
+        "impl Tr for G",
+        "impl Tr for G { fn f(&self) -> u32 { self.0 } }",
+        "impl Tr for G { fn f(&self) -> u32 { self.0 + 7 } }",
+    ),
     edit("impl Tr for Holder", "self.0.f() + 1000", "self.0.f() + 2000"),
     edit("impl Display for MyT", "pick(1); Ok(())", "pick(2); Ok(())"),
     edit("impl Handler for Fn", "log() + self(r)", "log() * self(r)"),
     edit("fn log, called by a vtable's method", "fn log() -> u32 { 1 }", "fn log() -> u32 { 2 }"),
-    edit("an unrelated function", "pub fn unrelated_to_any_value() -> u32 { 1 }", "pub fn unrelated_to_any_value() -> u32 { 2 }"),
+    edit(
+        "an unrelated function",
+        "pub fn unrelated_to_any_value() -> u32 { 1 }",
+        "pub fn unrelated_to_any_value() -> u32 { 2 }",
+    ),
 ];
 
 /// Each case's own edits: the bytes behind a pointer, the impl or type behind a vtable, a
@@ -651,7 +702,10 @@ const CASE_EDITS: &[(&str, Edit)] = &[
     ("handler_at_tail", edit("the pointee", "Wrap(0, index)", "Wrap(1, index)")),
     ("debug_and_tail", edit("the pointee", "&MyT(1)", "&MyT(3)")),
     ("tail_only", edit("the pointee", "Wrap(0, MyT(2))", "Wrap(0, MyT(4))")),
-    ("handler_inside_tail", edit("the pointee", "&Wrap(0, Inner(&index))", "&Wrap(5, Inner(&index))")),
+    (
+        "handler_inside_tail",
+        edit("the pointee", "&Wrap(0, Inner(&index))", "&Wrap(5, Inner(&index))"),
+    ),
     ("debug_and_inside_tail", edit("the pointee", "&MyT(1)", "&MyT(9)")),
     ("pre", edit("the pointee", "&Pre(&MyT(2), MyT(1))", "&Pre(&MyT(3), MyT(1))")),
     ("dyn_behind_dyn", edit("the pointee", "&W(&MyT(0))", "&W(&MyT(1))")),
@@ -666,7 +720,10 @@ const CASE_EDITS: &[(&str, Edit)] = &[
     ("p1", edit("a static pointed to", "static AA: A = A(7);", "static AA: A = A(70);")),
     ("p1", edit("the pointee", "&B(10, 20)", "&B(11, 20)")),
     ("p1", edit("the pointee", "&5u32", "&6u32")),
-    ("p1", edit("a function a pointer runs", "fn eleven() -> u32 { 11 }", "fn eleven() -> u32 { 12 }")),
+    (
+        "p1",
+        edit("a function a pointer runs", "fn eleven() -> u32 { 11 }", "fn eleven() -> u32 { 12 }"),
+    ),
     ("p2", edit("the pointee", "&A(21)", "&A(23)")),
     ("p2", edit("the pointee", "Wrap(100, A(5))", "Wrap(101, A(5))")),
     ("p2", edit("the pointee", r#"name: "x""#, r#"name: "y""#)),
@@ -699,30 +756,71 @@ const CASE_EDITS: &[(&str, Edit)] = &[
     ("pointers_to_dyn", edit("the pointee", "&A(9)", "&A(10)")),
     ("pointers_to_dyn", edit("the pointee", "&B(8)", "&B(9)")),
     ("pointers_to_dyn", edit("the tail's concrete value", "&Wrap(100, D(5))", "&Wrap(100, D(6))")),
-    ("pointers_to_dyn", edit("the raw slice's length", "&[&E(1) as &dyn Tr]", "&[&E(1) as &dyn Tr, &E(2) as &dyn Tr]")),
-    ("pointers_to_dyn", edit("a function a pointer runs", "fn eleven() -> u32 { 11 }", "fn eleven() -> u32 { 12 }")),
+    (
+        "pointers_to_dyn",
+        edit(
+            "the raw slice's length",
+            "&[&E(1) as &dyn Tr]",
+            "&[&E(1) as &dyn Tr, &E(2) as &dyn Tr]",
+        ),
+    ),
+    (
+        "pointers_to_dyn",
+        edit("a function a pointer runs", "fn eleven() -> u32 { 11 }", "fn eleven() -> u32 { 12 }"),
+    ),
     ("constant_memory", edit("the pointee", "Vt { name: &5 }", "Vt { name: &6 }")),
-    ("constant_memory", edit("a static pointed to", "End([1, 2, 3, 4], ())", "End([1, 2, 3, 5], ())")),
+    (
+        "constant_memory",
+        edit("a static pointed to", "End([1, 2, 3, 4], ())", "End([1, 2, 3, 5], ())"),
+    ),
     ("constant_memory", edit("the pointee", "&K(4)", "&K(5)")),
-    ("constant_memory", edit("the slice tail's length", "&G(6) as &dyn Tr]", "&G(6) as &dyn Tr, &K(7) as &dyn Tr]")),
-    ("constant_memory", edit("the slice tail's length", "&Prefix(&9, [1, 2])", "&Prefix(&9, [1, 2, 3])")),
-    ("constant_memory", edit("a function a pointer runs", "fn seven() -> u32 { 7 }", "fn seven() -> u32 { 70 }")),
-    ("constant_memory", edit("a function a pointer runs", "fn eight() -> u32 { 8 }", "fn eight() -> u32 { 80 }")),
+    (
+        "constant_memory",
+        edit("the slice tail's length", "&G(6) as &dyn Tr]", "&G(6) as &dyn Tr, &K(7) as &dyn Tr]"),
+    ),
+    (
+        "constant_memory",
+        edit("the slice tail's length", "&Prefix(&9, [1, 2])", "&Prefix(&9, [1, 2, 3])"),
+    ),
+    (
+        "constant_memory",
+        edit("a function a pointer runs", "fn seven() -> u32 { 7 }", "fn seven() -> u32 { 70 }"),
+    ),
+    (
+        "constant_memory",
+        edit("a function a pointer runs", "fn eight() -> u32 { 8 }", "fn eight() -> u32 { 80 }"),
+    ),
     ("constant_memory", edit("the pointee", "End8([2; 8], ())", "End8([3; 8], ())")),
     ("constant_memory", edit("the pointee", "E3([1, 2, 3], [])", "E3([1, 2, 4], [])")),
     ("constant_memory", edit("the pointee", "&[&1, &2, &3]", "&[&1, &4, &3]")),
-    ("which_static", edit_only("which static is pointed to", "(&BOTH, &SA)", "(&BOTH, &SB)", Only::Static)),
-    ("which_static", edit("a static pointed to", "pub static SA: u32 = 1;", "pub static SA: u32 = 3;")),
+    (
+        "which_static",
+        edit_only("which static is pointed to", "(&BOTH, &SA)", "(&BOTH, &SB)", Only::Static),
+    ),
+    (
+        "which_static",
+        edit("a static pointed to", "pub static SA: u32 = 1;", "pub static SA: u32 = 3;"),
+    ),
     (
         "provenance",
-        edit_only("a pointer made an equal number", "U { p: &SX as *const u8 }", "U { n: {address} }", Only::Provenance),
+        edit_only(
+            "a pointer made an equal number",
+            "U { p: &SX as *const u8 }",
+            "U { n: {address} }",
+            Only::Provenance,
+        ),
     ),
     ("provenance", edit("a static pointed to", "pub static SX: u8 = 5;", "pub static SX: u8 = 6;")),
     (
         "alignment",
         // Six pieces first put the eighth at an address a multiple of 8 either way: only its
         // alignment changes, which its reader, reading `P`'s initializer, sees as `P` has it.
-        edit_only("a piece's alignment", "&[0u8; 8] as *const [u8; 8]", "&0u64 as *const u64", Only::Alignment),
+        edit_only(
+            "a piece's alignment",
+            "&[0u8; 8] as *const [u8; 8]",
+            "&0u64 as *const u64",
+            Only::Alignment,
+        ),
     ),
     ("alignment", edit("the pointee", "&[0u8; 8] as", "&[1u8; 8] as")),
     ("refusals", edit("the pointee", "&A(3)", "&A(4)")),
@@ -739,11 +837,15 @@ fn declared(source: &str) -> Vec<(String, bool, String, String)> {
     let mut found = Vec::new();
     for (keyword, is_static) in [("static ", true), ("const ", false)] {
         for (at, _) in source.match_indices(keyword) {
-            if at > 0 && !source[..at].ends_with(|c: char| c.is_whitespace() || c == ';' || c == '{' || c == '}') {
+            if at > 0
+                && !source[..at]
+                    .ends_with(|c: char| c.is_whitespace() || c == ';' || c == '{' || c == '}')
+            {
                 continue;
             }
             let rest = &source[at + keyword.len()..];
-            let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            let name: String =
+                rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
             if name.is_empty() || name == "fn" || name == "mut" {
                 continue;
             }
@@ -855,7 +957,12 @@ fn read_consts(db: &TestDB) -> Vec<(String, ConstId)> {
         .flat_map(|imp| imp.impl_items(db).items.to_vec())
         .filter_map(|(_, item)| match item {
             AssocItemId::ConstId(id) => {
-                let name = ConstSignature::of(db, id).name.as_ref()?.as_str().strip_prefix(READ)?.to_owned();
+                let name = ConstSignature::of(db, id)
+                    .name
+                    .as_ref()?
+                    .as_str()
+                    .strip_prefix(READ)?
+                    .to_owned();
                 Some((name, id))
             }
             _ => None,
@@ -896,21 +1003,41 @@ impl Value {
 }
 
 fn value(db: &TestDB, id: ConstId) -> Result<Value, String> {
-    let value = db.const_eval(id, GenericArgs::empty(), None).map_err(|e| format!("const eval: {e:?}"))?;
+    let value =
+        db.const_eval(id, GenericArgs::empty(), None).map_err(|e| format!("const eval: {e:?}"))?;
     let map = &value.memory_map;
     let ids = matches!(map, hir_ty::MemoryMap::Complex(complex) if complex.vtable.tys().len() > 0);
     let (pieces, statics) = match map {
         hir_ty::MemoryMap::Complex(complex) => (
             (complex.memory.iter())
-                .map(|(&at, bytes)| (at, bytes.to_vec(), map.align_at(at), map.pointers_in(at..at + bytes.len()).to_vec()))
+                .map(|(&at, bytes)| {
+                    (
+                        at,
+                        bytes.to_vec(),
+                        map.align_at(at),
+                        map.pointers_in(at..at + bytes.len()).to_vec(),
+                    )
+                })
                 .collect(),
             (complex.statics.iter())
-                .map(|it| (it.start, it.size, blaze_items::key::path(db, blaze_items::ItemId::Static(it.id)).to_string()))
+                .map(|it| {
+                    (
+                        it.start,
+                        it.size,
+                        blaze_items::key::path(db, blaze_items::ItemId::Static(it.id)).to_string(),
+                    )
+                })
                 .collect(),
         ),
         _ => (Vec::new(), Vec::new()),
     };
-    Ok(Value { bytes: value.memory.to_vec(), pieces, value_pointers: map.value_pointers().to_vec(), statics, ids })
+    Ok(Value {
+        bytes: value.memory.to_vec(),
+        pieces,
+        value_pointers: map.value_pointers().to_vec(),
+        statics,
+        ids,
+    })
 }
 
 /// What the build emits for a value and for everything its relocations reach, in an order its
@@ -961,7 +1088,10 @@ impl<'a> Emitted<'a> {
             InstanceDef::DropGlue => "drop glue".to_owned(),
             InstanceDef::CallOnceShim => "call-once shim".to_owned(),
             InstanceDef::VtableShim(f) => {
-                format!("vtable shim of {}", blaze_items::key::path(self.db, blaze_items::ItemId::Function(f)))
+                format!(
+                    "vtable shim of {}",
+                    blaze_items::key::path(self.db, blaze_items::ItemId::Function(f))
+                )
             }
             InstanceDef::FnPointerShim => "fn pointer shim".to_owned(),
             InstanceDef::ReifyShim { receiver } => format!("reify shim (receiver {receiver})"),
@@ -998,7 +1128,11 @@ impl<'a> Emitted<'a> {
             DataRequest::Vtable { ty, trait_ref, blob } => {
                 let trait_ = match trait_ref {
                     Some((trait_, args)) => {
-                        format!("{} [{}]", TraitSignature::of(self.db, *trait_).name.as_str(), self.args(args.as_ref()))
+                        format!(
+                            "{} [{}]",
+                            TraitSignature::of(self.db, *trait_).name.as_str(),
+                            self.args(args.as_ref())
+                        )
                     }
                     None => "no principal".to_owned(),
                 };
@@ -1017,7 +1151,11 @@ impl<'a> Emitted<'a> {
             }
             DataRequest::Location(_) => self.out.push_str("a location\n"),
             DataRequest::Declaration(f) => {
-                let _ = writeln!(self.out, "the declaration of {}", blaze_items::key::path(self.db, blaze_items::ItemId::Function(*f)));
+                let _ = writeln!(
+                    self.out,
+                    "the declaration of {}",
+                    blaze_items::key::path(self.db, blaze_items::ItemId::Function(*f))
+                );
             }
             DataRequest::FilePath(_) => self.out.push_str("a file's path\n"),
             DataRequest::Text(parts) => {
@@ -1036,7 +1174,14 @@ impl<'a> Emitted<'a> {
 
     fn blob(&mut self, requests: &Requests, blob: &ConstBlob, depth: usize) {
         assert!(depth < 256, "a blob more than 256 pointers deep");
-        let _ = writeln!(self.out, "{:indent$}bytes {:02x?} align {}", "", blob.bytes, blob.align, indent = depth * 2);
+        let _ = writeln!(
+            self.out,
+            "{:indent$}bytes {:02x?} align {}",
+            "",
+            blob.bytes,
+            blob.align,
+            indent = depth * 2
+        );
         for &(offset, data, add) in &blob.relocs {
             let _ = write!(self.out, "{:indent$}@{offset}+{add} -> ", "", indent = depth * 2);
             self.data(requests, data.as_u32(), depth);
@@ -1046,7 +1191,13 @@ impl<'a> Emitted<'a> {
             let _ = writeln!(self.out, "{:indent$}@{offset} -> {name}", "", indent = depth * 2);
         }
         for (offset, ty) in &blob.type_ids {
-            let _ = writeln!(self.out, "{:indent$}@{offset} type id of {}", "", self.ty(ty.as_ref()), indent = depth * 2);
+            let _ = writeln!(
+                self.out,
+                "{:indent$}@{offset} type id of {}",
+                "",
+                self.ty(ty.as_ref()),
+                indent = depth * 2
+            );
         }
     }
 
@@ -1056,7 +1207,9 @@ impl<'a> Emitted<'a> {
         while let Some(pending) = self.work.pop_front() {
             spelled += 1;
             if spelled > REACHED {
-                return Err(format!("its emitted code reaches more than {REACHED} functions and statics"));
+                return Err(format!(
+                    "its emitted code reaches more than {REACHED} functions and statics"
+                ));
             }
             match pending {
                 Pending::Func(instance, env, name) => {
@@ -1064,15 +1217,24 @@ impl<'a> Emitted<'a> {
                     match crate::compiled_instance(self.db, instance, env) {
                         Ok(compiled) => {
                             let code = &compiled.code;
-                            let _ = writeln!(self.out, "code {:02x?} align {}", code.bytes, code.align);
+                            let _ =
+                                writeln!(self.out, "code {:02x?} align {}", code.bytes, code.align);
                             for reloc in code.relocs.iter() {
-                                let _ = write!(self.out, "@{} {:?}+{} -> ", reloc.offset, reloc.kind, reloc.addend);
+                                let _ = write!(
+                                    self.out,
+                                    "@{} {:?}+{} -> ",
+                                    reloc.offset, reloc.kind, reloc.addend
+                                );
                                 match reloc.name {
                                     RelocName::Func(index) => {
-                                        let name = self.target(&compiled.requests.funcs[index as usize].target);
+                                        let name = self.target(
+                                            &compiled.requests.funcs[index as usize].target,
+                                        );
                                         let _ = writeln!(self.out, "{name}");
                                     }
-                                    RelocName::Data(index) => self.data(&compiled.requests, index, 0),
+                                    RelocName::Data(index) => {
+                                        self.data(&compiled.requests, index, 0)
+                                    }
                                     other => {
                                         let _ = writeln!(self.out, "{other:?}");
                                     }
@@ -1127,12 +1289,17 @@ fn emitted(db: &TestDB, item: &Item, read: ConstId) -> Result<String, String> {
 
 /// The code id of `item`'s reader, which reads its value and nothing else of the case, or why
 /// it has none.
-fn read_code_id(db: &TestDB, item: &Item, readers: &[(String, hir_def::FunctionId)]) -> Result<hir_ty_identity::CodeId, String> {
+fn read_code_id(
+    db: &TestDB,
+    item: &Item,
+    readers: &[(String, hir_def::FunctionId)],
+) -> Result<hir_ty_identity::CodeId, String> {
     let name = reader(item.name.rsplit("::").next().expect("a name"));
     let Some(&(_, func)) = readers.iter().find(|it| it.0 == name) else {
         panic!("{}: no reader `{name}`", item.name);
     };
-    let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: fixture::test_crate(db) }.store();
+    let env =
+        ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: fixture::test_crate(db) }.store();
     let root = hir_ty_identity::Instance {
         subject: hir_ty_identity::Subject::Body(Body::Fn(func)),
         args: GenericArgs::empty().store(),
@@ -1156,9 +1323,10 @@ fn sides(case: &str, text: &str) -> Vec<Side> {
     let readers: Vec<(String, hir_def::FunctionId)> = hir_def::test_items::declarations(&db, krate)
         .into_iter()
         .filter_map(|it| match it {
-            ModuleDefId::FunctionId(id) => {
-                Some((hir_def::signatures::FunctionSignature::of(&db, id).name.as_str().to_owned(), id))
-            }
+            ModuleDefId::FunctionId(id) => Some((
+                hir_def::signatures::FunctionSignature::of(&db, id).name.as_str().to_owned(),
+                id,
+            )),
             _ => None,
         })
         .filter(|it| it.0.starts_with("__xcheck_read_"))
@@ -1215,7 +1383,9 @@ fn first_difference(a: &str, b: &str) -> String {
             (Some(x), Some(y)) if x == y => continue,
             (None, None) => return "none".to_owned(),
             (x, y) => {
-                let cut = |it: Option<&str>| it.map_or("<end>".to_owned(), |it| it.chars().take(240).collect());
+                let cut = |it: Option<&str>| {
+                    it.map_or("<end>".to_owned(), |it| it.chars().take(240).collect())
+                };
                 return format!("line {at}: `{}` became `{}`", cut(x), cut(y));
             }
         }
@@ -1270,10 +1440,11 @@ fn a_values_code_id_changes_exactly_when_its_emitted_code_does() {
                 (Ok(_), Ok(_)) => {
                     counts.entry(name.clone()).or_default();
                 }
-                (Err(e), Ok(_)) if walked && shared_refusal(e).is_some() => findings.push(format!(
-                    "{name}: the code generator refuses a word identity takes: {e}"
+                (Err(e), Ok(_)) if walked && shared_refusal(e).is_some() => findings
+                    .push(format!("{name}: the code generator refuses a word identity takes: {e}")),
+                (Ok(_), Err(why)) => findings.push(format!(
+                    "{name}: identity refuses what the code generator builds: {why}"
                 )),
-                (Ok(_), Err(why)) => findings.push(format!("{name}: identity refuses what the code generator builds: {why}")),
                 (Err(e), Err(why)) => {
                     if let Some(reason) = shared_refusal(e) {
                         match why.contains(reason) {
@@ -1283,12 +1454,16 @@ fn a_values_code_id_changes_exactly_when_its_emitted_code_does() {
                             )),
                         }
                     }
-                    refusals.push(format!("{name}: the code generator refuses it: {e}; identity: {why}"));
+                    refusals.push(format!(
+                        "{name}: the code generator refuses it: {e}; identity: {why}"
+                    ));
                 }
-                (Err(e), Ok(_)) => refusals.push(format!("{name}: the code generator refuses it: {e}; identity takes it")),
+                (Err(e), Ok(_)) => refusals
+                    .push(format!("{name}: the code generator refuses it: {e}; identity takes it")),
             }
         }
-        let moved = Edit { name: "an item first, moving every other", from: "", to: "", only: None };
+        let moved =
+            Edit { name: "an item first, moving every other", from: "", to: "", only: None };
         let edits = EDITS
             .iter()
             .chain(CASE_EDITS.iter().filter(|it| it.0 == *case).map(|it| &it.1))
@@ -1298,8 +1473,16 @@ fn a_values_code_id_changes_exactly_when_its_emitted_code_does() {
         for edit in edits {
             let p = || {
                 let name = format!("{case}::P");
-                let side = base.iter().find(|it| it.name == name).unwrap_or_else(|| panic!("{case}: no `P`"));
-                (name, side.value.as_ref().unwrap_or_else(|e| panic!("{case}::P does not evaluate: {e}")))
+                let side = base
+                    .iter()
+                    .find(|it| it.name == name)
+                    .unwrap_or_else(|| panic!("{case}: no `P`"));
+                (
+                    name,
+                    side.value
+                        .as_ref()
+                        .unwrap_or_else(|e| panic!("{case}::P does not evaluate: {e}")),
+                )
             };
             let to = match edit.to.contains(ADDRESS) {
                 true => {
@@ -1316,13 +1499,32 @@ fn a_values_code_id_changes_exactly_when_its_emitted_code_does() {
             let after = sides(case, &crate_text(head, &edited));
             if let Some(only) = edit.only {
                 let (name, before) = p();
-                let after = after.iter().find(|it| it.name == name).expect("the same items after an edit");
-                let after = after.value.as_ref().unwrap_or_else(|e| panic!("{name}, after `{}`: {e}", edit.name));
-                assert_eq!(before.without(only), after.without(only), "{name}, after `{}`: more changed than {only:?}", edit.name);
-                assert_ne!(before, after, "{name}, after `{}`: its {only:?} did not change", edit.name);
+                let after =
+                    after.iter().find(|it| it.name == name).expect("the same items after an edit");
+                let after = after
+                    .value
+                    .as_ref()
+                    .unwrap_or_else(|e| panic!("{name}, after `{}`: {e}", edit.name));
+                assert_eq!(
+                    before.without(only),
+                    after.without(only),
+                    "{name}, after `{}`: more changed than {only:?}",
+                    edit.name
+                );
+                assert_ne!(
+                    before, after,
+                    "{name}, after `{}`: its {only:?} did not change",
+                    edit.name
+                );
             }
-            for (Side { name, emitted, id, .. }, Side { emitted: emitted_after, id: id_after, .. }) in base.iter().zip(&after) {
-                let (Ok(emitted), Ok(id), Ok(emitted_after), Ok(id_after)) = (emitted, id, emitted_after, id_after) else {
+            for (
+                Side { name, emitted, id, .. },
+                Side { emitted: emitted_after, id: id_after, .. },
+            ) in base.iter().zip(&after)
+            {
+                let (Ok(emitted), Ok(id), Ok(emitted_after), Ok(id_after)) =
+                    (emitted, id, emitted_after, id_after)
+                else {
                     if emitted.is_ok() && id.is_ok() {
                         refusals.push(format!(
                             "{name}, after `{}`: refused ({:?} / {:?})",
@@ -1334,7 +1536,10 @@ fn a_values_code_id_changes_exactly_when_its_emitted_code_does() {
                     continue;
                 };
                 let (code_changed, id_changed) = (emitted != emitted_after, id != id_after);
-                eprintln!("compared {name} after `{}`: emitted changed {code_changed}, code id changed {id_changed}", edit.name);
+                eprintln!(
+                    "compared {name} after `{}`: emitted changed {code_changed}, code id changed {id_changed}",
+                    edit.name
+                );
                 let count = counts.entry(name.clone()).or_default();
                 match (code_changed, id_changed) {
                     (true, true) => count.0 += 1,
@@ -1357,7 +1562,8 @@ fn a_values_code_id_changes_exactly_when_its_emitted_code_does() {
         eprintln!("refused {refused}");
     }
     // A case or an edit that doesn't type-check is refused by both sides and checks nothing.
-    let broken: Vec<_> = refusals.iter().filter(|it| it.contains("HasErrors")).map(String::as_str).collect();
+    let broken: Vec<_> =
+        refusals.iter().filter(|it| it.contains("HasErrors")).map(String::as_str).collect();
     assert!(broken.is_empty(), "cases or edits that don't type-check:\n{}", broken.join("\n"));
     for (name, (changed, kept)) in &counts {
         eprintln!("checked {name}: {changed} edits changed both, {kept} changed neither");
@@ -1367,9 +1573,21 @@ fn a_values_code_id_changes_exactly_when_its_emitted_code_does() {
     // every case has a value an edit changes, and every value one that changes nothing.
     for name in ["DYN_NUMBER", "FN_NUMBER", "WRONG_TRAIT", "WRONG_ARGS", "ONLY_PROVENANCE"] {
         let name = format!("refusals::{name}");
-        assert!(agreed.contains(&name), "{name} is not refused by both sides for one shared reason");
+        assert!(
+            agreed.contains(&name),
+            "{name} is not refused by both sides for one shared reason"
+        );
     }
-    for name in ["asptr::S", "muninit::S", "sltail::S", "which_static::P", "provenance::P", "alignment::P", "parts::P", "copy::Q"] {
+    for name in [
+        "asptr::S",
+        "muninit::S",
+        "sltail::S",
+        "which_static::P",
+        "provenance::P",
+        "alignment::P",
+        "parts::P",
+        "copy::Q",
+    ] {
         let changed = counts.get(name).map_or(0, |it| it.0);
         assert!(changed > 0, "{name} is not checked, or no edit changed it");
     }
@@ -1378,6 +1596,7 @@ fn a_values_code_id_changes_exactly_when_its_emitted_code_does() {
         let changed = counts.iter().any(|(name, it)| name.starts_with(&prefix) && it.0 > 0);
         assert!(changed, "{case}: no value of it checked with an edit that changed it");
     }
-    let unchanged: Vec<_> = counts.iter().filter(|it| it.1.1 == 0).map(|it| it.0.as_str()).collect();
+    let unchanged: Vec<_> =
+        counts.iter().filter(|it| it.1.1 == 0).map(|it| it.0.as_str()).collect();
     assert!(unchanged.is_empty(), "values no edit left alone: {unchanged:?}");
 }

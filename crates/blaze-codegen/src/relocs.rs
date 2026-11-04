@@ -61,7 +61,8 @@ impl Reloc {
         if bytes[13..] != [0; 3] {
             return None;
         }
-        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+        let word =
+            |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
         Some(Reloc::new(word(0), word(4), word(8) as i32, kind_of(bytes[12])?))
     }
 }
@@ -153,7 +154,11 @@ impl<T: Eq + Hash> Distinct<T> {
 }
 
 /// The index of `target` among `targets`, pushed when it is new; `index` finds each by hash.
-fn index_in<T: Eq + Hash, A: Allocator>(targets: &mut Vec<T>, index: &mut HashTable<u32, A>, target: T) -> u32 {
+fn index_in<T: Eq + Hash, A: Allocator>(
+    targets: &mut Vec<T>,
+    index: &mut HashTable<u32, A>,
+    target: T,
+) -> u32 {
     let hash = FixedState.hash_one(&target);
     if let Some(&at) = index.find(hash, |&at| targets[at as usize] == target) {
         return at;
@@ -210,7 +215,12 @@ impl<T> Relocs<T> {
 
     pub fn get(&self, row: usize) -> Option<Relocation<&T>> {
         let it = self.rows.get(row)?;
-        Some(Relocation { at: it.at, kind: it.kind, target: self.target_of(it), addend: self.addend(row) })
+        Some(Relocation {
+            at: it.at,
+            kind: it.kind,
+            target: self.target_of(it),
+            addend: self.addend(row),
+        })
     }
 
     pub fn iter(&self) -> Iter<'_, T> {
@@ -230,7 +240,11 @@ impl<T> Relocs<T> {
     /// Puts rows in order (stably by `at`), and targets in the order they are first named,
     /// dropping any not named. `targets` are distinct. What only the assembly needs is in
     /// `scratch`.
-    fn assemble<A: Allocator + Copy>(pending: &mut [Pending], targets: Vec<T>, scratch: A) -> Relocs<T> {
+    fn assemble<A: Allocator + Copy>(
+        pending: &mut [Pending],
+        targets: Vec<T>,
+        scratch: A,
+    ) -> Relocs<T> {
         if !pending.is_sorted_by_key(|it| it.at) {
             blaze_ids::radix::sort_copy_by_key(pending, |it| it.at);
         }
@@ -244,7 +258,8 @@ impl<T> Relocs<T> {
                 named += 1;
             }
         }
-        let in_order = named as usize == targets.len() && order.iter().enumerate().all(|(at, &it)| it == at as u32);
+        let in_order = named as usize == targets.len()
+            && order.iter().enumerate().all(|(at, &it)| it == at as u32);
         let targets = if in_order {
             targets
         } else {
@@ -258,7 +273,10 @@ impl<T> Relocs<T> {
             let mut slots = Vec::with_capacity_in(targets.len(), scratch);
             slots.extend(targets.into_iter().map(Some));
             // alloc: the table's targets, in the order rows first name them
-            by_order.iter().map(|&old| slots[old as usize].take().expect("each target once")).collect()
+            by_order
+                .iter()
+                .map(|&old| slots[old as usize].take().expect("each target once"))
+                .collect()
         };
         let mut rows = Vec::with_capacity(pending.len());
         // alloc: the table's wide addends; none when every addend fits its row
@@ -284,7 +302,10 @@ impl<T> Relocs<T> {
     }
 
     /// [`Relocs::map`], stopping at the first error.
-    pub fn try_map<U: Eq + Hash, E>(&self, mut f: impl FnMut(&T) -> Result<U, E>) -> Result<Relocs<U>, E> {
+    pub fn try_map<U: Eq + Hash, E>(
+        &self,
+        mut f: impl FnMut(&T) -> Result<U, E>,
+    ) -> Result<Relocs<U>, E> {
         let mut distinct = Distinct::with_capacity(self.targets.len());
         let mut remap = Vec::with_capacity(self.targets.len());
         for target in &self.targets {
@@ -298,7 +319,12 @@ impl<T> Relocs<T> {
         let mut pending: Vec<Pending> = self
             .view()
             .iter_rows()
-            .map(|(row, addend)| Pending { at: row.at, target: remap[row.target as usize], kind: row.kind, addend })
+            .map(|(row, addend)| Pending {
+                at: row.at,
+                target: remap[row.target as usize],
+                kind: row.kind,
+                addend,
+            })
             // alloc: only when `f` makes two targets one
             .collect();
         Ok(Relocs::assemble(&mut pending, distinct.targets, Global))
@@ -365,7 +391,11 @@ impl<'a, T> RelocsView<'a, T> {
         T: Clone,
     {
         // alloc: a table its caller keeps
-        Relocs { rows: self.rows.to_vec(), targets: self.targets.to_vec(), wide: self.wide.to_vec() }
+        Relocs {
+            rows: self.rows.to_vec(),
+            targets: self.targets.to_vec(),
+            wide: self.wide.to_vec(),
+        }
     }
 
     /// [`Relocs::try_map`] of the table viewed, its index and remap in `frame`: it allocates
@@ -387,10 +417,12 @@ impl<'a, T> RelocsView<'a, T> {
             return Ok(Relocs { rows: self.rows.to_vec(), targets, wide: self.wide.to_vec() });
         }
         let mut pending = Vec::with_capacity_in(self.rows.len(), frame);
-        pending.extend(
-            self.iter_rows()
-                .map(|(row, addend)| Pending { at: row.at, target: remap[row.target as usize], kind: row.kind, addend }),
-        );
+        pending.extend(self.iter_rows().map(|(row, addend)| Pending {
+            at: row.at,
+            target: remap[row.target as usize],
+            kind: row.kind,
+            addend,
+        }));
         Ok(Relocs::assemble(&mut pending, targets, frame))
     }
 
@@ -420,7 +452,11 @@ impl<'a, T: Eq + Hash> RelocsView<'a, T> {
 
 impl<T: Eq + Hash> Relocs<T> {
     /// A table of `rows`, `targets` and `wide` in their one order, else what is out of it.
-    pub fn from_parts(rows: Vec<Reloc>, targets: Vec<T>, wide: Vec<(u32, i64)>) -> Result<Relocs<T>, &'static str> {
+    pub fn from_parts(
+        rows: Vec<Reloc>,
+        targets: Vec<T>,
+        wide: Vec<(u32, i64)>,
+    ) -> Result<Relocs<T>, &'static str> {
         check_parts(&rows, &targets, &wide, Global)?;
         Ok(Relocs { rows, targets, wide })
     }
@@ -504,7 +540,12 @@ impl<T: Eq + Hash> FromIterator<Relocation<T>> for Relocs<T> {
         let relocs = relocs.into_iter();
         let mut distinct = Distinct::with_capacity(relocs.size_hint().0);
         let mut pending: Vec<Pending> = relocs
-            .map(|it| Pending { at: it.at, target: distinct.index(it.target), kind: it.kind, addend: it.addend })
+            .map(|it| Pending {
+                at: it.at,
+                target: distinct.index(it.target),
+                kind: it.kind,
+                addend: it.addend,
+            })
             // alloc: the rows before their order; a hot caller uses `Relocs::try_from_iter_in`
             .collect();
         Relocs::assemble(&mut pending, distinct.targets, Global)
@@ -532,13 +573,19 @@ impl<'a, T> Iterator for Iter<'a, T> {
         let row = self.rows.next()?;
         let addend = match row.addend {
             WIDE => {
-                let (&(_, addend), rest) = self.wide.split_first().expect("a wide row has its addend");
+                let (&(_, addend), rest) =
+                    self.wide.split_first().expect("a wide row has its addend");
                 self.wide = rest;
                 addend
             }
             narrow => i64::from(narrow),
         };
-        Some(Relocation { at: row.at, kind: row.kind, target: &self.targets[row.target as usize], addend })
+        Some(Relocation {
+            at: row.at,
+            kind: row.kind,
+            target: &self.targets[row.target as usize],
+            addend,
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -574,20 +621,40 @@ mod tests {
     }
 
     fn owned(relocs: &Relocs) -> Vec<Relocation> {
-        relocs.iter().map(|it| Relocation { at: it.at, kind: it.kind, target: it.target.clone(), addend: it.addend }).collect()
+        relocs
+            .iter()
+            .map(|it| Relocation {
+                at: it.at,
+                kind: it.kind,
+                target: it.target.clone(),
+                addend: it.addend,
+            })
+            .collect()
     }
 
     #[test]
     fn a_target_is_kept_once_in_first_use_order() {
-        let relocs: Relocs = vec![reloc(9, call(1), -4), reloc(1, call(2), -4), reloc(5, call(1), -4)].into();
+        let relocs: Relocs =
+            vec![reloc(9, call(1), -4), reloc(1, call(2), -4), reloc(5, call(1), -4)].into();
         assert_eq!(relocs.targets(), [call(2), call(1)]);
-        assert_eq!(relocs.rows().iter().map(|it| (it.at, it.target)).collect::<Vec<_>>(), [(1, 0), (5, 1), (9, 1)]);
-        assert_eq!(owned(&relocs), [reloc(1, call(2), -4), reloc(5, call(1), -4), reloc(9, call(1), -4)]);
+        assert_eq!(
+            relocs.rows().iter().map(|it| (it.at, it.target)).collect::<Vec<_>>(),
+            [(1, 0), (5, 1), (9, 1)]
+        );
+        assert_eq!(
+            owned(&relocs),
+            [reloc(1, call(2), -4), reloc(5, call(1), -4), reloc(9, call(1), -4)]
+        );
     }
 
     #[test]
     fn one_set_of_relocations_is_one_table_whatever_the_order() {
-        let rows = [reloc(1, call(1), 0), reloc(3, call(2), 1 << 40), reloc(3, call(3), i64::from(WIDE)), reloc(7, call(1), 8)];
+        let rows = [
+            reloc(1, call(1), 0),
+            reloc(3, call(2), 1 << 40),
+            reloc(3, call(3), i64::from(WIDE)),
+            reloc(7, call(1), 8),
+        ];
         let a: Relocs = rows.to_vec().into();
         let mut b: Relocs = vec![rows[3].clone(), rows[0].clone()].into();
         b.push(rows[1].clone());
@@ -600,7 +667,8 @@ mod tests {
 
     #[test]
     fn parts_out_of_their_order_are_refused() {
-        let table: Relocs = vec![reloc(1, call(1), 0), reloc(2, call(2), 1 << 40), reloc(3, call(1), 0)].into();
+        let table: Relocs =
+            vec![reloc(1, call(1), 0), reloc(2, call(2), 1 << 40), reloc(3, call(1), 0)].into();
         let (rows, targets, wide) = table.clone().into_parts();
         assert_eq!(Relocs::from_parts(rows.clone(), targets.clone(), wide.clone()), Ok(table));
         let mut unsorted = rows.clone();
@@ -612,7 +680,14 @@ mod tests {
         (renamed[0].target, renamed[1].target, renamed[2].target) = (1, 0, 1);
         assert!(Relocs::from_parts(renamed, swapped, wide.clone()).is_err());
         assert!(Relocs::from_parts(rows.clone(), vec![call(1), call(1)], wide.clone()).is_err());
-        assert!(Relocs::from_parts(rows.clone(), [targets.clone(), vec![call(3)]].concat(), wide.clone()).is_err());
+        assert!(
+            Relocs::from_parts(
+                rows.clone(),
+                [targets.clone(), vec![call(3)]].concat(),
+                wide.clone()
+            )
+            .is_err()
+        );
         assert!(Relocs::from_parts(rows.clone(), targets.clone(), Vec::new()).is_err());
         assert!(Relocs::from_parts(rows.clone(), targets.clone(), vec![(1, 4)]).is_err());
         assert!(Relocs::from_parts(rows, targets, vec![(0, 1 << 40)]).is_err());
@@ -632,26 +707,34 @@ mod tests {
 
     #[test]
     fn mapping_merges_targets_made_equal() {
-        let table: Relocs = vec![reloc(1, call(1), 0), reloc(2, call(2), 1 << 40), reloc(3, call(3), 0)].into();
+        let table: Relocs =
+            vec![reloc(1, call(1), 0), reloc(2, call(2), 1 << 40), reloc(3, call(3), 0)].into();
         let merged = table.map(|it| match it {
             Target::Function(key) if key.0.0[0] == 3 => call(1),
             other => other.clone(),
         });
         assert_eq!(merged.targets(), [call(1), call(2)]);
-        assert_eq!(owned(&merged), [reloc(1, call(1), 0), reloc(2, call(2), 1 << 40), reloc(3, call(1), 0)]);
+        assert_eq!(
+            owned(&merged),
+            [reloc(1, call(1), 0), reloc(2, call(2), 1 << 40), reloc(3, call(1), 0)]
+        );
         assert_eq!(table.map(Clone::clone), table);
     }
 
     #[test]
     fn a_view_maps_and_checks_as_the_table_does() {
-        let table: Relocs = vec![reloc(1, call(1), 0), reloc(2, call(2), 1 << 40), reloc(3, call(3), 0)].into();
+        let table: Relocs =
+            vec![reloc(1, call(1), 0), reloc(2, call(2), 1 << 40), reloc(3, call(3), 0)].into();
         let merge = |it: &Target| match it {
             Target::Function(key) if key.0.0[0] == 3 => Ok::<_, ()>(call(1)),
             other => Ok(other.clone()),
         };
         frame::task(Tag::Codegen, |frame| {
             assert_eq!(table.view().try_map_in(frame, merge), table.try_map(merge));
-            assert_eq!(table.view().try_map_in(frame, |it| Ok::<_, ()>(it.clone())), Ok(table.clone()));
+            assert_eq!(
+                table.view().try_map_in(frame, |it| Ok::<_, ()>(it.clone())),
+                Ok(table.clone())
+            );
             assert_eq!(table.view().to_relocs(), table);
             let (rows, targets, wide) = table.clone().into_parts();
             assert_eq!(RelocsView::from_parts(&rows, &targets, &wide, frame), Ok(table.view()));

@@ -40,10 +40,7 @@ use crate::native::core::{ChoiceNode, ChoiceValue, MAX_SHRINKS, Spans, sort_key}
 /// drawing from `self.random`), so there is no per-probe seed.
 pub enum ShrinkRun<'a> {
     Full(&'a [ChoiceNode]),
-    Probe {
-        prefix: &'a [ChoiceValue],
-        max_size: usize,
-    },
+    Probe { prefix: &'a [ChoiceValue], max_size: usize },
 }
 
 /// The boxed future a [`ShrinkProbe`] resolves to: the
@@ -463,9 +460,8 @@ impl<'a> Shrinker<'a> {
         {
             return Ok(());
         }
-        let (is_interesting, actual_nodes, actual_spans) = self
-            .run_test_fn(ShrinkRun::Probe { prefix, max_size })
-            .await?;
+        let (is_interesting, actual_nodes, actual_spans) =
+            self.run_test_fn(ShrinkRun::Probe { prefix, max_size }).await?;
         self.calls += 1;
         if is_interesting && sort_key(&actual_nodes) < sort_key(&self.current_nodes) {
             self.accept_improvement(actual_nodes, actual_spans)?;
@@ -605,11 +601,7 @@ impl<'a> Shrinker<'a> {
         ));
         for useful in [true, false] {
             self.debug_msg("");
-            self.debug_msg(if useful {
-                "Useful passes:"
-            } else {
-                "Useless passes:"
-            });
+            self.debug_msg(if useful { "Useful passes:" } else { "Useless passes:" });
             self.debug_msg("");
             let mut buckets: Vec<&(&'static str, usize, usize, usize)> = stats
                 .iter()
@@ -660,63 +652,30 @@ impl<'a> Shrinker<'a> {
                 Box::new(|sh| boxed_pass(async move { sh.remove_discarded().await.map(|_| ()) })),
             ),
             ShrinkPass::new("delete_spans", Box::new(|sh| boxed_pass(sh.delete_spans()))),
-            ShrinkPass::new(
-                "shrink_duplicates",
-                Box::new(|sh| boxed_pass(sh.shrink_duplicates())),
-            ),
-            ShrinkPass::new(
-                "try_trivial_spans",
-                Box::new(|sh| boxed_pass(sh.try_trivial_spans())),
-            ),
+            ShrinkPass::new("shrink_duplicates", Box::new(|sh| boxed_pass(sh.shrink_duplicates()))),
+            ShrinkPass::new("try_trivial_spans", Box::new(|sh| boxed_pass(sh.try_trivial_spans()))),
             ShrinkPass::new(
                 "pass_to_descendant",
                 Box::new(|sh| boxed_pass(sh.pass_to_descendant())),
             ),
-            ShrinkPass::new(
-                "reorder_spans",
-                Box::new(|sh| boxed_pass(sh.reorder_spans())),
-            ),
-            ShrinkPass::new(
-                "node_program_5",
-                Box::new(|sh| boxed_pass(sh.node_program(5))),
-            ),
-            ShrinkPass::new(
-                "node_program_4",
-                Box::new(|sh| boxed_pass(sh.node_program(4))),
-            ),
-            ShrinkPass::new(
-                "node_program_3",
-                Box::new(|sh| boxed_pass(sh.node_program(3))),
-            ),
-            ShrinkPass::new(
-                "node_program_2",
-                Box::new(|sh| boxed_pass(sh.node_program(2))),
-            ),
-            ShrinkPass::new(
-                "node_program_1",
-                Box::new(|sh| boxed_pass(sh.node_program(1))),
-            ),
-            ShrinkPass::new(
-                "delete_chunks",
-                Box::new(|sh| boxed_pass(sh.delete_chunks())),
-            ),
+            ShrinkPass::new("reorder_spans", Box::new(|sh| boxed_pass(sh.reorder_spans()))),
+            ShrinkPass::new("node_program_5", Box::new(|sh| boxed_pass(sh.node_program(5)))),
+            ShrinkPass::new("node_program_4", Box::new(|sh| boxed_pass(sh.node_program(4)))),
+            ShrinkPass::new("node_program_3", Box::new(|sh| boxed_pass(sh.node_program(3)))),
+            ShrinkPass::new("node_program_2", Box::new(|sh| boxed_pass(sh.node_program(2)))),
+            ShrinkPass::new("node_program_1", Box::new(|sh| boxed_pass(sh.node_program(1)))),
+            ShrinkPass::new("delete_chunks", Box::new(|sh| boxed_pass(sh.delete_chunks()))),
             ShrinkPass::new(
                 "delete_between_repeats",
                 Box::new(|sh| boxed_pass(sh.delete_between_repeats())),
             ),
             ShrinkPass::new("zero_choices", Box::new(|sh| boxed_pass(sh.zero_choices()))),
-            ShrinkPass::new(
-                "swap_integer_sign",
-                Box::new(|sh| boxed_pass(sh.swap_integer_sign())),
-            ),
+            ShrinkPass::new("swap_integer_sign", Box::new(|sh| boxed_pass(sh.swap_integer_sign()))),
             ShrinkPass::new(
                 "binary_search_integer_towards_zero",
                 Box::new(|sh| boxed_pass(sh.binary_search_integer_towards_zero())),
             ),
-            ShrinkPass::new(
-                "bind_deletion",
-                Box::new(|sh| boxed_pass(sh.bind_deletion())),
-            ),
+            ShrinkPass::new("bind_deletion", Box::new(|sh| boxed_pass(sh.bind_deletion()))),
             ShrinkPass::new(
                 "minimize_individual_choices",
                 Box::new(|sh| boxed_pass(sh.minimize_individual_choices())),
@@ -738,10 +697,7 @@ impl<'a> Shrinker<'a> {
                 "swap_adjacent_blocks",
                 Box::new(|sh| boxed_pass(sh.swap_adjacent_blocks())),
             ),
-            ShrinkPass::new(
-                "shrink_floats",
-                Box::new(|sh| boxed_pass(sh.shrink_floats())),
-            ),
+            ShrinkPass::new("shrink_floats", Box::new(|sh| boxed_pass(sh.shrink_floats()))),
             ShrinkPass::new(
                 "redistribute_numeric_pairs",
                 Box::new(|sh| boxed_pass(sh.redistribute_numeric_pairs())),
@@ -759,10 +715,7 @@ impl<'a> Shrinker<'a> {
                 "shrink_grammar_strings",
                 Box::new(|sh| boxed_pass(sh.shrink_grammar_strings())),
             ),
-            ShrinkPass::new(
-                "shrink_strings",
-                Box::new(|sh| boxed_pass(sh.shrink_strings())),
-            ),
+            ShrinkPass::new("shrink_strings", Box::new(|sh| boxed_pass(sh.shrink_strings()))),
             ShrinkPass::new(
                 "lower_duplicated_characters",
                 Box::new(|sh| boxed_pass(sh.lower_duplicated_characters())),
@@ -775,10 +728,7 @@ impl<'a> Shrinker<'a> {
                 "redistribute_string_pairs",
                 Box::new(|sh| boxed_pass(sh.redistribute_string_pairs())),
             ),
-            ShrinkPass::new(
-                "lower_and_bump",
-                Box::new(|sh| boxed_pass(sh.lower_and_bump())),
-            ),
+            ShrinkPass::new("lower_and_bump", Box::new(|sh| boxed_pass(sh.lower_and_bump()))),
             ShrinkPass::new(
                 "try_shortening_via_increment",
                 Box::new(|sh| boxed_pass(sh.try_shortening_via_increment())),
@@ -787,11 +737,8 @@ impl<'a> Shrinker<'a> {
                 "shrink_clone_streams",
                 Box::new(|sh| boxed_pass(sh.shrink_clone_streams())),
             ),
-            ShrinkPass::new(
-                "mutate_and_shrink",
-                Box::new(|sh| boxed_pass(sh.mutate_and_shrink())),
-            )
-            .stochastic(),
+            ShrinkPass::new("mutate_and_shrink", Box::new(|sh| boxed_pass(sh.mutate_and_shrink())))
+                .stochastic(),
         ];
         let initial_size = self.current_nodes.len();
         let initial_calls = self.calls;

@@ -44,9 +44,7 @@ impl Pattern {
     }
     /// Construct a pattern that matches all the impls for that trait.
     pub fn impl_for(trait_pat: Self) -> Self {
-        Pattern {
-            elems: vec![PatElem::Impl(Box::new(trait_pat))],
-        }
+        Pattern { elems: vec![PatElem::Impl(Box::new(trait_pat))] }
     }
 
     fn len(&self) -> usize {
@@ -111,10 +109,8 @@ impl Pattern {
         // truncate the scrutinee name to start with the rightmost impl in its name. This isn't
         // fully precise in case of impls within impls, but we'll ignore that.
         if let Some(PatElem::Impl(_)) = self.elems.first()
-            && let Some((i, _)) = scrutinee_elems
-                .iter()
-                .enumerate()
-                .rfind(|(_, elem)| elem.is_impl())
+            && let Some((i, _)) =
+                scrutinee_elems.iter().enumerate().rfind(|(_, elem)| elem.is_impl())
         {
             scrutinee_elems = &scrutinee_elems[i..];
         }
@@ -241,27 +237,13 @@ impl PatElem {
     ) -> bool {
         match (self, elem) {
             (PatElem::Glob, _) => true,
-            (
-                PatElem::Ident {
-                    name: pat_ident,
-                    generics,
-                    ..
-                },
-                PathElem::Ident(ident, _),
-            ) => {
+            (PatElem::Ident { name: pat_ident, generics, .. }, PathElem::Ident(ident, _)) => {
                 // `crate` is a special keyword that referes to the current crate.
                 let same_ident =
                     pat_ident == ident || (pat_ident == "crate" && ident == &ctx.crate_name);
                 same_ident && PatTy::matches_generics(ctx, generics, args)
             }
-            (
-                PatElem::Ident {
-                    name: pat_ident,
-                    generics,
-                    ..
-                },
-                PathElem::Builtin(builtin, _),
-            ) => {
+            (PatElem::Ident { name: pat_ident, generics, .. }, PathElem::Builtin(builtin, _)) => {
                 !builtin.is_tuple()
                     && pat_ident == builtin.ident()
                     && PatTy::matches_generics(ctx, generics, args)
@@ -301,11 +283,8 @@ impl PatTy {
             return false;
         }
         let (type_pats, const_pats) = pats.split_at(generics.types.len());
-        let types_match = generics
-            .types
-            .iter()
-            .zip(type_pats)
-            .all(|(ty, pat)| pat.matches_ty(ctx, ty));
+        let types_match =
+            generics.types.iter().zip(type_pats).all(|(ty, pat)| pat.matches_ty(ctx, ty));
         let consts_match = generics
             .const_generics
             .iter()

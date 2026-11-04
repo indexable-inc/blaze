@@ -115,7 +115,9 @@ pub(crate) enum Form {
 /// encodings made it. A multiple of 16, so warm bytes keep the record's alignment.
 pub(crate) const SCHEMA_PREFIX: usize = 32;
 
-const _: () = assert!(SCHEMA_PREFIX.is_multiple_of(16) && SCHEMA_PREFIX == size_of::<blaze_format::SchemaHash>());
+const _: () = assert!(
+    SCHEMA_PREFIX.is_multiple_of(16) && SCHEMA_PREFIX == size_of::<blaze_format::SchemaHash>()
+);
 
 impl Form {
     pub(crate) const fn code(self) -> u8 {
@@ -218,7 +220,8 @@ impl RecordHeader {
 
     /// The bytes the record takes in its pack, padding included.
     pub(crate) fn span(&self) -> u64 {
-        span_of(self.stored).expect("a header is decoded, which refuses a length with no span, or made in memory")
+        span_of(self.stored)
+            .expect("a header is decoded, which refuses a length with no span, or made in memory")
     }
 }
 
@@ -346,12 +349,7 @@ impl Head {
         out.put_u32(crate::FORMAT);
         out.put_u32(0);
         out.put_u64(self.generation);
-        let index = self.index.unwrap_or(IndexRef {
-            slot: u8::MAX,
-            len: 0,
-            check: 0,
-            count: 0,
-        });
+        let index = self.index.unwrap_or(IndexRef { slot: u8::MAX, len: 0, check: 0, count: 0 });
         out.put_u64(u64::from(index.slot));
         out.put_u64(index.len);
         out.put_u32(index.check);

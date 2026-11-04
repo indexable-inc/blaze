@@ -34,7 +34,8 @@ pub fn summary(mismatches: &[Mismatch]) -> String {
         // alloc: once per sampled view verified, its summary
         return "Built again from nothing, every result matched the daemon's.".to_owned();
     }
-    let mut text = format!( // alloc: once per sampled view verified, its summary
+    let mut text = format!(
+        // alloc: once per sampled view verified, its summary
         "Built again from nothing, {} result{} differed from the daemon's; the daemon stopped \
          them.\n",
         mismatches.len(),

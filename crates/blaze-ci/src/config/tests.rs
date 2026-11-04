@@ -56,7 +56,10 @@ fn a_full_example_parses() {
     assert_eq!(config.checks.len(), 2);
     assert_eq!(config.checks[1].kind, CheckKind::Test);
     assert_eq!(config.checks[1].filter, ["service"]);
-    assert_eq!(config.release_checks[0].targets.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
+    assert_eq!(
+        config.release_checks[0].targets.target.as_deref(),
+        Some("x86_64-unknown-linux-gnu")
+    );
     assert_eq!(config.oracle.one_in, 50);
     assert_eq!(config.snapshot.keep, 3);
     assert_eq!(config.standby.misses, 6);

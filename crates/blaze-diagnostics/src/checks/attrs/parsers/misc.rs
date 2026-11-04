@@ -36,13 +36,13 @@ use syntax::{
 };
 
 use super::{Accepted, Finalize, GroupId, limit, no_args};
-use stdx::list::Join;
 use crate::{
     checks::attrs::{
         accept::Accept,
         args::{self, ArgParser, MetaItemOrLit, NameValue},
-        is, with_path,
+        is,
         parsed::{Parsed, ParsedAttr, ProcMacroKind},
+        with_path,
     },
     cx::Cx,
     lints::syntax::attrs::{
@@ -51,6 +51,7 @@ use crate::{
     },
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
+use stdx::list::Join;
 
 pub(crate) const PATHS: &[&[&str]] = &[
     &["allow_internal_unsafe"],
@@ -134,11 +135,13 @@ pub(crate) fn accept(state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &ArgP
             state.crate_type = true;
             Accepted::Group("crate_type")
         }
-        ["recursion_limit"] => {
-            Accepted::Single(early_fatal(cx, |cx| limit_of(cx, args)).map(|_| other("RecursionLimit")))
-        }
+        ["recursion_limit"] => Accepted::Single(
+            early_fatal(cx, |cx| limit_of(cx, args)).map(|_| other("RecursionLimit")),
+        ),
         ["move_size_limit"] => Accepted::Single(limit_of(cx, args).map(|_| other("MoveSizeLimit"))),
-        ["type_length_limit"] => Accepted::Single(limit_of(cx, args).map(|_| other("TypeLengthLimit"))),
+        ["type_length_limit"] => {
+            Accepted::Single(limit_of(cx, args).map(|_| other("TypeLengthLimit")))
+        }
         ["pattern_complexity_limit"] => {
             Accepted::Single(limit_of(cx, args).map(|_| other("PatternComplexityLimit")))
         }
@@ -180,17 +183,21 @@ pub(crate) fn accept(state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &ArgP
             Accepted::Single(name.map(|_| other("ReexportTestHarnessMain")))
         }
         ["rustc_abi"] => Accepted::Single(rustc_abi(cx, args)),
-        ["rustc_delayed_bug_from_inside_query"] => no_args(cx, args, other("RustcDelayedBugFromInsideQuery")),
+        ["rustc_delayed_bug_from_inside_query"] => {
+            no_args(cx, args, other("RustcDelayedBugFromInsideQuery"))
+        }
         ["rustc_evaluate_where_clauses"] => no_args(cx, args, other("RustcEvaluateWhereClauses")),
         ["rustc_test_entrypoint_marker"] => no_args(cx, args, other("RustcTestEntrypointMarker")),
         ["test_runner"] => Accepted::Single(test_runner(cx, args)),
         ["rustc_test_marker"] => Accepted::Single(rustc_test_marker(cx, args)),
         ["proc_macro"] => no_args(cx, args, Parsed::ProcMacro(ProcMacroKind::FunctionLike)),
         ["proc_macro_attribute"] => no_args(cx, args, Parsed::ProcMacro(ProcMacroKind::Attribute)),
-        ["proc_macro_derive"] => {
-            Accepted::Single(derive_like(cx, args, true).map(|()| Parsed::ProcMacro(ProcMacroKind::Derive)))
+        ["proc_macro_derive"] => Accepted::Single(
+            derive_like(cx, args, true).map(|()| Parsed::ProcMacro(ProcMacroKind::Derive)),
+        ),
+        ["rustc_builtin_macro"] => {
+            Accepted::Single(derive_like(cx, args, false).map(|()| other("RustcBuiltinMacro")))
         }
-        ["rustc_builtin_macro"] => Accepted::Single(derive_like(cx, args, false).map(|()| other("RustcBuiltinMacro"))),
         ["debugger_visualizer"] => {
             debugger_visualizer(cx, args);
             state.debugger_visualizer = true;
@@ -204,7 +211,11 @@ pub(crate) fn accept(state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &ArgP
     }
 }
 
-pub(crate) fn finalize(state: &mut State, group: &'static str, _fx: &mut Finalize<'_, '_, '_>) -> Option<Parsed> {
+pub(crate) fn finalize(
+    state: &mut State,
+    group: &'static str,
+    _fx: &mut Finalize<'_, '_, '_>,
+) -> Option<Parsed> {
     let (seen, parsed) = match group {
         "crate_type" => (state.crate_type, "CrateType"),
         "feature" => (state.feature, "Feature"),
@@ -217,19 +228,30 @@ pub(crate) fn finalize(state: &mut State, group: &'static str, _fx: &mut Finaliz
 }
 
 /// rustc's `AllowInternalUnsafeParser`'s check: on a function, only a proc macro may have it.
-pub(crate) fn check(group: GroupId, first: usize, fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr]) {
+pub(crate) fn check(
+    group: GroupId,
+    first: usize,
+    fx: &mut Finalize<'_, '_, '_>,
+    parsed: &[ParsedAttr],
+) {
     if let GroupId::Single(["allow_internal_unsafe"]) = group
         && matches!(fx.target(), Target::Fn)
         && !parsed.iter().any(|it| matches!(it.parsed, Parsed::ProcMacro(_)))
     {
-        let mut diag = Diag::error(None, "attribute should be applied to a macro", fx.attr_span(first));
+        let mut diag =
+            Diag::error(None, "attribute should be applied to a macro", fx.attr_span(first));
         diag.span_label(fx.target_span(), "not a macro");
         fx.emit_err(diag);
     }
 }
 
 /// `expect_name_value`, then `expect_string_literal`.
-fn name_value_str(cx: &mut Accept<'_, '_, '_>, args: &ArgParser, range: TextRange, name: Option<&str>) -> Option<String> {
+fn name_value_str(
+    cx: &mut Accept<'_, '_, '_>,
+    args: &ArgParser,
+    range: TextRange,
+    name: Option<&str>,
+) -> Option<String> {
     let nv = cx.expect_name_value(args, range, name)?;
     cx.expect_string_literal(nv)
 }
@@ -301,7 +323,8 @@ fn register_tool(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> bool {
             continue;
         };
         if ident.name == "rustc" {
-            let diag = cx.err(None, "tool `rustc` is reserved and cannot be registered", ident.range);
+            let diag =
+                cx.err(None, "tool `rustc` is reserved and cannot be registered", ident.range);
             cx.emit_err(diag);
             continue;
         }
@@ -451,7 +474,11 @@ fn rustc_test_marker(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Pa
 /// rustc's `parse_derive_like`, of `#[proc_macro_derive(Trait, attributes(a, b))]` (the trait's
 /// name mandatory) and `#[rustc_builtin_macro(Trait, attributes(..))]` (where it may be left
 /// out); a helper attribute named as a builtin attribute is linted.
-fn derive_like(cx: &mut Accept<'_, '_, '_>, args: &ArgParser, trait_name_mandatory: bool) -> Option<()> {
+fn derive_like(
+    cx: &mut Accept<'_, '_, '_>,
+    args: &ArgParser,
+    trait_name_mandatory: bool,
+) -> Option<()> {
     let Some(list) = args.as_list() else {
         if args.as_no_args().is_ok() && !trait_name_mandatory {
             return Some(());
@@ -567,13 +594,17 @@ const LINT: Template = Template {
     list: Some(&["lint1", "lint1, lint2, ...", r#"lint1, lint2, lint3, reason = "...""#]),
     one_of: &[],
     name_value_str: None,
-    docs: Some("https://doc.rust-lang.org/reference/attributes/diagnostics.html#lint-check-attributes"),
+    docs: Some(
+        "https://doc.rust-lang.org/reference/attributes/diagnostics.html#lint-check-attributes",
+    ),
 };
 
 /// `check_builtin_macro_attribute`'s: the builtin attribute macros it checks are words.
-const WORD: Template = Template { word: true, list: None, one_of: &[], name_value_str: None, docs: None };
+const WORD: Template =
+    Template { word: true, list: None, one_of: &[], name_value_str: None, docs: None };
 
-const CFG_ACCESSIBLE: Template = Template { word: false, list: Some(&["path"]), one_of: &[], name_value_str: None, docs: None };
+const CFG_ACCESSIBLE: Template =
+    Template { word: false, list: Some(&["path"]), one_of: &[], name_value_str: None, docs: None };
 
 /// `mod_file_path_from_attr`'s.
 const PATH: Template = Template {
@@ -696,13 +727,18 @@ fn unexpanded_value(
 }
 
 fn in_root_file(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> bool {
-    cx.krate.root_module(cx.db).as_source_file_id(cx.db).is_some_and(|root| attr.file == HirFileId::from(root))
+    cx.krate
+        .root_module(cx.db)
+        .as_source_file_id(cx.db)
+        .is_some_and(|root| attr.file == HirFileId::from(root))
 }
 
 /// Whether `written` is the first `#[path]` of the item `item`.
 fn first_path(item: ast::Node<'_>, written: ast::Attr<'_>) -> bool {
     let Some(item) = ast::AnyHasAttrs::cast(item) else { return false };
-    item.attrs().find(|it| it.simple_name() == Some("path")).is_some_and(|it| it.syntax() == written.syntax())
+    item.attrs()
+        .find(|it| it.simple_name() == Some("path"))
+        .is_some_and(|it| it.syntax() == written.syntax())
 }
 
 /// `cfg_accessible`'s `validate_input`.
@@ -753,7 +789,13 @@ fn compatible(template: &Template, meta: &Meta) -> bool {
 
 /// rustc's `emit_malformed_attribute` of an error: "malformed `name` attribute input", with
 /// the forms of `template` (none when there are more than 3).
-fn malformed(cx: &Cx<'_, '_>, attr: &Attr<'_>, name: &str, template: &Template, inner: bool) -> Diag {
+fn malformed(
+    cx: &Cx<'_, '_>,
+    attr: &Attr<'_>,
+    name: &str,
+    template: &Template,
+    inner: bool,
+) -> Diag {
     let span = cx.span(attr.in_file(attr.range()));
     let bang = if inner { "!" } else { "" };
     let mut suggestions = Vec::with_capacity(4);
@@ -780,8 +822,18 @@ fn malformed(cx: &Cx<'_, '_>, attr: &Attr<'_>, name: &str, template: &Template, 
     // alloc: the error's message; clone: its span, used again for the suggestions
     let mut diag = Diag::error(None, format!("malformed `{name}` attribute input"), span.clone());
     if !suggestions.is_empty() {
-        let message = if suggestions.len() == 1 { "must be of the form" } else { "the following are the possible correct uses" };
-        diag.suggestions(&span, message, suggestions, Applicability::HasPlaceholders, SuggestionStyle::ShowAlways);
+        let message = if suggestions.len() == 1 {
+            "must be of the form"
+        } else {
+            "the following are the possible correct uses"
+        };
+        diag.suggestions(
+            &span,
+            message,
+            suggestions,
+            Applicability::HasPlaceholders,
+            SuggestionStyle::ShowAlways,
+        );
     }
     if let Some(link) = template.docs {
         // alloc: the error's note
@@ -806,7 +858,15 @@ fn parse_meta<'db>(
                 bad_delim(cx, attr, tt, errors);
             }
             let tokens = flatten(tt);
-            let mut parser = MetaParser { cx, attr, edition, tokens: &tokens, at: 0, expected: SmallVec::new(), errors };
+            let mut parser = MetaParser {
+                cx,
+                attr,
+                edition,
+                tokens: &tokens,
+                at: 0,
+                expected: SmallVec::new(),
+                errors,
+            };
             parser.seq_top().map(Meta::List)
         }
         Args::NameValue(None) | Args::NameValue(Some(ast::Expr::MacroExpr(_))) => None,
@@ -831,7 +891,9 @@ fn parse_meta<'db>(
 
 /// `MetaBadDelim`: `#[path[..]]` or `#[path{..}]`.
 fn bad_delim(cx: &Cx<'_, '_>, attr: &Attr<'_>, tt: ast::TokenTree<'_>, errors: &mut Vec<Diag>) {
-    let (Some(open), Some(close)) = (tt.syntax().first_child_or_token(), tt.syntax().last_child_or_token()) else {
+    let (Some(open), Some(close)) =
+        (tt.syntax().first_child_or_token(), tt.syntax().last_child_or_token())
+    else {
         return;
     };
     let span = |range| cx.span(attr.in_file(range));
@@ -883,7 +945,11 @@ fn flatten(tt: ast::TokenTree<'_>) -> SmallVec<[Tok<'_>; 16]> {
     tokens
 }
 
-fn push_tokens<'t>(element: ast::Element<'t>, newline: &mut bool, tokens: &mut SmallVec<[Tok<'t>; 16]>) {
+fn push_tokens<'t>(
+    element: ast::Element<'t>,
+    newline: &mut bool,
+    tokens: &mut SmallVec<[Tok<'t>; 16]>,
+) {
     match element {
         NodeOrToken::Node(node) => {
             for child in node.children_with_tokens() {
@@ -1072,7 +1138,12 @@ impl<'p, 'db> MetaParser<'p, '_, 'db> {
         } else {
             is_word = true;
         }
-        Some(Item { range: TextRange::new(start, self.prev_end()), lit: false, is_word, word: None })
+        Some(Item {
+            range: TextRange::new(start, self.prev_end()),
+            lit: false,
+            is_word,
+            word: None,
+        })
     }
 
     /// `parse_paren_comma_seq` of `parse_meta_item_inner`, at its `(`: rustc's
@@ -1126,8 +1197,14 @@ impl<'p, 'db> MetaParser<'p, '_, 'db> {
         // alloc: the error's message
         let descr = self.peek().map_or_else(|| "`<eof>`".to_owned(), |it| descr(it, self.edition));
         // alloc: the error's message
-        let mut diag = Diag::error(None, format!("expected unsuffixed literal, found {descr}"), self.span(range));
-        if self.prev().is_some_and(|it| it.kind == SyntaxKind::EQ) && self.peek().is_some_and(is_ident) {
+        let mut diag = Diag::error(
+            None,
+            format!("expected unsuffixed literal, found {descr}"),
+            self.span(range),
+        );
+        if self.prev().is_some_and(|it| it.kind == SyntaxKind::EQ)
+            && self.peek().is_some_and(is_ident)
+        {
             let before = TextRange::empty(range.start());
             while self.peek().is_some_and(is_ident) {
                 self.bump();
@@ -1153,10 +1230,16 @@ impl<'p, 'db> MetaParser<'p, '_, 'db> {
         expected.dedup();
         let prev = self.prev();
         let found_span = self.span(found.range);
-        if found.kind == SyntaxKind::EQ2 && prev.is_some_and(is_ident) && expected.contains(&"`=`") {
+        if found.kind == SyntaxKind::EQ2 && prev.is_some_and(is_ident) && expected.contains(&"`=`")
+        {
             // clone: the error's span, used again for its suggestion
             let mut diag = Diag::error(None, "unexpected `==`", found_span.clone());
-            diag.suggestion_verbose(found_span, "try using `=` instead", "=", Applicability::MachineApplicable);
+            diag.suggestion_verbose(
+                found_span,
+                "try using `=` instead",
+                "=",
+                Applicability::MachineApplicable,
+            );
             return diag;
         }
         let list = stdx::list::list(expected.iter(), Join::Or, false);
@@ -1170,7 +1253,10 @@ impl<'p, 'db> MetaParser<'p, '_, 'db> {
                 // alloc: the error's label; clone: the list, also in the message
                 let short = if n > 6 { format!("{n} possible tokens") } else { list.clone() };
                 // alloc: the error's message and label
-                (format!("expected one of {list}, found {actual}"), format!("expected one of {short}"))
+                (
+                    format!("expected one of {list}, found {actual}"),
+                    format!("expected one of {short}"),
+                )
             }
         };
         // clone: the error's span, used again for its labels
@@ -1189,7 +1275,9 @@ impl<'p, 'db> MetaParser<'p, '_, 'db> {
             if is_ident(found) && !prev.text.starts_with("r#") && !found.text.starts_with("r#") {
                 // alloc: on the error path, the keyword the two identifiers might spell
                 let concat = format!("{}{}", prev.text, found.text);
-                if SyntaxKind::from_keyword(&concat, self.edition).is_some() || is_reserved_keyword(&concat, self.edition) {
+                if SyntaxKind::from_keyword(&concat, self.edition).is_some()
+                    || is_reserved_keyword(&concat, self.edition)
+                {
                     diag.suggestion_verbose(
                         self.span(TextRange::new(prev.range.start(), found.range.end())),
                         // alloc: the error's suggestion
@@ -1202,7 +1290,11 @@ impl<'p, 'db> MetaParser<'p, '_, 'db> {
         }
         match prev {
             Some(prev) if found.newline_before => {
-                let at = if expected.is_empty() { prev.range } else { TextRange::empty(prev.range.end()) };
+                let at = if expected.is_empty() {
+                    prev.range
+                } else {
+                    TextRange::empty(prev.range.end())
+                };
                 diag.span_label(self.span(at), label);
                 diag.span_label(found_span, "unexpected token");
             }
@@ -1249,7 +1341,11 @@ fn is_ident(tok: &Tok<'_>) -> bool {
 fn is_segment(tok: &Tok<'_>, edition: Edition) -> bool {
     matches!(
         tok.kind,
-        SyntaxKind::IDENT | SyntaxKind::SELF_KW | SyntaxKind::SUPER_KW | SyntaxKind::CRATE_KW | SyntaxKind::SELF_TYPE_KW
+        SyntaxKind::IDENT
+            | SyntaxKind::SELF_KW
+            | SyntaxKind::SUPER_KW
+            | SyntaxKind::CRATE_KW
+            | SyntaxKind::SELF_TYPE_KW
     ) || (tok.kind.is_any_identifier() && SyntaxKind::from_keyword(&tok.text, edition).is_none())
 }
 
@@ -1262,7 +1358,18 @@ fn is_lit(kind: SyntaxKind) -> bool {
 fn is_reserved_keyword(text: &str, edition: Edition) -> bool {
     matches!(
         text,
-        "abstract" | "become" | "box" | "do" | "final" | "macro" | "override" | "priv" | "typeof" | "unsized" | "virtual" | "yield"
+        "abstract"
+            | "become"
+            | "box"
+            | "do"
+            | "final"
+            | "macro"
+            | "override"
+            | "priv"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
     ) || (edition >= Edition::Edition2018 && text == "try")
         || (edition >= Edition::Edition2024 && text == "gen")
 }
@@ -1280,7 +1387,12 @@ enum Lit {
 
 /// `MetaItemLit::from_token_lit` of a literal token, with `report_lit_error`'s errors
 /// (`create_lit_error`).
-fn check_lit(cx: &Cx<'_, '_>, attr: &Attr<'_>, token: ast::Token<'_>, errors: &mut Vec<Diag>) -> Lit {
+fn check_lit(
+    cx: &Cx<'_, '_>,
+    attr: &Attr<'_>,
+    token: ast::Token<'_>,
+    errors: &mut Vec<Diag>,
+) -> Lit {
     let span = cx.span(attr.in_file(token.text_range()));
     let kind = token.kind();
     let text = token.text();
@@ -1290,7 +1402,11 @@ fn check_lit(cx: &Cx<'_, '_>, attr: &Attr<'_>, token: ast::Token<'_>, errors: &m
             let suffix = int.suffix();
             let symbol = &text[..text.len() - suffix.map_or(0, str::len)];
             match suffix {
-                None | Some("i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128" | "usize") => {
+                None
+                | Some(
+                    "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
+                    | "u128" | "usize",
+                ) => {
                     if int.value().is_err() {
                         errors.push(int_too_large(span, int.radix() as u32));
                         return Lit::Err;
@@ -1314,7 +1430,11 @@ fn check_lit(cx: &Cx<'_, '_>, attr: &Attr<'_>, token: ast::Token<'_>, errors: &m
                 }
             }
         }
-        SyntaxKind::STRING | SyntaxKind::BYTE_STRING | SyntaxKind::C_STRING | SyntaxKind::CHAR | SyntaxKind::BYTE => {
+        SyntaxKind::STRING
+        | SyntaxKind::BYTE_STRING
+        | SyntaxKind::C_STRING
+        | SyntaxKind::CHAR
+        | SyntaxKind::BYTE => {
             let Some(suffix) = args::suffix(text) else {
                 return if kind == SyntaxKind::STRING { Lit::Str } else { Lit::Other };
             };
@@ -1326,7 +1446,8 @@ fn check_lit(cx: &Cx<'_, '_>, attr: &Attr<'_>, token: ast::Token<'_>, errors: &m
                 _ => "byte",
             };
             // alloc: the error's message; clone: its span, used again for its label
-            let mut diag = Diag::error(None, format!("suffixes on {what} literals are invalid"), span.clone());
+            let mut diag =
+                Diag::error(None, format!("suffixes on {what} literals are invalid"), span.clone());
             // alloc: the error's label
             diag.span_label(span, format!("invalid suffix `{suffix}`"));
             errors.push(diag);
@@ -1357,11 +1478,16 @@ fn int_too_large(span: Span, radix: u32) -> Diag {
 
 /// `InvalidIntLiteralWidth`, `InvalidNumLiteralBasePrefix` or `InvalidNumLiteralSuffix`.
 fn invalid_int_suffix(span: Span, symbol: &str, suffix: &str) -> Diag {
-    let looks_like_width =
-        suffix.len() > 1 && suffix.starts_with(['i', 'u']) && suffix[1..].chars().all(|it| it.is_ascii_digit());
+    let looks_like_width = suffix.len() > 1
+        && suffix.starts_with(['i', 'u'])
+        && suffix[1..].chars().all(|it| it.is_ascii_digit());
     if looks_like_width {
         // alloc: the error's message
-        let mut diag = Diag::error(None, format!("invalid width `{}` for integer literal", &suffix[1..]), span);
+        let mut diag = Diag::error(
+            None,
+            format!("invalid width `{}` for integer literal", &suffix[1..]),
+            span,
+        );
         diag.help("valid widths are 8, 16, 32, 64 and 128");
         return diag;
     }
@@ -1369,11 +1495,17 @@ fn invalid_int_suffix(span: Span, symbol: &str, suffix: &str) -> Diag {
         // clone: the error's span, used again for its suggestion
         let mut diag = Diag::error(None, "invalid base prefix for number literal", span.clone());
         diag.note("base prefixes (`0xff`, `0b1010`, `0o755`) are lowercase");
-        diag.suggestion(span, "try making the prefix lowercase", fixed, Applicability::MaybeIncorrect);
+        diag.suggestion(
+            span,
+            "try making the prefix lowercase",
+            fixed,
+            Applicability::MaybeIncorrect,
+        );
         return diag;
     }
     // alloc: the error's message; clone: its span, used again for its label
-    let mut diag = Diag::error(None, format!("invalid suffix `{suffix}` for number literal"), span.clone());
+    let mut diag =
+        Diag::error(None, format!("invalid suffix `{suffix}` for number literal"), span.clone());
     // alloc: the error's label
     diag.span_label(span, format!("invalid suffix `{suffix}`"));
     diag.help("the suffix must be one of the numeric types (`u32`, `isize`, `f32`, etc.)");
@@ -1382,14 +1514,19 @@ fn invalid_int_suffix(span: Span, symbol: &str, suffix: &str) -> Diag {
 
 /// `InvalidFloatLiteralWidth` or `InvalidFloatLiteralSuffix`.
 fn invalid_float_suffix(span: Span, suffix: &str) -> Diag {
-    if suffix.len() > 1 && suffix.starts_with('f') && suffix[1..].chars().all(|it| it.is_ascii_digit()) {
+    if suffix.len() > 1
+        && suffix.starts_with('f')
+        && suffix[1..].chars().all(|it| it.is_ascii_digit())
+    {
         // alloc: the error's message
-        let mut diag = Diag::error(None, format!("invalid width `{}` for float literal", &suffix[1..]), span);
+        let mut diag =
+            Diag::error(None, format!("invalid width `{}` for float literal", &suffix[1..]), span);
         diag.help("valid widths are 32 and 64");
         return diag;
     }
     // alloc: the error's message; clone: its span, used again for its label
-    let mut diag = Diag::error(None, format!("invalid suffix `{suffix}` for float literal"), span.clone());
+    let mut diag =
+        Diag::error(None, format!("invalid suffix `{suffix}` for float literal"), span.clone());
     // alloc: the error's label
     diag.span_label(span, format!("invalid suffix `{suffix}`"));
     diag.help("valid suffixes are `f32` and `f64`");
@@ -1407,7 +1544,10 @@ fn fix_base_capitalisation(symbol: &str, suffix: &str) -> Option<String> {
         _ => return None,
     };
     let valid = symbol == "0"
-        && chars.filter(|it| *it != '_').take_while(|it| *it != 'i' && *it != 'u').all(|it| it.to_digit(base).is_some());
+        && chars
+            .filter(|it| *it != '_')
+            .take_while(|it| *it != 'i' && *it != 'u')
+            .all(|it| it.to_digit(base).is_some());
     // alloc: the error's suggestion
     valid.then(|| format!("0{}{}", base_char.to_ascii_lowercase(), &suffix[1..]))
 }
@@ -1425,7 +1565,10 @@ mod tests {
     fn expected_tokens_are_listed_as_rustc_lists_them() {
         assert_eq!(stdx::list::list(["`,`"], stdx::list::Join::Or, false), "`,`");
         assert_eq!(stdx::list::list(["`)`", "`,`"], stdx::list::Join::Or, false), "`)` or `,`");
-        assert_eq!(stdx::list::list(["`(`", "`,`", "`::`", "`=`"], stdx::list::Join::Or, false), "`(`, `,`, `::`, or `=`");
+        assert_eq!(
+            stdx::list::list(["`(`", "`,`", "`::`", "`=`"], stdx::list::Join::Or, false),
+            "`(`, `,`, `::`, or `=`"
+        );
     }
 
     #[test]
@@ -1460,7 +1603,8 @@ mod tests {
         assert!(!compatible(&LINT, &Meta::NameValue(true)));
         assert!(compatible(&WORD, &Meta::Word));
         assert!(!compatible(&WORD, &Meta::List(vec![word("a")])));
-        let one_of = Template { word: false, list: None, one_of: &["a"], name_value_str: None, docs: None };
+        let one_of =
+            Template { word: false, list: None, one_of: &["a"], name_value_str: None, docs: None };
         assert!(compatible(&one_of, &Meta::List(vec![word("a")])));
         assert!(!compatible(&one_of, &Meta::List(vec![word("b")])));
         assert!(compatible(&PATH, &Meta::NameValue(true)));

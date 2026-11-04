@@ -16,12 +16,12 @@ use hir_def::{
 };
 
 use blaze_hash::{Equivalent, HashMap, SharedMap};
-use std::alloc::Global;
 use rustc_abi::{TagEncoding, Variants};
 use rustc_type_ir::{
     UintTy,
     inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind},
 };
+use std::alloc::Global;
 
 use std::fmt::Write as _;
 use std::sync::Arc;

@@ -247,12 +247,7 @@ mod tests {
         let mut got = Vec::with_capacity(prefix.len() + src.len() + spare);
         got.extend_from_slice(prefix);
         copy(&mut got, src);
-        assert!(
-            got == expected,
-            "{name}: {} onto {} with {spare} spare",
-            src.len(),
-            prefix.len()
-        );
+        assert!(got == expected, "{name}: {} onto {} with {spare} spare", src.len(), prefix.len());
     }
 
     #[test]

@@ -9,10 +9,10 @@
 //! wrote. While a build runs, a level of [`FAN_IN`] files becomes one file a level up; as it
 //! ends, each of its tables becomes one file ([`plan`]).
 //!
-//! The history renames a merge's output into place, then deletes its inputs. Between the two
-//! (milliseconds) a reader's glob can see both, and count those rows twice; that race is not
-//! solved. A crash between the two leaves both until the next open deletes the inputs
-//! ([`superseded`]).
+//! The history renames a merge's output into place, then retires its inputs, which leave the
+//! disk once no reader pins them ([`super::retire`]). A reader that lists both leaves out the
+//! inputs ([`superseded`]); a crash between the two leaves both until the next open retires the
+//! inputs.
 
 use crate::schema;
 
@@ -92,7 +92,9 @@ pub(crate) struct Merge {
 pub(crate) fn plan(files: &[Name], ended: Option<u64>) -> Vec<Merge> {
     // alloc: once a flush that compacts
     let mut order: Vec<usize> = (0..files.len()).collect();
-    order.sort_unstable_by_key(|&at| (files[at].group(), files[at].first, files[at].last, files[at].level));
+    order.sort_unstable_by_key(|&at| {
+        (files[at].group(), files[at].first, files[at].last, files[at].level)
+    });
     // alloc: once a flush that compacts
     let mut merges = Vec::new();
     for group in order.chunk_by(|&a, &b| files[a].group() == files[b].group()) {
@@ -110,13 +112,15 @@ struct Item {
 
 fn plan_group(files: &[Name], group: &[usize], ended: Option<u64>, merges: &mut Vec<Merge>) {
     // alloc: a group's files, once a flush that compacts
-    let mut items: Vec<Item> = group.iter().map(|&at| Item { name: files[at], covers: vec![at] }).collect();
+    let mut items: Vec<Item> =
+        group.iter().map(|&at| Item { name: files[at], covers: vec![at] }).collect();
     // Each merge takes `FAN_IN` items and gives back one, so a group of n files merges fewer
     // than n times.
     for _ in 0..group.len() {
         let Some(level) = lowest_full(&items) else { break };
         // alloc: a merge's files, once a merge
-        let mut at: Vec<usize> = (0..items.len()).filter(|&it| items[it].name.level == level).collect();
+        let mut at: Vec<usize> =
+            (0..items.len()).filter(|&it| items[it].name.level == level).collect();
         at.sort_unstable_by_key(|&it| (items[it].name.first, items[it].name.last));
         at.truncate(FAN_IN);
         fold(&mut items, &mut at, level + 1);
@@ -160,8 +164,9 @@ fn fold(items: &mut Vec<Item>, at: &mut [usize], level: u32) {
 
 /// The files of `files` a merge already holds the rows of: of the same build and table as a
 /// merged file, of a lower level, and with their seqs inside its `first..=last`. A crash
-/// between a merge's rename and its deletes leaves them; a reader would count their rows
-/// twice. In ascending order.
+/// between a merge's rename and its retirement of them leaves them, and a reader may list them
+/// beside the merged file before they leave the disk; read, their rows would count twice. In
+/// ascending order.
 pub(crate) fn superseded(files: &[Name]) -> Vec<usize> {
     // alloc: once a history opens
     let mut order: Vec<usize> = (0..files.len()).collect();

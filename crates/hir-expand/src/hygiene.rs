@@ -27,7 +27,6 @@ use std::cell::Cell;
 use base_db::Db;
 use span::{Edition, MacroCallId, Span, SyntaxContext};
 
-
 pub use span::Transparency;
 
 /// The last few answers of a pure function of a small key, for one expansion: a `macro_rules`

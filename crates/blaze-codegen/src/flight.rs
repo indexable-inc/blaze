@@ -85,7 +85,12 @@ impl Flights {
     /// under in the memo, which `run` put there; `None` when it made none) and what the caller
     /// keeps. The landing is in the table before the run ends, so a build that waited for it
     /// or asks after takes it, and no function compiles twice while one compile of it lands.
-    pub fn ask<R>(&self, key: InstanceKey, owner: &Arc<str>, run: impl FnOnce() -> (Option<ContentId>, R)) -> Asked<R> {
+    pub fn ask<R>(
+        &self,
+        key: InstanceKey,
+        owner: &Arc<str>,
+        run: impl FnOnce() -> (Option<ContentId>, R),
+    ) -> Asked<R> {
         if let Some(shape) = self.landed.pin().get(&key) {
             return Asked::Landed(*shape);
         }
@@ -106,7 +111,10 @@ impl Flights {
                 // ended unlanded (else the look above found it).
                 let landed = self.landed.pin();
                 let kept = landed.get_or_insert(key, shape);
-                assert_eq!(*kept, shape, "flight key {key:?} landed twice, as {kept:?} and as {shape:?}");
+                assert_eq!(
+                    *kept, shape,
+                    "flight key {key:?} landed twice, as {kept:?} and as {shape:?}"
+                );
             }
             made = Some(it);
             Ok(landing)
@@ -115,7 +123,9 @@ impl Flights {
             (None, ..) => Asked::Theirs,
             (Some(_), Some(made), _) => Asked::Ran(made),
             (Some(_), None, Some(shape)) => Asked::Landed(shape),
-            (Some(_), None, None) => unreachable!("a run of flight key {key:?} that ended neither ran nor found a landing"),
+            (Some(_), None, None) => unreachable!(
+                "a run of flight key {key:?} that ended neither ran nor found a landing"
+            ),
         }
     }
 
@@ -125,7 +135,11 @@ impl Flights {
     /// what `named` writes, given the name of the build that runs it, and the job that runs it;
     /// a wait that would close a cycle of jobs gives way, unwinding with [`Cancelled`], so the
     /// task is posted again.
-    pub fn wait(&self, key: InstanceKey, mut named: impl FnMut(&mut String, &str)) -> Option<ContentId> {
+    pub fn wait(
+        &self,
+        key: InstanceKey,
+        mut named: impl FnMut(&mut String, &str),
+    ) -> Option<ContentId> {
         if let Some(shape) = self.landed.pin().get(&key) {
             return Some(*shape);
         }
@@ -134,7 +148,10 @@ impl Flights {
             named(it, running.get(&key).map_or("a build whose run of it ended", |owner| &**owner));
         };
         // No run under way: it ended, and its landing (or none) is in the table.
-        match self.runs.get_or_run_named(run_key(key), named, || Ok(self.landed.pin().get(&key).copied())) {
+        match self
+            .runs
+            .get_or_run_named(run_key(key), named, || Ok(self.landed.pin().get(&key).copied()))
+        {
             Ok(landing) => landing,
             // alloc: a give-way's payload, once per task that gives way
             Err(Cancelled) => std::panic::resume_unwind(Box::new(Cancelled)),
@@ -175,7 +192,9 @@ impl Flights {
     /// [`Flights::keep_summary`] of each of `made`: the keys of those refused.
     pub fn keep_summaries(&self, made: Vec<(InstanceKey, Summary)>) -> Vec<InstanceKey> {
         // alloc: per batch of summaries, sized by those refused
-        made.into_iter().filter_map(|(key, summary)| (!self.keep_summary(key, summary)).then_some(key)).collect()
+        made.into_iter()
+            .filter_map(|(key, summary)| (!self.keep_summary(key, summary)).then_some(key))
+            .collect()
     }
 
     /// The summary kept under each of `keys`, landed: `None` for one no build kept.
@@ -261,7 +280,10 @@ impl Plan {
     /// A plan of `len` items, each to be asked for first.
     pub fn new(len: usize) -> Plan {
         // alloc: per batch of store misses, sized by it
-        Plan { steps: vec![(Step::Asking, 0); len], decisions: (0..len).map(Decision::Ask).collect() }
+        Plan {
+            steps: vec![(Step::Asking, 0); len],
+            decisions: (0..len).map(Decision::Ask).collect(),
+        }
     }
 
     /// What to do next, in the order decided; empty once every item is done.

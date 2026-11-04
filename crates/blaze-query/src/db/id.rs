@@ -48,7 +48,9 @@ impl Id {
         match u32::try_from(word).ok().and_then(Id::new) {
             Some(id) => Ok(id),
             None if word == 0 => Err(FormatError::Zero { at, what }),
-            None => Err(FormatError::Bound { at, what, found: word, bound: u64::from(Id::MAX_U32) }),
+            None => {
+                Err(FormatError::Bound { at, what, found: word, bound: u64::from(Id::MAX_U32) })
+            }
         }
     }
 
@@ -79,7 +81,10 @@ impl Id {
     /// `MAX_PAGES` places indexed by it ([`super::dense::Whole`]) checks nothing at run time.
     #[inline]
     pub(crate) const fn page(self) -> usize {
-        debug_assert!(self.0.get() <= Id::MAX_U32, "an `Id` above `Id::MAX_U32`, which `Id::new` refuses");
+        debug_assert!(
+            self.0.get() <= Id::MAX_U32,
+            "an `Id` above `Id::MAX_U32`, which `Id::new` refuses"
+        );
         (self.0.get() >> PAGE_BITS) as usize & (MAX_PAGES - 1)
     }
 

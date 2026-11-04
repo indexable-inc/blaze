@@ -89,11 +89,8 @@ impl<'a> ClauseExtractor<'a> {
                 }
             }
 
-            MoveRegionsToHrtb {
-                binder_depth: DeBruijnId::zero(),
-                scope_regions,
-            }
-            .visit(&mut trait_.skip_binder);
+            MoveRegionsToHrtb { binder_depth: DeBruijnId::zero(), scope_regions }
+                .visit(&mut trait_.skip_binder);
         }
 
         let trait_ = trait_.move_from_under_binders(self.binder_stack.depth())?;

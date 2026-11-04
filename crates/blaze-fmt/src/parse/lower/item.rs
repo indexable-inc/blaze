@@ -274,11 +274,7 @@ impl Lower<'_> {
         }
     }
 
-    fn safety(
-        &self,
-        unsafe_: Option<ra::Token<'_>>,
-        safe: Option<ra::Token<'_>>,
-    ) -> ast::Safety {
+    fn safety(&self, unsafe_: Option<ra::Token<'_>>, safe: Option<ra::Token<'_>>) -> ast::Safety {
         match (unsafe_, safe) {
             (Some(u), _) => ast::Safety::Unsafe(self.tsp(u)),
             (None, Some(s)) => ast::Safety::Safe(self.tsp(s)),
@@ -317,9 +313,7 @@ impl Lower<'_> {
         let span = self.nsp(node);
         let ident = self.item_name(f.name(), span);
         let params = f.param_list();
-        let params_span = params
-            .map(|p| self.nsp(p.syntax()))
-            .unwrap_or(ident.span);
+        let params_span = params.map(|p| self.nsp(p.syntax())).unwrap_or(ident.span);
         let decl = self.fn_decl(params, f.ret_type(), span);
         let decl_end = match &decl.output {
             ast::FnRetTy::Ty(ty) => ty.span,

@@ -61,9 +61,15 @@ fn identity() -> ProcMacro {
     let db = built.db();
     let krate = *all_crates(db)
         .iter()
-        .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "proc_macros"))
+        .find(|it| {
+            it.extra_data(db)
+                .display_name
+                .as_ref()
+                .is_some_and(|it| it.crate_name().as_str() == "proc_macros")
+        })
         .expect("the fixture has the proc macros' crate");
-    let loaded = ProcMacros::get_for_crate(db, krate).expect("the proc macros' crate has its macros");
+    let loaded =
+        ProcMacros::get_for_crate(db, krate).expect("the proc macros' crate has its macros");
     loaded.macros().expect("they loaded")[0].clone() // clone: a test's macro, once per fixture
 }
 
@@ -74,7 +80,10 @@ fn give_query_macros(built: &mut Fixture) {
     let krate = *all_crates(db)
         .iter()
         .find(|it| {
-            it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "blaze_query_macros")
+            it.extra_data(db)
+                .display_name
+                .as_ref()
+                .is_some_and(|it| it.crate_name().as_str() == "blaze_query_macros")
         })
         .expect("the fixture has `blaze_query_macros`");
     let macros = ["tracked", "input", "interned"]
@@ -181,6 +190,12 @@ pub fn by_macro(db: &Db, cache: &Cache) -> u32 {
     let out = lint_given(&fixture, flags, Conf::default(), give_query_macros);
     assert_marked(&out, &source, flags);
     assert!(out.contains("the lock guard `guard` (`"), "the guard is named with its type:\n{out}");
-    assert!(out.contains("held across the query `width` (made by `#[blaze_query::tracked]`)"), "{out}");
-    assert!(out.contains("held across the query `infer` (a method of `HirDatabase` on the database)"), "{out}");
+    assert!(
+        out.contains("held across the query `width` (made by `#[blaze_query::tracked]`)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("held across the query `infer` (a method of `HirDatabase` on the database)"),
+        "{out}"
+    );
 }

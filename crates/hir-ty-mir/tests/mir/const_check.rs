@@ -8,14 +8,15 @@ use hir_def::{
     AssocItemId, DefWithBodyId,
     expr_store::{Body, ExpressionStore},
 };
+use hir_expand::fixture;
 use hir_ty::InferenceResult;
 use hir_ty_mir::mir::{
     MirSpan,
     const_check::{
-        ClosureNote, ConstCheckDiagnostic, ConstCheckKind, Desugaring, anon_const_check, const_check,
+        ClosureNote, ConstCheckDiagnostic, ConstCheckKind, Desugaring, anon_const_check,
+        const_check,
     },
 };
-use hir_expand::fixture;
 
 use crate::{constant, db::TestDB, function};
 
@@ -63,7 +64,9 @@ fn check_anon_consts(minicore: &str, src: &str, name: &str) -> Vec<(ConstCheckDi
         for &konst in InferenceResult::of(&db, func).defined_anon_consts() {
             let map = ExpressionStore::with_source_map(&db, konst.loc(&db).owner).1;
             for it in &anon_const_check(&db, konst).diagnostics {
-                let MirSpan::ExprId(expr) = it.span else { panic!("a span of no expression: {:?}", it.span) };
+                let MirSpan::ExprId(expr) = it.span else {
+                    panic!("a span of no expression: {:?}", it.span)
+                };
                 let range = map.expr_syntax(expr).expect("written syntax").value.text_range();
                 let text = src[usize::from(range.start())..usize::from(range.end())].to_owned();
                 found.push((it.clone(), text));
@@ -83,7 +86,11 @@ fn a_non_const_call_in_an_array_length_is_refused() {
     assert_eq!(at, "f(2)");
     assert_eq!(refused.code, "E0015");
     assert!(matches!(refused.kind, ConstCheckKind::NonConstFn { conditionally: false, .. }));
-    assert!(refused.message.contains("`f`") && refused.message.contains("constants"), "{}", refused.message);
+    assert!(
+        refused.message.contains("`f`") && refused.message.contains("constants"),
+        "{}",
+        refused.message
+    );
     let callable = src.replace("fn f", "const fn f");
     assert_eq!(reported(&check_anon_consts("sized", &callable, "main")), NONE);
 }
@@ -238,7 +245,11 @@ impl const T for S {
     let found = check("sized", src, impl_method("foo"));
     assert_eq!(
         reported(&found),
-        [("E0015", "cannot call non-const function `non_const` in constant functions", "non_const()")]
+        [(
+            "E0015",
+            "cannot call non-const function `non_const` in constant functions",
+            "non_const()"
+        )]
     );
 }
 
@@ -288,8 +299,9 @@ mod Y {
 
 static foo: &Y::X = &*Y::foo(Y::x as *const Y::X);
 ";
-    let found =
-        check("sized", src, |db| hir_def::test_items::static_item(db, fixture::test_crate(&db), "foo").into());
+    let found = check("sized", src, |db| {
+        hir_def::test_items::static_item(db, fixture::test_crate(&db), "foo").into()
+    });
     assert_eq!(
         reported(&found),
         [(
@@ -313,7 +325,11 @@ const fn outer() {
     let found = check("sized", src, func("outer"));
     assert_eq!(
         reported(&found),
-        [("E0015", "cannot call non-const function `outer::inner` in constant functions", "inner()")]
+        [(
+            "E0015",
+            "cannot call non-const function `outer::inner` in constant functions",
+            "inner()"
+        )]
     );
 }
 
@@ -345,7 +361,11 @@ const fn by_own() {
     let by_own = check("sized", src, func("by_own"));
     assert_eq!(
         reported(&by_own),
-        [("E0015", "cannot call non-const function `g::<u16>` in constant functions", "g::<u16>()")]
+        [(
+            "E0015",
+            "cannot call non-const function `g::<u16>` in constant functions",
+            "g::<u16>()"
+        )]
     );
 }
 
@@ -495,8 +515,7 @@ mod non_const_fallback {
 #[test]
 fn an_exposed_const_fn_may_not_use_a_local_feature() {
     let found = check("sized", UNSTABLE_INTRINSIC, func("const_main"));
-    let message =
-        "const function that might be (indirectly) exposed to stable cannot use `#[feature(local)]`";
+    let message = "const function that might be (indirectly) exposed to stable cannot use `#[feature(local)]`";
     assert_eq!(
         reported(&found),
         [("", message, "size_of_val(&x)"), ("", message, "align_of_val(&x)")]

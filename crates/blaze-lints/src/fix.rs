@@ -34,13 +34,29 @@ pub struct Fixed {
 pub enum FixError {
     Check(diag::CheckError),
     /// The fixes left the crate with an error it did not have; the texts are as they were.
-    Broke { at: String, error: String, by: Vec<String> },
+    Broke {
+        at: String,
+        error: String,
+        by: Vec<String>,
+    },
     /// Fixes still rewriting the same text after the last pass.
-    Conflict { at: String, first: String, second: String },
+    Conflict {
+        at: String,
+        first: String,
+        second: String,
+    },
     /// Findings with a fix still there after the last pass.
-    Unsettled { at: String, lint: String, message: String },
+    Unsettled {
+        at: String,
+        lint: String,
+        message: String,
+    },
     /// A fix the file's text refuses (outside it, or splitting a character).
-    Splice { at: String, lint: String, why: String },
+    Splice {
+        at: String,
+        lint: String,
+        why: String,
+    },
 }
 
 impl std::fmt::Display for FixError {
@@ -48,15 +64,24 @@ impl std::fmt::Display for FixError {
         match self {
             FixError::Check(it) => it.fmt(f),
             FixError::Broke { at, error, by } => {
-                write!(f, "{at}: the fixes of {} leave the error `{error}`, so none is made", by.join(", "))
+                write!(
+                    f,
+                    "{at}: the fixes of {} leave the error `{error}`, so none is made",
+                    by.join(", ")
+                )
             }
             FixError::Conflict { at, first, second } => {
-                write!(f, "{at}: the fixes of `{first}` and `{second}` rewrite the same text after {PASSES} passes")
+                write!(
+                    f,
+                    "{at}: the fixes of `{first}` and `{second}` rewrite the same text after {PASSES} passes"
+                )
             }
             FixError::Unsettled { at, lint, message } => {
                 write!(f, "{at}: `{lint}` still has a fix for `{message}` after {PASSES} passes")
             }
-            FixError::Splice { at, lint, why } => write!(f, "{at}: the fix of `{lint}` can't be made: {why}"),
+            FixError::Splice { at, lint, why } => {
+                write!(f, "{at}: the fix of `{lint}` can't be made: {why}")
+            }
         }
     }
 }
@@ -77,10 +102,16 @@ struct Planned<'f> {
 }
 
 /// Makes the fixes of `krate`'s findings in its files, setting the new texts in `db`.
-pub fn fix(db: &mut Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -> Result<Fixed, FixError> {
+pub fn fix(
+    db: &mut Db,
+    krate: hir::Crate,
+    setup: &Setup,
+    name_of: NameOf<'_>,
+) -> Result<Fixed, FixError> {
     let files = files_of(db, krate, name_of);
     let before = errors(db, krate, &files);
-    let originals: Vec<(FileId, String)> = files.values().map(|&(file, _)| (file, db.file_text(file).text(db).to_string())).collect();
+    let originals: Vec<(FileId, String)> =
+        files.values().map(|&(file, _)| (file, db.file_text(file).text(db).to_string())).collect();
     let mut by: BTreeSet<String> = BTreeSet::new();
     let mut changed: BTreeMap<FileId, String> = BTreeMap::new();
     let mut applied = 0;
@@ -100,7 +131,15 @@ pub fn fix(db: &mut Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -
             }
         }
         if planned.is_empty() {
-            return settled(db, krate, &files, &before, &originals, by, Fixed { files: changed.into_iter().collect(), applied, passes: pass });
+            return settled(
+                db,
+                krate,
+                &files,
+                &before,
+                &originals,
+                by,
+                Fixed { files: changed.into_iter().collect(), applied, passes: pass },
+            );
         }
         let edition = krate.edition(db);
         let mut made = Vec::with_capacity(planned.len());
@@ -111,7 +150,9 @@ pub fn fix(db: &mut Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -
             for fix in &fixes {
                 let clash = taken.iter().find(|it| overlaps(&it.parts, &fix.parts));
                 match clash {
-                    Some(it) => conflict = Some((it.at.clone(), it.lint.to_owned(), fix.lint.to_owned())),
+                    Some(it) => {
+                        conflict = Some((it.at.clone(), it.lint.to_owned(), fix.lint.to_owned()))
+                    }
                     None => {
                         by.insert(fix.lint.to_owned());
                         taken.push(fix);
@@ -122,11 +163,14 @@ pub fn fix(db: &mut Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -
             let parse = id.parse(db).clone(); // clone: two `Arc` counts, the working copy's
             let text = db.file_text(file);
             let appended = text.appended_root_module(db);
-            let name = files.values().find(|(it, _)| *it == file).map_or("", |(_, name)| name.as_str());
+            let name =
+                files.values().find(|(it, _)| *it == file).map_or("", |(_, name)| name.as_str());
             let end = text.text(db).len() - appended.map_or(0, str::len);
             let mut working = Working::new(name, edition, end, parse);
-            let mut parts: Vec<(TextRange, &str, &Planned<'_>)> =
-                taken.iter().flat_map(|fix| fix.parts.iter().map(move |&(range, text)| (range, text, *fix))).collect();
+            let mut parts: Vec<(TextRange, &str, &Planned<'_>)> = taken
+                .iter()
+                .flat_map(|fix| fix.parts.iter().map(move |&(range, text)| (range, text, *fix)))
+                .collect();
             parts.sort_by_key(|&(range, ..)| std::cmp::Reverse((range.start(), range.end())));
             for (range, text, fix) in parts {
                 working.splice(range, text.to_owned()).map_err(|why| FixError::Splice {
@@ -145,7 +189,11 @@ pub fn fix(db: &mut Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -
             for (file, appended, working) in &made {
                 if working.parse.errors().is_empty() {
                     let content = FileText::content_of(working.bytes(), *appended);
-                    EditionedFileId::new(db, *file, edition).seed_parse(db, content, &working.parse);
+                    EditionedFileId::new(db, *file, edition).seed_parse(
+                        db,
+                        content,
+                        &working.parse,
+                    );
                 }
             }
         });
@@ -159,7 +207,15 @@ pub fn fix(db: &mut Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -
     }
     let left = found.iter().map(|it| &it.diagnostic).find(|it| machine_fix(it).is_some());
     match left {
-        None => settled(db, krate, &files, &before, &originals, by, Fixed { files: changed.into_iter().collect(), applied, passes: PASSES }),
+        None => settled(
+            db,
+            krate,
+            &files,
+            &before,
+            &originals,
+            by,
+            Fixed { files: changed.into_iter().collect(), applied, passes: PASSES },
+        ),
         Some(diagnostic) => Err(FixError::Unsettled {
             at: at_of(db, &files, diagnostic.span.primary.first()),
             lint: diagnostic.lint_name().unwrap_or("").to_owned(),
@@ -180,7 +236,9 @@ fn machine_fix(diagnostic: &Diag) -> Option<Vec<(TextRange, &str)>> {
         .find_map(|it| it.substitutions.first())?;
     let mut parts: Vec<_> = substitution
         .iter()
-        .map(|(span, text)| (TextRange::new(TextSize::new(span.lo), TextSize::new(span.hi)), text.as_str()))
+        .map(|(span, text)| {
+            (TextRange::new(TextSize::new(span.lo), TextSize::new(span.hi)), text.as_str())
+        })
         .collect();
     parts.sort_by_key(|&(range, _)| (range.start(), range.end()));
     (!parts.is_empty()).then_some(parts)
@@ -238,14 +296,22 @@ fn settled(
 
 /// The crate's errors as rustc gives them, each keyed by its code and message, which a fix
 /// elsewhere in the file does not change.
-fn errors(db: &Db, krate: hir::Crate, files: &BTreeMap<String, (FileId, String)>) -> Vec<(String, Diag)> {
-    let paths: std::collections::HashMap<FileId, String> = files.values().map(|(file, name)| (*file, name.clone())).collect();
+fn errors(
+    db: &Db,
+    krate: hir::Crate,
+    files: &BTreeMap<String, (FileId, String)>,
+) -> Vec<(String, Diag)> {
+    let paths: std::collections::HashMap<FileId, String> =
+        files.values().map(|(file, name)| (*file, name.clone())).collect();
     let options = blaze_diagnostics::check::Options::default();
     blaze_diagnostics::check_crate(db, krate, blaze_diagnostics::Files::new(&paths, ""), &options)
         .into_iter()
         // The closing "aborting due to N previous errors; M warnings emitted" counts the others,
         // so a fix that only changes a warning would read as a new error.
-        .filter(|it| it.level == Level::Error && !(it.code.is_none() && it.message.starts_with("aborting due to ")))
+        .filter(|it| {
+            it.level == Level::Error
+                && !(it.code.is_none() && it.message.starts_with("aborting due to "))
+        })
         .map(|it| {
             let code = match &it.code {
                 Some(Code::Error(code) | Code::Lint(code)) => code.as_str(),
