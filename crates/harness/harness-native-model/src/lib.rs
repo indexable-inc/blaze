@@ -257,6 +257,8 @@ pub enum Msg {
     Runs(Vec<serde_json::Value>),
     /// A page of older runs (`runs` with `before`), and whether it was a full page (more may be older).
     RunsPage { runs: Vec<serde_json::Value>, full: bool },
+    /// Runs from all of history matching a search (`runs` with `q`, the palette's): added like a page, paging untouched.
+    RunsFound(Vec<serde_json::Value>),
     /// Output of run `r{run}` (of its stage `stage`, or the caller-visible streams), as `run_read` returned it.
     RunData { run: u64, stage: Option<u32>, err: bool, bytes: Vec<u8> },
 }
@@ -455,6 +457,7 @@ fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms): &(Terms
             reconcile_runs(w, dev, idx, &runs, true);
             w.set(History { loading: false, exhausted: !full });
         }
+        Msg::RunsFound(runs) => reconcile_runs(w, dev, idx, &runs, true),
         Msg::RunData { run, stage, err, bytes } => {
             let ent = match stage {
                 Some(k) => idx.stages.get(&(run, k)),

@@ -62,7 +62,20 @@ enum Do {
 struct Palette {
     query: String,
     at: usize,
+    /// The query history was last searched for, and when (the app's clock) the query last changed: the daemon is asked
+    /// once typing has paused for [`PALETTE_DEBOUNCE`].
+    searched: String,
+    changed: f32,
 }
+
+impl Palette {
+    fn new() -> Self {
+        Self { query: String::new(), at: 0, searched: String::new(), changed: 0.0 }
+    }
+}
+
+/// How long typing in the palette pauses before older history is searched (seconds).
+const PALETTE_DEBOUNCE: f32 = 0.2;
 
 /// The view's fixed nodes, by entity id.
 struct Ids {
@@ -928,6 +941,23 @@ impl App {
             };
             out.push((format!("arc{e}"), kind_glyph(model::kind_name(o)), name, "archived".into(), Do::Archived(e)));
         }
+        // While searching, every run the world holds that is not listed yet (in the tree, or found in older history by
+        // the daemon's search), newest first.
+        let q = self.palette.as_ref().map(|p| p.query.trim().to_lowercase()).unwrap_or_default();
+        if !q.is_empty() {
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            self.world.new_query::<&model::Run>().each_entity(|e, r| {
+                if !e.has(model::Archived::id()) {
+                    runs.push((r.n, *e.id()));
+                }
+            });
+            runs.sort_unstable_by(|a, b| b.cmp(a));
+            for (n, e) in runs {
+                let o = w.entity_from_id(e);
+                let cmd = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                out.push((format!("run{e}"), kind_glyph("proc"), format!("r{n}  {cmd}"), "run".into(), Do::Select(e)));
+            }
+        }
         out.push(("kill".into(), "\u{2715}", "Kill current object".into(), "\u{2318}W".into(), Do::Kill));
         out.push(("zoom-in".into(), "+", "Zoom in".into(), "\u{2318}=".into(), Do::Zoom(1)));
         out.push(("zoom-out".into(), "\u{2212}", "Zoom out".into(), "\u{2318}\u{2212}".into(), Do::Zoom(-1)));
@@ -937,6 +967,23 @@ impl App {
     }
 
     fn sync_palette(&mut self) {
+        // Older history than the world holds: once typing pauses, the daemon searches every run; what it finds joins the
+        // world (as a page would) and so the palette's entries.
+        let (time, mut wait) = (self.time, false);
+        if let Some(p) = self.palette.as_mut() {
+            let q = p.query.trim().to_owned();
+            if q != p.searched {
+                if q.chars().count() >= 2 && time - p.changed >= PALETTE_DEBOUNCE {
+                    self.link.runs_search(&q);
+                    p.searched = q;
+                } else {
+                    wait = true;
+                }
+            }
+        }
+        if wait {
+            self.poke();
+        }
         let w = self.world.world_ref();
         match (&self.palette, self.ids.palette) {
             (None, Some(id)) => {
@@ -1408,12 +1455,14 @@ impl App {
             51 => {
                 p.query.pop();
                 p.at = 0;
+                p.changed = self.time;
             }
             _ => {
                 let typed: String = chars.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect();
                 if !typed.is_empty() {
                     p.query.push_str(&typed);
                     p.at = 0;
+                    p.changed = self.time;
                 }
             }
         }
@@ -1444,7 +1493,7 @@ impl App {
             ("w", false) => self.kill(),
             ("s", false) => self.toggle_sidebar(),
             ("k", false) => {
-                self.palette = if self.palette.is_some() { None } else { Some(Palette { query: String::new(), at: 0 }) };
+                self.palette = if self.palette.is_some() { None } else { Some(Palette::new()) };
             }
             ("=", _) | ("+", _) => self.step_zoom(1),
             ("-", _) | ("_", _) => self.step_zoom(-1),
@@ -1547,7 +1596,17 @@ impl App {
 
     /// Open the palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE`).
     pub fn open_palette(&mut self) {
-        self.palette = Some(Palette { query: String::new(), at: 0 });
+        self.palette = Some(Palette::new());
+        self.poke();
+    }
+
+    /// Type `q` into the open palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE=<query>`).
+    pub fn palette_query(&mut self, q: &str) {
+        let time = self.time;
+        if let Some(p) = self.palette.as_mut() {
+            p.query = q.to_owned();
+            p.changed = time;
+        }
         self.poke();
     }
 }

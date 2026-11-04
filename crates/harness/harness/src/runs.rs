@@ -47,8 +47,9 @@ pub enum RunReq {
         repl: Option<String>,
     },
     RunStatus { id: String },
-    /// The newest runs (of `session`), up to `limit`; with `before`, only runs numbered below it (the next page back).
-    Runs { session: Option<u64>, limit: Option<usize>, before: Option<u64> },
+    /// The newest runs (of `session`), up to `limit`; with `before`, only runs numbered below it (the next page back);
+    /// with `q`, only runs whose command or id (`r12`) holds it, case-insensitively (a search over all history).
+    Runs { session: Option<u64>, limit: Option<usize>, before: Option<u64>, q: Option<String> },
     /// stage: None reads the caller-visible streams (out = "final" stdout, err = final.err).
     RunRead {
         id: String,
@@ -628,7 +629,8 @@ fn descendants(root: u32) -> Vec<Value> {
 
 /// Each run's meta as `status` gives it; a REPL's run (no session) also gets `owner`, the session its REPL's cells
 /// were posted under, when the index knows one.
-fn list(session: Option<u64>, limit: usize, before: Option<u64>) -> Result<Value> {
+fn list(session: Option<u64>, limit: usize, before: Option<u64>, q: Option<&str>) -> Result<Value> {
+    let q = q.map(str::trim).filter(|q| !q.is_empty()).map(str::to_lowercase);
     let mut ids: Vec<u64> = std::fs::read_dir(dir())
         .into_iter()
         .flatten()
@@ -646,6 +648,12 @@ fn list(session: Option<u64>, limit: usize, before: Option<u64>) -> Result<Value
         let id = format!("r{n}");
         let Ok(m) = status(&id, false) else { continue };
         if session.is_some() && m["session"].as_u64() != session {
+            continue;
+        }
+        if let Some(q) = &q
+            && id != *q
+            && !m["cmd"].as_str().is_some_and(|c| c.to_lowercase().contains(q.as_str()))
+        {
             continue;
         }
         let mut m = m;
@@ -897,7 +905,7 @@ pub fn handle(req: RunReq) -> Result<Value> {
         }
         RunReq::RunStdin { id, data, close } => write_stdin(&id, data.as_deref(), close),
         RunReq::RunStatus { id } => status(&id, true),
-        RunReq::Runs { session, limit, before } => list(session, limit.unwrap_or(50), before),
+        RunReq::Runs { session, limit, before, q } => list(session, limit.unwrap_or(50), before, q.as_deref()),
         RunReq::RunRead { id, stage, stream, offset, max_bytes, wait_ms } => {
             read(&id, stage, &stream, offset, max_bytes.unwrap_or(1 << 20).min(16 << 20), wait_ms.min(60_000))
         }

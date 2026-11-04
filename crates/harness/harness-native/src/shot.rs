@@ -24,8 +24,12 @@ pub fn run(path: &str) -> Result<(), String> {
     }
     // A title-bar strip as tall as AppKit's (Tahoe's, 32 points), so the shot lays the window out as the window does.
     app.set_chrome(crate::app::Chrome { strip: 32.0, title_x: 0.0 });
-    if std::env::var_os("HARNESS_NATIVE_SHOT_PALETTE").is_some() {
+    // `1` opens the palette empty; anything else opens it with that query typed.
+    if let Ok(q) = std::env::var("HARNESS_NATIVE_SHOT_PALETTE") {
         app.open_palette();
+        if q != "1" {
+            app.palette_query(&q);
+        }
     }
     // A session id, a run (`r12`) or one of its stages (`r12.0`).
     if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {
