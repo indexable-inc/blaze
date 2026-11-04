@@ -122,6 +122,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
 
     let mut text_edits = Vec::new();
     let mut expansions = Vec::new();
+    let mut contexts = Contexts::default();
     // A fixture that is itself mid-edit (`bar.;`) hands its errors on to what expands it.
     let source_parses =
         syntax::SourceFile::parse(&source_file.syntax().to_string(), Edition::CURRENT)
@@ -176,6 +177,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
             SpanMap::ExpansionSpanMap(token_map),
             show_spans,
             show_ctxt,
+            &mut contexts,
         );
         let indent = indent_of(call.syntax());
         let pp = reindent(indent, pp);
@@ -234,6 +236,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
                 src.file_id.span_map(&db),
                 show_spans,
                 show_ctxt,
+                &mut contexts,
             );
             format_to!(expanded_text, "\n{}", pp)
         }
@@ -249,6 +252,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
                 HirFileId::from(macro_file).span_map(&db),
                 false,
                 false,
+                &mut contexts,
             );
             format_to!(expanded_text, "\n{}", pp)
         }
@@ -267,6 +271,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
                 HirFileId::from(macro_file).span_map(&db),
                 false,
                 false,
+                &mut contexts,
             );
             format_to!(expanded_text, "\n{}", pp)
         }
@@ -357,11 +362,29 @@ fn indent_of(node: ast::Node<'_>) -> IndentLevel {
     IndentLevel(0)
 }
 
+/// The syntax contexts a test's expansions print, each non-root one labelled `C0`, `C1`, .. in
+/// the order it is first printed. A context's number is its place in interning order (its
+/// ingredient's ID page), which anything interned before it moves; which tokens share a
+/// context is what an expectation holds.
+#[derive(Default)]
+struct Contexts(blaze_hash::HashMap<SyntaxContext, usize, std::alloc::Global>);
+
+impl Contexts {
+    fn label(&mut self, ctx: SyntaxContext) -> String {
+        if ctx.is_root() {
+            return ctx.to_string();
+        }
+        let next = self.0.len();
+        format!("C{}", self.0.entry(ctx).or_insert(next))
+    }
+}
+
 fn pretty_print_macro_expansion(
     expn: ast::Node<'_>,
     map: SpanMap<'_>,
     show_spans: bool,
     show_ctxt: bool,
+    contexts: &mut Contexts,
 ) -> String {
     let mut res = String::new();
     let mut prev_kind = EOF;
@@ -419,9 +442,13 @@ fn pretty_print_macro_expansion(
             let span = map.span_for_range(token.text_range());
             format_to!(res, "#");
             if show_spans {
-                format_to!(res, "{span}",);
+                // `Span`'s own text, which ends in its context's, with the context's label.
+                let text = span.to_string();
+                let ctx = span.ctx.to_string();
+                let at = text.strip_suffix(&ctx).expect("a span's text ends in its context's");
+                format_to!(res, "{at}{}", contexts.label(span.ctx));
             } else if show_ctxt {
-                format_to!(res, "\\{}", span.ctx);
+                format_to!(res, "\\{}", contexts.label(span.ctx));
             }
             format_to!(res, "#");
         }

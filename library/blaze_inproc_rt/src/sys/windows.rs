@@ -49,7 +49,7 @@ use windows_sys::Win32::System::Threading::{
     TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, WaitOnAddress, WakeByAddressAll,
 };
 
-pub(crate) use pipe::{Listener, Stream, connect};
+pub use pipe::{Listener, Stream, connect};
 
 use super::Rights;
 use crate::channel::Channel;
@@ -66,7 +66,7 @@ fn os(what: impl std::fmt::Display) -> Error {
     Error::new(format!("Windows: {what}: {}", std::io::Error::last_os_error()))
 }
 
-pub(crate) fn page() -> u64 {
+pub fn page() -> u64 {
     static PAGE: OnceLock<u64> = OnceLock::new();
     *PAGE.get_or_init(|| {
         let mut info = SYSTEM_INFO::default();
@@ -78,11 +78,11 @@ pub(crate) fn page() -> u64 {
 
 /// x86-64 keeps instruction fetch coherent with stores from any processor: a thread that
 /// serializes after a store runs what was stored.
-pub(crate) fn check_icache() -> Result<(), Error> {
+pub fn check_icache() -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn random(out: &mut [u8; 16]) -> Result<(), Error> {
+pub fn random(out: &mut [u8; 16]) -> Result<(), Error> {
     // SAFETY: ProcessPrng writes exactly `out.len()` bytes into `out`.
     if unsafe { ProcessPrng(out.as_mut_ptr(), out.len()) } == 0 {
         return Err(os("ProcessPrng"));
@@ -164,13 +164,13 @@ fn map_view(
 /// A pagefile-backed section, zero when made. Its pages are committed with it (`SEC_COMMIT`:
 /// charged against the commit limit, given memory only once touched), so every view of it is
 /// readable everywhere with no commit step in between.
-pub(crate) struct Object {
+pub struct Object {
     section: OwnedHandle,
     len: u64,
 }
 
 impl Object {
-    pub(crate) fn create(name: &str, len: u64) -> Result<Object, Error> {
+    pub fn create(name: &str, len: u64) -> Result<Object, Error> {
         // SAFETY: a section backed by the paging file (`INVALID_HANDLE_VALUE`), unnamed, with the
         // default security; every argument is a value or null.
         let section = unsafe {
@@ -190,17 +190,17 @@ impl Object {
         Ok(Object { section: unsafe { OwnedHandle::from_raw_handle(section) }, len })
     }
 
-    pub(crate) fn len(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         self.len
     }
 
-    pub(crate) fn duplicate(&self) -> Result<Object, Error> {
+    pub fn duplicate(&self) -> Result<Object, Error> {
         let section =
             self.section.try_clone().map_err(|it| Error::new(format!("Windows: DuplicateHandle of a section: {it}")))?;
         Ok(Object { section, len: self.len })
     }
 
-    pub(crate) fn map_here(&self, access: Access) -> Result<View, Error> {
+    pub fn map_here(&self, access: Access) -> Result<View, Error> {
         let len = usize::try_from(self.len).map_err(|_| Error::new(format!("a view of {:#x} bytes", self.len)))?;
         // SAFETY: GetCurrentProcess returns a pseudo-handle, valid always.
         let at = map_view(self.section.as_raw_handle(), unsafe { GetCurrentProcess() }, 0, self.len, 0, 0, access)?;
@@ -209,18 +209,18 @@ impl Object {
 }
 
 /// A view in this process, unmapped when dropped.
-pub(crate) struct View {
+pub struct View {
     at: u64,
     len: usize,
     writable: bool,
 }
 
 impl View {
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 
-    pub(crate) fn address(&self) -> u64 {
+    pub fn address(&self) -> u64 {
         self.at
     }
 
@@ -231,7 +231,7 @@ impl View {
         Ok(())
     }
 
-    pub(crate) fn bytes(&self, range: Range<usize>) -> Result<&[u8], Error> {
+    pub fn bytes(&self, range: Range<usize>) -> Result<&[u8], Error> {
         self.check(&range)?;
         // SAFETY: the range is inside the view (checked), which stays mapped and readable while
         // `self` lives. Nothing writes the bytes a caller reads while it reads them: the daemon
@@ -240,7 +240,7 @@ impl View {
         Ok(unsafe { std::slice::from_raw_parts((self.at as usize + range.start) as *const u8, range.len()) })
     }
 
-    pub(crate) fn bytes_mut(&mut self, range: Range<usize>) -> Result<&mut [u8], Error> {
+    pub fn bytes_mut(&mut self, range: Range<usize>) -> Result<&mut [u8], Error> {
         if !self.writable {
             return Err(Error::new("writing a view mapped read-only"));
         }
@@ -250,7 +250,7 @@ impl View {
         Ok(unsafe { std::slice::from_raw_parts_mut((self.at as usize + range.start) as *mut u8, range.len()) })
     }
 
-    pub(crate) fn word(&self, at: usize) -> &AtomicU64 {
+    pub fn word(&self, at: usize) -> &AtomicU64 {
         assert!(
             at.is_multiple_of(8) && at.checked_add(8).is_some_and(|end| end <= self.len),
             "a word at {at:#x} of a view of {:#x}",
@@ -262,7 +262,7 @@ impl View {
         unsafe { &*((self.at as usize + at) as *const AtomicU64) }
     }
 
-    pub(crate) fn word32(&self, at: usize) -> &AtomicU32 {
+    pub fn word32(&self, at: usize) -> &AtomicU32 {
         assert!(
             at.is_multiple_of(4) && at.checked_add(4).is_some_and(|end| end <= self.len),
             "a word at {at:#x} of a view of {:#x}",
@@ -272,7 +272,7 @@ impl View {
         unsafe { &*((self.at as usize + at) as *const AtomicU32) }
     }
 
-    pub(crate) fn publish(&self, range: Range<usize>) {
+    pub fn publish(&self, range: Range<usize>) {
         if self.check(&range).is_err() || range.is_empty() {
             return;
         }
@@ -290,7 +290,7 @@ impl Drop for View {
 }
 
 /// Private memory of this process: code, then data right after it, in one allocation.
-pub(crate) struct Exec {
+pub struct Exec {
     at: *mut u8,
     code_pages: usize,
     data: usize,
@@ -311,7 +311,7 @@ impl Drop for Exec {
 }
 
 impl Exec {
-    pub(crate) fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
+    pub fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
         let page = page() as usize;
         let code_pages = code.max(1).next_multiple_of(page);
         let len = code_pages + data.next_multiple_of(page);
@@ -350,18 +350,18 @@ impl Exec {
         Ok(exec)
     }
 
-    pub(crate) fn code_address(&self) -> u64 {
+    pub fn code_address(&self) -> u64 {
         self.at as u64
     }
 
-    pub(crate) fn data_address(&self) -> u64 {
+    pub fn data_address(&self) -> u64 {
         self.at as u64 + self.code_pages as u64
     }
 
     /// Windows has no `fork`, and the code's pages are executable for every thread.
-    pub(crate) fn after_fork() {}
+    pub fn after_fork() {}
 
-    pub(crate) fn data(&mut self) -> &mut [u8] {
+    pub fn data(&mut self) -> &mut [u8] {
         // SAFETY: the data's `data` bytes after the code's pages, committed writable, live as
         // long as `self`; `&mut self` makes this the only borrow.
         unsafe { std::slice::from_raw_parts_mut(self.at.add(self.code_pages), self.data) }
@@ -370,12 +370,12 @@ impl Exec {
 
 /// What the daemon keeps to act in a run process: the process, and the objects it was granted
 /// with their rights.
-pub(crate) struct Remote {
+pub struct Remote {
     process: OwnedHandle,
     objects: Vec<(Object, Rights)>,
 }
 
-pub(crate) fn send_objects(
+pub fn send_objects(
     channel: &mut Channel,
     pid: u32,
     grant: &[u8],
@@ -486,14 +486,14 @@ fn private_protection(protect: u32) -> Result<u32, Error> {
 /// The asks' events: the doorbell the run process sets, and one per slot the daemon sets once
 /// it answered there, each auto-reset and duplicated into the run process; and the process, to
 /// see it end.
-pub(crate) struct Bells {
+pub struct Bells {
     doorbell: OwnedHandle,
     slots: Vec<OwnedHandle>,
     process: OwnedHandle,
 }
 
 impl Bells {
-    pub(crate) fn new(remote: &Remote, slots: usize) -> Result<(Bells, Vec<u64>), Error> {
+    pub fn new(remote: &Remote, slots: usize) -> Result<(Bells, Vec<u64>), Error> {
         let process = remote.process.try_clone().map_err(|it| Error::new(format!("Windows: DuplicateHandle of a process: {it}")))?;
         let mut names = Vec::with_capacity(slots + 1);
         let doorbell = bell(&remote.process, &mut names)?;
@@ -504,14 +504,14 @@ impl Bells {
         Ok((Bells { doorbell, slots: kept, process }, names))
     }
 
-    pub(crate) fn wake(&self, slot: usize, _: &AtomicU64) {
+    pub fn wake(&self, slot: usize, _: &AtomicU64) {
         if let Some(event) = self.slots.get(slot) {
             // SAFETY: an event this daemon made and holds.
             unsafe { SetEvent(event.as_raw_handle()) };
         }
     }
 
-    pub(crate) fn wait_ring(&self, _: &mut Stream) -> Result<bool, Error> {
+    pub fn wait_ring(&self, _: &mut Stream) -> Result<bool, Error> {
         let handles = [self.doorbell.as_raw_handle(), self.process.as_raw_handle()];
         // SAFETY: two handles this daemon holds, live for the call.
         let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
@@ -545,7 +545,7 @@ fn bell(process: &OwnedHandle, names: &mut Vec<u64>) -> Result<OwnedHandle, Erro
     Ok(event)
 }
 
-pub(crate) fn ring(_: &Stream, doorbell: u64) -> Result<(), Error> {
+pub fn ring(_: &Stream, doorbell: u64) -> Result<(), Error> {
     // SAFETY: the doorbell the daemon duplicated into this process; a handle that is not an
     // event fails the call, which is checked.
     if unsafe { SetEvent(doorbell as HANDLE) } == 0 {
@@ -554,7 +554,7 @@ pub(crate) fn ring(_: &Stream, doorbell: u64) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn hung_up(stream: &Stream) -> bool {
+pub fn hung_up(stream: &Stream) -> bool {
     stream.closed()
 }
 
@@ -562,14 +562,14 @@ fn millis(timeout: std::time::Duration) -> u32 {
     u32::try_from(timeout.as_millis()).unwrap_or(INFINITE - 1).clamp(1, INFINITE - 1)
 }
 
-pub(crate) fn wait_answer(_: &AtomicU64, _: u32, bell: u64, timeout: std::time::Duration) -> bool {
+pub fn wait_answer(_: &AtomicU64, _: u32, bell: u64, timeout: std::time::Duration) -> bool {
     // SAFETY: the slot's event the daemon duplicated into this process; a handle that is not
     // one fails the wait, and the caller looks at the state word either way.
     unsafe { WaitForSingleObject(bell as HANDLE, millis(timeout)) != WAIT_TIMEOUT }
 }
 
 /// Within this process only: on Windows the run process sleeps for a slot of its own.
-pub(crate) fn wait(word: &AtomicU64, expected: u32, timeout: std::time::Duration) -> bool {
+pub fn wait(word: &AtomicU64, expected: u32, timeout: std::time::Duration) -> bool {
     // SAFETY: `word` is live and 8-aligned; WaitOnAddress compares its first four bytes, the
     // low half, with `expected`, which is live for the call.
     let ok = unsafe { WaitOnAddress(word.as_ptr().cast(), (&raw const expected).cast(), 4, millis(timeout)) };
@@ -577,16 +577,16 @@ pub(crate) fn wait(word: &AtomicU64, expected: u32, timeout: std::time::Duration
     ok != 0 || unsafe { GetLastError() } != ERROR_TIMEOUT
 }
 
-pub(crate) fn wake(word: &AtomicU64) {
+pub fn wake(word: &AtomicU64) {
     // SAFETY: wakes the threads waiting on `word`'s address; reads nothing.
     unsafe { WakeByAddressAll(word.as_ptr().cast()) };
 }
 
 /// The calling thread's last error, put back when dropped.
-pub(crate) struct Errno(u32);
+pub struct Errno(u32);
 
 impl Errno {
-    pub(crate) fn keep() -> Errno {
+    pub fn keep() -> Errno {
         // SAFETY: reads this thread's last error.
         Errno(unsafe { GetLastError() })
     }
@@ -600,7 +600,7 @@ impl Drop for Errno {
 }
 
 impl Remote {
-    pub(crate) fn kill(&self) -> Result<(), Error> {
+    pub fn kill(&self) -> Result<(), Error> {
         // SAFETY: the run process's own handle, opened with PROCESS_TERMINATE.
         if unsafe { TerminateProcess(self.process.as_raw_handle(), 137) } == 0 {
             // SAFETY: the process handle, opened with PROCESS_SYNCHRONIZE; a zero wait returns
@@ -615,7 +615,7 @@ impl Remote {
 
     /// Maps the whole of object `object` into the run process anywhere, if its rights allow
     /// `access`.
-    pub(crate) fn map(&self, object: u32, access: Access) -> Result<u64, Error> {
+    pub fn map(&self, object: u32, access: Access) -> Result<u64, Error> {
         let Some((granted, rights)) = self.objects.get(object as usize) else {
             return Err(Error::new(format!("a map of object {object} of {}", self.objects.len())));
         };
@@ -625,7 +625,7 @@ impl Remote {
         map_view(granted.section.as_raw_handle(), self.process.as_raw_handle(), 0, granted.len, 0, 0, access)
     }
 
-    pub(crate) fn overlay(&self, slide: u64, grant: &Grant) -> Result<(), Error> {
+    pub fn overlay(&self, slide: u64, grant: &Grant) -> Result<(), Error> {
         let page = page();
         let base = grant.span.start.wrapping_add(slide);
         let end = grant
@@ -806,13 +806,13 @@ impl Remote {
 }
 
 /// An object the start hook was granted, by its index in the grant: the daemon maps it.
-pub(crate) struct Granted {
+pub struct Granted {
     index: u32,
     len: u64,
     rights: Rights,
 }
 
-pub(crate) fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<Granted>, Error> {
+pub fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<Granted>, Error> {
     let bad = |it: FrameError| Error::new(format!("the daemon's list of objects: {it}"));
     let frame = channel.recv()?;
     if frame.seq != OBJECTS_SEQ {
@@ -850,11 +850,11 @@ fn answer<'a>(frame: crate::frame::Frame<'a>, want: crate::frame::Kind, what: &s
 }
 
 impl Granted {
-    pub(crate) fn len(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         self.len
     }
 
-    pub(crate) fn map_anywhere(&self, channel: &mut Channel, access: Access) -> Result<u64, Error> {
+    pub fn map_anywhere(&self, channel: &mut Channel, access: Access) -> Result<u64, Error> {
         if !allowed(self.rights, access) || access == Access::Execute {
             return Err(Error::new(format!("object {} ({:?}) mapped anywhere as {access:?}", self.index, self.rights)));
         }
@@ -870,7 +870,7 @@ impl Granted {
     }
 }
 
-pub(crate) fn overlay(channel: &mut Channel, _: &[Granted], _: &[Overlay], _: u64) -> Result<(), Error> {
+pub fn overlay(channel: &mut Channel, _: &[Granted], _: &[Overlay], _: u64) -> Result<(), Error> {
     let frame = channel.request(kinds::OVERLAY, &[])?;
     let body = answer(frame, kinds::OVERLAID, "lay the overlays over this image")?;
     if !body.is_empty() {
@@ -889,15 +889,21 @@ unsafe extern "system" {
 /// What the process's global scope is on Windows: every module the system loader loaded, the
 /// executable first, each export found by `GetProcAddress` (forwarders followed), the first
 /// module that exports a name winning.
-pub(crate) struct Scope {
+pub struct Scope {
     /// Listed at the first lookup.
     modules: Option<Vec<HMODULE>>,
     /// The name being looked up, NUL-terminated; reused.
     name: Vec<u8>,
 }
 
+impl Default for Scope {
+    fn default() -> Scope {
+        Scope::new()
+    }
+}
+
 impl Scope {
-    pub(crate) fn new() -> Scope {
+    pub fn new() -> Scope {
         Scope { modules: None, name: Vec::new() }
     }
 
@@ -921,7 +927,7 @@ impl Scope {
         }
     }
 
-    pub(crate) fn find(&mut self, name: &str) -> Result<Option<u64>, Error> {
+    pub fn find(&mut self, name: &str) -> Result<Option<u64>, Error> {
         if name.is_empty() || name.as_bytes().contains(&0) {
             return Err(Error::new(format!("a lookup of {name:?}: not a C name")));
         }
@@ -945,7 +951,7 @@ impl Scope {
     }
 }
 
-pub(crate) fn own_image() -> Result<(u64, &'static [u8]), Error> {
+pub fn own_image() -> Result<(u64, &'static [u8]), Error> {
     // SAFETY: a null name asks for the executable's own module, which stays for the process.
     let base = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
     if base == 0 || !base.is_multiple_of(page()) {
@@ -964,14 +970,14 @@ pub(crate) fn own_image() -> Result<(u64, &'static [u8]), Error> {
 }
 
 /// NTFS has no clones; ReFS block cloning is not asked for: the caller writes the bytes.
-pub(crate) fn clone_file(_: &Path, _: &Path) -> Result<bool, Error> {
+pub fn clone_file(_: &Path, _: &Path) -> Result<bool, Error> {
     Ok(false)
 }
 
 /// A walk of every thread of the system: Windows lists threads by process no other way. A
 /// thread missing from the list would have its fence slot reaped, so a walk that fails midway
 /// is an error, never a shorter list.
-pub(crate) fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
+pub fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
     out.clear();
     // SAFETY: value-only arguments; the handle it returns is checked and owned below.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
@@ -1002,16 +1008,16 @@ pub(crate) fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
     }
 }
 
-pub(crate) fn service() -> Option<String> {
+pub fn service() -> Option<String> {
     None
 }
 
-pub(crate) fn thread_id() -> u64 {
+pub fn thread_id() -> u64 {
     // SAFETY: no arguments; reads the calling thread's ID.
     u64::from(unsafe { GetCurrentThreadId() })
 }
 
-pub(crate) fn serialize() {
+pub fn serialize() {
     // SAFETY: `cpuid` touches no memory and writes only eax, ebx, ecx and edx; rbx, which LLVM
     // reserves, is kept in another register around it.
     unsafe {
@@ -1038,7 +1044,7 @@ struct Context(CONTEXT);
 /// below the first with no unwind information can't be stepped over, since only a leaf may
 /// lack it, so the walk did not finish: `None`. The outermost frame returns to 0.
 #[inline(never)]
-pub(crate) fn backtrace(out: &mut [u64]) -> Option<usize> {
+pub fn backtrace(out: &mut [u64]) -> Option<usize> {
     // SAFETY: CONTEXT is plain integers: all zero is a value.
     let mut context = Context(unsafe { std::mem::zeroed() });
     // SAFETY: fills the 16-byte aligned CONTEXT it is given with this thread's registers.

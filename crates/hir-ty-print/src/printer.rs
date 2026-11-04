@@ -668,16 +668,10 @@ impl<'h, 't> Printer<'h, 't> {
             parent_args = &args[..generics.parent_count.min(args.len())];
             if generics.count > generics.parent_count && args.len() >= generics.count {
                 let own = self.own_args_no_defaults(&generics, args);
-                // A lifetime of a function is mostly late bound, and then no argument to rustc.
-                if self.mode.spelling == Spelling::TypeName
-                    && matches!(def, Def::Function(_))
-                    && own.iter().any(|it| it.region().is_some())
-                {
-                    return self.refuse(
-                        "a function generic over a lifetime: rustc's `type_name` writes an early bound one \
-                         `'_` and a late bound one not at all, which is not told apart here",
-                    );
-                }
+                // A function's arguments hold only its early bound lifetimes, as rustc's
+                // `generics_of` does (hir-def's `update_to_late_bound_lifetimes` is rustc's
+                // `is_late_bound_map`), so `type_name` writes each of them `'_` and a late bound
+                // one, which is no argument, not at all: `f<'_, u8>::{{closure}}`.
                 self.print_def_path(def, parent_args);
                 // A symbol has `::<..>` after a value's path, wherever it stands.
                 let was = self.in_value;

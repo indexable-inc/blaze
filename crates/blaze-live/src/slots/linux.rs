@@ -22,7 +22,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub(super) use super::unix::{GRAIN, Reserved, backtrace, descriptor, in_image_of};
+pub(super) use super::unix::{GRAIN, Reserved, backtrace};
 use super::{
     switch::{Dwarf, Layout, Memory, Span, Writes},
     unix::{__register_frame, Segments, load_cell, loaders, mmap, munmap},

@@ -25,7 +25,6 @@ use super::{
     image,
     switch::{Dwarf, Layout, Memory, Writes},
 };
-use crate::patch::{DESCRIPTOR, Descriptor};
 
 #[repr(C)]
 #[allow(dead_code)]
@@ -51,7 +50,6 @@ struct RuntimeFunction {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
-    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     fn GetCurrentProcess() -> *mut c_void;
     fn VirtualProtect(address: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
     fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
@@ -98,45 +96,6 @@ fn module_of(address: *const c_void) -> Result<*mut c_void, String> {
         return Err(format!("no module has {address:?}: {}", std::io::Error::last_os_error()));
     }
     Ok(module)
-}
-
-/// Where the descriptor of the module this code is in is, in memory, and its bytes.
-pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
-    let own = descriptor as fn() -> Result<(u64, &'static [u8]), String> as *const c_void;
-    let module = module_of(own)?;
-    // alloc: setup, the descriptor's name, looked up once at start
-    let name: Vec<u8> = DESCRIPTOR.bytes().chain([0]).collect();
-    // SAFETY: the module is loaded and the name ends in a zero.
-    let found = unsafe { GetProcAddress(module, name.as_ptr()) };
-    if found.is_null() {
-        // alloc: error path
-        return Err(format!(
-            "the module of blaze-live's code exports no {DESCRIPTOR}: blaze-link links it for \
-             live patches"
-        ));
-    }
-    let at = found as u64;
-    let end =
-        at.checked_add(Descriptor::SIZE as u64).ok_or("a descriptor past the end of memory")?;
-    Ok((at, readable(&(at..end), module as u64)?))
-}
-
-/// Checks that `range` is committed, readable memory of the module that has `near` (the
-/// descriptor's address).
-pub(super) fn in_image_of(range: &Range<u64>, near: u64) -> Result<(), String> {
-    let module = module_of(near as *const c_void)?;
-    readable(range, module as u64).map(|_| ())
-}
-
-/// The image's bytes at `range`, checked to be committed, readable and of the image at
-/// `base`.
-fn readable(range: &Range<u64>, base: u64) -> Result<&'static [u8], String> {
-    regions(range, |piece, region| checked_readable(&piece, region, base))?;
-    // SAFETY: `range` is committed, readable memory of the image (checked above), which stays
-    // loaded as long as its code, this, runs; it is data the linker wrote, which no patch
-    // writes over (the switch refuses data over the descriptor's cell and table, and the
-    // descriptor and the directory name are read-only data).
-    Ok(unsafe { image::view(range.start, (range.end - range.start) as usize) })
 }
 
 /// Checks that `piece`, of `region`, is readable memory of the image at `base`.
@@ -249,8 +208,8 @@ impl Memory for Os {
 
     fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String> {
         self.in_image(range)?;
-        // SAFETY: as in `readable`: committed, readable memory of the image (checked above)
-        // that no patch writes over.
+        // SAFETY: committed, readable memory of the image (checked above) that no patch
+        // writes over.
         Ok(unsafe { image::view(range.start, (range.end - range.start) as usize) })
     }
 
@@ -402,62 +361,6 @@ impl Regions {
         }
         Ok(())
     }
-}
-
-/// Calls `f` with `range` in pieces of one region each; an error names the first address
-/// of it nothing is committed at.
-fn regions(
-    range: &Range<u64>,
-    f: impl FnMut(Range<u64>, Region) -> Result<(), String>,
-) -> Result<(), String> {
-    regions_from(&mut None, range, f)
-}
-
-/// [`regions`], starting from `known`, the region last queried, and leaving there the last
-/// one it queries: spans sorted by address in one region cost one `VirtualQuery` in all. A
-/// region's protection is the same after a write as before ([`writable`] gives it back), so
-/// what was queried stays true while a patch is written.
-fn regions_from(
-    known: &mut Option<(Range<u64>, Region)>,
-    range: &Range<u64>,
-    mut f: impl FnMut(Range<u64>, Region) -> Result<(), String>,
-) -> Result<(), String> {
-    let mut at = range.start;
-    while at < range.end {
-        if let Some((region, of)) = known.as_ref().filter(|it| it.0.contains(&at)) {
-            let (piece, of) = (at..region.end.min(range.end), *of);
-            at = piece.end;
-            f(piece, of)?;
-            continue;
-        }
-        let mut info = MemoryBasicInformation {
-            base: std::ptr::null_mut(),
-            allocation_base: std::ptr::null_mut(),
-            allocation_protect: 0,
-            partition: 0,
-            size: 0,
-            state: 0,
-            protect: 0,
-            kind: 0,
-        };
-        let len = size_of::<MemoryBasicInformation>();
-        // SAFETY: `info` is a whole MEMORY_BASIC_INFORMATION.
-        if unsafe { VirtualQuery(at as *const c_void, &mut info, len) } != len {
-            // alloc: error path
-            return Err(format!("querying {at:#x}: {}", std::io::Error::last_os_error()));
-        }
-        let end = (info.base as u64).saturating_add(info.size as u64);
-        if info.state != MEM_COMMIT || end <= at {
-            // alloc: error path
-            return Err(format!("nothing is committed at {at:#x}"));
-        }
-        let region = Region { allocation: info.allocation_base as u64, protect: info.protect };
-        *known = Some((info.base as u64..end, region));
-        let piece = at..end.min(range.end);
-        at = piece.end;
-        f(piece, region)?;
-    }
-    Ok(())
 }
 
 /// Writes what `writes` has within `pages`, committed memory of the image with `protect`,

@@ -39,9 +39,5 @@ rustc_apfloat.workspace = true
 
 test-utils.workspace = true
 
-[features]
-default = []
-in-rust-tree = []
-
 [lints]
 workspace = true

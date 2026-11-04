@@ -15,38 +15,25 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
-blaze-format = { workspace = true, optional = true }
+blaze-format.workspace = true
 blaze-hash.workspace = true
-blaze-ids = { workspace = true, optional = true }
+blaze-ids.workspace = true
 blaze-lint-defs.workspace = true
 blaze-radix.workspace = true
-blaze-protocol = { workspace = true, optional = true }
-blaze-query = { workspace = true, optional = true }
+blaze-protocol.workspace = true
+blaze-query.workspace = true
 blaze-serde.workspace = true
-blaze-source = { workspace = true, optional = true }
+blaze-source.workspace = true
 blaze-manifest.workspace = true
 blaze-resolve.workspace = true
 cargo-util-schemas.workspace = true
-rustc-stable-hash = { workspace = true, optional = true }
+rustc-stable-hash.workspace = true
 semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-blaze-sha256 = { workspace = true, optional = true }
+blaze-sha256.workspace = true
 toml.workspace = true
 url.workspace = true
-
-[features]
-# The workspace load and the unit graph as queries of blaze's database (`query`), for the
-# daemon. Without it the crate reads no file and builds for wasm32-wasip1 (#458).
-query = [
-    "dep:blaze-format",
-    "dep:blaze-ids",
-    "dep:blaze-protocol",
-    "dep:blaze-query",
-    "dep:blaze-source",
-    "dep:rustc-stable-hash",
-    "dep:blaze-sha256",
-]
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

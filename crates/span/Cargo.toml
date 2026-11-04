@@ -12,7 +12,7 @@ authors.workspace = true
 
 [dependencies]
 blaze-hash.workspace = true
-blaze-query = { workspace = true, optional = true }
+blaze-query.workspace = true
 text-size.workspace = true
 unicode-width.workspace = true
 
@@ -26,11 +26,6 @@ stdx.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 syntax.workspace = true
-
-[features]
-default = ["query"]
-query = ["dep:blaze-query"]
-in-rust-tree = []
 
 [lints]
 workspace = true

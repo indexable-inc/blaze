@@ -499,6 +499,9 @@ pub const QUERY_COUNTS: Table = Table {
         col("evicted_asked", Type::U64, "of its runs, those for a value evicted earlier and asked for again: what eviction cost"),
         col("evicted", Type::U64, "its values a pass let go to keep its tag's values under their budget"),
         col("dropped", Type::U64, "its values an explicit `evict_values` or `evict_values_of` let go"),
+        col("reads_recorded", Type::U64, "the reads its runs recorded, a row read again later in the same run included: over `reads_kept`, how often its runs re-read the same rows"),
+        col("reads_kept", Type::U64, "the reads its runs' rows kept: each run's distinct reads, summed"),
+        col("reads_most", Type::U64, "the most reads one of its runs held on its thread's query stack as it ended (the build's most, not a sum)"),
     ],
 };
 

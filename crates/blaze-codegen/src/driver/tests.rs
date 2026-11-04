@@ -36,6 +36,9 @@ struct Function {
     /// Its owner for the dependency image, which the front end decides
     /// ([`Described::owner`]): the workspace's unless a test says.
     owner: Owner,
+    /// The function whose identity it has ([`Described::identity`]), itself when `None`: two
+    /// of one identity are one instance asked for by two origins.
+    identity_of: Option<u32>,
 }
 
 #[derive(Default)]
@@ -103,6 +106,7 @@ impl Program {
             outside: "memcpy",
             code_of: None,
             owner: Owner::Workspace,
+            identity_of: None,
         };
         self.functions.insert(id, function);
         self.functions.get_mut(&id).unwrap()
@@ -133,7 +137,7 @@ impl Frontend for Program {
         let code = self.code(*id);
         Ok(Described {
             owner: function.owner,
-            identity: ContentId::of("blaze v2 test identity 1", &id.to_le_bytes()),
+            identity: ContentId::of("blaze v2 test identity 1", &function.identity_of.unwrap_or(*id).to_le_bytes()),
             bound: Ok(code.0),
             item: item(*id),
             code,
@@ -1551,4 +1555,61 @@ fn a_tier_up_recompiles_its_importer_when_an_imports_tier_changes() {
     let bodies = machine.emitted_bodies.lock();
     assert!(bodies.contains(&0x44), "`f4`, at O2 now: {bodies:?}");
     assert!(bodies.contains(&0x22), "`f2`, whose import `f4` is built at O2 now: {bodies:?}");
+}
+
+/// One generic instance asked for by a member and by a dependency at one opt-level: one
+/// settings, but two keys, as its arguments and code are each asker's (`arrayvec`'s
+/// `CapacityError<&[u8; 1024]>::new` in `blaze-profile`'s tests). Its test binary's table has
+/// it as two functions, each with its own ID, rather than refusing them as one function
+/// across versions.
+#[test]
+fn one_instance_asked_for_by_two_origins_is_two_functions_of_its_test_binary() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let mut program = Program::default();
+    program.function(1, 0x11, &[2, 3]).symbol = Some("main".to_owned());
+    program.function(2, 0x22, &[]).identity_of = Some(9);
+    let dependency = program.function(3, 0x23, &[]);
+    (dependency.identity_of, dependency.origin) = (Some(9), Origin::Dependency(Package::new("dep")));
+    let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default())
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(built.stats.instances, 3, "2 and 3 are two keys");
+    let key_of = |body: u8| built.functions.iter().find(|it| it.code[0] == body).map(|it| it.key).unwrap();
+    let id = |key| built.inputs.binary_search_by_key(&key, |it| it.0).ok().map(|at| built.versions[at].0);
+    let (member, dependency) = (key_of(0x22), key_of(0x23));
+    assert_ne!(id(member), id(dependency), "two functions across versions");
+    let live = |key| built.identities.iter().find(|it| it.0 == key).map(|it| it.1);
+    assert!(live(member).is_some() && live(dependency).is_some(), "{:?}", built.identities);
+    assert_ne!(live(member), live(dependency), "two functions across edits: each its own live slot");
+    crate::ExecTable::new(&built, &[], 0, |_| None, ContentId::default(), std::iter::empty())
+        .unwrap_or_else(|why| panic!("{}", why.describe(&built)));
+}
+
+/// One instance whose two askers' describes give one key is one function across versions
+/// and across edits,
+/// with one ID whichever asker's describe the walk kept: the least origin's, never the first
+/// described (rule 22).
+#[test]
+fn one_key_of_two_origins_has_one_id_whichever_was_described_first() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let id_of_shared = |calls: &[u32]| {
+        let mut program = Program::default();
+        program.function(1, 0x11, calls).symbol = Some("main".to_owned());
+        let member = program.function(2, 0x22, &[]);
+        (member.identity_of, member.code_of) = (Some(9), Some(9));
+        let dependency = program.function(3, 0x22, &[]);
+        (dependency.identity_of, dependency.code_of) = (Some(9), Some(9));
+        dependency.origin = Origin::Dependency(Package::new("dep"));
+        let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default())
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+        assert_eq!(built.stats.instances, 2, "2 and 3 are one key");
+        let shared = built.functions.iter().find(|it| it.code[0] == 0x22).map(|it| it.key).unwrap();
+        let at = built.inputs.binary_search_by_key(&shared, |it| it.0).unwrap();
+        let live = built.identities.iter().find(|it| it.0 == shared).map(|it| it.1);
+        (shared, built.versions[at].0, live)
+    };
+    let (member_first, dependency_first) = (id_of_shared(&[2, 3]), id_of_shared(&[3, 2]));
+    assert_eq!(member_first.0, dependency_first.0, "one key either way");
+    assert_eq!(member_first.1, dependency_first.1, "one ID either way");
+    assert!(member_first.2.is_some());
+    assert_eq!(member_first.2, dependency_first.2, "one live identity either way");
 }

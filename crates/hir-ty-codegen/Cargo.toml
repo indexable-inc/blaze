@@ -87,15 +87,19 @@ hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [features]
-default = ["llvm-stencils"]
-# blaze-stencil's stencils made by LLVM at build time; off in the seed profile.
-llvm-stencils = ["blaze-stencil/llvm-stencils"]
-llvm = ["dep:inkwell"]
+# LLVM, linked in (inkwell over llvm-sys): the producer of std and every opt-level 2/3 unit, and
+# the maker of blaze-stencil's stencils at build time, which checks them against the committed
+# ones. Every native blaze has it (blaze-cargo's `native`); the seed, which has no C, does not.
+llvm = ["dep:inkwell", "blaze-stencil/llvm-stencils"]
+# The assembler of a blaze without LLVM (the seed): `asm/rsasm.rs`.
 rsasm = ["dep:rsasm"]
 # The LLVM producer of wasm32 code (`llvm.rs` `Machine::create_for`), for an LLVM built with
-# the WebAssembly target; the pinned one (llvm.json) is not yet.
+# the WebAssembly target. Off because the pinned archives (llvm.json, 2026-10-26) predate
+# llvm.py building that target (2026-11-01); once llvm.json pins ones that have it, this folds
+# into `llvm`.
 llvm-wasm = ["llvm", "inkwell/target-webassembly"]
-# The compiler as a WebAssembly module itself: see `crates/blaze-wasm`. It decides only what is
+# The compiler as a WebAssembly module itself: see `crates/blaze-wasm`, a workspace of its own
+# and the only one that turns it on, so it never unifies into the native build. It decides only what is
 # about that program, where it runs (`Target::host`) and that it links what it compiles into the
 # page's table (`Target::calls`), never anything of a target's code (`target.rs` tests).
 wasm = []

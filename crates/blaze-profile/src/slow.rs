@@ -177,6 +177,30 @@ pub struct QueryCount {
     pub evicted_asked: u64,
     pub evicted: u64,
     pub dropped: u64,
+    /// Reads its runs recorded, a row read again in the same run included (`reads_recorded`).
+    pub reads_recorded: u64,
+    /// Reads its runs' rows kept: their distinct reads (`reads_kept`).
+    pub reads_kept: u64,
+    /// The most reads one run held on its query stack (`reads_most`, the build's most).
+    pub reads_most: u64,
+}
+
+impl QueryCount {
+    /// Reads one run may hold on its query stack before the report flags it: 2^20 `u32`s, 4 MiB
+    /// of one thread's stack for one run, 64 times what a stored row's typical span holds.
+    pub const MANY_READS: u64 = 1 << 20;
+    /// Reads recorded over reads kept past which the report flags a query that re-reads: each
+    /// row read 8 times in one run, on average.
+    pub const REREAD_RATIO: u64 = 8;
+
+    /// Its runs re-read the same rows many times, or one run held a huge stack of reads
+    /// (`blaze slow`'s `reread`); a query that recorded fewer than [`Self::MANY_READS`] reads
+    /// in the build is too small to matter.
+    pub fn rereads(&self) -> bool {
+        self.reads_most >= Self::MANY_READS
+            || (self.reads_recorded >= Self::MANY_READS
+                && self.reads_recorded >= Self::REREAD_RATIO.saturating_mul(self.reads_kept))
+    }
 }
 
 /// The daemon's heap (`live bytes`) and footprint around the build, in bytes.
@@ -269,6 +293,9 @@ pub enum Kind {
     Reran,
     /// Runs for a value evicted earlier and asked for again.
     Evicted,
+    /// A query whose runs read the same rows many times, or held a huge stack of reads
+    /// (`query_counts.reads_*`).
+    Reread,
     /// The daemon let go of most of its heap between the build before and this one.
     Shed,
     /// Things the build computed again (the misses table), by cause.
@@ -286,6 +313,7 @@ pub enum Fix {
     KeepInMemory,
     KeepAcrossBuilds,
     ExplainMiss,
+    ReadOnce,
 }
 
 impl Fix {
@@ -302,6 +330,9 @@ impl Fix {
             Fix::KeepInMemory => "keep it in memory: values were evicted, then asked for and computed again",
             Fix::KeepAcrossBuilds => "keep the lowered database across requests: the daemon let it go between builds",
             Fix::ExplainMiss => "find why each was computed again (`blaze why`) and key it so it is reused",
+            Fix::ReadOnce => {
+                "read each row once a run: hoist reads out of loops over items, or read one query that gathers them; each read costs the run a query stack entry and its verify a check"
+            }
         }
     }
 }
@@ -1003,6 +1034,28 @@ impl<'a> Ctx<'a> {
                     subject: it.query.clone(),
                     owner: Some("blaze_query".to_owned()),
                     evidence: vec![format!("{} runs, {} verified", it.executed, it.verified), per],
+                });
+            }
+            if it.rereads() {
+                let ratio = it.reads_recorded as f64 / it.reads_kept.max(1) as f64;
+                out.push(Finding {
+                    kind: Kind::Reread,
+                    fix: Fix::ReadOnce,
+                    saves_ns: 0,
+                    estimate: Estimate::Unknown,
+                    title: format!(
+                        "reread: `{}` recorded {} reads over {} runs, keeping {} ({ratio:.1} reads a row kept); one run held {}",
+                        it.query, it.reads_recorded, it.executed, it.reads_kept, it.reads_most
+                    ),
+                    // clone: a finding's subject
+                    subject: it.query.clone(),
+                    owner: Some("blaze_query".to_owned()),
+                    evidence: vec![format!(
+                        "flagged past {} reads one run or {} reads recorded a read kept (with {} recorded)",
+                        QueryCount::MANY_READS,
+                        QueryCount::REREAD_RATIO,
+                        QueryCount::MANY_READS
+                    )],
                 });
             }
         }

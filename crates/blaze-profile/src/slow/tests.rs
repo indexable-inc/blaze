@@ -168,7 +168,7 @@ fn killed_daemon(dir: &std::path::Path) -> ! {
     let owner = std::fs::File::create(dir.join(crate::history::OWNER)).unwrap();
     owner.lock().unwrap();
     write!(&owner, "{}", std::process::id()).unwrap();
-    let mut history = crate::history::History::open(dir, crate::history::CAP_BYTES).unwrap();
+    let mut history = crate::history::History::open(dir, crate::history::CAP_BYTES, crate::sampler::unsampled()).unwrap();
     history.build_started(crate::history::BuildRow {
         build_id: 1,
         commit: None,
@@ -271,7 +271,7 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
 fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("blaze-slow-{name}-{}", std::process::id()));
     _ = std::fs::remove_dir_all(&dir);
-    crate::history::History::open(&dir, crate::history::CAP_BYTES).unwrap();
+    crate::history::History::open(&dir, crate::history::CAP_BYTES, crate::sampler::unsampled()).unwrap();
     let fixture = fixture.replace("{d}", &dir.display().to_string());
     let written = std::process::Command::new(duckdb).args(["-batch", "-bail", "-init", "/dev/null", "-c", &fixture]).output().unwrap();
     assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));

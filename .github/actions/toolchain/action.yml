@@ -1,6 +1,6 @@
 # Rust (the nightly in harness/toolchain) and the LLVM 23 blaze pins
 # (crates/hir-ty-codegen/llvm.json), on any of the hosted runners CI uses. `llvm: build` is Nix
-# with the flake's dev shell fetched: a build of blaze's `llvm` feature runs in it
+# with the flake's dev shell fetched: a build of blaze, which links LLVM, runs in it
 # (`nix develop --command cargo build ...`), linked statically against that LLVM with the dev
 # shell's C toolchain and libc. `llvm: run` puts the pinned LLVM's tools the harnesses read with
 # (llvm-dwarfdump) on PATH; `llvm: none` is neither. Windows has no Nix: it fetches the same

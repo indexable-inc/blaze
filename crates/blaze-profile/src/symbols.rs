@@ -8,9 +8,17 @@ use std::alloc::Global;
 /// A name for each of `pcs`: the function demangled with its offset, or the library and offset,
 /// or the bare address.
 pub(crate) fn names(pcs: &[u64]) -> HashMap<u64, String, Global> {
+    #[cfg(test)]
+    ASKED.with(|it| it.set(it.get() + 1));
     let mut names = HashMap::new_in(Global);
     names.extend(ix_prof::symbols::names(pcs));
     names
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`names`] on this thread: a test of what asks for names reads it.
+    pub(crate) static ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

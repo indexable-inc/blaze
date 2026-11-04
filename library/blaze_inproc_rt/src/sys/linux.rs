@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::Duration;
 
-pub(crate) use super::unix::{
+pub use super::unix::{
     Bells, Errno, Listener, Scope, Stream, backtrace, connect, hung_up, random, ring, serialize, wait_answer,
 };
 use super::Rights;
@@ -29,7 +29,7 @@ fn os(what: &str) -> Error {
     Error::new(format!("{what}: {}", std::io::Error::last_os_error()))
 }
 
-pub(crate) fn page() -> u64 {
+pub fn page() -> u64 {
     // SAFETY: sysconf has no preconditions.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page > 0 { page as u64 } else { 4096 }
@@ -47,7 +47,7 @@ fn ctr() -> u64 {
 /// AArch64: the instruction cache must not alias by virtual address, since code is written
 /// through the daemon's view and run through another process's. PIPT, or VIPT whose way is
 /// no larger than a page, or no maintenance needed at all (`CTR_EL0.DIC`).
-pub(crate) fn check_icache() -> Result<(), Error> {
+pub fn check_icache() -> Result<(), Error> {
     #[cfg(target_arch = "aarch64")]
     {
         let ctr = ctr();
@@ -100,13 +100,13 @@ fn icache_way() -> Result<u64, String> {
     Err("no level-1 instruction cache under /sys/devices/system/cpu/cpu0/cache".to_owned())
 }
 
-pub(crate) struct Object {
+pub struct Object {
     fd: OwnedFd,
     len: u64,
 }
 
 impl Object {
-    pub(crate) fn create(name: &str, len: u64) -> Result<Object, Error> {
+    pub fn create(name: &str, len: u64) -> Result<Object, Error> {
         let name = CString::new(format!("blaze-inproc:{name}")).map_err(|_| Error::new(format!("a memory object named {name:?}")))?;
         // SAFETY: `name` is a NUL-terminated string live for the call.
         let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
@@ -129,16 +129,16 @@ impl Object {
         Ok(Object { fd, len })
     }
 
-    pub(crate) fn len(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         self.len
     }
 
-    pub(crate) fn duplicate(&self) -> Result<Object, Error> {
+    pub fn duplicate(&self) -> Result<Object, Error> {
         let fd = self.fd.try_clone().map_err(|it| Error::new(format!("duplicating a memory object: {it}")))?;
         Ok(Object { fd, len: self.len })
     }
 
-    pub(crate) fn map_here(&self, access: Access) -> Result<View, Error> {
+    pub fn map_here(&self, access: Access) -> Result<View, Error> {
         View::map(self.fd.as_raw_fd(), self.len, access)
     }
 
@@ -156,7 +156,7 @@ impl Object {
 }
 
 /// A mapping in this process, unmapped when dropped.
-pub(crate) struct View {
+pub struct View {
     at: *mut u8,
     len: usize,
     writable: bool,
@@ -186,15 +186,15 @@ impl View {
         Ok(View { at: at as *mut u8, len: len as usize, writable })
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 
-    pub(crate) fn address(&self) -> u64 {
+    pub fn address(&self) -> u64 {
         self.at as u64
     }
 
-    pub(crate) fn bytes(&self, range: Range<usize>) -> Result<&[u8], Error> {
+    pub fn bytes(&self, range: Range<usize>) -> Result<&[u8], Error> {
         if range.start > range.end || range.end > self.len {
             return Err(Error::new(format!("bytes {range:?} of a view of {:#x}", self.len)));
         }
@@ -204,7 +204,7 @@ impl View {
         Ok(unsafe { std::slice::from_raw_parts(self.at.add(range.start), range.end - range.start) })
     }
 
-    pub(crate) fn bytes_mut(&mut self, range: Range<usize>) -> Result<&mut [u8], Error> {
+    pub fn bytes_mut(&mut self, range: Range<usize>) -> Result<&mut [u8], Error> {
         if !self.writable {
             return Err(Error::new("a write through a read-only view"));
         }
@@ -216,20 +216,20 @@ impl View {
         Ok(unsafe { std::slice::from_raw_parts_mut(self.at.add(range.start), range.end - range.start) })
     }
 
-    pub(crate) fn word(&self, at: usize) -> &AtomicU64 {
+    pub fn word(&self, at: usize) -> &AtomicU64 {
         assert!(at.is_multiple_of(8) && at + 8 <= self.len, "a word at {at:#x} of a view of {:#x}", self.len);
         // SAFETY: `at` is 8-aligned and in the mapping (asserted), page-aligned itself, so the
         // word is aligned; every access to the word, in this process and others, is atomic.
         unsafe { AtomicU64::from_ptr(self.at.add(at).cast()) }
     }
 
-    pub(crate) fn word32(&self, at: usize) -> &AtomicU32 {
+    pub fn word32(&self, at: usize) -> &AtomicU32 {
         assert!(at.is_multiple_of(4) && at + 4 <= self.len, "a word at {at:#x} of a view of {:#x}", self.len);
         // SAFETY: as for `word`, 4-aligned.
         unsafe { AtomicU32::from_ptr(self.at.add(at).cast()) }
     }
 
-    pub(crate) fn publish(&self, range: Range<usize>) {
+    pub fn publish(&self, range: Range<usize>) {
         if range.start >= range.end || range.end > self.len {
             return;
         }
@@ -286,7 +286,7 @@ unsafe fn sync_icache(start: usize, end: usize) {
 }
 
 /// Anonymous memory of this process: code, then data right after it, in one mapping.
-pub(crate) struct Exec {
+pub struct Exec {
     at: *mut u8,
     /// The code's pages, then the data's.
     code_pages: usize,
@@ -309,7 +309,7 @@ impl Drop for Exec {
 }
 
 impl Exec {
-    pub(crate) fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
+    pub fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
         let page = page() as usize;
         let code_pages = code.max(1).next_multiple_of(page);
         let len = code_pages + data.next_multiple_of(page);
@@ -344,18 +344,18 @@ impl Exec {
         Ok(exec)
     }
 
-    pub(crate) fn code_address(&self) -> u64 {
+    pub fn code_address(&self) -> u64 {
         self.at as u64
     }
 
-    pub(crate) fn data_address(&self) -> u64 {
+    pub fn data_address(&self) -> u64 {
         self.at as u64 + self.code_pages as u64
     }
 
     /// The code's pages are executable for every thread: nothing to do.
-    pub(crate) fn after_fork() {}
+    pub fn after_fork() {}
 
-    pub(crate) fn data(&mut self) -> &mut [u8] {
+    pub fn data(&mut self) -> &mut [u8] {
         // SAFETY: the data's `data` bytes after the code's pages, writable and in the mapping,
         // which lives as long as `self`; `&mut self` makes this the only borrow.
         unsafe { std::slice::from_raw_parts_mut(self.at.add(self.code_pages), self.data) }
@@ -381,12 +381,12 @@ fn map_anywhere(fd: RawFd, len: u64, access: Access) -> Result<u64, Error> {
 
 /// The daemon's side of a run process: a pidfd of it, which names that process even once its
 /// ID is reused; the start hook maps what it is given itself.
-pub(crate) struct Remote {
+pub struct Remote {
     process: OwnedFd,
 }
 
 impl Remote {
-    pub(crate) fn of(pid: u32) -> Result<Remote, Error> {
+    pub fn of(pid: u32) -> Result<Remote, Error> {
         // SAFETY: pidfd_open takes a process ID and flags and returns a new descriptor or -1.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if fd < 0 {
@@ -396,15 +396,15 @@ impl Remote {
         Ok(Remote { process: unsafe { OwnedFd::from_raw_fd(fd as RawFd) } })
     }
 
-    pub(crate) fn map(&self, object: u32, _: Access) -> Result<u64, Error> {
+    pub fn map(&self, object: u32, _: Access) -> Result<u64, Error> {
         Err(Error::new(format!("a start hook asked the daemon to map object {object}: on Linux the hook maps it")))
     }
 
-    pub(crate) fn overlay(&self, _: u64, _: &crate::handshake::Grant) -> Result<(), Error> {
+    pub fn overlay(&self, _: u64, _: &crate::handshake::Grant) -> Result<(), Error> {
         Err(Error::new("a start hook asked the daemon to lay its overlays: on Linux the hook lays them"))
     }
 
-    pub(crate) fn kill(&self) -> Result<(), Error> {
+    pub fn kill(&self) -> Result<(), Error> {
         // SAFETY: `process` is an open pidfd; no siginfo, no flags.
         let sent = unsafe {
             libc::syscall(libc::SYS_pidfd_send_signal, self.process.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0u32)
@@ -418,7 +418,7 @@ impl Remote {
 
 /// Sleeps on a futex that is not private, so a word of a shared mapping is the same futex in
 /// every process that maps it.
-pub(crate) fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
+pub fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
     let time = libc::timespec {
         tv_sec: timeout.as_secs().min(i32::MAX as u64) as libc::time_t,
         tv_nsec: timeout.subsec_nanos() as libc::c_long,
@@ -432,12 +432,12 @@ pub(crate) fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
     got == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ETIMEDOUT)
 }
 
-pub(crate) fn wake(word: &AtomicU64) {
+pub fn wake(word: &AtomicU64) {
     // SAFETY: as in `wait`; FUTEX_WAKE reads nothing of the word.
     unsafe { libc::syscall(libc::SYS_futex, word.as_ptr().cast::<u32>(), libc::FUTEX_WAKE, i32::MAX, 0usize, 0usize, 0u32) };
 }
 
-pub(crate) fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], objects: &[(&Object, Rights)]) -> Result<Remote, Error> {
+pub fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], objects: &[(&Object, Rights)]) -> Result<Remote, Error> {
     let remote = Remote::of(pid)?;
     let mut fds: Vec<OwnedFd> = Vec::with_capacity(objects.len());
     for (object, rights) in objects {
@@ -460,12 +460,12 @@ pub(crate) fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], object
     Ok(remote)
 }
 
-pub(crate) struct Granted {
+pub struct Granted {
     fd: OwnedFd,
     len: u64,
 }
 
-pub(crate) fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<Granted>, Error> {
+pub fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<Granted>, Error> {
     let mut out = Vec::with_capacity(count);
     for index in 0..count {
         let fd = channel
@@ -487,18 +487,18 @@ pub(crate) fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<Gr
 }
 
 impl Granted {
-    pub(crate) fn len(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         self.len
     }
 
-    pub(crate) fn map_anywhere(&self, _: &mut Channel, access: Access) -> Result<u64, Error> {
+    pub fn map_anywhere(&self, _: &mut Channel, access: Access) -> Result<u64, Error> {
         map_anywhere(self.fd.as_raw_fd(), self.len, access)
     }
 }
 
 /// A start hook's grant of `object` with `rights`, made in this process as the daemon makes it.
 #[cfg(test)]
-pub(crate) fn granted(object: &Object, rights: Rights) -> Result<Granted, Error> {
+pub fn granted(object: &Object, rights: Rights) -> Result<Granted, Error> {
     let fd = match rights {
         Rights::Code => object.read_only()?,
         Rights::Words => object.fd.try_clone().map_err(|it| Error::new(format!("duplicating a words object: {it}")))?,
@@ -506,7 +506,7 @@ pub(crate) fn granted(object: &Object, rights: Rights) -> Result<Granted, Error>
     Ok(Granted { fd, len: object.len })
 }
 
-pub(crate) fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide: u64) -> Result<(), Error> {
+pub fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide: u64) -> Result<(), Error> {
     for overlay in overlays {
         let object = objects
             .get(overlay.object as usize)
@@ -544,7 +544,7 @@ pub(crate) fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay]
     Ok(())
 }
 
-pub(crate) fn own_image() -> Result<(u64, &'static [u8]), Error> {
+pub fn own_image() -> Result<(u64, &'static [u8]), Error> {
     /// The executable's first `PT_LOAD`'s address and its bytes from the file.
     unsafe extern "C" fn first(info: *mut libc::dl_phdr_info, _: usize, data: *mut c_void) -> c_int {
         // SAFETY: the dynamic linker passes its own record of an object, live for the call,
@@ -583,7 +583,7 @@ pub(crate) fn own_image() -> Result<(u64, &'static [u8]), Error> {
     Ok((header, read(len)?))
 }
 
-pub(crate) fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
+pub fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
     let fail = |path: &Path, it: std::io::Error| Error::new(format!("{}: {it}", path.display()));
     let source = std::fs::File::open(from).map_err(|it| fail(from, it))?;
     let target = std::fs::OpenOptions::new().write(true).create_new(true).open(to).map_err(|it| fail(to, it))?;
@@ -601,7 +601,7 @@ pub(crate) fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
     }
 }
 
-pub(crate) fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
+pub fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
     out.clear();
     let dir = format!("/proc/{pid}/task");
     let entries = match std::fs::read_dir(&dir) {
@@ -618,11 +618,11 @@ pub(crate) fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn service() -> Option<String> {
+pub fn service() -> Option<String> {
     None
 }
 
-pub(crate) fn thread_id() -> u64 {
+pub fn thread_id() -> u64 {
     // SAFETY: gettid has no preconditions.
     unsafe { libc::syscall(libc::SYS_gettid) as u64 }
 }

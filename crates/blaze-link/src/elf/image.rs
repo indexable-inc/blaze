@@ -104,7 +104,7 @@ pub(crate) fn section_name(class: &Class) -> &str {
     match class {
         Class::Text => ".text",
         Class::Patch => ".blaze.patch",
-        Class::Stubs => ".blaze.stubs",
+        Class::Stubs => blaze_live::patch::STUBS_SECTION_ELF,
         Class::Plt => ".plt",
         Class::Rodata => ".rodata",
         Class::RelRo => ".data.rel.ro",

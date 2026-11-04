@@ -217,7 +217,7 @@ pub(crate) fn summarize(
     _: &mut Function,
     _: &Refs,
 ) -> Result<(Summary, Export), CodegenError> {
-    Err(failed(unit, "blaze was built without `--features llvm`"))
+    Err(failed(unit, "blaze was built without LLVM (blaze-engine's `native` feature)"))
 }
 
 /// Compiles an LLVM unit, with what it imports when it is a release unit. `refs` are its own
@@ -422,7 +422,7 @@ pub(crate) fn emit(
     _: &Refs,
     _: Option<(&Imports, &[Import<'_, Export>])>,
 ) -> Result<Emitted, CodegenError> {
-    Err(failed(unit, "blaze was built without `--features llvm`"))
+    Err(failed(unit, "blaze was built without LLVM (blaze-engine's `native` feature)"))
 }
 
 /// The optimization a unit's settings ask of LLVM.

@@ -175,7 +175,7 @@ impl Backend {
             Ok("llvm") if cfg!(feature = "llvm") => Ok(Backend::Llvm(optimization)),
             Ok("llvm") => {
                 // alloc: the error's message
-                Err(format!("BLAZE_BACKEND=llvm: blaze was built without `--features llvm`"))
+                Err(format!("BLAZE_BACKEND=llvm: blaze was built without LLVM (blaze-engine's `native` feature)"))
             }
             // alloc: the error's message
             Ok(other) => Err(format!("BLAZE_BACKEND={other}: expected `cranelift` or `llvm`")),

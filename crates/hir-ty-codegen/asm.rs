@@ -1611,8 +1611,9 @@ fn no_assembler(triple: &str) -> String {
     // alloc: the error's message
     format!(
         "inline assembly for {triple}: this blaze was built with no assembler, and blaze \
-         assembles `asm!`, `naked_asm!` and `global_asm!` only with its own (LLVM's, `--features \
-         llvm`, or rsasm, `--features rsasm`), never with the machine's C compiler"
+         assembles `asm!`, `naked_asm!` and `global_asm!` only with its own (LLVM's, which \
+         blaze-engine's `native` feature brings, or rsasm, hir-ty-codegen's `rsasm`, the seed's), \
+         never with the machine's C compiler"
     )
 }
 

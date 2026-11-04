@@ -593,7 +593,7 @@ def build_blaze(build: Build, llvm: Llvm, stage: str, flags: list[str], work: Pa
     )
     env.pop("RUSTFLAGS", None)
     cmd = [build.builder, "build", "--profile", PROFILE, "--target", build.target, "-p", PACKAGE]
-    run(f"build blaze ({stage})", [*cmd, "--features", "llvm"], env=env, secs=build.build_secs)
+    run(f"build blaze ({stage})", cmd, env=env, secs=build.build_secs)
     stop(Path(build.builder), env)
     built = target_dir / build.target / PROFILE
     bins = sorted(p.stem for p in (ENGINE / "src" / "bin").glob("*.rs"))

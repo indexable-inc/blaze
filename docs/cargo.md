@@ -34,9 +34,8 @@ profile and fails with it. From a checkout, the release's own recipe builds all 
 
 That build has the LLVM backend (the release profile's, [below](#backends)) and the LLVM tiers, as the
 installer's binaries do: the script fetches the LLVM 23 blaze pins and links it in statically
-([which LLVM](contributing.md#llvm-for---features-llvm)). `cargo install` from crates.io has
-the Cranelift backend only; `--features llvm` there needs `LLVM_SYS_231_PREFIX` set to that
-same LLVM. `cargo build -p blaze-engine --release` is the quicker build the harnesses and CI use while
+([which LLVM](contributing.md#llvm)). `cargo install` from crates.io builds the same: it
+needs `LLVM_SYS_231_PREFIX` set to that same LLVM. `cargo build -p blaze-engine --release` is the quicker build the harnesses and CI use while
 working on blaze; it is not what ships.
 
 `blaze` builds with the one toolchain blaze compiles, the dated nightly in

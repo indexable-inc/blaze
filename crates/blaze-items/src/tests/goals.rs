@@ -21,7 +21,7 @@ use super::{TestDB, edit, item, items, single, table::every_kind};
 use crate::{
     Fact, ImplEntry, ImplIndexKey, ItemId, blanket_impls,
     goals::{FactRefKey, Goals, fact_of_read, fact_ref_key, fact_value},
-    hidden_types, implements, impls,
+    hidden_types, implements, impls, rpitit_tys,
     index::impl_self_ty,
     item_key, key, kinds, specializes,
     table::{fact_of_ref, fact_ref},
@@ -38,7 +38,7 @@ fn a_fact_reads_back_from_its_parts() {
     let mut kinds: Vec<u16> = facts.iter().map(|it| it.kind().0).collect();
     kinds.sort_unstable();
     kinds.dedup();
-    assert_eq!(kinds.len(), 19, "one fact of each kind");
+    assert_eq!(kinds.len(), 20, "one fact of each kind");
     for fact in facts {
         let parts = fact_ref(&fact);
         assert_eq!(parts.kind, fact.kind());
@@ -420,15 +420,17 @@ pub type T = u8;
     assert!(Goals.value(&db, Some(fixture::test_crate(&db)), fact_ref(&fact)).is_some());
 }
 
-/// An impl method's types for the trait method's `impl Trait`s are written in its signature
-/// form, so a read of them stands for that signature; any other function's read is that
-/// function's too (empty, but keyed the same).
+/// An impl method's types for the trait method's `impl Trait`s are a fact of their own
+/// (`Fact::RpititTys`), never the method's signature: finding them proves the trait's bounds of
+/// the method's own `impl Trait`, which reads its bounds, part of that signature, so a read of
+/// them standing for the signature would hash the signature while they are found.
 #[test]
-fn a_read_of_an_impl_methods_rpitit_types_stands_for_its_signature() {
+fn a_read_of_an_impl_methods_rpitit_types_stands_for_their_own_fact() {
     let (db, _) = single(
         r#"
-pub trait Tr { fn f(self) -> impl Sized; }
-impl Tr for u8 { fn f(self) -> u8 { self } }
+//- minicore: sized, copy, clone
+pub trait Tr { fn f(self) -> impl Copy; }
+impl Tr for u8 { fn f(self) -> impl Copy { self } }
 "#,
     );
     let imp = items(&db)
@@ -447,8 +449,15 @@ impl Tr for u8 { fn f(self) -> u8 { self } }
             _ => None,
         })
         .expect("the impl has a method");
-    let read = fact_of_read(&db, fixture::test_crate(&db), "impl_rpitit_tys", f.as_id());
-    assert_eq!(read, Some(Fact::Signature(item_key(&db, ItemId::Function(f)))));
+    let krate = fixture::test_crate(&db);
+    let read = fact_of_read(&db, krate, "impl_rpitit_tys", f.as_id());
+    assert_eq!(read, Some(rpitit_tys(&db, f)));
+    assert_ne!(read, Some(Fact::Signature(item_key(&db, ItemId::Function(f)))));
+    let fact = rpitit_tys(&db, f);
+    assert_eq!(fact.kind(), kinds::RPITIT_TYS);
+    assert!(Goals.value(&db, Some(krate), fact_ref(&fact)).is_some(), "{fact:?} has a value");
+    let signature = Fact::Signature(item_key(&db, ItemId::Function(f)));
+    assert!(Goals.value(&db, Some(krate), fact_ref(&signature)).is_some(), "{signature:?} has a value");
 }
 
 #[test]

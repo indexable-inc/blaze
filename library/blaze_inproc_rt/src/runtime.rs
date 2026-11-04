@@ -41,6 +41,13 @@ pub fn attach() -> Result<&'static Attached, Error> {
     }
 }
 
+/// Whether the start hook ran: the executable's link put [`blaze_inproc_start`] first among its
+/// initializers, which only a dev executable's does. [`attach`] says whether it also attached;
+/// a dev executable run from its file (no `BLAZE_INPROC`) has a hook that ran and did not.
+pub fn hooked() -> bool {
+    ATTACHED.get().is_some()
+}
+
 /// A quiescent point of the calling thread, when this process was started by the daemon.
 pub fn quiesce() {
     if let Ok(attached) = attach() {
@@ -78,7 +85,7 @@ pub unsafe extern "C" fn blaze_inproc_start(
 /// `envp` is null or a null-terminated array of NUL-terminated strings, written by nothing
 /// else meanwhile.
 #[cfg(target_os = "linux")]
-pub(crate) unsafe fn take_from(envp: *mut *const std::ffi::c_char) -> Option<Vec<u8>> {
+pub unsafe fn take_from(envp: *mut *const std::ffi::c_char) -> Option<Vec<u8>> {
     if envp.is_null() {
         return None;
     }
@@ -292,7 +299,7 @@ impl Attached {
         self.slide
     }
 
-    /// What the daemon last announced ([`crate::CodeMemory::announce`]): one load.
+    /// What the daemon last announced (`blaze_inproc::CodeMemory::announce`): one load.
     pub fn announced(&self) -> u64 {
         Thread::announced(&self.control)
     }

@@ -3,13 +3,9 @@
 //!
 //! The `TokenTree` is semantically a tree, but for performance reasons it is stored as a flat structure.
 
-#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![feature(allocator_api, allocator_ext)]
 #![feature(portable_simd)]
 #![deny(unsafe_code)]
-
-#[cfg(feature = "in-rust-tree")]
-extern crate rustc_driver as _;
 
 extern crate rustc_lexer;
 

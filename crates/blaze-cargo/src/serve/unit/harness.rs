@@ -44,6 +44,7 @@ use super::{Job, codegen, compile, graph::Waits, lower_error};
 /// is made into a crate of its own here ([`compile::doctest::expand`]), refused as above.
 pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<Item = u32>) -> Result<(), Vec<(usize, ApiError)>> {
     let paths = Arc::clone(lowered.paths());
+    let spellings = Arc::clone(lowered.spellings());
     // alloc: once a write, the units it is given
     let units: Vec<u32> = units.into_iter().collect();
     let appended = units.iter().copied().filter(|&unit| tested(job, unit as usize) || codegen::wasm_macro(job, unit as usize));
@@ -63,7 +64,7 @@ pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<I
         }
         let toolchain = codegen::toolchain(job, unit).map_err(refused)?;
         let policy = codegen::policy(job, unit, toolchain).map_err(refused)?;
-        let frontend = codegen::frontend_over(db, &paths, &job.mounted, codegen::build_time(job, unit));
+        let frontend = codegen::frontend_over(db, &paths, &spellings, &job.mounted, codegen::build_time(job, unit));
         let harness = frontend.harness(krate, policy.profile.panic, policy.mode, blaze_usercode::test::fork_server);
         let Some(harness) = harness.map_err(|it| refused(it.what))? else { return Ok(None) };
         // The module the harness is written in, by its name in the crate's root: what the

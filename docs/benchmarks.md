@@ -487,10 +487,8 @@ Each project was measured with each code producer v1 had: Cranelift (the default
 summary tables) and LLVM (`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`, `BACKENDS` in
 `harness/bench.py`). v2 refuses those variables and picks the backend from the profile's
 `opt-level` (0 and 1 Cranelift, the rest LLVM; `crates/blaze-codegen/src/plan.rs`), so a v2
-tier is a profile: `bench.py`'s `BACKENDS` gives the release profile's `--release` for `llvm`. Cranelift is measured
-with blaze as it is installed and released, without the `llvm` feature (`BLAZE_BIN`), and LLVM
-with a build that has it (`BLAZE_LLVM_BIN`): a binary that links libLLVM loads it each time it
-starts, about 6 ms on the benchmark machine, and every `blaze` starts it once. A new tier
+tier is a profile: `bench.py`'s `BACKENDS` gives the release profile's `--release` for `llvm`. Both
+are measured with one blaze (`BLAZE_BIN`), which links LLVM as every native blaze does. A new tier
 is one more entry in `BACKENDS` in `harness/bench.py`; the report makes a table for every
 backend in the result.
 
@@ -675,7 +673,6 @@ As v1 was measured (against v2 this stops where [the top of the page](#benchmark
 ```
 nix develop .#bench
 cargo build -p blaze-engine --release
-CARGO_TARGET_DIR=target-llvm cargo build -p blaze-engine --release --features llvm
 python3 harness/bench.py ripgrep fd --runs 5 --out /tmp/bench.json   # any of the projects
 python3 harness/benchreport.py /tmp/bench.json --check               # what would change
 ```
@@ -754,8 +751,8 @@ machine has. blaze loses or fails on these:
 - **Cold.** `blaze build` from nothing is cargo's build plus the start of the daemon:
   6.29 s against 5.56 s on ripgrep, and the daemon is ready 6.2 s later.
 - **No-op** on ripgrep: 33 ms against cargo's 30 ms. This run's Cranelift column used the
-  binary built with the `llvm` feature, which spends about 6 ms loading libLLVM at every start;
-  the bench now measures that column with blaze as released (19 ms on ripgrep in
+  binary built with the `llvm` feature, which spends about 6 ms loading libLLVM at every start
+  (every native blaze has LLVM now, linked statically; 19 ms on ripgrep in
   [results.md](results.md#warm-edits-on-linux-x86-64-where-the-time-goes-and-build-scripts-2026-10-20)).
 
 Two commits after `2b2f2dcd5b` (`20708cd2da`, `c8f58ac7d9`) stop the daemon from running build

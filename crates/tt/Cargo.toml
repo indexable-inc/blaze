@@ -31,8 +31,5 @@ zerocopy.workspace = true
 blaze-alloc-count.workspace = true
 hegeltest.workspace = true
 
-[features]
-in-rust-tree = []
-
 [lints]
 workspace = true

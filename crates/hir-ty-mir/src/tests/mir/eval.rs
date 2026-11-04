@@ -110,7 +110,7 @@ fn check_pass_and_stdio_in(
         hir_def::nameres::set_expand_builtin_derives(&mut db, true);
     }
     // As a build does, for `Location::caller` and `file!()`.
-    crate::mir::location::name_sources(&mut db, "fixture", |_, _| Some("main.rs".to_owned()));
+    crate::mir::location::name_sources(&mut db, "fixture", |_, _, _| Some("main.rs".to_owned()));
     blaze_query::db::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let x = eval_main(&db, file_id);

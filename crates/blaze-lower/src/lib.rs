@@ -190,6 +190,9 @@ pub struct Lowered {
     paths: std::sync::Arc<HashMap<FileId, String>>,
     /// Each crate's identity worked out since the last write ([`Lowered::identity`]).
     identities: blaze_hash::HashMap<Crate, ContentId, Global>,
+    /// How cargo passes each crate's root, which the build's naming of files reads and each
+    /// crate's identity covers.
+    spellings: std::sync::Arc<Spellings>,
     /// Each root (an alias) [`Lowered::append_roots`] made since the last [`Lowered::refresh`],
     /// with the unit it was first made for and the content ID of the module it was given.
     appended: blaze_hash::HashMap<FileId, (usize, ContentId), Global>,
@@ -295,7 +298,7 @@ pub fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, Lower
 pub fn lower_into<T: blaze_query::Tree>(mut db: Db, lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
     let setup = db.batch(Trigger::named("the build lowered"), |db| lower_writes(db, lower))?;
     db.require_batches();
-    let Setup { unit_count, lowerings, sets, loads, view, workspace_root, const_macros } = setup;
+    let Setup { unit_count, lowerings, sets, loads, view, workspace_root, const_macros, spellings } = setup;
     let paths = paths_of(&db, sets);
     Ok(Lowered {
         db,
@@ -303,6 +306,7 @@ pub fn lower_into<T: blaze_query::Tree>(mut db: Db, lower: Lower<'_, T>) -> Resu
         crates: std::sync::Arc::new(Crates { units: lowerings, sets }),
         paths: std::sync::Arc::new(paths),
         identities: blaze_hash::HashMap::new_in(Global),
+        spellings,
         appended: blaze_hash::HashMap::new_in(Global),
         loads,
         view,
@@ -322,6 +326,100 @@ struct Setup {
     view: ContentId,
     workspace_root: crates::Root,
     const_macros: Vec<const_macros::Loaded>,
+    spellings: std::sync::Arc<Spellings>,
+}
+
+/// A crate root's directory as the source roots have it and as cargo passed the root to rustc
+/// ([`crates::spelled_src_path`]): rustc names the crate's files under `dir` from `passed`, so
+/// `file!()`, panic and `#[track_caller]` locations and debug info say
+/// `crates/x/../../library/x/src/more.rs` where the source root has `library/x/src/more.rs`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Spelling {
+    /// The root's directory, normal, as the source roots have it.
+    dir: String,
+    /// The same directory as cargo passed the root to rustc.
+    passed: String,
+}
+
+/// How cargo passes each crate root of the build (`Spelling`), which what the program says of
+/// its files is named from: by crate for the front end (`name_sources`) and a crate's
+/// identity, by path for the code generator ([`Spellings::name`]).
+pub struct Spellings {
+    /// Every crate root's directory, each spelling once, sorted.
+    roots: Vec<Spelling>,
+    /// The crates whose root cargo spells other than by its normal path, by their spelling's
+    /// index in `roots`.
+    crates: blaze_hash::HashMap<Crate, usize, Global>,
+}
+
+impl Spellings {
+    /// Of `made`, each crate made with its root's spelling.
+    fn new(made: Vec<(Crate, Spelling)>) -> Spellings {
+        // alloc: once a lowering, every root's spelling
+        let mut roots: Vec<Spelling> = made.iter().map(|(_, it)| it.clone()).collect();
+        roots.sort_unstable();
+        roots.dedup();
+        // alloc: once a lowering, the crates of a spelled root
+        let mut crates = blaze_hash::HashMap::new_in(Global);
+        for (krate, spelling) in made {
+            if spelling.dir != spelling.passed
+                && let Ok(at) = roots.binary_search(&spelling)
+            {
+                crates.insert(krate, at);
+            }
+        }
+        Spellings { roots, crates }
+    }
+
+    /// `krate`'s root's spelling, when cargo spells it other than by its normal path.
+    fn of(&self, krate: Crate) -> Option<&Spelling> {
+        self.crates.get(&krate).map(|&at| &self.roots[at])
+    }
+
+    /// The name `krate`'s code gives the file at normal absolute `path`, absolute: from its root's
+    /// directory as cargo passed it when the file is under it; none when the crate's root is
+    /// spelled by its normal path or the file is elsewhere, so it is named by `path`.
+    fn of_crate(&self, krate: Crate, path: &str) -> Option<String> {
+        let spelling = self.of(krate)?;
+        let rest = files::rest(path, &spelling.dir)?;
+        Some(format!("{}/{rest}", spelling.passed)) // alloc: the name, once per file a place names
+    }
+
+    /// The name rustc gives the file at normal absolute `path` by its path alone, absolute, as
+    /// the code generator names a file (its span tables and `file!()` texts hold no crate): from
+    /// the directory, as cargo passed it, of each crate root it is under. `Ok(None)` when every
+    /// such root is passed by its normal path, so it is named by `path`. An error when two roots
+    /// name it two ways (one directory passed two ways, or one root's directory in another's):
+    /// rustc names it by each crate that reads it, and by path alone it has no one name.
+    pub fn name(&self, path: &str) -> Result<Option<String>, String> {
+        if self.crates.is_empty() {
+            return Ok(None);
+        }
+        let mut named: Option<(String, &Spelling)> = None;
+        let mut spelled = false;
+        for root in &self.roots {
+            let Some(rest) = files::rest(path, &root.dir) else { continue };
+            spelled |= root.dir != root.passed;
+            let name = format!("{}/{rest}", root.passed); // alloc: a name, once per file named
+            match &named {
+                None => {}
+                Some((first, by)) if *first != name => {
+                    // alloc: the error's message
+                    return Err(format!(
+                        "`{path}` is `{first}` to the crates whose root's directory cargo passes as \
+                         `{}` and `{name}` to those it passes as `{}`: rustc names a file by each \
+                         crate that reads it, and blaze's code generator names it by its path alone",
+                        by.passed, root.passed
+                    ));
+                }
+                Some(_) => {}
+            }
+            if named.is_none() {
+                named = Some((name, root));
+            }
+        }
+        Ok(named.filter(|_| spelled).map(|(name, _)| name))
+    }
 }
 
 /// The writes of [`lower_into`], in its batch: the crate graph, source roots and files of
@@ -512,6 +610,8 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
     let mut all = Vec::with_capacity(order.len());
     // alloc: once a lowering, the crates made by their root file, for the units after to share.
     let mut made: blaze_hash::HashMap<FileId, Vec<Made>, Global> = blaze_hash::HashMap::new_in(Global);
+    // alloc: once a lowering, each crate made with how cargo passes its root
+    let mut spelled: Vec<(Crate, Spelling)> = Vec::new();
     let mut const_listed = Vec::new();
     let mut const_made = Vec::new();
     for index in order {
@@ -576,6 +676,9 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
         };
         let src = crates::src_path(unit, what)?;
         let src_path = VfsPath::from(abs(&src)?);
+        // rustc names the crate's files from its root as cargo passed it, `..`s and all.
+        let passed = crates::spelled_src_path(unit, what)?;
+        let spelling = Spelling { dir: files::parent(&src).to_owned(), passed: files::parent(&passed).to_owned() };
         let set = loads
             .iter()
             .filter(|(load, _)| files::rest(&src, load).is_some())
@@ -661,6 +764,7 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
                 && it.env == env
                 && it.durability == durability
                 && it.runs == runs
+                && it.spelling == spelling
         });
         let krate = match same {
             Some(it) => it.krate,
@@ -674,7 +778,9 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
                 }
                 // clone: as `made_of`
                 let krate = Crate::create(db, made_of, extra.clone(), workspace.clone(), cfg.clone(), env.clone(), durability);
-                made_of_root.push(Made { data, aliased, extra, workspace, cfg: cfg.clone(), env, durability, runs, krate });
+                // clone: once per crate made
+                spelled.push((krate, spelling.clone()));
+                made_of_root.push(Made { data, aliased, extra, workspace, cfg: cfg.clone(), env, durability, runs, spelling, krate });
                 all.push(krate);
                 krate
             }
@@ -700,7 +806,8 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
     // alloc: once per lowering, the primary units' crates
     let primary = (lowerings.iter().enumerate()).filter(|(at, _)| units.is_primary(*at)).filter_map(|(_, it)| it.krate).collect();
     base_db::set_primary_crates(db, primary);
-    name_sources(db, workspace_root.dir.as_deref(), &config.library);
+    let spellings = std::sync::Arc::new(Spellings::new(spelled));
+    name_sources(db, workspace_root.dir.as_deref(), &config.library, &spellings);
 
     Ok(Setup {
         unit_count,
@@ -710,6 +817,7 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
         view: root,
         workspace_root,
         const_macros: const_made,
+        spellings,
     })
 }
 
@@ -726,6 +834,9 @@ struct Made {
     env: Env,
     durability: Durability,
     runs: Vec<usize>,
+    /// How cargo passes its root: one file passed two ways is two crates, as rustc names their
+    /// files apart.
+    spelling: Spelling,
     krate: Crate,
 }
 
@@ -733,6 +844,12 @@ impl Lowered {
     /// [`Crates::krate`].
     pub fn krate(&self, unit: usize) -> Option<Crate> {
         self.crates.krate(unit)
+    }
+
+    /// How cargo passes each crate's root, which the program's names of its files are made from
+    /// ([`Spellings::name`]).
+    pub fn spellings(&self) -> &std::sync::Arc<Spellings> {
+        &self.spellings
     }
 
     /// Runs `f`'s writes as one change, `trigger` ([`Db::batch`]): the maintainers run once
@@ -775,7 +892,8 @@ impl Lowered {
 
     /// Unit `unit`'s identity in the front end: of its crate (its root file's path, data,
     /// cfgs, env, edition, target), its root's text and appended module (an alias's, which is
-    /// not among its source root's files), the files of its source root by path and content (an
+    /// not among its source root's files), how cargo passes its root (which its code's names of
+    /// its files say), the files of its source root by path and content (an
     /// applied run's `OUT_DIR` among them), and each crate it depends on by its identity, so the
     /// identity of a crate covers everything it is made from before it is resolved. None for a
     /// unit with no crate. Worked out once per crate between writes.
@@ -788,7 +906,7 @@ impl Lowered {
     /// a per-run `BLAZE_PROFILE`.
     pub fn identity(&mut self, unit: usize) -> Option<ContentId> {
         let krate = self.crates.krate(unit)?;
-        Some(identity_of(&self.db, krate, &mut self.identities))
+        Some(identity_of(&self.db, krate, &self.spellings, &mut self.identities))
     }
 
     /// The first variable of the process that a crate of the front end read through `env!` or
@@ -1105,11 +1223,16 @@ fn checked<'a>(crates: &'a Crates, run: usize, ran: &Ran) -> Result<(&'a Lowerin
 /// `include_str!` read moved on disk, and the view did not.
 const INCLUDED_MOVED: Trigger<'static> = Trigger::named("files include_bytes! or include_str! read moved on disk");
 
-const IDENTITY: &str = "blaze v2 cargo unit identity 4";
+const IDENTITY: &str = "blaze v2 cargo unit identity 5";
 
 /// [`Lowered::identity`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own rather than the thread's.
-fn identity_of(db: &Db, krate: Crate, known: &mut blaze_hash::HashMap<Crate, ContentId, Global>) -> ContentId {
+fn identity_of(
+    db: &Db,
+    krate: Crate,
+    spellings: &Spellings,
+    known: &mut blaze_hash::HashMap<Crate, ContentId, Global>,
+) -> ContentId {
     if let Some(identity) = known.get(&krate) {
         return *identity;
     }
@@ -1127,6 +1250,19 @@ fn identity_of(db: &Db, krate: Crate, known: &mut blaze_hash::HashMap<Crate, Con
         let root = db.file_source_root(data.root_file_id).source_root_id(db);
         let mut hasher = Hasher::new(IDENTITY);
         hasher.id(&at.content(db)).id(&db.file_text(data.root_file_id).content(db)).id(&db.source_root(root).content(db));
+        // How rustc names the crate's files, which its code says (`file!()`, panic locations).
+        match spellings.of(at) {
+            None => {
+                hasher.update(&[0]);
+            }
+            Some(spelling) => {
+                hasher.update(&[1]);
+                for text in [&spelling.dir, &spelling.passed] {
+                    hasher.update(&(text.len() as u64).to_le_bytes());
+                    hasher.update(text.as_bytes());
+                }
+            }
+        }
         hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
         for dep in &data.dependencies {
             hasher.id(&known[&dep.crate_id]);
@@ -1136,24 +1272,40 @@ fn identity_of(db: &Db, krate: Crate, known: &mut blaze_hash::HashMap<Crate, Con
     known[&krate]
 }
 
-/// Tells the evaluator of constants what the build calls each file (`file!()` in a constant's
-/// value, such as tracing's callsite statics), as cargo has rustc call it: a file of the
-/// standard library (under `library`) by its path as it is, one under the workspace's root
-/// `workspace` by its path from there, any other by its absolute path. The key names both
-/// directories, so telling it again for the same workspace evaluates nothing again.
-fn name_sources(db: &mut Db, workspace: Option<&str>, library: &str) {
+/// Tells the front end what the build calls each file (`file!()` in a constant's value, such as
+/// tracing's callsite statics, a `Location` the evaluator makes, a broken contract's place), as
+/// cargo has rustc call it; the code generator names files by [`Spellings::name`]: a
+/// file of the standard library (under `library`) by its path as it is, one under the
+/// workspace's root `workspace` by its path from there, any other by its absolute path; each as
+/// the crate whose code is in it reaches it from its root as cargo passed it, so a crate of a
+/// [`Spelling`] names the files under its root's directory from `passed`, `..`s and all. The
+/// key names both directories and the spellings, so telling it again for the same workspace
+/// evaluates nothing again. It is told once a database ([`lower_writes`]), whose crates the
+/// spellings are of.
+fn name_sources(db: &mut Db, workspace: Option<&str>, library: &str, spellings: &std::sync::Arc<Spellings>) {
     let library = format!("{}/", library.trim_end_matches('/'));
     let workspace = workspace.map(|it| format!("{}/", it.trim_end_matches('/')));
-    let key = format!("{}\0{library}", workspace.as_deref().unwrap_or(""));
-    hir_ty_mir::mir::location::name_sources(db, &key, move |db, file| {
+    // alloc: once a lowering, the spelled roots in the key, sorted as `roots` is
+    let spelled: Vec<String> = (spellings.roots.iter())
+        .filter(|it| it.dir != it.passed)
+        .map(|it| format!("{}\0{}", it.dir, it.passed))
+        .collect();
+    let key = format!("{}\0{library}\0{}", workspace.as_deref().unwrap_or(""), spelled.join("\0"));
+    let spellings = std::sync::Arc::clone(spellings);
+    hir_ty_mir::mir::location::name_sources(db, &key, move |db, krate, file| {
         let root = db.file_source_root(file).source_root_id(db);
         let root = db.source_root(root).source_root(db);
         let path = root.path_for_file(&file)?.as_path()?.as_str();
         if path.starts_with(&library) {
             return Some(path.to_owned());
         }
-        let relative = workspace.as_deref().and_then(|it| path.strip_prefix(it));
-        Some(relative.unwrap_or(path).to_owned())
+        // From the root's directory as cargo passed it, as rustc joins a module's path.
+        let path = spellings.of_crate(krate, path).unwrap_or_else(|| path.to_owned());
+        // cargo passes a root under the workspace's root by its path from there, by its text.
+        Some(match workspace.as_deref().and_then(|it| path.strip_prefix(it)) {
+            Some(relative) => relative.to_owned(),
+            None => path,
+        })
     });
 }
 

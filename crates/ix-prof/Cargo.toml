@@ -14,6 +14,8 @@ repository.workspace = true
 doctest = false
 
 [features]
+# A library other projects link too (docs/ix-prof.md), each taking what it needs; blaze-engine
+# takes `sampler` alone.
 default = ["sampler", "layer"]
 # The CPU sampler thread (perf_event_open on Linux, thread_suspend on arm64 macOS).
 sampler = []
@@ -28,6 +30,9 @@ arrow-array.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 blake3.workspace = true
+# The dev runtime's stubs and jump table: a function pointer of a blaze dev run is its slot's
+# stub, which only the jump table ties to its function (symbols.rs).
+blaze-inproc-rt.workspace = true
 crossbeam-queue.workspace = true
 flate2 = { workspace = true, features = ["rust_backend"] }
 # `endian-reader`: `EndianArcSlice`, the reader the symbolizer keeps DWARF in.

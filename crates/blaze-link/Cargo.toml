@@ -14,9 +14,6 @@ repository.workspace = true
 doctest = false
 
 [features]
-default = ["llvm-stencils"]
-# blaze-stencil's stencils made by LLVM at build time; off in the seed profile.
-llvm-stencils = ["blaze-lazy/llvm-stencils"]
 # The entry points and reference readers the fuzz targets call; off in every other build.
 fuzz = []
 

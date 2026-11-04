@@ -15,7 +15,6 @@ use crate::{Request, order, schema};
 /// What one [`super::build`] allocated on its thread: in all, inside [`external`] calls, and
 /// inside [`output`] (the JSON it returns).
 #[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(not(feature = "query"), allow(dead_code))]
 pub(super) struct Budget {
     total: u64,
     external: u64,
@@ -24,7 +23,6 @@ pub(super) struct Budget {
 
 impl Budget {
     /// What the graph allocated itself: its columns, maps and buffers.
-    #[cfg_attr(not(feature = "query"), allow(dead_code))]
     fn own(self) -> u64 {
         self.total - self.external - self.output
     }
@@ -68,7 +66,6 @@ pub(super) fn measured(
 }
 
 /// Runs `f`, and the graphs it built on this thread with their budgets.
-#[cfg_attr(not(feature = "query"), allow(dead_code))]
 fn armed(f: impl FnOnce()) -> Vec<(Budget, schema::UnitGraph)> {
     BUILT.with(|it| it.borrow_mut().clear());
     ARMED.set(true);
@@ -173,7 +170,6 @@ fn dense_ranks_give_equal_items_one_rank() {
 }
 
 /// The graph of real workspaces, built as the daemon builds it: through the load's queries.
-#[cfg(feature = "query")]
 mod load {
     use super::{Budget, armed};
     use crate::load::tests::{Ask, Fixture, HOST, WS, ask};

@@ -143,7 +143,7 @@ fn a_profile_that_is_not_there_is_an_error_naming_its_path() {
     assert!(absolute.contains("`/nonexistent/blaze/merged.profdata` can't be read"), "{absolute}");
 }
 
-#[cfg(feature = "llvm")]
+#[cfg(feature = "native")]
 #[test]
 fn a_profile_read_is_named_by_its_content_and_given() {
     let dir = tempfile::tempdir().unwrap();
@@ -155,7 +155,7 @@ fn a_profile_read_is_named_by_its_content_and_given() {
     assert_eq!(read.unstored.lock().as_deref(), Some(&bytes[..]));
 }
 
-#[cfg(not(feature = "llvm"))]
+#[cfg(not(feature = "native"))]
 #[test]
 fn a_profile_to_use_without_llvm_stops_naming_the_feature() {
     let dir = tempfile::tempdir().unwrap();

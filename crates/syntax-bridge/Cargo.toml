@@ -33,8 +33,8 @@ expect-test.workspace = true
 test-utils.workspace = true
 
 [features]
-in-rust-tree = ["parser/in-rust-tree", "tt/in-rust-tree", "syntax/in-rust-tree"]
-# The conversions the build no longer runs, as references for other crates' tests.
+# The conversions the build no longer runs, as references for other crates' tests; only dev
+# units turn it on (mbe's and hir-expand's).
 reference = []
 
 [lints]

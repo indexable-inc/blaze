@@ -616,6 +616,10 @@ pub struct MemoryLine<'a> {
     pub heap: u64,
     /// The chunks no owner holds ([`blaze_mem::chunks::cached`]).
     pub chunks: blaze_mem::chunks::Cached,
+    /// The most reads one query run held (and the run, `` `query` of key ``) and the most
+    /// pending rows one task held ([`blaze_query::db::stack_high_water`]), what the runaway
+    /// bounds are set against; not shown while both counts are 0.
+    pub stacks: blaze_query::db::StackHighWater,
 }
 
 impl MemoryLine<'_> {
@@ -737,6 +741,14 @@ impl fmt::Display for MemoryLine<'_> {
                 gib(self.chunks.cold),
             )?;
         }
+        let blaze_query::db::StackHighWater { run_reads, run, pending } = &self.stacks;
+        if (*run_reads, *pending) != (0, 0) {
+            write!(f, "; query stack most reads one run {run_reads}")?;
+            if !run.is_empty() {
+                write!(f, " ({run})")?;
+            }
+            write!(f, ", most pending rows one task {pending}")?;
+        }
         let total = self.blocks.total();
         if total.carved == 0 {
             return Ok(());
@@ -778,7 +790,8 @@ fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     let heap = blaze_graph::arena::held();
     let blocks = blaze_mem::blocks::snapshot();
     let chunks = blaze_mem::chunks::cached();
-    let said = MemoryLine { memory, blocks: &blocks, resident, heap, chunks }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
+    let stacks = blaze_query::db::stack_high_water();
+    let said = MemoryLine { memory, blocks: &blocks, resident, heap, chunks, stacks }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
     eprintln!("blaze serve: {said}");
     tracing::info!("{said}");
 }
@@ -2447,7 +2460,7 @@ mod tests {
         };
         blocks.classes[10] = blaze_mem::blocks::ClassCounters { size: 5 << 10, carved: 1 << 20, ..Default::default() };
         let chunks = blaze_mem::chunks::Cached { warm: 1 << 29, cold: 1 << 30 };
-        let said = MemoryLine { memory: &memory, blocks: &blocks, resident: Some(12 << 30), heap: 6 << 30, chunks }.to_string();
+        let said = MemoryLine { memory: &memory, blocks: &blocks, resident: Some(12 << 30), heap: 6 << 30, chunks, stacks: blaze_query::db::StackHighWater::default() }.to_string();
         let infer = said
             .find(&format!("; {} 1.00 (most 2.00, reserved 0 in 0) + heap 4.00 (most 5.00)", MemTag::Infer))
             .expect(&said);
@@ -2466,7 +2479,7 @@ mod tests {
         );
         // An allocator that keeps no tags says so, rather than show every tag holding none.
         let untagged = Snapshot { heap_by_tag: false, ..memory };
-        let said_untagged = MemoryLine { memory: &untagged, blocks: &blocks, resident: None, heap: 6 << 30, chunks }.to_string();
+        let said_untagged = MemoryLine { memory: &untagged, blocks: &blocks, resident: None, heap: 6 << 30, chunks, stacks: blaze_query::db::StackHighWater::default() }.to_string();
         assert!(said_untagged.starts_with("memory: global heap 6.00 GiB live, not kept by tag, in 7.00 "), "{said_untagged}");
         assert!(!said.contains(&format!("; {} ", MemTag::Parse)), "{said}");
         // The classes: live is carved less warm and cold; a class carving little is not shown.
@@ -2480,7 +2493,7 @@ mod tests {
         );
         let none = blaze_mem::blocks::Snapshot::default();
         let unknown =
-            MemoryLine { memory: &memory, blocks: &none, resident: None, heap: 0, chunks: blaze_mem::chunks::Cached::default() }
+            MemoryLine { memory: &memory, blocks: &none, resident: None, heap: 0, chunks: blaze_mem::chunks::Cached::default(), stacks: blaze_query::db::StackHighWater::default() }
                 .to_string();
         assert!(unknown.starts_with("memory: committed 5.00 GiB"), "{unknown}");
         assert!(!unknown.contains("blocks"), "{unknown}");

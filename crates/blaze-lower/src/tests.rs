@@ -428,7 +428,10 @@ fn files_are_at_cargos_paths_in_their_roots() {
 fn a_constants_file_names_a_members_file_from_the_workspaces_root() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();
-    let name = |unit: usize| hir_ty_mir::mir::location::source_path(db, krate(&built, unit).data(db).root_file_id);
+    let name = |unit: usize| {
+        let krate = krate(&built, unit);
+        hir_ty_mir::mir::location::source_path(db, krate, krate.data(db).root_file_id)
+    };
     assert_eq!(name(LIB), Some("a/src/lib.rs"));
     assert_eq!(name(BIN), Some("b/src/main.rs"));
     assert_eq!(name(CORE), Some("/rustc/abc/library/core/src/lib.rs"));
@@ -1574,4 +1577,140 @@ fn a_refresh_reads_again_an_included_file_that_moved_on_disk_and_only_it() {
     assert_eq!(refresh(&mut built), unmoved + 1);
     assert!(read(&built, &moving).0.is_err(), "a file gone is a moved read: its error");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The unit with a root outside its package ([`outside_root`]), and std's build of the same
+/// source.
+const RT: usize = 7;
+const STD_RT: usize = 8;
+/// A second unit passing the same root another way ([`outside_root`]'s `twice`).
+const RT_AGAIN: usize = 9;
+
+/// [`units`] with a member `r` whose lib is outside its directory (`[lib] path =
+/// "../library/rt/src/lib.rs"`, as crates/blaze-inproc-rt has it), and a standard library
+/// crate built from the same source under the library's mount (blaze's dev runtime). With
+/// `twice`, a member `s` passes the same root as `/w/s/../library/rt/src/lib.rs`.
+fn outside_root(twice: bool) -> Lowered {
+    let tree = MemTree::default();
+    let mut files: Vec<(&str, &[u8])> = FILES.to_vec();
+    files.push(("r/Cargo.toml", b"[package]\nname = \"r\"\n\n[lib]\npath = \"../library/rt/src/lib.rs\"\n"));
+    files.push(("s/Cargo.toml", b"[package]\nname = \"s\"\n\n[lib]\npath = \"../library/rt/src/lib.rs\"\n"));
+    files.push(("library/rt/src/lib.rs", b"mod more;\n"));
+    files.push(("library/rt/src/more.rs", b"pub fn more() {}\n"));
+    let root = tree.root(&files);
+    let library = tree.root(&[
+        ("core/Cargo.toml", b"[package]\nname = \"core\"\n"),
+        ("core/src/lib.rs", b"#[path = \"../../stdarch/crates/core_arch/src/mod.rs\"] mod core_arch;\n"),
+        ("stdarch/crates/core_arch/src/mod.rs", b"pub mod arch {}\n"),
+        ("rt/Cargo.toml", b"[package]\nname = \"rt\"\n"),
+        ("rt/src/lib.rs", b"mod more;\n"),
+        ("rt/src/more.rs", b"pub fn more() {}\n"),
+    ]);
+    let mut units = units();
+    let r = "path+file:///w/r#0.1.0";
+    let rt = "path+file:///rustc/abc/library/rt#0.0.0";
+    let ours = target("lib", "rt", "/w/r/../library/rt/src/lib.rs", "2021");
+    units.graph.units.push(unit(r, ours, Mode::Build, false, vec![]));
+    let theirs = target("lib", "rt", "/rustc/abc/library/rt/src/lib.rs", "2024");
+    units.graph.units.push(unit(rt, theirs, Mode::Build, true, vec![]));
+    units.plans.push(plan(&[], &[], None));
+    units.plans.push(plan(&[], &[], None));
+    units.packages.push(package(r, "r", "/w/r/Cargo.toml", Some("(/w/r)"), true));
+    units.packages.push(package(rt, "rt", "/rustc/abc/library/rt/Cargo.toml", Some("(/rustc/abc/library/rt)"), false));
+    if twice {
+        let s = "path+file:///w/s#0.1.0";
+        let again = target("lib", "rt", "/w/s/../library/rt/src/lib.rs", "2021");
+        units.graph.units.push(unit(s, again, Mode::Build, false, vec![]));
+        units.plans.push(plan(&[], &[], None));
+        units.packages.push(package(s, "s", "/w/s/Cargo.toml", Some("(/w/s)"), true));
+    }
+    units.packages.sort_by(|x, y| x.id.cmp(&y.id));
+    let config = config(root, library);
+    lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap()
+}
+
+/// A target whose root is outside its package's directory: cargo's `src_path` keeps the `..`s,
+/// which by its bytes is under the package's own directory and by its name in no source root.
+/// The root's directory is read into the package's source root, so its `mod` files resolve; the
+/// standard library's build of the same source is a crate of its own, of another file in std's
+/// root.
+#[test]
+fn a_root_outside_its_package_is_read_and_resolves_its_modules() {
+    let lowered = outside_root(false);
+    let db = lowered.db();
+    let paths = lowered.paths();
+
+    let ours = lowered.krate(RT).expect("the unit with a root outside its package is a crate");
+    let our_root = ours.data(db).root_file_id;
+    assert_eq!(paths.get(&our_root).map(String::as_str), Some("/w/library/rt/src/lib.rs"));
+    // In its package's source root, a local one, with the package's own files.
+    let set = root_of(db, ours);
+    assert!(!set.is_library);
+    assert!(set.file_for_path(&path("/w/r/Cargo.toml")).is_some());
+    let more = set.file_for_path(&path("/w/library/rt/src/more.rs")).copied().expect("the root's directory is read");
+    // `mod more;` resolves to the file beside the root, as rustc's would.
+    let def_map = hir_def::nameres::crate_def_map(db, ours);
+    assert_eq!(def_map.modules_for_file(db, more).count(), 1, "`mod more;` names `more.rs` beside the root");
+
+    // The standard library's build of the same source: another crate of another file, in std's
+    // library root.
+    let theirs = lowered.krate(STD_RT).expect("std's build is a crate");
+    let their_root = theirs.data(db).root_file_id;
+    assert_ne!(ours, theirs);
+    assert_ne!(our_root, their_root);
+    assert_eq!(paths.get(&their_root).map(String::as_str), Some("/rustc/abc/library/rt/src/lib.rs"));
+    assert!(root_of(db, theirs).is_library);
+    assert_eq!(root_id_of(db, theirs), root_id_of(db, lowered.krate(CORE).expect("core is a crate")));
+    assert_ne!(root_id_of(db, ours), root_id_of(db, theirs));
+}
+
+/// What a program says of its files (`file!()`, panic and `#[track_caller]` locations, debug
+/// info) is rustc's text: cargo passes a root under the workspace's root by its path from there
+/// as `[lib] path` spells it, and rustc joins each module's path to the root's directory, `..`s
+/// kept. The front end names a file by the crate whose code is in it; the code generator, by
+/// its path alone, the same.
+#[test]
+fn a_root_passed_with_dot_dots_names_its_files_as_rustc_does() {
+    let lowered = outside_root(false);
+    let db = lowered.db();
+    let ours = lowered.krate(RT).expect("the unit with a root outside its package is a crate");
+    let our_root = ours.data(db).root_file_id;
+    let more = root_of(db, ours).file_for_path(&path("/w/library/rt/src/more.rs")).copied().expect("read");
+    let name = |krate, file| hir_ty_mir::mir::location::source_path(db, krate, file);
+    assert_eq!(name(ours, our_root), Some("r/../library/rt/src/lib.rs"));
+    assert_eq!(name(ours, more), Some("r/../library/rt/src/more.rs"));
+    // A crate whose root cargo passes by its normal path names the same file by its normal
+    // path, as rustc would for that crate.
+    let lib = lowered.krate(LIB).expect("`a` is a crate");
+    assert_eq!(name(lib, more), Some("library/rt/src/more.rs"));
+    assert_eq!(name(lib, lib.data(db).root_file_id), Some("a/src/lib.rs"));
+    // std's build of the source is named as the standard library's files are.
+    let theirs = lowered.krate(STD_RT).expect("std's build is a crate");
+    assert_eq!(name(theirs, theirs.data(db).root_file_id), Some("/rustc/abc/library/rt/src/lib.rs"));
+
+    // The code generator's names, by path: absolute, which the build makes relative to the
+    // workspace's root as the front end's are.
+    let spellings = lowered.spellings();
+    assert_eq!(spellings.name("/w/library/rt/src/more.rs"), Ok(Some("/w/r/../library/rt/src/more.rs".to_owned())));
+    assert_eq!(spellings.name("/w/a/src/lib.rs"), Ok(None));
+    assert_eq!(spellings.name("/rustc/abc/library/rt/src/lib.rs"), Ok(None));
+}
+
+/// One root file two packages pass two ways (`/w/r/../library/rt/src/lib.rs` and
+/// `/w/s/../library/...`): each crate names it its own way, as rustc does; by path alone the
+/// file has no one name, and the code generator's name is refused naming both ways.
+#[test]
+fn a_root_passed_two_ways_is_two_crates_with_two_names() {
+    let lowered = outside_root(true);
+    let db = lowered.db();
+    let (r, s) = (lowered.krate(RT).expect("r is a crate"), lowered.krate(RT_AGAIN).expect("s is a crate"));
+    assert_ne!(r, s, "two packages' crates");
+    let root = r.data(db).root_file_id;
+    assert_eq!(s.data(db).root_file_id, root);
+    assert_eq!(hir_ty_mir::mir::location::source_path(db, r, root), Some("r/../library/rt/src/lib.rs"));
+    assert_eq!(hir_ty_mir::mir::location::source_path(db, s, root), Some("s/../library/rt/src/lib.rs"));
+    let Err(refused) = lowered.spellings().name("/w/library/rt/src/lib.rs") else {
+        panic!("a file named two ways by path alone was given one name")
+    };
+    assert!(refused.contains("/w/r/../library/rt/src") && refused.contains("/w/s/../library/rt/src"), "{refused}");
 }

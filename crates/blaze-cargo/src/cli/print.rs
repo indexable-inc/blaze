@@ -102,6 +102,9 @@ pub struct Shown {
     pub color: bool,
     /// `BLAZE_STATS` is set: the request's run time by kind goes to stderr too.
     pub stats: bool,
+    /// `check --fix`: the run makes the suggestions it prints, so no summary hints at
+    /// `blaze check --fix`.
+    pub fixing: bool,
 }
 
 /// What one unit's diagnostics came to.
@@ -126,7 +129,7 @@ struct Unit {
     test: bool,
     /// The library's doc tests, named as such when they fail.
     doctest: bool,
-    /// A path package, whose summary hints at `cargo fix`.
+    /// A path package, whose summary hints at `blaze check --fix`.
     local: bool,
 }
 
@@ -561,7 +564,7 @@ fn summary(line: &mut String, unit: &Unit, names: &str, counted: &Counted, shown
     let target = say::Named { kind: unit.kind, name: named(names, unit.target) };
     if !shown.quiet && counted.warned.total > 0 {
         say::leveled_with(line, say::WARN, "warning", shown.color, |line| {
-            say::generated_into(line, package, target, unit.test, unit.local, counted.warned);
+            say::generated_into(line, package, target, unit.test, unit.local && !shown.fixing, counted.warned);
         });
     }
     if counted.errors > 0 {

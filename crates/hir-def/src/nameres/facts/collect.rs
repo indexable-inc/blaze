@@ -58,7 +58,7 @@ use super::{
     FrameMap, FrameVec,
     env::{Ancestor, ChildMode, ChildRequest, CollectCx, CollectEnv, SideTables, Sink},
     map_in,
-    ops::{DeclOp, ImportOp, ImportSource, Inherited, MacroOp, MacroOpKind, OpLog},
+    ops::{DeclOp, ImportOp, ImportSource, Inherited, LegacyExports, MacroOp, MacroOpKind, OpLog},
     queries::{
         self, CrateEnvKey, Decl, DeclItems, DeclKey, EnvKey, ModuleDecls, Rows, RowsKey, Scope,
     },
@@ -687,7 +687,9 @@ impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
         let children = Box::from(&self.children[..]);
         let db = self.cx.db;
         let row = self.def_map.module(db, self.decl.module);
-        let legacy = textual_scope(row.scope(db));
+        // What it inherited and did not shadow is its parent's already: a `#[macro_use] mod`
+        // that handed it back would append each visible macro to the parent's chain again.
+        let legacy = legacy_exports_of(row.scope(db), &self.decl.inherited);
         #[cfg(test)]
         {
             let crate::nameres::ScopeSlot::Building(held) = &row.scope else {
@@ -848,12 +850,32 @@ pub(crate) fn decl_row(
     })
 }
 
-/// `scope`'s textual (`macro_rules!`) scope, every definition of each name, at exact size: a
-/// module's `legacy` and the scope a child starts with.
+/// `scope`'s textual (`macro_rules!`) scope, every definition of each name, at exact size: the
+/// scope a child starts with. `#[macro_use] mod` adds only what is not its module's latest
+/// already, so no chain holds an id twice.
 fn textual_scope(scope: &ItemScope) -> Inherited {
     let mut out = Vec::with_capacity(scope.legacy_macros().count());
-    // alloc: one exact box per name, the result's own
+    // alloc: one exact box per name, the key's own
     out.extend(scope.legacy_macros().map(|(name, macs)| (*name, Box::from(macs))));
+    out.into_boxed_slice()
+}
+
+/// What a `#[macro_use] mod` of the module with scope `scope` hands its parent: the latest
+/// definition of each name, leaving out one that is still the latest of `inherited` (the
+/// parent holds it as its latest already).
+fn legacy_exports_of(scope: &ItemScope, inherited: &Inherited) -> LegacyExports {
+    let inherited_latest = |name: &Name| {
+        inherited.iter().find(|it| it.0 == *name).and_then(|it| it.1.last().copied())
+    };
+    let exports = || {
+        scope
+            .legacy_macros()
+            .filter_map(|(name, macs)| Some((*name, *macs.last()?)))
+            .filter(|&(name, mac)| inherited_latest(&name) != Some(mac))
+    };
+    let mut out = Vec::with_capacity(exports().count());
+    // alloc: the query's value, at exact size, once per module
+    out.extend(exports());
     out.into_boxed_slice()
 }
 
@@ -2343,30 +2365,29 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
     }
 
     /// `#[macro_use] mod`: the child's `macro_rules!` join this module's textual scope, the last
-    /// definition of each name.
+    /// definition of each name. One that is this module's latest already (the child only
+    /// inherited it) is left out: rustc's textual scope continues through the module, it does
+    /// not copy it, so each `#[macro_use] mod` re-adding every visible macro grew every chain
+    /// (and every later key's `inherited`) by one per such module.
     fn import_all_legacy_macros(&mut self, child: ModuleId, mode: ChildMode) {
         let db = self.cx.db;
         let module = self.module_id;
+        let mut exports = Vec::new_in(self.cx.frame);
         match mode {
-            ChildMode::Separate(key) => {
-                for &(name, mac) in queries::legacy_exports(db, key).iter() {
-                    self.sink.apply(DeclOp::DefineLegacyMacro { module, name, mac });
-                }
-            }
-            ChildMode::Inline => {
-                let mut exports = Vec::new_in(self.cx.frame);
-                exports.extend(
-                    self.sink
-                        .def_map()
-                        .module(db, child)
-                        .scope(db)
-                        .legacy_macros()
-                        .filter_map(|(name, macs)| Some((*name, *macs.last()?))),
-                );
-                for (name, mac) in exports {
-                    self.sink.apply(DeclOp::DefineLegacyMacro { module, name, mac });
-                }
-            }
+            ChildMode::Separate(key) => exports.extend(queries::legacy_exports(db, key).iter().copied()),
+            ChildMode::Inline => exports.extend(
+                self.sink
+                    .def_map()
+                    .module(db, child)
+                    .scope(db)
+                    .legacy_macros()
+                    .filter_map(|(name, macs)| Some((*name, *macs.last()?))),
+            ),
+        }
+        let own = self.sink.def_map().module(db, module).scope(db);
+        exports.retain(|&(name, mac)| own.get_legacy_macro(&name).and_then(<[_]>::last) != Some(&mac));
+        for (name, mac) in exports {
+            self.sink.apply(DeclOp::DefineLegacyMacro { module, name, mac });
         }
     }
 
@@ -2557,6 +2578,76 @@ macro_rules! file_mac { () => {} }
         let ops = &queries::module_decls(&db, after).ops;
         assert!(ops.iter().all(|op| !matches!(op, DeclOp::Macro(_))), "a textual macro call was left for later");
         assert_eq!(ops.iter().filter(|op| matches!(op, DeclOp::AddMacroInvoc { .. })).count(), 2);
+    }
+
+    /// A nested tree under several `#[macro_use]` modules: every key's `inherited` names each
+    /// macro once, every textual chain (inherited ones too) holds each id once, and a deep
+    /// child inherits the whole chain with the shadowing definition last. Each `#[macro_use]
+    /// mod` used to hand back every macro it only inherited, growing each chain (and every
+    /// later key) by one per such module.
+    #[test]
+    fn inherited_textual_scope_has_each_macro_once() {
+        let db = assert_replay(
+            r#"
+//- /lib.rs crate:main
+macro_rules! top { () => {} }
+#[macro_use]
+mod m1 { macro_rules! one { () => {} } }
+#[macro_use]
+mod m2;
+#[macro_use]
+mod m3 { macro_rules! top { () => {} } }
+mod a {
+    #[macro_use]
+    mod n1 {}
+    #[macro_use]
+    mod n2;
+    mod b {
+        #[macro_use]
+        mod k {}
+        mod c {
+            top!();
+        }
+    }
+}
+//- /m2.rs
+macro_rules! two { () => {} }
+//- /a/n2.rs
+"#,
+        );
+        for key in keys(&db) {
+            let decl = key.decl(&db);
+            let mut names: Vec<_> = decl.inherited.iter().map(|it| it.0).collect();
+            let all = names.len();
+            names.sort_by(|a, b| a.symbol().cmp_order(b.symbol()));
+            names.dedup();
+            assert_eq!(names.len(), all, "a name repeats in the `inherited` of {:?}: {:?}", decl.module, decl.inherited);
+            for (name, macs) in super::held_scope(key).scope.legacy_macros() {
+                let mut ids = macs.to_vec();
+                ids.sort_unstable();
+                ids.dedup();
+                assert_eq!(ids.len(), macs.len(), "`{name:?}` repeats in the textual scope of {:?}: {macs:?}", decl.module);
+            }
+        }
+        let root = root_key(&db);
+        let held = super::held_scope(root);
+        let chain = |it: &str| held.scope.get_legacy_macro(&name(it)).map(<[_]>::len);
+        assert_eq!(chain("top"), Some(2), "the root's `top` is its own and `m3`'s, once each");
+        assert_eq!((chain("one"), chain("two")), (Some(1), Some(1)));
+        let c = child_key(&db, child_key(&db, child_key(&db, root, "a"), "b"), "c");
+        let inherited = &c.decl(&db).inherited;
+        assert_eq!(inherited.len(), 3, "`c` inherits `top`, `one` and `two`: {inherited:?}");
+        let root_top = held.scope.get_legacy_macro(&name("top")).map(<[_]>::to_vec);
+        let c_top = inherited.iter().find(|it| it.0 == name("top")).map(|it| it.1.to_vec());
+        assert_eq!(c_top, root_top, "`c` inherits the whole `top` chain, the shadowing one last");
+        for it in inherited.iter() {
+            let mut ids = it.1.to_vec();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), it.1.len(), "`{:?}` repeats in the `inherited` of `c`: {:?}", it.0, it.1);
+        }
+        let m1 = child_key(&db, root, "m1");
+        assert_eq!(queries::legacy_exports(&db, m1).len(), 1, "`m1` hands back only `one`");
     }
 
     #[test]

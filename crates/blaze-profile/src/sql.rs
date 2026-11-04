@@ -436,7 +436,7 @@ mod tests {
     fn old_history(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("blaze-sql-{name}-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
-        drop(History::open(&dir, CAP_BYTES).unwrap());
+        drop(History::open(&dir, CAP_BYTES, crate::sampler::unsampled()).unwrap());
         for table in ["events", "query_counts"] {
             fs::remove_file(dir.join(format!("schema.{table}.parquet"))).unwrap();
         }
@@ -542,7 +542,7 @@ mod tests {
         .unwrap();
         let dir = std::env::temp_dir().join(format!("blaze-sql-test-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
-        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let mut history = History::open(&dir, CAP_BYTES, crate::sampler::unsampled()).unwrap();
         history.build_ended(BuildRow {
             build_id: 77,
             commit: Some("feedbeef".into()),
@@ -620,7 +620,7 @@ mod tests {
         let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
         let dir = std::env::temp_dir().join(format!("blaze-sql-critical-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
-        History::open(&dir, CAP_BYTES).unwrap();
+        History::open(&dir, CAP_BYTES, crate::sampler::unsampled()).unwrap();
         let fixture = format!(
             "COPY (SELECT * FROM (VALUES (1::UBIGINT, 0::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
                 AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000001.builds.parquet';\n\
@@ -683,7 +683,7 @@ mod tests {
         let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
         let dir = std::env::temp_dir().join(format!("blaze-sql-uncovered-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
-        History::open(&dir, CAP_BYTES).unwrap();
+        History::open(&dir, CAP_BYTES, crate::sampler::unsampled()).unwrap();
         let fixture = format!(
             "COPY (SELECT * FROM (VALUES (1::UBIGINT, 0::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
                 AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000001.builds.parquet';\n\

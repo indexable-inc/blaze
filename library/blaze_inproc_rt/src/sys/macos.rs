@@ -34,10 +34,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::Duration;
 
-pub(crate) use super::unix::{
+pub use super::unix::{
     Bells, Errno, Listener, Scope, Stream, backtrace, connect, hung_up, random, ring, serialize, wait_answer,
 };
-pub(crate) use rendezvous::{Remote, recv_objects, send_objects};
+pub use rendezvous::{Remote, recv_objects, send_objects};
 use crate::channel::Channel;
 use crate::handshake::Overlay;
 use crate::{Access, Error};
@@ -114,7 +114,7 @@ const ULF_WAKE_ALL: u32 = 0x100;
 /// Errors come back negated, and `errno` is left as it was.
 const ULF_NO_ERRNO: u32 = 0x0100_0000;
 
-pub(crate) fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
+pub fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
     let micros = u32::try_from(timeout.as_micros()).unwrap_or(u32::MAX).max(1);
     // SAFETY: `word` is live and 8-aligned; the kernel compares its first four bytes, the low
     // half, with `expected` and sleeps on the memory they name.
@@ -122,7 +122,7 @@ pub(crate) fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
     got != -libc::ETIMEDOUT
 }
 
-pub(crate) fn wake(word: &AtomicU64) {
+pub fn wake(word: &AtomicU64) {
     // SAFETY: as in `wait`; a wake reads nothing of the word.
     unsafe { __ulock_wake(UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL | ULF_NO_ERRNO, word.as_ptr().cast(), 0) };
 }
@@ -141,7 +141,7 @@ fn kern(what: &str, code: Kern) -> Error {
     Error::new(format!("{what}: kern_return {code:#x} ({})", reason.to_string_lossy()))
 }
 
-pub(crate) fn page() -> u64 {
+pub fn page() -> u64 {
     // SAFETY: sysconf has no preconditions.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page > 0 { page as u64 } else { 16384 }
@@ -166,7 +166,7 @@ fn sysctl_int(name: &CStr) -> Result<i64, Error> {
 /// maintenance `sys_icache_invalidate` does through the daemon's view holds for every view of
 /// the same pages. EL0 can't read `CTR_EL0` on macOS (XNU leaves `SCTLR_EL1.UCT` clear, so the
 /// read traps), so the CPU is told by `hw.optional.arm64`, which XNU sets on Apple silicon.
-pub(crate) fn check_icache() -> Result<(), Error> {
+pub fn check_icache() -> Result<(), Error> {
     let arm64 = sysctl_int(c"hw.optional.arm64")?;
     if arm64 != 1 {
         return Err(Error::new(format!(
@@ -178,7 +178,7 @@ pub(crate) fn check_icache() -> Result<(), Error> {
 }
 
 /// A send right to a memory entry this process holds.
-pub(crate) struct Object {
+pub struct Object {
     port: Port,
     len: u64,
 }
@@ -191,7 +191,7 @@ impl Drop for Object {
 }
 
 impl Object {
-    pub(crate) fn create(name: &str, len: u64) -> Result<Object, Error> {
+    pub fn create(name: &str, len: u64) -> Result<Object, Error> {
         let mut size = len;
         let mut port = MACH_PORT_NULL;
         // SAFETY: `size` and `port` are live out-pointers; with no parent, NAMED_CREATE makes a
@@ -216,11 +216,11 @@ impl Object {
         Ok(object)
     }
 
-    pub(crate) fn len(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         self.len
     }
 
-    pub(crate) fn duplicate(&self) -> Result<Object, Error> {
+    pub fn duplicate(&self) -> Result<Object, Error> {
         // SAFETY: `port` is a send right this process holds; one more reference to it.
         let code = unsafe { mach_port_mod_refs(task(), self.port, MACH_PORT_RIGHT_SEND, 1) };
         if code != KERN_SUCCESS {
@@ -230,7 +230,7 @@ impl Object {
     }
 
     /// The whole object in this process, anywhere; never inherited by a child of it.
-    pub(crate) fn map_here(&self, access: Access) -> Result<View, Error> {
+    pub fn map_here(&self, access: Access) -> Result<View, Error> {
         let (protection, copy) = match access {
             Access::Execute => (VM_PROT_READ | VM_PROT_EXECUTE, false),
             Access::Read => (VM_PROT_READ, false),
@@ -299,7 +299,7 @@ fn map_entry(
 }
 
 /// A mapping in this process, unmapped when dropped.
-pub(crate) struct View {
+pub struct View {
     at: *mut u8,
     len: usize,
     writable: bool,
@@ -332,15 +332,15 @@ impl View {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 
-    pub(crate) fn address(&self) -> u64 {
+    pub fn address(&self) -> u64 {
         self.at as u64
     }
 
-    pub(crate) fn bytes(&self, range: Range<usize>) -> Result<&[u8], Error> {
+    pub fn bytes(&self, range: Range<usize>) -> Result<&[u8], Error> {
         if range.start > range.end || range.end > self.len {
             return Err(Error::new(format!("bytes {range:?} of a view of {:#x}", self.len)));
         }
@@ -352,7 +352,7 @@ impl View {
         Ok(unsafe { std::slice::from_raw_parts(at, range.end - range.start) })
     }
 
-    pub(crate) fn bytes_mut(&mut self, range: Range<usize>) -> Result<&mut [u8], Error> {
+    pub fn bytes_mut(&mut self, range: Range<usize>) -> Result<&mut [u8], Error> {
         if !self.writable {
             return Err(Error::new("a write through a read-only view"));
         }
@@ -366,7 +366,7 @@ impl View {
         Ok(unsafe { std::slice::from_raw_parts_mut(at, range.end - range.start) })
     }
 
-    pub(crate) fn word(&self, at: usize) -> &AtomicU64 {
+    pub fn word(&self, at: usize) -> &AtomicU64 {
         assert!(at.is_multiple_of(8) && at + 8 <= self.len, "a word at {at:#x} of a view of {:#x}", self.len);
         // SAFETY: `at` is 8-aligned and in the mapping (asserted), page-aligned itself, so the
         // word is aligned; every access to the word, in this process and others, is atomic.
@@ -375,7 +375,7 @@ impl View {
         unsafe { AtomicU64::from_ptr(ptr.cast()) }
     }
 
-    pub(crate) fn word32(&self, at: usize) -> &AtomicU32 {
+    pub fn word32(&self, at: usize) -> &AtomicU32 {
         assert!(at.is_multiple_of(4) && at + 4 <= self.len, "a word at {at:#x} of a view of {:#x}", self.len);
         // SAFETY: as for `word`, 4-aligned.
         let ptr = unsafe { self.at.add(at) };
@@ -383,7 +383,7 @@ impl View {
         unsafe { AtomicU32::from_ptr(ptr.cast()) }
     }
 
-    pub(crate) fn publish(&self, range: Range<usize>) {
+    pub fn publish(&self, range: Range<usize>) {
         if range.start >= range.end || range.end > self.len {
             return;
         }
@@ -400,7 +400,7 @@ impl View {
 /// unsigned under any code signing policy, and data in a mapping of its own right after it
 /// (`MAP_JIT` pages are writable or executable per thread together, so data among them would
 /// not be writable while code runs).
-pub(crate) struct Exec {
+pub struct Exec {
     code: *mut u8,
     code_pages: usize,
     /// Null when there is no data.
@@ -447,7 +447,7 @@ impl Drop for JitWritable {
 }
 
 impl Exec {
-    pub(crate) fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
+    pub fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
         let page = page() as usize;
         let code_pages = code.max(1).next_multiple_of(page);
         let data_pages = data.next_multiple_of(page);
@@ -515,22 +515,22 @@ impl Exec {
     /// the state it saved for that thread, which may be from inside a [`JitWritable`] that
     /// has since ended, and then the child's first instruction fetch from these pages is a
     /// permission fault (`SIGBUS`, ESR `0x8200000f`), seen in `blaze-stencil`'s forked runs.
-    pub(crate) fn after_fork() {
+    pub fn after_fork() {
         // SAFETY: changes only this thread's view of `MAP_JIT` pages, to executable and not
         // writable, the state every thread runs `Exec` code in; it takes no lock and allocates
         // nothing, so a child forked from a process of many threads may call it.
         unsafe { libc::pthread_jit_write_protect_np(1) };
     }
 
-    pub(crate) fn code_address(&self) -> u64 {
+    pub fn code_address(&self) -> u64 {
         self.code as u64
     }
 
-    pub(crate) fn data_address(&self) -> u64 {
+    pub fn data_address(&self) -> u64 {
         if self.data.is_null() { self.code as u64 + self.code_pages as u64 } else { self.data as u64 }
     }
 
-    pub(crate) fn data(&mut self) -> &mut [u8] {
+    pub fn data(&mut self) -> &mut [u8] {
         if self.data.is_null() {
             return &mut [];
         }
@@ -570,7 +570,7 @@ fn check_unsigned_code() -> Result<(), Error> {
 }
 
 /// A send right to an entry the daemon gave this start hook.
-pub(crate) struct Granted {
+pub struct Granted {
     port: Port,
     len: u64,
 }
@@ -584,13 +584,13 @@ impl Drop for Granted {
 }
 
 impl Granted {
-    pub(crate) fn len(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         self.len
     }
 
     /// The whole object anywhere, for the rest of the process: the control words. Never code,
     /// which runs only where an overlay puts it.
-    pub(crate) fn map_anywhere(&self, _: &mut Channel, access: Access) -> Result<u64, Error> {
+    pub fn map_anywhere(&self, _: &mut Channel, access: Access) -> Result<u64, Error> {
         let protection = match access {
             Access::Read => VM_PROT_READ,
             Access::Shared => VM_PROT_READ | VM_PROT_WRITE,
@@ -657,11 +657,11 @@ impl Granted {
 
 /// A start hook's grant of `object` with `rights`, made in this process as the daemon makes it.
 #[cfg(test)]
-pub(crate) fn granted(object: &Object, rights: super::Rights) -> Result<Granted, Error> {
+pub fn granted(object: &Object, rights: super::Rights) -> Result<Granted, Error> {
     Ok(Granted { port: object.entry(rendezvous::protection(rights))?, len: object.len })
 }
 
-pub(crate) fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide: u64) -> Result<(), Error> {
+pub fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide: u64) -> Result<(), Error> {
     for overlay in overlays {
         let object = objects
             .get(overlay.object as usize)
@@ -671,7 +671,7 @@ pub(crate) fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay]
     Ok(())
 }
 
-pub(crate) fn own_image() -> Result<(u64, &'static [u8]), Error> {
+pub fn own_image() -> Result<(u64, &'static [u8]), Error> {
     // SAFETY: no preconditions; dyld set it before any initializer runs.
     let header = unsafe { _NSGetMachExecuteHeader() } as u64;
     if header == 0 || !header.is_multiple_of(page()) {
@@ -694,7 +694,7 @@ pub(crate) fn own_image() -> Result<(u64, &'static [u8]), Error> {
     Ok((header, unsafe { std::slice::from_raw_parts(header as *const u8, len as usize) }))
 }
 
-pub(crate) fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
+pub fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
     let path = |it: &Path| CString::new(it.as_os_str().as_bytes()).map_err(|_| Error::new(format!("{} has a NUL", it.display())));
     let (source, target) = (path(from)?, path(to)?);
     // SAFETY: both are NUL-terminated paths live for the call; clonefile makes `target` new.
@@ -708,7 +708,7 @@ pub(crate) fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
     }
 }
 
-pub(crate) fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
+pub fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
     out.clear();
     let pid = c_int::try_from(pid).map_err(|_| Error::new(format!("process {pid}")))?;
     let mut capacity = 64usize;
@@ -734,11 +734,11 @@ pub(crate) fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
     }
 }
 
-pub(crate) fn service() -> Option<String> {
+pub fn service() -> Option<String> {
     Some(rendezvous::service_name(std::process::id()).to_string_lossy().into_owned())
 }
 
-pub(crate) fn thread_id() -> u64 {
+pub fn thread_id() -> u64 {
     let mut id = 0u64;
     // SAFETY: a null thread is the calling one; `id` is a live out-pointer.
     unsafe { libc::pthread_threadid_np(0, &raw mut id) };

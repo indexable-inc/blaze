@@ -357,3 +357,26 @@ fn a_result_is_traced_as_its_trace_says() {
     let Ok(got) = common.traced(Trace::Unknown("the sandbox's record was cut".to_owned()), &mut world, |it| it.cloned());
     assert_eq!(got, None);
 }
+
+/// Keep-going (`each`): a test run whose binaries are `edition`'s, refused as a dev test binary
+/// with no start hook, an artifact with no tests, `blaze-hash`'s, which runs, and `stdx`'s,
+/// refused too, names both refusals in order and still runs `blaze-hash`'s tests. Stopping at
+/// the first refusal ran none (coord-114).
+#[test]
+fn a_binary_that_cant_run_is_named_and_keeps_no_other_from_running() {
+    let built = ["edition", "no tests", "blaze-hash", "stdx"];
+    let (made, refused) = super::each(built.into_iter(), |name| match name {
+        "blaze-hash" => Ok(Some(name)),
+        "no tests" => Ok(None),
+        _ => Err(blaze_api::ApiError::new(format!("`{name}` runs under profile `test`, so on the daemon's code memory, and can't"), None)),
+    });
+    assert_eq!(made, ["blaze-hash"]);
+    let refused: Vec<&str> = refused.iter().map(|it| it.what.as_str()).collect();
+    assert_eq!(
+        refused,
+        [
+            "`edition` runs under profile `test`, so on the daemon's code memory, and can't",
+            "`stdx` runs under profile `test`, so on the daemon's code memory, and can't",
+        ]
+    );
+}

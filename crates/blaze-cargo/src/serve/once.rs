@@ -1,4 +1,4 @@
-//! The seed's one-shot build (docs/future/bootstrap.md): with no `daemon` feature there is no
+//! The seed's one-shot build (docs/future/bootstrap.md): with no `native` feature there is no
 //! `blaze serve` to connect to, so a command starts the same engine in its own process
 //! ([`super::engine`], [`super::start`]: the daemon's, never a second build path), speaks to it
 //! through one in-process connection with the socket's frames ([`blaze_api::client::Local`]),

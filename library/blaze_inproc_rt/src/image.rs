@@ -3,7 +3,7 @@
 //! and fixed maps, and where its headers are linked, from which a process's slide follows.
 //!
 //! The daemon reads them from the image part of the code memory (the file's bytes,
-//! [`crate::CodeMemory::lay_out`]); the start hook reads the same headers from its own image in
+//! `blaze_inproc::CodeMemory::lay_out`); the start hook reads the same headers from its own image in
 //! memory ([`crate::runtime`]) and checks the daemon's overlays against them. Both read
 //! untrusted bytes: every offset and length is checked, nothing here panics on any bytes.
 //!
@@ -30,8 +30,11 @@ mod elf;
 mod macho;
 mod pe;
 
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+pub mod testing;
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;
 
 use std::ops::Range;
 
@@ -164,20 +167,23 @@ fn check(format: Format, found: Found, page: u64) -> Result<Layout, Error> {
 }
 
 // The images' offsets are the file's `u64`s: past `usize` is a short read, as past the end.
-pub(crate) fn u16_at(bytes: &[u8], at: u64) -> Option<u16> {
-    blaze_bytes::le::get_u16(bytes, usize::try_from(at).ok()?)
+pub fn u16_at(bytes: &[u8], at: u64) -> Option<u16> {
+    let at = usize::try_from(at).ok()?;
+    Some(u16::from_le_bytes(bytes.get(at..at.checked_add(2)?)?.try_into().ok()?))
 }
 
-pub(crate) fn u32_at(bytes: &[u8], at: u64) -> Option<u32> {
-    blaze_bytes::le::get_u32(bytes, usize::try_from(at).ok()?)
+pub fn u32_at(bytes: &[u8], at: u64) -> Option<u32> {
+    let at = usize::try_from(at).ok()?;
+    Some(u32::from_le_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?))
 }
 
-pub(crate) fn u64_at(bytes: &[u8], at: u64) -> Option<u64> {
-    blaze_bytes::le::get_u64(bytes, usize::try_from(at).ok()?)
+pub fn u64_at(bytes: &[u8], at: u64) -> Option<u64> {
+    let at = usize::try_from(at).ok()?;
+    Some(u64::from_le_bytes(bytes.get(at..at.checked_add(8)?)?.try_into().ok()?))
 }
 
 /// `start..start + len`, or an error naming `what` when it overflows.
-pub(crate) fn range(start: u64, len: u64, what: &str) -> Result<Range<u64>, Error> {
+pub fn range(start: u64, len: u64, what: &str) -> Result<Range<u64>, Error> {
     let end = start.checked_add(len).ok_or_else(|| Error::new(format!("{what} at {start:#x} of {len:#x} bytes overflows")))?;
     Ok(start..end)
 }

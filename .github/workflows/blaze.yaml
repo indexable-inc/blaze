@@ -201,7 +201,7 @@ jobs:
         with:
           job: build
           llvm: true
-      - name: blaze build --release --features blaze-engine/llvm (the build job's)
+      - name: blaze build --release (the build job's)
         run: |
           python3 harness/unittests.py '{"build": true}'
       # The release's daemon ends first; the tree's blaze runs its own, from a home of its own.

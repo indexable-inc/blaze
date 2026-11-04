@@ -501,7 +501,9 @@ pub struct History {
     total: u64,
     /// The highest build any file of the directory is named for, or a flush was for.
     last_build: u64,
-    /// The CPU sampler's samples taken so far, and a flush's new ones.
+    /// The ring a flush reads CPU samples from ([`History::open`]), the samples of it read so
+    /// far, and a flush's new ones.
+    sampler: &'static sampler::Ring,
     sampled: u64,
     samples: Vec<Sample>,
     /// [`identity::binary`], once a history: every build of this process ran it.
@@ -516,8 +518,11 @@ pub struct History {
 impl History {
     /// The history in `dir`, made if it isn't there, holding at most `cap` bytes of files. Its
     /// first flush takes everything the rings still hold. A flush's number continues from the
-    /// files already there; the hidden files a write left half done are deleted.
-    pub fn open(dir: &Path, cap: u64) -> Result<History, HistoryError> {
+    /// files already there; the hidden files a write left half done are deleted. Its flushes
+    /// read CPU samples from `sampler`: the process's ring ([`sampler::process`]) in a daemon,
+    /// a ring of a test's own in a test, so what a test's flush writes never depends on a
+    /// sampler that something else in its process started.
+    pub fn open(dir: &Path, cap: u64, sampler: &'static sampler::Ring) -> Result<History, HistoryError> {
         fs::create_dir_all(dir).map_err(io_error(dir, "making the directory"))?;
         // alloc: once a history
         let mut kept = Vec::new();
@@ -586,6 +591,7 @@ impl History {
             kept: kept.into(),
             total,
             last_build,
+            sampler,
             sampled: 0,
             // alloc: once a history
             samples: Vec::new(),
@@ -802,7 +808,7 @@ impl History {
         let events = [batches::events(&self.read.events, self.process).map_err(arrow_error(&schema::EVENTS))?];
         let folded = [batches::folded(&self.read.folds, self.process).map_err(arrow_error(&schema::FOLDED))?];
         self.samples.clear();
-        let samples_skipped = sampler::since(&mut self.sampled, &mut self.samples);
+        let samples_skipped = self.sampler.since(&mut self.sampled, &mut self.samples);
         let samples = [self.samples_batch().map_err(arrow_error(&schema::SAMPLES))?];
         let rows = |parts: &[RecordBatch]| parts.iter().map(RecordBatch::num_rows).sum::<usize>();
         // What every thread is inside, with each flush where that changed: the last reading is
@@ -897,16 +903,17 @@ impl History {
         facts.into_iter().flatten().fold(build.unwrap_or(0).max(self.read.highest_build()), u64::max)
     }
 
-    /// The flush's CPU samples as a `samples` batch, their frames named.
+    /// The flush's CPU samples as a `samples` batch, their frames named. A flush with no new
+    /// samples names nothing.
     fn samples_batch(&self) -> Result<RecordBatch, ArrowError> {
+        if self.samples.is_empty() {
+            return Ok(RecordBatch::new_empty(batches::schema_of(&schema::SAMPLES)));
+        }
         let pcs: Vec<u64> =
             // alloc: a flush's addresses, once a flush
             self.samples.iter().flat_map(|it| it.pcs[..usize::from(it.depth)].iter().copied()).collect();
-        let mut names = symbols::names(&pcs);
-        for pc in pcs {
-            // alloc: a name for an address no symbol covers, once an address a flush
-            names.entry(pc).or_insert_with(|| format!("{pc:#x}"));
-        }
+        // Every address gets a name, the bare address at worst.
+        let names = symbols::names(&pcs);
         batches::samples(&self.samples, &names, (Instant::now(), clock::mono_ns()), self.process)
     }
 
@@ -1176,7 +1183,7 @@ mod tests {
     fn a_flush_says_each_site_that_reported_a_bug_since_the_last() {
         use stdx::assert::reported::Site;
         let dir = scratch("bugs");
-        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
         let at = std::panic::Location::caller();
         let site = |count| Site {
             kind: "AdtDef",
@@ -1229,7 +1236,7 @@ mod tests {
         let workspace = dir.join("work");
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
-        let mut history = History::open(&dir.join("profile"), CAP_BYTES).unwrap();
+        let mut history = History::open(&dir.join("profile"), CAP_BYTES, sampler::unsampled()).unwrap();
         let built = |history: &mut History, build_id| {
             let row = BuildRow {
                 workspace: workspace.to_str().unwrap().into(),
@@ -1260,7 +1267,7 @@ mod tests {
     fn the_images_a_build_linked_and_its_crate_graph_are_written_at_the_next_flush() {
         use crate::facts::{CrateDepRow, DepKind, LinkOutcome, LinkRow};
         let dir = scratch("facts");
-        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
         history.linked([LinkRow {
             build_id: 61,
             image: "app (bin)".into(),
@@ -1291,7 +1298,7 @@ mod tests {
 
         use crate::facts::QueryCountRow;
         let dir = scratch("query-counts");
-        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
         let mir = QueryCountRow {
             build_id: 63,
             query: "mir_body_query",
@@ -1301,6 +1308,9 @@ mod tests {
             evicted_asked: 3,
             evicted: 4,
             dropped: 5,
+            reads_recorded: 6,
+            reads_kept: 7,
+            reads_most: 8,
         };
         history.query_counted([mir, QueryCountRow { query: "infer_body_query", executed: 7566, ..mir }]);
         let flushed = history.flush(Some(63)).unwrap();
@@ -1314,9 +1324,20 @@ mod tests {
         let names = query.values().as_string::<i32>();
         assert_eq!(names.value(query.keys().value(1) as usize), "infer_body_query");
         assert_eq!(
-            ["build_id", "executed", "verified", "reran", "evicted_asked", "evicted", "dropped"]
-                .map(|it| count(it, 0)),
-            [63, 6384, 10, 2, 3, 4, 5],
+            [
+                "build_id",
+                "executed",
+                "verified",
+                "reran",
+                "evicted_asked",
+                "evicted",
+                "dropped",
+                "reads_recorded",
+                "reads_kept",
+                "reads_most"
+            ]
+            .map(|it| count(it, 0)),
+            [63, 6384, 10, 2, 3, 4, 5, 6, 7, 8],
             "each count in its own column"
         );
         assert_eq!(count("executed", 1), 7566);
@@ -1336,7 +1357,7 @@ mod tests {
         .join()
         .unwrap();
         let dir = scratch("flush");
-        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
         for table in schema::TABLES {
             let path = dir.join(format!("schema.{}.parquet", table.name));
             let read = read_back(&path);
@@ -1373,7 +1394,7 @@ mod tests {
     fn rows_written_between_flushes_past_a_rings_size_are_all_flushed() {
         crate::install();
         let dir = scratch("drained");
-        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
         let bursts = 24;
         let burst = flight::CAP / 8;
         let tid = std::thread::spawn(move || {
@@ -1409,12 +1430,12 @@ mod tests {
     #[test]
     fn a_history_opened_again_numbers_on_from_its_files() {
         let dir = scratch("reopen");
-        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
         history.build_ended(row(1, Outcome::Failed));
         let first = history.flush(Some(1)).unwrap();
         drop(history);
         fs::write(dir.join(".1-00000099.spans.parquet.tmp"), b"half").unwrap();
-        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
         assert!(!dir.join(".1-00000099.spans.parquet.tmp").exists(), "a half-written file is deleted");
         // The first flush takes what the rings hold, other tests' builds' rows among them.
         assert!(first.build >= 1, "{first:?}");
@@ -1438,7 +1459,7 @@ mod tests {
         // Past any build another test of this process writes rows of.
         const KILLED: u32 = 7_000_001;
         let dir = scratch("killed-mid-build");
-        let mut first = History::open(&dir, CAP_BYTES).unwrap();
+        let mut first = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
         std::thread::spawn(|| {
             let _build = flight::building(KILLED);
             let _span = tracing::info_span!(target: "blaze", "history killed mid-build").entered();
@@ -1449,7 +1470,7 @@ mod tests {
         assert!(timer.spans >= 1, "{timer:?}");
         assert!(timer.build >= u64::from(KILLED), "the timer's flush is named for the build its rows are of: {timer:?}");
         drop(first);
-        let second = History::open(&dir, CAP_BYTES).unwrap();
+        let second = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
         assert!(
             second.next_build() > KILLED,
             "the next daemon's first build is {}, a number the stopped daemon's rows already hold",
@@ -1458,10 +1479,38 @@ mod tests {
         _ = fs::remove_dir_all(&dir);
     }
 
+    /// A flush with no new CPU samples asks the symbolizer nothing. The history reads a ring of
+    /// the test's own: until 2026-11-03 it read the process's ring, and a run of this test saw
+    /// 8192 samples in each of its two flushes. A sample kept into its ring is the next
+    /// flush's, so the flushes read that ring and no other.
+    #[test]
+    fn a_flush_with_no_new_samples_names_nothing() {
+        static OWN: sampler::Ring = sampler::Ring::new();
+        let dir = scratch("idle");
+        let mut history = History::open(&dir, CAP_BYTES, &OWN).unwrap();
+        let asked = symbols::ASKED.with(std::cell::Cell::get);
+        let first = history.flush(None).unwrap();
+        let idle = history.flush(None).unwrap();
+        assert_eq!((first.samples, idle.samples), (0, 0), "the test's ring holds no samples");
+        assert_eq!(symbols::ASKED.with(std::cell::Cell::get), asked, "a flush with no samples asked for names");
+        let sample = Sample {
+            at: Instant::now(),
+            tid: 1,
+            depth: 0,
+            pcs: [0; sampler::DEPTH],
+            span: 0,
+            build: 0,
+            on_cpu: true,
+        };
+        OWN.keep(&[sample]);
+        assert_eq!(history.flush(None).unwrap().samples, 1, "the sample kept into the history's ring");
+        _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn past_the_cap_the_oldest_files_go_first() {
         let dir = scratch("cap");
-        let mut history = History::open(&dir, 1).unwrap();
+        let mut history = History::open(&dir, 1, sampler::unsampled()).unwrap();
         let mut flushes = Vec::new();
         for build in 1..=3 {
             history.build_ended(row(build, Outcome::Ok));

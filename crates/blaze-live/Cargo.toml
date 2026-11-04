@@ -12,13 +12,17 @@ keywords = ["hot-reload", "live-reload", "jit", "compiler"]
 categories = ["development-tools"]
 
 # blaze-inproc's run side (no `host` feature): the start hook a dev run needs, the channel
-# patches come through and the fences. blaze-live is a path dependency of programs outside this
+# patches come through and the fences. blaze-inproc-rt is that run side itself (the dev runtime,
+# which blaze also links into every dev executable as a crate of the standard library): the
+# descriptor, the jump table's execution log and the tier counters are its, and blaze-live's
+# switch is built on them. blaze-live is a path dependency of programs outside this
 # workspace too (demo/life, user programs, `tools/nix/life_launch.py`); cargo inherits its
 # `workspace = true` lines from this workspace's root `Cargo.toml`, which a copy of it must
 # carry with every crate below (flake.nix's `lifeSource` lists them). Its lints are written out, equal to
 # the root's `[workspace.lints]`, so a program's own lints don't apply to it.
 [dependencies]
 blaze-inproc.workspace = true
+blaze-inproc-rt.workspace = true
 blaze-sha256.workspace = true
 
 [dev-dependencies]

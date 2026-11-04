@@ -376,9 +376,13 @@ impl GenericParamsCollector {
         }
     }
 
+    /// rustc's `is_late_bound_map`: a lifetime parameter is late bound unless it is in a where
+    /// clause or bound, or is in the output (every lifetime is, when `return_captures_all`:
+    /// rustc's `has_fully_capturing_opaque`) without being constrained by an input.
     pub(crate) fn update_to_late_bound_lifetimes(
         &mut self,
         named_lifetime_store: &NamedLifetimeStore,
+        return_captures_all: bool,
     ) {
         for (_param_id, lifetime) in self.lifetimes.iter_mut() {
             let lifetime_name = &lifetime.name;
@@ -387,7 +391,8 @@ impl GenericParamsCollector {
             }
 
             if !named_lifetime_store.lifetimes_constrained_by_input.contains(lifetime_name)
-                && named_lifetime_store.lifetimes_in_output.contains(lifetime_name)
+                && (return_captures_all
+                    || named_lifetime_store.lifetimes_in_output.contains(lifetime_name))
             {
                 continue;
             }

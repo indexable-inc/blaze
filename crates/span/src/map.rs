@@ -736,7 +736,6 @@ impl RealSpanMap {
 
     /// The span [`RealSpanMap::absolute`]'s map gives `range`, with no map made: relative to the
     /// file's root.
-    #[cfg(feature = "query")]
     pub fn absolute_span(file_id: EditionedFileId, range: TextRange) -> Span {
         Span {
             range,
@@ -745,7 +744,6 @@ impl RealSpanMap {
         }
     }
 
-    #[cfg(feature = "query")]
     pub fn span_for_range(&self, range: TextRange) -> Span {
         let end = self.end();
         assert!(range.end() <= end, "range {range:?} goes beyond the end of the file {end:?}");
@@ -761,7 +759,6 @@ impl RealSpanMap {
     /// one found there: for ranges in increasing order (a walk of the tokens) each lookup is
     /// two compares while it stays in an anchor or moves to the next, `O(log d)` for `d`
     /// anchors on. Any `hint` gives the same span.
-    #[cfg(feature = "query")]
     #[inline]
     pub fn span_for_range_from(&self, range: TextRange, hint: &mut u32) -> Span {
         let end = self.end();
@@ -1046,7 +1043,6 @@ mod tests {
 
     /// The cursor gives the spans [`RealSpanMap::span_for_range`] does, walking in order, from
     /// any hint and in no order.
-    #[cfg(feature = "query")]
     #[test]
     fn a_cursor_gives_the_spans_a_search_does() {
         let mut rng = SplitMix64::new(7);
@@ -1105,11 +1101,9 @@ mod tests {
 
     /// The expansion map as it was kept before its ends and spans were columns: one
     /// `(end, span)` pair each, with its lookups and merge as they were.
-    #[cfg(feature = "query")]
     #[derive(Default)]
     struct Pairs(Vec<(TextSize, Span)>);
 
-    #[cfg(feature = "query")]
     impl Pairs {
         fn span_at(&self, offset: TextSize) -> Span {
             let entry = self.0.partition_point(|&(it, _)| it <= offset);
@@ -1155,7 +1149,6 @@ mod tests {
 
     /// Looking up a file's spans, an expansion's spans and the ranges of a span allocates
     /// nothing, once the expansion's index by anchor is made (on its first downward lookup).
-    #[cfg(feature = "query")]
     #[test]
     fn lookups_allocate_nothing() {
         let mut rng = SplitMix64::new(11);
@@ -1180,7 +1173,6 @@ mod tests {
     }
 
     /// A map of `n` spans over pieces of 1 to 4 bytes, with the same as [`Pairs`].
-    #[cfg(feature = "query")]
     fn spans(rng: &mut SplitMix64, n: usize) -> (SpanMap, Pairs) {
         let ctx = SyntaxContext::root(crate::Edition::CURRENT);
         let (mut map, mut pairs) = (SpanMap::empty(), Pairs::default());
@@ -1198,7 +1190,6 @@ mod tests {
         (map, pairs)
     }
 
-    #[cfg(feature = "query")]
     fn check_same(map: &SpanMap, pairs: &Pairs, rng: &mut SplitMix64) {
         assert_eq!(map.iter().collect::<Vec<_>>(), pairs.0);
         let Some(&(last, _)) = pairs.0.last() else { return };
@@ -1239,7 +1230,6 @@ mod tests {
     }
 
     /// The columns give the pairs' answers, before and after merging another map in.
-    #[cfg(feature = "query")]
     #[test]
     fn expansion_maps_agree_with_the_pairs() {
         let mut rng = SplitMix64::new(5);
@@ -1261,7 +1251,6 @@ mod tests {
     }
 
     /// Two expansion maps are equal exactly when their pairs are, and equal ones hash the same.
-    #[cfg(feature = "query")]
     #[test]
     fn expansion_maps_are_equal_when_their_pairs_are() {
         use std::hash::BuildHasher;
@@ -1284,7 +1273,6 @@ mod tests {
     }
 
     /// A metavariable's span, `n` past the start of anchor 7's text.
-    #[cfg(feature = "query")]
     fn group(n: u32) -> Span {
         let anchor = crate::SpanAnchor { file_id: file(), ast_id: id(7) };
         Span { range: range(n, n + 2), anchor, ctx: SyntaxContext::root(crate::Edition::CURRENT) }
@@ -1293,7 +1281,6 @@ mod tests {
     /// A fragment's span is found by its exact range only; of two with one range, the innermost
     /// (pushed first, as groups close) is found; pushing out of order changes nothing once
     /// finished; and the spans are part of what the map is.
-    #[cfg(feature = "query")]
     #[test]
     fn a_fragment_keeps_its_groups_span() {
         let (mut map, _) = spans(&mut SplitMix64::new(9), 20);
@@ -1326,7 +1313,6 @@ mod tests {
 
     /// The outermost fragments inside a range, in order: one inside another is not, nor is one
     /// running past the range's end; of two with one range, the innermost's span.
-    #[cfg(feature = "query")]
     #[test]
     fn the_outermost_fragments_in_a_range() {
         let (mut map, _) = spans(&mut SplitMix64::new(9), 30);
@@ -1353,7 +1339,6 @@ mod tests {
     /// What a merge keeps of the fragments' spans, by the rules of its fragment starts and ends
     /// taken one at a time: the moved fragments of the map merged in, and of this map's those
     /// whose start and end both stay, shifted past the replaced text.
-    #[cfg(feature = "query")]
     #[test]
     fn a_merge_keeps_the_fragments_spans_by_their_starts_and_ends() {
         let mut rng = SplitMix64::new(12);
@@ -1419,7 +1404,6 @@ mod tests {
 
     /// Mapping a span down allocates nothing once the map's index and the worker's buffer are
     /// made.
-    #[cfg(feature = "query")]
     #[test]
     fn ranges_with_span_allocates_nothing_warm() {
         let mut rng = SplitMix64::new(7);
@@ -1436,7 +1420,6 @@ mod tests {
     /// A finished map copied out has its columns at their exact lengths and is the same map,
     /// and filling and finishing a warm map allocates nothing (the fragment sorts are the
     /// worker's).
-    #[cfg(feature = "query")]
     #[test]
     fn a_copied_map_is_exact_and_finishing_allocates_nothing_warm() {
         let span = |at: u32| Span {
@@ -1470,7 +1453,6 @@ mod tests {
 
     /// The made identifiers' spans are part of what the map is, are copied out with it, are
     /// appended by a merge after the map's own, and are emptied by `clear`.
-    #[cfg(feature = "query")]
     #[test]
     fn made_idents_are_kept_copied_and_merged() {
         let mut rng = SplitMix64::new(13);
@@ -1495,7 +1477,6 @@ mod tests {
     /// `absolute_span` is the absolute map's span, allocating nothing; `from_file` allocates its
     /// two columns alone, and `within` and `without` nothing more once the worker's pairs are
     /// made.
-    #[cfg(feature = "query")]
     #[test]
     fn absolute_spans_need_no_map() {
         let map = RealSpanMap::absolute(file());

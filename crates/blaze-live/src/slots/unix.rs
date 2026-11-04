@@ -1,31 +1,21 @@
-//! What Linux and macOS share: finding the descriptor with `dlsym`, walking a stack with
+//! What Linux and macOS share: the image's segments, walking a stack with
 //! `_Unwind_Backtrace`, the unwinder's `__register_frame`, and address space reserved with
 //! `mmap` and committed with `mprotect` ([`Reserved`]).
 
 #![allow(unsafe_code, reason = "the loader's and the kernel's calls both Unix platforms share")]
 
 use std::{
-    ffi::{CStr, CString, c_char, c_int, c_void},
+    ffi::{c_int, c_void},
     ops::Range,
 };
 
-use super::{hook::FRAMES, image};
-use crate::patch::{DESCRIPTOR, Descriptor};
+// Finding the image's descriptor and what is in the image are the dev runtime's
+// (`blaze_inproc_rt::live::find`): every dev executable finds its execution log by them.
+use blaze_inproc_rt::live::find::{image_base, in_image, outside};
 
-#[repr(C)]
-#[allow(dead_code)]
-struct DlInfo {
-    fname: *const c_char,
-    fbase: *mut c_void,
-    sname: *const c_char,
-    saddr: *mut c_void,
-}
+use super::{hook::FRAMES, image};
 
 unsafe extern "C" {
-    fn dladdr(address: *const c_void, info: *mut DlInfo) -> c_int;
-    fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
-    fn dlclose(handle: *mut c_void) -> c_int;
     fn _Unwind_Backtrace(
         trace: extern "C" fn(*mut c_void, *mut c_void) -> c_int,
         data: *mut c_void,
@@ -58,48 +48,8 @@ const MAP_NORESERVE: c_int = 0x4000;
 const MAP_NORESERVE: c_int = 0x40;
 const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 
-const RTLD_LAZY: c_int = 1;
-#[cfg(target_os = "linux")]
-const RTLD_NOLOAD: c_int = 4;
-#[cfg(target_os = "macos")]
-const RTLD_NOLOAD: c_int = 0x10;
 const URC_NO_REASON: c_int = 0;
 const URC_END_OF_STACK: c_int = 5;
-
-/// The image that has `address`: where it starts and its path as the loader has it.
-fn image_of(address: *const c_void) -> Option<(u64, *const c_char)> {
-    let mut info = DlInfo {
-        fname: std::ptr::null(),
-        fbase: std::ptr::null_mut(),
-        sname: std::ptr::null(),
-        saddr: std::ptr::null_mut(),
-    };
-    // SAFETY: `info` is a whole `Dl_info` for dladdr to fill.
-    (unsafe { dladdr(address, &mut info) } != 0).then_some((info.fbase as u64, info.fname))
-}
-
-/// Where the image that has `address` starts, for the platforms' check that a patch's data
-/// is in the image it was linked for.
-pub(super) fn image_base(address: u64) -> Option<u64> {
-    image_of(address as *const c_void).map(|it| it.0)
-}
-
-/// Checks that the first and the last byte of `range` are in the image at `base`. The loader
-/// maps an image as one run of addresses; a gap within it is refused by the platform's walk
-/// of the mappings (unmapped, or mapped with no access).
-pub(super) fn in_image(range: &Range<u64>, base: u64) -> Result<(), String> {
-    let last = range.end.saturating_sub(1).max(range.start);
-    if image_base(range.start) == Some(base) && image_base(last) == Some(base) {
-        Ok(())
-    } else {
-        Err(outside(range, base))
-    }
-}
-
-fn outside(range: &Range<u64>, base: u64) -> String {
-    // alloc: error path
-    format!("data at {:#x}..{:#x}, outside the image at {base:#x}", range.start, range.end)
-}
 
 /// The address ranges the image the loader put at `base` is mapped in, sorted: those the
 /// loader's `dladdr` finds an address of the image in (ELF `PT_LOAD` segments, Mach-O
@@ -173,7 +123,7 @@ impl Segments {
         #[allow(dead_code)]
         struct Info {
             addr: u64,
-            name: *const c_char,
+            name: *const std::ffi::c_char,
             phdr: *const Phdr,
             phnum: u16,
         }
@@ -298,72 +248,15 @@ impl Segments {
     }
 }
 
-/// The descriptor of the image `base` from `handle`, if that is where `handle` finds it.
-fn lookup(handle: *mut c_void, name: &CStr, base: u64) -> Option<u64> {
-    if handle.is_null() {
-        return None;
-    }
-    // SAFETY: the handle is open, the name ends in a zero.
-    let found = unsafe { dlsym(handle, name.as_ptr()) };
-    (!found.is_null() && image_of(found)?.0 == base).then_some(found as u64)
-}
-
 /// The image's bytes at `range`, checked to be in the image at `base`; the caller checks
-/// they are readable (the platform's walk of its mappings) or knows (the descriptor, which
-/// the loader found by name).
+/// they are readable (the platform's walk of its mappings).
 pub(super) fn bytes(range: &Range<u64>, base: u64) -> Result<&'static [u8], String> {
     in_image(range, base)?;
     // SAFETY: `range` is in the image at `base` (checked above), which stays loaded as long as
     // this code, the image's own, runs; what is read is data the linker wrote, which no patch
     // writes over (the switch refuses data over the descriptor's cell and table, and the
-    // descriptor and the directory name are in read-only data).
+    // descriptor is in read-only data).
     Ok(unsafe { image::view(range.start, (range.end - range.start) as usize) })
-}
-
-/// Where the descriptor of the image this code is in is, in memory, and its bytes.
-pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
-    let at = find()?;
-    // alloc: error path
-    let base = image_base(at).ok_or_else(|| format!("no image has {DESCRIPTOR} at {at:#x}"))?;
-    let end =
-        at.checked_add(Descriptor::SIZE as u64).ok_or("a descriptor past the end of memory")?;
-    Ok((at, bytes(&(at..end), base)?))
-}
-
-fn find() -> Result<u64, String> {
-    let name = CString::new(DESCRIPTOR).map_err(|_| "a descriptor name with a zero")?;
-    let own = descriptor as fn() -> Result<(u64, &'static [u8]), String> as *const c_void;
-    let (base, path) = image_of(own).ok_or("the loader knows no image of blaze-live's own code")?;
-    // SAFETY: a null path asks for the program's handle, which is never unloaded.
-    let program = unsafe { dlopen(std::ptr::null(), RTLD_LAZY) };
-    if let Some(found) = lookup(program, &name, base) {
-        return Ok(found);
-    }
-    // A shared library that links blaze-live is found by its own path.
-    let path = (!path.is_null())
-        .then(|| {
-            // SAFETY: the loader's path of a loaded image ends in a zero and lives as long as
-            // it does.
-            unsafe { CStr::from_ptr(path) }
-        })
-        .filter(|it| !it.is_empty());
-    if let Some(path) = path {
-        // SAFETY: NOLOAD opens nothing new; the handle is closed below.
-        let handle = unsafe { dlopen(path.as_ptr(), RTLD_LAZY | RTLD_NOLOAD) };
-        let found = lookup(handle, &name, base);
-        if !handle.is_null() {
-            // SAFETY: opened above; the image stays loaded, as it was before.
-            unsafe { dlclose(handle) };
-        }
-        if let Some(found) = found {
-            return Ok(found);
-        }
-    }
-    let path =
-        // alloc: error path
-        path.map_or_else(|| "the program".to_owned(), |it| it.to_string_lossy().into_owned());
-    // alloc: error path
-    Err(format!("{path} exports no {DESCRIPTOR}: blaze-link links it for live patches"))
 }
 
 /// Pushes the code address of each frame of this thread's stack, newest first.
@@ -395,13 +288,6 @@ pub(super) fn loaders(at: u64, slots: u64) -> &'static [std::sync::atomic::Atomi
     // before the first call; it is the image's writable data (the linker's `Class::Table`),
     // which only `publish`'s atomic stores write (the switch refuses data over it).
     unsafe { image::words(at, slots as usize) }
-}
-
-/// Checks that `range` is in the image that has `near` (the descriptor's address).
-pub(super) fn in_image_of(range: &Range<u64>, near: u64) -> Result<(), String> {
-    // alloc: error path
-    let base = image_base(near).ok_or_else(|| format!("no image has {near:#x}"))?;
-    in_image(range, base)
 }
 
 /// What a reservation's length and commits are multiples of: the largest page of the

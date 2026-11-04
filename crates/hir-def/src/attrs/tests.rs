@@ -368,6 +368,12 @@ fn old_match_attr_flags(
                         "specialization_trait" => {
                             attr_flags.insert(AttrFlags::BLAZE_SPECIALIZATION_TRAIT)
                         }
+                        // The words the index learned after the string match was frozen
+                        // here, each a word attribute under `blaze` as those above.
+                        "linear" => attr_flags.insert(AttrFlags::LINEAR),
+                        "consumes" => attr_flags.insert(AttrFlags::CONSUMES),
+                        "reflect" => attr_flags.insert(AttrFlags::BLAZE_REFLECT),
+                        "sealed" => attr_flags.insert(AttrFlags::BLAZE_SEALED),
                         _ => {}
                     },
                     _ => {}

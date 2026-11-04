@@ -543,7 +543,7 @@ macro_rules! baz {
             - m7 : type
             - ok_double_macro_use_shadow : value
             - (legacy) baz : macro!
-            - (legacy) foo : macro! macro! macro!
+            - (legacy) foo : macro! macro!
 
             crate::m1
             - (legacy) bar : macro!
@@ -557,9 +557,9 @@ macro_rules! baz {
             - m4 : type
             - m5 : type
             - ok_shadow : value
-            - (legacy) bar : macro! macro!
+            - (legacy) bar : macro!
             - (legacy) baz : macro!
-            - (legacy) foo : macro! macro! macro! macro!
+            - (legacy) foo : macro! macro!
 
             crate::m3::m4
             - ok_shadow_deep : value
@@ -569,7 +569,7 @@ macro_rules! baz {
             crate::m3::m5
             - (legacy) bar : macro!
             - (legacy) baz : macro!
-            - (legacy) foo : macro! macro! macro!
+            - (legacy) foo : macro! macro!
 
             crate::m5
             - m6 : type

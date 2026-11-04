@@ -527,11 +527,16 @@ fn a_store_s_macro_calls_read_back_as_this_database_s() {
 }
 
 fn function_f(db: &TestDB) -> FunctionId {
-    let f = Name::new_symbol_root(intern::Symbol::intern("f"));
+    function_named(db, "f")
+}
+
+/// The function `name` of `lib` in `db`.
+fn function_named(db: &TestDB, name: &str) -> FunctionId {
+    let name = Name::new_symbol_root(intern::Symbol::intern(name));
     let krate = crate_named(db, "lib");
     (declared(db, krate).into_iter())
         .find_map(|item| match item {
-            Item::Function(it) if FunctionSignature::with_source_map(db, it).0.name == f => {
+            Item::Function(it) if FunctionSignature::with_source_map(db, it).0.name == name => {
                 Some(it)
             }
             _ => None,
@@ -551,25 +556,39 @@ fn with_signatures(fixture: &str, memory: &Memory, part: &[u8]) {
     memory.images.lock().insert(key, std::sync::Arc::new(Aligned::copy_from(&bytes)));
 }
 
-/// The signatures part of `lib` in a fresh database of `fixture`.
-fn part_of(fixture: &str) -> Vec<u8> {
+/// The signatures part of `lib` in a fresh database of `fixture`, the record filed under the
+/// key of its `f` the record of its `g`: what an encoding that wrote one item's signature for
+/// another would store, made from the database's own source text.
+fn part_with_g_as_f(fixture: &str) -> Vec<u8> {
     let db = fixture::db(fixture).into_db();
-    encode(&db, crate_named(&db, "lib"), &mut Vec::new()).unwrap()
+    let krate = crate_named(&db, "lib");
+    let (f, g) = (function_named(&db, "f"), function_named(&db, "g"));
+    encode_with(&db, krate, &mut Vec::new(), |item, calls| {
+        let item = if item == Item::Function(f) { Item::Function(g) } else { item };
+        record_of(&db, krate, item, calls)
+    })
+    .unwrap()
 }
 
+/// An image whose record of `f` is not `f`'s signature: checking records the difference and
+/// every mode serves the image's record. The image and the database are made from one source
+/// text, so every file a record names has the content the image was made from (`frozen`'s
+/// header check, which refuses a part made from other text as a corrupt image); the record
+/// alone is wrong.
 #[test]
 fn checking_finds_a_difference_and_serves_the_image() {
     let _turn = turn();
-    let other = FIXTURE.replace("pub fn f() -> u8 { 0 }", "pub fn f() -> u16 { 0 }");
-    let memory = stored(&other);
-    with_signatures(&other, &memory, &part_of(FIXTURE));
+    let fixture = FIXTURE
+        .replace("pub fn f() -> u8 { 0 }", "pub fn f() -> u16 { 0 }\npub fn g() -> u8 { 0 }");
+    let memory = stored(&fixture);
+    with_signatures(&fixture, &memory, &part_with_g_as_f(&fixture));
     _ = frozen::differences();
     for mode in [Mode::Serve, Mode::Check] {
-        let db = served_db(&other, &memory, mode);
+        let db = served_db(&fixture, &memory, mode);
         let f = function_f(&db);
         let served = served_function(&db, f).unwrap();
         let lowered = &FunctionSignature::with_source_map(&db, f).0;
-        assert_ne!(*served, **lowered, "the image's `f` returns a u8, the file's a u16");
+        assert_ne!(*served, **lowered, "the image's `f` is `g`, a u8; the file's `f` returns a u16");
         let differences = frozen::differences();
         match mode {
             Mode::Check => assert!(

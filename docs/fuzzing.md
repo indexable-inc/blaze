@@ -19,8 +19,8 @@ program with cargo too (`fuzz/fuzz.py`) was deleted on 2026-10-30 with the other
     uv run --frozen python fuzz/edits.py run '{"seed": "S", "rounds": 10, "steps": 20}'                             # a longer run
 
 Both take the cargo profiles to build, which pick the backend as v2 picks it: opt-level 0 and
-1 are Cranelift, the rest LLVM, so `release` needs a blaze built with `--features llvm`
-([harness.md](harness.md#under-llvm)). `store.py` takes v2's `blaze` in its input; `edits.py`
+1 are Cranelift, the rest LLVM, so `release` needs a blaze with LLVM, which every native one
+has ([harness.md](harness.md#under-llvm)). `store.py` takes v2's `blaze` in its input; `edits.py`
 the one `BLAZE_BIN` names, through `rebuild.py`. `edits.py` was v1's on v1's daemon (`--socket`,
 `sync` and `patch`) and its mixed model; on 2026-10-30 it moved onto `blaze build` in a warm
 home, each step held to a build of the same source in an empty home (`rebuild.Project`), and

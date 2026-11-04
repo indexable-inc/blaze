@@ -7,12 +7,13 @@
   ],
   "scripts": {
     "build": "bun gen/build.ts",
-    "check": "tsc -p tsconfig.json && tsc -p client/tsconfig.json && tsc -p gen/tsconfig.json && tsc -p content --runExternalCode",
+    "check": "tsc -p tsconfig.json && tsc -p client/tsconfig.json && tsc -p gen/tsconfig.json && tsc -p graph/tsconfig.json && tsc -p content --runExternalCode",
     "dev": "wrangler dev",
     "deploy": "bun gen/build.ts && wrangler deploy"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261019.1",
+    "@codegraphy-dev/graph-renderer": "0.4.0",
     "@huggingface/transformers": "4.3.2",
     "@types/bun": "^1.4.4",
     "flecs-content-mapper": "workspace:*",

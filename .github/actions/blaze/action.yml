@@ -4,7 +4,7 @@
 # store, the one cache, pulled from the shared remote (.github/actions/blaze-remote) that main's
 # runs push to after their tests. With `llvm: true`, also the LLVM blaze pins
 # (crates/hir-ty-codegen/llvm.json), fetched by its sha256 and named by LLVM_SYS_231_PREFIX, for
-# a build of the `llvm` feature. No Nix: the C compiler and linker are the runner's own (gcc and
+# a build of blaze, which links it (blaze-engine's default `native`). No Nix: the C compiler and linker are the runner's own (gcc and
 # glibc on Ubuntu, Xcode's clang on macOS), so what the build links runs on the runner as it is.
 # The remote's project is the job's, the platform's, and what the store's keys are made with
 # (`blaze-engine cache build`: the store's format and the hash of every source blaze is compiled
@@ -72,8 +72,7 @@ runs:
         if [ -n "$ALSO" ]; then
           echo "also=blaze-$RUNNER_OS-$RUNNER_ARCH-$ALSO-$build" | tee -a "$GITHUB_OUTPUT"
         fi
-    # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM for
-    # `--features llvm`"): llvm.py fetches the archive llvm.json names for this host, checks its
+    # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM"): llvm.py fetches the archive llvm.json names for this host, checks its
     # sha256 and unpacks it; crates/hir-ty-codegen/build.rs refuses any other prefix. Below
     # /usr/local/lib because llvm-sys's build script names the prefix's `lib` to the linker, and a
     # build script in blaze's sandbox may name only system directories of libraries

@@ -125,17 +125,17 @@ mod unix;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod linux;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) use linux::*;
+pub use linux::*;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use macos::*;
+pub use macos::*;
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 #[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) use windows::*;
+pub use windows::*;
 
 #[cfg(not(any(
     all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
@@ -148,11 +148,11 @@ mod none;
     all(target_os = "macos", target_arch = "aarch64"),
     all(windows, target_arch = "x86_64"),
 )))]
-pub(crate) use none::*;
+pub use none::*;
 
 /// What a run process may do with an object it is given.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Rights {
+pub enum Rights {
     /// Map it to read, execute or copy, never to write it shared: the image and arena, a
     /// fixed map's.
     Code,
@@ -163,7 +163,7 @@ pub(crate) enum Rights {
 
 /// The words of an object the start hook mapped at `at`, `len` bytes and at least `least`, for
 /// the rest of the process: the control words, the asks.
-pub(crate) fn adopt_words(at: u64, len: u64, least: u64) -> Result<&'static [std::sync::atomic::AtomicU64], crate::Error> {
+pub fn adopt_words(at: u64, len: u64, least: u64) -> Result<&'static [std::sync::atomic::AtomicU64], crate::Error> {
     if at == 0 || !at.is_multiple_of(8) || len < least || len > isize::MAX as u64 {
         return Err(crate::Error::new(format!("words of {len} bytes at {at:#x}, where {least} are needed")));
     }
@@ -181,7 +181,7 @@ pub(crate) fn adopt_words(at: u64, len: u64, least: u64) -> Result<&'static [std
 ///
 /// `at..at + 8` is mapped readable and writable in this process and private to it (an
 /// `Access::Copy` overlay), and no other thread reads or writes it meanwhile.
-pub(crate) unsafe fn store_private(at: u64, value: u64) {
+pub unsafe fn store_private(at: u64, value: u64) {
     // SAFETY: the caller's contract: 8 writable bytes of this process's own, nobody else's.
     unsafe { std::ptr::write_unaligned(at as *mut u64, value) };
 }

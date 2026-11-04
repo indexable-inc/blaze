@@ -1,4 +1,4 @@
-//! The start of a run, frame by frame, as the daemon ([`crate::host`]) and the program's
+//! The start of a run, frame by frame, as the daemon (`blaze_inproc::host`) and the program's
 //! start hook ([`crate::runtime`]) speak it:
 //!
 //! 1. HELLO, hook to daemon: the token from `BLAZE_INPROC`, the process ID, [`VERSION`], the
@@ -27,19 +27,19 @@ use crate::{Access, Error, Format, ImageWrite};
 pub const HOST_VAR: &str = "BLAZE_INPROC";
 
 /// The version of the handshake; a host and a hook of another refuse each other.
-pub(crate) const VERSION: u32 = 4;
+pub const VERSION: u32 = 4;
 
 /// The most objects and overlays one grant carries.
 const MOST: usize = 64;
 
 /// The most writes, and the most lookups, one grant carries.
-pub(crate) const MOST_BINDS: usize = 1 << 22;
+pub const MOST_BINDS: usize = 1 << 22;
 
 /// The longest name a lookup may have.
-pub(crate) const MOST_NAME: usize = 1 << 16;
+pub const MOST_NAME: usize = 1 << 16;
 
 /// The bytes of one encoded overlay: object, offset, length, address, access, place, image.
-pub(crate) const OVERLAY_BYTES: usize = 31;
+pub const OVERLAY_BYTES: usize = 31;
 
 /// The bytes of one encoded write: place, value, whether it is an address.
 const WRITE_BYTES: usize = 17;
@@ -52,21 +52,21 @@ fn bad(what: &'static str) -> impl Fn(FrameError) -> Error {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct Hello {
-    pub(crate) token: [u8; 16],
-    pub(crate) pid: u32,
-    pub(crate) version: u32,
-    pub(crate) page: u64,
+pub struct Hello {
+    pub token: [u8; 16],
+    pub pid: u32,
+    pub version: u32,
+    pub page: u64,
     /// Where the image's headers are in the process: its slide plus the linked header.
-    pub(crate) header: u64,
+    pub header: u64,
 }
 
 impl Hello {
-    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) {
         Writer::new(out).raw(&self.token).u32(self.pid).u32(self.version).u64(self.page).u64(self.header);
     }
 
-    pub(crate) fn decode(body: &[u8]) -> Result<Hello, Error> {
+    pub fn decode(body: &[u8]) -> Result<Hello, Error> {
         let bad = bad("a start hook's hello");
         let mut read = Reader::new(body);
         let hello = Hello {
@@ -83,7 +83,7 @@ impl Hello {
 
 /// Where an overlay goes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Place {
+pub enum Place {
     /// Over one of the image's code segments, from the same file offset of the image object.
     Code,
     /// Inside a reservation of the image: the arena, the cells, a fixed map.
@@ -93,20 +93,20 @@ pub(crate) enum Place {
 /// `len` bytes of object `object` from `offset`, mapped at the linked address `at` with
 /// `access`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Overlay {
-    pub(crate) object: u32,
-    pub(crate) offset: u64,
-    pub(crate) len: u64,
-    pub(crate) at: u64,
-    pub(crate) access: Access,
-    pub(crate) place: Place,
+pub struct Overlay {
+    pub object: u32,
+    pub offset: u64,
+    pub len: u64,
+    pub at: u64,
+    pub access: Access,
+    pub place: Place,
     /// A fixed map of a dependency image (`blaze-premap`'s), whose words that name its own
     /// addresses are linked at its base: it runs only unslid ([`crate::bind::check_slide`]).
-    pub(crate) image: bool,
+    pub image: bool,
 }
 
 impl Overlay {
-    pub(crate) fn range(&self) -> Range<u64> {
+    pub fn range(&self) -> Range<u64> {
         self.at..self.at.saturating_add(self.len)
     }
 }
@@ -114,31 +114,31 @@ impl Overlay {
 /// A word the start hook binds to `name` ([`crate::ImageLookup`]), the name's bytes at
 /// `name..name + len` of [`Grant::names`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Lookup {
-    pub(crate) place: u64,
-    pub(crate) addend: i64,
-    pub(crate) weak: bool,
-    pub(crate) name: u32,
-    pub(crate) len: u32,
+pub struct Lookup {
+    pub place: u64,
+    pub addend: i64,
+    pub weak: bool,
+    pub name: u32,
+    pub len: u32,
 }
 
 /// What the daemon gives a start hook. Objects: the image's code memory first (rights
 /// [`Rights::Code`]), the fence's control words second and the asks ([`crate::ask`]) third
 /// (both [`Rights::Words`]), then the cells and the objects of fixed maps.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) struct Grant {
-    pub(crate) format: Format,
-    pub(crate) header: u64,
-    pub(crate) span: Range<u64>,
-    pub(crate) objects: Vec<(u64, Rights)>,
+pub struct Grant {
+    pub format: Format,
+    pub header: u64,
+    pub span: Range<u64>,
+    pub objects: Vec<(u64, Rights)>,
     /// By address, none overlapping another.
-    pub(crate) overlays: Vec<Overlay>,
+    pub overlays: Vec<Overlay>,
     /// The words of dependency images the hook stores once the overlays are mapped: each whole
     /// inside an overlay of [`Overlay::image`] and [`Access::Copy`] ([`Grant::check_binds`]).
-    pub(crate) writes: Vec<ImageWrite>,
-    pub(crate) lookups: Vec<Lookup>,
+    pub writes: Vec<ImageWrite>,
+    pub lookups: Vec<Lookup>,
     /// Every lookup's name, one after another.
-    pub(crate) names: String,
+    pub names: String,
 }
 
 fn rights_tag(rights: Rights) -> u8 {
@@ -156,7 +156,7 @@ fn place_tag(place: Place) -> u8 {
 }
 
 impl Grant {
-    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut Vec<u8>) {
         out.reserve(
             41 + 9 * self.objects.len()
                 + OVERLAY_BYTES * self.overlays.len()
@@ -192,7 +192,7 @@ impl Grant {
     }
 
     /// The name of `lookup`, one of this grant's.
-    pub(crate) fn name(&self, lookup: &Lookup) -> &str {
+    pub fn name(&self, lookup: &Lookup) -> &str {
         let start = lookup.name as usize;
         self.names.get(start..start + lookup.len as usize).unwrap_or("")
     }
@@ -202,7 +202,7 @@ impl Grant {
     /// name is empty, longer than [`MOST_NAME`], has a NUL or is not where [`Grant::names`]
     /// has it, and more than [`MOST_BINDS`] of either. What a hook may store before the
     /// program runs is only ever a word of its own copy of a dependency image's data.
-    pub(crate) fn check_binds(&self) -> Result<(), Error> {
+    pub fn check_binds(&self) -> Result<(), Error> {
         if self.writes.len() > MOST_BINDS || self.lookups.len() > MOST_BINDS {
             return Err(Error::new(format!( // alloc: error path
                 "a grant of {} writes and {} lookups, past the most of {MOST_BINDS}",
@@ -248,7 +248,7 @@ impl Grant {
     /// the code memory never shared writable, shared words never executable and only in a
     /// reservation, code only from the code memory and executable, nothing out of its object
     /// or the span, no overlay over another.
-    pub(crate) fn decode(body: &[u8]) -> Result<Grant, Error> {
+    pub fn decode(body: &[u8]) -> Result<Grant, Error> {
         let bad = bad("the daemon's grant");
         let mut read = Reader::new(body);
         let tag = read.u8().map_err(&bad)?;
@@ -376,7 +376,7 @@ impl Grant {
     /// with pages of `page` bytes: every code segment is overlaid whole from its own file
     /// offset, everything else lands inside a reservation. Compared relative to each one's
     /// header, so a header the system loader moved changes nothing.
-    pub(crate) fn check(&self, own: &Layout, page: u64) -> Result<(), Error> {
+    pub fn check(&self, own: &Layout, page: u64) -> Result<(), Error> {
         if self.format != own.format {
             return Err(Error::new(format!("a grant for a {:?} image, where this one is {:?}", self.format, own.format)));
         }
@@ -429,11 +429,11 @@ impl Grant {
 }
 
 /// A MAP frame's body: the whole of granted object `object`, anywhere, with `access`.
-pub(crate) fn encode_map(object: u32, access: Access, out: &mut Vec<u8>) {
+pub fn encode_map(object: u32, access: Access, out: &mut Vec<u8>) {
     Writer::new(out).u32(object).u8(access.tag());
 }
 
-pub(crate) fn decode_map(body: &[u8]) -> Result<(u32, Access), Error> {
+pub fn decode_map(body: &[u8]) -> Result<(u32, Access), Error> {
     let bad = bad("a start hook's map");
     let mut read = Reader::new(body);
     let object = read.u32().map_err(&bad)?;
@@ -443,7 +443,7 @@ pub(crate) fn decode_map(body: &[u8]) -> Result<(u32, Access), Error> {
     Ok((object, access))
 }
 
-pub(crate) fn hex(bytes: &[u8; 16]) -> String {
+pub fn hex(bytes: &[u8; 16]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(32);
     for byte in bytes {
@@ -453,7 +453,7 @@ pub(crate) fn hex(bytes: &[u8; 16]) -> String {
     out
 }
 
-pub(crate) fn unhex(text: &[u8]) -> Option<[u8; 16]> {
+pub fn unhex(text: &[u8]) -> Option<[u8; 16]> {
     if text.len() != 32 {
         return None;
     }
@@ -470,7 +470,7 @@ pub(crate) fn unhex(text: &[u8]) -> Option<[u8; 16]> {
 }
 
 /// The address and token of a `BLAZE_INPROC` value.
-pub(crate) fn host_var(value: &[u8]) -> Result<(&str, [u8; 16]), Error> {
+pub fn host_var(value: &[u8]) -> Result<(&str, [u8; 16]), Error> {
     let tab = value
         .iter()
         .position(|it| *it == b'\t')

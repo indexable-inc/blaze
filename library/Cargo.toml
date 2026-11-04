@@ -4,6 +4,8 @@ cargo-features = ["profile-rustflags"]
 resolver = "1"
 members = [
   "std",
+  # blaze's dev runtime (crates/blaze-units/src/stdlib.rs, DEV_RUNTIME).
+  "blaze_inproc_rt",
   "sysroot",
   "coretests",
   "alloctests",

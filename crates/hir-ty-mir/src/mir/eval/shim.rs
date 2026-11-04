@@ -2250,7 +2250,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let Some((file, line, col)) = source_location_in_file(self.db, body, span) else {
             not_supported!("the caller's location: no place for {span:?}");
         };
-        let Some(name) = source_path(self.db, file) else {
+        // Named as the crate of the code the place is in names its files.
+        let Some(name) = source_path(self.db, hir_def::HasModule::krate(&body, self.db), file) else {
             not_supported!("the caller's location: the build did not name its file");
         };
         let Some(id) = self.lang_items().PanicLocation else {

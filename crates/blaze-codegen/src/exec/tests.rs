@@ -90,12 +90,21 @@ fn tests() -> Vec<(String, usize)> {
 }
 
 #[test]
-fn a_function_s_id_is_its_identity_with_its_settings() {
+fn a_function_s_id_is_its_subject_with_its_settings() {
+    use crate::{
+        driver::subject,
+        plan::{Origin, Package},
+    };
     let (identity, other) = (ContentId([1; 32]), ContentId([2; 32]));
     let (debug, release) = (Settings(ContentId([3; 32])), Settings(ContentId([4; 32])));
-    assert_eq!(fn_id(identity, debug), fn_id(identity, debug));
-    assert_ne!(fn_id(identity, debug), fn_id(identity, release));
-    assert_ne!(fn_id(identity, debug), fn_id(other, debug));
+    let (app, dep) = (Origin::Member(Package::new("app")), Origin::Dependency(Package::new("app")));
+    let id = |identity, settings, origin| fn_id(subject(identity, origin), settings);
+    assert_eq!(id(identity, debug, app), id(identity, debug, app));
+    assert_ne!(id(identity, debug, app), id(identity, release, app));
+    assert_ne!(id(identity, debug, app), id(other, debug, app));
+    assert_ne!(id(identity, debug, app), id(identity, debug, dep), "one name, two kinds of origin");
+    assert_ne!(id(identity, debug, app), id(identity, debug, Origin::Member(Package::new("ap"))));
+    assert_ne!(subject(identity, app), subject(identity, dep), "the live identity tells origins apart too");
 }
 
 #[test]

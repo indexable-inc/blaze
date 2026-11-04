@@ -23,28 +23,28 @@ pub struct Channel {
 }
 
 impl Channel {
-    pub(crate) fn new(stream: sys::Stream) -> Channel {
+    pub fn new(stream: sys::Stream) -> Channel {
         Channel { stream, buf: vec![0; CHUNK], start: 0, end: 0, last: 0, out: Vec::new(), seq: 0 }
     }
 
     /// The channel of the fd or handle `raw`, which the caller hands over.
     #[cfg(all(test, unix))]
-    pub(crate) fn from_raw(raw: i64) -> Result<Channel, Error> {
+    pub fn from_raw(raw: i64) -> Result<Channel, Error> {
         Ok(Channel::new(sys::Stream::from_raw(raw)?))
     }
 
     /// The socket under the channel, for the rendezvous to ask the OS about its peer.
     #[cfg(target_os = "macos")]
-    pub(crate) fn raw(&self) -> i64 {
+    pub fn raw(&self) -> i64 {
         self.stream.raw()
     }
 
-    pub(crate) fn stream(&mut self) -> &mut sys::Stream {
+    pub fn stream(&mut self) -> &mut sys::Stream {
         &mut self.stream
     }
 
     /// The stream, once nothing more is framed on it: the asks' doorbell.
-    pub(crate) fn into_stream(self) -> sys::Stream {
+    pub fn into_stream(self) -> sys::Stream {
         self.stream
     }
 

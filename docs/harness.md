@@ -146,7 +146,7 @@ need a few gigabytes there.
 The gate is what a change runs before it lands: its fast tier in the lane's ix VM. CI's merge
 gate is only the build and the unit tests; all of it, every part on every platform, runs in the
 release train on main after the merge ([CI](#ci)), which finds what the fast tier would have.
-A change is not done until all of it exits 0, with a blaze built with `--features llvm` (the
+A change is not done until all of it exits 0, with a native blaze, which has LLVM (the
 release profile is LLVM's). `harness/ci.py` is the one list of it: which harness runs in which
 part, in which tier, on which hosts.
 
@@ -200,12 +200,12 @@ profile is.
 
 ### Under LLVM
 
-Build with the `llvm` feature in the flake's dev shell, which has the LLVM 23 it pins
-([contributing.md](contributing.md#llvm-for---features-llvm)). Under v2 an `opt-level` of 2,
+Build in the flake's dev shell, which has the LLVM 23 it pins
+([contributing.md](contributing.md#llvm)). Under v2 an `opt-level` of 2,
 `s` or `z` is then LLVM at `-O2` and 3 is LLVM at `-O3`, so the release profile is LLVM; a
 profile that asks for LLVM of a blaze built without it is refused.
 
-    nix develop -c cargo build -p blaze-engine --release --features llvm
+    nix develop -c cargo build -p blaze-engine --release
 
 `BLAZE_BACKEND` and `BLAZE_OPT` are v1's settings: under v2, either one set at all makes every
 unit fail, saying the variable changes code its key has no part of
@@ -274,7 +274,7 @@ written from cargo again, and a change to one is a change to what blaze expects.
 | `spaces.py` | A two-crate workspace under a directory whose name has spaces, `$$`, `#` and quotes, built and edited with `blaze build`; every edit has to be applied by the daemon against rustc's symbols ([#14](https://github.com/indexable-inc/blaze/issues/14)) |
 | `nocompact.py` | A program linked with `-no_compact_unwind`, as bun is, which has `__eh_frame` and no `__unwind_info`: its edits are spliced, and the unwinder finds the frame of the edited function where its symbol now is, behind the program's frames and, once a thousand new functions outgrow that room, with all of them moved into the header's ([#33](https://github.com/indexable-inc/blaze/issues/33)). macOS on AArch64 |
 | `headerpad.py` | A program whose unwind table does not fit the room its link leaves after the load commands: the first link is told the room the unwind information of its objects wants and is linked once ([#173](https://github.com/indexable-inc/blaze/issues/173)), the edits after it are spliced, and a restarted daemon starts from the room kept beside the executable ([#13](https://github.com/indexable-inc/blaze/issues/13)). It is built for macOS 14, as nix's shell builds, which Apple's linker gives chained fixups unless told not to ([#30](https://github.com/indexable-inc/blaze/issues/30)). The daemon's own links. macOS on AArch64 |
-| `tiers.py` | Tiers ([tiers.md](tiers.md)): `demo/lifebench` running under the daemon reaches levels 2 and 3 with output identical to blaze's build from nothing with `BLAZE_TIER=off`, an edit of a tiered function demotes it and is applied at once, and `BLAZE_TIER=off` changes nothing. macOS on AArch64 with `--features llvm`; it exits 0 elsewhere |
+| `tiers.py` | Tiers ([tiers.md](tiers.md)): `demo/lifebench` running under the daemon reaches levels 2 and 3 with output identical to blaze's build from nothing with `BLAZE_TIER=off`, an edit of a tiered function demotes it and is applied at once, and `BLAZE_TIER=off` changes nothing. macOS on AArch64 (any native blaze, which has LLVM); it exits 0 elsewhere |
 | `tierbench.py` | The benchmark table of [tiers.md](tiers.md): `demo/lifebench` at level 1, 2 and 3 under a daemon and as cargo builds it (release, and `-O3` with the dev profile's checks), in interleaved rounds, the steady rate of each; `--together` runs a round's builds at once, for a loaded machine. Measures; checks nothing; not in CI |
 
 ### The store
@@ -497,7 +497,7 @@ install.sh fetching its own Rust (the release's pinned `rustc`, `cargo`, `rust-s
 `rust-src`, into `~/.blaze/toolchains`,
 [self-contained.md](self-contained.md#blazes-own-toolchain-the-stopgap)), and for the build the
 pinned LLVM as a contributor outside Nix gets it
-([contributing.md](contributing.md#llvm-for---features-llvm)): `.github/scripts/llvm.py fetch`
+([contributing.md](contributing.md#llvm)): `.github/scripts/llvm.py fetch`
 into `/usr/local/lib/blaze-llvm/<triple>`, checked against `crates/hir-ty-codegen/llvm.json`'s
 sha256, as `LLVM_SYS_231_PREFIX`. Neither is cached by CI. The C compiler, linker and libc are
 the runner's (gcc and glibc 2.39 on Ubuntu 24.04, Xcode's clang on macOS), so what the build and
@@ -582,7 +582,7 @@ on the newest commit of main once the one before it is done. It does not cancel 
 train: with a merge every few minutes, a train of 45 would never end.
 
 It builds blaze once per platform (Linux x86-64, Linux AArch64, macOS arm64, Windows x86-64),
-with the `llvm` feature, hands the binary to its other jobs, and runs:
+with LLVM, as every native blaze has it, hands the binary to its other jobs, and runs:
 
 - `harness/unittests.py` on each platform;
 - every part of `ci.py parts`, a job each: `core-1` ... `core-N` (the

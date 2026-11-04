@@ -14,7 +14,8 @@ import pagesJson from '../.gen/pages.json';
 import { currentUser, hasSessionCookie, isAdmin } from './auth';
 import { outer } from './base';
 import type { Env } from './env';
-import { ASSETS, ASSETS_HEADER, csp, methodNotAllowed, plain } from './http';
+import { csp } from './csp';
+import { ASSETS, ASSETS_HEADER, methodNotAllowed, plain } from './http';
 import { renderPage, type CommentRow, type Discussion } from './renderer';
 import type { Page } from './site-wasm';
 

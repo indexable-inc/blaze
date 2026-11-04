@@ -46,9 +46,5 @@ blaze-alloc-count.workspace = true
 crossbeam-channel.workspace = true
 hegeltest.workspace = true
 
-[features]
-default = []
-in-rust-tree = []
-
 [lints]
 workspace = true

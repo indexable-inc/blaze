@@ -1,7 +1,8 @@
 //! Re-execution counts, per ingredient: how many of its rows ran, how many were proved
 //! unchanged without running, how many ran again in a view they had already run in, how many
 //! ran because their value was evicted and asked for again (in any view), and how many values
-//! a budget's pass and an explicit drop let go. Process-wide, as ingredient numbers are.
+//! a budget's pass and an explicit drop let go; and its runs' reads: recorded, kept by the
+//! rows, and the most one run held. Process-wide, as ingredient numbers are.
 //!
 //! Each thread counts into a block of its own with a load and a store (no read-modify-write,
 //! no cache line two threads write), found through one thread-local read on the run and
@@ -33,7 +34,16 @@ pub(crate) const EVICTED_ASKED: usize = 3;
 pub(crate) const EVICTED: usize = 4;
 /// `evict_values` or `evict_values_of` dropped a value.
 pub(crate) const DROPPED: usize = 5;
-const KINDS: usize = 6;
+/// Reads a run recorded (before repeats were dropped), counted as it stored its edges.
+const READS_RECORDED: usize = 6;
+/// Reads a run's row kept: its distinct reads.
+const READS_KEPT: usize = 7;
+const KINDS: usize = 8;
+
+/// The most reads one run of each ingredient held on its thread's edge stack at its end since
+/// the last [`take`], which resets it: a mark, not a sum, so one word an ingredient shared by
+/// every thread, written only when a run passes it.
+static MOST_READS: [AtomicU64; MAX_INGREDIENTS] = [const { AtomicU64::new(0) }; MAX_INGREDIENTS];
 
 /// What one ingredient's rows did since the last [`take`].
 ///
@@ -53,13 +63,33 @@ pub struct Counts {
     pub evicted: u64,
     /// Values `evict_values` or `evict_values_of` dropped.
     pub dropped: u64,
+    /// Reads its runs recorded, repeats of an earlier read in the same run included (a read
+    /// equal to the run's last is never recorded): with `reads_kept`, how often its runs read
+    /// the same rows again.
+    pub reads_recorded: u64,
+    /// Reads its runs' rows kept: each run's distinct reads, summed.
+    pub reads_kept: u64,
+    /// The most entries one of its runs held on its thread's edge stack at once (repeats are
+    /// dropped once a run holds `max(4096, 2 x kept)`): what one run cost the stack.
+    pub reads_most: u64,
 }
 
 impl Counts {
-    fn of(gained: [u64; KINDS]) -> Counts {
-        let [executed, verified, reran, evicted_asked, evicted, dropped] = gained;
-        Counts { executed, verified, reran, evicted_asked, evicted, dropped }
+    fn of(gained: [u64; KINDS], reads_most: u64) -> Counts {
+        let [executed, verified, reran, evicted_asked, evicted, dropped, reads_recorded, reads_kept] = gained;
+        Counts { executed, verified, reran, evicted_asked, evicted, dropped, reads_recorded, reads_kept, reads_most }
     }
+}
+
+/// One run's reads, as it stored its edges ([`reads`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Reads {
+    /// Recorded: held, and the repeats dropped as the stack filled.
+    pub(crate) recorded: u64,
+    /// Kept by its row: its distinct reads.
+    pub(crate) kept: u64,
+    /// The most it held on the edge stack at once ([`super::local::Frame::held_most`]).
+    pub(crate) most: u64,
 }
 
 /// One ingredient's counts in one block, and what takes have reported of them.
@@ -133,6 +163,30 @@ pub(crate) fn count(ingredient: u32, what: usize) {
 /// Adds `by` to counter `what` of `ingredient` on this thread, as [`count`] does one.
 #[inline(never)]
 pub(crate) fn add(ingredient: u32, what: usize, by: u64) {
+    with_counters(ingredient, |counters| bump(counters, what, by));
+}
+
+/// Counts one run's reads to `ingredient`, once the run stored its edges.
+#[inline(never)]
+pub(crate) fn reads(ingredient: u32, reads: Reads) {
+    with_counters(ingredient, |counters| {
+        bump(counters, READS_RECORDED, reads.recorded);
+        bump(counters, READS_KEPT, reads.kept);
+    });
+    if let Some(most) = MOST_READS.get(ingredient as usize)
+        && most.load(Ordering::Relaxed) < reads.most
+    {
+        most.fetch_max(reads.most, Ordering::Relaxed);
+    }
+}
+
+fn bump(counters: &Counters, what: usize, by: u64) {
+    let at = &counters.now[what];
+    at.store(at.load(Ordering::Relaxed) + by, Ordering::Relaxed);
+}
+
+/// Lends `f` this thread's counters of `ingredient`.
+fn with_counters(ingredient: u32, f: impl FnOnce(&Counters)) {
     // A thread past its thread-locals' teardown counts nothing.
     let _ = HELD.try_with(|held| {
         let block = match held.0.get() {
@@ -144,15 +198,15 @@ pub(crate) fn add(ingredient: u32, what: usize, by: u64) {
             }
         };
         if let Some(counters) = block.counters.get(ingredient as usize) {
-            let at = &counters.now[what];
-            at.store(at.load(Ordering::Relaxed) + by, Ordering::Relaxed);
+            f(counters);
         }
     });
 }
 
-/// What each ingredient's counts gained since the last take, summed over every thread, as
-/// `each(name, counts)`; an ingredient that gained nothing is left out. Process-wide: two
-/// databases' counts, and two overlapping builds', land in whichever take comes first.
+/// What each ingredient's counts gained since the last take, summed over every thread, and the
+/// most reads one of its runs held since then, as `each(name, counts)`; an ingredient that
+/// gained nothing is left out. Process-wide: two databases' counts, and two overlapping
+/// builds', land in whichever take comes first.
 pub fn take(mut each: impl FnMut(&'static str, Counts)) {
     let ingredients = (ingredient::registered() as usize + 1).min(MAX_INGREDIENTS);
     // alloc: once per take (a build's end), a word per kind per registered ingredient
@@ -172,8 +226,9 @@ pub fn take(mut each: impl FnMut(&'static str, Counts)) {
         }
     }
     for (index, gained) in gained.into_iter().enumerate().skip(1) {
-        if gained.iter().any(|&it| it != 0) {
-            each(ingredient::name(index as u32), Counts::of(gained));
+        let most = MOST_READS[index].swap(0, Ordering::Relaxed);
+        if most != 0 || gained.iter().any(|&it| it != 0) {
+            each(ingredient::name(index as u32), Counts::of(gained, most));
         }
     }
 }

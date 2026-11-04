@@ -27,6 +27,11 @@ impl Programs for Fake {
     fn launch(&mut self, _: &Artifact, _: &mut Exec) -> Result<(), String> {
         Ok(())
     }
+
+    /// No daemon: every test executable starts as its command says.
+    fn started(&mut self, _: &Artifact, exec: &Exec) -> Result<Exec, String> {
+        Ok(exec.clone())
+    }
 }
 
 /// A package `foo` with a lib, a bin and a test `x`, each tested, and its doc tests; out of

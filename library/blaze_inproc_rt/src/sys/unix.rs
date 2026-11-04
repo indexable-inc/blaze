@@ -21,7 +21,7 @@ fn os(what: &str) -> Error {
     Error::new(format!("{what}: {}", std::io::Error::last_os_error()))
 }
 
-pub(crate) struct Stream {
+pub struct Stream {
     fd: OwnedFd,
     /// Descriptors that came with bytes already read, in order.
     fds: VecDeque<OwnedFd>,
@@ -51,12 +51,12 @@ impl Stream {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn raw(&self) -> i64 {
+    pub fn raw(&self) -> i64 {
         i64::from(self.fd.as_raw_fd())
     }
 
     #[cfg(all(test, unix))]
-    pub(crate) fn from_raw(raw: i64) -> Result<Stream, Error> {
+    pub fn from_raw(raw: i64) -> Result<Stream, Error> {
         let fd = RawFd::try_from(raw).map_err(|_| Error::new(format!("a channel fd of {raw}")))?;
         // SAFETY: a zeroed `stat` is a valid one: plain integers.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -72,7 +72,7 @@ impl Stream {
         Stream::new(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    pub(crate) fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
+    pub fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
         let value = match timeout {
             Some(timeout) => libc::timeval {
                 tv_sec: timeout.as_secs().min(i32::MAX as u64) as libc::time_t,
@@ -99,7 +99,7 @@ impl Stream {
     }
 
     /// Reads what came, keeping the descriptors that came with it.
-    pub(crate) fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let mut control = [0u64; 2 + MOST_FDS];
         loop {
             let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
@@ -175,12 +175,12 @@ impl Stream {
         Ok(())
     }
 
-    pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error> {
+    pub fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.send(bytes, &[])
     }
 
     /// Sends `bytes`, with `fds` on the first of them.
-    pub(crate) fn send(&mut self, mut bytes: &[u8], fds: &[RawFd]) -> Result<(), Error> {
+    pub fn send(&mut self, mut bytes: &[u8], fds: &[RawFd]) -> Result<(), Error> {
         if fds.len() > MOST_FDS {
             return Err(Error::new(format!("{} descriptors in one message", fds.len())));
         }
@@ -235,7 +235,7 @@ impl Stream {
     }
 
     /// The next descriptor that came with what was read.
-    pub(crate) fn take_fd(&mut self) -> Option<OwnedFd> {
+    pub fn take_fd(&mut self) -> Option<OwnedFd> {
         self.fds.pop_front()
     }
 
@@ -268,43 +268,43 @@ impl Stream {
     }
 }
 
-pub(crate) fn ring(stream: &Stream, _: u64) -> Result<(), Error> {
+pub fn ring(stream: &Stream, _: u64) -> Result<(), Error> {
     stream.ring()
 }
 
 /// After the start the daemon sends a run process nothing, so its end speaking is its end
 /// closing.
-pub(crate) fn hung_up(stream: &Stream) -> bool {
+pub fn hung_up(stream: &Stream) -> bool {
     stream.spoke()
 }
 
-pub(crate) fn wait_answer(word: &AtomicU64, expected: u32, _: u64, timeout: Duration) -> bool {
+pub fn wait_answer(word: &AtomicU64, expected: u32, _: u64, timeout: Duration) -> bool {
     super::wait(word, expected, timeout)
 }
 
 /// Askers sleep on their slots' words, shared with the daemon, and ring on the channel.
-pub(crate) struct Bells;
+pub struct Bells;
 
 impl Bells {
-    pub(crate) fn new(_: &super::Remote, slots: usize) -> Result<(Bells, Vec<u64>), Error> {
+    pub fn new(_: &super::Remote, slots: usize) -> Result<(Bells, Vec<u64>), Error> {
         Ok((Bells, vec![0; slots + 1]))
     }
 
-    pub(crate) fn wake(&self, _: usize, word: &AtomicU64) {
+    pub fn wake(&self, _: usize, word: &AtomicU64) {
         super::wake(word);
     }
 
-    pub(crate) fn wait_ring(&self, stream: &mut Stream) -> Result<bool, Error> {
+    pub fn wait_ring(&self, stream: &mut Stream) -> Result<bool, Error> {
         let mut bytes = [0u8; 256];
         Ok(stream.read(&mut bytes)? != 0)
     }
 }
 
 /// The calling thread's `errno`, put back when dropped.
-pub(crate) struct Errno(c_int);
+pub struct Errno(c_int);
 
 impl Errno {
-    pub(crate) fn keep() -> Errno {
+    pub fn keep() -> Errno {
         Errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
     }
 }
@@ -326,7 +326,7 @@ impl Drop for Errno {
     }
 }
 
-pub(crate) struct Listener {
+pub struct Listener {
     listener: UnixListener,
     path: std::path::PathBuf,
 }
@@ -340,7 +340,7 @@ impl Drop for Listener {
 impl Listener {
     /// Listens at `dir/inproc-<pid>.sock`; `dir` is made, or must already be, this user's
     /// only.
-    pub(crate) fn bind(dir: &Path) -> Result<(Listener, String), Error> {
+    pub fn bind(dir: &Path) -> Result<(Listener, String), Error> {
         let fail = |it: std::io::Error| Error::new(format!("{}: {it}", dir.display()));
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(fail)?;
         let meta = std::fs::metadata(dir).map_err(fail)?;
@@ -369,7 +369,7 @@ impl Listener {
     }
 
     /// The next connection, from a process of this user, and its process ID.
-    pub(crate) fn accept(&self) -> Result<(Stream, u32), Error> {
+    pub fn accept(&self) -> Result<(Stream, u32), Error> {
         loop {
             let (stream, _) = self.listener.accept().map_err(|it| Error::new(format!("accepting a run process: {it}")))?;
             let fd = OwnedFd::from(stream);
@@ -425,12 +425,12 @@ fn peer(fd: &OwnedFd) -> Result<u32, Error> {
     }
 }
 
-pub(crate) fn connect(address: &str) -> Result<Stream, Error> {
+pub fn connect(address: &str) -> Result<Stream, Error> {
     let stream = UnixStream::connect(address).map_err(|it| Error::new(format!("connecting to the daemon at {address}: {it}")))?;
     Stream::new(OwnedFd::from(stream))
 }
 
-pub(crate) fn random(out: &mut [u8; 16]) -> Result<(), Error> {
+pub fn random(out: &mut [u8; 16]) -> Result<(), Error> {
     // SAFETY: `out` is 16 writable bytes, within getentropy's limit of 256.
     if unsafe { libc::getentropy(out.as_mut_ptr().cast(), out.len()) } != 0 {
         return Err(os("getentropy"));
@@ -440,17 +440,23 @@ pub(crate) fn random(out: &mut [u8; 16]) -> Result<(), Error> {
 
 /// The process's global scope: what `dlsym(RTLD_DEFAULT, ..)` searches, the executable and
 /// the libraries the system loader loaded for it, in its order.
-pub(crate) struct Scope {
+pub struct Scope {
     /// The name being looked up, NUL-terminated; reused.
     name: Vec<u8>,
 }
 
+impl Default for Scope {
+    fn default() -> Scope {
+        Scope::new()
+    }
+}
+
 impl Scope {
-    pub(crate) fn new() -> Scope {
+    pub fn new() -> Scope {
         Scope { name: Vec::new() }
     }
 
-    pub(crate) fn find(&mut self, name: &str) -> Result<Option<u64>, Error> {
+    pub fn find(&mut self, name: &str) -> Result<Option<u64>, Error> {
         if name.is_empty() || name.as_bytes().contains(&0) {
             return Err(Error::new(format!("a lookup of {name:?}: not a C name")));
         }
@@ -473,7 +479,7 @@ pub(crate) fn protection(access: Access) -> c_int {
     }
 }
 
-pub(crate) fn serialize() {
+pub fn serialize() {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: `isb` only synchronizes this core's context; it reads and writes no memory.
     unsafe {
@@ -531,7 +537,7 @@ extern "C" fn step(context: *mut c_void, state: *mut c_void) -> c_int {
 /// The calling thread's return addresses, through the unwinder that runs its panics, so it
 /// sees every frame they would: code placed in a code memory registers its unwind info before
 /// its slot is stored.
-pub(crate) fn backtrace(out: &mut [u64]) -> Option<usize> {
+pub fn backtrace(out: &mut [u64]) -> Option<usize> {
     let mut walk = Walk { out, len: 0, full: false };
     // SAFETY: `step` matches the callback's signature and is given `walk`, live for the call.
     let result = unsafe { _Unwind_Backtrace(step, (&raw mut walk).cast()) };

@@ -401,6 +401,9 @@ pub(crate) struct TestRun {
     ok: bool,
     /// What keeping how its tests ran put ([`Runs::take_puts`]).
     puts: RunPuts,
+    /// The binaries whose tests can't run, each naming it and why ([`each`]): reported, and the
+    /// run failed, when it starts.
+    refused: Vec<ApiError>,
 }
 
 pub(crate) fn start(
@@ -417,128 +420,169 @@ pub(crate) fn start(
     }
     let filter = filter(&selection)?;
     let all = selection.all;
+    // Keep-going: a binary that can't run is refused, naming it, and every other one runs.
+    let (suites, refused) = each(built.iter().filter(|it| it.profile.test), |artifact| suited(job, artifact));
+    Ok(TestRun {
+        job: job.clone(),
+        tags,
+        filter,
+        all,
+        suites,
+        suite_of: Vec::new(),
+        queue: None,
+        ok: true,
+        puts: RunPuts::default(),
+        refused,
+    })
+}
+
+/// Each of `items` made by `make`: what each made (`None`: an item with nothing to run), and
+/// every refusal, in order. One that is refused never keeps the rest from being made: a run
+/// names every binary it can't run and runs every other one.
+pub(crate) fn each<I, T>(
+    items: impl Iterator<Item = I>,
+    mut make: impl FnMut(I) -> Result<Option<T>, ApiError>,
+) -> (Vec<T>, Vec<ApiError>) {
+    // alloc: once per run, a suite and a refusal each
+    let (mut made, mut refused) = (Vec::new(), Vec::new());
+    for item in items {
+        match make(item) {
+            Ok(Some(it)) => made.push(it),
+            Ok(None) => {}
+            Err(error) => refused.push(error),
+        }
+    }
+    (made, refused)
+}
+
+/// The suite of `artifact`, a test profile's: `None` for an artifact of no test unit, which
+/// has no tests; an error naming the binary when its tests can't run.
+fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiError> {
     let units = job.units();
     let config = &job.input.config;
-    let mut suites = Vec::new();
-    for artifact in built.iter().filter(|it| it.profile.test) {
-        let Some(program) = &artifact.executable else {
-            // A test unit always makes its binary; an artifact of no test unit has no tests.
-            if unit_of_artifact(job, artifact).is_some() {
-                return Err(UnitError::NoTestExecutable { target: artifact.target.name.clone() }.into());
-            }
-            continue;
-        };
-        let Some(at) = unit_of_artifact(job, artifact) else {
-            return Err(ApiError::new(format!("no test unit of `{}` is in the build", artifact.target.name), None));
-        };
-        let unit = &units.graph.units[at];
-        let package = package_of(units, unit)?;
-        let Some(made) = job.made[at].get() else {
-            return Err(ApiError::new(format!("the test binary `{program}` was not compiled by this job"), None));
-        };
-        let Some(context) = made.context else {
-            return Err(ApiError::new(format!("the test binary `{program}` was not compiled by this job"), None));
-        };
-        let suite = Suite { package: package.name.clone(), target: target_name(unit), context };
-        let manifest_dir = manifest_dir(&package.name, &package.manifest_path)?;
-        let sandboxed = !job.sandbox_off() && package.tests_sandboxed(units.sandboxed_tests);
-        let outside_why = if job.sandbox_off() {
-            Some("`BLAZE_SANDBOX=off` is set")
-        } else if package.tests.all {
-            Some("its package sets `tests = false` in `[package.metadata.blaze.sandbox]`")
-        } else if !sandboxed {
-            Some(
-                "its package does not opt in (`tests = true` in `[package.metadata.blaze.sandbox]`, or the \
-                 workspace's `sandboxed-tests` experiment)",
-            )
-        } else {
-            None
-        };
-        let unsandboxed = match sandboxed && job.input.verbose > 0 {
-            // alloc: under `-v`, once per binary
-            true => made.tests.iter().filter(|it| package.tests.outside(&it.name)).map(|it| it.name.clone()).collect(),
-            false => Vec::new(),
-        };
-        // alloc: one flag per test, once per binary
-        let inside: Vec<bool> = made.tests.iter().map(|it| sandboxed && !package.tests.outside(&it.name)).collect();
-        let Some(table) = &made.table else {
-            return Err(ApiError::new(
-                // alloc: error path
-                format!("the test binary `{program}` has no execution table: its link made none, so its tests can't be selected"),
-                None,
-            ));
-        };
-        let agree = table.tests.len() == made.tests.len()
-            && table.tests.iter().zip(&made.tests).all(|(kept, listed)| kept.0 == listed.name);
-        if !agree {
-            return Err(ApiError::new(
-                // alloc: error path
-                format!("the execution table of the test binary `{program}` lists other tests than its harness"),
-                None,
-            ));
+    let Some(program) = &artifact.executable else {
+        // A test unit always makes its binary; an artifact of no test unit has no tests.
+        if unit_of_artifact(job, artifact).is_some() {
+            return Err(UnitError::NoTestExecutable { target: artifact.target.name.clone() }.into());
         }
-        if let Some(runner) = artifact.runner.first() {
-            return Err(ApiError::new(
-                format!(
-                    "the test binary `{program}` has the runner `{runner}` (`target.<triple>.runner`), and \
-                     blaze's test queue runs a test binary itself, not under a runner"
-                ),
-                None,
-            ));
-        }
-        let loaded: Option<test::Loaded> = match super::run::launch(job, at, false).map_err(|what| ApiError::new(what, None))? {
-            super::run::Launch::File => None,
-        };
-        let env: Vec<(OsString, OsString)> =
-            super::run::process_env(&config.invocation.env, artifact, std::env::consts::OS);
-        // `Binary` is not `Clone`: a suite with tests on both sides is given two.
-        // clone: the binary's strings, once per binary and once more for one with tests outside
-        let make = |sandboxed: bool| Binary {
-            id: artifact.content,
-            name: program.clone(),
-            program: PathBuf::from(program),
-            env: env.clone(),
-            dir: manifest_dir.clone(),
-            read: vec![PathBuf::from(&config.invocation.root), PathBuf::from(&units.target_dir), manifest_dir.clone()],
-            write: Vec::new(),
-            network: false,
-            memory: None,
-            mode: TestMode::Process,
-            jobs: Vec::new(),
-            loaded: loaded.clone(),
-            sandboxed,
-        };
-        let binary = make(sandboxed);
-        let outside = (sandboxed && !package.tests.tests.is_empty()).then(|| make(false));
-        let tests = &made.tests;
-        // alloc: once per binary, a place per test
-        let mut by_name: Vec<u32> = (0..u32::try_from(tests.len()).expect("under 2^32 tests")).collect();
-        blaze_ids::names::sort_by_name_in(&mut by_name, |&it| tests[it as usize].name.as_bytes());
-        let disk = blaze_usercode::inputs::Disk::new(binary.env.clone());
-        let selector = job
-            .shared
-            .selectors
-            .take(suite.given(), artifact.content, || image::image(program, table))
-            .map_err(|what| ApiError::new(what, None))?;
-        suites.push(Suited {
-            name: program.clone(),
-            unit: at,
-            content: artifact.content,
-            // alloc: once per binary, a test's attributes each
-            attrs: tests.iter().map(attrs).collect(),
-            by_name,
-            selector: Some(selector),
-            kept_all: true,
-            binary: Some(binary),
-            outside,
-            inside,
-            outside_why,
-            unsandboxed,
-            disk,
-            common: traced::Common::default(),
-        });
+        return Ok(None);
+    };
+    let Some(at) = unit_of_artifact(job, artifact) else {
+        return Err(ApiError::new(format!("no test unit of `{}` is in the build", artifact.target.name), None));
+    };
+    let unit = &units.graph.units[at];
+    let package = package_of(units, unit)?;
+    let Some(made) = job.made[at].get() else {
+        return Err(ApiError::new(format!("the test binary `{program}` was not compiled by this job"), None));
+    };
+    let Some(context) = made.context else {
+        return Err(ApiError::new(format!("the test binary `{program}` was not compiled by this job"), None));
+    };
+    let suite = Suite { package: package.name.clone(), target: target_name(unit), context };
+    let manifest_dir = manifest_dir(&package.name, &package.manifest_path)?;
+    let sandboxed = !job.sandbox_off() && package.tests_sandboxed(units.sandboxed_tests);
+    let outside_why = if job.sandbox_off() {
+        Some("`BLAZE_SANDBOX=off` is set")
+    } else if package.tests.all {
+        Some("its package sets `tests = false` in `[package.metadata.blaze.sandbox]`")
+    } else if !sandboxed {
+        Some(
+            "its package does not opt in (`tests = true` in `[package.metadata.blaze.sandbox]`, or the \
+             workspace's `sandboxed-tests` experiment)",
+        )
+    } else {
+        None
+    };
+    let unsandboxed = match sandboxed && job.input.verbose > 0 {
+        // alloc: under `-v`, once per binary
+        true => made.tests.iter().filter(|it| package.tests.outside(&it.name)).map(|it| it.name.clone()).collect(),
+        false => Vec::new(),
+    };
+    // alloc: one flag per test, once per binary
+    let inside: Vec<bool> = made.tests.iter().map(|it| sandboxed && !package.tests.outside(&it.name)).collect();
+    let Some(table) = &made.table else {
+        return Err(ApiError::new(
+            // alloc: error path
+            format!("the test binary `{program}` has no execution table: its link made none, so its tests can't be selected"),
+            None,
+        ));
+    };
+    let agree = table.tests.len() == made.tests.len()
+        && table.tests.iter().zip(&made.tests).all(|(kept, listed)| kept.0 == listed.name);
+    if !agree {
+        return Err(ApiError::new(
+            // alloc: error path
+            format!("the execution table of the test binary `{program}` lists other tests than its harness"),
+            None,
+        ));
     }
-    Ok(TestRun { job: job.clone(), tags, filter, all, suites, suite_of: Vec::new(), queue: None, ok: true, puts: RunPuts::default() })
+    if let Some(runner) = artifact.runner.first() {
+        return Err(ApiError::new(
+            format!(
+                "the test binary `{program}` has the runner `{runner}` (`target.<triple>.runner`), and \
+                 blaze's test queue runs a test binary itself, not under a runner"
+            ),
+            None,
+        ));
+    }
+    let loaded: Option<test::Loaded> = match super::run::launch(job, at, false).map_err(|what| ApiError::new(what, None))? {
+        super::run::Launch::File => None,
+        // Its processes start from the file its code memory writes, the start hook's variable
+        // set, and its fork server attached as one that forks (`Program::command`).
+        super::run::Launch::InProcess => {
+            let held = job.shared.dev_runs.loaded(program).map_err(|what| ApiError::new(what, None))?;
+            // clone: a count, once per binary
+            Some(test::Loaded(held.program().clone()))
+        }
+    };
+    let env: Vec<(OsString, OsString)> =
+        super::run::process_env(&config.invocation.env, artifact, std::env::consts::OS);
+    // `Binary` is not `Clone`: a suite with tests on both sides is given two.
+    // clone: the binary's strings, once per binary and once more for one with tests outside
+    let make = |sandboxed: bool| Binary {
+        id: artifact.content,
+        name: program.clone(),
+        program: PathBuf::from(program),
+        env: env.clone(),
+        dir: manifest_dir.clone(),
+        read: vec![PathBuf::from(&config.invocation.root), PathBuf::from(&units.target_dir), manifest_dir.clone()],
+        write: Vec::new(),
+        network: false,
+        memory: None,
+        mode: TestMode::Process,
+        jobs: Vec::new(),
+        loaded: loaded.clone(),
+        sandboxed,
+    };
+    let binary = make(sandboxed);
+    let outside = (sandboxed && !package.tests.tests.is_empty()).then(|| make(false));
+    let tests = &made.tests;
+    // alloc: once per binary, a place per test
+    let mut by_name: Vec<u32> = (0..u32::try_from(tests.len()).expect("under 2^32 tests")).collect();
+    blaze_ids::names::sort_by_name_in(&mut by_name, |&it| tests[it as usize].name.as_bytes());
+    let disk = blaze_usercode::inputs::Disk::new(binary.env.clone());
+    let selector = job
+        .shared
+        .selectors
+        .take(suite.given(), artifact.content, || image::image(program, table))
+        .map_err(|what| ApiError::new(what, None))?;
+    Ok(Some(Suited {
+        name: program.clone(),
+        unit: at,
+        content: artifact.content,
+        // alloc: once per binary, a test's attributes each
+        attrs: tests.iter().map(attrs).collect(),
+        by_name,
+        selector: Some(selector),
+        kept_all: true,
+        binary: Some(binary),
+        outside,
+        inside,
+        outside_why,
+        unsandboxed,
+        disk,
+        common: traced::Common::default(),
+    }))
 }
 
 impl TestRun {
@@ -653,6 +697,14 @@ impl Runs<Real> for TestRun {
     ) -> Option<bool> {
         let mut binaries = Vec::with_capacity(self.suites.len());
         self.suite_of.clear();
+        for refused in std::mem::take(&mut self.refused) {
+            self.ok = false;
+            let what = match refused.at {
+                Some(at) => format!("the tests of `{at}` can't run: {}", refused.what),
+                None => refused.what,
+            };
+            out.push(Response::Diagnostic(super::say::refused(what, None, self.job.input.color)));
+        }
         if self.job.input.verbose > 0 {
             for suite in &self.suites {
                 let said = match (suite.outside_why, suite.unsandboxed.as_slice()) {

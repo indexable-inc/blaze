@@ -16,6 +16,7 @@ use blaze_ids::ContentId;
 use blaze_inproc::frame::{Frame, Kind, kinds};
 use blaze_inproc::host::{self, Host, Program, Session, Started};
 use blaze_inproc::{CodeMemory, CodeRange, Format};
+use blaze_units::stdlib::DEV_RUNTIME;
 use blaze_link::{DevRun, Image, Staged};
 use blaze_live::patch::{Answer, Message, MessageView};
 use blaze_units::schema::Mode;
@@ -49,40 +50,98 @@ pub(crate) fn dev_run(tiered: Option<u64>) -> DevRun {
     DevRun { arena: ARENA, cells, fixed: 0 }
 }
 
-/// The package whose runtime holds the start hook (`blaze_inproc_start`). A program whose
-/// build links it without its daemon side (feature `host`) runs on the daemon's code memory.
-const RUNTIME: &str = "blaze-inproc";
+/// The package whose daemon side (feature `host`) no program runs as: the daemon's own.
+const DAEMON_SIDE: &str = "blaze-inproc";
+
+/// The runtime that holds the start hook (`blaze_inproc_start`): the standard library's crate
+/// blaze links into every dev executable ([`DEV_RUNTIME`], library/blaze_inproc_rt), or the
+/// same source as a package of the build's (`blaze-inproc-rt`, which `blaze-inproc` and
+/// `blaze-live` depend on), which the load then gives no second one.
+fn is_runtime(name: &str) -> bool {
+    name.len() == DEV_RUNTIME.len()
+        && name.bytes().zip(DEV_RUNTIME.bytes()).all(|(it, want)| it == want || (it == b'-' && want == b'_'))
+}
 
 /// Whether `unit`, built as `policy` says (its own profile, before its mode is chosen), links
 /// as a dev executable: a program run on the daemon's code memory and patched while it runs.
-/// That is a binary or an example's (no test, no build script), under a profile that is not a
-/// release one, for this machine's own target where blaze has a code memory, whose closure
-/// links blaze-inproc's runtime without its daemon side: a program opts in by depending on
-/// it (through `blaze-live`). The daemon's own executable has the daemon side, and never runs
-/// as one.
+/// That is one under a profile that is not a release one ([`super::allows_live`]) that
+/// [`not_in_process`] finds nothing against. The daemon's own executable has blaze-inproc's
+/// daemon side, and never runs as one.
 pub(crate) fn runs_in_process(job: &Job, unit: usize, policy: &Policy) -> Result<bool, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
-    let target = &u.target;
-    let bin = target.kind.iter().chain(&target.crate_types).any(|it| it == "bin");
-    if u.mode != Mode::Build || !bin || target.is_custom_build() || job.graph.has(unit as u32, flag::TEST) {
-        return Ok(false);
-    }
-    if Format::host().is_none() || codegen::triple(job, u) != job.input.config.host {
-        return Ok(false);
-    }
     if super::allows_live(&u.profile.name, policy).is_err() {
         return Ok(false);
     }
+    Ok(not_in_process(job, unit)?.is_none())
+}
+
+/// Why `unit` is not a dev executable whatever its profile, or `None` when it is one: a
+/// binary or example's program (no build script) or a test binary (`--test`, its harness's
+/// fork server forking the processes its tests run in, `attach_forking`), for this machine's
+/// own target where blaze has a code memory, that links the runtime with the start hook
+/// ([`is_runtime`]) and not blaze-inproc's daemon side. The load links the runtime into every
+/// such program of a dev build as it links std (`blaze_units::stdlib::DEV_RUNTIME`), whatever
+/// it depends on; one without it is one the load gave none: a build of a platform the runtime
+/// has no standard library build for. A doctest's programs run under its runner, each a
+/// process of its own, never mapped. The reason is what a dev launch refused for it says
+/// ([`super::launch`]).
+pub(crate) fn not_in_process(job: &Job, unit: usize) -> Result<Option<String>, String> {
+    let u = job.unit(unit).map_err(|it| it.what)?;
+    let target = &u.target;
+    let test = u.mode == Mode::Test && job.graph.has(unit as u32, flag::TEST);
+    let bin = u.mode == Mode::Build
+        && !target.is_custom_build()
+        && !job.graph.has(unit as u32, flag::TEST)
+        && target.kind.iter().chain(&target.crate_types).any(|it| it == "bin");
+    if !test && !bin {
+        // alloc: once per unit asked, its reason
+        return Ok(Some("it is neither a binary's program nor a test binary".to_owned()));
+    }
+    if Format::host().is_none() {
+        // alloc: once per unit asked, its reason
+        return Ok(Some(format!("blaze has no code memory on {}", std::env::consts::OS)));
+    }
+    let triple = codegen::triple(job, u);
+    let host = &job.input.config.host;
+    if triple != *host {
+        // alloc: once per unit asked, its reason
+        return Ok(Some(format!("it is built for `{triple}`, and a code memory runs only this machine's own target, `{host}`")));
+    }
+    // The runtime's own crates' library tests (`blaze-inproc-rt`'s, `blaze-inproc`'s) make
+    // and attach their own hosts and code memories: run attached, they are not yet checked
+    // to hold (inprocrun's F4).
+    let own = &job.package(u).map_err(|it| it.what)?.name;
+    if target.is_lib() && (is_runtime(own) || own == DAEMON_SIDE) {
+        // alloc: once per unit asked, its reason
+        return Ok(Some(format!(
+            "it is the library test of `{own}`, the dev runtime's own, whose tests are not yet checked to hold when attached"
+        )));
+    }
+    let mut runtime = false;
     for dep in job.graph.closure(unit as u32).into_iter().skip(1) {
-        if job.graph.has(dep, flag::STD) {
+        let std = job.graph.has(dep, flag::STD);
+        let dep = job.unit(dep as usize).map_err(|it| it.what)?;
+        if std {
+            // The standard library's runtime: its library unit, named as its crate.
+            runtime |= dep.target.is_lib() && dep.target.name == DEV_RUNTIME;
             continue;
         }
-        let dep = job.unit(dep as usize).map_err(|it| it.what)?;
-        if job.package(dep).map_err(|it| it.what)?.name == RUNTIME {
-            return Ok(!dep.features.iter().any(|it| it == "host"));
+        let name = &job.package(dep).map_err(|it| it.what)?.name;
+        if name == DAEMON_SIDE && dep.features.iter().any(|it| it == "host") {
+            // alloc: once per unit asked, its reason
+            return Ok(Some(format!("it links `{DAEMON_SIDE}` with its daemon side (feature `host`), which no program runs as")));
         }
+        runtime |= is_runtime(name);
     }
-    Ok(false)
+    Ok(match runtime {
+        true => None,
+        // alloc: once per unit asked, its reason
+        false => Some(format!(
+            "it links no dev runtime (`{DEV_RUNTIME}`, the start hook): its standard library, for `{triple}` under \
+             profile `{}`, was built without it",
+            u.profile.name
+        )),
+    })
 }
 
 /// The daemon's dev executables by path, for a run to start from, and the host their runs
@@ -127,14 +186,27 @@ impl DevRuns {
         }
         let Some(format) = Format::host() else { return Ok(None) };
         if reserves(format, std::path::Path::new(path))? {
-            return Err(format!(
-                "{path} is a dev executable (linked to run on the daemon's code memory), and this daemon holds no \
-                 code memory of it: an earlier daemon linked it. Edit the program, or remove the file, and run again \
-                 so this daemon links it"
-            ));
+            return Err(unheld(path));
         }
         Ok(None)
     }
+
+    /// The dev executable at `path` as this daemon holds it, for a run or a test queue of the
+    /// daemon's own to start ([`super::Launch::InProcess`]): one this daemon did not link is an
+    /// error naming it ([`unheld`]), never a run of its file.
+    pub(crate) fn loaded(&self, path: &str) -> Result<Arc<Loaded>, String> {
+        // clone: a count, once per program or test binary started
+        self.programs.pin().get(path).cloned().ok_or_else(|| unheld(path))
+    }
+}
+
+/// Why the dev executable at `path` can't start: this daemon holds no code memory of it.
+fn unheld(path: &str) -> String {
+    format!(
+        "{path} is a dev executable (linked to run on the daemon's code memory), and this daemon holds no code \
+         memory of it: an earlier daemon linked it. Edit the program, or remove the file, and run again so this \
+         daemon links it"
+    )
 }
 
 /// Whether the executable at `path` reserves address space for a code memory's arena: a dev

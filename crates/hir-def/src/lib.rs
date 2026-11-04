@@ -7,7 +7,6 @@
 //! Note that `hir_def` is a work in progress, so not all of the above is
 //! actually true.
 
-#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![feature(allocator_api, allocator_ext, register_tool)]
 // `#[blaze::noalloc]` (docs/v2/plan/lanes/effects.md); inert under rustc.
 #![register_tool(blaze)]

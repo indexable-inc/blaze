@@ -293,7 +293,7 @@ pub(crate) struct Profiles(Box<[(String, Result<Profiled, String>)]>);
 
 /// A profile read for a job: its content ID, its bytes given to the code generator while the
 /// job lives, and those bytes again until a build puts them in the store.
-#[cfg_attr(not(feature = "llvm"), allow(dead_code))]
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 pub(crate) struct Profiled {
     id: ContentId,
     unstored: parking_lot::Mutex<Option<Vec<u8>>>,
@@ -301,7 +301,7 @@ pub(crate) struct Profiled {
     /// or why they don't read: what tells a profile blaze made, which applying to nothing
     /// refuses, from one rustc or clang made, which only warns ([`judge`]).
     names: Result<blaze_lints::profile::Names, String>,
-    #[cfg(feature = "llvm")]
+    #[cfg(feature = "native")]
     _given: hir_ty_codegen::v2::Profile,
 }
 
@@ -339,7 +339,7 @@ pub(crate) fn read_profile(root: &str, path: &str) -> Result<Profiled, String> {
     profiled(path, bytes, names)
 }
 
-#[cfg(feature = "llvm")]
+#[cfg(feature = "native")]
 fn profiled(path: &str, bytes: Vec<u8>, names: Result<blaze_lints::profile::Names, String>) -> Result<Profiled, String> {
     let id = hir_ty_codegen::v2::profile_id(&bytes);
     let given = hir_ty_codegen::v2::give_profile(id, &bytes)
@@ -348,12 +348,12 @@ fn profiled(path: &str, bytes: Vec<u8>, names: Result<blaze_lints::profile::Name
     Ok(Profiled { id, unstored: parking_lot::Mutex::new(Some(bytes)), names, _given: given })
 }
 
-#[cfg(not(feature = "llvm"))]
+#[cfg(not(feature = "native"))]
 fn profiled(path: &str, _bytes: Vec<u8>, _names: Result<blaze_lints::profile::Names, String>) -> Result<Profiled, String> {
     // alloc: an error
     Err(format!(
         "the flags for rustc have `-C profile-use={path}`, and this blaze is built without LLVM \
-         (blaze-cargo's feature `llvm`), the one back end that builds with a profile"
+         (blaze-cargo's feature `native`), the one back end that builds with a profile"
     ))
 }
 
@@ -812,25 +812,34 @@ impl Generated<'_> {
 /// thread of the build reads the one database of the task's reader by reference: the query
 /// engine's reads take `&self`, so none waits on another and none is cloned.
 fn frontend<'db>(reader: &'db UnitReader, mounted: &Arc<Mounted>, build_time: BuildTime) -> HirFrontend<'db> {
-    frontend_over(reader.db(), reader.paths(), mounted, build_time)
+    frontend_over(reader.db(), reader.paths(), reader.spellings(), mounted, build_time)
 }
 
-/// [`frontend`] over the database `db`, whose files are `paths`: what the loop's writer reads
-/// before it lends the front end to a task ([`super::harness::write`]). `build_time` is its
-/// unit's ([`build_time`]).
+/// [`frontend`] over the database `db`, whose files are `paths` and whose crates' roots cargo
+/// passes as `spellings` says: what the loop's writer reads before it lends the front end to a
+/// task ([`super::harness::write`]). `build_time` is its unit's ([`build_time`]).
 pub(crate) fn frontend_over<'db>(
     db: &'db base_db::Db,
     paths: &Arc<std::collections::HashMap<base_db::FileId, String>>,
+    spellings: &Arc<blaze_lower::Spellings>,
     mounted: &Arc<Mounted>,
     build_time: BuildTime,
 ) -> HirFrontend<'db> {
-    // A file of the view by the job's paths; one `include!` parses from outside every source
-    // root by its path outside, which a body lowered during the build may read first.
+    // A file of the view by the job's paths, as rustc names it: from the directory of the crate
+    // root it is under as cargo passed the root, `..`s kept (`Spellings::name`); one with two
+    // such names has none, and the code generator refuses what names it. One `include!` parses
+    // from outside every source root by its path outside, which a body lowered during the build
+    // may read first.
     let names = {
-        let (mounted, paths, files) = (Arc::clone(mounted), Arc::clone(paths), db.shared_files());
+        let (mounted, paths, spellings, files) =
+            (Arc::clone(mounted), Arc::clone(paths), Arc::clone(spellings), db.shared_files());
         move |file: base_db::FileId| -> Option<String> {
             match paths.get(&file) {
-                Some(path) => Some(mounted.name(path)),
+                Some(path) => match spellings.name(path) {
+                    Ok(Some(spelled)) => Some(mounted.name(&spelled)),
+                    Ok(None) => Some(mounted.name(path)),
+                    Err(_) => None,
+                },
                 None => files.included_source_path(file).map(|path| mounted.name(path.as_str())),
             }
         }
@@ -866,9 +875,9 @@ impl blaze_codegen::driver::Lookup for Reading<'_> {
 
 /// Whether a unit's link maps the dependency image: a dev executable, which runs on the
 /// daemon's code memory and takes edits. [`policy`] makes a unit live only when it
-/// [`runs_in_process`] (a binary's build for the host: no test, wasm macro or doctest's
-/// program, each of which runs as a process of its own), so the mode and what the unit makes
-/// say it. The one place a build decides it: codegen's front end splits ownership by it
+/// [`runs_in_process`] (a binary's build or a test binary for the host that links the dev
+/// runtime: no wasm macro or doctest's program, each of which runs as a process of its own), so
+/// the mode and what the unit makes say it. The one place a build decides it: codegen's front end splits ownership by it
 /// ([`HirFrontend::with_image`]) and the link makes the dev run by it ([`Parts::image`]).
 ///
 /// [`runs_in_process`]: super::run::inproc::runs_in_process
@@ -2062,7 +2071,8 @@ fn changed_assumptions(
 /// new key, and its new callers call that key's slot; code built before the edit (a frame
 /// still running, a caller whose code did not change) calls the slot of a key it had before,
 /// which has to run the new code too, or the edit never reaches it. `slotted` holds, for each
-/// identity (what a function is across edits of its body, `Built::identities`),
+/// identity (what a function is across edits of its body, told apart from instances side
+/// by side, `Built::identities`, `blaze_codegen::driver::subject`),
 /// every key the image made a slot for; `patchable` (sorted) is this build's functions
 /// reached through slots. A function gone from the build leaves its keys out: its slots are
 /// emptied with its code, as the linker does for any function removed.

@@ -190,13 +190,13 @@ fn f() {
     "#,
         &expect![[r#"
             ModuleIdLt {
-                [id]: Id(12291),
+                [id]: Id(#0),
                 krate: Crate(
-                    Id(9216),
+                    Id(#1),
                 ),
                 block: Some(
                     BlockId(
-                        Id(27649),
+                        Id(#2),
                     ),
                 ),
                 containing_module_inside_def_map: None,

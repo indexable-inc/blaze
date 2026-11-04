@@ -51,7 +51,7 @@ pub(crate) struct Sample {
     pub(crate) on_cpu: bool,
 }
 
-/// A ring of samples: the process's is [`SAMPLES`], which the sampler keeps into.
+/// What a [`Ring`] holds.
 struct Samples {
     ring: Vec<Sample>,
     next: u64,
@@ -74,32 +74,68 @@ impl Samples {
     }
 }
 
-static SAMPLES: Mutex<Samples> =
-    // alloc: none until the first sample, then once a process
-    Mutex::new(Samples { ring: Vec::new(), next: 0, state: String::new() });
+/// A ring of samples, the newest [`KEPT`]. The process's is [`process`], which the sampler
+/// [`start`]ed in this process keeps into; a history reads the ring it is given
+/// ([`crate::history::History::open`]), so a test's history reads a ring of the test's own and
+/// never what a sampler of the same process took.
+pub struct Ring(Mutex<Samples>);
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock()
+impl Ring {
+    /// An empty ring.
+    pub const fn new() -> Ring {
+        // alloc: none until the first sample, then once a ring
+        Ring(Mutex::new(Samples { ring: Vec::new(), next: 0, state: String::new() }))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Samples> {
+        self.0.lock()
+    }
+
+    /// Keeps `batch`, over the oldest once [`KEPT`] are.
+    pub(crate) fn keep(&self, batch: &[Sample]) {
+        self.lock().keep(batch);
+    }
+
+    /// The samples kept since sample number `next` (of every sample ever kept), into `into`;
+    /// moves `next` past them. Samples written over before they were read are left out: their
+    /// count is the result.
+    pub(crate) fn since(&self, next: &mut u64, into: &mut Vec<Sample>) -> u64 {
+        let samples = self.lock();
+        let total = samples.next;
+        let first = (*next).max(total.saturating_sub(KEPT as u64));
+        let skipped = first.saturating_sub(*next);
+        for i in first..total {
+            into.push(samples.ring[(i % KEPT as u64) as usize]);
+        }
+        *next = total;
+        skipped
+    }
+}
+
+impl Default for Ring {
+    fn default() -> Ring {
+        Ring::new()
+    }
+}
+
+static SAMPLES: Ring = Ring::new();
+
+/// The process's ring: what the sampler [`start`]ed in this process keeps into, and what a
+/// daemon's history reads.
+pub fn process() -> &'static Ring {
+    &SAMPLES
+}
+
+/// A ring nothing keeps into, for a test's history: it reads no CPU samples but its test's.
+#[cfg(test)]
+pub(crate) fn unsampled() -> &'static Ring {
+    static NONE: Ring = Ring::new();
+    &NONE
 }
 
 /// Keeps `batch` in the process's ring, over the oldest once [`KEPT`] are.
 pub(crate) fn keep(batch: &[Sample]) {
-    lock(&SAMPLES).keep(batch);
-}
-
-/// The samples kept since sample number `next` (of every sample ever kept), into `into`; moves
-/// `next` past them. Samples written over before they were read are left out: their count is
-/// the result.
-pub(crate) fn since(next: &mut u64, into: &mut Vec<Sample>) -> u64 {
-    let samples = lock(&SAMPLES);
-    let total = samples.next;
-    let first = (*next).max(total.saturating_sub(KEPT as u64));
-    let skipped = first.saturating_sub(*next);
-    for i in first..total {
-        into.push(samples.ring[(i % KEPT as u64) as usize]);
-    }
-    *next = total;
-    skipped
+    SAMPLES.keep(batch);
 }
 
 /// Why the process takes no CPU samples.
@@ -122,7 +158,7 @@ pub fn start(hz: u32) -> Result<(), Unsampled> {
         return Ok(());
     }
     let started = run(hz.max(1));
-    let mut samples = lock(&SAMPLES);
+    let mut samples = SAMPLES.lock();
     samples.state = match &started {
         // alloc: once a process
         Ok(how) => format!("on: {hz} Hz, {how}"),
@@ -198,7 +234,7 @@ pub(crate) fn os_tid() -> u64 {
 
 /// The samples taken since `since`, named, and what the sampler is.
 pub(crate) fn taken(since: Instant, epoch: &Epoch) -> (Vec<Sampled>, String) {
-    let samples = lock(&SAMPLES);
+    let samples = SAMPLES.lock();
     let state = match samples.state.is_empty() {
         // alloc: a dump, on demand
         true => "off: not started in this process (`blaze serve` starts it)".to_owned(),

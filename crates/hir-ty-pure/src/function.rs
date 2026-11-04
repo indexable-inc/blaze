@@ -402,7 +402,7 @@ fn place(cx: &Cx<'_>, instance: &Instance, span: MirSpan) -> Option<Place> {
     };
     let (file, line, column) = source_location_in_file(db, owner, span)?;
     let (_, range) = source_file_range(db, owner, span)?;
-    let path = source_path(db, file).unwrap_or_default().into();
+    let path = source_path(db, hir_def::HasModule::krate(&owner, db), file).unwrap_or_default().into();
     Some(Place { file, path, line, column, range })
 }
 

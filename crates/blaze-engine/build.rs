@@ -23,8 +23,7 @@ fn seed() {
     if !on("seed") {
         return;
     }
-    // `tui` too: crossterm has no wasm32 (Cargo.toml).
-    let not_in_seed = ["default", "llvm-stencils", "net", "explore", "mimalloc", "llvm", "tui"];
+    let not_in_seed = ["default", "native"];
     let also: Vec<&str> = not_in_seed.into_iter().filter(|it| on(it)).collect();
     if !also.is_empty() {
         panic!(

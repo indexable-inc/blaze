@@ -183,17 +183,18 @@ impl<'h, 't> Printer<'h, 't> {
             }
             TyKind::Coroutine(id, args) => {
                 let loc = id.0.loc(self.db);
-                // The future of an `async` closure is named after how the closure was called:
-                // called by value, rustc's is a body of its own, `{{closure}}::{{call_once}}`.
+                self.print_spelled_closure(loc, args.as_coroutine().parent_args());
+                // rustc's `print_coroutine_with_kind`: the future of an `async` closure is named
+                // after how the closure was called when that is not the kind its body was
+                // inferred with. The body of a `Fn` or `FnMut` closure is inferred `FnMut`, and
+                // called by value it is the by-move body, kind `FnOnce`: `{{call_once}}`. An
+                // `FnOnce` closure's body is `FnOnce` however it is called, and no call makes a
+                // `FnMut` body of an `FnOnce` one, so rustc's `{{call_mut}}` is never written.
                 if spelling == Spelling::TypeName
                     && matches!(loc.kind, HirClosureKind::Coroutine { source: CoroutineSource::Closure, .. })
+                    && hir_ty::mir::is_by_move_coroutine(self.db, id.0, args.as_coroutine())
                 {
-                    self.refuse(
-                        "the future of an `async` closure: rustc's `type_name` adds `{{call_once}}` \
-                         when the closure was called by value, which this coroutine does not say",
-                    );
-                } else {
-                    self.print_spelled_closure(loc, args.as_coroutine().parent_args());
+                    self.write_str("::{{call_once}}");
                 }
             }
             _ => return true,
