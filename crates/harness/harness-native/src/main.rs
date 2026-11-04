@@ -5,6 +5,7 @@ mod boxdraw;
 mod draw;
 mod gpu;
 mod link;
+mod look;
 mod pack;
 mod prefs;
 mod shot;

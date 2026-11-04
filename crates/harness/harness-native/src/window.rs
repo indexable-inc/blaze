@@ -10,6 +10,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSEventModifierFlags, NSMenu, NSMenuItem,
     NSPasteboard, NSPasteboardTypeString, NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
 };
@@ -26,6 +27,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const INITIAL: (f64, f64) = (1180.0, 760.0);
+/// Frame rates: while anything moves, and while only a running dot breathes.
+const LIVE: CAFrameRateRange = CAFrameRateRange { minimum: 60.0, maximum: 120.0, preferred: 120.0 };
+const CALM: CAFrameRateRange = CAFrameRateRange { minimum: 20.0, maximum: 30.0, preferred: 30.0 };
 /// From the zoom button's right edge to the title's first ink, as Ghostty's title bar sets it (measured on Tahoe).
 const TITLE_GAP: f64 = 16.0;
 
@@ -37,6 +41,10 @@ struct State {
     window: Retained<NSWindow>,
     last: Option<f64>,
     title: String,
+    /// The traffic lights' opacity as last set (they fade with the sidebar's fold).
+    lights: f32,
+    /// Drawing at the calm rate: only a running dot's breath moves.
+    calm: bool,
 }
 
 thread_local! {
@@ -139,6 +147,17 @@ define_class!(
         #[unsafe(method(viewDidChangeBackingProperties))]
         fn did_change_backing(&self) {
             self.sync_size();
+        }
+
+        /// Light or dark: the scene's fills pick their half, the sidebar's vibrancy follows on its own.
+        #[unsafe(method(viewDidChangeEffectiveAppearance))]
+        fn did_change_appearance(&self) {
+            let dark = is_dark(self);
+            with(|st| {
+                st.app.dark = dark;
+                st.app.poke();
+                st.link.setPaused(false);
+            });
         }
 
         #[unsafe(method(keyDown:))]
@@ -525,12 +544,58 @@ impl HarnessView {
                 st.title.clone_from(&st.app.title);
                 st.window.setTitle(&NSString::from_str(&st.title));
             }
-            if st.app.idle() {
-                st.link.setPaused(true);
-                st.last = None;
+            let lights = st.app.lights();
+            if (lights - st.lights).abs() > 1e-3 || (lights == 0.0) != (st.lights == 0.0) {
+                st.lights = lights;
+                set_lights(&st.window, lights);
+            }
+            match (st.app.idle(), st.app.breathing()) {
+                // Only a breath moves: keep drawing, at a calm rate.
+                (true, true) if !st.calm => {
+                    st.calm = true;
+                    st.link.setPreferredFrameRateRange(CALM);
+                }
+                (true, true) => {}
+                (true, false) => {
+                    st.link.setPaused(true);
+                    st.last = None;
+                }
+                (false, _) if st.calm => {
+                    st.calm = false;
+                    st.link.setPreferredFrameRateRange(LIVE);
+                }
+                (false, _) => {}
             }
         });
     }
+}
+
+/// Whether `view` is drawn in the dark appearance.
+fn is_dark(view: &NSView) -> bool {
+    // SAFETY: the appearance names are valid static strings.
+    let (aqua, dark) = unsafe { (NSAppearanceNameAqua, NSAppearanceNameDarkAqua) };
+    view.effectiveAppearance().bestMatchFromAppearancesWithNames(&NSArray::from_slice(&[aqua, dark])).is_some_and(|n| &*n == dark)
+}
+
+/// Show the traffic lights at `alpha` (they live on the sidebar: Dia's), hidden outright once they are gone.
+fn set_lights(window: &NSWindow, alpha: f32) {
+    for kind in [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton] {
+        if let Some(b) = window.standardWindowButton(kind) {
+            b.setAlphaValue(f64::from(alpha));
+            b.setHidden(alpha <= 0.0);
+        }
+    }
+}
+
+/// `HARNESS_NATIVE_APPEARANCE=light|dark`: this app's appearance (NSApp.appearance), not the system's; for captures.
+fn force_appearance(app: &NSApplication) {
+    let name = match std::env::var("HARNESS_NATIVE_APPEARANCE").as_deref() {
+        // SAFETY: the appearance names are valid static strings.
+        Ok("light") => unsafe { NSAppearanceNameAqua },
+        Ok("dark") => unsafe { NSAppearanceNameDarkAqua },
+        _ => return,
+    };
+    app.setAppearance(NSAppearance::appearanceNamed(name).as_deref());
 }
 
 /// The title-bar strip of `window` (none in fullscreen, where AppKit hides it), its traffic lights moved to its centre line.
@@ -600,7 +665,9 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     window.setTitlebarAppearsTransparent(true);
     window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
     window.setMinSize(NSSize::new(560.0, 320.0));
-    window.setBackgroundColor(Some(&NSColor::blackColor()));
+    // Clear: the sidebar's vibrancy (the effect view under the Metal view) shows wherever the scene paints nothing.
+    window.setOpaque(false);
+    window.setBackgroundColor(Some(&NSColor::clearColor()));
     let view = HarnessView::new(mtm, rect);
     view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
 
@@ -609,7 +676,8 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     layer.setDevice(Some(&**renderer.device()));
     layer.setPixelFormat(gpu::PIXEL_FORMAT);
     layer.setMaximumDrawableCount(3);
-    layer.setOpaque(true);
+    // Not opaque: the drawable's alpha (premultiplied, as every pipeline blends) lets the vibrancy through.
+    layer.setOpaque(false);
     // SAFETY: kCGColorSpaceExtendedSRGB is a valid static colour space name.
     layer.setColorspace(CGColorSpace::with_name(Some(unsafe { kCGColorSpaceExtendedSRGB })).as_deref());
     // SAFETY: kCAGravityTopLeft is a valid static gravity name.
@@ -623,17 +691,29 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
 
     let link = CAMetalDisplayLink::initWithMetalLayer(CAMetalDisplayLink::alloc(), &layer);
     link.setDelegate(Some(ProtocolObject::from_ref(&*view)));
-    link.setPreferredFrameRateRange(CAFrameRateRange { minimum: 60.0, maximum: 120.0, preferred: 120.0 });
+    link.setPreferredFrameRateRange(LIVE);
     link.setPreferredFrameLatency(1.0);
     // SAFETY: the main run loop and the common modes (frames keep coming during live resize and tracking).
     unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
 
     let mut app = App::new(wake_from_any_thread())?;
+    if std::env::var("HARNESS_NATIVE_SIDEBAR").as_deref() == Ok("0") {
+        app.fold_sidebar_now();
+    }
     if let Some(sid) = SELECT.with(std::cell::Cell::get) {
         app.select_session(sid);
     }
-    STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new() }));
-    window.setContentView(Some(&view));
+    STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new(), lights: 1.0, calm: false }));
+    // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.
+    let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), rect);
+    effect.setMaterial(NSVisualEffectMaterial::Sidebar);
+    effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+    // HARNESS_NATIVE_VIBRANCY=active: always the active material (captures of a window that never takes the keyboard).
+    effect.setState(if std::env::var("HARNESS_NATIVE_VIBRANCY").as_deref() == Ok("active") { NSVisualEffectState::Active } else { NSVisualEffectState::FollowsWindowActiveState });
+    effect.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+    effect.addSubview(&view);
+    window.setContentView(Some(&effect));
+    with(|st| st.app.dark = is_dark(&view));
     // The view hears the window's key changes (focus for the cursor).
     let center = objc2_foundation::NSNotificationCenter::defaultCenter();
     // SAFETY: the view outlives the window's notifications (both live until the app quits); the selectors take one
@@ -756,6 +836,7 @@ pub fn run(listener: Option<std::os::unix::net::UnixListener>, select: Option<u6
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(if no_activate() { NSApplicationActivationPolicy::Accessory } else { NSApplicationActivationPolicy::Regular });
     app.setMainMenu(Some(&main_menu(mtm)));
+    force_appearance(&app);
     let delegate = AppDelegate::new(mtm);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     DELEGATE.with(|d| {
