@@ -31,9 +31,10 @@ use crate::query::{LoadError, NativeInput};
 /// The table, under the workspace's root manifest, each input is a table of.
 pub(crate) const TABLE: &str = "[workspace.metadata.blaze.native]";
 
-/// The variables an input may not be handed in: cargo's and blaze's own, and those a loader or
-/// shell reads. Each is either set by cargo for every script (so the input would be overridden,
-/// or override cargo) or changes how programs run.
+/// The variables an input may not be handed in: cargo's and blaze's own, and those a loader,
+/// shell, make, compiler driver or reproducible build reads. Each is either set by cargo for
+/// every script (so the input would be overridden, or override cargo) or changes how programs
+/// run.
 const RESERVED: &[&str] = &[
     "OUT_DIR",
     "TARGET",
@@ -42,17 +43,25 @@ const RESERVED: &[&str] = &[
     "OPT_LEVEL",
     "DEBUG",
     "PROFILE",
-    "RUSTDOC",
     "CARGO",
     "PATH",
     "HOME",
+    "TMP",
+    "TEMP",
     "TMPDIR",
-    "LD_LIBRARY_PATH",
-    "LD_PRELOAD",
+    "SHELL",
+    "BASH_ENV",
+    "ENV",
+    "IFS",
+    "MAKEFLAGS",
+    "MFLAGS",
+    "SDKROOT",
+    "SOURCE_DATE_EPOCH",
 ];
 
-/// Prefixes no input's variable may start with, for the same reasons as [`RESERVED`].
-const RESERVED_PREFIXES: &[&str] = &["CARGO_", "DEP_", "RUSTC", "BLAZE_", "__BLAZE", "DYLD_"];
+/// Prefixes no input's variable may start with, for the same reasons as [`RESERVED`]: `RUST`
+/// covers `RUSTC`, `RUSTDOC`, `RUSTFLAGS` and `RUSTDOCFLAGS`; `LD_` and `DYLD_` the loaders'.
+const RESERVED_PREFIXES: &[&str] = &["CARGO_", "DEP_", "RUST", "BLAZE_", "__BLAZE", "LD_", "DYLD_"];
 
 /// One build script run of the graph: its package's name, the platform it is built for (none
 /// for the host) and its features.

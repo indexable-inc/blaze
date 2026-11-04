@@ -601,24 +601,42 @@ a named package takes the archive of the target the run is built for; a pin with
 that target, a `release` that is not `https://`, a `name` that is not one file name or a
 `sha256` that is not 64 lowercase hex digits fails the load naming the input, the target, the
 pin file and the package (`crates/blaze-units/src/load/native.rs`). `env` may not be a variable
-cargo or blaze sets or a loader reads (`OUT_DIR`, `TARGET`, `PATH`, `CARGO_*`, `DEP_*`,
-`RUSTC*`, `BLAZE_*`, `DYLD_*`, `LD_LIBRARY_PATH`, ...), and two inputs may not give one script
-the same variable.
+cargo or blaze sets, or a loader, shell, make, compiler driver or reproducible build reads:
+`OUT_DIR`, `TARGET`, `HOST`, `NUM_JOBS`, `OPT_LEVEL`, `DEBUG`, `PROFILE`, `CARGO`, `PATH`,
+`HOME`, `TMP`, `TEMP`, `TMPDIR`, `SHELL`, `BASH_ENV`, `ENV`, `IFS`, `MAKEFLAGS`, `MFLAGS`,
+`SDKROOT`, `SOURCE_DATE_EPOCH`, or any starting `CARGO_`, `DEP_`, `RUST` (`RUSTC`,
+`RUSTFLAGS`, `RUSTDOCFLAGS`, ...), `BLAZE_`, `__BLAZE`, `LD_` or `DYLD_`. Two inputs may not give
+one script the same variable.
 
-Before any of the build's units is lowered, the daemon lays out each input the build needs,
-on an IO thread (`crates/blaze-cargo/src/serve/native.rs`): the archive is got through
-blaze-fetch by its sha256, from the store when it has it and else downloaded, checked and kept
-there, then unpacked into `<BLAZE_HOME>/native/sha256-<hex>` (`~/.blaze/native/...` when
-`BLAZE_HOME` is unset), read-only, one directory per digest. It is made under a lock in a
-directory beside the final one, its mark `.blaze-native` (the digest) written last, and renamed
-into place whole, so a directory there is whole; one there without its digest's mark is refused,
-naming it, never used or written over. The archive (a `.tar.xz`, as `llvm.py pack` writes)
+Before any of the build's units is lowered (or a trace's or verify's view is read), the
+daemon lays out each input the build needs, on an IO thread
+(`crates/blaze-cargo/src/serve/native.rs`); jobs asking the same inputs share one layout task,
+and a wait for another process laying out the same digest stops when the job is cancelled. The
+archive is got through blaze-fetch by its sha256, from the store when it has it and else
+downloaded, checked and kept there, then unpacked into `<BLAZE_HOME>/native/sha256-<hex>`
+(`~/.blaze/native/...` when `BLAZE_HOME` is unset), read-only, one directory per digest. The
+bytes unpacked are hashed as they are read and held to the pin before the layout is used. It is
+made under a lock in a directory beside the final one (what a stopped layout left there is
+removed first), every file and directory synced, its mark `.blaze-native` written last and
+synced, and renamed into place whole, so a directory there is whole. The mark holds the digest
+and a listing of every file and link with its kind, BLAKE3 and length; the first time a daemon
+hands a layout to a build script it walks it against that listing, and a layout with no mark
+for its digest, a file changed, added, removed or made writable is refused naming the file and
+how to remove the layout (`chmod -R u+w <dir> && rm -rf <dir>`), never used or written over.
+
+The archive (a `.tar.xz`, as `llvm.py pack` writes) goes through blaze-fetch's one checked
+unpacker (`crates/blaze-fetch/src/unpack.rs`, which a registry's `.crate` goes through too): it
 must be one top directory, which is stripped; an entry with an absolute path, a `..`, a `\` or
-a NUL, a device, FIFO or sparse file, a path twice, an entry under a link, a symbolic link whose
-target leaves the layout or passes through another link, or a hard link to anything but a file
-written before it fails the layout, and so do more than 2^20 entries or 16 GiB of files. A
-download that fails or is not the pinned bytes fails the build naming the input, the target,
-the URL, and the pinned and received digests; there is no other place a script is pointed at.
+a NUL, a device, FIFO or sparse file, two entries that are one name to a case- and
+normalization-insensitive disk (APFS), an entry under a file or link, an entry named as the mark
+in any case, a symbolic link whose target leaves the layout or passes through another link
+(names compared the same way), a link the disk resolves outside the layout or to nothing, or a
+hard link to anything but a file written before it fails the layout, and so do more than 2^20
+entries, 16 GiB of files, or an xz dictionary over 256 MiB. Every directory is made before any
+link, so nothing is written through one. A download that fails or is not the pinned bytes fails
+the build naming the input, the target, the URL, and the pinned and received digests; there is
+no other place a script is pointed at. Old layouts are not yet collected (a follow-up for
+docs/gc.md): remove one with the command above.
 
 Each script run of a named package is then started with `env` set to that directory. The
 variable is set over the command's own (blaze's choice, 2026-11-04): a shell that sets it (`nix

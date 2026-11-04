@@ -524,8 +524,10 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// On an IO thread, before a job's lowering when its units name any: each of
     /// `units.native` fetched by its digest and laid out read-only, in its order
     /// ([`super::native::ensure`]). One that can't be is the job's error, naming it; there is
-    /// no other place a build script is pointed at.
-    fn native(&self, units: &Units) -> Result<Vec<super::native::NativeDir>, ApiError> {
+    /// no other place a build script is pointed at. A wait for another process laying one out
+    /// stops once `cancelled` (the job's) is set.
+    fn native(&self, units: &Units, cancelled: &AtomicBool) -> Result<Vec<super::native::NativeDir>, ApiError> {
+        let _ = cancelled;
         match units.native.first() {
             None => Ok(Vec::new()),
             Some(input) => Err(ApiError::new(

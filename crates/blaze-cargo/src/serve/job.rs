@@ -59,6 +59,7 @@ thread_local! {
 }
 
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -135,8 +136,8 @@ pub enum Value<S: Steps> {
     /// The fetch at its place in its batch ([`Fetching::fetches`]).
     Fetched(Arc<[Fetch]>, u32, Result<Source, ApiError>),
     Planned(Result<Planned, ApiError>),
-    /// The job's pinned native inputs laid out ([`Steps::native`]).
-    Native(Result<Vec<super::native::NativeDir>, ApiError>),
+    /// The pinned native inputs of [`native_key`] laid out ([`Steps::native`]).
+    Native(Key, Result<Vec<super::native::NativeDir>, ApiError>),
     Lowered(Result<FrontEnd<S>, ApiError>),
     /// A unit's compile, and the images it relinked, given back to the loop: by its last
     /// phase, or by the one that failed.
@@ -276,6 +277,23 @@ fn library_key() -> Key {
     Key(ContentId::of("blaze v2 serve library", b"library").0)
 }
 
+/// The single-flight key of laying out `native`, a view's pinned native inputs: every job
+/// asking the same inputs shares one layout ([`Jobs::native_laid`] holds its result). Covers
+/// every field of each, as the result (each [`super::native::NativeDir`]) holds them.
+fn native_key(native: &[blaze_units::query::NativeInput]) -> Key {
+    let mut hasher = Hasher::new("blaze v2 serve native");
+    hasher.part(&(native.len() as u64).to_le_bytes());
+    for input in native {
+        hasher.part(input.name.as_bytes()).part(input.target.as_bytes()).part(input.env.as_bytes());
+        hasher.part(&(input.packages.len() as u64).to_le_bytes());
+        for package in &input.packages {
+            hasher.part(package.as_bytes());
+        }
+        hasher.part(input.url.as_bytes()).part(input.sha256.as_bytes()).part(input.pin.as_bytes());
+    }
+    Key(hasher.finish().0)
+}
+
 /// The single-flight key of a fetch: every job asking the same source shares one download.
 fn fetch_key(fetch: &Fetch) -> Key {
     let mut hasher = Hasher::new("blaze v2 serve fetch");
@@ -302,7 +320,7 @@ pub(super) enum Does<S: Steps> {
     /// Task `at` fetches `fetches[at]`.
     Fetch { steps: Arc<S>, fetches: Arc<[Fetch]> },
     /// The units' pinned native inputs laid out, before the lowering ([`Steps::native`]).
-    Native { steps: Arc<S>, units: Arc<Units> },
+    Native { steps: Arc<S>, units: Arc<Units>, key: Key },
     /// The head's last front end, taken by the run that lowers into it.
     /// Its build dirs leased first ([`Steps::lease`]) into `leases`, against `checkout`,
     /// `builds` the dir of every workspace's build dir.
@@ -389,7 +407,9 @@ impl<S: Steps> plane::Work for Step<S> {
                 // clone: a refcount per fetch
                 self.settle(fetched, |it| Value::Fetched(fetches.clone(), arg, it))
             }
-            Does::Native { steps, units } => self.settle(steps.native(units).map_err(Failed::Error), Value::Native),
+            Does::Native { steps, units, key } => {
+                self.settle(steps.native(units, &self.cancelled).map_err(Failed::Error), |it| Value::Native(*key, it))
+            }
             Does::Lower { steps, input, kept, leases, checkout, builds } => {
                 // Its build dirs' leases, before anything is built into them: here, on the pool.
                 // The lock is held only to read and store the field, never across the lease's
@@ -1253,6 +1273,8 @@ enum Stage<S: Steps> {
 /// A view's lowering, held while its pinned native inputs are laid out ([`Stage::Native`]):
 /// what [`Jobs::lower_or_wait`] takes.
 struct NativeWait {
+    /// The layout's [`native_key`], its result read from [`Jobs::native_laid`].
+    key: Key,
     input: JobInput,
     root: Option<u32>,
     name: String,
@@ -2219,6 +2241,10 @@ pub struct Jobs<S: Steps> {
     /// The errors of fetches that failed, by where they mount: a fetch is one task for every
     /// job asking it, so the jobs that joined it read its error here. Once per source.
     fetch_failed: HashMap<String, ApiError, Global>,
+    /// The last result of laying out each list of pinned native inputs, by its [`native_key`]:
+    /// a layout is one task for every job asking the same inputs, so the jobs that joined it
+    /// read its result here. Each settling task writes its own before its nodes settle.
+    native_laid: BTreeMap<Key, Result<Arc<[super::native::NativeDir]>, ApiError>>,
     /// The store's placements by the store's tag: its tags are its own, made among its other
     /// effects, so there is no slot of ours in them to index by.
     placing: HashMap<Tag, Placing, Global>,
@@ -2346,6 +2372,7 @@ impl<S: Steps> Jobs<S> {
             library: None,
             library_failed: None,
             fetch_failed: HashMap::new_in(Global),
+            native_laid: BTreeMap::new(),
             placing: HashMap::new_in(Global),
             paths: Paths::new(machine),
             own,
@@ -2950,6 +2977,9 @@ impl<S: Steps> Jobs<S> {
                     }
                 }
             }
+            Value::Native(key, laid) => {
+                self.native_laid.insert(key, laid.map(Arc::from)); // alloc: once a layout of a list of inputs
+            }
             Value::StoredKept(front, stored) => {
                 let job = self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id)));
                 if let Some(storing) = job.and_then(|it| it.storing.as_mut()).filter(|it| it.node == node) {
@@ -3072,13 +3102,18 @@ impl<S: Steps> Jobs<S> {
                 job.queries.retain(|it| *it != prep.queries);
                 self.open(w, id, prep.opened, prep.asked);
             }
-            Stage::Native(at, wait) if at == node => match job.take_value(node) {
-                Some(Value::Native(Ok(dirs))) => {
-                    let NativeWait { mut input, root, name, checkout } = *wait;
-                    input.native = dirs.into();
+            // Read by its key, whether this job ran the layout or joined another's.
+            Stage::Native(at, wait) if at == node => match self.native_laid.get(&wait.key) {
+                Some(Ok(dirs)) if ok => {
+                    let dirs = Arc::clone(dirs); // clone: a refcount, once a job
+                    let NativeWait { mut input, root, name, checkout, .. } = *wait;
+                    input.native = dirs;
                     self.lower_or_wait(w, id, input, root, name, checkout);
                 }
-                Some(Value::Native(Err(error))) => self.end(w, id, false, Some(error)),
+                Some(Err(error)) if !ok => {
+                    let error = error.clone(); // clone: an error, once a job
+                    self.end(w, id, false, Some(error));
+                }
                 // alloc: an error, once
                 _ => self.end(w, id, false, Some(ApiError::new(format!("laying out the pinned native inputs: {why}"), None))),
             },
@@ -3290,20 +3325,18 @@ impl<S: Steps> Jobs<S> {
         };
         // Asked as the view is lowered, so it is in by the time the units are built.
         job.look = w.std.look_again(w.effects);
-        if matches!(job.work, Work::Trace(_) | Work::Verify(_)) {
-            job.ready.push(Ready { input, root: prep.root, front: None, writer: None });
-            self.next(w, id);
-            return;
-        }
         let name = named("lowering ", &prep.root_dir);
         // A build script given a pinned native input runs with it laid out: each is fetched
-        // and unpacked first, on an IO thread, and the lowering posted once they are.
+        // and unpacked first, on an IO thread, and the lowering (or a trace's or verify's
+        // view, which is ready as it stands) posted once they are. Every job asking the same
+        // inputs shares the one layout (`native_key`).
         if !input.units.native.is_empty() {
             let units = Arc::clone(&input.units); // clone: a refcount, once per view
-            let work = Step::of(&job.cancelled, Does::Native { steps: Arc::clone(w.steps), units });
+            let key = native_key(&units.native);
+            let work = Step::of(&job.cancelled, Does::Native { steps: Arc::clone(w.steps), units, key });
             let what = named("pinned native inputs of ", &checkout);
-            let fresh = lone(w.plane, NodeKind::Fetch, &what, Pool::Io, None, kinds::FETCH);
-            job.stage = Stage::Native(fresh.first(), Box::new(NativeWait { input, root: prep.root, name, checkout }));
+            let fresh = lone(w.plane, NodeKind::Fetch, &what, Pool::Io, Some(key), kinds::FETCH);
+            job.stage = Stage::Native(fresh.first(), Box::new(NativeWait { key, input, root: prep.root, name, checkout }));
             self.add(w, id, fresh, Some(work), false);
             return;
         }
@@ -3313,7 +3346,14 @@ impl<S: Steps> Jobs<S> {
     /// A job's view lowered ([`Jobs::lower`]), or once the kept front end of its root is
     /// stored, when that is being stored now.
     fn lower_or_wait(&mut self, w: &mut World<'_, S>, id: JobId, input: JobInput, root: Option<u32>, name: String, checkout: String) {
-        let Some(job) = self.jobs.get(key_of(id)) else { return };
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        // A trace or a verify lowers nothing: its view is ready as it stands, its pinned native
+        // inputs laid out before it, as for any view.
+        if matches!(job.work, Work::Trace(_) | Work::Verify(_)) {
+            job.ready.push(Ready { input, root, front: None, writer: None });
+            self.next(w, id);
+            return;
+        }
         let job_idle = job.idle;
         match root {
             // The root's front end is being stored: the lowering waits for it rather than

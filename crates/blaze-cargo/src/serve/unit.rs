@@ -97,6 +97,9 @@ pub struct Real {
     /// ([`crate::serve::native`]); none when the daemon has no home (neither `BLAZE_HOME` nor
     /// the user's home is set), which only a build that names an input is refused for.
     native: Option<PathBuf>,
+    /// The layouts this daemon has checked against their marks, each once
+    /// ([`crate::serve::native::Verified`]).
+    native_verified: crate::serve::native::Verified,
 }
 
 /// What every job's front shares: the daemon's paths, what was read of the machine's files,
@@ -139,7 +142,7 @@ impl Real {
             dev_runs: run::inproc::DevRuns::new(paths.state.join("inproc")),
         };
         let native = crate::toolchain::home().map(|it| it.join(crate::serve::native::NATIVE));
-        Ok(Real { fetcher, shared: Arc::new(shared), sources, native })
+        Ok(Real { fetcher, shared: Arc::new(shared), sources, native, native_verified: Default::default() })
     }
 }
 
@@ -178,7 +181,11 @@ impl Steps for Real {
         Ok(source)
     }
 
-    fn native(&self, units: &blaze_units::query::Units) -> Result<Vec<crate::serve::native::NativeDir>, ApiError> {
+    fn native(
+        &self,
+        units: &blaze_units::query::Units,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<crate::serve::native::NativeDir>, ApiError> {
         if units.native.is_empty() {
             return Ok(Vec::new());
         }
@@ -194,7 +201,11 @@ impl Steps for Real {
             ));
         };
         let fetcher = self.fetcher.pinned();
-        units.native.iter().map(|input| crate::serve::native::ensure(input, native, &fetcher)).collect()
+        units
+            .native
+            .iter()
+            .map(|input| crate::serve::native::ensure(input, native, &fetcher, &self.native_verified, cancelled))
+            .collect()
     }
 
     fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError> {
