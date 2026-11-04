@@ -70,7 +70,12 @@ pub fn run(path: &str) -> Result<(), String> {
     // HARNESS_NATIVE_SHOT_TYPE `text,t`: `text` typed at t seconds, into this offscreen app only (the palette's query
     // when it is open, the Archive's search when it has the keyboard).
     let mut typed = std::env::var("HARNESS_NATIVE_SHOT_TYPE").ok().and_then(|s| s.rsplit_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?))));
-    let mut key = std::env::var("HARNESS_NATIVE_SHOT_KEY").ok().and_then(|s| s.split_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?))));
+    // Several as `k,t;k,t` (rapid cmd+] presses).
+    let mut keys: Vec<(String, f32)> = std::env::var("HARNESS_NATIVE_SHOT_KEY").unwrap_or_default().split(';').filter_map(|s| s.split_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?)))).collect();
+    // HARNESS_NATIVE_SHOT_SEQ `t0,t1`: every frame from t0 to t1 seconds also written, as `<path>-<ms>.png` (time is then
+    // counted in frames of 1/60 s, so a slow readback does not skip animation).
+    let seq = std::env::var("HARNESS_NATIVE_SHOT_SEQ").ok().map(|s| nums(&s)).filter(|v| v.len() == 2);
+    let mut frames = 0u32;
     // HARNESS_NATIVE_SHOT_WHEEL `x,y,dy,t`: a trackpad swipe of `dy` points (negative: toward the end) over (x, y) from t
     // seconds: a began, changed events over 8 frames, an ended.
     let mut wheel = std::env::var("HARNESS_NATIVE_SHOT_WHEEL").ok().map(|s| nums(&s)).filter(|v| v.len() == 4).map(|v| (v, 0usize));
@@ -79,7 +84,8 @@ pub fn run(path: &str) -> Result<(), String> {
     let start = Instant::now();
     let tex = renderer.offscreen((w * backing) as usize, (h * backing) as usize);
     loop {
-        let t = start.elapsed().as_secs_f32();
+        let t = if seq.is_some() { frames as f32 / 60.0 } else { start.elapsed().as_secs_f32() };
+        frames += 1;
         if let Some(h) = hover.take_if(|h| t >= h[2]) {
             app.pointer_move(h[0], h[1], crate::app::KeyMods::default());
         }
@@ -101,7 +107,8 @@ pub fn run(path: &str) -> Result<(), String> {
         if let Some((text, _)) = typed.take_if(|k| t >= k.1) {
             app.commit_text(&text);
         }
-        if let Some((k, _)) = key.take_if(|k| t >= k.1) {
+        while keys.first().is_some_and(|k| t >= k.1) {
+            let (k, _) = keys.remove(0);
             app.shortcut(&k, 0, crate::app::KeyMods { cmd: true, ..Default::default() });
         }
         if up_next {
@@ -123,13 +130,26 @@ pub fn run(path: &str) -> Result<(), String> {
         }
         let r = &renderer;
         let draw = app.frame((w, h), backing, 1.0 / 60.0, &mut |x, y, gw, gh, b| r.upload_atlas(x, y, gw, gh, b));
-        if start.elapsed().as_secs_f32() >= secs {
+        if seq.as_ref().is_some_and(|v| t >= v[0] && t <= v[1]) {
+            renderer.render(&draw, Dest::Texture(tex.clone()));
+            let px = renderer.read(&tex);
+            write_png(&format!("{path}-{:05}.png", (t * 1000.0).round() as u32), &app, &px, (w * backing) as u32, (h * backing) as u32)?;
+            eprintln!("harness-native: seq t={t:.3} {}", app.probe());
+        }
+        if t >= secs {
             renderer.render(&draw, Dest::Texture(tex.clone()));
             break;
         }
         std::thread::sleep(Duration::from_millis(16));
     }
-    let mut px = renderer.read(&tex);
+    let px = renderer.read(&tex);
+    write_png(path, &app, &px, (w * backing) as u32, (h * backing) as u32)?;
+    eprintln!("harness-native: wrote {path}");
+    Ok(())
+}
+
+fn write_png(path: &str, app: &App, px: &[u8], w: u32, h: u32) -> Result<(), String> {
+    let mut px = px.to_vec();
     // The window is clear where the sidebar's vibrancy shows; offscreen there is none, so stand in a flat ground for it.
     let g = crate::look::tone(app.world.world_ref(), "shot_ground");
     let g = if app.dark { g.dark } else { g.light };
@@ -142,10 +162,8 @@ pub fn run(path: &str) -> Result<(), String> {
         c[3] = 255;
     }
     let file = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), (w * backing) as u32, (h * backing) as u32);
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
-    enc.write_header().and_then(|mut wr| wr.write_image_data(&px)).map_err(|e| e.to_string())?;
-    eprintln!("harness-native: wrote {path}");
-    Ok(())
+    enc.write_header().and_then(|mut wr| wr.write_image_data(&px)).map_err(|e| e.to_string())
 }

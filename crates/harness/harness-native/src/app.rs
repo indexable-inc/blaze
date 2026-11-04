@@ -1524,6 +1524,25 @@ impl App {
         self.poke();
     }
 
+    /// One line of what a shot sequence measures (src/shot.rs `HARNESS_NATIVE_SHOT_SEQ`): the fold spring, the focused
+    /// terminal's grid origin and columns, the selection pill's drawn y and the tree's scroll.
+    pub fn probe(&self) -> String {
+        let w = self.world.world_ref();
+        let grid = self.focused_term().and_then(|t| w.entity_from_id(t).try_cloned::<&crate::pane::TermGrid>());
+        let pill = w.try_lookup("ui_matched::hn_selection").and_then(|h| h.try_cloned::<&harness_native_ui_motion_api::Matched>());
+        let drawn = pill.and_then(|m| w.entity_from_id(m.owner).try_cloned::<&harness_native_ui_motion_api::Drawn>());
+        format!(
+            "side={:.4} open={} grid_x={:.2} cols={} pill_y={:.2} pill_v={:.1} scroll={:.2}",
+            self.side_x.x,
+            self.side_open,
+            grid.map_or(-1.0, |g| g.x),
+            grid.map_or(0, |g| g.cols),
+            drawn.map_or(-1.0, |d| d.y),
+            pill.map_or(0.0, |m| m.y.v),
+            w.entity_from_id(self.ids.tree).try_cloned::<&harness_native_ui_layout_api::ScrollState>().map_or(0.0, |s| s.y)
+        )
+    }
+
     /// Start with the sidebar folded away (`HARNESS_NATIVE_SIDEBAR=0`, for captures).
     pub fn fold_sidebar_now(&mut self) {
         self.side_open = false;
