@@ -5,10 +5,17 @@
 //! the warm database until the record that retracts it is published, which moves the epoch a
 //! kept front end is lowered into at, and the call then expands again.
 //!
+//! A macro that keeps a session reports what a call read only once its crate settles and the
+//! call gave the same from the fresh state as from the settled one: an "emit once" macro, which
+//! settles by what it does to its state yet gives otherwise as the first call, never does, and
+//! is told to the store as stateful; a macro that settles as proc-macro2's detection does
+//! reports every call's reads, keeps its calls from the settled state, and a later build finds
+//! them; and a warm revision that edits a call gives what a cold build of the edit gives.
+//!
 //! It runs on `scratch` of `BLAZE_MACRO_CORPUS` (`corpus/config.rs`), a copy of the workspace
-//! built as the first, whose `calls/data.txt` it changes and puts back. Its builds share one
-//! `Macros`, as a daemon's do; it changes a file of the scratch workspace, so it is one test in
-//! a process of its own.
+//! built as the first, whose `calls/data.txt` and `sessions/src/lib.rs` it changes and puts
+//! back. Its builds share one `Macros`, as a daemon's do; it changes files of the scratch
+//! workspace, so its tests take [`SCRATCH`] in turn, in a process of their own.
 
 #[allow(dead_code, reason = "shared with tests/corpus.rs, which uses other parts of it")]
 #[path = "corpus/config.rs"]
@@ -28,14 +35,18 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use base_db::Crate;
 use blaze_core::sim::{Faults, Sim};
 use blaze_usercode::{index, roots::verify};
 use proc_macro_api::kept::{self, Environment, Expansions, Keep, Put};
 use hir_def::nameres::crate_def_map;
-use hir_expand::proc_macro::{ProcMacroCall, ProcMacroExpander};
+use hir_expand::proc_macro::{ExpansionReads, ProcMacroCall, ProcMacroExpander};
 
 use config::Corpus;
 use record::{Record, Recorder, Records};
+
+/// Held by each test while it builds and changes the scratch workspace.
+static SCRATCH: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// A store in `sim`, open and ready.
 fn kept_in(sim: &mut Sim) -> blaze_cas::Store {
@@ -165,6 +176,7 @@ impl Drop for Changed {
 #[test]
 #[ignore = "needs BLAZE_MACRO_CORPUS with `scratch`: a copy of the fixture workspace built by blaze"]
 fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
+    let _scratch = SCRATCH.lock();
     let config = Corpus::read().unwrap_or_else(|why| panic!("{why}"));
     let dir = config.scratch().unwrap_or_else(|why| panic!("{why}")).to_owned();
     let toolchain = load::toolchain().unwrap_or_else(|why| panic!("{why}"));
@@ -244,7 +256,7 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     let replay = |name: &str, call: ProcMacroCall<'_>| {
         let output = expander(&loaded, name).expand_in(db, calls, call);
         let output = output.unwrap_or_else(|error| panic!("`{name}` again: {error:?}"));
-        (record::literals(&output), kept::take_puts())
+        (record::literals(&output.tree), kept::take_puts())
     };
 
     // A call whose variable changed finds nothing of the first and runs again.
@@ -292,4 +304,144 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     assert_ne!(macros.keeps().retractions_now(), at, "retracted: a front end kept at the old epoch is lowered afresh");
     let puts = again(serialize.call.call());
     assert!(!puts_of(&puts, "Serialize").is_empty(), "retracted, it expanded again: {:?}", whats(&puts));
+}
+
+/// The values of the store's verdict of the proc-macro crate `krate` that `puts` put.
+fn verdicts(puts: &[Put], krate: &str) -> Vec<Vec<u8>> {
+    // The crate's display name is its package's or its target's.
+    let names = [krate.to_owned(), krate.replace('_', "-")].map(|name| format!("the verdict of the proc macros of `{name}`"));
+    puts.iter().filter(|it| names.contains(&it.what)).map(|it| it.value.clone()).collect()
+}
+
+/// What each call in crate `krate` of a macro of crate `of` read, as its expansion reported it
+/// to the front end (`hir_expand`'s `expansion_reads`), its def map made first.
+fn reads_of(db: &base_db::Db, krate: Crate, of: Crate) -> Vec<ExpansionReads> {
+    let def_map = crate_def_map(db, krate);
+    let calls: Vec<_> = def_map.modules(db).flat_map(|(_, module)| module.scope(db).all_macro_calls()).collect();
+    calls.into_iter().filter(|call| call.loc(db).def.krate == of).map(|call| call.expansion_reads(db).clone()).collect()
+}
+
+/// The one recorded call of `name` on `subject`.
+fn call_on<'a>(records: &'a [Record], name: &str, subject: &str) -> &'a Record {
+    let found: Vec<&Record> =
+        records.iter().filter(|it| &*it.call.name == name && it.call.subject().as_deref() == Some(subject)).collect();
+    match found.as_slice() {
+        [one] => one,
+        _ => panic!("{} calls of `{name}` on `{subject}`", found.len()),
+    }
+}
+
+/// The macros of `corpus-once` (`once!`, "emit once": settles by its state, gives otherwise as
+/// the first call) and `corpus-settles` (`detect!`, settles as proc-macro2's detection does),
+/// three calls each in `corpus-sessions`, over two builds sharing a store and a warm revision
+/// of the second:
+///
+/// 1. The first build sees each crate's first call change the fresh state: both are told to
+///    settle, every call's reads are unknown (neither was known to settle at load), and the
+///    calls from the settled state that give the same from the fresh one are kept: `detect!`'s,
+///    and none of `once!`'s.
+/// 2. The second loads both as settling. Every `once!` call gives otherwise from the fresh
+///    state than from the settled one: its reads are unknown, saying so, the crate is told to
+///    be stateful, and none of its calls is kept. Every `detect!` call reports what it read,
+///    those from the settled state found as the first build kept them.
+/// 3. Its database, warm, with the third call of each edited: `detect!`'s edited call gives
+///    what a cold build of the edit gives, byte for byte, and `once!`'s calls' reads are
+///    unknown.
+#[test]
+#[ignore = "needs BLAZE_MACRO_CORPUS with `scratch`: a copy of the fixture workspace built by blaze"]
+fn a_session_macro_reports_its_reads_only_once_shown_the_same_from_either_state() {
+    let _scratch = SCRATCH.lock();
+    let config = Corpus::read().unwrap_or_else(|why| panic!("{why}"));
+    let dir = config.scratch().unwrap_or_else(|why| panic!("{why}")).to_owned();
+    let toolchain = load::toolchain().unwrap_or_else(|why| panic!("{why}"));
+    let mut sim = Sim::new(5, Faults::default());
+    let mut store = kept_in(&mut sim);
+    let keeping = kept::Keeping::new(Expansions { store: store.reader(), toolchain, environment: Arc::new(Environment::default()) })
+        .unwrap_or_else(|why| panic!("{why}"));
+    let macros = blaze_macro_eval::Macros::new(kept::Keeps::In(keeping), None);
+    let records = Records::default();
+    let mut loaded = Loaded::new();
+    let crates = |workspace: &load::Workspace| {
+        let krate = |name: &str| workspace.krate(name).unwrap_or_else(|why| panic!("{why}"));
+        (krate("corpus-sessions"), krate("corpus-once"), krate("corpus-settles"))
+    };
+    let unknown_saying = |reads: &[ExpansionReads], said: &str| {
+        reads.len() == 3 && reads.iter().all(|it| matches!(it, ExpansionReads::Unknown(why) if why.contains(said)))
+    };
+    let traced = |reads: &[ExpansionReads]| reads.len() == 3 && reads.iter().all(|it| matches!(it, ExpansionReads::Traced { .. }));
+
+    // 1. Unseen: each crate's first call changes the fresh state, and none what it left.
+    let first = build(&config, &dir, &macros, &records, &mut loaded);
+    let (sessions, once, settles) = crates(&first);
+    let db = first.lowered.db();
+    for (of, reads) in [("once", reads_of(db, sessions, once)), ("detect", reads_of(db, sessions, settles))] {
+        assert!(unknown_saying(&reads, "does not settle"), "`{of}!`, unseen: {reads:?}");
+    }
+    let mut puts = kept::take_puts();
+    assert_eq!(verdicts(&puts, "corpus_once"), [b"settles".to_vec()], "{:?}", whats(&puts));
+    assert_eq!(verdicts(&puts, "corpus_settles"), [b"settles".to_vec()], "{:?}", whats(&puts));
+    assert!(puts_of(&puts, "once").is_empty(), "`once!` was kept, giving otherwise from the fresh state: {:?}", whats(&puts));
+    assert!(!puts_of(&puts, "detect").is_empty(), "`detect!`'s calls from the settled state are kept: {:?}", whats(&puts));
+    macros.flush();
+    puts.extend(kept::take_puts());
+    let published = macros.keeps().publish(&mut store, puts);
+    assert!(published.refused.is_empty(), "{:?}", published.refused);
+    drop(first);
+    loaded.clear();
+    taken(&records);
+
+    // 2. Both settle at load. `once!` gives otherwise from the fresh state than from the
+    //    settled one, at each call; `detect!` gives the same, and is found.
+    let mut second = build(&config, &dir, &macros, &records, &mut loaded);
+    let (sessions, once, settles) = crates(&second);
+    let db = second.lowered.db();
+    let reads = reads_of(db, sessions, once);
+    assert!(unknown_saying(&reads, "gives otherwise from the fresh state"), "{reads:?}");
+    let reads = reads_of(db, sessions, settles);
+    assert!(traced(&reads), "{reads:?}");
+    let puts = kept::take_puts();
+    assert_eq!(verdicts(&puts, "corpus_once"), [b"stateful".to_vec()], "`once!` was told to be stateful: {:?}", whats(&puts));
+    assert!(puts_of(&puts, "once").is_empty(), "`once!` was kept unshown: {:?}", whats(&puts));
+    assert!(puts_of(&puts, "detect").is_empty(), "`detect!` ran what the first build kept: {:?}", whats(&puts));
+    taken(&records);
+
+    // 3. A warm revision of the second build's database, the third call of each edited.
+    let path = Path::new(&dir).join("sessions/src/lib.rs");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let edited = text.replace("once!(ONCE_THIRD)", "once!(ONCE_EDITED)").replace("detect!(DETECT_THIRD)", "detect!(DETECT_EDITED)");
+    assert_ne!(edited, text, "{} calls `once!(ONCE_THIRD)` and `detect!(DETECT_THIRD)`", path.display());
+    let file = (second.lowered.paths().iter())
+        .find(|(_, it)| Path::new(it.as_str()) == path)
+        .map(|(file, _)| *file)
+        .unwrap_or_else(|| panic!("the front end has no file {}", path.display()));
+    second.lowered.served_db().set_file_text(file, &edited);
+    let db = second.lowered.db();
+    let reads = reads_of(db, sessions, once);
+    assert!(reads.len() == 3 && reads.iter().all(|it| matches!(it, ExpansionReads::Unknown(_))), "warm: {reads:?}");
+    let reads = reads_of(db, sessions, settles);
+    assert!(traced(&reads), "warm: {reads:?}");
+    let warm = taken(&records);
+    let warm_edited = call_on(&warm, "detect", "DETECT_EDITED");
+    drop(second);
+    loaded.clear();
+
+    // A cold build of the edit, every call run in order from a fresh session, nothing kept:
+    // what rustc gives.
+    let changed = Changed::write(&path, &edited);
+    let cold_macros = blaze_macro_eval::Macros::new(kept::Keeps::Nothing("a cold build keeps nothing"), None);
+    let cold = build(&config, &dir, &cold_macros, &records, &mut loaded);
+    let (sessions, _, settles) = crates(&cold);
+    reads_of(cold.lowered.db(), sessions, settles);
+    let coldly = taken(&records);
+    let cold_edited = call_on(&coldly, "detect", "DETECT_EDITED");
+    match (warm_edited.eval.expanded(), cold_edited.eval.expanded()) {
+        (Some(warm), Some(cold)) => {
+            if let Some(difference) = difference::difference(cold, warm) {
+                panic!("{} expands warm otherwise than cold: {difference}", warm_edited.what());
+            }
+        }
+        _ => panic!("{} did not expand both warm and cold", warm_edited.what()),
+    }
+    drop(cold);
+    drop(changed);
 }

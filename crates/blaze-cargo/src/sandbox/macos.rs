@@ -944,6 +944,7 @@ mod tests {
             live: dir.join("live"),
             report: dir.join("report"),
             not_inputs: vec![exe],
+            given: None,
         };
         assert_eq!(crate::sandbox::alone::launch(&spec), 0);
         assert_eq!(std::fs::read_to_string(out.join("seen")).unwrap(), "v 1");

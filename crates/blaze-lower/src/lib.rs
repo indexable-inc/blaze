@@ -548,8 +548,8 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
             .map(|it| SourceRootId(it as u32))
             .collect()
     };
-    _ = LibraryRoots::builder(roots(true)).durability(Durability::MEDIUM).new(db);
-    _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(db);
+    _ = LibraryRoots::new(db, Durability::MEDIUM, roots(true));
+    _ = LocalRoots::new(db, Durability::MEDIUM, roots(false));
 
     let mut loaded = Vec::new();
     let mut read = Vec::with_capacity(loads.len());

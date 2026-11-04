@@ -12,7 +12,7 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_query::QueryKind;
-use blaze_query::db::Setter;
+use blaze_query::db::{Durability, Setter};
 use hir_def::{
     FunctionId, GenericDefId, ModuleDefId,
     deps::{ImageBuf, ImageStore},
@@ -414,7 +414,7 @@ fn a_goal_reads_back_from_its_stable_form_and_its_record() {
     let db = db_of(FIXTURE);
     let krate = local_crate(&db);
     let interner = DbInterner::new_with(&db, krate);
-    let facts = TestFacts::new(Knob::new(&db, 1, true, krate), true);
+    let facts = TestFacts::new(Knob::new(&db, Durability::LOW, 1, true, krate), true);
     let functions = functions(&db, krate);
     let tys = fixture_types(&db, interner, &functions);
 
@@ -508,7 +508,7 @@ fn looked_up(db: &Db, krate: Crate) -> Option<Answer> {
 fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
     let mut db = db_of(FIXTURE);
     let krate = local_crate(&db);
-    let knob = Knob::new(&db, 1, true, krate);
+    let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
     let memory = Arc::new(Memory::default());
     let facts = Arc::new(TestFacts::new(knob, true));
     let installed = install(&db, memory.clone(), facts.clone(), BUILD).unwrap();
@@ -542,7 +542,7 @@ fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
 fn two_answers_under_the_same_facts_stop_the_flush() {
     let mut db = db_of(FIXTURE);
     let krate = local_crate(&db);
-    let knob = Knob::new(&db, 1, true, krate);
+    let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
     let memory = Arc::new(Memory::default());
     let installed = install(&db, memory.clone(), Arc::new(TestFacts::new(knob, true)), BUILD).unwrap();
     offered(&db, knob);
@@ -557,7 +557,7 @@ fn two_answers_under_the_same_facts_stop_the_flush() {
 fn a_goal_with_a_read_that_is_no_fact_is_never_stored() {
     let db = db_of(FIXTURE);
     let krate = local_crate(&db);
-    let knob = Knob::new(&db, 1, true, krate);
+    let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
     let memory = Arc::new(Memory::default());
     let facts = Arc::new(TestFacts::new(knob, false));
     let installed = install(&db, memory.clone(), facts.clone(), BUILD).unwrap();
@@ -575,7 +575,7 @@ fn a_database_finds_only_its_own_store() {
     let db = db_of(FIXTURE);
     let other = db_of(FIXTURE);
     let krate = local_crate(&db);
-    let knob = Knob::new(&db, 1, true, krate);
+    let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
     let memory = Arc::new(Memory::default());
     let installed = install(&db, memory.clone(), Arc::new(TestFacts::new(knob, true)), BUILD).unwrap();
     assert!(install(&db, memory.clone(), Arc::new(TestFacts::new(knob, true)), BUILD).is_err());
@@ -610,7 +610,7 @@ fn a_lookup_or_offer_with_no_store_allocates_nothing() {
     // `blaze_reclaim`, which allocates once.
     assert!(lookup(interner, key).is_none());
     assert!(assert_at_most(0, "a goal-store lookup with no store installed", || lookup(interner, key)).is_none());
-    offered_with_no_store(&db, Knob::new(&db, 1, true, krate));
+    offered_with_no_store(&db, Knob::new(&db, Durability::LOW, 1, true, krate));
 }
 
 /// Rule 18, the solver's code: an edit of the vendored solver's source is another front-end
@@ -629,7 +629,7 @@ fn a_solver_source_edit_changes_the_identity_and_misses_the_goal_store() {
 
     let db = db_of(FIXTURE);
     let krate = local_crate(&db);
-    let knob = Knob::new(&db, 1, true, krate);
+    let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
     let memory = Arc::new(Memory::default());
     let facts = Arc::new(TestFacts::new(knob, true));
     let kept = install(&db, memory.clone(), facts.clone(), before).unwrap();

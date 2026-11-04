@@ -2,7 +2,7 @@
 //! lint names in them, against rustc's UI tests as they are, under compiletest's flags
 //! (`-Z deduplicate-diagnostics=no` with them).
 
-use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
+use hir_expand::proc_macro::{Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
 
 use crate::{
     Options,
@@ -875,11 +875,12 @@ fn main() { from_dep(); from_here(); }
 struct DeclaredByMacro;
 
 impl ProcMacroExpander for DeclaredByMacro {
-    fn expand(&self, _: &base_db::Db, call: ProcMacroCall<'_>) -> Result<hir_expand::tt::TopSubtree, ProcMacroExpansionError> {
+    fn expand(&self, _: &base_db::Db, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
         let call_site = call.call_site;
-        Ok(hir_expand::quote! { call_site =>
+        let tree = hir_expand::quote! { call_site =>
             fn generated_by_derive() { let unused = (); }
-        })
+        };
+        Ok(Expanded::untraced(tree, "a test's proc macro, which traces nothing of what it read"))
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set

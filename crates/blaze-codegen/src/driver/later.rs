@@ -34,7 +34,7 @@ use blaze_mem::{Tag, frame};
 
 use super::{
     Build, Built, By, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put, Sorted, StaticId,
-    StaticNode, Whence, callee, dev_template_key, error, placed, stopped, stored, stored_function, unfit,
+    StaticNode, Whence, callee, dev_template_key, error, placed, prepare_node, stopped, stored, stored_function, unfit,
     unkept_inline, unkept_message,
 };
 use crate::{
@@ -154,7 +154,7 @@ fn stored_one<I, S, L: Lookup + ?Sized>(
 ) -> Result<Option<CompiledFunction>, CodegenError> {
     match store.read(&at) {
         Ok(None) => Ok(None),
-        Ok(Some(bytes)) => match stored_function(bytes, key, &node.refs) {
+        Ok(Some(bytes)) => match stored_function(bytes, key, &node.refs, node.described.anchors.as_ref()) {
             Ok(Ok(function)) => Ok(Some(function)),
             Ok(Err(why)) => Err(unfit(key, node.unit.item, &node.described.name, Whence::Store(at), &why)),
             // alloc: an error
@@ -163,6 +163,12 @@ fn stored_one<I, S, L: Lookup + ?Sized>(
         // alloc: an error
         Err(why) => Err(error(key, node.unit.item, format!("reading the store's {at:?}: {why}"))),
     }
+}
+
+/// `unit`, `node`'s function at its own or another tier, as its template is kept: with its
+/// template code ([`crate::backend::Described::template_code`]).
+fn template_instance<I, S>(node: &FnNode<I, S>, unit: &Unit) -> Instance {
+    Instance { code: node.described.template_code, ..unit.instance }
 }
 
 /// The store's value of `template`, kept under `at` (a [`dev_template_key`]).
@@ -181,7 +187,7 @@ fn memoized<I, S>(
     template: &Template,
 ) -> Result<(CompiledFunction, Vec<Put>), CodegenError> {
     let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), &why);
-    let function = template.instantiate(key, &node.refs).map_err(unfit)?;
+    let function = template.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit)?;
     // alloc: the store's value of a memo hit, once a function
     Ok((function, vec![put_of(at, template)]))
 }
@@ -199,8 +205,8 @@ fn compiled<B: Prepare>(
     spec: &Spec,
 ) -> Result<(CompiledFunction, Vec<Put>, Made, ContentId), CodegenError> {
     let (key, item) = (unit.instance.key(), unit.item);
-    let at = dev_template_key(&unit.instance, &node.built_in, &node.refs, &spec.toolchain.id);
-    let (compiled, made) = backend.prepare(frontend, unit, spec, &node.instance, &node.refs)?;
+    let at = dev_template_key(&template_instance(node, unit), &node.built_in, &node.refs, &spec.toolchain.id);
+    let (compiled, made) = prepare_node(backend, frontend, unit, spec, node)?;
     let shape = compiled.key();
     if let Some(template) = memo.get(&shape) {
         let (function, puts) = memoized(node, key, at, shape, template)?;
@@ -221,13 +227,13 @@ fn compiled<B: Prepare>(
         (None, None) => {}
         _ => return Err(error(key, item, "the compile's side table and the function's record of it disagree")),
     }
-    let template = Template::of_owned(emitted.function, &node.refs, &emitted.extra)
+    let template = Template::of_owned_at(emitted.function, &node.refs, &emitted.extra, node.described.anchors.as_ref())
         // alloc: an error
         .map_err(|why| error(key, item, why.to_string()))?;
     let kept = memo.put(compiled, template);
     puts.push(put_of(at, kept));
     let unfit = |why| unfit(key, item, &node.described.name, Whence::Shape(shape), &why);
-    let function = kept.instantiate(key, &node.refs).map_err(unfit)?;
+    let function = kept.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit)?;
     Ok((function, puts, Made::Compiled, shape))
 }
 
@@ -295,7 +301,7 @@ fn claimed<B: Prepare>(
     };
     match memo.get(&shape) {
         Some(template) => {
-            memoized(node, key, dev_template_key(&unit.instance, &node.built_in, &node.refs, &spec.toolchain.id), shape, template).map(|(function, puts)| (function, puts, Made::Flown, shape))
+            memoized(node, key, dev_template_key(&template_instance(node, unit), &node.built_in, &node.refs, &spec.toolchain.id), shape, template).map(|(function, puts)| (function, puts, Made::Flown, shape))
         }
         // alloc: an error
         None => Err(error(key, unit.item, format!("its compile landed under shape {shape:?}, which the memo has no template of"))),
@@ -362,7 +368,7 @@ impl<I, S> Later<I, S> {
     pub fn memo_hit(&self, memo: &Memo, key: InstanceKey) -> Option<Result<CompiledFunction, CodegenError>> {
         let (node, template, shape) = self.recorded(memo, key)?;
         let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), &why);
-        Some(template.instantiate(key, &node.refs).map_err(unfit))
+        Some(template.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit))
     }
 
     /// The store's value of [`Later::memo_hit`]'s template, under `key`'s stored key: `None`
@@ -427,7 +433,7 @@ impl<I, S> Later<I, S> {
         let node = lazy_node(&self.nodes, key)?;
         let (unit, spec) = at_tier(key, node, to, counted)?;
         let tiered = unit.instance.key();
-        let at = dev_template_key(&unit.instance, &node.built_in, &node.refs, &spec.toolchain.id);
+        let at = dev_template_key(&template_instance(node, &unit), &node.built_in, &node.refs, &spec.toolchain.id);
         if let Some(function) = stored_one(node, at, tiered, store)? {
             // alloc: none, empty
             return Ok((function, Vec::new()));
@@ -555,7 +561,7 @@ impl<B: Prepare> Build<'_, B> {
         let checked: Vec<(InstanceKey, Result<ContentId, CodegenError>)> =
             self.until_stopped(&unchecked, &mut out.errors, |key| {
                 let node = &nodes[key];
-                let made = self.backend.prepare(self.frontend, &node.unit, &node.spec, &node.instance, &node.refs);
+                let made = prepare_node(self.backend, self.frontend, &node.unit, &node.spec, node);
                 // The IR is let go here, on the thread that built it: only its shape is kept.
                 (*key, made.map(|(shape, _)| shape.key()))
             });

@@ -756,7 +756,8 @@ fn publish_scopes(
                 scope.censor_non_proc_macros(krate);
             }
             let mut slot = cs.inputs.get(&module).copied();
-            work.slices += u64::from(publish::set_scope(db, &mut slot, module, scope, children));
+            work.slices +=
+                u64::from(publish::set_scope(db, krate, &mut slot, module, scope, children));
             let input = slot.expect("nameres delta: `set_scope` makes the input");
             cs.inputs.insert(module, input);
             if !censored {

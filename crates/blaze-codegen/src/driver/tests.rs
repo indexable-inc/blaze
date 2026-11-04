@@ -39,6 +39,10 @@ struct Function {
     /// The function whose identity it has ([`Described::identity`]), itself when `None`: two
     /// of one identity are one instance asked for by two origins.
     identity_of: Option<u32>,
+    /// Its own span tables' anchors, when its template is kept under a template code with no
+    /// name and no place in it ([`Described::template_code`]): its body and callees alone.
+    /// Its compiled code then names a position in two of them.
+    anchors: Option<[ContentId; crate::template::OWN_TABLES]>,
 }
 
 #[derive(Default)]
@@ -107,6 +111,7 @@ impl Program {
             code_of: None,
             owner: Owner::Workspace,
             identity_of: None,
+            anchors: None,
         };
         self.functions.insert(id, function);
         self.functions.get_mut(&id).unwrap()
@@ -135,12 +140,25 @@ impl Frontend for Program {
             .chain([FrontRef::Extern(function.outside.to_owned())])
             .collect();
         let code = self.code(*id);
+        let template_code = match function.anchors {
+            Some(_) => {
+                let mut template = Hasher::new("blaze v2 test template code 1");
+                template.update(&[function.body]);
+                for callee in &function.calls {
+                    template.update(&callee.to_le_bytes());
+                }
+                CodeHash(template.finish())
+            }
+            None => code,
+        };
         Ok(Described {
             owner: function.owner,
             identity: ContentId::of("blaze v2 test identity 1", &function.identity_of.unwrap_or(*id).to_le_bytes()),
             bound: Ok(code.0),
             item: item(*id),
             code,
+            template_code,
+            anchors: function.anchors,
             built_in_code: code,
             args: ContentId::default(),
             origin: function.origin,
@@ -244,6 +262,8 @@ struct Prepared {
     refs: usize,
     /// The code hashes of the bodies it builds in ([`Program::built_in`]).
     built_in: Vec<CodeHash>,
+    /// [`Function::anchors`]: its code names a position in its own tables.
+    own: Option<[ContentId; crate::template::OWN_TABLES]>,
 }
 
 /// A release function as its importers build it in: its body byte, which shows in their
@@ -278,7 +298,8 @@ impl Prepare for Machine {
         refs: &crate::template::Refs,
     ) -> Result<(Shape, Prepared), CodegenError> {
         self.prepared.fetch_add(1, Ordering::Relaxed);
-        let prepared = Prepared { body: program.functions[id].body, refs: refs.len(), built_in: program.built_in(*id) };
+        let function = &program.functions[id];
+        let prepared = Prepared { body: function.body, refs: refs.len(), built_in: program.built_in(*id), own: function.anchors };
         if prepared.body == FAILS_ITS_CHECK {
             return Err(error(unit.instance.key(), unit.item, "a layout too big for the target"));
         }
@@ -363,6 +384,15 @@ impl Prepare for Machine {
         }
         inlined.sort_unstable();
         inlined.dedup();
+        // A panic's location in its own tables, as a `Location` it passes, and its line row.
+        let mut lines = Vec::new();
+        if let Some(own) = prepared.own {
+            let at = code.len() as u32 + 1;
+            code.extend([0xe8, 0, 0, 0, 0]);
+            let span = blaze_format::SpanRef { anchor: own[1], index: 7 };
+            relocs.push(crate::Relocation { at, kind: RelocKind::PcRel32, target: Target::Position(span), addend: -4 });
+            lines.push(crate::Line { at: 0, span: blaze_format::SpanRef { anchor: own[0], index: 2 } });
+        }
         let function = CompiledFunction {
             key: unit.instance.key(),
             arch: unit.arch,
@@ -373,7 +403,7 @@ impl Prepare for Machine {
             inlined,
             side: None,
             unwind: None,
-            lines: Vec::new(),
+            lines,
             coverage: None,
             profile: None,
         };
@@ -522,6 +552,53 @@ fn a_cold_build_compiles_once_per_shape_and_a_warm_one_compiles_nothing() {
     assert_eq!(warm_machine.emitted.load(Ordering::Relaxed), 0);
     assert_eq!(warm.stats.stored, 5);
     assert_eq!(warm.functions, cold.functions);
+}
+
+/// Two items written alike, whose template code holds no name and no place
+/// (docs/v2/plan/design/name-free-identity.md): one compile and one template in the store,
+/// and each function made of it at its own positions, a warm build taking both from that one
+/// entry. Kept under their codes, the same two are two templates.
+#[test]
+fn two_items_written_alike_share_one_template_each_at_its_own_positions() {
+    let anchors = |n: u8| -> [ContentId; crate::template::OWN_TABLES] { std::array::from_fn(|t| ContentId([n + t as u8; 32])) };
+    let (two, three) = (anchors(0x20), anchors(0x30));
+    let program_of = |relative: bool| {
+        let mut program = program();
+        program.function(3, 0x22, &[4]);
+        if relative {
+            program.functions.get_mut(&2).unwrap().anchors = Some(two);
+            program.functions.get_mut(&3).unwrap().anchors = Some(three);
+        }
+        program
+    };
+    let templates = |built: &Built| {
+        let keys: std::collections::BTreeSet<Key> =
+            built.puts.iter().filter(|it| it.kind == Kind::Code).map(|it| it.key).collect();
+        keys.len()
+    };
+    let at_own = |built: &Built, own: &[ContentId; crate::template::OWN_TABLES]| {
+        let function = (built.functions.iter())
+            .find(|it| it.lines.iter().any(|line| line.span.anchor == own[0]))
+            .expect("a function at its own positions");
+        let located = blaze_format::SpanRef { anchor: own[1], index: 7 };
+        assert!(function.relocs.targets().contains(&Target::Position(located)), "its panic location is its own");
+        function.key
+    };
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let (program, machine, memo, mut store) = (program_of(true), Machine::default(), Memo::new(), Store::default());
+    let cold = build(&program, &machine, &policy, &memo, &store).unwrap();
+    assert_ne!(at_own(&cold, &two), at_own(&cold, &three), "two functions, each its own instance");
+    assert_eq!(machine.emitted.load(Ordering::Relaxed), 3, "`main`, `4` and one compile of the two");
+
+    let owned_program = program_of(false);
+    let owned = build(&owned_program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    assert_eq!(templates(&owned), templates(&cold) + 1, "kept under their codes, two templates");
+
+    store.keep(&cold.puts);
+    let warm_machine = Machine::default();
+    let warm = build(&program, &warm_machine, &policy, &Memo::new(), &store).unwrap();
+    assert_eq!(warm_machine.prepared.load(Ordering::Relaxed), 0, "both from the store");
+    assert_eq!(warm.functions, cold.functions, "each restored at its own positions");
 }
 
 #[test]
@@ -1097,12 +1174,12 @@ fn a_stored_function_is_the_decoded_templates() {
         for count in [template.refs, template.refs + 1] {
             let refs: Vec<Target> =
                 (0..count).map(|n| Target::Function(InstanceKey(ContentId([n as u8 + 2; 32])))).collect();
-            let made = stored_function(bytes, key, &refs).expect("a template");
+            let made = stored_function(bytes, key, &refs, None).expect("a template");
             assert_eq!(made, template.instantiate(key, &refs));
         }
     }
     assert_eq!(templates, cold.functions.len());
-    assert!(stored_function(&[0; 3], key, &[]).is_err());
+    assert!(stored_function(&[0; 3], key, &[], None).is_err());
 }
 
 /// A function built with a profile it no longer matches is counted however the build has it:
@@ -1126,7 +1203,7 @@ fn a_mismatched_profile_is_counted_compiled_or_stored() {
     };
     let mismatched = function(Some(crate::Profiled::Used { mismatched: true, applied: false }));
     let template = crate::template::Template::of(&mismatched, &[], &[]).unwrap();
-    let stored = stored_function(&crate::blob::encode(&template), key, &[]).unwrap().unwrap();
+    let stored = stored_function(&crate::blob::encode(&template), key, &[], None).unwrap().unwrap();
     assert_eq!(stored, mismatched);
     let mut out = Out::default();
     for it in [mismatched, stored, function(Some(crate::Profiled::Used { mismatched: false, applied: true })), function(None)] {

@@ -12,6 +12,7 @@ use arrow_array::{Array, RecordBatch, cast::AsArray, types::{Int64Type, UInt32Ty
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::{
+    history::{HistoryError, Pin},
     schema,
     slow::{DiedSpan, DiedThread},
 };
@@ -36,6 +37,8 @@ pub enum ReadingError {
     Arrow { path: PathBuf, error: arrow_schema::ArrowError },
     /// A column of an `open` file is missing or of another type.
     Column { path: PathBuf, column: &'static str },
+    /// The history could not be pinned ([`Pin`]), so which files it holds can't be told.
+    Pin(HistoryError),
 }
 
 impl fmt::Display for ReadingError {
@@ -47,6 +50,7 @@ impl fmt::Display for ReadingError {
             ReadingError::Column { path, column } => {
                 write!(f, "the profile history: {} has no column `{column}` of the type the open table has", path.display())
             }
+            ReadingError::Pin(error) => write!(f, "pinning the history to read its last open spans: {error}"),
         }
     }
 }
@@ -56,20 +60,18 @@ impl std::error::Error for ReadingError {}
 /// The last reading of the open spans of the process `pid` in the history `dir`, among its
 /// newest [`FILES`] `open` files; `None` where they hold none of it.
 pub fn last(dir: &Path, pid: u32) -> Result<Option<Reading>, ReadingError> {
-    let suffix = format!(".{}.parquet", schema::OPEN.name); // alloc: once a reading
-    let schema_file = format!("schema{suffix}"); // alloc: once a reading
-    let io = |doing| move |error| ReadingError::Io { path: dir.to_owned(), doing, error }; // alloc: an error
+    let schema_file = format!("schema.{}.parquet", schema::OPEN.name); // alloc: once a reading
+    // Held to the end: a merge retires `open` files, and none of these is deleted meanwhile.
+    let pin = Pin::take(dir).map_err(ReadingError::Pin)?;
+    let open = crate::history::table_at(&schema::OPEN);
     // alloc: the history's open files, once a reading
     let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
-    for entry in fs::read_dir(dir).map_err(io("listing"))? {
-        let entry = entry.map_err(io("listing"))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(&suffix) || name == schema_file || name.starts_with('.') {
-            continue;
-        }
-        let modified = entry.metadata().and_then(|it| it.modified()).map_err(io("reading a file's time in"))?;
-        files.push((modified, entry.path()));
+    for name in pin.snapshot().files(open).iter().filter(|it| **it != schema_file) {
+        let path = dir.join(name);
+        let modified = fs::metadata(&path)
+            .and_then(|it| it.modified())
+            .map_err(|error| ReadingError::Io { path: path.clone(), doing: "reading the time of", error })?; // clone: an error
+        files.push((modified, path));
     }
     // Newest first; the name (build, then flush) breaks a tie in time.
     files.sort_unstable_by(|a, b| b.cmp(a));

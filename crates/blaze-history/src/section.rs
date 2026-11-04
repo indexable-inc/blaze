@@ -17,7 +17,7 @@ use crate::{Config, DecodeError, History};
 
 /// The section's schema: [`History::encode`]'s bytes, by their version.
 pub const SCHEMA: SchemaHash =
-    blaze_format::schema("blaze plane history 2: blaze_history::History::encode bytes, version blzhis01");
+    blaze_format::schema("blaze plane history 4: blaze_history::History::encode bytes, version blzhis03");
 
 /// Writes `history` into `builder`'s image.
 pub fn write(history: &History, builder: &mut Builder) {

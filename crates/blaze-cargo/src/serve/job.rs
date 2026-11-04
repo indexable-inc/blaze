@@ -2084,7 +2084,13 @@ impl<S: Steps> Job<S> {
         let mut misses = std::mem::take(&mut self.misses);
         misses.sort_unstable();
         misses.dedup();
-        Ended { row: self.row(request, stats, outcome), links, crate_deps, misses }
+        // Its front end's run log, named with its database in hand, before the front end is
+        // kept or dropped: why each of its queries ran again.
+        let provenance = match &self.stage {
+            Stage::Units(build) => super::observe::provenance_rows(build_id, build.writer.ran()),
+            _ => Vec::new(),
+        };
+        Ended { row: self.row(request, stats, outcome), links, crate_deps, misses, provenance }
     }
 
     /// The value its stage waited on, if node `node` gave it.

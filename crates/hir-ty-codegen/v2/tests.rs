@@ -694,6 +694,109 @@ fn one_instance_under_two_debuginfo_levels_shares_a_key_only_with_its_shape() {
     }
 }
 
+const FORWARDERS: &str = r#"
+//- minicore: sized
+//- /std.rs crate:std lang
+pub fn one() -> u32 { 1 }
+pub fn two() -> u32 { 2 }
+pub fn via_one() -> u32 { one() }
+pub fn via_two() -> u32 { two() }
+//- /main.rs crate:main deps:std
+pub fn one() -> u32 { 1 }
+pub fn two() -> u32 { 2 }
+pub fn via_one() -> u32 { one() }
+pub fn via_two() -> u32 { two() }
+pub fn roots() -> u32 { std::via_one() + std::via_two() + via_one() + via_two() }
+"#;
+
+/// `described` of the function `name` of crate `krate` as `roots` (of crate `main`) asks for
+/// it, under `policy`, with the items lane's hashes: its template code, its code and whether
+/// it fills its own anchors.
+fn described_in(text: &str, policy: &Policy, krate: &str, name: &str) -> (CodeHash, CodeHash, bool) {
+    use base_db::all_crates;
+    use blaze_codegen::backend::Frontend as _;
+    let db: &'static TestDB = Box::leak(Box::new(fixture::db(text).into_db()));
+    let hashes = HashSource::Items(super::ItemHashes::new(Box::new(|_| None)));
+    let frontend = HirFrontend::new(Databases::new(db), hashes, BuildTime::default()).with_policy(policy);
+    let named = |name: &str| {
+        all_crates(db)
+            .iter()
+            .copied()
+            .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == name))
+            .unwrap_or_else(|| panic!("no crate `{name}`"))
+    };
+    let main = named("main");
+    blaze_query::db::attach(db, || {
+        let root = frontend.root(hir_def::test_items::function(db, main, "roots"));
+        let origin = frontend.with(|hir| frontend.origin(hir, main));
+        let func = hir_def::test_items::function(db, named(krate), name);
+        let instances = frontend.with(|hir| called(hir, &root, func));
+        let [instance] = &instances[..] else { panic!("`{name}`: {instances:?}") };
+        let described = (frontend.describe(instance, &origin)).unwrap_or_else(|e| panic!("`{name}`: {}", e.what));
+        (described.template_code, described.code, described.anchors.is_some())
+    })
+}
+
+/// The library's bodies are MIR-inlined in every unit, as shipped (`Build::options`), so a
+/// body of a `Lang` crate is its callees' bodies too: it is kept under its code, never a
+/// template code its callees' interfaces alone make, and fills no anchors of its own. Two
+/// forwarders written alike over two callees of one signature are so two keys.
+#[test]
+fn a_library_body_the_library_inlines_into_is_kept_under_its_code() {
+    let policy = policy(OptLevel::O0);
+    let one = described_in(FORWARDERS, &policy, "std", "via_one");
+    let two = described_in(FORWARDERS, &policy, "std", "via_two");
+    assert_eq!((one.0, one.2), (one.1, false), "`via_one` is kept under its code");
+    assert_eq!((two.0, two.2), (two.1, false), "`via_two` is kept under its code");
+    assert_ne!(one.0, two.0, "two library forwarders over two callees are two template keys");
+}
+
+/// A unit that puts names of its own in its code (a report's rows, a PGO record, a
+/// sanitizer's descriptors and its skip of `__sanitizer_*`) keeps its bodies under their
+/// codes: `Units::names`. The same body under a unit that does none of those fills its own
+/// anchors under a template code of its own.
+#[test]
+fn a_unit_that_names_its_code_keeps_it_under_its_code() {
+    let plain = described_in(FORWARDERS, &policy(OptLevel::O0), "main", "via_one");
+    assert!(plain.2, "the premise: a member's body at -O0 is held by table");
+    assert_ne!(plain.0, plain.1, "under a template code of its own");
+    let mut report = policy(OptLevel::O0);
+    report.report = true;
+    let mut pgo = policy(OptLevel::O0);
+    pgo.pgo = blaze_codegen::settings::Pgo::Generate;
+    let mut sanitize = policy(OptLevel::O0);
+    sanitize.sanitize.sanitizers = blaze_codegen::settings::Sanitizers::ADDRESS;
+    for (why, policy) in [("a report", report), ("PGO", pgo), ("a sanitizer", sanitize)] {
+        let (template, code, anchored) = described_in(FORWARDERS, &policy, "main", "via_one");
+        assert_eq!((template, anchored), (code, false), "under {why}, kept under its code");
+    }
+}
+
+const TOLD_LOCAL: &str = r#"
+//- minicore: sized
+//- /main.rs crate:main
+pub struct A(pub u32);
+pub fn holds() -> u32 { let held = A(1); held.0 }
+pub fn roots() -> u32 { holds() }
+"#;
+
+/// What a debugger is told of a function's locals' types is in its compiled function's side
+/// table, so it is folded into its link code (`with_names`), not its template code alone:
+/// renaming the type a local is of is another code where locals are told.
+#[test]
+fn a_told_locals_type_is_in_its_link_code() {
+    let told = |debuginfo: DebugInfo, text: &str| {
+        let mut policy = policy(OptLevel::O0);
+        policy.profile.debuginfo = debuginfo;
+        described_in(text, &policy, "main", "holds")
+    };
+    let renamed = TOLD_LOCAL.replace("struct A", "struct B").replace("A(1)", "B(1)");
+    let (before, after) = (told(DebugInfo::Full, TOLD_LOCAL), told(DebugInfo::Full, &renamed));
+    assert_ne!(before.1, after.1, "the told type's new name is a new link code");
+    assert_ne!(before.0, after.0, "and a new template code");
+    assert_ne!(told(DebugInfo::None, TOLD_LOCAL).1, before.1, "untold, its code holds no told type");
+}
+
 /// A function `#[blaze::cache]` made, with `deep` its closure reaches: `{deep}` is its body.
 fn cached_fixture(deep: &str) -> String {
     format!(

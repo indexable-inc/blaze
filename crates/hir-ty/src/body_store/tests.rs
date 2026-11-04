@@ -14,7 +14,7 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::QueryKind;
-use blaze_query::db::Setter;
+use blaze_query::db::{Durability, Setter};
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, ImplId, StaticId, StructId,
     TraitId, TypeAliasId, UnionId,
@@ -558,7 +558,7 @@ fn only_a_passing_borrow_check_is_stored() {
     let defs = Defs::default();
     let mut first = session(db_of(FIXTURE), &memory, &defs, None, Mode::Serve);
     let seven = function(&first.db, "seven");
-    let verdict = Verdict::new(&first.db, seven, false);
+    let verdict = Verdict::new(&first.db, Durability::LOW, seven, false);
     assert!(!borrow_checked(&first.db, verdict));
     assert_eq!(first.installed.flush().unwrap(), Flushed::default(), "a failing verdict is never offered");
     assert!(!lookup_passed(&first.db, seven, CHECKER, || panic!("not verifying")));

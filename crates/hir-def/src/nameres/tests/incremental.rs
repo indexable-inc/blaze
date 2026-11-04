@@ -630,3 +630,104 @@ struct AfterImpl;
     );
     assert_eq!(u32::from(span.range.start()), 0);
 }
+
+/// An attribute that gives back its item and counts its runs, each call stating `state` of its
+/// session, its calls ordered as those of a crate that keeps a session when `ordered`.
+#[derive(Debug)]
+struct Counting {
+    runs: std::sync::atomic::AtomicUsize,
+    ordered: bool,
+    state: hir_expand::proc_macro::StateUse,
+}
+
+impl hir_expand::proc_macro::ProcMacroExpander for Counting {
+    fn requires_session(&self) -> bool {
+        self.ordered
+    }
+
+    fn expand(
+        &self,
+        _: &base_db::Db,
+        call: hir_expand::proc_macro::ProcMacroCall<'_>,
+    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError> {
+        self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(hir_expand::proc_macro::Expanded {
+            tree: call.subtree.copy(),
+            reads: hir_expand::proc_macro::ExpansionReads::Nothing,
+            state: self.state,
+        })
+    }
+
+    // dyn: `ProcMacroExpander::eq_dyn`'s signature, compared when a crate's macros are set
+    fn eq_dyn(&self, other: &dyn hir_expand::proc_macro::ProcMacroExpander) -> bool {
+        std::ptr::eq(self as *const Self as *const (), other as *const _ as *const ())
+    }
+}
+
+/// What resolving a crate with one call of [`Counting`] does, and an edit of a file the call
+/// does not read: its runs when resolved, its runs after the edit, whether the def map says it
+/// used a call whose session took part, and how many expansions the edit's write ran.
+fn counting_across_an_unrelated_edit(
+    ordered: bool,
+    state: hir_expand::proc_macro::StateUse,
+) -> (usize, usize, bool, usize) {
+    let counting = std::sync::Arc::new(Counting { runs: Default::default(), ordered, state });
+    let extra = vec![(
+        "#[proc_macro_attribute]\npub fn counting(_attr: TokenStream, item: TokenStream) -> TokenStream { item }\n"
+            .to_owned(),
+        hir_expand::proc_macro::ProcMacro {
+            name: intern::Symbol::intern("counting"),
+            kind: hir_expand::proc_macro::ProcMacroKind::Attr,
+            expander: counting.clone(),
+            disabled: false,
+        },
+    )];
+    let fx = fixture::db_with_proc_macros(
+        r#"
+//- proc_macros: counting
+//- /lib.rs
+mod other;
+#[proc_macros::counting]
+pub struct Host;
+//- /other.rs
+pub fn unrelated() -> u32 { 1 }
+"#,
+        extra,
+    );
+    let other = fx.file_at("/other.rs");
+    let mut db = fx.into_db();
+    let krate = db.fetch_test_crate();
+    let marked = {
+        let def_map = crate_def_map(&db, krate);
+        let dump = def_map.dump(&db);
+        assert!(dump.contains("Host"), "the call's item is in the def map:\n{dump}");
+        def_map.session_macros
+    };
+    let resolved = counting.runs.load(std::sync::atomic::Ordering::Relaxed);
+    let file = other.file_id(&db);
+    let events = db.executed_in_write(|db| {
+        db.set_file_text(file, "pub fn unrelated() -> u32 { 2 }\n");
+        crate_def_map(db, krate);
+    });
+    let expanded = events.iter().filter(|it| it.contains("proc_macro_expansion")).count();
+    (resolved, counting.runs.load(std::sync::atomic::Ordering::Relaxed), marked, expanded)
+}
+
+/// A call whose output is fixed by its call and reads runs once and is reused across an edit
+/// of another file, whether its crate keeps no state or settles (its calls ordered, the call
+/// shown to give the same from either state): its def map is not marked as using the session,
+/// so nothing about it reruns each revision. A call whose session's state takes part marks it.
+#[test]
+fn a_fixed_expansion_is_reused_across_an_unrelated_edit() {
+    use hir_expand::proc_macro::StateUse;
+    for ordered in [false, true] {
+        let (resolved, edited, marked, expanded) = counting_across_an_unrelated_edit(ordered, StateUse::Fixed);
+        assert_eq!(resolved, 1, "ordered {ordered}: the call ran once to resolve the crate");
+        assert_eq!((edited, expanded), (1, 0), "ordered {ordered}: the edit ran the call again");
+        assert!(!marked, "ordered {ordered}: a fixed call marked the def map as using the session");
+    }
+    let (resolved, _, marked, _) =
+        counting_across_an_unrelated_edit(true, StateUse::Session("a test's call that says its session took part"));
+    assert_eq!(resolved, 1, "the call ran once to resolve the crate");
+    assert!(marked, "a call whose session took part marks the def map");
+}

@@ -17,6 +17,12 @@
 //!   close a cycle of tasks: one gives way, `Cancelled::WouldWaitOnItself`, and meets the cycle
 //!   on its own stack when it runs again). Heads are stack positions; a frame's `head` is the
 //!   lowest it depends on, so nested cycles merge into the outermost head, which iterates.
+//!   A read of a provisional row records no edge ([`read_provisional`]); each run of the cycle
+//!   hands its other reads on to its reader in read order, and so to the head ([`hand_over`]);
+//!   the converged head stores them all, over every round, as its edges, and each member's one
+//!   edge is its head ([`finalize`]). So a later view verifies a final cycle as any row: when
+//!   nothing it read changed the whole cycle is reused, else it runs again from its head. A
+//!   provisional row (a round not yet converged) is never verified.
 
 use std::{
     cell::Cell,
@@ -34,7 +40,7 @@ use super::{
     budget::Held,
     counts,
     id::PAGE_LEN,
-    ingredient::{self, Ingredient, Kind, Vtable, Weighed},
+    ingredient::{self, Explicit, Ingredient, Kind, Vtable, Weighed},
     local::{self, Frame, Kind as FrameKind, Member, NONE, Pending},
     provenance::Cause,
     row::{
@@ -42,7 +48,8 @@ use super::{
         UNTRACKED, VALUE, VIEW_MASK, row_at, span,
     },
     storage::{
-        ALL, Durability, FIELD, Relocate, Restamp, Storage, Table, color, key_parts, node_key, or,
+        ALL, Durability, FIELD, Relocate, Restamp, Storage, Summary, Table, color, key_parts,
+        node_key, or,
     },
     verify,
 };
@@ -172,6 +179,11 @@ impl Vtable {
             } else {
                 None
             },
+            explicit: if F::EVICTABLE && !F::BUDGETED {
+                Some(Explicit { tag: F::TAG, values: explicit_values::<F>, evict: evict_table::<F> })
+            } else {
+                None
+            },
             relocate: Some(relocate::<F> as fn(&mut Storage, u32, &mut Relocate)),
             restamp: Some(restamp::<F> as fn(&Storage, u32, &mut Restamp<'_>)),
             write_key: Some(write_key::<F> as fn(&Storage, Id, &mut String)),
@@ -219,19 +231,20 @@ fn read(storage: &Storage, header: &Header) {
     super::noted(storage, note);
 }
 
-/// A read of a provisional row of the cycle headed at stack index `head`.
+/// A read of a provisional row of the cycle headed at stack index `head`: a read inside the
+/// cycle, told apart here, where it is made. It records no edge: the cycle's rows are proved
+/// by the reads the cycle made outside itself, which its runs hand over in read order
+/// ([`hand_over`]); the reader joins the cycle (its `head`).
 fn read_provisional(storage: &Storage, header: &Header, head: u32) {
-    let note = local::with(|local| {
-        let node = header.node.load(Ordering::Relaxed);
+    local::with(|local| {
         let changed = header.changed.load(Ordering::Relaxed);
-        let note = local.read(storage, node, header.durability(), changed);
         if let Some(frame) = local.recording(storage) {
+            frame.durability = frame.durability.min(header.durability());
+            frame.changed = frame.changed.max(changed);
             frame.head = frame.head.min(head);
             frame.unshareable = true;
         }
-        note
     });
-    super::noted(storage, note);
 }
 
 /// The most bytes of a key's text [`write_key`] writes: a key's `Debug` can run to gigabytes (a
@@ -809,7 +822,10 @@ impl Drop for Running<'_> {
         let members = local::with(|local| {
             let frame = &local.frames[self.at as usize];
             let (members, pending) = (frame.members_start, frame.pending_start);
+            let cycle = frame.cycle.start as usize;
             local.truncate_pending(pending as usize);
+            // The unwinding cycle's reads go with its rows.
+            local.cycle_edges.truncate(cycle);
             members
         });
         empty_members(self.storage, members);
@@ -1016,6 +1032,19 @@ fn finish<F: Function>(
     let meta = durability | if done.untracked { UNTRACKED } else { 0 };
     // SAFETY: the flight holder, `RUNNING` set; the value was dropped above (rule 1).
     unsafe { put(table, row, new) };
+    // A head whose last round read no row of its cycle (or a verify turned run that was met
+    // by a cycle and then read none of it) ends outside any cycle: what it gathered as a head
+    // is no one's now. It is the top frame, so all of the gathering above its start is its.
+    local::with(|local| {
+        let start = local.frames[at as usize].cycle.start as usize;
+        local.cycle_edges.truncate(start);
+    });
+    // Nor are the rows it headed: the stale inner heads its earlier rounds kept, and members a
+    // verify met for it. Their values came from its provisional ones, and with no head left to
+    // finalize them, each would wait for it ever after (`refresh`'s `wait_for`, bounded only by
+    // `REFRESH_ROUNDS`). They are emptied, as an unwinding cycle's are, before this row
+    // publishes, so a task waiting on this flight finds them never made.
+    drop_orphans(storage, done.members, done.node);
     store_edges(storage, header, at);
     summarize(storage, done.node, at, done.untracked);
     header.changed.store(changed, Ordering::Relaxed);
@@ -1023,6 +1052,28 @@ fn finish<F: Function>(
     storage.paint(done.node, color(view, changed));
     // Release: the value, stamp and edges are published with the word (rule 2).
     header.verified.store(view | VALUE, Ordering::Release);
+}
+
+/// Empties the provisional rows from `from` on the member list whose head is node `head`, a run
+/// that ended outside its cycle ([`finish`]), and drops them and every row no longer provisional
+/// from the list. A provisional row of another head (one lower on the stack, which a verify met
+/// while this run was on it) stays, for that head to finalize or empty.
+fn drop_orphans(storage: &Storage, from: u32, head: u32) {
+    if local::with(|local| local.members.len() as u32 <= from) {
+        return;
+    }
+    let members = local::with(|local| local.members.split_off(from as usize)); // alloc: a head that ended outside its cycle, once
+    for member in members {
+        let Some(header) = member_header(storage, member) else { continue };
+        if header.verified.load(Ordering::Relaxed) & PROVISIONAL == 0 {
+            continue;
+        }
+        if header.extra.load(Ordering::Relaxed) as u32 == head {
+            reset_member(storage, member);
+        } else {
+            local::with(|local| local.members.push(member));
+        }
+    }
 }
 
 /// A run that read a provisional row of a cycle headed below it: it becomes a member of that
@@ -1067,7 +1118,16 @@ fn participate<F: Function>(
     }
     // SAFETY: as above, the row holds no value now.
     unsafe { put(table, row, value) };
-    store_edges(storage, header, at);
+    // A provisional row keeps no edges: its reads outside the cycle go on to its reader in
+    // read order, and on to the head ([`hand_over`]); a final member's one edge is its head
+    // ([`finalize`]). So no run of the cycle copies what the runs below it read.
+    let note = local::with(|local| {
+        let (_, note) = local.note_peak(at as usize);
+        hand_over(storage, local, at, done.head);
+        note
+    });
+    super::noted(storage, note);
+    storage.forget_edges(header.edges.swap(0, Ordering::Relaxed));
     storage.set_summary(done.node, ALL);
     header.changed.store(done.changed, Ordering::Relaxed);
     let meta = durability_of(done) | if done.reentered { HEAD } else { 0 };
@@ -1142,11 +1202,11 @@ fn head_round<F: Function>(
     unsafe { put(table, row, value) };
     let view = storage.view_bits();
     if converged {
-        let durability = finalize(storage, done.members, durability_of(done));
-        store_edges(storage, header, at);
-        storage.set_summary(done.node, ALL);
+        let reads = store_cycle_edges(storage, header, at);
+        let meta = finalize(storage, done.members, done.node, reads);
+        storage.set_summary(done.node, reads.summary);
         header.changed.store(view, Ordering::Relaxed);
-        header.meta.store(durability | CYCLE, Ordering::Relaxed);
+        header.meta.store(meta, Ordering::Relaxed);
         header.extra.store(0, Ordering::Relaxed);
         storage.paint(done.node, color(view, view));
         // Release: the final value, published (rule 2).
@@ -1163,6 +1223,16 @@ fn head_round<F: Function>(
         database_key: DatabaseKeyIndex::new(F::ingredient().index(), id),
         iteration: round,
     });
+    // This round's reads go to the cycle's, each once, before they are cut below.
+    let note = local::with(|local| {
+        // Its most before the dedup lowers what it holds.
+        let (_, note) = local.note_peak(at as usize);
+        let start = local.frames[at as usize].edges_start as usize;
+        local.dedup_from(start);
+        let bound = fold_round(local, at);
+        if bound == local::Note::Runaway { bound } else { note }
+    });
+    super::noted(storage, note);
     next_round(storage, done.members);
     let note = local::with(|local| {
         // Its most over the rounds: this round's reads are cut below.
@@ -1209,11 +1279,13 @@ fn next_round(storage: &Storage, from: u32) {
 }
 
 /// Makes every member from `from` final (a stale head is emptied instead): the lowest
-/// durability of the cycle on each, a new stamp, never verified by edges again.
-fn finalize(storage: &Storage, from: u32, durability: u32) -> u32 {
+/// durability of the cycle on each, a new stamp, and one edge, to its head (node `head`), with
+/// the summary of what the whole cycle read (`reads`): a member is proved unchanged exactly when
+/// its head is, whose edges are the cycle's reads. Returns the `meta` of the cycle's rows.
+fn finalize(storage: &Storage, from: u32, head: u32, reads: Converged) -> u32 {
     let members = local::with(|local| local.members.split_off(from as usize)); // alloc: a cycle's end, once
     let view = storage.view_bits();
-    let mut lowest = durability;
+    let mut lowest = reads.durability;
     for &member in &members {
         if let Some(header) = member_header(storage, member)
             && header.verified.load(Ordering::Relaxed) & PROVISIONAL != 0
@@ -1233,15 +1305,172 @@ fn finalize(storage: &Storage, from: u32, durability: u32) -> u32 {
             continue;
         }
         let node = header.node.load(Ordering::Relaxed);
-        storage.set_summary(node, ALL);
+        let span = storage.push_edges(&[head], (member.ingredient, Id::from_u32(member.id)));
+        storage.forget_edges(header.edges.swap(span, Ordering::Relaxed));
+        storage.set_summary(node, reads.summary);
         header.changed.store(view, Ordering::Relaxed);
-        header.meta.store(lowest | CYCLE, Ordering::Relaxed);
+        header.meta.store(lowest | CYCLE | reads.untracked, Ordering::Relaxed);
         header.extra.store(0, Ordering::Relaxed);
         storage.paint(node, color(view, view));
-        // Release: the member's value is final in this view (rule 2).
+        // Release: the member's value, edge and stamp are final in this view (rule 2).
         header.verified.store(view | VALUE, Ordering::Release);
     }
-    lowest
+    lowest | CYCLE | reads.untracked
+}
+
+/// What a converged cycle read outside itself, over every round ([`store_cycle_edges`]).
+#[derive(Clone, Copy)]
+struct Converged {
+    /// The OR of its reads' summaries and its replayed ones', all bits when untracked.
+    summary: Summary,
+    /// The lowest durability it read: `LOW` when untracked, `HIGH` when it read nothing.
+    durability: u32,
+    /// [`UNTRACKED`] when a run of it made an untracked read, else 0.
+    untracked: u32,
+}
+
+/// Hands what the run at `at` read outside its cycle, now that it ended a member of the cycle
+/// headed at `head` (below it), on toward the head:
+///
+/// - what it carries (durability, an untracked read, replayed summaries) to the head's frame;
+/// - its reads in read order: an inner head's earlier rounds' first, then its own run's (which
+///   hold what the runs below it handed it, at their places), then what it was handed while it
+///   ran and could not place;
+/// - left on the stack as its reader's when its reader is a recording run (the next frame below
+///   but barriers): its reader's read of this row comes next, so they sit where they were made,
+///   and the reader, which joins the cycle by that read, hands them on in turn;
+/// - else (a verify asked: the head's own, before it runs, or a row whose run may not read this
+///   one) put straight into the head's gathering, after its earlier rounds: every read reaches
+///   the head however the cycle was met.
+///
+/// So the head's edges are what the cycle read in read order (a read whose key came from an
+/// earlier read comes after it), except a run met only by a verify, whose reads come after the
+/// head's round they were made in.
+fn hand_over(storage: &Storage, local: &mut local::Local, at: u32, head: u32) {
+    debug_assert!(head < at, "a member's head is below it");
+    debug_assert_eq!(at as usize + 1, local.frames.len(), "a member hands over as the top frame");
+    let frame = &local.frames[at as usize];
+    let start = frame.edges_start as usize;
+    let (gathered, round) = (frame.cycle.start as usize, frame.cycle.round as usize);
+    let durability = frame.durability.min(frame.cycle.durability);
+    let untracked = frame.untracked | frame.cycle.untracked;
+    let summary = or(frame.summary, frame.cycle.summary);
+    let cycle = &mut local.frames[head as usize].cycle;
+    cycle.durability = cycle.durability.min(durability);
+    cycle.untracked |= untracked;
+    cycle.summary = or(cycle.summary, summary);
+    if local.cycle_edges.len() > gathered {
+        // An inner head that merges: its earlier rounds before its run's reads, what it was
+        // handed this round after them.
+        let local::Local { edges, cycle_edges, .. } = &mut *local;
+        let round = round.clamp(gathered, cycle_edges.len());
+        // alloc: none once warm: the edge stack grows to its high-water mark once per thread
+        edges.extend_from_slice(&cycle_edges[round..]);
+        edges.splice(start..start, cycle_edges.drain(gathered..round)).for_each(drop);
+        cycle_edges.truncate(gathered);
+    }
+    let top = local.edges.len();
+    let mut below = at as usize;
+    loop {
+        below -= 1;
+        let frame = &mut local.frames[below];
+        match frame.kind {
+            FrameKind::Barrier { .. } => {
+                // Its pop must not cut the reads it is under.
+                frame.edges_start = top as u32;
+            }
+            FrameKind::Run if std::ptr::eq(frame.storage, storage) => {
+                // The reader's: its count of them is its own from here, so it drops their
+                // repeats when it has read as many again ([`local::next_dedup`]), not at once.
+                let from = frame.edges_start as usize;
+                frame.dedup_at = frame.dedup_at.max(local::next_dedup(from, top - from));
+                local.frames[at as usize].edges_start = top as u32;
+                return;
+            }
+            FrameKind::Run | FrameKind::Verify => {
+                give_head(local, head, start);
+                return;
+            }
+        }
+    }
+}
+
+/// Puts the reads on the stack from `start` into the gathering of the head at `head`, at its
+/// end: under the gatherings of the frames above the head, which move up past them.
+fn give_head(local: &mut local::Local, head: u32, start: usize) {
+    let local::Local { edges, cycle_edges, frames, .. } = local;
+    let given = edges.len() - start;
+    if given == 0 {
+        return;
+    }
+    let end = cycle_edges.len();
+    let into = frames.get(head as usize + 1).map_or(end, |it| (it.cycle.start as usize).min(end));
+    // alloc: none once warm: the cycle reads grow to their high-water mark once per thread
+    cycle_edges.splice(into..into, edges[start..].iter().copied()).for_each(drop);
+    for frame in &mut frames[head as usize + 1..] {
+        frame.cycle.start += given as u32;
+        frame.cycle.round += given as u32;
+    }
+}
+
+/// Ends a round of the head at `at` (the top frame) in its gathering: this round's reads on
+/// the stack (in read order, holding what its members handed it) go after its earlier rounds'
+/// and before what was given it this round from verifies ([`give_head`]); then each is kept once,
+/// and the next round's gifts start after. [`local::Note::Runaway`] when the gathering holds
+/// more reads than one run may ([`local::RUN_READS`]): fail the head.
+fn fold_round(local: &mut local::Local, at: u32) -> local::Note {
+    let frame = &mut local.frames[at as usize];
+    let (start, gathered, round) =
+        (frame.edges_start as usize, frame.cycle.start as usize, frame.cycle.round as usize);
+    let (durability, untracked, summary) = (frame.durability, frame.untracked, frame.summary);
+    frame.cycle.durability = frame.cycle.durability.min(durability);
+    frame.cycle.untracked |= untracked;
+    frame.cycle.summary = or(frame.cycle.summary, summary);
+    let local::Local { edges, cycle_edges, .. } = &mut *local;
+    let round = round.max(gathered).min(cycle_edges.len());
+    // alloc: none once warm: the cycle reads grow to their high-water mark once per thread
+    cycle_edges.splice(round..round, edges[start..].iter().copied()).for_each(drop);
+    let held = local.cycle_union(gathered).len() as u64;
+    let next = local.cycle_edges.len() as u32;
+    local.frames[at as usize].cycle.round = next;
+    if held >= local.bounds.run_reads { local::Note::Runaway } else { local::Note::Fine }
+}
+
+/// Stores what the converged cycle headed by the run at `at` read outside itself over every
+/// round, its last round folded in ([`fold_round`]), each once in read order, as the head's
+/// edges, and lets go of them on the stack. Counts the head's last round's reads to its query,
+/// as [`store_edges`] does a run's, with the edges it keeps.
+fn store_cycle_edges(storage: &Storage, header: &Header, at: u32) -> Converged {
+    let (span, ingredient, reads, note, read) = local::with(|local| {
+        debug_assert_eq!(at as usize + 1, local.frames.len(), "a head's edges are stored while it is the top frame");
+        let (most, note) = local.note_peak(at as usize);
+        let frame = &local.frames[at as usize];
+        let (start, owner) = (frame.edges_start as usize, (frame.ingredient, Id::from_u32(frame.id)));
+        let recorded = (local.edges.len() - start) as u64 + frame.dropped;
+        local.dedup_from(start);
+        let bound = fold_round(local, at);
+        let note = if bound == local::Note::Runaway { bound } else { note };
+        let cycle = local.frames[at as usize].cycle;
+        let union = local.cycle_union(cycle.start as usize);
+        let read = if cycle.untracked {
+            Converged { summary: ALL, durability: 0, untracked: UNTRACKED }
+        } else {
+            Converged {
+                summary: or(cycle.summary, storage.summary_of_edges(union)),
+                durability: u32::from(cycle.durability.min(Durability::HIGH.0)),
+                untracked: 0,
+            }
+        };
+        let reads = counts::Reads { recorded, kept: union.len() as u64, most };
+        let span = storage.push_edges(union, owner);
+        local.cycle_edges.truncate(cycle.start as usize);
+        (span, owner.0, reads, note, read)
+    });
+    // The head is still on top: a new mark (or its runaway) names it.
+    super::noted(storage, note);
+    counts::reads(ingredient, reads);
+    storage.forget_edges(header.edges.swap(span, Ordering::Relaxed));
+    read
 }
 
 /// A query on this task's stack (at `at`) asked for again: a cycle through `key`. The asker
@@ -1433,12 +1662,21 @@ fn evict<F: Function>(table: &FnTable<F>, row: &RowOf<F>) -> Option<u64> {
 
 /// Evicts every value of `F`; returns how many.
 pub fn evict_values<F: Function>(db: &mut F::Db) -> usize {
-    let storage = db.storage_mut();
-    let Some(table) = storage.table::<FnTable<F>>(F::ingredient().index()) else { return 0 };
+    evict_table::<F>(db.storage_mut(), F::ingredient().index())
+}
+
+/// [`Explicit::evict`] of `F`, and [`evict_values`]: every value of its table at `index`.
+fn evict_table<F: Function>(storage: &mut Storage, index: u32) -> usize {
+    let Some(table) = storage.table::<FnTable<F>>(index) else { return 0 };
     let evicted = rows::<F>(storage, table).filter(|(_, row)| evict::<F>(table, row).is_some()).count();
     table.values.fetch_sub(evicted, Ordering::Relaxed);
-    counts::add(F::ingredient().index(), counts::DROPPED, evicted as u64);
+    counts::add(index, counts::DROPPED, evicted as u64);
     evicted
+}
+
+/// [`Explicit::values`] of `F`: how many of its rows hold a value, from its counter.
+fn explicit_values<F: Function>(storage: &Storage, index: u32) -> usize {
+    storage.table::<FnTable<F>>(index).map_or(0, |table| table.values.load(Ordering::Relaxed))
 }
 
 /// Evicts the values of `keys` of `F`; returns how many held one.

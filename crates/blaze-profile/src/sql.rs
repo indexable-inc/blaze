@@ -6,6 +6,10 @@
 //! [`views::PRELUDE`], and the file is read back with the `parquet` crate. With `--live`, the
 //! recorder's last seconds are written as Parquet first ([`history::write_live`]) and the views
 //! read them beside the history.
+//!
+//! Each directory is pinned ([`history::Pin`]) before its files are listed, and stays pinned
+//! until DuckDB has exited: the views name those files one by one, and the history's writer
+//! deletes none of them meanwhile, though a merge or the cap retires them.
 
 use std::{
     fmt,
@@ -21,7 +25,7 @@ use arrow_array::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::{
-    history::{self, HistoryError},
+    history::{self, HistoryError, Pin, Snapshot},
     views::{self, ViewError},
 };
 
@@ -288,11 +292,11 @@ pub const THREADS: u32 = 8;
 /// DuckDB's error naming it: never a quiet second route.
 pub const MEMORY_LIMIT: &str = "4GB";
 
-/// The DuckDB script of `sqls` over `dirs`: no extension installed, DuckDB's threads and memory
-/// capped ([`THREADS`], [`MEMORY_LIMIT`]) with spills in `scratch`, the views, then each query
-/// copied to its answer in `scratch` as Parquet ([`answer_in`]).
-fn script(sqls: &[&str], dirs: &[&Path], scratch: &Path) -> Result<String, SqlError> {
-    let prelude = views::prelude(dirs)?;
+/// The DuckDB script of `sqls` over the files of `snapshots`: no extension installed, DuckDB's
+/// threads and memory capped ([`THREADS`], [`MEMORY_LIMIT`]) with spills in `scratch`, the
+/// views, then each query copied to its answer in `scratch` as Parquet ([`answer_in`]).
+fn script(sqls: &[&str], snapshots: &[&Snapshot], scratch: &Path) -> Result<String, SqlError> {
+    let prelude = views::prelude(snapshots)?;
     // In the scratch directory: removed with the query's other files.
     let spill = scratch.join("spill");
     let spill = spill.to_str().ok_or_else(|| SqlError::Answer {
@@ -362,14 +366,18 @@ fn run_in(
         // alloc: an error
         Err(error) => return Err(no_duckdb(&format!("can't be read: {error}"))),
     }
-    // A view's glob that matches no file fails every query, so each directory gets the schema
-    // file of every table before a view opens over it.
+    // A view over no file fails every query, so each directory gets the schema file of every
+    // table before a view opens over it.
     for dir in dirs {
         history::ensure_schemas(dir).map_err(SqlError::History)?;
     }
+    // Held until DuckDB has exited (dropped at the end of this function, on every path): the
+    // files the script names stay on disk until then.
+    let pins = dirs.iter().map(|dir| Pin::take(dir)).collect::<Result<Vec<Pin>, HistoryError>>().map_err(SqlError::History)?; // alloc: a pin a directory, once a query
+    let snapshots: Vec<&Snapshot> = pins.iter().map(Pin::snapshot).collect(); // alloc: once a query
     let script_path = scratch.join("query.sql");
     let init = scratch.join("init.sql");
-    fs::write(&script_path, script(sqls, dirs, scratch)?).map_err(io_error(&script_path, "writing"))?;
+    fs::write(&script_path, script(sqls, &snapshots, scratch)?).map_err(io_error(&script_path, "writing"))?;
     // An empty init file, so the user's ~/.duckdbrc does not change what the query means.
     fs::write(&init, b"").map_err(io_error(&init, "writing"))?;
     let stdin = fs::File::open(&script_path).map_err(io_error(&script_path, "opening"))?;
@@ -389,9 +397,18 @@ fn run_in(
     // process another thread forked holds the writer's copy: its exec is made again, as every
     // spawn of blaze's is.
     let mut child = blaze_core::busy::while_busy(|| command.spawn()).map_err(io_error(duckdb, "running"))?;
-    let Some(status) = ended_or_stopped(&mut child, stop).map_err(io_error(duckdb, "waiting for"))? else {
+    let waited = ended_or_stopped(&mut child, stop);
+    if waited.is_err() {
+        // Not heard to end: killed and reaped before the pins go, so it reads no file after.
+        _ = child.kill();
+        _ = child.wait();
+    }
+    let Some(status) = waited.map_err(io_error(duckdb, "waiting for"))? else {
         return Err(SqlError::Stopped);
     };
+    // DuckDB has exited (or was killed and reaped): it reads no file of the pins any more.
+    drop(snapshots);
+    drop(pins);
     let stderr = fs::read(&stderr_path).map_err(io_error(&stderr_path, "reading"))?;
     let refused = |message: String| SqlError::Duckdb {
         message,
@@ -454,10 +471,12 @@ mod tests {
 
     #[test]
     fn the_script_installs_nothing_and_copies_one_query_out() {
-        let script = script(&["SELECT 1 ;\n", "SELECT 2"], &[Path::new("/h")], Path::new("/tmp/it's")).unwrap();
+        let listing = ["schema.spans.parquet".to_owned()];
+        let snapshot = Snapshot::resolve(Path::new("/h"), &listing, &history::retire::Retired::default());
+        let script = script(&["SELECT 1 ;\n", "SELECT 2"], &[&snapshot], Path::new("/tmp/it's")).unwrap();
         assert!(script.starts_with("SET autoinstall_known_extensions = false;"));
         assert!(script.contains("SET threads = 8;\nSET memory_limit = '4GB';\nSET temp_directory = '/tmp/it''s/spill';\n"), "{script}");
-        assert!(script.contains("read_parquet(['/h/*.spans.parquet'], union_by_name = true)"));
+        assert!(script.contains("read_parquet(['/h/schema.spans.parquet'], union_by_name = true)"));
         assert!(
             script.ends_with(
                 "COPY (\nSELECT 1\n) TO '/tmp/it''s/answer.parquet' (FORMAT parquet, COMPRESSION zstd);\n\

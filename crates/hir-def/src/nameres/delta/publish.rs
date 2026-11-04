@@ -250,17 +250,20 @@ impl Slices {
 
 // What the maintainer sets.
 
-/// A module's scope input after a run: made for a new module, set where the scope or the
-/// children changed. Whether it set anything.
+/// A module's scope input after a run: made for a new module (of `krate`'s kind,
+/// [`base_db::crate_durability`]), set where the scope or the children changed. Whether it set
+/// anything.
 pub(super) fn set_scope(
     db: &mut Db,
+    krate: Crate,
     slot: &mut Option<ScopeInput>,
     module: ModuleId,
     scope: ItemScope,
     children: FxIndexMap<Name, ModuleId>,
 ) -> bool {
     let Some(input) = *slot else {
-        *slot = Some(ScopeInput::new(db, module, scope, children));
+        let durability = base_db::crate_durability(&*db, krate);
+        *slot = Some(ScopeInput::new(db, durability, module, scope, children));
         return true;
     };
     let mut set = false;
@@ -314,6 +317,7 @@ pub(super) fn set_resolution(
     let Some(it) = *slot else {
         let it = CrateResolution::new(
             db,
+            base_db::crate_durability(&*db, krate),
             root,
             modules.expect("nameres delta: a crate's first resolution has its modules"),
             local,
@@ -387,7 +391,8 @@ pub(super) fn enter(db: &mut Db, krate: Crate, resolution: Option<CrateResolutio
             if let Some(it) = resolution {
                 crates.insert(krate, it);
             }
-            _ = Resolutions::builder(crates).durability(Durability::LOW).new(db);
+            // MEDIUM: set only as a crate gains or loses its state; std's def maps read it too.
+            _ = Resolutions::new(db, Durability::MEDIUM, crates);
         }
     }
 }

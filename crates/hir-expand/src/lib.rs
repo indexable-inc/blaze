@@ -967,13 +967,17 @@ impl MacroCallId {
     fn proc_macro_expansion(
         self,
         db: &Db,
-    ) -> (ExpandResult<tt::TopSubtree>, proc_macro::ExpansionReads) {
+    ) -> (ExpandResult<tt::TopSubtree>, proc_macro::ExpansionReads, proc_macro::StateUse) {
         let loc = self.loc(db);
         let (macro_arg, undo_info, _) = self.macro_arg_considering_derives(db, &loc.kind);
         if let Some(refusal) = self.arg_refusal(db, &loc.kind) {
             let empty = tt::TopSubtree::empty(macro_arg.top_subtree().delimiter.delim_span());
             db.files().expansions_are_read(loc.krate, base_db::ReadBy::Call(self.into()), Vec::new());
-            return (ExpandResult::new(empty, refusal), proc_macro::ExpansionReads::Nothing);
+            return (
+                ExpandResult::new(empty, refusal),
+                proc_macro::ExpansionReads::Nothing,
+                proc_macro::StateUse::Fixed,
+            );
         }
 
         let (ast, expander) = match loc.def.kind {
@@ -986,9 +990,9 @@ impl MacroCallId {
             _ => None,
         };
 
-        // A report left by an expansion that panicked is not this one's.
-        proc_macro::take_reads();
-        let ExpandResult { value: mut tt, err } = {
+        // The expander states what the call read and whether its session's state took part
+        // (`proc_macro::Expanded`): nothing here guesses either for it.
+        let proc_macro::ProcMacroExpansion { result: ExpandResult { value: mut tt, err }, reads, state } = {
             let span = proc_macro_span(db, ast);
             expander.expand(
                 db,
@@ -1001,15 +1005,14 @@ impl MacroCallId {
                 span_with_mixed_site_ctxt(db, span, self.into(), loc.def.edition),
             )
         };
-        let reported = proc_macro::take_reads();
-        let reads = match expander.requires_session(db, loc.def.krate) {
-            true => proc_macro::ExpansionReads::Unknown(
-                "its macro keeps a session: an expansion depends on the calls before it",
-            ),
-            false => reported.unwrap_or(proc_macro::ExpansionReads::Unknown(
-                "its expander reported nothing of what it read",
-            )),
-        };
+        // A call whose output may depend on the calls before it read its session's state, which
+        // lives in the expander: it runs again in every revision, in the order its readers ask
+        // for it, so the session is built again in order, and keeps its value when it gives the
+        // same. A call that is fixed by its call and reads (a stateless crate's, or a shown call
+        // of a crate that settles) reads nothing outside the database and is reused.
+        if let proc_macro::StateUse::Session(why) = state {
+            blaze_query::db::report_untracked_read(db, blaze_query::db::Untracked { what: why });
+        }
         // What keys a value by the crate's reads (a unit's record) reads them from the log, which
         // has this call's latest expansion only: one that was unknown and traces now replaces it.
         let logged = match &reads {
@@ -1025,7 +1028,7 @@ impl MacroCallId {
 
         fixup::reverse_fixups(&mut tt, undo_info);
 
-        (ExpandResult { value: tt, err }, reads)
+        (ExpandResult { value: tt, err }, reads, state)
     }
 }
 
@@ -1036,9 +1039,15 @@ impl MacroCallId {
     }
 
     /// What the expansion of this proc-macro call read besides its call, as its expander
-    /// reported it (`proc_macro::report_reads`). Panics for a call of another kind of macro.
+    /// stated it (`proc_macro::Expanded::reads`). Panics for a call of another kind of macro.
     pub fn expansion_reads(self, db: &Db) -> &proc_macro::ExpansionReads {
         &self.proc_macro_expansion(db).1
+    }
+
+    /// Whether what this proc-macro call gave depends on its session's state, as its expander
+    /// stated it (`proc_macro::Expanded::state`). Panics for a call of another kind of macro.
+    pub fn expansion_state(self, db: &Db) -> proc_macro::StateUse {
+        self.proc_macro_expansion(db).2
     }
 
     /// The proc macro this calls, as `def_crate` loaded it, and whether its calls from the

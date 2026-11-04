@@ -144,6 +144,9 @@ struct Scratch {
     /// The crates' work, from a pass's nodes ([`run_nodes`]) to its end ([`finish`]).
     jobs: Vec<Job>,
     slots: Vec<(Crate, DirectorySlot)>,
+    /// The impls of the crates the pass resets ([`reset`]), whose read sets go in one
+    /// [`forget_reset`] once every crate's job is out.
+    reset: Vec<ImplId>,
 }
 
 /// One crate's buffers, kept from one write to the next: what its work in a run uses, and what
@@ -245,7 +248,9 @@ pub(crate) fn prepare(db: &mut Db, state: &mut State, written: &Written<'_>) {
         if frozen::served(&*db, krate) || state.crates.contains_key(&krate) {
             continue;
         }
-        let slot = DirectorySlot::new(&*db, krate, blaze_query::db::Slot::empty(publish::slot_name(&*db, krate)));
+        let durability = base_db::crate_durability(&*db, krate);
+        let empty = blaze_query::db::Slot::empty(publish::slot_name(&*db, krate));
+        let slot = DirectorySlot::new(&*db, durability, krate, empty);
         state.crates.insert(krate, CrateState { published: Published::unpublished(slot), ..CrateState::default() });
         slots.push((krate, slot));
     }
@@ -268,6 +273,7 @@ fn cost_key(db: &Db, krate: Crate) -> u64 {
 /// workers; the jobs kept for [`finish`].
 pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &Written<'_>) {
     let crates = base_db::all_crates(db);
+    let waking = tracing::info_span!(target: "blaze", "impls woken", count = last.crates.len()).entered();
     let scratch = &mut state.scratch;
     scratch.deltas.clear();
     scratch.names.clear();
@@ -289,14 +295,23 @@ pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &
     if changed {
         scratch.woken.extend(state.wild.iter().copied());
     }
+    drop(waking);
     let mut jobs = std::mem::take(&mut state.scratch.jobs);
     jobs.clear();
-    for &krate in crates.iter() {
-        if frozen::served(db, krate) {
-            continue;
+    {
+        let _span = tracing::info_span!(target: "blaze", "impls start", count = crates.len()).entered();
+        let mut reset_impls = std::mem::take(&mut state.scratch.reset);
+        reset_impls.clear();
+        for &krate in crates.iter() {
+            if frozen::served(db, krate) {
+                continue;
+            }
+            let delta = state.scratch.deltas.get(&krate).copied();
+            jobs.push(start_crate(state, last, krate, delta, &mut reset_impls));
         }
-        let delta = state.scratch.deltas.get(&krate).copied();
-        jobs.push(start_crate(state, last, krate, delta));
+        forget_reset(state, &reset_impls);
+        reset_impls.clear();
+        state.scratch.reset = reset_impls;
     }
     let _span = tracing::info_span!(target: "blaze", "impls nodes", count = jobs.len()).entered();
     // alloc: once per pass, a node's index and cost key per crate maintained
@@ -738,8 +753,15 @@ pub(crate) fn finish(db: &mut Db, state: &mut State, out: &mut Vec<ImplsDelta>) 
 }
 
 /// Takes `krate`'s state out for its work, forgetting what it held first when name resolution
-/// maintains it from empty (`fresh`).
-fn start_crate(state: &mut State, last: &LastWrite, krate: Crate, delta: Option<usize>) -> Job {
+/// maintains it from empty (`fresh`): its impls go on `reset_impls`, whose read sets and owners
+/// the caller forgets once every crate's job is out ([`forget_reset`]).
+fn start_crate(
+    state: &mut State,
+    last: &LastWrite,
+    krate: Crate,
+    delta: Option<usize>,
+    reset_impls: &mut Vec<ImplId>,
+) -> Job {
     let fresh = delta.is_some_and(|at| last.crates[at].fresh);
     let Some(mut crate_state) = state.crates.remove(&krate) else {
         panic!("impls: crate {krate:?} has no state: step 0 ([`prepare`]) gives every crate one");
@@ -753,7 +775,7 @@ fn start_crate(state: &mut State, last: &LastWrite, krate: Crate, delta: Option<
     let mut scratch = std::mem::take(&mut crate_state.scratch);
     scratch.start();
     if fresh {
-        crate_state = reset(state, crate_state, &mut scratch);
+        crate_state = reset(crate_state, &mut scratch, reset_impls);
         let (traits, heads, names) = crate_state.published.keys();
         scratch.trait_keys.extend(traits);
         scratch.head_keys.extend(heads);
@@ -774,6 +796,24 @@ fn drop_gone(state: &mut State, crates: &[Crate]) {
             forget_reads(state, *imp);
             state.owner.remove(imp);
         }
+    }
+}
+
+/// Forgets the read sets and owners of the impls of every crate the pass reset, at once: a proc
+/// macro or build script reaching most crates resets most impls, and their read sets are most
+/// of the index, which a sweep drops in one pass ([`ReadIndex::forget_many`]) on the loop's
+/// thread while no crate's node runs yet. Nothing between the resets and here reads the index
+/// or the owners: the impls the write woke were read from them first.
+fn forget_reset(state: &mut State, impls: &[ImplId]) {
+    if impls.is_empty() {
+        return;
+    }
+    let _span = tracing::info_span!(target: "blaze", "impls reset", count = impls.len()).entered();
+    state.by_name.forget_many(impls.iter().copied());
+    state.by_def.forget_many(impls.iter().copied());
+    for imp in impls {
+        state.wild.remove(imp);
+        state.owner.remove(imp);
     }
 }
 
@@ -881,12 +921,10 @@ fn replay(state: &mut State, scratch: &mut CrateScratch, krate: Crate) {
 }
 
 /// Forgets what a crate held, keeping its published inputs and buffers: a crate maintained
-/// from empty sets every slice it had anew, emptied where it has no rows now.
-fn reset(state: &mut State, old: CrateState, scratch: &mut CrateScratch) -> CrateState {
-    for imp in old.impls.keys() {
-        forget_reads(state, *imp);
-        state.owner.remove(imp);
-    }
+/// from empty sets every slice it had anew, emptied where it has no rows now. Its impls go on
+/// `reset_impls`, for [`forget_reset`].
+fn reset(old: CrateState, scratch: &mut CrateScratch, reset_impls: &mut Vec<ImplId>) -> CrateState {
+    reset_impls.extend(old.impls.keys().copied());
     scratch.keys_changed.extend(old.impls.keys().copied());
     scratch.traits_changed.extend(old.assoc.keys().copied());
     CrateState { published: old.published, ..CrateState::default() }

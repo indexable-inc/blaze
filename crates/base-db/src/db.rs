@@ -147,13 +147,14 @@ impl Db {
     pub fn for_tests() -> Db {
         let log = std::sync::Arc::new(EventLog::default()); // alloc: a test database's setup
         let mut db = Db::with(Run::Here, Some(log));
-        _ = LibraryRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&mut db);
-        _ = LocalRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&mut db);
+        _ = LibraryRoots::new(&mut db, Durability::MEDIUM, Default::default());
+        _ = LocalRoots::new(&mut db, Durability::MEDIUM, Default::default());
         CrateGraphBuilder::default().set_in_db(&mut db);
         db
     }
 
     fn with(run: Run, log: Option<std::sync::Arc<EventLog>>) -> Db {
+        blaze_query::db::name_rows(name_row);
         let traced = executions::traced();
         let callback = (log.is_some() || traced).then(|| {
             let log = log.clone(); // clone: an `Arc` of the test log, once per database
@@ -722,6 +723,29 @@ impl fmt::Debug for Db {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("base_db::Db").field("run", &self.run).finish_non_exhaustive()
     }
+}
+
+/// The profile's name of an input's row ([`blaze_query::db::RowNamer`]): a file's text by the
+/// path its source root has it at (its `FileId` where it has none), so the run log says which
+/// file's edit made a query run again. Called with the database the log is taken with
+/// attached; any other row is left to its ID.
+fn name_row(ingredient: &'static str, id: blaze_query::db::Id, out: &mut String) -> bool {
+    use std::fmt::Write as _;
+    blaze_query::db::with_attached_db::<Db, _>(|db| {
+        let Some(db) = db else { return false };
+        match ingredient {
+            "FileText" => {
+                let Some(text) = <FileText as blaze_query::db::FromIdIn>::from_id_in(blaze_query::db::Database::storage(db), id) else { return false };
+                let file = text.file_id(db);
+                match db.path_for_file(file) {
+                    Some(path) => _ = write!(out, "{path}"),
+                    None => _ = write!(out, "{file:?}"),
+                }
+                true
+            }
+            _ => false,
+        }
+    })
 }
 
 impl blaze_query::db::Database for Db {

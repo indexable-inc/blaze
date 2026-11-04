@@ -221,9 +221,9 @@ impl Files {
                         Some(input) if input.source_root_id(&*db) == root => {}
                         Some(input) => set(input.set_source_root_id(db), durability, root),
                         None => {
-                            let builder = FileSourceRootInput::builder(root)
-                                .durability(durability.unwrap_or(Durability::MEDIUM));
-                            self.file_source_roots.set(file.index(), Some(builder.new(&*db)));
+                            let durability = durability.unwrap_or(Durability::MEDIUM);
+                            let input = FileSourceRootInput::new(&*db, durability, root);
+                            self.file_source_roots.set(file.index(), Some(input));
                         }
                     }
                     writer.crate_attrs.insert(file, krate);

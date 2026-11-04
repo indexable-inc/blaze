@@ -7,8 +7,8 @@
 //! had been kept. What is dropped:
 //!
 //! - every MIR of every body, built, runtime, optimized, specialized and monomorphized, of closures and
-//!   coroutines too: once code is stored, codegen does not read it again, and the borrow check
-//!   and constant evaluation keep their own results;
+//!   coroutines too, by its tag ([`drop_mir`]): once code is stored, codegen does not read it
+//!   again, and the borrow check and constant evaluation keep their own results;
 //! - the inference results of the bodies given;
 //! - the value of every constant and static evaluated: what codegen stored it as is read in
 //!   its place, and a constant evaluation that needs one again computes it.
@@ -17,9 +17,8 @@
 //! ([`hir_ty_borrowck::checked`]) read them on every build.
 
 use base_db::{Crate, Db};
+use blaze_query::db::Database as _;
 use hir_def::{DefWithBodyId, nameres::demand::crate_body_owners};
-
-use crate::mir;
 
 /// What [`drop_crates_after_store`] let go, by how many values: what its span and the release's
 /// line say.
@@ -78,41 +77,19 @@ pub fn drop_after_store(db: &mut Db, compiled: &[DefWithBodyId]) {
     hir_ty::evict::drop_inference(db, compiled);
 }
 
-/// Drops every MIR the database holds; returns how many.
+/// Drops every MIR the database holds; returns how many. Every MIR is the request's: a
+/// function tagged `mem_tag = Mir` whose values go only when asked (`lru = 0`) is a MIR of a
+/// body (built, runtime, optimized, specialized, monomorphized, promoted, of closures and
+/// coroutines), or what one is made from (a coroutine's witnesses, a body's location
+/// literals), and each is let go by its tag ([`blaze_query::db::Storage::evict_tag`]), so a
+/// MIR query added later goes with the rest, never kept for want of a line here. A build lets
+/// go of them all as it ends, a check's too (`blaze-cargo`'s release): only their memos stay,
+/// for the next build to verify against.
 pub fn drop_mir(db: &mut Db) -> usize {
-    let mut dropped = 0;
-    dropped += mir::mir_body_query::evict_values(db);
-    dropped += mir::mir_body_for_closure_query::evict_values(db);
-    dropped += mir::mir_body_for_coroutine_query::evict_values(db);
-    dropped += mir::mir_body_for_coroutine_by_move_query::evict_values(db);
-    dropped += mir::promoted_mir_body_query::evict_values(db);
+    db.storage_mut().evict_tag(blaze_mem::Tag::Mir)
+}
 
-    dropped += mir::runtime_mir_body_query::evict_values(db);
-    dropped += mir::runtime_mir_body_for_closure_query::evict_values(db);
-    dropped += mir::runtime_mir_body_for_coroutine_query::evict_values(db);
-    dropped += mir::runtime_mir_body_for_coroutine_by_move_query::evict_values(db);
-    dropped += mir::runtime_promoted_mir_body_query::evict_values(db);
-
-    dropped += mir::optimized_mir_body_query::evict_values(db);
-    dropped += mir::optimized_mir_body_for_closure_query::evict_values(db);
-    dropped += mir::optimized_mir_body_for_coroutine_query::evict_values(db);
-    dropped += mir::optimized_mir_body_for_coroutine_by_move_query::evict_values(db);
-    dropped += mir::specialized_mir_body::evict_values(db);
-
-    dropped += mir::monomorphized_mir_body_query::evict_values(db);
-    dropped += mir::monomorphized_mir_body_for_closure_query::evict_values(db);
-    dropped += mir::monomorphized_mir_body_for_coroutine_query::evict_values(db);
-    dropped += mir::monomorphized_mir_body_for_coroutine_by_move_query::evict_values(db);
-    dropped += mir::monomorphized_promoted_mir_body_query::evict_values(db);
-
-    dropped += mir::monomorphized_runtime_mir_body_query::evict_values(db);
-    dropped += mir::monomorphized_runtime_mir_body_for_closure_query::evict_values(db);
-    dropped += mir::monomorphized_runtime_mir_body_for_coroutine_query::evict_values(db);
-    dropped += mir::monomorphized_runtime_mir_body_for_coroutine_by_move_query::evict_values(db);
-
-    dropped += mir::monomorphized_optimized_mir_body_query::evict_values(db);
-    dropped += mir::monomorphized_optimized_mir_body_for_closure_query::evict_values(db);
-    dropped += mir::monomorphized_optimized_mir_body_for_coroutine_query::evict_values(db);
-    dropped += mir::monomorphized_optimized_mir_body_for_coroutine_by_move_query::evict_values(db);
-    dropped
+/// How many MIR values the database holds ([`drop_mir`]'s), from counters.
+pub fn mir_held(db: &Db) -> usize {
+    db.storage().values_of(blaze_mem::Tag::Mir)
 }

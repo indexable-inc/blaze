@@ -1590,6 +1590,7 @@ mod tests {
             live: base.join("live"),
             report: base.join("report"),
             not_inputs: vec![cmd.clone()],
+            given: None,
         };
         let (c, echo, hi) = (OsStr::new("/c"), OsStr::new("echo"), OsStr::new("hi>"));
 
@@ -1872,6 +1873,7 @@ mod tests {
             live: base.join("live"),
             report: base.join("report"),
             not_inputs: vec![cmd],
+            given: None,
         };
         // SAFETY: both values were just duplicated for this run, and nothing else names them.
         assert_eq!(run(&spec, unsafe { Given::adopt(&handed) }), Ok(3));

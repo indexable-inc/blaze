@@ -21,7 +21,7 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 use cfg::CfgAtom;
 use hir_expand::proc_macro::{
-    ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
+    Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
     ProcMacrosBuilder,
 };
 use intern::Symbol;
@@ -138,7 +138,7 @@ struct Replay {
 impl std::panic::RefUnwindSafe for Replay {}
 
 impl ProcMacroExpander for Replay {
-    fn expand(&self, _: &Db, call: ProcMacroCall<'_>) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+    fn expand(&self, _: &Db, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
         let recorded = Call {
             krate: self.krate.clone(),
             name: self.name.clone(),
@@ -154,8 +154,10 @@ impl ProcMacroExpander for Replay {
             }
         };
         let output = output.map_err(ProcMacroExpansionError::Panic)?;
-        syntax_bridge::parse_to_token_tree_static_span(Edition::CURRENT, call.call_site, &output)
-            .ok_or_else(|| ProcMacroExpansionError::System("the expansion does not lex".into()))
+        let tree = syntax_bridge::parse_to_token_tree_static_span(Edition::CURRENT, call.call_site, &output)
+            .ok_or_else(|| ProcMacroExpansionError::System("the expansion does not lex".into()))?;
+        // The pack keeps what each call gave, not what the macro read when it was recorded.
+        Ok(Expanded::untraced(tree, "a pack's recorded expansion: what its macro read when it was recorded is not kept"))
     }
 
     // dyn: hir-expand's `ProcMacroExpander::eq_dyn`, when a crate's macros are set.

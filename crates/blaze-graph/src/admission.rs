@@ -14,8 +14,10 @@
 //! quantile of what the kind held lately (the most of the last [`WINDOW`] peaks, approached by
 //! halves), never under the last peak seen, never over the most ever seen.
 //!
-//! A task's peak is everything it held: what it allocated through the global allocator
-//! (`arena::measure`) and what its frames held (`blaze_mem::frame`). Each kind belongs to a
+//! A task's peak is everything it held: what its work allocated through the global allocator,
+//! on its own job and on every job of the pool scopes it opened (its memory account,
+//! `arena::account`), never a sample of the whole process, and what its frames held
+//! (`blaze_mem::frame`). Each kind belongs to a
 //! subsystem ([`tag_of`]), and each subsystem has a budget, a share of the machine's
 //! ([`set_budgets`]): the scheduler holds back a task of a subsystem over its budget
 //! (`blaze_mem::tag::over_budget`) before the machine's budget is reached.
@@ -83,6 +85,30 @@ pub mod kinds {
     pub const STORE_KEPT: TaskKind = TaskKind(0x1_000f);
 }
 
+/// The name of one of the daemon's own task kinds ([`kinds`]), as a profile's `task` span
+/// says it; `None` for a query kind, which its query's name says.
+pub const fn name_of(kind: TaskKind) -> Option<&'static str> {
+    Some(match kind {
+        kinds::PLAN => "plan",
+        kinds::FETCH => "fetch",
+        kinds::LIBRARY => "library",
+        kinds::LOWER => "lower",
+        kinds::COMPILE => "compile",
+        kinds::REACH => "reach",
+        kinds::WALK => "walk",
+        kinds::UB_TESTS => "ub tests",
+        kinds::EVALUATE => "evaluate",
+        kinds::PROGRAM => "program",
+        kinds::UNIT_NAMES => "unit names",
+        kinds::UNIT_BODIES => "unit bodies",
+        kinds::UNIT_LINK => "unit link",
+        kinds::UNIT_STORE => "unit store",
+        kinds::PROGRAM_LINK => "program link",
+        kinds::STORE_KEPT => "store kept",
+        _ => return None,
+    })
+}
+
 /// The subsystem whose memory a task of `kind` holds: whose budget holds it back.
 ///
 /// Query kinds go by `blaze_query::kinds`' ranges (inputs, facts `0x1000`, the front end
@@ -116,14 +142,15 @@ pub const fn tag_of(kind: TaskKind) -> Tag {
 
 /// Runs `f` as a task of `kind`: in a [`blaze_mem::frame::task`] of [`tag_of`]`(kind)`, so
 /// what it allocates from the global heap is charged to that subsystem's line and not to the
-/// heap outside any task, and says the most it held: its global allocations
-/// ([`crate::arena::measure`]) and its frames' together, the peak [`Estimates`] learn from.
+/// heap outside any task, and says the most it held: its global allocations, its fan-out's
+/// included ([`crate::arena::account`]), and its frames' together, the peak [`Estimates`]
+/// learn from.
 /// Every runner of tasks (the exec scheduler's, the daemon's plane) runs a task's work through
 /// this, so a task's memory has one home whoever runs it.
 pub fn run_as<R>(kind: TaskKind, f: impl FnOnce() -> R) -> (R, u64) {
     let tag = tag_of(kind);
     let ((out, bytes), frames) =
-        blaze_mem::frame::measure(|| crate::arena::measure(|| blaze_mem::frame::task(tag, |_| f())));
+        blaze_mem::frame::measure(|| crate::arena::account(|| blaze_mem::frame::task(tag, |_| f())));
     (out, bytes + frames as u64)
 }
 

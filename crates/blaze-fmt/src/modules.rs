@@ -64,15 +64,39 @@ pub(crate) struct ModResolver<'ast, 'psess> {
     directory: Directory,
     file_map: FileModMap<'ast>,
     recursive: bool,
+    /// blaze: every `mod` whose file could not be resolved, in the order met. The walk goes on
+    /// past each one, so one run names them all instead of stopping at the first.
+    errors: Vec<ModuleResolutionError>, // alloc: a crate's resolution errors, reported once
 }
 
 /// Represents errors while trying to resolve modules.
 #[derive(Debug, Error)]
-#[error("failed to resolve mod `{module}`: {kind}")]
+#[error("failed to resolve `mod {module}` declared at {declared_at}: {kind}")]
 pub struct ModuleResolutionError {
     pub(crate) module: String,
+    /// blaze: where the `mod` is declared (`file:line:col`), so the error names both the missing
+    /// file and the declaration that points at it.
+    pub(crate) declared_at: String,
     pub(crate) kind: ModuleResolutionErrorKind,
 }
+
+/// blaze: every module of one crate that could not be resolved, one per line.
+#[derive(Debug)]
+pub struct ModuleResolutionErrors(pub(crate) Vec<ModuleResolutionError>);
+
+impl std::fmt::Display for ModuleResolutionErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (at, error) in self.0.iter().enumerate() {
+            if at > 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ModuleResolutionErrors {}
 
 /// Defines variants similar to those of [crate::expand_module::ModError]
 #[derive(Debug, Error)]
@@ -116,14 +140,18 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
             file_map: BTreeMap::new(),
             psess,
             recursive,
+            errors: Vec::new(),
         }
     }
 
     /// Creates a map that maps a file name to the module in AST.
+    ///
+    /// blaze: the map holds every module that resolved; the second value is every one that did
+    /// not (`None` when all did), so a caller formats what it can and reports the rest in one go.
     pub(crate) fn visit_crate(
         mut self,
         krate: &'ast ast::Crate,
-    ) -> Result<FileModMap<'ast>, ModuleResolutionError> {
+    ) -> (FileModMap<'ast>, Option<ModuleResolutionErrors>) {
         let root_filename = self.psess.span_to_filename(krate.spans.inner_span);
         self.directory.path = match root_filename {
             FileName::Real(ref p) => p.parent().unwrap_or(Path::new("")).to_path_buf(),
@@ -132,7 +160,9 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
 
         // Skip visiting sub modules when the input is from stdin.
         if self.recursive {
-            self.visit_mod_from_ast(&krate.items)?;
+            if let Err(error) = self.visit_mod_from_ast(&krate.items) {
+                self.errors.push(error);
+            }
         }
 
         let snippet_provider = self.psess.snippet_provider(krate.spans.inner_span);
@@ -146,7 +176,8 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
                 &krate.attrs,
             ),
         );
-        Ok(self.file_map)
+        let errors = (!self.errors.is_empty()).then(|| ModuleResolutionErrors(self.errors));
+        (self.file_map, errors)
     }
 
     /// Visit `cfg_if` macro and look for module declarations.
@@ -259,7 +290,16 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
         sub_mod: Module<'ast>,
     ) -> Result<(), ModuleResolutionError> {
         let old_directory = self.directory.clone();
-        let sub_mod_kind = self.peek_sub_mod(item, &sub_mod)?;
+        // blaze: a `mod` that does not resolve is recorded with where it is declared, and the
+        // walk goes on to its siblings (keep-going); nothing under it can be visited anyway.
+        let sub_mod_kind = match self.peek_sub_mod(item, &sub_mod) {
+            Ok(kind) => kind,
+            Err(mut error) => {
+                error.declared_at = self.psess.span_to_debug_info(item.span);
+                self.errors.push(error); // alloc: kept until the crate reports
+                None
+            }
+        };
         if let Some(sub_mod_kind) = sub_mod_kind {
             self.insert_sub_mod(sub_mod_kind.clone())?;
             self.visit_sub_mod_inner(sub_mod, sub_mod_kind)?;
@@ -388,10 +428,12 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
                 ))),
                 Err(ParserError::ParseError) => Err(ModuleResolutionError {
                     module: mod_name.to_string(),
+                    declared_at: String::new(),
                     kind: ModuleResolutionErrorKind::ParseError { file: path },
                 }),
                 Err(..) => Err(ModuleResolutionError {
                     module: mod_name.to_string(),
+                    declared_at: String::new(),
                     kind: ModuleResolutionErrorKind::NotFound { file: path },
                 }),
             };
@@ -455,10 +497,12 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
                     }
                     Err(ParserError::ParseError) => Err(ModuleResolutionError {
                         module: mod_name.to_string(),
+                        declared_at: String::new(),
                         kind: ModuleResolutionErrorKind::ParseError { file: file_path },
                     }),
                     Err(..) if outside_mods_empty => Err(ModuleResolutionError {
                         module: mod_name.to_string(),
+                        declared_at: String::new(),
                         kind: ModuleResolutionErrorKind::NotFound { file: file_path },
                     }),
                     Err(..) => {
@@ -486,12 +530,14 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
 
                     Err(ModuleResolutionError {
                         module: mod_name.to_string(),
+                        declared_at: String::new(),
                         kind: ModuleResolutionErrorKind::NotFound { file: default_path },
                     })
                 }
                 ModError::MultipleCandidates(default_path, secondary_path) => {
                     Err(ModuleResolutionError {
                         module: mod_name.to_string(),
+                        declared_at: String::new(),
                         kind: ModuleResolutionErrorKind::MultipleCandidates {
                             default_path,
                             secondary_path,

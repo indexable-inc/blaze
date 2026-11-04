@@ -83,8 +83,11 @@ that build and that `blaze-history` ended, never answered with an older build's 
    uses parts.
 3. **Against the last compute** (`blaze-cargo` `serve/why.rs`, `Ledger`, sans-IO): a miss
    with parts is compared with what the ledger holds of the same step and subject, from the
-   last build that computed it **and ended well** (a failed or cancelled build's computes may
-   not be kept, so it moves nothing on). Builds between may have reused it under another key,
+   last build that computed it, however that build ended: a failed or cancelled build moves
+   the ledger on too (a keep-going build that failed computed what it computed, under the key
+   it names), recorded as not ended well; the next miss of the same key, nothing kept under it,
+   reads as `Unfinished`: that compute likely failed or was stopped. Recording only builds that ended well left a run of failed builds with every miss
+   read as `First`. Builds between may have reused it under another key,
    so each cause names the build it is compared with ("since it was last computed, in build N").
    - `First`: the ledger has no record of the subject.
    - `Parts`: the key changed, and the parts that changed are named.
@@ -92,6 +95,8 @@ that build and that `blaze-history` ended, never answered with an older build's 
      does not name. That is a bug in the producer.
    - `Lost`: the key is the same, yet nothing is kept under it now: that compute did not keep
      it, or it was collected since.
+   - `Unfinished`: the key is the same, nothing is kept under it, and the build that last
+     computed it did not end well: that compute likely failed or was stopped.
    - `Beyond`: the key is the same, so what the value is filed under past the key differs, or
      that compute did not keep it. Which of the two it was is not explained yet.
    - `Twice`: two different misses of one step under one subject in one build. Neither is
@@ -115,7 +120,7 @@ that build and that `blaze-history` ended, never answered with an older build's 
   `blaze why ledger` and the first 16 bytes of the version: a hash of the encoding of a record
   with every field set and of a naming version (bumped when part names or subjects are made
   another way), so any change is a new version. Only types the ledger owns are written: one
-  framed deterministic-CBOR record per build that ended well, the subjects it computed with
+  framed deterministic-CBOR record per build, however it ended, the subjects it computed with
   their key, parts and kept entry; a compacted record also carries the gap and the newest build
   a dropped subject was last computed in.
   - **Restore**, on the history's thread after the daemon has started (answers say "still

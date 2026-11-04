@@ -80,8 +80,8 @@ use serde::{Deserialize, Serialize};
 /// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`]. 33:
 /// [`Status::bugs`]. 34: [`Request::FetchUrl`] and [`Response::Stored`]. 35:
 /// [`Status::settings`]. 36: an [`ApiError`] is its [`Report`] (docs/v2/plan/structured-output.md),
-/// [`Response::Report`], and [`Behind::id`].
-pub const SCHEMA: u32 = 36;
+/// [`Response::Report`], and [`Behind::id`]. 37: [`RebuildCause::Unfinished`].
+pub const SCHEMA: u32 = 37;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -426,6 +426,10 @@ pub enum RebuildCause {
     /// Its key is the one it had when last computed, in build `since`, yet nothing is kept
     /// under it: that compute did not keep it.
     Lost { since: u64 },
+    /// Its key is the one it had when last computed, in build `since`, which did not end well
+    /// (it failed or was stopped), and nothing is kept under it: that compute likely failed or
+    /// was stopped before it kept anything.
+    Unfinished { since: u64 },
     /// Its key is the one it had when last computed, in build `since`, so what its value is
     /// filed under past the key differs, or that compute did not keep it: `what` is filed
     /// beyond the key, which blaze does not explain yet.

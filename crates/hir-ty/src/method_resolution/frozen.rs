@@ -42,7 +42,7 @@ pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
             it.set_maps(db).with_durability(Durability::HIGH).to(maps);
         }
         None => {
-            _ = FrozenImpls::builder(maps).durability(Durability::HIGH).new(db);
+            _ = FrozenImpls::new(db, Durability::HIGH, maps);
         }
     }
 }

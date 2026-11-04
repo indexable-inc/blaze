@@ -926,6 +926,7 @@ fn windows_backend(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) ->
         live: PathBuf::new(),
         report: PathBuf::new(),
         not_inputs: Vec::with_capacity(0),
+        given: None,
     };
     let code = windows::run(&confined, windows::Given::own())?;
     if let Some(file) = &spec.record {

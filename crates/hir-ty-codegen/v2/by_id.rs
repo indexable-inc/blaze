@@ -29,6 +29,17 @@ impl Hashes for ById {
         Ok(CodeHash(by_id("test code", body)))
     }
 
+    /// The code itself: a test's bodies are told apart by id, so none share a template.
+    fn template_code(&self, db: &Db, body: Body) -> Result<CodeHash, String> {
+        self.code(db, body)
+    }
+
+    /// None: a test's bodies read no file's name, and their told locals are keyed by their
+    /// arguments (`HirFrontend::generic_args`).
+    fn names_read(&self, _: &Db, _: Body, _: bool) -> Result<(ContentId, bool), String> {
+        Ok((ContentId::default(), true))
+    }
+
     fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
         Ok(blaze_query::db::attach(db, || by_id("test type", ty)))
     }

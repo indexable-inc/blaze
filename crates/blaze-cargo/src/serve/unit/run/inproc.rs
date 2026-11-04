@@ -144,8 +144,11 @@ pub(crate) fn not_in_process(job: &Job, unit: usize) -> Result<Option<String>, S
     })
 }
 
-/// The daemon's dev executables by path, for a run to start from, and the host their runs
-/// attach through, made at the first one's link: one for the daemon's life ([`super::super::Shared`]).
+/// The daemon's dev executables by every path a run starts them from (the path the link makes
+/// and the copy cargo runs it from, [`commit`]'s `runs_from`), and the host their runs attach
+/// through, made at the first one's link: one for the daemon's life ([`super::super::Shared`]).
+/// Nothing is ever taken out: a kept link image let go past its budget
+/// ([`crate::serve::job`]'s `kept link images evict`) drops the image, never its program here.
 pub(crate) struct DevRuns {
     /// Where the host listens: the daemon's state directory's `inproc`.
     dir: PathBuf,
@@ -186,7 +189,7 @@ impl DevRuns {
         }
         let Some(format) = Format::host() else { return Ok(None) };
         if reserves(format, std::path::Path::new(path))? {
-            return Err(unheld(path));
+            return Err(self.unheld(path));
         }
         Ok(None)
     }
@@ -196,17 +199,34 @@ impl DevRuns {
     /// error naming it ([`unheld`]), never a run of its file.
     pub(crate) fn loaded(&self, path: &str) -> Result<Arc<Loaded>, String> {
         // clone: a count, once per program or test binary started
-        self.programs.pin().get(path).cloned().ok_or_else(|| unheld(path))
+        self.programs.pin().get(path).cloned().ok_or_else(|| self.unheld(path))
     }
-}
 
-/// Why the dev executable at `path` can't start: this daemon holds no code memory of it.
-fn unheld(path: &str) -> String {
-    format!(
-        "{path} is a dev executable (linked to run on the daemon's code memory), and this daemon holds no code \
-         memory of it: an earlier daemon linked it. Edit the program, or remove the file, and run again so this \
-         daemon links it"
-    )
+    /// Why the dev executable at `path` can't start: this daemon holds no code memory under
+    /// that path. One it holds under another path of the same file name (a run asking for a
+    /// copy its link did not register, [`commit`]'s `runs_from`) is named, as a bug of blaze's,
+    /// never taken for this one; else an earlier daemon linked it (nothing here is ever let go).
+    fn unheld(&self, path: &str) -> String {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let programs = self.programs.pin();
+        // alloc: error path, the paths held under the same file name
+        let mut held: Vec<&str> =
+            programs.keys().map(String::as_str).filter(|it| it.rsplit('/').next() == Some(name)).collect();
+        held.sort_unstable();
+        match held.is_empty() {
+            true => format!(
+                "{path} is a dev executable (linked to run on the daemon's code memory), and this daemon holds no code \
+                 memory of it: an earlier daemon linked it (this daemon lets go of no dev executable it linked). Edit \
+                 the program, or remove the file, and run again so this daemon links it"
+            ),
+            false => format!(
+                "{path} is a dev executable (linked to run on the daemon's code memory), and this daemon holds no code \
+                 memory under that path, only under {}: the run asks for a path its link did not register as one the \
+                 program runs from (a bug of blaze's: each link registers every path its program is placed at)",
+                held.join(", ")
+            ),
+        }
+    }
 }
 
 /// Whether the executable at `path` reserves address space for a code memory's arena: a dev
@@ -246,10 +266,16 @@ pub(crate) enum Told {
 /// the code memory its runs map, as a patch they apply, when it was placed into the room the
 /// image kept; else into a new code memory, and the runs of the old one told to start again.
 /// `kept` is the image's program, from its last link; `cells` the counter cells its
-/// [`DevRun`] reserves. Gives the file's bytes, for the store, and what the runs were told.
+/// [`DevRun`] reserves. `runs_from` is the copy of the file a run starts it from when that is
+/// not `path` (a test's program linked in its unit's directory and run from the profile's
+/// `deps`, cargo's new layout; a binary's `target/debug/foo` of `deps/foo-0123`): the program
+/// is held under both, so a run of either finds the memory this link committed into. Gives
+/// the file's bytes, for the store, and what the runs were told.
+#[expect(clippy::too_many_arguments, reason = "the link's image, its program and where it runs from, each its own")]
 pub(crate) fn commit(
     runs: &DevRuns,
     path: &str,
+    runs_from: Option<&str>,
     image: &mut Image,
     kept: &mut Option<Arc<Loaded>>,
     staged: Staged,
@@ -260,6 +286,9 @@ pub(crate) fn commit(
         .entered();
     if let Some(loaded) = kept.as_ref().filter(|_| !staged.full()) {
         let made = loaded.patch(image, staged, refused);
+        // A patch keeps the memory: every path it runs from names it still (and one a link
+        // before this registered under no copy now does).
+        hold(runs, path, runs_from, loaded);
         drop(span);
         return made;
     }
@@ -268,20 +297,39 @@ pub(crate) fn commit(
     let (loaded, bytes) = load(&host, name, image, staged, cells)?;
     let loaded = Arc::new(loaded);
     *kept = Some(loaded.clone());
-    // alloc: once per dev executable laid out whole, its path
-    let old = runs.programs.pin().insert(path.to_owned(), loaded).cloned();
-    let told = match old {
-        Some(old) if old.running() => {
-            // alloc: once per restart, its reason
-            let why = format!("{path} was linked again from scratch: its code is laid out anew");
-            old.restart(&why);
-            Told::Restart { why }
-        }
+    let mut told = Told::Nothing;
+    for old in hold(runs, path, runs_from, &loaded) {
         // No run maps the old memory: nothing to tell.
-        Some(_) | None => Told::Nothing,
-    };
+        if !old.running() {
+            continue;
+        }
+        // alloc: once per restart, its reason
+        let why = format!("{path} was linked again from scratch: its code is laid out anew");
+        old.restart(&why);
+        told = Told::Restart { why };
+    }
     drop(span);
     Ok((bytes, told))
+}
+
+/// `loaded` held under `path` and `runs_from`, the paths its runs start it from; the other
+/// programs it replaced there, each once.
+fn hold(runs: &DevRuns, path: &str, runs_from: Option<&str>, loaded: &Arc<Loaded>) -> Vec<Arc<Loaded>> {
+    let programs = runs.programs.pin();
+    let mut replaced: Vec<Arc<Loaded>> = Vec::new(); // alloc: none unless a program is replaced
+    for at in std::iter::once(path).chain(runs_from.filter(|it| *it != path)) {
+        if programs.get(at).is_some_and(|it| Arc::ptr_eq(it, loaded)) {
+            continue;
+        }
+        // alloc: once per dev executable laid out whole (or a copy newly registered), its path
+        // clone: a count, the program held under one more path
+        if let Some(old) = programs.insert(at.to_owned(), loaded.clone()).cloned()
+            && !replaced.iter().any(|it| Arc::ptr_eq(it, &old))
+        {
+            replaced.push(old);
+        }
+    }
+    replaced
 }
 
 /// The newest patch of a program's image, for the runs that ask; `generation` is the last

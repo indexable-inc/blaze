@@ -163,6 +163,15 @@ struct Units {
     /// a generic it asks for is then keyed by its arguments as well
     /// ([`HirFrontend::generic_args`]).
     tells: ByOrigin<Result<bool, PlanError>>,
+    /// Some origin's units tell a debugger of their named locals: what an instance every
+    /// origin may compile ([`user_compiled`]) is keyed as.
+    tells_any: bool,
+    /// Whether some unit of the origin puts names or places of its own in its compiled code
+    /// beside its positions ([`names_of`]): its template is then kept under its code, never its
+    /// template code ([`Hashes::template_code`]).
+    names: ByOrigin<Result<bool, PlanError>>,
+    /// Some origin's units do, as [`Self::any`] for inlining.
+    names_any: bool,
     /// Every options a unit of the origin may build a body with ([`Build::options`]), by
     /// whether the body is of the library's crates: what a generic it asks for has its compile
     /// identity under ([`hir_ty_identity::instance_identity`]).
@@ -178,6 +187,9 @@ impl Units {
         });
         let any = inlines.values().any(|it| it == &Ok(true));
         let tells = ByOrigin::of(policy, |origin| tells_of(policy, origin));
+        let tells_any = tells.values().any(|it| it == &Ok(true));
+        let names = ByOrigin::of(policy, |origin| names_of(policy, origin));
+        let names_any = names.values().any(|it| it == &Ok(true));
         let crates = base_db::all_crates(db);
         let mut by_build: HashMap<Build, Asked, Global> = HashMap::new_in(Global);
         let options = builds.map(|it| -> Result<Compiled, String> {
@@ -189,7 +201,7 @@ impl Units {
             }
             Ok(Compiled { lang: options_set(&asked.lang)?, other: options_set(&asked.other)? })
         });
-        Units { inlines, any, tells, options }
+        Units { inlines, any, tells, tells_any, names, names_any, options }
     }
 }
 
@@ -200,6 +212,22 @@ fn tells_of(policy: &Policy, origin: &Origin) -> Result<bool, PlanError> {
     let choice = policy.choose(origin, None)?;
     let told = |spec: &blaze_codegen::settings::Spec| spec.debuginfo.tells_locals();
     Ok(told(&choice.first) || choice.then.as_ref().is_some_and(told))
+}
+
+/// Whether a unit of `origin` puts in its compiled code names or places a template keyed by
+/// its template code ([`Hashes::template_code`]) would leave out, at its first spec or the spec
+/// a live build tiers it up to: a PGO build's profile record names the function by its path
+/// (`pgo::name`), and a report's rows (`Spec::report`) are of absolute positions in its side
+/// table.
+fn names_of(policy: &Policy, origin: &Origin) -> Result<bool, PlanError> {
+    let choice = policy.choose(origin, None)?;
+    // A sanitizing unit reads names too: SanitizerCoverage is off for a `__sanitizer_*`
+    // symbol (`backend::unsanitized`), and LLVM's sanitizers write descriptors that name the
+    // globals and frames they guard.
+    let named = |spec: &blaze_codegen::settings::Spec| {
+        spec.report || !matches!(spec.pgo, blaze_codegen::settings::Pgo::None) || !spec.sanitize.is_empty()
+    };
+    Ok(named(&choice.first) || choice.then.as_ref().is_some_and(named))
 }
 
 /// How the units of `origin` build bodies: at its first spec, at the spec a live build tiers
@@ -381,6 +409,26 @@ impl<'db> HirFrontend<'db> {
         of_origin.as_ref().copied().map_err(|it| it.to_string()) // alloc: the error's message
     }
 
+    /// What `of` says of the units of `origin` (by origin, and whether any origin's does) for
+    /// `instance`: as [`Self::inlines_as`], one answer for every requester of an instance its
+    /// users compile.
+    fn units_as(
+        &self,
+        db: &Db,
+        instance: &HirInstance,
+        origin: &Origin,
+        of: fn(&Units) -> (&ByOrigin<Result<bool, PlanError>>, bool),
+    ) -> Result<bool, String> {
+        let Some(units) = &self.units else { return Err(NO_POLICY.to_owned()) }; // alloc: an error
+        let (by_origin, any) = of(units);
+        match crate_of(db, &instance.0) {
+            Some(_) if !user_compiled(db, &instance.0) => {
+                by_origin.get(origin).as_ref().copied().map_err(|it| it.to_string()) // alloc: the error's message
+            }
+            _ => Ok(any),
+        }
+    }
+
     /// A function that is not generic, as a root of the build: `main`, a test, an exported
     /// function.
     pub fn root(&self, func: FunctionId) -> HirInstance {
@@ -438,7 +486,32 @@ impl<'db> HirFrontend<'db> {
         let built_in_code = built_in_code(db, hashes, &instance.0).map_err(fail)?;
         // A body built against the program's dyn facts is keyed by those it read (rule 18). A
         // copy of it built into a caller is built against none: `built_in_code`.
-        let code = super::devirt::code(built_in_code, refs::read(db, instance, walking).map_err(fail)?);
+        let read = refs::read(db, instance, walking).map_err(fail)?;
+        let told = self.units_as(db, instance, &origin, |it| (&it.tells, it.tells_any)).map_err(fail)?;
+        // What its compiled function reads of names beside its code (the files its `file!()`
+        // names, its told locals' types) is in every key of it (rule 20), its link code's as
+        // its template code's: read once, folded into both ([`with_names`]).
+        let body = kind_body(&instance.0);
+        let names = body.map(|body| hashes.names_read(db, body, told)).transpose().map_err(fail)?;
+        let code = with_names(super::devirt::code(built_in_code, read), names.map(|it| it.0));
+        // Its template is kept under its template code, which holds no name and no place, when
+        // all its positions are its own tables' and its code is its body's alone: none inlined
+        // from another body (`inlined`, a unit's inliner; `lang`, the library's bodies, which
+        // `Build::options` always inlines as shipped), no report rows or PGO record naming it
+        // (`Units::names`), and a body of its own (no shim's declaration, no `main`'s start).
+        // The template then holds its positions by table and the instance fills its own
+        // anchors (docs/v2/plan/design/name-free-identity.md).
+        let lang = crate_of(db, &instance.0).is_some_and(|it| it.data(db).origin.is_lang());
+        let named = self.units_as(db, instance, &origin, |it| (&it.names, it.names_any)).map_err(fail)?;
+        let held = match (inlined || lang || named, names) {
+            (false, Some((names, true))) => template_code_of(db, hashes, &instance.0, names).map_err(fail)?,
+            // A told local's type holding an alias, or no body of its own: kept under its code.
+            _ => None,
+        };
+        let (template_code, anchors) = match held {
+            Some((own, owner)) => (super::devirt::code(own, read), Some(hashes.anchors(db, owner).map_err(fail)?)),
+            None => (code, None),
+        };
         let plain = args_of(db, hashes, &instance.0).map_err(fail)?;
         let args = match generic {
             true => {
@@ -467,6 +540,8 @@ impl<'db> HirFrontend<'db> {
         Ok(Described {
             item,
             code,
+            template_code,
+            anchors,
             built_in_code,
             args,
             origin,
@@ -1016,8 +1091,12 @@ fn rooted<'db>(db: &'db Db, func: FunctionId, args: GenericArgs<'db>) -> HirInst
 /// caller's code. The callee's node holds this code and [`inlined`] names it by it, so the two
 /// compare (`blaze-codegen` `driver`'s `unkept_inline`); its own unit's code may hash the dyn
 /// facts it read beside it ([`super::devirt::code`]).
+///
+/// A copy bakes in the names of the files its `file!()` reads as its own unit's does, so they
+/// are folded in ([`with_names`], untold: a copy's locals are its caller's to tell).
 pub(crate) fn built_in_code(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String> {
-    code_of(db, hashes, kind)
+    let names = kind_body(kind).map(|body| hashes.names_read(db, body, false)).transpose()?;
+    Ok(with_names(code_of(db, hashes, kind)?, names.map(|it| it.0)))
 }
 
 /// The code hashes of the bodies the compile of `instance` built in, sorted, each once, each by
@@ -1153,6 +1232,8 @@ const ASM_DOMAIN: &str = "blaze v2 asm 1";
 const START_DOMAIN: &str = "blaze v2 start 1";
 /// A cached function's code with the code of its body it writes ([`fncache::written_code`]).
 const CACHED_DOMAIN: &str = "blaze v2 cached function 1";
+/// A code with what its body reads of names beside it ([`with_names`]).
+const WITH_NAMES_DOMAIN: &str = "blaze v2 code with names read 1";
 /// The PGO name of an instance hashes this ID ([`blaze_items::pgo`]), so the profile lints
 /// compute a plain function's name with the same domain.
 use blaze_items::pgo::ARGS_DOMAIN;
@@ -1208,26 +1289,7 @@ fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String
         Ok(CodeHash(hasher.finish()))
     };
     match instance.def {
-        InstanceDef::Fn(func) => {
-            let code = hashes.code(db, Body::Item(func.into()))?;
-            let written = blaze_query::db::attach(db, || fncache::written_code(db, func, instance, env));
-            let Some(written) = written else {
-                return Ok(code);
-            };
-            let mut hasher = Hasher::new(CACHED_DOMAIN);
-            hasher.id(&code.0);
-            match written {
-                Ok(hash) => hasher.update(&[0]).update(&hash.to_le_bytes()),
-                Err(fncache::Uncached::Impure(why)) => hasher.update(&[1]).update(why.as_bytes()),
-                // The body has no code identity: the function has no code either (rule 3).
-                // clone: the error owns its text; the query keeps its own
-                Err(fncache::Uncached::Refused(why)) => return Err(why.clone()),
-                // The body reaches what blaze can't compile: the function has no code either.
-                // alloc: the error's message
-                Err(fncache::Uncached::Uncompiled(it)) => return Err(it.to_string()),
-            };
-            Ok(CodeHash(hasher.finish()))
-        }
+        InstanceDef::Fn(func) => cached(db, hashes.code(db, Body::Item(func.into()))?, func, instance, env),
         InstanceDef::Closure(id) => hashes.code(db, Body::Closure(id)),
         InstanceDef::Coroutine(id) => hashes.code(db, Body::Coroutine(id)),
         InstanceDef::CoroutineByMove(id) => hashes.code(db, Body::CoroutineByMove(id)),
@@ -1246,6 +1308,86 @@ fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String
             shim(if receiver { 5 } else { 4 }, adapted)
         }
     }
+}
+
+/// `code`, of the body of `func` as `instance` runs it in `env`, with what the function cache
+/// keys of it ([`fncache::written_code`]): [`code_of`]'s and [`template_code_of`]'s one rule.
+fn cached(
+    db: &Db,
+    code: CodeHash,
+    func: FunctionId,
+    instance: &Instance,
+    env: &hir_ty::traits::StoredParamEnvAndCrate,
+) -> Result<CodeHash, String> {
+    let written = blaze_query::db::attach(db, || fncache::written_code(db, func, instance, env));
+    let Some(written) = written else {
+        return Ok(code);
+    };
+    let mut hasher = Hasher::new(CACHED_DOMAIN);
+    hasher.id(&code.0);
+    match written {
+        Ok(hash) => hasher.update(&[0]).update(&hash.to_le_bytes()),
+        Err(fncache::Uncached::Impure(why)) => hasher.update(&[1]).update(why.as_bytes()),
+        // The body has no code identity: the function has no code either (rule 3).
+        // clone: the error owns its text; the query keeps its own
+        Err(fncache::Uncached::Refused(why)) => return Err(why.clone()),
+        // The body reaches what blaze can't compile: the function has no code either.
+        // alloc: the error's message
+        Err(fncache::Uncached::Uncompiled(it)) => return Err(it.to_string()),
+    };
+    Ok(CodeHash(hasher.finish()))
+}
+
+/// What the template of `kind` is kept under when its positions are its own body's, as
+/// [`code_of`] makes its code: its body's [`Hashes::template_code`] with `names`, what it reads
+/// of names ([`Hashes::names_read`], folded into its code as well), and
+/// the body whose span tables its positions are in. `None` for an instance whose template may
+/// hold what is not its own (a shim's declaration of the function it adapts, `main`'s start,
+/// the allocator's, `asm!`), or whose body is written in no body of its own: kept under its
+/// code.
+fn template_code_of(
+    db: &Db,
+    hashes: &HashSource,
+    kind: &Kind,
+    names: ContentId,
+) -> Result<Option<(CodeHash, DefWithBodyId)>, String> {
+    let Kind::Code(instance, env) = kind else { return Ok(None) };
+    let Some(body) = kind_body(kind) else { return Ok(None) };
+    let Some(owner) = blaze_query::db::attach(db, || super::hashes::span_owner(db, body)) else {
+        return Ok(None);
+    };
+    let code = with_names(hashes.template_code(db, body)?, Some(names));
+    match instance.def {
+        InstanceDef::Fn(func) => Ok(Some((cached(db, code, func, instance, env)?, owner))),
+        _ => Ok(Some((code, owner))),
+    }
+}
+
+/// The body `kind` is compiled from, `None` for a shim, `main`'s start, the allocator's or
+/// `asm!`, which are written in no body of their own.
+fn kind_body(kind: &Kind) -> Option<Body> {
+    let Kind::Code(instance, _) = kind else { return None };
+    match instance.def {
+        InstanceDef::Fn(func) => Some(Body::Item(func.into())),
+        InstanceDef::Closure(id) => Some(Body::Closure(id)),
+        InstanceDef::Coroutine(id) => Some(Body::Coroutine(id)),
+        InstanceDef::CoroutineByMove(id) => Some(Body::CoroutineByMove(id)),
+        InstanceDef::DropGlue
+        | InstanceDef::CallOnceShim
+        | InstanceDef::VtableShim(_)
+        | InstanceDef::FnPointerShim
+        | InstanceDef::ReifyShim { .. } => None,
+    }
+}
+
+/// `code` with what its compiled body reads of names beside it ([`Hashes::names_read`]):
+/// the files its `file!()` names and its told locals' types. A body with none of its own (a
+/// shim, `main`'s start, the allocator's, `asm!`) keeps `code`.
+fn with_names(code: CodeHash, names: Option<ContentId>) -> CodeHash {
+    let Some(names) = names else { return code };
+    let mut hasher = Hasher::new(WITH_NAMES_DOMAIN);
+    hasher.id(&code.0).id(&names);
+    CodeHash(hasher.finish())
 }
 
 /// The content ID of an instance's generic arguments, regions left out.

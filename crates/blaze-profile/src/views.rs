@@ -1,17 +1,17 @@
 //! The named views over the history, as data: the one list both the explorer's `views` and
 //! `view` ops and `blaze explain <view> <args>` read. Each view's SQL is a section of
 //! `sql/examples.sql`, cut out at compile time; [`PRELUDE`] (`sql/views.sql`) defines the tables
-//! and views that SQL reads, over the directories [`prelude`] is given.
+//! and views that SQL reads, over the files of the directories [`prelude`] is given.
 
-use std::{fmt, fmt::Write as _, path::Path};
+use std::{fmt, fmt::Write as _};
 
 use serde_json::{Map, Value};
 
-use crate::schema;
+use crate::{history::Snapshot, schema};
 
 /// The DuckDB views every query runs after: one a table, and `queries`, `passes`,
 /// `fiber_stacks`, `job_waits`, `job_spans` and `span_sums`. Each
-/// `@<table>` in it is a list of globs, filled in by [`prelude`].
+/// `@<table>` in it is a list of files, filled in by [`prelude`].
 pub const PRELUDE: &str = include_str!("../sql/views.sql");
 
 const EXAMPLES: &str = include_str!("../sql/examples.sql");
@@ -78,14 +78,29 @@ const ENDED_BUILD: Arg = Arg {
 const LIMIT: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("20") };
 const EARLIER: Arg = Arg { name: "earlier", ty: ArgType::Text, default: None };
 const LATER: Arg = Arg { name: "later", ty: ArgType::Text, default: None };
+/// The build a key is diffed against: by default, the last at or before the one before the
+/// last build with key parts (`key_part_diff` takes the last that computed the same thing).
+const BEFORE: Arg = Arg {
+    name: "before",
+    ty: ArgType::U64,
+    default: Some("(SELECT max(build_id) - 1 FROM key_parts)"),
+};
+/// The build whose key is diffed: by default, the last with key parts.
+const AFTER: Arg = Arg { name: "after", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM key_parts)") };
 
 pub const VIEWS: &[View] = &[
     view("slowest_queries", &[BUILD, LIMIT]),
     view("slower_between_commits", &[EARLIER, LATER, LIMIT]),
-    view("memo_hit_rate_per_crate", &[BUILD]),
+    view("memo_hit_rate_per_query_kind", &[BUILD, LIMIT]),
     view("critical_path", &[ENDED_BUILD, LIMIT]),
     view("allocations_per_query_kind", &[BUILD]),
     view("what_reran", &[BUILD, LIMIT]),
+    view("why_reran", &[BUILD, LIMIT]),
+    view("untracked_reads", &[BUILD, LIMIT]),
+    view("cycle_reruns", &[BUILD, LIMIT]),
+    view("key_part_diff", &[BEFORE, AFTER, LIMIT]),
+    view("task_memory", &[BUILD]),
+    view("admission_waits", &[BUILD, LIMIT]),
     view("busiest_threads", &[BUILD, LIMIT]),
     view("longest_gaps", &[BUILD, LIMIT]),
     view("top_cpu_stacks", &[BUILD, LIMIT]),
@@ -203,7 +218,7 @@ pub enum ViewError {
     /// `$<name>` in the view's SQL, or `@<name>` in the prelude, that names no argument or
     /// table: a bug in the SQL files.
     Undeclared { view: &'static str, name: String },
-    /// A directory a glob can't be made of.
+    /// A history directory or file DuckDB can't be given by its path.
     BadPath { path: String, why: &'static str },
 }
 
@@ -247,7 +262,7 @@ impl fmt::Display for ViewError {
             ViewError::Undeclared { view, name } => {
                 write!(f, "the SQL of {view} names `{name}`, which is no argument or table of it")
             }
-            ViewError::BadPath { path, why } => write!(f, "the directory {path} {why}"),
+            ViewError::BadPath { path, why } => write!(f, "the history path {path} {why}"),
         }
     }
 }
@@ -362,44 +377,54 @@ pub(crate) fn quote(text: &str, out: &mut String) {
     out.push('\'');
 }
 
-/// [`PRELUDE`] reading each table from `<dir>/*.<table>.parquet` of every directory of `dirs`,
-/// then each view of [`VIEWS`] whose arguments all have defaults as a DuckDB view of that name
-/// (the latest build, the default limit), so a query can say `FROM uncovered_time`. Other
+/// [`PRELUDE`] reading each table from the files of it of every snapshot of `snapshots` (each a
+/// directory a reader pinned, [`crate::history::Pin`]), named one by one: never a glob, which
+/// DuckDB would expand again at each query and could find files the pin does not hold. Then
+/// each view of [`VIEWS`] whose arguments all have defaults as a DuckDB view of that name (the
+/// latest build, the default limit), so a query can say `FROM uncovered_time`. Other
 /// arguments take `blaze explain <view> <args>`.
-pub fn prelude(dirs: &[&Path]) -> Result<String, ViewError> {
+pub fn prelude(snapshots: &[&Snapshot]) -> Result<String, ViewError> {
     // alloc: the prelude, once a query
-    let mut globs: Vec<&str> = Vec::with_capacity(dirs.len());
-    for dir in dirs {
+    let mut dirs: Vec<&str> = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        let dir = snapshot.dir();
         let path = dir.to_str().ok_or_else(|| ViewError::BadPath {
             // alloc: an error, once a request
             path: dir.display().to_string(),
-            why: "is not UTF-8, and DuckDB's globs are",
+            why: "is not UTF-8, and the paths DuckDB is given are",
         })?;
-        if path.contains(['*', '?', '[', ']', '{', '}']) {
-            // alloc: an error, once a request
-            return Err(ViewError::BadPath { path: path.to_owned(), why: "has a character DuckDB's globs expand" });
-        }
-        globs.push(path.trim_end_matches('/'));
+        dirs.push(path.trim_end_matches('/'));
     }
+    let files: usize = snapshots.iter().map(|it| (0..schema::TABLES.len()).map(|at| it.files(at).len()).sum::<usize>()).sum();
     // alloc: the prelude, once a query
-    let mut out = String::with_capacity(PRELUDE.len() + 256 * dirs.len());
+    let mut out = String::with_capacity(PRELUDE.len() + 64 * files);
     let mut copied = 0;
     scan(PRELUDE, |it| {
         if it.sigil != b'@' {
             return Ok(());
         }
-        let Some(table) = schema::TABLES.iter().find(|table| table.name == it.name) else {
+        let Some(table) = schema::TABLES.iter().position(|table| table.name == it.name) else {
             // alloc: an error, a bug in views.sql
             return Err(ViewError::Undeclared { view: "views.sql", name: it.name.to_owned() });
         };
         out.push_str(&PRELUDE[copied..it.at]);
         out.push('[');
-        for (i, dir) in globs.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
+        let mut first = true;
+        for (snapshot, dir) in snapshots.iter().zip(&dirs) {
+            for name in snapshot.files(table) {
+                // alloc: a file's path, once a file a query
+                let path = format!("{dir}/{name}");
+                // DuckDB expands a glob in any path of the list, so a path holding one would
+                // read other files, or none.
+                if path.contains(['*', '?', '[', ']', '{', '}']) {
+                    return Err(ViewError::BadPath { path, why: "has a character DuckDB's globs expand" });
+                }
+                if !first {
+                    out.push_str(", ");
+                }
+                first = false;
+                quote(&path, &mut out);
             }
-            // alloc: the prelude, once a query
-            quote(&format!("{dir}/*.{}.parquet", table.name), &mut out);
         }
         out.push(']');
         copied = it.end;
@@ -540,13 +565,25 @@ mod tests {
 
     #[test]
     fn the_prelude_lists_each_tables_files_in_every_directory() {
-        let sql = prelude(&[Path::new("/state/profile/"), Path::new("/tmp/it's live")]).unwrap();
+        use std::path::Path;
+
+        use crate::history::retire::Retired;
+        let names = |it: &[&str]| it.iter().map(|it| (*it).to_owned()).collect::<Vec<String>>();
+        let state = Snapshot::resolve(
+            Path::new("/state/profile/"),
+            &names(&["schema.spans.parquet", "1-00000002.spans.parquet", "1-00000001.counters.parquet", "owner.lock"]),
+            &Retired::default(),
+        );
+        let live = Snapshot::resolve(Path::new("/tmp/it's live"), &names(&["live.spans.parquet"]), &Retired::default());
+        let sql = prelude(&[&state, &live]).unwrap();
         assert!(sql.contains(
-            "read_parquet(['/state/profile/*.spans.parquet', '/tmp/it''s live/*.spans.parquet'], union_by_name = true)"
-        ));
+            "read_parquet(['/state/profile/1-00000002.spans.parquet', '/state/profile/schema.spans.parquet', \
+             '/tmp/it''s live/live.spans.parquet'], union_by_name = true)"
+        ), "{sql}");
         assert!(!sql.contains("@spans") && !sql.contains("@heap_by_owner"));
         assert!(sql.contains("`@<table>`"), "a comment's text is left alone");
-        let error = prelude(&[Path::new("/tmp/a*b")]).unwrap_err();
+        let bad = Snapshot::resolve(Path::new("/tmp/a*b"), &names(&["schema.spans.parquet"]), &Retired::default());
+        let error = prelude(&[&bad]).unwrap_err();
         assert!(matches!(error, ViewError::BadPath { .. }), "{error:?}");
     }
 
@@ -566,7 +603,7 @@ mod tests {
         "having", "in", "is", "join", "last", "left", "like", "limit", "not", "null", "nulls",
         "on", "or", "order", "over", "partition", "qualify", "recursive", "replace", "select",
         "then", "union", "union_by_name", "using", "view", "when", "where", "with", "true",
-        "false", "rows", "unbounded", "preceding", "bigint", "cross", "ubigint", "varchar",
+        "false", "rows", "unbounded", "preceding", "bigint", "cross", "ubigint", "varchar", "full",
     ];
     /// DuckDB's functions the SQL files call.
     const FUNCTIONS: &[&str] = &[

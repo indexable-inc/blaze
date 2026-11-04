@@ -219,27 +219,38 @@ impl TemplateView<'_> {
     /// The function of instance `key` whose references are `refs`: [`Template::instantiate`]
     /// of the template the view is of, each part copied once.
     pub fn instantiate(self, key: InstanceKey, refs: &Refs) -> Result<CompiledFunction, TemplateError> {
+        self.instantiate_at(key, refs, None)
+    }
+
+    /// [`Self::instantiate`] for an instance whose own span tables are anchored at `anchors`:
+    /// each position the template holds in its own tables ([`own_anchor`]) is given its
+    /// instance's anchor.
+    pub fn instantiate_at(
+        self,
+        key: InstanceKey,
+        refs: &Refs,
+        anchors: OwnAnchors<'_>,
+    ) -> Result<CompiledFunction, TemplateError> {
         check_refs(refs)?;
         counts_its_own(self.relocs.targets(), self.profile.as_ref())?;
         if refs_len(refs) != self.refs {
             return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
         }
         frame::task(Tag::Codegen, |frame| {
-            let data = instantiate_data(self.data, refs, self.externs, &key.0, frame)?;
+            let data = instantiate_data(self.data, refs, self.externs, &key.0, anchors, frame)?;
             Ok(CompiledFunction {
                 key,
                 arch: self.arch,
                 align: self.align,
                 // alloc: the instance's code, kept by the build
                 code: self.code.to_vec(),
-                relocs: instantiate_relocs(self.relocs, refs, self.externs, &data, None, Some(key), frame)?,
+                relocs: instantiate_relocs(self.relocs, refs, self.externs, &data, None, Some(key), anchors, frame)?,
                 unwind: self.unwind.map(|it| instantiate_unwind(it, refs, &data)).transpose()?,
                 data,
                 // alloc: kept by the build
                 inlined: self.inlined.to_vec(),
                 side: self.side,
-                // alloc: kept by the build
-                lines: self.lines.to_vec(),
+                lines: absolute_lines(self.lines, anchors)?,
                 coverage: self.coverage,
                 profile: self.profile,
             })
@@ -320,6 +331,9 @@ pub enum TemplateError {
     ProfileCounters,
     /// Data or a static names a function's own code ([`Ref::Own`]), which only its code can.
     Own,
+    /// A position of the template is in table `n` of its instance's own ([`own_anchor`]), and
+    /// it was instantiated with no anchors of its own to fill it.
+    OwnPosition(u32),
 }
 
 impl std::fmt::Display for TemplateError {
@@ -361,11 +375,71 @@ impl std::fmt::Display for TemplateError {
             TemplateError::Own => {
                 write!(f, "data or a static names a function's own code, which only that code can")
             }
+            TemplateError::OwnPosition(table) => write!(
+                f,
+                "a position is in span table {table} of the instance's own, and the instance was given no \
+                 anchors of its own (`Described::anchors`)"
+            ),
         }
     }
 }
 
-pub const TEMPLATE_DOMAIN: &str = "blaze v2 template 4";
+pub const TEMPLATE_DOMAIN: &str = "blaze v2 template 5";
+
+/// How many span tables a body has: what an instance's own anchors are
+/// ([`crate::backend::Described::anchors`]), one per kind of span the front end tells apart.
+pub const OWN_TABLES: usize = 6;
+
+pub const OWN_ANCHOR_DOMAIN: &str = "blaze v2 template own span table 1";
+
+/// The anchor a template names table `table` of its instance's own span tables by: a template
+/// kept under a key with no name or place in it (`Described::template_code`) holds its own
+/// positions so, and each instance made of it is given back its own anchors, so two items
+/// whose bodies are written alike share one template and each reports where it is written
+/// (docs/v2/plan/design/name-free-identity.md). No span table is anchored so: an anchor is a
+/// content ID of its own domain.
+pub fn own_anchor(table: usize) -> ContentId {
+    OWN_ANCHORS[table]
+}
+
+static OWN_ANCHORS: std::sync::LazyLock<[ContentId; OWN_TABLES]> = std::sync::LazyLock::new(|| {
+    std::array::from_fn(|table| ContentId::of(OWN_ANCHOR_DOMAIN, &(table as u32).to_le_bytes()))
+});
+
+/// An instance's own anchors, in table order; `None` for one whose template keeps every
+/// position as compiled.
+pub type OwnAnchors<'a> = Option<&'a [ContentId; OWN_TABLES]>;
+
+/// `span` as a template holds it: in table `n` of `own`, by [`own_anchor`]; else as it is.
+fn relative(span: SpanRef, own: OwnAnchors<'_>) -> SpanRef {
+    match own.and_then(|own| own.iter().position(|it| *it == span.anchor)) {
+        Some(table) => SpanRef { anchor: own_anchor(table), index: span.index },
+        None => span,
+    }
+}
+
+/// `span` of a template as its instance, whose own anchors are `own`, holds it.
+fn absolute(span: SpanRef, own: OwnAnchors<'_>) -> Result<SpanRef, TemplateError> {
+    let Some(table) = OWN_ANCHORS.iter().position(|it| *it == span.anchor) else { return Ok(span) };
+    match own {
+        Some(own) => Ok(SpanRef { anchor: own[table], index: span.index }),
+        None => Err(TemplateError::OwnPosition(table as u32)),
+    }
+}
+
+fn relative_lines(lines: &mut [Line], own: OwnAnchors<'_>) {
+    if own.is_some() {
+        for line in lines {
+            line.span = relative(line.span, own);
+        }
+    }
+}
+
+/// `lines` of a template as its instance holds them.
+fn absolute_lines(lines: &[Line], own: OwnAnchors<'_>) -> Result<Vec<Line>, TemplateError> {
+    // alloc: kept by the build
+    lines.iter().map(|it| Ok(Line { at: it.at, span: absolute(it.span, own)? })).collect()
+}
 
 /// The outside symbols of a static's template: a static names none of its own accord.
 const NO_EXTERNS: &[&str] = &[];
@@ -436,6 +510,7 @@ fn template_relocs(
     data: &[Data],
     before: Option<u32>,
     own: Option<InstanceKey>,
+    anchors: OwnAnchors<'_>,
     frame: &Frame,
 ) -> Result<Relocs<Ref>, TemplateError> {
     relocs.try_map_in(frame, |target| {
@@ -452,7 +527,7 @@ fn template_relocs(
                 }
                 Ref::Data(at)
             }
-            Target::Position(span) => Ref::Position(*span),
+            Target::Position(span) => Ref::Position(relative(*span, anchors)),
             Target::Coverage(array) if *array < Covered::ARRAYS => Ref::Coverage(*array),
             Target::Coverage(array) => return Err(TemplateError::Coverage(*array)),
             Target::Counter(key) if own == Some(*key) => Ref::Counter,
@@ -477,7 +552,7 @@ fn template_data(
             align: it.align,
             // clone: a static's value, once a static
             bytes: it.bytes.clone(),
-            relocs: template_relocs(it.relocs.view(), refs, externs, data, Some(at as u32), None, frame)?,
+            relocs: template_relocs(it.relocs.view(), refs, externs, data, Some(at as u32), None, None, frame)?,
             writable: it.writable,
         });
     }
@@ -492,11 +567,12 @@ fn instantiate_data<E: AsRef<str>>(
     refs: &Refs,
     externs: &[E],
     owner: &ContentId,
+    anchors: OwnAnchors<'_>,
     frame: &Frame,
 ) -> Result<Vec<Data>, TemplateError> {
     let mut made: Vec<Data> = Vec::with_capacity(data.len());
     for (at, it) in data.iter().enumerate() {
-        let relocs = instantiate_relocs(it.relocs, refs, externs, &made, Some(at as u32), None, frame)?;
+        let relocs = instantiate_relocs(it.relocs, refs, externs, &made, Some(at as u32), None, anchors, frame)?;
         // alloc: the instance's data, kept by the build
         let bytes = it.bytes.to_vec();
         made.push(match it.writable {
@@ -517,6 +593,7 @@ fn instantiate_relocs<E: AsRef<str>>(
     data: &[Data],
     before: Option<u32>,
     own: Option<InstanceKey>,
+    anchors: OwnAnchors<'_>,
     frame: &Frame,
 ) -> Result<Relocs, TemplateError> {
     relocs.try_map_in(frame, |target| {
@@ -536,7 +613,7 @@ fn instantiate_relocs<E: AsRef<str>>(
                 }
                 Target::Data(data.get(at as usize).ok_or(TemplateError::Place(at))?.id)
             }
-            Ref::Position(span) => Target::Position(span),
+            Ref::Position(span) => Target::Position(absolute(span, anchors)?),
             Ref::Coverage(array) if array < Covered::ARRAYS => Target::Coverage(array),
             Ref::Coverage(array) => return Err(TemplateError::Coverage(array)),
             Ref::Counter => Target::Counter(own.ok_or(TemplateError::Counter(None))?),
@@ -628,15 +705,30 @@ impl Template {
     /// relocation to one of them that `refs` lacks is kept by name in the template. The
     /// function's code, data bytes, lines, unwind information and coverage move into it.
     pub fn of_owned(function: CompiledFunction, refs: &Refs, extra: &[String]) -> Result<Template, TemplateError> {
+        Template::of_owned_at(function, refs, extra, None)
+    }
+
+    /// [`Self::of_owned`] of the function of an instance whose own span tables are anchored at
+    /// `anchors`: each of its positions in them is held by its table ([`own_anchor`]), so the
+    /// template is the same whichever item it was compiled as, and [`Self::instantiate_at`]
+    /// gives each instance its own.
+    pub fn of_owned_at(
+        function: CompiledFunction,
+        refs: &Refs,
+        extra: &[String],
+        anchors: OwnAnchors<'_>,
+    ) -> Result<Template, TemplateError> {
         check_refs(refs)?;
         let externs = own_externs(refs, extra)?;
         let (relocs, mut data) = frame::task(Tag::Codegen, |frame| {
             let own = Some(function.key);
-            let relocs = template_relocs(function.relocs.view(), refs, &externs, &function.data, None, own, frame)?;
+            let relocs =
+                template_relocs(function.relocs.view(), refs, &externs, &function.data, None, own, anchors, frame)?;
             let mut data = Vec::with_capacity(function.data.len());
             for (at, it) in function.data.iter().enumerate() {
                 let at = Some(at as u32);
-                let relocs = template_relocs(it.relocs.view(), refs, &externs, &function.data, at, None, frame)?;
+                let relocs =
+                    template_relocs(it.relocs.view(), refs, &externs, &function.data, at, None, anchors, frame)?;
                 // alloc: none: the function's bytes move in once every check has passed
                 data.push(TemplateData { align: it.align, bytes: Vec::new(), relocs, writable: it.writable });
             }
@@ -647,6 +739,8 @@ impl Template {
         for (made, it) in data.iter_mut().zip(function.data) {
             made.bytes = it.bytes;
         }
+        let mut lines = function.lines;
+        relative_lines(&mut lines, anchors);
         Ok(Template {
             arch: function.arch,
             align: function.align,
@@ -656,7 +750,7 @@ impl Template {
             inlined: function.inlined,
             side: function.side,
             unwind,
-            lines: function.lines,
+            lines,
             refs: refs_len(refs),
             externs,
             coverage: function.coverage,
@@ -686,7 +780,18 @@ impl Template {
 
     /// The function of instance `key` whose references are `refs`.
     pub fn instantiate(&self, key: InstanceKey, refs: &Refs) -> Result<CompiledFunction, TemplateError> {
-        frame::task(Tag::Codegen, |frame| self.view(frame).instantiate(key, refs))
+        self.instantiate_at(key, refs, None)
+    }
+
+    /// The function of instance `key` whose references are `refs` and whose own span tables
+    /// are anchored at `anchors` ([`TemplateView::instantiate_at`]).
+    pub fn instantiate_at(
+        &self,
+        key: InstanceKey,
+        refs: &Refs,
+        anchors: OwnAnchors<'_>,
+    ) -> Result<CompiledFunction, TemplateError> {
+        frame::task(Tag::Codegen, |frame| self.view(frame).instantiate_at(key, refs, anchors))
     }
 
     /// The template's content ID: two templates with one are the same function up to what
@@ -749,7 +854,7 @@ impl StaticTemplate {
                 Init::Bytes { bytes, relocs } => TemplateInit::Bytes {
                     // clone: a static's value, kept by the build
                     bytes: bytes.clone(),
-                    relocs: template_relocs(relocs.view(), refs, &[], &value.data, None, None, frame)?,
+                    relocs: template_relocs(relocs.view(), refs, &[], &value.data, None, None, None, frame)?,
                 },
                 Init::Zeroed { size } => TemplateInit::Zeroed { size: *size },
             };
@@ -779,12 +884,12 @@ impl StaticTemplate {
         }
         let (data, init) = frame::task(Tag::Codegen, |frame| {
             let views = frame.alloc_slice_fill_with(self.data.len(), |at| self.data[at].view());
-            let data = instantiate_data(views, refs, NO_EXTERNS, &item.0, frame)?;
+            let data = instantiate_data(views, refs, NO_EXTERNS, &item.0, None, frame)?;
             let init = match &self.init {
                 TemplateInit::Bytes { bytes, relocs } => Init::Bytes {
                     // clone: a static's value, kept by the build
                     bytes: bytes.clone(),
-                    relocs: instantiate_relocs(relocs.view(), refs, NO_EXTERNS, &data, None, None, frame)?,
+                    relocs: instantiate_relocs(relocs.view(), refs, NO_EXTERNS, &data, None, None, None, frame)?,
                 },
                 TemplateInit::Zeroed { size } => Init::Zeroed { size: *size },
             };
@@ -1151,6 +1256,77 @@ mod tests {
             refs: 0,
         };
         assert_eq!(named.instantiate(ItemKey(ContentId([3; 32])), ContentId([4; 32]), &[]).unwrap_err(), TemplateError::Own);
+    }
+
+    /// A function whose code, data and lines name its own span tables at `own` and one table of
+    /// another body's: what a template kept under a name-free key holds by table.
+    fn positioned(key: InstanceKey, own: &[ContentId; OWN_TABLES]) -> CompiledFunction {
+        let other = SpanRef { anchor: ContentId([7; 32]), index: 9 };
+        let position = |table: usize, index| Target::Position(SpanRef { anchor: own[table], index });
+        let table = Data::new(
+            8,
+            vec![0; 16],
+            vec![
+                Relocation { at: 0, kind: RelocKind::Abs64, target: position(2, 1), addend: 0 },
+                Relocation { at: 8, kind: RelocKind::Abs64, target: Target::Position(other), addend: 0 },
+            ]
+            .into(),
+        );
+        CompiledFunction {
+            key,
+            arch: Arch::X86_64,
+            align: 16,
+            code: vec![0x48, 0x8d, 0x05, 0, 0, 0, 0, 0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3],
+            relocs: vec![
+                Relocation { at: 3, kind: RelocKind::PcRel32, target: position(0, 3), addend: -4 },
+                Relocation { at: 10, kind: RelocKind::PcRel32, target: Target::Data(table.id), addend: -4 },
+            ]
+            .into(),
+            data: vec![table],
+            inlined: Vec::new(),
+            side: None,
+            unwind: None,
+            lines: vec![
+                Line { at: 0, span: SpanRef { anchor: own[5], index: 4 } },
+                Line { at: 7, span: other },
+            ],
+            coverage: None,
+            profile: None,
+        }
+    }
+
+    /// Two items written alike in two places share one template held by table, which the
+    /// store round-trips byte for byte; each instance made of it is given back its own
+    /// positions in its code, its data and its lines, and one with no anchors is refused
+    /// (rule 25: what is persisted restores equal to a fresh build).
+    #[test]
+    fn a_template_holds_its_own_positions_by_table() {
+        let a: [ContentId; OWN_TABLES] = std::array::from_fn(|it| ContentId([10 + it as u8; 32]));
+        let b: [ContentId; OWN_TABLES] = std::array::from_fn(|it| ContentId([20 + it as u8; 32]));
+        let (fa, fb) = (positioned(key(1), &a), positioned(key(2), &b));
+        assert_ne!(fa.data[0].id, fb.data[0].id);
+        let ta = Template::of_owned_at(fa.clone(), &[], &[], Some(&a)).unwrap();
+        let tb = Template::of_owned_at(fb.clone(), &[], &[], Some(&b)).unwrap();
+        assert_eq!(ta, tb);
+        assert_eq!(ta.id(), tb.id());
+
+        let bytes = crate::blob::encode(&ta);
+        let restored = crate::blob::decode(&bytes).unwrap();
+        assert_eq!(restored, ta);
+        assert_eq!(crate::blob::encode(&restored), bytes);
+
+        assert_eq!(restored.instantiate_at(key(1), &[], Some(&a)).unwrap(), fa);
+        assert_eq!(restored.instantiate_at(key(2), &[], Some(&b)).unwrap(), fb);
+        let viewed = frame::task(Tag::Codegen, |frame| {
+            crate::blob::decode_view(&bytes, frame).unwrap().instantiate_at(key(2), &[], Some(&b))
+        });
+        assert_eq!(viewed.unwrap(), fb);
+        assert!(matches!(restored.instantiate_at(key(1), &[], None), Err(TemplateError::OwnPosition(_))));
+
+        // Compiled with no anchors, a template keeps every position as compiled.
+        let absolute = Template::of(&fa, &[], &[]).unwrap();
+        assert_ne!(absolute, ta);
+        assert_eq!(absolute.instantiate(key(1), &[]).unwrap(), fa);
     }
 
     /// Two counting siblings share one template, and each instance made of it counts in its

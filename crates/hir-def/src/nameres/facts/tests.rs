@@ -31,7 +31,7 @@ use hir_expand::{
     fixture,
     name::Name,
     proc_macro::{
-        CustomProcMacroExpander, ProcMacro, ProcMacroCall, ProcMacroExpander,
+        CustomProcMacroExpander, Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander,
         ProcMacroExpansionError, ProcMacroKind,
     },
 };
@@ -58,7 +58,6 @@ use crate::{
     },
     per_ns::Item,
     test_db::TestDB,
-    tt::TopSubtree,
     unstable_features::UnstableFeatures,
     visibility::{Visibility, VisibilityExplicitness},
 };
@@ -1134,14 +1133,14 @@ impl ProcMacroExpander for IdentityWhenValid {
         &self,
         _: &Db,
         ProcMacroCall { subtree, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let (parse, _) = syntax_bridge::token_tree_to_syntax_node(
             subtree.view(),
             syntax_bridge::TopEntryPoint::MacroItems,
             &mut |_| Edition::CURRENT,
         );
         if parse.errors().is_empty() {
-            Ok(subtree.copy())
+            Ok(Expanded::untraced(subtree.copy(), "a test's proc macro, which traces nothing of what it read"))
         } else {
             Err(ProcMacroExpansionError::Panic(format!(
                 "got invalid macro input: {:?}",

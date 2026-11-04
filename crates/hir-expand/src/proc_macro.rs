@@ -72,12 +72,13 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
         None
     }
 
-    /// Run the expander on one call.
+    /// Run the expander on one call: what it gave, with what it read and whether its session's
+    /// state took part ([`Expanded`]), which every expander states for every call it expands.
     fn expand(
         &self,
         db: &Db,
         call: ProcMacroCall<'_>,
-    ) -> Result<tt::TopSubtree, ProcMacroExpansionError>;
+    ) -> Result<Expanded, ProcMacroExpansionError>;
 
     /// Run in the calling crate's compilation session. Native expanders use `expand`.
     fn expand_in(
@@ -85,7 +86,7 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
         db: &Db,
         _calling_crate: Crate,
         call: ProcMacroCall<'_>,
-    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         self.expand(db, call)
     }
 
@@ -109,50 +110,73 @@ pub enum ProcMacroExpansionError {
 }
 
 /// What an expansion read besides its call and the variables it was given, as its server
-/// traced it: what the image of the calling crate is filed by (`hir_def::deps`).
+/// traced it: what the image of the calling crate is filed by (`hir_def::deps`). An expander
+/// states it for each call ([`Expanded::reads`]); nothing defaults it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExpansionReads {
     /// Nothing else.
     Nothing,
     /// The names it read, as the server encodes them, and the hash of the values they had.
     Traced { shape: sync::Arc<[u8]>, values: base_db::ContentId },
-    /// Not known, and why: the calling crate gets no image.
+    /// Not traced, and why, as the expander says it (it asked the database, it emitted a
+    /// diagnostic, it read the clock, a test's macro that traces nothing): the calling crate
+    /// gets no image.
     Unknown(&'static str),
 }
 
-thread_local! {
-    static READS: std::cell::Cell<Option<ExpansionReads>> = const { std::cell::Cell::new(None) };
+/// Whether what an expansion gave is fixed by its call and what it read, or also by the state
+/// its calling crate's session was in when it ran, which the calls before it left in the
+/// expander, outside the database. An expander states it for each call ([`Expanded::state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateUse {
+    /// Fixed by its call and reads: a macro whose crate keeps no state, or a call of a crate
+    /// that settles shown to give the same from the fresh state as from the settled one. Its
+    /// expansion is reused while those are the same, whatever ran before it.
+    Fixed,
+    /// It may depend on the calls before it, and why. Its expansion runs again in every
+    /// revision (an untracked read naming `why`), in the order its readers ask for it, and
+    /// keeps its value when it gives the same.
+    Session(&'static str),
 }
 
-// Each access to `READS` is a call of its own, never inlined: an expansion that waits between
-// two may resume on another thread, and an inlined access may reuse the address of the first
-// thread's slot (docs/v2/plan/lanes/may-suspend.md).
-
-/// What the expansion running on this thread read: called by an expander before `expand`
-/// returns. An expander that does not call it has reads [`ExpansionReads::Unknown`].
-#[inline(never)]
-pub fn report_reads(reads: ExpansionReads) {
-    carry_reads();
-    READS.set(Some(reads));
+/// What one call of an expander gave ([`ProcMacroExpander::expand`]).
+#[derive(Debug)]
+pub struct Expanded {
+    pub tree: tt::TopSubtree,
+    /// What it read besides its call.
+    pub reads: ExpansionReads,
+    /// Whether the session's state took part.
+    pub state: StateUse,
 }
 
-/// Carries [`READS`] with each job on a fiber across its waits ([`blaze_query::carry`]): an
-/// expansion that reported its reads and then waits on a query finds them, wherever it resumes.
-fn carry_reads() {
-    static CARRIED: std::sync::Once = std::sync::Once::new();
-    CARRIED.call_once(|| {
-        blaze_query::carry(blaze_query::Carried {
-            take: || stdx::lend::take_carried_cell(&READS, Option::is_none),
-            put: |it| stdx::lend::put_carried_cell(&READS, Option::is_none, it),
-            end: |it| stdx::lend::end_carried_cell(&READS, it),
-        });
-    });
+impl Expanded {
+    /// `tree`, from a call that read nothing but its call and kept no state.
+    pub fn reads_nothing(tree: tt::TopSubtree) -> Expanded {
+        Expanded { tree, reads: ExpansionReads::Nothing, state: StateUse::Fixed }
+    }
+
+    /// `tree`, from a call whose reads are not traced, for `why`, and that kept no state.
+    pub fn untraced(tree: tt::TopSubtree, why: &'static str) -> Expanded {
+        Expanded { tree, reads: ExpansionReads::Unknown(why), state: StateUse::Fixed }
+    }
 }
 
-/// What the expander reported since the last call, cleared.
-#[inline(never)]
-pub(crate) fn take_reads() -> Option<ExpansionReads> {
-    READS.take()
+/// What the reads of a failed call are: none are kept for it, and its crate gets no image.
+pub const FAILED_READS: &str = "it failed: what a failed expansion read is not kept";
+
+/// What a failed call of a macro whose calls are ordered states of its session: its failure
+/// may be of the state the calls before it left.
+pub const FAILED_IN_SESSION: &str =
+    "a failed call of a proc macro whose calls run in order: its failure may depend on the calls before it";
+
+/// What a proc-macro call gave, from [`CustomProcMacroExpander::expand`]: the expansion, what
+/// it read and whether its session's state took part, as its expander stated them, or as
+/// [`FAILED_READS`] and [`FAILED_IN_SESSION`] state them for a call that failed.
+#[derive(Debug)]
+pub struct ProcMacroExpansion {
+    pub result: ExpandResult<tt::TopSubtree>,
+    pub reads: ExpansionReads,
+    pub state: StateUse,
 }
 
 pub type ProcMacroLoadResult = Result<Vec<ProcMacro>, ProcMacroLoadingError>;
@@ -195,7 +219,7 @@ impl ProcMacrosBuilder {
             .collect::<HashMap<_, _, Global>>();
         map.shrink_to_fit();
         ProcMacros::try_get(db)
-            .unwrap_or_else(|| ProcMacros::new(db, Default::default()))
+            .unwrap_or_else(|| ProcMacros::new(db, Durability::HIGH, Default::default()))
             .set_by_crate(db)
             .with_durability(Durability::HIGH)
             .to(map);
@@ -225,7 +249,7 @@ pub struct ProcMacros {
 
 impl ProcMacros {
     pub fn init_default(db: &mut Db, durability: Durability) {
-        _ = Self::builder(Default::default()).durability(durability).new(db);
+        _ = Self::new(db, durability, Default::default());
     }
 
     /// Gives each crate of `given` its proc macros (or why it has none) in place of those it
@@ -235,7 +259,7 @@ impl ProcMacros {
     /// set that is not noted leaves it naming none.
     pub fn give(db: &mut Db, given: impl IntoIterator<Item = (Crate, ProcMacroLoadResult)>) {
         db.batch(base_db::Trigger::named("ProcMacros::give"), |db| {
-            let all = ProcMacros::try_get(db).unwrap_or_else(|| ProcMacros::new(db, Default::default()));
+            let all = ProcMacros::try_get(db).unwrap_or_else(|| ProcMacros::new(db, Durability::HIGH, Default::default()));
             let mut by_crate = all.by_crate(db).clone();
             for (krate, macros) in given {
                 by_crate.insert(krate, Arc::new(CrateProcMacros::new(macros))); // alloc: once per crate, when its proc macros are loaded
@@ -428,11 +452,6 @@ impl CustomProcMacroExpander {
         self.proc_macro_id == Self::PROC_MACRO_ATTR_DISABLED
     }
 
-    /// Whether this resolved macro shares mutable guest state with earlier calls.
-    pub fn requires_session(self, db: &Db, def_crate: Crate) -> bool {
-        self.loaded(db, def_crate).is_some_and(|it| it.expander.requires_session())
-    }
-
     /// The macro this names among those `def_crate` loaded, when it has one.
     fn loaded(self, db: &Db, def_crate: Crate) -> Option<&ProcMacro> {
         ProcMacros::get_for_crate(db, def_crate)
@@ -507,6 +526,10 @@ impl CustomProcMacroExpander {
         }
     }
 
+    /// Runs the call, or says why it can't: a macro missing or disabled, or a failure of its
+    /// expander, whose reads are [`FAILED_READS`]. A failed call of an expander whose calls run
+    /// in order states its session as [`FAILED_IN_SESSION`]; any other failure is of what the
+    /// database holds (the proc-macro map, the call), so it keeps no state.
     pub fn expand(
         self,
         db: &Db,
@@ -517,77 +540,51 @@ impl CustomProcMacroExpander {
         def_site: Span,
         call_site: Span,
         mixed_site: Span,
-    ) -> ExpandResult<tt::TopSubtree> {
-        match self.proc_macro_id {
-            Self::PROC_MACRO_ATTR_DISABLED => ExpandResult::new(
-                tt::TopSubtree::empty(tt::DelimSpan { open: call_site, close: call_site }),
-                ExpandError::new(call_site, ExpandErrorKind::ProcMacroAttrExpansionDisabled),
-            ),
-            Self::MISSING_EXPANDER => ExpandResult::new(
-                tt::TopSubtree::empty(tt::DelimSpan { open: call_site, close: call_site }),
-                ExpandError::new(call_site, missing(db, def_crate)),
-            ),
-            Self::DISABLED_ID => ExpandResult::new(
-                tt::TopSubtree::empty(tt::DelimSpan { open: call_site, close: call_site }),
-                ExpandError::new(call_site, ExpandErrorKind::MacroDisabled),
-            ),
-            id => {
-                let proc_macros = match ProcMacros::get_for_crate(db, def_crate) {
-                    Some(it) => it,
-                    None => {
-                        return ExpandResult::new(
-                            tt::TopSubtree::empty(tt::DelimSpan {
-                                open: call_site,
-                                close: call_site,
-                            }),
-                            ExpandError::other(
-                                call_site,
-                                "internal error: no proc macros for crate",
-                            ),
-                        );
-                    }
-                };
-                let proc_macro = match proc_macros.get(id, call_site) {
-                    Ok(proc_macro) => proc_macro,
-                    Err(e) => {
-                        return ExpandResult::new(
-                            tt::TopSubtree::empty(tt::DelimSpan {
-                                open: call_site,
-                                close: call_site,
-                            }),
-                            e,
-                        );
-                    }
-                };
-
-                let call = Self::call(db, calling_crate, tt, attr_arg, def_site, call_site, mixed_site);
-                match proc_macro.expander.expand_in(db, calling_crate, call) {
-                    Ok(t) => ExpandResult::ok(t),
-                    Err(err) => match err {
-                        // Don't discard the item in case something unexpected happened while expanding attributes
-                        ProcMacroExpansionError::System(text)
-                            if proc_macro.kind == ProcMacroKind::Attr =>
-                        {
-                            ExpandResult {
-                                value: tt.copy(), // alloc: error path: an attribute macro that failed keeps its item
-                                err: Some(ExpandError::other(call_site, text)),
-                            }
-                        }
-                        ProcMacroExpansionError::System(text)
-                        | ProcMacroExpansionError::Panic(text) => ExpandResult::new(
-                            tt::TopSubtree::empty(tt::DelimSpan {
-                                open: call_site,
-                                close: call_site,
-                            }),
-                            ExpandError::new(
-                                call_site,
-                                ExpandErrorKind::ProcMacroPanic(text.into_boxed_str()),
-                            ),
-                        ),
-                    },
-                }
+    ) -> ProcMacroExpansion {
+        let empty = || tt::TopSubtree::empty(tt::DelimSpan { open: call_site, close: call_site });
+        let refused = |err: ExpandError| ProcMacroExpansion {
+            result: ExpandResult::new(empty(), err),
+            reads: ExpansionReads::Unknown(FAILED_READS),
+            state: StateUse::Fixed,
+        };
+        let id = match self.proc_macro_id {
+            Self::PROC_MACRO_ATTR_DISABLED => {
+                return refused(ExpandError::new(call_site, ExpandErrorKind::ProcMacroAttrExpansionDisabled));
             }
-        }
+            Self::MISSING_EXPANDER => return refused(ExpandError::new(call_site, missing(db, def_crate))),
+            Self::DISABLED_ID => return refused(ExpandError::new(call_site, ExpandErrorKind::MacroDisabled)),
+            id => id,
+        };
+        let Some(proc_macros) = ProcMacros::get_for_crate(db, def_crate) else {
+            return refused(ExpandError::other(call_site, "internal error: no proc macros for crate"));
+        };
+        let proc_macro = match proc_macros.get(id, call_site) {
+            Ok(proc_macro) => proc_macro,
+            Err(e) => return refused(e),
+        };
+        let call = Self::call(db, calling_crate, tt, attr_arg, def_site, call_site, mixed_site);
+        let err = match proc_macro.expander.expand_in(db, calling_crate, call) {
+            Ok(Expanded { tree, reads, state }) => {
+                return ProcMacroExpansion { result: ExpandResult::ok(tree), reads, state };
+            }
+            Err(err) => err,
+        };
+        let result = match err {
+            // Don't discard the item in case something unexpected happened while expanding attributes
+            ProcMacroExpansionError::System(text) if proc_macro.kind == ProcMacroKind::Attr => ExpandResult {
+                value: tt.copy(), // alloc: error path: an attribute macro that failed keeps its item
+                err: Some(ExpandError::other(call_site, text)),
+            },
+            ProcMacroExpansionError::System(text) | ProcMacroExpansionError::Panic(text) => ExpandResult::new(
+                empty(),
+                ExpandError::new(call_site, ExpandErrorKind::ProcMacroPanic(text.into_boxed_str())),
+            ),
+        };
+        let state = match proc_macro.expander.ordered() {
+            true => StateUse::Session(FAILED_IN_SESSION),
+            false => StateUse::Fixed,
+        };
+        ProcMacroExpansion { result, reads: ExpansionReads::Unknown(FAILED_READS), state }
     }
 }
 

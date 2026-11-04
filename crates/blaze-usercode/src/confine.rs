@@ -32,6 +32,16 @@ use crate::trace::{self, Report};
 /// scope ([`crate::pool`]).
 pub const LIVE: &str = "__BLAZE_SANDBOX_LIVE";
 
+/// The variable of a [`Command`]'s environment that names, for a run that is keyed by what it
+/// reads, the variables its key has already (a build script's, those cargo sets from the
+/// unit), separated by `=`, which no variable's name has. The confine takes it out of what
+/// the program sees and gives it the launcher as [`Spec::given`]: the program's environment
+/// then holds those alone, and every other variable of the command is lent to it, seen only
+/// when read by name, each read traced, or all of them when it walks its environment
+/// (`blaze-cargo`'s `sandbox/v2.rs`). A command without it is given its whole environment, and
+/// a traced run of it reads all of it.
+pub const GIVEN: &str = "__BLAZE_SANDBOX_GIVEN";
+
 /// The subcommand and flag of blaze's launcher.
 pub const LAUNCH: [&str; 2] = ["sandbox", "--v2"];
 
@@ -103,6 +113,11 @@ pub struct Spec {
     pub report: PathBuf,
     /// Paths that are no inputs of what runs: the program itself, whose code is its key.
     pub not_inputs: Vec<PathBuf>,
+    /// The variables of [`Spec::env`] whose values the run's key has already ([`GIVEN`]):
+    /// where the platform's sandbox can lend the rest, only these are in the program's
+    /// environment, and what it reads of the others is traced by name. `None`: every variable
+    /// is in it, and a traced run reads them all.
+    pub given: Option<Vec<String>>,
 }
 
 /// A [`Spec`] lent from the command it runs: what [`Launcher::confine`] writes, the same JSON
@@ -122,15 +137,17 @@ pub struct SpecOf<'a> {
     live: Cow<'a, Path>,
     report: PathBuf,
     not_inputs: &'a [PathBuf],
+    given: Option<Vec<&'a str>>,
 }
 
-/// A command's environment as the program sees it: without [`LIVE`], which is the launcher's.
+/// A command's environment as the program sees it: without [`LIVE`] and [`GIVEN`], which are
+/// the launcher's.
 #[derive(Debug)]
 struct Passed<'a>(&'a [(OsString, OsString)]);
 
 impl Serialize for Passed<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let passed = self.0.iter().filter(|(name, _)| name != LIVE);
+        let passed = self.0.iter().filter(|(name, _)| name != LIVE && name != GIVEN);
         #[cfg(target_os = "wasi")]
         let passed = passed.map(|(name, value)| (wasi_os::Os(name), wasi_os::Os(value)));
         serializer.collect_seq(passed)
@@ -214,6 +231,10 @@ impl Launcher {
             return Err(format!("{}: its sandbox is off", command.program.display())); // alloc: error path
         };
         let live = command.env.iter().rev().find(|(name, _)| name == LIVE);
+        let given = match command.env.iter().rev().find(|(name, _)| name == GIVEN) {
+            None => None,
+            Some((_, names)) => Some(given_names(&command.program, names)?),
+        };
         Ok(SpecOf {
             program: &command.program,
             args: &command.args,
@@ -227,6 +248,7 @@ impl Launcher {
             live: live.map_or_else(|| Cow::Owned(scratch.join(LIVE_FILE)), |(_, value)| Cow::Borrowed(Path::new(value))),
             report: scratch.join(REPORT_FILE),
             not_inputs: std::slice::from_ref(&command.program),
+            given,
         })
     }
 
@@ -322,6 +344,35 @@ impl Confine for Launcher {
     }
 }
 
+/// The value of [`GIVEN`] for the variables `names`: each name, separated by `=`. A name with
+/// `=` in it is no variable's, and an error naming it.
+pub fn given_value<'a>(names: impl IntoIterator<Item = &'a std::ffi::OsStr>) -> Result<OsString, String> {
+    // alloc: setup, once per run prepared: the launcher's variable.
+    let mut value = OsString::new();
+    for (at, name) in names.into_iter().enumerate() {
+        if name.as_encoded_bytes().contains(&b'=') {
+            // alloc: error path
+            return Err(format!("the variable `{}` has `=` in its name, which no variable's has", name.display()));
+        }
+        if at > 0 {
+            value.push("=");
+        }
+        value.push(name);
+    }
+    Ok(value)
+}
+
+/// The names [`GIVEN`]'s value `names` lists, for `program`'s run: each is text, as the
+/// launcher's spec has it.
+fn given_names<'a>(program: &Path, names: &'a std::ffi::OsStr) -> Result<Vec<&'a str>, String> {
+    let Some(names) = names.to_str() else {
+        // alloc: error path
+        return Err(format!("{}: a variable its key has is named in bytes that are not UTF-8", program.display()));
+    };
+    // alloc: the edge: the launcher's spec, once per run.
+    Ok(names.split('=').filter(|it| !it.is_empty()).collect())
+}
+
 /// Writes `bytes` to the new file `file`, readable by its owner alone: a spec holds the
 /// program's whole environment, its secrets too, so it is made so and lives only until the
 /// launcher has read it, which removes it before anything runs (`blaze sandbox --v2`).
@@ -408,10 +459,22 @@ mod tests {
         let mut unnamed = command(false);
         unnamed.env.retain(|(name, _)| name != LIVE);
         let spec = read_back(&unnamed, Path::new("/s"));
-        assert_eq!((spec.live, spec.trace), (PathBuf::from("/s/live"), false));
+        assert_eq!((spec.live, spec.trace, spec.given), (PathBuf::from("/s/live"), false, None));
         let mut off = command(true);
         off.sandbox = Sandbox::Off;
         assert!(Launcher::spec(&off, Path::new("/s")).is_err());
+    }
+
+    /// The names a run's key has are the launcher's, never a variable the program sees.
+    #[test]
+    fn the_given_variable_is_the_launchers_not_the_programs() {
+        let mut lent = command(true);
+        let names = [std::ffi::OsStr::new("OUT_DIR"), std::ffi::OsStr::new("TARGET")];
+        lent.env.push((GIVEN.into(), given_value(names).unwrap()));
+        let spec = read_back(&lent, Path::new("/s"));
+        assert_eq!(spec.env, vec![("CC".into(), "cc".into())]);
+        assert_eq!(spec.given, Some(vec!["OUT_DIR".to_owned(), "TARGET".to_owned()]));
+        assert!(given_value([std::ffi::OsStr::new("A=B")]).unwrap_err().contains("`A=B`"));
     }
 
     #[test]
