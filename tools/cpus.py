@@ -32,6 +32,7 @@ import asyncio
 import json
 import re
 import sys
+import typing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,7 +48,7 @@ TABLE = ROOT / "crates/target-features/src/cpus/table.rs"
 # LLVM's target directory of each architecture blaze compiles for, by the first part of the
 # triple.
 LLVM_TARGETS = {"aarch64": "AArch64", "x86_64": "X86", "wasm32": "WebAssembly"}
-ALIAS = re.compile(r'^\s*def\s*:\s*ProcessorAlias<\s*"([^"]+)"\s*,\s*"([^"]+)"\s*>\s*;', re.M)
+ALIAS = re.compile(r'^\s*def\s*:\s*ProcessorAlias<\s*"([^"]+)"\s*,\s*"([^"]+)"\s*>\s*;', re.MULTILINE)
 # Any other mention of one, which the pattern above would miss: a `foreach`, a `let`.
 MENTION = re.compile(r"\bProcessorAlias\b")
 STEP_TIMEOUT_S = 120
@@ -123,7 +124,7 @@ async def aliases_in(at: Pin, path: str) -> list[tuple[str, str]]:
     ).decode()
     found = ALIAS.findall(text)
     # Each mention is the class itself or one alias the pattern read; another is one it can't.
-    mentions = len(MENTION.findall(text)) - len(re.findall(r"^\s*class\s+ProcessorAlias\b", text, re.M))
+    mentions = len(MENTION.findall(text)) - len(re.findall(r"^\s*class\s+ProcessorAlias\b", text, re.MULTILINE))
     if mentions != len(found):
         raise Failed(
             f"read {path}: it mentions ProcessorAlias {mentions} times outside its class, and "
@@ -163,7 +164,7 @@ def table(answers: dict[str, object], own: dict[str, object], llvm: dict[str, ob
     index of its feature set."""
     targets: dict[str, dict[str, object]] = {}
     for source in (answers, own):
-        for triple, data in source["targets"].items():  # pyright: ignore[reportAttributeAccessIssue]
+        for triple, data in typing.cast(dict[str, dict[str, object]], source["targets"]).items():
             if triple in targets:
                 raise Failed(f"build the table: `{triple}` is in both rustc.json and own_targets.json")
             targets[triple] = data
@@ -181,8 +182,8 @@ def table(answers: dict[str, object], own: dict[str, object], llvm: dict[str, ob
     ]
     for triple in sorted(targets):
         data = targets[triple]
-        cpus: dict[str, int] = dict(data.get("cpus") or {})
-        sets: list[list[str]] = data.get("cpu_features") or []
+        cpus: dict[str, int] = dict(typing.cast(dict[str, int], data.get("cpus") or {}))
+        sets = typing.cast(list[list[str]], data.get("cpu_features") or [])
         for alias, named in aliases_by_arch.get(triple.split("-")[0], {}).items():
             # A name rustc lists itself keeps rustc's features; an alias of a CPU rustc does not
             # list (its LLVM is older) has none to give.
