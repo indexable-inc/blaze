@@ -25,7 +25,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_query::{Cancelled, Cx, Database, DbError, Query, QueryKey, QueryKind};
 use blaze_units::{
     query::{
-        BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LoadError, LockWrite, Origin, PackagePlan, Planned, TestSandbox,
+        BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LoadError, LockFile, LockWrite, Origin, PackagePlan, Planned, TestSandbox,
         UnitPlan, Units,
     },
     schema::{Mode, Profile, Strip, Stripped, Target, Unit, UnitDep, UnitGraph},
@@ -437,7 +437,10 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
             package(&dep, "dep", "1.0.0", Some("registry `crates-io`".into()), false),
             package(&app, "app", "0.1.0", Some(format!("({root})")), true),
         ],
-        lock: Some(LockWrite { path: format!("{root}/Cargo.lock"), text: "# a lock\n".into() }),
+        lock: Some(LockWrite {
+            files: vec![LockFile { path: format!("{root}/Cargo.lock"), text: "# a lock\n".into() }],
+            said: Vec::new(),
+        }),
         warnings: vec![manifest],
         target_dir: format!("{root}/target"),
         build_dir: format!("{root}/target"),
@@ -1150,6 +1153,8 @@ fn checkout(sim: &mut Sim, manifest: &str) {
 type SimDaemon = Daemon<Sim, Fake>;
 
 fn start(sim: Sim, steps: &Arc<Fake>, seed: u64) -> SimDaemon {
+    // A view's build config names the blaze that runs it (`BuildConfig::blaze`).
+    crate::release::for_tests();
     Daemon::start(sim, options(), steps.clone(), Runner::Inline(Inline::new(seed))).unwrap_or_else(|why| panic!("{why}"))
 }
 

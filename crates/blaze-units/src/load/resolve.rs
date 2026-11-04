@@ -27,6 +27,7 @@ use std::alloc::Global;
 use super::files::Snap;
 use super::source::{Index, Located, Sources};
 use super::{Select, Spec, Staged, load_error};
+use crate::lock;
 use crate::query::{Fetch, LockWrite, LoadError};
 use crate::read::{
     self as summary, Package, Read, feature_unification, manifest_source, path_packages, rust_versions,
@@ -242,10 +243,18 @@ pub(crate) fn resolved<'r, 'db, R>(
         Staged::Failed(error) => return Ok(Staged::Failed(error)),
     }
 
-    let locked = spec.locked.map(|flag| lockfile::Locked { flag, path: &lock_path, path_deps: &path_deps });
-    let lock_write = match lockfile::lockfile_to_write(&mut whole, lock_text.as_deref(), lowest_rust_version.as_ref(), locked) {
-        Ok(text) => text.map(|text| LockWrite { path: lock_path.display().to_string(), text }),
-        Err(error) => return Ok(fail(error)),
+    let lock_write = match lock_files(
+        ctx,
+        ws,
+        spec,
+        &mut whole,
+        lock.as_ref(),
+        lock_text.as_deref(),
+        lowest_rust_version.as_ref(),
+        &path_deps,
+    ) {
+        Ok(it) => it,
+        Err(error) => return Ok(Staged::Failed(error)),
     };
 
     let feature_members = match feature_roots(&members_of(), &member_ids, &specs, &cli_features, unification) {
@@ -273,6 +282,120 @@ pub(crate) fn resolved<'r, 'db, R>(
         lock: lock_write,
         warnings,
     })
+}
+
+/// The lock files after the resolve `whole` (`old` and `old_text`: the `Cargo.lock` there, read
+/// and as text), as the lock policy lets this build leave them (docs/cargo.md, "Lock files";
+/// [`lock::policy`]): `Ok(None)` when neither changes, the files to write with what to say, or
+/// the refusal naming every move. `Cargo.lock` is cargo's, minimal as cargo's resolve keeps it
+/// (every package the lock file pins and the manifests still allow stays); `blaze.lock` pins
+/// the rest ([`lock::BlazeLock`]). A foreign workspace (a standard library) has no `blaze.lock`
+/// and no `lock = "required"`.
+#[allow(clippy::too_many_arguments)] // the resolve's parts the lock files are made of, each once
+fn lock_files<'r, 'db>(
+    ctx: &Context<Snap<'r, 'db>>,
+    ws: &Workspace<'_, Snap<'r, 'db>>,
+    spec: &Spec,
+    whole: &mut Resolve,
+    old: Option<&Resolve>,
+    old_text: Option<&str>,
+    lowest_rust_version: Option<&RustVersion>,
+    path_deps: &PathDeps,
+) -> Result<Option<LockWrite>, LoadError> {
+    let root = ws.root();
+    let manifest = ws.root_manifest().display().to_string();
+    let foreign = spec.foreign.is_some();
+    let required = match foreign {
+        true => false,
+        false => lock::required(ws.custom_metadata(), &manifest).map_err(|what| LoadError { what, at: Some(manifest.clone()) })?,
+    };
+    let policy = lock::policy(spec.lock, required).map_err(|what| LoadError { what, at: None })?;
+    // Refused, a lock file that reads back to the same resolve is the same (cargo's `--locked`);
+    // written, one whose lines differ is written again.
+    let refusing = matches!(policy, lock::Policy::Refuse(_));
+    let cargo_path = root.join(lockfile::LOCKFILE_NAME);
+    let text = lockfile::lockfile_change(whole, old_text, lowest_rust_version, refusing.then_some(path_deps));
+    let moves = match text.is_some() {
+        true => lock::moves(old, whole),
+        false => Vec::new(),
+    };
+    let cargo = lock::Change {
+        name: lockfile::LOCKFILE_NAME,
+        path: cargo_path.display().to_string(),
+        existed: old_text.is_some(),
+        text,
+        moves,
+    };
+    let mut changes = vec![cargo]; // alloc: the two lock files, once per load
+    let mut pins = lock::BlazeLock::default();
+    if !foreign {
+        let files = *ctx.files();
+        let path = root.join(lock::BLAZE_LOCK);
+        let shown = path.display().to_string();
+        let old_text = match files.read(&path) {
+            Ok(bytes) => Some(String::from_utf8(bytes.into_owned()).map_err(|error| LoadError {
+                what: format!("{shown} is not UTF-8 ({error}); `blaze lock` writes it again"),
+                at: Some(shown.clone()),
+            })?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(LoadError { what: format!("failed to read `{shown}`: {error}"), at: Some(shown) }),
+        };
+        let old_pins = match &old_text {
+            Some(text) => Some(lock::BlazeLock::parse(text, &shown).map_err(|what| LoadError { what, at: Some(shown.clone()) })?),
+            None => None,
+        };
+        pins = lock::BlazeLock {
+            blaze: identity(spec, ws).or_else(|| old_pins.as_ref().and_then(|it| it.blaze.clone())),
+            index: newest(whole, old_pins.as_ref()),
+            native: super::native::locked_pins(&files, ws.custom_metadata(), ws.root_manifest(), root)?,
+        };
+        let same = match &old_pins {
+            Some(old) => *old == pins,
+            None => pins.is_empty(),
+        };
+        changes.push(lock::Change {
+            name: lock::BLAZE_LOCK,
+            path: shown,
+            existed: old_text.is_some(),
+            text: (!same).then(|| pins.render()),
+            moves: match same {
+                true => Vec::new(),
+                false => lock::pin_moves(old_pins.as_ref(), &pins),
+            },
+        });
+    }
+    let summary = lock::Summary { packages: whole.len(), pins: &pins };
+    match lock::decide(policy, &manifest, &changes, &summary) {
+        lock::Outcome::Same => Ok(None),
+        lock::Outcome::Write(write) => Ok(Some(write)),
+        lock::Outcome::Refused(what) => Err(LoadError { what, at: Some(cargo_path.display().to_string()) }),
+    }
+}
+
+/// Which blaze `blaze.lock` records as building the workspace: the release that serves this
+/// build ([`Spec::blaze`]), unless the workspace's pin names another release or `--ignore-pin`
+/// was given for it (then this is not the blaze the workspace runs, and the lock keeps what it
+/// had). A build of the tree records nothing.
+fn identity<F: Files>(spec: &Spec, ws: &Workspace<'_, F>) -> Option<lock::Identity> {
+    let release = spec.blaze.as_ref()?;
+    let manifest = ws.root_manifest().display().to_string();
+    if spec.ignore_pin_for.as_deref() == Some(manifest.as_str()) {
+        return None;
+    }
+    let pin = ws.custom_metadata().and_then(|it| it.get("blaze")).and_then(|it| it.get("version")).and_then(toml::Value::as_str);
+    if pin.is_some_and(|pin| lock::is_release(pin) && pin != release) {
+        return None;
+    }
+    Some(lock::Identity { release: release.clone(), toolchain: lock::toolchain().to_owned() })
+}
+
+/// The newest publish time of any package `whole` took from a registry's index, or the lock's
+/// when that is newer: a package the lock file pinned was read from its manifest, which has
+/// none, so a build that resolved nothing new keeps what the lock says.
+fn newest(whole: &Resolve, old: Option<&lock::BlazeLock>) -> Option<String> {
+    let picked = whole.summaries().values().filter_map(|it| it.pubtime()).max();
+    let kept = old.and_then(|it| it.index.as_deref());
+    picked.into_iter().chain(kept).max().map(str::to_owned)
 }
 
 /// A [`Registry`] by reference: the resolve borrows the index, which is finished after it.

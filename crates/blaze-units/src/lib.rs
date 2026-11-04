@@ -26,6 +26,7 @@ mod graph;
 pub mod index;
 mod order;
 pub mod load;
+pub mod lock;
 pub mod query;
 pub mod read;
 pub mod schema;

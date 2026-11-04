@@ -82,6 +82,8 @@ Commands:
     test, t     Run the tests
     bench       Run the benchmarks
     doc, d      Build a package's documentation, from blaze's front end: no rustdoc runs
+    lock        Resolve the workspace and write Cargo.lock and blaze.lock, saying what moved (a
+                check that may write them under CI or `lock = "required"`: `check --no-locked`)
     clean       Remove the workspace's build directory (under blaze's root, never in the checkout);
                 `--list` every workspace's with its size, `--all` removes them all
     cache gc    Collect what blaze keeps on disk now (`--dry-run` removes nothing, `--last`

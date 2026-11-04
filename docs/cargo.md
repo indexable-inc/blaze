@@ -267,6 +267,64 @@ That runs every test, outside any sandbox, as cargo does. blaze's `--reached` ru
 tests an edit can have changed, in the daemon, and `--ub` runs them in blaze's evaluator
 ([below](#which-tests-run)). Doc tests are blaze's own build of each example (below).
 
+### Lock files
+
+A build resolves the workspace against `Cargo.lock` and may change two files at the root:
+`Cargo.lock`, cargo's own (byte for byte what cargo writes, so cargo and its tools read it), and
+`blaze.lock`, which pins what blaze builds with besides the crates (below). Which a build may do
+(`crates/blaze-units/src/lock.rs`, `policy`):
+
+| Asked | A build that would change a lock file |
+|---|---|
+| `--locked` or `--frozen` with `--no-locked` | error: they disagree |
+| `--locked` or `--frozen` | refused |
+| `--no-locked` | writes it, saying what moved |
+| `CI` set (not empty, `false` or `0`), or `TF_BUILD` | refused |
+| `[workspace.metadata.blaze] lock = "required"` | refused |
+| none of these | writes it, saying what moved |
+
+`blaze lock` is `blaze check --no-locked`: it resolves, writes both files and says what moved,
+whatever CI or `lock = "required"` says. blaze's own tree sets `lock = "required"`.
+
+A refusal names every move and why, then the fix:
+
+    error: Cargo.lock would change, and this build may not change it: `CI` is set, which makes --locked the default
+      Cargo.lock:
+        ~ serde 1.0.200 → 1.0.219 (`app v0.1.0` asks `1.0.210`, which 1.0.200 does not match)
+        + itoa 1.0.15 (`serde_json v1.0.140` asks `1`)
+        - ryu 1.0.18 (nothing depends on it now)
+    fix: run `blaze lock` where the workspace is and commit Cargo.lock; or pass --no-locked to let this build write it
+
+A write is never silent. A new lock file says one line; a changed one says what moved, under it:
+
+    note: wrote Cargo.lock and blaze.lock: 143 packages, 1 native input, index as of 2026-11-04T10:12Z (commit them)
+    note: updated Cargo.lock: 1 package moved (commit it)
+    note:   Cargo.lock: ~ serde 1.0.200 → 1.0.219 (`app v0.1.0` asks `1.0.210`, which 1.0.200 does not match)
+
+The resolve keeps every package the lock pins that the manifests still allow, as cargo's does,
+so a manifest edit moves only what it has to. Under a refusal, a lock file that reads back to
+the same resolve (another encoding or spacing) is the same, as cargo's `--locked` has it.
+
+`blaze.lock` sits beside `Cargo.lock` and holds, in TOML:
+
+- `[blaze] release`, `toolchain`: the blaze release that builds the workspace and the nightly it
+  ships (`harness/toolchain`). Recorded when that release runs it as its pin says (or nothing
+  pins one); a build of blaze's tree (`0.0.0-dev`), or `--ignore-pin`, keeps what is there.
+- `[index] newest`: the newest publish time (the sparse index's `pubtime`) of any package the
+  resolve took from a registry's index, shown as "index as of": the index as the lock saw it,
+  told without a clock. A build that took nothing new keeps it.
+- `[native.<name>] pin` and `[native.<name>.targets]`: each pinned native input's pin file and
+  every target's sha256 ([Pinned native inputs](#pinned-native-inputs)): every input the root
+  manifest declares and every target its pin names, whatever this build needs.
+
+A pinned input that disagrees with `blaze.lock` (a pin file edited, another blaze release) is a
+lock change like a moved package: refused where changes are refused, written and said elsewhere.
+A `blaze.lock` that would pin nothing is not written. Unknown keys and other format versions are
+errors naming the file. Why a second file and not `Cargo.lock`'s `[metadata]`: that table is a
+flat map of strings cargo copies through `cargo update` untouched, so a pin there would go stale
+without a word, and anything blaze adds to `Cargo.lock` stops it being what cargo writes. One
+file holds every pin that is not a crate (docs/v2/plan/lock-policy.md).
+
 ### Sandboxed tests (an experiment, opt-in)
 
 Tests run in a sandbox only where the daemon runs them (`blaze test --reached`,
@@ -1036,6 +1094,11 @@ its place; `blaze version-resolve <channel>` reads it again. A pin to a
 version stays on that release, whose bytes never change: promotion from canary to stable flips
 the same release.
 
+`blaze.lock` records the release that built the workspace and its nightly ([Lock
+files](#lock-files)); a build by another release is a lock change, refused under CI or
+`lock = "required"` until `blaze lock` records it. The launcher does not yet run the release
+`blaze.lock` names for a channel pin or an unpinned workspace.
+
 ## How far a constant's evaluation may go
 
 Every evaluation of a constant, static, array length or other compile-time code has a budget
@@ -1059,6 +1122,7 @@ it, for that request alone:
 
 | Variable | Meaning | Default |
 |---|---|---|
+| `CI`, `TF_BUILD` | `CI` not empty, `false` or `0`, or `TF_BUILD` set: a build may not change `Cargo.lock` or `blaze.lock` (`--no-locked` lets it; [Lock files](#lock-files)) | unset: a build writes them and says so |
 | `BLAZE_SANDBOX` | `off` (or `0`) runs build scripts and proc macros, and tests under `--reached`, outside the sandbox ([above](#build-scripts-and-proc-macros-run-in-a-sandbox)) | sandboxed |
 | `BLAZE_ELIDE` | `verify` also compiles and runs a build script blaze elided as inert, and checks it said what elision did; any other value is an error | unset: an inert script is not run |
 | `BLAZE_PROC_MACRO_CACHE` | `check` expands again each expansion the store kept and compares; any other value is an error | unset: a kept expansion is used |

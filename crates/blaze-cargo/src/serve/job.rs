@@ -2643,6 +2643,7 @@ impl<S: Steps> Jobs<S> {
             std: self.setup.std.clone(), // clone: the config owns it, once per view
             builds: self.setup.builds.clone(), // clone: the config owns it, once per view
             sources: self.setup.sources.clone(), // clone: the config owns it, once per view
+            blaze: crate::release::get().version.to_owned(), // alloc: the config owns it, once per view
         };
         let encoded = config.encode();
         let key = Hasher::new("blaze v2 serve last plan").id(&opened.view.root).part(&encoded).finish();
@@ -3322,23 +3323,30 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         if let Some(lock) = lock {
-            let path = self.paths.intern(&lock.path);
-            // clone: the driver's effect owns the file's name, once per lock write
-            let Some(file) = self.paths.files[path as usize].clone() else {
-                // alloc: an error, once
-                let error = ApiError::new(format!("the lock file's path {} is no file", lock.path), Some(lock.path));
-                self.end(w, id, false, Some(error));
-                return;
-            };
-            let tag = match self.own_tag(Own::Write { job: id, path }) {
-                Ok(tag) => tag,
-                Err(error) => {
+            // Each lock file the load let this build write (`Cargo.lock`, `blaze.lock`), then
+            // what it says of them: a write is never silent (docs/cargo.md, "Lock files").
+            for written in lock.files {
+                let path = self.paths.intern(&written.path);
+                // clone: the driver's effect owns the file's name, once per lock write
+                let Some(file) = self.paths.files[path as usize].clone() else {
+                    // alloc: an error, once
+                    let error = ApiError::new(format!("the lock file's path {} is no file", written.path), Some(written.path));
                     self.end(w, id, false, Some(error));
                     return;
-                }
-            };
-            self.begin_placing(id, path);
-            w.effects.push(Effect::Write { file, bytes: lock.text.into_bytes(), tag });
+                };
+                let tag = match self.own_tag(Own::Write { job: id, path }) {
+                    Ok(tag) => tag,
+                    Err(error) => {
+                        self.end(w, id, false, Some(error));
+                        return;
+                    }
+                };
+                self.begin_placing(id, path);
+                w.effects.push(Effect::Write { file, bytes: written.text.into_bytes(), tag });
+            }
+            for line in &lock.said {
+                w.said.push(Said::Report(id, Response::Diagnostic(lock_note(line))));
+            }
         }
         for warning in &units.warnings {
             w.said.push(Said::Report(id, Response::Diagnostic(warned(warning))));
@@ -5564,6 +5572,22 @@ fn script_ended<S: Steps>(w: &mut World<'_, S>, node: NodeId, ok: bool) {
 }
 
 /// A warning of the load, as cargo prints it.
+/// What a build says of the lock files it wrote ([`LockWrite::said`]), as a note.
+fn lock_note(line: &str) -> Diagnostic {
+    // alloc: a line of the lock write, once per plan that writes one
+    Diagnostic {
+        level: Level::Note,
+        code: None,
+        message: line.to_owned(), // alloc: the report owns it
+        spans: Vec::new(),        // alloc: none
+        children: Vec::new(),     // alloc: none
+        facts: Vec::new(),        // alloc: none
+        rendered: format!("note: {line}\n"), // alloc: the report owns it
+        unit: None,
+        explanation: None,
+    }
+}
+
 fn warned(warning: &str) -> Diagnostic {
     // alloc: a warning of the load, once per plan
     Diagnostic {

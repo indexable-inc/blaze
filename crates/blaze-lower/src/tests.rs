@@ -229,6 +229,7 @@ fn config(view: ContentId, library: ContentId) -> BuildConfig {
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
         sources: "/s/sources".to_owned(),
+        blaze: String::new(),
     }
 }
 

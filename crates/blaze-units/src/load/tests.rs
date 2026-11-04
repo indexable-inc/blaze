@@ -173,6 +173,7 @@ impl Fixture {
             std: STD.to_owned(),
             builds: BUILDS.to_owned(),
             sources: SOURCES.to_owned(),
+            blaze: String::new(),
         };
         self.db.open_with(View { root: self.tree.root(&files) }, &config.encode())
     }
@@ -271,7 +272,7 @@ fn one_package_plans_its_library_and_binary_with_the_standard_library() {
     assert!(!units.target_dir.starts_with("/home/u/ws/"));
     assert_eq!(units.finished, "`dev` profile [unoptimized + debuginfo]");
     assert!(units.warnings.is_empty(), "{:?}", units.warnings);
-    let lock = units.lock.as_ref().expect("a new lock file");
+    let lock = units.lock.as_ref().and_then(|it| it.file("Cargo.lock")).expect("a new lock file");
     assert_eq!(lock.path, "/home/u/ws/Cargo.lock");
     assert_eq!(lock.text, format!("{HEADER}\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\n"));
 
@@ -903,7 +904,7 @@ fn without_a_lock_file_the_index_is_fetched_first_and_the_lock_written() {
     ];
     let both = Ask { mounts: vec![index_mount, mount(&serde_fetch().at, "serde")], ..ask(&fetched) };
     let units = ready(fixture.plan(fixture.open(&both)));
-    assert_eq!(units.lock.as_ref().map(|it| it.text.as_str()), Some(serde_lock().as_str()));
+    assert_eq!(units.lock.as_ref().and_then(|it| it.file("Cargo.lock")).map(|it| it.text.as_str()), Some(serde_lock().as_str()));
 }
 
 #[test]
@@ -1027,7 +1028,7 @@ fn only_a_unit_that_uses_an_artifact_dependency_is_refused() {
     let c_only = Ask { args: &["-Zbindeps", "-p", "c"], ..ask(&files) };
     let units = ready(fixture.plan(fixture.open(&c_only)));
     assert_eq!(roots_named(&units), ["c lib"]);
-    let lock = units.lock.expect("a new lock file").text;
+    let lock = units.lock.as_ref().and_then(|it| it.file("Cargo.lock")).expect("a new lock file").text.clone();
     assert!(lock.contains("name = \"a\"\nversion = \"0.1.0\"\ndependencies = [\n \"b\",\n]\n"), "{lock}");
 
     let a_too = Ask { args: &["-Zbindeps", "-p", "a"], ..ask(&files) };

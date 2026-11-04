@@ -192,6 +192,11 @@ pub struct BuildConfig {
     /// disk there for what reads it outside the VFS (a build script, the C compiler it runs).
     /// Never cargo's `$CARGO_HOME`, where blaze keeps no packages.
     pub sources: String,
+    /// The version of the blaze that serves the build: a release's `0.YYYYMMDD.N`, or
+    /// `0.0.0-dev` for a build of the tree. `blaze.lock` records it when it is a release run as
+    /// the workspace pins it ([`crate::lock`]).
+    #[serde(default)]
+    pub blaze: String,
 }
 
 impl BuildConfig {
@@ -381,7 +386,7 @@ pub enum Planned {
 }
 
 impl Versioned for Planned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 8");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 9");
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -423,8 +428,8 @@ pub struct Units {
     pub plans: Vec<UnitPlan>,
     /// Every package of the graph, sorted by id.
     pub packages: Vec<PackagePlan>,
-    /// `Cargo.lock` as cargo would write it, when cargo would write it (none, or out of date
-    /// and not `--locked`).
+    /// The lock files the build writes (`Cargo.lock` as cargo would write it, `blaze.lock`),
+    /// when one changes and the lock policy lets the build change it ([`crate::lock`]).
     pub lock: Option<LockWrite>,
     /// cargo's warnings of the load, each as cargo prints it after `warning: `.
     pub warnings: Vec<String>,
@@ -449,7 +454,8 @@ pub struct Units {
 impl Versioned for Units {
     // 13: `CARGO_PRIMARY_PACKAGE` left the plans' variables ([`Units::is_primary`]).
     // 14: the pinned native inputs ([`Units::native`]).
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 14");
+    // 15: [`LockWrite`] writes `blaze.lock` too, and says what moved.
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 15");
 }
 
 /// One pinned native input for one target: an archive named by its digest, which blaze fetches,
@@ -641,8 +647,26 @@ impl TestSandbox {
     }
 }
 
+/// The lock files a plan writes (docs/cargo.md, "Lock files"; [`crate::lock`]), and what the
+/// build says of them.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct LockWrite {
+    /// Each lock file that changes, whole: `Cargo.lock` before `blaze.lock`.
+    pub files: Vec<LockFile>,
+    /// What the build says, each a line: what it wrote, then each move of a file that was there.
+    pub said: Vec<String>,
+}
+
+impl LockWrite {
+    /// The file of `name` (`Cargo.lock`, `blaze.lock`) it writes, if it writes it.
+    pub fn file(&self, name: &str) -> Option<&LockFile> {
+        self.files.iter().find(|it| it.path.rsplit('/').next() == Some(name))
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct LockFile {
+    /// Absolute.
     pub path: String,
     pub text: String,
 }
@@ -844,6 +868,7 @@ mod tests {
             std: "/s/std".to_owned(),
             builds: "/s/build".to_owned(),
             sources: "/s/sources".to_owned(),
+            blaze: String::new(),
         };
         assert_eq!(BuildConfig::decode(&config.encode()).unwrap(), config);
         assert!(BuildConfig::decode(b"\xff").is_err());

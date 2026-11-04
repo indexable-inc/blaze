@@ -622,13 +622,18 @@ pub struct Locked<'a> {
 /// The same lock file: the same lines, or under [`Locked`] the same resolve read back from
 /// both, so a lock file differing only in its encoding or its spacing is left alone.
 pub fn are_equal_lockfiles(orig: &str, current: &str, locked: Option<Locked<'_>>) -> bool {
+    are_equal_lockfiles_with(orig, current, locked.map(|it| it.path_deps))
+}
+
+/// [`are_equal_lockfiles`] by the workspace's path packages alone.
+fn are_equal_lockfiles_with(orig: &str, current: &str, path_deps: Option<&PathDeps>) -> bool {
     if orig.lines().eq(current.lines()) {
         return true;
     }
-    let Some(locked) = locked else { return false };
+    let Some(path_deps) = path_deps else { return false };
     let same = || -> Result<bool> {
-        let old = into_resolve(parse(orig)?, orig, locked.path_deps)?;
-        let new = into_resolve(parse(current)?, current, locked.path_deps)?;
+        let old = into_resolve(parse(orig)?, orig, path_deps)?;
+        let new = into_resolve(parse(current)?, current, path_deps)?;
         Ok(old == new)
     };
     matches!(same(), Ok(true))
@@ -644,13 +649,8 @@ pub fn lockfile_to_write(
     lowest_rust_version: Option<&RustVersion>,
     locked: Option<Locked<'_>>,
 ) -> Result<Option<String>> {
-    let mut out = serialize_resolve(resolve, orig);
-    if let Some(orig) = orig
-        && are_equal_lockfiles(orig, &out, locked)
-    {
-        return Ok(None);
-    }
-    if let Some(locked) = locked {
+    let out = lockfile_change(resolve, orig, lowest_rust_version, locked.map(|it| it.path_deps));
+    if let (Some(_), Some(locked)) = (&out, locked) {
         let action = if orig.is_some() { "update" } else { "create" };
         let (path, flag) = (locked.path.display(), locked.flag);
         bail!(
@@ -659,10 +659,35 @@ pub fn lockfile_to_write(
              remove the {flag} flag and use --offline instead."
         );
     }
+    Ok(out)
+}
+
+/// What a resolve changes of `Cargo.lock` (`orig`, the lock file there): `None` when it is
+/// already the same, else the new text, raised to the encoding a new lock file of the
+/// workspace would have (from its lowest `rust-version`) if it was older. `same_resolve` (the
+/// workspace's path packages) compares the resolves read back from both texts, as `--locked`
+/// does, so a lock file differing only in its encoding or spacing is the same; without it the
+/// lines are compared, and such a file is written again. Never an error: whether the change
+/// may be made is the caller's policy (blaze-units' `lock`).
+pub fn lockfile_change(
+    resolve: &mut Resolve,
+    orig: Option<&str>,
+    lowest_rust_version: Option<&RustVersion>,
+    same_resolve: Option<&PathDeps>,
+) -> Option<String> {
+    let mut out = serialize_resolve(resolve, orig);
+    if let Some(orig) = orig
+        && are_equal_lockfiles_with(orig, &out, same_resolve)
+    {
+        return None;
+    }
+    if same_resolve.is_some() {
+        return Some(out);
+    }
     let default_version = ResolveVersion::with_rust_version(lowest_rust_version);
     if resolve.version() < default_version {
         resolve.set_version(default_version);
         out = serialize_resolve(resolve, orig);
     }
-    Ok(Some(out))
+    Some(out)
 }

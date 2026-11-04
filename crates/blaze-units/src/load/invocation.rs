@@ -54,6 +54,17 @@ pub(crate) struct Asked {
     pub locked: bool,
     pub offline: bool,
     pub frozen: bool,
+    /// `--no-locked`: this build may change the lock files whatever `CI` or the workspace says
+    /// ([`crate::lock::policy`]).
+    pub no_locked: bool,
+    /// The environment says this runs on CI ([`crate::lock::ci_says`]): `--locked` is the
+    /// default. Read here, not kept in [`Asked::env`]: `CI` is no variable cargo's load reads.
+    pub ci: bool,
+    /// `BLAZE_IGNORE_PIN_FOR`: the root manifest a blaze above this one was told
+    /// `--ignore-pin` for, where this blaze is not the one the workspace pins.
+    pub ignore_pin_for: Option<String>,
+    /// [`crate::query::BuildConfig::blaze`]: the version of the blaze that serves the build.
+    pub blaze: String,
     /// `--config`, in order.
     pub config: Vec<String>,
     /// `-Z`, in order.
@@ -95,6 +106,11 @@ impl Asked {
             _ => None,
         }
     }
+
+    /// What the command line and the environment say of the lock files.
+    pub fn lock_ask(&self) -> crate::lock::LockAsk {
+        crate::lock::LockAsk { flag: self.locked_flag(), no_locked: self.no_locked, ci: self.ci }
+    }
 }
 
 /// The view's configuration as the load reads it.
@@ -105,11 +121,11 @@ pub(crate) struct Configured {
 }
 
 impl Versioned for Configured {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 6");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 7");
 }
 
 impl Versioned for Asked {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked 4");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked 5");
 }
 
 /// Reads `Cx::config`: the [`BuildConfig`] narrowed.
@@ -118,7 +134,7 @@ pub(crate) struct Invocation;
 impl Query for Invocation {
     const KIND: QueryKind = QueryKind(0x6010);
     const NAME: &'static str = "cargo invocation";
-    const PRODUCER: ContentId = producer("blaze v2 cargo invocation 4");
+    const PRODUCER: ContentId = producer("blaze v2 cargo invocation 5");
     type Key = ();
     type Value = Cbor<Configured>;
 
@@ -138,7 +154,7 @@ pub(crate) struct Asking;
 impl Query for Asking {
     const KIND: QueryKind = QueryKind(0x6011);
     const NAME: &'static str = "cargo asked";
-    const PRODUCER: ContentId = producer("blaze v2 cargo asked 2");
+    const PRODUCER: ContentId = producer("blaze v2 cargo asked 3");
     type Key = ();
     type Value = Cbor<Result<Asked, LoadError>>;
 
@@ -152,7 +168,7 @@ impl Query for Asking {
 }
 
 impl Versioned for Result<Asked, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked or not 3");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked or not 4");
 }
 
 fn configure(bytes: &[u8]) -> Configured {
@@ -162,6 +178,9 @@ fn configure(bytes: &[u8]) -> Configured {
         Err(what) => return Configured { asked: Err(LoadError { what, at: None }), mounts: empty },
     };
     let invocation = config.invocation;
+    let whole = |name: &str| crate::query::env_var(&invocation.env, name);
+    let ci = crate::lock::ci_says(whole("CI"), whole("TF_BUILD"));
+    let ignore_pin_for = whole("BLAZE_IGNORE_PIN_FOR").filter(|it| !it.is_empty()).map(str::to_owned);
     let env: Vec<(String, String)> =
         invocation.env.into_iter().filter(|(name, _)| read_by_cargo(name)).collect();
     let mut known: Vec<String> = Vec::new();
@@ -196,6 +215,9 @@ fn configure(bytes: &[u8]) -> Configured {
         std: config.std,
         builds: config.builds,
         sources: config.sources,
+        ci,
+        ignore_pin_for,
+        blaze: config.blaze,
         ..Asked::default()
     };
     asked.command = Some(invocation.command);
@@ -291,6 +313,7 @@ fn argument(command: Command, name: &str) -> Option<Takes> {
         "locked" => Some(Takes::Flag(|a| a.locked = true)),
         "offline" => Some(Takes::Flag(|a| a.offline = true)),
         "frozen" => Some(Takes::Flag(|a| a.frozen = true)),
+        "no-locked" => Some(Takes::Flag(|a| a.no_locked = true)),
         "config" => Some(Takes::Value(|a, v| {
             a.config.push(v);
             Ok(())
@@ -505,6 +528,7 @@ mod tests {
             std: "/s/std".to_owned(),
             builds: "/s/build".to_owned(),
             sources: "/s/sources".to_owned(),
+            blaze: String::new(),
         };
         let configured = configure(&config.encode());
         let asked = configured.asked.unwrap();
