@@ -133,7 +133,6 @@ fn a_streamed_response_read_in_place_allocates_nothing() {
             executable: 1,
         }),
         Response::Ran { code: Some(0), stderr: b"warn\n".to_vec(), stdout: b"hi\n".to_vec() },
-        Response::Error(ApiError::new("no such head", Some("main".to_owned()))),
         Response::Done { ok: false },
     ];
     let mut stream = Vec::new();
@@ -160,7 +159,6 @@ fn a_streamed_response_read_in_place_allocates_nothing() {
                 ResponseRef::BuildScript(it) => it.env.iter().count() + it.cfgs.iter().map(str::len).sum::<usize>(),
                 ResponseRef::TestResult(it) => it.output.len() + it.executable as usize,
                 ResponseRef::Ran { stderr, stdout, .. } => stderr.len() + stdout.len(),
-                ResponseRef::Error(it) => it.what.len(),
                 ResponseRef::Done { ok } => usize::from(ok),
                 other => panic!("{other:?}"),
             };

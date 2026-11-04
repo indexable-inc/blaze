@@ -314,6 +314,7 @@ ix-prof = { path = "crates/ix-prof", default-features = false }
 blaze-explore = { path = "crates/blaze-explore" }
 blaze-web = { path = "crates/blaze-web" }
 blaze-protocol = { path = "crates/blaze-protocol" }
+blaze-report = { path = "crates/blaze-report" }
 blaze-serde = { path = "crates/blaze-serde" }
 blaze-serde-derive = { path = "crates/blaze-serde-derive" }
 blaze-ui = { path = "crates/blaze-ui" }

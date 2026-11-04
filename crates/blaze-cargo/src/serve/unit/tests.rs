@@ -221,8 +221,11 @@ fn a_directive_the_sandbox_refuses_fails_the_build() {
     let z = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap();
     let printed = "cargo:rustc-link-search=native=/home/me/lib\n";
     let judged = script::judge(&z, &[], &value(0, printed, ""), Some(&[]), None, false);
-    assert!(judged.output.is_none());
-    assert!(judged.diagnostics[0].message.starts_with("the build script of `z-sys` printed a directive"));
+    assert!(judged.output.is_none() && judged.diagnostics.is_empty());
+    let report = judged.failure.expect("the sandbox refused it");
+    assert_eq!(report.rule.as_deref(), Some("sandbox:link-dir"));
+    assert_eq!(report.subject(), Some("z-sys"));
+    assert!(report.flat().contains("`cargo:rustc-link-search=native=/home/me/lib`"), "{}", report.flat());
     // Outside the sandbox nothing is checked.
     let judged = script::judge(&z, &[], &value(0, printed, ""), None, None, false);
     assert!(judged.output.is_some());
@@ -237,26 +240,29 @@ fn a_failed_script_says_what_cargo_says() {
     let z = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap();
     let judged = script::judge(&z, &[], &value(101, "cargo:warning=no zlib\n", "thread 'main' panicked\n"), Some(&[]), None, false);
     assert!(judged.output.is_none());
-    let [warning, error] = judged.diagnostics.as_slice() else { panic!("{:?}", judged.diagnostics) };
+    // Its warning is cargo's line; its failure is a report of the script, how it ended and the
+    // end of what it wrote (its directives left out).
+    let [warning] = judged.diagnostics.as_slice() else { panic!("{:?}", judged.diagnostics) };
     assert_eq!(warning.rendered, "warning: z-sys@0.1.0: no zlib\n");
-    assert_eq!(error.level, Level::Error);
-    assert_eq!(
-        error.message,
-        "failed to run custom build command for `z-sys v0.1.0 (/w/z-sys)`\n\nCaused by:\n  process didn't exit \
-         successfully: `/w/target/debug/build/x/build-script-build` (exit status: 101)\n  --- stdout\n  \
-         cargo:warning=no zlib\n  \n  --- stderr\n  thread 'main' panicked"
-    );
-    assert!(error.rendered.starts_with("error: failed to run custom build command for `z-sys v0.1.0 (/w/z-sys)`\n"));
+    let report = judged.failure.expect("the run failed");
+    assert_eq!(report.rule.as_deref(), Some("build-script:failed"));
+    assert_eq!(report.subject(), Some("z-sys"));
+    assert_eq!(report.flat(), "the build script failed\n  it ended with exit status: 101\n  thread 'main' panicked");
 
-    // An error it logged fails it too, under cargo's cause.
-    let judged = script::judge(&z, &[], &value(0, "cargo::error=no zlib\n", ""), Some(&[]), None, true);
-    let [logged, error] = judged.diagnostics.as_slice() else { panic!("{:?}", judged.diagnostics) };
-    assert_eq!(logged.message, "z-sys@0.1.0: no zlib");
-    assert_eq!(logged.rendered, "\x1b[1m\x1b[91merror\x1b[0m\x1b[1m:\x1b[0m z-sys@0.1.0: no zlib\n");
-    assert_eq!(
-        error.message,
-        "failed to run custom build command for `z-sys v0.1.0 (/w/z-sys)`\n\nCaused by:\n  build script logged errors"
-    );
+    // An error it logged fails it too, said as the headline.
+    let judged = script::judge(&z, &[], &value(0, "cargo::error=no `zlib`\n", ""), Some(&[]), None, true);
+    assert!(judged.diagnostics.is_empty(), "{:?}", judged.diagnostics);
+    let report = judged.failure.expect("it logged an error");
+    assert_eq!(report.rule.as_deref(), Some("build-script:error"));
+    assert_eq!(report.headline, blaze_api::Text::new().words("no ").code("zlib"));
+
+    // A script that says its own report (`cargo:blaze-report=`) is shown by it.
+    let printed = "cargo:blaze-report=headline=z-sys can't find zlib\ncargo:blaze-report=rule=llvm:pin\n\
+                   cargo:blaze-report=fact.found=`ZLIB_DIR` is not set\ncargo:blaze-report=fix=nix develop\n\
+                   cargo::error=no zlib: set ZLIB_DIR\n";
+    let report = script::judge(&z, &[], &value(0, printed, ""), Some(&[]), None, false).failure.expect("it logged an error");
+    assert_eq!(report.flat(), "z-sys can't find zlib\n  `ZLIB_DIR` is not set\n  fix: nix develop");
+    assert_eq!(report.rule.as_deref(), Some("llvm:pin"));
 }
 
 #[test]
@@ -296,7 +302,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
     assert!(!one.given.iter().any(|it| it == "SECRET_TOKEN"));
     // Nor in anything said of the run.
     let judged = script::judge(&z, &env, &value(1, "", ""), Some(&[]), None, false);
-    let said = blaze_protocol::cbor::to_vec(&judged.diagnostics).unwrap();
+    let said = blaze_protocol::cbor::to_vec(&(&judged.diagnostics, &judged.failure)).unwrap();
     assert!(!said.windows(7).any(|it| it == b"hunter2"));
 }
 

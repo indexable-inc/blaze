@@ -454,7 +454,7 @@ fn a_build(n: usize) -> Vec<Response> {
         responses.push(Response::UnitEnded(lib_of(&name)));
     }
     responses.push(Response::Fetched { verb: FetchVerb::Downloaded, what: "serde v1.0.219".to_owned() });
-    responses.push(Response::Error(ApiError::new("no package `nope` in the workspace", None)));
+    // No error: one ends a request, and is read and said owned, once (a report).
     responses
 }
 
@@ -574,4 +574,34 @@ fn what_the_daemon_fetched() {
     assert_eq!(err, "    Updating crates.io index\n  Downloaded serde v1.0.219\n");
     let (_, quiet) = printed(Shown { quiet: true, ..Shown::default() }, &responses, false);
     assert_eq!(quiet, "");
+}
+
+/// A unit's failure said as a report waits for what it blocks, names it by count and the one
+/// that matters, and stands for cargo's "could not compile"; JSON gets it whole, every package.
+#[test]
+fn a_units_report_names_what_it_blocks() {
+    let unit = lib_of("foo");
+    let at = blaze_api::Text::new().words("build script of ").package("foo", None).words("  (").path("/w/foo").words(")");
+    let report = blaze_api::Report::error(blaze_api::Text::plain("foo can't find zlib")).rule("llvm:pin").at(at);
+    let behind = blaze_api::Behind {
+        id: Some(unit.id),
+        why: "the build script failed".to_owned(),
+        unit: "foo v0.1.0 (build script run)".to_owned(),
+        units: vec!["app v0.1.0 (lib)".to_owned(), "app v0.1.0 (bin \"app\")".to_owned(), "cli v0.1.0 (bin \"cli\")".to_owned()],
+    };
+    let unchecked = blaze_api::Unchecked { open: Vec::new(), behind: vec![behind], tests: Vec::new(), stopped: false };
+    let responses = [
+        Response::Report { unit: Some(unit), report },
+        Response::Unchecked(unchecked),
+        Response::Done { ok: false },
+    ];
+    let (_, err) = printed(Shown::default(), &responses, false);
+    let expected = "error: foo can't find zlib  [llvm: pin]\n  ┌ build script of foo  (foo)\n  └ blocks 2 packages, including cli\n\n  more  blaze explain foo\n";
+    assert!(err.starts_with(expected), "{err}");
+    assert!(!err.contains("could not compile"), "{err}");
+
+    let json = Shown { format: Format::Json { short: false, ansi: false, render_diagnostics: false }, ..Shown::default() };
+    let (out, _) = printed(json, &responses, false);
+    let line = out.lines().find(|it| it.starts_with("{\"reason\":\"blaze-report\"")).expect(&out);
+    assert!(line.contains("\"all\":[\"app\",\"cli\"]") && line.contains("\"count\":2"), "{line}");
 }

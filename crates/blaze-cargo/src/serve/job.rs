@@ -1436,7 +1436,9 @@ impl<S: Steps> Build<S> {
                     _ => "it failed".to_owned(),                      // alloc: as above
                 };
                 let unit = name(root).unwrap_or_else(|| "a step of the build that is no unit".to_owned()); // alloc: as above
-                behind.push(Behind { why, unit, units: Vec::new() }); // alloc: one per failure
+                // A node of no unit (`usize::MAX`) has no id.
+                let id = u32::try_from(root).ok().filter(|_| root < graph.len());
+                behind.push(Behind { id, why, unit, units: Vec::new() }); // alloc: one per failure
             }
             if let (Some(group), Some(unit)) = (behind.last_mut(), name(at)) {
                 group.units.push(unit);

@@ -500,6 +500,7 @@ dependencies = [
  "blaze-mem",
  "blaze-protocol",
  "blaze-query",
+ "blaze-report",
  "blaze-serde",
  "blaze-vfs",
  "libc",
@@ -589,6 +590,7 @@ dependencies = [
  "blaze-protocol",
  "blaze-query",
  "blaze-registry",
+ "blaze-report",
  "blaze-serde",
  "blaze-sha256",
  "blaze-source",
@@ -1670,6 +1672,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-report"
+version = "0.0.0"
+dependencies = [
+ "blaze-protocol",
+ "serde",
+ "sonic-rs",
+ "toml",
+ "unicode-width 0.2.3",
+]
+
+[[package]]
 name = "blaze-resolve"
 version = "0.0.0"
 dependencies = [
@@ -1855,6 +1868,7 @@ dependencies = [
  "blaze-ids",
  "blaze-protocol",
  "blaze-query",
+ "blaze-report",
  "blaze-v2-proof",
  "blaze-vfs",
  "hashbrown 0.17.1",

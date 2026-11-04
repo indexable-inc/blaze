@@ -76,13 +76,8 @@ pub fn status_word(out: &mut String, word: &str, color: bool) {
     out.push(' ');
 }
 
-/// `level: what` and its newline into `out`, as cargo-util-terminal's `message_stderr` writes an
-/// unjustified status: the level in `style`, the colon plain.
-fn leveled(out: &mut String, style: &str, level: &str, what: &str, color: bool) {
-    leveled_with(out, style, level, color, |out| out.push_str(what));
-}
-
-/// [`leveled`] of the text `what` writes into `out`.
+/// `level: ` and the text `what` writes, and its newline, into `out`, as cargo-util-terminal's
+/// `message_stderr` writes an unjustified status: the level in `style`, the colon plain.
 pub fn leveled_with(out: &mut String, style: &str, level: &str, color: bool, what: impl FnOnce(&mut String)) {
     if color {
         out.push_str(style);
@@ -96,20 +91,35 @@ pub fn leveled_with(out: &mut String, style: &str, level: &str, color: bool, wha
     out.push('\n');
 }
 
-/// `error: what`: cargo's `Shell::error`, with its newline, into `out`.
+/// `error: what`: cargo's `Shell::error`, with its newline, into `out`: a report of words only
+/// ([`blaze_report::Report::text`]), through the one renderer. A caller that knows more says a
+/// [`blaze_report::Report`] of its own and renders it ([`report_into`]).
 pub fn error_into(out: &mut String, what: &str, color: bool) {
-    leveled(out, ERROR, "error", what, color);
+    words_into(out, blaze_report::Severity::Error, what, color);
 }
 
 /// `warning: what`: cargo's `Shell::warn`, with its newline, into `out`.
 pub fn warning_into(out: &mut String, what: &str, color: bool) {
-    leveled(out, WARN, "warning", what, color);
+    words_into(out, blaze_report::Severity::Warning, what, color);
 }
 
 /// `note: what`: cargo's `Shell::note` (annotate-snippets' secondary title: `note` in its note
 /// style, the colon and the text plain), with its newline, into `out`.
 pub fn note_into(out: &mut String, what: &str, color: bool) {
-    leveled(out, GOOD, "note", what, color);
+    words_into(out, blaze_report::Severity::Note, what, color);
+}
+
+/// A report of `what` alone at `severity`: `level: what` and its newline, the level in its
+/// style, as cargo's shell writes it.
+fn words_into(out: &mut String, severity: blaze_report::Severity, what: &str, color: bool) {
+    // alloc: a line said once, never per unit
+    let report = blaze_report::Report::new(severity, blaze_report::Text::plain(what));
+    report_into(out, &report, blaze_report::Caps { color, links: false, width: None }, &blaze_report::Roots::NONE);
+}
+
+/// `report` as the terminal `caps` describes gets it, paths shown from `roots`.
+pub fn report_into(out: &mut String, report: &blaze_report::Report, caps: blaze_report::Caps, roots: &blaze_report::Roots<'_>) {
+    blaze_report::render_into(out, report, caps, roots);
 }
 
 /// [`error_into`] as its own text, for an error path.

@@ -77,6 +77,7 @@ proc-macro-api.workspace = true
 blaze-ui.workspace = true
 blaze-units.workspace = true
 blaze-registry.workspace = true
+blaze-report.workspace = true
 # `.crate` files and `blaze fetch-url`: bytes by their digest, kept in the store.
 blaze-fetch.workspace = true
 # The `SourceId` of a git dependency the daemon fetches (`serve/fetch/git.rs`).

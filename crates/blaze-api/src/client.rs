@@ -69,8 +69,10 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClientError::Io(error) => write!(f, "the daemon's connection: {error}"),
-            ClientError::Refused(ApiError { what, at: Some(at) }) => write!(f, "{what} (at {at})"),
-            ClientError::Refused(ApiError { what, at: None }) => f.write_str(what),
+            ClientError::Refused(error) => match &error.at {
+                Some(at) => write!(f, "{} (at {at})", error.what),
+                None => f.write_str(&error.what),
+            },
             ClientError::Schema { theirs } => {
                 write!(f, "the daemon speaks schema {theirs}, this client {SCHEMA}")
             }

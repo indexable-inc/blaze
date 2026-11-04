@@ -951,6 +951,21 @@ impl Report {
             | Response::Unchecked(_)
             | Response::Work(_) => {}
             Response::Verified { mismatches } => self.verified = Some(mismatches),
+            // What blaze itself said of a unit (a build script that failed, a refused
+            // directive): an error is one of the build's, listed by its words.
+            Response::Report { report, .. } => match report.severity {
+                blaze_api::Severity::Error => {
+                    self.errors += 1;
+                    if self.listed_count < MOST_LISTED {
+                        self.listed_count += 1;
+                        self.listed.push('\n');
+                        report.flat_into(&mut self.listed);
+                        self.listed.push('\n');
+                    }
+                }
+                blaze_api::Severity::Warning => self.warnings += 1,
+                blaze_api::Severity::Note => {}
+            },
             Response::Error(error) => {
                 self.said.push_str("\n- ");
                 self.said.push_str(&error.what);
