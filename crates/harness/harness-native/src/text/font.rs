@@ -11,6 +11,8 @@ pub use super::font_mac::Font;
 pub trait FontSource: Clone + Sized {
     /// The font whose PostScript name is `name` at `size`, if it is installed (never a substitute).
     fn named(name: &str, size: f32) -> Option<Self>;
+    /// The regular face of the installed family `family` (Ghostty's font-family: "Berkeley Mono") at `size`, if any.
+    fn family(family: &str, size: f32) -> Option<Self>;
     /// The system's UI font at `size`, its emphasized weight when `bold`: text's font when Inter is not installed.
     fn system(size: f32, bold: bool) -> Self;
     /// The system's fixed-pitch font at `size`: code's when Berkeley Mono is not installed.

@@ -173,6 +173,26 @@ const CODE_FONTS: [&str; 4] = ["BerkeleyMono-Regular", "JetBrainsMono-Regular", 
 fn code_font(size: f32, weight: u16, italic: bool) -> Font {
     let env = std::env::var("HARNESS_MONO").ok();
     let regular = env.iter().map(String::as_str).chain(CODE_FONTS).find_map(|n| Font::named(n, size)).unwrap_or_else(|| Font::fixed(size));
+    styled(regular, size, weight, italic)
+}
+
+/// The first of `names` installed, by family (Ghostty's font-family) or PostScript name, at `size`.
+fn first_family(names: &[String], size: f32) -> Option<Font> {
+    names.iter().find_map(|n| Font::family(n, size).or_else(|| Font::named(n, size)))
+}
+
+/// The terminal's font families from the user's Ghostty config (font-family and its -bold, -italic and -bold-italic),
+/// each in Ghostty's order; empty: harness's own choice ([`code_font`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TermFamilies {
+    pub regular: Vec<String>,
+    pub bold: Vec<String>,
+    pub italic: Vec<String>,
+    pub bold_italic: Vec<String>,
+}
+
+/// `regular`'s bold (`weight` 600 and up) or slanted face, when it has one.
+fn styled(regular: Font, size: f32, weight: u16, italic: bool) -> Font {
     let bold = weight >= 600;
     if !bold && !italic {
         return regular;
@@ -294,8 +314,26 @@ impl Fonts {
     /// installed, else the bundled JetBrains Mono.
     pub fn term_font(&mut self, size: f32, bold: bool, italic: bool) -> FontId {
         register_term_fonts();
-        let f = code_font(size, if bold { 700 } else { 400 }, italic);
+        let weight = if bold { 700 } else { 400 };
+        let fam = &self.term_families;
+        // A family the config names for this style, in that style; else the primary family's; else harness's own.
+        let own = match (bold, italic) {
+            (false, false) => &[][..],
+            (true, false) => &fam.bold[..],
+            (false, true) => &fam.italic[..],
+            (true, true) => &fam.bold_italic[..],
+        };
+        let f = first_family(own, size)
+            .or_else(|| first_family(&fam.regular, size))
+            .map_or_else(|| code_font(size, weight, italic), |r| styled(r, size, weight, italic));
         self.register(&f)
+    }
+
+    /// Set the terminal's families (the user's Ghostty font-family keys); true when they changed.
+    pub fn set_term_families(&mut self, f: TermFamilies) -> bool {
+        let changed = self.term_families != f;
+        self.term_families = f;
+        changed
     }
 
     /// `id`'s metrics (an unknown id reads as zeros).
@@ -563,6 +601,8 @@ pub struct Fonts {
     look: TypeLook,
     /// What the typesetter has read of the fonts.
     shaper: shaper::Fonts,
+    /// The terminal's families from the user's Ghostty config.
+    term_families: TermFamilies,
 }
 
 impl Default for Fonts {
@@ -585,7 +625,7 @@ impl Fonts {
     /// Fonts that set type in the proportions of `look`.
     #[must_use]
     pub fn new(look: TypeLook) -> Self {
-        Self { by_id: HashMap::new(), ui: HashMap::new(), faces: HashMap::new(), look, shaper: shaper::Fonts::default() }
+        Self { by_id: HashMap::new(), ui: HashMap::new(), faces: HashMap::new(), look, shaper: shaper::Fonts::default(), term_families: TermFamilies::default() }
     }
 
     /// Set type in the proportions of `look` from now on (a scene reload): faces made for the old ones are made again.

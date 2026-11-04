@@ -45,12 +45,36 @@ pub fn filter(chunk: &[u8], term: &mut harness_vt::Term) -> Filtered {
 const FIXED: &[&[u8]] = &[
     b"\x1b[6n", b"\x1b[?6n", b"\x1b[5n", b"\x1b[c", b"\x1b[0c", b"\x1b[>c", b"\x1b[>0c", b"\x1b[?u",
     b"\x1b[18t", b"\x1b[14t", b"\x1b[16t", b"\x1b[>q", b"\x1b[>0q",
-    b"\x1b]10;?\x1b\\", b"\x1b]10;?\x07", b"\x1b]11;?\x1b\\", b"\x1b]11;?\x07",
+    b"\x1b]10;?\x1b\\", b"\x1b]10;?\x07", b"\x1b]11;?\x1b\\", b"\x1b]11;?\x07", b"\x1b]12;?\x1b\\", b"\x1b]12;?\x07",
+    // The appearance (dark or light), which picks the Ghostty theme's half the colours above come from.
+    b"\x1b[?996n",
 ];
 
 fn query_len(s: &[u8]) -> Option<usize> {
     if let Some(p) = FIXED.iter().find(|p| s.starts_with(p)) {
         return Some(p.len());
+    }
+    // OSC 4 palette queries: ESC ] 4 ; <index> ; ? [; <index> ; ?]... then BEL or ST.
+    if let Some(mut rest) = s.strip_prefix(b"\x1b]4;") {
+        loop {
+            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            if digits == 0 || !rest[digits..].starts_with(b";?") {
+                break;
+            }
+            rest = &rest[digits + 2..];
+            if let Some(after) = rest.strip_prefix(b";") {
+                rest = after;
+                continue;
+            }
+            let end = if rest.starts_with(b"\x07") {
+                1
+            } else if rest.starts_with(b"\x1b\\") {
+                2
+            } else {
+                break;
+            };
+            return Some(s.len() - rest.len() + end);
+        }
     }
     // DECRQM: ESC [ ? <digits> $ p
     if s.starts_with(b"\x1b[?") {

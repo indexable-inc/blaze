@@ -34,9 +34,7 @@ pub use libghostty_vt::terminal::Mode;
 
 /// A cell's pixel size as the daemon reports it (CSI 14/16 t). It has no font, so this is a nominal 8x16.
 pub const CELL_PX: (u32, u32) = (8, 16);
-/// The default ink and ground the daemon reports (OSC 10/11): harness-native's dark theme.
-pub const DEFAULT_FG: (u8, u8, u8) = (0xdc, 0xdc, 0xe0);
-pub const DEFAULT_BG: (u8, u8, u8) = (0x12, 0x12, 0x14);
+pub use harness_ghostty_config as ghostty_config;
 /// Ghostty's version when no Ghostty is installed to ask.
 const GHOSTTY_VERSION_FALLBACK: &str = "1.3.2";
 
@@ -306,6 +304,15 @@ pub struct Term {
 // this struct and moves with it, and `&mut self` (or the caller's lock) keeps all use on one thread at a time.
 unsafe impl Send for Term {}
 
+/// `t` as `term`'s default colours.
+fn apply_theme(term: &mut Terminal<'static, 'static>, t: &harness_ghostty_config::Theme) {
+    let rgb = |[r, g, b]: [u8; 3]| RgbColor { r, g, b };
+    ok(term.set_default_fg_color(Some(rgb(t.fg))));
+    ok(term.set_default_bg_color(Some(rgb(t.bg))));
+    ok(term.set_default_cursor_color(t.cursor.map(rgb)));
+    ok(term.set_default_color_palette(Some(libghostty_vt::style::Palette(t.palette.map(rgb)))));
+}
+
 /// libghostty errors here are invariant breaks (bad handle, out of memory), not input errors: input never fails.
 fn ok<T>(r: libghostty_vt::error::Result<T>) -> T {
     r.unwrap_or_else(|e| panic!("libghostty-vt: {e:?}"))
@@ -320,9 +327,12 @@ impl Term {
         let shared = Rc::new(RefCell::new(Shared::default()));
         ok(term.set_scrollback_max_lines(Some(scrollback)));
         ok(term.resize(cols, rows, CELL_PX.0, CELL_PX.1));
-        let rgb = |(r, g, b): (u8, u8, u8)| Some(RgbColor { r, g, b });
-        ok(term.set_default_fg_color(rgb(DEFAULT_FG)));
-        ok(term.set_default_bg_color(rgb(DEFAULT_BG)));
+        // The user's Ghostty theme for the current appearance (OSC 4/10/11/12 answer from it; see `query`).
+        apply_theme(&mut term, &harness_ghostty_config::current_theme());
+        // CSI ? 996 n: the system appearance, which picks the theme's dark or light half.
+        ok(term.on_color_scheme(|_| {
+            Some(if harness_ghostty_config::system_dark() { libghostty_vt::terminal::ColorScheme::Dark } else { libghostty_vt::terminal::ColorScheme::Light })
+        }));
         // The sentinel [`cursor_look`] reads as "no DECSCUSR in effect".
         ok(term.set_default_cursor_style(Some(libghostty_vt::terminal::CursorStyle::BlockHollow)));
         let s = shared.clone();
@@ -375,11 +385,19 @@ impl Term {
         self.shared.borrow_mut().replies.clear();
     }
 
-    /// Parse `bytes` (normally one terminal query) and return what libghostty wrote back for it.
+    /// Parse `bytes` (normally one terminal query) and return what libghostty wrote back for it. The default colours
+    /// are first set again from the user's Ghostty theme for the appearance now, so OSC 4/10/11 follow a theme edit or
+    /// a light/dark switch.
     pub fn query(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.set_theme(&harness_ghostty_config::current_theme());
         self.shared.borrow_mut().replies.clear();
         self.term.vt_write(bytes);
         std::mem::take(&mut self.shared.borrow_mut().replies)
+    }
+
+    /// Make `t` the default colours (ink, ground, cursor, the 256-colour palette); colours a program set by OSC stay.
+    pub fn set_theme(&mut self, t: &harness_ghostty_config::Theme) {
+        apply_theme(&mut self.term, t);
     }
 
     /// Resize to `cols` x `rows`, reflowing the primary screen.
