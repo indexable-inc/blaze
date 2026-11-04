@@ -8,9 +8,9 @@
 //!   Killed | Lost)`, [`ExitCode`], [`Created`] / [`Ended`], and `ChildOf` its session (or the device). A run split into
 //!   pipeline stages has one child per stage: [`StageNo`], `(Kind, Stage)`, its text, its own status, exit code and times.
 //! - A run whose session the daemon does not list goes under a group node (`(Kind, Group)`, [`GroupKey`], [`Name`]) on
-//!   the device: one "REPL runs" per REPL (the run's `repl`) or per gone session, else one "other runs".
+//!   the device: one "REPL runs" per REPL (the run's `repl`) or per gone session, else one "other runs", all below the live sessions.
 //! - [`Unfolded`] on a session (or the device) shows all its runs; without it the tree folds all but the last few.
-//!   [`Collapsed`] on a node hides all its children ("other runs" starts so).
+//!   [`Collapsed`] on a node hides all its children (every run group starts so).
 //! - `(Viewing, object)` on the app entity is what the main pane shows (exclusive).
 //! - An attached object has [`Term`]: its grid's size and how far it is scrolled back; the terminal (harness-vt) itself is the
 //!   host's, in [`Terms`] by session id (a parser is no plain data a component can hold).
@@ -470,9 +470,8 @@ fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json
                         g.set(GroupKey { s: key.as_str().into() });
                         g.add((Kind::id(), group_kind));
                         g.set(Name { s: name.as_str().into() });
-                        if key == "other" {
-                            g.add(Collapsed::id());
-                        }
+                        // Runs whose session is gone are history: every group starts collapsed.
+                        g.add(Collapsed::id());
                         g.child_of(dev);
                         idx.groups.insert(key, *g.id());
                         *g.id()
@@ -507,12 +506,13 @@ fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json
             set_times(c, s["start_ms"].as_u64(), s["end_ms"].as_u64());
         }
     }
-    // Groups sort among the device's children by their newest run; "other runs" goes last. Empty ones go.
+    // Groups sort below every live session (their key past any real timestamp), among themselves by their newest run;
+    // "other runs" goes last. Empty ones go.
     idx.groups.retain(|key, g| {
         let g = w.entity_from_id(*g);
         match groups_seen.get(key) {
             Some(&newest) => {
-                let created = Created { ms: if key == "other" { u64::MAX } else { newest } };
+                let created = Created { ms: if key == "other" { u64::MAX } else { (1 << 62) + newest } };
                 if g.try_cloned::<&Created>() != Some(created) {
                     g.set(created);
                 }
