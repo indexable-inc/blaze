@@ -6,7 +6,10 @@ use std::{
     cell::RefCell,
     fmt,
     hash::Hash,
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use blaze_format::Spans;
@@ -58,6 +61,58 @@ pub struct SpanMap<A: Allocator + Clone = Global> {
     /// then end; of fragments with one range (a fragment passed on whole to another macro), the
     /// innermost first.
     fragment_spans: Vec<(TextRange, Span), A>,
+    /// What [`SpanMap::count_kept`] added to [`kept_maps`], taken off again when the map is
+    /// dropped or cleared. Not part of what the map is.
+    counted: Option<Counted>,
+}
+
+/// What one kept map added to [`kept_maps`]: its heap bytes and pieces when it was counted.
+/// Kept, not read again at drop, as `by_anchor` can grow the map's heap after it is counted.
+#[derive(Clone, Copy)]
+struct Counted {
+    bytes: u64,
+    pieces: u64,
+}
+
+/// Heap bytes of every live map counted by [`SpanMap::count_kept`].
+static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Pieces of every live map counted by [`SpanMap::count_kept`].
+static KEPT_PIECES: AtomicU64 = AtomicU64::new(0);
+
+/// The heap bytes and pieces of every span map kept as a query's value
+/// ([`SpanMap::count_kept`]) and not yet dropped: the profile's `span map bytes` and `span map
+/// pieces` counters, which measure what packing the maps would save. Two relaxed loads; the
+/// two are not read at one instant.
+pub fn kept_maps() -> (u64, u64) {
+    (KEPT_BYTES.load(Ordering::Relaxed), KEPT_PIECES.load(Ordering::Relaxed))
+}
+
+impl<A: Allocator + Clone> Drop for SpanMap<A> {
+    fn drop(&mut self) {
+        self.uncount();
+    }
+}
+
+impl<A: Allocator + Clone> SpanMap<A> {
+    /// Adds the map's heap bytes and pieces to [`kept_maps`] until it is dropped: for a map
+    /// kept as a query's value. A map counted already is not counted again.
+    pub fn count_kept(&mut self) {
+        if self.counted.is_some() {
+            return;
+        }
+        let counted = Counted { bytes: self.heap_bytes() as u64, pieces: self.ends.len() as u64 };
+        KEPT_BYTES.fetch_add(counted.bytes, Ordering::Relaxed);
+        KEPT_PIECES.fetch_add(counted.pieces, Ordering::Relaxed);
+        self.counted = Some(counted);
+    }
+
+    /// Takes what [`SpanMap::count_kept`] added off [`kept_maps`].
+    fn uncount(&mut self) {
+        if let Some(Counted { bytes, pieces }) = self.counted.take() {
+            KEPT_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+            KEPT_PIECES.fetch_sub(pieces, Ordering::Relaxed);
+        }
+    }
 }
 
 impl<A: Allocator + Clone> SpanMap<A> {
@@ -202,6 +257,7 @@ impl SpanMap {
             fragment_ends: Vec::new(),
             // alloc: as `fragment_starts`
             fragment_spans: Vec::new(),
+            counted: None,
         }
     }
 }
@@ -233,6 +289,7 @@ impl<A: Allocator + Clone> SpanMap<A> {
 
     /// Empties the map, keeping each column's capacity: the worker's map, filled again.
     pub fn clear(&mut self) {
+        self.uncount();
         self.ends.clear();
         self.spans.clear();
         self.by_anchor = OnceLock::new();
@@ -276,6 +333,8 @@ impl<A: Allocator + Clone> SpanMap<A> {
             fragment_starts: copy(&self.fragment_starts, &alloc),
             fragment_ends: copy(&self.fragment_ends, &alloc),
             fragment_spans: copy(&self.fragment_spans, &alloc),
+            // A copy is counted only when it is kept itself.
+            counted: None,
         }
     }
 
