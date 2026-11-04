@@ -108,6 +108,12 @@ const BASE: u64 = 0x1_0000_0000;
 /// The room for the header and the load commands, which grow with the libraries and with an
 /// incremental link's sections.
 const HEADERS: u64 = 0x4000;
+/// The room past [`HEADERS`] an image linked with `-headerpad_max_install_names` keeps: each
+/// library's path grown to `MAXPATHLEN` takes about 1 KiB more, so 48 libraries' worth. The
+/// load commands are checked against what the image keeps once they are written.
+const MAX_NAMES_ROOM: u64 = 0xC000;
+/// ld64's `MAXPATHLEN`, which `-headerpad_max_install_names` grows every path to.
+const MAXPATHLEN: usize = 1024;
 const HEADER: usize = 32;
 const SEGMENT: usize = 72;
 const SECTION: usize = 80;
@@ -685,7 +691,7 @@ impl Writer for MachO {
     fn plan(&self) -> Plan {
         Plan {
             base: self.base(),
-            headers: HEADERS,
+            headers: header_room(&self.output.link, self.page),
             page: self.page,
             indexed_code: false,
             got_by_library: false,
@@ -959,6 +965,27 @@ impl std::ops::DerefMut for Out {
 
 fn page_up(value: u64, page: u64) -> u64 {
     value.next_multiple_of(page)
+}
+
+/// The room an image keeps for its header and load commands: [`HEADERS`], with what the link
+/// arguments ask after the load commands (`-headerpad`, `-headerpad_max_install_names`) on top,
+/// in whole pages.
+fn header_room(link: &crate::LinkArgs, page: u64) -> u64 {
+    let names = if link.headerpad_max_install_names { MAX_NAMES_ROOM } else { 0 };
+    page_up(HEADERS + link.headerpad + names, page)
+}
+
+/// The bytes ld64 keeps free after the load commands for the link arguments: `-headerpad`'s,
+/// or, under `-headerpad_max_install_names`, what each library path (and a shared library's
+/// own install name) needs to grow to [`MAXPATHLEN`], whichever is more.
+fn header_pad<'a>(link: &crate::LinkArgs, paths: impl Iterator<Item = &'a str>) -> u64 {
+    if !link.headerpad_max_install_names {
+        return link.headerpad;
+    }
+    let grown = (24 + MAXPATHLEN).next_multiple_of(8);
+    let names: usize =
+        paths.map(|it| grown.saturating_sub((24 + it.len() + 1).next_multiple_of(8))).sum();
+    link.headerpad.max(names as u64)
 }
 
 /// `segment$start$SEG` (`END` false) or `segment$end$SEG` of the segment `SEGMENT` in
@@ -1626,7 +1653,30 @@ impl MachO {
                 placed.plan.headers
             )));
         }
-        let mut flags = macho::MH_NOUNDEFS.0 | macho::MH_DYLDLINK.0 | macho::MH_TWOLEVEL.0;
+        let own_name = match &self.output.kind {
+            OutputKind::Shared { name, .. } => Some(name.as_str()),
+            OutputKind::Executable { .. } => None,
+        };
+        let pad = header_pad(
+            &self.output.link,
+            loaded.iter().map(|it| it.0.name.as_str()).chain(own_name),
+        );
+        if (HEADER + commands.0.len()) as u64 + pad > placed.plan.headers {
+            // alloc: error path
+            return Err(error(format!(
+                "the load commands take {} bytes and the link arguments (`-headerpad`, \
+                 `-headerpad_max_install_names`) ask {pad} free after them, more than the {} the \
+                 image keeps",
+                HEADER + commands.0.len(),
+                placed.plan.headers
+            )));
+        }
+        // A symbol imported by flat lookup (`-undefined dynamic_lookup`, a shared library's
+        // undefined symbol) is one the image leaves undefined, as ld64 says it.
+        let mut flags = macho::MH_DYLDLINK.0 | macho::MH_TWOLEVEL.0;
+        if placed.imports.iter().all(|it| it.library.is_some()) {
+            flags |= macho::MH_NOUNDEFS.0;
+        }
         flags |= match shared {
             true => macho::MH_NO_REEXPORTED_DYLIBS.0,
             false => macho::MH_PIE.0,

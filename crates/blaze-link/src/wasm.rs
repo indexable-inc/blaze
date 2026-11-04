@@ -430,6 +430,7 @@ mod tests {
             exec_log: false,
             sanitize: blaze_codegen::settings::Sanitize::default(),
             rpaths: Vec::new(),
+            link: crate::LinkArgs::default(),
             triple: "wasm32-unknown-unknown".into(),
         }
     }

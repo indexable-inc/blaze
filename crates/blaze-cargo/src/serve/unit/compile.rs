@@ -321,6 +321,7 @@ fn with_record_inputs<T>(
         plan: job.plan(unit)?,
         run_env: &runs.env,
         script_check_cfgs: script_check_cfgs(job, unit)?,
+        script_link_args: script_link_args(job, unit)?,
         makers,
         goal: keyed_goal(job.input.goal, u),
         color: job.input.color,
@@ -455,6 +456,10 @@ pub(crate) struct RecordInputs<'a> {
     /// The `--check-cfg`s its package's build script runs printed ([`script_check_cfgs`]):
     /// its check's lints read them, and neither its plan nor its crate's identity holds them.
     pub(crate) script_check_cfgs: Vec<String>,
+    /// The `rustc-link-arg*`s of the build scripts it is linked with, each with its script's
+    /// package ([`script_link_args`]): its link reads them, and neither its plan (which has
+    /// the rustflags' `-C link-arg`s) nor its crate's identity holds them.
+    pub(crate) script_link_args: Vec<(String, String)>,
     /// The code that makes the record ([`super::deps::record_makers`]): the front end's (its
     /// diagnostics, and the bodies the code generator compiles), the code generator's (the
     /// code it makes; the unit's target and flags, the rest of `Toolchain::id`, are in its
@@ -495,6 +500,13 @@ impl RecordInputs<'_> {
                 scratch,
                 &self.script_check_cfgs,
                 "build scripts' check-cfgs",
+                unit,
+            )?;
+            hash_cbor(
+                &mut hasher,
+                scratch,
+                &self.script_link_args,
+                "build scripts' link arguments",
                 unit,
             )
         })?;
@@ -562,6 +574,7 @@ impl RecordInputs<'_> {
             cbor("plan", self.plan)?,
             cbor("run environment", &self.run_env)?,
             cbor("the check-cfgs its build scripts printed", &self.script_check_cfgs)?,
+            cbor("the link arguments its build scripts printed", &self.script_link_args)?,
             id("the front end's code identity", Some(&self.makers.front_end)),
             id("the code generator's code identity", Some(&self.makers.codegen)),
             id(
@@ -2143,6 +2156,25 @@ fn script_check_cfgs(job: &Job, unit: usize) -> Result<Vec<String>, ApiError> {
     codegen::given(job, unit as u32)
         .map(|it| it.check_cfgs)
         .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))
+}
+
+/// The `rustc-link-arg*`s `unit`'s link is given by the build script runs it is linked with
+/// ([`codegen::link_args`]), each with its script's package: read once those runs are
+/// applied, as [`script_check_cfgs`] is.
+fn script_link_args(job: &Job, unit: usize) -> Result<Vec<(String, String)>, ApiError> {
+    let u = job.unit(unit)?;
+    // clone: the unit's name, on the error path
+    let named = |what: String| ApiError::new(what, Some(u.target.name.clone()));
+    let mine = codegen::given(job, unit as u32).map_err(named)?;
+    let args = codegen::link_args(job, unit as u32, &mine).map_err(named)?;
+    Ok(args
+        .into_iter()
+        .filter_map(|it| match it.from {
+            blaze_link::args::ArgFrom::BuildScript { package } => Some((package, it.arg)),
+            blaze_link::args::ArgFrom::Rustflags => None,
+        })
+        // alloc: once per unit per build, what its record key hashes
+        .collect())
 }
 
 pub(crate) use blaze_lower::{lint_flags, local};

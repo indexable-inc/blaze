@@ -538,6 +538,7 @@ mod tests {
             exec_log: false,
             sanitize: blaze_codegen::settings::Sanitize::default(),
             rpaths: Vec::new(),
+            link: crate::LinkArgs::default(),
             triple: "x86_64-unknown-linux-gnu".into(),
             stack: None,
         }

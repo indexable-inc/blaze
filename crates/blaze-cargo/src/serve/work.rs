@@ -411,7 +411,7 @@ pub enum Full {
 pub struct OutputFields(u32);
 
 impl OutputFields {
-    pub(crate) const NAMES: [&'static str; 17] = [
+    pub(crate) const NAMES: [&'static str; 18] = [
         "format",
         "arch",
         "kind",
@@ -429,6 +429,7 @@ impl OutputFields {
         "exec_log",
         "sanitize",
         "rpaths",
+        "link",
     ];
 
     /// The fields of `new` that differ from `old`'s. A shared library's exports are a field of
@@ -451,6 +452,7 @@ impl OutputFields {
             exec_log,
             sanitize,
             rpaths,
+            link,
         } = new;
         let (kind_differs, exports_differ) = match (&old.kind, kind) {
             (
@@ -477,6 +479,7 @@ impl OutputFields {
             old.exec_log != *exec_log,
             old.sanitize != *sanitize,
             old.rpaths != *rpaths,
+            old.link != *link,
         ];
         let mut bits = 0;
         for (at, differs) in differs.into_iter().enumerate() {

@@ -311,6 +311,7 @@ fn shared(exports: &[&str]) -> blaze_link::Output {
         exec_log: false,
         sanitize: Sanitize::default(),
         rpaths: Vec::new(),
+        link: blaze_link::LinkArgs::default(),
     }
 }
 

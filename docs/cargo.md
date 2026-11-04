@@ -267,6 +267,47 @@ That runs every test, outside any sandbox, as cargo does. blaze's `--reached` ru
 tests an edit can have changed, in the daemon, and `--ub` runs them in blaze's evaluator
 ([below](#which-tests-run)). Doc tests are blaze's own build of each example (below).
 
+### Link arguments
+
+blaze links every program with its own linker, so a link argument reaches no `cc`, ld64, GNU
+ld or lld. `-C link-arg=ARG` and `-C link-args=ARGS` in the rustflags (`RUSTFLAGS`,
+`CARGO_ENCODED_RUSTFLAGS`, `build.rustflags` and `target.<triple>.rustflags` in
+`.cargo/config.toml`, a profile's `rustflags`) and a build script's `cargo:rustc-link-arg*`
+(and `rustc-cdylib-link-arg`) are read by `crates/blaze-link/src/args.rs`: the C driver's layer
+comes off (`-Wl,a,b` is the linker's `a` and `b`, `-Xlinker a` its `a`), and each word is read in
+the spelling of the linker the target's rustc would run, ld64's on macOS and GNU ld's (and
+lld's) on Linux. What blaze's linker implements:
+
+| Option | ld64 (macOS) | GNU ld, lld (Linux) |
+|---|---|---|
+| a library | `-lNAME`, `-framework NAME`, `-needed_framework NAME`, `-needed-lNAME`, `-pthread` | `-lNAME`, `-l NAME`, `-l:FILE`, `--library=NAME`, `-pthread` |
+| where to look | `-L DIR`, `-F DIR` | `-L DIR`, `--library-path=DIR` |
+| rpath | `-rpath DIR` (`LC_RPATH`) | `-rpath DIR`, `-rpath=DIR`, `--rpath`, `-R DIR` for a directory (`DT_RUNPATH`) |
+| header room | `-headerpad SIZE` (hex), `-headerpad_max_install_names` | |
+| undefined symbols | `-undefined dynamic_lookup` (flat lookup, executables too), `-undefined error` | `-z defs` |
+| a shared library's name | `-install_name NAME` | `-soname NAME`, `-h NAME`, `-soname=NAME` |
+| a shared library's exports | `-exported_symbol _NAME` (added to the crate's) | |
+| the main thread's stack | `-stack_size SIZE` (hex, whole 4 KiB pages) | |
+| never unloaded | | `-z nodelete` |
+
+Taken because blaze's linker always does it: ld64's `-dead_strip`, `-pie`, `-search_paths_first`,
+`-adhoc_codesign`, `-undefined error` for an executable; GNU's `--gc-sections`, `--as-needed`,
+`--eh-frame-hdr`, `-Bsymbolic`, `--hash-style=gnu`, `-pie`, `-z now`, `-z relro`,
+`-z noexecstack`, `-z defs` for an executable. Taken because it asks nothing of the image:
+`-fuse-ld=...` and `--ld-path=...` (which system linker, and blaze runs none), GNU's `-O1`, ld64's
+`-w`, `-z nodelete` for an executable, and `--no-as-needed` with no library after it.
+
+Every other argument fails the link with one error naming each refused argument, the word of it
+refused, where it came from (the rustflags, or the build script of which package) and the target.
+Among those refused today: weak and re-exported libraries (`-weak_framework`, `-weak-l`), exports
+of an executable and export lists (`-rdynamic`, `--export-dynamic`, `-export_dynamic`,
+`-exported_symbols_list`, `--version-script`, `--dynamic-list`), layout scripts (`-T`), static and
+start-file-less links (`-static`, `-nostartfiles`), `-z lazy`, `-z execstack`, `-ObjC`,
+`-no_compact_unwind`, `-sectcreate`, `--wrap`, an object or archive given by path (give it as
+`cargo:rustc-link-lib` with `cargo:rustc-link-search`), and every link argument of a Windows or
+wasm target, which rustc gives `link.exe` or `wasm-ld` directly. A unit's record key covers the
+link arguments: the rustflags' through its plan, its build scripts' as a part of their own.
+
 ### Sandboxed tests (an experiment, opt-in)
 
 Tests run in a sandbox only where the daemon runs them (`blaze test --reached`,
