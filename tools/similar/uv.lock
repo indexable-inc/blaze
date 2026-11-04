@@ -44,7 +44,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.8" },
     { name = "tree-sitter", specifier = ">=0.25" },
     { name = "tree-sitter-rust", specifier = ">=0.24" },
-    { name = "typed-input", directory = "../../python/typed-input" },
+    { name = "typed-input", directory = "../typed-input" },
 ]
 
 [[package]]
@@ -1171,7 +1171,7 @@ wheels = [
 [[package]]
 name = "typed-input"
 version = "0"
-source = { directory = "../../python/typed-input" }
+source = { directory = "../typed-input" }
 
 [[package]]
 name = "typer"

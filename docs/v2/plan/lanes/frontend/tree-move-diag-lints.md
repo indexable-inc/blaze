@@ -73,14 +73,14 @@ Each owner's notes are the authority; a heading here is corrected when an owner'
   `Cx::new`), what lints call the view `Semantics` through (`cx.vsema.to_def(it)`).
   `Cx::syntax_view` must give a node of a tree `cx.vsema` handed out (asked of it).
 - `frontend-tree-move-expand` (`hir-expand`): `expand_view_cfg_attr` made public as
-  `hir_expand::attrs::expand_cfg_attr_view` (its request (3) in `v2/requests/db-expand.md`).
+  `hir_expand::attrs::expand_cfg_attr_view` (its request (3) in `docs/v2/requests/db-expand.md`).
   The iterator form `cfg_attrs_view` (below) is this lane's request (8) in the same file. The
   walk out of an expansion goes through `cx.vsema.find_parent_file`, so no `MacroCallLoc` twin
   is called here.
 - `frontend-tree-move-def` ([tree-move-def.md](tree-move-def.md)): `HasSource::source_view`,
   `HasChildSourceView`, `ExpressionStoreSourceMap::node_*_view`.
 
-### `cfg_attrs_view` (requested: `v2/requests/db-expand.md`, heading (8); applied)
+### `cfg_attrs_view` (requested: `docs/v2/requests/db-expand.md`, heading (8); applied)
 
 `Walk::attrs` is an iterator, and the `cfg_attr` rule stays in hir-expand, so hir-expand gets
 the iterator form of `expand_cfg_attr_view` for a caller that has the `CfgOptions` in hand, in
@@ -154,14 +154,14 @@ it compares `cfg_attrs_view` with `expand_cfg_attr` over the handles on nested `
 
 ## Requests
 
-- `v2/requests/diagnostics.md`: `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views
+- `docs/v2/requests/diagnostics.md`: `## frontend-tree: blaze-diagnostics lints/syntax.rs: onto views
   (1)` (the walk) and `## frontend-tree: blaze-diagnostics lints.rs: onto views (2)`
   (`body_item`): both applied by this lane under diagnostics' grant.
-- `v2/requests/db-expand.md` (8): `cfg_attrs_view`, which `Walk::attrs` calls; applied by
+- `docs/v2/requests/db-expand.md` (8): `cfg_attrs_view`, which `Walk::attrs` calls; applied by
   db-expand-views (`hir-expand/src/attrs.rs`).
-- `v2/requests/diagnostics-infer2-methods.md` (1): `lints/bodies/unstable_names.rs`, a file that
+- `docs/v2/requests/diagnostics-infer2-methods.md` (1): `lints/bodies/unstable_names.rs`, a file that
   lane wrote after the split; applied by its author.
 - The children's headings: their notes, `tree-move-diag-lints-<part>.md`. The 44 the `-bodies`
   and `-early` windows left were applied by this lane, merged onto today's files and marked per
   heading. The 6 imports headings (`-uses`'s, whose window had ended) were applied by this lane
-  once hir-def `use_tree_sources_view` (`v2/requests/db-expand.md` src.rs (2)) was in.
+  once hir-def `use_tree_sources_view` (`docs/v2/requests/db-expand.md` src.rs (2)) was in.

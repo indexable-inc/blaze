@@ -112,7 +112,7 @@ probe at every make. By that measure, as of 2026-10-29:
 | every blaze-query memo of a `SHARE` kind, as bytes | `crates/blaze-query` | db | 3 |
 | `Masked` (a function's masked IR) | `crates/blaze-codegen/src/fold.rs` | codegen | 4 |
 | codegen's `TEMPLATE`, `RELEASE`, `MASKED`, `FOLDED`, `STATIC` values | `crates/blaze-codegen/src/query.rs` | codegen | 4 (by 3) |
-| `Layout` (`layout_of_ty_query`, `layout_of_adt_query`) | `crates/hir-ty/src/layout.rs` | items | 5 (applied; callers in `v2/requests/items.md`) |
+| `Layout` (`layout_of_ty_query`, `layout_of_adt_query`) | `crates/hir-ty/src/layout.rs` | items | 5 (applied; callers in `docs/v2/requests/items.md`) |
 
 - **Memo bytes** (request 3) are the general case: one copy of equal values whichever view or
   key made them, keyed by the schema and fingerprint each memo has anyway, so it needs no

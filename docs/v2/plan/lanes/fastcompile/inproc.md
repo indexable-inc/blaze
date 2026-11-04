@@ -11,7 +11,7 @@ path cargo gives it, written once per content key and never again for a patch, a
 it runs is the daemon's code memory, laid over the file's code before `main`. A patch is a
 write into the daemon's view plus one atomic store, as before. Owned here:
 `crates/blaze-inproc/`, this file and [inproc-windows.md](inproc-windows.md). Hooks in other
-lanes are requests in `v2/requests/fastcompile.md` (`fastcompile-inproc-exec 1` and on; the
+lanes are requests in `docs/v2/requests/fastcompile.md` (`fastcompile-inproc-exec 1` and on; the
 earlier `fastcompile-inproc` and `fastcompile-inproc-macos` requests are superseded there).
 
 ## Why the change
@@ -347,7 +347,7 @@ What still differs, stated here rather than hidden:
   `MEM_PRIVATE` where the image was `MEM_IMAGE`. Module lists, unwinding and symbolization don't
   read these.
 
-## Wiring (requests in `v2/requests/fastcompile.md`)
+## Wiring (requests in `docs/v2/requests/fastcompile.md`)
 
 - link: the start hook's pointer first among the initializers; code segments on their own
   pages (PE: 64 KiB granules), never writable; reservations for the arena, cells and fixed

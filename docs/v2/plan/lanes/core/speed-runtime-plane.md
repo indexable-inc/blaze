@@ -105,6 +105,6 @@ and `plane.rs`, `admission.rs`, `plane_tests.rs` and `plane_tests/reference.rs` 
 ## Left to others
 
 Filed: `machine.rs` and `exec.rs` keeping one buffer for `step_into` and `cancel_into`, and a
-"Layout" item for [plane.md](plane.md) (`v2/requests/core.md`); the daemon's `serve/plane.rs`
-the same (`v2/requests/cargo.md`). Until they land each step of those callers still allocates
+"Layout" item for [plane.md](plane.md) (`docs/v2/requests/core.md`); the daemon's `serve/plane.rs`
+the same (`docs/v2/requests/cargo.md`). Until they land each step of those callers still allocates
 its output `Vec`.

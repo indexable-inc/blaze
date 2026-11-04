@@ -15,7 +15,7 @@
 //! driver does. A process of [`Effect::Spawn`] in a sandbox is made
 //! by the [`Confine`] a driver is given; a driver given none refuses it.
 //!
-//! On Windows [`iocp::Iocp`]. On WASI (the wasm32-wasip1 seed, todo/bootstrap/plan.md)
+//! On Windows [`iocp::Iocp`]. On WASI (the wasm32-wasip1 seed, docs/future/bootstrap.md)
 //! [`threads::Threads`], which starts no thread there and makes each file call as it is
 //! submitted. Each target's is its [`Native`] driver.
 //!
@@ -29,7 +29,7 @@
 // `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
-// The seed's target (todo/bootstrap/plan.md): WASI's positional reads and writes
+// The seed's target (docs/future/bootstrap.md): WASI's positional reads and writes
 // (`std::os::wasi::fs::FileExt`) and its random source (`std::random`), for temporary names
 // where there is no process id.
 #![cfg_attr(target_os = "wasi", feature(wasi_ext, random))]

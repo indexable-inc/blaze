@@ -92,7 +92,7 @@ the largest file at about 250 ms, 8× off.
   compared with a new one.
 - What stays SHA-256 is what something outside chose: the crates.io check in `corpus.verified`
   (the index lists SHA-256), and `Kept.key` (bytes, not files). The package is a request in
-  `v2/requests/speed.md`: add `blake3` to `pyproject.toml` and `uv.lock`.
+  `docs/v2/requests/speed.md`: add `blake3` to `pyproject.toml` and `uv.lock`.
 
 **Now.** For outputs, about 35 ms: 31 ms hashing, with per-file Python overhead (about 8 µs a file
 holding the GIL, 8 ms in all) overlapping it. That is within 15% of the bound. For trees, Python's
@@ -150,7 +150,7 @@ three traces a case. Then `under` ran on one core (about 450 ms). In all about 5
 - `main.rs` maps the traces lazily and joins the views. It builds owned traces only for a nameres
   case.
 - Two lines of `lib.rs` (`pub mod join; pub mod wire;`, and `Trace` dropping its derived serde
-  for `wire.rs`'s) are a request in `v2/requests/proof.md`, because `lib.rs` is shared. Until that
+  for `wire.rs`'s) are a request in `docs/v2/requests/proof.md`, because `lib.rs` is shared. Until that
   lands, `main.rs` does not build.
 
 **Now.** About 35 ms on 16 cores once the request lands: 25 ms of probes, 4 to 6 ms of streaming,

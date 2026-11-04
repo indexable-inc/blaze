@@ -129,7 +129,7 @@ buffer it is given when nothing is held.
 **Where it is now.** At the bound in syscalls and with no zeroing. Two things are left:
 - **Allocation per read and per send.** `blaze_core`'s `Done::Read` hands each read a new
   `Vec`, and `Done::Sent` does not hand the buffer back. That is a `malloc` and a `free` (about
-  50 to 100 ns) per read and per send. Requests K2 (`RecvInto`) and K3 in `v2/requests/core.md`
+  50 to 100 ns) per read and per send. Requests K2 (`RecvInto`) and K3 in `docs/v2/requests/core.md`
   are with the coordinator, since lane core is done. When core gives registered io_uring
   buffers, the bound drops to 0.05 µs per operation.
   - **Correction (speed-sol2-ci).** K2 and K3 have landed: `Effect::Recv` takes the buffer it
@@ -243,7 +243,7 @@ against it.
 ### What stands in the way
 
 These are what keep the wire from its bound, each with its owner:
-- **K2 and K3 in `v2/requests/core.md`**: reads into a kept buffer, and sends that hand the
+- **K2 and K3 in `docs/v2/requests/core.md`**: reads into a kept buffer, and sends that hand the
   buffer back. With the coordinator. (Correction, speed-sol2-ci: both landed and are used.)
 - **A blaze derive for the API types**: one owner to name. It would write constant key runs and
   borrowed mirror types, for item-heavy frames and allocation-free decode. (speed-sol2-ci: the
@@ -383,7 +383,7 @@ milliseconds, nearly all of it network.
 changed file. That is four processes at 1 to 2 ms each, under 10 ms against a fetch of hundreds
 of milliseconds, so within 10% of the bound already. Nothing changed here. What does cost
 more than it should is on the daemon's side: a change's file bytes go out as CBOR arrays of
-integers (the wire's `Op` byte strings, `v2/requests/vfs.md`), and the default branch's ops are
+integers (the wire's `Op` byte strings, `docs/v2/requests/vfs.md`), and the default branch's ops are
 sent twice, once to open its view and once to move it (`Request::Move`, a compare-and-swap of a
 head, asked of blaze-api).
 
@@ -420,7 +420,7 @@ summary at once. `Live::due_ns()` tells the caller when the held draw is due. Te
 **Where it is now.** At the bound inside `Live`. The caller in blaze-cargo still ticks only
 after 100 ms with no records, so after a burst the last frame can show up to 100 ms late. It
 also draws through `record` once per record, which makes a `String` for each. Both are asked of
-lane cargo in `v2/requests/cargo.md`: a read timeout of the shorter of the tick and `due_ns()`,
+lane cargo in `docs/v2/requests/cargo.md`: a read timeout of the shorter of the tick and `due_ns()`,
 and records handed over together through `records_into`.
 - **Correction (speed-sol2-ci).** Both are done. `blaze-cargo/src/cargo/say.rs` hands each batch
   to `live.records_into(batch, now_ns, &mut out)` and reads with a timeout of `due_ns()` less
@@ -529,7 +529,7 @@ precision on the GPU side until cosmos takes partial updates.
 
 ### What stands in the way
 
-- **The terminal caller's tick and batching**: `v2/requests/cargo.md`. (Correction,
+- **The terminal caller's tick and batching**: `docs/v2/requests/cargo.md`. (Correction,
   speed-sol2-ci: done by lane cargo.)
 - **Partial uploads in cosmos.gl**: a patched build under `assets/vendor/build/`, with npm.
 - **`Request::Move`** for the checkout's daemon side: blaze-api. (`Op`'s bytes are byte strings

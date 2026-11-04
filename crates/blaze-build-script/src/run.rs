@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// How a run of a script ended: its exit code, or the signal that ended it. Not `std`'s
-/// `ExitStatus`, which WASI (the wasm32-wasip1 seed, todo/bootstrap/plan.md) has no way to
+/// `ExitStatus`, which WASI (the wasm32-wasip1 seed, docs/future/bootstrap.md) has no way to
 /// make: a run there is a wasm module's, which ends with a code too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Ended {

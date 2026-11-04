@@ -334,7 +334,7 @@ blaze-usercode = { path = "crates/blaze-usercode" }
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 blaze-vfs = { path = "crates/blaze-vfs" }
 # WASI preview 1 for wasm guests at both pointer widths, and the bootstrap seed's runner
-# (todo/bootstrap/plan.md).
+# (docs/future/bootstrap.md).
 blaze-wasi = { path = "crates/blaze-wasi" }
 blaze-seed-run = { path = "crates/blaze-seed-run" }
 # Flecs's C and its read-only REST, for the build page's world (vendor/flecs-c/SOURCE.md).

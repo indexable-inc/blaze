@@ -146,7 +146,7 @@ windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "W
 
 [features]
 default = ["llvm-stencils", "net", "explore", "mimalloc", "tui", "daemon", "pprof"]
-# The seed profile (todo/bootstrap/plan.md, "The seed has no C") is this crate with none of
+# The seed profile (docs/future/bootstrap.md, "The seed has no C") is this crate with none of
 # these: each is a C, C++ or assembly dependency.
 # blaze-stencil's stencils made by LLVM at build time.
 llvm-stencils = ["hir-ty-codegen/llvm-stencils", "blaze-lazy/llvm-stencils", "blaze-link/llvm-stencils"]

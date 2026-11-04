@@ -31,7 +31,7 @@ and kind first, as the handle path did.
 | `view::Semantics::{resolve_path, resolve_type, resolve_macro_call, scope}` | blaze-lints `check.rs` (`Cx::path`, `resolve_type`, `macro_def`, `resolve_name`) |
 | `hir::Module::definition_source_range` (exists) | blaze-wasm `names.rs` `scope_path`: no `ModuleSource` twin needed |
 
-Requested of lane db (`v2/requests/db.md`, `## frontend-tree: hir src/semantics.rs: SemanticsScope::speculative_resolve_mod_path`; -hir told): `SemanticsScope::speculative_resolve_mod_path(&self,
+Requested of lane db (`docs/v2/requests/db.md`, `## frontend-tree: hir src/semantics.rs: SemanticsScope::speculative_resolve_mod_path`; -hir told): `SemanticsScope::speculative_resolve_mod_path(&self,
 path: &ModPath) -> Option<PathResolution<'db>>`, the tail of `speculative_resolve` (its
 `resolve_hir_path` of `Path::BarePath(path)`), which `speculative_resolve` can call. blaze-lints'
 `Cx::resolve_name` builds the one-segment `ModPath` of a captured name with
@@ -48,7 +48,7 @@ From frontend-tree-move-def (declared in [tree-move-def.md](tree-move-def.md)):
   once its callers move: hir-expand `attrs.rs`, `cfg_process.rs` (-expand), hir-def `attrs.rs`,
   `expr_store/lower.rs` (-def), blaze-engine `test_harness.rs` (-codegen), blaze-diagnostics
   (-diag-lints, -diag-lower); blaze-doc `lint.rs` is moved (-doc). Request:
-  `v2/requests/frontend.md`, `## frontend-tree: cfg src/cfg_expr.rs, src/tests.rs: delete
+  `docs/v2/requests/frontend.md`, `## frontend-tree: cfg src/cfg_expr.rs, src/tests.rs: delete
   CfgExpr::parse_from_ast (1)`.
 - `syntax_bridge::syntax_node_to_token_tree`, `syntax_node_to_token_tree_modified` and the cursor
   `Converter`: callers left in hir-expand (`builtin/derive_macro.rs`, `builtin/fn_macro.rs`,
@@ -72,5 +72,5 @@ From frontend-tree-move-def (declared in [tree-move-def.md](tree-move-def.md)):
 - `mbe/src/benchmark.rs`: the macro_rules fixtures' token trees are taken through `call_input`;
   the benchmark's hash expectations are unchanged, so the view input is the cursor's.
 - `const-ast/src/tests.rs`: unchanged, it compares the const views with the handles.
-- `blaze-cargo`'s `without_tests`: request in `v2/requests/cargo.md`; same items, ranges and
+- `blaze-cargo`'s `without_tests`: request in `docs/v2/requests/cargo.md`; same items, ranges and
   tokens, so the same hash, checked by blaze-cargo's existing state tests.

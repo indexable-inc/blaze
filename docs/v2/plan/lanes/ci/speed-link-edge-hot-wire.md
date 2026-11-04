@@ -51,7 +51,7 @@ per CLI process.
 
 One allocation per send is left: the server hands each reply to `Effect::Send` as an owned
 `Vec`, and `Done::Sent` does not give it back. That is request K3 with the coordinator
-(`v2/requests/core.md`). With it, the reply's buffer is reused and a warm request costs nothing
+(`docs/v2/requests/core.md`). With it, the reply's buffer is reused and a warm request costs nothing
 at all.
 
 ## Clone
@@ -71,7 +71,7 @@ Clone was removed from types that are never cloned anywhere in the workspace: `b
 | blaze-protocol | 39 | 0 |
 | blaze-api | 215 | 61, all in mem-core's `session.rs` (49), `frames/identity.rs` (10) and `lib.rs` (2) |
 
-Each of the 61 has a proposed fix or justification in `v2/requests/mem-core.md`
+Each of the 61 has a proposed fix or justification in `docs/v2/requests/mem-core.md`
 ("speed-link-edge-hot-wire: blaze-api's last 61 hot-lint findings"). The real per-request ones
 are the views `vec!` per job start, the best-of's `targets` and `filter` cloned per candidate,
 and the status and connection-end collects.

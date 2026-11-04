@@ -7,7 +7,7 @@ date: 2026-10-29
 
 Part of `mem-db-def` under `mem-db` (`docs/v2/plan/lanes/mem/db.md`, whose contract this follows).
 Path: `crates/hir/`, held by db-next2. Every change is a request:
-`v2/requests/mem-db-def-hir.md`, Parts R1 to R12. This note gives the design and the reasons.
+`docs/v2/requests/mem-db-def-hir.md`, Parts R1 to R12. This note gives the design and the reasons.
 
 ## What the slice is
 

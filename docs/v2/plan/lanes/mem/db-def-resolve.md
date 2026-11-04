@@ -7,7 +7,7 @@ date: 2026-10-29
 
 Part of `mem-db-def` under `mem-db` (`docs/v2/plan/lanes/mem/db.md`, whose contract this follows:
 one frame per query run, memo values owned and exact-size, hit paths allocate nothing). The exact
-code changes are in `v2/requests/mem-db-def-resolve.md` (R1 to R9, tests T1 to T4).
+code changes are in `docs/v2/requests/mem-db-def-resolve.md` (R1 to R9, tests T1 to T4).
 
 ## Scope
 

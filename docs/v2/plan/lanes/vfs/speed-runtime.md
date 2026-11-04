@@ -66,9 +66,9 @@ moving against Watchman's settle-to-query latency.
   `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)`, Windows `FlushProcessWriteBuffers`) move the
   fence to the collector; this is blaze-reclaim's to offer.
 - **No count per file read**: the database holding a view's bytes as lent through
-  `Pinned::file` (v2/requests/vfs.md item 8, db's).
+  `Pinned::file` (docs/v2/requests/vfs.md item 8, db's).
 - **No stat per change**: a batched look effect and the change's kind from the driver
-  (v2/requests/core.md, "From speed-runtime-vfs"). fanotify and FSEvents already say removed or
+  (docs/v2/requests/core.md, "From speed-runtime-vfs"). fanotify and FSEvents already say removed or
   directory.
 - **Batched hashing**: BLAKE3's multi-input API over every new file of a commit at once, as
   wide as the core's SIMD lanes, instead of one call per file.

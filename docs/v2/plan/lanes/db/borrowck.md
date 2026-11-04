@@ -6,7 +6,7 @@ date: 2026-10-29
 # blaze v2: the borrow checker's techniques (db-ty-borrowck)
 
 Design notes for [the db lane](../db.md), as written on 2026-10-29. The code is
-`crates/hir-ty-borrowck/`. Requests are in `v2/requests/db-ty-borrowck.md`.
+`crates/hir-ty-borrowck/`. Requests are in `docs/v2/requests/db-ty-borrowck.md`.
 
 ## The benchmark
 

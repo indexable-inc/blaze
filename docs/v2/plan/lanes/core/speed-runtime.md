@@ -75,7 +75,7 @@ with no waiter. It now wakes only when someone waits. The wait itself stays, as 
 
 The lock is still a `Mutex`. A lock-free reserve would need a per-thread count of holders for
 the "every holder waits" check, and it is not worth that while the lock is taken per chunk. The
-lock audit's item 5 in `v2/requests/core.md` says so.
+lock audit's item 5 in `docs/v2/requests/core.md` says so.
 
 ## Watching (blaze-core `fanotify.rs`, `watch.rs`, `fsevents.rs`)
 

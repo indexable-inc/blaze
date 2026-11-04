@@ -10,7 +10,7 @@ Item 16 of [frontend.md](../../design/frontend.md), design in [tree.md](tree.md)
 asm, matchers, builtin, validation, pretty). Child of
 [tree-move-diag-lints.md](tree-move-diag-lints.md), whose `Tree<'db>`/`Walk<'db>` on views
 (section "The walk on views") these files read. Every edit is a request to lane `diagnostics`
-(`v2/requests/diagnostics.md`), one heading per file, `## frontend-tree: blaze-diagnostics
+(`docs/v2/requests/diagnostics.md`), one heading per file, `## frontend-tree: blaze-diagnostics
 lints/syntax/<file>: onto views (1)`: 16 headings, landing as one group with the parent's
 `lints/syntax.rs` heading. `early/lexer/idents.rs` and `early/lexer/lex.rs` hold no handle and
 do not change.

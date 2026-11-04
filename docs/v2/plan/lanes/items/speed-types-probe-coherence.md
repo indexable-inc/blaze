@@ -8,7 +8,7 @@ date: 2026-10-29
 Notes of `speed-types-probe-coherence` (a child of `speed-types-probe`, lane
 [items](../items.md)) on four files of `crates/hir-ty/src/`. Every answer and its order is
 kept, as is every public signature. No query was added, so `db.rs` `kinds!` is unchanged.
-The tests are requested in `v2/requests/items.md` as `crates/blaze-items/src/tests/coherence.rs`,
+The tests are requested in `docs/v2/requests/items.md` as `crates/blaze-items/src/tests/coherence.rs`,
 because hir-ty has no test database.
 
 ## Benchmark

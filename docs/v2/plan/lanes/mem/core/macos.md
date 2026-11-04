@@ -48,8 +48,8 @@ and no allocation.
   see. Per stream that is the directory's CFString, a CFArray and the FSEventStream. The queue
   and the cookie CFString are made once per `Watch` and reused.
 - Before `blaze-mem`'s `Slab` matches only odd generations, a handle with an even generation can
-  name a free slot (request in `v2/requests/mem-core.md`). `conn_id` guards the one place a
+  name a free slot (request in `docs/v2/requests/mem-core.md`). `conn_id` guards the one place a
   caller's bits become a handle.
 - `fsevents.rs` keeps a copy of `FileName::new`'s rule (`file_name_ok`) so it can check a name
   without allocating. A test holds the two in agreement (optional request for
-  `FileName::is_valid` in `v2/requests/mem-core.md`).
+  `FileName::is_valid` in `docs/v2/requests/mem-core.md`).

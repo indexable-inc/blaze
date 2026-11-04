@@ -50,7 +50,7 @@ builtin shadow modes.
   with it.
 - `Resolver::traits_in_scope_into` fills a set the caller keeps; `hir-ty`'s
   `get_traits_in_scope` still collects a new set per method call in a block (asked of its
-  owner in `v2/requests/speed-hir.md`).
+  owner in `docs/v2/requests/speed-hir.md`).
 - `macro_def_site` turns a `macro_rules!` or proc macro away by the kind of its definition
   node before walking the crate's macros.
 - The test harness check reads the module's own name and one entry of its parent's children,

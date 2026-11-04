@@ -118,7 +118,7 @@ The trade: the tree is about twice the bytes of the varint stream, still half of
 token, with no per-group allocation. In exchange every access is O(1) with no decoding, and
 building is a single pass. The bridge's remaining per-token cost above O(1) is
 `FlatTree::range` (up to 8 steps from the last mark); format-tree is asked for an in-order walk in
-`v2/requests/format.md`.
+`docs/v2/requests/format.md`.
 
 ## Proof (tests beside the code, not run in this pass)
 

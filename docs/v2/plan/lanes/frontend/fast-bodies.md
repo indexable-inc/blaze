@@ -122,7 +122,7 @@ Child `frontend-fast-bodies-tasks` ([fast-bodies-tasks.md](fast-bodies-tasks.md)
   until then, and unreached bodies fill idle cores while codegen runs. The cost over
   "reached only" is total work, not latency: the unreached bodies' checks run off the critical
   path. The one body not checked is one whose outcome is read from the global cache (part 3),
-  which is the same outcome. Sent to `frontend-fast` as an objection (`v2/requests/frontend-fast.md`).
+  which is the same outcome. Sent to `frontend-fast` as an objection (`docs/v2/requests/frontend-fast.md`).
 
 ## 3. Dependencies checked once for everyone
 

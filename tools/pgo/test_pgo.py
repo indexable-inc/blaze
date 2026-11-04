@@ -14,7 +14,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parents[1] / "python" / "typed-input" / "src"))
+sys.path.insert(0, str(HERE.parent / "typed-input" / "src"))
 
 import pgo  # noqa: E402
 import typed_input  # noqa: E402

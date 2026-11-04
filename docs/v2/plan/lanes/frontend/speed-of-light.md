@@ -384,7 +384,7 @@ sections).
   about 600 000 cycles, **about 170 µs: 2% of the bound**, and the largest cost of a keystroke
   in a big file.
 - **In the way, and what removes it.** The tree code is `syntax-tree`'s, and requests-subtree-hash
-  is editing it now. The request is in `v2/requests/format.md` ("`FlatTree::replace_subtree` by
+  is editing it now. The request is in `docs/v2/requests/format.md` ("`FlatTree::replace_subtree` by
   copying, not repacking"):
   1. Copy the arrays, and patch only what the edit moves: the ancestors' sizes, the tokens that
      are direct children of an ancestor after the edit (their distance to their parent), the
@@ -397,7 +397,7 @@ sections).
      item and the spine. Its bound is then the item's size plus \(I\) spine words, under 1 µs.
      That is a layout change for format to weigh.
 
-  Step 1 is applied (requests-subtree-hash, `v2/requests/format.md`): `replace_subtree` copies
+  Step 1 is applied (requests-subtree-hash, `docs/v2/requests/format.md`): `replace_subtree` copies
   the arrays in three runs and patches what the edit moves, with `repack` gone. Not yet
   measured; step 2 remains.
 
@@ -453,7 +453,7 @@ file's last tree is kept beside salsa (`KEPT`, 128 direct-mapped slots, as
   45 000 cycles, 13 µs), about 18 µs in all. Before that (one BLAKE3 fingerprint of every
   item's syntax, ids and anchors on every edit), it was about 850 cycles an item, 120 µs.
 - **Applied (2026-10-29): what was in the way.** `AstIdMap::entries` and
-  `RealSpanMap::anchors` are lent as slices (frontend-tree-span, `v2/requests/frontend-deps-items.md`),
+  `RealSpanMap::anchors` are lent as slices (frontend-tree-span, `docs/v2/requests/frontend-deps-items.md`),
   and the bulk compare above replaces the per-item reads.
 - **What is left.** Two per-item passes: the walk that takes the items' ranges (1.4 µs) and
   comparing the keys from each end (1.4 µs). Both go once the prefix and suffix are placed as
@@ -494,7 +494,7 @@ the changed ones, as two runs, and each changed item's rows.
   10 000 cycles plus \(A\) counts at about 15 cycles, about 25 000 cycles, **about 7 µs, about
   85%**.
 - **In the way, and what removes it.**
-  1. `Attr::input` is a `Box`. The request is in `v2/requests/db-expand.md` ("`Attr::input`
+  1. `Attr::input` is a `Box`. The request is in `docs/v2/requests/db-expand.md` ("`Attr::input`
      shared, `Option<Arc<AttrInput>>`"). My side is ready: inputs are built with `.into()`.
      With it, assembly is about 25 000 cycles, 7 µs, **about 85%**.
   2. The rest of that gap, and the 6 µs of reference counts, go if the tree keeps each part's

@@ -62,10 +62,10 @@ red-green graph (its HIR is rebuilt per owner, its spans hashed relative to it).
 ## Left, and what it would take
 
 - `Option<ExprId>` is 8 bytes: `la_arena::Idx` has no niche (`MatchArm` and `RefType` stay 16).
-  Requested in `v2/requests/speed.md` "## speed-hir": vendor `la-arena` with a niche in `RawIdx`.
+  Requested in `docs/v2/requests/speed.md` "## speed-hir": vendor `la-arena` with a niche in `RawIdx`.
 - `upvars_mentioned` decodes every expression to learn a body has no closure: requested
-  `ExpressionStore::has_closures` (a byte scan of `expr_kind`) in `v2/requests/mem-format.md`
-  and the caller in `v2/requests/db-expand.md`. Keeping a path's resolved local at lowering
+  `ExpressionStore::has_closures` (a byte scan of `expr_kind`) in `docs/v2/requests/mem-format.md`
+  and the caller in `docs/v2/requests/db-expand.md`. Keeping a path's resolved local at lowering
   (rustc's `Res::Local`), so upvars needs no resolver, is open (lane db's index).
 - Bindings and labels keep their arenas (16 and 8 bytes, flat records).
 - The store and item tree columns move onto `blaze-mem` reserved regions and per-task frames:

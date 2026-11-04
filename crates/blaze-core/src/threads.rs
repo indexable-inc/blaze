@@ -2,7 +2,7 @@
 //! polls keeps the timers. Portable: the reference the other drivers are tested against. Two
 //! appends to one file in flight at once may land in either order, as with any asynchronous
 //! driver; a state machine that needs their order waits for the first. On WASI (the
-//! wasm32-wasip1 seed, todo/bootstrap/plan.md), which has no threads, it starts none: each file
+//! wasm32-wasip1 seed, docs/future/bootstrap.md), which has no threads, it starts none: each file
 //! call is made as it is submitted, and a poll waits only for a timer.
 //!
 //! What may wait on a peer for as long as the peer likes (a process, a listen, a receive, a
@@ -60,7 +60,7 @@ const UNIX_ONLY: &str =
 #[cfg(target_os = "wasi")]
 const UNIX_ONLY: &str = "a process spawn, a kill, a listen, a connect, a receive, a send and a hangup are refused on \
      WASI (the wasm32-wasip1 seed): it has no processes and no sockets; the seed runs build \
-     scripts and proc macros as wasm modules of its own (todo/bootstrap/plan.md)";
+     scripts and proc macros as wasm modules of its own (docs/future/bootstrap.md)";
 
 /// Values in slots of their own, each named by a [`Tag`] and by a generational handle: what a
 /// driver keeps of the spawns, watches and listens in flight. A handle of one removed, or

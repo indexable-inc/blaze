@@ -8,7 +8,7 @@ date: 2026-10-29
 The builtin macros (`builtin.rs`, `builtin/`) are `speed-hir-expand-builtin`'s, with their own
 notes in `speed-hir-expand-builtin.md`. The span map and the syntax-to-token-tree bridge are
 format's (`crates/span`, `crates/syntax-bridge`); what hir-expand needs from them is filed in
-`v2/requests/format.md` ("speed-hir-expand: span lookups per token ...").
+`docs/v2/requests/format.md` ("speed-hir-expand: span lookups per token ...").
 
 ## The benchmarks
 
@@ -53,7 +53,7 @@ output, `ExpandResult<(Parse<SyntaxNode>, ExpansionSpanMap)>`:
 - `ExpansionSpanMap` derives `Hash`: one pass over its columns, no `Debug` formatting.
 - `ExpandError` derives it.
 - `syntax::Parse<T>` and `mbe::ValueResult` don't yet; both are format's, filed by db-expand
-  (`v2/requests/db-expand.md`). The cheapest correct `Parse` hash is the green tree's content
+  (`docs/v2/requests/db-expand.md`). The cheapest correct `Parse` hash is the green tree's content
   hash taken once when the tree is built, not a walk per fingerprint.
 
 Hashes are by interned pointer (`Symbol`, `InternedSlice`, `SyntaxContext` ids). Those are
@@ -79,7 +79,7 @@ which db-salsa's S2 removes.
   The builtin derives' own small conversions (`derive_macro.rs`) and the IDE's speculative
   expansion still take the plain lookup.
 - **`Interned<ModPath>`**: hir-def still interns `ModPath` a second time at every store. That
-  is filed with the hir-def siblings in `v2/requests/speed-hir.md`, and
+  is filed with the hir-def siblings in `docs/v2/requests/speed-hir.md`, and
   `hir_expand::attrs::Attr::path` moves to `ModPath` in the same change.
 - **Proc macro calls**: build a `String` of the crate's working directory per call. The
   `expand_in` signature is `usercode-macros-native-next1`'s.

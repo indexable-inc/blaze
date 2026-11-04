@@ -323,7 +323,7 @@ The counts now:
   `is_below` agree with the joined string.
 - `paths.rs` `a_warm_table_interns_without_allocating`.
 
-**The gap, and what `Effect::Look` buys.** The request in `v2/requests/core.md` (lines
+**The gap, and what `Effect::Look` buys.** The request in `docs/v2/requests/core.md` (lines
 282-301) is the coordinator's:
 - `Effect::Look { files, tag }`, completing once with `Done::Looked(Vec<Looked>)`: each path's
   stamp and, when it differs from the stamp sent with it, its bytes or entries;

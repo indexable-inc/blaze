@@ -12,7 +12,7 @@ fn main() {
 }
 
 /// The `seed` feature is the seed profile, `--no-default-features --features seed`
-/// (todo/bootstrap/plan.md): no C, C++ or LLVM. With a feature that brings them back (`default`
+/// (docs/future/bootstrap.md): no C, C++ or LLVM. With a feature that brings them back (`default`
 /// among them, which is on unless `--no-default-features` is given) it is refused, naming both,
 /// never built as a seed that isn't one.
 fn seed() {

@@ -45,7 +45,7 @@ cache, `deps::ReadThrough`):
 ## The key
 
 Agreed with frontend-deps (2026-10-29, tmux to `frontend-deps-next2`; requests in
-`v2/requests/frontend-deps.md`).
+`docs/v2/requests/frontend-deps.md`).
 
 - **The image's key as it is filed** (`hir_def::deps::Image::key`): the crate's key
   (`deps/key.rs`: content, files, dependencies' keys, toolchain, `build`, paths relative) and,
@@ -69,7 +69,7 @@ Agreed with frontend-deps (2026-10-29, tmux to `frontend-deps-next2`; requests i
     `## frontend-fast-bodies-cache: values made from bodies, filed by their reads`.
   - The bodies part is under the check key, and frontend-fast-const-deps files a crate's constant
     values by it (`Served::keys` at session start, `Stored::keys` at drain;
-    `v2/requests/frontend-fast-const-deps.md`).
+    `docs/v2/requests/frontend-fast-const-deps.md`).
 - **The outcome's key** is `cache::key(check, inputs)`: the check key and what the check reads
   beyond it, listed next.
 - **What the check reads beyond the image** (`cache::Inputs`): the lint flags rustc is given,

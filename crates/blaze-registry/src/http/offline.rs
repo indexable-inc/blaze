@@ -1,4 +1,4 @@
-//! [`HyperHttp`] without the `net` feature: the seed profile (todo/bootstrap/plan.md, "The seed
+//! [`HyperHttp`] without the `net` feature: the seed profile (docs/future/bootstrap.md, "The seed
 //! has no C"), which builds offline from vendored sources and has no TLS. It is made as the
 //! networked one is, so a build that fetches nothing runs, and every request it is asked is
 //! [`NoNet`], naming the URL: never an answer from anywhere else.

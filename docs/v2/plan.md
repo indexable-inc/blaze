@@ -15,7 +15,7 @@ crates, the interfaces, the data structures, the vendored dependencies (salsa, c
 LLVM's bindings, the trait solver, std's build), the toolchain, the kernel interfaces, the file
 formats, the CI and the machines. If changing something makes blaze faster and keeps Rust's
 semantics, change it. When it isn't in your lane's paths, change it through a request
-(`v2/requests/<lane>.md`). The full rule is in [plan/goals/principles.md](plan/goals/principles.md).
+(`docs/v2/requests/<lane>.md`). The full rule is in [plan/goals/principles.md](plan/goals/principles.md).
 
 ## How the plan is laid out
 

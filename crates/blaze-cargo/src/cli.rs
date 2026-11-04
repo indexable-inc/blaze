@@ -219,7 +219,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Pprof(words) => pprof::main(words, auto_color()),
         #[cfg(not(feature = "pprof"))]
         Asked::Pprof(_) => said(Err(anyhow::anyhow!(
-            "blaze pprof: this blaze is built without blaze-cargo's `pprof` feature (the seed profile, todo/bootstrap/plan.md)"
+            "blaze pprof: this blaze is built without blaze-cargo's `pprof` feature (the seed profile, docs/future/bootstrap.md)"
         ))),
         Asked::Perf(words) => perf::main(words, auto_color()),
         Asked::Clean(words) => clean::main(words, auto_color()),

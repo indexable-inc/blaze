@@ -11,14 +11,14 @@ Part of the [store lane](../store.md), section 8 "Remote".
 
 - **`crates/blaze-cargo/src/remote.rs` and `remote/`** (v1): S3, HTTPS and gateway sync of
   whole packs on tokio. It is my path, but `docs/v2/plan/reference/crates.md` ("its remote store
-  becomes the read-through tier") and `v2/requests/store.md` request 2 delete it at
+  becomes the read-through tier") and `docs/v2/requests/store.md` request 2 delete it at
   integration. So, per the speed rules, I left it alone. It is measured below only as the
   "before".
 - **`crates/blaze-cas/src/remote.rs`** plus `Store::fetch` and `take_fetched` in
   `crates/blaze-cas/src/lib.rs`: the v2 tier. A laptop's `Client` pipelines 40-byte asks to the
   VM daemon's `Server` over a Unix socket or SSH-forwarded loopback. This code belongs to agent
-  `concurrency`, so every change is a request in `v2/requests/concurrency.md` (C1 to C8). Two
-  need new effects from core, requested in `v2/requests/core.md`.
+  `concurrency`, so every change is a request in `docs/v2/requests/concurrency.md` (C1 to C8). Two
+  need new effects from core, requested in `docs/v2/requests/core.md`.
 
 ## The benchmarks
 
@@ -70,7 +70,7 @@ How "v2 as written" was counted, from `crates/blaze-cas/src/remote.rs` and `lib.
 
 ## What changes, and why it is faster
 
-Each change is spelled out exactly, with its test, in `v2/requests/concurrency.md`.
+Each change is spelled out exactly, with its test, in `docs/v2/requests/concurrency.md`.
 
 - **C1, a real bound.** `serve` stops answering once `queued` passes `QUEUED_MOST` and resumes on
   `Done::Sent`. Before, one 40 KiB receive of 1024 asks for large values was answered whole, up

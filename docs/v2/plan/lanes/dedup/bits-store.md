@@ -6,7 +6,7 @@ date: 2026-10-29
 # dedup-bits-store: the store's and the format's bit sets
 
 Part of [dedup-bits](bits.md). None of these crates was free, so every move below is a
-request to its owner, under `## dedup: bits: <crate> ...` in `v2/requests/items.md`,
+request to its owner, under `## dedup: bits: <crate> ...` in `docs/v2/requests/items.md`,
 `store.md`, `frontend-image.md`, `proof.md`, `vfs.md`, `format.md` (span, syntax-tree, parser,
 intern) and `safety.md` (hir-ty-ub).
 

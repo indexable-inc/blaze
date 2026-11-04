@@ -275,7 +275,7 @@ instance never needs a key.
 
 ## The hook (requested of codegen)
 
-`v2/requests/fastcompile.md`, `fastcompile-ident-share 1`:
+`docs/v2/requests/fastcompile.md`, `fastcompile-ident-share 1`:
 
 - `hir-ty-codegen`'s `v2/frontend.rs` `described()` puts `share_key` in `Described::args` in
   place of `args_of`, hashed under its own domain, when the key is `Ok`.

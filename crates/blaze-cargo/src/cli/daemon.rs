@@ -1,7 +1,7 @@
 //! The daemon this CLI is a client of: found at its socket ([`crate::serve::socket`]), started
 //! as `blaze serve` when none answers there, spoken to through [`blaze_api::client::Client`].
 //!
-//! Without blaze-cargo's `daemon` feature (the wasm seed, todo/bootstrap/plan.md) there is no
+//! Without blaze-cargo's `daemon` feature (the wasm seed, docs/future/bootstrap.md) there is no
 //! daemon to find or start: [`connect`] hands back a client of the same engine run in this
 //! process for this command alone ([`crate::serve::once`]), and `blaze stop`, `status` and
 //! `daemon` are refused, naming the feature ([`NO_DAEMON`]).
@@ -28,7 +28,7 @@ use crate::{raw::process::Reaped, serve::Phase};
 
 /// Why a command that needs a running daemon is refused in a blaze built without one.
 pub const NO_DAEMON: &str = "this blaze is built without blaze-cargo's `daemon` feature (the seed profile, \
-     todo/bootstrap/plan.md): it runs no daemon, and each command builds in its own process and exits";
+     docs/future/bootstrap.md): it runs no daemon, and each command builds in its own process and exits";
 
 /// How long a daemon that was told to stop is waited for after the last step of its stop it
 /// said ([`blaze_api::Response::Stopping`]): one step is the making of its image, which grows

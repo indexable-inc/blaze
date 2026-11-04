@@ -135,7 +135,7 @@ uploads.
   Solid-style path would restyle only the points records touched, which needs a partial-upload
   call in the vendored cosmos build (`assets/vendor/build/`).
 - **One allocation per record for CBOR** remains, because `blaze-protocol` only has `to_vec`.
-  The request is `v2/requests/speed-link-edge-ci-web.md` item 2 (`cbor::append`).
+  The request is `docs/v2/requests/speed-link-edge-ci-web.md` item 2 (`cbor::append`).
 - **Deflate, not zstd**, for kept records: zstd at level 1 compresses several times faster.
   It is not a workspace dependency, and kept records only exist until a page is asked for.
 - Each function's fields are read back from Flecs (`ecs_get_id`, one lookup per node) to make

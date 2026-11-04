@@ -8,7 +8,7 @@ date: 2026-10-29
 Part of `mem-db-infer` (`docs/v2/plan/lanes/mem/db-infer.md`, rules R1 to R8) under `mem-db`
 (`docs/v2/plan/lanes/mem/db.md`). Paths, in `crates/hir-ty/src/infer/`: `expr.rs`, `pat.rs`,
 `coerce.rs`, `callee.rs`, `cast.rs`, `op.rs`, `place_op.rs`. The exact changes, with before and
-after code and their lines, are in `v2/requests/mem-db-infer-expr.md` (entries E0 to E17 and
+after code and their lines, are in `docs/v2/requests/mem-db-infer-expr.md` (entries E0 to E17 and
 interfaces X1 to X4). This note is the design.
 
 ## The shape

@@ -1,6 +1,6 @@
 [package]
 name = "blaze-seed-run"
-description = "The bootstrap seed's runner: runs blaze-seed.wasm (memory64) under Wasmtime with blaze's WASI host at 64-bit pointers, a linear memory reserved whole and committed only where touched, and a decommit import for blaze-mem (todo/bootstrap/plan.md)"
+description = "The bootstrap seed's runner: runs blaze-seed.wasm (memory64) under Wasmtime with blaze's WASI host at 64-bit pointers, a linear memory reserved whole and committed only where touched, and a decommit import for blaze-mem (docs/future/bootstrap.md)"
 publish = false
 
 version.workspace = true

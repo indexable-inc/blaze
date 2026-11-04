@@ -95,7 +95,7 @@ declarative macro.
 ## What is left
 
 - Each `ContentId::of` derives BLAKE3's key from the domain again. One derived key per domain
-  is asked of format (`v2/requests/format.md`, speed-types' request).
+  is asked of format (`docs/v2/requests/format.md`, speed-types' request).
 - Salsa interns the `StoredTy` argument of `ty_form` under a shard lock. If `StoredTy` were a
   salsa key by its own index (it is a dense `NonZeroU32` already), a miss would take no lock.
   That is the db lane's change in salsa. The per-`Cx` cache keeps it to one call per distinct

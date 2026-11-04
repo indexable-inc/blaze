@@ -18,4 +18,4 @@ Part of [proof](../proof.md). The details, with the before/after table, are in
   - the perf budgets use hyperfine-style statistics (warmup, outliers, a distribution-free
     interval).
 - Still short: the Python harness hashes with SHA-256 until the `blake3` package is added
-  (`v2/requests/speed.md`, `speed-link-edge-proof`).
+  (`docs/v2/requests/speed.md`, `speed-link-edge-proof`).

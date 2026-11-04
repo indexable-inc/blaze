@@ -83,5 +83,5 @@ previous task unordered before a writer that reads it.
 
 clippy reads only the nearest `clippy.toml`, so each hot crate (`blaze-cas`, `blaze-reclaim`,
 `blaze-query`; `blaze-ids`, `intern` and `blaze-graph` as requested in
-`v2/requests/concurrency.md`) has a copy of the root rules plus `disallowed-types` for
+`docs/v2/requests/concurrency.md`) has a copy of the root rules plus `disallowed-types` for
 `std::sync::{Mutex, RwLock}`, `parking_lot`'s and `DashMap`, citing concurrency.md.

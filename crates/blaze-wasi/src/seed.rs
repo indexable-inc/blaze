@@ -23,7 +23,7 @@
 //!   (`__indirect_function_table`), as blaze-link writes every wasm64 module. Misuse (an
 //!   unknown fiber, resuming one that runs or returned, a suspend off any fiber) traps, naming
 //!   the fiber and the call. This is the seed's fiber switch, blaze-graph's `sched::stack` on
-//!   wasm (todo/bootstrap/plan.md, "Fibers in the seed").
+//!   wasm (docs/future/bootstrap.md, "Fibers in the seed").
 //!
 //! Only an embedder whose store implements [`EmbedSeed`] links these: the seed runner, which
 //! enables this crate's `seed` feature (Wasmtime's `async`, which no wasm build of Wasmtime

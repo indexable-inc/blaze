@@ -94,7 +94,7 @@ mod os {
 
 /// WASI files have no owner and no permission bits, so whether a directory is the user's alone
 /// can't be told from inside: every step is refused, naming the directory, and nothing is made.
-/// Whoever runs the seed (todo/bootstrap/plan.md) holds what the guest is given.
+/// Whoever runs the seed (docs/future/bootstrap.md) holds what the guest is given.
 #[cfg(target_os = "wasi")]
 mod os {
     use std::{io, path::Path};

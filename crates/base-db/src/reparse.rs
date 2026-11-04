@@ -1,4 +1,4 @@
-//! A file's parse made from its last one on an edit (db's decision D8 in `v2/requests/db.md`;
+//! A file's parse made from its last one on an edit (db's decision D8 in `docs/v2/requests/db.md`;
 //! docs/v2/plan/lanes/format.md, "an edit reparses the changed item").
 //!
 //! Each text a file is set to gets a [`Reparse`], set with the text on its

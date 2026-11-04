@@ -7,7 +7,7 @@ date: 2026-10-29
 
 Ideas 11 and 12 of [compile-time.md](../../design/compile-time.md). Owned here:
 `crates/blaze-history/`, `tools/pgo/` and this file. The hooks in other lanes are requests in
-`v2/requests/fastcompile.md` (`fastcompile-sched 1` to `5`).
+`docs/v2/requests/fastcompile.md` (`fastcompile-sched 1` to `5`).
 
 ## 11. Scheduling from history (`crates/blaze-history`)
 
@@ -172,7 +172,7 @@ speedup's arithmetic and floor, rotated rounds, a baseline holding both binaries
   macOS (no Mach-O BOLT) and Windows; context-sensitive PGO (`-fcs-profile-generate`) is a
   later step once plain PGO is measured.
 
-## Requests (in `v2/requests/fastcompile.md`)
+## Requests (in `docs/v2/requests/fastcompile.md`)
 
 1. core: `Prediction`, `Predict` in `blaze_graph::admission`, `impl Predict for Estimates`
    (written here, with a test); left for core: exec's scheduler holds a `Box<dyn Predict>` and

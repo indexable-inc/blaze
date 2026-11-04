@@ -1,6 +1,6 @@
 //! The scheduler's one stack-switching layer: every fiber of [`super::fiber`]'s driver and of
 //! [`super::host`]'s pool jobs is made, resumed and suspended through it, and the target picks
-//! its implementation here, in one place (todo/bootstrap/plan.md, "Fibers in the seed"):
+//! its implementation here, in one place (docs/future/bootstrap.md, "Fibers in the seed"):
 //!
 //! - native targets: corosensei, a machine stack per fiber with a guard page below it;
 //! - wasm ([`wasm`]): the host's fibers, through the seed's own calls (`blaze_seed.fiber_*`):
@@ -34,7 +34,7 @@ pub const FIBER_STACK: usize = 16 << 20;
 /// wasm: the fiber's shadow stack, 4 MiB of linear memory taken whole when the fiber is made
 /// (wasm reserves nothing). It holds only a frame's address-taken memory: every other local is a
 /// wasm local, on the host's native stack for the fiber (the runner's async stack size).
-/// todo/bootstrap/plan.md's "Stack in the seed" puts the trait solver's deepest recursion (512
+/// docs/future/bootstrap.md's "Stack in the seed" puts the trait solver's deepest recursion (512
 /// levels) at about 3 MiB of whole native frames, an upper bound for its shadow-stack share, and
 /// the debug red zone of `ensure_sufficient_stack` is 1 MiB, so 4 MiB holds both; past it that
 /// check stops with its error (which aborts the seed: panic=abort), never an overflow.

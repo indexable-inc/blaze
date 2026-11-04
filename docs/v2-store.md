@@ -62,7 +62,7 @@ since the last, by the store and by every writer: it drains every segment into p
 3. once all of those are durable, the head is written, naming the new lengths and slot.
 
 Before step 1 each pack written to is padded with zeros to the next 4 KiB block, so the write
-starts and ends on a block; v2/requests/store.md asks the io_uring driver to write packs with
+starts and ends on a block; docs/v2/requests/store.md asks the io_uring driver to write packs with
 `O_DIRECT` from registered buffers.
 
 The head's write is the flip: a crash before it leaves the old head, naming only bytes that were
@@ -83,7 +83,7 @@ checks the index table's CRC-32C and reads the headers of the records between ea
 indexed and committed lengths into an in-memory delta, stepping over the zeros that end a
 commit. Nothing else is read: the index is the mapped table. Only the daemon holds a
 store (one writer: the commit cuts packs back to their committed length, so two writers would
-corrupt each other; v2/requests/store.md asks for the lock that enforces it).
+corrupt each other; docs/v2/requests/store.md asks for the lock that enforces it).
 
 A head of another format, a pack shorter than its head says, an index that does not match its
 CRC, a record header in the committed range that does not check, or anything but zeros where a
@@ -243,7 +243,7 @@ which one runs is dispatch, never a fallback:
 
 The differential tests run every path the test machine has against the portable one. What the
 store asks of the drivers (`O_DIRECT`, registered buffers, SQPOLL, linked submissions, huge pages
-and NUMA-local mappings) is in v2/requests/store.md; threads and pinning are core's.
+and NUMA-local mappings) is in docs/v2/requests/store.md; threads and pinning are core's.
 
 ## Settling: hot, warm and cold by reads
 

@@ -1,6 +1,6 @@
 """Turns a failure blaze hits building a real crate into a minimal crate.
 
-    PYTHONPATH=python/typed-input/src python3 tools/v2/repro/repro.py '<json>'
+    PYTHONPATH=tools/typed-input/src python3 tools/v2/repro/repro.py '<json>'
 
 One JSON object, its `command` one of:
 
@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "python" / "typed-input" / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "typed-input" / "src"))
 from typed_input import fail, parse, read  # noqa: E402
 
 SCRIPT = "repro.py"

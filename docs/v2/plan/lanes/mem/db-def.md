@@ -11,12 +11,12 @@ request:
 
 | part | paths | request file | notes |
 |---|---|---|---|
-| `mem-db-def` | shared harness; `crates/base-db/` | `v2/requests/mem-db-def.md` | this file |
-| `mem-db-def-collect` | `hir-def/src/nameres.rs`, `nameres/` but `path_resolution.rs` | `v2/requests/mem-db-def-collect.md` | `db-def-collect.md` |
-| `mem-db-def-resolve` | `nameres/path_resolution.rs`, `item_scope.rs`, `resolver.rs`, `per_ns.rs`, `visibility.rs`, `find_path.rs`, `dyn_map.rs` | `v2/requests/mem-db-def-resolve.md` | `db-def-resolve.md` |
-| `mem-db-def-items` | the rest of `hir-def` | `v2/requests/mem-db-def-items.md` | `db-def-items.md` |
-| `mem-db-def-expand` | `crates/hir-expand/` | `v2/requests/mem-db-def-expand.md` | `db-def-expand.md` |
-| `mem-db-def-hir` | `crates/hir/` | `v2/requests/mem-db-def-hir.md` | `db-def-hir.md` |
+| `mem-db-def` | shared harness; `crates/base-db/` | `docs/v2/requests/mem-db-def.md` | this file |
+| `mem-db-def-collect` | `hir-def/src/nameres.rs`, `nameres/` but `path_resolution.rs` | `docs/v2/requests/mem-db-def-collect.md` | `db-def-collect.md` |
+| `mem-db-def-resolve` | `nameres/path_resolution.rs`, `item_scope.rs`, `resolver.rs`, `per_ns.rs`, `visibility.rs`, `find_path.rs`, `dyn_map.rs` | `docs/v2/requests/mem-db-def-resolve.md` | `db-def-resolve.md` |
+| `mem-db-def-items` | the rest of `hir-def` | `docs/v2/requests/mem-db-def-items.md` | `db-def-items.md` |
+| `mem-db-def-expand` | `crates/hir-expand/` | `docs/v2/requests/mem-db-def-expand.md` | `db-def-expand.md` |
+| `mem-db-def-hir` | `crates/hir/` | `docs/v2/requests/mem-db-def-hir.md` | `db-def-hir.md` |
 
 ## Rules the parts share
 

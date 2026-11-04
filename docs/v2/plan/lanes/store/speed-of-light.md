@@ -288,10 +288,10 @@ delta (budget: 35 ms).
 ## The remote tier
 
 The v1 remote sync in `crates/blaze-cargo/src/remote.rs` and `remote/` is deleted at integration
-(`v2/requests/store.md` request 2), so it gets no bound. The v2 tier is `crates/blaze-cas/src/remote.rs`,
+(`docs/v2/requests/store.md` request 2), so it gets no bound. The v2 tier is `crates/blaze-cas/src/remote.rs`,
 which belongs to agent `concurrency`. Its bound belongs to that agent, and is written here or in
 `blaze-cas`'s notes. `speed-link-edge-remote`'s measurement of that tier, and the requests C1
-to C8 (`v2/requests/concurrency.md`) and K1 and K2 (`v2/requests/core.md`), give the inputs.
+to C8 (`docs/v2/requests/concurrency.md`) and K1 and K2 (`docs/v2/requests/core.md`), give the inputs.
 
 The bound a fetch has, per byte and per hit:
 - **A hit**: one round trip for a batch of lookups. With `FindMissingBlobs`-style batching, a

@@ -99,7 +99,7 @@ error naming the goal (`two_answers_under_the_same_facts_stop_the_flush`).
 
 **Where the store comes from** (`goal_store.rs`). The driver installs one per database:
 `goal_store::install(&db, images, facts, build)`, with the store adapter it gives
-`hir_def::deps::serve` (`DepImages`, requested in `v2/requests/cargo.md` by frontend-deps),
+`hir_def::deps::serve` (`DepImages`, requested in `docs/v2/requests/cargo.md` by frontend-deps),
 lane items' `GoalFacts`, and the build ID. It returns a guard; dropping it uninstalls. Stores
 are found by the database's nonce in a 16-slot registry of atomic pointers, read under a
 `blaze_reclaim` guard and freed through a `Limbo`. The interface above hir-ty is a trait,
@@ -117,7 +117,7 @@ bytes as they will be stored, fact values) to one of 64 per-thread-shard buffers
 own lock on its own cache line, capped at 1 MiB (past it, goals are dropped and counted).
 `Installed::flush` takes every buffer and writes on the store's threads
 (`ImageStore::for_each`). The driver calls it where it calls `hir_def::deps::store`: after the
-build's front-end work, with no query running (requested in `v2/requests/cargo.md`).
+build's front-end work, with no query running (requested in `docs/v2/requests/cargo.md`).
 
 **Reads on a miss.** A lookup runs in a `capture_reads` frame of the asking query. On a hit
 the parent's table keeps the answer with those reads (the fact values checked), so the next
@@ -128,7 +128,7 @@ stay reads of the asking query: a dependency it may not have, never one it lacks
 
 Today nothing is storable: the solver reads hir-ty and hir-def queries that stand for no fact.
 These are the reads, by the query, and the fact each should become (requested from lane items,
-`v2/requests/items.md`, and, where the solver must read through a narrower query, from db-ty):
+`docs/v2/requests/items.md`, and, where the solver must read through a narrower query, from db-ty):
 
 | Read by the solver (query) | Fact it should be |
 | --- | --- |
@@ -183,11 +183,11 @@ names by count after every build: the driver shows it under `-v`.
 
 ### 3.7 Requests
 
-- db-salsa (`v2/requests/db-salsa.md`, "frontend-fast-trait-store: iterate a `Reads`' reads
+- db-salsa (`docs/v2/requests/db-salsa.md`, "frontend-fast-trait-store: iterate a `Reads`' reads
   with their kind and name"): `ReadKind`, `Ingredient::read_kind`, `Reads::for_each_read`.
-- db-ty (`v2/requests/db-ty.md`, "frontend-fast-trait-store: a definition hook in `persist`'s
+- db-ty (`docs/v2/requests/db-ty.md`, "frontend-fast-trait-store: a definition hook in `persist`'s
   codec, an interner's crate, and `pub mod goal_store`").
-- items (`v2/requests/items.md`, "frontend-fast-trait-store: implement `GoalFacts`, and the
+- items (`docs/v2/requests/items.md`, "frontend-fast-trait-store: implement `GoalFacts`, and the
   facts the solver's reads need").
-- cargo (`v2/requests/cargo.md`, "frontend-fast-trait-store: install the goal store and flush
+- cargo (`docs/v2/requests/cargo.md`, "frontend-fast-trait-store: install the goal store and flush
   it beside `deps::store`").

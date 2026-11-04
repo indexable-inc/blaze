@@ -118,7 +118,7 @@ briefs live in `~/restart-2026-10-28/briefs/v2/`.
   `AstIdMap` and span map once per body. It now builds them once per anchor, shared by its bodies:
   for an `impl` of \(M\) methods and \(n\) nodes, \(O(Mn) \to O(n + M)\) per edit.
 - **Scans**: `expr_ids()` / `pat_ids()` give a store's ids without decoding, for the id-only
-  whole-store scans in `hir-ty-borrowck` (request in `v2/requests/db.md`).
+  whole-store scans in `hir-ty-borrowck` (request in `docs/v2/requests/db.md`).
 - **Paths no longer intern their `ModPath` a second time.** `ModPath` is a 16-byte `Copy` value
   with interned segments (speed-hir-expand), held directly in the path columns: one intern probe
   per lowered path instead of two, and one pointer fewer on every read.
@@ -144,5 +144,5 @@ briefs live in `~/restart-2026-10-28/briefs/v2/`.
   Moving them to runs in the type columns changes every `&FnType` reader.
 - **Decode borrows nothing from the pack.** A store read from the signature image copies its
   `Copy` columns into a fresh slab. To borrow them in place, `deps/signatures.rs` must name the
-  image owner type and pass an `Arc` of it to `read` (`v2/requests/speed-hir-store.md`).
+  image owner type and pass an `Arc` of it to `read` (`docs/v2/requests/speed-hir-store.md`).
 - **Bindings and labels** keep their arenas (16 and 8 bytes, flat records, no per-node heap).

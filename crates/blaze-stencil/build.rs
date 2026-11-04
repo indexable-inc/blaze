@@ -12,10 +12,10 @@
 //!   ones. The build writes the pin of what it made beside them (`OUT_DIR/stencils.json`); when
 //!   a change to the generator changes a library, the build stops naming each id and the
 //!   command that pins what it made, so the tree's pin is always what its generator makes.
-//!   The libraries are also committed, as data, in `prebuilt/` (todo/bootstrap/plan.md, "Who
+//!   The libraries are also committed, as data, in `prebuilt/` (docs/future/bootstrap.md, "Who
 //!   owns stencil generation"), and what the pinned LLVM made must be those bytes too, so the
 //!   build stops naming the command that commits what it made.
-//! - Without it (the seed profile, todo/bootstrap/plan.md, which has no LLVM) the libraries are
+//! - Without it (the seed profile, docs/future/bootstrap.md, which has no LLVM) the libraries are
 //!   the committed ones in `prebuilt/`. Nothing in the environment says where they are: a
 //!   library whose bytes are not the pinned ones is refused, naming its file, the pinned id and
 //!   its own.

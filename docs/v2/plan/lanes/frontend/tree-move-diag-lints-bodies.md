@@ -9,7 +9,7 @@ Item 16 of [frontend.md](../../design/frontend.md), design in [tree.md](tree.md)
 [tree-move-diag-lints.md](tree-move-diag-lints.md). Paths: `crates/blaze-diagnostics/src/lints/`
 `bodies.rs`, `bodies/`, `levels.rs`, `levels/`, `registry.rs`, `registry/`, `edit_distance.rs`.
 Every file has a live holder (lane `diagnostics`), so every move is a request in
-`v2/requests/diagnostics.md` under `## frontend-tree: blaze-diagnostics <file>: onto views (<n>)`.
+`docs/v2/requests/diagnostics.md` under `## frontend-tree: blaze-diagnostics <file>: onto views (<n>)`.
 
 ## What the files program against
 

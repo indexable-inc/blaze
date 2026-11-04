@@ -97,7 +97,7 @@ well as `DEPRECATED_SAFE_2024`. rustc's `fn_sig` of it is unsafe. Before, only t
 was set, so its body was checked as a safe function's body and it coerced to a safe `fn` pointer.
 db-ty-lower moved the deprecated-safe test first in `is_fn_unsafe_to_call`
 (`crates/hir-ty/src/utils.rs`), so a pre-2024 call outside `unsafe` still only lints, as in
-rustc. This was diagnostics' request 6 (`v2/requests/diagnostics.md`).
+rustc. This was diagnostics' request 6 (`docs/v2/requests/diagnostics.md`).
 
 ## Where it still doesn't match rustc, and what it would take
 

@@ -72,7 +72,7 @@ Lints that need types (the locks, channels and hashers ports: `blaze::std_lock`,
 
 ```sh
 blaze build -p astlog
-PYTHONPATH=python/typed-input/src python3 tools/astlog/scan.py \
+PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py \
     '{"astlog": "target/debug/astlog", "rules": "tools/astlog/rules", "paths": ["crates", "tools"]}'
 ```
 

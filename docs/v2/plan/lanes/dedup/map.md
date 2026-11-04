@@ -103,10 +103,10 @@ Two shapes:
   `MAP_FIXED` into a reserved room, `mremap` of a memory file over a live region,
   `mach_vm_remap` swaps. blaze-live is the lowest crate of all (no dependencies, linked into the
   user's program), so nothing else can be under it, and no other crate replaces live code. It
-  stays, with a comment saying why (`v2/requests/link.md`).
+  stays, with a comment saying why (`docs/v2/requests/link.md`).
 - **Code written once, then run**: `blaze-lazy/src/tests/exec.rs`, `blaze-stencil/src/tests/exec.rs`
   and `blaze-inproc`'s `View::publish`, three copies of the AArch64 `dc cvau`/`ic ivau` loop and
   two of the macOS `MAP_JIT` dance. blaze-lazy already depends on blaze-inproc and blaze-inproc on
   neither test crate, so the one implementation is a `blaze_inproc::exec::Executable` behind its
-  `sys` (`v2/requests/fastcompile.md`). Not in blaze-core: blaze-inproc's run process links without
+  `sys` (`docs/v2/requests/fastcompile.md`). Not in blaze-core: blaze-inproc's run process links without
   blaze-core, and the cache maintenance is already blaze-inproc's.

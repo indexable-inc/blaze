@@ -8,7 +8,7 @@ date: 2026-10-29
 Part of [tree-move-def.md](tree-move-def.md). Paths: `crates/hir-def/src/attrs.rs`,
 `crates/hir-def/src/attrs/**`. Owner of the files while this runs: `db-expand-attrs`; every
 change is a request under `## frontend-tree: hir-def attrs…: onto views (n)` in
-`v2/requests/db-expand.md`.
+`docs/v2/requests/db-expand.md`.
 
 Attributes are read for every item, field and generic parameter, so the walk is the hot path:
 it borrows views of the database's trees (`'db` from `db: &'db Db`), reads `&'db str` text, compares
@@ -114,7 +114,7 @@ side is `match_attr_flags_allocates_nothing`, beside the existing
   `match_attr_flags` on views and counts zero allocations (an attribute whose string value has
   an escape is left out: undoing it is the one buffer the reader may make).
 
-## Requests (2026-10-29, `v2/requests/db-expand.md`, owner db-expand-attrs)
+## Requests (2026-10-29, `docs/v2/requests/db-expand.md`, owner db-expand-attrs)
 
 - `## frontend-tree: hir-def attrs.rs: onto views (1)`;
 - `## frontend-tree: hir-def attrs/docs.rs: onto views (2)`;

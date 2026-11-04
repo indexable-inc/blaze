@@ -91,7 +91,7 @@ DEV_BACKEND_MISSING = (
     "the v2 daemon has no setting for the dev tier's backend yet: cargo's `codegen-backend` profile key "
     "(`-Zcodegen-backend --config 'profile.dev.codegen-backend=\"stencil\"'`) is parsed by blaze-manifest and "
     "not read into `blaze_codegen::plan::Policy`, which compiles opt-level 0 and 1 with Cranelift whatever it says; "
-    "requested in v2/requests/requests-backend-axis.md (codegen: `Profile::codegen_backend` in plan.rs; cargo: "
+    "requested in docs/v2/requests/requests-backend-axis.md (codegen: `Profile::codegen_backend` in plan.rs; cargo: "
     "`serve/unit/codegen.rs::policy` reading it; coordinator: blaze-manifest's `-Zcodegen-backend` gate)"
 )
 

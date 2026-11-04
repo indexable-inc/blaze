@@ -602,7 +602,7 @@ fn instruction_set(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Pars
     }
     // rustc's `UnsupportedInstructionSet` (an `arm` set on a target without thumb
     // interworking) names the target tuple, which the crate's cfg does not give: asked of
-    // the front end (`v2/requests/diagnostics.md`).
+    // the front end (`docs/v2/requests/diagnostics.md`).
     match set.name.as_str() {
         "a32" | "t32" => Some(Parsed::Other("InstructionSet")),
         _ => {

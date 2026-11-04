@@ -215,7 +215,7 @@ The per-module answer equals the old collector's, with three differences:
 `DefMap` API (`facts/impls.rs`). The scope changes with any item of M, but the list is equal
 then and backdates, so a bucket built from it reruns only when an impl is added or removed in
 a module it covers ([nameres-impls.md](nameres-impls.md)). Requests to lane items
-(`v2/requests/items.md`, "frontend-nameres") build `TraitImpls`/`InherentImpls` buckets and
+(`docs/v2/requests/items.md`, "frontend-nameres") build `TraitImpls`/`InherentImpls` buckets and
 `traits_in` from it per module and stop `in_crate_and_deps_for_trait_and_self_ty` looping
 `for_crate_and_deps`.
 

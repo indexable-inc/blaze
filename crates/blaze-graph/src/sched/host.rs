@@ -125,7 +125,7 @@ pub(crate) enum Turn {
     Ended,
 }
 
-/// A pool worker with no thread of its own (todo/bootstrap/plan.md, "One thread"): the pool's
+/// A pool worker with no thread of its own (docs/future/bootstrap.md, "One thread"): the pool's
 /// one worker loop ([`crate::pool`]'s `work`) on a fiber of this layer, which the thread that
 /// made the pool resumes as it waits ([`Driven::turn`]), and which switches back to it after
 /// each job it ran and wherever a worker with a thread would park. So a target without threads

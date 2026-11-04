@@ -1,6 +1,6 @@
 """The astlog lint gate: every rules file in `rules` over every file under `paths`, one file at a time.
 
-    PYTHONPATH=python/typed-input/src python3 tools/astlog/scan.py \
+    PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py \
         '{"astlog": "target/debug/astlog", "rules": "tools/astlog/rules", "paths": ["crates", "tools"]}'
 
 The files are git's (tracked, and untracked ones git does not ignore) with an extension of a

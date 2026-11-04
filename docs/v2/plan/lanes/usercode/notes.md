@@ -82,7 +82,7 @@ today every passed-through variable is in every traced key: sound, but a shell t
 `SHLVL` or `OLDPWD` reruns build scripts and misses kept expansions. `E *` also covers what the C
 library reads through its own internal calls (`TZ`, `LANG`, `LC_*`, `TMPDIR`, `MALLOC_*`, the
 resolver's variables), which no interposer sees. Narrowing it takes three owned pieces
-(v2/requests/usercode.md, request 6 revised): std calls a hook before it walks; the linker
+(docs/v2/requests/usercode.md, request 6 revised): std calls a hook before it walks; the linker
 marks an object whose only `environ` references are std's; and the interposer records `E *` for
 an unmarked object and the C library's own reads by name, from the libc the toolchain pins.
 

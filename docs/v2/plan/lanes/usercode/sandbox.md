@@ -123,7 +123,7 @@ What blaze does: it confines with an AppContainer in a job object and does not t
 record is one `X` line, so a run's result is keyed as cargo keys it. The cost per run (DACL
 reads, the lock between launchers, the profile, process creation) is in
 [speed-link-edge-usercode.md](speed-link-edge-usercode.md) and in section 6 of
-`v2/requests/usercode-sandbox.md`. 1, 2 and 4 were accepted. 3 (a write SID derived from the
+`docs/v2/requests/usercode-sandbox.md`. 1, 2 and 4 were accepted. 3 (a write SID derived from the
 directory) was declined, because it weakens the sandbox.
 
 - **Falls short** of BuildXL and fsatrace, which trace with Detours. *What it would take*: a DLL

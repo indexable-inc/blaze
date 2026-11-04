@@ -471,7 +471,7 @@ __name__ == "__main__":`). `harness/rustcsites.py` fails when blaze's code gains
 starts rustc, rustdoc or cargo ([no-rustc.md](no-rustc.md)).
 
 The repository's Python is one uv workspace (`pyproject.toml`, `uv.lock`, Python 3.13 from
-`.python-version`; shared helpers such as `python/typed-input` are its members). Its scripts run
+`.python-version`; shared helpers such as `tools/typed-input` are its members). Its scripts run
 with `uv run --frozen`, and the gate runs ruff and pyright over the ones the workspace lists
 (today `.github/scripts/downstream.py`, `harness/focused.py` and `python/`); an older script
 moves in when it is next changed. `harness/imports.py` runs in the workspace's Python too.

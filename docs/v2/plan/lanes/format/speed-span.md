@@ -36,7 +36,7 @@ Values in boxcar-style never-moving chunks (kept). No lock and no write on a rea
 **Now** (`crates/intern/src/arena.rs`):
 - Shards: `available_parallelism() * 4`, next power of two, at least 16, chosen once per
   process for every store (concurrency.md "Writers shard by hash"; concurrency-audit finding 1 in
-  `v2/requests/format.md`). More shards also shorten the copy a growing table does under its lock.
+  `docs/v2/requests/format.md`). More shards also shorten the copy a growing table does under its lock.
 - Reads and writes on separate lines: readers load a packed array of table pointers (stored
   only when a table grows, a few dozen times in a shard's life); writers lock `InsertLock`s padded
   to 128 bytes in their own array. A read writes nothing.
@@ -74,13 +74,13 @@ lock-free find after insert; the bump allocator aligns and never overlaps.
 
 - `intern` is unsafe by nature (raw arena memory, published pointers) behind a safe API; every
   block is one operation with its own `// SAFETY:` (the safety-audit items in
-  `v2/requests/format.md`, applied), except `symbol.rs`, handed to fix-orderkeys while it edits
+  `docs/v2/requests/format.md`, applied), except `symbol.rs`, handed to fix-orderkeys while it edits
   that file. The safe reference is the `HashMap` model in `arena.rs`'s tests.
 - Model checking: `crates/intern/src/sync.rs` switches `arena.rs`'s atomics and lock to
   `blaze-check`'s under `cfg(blaze_check)`; `model_racing_inserts_across_growth` runs two writers
   racing across a table growth and a lock-free reader, against the sequential model. `Table::new`
   zeroes pages in a normal build (std atomics are plain words) and makes each atomic in a model
   build. The manifest line waits on `blaze-check` becoming a workspace dependency
-  (`v2/requests/speed.md`, "speed-span" item 1).
+  (`docs/v2/requests/speed.md`, "speed-span" item 1).
 - `mbe`, `tt`, `syntax-bridge` and `const-ast` forbid `unsafe_code`; `span` denies it outside its
   one module (`hygiene.rs`, salsa ids).

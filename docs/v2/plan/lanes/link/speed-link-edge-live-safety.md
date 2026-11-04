@@ -7,7 +7,7 @@ date: 2026-10-29
 
 Part of [link](../link.md), lane `speed-link-edge-live-safety` (a child of `speed-link-edge`),
 after [speed-link-edge-live](speed-link-edge-live.md). It answers the safety audit of
-`crates/blaze-live` ("From safety-audit", `### blaze-live`, in `v2/requests/link.md`, each finding
+`crates/blaze-live` ("From safety-audit", `### blaze-live`, in `docs/v2/requests/link.md`, each finding
 marked there), by [the unsafe design](../../design/unsafe.md). Nothing here was built or run: this
 lane may not build; the tests below are written, not yet run.
 

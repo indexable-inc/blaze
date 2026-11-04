@@ -152,5 +152,5 @@ it was a `def_map` query lookup and a `Modules` lookup.
 
 - No measurement. The asserts check the sizes at the first build; the counts above are
   worked out from the code.
-- Persisted ast ids in the frozen bytes (raised in `v2/requests/format.md`) need a version bump
+- Persisted ast ids in the frozen bytes (raised in `docs/v2/requests/format.md`) need a version bump
   if bytes are ever read across blaze versions; untouched here.

@@ -10,7 +10,7 @@ Lane `frontend-tree-move-expand-derive`, a child of `frontend-tree-move-expand`
 ([tree-move-expand.md](tree-move-expand.md)). The files are
 `crates/hir-expand/src/builtin/derive_macro.rs` and `builtin/derive_macro/`. Their owner is
 lane db (db-expand, now its child `db-expand-derive`). Every edit is a request in
-`v2/requests/db-expand.md`:
+`docs/v2/requests/db-expand.md`:
 
 - (10) is withdrawn. db-expand-views refused it because its `CoercePointee` build changed the
   output for a 2015 item, inside what was meant to be a move with no output change.

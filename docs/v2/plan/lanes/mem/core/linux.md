@@ -67,6 +67,6 @@ loop doing the same SQEs. That is the next number to take, in an ix VM.
   thread, and the existing budgets codify these paths as they are.
 - `process::start` (not this lane's path) still allocates per spawn: the `Command`'s argv and
   environment, and its `Finish`.
-- `Slab::get` trusts an odd generation (request in `v2/requests/mem-core.md`, from
+- `Slab::get` trusts an odd generation (request in `docs/v2/requests/mem-core.md`, from
   mem-core-macos). Until that is fixed, `conn_of` maps a caller's even generation to no slot.
   Every other handle here is one the driver issued.

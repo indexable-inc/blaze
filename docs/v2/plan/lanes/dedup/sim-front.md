@@ -6,7 +6,7 @@ date: 2026-10-29
 # dedup-sim-front: near-copies in the front end, MIR and codegen
 
 Part of the dedup lane. The groups are `/tmp/similar-front.json` (141). Every move is a request
-under "## dedup: ..." in the owner's `v2/requests/<owner>.md`; the one file written directly
+under "## dedup: ..." in the owner's `docs/v2/requests/<owner>.md`; the one file written directly
 is `crates/blaze-format/src/placed.rs`.
 
 ## Picked, and why

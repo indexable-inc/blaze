@@ -84,8 +84,8 @@ aliasing error the history of the tags involved (Tree Borrows' `diagnostics.rs`)
 ## The evaluator's `Machine`
 
 The contract is the trait as landed in `crates/hir-ty-mir/src/mir/eval/machine.rs` (codegen-mir
-owns it; lane safety proposed it, in `v2/requests/codegen.md` "From safety" S1, and
-safety-check's C3 and C7 in `v2/requests/safety.md` refined it). `check::Checker` implements it.
+owns it; lane safety proposed it, in `docs/v2/requests/codegen.md` "From safety" S1, and
+safety-check's C3 and C7 in `docs/v2/requests/safety.md` refined it). `check::Checker` implements it.
 The calls, by what the checker sees:
 
 - memory: `alloc` (returns the root provenance), `free`, `root`, `read`, `write`, `copy`,

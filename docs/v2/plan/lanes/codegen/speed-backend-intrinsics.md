@@ -6,8 +6,8 @@ date: 2026-10-29
 # Intrinsics at LLVM's speed: notes of speed-backend-intrinsics
 
 Notes of the `speed-backend-intrinsics` lane of the speed pass, as of 2026-10-29. Code:
-`crates/hir-ty-codegen/{wasm_simd,neon,x86,asm}.rs`. Requests: `v2/requests/speed-backend-lower.md`
-(the two calls in `mod.rs`) and `v2/requests/speed.md` under speed-backend-intrinsics (per-function
+`crates/hir-ty-codegen/{wasm_simd,neon,x86,asm}.rs`. Requests: `docs/v2/requests/speed-backend-lower.md`
+(the two calls in `mod.rs`) and `docs/v2/requests/speed.md` under speed-backend-intrinsics (per-function
 ISA, Cranelift reductions).
 
 ## Where the time went
@@ -135,18 +135,18 @@ The one parser of bytes from disk is `Assembled::from_bytes`. It runs on a copy 
 checked with CRC32, is bounds-checked, and allocates no more than its input. A stored value that
 doesn't parse is now an error naming the key, not a silent reassembly. Its model is `to_bytes`,
 checked by a round-trip test over seeded values. It is listed for safety-fuzz in
-`v2/requests/safety.md`.
+`docs/v2/requests/safety.md`.
 
 ## What Cranelift cannot say yet (requests)
 
 1. **x86 beyond SSE2.** Cranelift's ISA flags are per ISA, and blaze has one per process. So
    `_mm_shuffle_epi8` (`pshufb`, Teddy's inner loop on x86-64), `palignr`, a general shuffle,
    `pminub`, `roundps` and `pcmpgtq` stay loops. The fix is an ISA per set of
-   `#[target_feature]`s (in `v2/requests/speed.md`). Then `admits` takes the set, and the
+   `#[target_feature]`s (in `docs/v2/requests/speed.md`). Then `admits` takes the set, and the
    `pshufb` arm becomes `x86_pshufb`.
 2. **Reductions.** `vmaxvq_u8` is 9 instructions against LLVM's 2. Cranelift has no reduce op.
    Vendoring cranelift-codegen and adding `vreduce_{umax,smax,umin,smin,add}` (`umaxv`, ...) is in
-   `v2/requests/speed.md`.
+   `docs/v2/requests/speed.md`.
 
 ## Benchmarks to run (when the speed pass measures)
 

@@ -152,7 +152,7 @@ def-map probes, 200 to 500), though inference resolved it already. **About 200 t
 - Name resolution done twice: inference records what each path resolves to (it has
   `assoc_resolutions` and `variant_resolution` already); recording the value-namespace result
   for every path expression in `InferenceResult` lets lowering read one column. That is
-  `hir-ty`'s; I will ask db-ty for it in `v2/requests/codegen-mir.md`.
+  `hir-ty`'s; I will ask db-ty for it in `docs/v2/requests/codegen-mir.md`.
 - Types interned again: locals keep the stored type inference already holds (`StoredTy` is an
   interned id; a `Ty` → `StoredTy` map per body, filled once, makes `.store()` an index).
 - Boxed operand lists: one arena per body for operands, freed with the body.

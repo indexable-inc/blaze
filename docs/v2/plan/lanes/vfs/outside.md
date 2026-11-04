@@ -10,7 +10,7 @@ toolchain, the C compiler's own headers, `/usr/include`, whatever a trace names.
 blaze-usercode's `inputs::Files` stamps each traced path once per check, which means one
 `stat` per path, and a C build script reads hundreds of headers. `crates/blaze-vfs/src/outside.rs`
 answers the same question with no syscall when nothing has changed: "has anything under this
-path changed since generation `g`?" (request 11 of `v2/requests/usercode.md`). The rules it
+path changed since generation `g`?" (request 11 of `docs/v2/requests/usercode.md`). The rules it
 reads under are in [../../design/concurrency.md](../../design/concurrency.md).
 
 ## What it is

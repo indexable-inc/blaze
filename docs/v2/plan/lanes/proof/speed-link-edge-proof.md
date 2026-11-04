@@ -59,7 +59,7 @@ throughputs are the published ones of the technique, to be measured when the coo
   Python environment (`pyproject.toml`, `uv.lock` are not this lane's paths). With hardware
   SHA-2 and every core it is ~2-3x below BLAKE3 a core. Switching changes the key domain
   (`"blaze v2 proof <kind> 1"` would go to 2) and nothing else. Requested in
-  `v2/requests/speed.md` under this agent's heading.
+  `docs/v2/requests/speed.md` under this agent's heading.
 - **The Rust compare does not hash first.** When both files are on disk, one SIMD pass that
   stops at the first difference reads each byte at most once; hashing both reads every byte and
   then needs a second pass to locate. Hash-first pays only against a stored digest, which is how

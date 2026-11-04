@@ -75,7 +75,7 @@ takes that path.
   other files are compared by their path under `auxiliary/`.
 - **`cases/bodies-cache/`.** Each case there is built twice with one store. The second build
   gets a fresh daemon home, workspace and target. Both builds are compared with rustc. Then the
-  second's `blaze-served` lines (requested in `v2/requests/frontend-fast-diff.md`) must say both
+  second's `blaze-served` lines (requested in `docs/v2/requests/frontend-fast-diff.md`) must say both
   the outcome and the bodies of each dependency were `served`. The exceptions are those a
   `//@ refused: dep` names: for each, one part must be `refused`. Those are the edges where the
   cache hands over to a check.

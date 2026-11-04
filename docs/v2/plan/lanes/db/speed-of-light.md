@@ -319,7 +319,7 @@ allocation plus its free is **≈ 20 ns**.
 - **Today:** was 24 (`recursion_depth: usize`, 8 bytes plus alignment), **20% off**. Now `u32`
   and `const`-asserted at 20: **at the bound**. fulfill.rs's SoA depth column goes from 8 to 4
   bytes per pending obligation. This needs the fulfill.rs edit requested in
-  `v2/requests/db-ty.md`.
+  `docs/v2/requests/db-ty.md`.
 
 ### `select` (`select.rs`)
 
@@ -364,7 +364,7 @@ errors never runs it.
     c > 1: (1 + c × n + n) = 13 evaluations a level, **≈ 1.9× off**.
   - `InferenceTable::has_trait_errors` (infer/unify.rs) runs the whole search for each pending
     error and `emit_trait_errors` runs it again, at least **2× more**.
-- **What removes it:** both were requested in `v2/requests/db-ty.md`.
+- **What removes it:** both were requested in `docs/v2/requests/db-ty.md`.
   - `InspectCandidate::instantiate_nested_goals_from(span, keep)` (inspect.rs) still advances
     every step's canonical state but builds trees only where `keep(source)`. errors.rs then
     passes `|s| s == GoalSource::Normalization`.
@@ -458,7 +458,7 @@ The sizes used, for a typical item:
     which reads each byte once, about 15 ns. It runs only when salsa compares a re-run's value,
     and it is exact where a 128-bit hash could collide and reuse a stale signature.
   - Result: ≈ 0.75 µs, **9.5× off**.
-- **Applied since** (over frontend-text's `clone_subtree_without`, `v2/requests/frontend-text.md`):
+- **Applied since** (over frontend-text's `clone_subtree_without`, `docs/v2/requests/frontend-text.md`):
   - the copy is made in one pass over the elements outside the elided node, never reading or
     copying the elided part;
   - that replaces the clone, the repack, the empty tree and the text copy (360 ns) with about
@@ -508,7 +508,7 @@ The sizes used, for a typical item:
     read the item off the live parse and ast id map. So every item's attribute query re-runs
     and backdates on a body edit: 150 × 300 ns ≈ **45 µs more**, found by speed-hir-sol-defs.
   - That makes ≈ 60 µs against a bound of ≈ 2 µs: **≈ 30× off**, from 55×.
-  - The attribute part goes when attributes are read off the outline (`v2/requests/db-expand.md`
+  - The attribute part goes when attributes are read off the outline (`docs/v2/requests/db-expand.md`
     item 12, with the arithmetic in speed-hir-sol-defs' section of this file). Then this
     file's ≈ 15 µs is all that's left: ≈ 7× off.
   - **Applied (10-29 and 10-30):** attributes are read off the outline and its flags column,
@@ -754,7 +754,7 @@ The most frequent operation: every read of a query inside a query, on every warm
   workers must be the plane's (no thread of the database's own), and `collect` is called from
   the daemon outside any task. Asked of the owner of `blaze_graph`'s plane: a way to run a batch
   of closures as plane tasks and wait for them from outside a task
-  (`v2/requests/db-query.md`, 4). `collect` never blocks a reader (reads take no lock) and runs
+  (`docs/v2/requests/db-query.md`, 4). `collect` never blocks a reader (reads take no lock) and runs
   between edits, so it is off an edit's critical path while it is slow.
 - **Applied (10-30, sol-all-base), on `Pool::scope`:** from 2^16 memos (`MARK_PARALLEL_FROM`)
   every pass of `collect` but the inputs' runs on the plane's workers (`on_workers`, one job a
@@ -946,7 +946,7 @@ Salsa costs are speed-salsa's, above:
      handle. It replaces one memo kind with the other for collected reads, so the memo count is
      unchanged. A segment then costs one intern and one memo hit: ≈ 15 ns today and ≈ 10 ns at
      salsa's bound, which is **the bound**. Requested of db-expand-names
-     (`v2/requests/db-expand.md`). **Applied** as `Modules::name(module, name)`, read through
+     (`docs/v2/requests/db-expand.md`). **Applied** as `Modules::name(module, name)`, read through
      `DefMap::name_in_module` by `resolve_remaining_segments`, `resolve_name_in_module` and the
      prelude and root lookups: a segment is ≈ 4 + 4.3 + 11 ≈ 20 ns, a three-segment path
      ≈ 27 + 2 × 20 ≈ **70 ns, 2×**, ≈ 45 ns at salsa's bound (counted, not built).
@@ -1047,7 +1047,7 @@ Salsa costs are speed-salsa's, above:
 - **What stands in the way of 90%:** per-(module, round) queries for modules the round doesn't
   touch. After round 0, most modules have no macro call left, gain no op, and sit in a component
   with no changed input, yet every round runs four queries for each of them. The changes, all
-  in frontend-nameres-core's files (requested in `v2/requests/frontend-nameres.md`):
+  in frontend-nameres-core's files (requested in `docs/v2/requests/frontend-nameres.md`):
   1. `RoundModules` carries the round's active modules as a sorted `u32` column beside `order`.
      A module is active if it has a pending directive, gained an op, or is a member of a
      component whose input changed. It also carries, per module, the round its component last
@@ -1261,7 +1261,7 @@ Costs are counted from the code as of 10-29 21:00, not measured. Salsa costs are
 above: a memo hit is 11 ns today and 5.4 ns at its bound, and an execution's bookkeeping is
 140 ns today and 35 ns at its bound. A file has 150 items. Zero-allocation budgets for the hit
 paths are in `alloc_budgets.rs` (the crate's counting allocator is requested from db-expand, in
-`v2/requests/db-expand.md`).
+`docs/v2/requests/db-expand.md`).
 
 ### `AttrFlags::query`: an item's attribute flags
 
@@ -1535,7 +1535,7 @@ What this covers, per macro call:
 
 Costs are counted from the code as of 10-29 (after frontend-db-def's `&Db` migration), not
 measured; "today" includes the changes requested of db-expand-macros in
-`v2/requests/db-expand-macros.md` (`## speed-hir-sol-expand`) only where it says "after".
+`docs/v2/requests/db-expand-macros.md` (`## speed-hir-sol-expand`) only where it says "after".
 Machine figures are the lane's: 3.5 GHz, IPC about 2 on this branchy code (so 1 instruction is
 about 0.14 ns), L1 4–5 cycles, L2 about 14. Salsa's figures are speed-salsa's, above: a memo hit
 is 11 ns today and 5.4 ns at its bound, an intern hit about 4.3 ns, an execution's bookkeeping
@@ -1705,7 +1705,7 @@ Files: `crates/base-db/src/{files,table,view,lib,editioned_file_id,input,content
 counted from the code as of 10-29 20:40, not measured. Round 1's before/after (no locks on reads,
 nothing done per unchanged file of a view, batched BLAKE3) is in
 [speed-hir-basedb.md](speed-hir-basedb.md). The exact edits named "block N" below are in
-`v2/requests/frontend-db-base.md`, under "speed-hir-sol-basedb"; frontend-db-base applied them.
+`docs/v2/requests/frontend-db-base.md`, under "speed-hir-sol-basedb"; frontend-db-base applied them.
 A second pass (sol-all-base, 10-30) made the root's content ID a trie, edits a root's file set
 in place, and compares a crate graph before hashing it; its costs are counted from the code too,
 with nothing built. The budget tests are in `crates/base-db/src/budget_tests.rs`. A "line" is a dependent cache-line load, as in
