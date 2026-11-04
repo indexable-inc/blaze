@@ -69,8 +69,6 @@ pub struct Shell;
 pub struct Proc;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Stage;
-#[derive(Component, Clone, Copy, Debug, Default)]
-pub struct Group;
 
 /// `(Status, status)`.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -179,12 +177,6 @@ pub struct History {
     pub exhausted: bool,
 }
 
-/// A group of runs with no listed session, by what they share (`repl:<id>`, `session:<n>`, `other`).
-#[derive(Component, Clone, Debug, Default, PartialEq)]
-pub struct GroupKey {
-    pub s: ScriptString,
-}
-
 /// Finished runs a parent shows while folded (running ones always show).
 pub const KEEP_RUNS: usize = 3;
 
@@ -209,8 +201,6 @@ pub enum PaneKind {
     Term,
     /// A run's or stage's output (Proc, Stage).
     Run,
-    /// A group's runs (Group).
-    Group,
     /// The Archive (ArchiveView).
     Archive,
 }
@@ -223,8 +213,6 @@ pub fn pane_kind(e: EntityView<'_>) -> PaneKind {
     let k = e.target(Kind::id(), 0).map_or(0, |t| *t.id());
     if k == *w.component_id::<ArchiveView>() {
         PaneKind::Archive
-    } else if k == *w.component_id::<Group>() {
-        PaneKind::Group
     } else if k == *w.component_id::<Stage>() || (k == *w.component_id::<Proc>() && !e.has(Object::id())) {
         PaneKind::Run
     } else {
@@ -307,7 +295,6 @@ pub fn register(world: &World) {
     world.component::<History>().writable();
     world.set(ArchiveAfter { ms: 600_000 });
     world.set(History::default());
-    world.component::<GroupKey>().writable();
     world.component::<Selected>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Shows>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Term>().writable();
@@ -325,7 +312,6 @@ fn for_tags(world: &World) {
     world.component::<Shell>();
     world.component::<Proc>();
     world.component::<Stage>();
-    world.component::<Group>();
     world.component::<Running>();
     world.component::<Exited>();
     world.component::<Lost>();
@@ -889,20 +875,6 @@ pub fn archive_view(world: WorldRef<'_>) -> u64 {
 
 fn ke_collapsed(w: WorldRef<'_>, e: u64) -> bool {
     w.entity_from_id(e).has(Collapsed::id())
-}
-
-/// Whether `e` is a group of runs (its row folds it rather than selecting it).
-#[must_use]
-pub fn is_group(world: WorldRef<'_>, e: u64) -> bool {
-    world.entity_from_id(e).has(GroupKey::id())
-}
-
-/// How many runs `e` holds directly.
-#[must_use]
-pub fn run_count(world: WorldRef<'_>, e: u64) -> usize {
-    let mut n = 0;
-    world.entity_from_id(e).each_child(|c| n += usize::from(c.has(Run::id())));
-    n
 }
 
 /// Collapse or expand `e`'s children.

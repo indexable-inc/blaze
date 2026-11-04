@@ -27,12 +27,10 @@ pub fn run(path: &str) -> Result<(), String> {
     if std::env::var_os("HARNESS_NATIVE_SHOT_PALETTE").is_some() {
         app.open_palette();
     }
-    // A session id, a run (`r12`) or one of its stages (`r12.0`), or a group of runs by its key (`g:repl:<id>`, `g:other`).
+    // A session id, a run (`r12`) or one of its stages (`r12.0`).
     if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {
         if s == "archive" {
             app.select_archive_later();
-        } else if let Some(key) = s.strip_prefix("g:") {
-            app.select_group(key);
         } else if let Some(run) = s.strip_prefix('r') {
             let (n, k) = run.split_once('.').map_or((run, None), |(n, k)| (n, k.parse().ok()));
             if let Ok(n) = n.parse() {

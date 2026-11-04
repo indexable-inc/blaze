@@ -206,7 +206,7 @@ impl App {
                 let Some(s) = sel.map(|s| w.entity_from_id(s)) else { return true };
                 if has_kids(s) && !s.has(model::Collapsed::id()) {
                     self.toggle_fold_of(*s.id(), k.mods.alt);
-                } else if let Some(p) = s.parent().filter(|p| p.target(model::Kind::id(), 0).is_some() && !model::is_group(w, *p.id())) {
+                } else if let Some(p) = s.parent().filter(|p| p.target(model::Kind::id(), 0).is_some()) {
                     self.select(Some(*p.id()));
                 }
             }
@@ -241,7 +241,7 @@ pub fn has_kids(e: EntityView<'_>) -> bool {
     any
 }
 
-/// The key an object's fold is kept by across launches: its daemon session (`s14`), its run (`r12`) or its group.
+/// The key an object's fold is kept by across launches: its daemon session (`s14`) or its run (`r12`).
 fn fold_key(e: EntityView<'_>) -> Option<String> {
     if let Some(o) = e.try_cloned::<&model::Object>() {
         return Some(format!("s{}", o.id));
@@ -249,10 +249,7 @@ fn fold_key(e: EntityView<'_>) -> Option<String> {
     if e.has(model::StageNo::id()) {
         return None;
     }
-    if let Some(r) = e.try_cloned::<&model::Run>() {
-        return Some(format!("r{}", r.n));
-    }
-    e.try_cloned::<&model::GroupKey>().map(|g| format!("g{}", g.s.as_str()))
+    e.try_cloned::<&model::Run>().map(|r| format!("r{}", r.n))
 }
 
 /// Set a row's disclosure: a chevron that folds `e` (turned open or not) when it has rows under it, shown while the row

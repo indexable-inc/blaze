@@ -122,8 +122,6 @@ pub struct App {
     resizing: bool,
     /// A run (and stage) to select once the runs show it.
     pending_run: Option<(u64, Option<u32>)>,
-    /// A group of runs to select once the runs make it, by its key (`repl:<id>`, `other`).
-    pending_group: Option<String>,
     link: Link,
     grid: Grid,
     zoom: usize,
@@ -310,7 +308,6 @@ impl App {
             run_terms,
             watching: HashMap::new(),
             pending_run: None,
-            pending_group: None,
             side_w,
             resizing: false,
             link,
@@ -507,18 +504,6 @@ impl App {
             self.pending_archive = false;
             model::select(w, Some(model::archive_view(w)));
         }
-        if let Some(key) = self.pending_group.clone() {
-            let mut found = None;
-            self.world.new_query::<&model::GroupKey>().each_entity(|e, g| {
-                if g.s.as_str() == key {
-                    found = Some(*e.id());
-                }
-            });
-            if found.is_some() {
-                model::select(w, found);
-                self.pending_group = None;
-            }
-        }
         if let Some((n, k)) = self.pending_run {
             let mut found = None;
             self.world.new_query::<&model::Run>().each_entity(|e, r| {
@@ -576,7 +561,6 @@ impl App {
             .into_iter()
             .map(|r| match r {
                 model::Row::Obj { e, .. } if self.run_of(e).is_some() => (format!("o{e}"), "hn.RunRow", r),
-                model::Row::Obj { e, .. } if model::is_group(w, e) => (format!("o{e}"), "hn.GroupRow", r),
                 model::Row::Obj { e, .. } => (format!("o{e}"), "hn.ObjRow", r),
                 model::Row::More { parent, .. } => (format!("more{parent}"), "hn.MoreRow", r),
             })
@@ -610,24 +594,6 @@ impl App {
                 }
             };
             let o = w.entity_from_id(e);
-            if model::is_group(w, e) {
-                // A group of runs without a listed session: pressing it shows it (its runs in a group pane); pressing it
-                // again folds it.
-                row.action(&format!("group:{e}"));
-                selection(row, sel == Some(e), clear);
-                indent(row, depth);
-                fold::disclosure(row, Some(o));
-                if let Some(p) = row.part("glyph") {
-                    p.icon(crate::look::GROUP_ICON);
-                }
-                if let Some(p) = row.part("name") {
-                    p.text(&o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default());
-                }
-                if let Some(p) = row.part("meta") {
-                    p.text(&model::run_count(w, e).to_string());
-                }
-                return;
-            }
             row.action(&format!("select:{e}"));
             fold::disclosure(row, Some(o));
             selection(row, sel == Some(e), clear);
@@ -693,10 +659,6 @@ impl App {
                     (None, model::PaneKind::Archive) => {
                         let n = model::archived(w).len();
                         (name, format!("{n} archived"))
-                    }
-                    (None, model::PaneKind::Group) => {
-                        let n = model::run_count(w, e);
-                        (name, format!("{n} run{}", if n == 1 { "" } else { "s" }))
                     }
                     _ => {
                         // The program-set title (OSC 0/2) never names anything (agents' titles are spinner frames and
@@ -1262,12 +1224,6 @@ impl App {
             } else if let Some(e) = a.strip_prefix("toggle:").or_else(|| a.strip_prefix("collapse:")).and_then(|s| s.parse().ok()) {
                 self.tree_focus = true;
                 self.toggle_fold_of(e, self.press.1.alt);
-            } else if let Some(g) = a.strip_prefix("group:").and_then(|s| s.parse().ok()) {
-                if self.selected() == Some(g) {
-                    model::toggle_collapse(self.world.world_ref(), g);
-                } else {
-                    self.select(Some(g));
-                }
             } else if let Some(p) = a.strip_prefix("fold:").and_then(|s| s.parse().ok()) {
                 model::toggle_fold(self.world.world_ref(), p);
             } else if a == "archive:open" {
@@ -1585,11 +1541,6 @@ impl App {
     /// Select run `r{n}` (or its stage `k`) once the runs show it (the shot's `HARNESS_NATIVE_SHOT_SELECT=r12[.0]`).
     pub fn select_run(&mut self, n: u64, k: Option<u32>) {
         self.pending_run = Some((n, k));
-    }
-
-    /// Select the group of runs keyed `key` once the runs make it (the shot's `HARNESS_NATIVE_SHOT_SELECT=g:repl:<id>`).
-    pub fn select_group(&mut self, key: &str) {
-        self.pending_group = Some(key.to_owned());
     }
 
     /// Open the Archive once the daemon's first list is in (the shot's `HARNESS_NATIVE_SHOT_SELECT=archive`).

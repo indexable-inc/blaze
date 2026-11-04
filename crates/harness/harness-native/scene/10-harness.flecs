@@ -214,34 +214,6 @@ prefab hn.RunRow : ui.Row {
   }
 }
 
-// A group of runs with no listed session ("REPL runs", "other runs"): its icon, its name, how many runs it holds and a
-// disclosure chevron (on hover or while open, turning on a spring); pressed to fold or unfold it.
-prefab hn.GroupRow : ui.Row {
-  Pressable
-  Action: {name: ""}
-  Fill: $tone_clear
-  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
-  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
-  indent : ui.Node {
-    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
-  }
-  disclose : hn.Disclosure {}
-  glyph : ui.Symbol, Muted {
-    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
-  }
-  name : ui.Lead, Ink {
-    TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
-  }
-  spacer : ui.Spacer {}
-  meta : ui.Line, Faint {
-    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-  }
-}
-
 // The fold of a session's older runs: a quiet "Show 5 more" (or "Show fewer"), lined up with the runs' commands.
 prefab hn.MoreRow : ui.Row {
   Pressable
@@ -321,27 +293,6 @@ prefab hn.RunPane : hn.Pane {
     }
   }
   term : hn.Terminal {}
-}
-
-// A group of runs (REPL runs, other runs): its name and count, then its runs, newest first.
-prefab hn.GroupPane : hn.Pane {
-  info : ui.Column {
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
-    Padding: {l: 18, r: 18, t: 16, b: 10}
-    name : ui.Words, Strong {
-      TextStyle: {size: $size_body, line: 18, role: 0, bold: 1}
-    }
-    meta : ui.Words, Muted {
-      TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0}
-    }
-  }
-  runs : ui.List {
-    Clip
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-    Padding: {l: 10, r: 10, t: 0, b: 10}
-  }
 }
 
 // A row of a pane's list (a run's stages, a group's runs): status dot, its id, its command in the code face, and on the
