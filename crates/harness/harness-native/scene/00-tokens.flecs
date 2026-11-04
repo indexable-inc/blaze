@@ -73,6 +73,14 @@ export const archive_zeta = 0.3
 export const count_kick_scale = 0.35
 export const count_omega = 26
 export const count_zeta = 0.35
+// The generic motion springs (prims.flecs's ui.spring tokens): a node's insert and removal Transition, a MatchedGeometry
+// slide (the selection pill between rows), and an Animate node's Size, Padding and Fill easing.
+export const spring_transition_omega = 20
+export const spring_transition_zeta = 0.9
+export const spring_matched_omega = 26
+export const spring_matched_zeta = 0.84
+export const spring_layout_omega = 18
+export const spring_layout_zeta = 1
 
 export const radius_control = 6
 export const radius_card = 12

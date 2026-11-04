@@ -37,7 +37,7 @@ pub enum TruncateMode {
 pub struct Truncate {
     pub mode: TruncateMode,
 }
-||||||| 5c40a4c
+
 /// The `Text` beside it is set on one line, never wrapped: cut with an ellipsis to the width layout gives it (Finder's
 /// sidebar rows). Its height is one line's whatever its width. A tag.
 #[derive(Component, Clone, Copy, Debug, Default)]

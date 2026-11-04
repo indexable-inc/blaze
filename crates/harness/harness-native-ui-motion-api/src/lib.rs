@@ -11,8 +11,8 @@ pub struct Motion {
     pub zeta: f32,
 }
 
-/// How a node appears as its group's spring goes 0 to 1: alpha at 0, offset at 0, scale at 0 (about its middle). The draw
-/// pass folds all three into the node and everything under it. A `Transition` writes it from its kind.
+/// How a node appears as its group's spring goes 0 to 1: alpha at 0, offset at 0, scale at 0 (about its middle; 0 or less
+/// is no scale). The draw pass folds all three into the node and everything under it. A `Transition` writes it.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Reveal {
     pub alpha0: f32,

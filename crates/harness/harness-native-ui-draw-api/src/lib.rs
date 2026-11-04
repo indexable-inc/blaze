@@ -43,6 +43,23 @@ pub struct Painted {
     pub clip_y: f32,
     pub clip_w: f32,
     pub clip_h: f32,
+    /// Where it is drawn (window points): its `Laid`, or its `Drawn` mid-slide, moved by every ancestor's transition.
+    /// `w` and `h` are before `scale`; the host lays the node out in `w` by `h` at `(x, y)` and scales what it drew about
+    /// `(x, y)`.
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Its own and its ancestors' transition scale (1 for none).
+    pub scale: f32,
+}
+
+impl Painted {
+    /// The rectangle it is laid out in before `scale` (see [`Painted::x`]).
+    #[must_use]
+    pub fn rect(&self) -> [f32; 4] {
+        [self.x, self.y, self.w, self.h]
+    }
 }
 
 impl Painted {

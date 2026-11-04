@@ -32,7 +32,7 @@ fn reveal_of(t: Transition, l: Laid, leaving: bool) -> Reveal {
     let (dx, dy, scale0) = match t.kind {
         TransitionKind::Opacity => (0.0, 0.0, 1.0),
         TransitionKind::Slide => (if leaving { l.w } else { -l.w }, 0.0, 1.0),
-        TransitionKind::Scale => (0.0, 0.0, t.scale),
+        TransitionKind::Scale => (0.0, 0.0, t.scale.max(0.01)),
         TransitionKind::Move => match t.from {
             FromEdge::Top => (0.0, -l.h, 1.0),
             FromEdge::Bottom => (0.0, l.h, 1.0),

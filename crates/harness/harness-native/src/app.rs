@@ -22,7 +22,7 @@ use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::{Intrinsic, Size, SizeKind, Sizing, Viewport};
 use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, Shape, TextStyle};
 use harness_native_ui_node_api::{Laid, Level};
-use harness_native_ui_text_api::{Icon, OneLine, Text};
+use harness_native_ui_text_api::{Icon, OneLine, Text, Truncate, TruncateMode};
 use harness_native_ui_view::{self as view, View, for_each};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
@@ -1141,7 +1141,8 @@ impl App {
                 let lay = if t.one_line || at + 0.5 >= w { one } else { self.layout(&t.text, &t.style, at) };
                 let st = set_of(&t.style);
                 let h = lay.lines.last().map_or(st.line, |l| l.top + l.height).max(st.line);
-                Intrinsic { w, h, at }
+                let [base, last] = [lay.lines.first(), lay.lines.last()].map(|l| l.map_or(0.0, |l| l.baseline));
+                Intrinsic { w, h, at, base, last }
             })
             .collect();
         typeset::apply(self.world.world_ref(), &wanted, &sizes)
@@ -1233,6 +1234,8 @@ impl App {
             let w = self.world.world_ref();
             let e = w.entity_from_id(id);
             let Some(laid) = e.try_cloned::<&Laid>() else { continue };
+            // Where the draw pass says it goes (moved by a transition, mid-slide on a MatchedGeometry), before its scale.
+            let laid = if p.w > 0.0 || p.h > 0.0 { Laid { x: p.x, y: p.y, w: p.w, h: p.h } } else { laid };
             // A breathing dot dims and brightens; a hover-only part fades with its row's hover.
             p.alpha *= crate::look::alpha(w, e, lo);
             let is_term = e.has(TermNode::id());
@@ -1292,9 +1295,11 @@ impl App {
                     let Some(text) = e.try_cloned::<&Text>() else { continue };
                     let style = e.try_cloned::<&TextStyle>().unwrap_or_default();
                     let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
-                    let lay = if e.has(OneLine::id()) {
-                        // One line, never wrapped: cut with an ellipsis to the width layout gave it.
-                        let cut = self.fit_text(text.s.as_str(), &style, laid.w.max(1.0) + 0.5);
+                    let truncate = e.try_cloned::<&Truncate>().map(|t| t.mode).or_else(|| e.has(OneLine::id()).then_some(TruncateMode::Tail));
+                    let lay = if let Some(mode) = truncate {
+                        // One line, never wrapped: cut with an ellipsis (at its end, middle or start) to the width layout gave it.
+                        let room = laid.w.max(1.0) + 0.5;
+                        let cut = typeset::elide(text.s.as_str(), mode, room, |t| self.layout(t, &style, 1.0e5).lines.iter().map(|l| l.width).fold(0.0, f32::max));
                         self.layout(&cut, &style, 1.0e5)
                     } else {
                         self.layout(text.s.as_str(), &style, laid.w.max(1.0) + 0.5)
@@ -1325,6 +1330,16 @@ impl App {
                 let (cx, cy) = (laid.x + laid.w * 0.5, laid.y + laid.h * 0.5);
                 for g in &mut d.glyphs[ng..] {
                     g.rect = [cx + (g.rect[0] - cx) * k, cy + (g.rect[1] - cy) * k + dy, g.rect[2] * k, g.rect[3] * k];
+                }
+            }
+            // A transition's scale: what this node drew, scaled about its corner.
+            if (p.scale - 1.0).abs() > 1e-4 && p.scale > 0.0 {
+                let (ox, oy, k) = (laid.x, laid.y, p.scale);
+                for panel in &mut d.panels[np..] {
+                    panel.rect = [ox + (panel.rect[0] - ox) * k, oy + (panel.rect[1] - oy) * k, panel.rect[2] * k, panel.rect[3] * k];
+                }
+                for g in &mut d.glyphs[ng..] {
+                    g.rect = [ox + (g.rect[0] - ox) * k, oy + (g.rect[1] - oy) * k, g.rect[2] * k, g.rect[3] * k];
                 }
             }
             if p.clipped {

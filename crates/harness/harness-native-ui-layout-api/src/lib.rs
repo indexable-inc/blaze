@@ -344,9 +344,10 @@ pub fn register(world: &World) {
     world.component::<AlignmentGuide>().writable();
     world.component::<LayoutPriority>().writable();
     world.component::<FixedSize>().writable();
-    world.component::<Grid>().writable();
-    world.component::<GridRow>().writable();
-    world.component::<GridColumn>().writable();
+    // Aliased (as `Node` is): each shares its name with the prefab that carries it (`prefab ui.Grid { Grid: ... }`).
+    world.component::<Grid>().writable().aliased();
+    world.component::<GridRow>().writable().aliased();
+    world.component::<GridColumn>().writable().aliased();
     world.component::<GridColumns>().writable();
     world.component::<Lazy>().writable();
     world.component::<LazyIndex>().writable();
@@ -356,6 +357,6 @@ pub fn register(world: &World) {
     world.component::<Overlay>().writable().aliased();
     world.component::<SafeAreaInset>().writable();
     world.component::<SafeAreaPadding>().writable();
-    world.component::<ViewThatFits>().writable();
+    world.component::<ViewThatFits>().writable().aliased();
     world.component::<AnchoredTo>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
 }
