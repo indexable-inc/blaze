@@ -927,14 +927,11 @@ pub(super) fn hash_expand(
                 }
             };
         }
-        let arms = adt
-            .shape
-            .as_pattern(span, &adt.name)
-            .into_iter()
-            .zip(adt.shape.field_names())
-            .map(|(pat, names)| {
-                let expr = {
-                    let it = names.iter().map(|it| {
+        let arms =
+            adt.shape.as_pattern(span, &adt.name).into_iter().zip(adt.shape.field_names()).map(
+                |(pat, names)| {
+                    let expr = {
+                        let it = names.iter().map(|it| {
                         let bound = bound_of_self(it);
                         if adt.packed {
                             quote! {span => #krate::hash::Hash::hash(&#bound, ra_expand_state); }
@@ -942,12 +939,13 @@ pub(super) fn hash_expand(
                             quote! {span => #krate::hash::Hash::hash(#bound, ra_expand_state); }
                         }
                     });
-                    quote! {span => {
-                        # #it
-                    } }
-                };
-                (pat, expr)
-            });
+                        quote! {span => {
+                            # #it
+                        } }
+                    };
+                    (pat, expr)
+                },
+            );
         let body = adt.match_self(span, arms.collect());
         // rustc leaves the discriminant out when there is only one variant.
         let check_discriminant = if matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1)
