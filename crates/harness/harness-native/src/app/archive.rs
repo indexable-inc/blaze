@@ -390,6 +390,8 @@ impl App {
         if let Some(b) = row.part("status") {
             let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
             let (text, ink, wash) = match (self.status_of(e), code) {
+                // Closed (cmd+W) but its process is alive in the daemon: say so, not a bare "running".
+                ("running", _) if o.has(model::Object::id()) => ("still running".to_owned(), looks.accent, looks.clear),
                 ("running", _) => ("running".to_owned(), looks.accent, looks.clear),
                 ("killed", _) => ("killed".to_owned(), looks.failed, looks.failed_wash),
                 ("lost", _) => ("lost".to_owned(), looks.lost, looks.clear),
