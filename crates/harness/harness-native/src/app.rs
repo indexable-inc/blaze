@@ -379,7 +379,9 @@ impl App {
                 let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
                 let t = o.try_cloned::<&model::Title>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
                 let cwd = o.try_cloned::<&model::Cwd>().map(|n| tilde(n.s.as_str())).unwrap_or_default();
-                let sub = if t.is_empty() || t == name { cwd } else { t };
+                // The program-set title (OSC 0/2) is kept on the entity but never names anything: agents' titles are
+                // spinner frames and "Claude Code", so only a shell's title shows, as the header's dim secondary text.
+                let sub = if kind == "shell" && !t.is_empty() && t != name { t } else { cwd };
                 let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
                 let e = *o.id();
                 let state = match (self.status_of(e), code) {
