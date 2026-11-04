@@ -37,6 +37,7 @@
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
+mod casefold;
 pub mod decisions;
 pub mod digest;
 pub mod error;
@@ -46,6 +47,7 @@ pub mod graph;
 pub mod request;
 pub mod store;
 pub mod tree;
+pub mod unpack;
 
 #[cfg(test)]
 mod tests;

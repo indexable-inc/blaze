@@ -24,6 +24,7 @@ mod heads;
 mod image;
 mod job;
 mod mounts;
+mod native;
 pub mod observe;
 /// The seed's one-shot build: this engine in the CLI's process, for its command alone.
 #[cfg(not(feature = "native"))]

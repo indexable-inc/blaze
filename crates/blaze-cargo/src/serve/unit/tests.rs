@@ -135,6 +135,7 @@ fn build(dir: &std::path::Path) -> Units {
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     }
 }
 
@@ -156,6 +157,7 @@ fn of<'a>(units: &'a Units, scripts: &'a [OnceLock<script::Applied>], tools: &'a
         launcher: std::path::Path::new("/opt/blaze/bin/blaze"),
         program: PathBuf::from("/w/target/debug/build/x/build-script-build"),
         scripts,
+        native: &[],
     }
 }
 
@@ -288,6 +290,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
     let place = blaze_usercode::script::Place {
         code: ContentId::of("blaze v2 test 1", b"script"),
         read: vec!["/w".into()],
+        pinned: Vec::new(),
         network: false,
         memory: None,
         mode: blaze_usercode::run::Mode::Normal,
@@ -798,6 +801,7 @@ fn a_pack_is_of_the_packages_binary_or_else_its_library() {
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     };
     let units = with(vec![
         unit(dep, target("dep", "lib", "/w/dep/src/lib.rs"), Mode::Check, &[]),
@@ -988,6 +992,7 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     };
     let config = BuildConfig {
         invocation: Invocation {
@@ -1222,6 +1227,7 @@ fn script_front_for(text: &'static [u8], on_core: bool, env: &[(&str, &str)], pr
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     };
     let config = BuildConfig {
         invocation: Invocation {
@@ -1492,6 +1498,7 @@ fn script_lib_front(lib: &[u8]) -> blaze_lower::Lowered {
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     };
     let config = BuildConfig {
         invocation: Invocation {
@@ -1597,6 +1604,7 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
         finished: String::new(),
         link_dirs: Vec::new(),
         sandboxed_tests: false,
+        native: Vec::new(),
     };
     let config = BuildConfig {
         invocation: Invocation {

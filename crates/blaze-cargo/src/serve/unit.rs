@@ -93,6 +93,13 @@ pub struct Real {
     /// blaze's sources directory ([`blaze_manifest::home::sources`]), the one place a fetched
     /// package is written on disk ([`crate::serve::fetch::keep_on_disk`]).
     sources: PathBuf,
+    /// Where the pinned native inputs are laid out, `<BLAZE_HOME>/native`
+    /// ([`crate::serve::native`]); none when the daemon has no home (neither `BLAZE_HOME` nor
+    /// the user's home is set), which only a build that names an input is refused for.
+    native: Option<PathBuf>,
+    /// The layouts this daemon has checked against their marks, each once
+    /// ([`crate::serve::native::Verified`]).
+    native_verified: crate::serve::native::Verified,
 }
 
 /// What every job's front shares: the daemon's paths, what was read of the machine's files,
@@ -134,7 +141,8 @@ impl Real {
             selectors: test::image::Selectors::default(),
             dev_runs: run::inproc::DevRuns::new(paths.state.join("inproc")),
         };
-        Ok(Real { fetcher, shared: Arc::new(shared), sources })
+        let native = crate::toolchain::home().map(|it| it.join(crate::serve::native::NATIVE));
+        Ok(Real { fetcher, shared: Arc::new(shared), sources, native, native_verified: Default::default() })
     }
 }
 
@@ -171,6 +179,25 @@ impl Steps for Real {
         let source = self.fetcher.fetch(fetch)?;
         crate::serve::fetch::keep_on_disk(fetch, &source, &self.sources)?;
         Ok(source)
+    }
+
+    fn native(
+        &self,
+        input: &blaze_units::query::NativeInput,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<std::path::PathBuf, ApiError> {
+        let Some(native) = &self.native else {
+            return Err(ApiError::new(
+                format!(
+                    "pinned native input `{}` is laid out under blaze's home, and the daemon has none: \
+                     set BLAZE_HOME (or HOME) where it starts",
+                    input.name
+                ),
+                Some(input.pin.clone()), // clone: an error's place, once
+            ));
+        };
+        let fetcher = self.fetcher.pinned();
+        crate::serve::native::ensure(input, native, &fetcher, &self.native_verified, cancelled)
     }
 
     fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError> {
@@ -450,7 +477,8 @@ fn env_seen(moved: &EnvMoved) -> (blaze_kernel::Seen, blaze_kernel::Seen) {
 /// The first part of two plans' units that differs, by name. Every field is named, so one
 /// added to [`Units`] is named here too.
 fn units_differ(kept: &Units, now: &Units) -> &'static str {
-    let Units { graph, plans, packages, lock, warnings, target_dir, build_dir, finished, link_dirs, sandboxed_tests } = kept;
+    let Units { graph, plans, packages, lock, warnings, target_dir, build_dir, finished, link_dirs, sandboxed_tests, native } =
+        kept;
     if graph != &now.graph {
         "the unit graph"
     } else if plans != &now.plans {
@@ -471,6 +499,8 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         "the build-script link directories"
     } else if sandboxed_tests != &now.sandboxed_tests {
         "whether tests run sandboxed"
+    } else if native != &now.native {
+        "the pinned native inputs"
     } else {
         "nothing compared"
     }

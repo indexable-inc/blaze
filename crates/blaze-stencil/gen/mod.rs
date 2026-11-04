@@ -27,9 +27,10 @@ pub fn main(out: &Path) {
     println!("cargo:rerun-if-env-changed={PREFIX}");
     let prefix = env::var_os(PREFIX).filter(|it| !it.is_empty()).unwrap_or_else(|| {
         panic!(
-            "blaze-stencil's stencils are made by the pinned LLVM, and {PREFIX} is unset: enter \
-             `nix develop`, or fetch it with `python3 .github/scripts/llvm.py fetch --target \
-             <triple> --dir <dir>` and set {PREFIX} to that directory"
+            "blaze-stencil's stencils are made by the pinned LLVM, and {PREFIX} is unset: blaze \
+             sets it to the LLVM crates/hir-ty-codegen/llvm.json pins, laid out under its home, \
+             for every package `[workspace.metadata.blaze.native.llvm]` in the root Cargo.toml \
+             names (docs/cargo.md, \"Pinned native inputs\"); build with blaze"
         )
     });
     println!("cargo:rerun-if-changed={}", PathBuf::from(prefix).join("blaze-llvm.json").display());

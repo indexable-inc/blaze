@@ -23,6 +23,9 @@ crossbeam-channel.workspace = true
 papaya.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+# The one checked unpacker of a tar stream (`unpack`), and the times cargo's rules give its files.
+tar.workspace = true
+filetime.workspace = true
 # SHA-512 only; SHA-256 is blaze-sha256's.
 sha2.workspace = true
 tracing.workspace = true

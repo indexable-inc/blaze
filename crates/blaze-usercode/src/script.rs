@@ -58,6 +58,12 @@ pub struct Place {
     pub code: ContentId,
     /// What it may read besides what every sandbox reads: its package, the toolchain.
     pub read: Vec<PathBuf>,
+    /// The pinned native inputs it is given (docs/cargo.md, "Pinned native inputs"): each the
+    /// variable it reads the layout from and the archive's digest (`sha256:<hex>`), sorted by
+    /// variable. Their digests are a part of its key, so another archive is another run
+    /// whatever directory it is laid out in; empty adds no part, and leaves every other
+    /// script's key as it was.
+    pub pinned: Vec<(String, String)>,
     /// Whether its package's manifest lets it reach the network: then what it reached is
     /// untraceable, and it is kept by cargo's rule.
     pub network: bool,
@@ -129,6 +135,18 @@ pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -
     let dir = crate::trace::os_bytes(unit.package.manifest_dir.as_os_str());
     given.ported("program", &program, &view);
     given.ported("dir", &dir, &view);
+    if !place.pinned.is_empty() {
+        let mut pinned: Vec<&(String, String)> = place.pinned.iter().collect(); // alloc: setup, a run's few inputs
+        pinned.sort();
+        let mut bytes = Vec::new(); // alloc: setup, as above
+        for (name, digest) in pinned {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(digest.as_bytes());
+            bytes.push(0);
+        }
+        given.part("pinned native inputs", &bytes);
+    }
     bound = bound.union(view.left(&program)).union(view.left(&dir));
     let key = RunKey { code: place.code, given: given.finish() };
     roots.bind(bound);
@@ -364,6 +382,7 @@ mod tests {
         Place {
             code: ContentId::of("blaze v2 test 1", b"script"),
             read: vec!["/ws/p".into()],
+            pinned: Vec::new(),
             network: false,
             memory: None,
             mode: Mode::Normal,
@@ -413,6 +432,29 @@ mod tests {
 
     fn inherited(path: &str) -> Vec<(OsString, OsString)> {
         vec![("PATH".into(), path.into()), ("HOME".into(), "/home/u".into())]
+    }
+
+    /// A pinned native input's digest is part of the run's key: another archive is another
+    /// run, even laid out at the same place; and a script given none keeps the key it had.
+    #[test]
+    fn the_key_has_each_pinned_inputs_digest() {
+        let mut given = unit();
+        given.config_env.push(blaze_build_script::unit::ConfigEnv {
+            name: "LLVM_SYS_231_PREFIX".into(),
+            value: "/home/u/.blaze/native/llvm".into(),
+            force: true,
+        });
+        let with = |digest: &str| {
+            let place = Place { pinned: vec![("LLVM_SYS_231_PREFIX".into(), format!("sha256:{digest}"))], ..place() };
+            prepare(&given, &inherited("/a"), &place).unwrap().spec.key
+        };
+        let (a, b) = (with(&"a".repeat(64)), with(&"b".repeat(64)));
+        assert_ne!(a, b);
+        assert_eq!(a, with(&"a".repeat(64)));
+        let none = prepare(&given, &inherited("/a"), &place()).unwrap().spec.key;
+        assert_ne!(a, none);
+        // The variable it is given is set from the unit: in the key by its value too.
+        assert!(prepare(&given, &inherited("/a"), &place()).unwrap().given.iter().any(|it| it == "LLVM_SYS_231_PREFIX"));
     }
 
     #[test]

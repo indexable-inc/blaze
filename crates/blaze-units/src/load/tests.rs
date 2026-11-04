@@ -844,6 +844,7 @@ impl Query for HostMacros {
                 finished: built.finished,
                 link_dirs: built.link_dirs,
                 sandboxed_tests: built.sandboxed_tests,
+                native: built.native,
             }),
             super::Staged::Needs(fetches) => Planned::Needs(fetches),
             super::Staged::Failed(error) => Planned::Failed(error),
