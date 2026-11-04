@@ -217,7 +217,7 @@ pub(super) fn macho_name(name: &str) -> String {
 
 /// [`macho_name`] in its two parts, built without allocating: the underscore it gains (or
 /// none), and the rest.
-fn spelled(name: &str) -> (&'static str, &str) {
+pub(crate) fn spelled(name: &str) -> (&'static str, &str) {
     match name.strip_prefix('\x01') {
         Some(rest) => ("", rest),
         None => ("_", name),

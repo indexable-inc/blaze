@@ -115,6 +115,12 @@ struct RecordRef<'a> {
 /// [`crate::serve::RecordMakers`] in place of the executable's bytes.
 const RECORD: &str = "blaze v2 cargo unit record 9";
 const OUTPUT: &str = "blaze v2 cargo output 1";
+
+/// The store's key of an output file's `bytes`: what a record names it by, and what a dev
+/// executable's program is known by in the daemon's code memory ([`super::run::inproc`]).
+pub(crate) fn output_key(bytes: &[u8]) -> Key {
+    Key(ContentId::of(OUTPUT, bytes))
+}
 /// A span table's anchor and content, as a test's selection holds it.
 const SPANS: &str = "blaze v2 cargo test spans 1";
 /// A test binary's context with the native inputs its link read, in link order.
@@ -1543,23 +1549,18 @@ fn held(job: &Job, unit: usize, kept: &mut Compiled) -> Result<(), Failed> {
     let mut told = Vec::new();
     for output in programs() {
         let path = output.path.as_str();
-        let bytes = match kept.puts.iter().find(|it| it.key == output.key) {
-            Some(put) => &put.bytes[..],
+        // Read only when the daemon does not hold the program by this key already.
+        let bytes = || match kept.puts.iter().find(|it| it.key == output.key) {
+            Some(put) => Ok(&put.bytes[..]),
             None => match job.input.store.get(&guard, &output.key) {
-                Ok(Some(it)) => it.bytes,
-                Ok(None) => {
-                    // alloc: error path
-                    let what = format!("{path}: its record names the output {:x}, which the store does not hold", output.key.0);
-                    return Err(ApiError::new(what, None).into());
-                }
-                Err(corrupt) => {
-                    // alloc: error path
-                    let what = format!("{path}: reading the output {:x} from the store: {corrupt}", output.key.0);
-                    return Err(ApiError::new(what, None).into());
-                }
+                Ok(Some(it)) => Ok(it.bytes),
+                // alloc: error path
+                Ok(None) => Err(format!("its record names the output {:x}, which the store does not hold", output.key.0)),
+                // alloc: error path
+                Err(corrupt) => Err(format!("reading the output {:x} from the store: {corrupt}", output.key.0)),
             },
         };
-        let adopted = job.shared.dev_runs.adopt(path, artifact::uplifted(path, plan), bytes);
+        let adopted = job.shared.dev_runs.adopt(path, artifact::uplifted(path, plan), output.key, bytes);
         match adopted.map_err(|what| ApiError::new(format!("{path}: {what}"), None))? {
             // alloc: a path, once per running program replaced
             super::run::inproc::Told::Restart { why } => told.push((path.to_owned(), why)),
@@ -1625,7 +1626,7 @@ fn store(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases) -> Re
         let mut keyed: Vec<(String, Key, bool)> = Vec::with_capacity(files.len());
         let mut output_keys: Vec<Key> = Vec::with_capacity(plan.outputs.len());
         let mut put_output = |puts: &mut Vec<Put>, bytes: Vec<u8>| {
-            let key = Key(ContentId::of(OUTPUT, &bytes));
+            let key = output_key(&bytes);
             if !output_keys.contains(&key) {
                 output_keys.push(key);
                 puts.push(Put { key, kind: Kind::Output, bytes });
