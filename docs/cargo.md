@@ -26,16 +26,17 @@ where v1 had a setting or command v2 lacks, the section says so. v2's design is
 
 From the release after 0.1.0, `--profile dist` builds the profile a release is built with, less
 the PGO a release adds ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)); 0.1.0 has no such
-profile and fails with it. From a checkout, the release's own recipe builds all of it, with the profile
-[tools/pgo/profiles.json](../tools/pgo/profiles.json) pins:
+profile and fails with it. From a checkout, the release's own recipe builds all of it with the
+blaze on PATH (the stage 0 `.github/blaze-version` names) and the pinned LLVM in
+`LLVM_SYS_231_PREFIX`, for this machine's target:
 
-    python3 .github/scripts/build_release.py --target $(rustc +"$(cat harness/toolchain)" -vV | sed -n 's/^host: //p') --out shipped
+    uv run --frozen --no-dev python .github/scripts/build_release.py '{"target": "aarch64-apple-darwin", "out": "shipped"}'
     cp shipped/* ~/.cargo/bin/
 
 That build has the LLVM backend (the release profile's, [below](#backends)) and the LLVM tiers, as the
 installer's binaries do: the script fetches the LLVM 23 blaze pins and links it in statically
 ([which LLVM](contributing.md#llvm)). `cargo install` from crates.io builds the same: it
-needs `LLVM_SYS_231_PREFIX` set to that same LLVM. `cargo build -p blaze-engine --release` is the quicker build the harnesses and CI use while
+needs `LLVM_SYS_231_PREFIX` set to that same LLVM. `blaze build -p blaze-engine --release` is the quicker build the harnesses and CI use while
 working on blaze; it is not what ships.
 
 `blaze` builds with the one toolchain blaze compiles, the dated nightly in

@@ -1,426 +1,339 @@
-#!/usr/bin/env python3
-"""Build blaze the one way it ships: the `dist` profile, optimized with a profile of its own
-work (PGO). The release workflow, the flake's `daemon` and `cargo install` from a checkout all
-build it with this.
+"""Build blaze the one way it ships: with the stage-0 blaze (.github/blaze-version), the `dist`
+profile, every binary of blaze-engine. release.yaml and install.yaml run it; blaze builds blaze,
+never cargo or rustc (AGENTS.md rule blaze-builds-blaze).
 
-  build_release.py --target T [--profdata FILE] [--out DIR]
-                                                  # the build, into target/T/dist; DIR gets every binary of blaze
-  build_release.py --target T --train DIR         # a new profile for T, into DIR (the pgo workflow)
-  build_release.py --pin DIR                      # tools/pgo/profiles.json names the profiles in DIR
-  build_release.py --target T --show              # the command the build runs, for any other driver
+One typed input (rule scripts-take-typed-input):
 
-The build is `cargo build -p blaze-engine --profile dist --locked --target T` with
-`RUSTFLAGS=-Cprofile-use=<profile>`, blaze-engine's default features: their `native` has LLVM,
-so every build of it has it, the training's included (std and every opt-level 2/3 unit are
-LLVM's): LLVM is linked in
-statically from the build crates/hir-ty-codegen/llvm.json pins, which `LLVM_SYS_231_PREFIX`
-names (the flake's) or, unset, .github/scripts/llvm.py fetches into target/llvm/T. The binaries
-are refused when one loads libLLVM, or on Linux a C++ runtime: a machine that downloads them has
-neither. The profile is the one tools/pgo/profiles.json pins for T: it
-is downloaded from the `pgo-profiles` release and refused unless its sha256 is the pinned
-one; `--profdata` gives the file instead (the flake fetches it with the same hash, since a nix
-build has no network).
+  uv run --frozen --no-dev python .github/scripts/build_release.py \\
+      '{"target": "x86_64-unknown-linux-gnu", "out": "shipped"}'
 
-A profile is trained by `--train`, in three steps:
+The build is `blaze build -p blaze-engine --profile dist --locked --target T`, run by `blaze`
+(the stage 0 .github/actions/blaze installs), against the LLVM `LLVM_SYS_231_PREFIX` names (the
+pin crates/hir-ty-codegen/llvm.json, which .github/actions/blaze fetches below /usr/local/lib:
+a build script in blaze's sandbox may name only system directories of libraries). T must be the
+host's: every release target builds on a machine of its own kind, nothing is cross-compiled.
 
-  1. the same build instrumented (`-Cprofile-generate`), into target/pgo-instrumented;
-  2. that blaze run on edits of projects the README's benchmarks do not measure (fd, bat,
-     just and hyperfine, at the commits harness/bench.py pins: a cold start and every kind of
-     edit, twice, through harness/abbench.py --train);
-  3. what it counted merged with the toolchain's llvm-profdata (`rustup component add
-     llvm-tools`), refused when it is too small to be the workers' (see below).
+`dist` is `release` with `lto = "thin"` and `codegen-units = 1`. blaze's release codegen is one
+LLVM unit per function with ThinLTO's summaries and imports across the whole program
+(docs/v2-codegen.md, "Release"), so what thin LTO and one unit per crate ask of rustc, inlining
+across functions and crates, is what blaze's release build always does; both settings are
+in the units' keys.
 
-A profile trained on older code still applies: LLVM uses it for every function whose control
-flow is unchanged and leaves the others unoptimized by it. The build counts what no longer
-matches and says so; the pgo workflow trains new profiles when that grows.
+PGO (`"pgo": "pinned"`): blaze builds with `-C profile-use` of the profile tools/pgo/profiles.json
+pins for T, downloaded and checked by its sha256 (or `profdata`, the same file already fetched).
+Only a profile trained on blaze's own build of blaze applies (`"builder": "blaze"`, made by
+tools/pgo/pgo.py with the LLVM pinned now): a profile of cargo's build names rustc's symbols and
+LLVM's format of another LLVM. pgo.py cannot train one yet, since blaze refuses
+`-C profile-generate` (its linker writes no profile sections: crates/blaze-cargo/src/serve/unit/
+codegen.rs, `pgo`), so today `pinned` stops with that error and releases ship `"pgo": "off"`.
 
-Against `cargo build --release` on Linux (docs/reports/RELEASE-BUILD.md): the cold start 14%
-shorter on nushell and ripgrep, an edit of a function 8% shorter on nushell, the same memory.
+The binaries are refused when one loads libLLVM, or on Linux a C++ runtime (a machine that
+downloads them has neither), and on Linux when one asks for a glibc newer than `GLIBC` (RHEL 9's;
+the release builds on the oldest hosted Ubuntu; install.sh says the same floor).
 
-A killed process writes no counters: `blaze stop` kills the workers, so abbench ends a
-training session by ending the daemon, after which each worker sees its input close and exits
-by itself. The `cc` crate passes `-Cprofile-generate`/`-Cprofile-use` on to the C compiler;
-on macOS Apple clang's profile format is not rustc's LLVM's and the instrumented blaze
-crashes at start (rust-lang/rust#163640), so the C code (mimalloc, ring) is built without
-them. macOS and Linux; stdlib only.
-
-On Linux every binary in DIR is refused when it asks for a glibc newer
-than `GLIBC` (RHEL 9's; Debian 12 and Ubuntu 22.04 have newer): the release builds on the
-oldest hosted Ubuntu, and a binary linked on a newer system asks for that system's glibc
-(GitHub issue #351). install.sh says the same floor to a system below it. With `--nix` (the
-flake's `dist`) every binary has to load nixpkgs' glibc through a loader under /nix/store
-instead, as a binary built by Nix does: it never meets the system's glibc, so the floor is not
-its own, and a binary of the build that would meet it is refused.
+Every step is bounded, and a failure stops the script naming the step, the command, its exit
+status and the tail of what it printed; nothing is skipped or done another way.
 """
 
-import argparse
+import asyncio
 import collections
 import hashlib
 import json
 import os
+import platform
 import re
-import shlex
 import shutil
-import struct
-import subprocess
 import sys
-import tempfile
-import time
+import tomllib
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, NoReturn
 
+SCRIPT = ".github/scripts/build_release.py"
 ROOT = Path(__file__).resolve().parents[2]
-HARNESS = ROOT / "harness"
-TOOLCHAIN = (HARNESS / "toolchain").read_text().strip()
+ENGINE = ROOT / "crates" / "blaze-engine"
+PACKAGE = "blaze-engine"
+PROFILE = "dist"
 PINS = ROOT / "tools" / "pgo" / "profiles.json"
-# Where tools/pgo/profiles.json says its files are, when it is first written.
-RELEASE = "https://github.com/indexable-inc/blaze/releases/download/pgo-profiles"
-# A training run that reached the workers counts tens of billions; one that lost them a few
-# million (the client's own short runs).
-MIN_COUNT = 1_000_000_000
-# What LLVM says of a function whose control flow changed since the profile was trained.
-STALE = re.compile(r"function control flow change detected \(hash mismatch\)")
-# The hash rustc gives the crate blaze-engine, in each of its symbols. Cargo derives it from the
-# whole graph of the build: every crate's name, version, source and features, the profile
-# (whether it builds incrementally too), the toolchain, and a wrapper of rustc around the
-# workspace's crates. LLVM finds a function of the
-# profile by its symbol, so a build whose hash is not the profile's finds next to nothing in it
-# (the crates that did not change below, none of the workspace's), and says nothing.
-CRATE = re.compile(rb"Cs([0-9A-Za-z]+)_6blaze")
-# The newest glibc a Linux binary of a release may ask for (install.sh's `glibc_floor`), and
-# how a binary names the versions it asks for (in its dynamic string table).
+LLVM_PIN = ROOT / "crates" / "hir-ty-codegen" / "llvm.json"
+LLVM_PREFIX = "LLVM_SYS_231_PREFIX"
+# The newest glibc a Linux binary of a release may ask for (install.sh's `glibc_floor`), and how a
+# binary names the versions it asks for (in its dynamic string table).
 GLIBC = (2, 34)
 GLIBC_VERSION = re.compile(rb"GLIBC_(\d+)\.(\d+)(?:\.\d+)?\x00")
-# The LLVM hir-ty-codegen's `llvm` feature links (vendor/llvm-sys/pin.rs), and the libraries no
-# shipped binary may load: LLVM is linked in, and on Linux libstdc++ with it.
-LLVM_PREFIX = "LLVM_SYS_231_PREFIX"
+# The libraries no shipped binary may load: LLVM is linked in, and on Linux libstdc++ with it.
 NOT_LOADED = {"linux": re.compile(r"libLLVM|libstdc\+\+|libc\+\+"), "darwin": re.compile(r"libLLVM")}
+# Flags from the environment would change what ships without the recipe saying so.
+FOREIGN_FLAGS = ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
+HOSTS = {
+    ("linux", "x86_64"): "x86_64-unknown-linux-gnu",
+    ("linux", "aarch64"): "aarch64-unknown-linux-gnu",
+    ("darwin", "arm64"): "aarch64-apple-darwin",
+}
+TAIL_LINES = 80
 
 
-def run(argv, **kwargs):
-    print("+", " ".join(map(str, argv)), flush=True)
-    return subprocess.run(argv, check=True, **kwargs)
+@dataclass(frozen=True)
+class Build:
+    # The Rust target triple, which must be the host's.
+    target: str
+    # Where every binary of blaze-engine is copied; created when missing.
+    out: str
+    # `off`: no profile. `pinned`: the blaze-trained profile tools/pgo/profiles.json pins for T.
+    pgo: Literal["off", "pinned"] = "off"
+    # With `pinned`: the pinned profile already fetched, in place of a download.
+    profdata: str = ""
+    # The blaze that builds blaze: the stage 0 on PATH.
+    blaze: str = "blaze"
+    # The target directory; `target` in the checkout when empty.
+    target_dir: str = ""
+    # The bound of the build, in seconds: a cold store of blaze's release builds for about 97
+    # minutes on hosted Linux x86-64 and longer on macOS (blaze-platform.yaml's build job).
+    build_secs: int = 4 * 3600
+    # The bound of `blaze stop` after the build, and of each check of a binary.
+    stop_secs: int = 120
+    check_secs: int = 60
+    download_secs: int = 300
 
 
-def sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+class Failed(Exception):
+    """A step that did not do what it must, naming it."""
 
 
-def recipe(target, rustflags, cflags, llvm="<LLVM_SYS_231_PREFIX>"):
-    """The environment and command of the build for `target`: `cargo build -p blaze-engine --profile
-    dist` with `rustflags`, `cflags` for the C code that crates build with `cc`,
-    and the LLVM prefix `llvm`. No wrapper
-    of rustc: one around the workspace's crates (`blaze enable`'s, nixpkgs' cargo-auditable)
-    changes their symbols, and the profile no longer finds them. Cargo hashes the empty
-    `RUSTC_WORKSPACE_WRAPPER` too, unlike an unset one, so every build sets it, the training's
-    included, whatever cargo's configuration says. Nor incremental, which a developer's
-    `CARGO_INCREMENTAL=1` would otherwise turn on for the workspace's crates, changing them as
-    well (`0` is `dist`'s own setting, so the hashes are those of a build without it)."""
-    triple = target.replace("-", "_")
-    env = {"RUSTUP_TOOLCHAIN": TOOLCHAIN, "RUSTFLAGS": rustflags, "RUSTC_WRAPPER": "", "RUSTC_WORKSPACE_WRAPPER": "",
-           "CARGO_INCREMENTAL": "0", LLVM_PREFIX: str(llvm)}
-    for name in ("CFLAGS", "CXXFLAGS"):
-        env[f"{name}_{triple}"] = " ".join(filter(None, [os.environ.get(f"{name}_{triple}"), cflags]))
-    return env, ["cargo", "build", "-p", "blaze-engine", "--profile", "dist", "--locked", "--target", target]
+def fail(message: str) -> NoReturn:
+    sys.exit(f"{SCRIPT}: {message}")
 
 
-def llvm_prefix(target):
-    """The prefix of the pinned LLVM: `LLVM_SYS_231_PREFIX` when it is set (build.rs refuses any
-    but the pinned build), else the pinned archive for `target`, fetched into target/llvm."""
-    given = os.environ.get(LLVM_PREFIX)
-    if given:
-        return Path(given)
-    prefix = ROOT / "target" / "llvm" / target
-    run([sys.executable, "-I", ROOT / ".github" / "scripts" / "llvm.py", "fetch", "--target", target, "--dir", prefix])
-    return prefix
+@dataclass(frozen=True)
+class Ran:
+    code: int
+    stdout: str
+    tail: str
 
 
-def build(target, target_dir, rustflags, cflags):
-    """The build into `target_dir`; the result is the binaries it built (every one of blaze's:
-    what ships is all of them) and how many functions LLVM found changed since the profile."""
-    own, argv = recipe(target, rustflags, cflags, llvm_prefix(target))
-    own["CARGO_TARGET_DIR"] = str(target_dir)
-    env = dict(os.environ, **own)
-    print("+", " ".join(f"{k}={shlex.quote(v)}" for k, v in own.items()), " ".join(argv), flush=True)
-    # LLVM's word on the profile reaches cargo as rustc warnings, one per changed function, for
-    # the crates that are not capped (the workspace's, the vendored rust-analyzer among them):
-    # counted here instead of printed, the other diagnostics printed as cargo would.
-    proc = subprocess.Popen(argv + ["--message-format=json"], cwd=ROOT, env=env,
-                            stdout=subprocess.PIPE, text=True)
-    stale, binaries = set(), []
-    for line in proc.stdout:
-        try:
-            message = json.loads(line)
-        except ValueError:
-            sys.stdout.write(line)
-            continue
-        if message.get("reason") == "compiler-artifact" and message.get("executable"):
-            binaries.append(Path(message["executable"]))
-        elif message.get("reason") == "compiler-message":
-            text = message["message"].get("message", "")
-            if STALE.search(text):
-                stale.add((message.get("package_id"), text))
+async def run(step: str, cmd: list[str], *, secs: float, env: dict[str, str] | None = None,
+              echo: bool = False) -> Ran:
+    """`cmd` run to its end within `secs`. With `echo`, each line it prints is passed on as it
+    comes (a CI log shows a slow build while it is slow) and only the last `TAIL_LINES` kept.
+    A nonzero exit or the bound running out is a `Failed` naming the step."""
+    shown = " ".join(cmd)
+    print(f"+ {shown}", flush=True)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=ROOT, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    assert proc.stdout is not None
+    tail: collections.deque[str] = collections.deque(maxlen=TAIL_LINES)
+    kept: list[str] = []
+
+    async def pump() -> None:
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace")
+            tail.append(line)
+            if echo:
+                sys.stdout.write(line)
+                sys.stdout.flush()
             else:
-                sys.stderr.write(message["message"].get("rendered") or text + "\n")
-    if proc.wait():
-        sys.exit(f"error: build_release: cargo failed ({proc.returncode})")
-    return binaries, len(stale)
+                kept.append(line)
+        await proc.wait()
+
+    try:
+        async with asyncio.timeout(secs):
+            await pump()
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise Failed(f"{step}: `{shown}` did not end in {secs:.0f} s; its last lines:\n{''.join(tail)}") from None
+    code = proc.returncode if proc.returncode is not None else -1
+    if code != 0:
+        raise Failed(f"{step}: `{shown}` exited {code}; its last lines:\n{''.join(tail)}")
+    return Ran(code, "".join(kept), "".join(tail))
 
 
-def crate_hash(binaries):
-    """The crate hash of blaze, read from the symbols of the binary."""
-    binary = next(b for b in binaries if b.stem == "blaze-engine")
-    found = collections.Counter(CRATE.findall(binary.read_bytes()))
-    return found.most_common(1)[0][0].decode() if found else None
+def host() -> str:
+    key = (sys.platform, platform.machine())
+    found = HOSTS.get(key)
+    if found is None:
+        raise Failed(f"host: blaze ships no release for {key[0]} on {key[1]} (the releases' hosts: "
+                     f"{', '.join(sorted(HOSTS.values()))})")
+    return found
 
 
-def pins():
-    return json.loads(PINS.read_text())
+def sha256(path: Path) -> str:
+    with open(path, "rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
 
 
-def pinned(target):
-    table = pins()
-    if table["toolchain"] != TOOLCHAIN:
-        sys.exit(f"error: build_release: {PINS} has profiles of Rust {table['toolchain']}, blaze builds with {TOOLCHAIN}: "
-                 "run the pgo workflow")
-    pin = table["targets"].get(target)
-    if not pin:
-        sys.exit(f"error: build_release: {PINS} has no profile for {target}: run the pgo workflow for it")
-    return dict(pin, url=f"{table['release']}/{pin['name']}")
+def binaries() -> list[str]:
+    """The binaries blaze-engine builds: its `[[bin]]`s and, unless `autobins` is off, the files of
+    `src/bin`. What ships is all of them."""
+    manifest = tomllib.loads((ENGINE / "Cargo.toml").read_text())
+    names = [b["name"] for b in manifest.get("bin", [])]
+    if manifest.get("package", {}).get("autobins", True):
+        names += [p.stem for p in sorted((ENGINE / "src" / "bin").glob("*.rs")) if p.stem not in names]
+    return sorted(names)
 
 
-def profile(target, given):
-    """The profile pinned for `target`: the file `given`, or a download; either way checked
-    against the pin."""
-    pin = pinned(target)
-    if given:
-        path = Path(given)
+async def pinned_profile(build: Build) -> Path:
+    """The profile tools/pgo/profiles.json pins for the target, checked by its sha256; refused
+    unless blaze's own build of blaze trained it with the LLVM pinned now."""
+    table = json.loads(PINS.read_text())
+    pin = table["targets"].get(build.target)
+    if pin is None:
+        raise Failed(f"pgo: {PINS} pins no profile for {build.target}: tools/pgo/pgo.py trains one")
+    if pin.get("builder") != "blaze":
+        raise Failed(
+            f"pgo: {PINS}'s profile for {build.target} ({pin['name']}) was trained on cargo's build of blaze, "
+            "whose symbols and LLVM are rustc's: blaze builds blaze (rule blaze-builds-blaze) and applies only a "
+            "profile tools/pgo/pgo.py trained on blaze's own build. pgo.py cannot train one yet: blaze refuses "
+            "`-C profile-generate` because its linker writes no profile sections (`__llvm_prf_*` and the profile "
+            "runtime; crates/blaze-cargo/src/serve/unit/codegen.rs, `pgo`). Build with \"pgo\": \"off\" until it does")
+    llvm = json.loads(LLVM_PIN.read_text())["commit"]
+    if pin.get("llvm") != llvm:
+        raise Failed(f"pgo: {PINS}'s profile for {build.target} was made by LLVM {pin.get('llvm')}, blaze links "
+                     f"{llvm} ({LLVM_PIN}): tools/pgo/pgo.py trains one with this LLVM")
+    if build.profdata:
+        path = Path(build.profdata).resolve()
     else:
         path = ROOT / "target" / "pgo" / pin["name"]
-        if not path.exists() or sha256(path) != pin["sha256"]:
+        if not path.is_file() or sha256(path) != pin["sha256"]:
+            url = f"{table['release']}/{pin['name']}"
+            print(f"build_release: downloading {url}", flush=True)
             path.parent.mkdir(parents=True, exist_ok=True)
-            print(f"build_release: downloading {pin['url']}", flush=True)
-            with urllib.request.urlopen(pin["url"], timeout=300) as got, open(path, "wb") as f:
-                shutil.copyfileobj(got, f)
+
+            def fetch() -> None:
+                with urllib.request.urlopen(url, timeout=build.download_secs) as got, open(path, "wb") as f:
+                    shutil.copyfileobj(got, f)
+
+            try:
+                async with asyncio.timeout(build.download_secs):
+                    await asyncio.to_thread(fetch)
+            except (TimeoutError, OSError) as e:
+                raise Failed(f"pgo: the download of {url} failed: {e!r}") from None
     if sha256(path) != pin["sha256"]:
-        sys.exit(f"error: build_release: {path} is not the profile {PINS} pins for {target} (sha256 {pin['sha256']})")
-    return path, pin
+        raise Failed(f"pgo: {path} is not the profile {PINS} pins for {build.target} (sha256 {pin['sha256']})")
+    return path
 
 
-def llvm_tool(name):
-    libdir = subprocess.run(["rustc", "--print", "target-libdir"], capture_output=True, text=True, check=True,
-                            env=dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN)).stdout.strip()
-    tool = Path(libdir).parent / "bin" / name
-    if not tool.exists():
-        sys.exit(f"error: build_release: {tool} is missing: `rustup component add llvm-tools --toolchain {TOOLCHAIN}`")
-    return tool
+def build_env(build: Build, target_dir: Path, profile: Path | None) -> dict[str, str]:
+    """The environment of the build: the caller's, with the target directory, the pinned LLVM and
+    the profile's flag, and none of the flags or wrappers a caller's environment could add."""
+    if set_ := [name for name in FOREIGN_FLAGS if os.environ.get(name)]:
+        raise Failed(f"environment: {', '.join(set_)} set; the release's recipe takes no flags or wrappers from the "
+                     "environment, as they would change what ships without it saying so")
+    prefix = os.environ.get(LLVM_PREFIX, "")
+    if not prefix:
+        raise Failed(f"llvm: {LLVM_PREFIX} is unset; blaze-engine's `native` links the pinned LLVM "
+                     f"({LLVM_PIN}), which .github/actions/blaze (`llvm: true`) fetches below /usr/local/lib "
+                     "and names there")
+    if not Path(prefix, "bin").is_dir():
+        raise Failed(f"llvm: {LLVM_PREFIX}={prefix} has no bin/: it is not an unpacked LLVM of {LLVM_PIN}")
+    env = {k: v for k, v in os.environ.items() if k not in FOREIGN_FLAGS}
+    env["CARGO_TARGET_DIR"] = str(target_dir)
+    env["CARGO_INCREMENTAL"] = "0"
+    if profile is not None:
+        env["CARGO_ENCODED_RUSTFLAGS"] = f"-Cprofile-use={profile}"
+    return env
 
 
-def train(target, out):
-    """A new profile for `target` in `out`, and beside it what tools/pgo/profiles.json pins of it."""
-    profdata = llvm_tool("llvm-profdata")
-    # Short: the daemon's sockets live under it, and a Unix socket's path has a limit.
-    work = Path(tempfile.mkdtemp(prefix="rjpgo-", dir="/tmp"))
-    raw = work / "raw"
-    raw.mkdir()
-    # On AArch64 a direct call reaches 128 MiB, and the instrumented blaze's code is larger. GNU ld
-    # then fails its calls into libgcc and the profiling runtime (R_AARCH64_CALL26 truncated);
-    # lld puts a range-extension thunk in front of them (pgo.yaml installs it on that runner).
-    rustflags = f"-Cprofile-generate={raw}"
-    if target.startswith("aarch64-unknown-linux"):
-        rustflags += " -Clink-arg=-fuse-ld=lld"
-    built, _ = build(target, ROOT / "target" / "pgo-instrumented", rustflags, "-fno-profile-generate")
-    binaries, crate = built[0].parent, crate_hash(built)
-
-    # Each process of the instrumented blaze writes its counters to a file of its own as it exits.
-    env = dict(os.environ, LLVM_PROFILE_FILE=str(raw / "%p.profraw"))
-    env.pop("RUST_BACKTRACE", None)
-    run([sys.executable, "abbench.py", "--bin", f"train={binaries}", "fd", "bat", "just", "hyperfine",
-         "--rounds", "1", "--runs", "2", "--kinds", "body,leaf,signature,generic,no-op", "--train",
-         "--work", str(work / "abbench"), "--out", str(work / "train.json")], cwd=HARNESS, env=env)
-    # A process still exiting is still writing its file.
-    began = time.time()
-    while subprocess.run(["pgrep", "-f", str(binaries)], capture_output=True).returncode == 0:
-        if time.time() - began > 300:
-            sys.exit(f"error: build_release: programs of {binaries} still run 5 minutes after the training")
-        time.sleep(1)
-
-    merged = work / "blaze.profdata"
-    run([profdata, "merge", "-o", merged, *sorted(raw.glob("*.profraw"))])
-    shown = subprocess.run([profdata, "show", merged], capture_output=True, text=True, check=True).stdout
-    total = int(re.search(r"^Total count: (\d+)", shown, re.M)[1])
-    print(f"build_release: the profile counts {total:,}", flush=True)
-    if total < MIN_COUNT:
-        sys.exit(f"error: build_release: the profile counts {total:,}, fewer than {MIN_COUNT:,}: the workers' counters were lost")
-
-    digest = sha256(merged)
-    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
-    name = f"blaze-{TOOLCHAIN}-{target}-{digest[:16]}.profdata"
-    out.mkdir(parents=True, exist_ok=True)
-    shutil.move(merged, out / name)
-    (out / f"{target}.json").write_text(json.dumps(
-        {"target": target, "name": name, "sha256": digest, "commit": commit, "count": total, "crate": crate}, indent=2) + "\n")
-    shutil.rmtree(work, ignore_errors=True)
-    print(f"build_release: {out / name}", flush=True)
-
-
-def pin(dirs):
-    """tools/pgo/profiles.json names the profiles trained into `dirs`, beside those of other targets."""
-    table = pins() if PINS.exists() else {"toolchain": TOOLCHAIN, "release": RELEASE, "targets": {}}
-    if table["toolchain"] != TOOLCHAIN:
-        table = dict(table, toolchain=TOOLCHAIN, targets={})
-    for d in dirs:
-        for entry in sorted(Path(d).glob("*.json")):
-            got = json.loads(entry.read_text())
-            if sha256(Path(d) / got["name"]) != got["sha256"]:
-                sys.exit(f"error: build_release: {Path(d) / got['name']} is not what {entry} says")
-            table["targets"][got.pop("target")] = got
-    table["targets"] = dict(sorted(table["targets"].items()))
-    PINS.parent.mkdir(exist_ok=True)
-    PINS.write_text(json.dumps(table, indent=2) + "\n")
-
-
-def glibc_asked(binary):
-    """The newest glibc `binary` asks for, as (major, minor), or None for one that asks for none."""
-    found = {(int(major), int(minor)) for major, minor in GLIBC_VERSION.findall(binary.read_bytes())}
+def glibc_asked(data: bytes) -> tuple[int, int] | None:
+    """The newest glibc a binary asks for, or None for one that asks for none."""
+    found = {(int(major), int(minor)) for major, minor in GLIBC_VERSION.findall(data)}
     return max(found, default=None)
 
 
-def check_glibc(out):
-    """Refuses the build when a binary in `out` asks for a glibc newer than `GLIBC`."""
-    shown = ".".join(map(str, GLIBC))
-    newer = []
-    for binary in sorted(out.iterdir()):
-        if binary.is_file() and binary.read_bytes()[:4] == b"\x7fELF":
-            asked = glibc_asked(binary)
-            if asked and asked > GLIBC:
-                newer.append(f"{binary.name} asks for glibc {'.'.join(map(str, asked))}")
-    if newer:
-        sys.exit(f"error: build_release: {'; '.join(newer)}, newer than RHEL 9's {shown}, so it does not start "
-                 "there: build on Ubuntu 22.04, as the release does")
-    print(f"build_release: the binaries in {out} ask for glibc {shown} or older", flush=True)
-
-
-def check_loads(out):
-    """Refuses the build when a binary in `out` loads a library `NOT_LOADED` names."""
-    system = "darwin" if sys.platform == "darwin" else "linux"
-    wrong = []
-    for binary in sorted(out.iterdir()):
-        if not binary.is_file() or binary.read_bytes()[:4] not in (b"\x7fELF", b"\xcf\xfa\xed\xfe"):
-            continue
-        argv = ["otool", "-L", binary] if system == "darwin" else ["readelf", "-d", binary]
-        shown = subprocess.run(argv, capture_output=True, text=True, check=True).stdout
-        lines = shown.splitlines()[1:] if system == "darwin" else [l for l in shown.splitlines() if "(NEEDED)" in l]
-        wrong += [f"{binary.name}: {line.strip()}" for line in lines if NOT_LOADED[system].search(line)]
-    if wrong:
-        sys.exit(f"error: build_release: a shipped binary loads what a user's machine lacks: {'; '.join(wrong)}. "
-                 "LLVM and, on Linux, libstdc++ are linked in statically (crates/hir-ty-codegen/build.rs)")
-    print(f"build_release: the binaries in {out} load no libLLVM" + ("" if system == "darwin" else " or C++ runtime"),
-          flush=True)
-
-
-def interpreter(binary):
-    """The loader a 64-bit ELF executable names (PT_INTERP), or None for one that names none."""
+async def check_binary(build: Build, binary: Path) -> list[str]:
+    """What is wrong with one shipped binary: a library it loads that a user's machine lacks, or a
+    glibc newer than the floor."""
     data = binary.read_bytes()
-    if data[:4] != b"\x7fELF" or data[4] != 2:
-        return None
-    endian = "<" if data[5] == 1 else ">"
-    (phoff,) = struct.unpack_from(endian + "Q", data, 0x20)
-    phentsize, phnum = struct.unpack_from(endian + "HH", data, 0x36)
-    for index in range(phnum):
-        header = phoff + index * phentsize
-        if struct.unpack_from(endian + "I", data, header)[0] == 3:
-            offset, size = struct.unpack_from(endian + "Q", data, header + 8)[0], struct.unpack_from(endian + "Q", data, header + 32)[0]
-            return data[offset:offset + size].rstrip(b"\0").decode()
-    return None
+    wrong: list[str] = []
+    if data[:4] == b"\x7fELF":
+        shown = (await run(f"check {binary.name}", ["readelf", "-d", str(binary)], secs=build.check_secs)).stdout
+        lines = [line for line in shown.splitlines() if "(NEEDED)" in line]
+        wrong += [f"{binary.name} loads {line.strip()}" for line in lines if NOT_LOADED["linux"].search(line)]
+        asked = glibc_asked(data)
+        if asked and asked > GLIBC:
+            wrong.append(f"{binary.name} asks for glibc {'.'.join(map(str, asked))}, newer than RHEL 9's "
+                         f"{'.'.join(map(str, GLIBC))}, so it does not start there: build on Ubuntu 22.04, as the "
+                         "release does")
+    elif data[:4] == b"\xcf\xfa\xed\xfe":
+        shown = (await run(f"check {binary.name}", ["otool", "-L", str(binary)], secs=build.check_secs)).stdout
+        lines = shown.splitlines()[1:]
+        wrong += [f"{binary.name} loads {line.strip()}" for line in lines if NOT_LOADED["darwin"].search(line)]
+    else:
+        wrong.append(f"{binary.name} is neither ELF nor Mach-O")
+    return wrong
 
 
-def check_nix(out):
-    """Refuses the build when a binary in `out` would load the system's glibc and not nixpkgs'."""
-    system = []
-    for binary in sorted(out.iterdir()):
-        if binary.is_file() and binary.read_bytes()[:4] == b"\x7fELF":
-            loader = interpreter(binary)
-            if loader is not None and not loader.startswith("/nix/store/"):
-                system.append(f"{binary.name} loads {loader}")
-    if system:
-        sys.exit(f"error: build_release: --nix, but {'; '.join(system)}, the system's glibc: build it in the flake")
-    print(f"build_release: the binaries in {out} load nixpkgs' glibc from /nix/store (--nix: RHEL 9's glibc floor is the release's)", flush=True)
+async def main_async(build: Build) -> None:
+    if build.target != host():
+        raise Failed(f"target: {build.target} is not this machine's ({host()}); each release target builds on a "
+                     "machine of its own kind, and blaze cross-compiles no release")
+    if not shutil.which(build.blaze):
+        raise Failed(f"blaze: `{build.blaze}` is not on PATH; .github/actions/blaze installs the stage 0 "
+                     ".github/blaze-version names")
+    said = await run("blaze --version", [build.blaze, "--version"], secs=build.check_secs)
+    print(f"build_release: stage 0 is {said.stdout.strip()}", flush=True)
+    profile = await pinned_profile(build) if build.pgo == "pinned" else None
+    target_dir = Path(build.target_dir).resolve() if build.target_dir else ROOT / "target"
+    env = build_env(build, target_dir, profile)
+    cmd = [build.blaze, "build", "-p", PACKAGE, "--profile", PROFILE, "--locked", "--target", build.target]
+    try:
+        await run("build", cmd, secs=build.build_secs, env=env, echo=True)
+    except Failed as built_wrong:
+        # The daemon ends either way: its last pack seals, and its memory is the next step's. The
+        # build's failure is the one said; a stop that fails too is said after it.
+        try:
+            await run("blaze stop", [build.blaze, "stop"], secs=build.stop_secs, env=env, echo=True)
+        except Failed as stop_wrong:
+            raise Failed(f"{built_wrong}\nand then {stop_wrong}") from None
+        raise
+    await run("blaze stop", [build.blaze, "stop"], secs=build.stop_secs, env=env, echo=True)
+
+    built = target_dir / build.target / PROFILE
+    out = Path(build.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    shipped: list[Path] = []
+    for name in binaries():
+        path = built / name
+        if not path.is_file():
+            raise Failed(f"build: `{' '.join(cmd)}` ended well and made no {path}")
+        shutil.copy2(path, out / name)
+        shipped.append(out / name)
+    async with asyncio.TaskGroup() as group:
+        checks = [group.create_task(check_binary(build, binary)) for binary in shipped]
+    wrong = [item for task in checks for item in task.result()]
+    if wrong:
+        raise Failed(f"check: a shipped binary would not run on a user's machine: {'; '.join(wrong)} (LLVM and, on "
+                     "Linux, libstdc++ are linked in statically: crates/hir-ty-codegen/build.rs)")
+    how = f"with the profile {profile.name}" if profile else "without PGO"
+    print(f"build_release: {', '.join(p.name for p in shipped)} in {out}, the `{PROFILE}` profile {how}, built by "
+          f"{said.stdout.strip()}; each loads no libLLVM"
+          + ("" if sys.platform == "darwin" else f" or C++ runtime and asks for glibc {'.'.join(map(str, GLIBC))} "
+             "or older"), flush=True)
 
 
-def ship(args, binaries):
-    """The binaries copied into `--out`."""
-    if not args.out:
-        return
-    args.out.mkdir(parents=True, exist_ok=True)
-    for binary in binaries:
-        shutil.copy2(binary, args.out / binary.name)
-    check_loads(args.out)
-    if "linux" in args.target:
-        check_nix(args.out) if args.nix else check_glibc(args.out)
+def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1].startswith("--"):
+        fail(f"`{' '.join(sys.argv[1:])}` is the retired cargo recipe's flags. The script takes one JSON object; "
+             "blaze builds blaze (rule blaze-builds-blaze), so the flake's `dist` (flake.nix), which built blaze "
+             "with cargo through those flags, has no recipe here; training a profile is tools/pgo/pgo.py's")
+    if len(sys.argv) != 2:
+        fail("usage: build_release.py CONFIG, one JSON object (see the top of the file)")
+    # Here, not at the top: the retired flags above are refused even where the workspace's
+    # Python (and so typed_input) is not the one running this, as in the flake's build.
+    import typed_input
 
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--target")
-    parser.add_argument("--profdata", help="the pinned profile, already fetched")
-    parser.add_argument("--train", type=Path, metavar="DIR", help="train a new profile into DIR")
-    parser.add_argument("--pin", nargs="+", metavar="DIR", help="pin the profiles trained into DIR")
-    parser.add_argument("--out", type=Path, metavar="DIR", help="copy the binaries into DIR")
-    parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
-    parser.add_argument("--no-pgo", action="store_true", help="build without a profile (releases, while PGO is off)")
-    parser.add_argument("--show", action="store_true", help="print the build's environment and command")
-    parser.add_argument("--nix", action="store_true",
-                        help="the flake's build: its Linux binaries load nixpkgs' glibc, not the system's (no RHEL 9 floor)")
-    args = parser.parse_args()
-    if args.pin:
-        return pin(args.pin)
-    if not args.target:
-        parser.error("--target is required")
-    args.out = args.out and args.out.resolve()
-    if args.train:
-        return train(args.target, args.train)
-    if args.show:
-        chosen = pinned(args.target)
-        env, argv = recipe(args.target, f"-Cprofile-use=<{chosen['url']}, sha256 {chosen['sha256']}>", "-fno-profile-use")
-        print(" ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()), " ".join(argv))
-        return
-    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
-    if args.no_pgo:
-        binaries, _ = build(args.target, target_dir, "", "")
-        ship(args, binaries)
-        print(f"build_release: {', '.join(b.name for b in binaries)} in {args.out or binaries[0].parent}, "
-              "without PGO (--no-pgo)", flush=True)
-        return
-    if pins()["toolchain"] != TOOLCHAIN and not args.strict:
-        # The toolchain moved and the pgo workflow has not trained on it yet (it runs when
-        # harness/toolchain changes on main): a build that is not a release goes without PGO.
-        print(f"warning: build_release: {PINS} has profiles of Rust {pins()['toolchain']}, blaze builds with "
-              f"{TOOLCHAIN}: built without PGO until the pgo workflow trains on {TOOLCHAIN}", file=sys.stderr, flush=True)
-        binaries, _ = build(args.target, target_dir, "", "")
-        ship(args, binaries)
-        print(f"build_release: {', '.join(b.name for b in binaries)} in {args.out or binaries[0].parent}, "
-              "without PGO", flush=True)
-        return
-    path, chosen = profile(args.target, args.profdata)
-    binaries, stale = build(args.target, target_dir, f"-Cprofile-use={path}", "-fno-profile-use")
-    crate = crate_hash(binaries)
-    if crate != chosen.get("crate"):
-        said = (f"build_release: this build's crates are not the ones the profile was trained on (blaze is crate "
-                f"{crate}, the profile's is {chosen.get('crate')}): Cargo.lock, the toolchain, the features or cargo's "
-                "settings differ, and the profile finds almost none of the workspace's functions. The pgo workflow trains "
-                "a profile of these crates.")
-        if args.strict:
-            sys.exit(f"error: {said}")
-        print(f"warning: {said}", file=sys.stderr, flush=True)
-    ship(args, binaries)
-    shown = args.out or binaries[0].parent
-    print(f"build_release: {', '.join(b.name for b in binaries)} in {shown}, with the profile trained at "
-          f"{chosen['commit'][:10]}; {stale} functions changed since and are not optimized by it", flush=True)
+    build = typed_input.parse(Build, sys.argv[1], SCRIPT)
+    try:
+        asyncio.run(main_async(build))
+    except Failed as e:
+        fail(str(e))
+    except ExceptionGroup as group:
+        failed, rest = group.split(Failed)
+        if rest is not None or failed is None:
+            raise
+        fail("; ".join(str(e) for e in failed.exceptions))
 
 
 if __name__ == "__main__":

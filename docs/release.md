@@ -98,7 +98,8 @@ Either way `release.yaml` builds the archives on the tag for macOS (Apple silico
 pinned release's fetch checks both, and a release from before `B3SUMS` (dated before 2026-10-31,
 when no release lacks it) by its `SHA256SUMS` alone; one dated later that lacks `B3SUMS` is
 refused ([cargo.md](cargo.md#pinning-a-release-of-blaze)). PGO is off for now (#870):
-the release is built with `--no-pgo`.
+the release is built with `"pgo": "off"`, by the stage-0 blaze `.github/blaze-version` names
+(`.github/scripts/build_release.py`; blaze builds blaze, never cargo or rustc).
 
 The sums come from the same release as the archives, so they show an archive arrived whole and
 unchanged, not that blaze's release workflow made it: whoever can replace a release's assets can

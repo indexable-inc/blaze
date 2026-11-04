@@ -1,9 +1,16 @@
 name: pgo
 
-# Trains the profiles blaze is optimized with (PGO), each on the runner its release binary is
-# built on, and pins them: the files go to the `pgo-profiles` release under names that carry
-# their sha256, and a commit to main writes those names and hashes into tools/pgo/profiles.json, which
-# the release workflow and the flake build with (.github/scripts/build_release.py).
+# Trains the profiles blaze is optimized with (PGO, and BOLT on ELF), each on the runner its
+# release binary is built on, and pins them: tools/pgo/pgo.py builds blaze instrumented with the
+# stage-0 blaze (.github/blaze-version; blaze builds blaze, never cargo or rustc), trains it on
+# tools/pgo/training.json, and `pgo.py publish` puts the files on the `pgo-profiles` release
+# under names that carry their sha256 and writes them into tools/pgo/profiles.json, which the
+# release workflow builds with (.github/scripts/build_release.py, `"pgo": "pinned"`).
+#
+# Today every train job stops at its first build with blaze's own error: blaze refuses
+# `-C profile-generate`, since its linker writes no profile sections yet
+# (crates/blaze-cargo/src/serve/unit/codegen.rs, `pgo`). Until it does, releases build with
+# `"pgo": "off"`.
 #
 # It runs by itself when what the crates are changes (Cargo.lock, a manifest, the toolchain, the
 # release recipe's features or the LLVM it links):
@@ -13,9 +20,9 @@ name: pgo
 # changes to the code. A release's version is not committed (Cargo.toml stays `0.0.0`, and the
 # release is told only to blaze-engine's build, by `BLAZE_RELEASE`), so a release does not make a
 # profile stale.
-# PGO is off for now: releases build with `--no-pgo` (release.yaml), so this runs by hand only. To turn it back on, restore the push trigger:
+# PGO is off for now: releases build with `"pgo": "off"` (release.yaml), so this runs by hand only. To turn it back on, restore the push trigger:
 #   push: { branches: [main], paths: [Cargo.lock, "**/Cargo.toml", harness/toolchain,
-#           .github/scripts/build_release.py, crates/hir-ty-codegen/llvm.json] }
+#           tools/pgo/**, crates/hir-ty-codegen/llvm.json] }
 on:
   workflow_dispatch:
 
@@ -37,8 +44,9 @@ jobs:
   train:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    # The instrumented build of blaze and the training.
-    timeout-minutes: 120
+    # Three builds of blaze (instrumented, with the profile, plain for the baseline), each bounded
+    # at two hours by pgo.py, the training and the measuring: the hosted runner's cap.
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -46,16 +54,27 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-15 }
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+    env:
+      # BOLT rewrites ELF alone: pgo.py refuses an ELF target that asks for none and a Mach-O one
+      # that asks for it.
+      BOLT: ${{ startsWith(matrix.os, 'macos') && 'none' || 'instrument' }}
     steps:
       - uses: actions/checkout@v7
-      # llvm-tools: llvm-profdata, which merges what the instrumented build counted. The daemon
-      # being trained reads the standard library from blaze's library/, not from a rust-src.
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal --component llvm-tools && rustup default "$tc"
-      # lld links the instrumented AArch64 blaze, whose code is past a direct call's reach for GNU ld
-      # (build_release.py, `train`).
-      - if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update -q && sudo apt-get install -yq lld && ld.lld --version
-      - run: python3 .github/scripts/build_release.py --target ${{ matrix.target }} --train "$RUNNER_TEMP/pgo"
+      # The builder: the stage 0 .github/blaze-version names, with its own Rust; pgo.py fetches the
+      # pinned LLVM itself (llvm-profdata, llvm-bolt among it).
+      - uses: ./.github/actions/blaze
+        with:
+          job: pgo
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - name: pgo.py build
+        run: |
+          jq -n --arg target "${{ matrix.target }}" --arg builder "$(command -v blaze)" \
+            --arg out "$RUNNER_TEMP/pgo/${{ matrix.target }}" --arg bolt "$BOLT" \
+            '{kind: "build", target: $target, builder: $builder, out: $out, bolt: $bolt}' > "$RUNNER_TEMP/pgo.json"
+          uv run --frozen python tools/pgo/pgo.py "$RUNNER_TEMP/pgo.json"
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
       - uses: actions/upload-artifact@v7
@@ -83,17 +102,21 @@ jobs:
         with:
           pattern: pgo-*
           path: ${{ runner.temp }}/pgo
-      - name: Upload
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      # Each file each <target>.json names, checked by its sha256, uploaded to the release
+      # tools/pgo/profiles.json names, and written into it.
+      - name: Upload and pin
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view pgo-profiles --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
             gh release create pgo-profiles --repo "$GITHUB_REPOSITORY" --prerelease --title "PGO profiles" \
               --notes "The profiles blaze's builds are optimized with, one file per toolchain, target and content (tools/pgo/profiles.json pins them by sha256). Not a release of blaze."
-          gh release upload pgo-profiles --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP"/pgo/*/*.profdata --clobber
-      - name: Pin
-        run: |
-          python3 .github/scripts/build_release.py --pin "$RUNNER_TEMP"/pgo/*
+          dirs=$(find "$RUNNER_TEMP/pgo" -mindepth 2 -maxdepth 2 -type d | jq -R . | jq -sc .)
+          uv run --frozen python tools/pgo/pgo.py "{\"kind\": \"publish\", \"dirs\": $dirs}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add tools/pgo/profiles.json

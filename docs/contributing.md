@@ -333,24 +333,21 @@ remove the worktree and the local branch
 
 ## The build that ships
 
-`cargo build --release` is the build to work with: the harnesses, the gate and CI use it, and
-it rebuilds quickly after a change. What users get is one other build: the `dist` profile
-(thin LTO) optimized with the PGO profile `tools/pgo/profiles.json` pins, built by
-`.github/scripts/build_release.py`. The release workflow runs that script, and the flake's
-`dist` runs it inside its derivation with the same profile fetched by its sha256.
-`cargo install --profile dist` builds the same profile without PGO, from the release after 0.1.0.
-[reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md) has the numbers.
+`blaze build --release` is the build to work with: the harnesses, the gate and CI use it, and
+it rebuilds quickly after a change. What users get is one other build: the `dist` profile,
+built by the stage-0 blaze `.github/blaze-version` names, through
+`.github/scripts/build_release.py` (one JSON input, `{"target": ..., "out": ...}`). The release
+workflow and install.yaml run that script; blaze builds blaze, never cargo or rustc. `dist`'s
+`lto = "thin"` and `codegen-units = 1` are what blaze's release codegen does anyway (one LLVM unit
+per function with ThinLTO's summaries and imports across the program, [v2-codegen.md](v2-codegen.md)).
+[reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md) has the numbers of the older cargo build.
 
-The PGO profiles are trained by the `pgo` workflow, one per target on the runner its release
-is built on; it uploads them to the `pgo-profiles` release and commits their names and hashes
-to `tools/pgo/profiles.json`. It runs by itself when Cargo.lock, a manifest or `harness/toolchain`
-changes on main: a profile finds each function by its symbol, which carries a hash of the
-whole graph of crates, so after such a change the old one finds almost nothing (the build
-warns, and a release refuses). A profile trained on older code of the same crates still
-applies to every function that has not changed since, and `build_release.py` ends by saying
-how many have: 24 after a one-line edit, about 1,600 for code 23 commits and 6,700 lines older
-(of the 187,000 functions a profile has). Run the workflow by hand when that count passes a
-few thousand and before a release after large changes to the daemon.
+PGO is off: releases build with `"pgo": "off"`. The `pgo` workflow trains profiles with
+`tools/pgo/pgo.py`, which builds blaze instrumented with the stage-0 blaze, and `"pgo": "pinned"`
+builds with the profile `tools/pgo/profiles.json` pins, only one trained on blaze's own build
+(`"builder": "blaze"`). Neither works yet: blaze refuses `-C profile-generate`, since its linker
+writes no profile sections (`crates/blaze-cargo/src/serve/unit/codegen.rs`, `pgo`), and the
+profiles pinned today are cargo's, which the script refuses with that error.
 
 ## LLVM
 

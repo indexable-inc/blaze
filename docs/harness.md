@@ -706,12 +706,9 @@ repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-
 `bench-bun.yaml`, `live-latency.yaml` and `realprojects.yaml` ([Real projects](#real-projects-the-verdict)) keep
 schedules of their own: each takes hours or a dedicated machine, and the train would wait on
 them. On a pull request that changes the flake, `nix/` or the dependencies, `nix-live.yaml`
-checks only the unit graphs. The flake's `dist` passes `--nix` to `build_release.py`, which
-then checks that every binary loads through a `/nix/store` loader instead of the glibc 2.34
-floor of a shipped release. `live-*.yaml` run on their own branches. None of them is part of `ci`. `site.yaml` deploys the
+checks only the unit graphs. The flake's `dist` still calls `build_release.py` with the retired
+cargo recipe's flags, which the script now refuses (blaze builds blaze). `live-*.yaml` run on their own branches. None of them is part of `ci`. `site.yaml` deploys the
 site, and `release.yaml` builds releases from tags, each target through
-`.github/scripts/build_release.py` (the `dist` profile with PGO,
-[reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)), the recipe the flake's `dist` runs too.
-`pgo.yaml` trains the profiles it uses, for each release the train makes, by hand, and on
-pushes to main that change Cargo.lock, a manifest or the toolchain, and pins them in
-`pgo/profiles.json`.
+`.github/scripts/build_release.py` (the `dist` profile, built by the stage-0 blaze, without
+PGO for now). `pgo.yaml` trains profiles with `tools/pgo/pgo.py`, by hand, and pins them in
+`tools/pgo/profiles.json`; blaze cannot train one yet (it refuses `-C profile-generate`).

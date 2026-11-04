@@ -2,7 +2,7 @@
 """Publish blaze (the crate `blaze-engine`) and the forked crates it depends on to crates.io.
 
   publish_crates.py --stage DIR          # write the crates to publish into DIR, nothing else
-  publish_crates.py --dry-run            # stage, then `cargo package --workspace` (builds each)
+  publish_crates.py --dry-run            # stage, package (`cargo package --no-verify`), then `blaze build --workspace`
   publish_crates.py --publish            # stage, verify as above, then publish what is missing
 
 blaze's crate, `crates/blaze-engine` in the repository, is published as `blaze-engine`, so that
@@ -644,8 +644,9 @@ def ship_code_identities(staged: Path) -> None:
     """Write the tree parts of blaze-engine's code identities, worked out from the checkout, into
     its staged crate, where its build script finds them (`blaze_codegen_code::work_out_here`)."""
     ask = json.dumps({"program": str(ROOT_CRATE), "into": str(staged)})
+    # blaze runs it: blaze builds blaze (AGENTS.md rule blaze-builds-blaze), never cargo.
     cmd = [
-        "cargo",
+        "blaze",
         "run",
         "--quiet",
         "--locked",
@@ -745,11 +746,16 @@ def run(cmd: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProces
 
 
 def verify(dest: Path) -> None:
-    r = run(["cargo", "package", "--workspace", "--allow-dirty"], dest, 4 * 3600)
-    if r.returncode != 0:
-        fail(
-            f"`cargo package --workspace` in {dest} exited {r.returncode}; tail:\n{r.stderr[-3000:]}"
-        )
+    """The staged crates packaged and built. cargo is crates.io's client here and nothing more
+    (`--no-verify`: it compiles nothing); the build is the stage 0's, since blaze builds blaze
+    (AGENTS.md rule blaze-builds-blaze), never cargo or rustc."""
+    for cmd in (
+        ["cargo", "package", "--workspace", "--allow-dirty", "--no-verify"],
+        ["blaze", "build", "--workspace"],
+    ):
+        r = run(cmd, dest, 4 * 3600)
+        if r.returncode != 0:
+            fail(f"`{' '.join(cmd)}` in {dest} exited {r.returncode}; tail:\n{r.stderr[-3000:]}")
 
 
 def publish(crates: list[Crate], dest: Path, deadline: float) -> None:
