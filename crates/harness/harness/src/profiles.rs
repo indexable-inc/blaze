@@ -24,7 +24,8 @@ pub const KINDS: &[&str] = &["claude", "codex", "shell"];
 
 const SYSTEM_NOTE: &str = "You are running inside harness. Your only tool is `ts`, a persistent TypeScript REPL whose \
 description lists the functions in scope (web search, agents.spawn/send/screen/tree to run and talk to other agents, \
-process and task tables). Use it for everything.";
+process and task tables). Use it for everything. To run another agent, use agents.spawn in ts (never a built-in \
+sub-agent or collaboration tool), so it appears in the harness tree.";
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
@@ -119,6 +120,7 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
         "-c".into(), format!("mcp_servers.harness.command={}", toml_str("bun")),
         "-c".into(), format!("mcp_servers.harness.args=[{args_list}]"),
         "-c".into(), format!("mcp_servers.harness.env={{{env_table}}}"),
+        "-c".into(), "mcp_servers.harness.default_tools_approval_mode=\"approve\"".into(), // ts runs without prompts
         "-c".into(), "web_search=\"disabled\"".into(),
         "-c".into(), "include_apply_patch_tool=false".into(),
         "-c".into(), format!("developer_instructions={}", toml_str(SYSTEM_NOTE)),
