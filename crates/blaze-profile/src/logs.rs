@@ -176,6 +176,20 @@ impl Hold {
         self.held.values().map(Held::rows).sum::<usize>() + self.released.rows()
     }
 
+    /// The event ids of the DEBUG rows held now, events and fields: rows of the rings no flush
+    /// has written, which the flight recorder's mapping keeps for a postmortem
+    /// ([`crate::flight::flush_pending`]).
+    pub fn held_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.held.values().chain([&self.released]).flat_map(|held| {
+            held.events.iter().map(|it| it.event_id).chain(held.fields.iter().map(|it| it.event_id))
+        })
+    }
+
+    /// The builds whose DEBUG rows are held now, at most [`HOLD_BUILDS`] after a sort.
+    pub fn held_builds(&self) -> impl Iterator<Item = u32> + '_ {
+        self.held.keys().copied()
+    }
+
     /// DEBUG rows dropped since the hold was made, events and fields.
     pub fn dropped(&self) -> u64 {
         self.dropped
