@@ -549,11 +549,14 @@ disk included: the checkout, `target/`, the toolchain, the pinned LLVM and blaze
 what main pushed since. A pull request's fork never becomes a snapshot. No swap is made on ix:
 its scrub refuses to snapshot a machine with swap on.
 
-ix serves AArch64 alone today, so with the variable on, Linux x86-64's build and unit tests run
-only on main's push (and the train), on hosted runners, and `workspace-check` stays on hosted
-runners on both platforms. Unset, every job runs on hosted runners: a job whose labels no runner
-serves waits a day for one, so the variable goes on only once the ix-runners GitHub App serves
-this repository and its ix account can pay.
+ix serves AArch64 alone today (its runner plane refuses an `x64` job), so with the variable on,
+Linux x86-64's build and unit tests run only on main's push (and the train), on hosted runners,
+and `workspace-check` stays on hosted runners on both platforms. A second variable,
+`BLAZE_IX_X64_RUNNERS`, moves `linux x64 / build` and `linux x64 / tests` to
+`[self-hosted, ix, x64, ix-cpu-64, blaze-<job>]` (64 vCPUs, ix's x86-64 cap, and the same 256 GiB
+memory), for once ix serves x86-64. Unset, every job runs on hosted runners: a job whose labels
+no runner serves waits a day for one, so each variable goes on only once the ix-runners GitHub
+App serves this repository on that architecture and its ix account can pay.
 
 ### Named harnesses, and the projects downstream
 

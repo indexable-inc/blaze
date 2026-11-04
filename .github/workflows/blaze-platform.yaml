@@ -10,8 +10,11 @@
 # demand up to 256 GiB, forked from a snapshot of the last green job on main with the same labels,
 # its disk (the checkout, blaze's store under $HOME, the toolchain, LLVM) included. Each job has
 # its own label set (`blaze-build`, `blaze-tests`), so each forks its own job's snapshot; main's
-# `warm` runs make the snapshots and the pull requests' `gate` runs fork them. ix serves AArch64
-# alone today, so `ix-cpu` goes with `linux-arm64`.
+# `warm` runs make the snapshots and the pull requests' `gate` runs fork them. `ix-arch` is the
+# runner's architecture label: ix's runner plane picks the machine by it (`arm64`, or `x64`,
+# whose cap is 64 vCPUs) and refuses one it does not serve, and ix serves AArch64 alone today,
+# so `x64` goes on only with BLAZE_IX_X64_RUNNERS (blaze.yaml). Memory has no label: every ix
+# runner's grows on demand to the platform's 256 GiB.
 name: blaze platform
 on:
   workflow_call:
@@ -28,6 +31,10 @@ on:
         description: "vCPUs of the ix runner the build and the unit tests run on (8, 16, 32, 64 or 128), or empty for `os`"
         type: string
         default: ""
+      ix-arch:
+        description: "the ix runner's architecture label, `arm64` or `x64`, which has to be the platform's"
+        type: string
+        default: arm64
       tier:
         description: "`fast` (the fast tier's harnesses), `full` (every harness), as in harness/ci.py, or `gate` and `warm` (none)"
         type: string
@@ -85,7 +92,7 @@ jobs:
     # (harness/unittests.py), and hands over what it compiled, so only the crates built with
     # `cfg(test)` are compiled here.
     needs: build
-    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "arm64", "ix-cpu-{0}", "blaze-tests"]', inputs.ix-cpu)) || inputs.os }}
+    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "{1}", "ix-cpu-{0}", "blaze-tests"]', inputs.ix-cpu, inputs.ix-arch)) || inputs.os }}
     # A store blaze's release has not compiled into yet: 49 min on Linux x86-64, and over an
     # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
     # enough for that one run to finish and push, which the runs after it then pull.
@@ -175,7 +182,7 @@ jobs:
 
   build:
     name: build
-    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "arm64", "ix-cpu-{0}", "blaze-build"]', inputs.ix-cpu)) || inputs.os }}
+    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "{1}", "ix-cpu-{0}", "blaze-build"]', inputs.ix-cpu, inputs.ix-arch)) || inputs.os }}
     # A store blaze's release has not compiled into builds for about 97 minutes on Linux
     # x86-64 (docs/unit-keys.md), and longer on macOS's 7 GB runner.
     timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 150 }}
