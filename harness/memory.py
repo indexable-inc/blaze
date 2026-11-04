@@ -28,18 +28,14 @@ library only.
 """
 import ctypes, os, platform, resource, stat, subprocess, sys, tempfile, threading, time
 
+import counters
+
 DARWIN = platform.system() == "Darwin"
 INTERVAL = float(os.environ.get("BLAZE_MEMORY_INTERVAL", "0.01"))
 PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024 if hasattr(os, "sysconf") else 4
 
 if DARWIN:
     _proc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    _RUSAGE_INFO_V4 = 4
-    # struct rusage_info_v4 (<sys/resource.h>): a UUID, then 35 counters of 64 bits.
-    _FOOTPRINT, _LIFETIME_MAX_FOOTPRINT = 7, 28
-
-    class _RusageInfo(ctypes.Structure):
-        _fields_ = [("uuid", ctypes.c_uint8 * 16), ("counters", ctypes.c_uint64 * 35)]
 
 
 def maxrss_mb(usage):
@@ -52,10 +48,11 @@ def held_kb(pid):
     zombie, which holds nothing). On Linux the most is what it holds now: the sampler keeps
     the peak."""
     if DARWIN:
-        info = _RusageInfo()
-        if _proc.proc_pid_rusage(pid, _RUSAGE_INFO_V4, ctypes.byref(info)) != 0 or not info.counters[_FOOTPRINT]:
+        # rusage_info_v4, read where it is read for instructions too (counters.py).
+        info = counters.rusage(pid)
+        if info is None or not info["footprint"]:
             return None
-        return info.counters[_FOOTPRINT] // 1024, info.counters[_LIFETIME_MAX_FOOTPRINT] // 1024
+        return info["footprint"] // 1024, info["lifetime_max_footprint"] // 1024
     try:
         with open(f"/proc/{pid}/statm") as f:
             pages = int(f.read().split()[1])
@@ -239,18 +236,24 @@ class Sampler:
         return round(max(self.most.values(), default=0) / 1024)
 
 
-def run(argv, cwd=None, env=None, timeout=None, sampler=None, text=True, stdin=subprocess.DEVNULL):
+def run(argv, cwd=None, env=None, timeout=None, sampler=None, text=True, stdin=subprocess.DEVNULL, meter=None):
     """Runs `argv` to its end as `subprocess.run(capture_output=True)` does. The result is
     (seconds, the CompletedProcess, the memory): `largest_mb` is the peak of the largest process
     of its tree (`wait4`'s, exact, or the sampler's when more), `peak_mb` the most the tree held
     at once (sampled, and never below `largest_mb`). With `sampler`, the command is watched by
     it (beside what it already watches), `largest_mb` is `wait4`'s alone and `peak_mb` None:
-    the caller has the sampler's; without, by one of its own."""
+    the caller has the sampler's; without, by one of its own. With `meter` (a
+    counters.Meter), the command and what it starts are counted by it: on Linux it starts
+    stopped until its counter is open, and the time is taken from when it was let go."""
     own = sampler is None
     sampler = sampler or Sampler()
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         began = time.time()
-        child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin, stdout=out, stderr=err)
+        if meter is not None:
+            child = meter.popen(argv, cwd=cwd, env=env, stdin=stdin, stdout=out, stderr=err)
+            began = time.time()
+        else:
+            child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin, stdout=out, stderr=err)
         sampler.add(child.pid)
         if own:
             sampler.start()
@@ -259,6 +262,10 @@ def run(argv, cwd=None, env=None, timeout=None, sampler=None, text=True, stdin=s
         if timer:
             timer.start()
         try:
+            if meter is not None:
+                # Exited and not reaped: macOS's totals of it are read now, the last time they can be.
+                os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+                meter.exited(child.pid)
             largest = waited(child)
         finally:
             if timer:

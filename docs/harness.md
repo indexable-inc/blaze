@@ -352,13 +352,18 @@ against fresh cargo with an empty and with a warm store (`--cold-runs`), the sam
 the fastest cargo setups (`--setups`: mold, wild, `-Zthreads=8`, cg_clif and `cargo check`) and
 the test suites under both (`--tests`). v2 has no runtime bench yet: benchmarks.md's runtime
 table is v1's `runbench.py`'s last result. `abbench.py` runs two or more builds of blaze against each other on `bench.py`'s
-edits, in interleaved rounds: an edit's wall time, the daemon's own time and (macOS) its
-workers' cycles, the cold start, and the workers' peak memory. It is how the release build's
+edits, in interleaved rounds: an edit's wall time, the daemon's own time and its workers'
+cycles and instructions (counters.py; the cold start's on macOS alone), the cold start, and the
+workers' peak memory. It is how the release build's
 profile was chosen ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)), and with `--train` it
 is the training of its PGO. `hotpatch.py` times an edit of a running program under Dioxus's
 subsecond against `blaze build` and `cargo build` with a restart; its program is
 `harness/hotpatch`. `benchhistory.py` appends a run to `docs/benchmarks/history/` (what the
-site's /bench page charts) and, with `check`, fails when a median moved past its noise band.
+site's /bench page charts) and, with `check`, fails when a median moved past its noise band:
+instructions first, with a 1% band, then wall time and memory with theirs, after a summary of
+what regressed and improved. `counters.py` is how every harness counts instructions and cycles
+(Linux's `perf_event_open`, macOS's `proc_pid_rusage`), null with the reason where it cannot
+([benchmarks.md](benchmarks.md#instruction-counts)).
 `memory.py` is how every harness measures memory: `memory.run` runs a command and returns its
 time with the exact peak of its largest process (`wait4`) and the peak of its whole tree
 (sampled), `memory.Sampler` follows a long-lived process such as the daemon with its workers,
@@ -371,7 +376,11 @@ whose runner is registered. `benchreport.py` writes each table from the newest s
 every platform, so one that did not run keeps its last numbers. `benchcharts.py` draws the
 benchmark charts (SVG, a light and a dark version, a bar per platform) from the same results;
 `benchreport.py` regenerates them whenever it writes a table, `--charts` on its own, and
-`--render` every table and chart.
+`--render` every table and chart. With one typed JSON input (`'{}'` for the repository's own
+paths) `benchcharts.py` also draws the trends, blaze against its own past runs, from
+`docs/benchmarks/history` into the README and benchmarks.md
+([benchmarks.md](benchmarks.md#over-time)); every workflow that appends to the history runs it and
+commits through `.github/scripts/bench_commit.py`, which draws them again on top of main.
 `live_latency.py` times live edits on macOS on AArch64 one at a time through `blaze build`, with
 one typed JSON input (`{"blaze": PATH, "program": "probe" | "life" | "bevy" | "egui", "edits": 10,
 "json": PATH}`; the fields are in its docstring); its JSON goes to `benchhistory.py live`. The
@@ -702,6 +711,9 @@ A failure joins the list only with an owner and a cause, in the change that expl
 `bench-readme.yaml` measures real projects on each platform's dedicated benchmark machine and
 commits the tables and the README's numbers to main. It runs a platform only once the
 repository variable `BENCH_RUNNERS` names it ([benchmarks.md](benchmarks.md#the-machines)).
+`bench-counts.yaml` runs on every push to main on the same machines: the stress corpus and two
+small projects, judged by instruction counts first
+([benchmarks.md](benchmarks.md#the-stress-corpus-and-the-per-merge-run)).
 `bench.yaml` (the store's microbenchmarks, two minutes) runs on pull requests and pushes too.
 `bench-bun.yaml`, `live-latency.yaml` and `realprojects.yaml` ([Real projects](#real-projects-the-verdict)) keep
 schedules of their own: each takes hours or a dedicated machine, and the train would wait on

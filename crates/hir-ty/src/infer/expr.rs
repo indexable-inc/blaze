@@ -888,6 +888,14 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     tracing::debug!(?expected_ty);
                     let opt_ty = match expected_ty.as_ref().map(|it| it.kind()) {
                         Some(TyKind::Int(_) | TyKind::Uint(_)) => expected_ty,
+                        // rustc #164965: an expected integer variable is reused instead of
+                        // making a fresh one and unifying it later (ints never coerce, so the
+                        // coercion would only unify). Not for `Castable`.
+                        Some(TyKind::Infer(InferTy::IntVar(_)))
+                            if matches!(expected, Expectation::HasType(_)) =>
+                        {
+                            expected_ty
+                        }
                         Some(TyKind::Char) => Some(self.types.types.u8),
                         Some(TyKind::RawPtr(..) | TyKind::FnDef(..) | TyKind::FnPtr(..)) => {
                             Some(self.types.types.usize)
@@ -900,6 +908,14 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     let expected_ty = expected.to_option(&self.table);
                     let opt_ty = match expected_ty.as_ref().map(|it| it.kind()) {
                         Some(TyKind::Int(_) | TyKind::Uint(_)) => expected_ty,
+                        // rustc #164965: an expected integer variable is reused instead of
+                        // making a fresh one and unifying it later (ints never coerce, so the
+                        // coercion would only unify). Not for `Castable`.
+                        Some(TyKind::Infer(InferTy::IntVar(_)))
+                            if matches!(expected, Expectation::HasType(_)) =>
+                        {
+                            expected_ty
+                        }
                         Some(TyKind::Char) => Some(self.types.types.u8),
                         Some(TyKind::RawPtr(..) | TyKind::FnDef(..) | TyKind::FnPtr(..)) => {
                             Some(self.types.types.usize)
@@ -909,9 +925,14 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     opt_ty.unwrap_or_else(|| self.table.next_int_var())
                 },
                 |_| {
-                    let opt_ty = expected
-                        .to_option(&self.table)
-                        .filter(|ty| matches!(ty.kind(), TyKind::Float(_)));
+                    // An expected float variable is reused too (rustc #164965), not for `Castable`.
+                    let opt_ty = expected.to_option(&self.table).filter(|ty| match ty.kind() {
+                        TyKind::Float(_) => true,
+                        TyKind::Infer(InferTy::FloatVar(_)) => {
+                            matches!(expected, Expectation::HasType(_))
+                        }
+                        _ => false,
+                    });
                     opt_ty.unwrap_or_else(|| self.table.next_float_var())
                 },
             ),

@@ -32,6 +32,7 @@ mod const_traits;
 mod deps;
 mod intrinsics;
 mod memo;
+mod trivial;
 mod word;
 
 fn simplify(e: ConstEvalError<'_>) -> ConstEvalError<'_> {
