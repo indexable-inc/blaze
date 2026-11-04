@@ -34,6 +34,7 @@ prefab hn.TitleBar : ui.Row {
 // width. The main card's left edge follows the clip's right edge.
 prefab hn.SideClip : ui.Column {
   Clip
+  Fill: $tone_side_tint
   Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
   Padding: {l: 0, r: 0, t: 0, b: 0}

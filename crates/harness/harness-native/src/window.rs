@@ -697,7 +697,12 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new(), lights: 1.0, calm: false }));
     // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.
     let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), rect);
-    effect.setMaterial(NSVisualEffectMaterial::Sidebar);
+    // HARNESS_NATIVE_MATERIAL=sidebar|under|hud: the vibrancy material under the sidebar's tint plate.
+    effect.setMaterial(match std::env::var("HARNESS_NATIVE_MATERIAL").as_deref() {
+        Ok("sidebar") => NSVisualEffectMaterial::Sidebar,
+        Ok("hud") => NSVisualEffectMaterial::HUDWindow,
+        _ => NSVisualEffectMaterial::UnderWindowBackground,
+    });
     effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
     // HARNESS_NATIVE_VIBRANCY=active: always the active material (captures of a window that never takes the keyboard).
     effect.setState(if std::env::var("HARNESS_NATIVE_VIBRANCY").as_deref() == Ok("active") { NSVisualEffectState::Active } else { NSVisualEffectState::FollowsWindowActiveState });

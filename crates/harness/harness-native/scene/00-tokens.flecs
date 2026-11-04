@@ -85,11 +85,13 @@ export const tone_ink_4 = Fill: {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
 export const tone_accent = Fill: {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
 
 export const tone_wash = Fill: {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
-export const tone_wash_hover = Fill: {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.045}}
+export const tone_wash_hover = Fill: {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
 export const tone_wash_press = Fill: {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
 // The selected row: a soft accent-tinted pill over the vibrancy.
 export const tone_knob = Fill: {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
-export const tone_select = Fill: {dark: {0.580, 0.600, 1.0, 0.16}, light: {0.369, 0.384, 0.902, 0.13}}
+export const tone_select = Fill: {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
+// The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
+export const tone_side_tint = Fill: {dark: {0.071, 0.071, 0.078, 0.75}, light: {0.965, 0.965, 0.970, 0.6}}
 // Nothing: a node that paints no fill.
 export const tone_clear = Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
 // The palette's scrim over the window and its card.
