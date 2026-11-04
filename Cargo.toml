@@ -36,6 +36,9 @@ exclude = [
     "vendor/verus/vir_macros",
     "vendor/verus/builtin",
     "vendor/verus/vstd",
+    # Charon's library (charon_lib), built only as a dependency of hir-ty-charon
+    # (vendor/charon/SOURCE.md).
+    "vendor/charon/charon",
     # blaze's zstd, picked per target: patched below (vendor/zstd-sys/SOURCE.md); libzstd-rs-sys
     # is its wasm implementation, built only there (vendor/libzstd-rs-sys/SOURCE.md).
     "vendor/zstd-sys",
@@ -264,6 +267,7 @@ hir-ty-mir = { path = "crates/hir-ty-mir", version = "0.0.0" }
 hir-ty-print = { path = "crates/hir-ty-print", version = "0.0.0" }
 hir-ty-identity = { path = "crates/hir-ty-identity" }
 hir-ty-verus = { path = "crates/hir-ty-verus", version = "0.0.0" }
+hir-ty-charon = { path = "crates/hir-ty-charon", version = "0.0.0" }
 hir-ty-pure = { path = "crates/hir-ty-pure", version = "0.0.0" }
 hir-ty-suspend = { path = "crates/hir-ty-suspend", version = "0.0.0" }
 hir-ty-share = { path = "crates/hir-ty-share", version = "0.0.0" }
