@@ -1,14 +1,14 @@
-// blaze's launch video: 10 seconds, 1920 by 1080 at 60 fps with sound, for X/Twitter. The words are the post's; the video
+// blaze's launch video: 12 seconds, 1920 by 1080 at 60 fps with sound, for X/Twitter. The words are the post's; the video
 // is the mark alone, and starts and ends on the dark ground, so it loops.
 //
 //   cd crates/harness && cargo run --release -p harness-video -- harness-video/scene/launch.flecs blaze-launch.mp4
 //
 // The mark (harness-native-blaze, the same mark and soundtrack as indexable-inc/anim):
 //   0.35 to 1.5   the letters drop in from the top of the frame, one by one, each landing on a note climbing A B C# E G#
-//   1.7           the fire catches from the b to the e, on A major, and lights the ground around it; the frame starts a
-//                 slow push in
-//   6.2 to 9.2    the letters glow white hot, burn down the fire's colours and crumble into embers
-//   8.2           where they stood, where to find it, arriving hot and cooling; gone again by the end
+//   1.7           the fire catches from the b to the e, on A major; the frame starts a slow push in
+//   5.4 to 8.4    the letters glow white hot, burn down the fire's colours and crumble into embers
+//   8.0           where they stood, where to find it, arriving hot and cooling; it holds while the last embers ring
+//                 out, then fades slowly to the dark ground the video started on
 //
 // Motion is data: a `Cue` child moves one member of its node (`Pose.fade`, `Pose.shrink`...) between two values over a
 // stretch of the clock. The `cue.*` templates below are the few moves this video makes, by name. The mark's own motion
@@ -17,17 +17,11 @@
 // ---- the moves ----
 @tree ChildOf
 cue {
-  // Fade in over `dur` from `at`.
-  template FadeIn {
-    prop at: f32 = 0
-    prop dur: f32 = 0.6
-    Cue: {member: "Pose.fade", from: 1, to: 0, at: $at, dur: $dur, ease: Out}
-  }
-  // Fade out over `dur` from `at`.
+  // Fade out over `dur` from `at`, slowly at both ends.
   template FadeOut {
     prop at: f32 = 0
-    prop dur: f32 = 0.45
-    Cue: {member: "Pose.fade", from: 0, to: 1, at: $at, dur: $dur, ease: In}
+    prop dur: f32 = 1
+    Cue: {member: "Pose.fade", from: 0, to: 1, at: $at, dur: $dur, ease: InOut}
   }
   // Grow by `by` of its size over `dur` from `at`, slowly at both ends (a camera pushing in).
   template PushIn {
@@ -54,20 +48,20 @@ launch_part {
 // ---- the video ----
 // The mark's timeline: its letters start falling at `drop`, and it burns away from `burn`.
 const drop = 0.35
-const burn = 6.2
+const burn = 5.4
 
 @tree ChildOf
 launch : ui.ZStack {
-  Video: {width: 960, height: 540, fps: 60, seconds: 10, scale: 2}
+  Video: {width: 960, height: 540, fps: 60, seconds: 12, scale: 2}
   Fill: $tone_ground
   Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
   Size: {w: {kind: Fixed, value: 960, min: 0, max: 0}, h: {kind: Fixed, value: 540, min: 0, max: 0}}
 
   stage : launch_part.Layer {
     mark : ui.Node {
-      BlazeMark: {start: $drop, exit: $burn, glow: 0.55}
+      BlazeMark: {start: $drop, exit: $burn}
       Size: {w: {kind: Fixed, value: 43 * $mark_cell, min: 0, max: 0}, h: {kind: Fixed, value: 23 * $mark_cell, min: 0, max: 0}}
-      cue.PushIn push(at: 1.6, dur: 5.2, by: 0.07)
+      cue.PushIn push(at: 1.6, dur: 5.6, by: 0.06)
     }
   }
 
@@ -75,8 +69,8 @@ launch : ui.ZStack {
   outro : launch_part.Layer {
     url : launch_part.Lead {
       Text: {s: "ix.dev/blaze"}
-      GlyphsIn: {at: 8.2, per: 0.045, dur: 0.5, by: 0, ease: Out, cool: 1.1, hot: $fire_3}
-      cue.FadeOut leave(at: 9.45, dur: 0.5)
+      GlyphsIn: {at: 8.0, per: 0.045, dur: 0.5, by: 0, ease: Out, cool: 1.1, hot: $fire_3}
+      cue.FadeOut leave(at: 10.4, dur: 1.3)
     }
   }
 }

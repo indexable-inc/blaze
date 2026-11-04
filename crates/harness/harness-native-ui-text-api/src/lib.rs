@@ -77,14 +77,11 @@ pub struct Frames {
 
 /// blaze's wordmark set on fire (harness-native-blaze), drawn as pixel art over the node's width: its letters start
 /// falling in from the top of the view at `start` seconds on the frame clock, the fire catches a beat after the last lands,
-/// and from `exit` (when it is after `start`) the letters burn away into embers. A picture without a file. With `glow`
-/// above 0 the fire lights the ground around it: a soft warm light behind the mark, as bright as the fire burns (times
-/// `glow`), flickering with it.
+/// and from `exit` (when it is after `start`) the letters burn away into embers. A picture without a file.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct BlazeMark {
     pub start: f32,
     pub exit: f32,
-    pub glow: f32,
 }
 
 /// A block caret after the last glyph a node's words show (a `Pose.cut` types them on), in `ink`, from `at` to `until`

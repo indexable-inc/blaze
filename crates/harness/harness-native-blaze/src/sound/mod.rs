@@ -432,7 +432,7 @@ pub fn soundtrack(
             o[1] += gain * (d[1] + 0.5 * w[1]);
         }
     }
-    let tail = (0.2 * sr as f32) as usize;
+    let tail = (0.6 * sr as f32) as usize;
     let n = out.len();
     for (i, o) in out.iter_mut().enumerate() {
         let left = n - i;

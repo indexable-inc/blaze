@@ -73,33 +73,6 @@ pub fn rgba(c: Rgba) -> [f32; 4] {
     [c.r, c.g, c.b, c.a]
 }
 
-/// A soft round light in `rgb`, `n` texels a side: straight alpha falling from 0.5 in the middle to 0 at the edge, on a
-/// curve with no visible rim.
-fn glow_texels(rgb: [u8; 3]) -> (Rc<[u8]>, u32) {
-    const N: u32 = 128;
-    thread_local! {
-        static GLOW: std::cell::RefCell<HashMap<[u8; 3], Rc<[u8]>>> = std::cell::RefCell::new(HashMap::new());
-    }
-    let tex = GLOW.with(|g| {
-        g.borrow_mut()
-            .entry(rgb)
-            .or_insert_with(|| {
-                let mut px = Vec::with_capacity((N * N * 4) as usize);
-                for y in 0..N {
-                    for x in 0..N {
-                        let (u, v) = ((x as f32 + 0.5) / N as f32 * 2.0 - 1.0, (y as f32 + 0.5) / N as f32 * 2.0 - 1.0);
-                        let r = (u * u + v * v).sqrt().min(1.0);
-                        let a = 0.5 * (1.0 - r * r).powi(3);
-                        px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], (a * 255.0).round() as u8]);
-                    }
-                }
-                px.into()
-            })
-            .clone()
-    });
-    (tex, N)
-}
-
 /// The `code_ink` tokens: each entity under `code_ink` with a `Fill`, by its dotted path below it, in the dark ink.
 fn code_ink(w: WorldRef<'_>) -> Vec<(String, [f32; 4])> {
     fn walk(e: EntityView<'_>, prefix: &str, out: &mut Vec<(String, [f32; 4])>) {
@@ -636,18 +609,6 @@ impl Painter {
         let y = ((rest[1] + (rest[3] - ch as f32 * cell) * 0.5 - lead as f32 * cell + ky * cell) * sc).round() / sc;
         let k = if rest[2] > 0.0 { rect[2] / rest[2] } else { 1.0 };
         let place = |r: [f32; 4]| [rect[0] + (r[0] - rest[0]) * k, rect[1] + (r[1] - rest[1]) * k, r[2] * k, r[3] * k];
-        if m.glow > 0.0 {
-            // The light it casts: wider than tall, centred a little above the letters' middle, where the flames are.
-            let warmth = (mark.warmth() * m.glow).min(1.5);
-            if warmth > 0.003 {
-                let f = mark.flame();
-                let (gw, gh) = (rest[2] * 2.2, rest[3] * 2.4);
-                let (cx, cy) = (rest[0] + rest[2] * 0.5, rest[1] + rest[3] * 0.42);
-                let (tex, n) = glow_texels(f);
-                let r = place([cx - gw * 0.5, cy - gh * 0.5, gw, gh]);
-                d.image(ImageInst { rect: r, size: [n as f32, n as f32, alpha * warmth, 1.0], clip: [0.0; 4] }, tex);
-            }
-        }
         let size = [img.w as f32, img.h as f32, alpha, 0.0];
         d.image(ImageInst { rect: place([x, y, img.w as f32 / sc, img.h as f32 / sc]), size, clip: [0.0; 4] }, img.rgba.into());
         Ok(())
