@@ -74,6 +74,17 @@ export const count_kick_scale = 0.35
 export const count_omega = 26
 export const count_zeta = 0.35
 
+// The Archive pane: its title, search line, filter chips, day headings and the right-hand columns (duration, time).
+export const size_title = 15
+export const field_h = 30
+export const chip_h = 24
+export const chip_radius = 12
+export const section_h = 30
+export const arch_took_w = 56
+export const arch_time_w = 84
+// A finished run with no session leaves the live tree this long after it ended (seconds).
+export const archive_after_s = 600
+
 export const radius_control = 6
 export const radius_card = 12
 

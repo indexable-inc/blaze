@@ -88,6 +88,9 @@ impl App {
             self.poke();
             return;
         }
+        if self.archive_wheel(if ev.precise { ev.dy / z } else { ev.dy }, ev.precise) {
+            return;
+        }
         self.wheel(if ev.precise { ev.dy / z } else { ev.dy }, ev.precise, m);
     }
 

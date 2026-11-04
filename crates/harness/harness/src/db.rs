@@ -324,6 +324,18 @@ pub fn object_by_name(name: &str) -> Option<String> {
     log("object_by_name", r).flatten()
 }
 
+/// The session a REPL's cells were posted under (its newest cell's parent `s<n>`), if any.
+pub fn repl_owner(repl: &str) -> Option<u64> {
+    let r = conn()
+        .query_row(
+            "select parent from objects where kind = 'repl' and id like ?1 escape '\\' and parent is not null order by created_ms desc limit 1",
+            [format!("{}.%", repl.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))],
+            |r| r.get::<_, String>(0),
+        )
+        .optional();
+    log("repl_owner", r).flatten().and_then(|p| p.strip_prefix('s')?.parse().ok())
+}
+
 /// One object's index row as JSON (null when unknown).
 pub fn object(id: &str) -> Value {
     let r = conn()

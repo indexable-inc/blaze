@@ -313,6 +313,13 @@ define_class!(
             wake();
         }
 
+        #[unsafe(method(ctxPin:))]
+        fn ctx_pin(&self, sender: &NSMenuItem) {
+            let e = sender.tag() as u64;
+            with(|st| st.app.toggle_pin(e));
+            wake();
+        }
+
         #[unsafe(method(ctxUnarchive:))]
         fn ctx_unarchive(&self, sender: &NSMenuItem) {
             let e = sender.tag() as u64;
@@ -487,9 +494,14 @@ impl HarnessView {
             menu.addItem(&it);
         };
         let e = with(|st| st.app.object_at(x, y)).flatten()?;
-        if with(|st| st.app.is_archived(e)).unwrap_or(false) {
+        let (archived, pinned, object) = with(|st| (st.app.is_archived(e), st.app.is_pinned(e), st.app.is_object(e))).unwrap_or_default();
+        if !object {
+            return None;
+        }
+        if archived {
             add("Unarchive", sel!(ctxUnarchive:), e);
         } else {
+            add(if pinned { "Don't Keep in Tree" } else { "Keep in Tree" }, sel!(ctxPin:), e);
             add("Kill", sel!(ctxKill:), e);
         }
         Some(menu)

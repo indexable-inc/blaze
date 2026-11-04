@@ -2,8 +2,9 @@
 //! app (and other features) share, so a write reads the file, changes one key and writes it back whole (through a
 //! temporary file and a rename, so a reader never sees half of it).
 //!
-//! Keys: `selected` (the session the main pane showed last), `sidebar_width` and `archived` (session ids cmd+W'd into
-//! the sidebar's Archive; the older `trashed` is read once in its place).
+//! Keys: `selected` (the session the main pane showed last), `sidebar_width`, `closed` (objects cmd+W'd, by key: `s14`,
+//! `r12`; the older `archived` and `trashed` session ids are read once in its place) and `pinned` (objects kept in the
+//! tree).
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 
@@ -43,6 +44,11 @@ fn write(m: Map<String, Value>) {
 /// The ids listed at `key` (the Archive's `archived`), or None when the file has no such key.
 pub fn ids(key: &str) -> Option<std::collections::BTreeSet<u64>> {
     get(key).and_then(|v| v.as_array().map(|a| a.iter().filter_map(Value::as_u64).collect()))
+}
+
+/// The strings listed at `key` (`closed`, `pinned`), or None when the file has no such key.
+pub fn keys(key: &str) -> Option<std::collections::BTreeSet<String>> {
+    get(key).and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()))
 }
 
 /// Drop `keys` from the file (when it has any of them), keeping every other key.

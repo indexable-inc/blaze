@@ -7,11 +7,16 @@
 //! - A shell run (`r12`) is an entity with [`Run`], `(Kind, Proc)`, [`Name`] (its command), `(Status, Running | Exited |
 //!   Killed | Lost)`, [`ExitCode`], [`Created`] / [`Ended`], and `ChildOf` its session (or the device). A run split into
 //!   pipeline stages has one child per stage: [`StageNo`], `(Kind, Stage)`, its text, its own status, exit code and times.
-//! - A run whose session the daemon does not list goes under a group node (`(Kind, Group)`, [`GroupKey`], [`Name`]) on
-//!   the device: one "REPL runs" per REPL (the run's `repl`) or per gone session, else one "other runs", all below the live sessions.
+//! - A run goes under its session, else under the session that owns its REPL (the daemon's `owner`), else on the device.
+//!   One whose session or owner the daemon no longer lists is an [`Orphan`].
 //! - [`Unfolded`] on a session (or the device) shows all its runs; without it the tree folds all but the last few.
 //!   [`Collapsed`] on a node hides all its children (every run group starts so).
-//! - [`Archived`] on an object takes it (and what is under it) out of the tree and into the sidebar's Archive.
+//! - [`Archived`] on an object takes it out of the tree and into the Archive pane. The `ArchiveRule` system sets it from
+//!   tags and relations alone: [`Closed`] (cmd+W) always, [`Pinned`] never, else a finished object whose parent session
+//!   ended or left the tree, an [`Orphan`] run, and a finished run on the device [`ArchiveAfter`] it ended. A running
+//!   object and a finished top-level session stay.
+//! - The Archive pane shows the [`ArchiveView`] entity ([`ARCHIVE`]); older runs come a page at a time ([`Paged`],
+//!   [`History`]) rather than all at once.
 //! - `(Selected, object)` on the app entity is the selection (exclusive). Each pane node of the view holds the exclusive
 //!   `(Shows, object)`: what it draws. The focused pane's `Shows` follows `Selected`; a second pane is a second node.
 //! - An attached object has [`Term`]: its grid's size and how far it is scrolled back; the terminal (harness-vt) itself is the
@@ -138,6 +143,42 @@ pub struct Collapsed;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Archived;
 
+/// On an object: the user closed it (cmd+W, Kill); it is archived whatever else holds. The host keeps these.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Closed;
+
+/// On an object: "Keep in tree" (or Unarchive): the rule never archives it. The host keeps these.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Pinned;
+
+/// On a run: it names a session (its own or its REPL's owner) that the daemon no longer lists.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Orphan;
+
+/// On a run: it came from a page of older history (the Archive's), so the poll's window does not drop it.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Paged;
+
+/// `(Kind, ArchiveView)`: the Archive pane's entity, selected and shown like an object.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ArchiveView;
+
+/// The Archive pane's entity.
+pub const ARCHIVE: &str = "views::archive";
+
+/// Singleton: how long after it ended a finished run on the device (no session) leaves the tree (the scene's token).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ArchiveAfter {
+    pub ms: u64,
+}
+
+/// Singleton: the older history's paging: a page asked for and not in yet, and whether the daemon has no older runs.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct History {
+    pub loading: bool,
+    pub exhausted: bool,
+}
+
 /// A group of runs with no listed session, by what they share (`repl:<id>`, `session:<n>`, `other`).
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct GroupKey {
@@ -170,6 +211,8 @@ pub enum PaneKind {
     Run,
     /// A group's runs (Group).
     Group,
+    /// The Archive (ArchiveView).
+    Archive,
 }
 
 /// The pane kind for `e`. A session whose kind the daemon named something unknown is `(Kind, Proc)` too, but it is a
@@ -178,7 +221,9 @@ pub enum PaneKind {
 pub fn pane_kind(e: EntityView<'_>) -> PaneKind {
     let w = e.world();
     let k = e.target(Kind::id(), 0).map_or(0, |t| *t.id());
-    if k == *w.component_id::<Group>() {
+    if k == *w.component_id::<ArchiveView>() {
+        PaneKind::Archive
+    } else if k == *w.component_id::<Group>() {
         PaneKind::Group
     } else if k == *w.component_id::<Stage>() || (k == *w.component_id::<Proc>() && !e.has(Object::id())) {
         PaneKind::Run
@@ -222,6 +267,8 @@ pub enum Msg {
     Detached { id: u64 },
     /// The daemon's recent shell runs, as its `runs` op returns them (newest first).
     Runs(Vec<serde_json::Value>),
+    /// A page of older runs (`runs` with `before`), and whether it was a full page (more may be older).
+    RunsPage { runs: Vec<serde_json::Value>, full: bool },
     /// Output of run `r{run}` (of its stage `stage`, or the caller-visible streams), as `run_read` returned it.
     RunData { run: u64, stage: Option<u32>, err: bool, bytes: Vec<u8> },
 }
@@ -251,6 +298,15 @@ pub fn register(world: &World) {
     world.component::<Unfolded>();
     world.component::<Collapsed>();
     world.component::<Archived>();
+    world.component::<Closed>();
+    world.component::<Pinned>();
+    world.component::<Orphan>();
+    world.component::<Paged>();
+    world.component::<ArchiveView>();
+    world.component::<ArchiveAfter>().writable();
+    world.component::<History>().writable();
+    world.set(ArchiveAfter { ms: 600_000 });
+    world.set(History::default());
     world.component::<GroupKey>().writable();
     world.component::<Selected>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Shows>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
@@ -309,6 +365,10 @@ pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -
     let terms: Terms = Rc::default();
     let run_terms: Terms = Rc::default();
     let parsers = (terms.clone(), run_terms.clone());
+    let view = world.entity_named(ARCHIVE);
+    view.add((Kind::id(), *world.component_id::<ArchiveView>()));
+    view.set(Name { s: "Archive".into() });
+    install_rule(world);
     let mut idx = Index::default();
     world.system_named::<&mut Inbox>("DaemonInbox").each_iter(move |it, _, inbox| {
         let w = it.world();
@@ -320,13 +380,58 @@ pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -
     (terms, run_terms)
 }
 
+/// Milliseconds since the epoch.
+#[must_use]
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The `ArchiveRule` system: each session and run (not a stage) gets [`Archived`] exactly when the rule holds.
+/// - [`Closed`]: archived. [`Pinned`]: kept.
+/// - Running: kept.
+/// - Finished, under a session: archived once that session ended or left the tree (its runs go with it).
+/// - A finished run that is an [`Orphan`]: archived; one on the device: archived [`ArchiveAfter`] it ended.
+/// - A finished top-level session: kept until it is closed.
+///
+/// One level a frame: a session archived this frame takes its runs with it the next.
+fn install_rule(world: WorldRef<'_>) {
+    let running = *world.component_id::<Running>();
+    world.system_named::<&Created>("ArchiveRule").with((Status::id(), flecs::Wildcard::ID)).without(StageNo::id()).each_entity(move |e, _| {
+        if !e.has(Object::id()) && !e.has(Run::id()) {
+            return;
+        }
+        let is_running = |x: EntityView<'_>| x.target(Status::id(), 0).is_some_and(|t| *t.id() == running);
+        let want = if e.has(Closed::id()) {
+            true
+        } else if e.has(Pinned::id()) || is_running(e) {
+            false
+        } else {
+            match e.parent().filter(|p| p.has(Object::id())) {
+                Some(p) => p.has(Archived::id()) || !is_running(p),
+                None if e.has(Run::id()) => {
+                    let after = e.world().try_get::<&ArchiveAfter>(|a| a.ms).unwrap_or(600_000);
+                    let ended = e.try_cloned::<&Ended>().map(|t| t.ms).or_else(|| e.try_cloned::<&Created>().map(|c| c.ms)).unwrap_or(0);
+                    e.has(Orphan::id()) || ended.saturating_add(after) <= now_ms()
+                }
+                None => false,
+            }
+        };
+        if e.has(Archived::id()) != want {
+            if want {
+                e.add(Archived::id());
+            } else {
+                e.remove(Archived::id());
+            }
+        }
+    });
+}
+
 /// Daemon ids to entities: sessions by id, runs by number, stages by (run number, index).
 #[derive(Default)]
 struct Index {
     sessions: HashMap<u64, u64>,
     runs: HashMap<u64, u64>,
     stages: HashMap<(u64, u32), u64>,
-    groups: HashMap<String, u64>,
 }
 
 fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms): &(Terms, Terms), msg: Msg) {
@@ -359,7 +464,11 @@ fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms): &(Terms
         // The stream ended (the program exited, or the daemon went): the last screen stays to read; the host attaches
         // again (on a fresh parser) when it wants the live one.
         Msg::Detached { .. } => {}
-        Msg::Runs(runs) => reconcile_runs(w, dev, idx, &runs),
+        Msg::Runs(runs) => reconcile_runs(w, dev, idx, &runs, false),
+        Msg::RunsPage { runs, full } => {
+            reconcile_runs(w, dev, idx, &runs, true);
+            w.set(History { loading: false, exhausted: !full });
+        }
         Msg::RunData { run, stage, err, bytes } => {
             let ent = match stage {
                 Some(k) => idx.stages.get(&(run, k)),
@@ -449,9 +558,10 @@ fn set_code(e: EntityView<'_>, code: Option<i64>) {
     }
 }
 
-/// Bring the runs in line with the daemon's `runs` answer: each a child of its session (or the device), its stages
-/// children of it when it was split into more than one.
-fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json::Value]) {
+/// Bring the runs in line with the daemon's `runs` answer: each a child of its session (else its REPL's owner, else the
+/// device), its stages children of it when it was split into more than one. A `paged` answer (older history) only adds:
+/// runs it does not name stay, and the runs it brings are [`Paged`], kept when the poll's window does not name them.
+fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json::Value], paged: bool) {
     let (kind, status) = (*w.component_id::<Kind>(), *w.component_id::<Status>());
     let proc_ = *w.component_id::<Proc>();
     let stage_kind = *w.component_id::<Stage>();
@@ -463,11 +573,8 @@ fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json
         "skipped" => *w.component_id::<Skipped>(),
         _ => *w.component_id::<Exited>(),
     };
-    let group_kind = *w.component_id::<Group>();
     let mut seen = std::collections::HashSet::new();
     let mut seen_stages = std::collections::HashSet::new();
-    // Group key -> its newest run's start.
-    let mut groups_seen: HashMap<String, u64> = HashMap::new();
     for r in runs {
         let Some(n) = r["id"].as_str().and_then(|s| s.strip_prefix('r')).and_then(|s| s.parse::<u64>().ok()) else { continue };
         seen.insert(n);
@@ -476,6 +583,9 @@ fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json
             None => {
                 let e = w.entity();
                 e.set(Run { n });
+                if paged {
+                    e.add(Paged::id());
+                }
                 idx.runs.insert(n, *e.id());
                 e
             }
@@ -489,35 +599,17 @@ fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json
             e.set(Cwd { s: cwd.into() });
         }
         set_times(e, r["start_ms"].as_u64(), r["end_ms"].as_u64());
-        let listed = r["session"].as_u64().and_then(|s| idx.sessions.get(&s).copied()).filter(|&p| w.entity_from_id(p).is_alive());
-        let parent = match listed {
-            Some(p) => p,
-            None => {
-                // No listed session: one group per REPL or gone session, else "other runs" (collapsed at first).
-                let (key, name) = match (r["repl"].as_str().filter(|s| !s.is_empty()), r["session"].as_u64()) {
-                    (Some(repl), _) => (format!("repl:{repl}"), format!("REPL runs \u{00B7} {repl}")),
-                    (None, Some(s)) => (format!("session:{s}"), format!("REPL runs \u{00B7} s{s}")),
-                    (None, None) => ("other".to_owned(), "other runs".to_owned()),
-                };
-                let start = r["start_ms"].as_u64().unwrap_or(0);
-                let newest = groups_seen.entry(key.clone()).or_insert(0);
-                *newest = (*newest).max(start);
-                match idx.groups.get(&key).map(|&g| w.entity_from_id(g)).filter(|g| g.is_alive()) {
-                    Some(g) => *g.id(),
-                    None => {
-                        let g = w.entity();
-                        g.set(GroupKey { s: key.as_str().into() });
-                        g.add((Kind::id(), group_kind));
-                        g.set(Name { s: name.as_str().into() });
-                        // Runs whose session is gone are history: every group starts collapsed.
-                        g.add(Collapsed::id());
-                        g.child_of(dev);
-                        idx.groups.insert(key, *g.id());
-                        *g.id()
-                    }
-                }
+        // Its session, else the session its REPL's cells ran under; a named one the daemon no longer lists orphans it.
+        let named = r["session"].as_u64().or_else(|| r["owner"].as_u64());
+        let listed = named.and_then(|s| idx.sessions.get(&s).copied()).filter(|&p| w.entity_from_id(p).is_alive());
+        let parent = listed.unwrap_or(dev);
+        if (named.is_some() && listed.is_none()) != e.has(Orphan::id()) {
+            if listed.is_none() {
+                e.add(Orphan::id());
+            } else {
+                e.remove(Orphan::id());
             }
-        };
+        }
         if e.parent().is_none_or(|p| *p.id() != parent) {
             e.child_of(parent);
         }
@@ -545,29 +637,12 @@ fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json
             set_times(c, s["start_ms"].as_u64(), s["end_ms"].as_u64());
         }
     }
-    // Groups sort below every live session (their key past any real timestamp), among themselves by their newest run;
-    // "other runs" goes last. Empty ones go.
-    idx.groups.retain(|key, g| {
-        let g = w.entity_from_id(*g);
-        match groups_seen.get(key) {
-            Some(&newest) => {
-                let created = Created { ms: if key == "other" { u64::MAX } else { (1 << 62) + newest } };
-                if g.try_cloned::<&Created>() != Some(created) {
-                    g.set(created);
-                }
-                true
-            }
-            None => {
-                if g.is_alive() {
-                    g.destruct();
-                }
-                false
-            }
-        }
-    });
     // Gone runs go with their stages (ChildOf deletes them).
+    if paged {
+        return;
+    }
     idx.runs.retain(|n, e| {
-        let keep = seen.contains(n);
+        let keep = seen.contains(n) || w.entity_from_id(*e).has(Paged::id());
         if !keep {
             let e = w.entity_from_id(*e);
             if e.is_alive() {
@@ -577,7 +652,7 @@ fn reconcile_runs(w: WorldRef<'_>, dev: u64, idx: &mut Index, runs: &[serde_json
         keep
     });
     idx.stages.retain(|key, c| {
-        let keep = seen_stages.contains(key);
+        let keep = seen_stages.contains(key) || (idx.runs.contains_key(&key.0) && !seen.contains(&key.0));
         if !keep {
             let c = w.entity_from_id(*c);
             if c.is_alive() {
@@ -670,11 +745,11 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
 pub fn tree(world: WorldRef<'_>) -> Vec<(u64, usize)> {
     fn walk(w: WorldRef<'_>, e: EntityView<'_>, depth: usize, out: &mut Vec<(u64, usize)>) {
         let mut kids: Vec<(u64, u64)> = Vec::new();
-        e.each_child(|c| {
-            if c.has(Object::id()) && !gone(c) {
+        for c in live_kids(e) {
+            if c.has(Object::id()) {
                 kids.push((c.try_cloned::<&Created>().map_or(0, |c| c.ms), *c.id()));
             }
-        });
+        }
         kids.sort_unstable();
         for (_, k) in kids {
             out.push((k, depth));
@@ -722,15 +797,13 @@ pub fn rows(world: WorldRef<'_>) -> Vec<Row> {
         }
         fn walk(&mut self, e: EntityView<'_>, depth: usize) {
             let mut kids: Vec<(u64, u64, u64)> = Vec::new();
-            e.each_child(|c| {
-                if c.target(Kind::id(), 0).is_some() && !gone(c) {
-                    let key = match c.try_cloned::<&StageNo>() {
-                        Some(s) => u64::from(s.k),
-                        None => c.try_cloned::<&Created>().map_or(0, |c| c.ms),
-                    };
-                    kids.push((key, *c.id(), 0));
-                }
-            });
+            for c in live_kids(e) {
+                let key = match c.try_cloned::<&StageNo>() {
+                    Some(s) => u64::from(s.k),
+                    None => c.try_cloned::<&Created>().map_or(0, |c| c.ms),
+                };
+                kids.push((key, *c.id(), 0));
+            }
             kids.sort_unstable();
             let runs: Vec<u64> = kids.iter().map(|k| k.1).filter(|&id| self.is_run(id)).collect();
             let unfolded = e.has(Unfolded::id());
@@ -772,20 +845,46 @@ pub fn rows(world: WorldRef<'_>) -> Vec<Row> {
     walk.out
 }
 
-/// Whether `e` is out of the tree: in the Archive.
-fn gone(e: EntityView<'_>) -> bool {
-    e.has(Archived::id())
+/// `e`'s children in the tree: those with a Kind that are not archived, and in place of an archived one, what under it
+/// is still in the tree (a run still running under a closed session floats up to where its session was).
+fn live_kids(e: EntityView<'_>) -> Vec<EntityView<'_>> {
+    let mut out = Vec::new();
+    e.each_child(|c| {
+        if c.target(Kind::id(), 0).is_none() {
+            return;
+        }
+        if c.has(Archived::id()) {
+            out.extend(live_kids(c).into_iter().filter(|k| !k.has(StageNo::id())));
+        } else {
+            out.push(c);
+        }
+    });
+    out
 }
 
-/// The objects in the Archive, oldest first.
+/// The sessions and runs in the Archive (not stages), oldest first by when they ended (else began).
 #[must_use]
 pub fn archived(world: WorldRef<'_>) -> Vec<u64> {
     let mut out: Vec<(u64, u64)> = Vec::new();
-    world.query::<&Object>().with(Archived::id()).build().each_entity(|e, _| {
-        out.push((e.try_cloned::<&Created>().map_or(0, |c| c.ms), *e.id()));
+    world.query::<&Created>().with(Archived::id()).build().each_entity(|e, c| {
+        if e.has(Object::id()) || e.has(Run::id()) {
+            out.push((e.try_cloned::<&Ended>().map_or(c.ms, |t| t.ms), *e.id()));
+        }
     });
     out.sort_unstable();
     out.into_iter().map(|(_, e)| e).collect()
+}
+
+/// When `e` ended, else when it began (ms since the epoch): where the Archive files it.
+#[must_use]
+pub fn when(e: EntityView<'_>) -> u64 {
+    e.try_cloned::<&Ended>().map(|t| t.ms).or_else(|| e.try_cloned::<&Created>().map(|c| c.ms)).unwrap_or(0)
+}
+
+/// The Archive pane's entity.
+#[must_use]
+pub fn archive_view(world: WorldRef<'_>) -> u64 {
+    *world.lookup(ARCHIVE).id()
 }
 
 fn ke_collapsed(w: WorldRef<'_>, e: u64) -> bool {

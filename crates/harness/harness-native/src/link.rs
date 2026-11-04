@@ -27,6 +27,9 @@ const POLL: Duration = Duration::from_millis(400);
 /// How many of the newest shell runs the poll asks for.
 const RUNS: usize = 100;
 
+/// How many older runs one page of the Archive's history asks for.
+pub const PAGE: usize = 100;
+
 /// How long one `run_read` waits for new output.
 const RUN_WAIT_MS: u64 = 1000;
 
@@ -351,6 +354,38 @@ impl Link {
     /// Stop following run `r{run}`'s output (of its stage `stage`).
     pub fn unwatch_run(&self, run: u64, stage: Option<u32>) {
         self.run_watch.lock().unwrap().remove(&(run, stage));
+    }
+
+    /// A page of [`PAGE`] runs older than `r{before}` (the Archive's history): it comes as `Msg::RunsPage`.
+    pub fn runs_page(&self, before: u64) {
+        let (tx, wake) = (self.tx.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let runs = match request(&json!({"op": "runs", "limit": PAGE, "before": before})) {
+                Ok(v) if v.get("error").is_none() => v["runs"].as_array().cloned().unwrap_or_default(),
+                Ok(v) => {
+                    eprintln!("harness-native: runs before r{before}: {v}");
+                    Vec::new()
+                }
+                Err(e) => {
+                    eprintln!("harness-native: runs before r{before}: {e}");
+                    Vec::new()
+                }
+            };
+            let full = runs.len() >= PAGE;
+            let _ = tx.send(Msg::RunsPage { runs, full });
+            wake();
+        });
+    }
+
+    /// Kill shell run `r{n}` (its process group).
+    pub fn kill_run(&self, n: u64) {
+        let poke = self.poke.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = request(&json!({"op": "run_kill", "id": format!("r{n}")})) {
+                eprintln!("harness-native: run_kill r{n}: {e}");
+            }
+            let _ = poke.send(());
+        });
     }
 
     pub fn kill(&self, id: u64) {
