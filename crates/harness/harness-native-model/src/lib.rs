@@ -153,6 +153,11 @@ pub struct Pinned;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Orphan;
 
+/// On a session: its program wrote output lately (the daemon's `busy`; a daemon that does not say counts as busy), so
+/// its running dot breathes. A live shell sitting at its prompt is not busy, and draws nothing.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Busy;
+
 /// On a run: it came from a page of older history (the Archive's), so the poll's window does not drop it.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Paged;
@@ -291,6 +296,7 @@ pub fn register(world: &World) {
     world.component::<Closed>();
     world.component::<Pinned>();
     world.component::<Orphan>();
+    world.component::<Busy>();
     world.component::<Paged>();
     world.component::<ArchiveView>();
     world.component::<ArchiveAfter>().writable();
@@ -358,14 +364,84 @@ pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -
     view.set(Name { s: "Archive".into() });
     install_rule(world);
     let mut idx = Index::default();
+    // The last list and runs answers applied, as fingerprints of what reconciling reads: an answer that changes none of
+    // it is dropped, so a daemon telling the same tree again costs no frame.
+    let (mut last_list, mut last_runs) = (None::<u64>, None::<u64>);
     world.system_named::<&mut Inbox>("DaemonInbox").each_iter(move |it, _, inbox| {
         let w = it.world();
+        // Consecutive output for one session goes to its parser as one feed (the daemon sends ~1 KB frames).
+        let mut data: Option<(u64, Vec<u8>)> = None;
+        let flush = |data: &mut Option<(u64, Vec<u8>)>, idx: &mut Index, inbox: &mut Inbox| {
+            if let Some((id, bytes)) = data.take() {
+                inbox.applied = inbox.applied.wrapping_add(1);
+                apply(w, dev, idx, &parsers, Msg::Data { id, bytes });
+            }
+        };
         for msg in rx.try_iter() {
+            match msg {
+                Msg::Data { id, bytes } => {
+                    match &mut data {
+                        Some((d, buf)) if *d == id => buf.extend_from_slice(&bytes),
+                        _ => {
+                            flush(&mut data, &mut idx, inbox);
+                            data = Some((id, bytes));
+                        }
+                    }
+                    continue;
+                }
+                Msg::List(ref s) => {
+                    let f = fingerprint(s, LIST_KEYS, &[]);
+                    if last_list == Some(f) {
+                        continue;
+                    }
+                    last_list = Some(f);
+                    // Runs hang under sessions: a changed list reconciles the next runs answer too.
+                    last_runs = None;
+                }
+                Msg::Runs(ref r) => {
+                    let f = fingerprint(r, RUN_KEYS, STAGE_KEYS);
+                    if last_runs == Some(f) {
+                        continue;
+                    }
+                    last_runs = Some(f);
+                }
+                Msg::Link(_) => (last_list, last_runs) = (None, None),
+                _ => {}
+            }
+            flush(&mut data, &mut idx, inbox);
             inbox.applied = inbox.applied.wrapping_add(1);
             apply(w, dev, &mut idx, &parsers, msg);
         }
+        flush(&mut data, &mut idx, inbox);
     });
     (terms, run_terms)
+}
+
+/// The session fields [`reconcile`] reads.
+const LIST_KEYS: &[&str] = &["id", "kind", "status", "exit", "name", "title", "cwd", "created_ms", "ended_ms", "parent", "busy"];
+/// The run fields [`reconcile_runs`] reads, and each stage's.
+const RUN_KEYS: &[&str] = &["id", "status", "exit_code", "cmd", "cwd", "start_ms", "end_ms", "session", "owner"];
+const STAGE_KEYS: &[&str] = &["status", "exit_code", "text", "start_ms", "end_ms"];
+
+/// A hash of `keys` of each item (and `stage_keys` of each of its `stages`), in order.
+fn fingerprint(items: &[serde_json::Value], keys: &[&str], stage_keys: &[&str]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let field = |h: &mut std::collections::hash_map::DefaultHasher, v: &serde_json::Value, keys: &[&str]| {
+        for k in keys {
+            v[*k].to_string().hash(h);
+        }
+    };
+    for v in items {
+        field(&mut h, v, keys);
+        if !stage_keys.is_empty() {
+            for s in v["stages"].as_array().into_iter().flatten() {
+                field(&mut h, s, stage_keys);
+            }
+        }
+        0xffu8.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Milliseconds since the epoch.
@@ -700,6 +776,14 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
         let cwd = s["cwd"].as_str().unwrap_or("");
         if e.try_cloned::<&Cwd>().is_none_or(|n| n.s.as_str() != cwd) {
             e.set(Cwd { s: cwd.into() });
+        }
+        let busy = s["busy"].as_bool().unwrap_or(true);
+        if e.has(Busy::id()) != busy {
+            if busy {
+                e.add(Busy::id());
+            } else {
+                e.remove(Busy::id());
+            }
         }
         // When it ended (the daemon's `ended_ms`): where the Archive files it.
         set_times(e, s["created_ms"].as_u64(), s["ended_ms"].as_u64());

@@ -92,6 +92,9 @@ struct Store {
 
 fn dir() -> PathBuf { paths::home().join("runs") }
 
+/// Whether any run is still going (the daemon's sweep then tells `watch` clients its stages may have moved).
+pub fn any_live() -> bool { !store().live.lock().unwrap().is_empty() }
+
 fn store() -> &'static Store {
     static S: OnceLock<Store> = OnceLock::new();
     S.get_or_init(|| {
@@ -448,6 +451,7 @@ fn start(
     let (tx, rx) = watch::channel(false);
     st.live.lock().unwrap().insert(id.clone(), Arc::new(Live { pid, done: rx, name, stdin: Mutex::new(stdin_pipe) }));
     index(&id);
+    crate::daemon::changed();
     let mut err = child.stderr.take().ok_or_else(|| anyhow!("no stderr pipe"))?;
     let id2 = id.clone();
     tokio::spawn(async move {
@@ -496,6 +500,7 @@ fn start(
             archive::compact_bg(id3);
         })
         .await;
+        crate::daemon::changed();
         let _ = tx.send(true);
     });
     Ok(json!({ "id": id, "pid": pid }))
