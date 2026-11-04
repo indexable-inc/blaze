@@ -1047,6 +1047,7 @@ name = "harness-native-ui-timeline-api"
 version = "0.1.0"
 dependencies = [
  "harness-native-flecs",
+ "harness-native-ui-look-api",
  "hyperion-api-layouts",
 ]
 

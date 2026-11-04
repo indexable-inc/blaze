@@ -1,17 +1,18 @@
-// blaze's launch video: 10 seconds, 1920 by 1080 at 60 fps with sound, for X/Twitter.
+// blaze's launch video: 10 seconds, 1920 by 1080 at 60 fps with sound, for X/Twitter. The words are the post's; the video
+// is the mark alone, and starts and ends on the dark ground, so it loops.
 //
 //   cd crates/harness && cargo run --release -p harness-video -- harness-video/scene/launch.flecs blaze-launch.mp4
 //
-// One idea, told by the mark itself (harness-native-blaze, the same mark and soundtrack as indexable-inc/anim):
+// The mark (harness-native-blaze, the same mark and soundtrack as indexable-inc/anim):
 //   0.35 to 1.5   the letters drop in from the top of the frame, one by one, each landing on a note climbing A B C# E G#
-//   1.7           the fire catches from the b to the e, on A major
-//   2.9 to 6.7    what it is, in two lines under it, each glyph rising in a beat after the last
-//   7.0 to 10.0   the words go, the letters glow white hot, burn down the fire's colours and crumble into embers; what is
-//                 left where they stood is the line that installs it, typed in and highlighted
+//   1.7           the fire catches from the b to the e, on A major, and lights the ground around it; the frame starts a
+//                 slow push in
+//   6.2 to 9.2    the letters glow white hot, burn down the fire's colours and crumble into embers
+//   8.2           where they stood, where to find it, arriving hot and cooling; gone again by the end
 //
-// Motion is data: a `Cue` child moves one member of its node (`Pose.fade`, `Pose.dy`...) between two values over a stretch
-// of the clock. The `cue.*` templates below are the few moves this video makes, by name. The mark's own motion and its
-// sound come from its `BlazeMark` times.
+// Motion is data: a `Cue` child moves one member of its node (`Pose.fade`, `Pose.shrink`...) between two values over a
+// stretch of the clock. The `cue.*` templates below are the few moves this video makes, by name. The mark's own motion
+// and its sound come from its `BlazeMark` times.
 
 // ---- the moves ----
 @tree ChildOf
@@ -28,25 +29,12 @@ cue {
     prop dur: f32 = 0.45
     Cue: {member: "Pose.fade", from: 0, to: 1, at: $at, dur: $dur, ease: In}
   }
-  // Drift `by` points up out of place over `dur` from `at` (pair it with a FadeOut).
-  template Lift {
+  // Grow by `by` of its size over `dur` from `at`, slowly at both ends (a camera pushing in).
+  template PushIn {
     prop at: f32 = 0
-    prop dur: f32 = 0.45
-    prop by: f32 = -6
-    Cue: {member: "Pose.dy", from: 0, to: $by, at: $at, dur: $dur, ease: In}
-  }
-  // Type its glyphs on, evenly, over `dur` from `at`.
-  template Type {
-    prop at: f32 = 0
-    prop dur: f32 = 1
-    Cue: {member: "Pose.cut", from: 1, to: 0, at: $at, dur: $dur, ease: Linear}
-  }
-  // Rise `by` points into place over `dur` from `at` (pair it with a FadeIn).
-  template Rise {
-    prop at: f32 = 0
-    prop dur: f32 = 0.9
-    prop by: f32 = 10
-    Cue: {member: "Pose.dy", from: $by, to: 0, at: $at, dur: $dur, ease: Out}
+    prop dur: f32 = 4
+    prop by: f32 = 0.05
+    Cue: {member: "Pose.shrink", from: 0, to: 0 - $by, at: $at, dur: $dur, ease: InOut}
   }
 }
 
@@ -58,25 +46,15 @@ launch_part {
     Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Percent, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 1, min: 0, max: 0}}
   }
-  prefab Hero : ui.Words, Strong {
-    TextStyle: {size: $size_hero, line: $line_hero, code_line: 0, role: 9, bold: 0, weight: 0}
-  }
-  prefab Lead : ui.Words, Muted {
+  prefab Lead : ui.Words, Ink {
     TextStyle: {size: $size_lead, line: $line_lead, code_line: 0, role: 9, bold: 0, weight: 0}
-  }
-  prefab Code : ui.Words, Strong {
-    TextStyle: {size: $size_code, line: $line_code, code_line: 0, role: 9, bold: 0, weight: 0}
-  }
-  // Fixed room of `h` points between parts.
-  prefab Gap : ui.Node {
-    Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
   }
 }
 
 // ---- the video ----
 // The mark's timeline: its letters start falling at `drop`, and it burns away from `burn`.
 const drop = 0.35
-const burn = 7.0
+const burn = 6.2
 
 @tree ChildOf
 launch : ui.ZStack {
@@ -85,37 +63,20 @@ launch : ui.ZStack {
   Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
   Size: {w: {kind: Fixed, value: 960, min: 0, max: 0}, h: {kind: Fixed, value: 540, min: 0, max: 0}}
 
-  // The mark and what it is. Layout never changes, so the mark stands still while the words come and go under it.
-  intro : launch_part.Layer {
+  stage : launch_part.Layer {
     mark : ui.Node {
-      BlazeMark: {start: $drop, exit: $burn}
+      BlazeMark: {start: $drop, exit: $burn, glow: 0.55}
       Size: {w: {kind: Fixed, value: 43 * $mark_cell, min: 0, max: 0}, h: {kind: Fixed, value: 23 * $mark_cell, min: 0, max: 0}}
-    }
-    gap : launch_part.Gap { Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 30, min: 0, max: 0}} }
-    // Each glyph rises into place a beat after the one before it, as if the fire's heat lifted it.
-    hero : launch_part.Hero {
-      Text: {s: "Rebuild Rust in milliseconds."}
-      GlyphsIn: {at: 2.9, per: 0.028, dur: 0.7, by: 9, ease: Out}
-      cue.FadeOut leave(at: 6.7)
-      cue.Lift drift(at: 6.7)
-    }
-    gap2 : launch_part.Gap { Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}} }
-    lead : launch_part.Lead {
-      Text: {s: "Type blaze wherever you'd type cargo."}
-      GlyphsIn: {at: 4.3, per: 0.018, dur: 0.6, by: 6, ease: Out}
-      cue.FadeOut leave(at: 6.75)
-      cue.Lift drift(at: 6.75)
+      cue.PushIn push(at: 1.6, dur: 5.2, by: 0.07)
     }
   }
 
-  // What the fire leaves: the line that installs it, where the mark stood.
-  // Typed in, as at a prompt, coloured by its own grammar in the fire's colours, the caret blinking after it.
+  // Where to find it, where the mark stood: each glyph arrives hot and cools.
   outro : launch_part.Layer {
-    install : launch_part.Code {
-      Text: {s: "curl -fsSL https://ix.dev/blaze | sh"}
-      Highlight: {file: "install.sh"}
-      cue.Type typed(at: 8.45, dur: 0.75)
-      Caret: {at: 8.3, until: 10, blink: 1.0, ink: $fire_2}
+    url : launch_part.Lead {
+      Text: {s: "ix.dev/blaze"}
+      GlyphsIn: {at: 8.2, per: 0.045, dur: 0.5, by: 0, ease: Out, cool: 1.1, hot: $fire_3}
+      cue.FadeOut leave(at: 9.45, dur: 0.5)
     }
   }
 }

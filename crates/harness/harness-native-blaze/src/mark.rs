@@ -250,6 +250,19 @@ impl Blaze {
         t < DROP_START[4] + DROP_DUR + HOP
     }
 
+    /// How much light the fire gives off after the last `render`, 0 (out) to about 1 (burning well; more as it flares
+    /// on the way out): its heat summed over every cell, against a healthy fire's.
+    pub fn warmth(&self) -> f32 {
+        let lit: f32 = self.heat.iter().sum();
+        let healthy = HEAT * 0.25 * self.source.iter().filter(|s| s.is_some()).count() as f32 * 6.0;
+        lit / healthy
+    }
+
+    /// The fire's own colour, its middle one.
+    pub fn flame(&self) -> Rgb {
+        self.theme.fire[2]
+    }
+
     /// Size of a rendered frame in cells, without lead.
     pub fn cells(&self) -> (usize, usize) {
         (self.w, self.h - CROP)

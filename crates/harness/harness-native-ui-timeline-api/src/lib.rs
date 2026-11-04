@@ -69,7 +69,8 @@ pub struct Cue {
 
 /// A node's words arriving glyph by glyph: each rises `by` points into place and fades in over `dur` seconds on `ease`,
 /// glyph `i` (in reading order) starting at `at + i * per`. The paint pass reads it against the frame clock; layout keeps
-/// every glyph's room from the start, so nothing moves as they arrive.
+/// every glyph's room from the start, so nothing moves as they arrive. With `cool` above 0 each glyph arrives hot, in
+/// the `hot` ink, and cools to its own over `cool` seconds.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct GlyphsIn {
     pub at: f32,
@@ -77,15 +78,20 @@ pub struct GlyphsIn {
     pub dur: f32,
     pub by: f32,
     pub ease: Ease,
+    pub cool: f32,
+    pub hot: harness_native_ui_look_api::Rgba,
 }
 
 impl GlyphsIn {
-    /// Glyph `i`'s opacity and how far it still sits below its place (points) at frame time `time`.
+    /// Glyph `i`'s opacity, how far it still sits below its place (points), and how hot it still is (1 all `hot`, 0 its
+    /// own ink) at frame time `time`.
     #[must_use]
-    pub fn of(&self, i: usize, time: f32) -> (f32, f32) {
-        let t = (time - self.at - i as f32 * self.per) / self.dur.max(1e-6);
+    pub fn of(&self, i: usize, time: f32) -> (f32, f32, f32) {
+        let since = time - self.at - i as f32 * self.per;
+        let t = since / self.dur.max(1e-6);
         let p = self.ease.at(t);
-        (t.clamp(0.0, 1.0).powf(0.6), self.by * (1.0 - p))
+        let heat = if self.cool > 0.0 { 1.0 - Ease::InOut.at(since / self.cool) } else { 0.0 };
+        (t.clamp(0.0, 1.0).powf(0.6), self.by * (1.0 - p), heat)
     }
 }
 

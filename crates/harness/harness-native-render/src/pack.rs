@@ -145,7 +145,8 @@ pub struct SpriteInst {
 pub struct ImageInst {
     /// x, y, w, h in points.
     pub rect: [f32; 4],
-    /// The texture's width and height in texels, the opacity, 0.
+    /// The texture's width and height in texels, the opacity, then 1 to filter it smoothly (a glow) rather than fetch
+    /// texels (pixel art).
     pub size: [f32; 4],
     /// The band it shows in, as a panel's `clip` (top, foot), then how far it fades in from each (0: a hard cut).
     pub clip: [f32; 4],
