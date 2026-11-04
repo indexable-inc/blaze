@@ -13,6 +13,10 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut renderer = Renderer::new(objc2_metal::MTLCreateSystemDefaultDevice().ok_or("no Metal device")?);
     let mut app = App::new(Arc::new(|| {}))?;
     app.persist = false;
+    // HARNESS_NATIVE_GALLERY=1: the layout-vocabulary examples instead of the app's view (a 32-point title strip as inset).
+    if std::env::var_os("HARNESS_NATIVE_GALLERY").is_some() {
+        crate::gallery::load(&app, 32.0)?;
+    }
     // HARNESS_NATIVE_APPEARANCE=light: the light appearance (the window follows the system's or NSApp's).
     app.dark = std::env::var("HARNESS_NATIVE_APPEARANCE").as_deref() != Ok("light");
     if std::env::var("HARNESS_NATIVE_SIDEBAR").as_deref() == Ok("0") {

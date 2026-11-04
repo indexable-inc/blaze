@@ -3,6 +3,7 @@ mod app;
 mod atlas;
 mod boxdraw;
 mod draw;
+mod gallery;
 mod gpu;
 mod link;
 mod look;

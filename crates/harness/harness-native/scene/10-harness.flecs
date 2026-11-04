@@ -48,11 +48,12 @@ prefab hn.SideClip : ui.Column {
 }
 
 // The sidebar: the device, then its objects as a tree, clear over the vibrancy. Its top padding is the gap under the
-// title-bar strip (the host adds the strip's height).
+// title-bar strip; SafeAreaPadding adds the strip (the window's SafeAreaInset, set by the host in lay_chrome).
 prefab hn.Sidebar : ui.Column {
   Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
   Padding: {l: 10, r: 10, t: 4, b: 10}
+  SafeAreaPadding: {l: false, r: false, t: true, b: false}
 }
 
 // The sidebar's tree: one row per object, kept by key (src/view.rs). It takes the sidebar's height left over by the
@@ -60,6 +61,16 @@ prefab hn.Sidebar : ui.Column {
 prefab hn.Tree : ui.Scroll {
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+}
+
+// The selected tree row's pill: a Background under the row (src/app.rs), matched by id so a new selection's pill
+// springs from where the last one was drawn.
+prefab hn.Selection : ui.Node {
+  Background
+  MatchedGeometry: {id: "hn.selection"}
+  Fill: $tone_select
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  Motion: {omega: $pill_omega, zeta: $pill_zeta}
 }
 
 // The archive row at the sidebar's bottom: an archive box, "Archive", how many objects it holds and a chevron on hover;
@@ -166,10 +177,12 @@ prefab hn.ObjRow : ui.Row {
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
   }
   spacer : ui.Spacer {}
+  // Room goes by priority: the hover-only shortcut gives way first, then the name (ui.Lead, -1); the badge never does.
   meta : ui.Line, Faint {
+    LayoutPriority: {value: -2}
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
-  badge : hn.Badge {}
+  badge : hn.Badge { LayoutPriority: {value: 1} }
   dot : hn.Dot {}
 }
 
@@ -264,6 +277,7 @@ prefab hn.Main : ui.Row, Plate {
   Lift: {blur: $seam_blur, alpha: $seam_alpha, dy: 0}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+  SafeAreaPadding: {l: false, r: false, t: true, b: false}
 }
 
 // A pane: clear on the card's terminal ground, no header (the title bar names what it shows).
@@ -580,13 +594,13 @@ prefab hn.Theme {
   badge_on {
     Padding: {l: $badge_pad, r: $badge_pad, t: 0, b: 0}
   }
-  // Springs: a running dot's breath (dimming to Reveal's alpha0), a chevron's turn, the selection pill, the sidebar's fold.
+  // Springs: a running dot's breath (dimming to Reveal's alpha0), a chevron's turn, the sidebar's fold (the selection
+  // pill's is on hn.Selection).
   breath {
     Motion: {omega: $breath_omega, zeta: $breath_zeta}
     Reveal: {alpha0: $breath_floor, dx: 0, dy: 0, scale0: 1}
   }
   turn { Motion: {omega: $turn_omega, zeta: $turn_zeta} }
-  pill { Motion: {omega: $pill_omega, zeta: $pill_zeta} }
   sidebar { Motion: {omega: $sidebar_omega, zeta: $sidebar_zeta} }
   lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }
   // A tree row folding in or away (its height and opacity).
