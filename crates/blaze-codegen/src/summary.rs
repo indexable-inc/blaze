@@ -159,6 +159,10 @@ const CALL_LEAST: usize = 32 + 1 + 1;
 const BODY_SHIFT: u16 = 6;
 const EXTERNAL: u16 = 1 << 12;
 const FLAGS: u16 = (1 << 13) - 1;
+/// One `Attrs` set's bits: `attrs` sits below `BODY_SHIFT`, `body` from it. A new attr bit
+/// that does not fit is a compile error here; growing the flags needs `BZU2` and a new key domain.
+const ATTRS_MASK: u16 = (1 << BODY_SHIFT) - 1;
+const _: () = assert!((Attrs::NORETURN as u16) << 1 == 1 << BODY_SHIFT);
 
 /// Why bytes are not a summary: at which byte, and what was wrong there.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -288,7 +292,7 @@ impl Summary {
     /// Nothing follows. Equal summaries are equal bytes: no field is a map, every list keeps
     /// its order, and every LEB128 is written in its shortest form.
     pub fn encode(&self) -> Vec<u8> {
-        let args: usize = self.calls.iter().map(|it| 11 * it.args.len()).sum();
+        let args: usize = self.calls.iter().map(|it| 12 * it.args.len()).sum();
         let len = 4 + 32 + 3 + 10 + 15 + (CALL_LEAST + 8) * self.calls.len() + args + 32 * self.addressed.len() + 5 * self.unused.len();
         // alloc: the summary's store bytes, moved into the build's put
         let mut out = Vec::with_capacity(len);
@@ -368,7 +372,7 @@ impl Summary {
             unused.push(read_u32(&mut input)?);
         }
         input.finish()?;
-        let attrs = |shift: u16| Attrs::from_bits(((flags >> shift) & 0x3f) as u8);
+        let attrs = |shift: u16| Attrs::from_bits(((flags >> shift) & ATTRS_MASK) as u8);
         Ok(Summary {
             key,
             size,
