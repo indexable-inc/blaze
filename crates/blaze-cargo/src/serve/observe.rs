@@ -860,7 +860,7 @@ impl Observe {
 const NO_PROFILING: &str = "this daemon keeps no profile history (only `blaze serve`'s does)";
 
 /// What a blaze built without blaze-cargo's `native` feature (the seed profile, which has no
-/// C: the explorer serves through Flecs and wtransport on ring) says to the explorer and to
+/// C: the explorer serves through Flecs and blaze-http's HTTP/3 on ring) says to the explorer and to
 /// `blaze debug sql --live`'s Arrow IPC, whose encoder is the explorer's.
 #[cfg(not(feature = "native"))]
 const NO_EXPLORER: &str = "this blaze is built without blaze-cargo's `native` feature (the seed profile), so it has no \

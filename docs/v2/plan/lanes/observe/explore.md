@@ -87,15 +87,17 @@ https://ix.dev/explore#127.0.0.1:<port>/<token>/<certhash>
 The certificate is self-signed ECDSA P-256 with SHA-256, made with rcgen (the `ring` backend),
 for `127.0.0.1` and `localhost`, with the CN `blaze explore`. It is made when the server starts
 and is valid for 13 days, starting 60 s before it was made: 13 days and 60 s in all, under the
-14 days that WebTransport's `serverCertificateHashes` allows. wtransport's client checks the same
-rules (P-256, at most 14 days, now inside the validity), so the session test proves the page
-will accept it.
+14 days that WebTransport's `serverCertificateHashes` allows. blaze-http's HTTP/3 client
+(`blaze_http::h3::check_pinned`) checks the same rules (P-256, at most 14 days, now inside the
+validity), so the session test proves the page will accept it as far as those rules go; a real
+Chrome against the probe is the check of the rest (docs/v2/plan/observe/http3-sans-io.md).
 
 `cert::Rotation` is the rotation rule alone, with the time as an argument. A new certificate is
 due 12 days after the current one began, a day before it expires, or at once if the clock went
 back to before it began. The server asks every 10 minutes of the wall clock, so a machine that
 slept past the day is caught within minutes of waking. The new identity goes in with
-`Endpoint::reload_config(.., rebind: false)`: same socket, same port. A certificate that fails to
+`Driver::set_identity` (blaze-http's h3 driver): same socket, same port; open sessions keep
+theirs. A certificate that fails to
 be made is reported on the daemon's log with when the current one expires, and is tried again at
 the next check. The current one keeps being served until it expires, and is never swapped for
 anything weaker.
@@ -268,4 +270,4 @@ and read the daemon's CPU time on the `blaze-explore` thread and its blocking po
 | Tiles: `busy_ns` never exceeds the bucket, counts add up, brute-force property, column types, refusals | `tiles::tests` |
 | Certificate rotation on a virtual clock, the P-256 OIDs in the DER | `cert::tests` |
 | Each op without a transport: views, view errors, no DuckDB, ranges, `no_world` | `ops::tests` |
-| An in-process session with wtransport's client: path and origin refusals, `unauthenticated` before `hello`, `hello`, `views` as IPC, `unknown_op`, `no_world`, a live frame's layout, `bad_token` closing only its own session, the dev origin | `server::tests` |
+| An in-process session with blaze-http's h3 client (pinning the hash): path and origin refusals, `unauthenticated` before `hello`, `hello`, `views` as IPC, `unknown_op`, `no_world`, a live frame's layout, `bad_token` closing only its own session, the dev origin | `server::tests` |

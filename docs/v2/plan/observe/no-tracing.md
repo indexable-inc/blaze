@@ -559,9 +559,9 @@ it on every toolchain bump; `vendor/charon/blaze.diff` takes charon's, including
 | crate | who pulls it | action |
 |---|---|---|
 | hyper-util 0.1.21 | blaze-registry (`client-legacy`), hyper-rustls 0.27 | **dropped**, with hyper-rustls and hyper (6.1) |
-| quinn 0.11.12, quinn-proto 0.11.19 | wtransport, from blaze-explore | vendored with a patch series (6.2) |
-| quinn-udp 0.5.16 | quinn | its `tracing` feature turned off by the quinn patch; no vendor copy |
-| wtransport 0.7.2 | blaze-explore | vendored with a patch series (6.2) |
+| quinn 0.11.12, quinn-proto 0.11.19 | wtransport, from blaze-explore | quinn-proto vendored with a patch series (6.2); quinn dropped (2026-11-04: http3-sans-io.md) |
+| quinn-udp 0.5.16 | quinn | dropped with quinn |
+| wtransport 0.7.2 | blaze-explore | dropped (2026-11-04): blaze-http's h3 core drives quinn-proto (http3-sans-io.md) |
 | ra-ap-rustc_pattern_analysis 0.179.0 | hir-ty-matchck | vendored with a patch series (6.2) |
 | charon (vendor) | hir-ty-charon | `blaze.diff` (5.2) |
 
@@ -586,7 +586,8 @@ ties the client to tokio's IO traits, so an io_uring driver would be a rewrite).
 
 ### 6.2 Vendored patch series
 
-quinn, quinn-proto, wtransport and ra-ap-rustc_pattern_analysis each get `vendor/<crate>/`
+quinn-proto and ra-ap-rustc_pattern_analysis each get `vendor/<crate>/` (quinn and wtransport
+had copies too until blaze-http's h3 core replaced them, docs/v2/plan/observe/http3-sans-io.md)
 laid out as `vendor/rustc_next_trait_solver` is: `src/` is upstream at a pinned version with the
 series applied, `patches/NNNN-name.patch` one per change, `PATCHES.md` with a `### NNNN-name`
 heading per patch (what, why), `Cargo.toml.orig`, and a line under `[patch.'crates-io']` in the
@@ -671,8 +672,8 @@ disallowed-crates = [
   this build asked for. Matching is by package name, any version, any source, path packages
   included.
 - A finding names the banned package and version and the chain from a workspace member to it
-  over the lock's dependency edges (`blaze-explore -> wtransport 0.7.2 -> quinn 0.11.12 ->
-  tracing 0.1.44`), points at the member manifest's dependency line, and quotes the `reason`
+  over the lock's dependency edges (`blaze-explore -> blaze-http -> quinn-proto 0.11.19 ->
+  tracing 0.1.44`, were the patch lost), points at the member manifest's dependency line, and quotes the `reason`
   (`errors-name-the-thing`).
 - The same walk refuses a manifest that turns on `blaze-trace/trace` (2.6).
 - `crates/blaze-lints/src/conf.rs` gets a `DisallowedCrate { name, reason }` list parsed and
@@ -823,7 +824,7 @@ independent of blaze-trace and land on their own, any time.
 | lane | phase | files | what |
 |---|---|---|---|
 | T1 `http1-client` | any | `crates/blaze-http/**` (new), `crates/blaze-registry/**` | 6.1: hyper, hyper-util, hyper-rustls, http-body-util and tokio-rustls out; `HyperHttp` on blaze-http's sans-IO core and tokio driver |
-| T2 `vendor-third-party` | any | `vendor/quinn/**`, `vendor/quinn-proto/**`, `vendor/wtransport/**`, `vendor/ra-ap-rustc_pattern_analysis/**`, `tools/vendor/**` | 6.2: patch series, `sync.py`, each crate's own tests under blaze |
+| T2 `vendor-third-party` | any | `vendor/quinn-proto/**`, `vendor/ra-ap-rustc_pattern_analysis/**`, `tools/vendor/**` | 6.2: patch series, `sync.py`, each crate's own tests under blaze |
 | 0.1 `trace-core` | 0 | `crates/blaze-trace/**` (new), `crates/blaze-profile/**` | sections 1-3, 2.1 registry with `events` and `Devirt`, 3.2 ordering and its stress test, 4's read side and `child_env`, 8.1 coexistence, `testing::{capture, print_tree}`, the wasm32-wasip1 build; blaze-profile's own sites converted; files the TLSDESC issue |
 | 0.2 `trace-graph` | 0 | `crates/blaze-graph/**` except `clippy.toml` | hooks become direct `blaze_trace` calls; `WaitKind` moves out |
 | 0.3 `trace-bench` | 0 | `crates/blaze-bench/**`, `.github/workflows/bench.yaml`, `docs/benchmarks.md` | 3.4: instruction counts and budgets in `blaze_bench`, `benches/trace.rs` with ablations, the `trace` job on `bench-arm64`/`bench-x86` |
@@ -873,7 +874,7 @@ integrator cuts the release and bumps `.github/blaze-version` (7.2).
    counts `Site` statics in a `trace` build and fails at 2048.
 5. **Solver debugging.** Solver and inference authors keep their debug sites as `trace` sites and
    get the tree back with `SOLVER_DEBUG` and `--features blaze-trace/trace`.
-6. **Vendor patch upkeep.** Each bump of quinn*, wtransport or pattern_analysis replays its series
+6. **Vendor patch upkeep.** Each bump of quinn-proto or pattern_analysis replays its series
    with `tools/vendor/sync.py` and runs the crate's own tests. The lockfile ban catches a bump that
    brings tracing back.
 7. **The `log` crate stays** (cranelift, wasmtime). Out of scope; the same ban can take it later.

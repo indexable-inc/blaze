@@ -1,6 +1,8 @@
-//! blaze's HTTP/1.1 client, sans-IO: a synchronous state machine ([`Client`]) that owns no
-//! socket, runtime, thread, timer or clock, and drivers that do the IO for it (`tokio_driver`
-//! today; an io_uring driver, or one on `blaze-core`'s effects, later, with no change here).
+//! blaze's HTTP, sans-IO: the HTTP/1.1 client, a synchronous state machine ([`Client`]) that
+//! owns no socket, runtime, thread, timer or clock, and drivers that do the IO for it
+//! (`tokio_driver` today; an io_uring driver, or one on `blaze-core`'s effects, later, with no
+//! change here); and HTTP/3 with WebTransport ([`h3`]), a core of the same shape over
+//! quinn-proto with its own driver contract and tokio driver (`h3::tokio_driver`).
 //!
 //! # The core
 //!
@@ -64,6 +66,7 @@
 pub mod client;
 mod gzip;
 pub mod h1;
+pub mod h3;
 mod pool;
 pub mod roots;
 mod tls;

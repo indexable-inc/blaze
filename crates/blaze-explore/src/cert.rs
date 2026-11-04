@@ -85,8 +85,8 @@ impl Rotation {
 #[derive(Debug)]
 pub enum CertError {
     Make(rcgen::Error),
-    /// wtransport did not take what rcgen made.
-    Take(String),
+    /// rustls did not take what rcgen made.
+    Take(blaze_http::h3::Error),
 }
 
 impl std::fmt::Display for CertError {
@@ -135,14 +135,13 @@ impl Cert {
         Ok(Cert { der, key_der: key.serialize_der(), validity, hash })
     }
 
-    /// The certificate and key as wtransport serves them.
-    pub fn identity(&self) -> Result<wtransport::Identity, CertError> {
-        use wtransport::tls::{Certificate, CertificateChain, PrivateKey};
+    /// The certificate and key as blaze-http's HTTP/3 endpoint serves them, checked by building
+    /// the TLS config it will serve them with.
+    pub fn identity(&self) -> Result<blaze_http::h3::Identity, CertError> {
         // clone: once a certificate, every 12 days
-        let certificate = Certificate::from_der(self.der.clone()).map_err(|why| CertError::Take(why.to_string()))?;
-        // clone: as above
-        let key = PrivateKey::from_der_pkcs8(self.key_der.clone());
-        Ok(wtransport::Identity::new(CertificateChain::single(certificate), key))
+        let identity = blaze_http::h3::Identity { cert_der: self.der.clone(), key_der: self.key_der.clone() };
+        blaze_http::h3::server_tls(&identity).map_err(CertError::Take)?;
+        Ok(identity)
     }
 }
 
@@ -219,13 +218,20 @@ mod tests {
     }
 
     #[test]
-    fn a_certificate_is_p256_der_wtransport_takes_and_new_each_time() {
+    fn a_certificate_is_p256_der_rustls_and_the_pin_check_take_and_new_each_time() {
         let validity = Validity::starting(T0);
         let first = Cert::make(validity).unwrap();
         let second = Cert::make(validity).unwrap();
         assert_ne!(first.hash, second.hash, "a fresh key each time");
         assert_eq!(first.hash, link::certhash(&first.der));
         first.identity().unwrap();
+        // What a browser's `serverCertificateHashes` checks, through the minute after it starts
+        // and until it ends; not after.
+        let pin = [blaze_sha256::digest(&first.der)];
+        for now in [validity.not_before_s, T0, validity.not_after_s] {
+            blaze_http::h3::check_pinned(&first.der, &pin, now).unwrap_or_else(|why| panic!("at {now}: {why}"));
+        }
+        assert!(blaze_http::h3::check_pinned(&first.der, &pin, validity.not_after_s + 1).is_err());
         // The OID of id-ecPublicKey and of the P-256 curve, in the subject's public key info.
         let ec_public_key = [0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
         let p256 = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];

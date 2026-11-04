@@ -17,7 +17,10 @@ use std::{
 };
 
 use blaze_explore::cert::{Cert, Validity};
-use wtransport::{Connection, Endpoint, RecvStream, SendStream, ServerConfig, endpoint::IncomingSession};
+use blaze_http::h3::{
+    Identity, ServerConfig, Transport,
+    tokio_driver::{Driver, RecvStream, Request, SendStream, Session},
+};
 
 /// Where the probe page is published: indexable-inc/ix serves `probe/index.html` there.
 const PAGE: &str = "https://ix.dev/explore/probe";
@@ -76,33 +79,26 @@ fn run() -> Result<(), String> {
     runtime.block_on(serve(&input, identity, &cert))
 }
 
-async fn serve(input: &Input, identity: wtransport::Identity, cert: &Cert) -> Result<(), String> {
-    let config = ServerConfig::builder()
-        .with_bind_address(SocketAddr::from((Ipv4Addr::LOCALHOST, input.port)))
-        .with_identity(identity)
-        .keep_alive_interval(Some(Duration::from_secs(5)))
-        .build();
-    let endpoint = Endpoint::server(config).map_err(|why| format!("listening on 127.0.0.1:{}: {why}", input.port))?;
-    let port = endpoint.local_addr().map_err(|why| format!("the bound port: {why}"))?.port();
+async fn serve(input: &Input, identity: Identity, cert: &Cert) -> Result<(), String> {
+    let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, input.port)))
+        .map_err(|why| format!("listening on 127.0.0.1:{}: {why}", input.port))?;
+    let config = ServerConfig { identity, transport: Transport { idle: Duration::from_secs(30), keep_alive: Some(Duration::from_secs(5)) } };
+    let (driver, mut incoming) = Driver::spawn(&tokio::runtime::Handle::current(), socket, Some(config), None)
+        .map_err(|why| why.to_string())?;
+    let port = driver.local_addr().port();
     println!("{}#127.0.0.1:{port}/{}", input.page, cert.hash);
     println!("certificate valid until {} (Unix seconds); Ctrl-C stops the probe", cert.validity.not_after_s);
-    loop {
-        tokio::spawn(echo(endpoint.accept().await));
+    while let Some(request) = incoming.recv().await {
+        tokio::spawn(echo(request));
     }
+    Err("the HTTP/3 driver stopped".to_owned())
 }
 
-async fn echo(incoming: IncomingSession) {
-    let request = match incoming.await {
-        Ok(it) => it,
-        Err(why) => {
-            println!("a connection failed before its CONNECT: {why}");
-            return;
-        }
-    };
+async fn echo(request: Request) {
     println!(
         "CONNECT {} from {}: Origin {:?}, User-Agent {:?}",
         request.path(),
-        request.remote_address(),
+        request.peer(),
         request.origin(),
         request.user_agent()
     );
@@ -118,34 +114,32 @@ async fn echo(incoming: IncomingSession) {
     println!("session ended: {}", connection.closed().await);
 }
 
-async fn bidi(connection: Connection) {
+async fn bidi(connection: Session) {
     while let Ok((mut send, mut recv)) = connection.accept_bi().await {
         tokio::spawn(async move {
             let echoed = copy(&mut recv, &mut send).await;
-            _ = send.finish().await;
+            send.finish();
             println!("bidirectional stream: {echoed} bytes echoed");
         });
     }
 }
 
-async fn uni(connection: Connection) {
+async fn uni(connection: Session) {
     while let Ok(mut recv) = connection.accept_uni().await {
-        // clone: a handle (an `Arc`) of the session's connection
+        // clone: a handle (an `Arc`) of the session
         let connection = connection.clone();
         tokio::spawn(async move {
-            let Ok(opening) = connection.open_uni().await else { return };
-            let Ok(mut send) = opening.await else { return };
+            let Ok(mut send) = connection.open_uni().await else { return };
             let echoed = copy(&mut recv, &mut send).await;
-            _ = send.finish().await;
+            send.finish();
             println!("unidirectional stream: {echoed} bytes echoed on one the probe opened");
         });
     }
 }
 
-async fn datagrams(connection: Connection) {
-    while let Ok(datagram) = connection.receive_datagram().await {
-        let payload = datagram.payload();
-        match connection.send_datagram(&payload) {
+async fn datagrams(connection: Session) {
+    while let Ok(payload) = connection.receive_datagram().await {
+        match connection.send_datagram(&payload).await {
             Ok(()) => println!("datagram: {} bytes echoed", payload.len()),
             Err(why) => println!("datagram of {} bytes not echoed: {why}", payload.len()),
         }

@@ -4,10 +4,10 @@ has it), with blaze's patch series (`vendor/<crate>/PATCHES.md`) replayed on top
 (docs/v2/plan/observe/no-tracing.md, section 6.2). Run it on every bump of the crate, and with
 the current version to re-check that the tree is upstream plus the series.
 
-    uv run --frozen tools/vendor/sync.py '{"crate": "quinn", "version": "0.11.12"}'
+    uv run --frozen tools/vendor/sync.py '{"crate": "quinn-proto", "version": "0.11.19"}'
 
 Input (inline JSON, a file's path, or `-`):
-- `crate`: `quinn`, `quinn-proto`, `wtransport` or `ra-ap-rustc_pattern_analysis`.
+- `crate`: `quinn-proto` or `ra-ap-rustc_pattern_analysis`.
 - `version`: the crates.io version to move to, exactly as the index lists it.
 - `check`: true to write nothing and fail when `vendor/<crate>` (its tree or its patches) is not
   what the replay makes; false (the default) to write the result.
@@ -60,7 +60,7 @@ from typing import Literal
 from typed_input import fail, parse
 
 SCRIPT = "sync.py"
-type Crate = Literal["quinn", "quinn-proto", "wtransport", "ra-ap-rustc_pattern_analysis"]
+type Crate = Literal["quinn-proto", "ra-ap-rustc_pattern_analysis"]
 INDEX = "https://index.crates.io"
 DOWNLOAD = "https://static.crates.io/crates"
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
