@@ -83,7 +83,7 @@ int32_t glue_with(const ecs_world_t *world, ecs_id_t id, ecs_entity_t *out, int3
     return n;
 }
 
-/* Flecs past 4.1.6 (this repo's pin, vendor/flecs/SOURCE.md) has no defer mode: operations queue only on a stage and
+/* Flecs past 4.1.6 (this repo's pin is v4.2.0, SOURCE.md) has no defer mode: operations queue only on a stage and
  * apply when it is merged, and ecs_is_deferred, ecs_defer_begin and ecs_defer_end are gone. A host's Flecs (the space
  * game's 4.1.6, SPEC.md "Host worlds") still has them. EcsIdOnInstantiateCopy is new with the rename of
  * (OnInstantiate, Override) to (OnInstantiate, Copy), after the defer API went, so it tells the two apart. */

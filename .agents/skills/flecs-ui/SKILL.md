@@ -7,7 +7,8 @@ description: "Building native UI as Flecs (the harness app in crates/harness/): 
 
 General Flecs rules, traits and script syntax are in the `flecs` skill; this one is how the harness app builds UI
 with them. Paths below are relative to `crates/harness/`. The app is copied from den's native stack: flecs v4.2.0
-(the indexable-inc/flecs fork, branch `indexable/v4.2`, pinned by rev in `vendor/hyperion-flecs-c/Cargo.toml`), Metal through the
+(the indexable-inc/flecs fork, branch `indexable/v4.2`, pinned by rev in `vendor/hyperion-flecs-c/Cargo.toml`; blaze's
+`vendor/flecs-c` pins the same rev, and CI's `.github/scripts/flecs_pin.py` fails when they differ), Metal through the
 indexable-inc/slang fork (`harness-native/build.rs`), den's text shaper plus Slug outlines, libghostty-vt for terminal
 state (`harness-vt`).
 

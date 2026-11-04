@@ -76,10 +76,25 @@
     "version": "0.12.16"
    },
    {
+    "checksum": "43d5b281e737544384e969a5ccad3f1cdd24b48086a0fc1b2a5262a26b8f4f4a",
+    "dependencies": [
+     "anstyle",
+     "anstyle-parse 0.2.7",
+     "anstyle-query",
+     "anstyle-wincon",
+     "colorchoice",
+     "is_terminal_polyfill",
+     "utf8parse"
+    ],
+    "name": "anstream",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.6.21"
+   },
+   {
     "checksum": "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d",
     "dependencies": [
      "anstyle",
-     "anstyle-parse",
+     "anstyle-parse 1.0.0",
      "anstyle-query",
      "anstyle-wincon",
      "colorchoice",
@@ -95,6 +110,15 @@
     "name": "anstyle",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "1.0.14"
+   },
+   {
+    "checksum": "4e7644824f0aa2c7b9384579234ef10eb7efb6a0deb83f9630a49594dd9c15c2",
+    "dependencies": [
+     "utf8parse"
+    ],
+    "name": "anstyle-parse",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.2.7"
    },
    {
     "checksum": "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e",
@@ -341,6 +365,15 @@
     "version": "0.1.92"
    },
    {
+    "checksum": "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4",
+    "dependencies": [
+     "critical-section"
+    ],
+    "name": "atomic-polyfill",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.0.3"
+   },
+   {
     "checksum": "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0",
     "name": "atomic-waker",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -522,6 +555,7 @@
      "blaze-build-script",
      "blaze-cas",
      "blaze-codegen",
+     "blaze-codegen-code",
      "blaze-core",
      "blaze-diagnostics",
      "blaze-doc",
@@ -589,8 +623,6 @@
      "syntax",
      "tar",
      "tempfile",
-     "tikv-jemalloc-ctl",
-     "tikv-jemalloc-sys",
      "tokio",
      "toml",
      "tracing",
@@ -694,6 +726,7 @@
     "dependencies": [
      "blake3",
      "glob",
+     "serde_json",
      "toml"
     ],
     "name": "blaze-codegen-code",
@@ -755,6 +788,7 @@
      "hir-lint-levels",
      "hir-ty",
      "hir-ty-borrowck",
+     "hir-ty-print",
      "intern",
      "memchr",
      "parking_lot",
@@ -1015,7 +1049,7 @@
    {
     "dependencies": [
      "blaze-alloc-count",
-     "foldhash",
+     "foldhash 0.2.0",
      "hashbrown 0.17.1",
      "hegeltest",
      "papaya",
@@ -1084,10 +1118,21 @@
    },
    {
     "dependencies": [
-     "blaze-bytes",
      "blaze-core",
      "blaze-ids",
+     "blaze-inproc-rt",
      "blaze-mem",
+     "blaze-spin",
+     "crossbeam-channel",
+     "libc",
+     "parking_lot"
+    ],
+    "name": "blaze-inproc",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "blaze-ids",
      "blaze-radix",
      "blaze-spin",
      "crossbeam-channel",
@@ -1095,7 +1140,7 @@
      "parking_lot",
      "windows-sys 0.61.2"
     ],
-    "name": "blaze-inproc",
+    "name": "blaze-inproc-rt",
     "version": "0.0.0"
    },
    {
@@ -1292,6 +1337,7 @@
      "blaze-check",
      "blaze-ids",
      "blaze-inproc",
+     "blaze-inproc-rt",
      "blaze-sha256"
     ],
     "name": "blaze-live",
@@ -1992,6 +2038,12 @@
     "version": "1.25.2"
    },
    {
+    "checksum": "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b",
+    "name": "byteorder",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.5.0"
+   },
+   {
     "checksum": "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33",
     "name": "bytes",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -1999,9 +2051,6 @@
    },
    {
     "checksum": "bbbad30e4b4c14a39e3cc8aed085a12a327257c316619c93581e017bc52be591",
-    "dependencies": [
-     "serde_core"
-    ],
     "name": "camino",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "1.2.6"
@@ -2057,7 +2106,6 @@
    {
     "dependencies": [
      "blaze-hash",
-     "cfg",
      "expect-test",
      "hegeltest",
      "intern",
@@ -2093,6 +2141,40 @@
     "version": "0.10.2"
    },
    {
+    "dependencies": [
+     "annotate-snippets",
+     "anstream 0.6.21",
+     "anyhow",
+     "bitflags 2.13.2",
+     "clap",
+     "derive_generic_visitor",
+     "either",
+     "enum-as-inner",
+     "env_logger",
+     "hashbrown 0.15.5",
+     "index_vec",
+     "indexmap",
+     "indoc",
+     "itertools 0.13.0",
+     "nom",
+     "petgraph",
+     "postcard",
+     "rustc-hash",
+     "serde",
+     "serde_json",
+     "serde_stacker",
+     "serde_state_perfect_derive",
+     "smallvec",
+     "stacker",
+     "take_mut",
+     "tracing",
+     "tracing-subscriber",
+     "ustr"
+    ],
+    "name": "charon",
+    "version": "0.1.309"
+   },
+   {
     "checksum": "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327",
     "dependencies": [
      "iana-time-zone",
@@ -2116,7 +2198,7 @@
    {
     "checksum": "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d",
     "dependencies": [
-     "anstream",
+     "anstream 1.0.0",
      "anstyle",
      "clap_lex",
      "strsim"
@@ -2210,6 +2292,15 @@
     "name": "constant_time_eq",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.4.2"
+   },
+   {
+    "checksum": "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca",
+    "dependencies": [
+     "unicode-segmentation"
+    ],
+    "name": "convert_case",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.6.0"
    },
    {
     "checksum": "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9",
@@ -2491,6 +2582,12 @@
     "version": "1.5.0"
    },
    {
+    "checksum": "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b",
+    "name": "critical-section",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.2.0"
+   },
+   {
     "checksum": "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1",
     "dependencies": [
      "crossbeam-utils"
@@ -2592,14 +2689,38 @@
     "version": "0.2.2"
    },
    {
+    "checksum": "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee",
+    "dependencies": [
+     "darling_core 0.20.11",
+     "darling_macro 0.20.11"
+    ],
+    "name": "darling",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.20.11"
+   },
+   {
     "checksum": "ed17f5901b6630b993ca003def43f2f8ef4014fc13b047b57aad617ff32bc2ec",
     "dependencies": [
-     "darling_core",
-     "darling_macro"
+     "darling_core 0.24.1",
+     "darling_macro 0.24.1"
     ],
     "name": "darling",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.24.1"
+   },
+   {
+    "checksum": "0d00b9596d185e565c2207a0b01f8bd1a135483d02d9b7b0a54b11da8d53412e",
+    "dependencies": [
+     "fnv",
+     "ident_case",
+     "proc-macro2",
+     "quote",
+     "strsim",
+     "syn 2.0.117"
+    ],
+    "name": "darling_core",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.20.11"
    },
    {
     "checksum": "6837e2cf7485aaae18f86181d2f0e9a7ed297a025e220aeabf63fdebd3a2ddff",
@@ -2615,9 +2736,20 @@
     "version": "0.24.1"
    },
    {
+    "checksum": "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead",
+    "dependencies": [
+     "darling_core 0.20.11",
+     "quote",
+     "syn 2.0.117"
+    ],
+    "name": "darling_macro",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.20.11"
+   },
+   {
     "checksum": "2ac7135c3ef02b2f7833bbeb1be5ba7f966dcde8a87c6b87f65a778d71a02785",
     "dependencies": [
-     "darling_core",
+     "darling_core 0.24.1",
      "quote",
      "syn 3.0.9"
     ],
@@ -2718,6 +2850,30 @@
     "version": "1.6.1"
    },
    {
+    "checksum": "972dd93b5dba0d648ee42fabc3c9756b1e5732e0fe514193c0e3008013305b7e",
+    "dependencies": [
+     "derive_generic_visitor_macros",
+     "itertools 0.14.0"
+    ],
+    "name": "derive_generic_visitor",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.1.2"
+   },
+   {
+    "checksum": "079c2738859003286c4940c2f7bd50f2f6f7f7688ad53cf8e6acda2dd0a918f2",
+    "dependencies": [
+     "convert_case 0.6.0",
+     "darling 0.20.11",
+     "itertools 0.13.0",
+     "proc-macro2",
+     "quote",
+     "syn 2.0.117"
+    ],
+    "name": "derive_generic_visitor_macros",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.1.2"
+   },
+   {
     "checksum": "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134",
     "dependencies": [
      "derive_more-impl"
@@ -2729,7 +2885,7 @@
    {
     "checksum": "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb",
     "dependencies": [
-     "convert_case",
+     "convert_case 0.10.0",
      "proc-macro2",
      "quote",
      "rustc_version",
@@ -2844,6 +3000,41 @@
     "version": "0.14.4"
    },
    {
+    "checksum": "0359ee92f81184d7985519e474bda2a5738476334edd3746c9b1265c067afe70",
+    "dependencies": [
+     "heck",
+     "proc-macro2",
+     "quote",
+     "syn 2.0.117"
+    ],
+    "name": "enum-as-inner",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.7.0"
+   },
+   {
+    "checksum": "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217",
+    "dependencies": [
+     "log",
+     "regex"
+    ],
+    "name": "env_filter",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "2.0.0"
+   },
+   {
+    "checksum": "de671bd27a75a797dc9ae289ba1e77276e75e2026408aab65185384e2d5cd3f6",
+    "dependencies": [
+     "anstream 1.0.0",
+     "anstyle",
+     "env_filter",
+     "jiff",
+     "log"
+    ],
+    "name": "env_logger",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.11.11"
+   },
+   {
     "checksum": "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f",
     "name": "equivalent",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -2919,6 +3110,12 @@
     "version": "0.1.11"
    },
    {
+    "checksum": "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99",
+    "name": "fixedbitset",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.5.7"
+   },
+   {
     "checksum": "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3",
     "dependencies": [
      "bitflags 2.13.2",
@@ -2941,16 +3138,28 @@
    },
    {
     "dependencies": [
-     "cc"
+     "cc",
+     "flecs-distr"
     ],
     "name": "flecs-c",
     "version": "0.1.0"
+   },
+   {
+    "name": "flecs-distr",
+    "source": "git+https://github.com/indexable-inc/flecs?rev=ab8b8e051c6f8ac014557136c97847941bd3caa0#ab8b8e051c6f8ac014557136c97847941bd3caa0",
+    "version": "4.2.0"
    },
    {
     "checksum": "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1",
     "name": "fnv",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "1.0.7"
+   },
+   {
+    "checksum": "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2",
+    "name": "foldhash",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.1.5"
    },
    {
     "checksum": "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb",
@@ -3130,6 +3339,24 @@
     "version": "2.7.1"
    },
    {
+    "checksum": "b0c35f58762feb77d74ebe43bdbc3210f09be9fe6742234d573bacc26ed92b67",
+    "dependencies": [
+     "byteorder"
+    ],
+    "name": "hash32",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.2.1"
+   },
+   {
+    "checksum": "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1",
+    "dependencies": [
+     "foldhash 0.1.5"
+    ],
+    "name": "hashbrown",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.15.5"
+   },
+   {
     "checksum": "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100",
     "name": "hashbrown",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -3140,13 +3367,27 @@
     "dependencies": [
      "allocator-api2",
      "equivalent",
-     "foldhash",
+     "foldhash 0.2.0",
      "serde",
      "serde_core"
     ],
     "name": "hashbrown",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.17.1"
+   },
+   {
+    "checksum": "cdc6457c0eb62c71aac4bc17216026d8410337c4126773b9c5daba343f17964f",
+    "dependencies": [
+     "atomic-polyfill",
+     "hash32",
+     "rustc_version",
+     "serde",
+     "spin",
+     "stable_deref_trait"
+    ],
+    "name": "heapless",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.7.17"
    },
    {
     "checksum": "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea",
@@ -3445,6 +3686,26 @@
    {
     "dependencies": [
      "base-db",
+     "blaze-hash",
+     "blaze-query",
+     "cfg",
+     "charon",
+     "hir-def",
+     "hir-expand",
+     "hir-ty",
+     "hir-ty-mir",
+     "intern",
+     "rustc_abi",
+     "rustc_type_ir",
+     "serde_json",
+     "ustr"
+    ],
+    "name": "hir-ty-charon",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "base-db",
      "blaze-alloc-count",
      "blaze-cas",
      "blaze-codegen",
@@ -3474,6 +3735,7 @@
      "hir-ty",
      "hir-ty-identity",
      "hir-ty-mir",
+     "hir-ty-print",
      "hir-ty-share",
      "inkwell",
      "intern",
@@ -3629,6 +3891,7 @@
      "hir-expand",
      "hir-lint-levels",
      "hir-ty",
+     "hir-ty-print",
      "hir-ty-tailck",
      "intern",
      "inventory",
@@ -3657,6 +3920,25 @@
    {
     "dependencies": [
      "base-db",
+     "blaze-hash",
+     "blaze-mem",
+     "blaze-query",
+     "hir-def",
+     "hir-expand",
+     "hir-ty",
+     "intern",
+     "rustc_abi",
+     "rustc_apfloat",
+     "rustc_type_ir",
+     "smallvec",
+     "span"
+    ],
+    "name": "hir-ty-print",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "base-db",
      "blaze-alloc-count",
      "blaze-hash",
      "blaze-ids",
@@ -3669,6 +3951,7 @@
      "hir-expand",
      "hir-ty",
      "hir-ty-mir",
+     "hir-ty-print",
      "hir-ty-share",
      "intern",
      "rustc_type_ir",
@@ -3757,6 +4040,7 @@
      "hir-expand",
      "hir-ty",
      "hir-ty-mir",
+     "hir-ty-print",
      "intern",
      "rustc_abi",
      "rustc_type_ir",
@@ -4126,6 +4410,15 @@
     "version": "0.2.0"
    },
    {
+    "checksum": "44faf5bb8861a9c72e20d3fb0fdbd59233e43056e2b80475ab0aacdc2e781355",
+    "dependencies": [
+     "serde"
+    ],
+    "name": "index_vec",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.1.4"
+   },
+   {
     "checksum": "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855",
     "dependencies": [
      "equivalent",
@@ -4173,7 +4466,7 @@
    {
     "checksum": "4c3b5acc1e2fd9375041a388da33d1eb8aed5f7a8c0dd3543e3ea2805adfbe20",
     "dependencies": [
-     "darling",
+     "darling 0.24.1",
      "indoc",
      "proc-macro2",
      "quote",
@@ -4214,6 +4507,15 @@
     "version": "1.70.2"
    },
    {
+    "checksum": "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186",
+    "dependencies": [
+     "either"
+    ],
+    "name": "itertools",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.13.0"
+   },
+   {
     "checksum": "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285",
     "dependencies": [
      "either"
@@ -4244,6 +4546,7 @@
      "arrow-ipc",
      "arrow-schema",
      "blake3",
+     "blaze-inproc-rt",
      "crossbeam-queue",
      "flate2",
      "gimli",
@@ -4474,6 +4777,15 @@
     ],
     "name": "macros",
     "version": "0.0.0"
+   },
+   {
+    "checksum": "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9",
+    "dependencies": [
+     "regex-automata"
+    ],
+    "name": "matchers",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.2.0"
    },
    {
     "dependencies": [
@@ -4850,12 +5162,6 @@
     "version": "0.0.0"
    },
    {
-    "checksum": "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a",
-    "name": "paste",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "1.0.15"
-   },
-   {
     "checksum": "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3",
     "name": "pathdiff",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -4883,6 +5189,18 @@
     "name": "percent-encoding",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "2.3.2"
+   },
+   {
+    "checksum": "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455",
+    "dependencies": [
+     "fixedbitset",
+     "hashbrown 0.15.5",
+     "indexmap",
+     "serde"
+    ],
+    "name": "petgraph",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.8.3"
    },
    {
     "checksum": "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd",
@@ -4917,6 +5235,7 @@
      "cobs",
      "embedded-io 0.4.0",
      "embedded-io 0.6.1",
+     "heapless",
      "serde"
     ],
     "name": "postcard",
@@ -5770,7 +6089,7 @@
    {
     "checksum": "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6",
     "dependencies": [
-     "foldhash",
+     "foldhash 0.2.0",
      "indexmap",
      "itoa",
      "memchr",
@@ -5790,6 +6109,38 @@
     "name": "serde_spanned",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "1.1.2"
+   },
+   {
+    "checksum": "d4936375d50c4be7eff22293a9344f8e46f323ed2b3c243e52f89138d9bb0f4a",
+    "dependencies": [
+     "serde",
+     "serde_core",
+     "stacker"
+    ],
+    "name": "serde_stacker",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.1.14"
+   },
+   {
+    "checksum": "fee99988af71dac4de7dd0882da328b8089e1b0bf10c4bb68792ec7581fb0375",
+    "dependencies": [
+     "serde",
+     "serde_state_perfect_derive_derive"
+    ],
+    "name": "serde_state_perfect_derive",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.0.0"
+   },
+   {
+    "checksum": "d80d31bfa32e1e337cb392a33c11b6548c0cc888ab1054ce6661aa45f07d28fa",
+    "dependencies": [
+     "proc-macro2",
+     "quote",
+     "syn 2.0.117"
+    ],
+    "name": "serde_state_perfect_derive_derive",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.0.0"
    },
    {
     "checksum": "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214",
@@ -6023,6 +6374,15 @@
     "version": "0.0.0"
    },
    {
+    "checksum": "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e",
+    "dependencies": [
+     "lock_api"
+    ],
+    "name": "spin",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.9.9"
+   },
+   {
     "checksum": "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596",
     "name": "stable_deref_trait",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -6188,11 +6548,16 @@
      "blaze-mem",
      "blaze-spin",
      "parking_lot",
-     "serde",
      "text-size"
     ],
     "name": "syntax-tree",
     "version": "0.0.0"
+   },
+   {
+    "checksum": "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60",
+    "name": "take_mut",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.2.2"
    },
    {
     "checksum": "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840",
@@ -6223,7 +6588,7 @@
     "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd",
     "dependencies": [
      "fastrand",
-     "getrandom 0.3.4",
+     "getrandom 0.4.3",
      "once_cell",
      "rustix",
      "windows-sys 0.61.2"
@@ -6254,9 +6619,6 @@
    },
    {
     "checksum": "f18aa187839b2bdb1ad2fa35ead8c4c2976b64e4363c386d45ac0f7ee85c9233",
-    "dependencies": [
-     "serde"
-    ],
     "name": "text-size",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "1.1.1"
@@ -6295,27 +6657,6 @@
     "name": "thread_local",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "1.1.9"
-   },
-   {
-    "checksum": "3a184c43b8ab2f41df2733b55556e3f5f632f4aeaa205b1bb018f574b7f5f142",
-    "dependencies": [
-     "libc",
-     "paste",
-     "tikv-jemalloc-sys"
-    ],
-    "name": "tikv-jemalloc-ctl",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "0.7.0"
-   },
-   {
-    "checksum": "1a2825c78386b4ae0314074867860ba9577875de945f05992c38815cbec327f0",
-    "dependencies": [
-     "cc",
-     "libc"
-    ],
-    "name": "tikv-jemalloc-sys",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
    },
    {
     "checksum": "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c",
@@ -6515,9 +6856,15 @@
    {
     "checksum": "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319",
     "dependencies": [
+     "matchers",
+     "nu-ansi-term",
+     "once_cell",
+     "regex-automata",
      "sharded-slab",
+     "smallvec",
      "thread_local",
      "time",
+     "tracing",
      "tracing-core",
      "tracing-log"
     ],
@@ -6743,6 +7090,19 @@
     "name": "url",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "2.5.8"
+   },
+   {
+    "checksum": "18b19e258aa08450f93369cf56dd78063586adf19e92a75b338a800f799a0208",
+    "dependencies": [
+     "ahash",
+     "byteorder",
+     "lazy_static",
+     "parking_lot",
+     "serde"
+    ],
+    "name": "ustr",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "1.1.0"
    },
    {
     "checksum": "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be",
@@ -7710,6 +8070,9 @@
      "blaze-inproc": {
       "opt-level": 3
      },
+     "blaze-inproc-rt": {
+      "opt-level": 3
+     },
      "dissimilar": {
       "opt-level": 3
      },
@@ -7742,11 +8105,13 @@
    },
    "dist": {
     "codegen-units": 1,
+    "incremental": false,
     "inherits": "release",
     "lto": "thin"
    },
    "release": {
     "debug": 0,
+    "incremental": true,
     "package": {
      "blake3": {
       "opt-level": 3
@@ -7798,7 +8163,8 @@
      "default-features": false,
      "features": [
       "std",
-      "neon"
+      "neon",
+      "wasm32_simd"
      ],
      "version": "1.8"
     },
@@ -7886,6 +8252,9 @@
     },
     "blaze-inproc": {
      "path": "crates/blaze-inproc"
+    },
+    "blaze-inproc-rt": {
+     "path": "crates/blaze-inproc-rt"
     },
     "blaze-intent": {
      "path": "crates/blaze-intent"
@@ -8020,10 +8389,6 @@
     "cargo-platform": "0.3.3",
     "cargo-util-schemas": "=0.14.3",
     "cfg": {
-     "features": [
-      "tt",
-      "syntax"
-     ],
      "path": "crates/cfg",
      "version": "0.0.0"
     },
@@ -8126,6 +8491,10 @@
      "path": "crates/hir-ty-borrowck",
      "version": "0.0.0"
     },
+    "hir-ty-charon": {
+     "path": "crates/hir-ty-charon",
+     "version": "0.0.0"
+    },
     "hir-ty-codegen": {
      "default-features": false,
      "path": "crates/hir-ty-codegen"
@@ -8151,6 +8520,10 @@
     },
     "hir-ty-mir": {
      "path": "crates/hir-ty-mir",
+     "version": "0.0.0"
+    },
+    "hir-ty-print": {
+     "path": "crates/hir-ty-print",
      "version": "0.0.0"
     },
     "hir-ty-pure": {
@@ -8465,8 +8838,6 @@
     "text-size": "1.1.1",
     "thin-vec": "0.2.21",
     "thiserror": "2.0.18",
-    "tikv-jemalloc-ctl": "0.7.0",
-    "tikv-jemalloc-sys": "0.7.1",
     "tokio": "1.54.1",
     "toml": "1.1.8",
     "toml_edit": {
@@ -8588,6 +8959,7 @@
    },
    "exclude": [
     "crates/blaze-wasm",
+    "crates/harness",
     "demo",
     "harness",
     "library",
@@ -8603,6 +8975,7 @@
     "vendor/verus/vir_macros",
     "vendor/verus/builtin",
     "vendor/verus/vstd",
+    "vendor/charon/charon",
     "vendor/zstd-sys",
     "vendor/libzstd-rs-sys"
    ],
@@ -8930,6 +9303,23 @@
    },
    "version": "0.12.16"
   },
+  "anstream@0.6.21": {
+   "authors": "",
+   "description": "IO stream adapters for writing colored text that will gracefully degrade according to your terminal's capabilities.",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "anstream",
+   "readme": "README.md",
+   "repository": "https://github.com/rust-cli/anstyle.git",
+   "rust_version": "1.66.0",
+   "source": {
+    "checksum": "43d5b281e737544384e969a5ccad3f1cdd24b48086a0fc1b2a5262a26b8f4f4a",
+    "kind": "registry"
+   },
+   "version": "0.6.21"
+  },
   "anstream@1.0.0": {
    "authors": "",
    "description": "IO stream adapters for writing colored text that will gracefully degrade according to your terminal's capabilities.",
@@ -8946,6 +9336,23 @@
     "kind": "registry"
    },
    "version": "1.0.0"
+  },
+  "anstyle-parse@0.2.7": {
+   "authors": "",
+   "description": "Parse ANSI Style Escapes",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "anstyle-parse",
+   "readme": "README.md",
+   "repository": "https://github.com/rust-cli/anstyle.git",
+   "rust_version": "1.66.0",
+   "source": {
+    "checksum": "4e7644824f0aa2c7b9384579234ef10eb7efb6a0deb83f9630a49594dd9c15c2",
+    "kind": "registry"
+   },
+   "version": "0.2.7"
   },
   "anstyle-parse@1.0.0": {
    "authors": "",
@@ -9355,6 +9762,23 @@
    },
    "version": "0.1.92"
   },
+  "atomic-polyfill@1.0.3": {
+   "authors": "Dario Nieuwenhuis <dirbaio@dirbaio.net>",
+   "description": "Atomic polyfills, for targets where they're not available.",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "atomic-polyfill",
+   "readme": "README.md",
+   "repository": "https://github.com/embassy-rs/atomic-polyfill",
+   "rust_version": "",
+   "source": {
+    "checksum": "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4",
+    "kind": "registry"
+   },
+   "version": "1.0.3"
+  },
   "atomic-waker@1.1.2": {
    "authors": "Stjepan Glavina <stjepang@gmail.com>:Contributors to futures-rs",
    "description": "A synchronization primitive for task wakeup",
@@ -9697,7 +10121,7 @@
   },
   "blaze-codegen-code@0.0.0": {
    "authors": "blaze contributors",
-   "description": "The content identities of blaze's code generator and of its trait solver, worked out by a build script over the checkout: what stored templates and stored solver answers are keyed by",
+   "description": "The content identities of blaze's code generator and of its front end (the trait solver included), worked out by the program's build script over the checkout or a shipped tree: what stored templates and stored front-end answers are keyed by",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
@@ -10031,6 +10455,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-image",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-inproc-rt@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's dev runtime built in blaze's workspace: the run process's side of a dev run and the wire both sides share, from library/blaze_inproc_rt's source (which the standard library's build links into every dev executable)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-inproc-rt",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-inproc-rt",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -10936,6 +11377,23 @@
    },
    "version": "1.25.2"
   },
+  "byteorder@1.5.0": {
+   "authors": "Andrew Gallant <jamslam@gmail.com>",
+   "description": "Library for reading/writing numbers in big-endian and little-endian.",
+   "homepage": "https://github.com/BurntSushi/byteorder",
+   "license": "Unlicense OR MIT",
+   "license_file": "",
+   "links": null,
+   "name": "byteorder",
+   "readme": "README.md",
+   "repository": "https://github.com/BurntSushi/byteorder",
+   "rust_version": "1.60",
+   "source": {
+    "checksum": "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b",
+    "kind": "registry"
+   },
+   "version": "1.5.0"
+  },
   "bytes@1.11.1": {
    "authors": "Carl Lerche <me@carllerche.com>:Sean McArthur <sean@seanmonstar.com>",
    "description": "Types and traits for working with bytes",
@@ -11105,6 +11563,23 @@
     "kind": "registry"
    },
    "version": "0.10.2"
+  },
+  "charon@0.1.309": {
+   "authors": "Son Ho <hosonmarc@gmail.com>:Guillaume Boisseau <nadrieril+git@gmail.com>:Opale Sj\u00f6stedt <opale.sjostedt@gmail.com>:hax Authors",
+   "description": "",
+   "homepage": "",
+   "license": "Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "charon",
+   "readme": "",
+   "repository": "",
+   "rust_version": "",
+   "source": {
+    "dir": "vendor/charon/charon",
+    "kind": "path"
+   },
+   "version": "0.1.309"
   },
   "chrono@0.4.45": {
    "authors": "",
@@ -11343,6 +11818,23 @@
     "kind": "registry"
    },
    "version": "0.10.0"
+  },
+  "convert_case@0.6.0": {
+   "authors": "Rutrum <dave@rutrum.net>",
+   "description": "Convert strings into any case",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "convert_case",
+   "readme": "README.md",
+   "repository": "https://github.com/rutrum/convert-case",
+   "rust_version": "",
+   "source": {
+    "checksum": "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca",
+    "kind": "registry"
+   },
+   "version": "0.6.0"
   },
   "core-foundation-sys@0.8.7": {
    "authors": "The Servo Project Developers",
@@ -11769,6 +12261,23 @@
    },
    "version": "1.5.0"
   },
+  "critical-section@1.2.0": {
+   "authors": "",
+   "description": "Cross-platform critical section",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "critical-section",
+   "readme": "README.md",
+   "repository": "https://github.com/rust-embedded/critical-section",
+   "rust_version": "",
+   "source": {
+    "checksum": "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b",
+    "kind": "registry"
+   },
+   "version": "1.2.0"
+  },
   "crossbeam-channel@0.5.17": {
    "authors": "",
    "description": "Multi-producer multi-consumer channels for message passing",
@@ -11956,6 +12465,23 @@
    },
    "version": "0.2.2"
   },
+  "darling@0.20.11": {
+   "authors": "Ted Driggs <ted.driggs@outlook.com>",
+   "description": "A proc-macro library for reading attributes into structs when\nimplementing custom derives.\n",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "darling",
+   "readme": "README.md",
+   "repository": "https://github.com/TedDriggs/darling",
+   "rust_version": "1.56",
+   "source": {
+    "checksum": "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee",
+    "kind": "registry"
+   },
+   "version": "0.20.11"
+  },
   "darling@0.24.1": {
    "authors": "Ted Driggs <ted.driggs@outlook.com>",
    "description": "A proc-macro library for reading attributes into structs when\nimplementing custom derives.\n",
@@ -11973,6 +12499,23 @@
    },
    "version": "0.24.1"
   },
+  "darling_core@0.20.11": {
+   "authors": "Ted Driggs <ted.driggs@outlook.com>",
+   "description": "Helper crate for proc-macro library for reading attributes into structs when\nimplementing custom derives. Use https://crates.io/crates/darling in your code.\n",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "darling_core",
+   "readme": "",
+   "repository": "https://github.com/TedDriggs/darling",
+   "rust_version": "1.56",
+   "source": {
+    "checksum": "0d00b9596d185e565c2207a0b01f8bd1a135483d02d9b7b0a54b11da8d53412e",
+    "kind": "registry"
+   },
+   "version": "0.20.11"
+  },
   "darling_core@0.24.1": {
    "authors": "Ted Driggs <ted.driggs@outlook.com>",
    "description": "Helper crate for proc-macro library for reading attributes into structs when\nimplementing custom derives. Use https://crates.io/crates/darling in your code.\n",
@@ -11989,6 +12532,23 @@
     "kind": "registry"
    },
    "version": "0.24.1"
+  },
+  "darling_macro@0.20.11": {
+   "authors": "Ted Driggs <ted.driggs@outlook.com>",
+   "description": "Internal support for a proc-macro library for reading attributes into structs when\nimplementing custom derives. Use https://crates.io/crates/darling in your code.\n",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "darling_macro",
+   "readme": "",
+   "repository": "https://github.com/TedDriggs/darling",
+   "rust_version": "1.56",
+   "source": {
+    "checksum": "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead",
+    "kind": "registry"
+   },
+   "version": "0.20.11"
   },
   "darling_macro@0.24.1": {
    "authors": "Ted Driggs <ted.driggs@outlook.com>",
@@ -12159,6 +12719,40 @@
     "kind": "registry"
    },
    "version": "1.6.1"
+  },
+  "derive_generic_visitor@1.1.2": {
+   "authors": "Nadrieril <nadrieril@users.noreply.github.com>",
+   "description": "Boilerplate for building rust visitors",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "derive_generic_visitor",
+   "readme": "README.md",
+   "repository": "https://github.com/Nadrieril/derive-generic-visitor",
+   "rust_version": "",
+   "source": {
+    "checksum": "972dd93b5dba0d648ee42fabc3c9756b1e5732e0fe514193c0e3008013305b7e",
+    "kind": "registry"
+   },
+   "version": "1.1.2"
+  },
+  "derive_generic_visitor_macros@1.1.2": {
+   "authors": "Nadrieril <nadrieril@users.noreply.github.com>",
+   "description": "Macros for `derive_generic_visitor`",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "derive_generic_visitor_macros",
+   "readme": "README.md",
+   "repository": "https://github.com/Nadrieril/derive-generic-visitor",
+   "rust_version": "",
+   "source": {
+    "checksum": "079c2738859003286c4940c2f7bd50f2f6f7f7688ad53cf8e6acda2dd0a918f2",
+    "kind": "registry"
+   },
+   "version": "1.1.2"
   },
   "derive_more-impl@2.1.1": {
    "authors": "Jelte Fennema <github-tech@jeltef.nl>",
@@ -12432,6 +13026,57 @@
    },
    "version": "0.14.4"
   },
+  "enum-as-inner@0.7.0": {
+   "authors": "Benjamin Fry <benjaminfry@me.com>",
+   "description": "A proc-macro for deriving inner field accessor functions on enums.\n",
+   "homepage": "",
+   "license": "MIT/Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "enum-as-inner",
+   "readme": "README.md",
+   "repository": "https://github.com/bluejekyll/enum-as-inner",
+   "rust_version": "",
+   "source": {
+    "checksum": "0359ee92f81184d7985519e474bda2a5738476334edd3746c9b1265c067afe70",
+    "kind": "registry"
+   },
+   "version": "0.7.0"
+  },
+  "env_filter@2.0.0": {
+   "authors": "",
+   "description": "Filter log events using environment variables\n",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "env_filter",
+   "readme": "README.md",
+   "repository": "https://github.com/rust-cli/env_logger",
+   "rust_version": "1.71",
+   "source": {
+    "checksum": "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217",
+    "kind": "registry"
+   },
+   "version": "2.0.0"
+  },
+  "env_logger@0.11.11": {
+   "authors": "",
+   "description": "A logging implementation for `log` which is configured via an environment\nvariable.\n",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "env_logger",
+   "readme": "README.md",
+   "repository": "https://github.com/rust-cli/env_logger",
+   "rust_version": "1.71",
+   "source": {
+    "checksum": "de671bd27a75a797dc9ae289ba1e77276e75e2026408aab65185384e2d5cd3f6",
+    "kind": "registry"
+   },
+   "version": "0.11.11"
+  },
   "equivalent@1.0.2": {
    "authors": "",
    "description": "Traits for key comparison in maps.",
@@ -12585,6 +13230,23 @@
    },
    "version": "0.1.11"
   },
+  "fixedbitset@0.5.7": {
+   "authors": "bluss",
+   "description": "FixedBitSet is a simple bitset collection",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "fixedbitset",
+   "readme": "README.md",
+   "repository": "https://github.com/petgraph/fixedbitset",
+   "rust_version": "1.56",
+   "source": {
+    "checksum": "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99",
+    "kind": "registry"
+   },
+   "version": "0.5.7"
+  },
   "flatbuffers@25.12.19": {
    "authors": "Robert Winslow <hello@rwinslow.com>:FlatBuffers Maintainers",
    "description": "Official FlatBuffers Rust runtime library.",
@@ -12621,7 +13283,7 @@
   },
   "flecs-c@0.1.0": {
    "authors": "",
-   "description": "Flecs's amalgamated C (flecs/) built with cc, plus the declarations Rust calls it through",
+   "description": "Flecs's amalgamated C (the indexable-inc/flecs fork's, pinned below) built with cc, plus the declarations Rust calls it through",
    "homepage": "",
    "license": "MIT",
    "license_file": "",
@@ -12635,6 +13297,25 @@
     "kind": "path"
    },
    "version": "0.1.0"
+  },
+  "flecs-distr@4.2.0": {
+   "authors": "",
+   "description": "Where this fork's amalgamated flecs (distr/flecs.c, distr/flecs.h) is, for a build script that compiles it with its own defines. Builds nothing itself.",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "flecs-distr",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/flecs",
+   "rust_version": "",
+   "source": {
+    "dir": "distr",
+    "kind": "git",
+    "rev": "ab8b8e051c6f8ac014557136c97847941bd3caa0",
+    "url": "https://github.com/indexable-inc/flecs"
+   },
+   "version": "4.2.0"
   },
   "fnv@1.0.7": {
    "authors": "Alex Crichton <alex@alexcrichton.com>",
@@ -12652,6 +13333,23 @@
     "kind": "registry"
    },
    "version": "1.0.7"
+  },
+  "foldhash@0.1.5": {
+   "authors": "Orson Peters <orsonpeters@gmail.com>",
+   "description": "A fast, non-cryptographic, minimally DoS-resistant hashing algorithm.",
+   "homepage": "",
+   "license": "Zlib",
+   "license_file": "",
+   "links": null,
+   "name": "foldhash",
+   "readme": "README.md",
+   "repository": "https://github.com/orlp/foldhash",
+   "rust_version": "1.60",
+   "source": {
+    "checksum": "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2",
+    "kind": "registry"
+   },
+   "version": "0.1.5"
   },
   "foldhash@0.2.0": {
    "authors": "Orson Peters <orsonpeters@gmail.com>",
@@ -12959,6 +13657,40 @@
    },
    "version": "2.7.1"
   },
+  "hash32@0.2.1": {
+   "authors": "Jorge Aparicio <jorge@japaric.io>",
+   "description": "32-bit hashing machinery",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "hash32",
+   "readme": "README.md",
+   "repository": "https://github.com/japaric/hash32",
+   "rust_version": "",
+   "source": {
+    "checksum": "b0c35f58762feb77d74ebe43bdbc3210f09be9fe6742234d573bacc26ed92b67",
+    "kind": "registry"
+   },
+   "version": "0.2.1"
+  },
+  "hashbrown@0.15.5": {
+   "authors": "Amanieu d'Antras <amanieu@gmail.com>",
+   "description": "A Rust port of Google's SwissTable hash map",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "hashbrown",
+   "readme": "README.md",
+   "repository": "https://github.com/rust-lang/hashbrown",
+   "rust_version": "1.65.0",
+   "source": {
+    "checksum": "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1",
+    "kind": "registry"
+   },
+   "version": "0.15.5"
+  },
   "hashbrown@0.16.1": {
    "authors": "Amanieu d'Antras <amanieu@gmail.com>",
    "description": "A Rust port of Google's SwissTable hash map",
@@ -12992,6 +13724,23 @@
     "kind": "registry"
    },
    "version": "0.17.1"
+  },
+  "heapless@0.7.17": {
+   "authors": "Jorge Aparicio <jorge@japaric.io>:Per Lindgren <per.lindgren@ltu.se>:Emil Fresk <emil.fresk@gmail.com>",
+   "description": "`static` friendly data structures that don't require dynamic memory allocation",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "heapless",
+   "readme": "README.md",
+   "repository": "https://github.com/japaric/heapless",
+   "rust_version": "",
+   "source": {
+    "checksum": "cdc6457c0eb62c71aac4bc17216026d8410337c4126773b9c5daba343f17964f",
+    "kind": "registry"
+   },
+   "version": "0.7.17"
   },
   "heck@0.5.0": {
    "authors": "",
@@ -13146,6 +13895,23 @@
    },
    "version": "0.0.0"
   },
+  "hir-ty-charon@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's MIR translated into Charon's ULLBC, structured to LLBC by Charon's own passes and written as the `.llbc` JSON Aeneas reads, in place of charon-driver (no rustc).",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "hir-ty-charon",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/hir-ty-charon",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "hir-ty-codegen@0.0.0": {
    "authors": "blaze contributors",
    "description": "blaze's code generator: rust-analyzer's MIR to machine code through Cranelift, LLVM or wasm",
@@ -13278,6 +14044,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/hir-ty-mir",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "hir-ty-print@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "rustc's printing of types and definition paths: one printer, spelled for diagnostics, `type_name`, symbols or debug info.",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "hir-ty-print",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/hir-ty-print",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -13911,6 +14694,23 @@
    },
    "version": "7.0.2"
   },
+  "index_vec@0.1.4": {
+   "authors": "Thom Chiovoloni <chiovolonit@gmail.com>",
+   "description": "Newtype-style helpers for `Vec` and `usize`.",
+   "homepage": "",
+   "license": "MIT/Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "index_vec",
+   "readme": "README.md",
+   "repository": "http://github.com/thomcc/index_vec",
+   "rust_version": "",
+   "source": {
+    "checksum": "44faf5bb8861a9c72e20d3fb0fdbd59233e43056e2b80475ab0aacdc2e781355",
+    "kind": "registry"
+   },
+   "version": "0.1.4"
+  },
   "indexmap@2.14.2": {
    "authors": "",
    "description": "A hash table with consistent order and fast iteration.",
@@ -13944,6 +14744,40 @@
     "kind": "registry"
    },
    "version": "2.0.8"
+  },
+  "inkwell@0.11.0": {
+   "authors": "Daniel Kolsoi <thadan64@gmail.com>",
+   "description": "Inkwell aims to help you pen your own programming languages by safely wrapping llvm-sys.",
+   "homepage": "",
+   "license": "Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "inkwell",
+   "readme": "README.md",
+   "repository": "https://github.com/TheDan64/inkwell",
+   "rust_version": "",
+   "source": {
+    "checksum": "a8fa0d01d313de5e4f9eea445cf5f6f3e20206491aca9cf0b1e0eb5108f07cd8",
+    "kind": "registry"
+   },
+   "version": "0.11.0"
+  },
+  "inkwell_internals@0.16.0": {
+   "authors": "Daniel Kolsoi <thadan64@gmail.com>",
+   "description": "Internal macro crate for inkwell",
+   "homepage": "",
+   "license": "Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "inkwell_internals",
+   "readme": "README.md",
+   "repository": "https://github.com/TheDan64/inkwell",
+   "rust_version": "",
+   "source": {
+    "checksum": "6cd70b3f0fa226688d0daeb53f4049272c65354d1f29b169ffdfa522146ded74",
+    "kind": "registry"
+   },
+   "version": "0.16.0"
   },
   "instability@0.3.14": {
    "authors": "Stephen M. Coakley <me@stephencoakley.com>:The Ratatui Developers",
@@ -14012,6 +14846,23 @@
     "kind": "registry"
    },
    "version": "1.70.2"
+  },
+  "itertools@0.13.0": {
+   "authors": "bluss",
+   "description": "Extra iterator adaptors, iterator methods, free functions, and macros.",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "itertools",
+   "readme": "README.md",
+   "repository": "https://github.com/rust-itertools/itertools",
+   "rust_version": "1.43.1",
+   "source": {
+    "checksum": "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186",
+    "kind": "registry"
+   },
+   "version": "0.13.0"
   },
   "itertools@0.14.0": {
    "authors": "bluss",
@@ -14522,6 +15373,23 @@
     "kind": "path"
    },
    "version": "0.0.0"
+  },
+  "matchers@0.2.0": {
+   "authors": "Eliza Weisman <eliza@buoyant.io>",
+   "description": "Regex matching on character and byte streams.\n",
+   "homepage": "https://github.com/hawkw/matchers",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "matchers",
+   "readme": "README.md",
+   "repository": "https://github.com/hawkw/matchers",
+   "rust_version": "",
+   "source": {
+    "checksum": "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9",
+    "kind": "registry"
+   },
+   "version": "0.2.0"
   },
   "mbe@0.0.0": {
    "authors": "blaze contributors",
@@ -15202,6 +16070,23 @@
     "kind": "registry"
    },
    "version": "2.3.2"
+  },
+  "petgraph@0.8.3": {
+   "authors": "bluss:mitchmindtree",
+   "description": "Graph data structure library. Provides graph types and graph algorithms.",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "petgraph",
+   "readme": "README.md",
+   "repository": "https://github.com/petgraph/petgraph",
+   "rust_version": "1.64",
+   "source": {
+    "checksum": "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455",
+    "kind": "registry"
+   },
+   "version": "0.8.3"
   },
   "pin-project-lite@0.2.17": {
    "authors": "",
@@ -16682,6 +17567,57 @@
    },
    "version": "1.1.2"
   },
+  "serde_stacker@0.1.14": {
+   "authors": "David Tolnay <dtolnay@gmail.com>",
+   "description": "Serde adapter that avoids stack overflow by dynamically growing the stack",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "serde_stacker",
+   "readme": "README.md",
+   "repository": "https://github.com/dtolnay/serde-stacker",
+   "rust_version": "1.67",
+   "source": {
+    "checksum": "d4936375d50c4be7eff22293a9344f8e46f323ed2b3c243e52f89138d9bb0f4a",
+    "kind": "registry"
+   },
+   "version": "0.1.14"
+  },
+  "serde_state_perfect_derive@1.0.0": {
+   "authors": "Guillaume Boisseau <nadrieril+git@gmail.com>",
+   "description": "Stateful serde serialization and deserialization with perfect derive",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "serde_state_perfect_derive",
+   "readme": "README.md",
+   "repository": "https://github.com/Nadrieril/serde_state",
+   "rust_version": "",
+   "source": {
+    "checksum": "fee99988af71dac4de7dd0882da328b8089e1b0bf10c4bb68792ec7581fb0375",
+    "kind": "registry"
+   },
+   "version": "1.0.0"
+  },
+  "serde_state_perfect_derive_derive@1.0.0": {
+   "authors": "Guillaume Boisseau <nadrieril+git@gmail.com>",
+   "description": "Derive macros for serde_state_perfect_derive",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "serde_state_perfect_derive_derive",
+   "readme": "README.md",
+   "repository": "https://github.com/Nadrieril/serde_state",
+   "rust_version": "",
+   "source": {
+    "checksum": "d80d31bfa32e1e337cb392a33c11b6548c0cc888ab1054ce6661aa45f07d28fa",
+    "kind": "registry"
+   },
+   "version": "1.0.0"
+  },
   "sha1@0.11.0": {
    "authors": "RustCrypto Developers",
    "description": "SHA-1 hash function",
@@ -17090,6 +18026,23 @@
    },
    "version": "0.0.0"
   },
+  "spin@0.9.9": {
+   "authors": "Mathijs van de Nes <git@mathijs.vd-nes.nl>:John Ericson <git@JohnEricson.me>:Joshua Barretto <joshua.s.barretto@gmail.com>",
+   "description": "Spin-based synchronization primitives",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "spin",
+   "readme": "README.md",
+   "repository": "https://github.com/mvdnes/spin-rs.git",
+   "rust_version": "1.38",
+   "source": {
+    "checksum": "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e",
+    "kind": "registry"
+   },
+   "version": "0.9.9"
+  },
   "stable_deref_trait@1.2.1": {
    "authors": "Robert Grosse <n210241048576@gmail.com>",
    "description": "An unsafe marker trait for types like Box and Rc that dereference to a stable address even when moved, and hence can be used with libraries such as owning_ref and rental.\n",
@@ -17344,6 +18297,23 @@
     "kind": "path"
    },
    "version": "0.0.0"
+  },
+  "take_mut@0.2.2": {
+   "authors": "Sgeo <sgeoster@gmail.com>",
+   "description": "Take a T from a &mut T temporarily",
+   "homepage": "https://github.com/Sgeo/take_mut",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "take_mut",
+   "readme": "README.md",
+   "repository": "https://github.com/Sgeo/take_mut",
+   "rust_version": "",
+   "source": {
+    "checksum": "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60",
+    "kind": "registry"
+   },
+   "version": "0.2.2"
   },
   "tar@0.4.46": {
    "authors": "Alex Crichton <alex@alexcrichton.com>",
@@ -18313,6 +19283,23 @@
     "kind": "registry"
    },
    "version": "2.5.8"
+  },
+  "ustr@1.1.0": {
+   "authors": "Anders Langlands <anderslanglands@gmail.com>",
+   "description": "Fast, FFI-friendly string interning.",
+   "homepage": "",
+   "license": "BSD-2-Clause-Patent",
+   "license_file": "",
+   "links": null,
+   "name": "ustr",
+   "readme": "README.md",
+   "repository": "https://github.com/anderslanglands/ustr",
+   "rust_version": "",
+   "source": {
+    "checksum": "18b19e258aa08450f93369cf56dd78063586adf19e92a75b338a800f799a0208",
+    "kind": "registry"
+   },
+   "version": "1.1.0"
   },
   "utf8_iter@1.0.4": {
    "authors": "Henri Sivonen <hsivonen@hsivonen.fi>",
@@ -20866,9 +21853,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "base-db@0.0.0",
@@ -21132,7 +22117,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -21160,7 +22146,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -21188,7 +22175,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -21228,7 +22216,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -21268,7 +22257,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -21458,13 +22448,7 @@
      "deps": [],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -21495,13 +22479,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -21840,13 +22818,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "lib",
      "mode": "build",
@@ -21946,6 +22918,10 @@
       {
        "name": "glob",
        "unit": "glob@0.3.4 lib glob build host"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.154 lib serde_json build host"
       },
       {
        "name": "toml",
@@ -22222,6 +23198,10 @@
       {
        "name": "hir_ty_borrowck",
        "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
        "name": "hir_ty",
@@ -22524,14 +23504,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "bin",
      "mode": "build",
@@ -22670,14 +23644,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "bin",
      "mode": "build",
@@ -22704,14 +23672,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -22742,14 +23704,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -22884,14 +23840,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "lib",
      "mode": "build",
@@ -23602,32 +24552,49 @@
      "src": "src/lib.rs",
      "target": "blaze_image"
     },
+    "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc-rt@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "../../library/blaze_inproc_rt/src/lib.rs",
+     "target": "blaze_inproc_rt"
+    },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
-      },
-      {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "parking_lot",
@@ -24011,8 +24978,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "llvm-stencils"
+      "daemon"
      ],
      "kind": "lib",
      "mode": "build",
@@ -24106,9 +25072,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "llvm-stencils"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-link@0.0.0",
@@ -24313,6 +25277,10 @@
     "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
+      },
       {
        "name": "blaze_inproc",
        "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
@@ -25900,9 +26868,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "query"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-units@0.0.0",
@@ -26773,11 +27739,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default",
-      "syntax",
-      "tt"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "cfg@0.0.0",
@@ -29571,6 +30533,10 @@
       {
        "name": "cc",
        "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "flecs_distr",
+       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
       }
      ],
      "edition": "2024",
@@ -29645,6 +30611,26 @@
      },
      "src": "src/lib.rs",
      "target": "flecs_c"
+    },
+    "flecs-distr@4.2.0 lib flecs_distr build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-distr@4.2.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "flecs_distr"
     },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
@@ -30916,12 +31902,20 @@
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty_share",
        "unit": "hir-ty-share@0.0.0 lib hir_ty_share build"
       },
       {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "inkwell",
+       "unit": "inkwell@0.11.0 lib inkwell build"
       },
       {
        "name": "intern",
@@ -31010,7 +32004,7 @@
      ],
      "edition": "2024",
      "features": [
-      "llvm-stencils"
+      "llvm"
      ],
      "kind": "lib",
      "mode": "build",
@@ -31372,6 +32366,10 @@
        "unit": "hir-lint-levels@0.0.0 lib hir_lint_levels build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty_tailck",
        "unit": "hir-ty-tailck@0.0.0 lib hir_ty_tailck build"
       },
@@ -31469,6 +32467,79 @@
      "src": "src/lib.rs",
      "target": "hir_ty_mir"
     },
+    "hir-ty-print@0.0.0 lib hir_ty_print build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_apfloat",
+       "unit": "rustc_apfloat@0.2.3+llvm-462a31f5a5ab lib rustc_apfloat build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "smallvec",
+       "unit": "smallvec@1.16.4 lib smallvec build"
+      },
+      {
+       "name": "span",
+       "unit": "span@0.0.0 lib span build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-print@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_print"
+    },
     "hir-ty-pure@0.0.0 lib hir_ty_pure build": {
      "crate_type": "lib",
      "deps": [
@@ -31515,6 +32586,10 @@
       {
        "name": "hir_ty_mir",
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
        "name": "hir_ty_share",
@@ -31834,6 +32909,10 @@
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -31993,56 +33072,6 @@
      "src": "src/lib.rs",
      "target": "hir_ty_wfcheck"
     },
-    "hir-ty@0.0.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "blaze_codegen_code",
-       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "hir-ty@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "hir-ty@0.0.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "hir-ty@0.0.0 custom-build build-script-build build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "hir-ty@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "hir-ty@0.0.0 lib hir_ty build": {
      "crate_type": "lib",
      "deps": [
@@ -32133,10 +33162,6 @@
       {
        "name": "hir_ty_comptime",
        "unit": "hir-ty-comptime@0.0.0 lib hir_ty_comptime build"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "hir-ty@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "indexmap",
@@ -33476,6 +34501,154 @@
      "src": "src/lib.rs",
      "target": "indoc"
     },
+    "inkwell@0.11.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "inkwell@0.11.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "inkwell@0.11.0 custom-build build-script-build build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "inkwell@0.11.0 lib inkwell build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "inkwell@0.11.0 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "inkwell_internals",
+       "unit": "inkwell_internals@0.16.0 proc-macro inkwell_internals build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "llvm_sys_231",
+       "unit": "llvm-sys@231.0.1 lib llvm_sys build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "inkwell"
+    },
+    "inkwell_internals@0.16.0 proc-macro inkwell_internals build host": {
+     "crate_type": "proc-macro",
+     "deps": [
+      {
+       "name": "proc_macro2",
+       "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
+      },
+      {
+       "name": "quote",
+       "unit": "quote@1.0.47 lib quote build host"
+      },
+      {
+       "name": "syn",
+       "unit": "syn@3.0.9 lib syn build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "proc-macro",
+     "mode": "build",
+     "pkg": "inkwell_internals@0.16.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "inkwell_internals"
+    },
     "instability@0.3.14 proc-macro instability build host": {
      "crate_type": "proc-macro",
      "deps": [
@@ -33664,6 +34837,26 @@
      "src": "src/lib.rs",
      "target": "itoa"
     },
+    "itoa@1.0.18 lib itoa build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "itoa@1.0.18",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "itoa"
+    },
     "ix-prof@0.0.0 lib ix_prof build": {
      "crate_type": "lib",
      "deps": [
@@ -33686,6 +34879,10 @@
       {
        "name": "blake3",
        "unit": "blake3@1.8.7 lib blake3 build"
+      },
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "crossbeam_queue",
@@ -34388,7 +35585,7 @@
      "src": "src/lib.rs",
      "target": "litrs"
     },
-    "llvm-sys@231.0.1 custom-build build-script-build build host": {
+    "llvm-sys@231.0.1 custom-build build-script-build build host features=-": {
      "crate_type": "bin",
      "deps": [
       {
@@ -34421,12 +35618,74 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "llvm-sys@231.0.1 custom-build build-script-build build host features=prefer-static": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build host"
+      },
+      {
+       "name": "cc",
+       "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "lazy_static",
+       "unit": "lazy_static@1.5.0 lib lazy_static build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "llvm-sys@231.0.1 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host features=prefer-static"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "llvm-sys@231.0.1 custom-build build-script-build run-custom-build host": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host"
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host features=-"
       }
      ],
      "edition": "2021",
@@ -34445,6 +35704,37 @@
      },
      "src": "build.rs",
      "target": "build-script-build"
+    },
+    "llvm-sys@231.0.1 lib llvm_sys build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "llvm_sys"
     },
     "llvm-sys@231.0.1 lib llvm_sys build host": {
      "crate_type": "lib",
@@ -36169,9 +37459,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "parser@0.0.0",
@@ -39828,6 +41116,34 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde_json@1.0.154 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_json@1.0.154 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde_json@1.0.154",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde_json@1.0.154 lib serde_json build": {
      "crate_type": "lib",
      "deps": [
@@ -39866,6 +41182,50 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_json"
+    },
+    "serde_json@1.0.154 lib serde_json build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "itoa",
+       "unit": "itoa@1.0.18 lib itoa build host"
+      },
+      {
+       "name": "memchr",
+       "unit": "memchr@2.8.3 lib memchr build host"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "serde_json@1.0.154 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "zmij",
+       "unit": "zmij@1.0.21 lib zmij build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_json@1.0.154",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -40595,10 +41955,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default",
-      "query"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "span@0.0.0",
@@ -40958,6 +42315,7 @@
       "default",
       "derive",
       "extra-traits",
+      "fold",
       "full",
       "parsing",
       "printing",
@@ -41186,9 +42544,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "syntax@0.0.0",
@@ -44808,6 +46164,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zmij@1.0.21 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.21 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zmij@1.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zmij@1.0.21 lib zmij build": {
      "crate_type": "lib",
      "deps": [
@@ -44827,6 +46208,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zmij"
+    },
+    "zmij@1.0.21 lib zmij build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.21 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zmij@1.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -46149,9 +47555,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "base-db@0.0.0",
@@ -46415,7 +47819,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -46443,7 +47848,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -46471,7 +47877,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -46511,7 +47918,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -46551,7 +47959,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -46741,13 +48150,7 @@
      "deps": [],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -46778,13 +48181,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -47123,13 +48520,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "lib",
      "mode": "build",
@@ -47229,6 +48620,10 @@
       {
        "name": "glob",
        "unit": "glob@0.3.4 lib glob build host"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.154 lib serde_json build host"
       },
       {
        "name": "toml",
@@ -47505,6 +48900,10 @@
       {
        "name": "hir_ty_borrowck",
        "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
        "name": "hir_ty",
@@ -47807,14 +49206,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "bin",
      "mode": "build",
@@ -47953,14 +49346,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "bin",
      "mode": "build",
@@ -47987,14 +49374,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -48025,14 +49406,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -48167,14 +49542,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "lib",
      "mode": "build",
@@ -48885,32 +50254,49 @@
      "src": "src/lib.rs",
      "target": "blaze_image"
     },
+    "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc-rt@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "../../library/blaze_inproc_rt/src/lib.rs",
+     "target": "blaze_inproc_rt"
+    },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
-      },
-      {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "parking_lot",
@@ -49294,8 +50680,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "llvm-stencils"
+      "daemon"
      ],
      "kind": "lib",
      "mode": "build",
@@ -49389,9 +50774,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "llvm-stencils"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-link@0.0.0",
@@ -49596,6 +50979,10 @@
     "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
+      },
       {
        "name": "blaze_inproc",
        "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
@@ -51183,9 +52570,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "query"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-units@0.0.0",
@@ -52056,11 +53441,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default",
-      "syntax",
-      "tt"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "cfg@0.0.0",
@@ -54795,6 +56176,10 @@
       {
        "name": "cc",
        "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "flecs_distr",
+       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
       }
      ],
      "edition": "2024",
@@ -54869,6 +56254,26 @@
      },
      "src": "src/lib.rs",
      "target": "flecs_c"
+    },
+    "flecs-distr@4.2.0 lib flecs_distr build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-distr@4.2.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "flecs_distr"
     },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
@@ -56140,12 +57545,20 @@
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty_share",
        "unit": "hir-ty-share@0.0.0 lib hir_ty_share build"
       },
       {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "inkwell",
+       "unit": "inkwell@0.11.0 lib inkwell build"
       },
       {
        "name": "intern",
@@ -56234,7 +57647,7 @@
      ],
      "edition": "2024",
      "features": [
-      "llvm-stencils"
+      "llvm"
      ],
      "kind": "lib",
      "mode": "build",
@@ -56596,6 +58009,10 @@
        "unit": "hir-lint-levels@0.0.0 lib hir_lint_levels build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty_tailck",
        "unit": "hir-ty-tailck@0.0.0 lib hir_ty_tailck build"
       },
@@ -56693,6 +58110,79 @@
      "src": "src/lib.rs",
      "target": "hir_ty_mir"
     },
+    "hir-ty-print@0.0.0 lib hir_ty_print build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_apfloat",
+       "unit": "rustc_apfloat@0.2.3+llvm-462a31f5a5ab lib rustc_apfloat build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "smallvec",
+       "unit": "smallvec@1.16.4 lib smallvec build"
+      },
+      {
+       "name": "span",
+       "unit": "span@0.0.0 lib span build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-print@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_print"
+    },
     "hir-ty-pure@0.0.0 lib hir_ty_pure build": {
      "crate_type": "lib",
      "deps": [
@@ -56739,6 +58229,10 @@
       {
        "name": "hir_ty_mir",
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
        "name": "hir_ty_share",
@@ -57058,6 +58552,10 @@
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -57217,56 +58715,6 @@
      "src": "src/lib.rs",
      "target": "hir_ty_wfcheck"
     },
-    "hir-ty@0.0.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "blaze_codegen_code",
-       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "hir-ty@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "hir-ty@0.0.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "hir-ty@0.0.0 custom-build build-script-build build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "hir-ty@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "hir-ty@0.0.0 lib hir_ty build": {
      "crate_type": "lib",
      "deps": [
@@ -57357,10 +58805,6 @@
       {
        "name": "hir_ty_comptime",
        "unit": "hir-ty-comptime@0.0.0 lib hir_ty_comptime build"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "hir-ty@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "indexmap",
@@ -58695,6 +60139,154 @@
      "src": "src/lib.rs",
      "target": "indoc"
     },
+    "inkwell@0.11.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "inkwell@0.11.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "inkwell@0.11.0 custom-build build-script-build build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "inkwell@0.11.0 lib inkwell build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "inkwell@0.11.0 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "inkwell_internals",
+       "unit": "inkwell_internals@0.16.0 proc-macro inkwell_internals build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "llvm_sys_231",
+       "unit": "llvm-sys@231.0.1 lib llvm_sys build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "inkwell"
+    },
+    "inkwell_internals@0.16.0 proc-macro inkwell_internals build host": {
+     "crate_type": "proc-macro",
+     "deps": [
+      {
+       "name": "proc_macro2",
+       "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
+      },
+      {
+       "name": "quote",
+       "unit": "quote@1.0.47 lib quote build host"
+      },
+      {
+       "name": "syn",
+       "unit": "syn@3.0.9 lib syn build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "proc-macro",
+     "mode": "build",
+     "pkg": "inkwell_internals@0.16.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "inkwell_internals"
+    },
     "instability@0.3.14 proc-macro instability build host": {
      "crate_type": "proc-macro",
      "deps": [
@@ -58883,6 +60475,26 @@
      "src": "src/lib.rs",
      "target": "itoa"
     },
+    "itoa@1.0.18 lib itoa build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "itoa@1.0.18",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "itoa"
+    },
     "ix-prof@0.0.0 lib ix_prof build": {
      "crate_type": "lib",
      "deps": [
@@ -58905,6 +60517,10 @@
       {
        "name": "blake3",
        "unit": "blake3@1.8.7 lib blake3 build"
+      },
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "crossbeam_queue",
@@ -59608,7 +61224,7 @@
      "src": "src/lib.rs",
      "target": "litrs"
     },
-    "llvm-sys@231.0.1 custom-build build-script-build build host": {
+    "llvm-sys@231.0.1 custom-build build-script-build build host features=-": {
      "crate_type": "bin",
      "deps": [
       {
@@ -59641,12 +61257,74 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "llvm-sys@231.0.1 custom-build build-script-build build host features=prefer-static": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build host"
+      },
+      {
+       "name": "cc",
+       "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "lazy_static",
+       "unit": "lazy_static@1.5.0 lib lazy_static build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "llvm-sys@231.0.1 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host features=prefer-static"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "llvm-sys@231.0.1 custom-build build-script-build run-custom-build host": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host"
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host features=-"
       }
      ],
      "edition": "2021",
@@ -59665,6 +61343,37 @@
      },
      "src": "build.rs",
      "target": "build-script-build"
+    },
+    "llvm-sys@231.0.1 lib llvm_sys build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "llvm_sys"
     },
     "llvm-sys@231.0.1 lib llvm_sys build host": {
      "crate_type": "lib",
@@ -61314,9 +63023,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "parser@0.0.0",
@@ -64894,6 +66601,34 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde_json@1.0.154 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_json@1.0.154 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde_json@1.0.154",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde_json@1.0.154 lib serde_json build": {
      "crate_type": "lib",
      "deps": [
@@ -64932,6 +66667,50 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_json"
+    },
+    "serde_json@1.0.154 lib serde_json build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "itoa",
+       "unit": "itoa@1.0.18 lib itoa build host"
+      },
+      {
+       "name": "memchr",
+       "unit": "memchr@2.8.3 lib memchr build host"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "serde_json@1.0.154 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "zmij",
+       "unit": "zmij@1.0.21 lib zmij build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_json@1.0.154",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -65661,10 +67440,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default",
-      "query"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "span@0.0.0",
@@ -66024,6 +67800,7 @@
       "default",
       "derive",
       "extra-traits",
+      "fold",
       "full",
       "parsing",
       "printing",
@@ -66252,9 +68029,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "syntax@0.0.0",
@@ -69874,6 +71649,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zmij@1.0.21 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.21 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zmij@1.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zmij@1.0.21 lib zmij build": {
      "crate_type": "lib",
      "deps": [
@@ -69893,6 +71693,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zmij"
+    },
+    "zmij@1.0.21 lib zmij build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.21 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zmij@1.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -71215,9 +73040,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "base-db@0.0.0",
@@ -71411,7 +73234,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -71439,7 +73263,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -71467,7 +73292,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -71511,7 +73337,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -71551,7 +73378,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -71741,13 +73569,7 @@
      "deps": [],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -71778,13 +73600,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -72123,13 +73939,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "lib",
      "mode": "build",
@@ -72229,6 +74039,10 @@
       {
        "name": "glob",
        "unit": "glob@0.3.4 lib glob build host"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.154 lib serde_json build host"
       },
       {
        "name": "toml",
@@ -72505,6 +74319,10 @@
       {
        "name": "hir_ty_borrowck",
        "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
        "name": "hir_ty",
@@ -72807,14 +74625,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "bin",
      "mode": "build",
@@ -72953,14 +74765,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "bin",
      "mode": "build",
@@ -72987,14 +74793,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -73025,14 +74825,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -73167,14 +74961,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "lib",
      "mode": "build",
@@ -73881,32 +75669,49 @@
      "src": "src/lib.rs",
      "target": "blaze_image"
     },
+    "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc-rt@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "../../library/blaze_inproc_rt/src/lib.rs",
+     "target": "blaze_inproc_rt"
+    },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
-      },
-      {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "parking_lot",
@@ -74290,8 +76095,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "llvm-stencils"
+      "daemon"
      ],
      "kind": "lib",
      "mode": "build",
@@ -74385,9 +76189,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "llvm-stencils"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-link@0.0.0",
@@ -74592,6 +76394,10 @@
     "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
+      },
       {
        "name": "blaze_inproc",
        "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
@@ -76179,9 +77985,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "query"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-units@0.0.0",
@@ -77052,11 +78856,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default",
-      "syntax",
-      "tt"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "cfg@0.0.0",
@@ -79840,6 +81640,10 @@
       {
        "name": "cc",
        "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "flecs_distr",
+       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
       }
      ],
      "edition": "2024",
@@ -79914,6 +81718,26 @@
      },
      "src": "src/lib.rs",
      "target": "flecs_c"
+    },
+    "flecs-distr@4.2.0 lib flecs_distr build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-distr@4.2.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "flecs_distr"
     },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
@@ -81185,12 +83009,20 @@
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty_share",
        "unit": "hir-ty-share@0.0.0 lib hir_ty_share build"
       },
       {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "inkwell",
+       "unit": "inkwell@0.11.0 lib inkwell build"
       },
       {
        "name": "intern",
@@ -81279,7 +83111,7 @@
      ],
      "edition": "2024",
      "features": [
-      "llvm-stencils"
+      "llvm"
      ],
      "kind": "lib",
      "mode": "build",
@@ -81641,6 +83473,10 @@
        "unit": "hir-lint-levels@0.0.0 lib hir_lint_levels build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty_tailck",
        "unit": "hir-ty-tailck@0.0.0 lib hir_ty_tailck build"
       },
@@ -81738,6 +83574,79 @@
      "src": "src/lib.rs",
      "target": "hir_ty_mir"
     },
+    "hir-ty-print@0.0.0 lib hir_ty_print build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_apfloat",
+       "unit": "rustc_apfloat@0.2.3+llvm-462a31f5a5ab lib rustc_apfloat build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "smallvec",
+       "unit": "smallvec@1.16.4 lib smallvec build"
+      },
+      {
+       "name": "span",
+       "unit": "span@0.0.0 lib span build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-print@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_print"
+    },
     "hir-ty-pure@0.0.0 lib hir_ty_pure build": {
      "crate_type": "lib",
      "deps": [
@@ -81784,6 +83693,10 @@
       {
        "name": "hir_ty_mir",
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
        "name": "hir_ty_share",
@@ -82103,6 +84016,10 @@
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -82262,56 +84179,6 @@
      "src": "src/lib.rs",
      "target": "hir_ty_wfcheck"
     },
-    "hir-ty@0.0.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "blaze_codegen_code",
-       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "hir-ty@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "hir-ty@0.0.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "hir-ty@0.0.0 custom-build build-script-build build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "hir-ty@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "hir-ty@0.0.0 lib hir_ty build": {
      "crate_type": "lib",
      "deps": [
@@ -82402,10 +84269,6 @@
       {
        "name": "hir_ty_comptime",
        "unit": "hir-ty-comptime@0.0.0 lib hir_ty_comptime build"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "hir-ty@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "indexmap",
@@ -83745,6 +85608,154 @@
      "src": "src/lib.rs",
      "target": "indoc"
     },
+    "inkwell@0.11.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "inkwell@0.11.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "inkwell@0.11.0 custom-build build-script-build build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "inkwell@0.11.0 lib inkwell build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "inkwell@0.11.0 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "inkwell_internals",
+       "unit": "inkwell_internals@0.16.0 proc-macro inkwell_internals build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "llvm_sys_231",
+       "unit": "llvm-sys@231.0.1 lib llvm_sys build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "inkwell"
+    },
+    "inkwell_internals@0.16.0 proc-macro inkwell_internals build host": {
+     "crate_type": "proc-macro",
+     "deps": [
+      {
+       "name": "proc_macro2",
+       "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
+      },
+      {
+       "name": "quote",
+       "unit": "quote@1.0.47 lib quote build host"
+      },
+      {
+       "name": "syn",
+       "unit": "syn@3.0.9 lib syn build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "proc-macro",
+     "mode": "build",
+     "pkg": "inkwell_internals@0.16.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "inkwell_internals"
+    },
     "instability@0.3.14 proc-macro instability build host": {
      "crate_type": "proc-macro",
      "deps": [
@@ -83933,6 +85944,26 @@
      "src": "src/lib.rs",
      "target": "itoa"
     },
+    "itoa@1.0.18 lib itoa build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "itoa@1.0.18",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "itoa"
+    },
     "ix-prof@0.0.0 lib ix_prof build": {
      "crate_type": "lib",
      "deps": [
@@ -83955,6 +85986,10 @@
       {
        "name": "blake3",
        "unit": "blake3@1.8.7 lib blake3 build"
+      },
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "crossbeam_queue",
@@ -84657,7 +86692,7 @@
      "src": "src/lib.rs",
      "target": "litrs"
     },
-    "llvm-sys@231.0.1 custom-build build-script-build build host": {
+    "llvm-sys@231.0.1 custom-build build-script-build build host features=-": {
      "crate_type": "bin",
      "deps": [
       {
@@ -84690,12 +86725,74 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "llvm-sys@231.0.1 custom-build build-script-build build host features=prefer-static": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build host"
+      },
+      {
+       "name": "cc",
+       "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "lazy_static",
+       "unit": "lazy_static@1.5.0 lib lazy_static build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "llvm-sys@231.0.1 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host features=prefer-static"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "llvm-sys@231.0.1 custom-build build-script-build run-custom-build host": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host"
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host features=-"
       }
      ],
      "edition": "2021",
@@ -84714,6 +86811,37 @@
      },
      "src": "build.rs",
      "target": "build-script-build"
+    },
+    "llvm-sys@231.0.1 lib llvm_sys build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "llvm_sys"
     },
     "llvm-sys@231.0.1 lib llvm_sys build host": {
      "crate_type": "lib",
@@ -86438,9 +88566,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "parser@0.0.0",
@@ -90093,6 +92219,34 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde_json@1.0.154 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_json@1.0.154 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde_json@1.0.154",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde_json@1.0.154 lib serde_json build": {
      "crate_type": "lib",
      "deps": [
@@ -90131,6 +92285,50 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_json"
+    },
+    "serde_json@1.0.154 lib serde_json build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "itoa",
+       "unit": "itoa@1.0.18 lib itoa build host"
+      },
+      {
+       "name": "memchr",
+       "unit": "memchr@2.8.3 lib memchr build host"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "serde_json@1.0.154 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "zmij",
+       "unit": "zmij@1.0.21 lib zmij build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_json@1.0.154",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -90860,10 +93058,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default",
-      "query"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "span@0.0.0",
@@ -91223,6 +93418,7 @@
       "default",
       "derive",
       "extra-traits",
+      "fold",
       "full",
       "parsing",
       "printing",
@@ -91451,9 +93647,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "syntax@0.0.0",
@@ -95073,6 +97267,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zmij@1.0.21 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.21 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zmij@1.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zmij@1.0.21 lib zmij build": {
      "crate_type": "lib",
      "deps": [
@@ -95092,6 +97311,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zmij"
+    },
+    "zmij@1.0.21 lib zmij build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.21 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zmij@1.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -96414,9 +98658,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "base-db@0.0.0",
@@ -96676,7 +98918,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -96704,7 +98947,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -96732,7 +98976,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -96776,7 +99021,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -96816,7 +99062,8 @@
      "edition": "2024",
      "features": [
       "neon",
-      "std"
+      "std",
+      "wasm32_simd"
      ],
      "kind": "lib",
      "mode": "build",
@@ -97006,13 +99253,7 @@
      "deps": [],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -97043,13 +99284,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -97388,13 +99623,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "lib",
      "mode": "build",
@@ -97494,6 +99723,10 @@
       {
        "name": "glob",
        "unit": "glob@0.3.4 lib glob build host"
+      },
+      {
+       "name": "serde_json",
+       "unit": "serde_json@1.0.154 lib serde_json build host"
       },
       {
        "name": "toml",
@@ -97770,6 +100003,10 @@
       {
        "name": "hir_ty_borrowck",
        "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
        "name": "hir_ty",
@@ -98072,14 +100309,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "bin",
      "mode": "build",
@@ -98218,14 +100449,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "bin",
      "mode": "build",
@@ -98252,14 +100477,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "build",
@@ -98290,14 +100509,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "custom-build",
      "mode": "run-custom-build",
@@ -98432,14 +100645,8 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
       "default",
-      "explore",
-      "llvm-stencils",
-      "mimalloc",
-      "net",
-      "pprof",
-      "tui"
+      "native"
      ],
      "kind": "lib",
      "mode": "build",
@@ -99150,32 +101357,49 @@
      "src": "src/lib.rs",
      "target": "blaze_image"
     },
+    "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc-rt@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "../../library/blaze_inproc_rt/src/lib.rs",
+     "target": "blaze_inproc_rt"
+    },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_bytes",
-       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
-      },
-      {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
+      },
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
-       "name": "blaze_spin",
-       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
-      },
-      {
        "name": "crossbeam_channel",
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
       },
       {
        "name": "parking_lot",
@@ -99559,8 +101783,7 @@
      ],
      "edition": "2024",
      "features": [
-      "daemon",
-      "llvm-stencils"
+      "daemon"
      ],
      "kind": "lib",
      "mode": "build",
@@ -99654,9 +101877,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "llvm-stencils"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-link@0.0.0",
@@ -99861,6 +102082,10 @@
     "blaze-live@0.1.0 lib blaze_live build": {
      "crate_type": "lib",
      "deps": [
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
+      },
       {
        "name": "blaze_inproc",
        "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
@@ -101448,9 +103673,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "query"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-units@0.0.0",
@@ -102321,11 +104544,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default",
-      "syntax",
-      "tt"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "cfg@0.0.0",
@@ -105054,6 +107273,10 @@
       {
        "name": "cc",
        "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "flecs_distr",
+       "unit": "flecs-distr@4.2.0 lib flecs_distr build host"
       }
      ],
      "edition": "2024",
@@ -105128,6 +107351,26 @@
      },
      "src": "src/lib.rs",
      "target": "flecs_c"
+    },
+    "flecs-distr@4.2.0 lib flecs_distr build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "flecs-distr@4.2.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "lib.rs",
+     "target": "flecs_distr"
     },
     "fnv@1.0.7 lib fnv build": {
      "crate_type": "lib",
@@ -106399,12 +108642,20 @@
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty_share",
        "unit": "hir-ty-share@0.0.0 lib hir_ty_share build"
       },
       {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "inkwell",
+       "unit": "inkwell@0.11.0 lib inkwell build"
       },
       {
        "name": "intern",
@@ -106493,7 +108744,7 @@
      ],
      "edition": "2024",
      "features": [
-      "llvm-stencils"
+      "llvm"
      ],
      "kind": "lib",
      "mode": "build",
@@ -106855,6 +109106,10 @@
        "unit": "hir-lint-levels@0.0.0 lib hir_lint_levels build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty_tailck",
        "unit": "hir-ty-tailck@0.0.0 lib hir_ty_tailck build"
       },
@@ -106952,6 +109207,79 @@
      "src": "src/lib.rs",
      "target": "hir_ty_mir"
     },
+    "hir-ty-print@0.0.0 lib hir_ty_print build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_expand",
+       "unit": "hir-expand@0.0.0 lib hir_expand build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_abi",
+       "unit": "rustc_abi@0.0.0 lib rustc_abi build"
+      },
+      {
+       "name": "rustc_apfloat",
+       "unit": "rustc_apfloat@0.2.3+llvm-462a31f5a5ab lib rustc_apfloat build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "smallvec",
+       "unit": "smallvec@1.16.4 lib smallvec build"
+      },
+      {
+       "name": "span",
+       "unit": "span@0.0.0 lib span build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-print@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_print"
+    },
     "hir-ty-pure@0.0.0 lib hir_ty_pure build": {
      "crate_type": "lib",
      "deps": [
@@ -106998,6 +109326,10 @@
       {
        "name": "hir_ty_mir",
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
+      },
+      {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
       },
       {
        "name": "hir_ty_share",
@@ -107317,6 +109649,10 @@
        "unit": "hir-ty-mir@0.0.0 lib hir_ty_mir build"
       },
       {
+       "name": "hir_ty_print",
+       "unit": "hir-ty-print@0.0.0 lib hir_ty_print build"
+      },
+      {
        "name": "hir_ty",
        "unit": "hir-ty@0.0.0 lib hir_ty build"
       },
@@ -107476,56 +109812,6 @@
      "src": "src/lib.rs",
      "target": "hir_ty_wfcheck"
     },
-    "hir-ty@0.0.0 custom-build build-script-build build host": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "blaze_codegen_code",
-       "unit": "blaze-codegen-code@0.0.0 lib blaze_codegen_code build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "build",
-     "pkg": "hir-ty@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "0",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
-    "hir-ty@0.0.0 custom-build build-script-build run-custom-build": {
-     "crate_type": "bin",
-     "deps": [
-      {
-       "name": "build_script_build",
-       "unit": "hir-ty@0.0.0 custom-build build-script-build build host"
-      }
-     ],
-     "edition": "2024",
-     "features": [],
-     "kind": "custom-build",
-     "mode": "run-custom-build",
-     "pkg": "hir-ty@0.0.0",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "build.rs",
-     "target": "build-script-build"
-    },
     "hir-ty@0.0.0 lib hir_ty build": {
      "crate_type": "lib",
      "deps": [
@@ -107616,10 +109902,6 @@
       {
        "name": "hir_ty_comptime",
        "unit": "hir-ty-comptime@0.0.0 lib hir_ty_comptime build"
-      },
-      {
-       "name": "build_script_build",
-       "unit": "hir-ty@0.0.0 custom-build build-script-build run-custom-build"
       },
       {
        "name": "indexmap",
@@ -108954,6 +111236,154 @@
      "src": "src/lib.rs",
      "target": "indoc"
     },
+    "inkwell@0.11.0 custom-build build-script-build build host": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "inkwell@0.11.0 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "inkwell@0.11.0 custom-build build-script-build build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "inkwell@0.11.0 lib inkwell build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "bitflags",
+       "unit": "bitflags@2.13.2 lib bitflags build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "inkwell@0.11.0 custom-build build-script-build run-custom-build"
+      },
+      {
+       "name": "inkwell_internals",
+       "unit": "inkwell_internals@0.16.0 proc-macro inkwell_internals build host"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "llvm_sys_231",
+       "unit": "llvm-sys@231.0.1 lib llvm_sys build"
+      },
+      {
+       "name": "thiserror",
+       "unit": "thiserror@2.0.18 lib thiserror build"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "llvm-sys-231",
+      "llvm23-1",
+      "llvm23-1-prefer-static",
+      "no-libffi-linking",
+      "target-aarch64",
+      "target-x86"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "inkwell@0.11.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "inkwell"
+    },
+    "inkwell_internals@0.16.0 proc-macro inkwell_internals build host": {
+     "crate_type": "proc-macro",
+     "deps": [
+      {
+       "name": "proc_macro2",
+       "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
+      },
+      {
+       "name": "quote",
+       "unit": "quote@1.0.47 lib quote build host"
+      },
+      {
+       "name": "syn",
+       "unit": "syn@3.0.9 lib syn build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "proc-macro",
+     "mode": "build",
+     "pkg": "inkwell_internals@0.16.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "inkwell_internals"
+    },
     "instability@0.3.14 proc-macro instability build host": {
      "crate_type": "proc-macro",
      "deps": [
@@ -109142,6 +111572,26 @@
      "src": "src/lib.rs",
      "target": "itoa"
     },
+    "itoa@1.0.18 lib itoa build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "itoa@1.0.18",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "itoa"
+    },
     "ix-prof@0.0.0 lib ix_prof build": {
      "crate_type": "lib",
      "deps": [
@@ -109164,6 +111614,10 @@
       {
        "name": "blake3",
        "unit": "blake3@1.8.7 lib blake3 build"
+      },
+      {
+       "name": "blaze_inproc_rt",
+       "unit": "blaze-inproc-rt@0.0.0 lib blaze_inproc_rt build"
       },
       {
        "name": "crossbeam_queue",
@@ -109867,7 +112321,7 @@
      "src": "src/lib.rs",
      "target": "litrs"
     },
-    "llvm-sys@231.0.1 custom-build build-script-build build host": {
+    "llvm-sys@231.0.1 custom-build build-script-build build host features=-": {
      "crate_type": "bin",
      "deps": [
       {
@@ -109900,12 +112354,74 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "llvm-sys@231.0.1 custom-build build-script-build build host features=prefer-static": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "anyhow",
+       "unit": "anyhow@1.0.104 lib anyhow build host"
+      },
+      {
+       "name": "cc",
+       "unit": "cc@1.4.3 lib cc build host"
+      },
+      {
+       "name": "lazy_static",
+       "unit": "lazy_static@1.5.0 lib lazy_static build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "llvm-sys@231.0.1 custom-build build-script-build run-custom-build": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host features=prefer-static"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "llvm-sys@231.0.1 custom-build build-script-build run-custom-build host": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host"
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build build host features=-"
       }
      ],
      "edition": "2021",
@@ -109924,6 +112440,37 @@
      },
      "src": "build.rs",
      "target": "build-script-build"
+    },
+    "llvm-sys@231.0.1 lib llvm_sys build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "llvm-sys@231.0.1 custom-build build-script-build run-custom-build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "prefer-static"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "llvm-sys@231.0.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "llvm_sys"
     },
     "llvm-sys@231.0.1 lib llvm_sys build host": {
      "crate_type": "lib",
@@ -111573,9 +114120,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "parser@0.0.0",
@@ -115149,6 +117694,34 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde_json@1.0.154 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_json@1.0.154 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde_json@1.0.154",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde_json@1.0.154 lib serde_json build": {
      "crate_type": "lib",
      "deps": [
@@ -115187,6 +117760,50 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_json"
+    },
+    "serde_json@1.0.154 lib serde_json build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "itoa",
+       "unit": "itoa@1.0.18 lib itoa build host"
+      },
+      {
+       "name": "memchr",
+       "unit": "memchr@2.8.3 lib memchr build host"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      },
+      {
+       "name": "build_script_build",
+       "unit": "serde_json@1.0.154 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "zmij",
+       "unit": "zmij@1.0.21 lib zmij build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_json@1.0.154",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -115916,10 +118533,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default",
-      "query"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "span@0.0.0",
@@ -116279,6 +118893,7 @@
       "default",
       "derive",
       "extra-traits",
+      "fold",
       "full",
       "parsing",
       "printing",
@@ -116507,9 +119122,7 @@
       }
      ],
      "edition": "2024",
-     "features": [
-      "default"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "syntax@0.0.0",
@@ -120125,6 +122738,31 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "zmij@1.0.21 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.21 custom-build build-script-build build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "zmij@1.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "zmij@1.0.21 lib zmij build": {
      "crate_type": "lib",
      "deps": [
@@ -120144,6 +122782,31 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "zmij"
+    },
+    "zmij@1.0.21 lib zmij build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "zmij@1.0.21 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "zmij@1.0.21",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },

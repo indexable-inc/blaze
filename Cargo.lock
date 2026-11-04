@@ -3141,7 +3141,13 @@ name = "flecs-c"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "flecs-distr",
 ]
+
+[[package]]
+name = "flecs-distr"
+version = "4.2.0"
+source = "git+https://github.com/indexable-inc/flecs?rev=ab8b8e051c6f8ac014557136c97847941bd3caa0#ab8b8e051c6f8ac014557136c97847941bd3caa0"
 
 [[package]]
 name = "fnv"

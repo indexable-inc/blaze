@@ -52,7 +52,7 @@ let
   ]
   ++ lib.optional (builtins.pathExists (repo + "/.cargo/config.toml")) (repo + "/.cargo/config.toml")
   ++ lib.mapAttrsToList (_: p: repo + "/${p.source.dir}")
-    (lib.filterAttrs (_: p: p.source.kind != "registry") all.packages));
+    (lib.filterAttrs (_: p: p.source.kind == "path") all.packages));
 
   # The manifest directory of a workspace-local package, cut down to what the crate reads so that
   # editing anything else in the repo does not change the unit.
@@ -84,6 +84,10 @@ let
           mkdir $out
           tar xzf ${crate} --strip-components=1 -C $out
         ''
+      # A git dependency pinned by rev (flecs-distr): the commit's tree, any branch, then the
+      # package's directory in it.
+      else if p.source.kind == "git" then
+        "${builtins.fetchGit { inherit (p.source) url rev; allRefs = true; }}/${p.source.dir}"
       else
         pathSource p)
     checked.packages;
