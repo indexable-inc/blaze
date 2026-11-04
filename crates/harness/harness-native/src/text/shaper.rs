@@ -390,7 +390,19 @@ impl Typesetter {
                     .shaper
                     .fallback
                     .entry((id, cluster.to_vec()))
-                    .or_insert_with(|| asked.fallback(&String::from_utf16_lossy(cluster)))
+                    .or_insert_with(|| {
+                        let text = String::from_utf16_lossy(cluster);
+                        // Private-use symbols (Nerd Font icons) are the bundled Symbols Nerd Font's, which CoreText's
+                        // cascade does not know.
+                        let private = text.chars().all(|c| matches!(u32::from(c), 0xE000..=0xF8FF | 0xF0000..));
+                        private
+                            .then(|| {
+                                super::register_term_fonts();
+                                SystemFont::named(super::NERD_FONT, asked.size())
+                            })
+                            .flatten()
+                            .unwrap_or_else(|| asked.fallback(&text))
+                    })
                     .clone();
                 index(fonts, &mut faces, &fb).or(base)
             };

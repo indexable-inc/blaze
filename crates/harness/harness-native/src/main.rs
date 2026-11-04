@@ -9,7 +9,6 @@ mod pack;
 mod prefs;
 mod shot;
 mod single;
-mod saved;
 mod term;
 mod text;
 mod window;
