@@ -22,7 +22,7 @@ pub(crate) mod syntax;
 pub use self::syntax::CheckCfg;
 pub use levels::{CommandLine, Level, LintOptions};
 pub(crate) use levels::{LevelMap, may_fire};
-pub(crate) use names::{Effective, EffectiveDef, ItemWalk, def_span};
+pub(crate) use names::{Effective, EffectiveDef, ItemWalk, def_span, observe};
 
 use ::syntax::{
     SyntaxNodePtr,

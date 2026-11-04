@@ -83,7 +83,7 @@ to it, that no project's pin or `PATH` changes:
   macOS (`pins.txt`), the same bytes rustup's `minimal` profile and the `wasm32-wasip1` target
   download; 6.0 MB less than with `rust-src`, and blaze's library archive (6.0 MB) comes
   beside it.
-- **Where:** `~/.blaze/toolchains/nightly-2026-10-25-<host>/` (`BLAZE_HOME` moves it), laid out as rustup
+- **Where:** `~/.blaze/toolchains/nightly-2026-10-25-<host>/` (the machine's: every `BLAZE_HOME` reads it), laid out as rustup
   lays out a toolchain, with its channel manifest, so that blaze's sysroot rules read it
   unchanged.
 - **Checked:** the sha256 of each component is compiled into blaze, from the channel

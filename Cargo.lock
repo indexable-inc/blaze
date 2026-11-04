@@ -842,6 +842,7 @@ dependencies = [
  "blaze-graph",
  "blaze-ids",
  "blaze-lower",
+ "blaze-manifest",
  "blaze-mem",
  "blaze-query",
  "blaze-registry",
@@ -1910,6 +1911,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "target-features",
  "toml",
  "url",
 ]
@@ -3796,6 +3798,7 @@ dependencies = [
  "span",
  "stdx",
  "syntax",
+ "target-features",
  "target-lexicon",
  "tracing",
  "triomphe",

@@ -276,7 +276,8 @@ Each step is one run. "Queries" are runs that compile nothing: `-vV`, `--print`,
 compiling, checking or linking a crate, a build script, a proc macro, a doctest example, a
 build script's probe, or an `asm!` block. bevy has no test step in bench.py, and its native
 libraries (ALSA, udev, Wayland, X11, Vulkan) and C compiler came from a nixpkgs shell. The
-scripts are in `harness/norustc/`: setup.sh, wrap.sh, count.py, classify.py and left.py.
+scripts are in `harness/norustc/`: setup.sh, wrap.sh, count.py and classify.py (left.py, which
+read v1's worker logs for functions left to rustc, is gone: v2 leaves none to rustc).
 
 `blaze build` and `test`, rustc runs per step (compiles + queries):
 

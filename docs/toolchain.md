@@ -42,7 +42,8 @@ the standard library is part of a compiler.
   from static.rust-lang.org, each checked against the sha256 compiled into blaze
   (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
-- **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), found
+- **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, the machine's: every `BLAZE_HOME` reads
+  this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain), found
   with nothing run (`crates/blaze-cargo/src/toolchain.rs`, `found`). rustup's directory is never
   read, not even when it has the same nightly: a toolchain found by its directory's name is
   trusted by name, whatever was installed there ([v2/plan/toolchain-c.md](v2/plan/toolchain-c.md),
@@ -108,7 +109,8 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    and the flake.
 2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
    target specs depend on the host rustc was built for; the three are merged into
-   `crates/blaze-units/src/stdlib/rustc.json`.
+   `crates/blaze-units/src/stdlib/rustc.json`, and `tools/cpus.py` writes the CPU table
+   (`target_features::cpus`) from it.
 3. The pull request `toolchain: pin nightly-YYYY-MM-DD` is opened, or updated when one is open,
    which runs the merge gate, and the release train is started on the branch and on
    `toolchain/base`, the main commit the branch is on, to compare with. (main's own trains are

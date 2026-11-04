@@ -11,17 +11,20 @@ the functions they declare from the program's entries until an edit had the crat
 and that edit's patch then compiled every one of them as a function added. Here a library
 includes `exports.in` (not a `.rs` file, so nothing loads it but the macro) with EXPORTS
 functions of the C ABI. Once the daemon has built the program, a function is added to the
-library: its patch has to be of a few functions, not of the EXPORTS, and the program has to
-print what its source says (`PRINTS`).
+library: the build has to compile a few functions, not the EXPORTS (`compiled` of its
+`blaze-work` line under `--message-format=json`), and the program has to print what its source
+says (`PRINTS`). v1 read the count from its workers' `patch: N functions` lines; v2 has no
+workers.
 
 Python 3, stdlib only.
 """
-import glob, os, re, shutil, subprocess, sys, tempfile
+import glob, os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import blaze_cli
 from blaze_cli import Side
+from storelib import links, state_of, worked
 
 EXPORTS = 64
 FILES = {
@@ -44,26 +47,19 @@ FILES = {
 PRINTS = "41 3\n"
 
 
-def patches(home):
-    """The `patch: N functions` lines of the workers' logs, in order."""
-    found = []
-    for log in sorted(glob.glob(os.path.join(home, "*", "*", "log"))):
-        found += [int(n) for n in re.findall(r"^patch: (\d+) functions$", open(log, errors="replace").read(), re.M)]
-    return found
-
-
 def tails(home, lines=40):
-    """The last lines of each of the daemon's logs, for a failure on a machine whose files are
-    gone once it ends."""
-    logs = sorted(glob.glob(os.path.join(home, "*.log")) + glob.glob(os.path.join(home, "*", "*", "log")))
+    """The last lines of each of the daemon's logs (`<home>/v2/serve.log` when a build started
+    it), for a failure on a machine whose files are gone once it ends."""
+    logs = sorted(glob.glob(os.path.join(home, "*.log")) + glob.glob(os.path.join(state_of(home), "*.log")))
     return "".join(f"\n--- {log}\n" + "".join(open(log, errors="replace").readlines()[-lines:]) for log in logs)
 
 
 def build(side, step, home):
-    _, ran = side.cargo("build")
+    """`blaze build --message-format=json`: what it printed on stdout."""
+    _, ran = side.cargo("build", "--message-format=json")
     if ran.returncode != 0:
         raise SystemExit(f"{step}: the build failed:\n{(ran.stdout + ran.stderr)[-3000:]}{tails(home)}")
-    return ran.stdout + ran.stderr
+    return ran.stdout
 
 
 def main():
@@ -85,23 +81,23 @@ def main():
     wrong = []
     try:
         build(side, "cold", home)
-        seen = len(patches(home))
         lib = os.path.join(ws, "gen/src/lib.rs")
         text = open(lib).read()
         open(lib, "w").write(text.replace("pub fn value() -> u32 {\n    1\n}",
                                           "pub fn value() -> u32 {\n    1 + added()\n}\n\nfn added() -> u32 {\n    40\n}"))
         said = build(side, "a function added", home)
-        made = patches(home)[seen:]
+        work = worked(said)
+        compiled = work[-1].compiled if work else None
+        made = links(said, "app")
         ran = subprocess.run([program], capture_output=True, text=True, timeout=60)
-        if "[blaze]" not in said:
-            wrong.append("the edit was not built by the daemon")
-        elif not made:
-            wrong.append("the edit was not patched")
-        elif made[-1] >= EXPORTS:
-            wrong.append(f"the patch is of {made[-1]} functions: the {EXPORTS} the included file declares were not listed")
+        if compiled is None:
+            wrong.append("the edit was not built by the daemon: no `blaze-work` line")
+        elif compiled >= EXPORTS:
+            wrong.append(f"the edit compiled {compiled} functions: the {EXPORTS} the included file declares were not listed")
         if ran.stdout != PRINTS:
             wrong.append(f"the program printed {ran.stdout.strip()!r}, not {PRINTS.strip()!r}")
-        print(f"{'a function added':30} {'ok' if not wrong else 'WRONG':8} patch of {made[-1] if made else '-'} functions")
+        how = made[-1] if made else "no link"
+        print(f"{'a function added':30} {'ok' if not wrong else 'WRONG':8} {compiled if compiled is not None else '-'} functions compiled; {how}")
     finally:
         side.cargo("stop")
     for why in wrong:

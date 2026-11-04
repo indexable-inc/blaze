@@ -13,9 +13,9 @@ with `dir` is built in that directory of its checkout (codex: codex-rs), and its
 paths in it. Under each
 backend, with a store, a daemon and a home of its own, and plain cargo building the same source
 into a target directory of its own outside the checkout (under `--reference`, which lets the two be on different disks, or `WORK/reference`):
-  cold       `blaze build` from nothing, then the wait until the daemon has the
-             workspace loaded and its first build linked; the standard library's crates are
-             units of that build like any other, built into the empty store
+  cold       `blaze build` from nothing, which starts the daemon and is its first build; the
+             standard library's crates are units of that build like any other, built into the
+             empty store
   no-op      `blaze build` with nothing changed
   body       one function's body is edited
   signature  a function gets another parameter, and every caller the argument
@@ -39,11 +39,10 @@ into docs/benchmarks.md's tables and the README's numbers.
 For every phase the result has the wall time of the command, cargo's time for the same
 step, the memory of both sides (`memory`: the most every process doing the work held at once,
 and the largest of them; harness/memory.py, docs/benchmarks.md "Memory and disk"), the most
-the daemon's workers have held so far (`rss_mb`), who built it (the daemon, or
-cargo and why), whether the daemon added the change to the linked program or linked again
-(and why), how many functions it compiled, and what it timed itself: the steps of the build
-one after another, what its threads spent on each step of compiling, and why a build started
-over when it did. The result also has what the daemon held once ready and after each phase
+the daemon has held so far (`rss_mb`), whether the build finished, and from the `blaze-work`
+line blaze builds print under `--message-format=json`: whether the daemon added the change to
+the linked program or linked again (and why), how many functions it compiled, and what it
+timed itself by step (`steps_us`). The result also has what the daemon held once ready and after each phase
 (`resident`), and what each side has on disk at the end (`disk_mb`); the runtime phase has each
 program's peak and size.
 
@@ -69,7 +68,7 @@ is a profile, as v2 picks it: `cranelift` builds the dev profile, `llvm` the rel
 import glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 
 import blaze_cli, counters, memory, storelib
-from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, fetch, how_built, program_output, test_results, test_verdict, timed, wait_warm
+from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, fetch, how_built, program_output, test_results, test_verdict, timed
 
 LET = "\n    let _bench_edit = 1u32;"
 
@@ -478,52 +477,44 @@ def write_edit(ws, changes, back):
 
 
 class Daemon:
-    """The daemon's workers for one checkout: their memory and what they logged."""
+    """The daemon of one checkout's home: its pid, from its lock (`storelib.daemon_pid`), and
+    its memory. v2's daemon does the work itself: it has no workers and no worker logs, and
+    what it did for a build is that build's `blaze-work` line (`storelib.worked`)."""
 
     def __init__(self, side):
-        self.side, self.read, self.peak, self.sampled = side, {}, 0, 0
+        self.side, self.peak, self.sampled = side, 0, 0
 
     def pid(self):
-        _, status = self.side.cargo("status")
-        # v2's first line is `pid: N`, v1's `daemon: pid N, ...`.
-        found = re.search(r"^(?:pid: |daemon: pid )(\d+)", status.stdout, re.M)
-        return int(found[1]) if found else None
+        return storelib.daemon_pid(self.side.env["BLAZE_HOME"])
 
     def resident_mb(self):
-        """What the daemon and every process below it (its workers) hold now."""
+        """What the daemon and every process below it hold now."""
         pid = self.pid()
         return memory.resident_mb([pid]) if pid else 0
 
     def workers(self):
-        _, status = self.side.cargo("status")
-        return [(int(pid), log) for pid, log in re.findall(r"worker: pid (\d+), .*, log (.*)$", status.stdout, re.M)]
+        """v1's workers, of which v2 has none: kept for the harnesses that still ask."""
+        return []
 
     def peak_mb(self):
-        """The most memory the workers have held at once so far, summed over those there are:
-        their VmHWM, or where there is none (macOS) the sampled peak of the daemon's tree."""
-        if not os.path.isdir("/proc/self"):
+        """The most memory the daemon has held so far: its VmHWM, or where there is none
+        (macOS) the sampled peak of the daemon's tree."""
+        pid = self.pid()
+        if not os.path.isdir("/proc/self") or not pid:
             self.peak = max(self.peak, self.sampled)
             return self.peak
-        total = 0
-        for pid, _ in self.workers():
-            try:
-                status = open(f"/proc/{pid}/status").read()
-            except OSError:
-                continue
-            total += int(re.search(r"VmHWM:\s+(\d+) kB", status)[1])
-        self.peak = max(self.peak, round(total / 1024))
+        try:
+            status = open(f"/proc/{pid}/status").read()
+        except OSError:
+            return self.peak
+        self.peak = max(self.peak, round(int(re.search(r"VmHWM:\s+(\d+) kB", status)[1]) / 1024))
         return self.peak
 
     def said(self, builds=0):
-        """What the workers logged since the last call, once `builds` edits are in it."""
-        for _ in range(100):
-            logs = {log: open(log, "rb").read() for _, log in self.workers() if os.path.exists(log)}
-            text = "".join(whole[self.read.get(log, 0):].decode(errors="replace") for log, whole in logs.items())
-            if text.count("edit-to-binary:") >= builds:
-                break
-            time.sleep(0.02)
-        self.read.update((log, len(whole)) for log, whole in logs.items())
-        return text
+        """v1's worker logs, of which v2 has none: always empty, kept for the harnesses that
+        still ask. What a build did is its own `blaze-work` line."""
+        del builds
+        return ""
 
 
 def metered(side, args, daemon=None, sampler=None, command="build", meter=None):
@@ -561,42 +552,50 @@ def memory_phase(rows, resident=None):
     return result
 
 
-def links(text):
-    """Each `link: <image> (<how>)` line in `text`, as (image, how)."""
-    return re.findall(r"^link: (\S+) \((.*)\)$", text, re.M)
+# What `blaze build --message-format=json` adds to a build's command line: its `blaze-work`
+# line (crates/blaze-ui/src/api.rs, `work_json`) says how each image was linked, how many
+# functions were compiled and what each step took.
+JSON = "--message-format=json"
 
 
-def link_kind(text, linked=frozenset()):
-    """How the builds in `text` reached the program: "spliced" when each link put what changed
+def links(out):
+    """Each image the builds in `out` (what blaze printed with `--message-format=json`)
+    linked, as `storelib.Link`s, from their `blaze-work` lines."""
+    return [link for work in storelib.worked(out) for link in work.links]
+
+
+def link_kind(out, linked=frozenset()):
+    """How the builds in `out` reached the program: "spliced" when each link put what changed
     into the image kept or left an image nothing it is made of changed ("unchanged"); "first
     link" when an image new to the build was laid out and the rest were spliced; else "full
-    link: <why>". `linked` holds the images linked before `text`: one
-    of them laid out as a first link lost the image kept, which is a full link too.
+    link: <why>". `linked` holds the paths of the images linked before `out`: one of them laid
+    out as a first link lost the image kept, which is a full link too.
 
+    >>> line = lambda *made: json.dumps(dict(reason="blaze-work", reran=0, green=0, compiled=0, found=0, link="patched",
+    ...                                      links=[dict(path=path, how=how, why=why) for path, how, why in made]))
     >>> link_kind("")
-    >>> link_kind("link: target/debug/app (spliced)\\n")
+    >>> link_kind(line(("target/debug/deps/app-1", "spliced", [])))
     'spliced'
-    >>> link_kind("link: target/debug/app (first link)\\n")
+    >>> link_kind(line(("target/debug/deps/app-1", "first", [])))
     'first link'
-    >>> link_kind("link: target/debug/app (first link)\\n", {"target/debug/app"})
-    'full link: target/debug/app was linked before and its image was not kept'
-    >>> link_kind("link: a (spliced)\\nlink: b (unchanged)\\n")
+    >>> link_kind(line(("target/debug/deps/app-1", "first", [])), {"target/debug/deps/app-1"})
+    'full link: target/debug/deps/app-1 was linked before and its image was not kept'
+    >>> link_kind(line(("a", "spliced", []), ("b", "unchanged", [])))
     'spliced'
-    >>> link_kind("link: a (spliced)\\nlink: b (not spliced: exports, debug)\\n")
+    >>> link_kind(line(("a", "spliced", []), ("b", "full", ["exports", "debug"])))
     'full link: b: exports, debug'
     >>> failed_link("full link: b: exports, debug"), failed_link("first link"), failed_link(None)
     (True, False, False)
     """
-    found = links(text)
+    found = links(out)
     if not found:
         return None
-    for image, how in found:
-        if how.startswith("first link") and image in linked:
-            return f"full link: {image} was linked before and its image was not kept"
-        if not how.startswith(("spliced", "unchanged", "first link")):
-            why = re.search(r"not spliced: (.*)", how)
-            return f"full link: {image}" + (f": {why[1][:160]}" if why else f" ({how[:160]})")
-    if all(how.startswith(("spliced", "unchanged")) for _, how in found):
+    for link in found:
+        if link.how == "first" and link.path in linked:
+            return f"full link: {link.path} was linked before and its image was not kept"
+        if link.how not in ("spliced", "unchanged", "first"):
+            return f"full link: {link.path}" + (f": {', '.join(link.why)[:160]}" if link.why else f" ({link.how[:160]})")
+    if all(link.how in ("spliced", "unchanged") for link in found):
         return "spliced"
     return "first link"
 
@@ -607,46 +606,39 @@ def failed_link(kind):
     return kind is not None and kind.startswith("full link")
 
 
-def daemon_steps(text):
-    """The steps the daemon timed in `text`, in milliseconds, summed over its builds."""
+def work_steps(out, scale):
+    """What each step of the builds in `out` took, from their `blaze-work` lines' `steps_us`
+    (the run time of the request's nodes by kind), summed over the builds, times `scale`."""
     steps = {}
-    for line in re.findall(r"^timeline-us: (.*)$", text, re.M):
-        for name, micros in (pair.split("=") for pair in line.split()):
-            # How long ago the file was saved is not the daemon's time.
-            if name != "notice":
-                steps[name] = round(steps.get(name, 0) + int(micros) / 1000, 2)
+    for message in storelib.messages(out, "blaze-work"):
+        took = message.get("steps_us")
+        for name, micros in (took.items() if isinstance(took, dict) else ()):
+            if isinstance(micros, int):
+                steps[name] = steps.get(name, 0) + micros * scale
     return steps
 
 
-def cold_steps(text):
-    """The steps of loading a workspace and building it for the first time, in seconds."""
-    steps = {}
-    for name, pattern in (("load", r"^load workspace: (\S+)"), ("resolve", r"^resolve: \d+ crates in (\S+)"),
-                          ("compile", r"^cold: compiled .* in (\S+) \("), ("emit", r"^cold: compiled .*\(\+(\S+) emit\)"),
-                          ("link", r"^link: (\S+) \(")):
-        found = re.findall(pattern, text, re.M)
-        if found:
-            steps[name] = round(sum(seconds(f) for f in found), 3)
-    return steps
+def daemon_steps(out):
+    """The steps the daemon timed for the builds in `out`, in milliseconds, summed."""
+    return {name: round(ms, 2) for name, ms in work_steps(out, 1e-3).items()}
+
+
+def cold_steps(out):
+    """The steps of the first build in `out`, in seconds."""
+    return {name: round(s, 3) for name, s in work_steps(out, 1e-6).items()}
 
 
 def thread_steps(text):
     """What the daemon's threads spent on each producer in `text`: seconds summed over the
-    threads."""
-    steps = {}
-    for producer, took in re.findall(r"^backend: (\w+) compiled \d+ functions, \d+ bytes, (\S+) ", text, re.M):
-        steps[producer] = round(steps.get(producer, 0) + seconds(took), 3)
-    return steps
+    threads. v1's `backend:` lines of each producer were its workers' logs, which v2 has none
+    of, so this is empty until v2 says it."""
+    del text
+    return {}
 
 
-def rounds(text):
-    """Why the builds in `text` started over, each time they did."""
-    return re.findall(r"^round \d+: \S+, started over: (.*)$", text, re.M)
-
-
-def compiled(text):
-    """How many functions the builds in `text` compiled."""
-    return sum(int(n) for n in re.findall(r"^stats: (\d+) of \d+ functions compiled", text, re.M))
+def compiled(out):
+    """How many functions the builds in `out` compiled (`blaze-work`'s `compiled`)."""
+    return sum(work.compiled for work in storelib.worked(out))
 
 
 class Setup:
@@ -765,29 +757,25 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
 
     def both():
         before = meter.settle()
-        took, mine, used = metered(ours, build, daemon, meter=meter)
+        took, mine, used = metered(ours, [*build, JSON], daemon, meter=meter)
         counted = meter.since(before, meter.settle())
         reference, other, cargo_used = metered(theirs, build)
         builds[0] += 1
         for side, ran in (("blaze", mine), ("cargo", other)):
             if ran.returncode != 0:
                 raise Failed(f"{name} {backend}: the {side} build failed:\n{ran.stderr[-3000:]}")
-        built = how_built(mine.stderr)
-        if built != "daemon":
-            # A build cargo did has the daemon load again; the next one is not timed against that.
-            wait_warm(ours, ws)
-        return took, reference, built, others(), used, cargo_used, mine.stderr, counted
+        return took, reference, how_built(mine.stderr), others(), used, cargo_used, mine.stdout, counted
 
-    def edit_link(kind, step, said):
-        """How the build of an edit linked, from what it and the daemon `said`. One that laid an
-        image out whole again, or said no link at all, ends the project's run there, before the
-        step is timed."""
-        link = link_kind(said, frozenset(linked))
+    def edit_link(kind, step, out):
+        """How the build of an edit linked, from the `blaze-work` lines in what it printed,
+        `out`. One that laid an image out whole again, or linked nothing, ends the project's
+        run there, before the step is timed."""
+        link = link_kind(out, frozenset(linked))
         if link is None:
-            raise Failed(f"{name} {backend}: the {kind} {step} said no `link:` line: how it linked is unknown")
+            raise Failed(f"{name} {backend}: the {kind} {step} has no link in its `blaze-work` line: how it linked is unknown")
         if failed_link(link):
             raise Failed(f"{name} {backend}: the {kind} {step} was not spliced: {link}")
-        linked.update(image for image, _ in links(said))
+        linked.update(link.path for link in links(out))
         return link
 
     def program():
@@ -816,18 +804,17 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
                                        for s, t in phase["setups"].items()), flush=True)
 
     def cold_blaze(side, label, watched, counting):
-        """`blaze build` from nothing on `side`, and the wait until its daemon is ready;
-        with the memory of both, until ready (the daemon is the command's child when it starts,
-        so the sampler finds it), what the daemon holds once ready, and what the command and
-        the daemon retired until it was ready and quiet (by the meter `counting`)."""
+        """`blaze build` from nothing on `side`, with the memory of both (the daemon is the
+        command's child when it starts, so the sampler finds it), what the daemon holds after
+        it, and what the command and the daemon retired until it was quiet (by the meter
+        `counting`). v2's first build is the daemon's, with nothing left to load after it, so
+        the wait for it to be ready (`warm`) is 0."""
         before = counting.snapshot()
         with memory.Sampler() as sampler:
-            took, mine, used = metered(side, build, sampler=sampler, meter=counting)
+            took, mine, used = metered(side, [*build, JSON], sampler=sampler, meter=counting)
             if mine.returncode != 0:
                 raise Failed(f"{name} {backend}: the first `blaze build` ({label}) failed:\n{mine.stderr[-3000:]}")
-            warm, states = wait_warm(side, side.ws)
-        if states != ["ready"]:
-            raise Failed(f"{name} {backend}: the daemon did not get ready ({label}): {states}\n{mine.stderr[-3000:]}")
+        warm = 0.0
         used = dict(peak_mb=max(sampler.peak_mb, used["largest_mb"]), largest_mb=max(used["largest_mb"], sampler.largest_mb),
                     resident_mb=watched.resident_mb())
         watched.sampled = max(watched.sampled, used["peak_mb"])
@@ -847,9 +834,9 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         ours.env.update(BLAZE_HOME=home(turn))
         daemon = Daemon(ours)
         took, warm, mine, used, counted = cold_blaze(ours, "empty store", daemon, meter)
-        said, built, peak = daemon.said(), how_built(mine.stderr), daemon.peak_mb()
+        said, built, peak = mine.stdout, how_built(mine.stderr), daemon.peak_mb()
         # The images this daemon has linked: each later link of one is an edit of it.
-        linked = {image for image, _ in links(said + mine.stderr)}
+        linked = {link.path for link in links(said)}
         reference, other, cargo_used = metered(theirs, build)
         if other.returncode != 0:
             raise Failed(f"{name} {backend}: the cargo build failed:\n{other.stderr[-3000:]}")
@@ -863,7 +850,6 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         if turn + 1 < cold_runs:
             ours.cargo("stop")
             shutil.rmtree(home(turn), ignore_errors=True)
-    daemon.said()
     ready_mb = round(statistics.median(c["used"]["resident_mb"] for c in colds))
     resident = dict(ready_mb=ready_mb, after=[])
     cold_disk = disk(ws, ours, theirs)
@@ -874,14 +860,13 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
                         samples_s=[round(c["build_s"] + c["warm_s"], 3) for c in colds], cargo_samples_s=[round(c["cargo_s"], 3) for c in colds],
                         build_samples_s=[round(c["build_s"], 3) for c in colds],
                         setups=setup_times(setups, [c["setups"] for c in colds]),
-                        compiled=compiled(said), steps_s=cold_steps(said), threads_s=thread_steps(said), started_over=rounds(said),
+                        compiled=compiled(said), steps_s=cold_steps(said), threads_s=thread_steps(said),
                         memory=memory_phase([(c["used"], c["cargo_used"]) for c in colds], ready_mb), disk_mb=cold_disk,
                         **counters.summary([c["counts"] for c in colds])))
 
     samples = [both() for _ in range(max(runs, 3))]
-    said = daemon.said()
-    linked.update(image for s in samples for image, _ in links(s[6]))
-    linked.update(image for image, _ in links(said))
+    said = "".join(s[6] for s in samples)
+    linked.update(link.path for link in links(said))
     held = daemon.resident_mb()
     resident["after"].append(dict(phase="no-op", builds=builds[0], mb=held))
     report("no-op", dict(memory=memory_phase([(s[4], s[5]) for s in samples], held), wall_s=round(statistics.median(s[0] for s in samples), 3), cargo_s=round(statistics.median(s[1] for s in samples), 3),
@@ -894,19 +879,16 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         made, back = [], []
         for turn in range(runs):
             places = write_edit(ws, changes, False)
-            took, reference, built, theirs_too, used, cargo_used, stderr, counted = both()
-            said = daemon.said(1 if built == "daemon" else 0)
-            link = edit_link(kind, "edit", said + stderr)
+            took, reference, built, theirs_too, used, cargo_used, said, counted = both()
+            link = edit_link(kind, "edit", said)
             made.append(dict(wall_s=took, cargo_s=reference, built=built, link=link, compiled=compiled(said), steps_ms=daemon_steps(said),
-                             threads_s=thread_steps(said), started_over=rounds(said), setups=theirs_too, used=used, cargo_used=cargo_used,
+                             threads_s=thread_steps(said), setups=theirs_too, used=used, cargo_used=cargo_used,
                              counts=counted))
             if turn == 0:
                 runs_right(kind)
-                daemon.said()
             write_edit(ws, changes, True)
-            took, reference, built, *_, stderr, _ = both()
-            said = daemon.said(1 if built == "daemon" else 0)
-            link = edit_link(kind, "edit taken back", said + stderr)
+            took, reference, built, *_, said, _ = both()
+            link = edit_link(kind, "edit taken back", said)
             back.append(dict(wall_s=took, cargo_s=reference, built=built, link=link, compiled=compiled(said)))
             # An edit the daemon turned down is one finding, not a time to take a median of,
             # and each has it load the workspace again.
@@ -919,7 +901,7 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         resident["after"].append(dict(phase=kind, builds=builds[0], mb=held))
         report(kind, dict(memory=memory_phase([(s["used"], s["cargo_used"]) for s in made], held), wall_s=median(made, "wall_s"), cargo_s=median(made, "cargo_s"), rss_mb=daemon.peak_mb(),
                           built=slowest["built"], link=slowest["link"], compiled=max(s["compiled"] for s in made), places=places,
-                          steps_ms=slowest["steps_ms"], threads_s=slowest["threads_s"], started_over=slowest["started_over"], slowest_s=round(slowest["wall_s"], 3),
+                          steps_ms=slowest["steps_ms"], threads_s=slowest["threads_s"], slowest_s=round(slowest["wall_s"], 3),
                           back_s=median(back, "wall_s"), back_cargo_s=median(back, "cargo_s"),
                           back_link=max(back, key=lambda s: s["wall_s"])["link"],
                           samples_s=[round(s["wall_s"], 3) for s in made], cargo_samples_s=[round(s["cargo_s"], 3) for s in made],
@@ -1084,10 +1066,8 @@ def measure_stress(crate, backend, runs, work):
                     if ran.returncode != 0:
                         side.cargo("stop")
                         raise Failed(f"stress {name} {backend}: the cold `blaze {command}` failed:\n{ran.stderr[-3000:]}")
-                    warm, states = wait_warm(side, ws)
-                if states != ["ready"]:
-                    side.cargo("stop")
-                    raise Failed(f"stress {name} {backend}: the daemon did not get ready after `blaze {command}`: {states}")
+                # v2's first build is the daemon's, with nothing left to load after it.
+                warm = 0.0
                 if pid := Daemon(side).pid():
                     meter.adopt(pid)
                 counted = meter.since(before, meter.settle())

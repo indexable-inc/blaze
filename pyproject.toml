@@ -36,6 +36,7 @@ include = [
   "harness/failures.py",
   "harness/focused.py",
   "harness/fuzz/edits.py",
+  "harness/hermetic.py",
   "harness/includes.py",
   "harness/incremental.py",
   "harness/keys.py",
@@ -44,12 +45,14 @@ include = [
   "harness/profile_fixtures.py",
   "harness/profile_gate.py",
   "harness/profile_trend.py",
+  "harness/storelib.py",
   "harness/storerevisions.py",
   "harness/toolchain_bump.py",
   "harness/v2",
   "tools/astlog/scan.py",
   "tools/devirt/*.py",
   "tools/layout",
+  "tools/cpus.py",
   "tools/similar",
   "tools/typed-input",
   "tools/v2",
@@ -60,6 +63,7 @@ include = [
 # migration keeps that existing import order; new workspace packages use normal imports.
 [tool.ruff.lint.per-file-ignores]
 "harness/fuzz/edits.py" = ["E402"]
+"harness/hermetic.py" = ["E402"]
 "harness/includes.py" = ["E402"]
 "harness/keys.py" = ["E402"]
 "harness/v2/*.py" = ["E402"]
@@ -75,6 +79,7 @@ include = [
   "harness/failures.py",
   "harness/focused.py",
   "harness/fuzz/edits.py",
+  "harness/hermetic.py",
   "harness/includes.py",
   "harness/incremental.py",
   "harness/keys.py",
@@ -83,17 +88,21 @@ include = [
   "harness/profile_fixtures.py",
   "harness/profile_gate.py",
   "harness/profile_trend.py",
+  "harness/storelib.py",
   "harness/storerevisions.py",
   "harness/toolchain_bump.py",
   "harness/v2",
   "tools/astlog/scan.py",
   "tools/devirt",
   "tools/layout",
+  "tools/cpus.py",
   "tools/typed-input",
   "tools/v2",
   "tools/vendor",
 ]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
-# harness/v2's scripts import `engine`, `report`, `blaze_cli` and `cases` as siblings off `sys.path`.
-extraPaths = ["harness", "harness/v2", "harness/v2/frontend"]
+# harness/v2's scripts import `engine`, `report`, `blaze_cli` and `cases` as siblings off `sys.path`;
+# `typed_input` (the workspace member tools/typed-input) resolves from its source as well as from
+# the environment `uv sync` installs it in, so a pyright outside that environment finds it too.
+extraPaths = ["harness", "harness/v2", "harness/v2/frontend", "tools/typed-input/src"]

@@ -244,6 +244,7 @@ fn plan(
             std: "/s/std".to_owned(),
             builds: "/s/build".to_owned(),
             sources: "/s/sources".to_owned(),
+            blaze: String::new(),
         };
         let opened = db.open_with(View { root: view }, &config.encode());
         let planned = db

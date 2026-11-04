@@ -3,8 +3,9 @@
 //! the release's `rustc`, `cargo` and `rust-std` as the Rust project publishes them (the source
 //! of the standard library is blaze's own, `library.rs`), each checked against the sha256 `pins.txt` has for it (`harness/toolchain_pins.py` writes
 //! that from the release's manifest), and laid out in `~/.blaze/toolchains/<release>-<host>`
-//! as rustup lays out a toolchain, its records and channel manifest included, so that what
-//! reads a sysroot reads this one unchanged.
+//! (the machine's, whatever `BLAZE_HOME` says: [`toolchains`]) as rustup lays out a toolchain,
+//! its records and channel manifest included, so that what reads a sysroot reads this one
+//! unchanged.
 //!
 //! It is a stopgap: blaze still runs cargo and rustc for the first build and the proc macros
 //! (docs/no-rustc.md). This gives them a home that no project's pin and no `PATH` changes; it
@@ -127,9 +128,10 @@ impl Release {
         self.components.iter().map(|it| it.pin.bytes).sum::<u64>() + self.manifest.bytes
     }
 
-    /// Where blaze keeps this release.
+    /// Where blaze keeps this release: under this machine's [`toolchains`], whatever
+    /// `BLAZE_HOME` says.
     pub fn dir(&self) -> Option<PathBuf> {
-        Some(home()?.join("toolchains").join(format!("{}-{}", self.version, self.host)))
+        Some(toolchains()?.join(format!("{}-{}", self.version, self.host)))
     }
 }
 
@@ -168,8 +170,24 @@ pub fn home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
         return Some(PathBuf::from(home));
     }
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
-    Some(PathBuf::from(home).join(".blaze"))
+    Some(user_home()?.join(".blaze"))
+}
+
+/// Where this machine keeps blaze's toolchains: `.blaze/toolchains` in the user's home, for
+/// every `BLAZE_HOME`. A release is its pinned bytes, each file checked against its sha256 as
+/// it is downloaded, so every home of the machine reads the one copy: `BLAZE_HOME` moves a
+/// daemon's settings and state, never what it builds with. A home of its own (a harness's, a
+/// CI job's, a second daemon's) neither downloads the release again nor fails for not having
+/// it. [`fetch`]'s lock keeps two processes from laying it out at once.
+pub fn toolchains() -> Option<PathBuf> {
+    Some(user_home()?.join(".blaze").join("toolchains"))
+}
+
+/// The user's home directory.
+fn user_home() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var_os(var).filter(|it| !it.is_empty())?;
+    Some(PathBuf::from(home))
 }
 
 /// Whether `dir` has a whole toolchain: what is moved into place is whole, so this tells one

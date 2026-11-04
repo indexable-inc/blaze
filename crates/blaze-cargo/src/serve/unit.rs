@@ -31,6 +31,7 @@ mod artifact;
 mod checks;
 mod codegen;
 mod compile;
+mod configs;
 mod deps;
 mod doc;
 mod error;
@@ -1003,7 +1004,10 @@ impl Writer<Real> for UnitWriter {
     ) -> Result<Vec<blaze_api::Diagnostic>, ApiError> {
         self.deps.as_ref().map_or(Ok(()), deps::differences)?;
         deps::item_errors(&self.session)?;
-        Ok(codegen::unapplied(&self.job, ok, built)?.into_iter().map(warning).collect())
+        let mut said: Vec<blaze_api::Diagnostic> =
+            codegen::unapplied(&self.job, ok, built)?.into_iter().map(warning).collect();
+        said.extend(configs::report(&self.job, self.reader(), ok, built)?);
+        Ok(said)
     }
 
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError> {

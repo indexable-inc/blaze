@@ -15,9 +15,8 @@ use super::files::{
     FixedFile, FixedPath, Found, MountTable, Snap, ancestors, read_file, read_through,
 };
 use super::invocation::Asking;
-use super::key_id;
-use super::load_error;
-use crate::query::{Cbor, LoadError, Mount, Versioned, producer};
+use super::{Unread, key_id, load_error};
+use crate::query::{Cbor, Mount, Versioned, producer};
 
 /// Which configuration a workspace is read with.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
@@ -69,8 +68,8 @@ pub(crate) struct ConfigRead {
     pub warnings: Vec<String>,
 }
 
-impl Versioned for Result<ConfigRead, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo config read 4");
+impl Versioned for Result<ConfigRead, Unread> {
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo config read 5");
 }
 
 pub(crate) struct ConfigChain;
@@ -78,18 +77,15 @@ pub(crate) struct ConfigChain;
 impl Query for ConfigChain {
     const KIND: QueryKind = QueryKind(0x6015);
     const NAME: &'static str = "cargo config";
-    const PRODUCER: ContentId = producer("blaze v2 cargo config 3");
+    const PRODUCER: ContentId = producer("blaze v2 cargo config 4");
     type Key = ConfigOf;
-    type Value = Cbor<Result<ConfigRead, LoadError>>;
+    type Value = Cbor<Result<ConfigRead, Unread>>;
 
     fn input(key: &ConfigOf) -> ContentId {
         key_id("blaze v2 cargo config key 2", key)
     }
 
-    fn execute(
-        cx: &mut Cx<'_>,
-        key: &ConfigOf,
-    ) -> Result<Cbor<Result<ConfigRead, LoadError>>, Cancelled> {
+    fn execute(cx: &mut Cx<'_>, key: &ConfigOf) -> Result<Cbor<Result<ConfigRead, Unread>>, Cancelled> {
         let (cwd, env, command, cli, unstable) = match key {
             ConfigOf::View => match cx.get::<Asking>(&())?.get() {
                 Ok(asked) => (
@@ -99,7 +95,7 @@ impl Query for ConfigChain {
                     asked.config.clone(),
                     asked.unstable.clone(),
                 ),
-                Err(error) => return Ok(Cbor(Err(error))),
+                Err(error) => return Ok(Cbor(Err(Unread::Failed(error)))),
             },
             ConfigOf::Fixed { cwd, env, .. } => {
                 (cwd.clone(), env.clone(), "build".to_owned(), Vec::new(), Vec::new())
@@ -111,8 +107,8 @@ impl Query for ConfigChain {
         })?;
         Ok(Cbor(match loaded {
             Ok(Ok(warnings)) => Ok(ConfigRead { warnings, ..read }),
-            Ok(Err(error)) => Err(load_error(&error, None)),
-            Err(unmounted) => Err(unmounted),
+            Ok(Err(error)) => Err(Unread::Failed(load_error(&error, None))),
+            Err(unread) => Err(unread),
         }))
     }
 }

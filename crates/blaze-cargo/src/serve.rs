@@ -894,8 +894,12 @@ pub(crate) fn engine(
         observe::keep_history(&paths.state, duckdb, events).map_err(|why| anyhow::anyhow!(why))?;
     // Fixed for the daemon's life before any job: a build's tasks only read it.
     let sysroot = crate::toolchain::sysroot().with_context(|| {
+        // alloc: once, on the error that stops the daemon from starting
+        let at = crate::toolchain::own::Release::ours().and_then(|it| it.dir());
+        let at =
+            at.map_or_else(|| "on this machine".to_owned(), |it| format!("at {}", it.display()));
         format!(
-            "blaze's toolchain ({}) is not on this machine: `blaze toolchain` installs it",
+            "blaze's toolchain ({}) is not whole {at}: `blaze toolchain` installs it",
             crate::toolchain::name()
         )
     })?;

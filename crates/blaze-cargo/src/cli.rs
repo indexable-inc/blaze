@@ -83,6 +83,8 @@ Commands:
     test, t     Run the tests
     bench       Run the benchmarks
     doc, d      Build a package's documentation, from blaze's front end: no rustdoc runs
+    lock        Resolve the workspace and write Cargo.lock and blaze.lock, saying what moved, even
+                under CI or `lock = \"required\"`; nothing is checked or built
     clean       Remove the workspace's build directory (under blaze's root, never in the checkout);
                 `--list` every workspace's with its size, `--all` removes them all
     cache gc    Collect what blaze keeps on disk now (`--dry-run` removes nothing, `--last`
@@ -317,6 +319,7 @@ pub fn request(asked: &Invocation, cargo: Cargo) -> Result<Request, String> {
     let targets = place::targets(asked, cargo).map_err(|it| it.to_string())?;
     let flags = &asked.flags;
     Ok(match asked.command() {
+        Command::Check if asked.lock => Request::Lock { view, targets },
         Command::Check => Request::Check { view, targets },
         Command::Doc => {
             Request::Doc { view, targets, no_deps: flags.no_deps, private: flags.private }
@@ -667,6 +670,11 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             return Ok(Then::Exit(Exit::Failed.code()));
         }
     };
+    // `blaze lock` built nothing: no `Finished`, only what it wrote (said as notes) or its error.
+    if asked.lock {
+        printer.flush()?;
+        return Ok(Then::Exit(if ok { 0 } else { Exit::Failed.code() }));
+    }
     // The pages are written before cargo's `Finished`, and a page not written fails the command.
     let documented = match (asked.command(), ok) {
         (Command::Doc, true) => match docs.finish() {

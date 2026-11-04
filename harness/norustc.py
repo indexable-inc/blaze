@@ -12,7 +12,8 @@ doctests and features, which the root package uses through another library, a pr
 is built with a copy of the pinned toolchain whose rustc, rustdoc and cargo write a line for
 each run and then become the real tool, linked with rustup under a name of its own for the run.
 A scenario ends once no counted tool runs and the log has been still for a while, so what the
-daemon does after a command is counted with it.
+daemon does after a command is counted with it. (v1 also waited for `blaze status` to say the
+workspace was `ready`; v2 has no load state, and a build that returns is done.)
 
 --record writes this platform's counts into the baseline (the fixture is built in the dev
 profile, which v2 compiles with Cranelift), after a change that
@@ -44,35 +45,35 @@ exec {real} "$@"
 """
 
 MAIN, LIB = "src/main.rs", "word/src/lib.rs"
-# The scenarios, each a list of (step, blaze arguments, edits, whether to wait for the
-# daemon to be ready). An edit is (file, old, new), or (file, None, text to add).
+# The scenarios, each a list of (step, blaze arguments, edits). An edit is (file, old, new), or
+# (file, None, text to add).
 SCENARIOS = [
-    ("cold build", [("cold", ["build"], [], True)]),
+    ("cold build", [("cold", ["build"], [])]),
     ("edits", [
-        ("nothing edited", ["build"], [], False),
-        ("a body", ["build"], [(MAIN, '"{} words', '"{} words!')], False),
-        ("a library's body", ["build"], [(LIB, ".count()", ".filter(|it| !it.is_empty()).count()")], False),
-        ("a new function", ["build"], [(MAIN, "fn main() {", "fn more() -> u32 {\n    3\n}\n\nfn main() {\n    more();")], False),
-        ("an error", ["build"], [(MAIN, "    more();", '    let _wrong: u32 = "no";\n    more();')], False),
-        ("the error mended", ["build"], [(MAIN, '    let _wrong: u32 = "no";\n', "")], False),
+        ("nothing edited", ["build"], []),
+        ("a body", ["build"], [(MAIN, '"{} words', '"{} words!')]),
+        ("a library's body", ["build"], [(LIB, ".count()", ".filter(|it| !it.is_empty()).count()")]),
+        ("a new function", ["build"], [(MAIN, "fn main() {", "fn more() -> u32 {\n    3\n}\n\nfn main() {\n    more();")]),
+        ("an error", ["build"], [(MAIN, "    more();", '    let _wrong: u32 = "no";\n    more();')]),
+        ("the error mended", ["build"], [(MAIN, '    let _wrong: u32 = "no";\n', "")]),
     ]),
     ("tests", [
-        ("first test --no-run", ["test", "--no-run", "--workspace"], [], True),
-        ("a body", ["test", "--no-run", "--workspace"], [(MAIN, '"{} words!', '"{} words!!')], False),
-        ("a test added", ["test", "--no-run", "--workspace"], [(LIB, None, "\n#[test]\nfn added() {}\n")], False),
+        ("first test --no-run", ["test", "--no-run", "--workspace"], []),
+        ("a body", ["test", "--no-run", "--workspace"], [(MAIN, '"{} words!', '"{} words!!')]),
+        ("a test added", ["test", "--no-run", "--workspace"], [(LIB, None, "\n#[test]\nfn added() {}\n")]),
     ]),
     ("doctests", [
-        ("first", ["test", "--doc", "-p", "word"], [], False),
-        ("again", ["test", "--doc", "-p", "word"], [], False),
+        ("first", ["test", "--doc", "-p", "word"], []),
+        ("again", ["test", "--doc", "-p", "word"], []),
     ]),
-    ("check", [("check", ["check"], [], False)]),
+    ("check", [("check", ["check"], [])]),
     # With no build of its flags loaded the daemon loads the workspace to check it.
     ("check unloaded", [
-        ("the daemon stopped", ["stop"], [], False),
-        ("check", ["check"], [], False),
-        ("an error", ["check"], [(MAIN, "fn main() {", 'fn wrong() -> u32 {\n    "no"\n}\n\nfn main() {')], False),
-        ("the error mended", ["check"], [(MAIN, 'fn wrong() -> u32 {\n    "no"\n}\n\n', "")], False),
-        ("another package", ["check", "-p", "word"], [], False),
+        ("the daemon stopped", ["stop"], []),
+        ("check", ["check"], []),
+        ("an error", ["check"], [(MAIN, "fn main() {", 'fn wrong() -> u32 {\n    "no"\n}\n\nfn main() {')]),
+        ("the error mended", ["check"], [(MAIN, 'fn wrong() -> u32 {\n    "no"\n}\n\n', "")]),
+        ("another package", ["check", "-p", "word"], []),
     ]),
 ]
 
@@ -186,15 +187,9 @@ def main():
     try:
         for scenario, steps in SCENARIOS:
             began = len(open(log).read().splitlines())
-            for step, args, edits, wait in steps:
+            for step, args, edits in steps:
                 apply(ws, edits)
                 ran = run(["blaze", *args], cwd=ws, env=env, timeout=1200)
-                if wait and ran.returncode == 0:
-                    for _ in range(600):
-                        status = run(["blaze", "status"], cwd=ws, env=env).stdout
-                        if ": ready" in status:
-                            break
-                        time.sleep(1)
                 settle(log)
                 said = (ran.stderr.strip().splitlines() or [""])[-1][:100]
                 print(f"  {scenario}: {step}: exit {ran.returncode}  {said}", flush=True)

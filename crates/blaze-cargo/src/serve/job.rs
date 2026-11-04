@@ -111,7 +111,7 @@ use super::{
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
         Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library,
-        Linking, Phase, Readers, RunPuts, Runs, Selection, Source, Steps, Writer,
+        Linking, LocalRead, Phase, Readers, RunPuts, Runs, Selection, Source, Steps, Writer,
     },
 };
 use crate::cli::print::Format;
@@ -135,6 +135,10 @@ pub enum Value<S: Steps> {
     Library(Result<Library, ApiError>),
     /// The fetch at its place in its batch ([`Fetching::fetches`]).
     Fetched(Arc<[Fetch]>, u32, Result<Source, ApiError>),
+    /// The [`FetchKind::Local`] at its place in its batch, read where it is on the disk.
+    Local(Arc<[Fetch]>, u32, Result<LocalRead, ApiError>),
+    /// The local mounts read again before a view is opened ([`Stage::Locals`]).
+    Locals(Result<Vec<LocalRead>, ApiError>),
     Planned(Result<Planned, ApiError>),
     /// The pinned native input of digest [`native_key`] laid out ([`Steps::native`]): its
     /// directory.
@@ -252,6 +256,7 @@ fn unavailable(
             FetchKind::Crate { .. } => "package",
             FetchKind::IndexFile => "index file",
             FetchKind::Git { .. } => "git tree",
+            FetchKind::Local { .. } => "path on disk",
         };
         what.push_str(&format!("\n  - {} ({kind}) from {}", fetch.what, fetch.url));
         // Without `net` each says the same (no HTTP client), said once below instead.
@@ -297,6 +302,7 @@ fn fetch_key(fetch: &Fetch) -> Key {
         FetchKind::Crate { sha256 } => hasher.part(b"crate").part(sha256.as_bytes()),
         FetchKind::IndexFile => hasher.part(b"index"),
         FetchKind::Git { commit } => hasher.part(b"git").part(commit.as_bytes()),
+        FetchKind::Local { probe } => hasher.part(b"local").part(&[u8::from(*probe)]),
     };
     Key(hasher.finish().0)
 }
@@ -310,20 +316,12 @@ pub struct Step<S: Steps> {
 
 /// What a batch's tasks do, each with what it owns.
 pub(super) enum Does<S: Steps> {
-    Library {
-        steps: Arc<S>,
-        kept: Vec<(String, String)>,
-    },
-    Plan {
-        steps: Arc<S>,
-        db: Arc<Database>,
-        queries: ViewId,
-    },
-    /// Task `at` fetches `fetches[at]`.
-    Fetch {
-        steps: Arc<S>,
-        fetches: Arc<[Fetch]>,
-    },
+    Library { steps: Arc<S>, kept: Vec<(String, String)> },
+    Plan { steps: Arc<S>, db: Arc<Database>, queries: ViewId },
+    /// Task `at` fetches `fetches[at]`, or reads it where it is on the disk.
+    Fetch { steps: Arc<S>, fetches: Arc<[Fetch]> },
+    /// The local mounts at `ats` read again, what is under them maybe changed.
+    Locals { steps: Arc<S>, ats: Vec<String> },
     /// The units' pinned native inputs laid out, before the lowering ([`Steps::native`]).
     /// One digest's layout, for every input of it: `input` is one of them.
     Native {
@@ -452,6 +450,7 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Library { .. } => tracing::info_span!("std library"),
             Does::Plan { .. } => tracing::info_span!("plan"),
             Does::Fetch { .. } => tracing::info_span!("fetch"),
+            Does::Locals { ats, .. } => tracing::info_span!(target: "blaze", "local mounts", count = ats.len()),
             Does::Native { input, .. } => tracing::info_span!(target: "blaze", "pinned native input", input = %input.name, sha256 = %input.sha256),
             Does::Lower { .. } => tracing::info_span!("lower workspace"),
             // Its phases have spans of their own (`unit::compile::compile`).
@@ -471,21 +470,24 @@ impl<S: Steps> plane::Work for Step<S> {
         }
         .entered();
         match &self.does {
-            Does::Library { steps, kept } => {
-                self.settle(steps.library(kept).map_err(Failed::Error), Value::Library)
+            Does::Library { steps, kept } => self.settle(steps.library(kept).map_err(Failed::Error), Value::Library),
+            Does::Plan { steps, db, queries } => self.settle(steps.plan(db, *queries), Value::Planned),
+            Does::Fetch { steps, fetches } => match &fetches[at].kind {
+                FetchKind::Local { .. } => {
+                    let read = steps.local(&fetches[at]).map_err(Failed::Error);
+                    // clone: a refcount per path read
+                    self.settle(read, |it| Value::Local(fetches.clone(), arg, it))
+                }
+                _ => {
+                    let fetched = steps.fetch(&fetches[at]).map_err(Failed::Error);
+                    // clone: a refcount per fetch
+                    self.settle(fetched, |it| Value::Fetched(fetches.clone(), arg, it))
+                }
+            },
+            Does::Locals { steps, ats } => self.settle(steps.locals(ats).map_err(Failed::Error), Value::Locals),
+            Does::Native { steps, input, key } => {
+                self.settle(steps.native(input, &self.cancelled).map_err(Failed::Error), |it| Value::Native(*key, it))
             }
-            Does::Plan { steps, db, queries } => {
-                self.settle(steps.plan(db, *queries), Value::Planned)
-            }
-            Does::Fetch { steps, fetches } => {
-                let fetched = steps.fetch(&fetches[at]).map_err(Failed::Error);
-                // clone: a refcount per fetch
-                self.settle(fetched, |it| Value::Fetched(fetches.clone(), arg, it))
-            }
-            Does::Native { steps, input, key } => self
-                .settle(steps.native(input, &self.cancelled).map_err(Failed::Error), |it| {
-                    Value::Native(*key, it)
-                }),
             Does::Lower { steps, input, kept, leases, checkout, builds } => {
                 // Its build dirs' leases, before anything is built into them: here, on the pool.
                 // The lock is held only to read and store the field, never across the lease's
@@ -868,7 +870,8 @@ fn command_of(work: &Work) -> Command {
         | Work::Tables
         | Work::Snapshot
         | Work::Edit(_)
-        | Work::Pack { .. } => Command::Check,
+        | Work::Pack { .. }
+        | Work::Lock(_) => Command::Check,
         Work::Doc { .. } => Command::Doc,
     }
 }
@@ -889,7 +892,8 @@ fn goal_of(work: &Work) -> Goal {
         | Work::Snapshot
         | Work::Edit(_)
         | Work::Pack { .. }
-        | Work::Doc { .. } => Goal::Check,
+        | Work::Doc { .. }
+        | Work::Lock(_) => Goal::Check,
     }
 }
 
@@ -916,7 +920,8 @@ fn reads_front_unbuilt(work: &Work) -> bool {
         | Work::Trace(_)
         | Work::Tables
         | Work::Pack { .. }
-        | Work::Doc { .. } => false,
+        | Work::Doc { .. }
+        | Work::Lock(_) => false,
     }
 }
 
@@ -937,6 +942,7 @@ fn work_word(work: &Work) -> &'static str {
         Work::Doc { .. } => "doc",
         Work::Edit(_) => "edit",
         Work::Ahead { .. } => "ahead",
+        Work::Lock(_) => "lock",
     }
 }
 
@@ -973,7 +979,8 @@ fn targets_of(work: &Work) -> Option<&Targets> {
         | Work::Reach { targets, .. }
         | Work::Ahead { targets, .. }
         | Work::Pack { targets, .. }
-        | Work::Doc { targets, .. } => Some(targets),
+        | Work::Doc { targets, .. }
+        | Work::Lock(targets) => Some(targets),
         Work::Tables | Work::Snapshot | Work::Edit(_) => None,
     }
 }
@@ -1412,6 +1419,8 @@ struct Ready<S: Steps> {
 
 enum Stage<S: Steps> {
     Library(NodeId),
+    /// The local mounts no watch vouches for being read again, the view to open once they are.
+    Locals(NodeId, Opened),
     Plan(NodeId, Prep),
     Fetch(Fetching),
     /// The view's pinned native inputs being laid out, the lowering to post once they are.
@@ -1925,9 +1934,8 @@ impl<S: Steps> std::fmt::Display for WaitedOn<'_, S> {
             }
             write!(f, "; job {id} ")?;
             match &job.stage {
-                Stage::Library(node) => {
-                    write!(f, "waits for the toolchain's library, node {}", node.0)?
-                }
+                Stage::Library(node) => write!(f, "waits for the toolchain's library, node {}", node.0)?,
+                Stage::Locals(node, _) => write!(f, "waits for its paths outside the view to be read again, node {}", node.0)?,
                 Stage::Plan(node, _) => write!(f, "waits for its plan, node {}", node.0)?,
                 Stage::Fetch(fetching) => write!(
                     f,
@@ -2900,6 +2908,17 @@ impl<S: Steps> Jobs<S> {
             self.end(w, id, false, Some(ApiError::new("the job has no view to build", None)));
             return;
         };
+        // Paths outside the view read where they are on the disk ([`Mounts::mount_local`]):
+        // each the watch can't vouch for is read again before the view's configuration takes
+        // its mount, so the build reads what is on the disk now, never a stale copy.
+        let ats = w.mounts.stale_locals(|dir, generation| blaze_vfs::outside::unchanged_since(std::path::Path::new(dir), generation));
+        if !ats.is_empty() {
+            let work = Step::of(&job.cancelled, Does::Locals { steps: w.steps.clone(), ats }); // clone: a refcount, once
+            let fresh = lone(w.plane, NodeKind::Fetch, "paths outside the view, read again", Pool::Io, None, kinds::FETCH);
+            job.stage = Stage::Locals(fresh.first(), opened);
+            self.add(w, id, fresh, Some(work), false);
+            return;
+        }
         self.open(w, id, opened, HashSet::new_in(Global));
     }
 
@@ -2943,6 +2962,7 @@ impl<S: Steps> Jobs<S> {
             std: self.setup.std.clone(), // clone: the config owns it, once per view
             builds: self.setup.builds.clone(), // clone: the config owns it, once per view
             sources: self.setup.sources.clone(), // clone: the config owns it, once per view
+            blaze: crate::release::get().version.to_owned(), // alloc: the config owns it, once per view
         };
         let encoded = config.encode();
         let key =
@@ -3316,6 +3336,17 @@ impl<S: Steps> Jobs<S> {
                 // clone: a failed fetch's place, once per source
                 self.fetch_failed.insert(fetches[at as usize].at.clone(), error);
             }
+            Value::Local(fetches, at, Ok(read)) => {
+                let fetch = &fetches[at as usize];
+                if let Err(why) = w.mounts.mount_local(w.vfs, read) {
+                    // clone: a failed read's names, once per path
+                    self.fetch_failed.insert(fetch.at.clone(), ApiError::new(why, Some(fetch.what.clone())));
+                }
+            }
+            Value::Local(fetches, at, Err(error)) => {
+                // clone: a failed read's place, once per path
+                self.fetch_failed.insert(fetches[at as usize].at.clone(), error);
+            }
             Value::Compiled(unit, result, images) => {
                 self.keep_images(node, unit, images);
                 self.compiled(w, node, unit, result);
@@ -3440,6 +3471,23 @@ impl<S: Steps> Jobs<S> {
                         ApiError::new(format!("the standard library's source: {why}"), None) // alloc: an error, once
                     });
                     self.end(w, id, false, Some(error));
+                }
+            }
+            Stage::Locals(at, opened) if at == node => {
+                let read = match job.take_value(node) {
+                    Some(Value::Locals(read)) => read,
+                    // alloc: an error, once
+                    _ => Err(ApiError::new(format!("reading the paths outside the view again: {why}"), None)),
+                };
+                let mounted = read.and_then(|reads| {
+                    reads.into_iter().try_for_each(|read| {
+                        let at = read.at.clone(); // clone: an error's place, once per path
+                        w.mounts.mount_local(w.vfs, read).map(drop).map_err(|why| ApiError::new(why, Some(at)))
+                    })
+                });
+                match mounted {
+                    Ok(()) => self.open(w, id, opened, HashSet::new_in(Global)),
+                    Err(error) => self.end(w, id, false, Some(error)),
                 }
             }
             Stage::Plan(at, prep) if at == node => match job.take_value(node) {
@@ -3646,6 +3694,26 @@ impl<S: Steps> Jobs<S> {
                     if w.mounts.has(&fetch.at) {
                         continue;
                     }
+                    // A path read where it is must be outside what blaze keeps itself: one
+                    // under its sources or its agents' views is a source fetched or a view
+                    // mounted, and a load asking for it there is a bug, said, never read past.
+                    // Owned, so no borrow of `self` outlives the check into the `end` below.
+                    let kept = match fetch.kind {
+                        // clone: an error's text, only when it is under one
+                        FetchKind::Local { .. } => {
+                            [&self.setup.sources, &self.setup.views].into_iter().find(|it| under(&fetch.at, it)).cloned()
+                        }
+                        _ => None,
+                    };
+                    if let Some(kept) = kept {
+                        let error = ApiError::new(
+                            // alloc: an error, once
+                            format!("the load asked to read {} where it is on the disk, but it is under {kept}, which blaze keeps and mounts itself", fetch.at),
+                            Some(fetch.at.clone()), // clone: an error, once
+                        );
+                        self.end(w, id, false, Some(error));
+                        return;
+                    }
                     let verb = match &fetch.kind {
                         FetchKind::Crate { .. } => {
                             Some((FetchVerb::Downloaded, fetch.what.clone()))
@@ -3656,6 +3724,7 @@ impl<S: Steps> Jobs<S> {
                                 .insert(fetch.what.clone())
                                 .then(|| (FetchVerb::Updating, fetch.what.clone()))
                         }
+                        FetchKind::Local { .. } => None,
                     };
                     if let Some((verb, what)) = verb {
                         w.said.push(Said::Report(id, Response::Fetched { verb, what }));
@@ -3746,29 +3815,42 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         if let Some(lock) = lock {
-            let path = self.paths.intern(&lock.path);
-            // clone: the driver's effect owns the file's name, once per lock write
-            let Some(file) = self.paths.files[path as usize].clone() else {
-                // alloc: an error, once
-                let error = ApiError::new(
-                    format!("the lock file's path {} is no file", lock.path),
-                    Some(lock.path),
-                );
-                self.end(w, id, false, Some(error));
-                return;
-            };
-            let tag = match self.own_tag(Own::Write { job: id, path }) {
-                Ok(tag) => tag,
-                Err(error) => {
+            // Each lock file the load let this build write (`Cargo.lock`, `blaze.lock`), then
+            // what it says of them: a write is never silent (docs/cargo.md, "Lock files").
+            for written in lock.files {
+                let path = self.paths.intern(&written.path);
+                // clone: the driver's effect owns the file's name, once per lock write
+                let Some(file) = self.paths.files[path as usize].clone() else {
+                    // alloc: an error, once
+                    let error = ApiError::new(
+                        format!("the lock file's path {} is no file", written.path),
+                        Some(written.path),
+                    );
                     self.end(w, id, false, Some(error));
                     return;
-                }
-            };
-            self.begin_placing(id, path);
-            w.effects.push(Effect::Write { file, bytes: lock.text.into_bytes(), tag });
+                };
+                let tag = match self.own_tag(Own::Write { job: id, path }) {
+                    Ok(tag) => tag,
+                    Err(error) => {
+                        self.end(w, id, false, Some(error));
+                        return;
+                    }
+                };
+                self.begin_placing(id, path);
+                w.effects.push(Effect::Write { file, bytes: written.text.into_bytes(), tag });
+            }
+            for line in &lock.said {
+                w.said.push(Said::Report(id, Response::Diagnostic(lock_note(line))));
+            }
         }
         for warning in &units.warnings {
             w.said.push(Said::Report(id, Response::Diagnostic(warned(warning))));
+        }
+        // `blaze lock` stops here: its plan wrote the lock files; nothing is lowered or built. The
+        // job finishes once those writes are placed ([`Jobs::wind_up`]).
+        if self.jobs.get(key_of(id)).is_some_and(|job| matches!(job.work, Work::Lock(_))) {
+            self.end(w, id, true, None);
+            return;
         }
         let short = match short(&prep.config.invocation.args) {
             Ok(short) => short,
@@ -5233,9 +5315,13 @@ impl<S: Steps> Jobs<S> {
         }
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
         let Build { input, front, mut writer, artifacts, evaluation, root, units, .. } = *build;
+        // A lint over every configuration denied (`blaze::dead` at `deny`) fails the build as
+        // a unit's denied lint does.
+        let mut denied = false;
         match writer.finished(ok, &units) {
             Ok(warnings) => {
                 for warning in warnings {
+                    denied |= warning.level == blaze_api::Level::Error;
                     w.said.push(Said::Report(id, Response::Diagnostic(warning)));
                 }
             }
@@ -5244,6 +5330,7 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         }
+        let (ok, runs, pack) = (ok && !denied, runs && !denied, pack && !denied);
         let served = match writer.served() {
             Ok(it) => it,
             Err(error) => {
@@ -6094,6 +6181,7 @@ fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<St
                 None,
             ));
         }
+        Work::Lock(_) => return Err(ApiError::new("a lock job ends once its plan is made, answering nothing more", None)),
     };
     Ok(Step::of(&job.cancelled, does))
 }
@@ -6182,6 +6270,7 @@ fn keeps_going(work: &Work) -> bool {
 fn stage_name<S: Steps>(stage: &Stage<S>) -> &'static str {
     match stage {
         Stage::Library(_) => "reading the standard library",
+        Stage::Locals(..) => "reading its paths outside the view again",
         Stage::Plan(..) => "planning",
         Stage::Fetch(_) => "fetching",
         Stage::Native(..) => "laying out its pinned native inputs",
@@ -6260,6 +6349,22 @@ fn script_ended<S: Steps>(w: &mut World<'_, S>, node: NodeId, ok: bool) {
 }
 
 /// A warning of the load, as cargo prints it.
+/// What a build says of the lock files it wrote ([`LockWrite::said`]), as a note.
+fn lock_note(line: &str) -> Diagnostic {
+    // alloc: a line of the lock write, once per plan that writes one
+    Diagnostic {
+        level: Level::Note,
+        code: None,
+        message: line.to_owned(), // alloc: the report owns it
+        spans: Vec::new(),        // alloc: none
+        children: Vec::new(),     // alloc: none
+        facts: Vec::new(),        // alloc: none
+        rendered: format!("note: {line}\n"), // alloc: the report owns it
+        unit: None,
+        explanation: None,
+    }
+}
+
 fn warned(warning: &str) -> Diagnostic {
     // alloc: a warning of the load, once per plan
     Diagnostic {
@@ -6366,4 +6471,10 @@ fn verify<S: Steps>(
         }
     }
     Ok(mismatches)
+}
+
+/// Whether `path` is `dir` or under it, by whole components.
+fn under(path: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches('/');
+    path.strip_prefix(dir).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }

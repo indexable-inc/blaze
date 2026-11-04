@@ -22,7 +22,7 @@ use crate::{
     ViewRef, Worked,
 };
 
-const REQUESTS: usize = 35;
+const REQUESTS: usize = 36;
 const RESPONSES: usize = 44;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
@@ -333,6 +333,7 @@ impl Gen {
                 ended_ns: self.wide() as i64,
                 started_ns: self.wide() as i64,
             },
+            34 => Request::Lock { view: self.view(0), targets: self.targets() },
             _ => Request::Stop,
         }
     }
@@ -949,7 +950,8 @@ fn request_index(request: &Request) -> usize {
         Request::Launch { .. } => 31,
         Request::FetchUrl { .. } => 32,
         Request::ClientRows { .. } => 33,
-        Request::Stop => 34,
+        Request::Lock { .. } => 34,
+        Request::Stop => 35,
     }
 }
 

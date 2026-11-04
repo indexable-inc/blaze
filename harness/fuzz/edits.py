@@ -452,7 +452,11 @@ def read_found(path):
 
 def check(paths, profiles, work):
     """Each file given, or all of found/edits/: whether a daemon shown its sources in turn gets one wrong."""
-    paths = paths or sorted(os.path.join(EDITS, name) for name in os.listdir(EDITS) if name.endswith(".rs")) if os.path.isdir(EDITS) else paths
+    paths = (
+        paths or sorted(os.path.join(EDITS, name) for name in os.listdir(EDITS) if name.endswith(".rs"))
+        if os.path.isdir(EDITS)
+        else paths
+    )
     wrong = 0
     for path in paths:
         path = path if os.path.exists(path) else os.path.join(EDITS, path)
@@ -553,11 +557,7 @@ def report(directory):
     findings = 0
     for profile in sorted({profile for result in results for profile in result["profiles"]}):
         rows = [row for result in results for row in result["profiles"].get(profile, [])]
-        edits = [
-            row
-            for row in rows
-            if row["kind"] not in ("start", "end") and row["how"] != NOT_FRESH
-        ]
+        edits = [row for row in rows if row["kind"] not in ("start", "end") and row["how"] != NOT_FRESH]
         wrong = [row for row in rows if row["wrong"]]
         findings += len(wrong)
         kinds = collections.Counter(row["wrong"].split(":")[0].split(" in ")[0] for row in wrong)

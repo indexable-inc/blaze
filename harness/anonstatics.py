@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """anonstatics.py: a static in a `const _` block of a crate rustc built, which an edit reaches
-through code blaze compiles, is rustc's static. Linux and macOS: on Windows `blaze`
-hands builds to cargo.
+through code blaze compiles, is rustc's static. Linux and macOS.
 
 usage: anonstatics.py    (BLAZE_BIN names the blaze built; blaze is found next to
                           it)
@@ -18,7 +17,8 @@ a rustc symbol"), so every edit of a winit program's frame function fell back to
 Here `mac` is objc2 (the macro, the trait, the generic reader), `dep` is winit (the class and
 generic code the program instantiates) and `app` the program, whose `frame` inlines all of it.
 Both libraries are outside the workspace, so rustc builds them. Every edit has to be served by
-the daemon and the program has to print the offset rustc's code wrote plus the edited value.
+the daemon (the build prints a `blaze-work` line under `--message-format=json`) and the program
+has to print the offset rustc's code wrote plus the edited value.
 
 Python 3, stdlib only.
 """
@@ -27,10 +27,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import glob
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import worked  # noqa: E402
+
 os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
 TIMEOUT = 900
 FILES = {
@@ -105,12 +107,13 @@ STEPS = [
 
 
 def build(ws, env, step):
-    ran = subprocess.run(["blaze", "build"], cwd=ws, env=env, capture_output=True, text=True,
-                         timeout=TIMEOUT)
+    """`blaze build --message-format=json`: what it printed on stdout, and everything it said."""
+    ran = subprocess.run(["blaze", "build", "--message-format=json"], cwd=ws, env=env,
+                         capture_output=True, text=True, timeout=TIMEOUT)
     said = ran.stdout + ran.stderr
     if ran.returncode != 0:
         raise SystemExit(f"{step}: the build failed:\n{said[-3000:]}")
-    return said
+    return ran.stdout, said
 
 
 def main():
@@ -131,25 +134,19 @@ def main():
     program, source = os.path.join(ws, "target", "debug", "aapp"), os.path.join(ws, "app", "src", "main.rs")
     wrong = 0
     try:
+        # The first build starts the daemon and is served by it: no wait for it.
         build(ws, env, "first build")
-        for _ in range(240):
-            if "[blaze]" in build(ws, env, "wait for the daemon"):
-                break
-            time.sleep(0.5)
-        else:
-            raise SystemExit(f"no build said `[blaze]`; the daemon's log is in {home}")
         for what, (old, new), expected in STEPS:
             text = open(source).read()
             assert old in text, (what, old)
             open(source, "w").write(text.replace(old, new, 1))
-            said = build(ws, env, what)
+            out, said = build(ws, env, what)
             printed = subprocess.run([program], capture_output=True, text=True, timeout=60).stdout.strip()
             verdict = "ok"
             if printed != expected:
                 verdict = f"PRINTED {printed!r}, NOT {expected!r}"
-            elif "[blaze]" not in said:
-                why = [line for line in said.splitlines() if "blaze" in line]
-                verdict = "NOT SERVED BY THE DAEMON: " + " | ".join(why)[-600:]
+            elif not worked(out):
+                verdict = "NOT SERVED BY THE DAEMON (no `blaze-work` line): " + said[-600:].replace("\n", " | ")
             wrong += verdict != "ok"
             print(f"{what:42} {verdict}", flush=True)
     finally:

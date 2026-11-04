@@ -140,6 +140,7 @@ pub(super) fn check(
         // A check writes no file of the probe: its build directory is named, never made.
         builds: format!("{DIR}/build"),
         sources: format!("{DIR}/sources"),
+        blaze: String::new(),
     };
     let view = db.open_with(View { root: tree.view }, &config.encode());
     let planned = db

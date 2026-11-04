@@ -110,7 +110,11 @@ STEPS = [
     ("a function added to it", [(FAR_CODE, "\n}\n", "\n}\npub fn more() -> u32 {\n    1\n}\n")], False),
     ("used from the including file", [(MAIN, "far::code());", "far::code() + far::more());")], False),
     ("remove the outside include! input", [(FAR_CODE, None, None)], True),
-    ("restore it", [(FAR_CODE, None, "pub fn code() -> u32 {\n    43\n}\npub fn more() -> u32 {\n    2\n}\n")], False),
+    (
+        "restore it",
+        [(FAR_CODE, None, "pub fn code() -> u32 {\n    43\n}\npub fn more() -> u32 {\n    2\n}\n")],
+        False,
+    ),
     ("nothing edited at the end", [], False, True),
 ]
 
@@ -172,7 +176,10 @@ def follow(files, steps):
                 verdict = "RECOMPILED" if fresh[0] else "NOT REBUILT"
                 said = f"unit kept: {kept(built.said, 'sinc')}, expected {fresh[0]}"
             wrong += verdict in WRONG or verdict in ("BOTH REFUSED", "RECOMPILED", "NOT REBUILT")
-            print(f"{what:40} {verdict:16} {took:6.0f} ms  {said.splitlines()[0][:90] if said else ''}", flush=True)
+            print(
+                f"{what:40} {verdict:16} {took:6.0f} ms  {said.splitlines()[0][:90] if said else ''}",
+                flush=True,
+            )
             if verdict == "DAEMON DIED":
                 raise SystemExit(f"the daemon died: its log is in {project.home}")
     finally:

@@ -84,8 +84,9 @@ use serde::{Deserialize, Serialize};
 /// [`Request::Flush`] and [`Response::Flushed`] in place of `Request::Sql` (`blaze debug sql
 /// --live`) and `Response::Queried`: a reader of the profile history asks the daemon to flush,
 /// then reads the history itself; and [`Request::ClientRows`] and [`Worked::build_id`]: a client
-/// sends its own recorder's rows of a build to the daemon, which writes them to the history.
-pub const SCHEMA: u32 = 38;
+/// sends its own recorder's rows of a build to the daemon, which writes them to the history. 39:
+/// [`Request::Lock`].
+pub const SCHEMA: u32 = 39;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -442,6 +443,11 @@ pub enum Request {
         most_bytes: Option<u64>,
         out: Option<String>,
     },
+    /// `blaze lock`: the workspace resolved as `targets` asks and its lock files (`Cargo.lock`,
+    /// `blaze.lock`) written when they change, whatever `CI` or `lock = "required"` says
+    /// (`Targets::cargo` carries `--no-locked`); nothing checked or built, no build script run.
+    /// Answered with what it wrote as note [`Response::Diagnostic`]s, or the load's error.
+    Lock { view: ViewRef, targets: Targets },
     /// What a client recorded of build `build` (its [`Worked::build_id`]), sent as the request
     /// that asked for it ends: its own `spans`, `events` and `folded` rows, each an Arrow IPC
     /// stream of the profile schema's table (empty for none), every row's `build_id` the

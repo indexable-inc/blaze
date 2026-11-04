@@ -47,6 +47,13 @@ pub(crate) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
     found
 }
 
+/// blaze: what the crate, as its configuration builds it, says of its definitions for the
+/// lints over every configuration (`crate::reach`): the dead-code pass's liveness and what it
+/// would report, with no diagnostic made.
+pub(crate) fn observe(cx: &Cx<'_, '_>) -> crate::reach::Observation {
+    dead::observe(cx, cx.effective())
+}
+
 #[cfg(test)]
 mod tests {
     use blaze_alloc_count::assert_at_most;

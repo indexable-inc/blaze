@@ -348,7 +348,7 @@ daemon died.
 
 **The client's rows.** Only the daemon writes the history. A client that ran a build sends
 its own flight recorder's rows (its start-up, connect, printing, a toolchain download) at its
-request's end as `Request::ClientRows` (blaze-api schema 36), every row tagged with the build
+request's end as `Request::ClientRows` (blaze-api schema 38), every row tagged with the build
 id the daemon gave it in `Worked::build_id`, with its start and end on the history's clock.
 The daemon writes them into `spans`, `events` and `folded` as the client's process
 (`process_name` = `blaze client`, `pid` the client's) and refuses rows of another build. The

@@ -128,12 +128,15 @@ jobs:
           pattern: answers-*
           path: ${{ runner.temp }}/answers
           merge-multiple: true
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           python3 .github/scripts/toolchain_bump_ci.py answers "$RUNNER_TEMP"/answers/rustc-*.json
+          # The CPU table (target_features::cpus) is the new answers' CPUs and their features.
+          uv run --frozen --no-dev python tools/cpus.py '{"write": true}'
           python3 .github/scripts/toolchain_bump_ci.py pr
       - if: failure()
         env:

@@ -58,6 +58,8 @@ blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-mem.workspace = true
 blaze-stencil.workspace = true
+# The CPUs of `-C target-cpu` and their features (target_features::cpus): the toolchain's CPU.
+target-features.workspace = true
 
 cranelift-codegen = { workspace = true, features = ["enable-serde", "x86", "arm64"] }
 cranelift-frontend.workspace = true

@@ -115,6 +115,12 @@ struct RecordRef<'a> {
 /// [`crate::serve::RecordMakers`] in place of the executable's bytes.
 const RECORD: &str = "blaze v2 cargo unit record 9";
 const OUTPUT: &str = "blaze v2 cargo output 1";
+
+/// The store's key of an output file's `bytes`: what a record names it by, and what a dev
+/// executable's program is known by in the daemon's code memory ([`super::run::inproc`]).
+pub(crate) fn output_key(bytes: &[u8]) -> Key {
+    Key(ContentId::of(OUTPUT, bytes))
+}
 /// A span table's anchor and content, as a test's selection holds it.
 const SPANS: &str = "blaze v2 cargo test spans 1";
 /// A test binary's context with the native inputs its link read, in link order.
@@ -1381,7 +1387,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
 /// mount's file there, not a path under a mount's directory: `target/` is under the
 /// workspace's, and the view has none of its outputs. A file the database has no text of is
 /// left out, and [`assemble`] names it as unread.
-fn unmounted(reader: &UnitReader, mounted: &Mounted, diags: &[Diag]) -> Vec<(String, String)> {
+pub(super) fn unmounted(reader: &UnitReader, mounted: &Mounted, diags: &[Diag]) -> Vec<(String, String)> {
     let db = reader.db();
     let names: Vec<&str> = blaze_diagnostics::emit::Sources::default()
         .unread(diags)
@@ -1451,7 +1457,10 @@ fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> 
 
 /// `diags`, the check's, with what clippy's lints and blaze's find in the unit's crate under
 /// `cargo clippy`, at the levels of its lint flags and attributes, before rustc's closing lines,
-/// which are made again to count them.
+/// which are made again to count them. `dead_code` is left out: `blaze::dead` says it once
+/// the job's units end, over every configuration of the package ([`super::configs`]), so an
+/// item another configuration uses is never called dead here. What drops it is the unit's own
+/// plan (it is linted), which its record's key covers.
 #[expect(
     clippy::too_many_arguments,
     reason = "the crate, where its files are named from, its plan and the check's"
@@ -1498,6 +1507,7 @@ fn linted(
         .map_err(|why| ApiError::new(why.to_string(), at()))?;
     let end = diags.iter().rposition(|it| !closing(it)).map_or(0, |at| at + 1);
     diags.truncate(end);
+    diags.retain(|it| it.lint_name() != Some("dead_code"));
     diags.extend(found.into_iter().map(|it| it.diagnostic));
     let closing = blaze_diagnostics::emit::summary(diags.iter());
     diags.extend(closing);
@@ -1625,6 +1635,7 @@ fn link(
 ) -> Result<(), Failed> {
     if let Some(mut kept) = phases.kept.take() {
         kept.macros = macros(job, reader, unit, kept.ok, Module::Kept(&kept));
+        held(job, unit, &mut kept)?;
         phases.linked = Some(Linked::Kept(kept));
         return Ok(());
     }
@@ -1680,6 +1691,74 @@ fn link(
     // with the std code each reaches copied into every one, was the 8 GiB codegen heap of a
     // `blaze test` of 21 small crates (B5, coord-105).
     phases.generated = None;
+    Ok(())
+}
+
+/// A dev executable's record replayed ([`super::run::Launch::InProcess`]): each program it
+/// names held by the daemon as that file ([`super::run::inproc::DevRuns::adopt`]), at its path
+/// and at the copy cargo makes of it, so a run of the build starts the code the record is of.
+/// The daemon holds only what it linked or adopted: a record another daemon made, or one of
+/// an earlier value of the unit's inputs than the daemon's last link at the path (a variable
+/// the build script reads set back), runs its own file, never the daemon's other link. A
+/// running program replaced is told to start again, and the build says so.
+fn held(job: &Job, unit: usize, kept: &mut Compiled) -> Result<(), Failed> {
+    if !kept.ok {
+        return Ok(());
+    }
+    let plan = job.plan(unit)?;
+    let made = artifact::made(plan);
+    let programs =
+        || kept.outputs.iter().filter(|it| it.executable && made.contains(&it.path.as_str()));
+    if programs().next().is_none() {
+        return Ok(());
+    }
+    // The question its link asked ([`codegen::policy`]): a live build is a dev executable's.
+    let policy =
+        codegen::toolchain(job, unit).and_then(|toolchain| codegen::policy(job, unit, toolchain));
+    if policy.map_err(|what| ApiError::new(what, None))?.mode != blaze_codegen::plan::Mode::Live {
+        return Ok(());
+    }
+    let guard = blaze_cas::enter();
+    let mut told = Vec::new();
+    for output in programs() {
+        let path = output.path.as_str();
+        // Read only when the daemon does not hold the program by this key already.
+        let bytes = || match kept.puts.iter().find(|it| it.key == output.key) {
+            Some(put) => Ok(&put.bytes[..]),
+            None => match job.input.store.get(&guard, &output.key) {
+                Ok(Some(it)) => Ok(it.bytes),
+                // alloc: error path
+                Ok(None) => Err(format!(
+                    "its record names the output {:x}, which the store does not hold",
+                    output.key.0
+                )),
+                // alloc: error path
+                Err(corrupt) => Err(format!(
+                    "reading the output {:x} from the store: {corrupt}",
+                    output.key.0
+                )),
+            },
+        };
+        let runs_from = artifact::uplifted(path, plan);
+        let adopted = job.shared.dev_runs.adopt(path, runs_from, output.key, bytes);
+        match adopted.map_err(|what| ApiError::new(format!("{path}: {what}"), None))? {
+            // alloc: a path, once per running program replaced
+            super::run::inproc::Told::Restart { why } => told.push((path.to_owned(), why)),
+            super::run::inproc::Told::Nothing | super::run::inproc::Told::Patched { .. } => {}
+        }
+    }
+    if told.is_empty() {
+        return Ok(());
+    }
+    let unit_of = job.unit_of(unit)?;
+    for (path, why) in told {
+        // alloc: a warning's text, once per restart
+        let what = format!(
+            "`{path}` is running and can't take this build as a patch: {why}; start it again to run it"
+        );
+        let said = say::cargo(Level::Warning, what, Some(unit_of.clone()), job.input.color);
+        kept.diagnostics.push(said);
+    }
     Ok(())
 }
 
@@ -1752,7 +1831,7 @@ fn store(
         let mut keyed: Vec<(String, Key, bool)> = Vec::with_capacity(files.len());
         let mut output_keys: Vec<Key> = Vec::with_capacity(plan.outputs.len());
         let mut put_output = |puts: &mut Vec<Put>, bytes: Vec<u8>| {
-            let key = Key(ContentId::of(OUTPUT, &bytes));
+            let key = output_key(&bytes);
             if !output_keys.contains(&key) {
                 output_keys.push(key);
                 puts.push(Put { key, kind: Kind::Output, bytes });
@@ -2173,7 +2252,7 @@ fn macros_built(db: &base_db::Db, krate: base_db::Crate, u: &Unit) -> Result<(),
 }
 
 /// `unit`'s crate in the front end.
-fn crate_of(job: &Job, unit: usize, u: &Unit) -> Result<base_db::Crate, ApiError> {
+pub(super) fn crate_of(job: &Job, unit: usize, u: &Unit) -> Result<base_db::Crate, ApiError> {
     job.crates.krate(unit).ok_or_else(|| {
         // alloc: error path
         ApiError::new(
@@ -2186,7 +2265,7 @@ fn crate_of(job: &Job, unit: usize, u: &Unit) -> Result<base_db::Crate, ApiError
 /// The lint flags of `unit`'s check, and the options they give it in `db`
 /// ([`blaze_diagnostics::cache::Inputs::options`], the same a kept outcome of it is keyed by):
 /// an error for flags that name no lint blaze has, whether or not a check runs.
-fn options(
+pub(super) fn options(
     job: &Job,
     db: &base_db::Db,
     unit: usize,

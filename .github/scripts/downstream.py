@@ -14,7 +14,8 @@
           uv-archive-fixtures  uv's 39 ZIP extraction cases alone
           uv-lock-edit         an edit of a uv lock diagnostic and its test's assertion
           ty-semantic-edit     an edit of a ty diagnostic and its mdtest's assertion
-        Every run has to say blaze built it (cargo's `Finished` line with blaze's tag). An edit
+        Every run asks for JSON messages and has to print blaze's `blaze-work` line, the daemon's
+        account of the request: a run without one was not built by blaze. An edit
         suite runs its witness three times: unchanged (passes), with the diagnostic and its
         assertion edited (passes), and with the diagnostic restored under the edited
         assertion (fails, printing the edited text): an executable the edit did not reach
@@ -31,6 +32,7 @@ Ported from astral-experiments/blaze#38, #41, #44 and #80 (Charlie Marsh).
 """
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -39,19 +41,20 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from typed_input import fail, parse
 
 SCRIPT = "downstream.py"
 type Suite = Literal["ruff-and-ty", "uv", "uv-archive-fixtures", "uv-lock-edit", "ty-semantic-edit"]
 
-# What a run of blaze's prints when blaze built it: cargo's `Finished` line, tagged with blaze's
-# name (`blaze`, or `blaze, remote down: ...`). blaze hands nothing to cargo (docs/no-rustc.md),
-# so a run without it built nothing, whatever its status.
 # Colour, which a test's own output may have, out of what is matched.
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-BUILT_BY_BLAZE = re.compile(r"`[^`]+` profile \[blaze[^\]]*\] target\(s\) in ")
+# Every `blaze test` asks for JSON messages on stdout, diagnostics still rendered for people on
+# stderr: the daemon's `blaze-work` line (crates/blaze-ui/src/api.rs, `work_json`) is then how a
+# run says blaze built it. blaze hands nothing to cargo (docs/no-rustc.md), so a run without one
+# built nothing, whatever its status.
+JSON_MESSAGES = "--message-format=json-render-diagnostics"
 # The environment every suite's tests run in. One libtest thread: ruff's language-server tests
 # install a process-wide panic hook, and uv's native authentication tests share the system's
 # credential store, which upstream's nextest gives a process each.
@@ -188,8 +191,20 @@ def export(name: str, value: str) -> None:
 
 
 def built_by_blaze(output: str, what: str) -> None:
-    if not BUILT_BY_BLAZE.search(output):
-        raise Failed(f"{what}: blaze did not say it built the tests (no `profile [blaze] target(s)` line)")
+    """Refuses a run that printed no `blaze-work` message: only JSON objects are messages, so
+    what blaze and the tests print for people is never read."""
+    for line in output.splitlines():
+        if not line.startswith("{") or "blaze-work" not in line:
+            continue
+        try:
+            message: object = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(message, dict) and cast(dict[str, object], message).get("reason") == "blaze-work":
+            return
+    raise Failed(
+        f"{what}: blaze did not say it built the tests (no `blaze-work` message under {JSON_MESSAGES})"
+    )
 
 
 def target_dir(checkout: Path) -> Path:
@@ -301,13 +316,15 @@ async def test(it: Test) -> None:
                 "--all-features",
                 "--locked",
                 "--no-fail-fast",
+                JSON_MESSAGES,
             ]
             ran = await run("ruff and ty", argv, cwd=checkout, env=child_env(TEST_ENV), minutes=270)
             built_by_blaze(ran.output, "ruff and ty")
         case "uv":
             await uv_suite(checkout, scratch)
         case "uv-archive-fixtures":
-            argv = ["blaze", "test", "--locked", "-p", "uv", "--test", "build", "--", "extract::"]
+            argv = ["blaze", "test", "--locked", JSON_MESSAGES, "-p", "uv", "--test", "build"]
+            argv += ["--", "extract::"]
             ran = await run("uv's archive fixtures", argv, cwd=checkout, env=child_env(TEST_ENV), minutes=120)
             built_by_blaze(ran.output, "uv's archive fixtures")
             if "39 passed; 0 failed" not in ran.output:
@@ -339,6 +356,7 @@ async def uv_suite(checkout: Path, scratch: Path) -> None:
         "--workspace",
         "--locked",
         "--no-fail-fast",
+        JSON_MESSAGES,
         "--features",
         UV_FEATURES,
         "--",
@@ -479,6 +497,7 @@ async def edit(it: Edit, checkout: Path) -> None:
         "blaze",
         "test",
         "--locked",
+        JSON_MESSAGES,
         "-p",
         it.package,
         "--test",

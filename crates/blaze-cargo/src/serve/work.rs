@@ -6,7 +6,7 @@
 //!
 //! Where each is called is part of its contract:
 //!
-//! - **On an IO thread of the plane**: [`Steps::fetch`], [`Steps::library`], [`Steps::native`]. They may block on
+//! - **On an IO thread of the plane**: [`Steps::fetch`], [`Steps::local`], [`Steps::locals`], [`Steps::library`], [`Steps::native`]. They may block on
 //!   the network or the disk; they touch no state of the loop.
 //! - **On a worker of the plane**: [`Steps::lower`], [`Front::compile`], [`Front::reach`],
 //!   [`Front::ub_tests`], [`Front::evaluate`], [`Front::codegen_inputs`], [`Front::tables`],
@@ -205,6 +205,27 @@ pub struct Library {
     pub fingerprint: String,
     /// Its files; none when it is mounted as it is already.
     pub source: Option<Source>,
+}
+
+/// A path outside the view and every source, read from the disk where it is
+/// ([`blaze_units::query::FetchKind::Local`]): a `path` dependency outside the checkout, or a
+/// manifest its workspace search looks for above it. Mounted as a root of its own, keyed by its
+/// bytes as a fetched source is, and kept for later jobs only while the watch of directories
+/// outside views vouches that nothing under it changed ([`LocalRead::watched`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LocalRead {
+    /// Where it is mounted, as the load names it: the package directory around the path the
+    /// load read, or that path alone when no package holds it.
+    pub at: String,
+    /// Its files: a directory's whole tree (`under` ""), or one file, or none for a path that
+    /// is not there (`under` the file's name, so it reads as absent).
+    pub source: Source,
+    /// For a directory, the canonical path it was read from (every symlink resolved), whose
+    /// watch outside views says when to read it again; `None` for one file or an absent
+    /// path, read again by every job.
+    pub watched: Option<String>,
+    /// [`blaze_vfs::outside::generation`] as read before its files were.
+    pub generation: u64,
 }
 
 /// A value for the store, put by the loop.
@@ -540,6 +561,18 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// On an IO thread: the source `fetch` names, fetched and checked (a `.crate`'s sha256 and
     /// its paths kept inside it, a git tree at its commit, an index file as served).
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError>;
+    /// On an IO thread: the path a [`blaze_units::query::FetchKind::Local`] names, read from the
+    /// disk where it is ([`crate::serve::fetch::local::read`]): the package directory around
+    /// it, or the path alone.
+    fn local(&self, fetch: &Fetch) -> Result<LocalRead, ApiError> {
+        let probe = matches!(fetch.kind, blaze_units::query::FetchKind::Local { probe: true });
+        crate::serve::fetch::local::read(&fetch.at, probe)
+    }
+    /// On an IO thread: each of these local mounts read again exactly where it is mounted
+    /// ([`crate::serve::fetch::local::read_at`]), since what is under it may have changed.
+    fn locals(&self, ats: &[String]) -> Result<Vec<LocalRead>, ApiError> {
+        ats.iter().map(|at| crate::serve::fetch::local::read_at(at)).collect()
+    }
     /// On an IO thread: the standard library's `library/`, put into the VFS once: where it is
     /// named (`/rustc/<commit>/library`), its fingerprint, and its files unless `kept` (a
     /// fingerprint, and where that library is mounted) has it there, read before by this
@@ -726,8 +759,10 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// On the loop, once every task of the job's build has ended and before it is kept: what
     /// the build's front end found wrong only once all of it ran (a dependency's image that
     /// differs from what its crate resolves to, under `BLAZE_DEP_IMAGES=check`; a profile blaze
-    /// made that applied to nothing), as the build's error, or its warnings to say. `ok`:
-    /// whether the build succeeded; `built`: its nodes' units, a unit once a node.
+    /// made that applied to nothing), as the build's error, or its warnings to say, with what
+    /// `blaze check` lints over every configuration of a package at once (`blaze::dead`; an
+    /// error of those fails the build). `ok`: whether the build succeeded; `built`: its nodes'
+    /// units, a unit once a node.
     fn finished(
         &mut self,
         ok: bool,

@@ -73,8 +73,17 @@ from typed_input import fail, parse
 SCRIPT = "incremental.py"
 ROOT = Path(__file__).resolve().parent.parent
 # Read by blaze or cargo from the caller's environment; set here alone, or not at all.
-SCRUBBED = ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC",
-            "RUSTC_WRAPPER", "BLAZE_HOME", "XDG_RUNTIME_DIR", "BLAZE_DUCKDB")
+SCRUBBED = (
+    "CARGO_TARGET_DIR",
+    "CARGO_INCREMENTAL",
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "BLAZE_HOME",
+    "XDG_RUNTIME_DIR",
+    "BLAZE_DUCKDB",
+)
 
 
 @dataclass(frozen=True)
@@ -141,8 +150,12 @@ async def run(step: str, argv: list[str], cwd: Path, env: Mapping[str, str], bou
             f"{step}: {argv!r} ran past its bound of {bound_s:.0f} s (killed, exit {process.returncode}); "
             f"stderr's tail:\n{err.decode(errors='replace')[-3000:]}"
         ) from None
-    return Ran(process.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace"),
-               time.monotonic() - began)
+    return Ran(
+        process.returncode or 0,
+        out.decode(errors="replace"),
+        err.decode(errors="replace"),
+        time.monotonic() - began,
+    )
 
 
 type Row = dict[str, object]
@@ -218,10 +231,17 @@ class Gate:
 
     async def sql(self, what: str, query: str) -> list[Row]:
         """`query` over the home's profile history, a row a dict."""
-        ran = await run(f"reading {what} from the history", [self.it.blaze, "debug", "sql", "--json", query],
-                        self.workspace, self.env, 120)
+        ran = await run(
+            f"reading {what} from the history",
+            [self.it.blaze, "debug", "sql", "--json", query],
+            self.workspace,
+            self.env,
+            120,
+        )
         if ran.code != 0:
-            raise Failed(f"reading {what}: `blaze debug sql --json` exited {ran.code}: {query}\n{ran.stderr[-3000:]}")
+            raise Failed(
+                f"reading {what}: `blaze debug sql --json` exited {ran.code}: {query}\n{ran.stderr[-3000:]}"
+            )
         rows: list[Row] = []
         for line in ran.stdout.splitlines():
             if line.strip():
@@ -232,7 +252,9 @@ class Gate:
         return rows
 
     async def last_build(self) -> int:
-        rows = await self.sql("the last build", "SELECT CAST(coalesce(max(build_id), 0) AS UBIGINT) AS last FROM builds")
+        rows = await self.sql(
+            "the last build", "SELECT CAST(coalesce(max(build_id), 0) AS UBIGINT) AS last FROM builds"
+        )
         return (number(rows[0], "last") or 0) if rows else 0
 
     async def ended_after(self, after: int, label: str) -> Row:
@@ -246,11 +268,17 @@ class Gate:
         deadline = time.monotonic() + self.it.history_s
         print(f"{label}: waiting for the history's row of the check after build {after}", flush=True)
         while True:
-            rows = [r for r in await self.sql(f"{label}'s build", query) if (text(r, "command") or "").startswith("check")]
+            rows = [
+                r
+                for r in await self.sql(f"{label}'s build", query)
+                if (text(r, "command") or "").startswith("check")
+            ]
             if rows:
                 return rows[-1]
             if time.monotonic() > deadline:
-                raise Failed(f"{label}: no check after build {after} ended in the history within {self.it.history_s:.0f} s")
+                raise Failed(
+                    f"{label}: no check after build {after} ended in the history within {self.it.history_s:.0f} s"
+                )
             await asyncio.sleep(0.5)
 
     async def check(self, label: str, bound_s: float, noisy: bool) -> Check:
@@ -259,10 +287,15 @@ class Gate:
         if noisy:
             tmp = tempfile.mkdtemp(prefix="rj-noise-")
             cwd = self.workspace / self.it.noise_cwd
-            env.update({
-                "TMPDIR": tmp, "OLDPWD": "/", "SHLVL": str(int(env.get("SHLVL", "1") or "1") + 3),
-                "PWD": str(cwd), "INCREMENTAL_GATE_NOISE": os.urandom(8).hex(),
-            })
+            env.update(
+                {
+                    "TMPDIR": tmp,
+                    "OLDPWD": "/",
+                    "SHLVL": str(int(env.get("SHLVL", "1") or "1") + 3),
+                    "PWD": str(cwd),
+                    "INCREMENTAL_GATE_NOISE": os.urandom(8).hex(),
+                }
+            )
         else:
             env.update({"OLDPWD": str(self.workspace), "PWD": str(cwd)})
         ran = await run(f"{label}: blaze check", [self.it.blaze, "check", *self.it.args], cwd, env, bound_s)
@@ -292,19 +325,39 @@ class Gate:
             misses_t = group.create_task(self.sql(f"{label}'s misses", misses_q))
             heap_t = group.create_task(self.sql(f"{label}'s heap", heap_q))
         counts = tuple(
-            QueryCount(text(r, "query") or "?", number(r, "executed") or 0, number(r, "verified") or 0,
-                       number(r, "written") or 0)
+            QueryCount(
+                text(r, "query") or "?",
+                number(r, "executed") or 0,
+                number(r, "verified") or 0,
+                number(r, "written") or 0,
+            )
             for r in counts_t.result()
         )
         misses = tuple(
-            Miss(text(r, "step") or "?", text(r, "item") or "?", text(r, "cause") or "?", text(r, "what"), text(r, "names"))
+            Miss(
+                text(r, "step") or "?",
+                text(r, "item") or "?",
+                text(r, "cause") or "?",
+                text(r, "what"),
+                text(r, "names"),
+            )
             for r in misses_t.result()
         )
         heap = heap_t.result()
         return Check(
-            label=label, wall_s=ran.seconds, code=ran.code, build=build, process=process,
-            tree=text(row, "tree"), blaze=text(row, "blaze"), ran=number(row, "misses"),
-            settled=number(row, "hits"), joined=number(row, "joined"), dur_ns=dur, counts=counts, misses=misses,
+            label=label,
+            wall_s=ran.seconds,
+            code=ran.code,
+            build=build,
+            process=process,
+            tree=text(row, "tree"),
+            blaze=text(row, "blaze"),
+            ran=number(row, "misses"),
+            settled=number(row, "hits"),
+            joined=number(row, "joined"),
+            dur_ns=dur,
+            counts=counts,
+            misses=misses,
             heap_end=number(heap[0], "heap_end") if heap else None,
             heap_peak=number(heap[0], "heap_peak") if heap else None,
         )
@@ -394,18 +447,24 @@ def bounded(check: Check, edit: Edit) -> list[str]:
     foreign = [it for it in check.misses if not owned(it.item, edit.package)]
     if foreign:
         names = ", ".join(sorted({f"{it.step}: {it.item}" for it in foreign})[:8])
-        said.append(f"{check.label}: {len(foreign)} things outside {edit.package} computed again, none expected: {names}")
+        said.append(
+            f"{check.label}: {len(foreign)} things outside {edit.package} computed again, none expected: {names}"
+        )
     return said
 
 
 def grew(before: Check, after: Check, bound: int) -> list[str]:
     if before.heap_end is None or after.heap_end is None:
-        return [f"{after.label}: no `live bytes` sample of the daemon at the end of {before.label} or {after.label}"]
+        return [
+            f"{after.label}: no `live bytes` sample of the daemon at the end of {before.label} or {after.label}"
+        ]
     if after.heap_end - before.heap_end > bound:
         return [
-            f"{after.label}: the daemon's heap at its end is {mib(after.heap_end)}, "
-            f"{mib(after.heap_end - before.heap_end)} over {before.label}'s {mib(before.heap_end)} "
-            f"(the bound is {mib(bound)})"
+            (
+                f"{after.label}: the daemon's heap at its end is {mib(after.heap_end)}, "
+                f"{mib(after.heap_end - before.heap_end)} over {before.label}'s {mib(before.heap_end)} "
+                f"(the bound is {mib(bound)})"
+            )
         ]
     return []
 
@@ -413,8 +472,13 @@ def grew(before: Check, after: Check, bound: int) -> list[str]:
 async def duckdb_of(it: Input) -> str:
     if it.duckdb is not None:
         return it.duckdb
-    ran = await run("the flake's DuckDB", ["nix", "build", "--no-link", "--print-out-paths", f"{ROOT}#duckdb"],
-                    ROOT, os.environ, 1800)
+    ran = await run(
+        "the flake's DuckDB",
+        ["nix", "build", "--no-link", "--print-out-paths", f"{ROOT}#duckdb"],
+        ROOT,
+        os.environ,
+        1800,
+    )
     if ran.code != 0 or not ran.stdout.strip():
         raise Failed(f"the flake's DuckDB: `nix build .#duckdb` exited {ran.code}:\n{ran.stderr[-3000:]}")
     return str(Path(ran.stdout.strip().splitlines()[-1]) / "bin" / "duckdb")
@@ -430,7 +494,9 @@ async def gate(it: Input, workspace: Path, home: Path) -> list[str]:
         raise Failed(f"edit: reading {edited}: {error}") from None
     source = original.decode()
     if source.count(it.edit.find) != 1:
-        raise Failed(f"edit: {edited} has {source.count(it.edit.find)} copies of edit.find, not one: {it.edit.find!r}")
+        raise Failed(
+            f"edit: {edited} has {source.count(it.edit.find)} copies of edit.find, not one: {it.edit.find!r}"
+        )
 
     failed: list[str] = []
     checks: list[Check] = []
@@ -466,7 +532,9 @@ async def gate(it: Input, workspace: Path, home: Path) -> list[str]:
     if back.tree is not None and restart.tree is not None and back.tree != restart.tree:
         failed.append(f"back: its tree digest {back.tree} is not the unedited {restart.tree}")
     failed += [
-        f"{c.label}: `blaze check` exited {c.code}, the warm check {warm.code}" for c in checks[1:] if c.code != warm.code
+        f"{c.label}: `blaze check` exited {c.code}, the warm check {warm.code}"
+        for c in checks[1:]
+        if c.code != warm.code
     ]
     if warm.code != 0:
         print(f"note: the warm check exited {warm.code}; the others are held to the same exit", flush=True)

@@ -157,25 +157,16 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
     }
     let cranelift = spec.backend.is_cranelift();
     let stencil = spec.backend == Backend::Stencil;
-    // Cranelift knows no CPU by name: a named one is the features it has past the baseline,
-    // which `toolchain.features` lists. LLVM is told the baseline's name only, and stencils
-    // are made for the baseline's.
-    if !cranelift && target.cpu() != toolchain.cpu {
-        // alloc: the error's message
-        return Err(fail(format!(
-            "the target's CPU is {}, the unit's {}: the {:?} back end is told no other CPU \
-             yet",
-            target.cpu(),
-            toolchain.cpu,
-            spec.backend
-        )));
-    }
+    // The CPU is the unit's set's ([`crate::Features`], [`crate::Target::cpu_of`]): LLVM is
+    // told its name and features, Cranelift (which knows no CPU by name) its features, and a
+    // stencil unit runs on it when it has every feature the stencils' CPU has
+    // (`check_stencils`).
     if stencil {
         check_stencils(unit, target, spec)?;
     }
     // Cranelift's ISA and LLVM's target machine are made for the set the first time it is
     // compiled with; a set that can't be made is the unit's error, never the baseline's code.
-    let features = target.features_of(&toolchain.features).map_err(fail)?;
+    let features = target.features_of(&toolchain.cpu, &toolchain.features).map_err(fail)?;
     if cranelift {
         crate::target_with(target, features).map_err(|e| {
             // alloc: the error's message
@@ -213,9 +204,15 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
 }
 
 /// What a stencil unit's spec must say of the stencils: the library the process copies from
-/// is the one its key names (`Toolchain::stencils`), its target features turn none of the
-/// baseline's off (the stencils are the baseline's code, which runs wherever the baseline's
-/// features are, and uses none past them).
+/// is the one its key names (`Toolchain::stencils`), and its CPU and target features turn none
+/// of the baseline's off. The stencils are the code of the target's baseline CPU
+/// ([`crate::Target::cpu`]) and use no instruction past its features, so they run on any CPU
+/// that has them all: a unit for `-C target-cpu=x86-64-v3` or `apple-m4` is such a CPU, whose
+/// toolchain lists only `+` features. What the program executes is the same either way: a
+/// `cfg(target_feature)` is the flags' (the front end's), and an intrinsic the stencils have
+/// no code of is the unit's typed error, never another instruction. A CPU without one of the
+/// baseline's features (`apple-a7` has no LSE, `generic` on macOS) lists it as `-`, and its
+/// stencil unit is refused, naming it: its code is LLVM's (`Backend::Llvm`).
 fn check_stencils(unit: &Unit, target: &crate::Target, spec: &Spec) -> Result<(), CodegenError> {
     let fail = |what: String| failed(unit, what);
     let toolchain = &spec.toolchain;
@@ -247,9 +244,12 @@ fn check_stencils(unit: &Unit, target: &crate::Target, spec: &Spec) -> Result<()
     if let Some(off) = toolchain.features.iter().find(|it| it.starts_with('-')) {
         // alloc: an error
         return Err(fail(format!(
-            "a stencil unit for the target features {:?}: stencils are the code of {}'s \
-             baseline, and `{off}` turns one of its features off",
+            "a stencil unit for CPU {} with the target features {:?}: stencils are the code of \
+             {}'s baseline CPU {}, and `{off}` turns one of its features off; a unit for this CPU \
+             is compiled by LLVM",
+            toolchain.cpu,
             toolchain.features,
+            toolchain.target,
             target.cpu()
         )));
     }
@@ -532,7 +532,7 @@ fn features(
     target: &crate::Target,
     instance: &HirInstance,
 ) -> Result<(crate::Features, bool), String> {
-    let unit = target.features_of(&spec.toolchain.features)?;
+    let unit = target.features_of(&spec.toolchain.cpu, &spec.toolchain.features)?;
     let func = match &instance.0 {
         Kind::Code(
             Instance { def: InstanceDef::Fn(func) | InstanceDef::VtableShim(func), .. },
@@ -559,15 +559,16 @@ fn features(
     if enabled.is_empty() {
         return Ok((unit, false));
     }
-    let set = with_enabled(target, &spec.toolchain.features, enabled.names())?;
+    let set = with_enabled(target, &spec.toolchain.cpu, &spec.toolchain.features, enabled.names())?;
     Ok((set, set != unit))
 }
 
-/// The set of `toolchain` (a unit's sorted features) with `enabled` (rustc's names, each with
-/// what it implies) turned on: a feature the toolchain turns off is on again, and one the
-/// baseline has or the toolchain turns on already is not named twice.
+/// The set of `toolchain` (a unit's sorted features, for its CPU `cpu`) with `enabled`
+/// (rustc's names, each with what it implies) turned on: a feature the toolchain turns off is
+/// on again, and one the baseline has or the toolchain turns on already is not named twice.
 fn with_enabled<'a>(
     target: &crate::Target,
+    cpu: &str,
     toolchain: &[String],
     enabled: impl Iterator<Item = &'a str>,
 ) -> Result<crate::Features, String> {
@@ -586,7 +587,7 @@ fn with_enabled<'a>(
         }
     }
     names.sort_unstable();
-    target.features_of(&names)
+    target.features_of(cpu, &names)
 }
 
 /// Which of `spec`'s sanitizers are off for the instance. As rustc's `codegen_instance_attrs`,
@@ -1478,16 +1479,18 @@ mod features_tests {
     #[test]
     fn a_functions_set_is_its_units_with_what_it_enables() {
         let x86 = crate::Target::of("x86_64-unknown-linux-gnu").expect("a target");
-        let set = with_enabled(&x86, &[], ["avx", "avx2", "sse2"].into_iter()).expect("a set");
+        let set =
+            with_enabled(&x86, x86.cpu(), &[], ["avx", "avx2", "sse2"].into_iter()).expect("a set");
         assert_eq!(set.names(), names(&["+avx", "+avx2"]));
         let unit = names(&["+avx", "+popcnt"]);
-        let set = with_enabled(&x86, &unit, ["avx", "avx2"].into_iter()).expect("a set");
+        let set = with_enabled(&x86, x86.cpu(), &unit, ["avx", "avx2"].into_iter()).expect("a set");
         assert_eq!(set.names(), names(&["+avx", "+avx2", "+popcnt"]));
         let unit = names(&["-popcnt"]);
-        let set = with_enabled(&x86, &unit, ["popcnt"].into_iter()).expect("a set");
+        let set = with_enabled(&x86, x86.cpu(), &unit, ["popcnt"].into_iter()).expect("a set");
         assert!(set.is_baseline());
-        let unit = x86.features_of(&names(&["+avx"])).expect("a set");
-        let same = with_enabled(&x86, &names(&["+avx"]), ["avx"].into_iter()).expect("a set");
+        let unit = x86.features_of(x86.cpu(), &names(&["+avx"])).expect("a set");
+        let same =
+            with_enabled(&x86, x86.cpu(), &names(&["+avx"]), ["avx"].into_iter()).expect("a set");
         assert_eq!(same, unit);
     }
 }

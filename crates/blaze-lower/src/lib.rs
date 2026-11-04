@@ -108,7 +108,7 @@ impl<T> Copy for Lower<'_, T> {}
 /// run (`SHLVL`, `OLDPWD`, `TERM_SESSION_ID`, `INVOCATION_ID`), so a no-op build lowered all
 /// again: 86 s in place of about 1 s.
 pub fn config_differs(kept: &BuildConfig, now: &BuildConfig) -> Option<String> {
-    let BuildConfig { invocation, mounts, host, library, std, builds, sources } = kept;
+    let BuildConfig { invocation, mounts, host, library, std, builds, sources, blaze: _ } = kept;
     let blaze_units::query::Invocation { command: _, args: _, root, cwd: _, env: _, files: _ } =
         invocation;
     if mounts != &now.mounts {

@@ -35,6 +35,9 @@ concurrency:
 env:
   # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
   BLAZE_CORES: all
+  # The projects built here are new and throwaway, with no committed lock: their builds may
+  # write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
+  BLAZE_LOCK: write
 
 jobs:
   shellcheck:

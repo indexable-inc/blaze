@@ -1135,6 +1135,7 @@ dependencies = [
  "span",
  "stdx",
  "syntax",
+ "target-features",
  "target-lexicon",
  "tracing",
  "triomphe",

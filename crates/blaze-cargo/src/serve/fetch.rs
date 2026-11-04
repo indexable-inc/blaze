@@ -8,6 +8,7 @@
 
 mod archive;
 mod git;
+pub mod local;
 #[cfg(test)]
 mod tests;
 
@@ -87,6 +88,10 @@ impl<H: Http + 'static> Fetcher<H> {
             FetchKind::Crate { sha256 } => self.package(fetch, sha256)?,
             FetchKind::IndexFile => self.index_file(fetch)?,
             FetchKind::Git { commit } => git::tree(self, fetch, commit)?,
+            // Read where it is, never fetched: the job reads it through `Steps::local`.
+            FetchKind::Local { .. } => {
+                return Err(failed(fetch, &[format!("`{}` is a path on the disk, which is read where it is, not fetched", fetch.at)], None));
+            }
         };
         tracing::debug!(what = %fetch.what, files = source.files.len(), "fetched");
         Ok(source)

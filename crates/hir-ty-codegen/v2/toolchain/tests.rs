@@ -142,6 +142,28 @@ fn a_microarchitecture_level_is_its_features() {
     assert!(it.features.is_sorted());
 }
 
+/// Any CPU rustc takes is its features from the CPU table, past the target's baseline, under
+/// its own name: an LLVM alias (`apple-m1`) is the baseline it names, and a CPU that lacks a
+/// feature of the baseline (`apple-a7`, no LSE) turns it off.
+#[test]
+fn a_named_cpu_is_the_tables_features_past_the_baseline() {
+    let n1 = of("aarch64-unknown-linux-gnu", &["-C", "target-cpu=neoverse-n1"]).unwrap();
+    assert_eq!(n1.cpu, "neoverse-n1");
+    for feature in ["+dotprod", "+lse", "+rcpc"] {
+        assert!(n1.features.contains(&feature.to_owned()), "{feature}: {:?}", n1.features);
+    }
+    let darwin = "aarch64-apple-darwin";
+    let m4 = of(darwin, &["-C", "target-cpu=apple-m4"]).unwrap();
+    assert_eq!(m4.cpu, "apple-m4");
+    assert!(m4.features.contains(&"+sme".to_owned()), "{:?}", m4.features);
+    assert!(m4.features.iter().all(|it| it.starts_with('+')), "{:?}", m4.features);
+    let m1 = of(darwin, &["-C", "target-cpu=apple-m1"]).unwrap();
+    assert!(m1.features.is_empty(), "the baseline: {:?}", m1.features);
+    let a7 = of(darwin, &["-C", "target-cpu=apple-a7"]).unwrap();
+    assert!(a7.features.contains(&"-lse".to_owned()), "{:?}", a7.features);
+    assert_eq!(a7.lacks_baseline(), Some("lse"));
+}
+
 #[test]
 fn flags_of_the_link_and_of_reports_are_not_the_codes() {
     let flags = [
@@ -170,7 +192,7 @@ fn a_flag_that_changes_code_and_is_not_read_is_an_error_naming_it() {
         (&["-Cpanic=abort"][..], "panic"),
         (&["-C", "code-model=large"][..], "code-model"),
         (&["-C", "lto=fat"][..], "lto"),
-        (&["-C", "target-cpu=skylake"][..], "skylake"),
+        (&["-C", "target-cpu=pentium-m99"][..], "pentium-m99"),
         (&["-C", "target-feature=avx2"][..], "avx2"),
         (&["--remap-path-prefix=/a=/b"][..], "remap-path-prefix"),
         (&["-C", "relocation-model=ropi"][..], "ropi"),
@@ -196,8 +218,10 @@ fn frame_pointers_are_the_flags_or_the_targets() {
             .unwrap()
             .frame_pointers
     );
+    // Apple's frame records are its code's own (`Target::llvm_frame_pointer`), not forced.
     let apple = of("aarch64-apple-darwin", &["-Cforce-frame-pointers=no"]).unwrap();
-    assert!(apple.frame_pointers, "Apple's ABI keeps them");
+    assert!(!apple.frame_pointers, "only the flags force every frame pointer");
+    assert!(of("aarch64-apple-darwin", &["-Cforce-frame-pointers=yes"]).unwrap().frame_pointers);
     assert_eq!(apple.cpu, "apple-m1");
     assert!(of(LINUX, &["-Cforce-frame-pointers=sometimes"]).is_err());
 }
@@ -248,7 +272,10 @@ fn here_is_the_hosts_features_on_the_baseline_cpu() {
     let here = here(&[]).unwrap();
     let native = of(Target::host(), &["-C", "target-cpu=native"]).unwrap();
     let elsewhere = of(Target::host(), &[]).unwrap();
-    assert_eq!(here.features, native.features, "the features `native` gives");
+    for feature in &here.features {
+        let given = &native.features;
+        assert!(given.contains(feature), "{feature}: of those `native` gives, {given:?}");
+    }
     assert!(here.features.iter().all(|it| it.starts_with('+')), "{:?}", here.features);
     assert!(here.features.is_sorted());
     assert_eq!(
@@ -268,9 +295,8 @@ fn elsewhere_is_the_baseline() {
         return;
     }
     let elsewhere = of(Target::host(), &[]).unwrap();
-    let apple = Target::host().contains("-apple-");
     assert!(elsewhere.features.is_empty(), "{:?}", elsewhere.features);
-    assert_eq!(elsewhere.frame_pointers, apple);
+    assert!(!elsewhere.frame_pointers, "no flag forces them, on Apple's targets too");
     for other in
         [LINUX, "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
     {

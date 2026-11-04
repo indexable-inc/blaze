@@ -8,7 +8,8 @@
 //! - Every file is read by its absolute path as cargo names it: under a mount of the view
 //!   through `Cx::file`, under a mount of another root (a registry or git package, the standard
 //!   library) through `Cx::file_at`, each an edge. A path under no mount is never read: the load
-//!   fails naming it.
+//!   asks the daemon to mount it ([`FetchKind::Local`], read from the disk where it is) and is
+//!   asked again.
 //! - The daemon asks one query per build, [`Plan`]: the units to build ([`Planned::Ready`]),
 //!   the sources to fetch and mount first ([`Planned::Needs`]), or cargo's error.
 //! - The standard library is one more crate graph loaded the same way, from its own root
@@ -192,6 +193,11 @@ pub struct BuildConfig {
     /// disk there for what reads it outside the VFS (a build script, the C compiler it runs).
     /// Never cargo's `$CARGO_HOME`, where blaze keeps no packages.
     pub sources: String,
+    /// The version of the blaze that serves the build: a release's `0.YYYYMMDD.N`, or
+    /// `0.0.0-dev` for a build of the tree. `blaze.lock` records it when it is a release run as
+    /// the workspace pins it ([`crate::lock`]).
+    #[serde(default)]
+    pub blaze: String,
 }
 
 impl BuildConfig {
@@ -388,7 +394,7 @@ pub enum Planned {
 }
 
 impl Versioned for Planned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 8");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 9");
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -410,6 +416,19 @@ pub enum FetchKind {
     IndexFile,
     /// A git repository's tree at `commit`: a directory.
     Git { commit: String },
+    /// A path outside the view and every source, read from the disk where it is: what a
+    /// `path` dependency outside the checkout is, or a manifest above one that its workspace
+    /// search looks for. `at` is the path the load read. Its files are a root keyed by their
+    /// bytes, as a fetched source's are. The daemon mounts:
+    ///
+    /// - a directory at `at`: the whole tree under it (a root `target/` and every `.git` left
+    ///   out, as a checkout's view leaves them);
+    /// - a `Cargo.toml` at `at` read for its contents (`probe` false): the whole tree of its
+    ///   directory, the package's;
+    /// - any other file at `at`, or a `Cargo.toml` only asked whether it is there (`probe`
+    ///   true, the workspace search above a package): that file alone;
+    /// - nothing at `at`: `at` as absent.
+    Local { probe: bool },
 }
 
 /// What cargo says when it can't: its message with its causes (`error: ...`, then
@@ -430,8 +449,8 @@ pub struct Units {
     pub plans: Vec<UnitPlan>,
     /// Every package of the graph, sorted by id.
     pub packages: Vec<PackagePlan>,
-    /// `Cargo.lock` as cargo would write it, when cargo would write it (none, or out of date
-    /// and not `--locked`).
+    /// The lock files the build writes (`Cargo.lock` as cargo would write it, `blaze.lock`),
+    /// when one changes and the lock policy lets the build change it ([`crate::lock`]).
     pub lock: Option<LockWrite>,
     /// cargo's warnings of the load, each as cargo prints it after `warning: `.
     pub warnings: Vec<String>,
@@ -456,7 +475,8 @@ pub struct Units {
 impl Versioned for Units {
     // 13: `CARGO_PRIMARY_PACKAGE` left the plans' variables ([`Units::is_primary`]).
     // 14: the pinned native inputs ([`Units::native`]).
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 14");
+    // 15: [`LockWrite`] writes `blaze.lock` too, and says what moved.
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 15");
 }
 
 /// One pinned native input for one target: an archive named by its digest, which blaze fetches,
@@ -651,8 +671,26 @@ impl TestSandbox {
     }
 }
 
+/// The lock files a plan writes (docs/cargo.md, "Lock files"; [`crate::lock`]), and what the
+/// build says of them.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct LockWrite {
+    /// Each lock file that changes, whole: `Cargo.lock` before `blaze.lock`.
+    pub files: Vec<LockFile>,
+    /// What the build says, each a line: what it wrote, then each move of a file that was there.
+    pub said: Vec<String>,
+}
+
+impl LockWrite {
+    /// The file of `name` (`Cargo.lock`, `blaze.lock`) it writes, if it writes it.
+    pub fn file(&self, name: &str) -> Option<&LockFile> {
+        self.files.iter().find(|it| it.path.rsplit('/').next() == Some(name))
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct LockFile {
+    /// Absolute.
     pub path: String,
     pub text: String,
 }
@@ -883,6 +921,7 @@ mod tests {
             std: "/s/std".to_owned(),
             builds: "/s/build".to_owned(),
             sources: "/s/sources".to_owned(),
+            blaze: String::new(),
         };
         assert_eq!(BuildConfig::decode(&config.encode()).unwrap(), config);
         assert!(BuildConfig::decode(b"\xff").is_err());

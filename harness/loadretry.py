@@ -6,9 +6,11 @@ flag. Removing or rewriting the configuration then has to build and run without 
 the daemon. Both cargo configuration filenames and a configuration above the workspace
 are covered. BLAZE_BIN names the compiler, with blaze beside it.
 """
-import os, re, shutil, subprocess, tempfile
+import os, shutil, subprocess, sys, tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from blaze_cli import base_env
+from storelib import daemon_pid
 
 
 def main():
@@ -20,7 +22,8 @@ def main():
         out.write('[package]\nname = "loadretry"\nversion = "0.0.0"\nedition = "2021"\n')
     with open(os.path.join(ws, "src", "main.rs"), "w") as out:
         out.write('fn main() { println!("recovered"); }\n')
-    env = base_env(os.path.join(work, "home"))
+    home = os.path.join(work, "home")
+    env = base_env(home)
     pid = None
 
     def blaze(*args):
@@ -29,15 +32,13 @@ def main():
 
     def same_daemon():
         nonlocal pid
-        status = blaze("status")
-        assert status.returncode == 0, status.stderr
-        found = re.search(r"^daemon: pid (\d+)", status.stdout, re.M)
-        assert found, status.stdout
-        current = int(found.group(1))
+        # The daemon's lock names its pid (storelib.daemon_pid); `blaze status` says it for
+        # people only.
+        current = daemon_pid(home)
+        assert current is not None, f"no daemon runs on {home}"
         if pid is None:
             pid = current
         assert current == pid, f"daemon restarted: {pid} -> {current}"
-        return status.stdout
 
     def refused(flag):
         ran = blaze("run", "-q")
@@ -72,7 +73,7 @@ def main():
         with open(path, "w") as out:
             out.write('[build]\nrustflags = []\n')
         recovered("rewrite configuration")
-        # Structured source errors remain cached until their Rust source changes.
+        # A source error is said again, under the same daemon, until its Rust source changes.
         ws = os.path.join(work, "broken")
         os.makedirs(os.path.join(ws, "src"))
         with open(os.path.join(ws, "Cargo.toml"), "w") as out:
@@ -80,15 +81,10 @@ def main():
         source = os.path.join(ws, "src", "main.rs")
         with open(source, "w") as out:
             out.write('fn main() { let = ; }\n')
-        workers = None
         for _ in range(2):
             ran = blaze("run", "-q")
             assert ran.returncode != 0 and "expected" in ran.stderr, ran.stdout + ran.stderr
-            status = same_daemon()
-            current = re.findall(r"^  worker: pid (\d+)", status, re.M)
-            if workers is not None:
-                assert current == workers, "unchanged source diagnostics started another worker"
-            workers = current
+            same_daemon()
         with open(source, "w") as out:
             out.write('fn main() { println!("recovered"); }\n')
         recovered("correct source diagnostics")

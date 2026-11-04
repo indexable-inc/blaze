@@ -248,6 +248,9 @@ const GLOBAL: &[Flag] = &[
     Flag { long: None, short: Some('Z'), ..Flag::new("", None, Takes::Value, "FLAG").many() },
     Flag::switch("frozen"),
     Flag::switch("locked"),
+    // A build may write the lock files though CI or `lock = "required"` refuses it (docs/cargo.md,
+    // "Lock files").
+    Flag::switch("no-locked"),
     Flag::switch("offline"),
     Flag::new("help", Some('h'), Takes::Switch, ""),
 ];
@@ -468,6 +471,9 @@ pub struct Invocation {
     pub directory: Option<OsString>,
     /// `-Z unstable-options` came before the command, where cargo looks for it to allow `-C`.
     pub unstable_options: bool,
+    /// `blaze lock`: the workspace resolved and its lock files written, nothing checked or
+    /// built ([`blaze_api::Request::Lock`]). Its command is `check`, whose flags it takes.
+    pub lock: bool,
 }
 
 impl Invocation {
@@ -798,6 +804,18 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
                     unstable_options |= z == Some("") && value == "unstable-options";
                     globals.push(value);
                 }
+            }
+            // `blaze lock`: the workspace resolved and its lock files written, whatever CI or
+            // `lock = "required"` says, and nothing more: `check`'s flags, with `--no-locked`
+            // one of the globals so that `blaze lock --no-locked` says it once.
+            Some("lock") => {
+                globals.push(OsString::from("--no-locked"));
+                let before = globals.len();
+                globals.extend(words);
+                return command_line_after(Command::Check, globals, before).map(|it| match it.help {
+                    true => Asked::Help(Some(Command::Check)),
+                    false => Asked::Cargo(Box::new(Invocation { directory, unstable_options, lock: true, ..it })),
+                });
             }
             Some(name) => match Command::named(name) {
                 Some(command) => {

@@ -58,6 +58,9 @@ resolver = "2"
 [workspace.metadata.blaze]
 experimental = ["sandboxed-tests"]
 version = "0.20261030.1"
+# A build may not change Cargo.lock or blaze.lock, here as under CI: `blaze lock` changes them,
+# saying what moved (docs/cargo.md, "Lock files").
+lock = "required"
 
 # blaze-lints' own lints (AGENTS.md rules 3, 9, 11, 13-15, 20, 22). Each is `warn` until its
 # count in crates/blaze-lints/baselines/ reaches zero, then `deny`. The other `hot_*` lints are

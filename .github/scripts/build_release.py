@@ -112,15 +112,17 @@ class Ran:
     tail: str
 
 
-async def run(step: str, cmd: list[str], *, secs: float, env: dict[str, str] | None = None,
-              echo: bool = False) -> Ran:
+async def run(
+    step: str, cmd: list[str], *, secs: float, env: dict[str, str] | None = None, echo: bool = False
+) -> Ran:
     """`cmd` run to its end within `secs`. With `echo`, each line it prints is passed on as it
     comes (a CI log shows a slow build while it is slow) and only the last `TAIL_LINES` kept.
     A nonzero exit or the bound running out is a `Failed` naming the step."""
     shown = " ".join(cmd)
     print(f"+ {shown}", flush=True)
     proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=ROOT, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        *cmd, cwd=ROOT, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
     assert proc.stdout is not None
     tail: collections.deque[str] = collections.deque(maxlen=TAIL_LINES)
     kept: list[str] = []
@@ -143,7 +145,9 @@ async def run(step: str, cmd: list[str], *, secs: float, env: dict[str, str] | N
     except TimeoutError:
         proc.kill()
         await proc.wait()
-        raise Failed(f"{step}: `{shown}` did not end in {secs:.0f} s; its last lines:\n{''.join(tail)}") from None
+        raise Failed(
+            f"{step}: `{shown}` did not end in {secs:.0f} s; its last lines:\n{''.join(tail)}"
+        ) from None
     code = proc.returncode if proc.returncode is not None else -1
     if code != 0:
         raise Failed(f"{step}: `{shown}` exited {code}; its last lines:\n{''.join(tail)}")
@@ -154,8 +158,10 @@ def host() -> str:
     key = (sys.platform, platform.machine())
     found = HOSTS.get(key)
     if found is None:
-        raise Failed(f"host: blaze ships no release for {key[0]} on {key[1]} (the releases' hosts: "
-                     f"{', '.join(sorted(HOSTS.values()))})")
+        raise Failed(
+            f"host: blaze ships no release for {key[0]} on {key[1]} (the releases' hosts: "
+            f"{', '.join(sorted(HOSTS.values()))})"
+        )
     return found
 
 
@@ -187,11 +193,14 @@ async def pinned_profile(build: Build) -> Path:
             "whose symbols and LLVM are rustc's: blaze builds blaze (rule blaze-builds-blaze) and applies only a "
             "profile tools/pgo/pgo.py trained on blaze's own build. pgo.py cannot train one yet: blaze refuses "
             "`-C profile-generate` because its linker writes no profile sections (`__llvm_prf_*` and the profile "
-            "runtime; crates/blaze-cargo/src/serve/unit/codegen.rs, `pgo`). Build with \"pgo\": \"off\" until it does")
+            'runtime; crates/blaze-cargo/src/serve/unit/codegen.rs, `pgo`). Build with "pgo": "off" until it does'
+        )
     llvm = json.loads(LLVM_PIN.read_text())["commit"]
     if pin.get("llvm") != llvm:
-        raise Failed(f"pgo: {PINS}'s profile for {build.target} was made by LLVM {pin.get('llvm')}, blaze links "
-                     f"{llvm} ({LLVM_PIN}): tools/pgo/pgo.py trains one with this LLVM")
+        raise Failed(
+            f"pgo: {PINS}'s profile for {build.target} was made by LLVM {pin.get('llvm')}, blaze links "
+            f"{llvm} ({LLVM_PIN}): tools/pgo/pgo.py trains one with this LLVM"
+        )
     if build.profdata:
         path = Path(build.profdata).resolve()
     else:
@@ -211,7 +220,9 @@ async def pinned_profile(build: Build) -> Path:
             except (TimeoutError, OSError) as e:
                 raise Failed(f"pgo: the download of {url} failed: {e!r}") from None
     if sha256(path) != pin["sha256"]:
-        raise Failed(f"pgo: {path} is not the profile {PINS} pins for {build.target} (sha256 {pin['sha256']})")
+        raise Failed(
+            f"pgo: {path} is not the profile {PINS} pins for {build.target} (sha256 {pin['sha256']})"
+        )
     return path
 
 
@@ -219,13 +230,17 @@ def build_env(build: Build, target_dir: Path, profile: Path | None) -> dict[str,
     """The environment of the build: the caller's, with the target directory, the pinned LLVM and
     the profile's flag, and none of the flags or wrappers a caller's environment could add."""
     if set_ := [name for name in FOREIGN_FLAGS if os.environ.get(name)]:
-        raise Failed(f"environment: {', '.join(set_)} set; the release's recipe takes no flags or wrappers from the "
-                     "environment, as they would change what ships without it saying so")
+        raise Failed(
+            f"environment: {', '.join(set_)} set; the release's recipe takes no flags or wrappers from the "
+            "environment, as they would change what ships without it saying so"
+        )
     prefix = os.environ.get(LLVM_PREFIX, "")
     if not prefix:
-        raise Failed(f"llvm: {LLVM_PREFIX} is unset; blaze-engine's `native` links the pinned LLVM "
-                     f"({LLVM_PIN}), which .github/actions/blaze (`llvm: true`) fetches below /usr/local/lib "
-                     "and names there")
+        raise Failed(
+            f"llvm: {LLVM_PREFIX} is unset; blaze-engine's `native` links the pinned LLVM "
+            f"({LLVM_PIN}), which .github/actions/blaze (`llvm: true`) fetches below /usr/local/lib "
+            "and names there"
+        )
     if not Path(prefix, "bin").is_dir():
         raise Failed(f"llvm: {LLVM_PREFIX}={prefix} has no bin/: it is not an unpacked LLVM of {LLVM_PIN}")
     env = {k: v for k, v in os.environ.items() if k not in FOREIGN_FLAGS}
@@ -248,18 +263,26 @@ async def check_binary(build: Build, binary: Path) -> list[str]:
     data = binary.read_bytes()
     wrong: list[str] = []
     if data[:4] == b"\x7fELF":
-        shown = (await run(f"check {binary.name}", ["readelf", "-d", str(binary)], secs=build.check_secs)).stdout
+        shown = (
+            await run(f"check {binary.name}", ["readelf", "-d", str(binary)], secs=build.check_secs)
+        ).stdout
         lines = [line for line in shown.splitlines() if "(NEEDED)" in line]
         wrong += [f"{binary.name} loads {line.strip()}" for line in lines if NOT_LOADED["linux"].search(line)]
         asked = glibc_asked(data)
         if asked and asked > GLIBC:
-            wrong.append(f"{binary.name} asks for glibc {'.'.join(map(str, asked))}, newer than RHEL 9's "
-                         f"{'.'.join(map(str, GLIBC))}, so it does not start there: build on Ubuntu 22.04, as the "
-                         "release does")
+            wrong.append(
+                f"{binary.name} asks for glibc {'.'.join(map(str, asked))}, newer than RHEL 9's "
+                f"{'.'.join(map(str, GLIBC))}, so it does not start there: build on Ubuntu 22.04, as the "
+                "release does"
+            )
     elif data[:4] == b"\xcf\xfa\xed\xfe":
-        shown = (await run(f"check {binary.name}", ["otool", "-L", str(binary)], secs=build.check_secs)).stdout
+        shown = (
+            await run(f"check {binary.name}", ["otool", "-L", str(binary)], secs=build.check_secs)
+        ).stdout
         lines = shown.splitlines()[1:]
-        wrong += [f"{binary.name} loads {line.strip()}" for line in lines if NOT_LOADED["darwin"].search(line)]
+        wrong += [
+            f"{binary.name} loads {line.strip()}" for line in lines if NOT_LOADED["darwin"].search(line)
+        ]
     else:
         wrong.append(f"{binary.name} is neither ELF nor Mach-O")
     return wrong
@@ -267,11 +290,15 @@ async def check_binary(build: Build, binary: Path) -> list[str]:
 
 async def main_async(build: Build) -> None:
     if build.target != host():
-        raise Failed(f"target: {build.target} is not this machine's ({host()}); each release target builds on a "
-                     "machine of its own kind, and blaze cross-compiles no release")
+        raise Failed(
+            f"target: {build.target} is not this machine's ({host()}); each release target builds on a "
+            "machine of its own kind, and blaze cross-compiles no release"
+        )
     if not shutil.which(build.blaze):
-        raise Failed(f"blaze: `{build.blaze}` is not on PATH; .github/actions/blaze installs the stage 0 "
-                     ".github/blaze-version names")
+        raise Failed(
+            f"blaze: `{build.blaze}` is not on PATH; .github/actions/blaze installs the stage 0 "
+            ".github/blaze-version names"
+        )
     said = await run("blaze --version", [build.blaze, "--version"], secs=build.check_secs)
     print(f"build_release: stage 0 is {said.stdout.strip()}", flush=True)
     profile = await pinned_profile(build) if build.pgo == "pinned" else None
@@ -304,20 +331,30 @@ async def main_async(build: Build) -> None:
         checks = [group.create_task(check_binary(build, binary)) for binary in shipped]
     wrong = [item for task in checks for item in task.result()]
     if wrong:
-        raise Failed(f"check: a shipped binary would not run on a user's machine: {'; '.join(wrong)} (LLVM and, on "
-                     "Linux, libstdc++ are linked in statically: crates/hir-ty-codegen/build.rs)")
+        raise Failed(
+            f"check: a shipped binary would not run on a user's machine: {'; '.join(wrong)} (LLVM and, on "
+            "Linux, libstdc++ are linked in statically: crates/hir-ty-codegen/build.rs)"
+        )
     how = f"with the profile {profile.name}" if profile else "without PGO"
-    print(f"build_release: {', '.join(p.name for p in shipped)} in {out}, the `{PROFILE}` profile {how}, built by "
-          f"{said.stdout.strip()}; each loads no libLLVM"
-          + ("" if sys.platform == "darwin" else f" or C++ runtime and asks for glibc {'.'.join(map(str, GLIBC))} "
-             "or older"), flush=True)
+    print(
+        f"build_release: {', '.join(p.name for p in shipped)} in {out}, the `{PROFILE}` profile {how}, built by "
+        f"{said.stdout.strip()}; each loads no libLLVM"
+        + (
+            ""
+            if sys.platform == "darwin"
+            else f" or C++ runtime and asks for glibc {'.'.join(map(str, GLIBC))} or older"
+        ),
+        flush=True,
+    )
 
 
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1].startswith("--"):
-        fail(f"`{' '.join(sys.argv[1:])}` is the retired cargo recipe's flags. The script takes one JSON object; "
-             "blaze builds blaze (rule blaze-builds-blaze), so the flake's `dist` (flake.nix), which built blaze "
-             "with cargo through those flags, has no recipe here; training a profile is tools/pgo/pgo.py's")
+        fail(
+            f"`{' '.join(sys.argv[1:])}` is the retired cargo recipe's flags. The script takes one JSON object; "
+            "blaze builds blaze (rule blaze-builds-blaze), so the flake's `dist` (flake.nix), which built blaze "
+            "with cargo through those flags, has no recipe here; training a profile is tools/pgo/pgo.py's"
+        )
     if len(sys.argv) != 2:
         fail("usage: build_release.py CONFIG, one JSON object (see the top of the file)")
     # Here, not at the top: the retired flags above are refused even where the workspace's

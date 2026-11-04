@@ -904,6 +904,11 @@ pub(super) const BLAZE: &[Lint] = &[
         Warn,
         "detects a `#[blaze::cache]` function whose result depends on more than its arguments",
     ),
+    // The cross-configuration reachability lints: one check over every configuration of a
+    // package (its lib, bins, tests, ...), docs/v2/plan/multiconfig-check.md.
+    l("blaze::dead", Warn, "detects an item no configuration of its package that was checked uses (rustc's `dead_code`, over every configuration at once)"),
+    l("blaze::test_only", Warn, "detects an item only the tests use, which `#[cfg(test)]` would leave out of every other build"),
+    l("blaze::cfg_only", Warn, "detects an item only some configurations use (a feature, a platform, a target), which a `#[cfg]` naming them would leave out of the rest"),
     l("blaze::hot_clone", Allow, "detects a clone in hot code that costs more than a copy")
         .externally_loaded(),
     l("blaze::hot_alloc", Allow, "detects a call in hot code that reaches the global allocator")
