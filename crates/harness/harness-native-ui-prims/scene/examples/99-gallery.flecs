@@ -11,7 +11,7 @@ swiftui_gallery : ui.Column {
     SafeAreaPadding: {l: false, r: false, t: true, b: false}
     Flex: {axis: Row, gap: 10, align: FirstBaseline, justify: Start, wrap: false}
     Padding: {l: 20, r: 20, t: 8, b: 0}
-    title : ui.Words, Strong { Text: {s: "Layout vocabulary"} TextStyle: {size: 22, line: 28, role: 0, bold: 1} }
+    title : ui.Words, Strong { Text: {s: "Layout vocabulary"}; TextStyle: {size: 22, line: 28, role: 0, bold: 1} }
     sub : ui.Words, Muted { Text: {s: "SwiftUI's, as flecs components and prims"} }
   }
   cards : ui.AdaptiveGrid {

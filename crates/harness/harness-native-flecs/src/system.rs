@@ -54,7 +54,7 @@ impl<'a> TableIter<'a, '_> {
             if !sys::ecs_id_is_pair(id) {
                 return None;
             }
-            let t = sys::ecs_get_alive(self.it.raw.real_world, id & 0xFFFF_FFFF);
+            let t = sys::ecs_get_alive(self.it.raw.world, id & 0xFFFF_FFFF);
             (t != 0).then(|| EntityView::new(self.it.stage(), t))
         }
     }

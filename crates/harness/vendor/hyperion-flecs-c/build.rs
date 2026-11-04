@@ -1,6 +1,6 @@
-//! flecs core (FLECS_CUSTOM_BUILD plus FLECS_LOG), always -O2, plus the addons whose features are on: `system`, `pipeline`,
-//! `meta`, `script`, `json` (never REST, HTTP or alerts). den-core and den-web build the core only; den-native turns on the
-//! first four. `json` is flecs's own serializer of type info, query results and values (den-flecs's `reflect`, the repl's
+//! flecs core (FLECS_CUSTOM_BUILD plus FLECS_LOG), always -O2, plus the addons whose features are on: `prefab`,
+//! `constraint_traits`, `cached_queries`, `query_plans` (core in flecs 4.1, addons since 4.2), `system`, `pipeline`, `meta`,
+//! `script`, `json` (never REST, HTTP or alerts). `json` is flecs's own serializer of type info, query results and values (den-flecs's `reflect`, the repl's
 //! live types: docs/repl-live-types.md).
 //!
 //! wasm32-unknown-unknown has no C library: `wasm-libc/` is a declaration-only set of headers plus `libc.c` (strings, ctype,
@@ -39,16 +39,28 @@ fn main() {
     if env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_none() {
         b.define("NDEBUG", None).define("FLECS_KEEP_ASSERT", None);
     }
-    // Addons, one cargo feature each (script pulls in meta, doc and parser itself; json pulls in meta and doc; pipeline pulls in system).
-    for (feature, addon) in [("SYSTEM", "FLECS_SYSTEM"), ("PIPELINE", "FLECS_PIPELINE"), ("META", "FLECS_META"), ("SCRIPT", "FLECS_SCRIPT"), ("JSON", "FLECS_JSON")] {
+    // Addons, one cargo feature each (script pulls in meta, doc and parser itself; json pulls in meta and doc; pipeline pulls in
+    // system, cached queries and query plans; system pulls in frame and module; meta with prefab pulls in query plans).
+    for (feature, addon) in [
+        ("PREFAB", "FLECS_PREFAB"),
+        ("CONSTRAINT_TRAITS", "FLECS_CONSTRAINT_TRAITS"),
+        ("CACHED_QUERIES", "FLECS_CACHED_QUERIES"),
+        ("QUERY_PLANS", "FLECS_QUERY_PLANS"),
+        ("SYSTEM", "FLECS_SYSTEM"),
+        ("PIPELINE", "FLECS_PIPELINE"),
+        ("META", "FLECS_META"),
+        ("SCRIPT", "FLECS_SCRIPT"),
+        ("JSON", "FLECS_JSON"),
+    ] {
         if env::var_os(format!("CARGO_FEATURE_{feature}")).is_some() {
             b.define(addon, None);
         }
     }
-    // The pipeline addon brings flecs's own OS API implementation (pthread threads and locks), which wasm32 has no C library for.
+    // The system addon (through flecs 4.2's frame addon) and the pipeline bring flecs's own OS API implementation (pthread threads
+    // and locks), which wasm32 has no C library for.
     assert!(
-        !(target.starts_with("wasm32") && env::var_os("CARGO_FEATURE_PIPELINE").is_some()),
-        "hyperion-flecs-c: the pipeline addon needs threads; build wasm32 with the core only"
+        !(target.starts_with("wasm32") && env::var_os("CARGO_FEATURE_SYSTEM").is_some()),
+        "hyperion-flecs-c: the system and pipeline addons need flecs's OS API; build wasm32 without them"
     );
     if target.starts_with("wasm32") {
         let libc = root.join("wasm-libc");

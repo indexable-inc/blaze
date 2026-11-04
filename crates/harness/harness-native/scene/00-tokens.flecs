@@ -105,58 +105,58 @@ export const radius_control = 6
 export const radius_card = 12
 
 // Vibrant labels: primary, secondary, tertiary, quaternary.
-export const tone_ink_1 = Fill: {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
-export const tone_ink_2 = Fill: {dark: {1, 1, 1, 0.74}, light: {0, 0, 0, 0.72}}
-export const tone_ink_3 = Fill: {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
-export const tone_ink_4 = Fill: {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
-export const tone_accent = Fill: {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+export const tone_ink_1: Fill = {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
+export const tone_ink_2: Fill = {dark: {1, 1, 1, 0.74}, light: {0, 0, 0, 0.72}}
+export const tone_ink_3: Fill = {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
+export const tone_ink_4: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
+export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
 
-export const tone_wash = Fill: {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
-export const tone_wash_hover = Fill: {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
-export const tone_wash_press = Fill: {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
+export const tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
+export const tone_wash_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
+export const tone_wash_press: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
 // The selected row: a soft accent-tinted pill over the vibrancy.
-export const tone_knob = Fill: {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
-export const tone_select = Fill: {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
+export const tone_knob: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
+export const tone_select: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
 // The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
-export const tone_side_tint = Fill: {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
+export const tone_side_tint: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
 // The one hairline between the sidebar and the main card.
-export const tone_seam = Fill: {dark: {1, 1, 1, 0.035}, light: {0, 0, 0, 0.04}}
+export const tone_seam: Fill = {dark: {1, 1, 1, 0.035}, light: {0, 0, 0, 0.04}}
 // Nothing: a node that paints no fill.
-export const tone_clear = Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+export const tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
 // The palette's scrim over the window and its card.
-export const tone_scrim = Fill: {dark: {0, 0, 0, 0.32}, light: {0, 0, 0, 0.12}}
-export const tone_card = Fill: {dark: {0.098, 0.098, 0.106, 1}, light: {1, 1, 1, 1}}
+export const tone_scrim: Fill = {dark: {0, 0, 0, 0.32}, light: {0, 0, 0, 0.12}}
+export const tone_card: Fill = {dark: {0.098, 0.098, 0.106, 1}, light: {1, 1, 1, 1}}
 // Offscreen shots only (src/shot.rs): a flat stand-in for the sidebar's vibrancy, which a texture cannot sample.
-export const tone_shot_ground = Fill: {dark: {0.165, 0.165, 0.180, 1}, light: {0.906, 0.906, 0.918, 1}}
-export const tone_plate = Fill: {dark: {0.071, 0.071, 0.078, 1}, light: {1, 1, 1, 1}}
-export const tone_plate_line = Fill: {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.09}}
-export const tone_switch_on = Fill: {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
+export const tone_shot_ground: Fill = {dark: {0.165, 0.165, 0.180, 1}, light: {0.906, 0.906, 0.918, 1}}
+export const tone_plate: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {1, 1, 1, 1}}
+export const tone_plate_line: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.09}}
+export const tone_switch_on: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
 // With a Ghostty theme (src/app/ghostty.rs, read live from the user's Ghostty config) the tokens on the terminal's
 // ground are set at runtime from each appearance's theme background and foreground: tone_term_ground (hn.Main),
 // tone_term_ink and tone_term_muted (hn.TitleBar), tone_plate (Plate), tone_card (hn.Palette.card) and tone_side_tint
 // (hn.SideClip). The values here are the built-in theme's, kept for an appearance the config does not theme.
 // The terminal's ground (the built-in theme's bg, #121214): the main card and the title bar over it, in both appearances.
-export const tone_term_ground = Fill: {dark: {0.071, 0.071, 0.078, 1}, light: {0.071, 0.071, 0.078, 1}}
+export const tone_term_ground: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.071, 0.071, 0.078, 1}}
 // Ink over the terminal's ground (always dark): the title bar's words.
-export const tone_term_ink = Fill: {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
-export const tone_term_muted = Fill: {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
+export const tone_term_ink: Fill = {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
+export const tone_term_muted: Fill = {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
 
-export const tone_running = Fill: {dark: {0.298, 0.718, 0.510, 1}, light: {0.18, 0.60, 0.38, 1}}
-export const tone_exited = Fill: {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
-export const tone_failed = Fill: {dark: {1.0, 0.45, 0.43, 1}, light: {0.84, 0.22, 0.20, 1}}
-export const tone_failed_wash = Fill: {dark: {1.0, 0.45, 0.43, 0.13}, light: {0.84, 0.22, 0.20, 0.10}}
-export const tone_lost = Fill: {dark: {0.949, 0.733, 0.322, 1}, light: {0.78, 0.55, 0.10, 1}}
+export const tone_running: Fill = {dark: {0.298, 0.718, 0.510, 1}, light: {0.18, 0.60, 0.38, 1}}
+export const tone_exited: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
+export const tone_failed: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {0.84, 0.22, 0.20, 1}}
+export const tone_failed_wash: Fill = {dark: {1.0, 0.45, 0.43, 0.13}, light: {0.84, 0.22, 0.20, 0.10}}
+export const tone_lost: Fill = {dark: {0.949, 0.733, 0.322, 1}, light: {0.78, 0.55, 0.10, 1}}
 
 // The cute touch: a small warm colour per kind on its icon.
-export const tone_kind_claude = Fill: {dark: {0.886, 0.502, 0.369, 1}, light: {0.800, 0.400, 0.260, 1}}
-export const tone_kind_codex = Fill: {dark: {0.306, 0.792, 0.741, 1}, light: {0.090, 0.580, 0.540, 1}}
-export const tone_kind_cursor = Fill: {dark: {0.718, 0.588, 1.0, 1}, light: {0.510, 0.360, 0.880, 1}}
-export const tone_kind_shell = Fill: {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
+export const tone_kind_claude: Fill = {dark: {0.886, 0.502, 0.369, 1}, light: {0.800, 0.400, 0.260, 1}}
+export const tone_kind_codex: Fill = {dark: {0.306, 0.792, 0.741, 1}, light: {0.090, 0.580, 0.540, 1}}
+export const tone_kind_cursor: Fill = {dark: {0.718, 0.588, 1.0, 1}, light: {0.510, 0.360, 0.880, 1}}
+export const tone_kind_shell: Fill = {dark: {1, 1, 1, 0.52}, light: {0, 0, 0, 0.50}}
 
 // The brand marks' fills (hn.Kind): Claude's orange (#D97757, its brand hex) in both appearances; OpenAI's and Cursor's
 // marks are monochrome, in the strong ink, so they turn with the appearance.
-export const tone_mark_claude = Fill: {dark: {0.851, 0.467, 0.341, 1}, light: {0.851, 0.467, 0.341, 1}}
-export const tone_mark_ink = Fill: {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
+export const tone_mark_claude: Fill = {dark: {0.851, 0.467, 0.341, 1}, light: {0.851, 0.467, 0.341, 1}}
+export const tone_mark_ink: Fill = {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
 
 prefab Strong {
   Fill: $tone_ink_1
@@ -187,7 +187,7 @@ prefab Plate {
 export const size_stats = 11
 export const line_stats = 14
 export const radius_stats = 6
-export const tone_stats_plate = Fill: {dark: {0, 0, 0, 0.62}, light: {0, 0, 0, 0.62}}
-export const tone_stats_ink = Fill: {dark: {1, 1, 1, 0.90}, light: {1, 1, 1, 0.90}}
-export const tone_stats_bar = Fill: {dark: {0.298, 0.718, 0.510, 0.85}, light: {0.298, 0.718, 0.510, 0.85}}
-export const tone_stats_hot = Fill: {dark: {1.0, 0.45, 0.43, 1}, light: {1.0, 0.45, 0.43, 1}}
+export const tone_stats_plate: Fill = {dark: {0, 0, 0, 0.62}, light: {0, 0, 0, 0.62}}
+export const tone_stats_ink: Fill = {dark: {1, 1, 1, 0.90}, light: {1, 1, 1, 0.90}}
+export const tone_stats_bar: Fill = {dark: {0.298, 0.718, 0.510, 0.85}, light: {0.298, 0.718, 0.510, 0.85}}
+export const tone_stats_hot: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {1.0, 0.45, 0.43, 1}}

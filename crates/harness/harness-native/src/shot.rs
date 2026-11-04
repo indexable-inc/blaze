@@ -151,6 +151,10 @@ pub fn run(path: &str) -> Result<(), String> {
     let px = renderer.read(&tex);
     write_png(path, &app, &px, (w * backing) as u32, (h * backing) as u32)?;
     eprintln!("harness-native: wrote {path}");
+    // The tooltip AppKit would show for the hovered node (it isn't drawn offscreen), when a hover was asked for.
+    if std::env::var_os("HARNESS_NATIVE_SHOT_HOVER").is_some() {
+        eprintln!("harness-native: tooltip {:?}", app.tooltip());
+    }
     // HARNESS_NATIVE_MENU_DUMP: the menu bar the window would have, read back from the NSMenu built from the keys.
     if std::env::var_os("HARNESS_NATIVE_MENU_DUMP").is_some() {
         eprint!("harness-native: menu bar\n{}", crate::window::dump_menu(&app.menu()));

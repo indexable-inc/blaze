@@ -121,7 +121,7 @@ pub fn children<'a>(e: EntityView<'a>) -> Vec<EntityView<'a>> {
 /// Geometry is written by layout; draw order is scene configuration.
 ///
 /// The parts of a composite keep the order the scene declares them in, at every depth, because flecs copies `OrderedChildren`
-/// onto every instance before it instantiates the parts (`(OnInstantiate, Override)`, set in vendored flecs's bootstrap: the
+/// onto every instance before it instantiates the parts (`(OnInstantiate, Copy)`, set in the prefab addon's bootstrap in our flecs fork: the
 /// trait cannot be changed once the world is up). `Node` is a world alias of its own name: the primitives' script declares
 /// it inside the `ui` scope (`prefab ui.Node { Node }`), where the bare name would otherwise find the prefab `ui.Node`
 /// itself, and no primitive, nor any part of a composite, would be a node.
