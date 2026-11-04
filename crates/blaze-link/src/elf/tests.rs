@@ -35,6 +35,7 @@ fn output(arch: blaze_codegen::Arch, kind: OutputKind, interpreter: Option<&str>
         exec_log: false,
         sanitize: blaze_codegen::settings::Sanitize::default(),
         rpaths: Vec::new(),
+        link: crate::LinkArgs::default(),
         triple: match arch {
             blaze_codegen::Arch::Aarch64 => "aarch64-unknown-linux-gnu",
             _ => "x86_64-unknown-linux-gnu",

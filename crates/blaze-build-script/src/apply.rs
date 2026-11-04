@@ -49,14 +49,23 @@ pub struct Compile {
     pub search: Vec<PathBuf>,
     /// `-l`.
     pub libs: Vec<String>,
-    /// `-C link-arg=`.
-    pub link_args: Vec<String>,
+    /// `-C link-arg=`, each with the script that printed it.
+    pub link_args: Vec<LinkArg>,
     /// `--cfg`.
     pub cfgs: Vec<String>,
     /// `--check-cfg`.
     pub check_cfgs: Vec<String>,
     /// Variables rustc runs with, and so `env!` reads.
     pub env: Vec<(String, String)>,
+}
+
+/// A `-C link-arg=` a unit is given, and which script printed it: an error refusing it names
+/// that script's package.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LinkArg {
+    /// The index, in the `linked` [`Compile::of`] was given, of the script's output.
+    pub from: usize,
+    pub arg: String,
 }
 
 impl Compile {
@@ -81,7 +90,7 @@ impl Compile {
                 compile.search.push(path.path().to_owned());
             }
         }
-        for it in linked {
+        for (from, it) in linked.iter().enumerate() {
             if it.own && pass_l {
                 compile.libs.extend(it.output.library_links.iter().cloned());
             }
@@ -89,7 +98,7 @@ impl Compile {
                 // cdylib arguments reach a cdylib from its dependencies too: cargo's issue 9562.
                 if to.applies_to(target, test) && (it.own || *to == LinkArgTarget::Cdylib) {
                     // clone: the edge: what codegen is given, once per unit, owned (request 7).
-                    compile.link_args.push(arg.clone());
+                    compile.link_args.push(LinkArg { from, arg: arg.clone() });
                 }
             }
         }
@@ -116,7 +125,7 @@ impl Compile {
         for lib in &self.libs {
             args.extend([Cow::Borrowed("-l"), Cow::Borrowed(lib.as_str())]);
         }
-        for arg in &self.link_args {
+        for LinkArg { arg, .. } in &self.link_args {
             let mut link_arg = String::with_capacity("link-arg=".len() + arg.len());
             link_arg.push_str("link-arg=");
             link_arg.push_str(arg);

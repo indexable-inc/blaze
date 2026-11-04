@@ -213,6 +213,7 @@ fn windows() -> Output {
         exec_log: false,
         sanitize: blaze_codegen::settings::Sanitize::default(),
         rpaths: Vec::new(),
+        link: crate::LinkArgs::default(),
         triple: "x86_64-pc-windows-msvc".into(),
         stack: Some(1 << 20),
     }
