@@ -34,18 +34,32 @@ const _: () = assert!(MOST_FEATURE_SETS <= u8::MAX as usize + 1);
 /// first named, each once. Only added to, under [`ADDING`], in order, so a slot that is not
 /// set yet ends the sets; read with no lock.
 #[expect(clippy::disallowed_types, reason = "the process's one numbering of feature sets: a `Features` is its number, read with no lock")]
-static FEATURE_SETS: [std::sync::OnceLock<Box<[String]>>; MOST_FEATURE_SETS] =
+static FEATURE_SETS: [std::sync::OnceLock<FeatureSet>; MOST_FEATURE_SETS] =
     [const { std::sync::OnceLock::new() }; MOST_FEATURE_SETS];
+
+/// What a [`Features`] numbers: the CPU code is made for and the features past that target's
+/// baseline it is made with. Two sets of one list and two CPUs are two numbers, so everything
+/// kept by `Features` (a target machine of LLVM's, an ISA of Cranelift's, a function's set) is
+/// kept per CPU too.
+#[derive(PartialEq, Eq, Debug)]
+struct FeatureSet {
+    /// `-C target-cpu` resolved (`native` is the host's name), or `None` for the target's own
+    /// ([`Target::cpu`]), which every target has another name of.
+    cpu: Option<Box<str>>,
+    names: Box<[String]>,
+}
 
 /// Held while a set is added to [`FEATURE_SETS`].
 static ADDING: Mutex<()> = Mutex::new(());
 
-/// A set of target features past the baseline of [`Target::cpu`] that code is compiled with:
-/// `+name` and `-name` in rustc's names, sorted, each once, as `blaze_codegen::Toolchain::features`
-/// has them. Numbered for the process ([`Target::features_of`]), so that a code generator is
-/// one per set and a function's set is a byte. The set changes the code only: it is in a
-/// unit's key through `Toolchain::features` and a function's `#[target_feature]` through its
-/// shape, and never in `cfg(target_feature)`, which comes from the flags.
+/// A CPU and a set of target features past the baseline of [`Target::cpu`] that code is
+/// compiled with: `+name` and `-name` in rustc's names, sorted, each once, as
+/// `blaze_codegen::Toolchain::features` has them, and the CPU `Toolchain::cpu` names when it is
+/// not the target's own ([`Self::cpu`]). Numbered for the process ([`Target::features_of`]), so
+/// that a code generator is one per CPU and set and a function's set is a byte. They change the
+/// code only: they are in a unit's key through `Toolchain::cpu` and `Toolchain::features` and a
+/// function's `#[target_feature]` through its shape, and never in `cfg(target_feature)`, which
+/// comes from the flags.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Features(u8);
 
@@ -56,9 +70,14 @@ impl Features {
     /// The features of the set, as [`Target::features_of`] was given them.
     pub fn names(self) -> &'static [String] {
         match FEATURE_SETS[self.index()].get() {
-            Some(set) => set,
+            Some(set) => &set.names,
             None => &[],
         }
+    }
+
+    /// The CPU of the set when it is not its target's own ([`Target::cpu_of`] gives either).
+    pub fn cpu(self) -> Option<&'static str> {
+        FEATURE_SETS[self.index()].get().and_then(|set| set.cpu.as_deref())
     }
 
     pub fn is_baseline(self) -> bool {
@@ -69,18 +88,21 @@ impl Features {
         usize::from(self.0)
     }
 
-    /// The number of `features`, given it is sorted and each once: a scan of the sets named so
-    /// far with no lock, and a new number under [`ADDING`] for a set first named. More than
-    /// [`MOST_FEATURE_SETS`] is an error naming the set.
-    fn interned(features: &[String]) -> Result<Features, String> {
-        if features.is_empty() {
+    /// The number of `cpu` (`None` for the target's own) and `features`, given it is sorted
+    /// and each once: a scan of the sets named so far with no lock, and a new number under
+    /// [`ADDING`] for a set first named. More than [`MOST_FEATURE_SETS`] is an error naming the
+    /// set.
+    fn interned(cpu: Option<&str>, features: &[String]) -> Result<Features, String> {
+        if cpu.is_none() && features.is_empty() {
             return Ok(Features::BASELINE);
         }
         // The set's number, or the first slot not set yet from `from` on.
         let find = |from: usize| -> Result<Features, usize> {
             for at in from..MOST_FEATURE_SETS {
                 match FEATURE_SETS[at].get() {
-                    Some(set) if **set == *features => return Ok(Features(at as u8)),
+                    Some(set) if set.cpu.as_deref() == cpu && *set.names == *features => {
+                        return Ok(Features(at as u8));
+                    }
                     Some(_) => {}
                     None => return Err(at),
                 }
@@ -99,12 +121,12 @@ impl Features {
         if free == MOST_FEATURE_SETS {
             // alloc: an error
             return Err(format!(
-                "the target features {features:?}: one process compiles with at most \
-                 {MOST_FEATURE_SETS} sets of target features, and this is one more"
+                "the target features {features:?} of CPU {cpu:?}: one process compiles with at \
+                 most {MOST_FEATURE_SETS} sets of a CPU and target features, and this is one more"
             ));
         }
-        // alloc: once per set a process compiles with, its names
-        FEATURE_SETS[free].get_or_init(|| features.into());
+        // alloc: once per set a process compiles with, its CPU's name and features' names
+        FEATURE_SETS[free].get_or_init(|| FeatureSet { cpu: cpu.map(Box::from), names: features.into() });
         Ok(Features(free as u8))
     }
 }
@@ -272,14 +294,23 @@ impl Target {
         usize::from(self.index)
     }
 
-    /// The set of target features past the baseline of [`Target::cpu`] that `features` names:
-    /// `-C target-feature` resolved and sorted, as `blaze_codegen::Toolchain::features` has
+    /// The set of code for CPU `cpu` (`Toolchain::cpu`, resolved) with the target features past
+    /// the baseline of [`Target::cpu`] that `features` names: `-C target-cpu`'s and
+    /// `-C target-feature`'s resolved and sorted, as `blaze_codegen::Toolchain::features` has
     /// them (the host's for a dev build that runs where it is built), or such a set with a
     /// function's `#[target_feature]` added. Any number of sets may be named, one for each
     /// toolchain a daemon builds with. A feature that turns off what Cranelift's code of the
     /// target always uses is refused, as are a name that is not `+` or `-` and a feature, a
-    /// list that is not sorted with each once, and a feature both on and off.
-    pub fn features_of(&self, features: &[String]) -> Result<Features, String> {
+    /// list that is not sorted with each once, a feature both on and off, and `native`, which
+    /// the toolchain resolves to the host's name.
+    pub fn features_of(&self, cpu: &str, features: &[String]) -> Result<Features, String> {
+        if cpu == "native" || cpu.is_empty() {
+            // alloc: an error
+            return Err(format!(
+                "the CPU {cpu:?} of {}: a toolchain names the CPU it resolved (`native` is the host's)",
+                self.triple
+            ));
+        }
         if !features.is_sorted_by(|a, b| a < b) {
             // alloc: an error
             return Err(format!("the target features {features:?} are not sorted, each once"));
@@ -293,7 +324,14 @@ impl Target {
                 return Err(format!("the target features {features:?} turn {name} on and off"));
             }
         }
-        Features::interned(features)
+        Features::interned((cpu != self.cpu()).then_some(cpu), features)
+    }
+
+    /// The CPU code of `features` is made for: its own ([`Features::cpu`]) or the target's
+    /// baseline ([`Self::cpu`]). What LLVM's target machine and each function's `target-cpu`
+    /// are told.
+    pub fn cpu_of(&self, features: Features) -> &str {
+        features.cpu().unwrap_or(self.cpu())
     }
 
     /// `features` in LLVM's names, as its target machine and a function's `target-features`
@@ -346,7 +384,9 @@ impl Target {
             Arch::Wasm32 | Arch::Wasm64 => (&[], &[]),
         };
         if always.contains(&name) {
-            if !on && name != "cmpxchg16b" {
+            // Cranelift's code has no x87, `fxsave` or unasked `cmpxchg16b` instruction, so a
+            // CPU without them (`-C target-cpu=generic` on x86-64 has no `fxsr`) changes none.
+            if !on && !matches!(name, "cmpxchg16b" | "x87" | "fxsr") {
                 // alloc: an error at setup, read once per ISA made.
                 return Err(format!(
                     "-{name}: Cranelift's code for {} always uses it",
@@ -705,7 +745,7 @@ impl Target {
 /// rustc's `to_llvm_features` gives them for LLVM 23: what LLVM spells otherwise, what rustc
 /// ties to it (`neon` and `fp-armv8` both ways; `sse4.2` turns `crc32` on), and nothing for
 /// a feature this LLVM no longer has. `None` where LLVM spells it as rustc does.
-fn renamed_for_llvm(arch: Arch, name: &str, on: bool) -> Option<&'static [&'static str]> {
+pub(crate) fn renamed_for_llvm(arch: Arch, name: &str, on: bool) -> Option<&'static [&'static str]> {
     Some(match arch {
         Arch::X86_64 => match name {
             "sse4.2" if on => &["sse4.2", "crc32"],
@@ -758,10 +798,10 @@ mod tests {
     #[test]
     fn a_set_is_one_number_and_two_sets_two() {
         let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
-        assert_eq!(x86.features_of(&[]), Ok(Features::BASELINE));
-        let avx2 = x86.features_of(&names(&["+avx", "+avx2"])).expect("a set");
-        let again = x86.features_of(&names(&["+avx", "+avx2"])).expect("a set");
-        let ssse3 = x86.features_of(&names(&["+ssse3"])).expect("a set");
+        assert_eq!(x86.features_of(x86.cpu(), &[]), Ok(Features::BASELINE));
+        let avx2 = x86.features_of(x86.cpu(), &names(&["+avx", "+avx2"])).expect("a set");
+        let again = x86.features_of(x86.cpu(), &names(&["+avx", "+avx2"])).expect("a set");
+        let ssse3 = x86.features_of(x86.cpu(), &names(&["+ssse3"])).expect("a set");
         assert_eq!(avx2, again);
         assert_ne!(avx2, ssse3);
         assert!(!avx2.is_baseline() && Features::BASELINE.is_baseline());
@@ -772,11 +812,11 @@ mod tests {
     #[test]
     fn a_set_out_of_order_twice_or_on_and_off_is_refused() {
         let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
-        assert!(x86.features_of(&names(&["+avx2", "+avx"])).is_err());
-        assert!(x86.features_of(&names(&["+avx", "+avx"])).is_err());
-        assert!(x86.features_of(&names(&["+popcnt", "-popcnt"])).is_err());
-        assert!(x86.features_of(&names(&["-sse2"])).is_err());
-        assert!(x86.features_of(&names(&["avx2"])).is_err());
+        assert!(x86.features_of(x86.cpu(), &names(&["+avx2", "+avx"])).is_err());
+        assert!(x86.features_of(x86.cpu(), &names(&["+avx", "+avx"])).is_err());
+        assert!(x86.features_of(x86.cpu(), &names(&["+popcnt", "-popcnt"])).is_err());
+        assert!(x86.features_of(x86.cpu(), &names(&["-sse2"])).is_err());
+        assert!(x86.features_of(x86.cpu(), &names(&["avx2"])).is_err());
     }
 
     /// Sets are numbered from many threads at once: each set gets one number.
@@ -787,7 +827,7 @@ mod tests {
         let numbered: Vec<Vec<Features>> = std::thread::scope(|scope| {
             let threads: Vec<_> = (0..8)
                 .map(|_| {
-                    scope.spawn(|| sets.iter().map(|it| x86.features_of(it).expect("a set")).collect::<Vec<_>>())
+                    scope.spawn(|| sets.iter().map(|it| x86.features_of(x86.cpu(), it).expect("a set")).collect::<Vec<_>>())
                 })
                 .collect();
             threads.into_iter().map(|it| it.join().expect("a thread")).collect()
@@ -805,15 +845,15 @@ mod tests {
     #[test]
     fn each_set_has_its_own_isa() {
         let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
-        let avx2 = x86.features_of(&names(&["+avx", "+avx2", "+sse3", "+sse4.1", "+sse4.2", "+ssse3"])).expect("a set");
-        let ssse3 = x86.features_of(&names(&["+sse3", "+ssse3"])).expect("a set");
+        let avx2 = x86.features_of(x86.cpu(), &names(&["+avx", "+avx2", "+sse3", "+sse4.1", "+sse4.2", "+ssse3"])).expect("a set");
+        let ssse3 = x86.features_of(x86.cpu(), &names(&["+sse3", "+ssse3"])).expect("a set");
         assert_eq!(setting_with(&x86, avx2, "has_avx2"), Some(true));
         assert_eq!(setting_with(&x86, avx2, "has_sse41"), Some(true));
         assert_eq!(setting_with(&x86, ssse3, "has_ssse3"), Some(true));
         assert_eq!(setting_with(&x86, ssse3, "has_avx2"), Some(false));
         assert_eq!(setting(&x86, "has_ssse3"), Some(false));
         let arm = Target::of("aarch64-apple-darwin").expect("a target");
-        let off = arm.features_of(&names(&["-lse"])).expect("a set");
+        let off = arm.features_of(arm.cpu(), &names(&["-lse"])).expect("a set");
         assert_eq!(setting_with(&arm, off, "has_lse"), Some(false));
         assert_eq!(setting(&arm, "has_lse"), Some(true));
     }
@@ -824,19 +864,19 @@ mod tests {
         let linux = Target::of("x86_64-unknown-linux-gnu").expect("a target");
         assert_eq!(linux.llvm_features(Features::BASELINE), "");
         let set = linux
-            .features_of(&names(&["+avx2", "+bmi1", "+lahfsahf", "+pclmulqdq", "+sse4.2", "-cmpxchg16b"]))
+            .features_of(linux.cpu(), &names(&["+avx2", "+bmi1", "+lahfsahf", "+pclmulqdq", "+sse4.2", "-cmpxchg16b"]))
             .expect("a set");
         assert_eq!(linux.llvm_features(set), "+avx2,+bmi,+sahf,+pclmul,+sse4.2,+crc32,-cx16");
-        let off = linux.features_of(&names(&["-sse4.2"])).expect("a set");
+        let off = linux.features_of(linux.cpu(), &names(&["-sse4.2"])).expect("a set");
         assert_eq!(linux.llvm_features(off), "-sse4.2");
         let windows = Target::of("x86_64-pc-windows-msvc").expect("a target");
         assert_eq!(windows.llvm_features(Features::BASELINE), "+cx16");
-        let avx = windows.features_of(&names(&["+avx"])).expect("a set");
+        let avx = windows.features_of(windows.cpu(), &names(&["+avx"])).expect("a set");
         assert_eq!(windows.llvm_features(avx), "+cx16,+avx");
         let arm = Target::of("aarch64-unknown-linux-gnu").expect("a target");
-        let set = arm.features_of(&names(&["+fp16", "+paca", "+pacg", "+rcpc2", "+tme"])).expect("a set");
+        let set = arm.features_of(arm.cpu(), &names(&["+fp16", "+paca", "+pacg", "+rcpc2", "+tme"])).expect("a set");
         assert_eq!(arm.llvm_features(set), "+fullfp16,+pauth,+rcpc-immo");
-        let neon = arm.features_of(&names(&["+fhm", "+neon"])).expect("a set");
+        let neon = arm.features_of(arm.cpu(), &names(&["+fhm", "+neon"])).expect("a set");
         assert_eq!(arm.llvm_features(neon), "+fp16fml,+neon,+fp-armv8");
     }
 

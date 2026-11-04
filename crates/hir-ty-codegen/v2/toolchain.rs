@@ -100,9 +100,6 @@ const AARCH64_IMPLIES: &[(&str, &[&str])] = &[
 ];
 
 const X86_64: &[&str] = &["fxsr", "sse", "sse2", "x87"];
-const X86_64_V2: &[&str] = &["cmpxchg16b", "lahfsahf", "popcnt", "sse3", "sse4.1", "sse4.2", "ssse3"];
-const X86_64_V3: &[&str] = &["avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "xsave"];
-const X86_64_V4: &[&str] = &["avx512bw", "avx512cd", "avx512dq", "avx512f", "avx512vl"];
 const AARCH64: &[&str] = &["fp-armv8", "neon"];
 const APPLE_M1: &[&str] = &["fp-armv8", "lse", "neon"];
 
@@ -116,8 +113,9 @@ const APPLE_M1: &[&str] = &["fp-armv8", "lse", "neon"];
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Runs {
     /// On the machine that builds it: a dev build or a test that runs where it is built.
-    /// With no `-C target-cpu`, its code may use every feature of this machine that
-    /// Cranelift can, as `-C target-cpu=native` gives them, on the baseline CPU's name.
+    /// With no `-C target-cpu`, its code may use every feature this machine is found to have
+    /// of those the code generator picks instructions by (`host_features`), on the baseline
+    /// CPU's name: of the features `-C target-cpu=native` gives, without its CPU's name.
     Here,
     /// On another machine: a `--target`, remote or output build. With no `-C target-cpu`,
     /// the target's baseline.
@@ -174,19 +172,8 @@ pub fn toolchain_for(
             (emitted.cpu().to_owned(), on_host(&emitted, baseline))
         }
         Some("native") => native(&emitted, baseline)?,
-        Some(named) => match levels(&emitted, named) {
-            // alloc: per toolchain made, a few names
-            Some(levels) => (named.to_owned(), set(&levels)),
-            None => {
-                // alloc: an error
-                return Err(format!(
-                    "-C target-cpu={named}: blaze knows the features of `native`, of {target}'s \
-                     baseline `{}` and, on x86-64, of `x86-64-v2` to `x86-64-v4`, not of \
-                     `{named}`",
-                    emitted.cpu()
-                ));
-            }
-        },
+        // alloc: per toolchain made, a few names
+        Some(named) => (named.to_owned(), of_cpu(&emitted, named)?),
     };
     let implies = implications(&emitted);
     for (enable, name) in &flags.features {
@@ -255,7 +242,7 @@ pub fn toolchain_for(
 /// unit's own, read where its code is made (`v2::Function::frame_pointers`).
 pub fn select(toolchain: &Toolchain) -> Result<(), String> {
     let target = Target::of(&toolchain.target)?;
-    target.features_of(&toolchain.features)?;
+    target.features_of(&toolchain.cpu, &toolchain.features)?;
     Ok(())
 }
 
@@ -383,27 +370,41 @@ pub(super) fn baseline(target: &Target) -> &'static [&'static str] {
     }
 }
 
-/// The features of a CPU named by `-C target-cpu` other than `native`: the baseline's, or an
-/// x86-64 microarchitecture level's. `None` for another name.
-fn levels(target: &Target, named: &str) -> Option<Vec<&'static str>> {
+/// The features of CPU `named` of `target` (`-C target-cpu`, any CPU rustc takes, LLVM's
+/// aliases among them): the baseline's, with what the CPU has past the target's baseline CPU
+/// turned on and what it lacks of it turned off, each with what it implies. What a CPU has is
+/// the CPU table's (`target_features::cpus`, rustc's features of each CPU, the one home of
+/// what blaze knows of CPUs); a name it does not know is an error naming it and the target.
+/// Only the difference between the two CPUs is read, so the baseline's own names (`fp-armv8`,
+/// which rustc folds into `neon`) stay as Cranelift and LLVM know them.
+fn of_cpu(target: &Target, named: &str) -> Result<BTreeSet<String>, String> {
+    let baseline = baseline(target);
     if named == target.cpu() {
-        // alloc: per toolchain made, a few names
-        return Some(baseline(target).to_vec());
+        return Ok(set(baseline));
     }
-    if target.arch != crate::Arch::X86_64 {
-        return None;
+    // alloc: an error, naming the target and the CPU
+    let has = target_features::cpus::features(target.triple(), named).map_err(|e| e.to_string())?;
+    let base = target_features::cpus::features(target.triple(), target.cpu()).map_err(|e| {
+        // alloc: an error
+        format!("{e}: the target's baseline CPU, which `-C target-cpu={named}` is read against")
+    })?;
+    let implies = implications(target);
+    let mut on = set(baseline);
+    for &feature in has.iter().filter(|it| !base.contains(it)) {
+        turn_on(&mut on, implies, feature);
     }
-    let levels: &[&[&str]] = match named {
-        "x86-64-v2" => &[X86_64, X86_64_V2],
-        "x86-64-v3" => &[X86_64, X86_64_V2, X86_64_V3],
-        "x86-64-v4" => &[X86_64, X86_64_V2, X86_64_V3, X86_64_V4],
-        _ => return None,
-    };
-    Some(levels.concat())
+    for &feature in base.iter().filter(|it| !has.contains(it)) {
+        turn_off(&mut on, implies, feature);
+    }
+    Ok(on)
 }
 
-/// `-C target-cpu=native`: the host's CPU by LLVM's name (the baseline's without LLVM), with
-/// the features the host has that Cranelift's code may use.
+/// `-C target-cpu=native`: the host's CPU by LLVM's name (`apple-m4`, `znver4`; the key
+/// records it, never `native`) with its features as [`of_cpu`] gives them, less those LLVM
+/// finds the host without (a VM that hides AVX-512 from a CPU that has it), and with every
+/// feature the host is found to have. Without LLVM (the seed, whose native code is stencils
+/// only) the host has no name to read: the baseline's name with what the host is found to
+/// have ([`on_host`]).
 fn native(target: &Target, baseline: &[&str]) -> Result<(String, BTreeSet<String>), String> {
     if target.triple() != Target::host() {
         // alloc: an error
@@ -413,16 +414,34 @@ fn native(target: &Target, baseline: &[&str]) -> Result<(String, BTreeSet<String
             Target::host()
         ));
     }
-    let name = match crate::host_cpu() {
-        Some((name, _)) => name,
+    let Some((name, told)) = crate::host_cpu() else {
         // alloc: per toolchain made, a few names
-        None => target.cpu().to_owned(),
+        return Ok((target.cpu().to_owned(), on_host(target, baseline)));
     };
-    Ok((name, on_host(target, baseline)))
+    let mut on = of_cpu(target, &name).map_err(|e| {
+        // alloc: an error
+        format!("-C target-cpu=native: LLVM names the host's CPU `{name}`, and {e}")
+    })?;
+    let implies = implications(target);
+    // alloc: per toolchain made, a few names
+    let lacks: Vec<&str> = told.split(',').filter_map(|it| it.strip_prefix('-')).collect();
+    // alloc: per toolchain made, a few names
+    let named: Vec<String> = on.iter().cloned().collect();
+    for feature in &named {
+        let llvm = crate::target::renamed_for_llvm(target.arch, feature, true);
+        if llvm.unwrap_or(std::slice::from_ref(&feature.as_str())).iter().any(|it| lacks.contains(it)) {
+            turn_off(&mut on, implies, feature);
+        }
+    }
+    for feature in host_features(target) {
+        turn_on(&mut on, implies, feature);
+    }
+    Ok((name, on))
 }
 
-/// The baseline with every feature the host has that Cranelift's code may use, and what
-/// each implies: `-C target-cpu=native`'s, and a build's that runs where it is built.
+/// The baseline with every feature the host is found to have of those the code generator
+/// picks instructions by, and what each implies: a build's that runs where it is built
+/// ([`Runs::Here`]), and `-C target-cpu=native`'s in a blaze without LLVM.
 fn on_host(target: &Target, baseline: &[&str]) -> BTreeSet<String> {
     let mut on = set(baseline);
     for feature in host_features(target) {

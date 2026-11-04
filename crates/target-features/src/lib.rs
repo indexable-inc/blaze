@@ -14,6 +14,7 @@ use std::fmt;
 
 use blaze_ids::bits::{BitArray, BitIndex};
 
+pub mod cpus;
 #[cfg(test)]
 mod tests;
 

@@ -45,7 +45,7 @@ use inkwell::{
     llvm_sys::{
         support::LLVMParseCommandLineOptions,
         transforms::pass_builder::{
-            LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazeHasFeature,
+            LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazeHasCpu, LLVMBlazeHasFeature,
             LLVMBlazeOpaquePasses, LLVMBlazeRunPasses,
         },
     },
@@ -267,7 +267,7 @@ fn compiled(
                 .collect::<SmallVec<[_; 1]>>();
             let mut functions = Vec::with_capacity(defined.len());
             for (at, defined) in defined.iter().enumerate() {
-                match Lowering::add(context, &module, target, defined, super::backend::V1_FRAME_POINTERS) {
+                match Lowering::add(context, &module, target, defined, super::backend::V1_FRAME_POINTERS, crate::Features::BASELINE) {
                     Ok(function) => functions.push(Some(function)),
                     Err(e) if alone.is_some() => return Err(e),
                     Err(e) => {
@@ -305,7 +305,7 @@ fn compiled(
             // Every body shown is declared before any is defined, as one may call another.
             let mut by_id = HashMap::new_in(Global);
             for (it, defined) in std::iter::zip(&seen, &shown) {
-                if let Ok(function) = Lowering::add(context, &module, target, defined, super::backend::V1_FRAME_POINTERS) {
+                if let Ok(function) = Lowering::add(context, &module, target, defined, super::backend::V1_FRAME_POINTERS, crate::Features::BASELINE) {
                     mark_hint(context, function, it.hint);
                     by_id.insert(it.id.as_u32(), function);
                 }
@@ -663,8 +663,8 @@ fn mark_hint<'ctx>(context: &'ctx Context, function: FunctionValue<'ctx>, hint: 
     function.add_attribute(AttributeLoc::Function, context.create_enum_attribute(hint, 0));
 }
 
-/// Gives `function` the `target-features` of `features`, as rustc gives each function its
-/// own: the whole set, since LLVM compiles a function that has one with it in place of its
+/// Gives `function` the `target-features` of `features` ([`lower::Lowering::add`], which tells
+/// it its `target-cpu` too), as rustc gives each function its own: the whole set, since LLVM compiles a function that has one with it in place of its
 /// target machine's. The attribute goes with the function's export, so LLVM's inliner builds
 /// it only into a caller that has its features. Nothing for the target's baseline.
 fn mark_features<'ctx>(
@@ -719,7 +719,7 @@ pub(super) fn export(
         // alloc: once per export, as `constants`
         let statics: HashSet<u32, Global> = recorder.statics().collect();
         let own = Defined { name: OWN, func, pointees, named: &[], weights: None, marked: false };
-        let function = Lowering::add(context, &module, recorder.target, &own, super::backend::V1_FRAME_POINTERS)?;
+        let function = Lowering::add(context, &module, recorder.target, &own, super::backend::V1_FRAME_POINTERS, crate::Features::BASELINE)?;
         mark_hint(context, function, hint);
         let shown = HashMap::new_in(Global);
         let (resume, memcmp) = (recorder.resume(), recorder.memcmp());
@@ -1656,10 +1656,10 @@ impl Machine {
         Self::create_for(target, optimization, super::Features::BASELINE)
     }
 
-    /// A target machine of `target`'s baseline CPU told `features` in LLVM's names
-    /// ([`super::Target::llvm_features`]), as rustc tells its own the features of
-    /// `-C target-feature` and `-C target-cpu`. A name LLVM's target lacks is an error naming
-    /// it, never left out.
+    /// A target machine of the CPU of `features` ([`super::Target::cpu_of`]) told its features
+    /// in LLVM's names ([`super::Target::llvm_features`]), as rustc tells its own the features
+    /// of `-C target-feature` and `-C target-cpu`. A CPU or feature LLVM's target lacks is an
+    /// error naming it, never left out.
     fn create_for(
         emitted: &super::Target,
         optimization: Optimization,
@@ -1687,10 +1687,11 @@ impl Machine {
         let triple = TargetTriple::create(name);
         let target = Target::from_triple(&triple)
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into()))?;
-        // The baseline CPU, as rustc compiles for; position-independent, as the rest of
-        // the program is. A wasm module is static, as rustc's wasm targets are: its code is
-        // reached by index and its data placed at link.
+        // The set's CPU (`-C target-cpu`, or the target's baseline), as rustc compiles for;
+        // position-independent, as the rest of the program is. A wasm module is static, as
+        // rustc's wasm targets are: its code is reached by index and its data placed at link.
         let told = told(emitted, features)?;
+        let cpu = emitted.cpu_of(features);
         let relocation = match emitted.arch {
             Arch::X86_64 | Arch::Aarch64 => RelocMode::PIC,
             Arch::Wasm32 | Arch::Wasm64 => RelocMode::Static,
@@ -1698,14 +1699,22 @@ impl Machine {
         let machine = target
             .create_target_machine(
                 &triple,
-                emitted.cpu(),
+                cpu,
                 &told,
                 optimization.level(),
                 relocation,
                 CodeModel::Default,
             )
             // alloc: an error
-            .ok_or_else(|| Unhandled::Llvm(format!("no target machine for {name} with the features {told:?}")))?;
+            .ok_or_else(|| {
+                Unhandled::Llvm(format!("no target machine for {name}'s CPU {cpu} with the features {told:?}"))
+            })?;
+        // SAFETY: `machine` is a live target machine, and `cpu` is read for its length during
+        // the call only.
+        if unsafe { LLVMBlazeHasCpu(machine.as_mut_ptr(), cpu.as_ptr().cast(), cpu.len()) } == 0 {
+            // alloc: an error
+            return Err(Unhandled::Llvm(format!("LLVM's {name} has no CPU {cpu:?} (-C target-cpu)")));
+        }
         for feature in told.split(',').filter(|it| !it.is_empty()) {
             let bare = &feature[1..];
             // SAFETY: `machine` is a live target machine, and `bare` is read for its length
@@ -2613,13 +2622,13 @@ attributes #0 = { alwaysinline }
             Arch::Aarch64 => "+dotprod",
             Arch::Wasm32 | Arch::Wasm64 => return,
         };
-        let set = target.features_of(&[wanted.to_owned()]).unwrap();
+        let set = target.features_of(target.cpu(), &[wanted.to_owned()]).unwrap();
         let machine = Machine::create_for(crate::Target::for_host(), Optimization::NONE, set).unwrap();
         let told = |it: &TargetMachine| it.get_feature_string().to_string_lossy().into_owned();
         assert!(told(&machine).contains(wanted), "{}", told(&machine));
         let baseline = Machine::create(crate::Target::for_host(), Optimization::NONE).unwrap();
         assert!(!told(&baseline).contains(wanted), "{}", told(&baseline));
-        let unknown = target.features_of(&["+no-such-feature".to_owned()]).unwrap();
+        let unknown = target.features_of(target.cpu(), &["+no-such-feature".to_owned()]).unwrap();
         let Err(Unhandled::Llvm(refused)) = Machine::create_for(crate::Target::for_host(), Optimization::NONE, unknown) else {
             panic!("a machine told a feature LLVM lacks");
         };
@@ -2627,6 +2636,36 @@ attributes #0 = { alwaysinline }
         let with_set = Machine::with_pgo(crate::Target::for_host(), Optimization::NONE, None, set, |_, it| Ok(told(it))).unwrap();
         let without = Machine::with(crate::Target::for_host(), Optimization::NONE, |_, it| Ok(told(it))).unwrap();
         assert!(with_set.contains(wanted) && !without.contains(wanted), "{with_set} {without}");
+    }
+
+    /// A function of a unit for a CPU past its target's baseline (`-C target-cpu=x86-64-v3`,
+    /// `apple-m4`, `neoverse-n1`) is told that CPU's name, as its target machine is; one of the
+    /// baseline's the baseline's.
+    #[test]
+    fn a_function_and_its_machine_are_told_the_units_cpu() {
+        use cranelift_codegen::ir::UserFuncName;
+
+        let target = crate::Target::for_host();
+        let cpu = match (target.arch, target.object_format) {
+            (Arch::X86_64, _) => "x86-64-v3",
+            (Arch::Aarch64, crate::ObjectFormat::MachO) => "apple-m4",
+            (Arch::Aarch64, _) => "neoverse-n1",
+            (Arch::Wasm32 | Arch::Wasm64, _) => return,
+        };
+        let isa = super::super::isa_for(target).unwrap();
+        let signature = ir::Signature::new(isa.default_call_conv());
+        let func = ir::Function::with_name_signature(UserFuncName::default(), signature);
+        let named = target.features_of(cpu, &[]).unwrap();
+        for (features, told) in [(crate::Features::BASELINE, target.cpu()), (named, cpu)] {
+            let context = Context::create();
+            let module = context.create_module("cpu");
+            let own = Defined { name: OWN, func: &func, pointees: &[], named: &[], weights: None, marked: false };
+            Lowering::add(&context, &module, target, &own, false, features).unwrap();
+            let text = module.print_to_string().to_string();
+            assert!(text.contains(&format!("\"target-cpu\"=\"{told}\"")), "{told}: {text}");
+            let machine = Machine::create_for(target, Optimization::NONE, features).unwrap();
+            assert_eq!(machine.get_cpu().to_string(), told);
+        }
     }
 
     /// What the kept passes make of a module is what LLVM's own run of the pipeline, with
@@ -2734,7 +2773,7 @@ attributes #0 = { alwaysinline }
         let context = Context::create();
         let module = context.create_module("tail");
         let own = Defined { name: OWN, func, pointees, named: &[], weights: None, marked: false };
-        let function = Lowering::add(&context, &module, target, &own, false)?;
+        let function = Lowering::add(&context, &module, target, &own, false, crate::Features::BASELINE)?;
         let constants: HashMap<u32, &[u8], Global> = HashMap::new_in(Global);
         let statics: HashSet<u32, Global> = HashSet::new_in(Global);
         let blocks_asm: HashMap<u32, &'static crate::asm::Inline, Global> = HashMap::new_in(Global);

@@ -584,13 +584,17 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     }
 
     /// Adds the function `defined` is to `module`, with the attributes of its signature,
-    /// keeping its frame pointer when `frame_pointers` (its unit's `Toolchain::frame_pointers`).
+    /// keeping its frame pointer when `frame_pointers` (its unit's `Toolchain::frame_pointers`),
+    /// for the CPU and with the target features of `features` (its unit's and its
+    /// `#[target_feature]`'s): the one place a function is told its `target-cpu` and
+    /// `target-features`, as rustc tells each function both.
     pub(super) fn add(
         context: &'ctx Context,
         module: &Module<'ctx>,
         target: &crate::Target,
         defined: &Defined<'_>,
         frame_pointers: bool,
+        features: crate::Features,
     ) -> Lowered<FunctionValue<'ctx>> {
         let func = defined.func;
         let addresses = addresses(func, &Flow::of(func));
@@ -611,10 +615,11 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         // Without, LLVM gives the frame pointer's register to values, and code that walks the
         // frames by it reads one of those.
         let frame = frame_pointers.then_some(("frame-pointer", "all"));
-        for (name, value) in [("target-cpu", target.cpu())].into_iter().chain(probe).chain(frame) {
+        for (name, value) in [("target-cpu", target.cpu_of(features))].into_iter().chain(probe).chain(frame) {
             let attribute = context.create_string_attribute(name, value);
             function.add_attribute(AttributeLoc::Function, attribute);
         }
+        super::mark_features(context, function, target, features)?;
         // Every function gets an unwind table entry, as a panic may cross any of them.
         let uwtable = super::attribute_kind("uwtable");
         function.add_attribute(AttributeLoc::Function, context.create_enum_attribute(uwtable, 2));

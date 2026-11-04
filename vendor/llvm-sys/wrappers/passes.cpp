@@ -559,6 +559,14 @@ LLVMBool LLVMBlazeHasFeature(LLVMTargetMachineRef Machine, const char *Name, siz
   return 0;
 }
 
+/* Whether `Machine`'s target knows the CPU `Name` (`Length` bytes), aliases included (AArch64's
+ * `isCPUStringValid` resolves `apple-m1` to `apple-a14`): LLVM told a CPU it does not know only
+ * prints a warning and compiles for none. */
+LLVMBool LLVMBlazeHasCpu(LLVMTargetMachineRef Machine, const char *Name, size_t Length) {
+  const MCSubtargetInfo &Info = reinterpret_cast<TargetMachine *>(Machine)->getMCSubtargetInfo();
+  return Info.isCPUStringValid(StringRef(Name, Length)) ? 1 : 0;
+}
+
 /* Runs the pipeline `Text` (`Length` bytes) over `M`, as LLVMRunPasses does with options whose
  * only change is SLP vectorization. Every module given to one object is of one context. */
 LLVMErrorRef LLVMBlazeRunPasses(LLVMBlazeOpaquePasses *Passes, LLVMModuleRef M,

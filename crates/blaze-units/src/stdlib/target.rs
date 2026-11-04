@@ -20,11 +20,9 @@
 //! then a binary search for the triple, a few word operations per `-C target-feature`, and the
 //! copy of the output; it reads no lock (a `OnceLock` once set is one atomic load).
 //!
-//! The CPUs of `-C target-cpu` are those `rustc --print target-cpus` lists (`cpus`) and the
-//! aliases LLVM has of them (`llvm_cpus.json`, written by `tools/llvm_cpus.py` from the LLVM
-//! blaze pins): LLVM keeps an alias such as `apple-m1` (of `apple-a14`) in a table of its own,
-//! which rustc's list leaves out and `-C target-cpu` accepts, so an alias has the features of
-//! the CPU it names.
+//! The CPUs of `-C target-cpu` and the features each has are `target_features::cpus`'s, the one
+//! table of them (`tools/cpus.py` writes it from `cpus` and `cpu_features` here and the pinned
+//! LLVM's aliases of those CPUs, such as `apple-m1` of `apple-a14`).
 
 use std::{borrow::Cow, collections::BTreeMap};
 
@@ -35,15 +33,6 @@ use serde::Deserialize;
 const DATA: &str = include_str!("rustc.json");
 /// The targets blaze defines itself, in [`RawTarget`]'s form: `targets` only.
 const OWN: &str = include_str!("own_targets.json");
-/// The CPU aliases of the pinned LLVM, by architecture (`tools/llvm_cpus.py`).
-const LLVM_CPUS: &str = include_str!("llvm_cpus.json");
-
-/// The file's `llvm` (the version and commit it is of) is for people; nothing reads it.
-#[derive(Deserialize)]
-struct RawLlvmCpus {
-    /// By the architecture of a triple ([`arch`]), each alias and the CPU it names.
-    aliases: BTreeMap<String, BTreeMap<String, String>>,
-}
 
 #[derive(Deserialize)]
 struct RawOwn {
@@ -89,11 +78,8 @@ struct RawTarget {
     /// those that need it.
     #[serde(default)]
     features_off: BTreeMap<String, Vec<String>>,
-    /// Each CPU of `-C target-cpu`, by the index of its `target_feature`s in `cpu_features`.
-    #[serde(default)]
-    cpus: BTreeMap<String, usize>,
-    #[serde(default)]
-    cpu_features: Vec<Vec<String>>,
+    // `cpus` and `cpu_features` are read by `tools/cpus.py` into `target_features::cpus`,
+    // which is what blaze reads of CPUs.
     /// The cfgs besides `target_feature` a feature has: wasm's `atomics`, `target_has_threads`.
     #[serde(default)]
     feature_cfgs: BTreeMap<String, Vec<String>>,
@@ -206,7 +192,7 @@ fn feature_of(cfg: &str) -> Option<&str> {
     cfg.strip_prefix(FEATURE_PREFIX)?.strip_suffix('"')
 }
 
-fn compile(triple: &str, raw: RawTarget, aliases: Option<&BTreeMap<String, String>>) -> Result<Compiled, String> {
+fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
     let RawTarget {
         cfg,
         nightly_cfg,
@@ -217,8 +203,6 @@ fn compile(triple: &str, raw: RawTarget, aliases: Option<&BTreeMap<String, Strin
         features,
         llvm_features,
         features_off,
-        cpus,
-        cpu_features,
         feature_cfgs,
         other_features,
     } = raw;
@@ -231,7 +215,8 @@ fn compile(triple: &str, raw: RawTarget, aliases: Option<&BTreeMap<String, Strin
             names.extend(turned.iter().map(String::as_str));
         }
     }
-    names.extend(cpu_features.iter().flatten().map(String::as_str));
+    let cpus = target_features::cpus::of(triple);
+    names.extend(cpus.iter().flat_map(|it| it.sets().iter().copied().flatten().copied()));
     names.extend(feature_cfgs.keys().map(String::as_str));
     names.sort_unstable();
     names.dedup();
@@ -296,24 +281,22 @@ fn compile(triple: &str, raw: RawTarget, aliases: Option<&BTreeMap<String, Strin
             pulls[usize::from(index(needed))].insert(at);
         }
     }
-    // rustc's CPUs, then each LLVM alias of one rustc lists, with its features; a name rustc
-    // lists itself keeps rustc's. Sorted by name, for the binary search of `tuned`.
-    let mut cpus: Vec<(Box<str>, Option<Features>)> = cpus
+    // Each CPU of the target, sorted by name, for the binary search of `tuned`.
+    let cpus: Box<[(Box<str>, Option<Features>)]> = cpus
         .iter()
-        .map(|(name, at)| (name.clone().into_boxed_str(), cpu_features.get(*at).map(|it| set(it.as_slice()))))
+        .flat_map(|it| it.names().iter().map(move |&(name, at)| (name, it.sets().get(usize::from(at)).copied())))
+        .map(|(name, of)| {
+            let set = of.map(|list| {
+                let mut bits = Features::default();
+                for &feature in list {
+                    bits.insert(index(feature));
+                }
+                bits
+            });
+            (Box::<str>::from(name), set)
+        })
+        // alloc: a target's columns, compiled once per process
         .collect();
-    for (alias, named) in aliases.into_iter().flatten() {
-        if cpus.binary_search_by(|(it, _)| (**it).cmp(alias.as_str())).is_ok() {
-            continue;
-        }
-        let of = cpus.binary_search_by(|(it, _)| (**it).cmp(named.as_str())).ok().map(|at| cpus[at].1);
-        if let Some(features) = of {
-            let at = cpus.partition_point(|(it, _)| &**it < alias.as_str());
-            // alloc: a target's columns, compiled once per process
-            cpus.insert(at, (alias.clone().into_boxed_str(), features));
-        }
-    }
-    let cpus = cpus.into_boxed_slice();
     let feature_cfgs = feature_cfgs.iter().map(|(name, cfgs)| (index(name), boxed(cfgs.iter().cloned()))).collect();
     let spec = match target_spec_json.values().next() {
         None => Err(format!("blaze recorded no target spec of `{triple}`")),
@@ -378,8 +361,6 @@ fn release() -> &'static Release {
             );
             raw.targets.insert(triple, target);
         }
-        let llvm: RawLlvmCpus =
-            serde_json::from_str(LLVM_CPUS).expect("stdlib/llvm_cpus.json is what tools/llvm_cpus.py writes");
         Release {
             version: raw.version,
             verbose: raw.verbose,
@@ -388,7 +369,7 @@ fn release() -> &'static Release {
                 .targets
                 .into_iter()
                 .map(|(triple, target)| {
-                    let compiled = compile(&triple, target, llvm.aliases.get(arch(&triple)));
+                    let compiled = compile(&triple, target);
                     (triple.into_boxed_str(), compiled)
                 })
                 .collect(),
@@ -477,11 +458,12 @@ impl Compiled {
                     .cpus
                     .binary_search_by(|(it, _)| (**it).cmp(name))
                     .map_err(|_| {
-                        format!(
-                            "`-C target-cpu={name}` is no CPU blaze knows of target `{triple}`: blaze knows \
-                             those `rustc --print target-cpus` lists (harness/answers.py) and the \
-                             pinned LLVM's aliases of them (tools/llvm_cpus.py)"
-                        )
+                        target_features::cpus::UnknownCpu {
+                            triple: triple.to_owned(),
+                            cpu: name.to_owned(),
+                            known_target: target_features::cpus::of(triple).is_some(),
+                        }
+                        .to_string()
                     })?;
                 self.cpus[at]
                     .1

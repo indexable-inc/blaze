@@ -40,7 +40,7 @@ use smallvec::SmallVec;
 use super::{
     INNER, Machine, Machinery, OWN, REBASED, Symbol, Unhandled, agree_calls, attribute_kind, emitted, link,
     lower::{Debug, Defined, Lowering},
-    mark_features, mark_hint,
+    mark_hint,
     pgo::{self, Counted},
     rebase,
     report::{self, Asked},
@@ -152,7 +152,7 @@ fn run(module: &Module<'_>, passes: &str, machine: &Machinery, vectorize: bool) 
 /// that `unsanitized` leaves on ([`sanitize::mark`]). With `pgo`, what it is built with for PGO
 /// and the name its counts are kept under ([`pgo::name`]), it is instrumented or given its
 /// profile's counts here, as LLVM's pre-link pipeline does. It is compiled with the target
-/// features `features`, its unit's and its `#[target_feature]`'s ([`mark_features`]), and
+/// features `features`, its unit's and its `#[target_feature]`'s, for their CPU ([`Lowering::add`]), and
 /// keeps its frame pointer when `frame_pointers`, its unit's `Toolchain::frame_pointers`.
 /// `report` gives it its lines on every format, for its compile's [`report`](super::report).
 pub(crate) fn prelink(
@@ -198,9 +198,8 @@ pub(crate) fn prelink(
         let blocks_asm = wants.asm_blocks();
         let shown = HashMap::new_in(Global);
         let function = tally.time(Phase::Lower, || {
-            let function = Lowering::add(context, &module, wants.target, &own, frame_pointers)?;
+            let function = Lowering::add(context, &module, wants.target, &own, frame_pointers, features)?;
             mark_hint(context, function, hint);
-            mark_features(context, function, wants.target, features)?;
             sanitize::mark(context, function, sanitize, unsanitized);
             Lowering::define(
                 context,
