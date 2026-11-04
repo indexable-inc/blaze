@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2 vfs - the team's source of truth lives on Cloudflare (a Rust Worker built by blaze, run as wasm, a Durable Object per head); multiplayer edits and merges are operations on the syntax tree, not text; commits, branches and merge in the vfs; blaze builds straight from a synced head; git is only a mirror.
+summary: blaze v2 vfs - the team's source of truth lives on Cloudflare (a Rust Worker built by blaze, run as wasm, a Durable Object per head); multiplayer edits and merges are operations on the syntax tree, not text; jj-style changes with stable IDs, first-class conflicts and an operation log; a branch can stack on another and takes its updates automatically; Pando-style per-head ordering for thousands of agents; blaze builds straight from a synced head; git is only a mirror.
 date: 2026-11-04
 ---
 # blaze v2 vfs: synced, multiplayer, no git
@@ -27,11 +27,16 @@ people that still want it (GitHub, code search, a plain `git clone`).
 
 - **Nodes are immutable and named by content** (BLAKE3 `ContentId`, the file and directory domains).
   Syncing them never conflicts: a peer either has a node or doesn't.
-- **A commit is a node too**: `{root, parents[], author, time, message}` under a new domain
-  `"blaze v2 vfs commit 1"`. History is a DAG of commits, as in git. The hash is BLAKE3, not SHA-1.
-- **A branch is a head that names a commit**: `branch/<name>`. A **live head**, `live/<name>`, names a
-  root that changes on every keystroke batch, the way a workspace head does today. A commit
-  snapshots a live head onto a branch.
+- **A commit is a node too**: `{root, parents[], change, author, time, message}` under a new
+  domain `"blaze v2 vfs commit 1"`. History is a DAG of commits, as in git. The hash is BLAKE3, not
+  SHA-1.
+- **A change is the unit of work, not a commit** (jj). A change has a stable change ID that
+  survives every rewrite. Its current commit changes on every edit, rebase or amend. Agents and
+  reviewers name changes, so "the change that adds X" stays the same thing while it is rebased a
+  hundred times. There is no staging area: the working copy is the change's current commit.
+- **A branch is a head that names a change**: `branch/<name>`. A **live head**, `live/<name>`, names
+  a root that changes on every keystroke batch, the way a workspace head does today. Recording a
+  live head makes a new commit of its change. See "Changes and stacks" below.
 - **Ops are structural.** An op names a syntax node by a stable identity (its item path plus a
   node ID that survives edits around it, assigned by the front end's syntax tree) and says what
   happens to it: replace its text, insert a child at a position, remove it, move it, rename a
@@ -54,6 +59,82 @@ people that still want it (GitHub, code search, a plain `git clone`).
   side moved merge cleanly. What still clashes (both sides changed the same node differently)
   becomes a typed conflict entry naming the item, and `blaze check` refuses to build it
   (errors-name-the-thing). Line diff3 applies only to files the front end does not parse.
+
+## Prior art, and what this takes from it
+
+- **jj (Jujutsu).**
+  - Changes with stable IDs.
+  - The working copy is a commit.
+  - Descendants rebase automatically when an ancestor is rewritten.
+  - Conflicts are first-class: they are stored in commits, so a rebase never stops halfway.
+  - An operation log records every repo operation, so any one can be undone. Concurrent
+    operations are merged, not locked.
+
+  We take all of it. jj still stores text and merges lines, and its backend is git. Here the
+  backend is the vfs, and conflicts and merges are on syntax nodes.
+- **OpenAI's Pando** (2026-11-02). It keeps the git protocol and rebuilds the server for Codex's
+  load:
+  - Each ref is ordered on its own, with no repository-wide order. The result is causal
+    consistency: two branches read together may be from different moments.
+  - Packs are immutable objects in blob storage, reused across every reader instead of built per
+    fetch, and compacted in the background like an LSM tree.
+  - A writer reads its own writes. A push costs O(1) metadata operations.
+  - The design was checked by deterministic simulation and TLA+/Lean specs.
+
+  We take all of it: a Durable Object per head is the per-ref order, and R2 packs are the reused
+  packs. Pando keeps git's data model (text, commits, line merges) because its users wanted the
+  git client. We don't need the git client, so we can change the model.
+- **Pijul and Darcs.** Patches that commute, so the order of independent changes doesn't matter.
+  Structural ops on distinct syntax nodes commute the same way. This plan gets that property
+  without Pijul's text-graph state.
+- **Sapling, Graphite and stacked diffs.** Stacks of small changes, restacked when a lower change
+  moves, and landed one at a time. This is the "branch based on a branch" below.
+- **Figma and Linear.** A server-ordered op log with clients rebasing their pending ops. This is
+  the live layer.
+
+## Changes and stacks: a branch on a branch takes its updates
+
+- A change names its **base**: trunk, another branch, or another change. A branch whose base is
+  another branch is a stack.
+- **When a base moves, every change on it is rebased onto the new base automatically** (jj's
+  descendant rebase), across heads. Each head's Durable Object subscribes to its base's moves. On a
+  move it does a structural three-way merge of its change onto the new base, then moves its own
+  head. The cascade runs down the stack one level at a time. Each level records which base version
+  it is on (`base@seq`), so a reader always knows how fresh a stack is (Pando's causal
+  consistency, made visible).
+- **A rebase never fails.** What doesn't merge becomes a conflict entry stored in the change,
+  naming the item, as in jj. The stack keeps moving, and the owner of the conflicted change (a
+  person or an agent) is told which item conflicts. Changes above it stay on the conflicted
+  version until it is resolved; they are never silently dropped.
+- **Landing** a change onto trunk is a move of trunk's head through trunk's Durable Object, which
+  is a merge queue of one. Structural ops on distinct nodes commute, so most landings need no
+  rebuild of what they don't touch. blaze keys every result by its inputs, so testing the merged
+  tree reuses everything the change didn't reach.
+- **The operation log** of each head (every move, rebase, land and resolve, with who did it and
+  why) lives in its Durable Object. `blaze undo` reverts any operation, as jj's does.
+
+## At the scale of an AI team
+
+The workload is a few people and thousands of agents. Each agent makes many small changes, stacked,
+all rebased continually, all built and tested.
+
+- **Nothing global.** The only ordering is per head (Pando). Agents on unrelated changes never wait
+  on each other. A trunk landing waits only on trunk.
+- **A change per task, a live head per agent.** An agent's head is a view: constant time to open, no
+  clone, no checkout. Spawning a thousand agents on trunk is a thousand view slots, not a thousand
+  checkouts.
+- **Claims on items, not files.** An agent may claim the syntax nodes it intends to change (a lease
+  with a time limit, held in the head's Durable Object). Another agent sees the claim before it
+  edits, which avoids conflicts rather than resolving them. A claim is advisory: edits still merge
+  or conflict as above.
+- **Gate by the exact tree.** A head reaches trunk only if `blaze check` and `blaze test` passed on
+  the exact root it lands as (keys-cover-every-input). Because results are content-keyed, the gate
+  for a rebased change re-runs only what the rebase changed.
+- **Reads served from the edge.** Packs are immutable and content-named, so Cloudflare's cache serves
+  them to every agent. A cold agent fetches what its build reads, not the history.
+- **Proof before production.** The Durable Object protocol (moves, cascades, claims, landing) gets
+  a model in blaze-check's simulation and deterministic replay tests before any team relies on it,
+  as Pando was checked.
 
 ## The server: blaze-sync, a Rust Worker built by blaze
 
@@ -138,12 +219,20 @@ Durability and deletion changes get a review before merge.
 - [ ] Browser client: blaze-wasm's `Compiler` reads a synced view, so a page edits and builds the same head
 - [ ] Done when: two humans and one agent edit one live head and converge to the same root, and p50/p99 from keystroke to remote view are traced (slow-is-p0-traced)
 
-### Slice 5: commits, branches, merge
-- [ ] Commit node; `blaze commit`, `blaze log`, `blaze branch`, `blaze switch` (a switch is a view: constant time)
+### Slice 5: changes, stacks, merge, operation log
+- [ ] Commit and change nodes; `blaze new`, `blaze log`, `blaze branch`, `blaze switch` (a switch is a view: constant time)
 - [ ] Lowest common ancestor over the commit DAG (Durable Object or client side; measure both)
-- [ ] Three-way tree merge plus diff3 text merge; typed conflict entries that `blaze check` refuses
-- [ ] Review: a "PR" is `pr/<n>`, a branch head plus its merge target; CI builds the view at that merge
-- [ ] Done when: blaze's own branches merge in the vfs with the same result git gives on a corpus of real merges, every difference explained
+- [ ] Three-way tree merge plus diff3 text merge; first-class conflict entries stored in changes, refused by `blaze check` with the item named
+- [ ] Bases and stacks: a head subscribes to its base's Durable Object and rebases itself on every move; `base@seq` recorded
+- [ ] Operation log per head; `blaze undo`
+- [ ] Landing through trunk's Durable Object, gated on check and test of the exact root (review before merge: durability)
+- [ ] Model the cascade and landing protocol in blaze-check before relying on it
+- [ ] Done when: a stack of 20 agent changes follows trunk through 100 landings with no stuck level, every conflict names its item, and blaze's own branches merge in the vfs with the same result git gives on a corpus of real merges, every difference explained
+
+### Slice 5b: many agents
+- [ ] Claims (leases on syntax nodes) in the head's Durable Object, shown to editors and agents
+- [ ] Spawn N agent heads off trunk as views; measure time to first build with no clone
+- [ ] Load test: 1,000 agent heads pushing at once; push and land latency p50/p99 from spans, with nothing cross-head on the path
 
 ### Slice 6: structural ops
 - [ ] Stable syntax node identities in the front end (survive edits around them; deterministic, so every replica assigns the same)
@@ -169,6 +258,11 @@ Durability and deletion changes get a review before merge.
 - **Node identity.** Stable IDs need either a stored ID per node (in the op log) or a deterministic
   match by item path and position. Stored IDs are sturdier, but every replica must agree on them.
   Pick by measuring both on the merge corpus.
+- **Cascade cost.** A deep stack under a busy trunk rebases on every landing. Should it debounce
+  (rebase at most every N seconds), or rebase lazily when someone reads the head? Measure in slice
+  5b.
+- **Claims.** Should a claim block other edits or only warn? The plan says warn. Change it only if
+  the load test shows wasted agent work from conflicts.
 - **Ordering of slices.** Slice 4 can ship with text ops and switch to structural ops in slice 6,
   or wait for slice 6. Shipping text ops first is faster to land, but the protocol must version
   the op set from day one.
