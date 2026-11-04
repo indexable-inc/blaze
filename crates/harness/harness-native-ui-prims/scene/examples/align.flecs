@@ -1,19 +1,28 @@
-// Baseline alignment: a 34-point number, 11-point words and 15-point words on one first baseline, against the same row
-// centred. Then AlignSelf and AlignmentGuide in a column aligned to its start.
+// Baseline alignment: a 56-point number, 11-point words and two wrapped lines of 13-point words on one first baseline,
+// against the same row centred. Centred, the small words float mid-number and the wrapped pair straddles it; on
+// FirstBaseline all three sit on the number's baseline. Then AlignSelf and AlignmentGuide in a column aligned to its start.
 
 prefab ex.BaselineDemo : ex.Card {
   label : ui.Label { Text: {s: "ALIGN FIRSTBASELINE VS CENTER"} }
   base : ui.Row {
     Flex: {axis: Row, gap: 6, align: FirstBaseline, justify: Start, wrap: false}
-    big : ui.Words, Strong { Text: {s: "42"} TextStyle: {size: 34, line: 40, role: 0, bold: 1} }
+    big : ui.Words, Strong { Text: {s: "42"} TextStyle: {size: 56, line: 64, role: 0, bold: 1} }
     small : ui.Words, Muted { Text: {s: "runs today"} TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0} }
-    mid : ui.Words { Text: {s: "since 900"} TextStyle: {size: 15, line: 20, role: 0, bold: 0} }
+    mid : ui.Words {
+      Text: {s: "since nine hundred"}
+      TextStyle: {size: 13, line: 16, role: 0, bold: 0}
+      Size: {w: {kind: Fixed, value: 64, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
   }
   centre : ui.Row {
     Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
-    big : ui.Words, Strong { Text: {s: "42"} TextStyle: {size: 34, line: 40, role: 0, bold: 1} }
+    big : ui.Words, Strong { Text: {s: "42"} TextStyle: {size: 56, line: 64, role: 0, bold: 1} }
     small : ui.Words, Muted { Text: {s: "runs today"} TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0} }
-    mid : ui.Words { Text: {s: "since 900"} TextStyle: {size: 15, line: 20, role: 0, bold: 0} }
+    mid : ui.Words {
+      Text: {s: "since nine hundred"}
+      TextStyle: {size: 13, line: 16, role: 0, bold: 0}
+      Size: {w: {kind: Fixed, value: 64, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
   }
 }
 
