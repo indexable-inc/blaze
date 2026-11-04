@@ -16,7 +16,6 @@ use std::{
 use anyhow::{Context as _, bail};
 use blaze_fetch::{FetchError, Fetcher, Form, Objects, Origin, Producer, Source, StoreOf};
 use semver::Version;
-use tar::{Archive, EntryType};
 
 use crate::registry::Registry;
 
@@ -312,49 +311,48 @@ fn set_generated_mtimes(dst: &Path) {
 }
 
 /// Unpacks a tarball whose every entry is under `<name>-<version>/`, files and directories
-/// only, into the directory above `dst`, with no more than cargo lets one unpack to, but for
-/// the entries `include` leaves out.
+/// only, into `dst`, `<name>-<version>` itself, with no more than cargo lets one unpack to, but
+/// for the entries `include` leaves out: through blaze-fetch's one checked unpacker
+/// ([`blaze_fetch::unpack`]) with cargo's rules (tar's modes under the umask, each file's
+/// time the entry's, a file listed again replacing the first, `.cargo-ok` dropped). Unlike
+/// tar, an entry with a `..` or an absolute path is refused, not skipped.
 fn unpack(tarball: &[u8], dst: &Path, include: impl Fn(&Path) -> bool) -> anyhow::Result<u64> {
     let limit = MAX_UNPACK_SIZE.max(tarball.len() as u64 * MAX_COMPRESSION_RATIO);
     let gz = flate2::read::GzDecoder::new(tarball);
-    let mut tar = Archive::new(LimitErrorReader { inner: gz, left: limit });
+    let prefix = dst.file_name().and_then(|it| it.to_str()).context("a package directory has a UTF-8 name")?;
+    std::fs::create_dir_all(dst).with_context(|| format!("failed to create `{}`", dst.display()))?;
     #[cfg(unix)]
-    tar.set_mask(umask());
-    let prefix = dst.file_name().context("a package directory has a name")?;
-    let parent = dst.parent().context("a package directory has a parent")?;
-    let mut written = 0;
-    for entry in tar.entries()? {
-        let mut entry = entry.context("failed to iterate over archive")?;
-        let entry_path = entry.path().context("failed to read entry path")?.into_owned();
-        match entry_path.strip_prefix(prefix) {
-            Ok(inside) if !include(inside) => continue,
-            Ok(_) => {}
-            Err(_) => bail!(
-                "invalid tarball downloaded, contains a file at {entry_path:?} which isn't under {prefix:?}"
-            ),
-        }
-        match entry.header().entry_type() {
-            EntryType::Regular | EntryType::Directory => {}
-            kind => bail!(
-                "invalid tarball downloaded, contains an entry at {entry_path:?} with invalid type {kind:?}"
-            ),
-        }
-        if entry_path.file_name().is_some_and(|it| it == PACKAGE_SOURCE_LOCK) {
-            continue;
-        }
-        written += entry.size();
-        let mut result = entry.unpack_in(parent).map_err(anyhow::Error::from);
-        if cfg!(windows) && is_windows_reserved_path(&entry_path) {
-            result = result.with_context(|| {
-                format!(
+    let mask = umask();
+    #[cfg(not(unix))]
+    let mask = 0;
+    let rules = blaze_fetch::unpack::Rules {
+        top: Some(prefix),
+        links: false,
+        fold: false,
+        twice: blaze_fetch::unpack::Twice::Replace,
+        modes: blaze_fetch::unpack::Modes::Cargo { mask },
+        reserved: &[],
+        skip: &[PACKAGE_SOURCE_LOCK],
+        include: &include,
+        sync: false,
+        most_entries: u64::MAX,
+        most_bytes: u64::MAX,
+        most_path: usize::MAX,
+    };
+    match blaze_fetch::unpack::unpack(LimitErrorReader { inner: gz, left: limit }, dst, &rules) {
+        Ok(unpacked) => Ok(unpacked.bytes),
+        Err(refused) => {
+            let reserved = cfg!(windows) && refused.path.as_deref().is_some_and(|it| is_windows_reserved_path(Path::new(it)));
+            let error = anyhow::anyhow!("invalid tarball downloaded for {prefix}: {refused}");
+            match reserved {
+                true => Err(error.context(format!(
                     "`{}` appears to contain a reserved Windows path, it cannot be extracted on Windows",
-                    entry_path.display()
-                )
-            });
+                    refused.path.unwrap_or_default()
+                ))),
+                false => Err(error),
+            }
         }
-        result.with_context(|| format!("failed to unpack entry at `{}`", entry_path.display()))?;
     }
-    Ok(written)
 }
 
 /// A reader that fails once more than `left` bytes are read from it, as cargo's

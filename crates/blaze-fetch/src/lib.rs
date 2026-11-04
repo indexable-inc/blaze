@@ -46,6 +46,7 @@ pub mod graph;
 pub mod request;
 pub mod store;
 pub mod tree;
+pub mod unpack;
 
 #[cfg(test)]
 mod tests;
