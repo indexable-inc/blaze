@@ -1,0 +1,40 @@
+[package]
+name = "hir-ty-charon"
+version = "0.0.0"
+repository.workspace = true
+description = "blaze's MIR translated into Charon's ULLBC, structured to LLBC by Charon's own passes and written as the `.llbc` JSON Aeneas reads, in place of charon-driver (no rustc)."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+blaze-query.workspace = true
+serde_json.workspace = true
+
+rustc_abi.workspace = true
+rustc_type_ir.workspace = true
+
+# local deps
+base-db.workspace = true
+cfg.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+intern.workspace = true
+
+# Charon's library, vendored (vendor/charon/SOURCE.md); outside the workspace, so by path.
+charon = { path = "../../vendor/charon/charon" }
+# The interned strings in Charon's `TargetInfo` (its `Other(Ustr)` arms); Charon's own version.
+ustr = "1.1.0"
+
+[dev-dependencies]
+hir-expand = { workspace = true, features = ["fixture"] }
+hir-ty-mir.workspace = true
+
+[lints]
+workspace = true

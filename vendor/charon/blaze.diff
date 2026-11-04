@@ -1,0 +1,266 @@
+diff -ru -x b charon/src/export.rs charon/src/export.rs
+--- charon/src/export.rs	2026-11-03 20:39:05
++++ charon/src/export.rs	2026-11-03 20:41:41
+@@ -1,8 +1,6 @@
+ pub mod multi_target;
+ 
+ use crate::ast::*;
+-#[cfg(feature = "minirust")]
+-use crate::errors::Level;
+ use crate::options::SerializationFormat;
+ use crate::transform::TransformCtx;
+ use serde::{Deserialize, Deserializer, Serialize};
+@@ -133,14 +131,7 @@
+                     return Err(());
+                 }
+             }
+-            #[cfg(feature = "minirust")]
+-            SerializationFormat::MiniRust => {
+-                if let Err(err) = crate::minirust::serialize(&self.translated, &mut writer) {
+-                    anstream::eprintln!("{}\n", err.render(&self.translated, Level::ERROR));
+-                    return Err(());
+-                }
+-            }
+-            #[cfg(not(feature = "minirust"))]
++            // blaze: MiniRust output is not vendored (vendor/charon/SOURCE.md).
+             SerializationFormat::MiniRust => error!("Charon was built without MiniRust support"),
+         }
+ 
+diff -ru -x b charon/src/lib.rs charon/src/lib.rs
+--- charon/src/lib.rs	2026-11-03 20:39:05
++++ charon/src/lib.rs	2026-11-03 20:41:41
+@@ -37,13 +37,8 @@
+ )]
+ // For when we use charon on itself :3
+ #![cfg_attr(feature = "charon_on_charon", feature(register_tool))]
+-#![cfg_attr(feature = "charon_on_charon", feature(rustc_private))]
+ #![cfg_attr(feature = "charon_on_charon", register_tool(charon))]
+ 
+-#[cfg(feature = "charon_on_charon")]
+-#[allow(unused_extern_crates)]
+-extern crate rustc_hir;
+-
+ extern crate serde_state_perfect_derive as serde_state;
+ 
+ #[macro_use]
+@@ -53,8 +48,6 @@
+ pub mod ast;
+ pub mod errors;
+ pub mod export;
+-#[cfg(feature = "minirust")]
+-pub mod minirust;
+ pub mod name_matcher;
+ pub mod options;
+ pub mod pretty;
+@@ -69,7 +62,8 @@
+ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+ 
+ /// The Git commit from which Charon was built.
+-pub const COMMIT_ID: &str = env!("CHARON_GIT_COMMIT");
++// blaze: was `env!("CHARON_GIT_COMMIT")`, set by a build script that ran git.
++pub const COMMIT_ID: &str = "a5443ed4e648b153ea0f052e9c22a3667ef1c0b9";
+ 
+ /// Read a `.llbc` file.
+ pub fn deserialize_llbc(path: &std::path::Path) -> anyhow::Result<ast::TranslatedCrate> {
+diff -ru -x b charon/src/logger.rs charon/src/logger.rs
+--- charon/src/logger.rs	2026-11-03 20:39:05
++++ charon/src/logger.rs	2026-11-03 20:41:41
+@@ -15,12 +15,11 @@
+     use tracing_subscriber::prelude::*;
+     tracing_subscriber::registry()
+         .with(tracing_subscriber::EnvFilter::from_default_env())
++        // blaze: was `tracing_tree::HierarchicalLayer` from a git fork; the plain fmt layer.
+         .with(
+-            tracing_tree::HierarchicalLayer::new(1)
++            tracing_subscriber::fmt::layer()
+                 .with_ansi(std::io::stderr().is_terminal())
+-                .with_indent_lines(true)
+-                .with_bracketed_fields(true)
+-                .with_timer(tracing_tree::time::Uptime::default()),
++                .with_writer(std::io::stderr),
+         )
+         .init();
+ }
+--- charon/Cargo.toml	2026-11-03 20:39:05
++++ charon/Cargo.toml	2026-11-03 20:42:04
+@@ -1,12 +1,9 @@
+-[workspace]
+-exclude = ["tests/popular-crates"]
+-members = [
+-    "adt-into",
+-    "rustc_const_uneval",
+-    "rustc_trait_elaboration",
+-]
+-
+-[workspace.package]
++# blaze: upstream's charon/Cargo.toml trimmed to the library (vendor/charon/SOURCE.md): no binaries,
++# tests or build script, the workspace's versions spelled out, and only the dependencies the
++# kept sources use.
++[package]
++name = "charon"
++version = "0.1.309"
+ authors = [
+     "Son Ho <hosonmarc@gmail.com>",
+     "Guillaume Boisseau <nadrieril+git@gmail.com>",
+@@ -15,151 +12,46 @@
+ ]
+ license = "Apache-2.0"
+ edition = "2024"
++publish = false
+ 
+-[workspace.dependencies]
+-itertools = "0.13"
+-proc-macro2 = "1.0"
+-quote = "1.0"
+-rustc-hash = "2"
+-syn = { version = "1.0.107", features = ["extra-traits", "full"] }
+-tracing = { version = "0.1", features = ["max_level_trace"] }
+-
+-[package]
+-name = "charon"
+-version = "0.1.309"
+-authors.workspace = true
+-edition.workspace = true
+-license.workspace = true
+-
+ [lib]
+ name = "charon_lib"
+ path = "src/lib.rs"
++doctest = false
++test = false
+ 
+-[[bin]]
+-# The main entrypoint. This is a wrapper that handles toolchain and cargo
+-# management and calls `charon-driver` for the real work.
+-name = "charon"
+-path = "src/bin/charon/main.rs"
+-
+-[[bin]]
+-# The rustc driver. The resulting binary dynamically links to rust dylibs
+-# including `librustc_driver.so`. Do not call directly, call charon instead to
+-# let it set up the right paths.
+-name = "charon-driver"
+-path = "src/bin/charon-driver/main.rs"
+-required-features = ["rustc"]
+-
+-[[bin]]
+-name = "generate-asts"
+-path = "src/bin/generate-asts/main.rs"
+-
+-[[test]]
+-name = "ui"
+-path = "tests/ui.rs"
+-harness = false
+-
+-[[test]]
+-name = "cargo"
+-path = "tests/cargo.rs"
+-harness = false
+-
+-[[test]]
+-name = "minirust"
+-path = "tests/minirust.rs"
+-harness = false
+-required-features = ["minirust"]
+-
+ [dependencies]
+-hax-adt-into = { path = "./adt-into" }
+-rustc_const_uneval = { path = "./rustc_const_uneval", optional = true }
+-rustc_trait_elaboration = { path = "./rustc_trait_elaboration", optional = true }
+-
+ annotate-snippets = { version = "0.12" }
+ anstream = "0.6.18"
+ anyhow = "1.0.81"
+-assert_cmd = "2.0"
+ bitflags = "2.6"
+ clap = { version = "4.0", features = ["derive", "env"] }
+-convert_case = "0.6.0"
+-crates_io_api = { version = "0.11.0", optional = true, default-features = false, features = ["rustls"] }
+ derive_generic_visitor = "1.1.0"
+ either = "1.15.0"
+ enum-as-inner = "0.7.0"
+ env_logger = { version = "0.11", features = ["color"] }
+-extension-traits = "1.0.1"
+-flate2 = { version = "1.0.34", optional = true }
+ hashbrown = { version = "0.15.0", default-features = false }
+ indexmap = { version = "2.7.1", features = ["serde"] }
+ index_vec = { version = "0.1.3", features = ["serde"] }
+ indoc = "2"
+-itertools.workspace = true
+-lazy_static = "1.4.0"
+-log = "0.4.17"
+-minirust-rs = { path = "../crates/minirust-rs", optional = true }
+-miniutil = { path = "../crates/miniutil", optional = true }
++itertools = "0.13"
+ nom = "7.1.3"
+ petgraph = "0.8.0"
+ postcard = { version = "1.1.3", features = ["use-std"] }
+-reqwest = { version = "0.12.8", optional = true, default-features = false, features = ["blocking", "rustls-tls"] }
+-rustc-hash.workspace = true
+-rustc_version = "0.4"
++rustc-hash = "2"
+ serde_json = { version = "1.0.91", features = ["unbounded_depth"] }
+ serde_stacker = "0.1.11"
+ serde_state_perfect_derive = "1.0.0"
+ serde = { version = "1.0.152", features = ["derive", "rc"] }
+ smallvec = "1.15.1"
+ stacker = "0.1"
+-syn.workspace = true
+ take_mut = "0.2.2"
+-tar = { version = "0.4.42", optional = true }
+-tempfile = "3"
+-toml = { version = "0.8", features = ["parse"] }
+-tracing-subscriber = { version = "0.3", features = [ "env-filter", "std", "fmt", ] }
+-tracing-tree = { git = "https://github.com/Nadrieril/tracing-tree", features = [ "time", ] } # Fork with improved formating and timing info.
+-tracing.workspace = true
++tracing-subscriber = { version = "0.3", features = ["env-filter", "std", "fmt"] }
++tracing = { version = "0.1", features = ["max_level_trace"] }
+ ustr = { version = "1.1.0", features = ["serde"] }
+-wait-timeout = "0.2.0"
+-which = "7.0"
+-rustc_apfloat = "0.2.3"
+ 
+ [features]
+-default = ["rustc", "minirust"]
+-# Hook into rustc-internal APIs. Needed for the `charon-driver` binary but not
+-# the main crate. Pass `--no-default-features` to compile `charon-lib` on a
+-# stable toolchain.
+-rustc = ["dep:rustc_const_uneval", "dep:rustc_trait_elaboration"]
+-# Enables converting monomorphized ULLBC to MiniRust's serialized format.
+-minirust = ["dep:minirust-rs", "dep:miniutil"]
+-# Enable the `charon` tool attribute when translating charon with itself.
++# Never turned on: named so the inert `cfg_attr(feature = "charon_on_charon", ...)` attributes and
++# options.rs's `cfg!(feature = "minirust")` refer to known features.
+ charon_on_charon = []
+-# This feature enables the `popular-crates` test which runs Charon on the most downloaded crates from crates.io.
+-popular-crates-test = [
+-    "dep:crates_io_api",
+-    "dep:flate2",
+-    "dep:reqwest",
+-    "dep:tar",
+-]
+-
+-[dev-dependencies]
+-ignore = "0.4"
+-indoc = "2"
+-libc = "0.2"
+-libtest-mimic = "0.8"
+-regex = "1"
+-snapbox = "0.6"
+-strip-ansi-escapes = "0.2.1"
+-tempfile = "3"
+-walkdir = "2.3.2"
+-
+-[package.metadata.rust-analyzer]
+-rustc_private = true
+-
+-[profile.dev.package.minirust-rs]
+-opt-level = 3
+-
+-[patch.crates-io]
+-# Fix a toolchain mismatch
+-libspecr = { git = "https://github.com/Nadrieril/specr", branch = "bump-toolchain" }
+-
+-[profile.dev.package.libspecr]
+-opt-level = 3
++minirust = []
