@@ -27,6 +27,17 @@
 # be had counts as code. `ci` is the one check that says whether everything that ran passed: it
 # is the check branch rules and the merge queue require. The queue tests each pull request
 # merged onto main and whatever is ahead of it, and main moves only to what it tested.
+#
+# ix runners (https://ix.dev/docs/runners): with the repository variable BLAZE_IX_RUNNERS set to
+# `true`, the gate's build and unit tests run on Linux AArch64 on a 64-vCPU ix runner, whose
+# memory grows on demand up to 256 GiB, in place of Linux x86-64 on a hosted runner, whose 16 GB
+# a build of blaze outgrows into swap for an hour or more and was shut down in (#1654); main's
+# `linux arm64` build and tests and the lint baselines run there too, and their green runs on
+# main are the snapshots the gate's runs fork, store and checkout included. ix serves AArch64
+# alone today, so Linux x86-64's build and tests stay on main's push, on a hosted runner. Unset,
+# every job runs on GitHub's hosted runners as before: a job whose labels no runner serves
+# waits for one for a day, so the variable goes on only once the ix-runners app serves this
+# repository.
 name: blaze
 on:
   push:
@@ -110,7 +121,8 @@ jobs:
   linux-x64:
     name: linux x64
     needs: changes
-    if: needs.changes.outputs.tier != 'none'
+    # The gate's on Linux AArch64 on ix in its place when BLAZE_IX_RUNNERS is on.
+    if: needs.changes.outputs.tier == 'warm' || (needs.changes.outputs.tier == 'gate' && vars.BLAZE_IX_RUNNERS != 'true')
     uses: ./.github/workflows/blaze-platform.yaml
     # For main's push of blaze's store (the cache-writer environment's secrets).
     secrets: inherit
@@ -120,18 +132,21 @@ jobs:
       tier: ${{ needs.changes.outputs.tier }}
       smoke: true
 
-  # On a push to main alone: their caches, for the train's runs and the next push's.
+  # On a push to main: their caches, for the train's runs and the next push's (and, on ix, the
+  # snapshots the gate's runs fork). The gate's build and unit tests too when BLAZE_IX_RUNNERS
+  # is on.
   linux-arm64:
     name: linux arm64
     needs: changes
-    if: needs.changes.outputs.tier == 'warm'
+    if: needs.changes.outputs.tier == 'warm' || (needs.changes.outputs.tier == 'gate' && vars.BLAZE_IX_RUNNERS == 'true')
     uses: ./.github/workflows/blaze-platform.yaml
     # For main's push of blaze's store (the cache-writer environment's secrets).
     secrets: inherit
     with:
       platform: linux-arm64
       os: ubuntu-24.04-arm
-      tier: warm
+      ix-cpu: ${{ vars.BLAZE_IX_RUNNERS == 'true' && '64' || '' }}
+      tier: ${{ needs.changes.outputs.tier }}
 
   macos:
     name: macos arm64
@@ -192,8 +207,11 @@ jobs:
     name: lint baselines
     needs: changes
     if: needs.changes.outputs.tier != 'none'
-    runs-on: ubuntu-24.04-arm
+    # On a 64-vCPU ix runner when BLAZE_IX_RUNNERS is on (blaze-platform.yaml's `ix-cpu`).
+    runs-on: ${{ vars.BLAZE_IX_RUNNERS == 'true' && fromJSON('["self-hosted", "ix", "arm64", "ix-cpu-64", "blaze-lint-baselines"]') || 'ubuntu-24.04-arm' }}
     timeout-minutes: 150
+    env:
+      BLAZE_CI_IX: ${{ vars.BLAZE_IX_RUNNERS == 'true' }}
     steps:
       - uses: actions/checkout@v7
       - id: blaze
