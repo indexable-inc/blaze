@@ -29,6 +29,17 @@ prefab hn.TitleBar : ui.Row {
   }
 }
 
+// The sidebar's fold (cmd+S): a clip as wide as the fold's spring leaves the sidebar, over the sidebar laid out at its
+// full width and slid left by the part folded away (src/app.rs lay_chrome), so its rows never lay out at an in-between
+// width. The main card's left edge follows the clip's right edge.
+prefab hn.SideClip : ui.Column {
+  Clip
+  Fill: $tone_side_tint
+  Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+}
+
 // The sidebar: the device, then its objects as a tree, clear over the vibrancy. Its top padding is the gap under the
 // title-bar strip (the host adds the strip's height).
 prefab hn.Sidebar : ui.Column {
@@ -39,8 +50,7 @@ prefab hn.Sidebar : ui.Column {
 
 // The sidebar's tree: one row per object, kept by key (src/view.rs). It takes the sidebar's height left over by the
 // device row and the Archive pinned under it, and clips what does not fit.
-prefab hn.Tree : ui.Column {
-  Clip
+prefab hn.Tree : ui.Scroll {
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
 }
@@ -72,12 +82,12 @@ prefab hn.ArchiveRow : ui.Row {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
     HoverLift: {lift: $archive_lift, scale: $archive_scale, kick_lift: $archive_kick_lift, kick_scale: $archive_kick_scale, omega: $archive_omega, zeta: $archive_zeta}
   }
-  name : ui.Words, Muted {
+  name : ui.Lead, Muted {
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
   // The count pulses when an object is archived.
-  count : ui.Words, Faint {
+  count : ui.Line, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
     HoverLift: {lift: 0, scale: 1, kick_lift: 0, kick_scale: $count_kick_scale, omega: $count_omega, zeta: $count_zeta}
   }
@@ -100,7 +110,7 @@ prefab hn.Badge : ui.Row {
   Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
   Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $badge_h, min: 0, max: 0}}
   Padding: {l: 0, r: 0, t: 0, b: 0}
-  code : ui.Words {
+  code : ui.Line {
     Fill: $tone_failed
     TextStyle: {size: $size_badge, line: $line_badge, role: 0, bold: 1}
   }
@@ -112,13 +122,27 @@ prefab hn.DeviceRow : ui.Row {
   Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
   Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
-  name : ui.Words, Faint {
+  name : ui.Lead, Faint {
     TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
   }
   dot : hn.Dot {}
   spacer : ui.Spacer {}
-  count : ui.Words, Faint {
+  count : ui.Line, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+}
+
+// A tree row's disclosure, Finder's: a chevron left of the row's icon that folds what is under the row, its hit target
+// the full slot (wider and taller than the glyph). The host gives it the chevron and the press only when the row has
+// rows under it (src/app/fold.rs); else it is an empty slot that keeps the icons in line.
+prefab hn.Disclosure : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Fixed, value: $disclose_w, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+  icon : ui.Symbol, Faint {
+    Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
   }
 }
 
@@ -137,14 +161,15 @@ prefab hn.ObjRow : ui.Row {
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
+  disclose : hn.Disclosure {}
   glyph : ui.Symbol {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
-  name : ui.Words, Ink {
+  name : ui.Lead, Ink {
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
   }
   spacer : ui.Spacer {}
-  meta : ui.Words, Faint {
+  meta : ui.Line, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
   badge : hn.Badge {}
@@ -166,14 +191,15 @@ prefab hn.RunRow : ui.Row {
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
+  disclose : hn.Disclosure {}
   glyph : ui.Symbol, Faint {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
-  name : ui.Words, Muted {
+  name : ui.Lead, Muted {
     TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
-  meta : ui.Words, Faint {
+  meta : ui.Line, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
 }
@@ -193,18 +219,16 @@ prefab hn.GroupRow : ui.Row {
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
+  disclose : hn.Disclosure {}
   glyph : ui.Symbol, Muted {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
-  name : ui.Words, Ink {
+  name : ui.Lead, Ink {
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
   }
   spacer : ui.Spacer {}
-  meta : ui.Words, Faint {
+  meta : ui.Line, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-  }
-  chevron : ui.Symbol, Faint {
-    Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
   }
 }
 
@@ -222,10 +246,11 @@ prefab hn.MoreRow : ui.Row {
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
+  disclose : hn.Disclosure {}
   glyph : ui.Node {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
-  name : ui.Words, Faint {
+  name : ui.Lead, Faint {
     TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
   }
 }
@@ -428,4 +453,19 @@ prefab hn.Theme {
   pill { Motion: {omega: $pill_omega, zeta: $pill_zeta} }
   sidebar { Motion: {omega: $sidebar_omega, zeta: $sidebar_zeta} }
   lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }
+  // A tree row folding in or away (its height and opacity).
+  tree_fold { Motion: {omega: $tree_fold_omega, zeta: $tree_fold_zeta} }
+  // The tree's scroll: the glide that keeps the selected row in view (and how far inside an edge it leaves it), how far
+  // an edge with more beyond it fades, and the overlay knob shown while it moves.
+  tree_scroll {
+    Motion: {omega: $tree_glide_omega, zeta: $tree_glide_zeta}
+    Size: {w: {kind: Fixed, value: $tree_reveal_margin, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  tree_fade {
+    Size: {w: {kind: Fixed, value: $tree_fade_len, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  knob {
+    Fill: $tone_knob
+    Size: {w: {kind: Fixed, value: $knob_width, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
 }

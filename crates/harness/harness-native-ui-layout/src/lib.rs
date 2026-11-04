@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use harness_native_flecs::prelude::*;
-use harness_native_ui_layout_api::{AnchoredTo, Aspect, Centre, Flex, Intrinsic, Padding, ScrollState, Side, Size, Sizing, Viewport};
+use harness_native_ui_layout_api::{AnchoredTo, Aspect, Centre, Flex, Intrinsic, Padding, ScrollState, ShrinkFirst, Side, Size, Sizing, Viewport};
 use harness_native_ui_node_api::{Offscreen, Hosted, Laid, Node, Placed};
 
 pub mod solve;
@@ -29,6 +29,7 @@ fn read(e: EntityView<'_>) -> Item {
         intrinsic: [intr.w, intr.h],
         scroll: [scroll.x, scroll.y],
         centre: e.try_cloned::<&Centre>().map(|c| c.at),
+        shrink_first: e.has(ShrinkFirst::id()),
         ..Item::default()
     }
 }
@@ -69,6 +70,7 @@ fn inputs(items: &[Item], room: [f32; 2], given: Option<Laid>, anchor: Option<(L
         h = mix(h, [it.id, f.axis as u64, u64::from(f.gap.to_bits()), f.align as u64, f.justify as u64, u64::from(f.wrap)]);
         h = mix(h, sizing(it.size[0]).into_iter().chain(sizing(it.size[1])));
         h = mix(h, it.pad.iter().chain(&it.intrinsic).chain(&it.scroll).chain([&it.aspect]).map(|v| u64::from(v.to_bits())));
+        h = mix(h, [u64::from(it.shrink_first)]);
         h = mix(h, [it.centre.map_or(u64::MAX, |c| u64::from(c.to_bits())), it.children.len() as u64]);
         h = mix(h, it.children.iter().map(|&c| c as u64));
     }

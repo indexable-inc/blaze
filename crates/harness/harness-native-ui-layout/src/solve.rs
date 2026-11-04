@@ -20,6 +20,8 @@ pub struct Item {
     pub scroll: [f32; 2],
     /// Its `Centre`: where along the main axis its children's middle goes, as a share of its length.
     pub centre: Option<f32>,
+    /// `ShrinkFirst`: out of room, it gives up its length before its siblings.
+    pub shrink_first: bool,
     pub children: Vec<usize>,
     pub nat: [f32; 2],
     pub out: Laid,
@@ -199,32 +201,42 @@ fn distribute(items: &[Item], i: usize, a: usize, inner: f32) -> Vec<f32> {
             }
         }
     } else if free < -0.01 {
-        let mut shrinkable: Vec<usize> =
-            (0..kids.len()).filter(|&k| matches!(items[kids[k]].size[a].kind, SizeKind::Fit | SizeKind::Grow)).collect();
-        while free < -0.01 && !shrinkable.is_empty() {
-            let total: f32 = shrinkable.iter().map(|&k| sizes[k]).sum();
-            if total <= 0.0 {
-                break;
-            }
-            let mut floored = Vec::new();
-            let deficit = -free;
-            for &k in &shrinkable {
-                let min = items[kids[k]].size[a].min;
-                let want = sizes[k] - deficit * sizes[k] / total;
-                if want <= min {
-                    floored.push(k);
-                }
-                let got = want.max(min);
-                free += sizes[k] - got;
-                sizes[k] = got;
-            }
-            shrinkable.retain(|k| !floored.contains(k));
-            if floored.is_empty() {
-                break;
-            }
+        // `ShrinkFirst` children give up their length first; the rest shrink after, only if that was not enough.
+        let can = |k: usize| matches!(items[kids[k]].size[a].kind, SizeKind::Fit | SizeKind::Grow);
+        for first in [true, false] {
+            let shrinkable: Vec<usize> = (0..kids.len()).filter(|&k| can(k) && (!first || items[kids[k]].shrink_first)).collect();
+            free = shrink(items, kids, a, &mut sizes, shrinkable, free);
         }
     }
     sizes
+}
+
+/// Shrink the `shrinkable` children of `kids` along axis `a` in proportion to their sizes, each down to its `min`, until
+/// `free` (negative: the overflow) is spent. Returns what is left of it.
+fn shrink(items: &[Item], kids: &[usize], a: usize, sizes: &mut [f32], mut shrinkable: Vec<usize>, mut free: f32) -> f32 {
+    while free < -0.01 && !shrinkable.is_empty() {
+        let total: f32 = shrinkable.iter().map(|&k| sizes[k]).sum();
+        if total <= 0.0 {
+            break;
+        }
+        let mut floored = Vec::new();
+        let deficit = -free;
+        for &k in &shrinkable {
+            let min = items[kids[k]].size[a].min;
+            let want = sizes[k] - deficit * sizes[k] / total;
+            if want <= min {
+                floored.push(k);
+            }
+            let got = want.max(min);
+            free += sizes[k] - got;
+            sizes[k] = got;
+        }
+        shrinkable.retain(|k| !floored.contains(k));
+        if floored.is_empty() {
+            break;
+        }
+    }
+    free
 }
 
 fn place(items: &mut [Item], i: usize) {
