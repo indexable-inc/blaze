@@ -129,7 +129,7 @@ fn place_of_span(
     syntax: &BodySyntax,
     span: Span,
 ) -> Option<Place> {
-    if span.anchor == syntax.span_map.span_for_range(TextRange::empty(0.into())).anchor {
+    if span.anchor == syntax.anchor {
         return anchored(db, owner, span.range.start());
     }
     let (file, line, column) = line_and_column(db, hir_expand::resolve_span(db, span))?;
