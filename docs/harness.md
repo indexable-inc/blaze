@@ -42,7 +42,11 @@ pins the same project it pins the same commit (the selftest holds them together)
 that commits its `Cargo.lock` builds with it; for one that does not (bevy, tokio, serde, rayon,
 regex, hyper) the lock is the harness's, `harness/v2/locks/<name>.Cargo.lock`, so two runs
 build the same dependencies. Until it is committed that project stops at its `lock` step; a run
-with `"write_locks": true` has blaze resolve it and writes it there.
+with `"write_locks": true` has blaze resolve it and writes it there. A workspace with
+`"sandbox_tests": true` (ripgrep) has its tests run in blaze's sandbox: a `sandbox` step adds
+`sandboxed-tests` to `experimental` in `[workspace.metadata.blaze]` of the copy's root
+`Cargo.toml` (never the fetched source; refused where it cannot be merged), and `result.json` and
+`report.md` say so per project, with the copy's BLAKE3 both before the edit and as built.
 
 For each project, `jobs` at a time, the longest first, each with a daemon home of its own
 (its `toolchains` linked to the machine's, as `BLAZE_HOME` moves them too):

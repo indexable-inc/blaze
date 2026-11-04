@@ -23,16 +23,22 @@ first, each with a daemon home of its own (`home`):
             harness/v2/locks/<name>.Cargo.lock); either is built `--locked`. A harness lock
             that is missing stops the project, unless `write_locks`, which has blaze resolve
             one and writes it there to be committed.
-    tree    the BLAKE3 of the copy (every path, its executable bit and its bytes; `.git` left
-            out), the lock's sha256, and the blaze binary's BLAKE3: the exact tree the result
-            is of (rule measure-the-exact-tree).
+    sandbox with the workspace's `sandbox_tests`: `sandboxed-tests` added to `experimental`
+            in `[workspace.metadata.blaze]` of the copy's root Cargo.toml (merged into a table
+            that is there; refused, naming the file, where it cannot be merged), so every test
+            runs in blaze's sandbox. The fetched source in `sources` is never edited.
+    tree    the BLAKE3 of the copy as built (every path, its executable bit and its bytes;
+            `.git` left out; after the `sandbox` edit), the lock's sha256, and the blaze
+            binary's BLAKE3: the exact tree the result is of (rule measure-the-exact-tree).
+            With `sandbox_tests`, the BLAKE3 of the copy before the edit too.
     build   `blaze build --workspace --all-targets --message-format=json`: the units built
             (`compiler-artifact`), and every unit that failed with blaze's error
             (`compiler-message` at level error, and plain `error:` lines).
     test    `blaze test --workspace --no-fail-fast --message-format=json`: each test of each
             test executable and doc test passed, failed or ignored (libtest's lines), with the
             panic of each failure; each executable that crashed or never built (blaze's
-            `blaze-unchecked` line) is a failure too.
+            `blaze-unchecked` line) is a failure too. result.json and report.md say per project
+            whether its tests ran sandboxed.
 
 Each step is bounded (`minutes` of the workspace for the build and for the tests, fixed bounds
 for the rest), and a step the harness could not finish names the step, the command, its exit
@@ -67,6 +73,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -181,7 +188,7 @@ class Merge:
 # The result (result.json), read back by `merge` and as a baseline with typed_input.
 
 type Outcome = Literal["passed", "failed", "ignored"]
-type StepName = Literal["fetch", "lock", "tree", "build", "test", "write lock", "stop", "vm"]
+type StepName = Literal["fetch", "lock", "sandbox", "tree", "build", "test", "write lock", "stop", "vm"]
 
 
 @dataclass(frozen=True)
@@ -221,12 +228,15 @@ class StepResult:
 
 @dataclass(frozen=True)
 class Tree:
-    """The exact tree a project's result is of."""
+    """The exact tree a project's result is of: `digest` is the copy as built, after every edit
+    the harness made to it (the lock, the `sandbox` step); `digest_before_sandbox` the copy
+    before the `sandbox` step edited its Cargo.toml ("" when it did not)."""
 
     rev: str
     tree: str
     digest: str
     lock_sha256: str
+    digest_before_sandbox: str = ""
 
 
 @dataclass(frozen=True)
@@ -251,6 +261,8 @@ class ProjectResult:
     build_failures: tuple[Failure, ...]
     tests: tuple[TestOutcome, ...]
     test_failures: tuple[Failure, ...]
+    # The tests ran in blaze's sandbox: the `sandbox` step opted the copy into `sandboxed-tests`.
+    sandbox_tests: bool = False
 
 
 @dataclass(frozen=True)
@@ -767,6 +779,68 @@ def tree_digest(root: Path) -> str:
     return whole.hexdigest()
 
 
+SANDBOXED_TESTS = "sandboxed-tests"
+SANDBOX_TABLE = "[workspace.metadata.blaze]"
+
+
+def sandboxed_manifest(text: str, where: str) -> str:
+    """The root manifest `text` (at `where`, for errors) with `sandboxed-tests` in `experimental`
+    of `[workspace.metadata.blaze]`: the table appended when there is none, the key added to the
+    table that is there, the experiment added to a one-line list of strings. Anything else (no
+    `[workspace]`, the table written inline or by dotted keys, `experimental` not such a list)
+    is refused naming the file; the result is parsed back and must be `text` with that one
+    experiment added."""
+    def refuse(why: str) -> StepFailed:
+        return StepFailed(f"sandbox: {where}: cannot add {SANDBOXED_TESTS!r} to `experimental` in {SANDBOX_TABLE}: {why}")
+
+    try:
+        before = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise refuse(f"it is not TOML: {e}") from None
+    workspace = before.get("workspace")
+    if not isinstance(workspace, dict):
+        raise refuse("it has no [workspace] table (this edit would make it a workspace root)")
+    metadata = cast(dict[str, object], workspace).get("metadata", {})
+    blaze = cast(dict[str, object], metadata).get("blaze") if isinstance(metadata, dict) else None
+    header = re.compile(r"^[ \t]*\[[ \t]*workspace[ \t]*\.[ \t]*metadata[ \t]*\.[ \t]*blaze[ \t]*\][ \t]*(#.*)?$", re.MULTILINE)
+    if blaze is None:
+        after = text + ("" if text.endswith("\n") or not text else "\n") + f"\n{SANDBOX_TABLE}\nexperimental = [\"{SANDBOXED_TESTS}\"]\n"
+    elif not isinstance(blaze, dict):
+        raise refuse(f"`workspace.metadata.blaze` is a {type(blaze).__name__}, not a table")
+    elif "experimental" not in blaze:
+        found = list(header.finditer(text))
+        if len(found) != 1:
+            raise refuse(f"the table is written inline or by dotted keys, not as one {SANDBOX_TABLE} header")
+        at = found[0].end()
+        after = text[:at] + f"\nexperimental = [\"{SANDBOXED_TESTS}\"]" + text[at:]
+    else:
+        experimental = cast(dict[str, object], blaze)["experimental"]
+        if not isinstance(experimental, list) or not all(isinstance(x, str) for x in cast(list[object], experimental)):
+            raise refuse(f"`experimental` is {experimental!r}, not a list of strings")
+        if SANDBOXED_TESTS in experimental:
+            return text
+        found = list(header.finditer(text))
+        lists = re.compile(r"^([ \t]*experimental[ \t]*=[ \t]*\[)([^\]\n]*\][ \t]*(#.*)?)$", re.MULTILINE)
+        at = found[0].end() if len(found) == 1 else -1
+        line = lists.search(text, at) if at >= 0 else None
+        nxt = re.compile(r"^[ \t]*\[", re.MULTILINE).search(text, at) if at >= 0 else None
+        if line is None or (nxt is not None and nxt.start() < line.start()):
+            raise refuse(f"`experimental` = {experimental!r} is not one line under one {SANDBOX_TABLE} header")
+        sep = ", " if experimental else ""
+        after = text[:line.start()] + line.group(1) + f"\"{SANDBOXED_TESTS}\"{sep}" + line.group(2) + text[line.end():]
+    # The edit is held to what it must be: the same manifest with the one experiment added.
+    want = json.loads(json.dumps(before))
+    table = want["workspace"].setdefault("metadata", {}).setdefault("blaze", {})
+    table["experimental"] = [SANDBOXED_TESTS, *table.get("experimental", [])]
+    try:
+        got = tomllib.loads(after)
+    except tomllib.TOMLDecodeError as e:
+        raise refuse(f"the edited manifest does not parse ({e})") from None
+    if json.loads(json.dumps(got)) != want:
+        raise refuse("the edited manifest is not the same manifest with the one experiment added")
+    return after
+
+
 def file_blake3(path: Path) -> str:
     return blake3.blake3(path.read_bytes()).hexdigest() if path.is_file() else ""
 
@@ -786,6 +860,8 @@ class Project:
     build: Reader = field(default_factory=Reader)
     test: Reader = field(default_factory=Reader)
     errors: list[str] = field(default_factory=list[str])
+    before_sandbox: str = ""
+    sandboxed: bool = False
 
     def result(self) -> ProjectResult:
         bad_exit = any(s.exit not in (0, None) for s in self.steps if s.step in ("build", "test"))
@@ -796,6 +872,7 @@ class Project:
             verdict=verdict, steps=tuple(self.steps), units_built=self.build.units_built,
             units_held_back=self.build.units_held_back, build_failures=tuple(self.build.build_failures),
             tests=tuple(self.test.tests), test_failures=tuple(self.test.test_failures),
+            sandbox_tests=self.sandboxed,
         )
 
 
@@ -870,11 +947,25 @@ async def run_project(ws: Workspace, args: Run, blaze: Path, work: Path, out: Pa
             )
         return 0
 
+    async def sandbox() -> int:
+        # The copy's manifest only: a new file in its place, so nothing it was cloned or linked
+        # from (the source in `sources`) changes.
+        manifest = checkout / "Cargo.toml"
+        if manifest.is_symlink() or not manifest.is_file():
+            raise StepFailed(f"{ws.name}: sandbox: {manifest} is not a file of the copy's own")
+        project.before_sandbox = await asyncio.to_thread(tree_digest, checkout)
+        edited = sandboxed_manifest(manifest.read_text(), f"{ws.name}'s {manifest.name} (the copy at {manifest})")
+        part = manifest.with_name(manifest.name + ".realprojects")
+        part.write_text(edited)
+        part.replace(manifest)
+        project.sandboxed = True
+        return 0
+
     async def measure() -> int:
         digest = await asyncio.to_thread(tree_digest, checkout)
         lock_path = checkout / "Cargo.lock"
         lock_sha = hashlib.sha256(lock_path.read_bytes()).hexdigest() if lock_path.is_file() else ""
-        project.tree = Tree(rev, tree, digest, lock_sha)
+        project.tree = Tree(rev, tree, digest, lock_sha, project.before_sandbox)
         return 0
 
     def build_argv() -> list[str]:
@@ -916,6 +1007,7 @@ async def run_project(ws: Workspace, args: Run, blaze: Path, work: Path, out: Pa
     try:
         ok = (await step(project, "fetch", ["git", "fetch", ws.repo, rev or args.commit], fetch, logged=True)
               and await step(project, "lock", [], lock)
+              and (not ws.sandbox_tests or await step(project, "sandbox", [], sandbox))
               and await step(project, "tree", [], measure))
         if ok:
             # The tests run after a failed build too: blaze builds what it can and runs every test
@@ -1173,6 +1265,11 @@ def report(result: Result, compared: Mapping[str, Changes], baseline: str) -> st
         lines.append(
             f"`{p.repo}` at `{p.tree.rev}` (tree `{p.tree.tree}`), files BLAKE3 `{p.tree.digest[:16]}`, "
             f"Cargo.lock sha256 `{p.tree.lock_sha256[:16]}`; on {p.host.system} {p.host.machine} ({p.host.where})."
+        )
+        lines.append("")
+        lines.append(
+            f"Tests ran sandboxed (`{SANDBOXED_TESTS}`, added to the copy's Cargo.toml; files BLAKE3 before the edit "
+            f"`{p.tree.digest_before_sandbox[:16]}`)." if p.sandbox_tests else "Tests ran unsandboxed."
         )
         lines.append("")
         lines.append("Steps: " + ", ".join(
@@ -1529,6 +1626,30 @@ def test_input() -> None:
         raise AssertionError("an unknown field was taken")
 
 
+def test_sandboxed_manifest() -> None:
+    def experimental(text: str) -> object:
+        return tomllib.loads(text)["workspace"]["metadata"]["blaze"]["experimental"]
+
+    bare = '[package]\nname = "a"\n\n[workspace]\nmembers = ["b"]\n'
+    assert experimental(sandboxed_manifest(bare, "x")) == ["sandboxed-tests"]
+    table = bare + '\n[workspace.metadata.blaze]  # ours\nconst-macros = 1\n\n[profile.dev]\nopt-level = 1\n'
+    edited = sandboxed_manifest(table, "x")
+    assert experimental(edited) == ["sandboxed-tests"] and tomllib.loads(edited)["profile"]["dev"]["opt-level"] == 1, edited
+    listed = bare + '\n[workspace.metadata.blaze]\nexperimental = ["const-macros"] # x\n'
+    assert experimental(sandboxed_manifest(listed, "x")) == ["sandboxed-tests", "const-macros"]
+    already = bare + '\n[workspace.metadata.blaze]\nexperimental = ["sandboxed-tests"]\n'
+    assert sandboxed_manifest(already, "x") == already
+    for refused in ('[package]\nname = "a"\n', bare + 'metadata.blaze = { sandbox = {} }\n',
+                    bare + '\n[workspace.metadata.blaze]\nexperimental = "const-macros"\n',
+                    bare + '\n[workspace.metadata.blaze]\nexperimental = [\n  "const-macros",\n]\n'):
+        try:
+            sandboxed_manifest(refused, "the/Cargo.toml")
+        except StepFailed as e:
+            assert "the/Cargo.toml" in str(e) and "sandboxed-tests" in str(e), e
+        else:
+            raise AssertionError(f"edited a manifest it cannot merge into:\n{refused}")
+
+
 def test_tree_digest() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -1543,7 +1664,8 @@ def test_tree_digest() -> None:
         assert tree_digest(root) != first, "an edit is"
 
 
-SELFTESTS = (test_reader, test_normalized, test_changes, test_round_trip, test_corpus, test_input, test_tree_digest)
+SELFTESTS = (test_reader, test_normalized, test_changes, test_round_trip, test_corpus, test_input, test_sandboxed_manifest,
+             test_tree_digest)
 
 
 def selftest() -> int:

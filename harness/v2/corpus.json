@@ -73,7 +73,8 @@
    "tree": "d5761395cbe3c315222cae65865599512c2ed141",
    "lock": "committed",
    "minutes": 60,
-   "why": "a mid-size workspace with a build script, integration tests that run the binary, and blaze_cli.py's pin"
+   "sandbox_tests": true,
+   "why": "a mid-size workspace with a build script, integration tests that run the binary, and blaze_cli.py's pin; its tests run in blaze's sandbox (`sandboxed-tests`)"
   },
   {
    "name": "nushell",
