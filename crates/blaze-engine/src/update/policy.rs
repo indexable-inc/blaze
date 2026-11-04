@@ -18,18 +18,23 @@ pub(crate) enum Mode {
     /// As `Warn`, and the daemon installs the newest release as the default outside pinned
     /// workspaces, saying so once after.
     Auto,
-    /// No line about newer releases; a yanked release is still said.
+    /// No line about newer releases; a yanked release is still said, so the daemon still reads
+    /// `latest.json`.
     Off,
+    /// No network at all: the daemon reads nothing and `blaze update` is refused, so no yanked
+    /// release can be said either (what an earlier check kept still is).
+    Offline,
 }
 
 impl Mode {
-    pub(crate) const NAMES: &str = "\"warn\", \"auto\" or \"off\"";
+    pub(crate) const NAMES: &str = "\"warn\", \"auto\", \"off\" or \"offline\"";
 
     pub(crate) fn parse(text: &str) -> Option<Mode> {
         match text {
             "warn" => Some(Mode::Warn),
             "auto" => Some(Mode::Auto),
             "off" => Some(Mode::Off),
+            "offline" => Some(Mode::Offline),
             _ => None,
         }
     }
@@ -39,6 +44,7 @@ impl Mode {
             Mode::Warn => "warn",
             Mode::Auto => "auto",
             Mode::Off => "off",
+            Mode::Offline => "offline",
         }
     }
 }
@@ -210,7 +216,7 @@ pub(crate) fn decide(here: &Here<'_>) -> Vec<Say> {
         };
         said.push(Say::Yanked { version: here.runs.to_owned(), reason: reason.to_owned(), fix });
     }
-    if here.quiet || here.mode == Mode::Off {
+    if here.quiet || matches!(here.mode, Mode::Off | Mode::Offline) {
         return said;
     }
     if let Some(version) = here.updated {
@@ -326,6 +332,7 @@ mod tests {
             ("canary channel: its newest", Here { channel: Channel::Canary, ..base }, vec![behind("0.20261104.0", "0.20261104.3")]),
             ("newer than the channel: nothing", Here { runs: "0.20261104.3", ..base }, vec![]),
             ("off: nothing", Here { runs: "0.20261103.9", mode: Mode::Off, ..base }, vec![]),
+            ("offline: nothing", Here { runs: "0.20261103.9", mode: Mode::Offline, ..base }, vec![]),
             ("auto: still said until installed", Here { runs: "0.20261103.9", mode: Mode::Auto, ..base }, vec![behind("0.20261103.9", "0.20261104.0")]),
             ("quiet (CI, no tty): nothing", Here { runs: "0.20261103.9", quiet: true, ..base }, vec![]),
             ("a build of the tree: nothing", Here { runs: "0.0.0-dev", ..base }, vec![]),
@@ -339,6 +346,7 @@ mod tests {
             ("yanked, unpinned", Here { runs: "0.20261101.0", ..base }, vec![yanked("0.20261101.0", update("0.20261104.0")), behind("0.20261101.0", "0.20261104.0")]),
             ("yanked, quiet: still said", Here { runs: "0.20261101.0", quiet: true, ..base }, vec![yanked("0.20261101.0", update("0.20261104.0"))]),
             ("yanked, off: still said", Here { runs: "0.20261101.0", mode: Mode::Off, ..base }, vec![yanked("0.20261101.0", update("0.20261104.0"))]),
+            ("yanked, offline: what was kept is said", Here { runs: "0.20261101.0", mode: Mode::Offline, ..base }, vec![yanked("0.20261101.0", update("0.20261104.0"))]),
             ("yanked, pinned", Here { runs: "0.20261101.0", pin: Pin::Version("0.20261101.0"), quiet: true, ..base }, vec![yanked("0.20261101.0", Fix::Pin("0.20261104.0".to_owned()))]),
             ("yanked, pinned to a channel", Here { runs: "0.20261101.0", pin: Pin::Channel, quiet: true, ..base }, vec![yanked("0.20261101.0", Fix::None)]),
             ("yanked, --ignore-pin", Here { runs: "0.20261101.0", pin: Pin::Ignored, quiet: true, ..base }, vec![yanked("0.20261101.0", update("0.20261104.0"))]),

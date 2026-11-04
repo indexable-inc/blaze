@@ -14,7 +14,8 @@
     promote.py promote '{"tag": "v0.YYYYMMDD.N", "run": "<run URL>", "bench": "<dir>"}'
         mark the release stable (not a prerelease) and Latest, unless a newer release is stable
         already; append the line saying so to its notes; the bench.py results under `bench`
-        (bench-<os>-<project>.json) become assets of it, what the next canary is compared with
+        (bench-<os>-<project>.json) become assets of it, what the next canary is compared with.
+        The stable pointer moves with `metadata`, which promote.yaml runs after it
     promote.py issue '{"tag": ..., "run": ..., "results": "<dir>", "needs": {<job>: {"result": ...}}}'
         open an issue for a canary that failed, or comment on the open one of that release: the
         jobs of `needs` (the workflow's) that failed, and each failed case of the smoke.py
@@ -26,16 +27,20 @@
         cargo's, and nothing is more than `threshold` percent worse than the stable release's
         result (bench.py --compare); `out` is the verdict in smoke.py's results form
     promote.py pointer '{"channel": "canary", "tag": "v0.YYYYMMDD.N"}'
-        the channel's pointer names the release (release.yaml, for canary)
+        the channel's pointer names the release (by hand; the workflows move both with `metadata`)
     promote.py latest '{"out": "latest.json"}'
         writes latest.json, what every blaze daemon reads every few minutes (docs/release.md,
         "latest.json"): each channel's newest release that is not yanked, the first lines of its
         notes and its page, and every yanked release with its reason. The workflow that runs it
         puts it in the R2 bucket blaze-releases, which https://ix.dev/blaze/latest.json serves
+    promote.py metadata '{"out": "latest.json"}'
+        what release.yaml, promote.yaml and yank.yaml run, one at a time (the concurrency group
+        release-metadata), after they changed a release: both channels' pointers set to each
+        channel's newest release that is not yanked, then `latest`. Worked out from the releases
+        alone, so a run the group cancels while it waits loses nothing: the next one writes it all
     promote.py yank '{"tag": "v0.YYYYMMDD.N", "reason": "miscompiles drops (#1234)"}'
-        yanks the release: the line `blaze-yanked: <reason>` at the top of its notes (an empty
-        reason takes it out again), and each channel's pointer moved to the channel's newest
-        release that is not yanked. yank.yaml runs it, then `latest`
+        yanks the release: its notes' first line becomes `blaze-yanked: <reason>` (an empty
+        reason takes it out again). yank.yaml runs it, then `metadata`
 
 Each channel has a pointer: the asset `stable` or `canary` of the release `channels`, which holds
 the channel's version and a newline. A workspace pinned to a channel (`[workspace.metadata.blaze]
@@ -93,6 +98,11 @@ class Latest:
 
 
 @dataclass(frozen=True)
+class Metadata:
+    out: str
+
+
+@dataclass(frozen=True)
 class Yank:
     tag: str
     reason: str
@@ -110,8 +120,9 @@ class Speed:
 
 
 POINTERS = "channels"
-# The line of a release's notes that yanks it (`promote.py yank`), which `latest` lists.
-YANKED = re.compile(r"^blaze-yanked: *(.*?) *$", re.M)
+# The first line of a release's notes, when it yanks the release (`promote.py yank`), which
+# `latest` lists. Only the first line: a line quoted further down the notes yanks nothing.
+YANKED = re.compile(r"blaze-yanked: *(.*?) *")
 # How much of a release's notes latest.json carries: blaze prints them with `blaze update`.
 NOTES_LINES = 12
 NOTES_MOST = 2000
@@ -242,8 +253,8 @@ def promote(tag, run_url, bench):
        "--notes-file", "-", input=f"{body}\n\n---\n\n{line}\n")
     if numbers := sorted(glob.glob(os.path.join(bench, "**", "bench-*.json"), recursive=True)) if bench else []:
         gh("release", "upload", tag, "-R", REPO, "--clobber", *numbers)
-    if latest:
-        pointer("stable", tag)
+    # The stable pointer and latest.json: promote.yaml's `metadata` job, in the group
+    # release-metadata, as release.yaml and yank.yaml write them.
     print(line)
 
 
@@ -260,7 +271,7 @@ def pointer(channel, tag):
         gh("release", "create", POINTERS, "-R", REPO, "--prerelease", "--latest=false", "--target", "main",
            "--title", "blaze's channels",
            "--notes", "Which release each channel is (docs/release.md): the assets `stable` and `canary` hold "
-                      "its version. Updated by release.yaml and promote.yaml; a pin to a channel reads them.")
+                      "its version. Updated by the metadata job of release.yaml, promote.yaml and yank.yaml; a pin to a channel reads them.")
     with tempfile.TemporaryDirectory() as dir:
         paths = []
         for name, value in files.items():
@@ -281,9 +292,13 @@ def dated_releases():
     return sorted(found, key=lambda r: key(r["tag"]), reverse=True)
 
 
+def first_line(body):
+    return body.replace("\r\n", "\n").lstrip("\n").split("\n", 1)[0]
+
+
 def yanked_of(release):
-    """Why `release` is yanked, or None."""
-    found = YANKED.search(release["body"].replace("\r\n", "\n"))
+    """Why `release` is yanked (the first line of its notes), or None."""
+    found = YANKED.fullmatch(first_line(release["body"]))
     return found.group(1) if found and found.group(1) else None
 
 
@@ -299,15 +314,18 @@ def newest_live(found):
 
 def first_lines(body):
     """The first lines of a release's notes, without the line that yanks it."""
-    lines = [line.rstrip() for line in body.replace("\r\n", "\n").strip().splitlines() if not YANKED.match(line)]
-    text = "\n".join(lines).strip()
+    body = body.replace("\r\n", "\n").strip()
+    if YANKED.fullmatch(first_line(body)):
+        body = body.split("\n", 1)[1] if "\n" in body else ""
+    text = "\n".join(line.rstrip() for line in body.strip().splitlines())
     text = "\n".join(text.splitlines()[:NOTES_LINES])
     return text if len(text) <= NOTES_MOST else text[:NOTES_MOST] + " ..."
 
 
-def latest(out):
-    """latest.json at `out` (docs/release.md, "latest.json"), the same bytes for the same releases."""
-    found = dated_releases()
+def latest(out, found=None):
+    """latest.json at `out` (docs/release.md, "latest.json"), the same bytes for the same releases
+    (`found`, read once by `metadata` so the pointers and latest.json say the same)."""
+    found = dated_releases() if found is None else found
     newest = newest_live(found)
     yanked = {r["tag"].removeprefix("v"): yanked_of(r) for r in found if yanked_of(r) is not None}
     value = {
@@ -323,19 +341,25 @@ def latest(out):
 
 
 def yank(tag, reason):
-    """Yanks `tag` (`reason` empty: takes the yank back), then moves each channel's pointer to its newest release
-    that is not yanked."""
+    """Yanks `tag` (`reason` empty: takes the yank back); `metadata` moves the pointers after."""
     if tag not in releases():
         sys.exit(f"promote.py: no release {tag} to yank")
     reason = " ".join(reason.split())
-    body = json.loads(gh("release", "view", tag, "-R", REPO, "--json", "body"))["body"].replace("\r\n", "\n")
-    body = YANKED.sub("", body).strip()
+    body = json.loads(gh("release", "view", tag, "-R", REPO, "--json", "body"))["body"].replace("\r\n", "\n").strip()
+    if YANKED.fullmatch(first_line(body)):
+        body = body.split("\n", 1)[1].strip() if "\n" in body else ""
     if reason:
         body = f"blaze-yanked: {reason}\n\n{body}"
     gh("release", "edit", tag, "-R", REPO, "--notes-file", "-", input=body + "\n")
-    for channel, release in newest_live(dated_releases()).items():
-        pointer(channel, release["tag"])
     print(f"{tag} is yanked: {reason}" if reason else f"{tag} is no longer yanked")
+
+
+def metadata(out):
+    """Both channels' pointers and latest.json, from the releases as they are now."""
+    found = dated_releases()
+    for channel, release in newest_live(found).items():
+        pointer(channel, release["tag"])
+    latest(out, found)
 
 
 def issue(tag, run_url, results, needs):
@@ -443,6 +467,8 @@ def main():
         pointer(it.channel, it.tag)
     elif step == "latest":
         latest(typed(Latest, given).out)
+    elif step == "metadata":
+        metadata(typed(Metadata, given).out)
     elif step == "yank":
         it = typed(Yank, given)
         yank(it.tag, it.reason)

@@ -868,6 +868,7 @@ dependencies = [
  "tar",
  "toml",
  "toml_edit",
+ "tracing",
  "url",
 ]
 

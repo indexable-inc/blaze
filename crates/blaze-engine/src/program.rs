@@ -217,10 +217,11 @@ fn pinned_elsewhere(words: &[OsString], given: bool) -> Result<Ran, String> {
     if wanted == pin::OURS {
         return Ok(Ran::Here { pin: Pinned::of(&named), manifest: Some(manifest) });
     }
-    // Run by a launcher for this same manifest, and not what it pins: a non-release where the
-    // release should be. `BLAZE_PINNED_BY` naming another workspace is inherited (a test of a
-    // pinned release building a temporary workspace) and says nothing here.
-    if pin::names(std::env::var_os(pin::PINNED_BY).as_deref(), &manifest) {
+    // Run by a launcher for this same manifest as the pinned release, and not it: the `blaze`
+    // kept for that release is another. Only then: a blaze found on PATH by a process under the
+    // pinned one (a build script, a test, a program `blaze run` runs) inherits
+    // `BLAZE_PINNED_BY` too, and runs the pinned release again, which runs itself.
+    if pin::names(std::env::var_os(pin::PINNED_BY).as_deref(), &manifest) && is_kept_for(&wanted) {
         let this = std::env::current_exe().unwrap_or_default();
         return Err(format!(
             "{shown} pins blaze {wanted}, and {}, which a blaze ran for it (`{}` names {shown}), is blaze {}: removing {} has it fetched again",
@@ -256,19 +257,30 @@ fn pinned_elsewhere(words: &[OsString], given: bool) -> Result<Ran, String> {
     Ok(Ran::Ended(ended(&mut command, &pinned)))
 }
 
+/// Whether this process is the `blaze` kept for the release `version` (`pin::installed`): a
+/// launcher that ran it as that release, and finds it another, is refused rather than run it
+/// again. The paths are compared resolved where they can be.
+fn is_kept_for(version: &str) -> bool {
+    let (Ok(this), Some(kept)) = (std::env::current_exe(), pin::installed(version)) else { return false };
+    let resolved = |it: &Path| std::fs::canonicalize(it).unwrap_or_else(|_| it.to_owned());
+    resolved(&this) == resolved(&kept)
+}
+
 /// Outside a pinned workspace (`manifest` its root manifest, when there is one): runs the
 /// default `blaze update` installed ([`update::runs_unpinned`]) with `words` when that is not
 /// this one, fetching it first when it is not there, telling it it is the default
-/// ([`update::RUN_AS_DEFAULT`]). A build of the tree runs itself. `Err` is why the default can't
-/// run, and no other runs in its place: `blaze update` or removing the default says otherwise.
+/// ([`update::RUN_AS_DEFAULT`]), which every process under it inherits and reads in place of
+/// the file. A build of the tree runs itself. `Err` is why the default can't run, and no other
+/// runs in its place: `blaze update` or removing the default says otherwise.
 fn run_default(words: &[OsString], manifest: Option<std::path::PathBuf>) -> Result<Ran, String> {
     let runs = update::runs_unpinned().map_err(|why| why.to_string())?;
     if runs == pin::OURS {
         return Ok(Ran::Here { pin: Pinned::None, manifest });
     }
-    // Run as the default, and not it: a release whose `blaze` is another where the default
-    // should be.
-    if std::env::var_os(update::RUN_AS_DEFAULT).is_some_and(|it| it == runs.as_str()) {
+    // Run as the default, and not it: the `blaze` kept for the default is another release.
+    // Only then: a blaze found on PATH under the default (its daemon, a build script, a test)
+    // inherits `BLAZE_RUN_AS_DEFAULT` too, and runs the default again, which runs itself.
+    if std::env::var_os(update::RUN_AS_DEFAULT).is_some_and(|it| it == runs.as_str()) && is_kept_for(&runs) {
         let this = std::env::current_exe().unwrap_or_default();
         return Err(format!(
             "blaze {runs} is the default `blaze update` installed, and {}, which a blaze ran as it (`{}`), is \

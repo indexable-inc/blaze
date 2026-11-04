@@ -1,7 +1,7 @@
 name: yank
 
-# Yanks a release of blaze (docs/release.md, "Yanking a release"): the line `blaze-yanked: <reason>` at the top of its
-# notes, each channel's pointer moved to the channel's newest release that is not yanked, and latest.json written
+# Yanks a release of blaze (docs/release.md, "Yanking a release"): its notes' first line becomes `blaze-yanked: <reason>`,
+# then (the job `metadata`, in the group release-metadata) each channel's pointer moved to the channel's newest release that is not yanked, and latest.json written
 # again, so every blaze that runs it or pins it says so on every command, CI too, from the daemon's next check (at
 # most five minutes). An empty reason takes the yank back. By hand: gh workflow run yank.yaml -f tag=v0.YYYYMMDD.N
 # -f reason="miscompiles drops (#1234)".
@@ -15,10 +15,6 @@ on:
         description: "why, said to everyone who runs it; empty takes the yank back"
         required: false
         default: ""
-
-concurrency:
-  group: release-metadata
-  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -36,21 +32,47 @@ jobs:
         env:
           TAG: ${{ inputs.tag }}
           REASON: ${{ inputs.reason }}
+        shell: bash # -eo pipefail: a failing promote.py fails the step through the tee
         run: |
           jq -n --arg tag "$TAG" --arg reason "$REASON" '{tag: $tag, reason: $reason}' > "$RUNNER_TEMP/yank.json"
           python3 -I .github/scripts/promote.py yank "$RUNNER_TEMP/yank.json" | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: latest.json
+
+  metadata:
+    name: pointers and latest.json
+    needs: yank
+    if: success()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # One at a time across release.yaml, promote.yaml and yank.yaml: each writes the pointers and
+    # latest.json from the releases as they are when it runs, so the last one to run is right. A
+    # run the group cancels while it waits behind a newer one loses nothing.
+    concurrency:
+      group: release-metadata
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      # Only GH_TOKEN: the Cloudflare token reaches no script, only wrangler-action below.
+      - name: pointers and latest.json
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash # -eo pipefail: a failing promote.py fails the step through the tee
+        run: python3 -I .github/scripts/promote.py metadata '{"out": "latest.json"}' | tee -a "$GITHUB_STEP_SUMMARY"
+      # The token R2 takes latest.json with: Object Read & Write on the bucket blaze-releases
+      # alone (docs/release.md, "latest.json"). Checked here, after the pointers moved, so a
+      # missing secret fails the run without holding a release back.
+      - name: the R2 token is set
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
         run: |
-          python3 -I .github/scripts/promote.py latest '{"out": "latest.json"}'
-          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-            echo "::error::latest.json is not published: the secret CLOUDFLARE_API_TOKEN is not set in $GITHUB_REPOSITORY's Actions secrets"
+          if [ -z "$TOKEN" ]; then
+            echo "::error::latest.json is not published: the secret CLOUDFLARE_R2_API_TOKEN is not set in $GITHUB_REPOSITORY's Actions secrets"
             exit 1
           fi
       - name: Publish latest.json
         uses: cloudflare/wrangler-action@v4
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: r2 object put blaze-releases/latest.json --file=latest.json --content-type=application/json --cache-control=public,max-age=60 --remote

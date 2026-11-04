@@ -301,10 +301,22 @@ done
 # unless its settings name a channel already.
 blaze_home="${BLAZE_HOME:-$HOME/.blaze}"
 rm -f "$blaze_home/default"
-if [ "$CHANNEL" = canary ] && [ -z "$VERSION" ] && ! grep -qs '^channel *=' "$blaze_home/config.toml"; then
+# config.toml read as TOML enough for this: a table header (comments after it allowed), and the key
+# `channel` in the table [update] (or `update.channel` before any table); a commented line is no key.
+# (Bracket expressions, not \[ and \]: awk -v takes the escapes out of what it is given.)
+update_header='^[ 	]*[[][ 	]*update[ 	]*[]][ 	]*(#.*)?$'
+names_channel() {
+    awk -v h="$update_header" '
+        /^[ \t]*\[/ { here = ($0 ~ h); top = 0; next }
+        BEGIN { top = 1 }
+        here && /^[ \t]*channel[ \t]*=/ { found = 1 }
+        top && /^[ \t]*update[ \t]*\.[ \t]*channel[ \t]*=/ { found = 1 }
+        END { exit !found }' "$1"
+}
+if [ "$CHANNEL" = canary ] && [ -z "$VERSION" ] && ! { [ -f "$blaze_home/config.toml" ] && names_channel "$blaze_home/config.toml"; }; then
     mkdir -p "$blaze_home"
-    if grep -qs '^\[update\]' "$blaze_home/config.toml"; then
-        awk '{ print } /^\[update\]$/ { print "channel = \"canary\"" }' "$blaze_home/config.toml" > "$blaze_home/.config.toml.new" &&
+    if [ -f "$blaze_home/config.toml" ] && awk -v h="$update_header" '$0 ~ h { found = 1 } END { exit !found }' "$blaze_home/config.toml"; then
+        awk -v h="$update_header" '{ print } !done && $0 ~ h { print "channel = \"canary\""; done = 1 }' "$blaze_home/config.toml" > "$blaze_home/.config.toml.new" &&
             mv -f "$blaze_home/.config.toml.new" "$blaze_home/config.toml"
     else
         printf '\n[update]\nchannel = "canary"\n' >> "$blaze_home/config.toml"

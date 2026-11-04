@@ -93,6 +93,8 @@ Nothing here waits on the network. blaze's daemon reads `https://ix.dev/blaze/la
 five minutes in the background (with its ETag, so an unchanged file is a `304`) and keeps what it
 found in `~/.blaze/update/state.json`; a command reads only that file. Before the daemon's first
 check nothing is said, and a check that fails keeps what the last one found and invents nothing.
+What stops the daemon from doing its part (a `config.toml` or `~/.blaze/default` it cannot
+read, an `"auto"` install that failed) is kept there too and said as one `warning:` line.
 Under CI (`CI` set) or when stderr is not a terminal, only a yanked release is said.
 
 `blaze update` reads `latest.json` at once, downloads the newest release of your channel,
@@ -103,6 +105,12 @@ pinned workspaces: the `blaze` you installed runs it in its place, as it runs a 
 (`~/.blaze/default` names it; running install.sh again removes it, so the blaze installed last
 runs). A daemon of the release before is replaced at the next command, as when any other build
 of blaze meets it. `blaze update --check` says what is out and installs nothing.
+
+`blaze update` never installs a yanked release: when your channel's newest is yanked it refuses
+and says so, and when moving off a yanked release goes to an older one it says that it is a
+downgrade. A `~/.blaze/default` it cannot parse is replaced, and it says so. When the blaze that
+runs is newer than the channel's newest (a canary under `"stable"`), it says that rather than
+calling it the newest.
 
 `blaze update` never changes a workspace's pin: there, it says the pin and that `blaze pin
 <version>` moves it. `blaze pin 0.YYYYMMDD.N` pins that release (fetched and checked first);
@@ -115,7 +123,8 @@ The settings are `[update]` in `~/.blaze/config.toml` (`$BLAZE_HOME/config.toml`
 |---|---|
 | `"warn"` (the default) | the lines above |
 | `"auto"` | the lines above, and the daemon installs the newest release as the default by itself, saying `blaze updated to <version>; notes: <url>` at the next command. Never a pin. A release it failed to install is not tried again by itself; `blaze update` tries it |
-| `"off"` | no line about newer releases or old pins; a yanked release is still said |
+| `"off"` | no line about newer releases or old pins. The daemon still reads `latest.json` every five minutes, so that a yanked release is still said |
+| `"offline"` | no network at all: the daemon reads nothing and `blaze update` refuses. A release yanked after this is set is never said (what an earlier check kept still is) |
 
 `channel` is `"stable"` (the default) or `"canary"`, the releases whose newest counts;
 install.sh with `--channel canary` sets it. A setting that is not one of these is said in place

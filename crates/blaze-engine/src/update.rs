@@ -11,8 +11,9 @@
 //!
 //! Files, under blaze's home (`BLAZE_HOME`, else `~/.blaze`, where `versions/` is):
 //!
-//! - `config.toml`: `[update] mode` (`"warn"`, the default; `"auto"`; `"off"`) and `channel`
-//!   (`"stable"`, the default; `"canary"`). `blaze update --mode/--channel` writes it.
+//! - `config.toml`: `[update] mode` (`"warn"`, the default; `"auto"`; `"off"`; `"offline"`, no
+//!   network at all) and `channel` (`"stable"`, the default; `"canary"`). `blaze update
+//!   --mode/--channel` writes it.
 //! - `default`: the version `blaze update` installed, which runs outside pinned workspaces in
 //!   the installed blaze's place. install.sh removes it, so the blaze installed last runs.
 //! - `update/state.json`: the last check (written by the daemon only, whole or not at all).
@@ -194,7 +195,7 @@ fn set(home: &Path, key: &str, value: &str) -> anyhow::Result<()> {
 }
 
 /// The last check, as `update/state.json` keeps it.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, PartialEq)]
 struct State {
     /// When `latest.json` was last asked for, whatever came of it.
     checked_at: Option<u64>,
@@ -207,6 +208,10 @@ struct State {
     failed: Option<String>,
     /// A release `auto` failed to install, and why: not tried again by `auto`.
     install_failed: Option<(String, String)>,
+    /// What the daemon found wrong on this machine that only its user can fix (a `default` or
+    /// `config.toml` it can't read, an install `auto` could not make): said before each command
+    /// until the next check finds it fixed. A network that fails is not one: that is `failed`.
+    problem: Option<String>,
 }
 
 impl State {
@@ -229,6 +234,7 @@ impl State {
             latest_at: value.get("latest_at").and_then(Value::as_u64),
             failed: string("failed"),
             install_failed,
+            problem: string("problem"),
         })
     }
 
@@ -242,22 +248,36 @@ impl State {
             "latest_at": self.latest_at,
             "failed": self.failed,
             "install_failed": install_failed,
+            "problem": self.problem,
         });
         let mut bytes = serde_json::to_vec_pretty(&value)?;
         bytes.push(b'\n');
         versions::kept(file, &bytes).with_context(|| format!("writing {}", file.display()))
     }
 
-    /// What the kept `latest.json` says.
+    /// What the kept `latest.json` says, read as [`latest_of`] reads it now.
     fn latest(&self) -> Option<Latest> {
-        self.latest.as_ref().and_then(|it| latest_of(it).ok())
+        let hosts = hosts().ok()?;
+        self.latest.as_ref().and_then(|it| latest_of(it, &hosts).ok())
     }
 }
 
+/// The hosts a release page `latest.json` names may be on: GitHub's, and that of the mirror
+/// `BLAZE_RELEASES` names.
+fn hosts() -> anyhow::Result<Vec<String>> {
+    let mut hosts = vec!["github.com".to_owned()]; // alloc: at most two hosts, once a read
+    if let versions::Source::Mirror(base) = versions::source()? {
+        let base = url::Url::parse(&base).with_context(|| format!("`BLAZE_RELEASES` is {base}, which is not an address"))?;
+        hosts.extend(base.host_str().map(str::to_owned));
+    }
+    Ok(hosts)
+}
+
 /// `latest.json` (docs/release.md, "latest.json") read: `schema` 1, `stable` and `canary`
-/// each with `version`, `url` and `notes`, and `yanked`, a version to its reason. The error
-/// names the field.
-fn latest_of(value: &Value) -> Result<Latest, String> {
+/// each with `version`, `url` (an `https://` page on one of `hosts`) and `notes`, and
+/// `yanked`, a version to its reason. What is printed of it is [`printable`]. The error names
+/// the field.
+fn latest_of(value: &Value, hosts: &[String]) -> Result<Latest, String> {
     if value.get("schema").and_then(Value::as_u64) != Some(1) {
         return Err("it has no `schema` 1".to_owned());
     }
@@ -270,11 +290,14 @@ fn latest_of(value: &Value) -> Result<Latest, String> {
         if !pin::is_version(version) {
             return Err(format!("its `{channel}.version` is {version:?}, not a release's version"));
         }
-        let url = field("url")?;
-        if !url.starts_with("https://") {
-            return Err(format!("its `{channel}.url` is {url:?}, not an https:// address"));
-        }
-        Ok(Newest { version: version.to_owned(), url: url.to_owned(), notes: trimmed(field("notes")?) })
+        let given = field("url")?;
+        let url = url::Url::parse(given)
+            .ok()
+            .filter(|it| it.scheme() == "https" && it.host_str().is_some_and(|host| hosts.iter().any(|it| it == host)))
+            .ok_or_else(|| {
+                format!("its `{channel}.url` is {:?}, not an https:// page on {}", printable(given), hosts.join(" or "))
+            })?;
+        Ok(Newest { version: version.to_owned(), url: printable(url.as_str()), notes: trimmed(field("notes")?) })
     };
     let mut yanked = Vec::new(); // alloc: the yanked releases, once a read
     if let Some(listed) = value.get("yanked") {
@@ -291,10 +314,40 @@ fn latest_of(value: &Value) -> Result<Latest, String> {
     Ok(Latest { stable: newest("stable")?, canary: newest("canary")?, yanked })
 }
 
-/// `text` without control characters but newlines: what `latest.json` says is printed to a
-/// terminal, and an escape sequence in it would be the terminal's to run.
+/// `text` without control characters but newlines, and without format characters (Unicode's
+/// `Cf`: bidirectional overrides, zero-width ones): what `latest.json` and a failed check say
+/// is printed to a terminal, where an escape sequence would be the terminal's to run and a
+/// bidirectional override would show other text than is there.
 fn printable(text: &str) -> String {
-    text.chars().filter(|it| *it == '\n' || !it.is_control()).collect() // alloc: a line to print, once a read
+    text.chars().filter(|it| *it == '\n' || !(it.is_control() || is_format(*it))).collect() // alloc: a line to print, once a read
+}
+
+/// Whether `c` is a format character, Unicode's general category `Cf` (16.0), which std does
+/// not tell.
+fn is_format(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0xAD | 0x600..=0x605
+            | 0x61C
+            | 0x6DD
+            | 0x70F
+            | 0x890..=0x891
+            | 0x8E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
 }
 
 /// The first [`NOTES_LINES`] lines of `notes`, at most [`NOTES_MOST`] characters, printable.
@@ -344,22 +397,25 @@ fn read_latest(etag: Option<&str>) -> anyhow::Result<(String, Read)> {
 /// was true when read, `latest_at`); nothing is made up in its place.
 fn check(state: &mut State, now: u64) {
     state.checked_at = Some(now);
-    let read = read_latest(state.etag.as_deref());
+    // The ETag only with the `latest.json` it is of: a `304` to a state that kept none would
+    // leave it with none.
+    let etag = state.latest().and(state.etag.as_deref());
+    let read = hosts().and_then(|hosts| read_latest(etag).map(|read| (hosts, read)));
     state.failed = match read {
-        Ok((_, Read::Same)) => None,
-        Ok((address, Read::New { etag, body })) => {
+        Ok((_, (_, Read::Same))) => None,
+        Ok((hosts, (address, Read::New { etag, body }))) => {
             let value = serde_json::from_slice::<Value>(&body).map_err(|error| error.to_string());
-            match value.and_then(|value| latest_of(&value).map(|_| value)) {
+            match value.and_then(|value| latest_of(&value, &hosts).map(|_| value)) {
                 Ok(value) => {
                     state.latest = Some(value);
                     state.latest_at = Some(now);
                     state.etag = etag;
                     None
                 }
-                Err(why) => Some(format!("{address}: {why}")),
+                Err(why) => Some(printable(&format!("{address}: {why}"))),
             }
         }
-        Err(error) => Some(format!("{error:#}")),
+        Err(error) => Some(printable(&format!("{error:#}"))),
     };
 }
 
@@ -394,14 +450,25 @@ fn refresh(forced: bool) -> anyhow::Result<Duration> {
     if !forced && !wait.is_zero() {
         return Ok(wait);
     }
+    // What only the user can fix is said before each command (`say`), and asked again at each
+    // check: the config and the default are read first, `offline` reads nothing more.
+    let config = config(&home);
+    let default = default(&home);
+    state.problem = match (&config, &default) {
+        (Err(error), _) | (_, Err(error)) => Some(printable(&error.to_string())),
+        _ => None,
+    };
+    if let Ok(Config { mode: Mode::Offline, .. }) = config {
+        state.write(&file)?;
+        return Ok(CHECK_EVERY);
+    }
     check(&mut state, now);
     state.write(&file)?;
+    let (Ok(config), Ok(default)) = (config, default) else { return Ok(CHECK_EVERY) };
     if forced {
         return Ok(CHECK_EVERY);
     }
-    let config = config(&home)?;
     let Some(latest) = state.latest() else { return Ok(CHECK_EVERY) };
-    let default = default(&home)?;
     let runs = policy::runs_unpinned(pin::OURS, default.as_deref());
     let failed = state.install_failed.as_ref().map(|(version, _)| version.as_str());
     if let Some(version) = policy::auto_install(config.mode, config.channel, &latest, runs, failed) {
@@ -409,8 +476,12 @@ fn refresh(forced: bool) -> anyhow::Result<Duration> {
             Ok(()) => versions::kept(&updated_file(&home), format!("{version}\n").as_bytes())
                 .with_context(|| format!("writing {}", updated_file(&home).display()))?,
             Err(why) => {
-                eprintln!("blaze: `[update] mode = \"auto\"` could not install blaze {version}: {why:#}");
-                state.install_failed = Some((version.to_owned(), format!("{why:#}")));
+                let why = printable(&format!("{why:#}"));
+                eprintln!("blaze: `[update] mode = \"auto\"` could not install blaze {version}: {why}");
+                state.problem = Some(format!(
+                    "`[update] mode = \"auto\"` could not install blaze {version} ({why}); `blaze update` tries again"
+                ));
+                state.install_failed = Some((version.to_owned(), why));
                 state.write(&file)?;
             }
         }
@@ -431,13 +502,32 @@ fn default(home: &Path) -> Result<Option<String>, UpdateError> {
 
 /// The release that runs outside a pinned workspace ([`policy::runs_unpinned`]): the default
 /// `blaze update` installed, or this blaze.
+///
+/// - Under a blaze a launcher ran as the default ([`RUN_AS_DEFAULT`], which every process
+///   under it inherits: its daemon, a build script running `$CARGO`, a test), that version,
+///   and no file is read: a build script's sandbox may not let it read blaze's home.
+/// - With no home there is no default.
+/// - A `default` that can't be read (a sandbox's `EPERM`) is no default; one that names no
+///   release is an error for a command the user ran, naming the file, and no default under a
+///   blaze a launcher ran ([`launched`]), which must keep working.
 pub(crate) fn runs_unpinned() -> Result<String, UpdateError> {
-    let default = default(&home()?)?;
+    let given = std::env::var(RUN_AS_DEFAULT).ok().filter(|it| pin::is_version(it));
+    if let Some(given) = given {
+        return Ok(policy::runs_unpinned(pin::OURS, Some(given.as_str())).to_owned());
+    }
+    let Ok(home) = home() else { return Ok(pin::OURS.to_owned()) };
+    let default = match default(&home) {
+        Ok(default) => default,
+        Err(UpdateError::Unread { .. }) => None,
+        Err(UpdateError::Default { .. }) if launched() => None,
+        Err(error) => return Err(error),
+    };
     Ok(policy::runs_unpinned(pin::OURS, default.as_deref()).to_owned())
 }
 
 /// The release `version` fetched and checked (`versions::fetch_for`) and made the default.
 fn install(home: &Path, version: &str) -> anyhow::Result<()> {
+    let _span = tracing::info_span!("update: installing a release as the default", version).entered();
     versions::fetch_for(version, "which `blaze update` installs")?;
     let file = default_file(home);
     versions::kept(&file, format!("{version}\n").as_bytes()).with_context(|| format!("writing {}", file.display()))
@@ -471,6 +561,9 @@ pub(crate) fn say(runs: &str, pin: Pin<'_>, manifest: Option<&Path>) {
             return;
         }
     };
+    if let Some(problem) = state.problem.as_deref().filter(|_| !quiet) {
+        eprintln!("warning: {problem}");
+    }
     let latest = state.latest();
     let updated_file = updated_file(&home);
     let updated = text(&updated_file).ok().flatten().map(|it| it.trim().to_owned()).filter(|it| pin::is_version(it));
@@ -563,6 +656,13 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
         return Ok(0);
     }
     let config = config(&home)?;
+    if config.mode == Mode::Offline {
+        bail!(
+            "{} sets `[update] mode = \"offline\"`: blaze makes no network calls for its updates, and \
+             `blaze update` is one (`blaze update --mode warn` turns them on)",
+            config_file(&home).display()
+        );
+    }
     refresh(true)?;
     let file = state_file(&home);
     let state = State::read(&file)?;
@@ -572,9 +672,17 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
     let latest = state.latest().with_context(|| format!("{} holds no latest.json after a check", file.display()))?;
     let channel = config.channel;
     let newest = latest.newest(channel);
-    let runs = runs_unpinned()?;
+    // A `default` that names no release is what `blaze update` is for: it is written again.
+    let (runs, corrupt) = match runs_unpinned() {
+        Ok(runs) => (runs, None),
+        Err(error @ UpdateError::Default { .. }) => (pin::OURS.to_owned(), Some(error)),
+        Err(error) => return Err(error.into()),
+    };
     let pinned = pinned_here();
     if only_check {
+        if let Some(corrupt) = &corrupt {
+            println!("{corrupt}");
+        }
         println!("blaze {runs} runs outside pinned workspaces; the newest {} release is blaze {}", channel.name(), newest.version);
         if let Some(reason) = latest.yanked(&runs) {
             println!("blaze {runs} is YANKED: {reason}");
@@ -593,17 +701,43 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<i32>
             pin::OURS
         );
     }
-    let newer = match (Version::parse(&newest.version), Version::parse(&runs)) {
-        (Some(newest), Some(runs)) => newest > runs,
-        _ => false,
+    // `latest.json` names no yanked release as a channel's newest (promote.py); one that does is
+    // not installed.
+    if let Some(reason) = latest.yanked(&newest.version) {
+        bail!(
+            "latest.json names blaze {} as the newest {} release, and yanks it ({reason}): it is not installed",
+            newest.version,
+            channel.name()
+        );
+    }
+    let (Some(to), Some(from)) = (Version::parse(&newest.version), Version::parse(&runs)) else {
+        bail!("blaze {runs} or blaze {} is not a release's version", newest.version);
     };
-    if !newer && (newest.version == runs || latest.yanked(&runs).is_none()) {
-        println!("blaze {runs} is the newest {} release", channel.name());
+    let yanked = latest.yanked(&runs);
+    if corrupt.is_none() && (to == from || (to < from && yanked.is_none())) {
+        if to == from {
+            println!("blaze {runs} is the newest {} release", channel.name());
+        } else {
+            println!(
+                "blaze {runs} is newer than the newest {} release, blaze {}: nothing to install \
+                 (`blaze update --channel canary` follows every release)",
+                channel.name(),
+                newest.version
+            );
+        }
     } else {
         install(&home, &newest.version)?;
         _ = std::fs::remove_file(updated_file(&home));
+        if let Some(corrupt) = &corrupt {
+            println!("{corrupt}; replaced with blaze {}", newest.version);
+        }
+        let how = match yanked {
+            Some(reason) if to < from => format!(", back from a yanked release ({reason}): a downgrade"),
+            Some(reason) => format!(", off a yanked release ({reason})"),
+            None => String::new(),
+        };
         println!(
-            "blaze {runs} → {} ({}): it runs outside pinned workspaces from the next command",
+            "blaze {runs} → {} ({}{how}): it runs outside pinned workspaces from the next command",
             newest.version,
             channel.name()
         );
@@ -632,4 +766,44 @@ fn print_notes(newest: &Newest) {
         println!();
     }
     println!("notes: {}", newest.url);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `update/state.json` round-trips: what is written reads back equal, and is written again
+    /// to the same bytes; none there reads as no check yet.
+    #[test]
+    fn the_state_round_trips() {
+        let dir = std::env::temp_dir().join(format!("blaze-update-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("update").join("state.json");
+        let page = |version: &str| format!("https://github.com/indexable-inc/blaze/releases/tag/v{version}");
+        let latest = serde_json::json!({
+            "schema": 1,
+            "stable": {"version": "0.20261104.0", "url": page("0.20261104.0"), "notes": "- a\n- b"},
+            "canary": {"version": "0.20261104.3", "url": page("0.20261104.3"), "notes": ""},
+            "yanked": {"0.20261101.0": "miscompiles drops"},
+        });
+        let state = State {
+            checked_at: Some(1_762_250_000),
+            etag: Some("\"3f2a\"".to_owned()),
+            latest: Some(latest),
+            latest_at: Some(1_762_249_700),
+            failed: Some("https://ix.dev/blaze/latest.json: timed out".to_owned()),
+            install_failed: Some(("0.20261104.0".to_owned(), "its B3SUMS says 00".to_owned())),
+            problem: Some("`[update] mode` is \"sometimes\"".to_owned()),
+        };
+        state.write(&file).unwrap();
+        let written = std::fs::read(&file).unwrap();
+        let read = State::read(&file).unwrap();
+        assert_eq!(read, state);
+        read.write(&file).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), written);
+        State::default().write(&file).unwrap();
+        assert_eq!(State::read(&file).unwrap(), State::default());
+        assert_eq!(State::read(&dir.join("none.json")).unwrap(), State::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -187,17 +187,25 @@ pub(crate) fn pin(args: &[String]) -> anyhow::Result<i32> {
     Ok(0)
 }
 
-/// The version or channel `blaze pin` is given: its one word that is no flag and no flag's
-/// value (`--manifest-path PATH`).
+/// The version or channel `blaze pin` is given: `blaze pin [VERSION] [--manifest-path PATH]`.
+/// `--manifest-path` (the one flag it takes, with its value as the next word or after `=`) is
+/// read by `pin::start`; any other flag is refused, naming it, rather than its value taken for
+/// the version.
 fn named(args: &[String]) -> anyhow::Result<Option<String>> {
     let mut words = args.iter();
     let mut named = None;
     while let Some(word) = words.next() {
         if word == "--manifest-path" {
-            words.next();
-        } else if word.starts_with('-') {
+            words.next().context("`blaze pin --manifest-path` takes the manifest's path")?;
             continue;
-        } else if let Some(first) = named.replace(word.clone()) {
+        }
+        if word.starts_with("--manifest-path=") {
+            continue;
+        }
+        if word.starts_with('-') {
+            bail!("`blaze pin` takes no {word}: `blaze pin [VERSION] [--manifest-path PATH]`");
+        }
+        if let Some(first) = named.replace(word.clone()) {
             bail!("`blaze pin` pins one release, and is given {first} and {word}");
         }
     }
