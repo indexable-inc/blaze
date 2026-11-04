@@ -38,6 +38,8 @@ permissions:
   actions: read
 
 env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
   # ruff's checkout has ty; uv's is uv's.
   REPO: ${{ startsWith(inputs.suite, 'uv') && 'astral-sh/uv' || 'astral-sh/ruff' }}
   REV: ${{ startsWith(inputs.suite, 'uv') && '5b5a53e1803d426ba04f4af8ff7d6ff747548218' || '07872adbafa7c00f42f1174d8aa3c3e324033009' }}

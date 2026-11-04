@@ -156,7 +156,8 @@ pub struct Config {
     pub root: PathBuf,
     /// The request's directory under the root, where the sockets and records go.
     pub dir: FileName,
-    /// How many tests (children, or libtest threads) run at once: the cores.
+    /// How many tests (children, or libtest threads) run at once: blaze's core budget
+    /// (`blaze_core::cores`), which every test thread is charged to.
     pub jobs: usize,
     pub fail_fast: bool,
     pub kill_grace: Duration,

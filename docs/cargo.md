@@ -755,6 +755,37 @@ the stall bound fails with an error naming what each thread is inside, and the d
 --stall-bound SECS` sets another, for a daemon started by hand (`blaze stop` first) on a host
 so loaded that one piece of work can go that long with nothing else moving.
 
+### Cores and priority
+
+By default blaze leaves two cores to the rest of the machine and runs at background priority,
+so a long build does not freeze the desktop (on 2026-11-03 a release build at every core and
+normal priority took an 18-core Mac to load 154 and froze its GUI). `BLAZE_CORES` says
+otherwise:
+
+| `BLAZE_CORES` | Cores | Priority |
+|---|---|---|
+| unset (or empty) | the machine's less 2, at least 1 | background |
+| `all` | every core | normal (CI and ix VMs set this) |
+| `n`, a whole number of 1 or more | exactly `n` | background |
+
+Anything else is an error naming the variable, the value and what it takes. The budget sizes
+the daemon's plane, its worker pool, test runs (a test binary's `--test-threads` is taken from
+the same budget as the processes running beside it) and the `NUM_JOBS` a build script's `cc`
+is told (a quarter of the budget: blaze has no jobserver to share, and scripts often run a
+few at once). `blaze test`'s live view runs a quarter of the budget's test binaries at once,
+each with `RUST_TEST_THREADS` at a quarter, unless the command sets `RUST_TEST_THREADS`
+itself. Background priority is nice 10 (`setpriority`), which every thread and child process
+inherits; on macOS the worker pool's threads also drop from `user-initiated` to the `default`
+QoS class. macOS's own background state (`PRIO_DARWIN_BG`) is not used: it throttles disk and
+network IO and keeps the work on the efficiency cores. A priority blaze cannot lower is a
+warning naming the call and errno, and the build goes on at the priority it started with.
+
+The client and the daemon each read it once, as they start (`blaze_core::cores`). A daemon's
+budget and priority are fixed for its life, so a command whose `BLAZE_CORES` asks for another
+budget or priority than the running daemon's is refused, naming both; `blaze stop` and run it
+again, and the daemon that command starts takes its setting. A daemon systemd or launchd
+starts (`blaze daemon install`) reads its unit's environment.
+
 ### Files
 
 The socket is `v2.sock` in `$BLAZE_HOME` if set, else `$XDG_RUNTIME_DIR/blaze`, else
@@ -943,6 +974,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 | `BLAZE_RUST_DIST` | where the pinned nightly's components come from: a URL, or a directory of them ([Install](#install)) | rust-lang's dist server, at the pinned date |
 | `BLAZE_RELEASES` | a mirror of blaze's releases ([below](#pinning-a-release-of-blaze)) | GitHub's |
 | `BLAZE_API_TOKEN` | the bearer token `blaze serve --http` requires ([Files](#files)) | none: `--http` refuses to start |
+| `BLAZE_CORES` | how many cores blaze's work runs on and at what priority: unset, the machine's less 2 at background priority; `all`, every core at normal priority; `n`, exactly `n` at background priority. A command whose value differs from the running daemon's is refused ([Cores and priority](#cores-and-priority)) | unset |
 | `BLAZE_EMIT` | LLVM instruction selection: `optimized` or `fast`. It is in no unit's key, so code the store kept under one value is used under the other | `optimized`; `fast` at level 0 |
 
 `BLAZE_BACKEND`, `BLAZE_OPT` and `BLAZE_INLINE` are not settings in v2. They change the code

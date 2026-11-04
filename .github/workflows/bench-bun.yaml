@@ -30,6 +30,10 @@ defaults:
   run:
     shell: bash
 
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
 jobs:
   platforms:
     name: platforms with a registered runner

@@ -25,6 +25,8 @@ permissions:
   contents: read
 
 env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 10
 

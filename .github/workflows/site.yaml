@@ -33,6 +33,10 @@ concurrency:
   group: site-${{ github.event_name }}-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
 jobs:
   site:
     runs-on: ubuntu-24.04

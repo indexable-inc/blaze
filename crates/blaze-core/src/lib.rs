@@ -35,6 +35,8 @@
 #![cfg_attr(target_os = "wasi", feature(wasi_ext, random))]
 
 pub mod busy;
+#[allow(unsafe_code, reason = "getpriority and setpriority on the calling process, each one call behind a safe function")]
+pub mod cores;
 #[cfg(target_os = "linux")]
 mod cgroup;
 pub mod create_process;

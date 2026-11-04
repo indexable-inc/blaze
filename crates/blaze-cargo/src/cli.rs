@@ -115,6 +115,13 @@ Every command takes cargo's flags; `blaze help <COMMAND>` lists them.
 /// `cargo-blaze blaze <command> ...`.
 pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     blaze_profile::began();
+    let words = words(args);
+    // A test executable the daemon launched runs as its test, with the daemon's priority
+    // already inherited: `BLAZE_CORES` is the CLI's and the daemon's, not the test's.
+    let trampoline = words.first().is_some_and(|it| it == run::TRAMPOLINE);
+    if !trampoline && let Err(code) = cores() {
+        return ended(code);
+    }
     // The client and `blaze serve` both: with `BLAZE_PROFILE` each records from here on.
     blaze_profile::install();
     _ = blaze_profile::flight::count_frame_copies(|| {
@@ -122,7 +129,6 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
         blaze_profile::flight::FrameCopied { copies: it.copies, bytes: it.bytes }
     });
     _ = blaze_profile::flight::count_cpu(blaze_profile::thread_cpu);
-    let words = words(args);
     if words.first().is_some_and(|it| it == "serve") {
         #[cfg(feature = "native")]
         return crate::serve::main(words.into_iter().skip(1));
@@ -133,10 +139,29 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
         }
     }
     // A test executable started through this blaze, to run as the process the daemon launched.
-    if words.first().is_some_and(|it| it == run::TRAMPOLINE) {
+    if trampoline {
         return ended(run::trampoline(words.into_iter().skip(1), auto_color()));
     }
     ended(command(words))
+}
+
+/// This process's core budget read (`BLAZE_CORES`, [`blaze_core::cores`]) and, unless it says
+/// `all`, its priority lowered, before it starts any thread or process, so all of them
+/// inherit it: the client's and `blaze serve`'s both, and the daemon a client starts inherits
+/// the client's. A value it refuses ends the process with the error; a priority it can't lower
+/// is a warning, and the process goes on ([`blaze_core::cores::lower`] says why).
+fn cores() -> Result<(), i32> {
+    let cores = match blaze_core::cores::get() {
+        Ok(cores) => cores,
+        Err(why) => {
+            eprint!("{}", say::error(&why.to_string(), auto_color()));
+            return Err(Exit::Usage.code());
+        }
+    };
+    if let Err(why) = blaze_core::cores::lower(&cores) {
+        eprint!("{}", say::warning(&why.to_string(), auto_color()));
+    }
+    Ok(())
 }
 
 /// The process's end with `code`: as `main`'s `ExitCode` where it fits in one, else at once.

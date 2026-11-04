@@ -22,8 +22,8 @@ pub(crate) enum UnitError {
     ProfileDir { package: String, out_dir: String },
     /// The plan of a run of `package`'s build script sets no `name`, which cargo always sets.
     NoVariable { package: String, name: &'static str },
-    /// How many jobs a run of `package`'s build script is told (`NUM_JOBS`): the machine's
-    /// parallelism could not be read, as cargo refuses to guess it.
+    /// How many jobs a run of `package`'s build script is told (`NUM_JOBS`): blaze's core budget
+    /// (`BLAZE_CORES`, the machine's parallelism) could not be read, as cargo refuses to guess it.
     Parallelism { package: String, error: String },
     /// The front end has no crate for build script compile `unit`: its purity can't be asked.
     NoCrate { unit: usize },
@@ -64,7 +64,7 @@ impl fmt::Display for UnitError {
             }
             UnitError::Parallelism { package, error } => write!(
                 f,
-                "the build script of `{package}` is told NUM_JOBS, and the machine's parallelism can't be read: {error}"
+                "the build script of `{package}` is told NUM_JOBS, a share of blaze's core budget, which can't be read: {error}"
             ),
             UnitError::NoCrate { unit } => {
                 write!(f, "the front end has no crate for the build script compiled by unit {unit}")

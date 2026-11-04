@@ -271,9 +271,16 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .ok_or_else(|| UnitError::ProfileDir { package: package.name.clone(), out_dir: out_dir.clone() }.to_string())?;
-    let jobs = std::thread::available_parallelism()
+    // A share of the daemon's budget, not all of it: a build script's `cc` starts `NUM_JOBS`
+    // compilers of its own (blaze gives it no jobserver), and up to the budget's scripts run at
+    // once as plane work, so each told the whole budget would run its square. A fixed share of
+    // the setting, never of how many run now: `NUM_JOBS` is part of what a script reads, so of
+    // its key ([`blaze_core::cores::NESTED`]).
+    let jobs = blaze_core::cores::get()
         .map_err(|error| UnitError::Parallelism { package: package.name.clone(), error: error.to_string() }.to_string())?
-        .get() as u32;
+        .split(blaze_core::cores::NESTED)
+        .get();
+    let jobs = u32::try_from(jobs).unwrap_or(u32::MAX);
     let exe = |name: &str| of.tools.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     Ok(bs::Unit {
         package: bs::Package {

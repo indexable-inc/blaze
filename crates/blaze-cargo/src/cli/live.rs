@@ -197,7 +197,8 @@ pub fn drive<A: Api>(
         let to_runner = to_runner.clone();
         // The workspace's member count comes with `Built`, after the first executables run, so
         // "to rerun pass" always names the package: `-p calc --lib` reruns it in any workspace.
-        let runner = Runner::new(asked, to_screen, to_runner, true, shown.color);
+        let cores = blaze_core::cores::get().map_err(io::Error::other)?;
+        let runner = Runner::new(asked, cores, to_screen, to_runner, true, shown.color);
         thread::Builder::new().name("blaze test runner".into()).spawn(move || runner.run(&runner_gets))?
     };
 
@@ -482,6 +483,9 @@ fn plain(lines: &[Line<'static>]) {
     let _ = io::stderr().write_all(text.as_bytes());
 }
 
+/// libtest's variable for how many threads it runs tests on.
+const RUST_TEST_THREADS: &str = "RUST_TEST_THREADS";
+
 /// One test executable the runner knows.
 struct Binary {
     artifact: Artifact,
@@ -539,6 +543,9 @@ struct Runner {
     queued: Vec<u32>,
     running: Vec<Running>,
     slots: usize,
+    /// The `RUST_TEST_THREADS` each executable is started with, a share of blaze's core budget;
+    /// `None` when the command set `RUST_TEST_THREADS` itself, which then reaches each as set.
+    threads: Option<usize>,
     /// The failures, as (order, exit code): the first in cargo's order is the exit code.
     failed: Vec<(String, Option<i32>)>,
     stopping: bool,
@@ -550,12 +557,39 @@ struct Runner {
 }
 
 impl Runner {
-    fn new(asked: &Invocation, to_screen: Sender<Msg>, to_runner: Sender<Run>, spec_flag: bool, color: bool) -> Runner {
-        Runner::of(asked.test_args(), asked.flags.fail_fast, to_screen, to_runner, spec_flag, color)
+    fn new(
+        asked: &Invocation,
+        cores: blaze_core::cores::Cores,
+        to_screen: Sender<Msg>,
+        to_runner: Sender<Run>,
+        spec_flag: bool,
+        color: bool,
+    ) -> Runner {
+        let told = std::env::var_os(RUST_TEST_THREADS).is_some();
+        Runner::of(asked.test_args(), asked.flags.fail_fast, cores, told, to_screen, to_runner, spec_flag, color)
     }
 
-    fn of(args: Vec<OsString>, fail_fast: bool, to_screen: Sender<Msg>, to_runner: Sender<Run>, spec_flag: bool, color: bool) -> Runner {
-        let cpus = thread::available_parallelism().map_or(1, usize::from);
+    /// `told`: whether the command's environment sets `RUST_TEST_THREADS` itself.
+    ///
+    /// The budget is split two ways at once, so the threads running stay near it: a quarter of
+    /// it in executables at once ([`blaze_core::cores::NESTED`]), each with libtest told the
+    /// share that leaves it (`RUST_TEST_THREADS`), where libtest alone would start a thread per
+    /// core in each. Executables are not run one at a time with the whole budget: they start as
+    /// each is linked, while the build goes on, and most are small; a few at once keeps the
+    /// cores busy while one long suite runs. A command's own `RUST_TEST_THREADS` or
+    /// `--test-threads` wins.
+    #[expect(clippy::too_many_arguments, reason = "the runner's whole setup, made once a command")]
+    fn of(
+        args: Vec<OsString>,
+        fail_fast: bool,
+        cores: blaze_core::cores::Cores,
+        told: bool,
+        to_screen: Sender<Msg>,
+        to_runner: Sender<Run>,
+        spec_flag: bool,
+        color: bool,
+    ) -> Runner {
+        let slots = cores.split(blaze_core::cores::NESTED).get();
         Runner {
             args,
             fail_fast,
@@ -566,7 +600,8 @@ impl Runner {
             seen: HashSet::default(), // alloc: one a command
             queued: Vec::new(),        // alloc: one a command
             running: Vec::new(),       // alloc: one a command
-            slots: (cpus / 4).max(1),
+            slots,
+            threads: (!told).then(|| cores.split(slots).get()),
             failed: Vec::new(),        // alloc: one a command
             stopping: false,
             build: None,
@@ -702,6 +737,9 @@ impl Runner {
         let root = std::path::Path::new(&it.artifact.manifest_path).parent().map_or_else(PathBuf::new, std::path::Path::to_owned);
         let exec = Exec::of(&it.artifact, executable, args, root);
         let mut command = exec.command();
+        if let Some(threads) = self.threads {
+            command.env(RUST_TEST_THREADS, threads.to_string()); // alloc: one an executable run
+        }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let json = it.json;
         let name = it.label.clone();
@@ -1005,7 +1043,9 @@ mod tests {
         artifact.runner = ["/bin/sh", "-c", "sleep 60 & echo \"child $!\""].map(str::to_owned).to_vec();
         let (to_screen, screen_gets) = unbounded::<Msg>();
         let (to_runner, runner_gets) = unbounded::<Run>();
-        let mut runner = Runner::of(Vec::new(), true, to_screen, to_runner.clone(), true, false);
+        let one = std::num::NonZero::<usize>::MIN;
+        let cores = blaze_core::cores::Cores::resolve(blaze_core::cores::Setting::Exactly(one), one);
+        let mut runner = Runner::of(Vec::new(), true, cores, true, to_screen, to_runner.clone(), true, false);
         runner.drain = Duration::from_millis(300);
         to_runner.send(Run::BuildOver { ok: true, artifacts: vec![artifact] }).unwrap();
         let (done, finished) = crossbeam_channel::bounded(1);

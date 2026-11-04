@@ -25,6 +25,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
 jobs:
   plan:
     runs-on: ubuntu-24.04
