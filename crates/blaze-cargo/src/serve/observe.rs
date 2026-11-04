@@ -27,6 +27,7 @@ use std::{
 use blaze_api::{ApiError, LiveFrame, Reply, RequestRef, Response};
 use blaze_core::Conn;
 use blaze_profile::{
+    errors::ErrorRow,
     facts::{CrateDepRow, KeyPartRow, LinkRow, ProvenanceRow, QueryCountRow, RunOutcome},
     history::{self, BuildRow, History, OWNER},
     live::{self, Feed, Frame},
@@ -252,6 +253,9 @@ pub struct Ended {
     /// Its front end's run log: each memo that ran again and why, each untracked read by name
     /// ([`provenance_rows`]).
     pub provenance: Vec<ProvenanceRow>,
+    /// Errors its daemon raised of itself rather than said of a unit: each of its tasks'
+    /// panics, its stack the row's `detail` (`job::daemon_panic`).
+    pub errors: Vec<ErrorRow>,
 }
 
 /// What the loop gives the `blaze-history` thread: a build as it starts, and as it ends.
@@ -567,7 +571,7 @@ fn keep(
                 (history.flush(None), false)
             }
             Ok(ToHistory::Ended(Finished {
-                ended: Ended { mut row, links, crate_deps, misses, provenance },
+                ended: Ended { mut row, links, crate_deps, misses, provenance, errors },
                 query_counts,
             })) => {
                 let build = row.build_id;
@@ -600,6 +604,7 @@ fn keep(
                 history.ran(provenance);
                 history.keyed(keyed);
                 history.missed(misses);
+                history.errored(errors);
                 history.build_ended(row);
                 doing.set(Step::Flushing, build);
                 (history.flush(Some(build)), false)
@@ -1281,6 +1286,7 @@ mod tests {
             crate_deps: Vec::new(),
             misses: Vec::new(),
             provenance: Vec::new(),
+            errors: Vec::new(),
         };
         let (to, rows) = crossbeam_channel::unbounded();
         let (failed_to, failed) = crossbeam_channel::unbounded();
@@ -1330,6 +1336,7 @@ mod tests {
             crate_deps: Vec::new(),
             misses: Vec::new(),
             provenance: Vec::new(),
+            errors: Vec::new(),
         }
     }
 
