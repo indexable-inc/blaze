@@ -42,7 +42,10 @@ class Workspace:
     `lock` says whose `Cargo.lock` it builds with: the project's own (`committed`, built with
     `--locked`) or the harness's (`harness`, LOCKS). `submodules` checks them out at the commits
     the tree pins. `build_args` and `test_args` come after `--workspace` (a feature set the
-    project's own CI tests with); `minutes` bounds each of the build and the tests."""
+    project's own CI tests with); `minutes` bounds each of the build and the tests.
+    `sandbox_tests` has realprojects.py add `sandboxed-tests` to `experimental` in
+    `[workspace.metadata.blaze]` of its copy's root Cargo.toml (never the fetched source), so
+    every test runs in blaze's sandbox."""
 
     name: str
     repo: str
@@ -56,6 +59,7 @@ class Workspace:
     build_args: tuple[str, ...] = ()
     test_args: tuple[str, ...] = ()
     minutes: int = 120
+    sandbox_tests: bool = False
 
     def lock_file(self) -> Path:
         return LOCKS / f"{self.name}.Cargo.lock"
