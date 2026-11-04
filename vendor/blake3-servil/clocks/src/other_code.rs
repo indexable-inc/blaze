@@ -15,9 +15,12 @@ pub const FUNCTIONS: usize = 1024;
 
 macro_rules! round {
     ($x:ident, $n:expr, $r:expr) => {
-        $x = ($x ^ ($n.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(($r as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9))))
-            .rotate_left(($r * 7 + 3) % 64)
-            .wrapping_mul(($n ^ ($r << 32)) | 1);
+        $x = ($x
+            ^ ($n
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .wrapping_add(($r as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9))))
+        .rotate_left(($r * 7 + 3) % 64)
+        .wrapping_mul(($n ^ ($r << 32)) | 1);
     };
 }
 
@@ -81,7 +84,12 @@ macro_rules! table256 {
 
 type Block = fn(u64) -> u64;
 
-const fn concat4<const M: usize, const R: usize>(a: [Block; M], b: [Block; M], c: [Block; M], d: [Block; M]) -> [Block; R] {
+const fn concat4<const M: usize, const R: usize>(
+    a: [Block; M],
+    b: [Block; M],
+    c: [Block; M],
+    d: [Block; M],
+) -> [Block; R] {
     assert!(R == 4 * M, "four parts make the whole");
     let mut out: [Block; R] = [block::<0>; R];
     let mut i = 0;
@@ -95,7 +103,8 @@ const fn concat4<const M: usize, const R: usize>(a: [Block; M], b: [Block; M], c
     out
 }
 
-static TABLE: [Block; FUNCTIONS] = concat4::<256, 1024>(table256!(0), table256!(256), table256!(512), table256!(768));
+static TABLE: [Block; FUNCTIONS] =
+    concat4::<256, 1024>(table256!(0), table256!(256), table256!(512), table256!(768));
 
 /// Run every function once, in order, each on the result of the one
 /// before: about 1 MiB of distinct code, executed once.
@@ -118,7 +127,11 @@ mod tests {
         // Code size: the spread of the functions' addresses (the linker
         // lays them out in one run), at least 512 bytes each.
         let span = addresses.last().unwrap() - addresses.first().unwrap();
-        assert!(span >= super::FUNCTIONS * 512, "{span} bytes of code for {} functions", super::FUNCTIONS);
+        assert!(
+            span >= super::FUNCTIONS * 512,
+            "{span} bytes of code for {} functions",
+            super::FUNCTIONS
+        );
         super::run();
     }
 }

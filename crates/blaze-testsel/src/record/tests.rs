@@ -40,7 +40,9 @@ fn the_header_is_the_copy_it_replaced() {
     };
     assert_eq!((MAGIC, HEADER), (*b"blzexec1", 16));
     let mut rng = SplitMix64::new(3);
-    for slots in [0, 1, 255, 256, 65_536, u32::MAX].into_iter().chain((0..64).map(|_| rng.next_u64() as u32)) {
+    for slots in
+        [0, 1, 255, 256, 65_536, u32::MAX].into_iter().chain((0..64).map(|_| rng.next_u64() as u32))
+    {
         assert_eq!(header(slots), kept(slots), "{slots} slots");
     }
 }
@@ -53,8 +55,13 @@ fn a_region_is_whole_only_when_armed_and_ended() {
     region[HEADER + 19] = 1;
     assert!(Record::of_region(&region, Ok(())).why().unwrap().contains("armed 0 of its 20"));
     assert!(mark_armed(&mut region));
-    assert_eq!(Record::of_region(&region, Ok(())), Record::Complete { slots: 20, hits: vec![3, 19] });
-    assert!(Record::of_region(&region, Err("ended by signal 9")).why().unwrap().contains("signal 9"));
+    assert_eq!(
+        Record::of_region(&region, Ok(())),
+        Record::Complete { slots: 20, hits: vec![3, 19] }
+    );
+    assert!(
+        Record::of_region(&region, Err("ended by signal 9")).why().unwrap().contains("signal 9")
+    );
     assert!(Record::of_region(&region[..HEADER + 10], Ok(())).why().is_some());
     assert!(Record::of_region(&region[..4], Ok(())).why().is_some());
     let mut other = region.clone();

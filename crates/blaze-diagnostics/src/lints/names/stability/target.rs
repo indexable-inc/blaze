@@ -21,12 +21,12 @@ use syntax::{
     view::{self as ast, AstNode as _, Node},
 };
 
-use stdx::list::Join;
 use crate::{
     cx::Cx,
     lower::{Found, Phase},
     model::{Applicability, Diag, SuggestionStyle},
 };
+use stdx::list::Join;
 
 /// What an attribute is on, as rustc's `Target` names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,7 +186,12 @@ pub(super) struct Attribute {
 
 impl Attribute {
     /// The `#[deprecated]` `meta` written in `attr` on `on`.
-    pub(super) fn new(target: Target, on: InFile<Node<'_>>, meta: &ast::Meta<'_>, attr: &ast::Attr<'_>) -> Option<Attribute> {
+    pub(super) fn new(
+        target: Target,
+        on: InFile<Node<'_>>,
+        meta: &ast::Meta<'_>,
+        attr: &ast::Attr<'_>,
+    ) -> Option<Attribute> {
         let path = meta.path()?.syntax().text_range();
         let whole = match attr.meta() {
             Some(it) if it.syntax() == meta.syntax() => attr.syntax().text_range(),
@@ -237,7 +242,10 @@ pub(super) fn useless(cx: &Cx<'_, '_>, attr: &Attribute, extern_types: bool) -> 
     let (applied, only) = applied(target, extern_types);
     let only = if only { "only " } else { "" };
     // alloc: the help of a `useless_deprecated` that fires
-    diag.help(format!("the `deprecated` attribute can {only}be applied to {}", stdx::list::list(applied.iter(), Join::And, false)));
+    diag.help(format!(
+        "the `deprecated` attribute can {only}be applied to {}",
+        stdx::list::list(applied.iter(), Join::And, false)
+    ));
     diag.warn(
         "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!",
     );
@@ -253,8 +261,17 @@ pub(super) fn no_effect(cx: &Cx<'_, '_>, attr: &Attribute, of_trait_impl: bool) 
     }
     let span = cx.span(attr.whole);
     // clone: the span of an `unused_attributes` that fires, for its label and its suggestion
-    let mut diag = Diag::lint("unused_attributes", "this `#[deprecated]` annotation has no effect", span.clone());
-    diag.suggestion(span, "remove the unnecessary deprecation attribute", "", Applicability::MachineApplicable);
+    let mut diag = Diag::lint(
+        "unused_attributes",
+        "this `#[deprecated]` annotation has no effect",
+        span.clone(),
+    );
+    diag.suggestion(
+        span,
+        "remove the unnecessary deprecation attribute",
+        "",
+        Applicability::MachineApplicable,
+    );
     super::source_fact(cx, &mut diag, attr.on);
     Some(Found::lint(diag, Phase::Items, attr.on))
 }
@@ -289,4 +306,3 @@ fn applied(target: Target, extern_types: bool) -> (Names, bool) {
 
 /// The names [`applied`] gives: at most every allowed target and every group, inline.
 type Names = SmallVec<[&'static str; ALLOWED.len() + 5]>;
-

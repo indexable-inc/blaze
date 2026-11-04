@@ -67,7 +67,13 @@ pub fn area_len(params: &[AbiParam]) -> usize {
 }
 
 /// Stores each of `values` (of `params`) at `base` onward in `area`.
-fn record(b: &mut FunctionBuilder<'_>, area: ir::Value, base: u32, params: &[AbiParam], values: &[ir::Value]) {
+fn record(
+    b: &mut FunctionBuilder<'_>,
+    area: ir::Value,
+    base: u32,
+    params: &[AbiParam],
+    values: &[ir::Value],
+) {
     let mut at = base;
     for (param, value) in params.iter().zip(values) {
         match param.purpose {
@@ -95,7 +101,9 @@ fn picks(params: &[AbiParam], rets: &[AbiParam]) -> Vec<usize> {
             let of: Vec<usize> = params
                 .iter()
                 .enumerate()
-                .filter(|(_, param)| param.value_type == ty && param.purpose == ArgumentPurpose::Normal)
+                .filter(|(_, param)| {
+                    param.value_type == ty && param.purpose == ArgumentPurpose::Normal
+                })
                 .map(|(k, _)| k)
                 .collect();
             assert!(!of.is_empty(), "a return of {ty} and no parameter of it");
@@ -116,7 +124,13 @@ fn picks(params: &[AbiParam], rets: &[AbiParam]) -> Vec<usize> {
 
 /// The shape family of `params` and `rets`, refused by Cranelift on its target when
 /// `refused`.
-fn shape(mk: &Mk, name: &'static str, params: &[AbiParam], rets: &[AbiParam], refused: bool) -> Family {
+fn shape(
+    mk: &Mk,
+    name: &'static str,
+    params: &[AbiParam],
+    rets: &[AbiParam],
+    refused: bool,
+) -> Family {
     let mut all = vec![p(I64)];
     all.extend_from_slice(params);
     let sig = mk.sig(&all, rets);
@@ -183,13 +197,25 @@ pub fn i128_pairs(mk: &Mk) -> Family {
 /// register to nobody, so the `i64` after it is on the stack too. Returns `rax:rdx` and
 /// `rcx`.
 pub fn i128_lone(mk: &Mk) -> Family {
-    shape(mk, "abi/i128_lone", &ps(&[I64, I64, I64, I64, I128, I64]), &ps(&[I128, I64]), mk.windows())
+    shape(
+        mk,
+        "abi/i128_lone",
+        &ps(&[I64, I64, I64, I64, I128, I64]),
+        &ps(&[I128, I64]),
+        mk.windows(),
+    )
 }
 
 /// AArch64's `i128` at an even register (AAPCS64 skips `x1`, Apple doesn't), until they
 /// spill; two `i128` returns take four registers, which x86-64 doesn't have.
 pub fn i128_even(mk: &Mk) -> Family {
-    shape(mk, "abi/i128_even", &ps(&[I128, I64, I128, I64, I128, I128]), &ps(&[I128, I128]), mk.x64())
+    shape(
+        mk,
+        "abi/i128_even",
+        &ps(&[I128, I64, I128, I64, I128, I128]),
+        &ps(&[I128, I128]),
+        mk.x64(),
+    )
 }
 
 /// Floats past the eight vector registers (Windows: four, by position).
@@ -302,10 +328,8 @@ pub fn struct_args(mk: &Mk) -> Family {
 /// AAPCS64 extends nothing, so there only the low bits are looked at.
 pub fn ext_seen(mk: &Mk) -> Family {
     let whole = mk.extends();
-    let narrow_args = mk.sig(
-        &[p(I8).uext(), p(I8).sext(), p(I16).uext(), p(I16).sext()],
-        &[p(I64)],
-    );
+    let narrow_args =
+        mk.sig(&[p(I8).uext(), p(I8).sext(), p(I16).uext(), p(I16).sext()], &[p(I64)]);
     let wide = mk.sig_of(&[I64], &[I64]);
     let entry = mk.func(0, mk.sig_of(&[I8, I8, I16, I16, I64], &[I64, I64]), |b, v| {
         let raw = import(b, FUNCS, 1, narrow_args.clone(), false);
@@ -422,7 +446,12 @@ mod run {
         }
         let mut data: Vec<&[u8]> = vec![area.as_slice()];
         data.extend(structs.iter().map(|it| it.as_slice()));
-        check(&mk, &family, &inputs, &Opts { data: &data, host: &[], forked: false, interp: false });
+        check(
+            &mk,
+            &family,
+            &inputs,
+            &Opts { data: &data, host: &[], forked: false, interp: false },
+        );
     }
 
     #[test]
@@ -502,11 +531,18 @@ mod run {
         let inputs: Vec<Vec<In>> = (0..16)
             .map(|_| {
                 let mut input = vec![In::Data(0)];
-                input.extend(params[1..].iter().map(|param| In::V(random(&mut rng, param.value_type))));
+                input.extend(
+                    params[1..].iter().map(|param| In::V(random(&mut rng, param.value_type))),
+                );
                 input
             })
             .collect();
-        check(&mk, &family, &inputs, &Opts { data: &[&area[..]], host: &[], forked: false, interp: false });
+        check(
+            &mk,
+            &family,
+            &inputs,
+            &Opts { data: &[&area[..]], host: &[], forked: false, interp: false },
+        );
     }
 
     /// x86-64 only: Cranelift's AArch64 has no `StructArgument`.

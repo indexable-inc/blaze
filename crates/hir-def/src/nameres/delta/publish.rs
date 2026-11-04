@@ -5,10 +5,10 @@
 //! one of this crate the run does not hold.
 
 use base_db::{Crate, Db};
-use hir_expand::name::Name;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_query::db::{Durability, Setter};
+use hir_expand::name::Name;
+use std::alloc::Global;
 use triomphe::Arc;
 
 use super::reads;
@@ -111,7 +111,11 @@ pub(in crate::nameres) fn input_name(db: &Db, id: blaze_query::db::Id, name: Nam
     *input.name(db, name)
 }
 
-pub(in crate::nameres) fn input_legacy_macro(db: &Db, id: blaze_query::db::Id, name: Name) -> Option<&[MacroId]> {
+pub(in crate::nameres) fn input_legacy_macro(
+    db: &Db,
+    id: blaze_query::db::Id,
+    name: Name,
+) -> Option<&[MacroId]> {
     let input = scope_input(id);
     if reads::on() {
         reads::note(input.module(db), None);
@@ -127,7 +131,10 @@ pub(in crate::nameres) fn input_traits(db: &Db, id: blaze_query::db::Id) -> &[Tr
     input.traits(db)
 }
 
-pub(in crate::nameres) fn input_children(db: &Db, id: blaze_query::db::Id) -> &FxIndexMap<Name, ModuleId> {
+pub(in crate::nameres) fn input_children(
+    db: &Db,
+    id: blaze_query::db::Id,
+) -> &FxIndexMap<Name, ModuleId> {
     let input = scope_input(id);
     if reads::on() {
         reads::note(input.module(db), None);
@@ -313,7 +320,16 @@ pub(super) fn set_resolution(
     slot: &mut Option<CrateResolution>,
     new: Assembled,
 ) -> u64 {
-    let Assembled { root, modules, local, data, prelude, macro_use_prelude, session_macros, records } = new;
+    let Assembled {
+        root,
+        modules,
+        local,
+        data,
+        prelude,
+        macro_use_prelude,
+        session_macros,
+        records,
+    } = new;
     let Some(it) = *slot else {
         let it = CrateResolution::new(
             db,

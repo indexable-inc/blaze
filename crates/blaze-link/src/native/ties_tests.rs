@@ -23,12 +23,31 @@ fn object(classes: &[Class], refs: &[(u32, u32)]) -> Object {
         let name = names.push(&format!("s{at}")).unwrap();
         let start = fixups.len() as u32;
         for (k, (_, symbol)) in refs.iter().filter(|it| it.0 == at as u32).enumerate() {
-            fixups.push(NativeFixup { at: k as u64, apply: Apply::Abs64, symbol: *symbol, addend: 0, minus: None });
+            fixups.push(NativeFixup {
+                at: k as u64,
+                apply: Apply::Abs64,
+                symbol: *symbol,
+                addend: 0,
+                minus: None,
+            });
         }
         let what = SectionKind::Alloc(class.clone(), 0);
-        sections.push(Section { name, what, align: 1, data: Data::Zero(16), fixups: start..fixups.len() as u32, retain: false });
+        sections.push(Section {
+            name,
+            what,
+            align: 1,
+            data: Data::Zero(16),
+            fixups: start..fixups.len() as u32,
+            retain: false,
+        });
         let def = SymbolDef::Section { section: at as u32, value: 0, size: 16 };
-        symbols.push(Symbol { name, def, binding: Binding::Local, kind: SymbolKind::Function, hidden: false });
+        symbols.push(Symbol {
+            name,
+            def,
+            binding: Binding::Local,
+            kind: SymbolKind::Function,
+            hidden: false,
+        });
     }
     Object { sections, symbols, fixups, names, ..Object::default() }
 }
@@ -43,7 +62,12 @@ fn graph(objects: Vec<Object>) -> Graph {
     for (n, object) in objects.into_iter().enumerate() {
         check_object(&object, 0).unwrap();
         let named: Vec<NameId> = (0..object.sections.len() as u32)
-            .filter(|at| matches!(object.sections[*at as usize].what, SectionKind::Alloc(Class::Named { .. }, _)))
+            .filter(|at| {
+                matches!(
+                    object.sections[*at as usize].what,
+                    SectionKind::Alloc(Class::Named { .. }, _)
+                )
+            })
             .map(NameId)
             .collect();
         let (symbols, sections) = (object.symbols.len(), object.sections.len() as u32);
@@ -114,8 +138,16 @@ fn a_tied_section_is_kept_exactly_when_what_it_is_tied_to_is() {
     let mut it = object(&classes, &[(4, 0), (5, 1), (5, 6)]);
     it.ties = vec![tie(2, 0), tie(3, 1), tie(4, 0), tie(5, 1)];
     let graph = graph(vec![it]);
-    assert_eq!(kept(&graph, &[(0, 0)]), [(0, 0), (0, 2), (0, 4)], "the live function's counters and PCs, nothing of the dead one's");
-    assert_eq!(kept(&graph, &[(0, 1)]), [(0, 1), (0, 3), (0, 5), (0, 6)], "a kept PC table's relocations are followed");
+    assert_eq!(
+        kept(&graph, &[(0, 0)]),
+        [(0, 0), (0, 2), (0, 4)],
+        "the live function's counters and PCs, nothing of the dead one's"
+    );
+    assert_eq!(
+        kept(&graph, &[(0, 1)]),
+        [(0, 1), (0, 3), (0, 5), (0, 6)],
+        "a kept PC table's relocations are followed"
+    );
     assert_eq!(kept(&graph, &[]), [] as [(u32, u32); 0], "a tied section is no root");
 }
 
@@ -136,14 +168,22 @@ fn a_tied_section_is_no_root_and_no_start_symbol_keeps_it() {
     let untied = graph(vec![it]);
     let parsed = &untied.loads[0].parsed;
     assert_eq!(parsed.roots, [2], "the untied init array only");
-    assert_eq!(parsed.named, [(NameId(4), 4)], "`__start___sancov_cntrs` keeps only the untied counters");
+    assert_eq!(
+        parsed.named,
+        [(NameId(4), 4)],
+        "`__start___sancov_cntrs` keeps only the untied counters"
+    );
     assert_eq!(kept(&untied, &[]), [(0, 2)]);
 
     let mut it = object(&[TEXT, counters()], &[]);
     it.ties = vec![tie(1, 0)];
     it.sections[1].retain = true;
     let retained = graph(vec![it]);
-    assert_eq!(retained.loads[0].parsed.roots, [1], "retain says so itself (lld: before SHF_LINK_ORDER)");
+    assert_eq!(
+        retained.loads[0].parsed.roots,
+        [1],
+        "retain says so itself (lld: before SHF_LINK_ORDER)"
+    );
     assert_eq!(kept(&retained, &[]), [(0, 0), (0, 1)], "and keeps what it is tied to");
 }
 
@@ -155,13 +195,18 @@ fn a_dropped_section_drops_what_is_tied_to_it() {
     let name = it.names.push("f").unwrap();
     it.groups = vec![crate::model::Group { name, sections: 0..1, largest: false }];
     it.grouped = vec![0];
-    it.ties = vec![Tie { section: 1, to: 0, ordered: false }, Tie { section: 2, to: 1, ordered: false }];
+    it.ties =
+        vec![Tie { section: 1, to: 0, ordered: false }, Tie { section: 2, to: 1, ordered: false }];
     let mut b = Build::new();
     b.graph = graph(vec![it]);
     b.discard(0, 0);
     let dropped: Vec<bool> = (0..4).map(|at| b.graph.discarded.get(at)).collect();
     assert_eq!(dropped, [true, true, true, false]);
-    assert_eq!(kept(&b.graph, &[(0, 1), (0, 2), (0, 3)]), [(0, 3)], "nothing dropped is kept by a reference");
+    assert_eq!(
+        kept(&b.graph, &[(0, 1), (0, 2), (0, 3)]),
+        [(0, 3)],
+        "nothing dropped is kept by a reference"
+    );
 }
 
 /// Mach-O: `s0` live, `s1` and `s6` dead; live support `s2` refers to `s0`, `s3` to `s1`,

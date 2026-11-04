@@ -116,7 +116,8 @@ impl Unit {
             ("OPT_LEVEL", self.profile.opt_level.as_str()),
         ];
         let empty = paths.iter().find(|(_, it)| it.is_empty()).map(|(field, _)| *field);
-        let empty = empty.or_else(|| texts.iter().find(|(_, it)| it.is_empty()).map(|(field, _)| *field));
+        let empty =
+            empty.or_else(|| texts.iter().find(|(_, it)| it.is_empty()).map(|(field, _)| *field));
         match empty {
             // alloc: error path.
             Some(field) => Err(Unfilled::Empty { package: package.descr(), field }),

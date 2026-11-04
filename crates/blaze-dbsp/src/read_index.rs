@@ -1,8 +1,8 @@
 use std::hash::Hash;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 /// [`ReadIndex::forget_many`] sweeps once the readers it forgets hold at least one in this many
 /// of the edges: a one-at-a-time forget costs about three probes at random per edge it drops,
@@ -114,9 +114,11 @@ impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
         let Some(&r) = self.by_reader.slot.get(&reader) else { return };
         let items = std::mem::take(&mut self.by_reader.rows[r as usize].items);
         for &(_, k) in &items {
-            let (in_key, _) = self.pairs.remove(&(k, r)).expect("a read index edge without its pair");
+            let (in_key, _) =
+                self.pairs.remove(&(k, r)).expect("a read index edge without its pair");
             if let Some(moved) = self.by_key.remove_at(k, in_key) {
-                self.pairs.get_mut(&(k, moved)).expect("a read index edge without its pair").0 = in_key;
+                self.pairs.get_mut(&(k, moved)).expect("a read index edge without its pair").0 =
+                    in_key;
             }
             if self.by_key.rows[k as usize].items.is_empty() {
                 self.by_key.release(k);

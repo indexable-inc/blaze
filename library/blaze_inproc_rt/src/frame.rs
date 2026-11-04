@@ -70,11 +70,21 @@ pub enum FrameError {
 impl fmt::Display for FrameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FrameError::Short { need, have } => write!(f, "a frame cut short: {need} bytes needed, {have} there"),
-            FrameError::TooLong { len } => write!(f, "a frame body of {len} bytes, past the most of {MOST_BODY}"),
-            FrameError::Reserved { bits } => write!(f, "a frame header with reserved bits {bits:#06x}"),
-            FrameError::Trailing { left } => write!(f, "{left} bytes after the end of a frame body"),
-            FrameError::Kind { kind } => write!(f, "a frame of kind {:#06x} where it was not expected", kind.0),
+            FrameError::Short { need, have } => {
+                write!(f, "a frame cut short: {need} bytes needed, {have} there")
+            }
+            FrameError::TooLong { len } => {
+                write!(f, "a frame body of {len} bytes, past the most of {MOST_BODY}")
+            }
+            FrameError::Reserved { bits } => {
+                write!(f, "a frame header with reserved bits {bits:#06x}")
+            }
+            FrameError::Trailing { left } => {
+                write!(f, "{left} bytes after the end of a frame body")
+            }
+            FrameError::Kind { kind } => {
+                write!(f, "a frame of kind {:#06x} where it was not expected", kind.0)
+            }
             FrameError::Utf8 => f.write_str("a frame string that is not UTF-8"),
             FrameError::Field { what, value } => write!(f, "a frame field {what} of {value}"),
         }

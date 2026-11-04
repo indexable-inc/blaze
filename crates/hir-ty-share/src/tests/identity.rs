@@ -7,7 +7,6 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, coroutine_code, interface_hash, item_key, key, layout_hash};
 use hegel::TestCase;
@@ -30,6 +29,7 @@ use rustc_type_ir::{
     PatternKind, TermKind, ValTreeKind,
     inherent::{GenericArgs as _, IntoKind},
 };
+use std::alloc::Global;
 
 use super::{TestDB, alias, declarations, function};
 use crate::{code, identity, is_plain_data};
@@ -407,7 +407,8 @@ impl<'db> OldSpell<'db> {
                             true => code::of_coroutine_by_move(db, id.0),
                             false => code::of_coroutine(db, id.0),
                         };
-                        let names = code::coroutine_names(db, id.0, by_move).map_err(|it| it.to_string())?;
+                        let names = code::coroutine_names(db, id.0, by_move)
+                            .map_err(|it| it.to_string())?;
                         self.id(&names);
                         *code.as_ref().map_err(ToString::to_string)?
                     }
@@ -421,7 +422,9 @@ impl<'db> OldSpell<'db> {
                 self.id(&key::coroutine_key(db, id.0).0);
                 let code = match self.old {
                     Old::Codegen => {
-                        self.id(&code::coroutine_names(db, id.0, false).map_err(|it| it.to_string())?);
+                        self.id(
+                            &code::coroutine_names(db, id.0, false).map_err(|it| it.to_string())?
+                        );
                         *code::of_coroutine(db, id.0).as_ref().map_err(ToString::to_string)?
                     }
                     Old::Share => coroutine_code(db, id.0).map_err(self.describe())?.0,
@@ -529,7 +532,9 @@ impl<'db> OldSpell<'db> {
                 self.bound_index(index);
                 self.u32(bound.var.as_u32());
             }
-            ConstKind::Alias(..) => return Err(format!("the constant `{konst:?}` is not evaluated")),
+            ConstKind::Alias(..) => {
+                return Err(format!("the constant `{konst:?}` is not evaluated"));
+            }
             ConstKind::Expr(_) => return Err(format!("the constant expression `{konst:?}`")),
             ConstKind::Infer(InferConst::Var(_) | InferConst::Fresh(_)) => {
                 return Err(format!("an inference variable `{konst:?}`"));
@@ -596,9 +601,9 @@ fn old_is_plain_data<'db>(
         TyKind::Array(element, _) | TyKind::Pat(element, _) => {
             old_is_plain_data(db, interner, infcx, param_env, element, depth + 1)
         }
-        TyKind::Tuple(fields) => fields
-            .iter()
-            .all(|it| old_is_plain_data(db, interner, infcx, param_env, it, depth + 1)),
+        TyKind::Tuple(fields) => {
+            fields.iter().all(|it| old_is_plain_data(db, interner, infcx, param_env, it, depth + 1))
+        }
         TyKind::Adt(def, args) => {
             let variants: Vec<hir_def::VariantId> = match def.def_id() {
                 AdtId::StructId(id) => vec![id.into()],
@@ -642,7 +647,12 @@ fn corpus<'db>(db: &'db TestDB) -> Vec<Ty<'db>> {
 
 /// Whether `a` and `b` fail on the same entries and tell the same pairs apart.
 #[track_caller]
-fn agree<A: PartialEq, B: PartialEq>(what: &str, names: &[String], a: &[Option<A>], b: &[Option<B>]) {
+fn agree<A: PartialEq, B: PartialEq>(
+    what: &str,
+    names: &[String],
+    a: &[Option<A>],
+    b: &[Option<B>],
+) {
     assert_eq!(a.len(), b.len());
     for i in 0..a.len() {
         assert_eq!(a[i].is_some(), b[i].is_some(), "{what}: `{}` is spelled by one only", names[i]);
@@ -723,7 +733,8 @@ fn constants_and_argument_lists_agree_with_the_old_spellings() {
         let names: Vec<String> = konsts.iter().map(|it| format!("{it:?}")).collect();
         let one: Vec<_> = konsts.iter().map(|&it| identity::konst(&db, it).ok()).collect();
         for old in [Old::Codegen, Old::Share] {
-            let then: Vec<_> = konsts.iter().map(|&it| OldSpell::konst_of(&db, old, it).ok()).collect();
+            let then: Vec<_> =
+                konsts.iter().map(|&it| OldSpell::konst_of(&db, old, it).ok()).collect();
             agree(&format!("{old:?}'s constants"), &names, &one, &then);
         }
 
@@ -733,7 +744,10 @@ fn constants_and_argument_lists_agree_with_the_old_spellings() {
             .flat_map(|&a| {
                 [
                     GenericArgs::new_from_slice(&[GenericArg::from(a)]),
-                    GenericArgs::new_from_slice(&[GenericArg::from(a), GenericArg::from(konsts[1])]),
+                    GenericArgs::new_from_slice(&[
+                        GenericArg::from(a),
+                        GenericArg::from(konsts[1]),
+                    ]),
                 ]
             })
             .collect();
@@ -837,7 +851,8 @@ fn ty_text(tc: &TestCase, depth: u32) -> String {
 fn random_types_agree_with_both_old_spellings(tc: TestCase) {
     let len: usize = tc.draw(gs::integers().min_value(1).max_value(9));
     let texts: Vec<String> = (0..len).map(|_| ty_text(&tc, 3)).collect();
-    let mut program = String::from("pub struct P(pub u32);\npub struct Q(pub u32);\npub struct W<T>(pub T);\n");
+    let mut program =
+        String::from("pub struct P(pub u32);\npub struct Q(pub u32);\npub struct W<T>(pub T);\n");
     for (at, text) in texts.iter().enumerate() {
         program.push_str(&format!("pub type A{at} = {text};\npub type B{at} = {text};\n"));
     }

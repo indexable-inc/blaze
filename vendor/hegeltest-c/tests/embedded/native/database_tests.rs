@@ -436,9 +436,7 @@ fn atomic_write_cleans_up_when_the_write_fails() {
 }
 
 fn clone_value(children: Vec<ChoiceValue>) -> ChoiceValue {
-    ChoiceValue::Clone(std::sync::Arc::new(
-        crate::native::core::CloneRecord::from_values(children),
-    ))
+    ChoiceValue::Clone(std::sync::Arc::new(crate::native::core::CloneRecord::from_values(children)))
 }
 
 #[test]
@@ -461,14 +459,7 @@ fn serialize_clone_drops_realized_info_but_preserves_equality() {
     use crate::native::core::{ChoiceNode, CloneRecord, Span};
     let realized = ChoiceValue::Clone(std::sync::Arc::new(CloneRecord::from_run(
         vec![ChoiceNode::boolean(BooleanChoice { p: 0.5 }, true, false)],
-        vec![Span {
-            start: 0,
-            end: 1,
-            label: 9,
-            depth: 0,
-            parent: None,
-            discarded: false,
-        }],
+        vec![Span { start: 0, end: 1, label: 9, depth: 0, parent: None, discarded: false }],
     )));
     let bytes = serialize_choices(std::slice::from_ref(&realized)).unwrap();
     let round_tripped = deserialize_choices(&bytes).unwrap();
@@ -523,9 +514,7 @@ fn deserialize_rejects_clone_nesting_beyond_max_depth() {
 fn nested_clones(depth: usize) -> Vec<ChoiceValue> {
     let mut choices = vec![ChoiceValue::Boolean(true)];
     for _ in 0..depth {
-        choices = vec![ChoiceValue::Clone(std::sync::Arc::new(
-            CloneRecord::from_values(choices),
-        ))];
+        choices = vec![ChoiceValue::Clone(std::sync::Arc::new(CloneRecord::from_values(choices)))];
     }
     choices
 }
@@ -557,14 +546,8 @@ fn nested_clone_nodes(depth: usize) -> Vec<ChoiceNode> {
 fn serialize_nodes_matches_serialize_choices_at_max_depth() {
     let nodes = nested_clone_nodes(MAX_CLONE_DEPTH);
     let choices: Vec<ChoiceValue> = nodes.iter().map(|n| n.value()).collect();
-    assert_eq!(
-        serialize_nodes(&nodes).unwrap(),
-        serialize_choices(&choices).unwrap()
-    );
-    assert_eq!(
-        deserialize_choices(&serialize_nodes(&nodes).unwrap()),
-        Some(choices)
-    );
+    assert_eq!(serialize_nodes(&nodes).unwrap(), serialize_choices(&choices).unwrap());
+    assert_eq!(deserialize_choices(&serialize_nodes(&nodes).unwrap()), Some(choices));
 }
 
 #[test]

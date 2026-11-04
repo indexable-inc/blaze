@@ -570,7 +570,12 @@ pub fn for_each_giving_way(
 /// alone: an item knows it will run again exactly when its unwind counted a give-way
 /// ([`pump::gave_way`]), wherever it ran. A rerun that gives way again, and any other panic,
 /// goes on to the caller (the first other panic once every thread stopped claiming).
-fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn(&mut St, Range<usize>) + Sync) {
+fn split<St>(
+    len: usize,
+    again: bool,
+    init: impl Fn() -> St + Sync,
+    run: impl Fn(&mut St, Range<usize>) + Sync,
+) {
     if len == 0 {
         return;
     }
@@ -600,7 +605,9 @@ fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn
             }
             for at in range {
                 let before = pump::gave_way();
-                let one = catch_unwind(AssertUnwindSafe(|| run(state.get_or_insert_with(&init), at..at + 1)));
+                let one = catch_unwind(AssertUnwindSafe(|| {
+                    run(state.get_or_insert_with(&init), at..at + 1)
+                }));
                 let Err(it) = one else { continue };
                 if pump::gave_way() == before {
                     resume_unwind(it);
@@ -747,13 +754,18 @@ where
 pub fn for_each<I: IntoSource>(items: I, f: impl Fn(I::Item) + Sync) {
     let items = items.into_source();
     let len = items.len();
-    split(len, <I::Source as Source>::AGAIN, || (), |(), range| {
-        for at in range {
-            // SAFETY: `split` gives each index below `len` once, or again after its call
-            // unwound when `AGAIN` allows.
-            f(unsafe { items.item(at) });
-        }
-    });
+    split(
+        len,
+        <I::Source as Source>::AGAIN,
+        || (),
+        |(), range| {
+            for at in range {
+                // SAFETY: `split` gives each index below `len` once, or again after its call
+                // unwound when `AGAIN` allows.
+                f(unsafe { items.item(at) });
+            }
+        },
+    );
     // SAFETY: every index was taken; nothing from `len` on was.
     unsafe { items.rest(len) };
 }
@@ -769,22 +781,27 @@ where
     let len = items.len();
     let first = AtomicUsize::new(usize::MAX);
     let found: Lock<Option<(usize, R)>> = Lock::new(None);
-    split(len, <I::Source as Source>::AGAIN, || (), |(), range| {
-        for at in range {
-            // SAFETY: as in `for_each`.
-            let item = unsafe { items.item(at) };
-            if at > first.load(Ordering::Relaxed) {
-                continue;
-            }
-            if let Some(made) = f(item) {
-                first.fetch_min(at, Ordering::Relaxed);
-                let mut found = found.lock_said("a search's find");
-                if found.as_ref().is_none_or(|&(was, _)| at < was) {
-                    *found = Some((at, made));
+    split(
+        len,
+        <I::Source as Source>::AGAIN,
+        || (),
+        |(), range| {
+            for at in range {
+                // SAFETY: as in `for_each`.
+                let item = unsafe { items.item(at) };
+                if at > first.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if let Some(made) = f(item) {
+                    first.fetch_min(at, Ordering::Relaxed);
+                    let mut found = found.lock_said("a search's find");
+                    if found.as_ref().is_none_or(|&(was, _)| at < was) {
+                        *found = Some((at, made));
+                    }
                 }
             }
-        }
-    });
+        },
+    );
     // SAFETY: every index was taken; nothing from `len` on was.
     unsafe { items.rest(len) };
     found.into_inner().map(|(_, it)| it)
@@ -853,7 +870,9 @@ mod tests {
                     let items: Vec<u64> = (0..64).collect();
                     super::map(&items, |&it| {
                         let mut got = 0;
-                        inner.scope(|scope| scope.submit(None, || it * 2, |made| got = made.unwrap()));
+                        inner.scope(|scope| {
+                            scope.submit(None, || it * 2, |made| got = made.unwrap())
+                        });
                         got
                     })
                 },
@@ -862,7 +881,9 @@ mod tests {
         }
         let want: Vec<u64> = (0..64).map(|it| it * 2).collect();
         for _ in 0..2 {
-            let got = rx.recv_timeout(LONG).expect("each map finishes rather than waiting on a second pool");
+            let got = rx
+                .recv_timeout(LONG)
+                .expect("each map finishes rather than waiting on a second pool");
             assert_eq!(got, want);
         }
     }
@@ -894,9 +915,11 @@ mod tests {
                             |it| asked = Some(it.unwrap()),
                         );
                         // Busy here, so the job is the other worker's.
-                        crate::spin::SpinWait::within("the other worker to start the scope's job", LONG, || {
-                            started.load(Ordering::Acquire)
-                        });
+                        crate::spin::SpinWait::within(
+                            "the other worker to start the scope's job",
+                            LONG,
+                            || started.load(Ordering::Acquire),
+                        );
                     });
                     Ok(())
                 });
@@ -905,7 +928,8 @@ mod tests {
             },
             move |it| _ = tx.send(it.unwrap()),
         );
-        let asked = rx.recv_timeout(LONG).expect("the job gives way rather than wait on its scope's owner");
+        let asked =
+            rx.recv_timeout(LONG).expect("the job gives way rather than wait on its scope's owner");
         assert_eq!(asked, Err(Cancelled));
     }
 
@@ -935,9 +959,11 @@ mod tests {
                             },
                             |it| asked = Some(it.unwrap()),
                         );
-                        crate::spin::SpinWait::within("the other worker's ask to link to the key's run or be answered", LONG, || {
-                            flights.waiters(key) >= 1 || answered.load(Ordering::Acquire)
-                        });
+                        crate::spin::SpinWait::within(
+                            "the other worker's ask to link to the key's run or be answered",
+                            LONG,
+                            || flights.waiters(key) >= 1 || answered.load(Ordering::Acquire),
+                        );
                         Ok(5)
                     });
                     assert_eq!(ran, Ok(5));
@@ -947,7 +973,10 @@ mod tests {
             move |it| _ = tx.send(it.unwrap()),
         );
         let asked = rx.recv_timeout(LONG).expect("the job's wait ends with the owner's run");
-        assert!(asked.is_ok(), "the job was refused a key its owner ends before waiting: {asked:?}");
+        assert!(
+            asked.is_ok(),
+            "the job was refused a key its owner ends before waiting: {asked:?}"
+        );
     }
 
     /// A loop inside a key's run whose items, on another worker, ask for that key: each gives
@@ -969,7 +998,9 @@ mod tests {
                 let ran = flights.get_or_run(key, || {
                     made = super::map(0..64, |at| {
                         runs[at].fetch_add(1, Ordering::Relaxed);
-                        if std::thread::current().id() != caller && flights.get_or_run(key, || Ok(())).is_err() {
+                        if std::thread::current().id() != caller
+                            && flights.get_or_run(key, || Ok(())).is_err()
+                        {
                             std::panic::resume_unwind(Box::new("gave way"));
                         }
                         at * 2
@@ -1043,7 +1074,11 @@ mod tests {
             })
         }));
         assert_eq!(caught.unwrap_err().downcast_ref::<&str>(), Some(&"item 3 failed"));
-        assert_eq!(runs.load(Ordering::Relaxed), 4, "the loop stops claiming at the failure, and reruns nothing");
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            4,
+            "the loop stops claiming at the failure, and reruns nothing"
+        );
     }
 
     /// self10's livelock: a task that runs a key gives a batch whose every task asks for that
@@ -1081,7 +1116,8 @@ mod tests {
             },
             move |it| _ = tx.send(it.unwrap()),
         );
-        let (again, runs) = rx.recv_timeout(LONG).expect("the batch ends rather than run its give-ways again");
+        let (again, runs) =
+            rx.recv_timeout(LONG).expect("the batch ends rather than run its give-ways again");
         assert_eq!(again, [0, 3, 6, 9]);
         assert_eq!(runs, [1; 12]);
     }
@@ -1099,16 +1135,20 @@ mod tests {
         let flights = Arc::new(Flights::<usize>::new());
         let (k, q) = (Key([21; 32]), Key([22; 32]));
         let c_runs_k = Arc::new(AtomicBool::new(false));
-        let runs: Arc<Vec<AtomicUsize>> = Arc::new((0..ITEMS).map(|_| AtomicUsize::new(0)).collect());
+        let runs: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..ITEMS).map(|_| AtomicUsize::new(0)).collect());
         let (tx, rx) = unbounded::<(char, String)>();
         {
-            let (flights, c_runs_k, runs, tx) = (Arc::clone(&flights), Arc::clone(&c_runs_k), Arc::clone(&runs), tx.clone());
+            let (flights, c_runs_k, runs, tx) =
+                (Arc::clone(&flights), Arc::clone(&c_runs_k), Arc::clone(&runs), tx.clone());
             pool.submit(
                 None,
                 move || {
                     flights.get_or_run(k, || {
                         c_runs_k.store(true, Ordering::Release);
-                        crate::spin::SpinWait::within("T to wait on K", LONG, || flights.waiters(k) == 1 && waiting_on_me() == 1);
+                        crate::spin::SpinWait::within("T to wait on K", LONG, || {
+                            flights.waiters(k) == 1 && waiting_on_me() == 1
+                        });
                         let made = super::map(0..ITEMS, |at| {
                             runs[at].fetch_add(1, Ordering::Relaxed);
                             if flights.get_or_run(q, || Ok(0)).is_err() {
@@ -1138,7 +1178,9 @@ mod tests {
                 None,
                 move || {
                     flights.get_or_run(q, || {
-                        crate::spin::SpinWait::within("C to run K", LONG, || c_runs_k.load(Ordering::Acquire));
+                        crate::spin::SpinWait::within("C to run K", LONG, || {
+                            c_runs_k.load(Ordering::Acquire)
+                        });
                         flights.get_or_run(k, || Ok(5))
                     })
                 },
@@ -1151,7 +1193,11 @@ mod tests {
         }
         let runs: Vec<usize> = runs.iter().map(|it| it.load(Ordering::Relaxed)).collect();
         let never: Vec<usize> = (0..ITEMS).filter(|&at| runs[at] == 0).collect();
-        assert!(never.is_empty(), "items never run in the loop's first pass: {} of {ITEMS}; heard {heard:?}", never.len());
+        assert!(
+            never.is_empty(),
+            "items never run in the loop's first pass: {} of {ITEMS}; heard {heard:?}",
+            never.len()
+        );
     }
 
     /// An immediate-retry loop around a one-item loop, on a job that runs K, which the run of Q
@@ -1174,16 +1220,19 @@ mod tests {
                     let mut said = String::new();
                     let ran = flights.get_or_run(k, || {
                         c_runs_k.store(true, Ordering::Release);
-                        crate::spin::SpinWait::within("T to wait on K", LONG, || flights.waiters(k) == 1 && waiting_on_me() == 1);
+                        crate::spin::SpinWait::within("T to wait on K", LONG, || {
+                            flights.waiters(k) == 1 && waiting_on_me() == 1
+                        });
                         for pass in 0..PASSES {
-                            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                super::map(0..1, |at| {
-                                    if flights.get_or_run(q, || Ok(0)).is_err() {
-                                        std::panic::resume_unwind(Box::new("gave way"));
-                                    }
-                                    at
-                                })
-                            }));
+                            let ran =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    super::map(0..1, |at| {
+                                        if flights.get_or_run(q, || Ok(0)).is_err() {
+                                            std::panic::resume_unwind(Box::new("gave way"));
+                                        }
+                                        at
+                                    })
+                                }));
                             match ran {
                                 Ok(_) => {
                                     said = format!("ended at pass {pass}");
@@ -1211,7 +1260,9 @@ mod tests {
                 None,
                 move || {
                     flights.get_or_run(q, || {
-                        crate::spin::SpinWait::within("C to run K", LONG, || c_runs_k.load(Ordering::Acquire));
+                        crate::spin::SpinWait::within("C to run K", LONG, || {
+                            c_runs_k.load(Ordering::Acquire)
+                        });
                         flights.get_or_run(k, || Ok(5))
                     })
                 },
@@ -1246,9 +1297,13 @@ mod tests {
                     let mut said = String::new();
                     let ran = flights.get_or_run(k, || {
                         c_runs_k.store(true, Ordering::Release);
-                        crate::spin::SpinWait::within("T1 and T2 to wait on K", LONG, || flights.waiters(k) == 2 && waiting_on_me() == 2);
+                        crate::spin::SpinWait::within("T1 and T2 to wait on K", LONG, || {
+                            flights.waiters(k) == 2 && waiting_on_me() == 2
+                        });
                         for ask in 0..ASKS {
-                            let got = flights.get_or_run(q1, || Ok(0)).or_else(|_| flights.get_or_run(q2, || Ok(0)));
+                            let got = flights
+                                .get_or_run(q1, || Ok(0))
+                                .or_else(|_| flights.get_or_run(q2, || Ok(0)));
                             if got.is_ok() {
                                 said = format!("ended at ask {ask}");
                                 return Ok(0);
@@ -1274,7 +1329,9 @@ mod tests {
                 None,
                 move || {
                     flights.get_or_run(q, || {
-                        crate::spin::SpinWait::within("C to run K", LONG, || c_runs_k.load(Ordering::Acquire));
+                        crate::spin::SpinWait::within("C to run K", LONG, || {
+                            c_runs_k.load(Ordering::Acquire)
+                        });
                         flights.get_or_run(k, || Ok(5))
                     })
                 },
@@ -1341,9 +1398,11 @@ mod tests {
             let key = round_key(round);
             let ran = flights.get_or_run(key, || {
                 hold(flights, round, held);
-                crate::spin::SpinWait::within("a window of items to wait on its round's key", LONG, || {
-                    flights.waiters(key) >= WINDOW
-                });
+                crate::spin::SpinWait::within(
+                    "a window of items to wait on its round's key",
+                    LONG,
+                    || flights.waiters(key) >= WINDOW,
+                );
                 Ok(())
             });
             assert_eq!(ran, Ok(()), "the holder's run of round {round}");
@@ -1355,16 +1414,24 @@ mod tests {
         let (tx, rx) = unbounded::<(char, String)>();
         {
             let (flights, held, tx) = (Arc::clone(&flights), Arc::clone(&held), tx.clone());
-            pool.submit(None, move || hold(&flights, ROUNDS, &held), move |ran| {
-                _ = tx.send(('h', format!("{:?}", ran.map_err(|_| "panicked"))));
-            });
+            pool.submit(
+                None,
+                move || hold(&flights, ROUNDS, &held),
+                move |ran| {
+                    _ = tx.send(('h', format!("{:?}", ran.map_err(|_| "panicked"))));
+                },
+            );
         }
         {
             let (flights, held, tx) = (Arc::clone(&flights), Arc::clone(&held), tx.clone());
             pool.submit(
                 None,
                 move || {
-                    crate::spin::SpinWait::within("the holder to hold every round's key", LONG, || held.load(Ordering::Acquire));
+                    crate::spin::SpinWait::within(
+                        "the holder to hold every round's key",
+                        LONG,
+                        || held.load(Ordering::Acquire),
+                    );
                     assert_eq!(super::threads(), WORKERS);
                     let live = AtomicUsize::new(0);
                     let most = AtomicUsize::new(0);
@@ -1381,9 +1448,13 @@ mod tests {
                         },
                         |_| false,
                     );
-                    let runs: Vec<usize> = runs.iter().map(|it| it.load(Ordering::Relaxed)).collect();
+                    let runs: Vec<usize> =
+                        runs.iter().map(|it| it.load(Ordering::Relaxed)).collect();
                     let never: Vec<usize> = (0..ITEMS).filter(|&at| runs[at] != 1).collect();
-                    format!("again {again:?}, most {}, not run once {never:?}", most.load(Ordering::SeqCst))
+                    format!(
+                        "again {again:?}, most {}, not run once {never:?}",
+                        most.load(Ordering::SeqCst)
+                    )
                 },
                 move |ran| _ = tx.send(('l', ran.unwrap_or_else(|_| "panicked".to_owned()))),
             );
@@ -1396,7 +1467,10 @@ mod tests {
         assert_eq!(holder.1, "Ok(())", "heard {heard:?}");
         let looped = heard.iter().find(|(who, _)| *who == 'l').expect("the loop said");
         let want = format!("again [], most {WINDOW}, not run once []");
-        assert_eq!(looped.1, want, "at most a window of {WINDOW} items started at once, each run once; heard {heard:?}");
+        assert_eq!(
+            looped.1, want,
+            "at most a window of {WINDOW} items started at once, each run once; heard {heard:?}"
+        );
     }
 
     /// Seeded loops of every shape against the same loops run in order, on pools of one to
@@ -1412,7 +1486,10 @@ mod tests {
 
             assert_eq!(super::map(&items, f), items.iter().map(f).collect::<Vec<_>>());
             let odd = |it: &u64| (it % 2 == 1).then(|| f(it));
-            assert_eq!(super::filter_map(&items, odd), items.iter().filter_map(odd).collect::<Vec<_>>());
+            assert_eq!(
+                super::filter_map(&items, odd),
+                items.iter().filter_map(odd).collect::<Vec<_>>()
+            );
             let owned: Vec<String> = items.iter().map(|it| it.to_string()).collect();
             let lens = super::map(owned.clone(), |it: String| it.len());
             assert_eq!(lens, owned.iter().map(String::len).collect::<Vec<_>>());
@@ -1428,15 +1505,22 @@ mod tests {
 
             let size = 1 + rng.below(40) as usize;
             let mut pieces = items.clone();
-            super::for_each(super::enumerate(super::chunks_mut(&mut pieces, size)), |(at, piece)| {
-                for it in piece {
-                    *it += at as u64;
-                }
-            });
-            let want: Vec<u64> = items.iter().enumerate().map(|(at, it)| it + (at / size) as u64).collect();
+            super::for_each(
+                super::enumerate(super::chunks_mut(&mut pieces, size)),
+                |(at, piece)| {
+                    for it in piece {
+                        *it += at as u64;
+                    }
+                },
+            );
+            let want: Vec<u64> =
+                items.iter().enumerate().map(|(at, it)| it + (at / size) as u64).collect();
             assert_eq!(pieces, want);
             let sums = super::map(super::chunks(&items, size), |piece| piece.iter().sum::<u64>());
-            assert_eq!(sums, items.chunks(size).map(|piece| piece.iter().sum::<u64>()).collect::<Vec<_>>());
+            assert_eq!(
+                sums,
+                items.chunks(size).map(|piece| piece.iter().sum::<u64>()).collect::<Vec<_>>()
+            );
             let rising = super::map(super::windows(&items, 2), |pair| pair[0] < pair[1]);
             assert_eq!(rising, items.windows(2).map(|pair| pair[0] < pair[1]).collect::<Vec<_>>());
 
@@ -1447,9 +1531,14 @@ mod tests {
             let target = rng.below(1 << 20);
             let big = |it: &u64| (*it >= target).then_some(*it);
             assert_eq!(super::find_map_first(&items, big), items.iter().find_map(big));
-            let first_at = super::find_map_first(super::enumerate(&items), |(at, it)| (*it >= target).then_some(at));
+            let first_at = super::find_map_first(super::enumerate(&items), |(at, it)| {
+                (*it >= target).then_some(at)
+            });
             assert_eq!(first_at, items.iter().position(|it| *it >= target));
-            assert_eq!(super::any(&items, |it| *it >= target), items.iter().any(|it| *it >= target));
+            assert_eq!(
+                super::any(&items, |it| *it >= target),
+                items.iter().any(|it| *it >= target)
+            );
             assert_eq!(super::all(&items, |it| *it < target), items.iter().all(|it| *it < target));
 
             let inits = AtomicUsize::new(0);
@@ -1465,7 +1554,10 @@ mod tests {
                 },
             );
             assert_eq!(made, items);
-            assert!(inits.load(Ordering::Relaxed) <= super::threads(), "one state per thread at most");
+            assert!(
+                inits.load(Ordering::Relaxed) <= super::threads(),
+                "one state per thread at most"
+            );
 
             let (sum, count) = super::join(|| items.iter().sum::<u64>(), || items.len());
             assert_eq!((sum, count), (items.iter().sum::<u64>(), len));
@@ -1503,7 +1595,9 @@ mod tests {
             let make = |n: usize| (0..n).map(|_| Counted(Arc::clone(&drops))).collect::<Vec<_>>();
             super::for_each(make(1000), drop);
             assert_eq!(drops.swap(0, Ordering::SeqCst), 1000);
-            let found = super::find_map_first(super::enumerate(make(1000)), |(at, it)| (at == 10).then_some(it));
+            let found = super::find_map_first(super::enumerate(make(1000)), |(at, it)| {
+                (at == 10).then_some(it)
+            });
             assert!(found.is_some());
             assert_eq!(drops.swap(0, Ordering::SeqCst), 999);
             drop(found);
@@ -1533,6 +1627,9 @@ mod tests {
         let text = panic.downcast_ref::<String>().map_or("", String::as_str);
         assert!(text.contains("item five thousand"), "{text}");
         assert!(*ran.lock() < 10_000);
-        assert_eq!(pool.install(|| super::map(0..100usize, |it| it + 1)), (1..101).collect::<Vec<_>>());
+        assert_eq!(
+            pool.install(|| super::map(0..100usize, |it| it + 1)),
+            (1..101).collect::<Vec<_>>()
+        );
     }
 }

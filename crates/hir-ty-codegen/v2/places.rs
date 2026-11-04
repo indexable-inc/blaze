@@ -9,17 +9,17 @@ use std::{
     hash::BuildHasher as _,
 };
 
+use base_db::{Crate, Db};
 use blaze_codegen::{Target, backend::FrontRef, template::Refs};
+use blaze_hash::FixedState;
 use blaze_mem::Frame;
 use cranelift_codegen::ir;
 use hashbrown::HashTable;
-use blaze_hash::FixedState;
 use hir_def::{
     FunctionId, ItemContainerId, Lookup, StaticId,
     attrs::AttrFlags,
     signatures::{FunctionSignature, StaticSignature},
 };
-use base_db::{Db, Crate};
 use hir_ty::{
     db::HirDatabase,
     next_solver::{
@@ -47,10 +47,7 @@ pub(crate) type Ref = FrontRef<HirInstance, HirStatic>;
 pub(crate) const PERSONALITY: &str = crate::unwind::PERSONALITY;
 
 /// The reference a function request of the IR builder is.
-pub(crate) fn func_ref(
-    db: &Db,
-    target: &FuncTarget,
-) -> Result<Ref, String> {
+pub(crate) fn func_ref(db: &Db, target: &FuncTarget) -> Result<Ref, String> {
     match target {
         // clone: `FrontRef::Extern` owns its name; `place_requests` places a symbol by `&str`
         FuncTarget::Symbol(symbol) => Ok(FrontRef::Extern(symbol.clone())),
@@ -60,7 +57,9 @@ pub(crate) fn func_ref(
         }
         FuncTarget::Instance(instance, env) => instance_ref(db, instance, env),
         // clone: only a call of an `asm!` block's function, whose `Kind::Asm` owns its text
-        FuncTarget::Asm(text) => Ok(FrontRef::Function(HirInstance(Kind::Asm(text.clone(), false)))),
+        FuncTarget::Asm(text) => {
+            Ok(FrontRef::Function(HirInstance(Kind::Asm(text.clone(), false))))
+        }
     }
 }
 
@@ -120,11 +119,15 @@ fn bodyless(
             }
             Ok(symbol)
         }
-        ItemContainerId::TraitId(_) => match db.lookup_impl_method_or_why(env.as_ref(db), func, args) {
-            Err(why) => Err(crate::no_impl_method(db, func, args, why)),
-            // alloc: the error's message
-            Ok(_) => Err(format!("a call of the trait method `{name}`, not of the impl's method it resolves to")),
-        },
+        ItemContainerId::TraitId(_) => {
+            match db.lookup_impl_method_or_why(env.as_ref(db), func, args) {
+                Err(why) => Err(crate::no_impl_method(db, func, args, why)),
+                // alloc: the error's message
+                Ok(_) => Err(format!(
+                    "a call of the trait method `{name}`, not of the impl's method it resolves to"
+                )),
+            }
+        }
         _ if FunctionSignature::is_intrinsic(db, func) => {
             // alloc: the error's message
             Err(format!("a call of the intrinsic `{name}`, which has no fallback body"))
@@ -259,7 +262,11 @@ impl<'a, A: Allocator> Placer<'a, A> {
     }
 
     /// [`Self::place`], an error naming the reference by `name`.
-    fn place_named(&mut self, it: Ref, name: impl FnOnce(&Ref, &[Ref]) -> String) -> Result<u32, String> {
+    fn place_named(
+        &mut self,
+        it: Ref,
+        name: impl FnOnce(&Ref, &[Ref]) -> String,
+    ) -> Result<u32, String> {
         let hashed = hash(&it);
         let refs = &self.refs;
         if let Some(&place) = self.index.find(hashed, |&at| refs[at as usize] == it) {
@@ -267,7 +274,10 @@ impl<'a, A: Allocator> Placer<'a, A> {
         }
         if !self.open {
             // alloc: the error's message
-            return Err(format!("the IR asks for {}, which its references do not list", name(&it, refs)));
+            return Err(format!(
+                "the IR asks for {}, which its references do not list",
+                name(&it, refs)
+            ));
         }
         self.add(hashed, it)
     }
@@ -310,7 +320,9 @@ fn ref_name(db: &Db, it: &Ref) -> String {
     match it {
         FrontRef::Function(instance) => super::Named(db, instance).to_string(), // alloc: the error's message
         // alloc: the error's message
-        FrontRef::Static(HirStatic(id)) => format!("the static `{}`", StaticSignature::of(db, *id).name.as_str()),
+        FrontRef::Static(HirStatic(id)) => {
+            format!("the static `{}`", StaticSignature::of(db, *id).name.as_str())
+        }
         FrontRef::Extern(name) => format!("the symbol `{name}`"), // alloc: the error's message
         FrontRef::Weak(name) => format!("the weak symbol `{name}`"), // alloc: the error's message
     }
@@ -346,7 +358,9 @@ pub(crate) fn place_requests<A: Allocator>(
     for request in &requests.funcs {
         let place = match &request.target {
             FuncTarget::Symbol(symbol) => placer.symbol(symbol)?,
-            target => placer.place_named(func_ref(db, target)?, |it, refs| unlisted(db, it, refs))?,
+            target => {
+                placer.place_named(func_ref(db, target)?, |it, refs| unlisted(db, it, refs))?
+            }
         };
         funcs.push(place);
     }
@@ -357,9 +371,9 @@ pub(crate) fn place_requests<A: Allocator>(
                 fill_type_ids(db, hashes, krate, blob)?;
                 DataPlace::Own
             }
-            DataRequest::Static(id) => {
-                DataPlace::Place(placer.place_named(static_ref(db, *id)?, |it, refs| unlisted(db, it, refs))?)
-            }
+            DataRequest::Static(id) => DataPlace::Place(
+                placer.place_named(static_ref(db, *id)?, |it, refs| unlisted(db, it, refs))?,
+            ),
             DataRequest::Location(Some((owner, span))) => {
                 DataPlace::Position(hashes.span(db, *owner, *span)?)
             }
@@ -388,11 +402,7 @@ pub(crate) fn place_requests<A: Allocator>(
 /// (rustc's `TypingEnv::fully_monomorphized`). Monomorphization normalizes the aliases of a
 /// body's types but leaves their constants unevaluated: `[u8; N]` of a `const N`. One with
 /// neither, as nearly every one, is given back with nothing made.
-pub(crate) fn evaluated<'db, T>(
-    db: &'db Db,
-    krate: Option<Crate>,
-    value: T,
-) -> Result<T, String>
+pub(crate) fn evaluated<'db, T>(db: &'db Db, krate: Option<Crate>, value: T) -> Result<T, String>
 where
     T: TypeFoldable<DbInterner<'db>> + std::fmt::Debug + Copy,
 {
@@ -589,7 +599,9 @@ mod tests {
         use super::{super::convert::Resolver as _, resolve};
         let places = super::Places { funcs: Vec::new(), datas: Vec::new(), refs: 2 };
         let refs = [Target::Extern("memcpy".to_owned()), Target::Extern("memset".to_owned())];
-        let found = resolve(&places, &refs, |it| [it.symbol("memset"), it.symbol("memcpy"), it.symbol("bcmp")]);
+        let found = resolve(&places, &refs, |it| {
+            [it.symbol("memset"), it.symbol("memcpy"), it.symbol("bcmp")]
+        });
         let [memset, memcpy, bcmp] = found;
         assert_eq!(memset, Ok(refs[1].clone()));
         assert_eq!(memcpy, Ok(refs[0].clone()));

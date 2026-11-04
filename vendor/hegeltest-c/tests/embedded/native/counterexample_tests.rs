@@ -35,24 +35,14 @@ fn int_node(value: i128) -> ChoiceNode {
 }
 
 fn span(label: u64, start: usize, end: usize) -> Span {
-    Span {
-        label,
-        start,
-        end,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    }
+    Span { label, start, end, depth: 0, parent: None, discarded: false }
 }
 
 fn graph_of(values: &[i128]) -> Graph {
     Graph::from_run(&Run {
         steps: values
             .iter()
-            .map(|&v| Step {
-                addr: Vec::new(),
-                value: ChoiceValue::Integer(BigInt::from(v)),
-            })
+            .map(|&v| Step { addr: Vec::new(), value: ChoiceValue::Integer(BigInt::from(v)) })
             .collect(),
     })
 }
@@ -79,15 +69,8 @@ fn adopt_founds_then_only_shortlex_displaces() {
     let mut c = Counterexample::default();
     assert!(c.adopt(vec![int_node(5), int_node(5)], vec![span(3, 0, 2)]));
     assert_eq!(c.incumbent_spans().len(), 1);
-    assert!(
-        !c.adopt(vec![int_node(9), int_node(9)], Vec::new()),
-        "shortlex-larger"
-    );
-    assert_eq!(
-        c.incumbent_spans().len(),
-        1,
-        "a rejected adopt changes nothing"
-    );
+    assert!(!c.adopt(vec![int_node(9), int_node(9)], Vec::new()), "shortlex-larger");
+    assert_eq!(c.incumbent_spans().len(), 1, "a rejected adopt changes nothing");
     assert!(c.adopt(vec![int_node(7)], Vec::new()), "shorter wins");
     assert_eq!(c.incumbent().unwrap(), &[int_node(7)]);
     assert!(c.incumbent_spans().is_empty());
@@ -112,10 +95,7 @@ fn rejection_evicts_the_incumbent_but_keeps_the_evidence() {
     assert_eq!(c.reject((1, 10)), Some(vec![int_node(1)]));
     assert!(c.incumbent().is_none());
     assert!(c.incumbent_spans().is_empty(), "the spans go with it");
-    assert!(
-        c.adopt(vec![int_node(2)], Vec::new()),
-        "a re-sighting founds again"
-    );
+    assert!(c.adopt(vec![int_node(2)], Vec::new()), "a re-sighting founds again");
     assert_eq!(c.reject((2, 30)), Some(vec![int_node(2)]));
     assert_eq!(
         c.caveat().as_deref(),
@@ -133,10 +113,7 @@ fn an_unconfirmed_origin_replays_as_its_incumbents_run() {
     assert!(c.graph().is_none());
     let graph = c.replay_graph().unwrap();
     assert_eq!(graph.edge_count(), 2);
-    assert_eq!(
-        graph.walk_verdict(&c.incumbent_run().unwrap()),
-        Walked::Whole
-    );
+    assert_eq!(graph.walk_verdict(&c.incumbent_run().unwrap()), Walked::Whole);
     assert_eq!(c.longest(), 2, "floored at the incumbent");
 }
 
@@ -144,8 +121,7 @@ fn an_unconfirmed_origin_replays_as_its_incumbents_run() {
 fn confirmation_stores_replay_state_and_the_witness_is_taken_once() {
     let mut c = Counterexample::default();
     c.adopt(vec![int_node(1)], Vec::new());
-    c.confirm(0.4, Some(witness("a")), graph_of(&[1, 2, 3]), 3, (4, 9))
-        .unwrap();
+    c.confirm(0.4, Some(witness("a")), graph_of(&[1, 2, 3]), 3, (4, 9)).unwrap();
     assert!(!c.needs_confirmation());
     assert_eq!(c.graph().unwrap().edge_count(), 3);
     assert_eq!(c.replay_graph().unwrap().edge_count(), 3);
@@ -161,17 +137,13 @@ fn confirmation_stores_replay_state_and_the_witness_is_taken_once() {
 #[test]
 fn confirmation_drops_the_history() {
     let mut c = Counterexample::default();
-    c.record_sighting(&[int_node(3)], &[span(5, 0, 1)], true)
-        .unwrap();
+    c.record_sighting(&[int_node(3)], &[span(5, 0, 1)], true).unwrap();
     c.record_sighting(&[int_node(3)], &[], false).unwrap();
     c.record_sighting(&[int_node(4)], &[], false).unwrap();
     let entries = c.history().entries();
     assert_eq!(entries.len(), 2, "deduplicated by choices");
     assert!(entries[0].accept);
-    assert_eq!(
-        entries[0].run().steps[0].addr,
-        vec![(5, 0), (DRAW_LABEL, 0)]
-    );
+    assert_eq!(entries[0].run().steps[0].addr, vec![(5, 0), (DRAW_LABEL, 0)]);
     assert_eq!(entries[1].run().steps[0].addr, vec![(DRAW_LABEL, 0)]);
     c.confirm(0.4, None, graph_of(&[3]), 1, (4, 9)).unwrap();
     assert!(c.history().is_empty());
@@ -195,12 +167,8 @@ fn repro_state_carries_the_replay_graph_its_hash_and_the_longest_run() {
     let unconfirmed = c.repro_state().unwrap();
     assert_eq!(unconfirmed.graph.edge_count(), 2);
     assert_eq!(unconfirmed.longest, 2);
-    assert_eq!(
-        unconfirmed.entropy,
-        fnv1a(&c.replay_graph().unwrap().encode().unwrap())
-    );
-    c.confirm(0.4, None, graph_of(&[1, 2, 3, 4]), 4, (4, 9))
-        .unwrap();
+    assert_eq!(unconfirmed.entropy, fnv1a(&c.replay_graph().unwrap().encode().unwrap()));
+    c.confirm(0.4, None, graph_of(&[1, 2, 3, 4]), 4, (4, 9)).unwrap();
     let confirmed = c.repro_state().unwrap();
     assert_eq!(confirmed.graph.edge_count(), 4);
     assert_eq!(confirmed.longest, 4);
@@ -222,11 +190,7 @@ fn trusted_origins_survive_rejection_without_eviction() {
     assert!(c.incumbent().is_some());
     assert!(c.take_witness().is_none());
     assert!(c.graph().is_none(), "a version-1 entry carries no graph");
-    assert_eq!(
-        c.replay_graph().unwrap().edge_count(),
-        1,
-        "so the origin replays as its incumbent"
-    );
+    assert_eq!(c.replay_graph().unwrap().edge_count(), 1, "so the origin replays as its incumbent");
 }
 
 #[test]
@@ -267,8 +231,7 @@ fn trust_seeds_and_folds_reuse_evidence() {
 #[test]
 fn trust_never_demotes_a_confirmed_origin() {
     let mut c = Counterexample::default();
-    c.confirm(0.7, Some(witness("a")), graph_of(&[1]), 1, (4, 4))
-        .unwrap();
+    c.confirm(0.7, Some(witness("a")), graph_of(&[1]), 1, (4, 4)).unwrap();
     c.trust(Some((Arc::new(graph_of(&[1, 2])), 2)), (1, 1));
     let (_, anchor) = c.take_witness().unwrap();
     assert_eq!(anchor, 0.7);
@@ -293,11 +256,7 @@ fn promotion_folds_trusted_evidence_into_the_confirmed_counts() {
         c.caveat().as_deref(),
         Some("nondeterministic failure, confirmed: failed 3 of 33 replays this run")
     );
-    assert_eq!(
-        c.graph().unwrap().edge_count(),
-        2,
-        "the batch's graph replaces the stored one"
-    );
+    assert_eq!(c.graph().unwrap().edge_count(), 2, "the batch's graph replaces the stored one");
 }
 
 #[test]
@@ -326,8 +285,7 @@ fn raise_anchor_is_monotone_and_confirmed_only() {
     assert!(t.take_witness().is_none());
     assert_eq!(t.anchor(), None);
     let mut k = Counterexample::default();
-    k.confirm(0.3, Some(witness("c")), graph_of(&[1]), 1, (4, 12))
-        .unwrap();
+    k.confirm(0.3, Some(witness("c")), graph_of(&[1]), 1, (4, 12)).unwrap();
     k.raise_anchor(0.2);
     k.raise_anchor(0.6);
     let (_, anchor) = k.take_witness().unwrap();
@@ -340,13 +298,7 @@ fn install_moves_the_whole_counterexample_and_raises_the_anchor() {
     let mut c = Counterexample::default();
     c.adopt(vec![int_node(9), int_node(9)], Vec::new());
     c.confirm(0.6, None, graph_of(&[9, 9]), 2, (4, 4)).unwrap();
-    c.install(
-        graph_of(&[3]),
-        vec![int_node(3)],
-        vec![span(2, 0, 1)],
-        0.4,
-        1,
-    );
+    c.install(graph_of(&[3]), vec![int_node(3)], vec![span(2, 0, 1)], 0.4, 1);
     assert_eq!(c.incumbent().unwrap(), &[int_node(3)]);
     assert_eq!(c.incumbent_spans().len(), 1);
     assert_eq!(c.graph().unwrap().edge_count(), 1);
@@ -451,8 +403,7 @@ fn a_dry_final_replay_switches_the_trusted_caveat_wording() {
 #[test]
 fn a_confirmed_origin_that_reproduced_at_every_replay_has_no_caveat() {
     let mut c = Counterexample::default();
-    c.confirm(nd::anchor_ceiling(), None, graph_of(&[1]), 1, (20, 20))
-        .unwrap();
+    c.confirm(nd::anchor_ceiling(), None, graph_of(&[1]), 1, (20, 20)).unwrap();
     c.record_final_replay((1, 1));
     assert!(c.caveat().is_none());
     c.record_final_replay((1, 2));
@@ -469,8 +420,7 @@ fn a_confirmed_origin_that_reproduced_at_every_replay_has_no_caveat() {
 fn a_miss_seen_outside_the_evidence_keeps_the_caveat() {
     let mut c = Counterexample::default();
     c.record_miss();
-    c.confirm(nd::anchor_ceiling(), None, graph_of(&[1]), 1, (20, 20))
-        .unwrap();
+    c.confirm(nd::anchor_ceiling(), None, graph_of(&[1]), 1, (20, 20)).unwrap();
     assert_eq!(
         c.caveat().as_deref(),
         Some("nondeterministic failure, confirmed: failed 20 of 20 replays this run")
@@ -512,14 +462,10 @@ fn a_trusted_origin_that_reproduced_at_every_replay_has_no_caveat() {
 fn a_trusted_origin_promoted_without_a_miss_has_no_caveat() {
     let mut c = Counterexample::default();
     c.trust(None, (1, 1));
-    c.confirm(nd::anchor_ceiling(), None, graph_of(&[1]), 1, (20, 20))
-        .unwrap();
+    c.confirm(nd::anchor_ceiling(), None, graph_of(&[1]), 1, (20, 20)).unwrap();
     assert!(c.caveat().is_none());
     c.record_trusted_batch((0, 5));
-    assert!(
-        c.caveat().is_none(),
-        "a trusted batch folds nothing once confirmed"
-    );
+    assert!(c.caveat().is_none(), "a trusted batch folds nothing once confirmed");
 }
 
 #[test]
@@ -541,8 +487,7 @@ fn stored_nondeterministic_state_keeps_its_caveat_through_promotion() {
     let mut c = Counterexample::default();
     c.trust(Some((Arc::new(graph_of(&[1])), 1)), (1, 1));
     assert!(c.caveat().is_some());
-    c.confirm(nd::anchor_ceiling(), None, graph_of(&[1]), 1, (20, 20))
-        .unwrap();
+    c.confirm(nd::anchor_ceiling(), None, graph_of(&[1]), 1, (20, 20)).unwrap();
     assert_eq!(
         c.caveat().as_deref(),
         Some("nondeterministic failure, confirmed: failed 21 of 21 replays this run")
@@ -625,9 +570,7 @@ fn the_map_reports_live_and_unconfirmed_origins_in_origin_order() {
     assert!(all.caveat("zeta").is_none());
     all.entry("c").adopt(vec![int_node(1)], Vec::new());
     all.entry("a").adopt(vec![int_node(2)], Vec::new());
-    all.entry("b")
-        .confirm(0.5, None, graph_of(&[1]), 1, (4, 6))
-        .unwrap();
+    all.entry("b").confirm(0.5, None, graph_of(&[1]), 1, (4, 6)).unwrap();
     assert!(all.any_live());
     assert_eq!(all.live_origins(), vec!["a", "c"]);
     assert_eq!(all.unconfirmed().collect::<Vec<_>>(), vec!["a", "c"]);
@@ -649,35 +592,18 @@ fn the_history_thins_raws_first_then_old_accepts_once_over_its_byte_bound() {
     let mut record = |first: i128, accept: bool| {
         let mut nodes = vec![int_node(0); big];
         nodes[0] = int_node(first);
-        c.record_sighting(&nodes, &[span(1, 0, big)], accept)
-            .unwrap();
+        c.record_sighting(&nodes, &[span(1, 0, big)], accept).unwrap();
     };
-    for (first, accept) in [
-        (1, true),
-        (2, false),
-        (3, false),
-        (4, true),
-        (5, true),
-        (6, true),
-        (7, true),
-        (8, true),
-    ] {
+    for (first, accept) in
+        [(1, true), (2, false), (3, false), (4, true), (5, true), (6, true), (7, true), (8, true)]
+    {
         record(first, accept);
     }
-    let firsts: Vec<ChoiceValue> = c
-        .history()
-        .entries()
-        .iter()
-        .map(|e| e.nodes[0].value())
-        .collect();
-    let expected: Vec<ChoiceValue> = [1, 5, 6, 7, 8]
-        .into_iter()
-        .map(|v| ChoiceValue::Integer(BigInt::from(v)))
-        .collect();
-    assert_eq!(
-        firsts, expected,
-        "raws 2 and 3 go first, then the second-oldest accept 4"
-    );
+    let firsts: Vec<ChoiceValue> =
+        c.history().entries().iter().map(|e| e.nodes[0].value()).collect();
+    let expected: Vec<ChoiceValue> =
+        [1, 5, 6, 7, 8].into_iter().map(|v| ChoiceValue::Integer(BigInt::from(v))).collect();
+    assert_eq!(firsts, expected, "raws 2 and 3 go first, then the second-oldest accept 4");
     assert!(c.history().bytes() <= HISTORY_BYTES);
     assert!(c.history().entries().iter().all(|e| e.accept));
 }
@@ -693,8 +619,5 @@ fn a_history_of_two_over_the_bound_keeps_the_newest() {
     }
     let entries = c.history().entries();
     assert_eq!(entries.len(), 1);
-    assert_eq!(
-        entries[0].nodes[0].value(),
-        ChoiceValue::Integer(BigInt::from(2))
-    );
+    assert_eq!(entries[0].nodes[0].value(), ChoiceValue::Integer(BigInt::from(2)));
 }

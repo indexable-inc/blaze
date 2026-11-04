@@ -73,7 +73,11 @@ const LAUNCHER_READS: &[&str] = &[];
 fn launcher_env() -> Vec<(OsString, OsString)> {
     // alloc: the edge: `Confined` owns the process it starts.
     let mut env = Vec::with_capacity(LAUNCHER_READS.len());
-    env.extend(LAUNCHER_READS.iter().filter_map(|name| Some((OsString::from(name), std::env::var_os(name)?))));
+    env.extend(
+        LAUNCHER_READS
+            .iter()
+            .filter_map(|name| Some((OsString::from(name), std::env::var_os(name)?))),
+    );
     env
 }
 
@@ -192,11 +196,16 @@ mod wasi_os {
     pub(super) mod args {
         use super::*;
 
-        pub(crate) fn serialize<S: Serializer>(args: &[OsString], serializer: S) -> Result<S::Ok, S::Error> {
+        pub(crate) fn serialize<S: Serializer>(
+            args: &[OsString],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
             serializer.collect_seq(args.iter().map(|arg| Os(arg)))
         }
 
-        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<OsString>, D::Error> {
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<OsString>, D::Error> {
             // alloc: the spec's arguments, read once a run
             Ok(Vec::<Read>::deserialize(deserializer)?.into_iter().map(|it| it.0).collect())
         }
@@ -205,7 +214,10 @@ mod wasi_os {
     pub(super) mod env {
         use super::*;
 
-        pub(crate) fn serialize<S: Serializer>(env: &[(OsString, OsString)], serializer: S) -> Result<S::Ok, S::Error> {
+        pub(crate) fn serialize<S: Serializer>(
+            env: &[(OsString, OsString)],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
             serializer.collect_seq(env.iter().map(|(name, value)| (Os(name), Os(value))))
         }
 
@@ -213,7 +225,10 @@ mod wasi_os {
             deserializer: D,
         ) -> Result<Vec<(OsString, OsString)>, D::Error> {
             // alloc: the spec's environment, read once a run
-            Ok(Vec::<(Read, Read)>::deserialize(deserializer)?.into_iter().map(|(name, value)| (name.0, value.0)).collect())
+            Ok(Vec::<(Read, Read)>::deserialize(deserializer)?
+                .into_iter()
+                .map(|(name, value)| (name.0, value.0))
+                .collect())
         }
     }
 }
@@ -245,7 +260,10 @@ impl Launcher {
             network: *network,
             trace: *trace,
             services,
-            live: live.map_or_else(|| Cow::Owned(scratch.join(LIVE_FILE)), |(_, value)| Cow::Borrowed(Path::new(value))),
+            live: live.map_or_else(
+                || Cow::Owned(scratch.join(LIVE_FILE)),
+                |(_, value)| Cow::Borrowed(Path::new(value)),
+            ),
             report: scratch.join(REPORT_FILE),
             not_inputs: std::slice::from_ref(&command.program),
             given,
@@ -256,7 +274,10 @@ impl Launcher {
     pub fn report(scratch: &Path) -> Result<Report, String> {
         let file = scratch.join(REPORT_FILE);
         let bytes = std::fs::read(&file).map_err(|error| {
-            format!("the launcher left no report at {} ({error}): it did not end as it should", file.display()) // alloc: error path
+            format!(
+                "the launcher left no report at {} ({error}): it did not end as it should",
+                file.display()
+            ) // alloc: error path
         })?;
         trace::decode(&bytes).map_err(|why| format!("{}: {why}", file.display())) // alloc: error path
     }
@@ -267,7 +288,8 @@ impl Confine for Launcher {
         let spec = Launcher::spec(command, scratch)?;
         let file = scratch.join(SPEC_FILE);
         blaze_mem::scratch::with_bytes(|text| {
-            serde_json::to_writer(&mut *text, &spec).map_err(|error| format!("the spec: {error}"))?; // alloc: error path
+            serde_json::to_writer(&mut *text, &spec)
+                .map_err(|error| format!("the spec: {error}"))?; // alloc: error path
             write_private(&file, text).map_err(|error| format!("{}: {error}", file.display())) // alloc: error path
         })?;
         let mut args = Vec::with_capacity(LAUNCH.len() + 1);
@@ -289,7 +311,8 @@ impl Confine for Launcher {
             return None;
         }
         // Where it stays: blaze's own directory, which is there as long as blaze is.
-        let dir = self.program.parent().filter(|it| !it.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let dir =
+            self.program.parent().filter(|it| !it.as_os_str().is_empty()).unwrap_or(Path::new("."));
         Some(Confined {
             program: self.program.clone(), // clone: the edge, once per launcher started
             // alloc: as above.
@@ -320,7 +343,10 @@ impl Confine for Launcher {
         let len = frame.len() - 4;
         if len > HAND_MOST {
             // alloc: error path
-            return Err(format!("{}: its spec is {len} bytes, past the launcher's {HAND_MOST}", command.program.display()));
+            return Err(format!(
+                "{}: its spec is {len} bytes, past the launcher's {HAND_MOST}",
+                command.program.display()
+            ));
         }
         frame[..4].copy_from_slice(&(len as u32).to_le_bytes());
         Ok(frame)
@@ -346,13 +372,18 @@ impl Confine for Launcher {
 
 /// The value of [`GIVEN`] for the variables `names`: each name, separated by `=`. A name with
 /// `=` in it is no variable's, and an error naming it.
-pub fn given_value<'a>(names: impl IntoIterator<Item = &'a std::ffi::OsStr>) -> Result<OsString, String> {
+pub fn given_value<'a>(
+    names: impl IntoIterator<Item = &'a std::ffi::OsStr>,
+) -> Result<OsString, String> {
     // alloc: setup, once per run prepared: the launcher's variable.
     let mut value = OsString::new();
     for (at, name) in names.into_iter().enumerate() {
         if name.as_encoded_bytes().contains(&b'=') {
             // alloc: error path
-            return Err(format!("the variable `{}` has `=` in its name, which no variable's has", name.display()));
+            return Err(format!(
+                "the variable `{}` has `=` in its name, which no variable's has",
+                name.display()
+            ));
         }
         if at > 0 {
             value.push("=");
@@ -367,7 +398,10 @@ pub fn given_value<'a>(names: impl IntoIterator<Item = &'a std::ffi::OsStr>) -> 
 fn given_names<'a>(program: &Path, names: &'a std::ffi::OsStr) -> Result<Vec<&'a str>, String> {
     let Some(names) = names.to_str() else {
         // alloc: error path
-        return Err(format!("{}: a variable its key has is named in bytes that are not UTF-8", program.display()));
+        return Err(format!(
+            "{}: a variable its key has is named in bytes that are not UTF-8",
+            program.display()
+        ));
     };
     // alloc: the edge: the launcher's spec, once per run.
     Ok(names.split('=').filter(|it| !it.is_empty()).collect())
@@ -388,7 +422,10 @@ fn write_private(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// The next run on `input`, a frame [`Confine::hand`] made, read into `buffer` (kept for the
 /// next): `None` when the driver closed `input` between two frames. A frame cut short, of
 /// another version, too long or whose spec does not parse is an error: the launcher's fault.
-pub fn read_hand(input: &mut impl Read, buffer: &mut Vec<u8>) -> Result<Option<(Handed, Spec)>, String> {
+pub fn read_hand(
+    input: &mut impl Read,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<(Handed, Spec)>, String> {
     let mut len = [0u8; 4];
     let mut got = 0;
     while got < len.len() {
@@ -404,19 +441,29 @@ pub fn read_hand(input: &mut impl Read, buffer: &mut Vec<u8>) -> Result<Option<(
     let len = u32::from_le_bytes(len) as usize;
     if !(HAND_HEADER - 4..=HAND_MOST).contains(&len) {
         // alloc: error path
-        return Err(format!("the driver's frame says it is {len} bytes, not between {} and {HAND_MOST}", HAND_HEADER - 4));
+        return Err(format!(
+            "the driver's frame says it is {len} bytes, not between {} and {HAND_MOST}",
+            HAND_HEADER - 4
+        ));
     }
     buffer.clear();
     buffer.resize(len, 0);
     // alloc: error path
-    input.read_exact(buffer).map_err(|error| format!("reading a frame of {len} bytes from the driver: {error}"))?;
-    let word = |at: usize| u64::from_le_bytes(buffer[at..at + 8].try_into().expect("8 bytes, inside the header"));
+    input
+        .read_exact(buffer)
+        .map_err(|error| format!("reading a frame of {len} bytes from the driver: {error}"))?;
+    let word = |at: usize| {
+        u64::from_le_bytes(buffer[at..at + 8].try_into().expect("8 bytes, inside the header"))
+    };
     let version = u32::from_le_bytes(buffer[..4].try_into().expect("4 bytes, inside the header"));
     if version != HAND_VERSION {
         // alloc: error path
-        return Err(format!("the driver's frame is of version {version}, and this launcher reads {HAND_VERSION}"));
+        return Err(format!(
+            "the driver's frame is of version {version}, and this launcher reads {HAND_VERSION}"
+        ));
     }
-    let handed = Handed { run: word(4), stdin: word(12), stdout: word(20), stderr: word(28), job: word(36) };
+    let handed =
+        Handed { run: word(4), stdin: word(12), stdout: word(20), stderr: word(28), job: word(36) };
     let spec = serde_json::from_slice(&buffer[HAND_HEADER - 4..])
         // alloc: error path
         .map_err(|error| format!("the spec of run {}: {error}", handed.run))?;
@@ -434,7 +481,13 @@ mod tests {
             env: vec![("CC".into(), "cc".into()), (LIVE.into(), "/root/live/7".into())],
             dir: "/ws".into(),
             stdin: Vec::new(),
-            sandbox: Sandbox::On { read: vec!["/ws".into()], write: vec!["/out".into()], network: false, trace, services: Vec::new() },
+            sandbox: Sandbox::On {
+                read: vec!["/ws".into()],
+                write: vec!["/out".into()],
+                network: false,
+                trace,
+                services: Vec::new(),
+            },
             memory: None,
         }
     }
@@ -454,7 +507,15 @@ mod tests {
         assert_eq!(spec.not_inputs, vec![PathBuf::from("/build/script")]);
         assert_eq!(
             (spec.program, spec.args, spec.dir, spec.read, spec.write, spec.network, spec.trace),
-            ("/build/script".into(), vec!["a".into()], "/ws".into(), vec!["/ws".into()], vec!["/out".into()], false, true)
+            (
+                "/build/script".into(),
+                vec!["a".into()],
+                "/ws".into(),
+                vec!["/ws".into()],
+                vec!["/out".into()],
+                false,
+                true
+            )
         );
         let mut unnamed = command(false);
         unnamed.env.retain(|(name, _)| name != LIVE);
@@ -479,7 +540,8 @@ mod tests {
 
     #[test]
     fn the_launcher_is_given_its_spec_and_the_report_is_read_back() {
-        let scratch = std::env::temp_dir().join(format!("blaze-confine-test-{}", std::process::id()));
+        let scratch =
+            std::env::temp_dir().join(format!("blaze-confine-test-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
         let launcher = Launcher { program: "/bin/blaze".into() };
@@ -496,13 +558,18 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "the spec holds the environment: its owner's alone");
         }
         assert!(launcher.traced(&command(true), &scratch).is_err());
-        std::fs::write(scratch.join(REPORT_FILE), trace::encode(&Report::NotMade("no".into()))).unwrap();
+        std::fs::write(scratch.join(REPORT_FILE), trace::encode(&Report::NotMade("no".into())))
+            .unwrap();
         assert!(launcher.traced(&command(true), &scratch).unwrap_err().contains("no sandbox"));
         std::fs::write(scratch.join(REPORT_FILE), trace::encode(&Report::Ran(None))).unwrap();
         assert!(launcher.traced(&command(true), &scratch).is_err());
         assert_eq!(launcher.traced(&command(false), &scratch), Ok(Traced::default()));
         let traced = Traced { env: vec![("CC".into(), Some("cc".into()))], ..Traced::default() };
-        std::fs::write(scratch.join(REPORT_FILE), trace::encode(&Report::Ran(Some(traced.clone())))).unwrap();
+        std::fs::write(
+            scratch.join(REPORT_FILE),
+            trace::encode(&Report::Ran(Some(traced.clone()))),
+        )
+        .unwrap();
         assert_eq!(launcher.traced(&command(true), &scratch), Ok(traced));
         _ = std::fs::remove_dir_all(&scratch);
     }
@@ -517,8 +584,14 @@ mod tests {
         stream.extend(launcher.hand(&command(false), Path::new("/t"), &second).unwrap());
         let mut input = &stream[..];
         let mut buffer = Vec::new();
-        assert_eq!(read_hand(&mut input, &mut buffer), Ok(Some((handed, read_back(&command(true), Path::new("/s"))))));
-        assert_eq!(read_hand(&mut input, &mut buffer), Ok(Some((second, read_back(&command(false), Path::new("/t"))))));
+        assert_eq!(
+            read_hand(&mut input, &mut buffer),
+            Ok(Some((handed, read_back(&command(true), Path::new("/s")))))
+        );
+        assert_eq!(
+            read_hand(&mut input, &mut buffer),
+            Ok(Some((second, read_back(&command(false), Path::new("/t")))))
+        );
         assert_eq!(read_hand(&mut input, &mut buffer), Ok(None), "closed between frames");
     }
 
@@ -552,7 +625,9 @@ mod tests {
                 assert_eq!(warm.program, PathBuf::from("/opt/blaze/bin/blaze"));
                 assert_eq!(warm.args, [OsString::from("sandbox"), OsString::from("--v2-serve")]);
                 assert_eq!(warm.dir, PathBuf::from("/opt/blaze/bin"));
-                assert!(warm.env.iter().all(|(name, _)| LAUNCHER_READS.iter().any(|it| name == it)));
+                assert!(
+                    warm.env.iter().all(|(name, _)| LAUNCHER_READS.iter().any(|it| name == it))
+                );
             }
             None => assert!(!cfg!(windows)),
         }

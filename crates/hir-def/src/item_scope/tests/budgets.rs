@@ -6,9 +6,9 @@ use std::hint::black_box;
 
 use base_db::relevant_crates;
 use blaze_alloc_count::assert_at_most;
+use hir_expand::fixture;
 use hir_expand::name::Name;
 use intern::Symbol;
-use hir_expand::fixture;
 
 use crate::{
     ModuleDefId,

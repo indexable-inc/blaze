@@ -202,8 +202,14 @@ fn parse(body: &[u8], period_ns: u64) -> Option<Sample> {
     let time = word(body, 8)?;
     let nr = word(body, 16)? as usize;
     // The event counts on CLOCK_MONOTONIC, the clock `crate::clock::now_ns` reads.
-    let mut sample =
-        Sample { t_ns: time as i64, tid: u64::from(tid), depth: 0, pcs: [0; DEPTH], on_cpu: true, weight_ns: period_ns };
+    let mut sample = Sample {
+        t_ns: time as i64,
+        tid: u64::from(tid),
+        depth: 0,
+        pcs: [0; DEPTH],
+        on_cpu: true,
+        weight_ns: period_ns,
+    };
     for i in 0..nr {
         let pc = word(body, 24 + 8 * i)?;
         if pc >= PERF_CONTEXT_MAX {
@@ -272,7 +278,8 @@ pub(super) fn run(hz: u32, sink: &Sink, stop: &AtomicBool) {
             match Event::open(tid, hz) {
                 Ok(event) => {
                     _ = events.insert(tid, event);
-                    if let Ok(name) = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")) {
+                    if let Ok(name) = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm"))
+                    {
                         names.push((tid as u64, name.trim_end().to_owned()));
                     }
                 }

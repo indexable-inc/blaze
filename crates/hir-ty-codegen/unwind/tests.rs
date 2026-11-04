@@ -56,7 +56,8 @@ fn stencil_landing_pads_are_an_lsda_of_its_calls() {
     let frame = Frame::Rows(FrameRows { len: 40, rows: rows.to_vec() });
     assert_eq!(made, Some(FunctionUnwind { frame, landing_pads: Some(expected) }));
 
-    let plain = FunctionUnwind::of_stencil(&stencil(dwarf, &calls[..1], &[], &[])).unwrap().unwrap();
+    let plain =
+        FunctionUnwind::of_stencil(&stencil(dwarf, &calls[..1], &[], &[])).unwrap().unwrap();
     assert_eq!(plain.landing_pads, None);
     let every = [Handler::Default { landing: 20 }];
     assert!(FunctionUnwind::of_stencil(&stencil(dwarf, &calls, &every, &[])).is_err());
@@ -287,7 +288,11 @@ fn saving(isa: &dyn TargetIsa, ints: usize, floats: usize, stack: u32) -> ir::Fu
     builder.switch_to_block(entry);
     let (int, float) = (builder.block_params(entry)[0], builder.block_params(entry)[1]);
     if stack > 0 {
-        let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, stack, 4));
+        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            stack,
+            4,
+        ));
         builder.ins().stack_store(types::I64, int, slot, 0);
     }
     let ints: Vec<_> = (0..ints as i64).map(|at| builder.ins().imul_imm(int, at + 3)).collect();
@@ -339,17 +344,19 @@ fn unwind_rules(
             CieOrFde::Fde(partial) => break partial.parse(read::EhFrame::cie_from_offset).unwrap(),
         }
     };
-    let bytes = |expression: &read::UnwindExpression<usize>| expression.get(&eh_frame).unwrap().0.slice().to_vec();
-    let unsigned = |register: gimli::Register, rule: &read::RegisterRule<usize>| {
-        matches!(rule, read::RegisterRule::ValExpression(it) if register.0 == 34 && bytes(it) == [gimli::DW_OP_lit0.0])
+    let bytes = |expression: &read::UnwindExpression<usize>| {
+        expression.get(&eh_frame).unwrap().0.slice().to_vec()
     };
+    let unsigned = |register: gimli::Register, rule: &read::RegisterRule<usize>| matches!(rule, read::RegisterRule::ValExpression(it) if register.0 == 34 && bytes(it) == [gimli::DW_OP_lit0.0]);
     let mut context = UnwindContext::new();
     let mut rows = fde.rows(&eh_frame, &bases, &mut context).unwrap();
     let mut stretches: Vec<(std::ops::Range<u64>, String)> = Vec::new();
     let mut restates_unsigned = false;
     while let Some(row) = rows.next_row().unwrap() {
         let mut state = match row.cfa() {
-            read::CfaRule::RegisterAndOffset { register, offset } => format!("cfa=r{}{offset:+}", register.0),
+            read::CfaRule::RegisterAndOffset { register, offset } => {
+                format!("cfa=r{}{offset:+}", register.0)
+            }
             read::CfaRule::Expression(it) => format!("cfa={:?}", bytes(it)),
         };
         let mut registers: Vec<_> = row.registers().collect();
@@ -392,13 +399,16 @@ fn system_v_rows_unwind_as_cranelifts() {
         use cranelift_codegen::settings::{self, Configurable};
         let mut flags = settings::builder();
         flags.set("preserve_frame_pointers", "true").unwrap();
-        let mut isa = cranelift_codegen::isa::lookup("aarch64-unknown-linux-gnu".parse().unwrap()).unwrap();
+        let mut isa =
+            cranelift_codegen::isa::lookup("aarch64-unknown-linux-gnu".parse().unwrap()).unwrap();
         isa.enable("sign_return_address").unwrap();
         isa.finish(settings::Flags::new(flags)).unwrap()
     });
     for isa in &isas {
         let isa = &**isa;
-        for (ints, floats, stack) in [(0, 0, 0), (2, 0, 0), (12, 0, 64), (0, 12, 0), (24, 24, 4096), (40, 40, 1 << 20)] {
+        for (ints, floats, stack) in
+            [(0, 0, 0), (2, 0, 0), (12, 0, 64), (0, 12, 0), (24, 24, 4096), (40, 40, 1 << 20)]
+        {
             let mut context = Context::for_function(saving(isa, ints, floats, stack));
             context.compile(isa, &mut Default::default()).unwrap();
             let Some(UnwindInfo::SystemV(info)) = context.create_unwind_info(isa).unwrap() else {
@@ -409,17 +419,26 @@ fn system_v_rows_unwind_as_cranelifts() {
             let address = Address::Constant(0);
             let cie = isa.create_systemv_cie().expect("a DWARF ISA");
             let (rules, restates_unsigned) = unwind_rules(&cie, made.fde(address).expect("an FDE"));
-            let (cranelifts, cranelift_restates_unsigned) = unwind_rules(&cie, info.to_fde(address));
+            let (cranelifts, cranelift_restates_unsigned) =
+                unwind_rules(&cie, info.to_fde(address));
             let case = format!("{} {ints} {floats} {stack}", isa.triple());
             assert_eq!(rules, cranelifts, "{case}");
-            assert!(!restates_unsigned, "{case}: a row restates that return addresses are unsigned");
+            assert!(
+                !restates_unsigned,
+                "{case}: a row restates that return addresses are unsigned"
+            );
             let apple = isa.triple().to_string() == "aarch64-apple-darwin";
             // Cranelift restates it for Apple only; if that changes, this no longer tests dropping it.
-            assert_eq!(cranelift_restates_unsigned, apple, "{case}: Cranelift's own entry row changed");
+            assert_eq!(
+                cranelift_restates_unsigned, apple,
+                "{case}: Cranelift's own entry row changed"
+            );
             let signed = format!(" r34={:?}", [gimli::DW_OP_lit1.0]);
             let signs = rules.iter().any(|(_, state)| state.contains(&signed));
             let flags = isa.isa_flags();
-            let signing = flags.iter().any(|it| it.name == "sign_return_address" && it.as_bool() == Some(true));
+            let signing = flags
+                .iter()
+                .any(|it| it.name == "sign_return_address" && it.as_bool() == Some(true));
             assert_eq!(signs, signing, "{case}");
         }
     }

@@ -19,7 +19,10 @@ pub(crate) fn hash_map<'f, K, V>(frame: &'f Frame) -> FrameHashMap<'f, K, V> {
     hashbrown::HashMap::with_hasher_in(FixedState, frame)
 }
 
-pub(crate) fn hash_map_with_capacity<'f, K, V>(capacity: usize, frame: &'f Frame) -> FrameHashMap<'f, K, V> {
+pub(crate) fn hash_map_with_capacity<'f, K, V>(
+    capacity: usize,
+    frame: &'f Frame,
+) -> FrameHashMap<'f, K, V> {
     hashbrown::HashMap::with_capacity_and_hasher_in(capacity, FixedState, frame)
 }
 
@@ -146,9 +149,10 @@ mod tests {
             (map.len(), map.keys().count(), set.len(), by.len())
         };
         let cold = frame::task(Tag::Codegen, &fill);
-        let warm = blaze_alloc_count::assert_at_most(0, "a warm unit's frame maps and sets", || {
-            frame::task(Tag::Codegen, &fill)
-        });
+        let warm =
+            blaze_alloc_count::assert_at_most(0, "a warm unit's frame maps and sets", || {
+                frame::task(Tag::Codegen, &fill)
+            });
         assert_eq!(cold, warm);
     }
 }

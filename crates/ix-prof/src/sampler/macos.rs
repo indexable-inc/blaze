@@ -22,7 +22,11 @@ type Port = libc::mach_port_t;
 unsafe extern "C" {
     static mach_task_self_: Port;
     fn mach_thread_self() -> Port;
-    fn task_threads(task: Port, list: *mut *mut Port, count: *mut libc::mach_msg_type_number_t) -> libc::kern_return_t;
+    fn task_threads(
+        task: Port,
+        list: *mut *mut Port,
+        count: *mut libc::mach_msg_type_number_t,
+    ) -> libc::kern_return_t;
     fn mach_port_deallocate(task: Port, name: Port) -> libc::kern_return_t;
     fn vm_deallocate(task: Port, address: usize, size: usize) -> libc::kern_return_t;
     fn thread_suspend(target: Port) -> libc::kern_return_t;
@@ -51,7 +55,8 @@ struct State {
     pad: u32,
 }
 
-const STATE_COUNT: libc::mach_msg_type_number_t = (size_of::<State>() / size_of::<libc::natural_t>()) as _;
+const STATE_COUNT: libc::mach_msg_type_number_t =
+    (size_of::<State>() / size_of::<libc::natural_t>()) as _;
 const _: () = assert!(STATE_COUNT == 68);
 
 /// User addresses on arm64 macOS are below 2^47; above are tag bits.
@@ -116,7 +121,12 @@ fn running(port: Port) -> bool {
     // SAFETY: `info` is a `thread_basic_info` of `count` words to fill; a dead port is an
     // error, not undefined behavior.
     let got = unsafe {
-        libc::thread_info(port, libc::THREAD_BASIC_INFO as libc::thread_flavor_t, (&raw mut info).cast(), &mut count)
+        libc::thread_info(
+            port,
+            libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+            (&raw mut info).cast(),
+            &mut count,
+        )
     };
     got == libc::KERN_SUCCESS && info.run_state == libc::TH_STATE_RUNNING
 }
@@ -153,7 +163,8 @@ pub(super) fn run(hz: u32, sink: &Sink, stop: &AtomicBool) {
                         {
                             new_names.push((b.tid, name));
                         }
-                        let weight_ns = if on_cpu { period_ns } else { period_ns * u64::from(OFF_CPU_EVERY) };
+                        let weight_ns =
+                            if on_cpu { period_ns } else { period_ns * u64::from(OFF_CPU_EVERY) };
                         if let Some(sample) = sample(port, b, on_cpu, weight_ns) {
                             batch.push(sample);
                         }
@@ -180,7 +191,14 @@ pub(super) fn run(hz: u32, sink: &Sink, stop: &AtomicBool) {
 /// Stops the thread, reads its stack and lets it go: nothing allocated and no lock taken
 /// while it is stopped, since it may hold the allocator's or any other.
 fn sample(port: Port, b: Bounds, on_cpu: bool, weight_ns: u64) -> Option<Sample> {
-    let mut sample = Sample { t_ns: crate::clock::now_ns(), tid: b.tid, depth: 0, pcs: [0; DEPTH], on_cpu, weight_ns };
+    let mut sample = Sample {
+        t_ns: crate::clock::now_ns(),
+        tid: b.tid,
+        depth: 0,
+        pcs: [0; DEPTH],
+        on_cpu,
+        weight_ns,
+    };
     // SAFETY: a live thread's port, not this thread's; a thread that has gone since its bounds
     // were read fails here, so a stopped thread's stack is the one `b` describes.
     if unsafe { thread_suspend(port) } != libc::KERN_SUCCESS {
@@ -189,7 +207,8 @@ fn sample(port: Port, b: Bounds, on_cpu: bool, weight_ns: u64) -> Option<Sample>
     let mut state = State::default();
     let mut count = STATE_COUNT;
     // SAFETY: `state` is an `arm_thread_state64_t` of `count` words to fill, of the stopped thread.
-    let got = unsafe { thread_get_state(port, ARM_THREAD_STATE64, (&raw mut state).cast(), &mut count) };
+    let got =
+        unsafe { thread_get_state(port, ARM_THREAD_STATE64, (&raw mut state).cast(), &mut count) };
     if got == libc::KERN_SUCCESS {
         walk(&state, b.low, b.high, &mut sample);
     }
@@ -244,7 +263,8 @@ mod tests {
         stack[at(8)] = 0x10;
         stack[at(9)] = 0x1003;
         let state = State { fp: aligned, pc: 0x1000, ..State::default() };
-        let mut sample = Sample { t_ns: 0, tid: 1, depth: 0, pcs: [0; DEPTH], on_cpu: true, weight_ns: 1 };
+        let mut sample =
+            Sample { t_ns: 0, tid: 1, depth: 0, pcs: [0; DEPTH], on_cpu: true, weight_ns: 1 };
         walk(&state, base, high, &mut sample);
         assert_eq!(sample.pcs(), &[0x1000, 0x1001, 0x1002, 0x1003]);
     }

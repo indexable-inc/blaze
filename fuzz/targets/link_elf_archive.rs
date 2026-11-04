@@ -20,7 +20,10 @@ use blaze_codegen::Arch;
 use blaze_fuzzer::Target;
 use blaze_link::{Format, NativeKind};
 use object::write::{Object as Builder, Relocation, StandardSection, Symbol, SymbolSection};
-use object::{Architecture, BinaryFormat, Endianness, RelocationFlags, SymbolFlags, SymbolKind, SymbolScope, elf};
+use object::{
+    Architecture, BinaryFormat, Endianness, RelocationFlags, SymbolFlags, SymbolKind, SymbolScope,
+    elf,
+};
 
 const TARGET: Target = Target {
     name: "link_elf_archive",
@@ -60,8 +63,9 @@ fn check_case(data: &[u8], case: usize) {
     let (aligned, at) = copy_at(data, 0);
     let aligned = &aligned[at..][..data.len()];
     let bound = blaze_fuzz::allowed(data.len());
-    let (largest, read) =
-        blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::Elf, arch, ARCHIVE, aligned));
+    let (largest, read) = blaze_fuzz::largest_allocation(|| {
+        blaze_link::fuzz_read(Format::Elf, arch, ARCHIVE, aligned)
+    });
     assert!(
         largest <= bound,
         "allocation bound: a {arch:?} read of {} bytes asked for {largest} bytes at once, past {bound}",
@@ -103,7 +107,9 @@ fn seeds() -> Vec<Vec<u8>> {
 
 fn named() -> Vec<(&'static str, Arch, Vec<u8>)> {
     let mut out = Vec::new();
-    for (arch, architecture) in [(Arch::X86_64, Architecture::X86_64), (Arch::Aarch64, Architecture::Aarch64)] {
+    for (arch, architecture) in
+        [(Arch::X86_64, Architecture::X86_64), (Arch::Aarch64, Architecture::Aarch64)]
+    {
         let (a, b) = members(architecture);
         let symbols: &[(&str, usize)] = &[("alpha", 0), ("beta", 1), ("gamma", 1)];
         let members: &[(&str, &[u8])] = &[("a.o", &a), ("b.o", &b)];
@@ -141,12 +147,26 @@ fn members(arch: Architecture) -> (Vec<u8>, Vec<u8>) {
         kind: SymbolKind::Unknown,
         ..symbol("beta", SymbolSection::Undefined, 0, SymbolScope::Dynamic, false)
     });
-    a.add_relocation(text, Relocation { offset: 4, symbol: beta, addend, flags: RelocationFlags::Elf { r_type: call } })
-        .expect("a relocation inside its section");
+    a.add_relocation(
+        text,
+        Relocation {
+            offset: 4,
+            symbol: beta,
+            addend,
+            flags: RelocationFlags::Elf { r_type: call },
+        },
+    )
+    .expect("a relocation inside its section");
     let mut b = Builder::new(BinaryFormat::Elf, arch, Endianness::Little);
     let text = b.section_id(StandardSection::Text);
     b.append_section_data(text, &[0; 8], 16);
-    b.add_symbol(symbol("local_b", SymbolSection::Section(text), 0, SymbolScope::Compilation, false));
+    b.add_symbol(symbol(
+        "local_b",
+        SymbolSection::Section(text),
+        0,
+        SymbolScope::Compilation,
+        false,
+    ));
     b.add_symbol(symbol("beta", SymbolSection::Section(text), 0, SymbolScope::Dynamic, false));
     b.add_symbol(symbol("gamma", SymbolSection::Section(text), 4, SymbolScope::Dynamic, true));
     (a.write().expect("an ELF object"), b.write().expect("an ELF object"))
@@ -251,7 +271,10 @@ mod tests {
     #[test]
     fn seeds_read() {
         for (what, arch, bytes) in named() {
-            assert!(blaze_link::fuzz_read(Format::Elf, arch, ARCHIVE, &bytes), "seed `{what}` is refused");
+            assert!(
+                blaze_link::fuzz_read(Format::Elf, arch, ARCHIVE, &bytes),
+                "seed `{what}` is refused"
+            );
         }
     }
 }

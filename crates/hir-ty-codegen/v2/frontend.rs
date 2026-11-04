@@ -6,11 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use base_db::{Crate, CrateOrigin, Db};
 use blaze_codegen::{
     CodegenError, InstanceKey, Owner,
-    backend::{Address, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates, Limit},
+    backend::{
+        Address, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates, Limit,
+    },
     plan::{Mode, Origin, Package, PlanError, Policy},
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey};
 use blaze_query::db::FromId;
@@ -23,20 +24,19 @@ use hir_ty::{
     db::{InternedClosure, InternedClosureId, InternedCoroutineId},
     next_solver::{DbInterner, GenericArgs, ParamEnv, Region, RegionExt, Ty, TyKind},
 };
-use hir_ty_mir::mir::MirOptions;
 use hir_ty_identity::{Compiled, OptionsSet, Shim, Subject, instance_identity};
+use hir_ty_mir::mir::MirOptions;
 use hir_ty_mir::mir::dispatch;
 use hir_ty_share::Unshared;
 use rustc_type_ir::inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind};
 use smallvec::{SmallVec, smallvec};
+use std::alloc::Global;
 
 use super::{
     Body, BuildTime, HashSource, Hashes, HirInstance, HirStatic, Kind, build::Build, refs,
     undescribed,
 };
-use crate::{
-    Instance, InstanceDef, exported_static, exported_symbol, fncache, linked_symbol,
-};
+use crate::{Instance, InstanceDef, exported_static, exported_symbol, fncache, linked_symbol};
 
 /// The build's database, `Sync` and shared by reference by every task. Nothing here locks.
 pub struct Databases<'db> {
@@ -104,7 +104,11 @@ impl<T> ByOrigin<T> {
     /// Made once a build.
     fn of(policy: &Policy, mut each: impl FnMut(&Origin) -> T) -> ByOrigin<T> {
         let mut kinds = |name: Package| {
-            [each(&Origin::Member(name)), each(&Origin::Dependency(name)), each(&Origin::BuildTime(name))]
+            [
+                each(&Origin::Member(name)),
+                each(&Origin::Dependency(name)),
+                each(&Origin::BuildTime(name)),
+            ]
         };
         // No package is named the empty name: these are of one the profile has nothing for.
         let [member, dependency, build_time] = kinds(Package::new(""));
@@ -225,7 +229,9 @@ fn names_of(policy: &Policy, origin: &Origin) -> Result<bool, PlanError> {
     // symbol (`backend::unsanitized`), and LLVM's sanitizers write descriptors that name the
     // globals and frames they guard.
     let named = |spec: &blaze_codegen::settings::Spec| {
-        spec.report || !matches!(spec.pgo, blaze_codegen::settings::Pgo::None) || !spec.sanitize.is_empty()
+        spec.report
+            || !matches!(spec.pgo, blaze_codegen::settings::Pgo::None)
+            || !spec.sanitize.is_empty()
     };
     Ok(named(&choice.first) || choice.then.as_ref().is_some_and(named))
 }
@@ -347,11 +353,7 @@ impl<'db> HirFrontend<'db> {
     /// there only, else ([`user_compiled`]: a generic, an `#[inline]` function, a closure) of
     /// any origin, as any may ask for it. What its references are walked
     /// for ([`refs::walk`]).
-    pub(crate) fn inlines(
-        &self,
-        db: &Db,
-        instance: &HirInstance,
-    ) -> Result<bool, String> {
+    pub(crate) fn inlines(&self, db: &Db, instance: &HirInstance) -> Result<bool, String> {
         self.inlines_as(db, instance, None)
     }
 
@@ -359,7 +361,9 @@ impl<'db> HirFrontend<'db> {
     /// ([`super::devirt::walking`]): what a unit builds its body with.
     pub(crate) fn walking(&self, db: &Db, instance: &HirInstance) -> Result<refs::Walking, String> {
         let inlined = self.inlines(db, instance)?;
-        super::devirt::walking(db, self.devirt.world(), instance, inlined, || self.owner(db, &instance.0))
+        super::devirt::walking(db, self.devirt.world(), instance, inlined, || {
+            self.owner(db, &instance.0)
+        })
     }
 
     /// [`Self::inlines`] as describing `instance` for `requester` decides it: of the origin
@@ -440,7 +444,11 @@ impl<'db> HirFrontend<'db> {
     /// `Client::expand1::<F>` or `expand2::<F>` for its `#[proc_macro*]` function `F`. An error
     /// names `func` when it has a const parameter or a type parameter count other than
     /// `items.len()`.
-    pub fn root_with_fn_items(&self, func: FunctionId, items: &[FunctionId]) -> Result<HirInstance, String> {
+    pub fn root_with_fn_items(
+        &self,
+        func: FunctionId,
+        items: &[FunctionId],
+    ) -> Result<HirInstance, String> {
         self.databases.with(|db| root_with_fn_items_in(db, func, items))
     }
 
@@ -455,7 +463,9 @@ impl<'db> HirFrontend<'db> {
         self.with(|db| {
             super::allocator::shim(db, krate, |func| self.root(func))
                 // alloc: the error's message
-                .map_err(|what| undescribed(db, &krate, None, format!("its allocator shim: {what}")))
+                .map_err(|what| {
+                    undescribed(db, &krate, None, format!("its allocator shim: {what}"))
+                })
         })
     }
 
@@ -482,12 +492,14 @@ impl<'db> HirFrontend<'db> {
         let origin = self.compiled_for(db, instance, requester);
         let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
         let owner = self.owner(db, &instance.0);
-        let walking = super::devirt::walking(db, self.devirt.world(), instance, inlined, || owner).map_err(fail)?;
+        let walking = super::devirt::walking(db, self.devirt.world(), instance, inlined, || owner)
+            .map_err(fail)?;
         let built_in_code = built_in_code(db, hashes, &instance.0).map_err(fail)?;
         // A body built against the program's dyn facts is keyed by those it read (rule 18). A
         // copy of it built into a caller is built against none: `built_in_code`.
         let read = refs::read(db, instance, walking).map_err(fail)?;
-        let told = self.units_as(db, instance, &origin, |it| (&it.tells, it.tells_any)).map_err(fail)?;
+        let told =
+            self.units_as(db, instance, &origin, |it| (&it.tells, it.tells_any)).map_err(fail)?;
         // What its compiled function reads of names beside its code (the files its `file!()`
         // names, its told locals' types) is in every key of it (rule 20), its link code's as
         // its template code's: read once, folded into both ([`with_names`]).
@@ -502,14 +514,19 @@ impl<'db> HirFrontend<'db> {
         // The template then holds its positions by table and the instance fills its own
         // anchors (docs/v2/plan/design/name-free-identity.md).
         let lang = crate_of(db, &instance.0).is_some_and(|it| it.data(db).origin.is_lang());
-        let named = self.units_as(db, instance, &origin, |it| (&it.names, it.names_any)).map_err(fail)?;
+        let named =
+            self.units_as(db, instance, &origin, |it| (&it.names, it.names_any)).map_err(fail)?;
         let held = match (inlined || lang || named, names) {
-            (false, Some((names, true))) => template_code_of(db, hashes, &instance.0, names).map_err(fail)?,
+            (false, Some((names, true))) => {
+                template_code_of(db, hashes, &instance.0, names).map_err(fail)?
+            }
             // A told local's type holding an alias, or no body of its own: kept under its code.
             _ => None,
         };
         let (template_code, anchors) = match held {
-            Some((own, owner)) => (super::devirt::code(own, read), Some(hashes.anchors(db, owner).map_err(fail)?)),
+            Some((own, owner)) => {
+                (super::devirt::code(own, read), Some(hashes.anchors(db, owner).map_err(fail)?))
+            }
             None => (code, None),
         };
         let plain = args_of(db, hashes, &instance.0).map_err(fail)?;
@@ -536,7 +553,8 @@ impl<'db> HirFrontend<'db> {
         let built_in = refs::built_in(db, instance, walking).map_err(fail)?.to_vec();
         // Written in a workspace crate: the complement of what a caller may build in
         // (`always_inlinable_callee`), so nothing patchable is ever built in.
-        let editable = crate_of(db, &instance.0).is_some_and(|krate| krate.data(db).origin.is_local());
+        let editable =
+            crate_of(db, &instance.0).is_some_and(|krate| krate.data(db).origin.is_local());
         Ok(Described {
             item,
             code,
@@ -609,16 +627,26 @@ impl<'db> HirFrontend<'db> {
     /// ([`args_of`]). Both give exact code. A key that can't be made for any other reason is
     /// an error: the instance is never compiled per instance in its place. A generic callee is
     /// of its caller's origin, so its key here is the one its caller's key holds.
-    pub(super) fn shared_args(&self, db: &Db, kind: &Kind, origin: &Origin) -> Result<ContentId, String> {
+    pub(super) fn shared_args(
+        &self,
+        db: &Db,
+        kind: &Kind,
+        origin: &Origin,
+    ) -> Result<ContentId, String> {
         let Kind::Code(instance, env) = kind else { return args_of(db, &self.hashes, kind) };
         let compiled = self.body_options(origin)?;
         // clone: the query's key, a reference count
-        let of = hir_ty_identity::Instance { subject: subject_of(instance.def), args: instance.args.clone() };
+        let of = hir_ty_identity::Instance {
+            subject: subject_of(instance.def),
+            args: instance.args.clone(),
+        };
         match instance_identity(db, &of, env, compiled) {
             Ok(identity) => Ok(Hasher::new(SHARED_ARGS_DOMAIN).id(&identity.0).finish()),
             Err(why) if per_instance(why) => args_of(db, &self.hashes, kind),
             // alloc: the error's message
-            Err(why) => Err(blaze_query::db::attach(db, || format!("no compile identity for {instance:?}: {why}"))),
+            Err(why) => Err(blaze_query::db::attach(db, || {
+                format!("no compile identity for {instance:?}: {why}")
+            })),
         }
     }
 
@@ -627,7 +655,7 @@ impl<'db> HirFrontend<'db> {
     pub(super) fn body_options(&self, origin: &Origin) -> Result<Compiled, String> {
         match &self.units {
             Some(units) => units.options.get(origin).clone(), // clone: a copy, or an error
-            None => Err(NO_POLICY.to_owned()), // alloc: an error
+            None => Err(NO_POLICY.to_owned()),                // alloc: an error
         }
     }
 
@@ -766,7 +794,8 @@ impl Frontend for HirFrontend<'_> {
     }
 
     fn stopped(&self) -> bool {
-        self.stop.is_some_and(|it| it.load(Ordering::Relaxed)) || self.checks.is_some_and(|it| it.stopped())
+        self.stop.is_some_and(|it| it.load(Ordering::Relaxed))
+            || self.checks.is_some_and(|it| it.stopped())
     }
 
     fn counted(&self, functions: &[(HirInstance, Origin)]) -> Vec<Counted> {
@@ -829,7 +858,9 @@ fn instantiates(db: &Db, kind: &Kind) -> Option<Instantiates> {
     let function = |func| blaze_items::item_key(db, ItemId::Function(func)).0;
     let body = match instance.def {
         InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => function(func),
-        InstanceDef::Closure(id) => blaze_items::key::closure_key(db, InternedClosureId::from_id(id)).0,
+        InstanceDef::Closure(id) => {
+            blaze_items::key::closure_key(db, InternedClosureId::from_id(id)).0
+        }
         InstanceDef::Coroutine(id) => {
             blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0
         }
@@ -840,19 +871,30 @@ fn instantiates(db: &Db, kind: &Kind) -> Option<Instantiates> {
         }
         InstanceDef::DropGlue => shim("drop glue"),
         InstanceDef::CallOnceShim | InstanceDef::FnPointerShim => shim("FnOnce::call_once"),
-        InstanceDef::ReifyShim { receiver: true } => shim("the Fn-trait call of a fn item or pointer"),
-        InstanceDef::ReifyShim { receiver: false } => match instance.args.as_ref().type_at(0).kind() {
-            TyKind::FnDef(def, _) => match def.0 {
-                CallableDefId::FunctionId(func) => function(func),
-                CallableDefId::StructId(it) => blaze_items::item_key(db, ItemId::Adt(AdtId::StructId(it))).0,
-                CallableDefId::EnumVariantId(it) => {
-                    let variant = it.lookup(db);
-                    let parent = blaze_items::item_key(db, ItemId::Adt(AdtId::EnumId(variant.parent))).0;
-                    Hasher::new(SHIM_BODY_DOMAIN).part(b"variant").id(&parent).part(variant.name.as_str().as_bytes()).finish()
-                }
-            },
-            _ => shim("the Fn-trait call of a fn item or pointer"),
-        },
+        InstanceDef::ReifyShim { receiver: true } => {
+            shim("the Fn-trait call of a fn item or pointer")
+        }
+        InstanceDef::ReifyShim { receiver: false } => {
+            match instance.args.as_ref().type_at(0).kind() {
+                TyKind::FnDef(def, _) => match def.0 {
+                    CallableDefId::FunctionId(func) => function(func),
+                    CallableDefId::StructId(it) => {
+                        blaze_items::item_key(db, ItemId::Adt(AdtId::StructId(it))).0
+                    }
+                    CallableDefId::EnumVariantId(it) => {
+                        let variant = it.lookup(db);
+                        let parent =
+                            blaze_items::item_key(db, ItemId::Adt(AdtId::EnumId(variant.parent))).0;
+                        Hasher::new(SHIM_BODY_DOMAIN)
+                            .part(b"variant")
+                            .id(&parent)
+                            .part(variant.name.as_str().as_bytes())
+                            .finish()
+                    }
+                },
+                _ => shim("the Fn-trait call of a fn item or pointer"),
+            }
+        }
     };
     Some(Instantiates { body, drop_glue: matches!(instance.def, InstanceDef::DropGlue) })
 }
@@ -864,7 +906,9 @@ fn limit_crate(db: &Db, kind: &Kind) -> Option<Crate> {
     match kind {
         Kind::Code(instance, env) => match instance.def {
             InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => Some(func.krate(db)),
-            def @ (InstanceDef::Closure(_) | InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_)) => {
+            def @ (InstanceDef::Closure(_)
+            | InstanceDef::Coroutine(_)
+            | InstanceDef::CoroutineByMove(_)) => {
                 closure_loc(db, def).map(|loc| loc.owner.module(db).krate(db))
             }
             InstanceDef::DropGlue
@@ -903,10 +947,15 @@ fn body_named(db: &Db, def: InstanceDef) -> String {
     match def {
         InstanceDef::Fn(func) => path(func),
         InstanceDef::VtableShim(func) => format!("the vtable shim of {}", path(func)), // alloc: an error's text
-        def @ (InstanceDef::Closure(_) | InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_)) => {
+        def @ (InstanceDef::Closure(_)
+        | InstanceDef::Coroutine(_)
+        | InstanceDef::CoroutineByMove(_)) => {
             match closure_loc(db, def).map(|loc| loc.owner) {
                 Some(InferBodyId::DefWithBodyId(owner)) => {
-                    format!("a closure in {}", blaze_items::key::path(db, ItemId::of_body(db, owner))) // alloc: an error's text
+                    format!(
+                        "a closure in {}",
+                        blaze_items::key::path(db, ItemId::of_body(db, owner))
+                    ) // alloc: an error's text
                 }
                 _ => "a closure in an anonymous constant".to_owned(), // alloc: an error's text
             }
@@ -914,7 +963,7 @@ fn body_named(db: &Db, def: InstanceDef) -> String {
         InstanceDef::DropGlue => "core::ptr::drop_in_place".to_owned(), // alloc: an error's text
         InstanceDef::CallOnceShim => "the `FnOnce::call_once` shim".to_owned(), // alloc: an error's text
         InstanceDef::FnPointerShim => "the fn pointer shim".to_owned(), // alloc: an error's text
-        InstanceDef::ReifyShim { .. } => "the reify shim".to_owned(), // alloc: an error's text
+        InstanceDef::ReifyShim { .. } => "the reify shim".to_owned(),   // alloc: an error's text
     }
 }
 
@@ -934,7 +983,11 @@ fn past_recursion_limit(
     };
     let (body, counted) = match &instance.0 {
         Kind::Code(it, _) => {
-            let quarter = if matches!(it.def, InstanceDef::DropGlue) { ", drop glue counting a quarter" } else { "" };
+            let quarter = if matches!(it.def, InstanceDef::DropGlue) {
+                ", drop glue counting a quarter"
+            } else {
+                ""
+            };
             (body_named(db, it.def), quarter)
         }
         kind => (super::linked::debug_name(db, kind), ""),
@@ -942,7 +995,8 @@ fn past_recursion_limit(
     // The item it is an instance of. It has no instance key: the walk refused it before it
     // described it, and its key is its description's. An `asm!` function and the allocator
     // shim's are never counted, so never here.
-    let item = item_of(db, &instance.0).map_or(ItemKey(ContentId::default()), |it| blaze_items::item_key(db, it));
+    let item = item_of(db, &instance.0)
+        .map_or(ItemKey(ContentId::default()), |it| blaze_items::item_key(db, it));
     CodegenError {
         unit: InstanceKey(ContentId::default()),
         item,
@@ -1123,14 +1177,20 @@ pub(crate) fn inlined(
         }
         Kind::Allocator(_) | Kind::Asm(..) => {
             // alloc: the error's message
-            return Err(format!("{instance:?} built in {built_in:?}, though nothing of its kind builds a body in"));
+            return Err(format!(
+                "{instance:?} built in {built_in:?}, though nothing of its kind builds a body in"
+            ));
         }
     };
     let mut found = Vec::with_capacity(built_in.len()); // alloc: the list returned
     for it in built_in {
-        let FrontRef::Function(callee) = super::places::call_ref(db, it.def, it.args.as_ref(), &env)? else {
+        let FrontRef::Function(callee) =
+            super::places::call_ref(db, it.def, it.args.as_ref(), &env)?
+        else {
             // alloc: the error's message
-            return Err(format!("{instance:?} built in {it:?}, which its callers name as no function"));
+            return Err(format!(
+                "{instance:?} built in {it:?}, which its callers name as no function"
+            ));
         };
         found.push(built_in_code(db, hashes, &callee.0)?);
     }
@@ -1210,18 +1270,16 @@ pub(super) fn item_of(db: &Db, kind: &Kind) -> Result<ItemId, String> {
         InstanceDef::CallOnceShim | InstanceDef::FnPointerShim => {
             lang(lang_items().FnOnce_call_once, "FnOnce::call_once")
         }
-        InstanceDef::ReifyShim { .. } => {
-            match instance.args.as_ref().type_at(0).kind() {
-                TyKind::FnDef(def, _) => Ok(match def.0 {
-                    CallableDefId::FunctionId(it) => ItemId::Function(it),
-                    CallableDefId::StructId(it) => ItemId::Adt(AdtId::StructId(it)),
-                    CallableDefId::EnumVariantId(it) => {
-                        ItemId::Adt(AdtId::EnumId(it.lookup(db).parent))
-                    }
-                }),
-                _ => lang(lang_items().FnOnce_call_once, "FnOnce::call_once"),
-            }
-        }
+        InstanceDef::ReifyShim { .. } => match instance.args.as_ref().type_at(0).kind() {
+            TyKind::FnDef(def, _) => Ok(match def.0 {
+                CallableDefId::FunctionId(it) => ItemId::Function(it),
+                CallableDefId::StructId(it) => ItemId::Adt(AdtId::StructId(it)),
+                CallableDefId::EnumVariantId(it) => {
+                    ItemId::Adt(AdtId::EnumId(it.lookup(db).parent))
+                }
+            }),
+            _ => lang(lang_items().FnOnce_call_once, "FnOnce::call_once"),
+        },
     }
 }
 
@@ -1289,7 +1347,9 @@ fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String
         Ok(CodeHash(hasher.finish()))
     };
     match instance.def {
-        InstanceDef::Fn(func) => cached(db, hashes.code(db, Body::Item(func.into()))?, func, instance, env),
+        InstanceDef::Fn(func) => {
+            cached(db, hashes.code(db, Body::Item(func.into()))?, func, instance, env)
+        }
         InstanceDef::Closure(id) => hashes.code(db, Body::Closure(id)),
         InstanceDef::Coroutine(id) => hashes.code(db, Body::Coroutine(id)),
         InstanceDef::CoroutineByMove(id) => hashes.code(db, Body::CoroutineByMove(id)),
@@ -1464,9 +1524,7 @@ fn names_workspace(db: &Db, ty: Ty<'_>, ours: &impl Fn(Crate) -> bool) -> bool {
         TyKind::FnDef(def, _) => ours(def.0.krate(db)),
         TyKind::Closure(id, _) => closure(id.0.loc(db).owner),
         TyKind::CoroutineClosure(id, _) => closure(id.0.loc(db).owner),
-        TyKind::Coroutine(id, _) | TyKind::CoroutineWitness(id, _) => {
-            closure(id.0.loc(db).owner)
-        }
+        TyKind::Coroutine(id, _) | TyKind::CoroutineWitness(id, _) => closure(id.0.loc(db).owner),
         TyKind::Dynamic(predicates, _) => (predicates.principal_def_id().into_iter())
             .chain(predicates.auto_traits())
             .any(|it| ours(GenericDefId::TraitId(it.0).krate(db))),
@@ -1484,25 +1542,29 @@ const INSTANCE_BOUND_DOMAIN: &str = "blaze v2 instance bound 1";
 fn identity(db: &Db, kind: &Kind, item: ItemKey, args: ContentId) -> ContentId {
     let mut hasher = Hasher::new(IDENTITY_DOMAIN);
     match kind {
-        Kind::Code(instance, _) => match instance.def {
-            InstanceDef::Fn(_) => hasher.update(&[0]).id(&item.0),
-            InstanceDef::Closure(id) => hasher
-                .update(&[1])
-                .id(&blaze_items::key::closure_key(db, InternedClosureId::from_id(id)).0),
-            InstanceDef::Coroutine(id) => hasher
-                .update(&[2])
-                .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
-            InstanceDef::CoroutineByMove(id) => hasher
-                .update(&[3])
-                .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
-            InstanceDef::DropGlue => hasher.update(&[4]).id(&item.0),
-            InstanceDef::CallOnceShim => hasher.update(&[5]).id(&item.0),
-            InstanceDef::VtableShim(_) => hasher.update(&[6]).id(&item.0),
-            InstanceDef::FnPointerShim => hasher.update(&[7]).id(&item.0),
-            InstanceDef::ReifyShim { receiver } => {
-                hasher.update(&[8, u8::from(receiver)]).id(&item.0)
+        Kind::Code(instance, _) => {
+            match instance.def {
+                InstanceDef::Fn(_) => hasher.update(&[0]).id(&item.0),
+                InstanceDef::Closure(id) => hasher.update(&[1]).id(&blaze_items::key::closure_key(
+                    db,
+                    InternedClosureId::from_id(id),
+                )
+                .0),
+                InstanceDef::Coroutine(id) => hasher
+                    .update(&[2])
+                    .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
+                InstanceDef::CoroutineByMove(id) => hasher
+                    .update(&[3])
+                    .id(&blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0),
+                InstanceDef::DropGlue => hasher.update(&[4]).id(&item.0),
+                InstanceDef::CallOnceShim => hasher.update(&[5]).id(&item.0),
+                InstanceDef::VtableShim(_) => hasher.update(&[6]).id(&item.0),
+                InstanceDef::FnPointerShim => hasher.update(&[7]).id(&item.0),
+                InstanceDef::ReifyShim { receiver } => {
+                    hasher.update(&[8, u8::from(receiver)]).id(&item.0)
+                }
             }
-        },
+        }
         Kind::Start(_) => hasher.update(&[10]).id(&item.0),
         Kind::Asm(..) => hasher.update(&[11]).id(&item.0),
         Kind::Allocator(forward) => hasher.update(&[12]).part(forward.symbol.as_bytes()),

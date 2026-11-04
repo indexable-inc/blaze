@@ -21,8 +21,8 @@ use std::{
 };
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_radix as radix;
+use std::alloc::Global;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cpu {
@@ -63,15 +63,17 @@ impl Topology {
         let count = u32::try_from(count).unwrap_or(u32::MAX);
         Topology {
             // alloc: the pool's shape, once per pool
-            cpus: (0..count).map(|id| Cpu { id, group: 0, socket: 0, node: 0, fast: true }).collect(),
+            cpus: (0..count)
+                .map(|id| Cpu { id, group: 0, socket: 0, node: 0, fast: true })
+                .collect(),
         }
     }
 
     /// The topology `root` says, where `root` is the kernel's `/sys/devices/system/cpu` (or a
     /// tree laid out as it is, for tests). The affinity mask is not applied here.
     pub fn from_sysfs(root: &Path) -> io::Result<Topology> {
-        let online = list(&read(&root.join("online"))?)
-            .map_err(|why| at(&root.join("online"), &why))?;
+        let online =
+            list(&read(&root.join("online"))?).map_err(|why| at(&root.join("online"), &why))?;
         let mut found = Vec::with_capacity(online.len());
         let mut capacities: HashMap<u32, u64, Global> = HashMap::new_in(Global); // alloc: setup, once per pool
         for &id in &online {
@@ -263,7 +265,11 @@ fn detect() -> io::Result<Topology> {
 }
 
 /// Where the OS says no more than a count, the pool's threads are not bound ([`crate::pool`]).
-#[cfg(not(any(target_os = "linux", target_os = "macos", all(target_family = "wasm", not(target_feature = "atomics")))))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(target_family = "wasm", not(target_feature = "atomics"))
+)))]
 fn detect() -> io::Result<Topology> {
     std::thread::available_parallelism().map(|it| Topology::flat(it.get()))
 }
@@ -484,8 +490,8 @@ mod tests {
 
     impl Tree {
         fn new(name: &str) -> Tree {
-            let dir = std::env::temp_dir()
-                .join(format!("blaze-topology-{}-{name}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("blaze-topology-{}-{name}", std::process::id()));
             _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Tree(dir)
@@ -688,8 +694,9 @@ mod tests {
     #[test]
     fn the_steal_order_does_not_depend_on_the_order_cpus_are_listed() {
         let cpu = |id, group, socket, node| Cpu { id, group, socket, node, fast: true };
-        let mut cpus: Vec<Cpu> =
-            (0..32u32).map(|id| cpu(id, (id * 7) % 16, (id * 7) % 16 / 8, (id * 7) % 16 / 4)).collect();
+        let mut cpus: Vec<Cpu> = (0..32u32)
+            .map(|id| cpu(id, (id * 7) % 16, (id * 7) % 16 / 8, (id * 7) % 16 / 4))
+            .collect();
         let forward = Topology { cpus: cpus.clone() };
         cpus.reverse();
         let backward = Topology { cpus };

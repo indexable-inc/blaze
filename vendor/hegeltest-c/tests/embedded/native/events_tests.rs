@@ -41,10 +41,7 @@ fn numeric_observations_report_a_distribution_summary() {
     stats.record_case(&[value("size", 2.0), value("size", 10.0)]);
     let lines = stats.render();
     assert_eq!(lines.len(), 2);
-    assert_eq!(
-        lines[1],
-        "  * size: count 4, min 1, median 2.5, mean 4.00, p90 10, max 10"
-    );
+    assert_eq!(lines[1], "  * size: count 4, min 1, median 2.5, mean 4.00, p90 10, max 10");
 }
 
 #[test]
@@ -52,10 +49,7 @@ fn odd_count_median_is_the_middle_observation() {
     let mut stats = RunStatistics::default();
     stats.record_case(&[value("n", 5.0), value("n", 1.0), value("n", 2.0)]);
     let lines = stats.render();
-    assert_eq!(
-        lines[1],
-        "  * n: count 3, min 1, median 2, mean 2.67, p90 5, max 5"
-    );
+    assert_eq!(lines[1], "  * n: count 3, min 1, median 2, mean 2.67, p90 5, max 5");
 }
 
 #[test]
@@ -77,16 +71,11 @@ fn bare_and_numeric_events_render_in_label_order() {
 #[test]
 fn p90_is_the_nearest_rank_below_an_outlying_maximum() {
     let mut stats = RunStatistics::default();
-    let observations: Vec<(String, Option<f64>)> = (1..=9)
-        .map(|n| value("n", n as f64))
-        .chain([value("n", 100.0)])
-        .collect();
+    let observations: Vec<(String, Option<f64>)> =
+        (1..=9).map(|n| value("n", n as f64)).chain([value("n", 100.0)]).collect();
     stats.record_case(&observations);
     let lines = stats.render();
-    assert_eq!(
-        lines[1],
-        "  * n: count 10, min 1, median 5.5, mean 14.50, p90 9, max 100"
-    );
+    assert_eq!(lines[1], "  * n: count 10, min 1, median 5.5, mean 14.50, p90 9, max 100");
 }
 
 #[test]

@@ -8,7 +8,8 @@ use thin_vec::ThinVec;
 use crate::rng::SplitMix64;
 
 use super::{
-    AtomicBitSlice, AtomicBits, BitArray, BitMatrix, BitSet, BitSlice, Bits, Ordering, Ranked, rank_in, ranks_of,
+    AtomicBitSlice, AtomicBits, BitArray, BitMatrix, BitSet, BitSlice, Bits, Ordering, Ranked,
+    rank_in, ranks_of,
 };
 
 /// The simplest copy `blaze_ids::bits` replaced (blaze-diagnostics' `lints/bodies/bits.rs`),
@@ -109,7 +110,10 @@ fn ranges_match_a_bit_at_a_time() {
         assert_eq!(fast.first_absent(), absent);
         let want: Vec<usize> = (0..size).filter(|&it| slow[it]).collect();
         assert_eq!(fast.iter().collect::<Vec<_>>(), want);
-        assert_eq!(fast.iter().rev().collect::<Vec<_>>(), want.iter().rev().copied().collect::<Vec<_>>());
+        assert_eq!(
+            fast.iter().rev().collect::<Vec<_>>(),
+            want.iter().rev().copied().collect::<Vec<_>>()
+        );
     }
 }
 
@@ -441,7 +445,8 @@ fn reads_and_writes_allocate_nothing() {
 fn the_set_is_the_reference(tc: TestCase) {
     let len: usize = tc.draw(gs::integers().min_value(1).max_value(399));
     let ops: Vec<(u8, usize)> = tc.draw(
-        gs::vecs(gs::tuples!(gs::integers().max_value(3), gs::integers().max_value(len - 1))).max_size(199),
+        gs::vecs(gs::tuples!(gs::integers().max_value(3), gs::integers().max_value(len - 1)))
+            .max_size(199),
     );
     let mut set = BitSet::<usize>::new(len);
     let mut reference = reference::Bits::new(len);
@@ -458,7 +463,10 @@ fn the_set_is_the_reference(tc: TestCase) {
     }
     let want: Vec<usize> = (0..len).filter(|&at| reference.contains(at)).collect();
     assert_eq!(set.iter().collect::<Vec<_>>(), want.clone());
-    assert_eq!(set.iter().rev().collect::<Vec<_>>(), want.iter().rev().copied().collect::<Vec<_>>());
+    assert_eq!(
+        set.iter().rev().collect::<Vec<_>>(),
+        want.iter().rev().copied().collect::<Vec<_>>()
+    );
     assert_eq!(set.count(), want.len());
     assert_eq!(set.iter().count(), want.len());
     assert_eq!(set.is_empty(), want.is_empty());
@@ -491,7 +499,11 @@ fn set_operations_are_the_references(tc: TestCase) {
             _ => had && !other,
         };
         changed |= now != had;
-        if now { rx.insert(at); } else { rx.remove(at); }
+        if now {
+            rx.insert(at);
+        } else {
+            rx.remove(at);
+        }
     }
     let said = match op {
         0 => x.union_with(&y),
@@ -499,7 +511,10 @@ fn set_operations_are_the_references(tc: TestCase) {
         _ => x.subtract(&y),
     };
     assert_eq!(said, changed);
-    assert_eq!(x.iter().collect::<Vec<_>>(), (0..len).filter(|&at| rx.contains(at)).collect::<Vec<_>>());
+    assert_eq!(
+        x.iter().collect::<Vec<_>>(),
+        (0..len).filter(|&at| rx.contains(at)).collect::<Vec<_>>()
+    );
     let subset = (0..len).all(|at| !rx.contains(at) || ry.contains(at));
     assert_eq!(x.is_subset(&y), subset);
 }
@@ -521,7 +536,8 @@ fn both_ends_meet(tc: TestCase) {
         }
     }
     front.extend(back.into_iter().rev());
-    let want: Vec<usize> = (0..words.len() * 64).filter(|&at| words[at / 64] >> (at % 64) & 1 == 1).collect();
+    let want: Vec<usize> =
+        (0..words.len() * 64).filter(|&at| words[at / 64] >> (at % 64) & 1 == 1).collect();
     assert_eq!(front, want);
 }
 

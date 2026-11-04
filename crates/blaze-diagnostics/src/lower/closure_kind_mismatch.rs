@@ -21,7 +21,8 @@ use crate::{
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ClosureKindMismatch) -> Vec<Found> {
     let (expected, found) = (d.expected, d.found);
     let at = cx.syntax_view(d.span.map(|it| it.syntax_node_ptr()));
-    let cause = Cause::of(cx, at, |ty| ty.as_closure().is_some_and(|it| it.fn_trait(cx.db) == found));
+    let cause =
+        Cause::of(cx, at, |ty| ty.as_closure().is_some_and(|it| it.fn_trait(cx.db) == found));
     let closure = d.closure.map(|it| cx.node_view(it));
     let head = closure.map(|it| cx.span(it.with_value(closure_decl_range(it.value.syntax()))));
     let mut diag = Diag::error(
@@ -47,7 +48,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ClosureKindMismatch) -> Vec<Found>
         let label = match found {
             FnTrait::FnOnce | FnTrait::AsyncFnOnce => {
                 // alloc: the error's label
-                Some(format!("closure is `{found}` because it moves the variable `{place}` out of its environment"))
+                Some(format!(
+                    "closure is `{found}` because it moves the variable `{place}` out of its environment"
+                ))
             }
             FnTrait::FnMut | FnTrait::AsyncFnMut => {
                 // alloc: the error's label

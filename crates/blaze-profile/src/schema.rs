@@ -186,7 +186,11 @@ pub const COUNTERS: Table = Table {
         col("name", Type::Dict, "what is counted"),
         col("t_ns", Type::I64, "when"),
         col("value", Type::F64, "the value then"),
-        opt("fiber", Type::U32, "the fiber a fiber stack counter is of; null for any other counter"),
+        opt(
+            "fiber",
+            Type::U32,
+            "the fiber a fiber stack counter is of; null for any other counter",
+        ),
         opt("job", Type::U64, "the job that ran on that fiber; null for any other counter"),
     ],
 };
@@ -231,7 +235,11 @@ pub const SWITCHES: Table = Table {
             Type::U64,
             "for started and ran, the job running where it was given to the pool (its spawner); for ready, the job that woke it; null for none (a thread on no fiber) and any other event",
         ),
-        opt("since_ns", Type::I64, "for started and ran, when the job began on its fiber, before it joined the graph"),
+        opt(
+            "since_ns",
+            Type::I64,
+            "for started and ran, when the job began on its fiber, before it joined the graph",
+        ),
         opt(
             "began_as",
             Type::U64,
@@ -262,7 +270,11 @@ pub const EVENTS: Table = Table {
             "the job running on the thread, as `switches.job` names it (its `began_as` before it joined the graph); null on no job",
         ),
         col("level", Type::Dict, "ERROR, WARN or INFO"),
-        col("target", Type::Dict, "its tracing target: the module path it was written in, unless it names one"),
+        col(
+            "target",
+            Type::Dict,
+            "its tracing target: the module path it was written in, unless it names one",
+        ),
         col("name", Type::Dict, "its callsite, as tracing names it: `event <file>:<line>`"),
         opt(
             "message",
@@ -289,13 +301,21 @@ pub const FOLDED: Table = Table {
         THREAD_NAME,
         col("name", Type::Dict, "the spans' name, as `spans.name`"),
         col("target", Type::Dict, "their tracing target, as `spans.target`"),
-        col("root", Type::U32, "1 when they were roots (depth 0: a worker's own work between jobs, which `uncovered_per_worker` counts as covered), else 0"),
+        col(
+            "root",
+            Type::U32,
+            "1 when they were roots (depth 0: a worker's own work between jobs, which `uncovered_per_worker` counts as covered), else 0",
+        ),
         col("from_ns", Type::I64, "when the first began"),
         col("to_ns", Type::I64, "when the last closed"),
         col("spans", Type::U64, "how many were folded"),
         col("dur_ns", Type::I64, "their durations summed"),
         col("max_dur_ns", Type::I64, "the longest"),
-        opt("self_cpu_ns", Type::I64, "their self CPU summed, as `spans.self_cpu_ns`; null when not counted"),
+        opt(
+            "self_cpu_ns",
+            Type::I64,
+            "their self CPU summed, as `spans.self_cpu_ns`; null when not counted",
+        ),
         opt("alloc_bytes", Type::U64, "bytes their thread allocated while they were open, summed"),
         opt("allocs", Type::U64, "allocations made while they were open, summed"),
         opt(
@@ -312,7 +332,11 @@ pub const BUILDS: Table = Table {
     name: "builds",
     doc: "one row a build request the daemon ran",
     columns: &[
-        col("build_id", Type::U64, "the build's number, unique in the history: a daemon numbers its builds past every build its files hold rows of"),
+        col(
+            "build_id",
+            Type::U64,
+            "the build's number, unique in the history: a daemon numbers its builds past every build its files hold rows of",
+        ),
         opt("commit", Type::Utf8, "the workspace's commit, when it is a git checkout"),
         col("workspace", Type::Utf8, "the workspace's root"),
         col("command", Type::Utf8, "what was asked: build, test, run, check, with the arguments"),
@@ -372,13 +396,21 @@ pub const PROVENANCE: Table = Table {
             "the memo: its query and its key as the key's type shows it, `` `infer_query`(DefWithBodyId(FunctionId(..))) `` (its id where the key has no `Debug`), as `cause_key` names it where it is another run's cause",
         ),
         col("kind", Type::Dict, "the query, as `query_counts.query` names it"),
-        col("outcome", Type::Dict, "ran (a run of it), or untracked read (its run made a read the engine can't see)"),
+        col(
+            "outcome",
+            Type::Dict,
+            "ran (a run of it), or untracked read (its run made a read the engine can't see)",
+        ),
         opt(
             "cause",
             Type::Utf8,
             "for ran: changed (a read changed since it last ran), evicted (its value was let go and asked for again), untracked (its last run made an untracked read) or cycle (a stale provisional row, or a verify that re-entered a cycle)",
         ),
-        col("view", Type::U32, "the database view it ran in: each write of inputs opens one, so a build has one or more"),
+        col(
+            "view",
+            Type::U32,
+            "the database view it ran in: each write of inputs opens one, so a build has one or more",
+        ),
         opt(
             "cause_key",
             Type::Utf8,
@@ -401,12 +433,28 @@ pub const KEY_PARTS: Table = Table {
     doc: "one row a part of the key of a thing a build computed again (one row with no part for a key that exposes none)",
     columns: &[
         col("build_id", Type::U64, "the build that computed it"),
-        col("step", Type::Dict, "what was computed, as `misses.step`: `unit`, `build script run`, `codegen dev template`"),
+        col(
+            "step",
+            Type::Dict,
+            "what was computed, as `misses.step`: `unit`, `build script run`, `codegen dev template`",
+        ),
         col("item", Type::Utf8, "what of, as `misses.item`"),
         col("key", Type::Utf8, "the whole key, in hex, as the store files it"),
-        opt("part", Type::Utf8, "the part's name: `the toolchain`, `settings`, `env CC`; null for a key that exposes no parts"),
-        opt("hash", Type::Utf8, "the part's hash, in hex; null when the key has no such part this time"),
-        opt("names", Type::Utf8, "the item the part is of, when another's (a dependency's unit): what a chain of reasons follows"),
+        opt(
+            "part",
+            Type::Utf8,
+            "the part's name: `the toolchain`, `settings`, `env CC`; null for a key that exposes no parts",
+        ),
+        opt(
+            "hash",
+            Type::Utf8,
+            "the part's hash, in hex; null when the key has no such part this time",
+        ),
+        opt(
+            "names",
+            Type::Utf8,
+            "the item the part is of, when another's (a dependency's unit): what a chain of reasons follows",
+        ),
         opt(
             "beyond",
             Type::Utf8,
@@ -527,7 +575,11 @@ pub const ERRORS: Table = Table {
             Type::Dict,
             "a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic, blaze-bug (a site of a bug the daemon went on past: `function` its value kind, `message` what and how often, `detail` the first report's thread and stack), uncoded",
         ),
-        opt("function", Type::Utf8, "the function or instance it is of: a refused instance, a panicking proc macro"),
+        opt(
+            "function",
+            Type::Utf8,
+            "the function or instance it is of: a refused instance, a panicking proc macro",
+        ),
         col("message", Type::Utf8, "its first line"),
         opt("detail", Type::Utf8, "why: its first help or note, or a refused function's reason"),
         opt("file", Type::Utf8, "the file of its primary span"),
@@ -543,7 +595,11 @@ pub const LINKS: Table = Table {
         BUILD_ID,
         col("image", Type::Utf8, "the image: the target as cargo names it, `blaze (bin)`"),
         opt("crate", Type::Dict, "the package it is of"),
-        col("outcome", Type::Dict, "patched (the kept image patched in place) or placed (laid out whole)"),
+        col(
+            "outcome",
+            Type::Dict,
+            "patched (the kept image patched in place) or placed (laid out whole)",
+        ),
         opt("dur_ns", Type::I64, "how long linking it took"),
     ],
 };
@@ -568,25 +624,69 @@ pub const QUERY_COUNTS: Table = Table {
     doc: "one row a query function a build ran, verified or evicted: what the query engine counted",
     columns: &[
         col("build_id", Type::U64, "the build that ended when they were taken"),
-        col("query", Type::Dict, "the query function, as `spans.query_kind` names a query's span where they agree"),
+        col(
+            "query",
+            Type::Dict,
+            "the query function, as `spans.query_kind` names a query's span where they agree",
+        ),
         col("executed", Type::U64, "its runs"),
         col("verified", Type::U64, "its rows proved unchanged without running"),
         col("reran", Type::U64, "of its runs, those in a view the row had already run in"),
-        col("evicted_asked", Type::U64, "of its runs, those for a value evicted earlier and asked for again: what eviction cost"),
-        col("evicted", Type::U64, "its values a pass let go to keep its tag's values under their budget"),
-        col("dropped", Type::U64, "its values an explicit `evict_values` or `evict_values_of` let go"),
-        col("reads_recorded", Type::U64, "the reads its runs recorded, a row read again later in the same run included: over `reads_kept`, how often its runs re-read the same rows"),
-        col("reads_kept", Type::U64, "the reads its runs' rows kept: each run's distinct reads, summed"),
-        col("reads_most", Type::U64, "the most reads one of its runs held on its thread's query stack as it ended (the build's most, not a sum)"),
+        col(
+            "evicted_asked",
+            Type::U64,
+            "of its runs, those for a value evicted earlier and asked for again: what eviction cost",
+        ),
+        col(
+            "evicted",
+            Type::U64,
+            "its values a pass let go to keep its tag's values under their budget",
+        ),
+        col(
+            "dropped",
+            Type::U64,
+            "its values an explicit `evict_values` or `evict_values_of` let go",
+        ),
+        col(
+            "reads_recorded",
+            Type::U64,
+            "the reads its runs recorded, a row read again later in the same run included: over `reads_kept`, how often its runs re-read the same rows",
+        ),
+        col(
+            "reads_kept",
+            Type::U64,
+            "the reads its runs' rows kept: each run's distinct reads, summed",
+        ),
+        col(
+            "reads_most",
+            Type::U64,
+            "the most reads one of its runs held on its thread's query stack as it ended (the build's most, not a sum)",
+        ),
         opt(
             "written",
             Type::U64,
             "of an input: the times a setter wrote one of its fields, an equal value too (each opens a view): what the build changed, behind every run after it; null in files of a blaze before it",
         ),
-        opt("ran_new", Type::U64, "of its runs, first runs (the row never ran in this database); null in files of a blaze before it"),
-        opt("ran_changed", Type::U64, "of its runs, those because a read changed since the row last ran (`provenance` names the read); null before it"),
-        opt("ran_untracked", Type::U64, "of its runs, those because the row's last run made an untracked read, so it runs in every view (`provenance` names the read); null before it"),
-        opt("ran_cycle", Type::U64, "of its runs, those for a cycle: a stale provisional row, or a verify that re-entered a cycle; null before it"),
+        opt(
+            "ran_new",
+            Type::U64,
+            "of its runs, first runs (the row never ran in this database); null in files of a blaze before it",
+        ),
+        opt(
+            "ran_changed",
+            Type::U64,
+            "of its runs, those because a read changed since the row last ran (`provenance` names the read); null before it",
+        ),
+        opt(
+            "ran_untracked",
+            Type::U64,
+            "of its runs, those because the row's last run made an untracked read, so it runs in every view (`provenance` names the read); null before it",
+        ),
+        opt(
+            "ran_cycle",
+            Type::U64,
+            "of its runs, those for a cycle: a stale provisional row, or a verify that re-entered a cycle; null before it",
+        ),
     ],
 };
 
@@ -598,24 +698,53 @@ pub const MISSES: Table = Table {
     doc: "one row a thing a build computed again instead of reusing, and why",
     columns: &[
         col("build_id", Type::U64, "the build that computed it again"),
-        col("step", Type::Dict, "what was computed: `codegen dev template`, `unit`, `build script run`"),
-        col("item", Type::Utf8, "what of, by path: a function, a unit, a package's build script's run"),
+        col(
+            "step",
+            Type::Dict,
+            "what was computed: `codegen dev template`, `unit`, `build script run`",
+        ),
+        col(
+            "item",
+            Type::Utf8,
+            "what of, by path: a function, a unit, a package's build script's run",
+        ),
         col(
             "cause",
             Type::Dict,
             "first, parts, lost, beyond, unnamed, read, unrecorded, collected, unshaped, twice, always, not_explained or failed",
         ),
-        opt("what", Type::Utf8, "what changed or why, in words: the read, the parts of its key that changed, the reason"),
-        opt("names", Type::Utf8, "the item the change is of, when another's: what a chain of reasons follows"),
-        opt("was", Type::Utf8, "the hash of what changed when it was last computed, in hex; null for several parts"),
+        opt(
+            "what",
+            Type::Utf8,
+            "what changed or why, in words: the read, the parts of its key that changed, the reason",
+        ),
+        opt(
+            "names",
+            Type::Utf8,
+            "the item the change is of, when another's: what a chain of reasons follows",
+        ),
+        opt(
+            "was",
+            Type::Utf8,
+            "the hash of what changed when it was last computed, in hex; null for several parts",
+        ),
         opt("now", Type::Utf8, "its hash now, in hex; null for several parts"),
-        opt("changed", Type::U32, "how many of its reads or key parts changed; for twice, how many keys it had"),
+        opt(
+            "changed",
+            Type::U32,
+            "how many of its reads or key parts changed; for twice, how many keys it had",
+        ),
         opt("of", Type::U32, "how many reads or key parts it has"),
-        opt("since", Type::U64, "the last build that computed it and ended well, which it is compared with"),
+        opt(
+            "since",
+            Type::U64,
+            "the last build that computed it and ended well, which it is compared with",
+        ),
     ],
 };
 
-const JOB: Column = opt("job", Type::U64, "the job, as `switches` numbers it; null for a thread lane");
+const JOB: Column =
+    opt("job", Type::U64, "the job, as `switches` numbers it; null for a thread lane");
 const STATE: Column = col(
     "state",
     Type::Utf8,
@@ -634,7 +763,11 @@ pub const JOB_INTERVALS: Table = Table {
         BUILD_ID,
         PROCESS,
         JOB,
-        opt("lane_thread", Type::U32, "for a thread lane, a thread no switch puts a job on: its thread"),
+        opt(
+            "lane_thread",
+            Type::U32,
+            "for a thread lane, a thread no switch puts a job on: its thread",
+        ),
         opt("fiber", Type::U32, "the fiber the job ran on"),
         STATE,
         col("from_ns", Type::I64, "when it began"),
@@ -647,7 +780,11 @@ pub const JOB_INTERVALS: Table = Table {
             Type::Utf8,
             "for running, what ended it: switch (its own next switch), record_end (the record's end, the job still running) or spans (a thread lane's last span)",
         ),
-        opt("wait_kind", Type::Utf8, "for a wait: what it waited for, as `switches` says; null for a thread lane's wait span"),
+        opt(
+            "wait_kind",
+            Type::Utf8,
+            "for a wait: what it waited for, as `switches` says; null for a thread lane's wait span",
+        ),
         opt("wait_value", Type::U64, "for a wait: its value, as `switches` says"),
         opt("awaits", Type::Utf8, "for a wait: its wait span's `awaits`"),
         opt("waker_job", Type::U64, "for a wait: the job that woke it, when the record names it"),
@@ -684,10 +821,18 @@ pub const SPAN_TIME: Table = Table {
         col("running_ns", Type::I64, "of it, its job ran on a core"),
         col("parked_ns", Type::I64, "of it, its job was parked before a `ready` row"),
         col("queued_ns", Type::I64, "of it, its job was runnable and waiting for a core"),
-        col("parked_or_queued_ns", Type::I64, "of it, its job waited with no `ready` row saying how long it was queued"),
+        col(
+            "parked_or_queued_ns",
+            Type::I64,
+            "of it, its job waited with no `ready` row saying how long it was queued",
+        ),
         col("unrecorded_ns", Type::I64, "of it, the record says nothing of its job"),
         col("uncovered_ns", Type::I64, "of its running time, the part under no child span"),
-        col("self_waiting_ns", Type::I64, "of its waiting, the part under no child span: for a span not `wait`, a wait with no name"),
+        col(
+            "self_waiting_ns",
+            Type::I64,
+            "of its waiting, the part under no child span: for a span not `wait`, a wait with no name",
+        ),
     ],
 };
 
@@ -698,7 +843,11 @@ pub const PATH_LINKS: Table = Table {
     columns: &[
         BUILD_ID,
         col("step", Type::U64, "its place on the path, 0 first"),
-        col("kind", Type::Utf8, "ran, queued, waited (no waker to cross to), wake (the waker's last run to the resume) or unrecorded"),
+        col(
+            "kind",
+            Type::Utf8,
+            "ran, queued, waited (no waker to cross to), wake (the waker's last run to the resume) or unrecorded",
+        ),
         PROCESS,
         JOB,
         col("lane", Type::Utf8, "the job or thread lane it is on"),
@@ -706,8 +855,16 @@ pub const PATH_LINKS: Table = Table {
         col("from_ns", Type::I64, "when it began"),
         col("to_ns", Type::I64, "when it ended"),
         col("dur_ns", Type::I64, "to_ns - from_ns"),
-        col("item", Type::Utf8, "the span it ran inside and its outermost one, or what it waited for"),
-        opt("woke_job", Type::U64, "the job whose wait this link's end woke: the path crossed from it"),
+        col(
+            "item",
+            Type::Utf8,
+            "the span it ran inside and its outermost one, or what it waited for",
+        ),
+        opt(
+            "woke_job",
+            Type::U64,
+            "the job whose wait this link's end woke: the path crossed from it",
+        ),
         opt("woke", Type::Utf8, "what that job waited for"),
     ],
 };
@@ -735,17 +892,33 @@ pub const PERF_RUNS: Table = Table {
     columns: &[
         col("run", Type::Utf8, "16 hex digits: a hash of its repetitions' profiles"),
         col("format", Type::U32, "the perf rows' format: a reader refuses one it does not know"),
-        col("target", Type::Utf8, "the program, as its profile names it (its executable's file name)"),
+        col(
+            "target",
+            Type::Utf8,
+            "the program, as its profile names it (its executable's file name)",
+        ),
         col("started_unix_ns", Type::I64, "when its first repetition began, on the wall clock"),
         col("reps", Type::U32, "how many repetitions"),
-        opt("tree", Type::Utf8, "the digest of the workspace's source tree, as `builds.tree`; null when not known (`gaps` says why)"),
+        opt(
+            "tree",
+            Type::Utf8,
+            "the digest of the workspace's source tree, as `builds.tree`; null when not known (`gaps` says why)",
+        ),
         col("blaze", Type::Utf8, "the BLAKE3 hash of the blaze that recorded it"),
-        opt("binary", Type::Utf8, "the BLAKE3 hash of the executable that ran; null when it could not be read"),
+        opt(
+            "binary",
+            Type::Utf8,
+            "the BLAKE3 hash of the executable that ran; null when it could not be read",
+        ),
         opt("build_id", Type::Utf8, "the executable's build id, as its profile's frames name it"),
         col("host", Type::Utf8, "the machine it ran on"),
         col("arch", Type::Utf8, "its architecture"),
         col("os", Type::Utf8, "its operating system"),
-        opt("cpu_period_ns", Type::U64, "the CPU time one sample stands for; null when the sampler was off"),
+        opt(
+            "cpu_period_ns",
+            Type::U64,
+            "the CPU time one sample stands for; null when the sampler was off",
+        ),
         col("sampler", Type::Utf8, "how the sampler ran, as the profile says"),
         col("samples", Type::U64, "samples of a thread on a CPU, every repetition"),
         col("unmapped", Type::U64, "of those, samples whose running function no code map names"),
@@ -763,9 +936,17 @@ pub const PERF_FUNCTIONS: Table = Table {
     columns: &[
         col("run", Type::Utf8, "the run, as `perf_runs.run`"),
         col("rep", Type::U32, "the repetition, from 0"),
-        col("function", Type::Utf8, "the instance's demangled path; the frame's symbol when no code map names it"),
+        col(
+            "function",
+            Type::Utf8,
+            "the instance's demangled path; the frame's symbol when no code map names it",
+        ),
         opt("module", Type::Utf8, "the image it is in"),
-        opt("identity", Type::Utf8, "what it is across builds (item, which instance, type arguments), hex: what runs are joined by"),
+        opt(
+            "identity",
+            Type::Utf8,
+            "what it is across builds (item, which instance, type arguments), hex: what runs are joined by",
+        ),
         opt("code", Type::Utf8, "its own code: its code hash and its type arguments' facts, hex"),
         opt("key", Type::Utf8, "its code with the codegen settings, hex"),
         opt("deep", Type::Utf8, "its key and those of everything it refers to, transitively, hex"),

@@ -14,11 +14,7 @@ use crate::native::shrinker::{ShrinkProbe, ShrinkRun, Shrinker};
 
 fn int_node(value: i128) -> ChoiceNode {
     ChoiceNode::integer(
-        IntegerChoice::new(
-            BigInt::from(i128::MIN),
-            BigInt::from(i128::MAX),
-            BigInt::from(0),
-        ),
+        IntegerChoice::new(BigInt::from(i128::MIN), BigInt::from(i128::MAX), BigInt::from(0)),
         BigInt::from(value),
         false,
     )
@@ -29,14 +25,7 @@ fn bool_node(value: bool) -> ChoiceNode {
 }
 
 fn span(start: usize, end: usize, discarded: bool) -> Span {
-    Span {
-        start,
-        end,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded,
-    }
+    Span { start, end, label: 1, depth: 0, parent: None, discarded }
 }
 
 type BoxedTestFn = Box<dyn ShrinkProbe + Send + 'static>;
@@ -123,14 +112,8 @@ fn remove_discarded_deletes_non_overlapping_regions_in_reverse() {
 
 #[test]
 fn remove_discarded_skips_nested_discarded_spans() {
-    let initial = vec![
-        int_node(0),
-        int_node(1),
-        int_node(2),
-        int_node(3),
-        int_node(4),
-        int_node(5),
-    ];
+    let initial =
+        vec![int_node(0), int_node(1), int_node(2), int_node(3), int_node(4), int_node(5)];
     let mut spans = Spans::new();
     spans.push(span(0, 6, false));
     spans.push(span(1, 5, true));

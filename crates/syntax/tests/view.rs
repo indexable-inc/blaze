@@ -106,7 +106,11 @@ fn check(path: &Path, parse: &Parse<SourceFile>) {
         let at = || format!("{path:?}, element {i} {:?}", key(h));
         assert_eq!(key(h), view_key(v), "{}", at());
         assert_eq!(h.index(), v.index(), "{}", at());
-        assert!(same(v.parent().map(NodeOrToken::Node), h.parent().map(NodeOrToken::Node)), "{}", at());
+        assert!(
+            same(v.parent().map(NodeOrToken::Node), h.parent().map(NodeOrToken::Node)),
+            "{}",
+            at()
+        );
         assert!(same(v.next_sibling_or_token(), h.next_sibling_or_token()), "{}", at());
         assert!(same(v.prev_sibling_or_token(), h.prev_sibling_or_token()), "{}", at());
         assert!(view::Node::at(root.shared_file(), v.id()) == v, "{}", at());
@@ -116,10 +120,26 @@ fn check(path: &Path, parse: &Parse<SourceFile>) {
                 assert!(same(v.first_child_or_token(), h.first_child_or_token()), "{}", at());
                 assert!(same(v.last_child_or_token(), h.last_child_or_token()), "{}", at());
                 let node = |it: Option<SyntaxNode>| it.map(NodeOrToken::Node);
-                assert!(same(v.first_child().map(NodeOrToken::Node), node(h.first_child())), "{}", at());
-                assert!(same(v.last_child().map(NodeOrToken::Node), node(h.last_child())), "{}", at());
-                assert!(same(v.next_sibling().map(NodeOrToken::Node), node(h.next_sibling())), "{}", at());
-                assert!(same(v.prev_sibling().map(NodeOrToken::Node), node(h.prev_sibling())), "{}", at());
+                assert!(
+                    same(v.first_child().map(NodeOrToken::Node), node(h.first_child())),
+                    "{}",
+                    at()
+                );
+                assert!(
+                    same(v.last_child().map(NodeOrToken::Node), node(h.last_child())),
+                    "{}",
+                    at()
+                );
+                assert!(
+                    same(v.next_sibling().map(NodeOrToken::Node), node(h.next_sibling())),
+                    "{}",
+                    at()
+                );
+                assert!(
+                    same(v.prev_sibling().map(NodeOrToken::Node), node(h.prev_sibling())),
+                    "{}",
+                    at()
+                );
                 assert_eq!(h.children().count(), v.children().count(), "{}", at());
                 assert_eq!(h.first_child_token_text(), v.first_child_token_text(), "{}", at());
                 let range = h.text_range();
@@ -132,16 +152,29 @@ fn check(path: &Path, parse: &Parse<SourceFile>) {
             (NodeOrToken::Token(h), NodeOrToken::Token(v)) => {
                 assert_eq!(h.text(), v.text(), "{}", at());
                 let token = |it: Option<syntax::SyntaxToken>| it.map(NodeOrToken::Token);
-                assert!(same(v.next_token().map(NodeOrToken::Token), token(h.next_token())), "{}", at());
-                assert!(same(v.prev_token().map(NodeOrToken::Token), token(h.prev_token())), "{}", at());
+                assert!(
+                    same(v.next_token().map(NodeOrToken::Token), token(h.next_token())),
+                    "{}",
+                    at()
+                );
+                assert!(
+                    same(v.prev_token().map(NodeOrToken::Token), token(h.prev_token())),
+                    "{}",
+                    at()
+                );
                 let offset = h.text_range().start();
                 assert_eq!(
                     handle_tokens(handle.token_at_offset(offset)),
                     view_tokens(&root.token_at_offset(offset)),
-                    "{}", at()
+                    "{}",
+                    at()
                 );
                 let range = h.text_range();
-                assert!(same(Some(root.covering_element(range)), Some(handle.covering_element(range))), "{}", at());
+                assert!(
+                    same(Some(root.covering_element(range)), Some(handle.covering_element(range))),
+                    "{}",
+                    at()
+                );
             }
             _ => panic!("{}: a node in one walk and a token in the other", at()),
         }
@@ -237,7 +270,9 @@ fn walking_a_whole_file_allocates_nothing() {
         for parse in parses(&text) {
             // An outline's bodies are parsed by the first walk; the budget is for reads.
             let first = walk(parse.root());
-            let again = blaze_alloc_count::assert_at_most(0, &format!("walking {path:?}"), || walk(parse.root()));
+            let again = blaze_alloc_count::assert_at_most(0, &format!("walking {path:?}"), || {
+                walk(parse.root())
+            });
             assert_eq!(first, again);
         }
     }

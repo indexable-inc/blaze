@@ -6,14 +6,8 @@ fn label_from_name_hashes_the_utf8_bytes() {
     assert_eq!(label_from_name(""), 0xcbf29ce484222325);
     assert_eq!(label_from_name("a"), 0xaf63dc4c8601ec8c);
     assert_eq!(label_from_name("foobar"), 0x85944171f73967e8);
-    assert_eq!(
-        label_from_name("hegel.integer"),
-        label_from_bytes(b"hegel.integer")
-    );
-    assert_eq!(
-        label_from_name("ünïcödé"),
-        label_from_bytes("ünïcödé".as_bytes())
-    );
+    assert_eq!(label_from_name("hegel.integer"), label_from_bytes(b"hegel.integer"));
+    assert_eq!(label_from_name("ünïcödé"), label_from_bytes("ünïcödé".as_bytes()));
 }
 
 #[test]

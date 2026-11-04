@@ -36,7 +36,11 @@ fn library<'a>(aux: &'a [(&'a str, &'a str, &'a str)]) -> Library<'a> {
 #[test]
 fn non_fmt_panic() {
     let aux = [("fancy_panic", "2015", include_str!("non_fmt_panic/fancy-panic.rs"))];
-    let ui = Ui { name: "non-fmt-panic.rs", source: include_str!("non_fmt_panic/non-fmt-panic.rs"), ..Ui::default() };
+    let ui = Ui {
+        name: "non-fmt-panic.rs",
+        source: include_str!("non_fmt_panic/non-fmt-panic.rs"),
+        ..Ui::default()
+    };
     assert_reports(
         &ui_library(ui, &library(&aux)),
         &[

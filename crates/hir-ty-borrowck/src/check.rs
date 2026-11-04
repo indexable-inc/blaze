@@ -5,8 +5,8 @@
 
 use std::fmt;
 
-use hir_ty::db::HirDatabase;
 use hir_def::hir::{BindingAnnotation, BindingId, ExprId, Pat, Statement};
+use hir_ty::db::HirDatabase;
 use rustc_type_ir::{
     ClauseKind, OutlivesClause, RegionKind,
     inherent::{GenericArgs as _, IntoKind},
@@ -25,13 +25,13 @@ use super::{
     Applicability, BorrowckDiagnostic, Child, Ctx, Mode, PartSpan, Sublevel, Suggestion,
     bitset::{BitSet, bits},
     cfg::{Cfg, Dominators, Location, index},
+    decode::Decoded,
+    flow,
     intervals::IntervalSet,
     liveness,
     loans::{Activation, Bias, Depth, Loan, Loans, places_conflict},
     mem::{self, FMap, FSet, FVec, Frame},
     moves::{InitFlow, InitKind, Lookup, MoveData, Mpi, apply},
-    decode::Decoded,
-    flow,
     names::Text,
     polonius,
     regions::{self, Category, RegionValues, Regions, UniversalKind},
@@ -152,7 +152,7 @@ impl<'f> Draft<'f> {
                 .map(|it| Child {
                     level: it.level,
                     message: String::from(it.message), // alloc: the owned diagnostic
-                    spans: it.spans.to_vec(), // alloc: the owned diagnostic
+                    spans: it.spans.to_vec(),          // alloc: the owned diagnostic
                     labels: labels(it.labels),
                 })
                 .collect(), // alloc: the owned diagnostic
@@ -197,20 +197,39 @@ pub(super) fn check<'o, 'f, 'db>(
     moved: &mut FVec<'o, UseOfMoved<'o>>,
 ) -> (usize, FVec<'o, regions::Requirement<'db>>, FVec<'o, usize>) {
     use crate::timings::{Phase, phase};
-    let (cfg, decoded, moves, rustc_moves, upvar_sources, flow, dominators, capture_temps, index_spans) =
-        phase(Phase::Moves, || {
-            let frame = ctx.frame;
-            let cfg = Cfg::new(frame, body);
-            let decoded = Decoded::new(ctx, body, &cfg);
-            let moves = MoveData::gather(ctx, body, &cfg, &decoded);
-            let rustc_moves = frame_only(|| rustc_move_indices(ctx, body, &moves));
-            let upvar_sources = frame_only(|| upvar_sources(ctx, body));
-            let flow = InitFlow::compute(frame, body, &cfg, &moves);
-            let dominators = Dominators::new(frame, &cfg);
-            let capture_temps = frame_only(|| capture_temps(frame, body));
-            let index_spans = frame_only(|| index_spans(frame, body));
-            (cfg, decoded, moves, rustc_moves, upvar_sources, flow, dominators, capture_temps, index_spans)
-        });
+    let (
+        cfg,
+        decoded,
+        moves,
+        rustc_moves,
+        upvar_sources,
+        flow,
+        dominators,
+        capture_temps,
+        index_spans,
+    ) = phase(Phase::Moves, || {
+        let frame = ctx.frame;
+        let cfg = Cfg::new(frame, body);
+        let decoded = Decoded::new(ctx, body, &cfg);
+        let moves = MoveData::gather(ctx, body, &cfg, &decoded);
+        let rustc_moves = frame_only(|| rustc_move_indices(ctx, body, &moves));
+        let upvar_sources = frame_only(|| upvar_sources(ctx, body));
+        let flow = InitFlow::compute(frame, body, &cfg, &moves);
+        let dominators = Dominators::new(frame, &cfg);
+        let capture_temps = frame_only(|| capture_temps(frame, body));
+        let index_spans = frame_only(|| index_spans(frame, body));
+        (
+            cfg,
+            decoded,
+            moves,
+            rustc_moves,
+            upvar_sources,
+            flow,
+            dominators,
+            capture_temps,
+            index_spans,
+        )
+    });
     let mut regions = phase(Phase::Constraints, || regions::build(ctx, body, &cfg, requirements));
     let count = ctx.infcx.num_region_vars();
     phase(Phase::Constraints, || regions::answer_placeholders(ctx.frame, &mut regions, count));
@@ -325,11 +344,8 @@ pub(super) fn check<'o, 'f, 'db>(
             eprintln!("{constraint:?}");
         }
         for (id, loan) in loans.loans.iter().enumerate() {
-            let points: Vec<usize> = values
-                .points_of(loan.region)
-                .iter()
-                .filter(|&it| it < cfg.points)
-                .collect(); // alloc: BLAZE_BORROWCK_DEBUG output only
+            let points: Vec<usize> =
+                values.points_of(loan.region).iter().filter(|&it| it < cfg.points).collect(); // alloc: BLAZE_BORROWCK_DEBUG output only
             eprintln!(
                 "loan {:?} {:?} at {:?} region {} points {points:?}",
                 loan.local,
@@ -540,7 +556,8 @@ fn member_choices<'f>(
     for constraint in &regions.members {
         let member = constraint.region;
         choices.clear();
-        choices.extend(regions.choices_of(constraint).iter().filter_map(|&it| regions.universal(it)));
+        choices
+            .extend(regions.choices_of(constraint).iter().filter_map(|&it| regions.universal(it)));
         lower.clear();
         lower.extend(values.universals_of(member).filter(|&it| it != 1));
         // A region of the signature written into the hidden type is that region on both sides.
@@ -1489,11 +1506,7 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                     && !self.is_raw_borrow(span)
                     && self.is_disaligned(place)
                 {
-                    self.report(
-                        "E0793",
-                        span,
-                        "reference to field of packed struct is unaligned",
-                    );
+                    self.report("E0793", span, "reference to field of packed struct is unaligned");
                 }
             }
             Rvalue::Discriminant(place) if self.ctx.cast_moves(self.body, place, span) => {
@@ -1829,12 +1842,10 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
             (
                 BorrowKind::Mut { kind: ClosureCapture },
                 BorrowKind::Mut { kind: ClosureCapture },
-            ) => {
-                (
-                    "E0524",
-                    text!(self, "two closures require unique access to {what} at the same time"),
-                )
-            }
+            ) => (
+                "E0524",
+                text!(self, "two closures require unique access to {what} at the same time"),
+            ),
             (BorrowKind::Mut { kind: ClosureCapture }, _) => (
                 "E0500",
                 text!(self, "closure requires unique access to {what} but it is already borrowed"),
@@ -2161,7 +2172,9 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
         let display = DisplayTarget::from_crate(db, self.ctx.krate);
         // Whose late-bound lifetimes a function item's `for<'a>` binds; a constructor has none.
         let owner = match dropped.function {
-            Some(hir_def::CallableDefId::FunctionId(it)) => Some(hir_def::GenericDefId::FunctionId(it)),
+            Some(hir_def::CallableDefId::FunctionId(it)) => {
+                Some(hir_def::GenericDefId::FunctionId(it))
+            }
             _ => None,
         };
         // An anonymous lifetime of a fn pointer's or closure's `for<'a>` by its position, `'1`,
@@ -2232,18 +2245,16 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                     MirSpan::ExprId(expr) => Some(expr),
                     _ => None,
                 };
-                let what = expr.and_then(|expr| {
-                    match regions::path_binding(self.ctx, self.body, expr) {
+                let what =
+                    expr.and_then(|expr| match regions::path_binding(self.ctx, self.body, expr) {
                         Some(binding) => {
                             Some(text!(self, "`{}`", self.ctx.store[binding].name.as_str()))
                         }
-                        None => matches!(
-                            self.ctx.store.expr(expr),
-                            hir_def::hir::Expr::Closure { .. }
-                        )
-                        .then_some("the closure"),
-                    }
-                });
+                        None => {
+                            matches!(self.ctx.store.expr(expr), hir_def::hir::Expr::Closure { .. })
+                                .then_some("the closure")
+                        }
+                    });
                 match what {
                     Some(what) => text!(self, "{what}, a `{}`,", fn_ptr(dropped.source)),
                     None => text!(self, "`{}`", fn_ptr(dropped.source)),
@@ -3853,7 +3864,11 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
             MoveErrorKind::Destructor(len) => {
                 let base = place.base(len);
                 let ty = self.ctx.place_ty(self.body, base.local, base.projection).ty;
-                text!(self, "cannot move out of type `{}`, which implements the `Drop` trait", self.ctx.shown_ty(&ty))
+                text!(
+                    self,
+                    "cannot move out of type `{}`, which implements the `Drop` trait",
+                    self.ctx.shown_ty(&ty)
+                )
             }
             MoveErrorKind::Guard => {
                 text!(self, "cannot move out of {} in pattern guard", self.quoted(place, "value"))

@@ -298,7 +298,8 @@ impl Recorder {
             .parent
             .and_then(|p| self.open.get(&p))
             .map_or(0, |p| p.span.depth.saturating_add(1));
-        let kind = new.kind.unwrap_or(if new.wait.is_some() { SpanKind::Wait } else { SpanKind::Span });
+        let kind =
+            new.kind.unwrap_or(if new.wait.is_some() { SpanKind::Wait } else { SpanKind::Span });
         let mut fields = new.fields;
         let span = Span {
             process: self.process,
@@ -372,7 +373,9 @@ impl Recorder {
             (Some(now), Some(then)) => Some((now - then).max(0)),
             _ => None,
         };
-        if let (Some(cpu), Some(parent)) = (total_cpu, at.checked_sub(1).and_then(|i| stack.get_mut(i))) {
+        if let (Some(cpu), Some(parent)) =
+            (total_cpu, at.checked_sub(1).and_then(|i| stack.get_mut(i)))
+        {
             parent.child_cpu += cpu;
         }
         let delta = |now: Option<u64>, then: Option<u64>| Some(now?.saturating_sub(then?));
@@ -416,7 +419,9 @@ impl Recorder {
                 s
             })
             .collect();
-        all.sort_by(|a, b| (a.thread, a.start_ns, a.span_id).cmp(&(b.thread, b.start_ns, b.span_id)));
+        all.sort_by(|a, b| {
+            (a.thread, a.start_ns, a.span_id).cmp(&(b.thread, b.start_ns, b.span_id))
+        });
         all
     }
 
@@ -435,13 +440,14 @@ impl Recorder {
 
     pub fn alloc(&mut self, a: RawAlloc) {
         self.advance_clock(a.t_ns);
-        let span_name = a
-            .span_id
-            .and_then(|id| self.open.get(&id))
-            .map(|it| it.span.name.clone());
+        let span_name = a.span_id.and_then(|id| self.open.get(&id)).map(|it| it.span.name.clone());
         let mut key: AllocKey = (a.pcs.clone(), span_name);
         if !self.allocs.contains_key(&key) && self.allocs.len() >= self.limits.alloc_stacks {
-            self.drop_records("allocs", 1, "too many distinct allocation stacks: folded into one row");
+            self.drop_records(
+                "allocs",
+                1,
+                "too many distinct allocation stacks: folded into one row",
+            );
             key = (Vec::new(), Some("<other stacks>".to_owned()));
         }
         let agg = self.allocs.entry(key.clone()).or_default();
@@ -453,7 +459,11 @@ impl Recorder {
         if self.live_blocks.len() < self.limits.live_blocks {
             self.live_blocks.insert(a.address, (key, a.bytes, a.count));
         } else {
-            self.drop_records("allocs", 1, "too many sampled live blocks: its free will not be seen");
+            self.drop_records(
+                "allocs",
+                1,
+                "too many sampled live blocks: its free will not be seen",
+            );
         }
         if self.alloc_events.push(a) {
             self.drop_records("alloc_events", 1, "recorder ring full");
@@ -487,14 +497,23 @@ impl Recorder {
         let firsts = [
             self.spans.items.front().filter(|_| self.spans.base > 0).map(|it| it.start_ns),
             self.samples.items.front().filter(|_| self.samples.base > 0).map(|it| it.t_ns),
-            self.alloc_events.items.front().filter(|_| self.alloc_events.base > 0).map(|it| it.t_ns),
+            self.alloc_events
+                .items
+                .front()
+                .filter(|_| self.alloc_events.base > 0)
+                .map(|it| it.t_ns),
         ];
         firsts.into_iter().flatten().max().unwrap_or(self.meta.start_ns)
     }
 
     /// Everything retained in `[since, until]` (all of it for `None`), as a canonical profile.
     /// Open spans are included, cut at `until` (their `dur_ns` so far).
-    pub fn snapshot(&self, since: Option<i64>, until: Option<i64>, symbols: &mut dyn Symbolize) -> Profile {
+    pub fn snapshot(
+        &self,
+        since: Option<i64>,
+        until: Option<i64>,
+        symbols: &mut dyn Symbolize,
+    ) -> Profile {
         let since = since.unwrap_or(i64::MIN);
         let until = until.unwrap_or(self.now_ns);
         let inside = |t: i64| t >= since && t <= until;
@@ -526,8 +545,10 @@ impl Recorder {
             s.dur_ns = (until - s.start_ns).max(0);
             p.spans.push(s);
         }
-        let samples: Vec<&RawSample> = self.samples.items.iter().filter(|s| inside(s.t_ns)).collect();
-        let events: Vec<&RawAlloc> = self.alloc_events.items.iter().filter(|a| inside(a.t_ns)).collect();
+        let samples: Vec<&RawSample> =
+            self.samples.items.iter().filter(|s| inside(s.t_ns)).collect();
+        let events: Vec<&RawAlloc> =
+            self.alloc_events.items.iter().filter(|a| inside(a.t_ns)).collect();
         let frees: Vec<&RawAlloc> = self.frees.items.iter().filter(|a| inside(a.t_ns)).collect();
         // Symbolize every address once.
         let mut addresses: Vec<u64> = samples

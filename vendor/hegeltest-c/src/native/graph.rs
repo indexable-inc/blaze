@@ -123,10 +123,7 @@ impl Run {
                 .iter()
                 .zip(addrs)
                 .filter(|(node, _)| !node.was_forced)
-                .map(|(node, addr)| Step {
-                    addr,
-                    value: node.value(),
-                })
+                .map(|(node, addr)| Step { addr, value: node.value() })
                 .collect(),
         }
     }
@@ -219,10 +216,7 @@ impl Default for Graph {
 impl Graph {
     /// The empty graph: `Start` and `End`, no edges.
     pub(crate) fn new() -> Graph {
-        let mut g = Graph {
-            nodes: Vec::new(),
-            index: HashMap::default(),
-        };
+        let mut g = Graph { nodes: Vec::new(), index: HashMap::default() };
         g.node_for(&Ident::Start);
         g.node_for(&Ident::End);
         g
@@ -247,10 +241,7 @@ impl Graph {
             return n;
         }
         let n = self.nodes.len();
-        self.nodes.push(Node {
-            ident: ident.clone(),
-            edges: Vec::new(),
-        });
+        self.nodes.push(Node { ident: ident.clone(), edges: Vec::new() });
         self.index.insert(ident.clone(), n);
         n
     }
@@ -354,10 +345,7 @@ impl Graph {
     }
 
     pub(crate) fn edge_count(&self) -> usize {
-        self.reachable()
-            .iter()
-            .map(|&n| self.nodes[n].edges.len())
-            .sum()
+        self.reachable().iter().map(|&n| self.nodes[n].edges.len()).sum()
     }
 
     /// The shrink order on graphs: fewer edges, then fewer reachable nodes,
@@ -371,11 +359,7 @@ impl Graph {
                 values.push(shrink_rank(&e.value));
             }
         }
-        GraphKey {
-            edges: values.len(),
-            nodes: order.len(),
-            values,
-        }
+        GraphKey { edges: values.len(), nodes: order.len(), values }
     }
 
     /// The graph with its unreachable nodes and the edges into them
@@ -393,10 +377,7 @@ impl Graph {
         for (i, &n) in order.iter().enumerate() {
             map[n] = i;
         }
-        let mut g = Graph {
-            nodes: Vec::with_capacity(order.len()),
-            index: HashMap::default(),
-        };
+        let mut g = Graph { nodes: Vec::with_capacity(order.len()), index: HashMap::default() };
         for &n in &order {
             let node = &self.nodes[n];
             g.index.insert(node.ident.clone(), g.nodes.len());
@@ -519,10 +500,7 @@ impl Graph {
         if !(2..=MAX_NODES).contains(&count) {
             return None;
         }
-        let mut g = Graph {
-            nodes: Vec::with_capacity(count),
-            index: HashMap::default(),
-        };
+        let mut g = Graph { nodes: Vec::with_capacity(count), index: HashMap::default() };
         for n in 0..count {
             let (&tag, tail) = rest.split_first()?;
             rest = tail;
@@ -542,10 +520,7 @@ impl Graph {
             if edges > MAX_EDGES {
                 return None;
             }
-            let mut node = Node {
-                ident,
-                edges: Vec::with_capacity(edges),
-            };
+            let mut node = Node { ident, edges: Vec::with_capacity(edges) };
             for _ in 0..edges {
                 let addr = take_frames(&mut rest)?;
                 let len = take_u32(&mut rest)?;
@@ -562,11 +537,7 @@ impl Graph {
                 if target >= count {
                     return None;
                 }
-                node.edges.push(Edge {
-                    addr,
-                    value: values.pop()?,
-                    target,
-                });
+                node.edges.push(Edge { addr, value: values.pop()?, target });
             }
             g.nodes.push(node);
         }

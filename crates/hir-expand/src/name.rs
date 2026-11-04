@@ -255,11 +255,7 @@ impl Name {
     }
 
     #[inline]
-    pub fn display<'a>(
-        &'a self,
-        db: &Db,
-        edition: Edition,
-    ) -> impl fmt::Display + 'a {
+    pub fn display<'a>(&'a self, db: &Db, edition: Edition) -> impl fmt::Display + 'a {
         _ = db;
         self.display_no_db(edition)
     }

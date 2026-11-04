@@ -76,10 +76,13 @@ fn pushes_in_order_stay_consolidated() {
 
 #[hegel::test]
 fn zset_matches_a_btreemap(tc: TestCase) {
-    let rows: Vec<(u8, i32)> = tc.draw(gs::vecs(gs::tuples!(
-        gs::integers().max_value(15),
-        gs::integers().min_value(-3).max_value(3),
-    )).max_size(63));
+    let rows: Vec<(u8, i32)> = tc.draw(
+        gs::vecs(gs::tuples!(
+            gs::integers().max_value(15),
+            gs::integers().min_value(-3).max_value(3),
+        ))
+        .max_size(63),
+    );
     let mut set = ZSet::new();
     let mut model = BTreeMap::<u8, Weight>::new();
     for &(t, w) in &rows {
@@ -354,12 +357,15 @@ fn arrangement_lookups_allocate_nothing() {
 
 #[hegel::test]
 fn arrangement_matches_a_btreemap(tc: TestCase) {
-    let ops: Vec<(u8, u8, u8, i32)> = tc.draw(gs::vecs(gs::tuples!(
-        gs::integers().max_value(5),
-        gs::integers().max_value(7),
-        gs::integers().max_value(3),
-        gs::integers().min_value(-2).max_value(2),
-    )).max_size(199));
+    let ops: Vec<(u8, u8, u8, i32)> = tc.draw(
+        gs::vecs(gs::tuples!(
+            gs::integers().max_value(5),
+            gs::integers().max_value(7),
+            gs::integers().max_value(3),
+            gs::integers().min_value(-2).max_value(2),
+        ))
+        .max_size(199),
+    );
     let mut arr = Arrangement::<u8, u8, u8>::new();
     // key -> (sort, value) -> weight.
     let mut model = BTreeMap::<u8, BTreeMap<(u8, u8), Weight>>::new();
@@ -427,10 +433,10 @@ fn a_warm_closure_allocates_nothing() {
 
 #[hegel::test]
 fn closure_matches_a_naive_bfs(tc: TestCase) {
-    let edges: Vec<(u8, u8)> = tc.draw(gs::vecs(gs::tuples!(
-        gs::integers().max_value(19),
-        gs::integers().max_value(19),
-    )).max_size(59));
+    let edges: Vec<(u8, u8)> = tc.draw(
+        gs::vecs(gs::tuples!(gs::integers().max_value(19), gs::integers().max_value(19),))
+            .max_size(59),
+    );
     let seeds: Vec<u8> = tc.draw(gs::vecs(gs::integers().max_value(19)).max_size(3));
     let step = |n: u8, next: &mut Vec<u8>| {
         next.extend(edges.iter().filter(|e| e.0 == n).map(|e| e.1));
@@ -485,7 +491,8 @@ fn a_warm_worklist_allocates_nothing() {
 
 #[hegel::test]
 fn worklist_matches_a_naive_queue(tc: TestCase) {
-    let ops: Vec<Option<u8>> = tc.draw(gs::vecs(gs::optional(gs::integers().max_value(9))).max_size(99));
+    let ops: Vec<Option<u8>> =
+        tc.draw(gs::vecs(gs::optional(gs::integers().max_value(9))).max_size(99));
     let mut work = Worklist::new();
     let mut model = VecDeque::new();
     for op in ops {

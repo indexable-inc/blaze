@@ -8,10 +8,7 @@ use blake3::hazmat::HasherExt;
 use blake3_servil::{Mode, convenience, performance};
 
 use super::{ContextKey, official, servil};
-use crate::{
-    ContentId,
-    rng::SplitMix64,
-};
+use crate::{ContentId, rng::SplitMix64};
 
 const MIB: usize = 1 << 20;
 
@@ -90,7 +87,9 @@ impl<'a> Of<'a> {
             Of::Plain => *blake3::hash(input).as_bytes(),
             Of::Keyed(key) => *blake3::keyed_hash(key, input).as_bytes(),
             Of::DeriveKey(context) => blake3::derive_key(context, input),
-            Of::ContextKey(key) => *blake3::Hasher::new_from_context_key(key).update(input).finalize().as_bytes(),
+            Of::ContextKey(key) => {
+                *blake3::Hasher::new_from_context_key(key).update(input).finalize().as_bytes()
+            }
         }
     }
 }
@@ -116,15 +115,27 @@ fn check(rng: &mut SplitMix64, of: Of<'_>, input: &[u8]) {
     let expected = of.official_once(input);
     let mut reference = of.official();
     reference.update(input);
-    assert_eq!(*reference.finalize().as_bytes(), expected, "official BLAKE3's two calls, {of:?}, {len} B");
+    assert_eq!(
+        *reference.finalize().as_bytes(),
+        expected,
+        "official BLAKE3's two calls, {of:?}, {len} B"
+    );
 
-    assert_eq!(*convenience::hash_with(mode, input).as_bytes(), expected, "hash_with, {of:?}, {len} B");
+    assert_eq!(
+        *convenience::hash_with(mode, input).as_bytes(),
+        expected,
+        "hash_with, {of:?}, {len} B"
+    );
     if let Of::Plain = of {
         assert_eq!(*convenience::hash(input).as_bytes(), expected, "hash, {len} B");
         assert_eq!(servil::hash(input), expected, "the backend's hash, {len} B");
     }
     if let Of::ContextKey(key) = of {
-        assert_eq!(servil::derive_key_with(key, input), expected, "the backend's derive_key_with, {len} B");
+        assert_eq!(
+            servil::derive_key_with(key, input),
+            expected,
+            "the backend's derive_key_with, {len} B"
+        );
     }
     let mut whole = performance::Hasher::new(mode);
     whole.update(input);
@@ -196,7 +207,11 @@ fn servil_is_official_blake3() {
         .iter()
         .map(|context| {
             let key = servil::context_key(context);
-            assert_eq!(key, blake3::hazmat::hash_derive_key_context(context), "the context key of {context:?}");
+            assert_eq!(
+                key,
+                blake3::hazmat::hash_derive_key_context(context),
+                "the context key of {context:?}"
+            );
             assert_eq!(performance::context_key(context), key);
             assert_eq!(official::context_key(context), key);
             &*Box::leak(Box::new(key))
@@ -229,7 +244,8 @@ fn the_backends_hash_alike() {
             let mut plain = (servil::Hasher::new(), official::Hasher::new());
             let mut whole = Vec::new();
             for _ in 0..rng.range(0..12) {
-                let len = if rng.one_in(8) { rng.range(0..70_000) } else { rng.range(0..80) } as usize;
+                let len =
+                    if rng.one_in(8) { rng.range(0..70_000) } else { rng.range(0..80) } as usize;
                 let start = rng.index(bytes.len() - len + 1);
                 let part = &bytes[start..start + len];
                 ours.update(part);
@@ -254,7 +270,8 @@ fn the_backends_hash_alike() {
 #[cfg(not(blaze_check))]
 #[test]
 fn of_many_is_alike_on_both_backends() {
-    let bytes: Vec<u8> = (0..2100u32).map(|n| (n.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    let bytes: Vec<u8> =
+        (0..2100u32).map(|n| (n.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
     for copies in [1, 2, 3, 7, 8, 9, 16, 17, 64, 65] {
         let inputs: Vec<&[u8]> = (0..=1100)
             .step_by(if copies > 16 { 7 } else { 1 })
@@ -294,7 +311,8 @@ fn hashing_starts_no_thread() {
     assert!(refused.is_err(), "a multithreaded call before initialize_multithreaded panics");
     #[cfg(target_os = "linux")]
     for task in std::fs::read_dir("/proc/self/task").expect("this process's threads") {
-        let comm = std::fs::read_to_string(task.expect("a thread").path().join("comm")).unwrap_or_default();
+        let comm = std::fs::read_to_string(task.expect("a thread").path().join("comm"))
+            .unwrap_or_default();
         assert!(!comm.starts_with("blake3-"), "a thread of the fork's pool: {comm:?}");
     }
 }

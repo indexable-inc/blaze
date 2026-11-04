@@ -11,7 +11,6 @@ use std::alloc::Allocator;
 
 use base_db::{BuiltDependency, Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{Frame, Tag};
 use cfg::CfgExpr;
 use either::Either;
@@ -24,6 +23,7 @@ use hir_expand::{
 };
 use intern::{Symbol, sym};
 use span::{Edition, FileAstId, ROOT_ERASED_FILE_AST_ID, SyntaxContext};
+use std::alloc::Global;
 use syntax::ast;
 use triomphe::Arc;
 
@@ -41,8 +41,7 @@ use crate::{
     macro_call_as_call_id,
     nameres::{
         BuiltinShadowMode, DefMap, DefMapCrateData, DiagnosticsByModule, Hygienic, LocalDefMap,
-        MacroSubNs,
-        ModuleData, ModuleOrigin, ModulesMap, ModulesSlot, ResolveMode, crate_def_map,
+        MacroSubNs, ModuleData, ModuleOrigin, ModulesMap, ModulesSlot, ResolveMode, crate_def_map,
         diagnostics::{DefDiagnostic, PreludeError},
         enable_builtin_derive_fast_path,
         mod_resolution::ModDir,
@@ -129,10 +128,7 @@ pub(crate) fn cx<'db, 'f>(
 }
 
 /// The crate attributes of the root file: the first part of the old `seed_with_top_level`.
-pub(crate) fn crate_data(
-    db: &Db,
-    krate: Crate,
-) -> Arc<DefMapCrateData> {
+pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
     let _p = tracing::info_span!(target: "blaze", "crate_data").entered();
     let krate_data = krate.data(db);
     let file_id = krate.root_file_id(db);
@@ -204,11 +200,7 @@ pub(crate) fn crate_data(
 
 /// The crate root's round-0 key: the extern prelude of the crate's dependencies (the old
 /// `seed_with_top_level`'s second part).
-pub(crate) fn root_decl(
-    db: &Db,
-    frame: &Frame,
-    krate: Crate,
-) -> DeclKey {
+pub(crate) fn root_decl(db: &Db, frame: &Frame, krate: Crate) -> DeclKey {
     let crate_data = queries::crate_data(db, krate);
     let deps = deps(db, frame, krate);
     let mut prelude = Vec::with_capacity_in(deps.len(), frame);
@@ -270,10 +262,7 @@ pub(crate) fn root_decl(
 /// The `LocalDefMap` paths read under a crate env: one per env, shared by every module whose
 /// collection starts from it.
 #[blaze_query::tracked(returns(ref))]
-fn crate_env_local(
-    db: &Db,
-    env: CrateEnvKey,
-) -> LocalDefMap {
+fn crate_env_local(db: &Db, env: CrateEnvKey) -> LocalDefMap {
     env.env(db).local_def_map()
 }
 
@@ -287,14 +276,12 @@ struct FileHead {
 }
 
 #[blaze_query::tracked(returns(ref))]
-fn mod_file_head(
-    db: &Db,
-    file: EditionedFileId,
-    krate: Crate,
-) -> FileHead {
+fn mod_file_head(db: &Db, file: EditionedFileId, krate: Crate) -> FileHead {
     match file_item_tree(db, file.into(), krate).top_level_attrs() {
         // clone: the cfg of a file that is configured out, once per such file
-        Some(AttrsOrCfgRef::CfgDisabled(cfg, _)) => FileHead { cfg_disabled: Some(cfg.clone()), macro_use: false },
+        Some(AttrsOrCfgRef::CfgDisabled(cfg, _)) => {
+            FileHead { cfg_disabled: Some(cfg.clone()), macro_use: false }
+        }
         Some(AttrsOrCfgRef::Enabled { attrs }) => {
             FileHead { cfg_disabled: None, macro_use: attrs.by_key(sym::macro_use).exists() }
         }
@@ -320,11 +307,7 @@ pub(super) fn held_scope(key: DeclKey) -> crate::nameres::BuildingScope {
 }
 
 /// One module's round-0 declarations: its collection over a [`DeclSink`].
-pub(crate) fn module_decls(
-    db: &Db,
-    frame: &Frame,
-    key: DeclKey,
-) -> ModuleDecls {
+pub(crate) fn module_decls(db: &Db, frame: &Frame, key: DeclKey) -> ModuleDecls {
     let _p = tracing::info_span!(target: "blaze", "module_decls").entered();
     let decl = key.decl(db);
     let cx = cx(db, frame, decl.krate, false);
@@ -405,10 +388,14 @@ fn inline_items(item_tree: &ItemTree, item: ModItemId, module: ModuleId) -> &[Mo
         ModItemKind::Mod(_, m) => match item_tree.mod_kind(m) {
             ModKind::Inline { items } => items,
             ModKind::Outline => {
-                panic!("nameres facts: the round-0 key of {module:?} names `mod` item {item:?}, which is not inline")
+                panic!(
+                    "nameres facts: the round-0 key of {module:?} names `mod` item {item:?}, which is not inline"
+                )
             }
         },
-        _ => panic!("nameres facts: the round-0 key of {module:?} names item {item:?}, which is not a `mod`"),
+        _ => panic!(
+            "nameres facts: the round-0 key of {module:?} names item {item:?}, which is not a `mod`"
+        ),
     }
 }
 
@@ -416,7 +403,11 @@ fn inline_items(item_tree: &ItemTree, item: ModItemId, module: ModuleId) -> &[Mo
 /// macro's definition, and where that definition is itself in an expansion of a declarative
 /// macro (`macro_rules! foo` made by `mk_foo!()`), the file of that macro's, up the chain. Each
 /// may be another crate's, whose edit changes no binding when the macros keep their ids.
-pub(in crate::nameres) fn definition_files(db: &Db, call: MacroCallId, mut each: impl FnMut(span::FileId)) {
+pub(in crate::nameres) fn definition_files(
+    db: &Db,
+    call: MacroCallId,
+    mut each: impl FnMut(span::FileId),
+) {
     let mut call = call;
     while let MacroDefKind::Declarative(ast, _) = call.loc(db).def.kind {
         each(ast.file_id.original_file(db).file_id(db));
@@ -563,9 +554,9 @@ impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
                 let calls = derive_calls.clone();
                 self.own_row().scope_mut().init_derive_attribute(adt, attr, attr_call, calls)
             }
-            DeclOp::ExternPrelude { .. } | DeclOp::MacroUsePrelude { .. } | DeclOp::Prelude { .. } => {
-                self.env_after(op)
-            }
+            DeclOp::ExternPrelude { .. }
+            | DeclOp::MacroUsePrelude { .. }
+            | DeclOp::Prelude { .. } => self.env_after(op),
             _ => {}
         }
     }
@@ -839,11 +830,7 @@ impl<'a, 'db, 'f> Sink<'db> for DeclSink<'a, 'db, 'f> {
 /// env holds it (its module bindings and children, in a `Building` scope); a module declared
 /// before the key's module under one of its ancestors, or under the key's module itself, with
 /// its `Scope::Decl` fact; `None` for any other.
-pub(crate) fn decl_row(
-    db: &Db,
-    key: DeclKey,
-    module: ModuleId,
-) -> Option<ModuleData> {
+pub(crate) fn decl_row(db: &Db, key: DeclKey, module: ModuleId) -> Option<ModuleData> {
     let decl = key.decl(db);
     let env = decl.env.env(db);
     if let Some(ancestor) = env.ancestors.iter().find(|it| it.module == module) {
@@ -873,9 +860,8 @@ fn textual_scope(scope: &ItemScope) -> Inherited {
 /// definition of each name, leaving out one that is still the latest of `inherited` (the
 /// parent holds it as its latest already).
 fn legacy_exports_of(scope: &ItemScope, inherited: &Inherited) -> LegacyExports {
-    let inherited_latest = |name: &Name| {
-        inherited.iter().find(|it| it.0 == *name).and_then(|it| it.1.last().copied())
-    };
+    let inherited_latest =
+        |name: &Name| inherited.iter().find(|it| it.0 == *name).and_then(|it| it.1.last().copied());
     let exports = || {
         scope
             .legacy_macros()
@@ -1243,7 +1229,10 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         self.sink.apply(DeclOp::Update {
             module,
             // alloc: the log owns each update's resolutions
-            resolutions: Box::new([(Some(name), PerNs::from_def(def, vis, value_ns_ctor_vis, None))]),
+            resolutions: Box::new([(
+                Some(name),
+                PerNs::from_def(def, vis, value_ns_ctor_vis, None),
+            )]),
             vis,
             import: None,
         });
@@ -1281,8 +1270,8 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                 });
                 // Change its helper attributes to the new id.
                 if let Some(derive_helpers) = side.derive_helpers.get_mut(&item) {
-                    for (_, _, call_id) in
-                        &mut derive_helpers[deferred_derive.helpers_range.start..deferred_derive.helpers_range.end]
+                    for (_, _, call_id) in &mut derive_helpers
+                        [deferred_derive.helpers_range.start..deferred_derive.helpers_range.end]
                     {
                         *call_id = Either::Right(impl_id);
                     }
@@ -1369,7 +1358,8 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                     None => Some(name),
                 };
                 // Keyed in the module's scope and in the extern prelude, as rustc's `IdentKey`.
-                let name = name.map(|it| super::super::def_site::extern_crate_binding_name(db, id, it));
+                let name =
+                    name.map(|it| super::super::def_site::extern_crate_binding_name(db, id, it));
 
                 let def_map = self.sink.def_map();
                 let is_crate_root = module_id == def_map.root && def_map.block.is_none();
@@ -1408,7 +1398,14 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                     self.sink.apply(DeclOp::Update {
                         module: module_id,
                         // alloc: the log owns each update's resolutions
-                        resolutions: Box::new([(name, PerNs::types(resolved.into(), vis, Some(ImportOrExternCrate::ExternCrate(id))))]),
+                        resolutions: Box::new([(
+                            name,
+                            PerNs::types(
+                                resolved.into(),
+                                vis,
+                                Some(ImportOrExternCrate::ExternCrate(id)),
+                            ),
+                        )]),
                         vis,
                         import: Some(ImportOrExternCrate::ExternCrate(id)),
                     });
@@ -1428,7 +1425,8 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                     id: InFile::new(self.file_id(), ast_id),
                 }
                 .intern(db);
-                self.sink.apply(DeclOp::DefineExternBlock { module: module_id, id: extern_block_id });
+                self.sink
+                    .apply(DeclOp::DefineExternBlock { module: module_id, id: extern_block_id });
                 self.collect(
                     item_tree.items(block.children),
                     ItemContainerId::ExternBlockId(extern_block_id),
@@ -1438,7 +1436,9 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
             ModItemKind::MacroRules(ast_id, mac) => {
                 self.collect_macro_rules(attrs, ast_id, mac, module_id)
             }
-            ModItemKind::Macro2(ast_id, mac) => self.collect_macro_def(attrs, ast_id, mac, module_id),
+            ModItemKind::Macro2(ast_id, mac) => {
+                self.collect_macro_def(attrs, ast_id, mac, module_id)
+            }
             ModItemKind::Impl(ast_id, imp) => {
                 let impl_id =
                     ImplLoc { container: module_id, id: InFile::new(self.file_id(), ast_id) }
@@ -1529,7 +1529,8 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                     }
                     None => {
                         // const _: T = ...;
-                        self.sink.apply(DeclOp::DefineUnnamedConst { module: module_id, id: const_id });
+                        self.sink
+                            .apply(DeclOp::DefineUnnamedConst { module: module_id, id: const_id });
                     }
                 }
             }
@@ -1639,8 +1640,11 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         match item_tree.mod_kind(module) {
             // inline module, just recurse
             ModKind::Inline { items } => {
-                let mod_dir =
-                    self.mod_dir.descend_into_definition(&name, path_attr.as_deref(), self.path_buf);
+                let mod_dir = self.mod_dir.descend_into_definition(
+                    &name,
+                    path_attr.as_deref(),
+                    self.path_buf,
+                );
                 let (child_items, child_dir) = match mod_dir {
                     Some(dir) => (DeclItems::Inline(item_id), dir),
                     None => (DeclItems::Nothing, self.mod_dir),
@@ -1658,7 +1662,8 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                 };
                 let Some(mod_dir) = mod_dir else { return };
                 if let ChildMode::Inline = mode {
-                    self.child(module_id, self.tree_id, item_tree, mod_dir).collect_in_top_module(items);
+                    self.child(module_id, self.tree_id, item_tree, mod_dir)
+                        .collect_in_top_module(items);
                 }
                 if is_macro_use {
                     self.import_all_legacy_macros(module_id, mode);
@@ -1767,7 +1772,12 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         mod_dir: ModDir,
     ) -> Option<(ModuleId, ChildMode)> {
         let db = self.cx.db;
-        let name = super::super::def_site::module_binding_name(db, self.tree_id.file_id(), declaration, name);
+        let name = super::super::def_site::module_binding_name(
+            db,
+            self.tree_id.file_id(),
+            declaration,
+            name,
+        );
         // A module's id is its parent and keyed name, so a second `mod` of a name and context
         // (E0428) declares nothing: the first keeps the name, as in rustc's resolver.
         if self.sink.def_map().module(db, self.module_id).children(db).contains_key(&name) {
@@ -1920,7 +1930,11 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         export: bool,
     ) {
         // Keyed as every item's name: the textual scope too (rustc's `MacroRulesDecl::ident`).
-        let name = super::super::def_site::def_binding_name(self.cx.db, ModuleDefId::MacroId(macro_.into()), name);
+        let name = super::super::def_site::def_binding_name(
+            self.cx.db,
+            ModuleDefId::MacroId(macro_.into()),
+            name,
+        );
         // Textual scoping
         self.sink.apply(DeclOp::DefineLegacyMacro { module: module_id, name, mac: macro_.into() });
 
@@ -1933,7 +1947,10 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
             self.sink.apply(DeclOp::Update {
                 module: root,
                 // alloc: the log owns each update's resolutions
-                resolutions: Box::new([(Some(name), PerNs::macros(macro_.into(), Visibility::Public, None))]),
+                resolutions: Box::new([(
+                    Some(name),
+                    PerNs::macros(macro_.into(), Visibility::Public, None),
+                )]),
                 vis: Visibility::Public,
                 import: None,
             });
@@ -1950,13 +1967,20 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         macro_: Macro2Id,
         vis: &RawVisibility,
     ) {
-        let name = super::super::def_site::def_binding_name(self.cx.db, ModuleDefId::MacroId(macro_.into()), name);
+        let name = super::super::def_site::def_binding_name(
+            self.cx.db,
+            ModuleDefId::MacroId(macro_.into()),
+            name,
+        );
         let vis = self.resolve_vis(vis);
         self.sink.apply(DeclOp::Declare { module: module_id, def: macro_.into() });
         self.sink.apply(DeclOp::Update {
             module: module_id,
             // alloc: the log owns each update's resolutions
-            resolutions: Box::new([(Some(name), PerNs::macros(macro_.into(), Visibility::Public, None))]),
+            resolutions: Box::new([(
+                Some(name),
+                PerNs::macros(macro_.into(), Visibility::Public, None),
+            )]),
             vis,
             import: None,
         });
@@ -1972,7 +1996,10 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         self.sink.apply(DeclOp::Update {
             module: root,
             // alloc: the log owns each update's resolutions
-            resolutions: Box::new([(Some(name), PerNs::macros(macro_.into(), Visibility::Public, None))]),
+            resolutions: Box::new([(
+                Some(name),
+                PerNs::macros(macro_.into(), Visibility::Public, None),
+            )]),
             vis: Visibility::Public,
             import: None,
         });
@@ -2054,10 +2081,9 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                 Some(Either::Left(it)) => MacroExpander::BuiltIn(it),
                 Some(Either::Right(it)) => MacroExpander::BuiltInEager(it),
                 None => {
-                    self.sink.apply(DeclOp::Diagnostic(DefDiagnostic::unimplemented_builtin_macro(
-                        self.module_id,
-                        f_ast_id,
-                    )));
+                    self.sink.apply(DeclOp::Diagnostic(
+                        DefDiagnostic::unimplemented_builtin_macro(self.module_id, f_ast_id),
+                    ));
                     MacroExpander::UnimplementedBuiltIn
                 }
             }
@@ -2280,99 +2306,99 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         let module_id = self.module_id;
         let sink = &*self.sink;
         {
-                let def_map = sink.def_map();
-                match def_map.hygienic_origin(db, module_id, path, Some(Namespace::Macros), ctxt) {
-                    Hygienic::Here => {}
-                    Hygienic::Unknown => return None,
-                    // In this def map, being collected: Case 2 resolves it once it is.
-                    Hygienic::At(at, _) if std::ptr::eq(def_map.map_for(db, at), def_map) => {
-                        return None;
-                    }
-                    origin @ Hygienic::At(..) => {
-                        return def_map
-                            .resolve_path_from(
-                                sink.local_def_map(),
-                                db,
-                                module_id,
-                                path,
-                                BuiltinShadowMode::Module,
-                                Some(MacroSubNs::Bang),
-                                origin,
-                            )
-                            .0
-                            .take_macros()
-                            .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
-                            .map(|it| it.definition(db));
-                    }
+            let def_map = sink.def_map();
+            match def_map.hygienic_origin(db, module_id, path, Some(Namespace::Macros), ctxt) {
+                Hygienic::Here => {}
+                Hygienic::Unknown => return None,
+                // In this def map, being collected: Case 2 resolves it once it is.
+                Hygienic::At(at, _) if std::ptr::eq(def_map.map_for(db, at), def_map) => {
+                    return None;
                 }
-                // Where the path goes on in another crate, that crate is collected in full, so
-                // what it names there it will still name once this crate is.
-                let of_another_crate = |path: &ModPath| {
-                    let resolved = def_map.resolve_path_fp_with_macro(
-                        sink.local_def_map(),
-                        db,
-                        ResolveMode::Other,
-                        module_id,
-                        path,
-                        BuiltinShadowMode::Module,
-                        Some(MacroSubNs::Bang),
-                    );
-                    let whole =
-                        resolved.segment_index.is_none() && resolved.prefix_info.differing_crate;
-                    resolved
-                        .resolved_def
-                        .take_macros()
-                        .filter(|&id| whole && sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
-                        .map(|it| it.definition(db))
-                };
-                let Some(name) = path.as_ident() else { return of_another_crate(path) };
-                // A name a `use` of this module imports from another crate (`use cfg_if::cfg_if;`)
-                // is not in its scope until imports are resolved, after this call would be:
-                // lol_html's `cfg_if!` defines its `trace!` for the modules that follow.
-                let imported = || sink.find_unresolved_named(module_id, *name, of_another_crate);
-                // The std prelude is another crate's, collected in full. Its `include!` read at
-                // item level puts the `macro_rules!` of the file in the textual scope of what
-                // follows: syn 1's `#[macro_use] mod token` has `Token!` from
-                // `include!("await.rs")`, and its `mod op` names it with nothing imported.
-                let prelude = || {
-                    // A block's def map is collected after the def maps around it, so what the
-                    // name is there (the std prelude, or an item of the module holding the
-                    // block) it stays. clang-sys's `load_manually` has a `mod build` in its
-                    // body whose `include!`d `macro_rules!` its `mod dynamic` uses.
-                    if def_map.block.is_some() {
-                        return def_map
-                            .resolve_path_fp_with_macro(
-                                sink.local_def_map(),
-                                db,
-                                ResolveMode::Other,
-                                module_id,
-                                path,
-                                BuiltinShadowMode::Module,
-                                Some(MacroSubNs::Bang),
-                            )
-                            .resolved_def
-                            .take_macros()
-                            .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
-                            .map(|it| it.definition(db));
-                    }
-                    let (prelude, _) = def_map.prelude?;
-                    if prelude.krate(db) == def_map.krate {
-                        return None;
-                    }
-                    def_map
-                        .resolve_in_prelude(db, name)
+                origin @ Hygienic::At(..) => {
+                    return def_map
+                        .resolve_path_from(
+                            sink.local_def_map(),
+                            db,
+                            module_id,
+                            path,
+                            BuiltinShadowMode::Module,
+                            Some(MacroSubNs::Bang),
+                            origin,
+                        )
+                        .0
                         .take_macros()
                         .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
-                        .map(|it| it.definition(db))
-                };
+                        .map(|it| it.definition(db));
+                }
+            }
+            // Where the path goes on in another crate, that crate is collected in full, so
+            // what it names there it will still name once this crate is.
+            let of_another_crate = |path: &ModPath| {
+                let resolved = def_map.resolve_path_fp_with_macro(
+                    sink.local_def_map(),
+                    db,
+                    ResolveMode::Other,
+                    module_id,
+                    path,
+                    BuiltinShadowMode::Module,
+                    Some(MacroSubNs::Bang),
+                );
+                let whole =
+                    resolved.segment_index.is_none() && resolved.prefix_info.differing_crate;
+                resolved
+                    .resolved_def
+                    .take_macros()
+                    .filter(|&id| whole && sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
+                    .map(|it| it.definition(db))
+            };
+            let Some(name) = path.as_ident() else { return of_another_crate(path) };
+            // A name a `use` of this module imports from another crate (`use cfg_if::cfg_if;`)
+            // is not in its scope until imports are resolved, after this call would be:
+            // lol_html's `cfg_if!` defines its `trace!` for the modules that follow.
+            let imported = || sink.find_unresolved_named(module_id, *name, of_another_crate);
+            // The std prelude is another crate's, collected in full. Its `include!` read at
+            // item level puts the `macro_rules!` of the file in the textual scope of what
+            // follows: syn 1's `#[macro_use] mod token` has `Token!` from
+            // `include!("await.rs")`, and its `mod op` names it with nothing imported.
+            let prelude = || {
+                // A block's def map is collected after the def maps around it, so what the
+                // name is there (the std prelude, or an item of the module holding the
+                // block) it stays. clang-sys's `load_manually` has a `mod build` in its
+                // body whose `include!`d `macro_rules!` its `mod dynamic` uses.
+                if def_map.block.is_some() {
+                    return def_map
+                        .resolve_path_fp_with_macro(
+                            sink.local_def_map(),
+                            db,
+                            ResolveMode::Other,
+                            module_id,
+                            path,
+                            BuiltinShadowMode::Module,
+                            Some(MacroSubNs::Bang),
+                        )
+                        .resolved_def
+                        .take_macros()
+                        .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
+                        .map(|it| it.definition(db));
+                }
+                let (prelude, _) = def_map.prelude?;
+                if prelude.krate(db) == def_map.krate {
+                    return None;
+                }
                 def_map
-                    .legacy_macro_in_textual_scope(db, module_id, name)
-                    .or_else(|| def_map.module(db, module_id).scope(db).get(name).take_macros())
-                    .or_else(|| Some(def_map.macro_use_prelude.get(name).copied()?.0))
+                    .resolve_in_prelude(db, name)
+                    .take_macros()
                     .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
                     .map(|it| it.definition(db))
-                    .or_else(imported)
-                    .or_else(prelude)
+            };
+            def_map
+                .legacy_macro_in_textual_scope(db, module_id, name)
+                .or_else(|| def_map.module(db, module_id).scope(db).get(name).take_macros())
+                .or_else(|| Some(def_map.macro_use_prelude.get(name).copied()?.0))
+                .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
+                .map(|it| it.definition(db))
+                .or_else(imported)
+                .or_else(prelude)
         }
     }
 
@@ -2386,7 +2412,9 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         let module = self.module_id;
         let mut exports = Vec::new_in(self.cx.frame);
         match mode {
-            ChildMode::Separate(key) => exports.extend(queries::legacy_exports(db, key).iter().copied()),
+            ChildMode::Separate(key) => {
+                exports.extend(queries::legacy_exports(db, key).iter().copied())
+            }
             ChildMode::Inline => exports.extend(
                 self.sink
                     .def_map()
@@ -2397,7 +2425,8 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
             ),
         }
         let own = self.sink.def_map().module(db, module).scope(db);
-        exports.retain(|&(name, mac)| own.get_legacy_macro(&name).and_then(<[_]>::last) != Some(&mac));
+        exports
+            .retain(|&(name, mac)| own.get_legacy_macro(&name).and_then(<[_]>::last) != Some(&mac));
         for (name, mac) in exports {
             self.sink.apply(DeclOp::DefineLegacyMacro { module, name, mac });
         }
@@ -2576,7 +2605,10 @@ macro_rules! file_mac { () => {} }
         let root_module: ModuleId = root.decl(&db).module;
         let held = super::held_scope(root);
         for it in ["inner_mac", "file_mac"] {
-            assert!(held.scope.get_legacy_macro(&name(it)).is_some(), "`{it}` is not in the root's textual scope");
+            assert!(
+                held.scope.get_legacy_macro(&name(it)).is_some(),
+                "`{it}` is not in the root's textual scope"
+            );
             assert!(
                 queries::module_decls(&db, root).ops.iter().any(|op| matches!(op,
                     DeclOp::DefineLegacyMacro { module, name: n, .. } if *module == root_module && *n == name(it))),
@@ -2588,7 +2620,10 @@ macro_rules! file_mac { () => {} }
         let after = child_key(&db, root, "after");
         assert!(after.decl(&db).inherited.iter().any(|it| it.0 == name("inner_mac")));
         let ops = &queries::module_decls(&db, after).ops;
-        assert!(ops.iter().all(|op| !matches!(op, DeclOp::Macro(_))), "a textual macro call was left for later");
+        assert!(
+            ops.iter().all(|op| !matches!(op, DeclOp::Macro(_))),
+            "a textual macro call was left for later"
+        );
         assert_eq!(ops.iter().filter(|op| matches!(op, DeclOp::AddMacroInvoc { .. })).count(), 2);
     }
 
@@ -2633,12 +2668,23 @@ macro_rules! two { () => {} }
             let all = names.len();
             names.sort_by(|a, b| a.symbol().cmp_order(b.symbol()));
             names.dedup();
-            assert_eq!(names.len(), all, "a name repeats in the `inherited` of {:?}: {:?}", decl.module, decl.inherited);
+            assert_eq!(
+                names.len(),
+                all,
+                "a name repeats in the `inherited` of {:?}: {:?}",
+                decl.module,
+                decl.inherited
+            );
             for (name, macs) in super::held_scope(key).scope.legacy_macros() {
                 let mut ids = macs.to_vec();
                 ids.sort_unstable();
                 ids.dedup();
-                assert_eq!(ids.len(), macs.len(), "`{name:?}` repeats in the textual scope of {:?}: {macs:?}", decl.module);
+                assert_eq!(
+                    ids.len(),
+                    macs.len(),
+                    "`{name:?}` repeats in the textual scope of {:?}: {macs:?}",
+                    decl.module
+                );
             }
         }
         let root = root_key(&db);
@@ -2656,7 +2702,13 @@ macro_rules! two { () => {} }
             let mut ids = it.1.to_vec();
             ids.sort_unstable();
             ids.dedup();
-            assert_eq!(ids.len(), it.1.len(), "`{:?}` repeats in the `inherited` of `c`: {:?}", it.0, it.1);
+            assert_eq!(
+                ids.len(),
+                it.1.len(),
+                "`{:?}` repeats in the `inherited` of `c`: {:?}",
+                it.0,
+                it.1
+            );
         }
         let m1 = child_key(&db, root, "m1");
         assert_eq!(queries::legacy_exports(&db, m1).len(), 1, "`m1` hands back only `one`");

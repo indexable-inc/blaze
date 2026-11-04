@@ -18,7 +18,6 @@ use base_db::{
     target::{Arch, TargetData},
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use cfg::CfgAtom;
 use hir_expand::proc_macro::{
     Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
@@ -28,6 +27,7 @@ use intern::Symbol;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use span::Edition;
+use std::alloc::Global;
 
 mod record;
 #[cfg(test)]
@@ -148,16 +148,24 @@ impl ProcMacroExpander for Replay {
         let output = match self.expansions.get(&recorded) {
             Some(output) => output.clone(),
             None => {
-                let missed = format!("no expansion of `{}` was recorded for this input", recorded.name);
+                let missed =
+                    format!("no expansion of `{}` was recorded for this input", recorded.name);
                 self.missed.lock().push(recorded);
                 Err(missed)
             }
         };
         let output = output.map_err(ProcMacroExpansionError::Panic)?;
-        let tree = syntax_bridge::parse_to_token_tree_static_span(Edition::CURRENT, call.call_site, &output)
-            .ok_or_else(|| ProcMacroExpansionError::System("the expansion does not lex".into()))?;
+        let tree = syntax_bridge::parse_to_token_tree_static_span(
+            Edition::CURRENT,
+            call.call_site,
+            &output,
+        )
+        .ok_or_else(|| ProcMacroExpansionError::System("the expansion does not lex".into()))?;
         // The pack keeps what each call gave, not what the macro read when it was recorded.
-        Ok(Expanded::untraced(tree, "a pack's recorded expansion: what its macro read when it was recorded is not kept"))
+        Ok(Expanded::untraced(
+            tree,
+            "a pack's recorded expansion: what its macro read when it was recorded is not kept",
+        ))
     }
 
     // dyn: hir-expand's `ProcMacroExpander::eq_dyn`, when a crate's macros are set.
@@ -201,7 +209,8 @@ impl Kind {
 
 impl Pack {
     pub fn project(self) -> Result<Project, String> {
-        let paths: HashMap<u32, &str, Global> = self.files.iter().map(|it| (it.id, &*it.path)).collect();
+        let paths: HashMap<u32, &str, Global> =
+            self.files.iter().map(|it| (it.id, &*it.path)).collect();
         let roots = self
             .roots
             .iter()
@@ -211,7 +220,11 @@ impl Pack {
                     let path = paths.get(&file).ok_or("a root with a file there is not")?;
                     set.insert(FileId::from_raw(file), VfsPath::new_virtual_path(path.to_string()));
                 }
-                Ok(if root.library { SourceRoot::new_library(set) } else { SourceRoot::new_local(set) })
+                Ok(if root.library {
+                    SourceRoot::new_library(set)
+                } else {
+                    SourceRoot::new_local(set)
+                })
             })
             .collect::<Result<Vec<_>, &str>>()?;
 
@@ -235,12 +248,16 @@ impl Pack {
         for krate in &self.crates {
             let name = |name: &str| CrateName::new(name).map_err(|_| "a bad crate name");
             let cfg = krate.cfg.iter().map(|atom| match atom.split_once('=') {
-                Some((key, value)) => CfgAtom::KeyValue { key: Symbol::intern(key), value: Symbol::intern(value) },
+                Some((key, value)) => {
+                    CfgAtom::KeyValue { key: Symbol::intern(key), value: Symbol::intern(value) }
+                }
                 None => CfgAtom::Flag(Symbol::intern(atom)),
             });
             let origin = match &krate.origin {
                 Origin::Local => CrateOrigin::Local { repo: None, name: None },
-                Origin::Library(name) => CrateOrigin::Library { repo: None, name: Symbol::intern(name) },
+                Origin::Library(name) => {
+                    CrateOrigin::Library { repo: None, name: Symbol::intern(name) }
+                }
                 Origin::Lang(name) => CrateOrigin::Lang(LangCrateOrigin::from(&**name)),
             };
             let display = krate.name.as_deref().map(CrateDisplayName::from_canonical_name);
@@ -261,7 +278,8 @@ impl Pack {
             );
             for dep in &krate.deps {
                 let to = *ids.get(dep.krate).ok_or("a dependency after what depends on it")?;
-                let dep = DependencyBuilder::with_prelude(name(&dep.name)?, to, dep.prelude, dep.sysroot);
+                let dep =
+                    DependencyBuilder::with_prelude(name(&dep.name)?, to, dep.prelude, dep.sysroot);
                 graph.add_dep(id, dep).map_err(|_| "a dependency cycle")?;
             }
             if let Some(list) = &krate.macros {
@@ -280,7 +298,8 @@ impl Pack {
             }
             ids.push(id);
         }
-        let files = self.files.into_iter().map(|it| (FileId::from_raw(it.id), it.path, it.text)).collect();
+        let files =
+            self.files.into_iter().map(|it| (FileId::from_raw(it.id), it.path, it.text)).collect();
         Ok(Project { files, roots, graph, macros, missed, main: FileId::from_raw(self.main) })
     }
 }

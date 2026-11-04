@@ -27,15 +27,15 @@
 use blaze_cas::{Key, Kind};
 use blaze_graph::par;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_mem::{Tag, frame};
+use std::alloc::Global;
 
 use super::{
     Build, Built, By, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put, Sorted, StaticId,
-    StaticNode, Whence, callee, dev_template_key, error, placed, prepare_node, stopped, stored, stored_function, unfit,
-    unkept_inline, unkept_message,
+    StaticNode, Whence, callee, dev_template_key, error, placed, prepare_node, stopped, stored,
+    stored_function, unfit, unkept_inline, unkept_message,
 };
 use crate::{
     Backend, CodegenError, CompiledFunction, Instance, InstanceKey, Unit,
@@ -62,7 +62,9 @@ pub struct Walked {
 /// thread: an initializer or finalizer array, as each object format names it. The functions
 /// such a static names are compiled ahead.
 pub fn runs_at_start(section: &str) -> bool {
-    let elf = |name: &str| section == name || section.strip_prefix(name).is_some_and(|it| it.starts_with('.'));
+    let elf = |name: &str| {
+        section == name || section.strip_prefix(name).is_some_and(|it| it.starts_with('.'))
+    };
     elf(".init_array")
         || elf(".preinit_array")
         || elf(".fini_array")
@@ -118,9 +120,16 @@ fn nothing() -> (InstanceKey, ItemKey) {
 }
 
 /// `key`'s node, if a lazy build may compile it: a function of the walk at a dev backend.
-fn lazy_node<I, S>(nodes: &Sorted<InstanceKey, FnNode<I, S>>, key: InstanceKey) -> Result<&FnNode<I, S>, CodegenError> {
+fn lazy_node<I, S>(
+    nodes: &Sorted<InstanceKey, FnNode<I, S>>,
+    key: InstanceKey,
+) -> Result<&FnNode<I, S>, CodegenError> {
     let Some(node) = nodes.get(&key) else {
-        return Err(error(key, nothing().1, "compiled lazily, but no function of the build's walk"));
+        return Err(error(
+            key,
+            nothing().1,
+            "compiled lazily, but no function of the build's walk",
+        ));
     };
     dev_only(key, node)?;
     Ok(node)
@@ -154,12 +163,16 @@ fn stored_one<I, S, L: Lookup + ?Sized>(
 ) -> Result<Option<CompiledFunction>, CodegenError> {
     match store.read(&at) {
         Ok(None) => Ok(None),
-        Ok(Some(bytes)) => match stored_function(bytes, key, &node.refs, node.described.anchors.as_ref()) {
-            Ok(Ok(function)) => Ok(Some(function)),
-            Ok(Err(why)) => Err(unfit(key, node.unit.item, &node.described.name, Whence::Store(at), &why)),
-            // alloc: an error
-            Err(why) => Err(error(key, node.unit.item, format!("the store's {at:?}: {why}"))),
-        },
+        Ok(Some(bytes)) => {
+            match stored_function(bytes, key, &node.refs, node.described.anchors.as_ref()) {
+                Ok(Ok(function)) => Ok(Some(function)),
+                Ok(Err(why)) => {
+                    Err(unfit(key, node.unit.item, &node.described.name, Whence::Store(at), &why))
+                }
+                // alloc: an error
+                Err(why) => Err(error(key, node.unit.item, format!("the store's {at:?}: {why}"))),
+            }
+        }
         // alloc: an error
         Err(why) => Err(error(key, node.unit.item, format!("reading the store's {at:?}: {why}"))),
     }
@@ -187,7 +200,8 @@ fn memoized<I, S>(
     template: &Template,
 ) -> Result<(CompiledFunction, Vec<Put>), CodegenError> {
     let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), &why);
-    let function = template.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit)?;
+    let function =
+        template.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit)?;
     // alloc: the store's value of a memo hit, once a function
     Ok((function, vec![put_of(at, template)]))
 }
@@ -205,14 +219,21 @@ fn compiled<B: Prepare>(
     spec: &Spec,
 ) -> Result<(CompiledFunction, Vec<Put>, Made, ContentId), CodegenError> {
     let (key, item) = (unit.instance.key(), unit.item);
-    let at = dev_template_key(&template_instance(node, unit), &node.built_in, &node.refs, &spec.toolchain.id);
+    let at = dev_template_key(
+        &template_instance(node, unit),
+        &node.built_in,
+        &node.refs,
+        &spec.toolchain.id,
+    );
     let (compiled, made) = prepare_node(backend, frontend, unit, spec, node)?;
     let shape = compiled.key();
     if let Some(template) = memo.get(&shape) {
         let (function, puts) = memoized(node, key, at, shape, template)?;
         return Ok((function, puts, Made::Memo, shape));
     }
-    let emitted = backend.emit(unit, spec, made, &node.refs, None).map_err(|why| super::naming(why, &node.described.name))?;
+    let emitted = backend
+        .emit(unit, spec, made, &node.refs, None)
+        .map_err(|why| super::naming(why, &node.described.name))?;
     if emitted.function.key != key {
         // alloc: an error
         return Err(error(key, item, format!("compiled as {:?}", emitted.function.key)));
@@ -223,17 +244,31 @@ fn compiled<B: Prepare>(
     // alloc: the store's values of a compile: its template and its side table
     let mut puts = Vec::with_capacity(2);
     match (emitted.side, emitted.function.side) {
-        (Some(bytes), Some(id)) => puts.push(Put { key: keys::side(&id), kind: Kind::Debug, bytes }),
+        (Some(bytes), Some(id)) => {
+            puts.push(Put { key: keys::side(&id), kind: Kind::Debug, bytes })
+        }
         (None, None) => {}
-        _ => return Err(error(key, item, "the compile's side table and the function's record of it disagree")),
+        _ => {
+            return Err(error(
+                key,
+                item,
+                "the compile's side table and the function's record of it disagree",
+            ));
+        }
     }
-    let template = Template::of_owned_at(emitted.function, &node.refs, &emitted.extra, node.described.anchors.as_ref())
-        // alloc: an error
-        .map_err(|why| error(key, item, why.to_string()))?;
+    let template = Template::of_owned_at(
+        emitted.function,
+        &node.refs,
+        &emitted.extra,
+        node.described.anchors.as_ref(),
+    )
+    // alloc: an error
+    .map_err(|why| error(key, item, why.to_string()))?;
     let kept = memo.put(compiled, template);
     puts.push(put_of(at, kept));
     let unfit = |why| unfit(key, item, &node.described.name, Whence::Shape(shape), &why);
-    let function = kept.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit)?;
+    let function =
+        kept.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit)?;
     Ok((function, puts, Made::Compiled, shape))
 }
 
@@ -254,7 +289,8 @@ fn claimed<B: Prepare>(
     spec: &Spec,
     check: impl Fn() -> Result<(), CodegenError>,
 ) -> Result<(CompiledFunction, Vec<Put>, Made, ContentId), CodegenError> {
-    let (key, at) = (unit.instance.key(), placed(stored(unit.instance.key(), &node.built_in), &node.refs));
+    let (key, at) =
+        (unit.instance.key(), placed(stored(unit.instance.key(), &node.built_in), &node.refs));
     let flights = memo.flights();
     let mut plan = flight::Plan::new(1);
     // alloc: what other builds' waits for this compile name it by, once per later compile
@@ -265,9 +301,13 @@ fn claimed<B: Prepare>(
         };
         match decision {
             flight::Decision::Ask(_) => {
-                let asked = flights.ask(at, &owner, || match check().and_then(|()| compiled(backend, frontend, memo, nodes, node, unit, spec)) {
-                    Ok(made) => (Some(made.3), Ok(made)),
-                    Err(why) => (None, Err(why)),
+                let asked = flights.ask(at, &owner, || {
+                    match check()
+                        .and_then(|()| compiled(backend, frontend, memo, nodes, node, unit, spec))
+                    {
+                        Ok(made) => (Some(made.3), Ok(made)),
+                        Err(why) => (None, Err(why)),
+                    }
                 });
                 match asked {
                     Asked::Ran(made) => return made,
@@ -281,7 +321,11 @@ fn claimed<B: Prepare>(
                 }
                 let landing = flights.wait(at, |it, owner| {
                     use std::fmt::Write as _;
-                    _ = write!(it, "codegen: `{}` {at:?}, which {owner} compiles", node.described.name);
+                    _ = write!(
+                        it,
+                        "codegen: `{}` {at:?}, which {owner} compiles",
+                        node.described.name
+                    );
                 });
                 plan.waited(0, landing);
             }
@@ -300,17 +344,35 @@ fn claimed<B: Prepare>(
         }
     };
     match memo.get(&shape) {
-        Some(template) => {
-            memoized(node, key, dev_template_key(&template_instance(node, unit), &node.built_in, &node.refs, &spec.toolchain.id), shape, template).map(|(function, puts)| (function, puts, Made::Flown, shape))
-        }
+        Some(template) => memoized(
+            node,
+            key,
+            dev_template_key(
+                &template_instance(node, unit),
+                &node.built_in,
+                &node.refs,
+                &spec.toolchain.id,
+            ),
+            shape,
+            template,
+        )
+        .map(|(function, puts)| (function, puts, Made::Flown, shape)),
         // alloc: an error
-        None => Err(error(key, unit.item, format!("its compile landed under shape {shape:?}, which the memo has no template of"))),
+        None => Err(error(
+            key,
+            unit.item,
+            format!("its compile landed under shape {shape:?}, which the memo has no template of"),
+        )),
     }
 }
 
 /// Refuses `key`'s compile unless the front end still describes its instance with the code and
 /// arguments of its key: IR built from another body would be placed in the image's slot.
-fn same_code<F: Frontend>(frontend: &F, node: &FnNode<F::Instance, F::Static>, key: InstanceKey) -> Result<(), CodegenError> {
+fn same_code<F: Frontend>(
+    frontend: &F,
+    node: &FnNode<F::Instance, F::Static>,
+    key: InstanceKey,
+) -> Result<(), CodegenError> {
     let now = frontend.describe(&node.instance, &node.requester)?;
     let was = node.unit.instance;
     if now.code == was.code && now.args == was.args {
@@ -331,12 +393,21 @@ fn same_code<F: Frontend>(frontend: &F, node: &FnNode<F::Instance, F::Static>, k
 }
 
 /// `node`'s unit and settings at `backend`, counting into its cells when `counted`.
-fn at_tier<I, S>(key: InstanceKey, node: &FnNode<I, S>, backend: Backend, counted: bool) -> Result<(Unit, Spec), CodegenError> {
+fn at_tier<I, S>(
+    key: InstanceKey,
+    node: &FnNode<I, S>,
+    backend: Backend,
+    counted: bool,
+) -> Result<(Unit, Spec), CodegenError> {
     // clone: per tier-up, the settings it compiles at
     let spec = Spec { backend, counted, fold: false, ..node.spec.clone() };
     let missing = match backend {
-        Backend::Llvm { .. } if spec.toolchain.llvm.is_none() => Some("LLVM, and this blaze was built without it"),
-        Backend::Stencil if spec.toolchain.stencils.is_none() => Some("stencils, and the target has no stencil library"),
+        Backend::Llvm { .. } if spec.toolchain.llvm.is_none() => {
+            Some("LLVM, and this blaze was built without it")
+        }
+        Backend::Stencil if spec.toolchain.stencils.is_none() => {
+            Some("stencils, and the target has no stencil library")
+        }
         _ => None,
     };
     if let Some(why) = missing {
@@ -352,7 +423,11 @@ fn at_tier<I, S>(key: InstanceKey, node: &FnNode<I, S>, backend: Backend, counte
 impl<I, S> Later<I, S> {
     /// `key`'s node and the memo's template of the shape its check recorded: no allocation,
     /// no lock but the memo's.
-    fn recorded<'m>(&self, memo: &'m Memo, key: InstanceKey) -> Option<(&FnNode<I, S>, &'m Template, ContentId)> {
+    fn recorded<'m>(
+        &self,
+        memo: &'m Memo,
+        key: InstanceKey,
+    ) -> Option<(&FnNode<I, S>, &'m Template, ContentId)> {
         let node = self.nodes.get(&key).filter(|it| !it.spec.backend.is_release())?;
         let shape = *self.shapes.get(&key)?;
         Some((node, memo.get(&shape)?, shape))
@@ -365,10 +440,19 @@ impl<I, S> Later<I, S> {
     /// thread that reads a lazy run's asks: it reads no store, builds no IR, takes no front
     /// end and no lock but the memo's. An `Err` is the instantiation's, which `compile_kept`
     /// gives too.
-    pub fn memo_hit(&self, memo: &Memo, key: InstanceKey) -> Option<Result<CompiledFunction, CodegenError>> {
+    pub fn memo_hit(
+        &self,
+        memo: &Memo,
+        key: InstanceKey,
+    ) -> Option<Result<CompiledFunction, CodegenError>> {
         let (node, template, shape) = self.recorded(memo, key)?;
-        let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), &why);
-        Some(template.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit))
+        let unfit =
+            |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), &why);
+        Some(
+            template
+                .instantiate_at(key, &node.refs, node.described.anchors.as_ref())
+                .map_err(unfit),
+        )
     }
 
     /// The store's value of [`Later::memo_hit`]'s template, under `key`'s stored key: `None`
@@ -406,7 +490,8 @@ impl<I, S> Later<I, S> {
             return memoized(node, key, node.template_key(), shape, template);
         }
         let check = || same_code(frontend, node, key);
-        claimed(backend, frontend, memo, &self.nodes, node, &node.unit, &node.spec, check).map(|it| (it.0, it.1))
+        claimed(backend, frontend, memo, &self.nodes, node, &node.unit, &node.spec, check)
+            .map(|it| (it.0, it.1))
     }
 
     /// `key`'s function compiled again at `backend` (a tier's, `blaze_stencil::tier::Tier::backend`),
@@ -433,13 +518,19 @@ impl<I, S> Later<I, S> {
         let node = lazy_node(&self.nodes, key)?;
         let (unit, spec) = at_tier(key, node, to, counted)?;
         let tiered = unit.instance.key();
-        let at = dev_template_key(&template_instance(node, &unit), &node.built_in, &node.refs, &spec.toolchain.id);
+        let at = dev_template_key(
+            &template_instance(node, &unit),
+            &node.built_in,
+            &node.refs,
+            &spec.toolchain.id,
+        );
         if let Some(function) = stored_one(node, at, tiered, store)? {
             // alloc: none, empty
             return Ok((function, Vec::new()));
         }
         let check = || same_code(frontend, node, key);
-        claimed(backend, frontend, memo, &self.nodes, node, &unit, &spec, check).map(|it| (it.0, it.1))
+        claimed(backend, frontend, memo, &self.nodes, node, &unit, &spec, check)
+            .map(|it| (it.0, it.1))
     }
 }
 
@@ -461,7 +552,8 @@ impl<B: Prepare> Build<'_, B> {
     ) -> Result<Built, Vec<CodegenError>> {
         if self.policy.mode == Mode::Output {
             let (unit, item) = nothing();
-            let why = "a lazy build (`later`) of a build whose output is a file, which is compiled whole";
+            let why =
+                "a lazy build (`later`) of a build whose output is a file, which is compiled whole";
             return Err(vec![error(unit, item, why)]); // alloc: an error
         }
         self.run_as(roots, static_roots, &[], Some(entry), store)
@@ -473,7 +565,11 @@ impl<B: Prepare> Build<'_, B> {
     }
 
     /// [`Later::compile_kept`] of the last run's walk, the function alone.
-    pub fn compile_one<L: Lookup + ?Sized>(&self, key: InstanceKey, store: &L) -> Result<CompiledFunction, CodegenError> {
+    pub fn compile_one<L: Lookup + ?Sized>(
+        &self,
+        key: InstanceKey,
+        store: &L,
+    ) -> Result<CompiledFunction, CodegenError> {
         self.compile_kept(key, store).map(|it| it.0)
     }
 
@@ -488,10 +584,17 @@ impl<B: Prepare> Build<'_, B> {
 
     /// [`Later::memo_hit`] of the last run's walk, with its template's [`Put`]
     /// ([`Later::memo_put`]): what [`Build::compile_kept`] gives from the memo.
-    pub fn memo_hit(&self, key: InstanceKey) -> Option<Result<(CompiledFunction, Vec<Put>), CodegenError>> {
+    pub fn memo_hit(
+        &self,
+        key: InstanceKey,
+    ) -> Option<Result<(CompiledFunction, Vec<Put>), CodegenError>> {
         let hit = self.last.memo_hit(self.memo, key)?;
         // alloc: the store's value of a memo hit, once a function
-        Some(hit.map(|function| (function, self.last.memo_put(self.memo, key).into_iter().collect())))
+        Some(
+            hit.map(|function| {
+                (function, self.last.memo_put(self.memo, key).into_iter().collect())
+            }),
+        )
     }
 
     /// A lazy run's functions, once the walk ended with no error: each checked, the entry's
@@ -514,7 +617,11 @@ impl<B: Prepare> Build<'_, B> {
                 None => {
                     let (unit, item) = nothing();
                     // alloc: an error
-                    out.errors.push(error(unit, item, format!("the entry is root {at}, of {} roots", root_keys.len())));
+                    out.errors.push(error(
+                        unit,
+                        item,
+                        format!("the entry is root {at}, of {} roots", root_keys.len()),
+                    ));
                 }
             }
         }
@@ -532,7 +639,8 @@ impl<B: Prepare> Build<'_, B> {
             .filter(|it| it.described.section.as_deref().is_some_and(runs_at_start))
             .flat_map(|it| it.refs.iter().filter_map(callee));
         // alloc: per build, its entry and start functions
-        let ahead: HashSet<InstanceKey, Global> = entry_keys.iter().copied().chain(started).collect();
+        let ahead: HashSet<InstanceKey, Global> =
+            entry_keys.iter().copied().chain(started).collect();
         // alloc: per build, its entry and start functions
         let mut ahead: Vec<InstanceKey> = ahead.into_iter().collect();
         ahead.sort_unstable();
@@ -548,7 +656,11 @@ impl<B: Prepare> Build<'_, B> {
                 Ok(Some(bytes)) => kept.push((*key, node, at, bytes)),
                 Ok(None) => unchecked.push(*key),
                 // alloc: an error
-                Err(why) => out.errors.push(error(*key, node.unit.item, format!("reading the store's {at:?}: {why}"))),
+                Err(why) => out.errors.push(error(
+                    *key,
+                    node.unit.item,
+                    format!("reading the store's {at:?}: {why}"),
+                )),
             }
         }
         // alloc: none but for the errors
@@ -580,7 +692,8 @@ impl<B: Prepare> Build<'_, B> {
         // alloc: per build, its entry and start functions
         let mut missing = Vec::new();
         for key in &ahead {
-            let read = lazy_node(nodes, *key).and_then(|node| Ok((node, stored_one(node, node.template_key(), *key, store)?)));
+            let read = lazy_node(nodes, *key)
+                .and_then(|node| Ok((node, stored_one(node, node.template_key(), *key, store)?)));
             match read {
                 Ok((node, Some(function))) => {
                     out.stats.stored += 1;
@@ -591,7 +704,16 @@ impl<B: Prepare> Build<'_, B> {
             }
         }
         let compiled = self.until_stopped(&missing, &mut out.errors, |&(key, node)| {
-            let made = claimed(self.backend, self.frontend, self.memo, nodes, node, &node.unit, &node.spec, || Ok(()));
+            let made = claimed(
+                self.backend,
+                self.frontend,
+                self.memo,
+                nodes,
+                node,
+                &node.unit,
+                &node.spec,
+                || Ok(()),
+            );
             (By::node(key, &node.unit), node.unit.instance.code, made)
         });
         for (by, code, made) in compiled {

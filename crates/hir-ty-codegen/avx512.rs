@@ -282,13 +282,8 @@ fn lowered(
             let (x, y) = (arg(a, 0), arg(a, 1));
             // alloc: the stub's text, the output
             let text = format!("vcmp{lanes} k0 {{k4}}, {x}, {y}{sae}, {predicate}");
-            let loads = [
-                Load::Vector(a),
-                Load::Vector(a),
-                Load::Immediate,
-                Load::Mask(k),
-                Load::Immediate,
-            ];
+            let loads =
+                [Load::Vector(a), Load::Vector(a), Load::Immediate, Load::Mask(k), Load::Immediate];
             ok(text, &loads, Out::Mask(k))
         }
         // Whether the low halves compare as the predicate says, as 0 or 1, with whether to
@@ -614,9 +609,7 @@ fn lowered(
                 return None;
             }
             let (mnemonic, bytes) = match (op, lanes.as_bytes()) {
-                ("compress", [b'd' | b'q' | b'w' | b'b']) => {
-                    (Concat(["vpcompress", lanes, ""]), a)
-                }
+                ("compress", [b'd' | b'q' | b'w' | b'b']) => (Concat(["vpcompress", lanes, ""]), a),
                 ("compress", b"ps" | b"pd") => (Concat(["vcompress", lanes, ""]), a),
                 ("compress", _) => return None,
                 (_, &[from, to]) => {
@@ -1000,7 +993,8 @@ mod tests {
     fn describe(cases: &[(&str, &str, u32, &[&str])]) -> String {
         let mut out = String::new();
         for &(name, shape, result, features) in cases {
-            let features = features.iter().map(|it| TargetFeature::from_name(it).unwrap()).collect();
+            let features =
+                features.iter().map(|it| TargetFeature::from_name(it).unwrap()).collect();
             let text = match lower(name, &given(shape), result, features) {
                 Some(Ok(it)) => format!("{} {:?}", it.text.replace('\n', "; "), it.out),
                 Some(Err(e)) => e,

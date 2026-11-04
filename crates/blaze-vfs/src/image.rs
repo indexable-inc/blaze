@@ -35,7 +35,6 @@ use blaze_image::{
     Builder, Corrupt, Image, OpenError, Refused, Section as Placed, SectionId, bytes_of,
 };
 
-pub use blaze_bytes::Bytes;
 use crate::{
     CommitError, OpError, Recovered, Vfs,
     disk::Disks,
@@ -44,6 +43,7 @@ use crate::{
     store::{Base, FILE, Mapped, NAME_INDEX_KEY, Source, Table, Writer, home},
     tree::Tree,
 };
+pub use blaze_bytes::Bytes;
 
 pub const TREE_SCHEMA: SchemaHash = schema(
     "blaze v2 vfs tree 2: header [u64; 30]; ids ContentId; shapes [u32; 2]; entry names u32; \
@@ -197,9 +197,15 @@ pub enum DisksUnused {
 impl fmt::Display for DisksUnused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DisksUnused::Refused(refused) => write!(f, "the VFS image's disks section is refused: {refused}"),
-            DisksUnused::Corrupt(corrupt) => write!(f, "the VFS image's disks section is corrupt: {corrupt}"),
-            DisksUnused::Outside => f.write_str("the VFS image's disks section is outside its file"),
+            DisksUnused::Refused(refused) => {
+                write!(f, "the VFS image's disks section is refused: {refused}")
+            }
+            DisksUnused::Corrupt(corrupt) => {
+                write!(f, "the VFS image's disks section is corrupt: {corrupt}")
+            }
+            DisksUnused::Outside => {
+                f.write_str("the VFS image's disks section is outside its file")
+            }
             DisksUnused::Malformed(what) => write!(f, "the VFS image's disks section: {what}"),
         }
     }
@@ -373,7 +379,8 @@ fn write_tree(
     }
     // The names are a checkout's, which whoever writes it picks: their index is placed by a
     // key they can't know before every name is chosen, and the same names give the same key.
-    let name_key = blaze_ids::index_key(NAME_INDEX_KEY, (0..names.len()).map(|name| names.get(name)));
+    let name_key =
+        blaze_ids::index_key(NAME_INDEX_KEY, (0..names.len()).map(|name| names.get(name)));
     // alloc: as above.
     let mut name_index = vec![0u32; places(spans.len())];
     let mask = name_index.len() - 1;
@@ -466,11 +473,7 @@ fn open(file: Mapping) -> Result<Opened, ImageUse> {
 }
 
 /// The base's columns, in place.
-fn view<'a>(
-    image: &'a Image<Mapping>,
-    tree: &Placed,
-    header: &[u64],
-) -> Result<Base<'a>, Corrupt> {
+fn view<'a>(image: &'a Image<Mapping>, tree: &Placed, header: &[u64]) -> Result<Base<'a>, Corrupt> {
     Ok(Base {
         ids: column::<_, C_IDS>(image, tree, header)?,
         shapes: column::<_, C_SHAPES>(image, tree, header)?,

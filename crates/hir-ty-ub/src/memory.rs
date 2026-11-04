@@ -159,7 +159,13 @@ pub struct Uninit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemError {
     /// `PointerOutOfBounds`.
-    OutOfBounds { alloc: AllocId, alloc_size: u64, ptr_offset: i64, inbounds_size: i64, msg: InAlloc },
+    OutOfBounds {
+        alloc: AllocId,
+        alloc_size: u64,
+        ptr_offset: i64,
+        inbounds_size: i64,
+        msg: InAlloc,
+    },
     /// `DanglingIntPointer`: no provenance, or a wildcard pointer at no exposed allocation.
     DanglingInt { addr: Addr, inbounds_size: i64, msg: InAlloc },
     /// `PointerUseAfterFree`.
@@ -232,7 +238,9 @@ fn in_alloc_attempt(f: &mut fmt::Formatter<'_>, msg: InAlloc, size: i64) -> fmt:
         InAlloc::InboundsPointerArithmetic => {
             write!(f, "attempting to offset pointer by {}", ShowBytes(size))
         }
-        InAlloc::Dereferenceable if size == 0 => f.write_str("pointer must point to some allocation"),
+        InAlloc::Dereferenceable if size == 0 => {
+            f.write_str("pointer must point to some allocation")
+        }
         InAlloc::Dereferenceable => {
             write!(f, "pointer must be dereferenceable for {}", ShowBytes(size))
         }
@@ -295,10 +303,12 @@ impl fmt::Display for MemError {
                     AlignMsg::BasedOn => "accessing memory based on pointer",
                 }
             ),
-            MemError::WriteToReadOnly(alloc) => write!(f, "writing to {alloc:?} which is read-only"),
-            MemError::Uninit(None) => {
-                f.write_str("using uninitialized data, but this operation requires initialized memory")
+            MemError::WriteToReadOnly(alloc) => {
+                write!(f, "writing to {alloc:?} which is read-only")
             }
+            MemError::Uninit(None) => f.write_str(
+                "using uninitialized data, but this operation requires initialized memory",
+            ),
             MemError::Uninit(Some(Uninit { alloc, access, bad })) => write!(
                 f,
                 "reading memory at {alloc:?}[{:#x}..{:#x}], but memory is uninitialized at \
@@ -308,14 +318,20 @@ impl fmt::Display for MemError {
                 bad.start,
                 bad.end(),
             ),
-            MemError::CopyOverlapping => f.write_str("`copy_nonoverlapping` called on overlapping ranges"),
+            MemError::CopyOverlapping => {
+                f.write_str("`copy_nonoverlapping` called on overlapping ranges")
+            }
             MemError::FreeNotStart { addr, prov } => write!(
                 f,
                 "deallocating {} which does not point to the beginning of an object",
                 ShowPtr(addr, prov)
             ),
-            MemError::FreeStatic(alloc) => write!(f, "deallocating {alloc:?}, which is static memory"),
-            MemError::FreeImmutable(alloc) => write!(f, "deallocating immutable allocation {alloc:?}"),
+            MemError::FreeStatic(alloc) => {
+                write!(f, "deallocating {alloc:?}, which is static memory")
+            }
+            MemError::FreeImmutable(alloc) => {
+                write!(f, "deallocating immutable allocation {alloc:?}")
+            }
             MemError::FreeWrongKind { alloc, has, used } => write!(
                 f,
                 "deallocating {alloc:?}, which is {has} memory, using {used} deallocation operation"
@@ -357,9 +373,9 @@ impl fmt::Display for MemError {
                 "internal error: the evaluator allocated {size} bytes at {addr:#x}, past the end \
                  of the address space"
             ),
-            MemError::TooManyAllocations => {
-                f.write_str("internal error: more allocations in one run than an allocation id counts")
-            }
+            MemError::TooManyAllocations => f.write_str(
+                "internal error: more allocations in one run than an allocation id counts",
+            ),
         }
     }
 }
@@ -733,9 +749,11 @@ impl Memory {
             return Ok(());
         }
         let msg = InAlloc::InboundsPointerArithmetic;
-        let (alloc, off) = self
-            .get_alloc(addr, prov, by)
-            .ok_or(MemError::DanglingInt { addr, inbounds_size: by, msg })?;
+        let (alloc, off) = self.get_alloc(addr, prov, by).ok_or(MemError::DanglingInt {
+            addr,
+            inbounds_size: by,
+            msg,
+        })?;
         let info = &self.infos[alloc.index()];
         if !info.live {
             return Err(MemError::UseAfterFree { alloc, msg });
@@ -874,9 +892,11 @@ impl Memory {
                 if run.whole && u64::from(run.len) == ps {
                     ptrs.push((pos, run.prov));
                 } else {
-                    frags.extend((0..run.len).map(|k| {
-                        (pos + u64::from(k), Frag { idx: run.idx + k, prov: run.prov })
-                    }));
+                    frags.extend(
+                        (0..run.len).map(|k| {
+                            (pos + u64::from(k), Frag { idx: run.idx + k, prov: run.prov })
+                        }),
+                    );
                 }
             }
             shadow.prov.insert_ptrs_presorted(&ptrs);
@@ -1050,9 +1070,7 @@ impl Memory {
             .iter()
             .enumerate()
             .filter(|&(i, info)| {
-                info.live
-                    && !info.kind.may_leak(info.made_global)
-                    && !reachable.contains(i)
+                info.live && !info.kind.may_leak(info.made_global) && !reachable.contains(i)
             })
             .map(|(i, info)| Leak {
                 alloc: AllocId::new(i as u32 + 1).expect("an index of the column"),

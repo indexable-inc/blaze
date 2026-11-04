@@ -51,8 +51,8 @@ use hir_ty::{
     InferBodyId,
     db::HirDatabase as _,
     mir::{
-        LocalId, MirBody, MirSpan, Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind,
-        StoredPlace, TerminatorKind, return_slot,
+        LocalId, MirBody, MirSpan, Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem,
+        Rvalue, StatementKind, StoredPlace, TerminatorKind, return_slot,
     },
     next_solver::{
         DbInterner, ParamEnv, Ty, TyKind, TypingMode,
@@ -201,7 +201,13 @@ struct Walker<'a, 'db> {
     env: ParamEnv<'db>,
 }
 
-fn read_body(db: &Db, krate: base_db::Crate, traits: &Traits, def: DefWithBodyId, out: &mut Passes) {
+fn read_body(
+    db: &Db,
+    krate: base_db::Crate,
+    traits: &Traits,
+    def: DefWithBodyId,
+    out: &mut Passes,
+) {
     let analysis = hir::BodyAnalysis::new(db, hir::DefWithBody::from(def));
     let body = analysis.body();
     if !body.exprs().any(|(_, it)| matches!(it, Expr::Loop { .. } | Expr::Closure { .. })) {
@@ -236,7 +242,10 @@ fn read_body(db: &Db, krate: base_db::Crate, traits: &Traits, def: DefWithBodyId
         traits,
         analysis: &analysis,
         parents: &parents,
-        infcx: DbInterner::new_with(db, krate).with_regions().infer_ctxt().build(TypingMode::non_body_analysis()),
+        infcx: DbInterner::new_with(db, krate)
+            .with_regions()
+            .infer_ctxt()
+            .build(TypingMode::non_body_analysis()),
         env: db.trait_environment(def.generic_def(db)),
     };
     // alloc: the passes of one body, a few
@@ -259,7 +268,9 @@ fn read_body(db: &Db, krate: base_db::Crate, traits: &Traits, def: DefWithBodyId
                 let Some(receiver) = walker.iterator_receiver(call, id) else { continue };
                 let receiver_ty = analysis.ty(analysis.infer().expr_ty(receiver));
                 for (index, &pat) in args.iter().enumerate() {
-                    let Some(strukt) = struct_of(db, krate, analysis.infer().pat_ty(pat)) else { continue };
+                    let Some(strukt) = struct_of(db, krate, analysis.infer().pat_ty(pat)) else {
+                        continue;
+                    };
                     if !holds(db, &receiver_ty, strukt) {
                         continue;
                     }
@@ -283,17 +294,28 @@ fn read_body(db: &Db, krate: base_db::Crate, traits: &Traits, def: DefWithBodyId
         }
         for (_, block) in mir.basic_blocks.iter() {
             let Some(terminator) = &block.terminator else { continue };
-            let TerminatorKind::Call { func, args, destination, .. } = &terminator.kind else { continue };
+            let TerminatorKind::Call { func, args, destination, .. } = &terminator.kind else {
+                continue;
+            };
             let MirSpan::ExprId(span) = terminator.span else { continue };
             if let Some(&(_, pass)) = for_seeds.iter().find(|it| it.0 == span) {
-                let mut prefix: Vec<Step> = destination.projection.as_slice().iter().map(|&it| Step::Is(it)).collect(); // alloc: one prefix
-                prefix.extend([Step::AnyDowncast, Step::Is(ProjectionElem::Field(hir_ty::mir::FieldIndex(0)))]);
+                let mut prefix: Vec<Step> =
+                    destination.projection.as_slice().iter().map(|&it| Step::Is(it)).collect(); // alloc: one prefix
+                prefix.extend([
+                    Step::AnyDowncast,
+                    Step::Is(ProjectionElem::Field(hir_ty::mir::FieldIndex(0))),
+                ]);
                 sources.push(Source { local: destination.local, prefix, pass });
             } else if destination.projection.is_empty()
                 && walker.is_index(func)
-                && let Some(strukt) = struct_of(db, krate, mir.locals[destination.local].ty.as_ref())
+                && let Some(strukt) =
+                    struct_of(db, krate, mir.locals[destination.local].ty.as_ref())
                 && args.first().and_then(place_of).is_some_and(|it| {
-                    holds(db, &analysis.ty(walker.place_ty(mir, it.local, it.projection.as_slice())), strukt)
+                    holds(
+                        db,
+                        &analysis.ty(walker.place_ty(mir, it.local, it.projection.as_slice())),
+                        strukt,
+                    )
                 })
                 && let Some(at) = walker.enclosing(span)
             {
@@ -317,7 +339,13 @@ fn read_body(db: &Db, krate: base_db::Crate, traits: &Traits, def: DefWithBodyId
 
 /// Marks the structs of `krate` that `def`'s expressions name as having a body that can't be
 /// read.
-fn unread(db: &Db, krate: base_db::Crate, analysis: &hir::BodyAnalysis<'_>, def: DefWithBodyId, out: &mut Passes) {
+fn unread(
+    db: &Db,
+    krate: base_db::Crate,
+    analysis: &hir::BodyAnalysis<'_>,
+    def: DefWithBodyId,
+    out: &mut Passes,
+) {
     let infer = analysis.infer();
     for (id, _) in analysis.body().exprs() {
         analysis.ty(infer.expr_ty(id)).walk(db, |inner| {
@@ -364,7 +392,9 @@ fn holds(db: &Db, ty: &hir::Type<'_>, strukt: StructId) -> bool {
     ty.walk(db, |inner| {
         found |= inner.as_slice().is_some_and(|it| is(&it))
             || inner.as_array_element(db).is_some_and(|it| is(&it))
-            || inner.as_adt().is_some_and(|adt| sequence(db, adt) && inner.type_arguments().next().is_some_and(|it| is(&it)));
+            || inner.as_adt().is_some_and(|adt| {
+                sequence(db, adt) && inner.type_arguments().next().is_some_and(|it| is(&it))
+            });
     });
     found
 }
@@ -380,7 +410,9 @@ fn sequence(db: &Db, adt: hir::Adt) -> bool {
     if matches!(name.as_str(), "Vec" | "VecDeque") {
         return true;
     }
-    let within = module.name(db).is_some_and(|it| matches!(it.as_str(), "slice" | "vec" | "array" | "vec_deque"));
+    let within = module
+        .name(db)
+        .is_some_and(|it| matches!(it.as_str(), "slice" | "vec" | "array" | "vec_deque"));
     within && matches!(name.as_str(), "Iter" | "IterMut" | "IntoIter" | "Drain")
 }
 
@@ -432,10 +464,19 @@ fn touch(passes: &mut [Open], pass: usize, rest: &[PlaceElem]) {
 impl<'db> Walker<'_, 'db> {
     /// The pass of the `for` loop whose desugaring's outer `match` is `id`, and its
     /// `Iterator::next` call, when it walks a collection of a struct.
-    fn for_loop(&self, passes: &mut Vec<Open>, id: ExprId, into_iter: ExprId, arm: &MatchArm) -> Option<(ExprId, usize)> {
+    fn for_loop(
+        &self,
+        passes: &mut Vec<Open>,
+        id: ExprId,
+        into_iter: ExprId,
+        arm: &MatchArm,
+    ) -> Option<(ExprId, usize)> {
         let body = self.analysis.body();
         let infer = self.analysis.infer();
-        let Expr::Loop { body: inner, source: LoopSource::ForLoop, .. } = body.expr(arm.expr) else { return None };
+        let Expr::Loop { body: inner, source: LoopSource::ForLoop, .. } = body.expr(arm.expr)
+        else {
+            return None;
+        };
         let Expr::Call { args: [head], .. } = body.expr(into_iter) else { return None };
         let Expr::Block { tail: Some(tail), .. } = body.expr(inner) else { return None };
         let Expr::Match { expr: next_call, arms: [_, some] } = body.expr(tail) else { return None };
@@ -453,7 +494,9 @@ impl<'db> Walker<'_, 'db> {
         let body = self.analysis.body();
         let Expr::Match { expr: into_iter, .. } = body.expr(outer) else { return outer };
         match body.expr(into_iter) {
-            Expr::Call { args: [head], .. } if matches!(body.expr(*head), Expr::MethodCall { .. }) => {
+            Expr::Call { args: [head], .. }
+                if matches!(body.expr(*head), Expr::MethodCall { .. }) =>
+            {
                 chain_base(body, *head)
             }
             _ => outer,
@@ -485,7 +528,9 @@ impl<'db> Walker<'_, 'db> {
     fn trait_of(&self, f: FunctionId) -> Option<TraitId> {
         match f.lookup(self.db).container {
             ItemContainerId::TraitId(it) => Some(it),
-            ItemContainerId::ImplId(it) => self.db.impl_trait(it).map(|it| it.skip_binder().def_id.0),
+            ItemContainerId::ImplId(it) => {
+                self.db.impl_trait(it).map(|it| it.skip_binder().def_id.0)
+            }
             _ => None,
         }
     }
@@ -506,7 +551,9 @@ impl<'db> Walker<'_, 'db> {
             match body.expr(parent) {
                 // The `for` itself is the desugaring's outer `match` above its `loop`.
                 Expr::Loop { source: LoopSource::ForLoop, .. } => {
-                    return Some(self.parents.of_expr(parent).map_or(parent, |it| self.for_key(it)));
+                    return Some(
+                        self.parents.of_expr(parent).map_or(parent, |it| self.for_key(it)),
+                    );
                 }
                 Expr::Loop { .. } => return Some(parent),
                 Expr::Closure { .. } => {
@@ -521,7 +568,9 @@ impl<'db> Walker<'_, 'db> {
     }
 
     fn place_ty(&self, mir: &MirBody<'db>, local: LocalId, projection: &[PlaceElem]) -> Ty<'db> {
-        PlaceTy::from_ty(mir.locals[local].ty.as_ref()).multi_projection_ty(&self.infcx, self.env, projection).ty
+        PlaceTy::from_ty(mir.locals[local].ty.as_ref())
+            .multi_projection_ty(&self.infcx, self.env, projection)
+            .ty
     }
 
     /// The pass whose element `place` is of, and its projection past the element: a source's,
@@ -550,7 +599,9 @@ impl<'db> Walker<'_, 'db> {
             if !matches!(elem, ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. }) {
                 continue;
             }
-            let Some(strukt) = struct_of(self.db, self.krate, self.place_ty(mir, place.local, &projection[..=at])) else {
+            let Some(strukt) =
+                struct_of(self.db, self.krate, self.place_ty(mir, place.local, &projection[..=at]))
+            else {
                 continue;
             };
             let key = self.enclosing(expr)?;
@@ -568,11 +619,18 @@ impl<'db> Walker<'_, 'db> {
             for (_, block) in mir.basic_blocks.iter() {
                 for statement in &block.statements {
                     let StatementKind::Assign(to, value) = &statement.kind else { continue };
-                    if !to.projection.is_empty() || to.local == return_slot() || sources.iter().any(|it| it.local == to.local) {
+                    if !to.projection.is_empty()
+                        || to.local == return_slot()
+                        || sources.iter().any(|it| it.local == to.local)
+                    {
                         continue;
                     }
                     let Some(from) = aliased(value) else { continue };
-                    let Some((pass, rest)) = self.element_of(mir, sources, passes, from, statement.span) else { continue };
+                    let Some((pass, rest)) =
+                        self.element_of(mir, sources, passes, from, statement.span)
+                    else {
+                        continue;
+                    };
                     if all_derefs(rest) {
                         sources.push(Source { local: to.local, prefix: Vec::new(), pass }); // alloc: an empty prefix
                         grew = true;
@@ -584,7 +642,9 @@ impl<'db> Walker<'_, 'db> {
             }
         }
         let sources: &[Source] = sources;
-        let is_source = |place: &StoredPlace| place.projection.is_empty() && sources.iter().any(|it| it.local == place.local);
+        let is_source = |place: &StoredPlace| {
+            place.projection.is_empty() && sources.iter().any(|it| it.local == place.local)
+        };
         // Takes in a place an element's field may be read or written through, where it is
         // visited: a visitor's place lives only for its call.
         let mut take = |place: &StoredPlace, span: MirSpan| {
@@ -609,7 +669,11 @@ impl<'db> Walker<'_, 'db> {
                                 take(place, span);
                             }
                         });
-                        if let Rvalue::Ref(_, it) | Rvalue::Len(it) | Rvalue::Discriminant(it) | Rvalue::CopyForDeref(it) = value {
+                        if let Rvalue::Ref(_, it)
+                        | Rvalue::Len(it)
+                        | Rvalue::Discriminant(it)
+                        | Rvalue::CopyForDeref(it) = value
+                        {
                             take(it, span);
                         }
                     }
@@ -685,7 +749,10 @@ fn bytes(n: u64) -> String {
 }
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
-    if !cx.on_blaze(LINT) || cx.expansion().is_some() || !cx.is_written(item.syntax()) || cx.is_in_test(item.syntax())
+    if !cx.on_blaze(LINT)
+        || cx.expansion().is_some()
+        || !cx.is_written(item.syntax())
+        || cx.is_in_test(item.syntax())
     {
         return;
     }
@@ -702,7 +769,8 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
     let Some(passes) = found.by_struct.get(&StructId::from(def)) else { return };
     let loaded = cx.conf().profile.as_ref();
     // clone: the profile's settings and a refcount, once per struct linted with a profile
-    let hits = loaded.map(|it| query::profile_hits(db, krate.base(), query::ProfileKey::new(db, it.clone())));
+    let hits = loaded
+        .map(|it| query::profile_hits(db, krate.base(), query::ProfileKey::new(db, it.clone())));
     let hit_of = |pass: &Pass| -> Option<profile::Hit> { hits?.of(function_of(pass.def)?) };
     // alloc: the passes a finding counts, a few
     let counted: Vec<(&Pass, Option<profile::Hit>)> = passes
@@ -716,10 +784,14 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
     }
     let fields = ty.fields(db);
     let field = |index: u32| fields.iter().find(|(it, _)| it.index() == index as usize);
-    let size_of = |index: u32| field(index).and_then(|(_, it)| it.layout(db).ok()).map(|it| it.size());
-    let name_of = |index: u32| field(index).map_or_else(|| index.to_string(), |(it, _)| it.name(db).as_str().to_owned());
+    let size_of =
+        |index: u32| field(index).and_then(|(_, it)| it.layout(db).ok()).map(|it| it.size());
+    let name_of = |index: u32| {
+        field(index).map_or_else(|| index.to_string(), |(it, _)| it.name(db).as_str().to_owned())
+    };
     // alloc: the fields the counted passes touch, a few
-    let mut touched: Vec<u32> = counted.iter().flat_map(|(it, _)| it.fields.iter().copied()).collect();
+    let mut touched: Vec<u32> =
+        counted.iter().flat_map(|(it, _)| it.fields.iter().copied()).collect();
     touched.sort_unstable();
     touched.dedup();
     let mut needed = 0;
@@ -749,7 +821,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
         let place = place_of_pass(db, pass);
         let at = match place {
             Some((file, range)) => match db.line_column(file, range.start()) {
-                Ok((line, _)) => format!(" ({}:{})", packable::shown_path(db, krate, file), line + 1),
+                Ok((line, _)) => {
+                    format!(" ({}:{})", packable::shown_path(db, krate, file), line + 1)
+                }
                 Err(()) => format!(" ({})", packable::shown_path(db, krate, file)),
             },
             None => String::new(), // alloc: a message's part
@@ -757,7 +831,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
         let pass_names: Vec<String> = pass.fields.iter().map(|&it| name_of(it)).collect(); // alloc: a message's part
         let pass_bytes: u64 = pass.fields.iter().filter_map(|&it| size_of(it)).sum();
         let hot = match (hit, loaded) {
-            (Some(hit), Some(loaded)) => format!(", {} of profile `{}`'s counts", hit.percent(), loaded.file_name()),
+            (Some(hit), Some(loaded)) => {
+                format!(", {} of profile `{}`'s counts", hit.percent(), loaded.file_name())
+            }
             _ => String::new(), // alloc: a message's part
         };
         let text = format!(
@@ -773,11 +849,23 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
     if let Some(loaded) = loaded
         && cold > 0
     {
-        notes.push((None, format!("{cold} more loops over it are not counted: profile `{}` shows them cold", loaded.file_name())));
+        notes.push((
+            None,
+            format!(
+                "{cold} more loops over it are not counted: profile `{}` shows them cold",
+                loaded.file_name()
+            ),
+        ));
     }
     if let Some(defs) = found.unread.get(&StructId::from(def)) {
         let named: Vec<String> = defs.iter().map(|&it| body_name(db, it)).collect(); // alloc: a message's part
-        notes.push((None, format!("the MIR of {} can't be built, so the loops there are not counted", named.join(", "))));
+        notes.push((
+            None,
+            format!(
+                "the MIR of {} can't be built, so the loops there are not counted",
+                named.join(", ")
+            ),
+        ));
     }
     let span = cx.span(range);
     let diagnostic = cx.blaze(LINT, name_node, span, message);
@@ -835,9 +923,22 @@ pub fn max_b(ps: &[Particle]) -> u32 {
 "#,
         );
         assert_eq!(found.matches("`Particle` takes 64 bytes").count(), 1, "{found}");
-        assert!(found.contains("the 2 loops over collections of it touch only `a` and `b`: 8 bytes of each element"), "{found}");
-        assert!(found.contains("the `for` loop in `fn sum_a` (") && found.contains("lib.rs:4) touches `a` (4 bytes)"), "{found}");
-        assert!(found.contains("the loop indexing it in `fn max_b` (") && found.contains("lib.rs:11) touches `b` (4 bytes)"), "{found}");
+        assert!(
+            found.contains(
+                "the 2 loops over collections of it touch only `a` and `b`: 8 bytes of each element"
+            ),
+            "{found}"
+        );
+        assert!(
+            found.contains("the `for` loop in `fn sum_a` (")
+                && found.contains("lib.rs:4) touches `a` (4 bytes)"),
+            "{found}"
+        );
+        assert!(
+            found.contains("the loop indexing it in `fn max_b` (")
+                && found.contains("lib.rs:11) touches `b` (4 bytes)"),
+            "{found}"
+        );
     }
 
     /// The same struct, where the loops read most of each element.

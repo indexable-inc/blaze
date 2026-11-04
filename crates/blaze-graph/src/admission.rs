@@ -31,10 +31,10 @@ use std::{
 
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{Tag, tag};
 use blaze_radix as radix;
 use serde::{Deserialize, Serialize};
+use std::alloc::Global;
 
 /// How many peaks under a prediction, in a row, bring it down a step.
 pub const WINDOW: u32 = 64;
@@ -149,8 +149,9 @@ pub const fn tag_of(kind: TaskKind) -> Tag {
 /// this, so a task's memory has one home whoever runs it.
 pub fn run_as<R>(kind: TaskKind, f: impl FnOnce() -> R) -> (R, u64) {
     let tag = tag_of(kind);
-    let ((out, bytes), frames) =
-        blaze_mem::frame::measure(|| crate::arena::account(|| blaze_mem::frame::task(tag, |_| f())));
+    let ((out, bytes), frames) = blaze_mem::frame::measure(|| {
+        crate::arena::account(|| blaze_mem::frame::task(tag, |_| f()))
+    });
     (out, bytes + frames as u64)
 }
 
@@ -378,8 +379,8 @@ pub struct Estimates {
 /// bytes whatever order their kinds were first seen in.
 mod in_order {
     use blaze_hash::HashMap;
-    use std::alloc::Global;
     use serde::{Deserialize, Deserializer, Serializer};
+    use std::alloc::Global;
 
     use super::{Estimate, TaskKind};
 
@@ -392,13 +393,15 @@ mod in_order {
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<HashMap<TaskKind, Estimate, Global>, D::Error> { // alloc: the estimates, kept across builds and persisted
+    ) -> Result<HashMap<TaskKind, Estimate, Global>, D::Error> {
+        // alloc: the estimates, kept across builds and persisted
         HashMap::deserialize(deserializer)
     }
 }
 
 /// The kinds of `by_kind` and their estimates, in order of the kinds' numbers.
-fn sorted(by_kind: &HashMap<TaskKind, Estimate, Global>) -> Vec<(TaskKind, Estimate)> { // alloc: the estimates, kept across builds and persisted
+fn sorted(by_kind: &HashMap<TaskKind, Estimate, Global>) -> Vec<(TaskKind, Estimate)> {
+    // alloc: the estimates, kept across builds and persisted
     // alloc: once per encoding of the estimates, as the daemon's image is written
     let mut kinds: Vec<(TaskKind, Estimate)> = by_kind.iter().map(|(&k, &e)| (k, e)).collect();
     radix::sort_copy_by_key(&mut kinds, |it| it.0.0);
@@ -490,13 +493,22 @@ impl Estimates {
 pub enum DecodeError {
     /// Not of this version of [`Estimates::encode`].
     Version,
-    Short { at: usize },
+    Short {
+        at: usize,
+    },
     /// Not as many bytes as `count` kinds take.
-    Length { count: u64, bytes: usize },
+    Length {
+        count: u64,
+        bytes: usize,
+    },
     /// A kind not after the one before it.
-    Order { kind: u32 },
+    Order {
+        kind: u32,
+    },
     /// An estimate no observations make.
-    Unsound { kind: u32 },
+    Unsound {
+        kind: u32,
+    },
 }
 
 impl fmt::Display for DecodeError {
@@ -767,7 +779,8 @@ mod tests {
                 estimates.observe(kind, peak);
                 model.entry(kind).or_default().observe(peak);
                 let asked = TaskKind(kinds[random.index(kinds.len())]);
-                let want = model.get(&asked).filter(|it| it.seen > 0).map_or(unseen, |it| it.predicted);
+                let want =
+                    model.get(&asked).filter(|it| it.seen > 0).map_or(unseen, |it| it.predicted);
                 assert_eq!(estimates.predict(asked), want, "seed {seed}");
             }
             assert_eq!(estimates.by_kind.len(), model.len(), "seed {seed}");
@@ -918,11 +931,17 @@ mod tests {
         assert!(squeeze.due(at(42 * GIB, None)), "at the line");
         assert!(squeeze.due(at(10 * GIB, Some(Tag::Mir))), "a released subsystem past its share");
         squeeze.released(at(40 * GIB, None));
-        assert!(!squeeze.due(at(42 * GIB, None)), "past the line, but under 40 + 3 since the release");
+        assert!(
+            !squeeze.due(at(42 * GIB, None)),
+            "past the line, but under 40 + 3 since the release"
+        );
         assert!(!squeeze.due(at(42 * GIB, Some(Tag::Infer))), "past a share, still under the step");
         assert!(squeeze.due(at(43 * GIB, None)), "a sixteenth (3 GiB) past what the release left");
         squeeze.released(at(20 * GIB, None));
-        assert!(squeeze.due(at(23 * GIB, Some(Tag::Infer))), "a release that freed much lowers the step's floor");
+        assert!(
+            squeeze.due(at(23 * GIB, Some(Tag::Infer))),
+            "a release that freed much lowers the step's floor"
+        );
         let unlimited = Pressure { held: u64::MAX - 1, limit: u64::MAX, over: Some(Tag::Mir) };
         assert!(!Squeeze::default().due(unlimited), "no limit: never due");
     }
@@ -945,7 +964,10 @@ mod tests {
         for tag in Tag::ALL {
             assert_eq!(caps[tag.index()], 48 * GIB / SHARES * share(tag), "{tag}");
         }
-        assert!(caps[Tag::Infer.index()] < 48 * GIB / 64 * share(Tag::Infer), "tighter than the budget");
+        assert!(
+            caps[Tag::Infer.index()] < 48 * GIB / 64 * share(Tag::Infer),
+            "tighter than the budget"
+        );
     }
 
     /// The plane predicts every node it admits and observes every task that ends: once each

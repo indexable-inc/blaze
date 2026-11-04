@@ -252,9 +252,7 @@ pub fn bit_width_of(
     env: StoredParamEnvAndCrate,
 ) -> Result<BitWidth, BitWidthError> {
     let normalizer = Normalizer::new(db, env.krate, env.param_env(db));
-    let ty = normalizer
-        .normalize(ty.as_ref())
-        .map_err(|_| BitWidthError::Normalization { ty })?;
+    let ty = normalizer.normalize(ty.as_ref()).map_err(|_| BitWidthError::Normalization { ty })?;
     let stored = ty.store();
     let int = |bits: u32, signed: bool| Ok(BitWidth { bits, signed });
     match ty.kind() {
@@ -284,7 +282,9 @@ pub fn bit_width_of(
                 }
             },
             AdtId::EnumId(id) => enum_width(db, id, stored),
-            AdtId::StructId(_) | AdtId::UnionId(_) => Err(BitWidthError::NotPackable { ty: stored }),
+            AdtId::StructId(_) | AdtId::UnionId(_) => {
+                Err(BitWidthError::NotPackable { ty: stored })
+            }
         },
         _ => Err(BitWidthError::NotPackable { ty: stored }),
     }
@@ -305,7 +305,8 @@ fn enum_width(db: &Db, id: EnumId, ty: StoredTy) -> Result<BitWidth, BitWidthErr
     if variants.is_empty() {
         return Err(BitWidthError::EmptyEnum { ty });
     }
-    if let Some(&variant) = variants.iter().find(|&&v| !variant_field_ids(db, v.into()).is_empty()) {
+    if let Some(&variant) = variants.iter().find(|&&v| !variant_field_ids(db, v.into()).is_empty())
+    {
         return Err(BitWidthError::EnumWithFields { ty, variant });
     }
     match AttrFlags::repr(db, id.into()).and_then(|it| it.int) {

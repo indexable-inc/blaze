@@ -44,13 +44,19 @@ use crate::{
 
 /// The schema of an object: its bytes inline, or the list of its chunks. [`CHUNK_LEN`] is in
 /// it, as which objects are chunked and where their chunks begin depend on it.
-const OBJECT: blaze_format::SchemaHash =
-    blaze_format::schema("blaze-fetch object: bytes, or chunks of 4194304 bytes, by their BLAKE3 3");
-const _: () = assert!(CHUNK_LEN == 4_194_304, "CHUNK_LEN is written in OBJECT's schema: change both together");
+const OBJECT: blaze_format::SchemaHash = blaze_format::schema(
+    "blaze-fetch object: bytes, or chunks of 4194304 bytes, by their BLAKE3 3",
+);
+const _: () = assert!(
+    CHUNK_LEN == 4_194_304,
+    "CHUNK_LEN is written in OBJECT's schema: change both together"
+);
 /// The schema of a chunk: a piece of an object, under the key of its own BLAKE3.
-const CHUNK: blaze_format::SchemaHash = blaze_format::schema("blaze-fetch chunk: a piece of an object by its BLAKE3 1");
+const CHUNK: blaze_format::SchemaHash =
+    blaze_format::schema("blaze-fetch chunk: a piece of an object by its BLAKE3 1");
 /// The schema of an index record: 41 bytes, an object's form, BLAKE3 and length.
-const RECORD: blaze_format::SchemaHash = blaze_format::schema("blaze-fetch index record: form, BLAKE3, length 2");
+const RECORD: blaze_format::SchemaHash =
+    blaze_format::schema("blaze-fetch index record: form, BLAKE3, length 2");
 const RECORD_LEN: usize = 41;
 
 /// The most bytes of an object held at once, to put or to read: an object longer than this
@@ -241,13 +247,18 @@ impl Bytes<'_> {
     fn len(&self) -> Result<u64, FetchError> {
         match self {
             Bytes::Slice(bytes) => Ok(bytes.len() as u64),
-            Bytes::File(path) => Ok(std::fs::metadata(path).map_err(self.io("reading the length of"))?.len()),
+            Bytes::File(path) => {
+                Ok(std::fs::metadata(path).map_err(self.io("reading the length of"))?.len())
+            }
         }
     }
 
     /// Each piece of at most [`CHUNK_LEN`] bytes, in order; every piece but the last is
     /// exactly [`CHUNK_LEN`].
-    fn each(&self, mut piece: impl FnMut(&[u8]) -> Result<(), FetchError>) -> Result<(), FetchError> {
+    fn each(
+        &self,
+        mut piece: impl FnMut(&[u8]) -> Result<(), FetchError>,
+    ) -> Result<(), FetchError> {
         match self {
             Bytes::Slice(bytes) => bytes.chunks(CHUNK_LEN).try_for_each(piece),
             Bytes::File(path) => {
@@ -304,7 +315,11 @@ impl<'s> Objects<'s> {
             .map_err(|e| failed(format!("its index record failed its check: {e:?}")))?; // alloc: error path
         let object = match record {
             None => return Ok(None),
-            Some(None) => return Err(failed("its index record is not 41 bytes of a form, a BLAKE3 and a length".to_owned())), // alloc: error path
+            Some(None) => {
+                return Err(failed(
+                    "its index record is not 41 bytes of a form, a BLAKE3 and a length".to_owned(),
+                ));
+            } // alloc: error path
             Some(Some(object)) => object,
         };
         Ok(self.whole(&object)?.then_some(object))
@@ -321,8 +336,10 @@ impl<'s> Objects<'s> {
             return Ok(true);
         }
         let listing = self.read(object)?;
-        let entries = tree::parse(&listing)
-            .map_err(|refused| FetchError::Tree { from: Producer::Given(object.blake3.to_string()), refused })?; // alloc: error path
+        let entries = tree::parse(&listing).map_err(|refused| FetchError::Tree {
+            from: Producer::Given(object.blake3.to_string()),
+            refused,
+        })?; // alloc: error path
         for entry in &entries {
             if !self.blob_whole(entry.blake3, entry.len)? {
                 return Ok(false);
@@ -342,11 +359,16 @@ impl<'s> Objects<'s> {
         let whole = store
             .read(&key, |entry| -> Result<bool, ()> {
                 match entry.bytes.split_first() {
-                    Some((&CHUNKED, list)) => Ok(chunk_list(list)?.all(|(chunk, _)| store.has(&chunk_key(chunk)))),
+                    Some((&CHUNKED, list)) => {
+                        Ok(chunk_list(list)?.all(|(chunk, _)| store.has(&chunk_key(chunk))))
+                    }
                     _ => Err(()),
                 }
             })
-            .map_err(|e| FetchError::Store { pin: None, what: format!("{blake3} failed its check: {e:?}") })?; // alloc: error path
+            .map_err(|e| FetchError::Store {
+                pin: None,
+                what: format!("{blake3} failed its check: {e:?}"),
+            })?; // alloc: error path
         match whole {
             None => Ok(false),
             Some(Err(())) => Err(not_an_object(blake3)),
@@ -362,7 +384,11 @@ impl<'s> Objects<'s> {
             Ok(())
         })?;
         if len != object.len {
-            return Err(FetchError::Length { object: object.blake3, expected: object.len, actual: len });
+            return Err(FetchError::Length {
+                object: object.blake3,
+                expected: object.len,
+                actual: len,
+            });
         }
         Ok(out)
     }
@@ -378,7 +404,11 @@ impl<'s> Objects<'s> {
     ) -> Result<u64, FetchError> {
         let failed = |what: String| FetchError::Store { pin: None, what };
         let check = |e: blaze_cas::Corrupt| failed(format!("{blake3} failed its check: {e:?}")); // alloc: error path
-        let value = self.store.pinned(&object_key(blake3)).map_err(check)?.ok_or_else(|| failed(format!("it has no {blake3}")))?; // alloc: error path
+        let value = self
+            .store
+            .pinned(&object_key(blake3))
+            .map_err(check)?
+            .ok_or_else(|| failed(format!("it has no {blake3}")))?; // alloc: error path
         let mut hashing = blaze_ids::b3::Hasher::new();
         let mut len = 0u64;
         match value.split_first() {
@@ -392,10 +422,15 @@ impl<'s> Objects<'s> {
                     let bytes = self
                         .store
                         .pinned(&chunk_key(chunk))
-                        .map_err(|e| failed(format!("{chunk}, a chunk of {blake3}, failed its check: {e:?}")))? // alloc: error path
+                        .map_err(|e| {
+                            failed(format!("{chunk}, a chunk of {blake3}, failed its check: {e:?}"))
+                        })? // alloc: error path
                         .ok_or_else(|| failed(format!("it has no {chunk}, a chunk of {blake3}")))?; // alloc: error path
                     if bytes.len() as u64 != chunk_len {
-                        return Err(failed(format!("{chunk}, a chunk of {blake3}, is {} bytes, and the list says {chunk_len}", bytes.len()))); // alloc: error path
+                        return Err(failed(format!(
+                            "{chunk}, a chunk of {blake3}, is {} bytes, and the list says {chunk_len}",
+                            bytes.len()
+                        ))); // alloc: error path
                     }
                     hashing.update(&bytes[..]);
                     len += chunk_len;
@@ -406,21 +441,34 @@ impl<'s> Objects<'s> {
         }
         let got = Blake3(hashing.finalize());
         if got != blake3 {
-            return Err(failed(format!("the bytes filed as {blake3} are {got}: kept wrong, and not given"))); // alloc: error path
+            return Err(failed(format!(
+                "the bytes filed as {blake3} are {got}: kept wrong, and not given"
+            ))); // alloc: error path
         }
         Ok(len)
     }
 
     /// `bytes`, checked against `pin`, kept as a file object with `pin` recorded onto it, as
     /// `check_and_file` does: for bytes a caller already has (a `.crate` in cargo's cache).
-    pub fn keep_pinned(&self, pin: &Digest, from: Producer, bytes: &[u8]) -> Result<Object, FetchError> {
+    pub fn keep_pinned(
+        &self,
+        pin: &Digest,
+        from: Producer,
+        bytes: &[u8],
+    ) -> Result<Object, FetchError> {
         check_and_file(*self, pin, Produced { made: Made::Bytes(bytes), from })
     }
 
     /// `tree`, the output of the pure step whose code identity is `code` over `inputs` (each
     /// an [`Object::id`]), kept with the step recorded onto it: a later run of the same step on
     /// the same inputs is [`Objects::lookup`] of [`Origin::Step`]. `step` names it in errors.
-    pub fn keep_step(&self, code: ContentId, inputs: &[ContentId], step: &str, tree: &Tree) -> Result<Object, FetchError> {
+    pub fn keep_step(
+        &self,
+        code: ContentId,
+        inputs: &[ContentId],
+        step: &str,
+        tree: &Tree,
+    ) -> Result<Object, FetchError> {
         let from = Producer::Step(step.to_owned()); // alloc: once a step
         let listing = listing_of(tree, &from)?;
         self.put_files(tree)?;
@@ -447,7 +495,8 @@ impl<'s> Objects<'s> {
             })?;
             value
         } else {
-            let mut value = Vec::with_capacity(1 + CHUNK_ENTRY * len.div_ceil(CHUNK_LEN as u64) as usize); // alloc: the list, once an object
+            let mut value =
+                Vec::with_capacity(1 + CHUNK_ENTRY * len.div_ceil(CHUNK_LEN as u64) as usize); // alloc: the list, once an object
             value.push(CHUNKED);
             bytes.each(|piece| {
                 whole.update(piece);
@@ -465,13 +514,16 @@ impl<'s> Objects<'s> {
         };
         let got = Blake3(whole.finalize());
         if got != blake3 || put != len {
-            return Err(bytes.io("filing")(std::io::Error::other(format!( // alloc: error path
+            return Err(bytes.io("filing")(std::io::Error::other(format!(
+                // alloc: error path
                 "its bytes changed while they were filed: hashed as {blake3}, then read as {got}"
             ))));
         }
-        self.store.put(object_key(blake3), Kind::Output, &value).map_err(|it| FetchError::Store {
-            pin: None,
-            what: format!("it keeps another value ({:x}) under the key of {blake3}", it.kept), // alloc: error path
+        self.store.put(object_key(blake3), Kind::Output, &value).map_err(|it| {
+            FetchError::Store {
+                pin: None,
+                what: format!("it keeps another value ({:x}) under the key of {blake3}", it.kept), // alloc: error path
+            }
         })?;
         Ok(Object { blake3, len, form })
     }
@@ -497,7 +549,10 @@ impl<'s> Objects<'s> {
 }
 
 fn not_an_object(blake3: Blake3) -> FetchError {
-    FetchError::Store { pin: None, what: format!("its value under the key of {blake3} is neither bytes nor a list of chunks") } // alloc: error path
+    FetchError::Store {
+        pin: None,
+        what: format!("its value under the key of {blake3} is neither bytes nor a list of chunks"),
+    } // alloc: error path
 }
 
 /// A chunked object's list: each chunk's BLAKE3 and length.
@@ -516,7 +571,12 @@ pub(crate) fn listing_of(tree: &Tree, from: &Producer) -> Result<Vec<u8>, FetchE
     let mut entries: Vec<Entry> = tree // alloc: once a tree
         .files
         .iter()
-        .map(|it| Entry { path: it.path.clone(), kind: it.kind, blake3: Blake3::of(&it.bytes), len: it.bytes.len() as u64 }) // clone: once a file
+        .map(|it| Entry {
+            path: it.path.clone(),
+            kind: it.kind,
+            blake3: Blake3::of(&it.bytes),
+            len: it.bytes.len() as u64,
+        }) // clone: once a file
         .collect();
     tree::listing(&mut entries).map_err(|refused| FetchError::Tree { from: from.clone(), refused }) // clone: error path
 }
@@ -539,7 +599,8 @@ pub fn ensure<'b>(
     if produced.made.form() != form {
         return Err(FetchError::Store {
             pin: Some(*pin),
-            what: format!( // alloc: error path
+            what: format!(
+                // alloc: error path
                 "{} made a {} where a {} was asked for, so nothing of it was kept",
                 produced.from,
                 produced.made.form().name(),
@@ -553,7 +614,11 @@ pub fn ensure<'b>(
 /// `produced` hashed here, in the pin's algorithm and BLAKE3, and checked against `pin`; on a
 /// match filed with `pin` recorded onto it, on a mismatch nothing kept. No caller hands in a
 /// hash: the bytes filed are the bytes hashed, read again as they are put.
-pub(crate) fn check_and_file(objects: Objects<'_>, pin: &Digest, produced: Produced<'_>) -> Result<Object, FetchError> {
+pub(crate) fn check_and_file(
+    objects: Objects<'_>,
+    pin: &Digest,
+    produced: Produced<'_>,
+) -> Result<Object, FetchError> {
     let Produced { made, from } = produced;
     let listing;
     let (bytes, form) = match made {

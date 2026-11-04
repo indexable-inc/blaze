@@ -11,14 +11,7 @@ use alloc::string::ToString;
 #[test]
 fn spans_get_mut_returns_mutable_reference() {
     let mut spans = Spans::new();
-    spans.push(Span {
-        start: 0,
-        end: 1,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    });
+    spans.push(Span { start: 0, end: 1, label: 1, depth: 0, parent: None, discarded: false });
     let span = spans.get_mut(0).unwrap();
     span.discarded = true;
     assert!(spans[0usize].discarded);
@@ -38,14 +31,7 @@ fn spans_trivial_handles_simplest_forced_and_oob() {
     let forced_interesting = ChoiceNode::boolean(BooleanChoice { p: 0.5 }, true, true);
 
     let mut spans = Spans::new();
-    spans.push(Span {
-        start: 0,
-        end: 2,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    });
+    spans.push(Span { start: 0, end: 2, label: 1, depth: 0, parent: None, discarded: false });
 
     let nodes = vec![simplest.clone(), simplest.clone()];
     assert!(spans.trivial(0, &nodes).unwrap());
@@ -64,14 +50,7 @@ fn spans_trivial_handles_simplest_forced_and_oob() {
 #[test]
 fn spans_into_vec_consumes_and_returns_inner() {
     let mut spans = Spans::new();
-    spans.push(Span {
-        start: 0,
-        end: 1,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    });
+    spans.push(Span { start: 0, end: 1, label: 1, depth: 0, parent: None, discarded: false });
     let v = spans.into_vec();
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].label, 1);
@@ -79,14 +58,7 @@ fn spans_into_vec_consumes_and_returns_inner() {
 
 #[test]
 fn spans_from_vec() {
-    let v = vec![Span {
-        start: 0,
-        end: 3,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    }];
+    let v = vec![Span { start: 0, end: 3, label: 1, depth: 0, parent: None, discarded: false }];
     let spans = Spans::from(v);
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0usize].label, 1);
@@ -95,14 +67,7 @@ fn spans_from_vec() {
 #[test]
 fn spans_deref_to_slice() {
     let mut spans = Spans::new();
-    spans.push(Span {
-        start: 0,
-        end: 1,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    });
+    spans.push(Span { start: 0, end: 1, label: 1, depth: 0, parent: None, discarded: false });
     let slice: &[Span] = &spans;
     assert_eq!(slice.len(), 1);
     assert_eq!(slice[0].label, 1);
@@ -135,9 +100,7 @@ fn draw_integer_forced_records_a_forced_node_without_consuming_the_prefix() {
         4,
         None,
     );
-    tc.draw_integer_forced(BigInt::from(0), BigInt::from(10), BigInt::from(7))
-        .ok()
-        .unwrap();
+    tc.draw_integer_forced(BigInt::from(0), BigInt::from(10), BigInt::from(7)).ok().unwrap();
     assert_eq!(tc.nodes.len(), 1);
     assert!(tc.nodes[0].was_forced);
     assert_eq!(tc.nodes[0].value(), ChoiceValue::Integer(BigInt::from(7)));
@@ -156,9 +119,7 @@ fn draw_integer_forced_notifies_observer() {
         }
     }
     let captured = Arc::new(Mutex::new(None));
-    let obs = Box::new(ForcedIntObserver {
-        captured: captured.clone(),
-    });
+    let obs = Box::new(ForcedIntObserver { captured: captured.clone() });
     let mut tc = NativeTestCase::for_choices_and_template(&[], None, None, 4, Some(obs));
     tc.draw_integer_forced(0i64, 5i64, 3i64).ok().unwrap();
     let recorded = captured.lock().unwrap().take();
@@ -168,19 +129,13 @@ fn draw_integer_forced_notifies_observer() {
 #[test]
 fn draw_integer_forced_errors_on_an_exhausted_test_case() {
     let mut tc = NativeTestCase::for_choices(&[], None, None);
-    assert!(matches!(
-        tc.draw_integer_forced(0i64, 5i64, 3i64),
-        Err(EngineError::Overrun)
-    ));
+    assert!(matches!(tc.draw_integer_forced(0i64, 5i64, 3i64), Err(EngineError::Overrun)));
 }
 
 #[test]
 fn draw_integer_forced_rejects_out_of_range_values() {
     let mut tc = NativeTestCase::for_choices_and_template(&[], None, None, 4, None);
-    let msg = tc
-        .draw_integer_forced(0i64, 5i64, 6i64)
-        .unwrap_err()
-        .to_string();
+    let msg = tc.draw_integer_forced(0i64, 5i64, 6i64).unwrap_err().to_string();
     assert!(msg.contains("outside"), "{msg}");
     assert!(msg.contains("bug in hegel"), "{msg}");
 }
@@ -188,22 +143,8 @@ fn draw_integer_forced_rejects_out_of_range_values() {
 #[test]
 fn spans_get_returns_span_by_index() {
     let mut spans = Spans::new();
-    spans.push(Span {
-        start: 0,
-        end: 1,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    });
-    spans.push(Span {
-        start: 1,
-        end: 2,
-        label: 2,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    });
+    spans.push(Span { start: 0, end: 1, label: 1, depth: 0, parent: None, discarded: false });
+    spans.push(Span { start: 1, end: 2, label: 2, depth: 0, parent: None, discarded: false });
     assert_eq!(spans.get(0).unwrap().label, 1);
     assert_eq!(spans.get(1).unwrap().label, 2);
     assert!(spans.get(2).is_none());
@@ -212,14 +153,7 @@ fn spans_get_returns_span_by_index() {
 #[test]
 fn spans_as_slice_returns_slice() {
     let mut spans = Spans::new();
-    spans.push(Span {
-        start: 0,
-        end: 1,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    });
+    spans.push(Span { start: 0, end: 1, label: 1, depth: 0, parent: None, discarded: false });
     let sl = spans.as_slice();
     assert_eq!(sl.len(), 1);
     assert_eq!(sl[0].label, 1);
@@ -309,9 +243,7 @@ fn weighted_notifies_observer_on_boolean_draw() {
         }
     }
     let captured = Arc::new(Mutex::new(None));
-    let obs = Box::new(CaptureBoolObserver {
-        captured: captured.clone(),
-    });
+    let obs = Box::new(CaptureBoolObserver { captured: captured.clone() });
     let mut tc = NativeTestCase::for_choices(&[ChoiceValue::Boolean(true)], None, Some(obs));
     let v = tc.weighted(0.5, None).ok().unwrap();
     assert!(v);
@@ -331,9 +263,7 @@ fn freeze_notifies_observer_on_conclude_test() {
         }
     }
     let captured = Arc::new(Mutex::new(None));
-    let obs = Box::new(FreezeObserver {
-        captured: captured.clone(),
-    });
+    let obs = Box::new(FreezeObserver { captured: captured.clone() });
     let mut tc = NativeTestCase::for_choices(&[], None, Some(obs));
     tc.freeze();
     let recorded = captured.lock().unwrap().take();
@@ -353,9 +283,7 @@ fn draw_integer_notifies_observer() {
     }
     let captured = Arc::new(Mutex::new(None));
     let choices = vec![ChoiceValue::Integer(BigInt::from(99))];
-    let obs = Box::new(IntObserver {
-        captured: captured.clone(),
-    });
+    let obs = Box::new(IntObserver { captured: captured.clone() });
     let mut tc = NativeTestCase::for_choices(&choices, None, Some(obs));
     let v = tc.draw_integer::<i128>(0, 100).ok().unwrap();
     assert_eq!(v, 99);
@@ -376,14 +304,9 @@ fn draw_float_notifies_observer() {
     }
     let captured = Arc::new(Mutex::new(None));
     let choices = vec![ChoiceValue::Float(2.5)];
-    let obs = Box::new(FloatObserver {
-        captured: captured.clone(),
-    });
+    let obs = Box::new(FloatObserver { captured: captured.clone() });
     let mut tc = NativeTestCase::for_choices(&choices, None, Some(obs));
-    let v = tc
-        .draw_float(FloatWidth::F64, 0.0, 10.0, false, false, 5e-324)
-        .ok()
-        .unwrap();
+    let v = tc.draw_float(FloatWidth::F64, 0.0, 10.0, false, false, 5e-324).ok().unwrap();
     assert_eq!(v, 2.5);
     let recorded = captured.lock().unwrap().take();
     assert_eq!(recorded, Some((2.5_f64.to_bits(), false)));
@@ -409,9 +332,7 @@ fn draw_bytes_notifies_observer() {
     }
     let captured: Captured = Arc::new(Mutex::new(None));
     let choices = vec![ChoiceValue::Bytes(vec![1, 2, 3])];
-    let obs = Box::new(BytesObserver {
-        captured: captured.clone(),
-    });
+    let obs = Box::new(BytesObserver { captured: captured.clone() });
     let mut tc = NativeTestCase::for_choices(&choices, None, Some(obs));
     let v = tc.draw_bytes(0, 10).ok().unwrap();
     assert_eq!(v, vec![1, 2, 3]);
@@ -438,14 +359,8 @@ fn draw_string_notifies_observer() {
         }
     }
     let captured: Captured = Arc::new(Mutex::new(None));
-    let choices = vec![ChoiceValue::String(vec![
-        b'a' as u32,
-        b'b' as u32,
-        b'c' as u32,
-    ])];
-    let obs = Box::new(StringObserver {
-        captured: captured.clone(),
-    });
+    let choices = vec![ChoiceValue::String(vec![b'a' as u32, b'b' as u32, b'c' as u32])];
+    let obs = Box::new(StringObserver { captured: captured.clone() });
     let mut tc = NativeTestCase::for_choices(&choices, None, Some(obs));
     let intervals =
         crate::native::intervalsets::IntervalSet::new(vec![(0, 0xD7FF), (0xE000, 0x10FFFF)])
@@ -470,14 +385,7 @@ fn draw_float_unbounded_with_nan_can_produce_nan() {
     for seed in 0..200u64 {
         let mut tc = NativeTestCase::new_random(EngineRng::seeded(seed)).unwrap();
         let v = tc
-            .draw_float(
-                FloatWidth::F64,
-                f64::NEG_INFINITY,
-                f64::INFINITY,
-                true,
-                true,
-                5e-324,
-            )
+            .draw_float(FloatWidth::F64, f64::NEG_INFINITY, f64::INFINITY, true, true, 5e-324)
             .ok()
             .unwrap();
         if v.is_nan() {
@@ -490,10 +398,7 @@ fn draw_float_unbounded_with_nan_can_produce_nan() {
 #[test]
 fn draw_float_half_bounded_below_explores_finite_range() {
     let mut tc = NativeTestCase::new_random(EngineRng::seeded(0)).unwrap();
-    let v = tc
-        .draw_float(FloatWidth::F64, 1.0, f64::INFINITY, false, false, 5e-324)
-        .ok()
-        .unwrap();
+    let v = tc.draw_float(FloatWidth::F64, 1.0, f64::INFINITY, false, false, 5e-324).ok().unwrap();
     assert!(v >= 1.0 && !v.is_nan());
 }
 
@@ -521,10 +426,7 @@ fn for_simplest_draws_integer_clamped_to_range_when_target_above() {
 #[test]
 fn for_simplest_draws_float_at_zero() {
     let mut tc = NativeTestCase::for_simplest(BUFFER_SIZE).unwrap();
-    let v = tc
-        .draw_float(FloatWidth::F64, -10.0, 10.0, false, false, 5e-324)
-        .ok()
-        .unwrap();
+    let v = tc.draw_float(FloatWidth::F64, -10.0, 10.0, false, false, 5e-324).ok().unwrap();
     assert_eq!(v, 0.0);
     assert!(v.is_sign_positive(), "expected +0.0, got -0.0");
 }
@@ -633,10 +535,7 @@ fn template_concrete_prefix_with_punning_then_template() {
 #[test]
 fn template_count_zero_errors_at_construction() {
     let msg = ChoiceTemplate::simplest(Some(0)).unwrap_err().to_string();
-    assert!(
-        msg.contains("ChoiceTemplate count must be positive"),
-        "{msg}"
-    );
+    assert!(msg.contains("ChoiceTemplate count must be positive"), "{msg}");
 }
 
 #[test]
@@ -696,10 +595,7 @@ fn biased_integer_sample_stays_in_range_for_wide_bounds() {
     let mut rng = EngineRng::seeded(2);
     for _ in 0..2000 {
         let v = swarm_sample(i64::MIN as i128, i64::MAX as i128, &mut rng);
-        assert!(
-            (i64::MIN as i128..=i64::MAX as i128).contains(&v),
-            "out of range: {v}"
-        );
+        assert!((i64::MIN as i128..=i64::MAX as i128).contains(&v), "out of range: {v}");
     }
 }
 
@@ -725,18 +621,10 @@ fn biased_integer_sample_produces_diverse_magnitudes_unbounded() {
     let mut magnitudes: HashSet<i32> = HashSet::default();
     for _ in 0..2000 {
         let v = swarm_sample(i64::MIN as i128, i64::MAX as i128, &mut rng);
-        let mag = if v == 0 {
-            0
-        } else {
-            128 - v.unsigned_abs().leading_zeros() as i32
-        };
+        let mag = if v == 0 { 0 } else { 128 - v.unsigned_abs().leading_zeros() as i32 };
         magnitudes.insert(mag);
     }
-    assert!(
-        magnitudes.len() >= 10,
-        "expected >= 10 magnitude buckets, got {}",
-        magnitudes.len()
-    );
+    assert!(magnitudes.len() >= 10, "expected >= 10 magnitude buckets, got {}", magnitudes.len());
 }
 
 #[test]
@@ -779,15 +667,11 @@ fn biased_integer_sample_wide_range_still_draws_from_distribution() {
 #[test]
 fn biased_integer_sample_log_skewed_bounded_range_favours_smaller_magnitudes() {
     let mut rng = EngineRng::seeded(11);
-    let mut samples: Vec<i128> = (0..2000)
-        .map(|_| swarm_sample(10_000, 10_000_000, &mut rng))
-        .collect();
+    let mut samples: Vec<i128> =
+        (0..2000).map(|_| swarm_sample(10_000, 10_000_000, &mut rng)).collect();
     samples.sort();
     let median = samples[samples.len() / 2];
-    assert!(
-        median < 1_000_000,
-        "median {median} is too high; expected log-skewed distribution"
-    );
+    assert!(median < 1_000_000, "median {median} is too high; expected log-skewed distribution");
 }
 
 /// Each category weight directly controls how often a wide draw returns a value
@@ -880,9 +764,8 @@ fn swarm_shared_parameters_correlate_operand_extremeness() {
     // vanishing probability. So "`v` is one of these" is effectively a pure
     // indicator that the interesting category fired — whose weight the shared
     // parameters control.
-    const INTERESTING_ONLY: [i128; 10] = [
-        512, -512, 1024, -1024, 2048, -2048, 4096, -4096, 8192, -8192,
-    ];
+    const INTERESTING_ONLY: [i128; 10] =
+        [512, -512, 1024, -1024, 2048, -2048, 4096, -4096, 8192, -8192];
     let interesting_hit = |v: i128| INTERESTING_ONLY.contains(&v);
     let pairs = 200_000;
 
@@ -1023,10 +906,7 @@ fn float_generation_parameters_follow_their_own_alphas_and_draw_independently() 
     }
     assert_eq!(
         GenerationParameters::default(),
-        GenerationParameters {
-            integer: int_default,
-            float: float_default,
-        }
+        GenerationParameters { integer: int_default, float: float_default }
     );
 
     let mut rng = EngineRng::seeded(78);
@@ -1038,16 +918,10 @@ fn float_generation_parameters_follow_their_own_alphas_and_draw_independently() 
         let f = p.float;
         let weights = float_weights(&f);
         for (i, &v) in weights.iter().enumerate() {
-            assert!(
-                (0.0..=1.0).contains(&v),
-                "float weight {i} = {v} out of [0, 1]"
-            );
+            assert!((0.0..=1.0).contains(&v), "float weight {i} = {v} out of [0, 1]");
         }
         let mass: f64 = weights.iter().sum();
-        assert!(
-            (mass - 1.0).abs() <= 1e-9,
-            "float weights sum to {mass}, expected 1"
-        );
+        assert!((mass - 1.0).abs() <= 1e-9, "float weights sum to {mass}, expected 1");
         if f.endpoint_probability != p.integer.endpoint_probability {
             differ += 1;
         }
@@ -1195,19 +1069,14 @@ fn constants_in_alphabet_is_memoised_on_the_interval_set() {
 #[test]
 fn biased_string_sample_empty_alphabet_returns_empty_string() {
     let sc = StringChoice {
-        intervals: crate::native::intervalsets::IntervalSet::new(vec![])
-            .unwrap()
-            .into(),
+        intervals: crate::native::intervalsets::IntervalSet::new(vec![]).unwrap().into(),
         min_size: 0,
         max_size: 0,
         constraint: None,
     };
     let mut rng = EngineRng::seeded(7);
     for _ in 0..200 {
-        assert_eq!(
-            biased_string_sample(&sc, &mut rng).unwrap(),
-            Vec::<u32>::new()
-        );
+        assert_eq!(biased_string_sample(&sc, &mut rng).unwrap(), Vec::<u32>::new());
     }
 }
 
@@ -1314,10 +1183,7 @@ fn integer_sample_from_distribution_uniform_fallback_for_indistinguishable_bound
             all_endpoints = false;
         }
     }
-    assert!(
-        !all_endpoints,
-        "uniform fallback should produce values across the range"
-    );
+    assert!(!all_endpoints, "uniform fallback should produce values across the range");
 }
 
 /// Beyond `i128` the middle spreads over the range's orders of magnitude
@@ -1351,10 +1217,7 @@ fn biased_integer_sample_beyond_i128_favours_small_magnitudes() {
         }
         widths.insert(v.bits() / 32);
     }
-    assert!(
-        (10..=200).contains(&above_huge),
-        "{above_huge} of 1000 above 10^25"
-    );
+    assert!((10..=200).contains(&above_huge), "{above_huge} of 1000 above 10^25");
     assert!(below_u64 > 700, "{below_u64} of 1000 fit a u64");
     assert!(
         widths.len() >= 4 && widths.iter().max() >= Some(&8),
@@ -1385,11 +1248,7 @@ fn biased_integer_sample_beyond_i128_narrow_and_huge_spans_stay_in_range() {
         let v = biased_integer_sample(&huge, &mut rng, params).unwrap();
         assert!(huge.validate(&v), "out of range: {v:?}");
     }
-    assert_eq!(
-        narrow_seen.len(),
-        11,
-        "narrow span values seen: {narrow_seen:?}"
-    );
+    assert_eq!(narrow_seen.len(), 11, "narrow span values seen: {narrow_seen:?}");
 }
 
 /// The bytes sampler's boundary draws cover each of its slots: the simplest
@@ -1397,10 +1256,7 @@ fn biased_integer_sample_beyond_i128_narrow_and_huge_spans_stay_in_range() {
 /// byte a `min_size` of at most one adds, each roughly one draw in a hundred.
 #[test]
 fn biased_bytes_sample_draws_each_boundary_value() {
-    let bc = crate::native::core::choices::BytesChoice {
-        min_size: 0,
-        max_size: 4,
-    };
+    let bc = crate::native::core::choices::BytesChoice { min_size: 0, max_size: 4 };
     let mut rng = EngineRng::seeded(27);
     let mut seen = HashSet::default();
     for _ in 0..2000 {
@@ -1424,10 +1280,7 @@ fn biased_integer_sample_erased_bigint_single_value() {
     let mut rng = EngineRng::seeded(23);
     for _ in 0..20 {
         let params = GenerationParameters::draw(&mut rng).unwrap().integer;
-        assert_eq!(
-            biased_integer_sample(&kind, &mut rng, params).unwrap(),
-            fixed.clone()
-        );
+        assert_eq!(biased_integer_sample(&kind, &mut rng, params).unwrap(), fixed.clone());
     }
 }
 
@@ -1456,27 +1309,14 @@ fn weighted_boolean_sample_consumes_exactly_one_byte() {
 #[test]
 fn weighted_boolean_sample_matches_the_floored_threshold() {
     use rand::Rng;
-    for p in [
-        1e-300,
-        1e-9,
-        1.0 / 512.0,
-        0.1,
-        0.5,
-        0.9,
-        1.0 - 1.0 / 512.0,
-        1.0 - 1e-12,
-    ] {
+    for p in [1e-300, 1e-9, 1.0 / 512.0, 0.1, 0.5, 0.9, 1.0 - 1.0 / 512.0, 1.0 - 1e-12] {
         let mut a = EngineRng::seeded(77);
         let mut b = EngineRng::seeded(77);
         let falsey = ((256.0_f64 * (1.0 - p)).floor().max(1.0) as u32).min(255);
         for _ in 0..256 {
             let mut byte = [0u8; 1];
             b.fill_bytes(&mut byte);
-            assert_eq!(
-                weighted_boolean_sample(p, &mut a),
-                u32::from(byte[0]) >= falsey,
-                "p={p}"
-            );
+            assert_eq!(weighted_boolean_sample(p, &mut a), u32::from(byte[0]) >= falsey, "p={p}");
         }
     }
 }
@@ -1486,12 +1326,8 @@ fn weighted_boolean_sample_matches_the_floored_threshold() {
 fn weighted_boolean_sample_respects_probability() {
     let mut rng = EngineRng::seeded(99);
     let n = 5000usize;
-    let high = (0..n)
-        .filter(|_| weighted_boolean_sample(0.9, &mut rng))
-        .count();
-    let low = (0..n)
-        .filter(|_| weighted_boolean_sample(0.1, &mut rng))
-        .count();
+    let high = (0..n).filter(|_| weighted_boolean_sample(0.9, &mut rng)).count();
+    let low = (0..n).filter(|_| weighted_boolean_sample(0.1, &mut rng)).count();
     assert!(high > n * 3 / 4, "p=0.9 produced only {high}/{n} trues");
     assert!(low < n / 4, "p=0.1 produced {low}/{n} trues");
 }
@@ -1515,11 +1351,7 @@ fn weighted_against_a_worked_out_threshold_draws_what_weighted_draws() {
         for i in 0..300 {
             let forced = [Some(true), Some(false), None][i % 3];
             let drawn = a.weighted(p, forced).unwrap();
-            assert_eq!(
-                drawn,
-                b.weighted_against(p, threshold, forced).unwrap(),
-                "p={p}"
-            );
+            assert_eq!(drawn, b.weighted_against(p, threshold, forced).unwrap(), "p={p}");
             seen[usize::from(drawn)] = true;
         }
         assert_eq!(a.nodes, b.nodes);
@@ -1563,10 +1395,7 @@ fn float_restrict_and_redraw_with_infinite_bounds_stays_finite() {
     };
     for raw in [5e-324, 1e-100, -3e-320, f64::from_bits(12345)] {
         let clamped = float_restrict_and_redraw(&fc, raw);
-        assert!(
-            clamped.is_finite(),
-            "float_restrict_and_redraw({raw:e}) produced {clamped}"
-        );
+        assert!(clamped.is_finite(), "float_restrict_and_redraw({raw:e}) produced {clamped}");
     }
 }
 
@@ -1574,10 +1403,7 @@ fn float_restrict_and_redraw_with_infinite_bounds_stays_finite() {
 fn draw_string_with_inverted_sizes_is_an_internal_error() {
     let mut tc = NativeTestCase::for_choices(&[], None, None);
     let intervals = crate::native::intervalsets::IntervalSet::new(vec![(0, 0xD7FF)]).unwrap();
-    let msg = tc
-        .draw_string(intervals.into(), 5, 4)
-        .unwrap_err()
-        .to_string();
+    let msg = tc.draw_string(intervals.into(), 5, 4).unwrap_err().to_string();
     assert!(msg.contains("min_size <= max_size"), "{msg}");
     assert!(msg.contains("bug in hegel"), "{msg}");
 }
@@ -1604,10 +1430,7 @@ fn draw_string_empty_alphabet_zero_max_size_puns_invalid_prefix_to_empty() {
 fn draw_string_with_empty_alphabet_and_nonzero_max_is_an_internal_error() {
     let mut tc = NativeTestCase::for_choices(&[], None, None);
     let intervals = crate::native::intervalsets::IntervalSet::new(vec![]).unwrap();
-    let msg = tc
-        .draw_string(intervals.into(), 0, 4)
-        .unwrap_err()
-        .to_string();
+    let msg = tc.draw_string(intervals.into(), 0, 4).unwrap_err().to_string();
     assert!(msg.contains("empty alphabet"), "{msg}");
     assert!(msg.contains("bug in hegel"), "{msg}");
 }
@@ -1615,9 +1438,7 @@ fn draw_string_with_empty_alphabet_and_nonzero_max_is_an_internal_error() {
 #[test]
 fn weighted_boolean_sample_keeps_true_reachable_for_tiny_p() {
     let mut rng = EngineRng::seeded(3);
-    let trues = (0..20_000)
-        .filter(|_| weighted_boolean_sample(1e-300, &mut rng))
-        .count();
+    let trues = (0..20_000).filter(|_| weighted_boolean_sample(1e-300, &mut rng)).count();
     assert!(trues > 0, "true must stay reachable for any p > 0");
     assert!(trues < 400, "tiny p must stay rare, got {trues}/20000");
 }
@@ -1625,14 +1446,7 @@ fn weighted_boolean_sample_keeps_true_reachable_for_tiny_p() {
 #[test]
 fn spans_trivial_returns_false_for_a_stale_out_of_range_span() {
     let mut spans = Spans::new();
-    spans.push(Span {
-        start: 5,
-        end: 7,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    });
+    spans.push(Span { start: 5, end: 7, label: 1, depth: 0, parent: None, discarded: false });
     assert!(
         !spans.trivial(0, &[]).unwrap(),
         "a span past the end of the nodes must not count as trivial"
@@ -1674,10 +1488,7 @@ fn draw_fresh_id_keeps_the_hole_when_the_first_addition_is_deleted() {
 
 #[test]
 fn draw_fresh_id_keeps_the_hole_when_a_middle_addition_is_deleted() {
-    let choices = [
-        ChoiceValue::Integer(BigInt::from(0)),
-        ChoiceValue::Integer(BigInt::from(2)),
-    ];
+    let choices = [ChoiceValue::Integer(BigInt::from(0)), ChoiceValue::Integer(BigInt::from(2))];
     let mut tc = NativeTestCase::for_choices(&choices, None, None);
     assert_eq!(tc.draw_fresh_id().unwrap(), 0);
     assert_eq!(tc.draw_fresh_id().unwrap(), 2);
@@ -1705,10 +1516,7 @@ fn draw_fresh_id_does_not_cascade_after_a_single_deletion() {
 /// shrinks re-record realized values, so the repair does not recur.
 #[test]
 fn draw_fresh_id_repairs_a_gap_of_three_to_small_ids() {
-    let choices = [
-        ChoiceValue::Integer(BigInt::from(2)),
-        ChoiceValue::Integer(BigInt::from(3)),
-    ];
+    let choices = [ChoiceValue::Integer(BigInt::from(2)), ChoiceValue::Integer(BigInt::from(3))];
     let mut tc = NativeTestCase::for_choices(&choices, None, None);
     assert_eq!(tc.draw_fresh_id().unwrap(), 0);
     assert_eq!(tc.draw_fresh_id().unwrap(), 1);
@@ -1774,9 +1582,7 @@ fn draw_fresh_id_notifies_the_observer() {
         }
     }
     let captured = Arc::new(Mutex::new(None));
-    let obs = Box::new(IdObserver {
-        captured: captured.clone(),
-    });
+    let obs = Box::new(IdObserver { captured: captured.clone() });
     let mut tc = NativeTestCase::for_choices_and_template(&[], None, None, 4, Some(obs))
         .with_random(EngineRng::seeded(0))
         .unwrap();
@@ -1814,18 +1620,14 @@ fn draw_from_set_generates_a_member_and_records_it_by_value() {
         }
         let chosen = tc.draw_from_set(&members).unwrap();
         assert!(members.contains(&chosen));
-        assert_eq!(
-            tc.nodes.last().unwrap().value(),
-            ChoiceValue::Integer(BigInt::from(chosen))
-        );
+        assert_eq!(tc.nodes.last().unwrap().value(), ChoiceValue::Integer(BigInt::from(chosen)));
         assert_eq!(fresh_id_kind_max(&tc, tc.nodes.len() - 1), BigInt::from(10));
     }
 }
 
 fn tc_with_fresh_ids(count: i64, tail: &[i64]) -> NativeTestCase {
-    let mut choices: Vec<ChoiceValue> = (0..count)
-        .map(|i| ChoiceValue::Integer(BigInt::from(i)))
-        .collect();
+    let mut choices: Vec<ChoiceValue> =
+        (0..count).map(|i| ChoiceValue::Integer(BigInt::from(i))).collect();
     choices.extend(tail.iter().map(|&v| ChoiceValue::Integer(BigInt::from(v))));
     let mut tc = NativeTestCase::for_choices(&choices, None, None);
     for i in 0..count {
@@ -1844,10 +1646,7 @@ fn draw_from_set_replays_a_surviving_member() {
 fn draw_from_set_repairs_a_dead_value_to_the_largest_member_below() {
     let mut tc = tc_with_fresh_ids(3, &[1]);
     assert_eq!(tc.draw_from_set(&[0, 2]).unwrap(), 0);
-    assert_eq!(
-        tc.nodes.last().unwrap().value(),
-        ChoiceValue::Integer(BigInt::from(0))
-    );
+    assert_eq!(tc.nodes.last().unwrap().value(), ChoiceValue::Integer(BigInt::from(0)));
 }
 
 #[test]
@@ -1882,9 +1681,7 @@ fn draw_from_set_notifies_the_observer() {
         }
     }
     let captured = Arc::new(Mutex::new(None));
-    let obs = Box::new(SetObserver {
-        captured: captured.clone(),
-    });
+    let obs = Box::new(SetObserver { captured: captured.clone() });
     let mut tc = NativeTestCase::for_choices_and_template(&[], None, None, 4, Some(obs))
         .with_random(EngineRng::seeded(0))
         .unwrap();
@@ -2004,17 +1801,11 @@ mod float_categories {
     }
 
     fn half_bounded(min: f64, max: f64) -> FloatChoice {
-        FloatChoice {
-            allow_infinity: true,
-            ..choice(min, max)
-        }
+        FloatChoice { allow_infinity: true, ..choice(min, max) }
     }
 
     fn with_snm(fc: FloatChoice, snm: f64) -> FloatChoice {
-        FloatChoice {
-            smallest_nonzero_magnitude: snm,
-            ..fc
-        }
+        FloatChoice { smallest_nonzero_magnitude: snm, ..fc }
     }
 
     /// All the mass on one category, so a draw exercises exactly that sampler
@@ -2066,10 +1857,7 @@ mod float_categories {
 
     fn assert_exactly_set(vs: &[f64], set: &[f64]) {
         for v in vs {
-            assert!(
-                set.iter().any(|s| s.to_bits() == v.to_bits()),
-                "{v:?} is not one of {set:?}"
-            );
+            assert!(set.iter().any(|s| s.to_bits() == v.to_bits()), "{v:?} is not one of {set:?}");
         }
         for s in set {
             assert!(seen(vs, *s), "{s:?} never drawn");
@@ -2147,12 +1935,7 @@ mod float_categories {
         );
         assert_exactly_set(
             &category_draws_at(&choice(0.0, 1.0), FloatWidth::F32, ENDPOINT),
-            &[
-                0.0,
-                1.0,
-                f64::from(f32::from_bits(1)),
-                f64::from(1.0f32.next_down()),
-            ],
+            &[0.0, 1.0, f64::from(f32::from_bits(1)), f64::from(1.0f32.next_down())],
         );
         assert_exactly_set(
             &category_draws_at(&unbounded(), FloatWidth::F32, ENDPOINT),
@@ -2160,14 +1943,7 @@ mod float_categories {
         );
         assert_exactly_set(
             &category_draws(&choice(100.0, 200.0), ENDPOINT),
-            &[
-                100.0,
-                200.0,
-                100.0f64.next_up(),
-                101.0,
-                199.0,
-                200.0f64.next_down(),
-            ],
+            &[100.0, 200.0, 100.0f64.next_up(), 101.0, 199.0, 200.0f64.next_down()],
         );
     }
 
@@ -2188,10 +1964,7 @@ mod float_categories {
             }
         }
         let tiny_fraction = tiny as f64 / vs.len() as f64;
-        assert!(
-            tiny_fraction > 0.2,
-            "only {tiny_fraction} of near-zero draws were below 1e-100"
-        );
+        assert!(tiny_fraction > 0.2, "only {tiny_fraction} of near-zero draws were below 1e-100");
         assert!(positive > 500 && negative > 500, "{positive} / {negative}");
 
         for v in category_draws(&choice(0.05, 10.0), NEAR_ZERO) {
@@ -2199,10 +1972,7 @@ mod float_categories {
         }
 
         let vs = category_draws_at(&unbounded(), FloatWidth::F32, NEAR_ZERO);
-        assert!(
-            vs.iter()
-                .all(|&v| v.abs() >= F32_MIN_POSITIVE && v.abs() < 0.1)
-        );
+        assert!(vs.iter().all(|&v| v.abs() >= F32_MIN_POSITIVE && v.abs() < 0.1));
         assert!(vs.iter().filter(|&&v| v.abs() < 1e-20).count() > 500);
     }
 
@@ -2214,10 +1984,7 @@ mod float_categories {
 
         let vs = category_draws_at(&unbounded(), FloatWidth::F32, SUBNORMAL);
         for &v in &vs {
-            assert!(
-                v.abs() >= f64::from(f32::from_bits(1)) && v.abs() < F32_MIN_POSITIVE,
-                "{v:e}"
-            );
+            assert!(v.abs() >= f64::from(f32::from_bits(1)) && v.abs() < F32_MIN_POSITIVE, "{v:e}");
             assert!(!v.is_subnormal(), "{v:e}");
         }
         assert!(vs.iter().any(|&v| v < 0.0) && vs.iter().any(|&v| v > 0.0));
@@ -2306,62 +2073,35 @@ mod float_categories {
             }
         }
         assert!(positive > 500 && negative > 500, "{positive} / {negative}");
-        assert!(
-            small > 250,
-            "only {small} of {} integers were below 1000",
-            vs.len()
-        );
+        assert!(small > 250, "only {small} of {} integers were below 1000", vs.len());
         assert!(seen(&vs, 1.0) && seen(&vs, -1.0));
         assert!(seen(&vs, TWO_53) || seen(&vs, -TWO_53));
         assert_exactly_set(
             &category_draws(&choice(0.0, 10.0), INTEGER),
             &(1..=10).map(f64::from).collect::<Vec<_>>(),
         );
-        assert_exactly_set(
-            &category_draws(&choice(-3.0, 0.5), INTEGER),
-            &[-1.0, -2.0, -3.0],
-        );
+        assert_exactly_set(&category_draws(&choice(-3.0, 0.5), INTEGER), &[-1.0, -2.0, -3.0]);
 
         let halves = category_draws(&unbounded(), HALF_INTEGER);
         let mut small = 0;
         for &v in &halves {
-            assert!(
-                v.fract().abs() == 0.5 && v.abs() < 4503599627370496.0,
-                "{v}"
-            );
+            assert!(v.fract().abs() == 0.5 && v.abs() < 4503599627370496.0, "{v}");
             if v.abs() < 1000.0 {
                 small += 1;
             }
         }
-        assert!(
-            small > 250,
-            "only {small} of {} half-integers were below 1000",
-            halves.len()
-        );
+        assert!(small > 250, "only {small} of {} half-integers were below 1000", halves.len());
         assert!(seen(&halves, 0.5) && seen(&halves, -0.5));
         assert!(seen(&halves, 1.5) || seen(&halves, -1.5));
-        assert_exactly_set(
-            &category_draws(&choice(0.0, 3.0), HALF_INTEGER),
-            &[0.5, 1.5, 2.5],
-        );
-        assert_exactly_set(
-            &category_draws(&choice(-2.0, 0.6), HALF_INTEGER),
-            &[0.5, -0.5, -1.5],
-        );
+        assert_exactly_set(&category_draws(&choice(0.0, 3.0), HALF_INTEGER), &[0.5, 1.5, 2.5]);
+        assert_exactly_set(&category_draws(&choice(-2.0, 0.6), HALF_INTEGER), &[0.5, -0.5, -1.5]);
 
         let vs = category_draws_at(&unbounded(), FloatWidth::F32, INTEGER);
-        assert!(
-            vs.iter()
-                .all(|&v| v == v.trunc() && v != 0.0 && v.abs() <= TWO_24)
-        );
+        assert!(vs.iter().all(|&v| v == v.trunc() && v != 0.0 && v.abs() <= TWO_24));
         assert!(seen(&vs, TWO_24) || seen(&vs, -TWO_24));
         assert!(seen(&vs, 1.0) || seen(&vs, -1.0));
         let halves = category_draws_at(&unbounded(), FloatWidth::F32, HALF_INTEGER);
-        assert!(
-            halves
-                .iter()
-                .all(|&v| v.fract().abs() == 0.5 && v.abs() < TWO_24 / 2.0)
-        );
+        assert!(halves.iter().all(|&v| v.fract().abs() == 0.5 && v.abs() < TWO_24 / 2.0));
         assert!(halves.iter().all(|&v| is_f32(v)));
     }
 
@@ -2401,60 +2141,28 @@ mod float_categories {
         }
 
         let muls = category_draws(&unbounded(), NEAR_MAX_FOR_MUL);
-        assert!(
-            muls.iter()
-                .all(|&v| in_band(v, (float_pow2(511), float_below(float_pow2(513)))))
-        );
-        let overflowing = muls
-            .windows(2)
-            .filter(|w| (w[0] * w[1]).is_infinite())
-            .count();
-        assert!(
-            overflowing > 300 && overflowing < muls.len() - 300,
-            "{overflowing}"
-        );
+        assert!(muls.iter().all(|&v| in_band(v, (float_pow2(511), float_below(float_pow2(513))))));
+        let overflowing = muls.windows(2).filter(|w| (w[0] * w[1]).is_infinite()).count();
+        assert!(overflowing > 300 && overflowing < muls.len() - 300, "{overflowing}");
         let muls = category_draws_at(&unbounded(), FloatWidth::F32, NEAR_MAX_FOR_MUL);
-        assert!(
-            muls.iter()
-                .all(|&v| in_band(v, (float_pow2(63), float_below(float_pow2(65)))))
-        );
-        let overflowing = muls
-            .windows(2)
-            .filter(|w| (w[0] as f32 * w[1] as f32).is_infinite())
-            .count();
-        assert!(
-            overflowing > 300 && overflowing < muls.len() - 300,
-            "{overflowing}"
-        );
+        assert!(muls.iter().all(|&v| in_band(v, (float_pow2(63), float_below(float_pow2(65))))));
+        let overflowing =
+            muls.windows(2).filter(|w| (w[0] as f32 * w[1] as f32).is_infinite()).count();
+        assert!(overflowing > 300 && overflowing < muls.len() - 300, "{overflowing}");
 
         let tinies = category_draws(&unbounded(), NEAR_SQRT_MIN_POSITIVE);
         assert!(
-            tinies
-                .iter()
-                .all(|&v| in_band(v, (float_pow2(-513), float_below(float_pow2(-510)))))
+            tinies.iter().all(|&v| in_band(v, (float_pow2(-513), float_below(float_pow2(-510)))))
         );
-        let underflowing = tinies
-            .windows(2)
-            .filter(|w| (w[0] * w[1]).is_subnormal())
-            .count();
-        assert!(
-            underflowing > 300 && underflowing < tinies.len() - 300,
-            "{underflowing}"
-        );
+        let underflowing = tinies.windows(2).filter(|w| (w[0] * w[1]).is_subnormal()).count();
+        assert!(underflowing > 300 && underflowing < tinies.len() - 300, "{underflowing}");
         let tinies = category_draws_at(&unbounded(), FloatWidth::F32, NEAR_SQRT_MIN_POSITIVE);
         assert!(
-            tinies
-                .iter()
-                .all(|&v| in_band(v, (float_pow2(-65), float_below(float_pow2(-62)))))
+            tinies.iter().all(|&v| in_band(v, (float_pow2(-65), float_below(float_pow2(-62)))))
         );
-        let underflowing = tinies
-            .windows(2)
-            .filter(|w| (w[0] as f32 * w[1] as f32).is_subnormal())
-            .count();
-        assert!(
-            underflowing > 300 && underflowing < tinies.len() - 300,
-            "{underflowing}"
-        );
+        let underflowing =
+            tinies.windows(2).filter(|w| (w[0] as f32 * w[1] as f32).is_subnormal()).count();
+        assert!(underflowing > 300 && underflowing < tinies.len() - 300, "{underflowing}");
     }
 
     #[test]
@@ -2480,20 +2188,13 @@ mod float_categories {
         assert!(canonical > 500, "{canonical}");
         assert!(signalling > 200, "{signalling}");
         assert!(other_payload > 200, "{other_payload}");
-        assert!(
-            !category_draws(&choice(0.0, 1.0), NAN)
-                .iter()
-                .any(|v| v.is_nan())
-        );
+        assert!(!category_draws(&choice(0.0, 1.0), NAN).iter().any(|v| v.is_nan()));
     }
 
     #[test]
     fn point_categories_draw_exactly_their_landmarks() {
         let fc = unbounded();
-        assert_exactly_set(
-            &category_draws(&fc, INFINITY),
-            &[f64::INFINITY, f64::NEG_INFINITY],
-        );
+        assert_exactly_set(&category_draws(&fc, INFINITY), &[f64::INFINITY, f64::NEG_INFINITY]);
         assert_exactly_set(&category_draws(&fc, MAX_MAGNITUDE), &[f64::MAX, -f64::MAX]);
         assert_exactly_set(
             &category_draws_at(&fc, FloatWidth::F32, MAX_MAGNITUDE),
@@ -2527,9 +2228,7 @@ mod float_categories {
             &[TWO_24],
         );
         assert!(
-            !category_draws(&choice(0.0, 1e8), MAX_EXACT_INTEGER)
-                .iter()
-                .all(|&v| v == TWO_24),
+            !category_draws(&choice(0.0, 1e8), MAX_EXACT_INTEGER).iter().all(|&v| v == TWO_24),
             "an f64 draw offered f32's landmark"
         );
         assert_exactly_set(&category_draws(&choice(0.0, 1.0), SIGNED_ZERO), &[0.0]);
@@ -2555,10 +2254,7 @@ mod float_categories {
             }
             exponents.insert((v.to_bits() >> 52) & 0x7FF);
         }
-        assert!(
-            powers > 500 && predecessors > 500,
-            "{powers} / {predecessors}"
-        );
+        assert!(powers > 500 && predecessors > 500, "{powers} / {predecessors}");
         assert!(negative > 500, "{negative}");
         assert!(exponents.len() > 500, "{}", exponents.len());
 
@@ -2591,20 +2287,11 @@ mod float_categories {
             }
             exponents.insert((bits >> 23) & 0xFF);
         }
-        assert!(
-            powers > 500 && predecessors > 500,
-            "{powers} / {predecessors}"
-        );
+        assert!(powers > 500 && predecessors > 500, "{powers} / {predecessors}");
         assert!(exponents.len() > 100, "{}", exponents.len());
         assert_exactly_set(
             &category_draws_at(&choice(1.0, 4.0), FloatWidth::F32, BINADE_EDGE),
-            &[
-                1.0,
-                2.0,
-                4.0,
-                f64::from(2.0f32.next_down()),
-                f64::from(4.0f32.next_down()),
-            ],
+            &[1.0, 2.0, 4.0, f64::from(2.0f32.next_down()), f64::from(4.0f32.next_down())],
         );
     }
 
@@ -2733,16 +2420,9 @@ mod float_categories {
         ] {
             let vs = category_draws(&fc, category);
             let mean = vs.iter().sum::<f64>() / vs.len() as f64;
-            assert!(
-                (mean - 0.375).abs() < 0.01,
-                "category {category}: mean {mean}"
-            );
+            assert!((mean - 0.375).abs() < 0.01, "category {category}: mean {mean}");
             let distinct: std::collections::HashSet<u64> = vs.iter().map(|v| v.to_bits()).collect();
-            assert!(
-                distinct.len() > 1900,
-                "category {category}: {}",
-                distinct.len()
-            );
+            assert!(distinct.len() > 1900, "category {category}: {}", distinct.len());
         }
     }
 
@@ -2752,12 +2432,7 @@ mod float_categories {
         let mut weights = [0.0; N_CATEGORIES];
         weights[INTEGER] = 0.5;
         weights[DEFAULT] = 0.5;
-        let half_integers = draws(
-            &fc,
-            FloatGenerationParameters::from_weights(weights),
-            3,
-            20_000,
-        );
+        let half_integers = draws(&fc, FloatGenerationParameters::from_weights(weights), 3, 20_000);
         let integral = half_integers.iter().filter(|&&v| v == v.trunc()).count() as f64
             / half_integers.len() as f64;
         assert!((integral - 0.5).abs() < 0.03, "{integral}");
@@ -2766,12 +2441,7 @@ mod float_categories {
         weights[NAN] = 0.25;
         weights[SIGNED_ZERO] = 0.25;
         weights[DEFAULT] = 0.5;
-        let vs = draws(
-            &unbounded(),
-            FloatGenerationParameters::from_weights(weights),
-            4,
-            20_000,
-        );
+        let vs = draws(&unbounded(), FloatGenerationParameters::from_weights(weights), 4, 20_000);
         let nan = vs.iter().filter(|v| v.is_nan()).count() as f64 / vs.len() as f64;
         let zero = vs.iter().filter(|&&v| v == 0.0).count() as f64 / vs.len() as f64;
         assert!((nan - 0.25).abs() < 0.03, "{nan}");
@@ -2780,12 +2450,7 @@ mod float_categories {
 
     #[test]
     fn default_weights_surface_every_category_on_the_unbounded_range() {
-        let vs = draws(
-            &unbounded(),
-            FloatGenerationParameters::default(),
-            11,
-            20_000,
-        );
+        let vs = draws(&unbounded(), FloatGenerationParameters::default(), 11, 20_000);
         let rate = |pred: &dyn Fn(f64) -> bool| {
             vs.iter().filter(|&&v| pred(v)).count() as f64 / vs.len() as f64
         };
@@ -2794,16 +2459,10 @@ mod float_categories {
             ("infinite", &|v| v.is_infinite()),
             ("zero", &|v| v == 0.0),
             ("subnormal", &|v| v.is_subnormal()),
-            ("near ±1", &|v| {
-                v.abs() != 1.0 && (v.abs() - 1.0).abs() < 1e-9
-            }),
+            ("near ±1", &|v| v.abs() != 1.0 && (v.abs() - 1.0).abs() < 1e-9),
             ("half integer", &|v| v.is_finite() && v.fract().abs() == 0.5),
-            ("top binade", &|v| {
-                v.is_finite() && v.abs() >= float_pow2(1023)
-            }),
-            ("max exact integer", &|v| {
-                v.abs() == TWO_53 || v.abs() == TWO_24
-            }),
+            ("top binade", &|v| v.is_finite() && v.abs() >= float_pow2(1023)),
+            ("max exact integer", &|v| v.abs() == TWO_53 || v.abs() == TWO_24),
             ("tiny", &|v| v != 0.0 && v.abs() < 1e-200),
         ];
         for (name, pred) in checks {
@@ -2847,9 +2506,7 @@ mod float_categories {
 
     fn direct_draws(sample: Sampler, fc: &FloatChoice, width: FloatWidth) -> Vec<f64> {
         let mut rng = EngineRng::seeded(42);
-        (0..500)
-            .map(|_| sample(fc, width, &mut rng).unwrap())
-            .collect()
+        (0..500).map(|_| sample(fc, width, &mut rng).unwrap()).collect()
     }
 
     #[test]
@@ -2884,10 +2541,7 @@ mod float_categories {
 
     #[test]
     fn float_width_bit_range_rounds_f32_bounds_inward() {
-        assert_eq!(
-            FloatWidth::F64.bit_range(1.0, 2.0),
-            (1.0f64.to_bits(), 2.0f64.to_bits())
-        );
+        assert_eq!(FloatWidth::F64.bit_range(1.0, 2.0), (1.0f64.to_bits(), 2.0f64.to_bits()));
         assert_eq!(
             FloatWidth::F32.bit_range(1.0, 2.0),
             (u64::from(1.0f32.to_bits()), u64::from(2.0f32.to_bits()))
@@ -2911,9 +2565,8 @@ mod float_categories {
     fn coin_flip_first_uses_whichever_option_has_a_value() {
         let mut rng = EngineRng::seeded(42);
         let positive = |x: i32, _: &mut EngineRng| (x > 0).then_some(x);
-        let both: Vec<i32> = (0..200)
-            .map(|_| coin_flip_first([1, 2], &mut rng, positive).unwrap())
-            .collect();
+        let both: Vec<i32> =
+            (0..200).map(|_| coin_flip_first([1, 2], &mut rng, positive).unwrap()).collect();
         assert!(both.contains(&1) && both.contains(&2));
         for _ in 0..50 {
             assert_eq!(coin_flip_first([0, 2], &mut rng, positive), Some(2));
@@ -2944,10 +2597,7 @@ mod float_categories {
                     .map(f64::abs),
                 Some(0.25)
             );
-            assert_eq!(
-                signed_magnitude_sample(&choice(-0.0, 0.0), &mut rng, smallest),
-                None
-            );
+            assert_eq!(signed_magnitude_sample(&choice(-0.0, 0.0), &mut rng, smallest), None);
         }
     }
 
@@ -2963,10 +2613,7 @@ mod float_categories {
         for _ in 0..100 {
             let v = banded_magnitude_sample(&choice(0.0, 2.0), band, &mut rng).unwrap();
             assert!((1.0..=2.0).contains(&v), "{v}");
-            assert_eq!(
-                banded_magnitude_sample(&choice(0.0, 0.5), band, &mut rng),
-                None
-            );
+            assert_eq!(banded_magnitude_sample(&choice(0.0, 0.5), band, &mut rng), None);
         }
     }
 
@@ -2986,19 +2633,8 @@ mod float_categories {
     #[test]
     fn float_endpoint_sample_returns_an_edge_or_its_neighbour() {
         assert_exactly_set(
-            &direct_draws(
-                float_endpoint_sample,
-                &choice(100.0, 200.0),
-                FloatWidth::F64,
-            ),
-            &[
-                100.0,
-                200.0,
-                100.0f64.next_up(),
-                101.0,
-                199.0,
-                200.0f64.next_down(),
-            ],
+            &direct_draws(float_endpoint_sample, &choice(100.0, 200.0), FloatWidth::F64),
+            &[100.0, 200.0, 100.0f64.next_up(), 101.0, 199.0, 200.0f64.next_down()],
         );
     }
 
@@ -3053,20 +2689,14 @@ mod float_categories {
             assert!((v + v).is_infinite());
         }
         for v in direct_draws(float_near_max_for_add_sample, &unbounded(), FloatWidth::F32) {
-            assert!(
-                v.abs() <= F32_MAX && (v as f32 + v as f32).is_infinite(),
-                "{v:e}"
-            );
+            assert!(v.abs() <= F32_MAX && (v as f32 + v as f32).is_infinite(), "{v:e}");
         }
     }
 
     #[test]
     fn float_near_max_for_mul_sample_sits_around_sqrt_max() {
         for v in direct_draws(float_near_max_for_mul_sample, &unbounded(), FloatWidth::F64) {
-            assert!(
-                (float_pow2(511)..float_pow2(513)).contains(&v.abs()),
-                "{v:e}"
-            );
+            assert!((float_pow2(511)..float_pow2(513)).contains(&v.abs()), "{v:e}");
         }
         for v in direct_draws(float_near_max_for_mul_sample, &unbounded(), FloatWidth::F32) {
             assert!((float_pow2(63)..float_pow2(65)).contains(&v.abs()), "{v:e}");
@@ -3075,25 +2705,11 @@ mod float_categories {
 
     #[test]
     fn float_near_sqrt_min_positive_sample_sits_around_sqrt_min_positive() {
-        for v in direct_draws(
-            float_near_sqrt_min_positive_sample,
-            &unbounded(),
-            FloatWidth::F64,
-        ) {
-            assert!(
-                (float_pow2(-513)..float_pow2(-510)).contains(&v.abs()),
-                "{v:e}"
-            );
+        for v in direct_draws(float_near_sqrt_min_positive_sample, &unbounded(), FloatWidth::F64) {
+            assert!((float_pow2(-513)..float_pow2(-510)).contains(&v.abs()), "{v:e}");
         }
-        for v in direct_draws(
-            float_near_sqrt_min_positive_sample,
-            &unbounded(),
-            FloatWidth::F32,
-        ) {
-            assert!(
-                (float_pow2(-65)..float_pow2(-62)).contains(&v.abs()),
-                "{v:e}"
-            );
+        for v in direct_draws(float_near_sqrt_min_positive_sample, &unbounded(), FloatWidth::F32) {
+            assert!((float_pow2(-65)..float_pow2(-62)).contains(&v.abs()), "{v:e}");
         }
     }
 
@@ -3103,10 +2719,7 @@ mod float_categories {
             assert!(v.is_nan());
         }
         let mut rng = EngineRng::seeded(42);
-        assert_eq!(
-            float_nan_sample(&choice(0.0, 1.0), FloatWidth::F64, &mut rng),
-            None
-        );
+        assert_eq!(float_nan_sample(&choice(0.0, 1.0), FloatWidth::F64, &mut rng), None);
     }
 
     #[test]
@@ -3116,10 +2729,7 @@ mod float_categories {
             &[f64::INFINITY, f64::NEG_INFINITY],
         );
         let mut rng = EngineRng::seeded(42);
-        assert_eq!(
-            float_infinity_sample(&choice(0.0, 1.0), FloatWidth::F64, &mut rng),
-            None
-        );
+        assert_eq!(float_infinity_sample(&choice(0.0, 1.0), FloatWidth::F64, &mut rng), None);
     }
 
     #[test]
@@ -3137,19 +2747,11 @@ mod float_categories {
     #[test]
     fn float_max_exact_integer_sample_is_plus_or_minus_two_to_the_mantissa() {
         assert_exactly_set(
-            &direct_draws(
-                float_max_exact_integer_sample,
-                &unbounded(),
-                FloatWidth::F64,
-            ),
+            &direct_draws(float_max_exact_integer_sample, &unbounded(), FloatWidth::F64),
             &[TWO_53, -TWO_53],
         );
         assert_exactly_set(
-            &direct_draws(
-                float_max_exact_integer_sample,
-                &unbounded(),
-                FloatWidth::F32,
-            ),
+            &direct_draws(float_max_exact_integer_sample, &unbounded(), FloatWidth::F32),
             &[TWO_24, -TWO_24],
         );
     }
@@ -3181,11 +2783,7 @@ mod float_categories {
         for v in direct_draws(float_non_dyadic_sample, &unbounded(), FloatWidth::F64) {
             assert!(v.is_finite() && v != v.trunc() && v.abs() <= 101.0, "{v}");
         }
-        for v in direct_draws(
-            float_non_dyadic_sample,
-            &choice(1000.0, 2000.0),
-            FloatWidth::F64,
-        ) {
+        for v in direct_draws(float_non_dyadic_sample, &choice(1000.0, 2000.0), FloatWidth::F64) {
             assert!((1000.0..=2000.0).contains(&v), "{v}");
         }
     }
@@ -3283,10 +2881,7 @@ fn a_test_case_reserves_room_for_the_most_choices_and_spans_seen() {
 #[test]
 fn spare_vectors_keep_the_roomiest_offer_for_a_test_case_that_can_fill_them() {
     let pair = |nodes: usize, spans: usize| {
-        (
-            Vec::<ChoiceNode>::with_capacity(nodes),
-            Vec::<Span>::with_capacity(spans),
-        )
+        (Vec::<ChoiceNode>::with_capacity(nodes), Vec::<Span>::with_capacity(spans))
     };
     let mut slot = None;
     let fresh = SpareVectors::take(&mut slot, 1000, 5, 7);
@@ -3358,8 +2953,7 @@ fn draws_of_booleans_floats_and_native_integers_keep_the_choice_sequence_plain()
     tc.draw_integer_forced(0, 10, 3).unwrap();
     tc.draw_fresh_id().unwrap();
     tc.draw_from_set(&[0, 1]).unwrap();
-    tc.draw_float(FloatWidth::F64, 0.0, 1.0, false, false, 5e-324)
-        .unwrap();
+    tc.draw_float(FloatWidth::F64, 0.0, 1.0, false, false, 5e-324).unwrap();
     assert!(tc.plain);
     assert_eq!(tc.nodes.len(), 11);
     assert!(tc.nodes.iter().all(ChoiceNode::owns_no_heap));
@@ -3413,8 +3007,7 @@ fn a_dropped_test_case_releases_the_streams_its_clone_nodes_hold() {
     let mut tc = NativeTestCase::new_random(EngineRng::seeded(0)).unwrap();
     tc.weighted(0.5, None).unwrap();
     tc.clone_stream().unwrap();
-    tc.nodes
-        .push(ChoiceNode::clone_stream(Arc::clone(&stream), false));
+    tc.nodes.push(ChoiceNode::clone_stream(Arc::clone(&stream), false));
     assert_eq!(Arc::strong_count(&stream), 2);
     drop(tc);
     assert_eq!(Arc::strong_count(&stream), 1);
@@ -3527,19 +3120,13 @@ fn uniform_draws_replay_misfit_and_template_the_prefix_in_their_own_width() {
         None,
     );
     assert_eq!(tc.draw_integer_uniform(3, 9).unwrap(), 7);
-    assert_eq!(
-        tc.draw_integer_uniform(u64::MAX - 1, u64::MAX).unwrap(),
-        u64::MAX
-    );
+    assert_eq!(tc.draw_integer_uniform(u64::MAX - 1, u64::MAX).unwrap(), u64::MAX);
     assert_eq!(tc.draw_integer_uniform(3, 9).unwrap(), 4);
     assert_eq!(tc.draw_integer_uniform(3, 9).unwrap(), 3);
     assert_eq!(tc.draw_integer_uniform(3, 9).unwrap(), 4);
     assert_eq!(tc.draw_integer_uniform(3, 9).unwrap(), 3);
     let values: Vec<ChoiceValue> = tc.nodes.iter().map(|n| n.data.value()).collect();
-    assert_eq!(
-        values,
-        [7, u64::MAX, 4, 3, 4, 3].map(|v| ChoiceValue::Integer(BigInt::from(v)))
-    );
+    assert_eq!(values, [7, u64::MAX, 4, 3, 4, 3].map(|v| ChoiceValue::Integer(BigInt::from(v))));
 }
 
 #[test]
@@ -3601,25 +3188,16 @@ fn i64_draws_replay_misfit_and_template_the_prefix() {
         None,
     );
     assert_eq!(tc.draw_integer_i64(3, 9).unwrap(), 7);
-    assert_eq!(
-        tc.draw_integer_i64(i64::MIN, i64::MIN + 1).unwrap(),
-        i64::MIN
-    );
+    assert_eq!(tc.draw_integer_i64(i64::MIN, i64::MIN + 1).unwrap(), i64::MIN);
     assert_eq!(tc.draw_integer_i64(3, 9).unwrap(), 4);
     assert_eq!(tc.draw_integer_i64(3, 9).unwrap(), 4);
     assert_eq!(tc.draw_integer_i64(3, 9).unwrap(), 3);
     assert_eq!(tc.draw_integer_i64(3, 9).unwrap(), 4);
     assert_eq!(tc.draw_integer_i64(3, 9).unwrap(), 3);
     let values: Vec<ChoiceValue> = tc.nodes.iter().map(|n| n.data.value()).collect();
-    assert_eq!(
-        values,
-        [7, i64::MIN, 4, 4, 3, 4, 3].map(|v| ChoiceValue::Integer(BigInt::from(v)))
-    );
+    assert_eq!(values, [7, i64::MIN, 4, 4, 3, 4, 3].map(|v| ChoiceValue::Integer(BigInt::from(v))));
     let kinds: Vec<ChoiceKind> = tc.nodes.iter().map(|n| n.data.kind()).collect();
-    assert_eq!(
-        kinds[1],
-        ChoiceKind::Integer(IntegerChoice::small(i64::MIN, i64::MIN + 1, 0))
-    );
+    assert_eq!(kinds[1], ChoiceKind::Integer(IntegerChoice::small(i64::MIN, i64::MIN + 1, 0)));
 }
 
 #[test]
@@ -3665,14 +3243,9 @@ fn a_test_case_works_out_each_narrow_range_once_until_another_takes_its_slot() {
     assert_eq!(ranges.get(0, 1).unwrap(), first);
     assert_eq!(ranges.0[slot], first);
     let unused = NarrowRange::default();
-    assert_eq!(
-        ranges.0.iter().filter(|held| **held == unused).count(),
-        ranges.0.len() - 1
-    );
+    assert_eq!(ranges.0.iter().filter(|held| **held == unused).count(), ranges.0.len() - 1);
 
-    let other = (2..256)
-        .find(|&max| NarrowRanges::slot(0, max) == slot)
-        .unwrap();
+    let other = (2..256).find(|&max| NarrowRanges::slot(0, max) == slot).unwrap();
     let second = ranges.get(0, other).unwrap();
     assert_eq!(second, NarrowRange::new(0, other).unwrap());
     assert_ne!(second, first);
@@ -3680,15 +3253,10 @@ fn a_test_case_works_out_each_narrow_range_once_until_another_takes_its_slot() {
     assert_eq!(ranges.get(0, 1).unwrap(), first);
     assert_eq!(ranges.0[slot], first);
 
-    let distinct = (2..256)
-        .find(|&max| NarrowRanges::slot(0, max) != slot)
-        .unwrap();
+    let distinct = (2..256).find(|&max| NarrowRanges::slot(0, max) != slot).unwrap();
     ranges.get(0, distinct).unwrap();
     assert_eq!(ranges.0[slot], first);
-    assert_eq!(
-        ranges.0.iter().filter(|held| **held == unused).count(),
-        ranges.0.len() - 2
-    );
+    assert_eq!(ranges.0.iter().filter(|held| **held == unused).count(), ranges.0.len() - 2);
 
     let mut a = EngineRng::seeded(3);
     let mut b = EngineRng::seeded(3);
@@ -3790,9 +3358,7 @@ fn uniform_u64_inclusive_draws_what_rands_sampler_draws_from_the_same_stream() {
 #[test]
 fn a_spent_template_stops_a_string_drawn_from_the_rng_early() {
     let kind = Arc::new(StringChoice {
-        intervals: crate::native::intervalsets::IntervalSet::new(vec![(0, 0x7F)])
-            .unwrap()
-            .into(),
+        intervals: crate::native::intervalsets::IntervalSet::new(vec![(0, 0x7F)]).unwrap().into(),
         min_size: 0,
         max_size: 10,
         constraint: None,
@@ -3823,13 +3389,9 @@ fn a_string_drawn_from_the_rng_notifies_the_observer() {
         }
     }
     let captured = SyncArc::new(Mutex::new(None));
-    let obs = Box::new(StringObserver {
-        captured: captured.clone(),
-    });
+    let obs = Box::new(StringObserver { captured: captured.clone() });
     let kind = Arc::new(StringChoice {
-        intervals: crate::native::intervalsets::IntervalSet::new(vec![(0, 0x7F)])
-            .unwrap()
-            .into(),
+        intervals: crate::native::intervalsets::IntervalSet::new(vec![(0, 0x7F)]).unwrap().into(),
         min_size: 0,
         max_size: 10,
         constraint: None,
@@ -3837,9 +3399,7 @@ fn a_string_drawn_from_the_rng_notifies_the_observer() {
     let mut tc = NativeTestCase::for_choices_and_template(&[], None, None, BUFFER_SIZE, Some(obs))
         .with_random(EngineRng::seeded(0))
         .unwrap();
-    let drawn = tc
-        .draw_string_from(kind, |_| Ok("ab".chars().map(u32::from).collect()))
-        .unwrap();
+    let drawn = tc.draw_string_from(kind, |_| Ok("ab".chars().map(u32::from).collect())).unwrap();
     assert_eq!(drawn, "ab");
     let recorded = captured.lock().unwrap().take();
     assert_eq!(recorded, Some((String::from("ab"), false)));
@@ -3852,9 +3412,7 @@ fn a_string_drawn_from_the_rng_replays_though_its_check_would_reject_it() {
     let constraint =
         RegexConstraint::new("(a)\\1", parse_pattern("(a)\\1", 0).unwrap(), true, None);
     let kind = Arc::new(StringChoice {
-        intervals: crate::native::intervalsets::IntervalSet::new(vec![(0, 0x7F)])
-            .unwrap()
-            .into(),
+        intervals: crate::native::intervalsets::IntervalSet::new(vec![(0, 0x7F)]).unwrap().into(),
         min_size: 0,
         max_size: 10,
         constraint: Some(crate::native::core::Constraint::Regex(Arc::new(constraint))),
@@ -3864,9 +3422,7 @@ fn a_string_drawn_from_the_rng_replays_though_its_check_would_reject_it() {
     let mut tc = NativeTestCase::for_choices_and_template(&[], None, None, BUFFER_SIZE, None)
         .with_random(EngineRng::seeded(0))
         .unwrap();
-    let drawn = tc
-        .draw_string_from(Arc::clone(&kind), |_| Ok(ab.clone()))
-        .unwrap();
+    let drawn = tc.draw_string_from(Arc::clone(&kind), |_| Ok(ab.clone())).unwrap();
     assert_eq!(drawn, "ab");
     assert!(kind.validate(&ab));
 }
@@ -3890,13 +3446,7 @@ fn shaped_sample_over_a_span_just_past_a_power_of_two_does_not_pile_up_there() {
             }
             widths.insert(v.bits());
         }
-        assert!(
-            full_width < 100,
-            "2^{k} + 1: {full_width} of 4000 full width"
-        );
-        assert!(
-            widths.len() >= 9.min(k as usize),
-            "2^{k} + 1: widths seen: {widths:?}"
-        );
+        assert!(full_width < 100, "2^{k} + 1: {full_width} of 4000 full width");
+        assert!(widths.len() >= 9.min(k as usize), "2^{k} + 1: widths seen: {widths:?}");
     }
 }

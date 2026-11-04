@@ -146,7 +146,10 @@ impl<T> Slab<T> {
     }
 
     /// Places the value `make` builds from its own handle.
-    pub fn try_insert_with(&mut self, make: impl FnOnce(Handle<T>) -> T) -> Result<Handle<T>, MemError> {
+    pub fn try_insert_with(
+        &mut self,
+        make: impl FnOnce(Handle<T>) -> T,
+    ) -> Result<Handle<T>, MemError> {
         if self.free != NONE {
             let index = self.free;
             let generation = self.entries[index as usize].generation + 1;
@@ -160,9 +163,12 @@ impl<T> Slab<T> {
             return Ok(handle);
         }
         let index = self.entries.len();
-        let index = u32::try_from(index).ok().filter(|&index| index != NONE).ok_or(
-            MemError::TooLarge { tag: self.tag(), what: "a slab's slot count", wanted: index },
-        )?;
+        let index =
+            u32::try_from(index).ok().filter(|&index| index != NONE).ok_or(MemError::TooLarge {
+                tag: self.tag(),
+                what: "a slab's slot count",
+                wanted: index,
+            })?;
         let handle = Handle { index, generation: 1, _of: PhantomData };
         self.entries.reserve(1)?;
         let value = make(handle);
@@ -244,11 +250,14 @@ impl<T> Slab<T> {
 
     /// Every value with its handle, in slot order.
     pub fn iter(&self) -> impl Iterator<Item = (Handle<T>, &T)> {
-        self.entries.iter().enumerate().filter(|(_, entry)| entry.occupied()).map(|(index, entry)| {
-            let handle = Handle { index: index as u32, generation: entry.generation, _of: PhantomData };
-            // SAFETY: the entry is occupied, so it holds a value.
-            (handle, unsafe { entry.value.assume_init_ref() })
-        })
+        self.entries.iter().enumerate().filter(|(_, entry)| entry.occupied()).map(
+            |(index, entry)| {
+                let handle =
+                    Handle { index: index as u32, generation: entry.generation, _of: PhantomData };
+                // SAFETY: the entry is occupied, so it holds a value.
+                (handle, unsafe { entry.value.assume_init_ref() })
+            },
+        )
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Handle<T>, &mut T)> {

@@ -629,11 +629,7 @@ fn match_loop_inner<'t>(
     }
 }
 
-fn match_loop<'t>(
-    db: &Db,
-    pattern: &'t MetaTemplate,
-    src: &'t tt::TopSubtree,
-) -> Match<'t> {
+fn match_loop<'t>(db: &Db, pattern: &'t MetaTemplate, src: &'t tt::TopSubtree) -> Match<'t> {
     let span = src.top_subtree().delimiter.delim_span();
     let mut src = src.iter();
     let mut stack: SmallVec<[TtIter<'_>; 1]> = SmallVec::new();

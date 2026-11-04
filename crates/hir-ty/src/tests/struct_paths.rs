@@ -92,17 +92,22 @@ fn diagnostics(name: &str) -> Vec<InferenceDiagnostic> {
                 _ => None,
             }));
             for it in scope.impls() {
-                functions.extend(it.impl_items(&db).items.iter().filter_map(|&(_, item)| match item {
-                    AssocItemId::FunctionId(it) => Some(it),
-                    _ => None,
-                }));
+                functions.extend(it.impl_items(&db).items.iter().filter_map(
+                    |&(_, item)| match item {
+                        AssocItemId::FunctionId(it) => Some(it),
+                        _ => None,
+                    },
+                ));
             }
         }
         let function = functions
             .into_iter()
             .find(|&it| FunctionSignature::of(&db, it).name.as_str() == name)
             .unwrap_or_else(|| panic!("the fixture's `{name}`"));
-        let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)));
+        let infer = InferenceResult::of(
+            &db,
+            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)),
+        );
         infer.diagnostics().to_vec()
     })
 }
@@ -176,8 +181,14 @@ fn a_static_as_a_path_pattern_is_e0532() {
 #[test]
 fn an_associated_item_after_a_type_in_a_tuple_struct_pattern_is_e0164() {
     check("assoc_fn_in_a_tuple_pattern", StructPathFound::TypeRelative(StructPathDef::AssocFn));
-    check("assoc_const_in_a_tuple_pattern", StructPathFound::TypeRelative(StructPathDef::AssocConst));
-    check("anchored_assoc_fn_in_a_tuple_pattern", StructPathFound::TypeRelative(StructPathDef::AssocFn));
+    check(
+        "assoc_const_in_a_tuple_pattern",
+        StructPathFound::TypeRelative(StructPathDef::AssocConst),
+    );
+    check(
+        "anchored_assoc_fn_in_a_tuple_pattern",
+        StructPathFound::TypeRelative(StructPathDef::AssocFn),
+    );
     // Before, `new` was lowered as an associated type of `Self` (E0223).
     let found = diagnostics("self_new_in_a_tuple_pattern");
     assert!(
@@ -200,10 +211,7 @@ fn a_trait_function_in_a_tuple_struct_pattern_is_e0532() {
 #[test]
 fn a_missing_item_after_a_type_in_a_tuple_struct_pattern_is_e0599() {
     let found = diagnostics("missing_item_in_a_tuple_pattern");
-    assert!(
-        matches!(&found[..], [InferenceDiagnostic::UnresolvedAssocItem { .. }]),
-        "{found:?}"
-    );
+    assert!(matches!(&found[..], [InferenceDiagnostic::UnresolvedAssocItem { .. }]), "{found:?}");
 }
 
 #[test]

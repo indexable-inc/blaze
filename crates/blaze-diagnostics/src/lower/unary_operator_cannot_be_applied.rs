@@ -63,7 +63,10 @@ pub(crate) fn lower<'db>(
     if let Some(trait_) = trait_ {
         let name = cx.def_path(hir::ModuleDef::Trait(trait_));
         // alloc: the error's text, for an error hir found
-        diag.fact_opt(cx.implements_fact(trait_, &d.found), format!("whether `{ty}` implements `{name}`"));
+        diag.fact_opt(
+            cx.implements_fact(trait_, &d.found),
+            format!("whether `{ty}` implements `{name}`"),
+        );
     }
     code_fact(cx, d.expr.map(|it| it.syntax_node_ptr()), &mut diag);
     // alloc: the error's parts, for an error hir found

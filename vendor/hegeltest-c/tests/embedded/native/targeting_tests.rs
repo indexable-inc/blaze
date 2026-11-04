@@ -8,11 +8,7 @@ use alloc::vec;
 
 fn integer_node(value: i128, min_value: i128, max_value: i128) -> ChoiceNode {
     ChoiceNode::integer(
-        IntegerChoice::new(
-            BigInt::from(min_value),
-            BigInt::from(max_value),
-            BigInt::from(0),
-        ),
+        IntegerChoice::new(BigInt::from(min_value), BigInt::from(max_value), BigInt::from(0)),
         BigInt::from(value),
         false,
     )
@@ -71,10 +67,7 @@ fn targeting_state_overwrites_only_on_strict_improvement() {
 fn targeting_state_tracks_multiple_labels_independently() {
     let mut state = TargetingState::new();
     let choices = vec![ChoiceValue::Integer(BigInt::from(0))];
-    state.record(
-        &choices,
-        &HashMap::from_iter([("a".to_string(), 1.0), ("b".to_string(), 2.0)]),
-    );
+    state.record(&choices, &HashMap::from_iter([("a".to_string(), 1.0), ("b".to_string(), 2.0)]));
     assert_eq!(state.best_score("a"), Some(1.0));
     assert_eq!(state.best_score("b"), Some(2.0));
     assert_eq!(state.best_score("c"), None);
@@ -89,10 +82,7 @@ fn seeds_are_sorted_by_label_and_carry_the_recorded_best() {
     state.record(&choices_a, &HashMap::from_iter([("a".to_string(), 1.0)]));
     assert_eq!(
         state.seeds(),
-        vec![
-            ("a".to_string(), 1.0, choices_a),
-            ("b".to_string(), 2.0, choices_b),
-        ]
+        vec![("a".to_string(), 1.0, choices_a), ("b".to_string(), 2.0, choices_b),]
     );
 }
 
@@ -105,10 +95,7 @@ fn nd_target_timeline_derives_the_node_values() {
     };
     assert_eq!(
         target.timeline(),
-        vec![
-            ChoiceValue::Integer(BigInt::from(3)),
-            ChoiceValue::Float(1.5)
-        ]
+        vec![ChoiceValue::Integer(BigInt::from(3)), ChoiceValue::Float(1.5)]
     );
 }
 
@@ -118,11 +105,7 @@ fn set_nd_target_stores_and_nd_target_reads_back() {
     assert!(state.nd_target("s").is_none());
     state.set_nd_target(
         "s".to_string(),
-        NdTarget {
-            nodes: vec![integer_node(1, 0, 10)],
-            reference: 4.0,
-            dead: false,
-        },
+        NdTarget { nodes: vec![integer_node(1, 0, 10)], reference: 4.0, dead: false },
     );
     assert_eq!(state.nd_target("s").unwrap().reference, 4.0);
 }
@@ -132,26 +115,16 @@ fn adopt_nd_moves_the_nodes_but_never_lowers_the_reference() {
     let mut state = TargetingState::new();
     state.set_nd_target(
         "s".to_string(),
-        NdTarget {
-            nodes: vec![integer_node(1, 0, 10)],
-            reference: 4.0,
-            dead: false,
-        },
+        NdTarget { nodes: vec![integer_node(1, 0, 10)], reference: 4.0, dead: false },
     );
     state.adopt_nd("s", vec![integer_node(2, 0, 10)], 3.0);
     let target = state.nd_target("s").unwrap();
     assert_eq!(target.reference, 4.0);
-    assert_eq!(
-        target.timeline(),
-        vec![ChoiceValue::Integer(BigInt::from(2))]
-    );
+    assert_eq!(target.timeline(), vec![ChoiceValue::Integer(BigInt::from(2))]);
     state.adopt_nd("s", vec![integer_node(5, 0, 10)], 6.0);
     let target = state.nd_target("s").unwrap();
     assert_eq!(target.reference, 6.0);
-    assert_eq!(
-        target.timeline(),
-        vec![ChoiceValue::Integer(BigInt::from(5))]
-    );
+    assert_eq!(target.timeline(), vec![ChoiceValue::Integer(BigInt::from(5))]);
 }
 
 #[test]
@@ -172,10 +145,7 @@ fn targeting_state_version_counts_every_new_best() {
     assert_eq!(state.version(), 1);
     state.record(&choices, &HashMap::from_iter([("s".to_string(), 1.0)]));
     assert_eq!(state.version(), 1);
-    state.record(
-        &choices,
-        &HashMap::from_iter([("s".to_string(), 2.0), ("t".to_string(), 0.0)]),
-    );
+    state.record(&choices, &HashMap::from_iter([("s".to_string(), 2.0), ("t".to_string(), 0.0)]));
     assert_eq!(state.version(), 3);
 }
 
@@ -292,14 +262,8 @@ fn is_climbable_rejects_strings() {
 #[test]
 fn step_choice_integer_adds_delta_within_range() {
     let node = integer_node(5, 0, 100);
-    assert_eq!(
-        step_choice(&node, 3),
-        Some(ChoiceValue::Integer(BigInt::from(8)))
-    );
-    assert_eq!(
-        step_choice(&node, -5),
-        Some(ChoiceValue::Integer(BigInt::from(0)))
-    );
+    assert_eq!(step_choice(&node, 3), Some(ChoiceValue::Integer(BigInt::from(8))));
+    assert_eq!(step_choice(&node, -5), Some(ChoiceValue::Integer(BigInt::from(0))));
 }
 
 #[test]
@@ -331,14 +295,8 @@ fn step_choice_boolean_only_steps_by_one() {
 #[test]
 fn step_choice_bytes_adds_big_endian_and_pads() {
     let node = bytes_node(vec![0x00, 0x01], 0, 8);
-    assert_eq!(
-        step_choice(&node, 1),
-        Some(ChoiceValue::Bytes(vec![0x00, 0x02]))
-    );
-    assert_eq!(
-        step_choice(&node, 256),
-        Some(ChoiceValue::Bytes(vec![0x01, 0x01]))
-    );
+    assert_eq!(step_choice(&node, 1), Some(ChoiceValue::Bytes(vec![0x00, 0x02])));
+    assert_eq!(step_choice(&node, 256), Some(ChoiceValue::Bytes(vec![0x01, 0x01])));
 }
 
 #[test]
@@ -428,15 +386,10 @@ where
     let improved = core::cell::Cell::new(false);
     let fut = async {
         let mut engine = Engine::new(&settings, None, &exchange).unwrap();
-        engine
-            .targeting
-            .record(&start, &HashMap::from_iter([("".to_string(), start_score)]));
+        engine.targeting.record(&start, &HashMap::from_iter([("".to_string(), start_score)]));
 
-        let mut optimiser = Optimiser {
-            engine: &mut engine,
-            max_valid: 10_000,
-            max_calls: 100_000,
-        };
+        let mut optimiser =
+            Optimiser { engine: &mut engine, max_valid: 10_000, max_calls: 100_000 };
         improved.set(optimiser.optimise_targets().await.unwrap());
     };
     crate::exchange::drive(&exchange, fut, |ds| {
@@ -517,8 +470,7 @@ fn hill_climb_rejects_invalid_trial_status() {
         if n == 7 {
             return TestCaseResult::Invalid;
         }
-        ds.target_observation(-((n - 7).saturating_abs() as f64), "")
-            .unwrap();
+        ds.target_observation(-((n - 7).saturating_abs() as f64), "").unwrap();
         TestCaseResult::Valid
     });
 }
@@ -559,8 +511,7 @@ fn run_trial_records_interesting_result_into_ctx() {
         if n == 7 {
             return interesting();
         }
-        ds.target_observation(-((n - 7).saturating_abs() as f64), "")
-            .unwrap();
+        ds.target_observation(-((n - 7).saturating_abs() as f64), "").unwrap();
         TestCaseResult::Valid
     });
 }
@@ -585,11 +536,8 @@ fn error_strictness_aborts_on_a_verdict_flip_during_hill_climbing() {
             &[ChoiceValue::Integer(BigInt::from(2))],
             &HashMap::from_iter([("".to_string(), -1.0)]),
         );
-        let mut optimiser = Optimiser {
-            engine: &mut engine,
-            max_valid: 10_000,
-            max_calls: 100_000,
-        };
+        let mut optimiser =
+            Optimiser { engine: &mut engine, max_valid: 10_000, max_calls: 100_000 };
         let err = match optimiser.optimise_targets().await {
             Err(err) => err,
             Ok(_) => panic!("expected the verdict flip to abort the climb"),
@@ -605,8 +553,7 @@ fn error_strictness_aborts_on_a_verdict_flip_during_hill_climbing() {
                     return Ok(interesting());
                 }
             }
-            ds.target_observation(-((n - 3).saturating_abs() as f64), "")
-                .unwrap();
+            ds.target_observation(-((n - 3).saturating_abs() as f64), "").unwrap();
             Ok(TestCaseResult::Valid)
         })()
         .unwrap_or(TestCaseResult::Overrun);
@@ -625,11 +572,8 @@ fn the_optimiser_stops_when_the_run_flips_nondeterministic() {
             &HashMap::from_iter([("".to_string(), 2.0)]),
         );
         engine.nd_active = true;
-        let mut optimiser = Optimiser {
-            engine: &mut engine,
-            max_valid: 10_000,
-            max_calls: 100_000,
-        };
+        let mut optimiser =
+            Optimiser { engine: &mut engine, max_valid: 10_000, max_calls: 100_000 };
         optimiser.optimise_targets().await.unwrap();
         assert_eq!(engine.calls, 0);
     };

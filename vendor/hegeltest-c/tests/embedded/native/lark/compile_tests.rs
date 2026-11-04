@@ -11,10 +11,7 @@ use alloc::vec;
 use std::path::{Path, PathBuf};
 
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("lark")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("lark")
 }
 
 /// Loads `%import`ed grammars from the fixtures directory, the way Lark
@@ -80,11 +77,7 @@ fn compile_fixture(path: &Path) -> GrammarResult<Grammar> {
 /// visits literals (deepest first); the port numbers them left to right.
 /// The numbering carries no meaning, so compare them by pattern instead.
 fn anon_normalized(name: &str) -> &str {
-    if name.starts_with("__ANON_") {
-        "__ANON"
-    } else {
-        name
-    }
+    if name.starts_with("__ANON_") { "__ANON" } else { name }
 }
 
 fn describe(grammar: &Grammar, starts: &[&str]) -> String {
@@ -93,13 +86,7 @@ fn describe(grammar: &Grammar, starts: &[&str]) -> String {
         .terminals
         .iter()
         .filter(|t| t.pattern.is_some())
-        .map(|t| {
-            (
-                anon_normalized(&t.name),
-                t.priority,
-                t.regexp.as_deref().unwrap(),
-            )
-        })
+        .map(|t| (anon_normalized(&t.name), t.priority, t.regexp.as_deref().unwrap()))
         .collect();
     terminals.sort_unstable();
     for (name, priority, regexp) in terminals {
@@ -221,32 +208,18 @@ fn rules_keep_their_structure() {
         rule(&grammar, "start").alternatives,
         vec![Sequence {
             items: vec![
-                Item::Repeat {
-                    inner: Box::new(Item::Rule(a)),
-                    min: 0,
-                    max: Some(1)
-                },
+                Item::Repeat { inner: Box::new(Item::Rule(a)), min: 0, max: Some(1) },
                 Item::Repeat {
                     inner: Box::new(Item::Group(vec![
-                        Sequence {
-                            items: vec![Item::Terminal(b)]
-                        },
-                        Sequence {
-                            items: vec![Item::Terminal(c)]
-                        },
+                        Sequence { items: vec![Item::Terminal(b)] },
+                        Sequence { items: vec![Item::Terminal(c)] },
                     ])),
                     min: 1,
                     max: None
                 },
+                Item::Repeat { inner: Box::new(Item::Rule(a)), min: 2, max: Some(3) },
                 Item::Repeat {
-                    inner: Box::new(Item::Rule(a)),
-                    min: 2,
-                    max: Some(3)
-                },
-                Item::Repeat {
-                    inner: Box::new(Item::Group(vec![Sequence {
-                        items: vec![Item::Rule(a)]
-                    }])),
+                    inner: Box::new(Item::Group(vec![Sequence { items: vec![Item::Rule(a)] }])),
                     min: 0,
                     max: Some(1)
                 },
@@ -296,13 +269,7 @@ fn templates_instantiate_once_per_argument_list() {
     names.sort_unstable();
     assert_eq!(
         names,
-        vec![
-            "nested{A}",
-            "sep{A,COMMA}",
-            "sep{A,VBAR}",
-            "sep{B,SEMICOLON}",
-            "start"
-        ]
+        vec!["nested{A}", "sep{A,COMMA}", "sep{A,VBAR}", "sep{B,SEMICOLON}", "start"]
     );
     let sep = rule(&grammar, "sep{A,COMMA}");
     let a = grammar.terminal_id("A").unwrap();
@@ -379,12 +346,7 @@ fn anonymous_terminal_naming() {
     let grammar =
         compiled("start: \"if\" \"+\" /x/ /x/ \"1a\" \"IF\" \"é\" \"split\"\nSPLIT: \"s\"");
     let names: Vec<&str> = grammar.terminals.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(
-        names,
-        vec![
-            "IF", "PLUS", "__ANON_0", "__ANON_1", "__ANON_2", "É", "__ANON_3"
-        ]
-    );
+    assert_eq!(names, vec!["IF", "PLUS", "__ANON_0", "__ANON_1", "__ANON_2", "É", "__ANON_3"]);
 }
 
 #[test]
@@ -400,15 +362,9 @@ fn a_template_parameter_used_as_a_template_is_rejected_like_lark() {
     let err = compiled("start: tmpl{inner}\ntmpl{x}: x{\"a\"}\ninner{y}: y \"b\"\n").unwrap_err();
     assert_eq!(err.message, "Template 'inner' is used without arguments");
     let err = compiled("start: tmpl{A}\ntmpl{x}: x{\"a\"}\nA: \"q\"\n").unwrap_err();
-    assert_eq!(
-        err.message,
-        "Template 'A' used but not defined (in rule tmpl{A})"
-    );
+    assert_eq!(err.message, "Template 'A' used but not defined (in rule tmpl{A})");
     let err = compiled("start: tmpl{r}\ntmpl{x}: x{\"a\"}\nr: \"q\"\n").unwrap_err();
-    assert_eq!(
-        err.message,
-        "Template 'r' used but not defined (in rule tmpl{r})"
-    );
+    assert_eq!(err.message, "Template 'r' used but not defined (in rule tmpl{r})");
 }
 
 #[test]
@@ -422,10 +378,7 @@ fn a_template_instantiating_itself_ever_deeper_is_rejected() {
         "{err}"
     );
     let err = compile_err("start: t{\"a\"}\nt{x}: x | u{t{x}}\nu{y}: y | t{u{y}}\n");
-    assert!(
-        err.contains("nests its instantiations more than 200 levels deep"),
-        "{err}"
-    );
+    assert!(err.contains("nests its instantiations more than 200 levels deep"), "{err}");
     compiled("start: t{t{t{\"a\"}}}\nt{x}: x | \"(\" x \")\"\n");
 }
 

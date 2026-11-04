@@ -238,8 +238,7 @@ pub mod sched {
 }
 "#;
 
-const MAIN: &str =
-    "//- /src/lib.rs crate:main deps:std,alloc,lock_api,parking_lot,hashbrown,indexmap,once_cell,papaya,blaze_graph\n";
+const MAIN: &str = "//- /src/lib.rs crate:main deps:std,alloc,lock_api,parking_lot,hashbrown,indexmap,once_cell,papaya,blaze_graph\n";
 
 /// The fixture of the crate `main` written `main`, with [`CRATES`].
 pub(crate) fn fixture(main: &str) -> String {
@@ -266,8 +265,16 @@ pub(crate) fn fixed(lint_name: &str, main: &str) -> String {
     let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
     names.insert(file, "src/lib.rs".to_owned());
     let name_of = |file: FileId| names.get(&file).cloned();
-    let flags = ["-A".to_owned(), "clippy::all".to_owned(), "-W".to_owned(), format!("clippy::{lint_name}")];
-    let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf::default() };
+    let flags = [
+        "-A".to_owned(),
+        "clippy::all".to_owned(),
+        "-W".to_owned(),
+        format!("clippy::{lint_name}"),
+    ];
+    let setup = Setup {
+        command_line: CommandLine::parse(&flags).expect("the flags read"),
+        conf: Conf::default(),
+    };
     let made = fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
     let after = db.file_text(file).text(&db).to_string();
     assert_ne!(after, before, "the fix of `{lint_name}` changed the file");
@@ -277,8 +284,11 @@ pub(crate) fn fixed(lint_name: &str, main: &str) -> String {
         for module in krate.modules(&db) {
             module.diagnostics(&db, &mut acc, false);
         }
-        let errors: Vec<String> =
-            acc.iter().map(|it| format!("{it:?}")).filter(|it| !it.starts_with("InactiveCode")).collect();
+        let errors: Vec<String> = acc
+            .iter()
+            .map(|it| format!("{it:?}"))
+            .filter(|it| !it.starts_with("InactiveCode"))
+            .collect();
         assert!(errors.is_empty(), "the fixed file is front-end clean:\n{after}\n{errors:#?}");
         let found = check(&db, krate, &setup, &name_of).expect("the file is named");
         let left: Vec<&str> = found.iter().map(|it| it.diagnostic.message.as_str()).collect();

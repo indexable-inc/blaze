@@ -665,7 +665,10 @@ fn rust_logo_is_gated() {
 
 fn main() {}
 "##;
-    assert_reports(&ui("doc-rust-logo.rs", "2015", source), &[error(1, &["`#[doc(rust_logo)]`", "rustdoc_internals"])]);
+    assert_reports(
+        &ui("doc-rust-logo.rs", "2015", source),
+        &[error(1, &["`#[doc(rust_logo)]`", "rustdoc_internals"])],
+    );
 }
 
 #[test]
@@ -845,7 +848,10 @@ fn auto_cfg_values_are_identifiers() {
 //~^ ERROR malformed `doc` attribute input
 fn f() {}
 "##;
-    assert_reports(&ui("doc-auto-cfg-values-non-ident.rs", "2015", source), &[error(5, &["`doc`"])]);
+    assert_reports(
+        &ui("doc-auto-cfg-values-non-ident.rs", "2015", source),
+        &[error(5, &["`doc`"])],
+    );
 }
 
 #[test]

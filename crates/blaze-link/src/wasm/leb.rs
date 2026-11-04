@@ -1,11 +1,11 @@
 //! LEB128 as the wasm binary format writes numbers, the 5-byte padded form an object leaves
 //! where the linker writes an index or an address, and the framing of sections and names.
 
+use blaze_format::cursor::Put;
 pub(super) use blaze_format::leb::{
     PADDED, len_u64 as uleb_len, padded_i32 as padded_sleb, padded_u32 as padded_uleb,
     put_i64 as sleb_into, put_u64 as uleb_into, write_i64 as sleb, write_u64 as uleb,
 };
-use blaze_format::cursor::Put;
 
 /// The bytes a wasm64 object leaves for an `i64.const`'s address or slot: a padded LEB of the
 /// most bytes a 64-bit value takes.

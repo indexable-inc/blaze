@@ -159,7 +159,8 @@ impl<'s> ScriptSource<'s> {
             .push_visible_span(open_start..open_end));
         } else {
             let after_closing_fence = strip_newline(after_closing_fence);
-            let after_closing_fence = after_closing_fence.trim_matches(rustc_lexer::is_horizontal_whitespace);
+            let after_closing_fence =
+                after_closing_fence.trim_matches(rustc_lexer::is_horizontal_whitespace);
             if !after_closing_fence.is_empty() {
                 // extra characters beyond the original fence pattern
                 let after_start = after_closing_fence.offset_from(&raw);
@@ -326,7 +327,15 @@ mod tests {
 
     #[test]
     fn shebangs_are_rustcs_with_their_newline() {
-        for text in ["#!/usr/bin/env cargo\nfn main() {}", "#!x", "#!x\r\nfn f() {}", "#![allow(x)]", "#! \n [a]", "fn f() {}", "#"] {
+        for text in [
+            "#!/usr/bin/env cargo\nfn main() {}",
+            "#!x",
+            "#!x\r\nfn f() {}",
+            "#![allow(x)]",
+            "#! \n [a]",
+            "fn f() {}",
+            "#",
+        ] {
             assert_eq!(super::strip_shebang(text), cargo_strip_shebang(text), "{text:?}");
         }
         // Only rustc counts comments as whitespace before the `[`.
@@ -340,7 +349,20 @@ mod tests {
     #[test]
     fn whitespace_is_rustc_lexers() {
         let old_ws = |c: char| {
-            matches!(c, '\u{A}' | '\u{B}' | '\u{C}' | '\u{D}' | '\u{85}' | '\u{2028}' | '\u{2029}' | '\u{200E}' | '\u{200F}' | '\t' | ' ')
+            matches!(
+                c,
+                '\u{A}'
+                    | '\u{B}'
+                    | '\u{C}'
+                    | '\u{D}'
+                    | '\u{85}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{200E}'
+                    | '\u{200F}'
+                    | '\t'
+                    | ' '
+            )
         };
         for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
             assert_eq!(rustc_lexer::is_whitespace(c), old_ws(c), "{c:?}");

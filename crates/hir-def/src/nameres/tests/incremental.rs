@@ -4,7 +4,10 @@ use hir_expand::fixture;
 
 use crate::{
     file_item_tree,
-    nameres::{crate_def_map, tests::{TestDB, TestDBExt}},
+    nameres::{
+        crate_def_map,
+        tests::{TestDB, TestDBExt},
+    },
 };
 
 fn check_def_map_is_not_recomputed(
@@ -63,7 +66,9 @@ pub const BAZ: u32 = 0;
     let all_crates_before = all_crates(&db);
     let a = *all_crates_before
         .iter()
-        .find(|it| it.extra_data(&db).display_name.as_ref().is_some_and(|name| name.to_string() == "a"))
+        .find(|it| {
+            it.extra_data(&db).display_name.as_ref().is_some_and(|name| name.to_string() == "a")
+        })
         .expect("crate a");
     let a_before = crate::nameres::delta::Slices::of(&db, a);
 
@@ -83,7 +88,12 @@ pub const BAZ: u32 = 0;
             let attrs = data
                 .crate_attrs
                 .iter()
-                .map(|it| it.strip_prefix("#![").and_then(|it| it.strip_suffix(']')).unwrap_or(it).to_owned())
+                .map(|it| {
+                    it.strip_prefix("#![")
+                        .and_then(|it| it.strip_suffix(']'))
+                        .unwrap_or(it)
+                        .to_owned()
+                })
                 .collect();
             new_crate_graph.add_crate_root(
                 root,
@@ -119,7 +129,11 @@ pub const BAZ: u32 = 0;
         }
     });
     let a_after = crate::nameres::delta::Slices::of(&db, a);
-    assert_eq!(a_before.differing(&a_after), Vec::<String>::new(), "fields of crate a's resolution set");
+    assert_eq!(
+        a_before.differing(&a_after),
+        Vec::<String>::new(),
+        "fields of crate a's resolution set"
+    );
     // `b` gets invalidated due to its new dependency edge to `a`. `c` already depended on `b`,
     // and `b` declares what it did, so `c`'s def map stays as it was.
     let names: Vec<(blaze_query::db::Id, String)> = all_crates(&db)
@@ -497,8 +511,8 @@ m!(Z);
             db.set_file_text(file_id, new_text);
             let db: &TestDB = db;
             let crate_def_map = crate_def_map(db, krate);
-            let module_data =
-                &crate_def_map.module(db, crate_def_map.modules_for_file(db, file_id).next().unwrap());
+            let module_data = &crate_def_map
+                .module(db, crate_def_map.modules_for_file(db, file_id).next().unwrap());
             assert_eq!(module_data.scope(db).resolutions().count(), 4);
         },
         &[("file_item_tree_query", 1), ("parse_macro_expansion", 0)],
@@ -594,7 +608,10 @@ fn execute_assert_write(
 fn assert_events(events: &[String], required: &[(&str, usize)], expect: &Expect) {
     for (event, count) in required {
         let n = events.iter().filter(|it| it.contains(event)).count();
-        assert_eq!(n, *count, "Expected {event} to be executed {count} times, but got {n}: {events:#?}");
+        assert_eq!(
+            n, *count,
+            "Expected {event} to be executed {count} times, but got {n}: {events:#?}"
+        );
     }
     expect.assert_debug_eq(&events);
 }
@@ -649,7 +666,8 @@ impl hir_expand::proc_macro::ProcMacroExpander for Counting {
         &self,
         _: &base_db::Db,
         call: hir_expand::proc_macro::ProcMacroCall<'_>,
-    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError> {
+    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError>
+    {
         self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(hir_expand::proc_macro::Expanded {
             tree: call.subtree.copy(),
@@ -721,13 +739,16 @@ pub fn unrelated() -> u32 { 1 }
 fn a_fixed_expansion_is_reused_across_an_unrelated_edit() {
     use hir_expand::proc_macro::StateUse;
     for ordered in [false, true] {
-        let (resolved, edited, marked, expanded) = counting_across_an_unrelated_edit(ordered, StateUse::Fixed);
+        let (resolved, edited, marked, expanded) =
+            counting_across_an_unrelated_edit(ordered, StateUse::Fixed);
         assert_eq!(resolved, 1, "ordered {ordered}: the call ran once to resolve the crate");
         assert_eq!((edited, expanded), (1, 0), "ordered {ordered}: the edit ran the call again");
         assert!(!marked, "ordered {ordered}: a fixed call marked the def map as using the session");
     }
-    let (resolved, _, marked, _) =
-        counting_across_an_unrelated_edit(true, StateUse::Session("a test's call that says its session took part"));
+    let (resolved, _, marked, _) = counting_across_an_unrelated_edit(
+        true,
+        StateUse::Session("a test's call that says its session took part"),
+    );
     assert_eq!(resolved, 1, "the call ran once to resolve the crate");
     assert!(marked, "a call whose session took part marks the def map");
 }

@@ -52,25 +52,41 @@ fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_on
     release.began(1);
     release.compiled_under(0, short);
     assert!(release.due(), "memory is short");
-    assert_eq!(release.plan(), Some(Plan { crates: vec![9], mir: true, pressed: true, ended: false }));
+    assert_eq!(
+        release.plan(),
+        Some(Plan { crates: vec![9], mir: true, pressed: true, ended: false })
+    );
     assert!(!release.due() && release.plan().is_none(), "taken");
     release.compiled_under(1, fine);
     assert!(release.due(), "no unit is open and crate 7 is finished");
-    assert_eq!(release.plan(), Some(Plan { crates: vec![7], mir: true, pressed: false, ended: false }));
+    assert_eq!(
+        release.plan(),
+        Some(Plan { crates: vec![7], mir: true, pressed: false, ended: false })
+    );
 
     let mut open = Release::of(Finished::new(vec![Some(7u32), Some(9)]), true);
     open.began(0);
     open.began(1);
     open.compiled_under(1, fine);
-    assert_eq!(open.plan(), Some(Plan { crates: vec![9], mir: false, pressed: false, ended: false }), "unit 0 still reads MIR");
+    assert_eq!(
+        open.plan(),
+        Some(Plan { crates: vec![9], mir: false, pressed: false, ended: false }),
+        "unit 0 still reads MIR"
+    );
 
     let mut check = Release::of(Finished::new(vec![Some(7u32), Some(9)]), false);
     check.began(0);
     check.began(1);
     check.compiled_under(0, fine);
-    assert!(!check.due() && check.plan().is_none(), "a check lets go of nothing while memory is fine");
+    assert!(
+        !check.due() && check.plan().is_none(),
+        "a check lets go of nothing while memory is fine"
+    );
     check.compiled_under(1, fine);
-    assert!(!check.due() && check.plan().is_none(), "nor once no unit is open: the next check reads its inference");
+    assert!(
+        !check.due() && check.plan().is_none(),
+        "nor once no unit is open: the next check reads its inference"
+    );
     let mut pressed = Release::of(Finished::new(vec![Some(7u32), Some(9)]), false);
     pressed.began(0);
     pressed.began(1);
@@ -98,7 +114,10 @@ fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_on
     built.began(0);
     built.began(1);
     built.compiled_under(1, fine);
-    assert_eq!(built.plan(), Some(Plan { crates: vec![9], mir: false, pressed: false, ended: false }));
+    assert_eq!(
+        built.plan(),
+        Some(Plan { crates: vec![9], mir: false, pressed: false, ended: false })
+    );
     built.end();
     assert_eq!(
         built.plan(),
@@ -108,7 +127,11 @@ fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_on
     let mut held_back = Release::of(Finished::new(vec![Some(7u32)]), false);
     held_back.began(0);
     held_back.short_under(short);
-    assert_eq!(held_back.plan(), Some(Plan { crates: vec![], mir: true, pressed: true, ended: false }), "the plane holding a task back for memory makes it due too");
+    assert_eq!(
+        held_back.plan(),
+        Some(Plan { crates: vec![], mir: true, pressed: true, ended: false }),
+        "the plane holding a task back for memory makes it due too"
+    );
 }
 
 /// Each release says one line naming why it ran, what went, what blaze held before and after,
@@ -117,13 +140,28 @@ fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_on
 #[test]
 fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     const GIB: u64 = 1 << 30;
-    let dropped = hir::evict::Dropped { bodies: 40, inference: 30, mir: 900, const_eval: 7, solver_caches: 5, intern_tables: 3 };
+    let dropped = hir::evict::Dropped {
+        bodies: 40,
+        inference: 30,
+        mir: 900,
+        const_eval: 7,
+        solver_caches: 5,
+        intern_tables: 3,
+    };
     let before = Pressure { held: 44 * GIB, limit: 48 * GIB, over: Some(Tag::Mir) };
     let after = Pressure { held: 38 * GIB, limit: 48 * GIB, over: None };
     // A release memory made due says the storage's holders.
-    let infer = MemoryUsage { name: "infer", rows: 2048, used: 1500, row_bytes: 1 << 28, value_bytes: 1 << 28 };
+    let infer = MemoryUsage {
+        name: "infer",
+        rows: 2048,
+        used: 1500,
+        row_bytes: 1 << 28,
+        value_bytes: 1 << 28,
+    };
     let storage = Holders::of(vec![infer]);
-    let said = Said { crates: 2, mir: true, pressed: true, ended: false, dropped, before, after, storage }.to_string();
+    let said =
+        Said { crates: 2, mir: true, pressed: true, ended: false, dropped, before, after, storage }
+            .to_string();
     assert_eq!(
         said,
         "front end release (memory: blaze is past the limit's line of 42.00 GiB): let go of 30 inference results of 40 \
@@ -133,14 +171,37 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     );
     let early = Pressure { held: 20 * GIB, ..before };
     let storage = Holders::of(Vec::new());
-    let said = Said { crates: 1, mir: false, pressed: true, ended: false, dropped, before: early, after: early, storage }.to_string();
+    let said = Said {
+        crates: 1,
+        mir: false,
+        pressed: true,
+        ended: false,
+        dropped,
+        before: early,
+        after: early,
+        storage,
+    }
+    .to_string();
     assert!(said.starts_with("front end release (memory: mir is past its share of "), "{said}");
-    assert!(!said.contains("MIR bodies") && said.contains("in 1 crates and 5 trait solver caches"), "{said}");
+    assert!(
+        !said.contains("MIR bodies") && said.contains("in 1 crates and 5 trait solver caches"),
+        "{said}"
+    );
     assert!(said.contains("(0.00 freed)"), "{said}");
     // A release memory did not make due says the storage's total alone, read from counters.
     let idle = Pressure { held: GIB, limit: u64::MAX, over: None };
     let storage = Holders::total(3 << 29);
-    let said = Said { crates: 1, mir: true, pressed: false, ended: false, dropped, before: idle, after: idle, storage }.to_string();
+    let said = Said {
+        crates: 1,
+        mir: true,
+        pressed: false,
+        ended: false,
+        dropped,
+        before: idle,
+        after: idle,
+        storage,
+    }
+    .to_string();
     assert!(said.starts_with("front end release (no unit is open)"), "{said}");
     assert!(said.ends_with(", under no limit; the query storage holds 1.50 GiB"), "{said}");
 }
@@ -150,7 +211,13 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
 /// so a function's pages made for keys it never ran read apart (memcap6).
 #[test]
 fn the_query_storage_s_largest_holders_are_said_with_their_rows_made_and_used() {
-    let usage = |name: &'static str, rows, used, row_bytes, value_bytes| MemoryUsage { name, rows, used, row_bytes, value_bytes };
+    let usage = |name: &'static str, rows, used, row_bytes, value_bytes| MemoryUsage {
+        name,
+        rows,
+        used,
+        row_bytes,
+        value_bytes,
+    };
     let holders = Holders::of(vec![
         usage("c", 1, 1, 1 << 20, 0),
         usage("source_place", 3_190_784, 400_000, 1 << 29, 0),

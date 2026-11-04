@@ -4,17 +4,27 @@ use derive_generic_visitor::{Drive, DriveMut, DriveTwo};
 use enum_as_inner::EnumAsInner;
 use serde_state::{DeserializeState, SerializeState};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo,
+)]
 #[serde_state(state_implements = DedupSerializerState)] // Avoid corecursive impls due to perfect derive
 pub struct Place {
     pub kind: PlaceKind,
     pub ty: Ty,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("Place"))]
 pub enum PlaceKind {
     /// A local variable in a function body.
@@ -27,9 +37,18 @@ pub enum PlaceKind {
 }
 
 /// Projects a place to a subplace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum ProjectionElem {
     /// Dereference a shared/mutable reference, a box, or a raw pointer.
     Deref,
@@ -46,18 +65,11 @@ pub enum ProjectionElem {
     /// that even constant indices into arrays are let-bound as separate variables.
     /// We **eliminate** this variant in a micro-pass for LLBC.
     #[cfg_attr(feature = "charon_on_charon", charon::rename("ProjIndex"))]
-    Index {
-        offset: Box<Operand>,
-        from_end: bool,
-    },
+    Index { offset: Box<Operand>, from_end: bool },
     /// Take a subslice of a slice or array. If `from_end` is `true` this is
     /// `slice[from..slice.len() - to]`, otherwise this is `slice[from..to]`.
     /// We **eliminate** this variant in a micro-pass for LLBC.
-    Subslice {
-        from: Box<Operand>,
-        to: Box<Operand>,
-        from_end: bool,
-    },
+    Subslice { from: Box<Operand>, to: Box<Operand>, from_end: bool },
     /// For a place `p`, `p.offset(n)` is the place located `n` bytes after `p`, where `n` is a
     /// signed or unsigned integer. This projection may go out of bounds of the original place, e.g.
     /// if we initially had a `*const T` pointing into an array. If `in_bounds` is `true` the offset
@@ -67,27 +79,16 @@ pub enum ProjectionElem {
     ///
     /// An offset may change the type of the place, like a transmute: `ty` is the type of the
     /// resulting place, which is `T: Sized` as proven by `ty_is_sized`.
-    Offset {
-        bytes: Box<Operand>,
-        in_bounds: bool,
-        ty: Ty,
-        ty_is_sized: Option<TraitRef>,
-    },
+    Offset { bytes: Box<Operand>, in_bounds: bool, ty: Ty, ty_is_sized: Option<TraitRef> },
 }
 
 impl Place {
     pub fn new(local_id: LocalId, ty: Ty) -> Place {
-        Place {
-            kind: PlaceKind::Local(local_id),
-            ty,
-        }
+        Place { kind: PlaceKind::Local(local_id), ty }
     }
 
     pub fn new_global(global: GlobalDeclRef, ty: Ty) -> Place {
-        Place {
-            kind: PlaceKind::Global(global),
-            ty,
-        }
+        Place { kind: PlaceKind::Global(global), ty }
     }
 
     pub fn ty(&self) -> &Ty {
@@ -121,10 +122,7 @@ impl Place {
     }
 
     pub fn project(self, elem: ProjectionElem, ty: Ty) -> Self {
-        Self {
-            kind: PlaceKind::Projection(Box::new(self), elem),
-            ty,
-        }
+        Self { kind: PlaceKind::Projection(Box::new(self), elem), ty }
     }
 
     pub fn project_auto_ty(self, krate: &TranslatedCrate, proj: ProjectionElem) -> Option<Self> {
@@ -145,10 +143,7 @@ impl Place {
                 panic!("internal type error")
             }
         };
-        Place {
-            ty: proj_ty,
-            kind: PlaceKind::Projection(Box::new(self), ProjectionElem::Deref),
-        }
+        Place { ty: proj_ty, kind: PlaceKind::Projection(Box::new(self), ProjectionElem::Deref) }
     }
 
     /// Iterate over the subplaces of this place, starting with the place itself.
@@ -162,8 +157,7 @@ impl Place {
     }
 
     pub fn projections(&self) -> impl Iterator<Item = &ProjectionElem> {
-        self.subplaces()
-            .filter_map(|place| Some(place.as_projection()?.1))
+        self.subplaces().filter_map(|place| Some(place.as_projection()?.1))
     }
 }
 
@@ -199,12 +193,7 @@ impl ProjectionElem {
                     Enum(variants) => {
                         let variant_id = (*variant_id)?;
                         let variant = variants.get(variant_id)?;
-                        variant
-                            .fields
-                            .get(*field_id)?
-                            .ty
-                            .clone()
-                            .substitute(&tref.generics)
+                        variant.fields.get(*field_id)?.ty.clone().substitute(&tref.generics)
                     }
                     Opaque | Alias(_) | Error(_) => return None,
                 }
@@ -221,11 +210,7 @@ impl ProjectionElem {
                     } else {
                         to.checked_sub(from)?
                     };
-                    Ty::mk_array(
-                        elem.clone(),
-                        ConstantExpr::mk_usize(len),
-                        ty_is_sized.clone(),
-                    )
+                    Ty::mk_array(elem.clone(), ConstantExpr::mk_usize(len), ty_is_sized.clone())
                 }
                 _ => return None,
             },

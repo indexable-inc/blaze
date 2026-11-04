@@ -386,10 +386,7 @@ impl Parser {
 
 impl<T: Terminals> Parse<'_, T> {
     fn next_symbol(&self, item: &Item) -> Option<Symbol> {
-        self.parser.lowered.productions[item.prod as usize]
-            .rhs
-            .get(item.dot as usize)
-            .copied()
+        self.parser.lowered.productions[item.prod as usize].rhs.get(item.dot as usize).copied()
     }
 
     fn add(
@@ -410,13 +407,7 @@ impl<T: Terminals> Parse<'_, T> {
         if self.items.len() >= self.parser.item_budget {
             return Err(ParseError { position: col });
         }
-        let item = Item {
-            prod,
-            dot,
-            origin,
-            col: col as u32,
-            back,
-        };
+        let item = Item { prod, dot, origin, col: col as u32, back };
         let idx = self.items.len() as u32;
         self.items.push(item);
         match self.next_symbol(&item) {
@@ -437,16 +428,10 @@ impl<T: Terminals> Parse<'_, T> {
             let pred = self.items[arrival.item as usize];
             let term = arrival.term as u32;
             if arrival.advance {
-                let back = Back::Token {
-                    pred: arrival.item,
-                    term,
-                };
+                let back = Back::Token { pred: arrival.item, term };
                 self.add(col, pred.prod, pred.dot + 1, pred.origin, back)?;
             } else {
-                let back = Back::Ignored {
-                    pred: arrival.item,
-                    term,
-                };
+                let back = Back::Ignored { pred: arrival.item, term };
                 self.add(col, pred.prod, pred.dot, pred.origin, back)?;
             }
         }
@@ -504,13 +489,7 @@ impl<T: Terminals> Parse<'_, T> {
                     }
                     let originator = self.items[pred as usize];
                     let back = Back::Child { pred, child: idx };
-                    self.add(
-                        col,
-                        originator.prod,
-                        originator.dot + 1,
-                        originator.origin,
-                        back,
-                    )?;
+                    self.add(col, originator.prod, originator.dot + 1, originator.origin, back)?;
                 }
             }
         }
@@ -578,8 +557,7 @@ impl<T: Terminals> Parse<'_, T> {
             return range;
         }
         let from = self.ends.len();
-        self.terminals
-            .ends(&mut self.memo, term, self.text, col, &mut self.ends);
+        self.terminals.ends(&mut self.memo, term, self.text, col, &mut self.ends);
         let to = self.ends.len();
         self.tried[term] = Some((from, to));
         (from, to)
@@ -593,15 +571,9 @@ impl<T: Terminals> Parse<'_, T> {
         advance: bool,
     ) -> Result<(), ParseError> {
         if self.items.len() + self.pending >= self.parser.item_budget {
-            return Err(ParseError {
-                position: self.items[item as usize].col as usize,
-            });
+            return Err(ParseError { position: self.items[item as usize].col as usize });
         }
-        self.delayed[end].push(Delayed {
-            item,
-            term,
-            advance,
-        });
+        self.delayed[end].push(Delayed { item, term, advance });
         self.pending += 1;
         Ok(())
     }
@@ -686,9 +658,7 @@ impl<T: Terminals> Parse<'_, T> {
                 return Ok(());
             }
             if self.items.len() >= self.parser.item_budget {
-                return Err(ParseError {
-                    position: top.col as usize,
-                });
+                return Err(ParseError { position: top.col as usize });
             }
             self.items.push(Item {
                 prod: waiter.prod,
@@ -707,9 +677,7 @@ impl<T: Terminals> Parse<'_, T> {
         let mut at = idx;
         loop {
             if self.built >= self.parser.item_budget {
-                return Err(ParseError {
-                    position: self.items[idx as usize].col as usize,
-                });
+                return Err(ParseError { position: self.items[idx as usize].col as usize });
             }
             self.built += 1;
             self.link(at)?;
@@ -739,11 +707,7 @@ impl<T: Terminals> Parse<'_, T> {
     }
 
     fn frame(&mut self, item: u32) -> Result<Frame, ParseError> {
-        Ok(Frame {
-            item,
-            steps: self.steps(item)?.into_iter(),
-            children: Vec::new(),
-        })
+        Ok(Frame { item, steps: self.steps(item)?.into_iter(), children: Vec::new() })
     }
 
     fn node(&self, frame: Frame) -> Tree {
@@ -769,11 +733,7 @@ impl<T: Terminals> Parse<'_, T> {
                 None => match stack.pop() {
                     Some(done) => {
                         let tree = self.node(done);
-                        stack
-                            .last_mut()
-                            .unwrap_or(&mut root_frame)
-                            .children
-                            .push(tree);
+                        stack.last_mut().unwrap_or(&mut root_frame).children.push(tree);
                     }
                     None => return Ok(self.node(root_frame)),
                 },

@@ -172,9 +172,11 @@ impl SystemV {
             return None;
         }
         match isa.triple().architecture {
-            Architecture::X86_64 => {
-                Some(SystemV { arch: Arch::X86_64, frame_pointer: gimli::X86_64::RBP.0, link: None })
-            }
+            Architecture::X86_64 => Some(SystemV {
+                arch: Arch::X86_64,
+                frame_pointer: gimli::X86_64::RBP.0,
+                link: None,
+            }),
             Architecture::Aarch64(_) => Some(SystemV {
                 arch: Arch::Aarch64,
                 frame_pointer: gimli::AArch64::X29.0,
@@ -209,7 +211,9 @@ impl SystemV {
         ];
         let encoding = reg.hw_enc();
         let mapped = match (self.arch, reg.class()) {
-            (Arch::X86_64, RegClass::Int) => X86_64_GENERAL.get(usize::from(encoding)).map(|it| it.0),
+            (Arch::X86_64, RegClass::Int) => {
+                X86_64_GENERAL.get(usize::from(encoding)).map(|it| it.0)
+            }
             (Arch::X86_64, RegClass::Float) => {
                 (encoding < 16).then(|| gimli::X86_64::XMM0.0 + u16::from(encoding))
             }
@@ -218,7 +222,9 @@ impl SystemV {
             (_, RegClass::Vector) => None,
         };
         // alloc: an error
-        mapped.ok_or_else(|| format!("a saved register {reg:?}, which has no DWARF number on {:?}", self.arch))
+        mapped.ok_or_else(|| {
+            format!("a saved register {reg:?}, which has no DWARF number on {:?}", self.arch)
+        })
     }
 
     /// The rows of `code`, from the unwind instructions Cranelift wrote as it emitted it.
@@ -243,7 +249,10 @@ impl SystemV {
                         rows.push((at, FrameRule::Offset(link, -up + offset)));
                     }
                 }
-                UnwindInst::DefineNewFrame { offset_upward_to_caller_sp: up, offset_downward_to_clobbers: down } => {
+                UnwindInst::DefineNewFrame {
+                    offset_upward_to_caller_sp: up,
+                    offset_downward_to_clobbers: down,
+                } => {
                     rows.push((at, FrameRule::CfaRegister(self.frame_pointer)));
                     clobbers_to_cfa = up.checked_add(down).ok_or_else(overflow)?;
                 }
@@ -285,7 +294,8 @@ fn call_entries(code: &CompiledCode) -> impl Iterator<Item = CallEntry> + '_ {
     code.buffer.call_sites().flat_map(|call_site| {
         let start = call_site.ret_addr - 1;
         let handlers = call_site.exception_handlers;
-        let plain = handlers.is_empty().then_some(CallEntry { start, landing_pad: 0, catch: false });
+        let plain =
+            handlers.is_empty().then_some(CallEntry { start, landing_pad: 0, catch: false });
         let handled = handlers.iter().filter_map(move |handler| match *handler {
             MachExceptionHandler::Tag(tag, landing_pad) => Some(CallEntry {
                 start,
@@ -378,10 +388,17 @@ impl Fde<'_> {
     /// as [`write_fde`] gives them after a CIE of `code_align` and `data_align`: rows of our
     /// own (Cranelift's of x86-64 and AArch64 since [`SystemV`], and stencils') straight from
     /// the rules, with nothing allocated past `out`; Cranelift's own `UnwindInfo` through gimli.
-    pub(super) fn write(self, code_align: u32, data_align: i32, out: &mut Vec<u8>) -> Result<(), String> {
+    pub(super) fn write(
+        self,
+        code_align: u32,
+        data_align: i32,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
         match self.0 {
             Frame::Rows(rows) => write_rows(&rows.rows, code_align, data_align, out),
-            Frame::Cranelift(info) => write_fde(info.to_fde(Address::Constant(0)), code_align, data_align, out),
+            Frame::Cranelift(info) => {
+                write_fde(info.to_fde(Address::Constant(0)), code_align, data_align, out)
+            }
             // alloc: an error
             Frame::Windows(_) => Err("an `.eh_frame` entry of a frame of Windows".to_owned()),
         }
@@ -423,14 +440,23 @@ fn write_rows_from(
 ) -> Result<(), String> {
     use gimli::leb128::write::{signed, unsigned};
     // alloc: an error
-    let code_align = u8::try_from(code_align).ok().filter(|it| *it != 0).ok_or_else(|| format!("a code alignment of {code_align}"))?;
+    let code_align = u8::try_from(code_align)
+        .ok()
+        .filter(|it| *it != 0)
+        .ok_or_else(|| format!("a code alignment of {code_align}"))?;
     // alloc: an error
-    let data_align = i8::try_from(data_align).ok().filter(|it| *it != 0).ok_or_else(|| format!("a data alignment of {data_align}"))?;
+    let data_align = i8::try_from(data_align)
+        .ok()
+        .filter(|it| *it != 0)
+        .ok_or_else(|| format!("a data alignment of {data_align}"))?;
     let factored = |offset: i32| -> Result<i32, String> {
         let factor = i32::from(data_align);
         let exact = offset.checked_rem(factor) == Some(0);
         // alloc: an error
-        exact.then(|| offset.checked_div(factor)).flatten().ok_or_else(|| format!("a data offset {offset} that is no multiple of {factor}"))
+        exact
+            .then(|| offset.checked_div(factor))
+            .flatten()
+            .ok_or_else(|| format!("a data offset {offset} that is no multiple of {factor}"))
     };
     // Writing to a `Vec` cannot fail.
     let uleb = |out: &mut Vec<u8>, value: u64| {
@@ -444,7 +470,9 @@ fn write_rows_from(
         if offset != previous {
             let delta = offset.checked_sub(previous).filter(|it| it % u32::from(code_align) == 0);
             // alloc: an error
-            let delta = delta.ok_or_else(|| format!("a row at {offset} after one at {previous}"))? / u32::from(code_align);
+            let delta = delta
+                .ok_or_else(|| format!("a row at {offset} after one at {previous}"))?
+                / u32::from(code_align);
             if delta < 0x40 {
                 out.push(gimli::DW_CFA_advance_loc.0 | delta as u8);
             } else if delta < 0x100 {
@@ -545,9 +573,11 @@ pub(super) fn write_fde(
         static WRITTEN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     // alloc: an error
-    let code_align = u8::try_from(code_align).map_err(|_| format!("a code alignment of {code_align}"))?;
+    let code_align =
+        u8::try_from(code_align).map_err(|_| format!("a code alignment of {code_align}"))?;
     // alloc: an error
-    let data_align = i8::try_from(data_align).map_err(|_| format!("a data alignment of {data_align}"))?;
+    let data_align =
+        i8::try_from(data_align).map_err(|_| format!("a data alignment of {data_align}"))?;
     let encoding = gimli::Encoding { address_size: 8, format: gimli::Format::Dwarf32, version: 1 };
     let cie = CommonInformationEntry::new(encoding, code_align, data_align, gimli::Register(0));
     let mut table = FrameTable::default();
@@ -624,14 +654,18 @@ fn stencil_landing_pads(code: &blaze_stencil::CodeRef<'_>) -> Result<Option<Vec<
     for handler in code.handlers {
         let Handler::Tag { .. } = handler else {
             // alloc: an error
-            return Err(format!("copy-and-patch code has a handler of every exception: {handler:?}"));
+            return Err(format!(
+                "copy-and-patch code has a handler of every exception: {handler:?}"
+            ));
         };
         lands = true;
     }
     if !lands {
         return Ok(None);
     }
-    let handlers = |call: &blaze_stencil::code::CallSite| code.handlers.get(call.handlers.start as usize..call.handlers.end as usize);
+    let handlers = |call: &blaze_stencil::code::CallSite| {
+        code.handlers.get(call.handlers.start as usize..call.handlers.end as usize)
+    };
     if let Some(call) = code.calls.iter().find(|it| it.ret == 0 || handlers(it).is_none()) {
         // alloc: an error
         return Err(format!("copy-and-patch code has a call site out of its tables: {call:?}"));
@@ -639,11 +673,20 @@ fn stencil_landing_pads(code: &blaze_stencil::CodeRef<'_>) -> Result<Option<Vec<
     Ok(Some(lsda::write(|| {
         code.calls.iter().flat_map(move |call| {
             let start = call.ret - 1;
-            let plain = call.handlers.is_empty().then_some(CallEntry { start, landing_pad: 0, catch: false });
-            let handled = handlers(call).unwrap_or_default().iter().filter_map(move |handler| match *handler {
-                Handler::Tag { tag, landing } => Some(CallEntry { start, landing_pad: landing, catch: tag == CATCH }),
-                Handler::Default { .. } => None,
+            let plain = call.handlers.is_empty().then_some(CallEntry {
+                start,
+                landing_pad: 0,
+                catch: false,
             });
+            let handled =
+                handlers(call).unwrap_or_default().iter().filter_map(
+                    move |handler| match *handler {
+                        Handler::Tag { tag, landing } => {
+                            Some(CallEntry { start, landing_pad: landing, catch: tag == CATCH })
+                        }
+                        Handler::Default { .. } => None,
+                    },
+                );
             plain.into_iter().chain(handled)
         })
     })))

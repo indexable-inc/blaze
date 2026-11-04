@@ -34,10 +34,8 @@ fn draw_bool(tc: &mut NativeTestCase) -> bool {
 
 #[test]
 fn a_branch_visible_at_the_divergence_is_followed_without_diverging() {
-    let mut tc = replay(vec![
-        vec![boolean(true), int(5)],
-        vec![boolean(true), boolean(false), int(7)],
-    ]);
+    let mut tc =
+        replay(vec![vec![boolean(true), int(5)], vec![boolean(true), boolean(false), int(7)]]);
     assert!(draw_bool(&mut tc));
     assert_eq!(tc.live_timelines(), vec![true, true]);
     assert!(!draw_bool(&mut tc));
@@ -48,10 +46,7 @@ fn a_branch_visible_at_the_divergence_is_followed_without_diverging() {
 
 #[test]
 fn the_first_live_timeline_serves_and_disagreeing_ones_leave() {
-    let mut tc = replay(vec![
-        vec![boolean(true), int(1)],
-        vec![boolean(true), int(2)],
-    ]);
+    let mut tc = replay(vec![vec![boolean(true), int(1)], vec![boolean(true), int(2)]]);
     draw_bool(&mut tc);
     assert_eq!(draw_int(&mut tc), 1);
     assert_eq!(tc.live_timelines(), vec![true, false]);
@@ -60,21 +55,12 @@ fn the_first_live_timeline_serves_and_disagreeing_ones_leave() {
 
 #[test]
 fn running_off_every_timeline_diverges_and_draws_randomly() {
-    let mut tc = replay(vec![
-        vec![boolean(true), int(1)],
-        vec![boolean(true), int(2)],
-    ]);
+    let mut tc = replay(vec![vec![boolean(true), int(1)], vec![boolean(true), int(2)]]);
     draw_bool(&mut tc);
     draw_int(&mut tc);
     draw_int(&mut tc);
     assert_eq!(tc.live_timelines(), vec![false, false]);
-    assert_eq!(
-        tc.divergence(),
-        Some(Divergence {
-            stream: vec![],
-            position: 2
-        })
-    );
+    assert_eq!(tc.divergence(), Some(Divergence { stream: vec![], position: 2 }));
     assert_eq!(tc.nodes.len(), 3);
 }
 
@@ -87,13 +73,7 @@ fn a_divergence_visible_later_continues_from_the_pruned_timeline_that_fits() {
     draw_bool(&mut tc);
     assert_eq!(draw_int(&mut tc), 1);
     assert!(!draw_bool(&mut tc));
-    assert_eq!(
-        tc.divergence(),
-        Some(Divergence {
-            stream: vec![],
-            position: 2
-        })
-    );
+    assert_eq!(tc.divergence(), Some(Divergence { stream: vec![], position: 2 }));
     assert_eq!(draw_int(&mut tc), 9);
 }
 
@@ -119,13 +99,7 @@ fn a_divergence_is_recorded_once() {
     draw_bool(&mut tc);
     draw_int(&mut tc);
     draw_int(&mut tc);
-    assert_eq!(
-        tc.divergence(),
-        Some(Divergence {
-            stream: vec![],
-            position: 1
-        })
-    );
+    assert_eq!(tc.divergence(), Some(Divergence { stream: vec![], position: 1 }));
 }
 
 #[test]
@@ -142,13 +116,7 @@ fn a_cloned_stream_prunes_for_its_parent() {
     assert_eq!(draw_int(&mut tc), 20);
     assert_eq!(tc.divergence(), None);
     draw_int(&mut child.lock());
-    assert_eq!(
-        tc.divergence(),
-        Some(Divergence {
-            stream: vec![0],
-            position: 2
-        })
-    );
+    assert_eq!(tc.divergence(), Some(Divergence { stream: vec![0], position: 2 }));
 }
 
 #[test]
@@ -162,20 +130,11 @@ fn a_timeline_without_a_clone_at_a_clone_position_leaves_the_live_set() {
 
 #[test]
 fn a_clone_position_no_live_timeline_has_diverges_and_donors_still_serve_the_child() {
-    let mut tc = replay(vec![
-        vec![int(1), int(2)],
-        vec![int(3), clone_of(vec![int(7)])],
-    ]);
+    let mut tc = replay(vec![vec![int(1), int(2)], vec![int(3), clone_of(vec![int(7)])]]);
     draw_int(&mut tc);
     assert_eq!(tc.live_timelines(), vec![true, false]);
     let child = tc.clone_stream().unwrap();
-    assert_eq!(
-        tc.divergence(),
-        Some(Divergence {
-            stream: vec![],
-            position: 1
-        })
-    );
+    assert_eq!(tc.divergence(), Some(Divergence { stream: vec![], position: 1 }));
     assert_eq!(draw_int(&mut child.lock()), 7);
 }
 
@@ -274,10 +233,7 @@ impl ExternalReplay for Scripted {
         self.frames.lock().push(frames.to_vec());
         let stored = self.values.get(self.seen.len() - 1)?.clone();
         if !fits(&stored) && self.divergence.is_none() {
-            self.divergence = Some(Divergence {
-                stream: stream.to_vec(),
-                position,
-            });
+            self.divergence = Some(Divergence { stream: stream.to_vec(), position });
         }
         Some(stored)
     }
@@ -293,12 +249,8 @@ impl ExternalReplay for Scripted {
 
 fn scripted_with_frames(values: Vec<ChoiceValue>) -> (NativeTestCase, Frames) {
     let frames = Arc::new(Mutex::new(Vec::new()));
-    let resolver = Scripted {
-        values,
-        seen: Vec::new(),
-        frames: Arc::clone(&frames),
-        divergence: None,
-    };
+    let resolver =
+        Scripted { values, seen: Vec::new(), frames: Arc::clone(&frames), divergence: None };
     let tc = NativeTestCase::for_external(Box::new(resolver), EngineRng::seeded(5), 8).unwrap();
     (tc, frames)
 }
@@ -346,13 +298,7 @@ fn an_external_resolver_serves_fitting_values_and_the_run_draws_past_it() {
 fn an_external_resolver_reports_its_own_divergence_and_a_misfit_draws_randomly() {
     let mut tc = scripted(vec![boolean(true), int(3)]);
     draw_int(&mut tc);
-    assert_eq!(
-        tc.divergence(),
-        Some(Divergence {
-            stream: vec![],
-            position: 0
-        })
-    );
+    assert_eq!(tc.divergence(), Some(Divergence { stream: vec![], position: 0 }));
     assert_eq!(draw_int(&mut tc), 3);
 }
 
@@ -369,10 +315,7 @@ fn a_cloned_stream_resolves_through_the_same_external_resolver() {
 fn plain_from_is_the_end_of_a_proposal_and_never_comes_otherwise() {
     assert_eq!(Replay::pun(vec![int(1), int(2)], None).plain_from(), 2);
     assert_eq!(Replay::pun(Vec::new(), None).plain_from(), 0);
-    assert_eq!(
-        Replay::counterexample(vec![vec![int(1)]]).plain_from(),
-        usize::MAX
-    );
+    assert_eq!(Replay::counterexample(vec![vec![int(1)]]).plain_from(), usize::MAX);
     assert_eq!(
         Replay::external(Box::new(Scripted {
             values: vec![int(1)],
@@ -383,10 +326,7 @@ fn plain_from_is_the_end_of_a_proposal_and_never_comes_otherwise() {
         .plain_from(),
         usize::MAX
     );
-    assert_eq!(
-        Replay::graph(Arc::new(Graph::new())).plain_from(),
-        usize::MAX
-    );
+    assert_eq!(Replay::graph(Arc::new(Graph::new())).plain_from(), usize::MAX);
 
     let pun = Replay::pun(vec![int(1), clone_of(vec![int(2), int(3), int(4)])], None);
     assert_eq!(pun.clone_child(&[], 1, Vec::new).plain_from(), 3);

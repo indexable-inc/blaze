@@ -20,9 +20,8 @@ use hegel::{TestCase, generators as gs};
 use parking_lot::Mutex;
 
 use super::{
-    AsId, Cancelled, Cause, Counts, Cycle, Database, DatabaseKeyIndex, Durability, Event,
-    FromIdIn, Hook, Id, Outcome, Provenance, ReadKind, Reads, Setter, Storage, attach,
-    capture_reads,
+    AsId, Cancelled, Cause, Counts, Cycle, Database, DatabaseKeyIndex, Durability, Event, FromIdIn,
+    Hook, Id, Outcome, Provenance, ReadKind, Reads, Setter, Storage, attach, capture_reads,
     input::field_node,
     owner_is,
     plumbing::{
@@ -510,9 +509,13 @@ fn a_walk_past_its_fuel_stops_naming_where_and_a_later_call_with_enough_ends() {
     let chain: Vec<Cell> = (0..64).map(|at| Cell::new(&db, at, 0)).collect();
     db.cells.lock().extend(chain.iter().map(|it| it.0));
     let top = chain[63];
-    assert_eq!(super::with_fuel(1 << 10, || *get::<Link>(&db, top)).map(|it| it.0), Ok((0..64).sum()));
+    assert_eq!(
+        super::with_fuel(1 << 10, || *get::<Link>(&db, top)).map(|it| it.0),
+        Ok((0..64).sum())
+    );
     chain[0].set_a(&mut db, 100);
-    let out = super::with_fuel(10, || *get::<Link>(&db, top)).expect_err("64 rows to run again on 10 steps");
+    let out = super::with_fuel(10, || *get::<Link>(&db, top))
+        .expect_err("64 rows to run again on 10 steps");
     assert_eq!((out.steps, out.query), (10, "Link"), "{out}");
     assert!((1..=64).contains(&out.depth), "{out}");
     assert!(out.to_string().contains("`Link`"), "{out}");
@@ -583,7 +586,8 @@ query!(Gate, u64, |db, key| key.b(db) / 1000);
 #[test]
 fn a_verify_reaching_a_pending_row_again_takes_its_answer_and_checks_each_row_once() {
     let mut db = TestDb::new();
-    let ladder: Vec<Cell> = (0..1 + 2 * LEVELS as u64).map(|at| Cell::new(&db, at % 3, 0)).collect();
+    let ladder: Vec<Cell> =
+        (0..1 + 2 * LEVELS as u64).map(|at| Cell::new(&db, at % 3, 0)).collect();
     let gate = Cell::new(&db, 0, 0);
     db.cells.lock().extend(ladder.iter().map(|it| it.0).chain([gate.0]));
     let head = ladder[0];
@@ -591,11 +595,15 @@ fn a_verify_reaching_a_pending_row_again_takes_its_answer_and_checks_each_row_on
     let runs = db.runs("Rung");
     // Every rung reads the gate, whose new `b` changes nothing: a deep verify of the cycle.
     gate.set_b(&mut db, 1);
-    let (value, spent) = super::with_fuel(1 << 30, || *get::<Rung>(&db, head)).expect("a bound far past it");
+    let (value, spent) =
+        super::with_fuel(1 << 30, || *get::<Rung>(&db, head)).expect("a bound far past it");
     assert_eq!(value, 2);
     assert_eq!(db.runs("Rung"), runs, "every rung was verified and none ran again");
     let rows = ladder.len() as u64 + 1;
-    assert!(spent <= 2 * rows, "each row brought up to date about once, not once a path: {spent} for {rows} rows");
+    assert!(
+        spent <= 2 * rows,
+        "each row brought up to date about once, not once a path: {spent} for {rows} rows"
+    );
 }
 
 /// How many times [`Endless`] reads its key's two fields: past any bound a test sets, and an
@@ -712,15 +720,25 @@ fn a_run_re_reading_its_rows_holds_each_about_once_and_its_counts_and_the_high_w
     counts_of("Rereader");
     counts_of("FewRows");
     let held = *get::<Rereader>(&db, cells[0]);
-    assert!(held <= 2 * wide, "{wide} rows read {PASSES} times held as {held} reads, not about {wide}");
+    assert!(
+        held <= 2 * wide,
+        "{wide} rows read {PASSES} times held as {held} reads, not about {wide}"
+    );
     let counts = counts_of("Rereader");
     assert_eq!(counts.executed, 1, "{counts:?}");
     assert_eq!((counts.reads_recorded, counts.reads_kept), (PASSES * wide, wide), "{counts:?}");
-    assert_eq!(counts.reads_most, 2 * wide, "at most twice its distinct reads at once, and it gets there: {counts:?}");
+    assert_eq!(
+        counts.reads_most,
+        2 * wide,
+        "at most twice its distinct reads at once, and it gets there: {counts:?}"
+    );
     let most = super::stack_high_water();
     assert!(most.run_reads >= wide, "{most:?}");
     let named = format!("`Rereader` of {:?}", cells[0]);
-    assert!(most.run.starts_with("`Rereader` of"), "the high-water mark names its run, {named}: {most:?}");
+    assert!(
+        most.run.starts_with("`Rereader` of"),
+        "the high-water mark names its run, {named}: {most:?}"
+    );
 
     // Two rows read 2^16 times each, on this thread whose stack `Rereader` grew past all
     // 2^17 of those reads: recorded far past kept, and still held on a small stack. A dedup
@@ -729,10 +747,18 @@ fn a_run_re_reading_its_rows_holds_each_about_once_and_its_counts_and_the_high_w
     assert!(warm >= 2 * FEW_PASSES, "the thread's stack is warm, {warm} entries");
     assert_eq!(*get::<FewRows>(&db, cells[1]), FEW_PASSES, "cell 1 is (1, 0)");
     let few = counts_of("FewRows");
-    assert_eq!((few.executed, few.reads_recorded, few.reads_kept), (1, 2 * FEW_PASSES, 2), "{few:?}");
+    assert_eq!(
+        (few.executed, few.reads_recorded, few.reads_kept),
+        (1, 2 * FEW_PASSES, 2),
+        "{few:?}"
+    );
     // A run holds at most `max(4096, 2 x kept)` at once (`local::next_dedup`): 4096 here, and
     // it does reach it.
-    assert_eq!(few.reads_most, 1 << 12, "two rows held at most 4096 at once on a warm thread: {few:?}");
+    assert_eq!(
+        few.reads_most,
+        1 << 12,
+        "two rows held at most 4096 at once on a warm thread: {few:?}"
+    );
 }
 
 /// Rows of [`Nest`] past its two heads and `y`: the chain `x`.
@@ -813,7 +839,8 @@ fn a_walks_steps_are_its_distinct_keys_and_past_its_bound_it_stops_naming_the_st
     let out = super::with_steps(10, || *get::<Stepper>(&db, top)).expect_err("64 steps on 10");
     assert_eq!((out.steps, out.at.as_str()), (10, "cell 53"), "{out}");
     assert!(super::local::with(|local| local.steps.is_none()), "the bound ended with its call");
-    let (value, taken) = super::with_steps(64, || *get::<Stepper>(&db, top)).expect("64 steps, each taken once");
+    let (value, taken) =
+        super::with_steps(64, || *get::<Stepper>(&db, top)).expect("64 steps, each taken once");
     assert_eq!((value, taken), ((0..64).sum(), 64));
     super::step(
         || unreachable!("outside a bound a step's key is never made"),
@@ -1949,7 +1976,10 @@ fn counts_of(query: &str) -> Counts {
         }
         None => taken.push((name, counts)),
     });
-    taken.iter().position(|it| it.0 == query).map_or_else(Counts::default, |at| taken.swap_remove(at).1)
+    taken
+        .iter()
+        .position(|it| it.0 == query)
+        .map_or_else(Counts::default, |at| taken.swap_remove(at).1)
 }
 
 /// What the three counted queries did since the last take.
@@ -1986,7 +2016,11 @@ fn each_run_verify_rerun_and_eviction_is_counted_per_query() {
     assert_eq!(evict_values_of::<CountedTens>(&mut db, &[cell]), 1);
     assert_eq!(*get::<CountedTens>(&db, cell), 1);
     let [tens, reader, _] = counted();
-    assert_eq!([did_runs(tens), did_runs(reader)], [(1, 0, 1, 1), (0, 0, 0, 0)], "run again in the view it ran in");
+    assert_eq!(
+        [did_runs(tens), did_runs(reader)],
+        [(1, 0, 1, 1), (0, 0, 0, 0)],
+        "run again in the view it ran in"
+    );
     assert_eq!((tens.dropped, tens.evicted), (1, 0), "an explicit drop, not a pass");
 
     cell.set_b(&mut db, 1);
@@ -2002,7 +2036,10 @@ fn each_run_verify_rerun_and_eviction_is_counted_per_query() {
 
     scan::<CountedCapped>(&mut db);
     let [_, _, capped] = counted();
-    assert_eq!(capped.evicted, 2, "three values over a budget of two, down to its low water: two go");
+    assert_eq!(
+        capped.evicted, 2,
+        "three values over a budget of two, down to its low water: two go"
+    );
     assert_eq!((capped.evicted_asked, capped.dropped), (0, 0));
 }
 
@@ -2085,7 +2122,10 @@ fn the_budget_holds_and_a_key_asked_for_in_every_view_is_never_let_go() {
         }
         db.storage_mut().synthetic_write(Durability::LOW);
         let held = values_held(&db, "Scanned");
-        assert!(held * WEIGHT as u64 <= BUDGET, "{held} values of {WEIGHT} bytes over a budget of {BUDGET}");
+        assert!(
+            held * WEIGHT as u64 <= BUDGET,
+            "{held} values of {WEIGHT} bytes over a budget of {BUDGET}"
+        );
     }
     assert_eq!(db.runs_of("Scanned", hot.as_id()), 1, "the hot key ran once: never let go");
     assert_eq!(db.runs("Scanned"), 1 + 270, "each key ran once: none was asked for after it went");
@@ -2210,12 +2250,24 @@ fn the_memory_report_counts_a_function_s_rows_in_use_apart_from_its_rows_made() 
         *usage.iter().find(|it| it.name == "Capped").expect("a row for `Capped`")
     };
     let usage = capped(&db);
-    assert_eq!((usage.rows, usage.used), (1024, 2), "one page made for the cells' ID page, two keys run");
-    assert_eq!(usage.value_bytes, 2 * WEIGHT as u64, "two values weighed, their `u64`s in place in the rows");
+    assert_eq!(
+        (usage.rows, usage.used),
+        (1024, 2),
+        "one page made for the cells' ID page, two keys run"
+    );
+    assert_eq!(
+        usage.value_bytes,
+        2 * WEIGHT as u64,
+        "two values weighed, their `u64`s in place in the rows"
+    );
     assert_eq!(usage.held(), usage.row_bytes + 2 * WEIGHT as u64);
     assert_eq!(evict_values::<Capped>(&mut db), 2);
     let usage = capped(&db);
-    assert_eq!((usage.rows, usage.used, usage.value_bytes), (1024, 2, 0), "values gone, memos kept");
+    assert_eq!(
+        (usage.rows, usage.used, usage.value_bytes),
+        (1024, 2, 0),
+        "values gone, memos kept"
+    );
 }
 
 /// A sweep between views (a build's release mid-build) holds each tag's values under the least
@@ -2277,7 +2329,11 @@ fn a_view_reads_no_value_under_the_budget_and_a_pass_only_those_held() {
     }
     db.storage_mut().synthetic_write(Durability::LOW);
     assert_eq!(values_held(&db, "Capped"), 1);
-    assert_eq!(db.storage().swept(), 1000, "the pass over the view that made them: each value once");
+    assert_eq!(
+        db.storage().swept(),
+        1000,
+        "the pass over the view that made them: each value once"
+    );
     db.storage_mut().synthetic_write(Durability::LOW);
     assert_eq!(db.storage().swept(), 0, "a view under the budget reads no value");
     let late = Cell::new(&db, 1000, 0);
@@ -2447,7 +2503,8 @@ fn attach_lends_the_storage_to_its_closure() {
 fn a_loops_tasks_have_their_callers_database_attached() {
     let db = TestDb::new();
     let addr = |db: Option<&TestDb>| db.map(|it| std::ptr::from_ref(it).addr());
-    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(4), false).unwrap();
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(4), false).unwrap();
     let task = |_| {
         // Long enough that the other workers take some of the tasks.
         blaze_graph::spin::busy(std::time::Duration::from_micros(300));
@@ -2455,7 +2512,8 @@ fn a_loops_tasks_have_their_callers_database_attached() {
     };
     let mine = Some(std::ptr::from_ref(&db).addr());
     let attached = pool.install(|| attach(&db, || super::par_map(64, task)));
-    let threads: std::collections::BTreeSet<String> = attached.iter().map(|it| format!("{:?}", it.1)).collect();
+    let threads: std::collections::BTreeSet<String> =
+        attached.iter().map(|it| format!("{:?}", it.1)).collect();
     assert!(threads.len() > 1, "the tasks ran on one thread: {threads:?}");
     assert!(attached.iter().all(|it| it.0 == mine), "{attached:?}");
     let detached = pool.install(|| super::par_map(64, task));
@@ -2473,7 +2531,9 @@ fn attach_lends_the_database_as_its_own_type_and_restores_the_one_before() {
     attach(&outer, || {
         assert_eq!(with_attached_db(addr), Some(std::ptr::from_ref(&outer).addr()));
         assert!(with_attached_db(|it: Option<&Wrong>| it.is_none()), "lent only as a `TestDb`");
-        attach(&inner, || assert_eq!(with_attached_db(addr), Some(std::ptr::from_ref(&inner).addr())));
+        attach(&inner, || {
+            assert_eq!(with_attached_db(addr), Some(std::ptr::from_ref(&inner).addr()))
+        });
         assert_eq!(with_attached_db(addr), Some(std::ptr::from_ref(&outer).addr()));
     });
     assert_eq!(with_attached_db(addr), None);
@@ -2518,7 +2578,10 @@ fn a_rerun_s_replaced_edges_are_freed_at_a_later_view_and_live_spans_survive_the
         // A view frees the dead once they outnumber the live edges and the nodes; this
         // view's rerun adds one span more.
         let nodes = u64::from(db.storage().nodes_made());
-        assert!(dead <= live.max(nodes) + 128, "round {round}: {dead} dead edges kept beside {live} live");
+        assert!(
+            dead <= live.max(nodes) + 128,
+            "round {round}: {dead} dead edges kept beside {live} live"
+        );
         settled += u64::from(dead < before);
         before = dead;
     }
@@ -2610,12 +2673,20 @@ fn nested_captures_hold_each_read_once_not_once_per_level() {
         read.push(it.key.key_index());
         ControlFlow::Continue(())
     });
-    assert_eq!(read, cells.iter().map(|it| it.0).collect::<Vec<_>>(), "every level's read, outermost first");
+    assert_eq!(
+        read,
+        cells.iter().map(|it| it.0).collect::<Vec<_>>(),
+        "every level's read, outermost first"
+    );
     assert_eq!(*get::<Replay>(&db, key), sum + 1);
     let last = DEPTH as u64 - 1;
     cells[DEPTH - 1].set_a(&mut db, 1000);
     assert_eq!(*get::<Nested>(&db, key), sum - last + 1000);
-    assert_eq!(*get::<Replay>(&db, key), sum - last + 1001, "the innermost read reaches the replaying query");
+    assert_eq!(
+        *get::<Replay>(&db, key),
+        sum - last + 1001,
+        "the innermost read reaches the replaying query"
+    );
     assert_eq!(db.runs("Replay"), 2);
 }
 
@@ -2631,7 +2702,8 @@ fn a_view_s_captured_reads_are_freed_when_the_next_view_opens() {
     assert_eq!(db.storage().edge_counts().2, 0, "the last view's capture is freed");
     let mut usage = Vec::new();
     db.storage().memory_usage(&mut usage);
-    let captured = usage.iter().find(|it| it.name == "captured reads").expect("a row for captured reads");
+    let captured =
+        usage.iter().find(|it| it.name == "captured reads").expect("a row for captured reads");
     assert_eq!((captured.rows, captured.row_bytes), (0, 0), "its pages given back");
     cell.set_a(&mut db, 4);
     assert_eq!(*get::<Capture>(&db, cell), 4);
@@ -2647,7 +2719,9 @@ fn the_memory_report_has_the_dependency_graph_s_columns() {
     assert_eq!(*get::<Label>(&db, cell), 11);
     let mut usage = Vec::new();
     db.storage().memory_usage(&mut usage);
-    let row = |name: &str| *usage.iter().find(|it| it.name == name).unwrap_or_else(|| panic!("no row {name}"));
+    let row = |name: &str| {
+        *usage.iter().find(|it| it.name == name).unwrap_or_else(|| panic!("no row {name}"))
+    };
     let edges = row("dependency edges");
     assert_eq!(edges.rows, 2, "`Label` reads `Parity`, `Parity` reads `a`");
     assert!(edges.row_bytes >= 8, "{edges:?}");

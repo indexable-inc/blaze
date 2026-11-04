@@ -15,11 +15,7 @@ use crate::native::shrinker::{ShrinkRun, Shrinker};
 
 fn int_node(value: i128) -> ChoiceNode {
     ChoiceNode::integer(
-        IntegerChoice::new(
-            BigInt::from(i128::MIN + 1),
-            BigInt::from(i128::MAX),
-            BigInt::from(0),
-        ),
+        IntegerChoice::new(BigInt::from(i128::MIN + 1), BigInt::from(i128::MAX), BigInt::from(0)),
         BigInt::from(value),
         false,
     )
@@ -152,10 +148,7 @@ fn lower_integers_together_survives_accepted_same_length_kind_pun() {
         Spans::new(),
     );
     drive_no_yield(shrinker.lower_integers_together()).unwrap();
-    assert!(matches!(
-        shrinker.current_nodes[0].value(),
-        ChoiceValue::Boolean(false)
-    ));
+    assert!(matches!(shrinker.current_nodes[0].value(), ChoiceValue::Boolean(false)));
 }
 
 #[test]
@@ -233,8 +226,5 @@ fn try_shortening_via_increment_skips_a_node_punned_mid_candidates() {
         Spans::new(),
     );
     drive_no_yield(shrinker.try_shortening_via_increment()).unwrap();
-    assert!(matches!(
-        shrinker.current_nodes[0].data,
-        ChoiceData::Boolean(_, false)
-    ));
+    assert!(matches!(shrinker.current_nodes[0].data, ChoiceData::Boolean(_, false)));
 }

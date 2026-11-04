@@ -110,8 +110,9 @@ fn run(args: &[OsString]) -> anyhow::Result<Outcome> {
 /// The standard library the daemon builds against: where blaze found it, checked to be the
 /// release's.
 fn found_library() -> anyhow::Result<probe::Library> {
-    let found = blaze_cargo::toolchain::library::found()
-        .map_err(|why| anyhow!("blaze's standard library, which a probe is checked against: {why}"))?;
+    let found = blaze_cargo::toolchain::library::found().map_err(|why| {
+        anyhow!("blaze's standard library, which a probe is checked against: {why}")
+    })?;
     probe::Library::at(found.dir.clone())
 }
 
@@ -123,13 +124,20 @@ fn answer(
     library: impl FnOnce() -> anyhow::Result<probe::Library>,
 ) -> anyhow::Result<Outcome> {
     if blaze_cargo::answers::is_question(args) {
-        let answer = blaze_cargo::answers::ours_told(args, stdin).context("blaze has no answer to this question")?;
+        let answer = blaze_cargo::answers::ours_told(args, stdin)
+            .context("blaze has no answer to this question")?;
         return Ok(Outcome { code: 0, stdout: answer.stdout, stderr: answer.stderr });
     }
-    let args: Vec<&str> = args.iter().map(|it| it.to_str()).collect::<Option<_>>().context("an argument that is not text")?;
+    let args: Vec<&str> = args
+        .iter()
+        .map(|it| it.to_str())
+        .collect::<Option<_>>()
+        .context("an argument that is not text")?;
     let probe = Probe::of(&args)?;
     if std::env::var_os("RUSTC_BOOTSTRAP").is_some_and(|it| it == "-1") {
-        bail!("blaze's rustc is a nightly, and `RUSTC_BOOTSTRAP=-1` asks for a stable one, which blaze does not check as");
+        bail!(
+            "blaze's rustc is a nightly, and `RUSTC_BOOTSTRAP=-1` asks for a stable one, which blaze does not check as"
+        );
     }
     let library = library()?;
     probe.answer(&args, stdin, &library)
@@ -217,7 +225,9 @@ impl<'a> Probe<'a> {
                 "--crate-type" => {
                     for kind in value()?.split(',') {
                         if !matches!(kind, "lib" | "rlib") {
-                            return Err(Refused::NotALibrary { crate_type: Some(kind.to_owned()) }.into());
+                            return Err(
+                                Refused::NotALibrary { crate_type: Some(kind.to_owned()) }.into()
+                            );
                         }
                     }
                     library = true;
@@ -291,38 +301,55 @@ impl<'a> Probe<'a> {
         style.ansi = match self.color {
             None | Some("auto" | "never") => false,
             Some("always") => true,
-            Some(other) => bail!("argument for `--color` must be auto, always or never (instead was `{other}`)"),
+            Some(other) => bail!(
+                "argument for `--color` must be auto, always or never (instead was `{other}`)"
+            ),
         };
         if let Some(width) = self.width {
-            style.width = width.parse().with_context(|| format!("`--diagnostic-width={width}` is not a number"))?;
+            style.width = width
+                .parse()
+                .with_context(|| format!("`--diagnostic-width={width}` is not a number"))?;
         }
         Ok((style, json))
     }
 
     /// The probe checked with blaze's front end over `library`, all of rustc's `args` read for
     /// its lints: what rustc would end with, the files asked for written when it compiles.
-    fn answer(&self, args: &[&str], stdin: &[u8], library: &probe::Library) -> anyhow::Result<Outcome> {
+    fn answer(
+        &self,
+        args: &[&str],
+        stdin: &[u8],
+        library: &probe::Library,
+    ) -> anyhow::Result<Outcome> {
         let name = self.name()?;
-        let host = blaze_cargo::toolchain::host().context("blaze knows no target triple of this machine")?;
+        let host = blaze_cargo::toolchain::host()
+            .context("blaze knows no target triple of this machine")?;
         let triple = self.target.unwrap_or(host);
         if triple.ends_with(".json") {
-            bail!("blaze checks a probe for the targets it knows, and `--target {triple}` is a file of its own");
+            bail!(
+                "blaze checks a probe for the targets it knows, and `--target {triple}` is a file of its own"
+            );
         }
         // The cfgs the crate is checked with are those rustc would print for the same flags.
         let flags: Vec<String> = self.cfg_flags.iter().map(|it| (*it).to_owned()).collect();
         let mut cfg_args = target::CfgArgs::from_flags(&flags).map_err(anyhow::Error::msg)?;
         if cfg_args.target_cpu.as_deref() == Some("native") {
-            cfg_args.host_cpu = hir_ty_codegen::host_cpu().map(|(name, features)| target::HostCpu {
-                arch: target::arch(host).to_owned(),
-                name,
-                features,
+            cfg_args.host_cpu = hir_ty_codegen::host_cpu().map(|(name, features)| {
+                target::HostCpu { arch: target::arch(host).to_owned(), name, features }
             });
         }
-        let cfgs = target::target_cfg(triple, &cfg_args)
-            .map_err(|why| anyhow!("blaze can't tell the cfgs rustc would check the crate with: {why}"))?;
+        let cfgs = target::target_cfg(triple, &cfg_args).map_err(|why| {
+            anyhow!("blaze can't tell the cfgs rustc would check the crate with: {why}")
+        })?;
         let (shown, source) = match self.input.context("no input filename given")? {
-            "-" => ("<anon>", String::from_utf8(stdin.to_vec()).context("the probe on standard input is not UTF-8")?),
-            file => (file, std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?),
+            "-" => (
+                "<anon>",
+                String::from_utf8(stdin.to_vec())
+                    .context("the probe on standard input is not UTF-8")?,
+            ),
+            file => {
+                (file, std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?)
+            }
         };
         let (style, json) = self.style()?;
         let all: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();

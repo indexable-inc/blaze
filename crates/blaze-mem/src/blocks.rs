@@ -372,7 +372,8 @@ impl Class {
     /// Counts `blocks` more (or fewer) on the `free` stack: on the thread until they reach the
     /// class's `gather`, then on the class's line.
     fn gather(&self, free: Free, blocks: i32) {
-        let full = tag::gathered(|gathered| self.gather_in(gathered, free, blocks)).unwrap_or(blocks);
+        let full =
+            tag::gathered(|gathered| self.gather_in(gathered, free, blocks)).unwrap_or(blocks);
         if full != 0 {
             self.fold(free, full, true);
         }
@@ -429,7 +430,9 @@ impl Class {
                     let trimmed = self.trim();
                     if !trimmed.busy {
                         self.counts.trims.fetch_add(1, Ordering::Relaxed);
-                        self.counts.given_back.fetch_add(trimmed.given_back as u64, Ordering::Relaxed);
+                        self.counts
+                            .given_back
+                            .fetch_add(trimmed.given_back as u64, Ordering::Relaxed);
                     }
                 }
             }
@@ -651,7 +654,8 @@ fn class_of(bytes: usize, align: usize, tag: Tag) -> Result<usize, MemError> {
 fn class(index: usize) -> Result<&'static Class, MemError> {
     let class = CLASS[index].get_or_init(|| {
         // alloc: once, when a class cannot be reserved
-        Class::new(class_size(index), CLASS_BYTES, Some(index), Tag::Chunks).map_err(|error| error.to_string())
+        Class::new(class_size(index), CLASS_BYTES, Some(index), Tag::Chunks)
+            .map_err(|error| error.to_string())
     });
     match class {
         Ok(class) => Ok(class),
@@ -732,10 +736,16 @@ unsafe impl<T: Sync> Sync for Slice<T> {}
 
 impl<T> Slice<T> {
     /// `len` values, the one at `at` made by `make(at)`, counted to `tag`.
-    pub fn new_with(len: usize, tag: Tag, mut make: impl FnMut(usize) -> T) -> Result<Slice<T>, MemError> {
-        let bytes = len
-            .checked_mul(mem::size_of::<T>())
-            .ok_or(MemError::TooLarge { tag, what: "a block's values", wanted: len })?;
+    pub fn new_with(
+        len: usize,
+        tag: Tag,
+        mut make: impl FnMut(usize) -> T,
+    ) -> Result<Slice<T>, MemError> {
+        let bytes = len.checked_mul(mem::size_of::<T>()).ok_or(MemError::TooLarge {
+            tag,
+            what: "a block's values",
+            wanted: len,
+        })?;
         let block = take(bytes, mem::align_of::<T>(), Fill::Any, tag)?;
         let first = block.as_ptr().cast::<T>();
         let mut slice = Slice { block, len: 0, _owns: PhantomData };
@@ -770,7 +780,9 @@ impl<T> Drop for Slice<T> {
     fn drop(&mut self) {
         // SAFETY: the first `len` places are values no one else drops; the block, given back
         // after this, is not read again by this slice.
-        unsafe { std::ptr::slice_from_raw_parts_mut(self.first().as_ptr(), self.len).drop_in_place() };
+        unsafe {
+            std::ptr::slice_from_raw_parts_mut(self.first().as_ptr(), self.len).drop_in_place()
+        };
     }
 }
 
@@ -835,11 +847,17 @@ impl Kept {
 // unreserved), so a block stays valid until given back, and any `Kept` (a copy) may give back
 // what another took. Zero-size layouts are a dangling, aligned pointer, never given back.
 unsafe impl std::alloc::Allocator for Kept {
-    fn allocate(&self, layout: std::alloc::Layout) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
+    fn allocate(
+        &self,
+        layout: std::alloc::Layout,
+    ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
         self.made(layout, Fill::Any)
     }
 
-    fn allocate_zeroed(&self, layout: std::alloc::Layout) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
+    fn allocate_zeroed(
+        &self,
+        layout: std::alloc::Layout,
+    ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
         self.made(layout, Fill::Zeroed)
     }
 
@@ -852,8 +870,10 @@ unsafe impl std::alloc::Allocator for Kept {
         let size = class.size();
         // The tag's freed bytes and the class's warm blocks, gathered in one thread-local
         // access; a thread being torn down has nothing gathered left: straight to the lines.
-        let (freed, fold) = tag::gathered(|gathered| (gathered.freed(self.0, size), class.gather_in(gathered, Free::Warm, warm)))
-            .unwrap_or((size, warm));
+        let (freed, fold) = tag::gathered(|gathered| {
+            (gathered.freed(self.0, size), class.gather_in(gathered, Free::Warm, warm))
+        })
+        .unwrap_or((size, warm));
         // A tag's line is never less than its live values hold: a value's bytes come off it
         // once they are freed, here or at the thread's fold.
         tag::sub(self.0, freed);
@@ -900,7 +920,11 @@ unsafe impl std::alloc::Allocator for Kept {
 unsafe impl std::alloc::AllocatorClone for Kept {}
 
 impl Kept {
-    fn made(self, layout: std::alloc::Layout, fill: Fill) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
+    fn made(
+        self,
+        layout: std::alloc::Layout,
+        fill: Fill,
+    ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
         if layout.size() == 0 {
             // A dangling pointer aligned to `layout`: the contract's zero-size block.
             let at = NonNull::<u8>::without_provenance(
@@ -914,9 +938,10 @@ impl Kept {
         tag::add(self.0, size);
         // The tag's allocated bytes and the class's warm blocks, gathered in one thread-local
         // access, so a kept value's allocation writes no shared line but the tag's live bytes.
-        let (allocated, fold) =
-            tag::gathered(|gathered| (gathered.allocated(self.0, size as u64), class.gather_in(gathered, Free::Warm, warm)))
-                .unwrap_or((size as u64, warm));
+        let (allocated, fold) = tag::gathered(|gathered| {
+            (gathered.allocated(self.0, size as u64), class.gather_in(gathered, Free::Warm, warm))
+        })
+        .unwrap_or((size as u64, warm));
         tag::add_allocated(self.0, allocated);
         if fold != 0 {
             class.fold(Free::Warm, fold, true);
@@ -954,7 +979,13 @@ impl Kept {
         // SAFETY: `ptr` holds `old.size()` bytes (the caller's contract) and the new block at
         // least `new.size()`, in another block (this one is the caller's until given back
         // below), so the ranges do not overlap.
-        unsafe { std::ptr::copy_nonoverlapping(ptr.as_ptr(), made.cast::<u8>().as_ptr(), old.size().min(new.size())) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ptr.as_ptr(),
+                made.cast::<u8>().as_ptr(),
+                old.size().min(new.size()),
+            )
+        };
         // SAFETY: `ptr` is a block of `old`, given back once; the caller does not use it again.
         unsafe { std::alloc::Allocator::deallocate(&self, ptr, old) };
         Ok(made)

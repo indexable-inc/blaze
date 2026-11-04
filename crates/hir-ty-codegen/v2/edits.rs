@@ -52,7 +52,9 @@ use blaze_v2_proof::{Apart, Stale, Trace, TraceBuilder, apart, kernel, over, und
 use hegel::{Hegel, Settings, TestCase, generators as gs};
 use hir_expand::fixture;
 
-use crate::v2::{Backends, BuildTime, Databases, HashSource, HirFrontend, ItemHashes, RootKind, Runs};
+use crate::v2::{
+    Backends, BuildTime, Databases, HashSource, HirFrontend, ItemHashes, RootKind, Runs,
+};
 use db::TestDB;
 
 /// The width of one field of the fixture's struct.
@@ -96,7 +98,6 @@ enum Edit {
     /// to the stack (rule 18: `boxed`'s key covers the impl).
     ToggleDrop,
 }
-
 
 /// What the fixture's source is rendered from.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -233,10 +234,16 @@ impl Model {
 fn edit(tc: &TestCase) -> Edit {
     match tc.draw(gs::integers::<u8>().max_value(7)) {
         0 => Edit::AddField(tc.draw(gs::sampled_from(vec![Width::U8, Width::U32, Width::U64]))),
-        1 => Edit::ChangeConst(tc.draw(gs::integers().max_value(1)), tc.draw(gs::integers::<u32>().max_value(99))),
+        1 => Edit::ChangeConst(
+            tc.draw(gs::integers().max_value(1)),
+            tc.draw(gs::integers::<u32>().max_value(99)),
+        ),
         2 => Edit::ChangeInlined(tc.draw(gs::integers::<u32>().max_value(99))),
         3 => Edit::FlipCfg,
-        4 => Edit::Reorder(tc.draw(gs::integers().max_value(ITEMS - 1)), tc.draw(gs::integers().max_value(ITEMS - 1))),
+        4 => Edit::Reorder(
+            tc.draw(gs::integers().max_value(ITEMS - 1)),
+            tc.draw(gs::integers().max_value(ITEMS - 1)),
+        ),
         5 => Edit::Reformat(tc.draw(gs::integers::<u8>().max_value(2))),
         6 => Edit::EditComment(tc.draw(gs::integers::<u32>().max_value(99))),
         _ => Edit::ToggleDrop,
@@ -257,14 +264,16 @@ impl Lookup for Kept {
 /// nothing built runs), set up once a process, allocations moving to the stack where
 /// `heap_to_stack` says.
 fn policy(heap_to_stack: bool) -> Policy {
-    static TOOLCHAIN: std::sync::OnceLock<blaze_codegen::settings::Toolchain> = std::sync::OnceLock::new();
+    static TOOLCHAIN: std::sync::OnceLock<blaze_codegen::settings::Toolchain> =
+        std::sync::OnceLock::new();
     let toolchain = TOOLCHAIN.get_or_init(|| {
         let target = crate::Target::for_fixtures().triple();
         // The fixture's own code generator: nothing it makes is kept past the process.
-        let code = crate::v2::CodegenCode(blaze_ids::ContentId::of("blaze v2 edits fixture code", b""));
+        let code =
+            crate::v2::CodegenCode(blaze_ids::ContentId::of("blaze v2 edits fixture code", b""));
         let target_data = crate::v2::toolchain::fixture_target_data(target);
-        let toolchain =
-            crate::v2::toolchain_for(&code, target, &target_data, &[], Runs::Elsewhere).expect("the fixture's toolchain");
+        let toolchain = crate::v2::toolchain_for(&code, target, &target_data, &[], Runs::Elsewhere)
+            .expect("the fixture's toolchain");
         crate::v2::select(&toolchain).expect("the fixture's code generator");
         toolchain
     });
@@ -304,7 +313,8 @@ fn build(
     // Named by path, so two databases of one text give one key ([`HashSource::ById`] would not).
     let hashes = ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned())));
     let build_time = BuildTime::default();
-    let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), build_time).with_policy(&policy);
+    let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), build_time)
+        .with_policy(&policy);
     let krate = fixture::test_crate(db);
     let roots = frontend.roots(krate, RootKind::Library).map_err(|it| it.what)?;
     let origin = frontend.with(|hir| frontend.origin(hir, krate));
@@ -328,13 +338,21 @@ fn traced(built: &Built, store: &Kept) -> (Trace, BTreeMap<QueryKey, InstanceKey
         let bytes = if *hit {
             store.0.get(key).map(Vec::as_slice)
         } else {
-            built.puts.binary_search_by(|it| it.key.cmp(key)).ok().map(|at| built.puts[at].bytes.as_slice())
+            built
+                .puts
+                .binary_search_by(|it| it.key.cmp(key))
+                .ok()
+                .map(|at| built.puts[at].bytes.as_slice())
         };
         let Some(bytes) = bytes else {
             let whence = if *hit { "the store has" } else { "the build put" };
-            panic!("the kernel entry {key:?} of instance {instance:?} was {} and {whence} no bytes under it", if *hit { "a hit" } else { "made" });
+            panic!(
+                "the kernel entry {key:?} of instance {instance:?} was {} and {whence} no bytes under it",
+                if *hit { "a hit" } else { "made" }
+            );
         };
-        kernel::record(&mut trace, row, kernel::value(bytes), [], *hit).unwrap_or_else(|why| panic!("{why}"));
+        kernel::record(&mut trace, row, kernel::value(bytes), [], *hit)
+            .unwrap_or_else(|why| panic!("{why}"));
         rows.insert(row, *instance);
     }
     (trace.finish(), rows)
@@ -355,8 +373,12 @@ fn each_apart<K: Ord + Clone + std::fmt::Debug, V: PartialEq + Clone + std::fmt:
 ) {
     for it in apart(incremental, clean) {
         out.push(match it {
-            Apart::OnlyFirst { key, value } => format!("{what} of {}: only incremental, {value:?}", name(&key)),
-            Apart::OnlySecond { key, value } => format!("{what} of {}: only clean, {value:?}", name(&key)),
+            Apart::OnlyFirst { key, value } => {
+                format!("{what} of {}: only incremental, {value:?}", name(&key))
+            }
+            Apart::OnlySecond { key, value } => {
+                format!("{what} of {}: only clean, {value:?}", name(&key))
+            }
             Apart::Differ { key, first, second } => {
                 format!("{what} of {}: {first:?} incremental, {second:?} clean", name(&key))
             }
@@ -375,16 +397,29 @@ fn verdict(
 ) -> Vec<String> {
     let (inc, inc_trace, inc_rows) = incremental;
     let (cl, cl_trace, cl_rows) = clean;
-    let names: BTreeMap<InstanceKey, &str> =
-        cl.debug_names.iter().chain(&inc.debug_names).map(|(key, name)| (*key, name.as_str())).collect();
-    let function = |key: &InstanceKey| format!("`{}` ({key:?})", names.get(key).copied().unwrap_or("?"));
+    let names: BTreeMap<InstanceKey, &str> = cl
+        .debug_names
+        .iter()
+        .chain(&inc.debug_names)
+        .map(|(key, name)| (*key, name.as_str()))
+        .collect();
+    let function =
+        |key: &InstanceKey| format!("`{}` ({key:?})", names.get(key).copied().unwrap_or("?"));
     let entry = |row: &QueryKey| match cl_rows.get(row).or_else(|| inc_rows.get(row)) {
-        Some(instance) => format!("the kernel entry {:?} of {}", Key(row.input), function(instance)),
+        Some(instance) => {
+            format!("the kernel entry {:?} of {}", Key(row.input), function(instance))
+        }
         None => format!("the kernel row {row:?}"),
     };
     let mut out = Vec::new();
 
-    each_apart("the codegen input", &map(inc.inputs.iter().copied()), &map(cl.inputs.iter().copied()), &function, &mut out);
+    each_apart(
+        "the codegen input",
+        &map(inc.inputs.iter().copied()),
+        &map(cl.inputs.iter().copied()),
+        &function,
+        &mut out,
+    );
     let keyed = |built: &Built| map(built.kernel.iter().map(|it| (it.instance, it.key)));
     for it in apart(&keyed(inc), &keyed(cl)) {
         if let Apart::Differ { key, first, second } = it {
@@ -431,19 +466,47 @@ fn verdict(
         });
     }
     let debug = |key: &dyn std::fmt::Debug| format!("{key:?}");
-    fn statics(built: &Built) -> BTreeMap<(blaze_items::ItemKey, blaze_ids::ContentId), &blaze_codegen::Static> {
+    fn statics(
+        built: &Built,
+    ) -> BTreeMap<(blaze_items::ItemKey, blaze_ids::ContentId), &blaze_codegen::Static> {
         map(built.statics.iter().map(|it| ((it.item, it.instance), it)))
     }
     each_apart("the static", &statics(inc), &statics(cl), &|key| debug(key), &mut out);
     let set = |keys: &[InstanceKey]| map(keys.iter().map(|it| (*it, ())));
     each_apart("the root", &set(&inc.roots), &set(&cl.roots), &function, &mut out);
-    each_apart("the patchable slot", &set(&inc.patchable), &set(&cl.patchable), &function, &mut out);
-    each_apart("the symbol", &map(inc.symbols.iter().cloned()), &map(cl.symbols.iter().cloned()), &function, &mut out);
-    let static_symbols = |built: &Built| map(built.static_symbols.iter().map(|(item, id, name)| ((*item, *id), name.clone())));
-    each_apart("the static symbol", &static_symbols(inc), &static_symbols(cl), &|key| debug(key), &mut out);
+    each_apart(
+        "the patchable slot",
+        &set(&inc.patchable),
+        &set(&cl.patchable),
+        &function,
+        &mut out,
+    );
+    each_apart(
+        "the symbol",
+        &map(inc.symbols.iter().cloned()),
+        &map(cl.symbols.iter().cloned()),
+        &function,
+        &mut out,
+    );
+    let static_symbols = |built: &Built| {
+        map(built.static_symbols.iter().map(|(item, id, name)| ((*item, *id), name.clone())))
+    };
+    each_apart(
+        "the static symbol",
+        &static_symbols(inc),
+        &static_symbols(cl),
+        &|key| debug(key),
+        &mut out,
+    );
     let items = |built: &Built| map(built.items.iter().map(|it| (*it, ())));
     each_apart("the item", &items(inc), &items(cl), &|key| debug(key), &mut out);
-    each_apart("the debug name", &map(inc.debug_names.iter().cloned()), &map(cl.debug_names.iter().cloned()), &function, &mut out);
+    each_apart(
+        "the debug name",
+        &map(inc.debug_names.iter().cloned()),
+        &map(cl.debug_names.iter().cloned()),
+        &function,
+        &mut out,
+    );
     let digests = |built: &Built| map(built.digests.functions.iter().copied());
     each_apart("the function digest", &digests(inc), &digests(cl), &function, &mut out);
     let digests = |built: &Built| map(built.digests.statics.iter().copied());
@@ -473,16 +536,32 @@ fn replay(edits: &[Edit], heap_to_stack: bool) {
         // build of the same bytes, whatever the fixture's parser does to its text.
         let (mut fresh, fresh_file) = database(&text);
         fresh.set_file_text(fresh_file, &body);
-        let clean = build(&fresh, &Memo::new(), &Kept::default(), blaze_store_check::Setting::OFF, heap_to_stack);
+        let clean = build(
+            &fresh,
+            &Memo::new(),
+            &Kept::default(),
+            blaze_store_check::Setting::OFF,
+            heap_to_stack,
+        );
         let (incremental, clean) = match (incremental, clean) {
             (Ok(a), Ok(b)) => (a, b),
-            (Err(why), Ok(_)) => panic!("after edits {:?}, the incremental build failed and the clean built: {why}\n{text}", &edits[..=n]),
-            (Ok(_), Err(why)) => panic!("after edits {:?}, the clean build failed and the incremental built: {why}\n{text}", &edits[..=n]),
-            (Err(a), Err(b)) => panic!("the fixture after {:?} builds neither way:\nincremental: {a}\nclean: {b}\n{text}", &edits[..=n]),
+            (Err(why), Ok(_)) => panic!(
+                "after edits {:?}, the incremental build failed and the clean built: {why}\n{text}",
+                &edits[..=n]
+            ),
+            (Ok(_), Err(why)) => panic!(
+                "after edits {:?}, the clean build failed and the incremental built: {why}\n{text}",
+                &edits[..=n]
+            ),
+            (Err(a), Err(b)) => panic!(
+                "the fixture after {:?} builds neither way:\nincremental: {a}\nclean: {b}\n{text}",
+                &edits[..=n]
+            ),
         };
         let (inc_trace, inc_rows) = traced(&incremental, &store);
         let (cl_trace, cl_rows) = traced(&clean, &Kept::default());
-        let found = verdict(&before, (&incremental, &inc_trace, &inc_rows), (&clean, &cl_trace, &cl_rows));
+        let found =
+            verdict(&before, (&incremental, &inc_trace, &inc_rows), (&clean, &cl_trace, &cl_rows));
         if !found.is_empty() {
             panic!(
                 "after edits {:?}, the incremental build is not the clean one ({} findings):\n- {}\n{text}",
@@ -517,7 +596,8 @@ fn incremental_is_clean(tc: &TestCase) {
 
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
 fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
+    let cases =
+        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
     Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 

@@ -29,9 +29,9 @@ use std::sync::Arc;
 use base_db::{Crate, Db};
 use blaze_format::cursor::{Put, Reader};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use hir_expand::{HirFileId, MacroCallId, MacroDefKind, proc_macro::ExpansionReads};
+use std::alloc::Global;
 
 use crate::{
     Lookup,
@@ -79,7 +79,10 @@ pub struct Reads {
 
 impl Reads {
     pub fn is_empty(&self) -> bool {
-        self.env.is_empty() && self.macros.is_empty() && self.deps.is_empty() && self.primary.is_empty()
+        self.env.is_empty()
+            && self.macros.is_empty()
+            && self.deps.is_empty()
+            && self.primary.is_empty()
     }
 
     /// The crates that read `CARGO_PRIMARY_PACKAGE` ([`Reads::primary`]), by their index in the
@@ -93,7 +96,8 @@ impl Reads {
     /// sorted; then its dependencies' expansions' ([`Reads::deps`]), what a rule for public
     /// keys looks at too.
     pub fn names(&self) -> (&[Box<str>], impl Iterator<Item = &[u8]>) {
-        let deps = self.deps.iter().flat_map(|(_, shapes)| shapes.iter().map(|(shape, _)| &**shape));
+        let deps =
+            self.deps.iter().flat_map(|(_, shapes)| shapes.iter().map(|(shape, _)| &**shape));
         (&self.env, self.macros.iter().map(|(shape, _)| &**shape).chain(deps))
     }
 
@@ -272,8 +276,10 @@ impl Reads {
     /// The values the reads had as `db` resolved `krate`, whose they are: what the image is
     /// filed by.
     pub(crate) fn values_then(&self, db: &Db, krate: Crate) -> ContentId {
-        self.values(db, krate, |_, _, then| Ok(then.expect("reads made in this database know their values")))
-            .expect("values made in this database do not fail")
+        self.values(db, krate, |_, _, then| {
+            Ok(then.expect("reads made in this database know their values"))
+        })
+        .expect("values made in this database do not fail")
     }
 
     /// The values the reads of `krate` have now: the process variables in `db`, each
@@ -334,7 +340,11 @@ impl Reads {
         };
         hasher.part(b"primary");
         for &at in &self.primary {
-            hasher.update(&at.to_le_bytes()).opt_part(base_db::env_var(db, at_closure(at)?, base_db::PRIMARY_PACKAGE));
+            hasher.update(&at.to_le_bytes()).opt_part(base_db::env_var(
+                db,
+                at_closure(at)?,
+                base_db::PRIMARY_PACKAGE,
+            ));
         }
         hasher.part(b"dependencies");
         for (at, shapes) in &self.deps {
@@ -399,11 +409,14 @@ fn served(db: &Db, krate: Crate, base: ContentId) -> Result<Reads, Refused> {
     env_reads(db, krate, own, &mut reads);
     for read in db.files().expansions_read_by(krate, base_db::ReadBy::Served(base)) {
         match read {
-            base_db::ExpansionRead::Traced { shape, values } => reads.macros.push((shape.into(), Some(values))),
+            base_db::ExpansionRead::Traced { shape, values } => {
+                reads.macros.push((shape.into(), Some(values)))
+            }
             // Never noted for a value served: it was filed by its reads, all traced.
             base_db::ExpansionRead::Unknown(why) => {
                 // alloc: why a crate is refused, once per refused crate
-                let call = format!("an expansion of crate {}, served from its image", krate.named(db));
+                let call =
+                    format!("an expansion of crate {}, served from its image", krate.named(db));
                 return Err(Refused::ProcMacro { call, why });
             }
         }
@@ -413,7 +426,9 @@ fn served(db: &Db, krate: Crate, base: ContentId) -> Result<Reads, Refused> {
     reads.macros.sort_unstable();
     reads.macros.dedup();
     if reads.macros.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err(Refused::Reads { why: "a dependency was served by two values of the same names" });
+        return Err(Refused::Reads {
+            why: "a dependency was served by two values of the same names",
+        });
     }
     Ok(reads)
 }
@@ -427,7 +442,11 @@ fn env_reads(db: &Db, krate: Crate, own: &base_db::Env, reads: &mut Reads) {
             continue;
         }
         if name == base_db::PRIMARY_PACKAGE {
-            let at = krate.transitive_deps(db).iter().position(|it| *it == krate).expect("a crate's closure holds it");
+            let at = krate
+                .transitive_deps(db)
+                .iter()
+                .position(|it| *it == krate)
+                .expect("a crate's closure holds it");
             reads.primary = vec![u32::try_from(at).expect("fewer than 2^32 crates")]; // alloc: one index, once per crate that read it
         } else if own.get(&name).is_none() {
             reads.env.push(name.into_boxed_str());

@@ -62,7 +62,11 @@ pub struct TooManyStates {
 
 impl std::fmt::Display for TooManyStates {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "more than {} crash states of {}: raise STOREMODEL_CRASH_STATES or shrink the scenario", self.most, self.pending)
+        write!(
+            f,
+            "more than {} crash states of {}: raise STOREMODEL_CRASH_STATES or shrink the scenario",
+            self.most, self.pending
+        )
     }
 }
 
@@ -193,7 +197,9 @@ pub fn describe(effect: &Effect) -> String {
         Effect::Sync { file, .. } => format!("sync {file}"),
         Effect::Truncate { file, len, .. } => format!("truncate {file} to {len}"),
         Effect::Write { file, bytes, .. } => format!("write {file} ({} bytes)", bytes.len()),
-        Effect::WriteAt { file, at, bytes, .. } => format!("write {} bytes of {file} at {at}", bytes.len()),
+        Effect::WriteAt { file, at, bytes, .. } => {
+            format!("write {} bytes of {file} at {at}", bytes.len())
+        }
         Effect::Rename { from, to, .. } => format!("rename {from} to {to}"),
         Effect::Remove { file, .. } => format!("remove {file}"),
         Effect::Map { file, .. } => format!("map {file}"),
@@ -220,7 +226,11 @@ impl CrashFs {
         let mut fs = CrashFs::new(persist);
         for (name, bytes) in disk {
             let ino = fs.inodes.len();
-            fs.inodes.push(Inode { live: bytes.clone(), durable: bytes.clone(), unsynced: Vec::new() });
+            fs.inodes.push(Inode {
+                live: bytes.clone(),
+                durable: bytes.clone(),
+                unsynced: Vec::new(),
+            });
             fs.live.insert(name.clone(), ino);
             fs.durable.insert(name.clone(), ino);
         }
@@ -229,7 +239,10 @@ impl CrashFs {
 
     /// What a clean shutdown leaves: everything durable as it is now (no effect in flight).
     pub fn synced_disk(&self) -> Disk {
-        self.durable.iter().map(|(name, ino)| (name.clone(), self.inodes[*ino].durable.clone())).collect()
+        self.durable
+            .iter()
+            .map(|(name, ino)| (name.clone(), self.inodes[*ino].durable.clone()))
+            .collect()
     }
 
     /// The effects asked for, in flight until [`CrashFs::complete`] or [`CrashFs::fail`] ends
@@ -275,17 +288,20 @@ impl CrashFs {
                 self.change(&file, Change::Cut(len));
                 Done::Truncated
             }
-            Effect::WriteAt { file, at, bytes, .. } => match self.live.contains_key(file.as_str()) {
-                true => {
-                    self.change(&file, Change::At(at, bytes));
-                    Done::Written
+            Effect::WriteAt { file, at, bytes, .. } => {
+                match self.live.contains_key(file.as_str()) {
+                    true => {
+                        self.change(&file, Change::At(at, bytes));
+                        Done::Written
+                    }
+                    false => Done::Failed(IoError(format!("{file}: no such file"))),
                 }
-                false => Done::Failed(IoError(format!("{file}: no such file"))),
-            },
+            }
             Effect::Sync { file, .. } => {
                 if let Some(&ino) = self.live.get(file.as_str()) {
                     let inode = &mut self.inodes[ino];
-                    let covered: Vec<Unsynced> = inode.unsynced.drain(..covers.min(inode.unsynced.len())).collect();
+                    let covered: Vec<Unsynced> =
+                        inode.unsynced.drain(..covers.min(inode.unsynced.len())).collect();
                     for it in covered.iter().filter(|it| !it.doomed) {
                         it.change.apply(&mut inode.durable);
                     }
@@ -297,7 +313,11 @@ impl CrashFs {
             }
             Effect::Write { file, bytes, .. } => {
                 let ino = self.inodes.len();
-                self.inodes.push(Inode { live: bytes.clone(), durable: bytes, unsynced: Vec::new() });
+                self.inodes.push(Inode {
+                    live: bytes.clone(),
+                    durable: bytes,
+                    unsynced: Vec::new(),
+                });
                 self.link(file.as_str(), ino);
                 self.commit_entries(Some(dir_of(file.as_str())));
                 Done::Written
@@ -320,13 +340,19 @@ impl CrashFs {
             }
             Effect::Map { file, .. } => Done::Mapped(Mapping::copy(&self.contents(&file))),
             Effect::Stat { file, .. } => Done::Stat(match self.live.get(file.as_str()) {
-                Some(ino) => Some(Meta { len: self.inodes[*ino].live.len() as u64, dir: false, modified_ns: 0 }),
+                Some(ino) => Some(Meta {
+                    len: self.inodes[*ino].live.len() as u64,
+                    dir: false,
+                    modified_ns: 0,
+                }),
                 None if self.live.keys().any(|it| it.starts_with(&format!("{file}/"))) => {
                     Some(Meta { len: 0, dir: true, modified_ns: 0 })
                 }
                 None => None,
             }),
-            other => panic!("the crash model has no rule for {other:?}: add one to blaze-storemodel's fs.rs"),
+            other => panic!(
+                "the crash model has no rule for {other:?}: add one to blaze-storemodel's fs.rs"
+            ),
         };
         Completion { tag, done }
     }
@@ -409,17 +435,31 @@ impl CrashFs {
         let mut entries = self.pending.clone();
         for flying in &self.flying {
             match &flying.effect {
-                Effect::Append { file, bytes, .. } => {
-                    may_change(&mut inodes, &mut live, &mut entries, file, Change::Append(bytes.clone()))
-                }
+                Effect::Append { file, bytes, .. } => may_change(
+                    &mut inodes,
+                    &mut live,
+                    &mut entries,
+                    file,
+                    Change::Append(bytes.clone()),
+                ),
                 Effect::Truncate { file, len, .. } => {
                     may_change(&mut inodes, &mut live, &mut entries, file, Change::Cut(*len))
                 }
                 Effect::WriteAt { file, at, bytes, .. } if live.contains_key(file.as_str()) => {
-                    may_change(&mut inodes, &mut live, &mut entries, file, Change::At(*at, bytes.clone()))
+                    may_change(
+                        &mut inodes,
+                        &mut live,
+                        &mut entries,
+                        file,
+                        Change::At(*at, bytes.clone()),
+                    )
                 }
                 Effect::Write { file, bytes, .. } => {
-                    inodes.push(Inode { live: bytes.clone(), durable: bytes.clone(), unsynced: Vec::new() });
+                    inodes.push(Inode {
+                        live: bytes.clone(),
+                        durable: bytes.clone(),
+                        unsynced: Vec::new(),
+                    });
                     let ino = inodes.len() - 1;
                     live.insert(file.as_str().to_owned(), ino);
                     entries.push(Entry::Link { name: file.as_str().to_owned(), ino });
@@ -447,7 +487,9 @@ impl CrashFs {
                 if entries.len() >= usize::BITS as usize - 1 || (1usize << entries.len()) > most {
                     return Err(too_many());
                 }
-                (0..1usize << entries.len()).map(|set| (0..entries.len()).filter(|n| set & (1 << n) != 0).collect()).collect()
+                (0..1usize << entries.len())
+                    .map(|set| (0..entries.len()).filter(|n| set & (1 << n) != 0).collect())
+                    .collect()
             }
         };
         let mut states: BTreeMap<ContentId, CrashState> = BTreeMap::new();
@@ -458,16 +500,23 @@ impl CrashFs {
             }
             let mut how = String::new();
             if !entries.is_empty() {
-                let lost: Vec<String> =
-                    (0..entries.len()).filter(|n| !kept.contains(n)).map(|n| entries[n].describe()).collect();
-                how.push_str(&format!("kept {} of {} pending directory changes", kept.len(), entries.len()));
+                let lost: Vec<String> = (0..entries.len())
+                    .filter(|n| !kept.contains(n))
+                    .map(|n| entries[n].describe())
+                    .collect();
+                how.push_str(&format!(
+                    "kept {} of {} pending directory changes",
+                    kept.len(),
+                    entries.len()
+                ));
                 if !lost.is_empty() {
                     how.push_str(&format!(" (lost: {})", lost.join(", ")));
                 }
             }
             // Each named file's choices: a prefix of its unsynced changes, the last perhaps torn.
             let mut disks: Vec<(Disk, String)> = vec![(Disk::new(), how)];
-            let named: BTreeSet<(String, Ino)> = names.iter().map(|(name, ino)| (name.clone(), *ino)).collect();
+            let named: BTreeSet<(String, Ino)> =
+                names.iter().map(|(name, ino)| (name.clone(), *ino)).collect();
             for (name, ino) in named {
                 let inode = &inodes[ino];
                 let mut choices: Vec<(Vec<u8>, String)> = Vec::new();
@@ -483,7 +532,10 @@ impl CrashFs {
                     choices.push((bytes, text));
                     if let Some(last) = n.checked_sub(1).map(|it| &inode.unsynced[it].change) {
                         let len = last.len();
-                        let cuts: BTreeSet<usize> = [1, len / 2, len.saturating_sub(1)].into_iter().filter(|it| *it > 0 && *it < len).collect();
+                        let cuts: BTreeSet<usize> = [1, len / 2, len.saturating_sub(1)]
+                            .into_iter()
+                            .filter(|it| *it > 0 && *it < len)
+                            .collect();
                         for cut in cuts {
                             let Some(torn) = last.torn(cut) else { continue };
                             let mut bytes = inode.durable.clone();

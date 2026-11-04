@@ -5,8 +5,8 @@
 //! Each program runs on Linux x86-64 under [`Plain`], whose scheduler keeps the running thread
 //! until it blocks or ends, so what each prints comes in one order.
 
-use hir_ty_mir::mir::{Plain, run_function};
 use hir_expand::fixture;
+use hir_ty_mir::mir::{Plain, run_function};
 
 use crate::function;
 

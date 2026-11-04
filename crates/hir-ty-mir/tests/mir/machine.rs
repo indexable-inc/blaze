@@ -5,13 +5,13 @@
 
 use std::{collections::BTreeMap, ops::Range};
 
+use hir_expand::fixture;
 use hir_ty::next_solver::{Ty, TyKind};
 use hir_ty_mir::mir::{
     Access, AtomicOrd, EvalThread, MResult, Machine, MemKind, Plain, Ptr, RetagMode, Shadow, Site,
     TypedCx, run_function,
 };
 use rustc_type_ir::inherent::IntoKind as _;
-use hir_expand::fixture;
 
 use crate::function;
 
@@ -89,33 +89,112 @@ impl TyClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
     Step,
-    Alloc { addr: u64, size: u64, kind: MemKind, prov: u32 },
-    Free { addr: u64, prov: Option<u32>, kind: MemKind },
-    Read { addr: u64, prov: Option<u32>, size: u64, align: u64, access: Access },
-    Write { addr: u64, prov: Option<u32>, size: u64, align: u64, access: Access },
-    Copy { dst: u64, dst_prov: Option<u32>, src: u64, src_prov: Option<u32>, size: u64 },
-    RequireInit { len: usize, init: bool },
-    AtomicLoad { addr: u64, prov: Option<u32>, size: u64, ord: AtomicOrd },
-    AtomicStore { addr: u64, prov: Option<u32>, ord: AtomicOrd },
-    Fence { ord: AtomicOrd, compiler_only: bool },
+    Alloc {
+        addr: u64,
+        size: u64,
+        kind: MemKind,
+        prov: u32,
+    },
+    Free {
+        addr: u64,
+        prov: Option<u32>,
+        kind: MemKind,
+    },
+    Read {
+        addr: u64,
+        prov: Option<u32>,
+        size: u64,
+        align: u64,
+        access: Access,
+    },
+    Write {
+        addr: u64,
+        prov: Option<u32>,
+        size: u64,
+        align: u64,
+        access: Access,
+    },
+    Copy {
+        dst: u64,
+        dst_prov: Option<u32>,
+        src: u64,
+        src_prov: Option<u32>,
+        size: u64,
+    },
+    RequireInit {
+        len: usize,
+        init: bool,
+    },
+    AtomicLoad {
+        addr: u64,
+        prov: Option<u32>,
+        size: u64,
+        ord: AtomicOrd,
+    },
+    AtomicStore {
+        addr: u64,
+        prov: Option<u32>,
+        ord: AtomicOrd,
+    },
+    Fence {
+        ord: AtomicOrd,
+        compiler_only: bool,
+    },
     /// `value`: the first 8 bytes of the value, little-endian (a pointer's address).
-    Typed { addr: u64, prov: Option<u32>, mode: RetagMode, ty: TyClass, value: u64 },
-    Offset { addr: u64, prov: Option<u32>, by: i64 },
-    Expose { addr: u64, prov: Option<u32> },
-    FromExposed { addr: u64, prov: Option<u32> },
-    Freeze { addr: u64 },
+    Typed {
+        addr: u64,
+        prov: Option<u32>,
+        mode: RetagMode,
+        ty: TyClass,
+        value: u64,
+    },
+    Offset {
+        addr: u64,
+        prov: Option<u32>,
+        by: i64,
+    },
+    Expose {
+        addr: u64,
+        prov: Option<u32>,
+    },
+    FromExposed {
+        addr: u64,
+        prov: Option<u32>,
+    },
+    Freeze {
+        addr: u64,
+    },
     Call,
-    Protect { addr: u64, prov: Option<u32>, size: u64 },
+    Protect {
+        addr: u64,
+        prov: Option<u32>,
+        size: u64,
+    },
     Ret,
-    Spawn { thread: EvalThread },
-    Schedule { running: EvalThread, chosen: EvalThread },
-    Join { thread: EvalThread },
-    Detach { thread: EvalThread },
+    Spawn {
+        thread: EvalThread,
+    },
+    Schedule {
+        running: EvalThread,
+        chosen: EvalThread,
+    },
+    Join {
+        thread: EvalThread,
+    },
+    Detach {
+        thread: EvalThread,
+    },
     Exit,
     Yield,
-    ThreadName { thread: EvalThread },
-    Release { object: u64 },
-    Acquire { object: u64 },
+    ThreadName {
+        thread: EvalThread,
+    },
+    Release {
+        object: u64,
+    },
+    Acquire {
+        object: u64,
+    },
     Finish,
 }
 
@@ -758,7 +837,8 @@ fn main() {
 "#,
     );
     let copied = made(&events, TyClass::Ref, RetagMode::Default);
-    let pointee = events[..copied.at].iter().position(|it| *it == Event::Freeze { addr: copied.to });
+    let pointee =
+        events[..copied.at].iter().position(|it| *it == Event::Freeze { addr: copied.to });
     assert!(pointee.is_some(), "`&7` is not frozen before `R` is used: {events:#?}");
     let frozen = events.iter().filter(|it| matches!(it, Event::Freeze { .. })).count();
     assert!(frozen >= 2, "`R`'s own copy is not frozen: {events:#?}");
@@ -802,8 +882,9 @@ fn a_step_comes_before_each_statement_s_memory_events() {
         assert!(typed.len() <= 1, "two typed copies without a step between: {statement:#?}");
         if let Some(&typed) = typed.first() {
             assert!(
-                !statement[typed + 1..].iter().any(|it| it.read().is_some()
-                    || matches!(it, Event::Write { .. })),
+                !statement[typed + 1..]
+                    .iter()
+                    .any(|it| it.read().is_some() || matches!(it, Event::Write { .. })),
                 "memory events after an assignment's `Typed` before the next step: {statement:#?}"
             );
         }

@@ -59,7 +59,10 @@ pub struct SparseIndex {
     config: Mutex<Option<RegistryConfig>>,
     auth: Option<Arc<Auth>>,
     /// The registry's name in the configuration, found once a token is first asked for.
-    #[expect(clippy::disallowed_types, reason = "found once a token is first asked for: per registry, not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "found once a token is first asked for: per registry, not global"
+    )]
     name: std::sync::OnceLock<Option<String>>,
     /// Whether requests carry the token.
     auth_required: AtomicBool,

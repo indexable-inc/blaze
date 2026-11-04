@@ -27,11 +27,14 @@ use syntax::{
 };
 
 use super::{
-    Finding, Lint,
-    exempt,
+    Finding, Lint, exempt,
     facts::{self, Parents},
 };
-use crate::{check::Cx, diag::Applicability, lints::guards::{Guards, Kind}};
+use crate::{
+    check::Cx,
+    diag::Applicability,
+    lints::guards::{Guards, Kind},
+};
 
 const LINT: Lint = Lint::SharedCollectionLock;
 
@@ -56,12 +59,17 @@ const COLLECTION_CRATES: &[(&str, &str, bool, Shape)] = &[
 ];
 
 /// std's collections, by diagnostic item.
-const STD_COLLECTIONS: [(&str, bool, Shape); 4] =
-    [("HashMap", true, Shape::Map), ("BTreeMap", false, Shape::Map), ("HashSet", true, Shape::Set), ("BTreeSet", false, Shape::Set)];
+const STD_COLLECTIONS: [(&str, bool, Shape); 4] = [
+    ("HashMap", true, Shape::Map),
+    ("BTreeMap", false, Shape::Map),
+    ("HashSet", true, Shape::Set),
+    ("BTreeSet", false, Shape::Set),
+];
 
 /// The wrappers with no diagnostic item that hold a lock in place for every thread, by crate
 /// and name: std's lazy and once cells and once_cell's `sync` ones.
-const CELLS: &[(&str, &str)] = &[("std", "LazyLock"), ("std", "OnceLock"), ("once_cell", "Lazy"), ("once_cell", "OnceCell")];
+const CELLS: &[(&str, &str)] =
+    &[("std", "LazyLock"), ("std", "OnceLock"), ("once_cell", "Lazy"), ("once_cell", "OnceCell")];
 
 /// A map or a set.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -116,7 +124,9 @@ impl Declared<'_> {
         match self {
             Declared::Field(Some(name)) => format!("the field `{}` of {}", name.text(), owner()),
             Declared::TupleField(Some(index)) => format!("the field `{index}` of {}", owner()),
-            Declared::Field(None) | Declared::TupleField(None) => format!("this field of {}", owner()),
+            Declared::Field(None) | Declared::TupleField(None) => {
+                format!("this field of {}", owner())
+            }
             Declared::Static(Some(name)) => format!("the static `{}`", name.text()),
             Declared::Static(None) => "this static".to_owned(),
         }
@@ -130,7 +140,9 @@ pub(super) fn check_declaration<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     let (written, declared) = if let Some(field) = ast::RecordField::cast(node) {
         (field.ty(), Declared::Field(field.name()))
     } else if let Some(field) = ast::TupleField::cast(node) {
-        let index = node.parent().and_then(|list| list.children().filter_map(ast::TupleField::cast).position(|it| it == field));
+        let index = node.parent().and_then(|list| {
+            list.children().filter_map(ast::TupleField::cast).position(|it| it == field)
+        });
         (field.ty(), Declared::TupleField(index))
     } else if let Some(item) = ast::Static::cast(node) {
         (item.ty(), Declared::Static(item.name()))
@@ -167,10 +179,16 @@ pub(super) fn check_declaration<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
                  guarded by the collection's epoch, not by a lock",
             );
             // alloc: the fix's one part and its message
-            diagnostic.multipart_suggestion(format!("share it as a `{papaya}`"), vec![part], Applicability::MaybeIncorrect);
+            diagnostic.multipart_suggestion(
+                format!("share it as a `{papaya}`"),
+                vec![part],
+                Applicability::MaybeIncorrect,
+            );
         }
         None if locked.hashes && !fixable => {
-            diagnostic.note(format!("share it as a `{papaya}` in a `std::sync::LazyLock`, which makes it on first use"));
+            diagnostic.note(format!(
+                "share it as a `{papaya}` in a `std::sync::LazyLock`, which makes it on first use"
+            ));
         }
         None if locked.hashes => {
             diagnostic.note(format!("share it as a `{papaya}`"));
@@ -205,31 +223,47 @@ fn locked_collection(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<Locked> {
     }
     let adt = ty.as_adt()?;
     let is_std_lock = [item("Mutex"), item("RwLock")].contains(&Some(adt));
-    let is_lock_api = facts::adt_is(db, adt, "lock_api", "Mutex") || facts::adt_is(db, adt, "lock_api", "RwLock");
+    let is_lock_api =
+        facts::adt_is(db, adt, "lock_api", "Mutex") || facts::adt_is(db, adt, "lock_api", "RwLock");
     if !is_std_lock && !is_lock_api {
         return None;
     }
     let inner = ty.type_arguments().last()?;
     let collection = inner.as_adt()?;
-    let (hashes, shape) = match STD_COLLECTIONS.iter().find(|(name, ..)| item(name) == Some(collection)) {
-        Some(&(_, hashes, shape)) => (hashes, shape),
-        None => {
-            let name = collection.name(db);
-            let of = collection.module(db).krate(db);
-            let &(_, _, hashes, shape) = COLLECTION_CRATES
-                .iter()
-                .find(|(krate_name, it, ..)| name.as_str() == *it && facts::crate_is(db, of, krate_name))?;
-            (hashes, shape)
-        }
-    };
+    let (hashes, shape) =
+        match STD_COLLECTIONS.iter().find(|(name, ..)| item(name) == Some(collection)) {
+            Some(&(_, hashes, shape)) => (hashes, shape),
+            None => {
+                let name = collection.name(db);
+                let of = collection.module(db).krate(db);
+                let &(_, _, hashes, shape) =
+                    COLLECTION_CRATES.iter().find(|(krate_name, it, ..)| {
+                        name.as_str() == *it && facts::crate_is(db, of, krate_name)
+                    })?;
+                (hashes, shape)
+            }
+        };
     let shown = |it: hir::Adt| it.name(db).as_str().to_owned(); // alloc: a message's part
-    Some(Locked { lock: shown(adt), collection: shown(collection), hashes, shape, layers, arcs, in_cell })
+    Some(Locked {
+        lock: shown(adt),
+        collection: shown(collection),
+        hashes,
+        shape,
+        layers,
+        arcs,
+        in_cell,
+    })
 }
 
 /// The fix of a type written `written`, its lock inside `layers` wrappers: the written lock
 /// type replaced by `papaya` with the written collection's arguments. `None` when the types are
 /// not written out to the collection's arguments (an alias).
-fn fix(cx: &Cx<'_, '_>, written: ast::Type<'_>, layers: usize, papaya: &str) -> Option<(TextRange, String)> {
+fn fix(
+    cx: &Cx<'_, '_>,
+    written: ast::Type<'_>,
+    layers: usize,
+    papaya: &str,
+) -> Option<(TextRange, String)> {
     let mut lock = written;
     for _ in 0..layers {
         let inner = type_args(lock)?.next()?;
@@ -283,7 +317,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         let Expr::MethodCall { receiver, .. } = expr else { continue };
         let Some((callee, _)) = analysis.callee(id) else { continue };
         let method = hir::Function::from(callee).name(db);
-        if !matches!(method.as_str(), "push" | "extend") || vec.is_none() || facts::impl_adt(db, callee) != vec {
+        if !matches!(method.as_str(), "push" | "extend")
+            || vec.is_none()
+            || facts::impl_adt(db, callee) != vec
+        {
             continue;
         }
         let receiver_ty = analysis.ty(infer.expr_ty(receiver)).strip_references();
@@ -326,7 +363,9 @@ fn shared_local(
     let db = cx.db();
     let body = analysis.body();
     if matches!(body.expr(init), Expr::Path(_))
-        || analysis.callee(init).is_some_and(|(f, _)| hir::Function::from(f).name(db).as_str() == "clone")
+        || analysis
+            .callee(init)
+            .is_some_and(|(f, _)| hir::Function::from(f).name(db).as_str() == "clone")
     {
         return None;
     }
@@ -357,7 +396,12 @@ fn shared_local(
 }
 
 /// The function of `blaze_graph::par` whose closure argument `expr` is inside, by its name.
-fn par_call(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, parents: &Parents, expr: ExprId) -> Option<String> {
+fn par_call(
+    cx: &Cx<'_, '_>,
+    analysis: &hir::BodyAnalysis<'_>,
+    parents: &Parents,
+    expr: ExprId,
+) -> Option<String> {
     let db = cx.db();
     let body = analysis.body();
     let mut child = expr;
@@ -369,7 +413,8 @@ fn par_call(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, parents: &Parents
         {
             let f = hir::Function::from(callee);
             let module = f.module(db);
-            if module.name(db).is_some_and(|it| it.as_str() == "par") && facts::crate_is(db, module.krate(db), "blaze_graph")
+            if module.name(db).is_some_and(|it| it.as_str() == "par")
+                && facts::crate_is(db, module.krate(db), "blaze_graph")
             {
                 return Some(f.name(db).as_str().to_owned()); // alloc: a message's part
             }
@@ -406,8 +451,14 @@ pub struct Pair(parking_lot::Mutex<hashbrown::HashMap<u32, u32>>);
             found.contains("the field `names` of `Cache` shares a `HashMap` behind one `Mutex`"),
             "{found}"
         );
-        assert!(found.contains("the field `shared` of `Cache` shares a `HashMap` behind one `RwLock`"), "{found}");
-        assert!(found.contains("the field `0` of `Pair` shares a `HashMap` behind one `Mutex`"), "{found}");
+        assert!(
+            found.contains("the field `shared` of `Cache` shares a `HashMap` behind one `RwLock`"),
+            "{found}"
+        );
+        assert!(
+            found.contains("the field `0` of `Pair` shares a `HashMap` behind one `Mutex`"),
+            "{found}"
+        );
         assert!(found.contains("papaya::HashMap<u32, u32>"), "{found}");
         assert!(
             found.contains("sorting where its order is read"),
@@ -473,10 +524,22 @@ pub struct Seen {
 "#,
         );
         assert_eq!(found.matches(FIELD).count(), 5, "{found}");
-        assert!(found.contains("the field `names` of `Seen` shares a `HashSet` behind one `Mutex`"), "{found}");
-        assert!(found.contains("the field `sorted` of `Seen` shares a `BTreeSet` behind one `RwLock`"), "{found}");
-        assert!(found.contains("the field `brown` of `Seen` shares a `HashSet` behind one `Mutex`"), "{found}");
-        assert!(found.contains("the field `indexed` of `Seen` shares a `IndexSet` behind one `Mutex`"), "{found}");
+        assert!(
+            found.contains("the field `names` of `Seen` shares a `HashSet` behind one `Mutex`"),
+            "{found}"
+        );
+        assert!(
+            found.contains("the field `sorted` of `Seen` shares a `BTreeSet` behind one `RwLock`"),
+            "{found}"
+        );
+        assert!(
+            found.contains("the field `brown` of `Seen` shares a `HashSet` behind one `Mutex`"),
+            "{found}"
+        );
+        assert!(
+            found.contains("the field `indexed` of `Seen` shares a `IndexSet` behind one `Mutex`"),
+            "{found}"
+        );
         assert!(found.contains("papaya::HashSet<u32>"), "{found}");
         assert_eq!(
             found.matches("sorting where its order is read").count(),
@@ -503,11 +566,27 @@ pub static MAP: LazyLock<HashMap<u32, u32>> = LazyLock::new(|| loop {});
 "#,
         );
         assert_eq!(found.matches(FIELD).count(), 4, "{found}");
-        assert!(found.contains("the static `PLAIN` shares a `HashMap` behind one `Mutex`"), "{found}");
-        assert!(found.contains("the static `LAZY` shares a `HashMap` behind one `Mutex`"), "{found}");
-        assert!(found.contains("the static `ONCE` shares a `HashMap` behind one `Mutex`"), "{found}");
-        assert!(found.contains("the static `CELL` shares a `HashSet` behind one `Mutex`"), "{found}");
-        assert_eq!(found.matches("in a `std::sync::LazyLock`").count(), 1, "only `PLAIN` has no cell:\n{found}");
+        assert!(
+            found.contains("the static `PLAIN` shares a `HashMap` behind one `Mutex`"),
+            "{found}"
+        );
+        assert!(
+            found.contains("the static `LAZY` shares a `HashMap` behind one `Mutex`"),
+            "{found}"
+        );
+        assert!(
+            found.contains("the static `ONCE` shares a `HashMap` behind one `Mutex`"),
+            "{found}"
+        );
+        assert!(
+            found.contains("the static `CELL` shares a `HashSet` behind one `Mutex`"),
+            "{found}"
+        );
+        assert_eq!(
+            found.matches("in a `std::sync::LazyLock`").count(),
+            1,
+            "only `PLAIN` has no cell:\n{found}"
+        );
         assert!(found.contains("papaya::HashSet<u32>"), "{found}");
         assert!(found.matches("papaya::HashMap<u32, u32>").count() >= 2, "{found}");
     }
@@ -533,8 +612,14 @@ pub fn shared() {
 "#,
         );
         assert_eq!(found.matches(FIELD).count(), 2, "{found}");
-        assert!(found.contains("the local `names` shares a `HashMap` behind one `Mutex` in an `Arc`"), "{found}");
-        assert!(found.contains("the local `sets` shares a `BTreeSet` behind one `RwLock` in an `Arc`"), "{found}");
+        assert!(
+            found.contains("the local `names` shares a `HashMap` behind one `Mutex` in an `Arc`"),
+            "{found}"
+        );
+        assert!(
+            found.contains("the local `sets` shares a `BTreeSet` behind one `RwLock` in an `Arc`"),
+            "{found}"
+        );
         assert!(found.contains("share it as an `Arc<papaya::HashMap<..>>`"), "{found}");
         assert!(found.contains("sorting where its order is read"), "{found}");
     }
@@ -545,7 +630,9 @@ pub fn shared() {
         let lock = "std::sync::Mutex<std::collections::HashMap<u32, u32>>";
         for before in [
             format!("pub struct Cache {{ names: {lock} }}\n"),
-            format!("pub static NAMES: std::sync::LazyLock<{lock}> = std::sync::LazyLock::new(|| loop {{}});\n"),
+            format!(
+                "pub static NAMES: std::sync::LazyLock<{lock}> = std::sync::LazyLock::new(|| loop {{}});\n"
+            ),
         ] {
             let found = blaze_only(LINT, &before);
             assert!(found.contains("papaya::HashMap<u32, u32>"), "{found}");

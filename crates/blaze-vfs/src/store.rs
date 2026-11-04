@@ -678,7 +678,10 @@ enum BlobAt<'a> {
 pub(crate) enum Source<'a> {
     Heap(&'a [u8]),
     /// `len` bytes at `at` of the blobs section of [`Table::mapped`].
-    Mapped { at: u64, len: u64 },
+    Mapped {
+        at: u64,
+        len: u64,
+    },
 }
 
 /// One generation of nodes: a base (empty unless restored from an image), then the columns.

@@ -182,30 +182,34 @@ fn pinned_elsewhere(words: &[OsString], given: bool) -> Result<Ran, String> {
     };
     let shown = manifest.display();
     let ignore = pin::ignores(given, &manifest);
-    let for_tree =
-        match pin::choose(pin::OURS, &manifest, &named, ignore).map_err(|why| why.to_string())? {
-            // `--ignore-pin` given here, for a workspace no blaze above this one was told it
-            // for: this blaze runs again with `BLAZE_IGNORE_PIN_FOR` naming the manifest, so a
-            // blaze a test or build script runs in this workspace (`$CARGO`) runs itself too,
-            // and one run in another workspace is held to that one's pin. Run again, not set
-            // here: setting a variable in this process is unsafe, and the word is rare.
-            pin::Choice::Ignored
-                if given && !pin::names(std::env::var_os(pin::IGNORE_PIN_FOR).as_deref(), &manifest) =>
-            {
-                let this = std::env::current_exe().map_err(|error| {
+    let for_tree = match pin::choose(pin::OURS, &manifest, &named, ignore)
+        .map_err(|why| why.to_string())?
+    {
+        // `--ignore-pin` given here, for a workspace no blaze above this one was told it
+        // for: this blaze runs again with `BLAZE_IGNORE_PIN_FOR` naming the manifest, so a
+        // blaze a test or build script runs in this workspace (`$CARGO`) runs itself too,
+        // and one run in another workspace is held to that one's pin. Run again, not set
+        // here: setting a variable in this process is unsafe, and the word is rare.
+        pin::Choice::Ignored
+            if given
+                && !pin::names(std::env::var_os(pin::IGNORE_PIN_FOR).as_deref(), &manifest) =>
+        {
+            let this = std::env::current_exe().map_err(|error| {
                     format!("`{}` runs this blaze again for {shown}, and where it is can't be told: {error}", pin::IGNORE_PIN)
                 })?;
-                let mut command = std::process::Command::new(&this);
-                command.args(words).env(pin::IGNORE_PIN_FOR, &manifest);
-                return Ok(Ran::Ended(ended(&mut command, &this)));
-            }
-            pin::Choice::Pinned => return Ok(Ran::Here { pin: Pinned::of(&named), manifest: Some(manifest) }),
-            pin::Choice::Ignored | pin::Choice::OwnTree => {
-                return Ok(Ran::Here { pin: Pinned::Ignored, manifest: Some(manifest) });
-            }
-            pin::Choice::Release => false,
-            pin::Choice::ReleaseForTree => true,
-        };
+            let mut command = std::process::Command::new(&this);
+            command.args(words).env(pin::IGNORE_PIN_FOR, &manifest);
+            return Ok(Ran::Ended(ended(&mut command, &this)));
+        }
+        pin::Choice::Pinned => {
+            return Ok(Ran::Here { pin: Pinned::of(&named), manifest: Some(manifest) });
+        }
+        pin::Choice::Ignored | pin::Choice::OwnTree => {
+            return Ok(Ran::Here { pin: Pinned::Ignored, manifest: Some(manifest) });
+        }
+        pin::Choice::Release => false,
+        pin::Choice::ReleaseForTree => true,
+    };
     let ignoring = format!("`blaze {} <command>` runs this one", pin::IGNORE_PIN);
     let wanted = if pin::is_channel(&named) {
         channel_version(&named).map_err(|why| {
@@ -261,7 +265,9 @@ fn pinned_elsewhere(words: &[OsString], given: bool) -> Result<Ran, String> {
 /// launcher that ran it as that release, and finds it another, is refused rather than run it
 /// again. The paths are compared resolved where they can be.
 fn is_kept_for(version: &str) -> bool {
-    let (Ok(this), Some(kept)) = (std::env::current_exe(), pin::installed(version)) else { return false };
+    let (Ok(this), Some(kept)) = (std::env::current_exe(), pin::installed(version)) else {
+        return false;
+    };
     let resolved = |it: &Path| std::fs::canonicalize(it).unwrap_or_else(|_| it.to_owned());
     resolved(&this) == resolved(&kept)
 }
@@ -280,7 +286,9 @@ fn run_default(words: &[OsString], manifest: Option<std::path::PathBuf>) -> Resu
     // Run as the default, and not it: the `blaze` kept for the default is another release.
     // Only then: a blaze found on PATH under the default (its daemon, a build script, a test)
     // inherits `BLAZE_RUN_AS_DEFAULT` too, and runs the default again, which runs itself.
-    if std::env::var_os(update::RUN_AS_DEFAULT).is_some_and(|it| it == runs.as_str()) && is_kept_for(&runs) {
+    if std::env::var_os(update::RUN_AS_DEFAULT).is_some_and(|it| it == runs.as_str())
+        && is_kept_for(&runs)
+    {
         let this = std::env::current_exe().unwrap_or_default();
         return Err(format!(
             "blaze {runs} is the default `blaze update` installed, and {}, which a blaze ran as it (`{}`), is \

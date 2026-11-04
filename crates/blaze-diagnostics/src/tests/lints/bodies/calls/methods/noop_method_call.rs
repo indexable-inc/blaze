@@ -3,16 +3,26 @@
 //! as they are (in `noop_method_call/`).
 
 use super::{
-    CORE_BORROW, CORE_CMP, CORE_CMP_PRELUDE, CORE_FMT, CORE_FMT_PRELUDE, CORE_ITER, CORE_ITER_PRELUDE, CORE_OPS,
-    CORE_OPS_PRELUDE, CORE_OPTION_RESULT, CORE_OPTION_RESULT_PRELUDE, Library, STD_VEC, STD_VEC_PRELUDE, ui_library,
+    CORE_BORROW, CORE_CMP, CORE_CMP_PRELUDE, CORE_FMT, CORE_FMT_PRELUDE, CORE_ITER,
+    CORE_ITER_PRELUDE, CORE_OPS, CORE_OPS_PRELUDE, CORE_OPTION_RESULT, CORE_OPTION_RESULT_PRELUDE,
+    Library, STD_VEC, STD_VEC_PRELUDE, ui_library,
 };
 use crate::tests::lints::bodies::calls::Ui;
 
 #[test]
 fn noop_method_call() {
     let core = format!("{CORE_OPS}{CORE_BORROW}");
-    let library = Library { core: &core, core_prelude: CORE_OPS_PRELUDE, std: "pub use core::{borrow, ops};\n", ..Library::default() };
-    let ui = Ui { name: "noop-method-call.rs", source: include_str!("noop_method_call/noop-method-call.rs"), ..Ui::default() };
+    let library = Library {
+        core: &core,
+        core_prelude: CORE_OPS_PRELUDE,
+        std: "pub use core::{borrow, ops};\n",
+        ..Library::default()
+    };
+    let ui = Ui {
+        name: "noop-method-call.rs",
+        source: include_str!("noop_method_call/noop-method-call.rs"),
+        ..Ui::default()
+    };
     assert_eq!(ui_library(ui, &library), include_str!("noop_method_call/noop-method-call.stderr"));
 }
 
@@ -93,9 +103,11 @@ pub mod sync {
 
 #[test]
 fn suspicious_double_ref_op() {
-    let core = format!("{CORE_OPS}{CORE_BORROW}{CORE_OPTION_RESULT}{CORE_CMP}{CORE_ITER}{CORE_FMT}");
-    let core_prelude =
-        format!("{CORE_OPS_PRELUDE}{CORE_OPTION_RESULT_PRELUDE}{CORE_CMP_PRELUDE}{CORE_ITER_PRELUDE}{CORE_FMT_PRELUDE}");
+    let core =
+        format!("{CORE_OPS}{CORE_BORROW}{CORE_OPTION_RESULT}{CORE_CMP}{CORE_ITER}{CORE_FMT}");
+    let core_prelude = format!(
+        "{CORE_OPS_PRELUDE}{CORE_OPTION_RESULT_PRELUDE}{CORE_CMP_PRELUDE}{CORE_ITER_PRELUDE}{CORE_FMT_PRELUDE}"
+    );
     let std = format!("{DOUBLE_REF_STD}{STD_VEC}");
     let std_prelude = format!("{STD_VEC_PRELUDE}        pub use crate::println;\n");
     let library = Library {
@@ -110,5 +122,8 @@ fn suspicious_double_ref_op() {
         source: include_str!("noop_method_call/suspicious-double-ref-op.rs"),
         ..Ui::default()
     };
-    assert_eq!(ui_library(ui, &library), include_str!("noop_method_call/suspicious-double-ref-op.stderr"));
+    assert_eq!(
+        ui_library(ui, &library),
+        include_str!("noop_method_call/suspicious-double-ref-op.stderr")
+    );
 }

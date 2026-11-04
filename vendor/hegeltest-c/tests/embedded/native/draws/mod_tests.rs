@@ -29,10 +29,7 @@ fn width_32_float_bounds_must_be_f32_representable() {
         let EngineError::InvalidArgument(msg) = err else {
             panic!("expected InvalidArgument, got {err:?}");
         };
-        assert!(
-            msg.contains(bad) && msg.contains("width 32"),
-            "unexpected message: {msg}"
-        );
+        assert!(msg.contains(bad) && msg.contains("width 32"), "unexpected message: {msg}");
     }
 
     let v = generate_float(&mut ntc, &float_spec(32, 0.5, 2.0)).unwrap();
@@ -61,10 +58,7 @@ fn bounds_leaving_only_an_infinity_without_infinity_are_an_invalid_argument() {
         let EngineError::InvalidArgument(msg) = err else {
             panic!("expected InvalidArgument, got {err:?}");
         };
-        assert!(
-            msg.contains("allow_infinity=false leaves no value"),
-            "unexpected message: {msg}"
-        );
+        assert!(msg.contains("allow_infinity=false leaves no value"), "unexpected message: {msg}");
     }
     let v = generate_float(&mut ntc, &float_spec(64, 0.0, f64::INFINITY)).unwrap();
     assert!(v.is_finite() && v >= 0.0);
@@ -76,10 +70,7 @@ fn bounds_leaving_only_an_infinity_without_infinity_are_an_invalid_argument() {
 #[test]
 fn narrow_to_f32_keeps_overflowing_finite_draws_finite() {
     let snm = f64::from(f32::from_bits(1));
-    assert_eq!(
-        narrow_to_f32(f64::NEG_INFINITY, f64::INFINITY, snm, 1.5),
-        1.5
-    );
+    assert_eq!(narrow_to_f32(f64::NEG_INFINITY, f64::INFINITY, snm, 1.5), 1.5);
     for raw in [1e300, -1e300, f64::MAX, f64::from(f32::MAX) * 2.0] {
         let v = narrow_to_f32(f64::NEG_INFINITY, f64::INFINITY, snm, raw);
         assert!(v.is_finite(), "{raw} narrowed to non-finite {v}");
@@ -98,10 +89,7 @@ fn many_reject_marks_invalid_when_cannot_reach_min_size() {
     state.rejections = 9;
 
     let result = many_reject(&mut ntc, &mut state);
-    assert!(
-        result.is_err(),
-        "expected StopTest once rejections overflow"
-    );
+    assert!(result.is_err(), "expected StopTest once rejections overflow");
     assert_eq!(ntc.status(), Some(Status::Invalid));
 }
 
@@ -151,10 +139,7 @@ fn many_more_draws_against_the_continue_probability_set() {
         state.count = 0;
     }
     assert_eq!(a.nodes, b.nodes);
-    assert!(
-        elements > 0 && longest >= 2,
-        "{elements} elements, longest {longest}"
-    );
+    assert!(elements > 0 && longest >= 2, "{elements} elements, longest {longest}");
 }
 
 #[test]
@@ -198,18 +183,9 @@ fn recursion_branch_probability_stays_finite_at_a_maximal_budget() {
 
 #[test]
 fn recursion_branch_probability_caps_chain_like_arities() {
-    assert_eq!(
-        recursion_branch_probability(1.0, 100),
-        RECURSION_MAX_BRANCH_PROBABILITY
-    );
-    assert_eq!(
-        recursion_branch_probability(0.5, 100),
-        RECURSION_MAX_BRANCH_PROBABILITY
-    );
-    assert_eq!(
-        recursion_branch_probability(1.01, 100),
-        RECURSION_MAX_BRANCH_PROBABILITY
-    );
+    assert_eq!(recursion_branch_probability(1.0, 100), RECURSION_MAX_BRANCH_PROBABILITY);
+    assert_eq!(recursion_branch_probability(0.5, 100), RECURSION_MAX_BRANCH_PROBABILITY);
+    assert_eq!(recursion_branch_probability(1.01, 100), RECURSION_MAX_BRANCH_PROBABILITY);
     assert!(recursion_branch_probability(1.3, 100) < RECURSION_MAX_BRANCH_PROBABILITY);
 }
 
@@ -263,10 +239,7 @@ fn recursion_profile_solves_the_target_expectation_exactly() {
         assert!(profile.boundary_probability >= tail);
         assert!(profile.boundary_probability <= RECURSION_MAX_BRANCH_PROBABILITY);
         let checked = profile_expectation(&profile, arity, tail);
-        assert!(
-            (checked - 50.0).abs() < 1e-6,
-            "arity {arity}: E[L] = {checked} != 50"
-        );
+        assert!((checked - 50.0).abs() < 1e-6, "arity {arity}: E[L] = {checked} != 50");
     }
 }
 
@@ -274,10 +247,7 @@ fn recursion_profile_solves_the_target_expectation_exactly() {
 fn recursion_profile_caps_growth_at_the_depth_limit() {
     let profile = recursion_profile(1000.0, 2.0, 0.0, 3);
     assert_eq!(profile.boundary_depth, 3);
-    assert_eq!(
-        profile.boundary_probability,
-        RECURSION_MAX_BRANCH_PROBABILITY
-    );
+    assert_eq!(profile.boundary_probability, RECURSION_MAX_BRANCH_PROBABILITY);
     assert!(profile.expected_leaves > 1.0);
     assert!(profile.expected_leaves < 1000.0);
 }
@@ -286,10 +256,7 @@ fn recursion_profile_caps_growth_at_the_depth_limit() {
 fn recursion_profile_plateaus_on_a_chain_like_grammar() {
     let profile = recursion_profile(100.0, 1.0, 0.0, u64::MAX);
     assert_eq!(profile.boundary_depth, 0);
-    assert_eq!(
-        profile.boundary_probability,
-        RECURSION_MAX_BRANCH_PROBABILITY
-    );
+    assert_eq!(profile.boundary_probability, RECURSION_MAX_BRANCH_PROBABILITY);
     assert!((profile.expected_leaves - 1.0).abs() < 1e-9);
 }
 
@@ -297,10 +264,7 @@ fn recursion_profile_plateaus_on_a_chain_like_grammar() {
 fn recursion_profile_stops_searching_at_the_horizon() {
     let profile = recursion_profile(1_000_000.0, 1.055, 0.0, u64::MAX);
     assert_eq!(profile.boundary_depth, RECURSION_PROFILE_HORIZON);
-    assert_eq!(
-        profile.boundary_probability,
-        RECURSION_MAX_BRANCH_PROBABILITY
-    );
+    assert_eq!(profile.boundary_probability, RECURSION_MAX_BRANCH_PROBABILITY);
     assert!(profile.expected_leaves < 1_000_000.0);
 }
 
@@ -344,10 +308,7 @@ fn new_recursion_state_with_a_tiny_budget_aims_for_a_single_leaf() {
         let mut ntc = NativeTestCase::new_random(EngineRng::seeded(23)).unwrap();
         let state = new_recursion_state(&mut ntc, 32, max_leaves).unwrap();
         assert_eq!(state.target, 1);
-        assert_eq!(
-            state.branch_probability,
-            recursion_branch_probability(2.0, 2)
-        );
+        assert_eq!(state.branch_probability, recursion_branch_probability(2.0, 2));
     }
 }
 
@@ -532,8 +493,5 @@ fn recursion_retry_discards_partial_observations_and_halves_the_target() {
     assert!(state.open_branches.is_empty());
     assert_eq!(state.closed_branches, 0);
     assert!(state.branch_probability < priced);
-    assert_eq!(
-        state.branch_probability,
-        recursion_branch_probability(3.0, 20)
-    );
+    assert_eq!(state.branch_probability, recursion_branch_probability(3.0, 20));
 }

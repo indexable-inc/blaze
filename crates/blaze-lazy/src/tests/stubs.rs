@@ -52,15 +52,18 @@ fn the_x86_resolver_reads_the_cell_and_ends_in_a_jump_through_r11() {
     for isa in &ISAS[..4] {
         let stubs = generate(isa, 1, 0).unwrap();
         let code = &stubs.bytes[RESOLVER as usize..stubs.layout.entries as usize];
-        let load = code.windows(3).position(|it| it == [0x48, 0x8b, 0x05]).expect("mov rax, [rip + cell]");
+        let load =
+            code.windows(3).position(|it| it == [0x48, 0x8b, 0x05]).expect("mov rax, [rip + cell]");
         let disp = i32::from_le_bytes(code[load + 3..load + 7].try_into().unwrap());
         assert_eq!(i64::from(RESOLVER) + load as i64 + 7 + i64::from(disp), i64::from(CELL));
         assert!(code.windows(5).any(|it| it == [0x41, 0x5b, 0x41, 0xff, 0xe3]), "pop r11; jmp r11");
         let trap = code.windows(2).rposition(|it| it == [0x0f, 0x0b]).expect("ud2");
-        let jz = code.windows(3).position(|it| it == [0x48, 0x85, 0xc0]).expect("test rax, rax") + 3;
+        let jz =
+            code.windows(3).position(|it| it == [0x48, 0x85, 0xc0]).expect("test rax, rax") + 3;
         assert_eq!(code[jz], 0x74);
         assert_eq!(jz + 2 + code[jz + 1] as usize, trap);
-        let probes = code.windows(8).filter(|it| *it == [0x48, 0xc7, 0x04, 0x24, 0, 0, 0, 0]).count();
+        let probes =
+            code.windows(8).filter(|it| *it == [0x48, 0xc7, 0x04, 0x24, 0, 0, 0, 0]).count();
         let size = match isa {
             Isa::X86_64 { save, .. } => save.size(),
             Isa::Aarch64 { .. } => unreachable!(),
@@ -137,7 +140,8 @@ fn the_aarch64_resolver_calls_the_cell_and_traps_on_zero() {
     for sve in [false, true] {
         let stubs = generate(&Isa::Aarch64 { sve }, 1, 0).unwrap();
         let code = words(&stubs.bytes[RESOLVER as usize..stubs.layout.entries as usize]);
-        let ldr = code.iter().position(|it| it & 0xff00_001f == 0x5800_0010).expect("ldr x16, cell");
+        let ldr =
+            code.iter().position(|it| it & 0xff00_001f == 0x5800_0010).expect("ldr x16, cell");
         let imm19 = (code[ldr] >> 5) & 0x7ffff;
         let offset = ((imm19 << 13) as i32 >> 13) * 4;
         assert_eq!(i64::from(RESOLVER) + 4 * ldr as i64 + i64::from(offset), i64::from(CELL));

@@ -38,9 +38,9 @@ use std::{
 use base_db::Crate;
 use blaze_core::sim::{Faults, Sim};
 use blaze_usercode::{index, roots::verify};
-use proc_macro_api::kept::{self, Environment, Expansions, Keep, Put};
 use hir_def::nameres::crate_def_map;
 use hir_expand::proc_macro::{ExpansionReads, ProcMacroCall, ProcMacroExpander};
+use proc_macro_api::kept::{self, Environment, Expansions, Keep, Put};
 
 use config::Corpus;
 use record::{Record, Recorder, Records};
@@ -76,16 +76,21 @@ fn build(
     records: &Records,
     loaded: &mut Loaded,
 ) -> load::Workspace {
-    let workspace = load::lower(dir, &config.cargo_home, config.homes(), keeping, |krate, macros| {
-        Ok(macros
-            .into_iter()
-            .map(|eval| {
-                loaded.push((krate.to_owned(), eval.name.as_str().to_owned(), eval.expander.clone()));
-                Recorder::wrap(krate, eval, records)
-            })
-            .collect())
-    })
-    .unwrap_or_else(|why| panic!("{why}"));
+    let workspace =
+        load::lower(dir, &config.cargo_home, config.homes(), keeping, |krate, macros| {
+            Ok(macros
+                .into_iter()
+                .map(|eval| {
+                    loaded.push((
+                        krate.to_owned(),
+                        eval.name.as_str().to_owned(),
+                        eval.expander.clone(),
+                    ));
+                    Recorder::wrap(krate, eval, records)
+                })
+                .collect())
+        })
+        .unwrap_or_else(|why| panic!("{why}"));
     let calls = workspace.krate("corpus-calls").unwrap_or_else(|why| panic!("{why}"));
     crate_def_map(workspace.lowered.db(), calls);
     workspace
@@ -107,8 +112,10 @@ fn whats(puts: &[Put]) -> Vec<&str> {
 
 /// The one recorded call of `name` on `subject` from `corpus-calls`.
 fn the_call<'a>(records: &'a [Record], name: &str, subject: &str) -> &'a Record {
-    let found: Vec<&Record> =
-        records.iter().filter(|it| &*it.call.name == name && it.call.subject().as_deref() == Some(subject)).collect();
+    let found: Vec<&Record> = records
+        .iter()
+        .filter(|it| &*it.call.name == name && it.call.subject().as_deref() == Some(subject))
+        .collect();
     match found.as_slice() {
         [one] => one,
         _ => panic!("{} calls of `{name}` on `{subject}`", found.len()),
@@ -138,7 +145,9 @@ const COPY: &[u8] = b"blaze v2 a checkout's copy 2\0";
 fn verified(puts: &mut [Put]) -> Vec<(blaze_usercode::RunKey, blaze_cas::Key)> {
     let named = "the proc macro `Serialize` of ";
     let mut verified = Vec::new();
-    for put in puts.iter_mut().filter(|it| it.what.starts_with(named) && !it.value.starts_with(COPY)) {
+    for put in
+        puts.iter_mut().filter(|it| it.what.starts_with(named) && !it.value.starts_with(COPY))
+    {
         let Keep::Run { run, traced } = &put.keep else { continue };
         // Any key stands for the unmarked result: it is what the record is found by.
         let unmarked = index::result_key(run, traced);
@@ -157,10 +166,18 @@ struct Changed {
 impl Changed {
     fn write(path: &Path, text: &str) -> Changed {
         let was = std::fs::read(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        assert_ne!(was.len(), text.len(), "a changed length tells the change apart from the file's stamp alone");
+        assert_ne!(
+            was.len(),
+            text.len(),
+            "a changed length tells the change apart from the file's stamp alone"
+        );
         std::fs::write(path, text).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        let file = std::fs::File::options().write(true).open(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        file.set_modified(SystemTime::now() + Duration::from_secs(5)).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        file.set_modified(SystemTime::now() + Duration::from_secs(5))
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         Changed { path: path.to_owned(), was }
     }
 }
@@ -182,8 +199,12 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     let toolchain = load::toolchain().unwrap_or_else(|why| panic!("{why}"));
     let mut sim = Sim::new(5, Faults::default());
     let mut store = kept_in(&mut sim);
-    let keeping = kept::Keeping::new(Expansions { store: store.reader(), toolchain, environment: Arc::new(Environment::default()) })
-        .unwrap_or_else(|why| panic!("{why}"));
+    let keeping = kept::Keeping::new(Expansions {
+        store: store.reader(),
+        toolchain,
+        environment: Arc::new(Environment::default()),
+    })
+    .unwrap_or_else(|why| panic!("{why}"));
     let macros = blaze_macro_eval::Macros::new(kept::Keeps::In(keeping), None);
 
     // A first build runs every macro and keeps what each stateless one made.
@@ -205,14 +226,25 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
         "include_data",
         "env_name",
     ] {
-        assert!(!puts_of(&puts, name).is_empty(), "the first build keeps nothing of `{name}`: {:?}", whats(&puts));
+        assert!(
+            !puts_of(&puts, name).is_empty(),
+            "the first build keeps nothing of `{name}`: {:?}",
+            whats(&puts)
+        );
     }
-    assert!(puts_of(&puts, "counter").is_empty(), "`counter` keeps state, and was kept: {:?}", whats(&puts));
+    assert!(
+        puts_of(&puts, "counter").is_empty(),
+        "`counter` keeps state, and was kept: {:?}",
+        whats(&puts)
+    );
     let verdict = |puts: &[Put], krate: &str| {
         // The crate's display name is its package's or its target's.
         let names = [krate.to_owned(), krate.replace('_', "-")]
             .map(|name| format!("the verdict of the proc macros of `{name}`"));
-        puts.iter().filter(|it| names.contains(&it.what)).map(|it| it.value.clone()).collect::<Vec<_>>()
+        puts.iter()
+            .filter(|it| names.contains(&it.what))
+            .map(|it| it.value.clone())
+            .collect::<Vec<_>>()
     };
     // Its first call changed the fresh state (it settles), its second what the first left.
     assert_eq!(
@@ -240,7 +272,11 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     assert!(puts.is_empty(), "the second build ran what the first kept: {:?}", whats(&puts));
     assert_eq!(firstly.len(), secondly.len(), "both builds make the same calls");
     for (one, two) in firstly.iter().zip(&secondly) {
-        assert_eq!((&one.call.krate, &one.call.name), (&two.call.krate, &two.call.name), "both builds call in one order");
+        assert_eq!(
+            (&one.call.krate, &one.call.name),
+            (&two.call.krate, &two.call.name),
+            "both builds call in one order"
+        );
         match (one.eval.expanded(), two.eval.expanded()) {
             (Some(ours), Some(theirs)) => {
                 if let Some(difference) = difference::difference(theirs, ours) {
@@ -265,17 +301,31 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     env.set("CARGO_PKG_NAME", "corpus-renamed");
     let (said, puts) = replay("env_name", ProcMacroCall { env: &env, ..package.call.call() });
     assert_eq!(said, ["\"corpus-renamed\""], "`env_name!` with CARGO_PKG_NAME changed");
-    assert_eq!(puts_of(&puts, "env_name").len(), 1, "with CARGO_PKG_NAME changed it ran: {:?}", whats(&puts));
+    assert_eq!(
+        puts_of(&puts, "env_name").len(),
+        1,
+        "with CARGO_PKG_NAME changed it ran: {:?}",
+        whats(&puts)
+    );
     let (said, puts) = replay("env_name", package.call.call());
     assert_eq!(said, ["\"corpus-calls\""], "`env_name!` as it was called");
     assert!(puts.is_empty(), "as it was called it is found: {:?}", whats(&puts));
 
     // A call whose file changed finds nothing of the first and reads it again.
     let data = the_call(&secondly, "include_data", "DATA");
-    let changed = Changed::write(&Path::new(&dir).join("calls/data.txt"), "changed after the first build\n");
+    let changed =
+        Changed::write(&Path::new(&dir).join("calls/data.txt"), "changed after the first build\n");
     let (said, puts) = replay("include_data", data.call.call());
-    assert!(said.iter().any(|it| it.contains("changed after the first build")), "`include_data!` read the old file: {said:?}");
-    assert_eq!(puts_of(&puts, "include_data").len(), 1, "with its file changed it ran: {:?}", whats(&puts));
+    assert!(
+        said.iter().any(|it| it.contains("changed after the first build")),
+        "`include_data!` read the old file: {said:?}"
+    );
+    assert_eq!(
+        puts_of(&puts, "include_data").len(),
+        1,
+        "with its file changed it ran: {:?}",
+        whats(&puts)
+    );
     drop(changed);
 
     // M1 (round 8): the warm database was given `Serialize` verified across checkouts. Once
@@ -286,7 +336,8 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
         .find(|it| &*it.call.name == "Serialize" && it.call.calling == Some(calls))
         .unwrap_or_else(|| panic!("`corpus-calls` calls no `Serialize`"));
     let again = |call: ProcMacroCall<'_>| {
-        let output = expander_of(&loaded, &serialize.call.krate, "Serialize").expand_in(db, calls, call);
+        let output =
+            expander_of(&loaded, &serialize.call.krate, "Serialize").expand_in(db, calls, call);
         output.unwrap_or_else(|error| panic!("`Serialize` again: {error:?}"));
         kept::take_puts()
     };
@@ -295,21 +346,37 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     let at = macros.keeps().retractions_now();
     let keeping = macros.keeps().keeping().unwrap_or_else(|not| panic!("{not}"));
     for (run, unmarked) in &verified {
-        keeping.put(Put::of(verify::retraction(run, unmarked), "the record of `Serialize`".to_owned()));
+        keeping.put(Put::of(
+            verify::retraction(run, unmarked),
+            "the record of `Serialize`".to_owned(),
+        ));
     }
-    assert_eq!(macros.keeps().retractions_now(), at, "put, not published: nothing is retracted yet");
+    assert_eq!(
+        macros.keeps().retractions_now(),
+        at,
+        "put, not published: nothing is retracted yet"
+    );
     let published = macros.keeps().publish(&mut store, Vec::new());
     assert!(published.refused.is_empty(), "{:?}", published.refused);
     assert!(!published.durable.is_empty(), "a record is durable before its job is done");
-    assert_ne!(macros.keeps().retractions_now(), at, "retracted: a front end kept at the old epoch is lowered afresh");
+    assert_ne!(
+        macros.keeps().retractions_now(),
+        at,
+        "retracted: a front end kept at the old epoch is lowered afresh"
+    );
     let puts = again(serialize.call.call());
-    assert!(!puts_of(&puts, "Serialize").is_empty(), "retracted, it expanded again: {:?}", whats(&puts));
+    assert!(
+        !puts_of(&puts, "Serialize").is_empty(),
+        "retracted, it expanded again: {:?}",
+        whats(&puts)
+    );
 }
 
 /// The values of the store's verdict of the proc-macro crate `krate` that `puts` put.
 fn verdicts(puts: &[Put], krate: &str) -> Vec<Vec<u8>> {
     // The crate's display name is its package's or its target's.
-    let names = [krate.to_owned(), krate.replace('_', "-")].map(|name| format!("the verdict of the proc macros of `{name}`"));
+    let names = [krate.to_owned(), krate.replace('_', "-")]
+        .map(|name| format!("the verdict of the proc macros of `{name}`"));
     puts.iter().filter(|it| names.contains(&it.what)).map(|it| it.value.clone()).collect()
 }
 
@@ -317,14 +384,21 @@ fn verdicts(puts: &[Put], krate: &str) -> Vec<Vec<u8>> {
 /// to the front end (`hir_expand`'s `expansion_reads`), its def map made first.
 fn reads_of(db: &base_db::Db, krate: Crate, of: Crate) -> Vec<ExpansionReads> {
     let def_map = crate_def_map(db, krate);
-    let calls: Vec<_> = def_map.modules(db).flat_map(|(_, module)| module.scope(db).all_macro_calls()).collect();
-    calls.into_iter().filter(|call| call.loc(db).def.krate == of).map(|call| call.expansion_reads(db).clone()).collect()
+    let calls: Vec<_> =
+        def_map.modules(db).flat_map(|(_, module)| module.scope(db).all_macro_calls()).collect();
+    calls
+        .into_iter()
+        .filter(|call| call.loc(db).def.krate == of)
+        .map(|call| call.expansion_reads(db).clone())
+        .collect()
 }
 
 /// The one recorded call of `name` on `subject`.
 fn call_on<'a>(records: &'a [Record], name: &str, subject: &str) -> &'a Record {
-    let found: Vec<&Record> =
-        records.iter().filter(|it| &*it.call.name == name && it.call.subject().as_deref() == Some(subject)).collect();
+    let found: Vec<&Record> = records
+        .iter()
+        .filter(|it| &*it.call.name == name && it.call.subject().as_deref() == Some(subject))
+        .collect();
     match found.as_slice() {
         [one] => one,
         _ => panic!("{} calls of `{name}` on `{subject}`", found.len()),
@@ -356,8 +430,12 @@ fn a_session_macro_reports_its_reads_only_once_shown_the_same_from_either_state(
     let toolchain = load::toolchain().unwrap_or_else(|why| panic!("{why}"));
     let mut sim = Sim::new(5, Faults::default());
     let mut store = kept_in(&mut sim);
-    let keeping = kept::Keeping::new(Expansions { store: store.reader(), toolchain, environment: Arc::new(Environment::default()) })
-        .unwrap_or_else(|why| panic!("{why}"));
+    let keeping = kept::Keeping::new(Expansions {
+        store: store.reader(),
+        toolchain,
+        environment: Arc::new(Environment::default()),
+    })
+    .unwrap_or_else(|why| panic!("{why}"));
     let macros = blaze_macro_eval::Macros::new(kept::Keeps::In(keeping), None);
     let records = Records::default();
     let mut loaded = Loaded::new();
@@ -366,22 +444,37 @@ fn a_session_macro_reports_its_reads_only_once_shown_the_same_from_either_state(
         (krate("corpus-sessions"), krate("corpus-once"), krate("corpus-settles"))
     };
     let unknown_saying = |reads: &[ExpansionReads], said: &str| {
-        reads.len() == 3 && reads.iter().all(|it| matches!(it, ExpansionReads::Unknown(why) if why.contains(said)))
+        reads.len() == 3
+            && reads
+                .iter()
+                .all(|it| matches!(it, ExpansionReads::Unknown(why) if why.contains(said)))
     };
-    let traced = |reads: &[ExpansionReads]| reads.len() == 3 && reads.iter().all(|it| matches!(it, ExpansionReads::Traced { .. }));
+    let traced = |reads: &[ExpansionReads]| {
+        reads.len() == 3 && reads.iter().all(|it| matches!(it, ExpansionReads::Traced { .. }))
+    };
 
     // 1. Unseen: each crate's first call changes the fresh state, and none what it left.
     let first = build(&config, &dir, &macros, &records, &mut loaded);
     let (sessions, once, settles) = crates(&first);
     let db = first.lowered.db();
-    for (of, reads) in [("once", reads_of(db, sessions, once)), ("detect", reads_of(db, sessions, settles))] {
+    for (of, reads) in
+        [("once", reads_of(db, sessions, once)), ("detect", reads_of(db, sessions, settles))]
+    {
         assert!(unknown_saying(&reads, "does not settle"), "`{of}!`, unseen: {reads:?}");
     }
     let mut puts = kept::take_puts();
     assert_eq!(verdicts(&puts, "corpus_once"), [b"settles".to_vec()], "{:?}", whats(&puts));
     assert_eq!(verdicts(&puts, "corpus_settles"), [b"settles".to_vec()], "{:?}", whats(&puts));
-    assert!(puts_of(&puts, "once").is_empty(), "`once!` was kept, giving otherwise from the fresh state: {:?}", whats(&puts));
-    assert!(!puts_of(&puts, "detect").is_empty(), "`detect!`'s calls from the settled state are kept: {:?}", whats(&puts));
+    assert!(
+        puts_of(&puts, "once").is_empty(),
+        "`once!` was kept, giving otherwise from the fresh state: {:?}",
+        whats(&puts)
+    );
+    assert!(
+        !puts_of(&puts, "detect").is_empty(),
+        "`detect!`'s calls from the settled state are kept: {:?}",
+        whats(&puts)
+    );
     macros.flush();
     puts.extend(kept::take_puts());
     let published = macros.keeps().publish(&mut store, puts);
@@ -400,16 +493,33 @@ fn a_session_macro_reports_its_reads_only_once_shown_the_same_from_either_state(
     let reads = reads_of(db, sessions, settles);
     assert!(traced(&reads), "{reads:?}");
     let puts = kept::take_puts();
-    assert_eq!(verdicts(&puts, "corpus_once"), [b"stateful".to_vec()], "`once!` was told to be stateful: {:?}", whats(&puts));
+    assert_eq!(
+        verdicts(&puts, "corpus_once"),
+        [b"stateful".to_vec()],
+        "`once!` was told to be stateful: {:?}",
+        whats(&puts)
+    );
     assert!(puts_of(&puts, "once").is_empty(), "`once!` was kept unshown: {:?}", whats(&puts));
-    assert!(puts_of(&puts, "detect").is_empty(), "`detect!` ran what the first build kept: {:?}", whats(&puts));
+    assert!(
+        puts_of(&puts, "detect").is_empty(),
+        "`detect!` ran what the first build kept: {:?}",
+        whats(&puts)
+    );
     taken(&records);
 
     // 3. A warm revision of the second build's database, the third call of each edited.
     let path = Path::new(&dir).join("sessions/src/lib.rs");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    let edited = text.replace("once!(ONCE_THIRD)", "once!(ONCE_EDITED)").replace("detect!(DETECT_THIRD)", "detect!(DETECT_EDITED)");
-    assert_ne!(edited, text, "{} calls `once!(ONCE_THIRD)` and `detect!(DETECT_THIRD)`", path.display());
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let edited = text
+        .replace("once!(ONCE_THIRD)", "once!(ONCE_EDITED)")
+        .replace("detect!(DETECT_THIRD)", "detect!(DETECT_EDITED)");
+    assert_ne!(
+        edited,
+        text,
+        "{} calls `once!(ONCE_THIRD)` and `detect!(DETECT_THIRD)`",
+        path.display()
+    );
     let file = (second.lowered.paths().iter())
         .find(|(_, it)| Path::new(it.as_str()) == path)
         .map(|(file, _)| *file)
@@ -417,7 +527,10 @@ fn a_session_macro_reports_its_reads_only_once_shown_the_same_from_either_state(
     second.lowered.served_db().set_file_text(file, &edited);
     let db = second.lowered.db();
     let reads = reads_of(db, sessions, once);
-    assert!(reads.len() == 3 && reads.iter().all(|it| matches!(it, ExpansionReads::Unknown(_))), "warm: {reads:?}");
+    assert!(
+        reads.len() == 3 && reads.iter().all(|it| matches!(it, ExpansionReads::Unknown(_))),
+        "warm: {reads:?}"
+    );
     let reads = reads_of(db, sessions, settles);
     assert!(traced(&reads), "warm: {reads:?}");
     let warm = taken(&records);
@@ -428,7 +541,8 @@ fn a_session_macro_reports_its_reads_only_once_shown_the_same_from_either_state(
     // A cold build of the edit, every call run in order from a fresh session, nothing kept:
     // what rustc gives.
     let changed = Changed::write(&path, &edited);
-    let cold_macros = blaze_macro_eval::Macros::new(kept::Keeps::Nothing("a cold build keeps nothing"), None);
+    let cold_macros =
+        blaze_macro_eval::Macros::new(kept::Keeps::Nothing("a cold build keeps nothing"), None);
     let cold = build(&config, &dir, &cold_macros, &records, &mut loaded);
     let (sessions, _, settles) = crates(&cold);
     reads_of(cold.lowered.db(), sessions, settles);

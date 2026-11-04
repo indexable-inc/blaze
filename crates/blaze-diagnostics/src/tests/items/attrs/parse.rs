@@ -21,7 +21,10 @@ fn f0() {}
 )]
 fn f1() {}
 "#;
-    assert_reports(&ui("attr-missing-comma.rs", "2015", source), &[error(4, &["`,`"]), error(10, &["`,`"])]);
+    assert_reports(
+        &ui("attr-missing-comma.rs", "2015", source),
+        &[error(4, &["`,`"]), error(10, &["`,`"])],
+    );
 }
 
 #[test]

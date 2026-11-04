@@ -579,7 +579,7 @@ fn neon(op: &str, types: &[Lanes]) -> Option<Lowered> {
                 features: features(&["aes"]),
                 text,
                 args: vec![Some(8); 2], // alloc: Lowered's own list, the output
-                results: vec![16], // alloc: Lowered's own list, the output
+                results: vec![16],      // alloc: Lowered's own list, the output
                 immediate: None,
             })
         }
@@ -884,7 +884,7 @@ impl Fused {
             features: features(&[]),
             text,
             args: vec![bytes(t), bytes(t), Some(c_bytes)], // alloc: Lowered's own list, the output
-            results: vec![t.bytes()], // alloc: Lowered's own list, the output
+            results: vec![t.bytes()],                      // alloc: Lowered's own list, the output
             immediate: None,
         };
         finish(lowered, &[t])
@@ -1006,12 +1006,7 @@ impl<'db> FunctionCx<'_, 'db> {
     /// `llvm.aarch64.neon.{name}` as Cranelift's vector instructions ([`Vector`]), in place
     /// of a lane at a time or a call of the instruction's own function. False for one that
     /// is not one of them.
-    pub(super) fn neon_vector(
-        &mut self,
-        name: &str,
-        args: &[Operand],
-        dst: Value,
-    ) -> Result<bool> {
+    pub(super) fn neon_vector(&mut self, name: &str, args: &[Operand], dst: Value) -> Result<bool> {
         if self.cg.target.arch != Arch::Aarch64 {
             return Ok(false);
         }

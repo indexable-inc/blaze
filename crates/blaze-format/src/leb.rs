@@ -226,9 +226,7 @@ fn decode_u64(rest: &[u8]) -> Result<(u64, usize), LebError> {
         return Ok((low | (u64::from(ninth) << 56), 9));
     }
     match *rest.get(9).ok_or(LebError::Truncated)? {
-        tenth @ 0..=1 => {
-            Ok((low | (u64::from(ninth & 0x7f) << 56) | (u64::from(tenth) << 63), 10))
-        }
+        tenth @ 0..=1 => Ok((low | (u64::from(ninth & 0x7f) << 56) | (u64::from(tenth) << 63), 10)),
         _ => Err(LebError::Overflow),
     }
 }

@@ -110,10 +110,7 @@ impl SpareVectors {
             }
             left => {
                 *slot = left;
-                SpareVectors {
-                    nodes: Vec::with_capacity(nodes),
-                    spans: Vec::with_capacity(spans),
-                }
+                SpareVectors { nodes: Vec::with_capacity(nodes), spans: Vec::with_capacity(spans) }
             }
         }
     }
@@ -416,11 +413,7 @@ const I64_LIMIT: f64 = (1u128 << 63) as f64;
 /// Both conversions truncate towards zero, saturate at the bounds and
 /// take `NaN` to zero; the `i64` one is a single instruction.
 fn f64_to_i128(r: f64) -> i128 {
-    if (-I64_LIMIT..I64_LIMIT).contains(&r) {
-        i128::from(r as i64)
-    } else {
-        r as i128
-    }
+    if (-I64_LIMIT..I64_LIMIT).contains(&r) { i128::from(r as i64) } else { r as i128 }
 }
 
 /// Hand-picked "interesting" boundary values: the small magnitudes `0..=±8`,
@@ -860,9 +853,7 @@ pub(crate) fn biased_i64_sample(
 /// overflows `i128` is unambiguously wide.
 pub(crate) fn is_narrow(min_value: i128, max_value: i128) -> bool {
     min_value < max_value
-        && max_value
-            .checked_sub(min_value)
-            .is_some_and(|w| (w as u128) < CURATED_MIN_WIDTH)
+        && max_value.checked_sub(min_value).is_some_and(|w| (w as u128) < CURATED_MIN_WIDTH)
 }
 
 /// What the narrow-range sampler works out from a range's bounds alone:
@@ -1007,12 +998,7 @@ fn biased_i128_sample(
     // distinct values on the stack, so this hot path allocates nothing).
     let mut endpoints = [0i128; 4];
     let mut n_end = 0usize;
-    for v in [
-        min_value,
-        max_value,
-        min_value.saturating_add(1),
-        max_value.saturating_sub(1),
-    ] {
+    for v in [min_value, max_value, min_value.saturating_add(1), max_value.saturating_sub(1)] {
         if v >= min_value && v <= max_value && !endpoints[..n_end].contains(&v) {
             endpoints[n_end] = v;
             n_end += 1;
@@ -1073,12 +1059,7 @@ fn biguint_sample_in_range(
 
     // Endpoint category: the range edges and their inner neighbours.
     let mut endpoints: Vec<BigInt> = Vec::with_capacity(4);
-    for v in [
-        min.clone(),
-        max.clone(),
-        min + BigInt::from(1),
-        max - BigInt::from(1),
-    ] {
+    for v in [min.clone(), max.clone(), min + BigInt::from(1), max - BigInt::from(1)] {
         if &v >= min && &v <= max && !endpoints.contains(&v) {
             endpoints.push(v);
         }
@@ -1135,11 +1116,7 @@ fn biguint_sample_in_range(
     let fits_below = magnitude <= below;
     let fits_above = magnitude <= above;
     let go_below = fits_below && (!fits_above || rng.random::<bool>());
-    Ok(if go_below {
-        center - BigInt::from(magnitude)
-    } else {
-        center + BigInt::from(magnitude)
-    })
+    Ok(if go_below { center - BigInt::from(magnitude) } else { center + BigInt::from(magnitude) })
 }
 
 /// Draw a [`BigUint`] at most `span` whose bit width is shaped like the
@@ -1164,20 +1141,13 @@ fn sample_biguint_shaped(span: &BigUint, rng: &mut EngineRng) -> Result<BigUint,
     let hi = dist.cdf(top + 0.5)?;
     let p = lo + rng.random::<f64>() * (hi - lo);
     let magnitude = libm::round(dist.inverse_cdf(p)?);
-    let width = if magnitude < 1.0 {
-        0
-    } else {
-        (libm::floor(libm::log2(magnitude)) as u64 + 1).min(bits)
-    };
+    let width =
+        if magnitude < 1.0 { 0 } else { (libm::floor(libm::log2(magnitude)) as u64 + 1).min(bits) };
     if width == 0 {
         return Ok(BigUint::from(0u32));
     }
     let floor = BigUint::from(1u32) << (width - 1) as usize;
-    let room = if width < bits {
-        &floor - BigUint::from(1u32)
-    } else {
-        span - &floor
-    };
+    let room = if width < bits { &floor - BigUint::from(1u32) } else { span - &floor };
     Ok(floor + sample_biguint_at_most(&room, rng))
 }
 
@@ -1232,25 +1202,13 @@ pub(crate) fn biased_float_sample(
         (params.near_one_probability, float_near_one_sample),
         (params.integer_probability, float_integer_sample),
         (params.half_integer_probability, float_half_integer_sample),
-        (
-            params.near_max_for_add_probability,
-            float_near_max_for_add_sample,
-        ),
-        (
-            params.near_max_for_mul_probability,
-            float_near_max_for_mul_sample,
-        ),
-        (
-            params.near_sqrt_min_positive_probability,
-            float_near_sqrt_min_positive_sample,
-        ),
+        (params.near_max_for_add_probability, float_near_max_for_add_sample),
+        (params.near_max_for_mul_probability, float_near_max_for_mul_sample),
+        (params.near_sqrt_min_positive_probability, float_near_sqrt_min_positive_sample),
         (params.nan_probability, float_nan_sample),
         (params.infinity_probability, float_infinity_sample),
         (params.max_magnitude_probability, float_max_magnitude_sample),
-        (
-            params.max_exact_integer_probability,
-            float_max_exact_integer_sample,
-        ),
+        (params.max_exact_integer_probability, float_max_exact_integer_sample),
         (params.signed_zero_probability, float_signed_zero_sample),
         (params.binade_edge_probability, float_binade_edge_sample),
         (params.non_dyadic_probability, float_non_dyadic_sample),
@@ -1458,10 +1416,7 @@ static GLOBAL_CONSTANTS_STRINGS: Lazy<Vec<Vec<u32>>> = Lazy::new(|| {
         "lorem لا بسم الله ipsum 你好1234你好",
         "a\u{000A}b\u{000D}c\u{0085}d\u{000B}e\u{000C}f\u{2028}g\u{2029}h\u{000D}\u{000A}i",
     ];
-    strings
-        .iter()
-        .map(|s| s.chars().map(|c| c as u32).collect::<Vec<u32>>())
-        .collect()
+    strings.iter().map(|s| s.chars().map(|c| c as u32).collect::<Vec<u32>>()).collect()
 });
 
 /// Boundary-biased sample for strings. Builds a "nasty" pool from the
@@ -1509,11 +1464,8 @@ pub(crate) fn biased_string_sample(
     let global_pool = &*GLOBAL_CONSTANTS_STRINGS;
     let contained = constants_in_alphabet(&sc.intervals);
     let size_ok = |cps: &[u32]| sc.min_size <= cps.len() && cps.len() <= sc.max_size;
-    let valid_global_count = global_pool
-        .iter()
-        .zip(contained.iter())
-        .filter(|(cps, m)| **m && size_ok(cps))
-        .count();
+    let valid_global_count =
+        global_pool.iter().zip(contained.iter()).filter(|(cps, m)| **m && size_ok(cps)).count();
     let count = small_count + valid_global_count;
     let threshold = (count as f64 * BOUNDARY_PROBABILITY).min(0.5);
     if rng.random::<f64>() < threshold {
@@ -1573,9 +1525,7 @@ pub(crate) fn biased_string_sample(
     }
 
     let len = many_draw_length(rng, sc.min_size, sc.max_size)?;
-    Ok((0..len)
-        .map(|_| sub_alphabet[rng.random_range(0..sub_alphabet.len())])
-        .collect())
+    Ok((0..len).map(|_| sub_alphabet[rng.random_range(0..sub_alphabet.len())]).collect())
 }
 
 /// Convert a codepoint sequence to a Rust `String`, dropping any surrogate
@@ -1633,10 +1583,7 @@ pub struct NativeVariables {
 
 impl NativeVariables {
     pub fn new() -> Self {
-        NativeVariables {
-            variables: Vec::new(),
-            removed: crate::native::HashSet::default(),
-        }
+        NativeVariables { variables: Vec::new(), removed: crate::native::HashSet::default() }
     }
 
     /// Add a variable ID (from [`NativeTestCase::draw_fresh_id`]) to the pool.
@@ -1646,11 +1593,7 @@ impl NativeVariables {
 
     /// Return the IDs of variables that have not been consumed, in order.
     pub fn active(&self) -> Vec<i64> {
-        self.variables
-            .iter()
-            .filter(|id| !self.removed.contains(*id))
-            .copied()
-            .collect()
+        self.variables.iter().filter(|id| !self.removed.contains(*id)).copied().collect()
     }
 
     /// Mark a variable as consumed.
@@ -1892,10 +1835,7 @@ impl FamilyCore {
     /// This test case's swarm parameters, or [`GenerationParameters::default`]
     /// if none were drawn (a replay-only family, which never samples).
     pub(crate) fn generation_parameters(&self) -> GenerationParameters {
-        self.generation_parameters
-            .get()
-            .copied()
-            .unwrap_or_default()
+        self.generation_parameters.get().copied().unwrap_or_default()
     }
 
     /// The family's concluded status, or `None` while still running.
@@ -2079,11 +2019,7 @@ impl NativeTestCase {
         observer: Option<Box<dyn DataObserver>>,
     ) -> Self {
         let max_size = max_size.max(choices.len());
-        let budget = if trailing.is_some() {
-            max_size
-        } else {
-            usize::MAX
-        };
+        let budget = if trailing.is_some() { max_size } else { usize::MAX };
         Self::new_stream(
             Replay::pun(choices.to_vec(), prefix_nodes.map(|n| n.to_vec())),
             None,
@@ -2218,14 +2154,8 @@ impl NativeTestCase {
         family: Arc<FamilyCore>,
         clone_id: Vec<usize>,
     ) -> Self {
-        let nodes = MOST_NODES
-            .load(Ordering::Relaxed)
-            .min(max_size)
-            .min(MOST_RESERVED);
-        let spans = MOST_SPANS
-            .load(Ordering::Relaxed)
-            .min(max_size)
-            .min(MOST_RESERVED);
+        let nodes = MOST_NODES.load(Ordering::Relaxed).min(max_size).min(MOST_RESERVED);
+        let spans = MOST_SPANS.load(Ordering::Relaxed).min(max_size).min(MOST_RESERVED);
         let addressed = replay.addressed();
         let bookkept = if addressed { spans } else { 0 };
         let spare = SpareVectors::take(&mut SPARE_VECTORS.lock(), max_size, nodes, spans);
@@ -2378,14 +2308,10 @@ impl NativeTestCase {
             return Err(EngineError::InvalidTestCase);
         }
         let idx = self.nodes.len();
-        let child_replay = self
-            .replay
-            .clone_child(&self.clone_id, idx, || self.draw_address());
+        let child_replay = self.replay.clone_child(&self.clone_id, idx, || self.draw_address());
         let child_rng = self.rng.as_mut().map(EngineRng::spawn);
-        let child_template = self.trailing_template.as_ref().map(|t| ChoiceTemplate {
-            kind: t.kind,
-            count: None,
-        });
+        let child_template =
+            self.trailing_template.as_ref().map(|t| ChoiceTemplate { kind: t.kind, count: None });
         let child_max_size =
             if child_rng.is_some() || child_template.is_some() || self.replay.stops() {
                 usize::MAX
@@ -2407,10 +2333,7 @@ impl NativeTestCase {
             child_id,
         );
         let handle = Arc::new(Mutex::new(child));
-        self.record(ChoiceNode::clone_stream(
-            Arc::new(RealizedStream::empty()),
-            false,
-        ));
+        self.record(ChoiceNode::clone_stream(Arc::new(RealizedStream::empty()), false));
         self.clone_children.push((idx, Arc::clone(&handle)));
         Ok(handle)
     }
@@ -2460,14 +2383,7 @@ impl NativeTestCase {
         let depth = self.span_stack.len() as u32;
         let idx = self.spans.len();
         let start = self.nodes.len();
-        self.spans.push(Span {
-            start,
-            end: start,
-            label,
-            depth,
-            parent,
-            discarded: false,
-        });
+        self.spans.push(Span { start, end: start, label, depth, parent, discarded: false });
         if self.addressed {
             self.address_span(parent, label);
         }
@@ -2549,11 +2465,7 @@ impl NativeTestCase {
                 None => self.top_child_nodes,
             };
         }
-        self.spans
-            .iter()
-            .filter(|s| s.parent == parent)
-            .map(|s| s.end - s.start)
-            .sum()
+        self.spans.iter().filter(|s| s.parent == parent).map(|s| s.end - s.start).sum()
     }
 
     /// Close the innermost currently-open span.
@@ -2678,10 +2590,7 @@ impl NativeTestCase {
 
         let params = self.family.generation_parameters().integer;
         let narrow = if is_narrow(i128::from(min_value), i128::from(max_value)) {
-            Some(
-                self.narrow_ranges
-                    .get(i128::from(min_value), i128::from(max_value))?,
-            )
+            Some(self.narrow_ranges.get(i128::from(min_value), i128::from(max_value))?)
         } else {
             None
         };
@@ -2826,8 +2735,7 @@ impl NativeTestCase {
         }
 
         self.plain &= plain(&kind, &recorded);
-        self.nodes
-            .push(ChoiceNode::integer(kind, recorded, was_forced));
+        self.nodes.push(ChoiceNode::integer(kind, recorded, was_forced));
 
         Ok(v)
     }
@@ -2940,10 +2848,7 @@ impl NativeTestCase {
     /// monotonically; values beyond the window are punned to the smallest
     /// member.
     pub fn draw_from_set(&mut self, members: &[i64]) -> Result<i64, EngineError> {
-        hegel_internal_assert!(
-            !members.is_empty(),
-            "draw_from_set requires at least one member"
-        );
+        hegel_internal_assert!(!members.is_empty(), "draw_from_set requires at least one member");
         let mut sorted = members.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -3073,12 +2978,7 @@ impl NativeTestCase {
             "draw_string with empty alphabet must have max_size == 0"
         );
 
-        let kind = StringChoice {
-            intervals,
-            min_size,
-            max_size,
-            constraint: None,
-        };
+        let kind = StringChoice { intervals, min_size, max_size, constraint: None };
 
         let (v, was_forced) = self.resolve_choice(
             || kind.simplest(),
@@ -3151,10 +3051,7 @@ impl NativeTestCase {
             }
         };
 
-        self.record(ChoiceNode::new(
-            ChoiceData::String(kind, v.clone()),
-            was_forced,
-        ));
+        self.record(ChoiceNode::new(ChoiceData::String(kind, v.clone()), was_forced));
 
         let s = codepoints_to_string(&v);
         if let Some(ref mut obs) = self.observer {
@@ -3305,10 +3202,7 @@ impl NativeTestCase {
         unit: impl FnOnce() -> Result<V, InternalError>,
         from_prefix: impl Fn(&ChoiceValue) -> Option<V>,
     ) -> Result<Option<(V, bool)>, EngineError> {
-        match self
-            .replay
-            .resolve(&self.clone_id, idx, || self.draw_address(), from_prefix)
-        {
+        match self.replay.resolve(&self.clone_id, idx, || self.draw_address(), from_prefix) {
             Resolved::Served(v) if !(self.replay.stops() && self.replay.divergence().is_some()) => {
                 return Ok(Some((v, false)));
             }
@@ -3318,10 +3212,7 @@ impl NativeTestCase {
                     Some(pn) => *stored == pn.data.simplest_value()?,
                     None => false,
                 };
-                return Ok(Some((
-                    if is_simplest { simplest()? } else { unit()? },
-                    false,
-                )));
+                return Ok(Some((if is_simplest { simplest()? } else { unit()? }, false)));
             }
             Resolved::Exhausted => {}
         }
@@ -3509,16 +3400,8 @@ mod float_sample {
     pub(super) fn log_uniform_magnitude(lo: f64, hi: f64, rng: &mut EngineRng) -> f64 {
         let (e_lo, e_hi) = (lo.to_bits() >> 52, hi.to_bits() >> 52);
         let e = rng.random_range(e_lo..=e_hi);
-        let m_lo = if e == e_lo {
-            lo.to_bits() & FLOAT_MANTISSA_MASK
-        } else {
-            0
-        };
-        let m_hi = if e == e_hi {
-            hi.to_bits() & FLOAT_MANTISSA_MASK
-        } else {
-            FLOAT_MANTISSA_MASK
-        };
+        let m_lo = if e == e_lo { lo.to_bits() & FLOAT_MANTISSA_MASK } else { 0 };
+        let m_hi = if e == e_hi { hi.to_bits() & FLOAT_MANTISSA_MASK } else { FLOAT_MANTISSA_MASK };
         f64::from_bits((e << 52) | rng.random_range(m_lo..=m_hi))
     }
 
@@ -3630,11 +3513,7 @@ mod float_sample {
     pub(super) fn log_uniform_integer(lo: u64, hi: u64, rng: &mut EngineRng) -> u64 {
         let bits = |v: u64| 64 - v.leading_zeros();
         let b = rng.random_range(bits(lo)..=bits(hi));
-        let (first, last) = if b == 0 {
-            (0, 0)
-        } else {
-            (1u64 << (b - 1), (1u64 << b) - 1)
-        };
+        let (first, last) = if b == 0 { (0, 0) } else { (1u64 << (b - 1), (1u64 << b) - 1) };
         rng.random_range(first.max(lo)..=last.min(hi))
     }
 
@@ -3771,24 +3650,18 @@ mod float_sample {
                 return None;
             }
             let e_lo = lo >> m;
-            let k_lo = if e_lo == 0 || lo & ((1u64 << m) - 1) != 0 {
-                e_lo + 1
-            } else {
-                e_lo
-            };
+            let k_lo = if e_lo == 0 || lo & ((1u64 << m) - 1) != 0 { e_lo + 1 } else { e_lo };
             let k_hi = hi >> m;
             if k_lo > k_hi {
                 return None;
             }
             let power = rng.random_range(k_lo..=k_hi) << m;
             let predecessor = power - 1;
-            Some(
-                width.to_float(if rng.random::<bool>() && predecessor >= lo {
-                    predecessor
-                } else {
-                    power
-                }),
-            )
+            Some(width.to_float(if rng.random::<bool>() && predecessor >= lo {
+                predecessor
+            } else {
+                power
+            }))
         })
     }
 

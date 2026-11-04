@@ -195,7 +195,11 @@ pub struct BadRecord {
 
 impl fmt::Display for BadRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "line {} of the sandbox's record is not a record's line: {:?}", self.line, self.text)
+        write!(
+            f,
+            "line {} of the sandbox's record is not a record's line: {:?}",
+            self.line, self.text
+        )
     }
 }
 
@@ -343,7 +347,10 @@ pub fn package_of(path: &Path) -> Option<&Path> {
 /// The hash of every file of the package at `dir` as cargo watches it: every file below it,
 /// by its path from `dir` and its bytes, but what is in a directory whose name starts with a
 /// `.` and the package's own `target`. `None` for no directory there.
-pub fn package<I: Inputs + ?Sized>(inputs: &mut I, dir: &Path) -> Result<Option<[u8; 32]>, I::Error> {
+pub fn package<I: Inputs + ?Sized>(
+    inputs: &mut I,
+    dir: &Path,
+) -> Result<Option<[u8; 32]>, I::Error> {
     inputs.tree(dir, true)
 }
 
@@ -430,7 +437,10 @@ pub fn assemble<'l, I: Inputs>(
         None => true,
         Some(scope) => line.scope.is_empty() || line.scope == scope,
     };
-    assemble_seen(lines.into_iter().filter(ours).map(|line| (line.seen, line.what.as_str())), inputs)
+    assemble_seen(
+        lines.into_iter().filter(ours).map(|line| (line.seen, line.what.as_str())),
+        inputs,
+    )
 }
 
 /// [`assemble`] of lines already of one scope, borrowed: each name is owned once, however
@@ -452,7 +462,9 @@ pub fn assemble_seen<'a, I: Inputs>(
                 Seen::Env if whole_env(what) => all_env = true,
                 Seen::Env => env.push(what),
                 // A name this blaze doesn't know is something it can't trace either.
-                Seen::Untraceable => untraceable.push(untraceable_of(what).unwrap_or(Untraceable::Descriptor)),
+                Seen::Untraceable => {
+                    untraceable.push(untraceable_of(what).unwrap_or(Untraceable::Descriptor))
+                }
                 Seen::Incomplete => untraceable.push(Untraceable::Descriptor),
                 Seen::RefusedWrite | Seen::RefusedNet => {}
             }
@@ -498,7 +510,10 @@ pub fn assemble_seen<'a, I: Inputs>(
         for &name in &env {
             let name = OsStr::new(name);
             let had = whole > 0
-                && (name == ALL_ENV_NAME || traced.env[1..whole].binary_search_by(|it| it.0.as_os_str().cmp(name)).is_ok());
+                && (name == ALL_ENV_NAME
+                    || traced.env[1..whole]
+                        .binary_search_by(|it| it.0.as_os_str().cmp(name))
+                        .is_ok());
             if !had {
                 let value = inputs.env(name).map(OsStr::to_owned);
                 traced.env.push((name.to_owned(), value)); // alloc: kept, as above
@@ -734,9 +749,7 @@ pub(crate) fn os_from(bytes: &[u8]) -> Result<OsString, String> {
     }
     #[cfg(not(any(unix, windows, target_os = "wasi")))]
     {
-        std::str::from_utf8(bytes)
-            .map(OsString::from)
-            .map_err(|_| "a name is not UTF-8".to_owned()) // alloc: error path
+        std::str::from_utf8(bytes).map(OsString::from).map_err(|_| "a name is not UTF-8".to_owned()) // alloc: error path
     }
 }
 
@@ -906,7 +919,8 @@ mod tests {
             code: ContentId::of("blaze v2 test 1", b"code"),
             given: ContentId::of("blaze v2 test 1", b"given"),
         };
-        let paths: Vec<Vec<u8>> = (0..400).map(|n| format!("/usr/include/x86_64/header-{n}.h").into_bytes()).collect();
+        let paths: Vec<Vec<u8>> =
+            (0..400).map(|n| format!("/usr/include/x86_64/header-{n}.h").into_bytes()).collect();
         let huge = vec![b'v'; KEYER_BATCH + 17];
         let mut batched = Keyer::new(&run);
         let mut reference = Hasher::new(crate::RunKey::DOMAIN);
@@ -942,7 +956,9 @@ mod tests {
         fn entry(&mut self, path: &Path) -> Result<crate::trace::Entry, String> {
             Ok(match (self.dirs.contains_key(path), self.files.get(path)) {
                 (true, _) => crate::trace::Entry::Dir,
-                (false, Some(hash)) => crate::trace::Entry::File(blaze_ids::ContentId(*hash), blaze_vfs::Mode::Regular),
+                (false, Some(hash)) => {
+                    crate::trace::Entry::File(blaze_ids::ContentId(*hash), blaze_vfs::Mode::Regular)
+                }
                 (false, None) => crate::trace::Entry::Missing,
             })
         }
@@ -1053,7 +1069,10 @@ mod tests {
         assert_eq!(traced.env, vec![("CC".into(), Some("cc".into())), ("UNSET".into(), None)]);
         assert!(traced.untraceable.is_empty());
         let other = assemble(&lines, Some("e2"), &mut fixed()).unwrap();
-        assert_eq!(other.files, vec![("/usr/bin/cc".into(), Some([2; 32])), ("/ws/missing".into(), None)]);
+        assert_eq!(
+            other.files,
+            vec![("/usr/bin/cc".into(), Some([2; 32])), ("/ws/missing".into(), None)]
+        );
     }
 
     #[test]
@@ -1138,7 +1157,15 @@ mod tests {
             ]
         );
         let paths: Vec<&Path> = traced.files.iter().map(|it| it.0.as_path()).collect();
-        assert_eq!(paths, [Path::new("/usr/bin/cc"), Path::new("/ws/a.txt"), Path::new("/ws/b"), Path::new("/ws/z")]);
+        assert_eq!(
+            paths,
+            [
+                Path::new("/usr/bin/cc"),
+                Path::new("/ws/a.txt"),
+                Path::new("/ws/b"),
+                Path::new("/ws/z")
+            ]
+        );
         assert_eq!(traced.env, vec![("CC".into(), Some("cc".into())), ("ZED".into(), None)]);
         assert_eq!(traced.untraceable, vec![Untraceable::Clock, Untraceable::Random]);
         for turn in 1..lines.len() {
@@ -1192,7 +1219,10 @@ mod tests {
             }
         }
         let mut tree = Tree(BTreeMap::from([
-            ("/p".into(), vec![("src", true), ("build.rs", false), (".git", true), ("target", true)]),
+            (
+                "/p".into(),
+                vec![("src", true), ("build.rs", false), (".git", true), ("target", true)],
+            ),
             ("/p/src".into(), vec![("lib.rs", false), ("deep", true)]),
             ("/p/src/deep".into(), vec![("a.rs", false)]),
         ]));
@@ -1234,7 +1264,12 @@ mod tests {
     #[test]
     fn windows_names_round_trip_as_their_units() {
         let lone: [u16; 5] = [0x61, 0xd800, 0xdc00, 0xdfff, 0x2e];
-        for units in [vec![], "a.rs".encode_utf16().collect(), "日本/🦀".encode_utf16().collect(), lone.to_vec()] {
+        for units in [
+            vec![],
+            "a.rs".encode_utf16().collect(),
+            "日本/🦀".encode_utf16().collect(),
+            lone.to_vec(),
+        ] {
             let bytes = le_of_wide(units.iter().copied(), units.len());
             assert_eq!(bytes.len(), 2 * units.len());
             assert_eq!(wide_of_le(&bytes), Ok(units));

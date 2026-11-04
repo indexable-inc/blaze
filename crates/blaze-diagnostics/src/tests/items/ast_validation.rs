@@ -230,7 +230,16 @@ fn main() {
     }
 }
 "###;
-    assert_reports(&ui("fn-body-optional-semantic-fail.rs", "2015", source), &[error(7, &[]), error(8, &[]), error(18, &["`impl`"]), error(23, &["`impl`"]), error(29, &["`extern`"])]);
+    assert_reports(
+        &ui("fn-body-optional-semantic-fail.rs", "2015", source),
+        &[
+            error(7, &[]),
+            error(8, &[]),
+            error(18, &["`impl`"]),
+            error(23, &["`impl`"]),
+            error(29, &["`extern`"]),
+        ],
+    );
 }
 
 #[test]
@@ -656,11 +665,7 @@ fn main() { }
     );
     assert_reports(
         &super::ui_fixture(&fixture),
-        &[
-            error(21, &[]),
-            error(11, &["`'c`"]),
-            error(21, &[]),
-        ],
+        &[error(21, &[]), error(11, &["`'c`"]), error(21, &[])],
     );
 }
 
@@ -1313,7 +1318,17 @@ static mut C: u8; //~ ERROR free static item without body
 static mut D; //~ ERROR free static item without body
 //~^ ERROR missing type for `static mut` item
 "#;
-    assert_reports(&ui("item-free-static-no-body-semantic-fail.rs", "2015", source), &[error(5, &[]), error(6, &[]), error(9, &[]), error(10, &[]), error(6, &["`static`"]), error(10, &["`static mut`"])]);
+    assert_reports(
+        &ui("item-free-static-no-body-semantic-fail.rs", "2015", source),
+        &[
+            error(5, &[]),
+            error(6, &[]),
+            error(9, &[]),
+            error(10, &[]),
+            error(6, &["`static`"]),
+            error(10, &["`static mut`"]),
+        ],
+    );
 }
 
 #[test]
@@ -1327,7 +1342,10 @@ const A: u8; //~ ERROR free constant item without body
 const B; //~ ERROR free constant item without body
 //~^ ERROR missing type for `const` item
 "#;
-    assert_reports(&ui("item-free-const-no-body-semantic-fail.rs", "2015", source), &[error(5, &[]), error(6, &[]), error(6, &["`const`"])]);
+    assert_reports(
+        &ui("item-free-const-no-body-semantic-fail.rs", "2015", source),
+        &[error(5, &[]), error(6, &[]), error(6, &["`const`"])],
+    );
 }
 
 #[test]

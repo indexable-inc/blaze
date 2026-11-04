@@ -116,7 +116,8 @@ impl Builder {
             executions += 1;
             let found = execute(&mut threads, coro::Job::Main(Rc::clone(&main)), self.stack_size);
             if let Some(found) = found {
-                let report = rt::explorer(|rt| report(installed(rt), &found, executions, mode, run_seed));
+                let report =
+                    rt::explorer(|rt| report(installed(rt), &found, executions, mode, run_seed));
                 panic!("{report}");
             }
             let more = rt::explorer(|rt| {
@@ -139,7 +140,9 @@ impl Builder {
                 Ok(false) if seeds.is_some() => {}
                 Ok(false) => break,
                 Err(found) => {
-                    let report = rt::explorer(|rt| report(installed(rt), &found, executions, mode, run_seed));
+                    let report = rt::explorer(|rt| {
+                        report(installed(rt), &found, executions, mode, run_seed)
+                    });
                     panic!("{report}");
                 }
             }
@@ -223,7 +226,9 @@ fn execute(threads: &mut Vec<Coroutine>, main: coro::Job, stack: usize) -> Optio
 fn message(panic: &(dyn Any + Send)) -> &str {
     match panic.downcast_ref::<&'static str>() {
         Some(message) => message,
-        None => panic.downcast_ref::<String>().map_or("(a panic payload not a string)", String::as_str),
+        None => {
+            panic.downcast_ref::<String>().map_or("(a panic payload not a string)", String::as_str)
+        }
     }
 }
 

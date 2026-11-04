@@ -51,7 +51,9 @@ impl Hashes for ById {
     fn span(&self, _: &Db, owner: DefWithBodyId, span: MirSpan) -> Result<SpanRef, String> {
         let (table, index) = code::table_of(span)
             // alloc: an error
-            .map_err(|at| format!("{span:?} of {owner:?}: inlined span {at}, which is of another body"))?;
+            .map_err(|at| {
+                format!("{span:?} of {owner:?}: inlined span {at}, which is of another body")
+            })?;
         Ok(SpanRef { anchor: by_id("test span", (owner, table)), index })
     }
 

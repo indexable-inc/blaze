@@ -81,14 +81,20 @@ fn try_call(
     let returned = b.create_block();
     b.append_block_param(returned, I64);
     b.append_block_param(returned, I64);
-    let normal = b.func.dfg.block_call(returned, &[ir::BlockArg::TryCallRet(0), ir::BlockArg::TryCallRet(1)]);
+    let normal = b
+        .func
+        .dfg
+        .block_call(returned, &[ir::BlockArg::TryCallRet(0), ir::BlockArg::TryCallRet(1)]);
     let mut landings = Vec::with_capacity(catches.len());
     let mut items = Vec::with_capacity(catches.len());
     for catch in catches {
         let landing = b.create_block();
         b.append_block_param(landing, I64);
         b.append_block_param(landing, I64);
-        let to = b.func.dfg.block_call(landing, &[ir::BlockArg::TryCallExn(0), ir::BlockArg::TryCallExn(1)]);
+        let to = b
+            .func
+            .dfg
+            .block_call(landing, &[ir::BlockArg::TryCallExn(0), ir::BlockArg::TryCallExn(1)]);
         items.push(match catch {
             Catch::Tag(tag) => ir::ExceptionTableItem::Tag(ir::ExceptionTag::from_u32(*tag), to),
             Catch::Default => ir::ExceptionTableItem::Default(to),
@@ -161,7 +167,8 @@ pub fn nested(mk: &Mk) -> Family {
     let inner = mk.func(1, pair_sig(mk, 3), |b, v| {
         let callee = import(b, FUNCS, 2, pair_sig(mk, 2), false);
         let throw = import(b, HOST, 0, throw_sig(mk), false);
-        let (returned, landings) = try_call(b, callee, None, &[v[0], v[1]], &[Catch::Tag(5), Catch::Default]);
+        let (returned, landings) =
+            try_call(b, callee, None, &[v[0], v[1]], &[Catch::Tag(5), Catch::Default]);
         b.switch_to_block(returned);
         let rs = b.block_params(returned).to_vec();
         b.ins().return_(&rs);

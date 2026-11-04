@@ -46,8 +46,8 @@ use std::sync::Arc;
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
 use blaze_format::cursor::{Put as _, Reader};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
+use std::alloc::Global;
 
 use crate::{
     FILE_DOMAIN, Mode, Recovered, Ticket,
@@ -204,7 +204,8 @@ impl Journal {
 
     fn load(file: FileName, tags: u64, bytes: &[u8], image: Option<FromImage>) -> Loaded {
         let mut found = Recovered::default();
-        let mut moves: HashMap<Box<str>, Vec<(u64, Option<ContentId>)>, Global> = HashMap::new_in(Global);
+        let mut moves: HashMap<Box<str>, Vec<(u64, Option<ContentId>)>, Global> =
+            HashMap::new_in(Global);
         let mut sequence = 0;
         let (mut tree, from) = match image {
             Some(FromImage { tree, name, nodes, resumed }) => {
@@ -555,7 +556,9 @@ fn write_node(
         } else if !children_done {
             stack.push((node, true));
             let entries = tree.entries(node).expect("a directory");
-            stack.extend(entries.iter().filter(|it| !written.contains(it.1)).map(|it| (it.1, false)));
+            stack.extend(
+                entries.iter().filter(|it| !written.contains(it.1)).map(|it| (it.1, false)),
+            );
             continue;
         } else {
             let entries = tree.entries(node).expect("a directory");

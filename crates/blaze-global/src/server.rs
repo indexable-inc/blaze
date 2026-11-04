@@ -116,7 +116,15 @@ impl<C: Channels> Server<C> {
     /// Tags it asks with are `tags..tags + 2^32`.
     pub fn new(at: Address, channels: C, trust: Trust, tags: u64) -> Server<C> {
         // alloc: setup: once a server or a connection.
-        Server { at, channels, trust, tags: Tags::new(tags), listen: None, peers: Vec::new(), problems: Vec::new() }
+        Server {
+            at,
+            channels,
+            trust,
+            tags: Tags::new(tags),
+            listen: None,
+            peers: Vec::new(),
+            problems: Vec::new(),
+        }
     }
 
     pub fn owns(&self, tag: Tag) -> bool {
@@ -151,7 +159,12 @@ impl<C: Channels> Server<C> {
         std::mem::take(&mut self.problems)
     }
 
-    pub fn complete(&mut self, store: &mut Store, completion: Completion, effects: &mut Vec<Effect>) {
+    pub fn complete(
+        &mut self,
+        store: &mut Store,
+        completion: Completion,
+        effects: &mut Vec<Effect>,
+    ) {
         let Completion { tag, done } = completion;
         if self.listen == Some(tag) {
             match done {
@@ -194,7 +207,10 @@ impl<C: Channels> Server<C> {
                     Done::Read(bytes) if bytes.is_empty() => {
                         let peer = &mut self.peers[at];
                         peer.closing = true;
-                        if peer.waiting.is_empty() && peer.sending.is_none() && peer.staged.is_empty() {
+                        if peer.waiting.is_empty()
+                            && peer.sending.is_none()
+                            && peer.staged.is_empty()
+                        {
                             self.remove(at, effects);
                         } else {
                             self.pump(at, store, effects);
@@ -263,7 +279,10 @@ impl<C: Channels> Server<C> {
     fn drop_peer(&mut self, at: usize, why: &str, effects: &mut Vec<Effect>) {
         let peer = &self.peers[at];
         // alloc: an error's message, made only when it fails.
-        self.problems.push(format!("a connection dropped with {} responses unsent: {why}", peer.waiting.len()));
+        self.problems.push(format!(
+            "a connection dropped with {} responses unsent: {why}",
+            peer.waiting.len()
+        ));
         self.remove(at, effects);
     }
 
@@ -272,7 +291,13 @@ impl<C: Channels> Server<C> {
         effects.push(Effect::Hangup { conn: peer.conn, tag: self.tags.next() });
     }
 
-    fn received(&mut self, at: usize, store: &mut Store, bytes: &[u8], effects: &mut Vec<Effect>) -> Result<(), String> {
+    fn received(
+        &mut self,
+        at: usize,
+        store: &mut Store,
+        bytes: &[u8],
+        effects: &mut Vec<Effect>,
+    ) -> Result<(), String> {
         let Server { peers, trust, .. } = self;
         let peer = &mut peers[at];
         peer.channel.received(bytes, &mut peer.plain)?;
@@ -291,7 +316,15 @@ impl<C: Channels> Server<C> {
                 break;
             }
             let body = &rest[head.head..head.head + head.body];
-            let response = answer(&head.path, body, store, trust, &mut peer.send_window, &mut peer.recv_window, effects);
+            let response = answer(
+                &head.path,
+                body,
+                store,
+                trust,
+                &mut peer.send_window,
+                &mut peer.recv_window,
+                effects,
+            );
             start += head.head + head.body;
             push(peer, response);
         }
@@ -331,7 +364,11 @@ impl<C: Channels> Server<C> {
         if peer.sending.is_none() && !peer.staged.is_empty() {
             let tag = tags.next();
             peer.sending = Some(tag);
-            effects.push(Effect::Send { conn: peer.conn, bytes: std::mem::take(&mut peer.staged), tag });
+            effects.push(Effect::Send {
+                conn: peer.conn,
+                bytes: std::mem::take(&mut peer.staged),
+                tag,
+            });
         }
         if peer.closing {
             if peer.waiting.is_empty() && peer.sending.is_none() {
@@ -403,9 +440,12 @@ fn answer(
 /// The value of `key` and its signed record: `Ok(None)` when it has no record of it.
 fn found<'s>(store: &'s Store, key: &Key) -> Result<Option<(Signed, &'s [u8])>, Response> {
     // alloc: an error's message, made only when it fails.
-    let failed = |why: String| Response::refused(500, &format!("the cache's value of {:x}: {why}", key.0));
+    let failed =
+        |why: String| Response::refused(500, &format!("the cache's value of {:x}: {why}", key.0));
     // alloc: an error's message, made only when it fails.
-    let Some(record) = store.get(&record_key(key)).map_err(|corrupt| failed(corrupt.to_string()))? else {
+    let Some(record) =
+        store.get(&record_key(key)).map_err(|corrupt| failed(corrupt.to_string()))?
+    else {
         return Ok(None);
     };
     let bytes: &[u8; SIGNED_LEN] =
@@ -415,16 +455,23 @@ fn found<'s>(store: &'s Store, key: &Key) -> Result<Option<(Signed, &'s [u8])>, 
     // alloc: an error's message, made only when it fails.
     let value = store.get(key).map_err(|corrupt| failed(corrupt.to_string()))?;
     let value = value.ok_or_else(|| failed("its record is kept and it is not".into()))?;
-    if value.content != signed.record.content || value.kind != signed.record.kind || signed.record.key != *key {
+    if value.content != signed.record.content
+        || value.kind != signed.record.kind
+        || signed.record.key != *key
+    {
         // alloc: an error's message, made only when it fails.
-        return Err(failed(format!("its record names {:?}, and the value kept is {:x} of kind {:?}", signed.record, value.content, value.kind)));
+        return Err(failed(format!(
+            "its record names {:?}, and the value kept is {:x} of kind {:?}",
+            signed.record, value.content, value.kind
+        )));
     }
     Ok(Some((signed, value.bytes)))
 }
 
 fn fetch(body: &[u8], store: &mut Store, window: &mut SendWindow) -> Result<Response, Response> {
     frame::task(MemTag::Store, |temp| {
-        let keys = wire::parse_fetch_ask_in(body, temp).map_err(|why| Response::refused(400, &why))?;
+        let keys =
+            wire::parse_fetch_ask_in(body, temp).map_err(|why| Response::refused(400, &why))?;
         let mut answers = Vec::with_capacity_in(keys.len(), temp);
         let mut bytes = 0;
         let mut deferring = false;
@@ -485,7 +532,14 @@ fn publish(
         // alloc: an error's message, made only when it fails.
         let checked = trust.verify(&signed).map_err(|refused| refused.to_string());
         let value = window.read(&mut reader, signed.record.len, checked.is_ok()).map_err(bad)?;
-        let status = checked.and_then(|()| keep(store, &signed, &value.expect("a value whose record is checked is kept"), &mut tickets));
+        let status = checked.and_then(|()| {
+            keep(
+                store,
+                &signed,
+                &value.expect("a value whose record is checked is kept"),
+                &mut tickets,
+            )
+        });
         statuses.push((signed.record.key, status));
     }
     reader.end("a publish").map_err(bad)?;
@@ -499,7 +553,12 @@ fn publish(
 }
 
 /// Puts a value whose record is checked: the value, then its record.
-fn keep(store: &mut Store, signed: &Signed, bytes: &[u8], tickets: &mut Vec<Ticket>) -> Result<(), String> {
+fn keep(
+    store: &mut Store,
+    signed: &Signed,
+    bytes: &[u8],
+    tickets: &mut Vec<Ticket>,
+) -> Result<(), String> {
     let record = signed.record;
     let found = blaze_cas::content_of(bytes);
     if found != record.content {
@@ -511,12 +570,18 @@ fn keep(store: &mut Store, signed: &Signed, bytes: &[u8], tickets: &mut Vec<Tick
     }
     let value = store.put(record.key, record.kind, bytes).map_err(|mismatch| {
         // alloc: an error's message, made only when it fails.
-        format!("the global cache keeps another value of {:x}: {:x}, not {:x}", record.key.0, mismatch.kept, mismatch.given)
+        format!(
+            "the global cache keeps another value of {:x}: {:x}, not {:x}",
+            record.key.0, mismatch.kept, mismatch.given
+        )
     })?;
     // alloc: an error's message, made only when it fails.
     let kept = store.put(record_key(&record.key), Kind::Query, &signed.encode()).map_err(|_| {
         // alloc: an error's message, made only when it fails.
-        format!("the global cache keeps another signed record of {:x} (another publisher's)", record.key.0)
+        format!(
+            "the global cache keeps another signed record of {:x} (another publisher's)",
+            record.key.0
+        )
     })?;
     tickets.extend([value, kept]);
     Ok(())
@@ -530,7 +595,9 @@ fn bundle(body: &[u8], store: &Store) -> Result<Response, Response> {
     let id = BundleId(ContentId(*reader.array().map_err(wire::truncated).map_err(bad)?));
     reader.end("a bundle request").map_err(bad)?;
     // alloc: an error's message, made only when it fails.
-    let manifest = store.get(&id.manifest_key()).map_err(|corrupt| Response::refused(500, &corrupt.to_string()))?;
+    let manifest = store
+        .get(&id.manifest_key())
+        .map_err(|corrupt| Response::refused(500, &corrupt.to_string()))?;
     // alloc: the edge: a response's buffers, one a request, sent after it.
     let mut out = Vec::new();
     wire::header(wire::BUNDLE_ANSWER, &mut out);
@@ -547,7 +614,12 @@ fn bundle(body: &[u8], store: &Store) -> Result<Response, Response> {
 }
 
 /// Keeps a manifest signed by a pinned publisher whose every record is the one it keeps.
-fn bundle_publish(body: &[u8], store: &mut Store, trust: &Trust, effects: &mut Vec<Effect>) -> Result<Response, Response> {
+fn bundle_publish(
+    body: &[u8],
+    store: &mut Store,
+    trust: &Trust,
+    effects: &mut Vec<Effect>,
+) -> Result<Response, Response> {
     // alloc: an error's message, made only when it fails.
     let bad = |why: String| Response::refused(400, &format!("a malformed bundle publish: {why}"));
     let mut reader = Reader::new(body);
@@ -565,12 +637,22 @@ fn bundle_publish(body: &[u8], store: &mut Store, trust: &Trust, effects: &mut V
                     Ok(Some((signed, _))) if signed.record == *entry => {}
                     Ok(Some((signed, _))) => {
                         // alloc: an error's message, made only when it fails.
-                        return Err(format!("it lists {:?} for {:x}, and the cache keeps {:?}", entry, entry.key.0, signed.record));
+                        return Err(format!(
+                            "it lists {:?} for {:x}, and the cache keeps {:?}",
+                            entry, entry.key.0, signed.record
+                        ));
                     }
                     // alloc: an error's message, made only when it fails.
-                    Ok(None) => return Err(format!("it lists {:x}, which the cache has no value of", entry.key.0)),
+                    Ok(None) => {
+                        return Err(format!(
+                            "it lists {:x}, which the cache has no value of",
+                            entry.key.0
+                        ));
+                    }
                     // alloc: an error's message, made only when it fails.
-                    Err(response) => return Err(String::from_utf8_lossy(&response.body).into_owned()),
+                    Err(response) => {
+                        return Err(String::from_utf8_lossy(&response.body).into_owned());
+                    }
                 }
             }
             Ok(())

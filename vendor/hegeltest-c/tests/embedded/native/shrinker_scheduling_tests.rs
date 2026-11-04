@@ -31,10 +31,8 @@ fn fixate_shrink_passes_runs_passes_to_fixed_point() {
         initial,
         Spans::new(),
     );
-    let mut passes = vec![ShrinkPass::new(
-        "zero_choices",
-        Box::new(|sh| Box::pin(sh.zero_choices())),
-    )];
+    let mut passes =
+        vec![ShrinkPass::new("zero_choices", Box::new(|sh| Box::pin(sh.zero_choices())))];
     drive_no_yield(shrinker.fixate_shrink_passes(&mut passes)).unwrap();
     let values: Vec<_> = shrinker
         .current_nodes
@@ -63,10 +61,8 @@ fn fixate_shrink_passes_records_deletion_stat_when_pass_shortens() {
         initial,
         Spans::new(),
     );
-    let mut passes = vec![ShrinkPass::new(
-        "delete_chunks",
-        Box::new(|sh| Box::pin(sh.delete_chunks())),
-    )];
+    let mut passes =
+        vec![ShrinkPass::new("delete_chunks", Box::new(|sh| Box::pin(sh.delete_chunks())))];
     drive_no_yield(shrinker.fixate_shrink_passes(&mut passes)).unwrap();
     assert!(shrinker.current_nodes.is_empty());
     let stats = shrinker.pass_stats(&passes);
@@ -240,12 +236,7 @@ fn fixate_passes_does_full_run_even_when_stalled() {
     );
     shrinker.max_stall = 5;
     let mut passes: Vec<ShrinkPass> = (1..=5)
-        .map(|i| {
-            ShrinkPass::new(
-                "node_program",
-                Box::new(move |sh| Box::pin(sh.node_program(i))),
-            )
-        })
+        .map(|i| ShrinkPass::new("node_program", Box::new(move |sh| Box::pin(sh.node_program(i)))))
         .collect();
     drive_no_yield(shrinker.fixate_shrink_passes(&mut passes)).unwrap();
     for sp in &passes {
@@ -360,10 +351,8 @@ fn fixate_grants_each_outer_iteration_a_fresh_stall_window() {
     shrinker.calls = 1000;
     shrinker.calls_at_last_shrink = 0;
     shrinker.max_stall = 10;
-    let mut passes = vec![ShrinkPass::new(
-        "zero_choices",
-        Box::new(|sh| Box::pin(sh.zero_choices())),
-    )];
+    let mut passes =
+        vec![ShrinkPass::new("zero_choices", Box::new(|sh| Box::pin(sh.zero_choices())))];
     drive_no_yield(shrinker.fixate_shrink_passes(&mut passes)).unwrap();
     let v = match &shrinker.current_nodes[0].value() {
         ChoiceValue::Integer(v) => i128::try_from(v).unwrap(),
@@ -388,10 +377,7 @@ fn fixate_shrink_passes_reorders_useful_passes_to_the_front() {
     );
     let mut passes = vec![
         ShrinkPass::new("useless", Box::new(|_| Box::pin(async { Ok(()) }))),
-        ShrinkPass::new(
-            "useful",
-            Box::new(|sh| Box::pin(sh.binary_search_integer_towards_zero())),
-        ),
+        ShrinkPass::new("useful", Box::new(|sh| Box::pin(sh.binary_search_integer_towards_zero()))),
     ];
     drive_no_yield(shrinker.fixate_shrink_passes(&mut passes)).unwrap();
     assert_eq!(passes[0].name, "useful");
@@ -420,9 +406,7 @@ fn fixate_emits_debug_per_pass_step_when_debug_set() {
     drive_no_yield(shrinker.fixate_shrink_passes(&mut passes)).unwrap();
     let messages = log.lock().unwrap();
     assert!(
-        messages
-            .iter()
-            .any(|m| m == "Trying shrink pass: binary_search_integer_towards_zero"),
+        messages.iter().any(|m| m == "Trying shrink pass: binary_search_integer_towards_zero"),
         "expected per-pass running message in log, got: {:?}",
         *messages
     );
@@ -451,11 +435,7 @@ fn shrink_emits_profile_report_when_debug_set() {
         "missing profile header. log: {}",
         combined
     );
-    assert!(
-        combined.contains("Useful passes:"),
-        "missing useful-passes header. log: {}",
-        combined
-    );
+    assert!(combined.contains("Useful passes:"), "missing useful-passes header. log: {}", combined);
     assert!(
         combined.contains("Useless passes:"),
         "missing useless-passes header. log: {}",
@@ -485,11 +465,7 @@ fn shrink_profile_reports_singular_call_unit() {
     shrinker.set_debug(move |msg| log_clone.lock().unwrap().push(msg.to_string()));
     drive_no_yield(shrinker.shrink()).unwrap();
     let combined = log.lock().unwrap().join("\n");
-    assert!(
-        !combined.contains("1 calls"),
-        "incorrect pluralization for 1 call. log: {}",
-        combined
-    );
+    assert!(!combined.contains("1 calls"), "incorrect pluralization for 1 call. log: {}", combined);
     assert!(
         !combined.contains("1 choices"),
         "incorrect pluralization for 1 choice. log: {}",
@@ -521,15 +497,8 @@ fn shrink_stops_immediately_when_deadline_already_passed() {
     shrinker.deadline = Some(Instant::now().unwrap() - Duration::from_secs(1));
     drive_no_yield(shrinker.shrink()).unwrap();
     assert!(shrinker.timed_out, "expected the shrink to time out");
-    assert_eq!(
-        shrinker.calls, 0,
-        "no candidate should have been considered"
-    );
-    assert_eq!(
-        calls.load(Ordering::Relaxed),
-        0,
-        "the test fn must not have been invoked"
-    );
+    assert_eq!(shrinker.calls, 0, "no candidate should have been considered");
+    assert_eq!(calls.load(Ordering::Relaxed), 0, "the test fn must not have been invoked");
     assert_eq!(
         shrinker.current_nodes.len(),
         50,
@@ -562,11 +531,7 @@ fn shrink_completes_normally_with_a_future_deadline() {
             _ => unreachable!(),
         })
         .collect();
-    assert_eq!(
-        values,
-        vec![0],
-        "should shrink to the minimal non-empty sequence"
-    );
+    assert_eq!(values, vec![0], "should shrink to the minimal non-empty sequence");
 }
 
 #[test]
@@ -673,11 +638,9 @@ impl ShrinkProbe for L3Probe {
 
     fn run<'s>(&'s mut self, req: ShrinkRun<'s>) -> ProbeFuture<'s> {
         let outcome = match req {
-            ShrinkRun::Full(nodes) => (
-                self.mode == SweepMode::Confirm,
-                nodes.to_vec(),
-                Spans::new(),
-            ),
+            ShrinkRun::Full(nodes) => {
+                (self.mode == SweepMode::Confirm, nodes.to_vec(), Spans::new())
+            }
             ShrinkRun::Probe { .. } => (false, Vec::new(), Spans::new()),
         };
         Box::pin(core::future::ready(Ok(outcome)))
@@ -688,17 +651,12 @@ impl ShrinkProbe for L3Probe {
 fn a_confirmation_sweep_rescues_improvements_dry_fast_sweeps_missed() {
     let mode_calls: Arc<Mutex<Vec<SweepMode>>> = Arc::default();
     let mut shrinker = Shrinker::with_probe(
-        Box::new(L3Probe {
-            mode: SweepMode::Fast,
-            mode_calls: Arc::clone(&mode_calls),
-        }),
+        Box::new(L3Probe { mode: SweepMode::Fast, mode_calls: Arc::clone(&mode_calls) }),
         vec![int_node(10), int_node(20)],
         Spans::new(),
     );
-    let mut passes = vec![ShrinkPass::new(
-        "zero_choices",
-        Box::new(|sh| Box::pin(sh.zero_choices())),
-    )];
+    let mut passes =
+        vec![ShrinkPass::new("zero_choices", Box::new(|sh| Box::pin(sh.zero_choices())))];
     drive_no_yield(shrinker.fixate_shrink_passes(&mut passes)).unwrap();
     let values: Vec<_> = shrinker
         .current_nodes
@@ -732,10 +690,8 @@ fn a_probe_that_declines_sweep_modes_gets_no_confirmation_sweep() {
         vec![int_node(5)],
         Spans::new(),
     );
-    let mut passes = vec![ShrinkPass::new(
-        "zero_choices",
-        Box::new(|sh| Box::pin(sh.zero_choices())),
-    )];
+    let mut passes =
+        vec![ShrinkPass::new("zero_choices", Box::new(|sh| Box::pin(sh.zero_choices())))];
     drive_no_yield(shrinker.fixate_shrink_passes(&mut passes)).unwrap();
     assert_eq!(
         shrinker.calls, 1,
@@ -800,9 +756,7 @@ impl ShrinkProbe for ConfirmOnlyWinner {
 #[test]
 fn the_confirmation_sweep_reaches_candidates_the_latched_stall_guard_dropped() {
     let mut shrinker = Shrinker::with_probe(
-        Box::new(ConfirmOnlyWinner {
-            mode: SweepMode::Fast,
-        }),
+        Box::new(ConfirmOnlyWinner { mode: SweepMode::Fast }),
         vec![int_node(50)],
         Spans::new(),
     );
@@ -824,10 +778,7 @@ fn the_confirmation_sweep_reaches_candidates_the_latched_stall_guard_dropped() {
         ChoiceValue::Integer(v) => i128::try_from(v).unwrap(),
         _ => unreachable!(),
     };
-    assert_eq!(
-        v, 40,
-        "the confirmation iteration must run with the stall guard off"
-    );
+    assert_eq!(v, 40, "the confirmation iteration must run with the stall guard off");
 }
 
 #[test]
@@ -868,9 +819,7 @@ fn the_stall_guard_yields_to_the_confirmation_sweep() {
 fn accept_improvement_notifies_the_probe() {
     let adopted = Arc::new(AtomicUsize::new(0));
     let mut shrinker = Shrinker::with_probe(
-        Box::new(AdoptionRecorder {
-            adopted: adopted.clone(),
-        }),
+        Box::new(AdoptionRecorder { adopted: adopted.clone() }),
         vec![int_node(10), int_node(10)],
         Spans::new(),
     );
@@ -881,11 +830,7 @@ fn accept_improvement_notifies_the_probe() {
 
     let rejected = drive_no_yield(shrinker.consider(&[int_node(9), int_node(10)])).unwrap();
     assert!(!rejected, "a sort-key-larger candidate is not adopted");
-    assert_eq!(
-        adopted.load(Ordering::SeqCst),
-        1,
-        "an unadopted run must not notify the probe"
-    );
+    assert_eq!(adopted.load(Ordering::SeqCst), 1, "an unadopted run must not notify the probe");
 
     drive_no_yield(shrinker.probe(&[ChoiceValue::Integer(BigInt::from(0))], 2)).unwrap();
     assert_eq!(adopted.load(Ordering::SeqCst), 2);

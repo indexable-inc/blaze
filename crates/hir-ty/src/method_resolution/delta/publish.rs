@@ -25,12 +25,12 @@ use std::sync::Arc;
 use base_db::{Crate, Db};
 use blaze_dbsp::{Pos, SliceHasher};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::db::{Durability, Setter, Slot, SlotName};
 use hir_def::{BuiltinDeriveImplId, ImplId, ModuleId, TraitId, nameres::crate_def_map};
 use hir_expand::name::Name;
 use rustc_type_ir::fast_reject::SimplifiedType as S;
+use std::alloc::Global;
 
 use super::head::{Head, HeadDef};
 
@@ -524,7 +524,10 @@ impl Published {
         name_rows: &mut Vec<(Name, CandidateRows)>,
     ) -> (u64, SliceDirectory) {
         assert!(
-            self.directory.is_none() && self.traits.is_empty() && self.heads.is_empty() && self.names.is_empty(),
+            self.directory.is_none()
+                && self.traits.is_empty()
+                && self.heads.is_empty()
+                && self.names.is_empty(),
             "impls: crate {krate:?} is published already, and made anew"
         );
         let durability = base_db::crate_durability(db, krate);
@@ -553,9 +556,9 @@ impl Published {
             durability,
             krate,
             Arc::new(self.traits.clone()), // alloc: clone: the crate's first directory
-            Arc::new(self.heads.clone()), // alloc: clone: as above
-            Arc::new(self.names.clone()), // alloc: clone: as above
-            self.body_modules.clone(),    // clone: a count
+            Arc::new(self.heads.clone()),  // alloc: clone: as above
+            Arc::new(self.names.clone()),  // alloc: clone: as above
+            self.body_modules.clone(),     // clone: a count
         );
         self.directory = Some(directory);
         (made, directory)
@@ -648,8 +651,8 @@ impl Published {
     pub(crate) fn keys(&self) -> (Vec<TraitId>, Vec<Head>, Vec<Name>) {
         (
             self.traits.keys().copied().collect(), // alloc: a crate maintained from empty, once
-            self.heads.keys().copied().collect(), // alloc: as above
-            self.names.keys().copied().collect(), // alloc: as above
+            self.heads.keys().copied().collect(),  // alloc: as above
+            self.names.keys().copied().collect(),  // alloc: as above
         )
     }
 
@@ -718,7 +721,7 @@ pub(crate) fn register_slots(db: &mut Db, slots: &[(Crate, DirectorySlot)]) {
 /// The module rank of `module` in its crate's `DefMap::modules` order: what readers merge the
 /// per-module parts of a slice by.
 pub(crate) fn module_rank(db: &Db, module: ModuleId) -> u32 {
-    crate_def_map(db, module.krate(db)).module_rank(db, module).unwrap_or_else(|| {
-        panic!("impls: module {module:?} is not among its crate's modules")
-    })
+    crate_def_map(db, module.krate(db))
+        .module_rank(db, module)
+        .unwrap_or_else(|| panic!("impls: module {module:?} is not among its crate's modules"))
 }

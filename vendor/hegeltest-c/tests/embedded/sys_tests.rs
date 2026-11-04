@@ -26,10 +26,7 @@ fn fs_append_creates_then_extends_a_file() {
     let path = temp_path(&dir, "file");
     fs::append(&path, b"first line\n").unwrap();
     fs::append(&path, b"second line\n").unwrap();
-    assert_eq!(
-        fs::read(&path).unwrap(),
-        b"first line\nsecond line\n".to_vec()
-    );
+    assert_eq!(fs::read(&path).unwrap(), b"first line\nsecond line\n".to_vec());
 }
 
 #[test]
@@ -115,9 +112,7 @@ fn fs_read_dir_skips_non_unicode_names() {
     use std::os::unix::ffi::OsStrExt;
     let dir = TempDir::new().unwrap();
     fs::write(&temp_path(&dir, "plain"), b"x").unwrap();
-    let weird = dir
-        .path()
-        .join(std::ffi::OsStr::from_bytes(&[0x66, 0xff, 0xfe]));
+    let weird = dir.path().join(std::ffi::OsStr::from_bytes(&[0x66, 0xff, 0xfe]));
     std::fs::write(&weird, b"y").unwrap();
     let names = fs::read_dir(dir.path().to_str().unwrap()).unwrap();
     assert_eq!(names, vec!["plain".to_string()]);
@@ -278,11 +273,7 @@ fn retry_intr_retries_interrupted_calls() {
     let mut calls = 0;
     let result = imp::retry_intr(|| {
         calls += 1;
-        if calls < 3 {
-            Err(rustix::io::Errno::INTR)
-        } else {
-            Ok(7)
-        }
+        if calls < 3 { Err(rustix::io::Errno::INTR) } else { Ok(7) }
     });
     assert_eq!(result, Ok(7));
     assert_eq!(calls, 3);

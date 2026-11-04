@@ -10,47 +10,80 @@ use crate::{Span, consteval::CreateConstError};
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum TyLoweringDiagnostic {
-    PathDiagnostic { source: TypeRefId, diag: PathLoweringDiagnostic },
+    PathDiagnostic {
+        source: TypeRefId,
+        diag: PathLoweringDiagnostic,
+    },
     /// `_` placeholders where no inference is: one each, but those of a type its body infers (a
     /// return type, a const's or a static's), which rustc reports in one error.
-    InferVarsNotAllowed { sources: Box<[Span]> },
+    InferVarsNotAllowed {
+        sources: Box<[Span]>,
+    },
     /// Lifetimes left out (`&T`, `'_`, a path without its lifetime arguments) where there is
     /// none to elide to. One site but for [`MissingLifetimeKind::ElisionFailure`], which has
     /// every site of one return type, as rustc reports them in one error.
-    MissingLifetimes { sites: Box<[ElidedLifetimeSite]>, kind: MissingLifetimeKind },
+    MissingLifetimes {
+        sites: Box<[ElidedLifetimeSite]>,
+        kind: MissingLifetimeKind,
+    },
     /// A const argument that is not a constant, at `site`: its expression, or the type ref of
     /// a path written where a type could stand.
-    InvalidConstArg { site: Span, reason: CreateConstError },
+    InvalidConstArg {
+        site: Span,
+        reason: CreateConstError,
+    },
     /// `impl Trait` where it is not allowed: E0562 (rustc's `ImplTraitPosition`, which the
     /// emitter reads from where `source` is written).
-    ImplTraitNotAllowed { source: TypeRefId },
+    ImplTraitNotAllowed {
+        source: TypeRefId,
+    },
     /// A trait object with more than one non-auto trait: E0225, at the bound of the `first`
     /// and those of the `additional` ones (rustc's `lower_trait_object_ty`).
-    AdditionalNonAutoTraits { first: TypeRefId, additional: Box<[TypeRefId]> },
+    AdditionalNonAutoTraits {
+        first: TypeRefId,
+        additional: Box<[TypeRefId]>,
+    },
     /// Two bounds of a trait object that give the associated type or const `assoc` different
     /// values, the second at `source`: E0719 (rustc's `lower_trait_object_ty`).
-    ConflictingAssocTypeBindings { source: TypeRefId, assoc: AssocItemId },
+    ConflictingAssocTypeBindings {
+        source: TypeRefId,
+        assoc: AssocItemId,
+    },
     /// A trait object whose principal trait `trait_` leaves out the type parameters `params`
     /// whose defaults name `Self`, at the bound `source`: E0393 (rustc's
     /// `report_missing_type_params`).
-    MissingSelfDefaultParams { source: TypeRefId, trait_: TraitId, params: Box<[TypeParamId]> },
+    MissingSelfDefaultParams {
+        source: TypeRefId,
+        trait_: TraitId,
+        params: Box<[TypeParamId]>,
+    },
     /// A trait object whose bounds are only relaxed ones (`dyn ?Sized`), at the first:
     /// E0224. A `dyn` with no trait written at all is the parser's.
-    ObjectWithoutTrait { source: TypeRefId },
+    ObjectWithoutTrait {
+        source: TypeRefId,
+    },
     /// A where predicate whose `for<..>` binder has type parameters (`for<F: Field<T>>`,
     /// `#![feature(blaze_comptime)]`) in a form not lowered yet, at `source` (the bound or the
     /// bounded type): a parameter bound other than exactly one `core::reflect::Field<C>` or
     /// `Variant<C>` (filters), a `const`/`[const]` bound, generic arguments on the parameter or
     /// its associated type, or an associated type of a supertrait with parameters. It makes no
     /// clause (`docs/v2/plan/design/comptime.md`).
-    ComptimeBinderNotYetSupported { source: TypeRefId },
+    ComptimeBinderNotYetSupported {
+        source: TypeRefId,
+    },
     /// The pattern of the pattern type `source` (`#![feature(pattern_types)]`), or one of its
     /// `|` alternatives, which is not lowered for `reason`.
-    PatternTypeNotLowered { source: TypeRefId, reason: PatternTypeUnsupported },
+    PatternTypeNotLowered {
+        source: TypeRefId,
+        reason: PatternTypeUnsupported,
+    },
     /// Computing `query` of `def` needed itself: E0391 (rustc's cycle error of that query).
     /// Each item in the cycle reports one, naming itself, so the errors of one cycle name
     /// every item in it.
-    QueryCycle { def: GenericDefId, query: CycleQuery },
+    QueryCycle {
+        def: GenericDefId,
+        query: CycleQuery,
+    },
 }
 
 /// The query of `def` whose computation needed itself, in a [`TyLoweringDiagnostic::QueryCycle`].
@@ -209,11 +242,17 @@ pub enum PathLoweringDiagnostic {
     /// The associated type `segment` names, looked up in `qself`'s bounds (`T::Name`,
     /// `Self::Name`) or in the trait (`Trait::Name`), that `failure` gives: E0220 not found,
     /// E0221 ambiguous, E0391 a cycle (rustc's `probe_single_bound_for_assoc_item`).
-    AssocTypeNotResolved { segment: u32, qself: AssocTypeQself, failure: AssocTypeFailure },
+    AssocTypeNotResolved {
+        segment: u32,
+        qself: AssocTypeQself,
+        failure: AssocTypeFailure,
+    },
     /// An associated type `segment` of a type no bound can give it of (`T::A::B`,
     /// `<u8>::Name`, an inherent one not found): E0223 (rustc's
     /// `report_ambiguous_assoc_item`).
-    AmbiguousAssocType { segment: u32 },
+    AmbiguousAssocType {
+        segment: u32,
+    },
 }
 
 /// Where an associated type shorthand is looked up.

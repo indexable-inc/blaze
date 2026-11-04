@@ -40,7 +40,12 @@ fn a_spec_that_is_no_cfg_is_refused() {
 
 #[test]
 fn values_before_names_are_refused() {
-    for spec in ["cfg(values(),true)", "cfg(any(),values())", "cfg(any(),values(any()))", "cfg(values(any()),foo)"] {
+    for spec in [
+        "cfg(values(),true)",
+        "cfg(any(),values())",
+        "cfg(any(),values(any()))",
+        "cfg(values(any()),foo)",
+    ] {
         assert_eq!(refused(spec).as_deref(), Some(error(spec, &[BEFORE_NAMES]).as_str()), "{spec}");
     }
 }
@@ -51,13 +56,22 @@ fn an_argument_that_is_not_one_is_named() {
         (r#"cfg("NOT_IDENT")"#, &[r#"`"NOT_IDENT"` is a string literal"#, CFG_ARGS]),
         (r#"cfg(foo,"NOT_IDENT",bar)"#, &[r#"`"NOT_IDENT"` is a string literal"#, CFG_ARGS]),
         ("cfg(any(foo))", &["`any(foo)` is invalid", "`any()` takes no argument"]),
-        ("cfg(foo,values(any(bar)))", &["`any(bar)` is invalid", "`any()` in `values()` takes no argument"]),
-        ("cfg(foo,values(any(),any()))", &["`any()` is invalid", "`any()` in `values()` cannot be specified multiple times"]),
+        (
+            "cfg(foo,values(any(bar)))",
+            &["`any(bar)` is invalid", "`any()` in `values()` takes no argument"],
+        ),
+        (
+            "cfg(foo,values(any(),any()))",
+            &["`any()` is invalid", "`any()` in `values()` cannot be specified multiple times"],
+        ),
         ("cfg(foo,values(bar))", &["`bar` is invalid", VALUES_ARGS]),
         (r#"cfg(foo,values("bar",bar,"bar"))"#, &["`bar` is invalid", VALUES_ARGS]),
         ("cfg(foo,test())", &["`test()` is invalid", CFG_ARGS]),
         ("cfg(foo,values(test()))", &["`test()` is invalid", VALUES_ARGS]),
-        (r#"cfg(foo,values(none("test")))"#, &[r#"`none("test")` is invalid"#, "`none()` in `values()` takes no argument"]),
+        (
+            r#"cfg(foo,values(none("test")))"#,
+            &[r#"`none("test")` is invalid"#, "`none()` in `values()` takes no argument"],
+        ),
         ("cfg(none())", &["`none()` is invalid", CFG_ARGS]),
     ];
     for &(spec, notes) in cases {
@@ -70,7 +84,10 @@ fn what_may_be_given_once_is_refused_twice() {
     let cases: &[(&str, &str)] = &[
         ("cfg(any(),any())", "`any()` cannot be specified multiple times"),
         ("cfg(foo,values(),values())", "`values()` cannot be specified multiple times"),
-        (r#"cfg(foo,values("bar",any()))"#, "`values()` arguments cannot specify string literals and `any()` at the same time"),
+        (
+            r#"cfg(foo,values("bar",any()))"#,
+            "`values()` arguments cannot specify string literals and `any()` at the same time",
+        ),
         ("cfg(foo,any())", "`cfg(any())` can only be provided in isolation"),
     ];
     for &(spec, note) in cases {
@@ -81,7 +98,10 @@ fn what_may_be_given_once_is_refused_twice() {
 #[test]
 fn names_after_values_and_keywords_are_refused() {
     let spec = "cfg(foo,values(),bar)";
-    assert_eq!(refused(spec).as_deref(), Some(error(spec, &["`cfg()` names cannot be after values"]).as_str()));
+    assert_eq!(
+        refused(spec).as_deref(),
+        Some(error(spec, &["`cfg()` names cannot be after values"]).as_str())
+    );
     let spec = "cfg(self)";
     assert_eq!(
         refused(spec).as_deref(),
@@ -125,7 +145,8 @@ fn names_and_values_add_up_as_rustc_adds_them() {
     check.add(r#"cfg(baz, values(any()))"#).unwrap();
     assert!(check.is_given());
     assert!(check.exhaustive_names());
-    let expecteds: Vec<String> = check.expecteds().iter().map(|(name, values)| format!("{name}: {values:?}")).collect();
+    let expecteds: Vec<String> =
+        check.expecteds().iter().map(|(name, values)| format!("{name}: {values:?}")).collect();
     assert_eq!(expecteds, [r#"foo: Some([Some("a"), Some("b")])"#, "bar: Any", "baz: Any"]);
     check.add("cfg(any())").unwrap();
     assert!(!check.exhaustive_names());

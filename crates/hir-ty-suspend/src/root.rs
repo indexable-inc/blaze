@@ -5,7 +5,6 @@
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::HashSet;
-use std::{alloc::Global, fmt};
 use hir_def::{
     AssocItemId, FunctionId, ModuleDefId, ModuleId, TraitId,
     nameres::{ModuleData, crate_def_map},
@@ -16,6 +15,7 @@ use hir_ty::{
     next_solver::{SimplifiedType, SolverDefId},
 };
 use intern::Symbol;
+use std::{alloc::Global, fmt};
 
 /// The crate whose function parks a fiber, by its crate name.
 const FIBERS: &str = "blaze_graph";
@@ -150,7 +150,8 @@ fn inherent_method(
 pub(crate) fn send_trait(db: &Db, krate: Crate) -> Option<TraitId> {
     let core = home_crate(db, krate, LangCrateOrigin::Core)?;
     let root = crate_def_map(db, core).root_module_id();
-    let Some(ModuleDefId::ModuleId(marker)) = data(db, root).name_in_scope(db, &name_of("marker")).take_types()
+    let Some(ModuleDefId::ModuleId(marker)) =
+        data(db, root).name_in_scope(db, &name_of("marker")).take_types()
     else {
         return None;
     };

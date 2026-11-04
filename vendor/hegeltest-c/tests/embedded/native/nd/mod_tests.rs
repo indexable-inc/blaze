@@ -57,30 +57,15 @@ fn bar_accepts_on_the_fourth_failure() {
 
 #[test]
 fn bar_rejects_zero_failures_at_the_gate() {
-    assert!(matches!(
-        discovery_bar(&evidence(0, 9)),
-        BarVerdict::Continue
-    ));
-    assert!(matches!(
-        discovery_bar(&evidence(0, 10)),
-        BarVerdict::Reject
-    ));
+    assert!(matches!(discovery_bar(&evidence(0, 9)), BarVerdict::Continue));
+    assert!(matches!(discovery_bar(&evidence(0, 10)), BarVerdict::Reject));
 }
 
 #[test]
 fn bar_rejects_when_the_cap_is_unreachable() {
-    assert!(matches!(
-        discovery_bar(&evidence(1, 36)),
-        BarVerdict::Continue
-    ));
-    assert!(matches!(
-        discovery_bar(&evidence(1, 37)),
-        BarVerdict::Reject
-    ));
-    assert!(matches!(
-        discovery_bar(&evidence(3, 37)),
-        BarVerdict::Reject
-    ));
+    assert!(matches!(discovery_bar(&evidence(1, 36)), BarVerdict::Continue));
+    assert!(matches!(discovery_bar(&evidence(1, 37)), BarVerdict::Reject));
+    assert!(matches!(discovery_bar(&evidence(3, 37)), BarVerdict::Reject));
 }
 
 /// Exact DP over [`discovery_bar`] with i.i.d. failure probability `p`:
@@ -186,28 +171,19 @@ fn gauntlet_floor_matches_its_derivation() {
     let boundary = evidence(GAUNTLET_MIN_FAILS, GAUNTLET_CAP - GAUNTLET_MIN_FAILS);
     assert!((boundary.lower_bound() - 0.0531).abs() < 5e-4);
     assert!(GAUNTLET_FLOOR < boundary.lower_bound());
-    assert!(matches!(
-        gauntlet(&boundary, 0.0, GAUNTLET_MIN_FAILS),
-        GauntletVerdict::Accept
-    ));
+    assert!(matches!(gauntlet(&boundary, 0.0, GAUNTLET_MIN_FAILS), GauntletVerdict::Accept));
 }
 
 #[test]
 fn gauntlet_gamma_is_unity_above_the_retention_high_water() {
     let e = evidence(18, 2);
     assert!(e.lower_bound() > 0.69);
-    assert!(matches!(
-        gauntlet(&e, 0.79, GAUNTLET_MIN_FAILS),
-        GauntletVerdict::Accept
-    ));
+    assert!(matches!(gauntlet(&e, 0.79, GAUNTLET_MIN_FAILS), GauntletVerdict::Accept));
     assert!(matches!(
         gauntlet(&e, RETENTION_HIGH_WATER, GAUNTLET_MIN_FAILS),
         GauntletVerdict::Continue
     ));
-    assert!(matches!(
-        gauntlet(&e, 0.83, GAUNTLET_MIN_FAILS),
-        GauntletVerdict::Continue
-    ));
+    assert!(matches!(gauntlet(&e, 0.83, GAUNTLET_MIN_FAILS), GauntletVerdict::Continue));
 }
 
 /// Exact DP over [`gauntlet`] with i.i.d. failure probability `q` for one
@@ -298,15 +274,9 @@ fn gauntlet_cap_bounds_the_undecidable() {
     for i in 0..29 {
         e.record(i % 2 == 0);
     }
-    assert!(matches!(
-        gauntlet(&e, 0.5, GAUNTLET_MIN_FAILS),
-        GauntletVerdict::Continue
-    ));
+    assert!(matches!(gauntlet(&e, 0.5, GAUNTLET_MIN_FAILS), GauntletVerdict::Continue));
     e.record(false);
-    assert!(matches!(
-        gauntlet(&e, 0.5, GAUNTLET_MIN_FAILS),
-        GauntletVerdict::Reject
-    ));
+    assert!(matches!(gauntlet(&e, 0.5, GAUNTLET_MIN_FAILS), GauntletVerdict::Reject));
 }
 
 #[test]
@@ -376,16 +346,9 @@ fn gauntlet_alpha_matches_the_014_charges() {
     assert!((drive_from_recruit - 0.0198).abs() < 5e-4);
     let confirm_drive = gauntlet_alpha(Evidence::default(), GAUNTLET_FLOOR, GAUNTLET_MIN_FAILS);
     assert!((confirm_drive - 2.9e-3).abs() < 1e-4);
-    let escalated = gauntlet_alpha(
-        Evidence::default(),
-        GAUNTLET_FLOOR,
-        GAUNTLET_MIN_FAILS_CEILING,
-    );
+    let escalated = gauntlet_alpha(Evidence::default(), GAUNTLET_FLOOR, GAUNTLET_MIN_FAILS_CEILING);
     assert!(escalated < 1.1e-7);
-    assert_eq!(
-        gauntlet_alpha(Evidence::default(), 0.9, GAUNTLET_MIN_FAILS),
-        0.0
-    );
+    assert_eq!(gauntlet_alpha(Evidence::default(), 0.9, GAUNTLET_MIN_FAILS), 0.0);
 }
 
 #[test]
@@ -395,19 +358,13 @@ fn charges_escalate_the_minimum_when_the_budget_runs_out() {
     while spend.charge(&Evidence::default(), 0.0, false, None) == GAUNTLET_MIN_FAILS {
         at_base += 1;
     }
-    assert_eq!(
-        at_base, 50,
-        "the budget affords 50 fast floor proposals at the base minimum"
-    );
+    assert_eq!(at_base, 50, "the budget affords 50 fast floor proposals at the base minimum");
     assert_eq!(spend.min_fails, GAUNTLET_MIN_FAILS + 1);
 }
 
 #[test]
 fn a_pinned_candidate_is_charged_at_its_own_minimum_even_past_the_budget() {
-    let mut spend = GauntletSpend {
-        remaining: 0.0,
-        ..GauntletSpend::default()
-    };
+    let mut spend = GauntletSpend { remaining: 0.0, ..GauntletSpend::default() };
     assert_eq!(
         spend.charge(&Evidence::default(), 0.0, true, Some(GAUNTLET_MIN_FAILS)),
         GAUNTLET_MIN_FAILS
@@ -421,14 +378,8 @@ fn a_pinned_candidate_is_charged_at_its_own_minimum_even_past_the_budget() {
 
 #[test]
 fn an_exhausted_budget_pins_new_candidates_at_the_ceiling() {
-    let mut spend = GauntletSpend {
-        remaining: 0.0,
-        ..GauntletSpend::default()
-    };
-    assert_eq!(
-        spend.charge(&Evidence::default(), 0.0, true, None),
-        GAUNTLET_MIN_FAILS_CEILING
-    );
+    let mut spend = GauntletSpend { remaining: 0.0, ..GauntletSpend::default() };
+    assert_eq!(spend.charge(&Evidence::default(), 0.0, true, None), GAUNTLET_MIN_FAILS_CEILING);
     assert_eq!(
         spend.charge(&Evidence::default(), 0.0, true, None),
         GAUNTLET_MIN_FAILS_CEILING,
@@ -452,20 +403,13 @@ fn an_unreachable_threshold_charges_nothing() {
 #[test]
 fn the_failure_minimum_binds_the_accept_not_the_reject() {
     let conclusive = evidence(GAUNTLET_MIN_FAILS, 0);
-    assert!(matches!(
-        gauntlet(&conclusive, 0.0, GAUNTLET_MIN_FAILS),
-        GauntletVerdict::Accept
-    ));
+    assert!(matches!(gauntlet(&conclusive, 0.0, GAUNTLET_MIN_FAILS), GauntletVerdict::Accept));
     assert!(matches!(
         gauntlet(&conclusive, 0.0, GAUNTLET_MIN_FAILS_CEILING),
         GauntletVerdict::Continue
     ));
     assert!(matches!(
-        gauntlet(
-            &evidence(GAUNTLET_MIN_FAILS_CEILING, 0),
-            0.0,
-            GAUNTLET_MIN_FAILS_CEILING
-        ),
+        gauntlet(&evidence(GAUNTLET_MIN_FAILS_CEILING, 0), 0.0, GAUNTLET_MIN_FAILS_CEILING),
         GauntletVerdict::Accept
     ));
 }

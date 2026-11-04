@@ -107,16 +107,23 @@ pub(crate) struct Weights {
 
 impl Weights {
     /// Samples in any order, summed per function and per pair.
-    pub(crate) fn new(mut functions: Vec<(ContentId, u64)>, mut calls: Vec<(ContentId, ContentId, u64)>) -> Weights {
+    pub(crate) fn new(
+        mut functions: Vec<(ContentId, u64)>,
+        mut calls: Vec<(ContentId, ContentId, u64)>,
+    ) -> Weights {
         functions.sort_unstable();
-        functions.dedup_by(|it, kept| it.0 == kept.0 && {
-            kept.1 += it.1;
-            true
+        functions.dedup_by(|it, kept| {
+            it.0 == kept.0 && {
+                kept.1 += it.1;
+                true
+            }
         });
         calls.sort_unstable();
-        calls.dedup_by(|it, kept| (it.0, it.1) == (kept.0, kept.1) && {
-            kept.2 += it.2;
-            true
+        calls.dedup_by(|it, kept| {
+            (it.0, it.1) == (kept.0, kept.1) && {
+                kept.2 += it.2;
+                true
+            }
         });
         let mut hasher = Hasher::new(WEIGHTS_DOMAIN);
         hasher.update(&(functions.len() as u64).to_le_bytes());
@@ -138,17 +145,20 @@ impl Weights {
     /// instance of its identity, one of an identity the build has no instance of dropped.
     pub(crate) fn heat(&self, identities: &[(InstanceKey, ContentId)]) -> Heat {
         // alloc: once per link with a profile, the build's instances by identity
-        let mut by: Vec<(ContentId, InstanceKey)> = identities.iter().map(|(key, identity)| (*identity, *key)).collect();
+        let mut by: Vec<(ContentId, InstanceKey)> =
+            identities.iter().map(|(key, identity)| (*identity, *key)).collect();
         by.sort_unstable();
         let keys = |identity: ContentId| {
             let from = by.partition_point(|it| it.0 < identity);
             by[from..].iter().take_while(move |it| it.0 == identity).map(|it| it.1)
         };
-        let functions = self.functions.iter().flat_map(|&(identity, weight)| keys(identity).map(move |key| (key, weight)));
-        let calls = self
-            .calls
+        let functions = self
+            .functions
             .iter()
-            .flat_map(|&(from, to, weight)| keys(from).flat_map(move |from| keys(to).map(move |to| (from, to, weight))));
+            .flat_map(|&(identity, weight)| keys(identity).map(move |key| (key, weight)));
+        let calls = self.calls.iter().flat_map(|&(from, to, weight)| {
+            keys(from).flat_map(move |from| keys(to).map(move |to| (from, to, weight)))
+        });
         Heat::new(functions, calls)
     }
 }
@@ -214,10 +224,13 @@ impl Profiles {
         // alloc: once per job, a distinct leaf and caller sampled
         let mut sampled: Sampled = HashMap::new_in(Global);
         for file in &files {
-            let bytes = std::fs::read(file).map_err(|error| format!("{}: {error}", file.display()))?;
-            let profile = Profile::from_ixprof(&bytes)
-                .map_err(|error| format!("{}: {error}; remove it, or profile again", file.display()))?;
-            samples(&profile, &mut sampled, &mut counts).map_err(|why| format!("{}: {why}", file.display()))?;
+            let bytes =
+                std::fs::read(file).map_err(|error| format!("{}: {error}", file.display()))?;
+            let profile = Profile::from_ixprof(&bytes).map_err(|error| {
+                format!("{}: {error}; remove it, or profile again", file.display())
+            })?;
+            samples(&profile, &mut sampled, &mut counts)
+                .map_err(|why| format!("{}: {why}", file.display()))?;
         }
         // alloc: once per job, a build id a profile names
         let mut named: Vec<BuildId> = sampled.keys().map(|it| it.0).collect();
@@ -225,7 +238,8 @@ impl Profiles {
         named.dedup();
         let maps = maps(&dir, &named)?;
         // alloc: once per job, an image a profile ran
-        let mut images: Vec<(String, Vec<(ContentId, u64)>, Vec<(ContentId, ContentId, u64)>)> = Vec::new();
+        let mut images: Vec<(String, Vec<(ContentId, u64)>, Vec<(ContentId, ContentId, u64)>)> =
+            Vec::new();
         for (&(build, leaf, caller), &Taken { samples, weight_ns }) in &sampled {
             let of = maps.iter().filter(|it| it.0 == build).map(|it| (&it.1, &it.2));
             let mut found = false;
@@ -252,8 +266,10 @@ impl Profiles {
                 }
             }
         }
-        let mut heats: Vec<(String, Weights)> =
-            images.into_iter().map(|(path, functions, calls)| (path, Weights::new(functions, calls))).collect();
+        let mut heats: Vec<(String, Weights)> = images
+            .into_iter()
+            .map(|(path, functions, calls)| (path, Weights::new(functions, calls)))
+            .collect();
         heats.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Ok(Some(Profiles { dir, heats, named, counts }))
     }
@@ -289,7 +305,8 @@ impl Profiles {
         let mut by_key = identities.to_vec();
         by_key.sort_unstable();
         let dir = self.dir.join(MAPS).join(image_dir(path));
-        std::fs::create_dir_all(&dir).map_err(|error| format!("making {}: {error}", dir.display()))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("making {}: {error}", dir.display()))?;
         // A function of no code holds no address, and one at its address would hide the
         // function that does from `function`.
         let sized = || functions.iter().filter(|it| it.2 > 0);
@@ -302,7 +319,10 @@ impl Profiles {
         bytes.extend_from_slice(&(rows as u64).to_le_bytes());
         for (key, addr, size) in sized() {
             let at = by_key.binary_search_by(|it| it.0.cmp(key)).map_err(|_| {
-                format!("the address map of {path}: its function {:x} is no instance the build reached", key.0)
+                format!(
+                    "the address map of {path}: its function {:x} is no instance the build reached",
+                    key.0
+                )
             })?;
             bytes.extend_from_slice(&addr.to_le_bytes());
             bytes.extend_from_slice(&size.to_le_bytes());
@@ -328,15 +348,19 @@ impl Profiles {
         }
         // Whole or not at all: a profile read while it is written finds the last one.
         let part = dir.join(format!("{name}.part-{}", std::process::id()));
-        std::fs::write(&part, &bytes).map_err(|error| format!("writing {}: {error}", part.display()))?;
-        std::fs::rename(&part, &file).map_err(|error| format!("renaming {} to {}: {error}", part.display(), file.display()))?;
+        std::fs::write(&part, &bytes)
+            .map_err(|error| format!("writing {}: {error}", part.display()))?;
+        std::fs::rename(&part, &file).map_err(|error| {
+            format!("renaming {} to {}: {error}", part.display(), file.display())
+        })?;
         self.collect(&dir, id)
     }
 
     /// Removes the maps in `dir` (one image's) that no profile names, but the newest [`KEEP`]
     /// counting `written`.
     fn collect(&self, dir: &Path, written: BuildId) -> Result<(), String> {
-        let entries = std::fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+        let entries =
+            std::fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
         // alloc: once per link that keeps a map, a map of its image's
         let mut unnamed: Vec<(SystemTime, PathBuf)> = Vec::new();
         for entry in entries {
@@ -397,8 +421,14 @@ fn physical(profile: &Profile, stack: u32) -> Result<[Option<At>; 2], String> {
         && found < 2
     {
         fuel = fuel.checked_sub(1).ok_or_else(|| format!("stack {stack} has a cycle"))?;
-        let it = profile.stacks.get(at as usize).ok_or_else(|| format!("stack {stack} names node {at}, past the table"))?;
-        let frame = profile.frames.get(it.frame as usize).ok_or_else(|| format!("stack node {at} names frame {}, past the table", it.frame))?;
+        let it = profile
+            .stacks
+            .get(at as usize)
+            .ok_or_else(|| format!("stack {stack} names node {at}, past the table"))?;
+        let frame = profile
+            .frames
+            .get(it.frame as usize)
+            .ok_or_else(|| format!("stack node {at} names frame {}, past the table", it.frame))?;
         node = it.parent;
         if frame.kind != FrameKind::Native {
             continue;
@@ -430,7 +460,11 @@ fn maps(dir: &Path, named: &[BuildId]) -> Result<Vec<(BuildId, String, Vec<Row>)
     for entry in entries {
         let entry = entry.map_err(|error| format!("{}: {error}", root.display()))?;
         // An image's maps are a directory; anything else here (a `.DS_Store`) is none of ours.
-        if entry.file_type().map_err(|error| format!("{}: {error}", entry.path().display()))?.is_dir() {
+        if entry
+            .file_type()
+            .map_err(|error| format!("{}: {error}", entry.path().display()))?
+            .is_dir()
+        {
             images.push(entry.path());
         }
     }
@@ -445,7 +479,8 @@ fn maps(dir: &Path, named: &[BuildId]) -> Result<Vec<(BuildId, String, Vec<Row>)
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(format!("{}: {error}", file.display())),
             };
-            let (path, rows) = parse(&bytes).map_err(|why| format!("{}: {why}; remove it", file.display()))?;
+            let (path, rows) =
+                parse(&bytes).map_err(|why| format!("{}: {why}; remove it", file.display()))?;
             out.push((*id, path, rows));
         }
     }
@@ -456,7 +491,8 @@ fn maps(dir: &Path, named: &[BuildId]) -> Result<Vec<(BuildId, String, Vec<Row>)
 fn parse(bytes: &[u8]) -> Result<(String, Vec<Row>), String> {
     let rest = bytes.strip_prefix(MAGIC).ok_or("not an address map of this blaze")?;
     let (len, rest) = rest.split_first_chunk::<4>().ok_or("cut short in its path's length")?;
-    let (path, rest) = rest.split_at_checked(u32::from_le_bytes(*len) as usize).ok_or("cut short in its path")?;
+    let (path, rest) =
+        rest.split_at_checked(u32::from_le_bytes(*len) as usize).ok_or("cut short in its path")?;
     let path = std::str::from_utf8(path).map_err(|_| "its path is not UTF-8")?;
     let (count, rest) = rest.split_first_chunk::<8>().ok_or("cut short in its count of rows")?;
     let count = u64::from_le_bytes(*count);
@@ -467,7 +503,8 @@ fn parse(bytes: &[u8]) -> Result<(String, Vec<Row>), String> {
     let rows: Vec<Row> = rest
         .chunks_exact(ROW)
         .map(|row| {
-            let word = |at: usize| u64::from_le_bytes(row[at..at + 8].try_into().unwrap_or_default());
+            let word =
+                |at: usize| u64::from_le_bytes(row[at..at + 8].try_into().unwrap_or_default());
             let mut identity = [0; 32];
             identity.copy_from_slice(&row[16..]);
             (word(0), word(8), ContentId(identity))

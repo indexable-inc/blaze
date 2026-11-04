@@ -10,11 +10,7 @@
 //! the most watched at once, and a handle to an entry taken out names nothing, even once its
 //! slot is another process's.
 
-use std::{
-    io,
-    sync::Once,
-    time::Duration,
-};
+use std::{io, sync::Once, time::Duration};
 
 use blaze_mem::{Slab, Tag as MemTag};
 use parking_lot::{Condvar, Mutex, MutexGuard};

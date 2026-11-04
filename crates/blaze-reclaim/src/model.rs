@@ -170,7 +170,8 @@ fn model_a_horizon_taken_before_a_lock_frees_nothing_retired_after_it() {
             thread::spawn(move || read(&shared))
         };
         let unlinker = {
-            let (shared, retired, drops) = (Arc::clone(&shared), Arc::clone(&retired), Arc::clone(&drops));
+            let (shared, retired, drops) =
+                (Arc::clone(&shared), Arc::clone(&retired), Arc::clone(&drops));
             thread::spawn(move || {
                 let old = shared.swap(Node::new(2, &drops), Ordering::AcqRel);
                 let mut retired = retired.lock();

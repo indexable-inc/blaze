@@ -368,7 +368,11 @@ impl Frame {
     }
 
     fn exhausted(&self, more: usize) -> MemError {
-        MemError::Exhausted { tag: self.tag.get(), reserved: self.limit, wanted: self.used().saturating_add(more) }
+        MemError::Exhausted {
+            tag: self.tag.get(),
+            reserved: self.limit,
+            wanted: self.used().saturating_add(more),
+        }
     }
 
     /// Makes the current block one `layout` fits in at the cursor: the current span grown, a
@@ -376,7 +380,11 @@ impl Frame {
     fn make_room(&self, layout: Layout) -> Result<(), MemError> {
         let (size, align) = (layout.size(), layout.align());
         if align > MAX_ALIGN {
-            return Err(MemError::TooLarge { tag: self.tag.get(), what: "a frame allocation's alignment", wanted: align });
+            return Err(MemError::TooLarge {
+                tag: self.tag.get(),
+                what: "a frame allocation's alignment",
+                wanted: align,
+            });
         }
         if self.used().saturating_add(size) > self.limit {
             return Err(self.exhausted(size));
@@ -396,7 +404,11 @@ impl Frame {
                 ahead = header(ahead).next;
             }
         }
-        let block = if size > SPAN_AT || !chunk_fits(layout) { self.new_span(layout)? } else { self.new_chunk()? };
+        let block = if size > SPAN_AT || !chunk_fits(layout) {
+            self.new_span(layout)?
+        } else {
+            self.new_chunk()?
+        };
         self.link_after_current(block);
         self.enter(block);
         self.reach(block, layout)
@@ -585,7 +597,9 @@ impl Frame {
             self.held.set(self.held.get() - CHUNK);
             let index = head.chunk;
             let given = self.task
-                && SHELF_OF.try_with(|shelf| shelf.give_chunk(Chunk::from_index(index), cold)).is_ok();
+                && SHELF_OF
+                    .try_with(|shelf| shelf.give_chunk(Chunk::from_index(index), cold))
+                    .is_ok();
             if !given {
                 match cold {
                     true => chunks::give_cold(Chunk::from_index(index), Tag::Frames),
@@ -691,7 +705,9 @@ impl Frame {
     pub fn alloc_uninit_slice<T>(&self, len: usize) -> &mut [MaybeUninit<T>] {
         let layout = match Layout::array::<T>(len) {
             Ok(layout) => layout,
-            Err(_) => fail(&MemError::TooLarge { tag: self.tag(), what: "a frame slice", wanted: len }),
+            Err(_) => {
+                fail(&MemError::TooLarge { tag: self.tag(), what: "a frame slice", wanted: len })
+            }
         };
         let ptr = self.alloc_layout(layout).cast::<MaybeUninit<T>>();
         // SAFETY: fresh memory of this frame for `len` elements, aligned, handed out once and
@@ -867,7 +883,8 @@ impl Frame {
 
 /// Whether a fresh chunk holds `layout` after its header.
 fn chunk_fits(layout: Layout) -> bool {
-    layout.align() <= CHUNK && align_up(HEADER, layout.align()).saturating_add(layout.size()) <= CHUNK
+    layout.align() <= CHUNK
+        && align_up(HEADER, layout.align()).saturating_add(layout.size()) <= CHUNK
 }
 
 /// Whether the block `block` holds `layout` at its start.
@@ -901,9 +918,11 @@ fn drop_span(block: *mut Block) {
 fn refused(why: cap::Refused, tag: Tag, wanted: usize) -> MemError {
     match why {
         cap::Refused::Cancelled => cancel(),
-        cap::Refused::TooBig { limit } => {
-            MemError::Exhausted { tag, reserved: usize::try_from(limit).unwrap_or(usize::MAX), wanted }
-        }
+        cap::Refused::TooBig { limit } => MemError::Exhausted {
+            tag,
+            reserved: usize::try_from(limit).unwrap_or(usize::MAX),
+            wanted,
+        },
     }
 }
 
@@ -1256,7 +1275,11 @@ fn refuse_unmapped(outer: *const Frame, starting: u32) -> ! {
          stack names as the enclosing task's, and no frame can be there: it is {}; a task frame \
          was carried wrong across a job's switch, or a number was stored as a frame. Task \
          {starting} starts at:\n{}",
-        if outer.addr() < LOWEST { "below the lowest address mapped" } else { "not aligned as a frame is" },
+        if outer.addr() < LOWEST {
+            "below the lowest address mapped"
+        } else {
+            "not aligned as a frame is"
+        },
         std::backtrace::Backtrace::force_capture()
     )
 }
@@ -1273,7 +1296,9 @@ fn refuse_outer(outer: *const Frame, seal: u64, owner: u32, starting: u32) -> ! 
     // bytes as they were; any other seal says the bytes are not a frame's, and nothing more is
     // read of them.
     let owned = if seal == UNSEALED {
-        let opened_at = outer.wrapping_byte_add(mem::offset_of!(Frame, opened_at)).cast::<&'static Location<'static>>();
+        let opened_at = outer
+            .wrapping_byte_add(mem::offset_of!(Frame, opened_at))
+            .cast::<&'static Location<'static>>();
         let ended_on = outer.wrapping_byte_add(mem::offset_of!(Frame, ended_on)).cast::<usize>();
         // SAFETY: the `opened_at` field of the dropped frame's bytes, as they were when it was
         // alive: a `&'static Location`, which a drop leaves as it was.
@@ -1504,7 +1529,10 @@ pub fn put_current(taken: NonZeroUsize) {
     let frame: *const Frame = ptr::with_exposed_provenance(taken.get());
     check_carried(frame, "switched in");
     STACK.with(|stack| {
-        assert!(stack.current.get().is_null(), "a job's frame put back on a thread inside another task");
+        assert!(
+            stack.current.get().is_null(),
+            "a job's frame put back on a thread inside another task"
+        );
         // Used only as `innermost` says: by the job that owns the frame, which runs on this
         // thread from now on.
         stack.current.set(frame);
@@ -1539,7 +1567,10 @@ pub fn put_peak(taken: NonZeroUsize) {
 /// Whether the switching job is unwinding from [`cancel`] ([`take_current`]).
 #[inline(never)]
 pub fn take_cancelling() -> Option<NonZeroUsize> {
-    STACK.try_with(|stack| stack.cancelling.replace(false)).unwrap_or(false).then_some(NonZeroUsize::MIN)
+    STACK
+        .try_with(|stack| stack.cancelling.replace(false))
+        .unwrap_or(false)
+        .then_some(NonZeroUsize::MIN)
 }
 
 #[inline(never)]
@@ -1702,14 +1733,20 @@ pub fn string<'f>(frame: &'f Frame, text: &str) -> crate::text::String<&'f Frame
 /// A copy of `path` in `frame`, to push onto or pop (unix only, [`crate::text`]).
 #[cfg(unix)]
 #[inline]
-pub fn path<'f>(frame: &'f Frame, path: impl AsRef<std::path::Path>) -> crate::text::PathBuf<&'f Frame> {
+pub fn path<'f>(
+    frame: &'f Frame,
+    path: impl AsRef<std::path::Path>,
+) -> crate::text::PathBuf<&'f Frame> {
     crate::text::PathBuf::from_path_in(path, frame)
 }
 
 /// A copy of `text` in `frame`, to grow (unix only, [`crate::text`]).
 #[cfg(unix)]
 #[inline]
-pub fn os_string<'f>(frame: &'f Frame, text: impl AsRef<std::ffi::OsStr>) -> crate::text::OsString<&'f Frame> {
+pub fn os_string<'f>(
+    frame: &'f Frame,
+    text: impl AsRef<std::ffi::OsStr>,
+) -> crate::text::OsString<&'f Frame> {
     crate::text::OsString::from_os_str_in(text, frame)
 }
 
@@ -1775,8 +1812,12 @@ mod tests {
         let taken = NonZeroUsize::new(stale.expose_provenance()).expect("a frame's address");
         let got = panic::catch_unwind(|| put_current(taken));
         let payload = got.expect_err("a dropped frame put back on a thread panics");
-        let text = payload.downcast_ref::<String>().cloned().expect("the panic's text is formatted");
-        assert!(text.contains(&format!("a job switched in carrying the frame at {stale:p}")), "{text}");
+        let text =
+            payload.downcast_ref::<String>().cloned().expect("the panic's text is formatted");
+        assert!(
+            text.contains(&format!("a job switched in carrying the frame at {stale:p}")),
+            "{text}"
+        );
         assert!(text.contains("it is dropped; the frame's address is "), "{text}");
         assert!(!in_task(), "the refused frame is not made current");
     }

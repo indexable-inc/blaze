@@ -126,10 +126,11 @@ fn main() {
     .into_db();
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
-    let main = def_map.module(&db, def_map.root).scope(&db).declarations().find_map(|it| match it {
-        ModuleDefId::FunctionId(it) => Some(it),
-        _ => None,
-    });
+    let main =
+        def_map.module(&db, def_map.root).scope(&db).declarations().find_map(|it| match it {
+            ModuleDefId::FunctionId(it) => Some(it),
+            _ => None,
+        });
     let source_map = Body::source_map(&db, main.unwrap().into());
     let mut placed = source_map
         .macro_calls()

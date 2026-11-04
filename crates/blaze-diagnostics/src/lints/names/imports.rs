@@ -26,10 +26,10 @@ mod unused;
 mod used;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::{HirFileId, InFile};
 use hir_expand::MacroCallKind;
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::{SyntaxNodePtr, TextRange};
 
 use crate::{
@@ -69,7 +69,9 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
         buffered.extend(qualifications::lints(cx, walk, &uses, &unused));
     }
     let mut found = buffered;
-    found.sort_by_cached_key(|found| found.lint_at.map(|at| places.place(cx, at)).unwrap_or_default());
+    found.sort_by_cached_key(|found| {
+        found.lint_at.map(|at| places.place(cx, at)).unwrap_or_default()
+    });
     debug_assert!(found.iter().all(|it| it.phase == Phase::Resolve));
     found.append(&mut unused.bodies);
     found
@@ -116,7 +118,8 @@ impl Places {
             let node = loc.to_node_view(cx.db);
             inner.push(match loc.kind {
                 MacroCallKind::Derive { .. } => {
-                    let adt = node.value.parent().map_or(node.value.text_range(), |it| it.text_range());
+                    let adt =
+                        node.value.parent().map_or(node.value.text_range(), |it| it.text_range());
                     (u32::from(adt.end()), 1)
                 }
                 _ => entered(node.value.text_range()),

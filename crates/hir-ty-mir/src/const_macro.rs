@@ -12,7 +12,6 @@ use std::{any::Any, sync::Arc};
 
 use base_db::{Crate, Db, all_crates};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{AdtId, FunctionId, MacroId, ModuleDefId, StructId, nameres::crate_def_map};
 use hir_expand::{
     name::Name,
@@ -27,6 +26,7 @@ use hir_ty::db::HirDatabase;
 use intern::Symbol;
 use rustc_type_ir::inherent::IntoKind;
 use span::{FileId, Span};
+use std::alloc::Global;
 use syntax::{
     AstNode, Edition, SyntaxKind,
     ast::{self, HasAttrs, HasModuleItem, HasName},
@@ -115,12 +115,7 @@ impl ConstMacroExpander {
     }
 
     /// What each parameter of `func`, of the macro crate `krate`, takes.
-    fn params(
-        &self,
-        db: &Db,
-        krate: Crate,
-        func: FunctionId,
-    ) -> Result<Vec<Param>, String> {
+    fn params(&self, db: &Db, krate: Crate, func: FunctionId) -> Result<Vec<Param>, String> {
         let item = const_ast_item(db, krate)?;
         let sig = db.callable_item_signature(func.into()).skip_binder().skip_binder();
         let target = DisplayTarget::from_crate(db, krate);
@@ -297,12 +292,13 @@ impl ProcMacroExpander for ConstMacroExpander {
                 Err(_) => ProcMacroExpansionError::Panic(format!("{text}{error:?}")),
             }
         })?;
-        let tree = parse_to_token_tree_static_span(edition, call_site, &output).ok_or_else(|| {
-            ProcMacroExpansionError::Panic(format!(
-                "the const macro `{}` returned text that is not tokens: {output:?}",
-                self.name
-            ))
-        })?;
+        let tree =
+            parse_to_token_tree_static_span(edition, call_site, &output).ok_or_else(|| {
+                ProcMacroExpansionError::Panic(format!(
+                    "the const macro `{}` returned text that is not tokens: {output:?}",
+                    self.name
+                ))
+            })?;
         // It runs on the database's evaluator, whose reads are the database's own, tracked;
         // none is traced as a server traces what it read, so its calling crate gets no image.
         Ok(Expanded::untraced(tree, CONST_MACRO_READS))

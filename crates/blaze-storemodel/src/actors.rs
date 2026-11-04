@@ -130,7 +130,11 @@ impl Default for Actors {
 
 impl Actors {
     /// Starts `body` as the actor `name`; it runs until its first schedule point.
-    pub fn spawn(&mut self, name: &str, body: impl FnOnce(&Turn) + Send + 'static) -> Result<(), Failure> {
+    pub fn spawn(
+        &mut self,
+        name: &str,
+        body: impl FnOnce(&Turn) + Send + 'static,
+    ) -> Result<(), Failure> {
         let (go, wait) = crossbeam_channel::unbounded();
         let events = self.send.clone();
         let id = self.actors.len();
@@ -142,16 +146,26 @@ impl Actors {
                     // A controller that has gone needs no word of the end.
                     Ok(()) => drop(turn.events.send((id, Event::Done))),
                     Err(payload) if payload.is::<Stopped>() => {}
-                    Err(payload) => drop(turn.events.send((id, Event::Panicked(panic_text(&*payload))))),
+                    Err(payload) => {
+                        drop(turn.events.send((id, Event::Panicked(panic_text(&*payload)))))
+                    }
                 }
             })
-            .unwrap_or_else(|why| panic!("storemodel: the thread of {name} could not start: {why}"));
-        self.actors.push(Actor { name: name.to_owned(), go: Some(go), next: Next::Done, thread: Some(thread) });
+            .unwrap_or_else(|why| {
+                panic!("storemodel: the thread of {name} could not start: {why}")
+            });
+        self.actors.push(Actor {
+            name: name.to_owned(),
+            go: Some(go),
+            next: Next::Done,
+            thread: Some(thread),
+        });
         self.next_event(id)
     }
 
     fn next_event(&mut self, id: usize) -> Result<(), Failure> {
-        let (from, event) = self.events.recv().expect("an actor that has the turn sends its next event");
+        let (from, event) =
+            self.events.recv().expect("an actor that has the turn sends its next event");
         assert_eq!(from, id, "only the actor with the turn runs");
         let name = &self.actors[id].name;
         self.actors[id].next = match event {
@@ -161,7 +175,9 @@ impl Actors {
             Event::Answer(keys) => Next::Answer(keys),
             Event::Done => Next::Done,
             Event::Failed(failure) => return Err(failure),
-            Event::Panicked(text) => return Err(Failure::new(properties::NO_PANIC, format!("{name} panicked: {text}"))),
+            Event::Panicked(text) => {
+                return Err(Failure::new(properties::NO_PANIC, format!("{name} panicked: {text}")));
+            }
         };
         Ok(())
     }

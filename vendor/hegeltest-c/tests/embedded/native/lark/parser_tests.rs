@@ -33,11 +33,7 @@ fn alts(alternatives: Vec<Alternative>) -> Expr {
 }
 
 fn repeat(inner: Expr, min: u32, max: Option<u32>) -> Expr {
-    Expr::Repeat {
-        inner: Box::new(inner),
-        min,
-        max,
-    }
+    Expr::Repeat { inner: Box::new(inner), min, max }
 }
 
 fn single_rule(text: &str) -> RuleDef {
@@ -74,10 +70,7 @@ fn rule_with_sequence_and_alternatives() {
 #[test]
 fn empty_alternatives() {
     let rule = single_rule("a: | \"x\" |");
-    assert_eq!(
-        rule.body,
-        alts(vec![alt(vec![]), alt(vec![lit("x")]), alt(vec![])])
-    );
+    assert_eq!(rule.body, alts(vec![alt(vec![]), alt(vec![lit("x")]), alt(vec![])]));
     assert!(single_rule("a:").body.is_single_empty());
 }
 
@@ -140,10 +133,7 @@ fn a_line_continuation_ending_the_grammar_leaves_a_definition_unfinished() {
 fn rule_modifiers_before_a_terminal_name_are_rejected() {
     for text in ["?_A: \"x\"", "!_A: \"x\"", "%override ?_A: \"x\""] {
         let message = err(text);
-        assert!(
-            message.contains("Expecting rule or terminal definition"),
-            "{text:?}: {message}"
-        );
+        assert!(message.contains("Expecting rule or terminal definition"), "{text:?}: {message}");
     }
 }
 
@@ -153,10 +143,7 @@ fn nesting_is_capped() {
     let rule = single_rule(&nested(MAX_NESTING));
     assert_eq!(rule.name, "a");
     let message = err(&nested(MAX_NESTING + 1));
-    assert!(
-        message.contains("Grammar nests more than 200 levels of parentheses"),
-        "{message}"
-    );
+    assert!(message.contains("Grammar nests more than 200 levels of parentheses"), "{message}");
     assert!(message.contains("line 1 column 204"), "{message}");
     assert!(err(&format!("a: {}b", "[".repeat(MAX_NESTING + 1))).contains("nests more than"));
     let templated = |depth: usize| format!("a: {}b{}", "t{".repeat(depth), "}".repeat(depth));
@@ -173,10 +160,7 @@ fn aliases() {
         Expr::Alternatives(alts) => alts.into_iter().map(|a| a.alias).collect(),
         _ => unreachable!(),
     };
-    assert_eq!(
-        aliases,
-        vec![Some("first".to_string()), Some("second".to_string()), None]
-    );
+    assert_eq!(aliases, vec![Some("first".to_string()), Some("second".to_string()), None]);
 }
 
 #[test]
@@ -191,10 +175,7 @@ fn templates_and_ranges() {
     assert_eq!(
         rule.body,
         alts(vec![alt(vec![
-            Expr::Template {
-                name: "sep".to_string(),
-                args: vec![rule_sym("b"), lit("x")],
-            },
+            Expr::Template { name: "sep".to_string(), args: vec![rule_sym("b"), lit("x")] },
             Expr::Literal(Pattern::re("[a-z]")),
         ])])
     );
@@ -221,10 +202,7 @@ fn terminal_definitions() {
     assert_eq!(term.priority, 2);
     assert_eq!(
         term.body,
-        alts(vec![
-            alt(vec![lit("a")]),
-            alt(vec![Expr::Literal(Pattern::re("b"))])
-        ])
+        alts(vec![alt(vec![lit("a")]), alt(vec![Expr::Literal(Pattern::re("b"))])])
     );
     assert_eq!(single_term("A: \"a\"").priority, 0);
 }
@@ -258,15 +236,7 @@ fn unexpected_colon() {
 
 #[test]
 fn misplaced_operators() {
-    for text in [
-        "a: b??",
-        "a: b(?)",
-        "a:+\n",
-        "a:?\n",
-        "a:*\n",
-        "a:|*\n",
-        "a: b ~ 1 ~ 2",
-    ] {
+    for text in ["a: b??", "a: b(?)", "a:+\n", "a:?\n", "a:*\n", "a:|*\n", "a: b ~ 1 ~ 2"] {
         assert!(err(text).contains("Misplaced operator"), "{text:?}");
     }
 }
@@ -276,10 +246,7 @@ fn parentheses_errors() {
     assert!(err("a: (\n").contains("Unclosed parenthesis"));
     assert!(err("a: [b\n").contains("Unclosed parenthesis"));
     for text in ["a: )\n", "a: [)\n", "a: (]\n", "a: b)\n"] {
-        assert!(
-            err(text).contains("Unmatched closing parenthesis"),
-            "{text:?}"
-        );
+        assert!(err(text).contains("Unmatched closing parenthesis"), "{text:?}");
     }
 }
 
@@ -303,10 +270,7 @@ fn other_statement_errors() {
 #[test]
 fn error_messages_carry_position_and_line() {
     let message = err("start: a\nb: c:\n");
-    assert!(
-        message.contains("Unexpected colon, at line 2 column 5"),
-        "{message}"
-    );
+    assert!(message.contains("Unexpected colon, at line 2 column 5"), "{message}");
     assert!(message.ends_with("b: c:"), "{message}");
 }
 
@@ -315,10 +279,7 @@ fn directives() {
     let statements = parse(
         "%ignore WS\n%ignore \" \" | /\\t/\n%declare A _B\n%import common.INT\n%import common.WS -> SPACE\n%import .rel.path (a, B)\n%override a: b\n%extend A: \"c\"",
     );
-    assert_eq!(
-        statements[0],
-        Statement::Ignore(alts(vec![alt(vec![term_sym("WS")])]))
-    );
+    assert_eq!(statements[0], Statement::Ignore(alts(vec![alt(vec![term_sym("WS")])])));
     assert_eq!(
         statements[1],
         Statement::Ignore(alts(vec![
@@ -338,10 +299,7 @@ fn directives() {
         Statement::Import(ImportStmt {
             path: vec!["common".to_string()],
             relative: false,
-            names: ImportNames::Single {
-                name: "INT".to_string(),
-                alias: None
-            },
+            names: ImportNames::Single { name: "INT".to_string(), alias: None },
         })
     );
     assert_eq!(
@@ -349,10 +307,7 @@ fn directives() {
         Statement::Import(ImportStmt {
             path: vec!["common".to_string()],
             relative: false,
-            names: ImportNames::Single {
-                name: "WS".to_string(),
-                alias: Some("SPACE".to_string())
-            },
+            names: ImportNames::Single { name: "WS".to_string(), alias: Some("SPACE".to_string()) },
         })
     );
     assert_eq!(
@@ -369,10 +324,7 @@ fn directives() {
 
 #[test]
 fn declare_accepts_rule_names_for_the_builder_to_reject() {
-    assert_eq!(
-        parse("%declare a")[0],
-        Statement::Declare(vec![Symbol::Rule("a".to_string())])
-    );
+    assert_eq!(parse("%declare a")[0], Statement::Declare(vec![Symbol::Rule("a".to_string())]));
 }
 
 #[test]
@@ -411,10 +363,7 @@ fn stray_tokens_after_an_alias_are_rejected() {
 #[test]
 fn an_alternative_bar_cannot_start_a_statement() {
     let message = err("\n| a");
-    assert!(
-        message.contains("Expecting rule or terminal definition"),
-        "{message}"
-    );
+    assert!(message.contains("Expecting rule or terminal definition"), "{message}");
 }
 
 #[test]

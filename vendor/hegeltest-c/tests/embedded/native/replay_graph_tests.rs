@@ -69,10 +69,7 @@ fn diverged_at(stream: Vec<usize>, position: usize) -> Option<Divergence> {
 
 /// A coin whose hidden outcome decides which of two spans follows.
 fn coin() -> Arc<Graph> {
-    graph(&[
-        run(&[(1, boolean(false)), (2, int(3))]),
-        run(&[(1, boolean(false)), (3, int(5))]),
-    ])
+    graph(&[run(&[(1, boolean(false)), (2, int(3))]), run(&[(1, boolean(false)), (3, int(5))])])
 }
 
 #[test]
@@ -147,14 +144,8 @@ fn the_empty_graph_diverges_at_the_first_draw() {
 fn consecutive_bare_draws_are_served_in_order() {
     let g = graph(&[Run {
         steps: vec![
-            Step {
-                addr: vec![(DRAW_LABEL, 0)],
-                value: boolean(true),
-            },
-            Step {
-                addr: vec![(DRAW_LABEL, 1)],
-                value: boolean(false),
-            },
+            Step { addr: vec![(DRAW_LABEL, 0)], value: boolean(true) },
+            Step { addr: vec![(DRAW_LABEL, 1)], value: boolean(false) },
         ],
     }]);
     let mut tc = walk(&g);
@@ -184,9 +175,7 @@ fn the_draw_frame_counts_direct_draws_of_the_innermost_span() {
     assert_eq!(tc.draw_address(), vec![(7, 0), (DRAW_LABEL, 1)]);
     tc.stop_span(false);
     assert_eq!(tc.draw_address(), vec![(DRAW_LABEL, 1)]);
-    in_span(&mut tc, 7, |tc| {
-        assert_eq!(tc.draw_address(), vec![(7, 1), (DRAW_LABEL, 0)])
-    });
+    in_span(&mut tc, 7, |tc| assert_eq!(tc.draw_address(), vec![(7, 1), (DRAW_LABEL, 0)]));
     let addrs = draw_addresses(&tc.spans, tc.nodes.len());
     assert_eq!(addrs.len(), 5);
     assert_eq!(addrs[0], vec![(DRAW_LABEL, 0)]);

@@ -37,7 +37,11 @@ fn compatible_with_protector(state: LocationState) -> bool {
 /// Every combination of the three fields packs into a distinct byte and unpacks to itself.
 #[test]
 fn packed_state_roundtrip() {
-    let sifas = [IdempotentForeignAccess::None, IdempotentForeignAccess::Read, IdempotentForeignAccess::Write];
+    let sifas = [
+        IdempotentForeignAccess::None,
+        IdempotentForeignAccess::Read,
+        IdempotentForeignAccess::Write,
+    ];
     let mut seen = HashSet::new_in(Global);
     for inner in PermissionPriv::ALL {
         for accessed in bool::exhaustive() {
@@ -77,7 +81,10 @@ fn all_read_accesses_commute() {
                 loc21.perform_access(kind, rel2, protected).unwrap();
                 loc21.perform_access(kind, rel1, protected).unwrap();
 
-                assert_eq!(loc12, loc21, "Read accesses {rel1:?} followed by {rel2:?} do not commute !");
+                assert_eq!(
+                    loc12, loc21,
+                    "Read accesses {rel1:?} followed by {rel2:?} do not commute !"
+                );
             }
         }
     }
@@ -245,7 +252,10 @@ mod spurious_read {
 
     impl Exhaustive for TestAccess {
         fn exhaustive() -> Box<dyn Iterator<Item = Self>> {
-            Box::new(<(PtrSelector, AccessKind)>::exhaustive().map(|(ptr, kind)| TestAccess { ptr, kind }))
+            Box::new(
+                <(PtrSelector, AccessKind)>::exhaustive()
+                    .map(|(ptr, kind)| TestAccess { ptr, kind }),
+            )
         }
     }
 
@@ -284,7 +294,10 @@ mod spurious_read {
                     .map(TestEvent::Access)
                     .chain(RetX::exhaustive().map(TestEvent::RetX))
                     .chain(RetY::exhaustive().map(TestEvent::RetY))
-                    .chain(LocStateProt::exhaustive().filter_map(|s| s.is_initial().then_some(TestEvent::RetagY(s)))),
+                    .chain(
+                        LocStateProt::exhaustive()
+                            .filter_map(|s| s.is_initial().then_some(TestEvent::RetagY(s))),
+                    ),
             )
         }
     }
@@ -326,7 +339,10 @@ mod spurious_read {
 
     impl Exhaustive for LocStateProt {
         fn exhaustive() -> Box<dyn Iterator<Item = Self>> {
-            Box::new(<(LocationState, bool)>::exhaustive().map(|(state, prot)| LocStateProt { state, prot }))
+            Box::new(
+                <(LocationState, bool)>::exhaustive()
+                    .map(|(state, prot)| LocStateProt { state, prot }),
+            )
         }
     }
 
@@ -359,9 +375,21 @@ mod spurious_read {
         /// The access a retag or a protector's end makes through `ptr` if it is accessed.
         fn retag_dependent_access(self, ptr: PtrSelector) -> Result<Self, ()> {
             let accessed = match ptr {
-                PtrSelector::X => self.x.state.permission().associated_access().filter(|_| self.x.state.accessed()),
-                PtrSelector::Y => self.y.state.permission().associated_access().filter(|_| self.y.state.accessed()),
-                PtrSelector::Other => panic!("the `accessed` status of `PtrSelector::Other` is unknown"),
+                PtrSelector::X => self
+                    .x
+                    .state
+                    .permission()
+                    .associated_access()
+                    .filter(|_| self.x.state.accessed()),
+                PtrSelector::Y => self
+                    .y
+                    .state
+                    .permission()
+                    .associated_access()
+                    .filter(|_| self.y.state.accessed()),
+                PtrSelector::Other => {
+                    panic!("the `accessed` status of `PtrSelector::Other` is unknown")
+                }
             };
             match accessed {
                 Some(kind) => self.perform_test_access(&TestAccess { ptr, kind }),
@@ -399,12 +427,15 @@ mod spurious_read {
 
         /// Every state reachable from `self` without UB, each once, with a sequence of events
         /// reaching it.
-        fn all_states_reachable_via_opaque_code<RetX, RetY>(self) -> impl Iterator<Item = (Self, OpaqueCode<RetX, RetY>)>
+        fn all_states_reachable_via_opaque_code<RetX, RetY>(
+            self,
+        ) -> impl Iterator<Item = (Self, OpaqueCode<RetX, RetY>)>
         where
             RetX: Exhaustive + Clone + 'static,
             RetY: Exhaustive + Clone + 'static,
         {
-            let mut handle: Vec<(Self, OpaqueCode<_, _>)> = vec![(self, OpaqueCode { events: Vec::new() })];
+            let mut handle: Vec<(Self, OpaqueCode<_, _>)> =
+                vec![(self, OpaqueCode { events: Vec::new() })];
             let mut paths: Vec<(Self, OpaqueCode<_, _>)> = Vec::new();
             let mut seen: HashSet<Self, Global> = HashSet::new_in(Global);
             while let Some((state, path)) = handle.pop() {
@@ -441,7 +472,9 @@ mod spurious_read {
                 let (source, target) = state;
                 for evt in <TestEvent<RetX, RetY>>::exhaustive() {
                     let Ok(new_source) = source.clone().perform_test_event(&evt) else { continue };
-                    let Ok(new_target) = target.clone().perform_test_event(&evt) else { return true };
+                    let Ok(new_target) = target.clone().perform_test_event(&evt) else {
+                        return true;
+                    };
                     if new_source == new_target {
                         continue;
                     }
@@ -479,7 +512,10 @@ mod spurious_read {
         let source = LocStateProtPair {
             xy_rel: RelPosXY::MutuallyForeign,
             x: LocStateProt {
-                state: LocationState::new_accessed(Permission::new_frozen(), IdempotentForeignAccess::default()),
+                state: LocationState::new_accessed(
+                    Permission::new_frozen(),
+                    IdempotentForeignAccess::default(),
+                ),
                 prot: true,
             },
             y: LocStateProt {
@@ -512,7 +548,8 @@ mod spurious_read {
         fn exhaustive() -> Box<dyn Iterator<Item = Self>> {
             let mut v = Vec::new();
             for xy_rel in RelPosXY::exhaustive() {
-                for (x_retag_perm, y_current_perm) in <(LocationState, LocationState)>::exhaustive() {
+                for (x_retag_perm, y_current_perm) in <(LocationState, LocationState)>::exhaustive()
+                {
                     precondition!(x_retag_perm.accessed());
                     precondition!(x_retag_perm.permission().is_initial());
                     precondition!(compatible_with_protector(x_retag_perm));
@@ -560,7 +597,9 @@ mod spurious_read {
         let mut err = 0;
         for pat in Pattern::exhaustive() {
             let Ok(initial_source) = pat.initial_state() else { continue };
-            for (final_source, opaque) in initial_source.all_states_reachable_via_opaque_code::<NoRet, AllowRet>() {
+            for (final_source, opaque) in
+                initial_source.all_states_reachable_via_opaque_code::<NoRet, AllowRet>()
+            {
                 let distinguishable = {
                     assert!(final_source.x.prot);
                     let spurious_read = TestAccess { ptr: PtrSelector::X, kind: AccessKind::Read };
@@ -582,6 +621,10 @@ mod spurious_read {
                 ok += 1;
             }
         }
-        assert!(err == 0, "Test failed after {err}/{} patterns had UB in the target but not the source", ok + err);
+        assert!(
+            err == 0,
+            "Test failed after {err}/{} patterns had UB in the target but not the source",
+            ok + err
+        );
     }
 }

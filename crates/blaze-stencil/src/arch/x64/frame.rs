@@ -230,7 +230,10 @@ fn return_call_stack(func: &ir::Function, inst: ir::Inst) -> Result<u32, Error> 
         return Err(Error::at(
             inst,
             // alloc: the error's message.
-            format!("`{opcode}` to a {} function: a tail call is to a `tail` function", sig.call_conv),
+            format!(
+                "`{opcode}` to a {} function: a tail call is to a `tail` function",
+                sig.call_conv
+            ),
         ));
     }
     let stack = abi::args(sig, |_, _, place| match place {
@@ -429,7 +432,9 @@ pub fn layout(func: &ir::Function, target: &Target, area: Area) -> Result<Frame,
         ));
     }
     if !func.dynamic_stack_slots.is_empty() {
-        return Err(Error::new("dynamic stack slots, which Cranelift's x64 backend lowers none of"));
+        return Err(Error::new(
+            "dynamic stack slots, which Cranelift's x64 backend lowers none of",
+        ));
     }
     if area.align > 1 << 30 {
         return Err(Error::new(
@@ -562,7 +567,11 @@ fn incoming(grow: u32, off: u32) -> Mem {
 }
 
 /// Writes the prologue up to the entry block's parameters.
-pub fn enter(buf: &mut Buf<'_>, rows: &mut impl FnMut(u32, Rule), frame: &Frame) -> Result<(), Error> {
+pub fn enter(
+    buf: &mut Buf<'_>,
+    rows: &mut impl FnMut(u32, Rule),
+    frame: &Frame,
+) -> Result<(), Error> {
     asm::push(buf, RBP);
     rows(buf.len(), Rule::CfaOffset(16));
     rows(buf.len(), Rule::Offset(DWARF_RBP, -16));
@@ -793,7 +802,11 @@ pub fn win_codes(
 
 /// The `UNWIND_INFO` Cranelift's `winx64::UnwindInfo::emit` writes for the prologue's rows
 /// (`create_unwind_info_from_insts`): what `with_saves` then corrects.
-pub fn win_raw(rows: &[(u32, Rule)], clobber: u32, out: &mut Vec<u8, impl Allocator>) -> Result<(), Error> {
+pub fn win_raw(
+    rows: &[(u32, Rule)],
+    clobber: u32,
+    out: &mut Vec<u8, impl Allocator>,
+) -> Result<(), Error> {
     let mut nodes = 0usize;
     let mut last = 0u8;
     win_codes(rows, clobber, |code| {
@@ -880,7 +893,9 @@ pub fn with_saves(info: &[u8], out: &mut Vec<u8, impl Allocator>) -> Result<(), 
             UWOP_PUSH_NONVOL | UWOP_SET_FPREG => 0,
             UWOP_SAVE_NONVOL | UWOP_SAVE_XMM128 => 1,
             // alloc: the error's message.
-            _ => return Err(Error::new(format!("a Windows unwind code {op} the glue never writes"))),
+            _ => {
+                return Err(Error::new(format!("a Windows unwind code {op} the glue never writes")));
+            }
         };
         let word = u16::from_le_bytes([nodes[at + 2 * following], nodes[at + 2 * following + 1]]);
         Ok((offset, op, register, word, 2 + 2 * following))

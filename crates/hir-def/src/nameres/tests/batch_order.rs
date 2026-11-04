@@ -340,7 +340,12 @@ impl hir_expand::proc_macro::ProcMacroExpander for Counted {
         self.state.lock().taken > 0
     }
 
-    fn speculate(&self, _: &base_db::Db, _: base_db::Crate, call: hir_expand::proc_macro::ProcMacroCall<'_>) {
+    fn speculate(
+        &self,
+        _: &base_db::Db,
+        _: base_db::Crate,
+        call: hir_expand::proc_macro::ProcMacroCall<'_>,
+    ) {
         let mut state = self.state.lock();
         let count = state.count;
         let (n, _) = self.run(count);
@@ -352,7 +357,8 @@ impl hir_expand::proc_macro::ProcMacroExpander for Counted {
         &self,
         _: &base_db::Db,
         _: hir_expand::proc_macro::ProcMacroCall<'_>,
-    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError> {
+    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError>
+    {
         unreachable!("a call of `#[counted]` is always in a calling crate")
     }
 
@@ -361,15 +367,24 @@ impl hir_expand::proc_macro::ProcMacroExpander for Counted {
         _: &base_db::Db,
         _: base_db::Crate,
         call: hir_expand::proc_macro::ProcMacroCall<'_>,
-    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError> {
-        let Some(crate::tt::TtElement::Leaf(crate::tt::Leaf::Ident(name))) = call.attrs.and_then(|it| it.iter().next()) else {
-            return Err(hir_expand::proc_macro::ProcMacroExpansionError::Panic("#[counted]: one identifier".into()));
+    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError>
+    {
+        let Some(crate::tt::TtElement::Leaf(crate::tt::Leaf::Ident(name))) =
+            call.attrs.and_then(|it| it.iter().next())
+        else {
+            return Err(hir_expand::proc_macro::ProcMacroExpansionError::Panic(
+                "#[counted]: one identifier".into(),
+            ));
         };
         let name = name.clone();
         let mut state = self.state.lock();
         state.taken += 1;
         let count = state.count;
-        let ahead = state.ahead.iter().position(|it| it.0 == call.call_site).map(|at| state.ahead.swap_remove(at));
+        let ahead = state
+            .ahead
+            .iter()
+            .position(|it| it.0 == call.call_site)
+            .map(|at| state.ahead.swap_remove(at));
         let n = match ahead {
             Some((_, from, n)) if from == count => {
                 state.took_ahead += 1;
@@ -383,8 +398,12 @@ impl hir_expand::proc_macro::ProcMacroExpander for Counted {
         let tree = hir_expand::builtin::quote::quote! { call_site => pub const #name: u32 = #n; };
         Ok(hir_expand::proc_macro::Expanded {
             tree,
-            reads: hir_expand::proc_macro::ExpansionReads::Unknown("a test's proc macro, which traces nothing of what it read"),
-            state: hir_expand::proc_macro::StateUse::Session("`#[counted]` gives the count the calls before it left"),
+            reads: hir_expand::proc_macro::ExpansionReads::Unknown(
+                "a test's proc macro, which traces nothing of what it read",
+            ),
+            state: hir_expand::proc_macro::StateUse::Session(
+                "`#[counted]` gives the count the calls before it left",
+            ),
         })
     }
 
@@ -398,8 +417,10 @@ impl hir_expand::proc_macro::ProcMacroExpander for Counted {
 /// what each call's turn was given, and how many calls ran ahead and how many turns took one.
 fn counted_in(order: RunOrder, counts: Counts) -> (Vec<(String, u32)>, usize, usize) {
     let previous = set_run_order(order);
-    let counted =
-        std::sync::Arc::new(Counted { counts, state: parking_lot::Mutex::new(CountedState::default()) });
+    let counted = std::sync::Arc::new(Counted {
+        counts,
+        state: parking_lot::Mutex::new(CountedState::default()),
+    });
     let extra = vec![(
         "#[proc_macro_attribute]\npub fn counted(_attr: TokenStream, item: TokenStream) -> TokenStream { item }\n".to_owned(),
         hir_expand::proc_macro::ProcMacro {
@@ -451,24 +472,45 @@ pub struct HostF;
 /// has each later call taken from its run ahead.
 #[test]
 fn ordered_calls_take_their_runs_ahead_only_from_their_turns_state() {
-    let orders = [RunOrder::LeftToReaders, RunOrder::InOrder, RunOrder::Reversed, RunOrder::Strided(2), RunOrder::Strided(3)];
+    let orders = [
+        RunOrder::LeftToReaders,
+        RunOrder::InOrder,
+        RunOrder::Reversed,
+        RunOrder::Strided(2),
+        RunOrder::Strided(3),
+    ];
     for order in orders {
         let (turns, _, _) = counted_in(order, Counts::Every);
         let names: Vec<&str> = turns.iter().map(|it| it.0.as_str()).collect();
         // `D` is in a module, collected after the root's calls of its round.
         let numbers: Vec<u32> = turns.iter().map(|it| it.1).collect();
-        assert_eq!(numbers, [0, 1, 2, 3, 4, 5], "{order:?}: the counter counts its turns in order: {turns:?}");
+        assert_eq!(
+            numbers,
+            [0, 1, 2, 3, 4, 5],
+            "{order:?}: the counter counts its turns in order: {turns:?}"
+        );
         let mut sorted = names.clone();
         sorted.sort_unstable();
-        assert_eq!(sorted, ["A", "B", "C", "D", "E", "F"], "{order:?}: every call has one turn: {turns:?}");
+        assert_eq!(
+            sorted,
+            ["A", "B", "C", "D", "E", "F"],
+            "{order:?}: every call has one turn: {turns:?}"
+        );
 
         let (turns, ran_ahead, took_ahead) = counted_in(order, Counts::First);
         let numbers: Vec<u32> = turns.iter().map(|it| it.1).collect();
-        assert_eq!(numbers, [0, 1, 1, 1, 1, 1], "{order:?}: only the first call starts from nothing: {turns:?}");
+        assert_eq!(
+            numbers,
+            [0, 1, 1, 1, 1, 1],
+            "{order:?}: only the first call starts from nothing: {turns:?}"
+        );
         if order == RunOrder::LeftToReaders {
             assert_eq!((ran_ahead, took_ahead), (0, 0), "no batch ran, so no call ran ahead");
         } else {
-            assert!(took_ahead > 0 && took_ahead == ran_ahead, "{order:?}: every run ahead is taken: {ran_ahead} {took_ahead}");
+            assert!(
+                took_ahead > 0 && took_ahead == ran_ahead,
+                "{order:?}: every run ahead is taken: {ran_ahead} {took_ahead}"
+            );
         }
     }
     // Both the counter's names in their turns' order and the order the front end collects

@@ -45,24 +45,12 @@ fn redistribute_string_pair_moves_entire_value_when_accepted() {
     ];
     let mut shrinker = accepting_shrinker(initial);
     drive_no_yield(shrinker.redistribute_string_pairs()).unwrap();
-    let (a, b) = match (
-        &shrinker.current_nodes[0].value(),
-        &shrinker.current_nodes[1].value(),
-    ) {
+    let (a, b) = match (&shrinker.current_nodes[0].value(), &shrinker.current_nodes[1].value()) {
         (ChoiceValue::String(a), ChoiceValue::String(b)) => (a.clone(), b.clone()),
         _ => unreachable!(),
     };
     assert!(a.is_empty(), "first node not emptied: {a:?}");
-    assert_eq!(
-        b,
-        vec![
-            b'a' as u32,
-            b'b' as u32,
-            b'c' as u32,
-            b'd' as u32,
-            b'e' as u32
-        ]
-    );
+    assert_eq!(b, vec![b'a' as u32, b'b' as u32, b'c' as u32, b'd' as u32, b'e' as u32]);
 }
 
 #[test]
@@ -125,11 +113,7 @@ fn redistribute_string_pair_moves_several_elements_in_one_invocation() {
 
 #[test]
 fn shrink_strings_collapses_accepting_run_toward_simplest() {
-    let initial = vec![string_node(
-        vec![b'a' as u32, b'b' as u32],
-        b'a' as u32,
-        b'z' as u32,
-    )];
+    let initial = vec![string_node(vec![b'a' as u32, b'b' as u32], b'a' as u32, b'z' as u32)];
     let mut shrinker = accepting_shrinker(initial);
     drive_no_yield(shrinker.shrink_strings()).unwrap();
     let v = match &shrinker.current_nodes[0].value() {
@@ -222,11 +206,7 @@ fn shrink_strings_linear_scan_breaks_when_replace_shortens_below_target() {
     drive_no_yield(shrinker.shrink_strings()).unwrap();
     match &shrinker.current_nodes[0].value() {
         ChoiceValue::String(s) => {
-            assert_eq!(
-                s.len(),
-                3,
-                "expected the shortest allowed prefix, got {s:?}"
-            )
+            assert_eq!(s.len(), 3, "expected the shortest allowed prefix, got {s:?}")
         }
         _ => unreachable!(),
     }
@@ -245,9 +225,7 @@ fn grammar_node(text: &str, simplest: &str, value: &str) -> ChoiceNode {
     let constraint =
         crate::native::lark::constraint::GrammarConstraint::new(grammar, start, 32, u32::MAX, None)
             .unwrap();
-    constraint
-        .simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(simplest)))
-        .unwrap();
+    constraint.simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(simplest))).unwrap();
     ChoiceNode::string(
         StringChoice {
             intervals: intervals(0, 0x10FFFF).into(),
@@ -271,14 +249,8 @@ fn the_string_passes_leave_a_string_under_a_grammar_alone() {
     drive_no_yield(shrinker.redistribute_string_pairs()).unwrap();
     drive_no_yield(shrinker.lower_duplicated_characters()).unwrap();
     drive_no_yield(shrinker.normalize_unicode_chars()).unwrap();
-    assert_eq!(
-        shrinker.current_nodes[0].value(),
-        ChoiceValue::String(cps("abb"))
-    );
-    assert_eq!(
-        shrinker.current_nodes[1].value(),
-        ChoiceValue::String(cps(""))
-    );
+    assert_eq!(shrinker.current_nodes[0].value(), ChoiceValue::String(cps("abb")));
+    assert_eq!(shrinker.current_nodes[1].value(), ChoiceValue::String(cps("")));
 }
 
 fn regex_node(pattern: &str, simplest: &str, value: &str) -> ChoiceNode {
@@ -289,12 +261,8 @@ fn regex_node(pattern: &str, simplest: &str, value: &str) -> ChoiceNode {
             crate::native::draws::StringSpec::Regex { kind, .. } => kind,
             _ => unreachable!(),
         };
-    let Some(Constraint::Regex(constraint)) = &kind.constraint else {
-        unreachable!()
-    };
-    constraint
-        .simplest_or_init(|| Ok::<_, ()>(cps(simplest)))
-        .unwrap();
+    let Some(Constraint::Regex(constraint)) = &kind.constraint else { unreachable!() };
+    constraint.simplest_or_init(|| Ok::<_, ()>(cps(simplest))).unwrap();
     ChoiceNode::string((*kind).clone(), cps(value), false)
 }
 
@@ -365,13 +333,11 @@ fn a_string_under_a_regex_shrinks_to_the_least_alternative() {
 /// once, which deleting them one at a time could not do.
 #[test]
 fn a_run_of_characters_a_regex_needs_together_is_deleted_at_once() {
-    let mut shrinker = string_shrinker(
-        vec![regex_node("(foo|barbaz)+", "foo", "foobarbazfoo")],
-        |s| {
+    let mut shrinker =
+        string_shrinker(vec![regex_node("(foo|barbaz)+", "foo", "foobarbazfoo")], |s| {
             let s: String = s.iter().map(|&c| char::from_u32(c).unwrap()).collect();
             s.contains("barbaz")
-        },
-    );
+        });
     drive_no_yield(shrinker.shrink_strings()).unwrap();
     assert_eq!(string_of(&shrinker), "barbaz");
 }
@@ -403,11 +369,7 @@ fn window_deletions_stop_after_a_stall_and_go_on_while_they_succeed() {
 #[test]
 fn the_ends_of_the_simplest_string_are_copied_over_a_string_under_a_regex() {
     let mut shrinker = string_shrinker(
-        vec![regex_node(
-            r"(com|org)\.[a-z]+@[a-z]+\.(com|org)",
-            "com.a@a.com",
-            "org.aaaaaa@a.org",
-        )],
+        vec![regex_node(r"(com|org)\.[a-z]+@[a-z]+\.(com|org)", "com.a@a.com", "org.aaaaaa@a.org")],
         |s| s.len() >= 16,
     );
     drive_no_yield(shrinker.shrink_strings()).unwrap();

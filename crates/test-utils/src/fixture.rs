@@ -320,7 +320,8 @@ impl FixtureWithProjectMeta {
 
             let (key, value) =
                 component.split_once(':').unwrap_or_else(|| panic!("invalid meta line: {meta:?}"));
-            let value = value.strip_prefix('"').and_then(|it| it.strip_suffix('"')).unwrap_or(value);
+            let value =
+                value.strip_prefix('"').and_then(|it| it.strip_suffix('"')).unwrap_or(value);
             match key {
                 "crate" => krate = Some(value.to_owned()),
                 "deps" => deps = value.split(',').map(|it| it.to_owned()).collect(),
@@ -394,7 +395,9 @@ fn meta_components(meta: &str) -> impl Iterator<Item = &str> {
                 rest[value..]
                     .match_indices('"')
                     .map(|(at, _)| value + at + 1)
-                    .find(|&after| rest[after..].chars().next().is_none_or(|c| c.is_ascii_whitespace()))
+                    .find(|&after| {
+                        rest[after..].chars().next().is_none_or(|c| c.is_ascii_whitespace())
+                    })
                     .unwrap_or_else(|| panic!("unterminated quoted value in meta line: {meta:?}"))
             }
             _ => word_end,

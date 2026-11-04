@@ -46,8 +46,10 @@ const _: () = assert!(MIN_SLOTS.is_power_of_two() && MIN_SLOTS <= MAX_SLOTS);
 /// an index each, names' ends (4 B) and bytes with an index; times [`SHARDS`]. 10.5 GiB of
 /// address space, none of it committed until used.
 #[cfg(test)]
-pub(crate) const RESERVED: usize =
-    SHARDS * (MAX_ENTRIES * (size_of::<SymKey>() + size_of::<ContentId>() + 4) + MAX_NAME_BYTES + 3 * MAX_SLOTS * 8);
+pub(crate) const RESERVED: usize = SHARDS
+    * (MAX_ENTRIES * (size_of::<SymKey>() + size_of::<ContentId>() + 4)
+        + MAX_NAME_BYTES
+        + 3 * MAX_SLOTS * 8);
 
 /// One shard of one table: finds a key or adds it, returning its index in the shard.
 pub(crate) trait Shard<K>: Send {
@@ -129,7 +131,13 @@ impl Index {
     /// ended; doubles the index first when it would be more than half full, rehashing the
     /// entries below it with `hash_of`.
     #[inline]
-    fn insert(&mut self, at: usize, hash: u64, entry: u32, hash_of: impl Fn(u32) -> u64) -> Result<(), MemError> {
+    fn insert(
+        &mut self,
+        at: usize,
+        hash: u64,
+        entry: u32,
+        hash_of: impl Fn(u32) -> u64,
+    ) -> Result<(), MemError> {
         if (entry as usize + 1) * 2 > self.slots.len() {
             self.grow(entry, hash_of)?;
             self.put(hash, entry);
@@ -147,7 +155,11 @@ impl Index {
         let old = self.slots.len();
         let want = (old * 2).max(MIN_SLOTS);
         if want > MAX_SLOTS {
-            return Err(MemError::Exhausted { tag: Tag::Link, reserved: MAX_SLOTS * 8, wanted: want * 8 });
+            return Err(MemError::Exhausted {
+                tag: Tag::Link,
+                reserved: MAX_SLOTS * 8,
+                wanted: want * 8,
+            });
         }
         self.slots.reserve(want - old)?;
         self.slots.extend(std::iter::repeat_n(0, want - old));
@@ -299,7 +311,8 @@ impl<'k> Shard<&'k str> for NameShard {
         let end = bytes.len() as u32;
         let entry = ends.try_push(end).unwrap_or_else(|error| stop(&error)) as u32;
         let (bytes, ends) = (bytes.as_slice(), ends.as_slice());
-        if let Err(error) = index.insert(at, hash, entry, |at| hash_name(name_at(bytes, ends, at))) {
+        if let Err(error) = index.insert(at, hash, entry, |at| hash_name(name_at(bytes, ends, at)))
+        {
             stop(&error)
         }
         entry
@@ -433,7 +446,10 @@ mod tests {
                 assert_eq!(ids.get_or_insert(hash_id(&i), &i), want, "id {n}");
             }
         }
-        assert_eq!((keys.len(), names.len(), ids.len()), (GROWN as usize, GROWN as usize, GROWN as usize));
+        assert_eq!(
+            (keys.len(), names.len(), ids.len()),
+            (GROWN as usize, GROWN as usize, GROWN as usize)
+        );
         for (k, at) in &reference_keys {
             assert_eq!(keys.key(*at as usize), *k);
             assert_eq!(keys.find(hash_key(*k), *k), Some(*at));
@@ -442,7 +458,11 @@ mod tests {
             assert_eq!(names.get(at), s.as_str());
             assert_eq!(names.find(hash_name(s), s), Some(at as u32));
         }
-        assert_eq!(names.bytes.as_slice(), name_list.concat().as_bytes(), "the names' bytes, in order");
+        assert_eq!(
+            names.bytes.as_slice(),
+            name_list.concat().as_bytes(),
+            "the names' bytes, in order"
+        );
         for (i, at) in &reference_ids {
             assert_eq!(ids.id(*at as usize), i);
             assert_eq!(ids.find(hash_id(i), i), Some(*at));
@@ -450,7 +470,10 @@ mod tests {
         assert_eq!(keys.find(hash_key(key(GROWN + 1)), key(GROWN + 1)), None);
         assert_eq!(names.find(hash_name("absent"), "absent"), None);
         assert_eq!(ids.find(hash_id(&content(GROWN + 1)), &content(GROWN + 1)), None);
-        assert!(keys.index.slots.len() >= 2 * GROWN as usize && keys.index.slots.len().is_power_of_two());
+        assert!(
+            keys.index.slots.len() >= 2 * GROWN as usize
+                && keys.index.slots.len().is_power_of_two()
+        );
     }
 
     /// The `unsafe` view of a name against the checked one, for names of every UTF-8 width.
@@ -463,7 +486,8 @@ mod tests {
         }
         for at in 0..names.len() {
             let start = if at == 0 { 0 } else { names.ends[at - 1] as usize };
-            let checked = std::str::from_utf8(&names.bytes[start..names.ends[at] as usize]).unwrap();
+            let checked =
+                std::str::from_utf8(&names.bytes[start..names.ends[at] as usize]).unwrap();
             assert_eq!(names.get(at), checked);
         }
         assert_eq!(names.len(), all.len() - 1, "the empty name is interned once");
@@ -476,14 +500,19 @@ mod tests {
         let mut keys = KeyShard::new().unwrap();
         let mut names = NameShard::new().unwrap();
         let mut ids = IdShard::new().unwrap();
-        let inputs: Vec<(SymKey, String, ContentId)> = (0..GROWN).map(|n| (key(n), name(n), content(n))).collect();
-        blaze_alloc_count::assert_at_most(0, "interning 40 000 new keys, names and ids into one shard each", || {
-            for (k, s, i) in &inputs {
-                keys.get_or_insert(hash_key(*k), *k);
-                names.get_or_insert(hash_name(s), s);
-                ids.get_or_insert(hash_id(i), i);
-            }
-        });
+        let inputs: Vec<(SymKey, String, ContentId)> =
+            (0..GROWN).map(|n| (key(n), name(n), content(n))).collect();
+        blaze_alloc_count::assert_at_most(
+            0,
+            "interning 40 000 new keys, names and ids into one shard each",
+            || {
+                for (k, s, i) in &inputs {
+                    keys.get_or_insert(hash_key(*k), *k);
+                    names.get_or_insert(hash_name(s), s);
+                    ids.get_or_insert(hash_id(i), i);
+                }
+            },
+        );
         blaze_alloc_count::assert_at_most(0, "lookups", || {
             for (k, s, i) in &inputs {
                 assert!(keys.find(hash_key(*k), *k).is_some());
@@ -556,7 +585,8 @@ mod tests {
                 other => panic!("the linker asked for {other:?}"),
             };
             let mut more = Vec::new();
-            if let Some(result) = image.complete(&Completion { tag: effect.tag(), done }, &mut more) {
+            if let Some(result) = image.complete(&Completion { tag: effect.tag(), done }, &mut more)
+            {
                 return result;
             }
             effects.extend(more);
@@ -589,19 +619,20 @@ mod tests {
         let changes: Vec<(InstanceKey, ContentId, String)> =
             (0..RELINKS).map(|n| (instance(2_000_000 + n), content(n), name(n))).collect();
         let before = symbols.dense_len();
-        let last: Sym = blaze_alloc_count::assert_at_most(0, "a warm relink's symbol table growth", || {
-            let mut last = Sym(0);
-            for (function, datum, extern_name) in &changes {
-                symbols.body(function);
-                let id = symbols.id(&function.0);
-                symbols.intern(SymKey::Slot(id));
-                let data = symbols.id(datum);
-                symbols.intern(SymKey::Data(data));
-                symbols.sym_name(extern_name);
-                last = symbols.intern(SymKey::Position(id, 3));
-            }
-            last
-        });
+        let last: Sym =
+            blaze_alloc_count::assert_at_most(0, "a warm relink's symbol table growth", || {
+                let mut last = Sym(0);
+                for (function, datum, extern_name) in &changes {
+                    symbols.body(function);
+                    let id = symbols.id(&function.0);
+                    symbols.intern(SymKey::Slot(id));
+                    let data = symbols.id(datum);
+                    symbols.intern(SymKey::Data(data));
+                    symbols.sym_name(extern_name);
+                    last = symbols.intern(SymKey::Position(id, 3));
+                }
+                last
+            });
         assert!(symbols.dense_len() > before, "the relinks grew the table");
         let (function, datum, extern_name) = &changes[RELINKS as usize - 1];
         let id = symbols.find_id(&function.0).expect("interned");
@@ -609,10 +640,17 @@ mod tests {
         assert_eq!(symbols.find_body(function), Some(symbols.body(function)));
         assert!(symbols.find_slot(function).is_some());
         assert!(symbols.find_id(datum).is_some());
-        assert_eq!(symbols.name_of(symbols.find_sym_name(extern_name).unwrap()), Some(extern_name.as_str()));
+        assert_eq!(
+            symbols.name_of(symbols.find_sym_name(extern_name).unwrap()),
+            Some(extern_name.as_str())
+        );
         let batch: Vec<Wide<'_>> = changes.iter().map(|it| Wide::Body(&it.0)).collect();
         let again = symbols.intern_wide(&batch);
-        assert_eq!(again[7], symbols.body(&changes[7].0), "a batch finds what the warm path interned");
+        assert_eq!(
+            again[7],
+            symbols.body(&changes[7].0),
+            "a batch finds what the warm path interned"
+        );
     }
 
     /// A new image's symbol table reserves its regions and commits nothing: making one costs

@@ -48,10 +48,7 @@ fn ranges(pattern: &str) -> Vec<(u32, u32)> {
 #[test]
 fn keyword_matched_by_a_regex_is_retyped() {
     let g = compiled("start: NAME \"if\" \"while\"\nNAME: /[a-z]+/\n%ignore \" \"\n");
-    assert_eq!(
-        lex(&g, "if while iffy"),
-        vec![("IF", 2), ("WHILE", 5), ("NAME", 4)]
-    );
+    assert_eq!(lex(&g, "if while iffy"), vec![("IF", 2), ("WHILE", 5), ("NAME", 4)]);
 }
 
 #[test]
@@ -69,22 +66,13 @@ fn keyword_with_flags_the_regex_lacks_stays_in_the_order() {
 #[test]
 fn string_terminals_with_flags_are_retyped_by_comparing_their_literals() {
     let g = compiled("start: NAME KW\nNAME: /[a-z]+/i\nKW: \"if\"i\n%ignore \" \"\n");
-    assert_eq!(
-        lex(&g, "IF iffy If"),
-        vec![("KW", 2), ("NAME", 4), ("KW", 2)]
-    );
+    assert_eq!(lex(&g, "IF iffy If"), vec![("KW", 2), ("NAME", 4), ("KW", 2)]);
     let texts = [
         "KeyWord", "keyword", "KEYWORD", "KeyWor", "KeyWords", "", "a b", "A B", "ab", "ß", "ẞ",
         "k", "K", "\u{212A}", "Ab", "aB",
     ];
-    let strings: &[(&str, &str)] = &[
-        ("KeyWord", "i"),
-        ("a b", "x"),
-        ("ß", "i"),
-        ("k", "i"),
-        ("Ab", "is"),
-        ("ab", ""),
-    ];
+    let strings: &[(&str, &str)] =
+        &[("KeyWord", "i"), ("a b", "x"), ("ß", "i"), ("k", "i"), ("Ab", "is"), ("ab", "")];
     for &(value, flags) in strings {
         let pattern = Pattern::str(value).with_flags(flags);
         let parsed = parse_pattern(&pattern_to_regexp(&pattern), 0).unwrap();
@@ -130,14 +118,8 @@ fn runs_and_probes_the_backtracking_matcher_left_open_are_carried() {
     assert!(lexer.can_stop(&digits, id("DA")));
     assert!(lexer.can_stop(&digits, id("C")));
     assert_eq!(lexer.settle(&digits, &chars("123"), 0, 2, false), None);
-    assert_eq!(
-        lexer.settle(&digits, &chars("12x"), 0, 2, false),
-        Some(Lexed::Token(id("D"), 2))
-    );
-    assert_eq!(
-        lexer.extend(&digits, &chars("123"), 0, 2, false),
-        Some(Lexed::Token(id("D"), 3))
-    );
+    assert_eq!(lexer.settle(&digits, &chars("12x"), 0, 2, false), Some(Lexed::Token(id("D"), 2)));
+    assert_eq!(lexer.extend(&digits, &chars("123"), 0, 2, false), Some(Lexed::Token(id("D"), 3)));
     let opt = lexer.match_terminal_scan(id("OPT"), &chars("a"), 0);
     assert_eq!(opt.lexed, Lexed::Token(id("OPT"), 1));
     assert!(matches!(opt.steps.as_slice(), [(_, Carry::Unless(_))]));
@@ -145,15 +127,9 @@ fn runs_and_probes_the_backtracking_matcher_left_open_are_carried() {
     assert!(lexer.can_stop(&opt, id("C")));
     assert_eq!(lexer.settle(&opt, &chars("a"), 0, 1, false), None);
     assert_eq!(lexer.settle(&opt, &chars("ab"), 0, 1, false), None);
-    assert_eq!(
-        lexer.settle(&opt, &chars("ac"), 0, 1, false),
-        Some(Lexed::Token(id("OPT"), 1))
-    );
+    assert_eq!(lexer.settle(&opt, &chars("ac"), 0, 1, false), Some(Lexed::Token(id("OPT"), 1)));
     assert_eq!(lexer.extend(&opt, &chars("ab"), 0, 1, false), None);
-    assert_eq!(
-        lexer.extend(&opt, &chars("ac"), 0, 1, false),
-        Some(Lexed::Token(id("OPT"), 1))
-    );
+    assert_eq!(lexer.extend(&opt, &chars("ac"), 0, 1, false), Some(Lexed::Token(id("OPT"), 1)));
 }
 
 #[test]
@@ -205,14 +181,8 @@ fn match_terminal_reports_its_own_pattern_only() {
     let lexer = Lexer::new(&g.terminals);
     let a = g.terminal_id("A").unwrap();
     let b = g.terminal_id("B").unwrap();
-    assert_eq!(
-        lexer.match_terminal(a, &chars("aab"), 0),
-        Lexed::Token(a, 2)
-    );
-    assert_eq!(
-        lexer.match_terminal(b, &chars("aab"), 1),
-        Lexed::Token(b, 3)
-    );
+    assert_eq!(lexer.match_terminal(a, &chars("aab"), 0), Lexed::Token(a, 2));
+    assert_eq!(lexer.match_terminal(b, &chars("aab"), 1), Lexed::Token(b, 3));
     assert_eq!(lexer.match_terminal(b, &chars("aab"), 0), Lexed::NoMatch);
 }
 
@@ -302,48 +272,21 @@ fn extend_carries_what_the_end_of_the_text_left_open() {
         "start: NAME KW C D E F\nNAME: /[a-z]+/\nKW: \"if\"\nC: \"ab\"\nD: /(?!x)[0-9]+/\nE: /a\\b/\nF: /(?<=x)(a?b)+/\n",
     );
     let lexer = Lexer::new(&grammar.terminals);
-    let id = |name: &str| {
-        grammar
-            .terminals
-            .iter()
-            .position(|t| t.name == name)
-            .unwrap()
-    };
+    let id = |name: &str| grammar.terminals.iter().position(|t| t.name == name).unwrap();
     let scan = lexer.next_token_scan(&chars("i"), 0);
     assert_eq!(scan.lexed, Lexed::Token(id("NAME"), 1));
-    assert_eq!(
-        lexer.extend(&scan, &chars("if "), 0, 1, true),
-        Some(Lexed::Token(id("KW"), 2))
-    );
-    assert_eq!(
-        lexer.extend(&scan, &chars("ifx"), 0, 1, true),
-        Some(Lexed::Token(id("NAME"), 3))
-    );
-    assert_eq!(
-        lexer.extend(&scan, &chars("xif"), 1, 1, false),
-        Some(Lexed::Token(id("NAME"), 3))
-    );
+    assert_eq!(lexer.extend(&scan, &chars("if "), 0, 1, true), Some(Lexed::Token(id("KW"), 2)));
+    assert_eq!(lexer.extend(&scan, &chars("ifx"), 0, 1, true), Some(Lexed::Token(id("NAME"), 3)));
+    assert_eq!(lexer.extend(&scan, &chars("xif"), 1, 1, false), Some(Lexed::Token(id("NAME"), 3)));
     let scan = lexer.match_terminal_scan(id("C"), &chars("a"), 0);
     assert_eq!(scan.lexed, Lexed::NoMatch);
-    assert_eq!(
-        lexer.extend(&scan, &chars("ab"), 0, 1, false),
-        Some(Lexed::Token(id("C"), 2))
-    );
-    assert_eq!(
-        lexer.extend(&scan, &chars("ax"), 0, 1, false),
-        Some(Lexed::NoMatch)
-    );
+    assert_eq!(lexer.extend(&scan, &chars("ab"), 0, 1, false), Some(Lexed::Token(id("C"), 2)));
+    assert_eq!(lexer.extend(&scan, &chars("ax"), 0, 1, false), Some(Lexed::NoMatch));
     let scan = lexer.match_terminal_scan(id("C"), &chars("x"), 0);
-    assert_eq!(
-        lexer.extend(&scan, &chars("xab"), 0, 1, false),
-        Some(Lexed::NoMatch)
-    );
+    assert_eq!(lexer.extend(&scan, &chars("xab"), 0, 1, false), Some(Lexed::NoMatch));
     let scan = lexer.match_terminal_scan(id("D"), &chars("12"), 0);
     assert_eq!(scan.lexed, Lexed::Token(id("D"), 2));
-    assert_eq!(
-        lexer.extend(&scan, &chars("123-"), 0, 2, false),
-        Some(Lexed::Token(id("D"), 3))
-    );
+    assert_eq!(lexer.extend(&scan, &chars("123-"), 0, 2, false), Some(Lexed::Token(id("D"), 3)));
     let scan = lexer.match_terminal_scan(id("E"), &chars("a"), 0);
     assert_eq!(scan.lexed, Lexed::Token(id("E"), 1));
     assert_eq!(lexer.extend(&scan, &chars("ab"), 0, 1, false), None);
@@ -365,13 +308,7 @@ fn extend_carries_what_the_end_of_the_text_left_open() {
     assert_eq!(scan.lexed, Lexed::NoMatch);
     assert_eq!(lexer.extend(&scan, &chars("abab"), 2, 0, false), None);
     assert_eq!(
-        lexer.extend(
-            &lexer.next_token_scan(&chars("a"), 1),
-            &chars("ab"),
-            1,
-            0,
-            false
-        ),
+        lexer.extend(&lexer.next_token_scan(&chars("a"), 1), &chars("ab"), 1, 0, false),
         None
     );
 }
@@ -427,13 +364,7 @@ fn anchored_patterns_may_look_before_their_start() {
 fn scans_note_whether_an_anchored_terminal_was_tried() {
     let grammar = compiled("start: A B C D\nA: /\\b[ab]a/\nB.2: /b/\nC: /(?<=x)c|d/\nD: /\\bbb/\n");
     let lexer = Lexer::new(&grammar.terminals);
-    let id = |name: &str| {
-        grammar
-            .terminals
-            .iter()
-            .position(|t| t.name == name)
-            .unwrap()
-    };
+    let id = |name: &str| grammar.terminals.iter().position(|t| t.name == name).unwrap();
     let scan = lexer.next_token_scan(&chars("aa"), 0);
     assert_eq!(scan.lexed, Lexed::Token(id("A"), 2));
     assert!(scan.anchored);
@@ -459,47 +390,23 @@ fn scans_note_whether_an_anchored_terminal_was_tried() {
 fn settle_answers_only_what_more_text_cannot_change() {
     let grammar = compiled("start: NAME C F\nNAME: /[a-z]+/\nC: \"ab\"\nF: /(a?b)+/\n");
     let lexer = Lexer::new(&grammar.terminals);
-    let id = |name: &str| {
-        grammar
-            .terminals
-            .iter()
-            .position(|t| t.name == name)
-            .unwrap()
-    };
+    let id = |name: &str| grammar.terminals.iter().position(|t| t.name == name).unwrap();
     let scan = lexer.match_terminal_scan(id("NAME"), &chars("ab"), 0);
-    assert_eq!(
-        lexer.settle(&scan, &chars("ab1"), 0, 2, false),
-        Some(Lexed::Token(id("NAME"), 2))
-    );
+    assert_eq!(lexer.settle(&scan, &chars("ab1"), 0, 2, false), Some(Lexed::Token(id("NAME"), 2)));
     assert_eq!(lexer.settle(&scan, &chars("abc"), 0, 2, false), None);
-    assert_eq!(
-        lexer.extend(&scan, &chars("abc"), 0, 2, false),
-        Some(Lexed::Token(id("NAME"), 3))
-    );
+    assert_eq!(lexer.extend(&scan, &chars("abc"), 0, 2, false), Some(Lexed::Token(id("NAME"), 3)));
     assert_eq!(lexer.settle(&scan, &chars("ab"), 0, 2, false), None);
     let scan = lexer.match_terminal_scan(id("C"), &chars("a"), 0);
     assert_eq!(scan.lexed, Lexed::NoMatch);
     assert_eq!(lexer.settle(&scan, &chars("a"), 0, 1, false), None);
-    assert_eq!(
-        lexer.settle(&scan, &chars("ax"), 0, 1, false),
-        Some(Lexed::NoMatch)
-    );
-    assert_eq!(
-        lexer.settle(&scan, &chars("ab"), 0, 1, false),
-        Some(Lexed::Token(id("C"), 2))
-    );
+    assert_eq!(lexer.settle(&scan, &chars("ax"), 0, 1, false), Some(Lexed::NoMatch));
+    assert_eq!(lexer.settle(&scan, &chars("ab"), 0, 1, false), Some(Lexed::Token(id("C"), 2)));
     let scan = lexer.match_terminal_scan(id("F"), &chars("ab"), 0);
     assert_eq!(scan.lexed, Lexed::Token(id("F"), 2));
-    assert_eq!(
-        lexer.settle(&scan, &chars("abx"), 0, 2, false),
-        Some(Lexed::Token(id("F"), 2))
-    );
+    assert_eq!(lexer.settle(&scan, &chars("abx"), 0, 2, false), Some(Lexed::Token(id("F"), 2)));
     assert_eq!(lexer.settle(&scan, &chars("aba"), 0, 2, false), None);
     assert_eq!(lexer.settle(&scan, &chars("abab"), 0, 2, false), None);
-    assert_eq!(
-        lexer.extend(&scan, &chars("abab"), 0, 2, false),
-        Some(Lexed::Token(id("F"), 4))
-    );
+    assert_eq!(lexer.extend(&scan, &chars("abab"), 0, 2, false), Some(Lexed::Token(id("F"), 4)));
 }
 
 #[test]
@@ -512,13 +419,7 @@ TAIL: /[a-z]+(?<=a)/
 ",
     );
     let lexer = Lexer::new(&grammar.terminals);
-    let id = |name: &str| {
-        grammar
-            .terminals
-            .iter()
-            .position(|t| t.name == name)
-            .unwrap()
-    };
+    let id = |name: &str| grammar.terminals.iter().position(|t| t.name == name).unwrap();
     let scan = lexer.match_terminal_scan(id("NUMBER"), &chars("12"), 0);
     assert_eq!(scan.lexed, Lexed::Token(id("NUMBER"), 2));
     for text in ["12,", "12 x"] {
@@ -529,48 +430,32 @@ TAIL: /[a-z]+(?<=a)/
         );
     }
     for text in ["123", "12"] {
-        assert_eq!(
-            lexer.settle(&scan, &chars(text), 0, 2, false),
-            None,
-            "{text:?}"
-        );
+        assert_eq!(lexer.settle(&scan, &chars(text), 0, 2, false), None, "{text:?}");
     }
     assert_eq!(
         lexer.settle(&scan, &chars("12.5"), 0, 2, false),
         Some(Lexed::Token(id("NUMBER"), 4))
     );
-    assert_eq!(
-        lexer.extend(&scan, &chars("12"), 0, 2, false),
-        Some(Lexed::Token(id("NUMBER"), 2))
-    );
+    assert_eq!(lexer.extend(&scan, &chars("12"), 0, 2, false), Some(Lexed::Token(id("NUMBER"), 2)));
     assert_eq!(
         lexer.extend(&scan, &chars("12.5"), 0, 2, false),
         Some(Lexed::Token(id("NUMBER"), 4))
     );
     let scan = lexer.match_terminal_scan(id("COMMENT"), &chars("  "), 0);
     assert_eq!(scan.lexed, Lexed::NoMatch);
-    assert_eq!(
-        lexer.settle(&scan, &chars("  x"), 0, 2, false),
-        Some(Lexed::NoMatch)
-    );
+    assert_eq!(lexer.settle(&scan, &chars("  x"), 0, 2, false), Some(Lexed::NoMatch));
     assert_eq!(lexer.settle(&scan, &chars("  #"), 0, 2, false), None);
     assert_eq!(lexer.settle(&scan, &chars("   "), 0, 2, false), None);
     let scan = lexer.next_token_scan(&chars("  "), 0);
     assert_eq!(scan.lexed, Lexed::NoMatch);
-    assert_eq!(
-        lexer.extend(&scan, &chars("  z"), 0, 2, true),
-        Some(Lexed::NoMatch)
-    );
+    assert_eq!(lexer.extend(&scan, &chars("  z"), 0, 2, true), Some(Lexed::NoMatch));
     assert_eq!(
         lexer.extend(&scan, &chars("  # c"), 0, 2, true),
         Some(Lexed::Token(id("COMMENT"), 5))
     );
     let scan = lexer.match_terminal_scan(id("TAIL"), &chars("abc"), 0);
     assert_eq!(scan.lexed, Lexed::Token(id("TAIL"), 1));
-    assert_eq!(
-        lexer.settle(&scan, &chars("abc-"), 0, 3, false),
-        Some(Lexed::Token(id("TAIL"), 1))
-    );
+    assert_eq!(lexer.settle(&scan, &chars("abc-"), 0, 3, false), Some(Lexed::Token(id("TAIL"), 1)));
     assert_eq!(lexer.settle(&scan, &chars("abcd"), 0, 3, false), None);
     assert_eq!(lexer.extend(&scan, &chars("abcd"), 0, 3, false), None);
 }
@@ -606,11 +491,8 @@ fn only_candidates_that_can_end_the_previous_match_are_worth_trying() {
 fn a_known_own_scan_stands_in_for_running_its_pattern_again() {
     let g = compiled("start: A B C\nA: /a+/\nB: /ab/\nC: /(c*)*d\\1/\n");
     let lexer = Lexer::new(&g.terminals);
-    let (a, b, c) = (
-        g.terminal_id("A").unwrap(),
-        g.terminal_id("B").unwrap(),
-        g.terminal_id("C").unwrap(),
-    );
+    let (a, b, c) =
+        (g.terminal_id("A").unwrap(), g.terminal_id("B").unwrap(), g.terminal_id("C").unwrap());
     for (id, text) in [(a, "aab"), (b, "aab"), (b, "abb"), (a, "xa"), (c, "ccccc")] {
         for pos in 0..2 {
             let text = chars(text);
@@ -665,26 +547,15 @@ fn steps_stay_in_the_scan_until_a_second_is_noted() {
 
 #[test]
 fn a_scan_follows_another_that_left_the_same_steps_open() {
-    let scan = |lexed: Lexed, steps: Steps, carried: bool| Scan {
-        lexed,
-        steps,
-        carried,
-        anchored: false,
-    };
+    let scan =
+        |lexed: Lexed, steps: Steps, carried: bool| Scan { lexed, steps, carried, anchored: false };
     let step = |id: TermId| (id, Carry::Tail(id));
     let own = scan(Lexed::Token(1, 2), Steps::One(step(1)), true);
     assert!(own.follows(&own));
     assert!(scan(Lexed::Token(7, 2), Steps::One(step(1)), true).follows(&own));
     assert!(!scan(Lexed::Token(1, 2), Steps::One(step(1)), false).follows(&own));
     assert!(!scan(Lexed::Token(1, 2), Steps::None, true).follows(&own));
-    assert!(
-        !scan(
-            Lexed::Token(1, 2),
-            Steps::Many(vec![step(0), step(1)]),
-            true
-        )
-        .follows(&own)
-    );
+    assert!(!scan(Lexed::Token(1, 2), Steps::Many(vec![step(0), step(1)]), true).follows(&own));
     assert!(!scan(Lexed::Token(1, 2), Steps::One((1, Carry::Literal)), true).follows(&own));
     let none = scan(Lexed::NoMatch, Steps::None, false);
     assert!(scan(Lexed::Token(1, 2), Steps::None, false).follows(&none));
@@ -692,13 +563,7 @@ fn a_scan_follows_another_that_left_the_same_steps_open() {
 
     let grammar = compiled("start: A B C\nA: /ab+/\nB: /a/\nC: /c/\n");
     let lexer = Lexer::new(&grammar.terminals);
-    let id = |name: &str| {
-        grammar
-            .terminals
-            .iter()
-            .position(|t| t.name == name)
-            .unwrap()
-    };
+    let id = |name: &str| grammar.terminals.iter().position(|t| t.name == name).unwrap();
     let own = lexer.match_terminal_scan(id("A"), &chars("abb"), 0);
     let basic = lexer.next_token_scan_knowing(&chars("abb"), 0, id("A"), &own);
     assert!(basic.follows(&own));
@@ -730,11 +595,7 @@ fn starters_rule_terminals_out_by_their_first_character() {
         let ch = char::from(ch);
         for (n, &term) in [a, b, c, d].iter().enumerate() {
             if !Starters::has(starters.at(ch), n) {
-                assert_eq!(
-                    lexer.match_terminal(term, &[ch], 0),
-                    Lexed::NoMatch,
-                    "{ch:?} {n}"
-                );
+                assert_eq!(lexer.match_terminal(term, &[ch], 0), Lexed::NoMatch, "{ch:?} {n}");
             }
         }
     }

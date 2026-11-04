@@ -386,8 +386,20 @@ fn a_directive_after_any_space_is_read() {
 #[test]
 fn a_line_is_a_directive_exactly_when_cargo_reads_one() {
     let pieces: [&[u8]; 14] = [
-        b" ", b"\t", b"\x0b", b"\x0c", b"\r", "\u{a0}".as_bytes(), "\u{85}".as_bytes(),
-        "\u{2003}".as_bytes(), b"cargo:", b"cargo", b":", b"x=y", b"\xff", b"\xc2",
+        b" ",
+        b"\t",
+        b"\x0b",
+        b"\x0c",
+        b"\r",
+        "\u{a0}".as_bytes(),
+        "\u{85}".as_bytes(),
+        "\u{2003}".as_bytes(),
+        b"cargo:",
+        b"cargo",
+        b":",
+        b"x=y",
+        b"\xff",
+        b"\xc2",
     ];
     fn cargo(line: &[u8]) -> Option<&str> {
         std::str::from_utf8(line).ok().map(str::trim).filter(|it| it.starts_with("cargo:"))
@@ -397,7 +409,9 @@ fn a_line_is_a_directive_exactly_when_cargo_reads_one() {
         let mut line = Vec::new();
         let state = rng.next_u64();
         for at in 0..(state % 6) {
-            line.extend_from_slice(pieces[((state >> (8 + 4 * at)) % pieces.len() as u64) as usize]);
+            line.extend_from_slice(
+                pieces[((state >> (8 + 4 * at)) % pieces.len() as u64) as usize],
+            );
         }
         assert_eq!(directive(&line), cargo(&line), "{line:?}");
     }
@@ -407,21 +421,42 @@ fn a_line_is_a_directive_exactly_when_cargo_reads_one() {
 #[test]
 fn a_reserved_key_is_one_of_cargo_s_prefixes() {
     const CARGO: &[&str] = &[
-        "rustc-flags=", "rustc-link-lib=", "rustc-link-search=", "rustc-link-arg-cdylib=",
-        "rustc-cdylib-link-arg=", "rustc-link-arg-bins=", "rustc-link-arg-bin=",
-        "rustc-link-arg-tests=", "rustc-link-arg-benches=", "rustc-link-arg-examples=",
-        "rustc-link-arg=", "rustc-cfg=", "rustc-check-cfg=", "rustc-env=", "warning=",
-        "rerun-if-changed=", "rerun-if-env-changed=",
+        "rustc-flags=",
+        "rustc-link-lib=",
+        "rustc-link-search=",
+        "rustc-link-arg-cdylib=",
+        "rustc-cdylib-link-arg=",
+        "rustc-link-arg-bins=",
+        "rustc-link-arg-bin=",
+        "rustc-link-arg-tests=",
+        "rustc-link-arg-benches=",
+        "rustc-link-arg-examples=",
+        "rustc-link-arg=",
+        "rustc-cfg=",
+        "rustc-check-cfg=",
+        "rustc-env=",
+        "warning=",
+        "rerun-if-changed=",
+        "rerun-if-env-changed=",
     ];
     let mut flags: Vec<String> = Vec::new();
     for prefix in CARGO {
         let key = &prefix[..prefix.len() - 1];
-        flags.extend([prefix.to_string(), format!("{prefix}x=y"), key.to_owned(), format!("{key}x=1")]);
+        flags.extend([
+            prefix.to_string(),
+            format!("{prefix}x=y"),
+            key.to_owned(),
+            format!("{key}x=1"),
+        ]);
         flags.push(format!("{}={key}", &key[..key.len() - 1]));
     }
     flags.extend(["".to_owned(), "=".to_owned(), "metadata=k=v".to_owned(), "error=e".to_owned()]);
     for flag in &flags {
-        assert_eq!(has_reserved_prefix(flag), CARGO.iter().any(|it| flag.starts_with(it)), "{flag:?}");
+        assert_eq!(
+            has_reserved_prefix(flag),
+            CARGO.iter().any(|it| flag.starts_with(it)),
+            "{flag:?}"
+        );
     }
 }
 

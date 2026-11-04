@@ -27,7 +27,10 @@ use crate::check::Cx;
 const LINT: Lint = Lint::MissingSizeHint;
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Impl<'t>) {
-    if !cx.on_blaze(LINT) || cx.expansion().is_some() || !cx.is_written(item.syntax()) || cx.is_in_test(item.syntax())
+    if !cx.on_blaze(LINT)
+        || cx.expansion().is_some()
+        || !cx.is_written(item.syntax())
+        || cx.is_in_test(item.syntax())
     {
         return;
     }
@@ -43,7 +46,10 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Impl<'t>) {
         return;
     }
     let named = |name: &str| {
-        imp.items(db).into_iter().filter_map(|it| it.as_function()).find(|it| it.name(db).as_str() == name)
+        imp.items(db)
+            .into_iter()
+            .filter_map(|it| it.as_function())
+            .find(|it| it.name(db).as_str() == name)
     };
     let Some(next) = named("next") else { return };
     let ty_name = adt.name(db);
@@ -97,7 +103,10 @@ fn walks(cx: &Cx<'_, '_>, adt: hir::Struct, next: hir::Function) -> Option<(Stri
         let ty = field.ty(db).strip_references();
         let boxed_slice = ty.as_adt().is_some_and(|it| it.name(db).as_str() == "Box")
             && ty.type_arguments().next().is_some_and(|it| it.is_slice());
-        ty.is_slice() || ty.is_array() || (ty.as_adt().is_some() && ty.as_adt() == vec) || boxed_slice
+        ty.is_slice()
+            || ty.is_array()
+            || (ty.as_adt().is_some() && ty.as_adt() == vec)
+            || boxed_slice
     });
     let ints = fields.iter().filter(|it| int(it)).count();
     let owner = hir::DefWithBody::from(next);
@@ -106,12 +115,17 @@ fn walks(cx: &Cx<'_, '_>, adt: hir::Struct, next: hir::Function) -> Option<(Stri
     let body = analysis.body();
     let infer = analysis.infer();
     let counter = body.exprs().find_map(|(_, expr)| {
-        let Expr::BinaryOp { lhs, op: Some(BinaryOp::Assignment { op: Some(ArithOp::Add | ArithOp::Sub) }), .. } = expr
+        let Expr::BinaryOp {
+            lhs,
+            op: Some(BinaryOp::Assignment { op: Some(ArithOp::Add | ArithOp::Sub) }),
+            ..
+        } = expr
         else {
             return None;
         };
         let Expr::Field { expr: of, name } = body.expr(lhs) else { return None };
-        if analysis.ty(infer.expr_ty(of)).strip_references().as_adt() != Some(hir::Adt::Struct(adt)) {
+        if analysis.ty(infer.expr_ty(of)).strip_references().as_adt() != Some(hir::Adt::Struct(adt))
+        {
             return None;
         }
         let field = fields.iter().find(|it| it.name(db) == *name)?;
@@ -140,18 +154,29 @@ fn exact(db: &base_db::Db, hint: hir::Function) -> bool {
     }
     let Expr::Tuple { exprs: [low, high] } = body.expr(at) else { return false };
     let Expr::Call { args: [inner], .. } = body.expr(*high) else { return false };
-    let option = analysis.ty(analysis.infer().expr_ty(*high)).as_adt().is_some_and(|it| it.name(db).as_str() == "Option");
+    let option = analysis
+        .ty(analysis.infer().expr_ty(*high))
+        .as_adt()
+        .is_some_and(|it| it.name(db).as_str() == "Option");
     option && same(db, def, body, *low, *inner)
 }
 
 /// Whether `a` and `b` are the same place: one local, or the same field of one.
-fn same(db: &base_db::Db, def: DefWithBodyId, body: &hir_def::expr_store::Body, a: ExprId, b: ExprId) -> bool {
+fn same(
+    db: &base_db::Db,
+    def: DefWithBodyId,
+    body: &hir_def::expr_store::Body,
+    a: ExprId,
+    b: ExprId,
+) -> bool {
     match (body.expr(a), body.expr(b)) {
         (Expr::Path(_), Expr::Path(_)) => {
             let local = local_of(db, def, body, a);
             local.is_some() && local == local_of(db, def, body, b)
         }
-        (Expr::Field { expr: x, name: m }, Expr::Field { expr: y, name: n }) => m == n && same(db, def, body, x, y),
+        (Expr::Field { expr: x, name: m }, Expr::Field { expr: y, name: n }) => {
+            m == n && same(db, def, body, x, y)
+        }
         _ => false,
     }
 }

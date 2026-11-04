@@ -81,12 +81,14 @@
 // is library/blaze_inproc_rt: the dev runtime blaze links into every dev executable whose
 // dependencies don't link it themselves (docs/v2/plan/lanes/fastcompile/inproc.md, "The
 // runtime"). This crate is the daemon's side built on it, and names its modules as its own.
-pub use blaze_inproc_rt::{Access, Error, Format, ImageLookup, ImageWrite, ask, channel, fence, frame, image, runtime};
-pub(crate) use blaze_inproc_rt::sys;
 #[cfg(test)]
 pub(crate) use blaze_inproc_rt::bind;
 #[cfg(any(test, feature = "host"))]
 pub(crate) use blaze_inproc_rt::handshake;
+pub(crate) use blaze_inproc_rt::sys;
+pub use blaze_inproc_rt::{
+    Access, Error, Format, ImageLookup, ImageWrite, ask, channel, fence, frame, image, runtime,
+};
 
 pub mod exec;
 #[cfg(feature = "host")]
@@ -193,7 +195,8 @@ impl CodeMemory {
     pub fn with_cells(name: &str, image: u64, arena: u64, cells: u64) -> Result<CodeMemory, Error> {
         let page = sys::page();
         let round = |len: u64, what: &str| {
-            len.checked_next_multiple_of(page).ok_or_else(|| Error::new(format!("{what} size overflows")))
+            len.checked_next_multiple_of(page)
+                .ok_or_else(|| Error::new(format!("{what} size overflows")))
         };
         let image = round(image, "image")?;
         let arena = round(arena, "arena")?;
@@ -363,11 +366,15 @@ impl CodeMemory {
 
     fn word(&self, offset: u64, what: &str) -> Result<&std::sync::atomic::AtomicU64, Error> {
         if !offset.is_multiple_of(8) {
-            return Err(Error::new(format!("a word {what} at {offset:#x}, which is not 8-byte aligned")));
+            return Err(Error::new(format!(
+                "a word {what} at {offset:#x}, which is not 8-byte aligned"
+            )));
         }
         let cells = self.image + self.arena_len;
         match &self.cells {
-            Some((_, view)) if offset >= cells && offset - cells < self.cells_len => Ok(view.word((offset - cells) as usize)),
+            Some((_, view)) if offset >= cells && offset - cells < self.cells_len => {
+                Ok(view.word((offset - cells) as usize))
+            }
             _ => {
                 self.checked(offset, 8)?;
                 Ok(self.view.word(offset as usize))
@@ -400,7 +407,9 @@ impl CodeMemory {
         }
         let range = self.checked(offset, 4)?;
         if !offset.is_multiple_of(4) {
-            return Err(Error::new(format!("an instruction at {offset:#x}, which is not 4-byte aligned")));
+            return Err(Error::new(format!(
+                "an instruction at {offset:#x}, which is not 4-byte aligned"
+            )));
         }
         self.touch(offset);
         self.view.word32(offset as usize).store(instruction, std::sync::atomic::Ordering::Release);
@@ -516,7 +525,8 @@ impl CodeMemory {
             return Some(placed.cells + (offset - cells.start));
         }
         let layout = self.layout.as_ref()?;
-        let segment = layout.code.iter().find(|it| offset >= it.offset && offset - it.offset < it.len)?;
+        let segment =
+            layout.code.iter().find(|it| offset >= it.offset && offset - it.offset < it.len)?;
         Some(segment.linked + (offset - segment.offset))
     }
 
@@ -530,7 +540,8 @@ impl CodeMemory {
             return Some(self.image + self.arena_len + (linked - placed.cells));
         }
         let layout = self.layout.as_ref()?;
-        let segment = layout.code.iter().find(|it| linked >= it.linked && linked - it.linked < it.len)?;
+        let segment =
+            layout.code.iter().find(|it| linked >= it.linked && linked - it.linked < it.len)?;
         Some(segment.offset + (linked - segment.linked))
     }
 
@@ -542,7 +553,11 @@ impl CodeMemory {
     /// The cells part, to read with no lock while compiles and placements hold this memory.
     pub fn cell_view(&self) -> Option<CellView> {
         let (_, view) = self.cells.as_ref()?;
-        Some(CellView { view: Arc::clone(view), start: self.image + self.arena_len, len: self.cells_len })
+        Some(CellView {
+            view: Arc::clone(view),
+            start: self.image + self.arena_len,
+            len: self.cells_len,
+        })
     }
 
     /// Records that the run process `pid` mapped the memory.
@@ -631,7 +646,13 @@ impl CodeMemory {
         let pids: Vec<String> = self
             .processes
             .iter()
-            .map(|it| if it.forks { format!("{} (which forks: until it and its children exit)", it.pid) } else { it.pid.to_string() })
+            .map(|it| {
+                if it.forks {
+                    format!("{} (which forks: until it and its children exit)", it.pid)
+                } else {
+                    it.pid.to_string()
+                }
+            })
             .collect();
         format!("processes {}", pids.join(", "))
     }
@@ -675,14 +696,20 @@ impl CellView {
     /// One relaxed load of the aligned word at `offset` of the object, which must be in the
     /// cells part.
     pub fn load(&self, offset: u64) -> Result<u64, Error> {
-        if !offset.is_multiple_of(8) || offset < self.start || offset.saturating_add(8) > self.start + self.len {
+        if !offset.is_multiple_of(8)
+            || offset < self.start
+            || offset.saturating_add(8) > self.start + self.len
+        {
             return Err(Error::new(format!(
                 "a cell load at {offset:#x}: not an aligned word of the cells {:#x}..{:#x}",
                 self.start,
                 self.start + self.len
             )));
         }
-        Ok(self.view.word((offset - self.start) as usize).load(std::sync::atomic::Ordering::Relaxed))
+        Ok(self
+            .view
+            .word((offset - self.start) as usize)
+            .load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 

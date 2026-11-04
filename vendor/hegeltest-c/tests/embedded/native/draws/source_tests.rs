@@ -48,10 +48,7 @@ fn a_test_case_draws_through_the_trait_as_through_its_own_methods() {
             Draws::draw_integer_i64(&mut a, -20, 20).unwrap(),
             b.draw_integer_i64(-20, 20).unwrap()
         );
-        assert_eq!(
-            Draws::weighted(&mut a, 0.3, None).unwrap(),
-            b.weighted(0.3, None).unwrap()
-        );
+        assert_eq!(Draws::weighted(&mut a, 0.3, None).unwrap(), b.weighted(0.3, None).unwrap());
         assert_eq!(
             Draws::weighted_against(&mut a, 0.3, 100, None).unwrap(),
             b.weighted_against(0.3, 100, None).unwrap()
@@ -60,10 +57,7 @@ fn a_test_case_draws_through_the_trait_as_through_its_own_methods() {
             Draws::weighted_precise(&mut a, 0.3, None).unwrap(),
             b.weighted_precise(0.3, None).unwrap()
         );
-        assert_eq!(
-            a.many_more(&mut state_a).unwrap(),
-            many_more(&mut b, &mut state_b).unwrap()
-        );
+        assert_eq!(a.many_more(&mut state_a).unwrap(), many_more(&mut b, &mut state_b).unwrap());
     }
     assert_eq!(state_a.count, state_b.count);
     let depth = a.span_depth();
@@ -139,10 +133,7 @@ fn forced_booleans_consume_no_entropy_from_an_rng() {
     assert!(draws.weighted_against(0.5, 128, Some(true)).unwrap());
     assert!(draws.weighted_precise(1.0, None).unwrap());
     assert!(!draws.weighted_precise(0.5, Some(false)).unwrap());
-    assert_eq!(
-        rng.try_next_u64().unwrap(),
-        EngineRng::seeded(5).try_next_u64().unwrap()
-    );
+    assert_eq!(rng.try_next_u64().unwrap(), EngineRng::seeded(5).try_next_u64().unwrap());
 }
 
 #[test]
@@ -191,11 +182,7 @@ fn the_simplest_source_answers_every_choice_at_its_simplest() {
 fn only_the_simplest_source_answers_that_it_is() {
     let mut rng = EngineRng::seeded(0);
     assert!(!RngDraws::new(&mut rng, GenerationParameters::default().integer).simplest());
-    assert!(
-        !NativeTestCase::new_random(EngineRng::seeded(0))
-            .unwrap()
-            .simplest()
-    );
+    assert!(!NativeTestCase::new_random(EngineRng::seeded(0)).unwrap().simplest());
     assert!(SimplestDraws::default().simplest());
 }
 

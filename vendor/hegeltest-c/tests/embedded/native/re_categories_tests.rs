@@ -26,11 +26,7 @@ fn classes_follow_the_general_category() {
             };
             for class in CLASSES {
                 let expected = python_class(c, class, version);
-                assert_eq!(
-                    in_class(c, class, version),
-                    expected,
-                    "U+{cp:04X} {class:?}"
-                );
+                assert_eq!(in_class(c, class, version), expected, "U+{cp:04X} {class:?}");
                 assert_eq!(
                     in_category(c, class, flags),
                     expected,
@@ -52,10 +48,7 @@ fn ranges_are_sorted_with_gaps_between() {
             let ranges = class_ranges(class, version).unwrap();
             assert!(!ranges.is_empty());
             for pair in ranges.windows(2) {
-                assert!(
-                    pair[0].0 <= pair[0].1 && pair[0].1 + 1 < pair[1].0,
-                    "{pair:?}"
-                );
+                assert!(pair[0].0 <= pair[0].1 && pair[0].1 + 1 < pair[1].0, "{pair:?}");
             }
         }
     }
@@ -83,11 +76,7 @@ fn classes_follow_the_version_assignments() {
     let word_16 = class_ranges(ChCode::Word, v16).unwrap();
     let word_15_1 = class_ranges(ChCode::Word, v15_1).unwrap();
     assert!(word_16.iter().any(|&(lo, hi)| (lo..=hi).contains(&0xA7CB)));
-    assert!(
-        !word_15_1
-            .iter()
-            .any(|&(lo, hi)| (lo..=hi).contains(&0xA7CB))
-    );
+    assert!(!word_15_1.iter().any(|&(lo, hi)| (lo..=hi).contains(&0xA7CB)));
 }
 
 #[test]

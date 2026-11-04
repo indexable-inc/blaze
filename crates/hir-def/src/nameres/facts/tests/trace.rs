@@ -9,9 +9,9 @@
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_query::db::FromId;
 use hir_expand::fixture;
+use std::alloc::Global;
 
 use super::{Exempt, compare_db, facts_crate_local_def_map};
 use crate::{
@@ -104,7 +104,11 @@ fn path(db: &Db, module: ModuleId) -> String {
 
 /// The modules whose `query` ran, as paths: its key's module (the anchor of a component for
 /// `scc_state` and `latest`), any round.
-fn ran(db: &TestDB, events: &[(String, blaze_query::db::Id)], query: &str) -> HashSet<String, Global> {
+fn ran(
+    db: &TestDB,
+    events: &[(String, blaze_query::db::Id)],
+    query: &str,
+) -> HashSet<String, Global> {
     events
         .iter()
         .filter(|(name, _)| name == query)
@@ -159,8 +163,12 @@ fn adding_an_item_reruns_its_module_and_its_readers() {
 /// Each module's `ModuleScope` at the crate's final round (its `fact_handle`) with the
 /// module's path. The handle's id stays the module's across revisions; its scope field moves
 /// only when the scope changed.
-fn final_scopes(db: &TestDB, krate: base_db::Crate) -> HashMap<blaze_query::db::Id, String, Global> {
-    let Some(r) = (0..64).find(|&r| queries::round_kind(db, RoundKey::new(db, krate, r)) == RoundKind::Final)
+fn final_scopes(
+    db: &TestDB,
+    krate: base_db::Crate,
+) -> HashMap<blaze_query::db::Id, String, Global> {
+    let Some(r) =
+        (0..64).find(|&r| queries::round_kind(db, RoundKey::new(db, krate, r)) == RoundKind::Final)
     else {
         panic!("no final round in 64");
     };
@@ -168,7 +176,9 @@ fn final_scopes(db: &TestDB, krate: base_db::Crate) -> HashMap<blaze_query::db::
     modules
         .order
         .iter()
-        .map(|&module| (queries::fact_handle(db, FactKey::new(db, module, krate, r)), path(db, module)))
+        .map(|&module| {
+            (queries::fact_handle(db, FactKey::new(db, module, krate, r)), path(db, module))
+        })
         .collect()
 }
 
@@ -242,10 +252,8 @@ fn a_negative_fact_holds_before_the_name_appears() {
     let db = fx.into_db();
     let krate = db.fetch_test_crate();
     let map = facts_crate_local_def_map(&db, krate).def_map(&db);
-    let (b_id, b) = map
-        .modules(&db)
-        .find(|&(id, _)| path(&db, id) == "crate::b")
-        .expect("`b` is in the map");
+    let (b_id, b) =
+        map.modules(&db).find(|&(id, _)| path(&db, id) == "crate::b").expect("`b` is in the map");
     let n = hir_expand::name::Name::new_symbol_root(intern::Symbol::intern("N"));
     assert!(b.scope(&db).get(&n).is_none(), "`a::N` does not exist yet");
     assert!(

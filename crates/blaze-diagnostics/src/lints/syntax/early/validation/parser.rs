@@ -11,7 +11,10 @@
 //! `BreakWithLabelAndLoop`) (MIT or Apache-2.0).
 
 use hir::{HirFileId, InFile};
-use syntax::{NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextRange, TextSize, view::{self as ast, AstNode as _}};
+use syntax::{
+    NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextRange, TextSize,
+    view::{self as ast, AstNode as _},
+};
 
 use super::{edition_at, emitted, span};
 use crate::{
@@ -48,7 +51,13 @@ impl Parsed {
 
     /// Checks `node` of `tree`, the `index`th tree of the walk: one `kind` read for any node
     /// that is neither a parameter nor a `break`.
-    pub(super) fn check(&mut self, cx: &Cx<'_, '_>, tree: &Tree<'_>, index: u32, node: ast::Node<'_>) {
+    pub(super) fn check(
+        &mut self,
+        cx: &Cx<'_, '_>,
+        tree: &Tree<'_>,
+        index: u32,
+        node: ast::Node<'_>,
+    ) {
         let Some(crate_at) = self.crate_at else { return };
         let found = match node.kind() {
             SyntaxKind::PARAM => varargs_without_pattern(cx, tree, node, crate_at),
@@ -77,7 +86,9 @@ fn varargs_without_pattern(
     crate_at: InFile<SyntaxNodePtr>,
 ) -> Option<Emitted> {
     // Most parameters start with their pattern: the first element read decides.
-    let first = param.children_with_tokens().find(|it| !it.kind().is_trivia() && it.kind() != SyntaxKind::ATTR);
+    let first = param
+        .children_with_tokens()
+        .find(|it| !it.kind().is_trivia() && it.kind() != SyntaxKind::ATTR);
     let Some(NodeOrToken::Token(dots)) = first else { return None };
     if dots.kind() != T![...] {
         return None;
@@ -87,7 +98,10 @@ fn varargs_without_pattern(
     let required = match item.parent().map(|it| it.kind()) {
         Some(SyntaxKind::EXTERN_ITEM_LIST) => false,
         Some(SyntaxKind::ASSOC_ITEM_LIST) => {
-            let in_trait = item.parent().and_then(|it| it.parent()).is_some_and(|it| it.kind() == SyntaxKind::TRAIT);
+            let in_trait = item
+                .parent()
+                .and_then(|it| it.parent())
+                .is_some_and(|it| it.kind() == SyntaxKind::TRAIT);
             !in_trait || edition_at(cx, tree.file, dots.text_range().start()).at_least_2018()
         }
         _ => true,
@@ -97,7 +111,8 @@ fn varargs_without_pattern(
     }
     let span = span(cx, tree, dots.text_range());
     // clone: a lint's span, for a lint found
-    let mut diag = Diag::lint("varargs_without_pattern", "missing pattern for `...` argument", span.clone());
+    let mut diag =
+        Diag::lint("varargs_without_pattern", "missing pattern for `...` argument", span.clone());
     diag.suggestion(
         span,
         "name the argument, or use `_` to continue ignoring it",
@@ -116,7 +131,10 @@ fn break_with_label_and_loop(
     crate_at: InFile<SyntaxNodePtr>,
 ) -> Option<Emitted> {
     let expr = ast::BreakExpr::cast(node)?;
-    let (Some(break_), Some(_), Some(value)) = (expr.break_token(), expr.lifetime(), expr.expr()) else { return None };
+    let (Some(break_), Some(_), Some(value)) = (expr.break_token(), expr.lifetime(), expr.expr())
+    else {
+        return None;
+    };
     let unlabeled = |node: ast::Node<'_>| !node.children().any(|it| it.kind() == SyntaxKind::LABEL);
     let confusable = match value {
         ast::Expr::LoopExpr(it) => unlabeled(it.syntax()),

@@ -43,7 +43,13 @@ pub struct Bounds {
 
 impl Default for Bounds {
     fn default() -> Bounds {
-        Bounds { executions: 200_000, steps: 400, crash_states: 4096, shrinks: 400, preemptions: Some(3) }
+        Bounds {
+            executions: 200_000,
+            steps: 400,
+            crash_states: 4096,
+            shrinks: 400,
+            preemptions: Some(3),
+        }
     }
 }
 
@@ -51,7 +57,10 @@ impl Default for Bounds {
 #[derive(Clone, Debug)]
 pub enum Search {
     Exhaustive,
-    Random { seed: u64, runs: u64 },
+    Random {
+        seed: u64,
+        runs: u64,
+    },
     /// One schedule, by its steps' names, as a report gives it.
     Replay(Vec<String>),
 }
@@ -66,7 +75,9 @@ impl Search {
         match knob("STOREMODEL_RANDOM") {
             Some(runs) => Search::Random {
                 runs: runs.parse().unwrap_or_else(|why| panic!("STOREMODEL_RANDOM={runs}: {why}")),
-                seed: knob("STOREMODEL_SEED").map_or(0, |it| it.parse().unwrap_or_else(|why| panic!("STOREMODEL_SEED={it}: {why}"))),
+                seed: knob("STOREMODEL_SEED").map_or(0, |it| {
+                    it.parse().unwrap_or_else(|why| panic!("STOREMODEL_SEED={it}: {why}"))
+                }),
             },
             None => default,
         }
@@ -79,7 +90,8 @@ impl Bounds {
     /// `none` for no bound).
     pub fn from_env(default: &Bounds) -> Bounds {
         let read = |name: &str, default: u64| {
-            knob(name).map_or(default, |it| it.parse().unwrap_or_else(|why| panic!("{name}={it}: {why}")))
+            knob(name)
+                .map_or(default, |it| it.parse().unwrap_or_else(|why| panic!("{name}={it}: {why}")))
         };
         Bounds {
             executions: read("STOREMODEL_EXECUTIONS", default.executions),
@@ -89,14 +101,19 @@ impl Bounds {
             preemptions: match knob("STOREMODEL_PREEMPTIONS").as_deref() {
                 None => default.preemptions,
                 Some("none") => None,
-                Some(it) => Some(it.parse().unwrap_or_else(|why| panic!("STOREMODEL_PREEMPTIONS={it}: {why}"))),
+                Some(it) => Some(
+                    it.parse().unwrap_or_else(|why| panic!("STOREMODEL_PREEMPTIONS={it}: {why}")),
+                ),
             },
         }
     }
 }
 
 /// A test knob, read once at the start of a search.
-#[expect(clippy::disallowed_methods, reason = "a model test's knobs, read once where its search starts")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a model test's knobs, read once where its search starts"
+)]
 fn knob(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
@@ -166,7 +183,10 @@ impl Chooser {
         if self.trail.len() >= self.most {
             return Err(Failure::new(
                 properties::EVERY_WAIT_ENDS,
-                format!("the run took {} steps without ending (STOREMODEL_STEPS raises the bound)", self.most),
+                format!(
+                    "the run took {} steps without ending (STOREMODEL_STEPS raises the bound)",
+                    self.most
+                ),
             ));
         }
         let at = self.trail.len();
@@ -180,13 +200,15 @@ impl Chooser {
                 ),
                 None => 0,
             },
-            Follow::Labels(want) => match want.front().and_then(|it| options.iter().position(|o| o == it)) {
-                Some(index) => {
-                    want.pop_front();
-                    index
+            Follow::Labels(want) => {
+                match want.front().and_then(|it| options.iter().position(|o| o == it)) {
+                    Some(index) => {
+                        want.pop_front();
+                        index
+                    }
+                    None => 0,
                 }
-                None => 0,
-            },
+            }
             Follow::Random(rng) => rng.index(options.len()),
         };
         self.trail.push(Step { index, count: options.len(), label: options[index].clone() });
@@ -214,7 +236,11 @@ pub struct Report {
 
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "storemodel `{}`: \"{}\" fails after {} executions", self.scenario, self.property, self.executions)?;
+        writeln!(
+            f,
+            "storemodel `{}`: \"{}\" fails after {} executions",
+            self.scenario, self.property, self.executions
+        )?;
         writeln!(f, "  {}", self.what)?;
         writeln!(f, "schedule ({} steps, shrunk from {}):", self.steps.len(), self.found_in)?;
         for (n, step) in self.steps.iter().enumerate() {
@@ -236,7 +262,12 @@ pub struct Explored {
 
 type Scenario<'a> = &'a dyn Fn(&mut Chooser, &mut Memo) -> Result<(), Failure>;
 
-fn once(run: Scenario<'_>, follow: Follow, most: usize, memo: &mut Memo) -> (Result<(), Failure>, Vec<Step>) {
+fn once(
+    run: Scenario<'_>,
+    follow: Follow,
+    most: usize,
+    memo: &mut Memo,
+) -> (Result<(), Failure>, Vec<Step>) {
     let mut chooser = Chooser { follow, trail: Vec::new(), most };
     let result = match catch_unwind(AssertUnwindSafe(|| run(&mut chooser, memo))) {
         Ok(result) => result,
@@ -255,13 +286,21 @@ pub fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// Runs `run` under `search`, within `bounds`.
-pub fn explore(name: &str, search: &Search, bounds: &Bounds, run: Scenario<'_>) -> Result<Explored, Box<Report>> {
+pub fn explore(
+    name: &str,
+    search: &Search,
+    bounds: &Bounds,
+    run: Scenario<'_>,
+) -> Result<Explored, Box<Report>> {
     let mut memo = Memo::default();
     let mut executions = 0u64;
-    let failed = |failure: Failure, trail: Vec<Step>, executions: u64| shrink(name, bounds, run, failure, trail, executions);
+    let failed = |failure: Failure, trail: Vec<Step>, executions: u64| {
+        shrink(name, bounds, run, failure, trail, executions)
+    };
     match search {
         Search::Replay(steps) => {
-            let (result, trail) = once(run, Follow::Labels(steps.iter().cloned().collect()), bounds.steps, &mut memo);
+            let (result, trail) =
+                once(run, Follow::Labels(steps.iter().cloned().collect()), bounds.steps, &mut memo);
             match result {
                 Ok(()) => Ok(Explored { executions: 1, crash_checks: memo.checks }),
                 Err(failure) => Err(Box::new(failed(failure, trail, 1))),
@@ -296,7 +335,8 @@ pub fn explore(name: &str, search: &Search, bounds: &Bounds, run: Scenario<'_>) 
                         executions: bounds.executions,
                     }));
                 }
-                let (result, mut trail) = once(run, Follow::Indices(prefix), bounds.steps, &mut memo);
+                let (result, mut trail) =
+                    once(run, Follow::Indices(prefix), bounds.steps, &mut memo);
                 if let Err(failure) = result {
                     return Err(Box::new(failed(failure, trail, executions)));
                 }
@@ -313,7 +353,14 @@ pub fn explore(name: &str, search: &Search, bounds: &Bounds, run: Scenario<'_>) 
     }
 }
 
-fn shrink(name: &str, bounds: &Bounds, run: Scenario<'_>, failure: Failure, trail: Vec<Step>, executions: u64) -> Report {
+fn shrink(
+    name: &str,
+    bounds: &Bounds,
+    run: Scenario<'_>,
+    failure: Failure,
+    trail: Vec<Step>,
+    executions: u64,
+) -> Report {
     let found_in = trail.len();
     let mut best: Vec<String> = trail.into_iter().map(|it| it.label).collect();
     let mut failure = failure;
@@ -325,7 +372,8 @@ fn shrink(name: &str, bounds: &Bounds, run: Scenario<'_>, failure: Failure, trai
         let mut candidate = best.clone();
         candidate.remove(at);
         // A fresh memo: a check skipped as done would hide the failure.
-        let (result, trail) = once(run, Follow::Labels(candidate.into()), bounds.steps, &mut Memo::default());
+        let (result, trail) =
+            once(run, Follow::Labels(candidate.into()), bounds.steps, &mut Memo::default());
         if let Err(again) = result
             && again.property == failure.property
             && trail.len() < best.len()

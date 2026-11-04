@@ -14,7 +14,10 @@ fn fmt_range_words() {
     assert_eq!(valid::fmt_range(1, u8::MAX.into(), u8::MAX.into()), "greater or equal to 1");
     assert_eq!(valid::fmt_range(2, 2, u8::MAX.into()), "equal to 2");
     assert_eq!(valid::fmt_range(1, 10, u8::MAX.into()), "in the range 1..=10");
-    assert_eq!(valid::fmt_range(10, 1, u8::MAX.into()), "less or equal to 1, or greater or equal to 10");
+    assert_eq!(
+        valid::fmt_range(10, 1, u8::MAX.into()),
+        "less or equal to 1, or greater or equal to 10"
+    );
 }
 
 #[test]
@@ -26,15 +29,23 @@ fn hex_is_two_digits_a_byte() {
 
 #[test]
 fn merge_joins_touching_and_overlapping() {
-    let mut cells = vec![Span::new(8, 4), Span::new(0, 4), Span::new(4, 2), Span::new(10, 6), Span::new(20, 0)];
+    let mut cells =
+        vec![Span::new(8, 4), Span::new(0, 4), Span::new(4, 2), Span::new(10, 6), Span::new(20, 0)];
     valid::merge(&mut cells);
     assert_eq!(cells, vec![Span::new(0, 6), Span::new(8, 8)]);
 }
 
 #[test]
 fn value_error_display() {
-    let whole = valid::ValueError { ty: "bool".into(), path: String::new(), msg: "encountered 0x02, but expected a boolean".into() };
-    assert_eq!(whole.to_string(), "constructing invalid value of type bool: encountered 0x02, but expected a boolean");
+    let whole = valid::ValueError {
+        ty: "bool".into(),
+        path: String::new(),
+        msg: "encountered 0x02, but expected a boolean".into(),
+    };
+    assert_eq!(
+        whole.to_string(),
+        "constructing invalid value of type bool: encountered 0x02, but expected a boolean"
+    );
     let field = valid::ValueError {
         ty: "Option<bool>".into(),
         path: ".<enum-variant(Some)>.0".into(),
@@ -66,7 +77,10 @@ fn offset_from_follows_rustc() {
     assert_eq!(from((0x1008, x), (0x1008, x), true), Ok(()));
     assert_eq!(from((0x1000, x), (0x1010, x), true), Err(Negative { a: 0x1000, b: 0x1010 }));
     assert_eq!(from((0x1020, x), (0x1000, x), false), Err(OutOfBounds { unsigned: false }));
-    assert_eq!(from((0x2000, y), (0x1000, x), false), Err(DifferentAllocations { unsigned: false }));
+    assert_eq!(
+        from((0x2000, y), (0x1000, x), false),
+        Err(DifferentAllocations { unsigned: false })
+    );
     assert_eq!(from((0x2000, y), (0x1010, x), true), Err(DifferentAllocations { unsigned: true }));
     assert_eq!(from((u64::MAX, None), (0, None), false), Err(TooFarAhead { unsigned: false }));
     assert_eq!(from((0, None), (u64::MAX, None), false), Err(TooFarBefore));
@@ -85,8 +99,14 @@ fn offset_from_words() {
         words(OutOfBounds { unsigned: true }),
         "`ptr_offset_from_unsigned` called on two different pointers where the memory range between them is not in-bounds of an allocation"
     );
-    assert_eq!(words(TooFarAhead { unsigned: false }), "`ptr_offset_from` called when first pointer is too far ahead of second");
-    assert_eq!(words(TooFarBefore), "`ptr_offset_from` called when first pointer is too far before second");
+    assert_eq!(
+        words(TooFarAhead { unsigned: false }),
+        "`ptr_offset_from` called when first pointer is too far ahead of second"
+    );
+    assert_eq!(
+        words(TooFarBefore),
+        "`ptr_offset_from` called when first pointer is too far before second"
+    );
     assert_eq!(
         words(Negative { a: 4096, b: 4112 }),
         "`ptr_offset_from_unsigned` called when first pointer has smaller address than second: 4096 < 4112"

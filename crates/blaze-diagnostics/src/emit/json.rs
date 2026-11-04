@@ -97,9 +97,8 @@ pub(super) fn line<'a>(diag: &'a Diag, placed: &Placed<'a>, rendered: String) ->
         children,
         rendered: Some(rendered),
     };
-    serde_json::to_string(&diagnostic).unwrap_or_else(|error| {
-        panic!("blaze-diagnostics: `{}` as JSON: {error}", diag.message)
-    })
+    serde_json::to_string(&diagnostic)
+        .unwrap_or_else(|error| panic!("blaze-diagnostics: `{}` as JSON: {error}", diag.message))
 }
 
 fn child<'a>(child: &'a Child, placed: &Placed<'a>) -> Diagnostic<'a> {

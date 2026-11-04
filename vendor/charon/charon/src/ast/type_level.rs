@@ -20,8 +20,19 @@ pub use types::*;
 pub use vars::*;
 
 /// A set of generic arguments.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct GenericArgs {
     pub regions: IndexVec<RegionId, Region>,
     pub types: IndexVec<TypeVarId, Ty>,
@@ -30,8 +41,20 @@ pub struct GenericArgs {
 }
 
 /// Region arguments used to instantiate a [`RegionBinder`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct RegionArgs {
     pub regions: IndexVec<RegionId, Region>,
 }
@@ -44,8 +67,20 @@ pub type PolyTraitDeclRef = RegionBinder<TraitDeclRef>;
 ///
 /// This can also represent `T: 'r`, by using `Region::Lub` for the left region. The right region
 /// may not be `Region::Lub`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct OutlivesPred(pub Region, pub Region);
 
 pub type PolyOutlivesPred = RegionBinder<OutlivesPred>;
@@ -57,8 +92,20 @@ pub type PolyOutlivesPred = RegionBinder<OutlivesPred>;
 /// T : Foo<S = String>
 ///         ^^^^^^^^^^
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct TraitTypeConstraint {
     pub trait_ref: TraitRef,
     pub type_id: AssocTypeId,
@@ -68,8 +115,20 @@ pub struct TraitTypeConstraint {
 pub type BoxedArgs = Box<GenericArgs>;
 
 /// Generic parameters for a declaration, including predicates.
-#[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct GenericParams {
     #[serde_state(stateless)]
     pub regions: IndexVec<RegionId, RegionParam>,
@@ -84,8 +143,20 @@ pub struct GenericParams {
     pub trait_type_constraints: IndexVec<TraitTypeConstraintId, RegionBinder<TraitTypeConstraint>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("BK"))]
 pub enum BinderKind {
     /// The parameters of a generic associated type.
@@ -104,8 +175,20 @@ pub enum BinderKind {
 /// A value of type `T` bound by generic parameters. Used in any context where we're adding generic
 /// parameters that aren't on the top-level item, e.g. `for<'a>` clauses (uses `RegionBinder` for
 /// now), trait methods, GATs (TODO).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct Binder<T> {
     #[cfg_attr(feature = "charon_on_charon", charon::rename("binder_params"))]
     pub params: GenericParams,
@@ -120,8 +203,20 @@ pub struct Binder<T> {
 
 /// A value of type `T` bound by regions. We should use `binder` instead but this causes name clash
 /// issues in the derived ocaml visitors.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[serde_state(state_implements = DedupSerializerState)] // Avoid corecursive impls due to perfect derive
 pub struct RegionBinder<T> {
     #[cfg_attr(feature = "charon_on_charon", charon::rename("binder_regions"))]
@@ -137,12 +232,7 @@ pub struct RegionBinder<T> {
 
 impl GenericArgs {
     pub fn len(&self) -> usize {
-        let GenericArgs {
-            regions,
-            types,
-            const_generics,
-            trait_refs,
-        } = self;
+        let GenericArgs { regions, types, const_generics, trait_refs } = self;
         regions.len() + types.len() + const_generics.len() + trait_refs.len()
     }
 
@@ -173,24 +263,13 @@ impl GenericArgs {
         const_generics: IndexVec<ConstGenericVarId, ConstantExpr>,
         trait_refs: IndexVec<TraitClauseId, PolyTraitRef>,
     ) -> Self {
-        Self {
-            regions,
-            types,
-            const_generics,
-            trait_refs,
-        }
+        Self { regions, types, const_generics, trait_refs }
     }
     pub fn new_types(types: IndexVec<TypeVarId, Ty>) -> Self {
-        Self {
-            types,
-            ..Self::empty()
-        }
+        Self { types, ..Self::empty() }
     }
     pub fn new_lifetimes(regions: IndexVec<RegionId, Region>) -> Self {
-        Self {
-            regions,
-            ..Self::empty()
-        }
+        Self { regions, ..Self::empty() }
     }
 
     /// Check whether this matches the given `GenericParams`.
@@ -217,12 +296,7 @@ impl GenericArgs {
     /// Concatenate this set of arguments with another one. Use with care, you must manage the
     /// order of arguments correctly.
     pub fn concat(mut self, other: &Self) -> Self {
-        let Self {
-            regions,
-            types,
-            const_generics,
-            trait_refs,
-        } = other;
+        let Self { regions, types, const_generics, trait_refs } = other;
         self.regions.clone_extend_from_other(regions);
         self.types.clone_extend_from_other(types);
         self.const_generics.clone_extend_from_other(const_generics);
@@ -233,9 +307,7 @@ impl GenericArgs {
 
 impl RegionArgs {
     pub fn empty() -> Self {
-        Self {
-            regions: Default::default(),
-        }
+        Self { regions: Default::default() }
     }
 
     pub fn erased(len: usize) -> Self {
@@ -278,12 +350,7 @@ impl GenericParams {
     /// Run some sanity checks.
     pub fn check_consistency(&self) {
         // Sanity check: check the clause ids are consistent.
-        assert!(
-            self.trait_clauses
-                .iter()
-                .enumerate()
-                .all(|(i, c)| c.clause_id.index() == i)
-        );
+        assert!(self.trait_clauses.iter().enumerate().all(|(i, c)| c.clause_id.index() == i));
 
         // Sanity check: region names are pairwise distinct (this caused trouble when generating
         // names for the backward functions in Aeneas): at some point, Rustc introduced names equal
@@ -292,11 +359,7 @@ impl GenericParams {
         let mut s = HashSet::new();
         for r in &self.regions {
             if let Some(name) = &r.name {
-                assert!(
-                    !s.contains(name),
-                    "Name \"{}\" reused for two different lifetimes",
-                    name
-                );
+                assert!(!s.contains(name), "Name \"{}\" reused for two different lifetimes", name);
                 s.insert(name);
             }
         }
@@ -341,9 +404,7 @@ impl GenericParams {
                     c.ty.clone(),
                 )
             }),
-            trait_refs: self
-                .trait_clauses
-                .map_ref(|clause| clause.identity_tref_at_depth(depth)),
+            trait_refs: self.trait_clauses.map_ref(|clause| clause.identity_tref_at_depth(depth)),
         }
     }
 
@@ -360,10 +421,9 @@ impl GenericParams {
             outlives,
             trait_type_constraints,
         } = other;
-        self.trait_clauses
-            .extend(trait_clauses.into_iter().update(|clause| {
-                clause.clause_id += num_clauses;
-            }));
+        self.trait_clauses.extend(trait_clauses.into_iter().update(|clause| {
+            clause.clause_id += num_clauses;
+        }));
         self.outlives.extend(outlives);
         self.trait_type_constraints.extend(trait_type_constraints);
     }
@@ -403,18 +463,10 @@ impl<T> Binder<T> {
     where
         T: TyVisitable,
     {
-        Binder {
-            params: Default::default(),
-            skip_binder: x.move_under_binder(),
-            kind,
-        }
+        Binder { params: Default::default(), skip_binder: x.move_under_binder(), kind }
     }
     pub fn new(kind: BinderKind, params: GenericParams, skip_binder: T) -> Self {
-        Self {
-            params,
-            skip_binder,
-            kind,
-        }
+        Self { params, skip_binder, kind }
     }
 
     /// Whether this binder binds any variables.
@@ -428,17 +480,11 @@ impl<T> Binder<T> {
     where
         T: TyVisitable + Clone,
     {
-        self.params
-            .is_empty()
-            .then(|| self.skip_binder.clone().move_from_under_binder().unwrap())
+        self.params.is_empty().then(|| self.skip_binder.clone().move_from_under_binder().unwrap())
     }
 
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Binder<U> {
-        Binder {
-            params: self.params,
-            skip_binder: f(self.skip_binder),
-            kind: self.kind,
-        }
+        Binder { params: self.params, skip_binder: f(self.skip_binder), kind: self.kind }
     }
 
     pub fn map_ref<U>(&self, f: impl FnOnce(&T) -> U) -> Binder<U> {
@@ -464,10 +510,7 @@ impl<T> Binder<T> {
     where
         T: TyVisitable,
     {
-        (
-            self.params.substitute(args),
-            self.skip_binder.substitute(args),
-        )
+        (self.params.substitute(args), self.skip_binder.substitute(args))
     }
 }
 
@@ -547,14 +590,8 @@ impl<T: AstVisitable> Binder<Binder<T>> {
             shift_by: &outer_params,
             binder_depth: Default::default(),
         });
-        inner_params
-            .regions
-            .iter_mut()
-            .for_each(|v| v.index += outer_params.regions.len());
-        inner_params
-            .types
-            .iter_mut()
-            .for_each(|v| v.index += outer_params.types.len());
+        inner_params.regions.iter_mut().for_each(|v| v.index += outer_params.regions.len());
+        inner_params.types.iter_mut().for_each(|v| v.index += outer_params.types.len());
         inner_params
             .const_generics
             .iter_mut()
@@ -574,22 +611,12 @@ impl<T: AstVisitable> Binder<Binder<T>> {
         } = &inner_params;
         outer_params.regions.clone_extend_from_other(regions);
         outer_params.types.clone_extend_from_other(types);
-        outer_params
-            .const_generics
-            .clone_extend_from_other(const_generics);
-        outer_params
-            .trait_clauses
-            .clone_extend_from_other(trait_clauses);
+        outer_params.const_generics.clone_extend_from_other(const_generics);
+        outer_params.trait_clauses.clone_extend_from_other(trait_clauses);
         outer_params.outlives.extend_from_slice(outlives);
-        outer_params
-            .trait_type_constraints
-            .clone_extend_from_other(trait_type_constraints);
+        outer_params.trait_type_constraints.clone_extend_from_other(trait_type_constraints);
 
-        Binder {
-            params: outer_params,
-            skip_binder: bound_value,
-            kind: BinderKind::Other,
-        }
+        Binder { params: outer_params, skip_binder: bound_value, kind: BinderKind::Other }
     }
 }
 

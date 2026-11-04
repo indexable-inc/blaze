@@ -8,7 +8,9 @@ mod tagged;
 use std::{borrow::Cow, fmt, marker::PhantomData};
 
 pub use content::{Content, ContentRefDeserializer};
-pub use flat::{Collect, FlatMapDeserializer, FlatMapSerializeMap, FlatMapSerializeStruct, FlatMapSerializer};
+pub use flat::{
+    Collect, FlatMapDeserializer, FlatMapSerializeMap, FlatMapSerializeStruct, FlatMapSerializer,
+};
 use serde::de::{self, DeserializeSeed, Deserializer, Unexpected, Visitor};
 pub use tagged::{no_variant, serialize_tagged_newtype, tagged, tagged_unit, untagged_unit};
 
@@ -46,9 +48,10 @@ impl<'de> Visitor<'de> for FieldSeed {
     fn visit_u64<E: de::Error>(self, value: u64) -> Result<Option<usize>, E> {
         match index_in(value, self.names) {
             Some(index) => Ok(Some(index)),
-            None if self.deny => {
-                Err(E::invalid_value(Unexpected::Unsigned(value), &format!("field index 0 <= i < {}", self.names.len()).as_str()))
-            }
+            None if self.deny => Err(E::invalid_value(
+                Unexpected::Unsigned(value),
+                &format!("field index 0 <= i < {}", self.names.len()).as_str(),
+            )),
             None => Ok(None),
         }
     }
@@ -187,7 +190,9 @@ impl<'de> Visitor<'de> for VariantSeed {
 
 /// The value of a struct field missing from the input: `None` for an `Option`, as serde's
 /// derive reads it, and the error naming `field` for anything else.
-pub fn missing_field<'de, V: de::Deserialize<'de>, E: de::Error>(field: &'static str) -> Result<V, E> {
+pub fn missing_field<'de, V: de::Deserialize<'de>, E: de::Error>(
+    field: &'static str,
+) -> Result<V, E> {
     V::deserialize(Missing { field, error: PhantomData })
 }
 
@@ -214,7 +219,9 @@ impl<'de, E: de::Error> Deserializer<'de> for Missing<E> {
 }
 
 /// A `Cow<str>` field with `#[serde(borrow)]`: borrowed when the input lends the string.
-pub fn borrow_cow_str<'de: 'a, 'a, D: Deserializer<'de>, R: From<Cow<'a, str>>>(deserializer: D) -> Result<R, D::Error> {
+pub fn borrow_cow_str<'de: 'a, 'a, D: Deserializer<'de>, R: From<Cow<'a, str>>>(
+    deserializer: D,
+) -> Result<R, D::Error> {
     deserializer.deserialize_str(CowStr(PhantomData)).map(From::from)
 }
 

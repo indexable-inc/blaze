@@ -4,9 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
+use blaze_manifest::files::Disk;
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::profiles::Profiles;
-use blaze_manifest::files::Disk;
 use blaze_manifest::{Config, Context, Workspace};
 
 /// A fresh directory holding `files`, each a path under it and its text.
@@ -129,7 +129,8 @@ fn a_path_base_joins_the_workspace_root() {
     );
     let ctx = context(&root);
     let ws = workspace(&ctx).unwrap();
-    let json = serde_json::to_value(blaze_manifest::metadata::export_no_deps(&ws).unwrap()).unwrap();
+    let json =
+        serde_json::to_value(blaze_manifest::metadata::export_no_deps(&ws).unwrap()).unwrap();
     let a = json["packages"].as_array().unwrap().iter().find(|p| p["name"] == "a").unwrap();
     let dep = &a["dependencies"][0];
     assert_eq!(dep["path"].as_str().unwrap(), root.join("crates").join("b").display().to_string());

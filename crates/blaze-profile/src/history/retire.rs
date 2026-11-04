@@ -103,7 +103,9 @@ impl Retired {
     /// The text of [`RETIRED`].
     pub fn encode(&self) -> String {
         // alloc: the file's text, once a retirement or reap
-        let mut out = String::with_capacity(64 + self.files.iter().map(|(it, _)| it.len() + 24).sum::<usize>());
+        let mut out = String::with_capacity(
+            64 + self.files.iter().map(|(it, _)| it.len() + 24).sum::<usize>(),
+        );
         out.push_str(HEADER);
         out.push('\n');
         out.push_str("generation ");
@@ -199,7 +201,10 @@ impl<'a> PinFile<'a> {
 /// An id is `<pid>-<n>`, digits and one dash.
 fn valid(id: &str) -> bool {
     id.split_once('-').is_some_and(|(pid, n)| {
-        !pid.is_empty() && !n.is_empty() && pid.bytes().all(|it| it.is_ascii_digit()) && n.bytes().all(|it| it.is_ascii_digit())
+        !pid.is_empty()
+            && !n.is_empty()
+            && pid.bytes().all(|it| it.is_ascii_digit())
+            && n.bytes().all(|it| it.is_ascii_digit())
     })
 }
 
@@ -208,7 +213,9 @@ fn valid(id: &str) -> bool {
 /// the order of `live`. A pin whose generation was not seen holds every file.
 pub fn pinned(live: &[&str], said: &[(&str, u64)]) -> Vec<Pinned> {
     // alloc: once a flush that retired files
-    live.iter().map(|id| said.iter().filter(|(it, _)| it == id).map(|&(_, generation)| generation).max()).collect()
+    live.iter()
+        .map(|id| said.iter().filter(|(it, _)| it == id).map(|&(_, generation)| generation).max())
+        .collect()
 }
 
 /// The files of each table a reader reads from one directory: [`Snapshot::resolve`] of its
@@ -240,12 +247,16 @@ impl Snapshot {
             taken.push((table, name.as_str()));
         }
         // alloc: once a reader pins a directory
-        let named: Vec<(usize, Name)> =
-            taken.iter().enumerate().filter_map(|(at, (_, name))| Some((at, Name::parse(name)?))).collect();
+        let named: Vec<(usize, Name)> = taken
+            .iter()
+            .enumerate()
+            .filter_map(|(at, (_, name))| Some((at, Name::parse(name)?)))
+            .collect();
         // alloc: once a reader pins a directory
         let names: Vec<Name> = named.iter().map(|(_, it)| *it).collect();
         // alloc: once a reader pins a directory
-        let mut gone: Vec<usize> = compact::superseded(&names).into_iter().map(|it| named[it].0).collect();
+        let mut gone: Vec<usize> =
+            compact::superseded(&names).into_iter().map(|it| named[it].0).collect();
         gone.sort_unstable();
         for (at, (table, name)) in taken.iter().enumerate() {
             if gone.binary_search(&at).is_err() {
@@ -275,7 +286,7 @@ impl Snapshot {
 /// The table of [`schema::TABLES`] a file `<anything>.<table>.parquet` is of.
 fn table_of(name: &str) -> Option<usize> {
     let stem = name.strip_suffix(".parquet")?;
-    schema::TABLES
-        .iter()
-        .position(|table| stem.strip_suffix(table.name).is_some_and(|rest| rest.ends_with('.') && rest.len() > 1))
+    schema::TABLES.iter().position(|table| {
+        stem.strip_suffix(table.name).is_some_and(|rest| rest.ends_with('.') && rest.len() > 1)
+    })
 }

@@ -101,10 +101,7 @@ fn deletes_wide_elements_between_repeated_grams() {
 
     let mut expected = vec![0i128; width];
     expected[width - 1] = 7;
-    assert_eq!(
-        parse_chunks(&shrinker.current_nodes, width),
-        Some(vec![expected])
-    );
+    assert_eq!(parse_chunks(&shrinker.current_nodes, width), Some(vec![expected]));
 }
 
 /// A run of one repeated value only has occurrences at distance 1, which
@@ -193,16 +190,7 @@ fn fingerprints_cover_all_value_kinds() {
             false,
         )
     };
-    let bytes = || {
-        ChoiceNode::bytes(
-            BytesChoice {
-                min_size: 0,
-                max_size: 8,
-            },
-            vec![1, 2],
-            false,
-        )
-    };
+    let bytes = || ChoiceNode::bytes(BytesChoice { min_size: 0, max_size: 8 }, vec![1, 2], false);
     let string = || {
         ChoiceNode::string(
             StringChoice {
@@ -215,15 +203,7 @@ fn fingerprints_cover_all_value_kinds() {
             false,
         )
     };
-    let initial = vec![
-        float(),
-        bytes(),
-        string(),
-        float(),
-        bytes(),
-        string(),
-        int_node(42),
-    ];
+    let initial = vec![float(), bytes(), string(), float(), bytes(), string(), int_node(42)];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
             ShrinkRun::Full(nodes) => {

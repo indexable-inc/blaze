@@ -314,7 +314,8 @@ impl<'db> MirLowerCtx<'_, '_, 'db> {
             // rustc's `UnwrapUnsafeBinder` place: a temporary would be borrowed or written in
             // place of the binder's value.
             Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Unwrap, .. } => {
-                let what = "`unwrap_binder!` as a place: MIR has no `UnwrapUnsafeBinder` projection";
+                let what =
+                    "`unwrap_binder!` as a place: MIR has no `UnwrapUnsafeBinder` projection";
                 Err(MirLowerError::NotSupported(what.to_owned())) // alloc: error path
             }
             _ => try_rvalue(self),

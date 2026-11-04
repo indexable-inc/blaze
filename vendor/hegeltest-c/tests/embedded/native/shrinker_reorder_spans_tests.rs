@@ -11,25 +11,14 @@ use alloc::vec::Vec;
 
 fn int_node(value: i128) -> ChoiceNode {
     ChoiceNode::integer(
-        IntegerChoice::new(
-            BigInt::from(i128::MIN),
-            BigInt::from(i128::MAX),
-            BigInt::from(0),
-        ),
+        IntegerChoice::new(BigInt::from(i128::MIN), BigInt::from(i128::MAX), BigInt::from(0)),
         BigInt::from(value),
         false,
     )
 }
 
 fn sib(start: usize, end: usize, label: u64, parent: Option<usize>) -> Span {
-    Span {
-        start,
-        end,
-        label,
-        depth: 0,
-        parent,
-        discarded: false,
-    }
+    Span { start, end, label, depth: 0, parent, discarded: false }
 }
 
 #[test]
@@ -111,14 +100,8 @@ fn reorder_spans_skips_singleton_groups() {
 
 #[test]
 fn reorder_spans_handles_multi_node_siblings() {
-    let initial = vec![
-        int_node(7),
-        int_node(2),
-        int_node(3),
-        int_node(5),
-        int_node(1),
-        int_node(9),
-    ];
+    let initial =
+        vec![int_node(7), int_node(2), int_node(3), int_node(5), int_node(1), int_node(9)];
     let mut spans = Spans::new();
     spans.push(sib(0, 2, 1, None));
     spans.push(sib(2, 4, 1, None));

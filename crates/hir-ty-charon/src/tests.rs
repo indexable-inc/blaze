@@ -117,7 +117,6 @@ fn json_is_deterministic() {
     same_json(&llbc_json(&a), &llbc_json(&b));
 }
 
-
 /// `a` and `b` are the same bytes; when not, the failure shows where they first part.
 fn same_json(a: &[u8], b: &[u8]) {
     if a == b {

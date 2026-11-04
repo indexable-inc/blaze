@@ -2,8 +2,8 @@ use base_db::EditionedFileId;
 use blaze_format::Persist;
 use expect_test::{Expect, expect};
 use hir_expand::HirFileId;
-use span::Edition;
 use hir_expand::fixture;
+use span::Edition;
 
 use crate::{
     item_tree::{ItemTree, ModItemKind, RawVisibility},
@@ -620,7 +620,9 @@ fn read_all(tree: &ItemTree, items: &[crate::item_tree::ModItemId]) -> usize {
                     read += read_all(tree, items);
                 }
             }
-            ModItemKind::ExternBlock(_, block) => read += read_all(tree, tree.items(block.children)),
+            ModItemKind::ExternBlock(_, block) => {
+                read += read_all(tree, tree.items(block.children))
+            }
             ModItemKind::Struct(_, s) => {
                 black_box((tree.get_name(s.name), &tree[s.visibility], tree.value_ns_ctor(s)));
             }

@@ -663,9 +663,9 @@ impl<'db> ProofTreeVisitor<'db> for BestObligation<'db> {
         }
 
         let candidate_impl = match candidate.kind() {
-            inspect::ProbeKind::TraitCandidate { source: CandidateSource::Impl(impl_id), .. } => {
-                Some(impl_id)
-            }
+            inspect::ProbeKind::TraitCandidate {
+                source: CandidateSource::Impl(impl_id), ..
+            } => Some(impl_id),
             _ => None,
         };
         let mut impl_where_bound_count = 0;

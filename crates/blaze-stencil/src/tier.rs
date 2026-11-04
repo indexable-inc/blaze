@@ -251,7 +251,8 @@ impl Tiering {
     pub fn remembered(&mut self, function: u32, tier: Tier) -> Option<Promote> {
         let highest = self.policy.highest;
         let state = &mut self.state[function as usize];
-        let allowed = tier > state.tier && tier <= highest && state.flags & (IN_FLIGHT | tier.bit()) == 0;
+        let allowed =
+            tier > state.tier && tier <= highest && state.flags & (IN_FLIGHT | tier.bit()) == 0;
         allowed.then(|| {
             state.flags |= IN_FLIGHT;
             Promote { function, to: tier }
@@ -317,7 +318,9 @@ impl Cells for [AtomicU64] {
         let word = usize::try_from(offset / 8).ok().and_then(|at| self.get(at));
         word.map(|it| it.load(Ordering::Relaxed))
             // alloc: the error, as above.
-            .ok_or_else(|| format!("a counter load at {offset:#x}, past the {} bytes of cells", self.len() * 8))
+            .ok_or_else(|| {
+                format!("a counter load at {offset:#x}, past the {} bytes of cells", self.len() * 8)
+            })
     }
 }
 
@@ -392,13 +395,21 @@ impl Counters {
     }
 
     /// `function`'s counts, if it has cells.
-    pub fn read<M: Cells + ?Sized>(&self, function: u32, memory: &M) -> Result<Option<Counts>, String> {
+    pub fn read<M: Cells + ?Sized>(
+        &self,
+        function: u32,
+        memory: &M,
+    ) -> Result<Option<Counts>, String> {
         let Some(offset) = self.cells(function) else { return Ok(None) };
         read(memory, offset).map(Some)
     }
 
     /// Every function with cells and its counts, appended to `out`.
-    pub fn snapshot<M: Cells + ?Sized>(&self, memory: &M, out: &mut Vec<(u32, Counts)>) -> Result<(), String> {
+    pub fn snapshot<M: Cells + ?Sized>(
+        &self,
+        memory: &M,
+        out: &mut Vec<(u32, Counts)>,
+    ) -> Result<(), String> {
         out.reserve(self.bound.len());
         for &function in &self.bound {
             let counts = read(memory, self.cells[function as usize])
@@ -431,7 +442,7 @@ impl Driver {
         Driver {
             tiering: Tiering::new(functions, policy),
             counters: Counters::new(functions),
-            read: Vec::new(),     // alloc: reused by every round, grown by the first.
+            read: Vec::new(), // alloc: reused by every round, grown by the first.
             promotes: Vec::new(), // alloc: as `read`.
         }
     }
@@ -472,8 +483,12 @@ impl Driver {
         if to.counts() != cells.is_some() {
             return Err(match cells {
                 // alloc: the error, which stops the run's tiering.
-                Some(cells) => format!("function {function} at {to:?}, which counts nothing, has cells at {cells:#x}"),
-                None => format!("function {function} at {to:?}, which counts, has no counter cells"), // alloc: as above.
+                Some(cells) => format!(
+                    "function {function} at {to:?}, which counts nothing, has cells at {cells:#x}"
+                ),
+                None => {
+                    format!("function {function} at {to:?}, which counts, has no counter cells")
+                } // alloc: as above.
             });
         }
         self.tiering.landed(function, to);

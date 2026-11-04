@@ -29,7 +29,8 @@ pub use program::main;
 /// tag's share of them (`blaze_mem::tag::Counters::heap`) is named in the memory line.
 #[cfg(all(not(test), feature = "native"))]
 #[global_allocator]
-static ALLOC: blaze_graph::arena::Counting<heaps::Heaps> = blaze_graph::arena::Counting(heaps::Heaps);
+static ALLOC: blaze_graph::arena::Counting<heaps::Heaps> =
+    blaze_graph::arena::Counting(heaps::Heaps);
 
 /// Without `native` (the seed profile, which has no C): std's allocator, counted the same way.
 #[cfg(all(not(test), not(feature = "native")))]

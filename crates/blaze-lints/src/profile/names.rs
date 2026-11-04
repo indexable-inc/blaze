@@ -37,12 +37,14 @@ pub(crate) fn of_profile_name(name: &[u8]) -> Option<String> {
 /// without writing its demangled path: what sorting a profile's records by who made them
 /// asks of each, so a profile of many functions is not demangled in full only to be counted.
 pub(crate) fn is_mangled(name: &[u8]) -> bool {
-    std::str::from_utf8(name).is_ok_and(|name| rustc_demangle::try_demangle(unprefixed(name)).is_ok())
+    std::str::from_utf8(name)
+        .is_ok_and(|name| rustc_demangle::try_demangle(unprefixed(name)).is_ok())
 }
 
 /// `name` without the source file LLVM puts before a function of internal linkage.
 fn unprefixed(name: &str) -> &str {
-    let mangled = |it: &str| ["_R", "__R", "_ZN", "__ZN"].iter().any(|prefix| it.starts_with(prefix));
+    let mangled =
+        |it: &str| ["_R", "__R", "_ZN", "__ZN"].iter().any(|prefix| it.starts_with(prefix));
     if mangled(name) {
         return name;
     }
@@ -163,7 +165,8 @@ fn type_key(ty: &str) -> Option<String> {
     }
     let ty = plain(ty)?;
     // A slice, array, tuple, function pointer or `impl` type has no path to match.
-    let named = !ty.is_empty() && ty.bytes().all(|it| it.is_ascii_alphanumeric() || it == b'_' || it == b':');
+    let named = !ty.is_empty()
+        && ty.bytes().all(|it| it.is_ascii_alphanumeric() || it == b'_' || it == b':');
     named.then_some(ty)
 }
 
@@ -202,16 +205,22 @@ pub(crate) fn of_function(db: &Db, f: hir::Function) -> Option<String> {
     let name = name.as_str();
     match f.as_assoc_item(db).map(|it| it.container(db)) {
         None => Some(format!("{}::{name}", module_path(db, &crate_name, f.module(db))?)),
-        Some(hir::AssocItemContainer::Trait(t)) => {
-            Some(format!("{}::{}::{name}", module_path(db, &crate_name, t.module(db))?, t.name(db).as_str()))
-        }
+        Some(hir::AssocItemContainer::Trait(t)) => Some(format!(
+            "{}::{}::{name}",
+            module_path(db, &crate_name, t.module(db))?,
+            t.name(db).as_str()
+        )),
         Some(hir::AssocItemContainer::Impl(imp)) => {
             let self_ty = self_key(db, imp.self_ty(db))?;
             match imp.trait_(db) {
                 None => Some(format!("{self_ty}::{name}")),
                 Some(t) => {
                     let t_crate = t.module(db).krate(db).display_name(db)?.crate_name().to_string();
-                    let trait_path = format!("{}::{}", module_path(db, &t_crate, t.module(db))?, t.name(db).as_str());
+                    let trait_path = format!(
+                        "{}::{}",
+                        module_path(db, &t_crate, t.module(db))?,
+                        t.name(db).as_str()
+                    );
                     Some(format!("<{self_ty} as {trait_path}>::{name}"))
                 }
             }
@@ -262,8 +271,14 @@ mod tests {
             ("<app::Grid>::get", "app::Grid::get"),
             ("<app::Grid<f32>>::get::<u8>", "app::Grid::get"),
             ("app::Grid<T>::get", "app::Grid::get"),
-            ("<app::Grid as core::ops::drop::Drop>::drop", "<app::Grid as core::ops::drop::Drop>::drop"),
-            ("<&mut app::Grid<u8> as app::Walk<fn() -> u8>>::step::{closure#1}", "<app::Grid as app::Walk>::step"),
+            (
+                "<app::Grid as core::ops::drop::Drop>::drop",
+                "<app::Grid as core::ops::drop::Drop>::drop",
+            ),
+            (
+                "<&mut app::Grid<u8> as app::Walk<fn() -> u8>>::step::{closure#1}",
+                "<app::Grid as app::Walk>::step",
+            ),
             ("<u32 as app::Walk>::step", "<u32 as app::Walk>::step"),
         ] {
             assert_eq!(normalized(demangled).as_deref(), Some(key), "{demangled}");
@@ -277,8 +292,14 @@ mod tests {
         // `_ZN3app3run17h0123456789abcdefE` is legacy `app::run`.
         let legacy = "_ZN3app3run17h0123456789abcdefE";
         assert_eq!(of_profile_name(legacy.as_bytes()).as_deref(), Some("app::run"));
-        assert_eq!(of_profile_name(format!("src/main.rs;{legacy}").as_bytes()).as_deref(), Some("app::run"));
-        assert_eq!(of_profile_name(format!("src/main.rs:{legacy}").as_bytes()).as_deref(), Some("app::run"));
+        assert_eq!(
+            of_profile_name(format!("src/main.rs;{legacy}").as_bytes()).as_deref(),
+            Some("app::run")
+        );
+        assert_eq!(
+            of_profile_name(format!("src/main.rs:{legacy}").as_bytes()).as_deref(),
+            Some("app::run")
+        );
         assert_eq!(of_profile_name(b"main"), None);
         assert_eq!(of_profile_name(b"blaze.pgo.00112233445566778899aabbccddeeff"), None);
     }

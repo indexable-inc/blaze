@@ -16,10 +16,7 @@ struct Lcg(u64);
 
 impl Lcg {
     fn next(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         self.0 >> 33
     }
 
@@ -143,14 +140,8 @@ fn start(body: Body, runs: &[Run], anchor: f64) -> (GraphShrinker, Probe) {
     }
     let mut probe = Probe::new(body);
     let shared = Arc::new(graph.clone());
-    let witness = (0..20)
-        .map(|_| probe.run(Arc::clone(&shared), 64))
-        .find(Outcome::clean)
-        .unwrap();
-    (
-        GraphShrinker::new(graph, witness.nodes, witness.spans, anchor),
-        probe,
-    )
+    let witness = (0..20).map(|_| probe.run(Arc::clone(&shared), 64)).find(Outcome::clean).unwrap();
+    (GraphShrinker::new(graph, witness.nodes, witness.spans, anchor), probe)
 }
 
 fn shrink(shrinker: &mut GraphShrinker, probe: &mut Probe) {
@@ -202,11 +193,7 @@ fn an_accept_tops_its_ledger_up_before_seeding_the_anchor() {
 
 fn hidden_coin(tc: &mut NativeTestCase, lcg: &mut Lcg) -> Option<bool> {
     int(tc, 1, 10)?;
-    let y = if lcg.coin(0.5) {
-        int(tc, 2, 10)?
-    } else {
-        int(tc, 3, 10)?
-    };
+    let y = if lcg.coin(0.5) { int(tc, 2, 10)? } else { int(tc, 3, 10)? };
     Some(y >= 3)
 }
 
@@ -214,10 +201,7 @@ fn hidden_coin(tc: &mut NativeTestCase, lcg: &mut Lcg) -> Option<bool> {
 fn a_hidden_coins_arms_shrink_together_and_the_tie_survives() {
     let (mut shrinker, mut probe) = start(
         hidden_coin,
-        &[
-            run(&[(A, value(5)), (B, value(6))]),
-            run(&[(A, value(5)), (C, value(7))]),
-        ],
+        &[run(&[(A, value(5)), (B, value(6))]), run(&[(A, value(5)), (C, value(7))])],
         0.5,
     );
     shrink(&mut shrinker, &mut probe);
@@ -249,12 +233,7 @@ fn list(tc: &mut NativeTestCase, _: &mut Lcg) -> Option<bool> {
 fn a_list_shrinks_to_the_one_element_that_fails() {
     let (mut shrinker, mut probe) = start(
         list,
-        &[run(&[
-            (A, value(3)),
-            (B, value(1)),
-            (&[(2, 1)], value(7)),
-            (&[(2, 2)], value(2)),
-        ])],
+        &[run(&[(A, value(3)), (B, value(1)), (&[(2, 1)], value(7)), (&[(2, 2)], value(2))])],
         0.5,
     );
     shrink(&mut shrinker, &mut probe);
@@ -307,17 +286,9 @@ fn a_failing_run_the_graph_cannot_produce_is_grafted_unless_foreign() {
         "foreign at the first draw: the walk serves 5 there"
     );
     shrinker.graft(&run(&[(A, value(5)), (B, value(1))]));
-    assert_eq!(
-        shrinker.graph().edge_count(),
-        2,
-        "foreign at the second draw"
-    );
+    assert_eq!(shrinker.graph().edge_count(), 2, "foreign at the second draw");
     shrinker.graft(&run(&[(A, value(5))]));
-    assert_eq!(
-        shrinker.graph().edge_count(),
-        3,
-        "the early exit is a gap: a tie at the start"
-    );
+    assert_eq!(shrinker.graph().edge_count(), 3, "the early exit is a gap: a tie at the start");
     let start = &shrinker.graph().nodes()[START].edges;
     assert!(start.iter().all(|e| e.value == value(5)));
     assert!(start.iter().any(|e| e.target == crate::native::graph::END));
@@ -341,9 +312,7 @@ fn an_early_exits_shrink_keeps_no_value_the_walk_never_serves() {
 }
 
 fn float_body(tc: &mut NativeTestCase, _: &mut Lcg) -> Option<bool> {
-    let f = draw(tc, 1, |tc| {
-        tc.draw_float(FloatWidth::F64, 0.0, 100.0, false, false, 5e-324)
-    })?;
+    let f = draw(tc, 1, |tc| tc.draw_float(FloatWidth::F64, 0.0, 100.0, false, false, 5e-324))?;
     Some(f >= 2.5)
 }
 
@@ -361,16 +330,10 @@ fn bytes_body(tc: &mut NativeTestCase, _: &mut Lcg) -> Option<bool> {
 
 #[test]
 fn sequences_halve_then_drop_then_zero() {
-    let (mut shrinker, mut probe) = start(
-        bytes_body,
-        &[run(&[(A, ChoiceValue::Bytes(vec![3, 4, 5, 6]))])],
-        0.5,
-    );
+    let (mut shrinker, mut probe) =
+        start(bytes_body, &[run(&[(A, ChoiceValue::Bytes(vec![3, 4, 5, 6]))])], 0.5);
     shrink(&mut shrinker, &mut probe);
-    assert_eq!(
-        shrinker.witness().0[0].value(),
-        ChoiceValue::Bytes(vec![0, 0, 5])
-    );
+    assert_eq!(shrinker.witness().0[0].value(), ChoiceValue::Bytes(vec![0, 0, 5]));
 }
 
 fn boolean_body(tc: &mut NativeTestCase, _: &mut Lcg) -> Option<bool> {
@@ -384,11 +347,8 @@ fn huge_body(tc: &mut NativeTestCase, _: &mut Lcg) -> Option<bool> {
 
 #[test]
 fn a_boolean_or_an_integer_past_i128_has_only_the_simplest_to_try() {
-    let (mut shrinker, mut probe) = start(
-        boolean_body,
-        &[run(&[(A, ChoiceValue::Boolean(true))])],
-        0.5,
-    );
+    let (mut shrinker, mut probe) =
+        start(boolean_body, &[run(&[(A, ChoiceValue::Boolean(true))])], 0.5);
     shrink(&mut shrinker, &mut probe);
     assert_eq!(shrinker.witness().0[0].value(), ChoiceValue::Boolean(true));
     let huge = ChoiceValue::Integer(BigInt::from(u128::MAX));
@@ -416,11 +376,7 @@ fn a_clones_record_is_not_shrunk_in_this_cut() {
 
 fn string_body(tc: &mut NativeTestCase, _: &mut Lcg) -> Option<bool> {
     let s = draw(tc, 1, |tc| {
-        tc.draw_string(
-            Arc::new(IntervalSet::new(vec![(b'a' as u32, b'c' as u32)]).unwrap()),
-            0,
-            8,
-        )
+        tc.draw_string(Arc::new(IntervalSet::new(vec![(b'a' as u32, b'c' as u32)]).unwrap()), 0, 8)
     })?;
     let chars: Vec<char> = s.chars().collect();
     Some(chars.len() >= 2 && chars[0] == 'c' && chars[1] != 'a')
@@ -438,11 +394,7 @@ fn strings_shrink_like_bytes_toward_their_simplest_codepoint() {
 fn a_value_edit_no_clean_replay_settled_on_is_rejected() {
     let (mut shrinker, mut probe) = start(two_ints, &[run(&[(A, value(7)), (B, value(8))])], 0.5);
     let candidate = (**shrinker.graph()).clone();
-    let edit = Edit::Value {
-        node: START,
-        addr: C.to_vec(),
-        value: value(9),
-    };
+    let edit = Edit::Value { node: START, addr: C.to_vec(), value: value(9) };
     let verdict = drive_no_yield(shrinker.judge(&mut probe, candidate, edit)).unwrap();
     assert!(matches!(verdict, Verdict::Rejected));
     assert_eq!(shrinker.replays(), nd::GAUNTLET_MIN_FAILS);
@@ -451,17 +403,9 @@ fn a_value_edit_no_clean_replay_settled_on_is_rejected() {
 #[test]
 fn a_value_edit_for_a_draw_the_graph_no_longer_has_is_skipped() {
     let (mut shrinker, mut probe) = start(two_ints, &[run(&[(A, value(7)), (B, value(8))])], 0.5);
-    let data = shrinker
-        .constraints
-        .get(&(Ident::Start, addr(A)))
-        .unwrap()
-        .clone();
-    let mut key = EdgeKey {
-        from: Ident::At(C.to_vec()),
-        addr: addr(A),
-        value: value(7),
-        to: Ident::End,
-    };
+    let data = shrinker.constraints.get(&(Ident::Start, addr(A))).unwrap().clone();
+    let mut key =
+        EdgeKey { from: Ident::At(C.to_vec()), addr: addr(A), value: value(7), to: Ident::End };
     let moved = drive_no_yield(shrinker.try_value(&mut probe, &mut key, &data, value(1))).unwrap();
     assert!(!moved);
     assert_eq!(shrinker.replays(), 0);
@@ -474,19 +418,10 @@ fn adopting_keeps_a_smaller_standing_witness_the_new_graph_still_walks() {
     let mut graph = (**shrinker.graph()).clone();
     graph.insert(&run(&[(A, value(5)), (B, value(4))]));
     let shared = Arc::new(graph.clone());
-    let long = (0..40)
-        .map(|_| probe.run(Arc::clone(&shared), 8))
-        .find(|o| o.nodes.len() == 2)
-        .unwrap();
-    let long = Outcome {
-        failed: true,
-        divergence: false,
-        ended: true,
-        ..long
-    };
-    shrinker
-        .adopt(&mut probe, graph, long.clone(), 0.6)
-        .unwrap();
+    let long =
+        (0..40).map(|_| probe.run(Arc::clone(&shared), 8)).find(|o| o.nodes.len() == 2).unwrap();
+    let long = Outcome { failed: true, divergence: false, ended: true, ..long };
+    shrinker.adopt(&mut probe, graph, long.clone(), 0.6).unwrap();
     assert_eq!(ints(shrinker.witness().0), vec![5]);
     assert_eq!(shrinker.anchor(), 0.6);
     let only_long = Graph::from_run(&run(&[(A, value(5)), (B, value(4))]));
@@ -501,14 +436,7 @@ fn constraints_are_learned_for_every_draw_but_clones() {
     let (mut shrinker, _) = start(two_ints, &[run(&[(A, value(7)), (B, value(8))])], 0.5);
     assert_eq!(shrinker.constraints.len(), 2);
     let clone = ChoiceNode::clone_stream(Arc::new(RealizedStream::empty()), false);
-    let span = Span {
-        start: 0,
-        end: 1,
-        label: 9,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    };
+    let span = Span { start: 0, end: 1, label: 9, depth: 0, parent: None, discarded: false };
     shrinker.learn_constraints(&[clone], &[span]);
     assert_eq!(shrinker.constraints.len(), 2);
 }
@@ -585,12 +513,7 @@ fn four_ints(tc: &mut NativeTestCase, _: &mut Lcg) -> Option<bool> {
 fn a_span_the_test_always_draws_is_retried_with_at_most_the_nearest_count_lowerings() {
     let (mut shrinker, mut probe) = start(
         four_ints,
-        &[run(&[
-            (A, value(5)),
-            (B, value(5)),
-            (C, value(5)),
-            (&[(4, 0)], value(10)),
-        ])],
+        &[run(&[(A, value(5)), (B, value(5)), (C, value(5)), (&[(4, 0)], value(10))])],
         0.5,
     );
     shrink(&mut shrinker, &mut probe);
@@ -651,11 +574,8 @@ fn wrapped_then_tail(tc: &mut NativeTestCase, lcg: &mut Lcg) -> Option<bool> {
 
 #[test]
 fn a_span_the_test_stops_drawing_is_deleted_outright_and_its_inner_span_skipped() {
-    let (mut shrinker, mut probe) = start(
-        wrapped_then_tail,
-        &[run(&[(&[(1, 0), (2, 0)], value(5)), (C, value(7))])],
-        0.1,
-    );
+    let (mut shrinker, mut probe) =
+        start(wrapped_then_tail, &[run(&[(&[(1, 0), (2, 0)], value(5)), (C, value(7))])], 0.1);
     assert_eq!(ints(shrinker.witness().0), vec![5, 7]);
     probe.min_fails = 1;
     probe.seed = 2;
@@ -679,11 +599,7 @@ fn flag_then_pair(tc: &mut NativeTestCase, _: &mut Lcg) -> Option<bool> {
 fn only_integer_draws_are_lowered_for_a_span_deletion() {
     let (mut shrinker, mut probe) = start(
         flag_then_pair,
-        &[run(&[
-            (A, ChoiceValue::Boolean(true)),
-            (B, value(5)),
-            (C, value(5)),
-        ])],
+        &[run(&[(A, ChoiceValue::Boolean(true)), (B, value(5)), (C, value(5))])],
         0.5,
     );
     assert!(!drive_no_yield(shrinker.span_pass(&mut probe)).unwrap());
@@ -722,11 +638,7 @@ fn a_forced_draw_is_not_an_edge_and_cannot_cycle_the_shrink() {
 
 fn ab_string_body(tc: &mut NativeTestCase, _: &mut Lcg) -> Option<bool> {
     let s = draw(tc, 1, |tc| {
-        tc.draw_string(
-            Arc::new(IntervalSet::new(vec![(b'a' as u32, b'c' as u32)]).unwrap()),
-            0,
-            8,
-        )
+        tc.draw_string(Arc::new(IntervalSet::new(vec![(b'a' as u32, b'c' as u32)]).unwrap()), 0, 8)
     })?;
     Some(s.chars().count() >= 2)
 }
@@ -740,9 +652,7 @@ fn under_grammar(text: &str, simplest: &str, value: &str) -> ChoiceData {
     let constraint =
         crate::native::lark::constraint::GrammarConstraint::new(grammar, start, 8, u32::MAX, None)
             .unwrap();
-    constraint
-        .simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(simplest)))
-        .unwrap();
+    constraint.simplest_or_init(|| Ok::<_, crate::control::InternalError>(cps(simplest))).unwrap();
     ChoiceData::String(
         Arc::new(crate::native::core::StringChoice {
             intervals: Arc::new(IntervalSet::new(vec![(b'a' as u32, b'c' as u32)]).unwrap()),

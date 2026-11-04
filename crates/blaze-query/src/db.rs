@@ -38,15 +38,16 @@ pub use capture::{
     Read, ReadKind, Reads, capture_reads, for_span_text, replay_reads, unshareable_reads,
 };
 pub use counts::{Counts, take as take_counts};
-/// The most reads one query run held and the most pending rows one task held, process-wide:
-/// what the query stack's runaway bounds are set against (the daemon's memory line says them).
-pub use local::{HighWater as StackHighWater, high_water as stack_high_water};
 pub use function::completed;
 pub use id::{AsId, FromId, FromIdIn, Id};
 pub use input::Setter;
 pub use interned::NamesIds;
+/// The most reads one query run held and the most pending rows one task held, process-wide:
+/// what the query stack's runaway bounds are set against (the daemon's memory line says them).
+pub use local::{HighWater as StackHighWater, high_water as stack_high_water};
 pub use provenance::{
-    Cause, LOG_MOST, Logged, LoggedRun, Outcome, Provenance, RowNamer, Taken, log_runs, name_rows, take_log_in,
+    Cause, LOG_MOST, Logged, LoggedRun, Outcome, Provenance, RowNamer, Taken, log_runs, name_rows,
+    take_log_in,
 };
 pub use slot::{Filled, Slot, SlotClaim, SlotError, SlotName, SlotRefused};
 pub use storage::{Database, Durability, Hook, Storage, View};
@@ -58,9 +59,7 @@ pub mod plumbing {
     pub use blaze_mem::Tag;
 
     pub use super::{
-        function::{
-            CycleKind, Function, MAX_ROUNDS, evict_values, evict_values_of, fetch,
-        },
+        function::{CycleKind, Function, MAX_ROUNDS, evict_values, evict_values_of, fetch},
         ingredient::{Ingredient, Kind, Vtable},
         input::{
             Input, InputSetter, input_fields, input_new, input_new_singleton, input_read,
@@ -318,13 +317,19 @@ fn out_of_steps(steps: u64, key: u128, at: impl FnOnce() -> String) -> ! {
 /// here, and a panic in it leaves the key named by its number (rule 17).
 #[cold]
 #[inline(never)]
-pub(crate) fn out_of_fuel<F: function::Function>(db: &F::Db, steps: u64, index: u32, key: F::Key) -> ! {
+pub(crate) fn out_of_fuel<F: function::Function>(
+    db: &F::Db,
+    steps: u64,
+    index: u32,
+    key: F::Key,
+) -> ! {
     let depth = local::with(|local| local.frames.len());
     let id = key.as_id();
     let fuel = local::with(|local| local.fuel.take());
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut value = String::new(); // alloc: an error's text, once per bound that trips
-        attach(db, || function::write_key_text(&mut value, id, |out| F::write_key(key, out))).then_some(value)
+        attach(db, || function::write_key_text(&mut value, id, |out| F::write_key(key, out)))
+            .then_some(value)
     }));
     local::with(|local| local.fuel = fuel);
     let value = match written {
@@ -473,7 +478,8 @@ pub(crate) fn noted(storage: &Storage, note: local::Note) {
 #[cold]
 #[inline(never)]
 fn name_most_reads(storage: &Storage, held: u64) {
-    let top = local::with(|local| local.frames.last().map(|it| (it.ingredient, Id::from_u32(it.id))));
+    let top =
+        local::with(|local| local.frames.last().map(|it| (it.ingredient, Id::from_u32(it.id))));
     let Some((ingredient, id)) = top else { return };
     local::name_most_reads(held, || {
         let barrier = local::barrier();
@@ -587,7 +593,7 @@ pub(crate) fn key_text(storage: &Storage, index: u32, id: Id) -> String {
     match written {
         Some(Ok(text)) => text,
         Some(Err(_)) => format!("{id:?} (its key's `Debug` failed)"), // alloc: as above
-        None => format!("{id:?}"),                                     // alloc: as above
+        None => format!("{id:?}"),                                    // alloc: as above
     }
 }
 
@@ -663,7 +669,12 @@ pub fn report_untracked_read<D: Database>(db: &D, why: Untracked) {
     });
     if let Some((index, node, first)) = query {
         if first && provenance::logging() {
-            storage.run_log.log(storage.key_of(node), 0, storage.view_bits(), Logged::UntrackedRead(why.what));
+            storage.run_log.log(
+                storage.key_of(node),
+                0,
+                storage.view_bits(),
+                Logged::UntrackedRead(why.what),
+            );
         }
         tracing::debug!(
             target: "blaze_query",

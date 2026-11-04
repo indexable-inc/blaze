@@ -30,13 +30,8 @@ fn codepoints(s: &str) -> Vec<u32> {
 
 #[test]
 fn oversize_regex_draws_stop_and_restore_the_output_buffer() {
-    for pattern in [
-        "a{100000000}",
-        "[ab]{100000000}",
-        "[^ab]{100000000}",
-        "abcdefghij",
-        "(abc)\\1",
-    ] {
+    for pattern in ["a{100000000}", "[ab]{100000000}", "[^ab]{100000000}", "abcdefghij", "(abc)\\1"]
+    {
         let re = CompiledRegex::compile(pattern, None, UnicodeVersion::LATEST).unwrap();
         let mut rng = EngineRng::seeded(0);
         let mut draws = RngDraws::new(&mut rng, Default::default());
@@ -79,13 +74,7 @@ fn nullable_regex_repeats_have_a_work_limit() {
     state.remaining = 16;
     let mut draws = SimplestDraws::default();
     assert!(matches!(
-        generate_subpattern(
-            &mut draws,
-            &re.parsed.pattern,
-            &mut state,
-            &None,
-            &mut Vec::new()
-        ),
+        generate_subpattern(&mut draws, &re.parsed.pattern, &mut state, &None, &mut Vec::new()),
         Err(EngineError::InvalidTestCase)
     ));
     assert_eq!(draws.status(), Some(Status::Invalid));
@@ -133,9 +122,9 @@ fn set_len(set: &InSet) -> u64 {
 fn listed(set: &InSet) -> Vec<char> {
     match set {
         InSet::Listed(chars) => chars.to_vec(),
-        InSet::Complement(complement) => (0..complement.len)
-            .map(|idx| complement.get(idx).unwrap())
-            .collect(),
+        InSet::Complement(complement) => {
+            (0..complement.len).map(|idx| complement.get(idx).unwrap()).collect()
+        }
     }
 }
 
@@ -176,10 +165,7 @@ fn build_in_set_ascii_categories_are_ascii_only() {
     let alphabet =
         IntervalSet::new(vec![('0' as u32, 'z' as u32), ('é' as u32, 'é' as u32)]).unwrap();
     let out = listed(&build_in_set(&items, SRE_FLAG_ASCII, &Some(alphabet.clone())).unwrap());
-    assert!(
-        out.iter().all(|c| c.is_ascii_alphanumeric() || *c == '_'),
-        "{out:?}"
-    );
+    assert!(out.iter().all(|c| c.is_ascii_alphanumeric() || *c == '_'), "{out:?}");
     let out = listed(&build_in_set(&items, 0, &Some(alphabet)).unwrap());
     assert!(out.contains(&'é'));
 }
@@ -203,28 +189,16 @@ fn build_in_set_positive_enumeration_agrees_with_the_matcher() {
     let cases: Vec<(Vec<SetItem>, u32)> = vec![
         (vec![SetItem::Literal('k' as u32)], SRE_FLAG_IGNORECASE),
         (vec![SetItem::Literal('ß' as u32)], SRE_FLAG_IGNORECASE),
-        (
-            vec![SetItem::Literal('\u{130}' as u32)],
-            SRE_FLAG_IGNORECASE,
-        ),
-        (
-            vec![SetItem::Range('a' as u32, 'z' as u32)],
-            SRE_FLAG_IGNORECASE,
-        ),
+        (vec![SetItem::Literal('\u{130}' as u32)], SRE_FLAG_IGNORECASE),
+        (vec![SetItem::Range('a' as u32, 'z' as u32)], SRE_FLAG_IGNORECASE),
         (vec![SetItem::Range(0x3b1, 0x3c9)], SRE_FLAG_IGNORECASE),
         (vec![SetItem::Range(0x3b1, 0x3c9)], 0),
         (
-            vec![
-                SetItem::Range('À' as u32, 'Ö' as u32),
-                SetItem::Literal('a' as u32),
-            ],
+            vec![SetItem::Range('À' as u32, 'Ö' as u32), SetItem::Literal('a' as u32)],
             SRE_FLAG_IGNORECASE | SRE_FLAG_ASCII,
         ),
         (
-            vec![
-                SetItem::Category(ChCode::Digit),
-                SetItem::Literal('x' as u32),
-            ],
+            vec![SetItem::Category(ChCode::Digit), SetItem::Literal('x' as u32)],
             SRE_FLAG_IGNORECASE | SRE_FLAG_ASCII,
         ),
     ];
@@ -233,9 +207,8 @@ fn build_in_set_positive_enumeration_agrees_with_the_matcher() {
             .into_iter()
             .filter(|c| (*c as u32) <= 0xFFFF)
             .collect();
-        let matched: HashSet<char> = gather_chars(&None, |c| set_matches(&items, c, flags))
-            .into_iter()
-            .collect();
+        let matched: HashSet<char> =
+            gather_chars(&None, |c| set_matches(&items, c, flags)).into_iter().collect();
         assert_eq!(enumerated, matched, "{items:?} with flags {flags}");
     }
 }
@@ -271,20 +244,13 @@ fn build_in_set_negated_default_set_is_the_complement_of_its_literals() {
     };
     assert_eq!(
         complement.excluded,
-        vec![
-            ('0' as u32, '2' as u32),
-            ('k' as u32, 'k' as u32),
-            (0xD800, 0xDFFF),
-        ]
+        vec![('0' as u32, '2' as u32), ('k' as u32, 'k' as u32), (0xD800, 0xDFFF),]
     );
     assert_eq!(set_len(&out), DEFAULT_ANY_LEN - 4);
     assert_eq!(listed(&out), reference_in_set(&items, 0, &None));
     let ignorecase = build_in_set(&items, SRE_FLAG_IGNORECASE, &None).unwrap();
     assert_eq!(set_len(&ignorecase), DEFAULT_ANY_LEN - 6);
-    assert_eq!(
-        listed(&ignorecase),
-        reference_in_set(&items, SRE_FLAG_IGNORECASE, &None)
-    );
+    assert_eq!(listed(&ignorecase), reference_in_set(&items, SRE_FLAG_IGNORECASE, &None));
     assert!(!listed(&ignorecase).contains(&'K'));
     assert!(!listed(&ignorecase).contains(&'\u{212A}'));
     assert!(complement.get(u64::from(u32::MAX) + 1).is_err());
@@ -298,13 +264,7 @@ fn generate_op_empty_in_set_marks_invalid() {
     let alphabet = Some(IntervalSet::new(vec![('x' as u32, 'x' as u32)]).unwrap());
     let items = vec![SetItem::Literal('a' as u32), SetItem::Literal('b' as u32)];
     let mut out = Vec::new();
-    let result = generate_op(
-        &mut ntc,
-        &OpCode::In(items),
-        &mut state,
-        &alphabet,
-        &mut out,
-    );
+    let result = generate_op(&mut ntc, &OpCode::In(items), &mut state, &alphabet, &mut out);
     assert!(result.is_err());
     assert_eq!(ntc.status(), Some(Status::Invalid));
 }
@@ -466,14 +426,8 @@ fn generate_op_ignorecase_not_literal_excludes_every_case_equal_char() {
         let mut ntc = NativeTestCase::new_random(EngineRng::seeded(seed)).unwrap();
         let mut state = ignorecase_state(&caches);
         let mut out = Vec::new();
-        generate_op(
-            &mut ntc,
-            &OpCode::NotLiteral('İ' as u32),
-            &mut state,
-            &alphabet,
-            &mut out,
-        )
-        .unwrap();
+        generate_op(&mut ntc, &OpCode::NotLiteral('İ' as u32), &mut state, &alphabet, &mut out)
+            .unwrap();
         assert!(
             out == chars("x") || out == chars("\u{307}"),
             "seed {seed} emitted a case-equal char {out:?}"
@@ -583,10 +537,7 @@ fn generate_regex_ignorecase_negated_class_excludes_every_case_equal_char() {
     for seed in 0..100 {
         let mut ntc = NativeTestCase::new_random(EngineRng::seeded(seed)).unwrap();
         let s = generate_regex(&mut ntc, &re, true).unwrap();
-        assert!(
-            s == "x" || s == "\u{307}",
-            "seed {seed}: {s:?} is case-equal to an excluded char"
-        );
+        assert!(s == "x" || s == "\u{307}", "seed {seed}: {s:?} is case-equal to an excluded char");
         seen.insert(s);
     }
     assert_eq!(seen.len(), 2, "saw {seen:?}");
@@ -613,10 +564,7 @@ fn generate_regex_fullmatch_lookbehind_is_validated_against_the_final_string() {
             assert_eq!(s, "b");
         }
     }
-    assert!(
-        produced > 0,
-        "a zero-width lookbehind body that holds must pass"
-    );
+    assert!(produced > 0, "a zero-width lookbehind body that holds must pass");
 }
 
 #[test]
@@ -739,11 +687,7 @@ fn reference_in_set(items: &[SetItem], flags: u32, alphabet: &Option<IntervalSet
             SetItem::Category(cat) => categories.push(*cat),
         }
     }
-    let in_classes = |c: char| {
-        categories
-            .iter()
-            .any(|cat| reference_in_category(c, *cat, ascii))
-    };
+    let in_classes = |c: char| categories.iter().any(|cat| reference_in_category(c, *cat, ascii));
     if !negate {
         let mut out = Vec::new();
         let mut seen: HashSet<char> = HashSet::default();
@@ -802,10 +746,7 @@ fn build_in_set_category_classes_match_a_lookup_per_character() {
     let item_sets: Vec<Vec<SetItem>> = [Digit, NotDigit, Space, NotSpace, Word, NotWord]
         .iter()
         .flat_map(|cat| {
-            [
-                vec![SetItem::Category(*cat)],
-                vec![SetItem::Negate, SetItem::Category(*cat)],
-            ]
+            [vec![SetItem::Category(*cat)], vec![SetItem::Negate, SetItem::Category(*cat)]]
         })
         .chain([
             vec![SetItem::Negate, SetItem::Literal('a' as u32)],
@@ -825,32 +766,17 @@ fn build_in_set_category_classes_match_a_lookup_per_character() {
                 SetItem::Category(Space),
                 SetItem::Category(Digit),
             ],
-            vec![
-                SetItem::Literal('a' as u32),
-                SetItem::Category(Word),
-                SetItem::Category(Space),
-            ],
+            vec![SetItem::Literal('a' as u32), SetItem::Category(Word), SetItem::Category(Space)],
             vec![SetItem::Literal('α' as u32), SetItem::Category(Word)],
-            vec![
-                SetItem::Negate,
-                SetItem::Literal('α' as u32),
-                SetItem::Category(Space),
-            ],
-            vec![
-                SetItem::Negate,
-                SetItem::Literal('α' as u32),
-                SetItem::Category(Word),
-            ],
+            vec![SetItem::Negate, SetItem::Literal('α' as u32), SetItem::Category(Space)],
+            vec![SetItem::Negate, SetItem::Literal('α' as u32), SetItem::Category(Word)],
         ])
         .collect();
     for alphabet in &alphabets {
         for items in &item_sets {
-            for flags in [
-                0,
-                SRE_FLAG_IGNORECASE,
-                SRE_FLAG_ASCII,
-                SRE_FLAG_IGNORECASE | SRE_FLAG_ASCII,
-            ] {
+            for flags in
+                [0, SRE_FLAG_IGNORECASE, SRE_FLAG_ASCII, SRE_FLAG_IGNORECASE | SRE_FLAG_ASCII]
+            {
                 assert_eq!(
                     listed(&build_in_set(items, flags, alphabet).unwrap()),
                     reference_in_set(items, flags, alphabet),
@@ -905,10 +831,7 @@ fn a_repeated_class_draws_what_repeating_it_in_a_group_would() {
         let direct = CompiledRegex::compile(direct, None, UnicodeVersion::LATEST).unwrap();
         let grouped = CompiledRegex::compile(grouped, None, UnicodeVersion::LATEST).unwrap();
         assert!(matches!(repeated(&direct).data[..], [OpCode::In(_)]));
-        assert!(matches!(
-            repeated(&grouped).data[..],
-            [OpCode::Subpattern { group: Some(_), .. }]
-        ));
+        assert!(matches!(repeated(&grouped).data[..], [OpCode::Subpattern { group: Some(_), .. }]));
         for seed in 0..200 {
             let mut ntc = NativeTestCase::new_random(EngineRng::seeded(seed)).unwrap();
             let one = generate_regex(&mut ntc, &direct, true).unwrap();
@@ -931,21 +854,13 @@ fn a_repeated_empty_class_marks_invalid() {
     let alphabet = Some(IntervalSet::new(vec![('x' as u32, 'x' as u32)]).unwrap());
     for (items, alphabet, complemented) in [
         (vec![SetItem::Literal('a' as u32)], &alphabet, false),
-        (
-            vec![SetItem::Negate, SetItem::Range(0, 0xFFFF)],
-            &None,
-            true,
-        ),
+        (vec![SetItem::Negate, SetItem::Range(0, 0xFFFF)], &None, true),
     ] {
         let mut ntc =
             NativeTestCase::for_choices(&[ChoiceValue::Integer(BigInt::from(0))], None, None);
         let caches = Caches::default();
         let mut state = ignorecase_state(&caches);
-        let op = OpCode::MaxRepeat {
-            min: 1,
-            max: 1,
-            item: sub(vec![OpCode::In(items)]),
-        };
+        let op = OpCode::MaxRepeat { min: 1, max: 1, item: sub(vec![OpCode::In(items)]) };
         let mut out = Vec::new();
         let result = generate_op(&mut ntc, &op, &mut state, alphabet, &mut out);
         assert!(result.is_err());
@@ -957,10 +872,7 @@ fn a_repeated_empty_class_marks_invalid() {
             matches!(set, InSet::Complement(complement) if complement.len == 0),
             complemented
         );
-        assert_eq!(
-            matches!(set, InSet::Listed(chars) if chars.is_empty()),
-            !complemented
-        );
+        assert_eq!(matches!(set, InSet::Listed(chars) if chars.is_empty()), !complemented);
     }
 }
 
@@ -968,12 +880,8 @@ fn a_repeated_empty_class_marks_invalid() {
 fn a_captured_group_is_kept_only_when_the_pattern_reads_it_back() {
     use crate::native::rng::EngineRng;
     let caches = Caches::default();
-    let op = OpCode::Subpattern {
-        group: Some(1),
-        add_flags: 0,
-        del_flags: 0,
-        p: sub(vec![lit('a')]),
-    };
+    let op =
+        OpCode::Subpattern { group: Some(1), add_flags: 0, del_flags: 0, p: sub(vec![lit('a')]) };
     for capture in [false, true] {
         let mut ntc = NativeTestCase::for_choices(&[], None, None);
         let mut state = ignorecase_state(&caches);
@@ -1059,11 +967,7 @@ fn the_simplest_source_draws_the_simplest_match() {
     ] {
         let re = CompiledRegex::compile(pattern, None, UnicodeVersion::LATEST).unwrap();
         let mut draws = SimplestDraws::default();
-        assert_eq!(
-            generate_regex(&mut draws, &re, fullmatch).unwrap(),
-            expected,
-            "{pattern:?}"
-        );
+        assert_eq!(generate_regex(&mut draws, &re, fullmatch).unwrap(), expected, "{pattern:?}");
         assert_eq!(draws.status(), None);
     }
 }
@@ -1148,10 +1052,7 @@ fn the_least_alternative_is_chosen_among_those_the_alphabet_can_supply() {
     assert_eq!(simplest("(?:a|bb)", only_b()), "bb");
     let re = CompiledRegex::compile("(?:a|aa)", only_b(), UnicodeVersion::LATEST).unwrap();
     let mut draws = SimplestDraws::default();
-    assert!(matches!(
-        generate_regex(&mut draws, &re, true),
-        Err(EngineError::InvalidTestCase)
-    ));
+    assert!(matches!(generate_regex(&mut draws, &re, true), Err(EngineError::InvalidTestCase)));
     assert_eq!(draws.status(), Some(Status::Invalid));
 }
 
@@ -1162,10 +1063,7 @@ fn the_least_alternative_is_chosen_among_those_the_alphabet_can_supply() {
 fn an_alternative_that_cannot_be_drawn_fails_the_simplest_walk() {
     let re = CompiledRegex::compile(r"b(?:\A|a)", None, UnicodeVersion::LATEST).unwrap();
     let mut draws = SimplestDraws::default();
-    assert!(matches!(
-        generate_regex(&mut draws, &re, true),
-        Err(EngineError::InvalidTestCase)
-    ));
+    assert!(matches!(generate_regex(&mut draws, &re, true), Err(EngineError::InvalidTestCase)));
     assert_eq!(draws.status(), Some(Status::Invalid));
     let spec = spec(r"b(?:\A|a)", true);
     let mut ntc = NativeTestCase::new_random(EngineRng::seeded(1)).unwrap();
@@ -1186,10 +1084,7 @@ fn the_simplest_string_is_valid_when_the_least_alternative_fails_the_pattern() {
         let re = CompiledRegex::compile(pattern, None, UnicodeVersion::LATEST).unwrap();
         let mut draws = SimplestDraws::default();
         assert!(
-            matches!(
-                generate_regex(&mut draws, &re, true),
-                Err(EngineError::InvalidTestCase)
-            ),
+            matches!(generate_regex(&mut draws, &re, true), Err(EngineError::InvalidTestCase)),
             "{pattern:?}"
         );
         let spec = spec(pattern, true);
@@ -1223,21 +1118,9 @@ fn classes_and_case_folding_follow_the_unicode_version() {
     let v15_1 = UnicodeVersion::parse("15.1.0").unwrap();
     let v16 = UnicodeVersion::parse("16.0.0").unwrap();
     let rams_horn = Some(IntervalSet::new(vec![(0xA7CB, 0xA7CB)]).unwrap());
-    assert!(
-        CompiledRegex::compile(r"\w", rams_horn.clone(), v16)
-            .unwrap()
-            .producible()
-    );
-    assert!(
-        !CompiledRegex::compile(r"\w", rams_horn.clone(), v15_1)
-            .unwrap()
-            .producible()
-    );
-    assert!(
-        CompiledRegex::compile(r"\W", rams_horn, v15_1)
-            .unwrap()
-            .producible()
-    );
+    assert!(CompiledRegex::compile(r"\w", rams_horn.clone(), v16).unwrap().producible());
+    assert!(!CompiledRegex::compile(r"\w", rams_horn.clone(), v15_1).unwrap().producible());
+    assert!(CompiledRegex::compile(r"\W", rams_horn, v15_1).unwrap().producible());
     let drawn = |version: UnicodeVersion| {
         let re = CompiledRegex::compile(r"(?i)\uA7CE", None, version).unwrap();
         let mut seen = HashSet::default();
@@ -1280,13 +1163,7 @@ fn a_regex_string_is_one_choice_under_the_pattern_as_its_constraint() {
     assert_eq!(ntc.nodes.len(), 1);
     let (recorded, value) = ntc.nodes[0].data.as_string().unwrap();
     assert_eq!(recorded, &**kind);
-    assert_eq!(
-        value,
-        chars(&drawn)
-            .iter()
-            .map(|&c| u32::from(c))
-            .collect::<Vec<u32>>()
-    );
+    assert_eq!(value, chars(&drawn).iter().map(|&c| u32::from(c)).collect::<Vec<u32>>());
     assert!(kind.validate(value));
     assert_eq!(
         kind.constraint.as_ref().unwrap().simplest(),
@@ -1310,31 +1187,18 @@ fn a_regex_string_drawn_over_an_alphabet_is_recorded_over_it() {
     let kind = regex_kind(&spec);
     assert_eq!(kind.intervals.len(), 3);
     assert!(kind.validate(&[u32::from('b')]));
-    assert!(
-        !kind.validate(&[u32::from('z')]),
-        "in the pattern, outside the alphabet"
-    );
+    assert!(!kind.validate(&[u32::from('z')]), "in the pattern, outside the alphabet");
 }
 
 #[test]
 fn a_replayed_string_the_pattern_rejects_is_punned_to_the_simplest() {
     let spec = spec("[a-z]+@[a-z]+", true);
-    let stored = vec![ChoiceValue::String(
-        chars("!!!").iter().map(|&c| u32::from(c)).collect(),
-    )];
+    let stored = vec![ChoiceValue::String(chars("!!!").iter().map(|&c| u32::from(c)).collect())];
     let mut ntc = NativeTestCase::for_choices(&stored, None, None);
-    assert_eq!(
-        crate::native::draws::generate_string(&mut ntc, &spec).unwrap(),
-        "a@a"
-    );
-    let kept = vec![ChoiceValue::String(
-        chars("zz@q").iter().map(|&c| u32::from(c)).collect(),
-    )];
+    assert_eq!(crate::native::draws::generate_string(&mut ntc, &spec).unwrap(), "a@a");
+    let kept = vec![ChoiceValue::String(chars("zz@q").iter().map(|&c| u32::from(c)).collect())];
     let mut ntc = NativeTestCase::for_choices(&kept, None, None);
-    assert_eq!(
-        crate::native::draws::generate_string(&mut ntc, &spec).unwrap(),
-        "zz@q"
-    );
+    assert_eq!(crate::native::draws::generate_string(&mut ntc, &spec).unwrap(), "zz@q");
 }
 
 #[test]
@@ -1343,10 +1207,7 @@ fn the_simplest_string_falls_back_on_seeded_draws_when_the_simplest_walk_fails_i
     let kind = regex_kind(&spec);
     let mut ntc = NativeTestCase::new_random(EngineRng::seeded(1)).unwrap();
     crate::native::draws::generate_string(&mut ntc, &spec).unwrap();
-    assert_eq!(
-        kind.constraint.as_ref().unwrap().simplest(),
-        Some(&[u32::from('b')][..])
-    );
+    assert_eq!(kind.constraint.as_ref().unwrap().simplest(), Some(&[u32::from('b')][..]));
 }
 
 #[test]
@@ -1354,10 +1215,7 @@ fn a_pattern_with_no_string_concludes_the_test_case_invalid_at_the_first_draw() 
     let spec = spec("(?>a+)a", true);
     let mut ntc = NativeTestCase::new_random(EngineRng::seeded(1)).unwrap();
     let result = crate::native::draws::generate_string(&mut ntc, &spec);
-    assert!(
-        matches!(result, Err(EngineError::InvalidTestCase)),
-        "{result:?}"
-    );
+    assert!(matches!(result, Err(EngineError::InvalidTestCase)), "{result:?}");
     assert_eq!(ntc.status(), Some(Status::Invalid));
 }
 
@@ -1370,16 +1228,10 @@ fn a_draw_over_the_size_cap_concludes_the_test_case_invalid() {
     };
     let mut rng = EngineRng::seeded(0);
     let mut draws = RngDraws::new(&mut rng, Default::default());
-    assert!(matches!(
-        draw_regex(&mut draws, re, true, 2),
-        Err(EngineError::InvalidTestCase)
-    ));
+    assert!(matches!(draw_regex(&mut draws, re, true, 2), Err(EngineError::InvalidTestCase)));
     assert_eq!(draws.status(), Some(Status::Invalid));
     let mut draws = RngDraws::new(&mut rng, Default::default());
-    assert_eq!(
-        draw_regex(&mut draws, re, true, kind.max_size).unwrap(),
-        vec![u32::from('a'); 3]
-    );
+    assert_eq!(draw_regex(&mut draws, re, true, kind.max_size).unwrap(), vec![u32::from('a'); 3]);
 }
 
 #[test]
@@ -1410,10 +1262,7 @@ fn a_literal_pattern_is_emitted_without_a_walk() {
     let compiled = |pattern: &str, alphabet: Option<IntervalSet>| {
         CompiledRegex::compile(pattern, alphabet, UnicodeVersion::LATEST).unwrap()
     };
-    assert_eq!(
-        compiled("abc", None).literal.as_deref(),
-        Some(&chars("abc")[..])
-    );
+    assert_eq!(compiled("abc", None).literal.as_deref(), Some(&chars("abc")[..]));
     assert_eq!(compiled("", None).literal.as_deref(), Some(&[][..]));
     assert!(compiled("(?i)abc", None).literal.is_none());
     assert!(compiled("a.c", None).literal.is_none());
@@ -1424,11 +1273,7 @@ fn a_literal_pattern_is_emitted_without_a_walk() {
     let mut rng = EngineRng::seeded(3);
     let mut draws = RngDraws::new(&mut rng, Default::default());
     assert_eq!(generate_regex(&mut draws, &re, true).unwrap(), "abc");
-    assert_eq!(
-        rng.next_byte(),
-        EngineRng::seeded(3).next_byte(),
-        "the draw consumed randomness"
-    );
+    assert_eq!(rng.next_byte(), EngineRng::seeded(3).next_byte(), "the draw consumed randomness");
 }
 
 #[test]
@@ -1496,11 +1341,7 @@ fn a_negated_class_under_ignorecase_never_draws_a_character_folding_into_it() {
         let re = CompiledRegex::compile(pattern, Some(alphabet), UnicodeVersion::LATEST).unwrap();
         for seed in 0..40 {
             let mut ntc = NativeTestCase::new_random(EngineRng::seeded(seed)).unwrap();
-            assert_eq!(
-                generate_regex(&mut ntc, &re, true).unwrap(),
-                "a",
-                "{pattern:?}"
-            );
+            assert_eq!(generate_regex(&mut ntc, &re, true).unwrap(), "a", "{pattern:?}");
         }
     }
 }
@@ -1625,9 +1466,7 @@ fn strings_drawn_for_anchors_and_lookarounds_are_accepted_by_the_constraint() {
         let mut produced = 0;
         for fullmatch in [true, false] {
             let kind = re.kind(fullmatch).unwrap();
-            let Some(Constraint::Regex(constraint)) = &kind.constraint else {
-                unreachable!()
-            };
+            let Some(Constraint::Regex(constraint)) = &kind.constraint else { unreachable!() };
             for seed in 0..100 {
                 let mut ntc = NativeTestCase::new_random(EngineRng::seeded(seed)).unwrap();
                 let Ok(s) = generate_regex(&mut ntc, &re, fullmatch) else {
@@ -1684,11 +1523,7 @@ fn generate_regex_skips_a_repeat_whose_body_the_alphabet_cannot_supply() {
     assert!(re.unproducible);
     for seed in 0..50 {
         let mut ntc = NativeTestCase::new_random(EngineRng::seeded(seed)).unwrap();
-        assert_eq!(
-            generate_regex(&mut ntc, &re, true).unwrap(),
-            "k",
-            "seed {seed}"
-        );
+        assert_eq!(generate_regex(&mut ntc, &re, true).unwrap(), "k", "seed {seed}");
     }
     let mut ntc = NativeTestCase::for_choices(&[], None, None);
     assert_eq!(generate_regex(&mut ntc, &re, true).unwrap(), "k");
@@ -1710,11 +1545,7 @@ fn generate_regex_branch_picks_only_producible_alternatives() {
     let re = CompiledRegex::compile("Ā|b|Ē", alphabet.clone(), UnicodeVersion::LATEST).unwrap();
     for seed in 0..50 {
         let mut ntc = NativeTestCase::new_random(EngineRng::seeded(seed)).unwrap();
-        assert_eq!(
-            generate_regex(&mut ntc, &re, true).unwrap(),
-            "b",
-            "seed {seed}"
-        );
+        assert_eq!(generate_regex(&mut ntc, &re, true).unwrap(), "b", "seed {seed}");
     }
     let re = CompiledRegex::compile("Āx|b|Ēy", alphabet.clone(), UnicodeVersion::LATEST).unwrap();
     let mut ntc = NativeTestCase::for_choices(&[], None, None);
@@ -1793,24 +1624,12 @@ fn producible_op_covers_every_op_kind() {
     );
     assert!(ok(&OpCode::At(AtCode::Boundary)));
     assert!(ok(&OpCode::GroupRef(1)));
-    assert!(ok(&OpCode::AssertNot {
-        direction: 1,
-        p: dead.clone()
-    }));
+    assert!(ok(&OpCode::AssertNot { direction: 1, p: dead.clone() }));
     assert!(!ok(&OpCode::Failure));
     assert!(ok(&OpCode::Branch(vec![dead.clone(), live.clone()])));
     assert!(!ok(&OpCode::Branch(vec![dead.clone()])));
-    assert!(!ok(&OpCode::Subpattern {
-        group: None,
-        add_flags: 0,
-        del_flags: 0,
-        p: dead.clone()
-    }));
-    assert!(ok(&OpCode::GroupRefExists {
-        cond_group: 1,
-        yes: dead.clone(),
-        no: None
-    }));
+    assert!(!ok(&OpCode::Subpattern { group: None, add_flags: 0, del_flags: 0, p: dead.clone() }));
+    assert!(ok(&OpCode::GroupRefExists { cond_group: 1, yes: dead.clone(), no: None }));
     assert!(ok(&OpCode::GroupRefExists {
         cond_group: 1,
         yes: dead.clone(),
@@ -1821,26 +1640,11 @@ fn producible_op_covers_every_op_kind() {
         yes: dead.clone(),
         no: Some(dead.clone())
     }));
-    assert!(!ok(&OpCode::Assert {
-        direction: 1,
-        p: dead.clone()
-    }));
+    assert!(!ok(&OpCode::Assert { direction: 1, p: dead.clone() }));
     assert!(ok(&OpCode::AtomicGroup(live.clone())));
-    assert!(ok(&OpCode::MaxRepeat {
-        min: 0,
-        max: 3,
-        item: dead.clone()
-    }));
-    assert!(!ok(&OpCode::MinRepeat {
-        min: 1,
-        max: 3,
-        item: dead.clone()
-    }));
-    assert!(ok(&OpCode::PossessiveRepeat {
-        min: 1,
-        max: 3,
-        item: live.clone()
-    }));
+    assert!(ok(&OpCode::MaxRepeat { min: 0, max: 3, item: dead.clone() }));
+    assert!(!ok(&OpCode::MinRepeat { min: 1, max: 3, item: dead.clone() }));
+    assert!(ok(&OpCode::PossessiveRepeat { min: 1, max: 3, item: live.clone() }));
     let caches = Caches::default();
     assert!(producible_sub(&SubPattern::new(), 0, &alphabet, &caches).unwrap());
     assert!(!producible_sub(&dead, 0, &alphabet, &caches).unwrap());
@@ -1854,11 +1658,7 @@ fn producible_sub_answers_for_every_subpattern_of_an_alternation() {
     let branch = sub(vec![OpCode::Branch(vec![
         sub(vec![lit('a')]),
         sub(vec![lit('Ā')]),
-        sub(vec![OpCode::MaxRepeat {
-            min: 0,
-            max: 1,
-            item: sub(vec![lit('Ē')]),
-        }]),
+        sub(vec![OpCode::MaxRepeat { min: 0, max: 1, item: sub(vec![lit('Ē')]) }]),
     ])]);
     assert!(producible_sub(&branch, 0, &alphabet, &caches).unwrap());
     let answers = caches.producible.lock();
@@ -1891,24 +1691,12 @@ fn an_alphabet_is_described_by_its_first_ranges() {
     };
     assert_eq!(describe_alphabet(&set(&[])), "of no characters");
     assert_eq!(describe_alphabet(&set(&[('a', 'a')])), "'a'");
+    assert_eq!(describe_alphabet(&set(&[('0', '9'), ('a', 'f')])), "'0'..='9', 'a'..='f'");
     assert_eq!(
-        describe_alphabet(&set(&[('0', '9'), ('a', 'f')])),
-        "'0'..='9', 'a'..='f'"
-    );
-    assert_eq!(
-        describe_alphabet(&set(&[
-            ('0', '9'),
-            ('a', 'f'),
-            ('g', 'g'),
-            ('p', 'q'),
-            ('x', 'z')
-        ])),
+        describe_alphabet(&set(&[('0', '9'), ('a', 'f'), ('g', 'g'), ('p', 'q'), ('x', 'z')])),
         "'0'..='9', 'a'..='f', 'g', 'p'..='q', and 1 more ranges"
     );
-    assert_eq!(
-        describe_alphabet(&IntervalSet::new(vec![(0xD800, 0xD800)]).unwrap()),
-        "U+D800"
-    );
+    assert_eq!(describe_alphabet(&IntervalSet::new(vec![(0xD800, 0xD800)]).unwrap()), "U+D800");
 }
 
 fn text_alphabet(chars: &str) -> StringSpec {
@@ -1926,11 +1714,7 @@ fn text_alphabet(chars: &str) -> StringSpec {
 
 fn codepoint_alphabet(min: u32, max: u32) -> StringSpec {
     StringSpec::text(
-        &TextAlphabet {
-            min_codepoint: min,
-            max_codepoint: max,
-            ..TextAlphabet::default()
-        },
+        &TextAlphabet { min_codepoint: min, max_codepoint: max, ..TextAlphabet::default() },
         0,
         0,
     )
@@ -2000,10 +1784,7 @@ fn a_regex_generator_over_an_alphabet_that_cannot_match_its_pattern_is_rejected(
             else {
                 panic!("{pattern:?} was built");
             };
-            assert!(
-                matches!(err, EngineError::InvalidArgument(_)),
-                "{pattern:?}"
-            );
+            assert!(matches!(err, EngineError::InvalidArgument(_)), "{pattern:?}");
             assert_eq!(err.to_string(), expected, "{pattern:?}");
         }
     }
@@ -2041,10 +1822,7 @@ fn a_regex_generator_whose_pattern_matches_nothing_is_rejected() {
         let Err(err) = StringSpec::regex(pattern, true, None, UnicodeVersion::LATEST) else {
             panic!("{pattern:?} was built");
         };
-        assert!(
-            matches!(err, EngineError::InvalidArgument(_)),
-            "{pattern:?}"
-        );
+        assert!(matches!(err, EngineError::InvalidArgument(_)), "{pattern:?}");
         assert_eq!(
             err.to_string(),
             format!("regex pattern {pattern:?} matches no string the generator can produce")

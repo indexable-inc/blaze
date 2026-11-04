@@ -4,20 +4,23 @@
 use std::hint::black_box;
 
 use base_db::Db;
+use blaze_query::db::AsId;
+use hir_expand::fixture;
 use hir_expand::name::Name;
 use intern::Symbol;
-use blaze_query::db::AsId;
 use syntax::view::{self as ast, AstNode};
-use hir_expand::fixture;
 
 use crate::{
-    AdtId, ImplId, Lookup, ModuleDefId, ModuleId, nameres::facts::impls::module_impls,
-    src::HasSource, test_db::{TestDB, TestDBExt},
+    AdtId, ImplId, Lookup, ModuleDefId, ModuleId,
+    nameres::facts::impls::module_impls,
+    src::HasSource,
+    test_db::{TestDB, TestDBExt},
 };
 
 /// Each impl as written: `Trait for Type`, or `Type` for an inherent one.
 fn render(db: &TestDB, impls: &[ImplId]) -> Vec<String> {
-    let text = |ty: Option<ast::Type<'_>>| ty.map_or_else(String::new, |it| it.syntax().to_string());
+    let text =
+        |ty: Option<ast::Type<'_>>| ty.map_or_else(String::new, |it| it.syntax().to_string());
     impls
         .iter()
         .map(|&it| {
@@ -171,7 +174,10 @@ impl crate::Tr for B {}
     assert_eq!(snapshot(&db, b), b_before);
 
     // An impl added to `a`: `a`'s list reruns and has it, `b`'s is not rerun.
-    db.set_file_text(a_file, "pub struct A;\nimpl A {}\npub fn added() {}\nimpl crate::Tr for A {}\n");
+    db.set_file_text(
+        a_file,
+        "pub struct A;\nimpl A {}\npub fn added() {}\nimpl crate::Tr for A {}\n",
+    );
     assert_eq!((db.module_for_file(a_file), db.module_for_file(b_file)), (a, b));
     let ran = ran_for(&db, || {
         module_impls(&db, a);

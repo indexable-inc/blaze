@@ -68,7 +68,10 @@ fn a_reader_racing_a_merge_reads_each_row_once_and_no_file_goes_from_under_it() 
                         assert_eq!(snapshot.dir(), Path::new("/h"));
                         let files = snapshot.files(spans);
                         for file in files {
-                            assert!(disk.contains(file), "order {order:010b}: {file} was deleted under the reader");
+                            assert!(
+                                disk.contains(file),
+                                "order {order:010b}: {file} was deleted under the reader"
+                            );
                         }
                         let mut rows: Vec<u64> = files
                             .iter()
@@ -76,7 +79,11 @@ fn a_reader_racing_a_merge_reads_each_row_once_and_no_file_goes_from_under_it() 
                             .flat_map(|it| it.first..=it.last)
                             .collect();
                         rows.sort_unstable();
-                        assert_eq!(rows, [1, 2, 3], "order {order:010b}: the reader read {files:?}");
+                        assert_eq!(
+                            rows,
+                            [1, 2, 3],
+                            "order {order:010b}: the reader read {files:?}"
+                        );
                         assert!(files.contains(&"schema.spans.parquet".to_owned()));
                     }
                 }
@@ -101,7 +108,10 @@ fn a_reader_racing_a_merge_reads_each_row_once_and_no_file_goes_from_under_it() 
 #[test]
 fn the_retired_file_round_trips_and_pins_parse() {
     let mut retired = Retired::default();
-    assert!(retired.retire(["1-00000001.spans.parquet".to_owned(), "1-00000002.spans.parquet".to_owned()]));
+    assert!(
+        retired
+            .retire(["1-00000001.spans.parquet".to_owned(), "1-00000002.spans.parquet".to_owned()])
+    );
     assert!(!retired.retire(["1-00000001.spans.parquet".to_owned()]), "a file is retired once");
     assert!(retired.retire(["0-00000003.folded.parquet".to_owned()]));
     let text = retired.encode();

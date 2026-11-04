@@ -18,10 +18,7 @@ fn clone_stream_records_a_clone_node_and_hands_out_a_child() {
     draw(&mut child.lock());
 
     assert_eq!(parent.nodes.len(), 3);
-    assert_eq!(
-        parent.nodes[1].kind(),
-        crate::native::core::ChoiceKind::Clone
-    );
+    assert_eq!(parent.nodes[1].kind(), crate::native::core::ChoiceKind::Clone);
     assert!(!parent.nodes[1].was_forced);
     assert_eq!(child.lock().nodes.len(), 1);
 }
@@ -89,10 +86,7 @@ fn reassemble_embeds_child_records_recursively() {
     };
     let child_nodes = stream.nodes();
     assert_eq!(child_nodes.len(), 2);
-    assert_eq!(
-        child_nodes[1].kind(),
-        crate::native::core::ChoiceKind::Clone
-    );
+    assert_eq!(child_nodes[1].kind(), crate::native::core::ChoiceKind::Clone);
     let Some(inner) = child_nodes[1].data.as_clone() else {
         panic!("nested clone node was not realized");
     };
@@ -145,10 +139,7 @@ fn replay_child_overruns_when_it_draws_past_its_recorded_stream() {
     let replay_child = replay.clone_stream().unwrap();
     let mut c = replay_child.lock();
     draw(&mut c);
-    assert!(matches!(
-        c.draw_integer::<i128>(0, 10),
-        Err(EngineError::Overrun)
-    ));
+    assert!(matches!(c.draw_integer::<i128>(0, 10), Err(EngineError::Overrun)));
     assert_eq!(replay.status(), Some(Status::EarlyStop));
 }
 
@@ -180,10 +171,7 @@ fn family_conclusion_stops_every_stream() {
     let mut parent = NativeTestCase::new_random(EngineRng::seeded(5)).unwrap();
     let child = parent.clone_stream().unwrap();
     child.lock().conclude(Status::Invalid, None);
-    assert!(matches!(
-        parent.draw_integer::<i128>(0, 10),
-        Err(EngineError::InvalidTestCase)
-    ));
+    assert!(matches!(parent.draw_integer::<i128>(0, 10), Err(EngineError::InvalidTestCase)));
     assert_eq!(parent.status(), Some(Status::Invalid));
     assert_eq!(child.lock().status(), Some(Status::Invalid));
 }
@@ -192,10 +180,7 @@ fn family_conclusion_stops_every_stream() {
 fn conclusion_is_write_once_across_streams() {
     let mut parent = NativeTestCase::new_random(EngineRng::seeded(5)).unwrap();
     let child = parent.clone_stream().unwrap();
-    parent.conclude(
-        Status::Interesting,
-        Some(InterestingOrigin("first".to_string())),
-    );
+    parent.conclude(Status::Interesting, Some(InterestingOrigin("first".to_string())));
     child.lock().conclude(Status::Valid, None);
     assert_eq!(parent.status(), Some(Status::Interesting));
     let (_, origin) = parent.family().conclusion().unwrap();
@@ -210,10 +195,7 @@ fn family_budget_caps_total_draws_across_streams() {
     let child = parent.clone_stream().unwrap();
     let mut c = child.lock();
     draw(&mut c);
-    assert!(matches!(
-        c.draw_integer::<i128>(0, 10),
-        Err(EngineError::Overrun)
-    ));
+    assert!(matches!(c.draw_integer::<i128>(0, 10), Err(EngineError::Overrun)));
     assert_eq!(parent.status(), Some(Status::EarlyStop));
 }
 
@@ -265,10 +247,7 @@ fn clone_stream_fails_after_the_family_has_concluded() {
 fn clone_node_consumes_a_slot_in_the_stream_budget() {
     let mut parent = NativeTestCase::for_probe(&[], EngineRng::seeded(13), 1).unwrap();
     parent.clone_stream().unwrap();
-    assert!(matches!(
-        parent.draw_integer::<i128>(0, 10),
-        Err(EngineError::Overrun)
-    ));
+    assert!(matches!(parent.draw_integer::<i128>(0, 10), Err(EngineError::Overrun)));
 }
 
 #[test]

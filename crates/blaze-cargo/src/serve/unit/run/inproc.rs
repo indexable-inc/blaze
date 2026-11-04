@@ -16,13 +16,15 @@ use blaze_ids::ContentId;
 use blaze_inproc::frame::{Frame, Kind, kinds};
 use blaze_inproc::host::{self, Host, Program, Session, Started};
 use blaze_inproc::{CodeMemory, CodeRange, Format};
-use blaze_units::stdlib::DEV_RUNTIME;
 use blaze_link::{DevRun, Image, Staged};
 use blaze_live::patch::{Answer, Message, MessageView};
 use blaze_units::schema::Mode;
+use blaze_units::stdlib::DEV_RUNTIME;
 
 use crate::serve::unit::{Job, codegen, graph::flag};
-use blaze_live::patch::ask::{self, ANSWER, ANSWERED, NO_PATCH, NO_TIERS, PATCH, PATCH_ASK, TIERS_ASK};
+use blaze_live::patch::ask::{
+    self, ANSWER, ANSWERED, NO_PATCH, NO_TIERS, PATCH, PATCH_ASK, TIERS_ASK,
+};
 use crossbeam_queue::SegQueue;
 use parking_lot::{Mutex, MutexGuard};
 
@@ -59,7 +61,10 @@ const DAEMON_SIDE: &str = "blaze-inproc";
 /// `blaze-live` depend on), which the load then gives no second one.
 fn is_runtime(name: &str) -> bool {
     name.len() == DEV_RUNTIME.len()
-        && name.bytes().zip(DEV_RUNTIME.bytes()).all(|(it, want)| it == want || (it == b'-' && want == b'_'))
+        && name
+            .bytes()
+            .zip(DEV_RUNTIME.bytes())
+            .all(|(it, want)| it == want || (it == b'-' && want == b'_'))
 }
 
 /// Whether `unit`, built as `policy` says (its own profile, before its mode is chosen), links
@@ -105,7 +110,9 @@ pub(crate) fn not_in_process(job: &Job, unit: usize) -> Result<Option<String>, S
     let host = &job.input.config.host;
     if triple != *host {
         // alloc: once per unit asked, its reason
-        return Ok(Some(format!("it is built for `{triple}`, and a code memory runs only this machine's own target, `{host}`")));
+        return Ok(Some(format!(
+            "it is built for `{triple}`, and a code memory runs only this machine's own target, `{host}`"
+        )));
     }
     // The runtime's own crates' library tests (`blaze-inproc-rt`'s, `blaze-inproc`'s) make
     // and attach their own hosts and code memories: run attached, they are not yet checked
@@ -129,7 +136,9 @@ pub(crate) fn not_in_process(job: &Job, unit: usize) -> Result<Option<String>, S
         let name = &job.package(dep).map_err(|it| it.what)?.name;
         if name == DAEMON_SIDE && dep.features.iter().any(|it| it == "host") {
             // alloc: once per unit asked, its reason
-            return Ok(Some(format!("it links `{DAEMON_SIDE}` with its daemon side (feature `host`), which no program runs as")));
+            return Ok(Some(format!(
+                "it links `{DAEMON_SIDE}` with its daemon side (feature `host`), which no program runs as"
+            )));
         }
         runtime |= is_runtime(name);
     }
@@ -168,7 +177,8 @@ impl DevRuns {
             return Ok(it.clone());
         }
         let made = Arc::new(
-            Host::new(&self.dir).map_err(|it| format!("listening for dev runs in {}: {it}", self.dir.display()))?,
+            Host::new(&self.dir)
+                .map_err(|it| format!("listening for dev runs in {}: {it}", self.dir.display()))?,
         );
         *host = Some(made.clone());
         Ok(made)
@@ -180,7 +190,11 @@ impl DevRuns {
     /// arena), which runs as linked. A dev executable this daemon did not link (an earlier
     /// daemon did, and this one's builds found it done) is an error naming it, never a run of
     /// its file that edits would not reach.
-    pub(crate) fn launch(&self, path: &str, pid: u32) -> Result<Option<Vec<(String, String)>>, String> {
+    pub(crate) fn launch(
+        &self,
+        path: &str,
+        pid: u32,
+    ) -> Result<Option<Vec<(String, String)>>, String> {
         let _span = tracing::info_span!(target: "blaze", "dev run launch", path, pid).entered();
         // clone: a count, once per launch, so no guard of the table is held while it writes
         let loaded = self.programs.pin().get(path).cloned();
@@ -210,8 +224,11 @@ impl DevRuns {
         let name = path.rsplit('/').next().unwrap_or(path);
         let programs = self.programs.pin();
         // alloc: error path, the paths held under the same file name
-        let mut held: Vec<&str> =
-            programs.keys().map(String::as_str).filter(|it| it.rsplit('/').next() == Some(name)).collect();
+        let mut held: Vec<&str> = programs
+            .keys()
+            .map(String::as_str)
+            .filter(|it| it.rsplit('/').next() == Some(name))
+            .collect();
         held.sort_unstable();
         match held.is_empty() {
             true => format!(
@@ -242,7 +259,8 @@ fn reserves(format: Format, path: &std::path::Path) -> Result<bool, String> {
     headers.truncate(read);
     let Some(len) = blaze_inproc::image::headers_len(format, &headers) else { return Ok(false) };
     if len > headers.len() as u64 {
-        let more = usize::try_from(len).map_err(|_| format!("{}'s headers say they are {len:#x} bytes", path.display()))?;
+        let more = usize::try_from(len)
+            .map_err(|_| format!("{}'s headers say they are {len:#x} bytes", path.display()))?;
         headers.resize(more, 0);
         file.read_exact(&mut headers[read..]).map_err(what)?;
     }
@@ -271,7 +289,10 @@ pub(crate) enum Told {
 /// `deps`, cargo's new layout; a binary's `target/debug/foo` of `deps/foo-0123`): the program
 /// is held under both, so a run of either finds the memory this link committed into. Gives
 /// the file's bytes, for the store, and what the runs were told.
-#[expect(clippy::too_many_arguments, reason = "the link's image, its program and where it runs from, each its own")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the link's image, its program and where it runs from, each its own"
+)]
 pub(crate) fn commit(
     runs: &DevRuns,
     path: &str,
@@ -314,7 +335,12 @@ pub(crate) fn commit(
 
 /// `loaded` held under `path` and `runs_from`, the paths its runs start it from; the other
 /// programs it replaced there, each once.
-fn hold(runs: &DevRuns, path: &str, runs_from: Option<&str>, loaded: &Arc<Loaded>) -> Vec<Arc<Loaded>> {
+fn hold(
+    runs: &DevRuns,
+    path: &str,
+    runs_from: Option<&str>,
+    loaded: &Arc<Loaded>,
+) -> Vec<Arc<Loaded>> {
     let programs = runs.programs.pin();
     let mut replaced: Vec<Arc<Loaded>> = Vec::new(); // alloc: none unless a program is replaced
     for at in std::iter::once(path).chain(runs_from.filter(|it| *it != path)) {
@@ -362,15 +388,27 @@ pub(crate) struct Loaded {
 /// [`dev_run`]'s for the same link. A later full link of the image commits a message that
 /// tells the runs of its old memory to start again; it is the caller's to send them
 /// ([`Loaded::restart`]), so it is not kept here.
-pub(crate) fn load(host: &Arc<Host>, name: &str, image: &mut Image, staged: Staged, cells: u64) -> Result<(Loaded, Vec<u8>), String> {
-    let format = Format::host().ok_or("blaze runs no process in its code memory on this platform")?;
+pub(crate) fn load(
+    host: &Arc<Host>,
+    name: &str,
+    image: &mut Image,
+    staged: Staged,
+    cells: u64,
+) -> Result<(Loaded, Vec<u8>), String> {
+    let format =
+        Format::host().ok_or("blaze runs no process in its code memory on this platform")?;
     let len = staged.len();
     if len > IMAGE {
-        return Err(format!("the dev executable `{name}` is {len:#x} bytes, more than its code memory's {IMAGE:#x}"));
+        return Err(format!(
+            "the dev executable `{name}` is {len:#x} bytes, more than its code memory's {IMAGE:#x}"
+        ));
     }
     let generation = staged.generation();
-    let mut memory = CodeMemory::with_cells(name, IMAGE, ARENA, cells).map_err(|it| it.to_string())?;
-    image.commit_into(staged, &mut memory).map_err(|it| format!("committing `{name}` into its code memory: {it}"))?;
+    let mut memory =
+        CodeMemory::with_cells(name, IMAGE, ARENA, cells).map_err(|it| it.to_string())?;
+    image
+        .commit_into(staged, &mut memory)
+        .map_err(|it| format!("committing `{name}` into its code memory: {it}"))?;
     memory.lay_out(format).map_err(|it| format!("laying `{name}`'s code memory out: {it}"))?;
     // alloc: once per dev executable linked, the bytes the store keeps.
     let bytes = memory.bytes(CodeRange { offset: 0, len }).map_err(|it| it.to_string())?.to_vec();
@@ -378,7 +416,8 @@ pub(crate) fn load(host: &Arc<Host>, name: &str, image: &mut Image, staged: Stag
     let patch: Arc<Mutex<Patch>> = Arc::new(Mutex::new(Patch { generation, message: None }));
     let failures: Failures = Arc::default();
     let (sessions, started) = crossbeam_channel::unbounded();
-    let program = Arc::new(Program::new(host.clone(), Arc::new(Mutex::new(memory)), file, sessions));
+    let program =
+        Arc::new(Program::new(host.clone(), Arc::new(Mutex::new(memory)), file, sessions));
     let launched: Launched = Arc::default();
     let served = Served {
         patch: patch.clone(),
@@ -391,7 +430,17 @@ pub(crate) fn load(host: &Arc<Host>, name: &str, image: &mut Image, staged: Stag
         .spawn(move || sessions_of(started, &served))
         .map_err(|it| format!("starting the thread that serves `{name}`'s runs: {it}"))?;
     // alloc: once per dev executable laid out whole, its name
-    Ok((Loaded { program, patch, failures, launched, lineage: image.lineage(), name: name.to_owned() }, bytes))
+    Ok((
+        Loaded {
+            program,
+            patch,
+            failures,
+            launched,
+            lineage: image.lineage(),
+            name: name.to_owned(),
+        },
+        bytes,
+    ))
 }
 
 /// The runs a `blaze run` started by process ID ([`Loaded::launch`]): each one's start, which
@@ -422,12 +471,20 @@ impl Loaded {
     /// signature or layout, `codegen::changed_assumptions`): they are told
     /// to start again instead, for that reason, unless the linker's own message already is a
     /// restart.
-    pub(crate) fn patch(&self, image: &mut Image, staged: Staged, refused: Option<&str>) -> Result<(Vec<u8>, Told), String> {
+    pub(crate) fn patch(
+        &self,
+        image: &mut Image,
+        staged: Staged,
+        refused: Option<&str>,
+    ) -> Result<(Vec<u8>, Told), String> {
         let name = &self.name;
-        let format = Format::host().ok_or("blaze runs no process in its code memory on this platform")?;
+        let format =
+            Format::host().ok_or("blaze runs no process in its code memory on this platform")?;
         let len = staged.len();
         if len > IMAGE {
-            return Err(format!("the dev executable `{name}` is {len:#x} bytes, more than its code memory's {IMAGE:#x}"));
+            return Err(format!(
+                "the dev executable `{name}` is {len:#x} bytes, more than its code memory's {IMAGE:#x}"
+            ));
         }
         let mut memory = lock(self.program.memory());
         let message = image
@@ -436,24 +493,39 @@ impl Loaded {
         let generation = image.generation();
         let message = match (message, refused) {
             // The linker's own restart says what of the link it could not take: kept.
-            (Some(message), _) if matches!(Message::view(&message), Ok(MessageView::Restart { .. })) => Some(message),
+            (Some(message), _)
+                if matches!(Message::view(&message), Ok(MessageView::Restart { .. })) =>
+            {
+                Some(message)
+            }
             // alloc: once per refused patch, its reason
-            (_, Some(why)) => Some(Message::Restart { id: self.lineage, generation, why: why.to_owned() }.encode()),
+            (_, Some(why)) => Some(
+                Message::Restart { id: self.lineage, generation, why: why.to_owned() }.encode(),
+            ),
             (message, None) => message,
         };
-        memory.lay_out(format).map_err(|it| format!("laying `{name}`'s code memory out after a patch: {it}"))?;
+        memory
+            .lay_out(format)
+            .map_err(|it| format!("laying `{name}`'s code memory out after a patch: {it}"))?;
         // alloc: once per patch, the bytes the store keeps.
-        let bytes = memory.bytes(CodeRange { offset: 0, len }).map_err(|it| it.to_string())?.to_vec();
+        let bytes =
+            memory.bytes(CodeRange { offset: 0, len }).map_err(|it| it.to_string())?.to_vec();
         let file = host::Image { key: ContentId::of(DOMAIN, &bytes).0, len, store: None };
         self.program.relaid(&memory, file).map_err(|it| format!("`{name}`: {it}"))?;
         let told = match &message {
             None => Told::Nothing,
             Some(message) => match Message::view(message) {
                 // alloc: once per restart, its reason
-                Ok(MessageView::Restart { why, .. }) if self.running() => Told::Restart { why: why.to_owned() },
+                Ok(MessageView::Restart { why, .. }) if self.running() => {
+                    Told::Restart { why: why.to_owned() }
+                }
                 Ok(MessageView::Restart { .. }) => Told::Nothing,
                 Ok(_) => Told::Patched { generation },
-                Err(why) => return Err(format!("the linker's message for `{name}`'s generation {generation}: {why}")),
+                Err(why) => {
+                    return Err(format!(
+                        "the linker's message for `{name}`'s generation {generation}: {why}"
+                    ));
+                }
             },
         };
         if let Some(message) = message {
@@ -475,7 +547,8 @@ impl Loaded {
         let mut patch = lock(&self.patch);
         let generation = patch.generation + 1;
         // alloc: once per restart, its reason
-        let message = Message::Restart { id: self.lineage, generation, why: why.to_owned() }.encode();
+        let message =
+            Message::Restart { id: self.lineage, generation, why: why.to_owned() }.encode();
         *patch = Patch { generation, message: Some(Arc::from(message)) };
         memory.announce(generation);
     }
@@ -483,7 +556,11 @@ impl Loaded {
     /// The command that runs `command`'s program from the memory: the executable written at
     /// `command.program` when it is not there yet, and the start hook's variable set. `forks`:
     /// the process forks children that run the program (a test fork server).
-    pub(crate) fn command(&self, command: Command, forks: bool) -> Result<(Command, Started), String> {
+    pub(crate) fn command(
+        &self,
+        command: Command,
+        forks: bool,
+    ) -> Result<(Command, Started), String> {
         self.program.command(command, forks).map_err(|it| it.to_string())
     }
 
@@ -531,27 +608,35 @@ impl Loaded {
         // alloc: the failures, few, once a run
         std::iter::from_fn(|| self.failures.pop()).collect()
     }
-
 }
 
 /// Hands each started run's session to a thread that serves its asks, until the program is
 /// dropped; a start that failed is kept as a failure. A run [`Loaded::launch`] started is
 /// told to the program as exited once its channel hangs up, so no fence waits for it.
-fn sessions_of(started: crossbeam_channel::Receiver<Result<Session, blaze_inproc::Error>>, served: &Served) {
+fn sessions_of(
+    started: crossbeam_channel::Receiver<Result<Session, blaze_inproc::Error>>,
+    served: &Served,
+) {
     for session in started {
         match session {
             Ok(session) => {
                 let pid = session.pid;
                 // clone: three counts and a weak one, once per run started
-                let (patch, failures, launched, program) =
-                    (served.patch.clone(), served.failures.clone(), served.launched.clone(), served.program.clone());
-                let spawned = std::thread::Builder::new().name("blaze dev run asks".to_owned()).spawn(move || {
-                    serve(session, &patch, &failures);
-                    let started = launched.pin().remove(&pid).copied();
-                    if let (Some(started), Some(program)) = (started, program.upgrade()) {
-                        program.exited(started);
-                    }
-                });
+                let (patch, failures, launched, program) = (
+                    served.patch.clone(),
+                    served.failures.clone(),
+                    served.launched.clone(),
+                    served.program.clone(),
+                );
+                let spawned = std::thread::Builder::new()
+                    .name("blaze dev run asks".to_owned())
+                    .spawn(move || {
+                        serve(session, &patch, &failures);
+                        let started = launched.pin().remove(&pid).copied();
+                        if let (Some(started), Some(program)) = (started, program.upgrade()) {
+                            program.exited(started);
+                        }
+                    });
                 if let Err(error) = spawned {
                     served.failures.push(format!("serving process {pid}'s asks: {error}"));
                 }
@@ -600,8 +685,9 @@ fn answer(
             let (at, offset) = ask::read_patch_ask(frame.body)?;
             match &patch.message {
                 Some(message) if patch.generation > at => {
-                    ask::piece_into(patch.generation, message, offset, body)
-                        .map_err(|why| format!("the patch of generation {}: {why}", patch.generation))?;
+                    ask::piece_into(patch.generation, message, offset, body).map_err(|why| {
+                        format!("the patch of generation {}: {why}", patch.generation)
+                    })?;
                     Ok(PATCH)
                 }
                 _ => Ok(NO_PATCH),
@@ -610,12 +696,11 @@ fn answer(
         ANSWER => {
             match Answer::decode(frame.body).map_err(|why| format!("an answer: {why}"))? {
                 Answer::Applied { .. } => {}
-                Answer::RolledBack { generation, to, why } => {
-                    failures.push(format!("process {pid} rolled generation {generation} back to {to}: {why}"))
-                }
-                Answer::Declined { generation, why } => {
-                    failures.push(format!("process {pid} did not apply generation {generation}: {why}"))
-                }
+                Answer::RolledBack { generation, to, why } => failures.push(format!(
+                    "process {pid} rolled generation {generation} back to {to}: {why}"
+                )),
+                Answer::Declined { generation, why } => failures
+                    .push(format!("process {pid} did not apply generation {generation}: {why}")),
             }
             Ok(ANSWERED)
         }

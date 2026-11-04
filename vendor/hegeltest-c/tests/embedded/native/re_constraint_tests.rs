@@ -37,14 +37,8 @@ fn a_search_constraint_accepts_a_string_the_pattern_matches_anywhere_in() {
 fn the_simplest_string_is_set_once() {
     let c = constraint("a+", true);
     assert_eq!(c.simplest(), None);
-    assert_eq!(
-        c.simplest_or_init(|| Ok::<_, ()>(cps("a"))).unwrap(),
-        cps("a")
-    );
-    assert_eq!(
-        c.simplest_or_init(|| Ok::<_, ()>(cps("aa"))).unwrap(),
-        cps("a")
-    );
+    assert_eq!(c.simplest_or_init(|| Ok::<_, ()>(cps("a"))).unwrap(), cps("a"));
+    assert_eq!(c.simplest_or_init(|| Ok::<_, ()>(cps("aa"))).unwrap(), cps("a"));
     assert_eq!(c.simplest(), Some(cps("a").as_slice()));
 }
 
@@ -62,10 +56,7 @@ fn identity_follows_the_pattern_its_flags_the_match_mode_and_the_alphabet() {
     assert_ne!(whole.identity(), constraint("a+", false).identity());
     assert_ne!(hash_of(&whole), hash_of(&constraint("a+", false)));
     assert_ne!(whole, constraint("b+", true));
-    assert_ne!(
-        whole,
-        RegexConstraint::new("a+", parse_pattern("(?i)a+", 0).unwrap(), true, None)
-    );
+    assert_ne!(whole, RegexConstraint::new("a+", parse_pattern("(?i)a+", 0).unwrap(), true, None));
     let letters = IntervalSet::new(vec![(u32::from('a'), u32::from('z'))]).unwrap();
     assert_ne!(
         whole,
@@ -129,9 +120,7 @@ fn a_string_the_generator_drew_is_accepted_without_a_check() {
 
 #[test]
 fn the_program_and_the_matcher_agree_on_what_a_constraint_accepts() {
-    let texts = [
-        "", "a", "b", "ab", "ba", "aab", "bba", "abab", "baba", "xx", "aaa", "aa",
-    ];
+    let texts = ["", "a", "b", "ab", "ba", "aab", "bba", "abab", "baba", "xx", "aaa", "aa"];
     for pattern in [
         "(?:|a)*",
         "(?:a|)*",

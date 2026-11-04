@@ -199,9 +199,7 @@ fn signature_types<'t>(
     let foreign = |node: ast::Node<'t>| {
         node.parent().is_some_and(|it| ast::ExternItemList::can_cast(it.kind()))
     };
-    let exported = || {
-        cx.conf().bool("avoid-breaking-exported-api", true) && cx.is_exported(node)
-    };
+    let exported = || cx.conf().bool("avoid-breaking-exported-api", true) && cx.is_exported(node);
     if let Some(function) = ast::Fn::cast(node) {
         if foreign(node) {
             return None;
@@ -228,8 +226,10 @@ fn signature_types<'t>(
         let owner = owner()?;
         if matches!(owner, Owner::Inherent | Owner::TraitImpl) {
             // `check_impl_item`: the context has no `is_exported`.
-            return (!types.is_empty())
-                .then(|| Context { is_in_trait_impl: owner == Owner::TraitImpl, ..Context::default() });
+            return (!types.is_empty()).then(|| Context {
+                is_in_trait_impl: owner == Owner::TraitImpl,
+                ..Context::default()
+            });
         }
     } else if let Some(statik) = ast::Static::cast(node) {
         if foreign(node) {
@@ -266,7 +266,8 @@ impl<'q, 't> Pass<'_, 'q, 't> {
             return;
         }
         if !context.is_nested_call {
-            let threshold = u64::try_from(cx.conf().int("type-complexity-threshold", 250)).expect("a count, checked as the configuration loads");
+            let threshold = u64::try_from(cx.conf().int("type-complexity-threshold", 250))
+                .expect("a count, checked as the configuration loads");
             if complexity(ty, 1) > threshold {
                 return;
             }
@@ -279,9 +280,12 @@ impl<'q, 't> Pass<'_, 'q, 't> {
                 }
             }
             ast::Type::PathType(path) => {
-                let allowed = !(context.is_exported
-                    && cx.conf().bool("avoid-breaking-exported-api", true));
-                if allowed && let Some(outer) = std_of(cx, ty) && self.triggered(path, outer) {
+                let allowed =
+                    !(context.is_exported && cx.conf().bool("avoid-breaking-exported-api", true));
+                if allowed
+                    && let Some(outer) = std_of(cx, ty)
+                    && self.triggered(path, outer)
+                {
                     return;
                 }
                 context.is_nested_call = true;
@@ -368,7 +372,9 @@ fn box_collection<'t>(cx: &mut Cx<'_, 't>, path: ast::PathType<'t>, outer: Std) 
         span,
         format!("you seem to be trying to use `Box<{content}>`. Consider using just `{content}`"),
     )
-    .help(format!("`{content}` is already on the heap, `Box<{content}>` makes an extra allocation"));
+    .help(format!(
+        "`{content}` is already on the heap, `Box<{content}>` makes an extra allocation"
+    ));
     true
 }
 
@@ -412,7 +418,9 @@ fn borrowed_box<'t>(cx: &Cx<'_, 't>, reference: ast::RefType<'t>) -> bool {
 /// clippy's `is_any_trait`: `dyn Any`, its first bound `core::any::Any`.
 fn is_any_trait<'t>(cx: &Cx<'_, 't>, ty: ast::Type<'t>) -> bool {
     let ast::Type::DynTraitType(dyn_) = ty else { return false };
-    let Some(bound) = dyn_.type_bound_list().and_then(|it| it.bounds().next()) else { return false };
+    let Some(bound) = dyn_.type_bound_list().and_then(|it| it.bounds().next()) else {
+        return false;
+    };
     let Some(ast::Type::PathType(path)) = bound.ty() else { return false };
     let Some(path) = path.path() else { return false };
     let db = cx.db();
@@ -475,7 +483,9 @@ fn complexity(ty: ast::Type<'_>, nest: u64) -> u64 {
         ast::Type::RefType(it) => score += inner(it.ty()),
         ast::Type::SliceType(it) => score += inner(it.ty()),
         ast::Type::ArrayType(it) => score += inner(it.ty()),
-        ast::Type::TupleType(it) => score += it.fields().map(|it| complexity(it, nest)).sum::<u64>(),
+        ast::Type::TupleType(it) => {
+            score += it.fields().map(|it| complexity(it, nest)).sum::<u64>()
+        }
         ast::Type::PathType(it) => score += it.path().map_or(0, |it| path_complexity(it, nest)),
         ast::Type::FnPtrType(it) => {
             if let Some(params) = it.param_list() {
@@ -535,7 +545,8 @@ fn path_complexity(path: ast::Path<'_>, nest: u64) -> u64 {
                     .filter_map(|it| it.ty())
                     .map(|it| complexity(it, nest + 1))
                     .sum::<u64>();
-                score += segment.ret_type().and_then(|it| it.ty()).map_or(0, |it| complexity(it, nest));
+                score +=
+                    segment.ret_type().and_then(|it| it.ty()).map_or(0, |it| complexity(it, nest));
             }
         }
         at = path.qualifier();

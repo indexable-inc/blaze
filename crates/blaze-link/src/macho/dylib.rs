@@ -157,7 +157,9 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
                 .and_then(|(offset, size)| bytes.get(offset..offset.checked_add(size)?))
                 .ok_or_else(|| {
                     // alloc: error path
-                    format!("{command}'s export trie ({size} bytes at {offset:#x}) is outside the file")
+                    format!(
+                        "{command}'s export trie ({size} bytes at {offset:#x}) is outside the file"
+                    )
                 })?;
             let base = base.ok_or("an export trie, but no segment maps the Mach-O header")?;
             // The trie shares prefixes, so its names take more bytes than it does: start at
@@ -169,11 +171,13 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
         }
         None => {
             let symtab = symtab.ok_or("neither an export trie nor a symbol table")?;
-            let table: SymbolTable<'_, Header, &[u8]> = symtab.symbols(endian, bytes).map_err(err)?;
+            let table: SymbolTable<'_, Header, &[u8]> =
+                symtab.symbols(endian, bytes).map_err(err)?;
             // The string table holds every name, each of which loses its `_` (or, rarely, gains a
             // `\x01`). `symbols` checks only the nlists: a name read past the file's end is an
             // error, so only the table's bytes inside the file can be names.
-            let (stroff, strsize) = (symtab.stroff.get(endian) as usize, symtab.strsize.get(endian) as usize);
+            let (stroff, strsize) =
+                (symtab.stroff.get(endian) as usize, symtab.strsize.get(endian) as usize);
             names = Names::with_capacity(strsize.min(bytes.len().saturating_sub(stroff)));
             symtab_exports(&table, endian, &sections, &mut names)?
         }
@@ -220,7 +224,9 @@ impl<'a> Sections<'a> {
         let mut sorted = SectionList::new();
         sorted.extend(all.iter().copied().filter(|it| it.size != 0));
         radix::sort_copy_by_key(&mut sorted, |it| it.addr);
-        let disjoint = sorted.windows(2).all(|it| it[0].addr.checked_add(it[0].size).is_some_and(|end| end <= it[1].addr));
+        let disjoint = sorted
+            .windows(2)
+            .all(|it| it[0].addr.checked_add(it[0].size).is_some_and(|end| end <= it[1].addr));
         Sections { all, sorted: disjoint.then_some(sorted) }
     }
 
@@ -291,7 +297,12 @@ fn trie_exports(
             let (kind, weak) = export(info, &classify)
                 // alloc: error path
                 .map_err(|what| format!("node {node:#x}: {what}"))?;
-            out.push(SharedSymbol { name: super::push_core_name(names, &name)?, version: None, kind, weak });
+            out.push(SharedSymbol {
+                name: super::push_core_name(names, &name)?,
+                version: None,
+                kind,
+                weak,
+            });
         }
         // alloc: error path
         let count = r.u8().map_err(|_| format!("node {node:#x} runs past the end"))?;
@@ -305,7 +316,12 @@ fn trie_exports(
                 .filter(|&it| it < data.len())
                 // alloc: error path
                 .ok_or_else(|| format!("node {node:#x} has a child at {child:#x}, out of range"))?;
-            stack.push(Edge { label: label as u32, len: len as u32, child: child as u32, parent: name.len() as u32 });
+            stack.push(Edge {
+                label: label as u32,
+                len: len as u32,
+                child: child as u32,
+                parent: name.len() as u32,
+            });
         }
         stack[first..].reverse();
         let Some(edge) = stack.pop() else { break };
@@ -329,7 +345,11 @@ struct Owned {
 /// The walk as it was before the one-buffer walk: a stack of owned prefixes, a hash set
 /// of the nodes seen, the model `trie_exports` is checked against.
 #[cfg(any(test, feature = "fuzz"))]
-fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Result<Vec<Owned>, String> {
+fn reference_trie_exports(
+    data: &[u8],
+    base: u64,
+    sections: &[Section],
+) -> Result<Vec<Owned>, String> {
     let classify = |offset: u64| -> SymbolKind {
         let addr = base.wrapping_add(offset);
         match sections.iter().find(|it| it.contains(addr)) {
@@ -356,7 +376,8 @@ fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Resul
                 // alloc: the reference walk's error
                 .ok_or_else(|| format!("node {node:#x}'s export info runs past the end"))?;
             // alloc: the reference walk's error
-            let (kind, weak) = export(info, &classify).map_err(|what| format!("node {node:#x}: {what}"))?;
+            let (kind, weak) =
+                export(info, &classify).map_err(|what| format!("node {node:#x}: {what}"))?;
             out.push(Owned { name: super::core_name(&prefix)?, kind, weak });
         }
         // alloc: the reference walk's error
@@ -419,7 +440,10 @@ pub(crate) fn trie_differential(trie: &[u8]) -> Result<bool, String> {
 }
 
 /// What a terminal node's export info says: the symbol's kind and whether it is weak.
-fn export(info: &[u8], classify: &impl Fn(u64) -> SymbolKind) -> Result<(SymbolKind, bool), String> {
+fn export(
+    info: &[u8],
+    classify: &impl Fn(u64) -> SymbolKind,
+) -> Result<(SymbolKind, bool), String> {
     let known = macho::EXPORT_SYMBOL_FLAGS_KIND_MASK
         | (macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
             | macho::EXPORT_SYMBOL_FLAGS_REEXPORT
@@ -526,7 +550,13 @@ mod tests {
         out.extend_from_slice(&field);
     }
 
-    fn segment(name: &str, vmaddr: u64, fileoff: u64, filesize: u64, sections: &[(&str, u64, u64, u32)]) -> Vec<u8> {
+    fn segment(
+        name: &str,
+        vmaddr: u64,
+        fileoff: u64,
+        filesize: u64,
+        sections: &[(&str, u64, u64, u32)],
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.put_u32(macho::LC_SEGMENT_64.0);
         out.put_u32(72 + 80 * sections.len() as u32);
@@ -616,7 +646,10 @@ mod tests {
                 0x4000,
                 0x4000,
                 0,
-                &[("__data", 0x4000, 0x100, 0), ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES.to_flags().0)],
+                &[
+                    ("__data", 0x4000, 0x100, 0),
+                    ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES.to_flags().0),
+                ],
             ),
         ]
     }
@@ -668,7 +701,8 @@ mod tests {
                 let len = node.terminal.len() as u64;
                 at += blaze_format::leb::len_u64(len) as u64 + len + 1;
                 for (label, child) in children {
-                    at += label.len() as u64 + 1 + blaze_format::leb::len_u64(offsets[*child]) as u64;
+                    at +=
+                        label.len() as u64 + 1 + blaze_format::leb::len_u64(offsets[*child]) as u64;
                 }
             }
             if next == offsets {
@@ -724,7 +758,11 @@ mod tests {
     /// Every export's name is one push of the arena, back to back: the arena holds each name
     /// once and nothing else, and the library has no versions.
     fn arena_is_exact(shared: &Shared) {
-        let bytes: usize = shared.symbols.iter().map(|it| shared.names.get(it.name).expect("in the arena").len()).sum();
+        let bytes: usize = shared
+            .symbols
+            .iter()
+            .map(|it| shared.names.get(it.name).expect("in the arena").len())
+            .sum();
         assert_eq!(shared.names.bytes(), bytes);
         assert!(shared.versions.is_empty());
     }
@@ -746,22 +784,37 @@ mod tests {
     fn sample_trie() -> Vec<u8> {
         let foo = Node {
             terminal: info(0, &[0x1010]),
-            children: vec![("bar", leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0, &[0x4010])))],
+            children: vec![(
+                "bar",
+                leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0, &[0x4010])),
+            )],
         };
         let fo = Node {
             terminal: Vec::new(),
             children: vec![
                 ("o", foo),
                 ("b", leaf(reexport(0, 1, "_bob"))),
-                ("_tls", leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0), &[0x4100]))),
+                (
+                    "_tls",
+                    leaf(info(
+                        u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0),
+                        &[0x4100],
+                    )),
+                ),
             ],
         };
         let underscore = Node {
             terminal: Vec::new(),
             children: vec![
                 ("fo", fo),
-                ("abs", leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.0), &[0x1234]))),
-                ("res", leaf(info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.0, &[0x1020, 0x1030]))),
+                (
+                    "abs",
+                    leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.0), &[0x1234])),
+                ),
+                (
+                    "res",
+                    leaf(info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.0, &[0x1020, 0x1030])),
+                ),
                 ("same", leaf(reexport(0, 1, ""))),
             ],
         };
@@ -809,7 +862,13 @@ mod tests {
         );
         let shared = read("libfoo.dylib", &bytes, Arch::X86_64).unwrap();
         assert_eq!(shared.symbols.len(), 7);
-        assert_eq!(exports(&shared), exports(&read("libfoo.dylib", &with_trie(macho::CPU_TYPE_X86_64.0, &trie), Arch::X86_64).unwrap()));
+        assert_eq!(
+            exports(&shared),
+            exports(
+                &read("libfoo.dylib", &with_trie(macho::CPU_TYPE_X86_64.0, &trie), Arch::X86_64)
+                    .unwrap()
+            )
+        );
         assert!(shared.inputs.is_empty());
     }
 
@@ -943,7 +1002,9 @@ mod tests {
         let children = if depth > 4 { 0 } else { rng.below(4) };
         Node {
             terminal: random_info(rng),
-            children: (0..children).map(|_| (LABELS[rng.below(LABELS.len())], random_node(rng, depth + 1))).collect(),
+            children: (0..children)
+                .map(|_| (LABELS[rng.below(LABELS.len())], random_node(rng, depth + 1)))
+                .collect(),
         }
     }
 
@@ -963,7 +1024,11 @@ mod tests {
                 2 => trie.truncate(rng.below(trie.len() + 1)),
                 _ => {}
             }
-            assert_eq!(walk(&trie, 0, &sections), reference_trie_exports(&trie, 0, &sections), "{trie:x?}");
+            assert_eq!(
+                walk(&trie, 0, &sections),
+                reference_trie_exports(&trie, 0, &sections),
+                "{trie:x?}"
+            );
         }
         let trie = sample_trie();
         assert_eq!(walk(&trie, 0, &sections), reference_trie_exports(&trie, 0, &sections));
@@ -984,14 +1049,21 @@ mod tests {
                 .collect();
             let sections = Sections::new(&all);
             for addr in (0..0x120).step_by(8) {
-                let linear = all.iter().find(|it| it.contains(addr)).map(|it| (it.addr, it.size, it.flags));
+                let linear =
+                    all.iter().find(|it| it.contains(addr)).map(|it| (it.addr, it.size, it.flags));
                 let found = sections.find(addr).map(|it| (it.addr, it.size, it.flags));
                 assert_eq!(found, linear, "{addr:#x}");
             }
         }
-        let overlapping = [Section { addr: 0x10, size: 0x20, flags: 0 }, Section { addr: 0, size: 0x20, flags: 0 }];
+        let overlapping = [
+            Section { addr: 0x10, size: 0x20, flags: 0 },
+            Section { addr: 0, size: 0x20, flags: 0 },
+        ];
         assert!(Sections::new(&overlapping).sorted.is_none());
-        let high = [Section { addr: u64::MAX - 1, size: 4, flags: 0 }, Section { addr: 0, size: 4, flags: 0 }];
+        let high = [
+            Section { addr: u64::MAX - 1, size: 4, flags: 0 },
+            Section { addr: 0, size: 4, flags: 0 },
+        ];
         assert!(Sections::new(&high).find(u64::MAX).is_some());
     }
 
@@ -1000,10 +1072,11 @@ mod tests {
     #[test]
     fn read_allocation_budget() {
         let bytes = with_trie(macho::CPU_TYPE_ARM64.0, &sample_trie());
-        let shared = blaze_alloc_count::assert_at_most(6, "dylib::read of a library with a trie", || {
-            read("libfoo.dylib", &bytes, Arch::Aarch64)
-        })
-        .unwrap();
+        let shared =
+            blaze_alloc_count::assert_at_most(6, "dylib::read of a library with a trie", || {
+                read("libfoo.dylib", &bytes, Arch::Aarch64)
+            })
+            .unwrap();
         assert_eq!(shared.symbols.len(), 7);
     }
 
@@ -1017,7 +1090,9 @@ mod tests {
         table.extend_from_slice(&[macho::N_SECT.0 | macho::N_EXT.0, 1]);
         table.extend_from_slice(&0u16.to_le_bytes());
         table.put_u64(0x1000);
-        for (nsyms, strsize, accepted) in [(0, u32::MAX, true), (0, 0x0100_0000, true), (1, u32::MAX, false)] {
+        for (nsyms, strsize, accepted) in
+            [(0, u32::MAX, true), (0, 0x0100_0000, true), (1, u32::MAX, false)]
+        {
             let table_len = table.len() as u32;
             let mut tail = table.clone();
             tail.extend_from_slice(strings);
@@ -1031,9 +1106,19 @@ mod tests {
                 },
                 &tail,
             );
-            let (read, used) = blaze_alloc_count::measure(|| read("libsym.dylib", &bytes, Arch::Aarch64));
-            assert_eq!(read.is_ok(), accepted, "{nsyms} symbols, a string table of {strsize:#x} bytes: {read:?}");
-            assert!(used.largest <= bytes.len() as u64, "{} bytes at once reading {} bytes", used.largest, bytes.len());
+            let (read, used) =
+                blaze_alloc_count::measure(|| read("libsym.dylib", &bytes, Arch::Aarch64));
+            assert_eq!(
+                read.is_ok(),
+                accepted,
+                "{nsyms} symbols, a string table of {strsize:#x} bytes: {read:?}"
+            );
+            assert!(
+                used.largest <= bytes.len() as u64,
+                "{} bytes at once reading {} bytes",
+                used.largest,
+                bytes.len()
+            );
         }
     }
 
@@ -1046,15 +1131,23 @@ mod tests {
         let mut rng = Rng(blaze_ids::rng::SplitMix64::new(0xa11c));
         let wide = Node {
             terminal: Vec::new(),
-            children: (0..40).map(|_| (LABELS[rng.below(LABELS.len())], random_node(&mut rng, 3))).collect(),
+            children: (0..40)
+                .map(|_| (LABELS[rng.below(LABELS.len())], random_node(&mut rng, 3)))
+                .collect(),
         };
         for trie in [sample_trie(), build_trie(&random_node(&mut rng, 0)), build_trie(&wide)] {
             let mut sized = Names::default();
             let expected = trie_exports(&trie, 0, &sections, &mut sized).unwrap().len();
             let mut names = Names::with_capacity(sized.bytes());
-            let (symbols, used) = blaze_alloc_count::measure(|| trie_exports(&trie, 0, &sections, &mut names));
+            let (symbols, used) =
+                blaze_alloc_count::measure(|| trie_exports(&trie, 0, &sections, &mut names));
             assert_eq!(symbols.unwrap().len(), expected);
-            assert!(used.allocations <= 2, "{} allocations walking a trie of {} bytes", used.allocations, trie.len());
+            assert!(
+                used.allocations <= 2,
+                "{} allocations walking a trie of {} bytes",
+                used.allocations,
+                trie.len()
+            );
         }
     }
 
@@ -1063,10 +1156,11 @@ mod tests {
     #[test]
     fn sections_allocate_nothing() {
         let all = test_sections();
-        let found = blaze_alloc_count::assert_at_most(0, "Sections::new and Sections::find", || {
-            let sections = Sections::new(&all);
-            (0..0x5000u64).step_by(8).filter(|&addr| sections.find(addr).is_some()).count()
-        });
+        let found =
+            blaze_alloc_count::assert_at_most(0, "Sections::new and Sections::find", || {
+                let sections = Sections::new(&all);
+                (0..0x5000u64).step_by(8).filter(|&addr| sections.find(addr).is_some()).count()
+            });
         assert!(found > 0);
     }
 }

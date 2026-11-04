@@ -34,7 +34,6 @@ use std::cmp::Ordering;
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir::{
     AsAssocItem as _, AssocItem, AssocItemContainer, GenericDef, HasVisibility as _, ModuleDef,
     db::HirDatabase as _,
@@ -50,6 +49,7 @@ use rustc_type_ir::{
     AliasTyKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _, TypeVisitor,
     inherent::IntoKind as _,
 };
+use std::alloc::Global;
 
 use crate::cx::Cx;
 
@@ -73,7 +73,8 @@ pub(super) enum Level {
 
 impl Level {
     /// `Level::all_levels`: most direct first.
-    const ALL: [Level; 4] = [Level::Direct, Level::Reexported, Level::Reachable, Level::ReachableThroughImplTrait];
+    const ALL: [Level; 4] =
+        [Level::Direct, Level::Reexported, Level::Reachable, Level::ReachableThroughImplTrait];
 }
 
 /// A visibility: everywhere, or in a module and the modules in it.
@@ -137,7 +138,7 @@ impl Effective {
         let mut build = Build {
             cx,
             t: Effective::default(),
-            queue: Vec::new(),  // alloc: setup, a definition is queued once at a time
+            queue: Vec::new(), // alloc: setup, a definition is queued once at a time
             queued: Vec::new(), // alloc: setup, a column over the numbering
             impls_of: HashMap::new_in(Global),
             names: Names::new(db, false),
@@ -170,7 +171,9 @@ impl Effective {
     /// The crate's own definitions [`Effective::is_reachable`] holds of, in numbering order.
     pub(crate) fn reachable_local(&self) -> impl Iterator<Item = Def> + '_ {
         (self.defs.iter().zip(&self.ev).zip(&self.local))
-            .filter(|((_, ev), local)| **local && matches!(ev, Some(ev) if ev.at(Level::Reachable) == Vis::Public))
+            .filter(|((_, ev), local)| {
+                **local && matches!(ev, Some(ev) if ev.at(Level::Reachable) == Vis::Public)
+            })
             .map(|((def, _), _)| *def)
     }
 
@@ -208,7 +211,9 @@ pub(super) fn vis_of(cx: &Cx<'_, '_>, vis: hir::Visibility) -> Vis {
     match vis {
         hir::Visibility::Public => Vis::Public,
         hir::Visibility::PubCrate(_) => Vis::In(cx.krate.root_module(cx.db)),
-        hir::Visibility::Module(id, _) => Vis::In(hir::Module::from(id).nearest_non_block_module(cx.db)),
+        hir::Visibility::Module(id, _) => {
+            Vis::In(hir::Module::from(id).nearest_non_block_module(cx.db))
+        }
     }
 }
 
@@ -277,7 +282,9 @@ pub(super) fn nominal(cx: &Cx<'_, '_>, def: Def) -> Vis {
         Def::Item(ModuleDef::EnumVariant(it)) => vis_of(cx, it.parent_enum(db).visibility(db)),
         Def::Item(it) => vis_of(cx, it.visibility(db)),
         Def::Field(it) => match it.parent_def(db) {
-            hir::Variant::EnumVariant(variant) => vis_of(cx, variant.parent_enum(db).visibility(db)),
+            hir::Variant::EnumVariant(variant) => {
+                vis_of(cx, variant.parent_enum(db).visibility(db))
+            }
             _ => vis_of(cx, it.visibility(db)),
         },
         Def::Impl(_) => Vis::Public,
@@ -295,7 +302,13 @@ pub(super) fn private(cx: &Cx<'_, '_>, def: Def) -> Vis {
 
 /// `EffectiveVisibilities::update` of `current`: at each level up to `level`, raised to the
 /// inherited visibility capped by `max`; whether any rose.
-fn raise(cx: &Cx<'_, '_>, mut current: Ev, max: Option<Vis>, inherited: Ev, level: Level) -> (Ev, bool) {
+fn raise(
+    cx: &Cx<'_, '_>,
+    mut current: Ev,
+    max: Option<Vis>,
+    inherited: Ev,
+    level: Level,
+) -> (Ev, bool) {
     let mut changed = false;
     let mut inherited_at_prev = inherited.at(level);
     let mut calculated = inherited_at_prev;
@@ -304,7 +317,9 @@ fn raise(cx: &Cx<'_, '_>, mut current: Ev, max: Option<Vis>, inherited: Ev, leve
             let inherited_at = inherited.at(l);
             if !(inherited_at_prev == inherited_at && level != l) {
                 calculated = match max {
-                    Some(max) if partial_cmp(cx, inherited_at, max) == Some(Ordering::Greater) => max,
+                    Some(max) if partial_cmp(cx, inherited_at, max) == Some(Ordering::Greater) => {
+                        max
+                    }
                     _ => inherited_at,
                 };
             }
@@ -354,7 +369,14 @@ impl<'db> Build<'_, '_, 'db> {
     }
 
     /// `EffectiveVisibilities::update`.
-    fn update(&mut self, id: u32, max: Option<Vis>, private: Vis, inherited: Ev, level: Level) -> bool {
+    fn update(
+        &mut self,
+        id: u32,
+        max: Option<Vis>,
+        private: Vis,
+        inherited: Ev,
+        level: Level,
+    ) -> bool {
         let current = self.t.ev[id as usize].unwrap_or(Ev::from_vis(private));
         let (new, changed) = raise(self.cx, current, max, inherited, level);
         self.t.ev[id as usize] = Some(new);
@@ -419,7 +441,14 @@ impl<'db> Build<'_, '_, 'db> {
                 let items = id.def_map(db).module(db, id).scope(db);
                 for (_, per_ns) in items.entries() {
                     if let Some(it) = per_ns.types {
-                        self.binding(Some(it.def), it.vis, it.import.and_then(ImportOrExternCrate::use_), here, scope_vis, inherited);
+                        self.binding(
+                            Some(it.def),
+                            it.vis,
+                            it.import.and_then(ImportOrExternCrate::use_),
+                            here,
+                            scope_vis,
+                            inherited,
+                        );
                     }
                     if let Some(it) = per_ns.values {
                         let import = it.import.map(|import| match import {
@@ -430,7 +459,14 @@ impl<'db> Build<'_, '_, 'db> {
                     }
                     if let Some(it) = per_ns.macros {
                         let import = it.import.and_then(ImportOrExternCrate::use_);
-                        self.binding(Some(ModuleDefId::MacroId(it.def)), it.vis, import, here, scope_vis, inherited);
+                        self.binding(
+                            Some(ModuleDefId::MacroId(it.def)),
+                            it.vis,
+                            import,
+                            here,
+                            scope_vis,
+                            inherited,
+                        );
                     }
                 }
                 for it in items.underscore_imports() {
@@ -442,7 +478,14 @@ impl<'db> Build<'_, '_, 'db> {
                 let variants = it.variants(db);
                 for &variant in &variants {
                     let id = self.id(Def::Item(ModuleDef::EnumVariant(variant)));
-                    self.update_def(id, self.t.nominal[id as usize], scope_vis, here, inherited, Level::Direct);
+                    self.update_def(
+                        id,
+                        self.t.nominal[id as usize],
+                        scope_vis,
+                        here,
+                        inherited,
+                        Level::Direct,
+                    );
                 }
                 for variant in variants {
                     let parent = self.id(Def::Item(ModuleDef::EnumVariant(variant)));
@@ -466,7 +509,14 @@ impl<'db> Build<'_, '_, 'db> {
                 let here = self.t.private[scope as usize];
                 for item in it.items_iter(db) {
                     let id = self.id(Def::Item(item.into()));
-                    self.update_def(id, self.t.nominal[id as usize], scope_vis, here, inherited, Level::Direct);
+                    self.update_def(
+                        id,
+                        self.t.nominal[id as usize],
+                        scope_vis,
+                        here,
+                        inherited,
+                        Level::Direct,
+                    );
                 }
             }
             _ => {}
@@ -511,7 +561,15 @@ impl<'db> Build<'_, '_, 'db> {
     }
 
     /// `update_def`: nothing rises where the name's visibility or its parent's is private.
-    fn update_def(&mut self, id: u32, vis: Vis, parent_vis: Vis, private: Vis, inherited: Ev, level: Level) {
+    fn update_def(
+        &mut self,
+        id: u32,
+        vis: Vis,
+        parent_vis: Vis,
+        private: Vis,
+        inherited: Ev,
+        level: Level,
+    ) {
         if vis == private || parent_vis == private {
             return;
         }
@@ -525,14 +583,23 @@ impl<'db> Build<'_, '_, 'db> {
         let id = self.id(Def::Field(field));
         let inherited = self.ev_or_private(parent);
         let parent_vis = self.t.nominal[parent as usize];
-        self.update_def(id, self.t.nominal[id as usize], parent_vis, here, inherited, Level::Direct);
+        self.update_def(
+            id,
+            self.t.nominal[id as usize],
+            parent_vis,
+            here,
+            inherited,
+            Level::Direct,
+        );
     }
 
     /// What resolve's pass walks again when a definition rises: its names and fields.
     fn rise(&mut self, id: u32) {
         let db = self.cx.db;
         match self.t.defs[id as usize] {
-            Def::Item(ModuleDef::Module(_) | ModuleDef::Adt(_) | ModuleDef::Trait(_)) => self.push(id),
+            Def::Item(ModuleDef::Module(_) | ModuleDef::Adt(_) | ModuleDef::Trait(_)) => {
+                self.push(id)
+            }
             Def::Item(ModuleDef::EnumVariant(it)) => {
                 let parent = self.id(Def::Item(ModuleDef::Adt(hir::Adt::Enum(it.parent_enum(db)))));
                 self.push(parent);
@@ -673,7 +740,8 @@ impl<'db> Build<'_, '_, 'db> {
             if !self.t.local[id as usize] {
                 continue;
             }
-            let max = (level != Level::ReachableThroughImplTrait).then(|| self.t.nominal[id as usize]);
+            let max =
+                (level != Level::ReachableThroughImplTrait).then(|| self.t.nominal[id as usize]);
             if self.update_eff_vis(id, ev, max, level) {
                 self.enqueue(id);
             }
@@ -688,7 +756,12 @@ impl<'db> Build<'_, '_, 'db> {
         let db = self.cx.db;
         let ev = self.t.ev[id as usize];
         match self.t.defs[id as usize] {
-            Def::Item(def @ (ModuleDef::Function(_) | ModuleDef::Const(_) | ModuleDef::Static(_) | ModuleDef::TypeAlias(_))) => {
+            Def::Item(
+                def @ (ModuleDef::Function(_)
+                | ModuleDef::Const(_)
+                | ModuleDef::Static(_)
+                | ModuleDef::TypeAlias(_)),
+            ) => {
                 let Some(ev) = ev else { return };
                 if def.as_assoc_item(db).is_some() {
                     return;
@@ -771,10 +844,14 @@ impl<'db> Build<'_, '_, 'db> {
                     for field in variant.fields_iter(db) {
                         let field_id = self.id(Def::Field(field));
                         self.update_nominal(field_id, variant_ev, Level::Reachable);
-                        self.reach(variant_ev, Level::Reachable, |names| names.ty(field.ty(db).to_next_solver()));
+                        self.reach(variant_ev, Level::Reachable, |names| {
+                            names.ty(field.ty(db).to_next_solver())
+                        });
                     }
                     // A variant reachable makes its enum so.
-                    self.reach(variant_ev, Level::Reachable, |names| names.push(Def::Item(ModuleDef::Adt(adt))));
+                    self.reach(variant_ev, Level::Reachable, |names| {
+                        names.push(Def::Item(ModuleDef::Adt(adt)))
+                    });
                 }
             }
             Def::Item(ModuleDef::Adt(adt)) => {
@@ -793,7 +870,9 @@ impl<'db> Build<'_, '_, 'db> {
                     let field_id = self.id(Def::Field(field));
                     self.update_nominal(field_id, ev, Level::Reachable);
                     if let Some(field_ev) = self.t.ev[field_id as usize] {
-                        self.reach(field_ev, Level::Reachable, |names| names.ty(field.ty(db).to_next_solver()));
+                        self.reach(field_ev, Level::Reachable, |names| {
+                            names.ty(field.ty(db).to_next_solver())
+                        });
                     }
                 }
             }
@@ -948,7 +1027,9 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Names<'db> {
 
     fn visit_ty(&mut self, ty: Ty<'db>) {
         match ty.kind() {
-            TyKind::Adt(..) | TyKind::Foreign(_) | TyKind::FnDef(..) | TyKind::Dynamic(..) => self.outermost(ty),
+            TyKind::Adt(..) | TyKind::Foreign(_) | TyKind::FnDef(..) | TyKind::Dynamic(..) => {
+                self.outermost(ty)
+            }
             TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id }, .. }) => {
                 if self.skip_assoc || !self.seen.insert(ty) {
                     return;

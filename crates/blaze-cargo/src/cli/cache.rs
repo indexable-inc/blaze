@@ -47,7 +47,9 @@ pub fn main(words: &[OsString], color: bool) -> i32 {
 /// The areas, as the daemon's ([`crate::serve::gc`]).
 fn areas() -> Result<Vec<String>, String> {
     let builds = crate::serve::builds().map_err(|error| format!("{error:#}"))?;
-    let root = builds.parent().ok_or_else(|| format!("{} has no parent, blaze's root", builds.display()))?;
+    let root = builds
+        .parent()
+        .ok_or_else(|| format!("{} has no parent, blaze's root", builds.display()))?;
     let machine = crate::serve::machine().map_err(|error| format!("{error:#}"))?;
     let mut areas = vec![root.to_string_lossy().into_owned()];
     if machine != root {
@@ -72,7 +74,10 @@ fn collect(dry_run: bool) -> Result<String, String> {
                 held.push(area.clone()); // clone: the run's copy, an area or two
             }
             Err(by) => {
-                out.push_str(&format!("{area} is left alone: {by} holds its {}\n", blaze_gc::lease::COLLECTOR));
+                out.push_str(&format!(
+                    "{area} is left alone: {by} holds its {}\n",
+                    blaze_gc::lease::COLLECTOR
+                ));
                 skipped.push(format!("{area} (held by {by})"));
                 held.push(String::new());
             }
@@ -84,7 +89,8 @@ fn collect(dry_run: bool) -> Result<String, String> {
     }
     // Every checkout a build dir names that exists: the heads, as the CLI can know them.
     let clock = blaze_gc::plan::Clock::default();
-    let found: Inventory = blaze_gc::fs::scan(&held, None, u32::MAX, None, &clock, &mut blaze_gc::fs::Sizes::new())?;
+    let found: Inventory =
+        blaze_gc::fs::scan(&held, None, u32::MAX, None, &clock, &mut blaze_gc::fs::Sizes::new())?;
     let mut heads: Vec<String> = found
         .objects
         .iter()
@@ -95,7 +101,8 @@ fn collect(dry_run: bool) -> Result<String, String> {
     heads.sort_unstable();
     heads.dedup();
     let root = std::path::PathBuf::from(&areas[0]);
-    let levels = blaze_gc::settings::GcSettings::read(&root, blaze_gc::pace::Levels::default())?.levels;
+    let levels =
+        blaze_gc::settings::GcSettings::read(&root, blaze_gc::pace::Levels::default())?.levels;
     let mut collector = Collector::new(Config { levels, ..Config::daemon(areas) });
     collector.heads(&heads);
     collector.skipped(skipped);
@@ -110,12 +117,16 @@ fn collect(dry_run: bool) -> Result<String, String> {
 /// `blaze cache gc` or a daemon that runs no collector, and that is the error.
 fn asked_of_daemon(dry_run: bool, mut out: String) -> Result<String, String> {
     let mut report = None;
-    let asked = super::observe::ask(blaze_api::Request::Gc { dry_run }, super::daemon::Start::Never, |response| {
-        if let blaze_api::ResponseRef::Collected { report: it } = response {
-            report = Some(it.to_owned());
-        }
-        Ok(())
-    });
+    let asked = super::observe::ask(
+        blaze_api::Request::Gc { dry_run },
+        super::daemon::Start::Never,
+        |response| {
+            if let blaze_api::ResponseRef::Collected { report: it } = response {
+                report = Some(it.to_owned());
+            }
+            Ok(())
+        },
+    );
     match (asked, report) {
         (Ok(()), Some(report)) => {
             out.push_str("every area is the daemon's: its collector ran this\n");
@@ -123,7 +134,9 @@ fn asked_of_daemon(dry_run: bool, mut out: String) -> Result<String, String> {
             Ok(out)
         }
         (Ok(()), None) => Err(format!("{out}the daemon answered `blaze cache gc` with no report")),
-        (Err(why), _) => Err(format!("{out}nothing is collected: every area is another collector's, and the daemon did not run it: {why}")),
+        (Err(why), _) => Err(format!(
+            "{out}nothing is collected: every area is another collector's, and the daemon did not run it: {why}"
+        )),
     }
 }
 

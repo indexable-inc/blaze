@@ -17,12 +17,12 @@ use blaze_format::{
     ALIGN, FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer, open_as,
     schema_of,
 };
+use blaze_query::db::{AsId, FromId};
 use hir_def::{
-    AdtId, AssocItemId, ConstParamId, EnumVariantId, GenericDefId, GenericParamId, ImplId, LifetimeParamId,
-    StructId, TraitId, TypeOrConstParamId, TypeParamId, UnionId, VariantId,
+    AdtId, AssocItemId, ConstParamId, EnumVariantId, GenericDefId, GenericParamId, ImplId,
+    LifetimeParamId, StructId, TraitId, TypeOrConstParamId, TypeParamId, UnionId, VariantId,
 };
 use la_arena::{Idx, RawIdx};
-use blaze_query::db::{AsId, FromId};
 
 use crate::{
     Span, TyLoweringDiagnostic,
@@ -36,9 +36,8 @@ use crate::{
         },
         diagnostics::{
             AssocTypeFailure, AssocTypeQself, CycleQuery, ElidedLifetimeSite,
-            GenericArgsProhibitedReason,
-            IncorrectGenericsLenKind, MissingLifetimeKind, PathGenericsSource,
-            PathLoweringDiagnostic, PatternTypeUnsupported,
+            GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind,
+            PathGenericsSource, PathLoweringDiagnostic, PatternTypeUnsupported,
         },
     },
     next_solver::{
@@ -234,12 +233,12 @@ impl ColdBatch {
     fn new(kind: BatchKind) -> ColdBatch {
         ColdBatch {
             kind,
-            key_tags: Vec::new(), // alloc: empty
-            keys: Vec::new(), // alloc: empty
-            starts: Vec::new(), // alloc: empty
-            tys: Vec::new(), // alloc: empty
-            defaults: Vec::new(), // alloc: empty
-            trait_ids: Vec::new(), // alloc: empty
+            key_tags: Vec::new(),   // alloc: empty
+            keys: Vec::new(),       // alloc: empty
+            starts: Vec::new(),     // alloc: empty
+            tys: Vec::new(),        // alloc: empty
+            defaults: Vec::new(),   // alloc: empty
+            trait_ids: Vec::new(),  // alloc: empty
             trait_args: Vec::new(), // alloc: empty
             predicates: Vec::new(), // alloc: empty
             side: ColdSide::default(),
@@ -411,8 +410,10 @@ impl Persist for ColdBatch {
             predicates: predicates.slice(field(offset_of!(BatchRoot, predicates))),
             side: SideRec {
                 rows: rows.slice(side_field(offset_of!(SideRec, rows))),
-                diagnostics_at: diagnostics_at.slice(side_field(offset_of!(SideRec, diagnostics_at))),
-                anon_consts_at: anon_consts_at.slice(side_field(offset_of!(SideRec, anon_consts_at))),
+                diagnostics_at: diagnostics_at
+                    .slice(side_field(offset_of!(SideRec, diagnostics_at))),
+                anon_consts_at: anon_consts_at
+                    .slice(side_field(offset_of!(SideRec, anon_consts_at))),
                 diagnostics: diagnostics.slice(side_field(offset_of!(SideRec, diagnostics))),
                 anon_consts: anon_consts.slice(side_field(offset_of!(SideRec, anon_consts))),
             },
@@ -521,7 +522,8 @@ impl<'a> ColdBatchRef<'a> {
             "side table columns of different lengths",
         )?;
         self.ensure(
-            side.rows.is_sorted_by(|a, b| a < b) && side.rows.last().is_none_or(|&it| (it as usize) < rows),
+            side.rows.is_sorted_by(|a, b| a < b)
+                && side.rows.last().is_none_or(|&it| (it as usize) < rows),
             "side table rows that are not ascending rows of the batch",
         )?;
         self.ensure(
@@ -594,9 +596,9 @@ impl<'a> ColdBatchRef<'a> {
         let tys = self.table(interner)?;
         let values = exact(
             self.tys.len(),
-            self.tys
-                .iter()
-                .map(|&ty| Ok::<_, FormatError>(StoredEarlyBinder::bind(interner, tys.ty(ty)?.store()))),
+            self.tys.iter().map(|&ty| {
+                Ok::<_, FormatError>(StoredEarlyBinder::bind(interner, tys.ty(ty)?.store()))
+            }),
         )?;
         Ok(Batch { keys: self.impl_keys()?, values, side: self.side_table()? })
     }
@@ -675,7 +677,8 @@ impl<'a> ColdBatchRef<'a> {
         let anon_consts: Box<[AnonConstId<'db>]> = exact(
             side.anon_consts.len(),
             side.anon_consts.iter().map(|&bits| {
-                blaze_query::db::Id::decode(bits, self.at, "a constant's id").map(AnonConstId::from_id)
+                blaze_query::db::Id::decode(bits, self.at, "a constant's id")
+                    .map(AnonConstId::from_id)
             }),
         )?;
         let range = |starts: &[u32], at: usize, len: usize| {
@@ -1107,8 +1110,9 @@ impl Words<'_> {
         Ok(match tag {
             0 => TypeParamId::from_unchecked(type_or_const()).into(),
             1 => ConstParamId::from_unchecked(type_or_const()).into(),
-            2 => LifetimeParamId { parent, local_id: Idx::from_raw(RawIdx::from_u32(local)) }
-                .into(),
+            2 => {
+                LifetimeParamId { parent, local_id: Idx::from_raw(RawIdx::from_u32(local)) }.into()
+            }
             _ => return Err(self.invalid("a generic parameter of no kind")),
         })
     }
@@ -1362,9 +1366,8 @@ mod tests {
 
     #[test]
     fn a_read_column_is_one_allocation() {
-        let (column, used) = blaze_alloc_count::measure(|| {
-            exact::<u32, ()>(1000, (0..1000).map(Ok))
-        });
+        let (column, used) =
+            blaze_alloc_count::measure(|| exact::<u32, ()>(1000, (0..1000).map(Ok)));
         assert_eq!((used.allocations, column.unwrap().len()), (1, 1000));
     }
 
@@ -1377,7 +1380,8 @@ mod tests {
         let def: GenericDefId = ImplId::from_id(id(9)).into();
         let trait_def: GenericDefId = TraitId::from_id(id(10)).into();
         let adt: GenericDefId = AdtId::EnumId(EnumId::from_id(id(11))).into();
-        let param = TypeOrConstParamId { parent: def, local_id: Idx::from_raw(RawIdx::from_u32(2)) };
+        let param =
+            TypeOrConstParamId { parent: def, local_id: Idx::from_raw(RawIdx::from_u32(2)) };
         let path = |diag| TyLoweringDiagnostic::PathDiagnostic { source, diag };
         let segment = PathGenericsSource::Segment(1);
         let assoc = PathGenericsSource::AssocType { segment: 2, assoc_type: 3 };
@@ -1412,8 +1416,11 @@ mod tests {
             }),
             path(PathLoweringDiagnostic::IncorrectGenericsOrder {
                 generics_source: assoc,
-                param_id: LifetimeParamId { parent: trait_def, local_id: Idx::from_raw(RawIdx::from_u32(0)) }
-                    .into(),
+                param_id: LifetimeParamId {
+                    parent: trait_def,
+                    local_id: Idx::from_raw(RawIdx::from_u32(0)),
+                }
+                .into(),
                 arg_idx: 1,
                 has_self_arg: false,
             }),
@@ -1423,11 +1430,27 @@ mod tests {
                 expected_count: 2,
                 hard_error: true,
             }),
-            path(PathLoweringDiagnostic::ElisionFailure { generics_source: assoc, def, expected_count: 1 }),
-            path(PathLoweringDiagnostic::MissingLifetime { generics_source: segment, def: trait_def, expected_count: 3 }),
+            path(PathLoweringDiagnostic::ElisionFailure {
+                generics_source: assoc,
+                def,
+                expected_count: 1,
+            }),
+            path(PathLoweringDiagnostic::MissingLifetime {
+                generics_source: segment,
+                def: trait_def,
+                expected_count: 3,
+            }),
             path(PathLoweringDiagnostic::GenericDefaultRefersToSelf { segment: 0 }),
-            path(PathLoweringDiagnostic::LateBoundLifetimeArgs { generics_source: assoc, def, hard_error: true }),
-            path(PathLoweringDiagnostic::LateBoundLifetimeArgs { generics_source: segment, def: adt, hard_error: false }),
+            path(PathLoweringDiagnostic::LateBoundLifetimeArgs {
+                generics_source: assoc,
+                def,
+                hard_error: true,
+            }),
+            path(PathLoweringDiagnostic::LateBoundLifetimeArgs {
+                generics_source: segment,
+                def: adt,
+                hard_error: false,
+            }),
             path(PathLoweringDiagnostic::AmbiguousAssociatedItem {
                 segment: 1,
                 variant: EnumVariantId::from_id(id(13)),
@@ -1453,7 +1476,10 @@ mod tests {
             TyLoweringDiagnostic::ImplTraitNotAllowed { source },
             TyLoweringDiagnostic::AdditionalNonAutoTraits {
                 first: source,
-                additional: Box::new([Idx::from_raw(RawIdx::from_u32(8)), Idx::from_raw(RawIdx::from_u32(9))]),
+                additional: Box::new([
+                    Idx::from_raw(RawIdx::from_u32(8)),
+                    Idx::from_raw(RawIdx::from_u32(9)),
+                ]),
             },
             TyLoweringDiagnostic::ConflictingAssocTypeBindings {
                 source,
@@ -1476,9 +1502,14 @@ mod tests {
             TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::Supertraits },
             TyLoweringDiagnostic::QueryCycle { def, query: CycleQuery::ImplSelfTy },
             TyLoweringDiagnostic::QueryCycle { def, query: CycleQuery::ImplTrait },
-            TyLoweringDiagnostic::InferVarsNotAllowed { sources: Box::new([Span::TypeRefId(source)]) },
             TyLoweringDiagnostic::InferVarsNotAllowed {
-                sources: Box::new([Span::ExprId(Idx::from_raw(RawIdx::from_u32(1))), Span::TypeRefId(source)]),
+                sources: Box::new([Span::TypeRefId(source)]),
+            },
+            TyLoweringDiagnostic::InferVarsNotAllowed {
+                sources: Box::new([
+                    Span::ExprId(Idx::from_raw(RawIdx::from_u32(1))),
+                    Span::TypeRefId(source),
+                ]),
             },
             TyLoweringDiagnostic::InferVarsNotAllowed { sources: Box::new([Span::Dummy]) },
             TyLoweringDiagnostic::InvalidConstArg {
@@ -1494,13 +1525,20 @@ mod tests {
                 kind: MissingLifetimeKind::Missing,
             },
             TyLoweringDiagnostic::MissingLifetimes {
-                sites: Box::new([ElidedLifetimeSite::Placeholder(Idx::from_raw(RawIdx::from_u32(4)))]),
+                sites: Box::new([ElidedLifetimeSite::Placeholder(Idx::from_raw(
+                    RawIdx::from_u32(4),
+                ))]),
                 kind: MissingLifetimeKind::NotAllowed,
             },
             TyLoweringDiagnostic::MissingLifetimes {
                 sites: Box::new([
                     ElidedLifetimeSite::Reference(source),
-                    ElidedLifetimeSite::Path { source, generics_source: assoc, def: adt, expected_count: 2 },
+                    ElidedLifetimeSite::Path {
+                        source,
+                        generics_source: assoc,
+                        def: adt,
+                        expected_count: 2,
+                    },
                     ElidedLifetimeSite::Placeholder(Idx::from_raw(RawIdx::from_u32(0))),
                 ]),
                 kind: MissingLifetimeKind::ElisionFailure,
@@ -1550,7 +1588,11 @@ mod tests {
         ColdBatch {
             kind: BatchKind::FieldTypes,
             key_tags: vec![1, 1, 2],
-            keys: vec![id_bits(StructId::from_id(id(1))), id_bits(StructId::from_id(id(4))), id_bits(UnionId::from_id(id(2)))],
+            keys: vec![
+                id_bits(StructId::from_id(id(1))),
+                id_bits(StructId::from_id(id(4))),
+                id_bits(UnionId::from_id(id(2))),
+            ],
             starts: vec![0, 2, 2, 3],
             tys: vec![0, 1, 0],
             defaults: vec![0, 3, 0],

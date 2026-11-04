@@ -27,10 +27,10 @@ use blaze_codegen::{Arch, CompiledFunction, InstanceKey, Static, Target};
 use blaze_core::FileName;
 use blaze_graph::par;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_mem::align::checked_align_up_u64;
+use std::alloc::Global;
 
 use crate::arena::{FrameVec, collect_in};
 use crate::model::{self, Apply, Class, Fixup, Holds, Plan, Sym};
@@ -334,7 +334,10 @@ pub(crate) fn fix(plan: &mut Plan, place: &Place) -> Result<(), String> {
     }
     if !place.page.is_power_of_two() || place.base % place.page != 0 {
         // alloc: error path
-        return Err(format!("an image at {:#x}, not on a page of {:#x} bytes", place.base, place.page));
+        return Err(format!(
+            "an image at {:#x}, not on a page of {:#x} bytes",
+            place.base, place.page
+        ));
     }
     plan.base = place.base;
     plan.page = plan.page.max(place.page);
@@ -385,14 +388,18 @@ impl Placed {
     pub fn write_into(&self, out: &mut [u8], offsets: &[usize]) -> Result<(), LinkError> {
         if offsets.len() != self.segments.len() {
             // alloc: error path
-            return Err(error(None, format!("{} offsets for {} segments", offsets.len(), self.segments.len())));
+            return Err(error(
+                None,
+                format!("{} offsets for {} segments", offsets.len(), self.segments.len()),
+            ));
         }
         // alloc: the copy jobs, once per prelink
         let mut jobs: Vec<CopyJob<'_, '_>> = Vec::new();
         let (mut rest, mut consumed) = (out, 0usize);
         for (at, &offset) in offsets.iter().enumerate() {
             let len = self.segments[at].len as usize;
-            let fits = offset >= consumed && offset.checked_add(len).is_some_and(|end| end - consumed <= rest.len());
+            let fits = offset >= consumed
+                && offset.checked_add(len).is_some_and(|end| end - consumed <= rest.len());
             if offset as u64 % self.page != 0 || !fits {
                 return Err(error(
                     None,
@@ -415,21 +422,42 @@ impl Placed {
     }
 
     /// Segment `at`'s copy jobs into `out` (its `len` bytes), its gaps zeroed.
-    fn carve<'s, 'o>(&'s self, at: usize, mut out: &'o mut [u8], jobs: &mut Vec<CopyJob<'s, 'o>>) -> Result<(), LinkError> {
+    fn carve<'s, 'o>(
+        &'s self,
+        at: usize,
+        mut out: &'o mut [u8],
+        jobs: &mut Vec<CopyJob<'s, 'o>>,
+    ) -> Result<(), LinkError> {
         let mut addr = self.segments[at].addr;
-        for space in self.state.spaces[self.groups[at].0..self.groups[at].1].iter().filter(|it| !it.zero && !it.bytes.is_empty()) {
+        for space in self.state.spaces[self.groups[at].0..self.groups[at].1]
+            .iter()
+            .filter(|it| !it.zero && !it.bytes.is_empty())
+        {
             let len = space.bytes.len().min(space.region.size as usize);
-            let from = space.region.addr.checked_sub(addr).map(|it| it as usize).filter(|it| it + len <= out.len());
+            let from = space
+                .region
+                .addr
+                .checked_sub(addr)
+                .map(|it| it as usize)
+                .filter(|it| it + len <= out.len());
             let Some(from) = from else {
                 // alloc: error path
-                return Err(error(None, format!("the region at {:#x} is out of its segment's order", space.region.addr)));
+                return Err(error(
+                    None,
+                    format!("the region at {:#x} is out of its segment's order", space.region.addr),
+                ));
             };
             let (gap, tail) = std::mem::take(&mut out).split_at_mut(from);
             gap.fill(0);
             let (bytes, tail) = tail.split_at_mut(len);
             out = tail;
             addr = space.region.addr + len as u64;
-            jobs.extend(bytes.chunks_mut(COPY_CHUNK).enumerate().map(|(n, chunk)| (space, n * COPY_CHUNK, chunk)));
+            jobs.extend(
+                bytes
+                    .chunks_mut(COPY_CHUNK)
+                    .enumerate()
+                    .map(|(n, chunk)| (space, n * COPY_CHUNK, chunk)),
+            );
         }
         out.fill(0);
         Ok(())
@@ -444,12 +472,23 @@ pub fn prelink_placed(request: &Request<'_>) -> Result<Placed, LinkError> {
         return Err(error(None, "a dependency image links as a shared image"));
     };
     if output.incremental || output.live.is_some() || output.dev_run.is_some() {
-        return Err(error(None, "a dependency image is linked whole: its output is neither incremental, live nor a dev run"));
+        return Err(error(
+            None,
+            "a dependency image is linked whole: its output is neither incremental, live nor a dev run",
+        ));
     }
     // alloc: error path
-    let to = FileName::new(name).ok_or_else(|| error(None, format!("`{name}` is no file name for a dependency image")))?;
+    let to = FileName::new(name)
+        .ok_or_else(|| error(None, format!("`{name}` is no file name for a dependency image")))?;
     let page = page(output.format, output.arch);
-    let place = Place { base: request.base, page, tls_bias: request.tls_bias, tls_from: 0, end: 0, beside: false };
+    let place = Place {
+        base: request.base,
+        page,
+        tls_bias: request.tls_bias,
+        tls_from: 0,
+        end: 0,
+        beside: false,
+    };
     // clone: the image owns its output, once per image
     let mut image = Image::placed(to, output.clone(), Some(place))?;
     let change = Change {
@@ -458,7 +497,7 @@ pub fn prelink_placed(request: &Request<'_>) -> Result<Placed, LinkError> {
         names: request.names.iter().map(|it| (*it).clone()).collect(), // clone: the change owns its names, once per image
         debug_names: request.debug_names.iter().map(|it| (*it).clone()).collect(), // clone: as above
         natives: request.natives.to_vec(), // alloc: once per image
-        spans: request.spans.to_vec(), // alloc: once per image
+        spans: request.spans.to_vec(),     // alloc: once per image
         ..Change::default()
     };
     let owned = image.stage(change)?.state;
@@ -469,8 +508,12 @@ pub fn prelink_placed(request: &Request<'_>) -> Result<Placed, LinkError> {
     // alloc: each list of the answer, once per image
     let mut functions = Vec::with_capacity(request.functions.len());
     for function in request.functions {
-        let piece = symbols.find_body(&function.key).and_then(|it| state.home(it)).and_then(|it| state.piece(it.0));
-        let piece = piece.ok_or_else(|| error(Some(function.key), "the prelink placed no code for it"))?;
+        let piece = symbols
+            .find_body(&function.key)
+            .and_then(|it| state.home(it))
+            .and_then(|it| state.piece(it.0));
+        let piece =
+            piece.ok_or_else(|| error(Some(function.key), "the prelink placed no code for it"))?;
         functions.push((function.key, piece.addr, piece.size));
     }
     let mut statics = Vec::with_capacity(request.statics.len());
@@ -481,11 +524,18 @@ pub fn prelink_placed(request: &Request<'_>) -> Result<Placed, LinkError> {
         };
         let piece = sym.and_then(|it| state.home(it)).and_then(|it| state.piece(it.0));
         // alloc: error path
-        let piece = piece.ok_or_else(|| error(None, format!("the prelink placed no static {:?}", it.item)))?;
+        let piece = piece
+            .ok_or_else(|| error(None, format!("the prelink placed no static {:?}", it.item)))?;
         let at = if it.thread_local {
             StaticAt::ThreadLocal(thread_local(state, piece.addr).ok_or_else(|| {
                 // alloc: error path
-                error(None, format!("the thread-local static {:?} is outside the thread-local template", it.item))
+                error(
+                    None,
+                    format!(
+                        "the thread-local static {:?} is outside the thread-local template",
+                        it.item
+                    ),
+                )
             })?)
         } else {
             StaticAt::Addr(piece.addr)
@@ -498,7 +548,10 @@ pub fn prelink_placed(request: &Request<'_>) -> Result<Placed, LinkError> {
         functions,
         statics,
         // alloc: the answer's names, once per prelink
-        names: names(state, symbols).into_iter().map(|(name, def)| PlacedName { name, def }).collect(),
+        names: names(state, symbols)
+            .into_iter()
+            .map(|(name, def)| PlacedName { name, def })
+            .collect(),
         binds,
         libraries: libraries(state),
         init: init_entries(state, symbols, &Class::InitArray),
@@ -544,14 +597,20 @@ fn value_of(state: &State, mut sym: Sym) -> Option<(u64, Kind, u64)> {
                 let region = &state.spaces.get(piece.region as usize)?.region;
                 let (addr, size) = (piece.addr + offset, if offset == 0 { piece.size } else { 0 });
                 return Some(match region.class {
-                    Class::Tdata | Class::Tbss => (thread_local(state, addr)?, Kind::ThreadLocal, size),
+                    Class::Tdata | Class::Tbss => {
+                        (thread_local(state, addr)?, Kind::ThreadLocal, size)
+                    }
                     _ if region.prot.exec => (addr, Kind::Function, size),
                     _ => (addr, Kind::Data, size),
                 });
             }
             state::Def::Absolute(value) => return Some((value, Kind::Data, 0)),
             state::Def::TlsOffset(offset) => {
-                return Some((state.tls_at?.wrapping_add(offset as i64) as u64, Kind::ThreadLocal, 0));
+                return Some((
+                    state.tls_at?.wrapping_add(offset as i64) as u64,
+                    Kind::ThreadLocal,
+                    0,
+                ));
             }
             state::Def::TpOff(offset) => return Some((offset as u64, Kind::ThreadLocal, 0)),
             state::Def::Alias(to) => sym = to,
@@ -574,7 +633,11 @@ fn names(state: &State, symbols: &Symbols) -> Vec<(String, Def)> {
         out.push((symbols.str(*name).to_owned(), def));
     }
     for it in natives {
-        let (Some(name), Some((value, kind, size))) = (symbols.name_of(it.sym), value_of(state, it.sym)) else { continue };
+        let (Some(name), Some((value, kind, size))) =
+            (symbols.name_of(it.sym), value_of(state, it.sym))
+        else {
+            continue;
+        };
         let strength = if it.weak { Strength::Weak } else { Strength::Strong };
         let def = Def { value, size: size.max(it.size), kind, strength, order: it.order };
         // alloc: the answer owns its names, once per name
@@ -590,7 +653,8 @@ fn names(state: &State, symbols: &Symbols) -> Vec<(String, Def)> {
 /// weakly defined names the image reaches some other way ([`Prelinked::reached_directly`]).
 fn binds(state: &State, symbols: &Symbols) -> Result<(Vec<Bind>, Vec<String>), LinkError> {
     let imports = &state.resolved.imports;
-    let import = |at: u32| imports.get(at as usize).ok_or_else(|| error(None, "a cell bound to no import"));
+    let import =
+        |at: u32| imports.get(at as usize).ok_or_else(|| error(None, "a cell bound to no import"));
     // alloc: the answer's binds, once per prelink
     let mut out: Vec<Bind> = Vec::new();
     // alloc: the answer's names reached directly, once per prelink
@@ -600,22 +664,38 @@ fn binds(state: &State, symbols: &Symbols) -> Result<(Vec<Bind>, Vec<String>), L
             Holds::Import(at) => (at, BindKind::Addr),
             Holds::ImportTpOff(at) => (at, BindKind::TpOff),
             Holds::TlsGd { import: Some(_), .. } | Holds::TlsDesc { import: Some(_), .. } => {
-                return Err(error(None, "a dynamic thread-local access to an import in a dependency image"));
+                return Err(error(
+                    None,
+                    "a dynamic thread-local access to an import in a dependency image",
+                ));
             }
             _ => continue,
         };
         let import = import(at)?;
         // clone: the answer owns its names, once per bind
-        out.push(Bind { place: entry.addr, name: import.name.clone(), addend: 0, kind, weak: import.weak });
+        out.push(Bind {
+            place: entry.addr,
+            name: import.name.clone(),
+            addend: 0,
+            kind,
+            weak: import.weak,
+        });
     }
     for bind in state.lists.binds.items.iter() {
         let import = import(bind.import)?;
         // clone: the answer owns its names, once per bind
         let name = import.name.clone();
-        out.push(Bind { place: bind.addr, name, addend: bind.addend, kind: BindKind::Addr, weak: import.weak });
+        out.push(Bind {
+            place: bind.addr,
+            name,
+            addend: bind.addend,
+            kind: BindKind::Addr,
+            weak: import.weak,
+        });
     }
     // alloc: the weakly defined natives, once per prelink
-    let weak: HashSet<Sym, Global> = state.resolved.native_defs(&state.inputs).filter(|it| it.weak).map(|it| it.sym).collect();
+    let weak: HashSet<Sym, Global> =
+        state.resolved.native_defs(&state.inputs).filter(|it| it.weak).map(|it| it.sym).collect();
     if !weak.is_empty() {
         for piece in state.live_pieces() {
             let name = |sym: Sym| symbols.name_of(sym).map(str::to_owned);
@@ -626,13 +706,19 @@ fn binds(state: &State, symbols: &Symbols) -> Result<(Vec<Bind>, Vec<String>), L
                 let kind = match kind {
                     crate::reloc::GotKind::Address => BindKind::Addr,
                     crate::reloc::GotKind::TpOff => BindKind::TpOff,
-                    _ => return Err(error(None, "a dynamic thread-local access in a dependency image")),
+                    _ => {
+                        return Err(error(
+                            None,
+                            "a dynamic thread-local access in a dependency image",
+                        ));
+                    }
                 };
                 let Some(name) = name(target) else { continue };
                 out.push(Bind { place: piece.addr, name, addend: 0, kind, weak: false });
                 continue;
             }
-            let writable = state.spaces.get(piece.region as usize).is_some_and(|it| it.region.prot.write);
+            let writable =
+                state.spaces.get(piece.region as usize).is_some_and(|it| it.region.prot.write);
             for fixup in piece.fixups() {
                 if let Some(minus) = fixup.minus.filter(|it| weak.contains(it)) {
                     direct.extend(name(minus));
@@ -645,7 +731,13 @@ fn binds(state: &State, symbols: &Symbols) -> Result<(Vec<Bind>, Vec<String>), L
                     direct.push(name);
                     continue;
                 }
-                out.push(Bind { place: piece.addr + fixup.at, name, addend: fixup.addend, kind: BindKind::Addr, weak: false });
+                out.push(Bind {
+                    place: piece.addr + fixup.at,
+                    name,
+                    addend: fixup.addend,
+                    kind: BindKind::Addr,
+                    weak: false,
+                });
             }
         }
     }
@@ -681,7 +773,11 @@ fn segments(
             continue;
         }
         let start = group[0].region.addr / page * page;
-        let end = group.iter().map(|it| it.region.addr + it.region.capacity.max(it.region.size)).max().unwrap_or(start);
+        let end = group
+            .iter()
+            .map(|it| it.region.addr + it.region.capacity.max(it.region.size))
+            .max()
+            .unwrap_or(start);
         if end <= start {
             continue;
         }
@@ -694,7 +790,10 @@ fn segments(
         let inside = |addr: u64| (start..end).contains(&addr);
         let prot = if prot.exec {
             Prot::Code
-        } else if prot.write || binds.iter().any(|it| inside(it.place)) || thread_vars.iter().any(|it| inside(it.0)) {
+        } else if prot.write
+            || binds.iter().any(|it| inside(it.place))
+            || thread_vars.iter().any(|it| inside(it.0))
+        {
             Prot::Data
         } else {
             Prot::ReadOnly
@@ -727,7 +826,11 @@ fn libraries(state: &State) -> Vec<Library> {
         .iter()
         .zip(resolved.library_orders.iter())
         // clone: the answer owns its names, once per library
-        .map(|(it, order)| Library { name: it.name.clone(), order: *order, as_needed: it.as_needed })
+        .map(|(it, order)| Library {
+            name: it.name.clone(),
+            order: *order,
+            as_needed: it.as_needed,
+        })
         // alloc: the answer's libraries, once per prelink or layout
         .collect()
 }
@@ -736,13 +839,27 @@ fn libraries(state: &State) -> Vec<Library> {
 fn init_entries(state: &State, symbols: &Symbols, class: &Class) -> Vec<InitEntry> {
     let mut out: Vec<InitEntry> = state
         .live_pieces()
-        .filter(|it| it.size >= 8 && state.spaces.get(it.region as usize).is_some_and(|space| space.region.class == *class))
+        .filter(|it| {
+            it.size >= 8
+                && state
+                    .spaces
+                    .get(it.region as usize)
+                    .is_some_and(|space| space.region.class == *class)
+        })
         .map(|piece| {
             let tie = match (piece.what(), symbols.key(piece.sym)) {
-                (What::Static { .. }, SymKey::Static(item, instance)) => tie_of(symbols, item, instance),
+                (What::Static { .. }, SymKey::Static(item, instance)) => {
+                    tie_of(symbols, item, instance)
+                }
                 _ => [0; 64],
             };
-            InitEntry { rank: piece.rank(), order: piece.order(), tie, at: piece.addr, count: (piece.size / 8) as u32 }
+            InitEntry {
+                rank: piece.rank(),
+                order: piece.order(),
+                tie,
+                at: piece.addr,
+                count: (piece.size / 8) as u32,
+            }
         })
         // alloc: the answer's pieces, once per prelink or layout
         .collect();
@@ -767,7 +884,9 @@ impl<'a> Stage<'a> {
             return Ok(());
         }
         let symbols: &Symbols = &*self.symbols;
-        let rust = |sym: &Sym| matches!(symbols.key(*sym), SymKey::Body(_) | SymKey::Slot(_) | SymKey::Static(..));
+        let rust = |sym: &Sym| {
+            matches!(symbols.key(*sym), SymKey::Body(_) | SymKey::Slot(_) | SymKey::Static(..))
+        };
         let mut wanted: FrameVec<'a, Sym> = Vec::new_in(self.arena);
         for id in self.fresh.iter() {
             let piece = self.new.piece(id).expect("a fresh piece is live");
@@ -781,9 +900,13 @@ impl<'a> Stage<'a> {
                 continue;
             }
             let def = match self.symbols.key(sym) {
-                SymKey::Body(id) | SymKey::Slot(id) => outside.function(&self.symbols.instance(id)).map(state::Def::Absolute),
+                SymKey::Body(id) | SymKey::Slot(id) => {
+                    outside.function(&self.symbols.instance(id)).map(state::Def::Absolute)
+                }
                 SymKey::Static(item, instance) => {
-                    match outside.static_at(&self.symbols.item(item), self.symbols.content(instance)) {
+                    match outside
+                        .static_at(&self.symbols.item(item), self.symbols.content(instance))
+                    {
                         Some(StaticAt::Addr(addr)) => Some(state::Def::Absolute(addr)),
                         Some(StaticAt::ThreadLocal(offset)) => {
                             if self.plan.tls_descriptors {
@@ -834,7 +957,12 @@ impl<'a> Stage<'a> {
                     .and_then(|it| i64::try_from(it).ok())
                     .and_then(|it| place.tls_bias.checked_add(it));
                 // alloc: error path
-                Some(from.ok_or_else(|| error(None, format!("thread-locals past {:#x} in the run's area", place.tls_from)))?)
+                Some(from.ok_or_else(|| {
+                    error(
+                        None,
+                        format!("thread-locals past {:#x} in the run's area", place.tls_from),
+                    )
+                })?)
             }
         };
         if !self.full && self.old.laid_out && self.old.tls_at != at {

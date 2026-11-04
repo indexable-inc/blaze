@@ -195,13 +195,21 @@ struct PathQuery<'a> {
 }
 
 /// The name of blaze's test harness module (`blaze-engine`'s `test_harness::MODULE`).
-#[expect(clippy::disallowed_types, reason = "the process's one test harness name symbol: the constant is interned once")]
-static TEST_HARNESS: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::intern("__blaze_test_harness"));
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one test harness name symbol: the constant is interned once"
+)]
+static TEST_HARNESS: std::sync::LazyLock<Symbol> =
+    std::sync::LazyLock::new(|| Symbol::intern("__blaze_test_harness"));
 
 /// `::core::blaze::contract_test`, what the attribute path `blaze::contract_test` names.
-#[expect(clippy::disallowed_types, reason = "the process's one alias path: its names are interned once")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one alias path: its names are interned once"
+)]
 static CONTRACT_TEST: std::sync::LazyLock<[Name; 3]> = std::sync::LazyLock::new(|| {
-    [intern::sym::core, Symbol::intern("blaze"), intern::sym::contract_test].map(Name::new_symbol_root)
+    [intern::sym::core, Symbol::intern("blaze"), intern::sym::contract_test]
+        .map(Name::new_symbol_root)
 });
 
 /// The path an attribute macro's `path` resolves as: `blaze::contract_test` is blaze's builtin
@@ -211,7 +219,8 @@ static CONTRACT_TEST: std::sync::LazyLock<[Name; 3]> = std::sync::LazyLock::new(
 fn attr_path_alias(path: &ModPath, expected: Option<MacroSubNs>) -> (PathKind, Segments<'_>) {
     match (expected, path.kind, path.segments()) {
         (Some(MacroSubNs::Attr), PathKind::Plain, [first, second])
-            if first.symbol().as_str() == "blaze" && *second.symbol() == intern::sym::contract_test =>
+            if first.symbol().as_str() == "blaze"
+                && *second.symbol() == intern::sym::contract_test =>
         {
             (PathKind::Abs, Segments::plain(&CONTRACT_TEST[..]))
         }
@@ -220,11 +229,7 @@ fn attr_path_alias(path: &ModPath, expected: Option<MacroSubNs>) -> (PathKind, S
 }
 
 impl PerNs {
-    pub(super) fn filter_macro(
-        mut self,
-        db: &Db,
-        expected: Option<MacroSubNs>,
-    ) -> Self {
+    pub(super) fn filter_macro(mut self, db: &Db, expected: Option<MacroSubNs>) -> Self {
         self.macros = self.macros.filter(|def| sub_namespace_match(db, def.def, expected));
 
         self
@@ -311,7 +316,8 @@ impl DefMap {
         // resolving them to. Pass `None` otherwise, e.g. when we're resolving import paths.
         expected_macro_subns: Option<MacroSubNs>,
     ) -> ResolvePathResult {
-        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
+        let q =
+            PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
         let (kind, segments) = attr_path_alias(path, expected_macro_subns);
         self.resolve_fp(q, original_module, kind, segments, &mut |_| {})
     }
@@ -329,7 +335,8 @@ impl DefMap {
         expected_macro_subns: Option<MacroSubNs>,
         reads: &mut impl FnMut(PathRead),
     ) -> ResolvePathResult {
-        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
+        let q =
+            PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
         let (kind, segments) = attr_path_alias(path, expected_macro_subns);
         self.resolve_fp(q, original_module, kind, segments, reads)
     }
@@ -344,7 +351,8 @@ impl DefMap {
         shadow: BuiltinShadowMode,
         expected_macro_subns: Option<MacroSubNs>,
     ) -> ResolvePathResult {
-        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
+        let q =
+            PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
         self.resolve_single(q, original_module, path.kind, Segments::of(path), &mut |_| {})
     }
 
@@ -363,7 +371,8 @@ impl DefMap {
         around: bool,
     ) -> ResolvePathResult {
         let (local_def_map, db, mode) = q;
-        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
+        let q =
+            PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
         match around {
             true => self.resolve_fp(q, original_module, kind, segments, &mut |_| {}),
             false => self.resolve_single(q, original_module, kind, segments, &mut |_| {}),
@@ -444,7 +453,9 @@ impl DefMap {
                 };
                 (PerNs::types(root.into(), Visibility::Public, None), 0)
             }
-            PathKind::Crate => (PerNs::types(self.crate_root(db).into(), Visibility::Public, None), 0),
+            PathKind::Crate => {
+                (PerNs::types(self.crate_root(db).into(), Visibility::Public, None), 0)
+            }
             // plain import or absolute path in 2015: crate-relative with
             // fallback to extern prelude (with the simplification in
             // rust-lang/rust#57745)
@@ -465,9 +476,7 @@ impl DefMap {
                         1,
                     ),
                     // `use ::*;` names the crate root itself.
-                    None => {
-                        (PerNs::types(self.crate_root(db).into(), Visibility::Public, None), 0)
-                    }
+                    None => (PerNs::types(self.crate_root(db).into(), Visibility::Public, None), 0),
                 }
             }
             PathKind::Plain => {
@@ -714,11 +723,8 @@ impl DefMap {
                         );
                     }
 
-                    let def_map = if module.block(db) == self.block_id() {
-                        self
-                    } else {
-                        module.def_map(db)
-                    };
+                    let def_map =
+                        if module.block(db) == self.block_id() { self } else { module.def_map(db) };
 
                     // Since it is a qualified path here, it should not contains legacy macros
                     let segment = segments.keyed_in(db, def_map, module, i);
@@ -730,8 +736,9 @@ impl DefMap {
                     cov_mark::hit!(can_import_enum_variant);
 
                     let named = i.checked_sub(1).map(|prev| &segments.names[prev]);
-                    let vis =
-                        self.declared_enum_visibility(db, e, curr, named, reads).unwrap_or(curr.vis);
+                    let vis = self
+                        .declared_enum_visibility(db, e, curr, named, reads)
+                        .unwrap_or(curr.vis);
                     // A variant is no binding of the enum's module: a write touching the enum
                     // wakes this read (`enum_glob_wakes`), as it wakes a glob of the enum.
                     crate::nameres::delta::reads::note(
@@ -740,14 +747,16 @@ impl DefMap {
                     );
                     // The variant's name as the enum's scope binds it, adjusted to the enum's
                     // expansion (rustc's `resolve_ident_in_module` of the enum's module).
-                    let segment = segments.keyed_for(db, || super::def_site::enum_expansion(db, e), i);
-                    let res = e.enum_variants(db).variants.get(&segment).map(|&(variant, shape)| {
-                        if shape.has_value_ns_ctor() {
-                            PerNs::both(variant.into(), variant.into(), vis, None)
-                        } else {
-                            PerNs::types(variant.into(), vis, None)
-                        }
-                    });
+                    let segment =
+                        segments.keyed_for(db, || super::def_site::enum_expansion(db, e), i);
+                    let res =
+                        e.enum_variants(db).variants.get(&segment).map(|&(variant, shape)| {
+                            if shape.has_value_ns_ctor() {
+                                PerNs::both(variant.into(), variant.into(), vis, None)
+                            } else {
+                                PerNs::types(variant.into(), vis, None)
+                            }
+                        });
                     // FIXME: Need to filter visibility here and below? Not sure.
                     return match res {
                         // Enum variants are in value namespace, segments left => no resolution.
@@ -784,11 +793,16 @@ impl DefMap {
                         Some(crate::nameres::delta::reads::trait_import()),
                     );
                     let mut res = PerNs::none();
-                    let listed = self.for_each_trait_item_for_import(db, trait_, q.collected, |name, item| {
-                        if name == *segment {
-                            res = res.or(trait_item_per_ns(item, curr.vis));
-                        }
-                    });
+                    let listed = self.for_each_trait_item_for_import(
+                        db,
+                        trait_,
+                        q.collected,
+                        |name, item| {
+                            if name == *segment {
+                                res = res.or(trait_item_per_ns(item, curr.vis));
+                            }
+                        },
+                    );
                     if listed.is_err() {
                         res = PerNs::none();
                     }
@@ -816,12 +830,11 @@ impl DefMap {
                 .filter_visibility(|vis| vis.is_visible_from_def_map(db, self, original_module));
             // A name can be a private module and a public function at once: the harness keeps
             // the module.
-            curr_per_ns = match visible != curr_per_ns
-                && self.is_test_harness(db, original_module, reads)
-            {
-                true => curr_per_ns,
-                false => visible,
-            };
+            curr_per_ns =
+                match visible != curr_per_ns && self.is_test_harness(db, original_module, reads) {
+                    true => curr_per_ns,
+                    false => visible,
+                };
         }
 
         ResolvePathResult::new(
@@ -958,7 +971,11 @@ impl DefMap {
         })
     }
 
-    fn resolve_in_macro_use_prelude<R: FnMut(PathRead)>(&self, name: &Name, reads: &mut R) -> PerNs {
+    fn resolve_in_macro_use_prelude<R: FnMut(PathRead)>(
+        &self,
+        name: &Name,
+        reads: &mut R,
+    ) -> PerNs {
         reads(PathRead::MacroUsePrelude(*name));
         self.macro_use_prelude.get(name).map_or(PerNs::none(), |&(it, extern_crate)| {
             PerNs::macros(
@@ -989,7 +1006,8 @@ impl DefMap {
                 self.name_in_module(db, self.root, name)
             }
         };
-        let done = if types_only { from_crate_root.types.is_some() } else { from_crate_root.is_full() };
+        let done =
+            if types_only { from_crate_root.types.is_some() } else { from_crate_root.is_full() };
         // Don't resolve the extern prelude in the pseudo-module of a block.
         if done || (self.block.is_some() && module == self.root) {
             return from_crate_root;

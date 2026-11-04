@@ -5,11 +5,11 @@ use std::any::Any;
 use std::{panic::RefUnwindSafe, sync};
 
 use base_db::{Crate, CrateBuilderId, CratesIdMap, Db, Env, ProcMacroLoadingError};
-use intern::Symbol;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_query::db::{Durability, Setter};
+use intern::Symbol;
 use span::Span;
+use std::alloc::Global;
 use triomphe::Arc;
 
 use crate::{ExpandError, ExpandErrorKind, ExpandResult, tt};
@@ -74,11 +74,8 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
 
     /// Run the expander on one call: what it gave, with what it read and whether its session's
     /// state took part ([`Expanded`]), which every expander states for every call it expands.
-    fn expand(
-        &self,
-        db: &Db,
-        call: ProcMacroCall<'_>,
-    ) -> Result<Expanded, ProcMacroExpansionError>;
+    fn expand(&self, db: &Db, call: ProcMacroCall<'_>)
+    -> Result<Expanded, ProcMacroExpansionError>;
 
     /// Run in the calling crate's compilation session. Native expanders use `expand`.
     fn expand_in(
@@ -93,7 +90,8 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool; // dyn: comparing expanders when a crate's macros are set, not per expansion
 }
 
-impl PartialEq for dyn ProcMacroExpander { // dyn: comparing expanders when a crate's macros are set, not per expansion
+impl PartialEq for dyn ProcMacroExpander {
+    // dyn: comparing expanders when a crate's macros are set, not per expansion
     fn eq(&self, other: &Self) -> bool {
         self.eq_dyn(other)
     }
@@ -166,8 +164,7 @@ pub const FAILED_READS: &str = "it failed: what a failed expansion read is not k
 
 /// What a failed call of a macro whose calls are ordered states of its session: its failure
 /// may be of the state the calls before it left.
-pub const FAILED_IN_SESSION: &str =
-    "a failed call of a proc macro whose calls run in order: its failure may depend on the calls before it";
+pub const FAILED_IN_SESSION: &str = "a failed call of a proc macro whose calls run in order: its failure may depend on the calls before it";
 
 /// What a proc-macro call gave, from [`CustomProcMacroExpander::expand`]: the expansion, what
 /// it read and whether its session's state took part, as its expander stated them, or as
@@ -259,7 +256,8 @@ impl ProcMacros {
     /// set that is not noted leaves it naming none.
     pub fn give(db: &mut Db, given: impl IntoIterator<Item = (Crate, ProcMacroLoadResult)>) {
         db.batch(base_db::Trigger::named("ProcMacros::give"), |db| {
-            let all = ProcMacros::try_get(db).unwrap_or_else(|| ProcMacros::new(db, Durability::HIGH, Default::default()));
+            let all = ProcMacros::try_get(db)
+                .unwrap_or_else(|| ProcMacros::new(db, Durability::HIGH, Default::default()));
             let mut by_crate = all.by_crate(db).clone();
             for (krate, macros) in given {
                 by_crate.insert(krate, Arc::new(CrateProcMacros::new(macros))); // alloc: once per crate, when its proc macros are loaded
@@ -386,11 +384,15 @@ fn missing(db: &Db, krate: Crate) -> ExpandErrorKind {
     let name = krate.named(db);
     let why = match ProcMacros::get_for_crate(db, krate).map(|it| &it.0) {
         // alloc: an error's message, once per macro call that can't be expanded
-        None => format!("the proc-macro crate `{name}` ({krate:?}) has no entry in the proc-macro map"),
+        None => {
+            format!("the proc-macro crate `{name}` ({krate:?}) has no entry in the proc-macro map")
+        }
         // alloc: as above
         Some(Err(e)) => format!("the proc-macro crate `{name}` ({krate:?}): {e}"),
         // alloc: as above
-        Some(Ok(_)) => format!("the proc-macro crate `{name}` ({krate:?}) loaded and exports no macro of this name"),
+        Some(Ok(_)) => format!(
+            "the proc-macro crate `{name}` ({krate:?}) loaded and exports no macro of this name"
+        ),
     };
     ExpandErrorKind::MissingProcMacroExpander { krate, why: why.into_boxed_str() }
 }
@@ -549,14 +551,24 @@ impl CustomProcMacroExpander {
         };
         let id = match self.proc_macro_id {
             Self::PROC_MACRO_ATTR_DISABLED => {
-                return refused(ExpandError::new(call_site, ExpandErrorKind::ProcMacroAttrExpansionDisabled));
+                return refused(ExpandError::new(
+                    call_site,
+                    ExpandErrorKind::ProcMacroAttrExpansionDisabled,
+                ));
             }
-            Self::MISSING_EXPANDER => return refused(ExpandError::new(call_site, missing(db, def_crate))),
-            Self::DISABLED_ID => return refused(ExpandError::new(call_site, ExpandErrorKind::MacroDisabled)),
+            Self::MISSING_EXPANDER => {
+                return refused(ExpandError::new(call_site, missing(db, def_crate)));
+            }
+            Self::DISABLED_ID => {
+                return refused(ExpandError::new(call_site, ExpandErrorKind::MacroDisabled));
+            }
             id => id,
         };
         let Some(proc_macros) = ProcMacros::get_for_crate(db, def_crate) else {
-            return refused(ExpandError::other(call_site, "internal error: no proc macros for crate"));
+            return refused(ExpandError::other(
+                call_site,
+                "internal error: no proc macros for crate",
+            ));
         };
         let proc_macro = match proc_macros.get(id, call_site) {
             Ok(proc_macro) => proc_macro,
@@ -571,14 +583,21 @@ impl CustomProcMacroExpander {
         };
         let result = match err {
             // Don't discard the item in case something unexpected happened while expanding attributes
-            ProcMacroExpansionError::System(text) if proc_macro.kind == ProcMacroKind::Attr => ExpandResult {
-                value: tt.copy(), // alloc: error path: an attribute macro that failed keeps its item
-                err: Some(ExpandError::other(call_site, text)),
-            },
-            ProcMacroExpansionError::System(text) | ProcMacroExpansionError::Panic(text) => ExpandResult::new(
-                empty(),
-                ExpandError::new(call_site, ExpandErrorKind::ProcMacroPanic(text.into_boxed_str())),
-            ),
+            ProcMacroExpansionError::System(text) if proc_macro.kind == ProcMacroKind::Attr => {
+                ExpandResult {
+                    value: tt.copy(), // alloc: error path: an attribute macro that failed keeps its item
+                    err: Some(ExpandError::other(call_site, text)),
+                }
+            }
+            ProcMacroExpansionError::System(text) | ProcMacroExpansionError::Panic(text) => {
+                ExpandResult::new(
+                    empty(),
+                    ExpandError::new(
+                        call_site,
+                        ExpandErrorKind::ProcMacroPanic(text.into_boxed_str()),
+                    ),
+                )
+            }
         };
         let state = match proc_macro.expander.ordered() {
             true => StateUse::Session(FAILED_IN_SESSION),
@@ -615,7 +634,10 @@ mod tests {
         assert!(none.contains("`pm`") && none.contains("no entry in the proc-macro map"), "{none}");
         set(fixture.db_mut(), krate, Err(ProcMacroLoadingError::NotYetBuilt));
         let unbuilt = why(fixture.db(), krate);
-        assert!(unbuilt.contains("`pm`") && unbuilt.contains("proc-macro not yet built"), "{unbuilt}");
+        assert!(
+            unbuilt.contains("`pm`") && unbuilt.contains("proc-macro not yet built"),
+            "{unbuilt}"
+        );
         set(fixture.db_mut(), krate, Ok(Vec::new()));
         let loaded = why(fixture.db(), krate);
         assert!(loaded.contains("exports no macro of this name"), "{loaded}");

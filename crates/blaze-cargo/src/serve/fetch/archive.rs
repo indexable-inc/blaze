@@ -30,7 +30,13 @@ pub(super) fn unpack(tarball: &[u8], prefix: &str) -> Result<Vec<SourceFile>, St
     let mut tar = Archive::new(LimitErrorReader { inner: gz, left: limit });
     let entries = tar.entries().map_err(|e| format!("failed to iterate over archive: {e}"))?;
     let mut files = Vec::new(); // alloc: the package's files, once a fetch
-    let mut names = Names::new(NameRules { top: Some(prefix), fold: false, twice: Twice::Refuse, reserved: &[], most_path: usize::MAX });
+    let mut names = Names::new(NameRules {
+        top: Some(prefix),
+        fold: false,
+        twice: Twice::Refuse,
+        reserved: &[],
+        most_path: usize::MAX,
+    });
     for entry in entries {
         let mut entry = entry.map_err(|e| format!("failed to iterate over archive: {e}"))?;
         let raw = entry.path_bytes().into_owned(); // alloc: an entry's name, once an entry
@@ -38,34 +44,43 @@ pub(super) fn unpack(tarball: &[u8], prefix: &str) -> Result<Vec<SourceFile>, St
         let kind = entry.header().entry_type();
         let is_dir = is_dir_entry(entry.header(), &raw);
         if !is_dir && kind != EntryType::Regular {
-            return Err(format!("invalid tarball downloaded, contains an entry at {shown:?} with invalid type {kind:?}"));
+            return Err(format!(
+                "invalid tarball downloaded, contains an entry at {shown:?} with invalid type {kind:?}"
+            ));
         }
-        let refused = |why: blaze_fetch::unpack::UnpackRefused| format!("invalid tarball downloaded: {why}");
+        let refused =
+            |why: blaze_fetch::unpack::UnpackRefused| format!("invalid tarball downloaded: {why}");
         let Some(inside) = names.under_top(&raw).map_err(refused)? else {
             if is_dir {
                 continue;
             }
-            return Err(format!("invalid tarball downloaded, contains a file at {shown:?} which is the package's directory"));
+            return Err(format!(
+                "invalid tarball downloaded, contains a file at {shown:?} which is the package's directory"
+            ));
         };
         if inside.rsplit('/').next() == Some(PACKAGE_SOURCE_LOCK) {
             continue;
         }
         if cfg!(windows) && is_windows_reserved_path(std::path::Path::new(&inside)) {
-            return Err(format!("`{shown}` appears to contain a reserved Windows path, it cannot be extracted on Windows"));
+            return Err(format!(
+                "`{shown}` appears to contain a reserved Windows path, it cannot be extracted on Windows"
+            ));
         }
         names.claim(&inside, is_dir).map_err(refused)?;
         if is_dir {
             continue;
         }
-        let bits = entry.header().mode().map_err(|e| format!("failed to unpack entry at `{shown}`: {e}"))?;
+        let bits = entry
+            .header()
+            .mode()
+            .map_err(|e| format!("failed to unpack entry at `{shown}`: {e}"))?;
         // The entry's bytes in a block of their own, kept past the fetch with the VFS tree
         // that holds them, read straight in: as many as its header says, which the archive's
         // limit bounds (a header claiming more stops here, as the reader would at the limit).
         let size = entry.size();
-        let size = usize::try_from(size)
-            .ok()
-            .filter(|_| size <= limit)
-            .ok_or_else(|| format!("failed to unpack entry at `{shown}`: maximum limit reached when reading"))?;
+        let size = usize::try_from(size).ok().filter(|_| size <= limit).ok_or_else(|| {
+            format!("failed to unpack entry at `{shown}`: maximum limit reached when reading")
+        })?;
         let bytes = Bytes::kept(Tag::Vfs, size, |place| entry.read_exact(place))
             .map_err(|e| format!("failed to unpack entry at `{shown}`: {e}"))?;
         let mode = if bits & 0o111 != 0 { Mode::Executable } else { Mode::Regular };

@@ -41,10 +41,10 @@ use blaze_ids::ContentId;
 
 use crate::{
     Given, RunKey, RunKind,
+    confine::GIVEN,
     roots::{Role, RoleSet, RootMap},
     rule::CargoRule,
     run::{self, Mode, OutFile, Value},
-    confine::GIVEN,
     trace::ALL_ENV_NAME,
 };
 
@@ -113,13 +113,20 @@ impl Prepared {
 
 /// The environment `unit`'s script sees, started in `inherited`: what [`prepare`] starts its
 /// run in ([`Prepared::script_env`]), and what a pure key's find reads its variables from.
-pub fn script_env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Vec<(OsString, OsString)>, Error> {
+pub fn script_env(
+    unit: &Unit,
+    inherited: &[(OsString, OsString)],
+) -> Result<Vec<(OsString, OsString)>, Error> {
     Ok(blaze_build_script::env(unit, inherited)?.vars)
 }
 
 /// `unit`'s run, in a build started with `inherited` (cargo's environment once started:
 /// [`blaze_build_script::env::cargo_started`]).
-pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -> Result<Prepared, Error> {
+pub fn prepare(
+    unit: &Unit,
+    inherited: &[(OsString, OsString)],
+    place: &Place,
+) -> Result<Prepared, Error> {
     let env = blaze_build_script::env(unit, inherited)?;
     let mut roots = place
         .roots
@@ -166,13 +173,16 @@ pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -
     // traced as it is read.
     let mut command_env = Vec::with_capacity(vars.len() + 1); // alloc: setup, the command's environment
     command_env.extend(vars.iter().cloned()); // clone: setup, as above; the check keeps its own
-    command_env.push((GIVEN.into(), crate::confine::given_value(names.iter().map(OsString::as_os_str)).map_err(Error)?));
+    command_env.push((
+        GIVEN.into(),
+        crate::confine::given_value(names.iter().map(OsString::as_os_str)).map_err(Error)?,
+    ));
     let command = Command {
         program: unit.script.clone(), // clone: setup, the command owns its program
-        args: Vec::new(), // alloc: none, an empty list
+        args: Vec::new(),             // alloc: none, an empty list
         env: command_env,
         dir: unit.package.manifest_dir.clone(), // clone: setup, the command owns its directory
-        stdin: Vec::new(), // alloc: none, empty
+        stdin: Vec::new(),                      // alloc: none, empty
         sandbox: Sandbox::On {
             read: place.read.clone(), // clone: setup, the sandbox owns what it may read
             write: vec![unit.out_dir.clone()], // clone: setup, the sandbox owns what it may write
@@ -183,7 +193,8 @@ pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -
         memory: place.memory,
     };
     // clone: setup, the run owns its OUT_DIR
-    let spec = run::Spec { key, command, out_dir: Some(unit.out_dir.clone()), mode: place.mode, roots };
+    let spec =
+        run::Spec { key, command, out_dir: Some(unit.out_dir.clone()), mode: place.mode, roots };
     Ok(Prepared { spec, env: checked, given: names, made: given })
 }
 
@@ -302,7 +313,11 @@ pub fn keyed(prepared: &Prepared, traced: &mut Traced) -> Result<(), Error> {
         traced.env.retain(|(name, value)| value.is_some() || !make_flag(name));
     }
     let checked = |name: &OsStr| {
-        prepared.env.binary_search_by(|it| it.0.as_os_str().cmp(name)).ok().map(|at| prepared.env[at].1.as_os_str())
+        prepared
+            .env
+            .binary_search_by(|it| it.0.as_os_str().cmp(name))
+            .ok()
+            .map(|at| prepared.env[at].1.as_os_str())
     };
     for (name, value) in traced.env.iter().filter(|it| it.0 != ALL_ENV_NAME) {
         if value.as_deref() != checked(name) {
@@ -320,7 +335,8 @@ pub fn keyed(prepared: &Prepared, traced: &mut Traced) -> Result<(), Error> {
     }
     if whole {
         // About a hundred names on each side, once per run kept: no order of the trace assumed.
-        let missing = prepared.env.iter().find(|(name, _)| !traced.env.iter().any(|it| it.0 == *name));
+        let missing =
+            prepared.env.iter().find(|(name, _)| !traced.env.iter().any(|it| it.0 == *name));
         if let Some((name, _)) = missing {
             // alloc: error path
             return Err(Error(format!(
@@ -340,7 +356,11 @@ pub fn keyed(prepared: &Prepared, traced: &mut Traced) -> Result<(), Error> {
 /// What cargo watches of `unit`'s run that ended as `exit` did: its `rerun-if-changed` and
 /// `rerun-if-env-changed`, or its whole package when it named no path. Output cargo refuses
 /// is the error cargo gives, and the run is not kept.
-pub fn cargo_rule(unit: &Unit, inherited: &[(OsString, OsString)], exit: &Exit) -> Result<CargoRule, Error> {
+pub fn cargo_rule(
+    unit: &Unit,
+    inherited: &[(OsString, OsString)],
+    exit: &Exit,
+) -> Result<CargoRule, Error> {
     let cx = output::Context::of(unit, inherited);
     blaze_build_script::watched_in(&exit.stdout, &cx, &unit.package.manifest_dir).map(CargoRule::of)
 }
@@ -367,7 +387,9 @@ pub fn verify_elided(elided: &Value, ran: &Value) -> Result<(), Error> {
     blaze_build_script::verify(&elided.stdout, &ran.stdout)?;
     match run::differs(elided, ran) {
         // alloc: error path
-        Some(what) => Err(Error(format!("the elided build script's run differs from what elision said: {what}"))),
+        Some(what) => Err(Error(format!(
+            "the elided build script's run differs from what elision said: {what}"
+        ))),
         None => Ok(()),
     }
 }
@@ -401,7 +423,9 @@ mod tests {
             network: false,
             memory: None,
             mode: Mode::Normal,
-            roots: RootMap::default().with(Role::Target, Path::new("/t")).with(Role::Tools, Path::new("/bin")),
+            roots: RootMap::default()
+                .with(Role::Target, Path::new("/t"))
+                .with(Role::Tools, Path::new("/bin")),
         }
     }
 
@@ -460,7 +484,10 @@ mod tests {
             force: true,
         });
         let with = |digest: &str| {
-            let place = Place { pinned: vec![("LLVM_SYS_231_PREFIX".into(), format!("sha256:{digest}"))], ..place() };
+            let place = Place {
+                pinned: vec![("LLVM_SYS_231_PREFIX".into(), format!("sha256:{digest}"))],
+                ..place()
+            };
             prepare(&given, &inherited("/a"), &place).unwrap().spec.key
         };
         let (a, b) = (with(&"a".repeat(64)), with(&"b".repeat(64)));
@@ -469,7 +496,13 @@ mod tests {
         let none = prepare(&given, &inherited("/a"), &place()).unwrap().spec.key;
         assert_ne!(a, none);
         // The variable it is given is set from the unit: in the key by its value too.
-        assert!(prepare(&given, &inherited("/a"), &place()).unwrap().given.iter().any(|it| it == "LLVM_SYS_231_PREFIX"));
+        assert!(
+            prepare(&given, &inherited("/a"), &place())
+                .unwrap()
+                .given
+                .iter()
+                .any(|it| it == "LLVM_SYS_231_PREFIX")
+        );
     }
 
     #[test]
@@ -484,7 +517,11 @@ mod tests {
         let three = prepare(&other, &inherited("/a"), &place()).unwrap();
         assert_ne!(one.spec.key, three.spec.key);
         for prepared in [&one, &two, &three] {
-            assert_eq!(prepared.made.finish(), prepared.spec.key.given, "the key is made of what is kept");
+            assert_eq!(
+                prepared.made.finish(),
+                prepared.spec.key.given,
+                "the key is made of what is kept"
+            );
         }
         let Sandbox::On { write, trace, .. } = &one.spec.command.sandbox else { panic!() };
         assert!(*trace && write == &[unit().out_dir]);
@@ -511,14 +548,21 @@ mod tests {
     #[test]
     fn a_trace_that_disagrees_with_the_check_is_refused_naming_the_variable() {
         let prepared = prepare(&unit(), &inherited("/a"), &place()).unwrap();
-        let mut other = Traced { env: vec![("PATH".into(), Some("/elsewhere".into()))], ..Traced::default() };
+        let mut other =
+            Traced { env: vec![("PATH".into(), Some("/elsewhere".into()))], ..Traced::default() };
         let error = keyed(&prepared, &mut other).unwrap_err();
         assert!(error.0.contains("`PATH`") && error.0.contains("a value of 10 bytes"), "{error:?}");
         // A value can be a secret: the error names its length, never its bytes.
         assert!(!error.0.contains("/elsewhere"), "{error:?}");
         // The whole environment read, every variable of the check's there but `HOME`.
         let mut env = vec![(OsString::from(ALL_ENV_NAME), Some(OsString::from("h")))];
-        env.extend(prepared.env.iter().filter(|it| it.0 != "HOME").map(|(name, value)| (name.clone(), Some(value.clone()))));
+        env.extend(
+            prepared
+                .env
+                .iter()
+                .filter(|it| it.0 != "HOME")
+                .map(|(name, value)| (name.clone(), Some(value.clone()))),
+        );
         let mut short = Traced { env, ..Traced::default() };
         let error = keyed(&prepared, &mut short).unwrap_err();
         assert!(error.0.contains("no `HOME`"), "{error:?}");
@@ -531,7 +575,10 @@ mod tests {
         assert_eq!(kept(" -j --jobserver-fds=3,4 -j"), None);
         assert_eq!(kept("--jobs=4 --jobserver-auth=fifo:/tmp/GMfifo1"), None);
         assert_eq!(kept("k -j8 --jobserver-auth=3,4"), Some("k".into()));
-        assert_eq!(kept("k -j8 --jobserver-auth=3,4 -- CFLAGS=-O3"), Some("k -- CFLAGS=-O3".into()));
+        assert_eq!(
+            kept("k -j8 --jobserver-auth=3,4 -- CFLAGS=-O3"),
+            Some("k -- CFLAGS=-O3".into())
+        );
         // Overrides are kept as they are, a `-j` among them too; an escaped space is in its word.
         assert_eq!(kept(" -- CFLAGS=-O3\\ -j2  X=1"), Some("-- CFLAGS=-O3\\ -j2  X=1".into()));
         assert_eq!(kept("-I/a\\ b -j3"), Some("-I/a\\ b".into()));
@@ -554,20 +601,43 @@ mod tests {
             prepare(&unit(), &env, &place()).unwrap()
         };
         let first = make("k -j8 --jobserver-auth=3,4 -- CFLAGS=-O3");
-        assert!(first.env.iter().any(|it| it.0 == "MAKEFLAGS" && it.1 == "k -- CFLAGS=-O3"), "{:?}", first.env);
+        assert!(
+            first.env.iter().any(|it| it.0 == "MAKEFLAGS" && it.1 == "k -- CFLAGS=-O3"),
+            "{:?}",
+            first.env
+        );
         assert!(!first.env.iter().any(|it| it.0 == "CARGO_MAKEFLAGS"));
         let store = kept_whole(&first);
-        assert!(finds(&store, &make("k -j4 --jobserver-auth=5,6 -- CFLAGS=-O3")), "another jobserver misses");
-        assert!(!finds(&store, &make("k -j8 --jobserver-auth=3,4 -- CFLAGS=-O0")), "another override finds");
-        assert!(!finds(&store, &make("-j8 --jobserver-auth=3,4")), "no override finds the run given one");
+        assert!(
+            finds(&store, &make("k -j4 --jobserver-auth=5,6 -- CFLAGS=-O3")),
+            "another jobserver misses"
+        );
+        assert!(
+            !finds(&store, &make("k -j8 --jobserver-auth=3,4 -- CFLAGS=-O0")),
+            "another override finds"
+        );
+        assert!(
+            !finds(&store, &make("-j8 --jobserver-auth=3,4")),
+            "no override finds the run given one"
+        );
         // Only the jobserver: as a build outside make.
         let outside = kept_whole(&prepare(&unit(), &inherited("/a"), &place()).unwrap());
         assert!(finds(&outside, &make("-j8 --jobserver-auth=3,4")));
         // Cargo's rule records what the check has of it.
-        let mut traced = Traced { untraceable: vec![blaze_core::Untraceable::Clock], ..Traced::default() };
-        let watched = CargoRule { env: vec!["MAKEFLAGS".into(), "CARGO_MAKEFLAGS".into()], ..CargoRule::default() };
+        let mut traced =
+            Traced { untraceable: vec![blaze_core::Untraceable::Clock], ..Traced::default() };
+        let watched = CargoRule {
+            env: vec!["MAKEFLAGS".into(), "CARGO_MAKEFLAGS".into()],
+            ..CargoRule::default()
+        };
         rule::widen(&mut traced, &watched, &mut Disk::new(first.env.clone())).unwrap();
-        assert_eq!(traced.env, vec![("CARGO_MAKEFLAGS".into(), None), ("MAKEFLAGS".into(), Some("k -- CFLAGS=-O3".into()))]);
+        assert_eq!(
+            traced.env,
+            vec![
+                ("CARGO_MAKEFLAGS".into(), None),
+                ("MAKEFLAGS".into(), Some("k -- CFLAGS=-O3".into()))
+            ]
+        );
     }
 
     /// The store a run of `prepared` that read its whole environment leaves, as `Run::complete`
@@ -589,10 +659,12 @@ mod tests {
 
         // The run, as the sandbox reports it: what it read of the environment it was started with.
         let lines: Vec<Line> = names.iter().map(|name| Line::new(Seen::Env, "", name)).collect();
-        let mut traced = trace::assemble(&lines, None, &mut Disk::new(prepared.script_env().to_vec())).unwrap();
+        let mut traced =
+            trace::assemble(&lines, None, &mut Disk::new(prepared.script_env().to_vec())).unwrap();
         keyed(prepared, &mut traced).unwrap();
         let roots = prepared.spec.roots.view();
-        let (marked, stored) = roots.kept(&traced, &elided(b"cargo:rustc-cfg=x\n".to_vec())).unwrap();
+        let (marked, stored) =
+            roots.kept(&traced, &elided(b"cargo:rustc-cfg=x\n".to_vec())).unwrap();
         vec![
             (index::slot(&prepared.spec.key, 0), Shape::of(&marked.local).encode()),
             (index::result_key(&prepared.spec.key, &marked.local), stored.encode()),
@@ -616,18 +688,39 @@ mod tests {
             prepare(&unit(), &env, &place()).unwrap()
         };
         let first = shell("/a", "x", "1");
-        let given = first.spec.command.env.iter().find(|it| it.0 == GIVEN).expect("the launcher is told the given names");
+        let given = first
+            .spec
+            .command
+            .env
+            .iter()
+            .find(|it| it.0 == GIVEN)
+            .expect("the launcher is told the given names");
         let given: Vec<&str> = given.1.to_str().unwrap().split('=').collect();
         assert!(given.contains(&"OUT_DIR") && given.contains(&"TARGET"), "{given:?}");
-        assert!(!given.iter().any(|it| ["PATH", "OLDPWD", "SHLVL", "CARGO_MAKEFLAGS"].contains(it)), "{given:?}");
-        assert!(!first.script_env().iter().any(|it| it.0 == GIVEN), "the launcher's variable is not the script's");
+        assert!(
+            !given.iter().any(|it| ["PATH", "OLDPWD", "SHLVL", "CARGO_MAKEFLAGS"].contains(it)),
+            "{given:?}"
+        );
+        assert!(
+            !first.script_env().iter().any(|it| it.0 == GIVEN),
+            "the launcher's variable is not the script's"
+        );
         // It read `PATH` by name, and `TARGET`, which its key has already.
         let store = kept_reading(&first, &["PATH", "TARGET"]);
-        assert!(finds(&store, &shell("/a", "y", "3")), "another shell, the same in what the run read, misses");
-        assert!(!finds(&store, &shell("/b", "x", "1")), "another PATH, which the run read, finds the run of another");
+        assert!(
+            finds(&store, &shell("/a", "y", "3")),
+            "another shell, the same in what the run read, misses"
+        );
+        assert!(
+            !finds(&store, &shell("/b", "x", "1")),
+            "another PATH, which the run read, finds the run of another"
+        );
         // One that read `OLDPWD` is keyed by it.
         let store = kept_reading(&first, &["OLDPWD"]);
-        assert!(!finds(&store, &shell("/a", "y", "1")), "another OLDPWD, which the run read, finds the run of another");
+        assert!(
+            !finds(&store, &shell("/a", "y", "1")),
+            "another OLDPWD, which the run read, finds the run of another"
+        );
         assert!(finds(&store, &shell("/b", "x", "2")));
     }
 
@@ -641,10 +734,16 @@ mod tests {
         };
 
         let get = |key: &blaze_cas::Key| {
-            Ok::<_, blaze_cas::Corrupt>(store.iter().find(|it| it.0 == *key).map(|it| it.1.as_slice()))
+            Ok::<_, blaze_cas::Corrupt>(
+                store.iter().find(|it| it.0 == *key).map(|it| it.1.as_slice()),
+            )
         };
         let mut disk = Disk::new(prepared.env.clone());
-        let found = index::search(get, &prepared.spec.key, &mut Rooted::new(prepared.spec.roots.view(), &mut disk));
+        let found = index::search(
+            get,
+            &prepared.spec.key,
+            &mut Rooted::new(prepared.spec.roots.view(), &mut disk),
+        );
         match found {
             Ok(Found::Hit { .. }) => true,
             Ok(Found::Miss { .. }) => false,
@@ -670,7 +769,8 @@ mod tests {
 
         let mut sim = Sim::new(11, Faults::default());
         let mut effects = Vec::new();
-        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+        let config =
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(&mut sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
@@ -687,17 +787,25 @@ mod tests {
         // Kept as the daemon keeps it when the sandboxed run ends: from its Start.
         let prepared = prepare(&unit(), &inherited("/a"), &place()).unwrap();
         let mut disk = Disk::new(prepared.script_env().to_vec());
-        pure::keep(&mut store, &proof, prepared.spec.roots.view(), Vec::new(), &mut disk, &value).unwrap();
+        pure::keep(&mut store, &proof, prepared.spec.roots.view(), Vec::new(), &mut disk, &value)
+            .unwrap();
         // The next build's lookup, before anything is compiled: the script's environment made
         // again, under the run's roots.
-        let roots = place().roots.with(Role::Package, &unit().package.manifest_dir).with(Role::OutDir, &unit().out_dir);
+        let roots = place()
+            .roots
+            .with(Role::Package, &unit().package.manifest_dir)
+            .with(Role::OutDir, &unit().out_dir);
         let reader = store.reader();
         let guard = blaze_cas::enter();
         let find = |unit: &Unit| {
             let mut disk = Disk::new(script_env(unit, &inherited("/a")).unwrap());
             pure::find(&reader, &guard, &proof, roots.view(), &mut disk).unwrap()
         };
-        assert_eq!(find(&unit()), Some(value), "a pure key kept by a run is not found by the next build");
+        assert_eq!(
+            find(&unit()),
+            Some(value),
+            "a pure key kept by a run is not found by the next build"
+        );
         let mut other = unit();
         other.target = "aarch64-unknown-linux-gnu".into();
         assert_eq!(find(&other), None, "a given variable the script reads is not in its pure key");
@@ -750,7 +858,8 @@ mod tests {
         assert_eq!(named.paths, vec![PathBuf::from("/ws/p/build.rs")]);
         assert_eq!(named.env, vec![OsString::from("VERSION")]);
         let env_only =
-            cargo_rule(&unit(), &inherited("/a"), &exit(b"cargo:rerun-if-env-changed=VERSION\n")).unwrap();
+            cargo_rule(&unit(), &inherited("/a"), &exit(b"cargo:rerun-if-env-changed=VERSION\n"))
+                .unwrap();
         assert_eq!(env_only.package, None);
         assert!(env_only.paths.is_empty());
     }
@@ -774,13 +883,17 @@ mod tests {
     fn an_inert_script_is_read_and_checked_against_its_run() {
         let root = PathBuf::from("/ws/p/build.rs");
         let files: BTreeMap<PathBuf, Vec<u8>> =
-            [(root.clone(), b"fn main() {\n    println!(\"cargo:rustc-cfg=fast\");\n}\n".to_vec())].into();
+            [(root.clone(), b"fn main() {\n    println!(\"cargo:rustc-cfg=fast\");\n}\n".to_vec())]
+                .into();
         let value = inert(&root, &files, &[]).unwrap();
         assert_eq!(value.stdout, b"cargo:rustc-cfg=fast\n");
         assert!(inert(&root, &files, &["-D".into(), "warnings".into()]).is_none());
-        let other: BTreeMap<PathBuf, Vec<u8>> =
-            [(root.clone(), b"fn main() { println!(\"cargo:rustc-env=T={}\", std::env::var(\"T\").unwrap()); }\n".to_vec())]
-                .into();
+        let other: BTreeMap<PathBuf, Vec<u8>> = [(
+            root.clone(),
+            b"fn main() { println!(\"cargo:rustc-env=T={}\", std::env::var(\"T\").unwrap()); }\n"
+                .to_vec(),
+        )]
+        .into();
         assert!(inert(&root, &other, &[]).is_none());
         verify_elided(&value, &elided(b"cargo:rustc-cfg=fast\n".to_vec())).unwrap();
         assert!(verify_elided(&value, &elided(b"cargo:rustc-cfg=slow\n".to_vec())).is_err());

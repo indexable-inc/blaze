@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use blaze_cas::{Kind, Key};
+use blaze_cas::{Key, Kind};
 use blaze_fuzzer::Target;
 use blaze_ids::ContentId;
 
@@ -102,8 +102,10 @@ fn check(data: &[u8]) {
             &[shared::PackRef { committed: pack.len() as u64, ..shared::lone_ref(0) }],
             &dictionaries,
         );
-        let mut sim =
-            shared::store_of(&[(HEAD, head.as_slice()), (shared::pack_file(0).as_str(), pack.as_slice())]);
+        let mut sim = shared::store_of(&[
+            (HEAD, head.as_slice()),
+            (shared::pack_file(0).as_str(), pack.as_slice()),
+        ]);
         shared::read_back(&mut sim, &[(value.key, None)]);
     } else {
         let (values, settles) = shared::values(&mut input);
@@ -206,7 +208,15 @@ fn seeds() -> Vec<Vec<u8>> {
 
 /// A compressed value record of key 0 naming `raw` bytes, its content no hash of them.
 fn cold(kind: Kind, form: u8, dictionary: u32, raw: u64) -> Record {
-    Record { kind: kind.code(), form, dictionary, stored: 0, raw, key: shared::key(0), content: ContentId([0; 32]) }
+    Record {
+        kind: kind.code(),
+        form,
+        dictionary,
+        stored: 0,
+        raw,
+        key: shared::key(0),
+        content: ContentId([0; 32]),
+    }
 }
 
 #[cfg_attr(test, allow(dead_code))]

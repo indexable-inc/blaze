@@ -58,8 +58,7 @@ pub mod wait;
 
 pub use machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec};
 pub use plane::{
-    Budget, Key, Memo, NoMemo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId,
-    RequestStats,
+    Budget, Key, Memo, NoMemo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
 };
 
 /// A task stopped before its end because going on could not end: a wait that would close a

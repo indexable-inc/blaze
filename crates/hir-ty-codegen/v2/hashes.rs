@@ -30,6 +30,7 @@ use base_db::Db;
 use blaze_format::SpanRef;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey, item_key, key};
+use blaze_query::db::FromId;
 use hir_def::{DefWithBodyId, ExpressionStoreOwnerId, FunctionId, expr_store::Body as BodyStore};
 use hir_ty::{
     InferBodyId,
@@ -41,7 +42,6 @@ use hir_ty_share::{
     code::{self, TABLES},
     identity,
 };
-use blaze_query::db::FromId;
 
 use super::{Body, Hashes};
 
@@ -86,7 +86,7 @@ impl ItemHashes {
             // alloc: the tables returned, exact size
             store.bindings().map(|(it, _)| MirSpan::BindingId(it)).collect(),
             vec![MirSpan::SelfParam], // alloc: the tables returned, one span
-            vec![MirSpan::Unknown], // alloc: the tables returned, one span
+            vec![MirSpan::Unknown],   // alloc: the tables returned, one span
         ];
         anchors.into_iter().zip(spans).collect() // alloc: the tables returned, exact size
     }
@@ -119,7 +119,10 @@ impl Hashes for ItemHashes {
                 }
                 Body::CoroutineByMove(id) => {
                     let id = InternedCoroutineId::from_id(id);
-                    (code::of_coroutine_by_move(db, id), id.loc(db).owner.expression_store_owner(db))
+                    (
+                        code::of_coroutine_by_move(db, id),
+                        id.loc(db).owner.expression_store_owner(db),
+                    )
                 }
             };
             let code = match code {
@@ -138,7 +141,9 @@ impl Hashes for ItemHashes {
                 Body::Item(def) => code::of_item(db, def),
                 Body::Closure(id) => code::of_closure(db, InternedClosureId::from_id(id)),
                 Body::Coroutine(id) => code::of_coroutine(db, InternedCoroutineId::from_id(id)),
-                Body::CoroutineByMove(id) => code::of_coroutine_by_move(db, InternedCoroutineId::from_id(id)),
+                Body::CoroutineByMove(id) => {
+                    code::of_coroutine_by_move(db, InternedCoroutineId::from_id(id))
+                }
             };
             let code = code.as_ref().map_err(ToString::to_string)?; // alloc: the error's message
             let mut h = Hasher::new(TEMPLATE_CODE_DOMAIN);
@@ -165,7 +170,10 @@ impl Hashes for ItemHashes {
             h.update(&(files.len() as u64).to_le_bytes());
             for file in &files {
                 match file {
-                    Some(name) => h.update(&[1]).update(&(name.len() as u64).to_le_bytes()).update(name.as_bytes()),
+                    Some(name) => h
+                        .update(&[1])
+                        .update(&(name.len() as u64).to_le_bytes())
+                        .update(name.as_bytes()),
                     None => h.update(&[0]),
                 };
             }
@@ -201,12 +209,7 @@ impl Hashes for ItemHashes {
         blaze_query::db::attach(db, || identity::konst(db, konst).map_err(|why| why.to_string()))
     }
 
-    fn span(
-        &self,
-        db: &Db,
-        owner: DefWithBodyId,
-        span: MirSpan,
-    ) -> Result<SpanRef, String> {
+    fn span(&self, db: &Db, owner: DefWithBodyId, span: MirSpan) -> Result<SpanRef, String> {
         let Ok((table, index)) = code::table_of(span) else {
             // alloc: the error's message
             return Err(format!(
@@ -244,7 +247,9 @@ pub(crate) fn told_of(db: &Db, body: Body) -> Result<Option<ContentId>, String> 
         Body::Item(def) => db.mir_body(InferBodyId::DefWithBodyId(def)),
         Body::Closure(id) => db.mir_body_for_closure(InternedClosureId::from_id(id)),
         Body::Coroutine(id) => db.mir_body_for_coroutine(InternedCoroutineId::from_id(id)),
-        Body::CoroutineByMove(id) => db.mir_body_for_coroutine_by_move(InternedCoroutineId::from_id(id)),
+        Body::CoroutineByMove(id) => {
+            db.mir_body_for_coroutine_by_move(InternedCoroutineId::from_id(id))
+        }
     };
     // alloc: the error's message
     let mir = mir.map_err(|why| format!("the MIR of {body:?} failed to lower: {why:?}"))?;
@@ -258,7 +263,9 @@ pub(crate) fn span_owner(db: &Db, body: Body) -> Option<DefWithBodyId> {
     let owner = match body {
         Body::Item(def) => return Some(def),
         Body::Closure(id) => InternedClosureId::from_id(id).loc(db).owner,
-        Body::Coroutine(id) | Body::CoroutineByMove(id) => InternedCoroutineId::from_id(id).loc(db).owner,
+        Body::Coroutine(id) | Body::CoroutineByMove(id) => {
+            InternedCoroutineId::from_id(id).loc(db).owner
+        }
     };
     match owner {
         InferBodyId::DefWithBodyId(def) => Some(def),

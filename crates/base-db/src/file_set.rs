@@ -3,9 +3,9 @@
 use std::fmt;
 
 use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use blaze_mem::scratch;
 use indexmap::IndexMap;
+use std::alloc::Global;
 
 use crate::{AnchoredPath, FileId, VfsPath};
 
@@ -132,7 +132,10 @@ impl FileSetConfig {
     }
 
     /// `files` partitioned: set `i` for each prefix list `i`, then the set of the rest.
-    pub fn partition<'p>(&self, files: impl IntoIterator<Item = (FileId, &'p VfsPath)>) -> Vec<FileSet> {
+    pub fn partition<'p>(
+        &self,
+        files: impl IntoIterator<Item = (FileId, &'p VfsPath)>,
+    ) -> Vec<FileSet> {
         let mut res = vec![FileSet::default(); self.n_file_sets]; // alloc: the sets are the output
         scratch::with_bytes(|key| {
             for (file_id, path) in files {

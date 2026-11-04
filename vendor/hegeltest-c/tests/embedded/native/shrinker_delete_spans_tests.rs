@@ -35,14 +35,7 @@ fn int_node(value: i128) -> ChoiceNode {
 }
 
 fn span(start: usize, end: usize) -> Span {
-    Span {
-        start,
-        end,
-        label: 1,
-        depth: 0,
-        parent: None,
-        discarded: false,
-    }
+    Span { start, end, label: 1, depth: 0, parent: None, discarded: false }
 }
 
 fn values(nodes: &[ChoiceNode]) -> Vec<i128> {
@@ -135,13 +128,7 @@ fn stale_narrow_and_duplicate_spans_cost_no_test_calls() {
 /// is tried again rather than skipped.
 #[test]
 fn attempted_extents_reset_after_an_improvement() {
-    let initial = vec![
-        int_node(1),
-        int_node(1),
-        int_node(2),
-        int_node(2),
-        int_node(3),
-    ];
+    let initial = vec![int_node(1), int_node(1), int_node(2), int_node(2), int_node(3)];
     let mut initial_spans = Spans::new();
     initial_spans.push(span(0, 2));
     initial_spans.push(span(2, 4));
@@ -191,9 +178,7 @@ fn float_node(value: f64) -> ChoiceNode {
 fn string_node(value: &str) -> ChoiceNode {
     ChoiceNode::string(
         StringChoice {
-            intervals: IntervalSet::new(vec![(b'a' as u32, b'z' as u32)])
-                .unwrap()
-                .into(),
+            intervals: IntervalSet::new(vec![(b'a' as u32, b'z' as u32)]).unwrap().into(),
             min_size: 0,
             max_size: 16,
             constraint: None,
@@ -248,11 +233,7 @@ fn list_spans(nodes: &[ChoiceNode]) -> Spans {
     let list_end = 2 * elements.len() + 1;
     spans.push(span(0, list_end));
     for k in 0..elements.len() {
-        spans.push(Span {
-            parent: Some(0),
-            depth: 1,
-            ..span(2 * k + 1, 2 * k + 2)
-        });
+        spans.push(Span { parent: Some(0), depth: 1, ..span(2 * k + 1, 2 * k + 2) });
     }
     spans.push(span(list_end, list_end + 1));
     spans
@@ -313,10 +294,7 @@ fn deleting_an_element_flips_a_parity_flag_drawn_after_the_list() {
     });
     drive_no_yield(shrinker.delete_spans()).unwrap();
     let (elements, even) = decode_list(&shrinker.current_nodes).unwrap();
-    assert_eq!(
-        (elements, even.value()),
-        (vec![1], ChoiceValue::Boolean(false))
-    );
+    assert_eq!((elements, even.value()), (vec![1], ChoiceValue::Boolean(false)));
 }
 
 #[test]
@@ -327,10 +305,7 @@ fn deleting_an_element_shortens_a_string_drawn_after_the_list() {
     });
     drive_no_yield(shrinker.delete_spans()).unwrap();
     let (elements, s) = decode_list(&shrinker.current_nodes).unwrap();
-    assert_eq!(
-        (elements, s.value()),
-        (vec![1], ChoiceValue::String(vec![b'a' as u32]))
-    );
+    assert_eq!((elements, s.value()), (vec![1], ChoiceValue::String(vec![b'a' as u32])));
 }
 
 #[test]
@@ -345,25 +320,12 @@ fn a_float_drawn_after_the_list_is_not_nudged() {
 
 #[test]
 fn a_deletion_with_nothing_after_the_enclosing_span_is_not_retried() {
-    let initial = vec![
-        bool_node(true),
-        int_node(0),
-        bool_node(true),
-        int_node(1),
-        bool_node(false),
-    ];
+    let initial =
+        vec![bool_node(true), int_node(0), bool_node(true), int_node(1), bool_node(false)];
     let mut spans = Spans::new();
     spans.push(span(0, 5));
-    spans.push(Span {
-        parent: Some(0),
-        depth: 1,
-        ..span(1, 2)
-    });
-    spans.push(Span {
-        parent: Some(0),
-        depth: 1,
-        ..span(3, 4)
-    });
+    spans.push(Span { parent: Some(0), depth: 1, ..span(1, 2) });
+    spans.push(Span { parent: Some(0), depth: 1, ..span(3, 4) });
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in_probe = Arc::clone(&calls);
     let mut shrinker = Shrinker::with_probe(

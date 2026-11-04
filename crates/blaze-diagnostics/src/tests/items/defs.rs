@@ -355,7 +355,8 @@ fn main() {}
 #[test]
 fn a_lifetime_declared_twice_is_e0403() {
     // tests/ui/error-codes/E0263.rs
-    let source = "fn foo<'a, 'b, 'a>(x: &'a str, y: &'b str) {\n    //~^ ERROR E0403\n}\n\nfn main() {}\n";
+    let source =
+        "fn foo<'a, 'b, 'a>(x: &'a str, y: &'b str) {\n    //~^ ERROR E0403\n}\n\nfn main() {}\n";
     let stderr = r#"error[E0403]: the name `'a` is already used for a generic parameter in this item's generic parameters
   --> $DIR/E0263.rs:1:16
    |
@@ -543,7 +544,8 @@ For more information about this error, try `rustc --explain E0415`.
 #[test]
 fn a_name_bound_twice_in_a_pattern() {
     // tests/ui/error-codes/E0416.rs
-    let source = "fn main() {\n    match (1, 2) {\n        (x, x) => {} //~ ERROR E0416\n    }\n}\n";
+    let source =
+        "fn main() {\n    match (1, 2) {\n        (x, x) => {} //~ ERROR E0416\n    }\n}\n";
     let stderr = r#"error[E0416]: identifier `x` is bound more than once in the same pattern
   --> $DIR/E0416.rs:3:13
    |
@@ -615,7 +617,11 @@ fn main() {}
     // rustc points at `$a: u8` in the `macro_rules!`, blaze at `legacy!(a)`, where the field's
     // name was written (a span mapping of a node made of two files' tokens, not hygiene).
     let stderr = ui("fields-definition.rs", "2015", source);
-    assert_eq!(stderr.matches("error[E0124]: field `a` is already declared").count(), 1, "{stderr}");
+    assert_eq!(
+        stderr.matches("error[E0124]: field `a` is already declared").count(),
+        1,
+        "{stderr}"
+    );
     assert!(stderr.contains("`a` first declared here"), "{stderr}");
     assert!(stderr.contains("this error originates in the macro `legacy`"), "{stderr}");
 }
@@ -720,7 +726,18 @@ fn main() {
     TooManyVariants::X256 as u8;
 }
 "#;
-    assert_reports(&ui_core("E0081.rs", "2015", "unary_ops, builtin_impls", source), &[error(1, &["`3`"]), error(11, &["`1`"]), error(20, &["`-1`"]), error(30, &["`0`"]), error(30, &["`-2`"]), error(87, &["`X256`"]), error(57, &["`0`"])]);
+    assert_reports(
+        &ui_core("E0081.rs", "2015", "unary_ops, builtin_impls", source),
+        &[
+            error(1, &["`3`"]),
+            error(11, &["`1`"]),
+            error(20, &["`-1`"]),
+            error(30, &["`0`"]),
+            error(30, &["`-2`"]),
+            error(87, &["`X256`"]),
+            error(57, &["`0`"]),
+        ],
+    );
 }
 
 #[test]
@@ -964,11 +981,9 @@ fn a_bits_field_of_no_fixed_width_names_the_struct_the_field_and_the_type() {
         .collect();
     assert_eq!(
         errors,
-        [
-            "field `len` of `#[blaze::bits]` struct `Wire`: type `usize` is as wide as the \
+        ["field `len` of `#[blaze::bits]` struct `Wire`: type `usize` is as wide as the \
              target's pointers, and a bit-packed layout may not change with the target: use a \
-             fixed-width integer"
-        ]
+             fixed-width integer"]
     );
 }
 
@@ -1003,6 +1018,10 @@ fn main() {}
 "#;
     // rustc's one error, `Legacy`'s, checked by count and macro as the fields' version is.
     let stderr = ui("variants-definition.rs", "2015", source);
-    assert_eq!(stderr.matches("error[E0428]: the name `V` is defined multiple times").count(), 1, "{stderr}");
+    assert_eq!(
+        stderr.matches("error[E0428]: the name `V` is defined multiple times").count(),
+        1,
+        "{stderr}"
+    );
     assert!(stderr.contains("this error originates in the macro `legacy`"), "{stderr}");
 }

@@ -8,9 +8,7 @@ use alloc::vec;
 fn nested_clones(depth: usize) -> Vec<ChoiceValue> {
     let mut choices = vec![ChoiceValue::Boolean(true)];
     for _ in 0..depth {
-        choices = vec![ChoiceValue::Clone(std::sync::Arc::new(
-            CloneRecord::from_values(choices),
-        ))];
+        choices = vec![ChoiceValue::Clone(std::sync::Arc::new(CloneRecord::from_values(choices)))];
     }
     choices
 }
@@ -47,17 +45,13 @@ fn small_sequence_uses_the_raw_prefix() {
     let blob = encode_failure(&[ChoiceValue::Boolean(true)]).unwrap();
     let bytes = base64_decode(&blob).unwrap();
     assert_eq!(bytes[0], PREFIX_RAW);
-    assert_eq!(
-        decode_failure(&blob).unwrap(),
-        vec![ChoiceValue::Boolean(true)]
-    );
+    assert_eq!(decode_failure(&blob).unwrap(), vec![ChoiceValue::Boolean(true)]);
 }
 
 #[test]
 fn long_repetitive_sequence_uses_the_zlib_prefix() {
-    let choices: Vec<ChoiceValue> = (0..500)
-        .map(|_| ChoiceValue::Integer(BigInt::from(1)))
-        .collect();
+    let choices: Vec<ChoiceValue> =
+        (0..500).map(|_| ChoiceValue::Integer(BigInt::from(1))).collect();
     let blob = encode_failure(&choices).unwrap();
     let bytes = base64_decode(&blob).unwrap();
     assert_eq!(bytes[0], PREFIX_ZLIB);
@@ -100,9 +94,7 @@ fn decode_rejects_zlib_bomb() {
     let raw = serialize_choices(&[ChoiceValue::Bytes(vec![0u8; MAX_DECOMPRESSED_LEN])]).unwrap();
     assert!(raw.len() > MAX_DECOMPRESSED_LEN);
     let mut payload = vec![PREFIX_ZLIB];
-    payload.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(
-        &raw, ZLIB_LEVEL,
-    ));
+    payload.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(&raw, ZLIB_LEVEL));
     let blob = base64_encode(&payload);
     assert!(decode_failure(&blob).is_none());
 }
@@ -119,10 +111,7 @@ fn over_bound_payload_takes_the_raw_prefix_and_round_trips() {
 #[test]
 fn zlib_decode_limit_admits_large_legitimate_blobs() {
     let choices = vec![ChoiceValue::Bytes(vec![0u8; MAX_DECOMPRESSED_LEN - 9])];
-    assert_eq!(
-        serialize_choices(&choices).unwrap().len(),
-        MAX_DECOMPRESSED_LEN
-    );
+    assert_eq!(serialize_choices(&choices).unwrap().len(), MAX_DECOMPRESSED_LEN);
     let blob = encode_failure(&choices).unwrap();
     let bytes = base64_decode(&blob).unwrap();
     assert_eq!(bytes[0], PREFIX_ZLIB);
@@ -133,14 +122,14 @@ fn zlib_decode_limit_admits_large_legitimate_blobs() {
 fn blob_roundtrips_clone_values() {
     let choices = vec![
         ChoiceValue::Boolean(true),
-        ChoiceValue::Clone(std::sync::Arc::new(
-            crate::native::core::CloneRecord::from_values(vec![
+        ChoiceValue::Clone(std::sync::Arc::new(crate::native::core::CloneRecord::from_values(
+            vec![
                 ChoiceValue::Integer(crate::native::bignum::BigInt::from(7)),
                 ChoiceValue::Clone(std::sync::Arc::new(
                     crate::native::core::CloneRecord::from_values(Vec::new()),
                 )),
-            ]),
-        )),
+            ],
+        ))),
     ];
     let blob = encode_failure(&choices).unwrap();
     assert_eq!(decode_failure(&blob), Some(choices));
@@ -151,20 +140,13 @@ fn graph_of(values: Vec<ChoiceValue>) -> Graph {
         steps: values
             .into_iter()
             .enumerate()
-            .map(|(i, value)| Step {
-                addr: vec![(28, i)],
-                value,
-            })
+            .map(|(i, value)| Step { addr: vec![(28, i)], value })
             .collect(),
     })
 }
 
 fn sample_nd_state() -> NdReproState {
-    NdReproState {
-        graph: graph_of(sample_choices()),
-        entropy: 0xDEAD_BEEF_CAFE_F00D,
-        longest: 12,
-    }
+    NdReproState { graph: graph_of(sample_choices()), entropy: 0xDEAD_BEEF_CAFE_F00D, longest: 12 }
 }
 
 fn same_graph(a: &Graph, b: &Graph) -> bool {
@@ -186,14 +168,10 @@ fn nd_blob_round_trips_graph_entropy_and_longest() {
 
 #[test]
 fn incompressible_nd_state_uses_the_raw_prefix() {
-    let noise: Vec<u8> = (0..200u32)
-        .map(|i| (i.wrapping_mul(197).wrapping_add(i * i * 31) % 251) as u8)
-        .collect();
-    let state = NdReproState {
-        graph: graph_of(vec![ChoiceValue::Bytes(noise)]),
-        entropy: 1,
-        longest: 4,
-    };
+    let noise: Vec<u8> =
+        (0..200u32).map(|i| (i.wrapping_mul(197).wrapping_add(i * i * 31) % 251) as u8).collect();
+    let state =
+        NdReproState { graph: graph_of(vec![ChoiceValue::Bytes(noise)]), entropy: 1, longest: 4 };
     let blob = encode_nd_failure(&state).unwrap();
     let bytes = base64_decode(&blob).unwrap();
     assert_eq!(bytes[0], PREFIX_ND_RAW);
@@ -203,11 +181,7 @@ fn incompressible_nd_state_uses_the_raw_prefix() {
 #[test]
 fn long_nd_state_uses_the_zlib_prefix_and_round_trips() {
     let state = NdReproState {
-        graph: graph_of(
-            (0..500)
-                .map(|_| ChoiceValue::Integer(BigInt::from(1)))
-                .collect(),
-        ),
+        graph: graph_of((0..500).map(|_| ChoiceValue::Integer(BigInt::from(1))).collect()),
         entropy: 7,
         longest: 4,
     };
@@ -234,10 +208,7 @@ fn nd_state_decode_rejects_malformed_bytes() {
     assert!(decode_nd_state(&good[1..]).is_none(), "wrong magic");
     assert!(decode_nd_state(&good[..5]).is_none(), "no entropy");
     assert!(decode_nd_state(&good[..13]).is_none(), "no longest");
-    assert!(
-        decode_nd_state(&good[..good.len() - 1]).is_none(),
-        "truncated graph"
-    );
+    assert!(decode_nd_state(&good[..good.len() - 1]).is_none(), "truncated graph");
     let mut wrong_version = good.clone();
     wrong_version[4] = 9;
     assert!(decode_nd_state(&wrong_version).is_none());
@@ -249,11 +220,7 @@ fn nd_state_decode_rejects_malformed_bytes() {
     assert!(decode_nd_state(&absurd_count).is_none());
     let mut corrupt_value = good.clone();
     assert_eq!(corrupt_value[21], 0, "node 0 is Start");
-    assert_eq!(
-        u32::from_le_bytes(corrupt_value[26..30].try_into().unwrap()),
-        1,
-        "one frame"
-    );
+    assert_eq!(u32::from_le_bytes(corrupt_value[26..30].try_into().unwrap()), 1, "one frame");
     corrupt_value[50] = 9;
     assert!(
         decode_nd_state(&corrupt_value).is_none(),
@@ -270,11 +237,8 @@ fn nd_state_decode_rejects_trailing_bytes_after_the_graph() {
 
 #[test]
 fn nd_state_decode_rejects_an_edge_value_with_trailing_bytes() {
-    let state = NdReproState {
-        graph: graph_of(vec![ChoiceValue::Boolean(true)]),
-        entropy: 1,
-        longest: 0,
-    };
+    let state =
+        NdReproState { graph: graph_of(vec![ChoiceValue::Boolean(true)]), entropy: 1, longest: 0 };
     let mut bytes = encode_nd_state(&state).unwrap();
     let len = u32::from_le_bytes(bytes[42..46].try_into().unwrap()) as usize;
     bytes[42..46].copy_from_slice(&(len as u32 + 1).to_le_bytes());

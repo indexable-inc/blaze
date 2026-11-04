@@ -102,12 +102,16 @@ pub(crate) fn response_head(buffer: &[u8], body_most: u64) -> Result<Option<Resp
     Ok(Some(ResponseHead { status, head, body: fields.body, close: fields.close }))
 }
 
-pub(crate) fn request_head(buffer: &[u8], body_most: impl Fn(&str) -> u64) -> Result<Option<RequestHead>, Bad> {
+pub(crate) fn request_head(
+    buffer: &[u8],
+    body_most: impl Fn(&str) -> u64,
+) -> Result<Option<RequestHead>, Bad> {
     let Some((head, lines)) = head_lines(buffer)? else { return Ok(None) };
     let mut lines = lines.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
     let mut words = request_line.split(' ');
-    let (Some(method), Some(path), Some(version), None) = (words.next(), words.next(), words.next(), words.next())
+    let (Some(method), Some(path), Some(version), None) =
+        (words.next(), words.next(), words.next(), words.next())
     else {
         // alloc: an error's message, made only when it fails.
         return Err(bad(400, format!("not a request line: {request_line:?}")));
@@ -139,7 +143,8 @@ fn head_lines(buffer: &[u8]) -> Result<Option<(usize, &str)>, Bad> {
         }
         return Ok(None);
     };
-    let text = std::str::from_utf8(&buffer[..end]).map_err(|_| bad(400, "a head that is not UTF-8".into()))?;
+    let text = std::str::from_utf8(&buffer[..end])
+        .map_err(|_| bad(400, "a head that is not UTF-8".into()))?;
     Ok(Some((end + 4, text)))
 }
 
@@ -153,7 +158,9 @@ fn fields<'a>(lines: impl Iterator<Item = &'a str>, body_most: u64) -> Result<Fi
     let mut close = false;
     for line in lines {
         // alloc: an error's message, made only when it fails.
-        let (name, value) = line.split_once(':').ok_or_else(|| bad(400, format!("a header with no colon: {line:?}")))?;
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| bad(400, format!("a header with no colon: {line:?}")))?;
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
             if body.is_some() {
@@ -164,15 +171,23 @@ fn fields<'a>(lines: impl Iterator<Item = &'a str>, body_most: u64) -> Result<Fi
                 return Err(bad(400, format!("a Content-Length of {value:?}")));
             }
             // alloc: an error's message, made only when it fails.
-            let len = value.parse::<u64>().map_err(|_| bad(413, format!("a Content-Length of {value}")))?;
+            let len = value
+                .parse::<u64>()
+                .map_err(|_| bad(413, format!("a Content-Length of {value}")))?;
             if len > body_most {
                 // alloc: an error's message, made only when it fails.
-                return Err(bad(413, format!("a body of {len} bytes, more than the {body_most} allowed")));
+                return Err(bad(
+                    413,
+                    format!("a body of {len} bytes, more than the {body_most} allowed"),
+                ));
             }
             body = Some(len as usize);
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             // alloc: an error's message, made only when it fails.
-            return Err(bad(400, format!("a body sent as {value}: only a Content-Length is taken")));
+            return Err(bad(
+                400,
+                format!("a body sent as {value}: only a Content-Length is taken"),
+            ));
         } else if name.eq_ignore_ascii_case("connection") {
             close = value.split(',').any(|it| it.trim().eq_ignore_ascii_case("close"));
         }
@@ -225,15 +240,31 @@ mod tests {
         refused("POST /v1/fetch HTTP/1.0\r\nContent-Length: 0\r\n\r\n", 400, "HTTP/1.1");
         refused("POST /v1/fetch HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", 400, "chunked");
         refused("POST /v1/fetch HTTP/1.1\r\nContent-Length: 101\r\n\r\n", 413, "more than");
-        refused("POST /v1/fetch HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n", 413, "Content-Length");
+        refused(
+            "POST /v1/fetch HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n",
+            413,
+            "Content-Length",
+        );
         refused("POST /v1/fetch HTTP/1.1\r\nContent-Length: -1\r\n\r\n", 400, "Content-Length");
-        refused("POST /v1/fetch HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n", 400, "two");
+        refused(
+            "POST /v1/fetch HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
+            400,
+            "two",
+        );
         refused("POST /v1/fetch HTTP/1.1\r\n\r\n", 411, "no Content-Length");
         refused("POST /v1/fetch HTTP/1.1\r\nbroken\r\n\r\n", 400, "colon");
         let long = vec![b'a'; HEAD_MOST];
         assert!(request_head(&long, |_| 0).unwrap_err().what.contains("longer than"));
         assert!(response_head(b"SPDY/3 200 OK\r\n\r\n", 0).unwrap_err().contains("HTTP/1.1"));
-        assert!(response_head(b"HTTP/1.1 OK\r\nContent-Length: 0\r\n\r\n", 0).unwrap_err().contains("no status"));
-        assert!(response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n", 10).unwrap_err().contains("more than"));
+        assert!(
+            response_head(b"HTTP/1.1 OK\r\nContent-Length: 0\r\n\r\n", 0)
+                .unwrap_err()
+                .contains("no status")
+        );
+        assert!(
+            response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n", 10)
+                .unwrap_err()
+                .contains("more than")
+        );
     }
 }

@@ -38,7 +38,12 @@ struct Gated {
 }
 
 /// The feature gates of the crate's syntax, in rustc's order.
-pub(super) fn check(cx: &Cx<'_, '_>, walk: &Walk<'_>, features: &Features, _flags: &Flags) -> Vec<Found> {
+pub(super) fn check(
+    cx: &Cx<'_, '_>,
+    walk: &Walk<'_>,
+    features: &Features,
+    _flags: &Flags,
+) -> Vec<Found> {
     let spans = pre::spans(walk);
     let mut found = hard(cx, features, &spans);
     let mut stash = soft(cx, features, &spans);
@@ -74,25 +79,37 @@ fn hard_gate(pre: Pre) -> Option<(&'static str, &'static str, Option<&'static st
         Pre::ConstClosures => ("const_closures", "const closures are experimental", None),
         Pre::ConstTraitImpl => ("const_trait_impl", "const trait impls are experimental", None),
         Pre::Coroutines => ("coroutines", "coroutine syntax is experimental", None),
-        Pre::DefaultFieldValues => ("default_field_values", "default values on fields are experimental", None),
-        Pre::ExplicitTailCalls => ("explicit_tail_calls", "`become` expression is experimental", None),
+        Pre::DefaultFieldValues => {
+            ("default_field_values", "default values on fields are experimental", None)
+        }
+        Pre::ExplicitTailCalls => {
+            ("explicit_tail_calls", "`become` expression is experimental", None)
+        }
         Pre::Frontmatter => ("frontmatter", "frontmatters are experimental", None),
         Pre::GenBlocks => ("gen_blocks", "gen blocks are experimental", None),
-        Pre::GenericConstItems => ("generic_const_items", "generic const items are experimental", None),
+        Pre::GenericConstItems => {
+            ("generic_const_items", "generic const items are experimental", None)
+        }
         Pre::ImplRestriction => ("impl_restriction", "`impl` restrictions are experimental", None),
         Pre::MinGenericConstArgs => {
             ("gca_min_const_items", "unbraced const blocks as const args are experimental", None)
         }
-        Pre::MoreQualifiedPaths => {
-            ("more_qualified_paths", "usage of qualified paths in this context is experimental", None)
-        }
+        Pre::MoreQualifiedPaths => (
+            "more_qualified_paths",
+            "usage of qualified paths in this context is experimental",
+            None,
+        ),
         Pre::MutRestriction => ("mut_restriction", "`mut` restrictions are experimental", None),
-        Pre::ReturnTypeNotation => ("return_type_notation", "return type notation is experimental", None),
+        Pre::ReturnTypeNotation => {
+            ("return_type_notation", "return type notation is experimental", None)
+        }
         Pre::SuperLet => ("super_let", "`super let` is experimental", None),
         Pre::TryBlocksHeterogeneous => {
             ("try_blocks_heterogeneous", "`try bikeshed` expression is experimental", None)
         }
-        Pre::UnnamedEnumVariants => ("unnamed_enum_variants", "unnamed enum variants are experimental", None),
+        Pre::UnnamedEnumVariants => {
+            ("unnamed_enum_variants", "unnamed enum variants are experimental", None)
+        }
         Pre::UnsafeFields => ("unsafe_fields", "`unsafe` fields are experimental", None),
         Pre::YeetExpr => ("yeet_expr", "`do yeet` expression is experimental", None),
         Pre::AsyncTraitBounds => (
@@ -105,8 +122,12 @@ fn hard_gate(pre: Pre) -> Option<(&'static str, &'static str, Option<&'static st
             "`for<...>` binders for closures are experimental",
             Some("consider removing `for<...>`"),
         ),
-        Pre::AssociatedConstEquality => ("gca_min_const_items", "associated const equality is incomplete", None),
-        Pre::MgcaTypeConstSyntax => ("min_generic_const_args", "`type const` syntax is experimental", None),
+        Pre::AssociatedConstEquality => {
+            ("gca_min_const_items", "associated const equality is incomplete", None)
+        }
+        Pre::MgcaTypeConstSyntax => {
+            ("min_generic_const_args", "`type const` syntax is experimental", None)
+        }
         Pre::YieldExpr => ("yield_expr", "yield syntax is experimental", None),
         Pre::AutoTraits
         | Pre::DeclMacro
@@ -120,11 +141,18 @@ fn hard_gate(pre: Pre) -> Option<(&'static str, &'static str, Option<&'static st
 
 /// Whether rustc errors at `at` for the hard gate `pre`, by the rule `check_crate` reads it
 /// with.
-fn hard_gated(cx: &Cx<'_, '_>, features: &Features, pre: Pre, feature: &str, at: InFile<TextRange>) -> bool {
+fn hard_gated(
+    cx: &Cx<'_, '_>,
+    features: &Features,
+    pre: Pre,
+    feature: &str,
+    at: InFile<TextRange>,
+) -> bool {
     match pre {
         // Part of `min_generic_const_args`: either enables it.
         Pre::MgcaTypeConstSyntax => {
-            is_gated(cx, features, "min_generic_const_args", at) && is_gated(cx, features, "mgca_type_const_syntax", at)
+            is_gated(cx, features, "min_generic_const_args", at)
+                && is_gated(cx, features, "mgca_type_const_syntax", at)
         }
         // `coroutines` and `gen_blocks` imply `yield_expr`.
         Pre::YieldExpr => {
@@ -242,9 +270,12 @@ fn soft(cx: &Cx<'_, '_>, features: &Features, spans: &pre::Spans) -> Stash {
         }
     }
     // `default fn` under `#![blaze::specialization]` needs neither feature.
-    let blaze = hir_ty::specialization_mode(cx.db, cx.krate.base()) == hir_ty::SpecializationMode::Blaze;
+    let blaze =
+        hir_ty::specialization_mode(cx.db, cx.krate.base()) == hir_ty::SpecializationMode::Blaze;
     for gated in spans[Pre::MinSpecialization as usize].iter().filter(|_| !blaze) {
-        if is_gated(cx, features, "specialization", gated.at) && is_gated(cx, features, "min_specialization", gated.at) {
+        if is_gated(cx, features, "specialization", gated.at)
+            && is_gated(cx, features, "min_specialization", gated.at)
+        {
             warn(&mut stash, "specialization", gated, "specialization is experimental");
         }
     }
@@ -285,8 +316,14 @@ mod tests {
 
     #[test]
     fn only_the_rules_gates_have_no_feature_of_their_own() {
-        assert_eq!(hard_gate(Pre::AssociatedConstEquality).map(|it| it.0), Some("gca_min_const_items"));
-        assert_eq!(hard_gate(Pre::MgcaTypeConstSyntax).map(|it| it.0), Some("min_generic_const_args"));
+        assert_eq!(
+            hard_gate(Pre::AssociatedConstEquality).map(|it| it.0),
+            Some("gca_min_const_items")
+        );
+        assert_eq!(
+            hard_gate(Pre::MgcaTypeConstSyntax).map(|it| it.0),
+            Some("min_generic_const_args")
+        );
         assert!(hard_gate(Pre::TryBlocks).is_none());
     }
 }

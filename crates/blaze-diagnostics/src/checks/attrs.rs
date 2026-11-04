@@ -174,7 +174,8 @@ impl<'f> Lowered<'f> {
 
     /// Ends the current owner's run.
     fn close(&mut self) {
-        let end = u32::try_from(self.attrs.len()).expect("a crate has fewer than 2^32 parsed attributes");
+        let end =
+            u32::try_from(self.attrs.len()).expect("a crate has fewer than 2^32 parsed attributes");
         self.ends.push(end);
     }
 
@@ -191,7 +192,13 @@ impl<'f> Lowered<'f> {
 
 /// Pushes `owner`'s errors, draining `errors`. Besides its source, each reads the
 /// `#![feature]`s of the crate root, which the gates, the parsers and their targets look at.
-fn push(cx: &Cx<'_, '_>, owner: &Owner<'_>, phase: Phase, errors: &mut Vec<Diag>, found: &mut Vec<Found>) {
+fn push(
+    cx: &Cx<'_, '_>,
+    owner: &Owner<'_>,
+    phase: Phase,
+    errors: &mut Vec<Diag>,
+    found: &mut Vec<Found>,
+) {
     if errors.is_empty() {
         return;
     }
@@ -275,16 +282,24 @@ fn lower<'db>(
                 let at = match groups.iter().position(|it| it.id == id) {
                     Some(at) => at,
                     None => {
-                        groups.push(Group { module, id, first: index, kind: GroupKind::Single(None) });
+                        groups.push(Group {
+                            module,
+                            id,
+                            first: index,
+                            kind: GroupKind::Single(None),
+                        });
                         groups.len() - 1
                     }
                 };
                 let group = &mut groups[at];
                 if let Some(converted) = converted {
-                    let GroupKind::Single(used) = &mut group.kind else { unreachable!("{id:?} is a single parser") };
+                    let GroupKind::Single(used) = &mut group.kind else {
+                        unreachable!("{id:?} is a single parser")
+                    };
                     if used.is_some() {
                         if let Kind::Single(on_duplicate) = builtin.kind
-                            && let Some(diag) = duplicate(cx, owner, builtin.path, on_duplicate, group.first, index)
+                            && let Some(diag) =
+                                duplicate(cx, owner, builtin.path, on_duplicate, group.first, index)
                         {
                             out.push(diag);
                         }
@@ -302,7 +317,8 @@ fn lower<'db>(
             }
         }
         if !matches!(builtin.targets, Targets::ManuallyChecked)
-            && let Some(diag) = accept::target_error(cx, &session.krate, owner, attr, builtin.targets, "")
+            && let Some(diag) =
+                accept::target_error(cx, &session.krate, owner, attr, builtin.targets, "")
         {
             out.push(diag);
         }
@@ -322,7 +338,9 @@ fn lower<'db>(
                 }
             }
             GroupKind::State => {
-                let GroupId::Named(name) = group.id else { unreachable!("{:?} keeps a state", group.id) };
+                let GroupId::Named(name) = group.id else {
+                    unreachable!("{:?} keeps a state", group.id)
+                };
                 if let Some(made) = parsers::finalize(&mut node, group.module, name, &mut fx) {
                     parsed.push(ParsedAttr { parsed: made, attr: group.first });
                 }
@@ -353,7 +371,8 @@ pub(in crate::checks) fn with_path<R>(attr: &Attr<'_>, f: impl FnOnce(&[&str]) -
     let AttrKind::Meta { meta, .. } = attr.kind else { return f(&["doc"]) };
     let Some(path) = meta.path() else { return f(&[]) };
     // alloc: inline up to four segments
-    let segments: SmallVec<[&str; 4]> = path.segments().map(|it| it.name_ref().map_or("<>", |it| it.text())).collect();
+    let segments: SmallVec<[&str; 4]> =
+        path.segments().map(|it| it.name_ref().map_or("<>", |it| it.text())).collect();
     f(&segments)
 }
 
@@ -391,7 +410,11 @@ fn duplicate(
         return None;
     }
     // alloc: clone: the error's message and span
-    let mut diag = Diag::error(None, format!("multiple `{}` attributes", path.join("..")), unused_span.clone());
+    let mut diag = Diag::error(
+        None,
+        format!("multiple `{}` attributes", path.join("..")),
+        unused_span.clone(),
+    );
     diag.suggestion(unused_span, "remove this attribute", "", Applicability::MachineApplicable);
     diag.span_note(used_span, "attribute also specified here");
     Some(diag)
@@ -414,7 +437,10 @@ fn safety(cx: &Cx<'_, '_>, attr: &Attr<'_>, expected: Safety) -> Option<Diag> {
                 diag.multipart_suggestion(
                     "wrap the attribute in `unsafe(...)`",
                     // alloc: the error's suggestion
-                    vec![(inner.shrink_to_lo(), "unsafe(".to_owned()), (inner.shrink_to_hi(), ")".to_owned())],
+                    vec![
+                        (inner.shrink_to_lo(), "unsafe(".to_owned()),
+                        (inner.shrink_to_hi(), ")".to_owned()),
+                    ],
                     Applicability::MachineApplicable,
                 );
             }
@@ -430,13 +456,13 @@ fn not_unsafe(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> Diag {
     let AttrKind::Meta { unsafety: Some(unsafety), .. } = attr.kind else {
         unreachable!("`{}` is written `unsafe(..)`", attr.name())
     };
-    let keyword = unsafety
-        .unsafe_token()
-        .map(|it| it.text_range())
-        .unwrap_or_else(|| TextRange::at(unsafety.syntax().text_range().start(), TextSize::from(6)));
+    let keyword = unsafety.unsafe_token().map(|it| it.text_range()).unwrap_or_else(|| {
+        TextRange::at(unsafety.syntax().text_range().start(), TextSize::from(6))
+    });
     let span = cx.span(attr.in_file(keyword));
     // alloc: clone: the error's message and span
-    let mut diag = Diag::error(None, format!("`{}` is not an unsafe attribute", attr.name()), span.clone());
+    let mut diag =
+        Diag::error(None, format!("`{}` is not an unsafe attribute", attr.name()), span.clone());
     diag.span_label(span, "this is not an unsafe attribute");
     diag.note("extraneous unsafe is not allowed in attributes");
     diag
@@ -464,13 +490,25 @@ fn at_crate_level(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> Option<Diag> {
     let range = attr.range();
     let span = cx.span(attr.in_file(range));
     // alloc: clone: the error's message and span
-    let mut diag = Diag::error(None, format!("`{name}` attribute cannot be used at crate level"), span.clone());
+    let mut diag = Diag::error(
+        None,
+        format!("`{name}` attribute cannot be used at crate level"),
+        span.clone(),
+    );
     let pound = TextRange::new(range.start(), attr.inner_range().start());
-    diag.suggestion_verbose(cx.span(attr.in_file(pound)), "perhaps you meant to use an outer attribute", "#[", Applicability::MachineApplicable);
+    diag.suggestion_verbose(
+        cx.span(attr.in_file(pound)),
+        "perhaps you meant to use an outer attribute",
+        "#[",
+        Applicability::MachineApplicable,
+    );
     if let Some(file) = cx.file_of(&span)
         && let Some(next) = first_line_of_next_item(cx.file_text(file), range.end())
     {
-        diag.span_label(cx.span_in_file(file, next), "the inner attribute doesn't annotate this item");
+        diag.span_label(
+            cx.span_in_file(file, next),
+            "the inner attribute doesn't annotate this item",
+        );
     }
     Some(diag)
 }
@@ -509,7 +547,9 @@ fn in_where(cx: &Cx<'_, '_>, owner: &Owner<'_>, indices: &[usize]) -> Diag {
         let attr = &owner.attrs[it];
         cx.span(attr.in_file(attr.range()))
     });
-    let Some(first) = spans.next() else { unreachable!("a `where` predicate's attributes are given") };
+    let Some(first) = spans.next() else {
+        unreachable!("a `where` predicate's attributes are given")
+    };
     let mut diag = Diag::error(None, "most attributes are not supported in `where` clauses", first);
     for span in spans {
         diag.primary(span);

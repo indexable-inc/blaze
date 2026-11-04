@@ -25,14 +25,20 @@ pub struct Locked(File);
 impl Locked {
     /// `file` locked exclusively, waiting for another holder to let go.
     pub fn lock(file: File) -> io::Result<Locked> {
-        #[allow(clippy::disallowed_methods, reason = "the one place a file is locked: it is unlocked as `Locked` drops")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the one place a file is locked: it is unlocked as `Locked` drops"
+        )]
         file.lock()?;
         Ok(Locked(file))
     }
 
     /// `file` locked shared, waiting for an exclusive holder to let go.
     pub fn lock_shared(file: File) -> io::Result<Locked> {
-        #[allow(clippy::disallowed_methods, reason = "the one place a file is locked: it is unlocked as `Locked` drops")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the one place a file is locked: it is unlocked as `Locked` drops"
+        )]
         file.lock_shared()?;
         Ok(Locked(file))
     }
@@ -40,7 +46,10 @@ impl Locked {
     /// `file` locked exclusively if no one else holds it now: `Ok(Err(file))`, the file given
     /// back unlocked, while another holds it.
     pub fn try_lock(file: File) -> io::Result<Result<Locked, File>> {
-        #[allow(clippy::disallowed_methods, reason = "the one place a file is locked: it is unlocked as `Locked` drops")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the one place a file is locked: it is unlocked as `Locked` drops"
+        )]
         let tried = file.try_lock();
         Self::tried(file, tried)
     }
@@ -48,7 +57,10 @@ impl Locked {
     /// `file` locked shared if no one holds it exclusively now: `Ok(Err(file))`, the file given
     /// back unlocked, while another does.
     pub fn try_lock_shared(file: File) -> io::Result<Result<Locked, File>> {
-        #[allow(clippy::disallowed_methods, reason = "the one place a file is locked: it is unlocked as `Locked` drops")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the one place a file is locked: it is unlocked as `Locked` drops"
+        )]
         let tried = file.try_lock_shared();
         Self::tried(file, tried)
     }
@@ -94,7 +106,15 @@ mod tests {
     #[test]
     fn a_dropped_lock_is_let_go_while_a_copy_of_its_file_is_open() {
         let path = std::env::temp_dir().join(format!("stdx-file-lock-{}", std::process::id()));
-        let open = || OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).unwrap();
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap()
+        };
         let file = Locked::try_lock(open()).unwrap().unwrap();
         // A copy of the descriptor shares the open file, and so its lock, as a forked child's does.
         let copy: File = file.try_clone().unwrap();
@@ -113,7 +133,10 @@ mod tests {
         };
         let copy = file.try_clone().unwrap();
         drop(file);
-        assert!(Locked::try_lock(open()).unwrap().is_err(), "a closed copy alone lets go of nothing");
+        assert!(
+            Locked::try_lock(open()).unwrap().is_err(),
+            "a closed copy alone lets go of nothing"
+        );
         drop(copy);
         std::fs::remove_file(&path).unwrap();
     }

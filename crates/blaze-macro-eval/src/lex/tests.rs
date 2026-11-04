@@ -53,7 +53,9 @@ fn shape(trees: &[Tree]) -> Vec<String> {
                 crate::print::literal_text(*kind, symbol.as_str(), *suffix, &mut text);
                 format!("{text}{}", mark(*spacing))
             }
-            Tree::DocComment { data, spacing, .. } => format!("doc{:?}{}", data.as_str(), mark(*spacing)),
+            Tree::DocComment { data, spacing, .. } => {
+                format!("doc{:?}{}", data.as_str(), mark(*spacing))
+            }
             Tree::Group { delimiter, stream, open, spacing, .. } => format!(
                 "{delimiter:?}{}[{}]{}",
                 mark(*open),
@@ -95,7 +97,8 @@ fn raw_and_forced_keyword_idents() {
     assert_eq!(emitted, ["forced keywords are experimental"]);
     // A direction-changing codepoint is a warning, not an error.
     let (mut emitted, mut warned) = (Vec::new(), Vec::new());
-    let bidi = stream("\"a\u{202E}b\"", site(), Edition::Edition2021, false, &mut emitted, &mut warned);
+    let bidi =
+        stream("\"a\u{202E}b\"", site(), Edition::Edition2021, false, &mut emitted, &mut warned);
     assert_eq!(shape(bidi.unwrap().trees()).len(), 1);
     assert!(emitted.is_empty(), "{emitted:?}");
     assert_eq!(warned.len(), 1, "{warned:?}");
@@ -114,12 +117,22 @@ fn raw_and_forced_keyword_idents() {
 
 #[test]
 fn every_literal_kind() {
-    let stream = lex("'a' b'a' \"s\" r#\"s\"# b\"s\" br##\"s\"## c\"s\" cr#\"s\"# 1u8 1.5e3f64 0x1F");
+    let stream =
+        lex("'a' b'a' \"s\" r#\"s\"# b\"s\" br##\"s\"## c\"s\" cr#\"s\"# 1u8 1.5e3f64 0x1F");
     assert_eq!(
         shape(stream.trees()),
         [
-            "'a'A", "b'a'A", "\"s\"A", "r#\"s\"#A", "b\"s\"A", "br##\"s\"##A", "c\"s\"A", "cr#\"s\"#A",
-            "1u8A", "1.5e3f64A", "0x1FA",
+            "'a'A",
+            "b'a'A",
+            "\"s\"A",
+            "r#\"s\"#A",
+            "b\"s\"A",
+            "br##\"s\"##A",
+            "c\"s\"A",
+            "cr#\"s\"#A",
+            "1u8A",
+            "1.5e3f64A",
+            "0x1FA",
         ]
     );
     let kinds: Vec<LitKind> = stream
@@ -155,7 +168,9 @@ fn every_literal_kind() {
 fn every_token_is_at_the_call_site() {
     let span = site();
     let stream = lex("a(b)");
-    let [Tree::Ident { span: a, .. }, Tree::Group { span: group, stream: inner, .. }] = stream.trees() else {
+    let [Tree::Ident { span: a, .. }, Tree::Group { span: group, stream: inner, .. }] =
+        stream.trees()
+    else {
         panic!("{:?}", stream.trees());
     };
     assert_eq!(*a, span);
@@ -168,7 +183,9 @@ fn every_token_is_at_the_call_site() {
 fn an_operator_as_long_as_the_call_site_gets_a_byte_of_it_per_character() {
     let call_site = Span { range: TextRange::new(20.into(), 22.into()), ..site() };
     let mut emitted = Vec::new();
-    let path = stream("a::b", call_site, Edition::Edition2021, false, &mut emitted, &mut Vec::new()).unwrap();
+    let path =
+        stream("a::b", call_site, Edition::Edition2021, false, &mut emitted, &mut Vec::new())
+            .unwrap();
     let spans: Vec<TextRange> = path
         .trees()
         .iter()
@@ -187,8 +204,15 @@ fn an_operator_as_long_as_the_call_site_gets_a_byte_of_it_per_character() {
         ]
     );
     // An operator of another length keeps the whole span.
-    let range = stream("..=", call_site, Edition::Edition2021, false, &mut emitted, &mut Vec::new()).unwrap();
-    assert!(range.trees().iter().all(|tree| matches!(tree, Tree::Punct { span, .. } if span.range == call_site.range)));
+    let range =
+        stream("..=", call_site, Edition::Edition2021, false, &mut emitted, &mut Vec::new())
+            .unwrap();
+    assert!(
+        range
+            .trees()
+            .iter()
+            .all(|tree| matches!(tree, Tree::Punct { span, .. } if span.range == call_site.range))
+    );
 }
 
 #[test]
@@ -317,7 +341,10 @@ fn literal_of(text: &str) -> Result<(LitKind, String, Option<String>), String> {
 fn a_literal_from_text() {
     assert_eq!(literal_of("1"), Ok((LitKind::Integer, "1".to_owned(), None)));
     assert_eq!(literal_of("-1"), Ok((LitKind::Integer, "-1".to_owned(), None)));
-    assert_eq!(literal_of("-1.5f32"), Ok((LitKind::Float, "-1.5".to_owned(), Some("f32".to_owned()))));
+    assert_eq!(
+        literal_of("-1.5f32"),
+        Ok((LitKind::Float, "-1.5".to_owned(), Some("f32".to_owned())))
+    );
     assert_eq!(literal_of("\"s\""), Ok((LitKind::Str, "s".to_owned(), None)));
     assert_eq!(literal_of("r#\"s\"#"), Ok((LitKind::StrRaw(1), "s".to_owned(), None)));
     assert_eq!(literal_of("b'x'"), Ok((LitKind::Byte, "x".to_owned(), None)));

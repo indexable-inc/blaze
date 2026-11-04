@@ -61,7 +61,11 @@ pub struct Graphs {
 }
 
 enum Asked {
-    Record { root: u32, build: u64, record: Record },
+    Record {
+        root: u32,
+        build: u64,
+        record: Record,
+    },
     Start(crossbeam_channel::Sender<Result<(), String>>),
     Follow(crossbeam_channel::Sender<Result<Following, String>>),
     Rest {

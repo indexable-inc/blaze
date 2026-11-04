@@ -19,8 +19,7 @@ fn exhausted_source() -> (NativeDataSource, NativeTestCaseHandle) {
 #[test]
 fn take_nodes_and_take_spans_return_recorded_data() {
     let (ds, handle) = random_source();
-    ds.generate_integer(&BigInt::from(0), &BigInt::from(10))
-        .unwrap();
+    ds.generate_integer(&BigInt::from(0), &BigInt::from(10)).unwrap();
 
     let nodes = NativeDataSource::take_nodes(&handle);
     let spans = NativeDataSource::take_spans(&handle);
@@ -149,20 +148,14 @@ fn pool_restore_does_not_put_back_a_non_consuming_draw() {
     let mut pool = ds.new_pool().unwrap();
     let id = ds.pool_add(&mut pool).unwrap();
     assert_eq!(ds.pool_generate(&mut pool, false).unwrap(), id);
-    assert!(matches!(
-        ds.pool_restore(&mut pool, id),
-        Err(DataSourceError::InvalidArgument(_))
-    ));
+    assert!(matches!(ds.pool_restore(&mut pool, id), Err(DataSourceError::InvalidArgument(_))));
 }
 
 #[test]
 fn pool_generate_on_empty_pool_returns_assume() {
     let (ds, _handle) = random_source();
     let mut pool = ds.new_pool().unwrap();
-    assert!(matches!(
-        ds.pool_generate(&mut pool, false),
-        Err(DataSourceError::Assume)
-    ));
+    assert!(matches!(ds.pool_generate(&mut pool, false), Err(DataSourceError::Assume)));
 }
 
 fn sequential_machine(
@@ -281,10 +274,7 @@ fn new_state_machine_with_non_parallel_invariant_flags_is_invalid_argument() {
         Ok(_) => panic!("expected an InvalidArgument error"),
     };
     assert!(matches!(err, DataSourceError::InvalidArgument(_)));
-    assert!(
-        err.to_string()
-            .contains("invariant_always_check must be parallel to invariant_names")
-    );
+    assert!(err.to_string().contains("invariant_always_check must be parallel to invariant_names"));
 }
 
 #[test]
@@ -328,10 +318,7 @@ fn new_state_machine_with_bad_concurrency_bounds_is_invalid_argument() {
             Ok(_) => panic!("expected an InvalidArgument error"),
         };
         assert!(matches!(err, DataSourceError::InvalidArgument(_)));
-        assert!(
-            err.to_string()
-                .contains("concurrency bounds must satisfy 1 <= min <= max")
-        );
+        assert!(err.to_string().contains("concurrency bounds must satisfy 1 <= min <= max"));
         assert!(!ds.test_aborted());
     }
 }
@@ -365,12 +352,7 @@ fn state_machine_next_rule_returns_in_range_indices() {
     let mut machine =
         sequential_machine(&ds, vec!["a".into(), "b".into(), "c".into()], vec![]).unwrap();
     assert!(ds.state_machine_next_group(&mut machine).unwrap().is_some());
-    assert!(
-        ds.state_machine_next_rule(&mut machine, 0)
-            .unwrap()
-            .unwrap()
-            < 3
-    );
+    assert!(ds.state_machine_next_rule(&mut machine, 0).unwrap().unwrap() < 3);
     for _ in 0..20 {
         if ds.state_machine_next_group(&mut machine).unwrap().is_none() {
             break;
@@ -403,20 +385,9 @@ fn state_machine_calls_on_exhausted_source_stop_test() {
     ));
     let (fresh, _fresh_handle) = random_source();
     let mut machine = sequential_machine(&fresh, vec!["a".into(), "b".into()], vec![]).unwrap();
-    assert!(matches!(
-        ds.state_machine_next_group(&mut machine),
-        Err(DataSourceError::StopTest)
-    ));
-    assert!(
-        fresh
-            .state_machine_next_group(&mut machine)
-            .unwrap()
-            .is_some()
-    );
-    assert!(matches!(
-        ds.state_machine_next_rule(&mut machine, 0),
-        Err(DataSourceError::StopTest)
-    ));
+    assert!(matches!(ds.state_machine_next_group(&mut machine), Err(DataSourceError::StopTest)));
+    assert!(fresh.state_machine_next_group(&mut machine).unwrap().is_some());
+    assert!(matches!(ds.state_machine_next_rule(&mut machine, 0), Err(DataSourceError::StopTest)));
 }
 
 #[test]
@@ -462,29 +433,20 @@ fn generate_boolean_forced_contradicting_boundary_is_invalid_argument() {
 #[test]
 fn generate_inverted_bounds_map_to_invalid_argument_without_aborting() {
     let (ds, _handle) = random_source();
-    let err = ds
-        .generate_integer(&BigInt::from(1), &BigInt::from(0))
-        .unwrap_err();
+    let err = ds.generate_integer(&BigInt::from(1), &BigInt::from(0)).unwrap_err();
     assert!(matches!(err, DataSourceError::InvalidArgument(_)));
     assert!(!ds.test_aborted());
-    assert!(
-        ds.generate_integer(&BigInt::from(0), &BigInt::from(0))
-            .is_ok()
-    );
+    assert!(ds.generate_integer(&BigInt::from(0), &BigInt::from(0)).is_ok());
 }
 
 #[test]
 fn generate_stoptest_sets_aborted_and_short_circuits() {
     let (ds, _handle) = exhausted_source();
-    let err = ds
-        .generate_integer(&BigInt::from(0), &BigInt::from(10))
-        .unwrap_err();
+    let err = ds.generate_integer(&BigInt::from(0), &BigInt::from(10)).unwrap_err();
     assert!(matches!(err, DataSourceError::StopTest));
     assert!(ds.test_aborted());
 
-    let err2 = ds
-        .generate_integer(&BigInt::from(0), &BigInt::from(10))
-        .unwrap_err();
+    let err2 = ds.generate_integer(&BigInt::from(0), &BigInt::from(10)).unwrap_err();
     assert!(matches!(err2, DataSourceError::StopTest));
     assert!(ds.start_span(0).is_err());
     assert!(ds.stop_span(false).is_err());
@@ -511,11 +473,7 @@ fn state_machine_rule_rejected_reports_the_outstanding_rule() {
     );
     assert!(!ds.test_aborted());
     assert!(ds.state_machine_next_group(&mut machine).unwrap().is_some());
-    assert!(
-        ds.state_machine_next_rule(&mut machine, 0)
-            .unwrap()
-            .is_some()
-    );
+    assert!(ds.state_machine_next_rule(&mut machine, 0).unwrap().is_some());
     ds.state_machine_rule_rejected(&mut machine, 0).unwrap();
     assert!(ds.state_machine_rule_rejected(&mut machine, 0).is_err());
 }
@@ -523,9 +481,7 @@ fn state_machine_rule_rejected_reports_the_outstanding_rule() {
 #[test]
 fn generate_integer_round_trips() {
     let (ds, _handle) = random_source();
-    let value = ds
-        .generate_integer(&BigInt::from(5), &BigInt::from(5))
-        .unwrap();
+    let value = ds.generate_integer(&BigInt::from(5), &BigInt::from(5)).unwrap();
     assert_eq!(value, BigInt::from(5));
 }
 
@@ -604,10 +560,7 @@ fn pools_are_shared_across_cloned_streams() {
     let child = ds.clone_stream().unwrap();
     let got = child.pool_generate(&mut pool, true).unwrap();
     assert_eq!(got, v1);
-    assert!(matches!(
-        ds.pool_generate(&mut pool, false),
-        Err(DataSourceError::Assume)
-    ));
+    assert!(matches!(ds.pool_generate(&mut pool, false), Err(DataSourceError::Assume)));
     ds.pool_restore(&mut pool, v1).unwrap();
     assert_eq!(ds.pool_generate(&mut pool, false).unwrap(), v1);
 }
@@ -667,14 +620,8 @@ fn mark_complete_from_a_clone_concludes_the_family() {
     let (ds, handle) = random_source();
     let child = ds.clone_stream().unwrap();
     child.mark_complete(&TestCaseResult::Invalid);
-    assert!(matches!(
-        ds.generate_boolean(0.5, None),
-        Err(DataSourceError::Assume)
-    ));
-    assert!(matches!(
-        NativeDataSource::take_outcome(&handle),
-        Ok(TestCaseResult::Invalid)
-    ));
+    assert!(matches!(ds.generate_boolean(0.5, None), Err(DataSourceError::Assume)));
+    assert!(matches!(NativeDataSource::take_outcome(&handle), Ok(TestCaseResult::Invalid)));
 }
 
 #[test]

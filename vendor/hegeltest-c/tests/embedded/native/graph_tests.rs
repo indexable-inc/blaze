@@ -14,10 +14,7 @@ fn int(v: i64) -> ChoiceValue {
 }
 
 fn step(addr: &[Frame], value: ChoiceValue) -> Step {
-    Step {
-        addr: addr.to_vec(),
-        value,
-    }
+    Step { addr: addr.to_vec(), value }
 }
 
 fn run(steps: Vec<Step>) -> Run {
@@ -29,17 +26,11 @@ const LEFT: &[Frame] = &[(2, 0), (11, 0)];
 const RIGHT: &[Frame] = &[(3, 0), (11, 0)];
 
 fn left_run(coin: bool, v: i64) -> Run {
-    run(vec![
-        step(COIN, ChoiceValue::Boolean(coin)),
-        step(LEFT, int(v)),
-    ])
+    run(vec![step(COIN, ChoiceValue::Boolean(coin)), step(LEFT, int(v))])
 }
 
 fn right_run(coin: bool, v: i64) -> Run {
-    run(vec![
-        step(COIN, ChoiceValue::Boolean(coin)),
-        step(RIGHT, int(v)),
-    ])
+    run(vec![step(COIN, ChoiceValue::Boolean(coin)), step(RIGHT, int(v))])
 }
 
 fn at(frames: &[Frame]) -> Ident {
@@ -47,14 +38,7 @@ fn at(frames: &[Frame]) -> Ident {
 }
 
 fn span(start: usize, end: usize, label: u64, parent: Option<usize>) -> Span {
-    Span {
-        start,
-        end,
-        label,
-        depth: 0,
-        parent,
-        discarded: false,
-    }
+    Span { start, end, label, depth: 0, parent, discarded: false }
 }
 
 #[test]
@@ -84,11 +68,7 @@ fn draw_addresses_follow_open_spans_with_sibling_ordinals() {
 /// span, so the run's own graph walks it whole.
 #[test]
 fn bare_draws_in_one_span_get_distinct_addresses() {
-    let spans = vec![
-        span(0, 5, 1, None),
-        span(1, 2, 17, Some(0)),
-        span(3, 4, 17, Some(0)),
-    ];
+    let spans = vec![span(0, 5, 1, None), span(1, 2, 17, Some(0)), span(3, 4, 17, Some(0))];
     let addrs = draw_addresses(&spans, 6);
     assert_eq!(
         addrs,
@@ -109,11 +89,7 @@ fn bare_draws_in_one_span_get_distinct_addresses() {
         ChoiceValue::Boolean(false),
         int(7),
     ];
-    let r = run(addrs
-        .into_iter()
-        .zip(values)
-        .map(|(addr, value)| step(&addr, value))
-        .collect());
+    let r = run(addrs.into_iter().zip(values).map(|(addr, value)| step(&addr, value)).collect());
     assert_eq!(r.idents().len(), 6);
     assert_eq!(r.idents().iter().collect::<HashSet<_>>().len(), 6);
     assert_eq!(Graph::from_run(&r).walk_verdict(&r), Walked::Whole);
@@ -146,14 +122,8 @@ fn run_from_nodes_pairs_values_with_addresses() {
 #[test]
 fn identity_is_the_prefix_through_the_first_new_frame() {
     assert_eq!(ident_after(COIN, LEFT), at(&[(2, 0)]));
-    assert_eq!(
-        ident_after(&[(1, 0), (17, 0)], &[(1, 0), (17, 1)]),
-        at(&[(1, 0), (17, 1)])
-    );
-    assert_eq!(
-        ident_after(&[(1, 0), (17, 0)], &[(1, 0), (2, 0), (17, 0)]),
-        at(&[(1, 0), (2, 0)])
-    );
+    assert_eq!(ident_after(&[(1, 0), (17, 0)], &[(1, 0), (17, 1)]), at(&[(1, 0), (17, 1)]));
+    assert_eq!(ident_after(&[(1, 0), (17, 0)], &[(1, 0), (2, 0), (17, 0)]), at(&[(1, 0), (2, 0)]));
     assert_eq!(ident_after(&[(1, 0), (17, 0)], &[(1, 0)]), at(&[(1, 0)]));
     assert_eq!(ident_after(COIN, &[]), at(&[]));
     assert_eq!(ident_before(None, COIN), Ident::Start);
@@ -216,16 +186,12 @@ fn walk_verdicts() {
         ])),
         Walked::Gap
     );
-    assert_eq!(
-        g.walk_verdict(&run(vec![step(COIN, int(0)), step(LEFT, int(3))])),
-        Walked::Gap
-    );
+    assert_eq!(g.walk_verdict(&run(vec![step(COIN, int(0)), step(LEFT, int(3))])), Walked::Gap);
     assert_eq!(g.walk_verdict(&Run::default()), Walked::Gap);
     assert_eq!(
-        g.walk_verdict(&run(vec![
-            step(COIN, ChoiceValue::Boolean(true)),
-            step(&[(4, 0)], int(3)),
-        ])),
+        g.walk_verdict(&run(
+            vec![step(COIN, ChoiceValue::Boolean(true)), step(&[(4, 0)], int(3)),]
+        )),
         Walked::Foreign,
         "the walk serves false before it reaches the state the run has and the graph lacks"
     );
@@ -247,16 +213,8 @@ fn reachable_terminates_on_cycles() {
     let t = &[(2, 0), (6, 0)];
     let u = &[(1, 0), (7, 0)];
     let w = &[(2, 0), (8, 0)];
-    let mut g = Graph::from_run(&run(vec![
-        step(s, int(1)),
-        step(t, int(2)),
-        step(u, int(3)),
-    ]));
-    g.insert(&run(vec![
-        step(t, int(2)),
-        step(s, int(1)),
-        step(w, int(4)),
-    ]));
+    let mut g = Graph::from_run(&run(vec![step(s, int(1)), step(t, int(2)), step(u, int(3))]));
+    g.insert(&run(vec![step(t, int(2)), step(s, int(1)), step(w, int(4))]));
     let order = g.reachable();
     assert_eq!(order.len(), 4);
     assert_eq!(order[0], START);
@@ -278,18 +236,9 @@ fn key_orders_by_edges_then_nodes_then_values() {
     let left = one.node(&at(&[(2, 0)])).unwrap();
     assert!(one.set_value(left, LEFT, &int(3), int(2)).key() < one.key());
     assert!(one.set_value(left, LEFT, &int(3), int(-2)).key() < one.key());
-    assert!(
-        one.set_value(left, LEFT, &int(3), ChoiceValue::Boolean(true))
-            .key()
-            < one.key()
-    );
+    assert!(one.set_value(left, LEFT, &int(3), ChoiceValue::Boolean(true)).key() < one.key());
     let tied = two.set_value(START, COIN, &coin, ChoiceValue::Boolean(true));
-    assert!(
-        tied.nodes()[START]
-            .edges
-            .iter()
-            .all(|e| e.value == ChoiceValue::Boolean(true))
-    );
+    assert!(tied.nodes()[START].edges.iter().all(|e| e.value == ChoiceValue::Boolean(true)));
     assert_eq!(two.set_value(START, LEFT, &coin, int(1)).key(), two.key());
     let mut chain = Graph::from_run(&run(vec![step(COIN, int(1)), step(LEFT, int(1))]));
     chain.insert(&run(vec![step(COIN, int(1)), step(RIGHT, int(1))]));
@@ -326,10 +275,7 @@ fn pruned_drops_unreachable_nodes_and_keeps_end() {
     assert_eq!(p.nodes()[END].ident, Ident::End);
     assert!(p.nodes()[END].edges.is_empty());
     assert_eq!(p.edge_count(), 1);
-    assert_eq!(
-        p.walk_verdict(&run(vec![step(COIN, ChoiceValue::Boolean(false))])),
-        Walked::Whole
-    );
+    assert_eq!(p.walk_verdict(&run(vec![step(COIN, ChoiceValue::Boolean(false))])), Walked::Whole);
 }
 
 #[test]
@@ -344,11 +290,7 @@ fn pruning_keeps_end_when_nothing_reaches_it() {
 fn deleting_a_last_edge_merges_the_redirected_edge_with_an_existing_one() {
     let mut g = Graph::from_run(&left_run(false, 3));
     g.insert(&run(vec![step(COIN, ChoiceValue::Boolean(false))]));
-    assert_eq!(
-        g.nodes()[START].edges.len(),
-        2,
-        "a tie: on to LEFT, or the end"
-    );
+    assert_eq!(g.nodes()[START].edges.len(), 2, "a tie: on to LEFT, or the end");
     let left = g.node(&at(&[(2, 0)])).unwrap();
     let cut = g.delete_edge(left, 0);
     assert_eq!(cut.nodes()[START].edges.len(), 1);
@@ -380,22 +322,18 @@ fn clone_value(children: Vec<ChoiceValue>) -> ChoiceValue {
 
 #[test]
 fn encode_decode_round_trip_covers_every_value_kind() {
-    let realized = ChoiceValue::Clone(Arc::new(CloneRecord::from_stream(Arc::new(
-        RealizedStream::new(
+    let realized =
+        ChoiceValue::Clone(Arc::new(CloneRecord::from_stream(Arc::new(RealizedStream::new(
             vec![ChoiceNode::boolean(BooleanChoice { p: 0.5 }, true, false)],
             Vec::new(),
-        ),
-    ))));
+        )))));
     let mut g = Graph::from_run(&run(vec![
         step(COIN, ChoiceValue::Boolean(true)),
         step(LEFT, int(-12)),
         step(&[(2, 0), (12, 0)], ChoiceValue::Float(2.5)),
         step(&[(2, 0), (13, 0)], ChoiceValue::Bytes(vec![1, 2, 3])),
         step(&[(2, 0), (14, 0)], ChoiceValue::String(vec![104, 105])),
-        step(
-            &[(2, 0), (15, 0)],
-            clone_value(vec![int(1), clone_value(vec![])]),
-        ),
+        step(&[(2, 0), (15, 0)], clone_value(vec![int(1), clone_value(vec![])])),
         step(&[(2, 0), (16, 0)], realized),
     ]));
     g.insert(&right_run(true, 5));
@@ -481,10 +419,7 @@ fn decode_accepts_a_hand_built_graph() {
         .edge(LEFT, &body(&[int(2)]), END)
         .decode()
         .unwrap();
-    assert_eq!(
-        g.walk_verdict(&run(vec![step(COIN, int(1)), step(LEFT, int(2))])),
-        Walked::Whole
-    );
+    assert_eq!(g.walk_verdict(&run(vec![step(COIN, int(1)), step(LEFT, int(2))])), Walked::Whole);
 }
 
 #[test]
@@ -495,22 +430,8 @@ fn decode_rejects_malformed_input() {
     assert!(Wire::new(2).decode().is_none());
     assert!(Wire::new(2).raw(&[3]).decode().is_none());
     assert!(Wire::new(2).ident(&Ident::End).decode().is_none());
-    assert!(
-        Wire::new(2)
-            .ident(&Ident::Start)
-            .edges(0)
-            .ident(&Ident::Start)
-            .decode()
-            .is_none()
-    );
-    assert!(
-        Wire::new(2)
-            .ident(&Ident::Start)
-            .edges(0)
-            .ident(&at(COIN))
-            .decode()
-            .is_none()
-    );
+    assert!(Wire::new(2).ident(&Ident::Start).edges(0).ident(&Ident::Start).decode().is_none());
+    assert!(Wire::new(2).ident(&Ident::Start).edges(0).ident(&at(COIN)).decode().is_none());
     assert!(
         Wire::new(4)
             .ident(&Ident::Start)
@@ -525,13 +446,7 @@ fn decode_rejects_malformed_input() {
             .is_none()
     );
     assert!(Wire::new(2).ident(&Ident::Start).decode().is_none());
-    assert!(
-        Wire::new(2)
-            .ident(&Ident::Start)
-            .edges(MAX_EDGES + 1)
-            .decode()
-            .is_none()
-    );
+    assert!(Wire::new(2).ident(&Ident::Start).edges(MAX_EDGES + 1).decode().is_none());
     let mut frames = Wire::new(2).ident(&Ident::Start).edges(1);
     put_u32(&mut frames.0, MAX_FRAMES + 1);
     assert!(frames.decode().is_none());
@@ -614,10 +529,7 @@ fn value_kinds_and_ranks() {
         shrink_rank(&ChoiceValue::Bytes(vec![0, 4])) < shrink_rank(&ChoiceValue::Bytes(vec![3, 4]))
     );
     assert_eq!(shrink_rank(&ChoiceValue::Boolean(false)), (0, 0, vec![]));
-    assert_eq!(
-        shrink_rank(&ChoiceValue::Integer(BigInt::from(u128::MAX))),
-        (1, u64::MAX, vec![])
-    );
+    assert_eq!(shrink_rank(&ChoiceValue::Integer(BigInt::from(u128::MAX))), (1, u64::MAX, vec![]));
 }
 
 #[test]

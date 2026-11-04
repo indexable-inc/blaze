@@ -21,8 +21,7 @@ fn constraint(text: &str, start: &str, max_size: usize, simplest: &str) -> Gramm
     let grammar = compiled(text, start);
     let start = grammar.start[0];
     let c = GrammarConstraint::new(grammar, start, max_size, u32::MAX, None).unwrap();
-    c.simplest_or_init(|| Ok::<_, InternalError>(cps(simplest)))
-        .unwrap();
+    c.simplest_or_init(|| Ok::<_, InternalError>(cps(simplest))).unwrap();
     c
 }
 
@@ -37,10 +36,7 @@ fn size_limits_exclude_both_needed_and_ignored_placeholders() {
     let plain = constraint(AB, "start", 2, "a");
     assert!(plain.accepts(&cps("ab")));
     assert!(!plain.accepts(&cps("abb")));
-    for text in [
-        "start: X /a+/\n%declare X\n",
-        "start: /a+/\n%declare X\n%ignore X\n",
-    ] {
+    for text in ["start: X /a+/\n%declare X\n", "start: /a+/\n%declare X\n%ignore X\n"] {
         let spec = from_lark(
             text,
             &NoImports,
@@ -186,17 +182,9 @@ fn the_grammar_the_start_rule_and_the_size_cap_each_tell_constraints_apart() {
     assert_eq!(from_start.simplest(), None);
     assert_eq!(from_start.simplest_or_init(|| Err(7)), Err(7));
     assert_eq!(from_start.simplest(), None);
-    assert_eq!(
-        from_start.simplest_or_init(|| Ok::<_, u8>(cps("ab"))),
-        Ok(cps("ab").as_slice())
-    );
-    assert_eq!(
-        from_start.simplest_or_init(|| Ok::<_, u8>(cps("zzz"))),
-        Ok(cps("ab").as_slice())
-    );
-    from_other
-        .simplest_or_init(|| Ok::<_, u8>(cps("b")))
-        .unwrap();
+    assert_eq!(from_start.simplest_or_init(|| Ok::<_, u8>(cps("ab"))), Ok(cps("ab").as_slice()));
+    assert_eq!(from_start.simplest_or_init(|| Ok::<_, u8>(cps("zzz"))), Ok(cps("ab").as_slice()));
+    from_other.simplest_or_init(|| Ok::<_, u8>(cps("b"))).unwrap();
     assert_eq!(from_start.simplest(), Some(cps("ab").as_slice()));
     assert_ne!(from_start, from_other);
     assert!(from_start.accepts(&cps("ab")));
@@ -211,11 +199,9 @@ fn an_alphabet_holds_every_terminal_but_a_placeholder_and_tells_constraints_apar
     let x = grammar.terminal_id("X").unwrap();
     grammar.terminals[x] = crate::native::lark::compile::TerminalDef::placeholder("X").unwrap();
     let start = grammar.start[0];
-    let lower = IntervalSet::new(vec![
-        (u32::from(' '), u32::from(' ')),
-        (u32::from('a'), u32::from('z')),
-    ])
-    .unwrap();
+    let lower =
+        IntervalSet::new(vec![(u32::from(' '), u32::from(' ')), (u32::from('a'), u32::from('z'))])
+            .unwrap();
     let narrow =
         GrammarConstraint::new(grammar.clone(), start, 64, u32::MAX, Some(&lower)).unwrap();
     let wide = GrammarConstraint::new(grammar, start, 64, u32::MAX, None).unwrap();
@@ -223,11 +209,7 @@ fn an_alphabet_holds_every_terminal_but_a_placeholder_and_tells_constraints_apar
     assert!(narrow.accepts(&cps(&format!("ab {marker}"))));
     assert!(!narrow.accepts(&cps(&format!("aB {marker}"))));
     assert!(wide.accepts(&cps(&format!("aB {marker}"))));
-    assert!(
-        marker
-            .chars()
-            .all(|c| narrow.intervals().contains(u32::from(c)))
-    );
+    assert!(marker.chars().all(|c| narrow.intervals().contains(u32::from(c))));
     assert!(!narrow.intervals().contains(u32::from('!')));
     assert_ne!(narrow, wide);
 }
@@ -238,10 +220,7 @@ fn debug_names_the_identity_and_the_start_rule() {
     let shown = format!("{c:?}");
     assert_eq!(
         shown,
-        format!(
-            "GrammarConstraint {{ identity: {:016x}, start: \"start\" }}",
-            c.identity()
-        )
+        format!("GrammarConstraint {{ identity: {:016x}, start: \"start\" }}", c.identity())
     );
 }
 
@@ -253,10 +232,7 @@ fn placeholders_are_kept_apart_from_tokens_where_the_grammar_ignores_text() {
         from_lark(
             text,
             &NoImports,
-            GrammarOptions {
-                explicit: vec!["X".to_string()],
-                ..GrammarOptions::default()
-            },
+            GrammarOptions { explicit: vec!["X".to_string()], ..GrammarOptions::default() },
         )
         .unwrap()
     };

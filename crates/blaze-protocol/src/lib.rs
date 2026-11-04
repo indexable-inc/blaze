@@ -65,8 +65,8 @@ impl<T> Message<T> {
 /// Writes `item`, one encoded CBOR item, as one frame: its length and the item in one
 /// vectored write where `to` takes both, copying neither.
 pub fn write_frame(to: &mut impl Write, item: &[u8]) -> io::Result<()> {
-    let len = frame_len(item.len())
-        .map_err(|said| io::Error::new(io::ErrorKind::InvalidInput, said))?;
+    let len =
+        frame_len(item.len()).map_err(|said| io::Error::new(io::ErrorKind::InvalidInput, said))?;
     write_both(to, &len.to_be_bytes(), item)
 }
 

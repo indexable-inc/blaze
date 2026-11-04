@@ -75,10 +75,5 @@ fn shrink_ordering_returns_early_on_trivial_input() {
 #[test]
 fn shrink_ordering_handles_predicate_that_never_accepts() {
     let keys = [5u32, 3, 1];
-    drive_no_yield(shrink_ordering(
-        keys.len(),
-        |i| keys[i],
-        |_: &[usize]| Ok(false),
-    ))
-    .unwrap();
+    drive_no_yield(shrink_ordering(keys.len(), |i| keys[i], |_: &[usize]| Ok(false))).unwrap();
 }

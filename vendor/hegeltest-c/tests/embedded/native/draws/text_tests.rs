@@ -13,11 +13,9 @@ fn build_intervals_default_excludes_surrogates() {
 
 #[test]
 fn build_intervals_codec_ascii() {
-    let iv = build_intervals(&TextAlphabet {
-        codec: Some("ascii".to_string()),
-        ..Default::default()
-    })
-    .unwrap();
+    let iv =
+        build_intervals(&TextAlphabet { codec: Some("ascii".to_string()), ..Default::default() })
+            .unwrap();
     assert_eq!(iv.len(), 128);
     assert!(iv.contains(0));
     assert!(iv.contains(127));
@@ -26,31 +24,25 @@ fn build_intervals_codec_ascii() {
 
 #[test]
 fn build_intervals_codec_latin1() {
-    let iv = build_intervals(&TextAlphabet {
-        codec: Some("latin-1".to_string()),
-        ..Default::default()
-    })
-    .unwrap();
+    let iv =
+        build_intervals(&TextAlphabet { codec: Some("latin-1".to_string()), ..Default::default() })
+            .unwrap();
     assert_eq!(iv.len(), 256);
 }
 
 #[test]
 fn build_intervals_codec_utf8_is_explicit_default() {
-    let iv = build_intervals(&TextAlphabet {
-        codec: Some("utf-8".to_string()),
-        ..Default::default()
-    })
-    .unwrap();
+    let iv =
+        build_intervals(&TextAlphabet { codec: Some("utf-8".to_string()), ..Default::default() })
+            .unwrap();
     assert_eq!(iv.len(), 0x110000 - 2048);
 }
 
 #[test]
 fn build_intervals_unknown_codec_is_invalid_argument() {
-    let err = build_intervals(&TextAlphabet {
-        codec: Some("ebcdic".to_string()),
-        ..Default::default()
-    })
-    .unwrap_err();
+    let err =
+        build_intervals(&TextAlphabet { codec: Some("ebcdic".to_string()), ..Default::default() })
+            .unwrap_err();
     assert!(matches!(err, EngineError::InvalidArgument(_)));
     assert!(err.to_string().contains("invalid codec"));
 }
@@ -296,14 +288,8 @@ fn build_intervals_exclude_categories_excludes_astral_members() {
     })
     .unwrap();
     assert!(!iv.contains(0xE000), "BMP private-use must be excluded");
-    assert!(
-        !iv.contains(0xF0000),
-        "plane-15 private-use must be excluded"
-    );
-    assert!(
-        !iv.contains(0x10FFFD),
-        "plane-16 private-use must be excluded"
-    );
+    assert!(!iv.contains(0xF0000), "plane-15 private-use must be excluded");
+    assert!(!iv.contains(0x10FFFD), "plane-16 private-use must be excluded");
     assert!(iv.contains(b'a' as u32));
 }
 

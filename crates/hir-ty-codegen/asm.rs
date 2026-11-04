@@ -16,7 +16,6 @@ use std::{
 };
 
 use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use cranelift_codegen::{binemit::Reloc, isa::CallConv};
 use hir_def::hir::{AsmOptions, AsmPiece, InlineAsmRegOrRegClass};
 use object::{
@@ -24,6 +23,7 @@ use object::{
     RelocationTarget, elf, macho, pe,
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::{
     Arch, ObjectFormat, Target,
@@ -1063,7 +1063,10 @@ pub(super) struct Inline {
 /// the key's hash, and a level whose probes are all taken leads to the next, of twice as many,
 /// so nothing is moved or rehashed and a lookup is acquire loads alone. Two threads that set
 /// one slot meet on it for the move of an entry, never while one computes it.
-#[expect(clippy::disallowed_types, reason = "a slot set once, read with an acquire load: the table's entries, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a slot set once, read with an acquire load: the table's entries, not global state"
+)]
 struct Table<K, V> {
     levels: [std::sync::OnceLock<Box<[std::sync::OnceLock<(K, V)>]>>; LEVELS],
 }
@@ -1074,7 +1077,10 @@ const FIRST: usize = 1 << 10;
 /// The slots of a level a key may be in, from the one its hash names on.
 const PROBES: usize = 16;
 
-#[expect(clippy::disallowed_types, reason = "a slot set once, read with an acquire load: the table's entries, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a slot set once, read with an acquire load: the table's entries, not global state"
+)]
 impl<K: PartialEq, V> Table<K, V> {
     const fn new() -> Table<K, V> {
         Table { levels: [const { std::sync::OnceLock::new() }; LEVELS] }
@@ -1086,7 +1092,10 @@ impl<K: PartialEq, V> Table<K, V> {
     fn slots(&self, hash: u64, make: bool) -> impl Iterator<Item = &std::sync::OnceLock<(K, V)>> {
         let levels = self.levels.iter().enumerate().map_while(move |(at, level)| match make {
             // alloc: a level, made once per process
-            true => Some(level.get_or_init(|| (0..FIRST << at).map(|_| std::sync::OnceLock::new()).collect())),
+            true => Some(
+                level
+                    .get_or_init(|| (0..FIRST << at).map(|_| std::sync::OnceLock::new()).collect()),
+            ),
             false => level.get(),
         });
         levels.flat_map(move |level| {
@@ -1225,9 +1234,9 @@ pub(super) fn inline(
     let high_byte = arch == Arch::X86_64
         && (template.iter().any(|piece| match piece {
             AsmPiece::Operand { modifier, .. } => *modifier == Some('h'),
-            AsmPiece::Lit(lit) => lit
-                .split(|it: char| !it.is_ascii_alphanumeric())
-                .any(|word| ["ah", "bh", "ch", "dh"].iter().any(|it| it.eq_ignore_ascii_case(word))),
+            AsmPiece::Lit(lit) => lit.split(|it: char| !it.is_ascii_alphanumeric()).any(|word| {
+                ["ah", "bh", "ch", "dh"].iter().any(|it| it.eq_ignore_ascii_case(word))
+            }),
         }) || operands.iter().any(|operand| {
             matches!(operand, Operand::Reg { reg: InlineAsmRegOrRegClass::Reg(name), .. }
                 if HIGH.contains(&name.as_str().trim_matches('"')))
@@ -1584,8 +1593,9 @@ fn keyed(domain: &str, triple: &str, text: &str) -> ([u8; 32], u64) {
 /// and says so. `BLAZE_ASSEMBLER`, which once picked the machine's C compiler, is refused rather
 /// than ignored.
 fn assembled_object(triple: &str, text: &str) -> Result<Vec<u8>, String> {
-    static SET: LazyLock<Option<String>> =
-        LazyLock::new(|| std::env::var_os("BLAZE_ASSEMBLER").map(|it| it.to_string_lossy().into_owned()));
+    static SET: LazyLock<Option<String>> = LazyLock::new(|| {
+        std::env::var_os("BLAZE_ASSEMBLER").map(|it| it.to_string_lossy().into_owned())
+    });
     if let Some(set) = &*SET {
         // alloc: the error's message
         return Err(format!(
@@ -1668,9 +1678,10 @@ fn code(object: &[u8]) -> Result<Assembled, String> {
         .section_index()
         .and_then(|it| file.section_by_index(it).ok())
         .ok_or_else(|| failed(&"the function is in no section"))?;
-    if let Some(other) = file.symbols().find(|it| {
-        it.index() != symbol.index() && it.is_definition() && it.is_global()
-    }) {
+    if let Some(other) = file
+        .symbols()
+        .find(|it| it.index() != symbol.index() && it.is_definition() && it.is_global())
+    {
         return Err(failed(&format_args!(
             "a block that defines the symbol `{}`: blaze takes an `asm!` or `naked_asm!` \
              block as one function, and links what else assembly defines only from a \
@@ -1678,9 +1689,10 @@ fn code(object: &[u8]) -> Result<Assembled, String> {
             other.name().unwrap_or("?")
         )));
     }
-    if let Some(other) = file.sections().find(|it| {
-        it.index() != section.index() && it.size() > 0 && holds_code_or_data(it)
-    }) {
+    if let Some(other) = file
+        .sections()
+        .find(|it| it.index() != section.index() && it.size() > 0 && holds_code_or_data(it))
+    {
         return Err(failed(&format_args!(
             "a block that puts {} bytes in the section `{}`: blaze takes an `asm!` or \
              `naked_asm!` block as one function, and links other sections only of a \
@@ -1797,7 +1809,14 @@ mod tests {
         use super::{AsmOptions, AsmPiece, ObjectFormat, wrapper_x86_64};
         let text = |template: &str, options| {
             let template = [AsmPiece::Lit(template.into())];
-            wrapper_x86_64((ObjectFormat::Coff, super::Target::for_host().call_conv), &template, options, &[]).unwrap().text
+            wrapper_x86_64(
+                (ObjectFormat::Coff, super::Target::for_host().call_conv),
+                &template,
+                options,
+                &[],
+            )
+            .unwrap()
+            .text
         };
         let intel = text("int $$0x29\nmov eax, $$$$5", AsmOptions::NORETURN);
         assert!(intel.contains("int 0x29\nmov eax, 5\n"), "{intel}");

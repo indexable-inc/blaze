@@ -55,8 +55,10 @@ fn check(data: &[u8]) {
             shared::reseal_head(&mut head);
         }
         let pack = shared::lone_pack();
-        let mut sim =
-            shared::store_of(&[(HEAD, head.as_slice()), (shared::pack_file(0).as_str(), pack.as_slice())]);
+        let mut sim = shared::store_of(&[
+            (HEAD, head.as_slice()),
+            (shared::pack_file(0).as_str(), pack.as_slice()),
+        ]);
         shared::read_back(&mut sim, &[(shared::lone_key(), Some(shared::LONE))]);
     } else {
         let (values, settles) = shared::values(&mut input);

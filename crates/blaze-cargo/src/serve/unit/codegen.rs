@@ -8,24 +8,24 @@
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
+use blaze_api::ApiError;
+use blaze_build_script::{
+    apply::{Compile, Linked as LinkedTo},
+    unit as bs,
+};
 use blaze_codegen::{
     Backend, InstanceKey, NativeLib, NativeLibKind, Target,
     driver::{Build, Built, ProfileCounts},
     plan::{Mode as BuildMode, OptLevel, Origin, Override, Package, Policy, Profile},
     settings::{DebugInfo, Panic, Pgo, Sanitize, Sanitizers, Toolchain},
 };
-use blaze_build_script::{
-    apply::{Compile, Linked as LinkedTo},
-    unit as bs,
-};
-use blaze_api::ApiError;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_link::{Change, Image, Native, NativeKind, Output};
 use blaze_units::schema::{self, Mode, Unit};
 use hir_ty_codegen::v2::{
-    Assumed, Backends, BodyChecks, BuildTime, Databases, GlobalAsmObject, HashSource, HirFrontend, HirInstance, ItemHashes,
-    LinkInputs, RootKind, Roots, Runs,
+    Assumed, Backends, BodyChecks, BuildTime, Databases, GlobalAsmObject, HashSource, HirFrontend,
+    HirInstance, ItemHashes, LinkInputs, RootKind, Roots, Runs,
 };
 
 use super::{Job, Real, UnitReader, files::Mounted, graph::flag, script};
@@ -51,7 +51,9 @@ pub(crate) enum Makes {
 /// What `unit` makes; an error for what blaze does not make.
 pub(crate) fn makes(unit: &Unit) -> Result<Makes, String> {
     let target = &unit.target;
-    let has = |kind: &str| target.crate_types.iter().any(|it| it == kind) || target.kind.iter().any(|it| it == kind);
+    let has = |kind: &str| {
+        target.crate_types.iter().any(|it| it == kind) || target.kind.iter().any(|it| it == kind)
+    };
     // A library's doctests make programs: each example's and the runner's.
     if matches!(unit.mode, Mode::Test | Mode::Doctest) || target.is_custom_build() || has("bin") {
         return Ok(Makes::Executable);
@@ -121,7 +123,9 @@ pub(crate) fn toolchain(job: &Job, unit: usize) -> Result<Toolchain, String> {
     // The data its crates are laid out by, which the toolchain's id is of.
     blaze_lower::target_data(triple)
         .map_err(|it| it.to_string())
-        .and_then(|target_data| hir_ty_codegen::v2::toolchain(triple, &target_data, &plan.rustflags, runs(u)))
+        .and_then(|target_data| {
+            hir_ty_codegen::v2::toolchain(triple, &target_data, &plan.rustflags, runs(u))
+        })
         // alloc: an error
         .map_err(|it| format!("unit {unit} (`{}` of {}): {it}", u.target.name, u.pkg_id))
 }
@@ -157,7 +161,9 @@ pub(crate) fn debuginfo(debuginfo: &schema::DebugInfo) -> Result<DebugInfo, Stri
             "full" | "true" => DebugInfo::Full,
             other => return Err(format!("debuginfo `{other}` is none rustc takes")),
         },
-        schema::DebugInfo::Level(other) => return Err(format!("debuginfo `{other}` is none rustc takes")),
+        schema::DebugInfo::Level(other) => {
+            return Err(format!("debuginfo `{other}` is none rustc takes"));
+        }
     })
 }
 
@@ -195,7 +201,11 @@ pub(crate) fn origin(job: &Job, at: usize, unit: &Unit) -> Result<Origin, String
 /// function of the build copy-and-patch stencils whatever its level, std's too
 /// ([`Profile::stencils`]): what the seed builds with. Any other is an error naming it, never
 /// a key ignored.
-pub(crate) fn codegen_backend(profile: &schema::Profile, package: &str, level: OptLevel) -> Result<bool, String> {
+pub(crate) fn codegen_backend(
+    profile: &schema::Profile,
+    package: &str,
+    level: OptLevel,
+) -> Result<bool, String> {
     let asked = match profile.codegen_backend.as_deref() {
         None | Some("llvm") => return Ok(false),
         Some(asked) => asked,
@@ -330,7 +340,10 @@ pub(crate) fn read_profile(root: &str, path: &str) -> Result<Profiled, String> {
     let at = std::path::Path::new(root).join(path);
     let bytes = std::fs::read(&at).map_err(|error| {
         // alloc: an error
-        format!("the flags for rustc have `-C profile-use={path}`, and `{}` can't be read: {error}", at.display())
+        format!(
+            "the flags for rustc have `-C profile-use={path}`, and `{}` can't be read: {error}",
+            at.display()
+        )
     })?;
     let names = blaze_lints::profile::names(&bytes);
     if let Ok(names) = &names {
@@ -340,7 +353,11 @@ pub(crate) fn read_profile(root: &str, path: &str) -> Result<Profiled, String> {
 }
 
 #[cfg(feature = "native")]
-fn profiled(path: &str, bytes: Vec<u8>, names: Result<blaze_lints::profile::Names, String>) -> Result<Profiled, String> {
+fn profiled(
+    path: &str,
+    bytes: Vec<u8>,
+    names: Result<blaze_lints::profile::Names, String>,
+) -> Result<Profiled, String> {
     let id = hir_ty_codegen::v2::profile_id(&bytes);
     let given = hir_ty_codegen::v2::give_profile(id, &bytes)
         // alloc: an error
@@ -349,7 +366,11 @@ fn profiled(path: &str, bytes: Vec<u8>, names: Result<blaze_lints::profile::Name
 }
 
 #[cfg(not(feature = "native"))]
-fn profiled(path: &str, _bytes: Vec<u8>, _names: Result<blaze_lints::profile::Names, String>) -> Result<Profiled, String> {
+fn profiled(
+    path: &str,
+    _bytes: Vec<u8>,
+    _names: Result<blaze_lints::profile::Names, String>,
+) -> Result<Profiled, String> {
     // alloc: an error
     Err(format!(
         "the flags for rustc have `-C profile-use={path}`, and this blaze is built without LLVM \
@@ -366,7 +387,9 @@ fn pgo_of(job: &Job, asked: PgoFlag<'_>) -> Result<Pgo, String> {
         // alloc: an error
         Some((_, Err(what))) => Err(what.clone()),
         // alloc: an error
-        None => Err(format!("`-C profile-use={path}` is in no unit's flags the job read its profiles from")),
+        None => Err(format!(
+            "`-C profile-use={path}` is in no unit's flags the job read its profiles from"
+        )),
     }
 }
 
@@ -404,9 +427,14 @@ pub(crate) fn unapplied(job: &Job, ok: bool, built: &[u32]) -> Result<Vec<String
         .iter()
         .enumerate()
         .filter(|(unit, plan)| {
-            was_built[*unit] && !job.graph.has(*unit as u32, flag::RUN) && matches!(pgo(&plan.rustflags), Ok(PgoFlag::Use(_)))
+            was_built[*unit]
+                && !job.graph.has(*unit as u32, flag::RUN)
+                && matches!(pgo(&plan.rustflags), Ok(PgoFlag::Use(_)))
         })
-        .map(|(unit, _)| Accounted { unit, counted: job.counted.get(unit).and_then(|it| it.get()).map(|it| &it[..]) })
+        .map(|(unit, _)| Accounted {
+            unit,
+            counted: job.counted.get(unit).and_then(|it| it.get()).map(|it| &it[..]),
+        })
         .collect();
     if accounted.is_empty() {
         return Ok(Vec::new());
@@ -417,7 +445,11 @@ pub(crate) fn unapplied(job: &Job, ok: bool, built: &[u32]) -> Result<Vec<String
         .iter()
         .filter_map(|(path, read)| {
             let read = read.as_ref().ok()?;
-            Some(Named { id: read.id, path, names: read.names.as_ref().copied().map_err(String::as_str) })
+            Some(Named {
+                id: read.id,
+                path,
+                names: read.names.as_ref().copied().map_err(String::as_str),
+            })
         })
         .collect();
     judge(ok, accounted, |unit| super::compile::recorded_profiles(job, unit), &named)
@@ -503,7 +535,9 @@ pub(crate) fn judge<'a>(
         }
         let Some(named) = profiles.iter().find(|it| it.id == id) else {
             // alloc: an error
-            let what = format!("the job's units used the profile of content {id:x}, which is none the job read");
+            let what = format!(
+                "the job's units used the profile of content {id:x}, which is none the job read"
+            );
             return Err(ApiError::new(what, None));
         };
         match applied_nothing(named, counts) {
@@ -530,7 +564,11 @@ fn applied_nothing(named: &Named<'_>, counts: ProfileCounts) -> Result<String, S
     let names = match names {
         Ok(names) => *names,
         // alloc: as above
-        Err(why) => return Ok(format!("{head}. Its records' names don't read ({why}), so who made it is not known; the build goes on without its counts")),
+        Err(why) => {
+            return Ok(format!(
+                "{head}. Its records' names don't read ({why}), so who made it is not known; the build goes on without its counts"
+            ));
+        }
     };
     let blaze_lints::profile::Names { records, blaze, rustc, foreign } = names;
     if mismatched > 0 {
@@ -578,13 +616,17 @@ fn applied_nothing(named: &Named<'_>, counts: ProfileCounts) -> Result<String, S
 /// `give_profile`.
 fn profile_put(job: &Job, pgo: Pgo) -> Result<Option<blaze_codegen::driver::Put>, String> {
     let Pgo::Use(id) = pgo else { return Ok(None) };
-    let read = profiles(job).0.iter().find_map(|it| it.1.as_ref().ok().filter(|read| read.id == id)).ok_or_else(|| {
-        // alloc: an error
-        format!(
-            "the profile {id:x} the build uses was not given to the code generator \
+    let read = profiles(job)
+        .0
+        .iter()
+        .find_map(|it| it.1.as_ref().ok().filter(|read| read.id == id))
+        .ok_or_else(|| {
+            // alloc: an error
+            format!(
+                "the profile {id:x} the build uses was not given to the code generator \
              (`hir_ty_codegen::v2::give_profile`)"
-        )
-    })?;
+            )
+        })?;
     let key = blaze_cas::Key(id);
     if job.input.store.has(&blaze_cas::enter(), &key) {
         return Ok(None);
@@ -595,7 +637,10 @@ fn profile_put(job: &Job, pgo: Pgo) -> Result<Option<blaze_codegen::driver::Put>
 
 /// Gives back the bytes of a profile put that a failed build will not hand to the store.
 fn unput_profile(job: &Job, put: blaze_codegen::driver::Put) {
-    let read = profiles(job).0.iter().find_map(|it| it.1.as_ref().ok().filter(|read| blaze_cas::Key(read.id) == put.key));
+    let read = profiles(job)
+        .0
+        .iter()
+        .find_map(|it| it.1.as_ref().ok().filter(|read| blaze_cas::Key(read.id) == put.key));
     if let Some(read) = read {
         *read.unstored.lock() = Some(put.bytes);
     }
@@ -615,10 +660,21 @@ pub(crate) fn vecreport(rustflags: &[String]) -> bool {
             "-W" | "--warn" | "-D" | "--deny" | "-F" | "--forbid" | "--force-warn" => (true, None),
             "-A" | "--allow" => (false, None),
             _ => {
-                let joined = [("-W", true), ("--warn=", true), ("-D", true), ("--deny=", true), ("-F", true)]
-                    .into_iter()
-                    .chain([("--forbid=", true), ("--force-warn=", true), ("-A", false), ("--allow=", false)])
-                    .find_map(|(prefix, level)| flag.strip_prefix(prefix).map(|name| (level, name)));
+                let joined = [
+                    ("-W", true),
+                    ("--warn=", true),
+                    ("-D", true),
+                    ("--deny=", true),
+                    ("-F", true),
+                ]
+                .into_iter()
+                .chain([
+                    ("--forbid=", true),
+                    ("--force-warn=", true),
+                    ("-A", false),
+                    ("--allow=", false),
+                ])
+                .find_map(|(prefix, level)| flag.strip_prefix(prefix).map(|name| (level, name)));
                 match joined {
                     Some((level, name)) => (level, Some(name)),
                     None => continue,
@@ -677,7 +733,8 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
         let dep_info = debuginfo(&profile.debuginfo)?;
         let differs = Override {
             opt_level: (level != opt).then_some(level),
-            overflow_checks: (profile.overflow_checks != base.overflow_checks).then_some(profile.overflow_checks),
+            overflow_checks: (profile.overflow_checks != base.overflow_checks)
+                .then_some(profile.overflow_checks),
             debug_assertions: (profile.debug_assertions != base.debug_assertions)
                 .then_some(profile.debug_assertions),
             debuginfo: (dep_info != info).then_some(dep_info),
@@ -738,8 +795,14 @@ impl Parts {
     /// What codegen made, read through `reader`'s front end. The unit's crate is the same in
     /// it as in the one codegen read: every input of the crate is of a unit it depends on,
     /// done before its codegen began, so a write applied since changed none of it.
-    pub(crate) fn over<'a>(&'a self, reader: &'a UnitReader, mounted: &Arc<Mounted>) -> Generated<'a> {
-        let frontend = frontend(reader, mounted, self.build_time).with_policy(&self.policy).with_image(self.image);
+    pub(crate) fn over<'a>(
+        &'a self,
+        reader: &'a UnitReader,
+        mounted: &Arc<Mounted>,
+    ) -> Generated<'a> {
+        let frontend = frontend(reader, mounted, self.build_time)
+            .with_policy(&self.policy)
+            .with_image(self.image);
         Generated {
             built: &self.built,
             roots: &self.roots,
@@ -761,7 +824,10 @@ pub(crate) struct Generated<'a> {
     pub(crate) image: bool,
     /// The span tables and debug names the build's code names: read once, by the first
     /// link or test selection that needs them, and none for a library.
-    #[expect(clippy::disallowed_types, reason = "read once, by the first link or test selection that needs it: per unit's codegen, not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "read once, by the first link or test selection that needs it: per unit's codegen, not global"
+    )]
     side: std::cell::OnceCell<LinkInputs>,
 }
 
@@ -771,7 +837,10 @@ impl Generated<'_> {
     /// each function's side table: this build's from its puts, the rest from `store`. Empty
     /// for a build not made for it ([`Policy::report`]). A side table the store lacks, or one
     /// that does not read, is an error naming the function.
-    pub(crate) fn report(&self, store: &blaze_cas::Reader) -> Result<Vec<hir_ty_codegen::v2::report::Reported>, String> {
+    pub(crate) fn report(
+        &self,
+        store: &blaze_cas::Reader,
+    ) -> Result<Vec<hir_ty_codegen::v2::report::Reported>, String> {
         if !self.policy.report {
             return Ok(Vec::new());
         }
@@ -779,7 +848,9 @@ impl Generated<'_> {
         let workspace = &self.built.editable;
         // alloc: once per unit reported, a function each
         let mut reports = Vec::new();
-        for function in self.built.functions.iter().filter(|it| workspace.binary_search(&it.key).is_ok()) {
+        for function in
+            self.built.functions.iter().filter(|it| workspace.binary_search(&it.key).is_ok())
+        {
             let Some(id) = function.side else { continue };
             let key = blaze_codegen::query::keys::side(&id);
             let named = || format!("{:?}", function.key); // alloc: an error's name
@@ -788,13 +859,18 @@ impl Generated<'_> {
                 None => match store.get(&guard, &key) {
                     Ok(Some(entry)) => entry.bytes,
                     // alloc: an error
-                    Ok(None) => return Err(format!("the side table of {} is not in the store", named())),
+                    Ok(None) => {
+                        return Err(format!("the side table of {} is not in the store", named()));
+                    }
                     // alloc: an error
-                    Err(corrupt) => return Err(format!("the side table of {}: {corrupt}", named())),
+                    Err(corrupt) => {
+                        return Err(format!("the side table of {}: {corrupt}", named()));
+                    }
                 },
             };
             // alloc: an error
-            let rows = hir_ty_codegen::v2::report::of_side(bytes).map_err(|why| format!("the report of {}: {why}", named()))?;
+            let rows = hir_ty_codegen::v2::report::of_side(bytes)
+                .map_err(|why| format!("the report of {}: {why}", named()))?;
             if !rows.is_empty() {
                 reports.push((function.key, rows));
             }
@@ -815,7 +891,11 @@ impl Generated<'_> {
 /// The code generator's view of the job's front end, its files named as rustc names them. Every
 /// thread of the build reads the one database of the task's reader by reference: the query
 /// engine's reads take `&self`, so none waits on another and none is cloned.
-fn frontend<'db>(reader: &'db UnitReader, mounted: &Arc<Mounted>, build_time: BuildTime) -> HirFrontend<'db> {
+fn frontend<'db>(
+    reader: &'db UnitReader,
+    mounted: &Arc<Mounted>,
+    build_time: BuildTime,
+) -> HirFrontend<'db> {
     frontend_over(reader.db(), reader.paths(), reader.spellings(), mounted, build_time)
 }
 
@@ -848,18 +928,23 @@ pub(crate) fn frontend_over<'db>(
             }
         }
     };
-    HirFrontend::new(Databases::new(db), HashSource::Items(ItemHashes::new(Box::new(names))), build_time)
+    HirFrontend::new(
+        Databases::new(db),
+        HashSource::Items(ItemHashes::new(Box::new(names))),
+        build_time,
+    )
 }
 
 /// The tests of test unit `unit` as its harness lists them, compiling nothing: the same
 /// listing, names and attributes as the test binary's ([`generate`]).
 pub(crate) fn test_roots(job: &Job, reader: &UnitReader, unit: usize) -> Result<Roots, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
-    let krate = job
-        .crates
-        .krate(unit)
-        .ok_or_else(|| format!("unit {unit} (`{}`) has no crate in the front end", u.target.name))?;
-    frontend(reader, &job.mounted, build_time(job, unit)).roots(krate, RootKind::Test).map_err(|it| it.what)
+    let krate = job.crates.krate(unit).ok_or_else(|| {
+        format!("unit {unit} (`{}`) has no crate in the front end", u.target.name)
+    })?;
+    frontend(reader, &job.mounted, build_time(job, unit))
+        .roots(krate, RootKind::Test)
+        .map_err(|it| it.what)
 }
 
 /// The store as a build reads it: with no lock, under the build's guard.
@@ -913,17 +998,21 @@ pub(crate) fn generate<'db>(
     // (`MirOptions::heap_to_stack`): known of a unit that links a program, never of a library
     // whose program is linked later, which may bring its own `#[global_allocator]`.
     let heap_to_stack = match makes {
-        Makes::Executable | Makes::Shared { .. } => hir_ty_codegen::v2::allocations_unobserved(reader.db(), krate)
-            // alloc: an error
-            .map_err(|it| format!("unit {unit} (`{}` of {}): {it}", u.target.name, u.pkg_id))?,
+        Makes::Executable | Makes::Shared { .. } => {
+            hir_ty_codegen::v2::allocations_unobserved(reader.db(), krate)
+                // alloc: an error
+                .map_err(|it| format!("unit {unit} (`{}` of {}): {it}", u.target.name, u.pkg_id))?
+        }
         Makes::Library => false,
     };
     let policy = Policy { heap_to_stack, ..policy(job, unit, toolchain)? };
     // A cancelled job's build stops within a function: its caller posts it again.
     let build_time = build_time(job, unit);
     let image = links_image(makes, &policy);
-    let frontend =
-        frontend(reader, mounted, build_time).with_policy(&policy).with_image(image).with_stop(&job.input.cancelled);
+    let frontend = frontend(reader, mounted, build_time)
+        .with_policy(&policy)
+        .with_image(image)
+        .with_stop(&job.input.cancelled);
     let frontend = match checks {
         Some(checks) => frontend.with_checks(checks),
         None => frontend,
@@ -933,12 +1022,14 @@ pub(crate) fn generate<'db>(
         Err(error) => return Ok(Err(refused(reader, mounted.root(), vec![error]))),
     };
     let origin = origin(job, unit, u)?;
-    let asked: Vec<(HirInstance, Origin)> = roots.roots.iter().map(|it| (it.clone(), origin)).collect();
+    let asked: Vec<(HirInstance, Origin)> =
+        roots.roots.iter().map(|it| (it.clone(), origin)).collect();
     // The job holds the profile given for as long as it lives, so for the whole build.
     let profile = profile_put(job, policy.pgo)?;
     // `BLAZE_VERIFY_STORE` in the request's environment: the store hits it samples are
     // compiled again and checked ([`Build::verify_store`]); a value that is none is the error.
-    let verify = blaze_store_check::Setting::from_env(&job.input.config.invocation.env).map_err(|it| it.to_string())?;
+    let verify = blaze_store_check::Setting::from_env(&job.input.config.invocation.env)
+        .map_err(|it| it.to_string())?;
     let backends = Backends::default();
     let built = {
         let guard = blaze_cas::enter();
@@ -954,7 +1045,8 @@ pub(crate) fn generate<'db>(
             built.puts.extend(profile);
             if let Some(slot) = job.counted.get(unit) {
                 // alloc: once per unit built, one entry per profile it used (none or one)
-                let _ = slot.set(built.stats.profiles.iter().map(|(id, counts)| (*id, *counts)).collect());
+                let _ = slot
+                    .set(built.stats.profiles.iter().map(|(id, counts)| (*id, *counts)).collect());
             }
             Ok(Ok(Parts { built, roots, policy, image, build_time }))
         }
@@ -999,7 +1091,10 @@ impl Refused {
     /// and points at its report, said once a job ([`ToolchainFailed::report`]).
     pub(crate) fn lines(&self) -> impl Iterator<Item = String> + '_ {
         self.errors.iter().enumerate().map(|(at, error)| {
-            let of = self.toolchain.iter().find_map(|it| Some((it, it.instances.iter().find(|(i, _)| *i == at)?)));
+            let of = self
+                .toolchain
+                .iter()
+                .find_map(|it| Some((it, it.instances.iter().find(|(i, _)| *i == at)?)));
             match of {
                 Some((failed, (_, named))) => failed.line(named),
                 None => error.clone(), // clone: the error path, a line of a unit's error
@@ -1048,10 +1143,14 @@ impl ToolchainFailed {
         );
         let mut report = super::say::refused(message, None, color);
         for diag in &self.diags {
-            let it = blaze_diagnostics::api::diagnostic(diag, sources, style, None).map_err(|why| {
-                // alloc: the error path
-                format!("{why}, in the front end's error `{}` of `{}` in `{}`", diag.message, self.path, self.krate)
-            })?;
+            let it =
+                blaze_diagnostics::api::diagnostic(diag, sources, style, None).map_err(|why| {
+                    // alloc: the error path
+                    format!(
+                        "{why}, in the front end's error `{}` of `{}` in `{}`",
+                        diag.message, self.path, self.krate
+                    )
+                })?;
             report.rendered.push_str(&it.rendered);
             report.children.push(it);
         }
@@ -1074,7 +1173,8 @@ fn refused(reader: &UnitReader, root: &str, errors: Vec<blaze_codegen::CodegenEr
         // clone: the error path, the instance's name in its unit's line
         let named = front.named.clone();
         let path = blaze_query::db::attach(db, || blaze_items::key::path(db, front.id));
-        if let Some(failed) = toolchain.iter_mut().find(|it| it.path == path && it.why == front.why) {
+        if let Some(failed) = toolchain.iter_mut().find(|it| it.path == path && it.why == front.why)
+        {
             failed.instances.push((at, named));
             continue;
         }
@@ -1084,7 +1184,8 @@ fn refused(reader: &UnitReader, root: &str, errors: Vec<blaze_codegen::CodegenEr
             blaze_items::ItemId::Static(it) => Some(hir_def::DefWithBodyId::StaticId(it)),
             _ => None,
         };
-        let diags = body.map_or_else(Vec::new, |def| blaze_diagnostics::check::check_one_body(db, def, files));
+        let diags = body
+            .map_or_else(Vec::new, |def| blaze_diagnostics::check::check_one_body(db, def, files));
         let sources = texts(reader, root, &diags);
         let krate = match &krate.extra_data(db).display_name {
             Some(name) => name.canonical_name().as_str().to_owned(), // alloc: the error path
@@ -1102,7 +1203,11 @@ fn refused(reader: &UnitReader, root: &str, errors: Vec<blaze_codegen::CodegenEr
 /// The text of each file `diags` point into, by its name in them (relative to `root`), as the
 /// database has it ([`UnitReader::files_named`]): the text their spans were made against. A name
 /// the database has no file of is left out, for the mounts to read ([`Mounted::add_sources`]).
-fn texts(reader: &UnitReader, root: &str, diags: &[blaze_diagnostics::Diag]) -> Vec<(String, String)> {
+fn texts(
+    reader: &UnitReader,
+    root: &str,
+    diags: &[blaze_diagnostics::Diag],
+) -> Vec<(String, String)> {
     if diags.is_empty() {
         return Vec::new(); // alloc: empty, allocates nothing
     }
@@ -1246,7 +1351,8 @@ pub(crate) fn given(job: &Job, unit: u32) -> Result<Compile, String> {
         }
     }
     // `Compile::of` asks of the package only whether it has a library.
-    let lib = bs::Target { name: String::new(), kind: vec!["lib".to_owned()], crate_types: Vec::new() };
+    let lib =
+        bs::Target { name: String::new(), kind: vec!["lib".to_owned()], crate_types: Vec::new() };
     let targets = match job.graph.package_has_lib(unit) {
         true => vec![lib],
         false => Vec::new(),
@@ -1263,7 +1369,13 @@ pub(crate) fn given(job: &Job, unit: u32) -> Result<Compile, String> {
 /// library, as rustc puts a crate's code before the libraries.
 ///
 /// [`Graph::linked_in`]: super::graph::Graph::linked_in
-fn natives(job: &Job, unit: usize, krate: base_db::Crate, frontend: &HirFrontend<'_>, triple: &str) -> Result<Natives, String> {
+fn natives(
+    job: &Job,
+    unit: usize,
+    krate: base_db::Crate,
+    frontend: &HirFrontend<'_>,
+    triple: &str,
+) -> Result<Natives, String> {
     let unit = unit as u32;
     let mine = given(job, unit)?;
     let mut libs = Vec::new();
@@ -1382,7 +1494,9 @@ impl std::fmt::Display for LinkCause {
             ),
             LinkCause::Linker { step, error } => write!(f, "{}: {error}", step.name()),
             LinkCause::Native(error) => write!(f, "{}: {}", error.path.display(), error.error),
-            LinkCause::NativeGone(path) => write!(f, "{}: the native library is gone", path.display()),
+            LinkCause::NativeGone(path) => {
+                write!(f, "{}: the native library is gone", path.display())
+            }
             LinkCause::NoToolchain => f.write_str("blaze's toolchain is not installed"),
             LinkCause::Unnamed => f.write_str("the path is no file the linker can name"),
             LinkCause::Given(what) => f.write_str(what),
@@ -1439,9 +1553,11 @@ pub(crate) fn link(
 ) -> Result<LinkMade, LinkFailed> {
     // In a task of the link's tag, so the image and the staging a link keeps are named on the
     // daemon's memory line.
-    blaze_mem::frame::task(blaze_mem::Tag::Link, |_| link_at(job, unit, krate, path, makes, generated, images))
-        // alloc: error path
-        .map_err(|cause| LinkFailed { image: path.to_owned(), cause })
+    blaze_mem::frame::task(blaze_mem::Tag::Link, |_| {
+        link_at(job, unit, krate, path, makes, generated, images)
+    })
+    // alloc: error path
+    .map_err(|cause| LinkFailed { image: path.to_owned(), cause })
 }
 
 fn link_at(
@@ -1471,7 +1587,8 @@ fn link_at(
         _ => None,
     };
     let test = job.graph.has(unit as u32, flag::TEST);
-    let linker = |step: LinkStep| move |error: blaze_link::LinkError| LinkCause::Linker { step, error };
+    let linker =
+        |step: LinkStep| move |error: blaze_link::LinkError| LinkCause::Linker { step, error };
     let output = match wasm {
         // A wasm module is linked whole and never slid or patched in place, and its debug info
         // is its name section: each expansion instantiates the module afresh.
@@ -1490,10 +1607,11 @@ fn link_at(
     output.sanitize = generated.policy.sanitize;
     let (assembled, located) = {
         let _span = tracing::info_span!(target: "blaze", "link natives", unit = %path).entered();
-        let Natives { libs, search, assembled } = natives(job, unit, krate, &generated.frontend, triple(job, u))?;
+        let Natives { libs, search, assembled } =
+            natives(job, unit, krate, &generated.frontend, triple(job, u))?;
         let sysroot = crate::toolchain::sysroot().ok_or(LinkCause::NoToolchain)?;
-        let located =
-            blaze_link::target::locate(&mut output, &libs, &search, &sysroot).map_err(linker(LinkStep::Locate))?;
+        let located = blaze_link::target::locate(&mut output, &libs, &search, &sysroot)
+            .map_err(linker(LinkStep::Locate))?;
         (assembled, located)
     };
     let side = {
@@ -1506,22 +1624,38 @@ fn link_at(
     let weights = profiles.and_then(|it| it.weights(path));
     let heat = weights.map(|it| it.heat(&built.identities));
 
-    let (mut linked, changed, relaid) = kept_image(images, path, &output, weights.map(super::layout::Weights::id))?;
+    let (mut linked, changed, relaid) =
+        kept_image(images, path, &output, weights.map(super::layout::Weights::id))?;
     // The image goes back whether the link is made or not: one that fails leaves it as it
     // was, and the next link is a change of it.
-    let made = relink(job, unit, path, generated, test, &assembled, &located, side, heat.as_ref(), &mut linked);
+    let made = relink(
+        job,
+        unit,
+        path,
+        generated,
+        test,
+        &assembled,
+        &located,
+        side,
+        heat.as_ref(),
+        &mut linked,
+    );
     // What address holds which function, for a profile of this build to be read through.
     let mapped = match (&made, profiles) {
-        (Ok(_), Some(profiles)) => {
-            profiles.write_map(path, linked.image.build_id(), &linked.image.functions(), &built.identities)
-        }
+        (Ok(_), Some(profiles)) => profiles.write_map(
+            path,
+            linked.image.build_id(),
+            &linked.image.functions(),
+            &built.identities,
+        ),
         _ => Ok(()),
     };
     // What each address is by code identity and what it refers to, for `blaze perf` to name a
     // run's functions across builds and say why each changed.
     let perf_mapped = match &made {
         Ok(_) => {
-            let _span = tracing::info_span!(target: "blaze", "link perf map", unit = %path).entered();
+            let _span =
+                tracing::info_span!(target: "blaze", "link perf map", unit = %path).entered();
             super::perf::write_map(job, path, &linked.image, built)
         }
         Err(_) => Ok(()),
@@ -1625,7 +1759,8 @@ pub(crate) fn static_rows(
     let mut rows = Vec::with_capacity(statics.len());
     for it in statics {
         scratch.clear();
-        blaze_protocol::cbor::append(&mut scratch, it).map_err(|error| format!("the static {:?}: {error}", it.item))?;
+        blaze_protocol::cbor::append(&mut scratch, it)
+            .map_err(|error| format!("the static {:?}: {error}", it.item))?;
         rows.push((it.item, it.instance, ContentId::of(STATIC_DOMAIN, &scratch)));
     }
     rows.sort_unstable();
@@ -1703,7 +1838,8 @@ pub(crate) fn function_rows(
     rows.sort_unstable();
     if let Some(pair) = rows.windows(2).find(|it| it[0].0 == it[1].0 && it[0].1 != it[1].1) {
         let key = pair[0].0;
-        let name = debug_names.iter().find(|it| it.0 == key).map_or("(no debug name)", |it| it.1.as_str());
+        let name =
+            debug_names.iter().find(|it| it.0 == key).map_or("(no debug name)", |it| it.1.as_str());
         // alloc: error path
         return Err(format!(
             "the function `{name}` ({key:?}) is filled two ways in one build ({:?} and {:?}): one key is one function",
@@ -1741,7 +1877,10 @@ fn relink(
     side: &LinkInputs,
     heat: Option<&blaze_link::Heat>,
     linked: &mut Linked,
-) -> Result<(Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>, Laid, super::run::inproc::Told), LinkCause> {
+) -> Result<
+    (Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>, Laid, super::run::inproc::Told),
+    LinkCause,
+> {
     let built = generated.built;
     // Each native input by the hash of its contents, through the process's table of files by
     // their `stat`: one `stat` for a library the image already has, read only when it is new.
@@ -1784,18 +1923,23 @@ fn relink(
         if added_natives.binary_search(&native_ids[order]).is_ok() {
             let bytes = std::fs::read(&it.path).map_err(|error| {
                 // alloc: error path
-                LinkCause::Native(blaze_usercode::inputs::Unreadable { path: it.path.clone(), error: error.to_string() })
+                LinkCause::Native(blaze_usercode::inputs::Unreadable {
+                    path: it.path.clone(),
+                    error: error.to_string(),
+                })
             })?;
             // alloc: once per native input new to the image, which keeps it shared from here.
             bytes_of.push((order, Arc::<[u8]>::from(bytes)));
         }
     }
 
-    let (functions, removed, added_keys) = function_rows(&linked.functions, &built.functions, &built.debug_names)?;
+    let (functions, removed, added_keys) =
+        function_rows(&linked.functions, &built.functions, &built.debug_names)?;
     let (statics, gone_statics, new_statics) = static_rows(&linked.statics, &built.statics)?;
     let mut patchable: Vec<InstanceKey> = built.patchable.iter().copied().collect();
     patchable.sort_unstable();
-    let mut names: Vec<(String, Target)> = Vec::with_capacity(built.symbols.len() + built.static_symbols.len());
+    let mut names: Vec<(String, Target)> =
+        Vec::with_capacity(built.symbols.len() + built.static_symbols.len());
     for (key, name) in &built.symbols {
         let target = match patchable.binary_search(key).is_ok() {
             true => Target::Function(*key),
@@ -1834,14 +1978,21 @@ fn relink(
     if unchanged {
         let _span = tracing::info_span!(target: "blaze", "link unchanged", unit = %path).entered();
         linked.names = kept_names;
-        let bytes = linked.image.file().map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error })?;
+        let bytes = linked
+            .image
+            .file()
+            .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error })?;
         let table = tests_table(test, path, generated, side, linked)?;
         return Ok((bytes, read, table, Laid::Nothing, super::run::inproc::Told::Nothing));
     }
     // clone: the names gone, a few a link, which an image that refuses the change still has
     let gone_names = unnamed.clone();
     let change = Change {
-        added: built.functions.iter().filter(|it| added_keys.binary_search(&it.key).is_ok()).collect(),
+        added: built
+            .functions
+            .iter()
+            .filter(|it| added_keys.binary_search(&it.key).is_ok())
+            .collect(),
         removed,
         // A whole build tiers nothing up: the slots that run another function than their own
         // are an edited function's earlier keys', in a live image.
@@ -1849,7 +2000,11 @@ fn relink(
         statics: built
             .statics
             .iter()
-            .filter(|it| new_statics.binary_search_by(|row| (row.0, row.1).cmp(&(it.item, it.instance))).is_ok())
+            .filter(|it| {
+                new_statics
+                    .binary_search_by(|row| (row.0, row.1).cmp(&(it.item, it.instance)))
+                    .is_ok()
+            })
             .collect(),
         removed_statics: gone_statics.iter().map(|row| (row.0, row.1)).collect(),
         names,
@@ -1859,11 +2014,23 @@ fn relink(
         natives: bytes_of
             .iter()
             .map(|(at, bytes)| match assembled.get(*at) {
-                Some(object) => Native { id: object.id, name: &object.name, bytes, kind: NativeKind::Object, order: *at as u32 },
+                Some(object) => Native {
+                    id: object.id,
+                    name: &object.name,
+                    bytes,
+                    kind: NativeKind::Object,
+                    order: *at as u32,
+                },
                 None => {
                     let index = *at - assembled.len();
                     let it = &located[index];
-                    Native { id: native_ids[*at], name: &it.name, bytes, kind: it.kind, order: FIRST_LIBRARY + index as u32 }
+                    Native {
+                        id: native_ids[*at],
+                        name: &it.name,
+                        bytes,
+                        kind: it.kind,
+                        order: FIRST_LIBRARY + index as u32,
+                    }
                 }
             })
             .collect(),
@@ -1891,33 +2058,37 @@ fn relink(
         Some(_) => super::artifact::uplifted(path, job.plan(unit).map_err(|it| it.what)?),
         None => None,
     };
-    let made = linked.image.stage(change).map_err(|error| LinkCause::Linker { step: LinkStep::Stage, error }).and_then(|staged| {
-        let laid = match staged.full() {
-            true => Laid::Whole,
-            false => Laid::Patched,
-        };
-        match linked.output.dev_run {
-            // A dev executable's file is its code memory's image part, which its runs map.
-            Some(dev_run) => super::run::inproc::commit(
-                &job.shared.dev_runs,
-                path,
-                runs_from,
-                &mut linked.image,
-                &mut linked.loaded,
-                staged,
-                dev_run.cells,
-                refused.as_deref(),
-            )
-            .map(|(bytes, told)| (bytes, laid, told))
-            // alloc: error path
-            .map_err(|what| LinkCause::Given(format!("{path}: {what}"))),
-            None => linked
-                .image
-                .bytes(staged)
-                .map(|bytes| (bytes, laid, super::run::inproc::Told::Nothing))
-                .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error }),
-        }
-    });
+    let made = linked
+        .image
+        .stage(change)
+        .map_err(|error| LinkCause::Linker { step: LinkStep::Stage, error })
+        .and_then(|staged| {
+            let laid = match staged.full() {
+                true => Laid::Whole,
+                false => Laid::Patched,
+            };
+            match linked.output.dev_run {
+                // A dev executable's file is its code memory's image part, which its runs map.
+                Some(dev_run) => super::run::inproc::commit(
+                    &job.shared.dev_runs,
+                    path,
+                    runs_from,
+                    &mut linked.image,
+                    &mut linked.loaded,
+                    staged,
+                    dev_run.cells,
+                    refused.as_deref(),
+                )
+                .map(|(bytes, told)| (bytes, laid, told))
+                // alloc: error path
+                .map_err(|what| LinkCause::Given(format!("{path}: {what}"))),
+                None => linked
+                    .image
+                    .bytes(staged)
+                    .map(|bytes| (bytes, laid, super::run::inproc::Told::Nothing))
+                    .map_err(|error| LinkCause::Linker { step: LinkStep::Bytes, error }),
+            }
+        });
     let (bytes, laid, told) = match made {
         Ok(made) => made,
         Err(cause) => {
@@ -2065,12 +2236,20 @@ fn changed_assumptions(
         let path = frontend.item_path(*key);
         let _ = match now {
             Assumed::Signature(_) => {
-                write!(why, "the signature of `{path}` changed: code built before the edit calls it as it was")
+                write!(
+                    why,
+                    "the signature of `{path}` changed: code built before the edit calls it as it was"
+                )
             }
             Assumed::Layout(_) => {
-                write!(why, "the layout of `{path}` changed: values made before the edit are laid out as it was")
+                write!(
+                    why,
+                    "the layout of `{path}` changed: values made before the edit are laid out as it was"
+                )
             }
-            Assumed::Unhashable(_) => write!(why, "`{path}` changed, and blaze can't hash what code assumes of it"),
+            Assumed::Unhashable(_) => {
+                write!(why, "`{path}` changed, and blaze can't hash what code assumes of it")
+            }
         };
     }
     if changed.len() > NAMED {
@@ -2096,14 +2275,19 @@ pub(crate) fn edited_slots(
     debug_names: &[(InstanceKey, String)],
 ) -> Result<(Vec<(InstanceKey, InstanceKey)>, Vec<(ContentId, InstanceKey)>), String> {
     // alloc: once per live link, a pair per patchable function, kept by the image
-    let mut now: Vec<(ContentId, InstanceKey)> =
-        identities.iter().filter(|it| patchable.binary_search(&it.0).is_ok()).map(|(key, id)| (*id, *key)).collect();
+    let mut now: Vec<(ContentId, InstanceKey)> = identities
+        .iter()
+        .filter(|it| patchable.binary_search(&it.0).is_ok())
+        .map(|(key, id)| (*id, *key))
+        .collect();
     now.sort_unstable();
     now.dedup();
     // Two functions one across edits: which of them an earlier key's slot runs is not
     // decidable (rule 18), never a guess.
     if let Some(pair) = now.windows(2).find(|it| it[0].0 == it[1].0) {
-        let name = |key: InstanceKey| debug_names.iter().find(|it| it.0 == key).map_or("(no debug name)", |it| it.1.as_str());
+        let name = |key: InstanceKey| {
+            debug_names.iter().find(|it| it.0 == key).map_or("(no debug name)", |it| it.1.as_str())
+        };
         // alloc: error path
         return Err(format!(
             "`{}` ({:?}) and `{}` ({:?}) are one function across edits (identity {:?}): the live image can't \
@@ -2166,7 +2350,9 @@ pub(crate) fn link_lib(value: &str) -> Result<NativeLib, String> {
         "dylib" => NativeLibKind::Dylib,
         "static" => NativeLibKind::Static { whole, bundle },
         "framework" => NativeLibKind::Framework,
-        "link-arg" => return Err(format!("`-l {value}`: blaze's linker takes no raw link argument")),
+        "link-arg" => {
+            return Err(format!("`-l {value}`: blaze's linker takes no raw link argument"));
+        }
         other => return Err(format!("`-l {value}`: unknown library kind `{other}`")),
     };
     // `NAME:RENAME` links `RENAME` where the crate's `#[link]` says `NAME`.
@@ -2181,7 +2367,11 @@ pub(crate) fn link_lib(value: &str) -> Result<NativeLib, String> {
 /// `-lpthread`) are libraries; any other is an error naming it.
 pub(crate) fn link_arg(arg: &str) -> Result<NativeLib, String> {
     if arg == "-pthread" {
-        return Ok(NativeLib { name: "pthread".to_owned(), kind: NativeLibKind::Dylib, verbatim: false });
+        return Ok(NativeLib {
+            name: "pthread".to_owned(),
+            kind: NativeLibKind::Dylib,
+            verbatim: false,
+        });
     }
     match arg.strip_prefix("-l") {
         Some(name) if !name.is_empty() => {

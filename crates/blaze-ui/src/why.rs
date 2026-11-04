@@ -8,13 +8,20 @@ use blaze_ids::ContentId;
 /// `rebuilt` as `blaze why` prints it.
 pub fn lines(out: &mut String, rebuilt: &Rebuilt) {
     if rebuilt.restoring {
-        put!(out, "note: the daemon is still restoring blaze why's ledger, so whether it restored whole is not known yet\n");
+        put!(
+            out,
+            "note: the daemon is still restoring blaze why's ledger, so whether it restored whole is not known yet\n"
+        );
     }
     if let Some(torn) = &rebuilt.torn {
-        put!(out, "note: blaze why's ledger restored short at the daemon's start ({torn}): an item whose records it lost reads as computed first, or as not explained where an older record of it was read\n");
+        put!(
+            out,
+            "note: blaze why's ledger restored short at the daemon's start ({torn}): an item whose records it lost reads as computed first, or as not explained where an older record of it was read\n"
+        );
     }
     if let Some(dropped) = rebuilt.dropped
-        && (rebuilt.groups.iter().any(|it| it.cause == RebuildCause::First) || rebuilt.rebuilt.iter().any(|it| it.cause == RebuildCause::First))
+        && (rebuilt.groups.iter().any(|it| it.cause == RebuildCause::First)
+            || rebuilt.rebuilt.iter().any(|it| it.cause == RebuildCause::First))
     {
         put!(
             out,
@@ -35,7 +42,10 @@ pub fn lines(out: &mut String, rebuilt: &Rebuilt) {
         return chain(out, build, &rebuilt.rebuilt);
     }
     if rebuilt.count == 0 {
-        put!(out, "build {build} computed nothing again that was asked of: everything was reused\n");
+        put!(
+            out,
+            "build {build} computed nothing again that was asked of: everything was reused\n"
+        );
         return;
     }
     put!(out, "build {build} computed {} things again:\n", rebuilt.count);
@@ -166,7 +176,7 @@ fn short(id: &ContentId) -> String {
 fn and(names: &[String]) -> String {
     match names {
         [] => "nothing it names".to_owned(), // alloc: a reason's text
-        [one] => one.clone(), // clone: a reason's text
+        [one] => one.clone(),                // clone: a reason's text
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }

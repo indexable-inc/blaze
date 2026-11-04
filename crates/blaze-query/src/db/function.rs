@@ -180,7 +180,11 @@ impl Vtable {
                 None
             },
             explicit: if F::EVICTABLE && !F::BUDGETED {
-                Some(Explicit { tag: F::TAG, values: explicit_values::<F>, evict: evict_table::<F> })
+                Some(Explicit {
+                    tag: F::TAG,
+                    values: explicit_values::<F>,
+                    evict: evict_table::<F>,
+                })
             } else {
                 None
             },
@@ -306,7 +310,8 @@ pub(crate) fn write_key_text(
 /// fails.
 fn write_key<F: Function>(storage: &Storage, id: Id, out: &mut String) {
     use std::fmt::Write as _;
-    let written = F::Key::from_id_in(storage, id).is_some_and(|key| write_key_text(out, id, |out| F::write_key(key, out)));
+    let written = F::Key::from_id_in(storage, id)
+        .is_some_and(|key| write_key_text(out, id, |out| F::write_key(key, out)));
     if !written {
         _ = write!(out, "{id:?}");
     }
@@ -958,10 +963,15 @@ fn durability_of(done: &Ran) -> u32 {
 /// end. Counted here, once a run, so a read costs nothing more.
 fn store_edges(storage: &Storage, header: &Header, at: u32) {
     let (span, ingredient, reads, note) = local::with(|local| {
-        debug_assert_eq!(at as usize + 1, local.frames.len(), "a run's edges are stored while it is the top frame");
+        debug_assert_eq!(
+            at as usize + 1,
+            local.frames.len(),
+            "a run's edges are stored while it is the top frame"
+        );
         let (most, note) = local.note_peak(at as usize);
         let frame = &local.frames[at as usize];
-        let (start, owner) = (frame.edges_start as usize, (frame.ingredient, Id::from_u32(frame.id)));
+        let (start, owner) =
+            (frame.edges_start as usize, (frame.ingredient, Id::from_u32(frame.id)));
         let recorded = (local.edges.len() - start) as u64 + frame.dropped;
         local.dedup_from(start);
         let kept = (local.edges.len() - start) as u64;
@@ -1442,10 +1452,15 @@ fn fold_round(local: &mut local::Local, at: u32) -> local::Note {
 /// as [`store_edges`] does a run's, with the edges it keeps.
 fn store_cycle_edges(storage: &Storage, header: &Header, at: u32) -> Converged {
     let (span, ingredient, reads, note, read) = local::with(|local| {
-        debug_assert_eq!(at as usize + 1, local.frames.len(), "a head's edges are stored while it is the top frame");
+        debug_assert_eq!(
+            at as usize + 1,
+            local.frames.len(),
+            "a head's edges are stored while it is the top frame"
+        );
         let (most, note) = local.note_peak(at as usize);
         let frame = &local.frames[at as usize];
-        let (start, owner) = (frame.edges_start as usize, (frame.ingredient, Id::from_u32(frame.id)));
+        let (start, owner) =
+            (frame.edges_start as usize, (frame.ingredient, Id::from_u32(frame.id)));
         let recorded = (local.edges.len() - start) as u64 + frame.dropped;
         local.dedup_from(start);
         let bound = fold_round(local, at);
@@ -1668,7 +1683,8 @@ pub fn evict_values<F: Function>(db: &mut F::Db) -> usize {
 /// [`Explicit::evict`] of `F`, and [`evict_values`]: every value of its table at `index`.
 fn evict_table<F: Function>(storage: &mut Storage, index: u32) -> usize {
     let Some(table) = storage.table::<FnTable<F>>(index) else { return 0 };
-    let evicted = rows::<F>(storage, table).filter(|(_, row)| evict::<F>(table, row).is_some()).count();
+    let evicted =
+        rows::<F>(storage, table).filter(|(_, row)| evict::<F>(table, row).is_some()).count();
     table.values.fetch_sub(evicted, Ordering::Relaxed);
     counts::add(index, counts::DROPPED, evicted as u64);
     evicted

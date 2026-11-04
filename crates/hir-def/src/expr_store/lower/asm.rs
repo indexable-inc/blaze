@@ -1,8 +1,8 @@
 //! Lowering of inline assembly.
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir_expand::name::Name;
 use intern::Symbol;
+use std::alloc::Global;
 use syntax::{
     T,
     view::{self as ast, AstNode, AstToken, HasModuleItem, HasName, IsString},
@@ -235,10 +235,7 @@ impl ExprCollector<'_> {
                             }
                             ast::AsmOperand::AsmSym(s) => {
                                 let Some(path) = s.path().and_then(|p| {
-                                    self.lower_path_view(
-                                        p,
-                                        &mut ImplTraitLowering::Error,
-                                    )
+                                    self.lower_path_view(p, &mut ImplTraitLowering::Error)
                                 }) else {
                                     continue;
                                 };

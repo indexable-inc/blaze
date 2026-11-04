@@ -969,12 +969,10 @@ mod wrappers {
             self.0.visit_item_ref(ItemId::Global(x.id), &mut x.generics)
         }
         fn visit_trait_decl_ref(&mut self, x: &mut TraitDeclRef) -> ControlFlow<Self::Break> {
-            self.0
-                .visit_item_ref(ItemId::TraitDecl(x.id), &mut x.generics)
+            self.0.visit_item_ref(ItemId::TraitDecl(x.id), &mut x.generics)
         }
         fn visit_trait_impl_ref(&mut self, x: &mut TraitImplRef) -> ControlFlow<Self::Break> {
-            self.0
-                .visit_item_ref(ItemId::TraitImpl(x.id), &mut x.generics)
+            self.0.visit_item_ref(ItemId::TraitImpl(x.id), &mut x.generics)
         }
         fn visit_fn_ptr(&mut self, x: &mut FnPtr) -> ControlFlow<Self::Break> {
             match x.kind.as_ref() {
@@ -1014,10 +1012,7 @@ mod wrappers {
         for DontLeakImplDetails<VisitWithBinderStack<V>>
     {
         fn enter_item(&mut self, item: ItemRef<'_>) {
-            self.0
-                .0
-                .binder_stack_mut()
-                .push(item.generic_params().clone());
+            self.0.0.binder_stack_mut().push(item.generic_params().clone());
         }
         fn exit_item(&mut self, _item: ItemRef<'_>) {
             self.0.0.binder_stack_mut().pop();
@@ -1027,10 +1022,7 @@ mod wrappers {
         for DontLeakImplDetails<VisitWithBinderStack<V>>
     {
         fn enter_item(&mut self, item: ItemRefMut<'_>) {
-            self.0
-                .0
-                .binder_stack_mut()
-                .push(item.as_ref().generic_params().clone());
+            self.0.0.binder_stack_mut().push(item.as_ref().generic_params().clone());
         }
         fn exit_item(&mut self, _item: ItemRefMut<'_>) {
             self.0.0.binder_stack_mut().pop();

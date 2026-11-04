@@ -8,8 +8,8 @@ use base_db::{EditionedFileId, FileId, FileText};
 use blaze_api::{Edit, EditedItem, How, Target};
 use blaze_items::{ItemKey, key::Resolved};
 use blaze_vfs::Op;
-use syntax::{Edition, NodeOrToken, SourceFile, SyntaxKind};
 use hir_expand::fixture;
+use syntax::{Edition, NodeOrToken, SourceFile, SyntaxKind};
 
 use super::{applied, assert_fresh, db::TestDB, roots};
 use crate::{Applied, Files, apply};
@@ -87,7 +87,10 @@ fn texts(view: &View) -> BTreeMap<String, String> {
 }
 
 fn rename(file: &str, item: &str, to: &str) -> Edit {
-    Edit::Rename { to: to.to_owned(), item: Target { file: file.to_owned(), item: item.to_owned() } }
+    Edit::Rename {
+        to: to.to_owned(),
+        item: Target { file: file.to_owned(), item: item.to_owned() },
+    }
 }
 
 /// `edits` made on `GRAPH`, checked against `after`, the files as text edits would leave them.
@@ -110,7 +113,11 @@ fn check(edits: &[Edit], after: &BTreeMap<String, String>) -> (TestDB, Applied) 
         .collect();
     edited_files.sort_unstable();
     edited_files.dedup();
-    assert_eq!(made.seeds().count(), edited_files.len(), "a seed for each file edited, none with errors");
+    assert_eq!(
+        made.seeds().count(),
+        edited_files.len(),
+        "a seed for each file edited, none with errors"
+    );
     for seed in made.seeds() {
         let (path, text) = after
             .iter()
@@ -135,13 +142,19 @@ fn check(edits: &[Edit], after: &BTreeMap<String, String>) -> (TestDB, Applied) 
             let id = EditionedFileId::new(next, seed.file, seed.edition);
             let input = next.file_text(seed.file);
             assert_eq!(input.content(next), seed.content, "the seed is of the file's text as set");
-            assert!(seed.parse.root().text() == input.text(next).as_str(), "the seed's tree is of the file's text");
+            assert!(
+                seed.parse.root().text() == input.text(next).as_str(),
+                "the seed's tree is of the file's text"
+            );
             assert!(id.seed_parse(next, seed.content, &seed.parse), "the front end takes the seed");
         }
     });
     for seed in &seeds {
         let id = EditionedFileId::new(&next, seed.file, seed.edition);
-        assert!(std::ptr::eq(id.parse(&next).root().file(), seed.parse.root().file()), "no parse of its own");
+        assert!(
+            std::ptr::eq(id.parse(&next).root().file(), seed.parse.root().file()),
+            "no parse of its own"
+        );
     }
     (db, made)
 }
@@ -266,10 +279,15 @@ fn renaming_an_associated_fn_and_then_editing_names_the_view_as_it_was() {
 #[test]
 fn a_rename_stops_at_what_it_cant_place_or_do() {
     let (db, files) = view(GRAPH, &PATHS);
-    let error = apply(&db, &files, &[rename("shapes.rs", "area", "fn")]).err().expect("the edits are refused");
+    let error = apply(&db, &files, &[rename("shapes.rs", "area", "fn")])
+        .err()
+        .expect("the edits are refused");
     assert!(error.what.contains("is no identifier"), "{error:?}");
-    let edit = Edit::AddItem { file: "lib.rs".to_owned(), into: None, text: "fn x() {}".to_owned() };
-    let error = apply(&db, &files, &[edit, rename("shapes.rs", "area", "surface")]).err().expect("the edits are refused");
+    let edit =
+        Edit::AddItem { file: "lib.rs".to_owned(), into: None, text: "fn x() {}".to_owned() };
+    let error = apply(&db, &files, &[edit, rename("shapes.rs", "area", "surface")])
+        .err()
+        .expect("the edits are refused");
     assert!(error.what.contains("renames come first"), "{error:?}");
 
     let fixture = r#"
@@ -279,7 +297,9 @@ pub fn area() -> u32 { 1 }
 pub fn both() -> u32 { twice!() }
 "#;
     let (db, files) = view(fixture, &["lib.rs"]);
-    let error = apply(&db, &files, &[rename("lib.rs", "area", "surface")]).err().expect("the edits are refused");
+    let error = apply(&db, &files, &[rename("lib.rs", "area", "surface")])
+        .err()
+        .expect("the edits are refused");
     assert!(error.what.contains("lib.rs:1: in tokens no macro expanded"), "{error:?}");
 
     let fixture = r#"
@@ -290,7 +310,9 @@ impl Shape for S { fn area(&self) -> u32 { 1 } }
 fn total(s: &S) -> u32 { s.area() }
 "#;
     let (db, files) = view(fixture, &["lib.rs"]);
-    let error = apply(&db, &files, &[rename("lib.rs", "<S as Shape>::area", "size")]).err().expect("the edits are refused");
+    let error = apply(&db, &files, &[rename("lib.rs", "<S as Shape>::area", "size")])
+        .err()
+        .expect("the edits are refused");
     assert!(error.what.contains("rename it in the trait"), "{error:?}");
     let made = apply(&db, &files, &[rename("lib.rs", "Shape::area", "size")]).unwrap();
     let mut after = texts(&files);
@@ -310,7 +332,10 @@ fn walked(text: &str, name: &str) -> Vec<u32> {
             NodeOrToken::Token(token) => Some(token),
             NodeOrToken::Node(_) => None,
         })
-        .filter(|it| it.kind() == SyntaxKind::IDENT && it.text().strip_prefix("r#").unwrap_or(it.text()) == name)
+        .filter(|it| {
+            it.kind() == SyntaxKind::IDENT
+                && it.text().strip_prefix("r#").unwrap_or(it.text()) == name
+        })
         .map(|it| u32::from(it.text_range().start()))
         .collect()
 }
@@ -320,7 +345,10 @@ fn the_names_matches_reach_every_identifier_of_it_and_nothing_else() {
     let text = "fn area() {} // area\nfn r#area() { areas(); \"area\"; x.area; let _ = area_of; }\n\
                 mod m { fn f() { m::area() } }\n";
     let finder = memchr::memmem::Finder::new(b"area");
-    for parse in [SourceFile::parse(text, Edition::CURRENT), SourceFile::parse_outline(text, Edition::CURRENT)] {
+    for parse in [
+        SourceFile::parse(text, Edition::CURRENT),
+        SourceFile::parse_outline(text, Edition::CURRENT),
+    ] {
         let root = parse.root();
         let found: Vec<u32> = finder
             .find_iter(text.as_bytes())
@@ -328,6 +356,10 @@ fn the_names_matches_reach_every_identifier_of_it_and_nothing_else() {
             .map(|it| u32::from(it.text_range().start()))
             .collect();
         assert_eq!(found, walked(text, "area"));
-        assert_eq!(found.len(), 4, "the fn, the raw fn, the field and the path; no comment, string or longer name");
+        assert_eq!(
+            found.len(),
+            4,
+            "the fn, the raw fn, the field and the path; no comment, string or longer name"
+        );
     }
 }

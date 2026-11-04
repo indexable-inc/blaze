@@ -55,7 +55,8 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, call: ast::MacroCall<'t>) {
     let Some(tt) = call.token_tree() else { return };
     let mut args = Vec::new();
     cx.macro_args(call, &mut args);
-    let limit = u64::try_from(cx.conf().int("too-large-for-stack", 200)).expect("a count, checked as the configuration loads");
+    let limit = u64::try_from(cx.conf().int("too-large-for-stack", 200))
+        .expect("a count, checked as the configuration loads");
     let (inner, len) = if repeats(tt.syntax()) {
         let [(elem_at, elem), (len_at, len)] = args[..] else { return };
         let copy = cx.ty(elem).is_some_and(|it| it.is_copy(cx.db()));

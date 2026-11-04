@@ -12,8 +12,7 @@ use rustc_type_ir::{self as ty, Interner};
 use crate::solve::assembly::Candidate;
 use crate::solve::{Goal, GoalSource, GoalStalledOn, VisibleForLeakCheck};
 
-type NestedGoal<I> =
-    (GoalSource, Goal<I, <I as Interner>::Predicate>, Option<GoalStalledOn<I>>);
+type NestedGoal<I> = (GoalSource, Goal<I, <I as Interner>::Predicate>, Option<GoalStalledOn<I>>);
 type RegionConstraint<I> = (ty::RegionConstraint<I>, VisibleForLeakCheck);
 type OpaqueType<I> = (ty::OpaqueTypeKey<I>, <I as Interner>::Ty);
 type NormalizationGoal<I> = (GoalSource, Goal<I, <I as Interner>::Predicate>);
@@ -98,11 +97,7 @@ impl<I: Interner> SolverScratch<I> {
             + held_in(&self.region_vars, HashSet::capacity, size_of::<ty::RegionVid>() + 1)
             + held_in(&self.region_constraints, Vec::capacity, size_of::<RegionConstraint<I>>())
             + held_in(&self.opaque_types, Vec::capacity, size_of::<OpaqueType<I>>())
-            + held_in(
-                &self.normalization_goals,
-                Vec::capacity,
-                size_of::<NormalizationGoal<I>>(),
-            )
+            + held_in(&self.normalization_goals, Vec::capacity, size_of::<NormalizationGoal<I>>())
     }
 }
 

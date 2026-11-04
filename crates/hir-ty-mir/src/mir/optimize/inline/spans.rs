@@ -4,12 +4,12 @@
 //! scope names the call it was inlined at, a span of the body it was inlined into. That is
 //! what rustc's inlined `SourceScope`s say, with `inlined` and `inlined_parent_scope`.
 
-use base_db::Db;
 use crate::{
     InferBodyId,
     db::HirDatabase,
     mir::{Inlined, InlinedBody, MirBody, MirSpan, location::track_caller, overflow},
 };
+use base_db::Db;
 
 /// The body whose expression store the spans of an inlined callee are of.
 pub fn owner_of<'db>(db: &'db Db, callee: InlinedBody<'db>) -> InferBodyId<'db> {

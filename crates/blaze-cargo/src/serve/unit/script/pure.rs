@@ -46,7 +46,9 @@ pub(crate) fn verifies(job: &Job) -> Result<bool, ApiError> {
         Some((_, value)) if value == "verify" => Ok(true),
         Some((_, value)) => Err(ApiError::new(
             // alloc: the edge: the error the build stops with
-            format!("{PURE}={value} is not a value blaze takes: `verify` builds and runs a pure build script whose result was kept as well, unset runs none"),
+            format!(
+                "{PURE}={value} is not a value blaze takes: `verify` builds and runs a pure build script whose result was kept as well, unset runs none"
+            ),
             None,
         )),
     }
@@ -131,7 +133,9 @@ pub(crate) fn unbuilt(job: &Job, reader: &UnitReader, unit: usize) -> Result<boo
 /// Whether compile `unit` built nothing because its runs hit ([`unbuilt`], already asked): then
 /// it keeps no record.
 pub(crate) fn built_nothing(job: &Job, unit: usize) -> bool {
-    !verifies(job).unwrap_or(true) && !super::rechecks(job).unwrap_or(true) && of(job, unit).is_some_and(Pure::all_hit)
+    !verifies(job).unwrap_or(true)
+        && !super::rechecks(job).unwrap_or(true)
+        && of(job, unit).is_some_and(Pure::all_hit)
 }
 
 /// The most instances a build script's purity proof may walk before it stops with an error
@@ -154,7 +158,13 @@ const ENGINE_FUEL: u64 = 1 << 28;
 /// What the pure path finds of the script compiled by unit `compile`, its target `target`
 /// (`build-script-build`) and `unit` its name (`serde v1.0.219 (build script)`), which the
 /// proof's span carries.
-fn work_out(job: &Job, reader: &UnitReader, compile: usize, target: &str, unit: &str) -> Result<Purity, ApiError> {
+fn work_out(
+    job: &Job,
+    reader: &UnitReader,
+    compile: usize,
+    target: &str,
+    unit: &str,
+) -> Result<Purity, ApiError> {
     let db = reader.db();
     let krate = job.crates.krate(compile).ok_or(UnitError::NoCrate { unit: compile })?;
     // Not proved, so built and run in the sandbox as any script: the proof is asked of a free
@@ -180,7 +190,9 @@ fn work_out(job: &Job, reader: &UnitReader, compile: usize, target: &str, unit: 
                 proof
             }
             // alloc: an error, once
-            Ok((Ok((proof, _)), _)) => return Err(refused(job, compile, format!("it walked {}", proof.steps))),
+            Ok((Ok((proof, _)), _)) => {
+                return Err(refused(job, compile, format!("it walked {}", proof.steps)));
+            }
             Ok((Err(out), _)) => return Err(refused(job, compile, format!("it {out}"))), // alloc: an error, once
             Err(out) => {
                 let what = format!(
@@ -201,7 +213,8 @@ fn work_out(job: &Job, reader: &UnitReader, compile: usize, target: &str, unit: 
         identity: proved.identity,
         // alloc: once per pure script: the names its key reads
         env: proved.env.iter().map(|it| OsString::from(it.as_str())).collect(),
-        reads: proved.effects.has(hir_ty_pure::Effects::READ) || proved.effects.has(hir_ty_pure::Effects::PROBE),
+        reads: proved.effects.has(hir_ty_pure::Effects::READ)
+            || proved.effects.has(hir_ty_pure::Effects::PROBE),
         writes: proved.effects.has(hir_ty_pure::Effects::WRITE),
         prints: proved.effects.has(hir_ty_pure::Effects::PRINT),
     };
@@ -228,7 +241,9 @@ fn work_out(job: &Job, reader: &UnitReader, compile: usize, target: &str, unit: 
 /// instances than [`PROOF_STEPS`]: `how` says how far it got.
 fn refused(job: &Job, compile: usize, how: String) -> ApiError {
     // alloc: an error, once
-    let what = format!("walks more than the {PROOF_STEPS} instances a proof's walk may reach (rule 15): {how}");
+    let what = format!(
+        "walks more than the {PROOF_STEPS} instances a proof's walk may reach (rule 15): {how}"
+    );
     proof_error(job, compile, &what)
 }
 
@@ -236,8 +251,12 @@ fn refused(job: &Job, compile: usize, how: String) -> ApiError {
 /// `what` says what the proof did.
 fn proof_error(job: &Job, compile: usize, what: &str) -> ApiError {
     let unit = job.unit(compile);
-    let script = unit.as_ref().map_or_else(|it| it.what.clone(), |it| format!("`{}` of `{}`", it.target.name, it.pkg_id)); // alloc: an error, once
-    let what = format!("the purity proof of the build script {script} (`script_proof` of its `main`) {what}"); // alloc: an error, once
+    let script = unit
+        .as_ref()
+        .map_or_else(|it| it.what.clone(), |it| format!("`{}` of `{}`", it.target.name, it.pkg_id)); // alloc: an error, once
+    let what = format!(
+        "the purity proof of the build script {script} (`script_proof` of its `main`) {what}"
+    ); // alloc: an error, once
     ApiError::new(what, unit.ok().map(|it| it.pkg_id.clone())) // clone: an error, once
 }
 
@@ -247,7 +266,9 @@ fn run_of(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsString)>)
     let units = job.units();
     let compile = compile_of(units, run)
         // alloc: the edge: the error the build stops with
-        .ok_or_else(|| ApiError::new(format!("the run of unit {run} has no build script compiled"), None))?;
+        .ok_or_else(|| {
+            ApiError::new(format!("the run of unit {run} has no build script compiled"), None)
+        })?;
     let of = Of {
         units,
         host: &job.input.config.host,
@@ -258,7 +279,8 @@ fn run_of(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsString)>)
         native: &job.input.native,
     };
     // alloc: the edge: the error the build stops with
-    let unit = script_unit(&of, run).map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
+    let unit = script_unit(&of, run)
+        .map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
     // As `prepare` starts the run in it, so the pure key reads what the run is given.
     let env = inherited(&job.input.config.invocation.env, job.plan(run)?, !outside(job, run));
     Ok((unit, env))
@@ -267,8 +289,12 @@ fn run_of(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsString)>)
 /// The environment `unit`'s script sees, started in `inherited`: what a pure key's variables
 /// have the values of, the whole of it as [`blaze_usercode::script::prepare`] starts a run in
 /// it ([`blaze_usercode::script::Prepared::script_env`], what [`keep`] reads them from).
-fn script_env(unit: &bs::Unit, inherited: &[(OsString, OsString)]) -> Result<Vec<(OsString, OsString)>, ApiError> {
-    blaze_usercode::script::script_env(unit, inherited).map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))
+fn script_env(
+    unit: &bs::Unit,
+    inherited: &[(OsString, OsString)],
+) -> Result<Vec<(OsString, OsString)>, ApiError> {
+    blaze_usercode::script::script_env(unit, inherited)
+        .map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))
 }
 
 /// What a build's report says of run unit `run`'s script: [`purity`] of its compile, and
@@ -287,7 +313,12 @@ pub(crate) fn hit(job: &Job, run: usize) -> Option<&Value> {
 /// when the script is pure: the package files it read, or the error naming the effect its
 /// proof said it never has. `None` for a script that is not pure. Asked before the run's own
 /// key takes anything out of the trace.
-pub(crate) fn check(job: &Job, run: usize, unit: &bs::Unit, traced: &Traced) -> Option<Result<Read, String>> {
+pub(crate) fn check(
+    job: &Job,
+    run: usize,
+    unit: &bs::Unit,
+    traced: &Traced,
+) -> Option<Result<Read, String>> {
     let pure = of(job, compile_of(job.units(), run)?)?;
     // clone: once per run of a pure script: the two paths its loader reads may come from
     let toolchain = [job.shared.tools.clone(), job.shared.launcher.clone()];
@@ -315,7 +346,9 @@ pub(crate) fn retract(
     roots: &RootMap,
     value: &Value,
 ) -> Result<Option<(String, RunPuts)>, (String, RunPuts)> {
-    let Some(pure) = compile_of(job.units(), run).and_then(|compile| of(job, compile)) else { return Ok(None) };
+    let Some(pure) = compile_of(job.units(), run).and_then(|compile| of(job, compile)) else {
+        return Ok(None);
+    };
     let Some(hit) = pure.found(run) else { return Ok(None) };
     match pure::retract(store, &pure.proof, roots.view(), hit, value) {
         Ok(None) => Ok(None),
@@ -327,7 +360,11 @@ pub(crate) fn retract(
         }
         Err(not) => {
             // alloc: the edge: the error the build stops with
-            let what = format!("the build script of `{}`: retracting its pure key's verified result: {:?}", unit.package.descr(), not.error);
+            let what = format!(
+                "the build script of `{}`: retracting its pure key's verified result: {:?}",
+                unit.package.descr(),
+                not.error
+            );
             Err((what, landed(not)))
         }
     }
@@ -360,7 +397,9 @@ pub(crate) fn keep(
     if !value.succeeded() {
         return Ok(RunPuts::default());
     }
-    let Some(pure) = compile_of(job.units(), run).and_then(|compile| of(job, compile)) else { return Ok(RunPuts::default()) };
+    let Some(pure) = compile_of(job.units(), run).and_then(|compile| of(job, compile)) else {
+        return Ok(RunPuts::default());
+    };
     let script = unit.package.descr();
     pure::checked_value(&script, &pure.proof, value).map_err(|it| (it.0, RunPuts::default()))?;
     let mut disk = Disk::new(script_env.to_vec()); // alloc: once per kept run of a pure script, its key's environment
@@ -373,7 +412,10 @@ pub(crate) fn keep(
         })
         .map_err(|not| {
             // alloc: the edge: the error the build stops with
-            let what = format!("the build script of `{script}`: keeping its result under its pure key: {:?}", not.error);
+            let what = format!(
+                "the build script of `{script}`: keeping its result under its pure key: {:?}",
+                not.error
+            );
             (what, landed(not))
         })
 }

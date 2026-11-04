@@ -31,18 +31,11 @@ fn matches_python_for_every_codepoint_of_every_version() {
     for &(end, category) in PYTHON_RANGES {
         expected.resize(end as usize + 1, category);
     }
-    assert_eq!(
-        expected.len(),
-        0x110000,
-        "python reference does not cover full range"
-    );
+    assert_eq!(expected.len(), 0x110000, "python reference does not cover full range");
     assert_matches(LATEST, &expected);
 
     let older: Vec<&str> = PYTHON_DELTAS.iter().map(|(name, _)| *name).collect();
-    let versions: Vec<&str> = UnicodeVersion::all()
-        .skip(1)
-        .map(UnicodeVersion::as_str)
-        .collect();
+    let versions: Vec<&str> = UnicodeVersion::all().skip(1).map(UnicodeVersion::as_str).collect();
     assert_eq!(older, versions);
     for &(name, runs) in PYTHON_DELTAS {
         for &(start, end, category) in runs {
@@ -68,10 +61,7 @@ fn versions_parse_by_number() {
     assert_eq!(version("99.9"), LATEST);
     for name in ["13.0.0", "15.0.1", "15.2", "0.0.0"] {
         let err = UnicodeVersion::parse(name).unwrap_err().to_string();
-        assert!(matches!(
-            UnicodeVersion::parse(name),
-            Err(EngineError::InvalidArgument(_))
-        ));
+        assert!(matches!(UnicodeVersion::parse(name), Err(EngineError::InvalidArgument(_))));
         assert!(
             err.contains(&format!("no tables for Unicode {name}"))
                 && err.contains("14.0.0, 15.0.0, 15.1.0, 16.0.0, 17.0.0"),
@@ -80,10 +70,7 @@ fn versions_parse_by_number() {
     }
     for name in ["", "x", "15.1.0.0", "15.a", "1 5", "-15.0.0", "15..0"] {
         let err = UnicodeVersion::parse(name).unwrap_err().to_string();
-        assert!(
-            err.contains("is not a Unicode version number"),
-            "{name:?}: {err}"
-        );
+        assert!(err.contains("is not a Unicode version number"), "{name:?}: {err}");
     }
 }
 
@@ -151,11 +138,7 @@ fn case_tables_are_sorted_and_cased_in_their_version() {
             assert!(pair[0].0 < pair[1].0, "{pair:?} in {}", version.as_str());
         }
         for &(cp, lower, upper) in mappings {
-            assert!(
-                lower != cp || upper != cp,
-                "U+{cp:04X} in {}",
-                version.as_str()
-            );
+            assert!(lower != cp || upper != cp, "U+{cp:04X} in {}", version.as_str());
             for c in [cp, lower, upper] {
                 assert_ne!(
                     version.general_category(c).unwrap(),
@@ -205,34 +188,21 @@ fn overlaying_runs_matches_a_per_codepoint_overlay() {
         vec![(35, 39, Cn)],
         vec![(39, 39, Cn)],
         vec![(0, 39, So)],
-        vec![
-            (2, 3, So),
-            (6, 6, So),
-            (12, 12, Lu),
-            (27, 33, Zs),
-            (38, 39, Zs),
-        ],
+        vec![(2, 3, So), (6, 6, So), (12, 12, Lu), (27, 33, Zs), (38, 39, Zs)],
     ];
     for runs in cases {
         let overlaid = overlay_runs(&base, &runs);
         assert_eq!(overlaid, brute_force_overlay(&base, &runs, 39), "{runs:?}");
         assert_eq!(overlaid.last().unwrap().0, 39);
         for pair in overlaid.windows(2) {
-            assert!(
-                pair[0].0 < pair[1].0 && pair[0].1 != pair[1].1,
-                "{overlaid:?}"
-            );
+            assert!(pair[0].0 < pair[1].0 && pair[0].1 != pair[1].1, "{overlaid:?}");
         }
     }
 }
 
 #[test]
 fn overlaying_case_changes_inserts_replaces_and_removes() {
-    let base = vec![
-        (0x41, 0x61, 0x41),
-        (0x61, 0x61, 0x41),
-        (0x100, 0x101, 0x100),
-    ];
+    let base = vec![(0x41, 0x61, 0x41), (0x61, 0x61, 0x41), (0x100, 0x101, 0x100)];
     assert_eq!(overlay_case(&base, &[]), base);
     assert_eq!(
         overlay_case(
@@ -254,14 +224,7 @@ fn overlaying_case_changes_inserts_replaces_and_removes() {
         ]
     );
     assert_eq!(
-        overlay_case(
-            &base,
-            &[
-                (0x41, 0x41, 0x41),
-                (0x61, 0x61, 0x61),
-                (0x100, 0x100, 0x100)
-            ]
-        ),
+        overlay_case(&base, &[(0x41, 0x41, 0x41), (0x61, 0x61, 0x61), (0x100, 0x100, 0x100)]),
         vec![]
     );
 }
@@ -335,10 +298,7 @@ fn is_in_group_two_char_matches_exactly() {
 #[test]
 fn is_in_group_major_class_matches_all_subclasses() {
     for &cp in &['A' as u32, 'a' as u32, 0x01C5, 0x02B0, 0x00AA] {
-        assert!(
-            LATEST.is_in_group(cp, "L").unwrap(),
-            "U+{cp:04X} should match L"
-        );
+        assert!(LATEST.is_in_group(cp, "L").unwrap(), "U+{cp:04X} should match L");
     }
     assert!(!LATEST.is_in_group(' ' as u32, "L").unwrap());
     assert!(!LATEST.is_in_group('0' as u32, "L").unwrap());
@@ -347,13 +307,8 @@ fn is_in_group_major_class_matches_all_subclasses() {
     assert!(LATEST.is_in_group(0x2160, "N").unwrap());
     assert!(!LATEST.is_in_group('A' as u32, "N").unwrap());
 
-    for &cp in &[
-        '_' as u32, '-' as u32, '(' as u32, ')' as u32, 0x00AB, 0x00BB, '.' as u32,
-    ] {
-        assert!(
-            LATEST.is_in_group(cp, "P").unwrap(),
-            "U+{cp:04X} should match P"
-        );
+    for &cp in &['_' as u32, '-' as u32, '(' as u32, ')' as u32, 0x00AB, 0x00BB, '.' as u32] {
+        assert!(LATEST.is_in_group(cp, "P").unwrap(), "U+{cp:04X} should match P");
     }
 
     assert!(LATEST.is_in_group(' ' as u32, "Z").unwrap());
@@ -483,11 +438,7 @@ fn category_runs_in_clip_the_runs_to_the_range() {
         }
         assert_eq!(next, top + 1, "runs over {lo:#x}..={hi:#x}");
     }
-    assert!(
-        LATEST
-            .category_runs_in(0, 0x10FFFF)
-            .eq(LATEST.category_runs())
-    );
+    assert!(LATEST.category_runs_in(0, 0x10FFFF).eq(LATEST.category_runs()));
     assert_eq!(
         LATEST.category_runs_in(0x41, 0x5A).collect::<Vec<_>>(),
         vec![(0x41, 0x5A, Category::Lu)]

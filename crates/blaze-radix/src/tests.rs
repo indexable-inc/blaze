@@ -120,8 +120,10 @@ fn keys_of_every_width_sort_as_the_standard_sort() {
                 })*};
             }
             check!(u8, u16, u32, u64, usize);
-            let mut got: Vec<u128> =
-                wide.iter().map(|&it| u128::from(it) << 64 | u128::from(it.rotate_left(17))).collect();
+            let mut got: Vec<u128> = wide
+                .iter()
+                .map(|&it| u128::from(it) << 64 | u128::from(it.rotate_left(17)))
+                .collect();
             let mut want = got.clone();
             want.sort_unstable();
             sort(&mut got);
@@ -176,7 +178,8 @@ fn the_parallel_path_is_the_same_on_any_thread_count() {
         for shape in [0, 1, 2, 5, 6, 7] {
             let pairs = pairs_of(&keys(&mut rng, n, shape));
             let want = stable(&pairs);
-            for workers in [&Pretend(2) as &dyn Workers, &Pretend(7), &Pretend(64), &Threads(3), &Threads(8)]
+            for workers in
+                [&Pretend(2) as &dyn Workers, &Pretend(7), &Pretend(64), &Threads(3), &Threads(8)]
             {
                 let mut got = pairs.clone();
                 on(workers).sort_pairs(&mut got);
@@ -184,7 +187,10 @@ fn the_parallel_path_is_the_same_on_any_thread_count() {
             }
             let mut got: Vec<u64> = pairs.iter().map(|it| it.0).collect();
             on(&Threads(4)).sort(&mut got);
-            assert!(got.iter().copied().eq(want.iter().map(|it| it.0)), "keys, n {n}, shape {shape}");
+            assert!(
+                got.iter().copied().eq(want.iter().map(|it| it.0)),
+                "keys, n {n}, shape {shape}"
+            );
         }
     }
     let mut got = vec![7u32; PARALLEL];
@@ -260,8 +266,9 @@ fn sorting_in_a_given_scratch_is_the_same_sort() {
             assert_eq!(got, want, "n {n}, shape {shape}");
         }
     }
-    let wide: Vec<(u128, u32)> =
-        (0..WIDE as u32 + 7).map(|at| (((rng.next_u64() as u128) << 64) | rng.next_u64() as u128, at)).collect();
+    let wide: Vec<(u128, u32)> = (0..WIDE as u32 + 7)
+        .map(|at| (((rng.next_u64() as u128) << 64) | rng.next_u64() as u128, at))
+        .collect();
     let mut want = wide.clone();
     want.sort_by_key(|it| it.0);
     let mut got = wide;
@@ -317,9 +324,15 @@ fn order_helpers_keep_order() {
         let (c, d) = (a as i32, b as i32);
         assert_eq!(c.cmp(&d), signed_32(c).cmp(&signed_32(d)));
         let (e, f) = (rng.below(3) as u32, rng.below(3) as u32);
-        assert_eq!((e, c as u32).cmp(&(f, d as u32)), pack_32(e, c as u32).cmp(&pack_32(f, d as u32)));
+        assert_eq!(
+            (e, c as u32).cmp(&(f, d as u32)),
+            pack_32(e, c as u32).cmp(&pack_32(f, d as u32))
+        );
         let (g, h) = (rng.below(3), rng.below(3));
-        assert_eq!((g, a as u64).cmp(&(h, b as u64)), pack_64(g, a as u64).cmp(&pack_64(h, b as u64)));
+        assert_eq!(
+            (g, a as u64).cmp(&(h, b as u64)),
+            pack_64(g, a as u64).cmp(&pack_64(h, b as u64))
+        );
     }
     for edge in [i64::MIN, -1, 0, 1, i64::MAX] {
         assert!(signed_64(edge) <= signed_64(i64::MAX) && signed_64(edge) >= signed_64(i64::MIN));
@@ -330,13 +343,16 @@ fn order_helpers_keep_order() {
 /// permutation of the items, never anything else.
 #[test]
 fn a_key_that_changes_between_reads_panics_or_permutes() {
-    for (n, workers) in [(5000, &Serial as &dyn Workers), (PARALLEL + 1, &Serial), (PARALLEL + 1, &Pretend(4))]
+    for (n, workers) in
+        [(5000, &Serial as &dyn Workers), (PARALLEL + 1, &Serial), (PARALLEL + 1, &Pretend(4))]
     {
         let items: Vec<u64> = (0..n as u64).rev().collect();
         let calls = AtomicU64::new(0);
         let mut got = items.clone();
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            on(workers).sort_copy_by_key(&mut got, |it| *it ^ (calls.fetch_add(1, Ordering::Relaxed) & 0x0F0F));
+            on(workers).sort_copy_by_key(&mut got, |it| {
+                *it ^ (calls.fetch_add(1, Ordering::Relaxed) & 0x0F0F)
+            });
         }));
         got.sort_unstable();
         let mut want = items;

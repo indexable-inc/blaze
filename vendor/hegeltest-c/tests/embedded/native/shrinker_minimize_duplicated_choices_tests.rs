@@ -31,23 +31,12 @@ fn float_node(value: f64) -> ChoiceNode {
 }
 
 fn bytes_node(value: Vec<u8>) -> ChoiceNode {
-    ChoiceNode::bytes(
-        BytesChoice {
-            min_size: 0,
-            max_size: 16,
-        },
-        value,
-        false,
-    )
+    ChoiceNode::bytes(BytesChoice { min_size: 0, max_size: 16 }, value, false)
 }
 
 fn integer_node(value: i128, min_value: i128, max_value: i128) -> ChoiceNode {
     ChoiceNode::integer(
-        IntegerChoice::new(
-            BigInt::from(min_value),
-            BigInt::from(max_value),
-            BigInt::from(0),
-        ),
+        IntegerChoice::new(BigInt::from(min_value), BigInt::from(max_value), BigInt::from(0)),
         BigInt::from(value),
         false,
     )
@@ -190,9 +179,8 @@ fn group_accepts_uniform_at_least(initial: Vec<ChoiceNode>, threshold: i128) -> 
 
 #[test]
 fn shrink_duplicates_positive_descent_is_log_log() {
-    let initial: Vec<ChoiceNode> = (0..5)
-        .map(|_| integer_node(1_000_000_000_000_000, 0, i128::MAX))
-        .collect();
+    let initial: Vec<ChoiceNode> =
+        (0..5).map(|_| integer_node(1_000_000_000_000_000, 0, i128::MAX)).collect();
     let mut shrinker = group_accepts_uniform_at_least(initial, 100);
     drive_no_yield(shrinker.shrink_duplicates()).unwrap();
 
@@ -211,9 +199,8 @@ fn shrink_duplicates_positive_descent_is_log_log() {
 
 #[test]
 fn shrink_duplicates_negative_descent_is_log_log() {
-    let initial: Vec<ChoiceNode> = (0..5)
-        .map(|_| integer_node(-1_000_000_000_000_000, i128::MIN + 1, 0))
-        .collect();
+    let initial: Vec<ChoiceNode> =
+        (0..5).map(|_| integer_node(-1_000_000_000_000_000, i128::MIN + 1, 0)).collect();
     let mut shrinker = Shrinker::with_probe(
         Box::new(move |run: ShrinkRun<'_>| match run {
             ShrinkRun::Full(nodes) => {
@@ -285,9 +272,8 @@ fn shrink_duplicates_skips_group_invalidated_by_concurrent_shrink() {
 /// filter now finds only one member in range and short-circuits.
 #[test]
 fn shrink_duplicates_group_replace_short_circuits_when_truncated() {
-    let initial: Vec<ChoiceNode> = (0..5)
-        .map(|_| integer_node(1_000_000_000_000_000, 0, i128::MAX))
-        .collect();
+    let initial: Vec<ChoiceNode> =
+        (0..5).map(|_| integer_node(1_000_000_000_000_000, 0, i128::MAX)).collect();
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
             ShrinkRun::Full(nodes) => {
@@ -390,10 +376,7 @@ fn shrink_lowers_a_duplicated_size_before_zeroing_what_it_governs() {
     );
     drive_no_yield(shrinker.shrink()).unwrap();
     let values: Vec<ChoiceValue> = shrinker.current_nodes.iter().map(|n| n.value()).collect();
-    assert_eq!(
-        values,
-        [2, 2, 0, 0, 1, 0].map(|v| ChoiceValue::Integer(BigInt::from(v)))
-    );
+    assert_eq!(values, [2, 2, 0, 0, 1, 0].map(|v| ChoiceValue::Integer(BigInt::from(v))));
 }
 
 /// Interesting iff the first node is `2`, the second and fourth are equal

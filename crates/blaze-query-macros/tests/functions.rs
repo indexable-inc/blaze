@@ -379,7 +379,11 @@ fn out_of_fuel_names_the_keys_value() {
     assert!(out.to_string().contains(r#"text: "ab""#), "{out}");
 
     let out = blaze_query::db::with_fuel(0, || repeat(&db, source, 3, '-')).expect_err("no fuel");
-    assert_eq!(out.value, format!(r#"(Source {{ [id]: {id:?}, text: "ab", weight: 1 }}, 3, '-')"#), "{out}");
+    assert_eq!(
+        out.value,
+        format!(r#"(Source {{ [id]: {id:?}, text: "ab", weight: 1 }}, 3, '-')"#),
+        "{out}"
+    );
 
     let out = blaze_query::db::with_fuel(0, || answer(&db)).expect_err("no fuel");
     assert_eq!(out.value, "()", "{out}");

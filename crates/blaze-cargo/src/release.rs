@@ -67,7 +67,11 @@ pub fn watch_updates() -> std::io::Result<Option<Updates>> {
                     let _span = tracing::info_span!("update check: reading latest.json").entered();
                     std::panic::catch_unwind(check).unwrap_or(AFTER_PANIC)
                 };
-                let _span = tracing::info_span!("update check: waiting for the next", secs = wait.as_secs()).entered();
+                let _span = tracing::info_span!(
+                    "update check: waiting for the next",
+                    secs = wait.as_secs()
+                )
+                .entered();
                 match stopped.recv_timeout(wait) {
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                     // The daemon ended: its `Updates` was dropped.

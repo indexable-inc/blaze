@@ -24,9 +24,9 @@ mod source;
 #[cfg(test)]
 mod tests;
 
-use hir::Crate;
 use base_db::Db;
 use blaze_hash::HashSet;
+use hir::Crate;
 use std::alloc::Global;
 
 pub use crate::places::Documented;
@@ -94,7 +94,12 @@ pub fn crates_to_document(
     let reached = reached
         .into_iter()
         .map(|(krate, target)| {
-            Ok(Reached { name: crate_name(db, krate)?, krate, version: krate.version(db).unwrap_or_default(), target })
+            Ok(Reached {
+                name: crate_name(db, krate)?,
+                krate,
+                version: krate.version(db).unwrap_or_default(),
+                target,
+            })
         })
         .collect::<Result<Vec<_>, base_db::UnnamedCrate>>()?
         .into_iter()

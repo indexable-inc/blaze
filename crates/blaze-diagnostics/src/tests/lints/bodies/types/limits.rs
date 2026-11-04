@@ -95,13 +95,23 @@ fn main() {
         error(6, &["`-5`", "`i3`", "`-4..=3`"]),
         error(7, &["`0b1000_u3`", "`u3`", "`0..=7`"]),
     ];
-    let stderr = ui(Ui { name: "arbitrary-ints.rs", core: "copy, unary_ops, builtin_impls", source, ..Ui::default() });
+    let stderr = ui(Ui {
+        name: "arbitrary-ints.rs",
+        core: "copy, unary_ops, builtin_impls",
+        source,
+        ..Ui::default()
+    });
     assert_reports(&stderr, &expected);
     let allowed = "#![allow(overflowing_literals, unused_comparisons, invalid_nan_comparisons, \
                    ambiguous_wide_pointer_comparisons, unpredictable_function_pointer_comparisons)]\n";
     // The same lines, one lower: the `#![allow]` goes after the opt-in.
     let source = source.replacen('\n', &format!("\n{allowed}"), 1);
-    let stderr = ui(Ui { name: "arbitrary-ints.rs", core: "copy, unary_ops, builtin_impls", source: &source, ..Ui::default() });
+    let stderr = ui(Ui {
+        name: "arbitrary-ints.rs",
+        core: "copy, unary_ops, builtin_impls",
+        source: &source,
+        ..Ui::default()
+    });
     let expected = expected.map(|it| Expect { line: it.line.map(|line| line + 1), ..it });
     assert_reports(&stderr, &expected);
 }
@@ -118,6 +128,14 @@ fn f(x: u3, y: i3) -> u8 {
 }
 fn main() { f(0, 0); }
 ";
-    let stderr = ui(Ui { name: "arbitrary-ints-pat.rs", core: "copy, unary_ops, builtin_impls", source, ..Ui::default() });
-    assert_reports(&stderr, &[error(3, &["`8`", "`u3`", "`0..=7`"]), error(4, &["`-5`", "`i3`", "`-4..=3`"])]);
+    let stderr = ui(Ui {
+        name: "arbitrary-ints-pat.rs",
+        core: "copy, unary_ops, builtin_impls",
+        source,
+        ..Ui::default()
+    });
+    assert_reports(
+        &stderr,
+        &[error(3, &["`8`", "`u3`", "`0..=7`"]), error(4, &["`-5`", "`i3`", "`-4..=3`"])],
+    );
 }

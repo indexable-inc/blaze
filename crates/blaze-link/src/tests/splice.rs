@@ -6,8 +6,8 @@
 use blaze_codegen::{CompiledFunction, Init, Relocs, Static, Target};
 use blaze_core::{Completion, Effect, FileName};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_items::ItemKey;
+use std::alloc::Global;
 
 use super::{
     Change, Disk, Image, Linked, Sparse, TO, edit, first, function, id, key, name, output, program,
@@ -29,9 +29,9 @@ enum Touch {
 
 fn touched(effect: &Effect) -> Option<(Touch, &FileName)> {
     match effect {
-        Effect::WriteAt { file, .. } | Effect::Write { file, .. } | Effect::Truncate { file, .. } => {
-            Some((Touch::Writes, file))
-        }
+        Effect::WriteAt { file, .. }
+        | Effect::Write { file, .. }
+        | Effect::Truncate { file, .. } => Some((Touch::Writes, file)),
         Effect::Remove { file, .. } => Some((Touch::Removes, file)),
         Effect::Clone { to, .. } => Some((Touch::ClonedInto, to)),
         Effect::Rename { to, .. } => Some((Touch::RenamedOnto, to)),
@@ -41,7 +41,11 @@ fn touched(effect: &Effect) -> Option<(Touch, &FileName)> {
 
 /// [`Disk::link`], noting each file an effect touches and holding that the image's file is as
 /// the last commit left it until the rename puts the new one there.
-fn link_watching(disk: &mut Disk, image: &mut Image, change: Change<'_>) -> (Result<u64, LinkError>, Vec<(Touch, FileName)>) {
+fn link_watching(
+    disk: &mut Disk,
+    image: &mut Image,
+    change: Change<'_>,
+) -> (Result<u64, LinkError>, Vec<(Touch, FileName)>) {
     let staged = image.stage(change).unwrap();
     let mut effects = Vec::new();
     image.commit(staged, &mut effects).unwrap();
@@ -56,7 +60,10 @@ fn link_watching(disk: &mut Disk, image: &mut Image, change: Change<'_>) -> (Res
         if let Some(it) = &touch {
             seen.push(it.clone());
         }
-        if touch.as_ref().is_none_or(|(touch, file)| *touch != Touch::RenamedOnto || *file != name(TO)) {
+        if touch
+            .as_ref()
+            .is_none_or(|(touch, file)| *touch != Touch::RenamedOnto || *file != name(TO))
+        {
             let now = disk.files.get(&name(TO));
             let same = match (&before, now) {
                 (Some(before), Some(now)) => before.same(now),
@@ -86,9 +93,17 @@ fn a_commit_never_writes_the_images_file_in_place() {
     for change in [first(&start, &g), edit(&g2)] {
         let (result, seen) = link_watching(&mut disk, &mut image, change);
         result.unwrap();
-        let on_image: Vec<Touch> = seen.iter().filter(|(_, file)| *file == name(TO)).map(|it| it.0).collect();
-        assert_eq!(on_image, [Touch::RenamedOnto], "the image's file is only ever renamed onto: {seen:?}");
-        assert!(seen.iter().any(|(touch, file)| *touch == Touch::Writes && *file == name(NEXT)), "{seen:?}");
+        let on_image: Vec<Touch> =
+            seen.iter().filter(|(_, file)| *file == name(TO)).map(|it| it.0).collect();
+        assert_eq!(
+            on_image,
+            [Touch::RenamedOnto],
+            "the image's file is only ever renamed onto: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|(touch, file)| *touch == Touch::Writes && *file == name(NEXT)),
+            "{seen:?}"
+        );
         assert!(!disk.files.contains_key(&name(NEXT)));
     }
     let linked = Linked::of(disk.file(TO));
@@ -114,11 +129,18 @@ fn a_commit_cut_short_is_not_what_the_next_one_builds_on() {
     crashed.files.insert(name(NEXT), left);
     let (result, seen) = link_watching(&mut crashed, &mut image, edit(&g2));
     assert_eq!(result, clean.link(&mut twin, edit(&g2)));
-    let on_next: Vec<Touch> = seen.iter().filter(|(_, file)| *file == name(NEXT)).map(|it| it.0).collect();
+    let on_next: Vec<Touch> =
+        seen.iter().filter(|(_, file)| *file == name(NEXT)).map(|it| it.0).collect();
     assert_eq!(on_next.first(), Some(&Touch::Removes), "the stale next file goes first: {seen:?}");
-    assert!(on_next.contains(&Touch::ClonedInto), "an incremental commit clones the image: {seen:?}");
+    assert!(
+        on_next.contains(&Touch::ClonedInto),
+        "an incremental commit clones the image: {seen:?}"
+    );
     assert!(!crashed.files.contains_key(&name(NEXT)));
-    assert!(crashed.file(TO).same(clean.file(TO)), "the commit after a crash writes what a clean one does");
+    assert!(
+        crashed.file(TO).same(clean.file(TO)),
+        "the commit after a crash writes what a clean one does"
+    );
 }
 
 fn static_of(n: u8, size: usize, align: u32, value: u8) -> Static {
@@ -196,7 +218,8 @@ fn a_static_added_by_a_relink_keeps_its_place_and_bytes_through_later_relinks() 
 /// that reads back as its bytes.
 #[test]
 fn mangled_names_sharing_prefixes_intern_as_a_map_would() {
-    let names: Vec<String> = (0..5000).map(|it| format!("_ZN5crate{}{}E", it % 97, "x".repeat(it % 13))).collect();
+    let names: Vec<String> =
+        (0..5000).map(|it| format!("_ZN5crate{}{}E", it % 97, "x".repeat(it % 13))).collect();
     let mut symbols = Symbols::default();
     let mut model = HashMap::<&str, _, Global>::default();
     let mut ids = HashSet::new_in(Global);

@@ -16,18 +16,20 @@
 
 use std::mem::{offset_of, size_of};
 
-use blaze_format::{FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema_of};
+use blaze_format::{
+    FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema_of,
+};
+use blaze_query::db::FromId;
 use either::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId};
-use blaze_query::db::FromId;
 use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast};
 
 use super::{HAS_EXPRS, at_of, bits, ensure, idx, packed_bits, packed_of, raw};
 use crate::{
     expr_store::{
         BodySourceMap, ExprOrPatSource, ExprSource, ExpressionStoreDiagnostics,
-        ExpressionStoreSourceMap, LabelSource, LifetimeSource, MacroCallPtr, PatSource, SelfParamPtr,
-        TypeSource,
+        ExpressionStoreSourceMap, LabelSource, LifetimeSource, MacroCallPtr, PatSource,
+        SelfParamPtr, TypeSource,
         source_map::{
             BackMap, BindingPats, ExpressionOnlySourceMap, FormatTemplate, IdTable, NO_SOURCE,
             SourceTable,
@@ -316,7 +318,10 @@ impl<'a> BackRef<'a> {
     }
 
     fn is_empty(&self) -> bool {
-        self.kinds.is_empty() && self.starts.is_empty() && self.ends.is_empty() && self.runs.is_empty()
+        self.kinds.is_empty()
+            && self.starts.is_empty()
+            && self.ends.is_empty()
+            && self.runs.is_empty()
     }
 
     /// Checks the columns are a [`BackMap`] of pointers of type `N`, as
@@ -340,15 +345,24 @@ impl<'a> BackRef<'a> {
                 first = Some(slot);
             }
             ensure(start <= end, &self.ends[slot], buffer, "a range that ends before it starts")?;
-            let casts =
-                syntax_kind(u32::from(*kind)).and_then(|kind| ptr_of::<N>(kind, start, end)).is_some();
+            let casts = syntax_kind(u32::from(*kind))
+                .and_then(|kind| ptr_of::<N>(kind, start, end))
+                .is_some();
             ensure(casts, kind, buffer, "a syntax kind its pointer type does not cast")?;
         }
         let Some(first) = first else {
-            return ensure(self.runs.is_empty(), rec, buffer, "file runs in a back map without syntax");
+            return ensure(
+                self.runs.is_empty(),
+                rec,
+                buffer,
+                "file runs in a back map without syntax",
+            );
         };
         let Some(head) = self.runs.first() else {
-            return Err(FormatError::Invalid { at: at_of(rec, buffer), what: "syntax without a file" });
+            return Err(FormatError::Invalid {
+                at: at_of(rec, buffer),
+                what: "syntax without a file",
+            });
         };
         ensure(head.start == 0, head, buffer, "a first file run that does not start at id 0")?;
         for run in self.runs {
@@ -397,7 +411,9 @@ impl<'a> BackRef<'a> {
             // alloc: the decode's one copy of the column.
             self.runs.iter().map(|run| run.start).collect(),
             (self.runs.iter())
-                .map(|run| file_of(run.file_kind, run.file).expect("checked when the buffer was read"))
+                .map(|run| {
+                    file_of(run.file_kind, run.file).expect("checked when the buffer was read")
+                })
                 // alloc: the decode's one copy of the column.
                 .collect(),
         )
@@ -489,7 +505,11 @@ fn source_table<N: AstNode, W: Copy, V>(
 }
 
 /// The word of `src`'s value in a [`SourceTable`]'s checked columns, by binary search.
-fn table_get<N: AstNode, W: Copy>(keys: &[Src], values: &[W], src: &InFile<AstPtr<N>>) -> Option<W> {
+fn table_get<N: AstNode, W: Copy>(
+    keys: &[Src],
+    values: &[W],
+    src: &InFile<AstPtr<N>>,
+) -> Option<W> {
     let at = keys.binary_search_by_key(&Src::of(src).key(), Src::key).ok()?;
     values.get(at).copied()
 }
@@ -538,15 +558,18 @@ impl SourceMapColumns {
         } = map;
         let mut w = Words::new();
         let (types_map, types_map_ids) = table_columns(types_map, |&ty| raw(ty));
-        let (lifetime_map, lifetime_map_ids) = table_columns(lifetime_map, |&lifetime| raw(lifetime));
+        let (lifetime_map, lifetime_map_ids) =
+            table_columns(lifetime_map, |&lifetime| raw(lifetime));
         let (mut expr_map_back, mut pat_map_back, mut label_map_back) =
             (BackColumns::EMPTY, BackColumns::EMPTY, BackColumns::EMPTY);
         // alloc: empty unless the map has expressions; then the column's one copy.
         let (mut binding_starts, mut binding_pats) = (Column { at: 0, len: 0 }, Vec::new());
         // alloc: empty unless the map has expressions; then each is the column's one copy.
-        let (mut expr_keys, mut expr_ids, mut pat_keys, mut pat_ids) = (vec![], vec![], vec![], vec![]);
+        let (mut expr_keys, mut expr_ids, mut pat_keys, mut pat_ids) =
+            (vec![], vec![], vec![], vec![]);
         // alloc: empty unless the map has expressions; then each is the column's one copy.
-        let (mut label_keys, mut label_ids, mut call_keys, mut calls) = (vec![], vec![], vec![], vec![]);
+        let (mut label_keys, mut label_ids, mut call_keys, mut calls) =
+            (vec![], vec![], vec![], vec![]);
         if let Some(it) = expr_only.as_deref() {
             let ExpressionOnlySourceMap {
                 expr_map,
@@ -657,7 +680,10 @@ fn put_template(w: &mut Words, template: Option<&FormatTemplate>) {
 }
 
 /// Reads a template [`put_template`] wrote, for a store of `exprs` expressions.
-fn get_template(r: &mut Read<'_>, exprs: usize) -> Result<Option<Box<FormatTemplate>>, FormatError> {
+fn get_template(
+    r: &mut Read<'_>,
+    exprs: usize,
+) -> Result<Option<Box<FormatTemplate>>, FormatError> {
     Ok(match r.tag(2, "a template map that is neither 0 nor 1")? {
         0 => None,
         // alloc: once per decoded map with templates, as `finish` boxes it.
@@ -764,12 +790,28 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
         let ty = |&ty: &u32| (ty as usize) < types;
         check_table::<ast::Type, _>(map.types_map, map.types_map_ids, ty, root, buffer)?;
         let lifetime = |&lifetime: &u32| (lifetime as usize) < lifetimes;
-        check_table::<ast::Lifetime, _>(map.lifetime_map, map.lifetime_map_ids, lifetime, root, buffer)?;
+        check_table::<ast::Lifetime, _>(
+            map.lifetime_map,
+            map.lifetime_map_ids,
+            lifetime,
+            root,
+            buffer,
+        )?;
         // A macro call's id is a word of its own, refused naming it (not as an arena index).
         for call in map.expansion_calls {
-            blaze_query::db::Id::decode(*call, at_of(call, buffer), "a source table's macro call id")?;
+            blaze_query::db::Id::decode(
+                *call,
+                at_of(call, buffer),
+                "a source table's macro call id",
+            )?;
         }
-        check_table::<ast::MacroCall, _>(map.expansions, map.expansion_calls, |_| true, root, buffer)?;
+        check_table::<ast::MacroCall, _>(
+            map.expansions,
+            map.expansion_calls,
+            |_| true,
+            root,
+            buffer,
+        )?;
         Ok(map)
     }
 
@@ -827,7 +869,10 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
 
     /// As [`ExpressionStoreSourceMap::patterns_for_binding`], read in place; empty for a
     /// binding past the store's.
-    pub fn patterns_for_binding(self, binding: BindingId) -> impl ExactSizeIterator<Item = PatId> + 'a {
+    pub fn patterns_for_binding(
+        self,
+        binding: BindingId,
+    ) -> impl ExactSizeIterator<Item = PatId> + 'a {
         let at = raw(binding) as usize;
         let pats: &'a [u32] = match (self.binding_starts.get(at), self.binding_starts.get(at + 1)) {
             (Some(&start), Some(&end)) => &self.binding_pats[start as usize..end as usize],
@@ -883,7 +928,9 @@ impl ExpressionStoreSourceMap {
     /// As [`ExpressionStore::columns`](crate::expr_store::ExpressionStore::columns), for
     /// [`ExpressionStoreSourceMap`]'s schema.
     pub fn columns() -> blaze_format::tiers::BufferColumns {
-        blaze_format::tiers::BufferColumns::of::<SourceMapRoot>(<ExpressionStoreSourceMap as Persist>::SCHEMA)
+        blaze_format::tiers::BufferColumns::of::<SourceMapRoot>(
+            <ExpressionStoreSourceMap as Persist>::SCHEMA,
+        )
     }
 }
 
@@ -938,7 +985,9 @@ impl BodySourceMap {
     /// As [`ExpressionStore::columns`](crate::expr_store::ExpressionStore::columns), for
     /// [`BodySourceMap`]'s schema.
     pub fn columns() -> blaze_format::tiers::BufferColumns {
-        blaze_format::tiers::BufferColumns::of::<BodySourceMapRoot>(<BodySourceMap as Persist>::SCHEMA)
+        blaze_format::tiers::BufferColumns::of::<BodySourceMapRoot>(
+            <BodySourceMap as Persist>::SCHEMA,
+        )
     }
 }
 
@@ -1094,7 +1143,11 @@ pub(super) fn assert_round_trip(map: &ExpressionStoreSourceMap) {
     let decoded = read.decode().expect("a source map just written");
     tests::assert_maps_eq(&decoded, map);
     assert_eq!(decoded, *map);
-    assert_eq!(blaze_format::to_bytes(&decoded), bytes, "a source map written again as other bytes");
+    assert_eq!(
+        blaze_format::to_bytes(&decoded),
+        bytes,
+        "a source map written again as other bytes"
+    );
 }
 
 /// [`assert_round_trip`] for a body's source map.
@@ -1108,7 +1161,11 @@ pub(super) fn assert_body_round_trip(map: &BodySourceMap) {
     let decoded = read.decode().expect("a source map just written");
     tests::assert_maps_eq(&decoded.store, &map.store);
     assert_eq!(decoded, *map);
-    assert_eq!(blaze_format::to_bytes(&decoded), bytes, "a source map written again as other bytes");
+    assert_eq!(
+        blaze_format::to_bytes(&decoded),
+        bytes,
+        "a source map written again as other bytes"
+    );
 }
 
 #[cfg(test)]
@@ -1129,7 +1186,10 @@ mod tests {
 
     /// Checks what `read` reads in place against `map`: every id of every arena (and one past
     /// it), with syntax or without, and every key of every table.
-    pub(super) fn assert_reads(read: ExpressionStoreSourceMapRef<'_>, map: &ExpressionStoreSourceMap) {
+    pub(super) fn assert_reads(
+        read: ExpressionStoreSourceMapRef<'_>,
+        map: &ExpressionStoreSourceMap,
+    ) {
         assert_eq!(read.has_exprs(), map.expr_only.is_some());
         if let Some(it) = map.expr_only.as_deref() {
             for id in (0..it.expr_map_back.len() as u32 + 1).map(idx) {
@@ -1205,7 +1265,8 @@ mod tests {
         let pats: Vec<PatId> = (0..4).map(|_| builder.alloc_pat(Pat::Wild)).collect();
         let labels: Vec<LabelId> =
             (0..2).map(|_| builder.labels.alloc(Label { name: Name::missing() })).collect();
-        let types: Vec<TypeRefId> = (0..3).map(|_| builder.alloc_type_ref(TypeRef::Never)).collect();
+        let types: Vec<TypeRefId> =
+            (0..3).map(|_| builder.alloc_type_ref(TypeRef::Never)).collect();
         let lifetime = builder.lifetimes.alloc(LifetimeRef::Static);
         let bindings: Vec<BindingId> = (0..3)
             .map(|_| {
@@ -1217,7 +1278,8 @@ mod tests {
                 })
             })
             .collect();
-        let (call, path, wild) = (SyntaxKind::CALL_EXPR, SyntaxKind::PATH_EXPR, SyntaxKind::WILDCARD_PAT);
+        let (call, path, wild) =
+            (SyntaxKind::CALL_EXPR, SyntaxKind::PATH_EXPR, SyntaxKind::WILDCARD_PAT);
         builder.expr_map_back.insert(exprs[0], src(0, false, call, 0, 4));
         builder.expr_map_back.insert(exprs[2], src(1, true, path, 0, 1));
         builder.expr_map_back.insert(exprs[3], src(1, true, path, 2, 3));
@@ -1291,30 +1353,61 @@ fn f(a: u32, (b, c): (u32, u32)) -> u32 {
         let u32_at = |column: usize, slot: usize| column + slot * size_of::<u32>();
 
         let lifetime = u16::from(SyntaxKind::LIFETIME);
-        assert!(refused(&with_u16(&bytes, kind + 2 * slot, lifetime)), "a kind its type doesn't cast");
+        assert!(
+            refused(&with_u16(&bytes, kind + 2 * slot, lifetime)),
+            "a kind its type doesn't cast"
+        );
         let last = SyntaxKind::__LAST as u16;
         assert!(refused(&with_u16(&bytes, kind + 2 * slot, last)), "a kind out of range");
         assert!(refused(&with_u16(&bytes, kind + 2 * slot, NO_SOURCE)), "no syntax with a range");
         assert!(refused(&with_word(&bytes, u32_at(starts, none), 1)), "a range for no syntax");
         let end = exprs.ends[slot];
-        assert!(refused(&with_word(&bytes, u32_at(starts, slot), end + 1)), "an end before its start");
+        assert!(
+            refused(&with_word(&bytes, u32_at(starts, slot), end + 1)),
+            "an end before its start"
+        );
 
-        let len_at = at_of(&read.root.expr_map_back.ends, &buffer) as usize + offset_of!(Slice<u32>, len);
-        assert!(refused(&with_word(&bytes, len_at, exprs.len() as u32 - 1)), "columns of two lengths");
+        let len_at =
+            at_of(&read.root.expr_map_back.ends, &buffer) as usize + offset_of!(Slice<u32>, len);
+        assert!(
+            refused(&with_word(&bytes, len_at, exprs.len() as u32 - 1)),
+            "columns of two lengths"
+        );
 
         let runs = offset_in(exprs.runs, &buffer);
         let run = |at: usize, field: usize| runs + at * size_of::<FileRun>() + field;
-        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, start)), 1)), "a first run past 0");
-        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file_kind)), 7)), "a file kind");
+        assert!(
+            refused(&with_word(&bytes, run(0, offset_of!(FileRun, start)), 1)),
+            "a first run past 0"
+        );
+        assert!(
+            refused(&with_word(&bytes, run(0, offset_of!(FileRun, file_kind)), 7)),
+            "a file kind"
+        );
         assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)), 0)), "an id of 0");
-        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)) + 4, 1)), "an id word past `u32`");
+        assert!(
+            refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)) + 4, 1)),
+            "an id word past `u32`"
+        );
         let past = blaze_query::db::Id::MAX_U32 + 1;
-        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)), past)), "an id word past `Id::MAX_U32`");
+        assert!(
+            refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)), past)),
+            "an id word past `Id::MAX_U32`"
+        );
         let second = offset_of!(FileRun, start);
-        assert!(refused(&with_word(&bytes, run(1, second), exprs.runs[2].start)), "runs out of order");
+        assert!(
+            refused(&with_word(&bytes, run(1, second), exprs.runs[2].start)),
+            "runs out of order"
+        );
         let empty = exprs.runs[1].start - 1;
-        assert_eq!(exprs.kinds[empty as usize], NO_SOURCE, "an id without syntax before the macro's");
-        assert!(refused(&with_word(&bytes, run(1, second), empty)), "a run at an id without syntax");
+        assert_eq!(
+            exprs.kinds[empty as usize], NO_SOURCE,
+            "an id without syntax before the macro's"
+        );
+        assert!(
+            refused(&with_word(&bytes, run(1, second), empty)),
+            "a run at an id without syntax"
+        );
         let mut same = bytes.clone();
         let (from, to) = (run(0, 0), run(1, 0));
         same.copy_within(from..from + size_of::<FileRun>(), to);
@@ -1341,7 +1434,10 @@ fn f(a: u32, (b, c): (u32, u32)) -> u32 {
         assert!(refused(&with_word(&bytes, ty, read.types_map_back.len() as u32)));
 
         let binding_pat = offset_in(read.binding_pats, &buffer);
-        assert!(refused(&with_word(&bytes, binding_pat, pats)), "a binding's pattern past its arena");
+        assert!(
+            refused(&with_word(&bytes, binding_pat, pats)),
+            "a binding's pattern past its arena"
+        );
         let starts = offset_in(read.binding_starts, &buffer);
         assert!(read.binding_starts.len() >= 3, "a map of more than one binding");
         let word = |at: usize| starts + at * size_of::<u32>();
@@ -1370,11 +1466,15 @@ fn f(a: u32, (b, c): (u32, u32)) -> u32 {
         twice.copy_within(keys..keys + size, keys + size);
         assert!(refused(&Aligned::copy_from(&twice)), "a key twice in a source table");
 
-        assert!(refused(&with_word(&bytes, keys + offset_of!(Src, kind), u32::MAX)), "a key's kind");
+        assert!(
+            refused(&with_word(&bytes, keys + offset_of!(Src, kind), u32::MAX)),
+            "a key's kind"
+        );
         assert!(refused(&with_word(&bytes, keys + offset_of!(Src, file_kind), 7)), "a key's file");
         assert!(refused(&with_word(&bytes, keys + offset_of!(Src, file), 0)), "a key's id");
 
-        let expr_map = &source_map.store.expr_only.as_deref().expect("a body's source map").expr_map;
+        let expr_map =
+            &source_map.store.expr_only.as_deref().expect("a body's source map").expr_map;
         let reversed: Box<[_]> = expr_map.entries().iter().rev().copied().collect();
         assert!(SourceTable::from_sorted(reversed).is_none(), "decoding re-sorts nothing");
     }

@@ -40,14 +40,14 @@ mod harness;
 #[cfg(test)]
 mod tests;
 
-use std::{borrow::Cow, cell::Cell, collections::HashMap, fmt};
 use std::alloc::Global;
+use std::{borrow::Cow, cell::Cell, collections::HashMap, fmt};
 
-use base_db::{FileSetConfig, Trigger};
 use base_db::{
     AbsPathBuf, ConstEvalBudget, ContentId, Crate, CrateWorkspaceData, Env, FileId, FileSet,
     LibraryRoots, LocalRoots, SourceRoot, SourceRootId, VfsPath, ViewChange, ViewFile, ViewRoot,
 };
+use base_db::{FileSetConfig, Trigger};
 use blaze_hash::HashSet;
 use blaze_ids::{Hasher, radix};
 use blaze_query::db::{Database as _, Durability, Setter};
@@ -109,7 +109,8 @@ impl<T> Copy for Lower<'_, T> {}
 /// again: 86 s in place of about 1 s.
 pub fn config_differs(kept: &BuildConfig, now: &BuildConfig) -> Option<String> {
     let BuildConfig { invocation, mounts, host, library, std, builds, sources } = kept;
-    let blaze_units::query::Invocation { command: _, args: _, root, cwd: _, env: _, files: _ } = invocation;
+    let blaze_units::query::Invocation { command: _, args: _, root, cwd: _, env: _, files: _ } =
+        invocation;
     if mounts != &now.mounts {
         return Some("its mounts".to_owned()); // alloc: a reason, once per front end let go
     }
@@ -305,7 +306,10 @@ pub fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, Lower
 /// as one change, one batch, so the maintainers run once over all of it. From then on the
 /// database takes its writes only in batches ([`Db::require_batches`]): each later change of
 /// the build ([`Lowered::ran`], [`Lowered::refresh`], ...) is one.
-pub fn lower_into<T: blaze_query::Tree>(mut db: Db, lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
+pub fn lower_into<T: blaze_query::Tree>(
+    mut db: Db,
+    lower: Lower<'_, T>,
+) -> Result<Lowered, LowerError> {
     let setup = db.batch(Trigger::named("the build lowered"), |db| lower_writes(db, lower))?;
     db.require_batches();
     let Setup { lowerings, sets, loads, view, workspace_root, const_macros, spellings } = setup;
@@ -434,7 +438,10 @@ impl Spellings {
 
 /// The writes of [`lower_into`], in its batch: the crate graph, source roots and files of
 /// `lower.units`, and what the database is told of the build.
-fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Result<Setup, LowerError> {
+fn lower_writes<T: blaze_query::Tree>(
+    db: &mut Db,
+    lower: Lower<'_, T>,
+) -> Result<Setup, LowerError> {
     let Lower { units, config, files, root, host_cpu } = lower;
     let unit_count = units.graph.units.len();
     if units.plans.len() != unit_count {
@@ -448,7 +455,10 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
     let package_of = |unit: &Unit| {
         packages.get(unit.pkg_id.as_str()).copied().ok_or_else(|| {
             LowerError::at(
-                format!("unit `{}` of package `{}` is of no package of the build", unit.target.name, unit.pkg_id),
+                format!(
+                    "unit `{}` of package `{}` is of no package of the build",
+                    unit.target.name, unit.pkg_id
+                ),
                 unit.pkg_id.clone(),
             )
         })
@@ -526,7 +536,12 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
     let mut excluded: Vec<String> = excluded.into_iter().collect();
     excluded.sort_unstable();
 
-    let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files, read_view: Cell::new(false) };
+    let tree = files::Mounts {
+        mounts: &config.mounts,
+        view: root,
+        tree: files,
+        read_view: Cell::new(false),
+    };
     ProcMacros::init_default(db, Durability::HIGH);
     // rustc compiles, checks and evaluates what a builtin derive expands to: the impls it
     // writes have bodies, which recording them without expanding (rust-analyzer's fast path)
@@ -538,10 +553,18 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
             false => SourceRoot::new_local(FileSet::default()),
         };
         let durability = if is_library { Durability::HIGH } else { Durability::LOW };
-        db.set_source_root_with_durability(SourceRootId(index as u32), Arc::new(source_root), durability);
+        db.set_source_root_with_durability(
+            SourceRootId(index as u32),
+            Arc::new(source_root),
+            durability,
+        );
     }
     let other = SourceRootId(library.len() as u32);
-    db.set_source_root_with_durability(other, Arc::new(SourceRoot::new_local(FileSet::default())), Durability::LOW);
+    db.set_source_root_with_durability(
+        other,
+        Arc::new(SourceRoot::new_local(FileSet::default())),
+        Durability::LOW,
+    );
     let roots = |library_too: bool| -> HashSet<SourceRootId, Global> {
         (0..=library.len())
             .filter(|&it| library.get(it).copied().unwrap_or(false) == library_too)
@@ -612,7 +635,10 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
         for dep in &unit.dependencies {
             let Some(lowering) = lowerings.get_mut(dep.index) else {
                 return Err(LowerError::at(
-                    format!("a dependency `{}` on unit {}, which the build lacks", dep.extern_crate_name, dep.index),
+                    format!(
+                        "a dependency `{}` on unit {}, which the build lacks",
+                        dep.extern_crate_name, dep.index
+                    ),
                     whats[index].clone(),
                 ));
             };
@@ -625,7 +651,8 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
     let order = crates::topological(units, &whats, &const_plan.after)?;
     let mut all = Vec::with_capacity(order.len());
     // alloc: once a lowering, the crates made by their root file, for the units after to share.
-    let mut made: blaze_hash::HashMap<FileId, Vec<Made>, Global> = blaze_hash::HashMap::new_in(Global);
+    let mut made: blaze_hash::HashMap<FileId, Vec<Made>, Global> =
+        blaze_hash::HashMap::new_in(Global);
     // alloc: once a lowering, each crate made with how cargo passes its root
     let mut spelled: Vec<(Crate, Spelling)> = Vec::new();
     let mut const_listed = Vec::new();
@@ -641,7 +668,11 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
             None => {
                 // The workspace's `const-eval` budget is for its own crates: the standard
                 // library's are evaluated under blaze's, the same in every workspace.
-                let const_eval = if unit.is_std { ConstEvalBudget::default() } else { workspace_root.const_eval };
+                let const_eval = if unit.is_std {
+                    ConstEvalBudget::default()
+                } else {
+                    workspace_root.const_eval
+                };
                 let made = crates::workspace_data(triple, &toolchain, const_eval)?;
                 workspaces.insert((triple, unit.is_std), made.clone());
                 made
@@ -658,7 +689,11 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
                 cfg.extend([crates::run_profile_atom(units, dep.index)]);
             }
         }
-        let durability = if library[set_of[unit.pkg_id.as_str()]] { Durability::HIGH } else { Durability::MEDIUM };
+        let durability = if library[set_of[unit.pkg_id.as_str()]] {
+            Durability::HIGH
+        } else {
+            Durability::MEDIUM
+        };
         let macros = match const_plan.group_of[index] {
             None => None,
             Some(group) => {
@@ -673,7 +708,11 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
                             .filter(|(load, _)| files::rest(&file, load).is_some())
                             .max_by_key(|(load, _)| load.len())
                             .map_or(other, |(_, set)| SourceRootId(*set as u32));
-                        let macros_root = db.source_root(file_set).source_root(&*db).file_for_path(&file_path).copied();
+                        let macros_root = db
+                            .source_root(file_set)
+                            .source_root(&*db)
+                            .file_for_path(&file_path)
+                            .copied();
                         let cx = const_macros::Cx {
                             units,
                             whats: &whats,
@@ -687,7 +726,8 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
                             proc_macro_cwd: abs(&crates::proc_macro_cwd(&workspace_root, package))?,
                             durability,
                         };
-                        let (made, listed) = const_macros::make(db, &mut const_plan, group, cx, &mut all)?;
+                        let (made, listed) =
+                            const_macros::make(db, &mut const_plan, group, cx, &mut all)?;
                         let krate = made.krate;
                         const_listed.push((krate, listed));
                         const_made.push(made);
@@ -701,7 +741,10 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
         let src_path = VfsPath::from(abs(&src)?);
         // rustc names the crate's files from its root as cargo passed it, `..`s and all.
         let passed = crates::spelled_src_path(unit, what)?;
-        let spelling = Spelling { dir: files::parent(&src).to_owned(), passed: files::parent(&passed).to_owned() };
+        let spelling = Spelling {
+            dir: files::parent(&src).to_owned(),
+            passed: files::parent(&passed).to_owned(),
+        };
         let set = loads
             .iter()
             .filter(|(load, _)| files::rest(&src, load).is_some())
@@ -721,12 +764,19 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
             true => {
                 let read: &Db = &*db;
                 let text = read.file_text(root_file);
-                let (edition, proc_macro) = (crates::edition(unit, what)?, unit.target.is_proc_macro());
+                let (edition, proc_macro) =
+                    (crates::edition(unit, what)?, unit.target.is_proc_macro());
                 let links = crates::links_proc_macro(proc_macro, &**text.text(read), edition);
                 if links {
                     crates::host_side(&mut cfg);
                 }
-                Some(MacroHost { root: root_file, content: text.content(read), edition, proc_macro, links })
+                Some(MacroHost {
+                    root: root_file,
+                    content: text.content(read),
+                    edition,
+                    proc_macro,
+                    links,
+                })
             }
             false => None,
         };
@@ -802,14 +852,38 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
                 let mut made_of = data.clone();
                 if aliased {
                     made_of.root_file_id = db.alias(root_file).map_err(|error| {
-                        LowerError::at(format!("the root file `{src}` of {what} has no root of its own: {error}"), src.clone())
+                        LowerError::at(
+                            format!(
+                                "the root file `{src}` of {what} has no root of its own: {error}"
+                            ),
+                            src.clone(),
+                        )
                     })?;
                 }
                 // clone: as `made_of`
-                let krate = Crate::create(db, made_of, extra.clone(), workspace.clone(), cfg.clone(), env.clone(), durability);
+                let krate = Crate::create(
+                    db,
+                    made_of,
+                    extra.clone(),
+                    workspace.clone(),
+                    cfg.clone(),
+                    env.clone(),
+                    durability,
+                );
                 // clone: once per crate made
                 spelled.push((krate, spelling.clone()));
-                made_of_root.push(Made { data, aliased, extra, workspace, cfg: cfg.clone(), env, durability, runs, spelling, krate });
+                made_of_root.push(Made {
+                    data,
+                    aliased,
+                    extra,
+                    workspace,
+                    cfg: cfg.clone(),
+                    env,
+                    durability,
+                    runs,
+                    spelling,
+                    krate,
+                });
                 all.push(krate);
                 krate
             }
@@ -833,7 +907,10 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
     // `CARGO_PRIMARY_PACKAGE` is of the request, in no crate's variables: the crates of the
     // units of its primary packages see it ([`blaze_units::query::Units::is_primary`]).
     // alloc: once per lowering, the primary units' crates
-    let primary = (lowerings.iter().enumerate()).filter(|(at, _)| units.is_primary(*at)).filter_map(|(_, it)| it.krate).collect();
+    let primary = (lowerings.iter().enumerate())
+        .filter(|(at, _)| units.is_primary(*at))
+        .filter_map(|(_, it)| it.krate)
+        .collect();
     base_db::set_primary_crates(db, primary);
     let spellings = std::sync::Arc::new(Spellings::new(spelled));
     name_sources(db, workspace_root.dir.as_deref(), &config.library, &spellings);
@@ -1003,7 +1080,13 @@ impl Lowered {
 
     /// [`Lowered::ran`]'s writes, in its batch: `ran`, a run checked against `crates` and made
     /// its class's ([`canonical_run`]), of unit `lowering`, its cfgs `cfgs`.
-    fn apply_run(&mut self, ran: &Ran, crates: &Crates, lowering: &Lowering, cfgs: &[CfgAtom]) -> Result<(), LowerError> {
+    fn apply_run(
+        &mut self,
+        ran: &Ran,
+        crates: &Crates,
+        lowering: &Lowering,
+        cfgs: &[CfgAtom],
+    ) -> Result<(), LowerError> {
         let out_dir = &ran.out_dir;
         let mut loaded = Vec::with_capacity(ran.files.len());
         for (path, bytes) in &ran.files {
@@ -1027,7 +1110,8 @@ impl Lowered {
             written.push(krate);
             let runs = self.applied.entry(krate).or_default();
             runs.retain(|(it, _)| *it != class);
-            let applying = Applied { cfgs: cfgs.to_vec(), env: ran.env.clone(), out_dir: out_dir.clone() };
+            let applying =
+                Applied { cfgs: cfgs.to_vec(), env: ran.env.clone(), out_dir: out_dir.clone() };
             runs.push((class, applying));
             radix::sort_by_key(runs, |(it, _)| *it as u64);
             let base = &crates.units[dependent];
@@ -1078,7 +1162,9 @@ impl Lowered {
         // ([`Lowered::env_moved`]): a later read reads them, and no maintainer runs. Its own
         // batch: the database takes writes only in batches, and this one notes nothing.
         let vars: Env = config.invocation.env.iter().cloned().collect();
-        self.db.batch(Trigger::named("the process environment set"), |db| base_db::set_process_env(db, vars));
+        self.db.batch(Trigger::named("the process environment set"), |db| {
+            base_db::set_process_env(db, vars)
+        });
         // A new job: its units' roots are appended to again, and may be made other than before;
         // the first of its runs of a class to end is the class's, whichever an earlier job's was.
         self.appended.clear();
@@ -1088,13 +1174,20 @@ impl Lowered {
             self.db.reload_included_files(INCLUDED_MOVED);
             return Ok(true);
         }
-        let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files, read_view: Cell::new(false) };
+        let tree = files::Mounts {
+            mounts: &config.mounts,
+            view: root,
+            tree: files,
+            read_view: Cell::new(false),
+        };
         if crates::root(units, &tree)? != self.workspace_root {
             return Ok(false);
         }
         self.identities.clear();
         // One change: the view's files, the seeds and the const macros they list, one batch.
-        self.batch(Trigger::named("the view moved"), |this| this.refresh_writes(&tree, root, seed))?;
+        self.batch(Trigger::named("the view moved"), |this| {
+            this.refresh_writes(&tree, root, seed)
+        })?;
         // A crate of the macro host whose root now links `proc_macro` or no longer does is
         // made with another cfg (`crates::host_side`): lowered anew, as a moved root is.
         Ok(!self.macro_host_moved())
@@ -1198,7 +1291,9 @@ impl Lowered {
             unreachable!("checked: a proc macro's unit has a crate")
         };
         let macros = macros.map(|mut macros| {
-            macros.sort_unstable_by(|a, b| a.name.cmp_order(&b.name).then_with(|| a.kind.cmp(&b.kind)));
+            macros.sort_unstable_by(|a, b| {
+                a.name.cmp_order(&b.name).then_with(|| a.kind.cmp(&b.kind))
+            });
             macros
         });
         self.identities.clear();
@@ -1228,7 +1323,9 @@ impl Lowered {
         mode: hir_def::deps::Mode,
     ) -> Result<hir_def::deps::Served, LowerError> {
         let trigger = Trigger::named("the dependencies' images served");
-        self.db.batch(trigger, |db| hir_def::deps::serve(db, crates, build, images, mode)).map_err(LowerError::new)
+        self.db
+            .batch(trigger, |db| hir_def::deps::serve(db, crates, build, images, mode))
+            .map_err(LowerError::new)
     }
 
     /// The images of the crates `served` keyed and found none of, written to `images` from
@@ -1252,7 +1349,11 @@ impl Lowered {
 }
 
 /// Unit `run` as a build script's run that `ran` is of, and `ran`'s cfgs parsed.
-fn checked<'a>(crates: &'a Crates, run: usize, ran: &Ran) -> Result<(&'a Lowering, Vec<CfgAtom>), LowerError> {
+fn checked<'a>(
+    crates: &'a Crates,
+    run: usize,
+    ran: &Ran,
+) -> Result<(&'a Lowering, Vec<CfgAtom>), LowerError> {
     let Some(lowering) = crates.units.get(run) else {
         return Err(LowerError::new(format!("the build has no unit {run}")));
     };
@@ -1281,7 +1382,9 @@ fn cfg_atoms(ran: &Ran, what: &str) -> Result<Vec<CfgAtom>, LowerError> {
 /// of several.
 fn canonical_run<'a>(crates: &Crates, run: usize, ran: &'a Ran) -> Cow<'a, Ran> {
     let class = crates.units[run].class;
-    let Some(out_dir) = crates.units.get(class).and_then(|it| it.out_dir.as_deref()) else { return Cow::Borrowed(ran) };
+    let Some(out_dir) = crates.units.get(class).and_then(|it| it.out_dir.as_deref()) else {
+        return Cow::Borrowed(ran);
+    };
     if class == run || out_dir == ran.out_dir {
         return Cow::Borrowed(ran);
     }
@@ -1294,14 +1397,20 @@ fn canonical_run<'a>(crates: &Crates, run: usize, ran: &'a Ran) -> Cow<'a, Ran> 
         files: ran
             .files
             .iter()
-            .map(|(path, bytes)| (path.clone(), crates::replace_bytes(bytes, own.as_bytes(), out_dir.as_bytes()).into_owned()))
+            .map(|(path, bytes)| {
+                (
+                    path.clone(),
+                    crates::replace_bytes(bytes, own.as_bytes(), out_dir.as_bytes()).into_owned(),
+                )
+            })
             .collect(), // alloc: as above
     })
 }
 
 /// The change [`Lowered::refresh`] writes when a file outside the VFS that `include_bytes!` or
 /// `include_str!` read moved on disk, and the view did not.
-const INCLUDED_MOVED: Trigger<'static> = Trigger::named("files include_bytes! or include_str! read moved on disk");
+const INCLUDED_MOVED: Trigger<'static> =
+    Trigger::named("files include_bytes! or include_str! read moved on disk");
 
 const IDENTITY: &str = "blaze v2 cargo unit identity 5";
 
@@ -1324,12 +1433,20 @@ fn identity_of(
         let data = at.data(db);
         if !deps_known {
             stack.push((at, true));
-            stack.extend(data.dependencies.iter().filter(|it| !known.contains_key(&it.crate_id)).map(|it| (it.crate_id, false)));
+            stack.extend(
+                data.dependencies
+                    .iter()
+                    .filter(|it| !known.contains_key(&it.crate_id))
+                    .map(|it| (it.crate_id, false)),
+            );
             continue;
         }
         let root = db.file_source_root(data.root_file_id).source_root_id(db);
         let mut hasher = Hasher::new(IDENTITY);
-        hasher.id(&at.content(db)).id(&db.file_text(data.root_file_id).content(db)).id(&db.source_root(root).content(db));
+        hasher
+            .id(&at.content(db))
+            .id(&db.file_text(data.root_file_id).content(db))
+            .id(&db.source_root(root).content(db));
         // How rustc names the crate's files, which its code says (`file!()`, panic locations).
         match spellings.of(at) {
             None => {
@@ -1362,7 +1479,12 @@ fn identity_of(
 /// key names both directories and the spellings, so telling it again for the same workspace
 /// evaluates nothing again. It is told once a database ([`lower_writes`]), whose crates the
 /// spellings are of.
-fn name_sources(db: &mut Db, workspace: Option<&str>, library: &str, spellings: &std::sync::Arc<Spellings>) {
+fn name_sources(
+    db: &mut Db,
+    workspace: Option<&str>,
+    library: &str,
+    spellings: &std::sync::Arc<Spellings>,
+) {
     let library = format!("{}/", library.trim_end_matches('/'));
     let workspace = workspace.map(|it| format!("{}/", it.trim_end_matches('/')));
     // alloc: once a lowering, the spelled roots in the key, sorted as `roots` is
@@ -1400,7 +1522,12 @@ fn tables(db: &mut Db) -> Vec<(&'static str, u64, u64)> {
 }
 
 /// `change` of source root `set` made in `paths` too.
-fn note(paths: &mut std::sync::Arc<HashMap<FileId, String>>, db: &Db, set: usize, change: &ViewChange) {
+fn note(
+    paths: &mut std::sync::Arc<HashMap<FileId, String>>,
+    db: &Db,
+    set: usize,
+    change: &ViewChange,
+) {
     if change.added.is_empty() && change.removed.is_empty() {
         return;
     }
@@ -1447,14 +1574,21 @@ fn set_files(
     // of every package's prefixes would put `/w/ab/x.rs` in `/w/a`'s, its prefixes being bytes.
     let mut partition = FileSetConfig::builder();
     for index in 0..sets {
-        partition.add_file_set(if index == set { vec![VfsPath::from(base_path.clone())] } else { Vec::new() });
+        partition.add_file_set(if index == set {
+            vec![VfsPath::from(base_path.clone())]
+        } else {
+            Vec::new()
+        });
     }
     let partition = partition.build();
     let other = SourceRootId(sets as u32);
     let mut view = Vec::with_capacity(loaded.len());
     for file in loaded {
         let Some(path) = files::rest(&file.path, base).filter(|it| !it.is_empty()) else {
-            return Err(LowerError::at(format!("`{}` is not under `{base}`", file.path), file.path.clone()));
+            return Err(LowerError::at(
+                format!("`{}` is not under `{base}`", file.path),
+                file.path.clone(),
+            ));
         };
         view.push(ViewFile { path, id: file.id, bytes: &file.bytes });
     }

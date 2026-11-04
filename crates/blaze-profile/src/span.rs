@@ -104,7 +104,8 @@ pub enum Outcome {
 
 impl Outcome {
     /// Every outcome, each at its [`Outcome::index`].
-    pub const ALL: [Outcome; 5] = [Outcome::Ok, Outcome::Panic, Outcome::StepLimit, Outcome::MemoryLimit, Outcome::Error];
+    pub const ALL: [Outcome; 5] =
+        [Outcome::Ok, Outcome::Panic, Outcome::StepLimit, Outcome::MemoryLimit, Outcome::Error];
 
     pub const fn index(self) -> usize {
         self as usize
@@ -438,7 +439,10 @@ impl tracing::callsite::Callsite for KindCallsite {
 }
 
 /// The metadata of the kind `name`: target `blaze`, info, no fields.
-pub const fn kind_meta(name: &'static str, callsite: &'static KindCallsite) -> tracing::Metadata<'static> {
+pub const fn kind_meta(
+    name: &'static str,
+    callsite: &'static KindCallsite,
+) -> tracing::Metadata<'static> {
     tracing::Metadata::new(
         name,
         "blaze",
@@ -637,7 +641,11 @@ fn typed<K: Span>(said: &Said, span_id: u64) -> Result<Typed<K>, KindError> {
 /// and the Parquet history keeps it, in order. Names are interned in this process as they are
 /// read.
 pub fn read_batch<K: Span>(batch: &RecordBatch) -> Result<Vec<Typed<K>>, KindError> {
-    let missing = |column: &'static str| KindError::Column { kind: K::NAME, column, why: "is not in the batch" };
+    let missing = |column: &'static str| KindError::Column {
+        kind: K::NAME,
+        column,
+        why: "is not in the batch",
+    };
     let names = batch.column_by_name("name").ok_or(missing("name"))?;
     let ids = batch.column_by_name("span_id").ok_or(missing("span_id"))?;
     let ids = ids.as_primitive_opt::<UInt64Type>().ok_or(KindError::Column {
@@ -661,7 +669,11 @@ pub fn read_batch<K: Span>(batch: &RecordBatch) -> Result<Vec<Typed<K>>, KindErr
         for &(cells, column) in &columns {
             let word = if cells.column.ty == Type::U64 {
                 let Some(numbers) = column.as_primitive_opt::<UInt64Type>() else {
-                    return Err(KindError::Column { kind: K::NAME, column: cells.column.name, why: "is not UInt64" });
+                    return Err(KindError::Column {
+                        kind: K::NAME,
+                        column: cells.column.name,
+                        why: "is not UInt64",
+                    });
                 };
                 if numbers.is_valid(row) { numbers.value(row).saturating_add(1) } else { 0 }
             } else {
@@ -694,7 +706,8 @@ pub struct KindTable {
 }
 
 /// The columns every kind's view has, before its fields.
-const VIEW_COLUMNS: &str = "build_id, process, thread, thread_name, span_id, parent, depth, start_ns, dur_ns, self_cpu_ns";
+const VIEW_COLUMNS: &str =
+    "build_id, process, thread, thread_name, span_id, parent, depth, start_ns, dur_ns, self_cpu_ns";
 
 /// Writes into `out` one view a kind, `span_<name>` (`span_macro_expand`): its rows of `spans`
 /// with its fields as columns of their names (`path` for a `macro expand`'s `function`). What
@@ -704,7 +717,11 @@ pub fn views(out: &mut String) {
     for kind in KINDS {
         // alloc: once per kind as a connection's views are made
         // Writing to a `String` does not fail.
-        _ = write!(out, "\nCREATE OR REPLACE VIEW span_{} AS\nSELECT {VIEW_COLUMNS}", kind.name.replace(' ', "_"));
+        _ = write!(
+            out,
+            "\nCREATE OR REPLACE VIEW span_{} AS\nSELECT {VIEW_COLUMNS}",
+            kind.name.replace(' ', "_")
+        );
         for (field, column) in kind.fields {
             _ = write!(out, ", \"{column}\" AS \"{field}\"");
         }
@@ -1002,7 +1019,11 @@ mod tests {
         let krate = Name::of("span kinds test");
         let unit = Name::of("span-kinds v0.1.0 (lib)");
         let expand = MacroExpand { path: Name::of("span_kinds::Derive"), krate };
-        let expanded = MacroExpanded { steps: Some(4_200_000), peak_bytes: Some(48 << 20), outcome: Outcome::MemoryLimit };
+        let expanded = MacroExpanded {
+            steps: Some(4_200_000),
+            peak_bytes: Some(48 << 20),
+            outcome: Outcome::MemoryLimit,
+        };
         let awaits = Name::of("span kinds key");
         let wait = Wait { awaits, function: awaits, owner: Some(7), on: WaitKind::Channel };
         let hold = Hold { what: Name::of("span kinds round"), holder: 9 };
@@ -1034,13 +1055,26 @@ mod tests {
         let rows = rows_of(tid);
         let from_ring = |row: &SpanRow| read::<MacroExpand>(row).unwrap();
         let expands: Vec<_> = rows.iter().filter_map(from_ring).collect();
-        assert_eq!(expands, [Typed { fields: expand, ended: Some(expanded) }], "the ring's row is the kind");
+        assert_eq!(
+            expands,
+            [Typed { fields: expand, ended: Some(expanded) }],
+            "the ring's row is the kind"
+        );
         let waits: Vec<_> = rows.iter().filter_map(|it| read::<Wait>(it).unwrap()).collect();
         assert_eq!(waits, [Typed { fields: wait, ended: Some(()) }]);
-        assert_eq!(rows.iter().filter_map(|it| read::<UnitNames>(it).unwrap()).count(), 1, "a kind is its own site");
+        assert_eq!(
+            rows.iter().filter_map(|it| read::<UnitNames>(it).unwrap()).count(),
+            1,
+            "a kind is its own site"
+        );
 
-        let batch = batches::spans(&rows, Process { pid: 1, name: "span kinds test", commit: None }).unwrap();
-        assert_eq!(read_batch::<MacroExpand>(&batch).unwrap(), [Typed { fields: expand, ended: Some(expanded) }]);
+        let batch =
+            batches::spans(&rows, Process { pid: 1, name: "span kinds test", commit: None })
+                .unwrap();
+        assert_eq!(
+            read_batch::<MacroExpand>(&batch).unwrap(),
+            [Typed { fields: expand, ended: Some(expanded) }]
+        );
         assert_eq!(read_batch::<Wait>(&batch).unwrap(), [Typed { fields: wait, ended: Some(()) }]);
         assert_eq!(read_batch::<Hold>(&batch).unwrap(), [Typed { fields: hold, ended: Some(()) }]);
         let phases = [
@@ -1066,7 +1100,9 @@ mod tests {
         .join()
         .unwrap();
         let rows = rows_of(tid);
-        let [unwound] = &rows.iter().filter_map(|it| read::<MacroExpand>(it).unwrap()).collect::<Vec<_>>()[..] else {
+        let [unwound] =
+            &rows.iter().filter_map(|it| read::<MacroExpand>(it).unwrap()).collect::<Vec<_>>()[..]
+        else {
             panic!("one `macro expand`")
         };
         assert_eq!(unwound.fields.path, path);
@@ -1076,7 +1112,11 @@ mod tests {
     #[test]
     fn a_batch_of_another_layout_is_a_typed_error() {
         let (tid, ..) = spans_of_every_kind();
-        let batch = batches::spans(&rows_of(tid), Process { pid: 1, name: "span kinds test", commit: None }).unwrap();
+        let batch = batches::spans(
+            &rows_of(tid),
+            Process { pid: 1, name: "span kinds test", commit: None },
+        )
+        .unwrap();
         let at = batch.schema().index_of("waits_on").unwrap();
         let mut older = batch.clone();
         older.remove_column(at);
@@ -1090,11 +1130,18 @@ mod tests {
     fn every_typed_column_is_a_column_of_spans_after_the_generic_ones() {
         let spans = schema::SPANS;
         for cells in &CELLS {
-            let at = spans.column(cells.column.name).unwrap_or_else(|| panic!("`{}` is a spans column", cells.column.name));
+            let at = spans
+                .column(cells.column.name)
+                .unwrap_or_else(|| panic!("`{}` is a spans column", cells.column.name));
             assert_eq!(spans.columns[at].ty, cells.column.ty);
         }
-        let last: Vec<&str> = spans.columns[spans.columns.len() - TYPED..].iter().map(|it| it.name).collect();
-        assert_eq!(last, TYPED_COLUMNS.map(|it| it.name), "a typed column goes at the end, keeping `VERSION`");
+        let last: Vec<&str> =
+            spans.columns[spans.columns.len() - TYPED..].iter().map(|it| it.name).collect();
+        assert_eq!(
+            last,
+            TYPED_COLUMNS.map(|it| it.name),
+            "a typed column goes at the end, keeping `VERSION`"
+        );
         assert_eq!(spans.columns[schema::SPANS_GENERIC_AT].name, "crate");
     }
 

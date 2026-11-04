@@ -55,11 +55,7 @@ pub enum NodeKind {
     Terminal(TermId),
     Rule(RuleId),
     Group(GroupId, Vec<Alt>),
-    Repeat {
-        inner: Box<Node>,
-        min: u32,
-        max: Option<u32>,
-    },
+    Repeat { inner: Box<Node>, min: u32, max: Option<u32> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,10 +187,7 @@ impl Analyzer<'_> {
                 if *min == 0 {
                     Some(0)
                 } else {
-                    Some(
-                        self.item_size(inner, measure)?
-                            .saturating_mul(u64::from(*min)),
-                    )
+                    Some(self.item_size(inner, measure)?.saturating_mul(u64::from(*min)))
                 }
             }
         }
@@ -287,10 +280,7 @@ impl Analyzer<'_> {
     }
 
     fn rule_alternatives(&self, r: RuleId) -> impl Iterator<Item = &Sequence> {
-        self.grammar.rules[r]
-            .alternatives
-            .iter()
-            .filter(|alt| self.seq_min_size(alt).is_some())
+        self.grammar.rules[r].alternatives.iter().filter(|alt| self.seq_min_size(alt).is_some())
     }
 
     /// Iterate the smallest-size and smallest-depth estimates to a
@@ -302,10 +292,8 @@ impl Analyzer<'_> {
             for i in 0..self.order.len() {
                 let r = self.order[i];
                 let alternatives = &self.grammar.rules[r].alternatives;
-                let min_size = alternatives
-                    .iter()
-                    .filter_map(|alt| self.seq_size(alt, Measure::Min))
-                    .min();
+                let min_size =
+                    alternatives.iter().filter_map(|alt| self.seq_size(alt, Measure::Min)).min();
                 let typical_size = alternatives
                     .iter()
                     .filter_map(|alt| self.seq_size(alt, Measure::Typical))
@@ -477,10 +465,7 @@ pub fn analyze(
             alternatives: analyzer.build_alts(&rule.alternatives),
         })
         .collect();
-    Ok(Analysis {
-        rules,
-        groups: analyzer.groups.get(),
-    })
+    Ok(Analysis { rules, groups: analyzer.groups.get() })
 }
 
 #[cfg(test)]

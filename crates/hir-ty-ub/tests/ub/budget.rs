@@ -2,6 +2,7 @@
 //! sites exist, an access, a copy and a step allocate nothing.
 
 use blaze_alloc_count::assert_at_most;
+use hir_expand::fixture;
 use hir_ty::{InferBodyId, mir::MirSpan};
 use hir_ty_mir::mir::{Access, Machine, MemKind, Ptr, Site};
 use hir_ty_ub::{
@@ -9,7 +10,6 @@ use hir_ty_ub::{
     check::{Checker, Shadow, Sites},
     memory::Bytes,
 };
-use hir_expand::fixture;
 
 use crate::main_of;
 

@@ -144,11 +144,7 @@ impl<'db> Graph<'_, '_, 'db> {
     }
 
     /// Whether `node` is outside itself, and what it names.
-    fn read(
-        &self,
-        db: &'db Db,
-        node: &Ref,
-    ) -> Result<(bool, Cow<'db, [Ref]>), String> {
+    fn read(&self, db: &'db Db, node: &Ref) -> Result<(bool, Cow<'db, [Ref]>), String> {
         let names = match node {
             Ref::Function(instance) => match &instance.0 {
                 Kind::Asm(..) => return Ok((true, Cow::Borrowed(&[]))),
@@ -160,7 +156,9 @@ impl<'db> Graph<'_, '_, 'db> {
             Ref::Static(value) => {
                 Cow::Owned(statics::value(db, &self.frontend.hashes, value.0)?.refs)
             }
-            Ref::Extern(_) | Ref::Weak(_) => unreachable!("a symbol outside blaze's code is no node"),
+            Ref::Extern(_) | Ref::Weak(_) => {
+                unreachable!("a symbol outside blaze's code is no node")
+            }
         };
         let outside = names.iter().any(|it| match it {
             Ref::Extern(name) | Ref::Weak(name) => {

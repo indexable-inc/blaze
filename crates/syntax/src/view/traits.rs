@@ -123,8 +123,9 @@ pub trait HasAttrs<'t>: AstNode<'t> {
 pub fn block_may_start_with_inner_attr(block: &str, inner_docs: bool) -> bool {
     let Some(mut rest) = block.strip_prefix('{') else { return true };
     loop {
-        rest = rest
-            .trim_start_matches(|c: char| matches!(c, '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' '));
+        rest = rest.trim_start_matches(|c: char| {
+            matches!(c, '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' ')
+        });
         if let Some(comment) = rest.strip_prefix("//") {
             if inner_docs && comment.starts_with('!') {
                 return true;

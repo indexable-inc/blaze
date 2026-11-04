@@ -49,12 +49,7 @@ fn initial_coarse_reduction_no_op_when_shape_stable() {
 
 #[test]
 fn initial_coarse_reduction_lowers_when_shape_depends_on_value() {
-    let initial = vec![
-        small_int_node(3),
-        small_int_node(0),
-        small_int_node(0),
-        small_int_node(0),
-    ];
+    let initial = vec![small_int_node(3), small_int_node(0), small_int_node(0), small_int_node(0)];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
             ShrinkRun::Full(nodes) => {
@@ -158,12 +153,7 @@ fn initial_coarse_reduction_accepts_probe_when_direct_replace_fails() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let initial = vec![
-        small_int_node(3),
-        small_int_node(0),
-        small_int_node(0),
-        small_int_node(0),
-    ];
+    let initial = vec![small_int_node(3), small_int_node(0), small_int_node(0), small_int_node(0)];
     let probe_calls = Arc::new(AtomicUsize::new(0));
     let probe_calls_for_closure = probe_calls.clone();
     let mut shrinker = Shrinker::with_probe(
@@ -177,30 +167,19 @@ fn initial_coarse_reduction_accepts_probe_when_direct_replace_fails() {
                     return (true, nodes.to_vec(), Spans::new());
                 }
                 if head == 0 && nodes.len() == 4 {
-                    return (
-                        false,
-                        vec![small_int_node(0), small_int_node(0)],
-                        Spans::new(),
-                    );
+                    return (false, vec![small_int_node(0), small_int_node(0)], Spans::new());
                 }
                 (false, nodes.to_vec(), Spans::new())
             }
             ShrinkRun::Probe { .. } => {
                 probe_calls_for_closure.fetch_add(1, Ordering::Relaxed);
-                (
-                    true,
-                    vec![small_int_node(0), small_int_node(0)],
-                    Spans::new(),
-                )
+                (true, vec![small_int_node(0), small_int_node(0)], Spans::new())
             }
         }),
         initial,
         Spans::new(),
     );
     drive_no_yield(shrinker.initial_coarse_reduction()).unwrap();
-    assert!(
-        probe_calls.load(Ordering::Relaxed) > 0,
-        "probe branch was never reached"
-    );
+    assert!(probe_calls.load(Ordering::Relaxed) > 0, "probe branch was never reached");
     assert_eq!(shrinker.current_nodes.len(), 2);
 }

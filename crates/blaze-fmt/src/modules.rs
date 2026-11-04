@@ -200,10 +200,7 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
         Ok(())
     }
 
-    fn visit_cfg_select(
-        &mut self,
-        item: &ast::Item,
-    ) -> Result<(), ModuleResolutionError> {
+    fn visit_cfg_select(&mut self, item: &ast::Item) -> Result<(), ModuleResolutionError> {
         let mut visitor = visitor::CfgSelectVisitor::new(self.psess);
         visitor.visit_item(item);
         for module_item in visitor.mods() {

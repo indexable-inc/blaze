@@ -10,11 +10,17 @@ fn main() -> ExitCode {
     const USAGE: &str = "usage: blaze-seed-run [--memory-max=SIZE] SEED.wasm [ARG...]";
     let mut args = std::env::args_os().skip(1).peekable();
     let mut memory_max = blaze_seed_run::MEMORY_MAX;
-    if let Some(size) = args.peek().and_then(|first| first.to_str()).and_then(|first| first.strip_prefix("--memory-max=")) {
+    if let Some(size) = args
+        .peek()
+        .and_then(|first| first.to_str())
+        .and_then(|first| first.strip_prefix("--memory-max="))
+    {
         match size_of(size) {
             Some(bytes) => memory_max = bytes,
             None => {
-                eprintln!("blaze-seed-run: --memory-max={size} is not a size (bytes, or a number with K, M, G or T)\n{USAGE}");
+                eprintln!(
+                    "blaze-seed-run: --memory-max={size} is not a size (bytes, or a number with K, M, G or T)\n{USAGE}"
+                );
                 return ExitCode::from(2);
             }
         }

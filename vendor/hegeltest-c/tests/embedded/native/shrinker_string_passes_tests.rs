@@ -94,11 +94,7 @@ fn normalize_unicode_chars_replaces_accented_letter_with_base() {
 
 #[test]
 fn normalize_unicode_chars_skips_when_no_simpler_chars() {
-    let initial = vec![string_node_with(
-        b'A' as u32,
-        b'Z' as u32,
-        vec![b'A' as u32],
-    )];
+    let initial = vec![string_node_with(b'A' as u32, b'Z' as u32, vec![b'A' as u32])];
     let mut shrinker = Shrinker::with_probe(
         Box::new(|run: ShrinkRun<'_>| match run {
             ShrinkRun::Full(nodes) => (true, nodes.to_vec(), Spans::new()),
@@ -199,10 +195,9 @@ fn lower_duplicated_characters_handles_mismatched_alphabets() {
         Spans::new(),
     );
     drive_no_yield(shrinker.lower_duplicated_characters()).unwrap();
-    if let (ChoiceKind::String(k1), ChoiceValue::String(s1)) = (
-        shrinker.current_nodes[1].kind(),
-        &shrinker.current_nodes[1].value(),
-    ) {
+    if let (ChoiceKind::String(k1), ChoiceValue::String(s1)) =
+        (shrinker.current_nodes[1].kind(), &shrinker.current_nodes[1].value())
+    {
         assert!(k1.validate(s1), "node 1 left with out-of-alphabet value");
     }
 }

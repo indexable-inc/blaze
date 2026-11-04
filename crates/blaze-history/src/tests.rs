@@ -156,7 +156,8 @@ impl Model {
         let mut last: Vec<u64> = runs.iter().rev().take(RUNS).map(|&it| u64::from(it)).collect();
         last.sort_unstable();
         let n = last.len();
-        let median = if n % 2 == 1 { last[n / 2] } else { (last[n / 2 - 1] + last[n / 2]).div_ceil(2) };
+        let median =
+            if n % 2 == 1 { last[n / 2] } else { (last[n / 2 - 1] + last[n / 2]).div_ceil(2) };
         Some((median, *held))
     }
 }
@@ -179,8 +180,16 @@ fn the_table_holds_what_the_model_says() {
             let kind = TaskKind(random.below(3) as u32);
             let key = &keys[random.index(keys.len())];
             let got = writer.get(kind, key);
-            assert_eq!(got, reader.get(kind, key), "seed {seed}: the reader reads what the writer does");
-            assert_eq!(got.map(|it| (it.ran_us(), it.peak)), model.get(slots, kind, key), "seed {seed}");
+            assert_eq!(
+                got,
+                reader.get(kind, key),
+                "seed {seed}: the reader reads what the writer does"
+            );
+            assert_eq!(
+                got.map(|it| (it.ran_us(), it.peak)),
+                model.get(slots, kind, key),
+                "seed {seed}"
+            );
         }
         assert!(writer.records().all(|(_, it)| it.is_sound()), "seed {seed}");
     }
@@ -229,7 +238,10 @@ fn a_history_comes_back_from_its_bytes() {
             key[..8].copy_from_slice(&record.key[0].to_le_bytes());
             key[8..16].copy_from_slice(&record.key[1].to_le_bytes());
             let key = Key(key);
-            assert_eq!(back.predict(record.kind, Some(&key)), history.predict(record.kind, Some(&key)));
+            assert_eq!(
+                back.predict(record.kind, Some(&key)),
+                history.predict(record.kind, Some(&key))
+            );
         }
     }
 }
@@ -256,7 +268,10 @@ fn a_history_read_into_another_size_keeps_the_newest_of_each_bucket() {
         for record in newest.values() {
             assert!(smaller.keys().records().any(|it| it.1 == *record), "seed {seed}: {record:?}");
         }
-        assert_eq!(History::decode(&smaller.encode(), config(16)).unwrap().encode(), smaller.encode());
+        assert_eq!(
+            History::decode(&smaller.encode(), config(16)).unwrap().encode(),
+            smaller.encode()
+        );
     }
 }
 
@@ -327,7 +342,11 @@ fn readers_never_see_a_torn_record() {
                     let Some(record) = reader.get(KIND, &key) else { continue };
                     let seen = u64::from(record.seen);
                     assert_eq!((record.stamp, record.peak), (seen, seen), "{record:?}");
-                    assert_eq!(record.runs[(record.seen as usize - 1) % RUNS], record.seen, "{record:?}");
+                    assert_eq!(
+                        record.runs[(record.seen as usize - 1) % RUNS],
+                        record.seen,
+                        "{record:?}"
+                    );
                     assert!(seen >= last, "{seen} after {last}");
                     last = seen;
                 }
@@ -362,19 +381,24 @@ fn predicted(history: &History, id: u32, deps: &[u32], key: Key) -> Spec {
 /// What the plane gives on opening one request of `specs` and closing it.
 fn open(plane: &mut Plane, specs: Vec<Spec>) -> Vec<PlaneOutput> {
     let request = RequestId(1);
-    let mut out = plane.step(PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going: true, idle: false }).unwrap();
+    let mut out = plane
+        .step(PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going: true, idle: false })
+        .unwrap();
     out.extend(plane.step(PlaneInput::Add { at_ns: 0, request, nodes: specs }).unwrap());
     out.extend(plane.step(PlaneInput::Close { at_ns: 0, request }).unwrap());
     out
 }
 
 fn runs(out: &[PlaneOutput]) -> Vec<NodeId> {
-    out.iter().filter_map(|it| if let PlaneOutput::Run { id, .. } = it { Some(*id) } else { None }).collect()
+    out.iter()
+        .filter_map(|it| if let PlaneOutput::Run { id, .. } = it { Some(*id) } else { None })
+        .collect()
 }
 
 /// The order a plane of one core runs `specs` in, each task done before the next starts.
 fn order(specs: Vec<Spec>) -> Vec<NodeId> {
-    let mut plane = Plane::new(PlaneConfig { io: 1, work: 1, budget: None, starve_after: 8 }).unwrap();
+    let mut plane =
+        Plane::new(PlaneConfig { io: 1, work: 1, budget: None, starve_after: 8 }).unwrap();
     let mut out = open(&mut plane, specs);
     let mut ran = Vec::new();
     for at in 1.. {
@@ -384,7 +408,14 @@ fn order(specs: Vec<Spec>) -> Vec<NodeId> {
         let started = runs(&out);
         assert_eq!(started.len(), 1, "one core runs one task at a time: {started:?}");
         ran.push(started[0]);
-        let done = PlaneInput::Done { at_ns: at, id: started[0], outcome: Outcome::Built, added: Vec::new(), group: None, peak: 0 };
+        let done = PlaneInput::Done {
+            at_ns: at,
+            id: started[0],
+            outcome: Outcome::Built,
+            added: Vec::new(),
+            group: None,
+            peak: 0,
+        };
         out = plane.step(done).unwrap();
     }
     unreachable!()
@@ -398,10 +429,18 @@ fn the_plane_runs_the_longest_path_of_history_first() {
     history.observe(KIND, Some(&a), 100_000, 0);
     history.observe(KIND, Some(&b), 900_000, 0);
     history.observe(KIND, Some(&c), 2_000_000, 0);
-    let specs = vec![predicted(&history, 0, &[], a), predicted(&history, 1, &[0], b), predicted(&history, 2, &[], c)];
+    let specs = vec![
+        predicted(&history, 0, &[], a),
+        predicted(&history, 1, &[0], b),
+        predicted(&history, 2, &[], c),
+    ];
     assert_eq!(order(specs), [NodeId(2), NodeId(0), NodeId(1)]);
     // With the costs every node has without a history, the longer chain of nodes goes first.
-    let flat = vec![spec(0, &[], Some(a), 1, 0), spec(1, &[0], Some(b), 1, 0), spec(2, &[], Some(c), 1, 0)];
+    let flat = vec![
+        spec(0, &[], Some(a), 1, 0),
+        spec(1, &[0], Some(b), 1, 0),
+        spec(2, &[], Some(c), 1, 0),
+    ];
     assert_eq!(order(flat), [NodeId(0), NodeId(1), NodeId(2)]);
 }
 
@@ -421,14 +460,15 @@ fn the_plane_orders_random_graphs_by_the_history_critical_path() {
                 history.observe(KIND, Some(key), random.below(50) * 10_000, 0);
             }
         }
-        let deps: Vec<Vec<u32>> = (0..n)
-            .map(|i| (0..i as u32).filter(|_| random.below(4) == 0).collect())
-            .collect();
-        let specs: Vec<Spec> = (0..n).map(|i| predicted(&history, i as u32, &deps[i], keys[i])).collect();
+        let deps: Vec<Vec<u32>> =
+            (0..n).map(|i| (0..i as u32).filter(|_| random.below(4) == 0).collect()).collect();
+        let specs: Vec<Spec> =
+            (0..n).map(|i| predicted(&history, i as u32, &deps[i], keys[i])).collect();
         let cost: Vec<u64> = specs.iter().map(|it| it.cost).collect();
         let mut path = cost.clone();
         for i in (0..n).rev() {
-            let after = (i + 1..n).filter(|&j| deps[j].contains(&(i as u32))).map(|j| path[j]).max();
+            let after =
+                (i + 1..n).filter(|&j| deps[j].contains(&(i as u32))).map(|j| path[j]).max();
             path[i] = cost[i] + after.unwrap_or(0);
         }
         let mut done = vec![false; n];
@@ -480,7 +520,8 @@ fn a_history_is_the_planes_predictor() {
 /// The median of the first `seen` of `runs` (at most [`RUNS`]) by sorting them: the reference
 /// [`Record::ran_us`] is held to.
 fn sorted_median(runs: [u32; RUNS], seen: u32) -> u64 {
-    let mut last: Vec<u64> = runs[..(seen as usize).min(RUNS)].iter().map(|&it| u64::from(it)).collect();
+    let mut last: Vec<u64> =
+        runs[..(seen as usize).min(RUNS)].iter().map(|&it| u64::from(it)).collect();
     last.sort_unstable();
     match last.len() {
         0 => 0,
@@ -501,7 +542,8 @@ fn the_median_of_mins_and_maxes_is_the_sorted_one() {
     }
     // Every order of four runs of four values, ties included, up to the most a run can be.
     for code in 0..256u32 {
-        let runs = [code & 3, (code >> 2) & 3, (code >> 4) & 3, code >> 6].map(|it| it * (u32::MAX / 3));
+        let runs =
+            [code & 3, (code >> 2) & 3, (code >> 4) & 3, code >> 6].map(|it| it * (u32::MAX / 3));
         for seen in 0..=5 {
             let record = Record { kind: KIND, key: [1, 2], seen, stamp: 1, peak: 0, runs };
             assert_eq!(record.ran_us(), sorted_median(runs, seen), "{runs:?}, seen {seen}");
@@ -527,7 +569,10 @@ fn a_record_after_an_empty_way_is_refused() {
     let mut gapped = bytes[..records_at].to_vec();
     gapped[records_at - 8..].copy_from_slice(&1u64.to_le_bytes());
     gapped.extend_from_slice(&bytes[second_at..]);
-    assert_eq!(History::decode(&gapped, config(16)).map(|_| ()), Err(DecodeError::Gap { slot: second }));
+    assert_eq!(
+        History::decode(&gapped, config(16)).map(|_| ()),
+        Err(DecodeError::Gap { slot: second })
+    );
     assert!(History::decode(&bytes, config(16)).is_ok());
 }
 
@@ -537,15 +582,25 @@ fn predicting_and_observing_allocate_nothing() {
     let (seen, unseen) = (same_bucket(1), same_bucket(2));
     history.observe(KIND, Some(&seen), 2_000_000, 64);
     let reader = history.reader();
-    blaze_alloc_count::assert_at_most(0, "a seen key's prediction", || history.predict(KIND, Some(&seen)));
-    blaze_alloc_count::assert_at_most(0, "an unseen key's prediction", || history.predict(KIND, Some(&unseen)));
-    blaze_alloc_count::assert_at_most(0, "a keyless prediction", || history.predict(KIND, None));
-    blaze_alloc_count::assert_at_most(0, "an unseen kind's prediction", || history.predict(TaskKind(77), Some(&seen)));
-    blaze_alloc_count::assert_at_most(0, "a reader's read", || reader.get(KIND, &seen));
-    blaze_alloc_count::assert_at_most(0, "observing a seen kind's seen key, new key and no key", || {
-        history.observe(KIND, Some(&seen), 1_000_000, 32);
-        history.observe(KIND, Some(&unseen), 1_000_000, 32);
-        history.observe(KIND, None, 1_000_000, 32);
+    blaze_alloc_count::assert_at_most(0, "a seen key's prediction", || {
+        history.predict(KIND, Some(&seen))
     });
+    blaze_alloc_count::assert_at_most(0, "an unseen key's prediction", || {
+        history.predict(KIND, Some(&unseen))
+    });
+    blaze_alloc_count::assert_at_most(0, "a keyless prediction", || history.predict(KIND, None));
+    blaze_alloc_count::assert_at_most(0, "an unseen kind's prediction", || {
+        history.predict(TaskKind(77), Some(&seen))
+    });
+    blaze_alloc_count::assert_at_most(0, "a reader's read", || reader.get(KIND, &seen));
+    blaze_alloc_count::assert_at_most(
+        0,
+        "observing a seen kind's seen key, new key and no key",
+        || {
+            history.observe(KIND, Some(&seen), 1_000_000, 32);
+            history.observe(KIND, Some(&unseen), 1_000_000, 32);
+            history.observe(KIND, None, 1_000_000, 32);
+        },
+    );
     assert_eq!(reader.get(KIND, &unseen).map(|it| it.seen), Some(1));
 }

@@ -8,9 +8,14 @@ mod db;
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use base_db::relevant_crates;
-use hir_def::{FunctionId, HasModule, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
+use hir_def::{
+    FunctionId, HasModule, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature,
+};
 use hir_expand::EditionedFileId;
-use hir_ty::{InferBodyId, ParamEnvAndCrate, db::HirDatabase, mir::MirSpan, next_solver::GenericArgs};
+use hir_expand::fixture;
+use hir_ty::{
+    InferBodyId, ParamEnvAndCrate, db::HirDatabase, mir::MirSpan, next_solver::GenericArgs,
+};
 use hir_ty_mir::mir::{Plain, Site, print_mir_body, run_function};
 use hir_ty_ub::{
     Config, Found, Outcome, Ub,
@@ -18,7 +23,6 @@ use hir_ty_ub::{
     memory::MemError,
     run_test,
 };
-use hir_expand::fixture;
 
 use crate::db::TestDB;
 
@@ -105,10 +109,15 @@ fn main_of(db: &TestDB, file: EditionedFileId) -> FunctionId {
             if data.origin.file_id().map(|f| f.file_id(db)) != Some(file_id) {
                 continue;
             }
-            let main = def_map.module(db, module_id).scope(db).declarations().find_map(|def| match def {
-                ModuleDefId::FunctionId(f) if FunctionSignature::of(db, f).name.as_str() == "main" => Some(f),
-                _ => None,
-            });
+            let main =
+                def_map.module(db, module_id).scope(db).declarations().find_map(|def| match def {
+                    ModuleDefId::FunctionId(f)
+                        if FunctionSignature::of(db, f).name.as_str() == "main" =>
+                    {
+                        Some(f)
+                    }
+                    _ => None,
+                });
             if let Some(main) = main {
                 return main;
             }
@@ -161,7 +170,11 @@ fn main_mir(fixture: &str) -> String {
             param_env: db.trait_environment(main.into()),
             krate: main.module(&db).krate(&db),
         };
-        match db.monomorphized_runtime_mir_body(main.into(), GenericArgs::empty().store(), env.store()) {
+        match db.monomorphized_runtime_mir_body(
+            main.into(),
+            GenericArgs::empty().store(),
+            env.store(),
+        ) {
             Ok(body) => print_mir_body(&db, &body, "main"),
             Err(e) => format!("no MIR for `main`: {e:?}"),
         }

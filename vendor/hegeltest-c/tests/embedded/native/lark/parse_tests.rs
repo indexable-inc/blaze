@@ -25,11 +25,7 @@ struct Setup {
 fn build(grammar: Grammar) -> Setup {
     let lexer = Lexer::new(&grammar.terminals);
     let parser = Parser::new(&grammar, grammar.start[0]);
-    Setup {
-        grammar,
-        lexer,
-        parser,
-    }
+    Setup { grammar, lexer, parser }
 }
 
 fn setup(text: &str) -> Setup {
@@ -51,11 +47,7 @@ fn a_regex_repeat_stops_at_an_empty_iteration_after_consuming_text() {
 #[test]
 fn item_limits_fail_cleanly_during_scanning_and_tree_reconstruction() {
     for (grammar, text, expected) in [
-        (
-            "start: \"a\" start |\n",
-            "aaaaaaaaaaaaaaaa",
-            "aaaaaaaaaaaaaaaa",
-        ),
+        ("start: \"a\" start |\n", "aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"),
         ("start: \"a\"+\n%ignore \" \"\n", " a a ", "[ ]a[ ]a[ ]"),
     ] {
         let s = setup(grammar);
@@ -226,17 +218,9 @@ fn trees_follow_the_grammar() {
                 Tree::Rule {
                     id: s.rule("a"),
                     alt: 1,
-                    children: vec![Tree::Terminal {
-                        id: s.term("Y"),
-                        start: 0,
-                        end: 1
-                    }],
+                    children: vec![Tree::Terminal { id: s.term("Y"), start: 0, end: 1 }],
                 },
-                Tree::Terminal {
-                    id: s.term("B"),
-                    start: 1,
-                    end: 2
-                },
+                Tree::Terminal { id: s.term("B"), start: 1, end: 2 },
             ],
         }
     );
@@ -276,16 +260,8 @@ fn nullable_rules_and_the_empty_string() {
                         id: s.rule("d"),
                         alt: 0,
                         children: vec![
-                            Tree::Rule {
-                                id: s.rule("e"),
-                                alt: 0,
-                                children: vec![]
-                            },
-                            Tree::Rule {
-                                id: s.rule("e"),
-                                alt: 0,
-                                children: vec![]
-                            },
+                            Tree::Rule { id: s.rule("e"), alt: 0, children: vec![] },
+                            Tree::Rule { id: s.rule("e"), alt: 0, children: vec![] },
                         ],
                     }],
                 },
@@ -332,11 +308,7 @@ fn groups_and_counted_repeats() {
         panic!("{tree:?}");
     };
     assert_eq!(outer.len(), 1);
-    let Tree::Group {
-        alt: 0,
-        children: inner,
-    } = &outer[0]
-    else {
+    let Tree::Group { alt: 0, children: inner } = &outer[0] else {
         panic!("{tree:?}");
     };
     assert!(matches!(&inner[..], [Tree::Repeat { children }] if children.len() == 2));
@@ -385,28 +357,12 @@ fn ignored_text_anywhere() {
     let Tree::Rule { children, .. } = &tree else {
         panic!("{tree:?}");
     };
-    let items: Vec<&Tree> = children
-        .iter()
-        .filter(|c| !matches!(c, Tree::Ignored { .. }))
-        .collect();
+    let items: Vec<&Tree> =
+        children.iter().filter(|c| !matches!(c, Tree::Ignored { .. })).collect();
     assert_eq!(items.len(), 2);
     assert_eq!(children.len(), 5);
-    assert!(matches!(
-        children[0],
-        Tree::Ignored {
-            start: 0,
-            end: 1,
-            ..
-        }
-    ));
-    assert!(matches!(
-        children[4],
-        Tree::Ignored {
-            start: 4,
-            end: 5,
-            ..
-        }
-    ));
+    assert!(matches!(children[0], Tree::Ignored { start: 0, end: 1, .. }));
+    assert!(matches!(children[4], Tree::Ignored { start: 4, end: 5, .. }));
 }
 
 #[test]
@@ -476,9 +432,7 @@ fn declared_terminals_never_match() {
 fn ambiguous_grammars_parse_once() {
     let s = setup("start: e\ne: e \"+\" e | \"1\"\n");
     assert!(s.accepts("1+1+1+1"));
-    let text: String = core::iter::repeat_n("1+", 200)
-        .chain(core::iter::once("1"))
-        .collect();
+    let text: String = core::iter::repeat_n("1+", 200).chain(core::iter::once("1")).collect();
     assert_eq!(leaves(&s.tree(&text)).len(), 401);
     assert!(!s.accepts("1+1+"));
 }
@@ -486,16 +440,12 @@ fn ambiguous_grammars_parse_once() {
 #[test]
 fn an_ambiguous_grammar_parses_a_long_string_within_its_budget() {
     let s = setup("start: e\ne: e \"+\" e | \"1\"\n");
-    let text: String = core::iter::repeat_n("1+", 99)
-        .chain(core::iter::once("1"))
-        .collect();
+    let text: String = core::iter::repeat_n("1+", 99).chain(core::iter::once("1")).collect();
     assert_eq!(leaves(&s.tree(&text)).len(), 199);
     let strict = Parser::new(&s.grammar, s.grammar.start[0]).with_budget(1000);
     let err = strict.parse(&s.lexer, &chars(&text)).unwrap_err();
     assert!(err.position > 0 && err.position < text.len(), "{err:?}");
-    let short: String = core::iter::repeat_n("1+", 4)
-        .chain(core::iter::once("1"))
-        .collect();
+    let short: String = core::iter::repeat_n("1+", 4).chain(core::iter::once("1")).collect();
     assert!(strict.accepts(&s.lexer, &chars(&short)));
 }
 
@@ -564,11 +514,7 @@ fn generated(
 ) -> Vec<String> {
     let spec = GrammarSpec::new(
         grammar.clone(),
-        GrammarOptions {
-            start: start.to_string(),
-            max_size,
-            ..GrammarOptions::default()
-        },
+        GrammarOptions { start: start.to_string(), max_size, ..GrammarOptions::default() },
     )
     .unwrap();
     seeds
@@ -625,19 +571,11 @@ fn fixture_grammars_parse_their_own_strings() {
 /// second.
 #[test]
 fn the_ambiguous_fixture_parses_its_own_strings() {
-    assert!(
-        !corpus_grammars()
-            .iter()
-            .any(|(name, _)| name == "ambiguous")
-    );
+    assert!(!corpus_grammars().iter().any(|(name, _)| name == "ambiguous"));
     let grammar = fixture("ambiguous", "start");
     let s = build(grammar);
     let strings = generated(&s.grammar, "start", 3000, 0..30);
-    let longest = strings
-        .iter()
-        .filter(|s| s.len() <= 1600)
-        .max_by_key(|s| s.len())
-        .unwrap();
+    let longest = strings.iter().filter(|s| s.len() <= 1600).max_by_key(|s| s.len()).unwrap();
     assert!(longest.len() > 1000, "{}", longest.len());
     let text = chars(longest);
     let tree = s.parser.parse(&s.lexer, &text).unwrap();
@@ -684,11 +622,7 @@ fn write_verdicts() {
             lines.push_str(if verdict { "true\n" } else { "false\n" });
             count += 1;
         }
-        std::fs::write(
-            Path::new(&dir).join(format!("{name}.verdicts.jsonl")),
-            lines,
-        )
-        .unwrap();
+        std::fs::write(Path::new(&dir).join(format!("{name}.verdicts.jsonl")), lines).unwrap();
         std::eprintln!("{name}: {count} candidates, {:?}", started.elapsed());
     }
 }
@@ -698,22 +632,14 @@ fn right_recursion_takes_a_column_of_items_per_character() {
     let right = setup("start: \"a\" start | \"a\"\n");
     let list = setup("start: list\nlist: item \",\" list | item\nitem: \"a\"\n");
     let text: String = core::iter::repeat_n('a', 8192).collect();
-    let items: String = core::iter::repeat_n("a,", 4095)
-        .chain(core::iter::once("a"))
-        .collect();
+    let items: String = core::iter::repeat_n("a,", 4095).chain(core::iter::once("a")).collect();
     for (s, text) in [(&right, &text), (&list, &items)] {
         let lean = Parser::new(&s.grammar, s.grammar.start[0]).with_item_budget(100_000);
         let tree = lean.parse(&s.lexer, &chars(text)).unwrap();
         assert!(covers(&tree, &chars(text)));
-        assert_eq!(
-            read_back(&tree, &chars(text)).replace(['[', ']'], ""),
-            *text
-        );
+        assert_eq!(read_back(&tree, &chars(text)).replace(['[', ']'], ""), *text);
     }
-    for g in [
-        "start: x\nx: x | \"a\" x | \"a\"\n",
-        "start: start | \"a\" start | \"a\"\n",
-    ] {
+    for g in ["start: x\nx: x | \"a\" x | \"a\"\n", "start: start | \"a\" start | \"a\"\n"] {
         let cycle = setup(g);
         assert!(cycle.accepts("aaa"));
         assert_eq!(leaves(&cycle.tree("aaa")).len(), 3);
@@ -724,9 +650,7 @@ fn right_recursion_takes_a_column_of_items_per_character() {
 #[test]
 fn a_parse_holding_too_many_items_is_given_up() {
     let s = setup("start: e\ne: e \"+\" e | \"1\"\n");
-    let text: String = core::iter::repeat_n("1+", 20)
-        .chain(core::iter::once("1"))
-        .collect();
+    let text: String = core::iter::repeat_n("1+", 20).chain(core::iter::once("1")).collect();
     let strict = Parser::new(&s.grammar, s.grammar.start[0]).with_item_budget(200);
     let err = strict.parse(&s.lexer, &chars(&text)).unwrap_err();
     assert!(err.position > 0 && err.position < text.len(), "{err:?}");
@@ -748,9 +672,7 @@ fn a_derivation_as_deep_as_its_text_is_long_needs_no_call_stack() {
             assert_eq!(tree.size(), 3 * depth + 2);
             let layout = Layout::new(&tree);
             assert_eq!(layout.depth() as usize, depth + 1);
-            let pairs: u32 = (1..=depth as u32)
-                .map(|i| u32::BITS - i.leading_zeros())
-                .sum();
+            let pairs: u32 = (1..=depth as u32).map(|i| u32::BITS - i.leading_zeros()).sum();
             assert_eq!(layout.hoists().len(), pairs as usize);
             drop(layout);
             drop(tree);
@@ -780,10 +702,7 @@ fn unit_cycles_have_two_waiters_wherever_they_are_entered() {
     for (g, text) in [
         ("start: a\na: b | \"y\"\nb: a\n", "y"),
         ("start: \"x\" a\na: b | \"y\"\nb: a\n", "xy"),
-        (
-            "start: \"x\" a \"z\"\na: b | \"y\"\nb: a | n a\nn:\n",
-            "xyz",
-        ),
+        ("start: \"x\" a \"z\"\na: b | \"y\"\nb: a | n a\nn:\n", "xyz"),
         ("start: a | \"x\" start\na: start | \"y\"\n", "xxy"),
     ] {
         let s = setup(g);

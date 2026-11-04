@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
 use expect_test::{expect, expect_file};
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use crate::{
     exec::{Did, drive},
@@ -322,7 +322,8 @@ fn random_builds_keep_the_rules() {
         }
         let deps_of: HashMap<u32, Vec<u32>, Global> = // alloc: a test's model
             specs.iter().map(|it| (it.id.0, it.deps.iter().map(|it| it.0).collect())).collect();
-        let pool_of: HashMap<u32, Pool, Global> = specs.iter().map(|it| (it.id.0, it.pool)).collect(); // alloc: a test's model
+        let pool_of: HashMap<u32, Pool, Global> =
+            specs.iter().map(|it| (it.id.0, it.pool)).collect(); // alloc: a test's model
         let mut machine = Machine::new(config).unwrap();
         let mut running: Vec<u32> = Vec::new();
         let mut finished = None;

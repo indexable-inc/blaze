@@ -84,7 +84,10 @@ pub(crate) fn reaches(p: u64, to: u64, reach: i64) -> bool {
 /// segments: the index of each segment's end, the last being `pieces`' length. A segment ends
 /// before a piece whose end would be more than [`SEGMENT`] past the segment's start, unless
 /// the segment has no piece yet.
-pub(crate) fn segments<A: Allocator>(pieces: impl Iterator<Item = (u64, u64)>, out: &mut Vec<usize, A>) {
+pub(crate) fn segments<A: Allocator>(
+    pieces: impl Iterator<Item = (u64, u64)>,
+    out: &mut Vec<usize, A>,
+) {
     let (mut at, mut start, mut first) = (0u64, 0u64, 0usize);
     let mut count = 0;
     for (index, (align, size)) in pieces.enumerate() {
@@ -101,11 +104,19 @@ pub(crate) fn segments<A: Allocator>(pieces: impl Iterator<Item = (u64, u64)>, o
 
 /// The address of the thunk of `target` and `addend` nearest the branch at `p` among those in
 /// its reach, `None` when there is none.
-pub(crate) fn through(symbols: &Symbols, state: &State, target: Sym, addend: i64, p: u64) -> Option<u64> {
+pub(crate) fn through(
+    symbols: &Symbols,
+    state: &State,
+    target: Sym,
+    addend: i64,
+    p: u64,
+) -> Option<u64> {
     let addend = i32::try_from(addend).ok()?;
     let mut best: Option<u64> = None;
     for island in 0..state.islands {
-        let Some(at) = placed(symbols, state, SymKey::Thunk(target, island, addend)) else { continue };
+        let Some(at) = placed(symbols, state, SymKey::Thunk(target, island, addend)) else {
+            continue;
+        };
         if reaches(p, at, REACH) && best.is_none_or(|it| at.abs_diff(p) < it.abs_diff(p)) {
             best = Some(at);
         }
@@ -198,13 +209,22 @@ impl<'a> Stage<'a> {
             islands = tracing::field::Empty,
         );
         let _enter = span.enter();
-        let changed = if self.full { self.full_thunks(first, near, &regions)? } else { self.patch_thunks(&regions)? };
+        let changed = if self.full {
+            self.full_thunks(first, near, &regions)?
+        } else {
+            self.patch_thunks(&regions)?
+        };
         span.record("changed", changed);
         span.record("islands", self.new.islands);
         Ok(changed)
     }
 
-    fn full_thunks(&mut self, first: bool, near: bool, regions: &[Region]) -> Result<bool, LinkError> {
+    fn full_thunks(
+        &mut self,
+        first: bool,
+        near: bool,
+        regions: &[Region],
+    ) -> Result<bool, LinkError> {
         let arena = self.arena;
         let mut needs: FrameVec<'a, Need> = Vec::new_in(arena);
         let mut used: FrameVec<'a, PieceId> = Vec::new_in(arena);
@@ -221,7 +241,9 @@ impl<'a> Stage<'a> {
                     align_up_u64(piece.addr + piece.size, 4)
                 });
                 let (mut low, mut high) = (after, after);
-                while let Some((_, id)) = text.thunks.get(thunk).filter(|it| it.0 as usize == island) {
+                while let Some((_, id)) =
+                    text.thunks.get(thunk).filter(|it| it.0 as usize == island)
+                {
                     let addr = self.new.piece(*id).expect("live").addr;
                     (low, high) = (low.min(addr), high.max(addr + LEN));
                     thunk += 1;
@@ -249,9 +271,11 @@ impl<'a> Stage<'a> {
                             continue;
                         }
                         let fits = |(low, high): (u64, u64)| {
-                            reaches(p, low, REACH - MARGIN) && reaches(p, high + LEN, REACH - MARGIN)
+                            reaches(p, low, REACH - MARGIN)
+                                && reaches(p, high + LEN, REACH - MARGIN)
                         };
-                        let island = islands.into_iter().flatten().find(|it| fits(spans[*it as usize]));
+                        let island =
+                            islands.into_iter().flatten().find(|it| fits(spans[*it as usize]));
                         // None in reach: the writer names the branch ([`through`]).
                         let Some(island) = island else { continue };
                         needs.push(Need { target, island, addend });
@@ -274,7 +298,10 @@ impl<'a> Stage<'a> {
         if first {
             used.sort_unstable();
             used.dedup();
-            let stale = text.iter().flat_map(|it| it.thunks.iter().map(|(_, id)| *id)).filter(|id| used.binary_search(id).is_err());
+            let stale = text
+                .iter()
+                .flat_map(|it| it.thunks.iter().map(|(_, id)| *id))
+                .filter(|id| used.binary_search(id).is_err());
             let stale = crate::arena::collect_in(stale, arena);
             for id in stale.iter() {
                 self.unmake(*id);

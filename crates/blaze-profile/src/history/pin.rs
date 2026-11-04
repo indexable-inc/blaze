@@ -48,7 +48,8 @@ impl Pin {
     pub fn take(dir: &Path) -> Result<Pin, HistoryError> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let pins = dir.join(PINS);
-        fs::create_dir_all(&pins).map_err(io_error(&pins, "making the directory of readers' pins"))?;
+        fs::create_dir_all(&pins)
+            .map_err(io_error(&pins, "making the directory of readers' pins"))?;
         // alloc: a pin's id, once a pin
         let id = format!("{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
         // Files of a dead process that had this pid and number say nothing of this pin.
@@ -60,7 +61,9 @@ impl Pin {
                 match fs::remove_file(&path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(io_error(&path, "deleting a dead reader's pin file")(error)),
+                    Err(error) => {
+                        return Err(io_error(&path, "deleting a dead reader's pin file")(error));
+                    }
                 }
             }
         }
@@ -74,9 +77,13 @@ impl Pin {
         match lock.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
-                return Err(io_error(&making, "locking a reader's pin, which another holds")(io::ErrorKind::WouldBlock.into()));
+                return Err(io_error(&making, "locking a reader's pin, which another holds")(
+                    io::ErrorKind::WouldBlock.into(),
+                ));
             }
-            Err(fs::TryLockError::Error(error)) => return Err(io_error(&making, "locking a reader's pin")(error)),
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(io_error(&making, "locking a reader's pin")(error));
+            }
         }
         let lock_path = pins.join(PinFile::Lock { id: &id }.file_name());
         let mut held = Held { lock: Some(lock), lock_path, said: None };
@@ -157,7 +164,9 @@ pub(crate) fn pinned(dir: &Path) -> Result<Vec<Pinned>, HistoryError> {
                 Ok(Some(false))
             }
             Err(fs::TryLockError::WouldBlock) => Ok(Some(true)),
-            Err(fs::TryLockError::Error(error)) => Err(io_error(path, "locking a reader's pin")(error)),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(io_error(path, "locking a reader's pin")(error))
+            }
         }
     };
     // alloc: once a reap

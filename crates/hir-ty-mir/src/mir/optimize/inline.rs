@@ -23,7 +23,6 @@ use std::ops::Range;
 
 use base_db::{Crate, Db};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir_def::{
     CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, attrs::AttrFlags,
     signatures::FunctionSignature,
@@ -35,6 +34,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind, Ty as _},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{
     db::HirDatabase,
@@ -132,10 +132,7 @@ impl Attrs {
 }
 
 /// The target features `body` is compiled with, as declared: a closure has its function's.
-fn target_features<'db>(
-    db: &'db Db,
-    body: InlinedBody<'db>,
-) -> &'db HashSet<Symbol, Global> {
+fn target_features<'db>(db: &'db Db, body: InlinedBody<'db>) -> &'db HashSet<Symbol, Global> {
     let func = match body {
         InlinedBody::Fn(func) => Some(func),
         InlinedBody::Closure(_) => owner_of(db, body).as_function(),
@@ -337,8 +334,7 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
 
         let callee_options = self.callee_options(site.callee);
         // The callee's optimization inlines its own callees in turn, a query inside this one.
-        let generic =
-            stdx::ensure_sufficient_stack(|| optimized(db, site.callee, callee_options))?;
+        let generic = stdx::ensure_sufficient_stack(|| optimized(db, site.callee, callee_options))?;
         is_inline_valid_on_body(db, site.callee, generic)?;
         if self.past_depth_limit() && generic.basic_blocks.len() > 1 {
             return None;
@@ -350,9 +346,10 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
             Ok(it) => it,
             Err(error) => {
                 // A type's `Debug` reads the attached database.
-                blaze_query::db::attach(db, || {
-                    tracing::debug!(callee = ?site.callee, ?error, "not inlined: not monomorphized")
-                });
+                blaze_query::db::attach(
+                    db,
+                    || tracing::debug!(callee = ?site.callee, ?error, "not inlined: not monomorphized"),
+                );
                 return None;
             }
         };
@@ -489,11 +486,7 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
 }
 
 /// rustc's `is_inline_valid_on_fn`. An intrinsic never resolves to a callee.
-fn is_inline_valid_on_fn(
-    db: &Db,
-    callee: InlinedBody<'_>,
-    attrs: Attrs,
-) -> Option<()> {
+fn is_inline_valid_on_fn(db: &Db, callee: InlinedBody<'_>, attrs: Attrs) -> Option<()> {
     if attrs.has(AttrFlags::RUSTC_NO_MIR_INLINE) || attrs.has(AttrFlags::COLD) {
         return None;
     }
@@ -505,11 +498,7 @@ fn is_inline_valid_on_fn(
 
 /// rustc's `is_inline_valid_on_body` (a tail call, which this MIR has none of), and what this
 /// inliner refuses that rustc takes.
-fn is_inline_valid_on_body(
-    db: &Db,
-    callee: InlinedBody<'_>,
-    body: &MirBody<'_>,
-) -> Option<()> {
+fn is_inline_valid_on_body(db: &Db, callee: InlinedBody<'_>, body: &MirBody<'_>) -> Option<()> {
     // rustc never calls a coroutine's body: it calls its `poll`.
     if body.coroutine.is_some() {
         return None;
@@ -599,12 +588,7 @@ fn optimized<'db>(
 /// checks; a crate of the build has the caller's, its `debug_assertions` deciding its UB
 /// checks. Each is a copy built into its caller ([`MirOptions::built_in`]): no dyn facts, no
 /// allocation moved to the stack.
-fn callee_options(
-    db: &Db,
-    caller: Crate,
-    callee: Crate,
-    options: MirOptions,
-) -> MirOptions {
+fn callee_options(db: &Db, caller: Crate, callee: Crate, options: MirOptions) -> MirOptions {
     let options = options.built_in();
     if callee == caller {
         return options;
@@ -678,9 +662,11 @@ pub(crate) fn written_cross_crate_inlinable(db: &Db, func: FunctionId) -> Option
     }
     // Code generators may not support the float types in calls, and inlining avoids them.
     let sig = db.callable_item_signature(func.into()).instantiate_identity().skip_norm_wip();
-    let floats = sig.skip_binder().inputs_and_output.iter().any(|ty| {
-        matches!(ty.kind(), TyKind::Float(FloatTy::F16 | FloatTy::F128))
-    });
+    let floats = sig
+        .skip_binder()
+        .inputs_and_output
+        .iter()
+        .any(|ty| matches!(ty.kind(), TyKind::Float(FloatTy::F16 | FloatTy::F128)));
     floats.then_some(true)
 }
 

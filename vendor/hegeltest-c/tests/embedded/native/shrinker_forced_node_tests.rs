@@ -14,11 +14,7 @@ use alloc::vec::Vec;
 
 fn int_node(value: i128, was_forced: bool) -> ChoiceNode {
     ChoiceNode::integer(
-        IntegerChoice::new(
-            BigInt::from(i128::MIN + 1),
-            BigInt::from(i128::MAX),
-            BigInt::from(0),
-        ),
+        IntegerChoice::new(BigInt::from(i128::MIN + 1), BigInt::from(i128::MAX), BigInt::from(0)),
         BigInt::from(value),
         was_forced,
     )
@@ -43,14 +39,7 @@ fn bool_node(value: bool, was_forced: bool) -> ChoiceNode {
 }
 
 fn bytes_node(value: Vec<u8>, was_forced: bool) -> ChoiceNode {
-    ChoiceNode::bytes(
-        BytesChoice {
-            min_size: 0,
-            max_size: 16,
-        },
-        value,
-        was_forced,
-    )
+    ChoiceNode::bytes(BytesChoice { min_size: 0, max_size: 16 }, value, was_forced)
 }
 
 fn accepting_shrinker(initial: Vec<ChoiceNode>) -> Shrinker<'static> {
@@ -89,11 +78,8 @@ fn binary_search_integer_towards_zero_skips_forced_node() {
 
 #[test]
 fn shrink_duplicates_skips_forced_member_of_group() {
-    let mut shrinker = accepting_shrinker(vec![
-        int_node(7, true),
-        int_node(7, false),
-        int_node(7, false),
-    ]);
+    let mut shrinker =
+        accepting_shrinker(vec![int_node(7, true), int_node(7, false), int_node(7, false)]);
     drive_no_yield(shrinker.shrink_duplicates()).unwrap();
     assert_integer_at(&shrinker, 0, 7);
 }
@@ -107,10 +93,8 @@ fn redistribute_integers_skips_forced_node() {
 
 #[test]
 fn shrink_bytes_skips_forced_node() {
-    let mut shrinker = accepting_shrinker(vec![
-        bytes_node(vec![9, 9, 9], true),
-        bytes_node(vec![1, 2, 3], false),
-    ]);
+    let mut shrinker =
+        accepting_shrinker(vec![bytes_node(vec![9, 9, 9], true), bytes_node(vec![1, 2, 3], false)]);
     drive_no_yield(shrinker.shrink_bytes()).unwrap();
     match &shrinker.current_nodes[0].value() {
         ChoiceValue::Bytes(b) => assert_eq!(b, &vec![9, 9, 9]),
@@ -130,11 +114,8 @@ fn shrink_floats_skips_forced_node() {
 
 #[test]
 fn try_shortening_via_increment_skips_forced_node() {
-    let mut shrinker = accepting_shrinker(vec![
-        int_node(5, true),
-        int_node(3, false),
-        int_node(2, false),
-    ]);
+    let mut shrinker =
+        accepting_shrinker(vec![int_node(5, true), int_node(3, false), int_node(2, false)]);
     drive_no_yield(shrinker.try_shortening_via_increment()).unwrap();
     assert_integer_at(&shrinker, 0, 5);
 }
@@ -221,17 +202,11 @@ fn normalize_unicode_chars_skips_forced_node() {
 /// and accept it (it is interesting and shortlex-smaller).
 #[test]
 fn consider_accepts_length_reducing_candidate_past_forced_node() {
-    let mut shrinker = accepting_shrinker(vec![
-        int_node(1, false),
-        int_node(9, true),
-        int_node(2, false),
-    ]);
+    let mut shrinker =
+        accepting_shrinker(vec![int_node(1, false), int_node(9, true), int_node(2, false)]);
     let interesting =
         drive_no_yield(shrinker.consider(&[int_node(9, true), int_node(2, false)])).unwrap();
-    assert!(
-        interesting,
-        "length-reducing candidate must not be pre-rejected by the forced guard"
-    );
+    assert!(interesting, "length-reducing candidate must not be pre-rejected by the forced guard");
     assert_eq!(
         shrinker.current_nodes.len(),
         2,
