@@ -10,6 +10,17 @@
 //! ends, and [`Sim::dial`] is a peer from outside (an agent's client, a webhook) that the test
 //! plays with [`Sim::peer_send`], [`Sim::peer_received`] and [`Sim::peer_hangup`].
 //!
+//! File locks ([`Effect::Lock`]) are a table of who holds each file's lock, by `flock`'s
+//! rules: shared locks share, an exclusive one is alone, and a lock another excludes is
+//! [`Done::Contended`], never waited for. [`Sim::hold_lock`] is another process holding one. A
+//! lock follows its file as a rename moves it; a file removed or replaced takes its locks with
+//! it, so a lock of the name made again is another's. A crash lets every lock go.
+//!
+//! Targeted faults, each until a crash: [`Sim::fail_syncs`] (a disk gone bad),
+//! [`Sim::hold_syncs`] (a disk that stopped answering), [`Sim::slow_writes`],
+//! [`Sim::hold_lists`] and [`Sim::fail_lists`], [`Sim::hold_sends`], and [`Sim::fill`] (a disk
+//! out of room: what does not fit fails with ENOSPC, an append keeping the part that fits).
+//!
 //! What is in flight sits where a real driver keeps it (docs/v2/plan/design/memory.md,
 //! "Generational handles"): effects in a [`Wheel`], spawns, watches and listens in [`Tagged`]
 //! slabs named by the asker's tag, and the ends of connections in a [`Slab`] whose handle bits
@@ -32,7 +43,7 @@ use std::alloc::Global;
 pub use self::journal::Journal;
 use crate::{
     Access, Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError,
-    Meta, RECV_MOST, Tag,
+    LockMode, Meta, RECV_MOST, Tag,
     threads::tagged::{Id, Tagged},
     wheel::{self, Wheel},
 };
@@ -89,7 +100,8 @@ struct End {
 /// The simulation's random numbers: blaze's one seeded SplitMix64.
 pub use blaze_rng::SplitMix64 as Rng;
 
-/// How unkind the simulated machine is.
+/// How unkind the simulated machine is, at random. The faults a test aims at one place
+/// ([`Sim::fail_syncs`], [`Sim::fill`] and the rest in the module's docs) are the [`Sim`]'s.
 #[derive(Clone, Debug)]
 pub struct Faults {
     /// An effect fails once in this many (0: never). A failed append writes a random part of
@@ -313,6 +325,17 @@ pub struct Sim {
     /// with the clock then ([`Sim::record`]).
     recording: Vec<FileName>,
     recorded: Vec<(Duration, FileName, bool)>,
+    /// Appends and writes of files under this directory take their bytes from what is left of
+    /// its room ([`Sim::fill`]): a disk filling up.
+    room: Option<(FileName, u64)>,
+    /// Who holds each file's lock ([`Effect::Lock`]), by the tag that took it, in the order
+    /// taken; a file no one holds has no entry.
+    locks: HashMap<FileName, Vec<(Tag, LockMode)>, Global>,
+    /// Locks held of files removed or replaced since: still held, so an unlock lets them go,
+    /// but of a file no name leads to, so they exclude no one.
+    unlinked: Vec<Tag>,
+    /// The locks another process holds ([`Sim::hold_lock`]).
+    outside: HashMap<FileName, LockMode, Global>,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -382,6 +405,11 @@ impl Sim {
             slow: None,
             recording: Vec::new(),
             recorded: Vec::new(),
+            room: None,
+            locks: HashMap::new_in(Global),
+            // alloc: none until a locked file is removed.
+            unlinked: Vec::new(),
+            outside: HashMap::new_in(Global),
         }
     }
 
@@ -462,12 +490,19 @@ impl Sim {
     /// a random prefix of the changes after (appends, writes at an offset, truncations), the
     /// last of which may be torn. A whole-file write or rename that completed is kept whole;
     /// one in flight is not there.
+    ///
+    /// Every lock goes with the processes that held them, another process's too
+    /// ([`Sim::hold_lock`]), and a disk filled up ([`Sim::fill`]) has room again.
     pub fn crash(&mut self) {
         self.pending.drain(|_, _| {});
         self.held.clear();
         self.held_sends.clear();
         self.hold_syncs = None;
         self.fail_syncs = None;
+        self.room = None;
+        self.locks.clear();
+        self.unlinked.clear();
+        self.outside.clear();
         self.hold_lists = None;
         self.held_lists.clear();
         self.fail_lists = None;
@@ -545,6 +580,28 @@ impl Sim {
     /// unsynced. For a test of a store that breaks.
     pub fn fail_syncs(&mut self, dir: FileName) {
         self.fail_syncs = Some(dir);
+    }
+
+    /// From now on, appends, whole-file writes and writes at an offset of files under `dir`
+    /// take their bytes from `room`, until a crash: a disk filling up. One that does not fit
+    /// fails with ENOSPC, naming the file: an append keeps the part that fits, unsynced (a
+    /// short write), as does a write at an offset, and a whole-file write leaves the file as it
+    /// was. For a test of a store or a journal on a full disk.
+    pub fn fill(&mut self, dir: FileName, room: u64) {
+        self.room = Some((dir, room));
+    }
+
+    /// Another process holds `file`'s lock in `mode`, until [`Sim::release_lock`] or a crash:
+    /// a lock asked of it that `mode` excludes is [`Done::Contended`]. Whatever the simulation's
+    /// own locks of it are, as a test plays another process that got there first.
+    pub fn hold_lock(&mut self, file: &FileName, mode: LockMode) {
+        // clone: the world changed by the test, not an op.
+        self.outside.insert(file.clone(), mode);
+    }
+
+    /// Another process lets go of `file`'s lock ([`Sim::hold_lock`]).
+    pub fn release_lock(&mut self, file: &FileName) {
+        self.outside.remove(file);
     }
 
     /// From now on, each write, truncate and sync of a file under `dir` completes `by` after it
@@ -774,6 +831,7 @@ impl Sim {
     /// The file removed by something outside the state machine.
     pub fn delete(&mut self, file: &FileName) {
         self.files.remove(file);
+        self.unlink_locks(file);
         self.changed(file);
     }
 
@@ -886,9 +944,143 @@ impl Sim {
             // clone: the world changed by the test, not an op.
             self.files.insert(to.clone(), sim);
             self.disk.renamed(from, to);
+            self.move_locks(from, to);
             self.changed(from);
             self.changed(to);
         }
+    }
+
+    /// Whether `tag` holds a lock, of a file there or of one gone.
+    fn holds_lock(&self, tag: Tag) -> bool {
+        self.unlinked.contains(&tag)
+            || self.locks.values().any(|holders| holders.iter().any(|&(it, _)| it == tag))
+    }
+
+    /// [`Effect::Lock`] of `file` in `mode` under `tag`, decided as it completes.
+    fn lock(&mut self, file: &FileName, mode: LockMode, tag: Tag) -> Done {
+        if self.holds_lock(tag) {
+            // alloc: an error's message.
+            return Done::Failed(IoError(format!(
+                "{file}: lock {} asked under a tag that holds a lock already",
+                tag.0
+            )));
+        }
+        // Opened to read and write, made if missing, whether or not the lock is taken, as a
+        // real driver opens it.
+        if !self.files.contains_key(file) {
+            file_mut(&mut self.files, file);
+            self.changed(file);
+        }
+        let holders = self.locks.get(file).map_or(&[][..], Vec::as_slice);
+        let outside = self.outside.get(file).copied();
+        let free = match mode {
+            LockMode::Exclusive => holders.is_empty() && outside.is_none(),
+            LockMode::Shared => {
+                holders.iter().all(|&(_, it)| it == LockMode::Shared)
+                    && outside != Some(LockMode::Exclusive)
+            }
+        };
+        if !free {
+            return Done::Contended;
+        }
+        match self.locks.get_mut(file) {
+            Some(holders) => holders.push((tag, mode)),
+            None => {
+                // clone: once per file locked while no one held it, its key.
+                // alloc: the file's holders, kept while any hold it.
+                self.locks.insert(file.clone(), vec![(tag, mode)]);
+            }
+        }
+        Done::Locked
+    }
+
+    /// The lock `lock` took let go of: whether it held one.
+    fn unlock(&mut self, lock: Tag) -> bool {
+        if let Some(at) = self.unlinked.iter().position(|&it| it == lock) {
+            self.unlinked.swap_remove(at);
+            return true;
+        }
+        let Some(file) = self
+            .locks
+            .iter()
+            .find(|(_, holders)| holders.iter().any(|&(it, _)| it == lock))
+            // clone: the name of the file let go of, a refcount.
+            .map(|(file, _)| file.clone())
+        else {
+            return false;
+        };
+        let holders = self.locks.get_mut(&file).expect("found above");
+        holders.retain(|&(it, _)| it != lock);
+        if holders.is_empty() {
+            self.locks.remove(&file);
+        }
+        true
+    }
+
+    /// The locks of `file` stay held but exclude no one: their file is removed or replaced, so
+    /// the name, made again, is another file.
+    fn unlink_locks(&mut self, file: &FileName) {
+        if let Some(holders) = self.locks.remove(file) {
+            self.unlinked.extend(holders.into_iter().map(|(tag, _)| tag));
+        }
+    }
+
+    /// The locks of `from` follow their file to `to`, as a rename moves it; `to`'s own go with
+    /// the file the rename replaced.
+    fn move_locks(&mut self, from: &FileName, to: &FileName) {
+        self.unlink_locks(to);
+        if let Some(holders) = self.locks.remove(from) {
+            // clone: the name the locked file has now, a refcount.
+            self.locks.insert(to.clone(), holders);
+        }
+    }
+
+    /// `effect` on a disk filling up ([`Sim::fill`]): handed back to be done, its bytes taken
+    /// from the room, when it fits; else what it ends with, an append or a write at an offset
+    /// having kept the part that fit.
+    fn take_room(&mut self, effect: Effect) -> Result<Effect, Done> {
+        let Some((dir, room)) = &mut self.room else {
+            return Ok(effect);
+        };
+        let (file, len) = match &effect {
+            Effect::Append { file, bytes, .. } | Effect::Write { file, bytes, .. } => {
+                (file, bytes.len() as u64)
+            }
+            // One of a file not there fails as it would have, taking no room.
+            Effect::WriteAt { file, bytes, .. } if self.files.contains_key(file) => {
+                (file, bytes.len() as u64)
+            }
+            _ => return Ok(effect),
+        };
+        if !file.is_under(dir) {
+            return Ok(effect);
+        }
+        if len <= *room {
+            *room -= len;
+            return Ok(effect);
+        }
+        let fits = *room as usize;
+        *room = 0;
+        // alloc: an error's message.
+        let full = Done::Failed(IoError(format!("{file}: No space left on device (os error 28)")));
+        match effect {
+            Effect::Append { file, mut bytes, .. } => {
+                bytes.truncate(fits);
+                file_mut(&mut self.files, &file).ops.push(Op::Append(bytes));
+                if fits > 0 {
+                    self.changed(&file);
+                }
+            }
+            Effect::WriteAt { file, at, mut bytes, .. } if fits > 0 => {
+                bytes.truncate(fits);
+                let sim = self.files.get_mut(&file).expect("looked up above");
+                sim.ops.push(Op::At(at, bytes));
+                self.changed(&file);
+            }
+            // A whole-file write leaves the file as it was.
+            _ => {}
+        }
+        Err(full)
     }
 
     fn fail(&mut self, tag: Tag) -> Completion {
@@ -1007,6 +1199,10 @@ impl Sim {
             }
             return self.fail(tag);
         }
+        let effect = match self.take_room(effect) {
+            Ok(effect) => effect,
+            Err(done) => return Completion { tag, done },
+        };
         let done = match effect {
             Effect::ReadAll { file, .. } => {
                 self.read(&file, 0, usize::MAX).map_or_else(Done::Failed, Done::Read)
@@ -1029,8 +1225,10 @@ impl Sim {
                 self.changed(&file);
                 Done::Truncated
             }
+            // Made beside it and renamed over it: a lock of the file it replaced is of that one.
             Effect::Write { file, bytes, .. } => {
                 *file_mut(&mut self.files, &file) = SimFile::whole(bytes);
+                self.unlink_locks(&file);
                 self.changed(&file);
                 Done::Written
             }
@@ -1047,6 +1245,7 @@ impl Sim {
                 Some(sim) => {
                     *file_mut(&mut self.files, &to) = sim;
                     self.disk.renamed(&from, &to);
+                    self.move_locks(&from, &to);
                     self.changed(&from);
                     self.changed(&to);
                     Done::Renamed
@@ -1140,10 +1339,12 @@ impl Sim {
             },
             Effect::Remove { file, .. } => {
                 if self.files.remove(&file).is_some() {
+                    self.unlink_locks(&file);
                     self.changed(&file);
                 }
                 Done::Removed
             }
+            Effect::Lock { file, mode, tag } => self.lock(&file, mode, tag),
             Effect::Timer { .. } => Done::Fired,
             Effect::Map { file, .. } => {
                 // alloc: the mapping, which the completion carries.
@@ -1164,8 +1365,9 @@ impl Sim {
             | Effect::Connect { .. }
             | Effect::Recv { .. }
             | Effect::Send { .. }
-            | Effect::Hangup { .. } => {
-                unreachable!("watches, kills and sockets are not pending effects")
+            | Effect::Hangup { .. }
+            | Effect::Unlock { .. } => {
+                unreachable!("watches, kills, sockets and unlocks are not pending effects")
             }
         };
         Completion { tag, done }
@@ -1263,6 +1465,19 @@ impl Driver for Sim {
                     };
                     // Every change of the watch told by now is heard first.
                     self.tell_after(watch, tag, done, Of::Flush(watch));
+                    continue;
+                }
+                // A real unlock cannot fail, so none is injected to.
+                Effect::Unlock { lock, tag } => {
+                    let done = match self.unlock(lock) {
+                        true => Done::Unlocked,
+                        // alloc: an error's message.
+                        false => Done::Failed(IoError(format!(
+                            "unlock of lock {}: it holds no lock",
+                            lock.0
+                        ))),
+                    };
+                    self.tell(tag, done, Of::Op);
                     continue;
                 }
                 Effect::Kill { tag } => {
@@ -2407,5 +2622,82 @@ mod tests {
         assert!(matches!(&seen[&Tag(3)], Done::Failed(_)));
         assert!(matches!(&seen[&Tag(4)], Done::Failed(_)));
         assert!(sim.dial(&at).is_err());
+    }
+
+    /// Runs `effects` on `sim` until idle: each one's end by its tag.
+    fn ran(sim: &mut Sim, mut effects: Vec<Effect>) -> BTreeMap<Tag, Done> {
+        let mut seen = BTreeMap::new();
+        run_until_idle(sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done));
+        seen
+    }
+
+    /// Two exclusive locks of a file contend and an unlock lets the next take it; shared locks
+    /// share and exclude an exclusive one, as another process's lock does; a lock asked under a
+    /// tag that holds one, and an unlock of a tag that holds none, fail; a crash lets every lock
+    /// go, another process's too.
+    #[test]
+    fn locks_exclude_as_flock_does_until_unlocked_or_a_crash() {
+        use LockMode::{Exclusive, Shared};
+        let mut sim = Sim::new(3, Faults::default());
+        let lock = name("history/lock");
+        let take = |mode, tag| Effect::Lock { file: lock.clone(), mode, tag: Tag(tag) };
+        let free = |lock, tag| Effect::Unlock { lock: Tag(lock), tag: Tag(tag) };
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 1)])[&Tag(1)], Done::Locked);
+        assert!(sim.exists(&lock), "a lock makes its file");
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 2)])[&Tag(2)], Done::Contended);
+        assert_eq!(ran(&mut sim, vec![take(Shared, 3)])[&Tag(3)], Done::Contended);
+        assert!(matches!(&ran(&mut sim, vec![take(Shared, 1)])[&Tag(1)], Done::Failed(_)));
+        assert_eq!(ran(&mut sim, vec![free(1, 4)])[&Tag(4)], Done::Unlocked);
+        assert!(matches!(&ran(&mut sim, vec![free(1, 5)])[&Tag(5)], Done::Failed(_)));
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 2)])[&Tag(2)], Done::Locked);
+        assert_eq!(ran(&mut sim, vec![free(2, 6)])[&Tag(6)], Done::Unlocked);
+        let seen = ran(&mut sim, vec![take(Shared, 7), take(Shared, 8)]);
+        assert_eq!((&seen[&Tag(7)], &seen[&Tag(8)]), (&Done::Locked, &Done::Locked));
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 9)])[&Tag(9)], Done::Contended);
+        sim.crash();
+        sim.hold_lock(&lock, Exclusive);
+        assert_eq!(ran(&mut sim, vec![take(Shared, 9)])[&Tag(9)], Done::Contended);
+        sim.release_lock(&lock);
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 9)])[&Tag(9)], Done::Locked);
+        sim.hold_lock(&lock, Shared);
+        sim.crash();
+        assert_eq!(ran(&mut sim, vec![take(Exclusive, 10)])[&Tag(10)], Done::Locked);
+    }
+
+    /// On a disk filled up, an append past the room keeps the part that fits, unsynced, and
+    /// fails naming ENOSPC; a whole-file write that does not fit leaves the file as it was; a
+    /// file outside the directory has room, and a crash gives the room back.
+    #[test]
+    fn a_full_disk_cuts_an_append_short_and_leaves_a_write_as_it_was() {
+        let mut sim = Sim::new(4, Faults::default());
+        let (log, head) = (name("history/log"), name("history/head"));
+        let write = |bytes: &[u8], tag| Effect::Write {
+            file: head.clone(),
+            bytes: bytes.to_vec(),
+            tag: Tag(tag),
+        };
+        let append = |bytes: &[u8], tag| Effect::Append {
+            file: log.clone(),
+            bytes: bytes.to_vec(),
+            tag: Tag(tag),
+        };
+        assert_eq!(ran(&mut sim, vec![write(b"old", 0)])[&Tag(0)], Done::Written);
+        sim.fill(name("history"), 5);
+        assert_eq!(ran(&mut sim, vec![append(b"abc", 1)])[&Tag(1)], Done::Appended);
+        let full = ran(&mut sim, vec![append(b"defg", 2)]);
+        assert!(
+            matches!(&full[&Tag(2)], Done::Failed(why)
+                if why.0 == "history/log: No space left on device (os error 28)"),
+            "{full:?}"
+        );
+        assert_eq!(sim.contents(&log), b"abcde");
+        assert!(matches!(&ran(&mut sim, vec![write(b"new", 3)])[&Tag(3)], Done::Failed(_)));
+        assert_eq!(sim.contents(&head), b"old");
+        let elsewhere =
+            Effect::Append { file: name("elsewhere"), bytes: b"fits".to_vec(), tag: Tag(4) };
+        assert_eq!(ran(&mut sim, vec![elsewhere])[&Tag(4)], Done::Appended);
+        sim.crash();
+        assert_eq!(ran(&mut sim, vec![write(b"new", 5)])[&Tag(5)], Done::Written);
+        assert_eq!(sim.contents(&head), b"new");
     }
 }

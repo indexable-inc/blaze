@@ -1731,6 +1731,8 @@ pub struct Uring {
     /// Made for the first [`Effect::Stamp`].
     stampers: Option<Stampers>,
     offload: Offload,
+    /// The file locks of [`Effect::Lock`], each taken as it is asked for.
+    locks: crate::locks::Locks,
     in_flight: usize,
 }
 
@@ -1790,6 +1792,7 @@ impl Uring {
             trees: Vec::with_capacity(SPARES),   // alloc: setup, once per driver.
             stampers: None,
             offload: Offload::new()?,
+            locks: crate::locks::Locks::new(),
             in_flight: 0,
         })
     }
@@ -2306,6 +2309,12 @@ impl Driver for Uring {
                     crate::threads::read_link(&self.root, &file).map(Some)
                 }
                 Effect::Remove { file, .. } => self.remove(tag, &file).map(|()| None),
+                // No io_uring op takes a lock, and `flock` without waiting is one call: here on
+                // the driver's thread, as a mode is set.
+                Effect::Lock { file, mode, .. } => {
+                    self.locks.lock(&self.root, &file, mode, tag).map(Some)
+                }
+                Effect::Unlock { lock, .. } => self.locks.unlock(lock).map(Some),
                 Effect::Watch { dir, .. } => self.watch(tag, dir, false).map(|()| None),
                 // Linux keeps no journal across a restart: the first batch says what of the
                 // cursor is lost, and the watch is live from its start.

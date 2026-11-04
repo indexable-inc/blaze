@@ -98,8 +98,12 @@ smallest run that still fails, and replays it exactly.
   random prefix of the later changes, the last of which may be torn. A whole-file write or rename
   that completed is kept whole.
 - Targeted faults: `fail_syncs`, `hold_syncs`/`release_held` (a commit that hangs), `slow_writes`,
-  `hold_lists`/`fail_lists`, `hold_sends`, `lose_changes`, and `record` to see the order
-  completions were told in.
+  `hold_lists`/`fail_lists`, `hold_sends`, `lose_changes`, `fill` (a full disk: appends and
+  writes under a directory past its room fail with ENOSPC, an append keeping the part that fit),
+  and `record` to see the order completions were told in.
+- A lock table for `Effect::Lock`/`Effect::Unlock` (flock's semantics, never waiting: a lock that
+  another excludes is `Done::Contended`), with `hold_lock`/`release_lock` for another process's
+  lock of a file; a crash lets every lock go, another process's too.
 - `program` for spawned processes (a memory limit kills, as a cgroup does), `dial`/`peer_*` for a
   peer outside the simulation.
 

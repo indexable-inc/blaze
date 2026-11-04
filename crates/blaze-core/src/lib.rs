@@ -62,6 +62,7 @@ mod journal;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code, reason = "the kqueue driver: kevent and the records it reads")]
 pub mod kqueue;
+mod locks;
 #[cfg(unix)]
 #[allow(unsafe_code, reason = "sockets: descriptors owned from raw and the calls std lacks")]
 mod net;
@@ -412,6 +413,25 @@ pub enum Effect {
         file: FileName,
         tag: Tag,
     },
+    /// The advisory lock of `file`, taken without waiting: completes with [`Done::Locked`] once
+    /// taken, or with [`Done::Contended`] when another holder has it in a way that excludes
+    /// `mode` (another process, or another lock this driver took of the same file), and then
+    /// nothing is held. The file is made if missing, with its directories, and opened to read
+    /// and write, never truncated. A lock taken is held until an [`Effect::Unlock`] of its tag,
+    /// or until the process ends: a crash lets every lock go. On Unix it is `flock`'s, on
+    /// Windows `LockFileEx`'s. A lock asked under a tag that holds one already fails, naming the
+    /// tag and the file. There is no lock that waits: a waiter retries on its own timer.
+    Lock {
+        file: FileName,
+        mode: LockMode,
+        tag: Tag,
+    },
+    /// The lock that [`Effect::Lock`] of tag `lock` took let go of, its file closed. Completes
+    /// with [`Done::Unlocked`]; a `lock` that holds nothing fails, naming it.
+    Unlock {
+        lock: Tag,
+        tag: Tag,
+    },
     /// Completes with [`Done::Changed`] each time files under `dir` change, until an
     /// [`Effect::Unwatch`] of the same tag, which ends it with [`Done::Unwatched`], or a
     /// [`Done::Failed`], which ends it too. It is in flight until it ends; an unwatch has no
@@ -555,6 +575,8 @@ impl Effect {
             | Effect::Stat { tag, .. }
             | Effect::Lstat { tag, .. }
             | Effect::Remove { tag, .. }
+            | Effect::Lock { tag, .. }
+            | Effect::Unlock { tag, .. }
             | Effect::Watch { tag, .. }
             | Effect::Journal { tag, .. }
             | Effect::Unwatch { tag }
@@ -573,6 +595,15 @@ impl Effect {
             | Effect::Hangup { tag, .. } => *tag,
         }
     }
+}
+
+/// How [`Effect::Lock`] takes a file's lock.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum LockMode {
+    /// Held with any number of other shared locks, and with no exclusive one.
+    Shared,
+    /// Held alone.
+    Exclusive,
 }
 
 /// Where [`Effect::Listen`] listens or [`Effect::Connect`] connects. A socket listened on is
@@ -803,6 +834,13 @@ pub enum Done {
     Linked,
     Stat(Option<Meta>),
     Removed,
+    /// Of an [`Effect::Lock`]: the lock is held.
+    Locked,
+    /// Of an [`Effect::Lock`]: another holder has the lock in a way that excludes the mode
+    /// asked, and nothing is held.
+    Contended,
+    /// Of an [`Effect::Unlock`]: the lock is let go of.
+    Unlocked,
     /// Files under a watched directory changed: each is named once, in no order. `lost` says
     /// the system dropped changes (its queue overflowed), so whoever watches must look at the
     /// whole directory again: the names are not all of them.

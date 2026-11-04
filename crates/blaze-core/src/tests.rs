@@ -157,6 +157,37 @@ fn the_native_driver_runs_the_shared_script_as_threads_does() {
     assert_eq!(script(&mut crate::native(&root, 2).unwrap()), threads);
 }
 
+/// Each step's end, one at a time: two exclusive locks of one file (the second contends, as
+/// another holder's does), the first let go of, the second asked again.
+fn locks(driver: &mut impl Driver) -> Vec<Done> {
+    let lock = name("history/lock");
+    let take =
+        |tag| Effect::Lock { file: lock.clone(), mode: crate::LockMode::Exclusive, tag: Tag(tag) };
+    let steps = [
+        take(1),
+        take(2),
+        Effect::Unlock { lock: Tag(1), tag: Tag(3) },
+        take(4),
+        Effect::Unlock { lock: Tag(4), tag: Tag(5) },
+    ];
+    let mut seen = Vec::new();
+    for step in steps {
+        run_until_idle(driver, &mut vec![step], |done, _| seen.push(done.done));
+    }
+    seen
+}
+
+/// A lock of a file excludes another of it, on the driver the build path makes as on threads,
+/// until it is let go of.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_lock_excludes_another_until_it_is_let_go_of() {
+    let want = vec![Done::Locked, Done::Contended, Done::Unlocked, Done::Locked, Done::Unlocked];
+    assert_eq!(locks(&mut Sim::new(1, Faults::default())), want, "simulated");
+    assert_eq!(locks(&mut Threads::new(&dir("locks-threads"), 1)), want, "threads");
+    assert_eq!(locks(&mut crate::native(&dir("locks-native"), 1).unwrap()), want, "native");
+}
+
 /// A time with nanoseconds below the second, and a whole number of NTFS's 100 ns, so every
 /// file system the tests run on keeps it exactly.
 const TIME: u64 = 1_700_000_000_123_456_700;

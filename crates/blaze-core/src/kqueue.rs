@@ -317,6 +317,8 @@ pub struct Kqueue {
     listen_tags: HashMap<Tag, ListenId, Global>,
     connecting: Slab<Connecting>,
     conns: Slab<Connection>,
+    /// The file locks of [`Effect::Lock`], each taken as it is asked for.
+    locks: crate::locks::Locks,
     in_flight: usize,
     /// What the watches' callbacks allocated beyond their payloads, as each watch stopped.
     #[cfg(test)]
@@ -401,6 +403,7 @@ impl Kqueue {
             listen_tags: tags(),
             connecting: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
             conns: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            locks: crate::locks::Locks::new(),
             in_flight: 0,
             #[cfg(test)]
             watch_overhead: 0,
@@ -477,6 +480,17 @@ impl Kqueue {
                     true => self.to_threads(effect),
                     false => self.backlog.push_back(effect),
                 }
+                Ok(())
+            }
+            // A lock never waits, so it is taken here rather than on the threads.
+            Effect::Lock { file, mode, tag } => {
+                let done = self.locks.lock(&self.root, &file, mode, tag)?;
+                self.ready.push(Completion { tag, done });
+                Ok(())
+            }
+            Effect::Unlock { lock, tag } => {
+                let done = self.locks.unlock(lock)?;
+                self.ready.push(Completion { tag, done });
                 Ok(())
             }
             Effect::Timer { after, tag } => {

@@ -586,6 +586,8 @@ pub struct Iocp {
     spawning: HashMap<Tag, SpawnId, Global>,
     conns: Slab<Connection>,
     entries: [OVERLAPPED_ENTRY; ENTRIES],
+    /// The file locks of [`Effect::Lock`], each taken as it is asked for.
+    locks: crate::locks::Locks,
     in_flight: usize,
     /// What the threads allocated doing their file effects.
     #[cfg(test)]
@@ -682,6 +684,7 @@ impl Iocp {
             conns: Slab::new(CONNS, MemTag::Io).map_err(mem)?,
             // SAFETY: all zeros is an entry of nothing, written over before it is read.
             entries: unsafe { std::mem::zeroed() },
+            locks: crate::locks::Locks::new(),
             in_flight: 0,
             #[cfg(test)]
             thread_allocations,
@@ -867,6 +870,18 @@ impl Iocp {
                     )
                 })?;
                 self.ready.push(Completion { tag, done: Done::Timed });
+                Ok(())
+            }
+            // `LockFileEx` without waiting is one call that never blocks: here, as a file's
+            // times are set.
+            Effect::Lock { file, mode, tag } => {
+                let done = self.locks.lock(&self.root, &file, mode, tag)?;
+                self.ready.push(Completion { tag, done });
+                Ok(())
+            }
+            Effect::Unlock { lock, tag } => {
+                let done = self.locks.unlock(lock)?;
+                self.ready.push(Completion { tag, done });
                 Ok(())
             }
             effect @ (Effect::Write { .. }
