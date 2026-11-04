@@ -18,11 +18,15 @@ use crate::span;
 /// `folded` rows a parent's site and site, and a span's self time is its duration less its
 /// children's rows and its `folded_ns`. A file of version 2 or older has no `folded_ns` column
 /// and folded nothing (no blaze before 3 turned folding on), so a null `folded_ns` reads as
-/// 0 and its spans' self time stays right. At 4: `events.message` is the message alone (it was
-/// the message, then each other field as `name=value`); an event's other fields are rows of
-/// `event_fields`, joined on `process` and `events.event_id`. A file of version 3 or older has no
+/// 0 and its spans' self time stays right. At 4: `provenance` is the query engine's run log
+/// (`blaze_query::db::take_log_in`), one row a run that was not a first and one an untracked read,
+/// with the read that changed (`cause_key`, `cause_kind`) or the untracked read's name (`what`)
+/// and the database view; its never-written `dur_ns`, `unit` and `crate` are gone, and
+/// `outcome` says `ran` or `untracked read` (no file before 4 has a `provenance` row). At 5: `events.message` is the message alone (it
+/// was the message, then each other field as `name=value`); an event's other fields are rows of
+/// `event_fields`, joined on `process` and `events.event_id`. A file of version 4 or older has no
 /// `event_id` and its fields are in its `message`.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// A version before [`VERSION`] whose files a reader reads as [`VERSION`]'s, and what reading
 /// them so takes.
@@ -33,17 +37,24 @@ pub struct Upgrade {
     pub how: &'static str,
 }
 
-/// Each older version a reader reads, oldest last, with no rewrite. 3 reads as 4: its `events`
+/// Each older version a reader reads, oldest last, with no rewrite. 4 reads as 5: its `events`
 /// have no `event_id`, which the views read through the table's schema file as null, and the
 /// loaders take a null `event_id` as an event with no `event_fields` rows; its fields stay in its
-/// `message` as `name=value`, as 3 wrote them. 2 reads as 4 as 3 does and also has no
-/// `folded_ns`, read as null, which every reader takes as 0, right as no blaze before 3 folded.
-/// 1 does not: its `spans.owner` and `switches.wait_value` name a job by its slot + 1, and its
-/// generation, which 2's `generation << 32 | slot` needs, was never written.
+/// `message` as `name=value`, as 4 wrote them. 3 reads as 5 as 4 does, and its `query_counts`
+/// have none of 4's `written` and `ran_*` columns, read as null (not counted, as each column
+/// says); it has no `provenance` row (no blaze before 4 wrote one) and no `key_parts`. 2 reads as
+/// 5 as 3 does and also has no `folded_ns`, read as null, which every reader takes as 0, right
+/// as no blaze before 3 folded. 1 does not: its `spans.owner` and `switches.wait_value` name a
+/// job by its slot + 1, and its generation, which 2's `generation << 32 | slot` needs, was never
+/// written.
 pub const UPGRADES: &[Upgrade] = &[
     Upgrade {
-        from: 3,
+        from: 4,
         how: "no `events.event_id` column: read through the schema file as null, an event with no `event_fields` rows; its fields stay in its `message`",
+    },
+    Upgrade {
+        from: 3,
+        how: "as 4, and no `query_counts` `written` or `ran_*` columns (read as null: not counted), no `provenance` rows and no `key_parts` table",
     },
     Upgrade {
         from: 2,
@@ -459,19 +470,62 @@ const STACK_PCS: Column = opt(
     "the stack's addresses, outermost first, one a frame of the unwind (an inlined function's frames in `stack` share one): the last is where the thread was, each other a return address, so the call is the address before it; null in rows of a blaze before it",
 );
 
-/// Each query of a build that was not a plain memo hit, and why.
+/// Why the query engine ran what it ran: its run log (`blaze_query::db::take_log_in`), taken as
+/// a build ends while the daemon keeps a history. One row a run that was not a first one (a
+/// first run is `query_counts.ran_new` alone: a cold build's every run is one), and one row the
+/// first untracked read of a run, sorted by query, key, view and cause. Verified rows are
+/// `query_counts.verified`, counted, not listed.
 pub const PROVENANCE: Table = Table {
     name: "provenance",
-    doc: "one row a query of a build that was verified or rerun, with the cause",
+    doc: "one row a query run that was not a first run, with why it ran, and one an untracked read a run made",
     columns: &[
-        col("build_id", Type::U64, "the build"),
-        col("query_key", Type::Utf8, "the query and its key"),
-        col("kind", Type::Dict, "the query's kind"),
-        col("outcome", Type::Dict, "verified, reran, or reran-same-output (an early cutoff)"),
-        opt("cause", Type::Utf8, "the input or query key whose change made it rerun"),
-        col("dur_ns", Type::I64, "how long verifying or running it took"),
-        opt("unit", Type::Utf8, "the codegen unit it was for"),
-        opt("crate", Type::Dict, "the crate it was of"),
+        col("build_id", Type::U64, "the build that ended when the log was taken"),
+        col(
+            "query_key",
+            Type::Utf8,
+            "the memo: its query and its key as the key's type shows it, `` `infer_query`(DefWithBodyId(FunctionId(..))) `` (its id where the key has no `Debug`), as `cause_key` names it where it is another run's cause",
+        ),
+        col("kind", Type::Dict, "the query, as `query_counts.query` names it"),
+        col("outcome", Type::Dict, "ran (a run of it), or untracked read (its run made a read the engine can't see)"),
+        opt(
+            "cause",
+            Type::Utf8,
+            "for ran: changed (a read changed since it last ran), evicted (its value was let go and asked for again), untracked (its last run made an untracked read) or cycle (a stale provisional row, or a verify that re-entered a cycle)",
+        ),
+        col("view", Type::U32, "the database view it ran in: each write of inputs opens one, so a build has one or more"),
+        opt(
+            "cause_key",
+            Type::Utf8,
+            "for changed: the read that changed: an input's or tracked struct's field as `` `Input.field`(<row>) ``, its row by name where the front end names it (a file's text by its path, `` `FileText.text`(/src/lib.rs) ``) else its id, or a memo as `query_key` names it, whose own row says why it changed",
+        ),
+        opt("cause_kind", Type::Dict, "what `cause_key` is: input, tracked or function"),
+        opt(
+            "what",
+            Type::Utf8,
+            "for untracked read: what was read and why it can't be a tracked read (`blaze_query::db::Untracked::what`)",
+        ),
+    ],
+};
+
+/// The parts of the key of each thing a build computed again (a unit, a build script's run,
+/// a codegen template), each by name with its hash: what `misses` explains against the last
+/// build, kept whole so two builds' keys (two homes, two shells) can be diffed part by part.
+pub const KEY_PARTS: Table = Table {
+    name: "key_parts",
+    doc: "one row a part of the key of a thing a build computed again (one row with no part for a key that exposes none)",
+    columns: &[
+        col("build_id", Type::U64, "the build that computed it"),
+        col("step", Type::Dict, "what was computed, as `misses.step`: `unit`, `build script run`, `codegen dev template`"),
+        col("item", Type::Utf8, "what of, as `misses.item`"),
+        col("key", Type::Utf8, "the whole key, in hex, as the store files it"),
+        opt("part", Type::Utf8, "the part's name: `the toolchain`, `settings`, `env CC`; null for a key that exposes no parts"),
+        opt("hash", Type::Utf8, "the part's hash, in hex; null when the key has no such part this time"),
+        opt("names", Type::Utf8, "the item the part is of, when another's (a dependency's unit): what a chain of reasons follows"),
+        opt(
+            "beyond",
+            Type::Utf8,
+            "what the value is filed under past its key that the parts do not explain (a unit's process variables, a build script's traced reads); null when nothing",
+        ),
     ],
 };
 
@@ -664,6 +718,15 @@ pub const QUERY_COUNTS: Table = Table {
         col("reads_recorded", Type::U64, "the reads its runs recorded, a row read again later in the same run included: over `reads_kept`, how often its runs re-read the same rows"),
         col("reads_kept", Type::U64, "the reads its runs' rows kept: each run's distinct reads, summed"),
         col("reads_most", Type::U64, "the most reads one of its runs held on its thread's query stack as it ended (the build's most, not a sum)"),
+        opt(
+            "written",
+            Type::U64,
+            "of an input: the times a setter wrote one of its fields, an equal value too (each opens a view): what the build changed, behind every run after it; null in files of a blaze before it",
+        ),
+        opt("ran_new", Type::U64, "of its runs, first runs (the row never ran in this database); null in files of a blaze before it"),
+        opt("ran_changed", Type::U64, "of its runs, those because a read changed since the row last ran (`provenance` names the read); null before it"),
+        opt("ran_untracked", Type::U64, "of its runs, those because the row's last run made an untracked read, so it runs in every view (`provenance` names the read); null before it"),
+        opt("ran_cycle", Type::U64, "of its runs, those for a cycle: a stale provisional row, or a verify that re-entered a cycle; null before it"),
     ],
 };
 
@@ -952,7 +1015,7 @@ pub const TEST_RUNS: Table = Table {
 };
 
 /// Every table the history and the live feed hold.
-pub const TABLES: [&Table; 28] = [
+pub const TABLES: [&Table; 29] = [
     &SPANS,
     &COUNTERS,
     &EVENTS,
@@ -981,6 +1044,7 @@ pub const TABLES: [&Table; 28] = [
     &PROCESSES,
     &TEST_RUNS,
     &IMAGES,
+    &KEY_PARTS,
 ];
 
 /// The tables that are results, made on request and not kept.

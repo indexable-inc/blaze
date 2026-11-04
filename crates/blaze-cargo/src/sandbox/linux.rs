@@ -3101,6 +3101,7 @@ for it in "$OUT"/*; do :; done
             live: dir.join("live"),
             report: dir.join("report"),
             not_inputs: vec!["/bin/sh".into()],
+            given: None,
         };
         assert_eq!(alone::launch(&spec), 0);
         let read = |it: &Path| std::fs::read_to_string(it).unwrap();

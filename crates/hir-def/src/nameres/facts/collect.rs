@@ -20,7 +20,7 @@ use hir_expand::{
     builtin::{find_builtin_attr, find_builtin_derive, find_builtin_macro},
     mod_path::{ModPath, PathKind},
     name::{AsName, Name},
-    proc_macro::{CustomProcMacroExpander, ProcMacros},
+    proc_macro::{CustomProcMacroExpander, ProcMacros, StateUse},
 };
 use intern::{Symbol, sym};
 use span::{Edition, FileAstId, ROOT_ERASED_FILE_AST_ID, SyntaxContext};
@@ -1088,12 +1088,15 @@ pub(crate) fn collect_expansion<'db, S: Sink<'db>, A: Allocator + Clone>(
         return;
     }
     sink.collecting_expansion(call);
-    let def = call.loc(db).def;
-    if let MacroDefKind::ProcMacro(_, exp, _) = def.kind
-        && exp.requires_session(db, def.krate)
+    // A call whose output may depend on its session's state runs again in each revision
+    // itself (its expansion's untracked read, `MacroCallId::expansion_state`), and keeps its
+    // value when it gives the same: this collection reads it as any other expansion and is
+    // reused while what it read is. The def map still says it used such a call, as an image of
+    // it would not run its calls, so a later query's calls (bodies) would start from another
+    // state. A stateless crate's call, or a shown call of a crate that settles, marks nothing.
+    if let MacroDefKind::ProcMacro(..) = call.loc(db).def.kind
+        && let StateUse::Session(_) = call.expansion_state(db)
     {
-        // Equal expansion output still has state changes to replay next revision.
-        blaze_query::db::report_untracked_read(db);
         sink.apply(DeclOp::SessionMacros);
     }
     let file_id: HirFileId = call.into();

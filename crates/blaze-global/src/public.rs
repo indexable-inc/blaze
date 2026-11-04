@@ -182,12 +182,25 @@ pub enum RunPart {
 /// A function instance and the crates its code and type arguments come from.
 #[derive(Clone, Debug)]
 pub struct FnSource {
+    /// The instance the link names it by (`blaze_codegen::backend::Described::code`).
     pub instance: Instance,
+    /// The code its template is kept under (`Described::template_code`): its code without the
+    /// key of the store it is written in where its template holds its positions by table
+    /// (docs/v2/plan/design/name-free-identity.md), else `instance.code`.
+    pub template_code: blaze_items::CodeHash,
     /// The crate of the item its code hash is of.
     pub code: Origin,
     /// The crates of the facts of its type arguments: the types' crates, the toolchain for
     /// primitives.
     pub args: Vec<Origin>,
+}
+
+impl FnSource {
+    /// The instance its template is kept under, as the driver's `FnNode::template_instance`
+    /// gives `dev_template_key` and `release_template_key`.
+    pub fn template_instance(&self) -> Instance {
+        Instance { code: self.template_code, ..self.instance }
+    }
 }
 
 /// An LLVM-optimized function as the release driver keeps it: under
@@ -506,7 +519,7 @@ impl Rule {
         let imported_units: Vec<InstanceKey> = made.imported.iter().map(|it| it.instance.key()).collect();
         let (_, key) = with_keys(made.built_in, |built_in| {
             blaze_codegen::driver::release_template_key(
-                &made.function.instance,
+                &made.function.template_instance(),
                 built_in,
                 made.refs,
                 made.imports,
@@ -600,7 +613,7 @@ impl Rule {
     pub fn dev_function(&self, made: &DevFunctionMade<'_>) -> Result<Public, Private> {
         let spec = made.spec;
         let key = with_keys(made.built_in, |built_in| {
-            blaze_codegen::driver::dev_template_key(&made.function.instance, built_in, made.refs, &spec.toolchain.id)
+            blaze_codegen::driver::dev_template_key(&made.function.template_instance(), built_in, made.refs, &spec.toolchain.id)
         });
         let private = |why: String| Private { key, why };
         ascending(made.built_in).map_err(private)?;
@@ -1149,6 +1162,7 @@ mod tests {
     fn source(n: u8, settings: Settings, code: Origin) -> FnSource {
         FnSource {
             instance: Instance { code: CodeHash(ContentId([n; 32])), args: ContentId([n + 1; 32]), settings },
+            template_code: CodeHash(ContentId([n; 32])),
             code,
             args: vec![Origin::Toolchain(TOOLCHAIN)],
         }

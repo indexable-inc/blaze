@@ -266,6 +266,11 @@ fn bad_bytes_are_refused_naming_what_is_wrong() {
     let bytes = history.encode();
     let decode = |bytes: &[u8]| History::decode(bytes, config(64)).map(|_| ());
     assert_eq!(decode(b"blzhis00"), Err(DecodeError::Version));
+    // Peaks learned before tasks had memory accounts (the job's own count, a whole process's
+    // high-water mark) are not trusted: refused as another version, never read.
+    let mut older = bytes.clone();
+    older[..8].copy_from_slice(b"blzhis02");
+    assert_eq!(decode(&older), Err(DecodeError::Version));
     assert_eq!(decode(&bytes[..12]), Err(DecodeError::Short { at: 8 }));
     assert!(matches!(decode(&bytes[..bytes.len() - 1]), Err(DecodeError::Length { .. })));
     let mut longer = bytes.clone();

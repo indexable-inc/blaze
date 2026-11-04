@@ -2328,6 +2328,13 @@ pub(crate) fn open_said(site: u16, said: &Said) -> u64 {
     id
 }
 
+/// Makes a span of `site` beginning now, its columns `said`, under no span and entered on no
+/// thread's stack ([`crate::span::Detached`]): its id, for [`closed`] on whichever thread its
+/// wait ends on, which writes its row there.
+pub(crate) fn open_detached(site: u16, said: &Said) -> u64 {
+    began(site, Some(0), said)
+}
+
 /// Makes a span of `site` beginning now on this thread, its columns `said`, under `parent`
 /// (`Some(0)`: a root), or under the innermost span the thread is inside when `None`.
 #[inline]
@@ -2718,8 +2725,9 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
 /// typed column (129.9 M) sum to about 1.1 M rows a thread, parent and name each
 /// [`FOLD_AGE`], so the spans table goes from 153.9 M rows to about 25 M (6x fewer). Their
 /// self CPU is small beside the build's: 88 s under 5 us and 823 s under 100 us, of 16,407 s.
-/// No reader looks at one span this short: `blaze slow` reads spans of 10 ms and longer on
-/// that build ([`crate::time::load::SPAN_BUDGET`]). Waits fold only below
+/// No reader looks at one span this short: `blaze slow` reads that build's spans of 200 us and
+/// longer, and the shorter ones only on its critical path's lanes
+/// ([`crate::time::load::SPAN_BUDGET`]). Waits fold only below
 /// [`WAIT_FOLD_BELOW`].
 pub const FOLD_BELOW: Duration = Duration::from_micros(20);
 
@@ -3688,7 +3696,6 @@ pub struct ThreadNow {
 /// may show a span it just left; the stall watchdog reads threads that do not move.
 pub fn threads_now() -> Vec<ThreadNow> {
     let scale = clock::Scale::now();
-    let now = clock::ticks();
     // clone: the list of rings, so none is read under the lock threads take to start
     let rings = lock(&RINGS).clone();
     // alloc: a dump, on demand
@@ -3706,10 +3713,15 @@ pub fn threads_now() -> Vec<ThreadNow> {
             .filter_map(|&id| {
                 let opened = by_number(ring_of(id))?.opened(id)?;
                 let meta = meta(opened.site)?;
+                // Read after the span's start, not once before the walk: a span its thread
+                // opened while the walk read the rings before it started after such a reading,
+                // and `now - start` wrapped to 2^64 ticks, said as 9223372036.9 s. A start past
+                // the reading (another core's counter a tick ahead) is a span just begun.
+                let now = clock::ticks();
                 Some(OpenSpan {
                     name: meta.name(),
                     target: meta.target(),
-                    for_ns: scale.ns(now.wrapping_sub(opened.start)),
+                    for_ns: scale.ns(now.saturating_sub(opened.start)),
                     krate: self::name((opened.of >> 32) as Sym),
                     function: self::name(opened.of as Sym),
                     unit: self::name(opened.unit as Sym),

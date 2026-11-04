@@ -14,20 +14,24 @@
 //! [`manifest`]): each table's files, by name, each with an entry saying its schema version,
 //! rows, and the builds, instants and boot its rows span ([`manifest::Entry`]), so a reader of
 //! one build reads only the files that can hold its rows ([`manifest::Scope::Build`]) and a
-//! file of a version this blaze can't read is refused, naming it ([`schema::readable`]). Every reader reads exactly the files it lists
+//! file of a version this blaze can't read is refused, naming it ([`schema::readable`]).
+//! Every reader reads exactly the files it lists
 //! (the views are given them as an explicit list, [`crate::views::prelude`]); a file in the
 //! directory it does not list is not part of the history. Each change is one rewrite of the
 //! manifest, to a hidden name and then renamed over it, under its lock: a flush writes its
-//! files, then lists them; a merge writes its output, then lists it and unlists its inputs in
-//! one commit, then deletes them; the cap unlists the oldest files, then deletes them. So a
-//! reader never reads a merge's rows twice or half of them, and a crash leaves at worst files
-//! the manifest does not list, which the next [`History::open`] deletes. Beside them,
+//! files, then lists them; a merge writes its output, then lists it and retires its inputs in
+//! one commit; the cap retires the oldest files. So a reader never reads a merge's rows twice
+//! or half of them, and a crash leaves at worst files the manifest neither lists nor retires,
+//! which the next [`History::open`] deletes. A retired file is unlisted at once and deleted
+//! only once no reader's [`Pin`] can still read it ([`retire`], [`History::reap`]): a reader
+//! pins the history before it reads the manifest and holds the pin until its last read of the
+//! files it lists has ended, so none is deleted under it. Beside them,
 //! `schema.<table>.parquet` holds no rows and every column of each table, and heads each
 //! view's list, so each view resolves even before a table has rows, with today's columns.
 //!
 //! Each file is made in memory, in a buffer kept across flushes, and written with one `write`
 //! to a hidden name, then renamed, so DuckDB never reads half a file. Past [`CAP_BYTES`] (or the
-//! cap the history is opened with), the oldest builds are deleted first, each whole: every
+//! cap the history is opened with), the oldest builds are retired first, each whole: every
 //! table and flush of a build at once, so a reader of a build reads all of it or none
 //! ([`History::trim`]).
 //!
@@ -46,6 +50,9 @@
 //! Until 2026-11-04 readers globbed `*.<table>.parquet`, and a glob between a merge's rename
 //! and its deletes counted the merged rows twice; a directory of that time, with no manifest,
 //! has one made of its files on first open ([`manifest`]).
+//! Until 2026-11-04 a merge also deleted its inputs at once, and a `blaze slow` racing it
+//! failed on DuckDB's "Cannot open file"; its inputs are retired now, deleted once no pin
+//! holds them.
 //!
 //! What a reader sees is what the history committed: rows the drain took and no flush has
 //! written yet are in no file. A reader that asks for everything recorded so far asks the
@@ -105,7 +112,7 @@ use crate::{
     batches::{self, Process},
     clock, crash,
     errors::{self, ErrorRow},
-    facts::{self, CrateDepRow, LinkRow, MissRow, ProcessRow, QueryCountRow, TestRunRow},
+    facts::{self, CrateDepRow, KeyPartRow, LinkRow, MissRow, ProcessRow, ProvenanceRow, QueryCountRow, TestRunRow},
     flight::{self, CounterRow, Cursor, Plot, Read, SpanRow},
     identity, logs, panics,
     sampler::{self, Sample},
@@ -115,9 +122,13 @@ use crate::{
 
 pub(crate) mod compact;
 pub mod manifest;
+mod pin;
+pub(crate) mod retire;
 
 use compact::Name;
 pub use manifest::Manifest;
+pub use pin::Pin;
+pub use retire::PINS;
 
 /// What the history keeps by default: 4 GiB, about 400 million rows at the ~10 bytes a row
 /// takes compressed. A self-build's `check` and `build` wrote about 1 GiB together with every
@@ -323,6 +334,8 @@ pub struct Flushed {
     pub test_runs: usize,
     /// Rows clients sent ([`History::client_rows`]), of every table.
     pub client: usize,
+    pub key_parts: usize,
+    pub provenance: usize,
     /// Spans the threads were inside as the flush read them.
     pub open: usize,
     pub folded: usize,
@@ -330,9 +343,10 @@ pub struct Flushed {
     pub bytes: u64,
     /// Rows the rings wrote over before this flush read them, CPU samples included.
     pub skipped: u64,
-    /// Old files deleted to stay under the cap.
+    /// Old files retired to stay under the cap (deleted once no reader pins them).
     pub deleted: u32,
-    /// Files merged into others, and deleted, after the flush.
+    /// Files merged into others, and retired, after the flush (deleted once no reader pins
+    /// them).
     pub merged: u32,
     /// Files those merges made.
     pub compacted: u32,
@@ -488,7 +502,7 @@ fn properties(table: &Table) -> WriterProperties {
     it.build()
 }
 
-fn table_at(table: &Table) -> usize {
+pub(crate) fn table_at(table: &Table) -> usize {
     match schema::TABLES.iter().position(|it| it.name == table.name) {
         Some(at) => at,
         None => unreachable!("{} is a table of the history", table.name),
@@ -565,7 +579,7 @@ impl Writer {
     }
 }
 
-/// The empty file of `table` in the history `dir`, which every view's glob matches, so a view
+/// The empty file of `table` in the history `dir`, which every view reads, so a view
 /// of a table no file has rows for reads as empty instead of failing.
 fn schema_file(dir: &Path, table: &Table) -> PathBuf {
     // alloc: a file's name, once a table
@@ -719,7 +733,7 @@ pub fn builds(rows: &[BuildRow], pid: u32) -> Result<RecordBatch, ArrowError> {
     RecordBatch::try_new(batches::schema_of(&schema::BUILDS), columns)
 }
 
-/// A file of the history the cap counts: written by a flush or a merge, deleted oldest first
+/// A file of the history the cap counts: written by a flush or a merge, retired oldest first
 /// (by the last flush it holds rows of, `name.last`).
 struct Kept {
     name: Name,
@@ -903,6 +917,10 @@ pub struct History {
     /// Clients' times of builds that had not ended as they came, by build: given to its row
     /// as it ends. At most [`RECENT_BUILDS`], oldest dropped.
     pending_clients: VecDeque<(u64, (i64, i64))>,
+    /// The parts of the keys of what builds computed again, since the last flush.
+    key_parts: Vec<KeyPartRow>,
+    /// The query engine's run log at each build's end, since the last flush.
+    provenance: Vec<ProvenanceRow>,
     /// The files written, oldest first, and their bytes all told.
     kept: VecDeque<Kept>,
     total: u64,
@@ -946,12 +964,16 @@ pub struct History {
     /// and the last flush wrote: a history that drops so deletes the mapping.
     persisted: bool,
     clean: bool,
+    /// The manifest may name retired files still on disk: set as this history retires files,
+    /// or opens on a manifest that names some, so a flush that retired nothing takes no look
+    /// at the manifest for [`History::reap`].
+    reaping: bool,
 }
 
 /// The files of the history `dir` as its open finds them, under the manifest's lock: what a
 /// crash left is deleted (each hidden file a write left half done, and each file of a form blaze
-/// writes that the manifest does not list: a merge's output not yet committed, a merge's inputs
-/// or a capped file committed away and not yet deleted), and a file the manifest lists that is
+/// writes that the manifest neither lists nor retires: a merge's output not yet committed), a
+/// retired file is left for [`History::reap`], and a file the manifest lists that is
 /// not there is [`manifest::ManifestError::Missing`]. A directory with no manifest has one made
 /// of its files first ([`manifest::hold`]). The files the cap counts (the manifest's flushes',
 /// merges' and derived tables', oldest first; not a perf run's), the highest build they are
@@ -979,6 +1001,8 @@ fn sweep(dir: &Path) -> Result<(VecDeque<Kept>, u64, u64), HistoryError> {
                 // alloc: a file's name, once a history
                 present.insert(name.to_owned());
             }
+            // Retired and not yet deleted: a reader's pin may hold it ([`History::reap`]).
+            manifest::Kind::Listable if held.manifest().retired().holds(name) => {}
             manifest::Kind::Listable => match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -1024,7 +1048,8 @@ fn sweep(dir: &Path) -> Result<(VecDeque<Kept>, u64, u64), HistoryError> {
 impl History {
     /// The history in `dir`, made if it isn't there, holding at most `cap` bytes of files. Its
     /// first flush takes everything the rings still hold. A flush's number continues from the
-    /// manifest's; what a crash left is deleted ([`sweep`]). Its flushes
+    /// manifest's; what a crash left is deleted ([`sweep`]), and the retired files no reader's
+    /// pin holds ([`History::reap`]). Its flushes
     /// read CPU samples from `sampler`: the process's ring ([`sampler::process`]) in a daemon,
     /// a ring of a test's own in a test, so what a test's flush writes never depends on a
     /// sampler that something else in its process started.
@@ -1106,6 +1131,10 @@ impl History {
             recent: VecDeque::with_capacity(RECENT_BUILDS),
             // alloc: once a history
             pending_clients: VecDeque::new(),
+            // alloc: once a history
+            key_parts: Vec::new(),
+            // alloc: once a history
+            provenance: Vec::new(),
             kept: kept.into(),
             total,
             side: side_bytes(dir),
@@ -1129,8 +1158,11 @@ impl History {
             postmortem,
             persisted: false,
             clean: false,
+            // The first reap looks: a manifest a crash left may name retired files.
+            reaping: true,
         };
         history.trim()?;
+        history.reap()?;
         Ok(history)
     }
 
@@ -1320,11 +1352,24 @@ impl History {
         self.misses.extend(rows);
     }
 
+    /// Notes the parts of the key of each thing a build computed again, for the next flush to
+    /// write.
+    pub fn keyed(&mut self, rows: impl IntoIterator<Item = KeyPartRow>) {
+        self.key_parts.extend(rows);
+    }
+
+    /// Notes the query engine's run log as a build ended (why each run ran), for the next
+    /// flush to write.
+    pub fn ran(&mut self, rows: impl IntoIterator<Item = ProvenanceRow>) {
+        self.provenance.extend(rows);
+    }
+
     /// Writes what the rings hold that is new since the last flush, and the builds that ended
     /// since, one file a table with rows, named for the highest build any of its rows is of and
     /// never below `build` (`None`: the timer's flush, named 0 when it holds no build's rows).
     /// Then merges files this history wrote ([`Flushed::merged`]; each table of `build` into one
-    /// file when `build` is given, as its build ends) and deletes the oldest files past the cap.
+    /// file when `build` is given, as its build ends) and retires the oldest files past the cap,
+    /// then deletes the retired files no reader pins.
     /// A failed write is an error naming the file; the rows it held are not written again. A
     /// failed merge is an error after the flush's own files are written.
     pub fn flush(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
@@ -1477,6 +1522,8 @@ impl History {
         let query_counts =
             [facts::query_counts(&self.query_counts).map_err(arrow_error(&schema::QUERY_COUNTS))?];
         let misses = [facts::misses(&self.misses).map_err(arrow_error(&schema::MISSES))?];
+        let key_parts = [facts::key_parts(&self.key_parts).map_err(arrow_error(&schema::KEY_PARTS))?];
+        let provenance = [facts::provenance(&self.provenance).map_err(arrow_error(&schema::PROVENANCE))?];
         let switches =
             [batches::switches(&self.read.switches, self.process).map_err(arrow_error(&schema::SWITCHES))?];
         let mut events = vec![batches::events(&self.read.events, self.process).map_err(arrow_error(&schema::EVENTS))?]; // alloc: as `spans`
@@ -1531,6 +1578,8 @@ impl History {
             crate_deps: rows(&crate_deps),
             query_counts: rows(&query_counts),
             misses: rows(&misses),
+            key_parts: rows(&key_parts),
+            provenance: rows(&provenance),
             open: rows(&open),
             folded: rows(&folded),
             panics: rows(&panics),
@@ -1543,7 +1592,7 @@ impl History {
         let build = named;
         flushed.build = build;
         self.last_build = self.last_build.max(build);
-        let tables: [(&'static Table, &[RecordBatch]); 18] = [
+        let tables: [(&'static Table, &[RecordBatch]); 20] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
@@ -1555,6 +1604,8 @@ impl History {
             (&schema::CRATE_DEPS, &crate_deps),
             (&schema::QUERY_COUNTS, &query_counts),
             (&schema::MISSES, &misses),
+            (&schema::KEY_PARTS, &key_parts),
+            (&schema::PROVENANCE, &provenance),
             (&schema::OPEN, &open),
             (&schema::FOLDED, &folded),
             (&schema::PANICS, &panics),
@@ -1622,9 +1673,16 @@ impl History {
         self.processes.clear();
         self.test_runs.clear();
         self.client_build = 0;
+        self.key_parts.clear();
+        self.provenance.clear();
         let compacted = self.compact(ended, &mut flushed);
-        flushed.deleted = self.trim()?;
+        let trimmed = self.trim().map(|it| flushed.deleted = it);
+        // After every retirement is committed, so a reader either read the manifest that
+        // retired a file or pins it.
+        let reaped = self.reap();
         compacted?;
+        trimmed?;
+        reaped?;
         let postmortem = self.postmortem.take().or_else(|| flight::postmortem::failed().map(HistoryError::Postmortem));
         if let Some(error) = postmortem {
             return Err(error);
@@ -1637,9 +1695,9 @@ impl History {
 
     /// Merges the files this history wrote since it opened as [`compact::plan`] says, `ended`
     /// the build whose end this flush is for, counting the files merged and made in `flushed`.
-    /// Each merge's output is renamed into place, then listed in place of its inputs in one
-    /// commit of the manifest, then its inputs are deleted; a merge that fails leaves every
-    /// input listed and ends the compaction.
+    /// Each merge's output is renamed into place, then listed in one commit of the manifest that
+    /// retires its inputs (deleted once no pin holds them, [`History::reap`]); a merge that
+    /// fails leaves every input listed and ends the compaction.
     fn compact(&mut self, ended: Option<u64>, flushed: &mut Flushed) -> Result<(), HistoryError> {
         // alloc: once a flush
         let ours: Vec<usize> = (0..self.kept.len()).filter(|&at| self.kept[at].ours).collect();
@@ -1673,50 +1731,67 @@ impl History {
                     doing: "taking the entries of its inputs, of which the history keeps none",
                     error: CompactError::SchemaDiffers,
                 })?;
-            // The commit point: the output listed and its inputs unlisted at once, so a reader
+            // The commit point: the output listed and its inputs retired at once, so a reader
             // reads the rows once. A commit that fails leaves the output unlisted, which the
             // next open deletes, and every input listed.
             let mut held = manifest::hold(&self.dir)?;
             // clone: a file's entry, once a merge
             held.add(name_of(&path), entry.clone())?;
-            for input in &job.inputs {
-                held.remove(name_of(input));
-            }
+            held.retire(job.inputs.iter().map(|it| name_of(it)));
+            self.reaping = true;
             held.commit()?;
             drop(held);
-            let mut gone = 0;
+            let mut bytes_gone = 0;
             self.kept.retain(|it| {
                 let merged = job.inputs.contains(&it.path);
                 if merged {
-                    gone += it.bytes;
+                    bytes_gone += it.bytes;
                 }
                 !merged
             });
-            self.total -= gone;
+            self.total -= bytes_gone;
             let at = self.kept.partition_point(|it| it.name.last <= job.output.last);
-            // clone: a file's path, once a merge
-            self.kept.insert(at, Kept { name: job.output, bytes, path: path.clone(), entry, ours: true });
+            self.kept.insert(at, Kept { name: job.output, bytes, path, entry, ours: true });
             self.total += bytes;
             flushed.compacted += 1;
-            for input in &job.inputs {
-                match fs::remove_file(input) {
-                    Ok(()) => {}
-                    // Gone already, as the merge wants it.
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(HistoryError::Compact {
-                            output: path,
-                            // clone: an error
-                            file: input.clone(),
-                            doing: "deleting a merged input",
-                            error: CompactError::Io(error),
-                        });
-                    }
-                }
-                flushed.merged += 1;
-            }
+            flushed.merged += u32::try_from(job.inputs.len()).unwrap_or(u32::MAX);
         }
         Ok(())
+    }
+
+    /// Deletes the retired files no reader's pin holds, then commits that they are gone: how
+    /// many. Called only once every retirement is committed, so a reader either read the
+    /// manifest that retired a file or holds it with its pin ([`retire`]). A file is deleted
+    /// before the manifest stops naming it, so a crash between leaves a name the next reap
+    /// finds gone.
+    fn reap(&mut self) -> Result<u32, HistoryError> {
+        if !self.reaping {
+            return Ok(0);
+        }
+        let mut held = manifest::hold(&self.dir)?;
+        if held.manifest().retired().files.is_empty() {
+            self.reaping = false;
+            return Ok(0);
+        }
+        let _span = tracing::info_span!(target: "blaze", "profile reap").entered();
+        let pins = pin::pinned(&self.dir)?;
+        let reapable = held.manifest().retired().reapable(&pins);
+        if reapable.is_empty() {
+            return Ok(0);
+        }
+        for &at in &reapable {
+            let path = self.dir.join(&held.manifest().retired().files[at].0);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                // Gone already (a crash after the delete, before the commit), as it should be.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(&path, "deleting a retired file no reader pins")(error)),
+            }
+        }
+        held.reaped(&reapable);
+        held.commit()?;
+        self.reaping = !held.manifest().retired().files.is_empty();
+        Ok(u32::try_from(reapable.len()).unwrap_or(u32::MAX))
     }
 
     /// The build a flush's files are named for: the highest build any of its rows is of, and
@@ -1736,6 +1811,8 @@ impl History {
             self.processes.iter().map(|it| it.build_id).max(),
             self.test_runs.iter().map(|it| it.build_id).max(),
             Some(self.client_build),
+            self.key_parts.iter().map(|it| it.build_id).max(),
+            self.provenance.iter().map(|it| it.build_id).max(),
         ];
         facts.into_iter().flatten().fold(build.unwrap_or(0).max(self.read.highest_build()), u64::max)
     }
@@ -1751,11 +1828,12 @@ impl History {
         batches::samples(&self.samples, &frames, (Instant::now(), clock::mono_ns()), self.process)
     }
 
-    /// Deletes the oldest builds until the rest fit under the cap: a build's files go all at
+    /// Retires the oldest builds until the rest fit under the cap: a build's files go all at
     /// once, every table of it, never one table of a build, so a reader of a build reads all of
     /// it or none. The files of no build (named 0: flushes of an idle daemon) go one at a time.
-    /// A build is as old as its newest file's flush; the newest flush's build is kept. Unlisted
-    /// in one commit of the manifest, then deleted.
+    /// A build is as old as its newest file's flush; the newest flush's build is kept. Retired
+    /// in one commit of the manifest: deleted once no pin holds them ([`History::reap`]). How
+    /// many.
     fn trim(&mut self) -> Result<u32, HistoryError> {
         // The mappings and crash records take their room first; the Parquet files the rest.
         let cap = self.cap.saturating_sub(self.side);
@@ -1796,45 +1874,23 @@ impl History {
             gone.contains(&(kept.name.build, (kept.name.build == 0).then_some(at)))
         };
         let mut held = manifest::hold(&self.dir)?;
-        for (at, kept) in self.kept.iter().enumerate() {
-            if goes(at, kept) {
-                held.remove(name_of(&kept.path));
-            }
-        }
+        held.retire(self.kept.iter().enumerate().filter(|&(at, kept)| goes(at, kept)).map(|(_, kept)| name_of(&kept.path)));
+        self.reaping = true;
         held.commit()?;
         drop(held);
-        // alloc: once a flush past the cap
-        let mut left = VecDeque::with_capacity(self.kept.len());
-        let mut deleted = 0u32;
-        let mut failed = None;
-        for (at, kept) in std::mem::take(&mut self.kept).into_iter().enumerate() {
-            if !goes(at, &kept) {
-                left.push_back(kept);
-                continue;
+        let before = self.kept.len();
+        let mut at = 0;
+        let mut bytes = 0;
+        self.kept.retain(|kept| {
+            let retired = goes(at, kept);
+            at += 1;
+            if retired {
+                bytes += kept.bytes;
             }
-            match fs::remove_file(&kept.path) {
-                Ok(()) => {}
-                // Gone already, as the cap wants it.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                // Unlisted: no reader reads it, and the next open deletes it. The first failure
-                // is said once every file is tried.
-                Err(error) => {
-                    failed.get_or_insert(HistoryError::Io {
-                        // clone: an error
-                        path: kept.path.clone(),
-                        doing: "deleting a file of the oldest build past the history's cap",
-                        error,
-                    });
-                }
-            }
-            self.total -= kept.bytes;
-            deleted = deleted.saturating_add(1);
-        }
-        self.kept = left;
-        match failed {
-            Some(error) => Err(error),
-            None => Ok(deleted),
-        }
+            !retired
+        });
+        self.total -= bytes;
+        Ok(u32::try_from(before - self.kept.len()).unwrap_or(u32::MAX))
     }
 }
 
@@ -2490,6 +2546,11 @@ mod tests {
             reads_recorded: 6,
             reads_kept: 7,
             reads_most: 8,
+            written: 9,
+            ran_new: 10,
+            ran_changed: 11,
+            ran_untracked: 12,
+            ran_cycle: 13,
         };
         history.query_counted([mir, QueryCountRow { query: "infer_body_query", executed: 7566, ..mir }]);
         let flushed = history.flush(Some(63)).unwrap();
@@ -2513,10 +2574,15 @@ mod tests {
                 "dropped",
                 "reads_recorded",
                 "reads_kept",
-                "reads_most"
+                "reads_most",
+                "written",
+                "ran_new",
+                "ran_changed",
+                "ran_untracked",
+                "ran_cycle"
             ]
             .map(|it| count(it, 0)),
-            [63, 6384, 10, 2, 3, 4, 5, 6, 7, 8],
+            [63, 6384, 10, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
             "each count in its own column"
         );
         assert_eq!(count("executed", 1), 7566);
@@ -2749,9 +2815,9 @@ mod tests {
         assert!(history.seq > ended.seq, "the next flush numbers past the manifest's");
     }
 
-    /// A merge committed (its output listed, its inputs unlisted) and crashed before its
+    /// A merge committed (its output listed, its inputs retired) and crashed before its
     /// inputs were deleted reads each row once, before the commit, after it, and after the
-    /// reopen that deletes the inputs.
+    /// reopen that deletes the inputs, which no pin holds.
     #[test]
     fn a_merge_committed_and_not_deleted_reads_each_row_once() {
         let dir = scratch("merged-not-deleted");
@@ -2774,18 +2840,48 @@ mod tests {
         let mut held = manifest::hold(&dir).unwrap();
         let entries: Vec<manifest::Entry> = inputs.iter().map(|it| held.manifest().entry(name_of(it)).unwrap().clone()).collect();
         held.add(name_of(&path), manifest::Entry::merged(&entries).unwrap()).unwrap();
-        for it in &inputs {
-            held.remove(name_of(it));
-        }
+        held.retire(inputs.iter().map(|it| name_of(it)));
         held.commit().unwrap();
         drop(held);
         assert!(inputs.iter().all(|it| it.exists()), "the crash left the inputs");
         assert_eq!(listed_rows(&dir, &schema::BUILDS), 2, "the inputs are unlisted, so read once");
 
         drop(History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap());
-        assert!(inputs.iter().all(|it| !it.exists()), "the open deletes what the manifest does not list");
+        assert!(inputs.iter().all(|it| !it.exists()), "the open deletes the retired files no pin holds");
         assert!(path.exists());
+        assert!(manifest::read(&dir).unwrap().retired().files.is_empty(), "and forgets them");
         assert_eq!(listed_rows(&dir, &schema::BUILDS), 2);
+    }
+
+    /// A reader's pin keeps the files the manifest it read lists on disk while the cap (or a
+    /// merge) retires them; they go at the first flush after the pin drops.
+    #[test]
+    fn a_pinned_reader_keeps_retired_files_until_it_lets_go() {
+        let dir = scratch("pinned-merge");
+        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        history.flush(None).unwrap();
+        history.build_ended(row(5, Outcome::Running));
+        history.flush(None).unwrap();
+        let pin = Pin::take(&dir).unwrap();
+        let read: Vec<String> = pin.manifest().files(schema::BUILDS.name).map(str::to_owned).collect();
+        assert!(!read.is_empty());
+        let next = u64::from(history.next_build());
+        history.build_ended(row(next, Outcome::Ok));
+        // Past the cap, the older builds' files the pin read are retired, not deleted.
+        history.cap = 1;
+        history.flush(Some(next)).unwrap();
+        let now = manifest::read(&dir).unwrap();
+        assert!(read.iter().any(|it| now.retired().holds(it)), "the cap retired a file the pin read");
+        for name in &read {
+            assert!(dir.join(name).exists(), "{name} was deleted under a pinned reader");
+        }
+        drop(pin);
+        history.flush(None).unwrap();
+        let after = manifest::read(&dir).unwrap();
+        for (name, _) in &now.retired().files {
+            assert!(!dir.join(name).exists(), "{name} stayed after the last pin let go");
+        }
+        assert!(after.retired().files.is_empty());
     }
 
     /// A history from before manifests gets one made of its files, written once by its next

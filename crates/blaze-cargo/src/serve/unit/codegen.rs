@@ -1885,6 +1885,12 @@ fn relink(
         }
         None => (Vec::new(), None),
     };
+    // The copy a run starts a dev executable from when it is not `path` (cargo's `executable`,
+    // [`super::artifact::executable`]): its program is held under it too.
+    let runs_from = match linked.output.dev_run {
+        Some(_) => super::artifact::uplifted(path, job.plan(unit).map_err(|it| it.what)?),
+        None => None,
+    };
     let made = linked.image.stage(change).map_err(|error| LinkCause::Linker { step: LinkStep::Stage, error }).and_then(|staged| {
         let laid = match staged.full() {
             true => Laid::Whole,
@@ -1895,6 +1901,7 @@ fn relink(
             Some(dev_run) => super::run::inproc::commit(
                 &job.shared.dev_runs,
                 path,
+                runs_from,
                 &mut linked.image,
                 &mut linked.loaded,
                 staged,

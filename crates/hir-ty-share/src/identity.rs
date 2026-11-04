@@ -341,17 +341,20 @@ impl<'db> Spell<'db> {
             TyKind::Coroutine(id, args) => {
                 self.u8(19);
                 self.key(key::coroutine_key(db, id.0));
-                let code = match is_by_move_coroutine(db, id.0, args.as_coroutine()) {
+                let by_move = is_by_move_coroutine(db, id.0, args.as_coroutine());
+                let code = match by_move {
                     true => code::of_coroutine_by_move(db, id.0),
                     false => code::of_coroutine(db, id.0),
                 };
                 self.id(code.as_ref().map_err(Clone::clone)?);
+                self.id(&code::coroutine_names(db, id.0, by_move)?);
                 self.args(args)?;
             }
             TyKind::CoroutineWitness(id, args) => {
                 self.u8(20);
                 self.key(key::coroutine_key(db, id.0));
                 self.id(code::of_coroutine(db, id.0).as_ref().map_err(Clone::clone)?);
+                self.id(&code::coroutine_names(db, id.0, false)?);
                 self.args(args)?;
             }
             TyKind::Never => self.u8(21),

@@ -5,6 +5,13 @@ date: 2026-10-20
 ---
 # blaze in the browser
 
+> **2026-11-04:** the Dioxus page described here is gone: `web/dioxus/`, `build-dioxus.sh`,
+> `index.html`, `playground.js`, `style.css`, `core-macro/` and `src/macros.rs` (the `rsx!`,
+> `#[component]` and `Props` expanders) were removed, since the page was built by rustc and
+> nothing in CI or the site used it. The website playground (`build-site.sh`, the canvas
+> demos in `web/demos/`) and packs (`blaze_set_pack`, `blaze-wasm analyze`) remain; a pack's
+> proc macro calls now expand only from what the pack recorded. The rest is as of 2026-10-20.
+
 This is the report for the `blaze-wasm` spike: can blaze's compiler run in a web page,
 compile Rust there, and swap edited functions into a running program?
 

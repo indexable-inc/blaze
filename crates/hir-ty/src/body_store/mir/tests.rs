@@ -14,7 +14,7 @@ use blaze_alloc_count::measure;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
 use std::alloc::Global;
-use blaze_query::db::Setter;
+use blaze_query::db::{Durability, Setter};
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId, StructId, VariantId,
     deps::ImageStore,
@@ -267,7 +267,7 @@ fn mir_of<'db>(db: &'db Db, owner: MirOwner<'db>) -> MirBody<'db> {
 }
 
 fn ask(s: &Session, closure: bool) -> Ask {
-    Ask::new(&s.db, function(&s.db, "closures"), closure, false)
+    Ask::new(&s.db, Durability::LOW, function(&s.db, "closures"), closure, false)
 }
 
 /// `owner`'s MIR in stable form: its answer's bytes, every id by its key.
@@ -350,7 +350,8 @@ fn a_lowering_error_is_never_stored() {
     let memory = Arc::new(Memory::default());
     let defs = Defs::default();
     let mut first = session(db_of(FIXTURE), &memory, &defs, None, Mode::Serve);
-    let failing = Ask::new(&first.db, function(&first.db, "closures"), false, true);
+    let failing =
+        Ask::new(&first.db, Durability::LOW, function(&first.db, "closures"), false, true);
     assert!(built_mir(&first.db, failing).is_err());
     assert_eq!(without_steps(first.installed.flush().unwrap()), Flushed::default(), "an error is never offered");
     assert_eq!(memory.len(), 0);
@@ -627,6 +628,6 @@ fn no_store_builds_as_without_one() {
     let owner = MirOwner::Body(InferBodyId::DefWithBodyId(def));
     let (_, schema) = place(&db, owner).unwrap();
     assert!(matches!(lookup_mir(&db, def, owner, schema), Lookup::Off));
-    let ask = Ask::new(&db, def, false, false);
+    let ask = Ask::new(&db, Durability::LOW, def, false, false);
     assert_eq!(*built_mir(&db, ask).as_ref().unwrap(), mir_of(&db, owner_of(&db, ask)));
 }

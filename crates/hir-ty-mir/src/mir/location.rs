@@ -204,7 +204,7 @@ pub fn name_sources(
             names.set_rule(db).with_durability(blaze_query::db::Durability::HIGH).to(rule);
         }
         None => {
-            _ = SourceNames::builder(rule).durability(blaze_query::db::Durability::HIGH).new(db);
+            _ = SourceNames::new(db, blaze_query::db::Durability::HIGH, rule);
             // Reading a singleton that does not exist yet is not tracked: what read it before
             // reported an untracked read (`file_source_path`), which a new revision makes stale.
             // The read may be under a memo of any durability, so the write is of the highest.
@@ -222,7 +222,10 @@ pub fn source_path<'db>(db: &'db Db, krate: base_db::Crate, file: base_db::FileI
 #[blaze_query::tracked(returns(as_deref))]
 fn file_source_path<'db>(db: &'db Db, krate: base_db::Crate, file: base_db::FileText) -> Option<String> {
     let Some(names) = SourceNames::try_get(db) else {
-        blaze_query::db::report_untracked_read(db);
+        blaze_query::db::report_untracked_read(
+            db,
+            blaze_query::db::Untracked { what: "the absence of the `SourceNames` singleton (`name_sources` not told yet)" },
+        );
         return None;
     };
     (names.rule(db).paths)(db, krate, *file.file_id(db))
@@ -386,6 +389,39 @@ fn concat_part(argument: Argument<'_>) -> Option<ConcatPart> {
         let range = first.text_range().cover(arguments.text_range());
         ConcatPart::Location(expander, range)
     })
+}
+
+/// The file a `file!()` that expanded to `file_id` names: where its outermost written call is,
+/// as the code generator places it. `None` for one that is in no file.
+pub fn location_macro_file(db: &Db, file_id: HirFileId) -> Option<base_db::FileId> {
+    let site = written_call(db, file_id)?;
+    let range = InFile::new(site.file_id, written_range(site.value));
+    let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
+    macro_location_of(db, file_id.into(), range).map(|(file, _, _)| file)
+}
+
+/// Every file the code of `owner`'s body names by `file!()`, alone or in a `concat!`, in no
+/// order and maybe twice: what the code generator bakes into the body's data as text, so what
+/// a key of its compiled code that leaves out where the body is written must hold
+/// (docs/v2/plan/design/name-free-identity.md). Empty, reading no source map, for a body that
+/// calls neither macro.
+pub fn files_read(db: &Db, owner: DefWithBodyId) -> Vec<base_db::FileId> {
+    // alloc: none for a body without `file!()`, which is nearly every one
+    let mut files = Vec::new();
+    for &file_id in location_macros(db, owner).values() {
+        files.extend(location_macro_file(db, file_id));
+    }
+    for &file_id in located_concats(db, owner).values() {
+        let Some(call) = file_id.macro_file().map(|it| it.loc(db).to_node_view(db)) else { continue };
+        for part in concat_parts(call.value).into_iter().flatten() {
+            if let ConcatPart::Location(_, range) = part
+                && let Some((file, _, _)) = macro_location_of(db, call.file_id, range)
+            {
+                files.push(file);
+            }
+        }
+    }
+    files
 }
 
 /// The macro call an expansion comes from that is itself written out, in the source or in

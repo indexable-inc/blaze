@@ -12,6 +12,10 @@
 //! the flush's manifest holds them. One path, so nothing is read twice: until 2026-11-04,
 //! `--live` wrote the recorder's last seconds beside the history, and the rows of those
 //! seconds a flush had also written were read twice.
+//!
+//! The history is pinned ([`history::Pin`]) before its manifest is read, and stays pinned
+//! until DuckDB has exited: the views name the files that manifest lists one by one, and the
+//! history's writer deletes none of them meanwhile, though a merge or the cap retires them.
 
 use std::{
     fmt,
@@ -27,7 +31,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 pub use crate::history::manifest::Scope;
 use crate::{
-    history::{self, HistoryError, manifest},
+    history::{self, HistoryError, Pin, manifest},
     views::{self, ViewError},
 };
 
@@ -358,14 +362,15 @@ fn run_in(
         Err(error) => return Err(no_duckdb(&format!("can't be read: {error}"))),
     }
     // Each view's list leads with its table's schema file, so the history gets the schema file
-    // of every table before a view opens over it. Then the manifest, once: the files the
-    // views read are the ones it lists now, and a file a merge or the cap unlists after this is
-    // deleted under the running query, which fails with DuckDB's error naming it.
+    // of every table before a view opens over it. Then the pin, which reads the manifest once:
+    // the files the views read are the ones it lists, and the pin, held until DuckDB has exited
+    // (dropped at the end of this function, on every path), keeps each on disk until then,
+    // though a merge or the cap retires it meanwhile.
     history::ensure_schemas(history).map_err(SqlError::History)?;
-    let manifest = manifest::read(history).map_err(SqlError::History)?;
+    let pin = Pin::take(history).map_err(SqlError::History)?;
     let script_path = scratch.join("query.sql");
     let init = scratch.join("init.sql");
-    fs::write(&script_path, script(sqls, history, &manifest, scope, scratch)?).map_err(io_error(&script_path, "writing"))?;
+    fs::write(&script_path, script(sqls, history, pin.manifest(), scope, scratch)?).map_err(io_error(&script_path, "writing"))?;
     // An empty init file, so the user's ~/.duckdbrc does not change what the query means.
     fs::write(&init, b"").map_err(io_error(&init, "writing"))?;
     let stdin = fs::File::open(&script_path).map_err(io_error(&script_path, "opening"))?;
@@ -385,9 +390,17 @@ fn run_in(
     // process another thread forked holds the writer's copy: its exec is made again, as every
     // spawn of blaze's is.
     let mut child = blaze_core::busy::while_busy(|| command.spawn()).map_err(io_error(duckdb, "running"))?;
-    let Some(status) = ended_or_stopped(&mut child, stop).map_err(io_error(duckdb, "waiting for"))? else {
+    let waited = ended_or_stopped(&mut child, stop);
+    if waited.is_err() {
+        // Not heard to end: killed and reaped before the pin goes, so it reads no file after.
+        _ = child.kill();
+        _ = child.wait();
+    }
+    let Some(status) = waited.map_err(io_error(duckdb, "waiting for"))? else {
         return Err(SqlError::Stopped);
     };
+    // DuckDB has exited (or was killed and reaped): it reads no file of the pin any more.
+    drop(pin);
     let stderr = fs::read(&stderr_path).map_err(io_error(&stderr_path, "reading"))?;
     let refused = |message: String| SqlError::Duckdb {
         message,

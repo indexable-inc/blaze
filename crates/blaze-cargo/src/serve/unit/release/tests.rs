@@ -36,7 +36,8 @@ fn a_crate_is_finished_once_its_last_unit_compiled_and_open_units_are_counted() 
 
 /// The decisions the job loop acts on: a release is due once no unit is open and a crate is
 /// finished, or once memory is short; the MIR goes only then, never while a unit is open and
-/// memory is fine; a check never releases; a release taken is not due again.
+/// memory is fine; a check releases only when memory is short, and then names no crate; a
+/// release taken is not due again.
 #[test]
 fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_only_then() {
     const GIB: u64 = 1 << 30;
@@ -51,22 +52,63 @@ fn a_release_is_due_when_no_unit_is_open_or_memory_is_short_and_takes_the_mir_on
     release.began(1);
     release.compiled_under(0, short);
     assert!(release.due(), "memory is short");
-    assert_eq!(release.plan(), Some(Plan { crates: vec![9], mir: true, pressed: true }));
+    assert_eq!(release.plan(), Some(Plan { crates: vec![9], mir: true, pressed: true, ended: false }));
     assert!(!release.due() && release.plan().is_none(), "taken");
     release.compiled_under(1, fine);
     assert!(release.due(), "no unit is open and crate 7 is finished");
-    assert_eq!(release.plan(), Some(Plan { crates: vec![7], mir: true, pressed: false }));
+    assert_eq!(release.plan(), Some(Plan { crates: vec![7], mir: true, pressed: false, ended: false }));
 
     let mut open = Release::of(Finished::new(vec![Some(7u32), Some(9)]), true);
     open.began(0);
     open.began(1);
     open.compiled_under(1, fine);
-    assert_eq!(open.plan(), Some(Plan { crates: vec![9], mir: false, pressed: false }), "unit 0 still reads MIR");
+    assert_eq!(open.plan(), Some(Plan { crates: vec![9], mir: false, pressed: false, ended: false }), "unit 0 still reads MIR");
 
-    let mut check = Release::of(Finished::new(vec![Some(7u32)]), false);
+    let mut check = Release::of(Finished::new(vec![Some(7u32), Some(9)]), false);
     check.began(0);
-    check.compiled_under(0, short);
-    assert!(!check.due() && check.plan().is_none(), "a check lets go of nothing");
+    check.began(1);
+    check.compiled_under(0, fine);
+    assert!(!check.due() && check.plan().is_none(), "a check lets go of nothing while memory is fine");
+    check.compiled_under(1, fine);
+    assert!(!check.due() && check.plan().is_none(), "nor once no unit is open: the next check reads its inference");
+    let mut pressed = Release::of(Finished::new(vec![Some(7u32), Some(9)]), false);
+    pressed.began(0);
+    pressed.began(1);
+    pressed.compiled_under(0, short);
+    assert!(pressed.due(), "memory is short in a check too");
+    assert_eq!(
+        pressed.plan(),
+        Some(Plan { crates: vec![], mir: true, pressed: true, ended: false }),
+        "a check's release under pressure lets go of every MIR and sweeps, but of no crate's inference by name"
+    );
+    assert!(!pressed.due() && pressed.plan().is_none(), "taken");
+    let mut ended = Release::of(Finished::new(vec![Some(7u32), Some(9)]), false);
+    ended.began(0);
+    ended.compiled_under(0, fine);
+    assert!(!ended.due(), "a check under way lets go of nothing while memory is fine");
+    ended.end();
+    assert!(ended.due(), "a check's end lets go of its MIR, under no pressure");
+    assert_eq!(
+        ended.plan(),
+        Some(Plan { crates: vec![], mir: true, pressed: false, ended: true }),
+        "every MIR, no crate's inference, no sweep: the next check reads its inference and verifies its MIR's memos"
+    );
+    assert!(!ended.due() && ended.plan().is_none(), "taken");
+    let mut built = Release::of(Finished::new(vec![Some(7u32), Some(9)]), true);
+    built.began(0);
+    built.began(1);
+    built.compiled_under(1, fine);
+    assert_eq!(built.plan(), Some(Plan { crates: vec![9], mir: false, pressed: false, ended: false }));
+    built.end();
+    assert_eq!(
+        built.plan(),
+        Some(Plan { crates: vec![], mir: true, pressed: false, ended: true }),
+        "a build's end lets go of every MIR though a unit (one that panicked) is still open"
+    );
+    let mut held_back = Release::of(Finished::new(vec![Some(7u32)]), false);
+    held_back.began(0);
+    held_back.short_under(short);
+    assert_eq!(held_back.plan(), Some(Plan { crates: vec![], mir: true, pressed: true, ended: false }), "the plane holding a task back for memory makes it due too");
 }
 
 /// Each release says one line naming why it ran, what went, what blaze held before and after,
@@ -81,7 +123,7 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     // A release memory made due says the storage's holders.
     let infer = MemoryUsage { name: "infer", rows: 2048, used: 1500, row_bytes: 1 << 28, value_bytes: 1 << 28 };
     let storage = Holders::of(vec![infer]);
-    let said = Said { crates: 2, mir: true, pressed: true, dropped, before, after, storage }.to_string();
+    let said = Said { crates: 2, mir: true, pressed: true, ended: false, dropped, before, after, storage }.to_string();
     assert_eq!(
         said,
         "front end release (memory: blaze is past the limit's line of 42.00 GiB): let go of 30 inference results of 40 \
@@ -91,14 +133,14 @@ fn a_release_says_why_what_went_and_the_memory_against_the_limit() {
     );
     let early = Pressure { held: 20 * GIB, ..before };
     let storage = Holders::of(Vec::new());
-    let said = Said { crates: 1, mir: false, pressed: true, dropped, before: early, after: early, storage }.to_string();
+    let said = Said { crates: 1, mir: false, pressed: true, ended: false, dropped, before: early, after: early, storage }.to_string();
     assert!(said.starts_with("front end release (memory: mir is past its share of "), "{said}");
     assert!(!said.contains("MIR bodies") && said.contains("in 1 crates and 5 trait solver caches"), "{said}");
     assert!(said.contains("(0.00 freed)"), "{said}");
     // A release memory did not make due says the storage's total alone, read from counters.
     let idle = Pressure { held: GIB, limit: u64::MAX, over: None };
     let storage = Holders::total(3 << 29);
-    let said = Said { crates: 1, mir: true, pressed: false, dropped, before: idle, after: idle, storage }.to_string();
+    let said = Said { crates: 1, mir: true, pressed: false, ended: false, dropped, before: idle, after: idle, storage }.to_string();
     assert!(said.starts_with("front end release (no unit is open)"), "{said}");
     assert!(said.ends_with(", under no limit; the query storage holds 1.50 GiB"), "{said}");
 }

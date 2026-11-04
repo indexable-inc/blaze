@@ -1622,8 +1622,9 @@ pub(crate) fn body_tag(body: Body) -> u8 {
     }
 }
 
-/// A body's own code, anonymous: its code hash (each callee by interface), its bindings'
-/// names and its span-table indices ([`hir_ty_share::code`]); never its key or a position.
+/// A body's own code, anonymous: its code hash (each callee by interface) and its span-table
+/// indices ([`hir_ty_share::code`]); never its key, a position or a binding's name (a
+/// debugger reads those from the database at link).
 pub(crate) fn own_code(db: &Db, body: Body) -> Result<ContentId, String> {
     let code = match body {
         Body::Fn(f) => code::of_item(db, f.into()),

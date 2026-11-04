@@ -200,7 +200,7 @@ fn script_env(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsStrin
         native: &job.input.native,
     };
     let unit = script_unit(&of, run)?;
-    let env = inherited(&job.input.config.invocation.env, job.plan(run).map_err(|it| it.what)?);
+    let env = inherited(&job.input.config.invocation.env, job.plan(run).map_err(|it| it.what)?, !outside(job, run));
     let vars = blaze_build_script::env(&unit, &env).map_err(|error| error.0)?.vars;
     Ok((unit, vars))
 }
@@ -406,14 +406,43 @@ fn triple_of<'a>(unit: &'a Unit, host: &'a str) -> &'a str {
 /// compare with nothing.
 pub(crate) const JOB_ONLY: &[&str] = &[ELIDE, SCRIPT_CACHE, pure::PURE, proc_macro_api::kept::CACHE];
 
+/// The names a process's temporary directory goes by: POSIX's `TMPDIR`, the `TMP`, `TEMP` and
+/// `TEMPDIR` older programs look up, and nix's `NIX_BUILD_TOP` (a nix shell's build directory,
+/// which is its temporary one). A sandboxed run has a temporary directory of its own, an empty
+/// one, and the job's is not in its view at all, so none of the job's values names anything
+/// the run can see: on unix ([`inherited`]) a sandboxed run is given none of the job's `TMPDIR`
+/// (each sandbox gives the program its own, and reads the one it is given to choose it, so a
+/// value of the job's would decide what the sandbox binds), and the others, where the job has
+/// them, as [`SANDBOX_TEMP`]. This is the sandbox's own directory, not a list of variables
+/// that change from shell to shell: what a run is keyed by of the rest of the job's
+/// environment is what it read of it, each variable lent to it and traced as it is read
+/// ([`blaze_usercode::confine::GIVEN`]). So no shell's temporary directory, a fresh
+/// `/tmp/nix-shell.XXXXXX` for each `nix develop`, is in a key or in what a run prints.
+pub(crate) const TEMP_NAMES: &[&str] = &["NIX_BUILD_TOP", "TEMP", "TEMPDIR", "TMP", "TMPDIR"];
+
+/// What a sandboxed run's [`TEMP_NAMES`] but `TMPDIR` are: the sandbox's own empty `/tmp`, the
+/// same in every shell.
+pub(crate) const SANDBOX_TEMP: &str = "/tmp";
+
 /// The environment a script is started in: the job's whole environment but [`JOB_ONLY`], what
-/// cargo sets for the unit over it.
-pub(crate) fn inherited(job: &[(String, String)], plan: &UnitPlan) -> Vec<(OsString, OsString)> {
+/// cargo sets for the unit over it. A `sandboxed` run (not [`outside`]) on unix has the job's
+/// [`TEMP_NAMES`] as that says, the sandbox's temporary directory; what cargo sets (a `[env]`
+/// value) is never rewritten. A run outside the sandbox, or on Windows (whose sandbox sets
+/// `TMP` and `TEMP` itself), has the job's as they are.
+pub(crate) fn inherited(job: &[(String, String)], plan: &UnitPlan, sandboxed: bool) -> Vec<(OsString, OsString)> {
+    let own_temp = cfg!(unix) && sandboxed;
+    let job = job.iter().filter(|it| !JOB_ONLY.contains(&it.0.as_str())).filter_map(|(name, value)| {
+        match (own_temp && TEMP_NAMES.contains(&name.as_str()), name.as_str()) {
+            (false, _) => Some((name.as_str(), value.as_str())),
+            (true, "TMPDIR") => None,
+            (true, _) => Some((name.as_str(), SANDBOX_TEMP)),
+        }
+    });
     // cargo's first, then a stable sort by name and the first of each name kept: cargo's over
     // the job's, in one sort with no map.
-    let mut env: Vec<&(String, String)> = Vec::with_capacity(plan.env.len() + job.len());
-    env.extend(plan.env.iter().chain(job.iter().filter(|it| !JOB_ONLY.contains(&it.0.as_str()))));
-    env.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut env: Vec<(&str, &str)> = Vec::with_capacity(plan.env.len() + job.size_hint().1.unwrap_or(0));
+    env.extend(plan.env.iter().map(|(name, value)| (name.as_str(), value.as_str())).chain(job));
+    env.sort_by(|a, b| a.0.cmp(b.0));
     env.dedup_by(|later, first| later.0 == first.0);
     env.into_iter().map(|(name, value)| (OsString::from(name), OsString::from(value))).collect()
 }
@@ -680,7 +709,7 @@ enum How {
 
 /// Whether run `run` is outside the sandbox: `BLAZE_SANDBOX=off`, or the workspace took its
 /// package out by name.
-fn outside(job: &Job, run: usize) -> bool {
+pub(crate) fn outside(job: &Job, run: usize) -> bool {
     job.sandbox_off() || job.plan(run).is_ok_and(|it| it.unsandboxed)
 }
 
@@ -745,7 +774,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         native: &job.input.native,
     };
     let unit = script_unit(&of, run).map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
-    let env = inherited(&job.input.config.invocation.env, job.plan(run)?);
+    let env = inherited(&job.input.config.invocation.env, job.plan(run)?, !outside(job, run));
     let Some((_, code)) = program else {
         let disk = blaze_usercode::inputs::Disk::new(Vec::new());
         return Ok(Some(Start { unit, env, disk, how: How::Inert, elided }));
@@ -799,7 +828,13 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     }
     let disk = blaze_usercode::inputs::Disk::new(prepared.env.clone());
     let how = match outside(job, run) {
-        true => How::Outside(Command { sandbox: Sandbox::Off, ..prepared.spec.command }),
+        true => {
+            // Outside the sandbox nothing is lent: the program is given its whole environment,
+            // without the launcher's variable.
+            let mut command = Command { sandbox: Sandbox::Off, ..prepared.spec.command };
+            command.env.retain(|it| it.0 != blaze_usercode::confine::GIVEN);
+            How::Outside(command)
+        }
         false => How::Sandboxed(prepared),
     };
     Ok(Some(Start { unit, env, disk, how, elided }))

@@ -799,7 +799,7 @@ impl Gen {
 
     fn rebuild_cause(&mut self, depth: u32) -> crate::RebuildCause {
         use crate::{PartChanged, RebuildCause};
-        match self.below(13) {
+        match self.below(14) {
             0 => RebuildCause::First,
             1 => RebuildCause::Parts {
                 parts: self.u32(),
@@ -829,6 +829,7 @@ impl Gen {
             9 => RebuildCause::Twice { count: self.u32() },
             10 => RebuildCause::Always { why: self.text() },
             11 => RebuildCause::NotExplained { what: self.text() },
+            12 => RebuildCause::Unfinished { since: self.wide() },
             _ => RebuildCause::Failed { why: self.text() },
         }
     }

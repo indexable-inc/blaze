@@ -20,7 +20,8 @@
 //! ([`Reads::primary`]), valued as that crate reads it now.
 //!
 //! An expansion whose reads are not known (one its server could not trace, one that read the
-//! clock, one that asked the database about a span, one of a macro that keeps a session) makes
+//! clock, one that asked the database about a span, one of a macro whose session does not
+//! settle or that moved its session's state on) makes
 //! the crate's image leave out an input, so the crate is refused an image ([`Refused`]).
 
 use std::sync::Arc;

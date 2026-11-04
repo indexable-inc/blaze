@@ -887,6 +887,10 @@ impl Writer<Real> for UnitWriter {
         deps::served(self.front.db(), &self.job, &self.session)
     }
 
+    fn ran(&self) -> blaze_query::db::Taken {
+        blaze_query::db::take_log_in(self.front.db())
+    }
+
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic> {
         deps::noted(self.flushed.as_ref(), self.session.item_steps().as_ref())
     }
@@ -900,7 +904,10 @@ impl Writer<Real> for UnitWriter {
             let what = "the front end is not kept for the head's next build: a write to it panicked, and it may be half written";
             return Err(self.refused(what));
         }
-        // The build is over: what its finished crates keep goes before the front end is kept.
+        // The build is over: what its finished crates keep goes before the front end is kept,
+        // and every MIR it made, of a check as of any build, so the kept front end holds none
+        // of it into the next build (a check's MIR, kept, grew the heap by every check).
+        self.release.end();
         if let Some(lowered) = Arc::get_mut(&mut self.front) {
             self.release.release(lowered);
         }

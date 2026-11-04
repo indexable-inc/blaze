@@ -1928,13 +1928,13 @@ impl hir_expand::proc_macro::ProcMacroExpander for HugeExpander {
         &self,
         _: &Db,
         hir_expand::proc_macro::ProcMacroCall { call_site, .. }: hir_expand::proc_macro::ProcMacroCall<'_>,
-    ) -> Result<crate::tt::TopSubtree, hir_expand::proc_macro::ProcMacroExpansionError> {
+    ) -> Result<hir_expand::proc_macro::Expanded, hir_expand::proc_macro::ProcMacroExpansionError> {
         let text = format!(
             "macro_rules! ignore {{ ($($t:tt)*) => {{}}; }} ignore! {{ {} }} pub struct Big;",
             "0 ".repeat(2_200_000)
         );
-        Ok(syntax_bridge::parse_to_token_tree_static_span(Edition::CURRENT, call_site, &text)
-            .unwrap())
+        let tree = syntax_bridge::parse_to_token_tree_static_span(Edition::CURRENT, call_site, &text).unwrap();
+        Ok(hir_expand::proc_macro::Expanded::untraced(tree, "a test's proc macro, which traces nothing of what it read"))
     }
 
     // dyn: `ProcMacroExpander::eq_dyn`'s signature, compared when a crate's macros are set

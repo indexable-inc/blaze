@@ -1,9 +1,9 @@
 //! The named views over the history, as data: the one list both the explorer's `views` and
 //! `view` ops and `blaze explain <view> <args>` read. Each view's SQL is a section of
 //! `sql/examples.sql`, cut out at compile time; [`PRELUDE`] (`sql/views.sql`) defines the tables
-//! and views that SQL reads, over the directories [`prelude`] is given.
+//! and views that SQL reads, over the files of the directories [`prelude`] is given.
 
-use std::{fmt, fmt::Write as _, path::Path};
+use std::{fmt, fmt::Write as _};
 
 use serde_json::{Map, Value};
 
@@ -81,14 +81,29 @@ const ENDED_BUILD: Arg = Arg {
 const LIMIT: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("20") };
 const EARLIER: Arg = Arg { name: "earlier", ty: ArgType::Text, default: None };
 const LATER: Arg = Arg { name: "later", ty: ArgType::Text, default: None };
+/// The build a key is diffed against: by default, the last at or before the one before the
+/// last build with key parts (`key_part_diff` takes the last that computed the same thing).
+const BEFORE: Arg = Arg {
+    name: "before",
+    ty: ArgType::U64,
+    default: Some("(SELECT max(build_id) - 1 FROM key_parts)"),
+};
+/// The build whose key is diffed: by default, the last with key parts.
+const AFTER: Arg = Arg { name: "after", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM key_parts)") };
 
 pub const VIEWS: &[View] = &[
     view("slowest_queries", &[BUILD, LIMIT]),
     view("slower_between_commits", &[EARLIER, LATER, LIMIT]),
-    view("memo_hit_rate_per_crate", &[BUILD]),
+    view("memo_hit_rate_per_query_kind", &[BUILD, LIMIT]),
     view("critical_path", &[ENDED_BUILD, LIMIT]),
     view("allocations_per_query_kind", &[BUILD]),
     view("what_reran", &[BUILD, LIMIT]),
+    view("why_reran", &[BUILD, LIMIT]),
+    view("untracked_reads", &[BUILD, LIMIT]),
+    view("cycle_reruns", &[BUILD, LIMIT]),
+    view("key_part_diff", &[BEFORE, AFTER, LIMIT]),
+    view("task_memory", &[BUILD]),
+    view("admission_waits", &[BUILD, LIMIT]),
     view("busiest_threads", &[BUILD, LIMIT]),
     view("longest_gaps", &[BUILD, LIMIT]),
     view("top_cpu_stacks", &[BUILD, LIMIT]),
@@ -401,7 +416,7 @@ pub fn prelude(dir: &Path, manifest: &Manifest, scope: Scope) -> Result<String, 
         if it.sigil != b'@' {
             return Ok(());
         }
-        let Some(table) = schema::TABLES.iter().find(|table| table.name == it.name) else {
+        let Some(table) = schema::TABLES.iter().position(|table| table.name == it.name) else {
             // alloc: an error, a bug in views.sql
             return Err(ViewError::Undeclared { view: "views.sql", name: it.name.to_owned() });
         };
@@ -610,7 +625,7 @@ mod tests {
         "having", "in", "is", "join", "last", "left", "like", "limit", "not", "null", "nulls",
         "on", "or", "order", "over", "partition", "qualify", "recursive", "replace", "select",
         "then", "union", "union_by_name", "using", "view", "when", "where", "with", "true",
-        "false", "rows", "unbounded", "preceding", "bigint", "cross", "ubigint", "varchar",
+        "false", "rows", "unbounded", "preceding", "bigint", "cross", "ubigint", "varchar", "full",
         "hugeint",
     ];
     /// DuckDB's functions the SQL files call.

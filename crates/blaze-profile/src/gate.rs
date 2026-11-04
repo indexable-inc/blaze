@@ -378,7 +378,7 @@ fn build(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Build, Gat
          CAST(process AS BIGINT) AS process, CAST(tree AS VARCHAR) AS tree, CAST(blaze AS VARCHAR) AS blaze \
          FROM builds WHERE {which} AND dur_ns IS NOT NULL ORDER BY build_id DESC, started_ns DESC LIMIT 1"
     );
-    let row = sql::run(&Query { duckdb, history, sql: &sql })?;
+    let row = sql::run(&Query { duckdb, history, scope: sql::Scope::All, sql: &sql })?;
     let (Some(build), Some(t0), Some(dur)) = (first_i64(&row, 0), first_i64(&row, 1), first_i64(&row, 2)) else {
         // alloc: an error, once a verdict
         return Err(GateError::NoBuild { history: history.to_owned(), build: asked });
@@ -523,13 +523,13 @@ fn sql_checks(it: &Build) -> Vec<(CheckName, Vec<String>, Judge)> {
 /// Each of `sqls`' answers, or why it has none. They run in one DuckDB; when that fails, each
 /// runs alone so the error is the query's own and the others still answer.
 fn answers(duckdb: &Path, history: &Path, sqls: &[&str]) -> Vec<Result<Vec<RecordBatch>, String>> {
-    match sql::run_all(duckdb, history, sqls) {
+    match sql::run_all(duckdb, history, sql::Scope::All, sqls) {
         // alloc: the checks' answers, once a verdict
         Ok(all) => all.into_iter().map(Ok).collect(),
         Err(_) => sqls
             .iter()
             // alloc: an error, once a check
-            .map(|&sql| sql::run(&Query { duckdb, history, sql }).map_err(|error| first_line(&error.to_string())))
+            .map(|&sql| sql::run(&Query { duckdb, history, scope: sql::Scope::All, sql }).map_err(|error| first_line(&error.to_string())))
             // alloc: the checks' answers, once a verdict
             .collect(),
     }
@@ -907,7 +907,7 @@ fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, Stri
     }
     // alloc: the queries, once a check
     let asked: Vec<&str> = sqls.iter().map(String::as_str).collect();
-    let answers = sql::run_all(duckdb, &empty, &asked).map_err(|error| first_line(&error.to_string()))?;
+    let answers = sql::run_all(duckdb, &empty, sql::Scope::All, &asked).map_err(|error| first_line(&error.to_string()))?;
     for ((table, read), answer) in tables.iter().zip(&answers) {
         let rows = first_i64(answer, 0).unwrap_or(-1);
         let (merged, inputs) = (nullable(answer, 1), nullable(answer, 2));
@@ -951,7 +951,7 @@ impl Drop for Scratch {
 pub fn summary(duckdb: &Path, history: &Path, build: i64, out: &Path) -> Result<(), GateError> {
     // alloc: a query, once a summary
     let sql = format!("SELECT * FROM build_summary WHERE build_id = {build} ORDER BY name");
-    let batches = sql::run(&Query { duckdb, history, sql: &sql })?;
+    let batches = sql::run(&Query { duckdb, history, scope: sql::Scope::All, sql: &sql })?;
     let fail = |why: String| GateError::Summary { path: out.to_owned(), why };
     let Some(first) = batches.iter().find(|it| it.num_rows() > 0) else {
         return Err(fail(format!("build {build} has no row in build_summary")));

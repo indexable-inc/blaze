@@ -21,7 +21,7 @@ use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
 
 use base_db::{ContentId, Crate, Db};
 use hir_def::nameres::crate_def_map;
-use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError};
+use hir_expand::proc_macro::{Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError};
 use parking_lot::Mutex;
 use tt::TopSubtree;
 
@@ -52,15 +52,17 @@ struct Twin {
 
 impl std::panic::RefUnwindSafe for Twin {}
 
-fn outcome(result: &Result<TopSubtree, ProcMacroExpansionError>) -> Result<&TopSubtree, String> {
+fn outcome(result: &Result<Expanded, ProcMacroExpansionError>) -> Result<&TopSubtree, String> {
     match result {
-        Ok(tree) => Ok(tree),
+        Ok(expanded) => Ok(&expanded.tree),
         Err(error) => Err(format!("{error:?}")),
     }
 }
 
 impl Twin {
-    fn run(&self, db: &Db, calling: Crate, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+    /// The evaluator's expansion, its reads and state as it stated them, compared with the
+    /// module's.
+    fn run(&self, db: &Db, calling: Crate, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
         let evaluated = self.evaluated.expand_in(db, calling, call);
         let module = self.module.expand_in(db, calling, call);
         let difference = match (outcome(&evaluated), outcome(&module)) {
@@ -89,11 +91,11 @@ impl ProcMacroExpander for Twin {
         self.evaluated.code()
     }
 
-    fn expand(&self, _db: &Db, _call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+    fn expand(&self, _db: &Db, _call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
         Err(ProcMacroExpansionError::System("the corpus calls every macro from a calling crate".to_owned()))
     }
 
-    fn expand_in(&self, db: &Db, calling: Crate, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+    fn expand_in(&self, db: &Db, calling: Crate, call: ProcMacroCall<'_>) -> Result<Expanded, ProcMacroExpansionError> {
         self.run(db, calling, call)
     }
 

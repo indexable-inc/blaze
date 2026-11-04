@@ -202,7 +202,8 @@ pub fn set_primary_crates(db: &mut Db, mut crates: Vec<Crate>) {
             }
         }
         None => {
-            PrimaryCrates::new(db, crates);
+            // MEDIUM: of the request, like the crate graph; set again only when it moves.
+            PrimaryCrates::new(db, Durability::MEDIUM, crates);
             db.note(maintain::Note::Crates);
         }
     })
@@ -276,7 +277,9 @@ pub fn set_process_env(db: &mut Db, vars: Env) {
                 }
             }
             None => {
-                ProcessEnv::new(db, vars, content);
+                // MEDIUM: of the request, like the crate graph; set again only when a
+                // variable changes, never by an edit to a source file.
+                ProcessEnv::new(db, Durability::MEDIUM, vars, content);
                 db.note(maintain::Note::Crates);
             }
         }
@@ -601,6 +604,22 @@ pub fn toolchain_channel(db: &Db, krate: Crate) -> Option<ReleaseChannel> {
     krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre).ok())
 }
 
+/// The kind of an input made from `krate`'s sources (a maintainer's per-crate state), by the
+/// crate's origin, which every crate has: `LOW` for a workspace crate (`Local`), `HIGH` for the
+/// standard library (`Lang`), rustc's crates and registry, git and vendored dependencies
+/// (`Library`). blaze-lower gives a crate the origin that matches its source root (a path
+/// package's root is local, every other package's a library's); a registry library's doctest
+/// crates are `Library` too (blaze-lower `doctests`). A library crate's input stated `LOW`
+/// would have every query over it verify again after each workspace edit.
+pub fn crate_durability(db: &Db, krate: Crate) -> Durability {
+    match krate.data(db).origin {
+        CrateOrigin::Local { .. } => Durability::LOW,
+        CrateOrigin::Library { .. } | CrateOrigin::Lang(_) | CrateOrigin::Rustc { .. } => {
+            Durability::HIGH
+        }
+    }
+}
+
 #[blaze_query::input(singleton, debug)]
 struct AllCrates {
     #[returns(clone)]
@@ -653,7 +672,7 @@ pub fn set_all_crates_with_durability(
                 all.set_content(db).with_durability(durability).to(content);
             }
             None => {
-                _ = AllCrates::builder(crates, content).durability(durability).new(db);
+                _ = AllCrates::new(db, durability, crates, content);
             }
         }
     })

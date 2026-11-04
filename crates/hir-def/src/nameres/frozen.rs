@@ -120,7 +120,7 @@ pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
             it.set_maps(db).with_durability(Durability::HIGH).to(maps);
         }
         None => {
-            _ = FrozenDefMaps::builder(maps).durability(Durability::HIGH).new(db);
+            _ = FrozenDefMaps::new(db, Durability::HIGH, maps);
         }
     }
 }
@@ -293,7 +293,7 @@ pub fn set_lang_items(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
             it.set_maps(db).with_durability(Durability::HIGH).to(maps);
         }
         None => {
-            _ = FrozenLangItems::builder(maps).durability(Durability::HIGH).new(db);
+            _ = FrozenLangItems::new(db, Durability::HIGH, maps);
         }
     }
 }

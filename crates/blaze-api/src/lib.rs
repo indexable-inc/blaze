@@ -80,12 +80,12 @@ use serde::{Deserialize, Serialize};
 /// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`]. 33:
 /// [`Status::bugs`]. 34: [`Request::FetchUrl`] and [`Response::Stored`]. 35:
 /// [`Status::settings`]. 36: an [`ApiError`] is its [`Report`] (docs/v2/plan/structured-output.md),
-/// [`Response::Report`], and [`Behind::id`]. 37: [`Request::Flush`] and [`Response::Flushed`] in
-/// place of `Request::Sql` (`blaze debug sql --live`) and `Response::Queried`: a reader of the
-/// profile history asks the daemon to flush, then reads the history itself; and
-/// [`Request::ClientRows`] and [`Worked::build_id`]: a client sends its own recorder's rows of a
-/// build to the daemon, which writes them to the history.
-pub const SCHEMA: u32 = 37;
+/// [`Response::Report`], and [`Behind::id`]. 37: [`RebuildCause::Unfinished`]. 38:
+/// [`Request::Flush`] and [`Response::Flushed`] in place of `Request::Sql` (`blaze debug sql
+/// --live`) and `Response::Queried`: a reader of the profile history asks the daemon to flush,
+/// then reads the history itself; and [`Request::ClientRows`] and [`Worked::build_id`]: a client
+/// sends its own recorder's rows of a build to the daemon, which writes them to the history.
+pub const SCHEMA: u32 = 38;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -451,6 +451,10 @@ pub enum RebuildCause {
     /// Its key is the one it had when last computed, in build `since`, yet nothing is kept
     /// under it: that compute did not keep it.
     Lost { since: u64 },
+    /// Its key is the one it had when last computed, in build `since`, which did not end well
+    /// (it failed or was stopped), and nothing is kept under it: that compute likely failed or
+    /// was stopped before it kept anything.
+    Unfinished { since: u64 },
     /// Its key is the one it had when last computed, in build `since`, so what its value is
     /// filed under past the key differs, or that compute did not keep it: `what` is filed
     /// beyond the key, which blaze does not explain yet.

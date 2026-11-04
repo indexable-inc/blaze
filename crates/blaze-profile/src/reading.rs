@@ -11,6 +11,7 @@ use arrow_array::{Array, RecordBatch, cast::AsArray, types::{Int64Type, UInt32Ty
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::{
+    history::{HistoryError, Pin},
     schema,
     slow::{DiedSpan, DiedThread},
 };
@@ -35,8 +36,8 @@ pub enum ReadingError {
     Arrow { path: PathBuf, error: arrow_schema::ArrowError },
     /// A column of an `open` file is missing or of another type.
     Column { path: PathBuf, column: &'static str },
-    /// The history's manifest can't be read.
-    History(crate::history::HistoryError),
+    /// The history could not be pinned and its manifest read ([`Pin`]).
+    History(HistoryError),
 }
 
 impl fmt::Display for ReadingError {
@@ -48,7 +49,7 @@ impl fmt::Display for ReadingError {
             ReadingError::Column { path, column } => {
                 write!(f, "the profile history: {} has no column `{column}` of the type the open table has", path.display())
             }
-            ReadingError::History(error) => write!(f, "{error}"),
+            ReadingError::History(error) => write!(f, "pinning the history to read its last open spans: {error}"),
         }
     }
 }
@@ -59,7 +60,10 @@ impl std::error::Error for ReadingError {}
 /// newest [`FILES`] `open` files its manifest lists (by their latest instant, then name);
 /// `None` where they hold none of it.
 pub fn last(dir: &Path, pid: u32) -> Result<Option<Reading>, ReadingError> {
-    let manifest = crate::history::manifest::read(dir).map_err(ReadingError::History)?;
+    // Held to the end: a merge or the cap retires `open` files, and none the manifest it read
+    // lists is deleted meanwhile.
+    let pin = Pin::take(dir).map_err(ReadingError::History)?;
+    let manifest = pin.manifest();
     // alloc: the history's open files, once a reading
     let mut files: Vec<(i64, &str)> = manifest
         .entries(schema::OPEN.name)

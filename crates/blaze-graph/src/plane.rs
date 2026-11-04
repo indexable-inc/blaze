@@ -552,6 +552,17 @@ pub struct Counts {
 /// weight up to 16, so for those the shares are exact.
 const SHARE: u128 = 720_720 << 32;
 
+/// What memory admission did with a task as it started ([`Plane::admitted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Admitted {
+    /// The memory the plane granted it: its predicted peak.
+    pub granted: u64,
+    /// The times another task with memory started while it did not fit.
+    pub passed: u32,
+    /// The pool it runs on: what a wait that memory did not hold back waited for a thread of.
+    pub pool: Pool,
+}
+
 /// What one request did, for its proof of work ([`Plane::stats`]).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RequestStats {
@@ -1127,6 +1138,21 @@ impl<M: Memo> Plane<M> {
         let node = *self.index.get(&id)?;
         debug_assert!(self.node_slots.live(node), "the index holds a stale handle of {id}");
         Some(&self.states[node.index() as usize])
+    }
+
+    /// What memory admission did with the task node `id` runs, read as it starts (after its
+    /// [`PlaneOutput::Run`]): the bytes the plane granted it (its predicted peak) and the times
+    /// it was passed over for memory before it started. `None` for a node with no live task.
+    /// The driver writes it into the task's profile span (`blaze_profile::span::Task`), so a
+    /// forecast that held tasks back shows against what each task then held.
+    pub fn admitted(&self, id: NodeId) -> Option<Admitted> {
+        let node = *self.index.get(&id)?;
+        let task = self.rows[node.index() as usize].task;
+        if task == NO_TASK || !self.task_slots.live(task) {
+            return None;
+        }
+        let row = &self.tasks[row_of(task)];
+        Some(Admitted { granted: row.memory, passed: row.passed, pool: row.pool })
     }
 
     /// Whether `request` is known and not finished: one [`Plane::cancel_into`] takes.

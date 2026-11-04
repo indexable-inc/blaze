@@ -30,14 +30,24 @@ several readers.
     `kern.bootsessionuuid`), and the process that wrote it
     (crates/blaze-profile/src/history/manifest.rs). Rewriting it (to a hidden name, renamed over
     the last, under `manifest.lock`) is the one commit point of every change: a flush lists its
-    files in one commit; a merge lists its output and unlists its inputs in one commit, then
-    deletes the inputs; the cap unlists, then deletes. So a reader reads each row once, during a
-    merge too: until 2026-11-04 the views globbed `*.<table>.parquet`, and a glob during a merge
-    could read a merged file beside its inputs, every row twice. `blaze debug time`'s derived
-    tables and `blaze perf record`'s runs are listed the same way. At open the history deletes
-    what a crash left (a file of a form blaze writes that the manifest does not list, a hidden
+    files in one commit; a merge lists its output and retires its inputs in one commit; the cap
+    retires the oldest builds. So a reader reads each row once, during a merge too: until
+    2026-11-04 the views globbed `*.<table>.parquet`, and a glob during a merge could read a
+    merged file beside its inputs, every row twice. `blaze debug time`'s derived tables and
+    `blaze perf record`'s runs are listed the same way. At open the history deletes what a crash
+    left (a file of a form blaze writes that the manifest neither lists nor retires, a hidden
     half-written file) and refuses, naming it, a listed file that is missing or a Parquet file of
     no form blaze writes. A history from before manifests gets one made of its files, once.
+
+    **Pins.** A retired file is unlisted at once and named in the manifest's `retired` list, with
+    the manifest's generation that retired it, until it is deleted
+    (crates/blaze-profile/src/history/retire.rs). A reader pins the history before it reads the
+    manifest (`history::Pin`: a lock file it holds in `pins/`, then the manifest, then a file
+    saying the generation it read) and holds the pin until DuckDB has exited. The writer deletes
+    a retired file only once every live pin has said that generation or a later one, so no file
+    a reader's manifest lists is deleted under it: until 2026-11-04 a merge deleted its inputs at
+    once, and a `blaze slow` racing it failed on DuckDB's "Cannot open file". A dead reader's
+    lock file, which no one holds, is deleted by the writer.
 
     **What a reader sees.** Every reader (`blaze debug sql`, `blaze explain`, `blaze slow`,
     `blaze debug time`) first asks the daemon that writes the history to flush
@@ -89,13 +99,17 @@ are kept in `stack_pcs`, and the `images` table says which file each is in.
 
 Defined once, in `crates/blaze-profile/src/schema.rs`. The Arrow schema of each table, the
 Parquet files, the live feed, the DuckDB views and this page all come from it. Schema version
-4 (`schema::VERSION`; at 4 `events.message` became the message alone, the other fields rows of
-`event_fields`). Each Arrow schema's metadata carries `blaze.table`, `blaze.schema` (the version)
-and `blaze.clock`, and each file's manifest entry says its version. A reader reads a file of
-version 4 as it is, one of version 3 as 4 (its absent `events.event_id` reads as null: an event
-with no `event_fields` rows, its fields still in its `message`) and one of version 2 as 4 as well
-(its absent `folded_ns` also reads as null, which every reader takes as 0; `schema::UPGRADES`),
-and refuses any other, naming the file: version 1 named a job by its slot alone, and the
+5 (`schema::VERSION`; 4 filled `provenance` with the query engine's run log and added
+`key_parts` and `query_counts`' causes; at 5 `events.message` became the message alone, the
+other fields rows of `event_fields`). How to read all of this when something is wrong: the
+`debugging` skill, `.agents/skills/debugging/SKILL.md`. Each Arrow schema's metadata carries
+`blaze.table`, `blaze.schema` (the version) and `blaze.clock`, and each file's manifest entry
+says its version. A reader reads a file of version 5 as it is, one of version 4 as 5 (its
+absent `events.event_id` reads as null: an event with no `event_fields` rows, its fields still
+in its `message`), one of version 3 as 5 as well (its absent `query_counts` causes read as
+null, not counted; it has no `provenance` rows) and one of version 2 as 5 too (its absent
+`folded_ns` also reads as null, which every reader takes as 0; `schema::UPGRADES`), and
+refuses any other, naming the file: version 1 named a job by its slot alone, and the
 generation version 2 needs was never written.
 
 **Time.** Every `*_ns` instant is in nanoseconds on the machine's monotonic clock: Linux
@@ -140,15 +154,18 @@ column.
 | awaits | utf8? | what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it |
 | owner | u64? | who runs what a `wait` waits for (for a key, the job running it, as `switches.job` names it; null when not known), or the job that holds a `hold`. A `hold` span (a key held across a suspension, such as a codegen round) names its holder here, so its waiters' `owner` matches it |
 | steps | u64? | the basic blocks a `macro expand` ran on the evaluator, or the instances a `build script proof` walked (`hir_ty_pure::ScriptProof::steps`: the same on a cold, warm or busy daemon, and the margin under the proof's bound); null for a compiled run, a run or proof that did not end, and any other span |
-| peak_bytes | u64? | the most stack and heap a `macro expand`'s evaluator held at once; null as `steps` is |
+| peak_bytes | u64? | the most stack and heap a `macro expand`'s evaluator held at once (null as `steps` is), or the most a daemon `task` held at once, global allocations and frames together (`blaze_graph::admission::run_as`); null for a task that gave way or panicked |
 | outcome | dict? | how a `macro expand` ended: ok, panic, step limit, memory limit or error; null for one that did not end (an unwind) |
 | waits_on | dict? | the kind of thing a `wait` waits on: key, lock, channel, io, child or scope |
 | job | u64? | the pool job a `job` span is of, as `switches.job` names it (or `switches.began_as`, for a job that joined the graph after the span opened); the spans under it are its job's too |
 | creator | u64? | the span (`span_id`) that was open on the thread that gave a `job` span's job to the pool, as it gave it; null for a job given outside any span. A job given by a thread that is no pool job (the daemon's main loop, a build's driver) has no `by_job`, so the critical path crosses from the job to its giver through this span: its lane, and its end as when the job was given (`time::Model::link_creators`) |
 | module_from | dict? | where a `macro module` got its wasm module's machine code: memo (this process had it), store (the daemon's own store) or compiled; null for a load that did not end (refused or failed) |
 | code_bytes | u64? | the bytes of a `macro module`'s machine code, as the store keeps it; null for one from the memo |
+| granted_bytes | u64? | the memory the plane granted a daemon `task` as it started, its predicted peak (`blaze_graph::admission`): against `peak_bytes`, how far off the forecast was |
+| passed | u64? | the times a daemon `task` was passed over for memory before it started (another started while its grant did not fit); 0 when memory never held it back |
+| node | u64? | the plane node a daemon `task` ran as |
 
-The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`), `hold` (`what`, `holder`), `job` (`kind`, `job`, `creator`), `worker` (`doing` in `function`: a pool worker's `search`, `idle` or `switch` between jobs), `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`) and `build script proof` (`krate`, `unit`, and as it ends `steps`). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
+The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`), `hold` (`what`, `holder`), `job` (`kind`, `job`, `creator`), `worker` (`doing` in `function`: a pool worker's `search`, `idle` or `switch` between jobs), `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`) `build script proof` (`krate`, `unit`, and as it ends `steps`), `admission` (a plane task's wait from ready to start: `kind` in `function`, `node`, and as it ends `waited_for` in `awaits` (memory, a work or io thread, nothing), `passed`, `granted`; detached, on no thread's stack, as no thread waits in it; `blaze explain admission_waits`) and `task` (a daemon plane task run on a thread, `crates/blaze-cargo/src/serve/plane.rs`: `kind` in `function` as `unit bodies (infer)`, `node`, `granted`, `passed`, and as it ends `peak` in `peak_bytes`; `blaze explain task_memory` and `admission_waits` read it). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
 
 A `macro expand` span is one run of a proc macro: `function` is the macro's path (`serde_derive::Serialize`), `crate` the crate the call is in. A unit's phase spans (`unit names`, `unit bodies`, `unit codegen`, `unit link`, `unit store`) carry the unit in `unit` as `serde v1.0.219 (build script)`; their `crate` is the target's name, `build-script-build` for every build script. A `scope` wait names the span its caller opened the scope in: `scope 13 of unit codegen serde v1.0.219 (build script)`.
 
@@ -242,6 +259,16 @@ are the `query_counts` table.
 | reads_recorded | u64 | the reads its runs recorded, a row read again later in the same run included: over `reads_kept`, how often its runs re-read the same rows |
 | reads_kept | u64 | the reads its runs' rows kept: each run's distinct reads, summed |
 | reads_most | u64 | the most reads one of its runs held on its thread's query stack as it ended (the build's most, not a sum) |
+| written | u64? | of an input: the times a setter wrote one of its fields, an equal value too (each opens a view): what the build changed, behind every run after it; null in files of a blaze before it. `harness/incremental.py` names a build's re-runs by it |
+| ran_new | u64? | of its runs, first runs of a row (schema 4; null before) |
+| ran_changed | u64? | of its runs, those because a read changed since the row last ran; `provenance` names the read |
+| ran_untracked | u64? | of its runs, those because the row's last run made an untracked read, so it runs in every view; `provenance` names the read |
+| ran_cycle | u64? | of its runs, those of a cycle: a stale provisional row, or a verify that re-entered a cycle |
+
+Each run counts its cause once, in `blaze_query`'s `Storage::record_run`, the one place a run
+says why it runs, so `ran_new + ran_changed + ran_untracked + ran_cycle + evicted_asked` adds
+up to `executed`; a build where it does not has a run path that skips `record_run`, which is a
+bug. They are counted always; the per-run rows are `provenance`'s.
 
 When a build ends, the daemon takes the counts (`blaze_query::db::take_counts`, in
 `crates/blaze-cargo/src/serve/observe.rs`) and the next flush writes them. The counts belong to
@@ -259,14 +286,14 @@ there a repeated name is not a repeated key.
 | build_id | u64 | the build that computed it again |
 | step | dict | what was computed: `codegen dev template`, `unit`, `build script run` |
 | item | utf8 | what of, by path: a function, a unit, a package's build script's run |
-| cause | dict | `first`, `parts`, `lost`, `beyond`, `unnamed`, `read`, `unrecorded`, `collected`, `unshaped`, `twice`, `always`, `not_explained` or `failed` |
+| cause | dict | `first`, `parts`, `lost`, `unfinished`, `beyond`, `unnamed`, `read`, `unrecorded`, `collected`, `unshaped`, `twice`, `always`, `not_explained` or `failed` |
 | what | utf8? | what changed or why, in words: the read, the parts of its key that changed, the reason |
 | names | utf8? | the item the change is of, when it is another's: what a chain of reasons follows |
 | was | utf8? | the hash of what changed when it was last computed, in hex; null for several parts |
 | now | utf8? | its hash now, in hex; null for several parts |
 | changed | u32? | how many of its reads or key parts changed; for `twice`, how many keys it had |
 | of | u32? | how many reads or key parts it has |
-| since | u64? | the last build that computed it and ended well, which it is compared with |
+| since | u64? | the last build that computed it (however that build ended), which it is compared with |
 
 `blaze why` reads the same rows from the daemon (`Request::Rebuilt`). How each cause is worked
 out is in docs/v2/plan/lanes/why.md.
@@ -441,18 +468,51 @@ look up `address - slide` (less 1 for every address but the last of the stack) i
 address in no image is JIT code (a proc macro's wasm, named only in the process, in `stack`) or
 a wild frame.
 
-### `provenance`: one row a query of a build that was verified or rerun, with the cause
+### `provenance`: one row a query run that was not a first run, with why it ran
+
+The query engine's run log (`blaze_query::db::take_log_in`), on while the daemon keeps a history
+(`blaze serve`) and taken as a build ends beside `query_counts`. One row a run that was not a
+first run (a cold build's runs are `query_counts.ran_new` alone, so a cold build writes few
+rows), and one row the first untracked read of a run. Verified rows are counted, not listed.
+Rows are sorted by query, key, view and cause, so two runs of one build write the same rows.
+Past 2^19 entries between two builds' ends the log keeps the first and the daemon warns with
+the number dropped; the counts still hold every run. Before schema 4 nothing wrote this table.
 
 | column | type | |
 |---|---|---|
-| build_id | u64 | the build |
-| query_key | utf8 | the query and its key |
-| kind | dict | the query's kind |
-| outcome | dict | verified, reran, or reran-same-output (an early cutoff) |
-| cause | utf8? | the input or query key whose change made it rerun |
-| dur_ns | i64 | how long verifying or running it took |
-| unit | utf8? | the codegen unit it was for |
-| crate | dict? | the crate it was of |
+| build_id | u64 | the build that ended when the log was taken |
+| query_key | utf8 | the memo: its query and its key as the key's type shows it, `` `infer_query`(DefWithBodyId(..)) `` (its id where the key has no `Debug`) |
+| kind | dict | the query, as `query_counts.query` names it |
+| outcome | dict | `ran`, or `untracked read` (its run made a read the engine can't see) |
+| cause | utf8? | for `ran`: `changed`, `evicted`, `untracked` or `cycle` |
+| view | u32 | the database view it ran in: each write of inputs opens one |
+| cause_key | utf8? | for `changed`: the read that changed, `` `Input.field`(<row>) `` for an input's or tracked struct's field (a file's text by its path, `` `FileText.text`(/src/lib.rs) ``; another row by its id), else a memo named as `query_key` names it, whose own row says why it changed |
+| cause_kind | dict? | what `cause_key` is: `input`, `tracked`, `interned` or `function` |
+| what | utf8? | for `untracked read`: its name, the `what` of `Untracked { what }` |
+
+Each storage keeps its own log as node keys, so logging formats nothing; the build's front end
+takes it as the build ends, with its database attached (`blaze_query::db::take_log_in`, through
+`Writer::ran`), and only then is each node named: a memo by its key's `Debug`, an input's row
+by the front end's namer (`blaze_query::db::name_rows`; base-db names `FileText` by path),
+else by id. `blaze explain what_reran`, `why_reran` (each rerun followed
+through the memos that changed to its root), `untracked_reads` and `cycle_reruns` read it.
+
+### `key_parts`: one row a part of the key of a thing a build computed again
+
+The parts of each `misses` row's key (`blaze_kernel::Miss::parts`), written beside it, so two
+builds' keys, or two homes' histories, can be diffed part by part (`blaze explain
+key_part_diff before=N after=M`). A key with no parts has one row with a null `part`.
+
+| column | type | |
+|---|---|---|
+| build_id | u64 | the build that computed it |
+| step | dict | as `misses.step`: `unit`, `build script run`, `codegen dev template` |
+| item | utf8 | as `misses.item` |
+| key | utf8 | the whole key, in hex, as the store files it |
+| part | utf8? | the part's name: `toolchain`, `settings`, `env CC`; null for a key with no parts |
+| hash | utf8? | the part's hash, in hex; null when the key has no such part this time |
+| names | utf8? | the item the part is of, when another's (a dependency's unit) |
+| beyond | utf8? | what the value is filed under past the key that the parts do not explain (a unit's process variables, a build script's traced reads) |
 
 ### `inputs`: one row an input that changed for a build
 
@@ -1089,12 +1149,23 @@ What the profile could not see is listed after the findings, as blind spots, nev
 - a critical path that stops short of the build's start;
 - rows the recorder lost (`rows_lost`): spans it had no slot for, rows a ring wrote over between
   drains, and of those the rows skipped while the history's writer was behind, each counted.
-- spans the model did not read (`spans_cut`, report version 4): a build of more spans than
-  `time::load::SPAN_BUDGET` (8 million) is modelled from those at or past the least floor (0, then
-  100 us, 1 ms, ... 1 s) that fits, with every root `job` and `wait` span and every unended one. The
-  report says the floor and the spans and time left out. A short span's time is its parent's
-  own, and a park inside a nested wait under the floor reads as an unnamed wait. The spans by name
-  still count every span.
+- spans the model did not read (`spans_cut`, report version 5): a build of more spans than
+  `time::load::SPAN_BUDGET` (8 million) is modelled in two passes (`time::load::modelled`). The
+  first reads the spans at or past the least floor (0, then 100 us, 200 us, 500 us, 1 ms, ...
+  1000 s, in steps of 1, 2 and 5) that keeps them within 6 million, and every unended one; a
+  child is never longer than its parent, so no span read loses its parent. The root `job` spans
+  and the `wait` spans under that floor are summed in DuckDB instead, by name, crate and subject
+  (a job's function, a wait's `awaits`): count, time, longest and CPU, the 64 groups that took
+  the most time and a total by name. A first model of the switches and those spans gives a
+  critical path; the spans of the lanes it crosses (each job's runs on their threads, each
+  thread lane's life) are read again under the floor, from the least floor that keeps them
+  within 2 million, and the final model is built from both. The report says both floors, the
+  spans and time left out, the summed groups, the lanes on the final path the second pass did
+  not read, and the jobs whose root span was under the floor (not judged for running inside no
+  span). A park with no wait span shorter than the floor is classed `<kind> wait under the read
+  floor`, not as an unnamed wait. The spans by name and the workers' CPU count every span. The
+  only refusal left is a build whose unended spans alone pass the bound, which takes a recorder
+  that left millions of spans open.
 
 
 Its header says the recorder's loss on a line of its own, even when it lost nothing

@@ -2106,7 +2106,13 @@ impl<S: Steps> Job<S> {
         for it in &mut test_runs {
             it.build_id = build_id;
         }
-        Ended { row: self.row(request, stats, outcome), links, crate_deps, misses, test_runs }
+        // Its front end's run log, named with its database in hand, before the front end is
+        // kept or dropped: why each of its queries ran again.
+        let provenance = match &self.stage {
+            Stage::Units(build) => super::observe::provenance_rows(build_id, build.writer.ran()),
+            _ => Vec::new(),
+        };
+        Ended { row: self.row(request, stats, outcome), links, crate_deps, misses, test_runs, provenance }
     }
 
     /// The value its stage waited on, if node `node` gave it.

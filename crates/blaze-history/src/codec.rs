@@ -20,7 +20,15 @@ use crate::{
     table::{self, RUNS, Record, WAYS, Writer},
 };
 
-pub const MAGIC: &[u8; 8] = b"blzhis01";
+/// `03`: peaks as charged to each task's memory account (`blaze_graph::arena::account`): what
+/// its work allocated less what it freed, on its own job and on every job of the pool scopes
+/// it opened, never another task's bytes. A `02` history's peaks were the job's own count
+/// alone, which left out its fan-out, and a program's build that ran alone learned what the
+/// whole process held beyond its start; a `01` history's were read on whatever thread a task
+/// ended on, against the base it took on the thread it began on (a daemon's whole heap, 121.59
+/// GB for a build script, nftest2). Neither is what this blaze predicts by, so an image of
+/// either starts its history empty and says so (the daemon's restore names the section and why).
+pub const MAGIC: &[u8; 8] = b"blzhis03";
 pub const KIND_BYTES: usize = 24;
 pub const RECORD_BYTES: usize = 64;
 /// The most slots bytes may say a table had: 1 GiB of records. More is not a table this

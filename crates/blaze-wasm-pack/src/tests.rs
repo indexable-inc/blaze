@@ -55,12 +55,8 @@ fn pack() -> Pack {
     }
 }
 
-fn no_builtin(_: &Call) -> Option<Result<String, String>> {
-    None
-}
-
 fn load(pack: Pack) -> (Db, FileId) {
-    let project = pack.project(no_builtin).expect("the pack loads");
+    let project = pack.project().expect("the pack loads");
     let mut change = ChangeWithProcMacros::default();
     for (id, _, text) in project.files {
         change.change_file(id, Some(text));
@@ -80,21 +76,21 @@ fn load(pack: Pack) -> (Db, FileId) {
 fn a_dependency_after_what_depends_on_it_is_refused() {
     let mut pack = pack();
     pack.crates.swap(0, 2);
-    assert_eq!(pack.project(no_builtin).err().as_deref(), Some("a dependency after what depends on it"));
+    assert_eq!(pack.project().err().as_deref(), Some("a dependency after what depends on it"));
 }
 
 #[test]
 fn a_bad_edition_is_refused() {
     let mut pack = pack();
     pack.crates[0].edition = "1999".to_owned();
-    assert_eq!(pack.project(no_builtin).err().as_deref(), Some("a bad edition"));
+    assert_eq!(pack.project().err().as_deref(), Some("a bad edition"));
 }
 
 #[test]
 fn a_root_with_a_file_not_there_is_refused() {
     let mut pack = pack();
     pack.roots[0].files.push(9);
-    assert_eq!(pack.project(no_builtin).err().as_deref(), Some("a root with a file there is not"));
+    assert_eq!(pack.project().err().as_deref(), Some("a root with a file there is not"));
 }
 
 #[test]

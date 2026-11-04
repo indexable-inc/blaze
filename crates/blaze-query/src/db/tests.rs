@@ -32,8 +32,8 @@ use super::{
         tracked_fields, tracked_new, value_hash,
     },
     replay_reads, report_untracked_read,
-    row::VIEW_MASK,
-    storage::{Summary, input_bits},
+    row::{Header, PROVISIONAL, VIEW_MASK},
+    storage::{Summary, input_bits, node_key},
     unshareable_reads, unwind_if_cancelled, with_attached, with_attached_db,
 };
 
@@ -927,6 +927,294 @@ fn a_fixpoint_of_two_queries_converges_from_its_head() {
 }
 
 query!(
+    RingA,
+    u64,
+    |db, key| (get::<RingB>(db, key) + 1).min(key.a(db));
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(
+    RingB,
+    u64,
+    |db, key| get::<RingA>(db, key) + get::<RingGate>(db, key);
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(RingGate, u64, |db, key| key.b(db) / 1000);
+
+/// A converged cycle is verified as any row is: its head by what the whole cycle read outside
+/// itself, a member by its head. A write its reads see but that changes none of their values
+/// (the gate turns a new `b` into the same 0) leaves both rows proved without a run, view after
+/// view, whichever is asked first. Before, the claim-free walk refused every cycle-made row,
+/// and `summary` (hir-ty-suspend) ran 13M times in one check with none verified.
+#[test]
+fn a_converged_cycle_is_verified_whole_when_nothing_it_read_changed() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 4, 0);
+    assert_eq!((*get::<RingA>(&db, cell), *get::<RingB>(&db, cell)), (4, 4));
+    let runs = (db.runs("RingA"), db.runs("RingB"));
+    counts_of("RingA");
+    counts_of("RingB");
+    for b in 1..=2 {
+        cell.set_b(&mut db, b);
+        if b == 1 {
+            assert_eq!(*get::<RingB>(&db, cell), 4, "a member asked first, proved by its head");
+            assert_eq!(*get::<RingA>(&db, cell), 4);
+        } else {
+            assert_eq!(*get::<RingA>(&db, cell), 4, "the head asked first");
+            assert_eq!(*get::<RingB>(&db, cell), 4);
+        }
+    }
+    assert!(settled(), "the cycle left nothing on this thread");
+    assert_eq!((db.runs("RingA"), db.runs("RingB")), runs, "no row of the cycle ran again");
+    let (a, b) = (counts_of("RingA"), counts_of("RingB"));
+    assert_eq!((a.executed, a.verified), (0, 2), "the head proved once a view");
+    assert_eq!((b.executed, b.verified), (0, 2), "the member proved once a view");
+}
+
+// `RingA` and `RingB` again under their own names: counts are process-wide, by query name, so
+// each test reads only its own.
+query!(
+    LoopA,
+    u64,
+    |db, key| (get::<LoopB>(db, key) + 1).min(key.a(db));
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(
+    LoopB,
+    u64,
+    |db, key| get::<LoopA>(db, key) + get::<LoopGate>(db, key);
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(LoopGate, u64, |db, key| key.b(db) / 1000);
+
+/// A cycle whose reads changed runs again from its head, members included, to the value a run
+/// from scratch gives: here a new gate read only by the member changes the member and not the
+/// head, and the member asked first runs the cycle again (heading it this time).
+#[test]
+fn a_converged_cycle_runs_again_when_a_members_read_changed() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 4, 0);
+    assert_eq!((*get::<LoopA>(&db, cell), *get::<LoopB>(&db, cell)), (4, 4));
+    let runs = (db.runs("LoopA"), db.runs("LoopB"));
+    cell.set_b(&mut db, 5000);
+    assert_eq!(*get::<LoopB>(&db, cell), 9, "the member's new gate: 4 + 5");
+    assert_eq!(*get::<LoopA>(&db, cell), 4);
+    assert!(settled(), "the rerun cycle left nothing on this thread");
+    assert!(db.runs("LoopA") > runs.0 && db.runs("LoopB") > runs.1, "both rows ran again");
+    let ran = (db.runs("LoopA"), db.runs("LoopB"));
+    cell.set_b(&mut db, 5001);
+    assert_eq!((*get::<LoopA>(&db, cell), *get::<LoopB>(&db, cell)), (4, 9));
+    assert_eq!((db.runs("LoopA"), db.runs("LoopB")), ran, "an equal gate leaves it verified again");
+    assert!(settled());
+}
+
+query!(
+    EarlyA,
+    u64,
+    |db, key| *get::<EarlyB>(db, key);
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(EarlyB, u64, |db, key| {
+    // `b` is read only while the head is still its initial 0: in round 1, never in the last.
+    let a = *get::<EarlyA>(db, key);
+    if a == 0 { key.b(db) + 1 } else { a }
+});
+
+/// A cycle's edges hold what every round read, not only the last: `b` is read in round 1
+/// alone, yet the converged value came from it, so a new `b` runs the cycle again to the value a
+/// run from scratch gives (keys cover every input). Kept to the last round's reads, the head
+/// would be proved unchanged and keep the old `b + 1`.
+#[test]
+fn a_read_only_an_early_round_made_runs_the_cycle_again() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 0, 2);
+    assert_eq!(*get::<EarlyA>(&db, cell), 3);
+    assert!(settled(), "the cycle's gathered reads went to its head and nowhere else");
+    cell.set_b(&mut db, 5);
+    assert_eq!(*get::<EarlyA>(&db, cell), 6, "as from scratch");
+    assert_eq!(*get::<EarlyB>(&db, cell), 6);
+    let ran = db.runs("EarlyA");
+    cell.set_a(&mut db, 1);
+    assert_eq!(*get::<EarlyA>(&db, cell), 6);
+    assert_eq!(db.runs("EarlyA"), ran, "`a` was never read: the cycle stays verified");
+    assert!(settled());
+}
+
+/// Nothing is left on this thread's query stacks: no frame, no edge, no gathered cycle read.
+fn settled() -> bool {
+    super::local::with(|local| local.is_empty())
+}
+
+/// How many times [`OnceSelf`] ran: it reads itself in its first run only.
+static ONCE_SELF: AtomicUsize = AtomicUsize::new(0);
+
+query!(
+    OnceSelf,
+    u64,
+    |db, key| {
+        if ONCE_SELF.fetch_add(1, Ordering::Relaxed) == 0 {
+            *get::<OnceSelf>(db, key) + key.b(db)
+        } else {
+            key.b(db)
+        }
+    };
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+
+/// A head whose later round reads nothing of its cycle ends as any run does, through `finish`,
+/// with round 1's reads gathered for it: those go with the frame, not onto the next top-level
+/// query (before, they stayed on the thread and joined an unrelated cycle's edges).
+#[test]
+fn a_head_that_ends_without_its_cycle_leaves_no_gathered_reads() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 0, 2);
+    assert_eq!(*get::<OnceSelf>(&db, cell), 2);
+    assert!(settled(), "round 1's gathered reads left on the thread");
+    cell.set_b(&mut db, 7);
+    assert_eq!(*get::<OnceSelf>(&db, cell), 7, "it read `b`, so a new `b` runs it again");
+    assert!(settled());
+}
+
+query!(
+    NestOuter,
+    u64,
+    |db, key| *get::<NestInner>(db, key);
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(
+    NestInner,
+    u64,
+    |db, key| {
+        // Its own cycle first: `b` is read only in that inner cycle's round 1, before it reads
+        // the outer head and joins its cycle.
+        let own = *get::<NestInner>(db, key);
+        if own == 0 { key.b(db) + 1 } else { own.max(*get::<NestOuter>(db, key)) }
+    };
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+
+/// A read made only in an inner head's early round, before that head joined an outer cycle,
+/// is in the outer head's edges: a new `b` runs the whole cycle again to the value a run from
+/// scratch gives, and a write to `a`, which nothing read, leaves it verified.
+#[test]
+fn a_read_of_an_inner_heads_early_round_reaches_the_outer_head() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 0, 2);
+    assert_eq!(*get::<NestOuter>(&db, cell), 3);
+    assert_eq!(*get::<NestInner>(&db, cell), 3);
+    assert!(settled());
+    cell.set_b(&mut db, 5);
+    assert_eq!(*get::<NestOuter>(&db, cell), 6, "as from scratch");
+    assert_eq!(*get::<NestInner>(&db, cell), 6);
+    assert!(settled());
+    let ran = (db.runs("NestOuter"), db.runs("NestInner"));
+    cell.set_a(&mut db, 1);
+    assert_eq!(*get::<NestOuter>(&db, cell), 6);
+    assert_eq!((db.runs("NestOuter"), db.runs("NestInner")), ran, "`a` was never read");
+    assert!(settled());
+}
+
+/// The row of `F`'s key `id` and its node, once it ran.
+fn function_row<F: Function>(storage: &Storage, id: Id) -> Option<(&Header, u32)> {
+    let key = node_key(F::ingredient().index(), id, 0);
+    let node = (1..storage.nodes_made()).find(|&node| storage.key_of(node) == key)?;
+    Some((super::verify::function_header(storage, storage.node(node))?, node))
+}
+
+/// What [`ProbeHead`] saw of its member's row mid-cycle after view 1: its word, and whether the
+/// claim-free walk proved it.
+static PROBED: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+
+query!(
+    ProbeHead,
+    u64,
+    |db, key| {
+        let member = *get::<ProbeMember>(db, key);
+        let storage = db.storage();
+        if storage.view_bits() > 1 {
+            let (header, node) =
+                function_row::<ProbeMember>(storage, key.0).expect("the member's row, run in view 1");
+            let word = header.verified.load(Ordering::Acquire);
+            let proved = super::verify::unclaimed(storage, header, word, node);
+            PROBED.lock().push((word, proved));
+        }
+        (member + 1).min(key.a(db))
+    };
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(ProbeMember, u64, |db, key| *get::<ProbeHead>(db, key));
+
+/// A provisional row (a round not yet converged) is never verified, even one whose word names
+/// the earlier view it was final in: in round 1 of the cycle's rerun the member holds its old
+/// view's bits with `PROVISIONAL`, and the claim-free walk refuses it.
+#[test]
+fn a_provisional_row_is_never_verified() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert_eq!(*get::<ProbeHead>(&db, cell), 3);
+    cell.set_a(&mut db, 2);
+    let view = db.storage().view_bits();
+    assert_eq!(*get::<ProbeHead>(&db, cell), 2);
+    let probed = std::mem::take(&mut *PROBED.lock());
+    assert!(!probed.is_empty(), "the head ran its cycle again after the write");
+    for &(word, proved) in &probed {
+        assert_ne!(word & PROVISIONAL, 0, "the member is mid-cycle: {word:#x}");
+        assert!(!proved, "a provisional row was verified: {word:#x}");
+    }
+    let earlier = |&(word, _): &(u32, bool)| (1..view).contains(&(word & VIEW_MASK));
+    assert!(probed.iter().any(earlier), "round 1 saw the member's earlier view: {probed:x?}");
+    assert_eq!(*get::<ProbeMember>(&db, cell), 2);
+    assert!(settled());
+    // Once final, the head holds what the cycle read outside itself, and no row of the cycle;
+    // the member's one edge is its head.
+    let storage = db.storage();
+    let (head, head_node) = function_row::<ProbeHead>(storage, cell.0).expect("the head's row");
+    let (member, member_node) =
+        function_row::<ProbeMember>(storage, cell.0).expect("the member's row");
+    let edges_of = |header: &Header| {
+        let span = header.edges.load(Ordering::Acquire);
+        let start = super::row::span::start(span);
+        (start..start + super::row::span::len(span)).map(|at| storage.edge(at)).collect::<Vec<_>>()
+    };
+    let read = edges_of(head);
+    assert!(!read.is_empty(), "the head read `a`");
+    assert!(
+        !read.contains(&head_node) && !read.contains(&member_node),
+        "a provisional read became an edge: {read:?}"
+    );
+    assert_eq!(edges_of(member), [head_node], "a member's one edge is its head");
+    for header in [head, member] {
+        assert_eq!(header.verified.load(Ordering::Acquire) & PROVISIONAL, 0, "final");
+    }
+}
+
+query!(
     Diverge,
     u64,
     |db, key| get::<Diverge>(db, key) + 1;
@@ -1656,6 +1944,7 @@ fn counts_of(query: &str) -> Counts {
                 reads_recorded: was.reads_recorded + counts.reads_recorded,
                 reads_kept: was.reads_kept + counts.reads_kept,
                 reads_most: was.reads_most.max(counts.reads_most),
+                written: was.written + counts.written,
             };
         }
         None => taken.push((name, counts)),
@@ -1715,6 +2004,42 @@ fn each_run_verify_rerun_and_eviction_is_counted_per_query() {
     let [_, _, capped] = counted();
     assert_eq!(capped.evicted, 2, "three values over a budget of two, down to its low water: two go");
     assert_eq!((capped.evicted_asked, capped.dropped), (0, 0));
+}
+
+/// An input of one field only [`each_set_of_an_input_is_counted_as_written`] makes, so no
+/// other test's writes reach its counts (a take is process-wide).
+struct Written;
+
+impl Input for Written {
+    type Fields = (u64,);
+    const NAME: &'static str = "Written";
+    const FILE: &'static str = file!();
+    const FIELDS: u32 = 1;
+    const FIELD_NAMES: &'static [&'static str] = &["value"];
+    const SINGLETON: bool = false;
+
+    fn ingredient() -> &'static Ingredient {
+        ingredient!(input::<Written>)
+    }
+}
+
+fn written_value(fields: &mut (u64,)) -> &mut u64 {
+    &mut fields.0
+}
+
+/// What `query_counts.written` holds: each setter's write of an input's field counts once
+/// against that input, an equal value too (it opens a view all the same), and making one
+/// counts nothing. harness/incremental.py names a no-op build's re-runs by it.
+#[test]
+fn each_set_of_an_input_is_counted_as_written() {
+    let mut db = TestDb::new();
+    let id = input_new::<Written, 1>(db.storage(), (1,), [Durability::LOW]);
+    assert_eq!(counts_of("Written").written, 0, "made, not written");
+    input_set::<Written, u64>(db.storage_mut(), id, 0, written_value).to(2);
+    input_set::<Written, u64>(db.storage_mut(), id, 0, written_value).to(2);
+    let counts = counts_of("Written");
+    assert_eq!(counts.written, 2, "two writes, the second of an equal value: {counts:?}");
+    assert_eq!(counts.executed, 0, "{counts:?}");
 }
 
 /// Asks for one key of `F` in two views, then for two other keys in a third, and opens a
@@ -2548,6 +2873,110 @@ fn random_graphs_agree_with_a_run_from_scratch(tc: TestCase) {
         *seen.entry((query, key, view)).or_insert(0) += 1;
     }
     assert!(seen.values().all(|&count| count == 1), "a query ran twice in one view");
+}
+
+/// A random graph's node read as a fixpoint: the max of what it reads, from 0, through cycles.
+struct CycGraph;
+
+impl Spec for CycGraph {
+    type Key = Node;
+    type Value = u64;
+    const QUERY: &'static str = "CycGraph";
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+
+    fn cache() -> &'static Ingredient {
+        ingredient!(function::<CycGraph>)
+    }
+
+    fn compute(db: &TestDb, key: Node) -> u64 {
+        let at = *interned_fields::<Indices>(db.storage(), key.0) as usize;
+        let mut value = 0;
+        for &dep in &db.graph[at].deps {
+            value = value.max(match dep {
+                Dep::Input(input) => {
+                    let cell = Cell(db.cells.lock()[input]);
+                    cell.a(db)
+                }
+                Dep::Query(query) => *fetch::<CycGraph>(db, node(db, query)),
+            });
+        }
+        value
+    }
+
+    fn initial(_: &TestDb, _: Node) -> u64 {
+        0
+    }
+}
+
+/// Every node's least fixpoint: each the max of what it reads, from all 0, until none moves.
+fn least_fixpoint(graph: &[GNode], inputs: &[u64]) -> Vec<u64> {
+    let mut values = vec![0u64; graph.len()];
+    loop {
+        let mut moved = false;
+        for (at, spec) in graph.iter().enumerate() {
+            let value = spec
+                .deps
+                .iter()
+                .map(|&dep| match dep {
+                    Dep::Input(input) => inputs[input],
+                    Dep::Query(query) => values[query],
+                })
+                .max()
+                .unwrap_or(0);
+            moved |= value != values[at];
+            values[at] = value;
+        }
+        if !moved {
+            return values;
+        }
+    }
+}
+
+/// Converged cycles verified whole agree with a run from scratch: a random graph of max nodes
+/// whose reads may point anywhere (so cycles, nested and overlapping), its inputs written up
+/// and down at random, every node asked for in a random order after each write.
+#[hegel::test]
+fn random_cyclic_fixpoints_agree_with_a_run_from_scratch(tc: TestCase) {
+    let inputs: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+    let queries: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
+    let graph: Vec<GNode> = (0..queries)
+        .map(|_| {
+            let count: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+            let deps = (0..count)
+                .map(|_| {
+                    if tc.draw(gs::booleans()) {
+                        Dep::Query(tc.draw(gs::integers::<usize>().max_value(queries - 1)))
+                    } else {
+                        Dep::Input(tc.draw(gs::integers::<usize>().max_value(inputs - 1)))
+                    }
+                })
+                .collect();
+            GNode { op: Op::Max, deps }
+        })
+        .collect();
+    let mut values: Vec<u64> = (0..inputs).map(|i| i as u64).collect();
+    let mut db = TestDb::made(None, graph);
+    let cells: Vec<Cell> = values.iter().map(|&value| Cell::new(&db, value, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    let writes: usize = tc.draw(gs::integers::<usize>().max_value(10));
+    for step in 0..=writes {
+        if step > 0 {
+            let input: usize = tc.draw(gs::integers::<usize>().max_value(inputs - 1));
+            values[input] = tc.draw(gs::integers::<u64>().max_value(9));
+            cells[input].set_a(&mut db, values[input]);
+        }
+        let expected = least_fixpoint(&db.graph, &values);
+        let first: usize = tc.draw(gs::integers::<usize>().max_value(queries - 1));
+        for at in (0..queries).map(|at| (at + first) % queries) {
+            assert_eq!(
+                *fetch::<CycGraph>(&db, node(&db, at)),
+                expected[at],
+                "node {at} at step {step} of {:?}",
+                db.graph
+            );
+            assert!(settled(), "node {at} at step {step} left reads on the thread");
+        }
+    }
 }
 
 /// After one input is edited and every node is asked for again, every memo that ran did so

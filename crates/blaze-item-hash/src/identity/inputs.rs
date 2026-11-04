@@ -34,7 +34,7 @@ pub fn set_build(db: &mut Db, build: ContentId) {
             front_end.set_build(db).with_durability(blaze_query::db::Durability::HIGH).to(build);
         }
         None => {
-            _ = FrontEnd::builder(build).durability(blaze_query::db::Durability::HIGH).new(db);
+            _ = FrontEnd::new(db, blaze_query::db::Durability::HIGH, build);
             // Reading a singleton that does not exist yet is not tracked: what read it before
             // reported an untracked read ([`build`]), which a new revision makes stale.
             db.storage_mut().synthetic_write(blaze_query::db::Durability::LOW);
@@ -47,7 +47,10 @@ pub(crate) fn build(db: &Db) -> Option<ContentId> {
     match FrontEnd::try_get(db) {
         Some(front_end) => Some(front_end.build(db)),
         None => {
-            blaze_query::db::report_untracked_read(db);
+            blaze_query::db::report_untracked_read(
+                db,
+                blaze_query::db::Untracked { what: "the absence of the `FrontEnd` singleton (`set_build` not told yet)" },
+            );
             None
         }
     }

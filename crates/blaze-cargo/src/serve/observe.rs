@@ -29,7 +29,7 @@ use std::{
 use blaze_api::{ApiError, LiveFrame, Reply, RequestRef, Response};
 use blaze_core::Conn;
 use blaze_profile::{
-    facts::{CrateDepRow, LinkRow, QueryCountRow},
+    facts::{CrateDepRow, KeyPartRow, LinkRow, ProvenanceRow, QueryCountRow, RunOutcome},
     history::{self, BuildRow, History, OWNER},
     live::{self, Feed, Frame},
 };
@@ -246,6 +246,9 @@ pub struct Ended {
     pub misses: Vec<blaze_kernel::Miss>,
     /// The tests its runs finished, one row each.
     pub test_runs: Vec<blaze_profile::facts::TestRunRow>,
+    /// Its front end's run log: each memo that ran again and why, each untracked read by name
+    /// ([`provenance_rows`]).
+    pub provenance: Vec<ProvenanceRow>,
 }
 
 /// What the loop gives the `blaze-history` thread: a build as it starts, and as it ends, and
@@ -273,10 +276,74 @@ enum ToHistory {
 pub const FLUSH_WAIT: Duration = Duration::from_secs(30);
 
 /// What the `blaze-history` thread writes of a build that ended: its rows (with its misses,
-/// which it explains against `blaze why`'s ledger) and what the query engine counted by its end.
+/// which it explains against `blaze why`'s ledger, and its run log) and what the query engine
+/// counted by its end.
 struct Finished {
     ended: Ended,
     query_counts: Vec<QueryCountRow>,
+}
+
+/// A front end's run log, as `build`'s `provenance` rows: each memo that ran again and its
+/// cause, each untracked read by name. Taken on the loop as the build ends, with its database
+/// ([`super::work::Writer::ran`]); sorted by the engine, so the rows are the same each time.
+pub(super) fn provenance_rows(build: u64, taken: blaze_query::db::Taken) -> Vec<ProvenanceRow> {
+    let blaze_query::db::Taken { rows, dropped } = taken;
+    if dropped > 0 {
+        // Never silent (rule 3): the counts in `query_counts` still hold every run.
+        tracing::warn!(
+            target: "blaze",
+            build,
+            dropped,
+            "the query engine's run log kept its first {} runs; the rest of build {build}'s are in `query_counts` alone",
+            blaze_query::db::LOG_MOST,
+        );
+    }
+    // alloc: once a build, a row a memo that ran again
+    rows.into_iter().map(|run| provenance_row(build, run)).collect()
+}
+
+fn provenance_row(build_id: u64, run: blaze_query::db::LoggedRun) -> ProvenanceRow {
+    use blaze_query::db::{Cause, Logged};
+    let blaze_query::db::LoggedRun { query, key, view, why, read, read_kind } = run;
+    let (outcome, cause, what) = match why {
+        Logged::Ran(cause) => {
+            let name = match cause {
+                Cause::Changed(_) => "changed",
+                Cause::New => "new",
+                Cause::Evicted => "evicted",
+                Cause::Untracked => "untracked",
+                Cause::Cycle => "cycle",
+            };
+            (RunOutcome::Ran, Some(name), None)
+        }
+        Logged::UntrackedRead(what) => (RunOutcome::UntrackedRead, None, Some(what)),
+    };
+    ProvenanceRow { build_id, query_key: key, kind: query, outcome, cause, view, cause_key: read, cause_kind: read_kind, what }
+}
+
+/// The parts of the key of each thing `build` computed again, a row a part (one with no part
+/// for a key that exposes none): what two builds' keys are diffed by, across homes too.
+fn key_parts(build_id: u64, misses: &[blaze_kernel::Miss]) -> Vec<KeyPartRow> {
+    // alloc: once a build, a row a part of a miss's key
+    let mut rows = Vec::new();
+    for miss in misses {
+        let key = format!("{:x}", miss.key); // alloc: a row's text
+        let row = |part: Option<&blaze_kernel::Part>| KeyPartRow {
+            build_id,
+            step: miss.step,
+            item: miss.item.clone(), // clone: a row's own text
+            key: key.clone(),        // clone: a row's own text
+            part: part.map(|it| it.name.clone()),                       // clone: a row's own text
+            hash: part.and_then(|it| it.hash).map(|it| format!("{it:x}")), // alloc: a row's text
+            names: part.and_then(|it| it.names.clone()),                // clone: a row's own text
+            beyond: miss.beyond,
+        };
+        if miss.parts.is_empty() {
+            rows.push(row(None));
+        }
+        rows.extend(miss.parts.iter().map(|part| row(Some(part))));
+    }
+    rows
 }
 
 /// What the query engine counted since the last take, as `build`'s `query_counts` rows. Taken
@@ -299,6 +366,11 @@ fn query_count_row(build_id: u64, query: &'static str, counts: blaze_query::db::
         reads_recorded,
         reads_kept,
         reads_most,
+        written,
+        ran_new,
+        ran_changed,
+        ran_untracked,
+        ran_cycle,
     } = counts;
     QueryCountRow {
         build_id,
@@ -312,6 +384,11 @@ fn query_count_row(build_id: u64, query: &'static str, counts: blaze_query::db::
         reads_recorded,
         reads_kept,
         reads_most,
+        written,
+        ran_new,
+        ran_changed,
+        ran_untracked,
+        ran_cycle,
     }
 }
 
@@ -387,6 +464,9 @@ pub fn keep_history(
         Ok(Err(why)) => return Err(why),
         Err(_) => return Err("the profile history's thread (`blaze-history`) ended before it opened the history".to_owned()),  // alloc: error path
     };
+    // A daemon that keeps a history logs why each memo ran again, for its `provenance` rows
+    // ([`provenance_rows`]); one that keeps none counts alone.
+    blaze_query::db::log_runs(true);
     Ok((Profiling { dir, duckdb, first_build, ended, failed, told, doing }, Keeper(thread)))
 }
 
@@ -514,9 +594,11 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed
                 _ = told.send(Told::ClientWritten { to, written });
                 (flushed, false)
             }
-            Ok(ToHistory::Ended(Finished { ended: Ended { mut row, links, crate_deps, misses, test_runs }, query_counts })) => {
+            Ok(ToHistory::Ended(Finished { ended: Ended { mut row, links, crate_deps, misses, test_runs, provenance }, query_counts })) => {
                 let build = row.build_id;
                 let ended_well = matches!(row.outcome, history::Outcome::Ok);
+                // Before the ledger takes the misses: their keys' parts, which it drops.
+                let keyed = key_parts(build, &misses);
                 doing.set(Step::Explaining, build);
                 let (rebuilt, misses, record) = why.explain(build, ended_well, misses);
                 // clone: the answer's copy of whose build it is, once a build
@@ -535,6 +617,8 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed
                 history.linked(links);
                 history.crate_graph(crate_deps);
                 history.query_counted(query_counts);
+                history.ran(provenance);
+                history.keyed(keyed);
                 history.missed(misses);
                 history.tests_ran(test_runs);
                 history.build_ended(row);
@@ -1136,6 +1220,11 @@ mod tests {
             reads_recorded: 6,
             reads_kept: 7,
             reads_most: 8,
+            written: 9,
+            ran_new: 10,
+            ran_changed: 11,
+            ran_untracked: 12,
+            ran_cycle: 13,
         };
         let row = query_count_row(71, "mir_body_query", counts);
         assert_eq!(
@@ -1148,9 +1237,14 @@ mod tests {
                 row.dropped,
                 row.reads_recorded,
                 row.reads_kept,
-                row.reads_most
+                row.reads_most,
+                row.written,
+                row.ran_new,
+                row.ran_changed,
+                row.ran_untracked,
+                row.ran_cycle
             ],
-            [6384, 1, 2, 3, 4, 5, 6, 7, 8]
+            [6384, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
         let ended = Ended {
             row: BuildRow {
@@ -1174,6 +1268,7 @@ mod tests {
             crate_deps: Vec::new(),
             misses: Vec::new(),
             test_runs: Vec::new(),
+            provenance: Vec::new(),
         };
         let (to, rows) = crossbeam_channel::unbounded();
         let (failed_to, failed) = crossbeam_channel::unbounded();
@@ -1253,7 +1348,7 @@ mod tests {
             client_ns: None,
             daemon_cpu_ns: None,
         };
-        Ended { row, links: Vec::new(), crate_deps: Vec::new(), misses: Vec::new(), test_runs: Vec::new() }
+        Ended { row, links: Vec::new(), crate_deps: Vec::new(), misses: Vec::new(), test_runs: Vec::new(), provenance: Vec::new() }
     }
 
     fn explained(build: u64) -> Told {

@@ -399,11 +399,16 @@ impl<'db> OldSpell<'db> {
                 self.u8(19);
                 self.id(&key::coroutine_key(db, id.0).0);
                 let code = match self.old {
+                    // The code generator's code held the coroutine's binding names; they are
+                    // beside it now ([`code::coroutine_names`]).
                     Old::Codegen => {
-                        let code = match is_by_move_coroutine(db, id.0, args.as_coroutine()) {
+                        let by_move = is_by_move_coroutine(db, id.0, args.as_coroutine());
+                        let code = match by_move {
                             true => code::of_coroutine_by_move(db, id.0),
                             false => code::of_coroutine(db, id.0),
                         };
+                        let names = code::coroutine_names(db, id.0, by_move).map_err(|it| it.to_string())?;
+                        self.id(&names);
                         *code.as_ref().map_err(ToString::to_string)?
                     }
                     Old::Share => coroutine_code(db, id.0).map_err(self.describe())?.0,
@@ -415,7 +420,10 @@ impl<'db> OldSpell<'db> {
                 self.u8(20);
                 self.id(&key::coroutine_key(db, id.0).0);
                 let code = match self.old {
-                    Old::Codegen => *code::of_coroutine(db, id.0).as_ref().map_err(ToString::to_string)?,
+                    Old::Codegen => {
+                        self.id(&code::coroutine_names(db, id.0, false).map_err(|it| it.to_string())?);
+                        *code::of_coroutine(db, id.0).as_ref().map_err(ToString::to_string)?
+                    }
                     Old::Share => coroutine_code(db, id.0).map_err(self.describe())?.0,
                 };
                 self.id(&code);

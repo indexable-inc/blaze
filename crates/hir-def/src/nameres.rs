@@ -156,7 +156,7 @@ pub fn set_expand_builtin_derives(db: &mut Db, expand: bool) {
             it.set_expand(db).with_durability(Durability::HIGH).to(expand);
         }
         None => {
-            _ = BuiltinDerives::builder(expand).durability(Durability::HIGH).new(db);
+            _ = BuiltinDerives::new(db, Durability::HIGH, expand);
         }
     }
     db.note_crates_changed();
@@ -261,7 +261,8 @@ pub struct DefMap {
     // FIXME: Figure out a better way for the IDE layer to resolve these?
     derive_helpers_in_scope: DeriveHelpers,
 
-    /// Whether collecting declarations ran a macro with compilation-local state.
+    /// Whether collecting declarations ran a proc-macro call whose output may depend on its
+    /// session's state (`hir_expand::proc_macro::StateUse::Session`).
     pub session_macros: bool,
 
     /// What the paths of this def map's imports and macro calls resolved through.

@@ -740,7 +740,11 @@ static CARRIED_LEN: AtomicUsize = AtomicUsize::new(0);
 /// (each job's limit is set at its start, in `body`), and the job's reclamation task
 /// (`blaze_reclaim`: a pool's job is one), which keeps what the job read valid while it waits,
 /// its task frame (`blaze_mem::frame`, which allocates into the job's own frame wherever it
-/// resumes), its innermost open scope ([`super::innermost_scope`]), its give-ways
+/// resumes) and the most its frames held since its innermost frame measure began, the memory
+/// account its global-heap bytes are charged to (`crate::arena::account`, the job's task's, not
+/// the thread's: a peak read on whatever thread a job ended on was once a daemon's whole heap
+/// drifted between threads, 121.59 GB for one build script, nftest2), its
+/// innermost open scope ([`super::innermost_scope`]), its give-ways
 /// (`crate::pump::gave_way`), which a loop compares across an item that may resume elsewhere,
 /// and whether it has asked since it last gave way ([`super::before_claim`]).
 pub(super) fn carry_stack_limit() {
@@ -750,6 +754,8 @@ pub(super) fn carry_stack_limit() {
         carry(Carried::word(super::host::take_scope, super::host::put_scope));
         carry(Carried::word(blaze_mem::frame::take_current, blaze_mem::frame::put_current));
         carry(Carried::word(blaze_mem::frame::take_below, blaze_mem::frame::put_below));
+        carry(Carried::word(blaze_mem::frame::take_peak, blaze_mem::frame::put_peak));
+        carry(Carried::word(crate::arena::take_account, crate::arena::put_account));
         carry(Carried::word(blaze_mem::frame::take_cancelling, blaze_mem::frame::put_cancelling));
         carry(Carried::word(crate::pump::take_gave_ways, crate::pump::put_gave_ways));
         carry(Carried::word(super::host::take_retry, super::host::put_retry));

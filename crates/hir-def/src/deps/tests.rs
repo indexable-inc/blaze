@@ -13,13 +13,13 @@ use std::alloc::Global;
 use blaze_ids::ContentId;
 use hir_expand::fixture;
 use hir_expand::proc_macro::{
-    ExpansionReads, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
-    ProcMacroKind, report_reads,
+    Expanded, ExpansionReads, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+    ProcMacroKind, StateUse,
 };
 use parking_lot::Mutex;
 
 use super::*;
-use crate::{nameres::frozen, test_db::TestDB, tt::TopSubtree};
+use crate::{nameres::frozen, test_db::TestDB};
 
 const FIXTURE: &str = r#"
 //- /main.rs crate:main deps:lib new_source_root:local
@@ -390,9 +390,9 @@ impl ProcMacroExpander for Reading {
         &self,
         _: &Db,
         call: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
-        report_reads(ExpansionReads::Traced { shape: SHAPE.into(), values: values_of(SHAPE) });
-        Ok(call.subtree.copy())
+    ) -> Result<Expanded, ProcMacroExpansionError> {
+        let reads = ExpansionReads::Traced { shape: SHAPE.into(), values: values_of(SHAPE) };
+        Ok(Expanded { tree: call.subtree.copy(), reads, state: StateUse::Fixed })
     }
 
     fn code(&self) -> Option<ContentId> {
@@ -653,12 +653,12 @@ impl ProcMacroExpander for Flaky {
         &self,
         _: &Db,
         call: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
-        match TRACES.load(SeqCst) {
-            true => report_reads(ExpansionReads::Traced { shape: SHAPE.into(), values: values_of(SHAPE) }),
-            false => report_reads(ExpansionReads::Unknown("its server could not trace it")),
-        }
-        Ok(call.subtree.copy())
+    ) -> Result<Expanded, ProcMacroExpansionError> {
+        let reads = match TRACES.load(SeqCst) {
+            true => ExpansionReads::Traced { shape: SHAPE.into(), values: values_of(SHAPE) },
+            false => ExpansionReads::Unknown("its server could not trace it"),
+        };
+        Ok(Expanded { tree: call.subtree.copy(), reads, state: StateUse::Fixed })
     }
 
     fn code(&self) -> Option<ContentId> {

@@ -93,6 +93,13 @@ fn reason(cause: &RebuildCause, exact: bool) -> String {
                 false => String::new(),
             }
         ),
+        RebuildCause::Unfinished { since: build } => format!(
+            "its key is the one it had when last computed{}, in a build that did not end well, and nothing is kept under it: that compute likely failed or was stopped",
+            match exact {
+                true => format!(", in build {build}"),
+                false => String::new(),
+            }
+        ),
         RebuildCause::Beyond { what, since: build } => format!(
             "its key is the one it had when last computed{}, so {what} differ, or that compute did not keep it: which, is not explained yet",
             match exact {

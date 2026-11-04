@@ -5,16 +5,21 @@
 //!
 //! - A flush writes its files in place, then lists them in one commit
 //!   ([`super::History::flush`]).
-//! - A merge writes its output in place, then in one commit lists it and unlists its inputs,
-//!   then deletes them: a reader reads the inputs or the output, never both.
-//! - The cap unlists the oldest files, then deletes them.
+//! - A merge writes its output in place, then in one commit lists it and retires its inputs:
+//!   a reader reads the inputs or the output, never both.
+//! - The cap retires the oldest files.
+//!
+//! A file retired is unlisted at once and named in the manifest's [`Retired`] until it is
+//! deleted, which waits until no reader's pin can still read it ([`super::retire`]): a reader
+//! pins the history ([`super::Pin`]) before it reads the manifest, and holds the pin until its
+//! last read of the files that manifest lists has ended.
 //! - Another process's writer (`blaze debug time`'s derived tables, `blaze perf record`'s runs)
 //!   writes its files to hidden names, then holding the lock renames them into place and lists
 //!   them ([`super::write_listed`]).
 //!
-//! So a crash leaves at worst a file the manifest does not list (a merge's output written but
-//! not committed, a merge's inputs or a capped file committed away but not deleted): garbage the
-//! history's next open deletes ([`super::History::open`]). A file the manifest lists is never
+//! So a crash leaves at worst a file the manifest neither lists nor retires (a merge's output
+//! written but not committed): garbage the history's next open deletes
+//! ([`super::History::open`]). A retired file a crash left is deleted once no pin holds it. A file the manifest lists is never
 //! missing, unless something other than blaze deleted it; the open refuses that, naming it.
 //!
 //! Writers take [`LOCK`] around each read-modify-write of the manifest, so two processes'
@@ -50,7 +55,7 @@ use parquet::file::{
 use serde_derive::{Deserialize, Serialize};
 use stdx::file_lock::Locked;
 
-use super::{HistoryError, compact::Name, io_error, put};
+use super::{HistoryError, compact::Name, io_error, put, retire::Retired};
 use crate::{clock, perf, schema};
 
 /// The manifest's file in the history's directory.
@@ -80,6 +85,10 @@ pub struct Manifest {
     /// `<stem>.<table>.parquet`, and each one's entry. A table with no file has no entry. A
     /// table this blaze does not know (a newer blaze's) is kept as written, and read by no view.
     tables: BTreeMap<String, BTreeMap<String, Entry>>,
+    /// The history's generation and the files unlisted and not yet deleted
+    /// ([`super::retire`]).
+    #[serde(default)]
+    retired: Retired,
 }
 
 /// What a file listed holds, so a reader picks the files it reads without opening any.
@@ -267,6 +276,8 @@ pub enum ManifestError {
     Locked,
     /// A file whose footer says no `blaze.schema`: no blaze writer wrote it.
     Unversioned,
+    /// Its retired files are not ones a writer retires: `why`.
+    Retired(&'static str),
 }
 
 impl fmt::Display for ManifestError {
@@ -283,6 +294,7 @@ impl fmt::Display for ManifestError {
             ),
             ManifestError::Locked => write!(f, "another process held its lock ({LOCK}) for over {LOCK_WAIT:?}, far past one commit"),
             ManifestError::Unversioned => write!(f, "its footer says no `blaze.schema` version: no blaze writer wrote it, so no reader can say what its rows mean (delete it, or the directory)"),
+            ManifestError::Retired(why) => write!(f, "what it says is retired can't be: {why}"),
         }
     }
 }
@@ -297,12 +309,17 @@ impl Manifest {
     /// A manifest listing nothing.
     pub fn new() -> Manifest {
         // alloc: none until a file is listed
-        Manifest { format: FORMAT, flushed: 0, tables: BTreeMap::new() }
+        Manifest { format: FORMAT, flushed: 0, tables: BTreeMap::new(), retired: Retired::default() }
     }
 
     /// The number of the last flush the history committed.
     pub fn flushed(&self) -> u64 {
         self.flushed
+    }
+
+    /// The history's generation and the files it unlisted and has not yet deleted.
+    pub fn retired(&self) -> &Retired {
+        &self.retired
     }
 
     /// The files of `table`, in name order.
@@ -402,6 +419,16 @@ impl Manifest {
         }
     }
 
+    /// Unlists each of `names` and retires it, at one new generation ([`Retired::retire`]).
+    pub(crate) fn retire<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
+        // alloc: the names retired, once a commit that retires files
+        let names: Vec<String> = names.into_iter().map(str::to_owned).collect();
+        for name in &names {
+            self.remove(name);
+        }
+        self.retired.retire(names);
+    }
+
     /// Notes that the flush `seq` committed.
     pub(crate) fn flush_committed(&mut self, seq: u64) {
         self.flushed = self.flushed.max(seq);
@@ -419,6 +446,11 @@ impl Manifest {
         let manifest: Manifest = serde_json::from_slice(bytes).map_err(ManifestError::Json)?;
         if manifest.format != FORMAT {
             return Err(ManifestError::Format(manifest.format));
+        }
+        manifest.retired.check().map_err(ManifestError::Retired)?;
+        if let Some((name, _)) = manifest.retired.files.iter().find(|(it, _)| manifest.contains(it)) {
+            // clone: an error
+            return Err(ManifestError::Entry { table: table_of(name).unwrap_or("of none").to_owned(), file: name.clone() });
         }
         for (table, files) in &manifest.tables {
             let known = schema::TABLES.iter().any(|it| it.name == table.as_str());
@@ -633,8 +665,15 @@ impl Held {
         self.manifest.insert(name, entry).map_err(|why| HistoryError::Manifest { path: self.path.clone(), why })
     }
 
-    pub(crate) fn remove(&mut self, name: &str) {
-        self.manifest.remove(name);
+    /// Unlists each of `names` and retires it ([`Manifest::retire`]): deleted once no pin holds
+    /// it ([`Held::reaped`]).
+    pub(crate) fn retire<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
+        self.manifest.retire(names);
+    }
+
+    /// Forgets the retired files at `at` (positions in [`Retired::files`], ascending), deleted.
+    pub(crate) fn reaped(&mut self, at: &[usize]) {
+        self.manifest.retired.reaped(at);
     }
 
     pub(crate) fn flush_committed(&mut self, seq: u64) {

@@ -9150,10 +9150,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(file_id) = self.location_macro(owner, expr) else {
             return Ok(None);
         };
-        let Some(site) = written_call(db, file_id) else { return Ok(None) };
-        let range = InFile::new(site.file_id, written_range(site.value));
-        let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
-        let Some((file, _, _)) = macro_location_of(db, file_id.into(), range) else {
+        let Some(file) = hir_ty_mir::mir::location::location_macro_file(db, file_id) else {
             return Ok(None);
         };
         let path = self.cg.file_path(file);
@@ -14534,6 +14531,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     "x86.avx512fp16.",
                     "x86.avx512bf16.",
                     "x86.avx2.vpdp",
+                    "x86.avx2.gather.",
                     "x86.vcvtne",
                     "x86.vbcstne",
                 ]

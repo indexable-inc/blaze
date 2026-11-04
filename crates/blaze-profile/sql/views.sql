@@ -38,6 +38,10 @@ SELECT * FROM read_parquet(@test_runs, union_by_name = true);
 CREATE OR REPLACE VIEW samples AS
 SELECT * FROM read_parquet(@samples, union_by_name = true);
 
+-- Why the query engine ran what it ran (schema 4 on): a row a run that was not a first one,
+-- with its cause and, for a changed read, the read by name (`cause_key`, which names another
+-- row's `query_key` where the read is a memo), and a row an untracked read by name. Counts of
+-- every run and verify, first runs included, are in `query_counts`.
 CREATE OR REPLACE VIEW provenance AS
 SELECT * FROM read_parquet(@provenance, union_by_name = true);
 
@@ -58,7 +62,7 @@ SELECT * FROM read_parquet(@events, union_by_name = true);
 
 -- One row a field of a kept event other than its message, its value in the column `kind` names
 -- (i64, u64, f64, bool or str); `process` and `event_id` name its event, as in `events`. A file
--- of schema version 3 or older has no rows here: its fields are in its events' `message`.
+-- of schema version 4 or older has no rows here: its fields are in its events' `message`.
 CREATE OR REPLACE VIEW event_fields AS
 SELECT * FROM read_parquet(@event_fields, union_by_name = true);
 
@@ -124,6 +128,11 @@ SELECT * FROM read_parquet(@open, union_by_name = true);
 -- What each build computed again instead of reusing, and why (`blaze why`).
 CREATE OR REPLACE VIEW misses AS
 SELECT * FROM read_parquet(@misses, union_by_name = true);
+
+-- The parts of the key of each miss (schema 4 on): what two builds' keys, or two homes', are
+-- diffed by (`key_part_diff`).
+CREATE OR REPLACE VIEW key_parts AS
+SELECT * FROM read_parquet(@key_parts, union_by_name = true);
 
 -- Profiled runs of programs blaze built (`blaze perf record`, crates/blaze-profile/src/perf.rs).
 CREATE OR REPLACE VIEW perf_runs AS
@@ -205,8 +214,9 @@ FROM spans ASOF LEFT JOIN (
     ON spans.process = runs.process AND spans.thread = runs.thread AND spans.start_ns >= runs.t_ns;
 
 -- One row a span of a query, with what the memo did with that query when provenance has it:
--- `memo` is verified, reran or reran-same-output, matched on the build, the query's kind and
--- its key (the span's `function` field); null where provenance has no row for it.
+-- `memo` is the row's outcome (ran, untracked read) and `cause` its cause, matched on the
+-- build, the query's kind and its key. A query span's `function` is a display name, not the
+-- memo's `` `query`(<key>) ``, so the match finds no row today: read `provenance` itself.
 CREATE OR REPLACE VIEW queries AS
 SELECT spans.*, memo.outcome AS memo, memo.cause AS cause
 FROM spans

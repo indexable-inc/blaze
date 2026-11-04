@@ -14,7 +14,7 @@ use blaze_mem::Tag;
 use parking_lot::Mutex;
 
 use super::{
-    Id, MemoryUsage,
+    Id, MemoryUsage, counts,
     ingredient::{Ingredient, Kind, Vtable},
     local,
     row::{Pages, layout},
@@ -96,6 +96,7 @@ impl Vtable {
             verify: None,
             reset: None,
             weighed: None,
+            explicit: None,
             relocate: None,
             restamp: None,
             write_key: None,
@@ -327,6 +328,9 @@ impl<I: Input, T> Setter for InputSetter<'_, I, T> {
         let fields = unsafe { (*row.fields.get()).assume_init_mut() };
         let old_value = std::mem::replace((self.at)(fields), value);
         *self.storage.node_mut(node).color_mut() = color(FIELD | u32::from(durability.0), view);
+        // Counted per input, so a build's `query_counts` name what it set: the cause of every
+        // run after it (harness/incremental.py reads them).
+        counts::count(I::ingredient().index(), counts::WRITTEN);
         old_value
     }
 }

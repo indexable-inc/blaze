@@ -9,10 +9,11 @@
 //! wrote. While a build runs, a level of [`FAN_IN`] files becomes one file a level up; as it
 //! ends, each of its tables becomes one file ([`plan`]).
 //!
-//! The history renames a merge's output into place, then deletes its inputs. Between the two
-//! (milliseconds) a reader's glob can see both, and count those rows twice; that race is not
-//! solved. A crash between the two leaves both until the next open deletes the inputs
-//! ([`superseded`]).
+//! The history renames a merge's output into place, then in one commit of the manifest lists
+//! it and retires its inputs (unlisted at once, deleted once no reader pins them:
+//! [`super::retire`]), so a reader reads the inputs or the output, never both. A history from
+//! before manifests may hold both (a crash between a merge's rename and its deletes): the
+//! manifest made of its files leaves out the inputs ([`superseded`]).
 
 use crate::schema;
 
@@ -160,8 +161,8 @@ fn fold(items: &mut Vec<Item>, at: &mut [usize], level: u32) {
 
 /// The files of `files` a merge already holds the rows of: of the same build and table as a
 /// merged file, of a lower level, and with their seqs inside its `first..=last`. A crash
-/// between a merge's rename and its deletes leaves them; a reader would count their rows
-/// twice. In ascending order.
+/// between a merge's rename and its deletes, before manifests, left them; read, their rows
+/// would count twice. In ascending order.
 pub(crate) fn superseded(files: &[Name]) -> Vec<usize> {
     // alloc: once a history opens
     let mut order: Vec<usize> = (0..files.len()).collect();

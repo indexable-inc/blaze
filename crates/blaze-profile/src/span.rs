@@ -525,6 +525,44 @@ impl<E: Fields> Ending<E> {
     }
 }
 
+/// A span on no thread's stack and under no span, for a wait no thread does (a queued task's
+/// wait for admission): opened by [`detached`] on one thread and closed on whichever its wait
+/// ends on, by [`Detached::ended`] or by its drop, which closes it with its end's columns
+/// null ("did not end"). Not entered, so the spans its opener makes meanwhile are not its
+/// children.
+#[must_use = "a detached span that ends with fields says them with `ended`"]
+pub struct Detached<E: Fields> {
+    id: u64,
+    _ended: PhantomData<E>,
+}
+
+/// Opens `kind` detached ([`Detached`]), of the build the thread works for
+/// ([`flight::building`]).
+pub fn detached<K: Span>(kind: K) -> Detached<K::Ended> {
+    let id = match K::site() {
+        None => flight::UNRECORDED,
+        Some(site) => {
+            let mut said = Said::EMPTY;
+            kind.write(&mut said);
+            flight::open_detached(site, &said)
+        }
+    };
+    Detached { id, _ended: PhantomData }
+}
+
+impl<E: Fields> Detached<E> {
+    /// Says `ended`, then closes the span.
+    pub fn ended(self, ended: E) {
+        flight::said_after(self.id, |said| ended.write(said));
+    }
+}
+
+impl<E: Fields> Drop for Detached<E> {
+    fn drop(&mut self) {
+        _ = flight::closed(self.id);
+    }
+}
+
 /// Opens `kind` on this thread and enters it: its id, [`flight::UNRECORDED`] when not recorded.
 #[inline]
 fn open_id<K: Span>(kind: K) -> u64 {
@@ -866,13 +904,13 @@ span_kinds! {
     }
     typed {
         Awaits = "awaits" (Utf8): Name,
-            "what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it";
+            "what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it. For an `admission` span, what held the task back: memory, a work or io thread, or nothing";
         Owner = "owner" (U64): u64,
             "who runs what a `wait` waits for (for a key, the job running it, as `switches.job` names it; null when not known), or the job that holds a `hold`";
         Steps = "steps" (U64): u64,
             "the basic blocks a `macro expand` ran on the evaluator, or the instances a `build script proof` walked (the same on a cold, warm or busy daemon: the margin under its bound); null for a compiled run, a run or proof that did not end, and any other span";
         PeakBytes = "peak_bytes" (U64): u64,
-            "the most stack and heap a `macro expand`'s evaluator held at once; null as `steps` is";
+            "the most stack and heap a `macro expand`'s evaluator held at once (null as `steps` is), or the most a daemon `task` held at once, its global allocations and frames together (`blaze_graph::admission::run_as`); null for a task that gave way or panicked, and any other span";
         Outcome = "outcome" (Dict): Outcome,
             "how a `macro expand` ended: ok, panic, step limit, memory limit or error; null for one that did not end (an unwind)";
         WaitsOn = "waits_on" (Dict): WaitKind,
@@ -885,6 +923,12 @@ span_kinds! {
             "the bytes of a `macro module`'s machine code: read from the store, or made by its compile and kept; null for a memo hit, a compile with no store to keep it in, and any other span";
         Creator = "creator" (U64): u64,
             "the span open on the thread that gave a `job` span's job to the pool, as `span_id` numbers it in the same process: what the job stands on when no job gave it (the daemon's loop on no fiber), which the critical path crosses into; null when the giver was inside no span, and for any other span";
+        GrantedBytes = "granted_bytes" (U64): u64,
+            "the memory the plane granted a daemon `task` as it started: its predicted peak (`blaze_graph::admission`), what its memory admission held it to; against `peak_bytes`, how far off the forecast was; null for any other span";
+        Passed = "passed" (U64): u64,
+            "the times a daemon `task` was passed over for memory before it started: another task started while its granted bytes did not fit (0: memory never held it back); null for any other span";
+        Node = "node" (U64): u64,
+            "the plane node a daemon `task` ran as, as the build's records number it; null for any other span";
     }
     kinds {
         /// A unit's names phase: its crate's names resolved, or its record replayed.
@@ -927,6 +971,23 @@ span_kinds! {
         /// (`build-script-build`): as it ends, `steps`, the instances its walk took.
         ScriptProof = "build script proof" { krate: Name => Crate, unit: Name => Unit }
             => ScriptProved { steps: u64 => Steps }
+        /// One run of a daemon plane task on a thread (`blaze_cargo::serve::plane`): `kind` its
+        /// task kind and subsystem (`unit bodies (infer)`), `node` the plane node it ran as,
+        /// `granted` the memory the plane granted it (its predicted peak) and `passed` the
+        /// times it was passed over for memory before it started; as it ends, `peak` the most
+        /// it held. The unit phase and query spans of its work are under it.
+        Task = "task" { kind: Name => Function, node: u64 => Node, granted: u64 => GrantedBytes, passed: u64 => Passed }
+            => TaskEnded { peak: Option<u64> => PeakBytes }
+        /// A daemon plane task's wait for admission (`blaze_cargo::serve::plane`): from the
+        /// step its node became ready to the step it started, `kind` its task kind as its
+        /// `task` span names it and `node` its plane node. No thread waits in it (the plane
+        /// queues the task), so it is [`detached`]: on no thread's stack, under no span. As
+        /// it ends, `waited_for` what held it back (memory when another task with memory
+        /// started while it did not fit, else a thread of its pool, or nothing when it started
+        /// in the step it became ready), `passed` and `granted` as its `task` span's. One
+        /// that never started (its request cancelled, it settled from the memo) ends unsaid.
+        Admission = "admission" { kind: Name => Function, node: u64 => Node }
+            => Admitted { waited_for: Name => Awaits, passed: u64 => Passed, granted: u64 => GrantedBytes }
     }
 }
 

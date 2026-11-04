@@ -42,6 +42,23 @@ fn workers(threads: impl IntoIterator<Item = u32>) -> Facts {
 }
 
 fn report(switches: Vec<SwitchIn>, spans: Vec<SpanIn>, wall: i64, facts: &Facts) -> Report {
+    // The threads' CPU as `load::facts` counts it in DuckDB, over the fixture's spans.
+    let mut facts = facts.clone();
+    for it in &spans {
+        let at = match facts.thread_cpu.iter().position(|cpu| (cpu.process, cpu.thread) == (it.process, it.thread)) {
+            Some(at) => at,
+            None => {
+                facts.thread_cpu.push(ThreadCpu { process: it.process, thread: it.thread, ..ThreadCpu::default() });
+                facts.thread_cpu.len() - 1
+            }
+        };
+        let cpu = &mut facts.thread_cpu[at];
+        match it.self_cpu_ns {
+            Some(ns) => (cpu.cpu_ns, cpu.counted) = (cpu.cpu_ns + ns, cpu.counted + 1),
+            None => cpu.uncounted += 1,
+        }
+    }
+    let facts = &facts;
     let model = Model::build(Input { build: 1, build_row: Some((0, wall * U)), switches, spans, events: Vec::new() }).unwrap();
     let path = path::critical(&model);
     let one = analyse(&model, &path, facts);

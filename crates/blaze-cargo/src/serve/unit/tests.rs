@@ -175,7 +175,7 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
         "cargo:rustc-cfg=has_z\ncargo::rustc-env=Z_VERSION=1.3\ncargo:rustc-link-lib=static=z\n\
          cargo:rustc-link-search=native={out_dir}/lib\ncargo:warning=z is old\ncargo:include={out_dir}/include\n"
     );
-    let env = script::inherited(&[], &units.plans[1]);
+    let env = script::inherited(&[], &units.plans[1], true);
     let judged = script::judge(&z, &env, &value(0, &printed, ""), Some(&[]), None, false);
     let output = judged.output.expect("the run succeeded");
     assert_eq!(output.cfgs, ["has_z"]);
@@ -274,11 +274,17 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
         ("SECRET_TOKEN".to_owned(), "hunter2".to_owned()),
         ("CARGO_PKG_NAME".to_owned(), "wrong".to_owned()),
         ("BLAZE_SCRIPT_CACHE".to_owned(), "check".to_owned()),
+        ("TMPDIR".to_owned(), "/tmp/nix-shell.dv7jx8".to_owned()),
     ];
     let dir = tempfile::tempdir().unwrap();
     let units = build(dir.path());
-    let env = script::inherited(&job, &units.plans[1]);
+    let env = script::inherited(&job, &units.plans[1], true);
     let get = |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, value)| value.clone());
+    // A shell's own temporary directory is none of a sandboxed run's: its sandbox gives its own.
+    #[cfg(unix)]
+    assert_eq!(get("TMPDIR"), None);
+    let outside = script::inherited(&job, &units.plans[1], false);
+    assert!(outside.iter().any(|(name, value)| name == "TMPDIR" && value == "/tmp/nix-shell.dv7jx8"), "a run outside the sandbox has the shell's");
     assert_eq!(get("BLAZE_SCRIPT_CACHE"), None, "how blaze checks its store is the job's, never a script's");
     assert_eq!(get("CARGO_PKG_NAME"), Some(OsString::from("z-sys")));
     assert_eq!(get("SECRET_TOKEN"), Some(OsString::from("hunter2")));
@@ -299,7 +305,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
     let one = blaze_usercode::script::prepare(&z, &env, &place).unwrap();
     let other: Vec<(String, String)> =
         job.iter().map(|(name, value)| (name.clone(), value.replace("hunter2", "swordfish"))).collect();
-    let two = blaze_usercode::script::prepare(&z, &script::inherited(&other, &units.plans[1]), &place).unwrap();
+    let two = blaze_usercode::script::prepare(&z, &script::inherited(&other, &units.plans[1], true), &place).unwrap();
     // A value passed through is in no key: what the script reads of it is traced.
     assert_eq!(one.spec.key, two.spec.key);
     assert!(!one.given.iter().any(|it| it == "SECRET_TOKEN"));

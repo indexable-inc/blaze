@@ -211,7 +211,7 @@ impl File {
             },
             Some(Fault::Tail { keep, why }) => {
                 if !self.ledger.is_empty() {
-                    // The cut record was a build's that ended well: its subjects' last computes
+                    // The cut record was a build's: its subjects' last computes
                     // are lost, so every record before it is compared with nothing. The ledger
                     // is written whole with that gap at the restore, so a second restart keeps it.
                     let after = self.ledger.after_newest();
@@ -698,6 +698,7 @@ mod tests {
                     build: 7,
                     parts: Vec::new(),
                     beyond: None,
+                    unfinished: false,
                     subject: ContentId([1; 32]),
                 },
             );

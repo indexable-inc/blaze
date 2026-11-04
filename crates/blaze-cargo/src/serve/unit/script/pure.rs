@@ -29,7 +29,7 @@ use blaze_usercode::{
     run::Value,
 };
 
-use super::{Of, compile_of, inherited, named_program, run_roots, script_unit};
+use super::{Of, compile_of, inherited, named_program, outside, run_roots, script_unit};
 use crate::serve::{
     unit::{Job, UnitReader, error::UnitError},
     work::RunPuts,
@@ -259,7 +259,8 @@ fn run_of(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsString)>)
     };
     // alloc: the edge: the error the build stops with
     let unit = script_unit(&of, run).map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
-    let env = inherited(&job.input.config.invocation.env, job.plan(run)?);
+    // As `prepare` starts the run in it, so the pure key reads what the run is given.
+    let env = inherited(&job.input.config.invocation.env, job.plan(run)?, !outside(job, run));
     Ok((unit, env))
 }
 

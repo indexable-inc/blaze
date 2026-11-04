@@ -121,7 +121,7 @@ pub struct FieldOrder {
 pub fn install(db: &mut Db, plan: Option<Arc<FieldOrderPlan>>) {
     match FieldOrder::try_get(db) {
         None => {
-            _ = FieldOrder::builder(plan).durability(Durability::HIGH).new(db);
+            _ = FieldOrder::new(db, Durability::HIGH, plan);
         }
         Some(input) => {
             if *input.plan(db) != plan {

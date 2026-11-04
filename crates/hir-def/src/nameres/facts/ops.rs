@@ -235,7 +235,8 @@ pub(crate) enum DeclOp {
     },
     /// A derive helper attribute that resolved (the old `derive_helper_uses`).
     DeriveHelperUse(DeriveHelperUse),
-    /// A macro with compilation-local state ran.
+    /// A proc-macro call whose output may depend on its session's state ran
+    /// (`hir_expand::proc_macro::StateUse::Session`).
     SessionMacros,
 }
 
