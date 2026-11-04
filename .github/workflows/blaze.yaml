@@ -104,7 +104,8 @@ jobs:
       # their index (tools/docs.py).
       - run: python3 tools/docs.py check
       # Each hash domain in crates/ is written once outside tests (tools/v2/domains.py).
-      - run: uv run --frozen python tools/v2/domains.py '{"root": "."}'
+      - run: |
+          uv run --frozen python tools/v2/domains.py '{"root": "."}'
 
   linux-x64:
     name: linux x64
@@ -201,7 +202,8 @@ jobs:
           job: build
           llvm: true
       - name: blaze build --release --features blaze-engine/llvm (the build job's)
-        run: python3 harness/unittests.py '{"build": true}'
+        run: |
+          python3 harness/unittests.py '{"build": true}'
       # The release's daemon ends first; the tree's blaze runs its own, from a home of its own.
       - run: blaze stop
       - env:
