@@ -1,7 +1,9 @@
 //! Asking a server for a file: the [`Http`] trait the index and the downloads go through, the
 //! retries of cargo's `net.retry` (`src/util/network/retry.rs`), and [`HyperHttp`], over the
-//! HTTP stack the rest of blaze uses (hyper 1 and rustls with ring); without the `net` feature
-//! (the seed profile) a [`HyperHttp`] whose every request is [`NoNet`].
+//! HTTP stack the rest of blaze uses (hyper 1 and rustls with ring, HTTP/2 or HTTP/1.1 over TCP,
+//! and HTTP/3 over quinn where `net.http3` and the host's advert pick it: [`choice`],
+//! docs/networking.md); without the `net` feature (the seed profile) a [`HyperHttp`] whose every
+//! request is [`NoNet`].
 
 use std::{
     fmt,
@@ -11,9 +13,20 @@ use std::{
 };
 
 #[cfg(feature = "net")]
+mod adverts;
+pub mod choice;
+#[cfg(feature = "net")]
 mod client;
+#[cfg(feature = "net")]
+mod dns;
 #[cfg(not(feature = "net"))]
 mod offline;
+#[cfg(feature = "net")]
+mod quic;
+mod settings;
+
+pub use choice::{Http3, Http3Failed, Http3Refused};
+pub use settings::Net;
 
 /// Whether this blaze can ask a server for anything: built with the `net` feature. Without it
 /// every request is [`NoNet`], so what is not in the store or the sources already can't be had,

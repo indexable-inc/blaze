@@ -20,6 +20,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 - [ix-prof.md](ix-prof.md): Profiling any Rust program, not only blaze, like Go's pprof. Covers the ix-prof crate (CPU samples of every thread, tracing spans with their own CPU time and allocations, named waits, allocations by stack), `IX_PROF=<dir>`, the loopback `/debug/pprof` endpoint and live stream, and `blaze pprof` with top, peek, tree, list, flame, diff, export and --http.
 - [lints.md](lints.md): The general `blaze::` lints `blaze check` runs in every workspace (`blaze::general`): what each catches, why it costs, how to fix or allow it, and the `clippy.toml` keys that tune them.
 - [mir-passes.md](mir-passes.md): The MIR passes from built MIR to runtime MIR, ported from rustc, that codegen and the interpreter run on.
+- [networking.md](networking.md): blaze's one HTTP client (crates.io index and downloads, URL fetches, release downloads): TCP with HTTP/2 or HTTP/1.1, HTTP/3 over QUIC by `net.http3`, how a host's HTTP/3 is learned (DNS HTTPS records, Alt-Svc), retries, proxies, and its errors.
 - [release.md](release.md): Releases: the canary and stable channels, how a release is cut and what gates promotion to stable.
 - [resolve.md](resolve.md): Reading Cargo.toml and .cargo/config.toml as cargo does (blaze-manifest), and how it measured against cargo.
 - [toolchain.md](toolchain.md): blaze's own pinned nightly: what it is, how it is fetched and checked, and the daily bump.

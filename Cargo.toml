@@ -570,6 +570,17 @@ http = "1.5.0"
 hyper = { version = "1.12.0", default-features = false }
 hyper-rustls = { version = "0.27.10", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
+# HTTP/3 for blaze-registry's one HTTP client (`net.http3`, docs/networking.md): QUIC by quinn on
+# the rustls/ring provider the rest of blaze uses (quinn is under wtransport already), HTTP/3 by h3.
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+# The `Buf` an HTTP/3 body comes in.
+bytes = "1.11.1"
+# The DNS HTTPS records (RFC 9460) that say a host serves HTTP/3. Addresses stay with the
+# system's getaddrinfo: hickory's macOS configuration reads only the global resolvers, not the
+# scoped ones a VPN's split DNS adds (docs/networking.md, "DNS").
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "system-config"] }
 # The persistent maps of blaze-resolve: im-rc's maintained fork (im-rc has had no release since 2021).
 imbl = "7.0.2"
 inkwell = { version = "0.11.0", default-features = false }

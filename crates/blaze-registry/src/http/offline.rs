@@ -7,7 +7,7 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use http::Method;
 
-use super::{Bounds, Http, Response};
+use super::{Bounds, Http, Net, Response};
 
 /// A request this blaze can't send: it is built without blaze-registry's `net` feature.
 #[derive(Clone, Debug)]
@@ -35,6 +35,11 @@ pub struct HyperHttp {
 
 impl HyperHttp {
     pub fn new(_timeout: Duration) -> anyhow::Result<HyperHttp> {
+        Ok(HyperHttp { _offline: () })
+    }
+
+    /// As [`HyperHttp::new`]: `net` changes nothing when nothing is asked.
+    pub fn with_net(_timeout: Duration, _net: Net) -> anyhow::Result<HyperHttp> {
         Ok(HyperHttp { _offline: () })
     }
 

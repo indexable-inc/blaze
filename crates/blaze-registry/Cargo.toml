@@ -41,23 +41,51 @@ blaze-fetch.workspace = true
 # The configuration credentials are read from, as cargo's `GlobalContext` holds it.
 blaze-manifest.workspace = true
 toml.workspace = true
-# The HTTP stack the rest of blaze uses (crates/blaze-engine/Cargo.toml): hyper 1 over rustls with ring.
-hyper = { workspace = true, optional = true, features = ["client", "http1"] }
+# The HTTP stack the rest of blaze uses (crates/blaze-engine/Cargo.toml): hyper 1 over rustls with
+# ring, HTTP/2 where the server's ALPN picks it, else HTTP/1.1; HTTP/3 by quinn and h3 below.
+hyper = { workspace = true, optional = true, features = ["client", "http1", "http2"] }
 # The method, status and header names `api` asks with, which the seed has without hyper and tokio.
 http.workspace = true
-hyper-util = { workspace = true, optional = true, features = ["client-legacy", "http1", "tokio"] }
-hyper-rustls = { workspace = true, optional = true, features = ["http1", "native-tokio", "ring", "tls12"] }
+hyper-util = { workspace = true, optional = true, features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { workspace = true, optional = true, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
 http-body-util = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "sync", "time"] }
+# `net` for the addresses an HTTP/3 connection is made to (getaddrinfo, as hyper's connector).
+tokio = { workspace = true, optional = true, features = ["net", "rt-multi-thread", "sync", "time"] }
+# HTTP/3 (`net.http3`): QUIC on the same rustls/ring provider and machine roots as the TCP path.
+quinn = { workspace = true, optional = true }
+h3 = { workspace = true, optional = true }
+h3-quinn = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+# A host's DNS HTTPS record (RFC 9460), which says it serves HTTP/3.
+hickory-resolver = { workspace = true, optional = true }
+# The spans every wait of a request opens: the host, the protocol and why it was chosen.
+tracing = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [features]
 default = ["net"]
-# `http::HyperHttp` over hyper and rustls on ring. Without it (the seed profile, which builds
-# offline from vendored sources) every request is `http::NoNet`, naming its URL.
-net = ["dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:http-body-util", "dep:tokio"]
+# `http::HyperHttp` over hyper and rustls on ring, and HTTP/3 over quinn and h3 on the same.
+# Without it (the seed profile, which builds offline from vendored sources) every request is
+# `http::NoNet`, naming its URL.
+net = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:hyper-rustls",
+    "dep:http-body-util",
+    "dep:tokio",
+    "dep:quinn",
+    "dep:h3",
+    "dep:h3-quinn",
+    "dep:bytes",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:hickory-resolver",
+    "dep:tracing",
+]
 
 [lints]
 workspace = true
