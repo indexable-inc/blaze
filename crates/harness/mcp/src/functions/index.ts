@@ -5,9 +5,10 @@ import { table, Table } from "../table.ts";
 import { nuon } from "../nuon.ts";
 import { tasks, task, taskValue, wait } from "../tasks.ts";
 import { agents } from "../agents.ts";
+import { sql } from "../sql.ts";
 import { sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo } from "../proc.ts";
 
-export const functions = { googleSearch, withHiddenPage, table, Table, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents };
+export const functions = { googleSearch, withHiddenPage, table, Table, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, agents, sql };
 
 /** Shown in the MCP tool description so the model knows what it can call. */
 export const docs: Record<keyof typeof functions, string> = {
@@ -35,4 +36,6 @@ export const docs: Record<keyof typeof functions, string> = {
   runInfo: "runInfo(run: 'r12' | Proc): Promise<{ id; cmd; cwd; session; parent; status; exit_code; signal; start_ms; end_ms; pipelines: { op: ';'|'&&'|'||'|null; stages: number[] }[]; stages: Table<{ i; text; pipeline; pid; exit_code; signal; status: pending|running|done|skipped|unknown; start_ms; end_ms; stdout_bytes; stderr_bytes }>; procs?: live process tree while running }> — the run graph for one command.",
   agents:
     "agents — the harness agent tree (sessions shown in the harness web UI). agents.self() / agents.parent(): session ids; await agents.list() / agents.tree(): Table; await agents.spawn({ kind?: 'claude'|'codex'|'shell' = 'claude', prompt?, args?, cwd? }): id of a new child agent under this one; await agents.send(id, text, { submit? = true }): type a message into it (Enter pressed); await agents.notifyParent(text); await agents.screen(id): its screen as text; await agents.waitFor(id, textOrRegex, timeoutMs?); await agents.kill(id); await agents.url(id?): web UI link.",
+  sql:
+    "sql`select ...`: Promise<Table<Row>> — DuckDB over everything harness has stored, surviving daemon restarts; ${values} become bound parameters. Everything is an object: PTY sessions 's7' (kind claude|codex|cursor|shell), shell runs 'r12' (kind proc, every sh() call), their pipeline stages 'r12.0' (kind stage, parent r12), REPL cells (kind repl). Views: objects(id, kind, name, parent, cwd, args json, created_ms, ended_ms, status, exit_code, signal, meta json); sessions / runs (+cmd) / stages (+text, idx, pipeline) = objects by kind; streams(object, stream: pty|stdout|stderr|stdin|final_err|messages, path, bytes, compacted_ms); lines(object, kind, stream, line_no, ts_ms, text) = every line of every stream, live and archived (alias events); messages(object, role, kind: text|thinking|tool_call|tool_result, tool, text, ts_ms) = agent conversations. Examples: errors across all runs: sql`select object, line_no, text from lines where kind = 'stage' and text ilike '%error%' order by object desc limit 20`; last clippy output from any agent: sql`select l.line_no, l.text from lines l where l.object = (select id from stages where text like 'cargo clippy%' order by created_ms desc limit 1) order by stream, line_no`; one run's stages: sql`select id, text, status, exit_code from stages where parent = ${'r12'} order by idx`.",
 };

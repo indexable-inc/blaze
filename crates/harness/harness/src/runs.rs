@@ -13,7 +13,7 @@
 //! Store: paths::home()/runs/<id>/ meta.json, sN.out, sN.err, sN.pid, sN.rc, final.err.
 //! The caller-visible stdout ("final") is the last stage of each executed pipeline, in order;
 //! the caller-visible stderr is final.err (every stage's stderr, as it arrived).
-use crate::paths;
+use crate::{archive, db, paths};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -89,7 +89,7 @@ fn store() -> &'static Store {
     })
 }
 
-fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 }
+pub fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 }
 
 fn run_dir(id: &str) -> Result<PathBuf> {
     if !id.starts_with('r') || id.len() < 2 || !id[1..].bytes().all(|b| b.is_ascii_digit()) {
@@ -373,6 +373,7 @@ fn start(
     write_meta(&d, &meta)?;
     let (tx, rx) = watch::channel(false);
     st.live.lock().unwrap().insert(id.clone(), Arc::new(Live { pid, done: rx }));
+    index(&id);
     let mut err = child.stderr.take().ok_or_else(|| anyhow!("no stderr pipe"))?;
     let id2 = id.clone();
     tokio::spawn(async move {
@@ -415,6 +416,12 @@ fn start(
             let _ = write_meta(&d, &m);
         }
         store().live.lock().unwrap().remove(&id2);
+        let id3 = id2.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            index(&id3);
+            archive::compact_bg(id3);
+        })
+        .await;
         let _ = tx.send(true);
     });
     Ok(json!({ "id": id, "pid": pid }))
@@ -479,6 +486,31 @@ fn overlay(d: &Path, m: &mut Value, live: bool) {
             });
             s["stdout_bytes"] = json!(size(&d.join(format!("s{k}.out"))));
             s["stderr_bytes"] = json!(size(&d.join(format!("s{k}.err"))));
+        }
+    }
+}
+
+/// Write the run's current state into the object index.
+fn index(id: &str) {
+    match (run_dir(id), status(id, false)) {
+        (Ok(d), Ok(m)) => db::upsert_run(&m, &d),
+        (_, Err(e)) => eprintln!("index {id}: {e:#}"),
+        _ => {}
+    }
+}
+
+/// Startup: index every run on disk that isn't compacted yet (older runs, runs the last daemon
+/// lost mid-flight), so the index covers runs from before it existed.
+pub fn backfill() {
+    let ids: Vec<String> = std::fs::read_dir(dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().filter(|n| n.starts_with('r')).map(str::to_string))
+        .collect();
+    for id in ids {
+        if run_dir(&id).is_ok() && !db::is_compacted(&id) && !store().live.lock().unwrap().contains_key(&id) {
+            index(&id);
         }
     }
 }

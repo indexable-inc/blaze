@@ -1,4 +1,7 @@
+mod archive;
 mod client;
+mod db;
+mod messages;
 mod daemon;
 mod paths;
 mod profiles;
@@ -16,7 +19,7 @@ harness claude|codex|shell [args...]
                               start a locked-down agent in this directory, open it in the web UI
 harness tui [claude|codex|shell [args...]]
                               terminal UI instead of the browser (ctrl-] returns to the tree)
-harness ls                    print the session tree
+harness ls [--all]            print the session tree (--all: past sessions too, from the index)
 harness send <id> <text...>   type a message into a session and press Enter
 harness screen <id>           print a session's current screen
 harness kill <id>             kill a session's process
@@ -56,7 +59,8 @@ async fn main() -> Result<()> {
             daemon::run(port).await
         }
         Some("ls") => {
-            let v = client::Ctl::connect().await?.req(json!({"op": "list"})).await?;
+            let all = args.get(1).is_some_and(|a| a == "--all" || a == "-a");
+            let v = client::Ctl::connect().await?.req(json!({"op": "list", "all": all})).await?;
             for (_, line, _) in client::tree_lines(v["sessions"].as_array().map(Vec::as_slice).unwrap_or(&[])) {
                 println!("{line}");
             }

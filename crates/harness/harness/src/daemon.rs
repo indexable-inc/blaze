@@ -1,7 +1,7 @@
 //! harnessd: owns every agent PTY, mirrors each into a vt100 emulator (so a re-attaching client or
 //! the web view can redraw the current screen), records the parent/child tree, and serves the
 //! socket API plus the web UI. Survives client exit like a tmux server.
-use crate::{paths, profiles, proto, queries, runs, web};
+use crate::{archive, db, messages, paths, profiles, proto, queries, runs, web};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -35,6 +35,8 @@ impl vt100::Callbacks for TitleCb {
 pub struct Session {
     pub id: u64,
     pub kind: String,
+    /// Unique among running objects; how a get-or-create spawn finds it again.
+    pub name: Option<String>,
     pub parent: Option<u64>,
     pub cwd: String,
     pub argv: Vec<String>,
@@ -87,7 +89,7 @@ impl Session {
         let (cols, rows) = self.size();
         let title = self.term.lock().unwrap().callbacks().title.clone();
         json!({
-            "id": self.id, "kind": self.kind, "parent": self.parent, "title": title, "cwd": self.cwd,
+            "id": self.id, "object": format!("s{}", self.id), "kind": self.kind, "name": self.name, "parent": self.parent, "title": title, "cwd": self.cwd,
             "argv": self.argv, "created_ms": self.created_ms, "exit": *self.exit.lock().unwrap(),
             "attached": self.attached.load(Ordering::Relaxed), "cols": cols, "rows": rows,
         })
@@ -108,7 +110,11 @@ pub struct Daemon {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Req {
-    List,
+    /// Live sessions; with all: true also past ones from the index (status exited | lost).
+    List {
+        #[serde(default)]
+        all: bool,
+    },
     Info,
     Last,
     Spawn {
@@ -118,6 +124,7 @@ pub enum Req {
         parent: Option<u64>,
         cwd: Option<String>,
         prompt: Option<String>,
+        name: Option<String>,
         cols: Option<u16>,
         rows: Option<u16>,
     },
@@ -136,6 +143,11 @@ pub enum Req {
     Kill { id: u64 },
     Forget { id: u64 },
     Shutdown,
+    /// A REPL cell started or finished (posted by the MCP process): indexed as a `repl` object.
+    ReplTask {
+        #[serde(flatten)]
+        task: Value,
+    },
     /// Shell runs with every pipeline stage's output stored: run, run_status, runs, run_read, run_kill, run_wait.
     #[serde(untagged)]
     Runs(runs::RunReq),
@@ -158,10 +170,31 @@ impl Daemon {
         self: &Arc<Self>, kind: &str, args: &[String], parent: Option<u64>, cwd: Option<String>, prompt: Option<&str>,
         cols: u16, rows: u16,
     ) -> Result<u64> {
+        self.spawn_named(kind, args, parent, cwd, prompt, None, cols, rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_named(
+        self: &Arc<Self>, kind: &str, args: &[String], parent: Option<u64>, cwd: Option<String>, prompt: Option<&str>,
+        name: Option<String>, cols: u16, rows: u16,
+    ) -> Result<u64> {
+        if let Some(n) = &name {
+            db::check_name(n)?;
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let sock = paths::sock();
         let cwd = cwd.unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".into()));
-        let launch = profiles::launch(kind, &profiles::Ctx { session: id, cwd: &cwd, sock: &sock, user_args: args, prompt })?;
+        let created_ms = now_ms();
+        // A known Claude session id ties this object to its transcript (the messages stream).
+        let mut args = args.to_vec();
+        let mut meta = json!({ "session": id, "cwd": cwd, "created_ms": created_ms });
+        let resumes = args.iter().any(|a| matches!(a.as_str(), "-r" | "--resume" | "-c" | "--continue" | "--session-id"));
+        if kind == "claude" && !resumes {
+            let uuid = uuid_v4();
+            args.splice(0..0, ["--session-id".to_string(), uuid.clone()]);
+            meta["claude_session"] = json!(uuid);
+        }
+        let launch = profiles::launch(kind, &profiles::Ctx { session: id, cwd: &cwd, sock: &sock, user_args: &args, prompt })?;
         let mut cmd = CommandBuilder::new(&launch.program);
         cmd.args(&launch.args);
         cmd.cwd(&cwd);
@@ -190,8 +223,14 @@ impl Daemon {
         let (tx, _) = broadcast::channel(4096);
         let mut argv = vec![launch.program.clone()];
         argv.extend(launch.args.iter().cloned());
+        let raw_path = db::object_dir(&format!("s{id}")).join("pty");
+        std::fs::create_dir_all(raw_path.parent().unwrap())?;
+        let mut raw = std::fs::OpenOptions::new().create(true).append(true).open(&raw_path)?;
+        db::session_start(&db::SessionRow {
+            id, kind, name: name.as_deref(), parent, cwd: &cwd, argv: &argv, created_ms, meta,
+        });
         let session = Arc::new(Session {
-            id, kind: kind.into(), parent, cwd, argv, created_ms: now_ms(),
+            id, kind: kind.into(), name, parent, cwd, argv, created_ms,
             term: Mutex::new(vt100::Parser::new_with_callbacks(
                 NonZeroU16::new(rows).unwrap_or(NonZeroU16::new(24).unwrap()),
                 NonZeroU16::new(cols).unwrap_or(NonZeroU16::new(80).unwrap()),
@@ -210,6 +249,10 @@ impl Daemon {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
+                // Every byte the PTY produced, so the transcript outlives the daemon.
+                if let Err(e) = raw.write_all(&buf[..n]) {
+                    eprintln!("session {id} pty stream: {e}");
+                }
                 let f = {
                     let mut term = s.term.lock().unwrap();
                     let f = queries::filter(&buf[..n], &mut term);
@@ -228,6 +271,8 @@ impl Daemon {
             let code = child.wait().map(|st| st.exit_code() as i32).unwrap_or(-1);
             *s.exit.lock().unwrap() = Some(code);
             let _ = s.tx.send(Ev::Exit(code));
+            db::session_end(s.id, code, now_ms());
+            archive::compact_bg(format!("s{}", s.id));
         })?;
         eprintln!("spawned session {id}: {kind} (parent {parent:?})");
         Ok(id)
@@ -235,15 +280,27 @@ impl Daemon {
 
     fn handle(self: &Arc<Self>, req: Req) -> Result<Value> {
         Ok(match req {
-            Req::List => json!({ "sessions": self.list() }),
+            Req::List { all } => {
+                let mut v = self.list();
+                if all {
+                    let live: std::collections::HashSet<u64> = v.iter().filter_map(|s| s["id"].as_u64()).collect();
+                    v.extend(db::sessions().into_iter().filter(|s| s["id"].as_u64().is_some_and(|i| !live.contains(&i))));
+                    v.sort_by_key(|s| s["id"].as_u64());
+                }
+                json!({ "sessions": v })
+            }
+            Req::ReplTask { task } => {
+                db::repl_task(&task)?;
+                json!({ "ok": true })
+            }
             Req::Info => json!({ "pid": std::process::id(), "web": format!("http://127.0.0.1:{}", self.web_port), "sock": paths::sock() }),
             Req::Last => {
                 let last = *self.last.lock().unwrap();
                 let alive = last.and_then(|id| self.get(id).ok()).filter(|s| s.exit.lock().unwrap().is_none()).map(|s| s.id);
                 json!({ "id": alive })
             }
-            Req::Spawn { kind, args, parent, cwd, prompt, cols, rows } => {
-                let id = self.spawn(&kind, &args, parent, cwd, prompt.as_deref(), cols.unwrap_or(120), rows.unwrap_or(40))?;
+            Req::Spawn { kind, args, parent, cwd, prompt, name, cols, rows } => {
+                let id = self.spawn_named(&kind, &args, parent, cwd, prompt.as_deref(), name, cols.unwrap_or(120), rows.unwrap_or(40))?;
                 json!({ "id": id })
             }
             Req::Send { id, text, raw, submit } => {
@@ -303,7 +360,16 @@ pub async fn run(web_port: u16) -> Result<()> {
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
     let web = tokio::net::TcpListener::bind(("127.0.0.1", web_port)).await.with_context(|| format!("bind web port {web_port}"))?;
     let web_port = web.local_addr()?.port();
-    let d = Arc::new(Daemon { sessions: Mutex::new(BTreeMap::new()), next: AtomicU64::new(1), last: Mutex::new(None), web_port });
+    // The object index: session ids continue after the last one ever used; sessions the last daemon
+    // left running are lost; older runs get indexed, finished objects compacted, transcripts mirrored.
+    db::mark_lost_sessions();
+    let next = db::max_session_id() + 1;
+    std::thread::spawn(|| {
+        runs::backfill();
+        archive::compact_pending();
+    });
+    std::thread::spawn(messages::poll);
+    let d = Arc::new(Daemon { sessions: Mutex::new(BTreeMap::new()), next: AtomicU64::new(next), last: Mutex::new(None), web_port });
     std::fs::write(paths::info(), json!({ "pid": std::process::id(), "web": format!("http://127.0.0.1:{web_port}") }).to_string())?;
     eprintln!("harnessd pid {} socket {} web http://127.0.0.1:{web_port}", std::process::id(), sock.display());
     tokio::spawn(web::serve(d.clone(), web));
@@ -409,4 +475,16 @@ async fn attach(s: Arc<Session>, mut r: tokio::net::unix::OwnedReadHalf, mut w: 
     out.abort();
     s.attached.fetch_sub(1, Ordering::Relaxed);
     res
+}
+
+/// Random RFC 4122 v4 UUID (for Claude's --session-id).
+fn uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut b);
+    }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }

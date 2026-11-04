@@ -4,6 +4,20 @@
 import * as acorn from "acorn";
 import { nuon } from "./nuon.ts";
 import { installCapture, inTask, newTask, type Task } from "./tasks.ts";
+import { req, daemonPresent } from "./daemon.ts";
+
+// This REPL process as the parent of its cells' objects in the harness index (`<repl>.t3`, kind repl).
+const REPL_ID = `repl-${process.pid}-${Date.now().toString(36)}`;
+const cap = (s: string, n = 64 << 10) => (s.length > n ? s.slice(0, n) + `… [${s.length - n} more chars]` : s);
+/** Index a cell in harnessd (best effort; the REPL works without the daemon). */
+function post(t: Task) {
+  if (!daemonPresent()) return;
+  req({
+    op: "repl_task", repl: REPL_ID, id: t.id, session: process.env.HARNESS_SESSION ? Number(process.env.HARNESS_SESSION) : null,
+    cwd: process.cwd(), code: cap(t.code), status: t.status, started_ms: t.started.getTime(), ended_ms: t.ended?.getTime() ?? null,
+    logs: cap(t.logs.join("\n")), result: cap(t.result),
+  }).catch(() => {});
+}
 
 const transpiler = new Bun.Transpiler({ loader: "ts", target: "bun", trimUnusedImports: false, deadCodeElimination: false });
 const AsyncFunction = (async () => {}).constructor as new (...args: string[]) => (...a: unknown[]) => Promise<unknown>;
@@ -74,7 +88,8 @@ export class Repl {
   /** Start a cell as a task and return it at once; cells run concurrently, each with its own console capture. */
   run(code: string, timeoutMs?: number): Task {
     const t = newTask(code);
-    inTask(t, () => this.#run(code, timeoutMs)).then(({ ok, value, result }) => t.finish(ok, value, result));
+    post(t);
+    inTask(t, () => this.#run(code, timeoutMs)).then(({ ok, value, result }) => { t.finish(ok, value, result); post(t); });
     return t;
   }
 

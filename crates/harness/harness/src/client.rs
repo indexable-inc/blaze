@@ -227,6 +227,7 @@ pub fn tree_lines(list: &[Value]) -> Vec<(u64, String, bool)> {
             let exit = s["exit"].as_i64();
             let state = match exit {
                 Some(c) => format!("exit {c}"),
+                None if s["status"] == "lost" => "lost".into(), // the daemon stopped while it ran
                 None if s["attached"].as_u64().unwrap_or(0) > 0 => "attached".into(),
                 None => "running".into(),
             };
@@ -234,7 +235,7 @@ pub fn tree_lines(list: &[Value]) -> Vec<(u64, String, bool)> {
             (
                 s["id"].as_u64().unwrap_or(0),
                 format!("{indent}#{} {:<6} {:<9} {:>4}  {}", s["id"], s["kind"].as_str().unwrap_or(""), state, age(s["created_ms"].as_u64().unwrap_or(0)), title),
-                exit.is_some(),
+                exit.is_some() || s["status"] == "lost",
             )
         })
         .collect()
