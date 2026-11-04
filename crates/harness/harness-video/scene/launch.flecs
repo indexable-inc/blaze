@@ -7,8 +7,9 @@
 //   0.35 to 1.5   the letters drop in from the top of the frame, one by one, each landing on a note climbing A B C# E G#
 //   1.7           the fire catches from the b to the e, on A major; the frame starts a slow push in
 //   3.8 to 6.8    the letters glow white hot, burn down the fire's colours and crumble into embers
-//   6.4           where they stood, where to find it, arriving hot and cooling; it holds while the last embers ring
-//                 out, then fades slowly to the dark ground the video started on
+//   5.6           the theme comes home, E A then a low A (burn + 1.8 in the exit's sound): on that A, where the letters
+//                 stood, where to find it, arriving hot and cooling; it holds under the exit's pad and fades out with it,
+//                 to the dark ground the video started on
 //
 // Motion is data: a `Cue` child moves one member of its node (`Pose.fade`, `Pose.shrink`...) between two values over a
 // stretch of the clock. The `cue.*` templates below are the few moves this video makes, by name. The mark's own motion
@@ -49,6 +50,8 @@ launch_part {
 // The mark's timeline: its letters start falling at `drop`, and it burns away from `burn`.
 const drop = 0.35
 const burn = 3.8
+// The low A the exit's sound comes home on.
+const home = $burn + 1.8
 
 @tree ChildOf
 launch : ui.ZStack {
@@ -69,8 +72,8 @@ launch : ui.ZStack {
   outro : launch_part.Layer {
     url : launch_part.Lead {
       Text: {s: "ix.dev/blaze"}
-      GlyphsIn: {at: 6.4, per: 0.045, dur: 0.5, by: 0, ease: Out, cool: 1.1, hot: $fire_3}
-      cue.FadeOut leave(at: 8.4, dur: 1.2)
+      GlyphsIn: {at: $home, per: 0.045, dur: 0.5, by: 0, ease: Out, cool: 1.1, hot: $fire_3}
+      cue.FadeOut leave(at: 8.5, dur: 1.4)
     }
   }
 }

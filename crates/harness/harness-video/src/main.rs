@@ -144,9 +144,17 @@ impl Stage {
 
     /// The soundtrack at `sr` Hz: the one `BlazeMark`'s, or None for a scene without one.
     fn sound(&self, sr: u32) -> Result<Option<Vec<[f32; 2]>>, String> {
-        use harness_native_ui_text_api::BlazeMark;
+        use harness_native_ui_text_api::{BlazeMark, Text};
+        use harness_native_ui_timeline_api::GlyphsIn;
         let mut marks = Vec::new();
         self.world.new_query::<&BlazeMark>().each_entity(|e, m| marks.push((e.path(), *m)));
+        // Each glyph that arrives (a `GlyphsIn`) rings as it does, in time order.
+        let mut glints = Vec::new();
+        self.world.new_query::<(&GlyphsIn, &Text)>().each(|(g, t)| {
+            let n = t.s.as_str().chars().filter(|c| !c.is_whitespace()).count();
+            glints.extend((0..n).map(|i| g.at + g.per * i as f32));
+        });
+        glints.sort_by(f32::total_cmp);
         match marks.as_slice() {
             [] => Ok(None),
             [(_, m)] => Ok(Some(harness_native_blaze::sound::soundtrack(
@@ -154,6 +162,7 @@ impl Stage {
                 self.video.seconds,
                 m.start,
                 (m.exit > m.start).then_some(m.exit),
+                &glints,
                 7,
             ))),
             many => Err(format!(

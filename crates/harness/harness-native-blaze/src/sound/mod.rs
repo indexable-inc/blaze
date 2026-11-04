@@ -172,6 +172,22 @@ impl Track {
         }
     }
 
+    /// Words arriving a glyph at a time, one soft bell at each of `at` (seconds, in order): a run up A major's
+    /// pentatonic from the A two octaves over the theme's home, panned left to right across the words and thinning as
+    /// it climbs, so a line of them sounds like one gesture over the low A rather than a row of separate notes.
+    fn glints(&mut self, at: &[f32]) {
+        const STEPS: [f32; 5] = [0.0, 2.0, 4.0, 7.0, 9.0];
+        let n = at.len().max(2) as f32 - 1.0;
+        for (i, &t) in at.iter().enumerate() {
+            let semis = 12.0 * (i / STEPS.len()) as f32 + STEPS[i % STEPS.len()];
+            let freq = 880.0 * 2f32.powf(semis / 12.0);
+            let k = i as f32 / n;
+            let amp = 0.1 * (1.0 - 0.5 * k) * self.rng.range(0.9, 1.1);
+            let t = t + self.rng.range(-0.004, 0.004);
+            self.bell(t, freq, amp, 1.6 - 0.6 * k, -0.45 + 0.9 * k);
+        }
+    }
+
     /// Fire catching across the word in `catch` seconds and burning for
     /// `dur`: air drawn in just before, a whoomph that travels from the
     /// first letter to the last over a sub thump, then the fire itself.
@@ -386,6 +402,7 @@ pub fn soundtrack(
     seconds: f32,
     start: f32,
     exit: Option<f32>,
+    glints: &[f32],
     seed: u64,
 ) -> Vec<[f32; 2]> {
     let mut rng = Rng(seed | 1);
@@ -417,6 +434,7 @@ pub fn soundtrack(
     let burns = exit.map_or(seconds, |e| e + 0.6) - lit;
     tr.ignite(lit, blaze::IGNITE, burns.max(1.6));
     tr.resolve(lit);
+    tr.glints(glints);
     let (mut out, gain) = tr.mix();
     if let Some(at) = exit {
         // The exit as anim plays it: its own track through the same room, at the soundtrack's scale.
