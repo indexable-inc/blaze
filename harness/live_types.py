@@ -81,8 +81,12 @@ class Daemon:
     async def run(self, step: str) -> Running:
         """`blaze run` of the program, once it said it is ready."""
         proc = await asyncio.create_subprocess_exec(
-            self.blaze, "run", cwd=self.project, env=self.env,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            self.blaze,
+            "run",
+            cwd=self.project,
+            env=self.env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
         running = Running(proc)
         await running.wait_for(f"{step}: the program starts", "ready")
@@ -186,11 +190,16 @@ async def main(args: Args) -> None:
         for stage, name in STAGES.items():
             step = f"stage {stage} ({name})"
             outcome, got, took = await edit(step, live, program, stage)
-            print(f"{step}: {outcome.removeprefix('outcome: ')} [{took:.0f} ms from the build to applied]", flush=True)
+            print(
+                f"{step}: {outcome.removeprefix('outcome: ')} [{took:.0f} ms from the build to applied]",
+                flush=True,
+            )
             if not applied(outcome):
                 raise StepError(f"{step}: the edit was not applied as a patch: {outcome}")
             if got != expected[stage]:
-                raise StepError(f"{step}: the program says `{got}`, the build from nothing `{expected[stage]}`")
+                raise StepError(
+                    f"{step}: the program says `{got}`, the build from nothing `{expected[stage]}`"
+                )
             print(f"  {got}", flush=True)
 
         # A type the program has values of, changed in place, is the one edit that restarts.

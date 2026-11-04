@@ -22,6 +22,7 @@ daemon's lock), and `Daemon.command` with `test_results`: any blaze command aske
 and the `blaze-test-result` lines of a `blaze test --reached --message-format=json`
 (crates/blaze-cargo/src/cli/json.rs, `test_result`) read into `TestLine`s.
 """
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -39,7 +40,7 @@ import time
 from collections.abc import Iterable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Literal, TypeVar, cast
+from typing import Literal, cast
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STRESS = os.path.join(HERE, "stress")
@@ -52,9 +53,19 @@ START_SECS, BUILD_SECS, RUN_SECS, STOP_SECS = 300, 1800, 60, 300
 LISTENING = "blaze serve: listening on "
 BROKEN = "the store cannot go on: "
 # Read by blaze or cargo from the caller's environment; a harness sets what it means to.
-SCRUBBED = ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTDOCFLAGS", "RUSTC", "RUSTC_WRAPPER",
-            "RUSTC_WORKSPACE_WRAPPER", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "CARGO_INCREMENTAL",
-            "BLAZE_HOME", "XDG_RUNTIME_DIR")
+SCRUBBED = (
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_TARGET",
+    "CARGO_INCREMENTAL",
+    "BLAZE_HOME",
+    "XDG_RUNTIME_DIR",
+)
 # For `run`, as its callers outside the store harnesses have it: what a program is run under.
 RUNNER = shlex.split(os.environ.get("BLAZE_RUNNER", ""))
 
@@ -71,8 +82,8 @@ def scratch(prefix: str) -> str:
 
 def run(path: str) -> str:
     try:
-        ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=60)
-    except Exception as error:
+        ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
         return f"did not run: {error}"
     return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
 
@@ -80,7 +91,7 @@ def run(path: str) -> str:
 def printed(executable: str) -> str:
     """What a program prints, with its exit status when that is not 0."""
     try:
-        ran = subprocess.run([executable], capture_output=True, text=True, timeout=RUN_SECS)
+        ran = subprocess.run([executable], capture_output=True, text=True, timeout=RUN_SECS, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         return f"did not run: {error}"
     return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
@@ -225,10 +236,7 @@ def text_of(message: Message, field: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
-T = TypeVar("T")
-
-
-def field_of(message: Mapping[str, object], field: str, kind: type[T]) -> T:
+def field_of[T](message: Mapping[str, object], field: str, kind: type[T]) -> T:
     """The field `field` of `message`, of type `kind`; a message without one, or with one of
     another type, is refused, naming both."""
     value = message.get(field)
@@ -300,11 +308,20 @@ def worked(said: str) -> list[Work]:
     `--message-format=json` printed: one a request the daemon served."""
     out: list[Work] = []
     for message in messages(said, "blaze-work"):
-        made = tuple(Link(text_of(it, "path") or "", text_of(it, "how") or "", strings_of(it, "why"))
-                     for it in objects_of(message, "links"))
-        out.append(Work(field_of(message, "reran", int), field_of(message, "green", int),
-                        field_of(message, "compiled", int), field_of(message, "found", int),
-                        text_of(message, "link") or "", made))
+        made = tuple(
+            Link(text_of(it, "path") or "", text_of(it, "how") or "", strings_of(it, "why"))
+            for it in objects_of(message, "links")
+        )
+        out.append(
+            Work(
+                field_of(message, "reran", int),
+                field_of(message, "green", int),
+                field_of(message, "compiled", int),
+                field_of(message, "found", int),
+                text_of(message, "link") or "",
+                made,
+            )
+        )
     return out
 
 
@@ -313,8 +330,9 @@ def links(said: str, program: str) -> list[Link]:
     lines. A link names the output before it is uplifted, cargo's `deps/<program>-<metadata>`,
     or the uplifted path itself."""
     own = re.compile(rf"{re.escape(program)}(?:-[0-9a-f]+)?(?:\.exe|\.dylib|\.so|\.dll)?")
-    return [link for work in worked(said) for link in work.links
-            if own.fullmatch(os.path.basename(link.path))]
+    return [
+        link for work in worked(said) for link in work.links if own.fullmatch(os.path.basename(link.path))
+    ]
 
 
 class Daemon:
@@ -322,8 +340,14 @@ class Daemon:
     is set for it and for every build asked of it, over what `environment` leaves, a value of
     None unsetting the variable."""
 
-    def __init__(self, blaze: str, home: str, name: str = "serve", wait: bool = True,
-                 env: Mapping[str, str | None] | None = None):
+    def __init__(
+        self,
+        blaze: str,
+        home: str,
+        name: str = "serve",
+        wait: bool = True,
+        env: Mapping[str, str | None] | None = None,
+    ):
         self.blaze, self.home = blaze, home
         os.makedirs(home, exist_ok=True)
         given: dict[str, str | None] = {**environment(home), **(env or {})}
@@ -331,8 +355,14 @@ class Daemon:
         self.log_path = os.path.join(home, f"{name}.log")
         self.seen = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
         with open(self.log_path, "a") as out:
-            self.process = subprocess.Popen([blaze, "serve"], stdin=subprocess.DEVNULL, stdout=out, stderr=out,
-                                            env=self.env, start_new_session=True)
+            self.process = subprocess.Popen(
+                [blaze, "serve"],
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=out,
+                env=self.env,
+                start_new_session=True,
+            )
         self.listening = False
         if wait:
             self.wait()
@@ -362,7 +392,9 @@ class Daemon:
                 return False
             if time.monotonic() > deadline:
                 self.kill()
-                raise Failed(f"`blaze serve` in {self.home} did not listen within {timeout} s: {self.log_path}")
+                raise Failed(
+                    f"`blaze serve` in {self.home} did not listen within {timeout} s: {self.log_path}"
+                )
             time.sleep(0.02)
         self.listening = True
         return True
@@ -374,24 +406,40 @@ class Daemon:
         """A `blaze build` of `ws` started and not waited for."""
         if not self.listening or not self.alive():
             raise Failed(f"a build asked of a daemon that does not listen: {self.log_path}")
-        return subprocess.Popen(self.argv(*args), cwd=ws, env=self.env, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return subprocess.Popen(
+            self.argv(*args),
+            cwd=ws,
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
-    def answer(self, client: subprocess.Popen[str], program: str = PROGRAM,
-               timeout: float = BUILD_SECS) -> Built:
+    def answer(
+        self, client: subprocess.Popen[str], program: str = PROGRAM, timeout: float = BUILD_SECS
+    ) -> Built:
         try:
             out, err = client.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             client.kill()
             out, err = client.communicate()
-            raise Failed(f"`blaze build` took more than {timeout} s:\n{(out + err)[-3000:]}\nlog: {self.log_path}")
+            raise Failed(
+                f"`blaze build` took more than {timeout} s:\n{(out + err)[-3000:]}\nlog: {self.log_path}"
+            )
         return Built(client.returncode, out + err, artifact(out, program) if client.returncode == 0 else None)
 
     def build(self, ws: str, *args: str, program: str = PROGRAM, timeout: float = BUILD_SECS) -> Built:
         return self.answer(self.asking(ws, *args), program, timeout)
 
-    def command(self, ws: str, verb: str, *args: str, env: Mapping[str, str | None] | None = None,
-                timeout: float = BUILD_SECS) -> Ran:
+    def command(
+        self,
+        ws: str,
+        verb: str,
+        *args: str,
+        env: Mapping[str, str | None] | None = None,
+        timeout: float = BUILD_SECS,
+    ) -> Ran:
         """`blaze VERB ARGS` in `ws` asked of this daemon and waited for, with `env` over the
         daemon's (None unsets a variable): what a client's environment changes, the request
         carries. One that outlasts `timeout` is killed and fails the step, naming it."""
@@ -400,21 +448,37 @@ class Daemon:
         given = {name: value for name, value in {**self.env, **(env or {})}.items() if value is not None}
         argv = [self.blaze, verb, *args]
         try:
-            ran = subprocess.run(argv, cwd=ws, env=given, stdin=subprocess.DEVNULL, capture_output=True,
-                                 text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
+            ran = subprocess.run(
+                argv,
+                cwd=ws,
+                env=given,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+            )
         except subprocess.TimeoutExpired as error:
-            raise Failed(f"`{shlex.join(argv)}` in {ws} took more than {timeout} s\nlog: {self.log_path}") from error
+            raise Failed(
+                f"`{shlex.join(argv)}` in {ws} took more than {timeout} s\nlog: {self.log_path}"
+            ) from error
         return Ran(argv, ran.returncode, ran.stdout, ran.stderr)
 
     def stop(self, timeout: float = STOP_SECS) -> None:
         """`blaze stop`, which writes the daemon's image and ends it, waited for."""
         if self.alive():
-            subprocess.run([self.blaze, "stop"], env=self.env, capture_output=True, timeout=timeout)
+            subprocess.run(
+                [self.blaze, "stop"], env=self.env, capture_output=True, timeout=timeout, check=False
+            )
             try:
                 self.process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 self.kill()
-                raise Failed(f"`blaze stop` did not end the daemon in {self.home} within {timeout} s: {self.log_path}")
+                raise Failed(
+                    f"`blaze stop` did not end the daemon in {self.home} within {timeout} s: {self.log_path}"
+                )
         self.stray()
 
     def kill(self) -> None:
@@ -428,7 +492,9 @@ class Daemon:
         log = os.path.join(state_of(self.home), "serve.log")
         if not os.path.exists(log):
             return False
-        subprocess.run([self.blaze, "stop"], env=self.env, capture_output=True, timeout=STOP_SECS)
+        subprocess.run(
+            [self.blaze, "stop"], env=self.env, capture_output=True, timeout=STOP_SECS, check=False
+        )
         os.replace(log, f"{log}.{time.time_ns()}")
         return True
 
@@ -443,11 +509,13 @@ def checkout(at: str, value: int = 0) -> str:
 
 def set_value(ws: str, old: int, new: int) -> None:
     path = os.path.join(ws, MID)
-    text = open(path).read()
+    with open(path) as file:
+        text = file.read()
     was = AREA + (f" + {old}" if old else "")
     if was not in text:
         raise Failed(f"{path} has no `{was}`")
-    open(path, "w").write(text.replace(was, AREA + (f" + {new}" if new else ""), 1))
+    with open(path, "w") as file:
+        file.write(text.replace(was, AREA + (f" + {new}" if new else ""), 1))
 
 
 class Checkout:
@@ -474,8 +542,10 @@ def from_nothing(blaze: str, at: str, value: int, keep: bool) -> str | None:
     finally:
         daemon.stop()
     if built.status != 0 or not built.executable:
-        raise Failed(f"the build from nothing of {value} failed ({built.status}):\n{built.said[-3000:]}\n"
-                     f"log: {daemon.log_path}")
+        raise Failed(
+            f"the build from nothing of {value} failed ({built.status}):\n{built.said[-3000:]}\n"
+            f"log: {daemon.log_path}"
+        )
     out = built.program()
     if not keep:
         shutil.rmtree(at, ignore_errors=True)
@@ -487,7 +557,8 @@ def references(blaze: str, work: str, values: Iterable[int], jobs: int = 4) -> d
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         made: dict[int, Future[str | None]] = {
             value: pool.submit(from_nothing, blaze, os.path.join(work, f"ref-{value}"), value, False)
-            for value in sorted(set(values))}
+            for value in sorted(set(values))
+        }
         return {value: future.result() for value, future in made.items()}
 
 
@@ -502,6 +573,7 @@ def blaze_of(path: str) -> str:
 @dataclass(frozen=True)
 class Ran:
     """A blaze command that ended: its command line, exit status and what it printed."""
+
     argv: list[str]
     status: int
     stdout: str
@@ -517,6 +589,7 @@ class CachedRun:
     """The kept run that stands for a test not run (blaze_api::Cached): what it was kept by
     (`executed`: the functions it executed; `reached`: what it reaches, its record not whole,
     with why), how long it took and how it ended."""
+
     basis: Literal["executed", "reached"]
     why: str | None
     millis: int
@@ -527,6 +600,7 @@ class CachedRun:
 class TestLine:
     """One `blaze-test-result` line (blaze_api::TestResult): `cached` is None for a test that
     ran this time; `outside` says it ran outside the sandbox, so its pass is never kept."""
+
     binary: str
     executable: int
     name: str
@@ -567,14 +641,16 @@ def test_results(stdout: str) -> list[TestLine]:
     fails naming it."""
     found: list[TestLine] = []
     for line in messages(stdout, "blaze-test-result"):
-        found.append(TestLine(
-            binary=field_of(line, "binary", str),
-            executable=field_of(line, "executable", int),
-            name=field_of(line, "name", str),
-            outcome=_outcome(line),
-            millis=field_of(line, "millis", int),
-            outside=field_of(line, "outside", bool),
-            cached=_cached(line),
-            output=field_of(line, "output", str),
-        ))
+        found.append(
+            TestLine(
+                binary=field_of(line, "binary", str),
+                executable=field_of(line, "executable", int),
+                name=field_of(line, "name", str),
+                outcome=_outcome(line),
+                millis=field_of(line, "millis", int),
+                outside=field_of(line, "outside", bool),
+                cached=_cached(line),
+                output=field_of(line, "output", str),
+            )
+        )
     return found

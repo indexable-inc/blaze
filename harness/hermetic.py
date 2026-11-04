@@ -31,6 +31,7 @@ address outside; `plain` does not opt in and has one pure test. Steps, each a ru
 In every run after the first the outside tests run and say `outside`, and no test is both
 cached and outside.
 """
+
 import os
 import shutil
 import sys
@@ -45,8 +46,11 @@ from storelib import Daemon, Failed, Ran, TestLine, blaze_of, scratch, test_resu
 TIMEOUT = 900
 KNOB = "HERMETIC_KNOB"
 DATA = "kept/data/input.txt"
-DEEP = ("kept/src/lib.rs", "    fn level3(x: u32) -> u32 {\n        x\n    }",
-        "    fn level3(x: u32) -> u32 {\n        if x == u32::MAX { 0 } else { x }\n    }")
+DEEP = (
+    "kept/src/lib.rs",
+    "    fn level3(x: u32) -> u32 {\n        x\n    }",
+    "    fn level3(x: u32) -> u32 {\n        if x == u32::MAX { 0 } else { x }\n    }",
+)
 
 FILES = {
     "Cargo.toml": '[workspace]\nmembers = ["kept", "plain"]\nresolver = "2"\n',
@@ -140,6 +144,7 @@ ALL = SANDBOXED | OUTSIDE
 @dataclass(frozen=True)
 class Step:
     """What one run has to show: the sandboxed tests that run (the rest of them cached)."""
+
     what: str
     runs: frozenset[str]
 
@@ -153,8 +158,8 @@ def verdict(step: Step, ran: Ran, lines: list[TestLine], first: bool) -> str:
         if line.name in by_name:
             return f"{line.name}: TWO RESULTS"
         by_name[line.name] = line
-    if set(by_name) != ALL:
-        return f"TESTS {sorted(set(by_name) ^ ALL)} ARE MISSING OR EXTRA"
+    if frozenset(by_name) != ALL:
+        return f"TESTS {sorted(frozenset(by_name) ^ ALL)} ARE MISSING OR EXTRA"
     wrong: list[str] = []
     for name, line in sorted(by_name.items()):
         stood = line.cached
@@ -233,8 +238,10 @@ def main() -> None:
         edit(ws, DATA, None, "input two\n")
         run(Step("the file one test reads changed: that test runs", frozenset({"tests::reads_input"})))
         knob = {KNOB: "turned"}
-        run(Step("the variable one test reads changed: that test runs", frozenset({"tests::reads_env"})),
-            env=knob)
+        run(
+            Step("the variable one test reads changed: that test runs", frozenset({"tests::reads_env"})),
+            env=knob,
+        )
         path, old, new = DEEP
         edit(ws, path, old, new)
         run(Step("a function three calls below the pure test: it runs", frozenset({"tests::pure"})), env=knob)

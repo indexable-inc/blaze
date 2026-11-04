@@ -57,9 +57,7 @@ async def command(inp: Input, root: Path, step: str, *args: str) -> str:
             f"{step}: {argv!r}, exit {process.returncode}, timed out; {stderr.decode()[-3000:]}"
         ) from None
     if process.returncode:
-        raise RuntimeError(
-            f"{step}: {argv!r}, exit {process.returncode}; {stderr.decode()[-3000:]}"
-        )
+        raise RuntimeError(f"{step}: {argv!r}, exit {process.returncode}; {stderr.decode()[-3000:]}")
     return stdout.decode().strip()
 
 
@@ -71,28 +69,30 @@ async def expect(inp: Input, root: Path, step: str, wanted: str) -> None:
 
 
 async def generated(inp: Input, root: Path) -> None:
-    write(root, {
-        "Cargo.toml": '[workspace]\nmembers=["app","mac"]\nresolver="2"\n',
-        "app/Cargo.toml": '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n'
-        '[dependencies]\nmac={path="../mac"}\n',
-        "app/src/main.rs": '''use std::any::TypeId;
+    write(
+        root,
+        {
+            "Cargo.toml": '[workspace]\nmembers=["app","mac"]\nresolver="2"\n',
+            "app/Cargo.toml": '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n'
+            '[dependencies]\nmac={path="../mac"}\n',
+            "app/src/main.rs": """use std::any::TypeId;
 #[mac::declare] struct Local;
 fn id<T: 'static>(_: T) -> TypeId { TypeId::of::<T>() }
 fn main() {
     Local::register(30);
     println!("{} {} {}", mac::value!(), Local::offset(), id(Local::key()) == id(Local::key()));
 }
-''',
-        "mac/Cargo.toml": '[package]\nname="mac"\nversion="0.1.0"\nedition="2021"\n'
-        '[lib]\nproc-macro=true\n',
-        "mac/build.rs": '''fn main() {
+""",
+            "mac/Cargo.toml": '[package]\nname="mac"\nversion="0.1.0"\nedition="2021"\n'
+            "[lib]\nproc-macro=true\n",
+            "mac/build.rs": """fn main() {
     println!("cargo:rerun-if-changed=value.txt");
     let value = std::fs::read_to_string("value.txt").unwrap();
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     std::fs::write(out.join("version.expr"), value).unwrap();
 }
-''',
-        "mac/src/lib.rs": '''use proc_macro::TokenStream;
+""",
+            "mac/src/lib.rs": """use proc_macro::TokenStream;
 const VALUE: u32 = include!(concat!(env!("OUT_DIR"), "/version.expr"));
 #[proc_macro]
 pub fn value(_: TokenStream) -> TokenStream { format!("{}u32", VALUE).parse().unwrap() }
@@ -114,8 +114,9 @@ pub fn declare(_: TokenStream, _: TokenStream) -> TokenStream {
         }
     };".parse().unwrap()
 }
-''',
-    })
+""",
+        },
+    )
     try:
         for value in [7, 9, 3, 7]:
             write(root, {"mac/value.txt": str(value)})
@@ -127,9 +128,11 @@ pub fn declare(_: TokenStream, _: TokenStream) -> TokenStream {
 
 
 async def callbacks(inp: Input, root: Path) -> None:
-    write(root, {
-        "Cargo.toml": '[package]\nname="callbacks"\nversion="0.1.0"\nedition="2021"\n',
-        "src/main.rs": '''mod label;
+    write(
+        root,
+        {
+            "Cargo.toml": '[package]\nname="callbacks"\nversion="0.1.0"\nedition="2021"\n',
+            "src/main.rs": """mod label;
 use std::sync::LazyLock;
 static RULE: &str = "assignment";
 static REGISTRY: LazyLock<&'static &'static str> = LazyLock::new(|| &RULE);
@@ -138,9 +141,10 @@ static VALUE: LazyLock<usize> = LazyLock::new(helper);
 fn main() {
     println!("{} {} {} {}", std::ptr::eq(*REGISTRY, &RULE), *VALUE, helper(), label::value());
 }
-''',
-        "src/label.rs": "pub fn value() -> usize { 1 }\n",
-    })
+""",
+            "src/label.rs": "pub fn value() -> usize { 1 }\n",
+        },
+    )
     try:
         await expect(inp, root, "LazyLock cold identity", "true 10 10 1")
         write(root, {"src/label.rs": "pub fn value() -> usize { 2 }\n"})
@@ -157,38 +161,36 @@ fn main() {
 async def cfg_roots(inp: Input, root: Path) -> None:
     # These roots need the candidate's fix, so they belong here rather than in
     # release smoke, which exercises the compiler published before this change.
-    write(root, {
-        "Cargo.toml": '[package]\nname="cfg-roots"\nversion="0.1.0"\nedition="2024"\n'
-        '[workspace]\n',
-        "src/main.rs": "fn main() {}\n",
-        "tests/cfg_disabled.rs": '''//! A disabled crate still gets an empty libtest harness (#1323, Astral #35).
+    write(
+        root,
+        {
+            "Cargo.toml": '[package]\nname="cfg-roots"\nversion="0.1.0"\nedition="2024"\n[workspace]\n',
+            "src/main.rs": "fn main() {}\n",
+            "tests/cfg_disabled.rs": """//! A disabled crate still gets an empty libtest harness (#1323, Astral #35).
 #![cfg(any())]
 
 #[test]
 fn disabled_test() {
     panic!("a test from a cfg-disabled crate ran");
 }
-''',
-        "tests/cfg_attr_disabled.rs": '''//! A second disabled target joins the same worker, with its cfg supplied by cfg_attr.
+""",
+            "tests/cfg_attr_disabled.rs": """//! A second disabled target joins the same worker, with its cfg supplied by cfg_attr.
 #![cfg_attr(all(), cfg(any()))]
 
 #[test]
 fn disabled_test() {
     panic!("a test from a cfg_attr-disabled crate ran");
 }
-''',
-    })
+""",
+        },
+    )
     try:
         for target in ("cfg_disabled", "cfg_attr_disabled"):
             step = f"empty cfg-root harness {target}"
             actual = await command(inp, root, step, "test", "--test", target)
             lines = actual.splitlines()
-            summary = (
-                "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
-            )
-            if lines.count("running 0 tests") != 1 or sum(
-                line.startswith(summary) for line in lines
-            ) != 1:
+            summary = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
+            if lines.count("running 0 tests") != 1 or sum(line.startswith(summary) for line in lines) != 1:
                 raise RuntimeError(
                     f"{step}: blaze test --test {target} exited 0 but printed {actual!r}, "
                     "expected one successful empty harness"
@@ -203,7 +205,9 @@ async def main(inp: Input) -> None:
         raise ValueError("timeout_seconds must be positive")
     # Under /tmp on macOS: each fixture's daemon has its socket in its home, and macOS allows a
     # socket's path 104 bytes.
-    with tempfile.TemporaryDirectory(prefix="blaze-own-inputs-", dir="/tmp" if sys.platform == "darwin" else None) as work:
+    with tempfile.TemporaryDirectory(
+        prefix="blaze-own-inputs-", dir="/tmp" if sys.platform == "darwin" else None
+    ) as work:
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(generated(inp, Path(work) / "macro"))
             tasks.create_task(callbacks(inp, Path(work) / "callbacks"))

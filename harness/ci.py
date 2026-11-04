@@ -37,6 +37,7 @@ has `blaze toolchain` download once before the first harness.
 Every harness in a part runs even when one before it fails; the part fails at the end and names
 them. BLAZE_BIN is the blaze the harnesses run, as for each harness on its own.
 """
+
 import json
 import math
 import os
@@ -56,7 +57,9 @@ ROOT = os.path.dirname(HERE)
 SYSTEM = {"linux": "linux", "darwin": "macos", "win32": "windows"}[sys.platform]
 ARCH = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
 BLAZE_CLI = os.path.join(
-    os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine"))),
+    os.path.dirname(
+        os.path.abspath(os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine"))
+    ),
     "blaze.exe" if SYSTEM == "windows" else "blaze",
 )
 
@@ -148,13 +151,28 @@ HARNESSES = [
     ("core", ["tiers.py"], {}, on("macos"), 1),
     # #418: the same seeds with an empty and a warm store, and asm! text changed under one IR;
     # each profile picks its backend (dev: Cranelift, release: LLVM).
-    ("core", ["fuzz/store.py", arg({"blaze": BLAZE_CLI, "profiles": ["dev", "release"]})], {}, on("linux-x86_64"), 2),
+    (
+        "core",
+        ["fuzz/store.py", arg({"blaze": BLAZE_CLI, "profiles": ["dev", "release"]})],
+        {},
+        on("linux-x86_64"),
+        2,
+    ),
     ("core", ["fuzz/edits.py", "smoke", arg({"profiles": ["dev", "release"]})], {}, on("linux-x86_64"), 2),
     # DWARF read by gdb out of an ELF executable.
     ("core", ["debuginfo.py"], {}, on("linux"), None),
-    *((f"keys-{k}", ["keys.py", arg({"shard": {"index": k, "count": KEYS}})], {}, DAEMON, None) for k in range(1, KEYS + 1)),
+    *(
+        (f"keys-{k}", ["keys.py", arg({"shard": {"index": k, "count": KEYS}})], {}, DAEMON, None)
+        for k in range(1, KEYS + 1)
+    ),
     # The v2 daemon's store (crates/blaze-cas): its CLI speaks over a Unix socket, so not Windows.
-    ("store-kills", ["storekills.py", arg({"blaze": BLAZE_CLI, "kills": 100})], {}, on("linux", "macos"), None),
+    (
+        "store-kills",
+        ["storekills.py", arg({"blaze": BLAZE_CLI, "kills": 100})],
+        {},
+        on("linux", "macos"),
+        None,
+    ),
     ("store", ["storecorrupts.py", arg({"blaze": BLAZE_CLI, "rounds": 4})], {}, on("linux", "macos"), None),
     # It mounts a tmpfs. In the fast tier: what a build keeps grows with features that write
     # the store, and a full disk is where that shows.
@@ -260,8 +278,10 @@ def fast_of(harness):
     name = label(harness)
     keys = [key for key in FAST if name == key or name.startswith(key + " ")]
     if not keys:
-        sys.exit(f"ci.py: {name!r} is in the fast tier and FAST has no line for it: add its seconds "
-                 f"on the slowest host, and the hosts it runs on in the fast tier")
+        sys.exit(
+            f"ci.py: {name!r} is in the fast tier and FAST has no line for it: add its seconds "
+            f"on the slowest host, and the hosts it runs on in the fast tier"
+        )
     return FAST[max(keys, key=len)]
 
 
@@ -272,8 +292,10 @@ def check_tables():
     for table, name in ((FAST, "FAST"), (CORE, "CORE")):
         for key in table:
             if not any(it == key or it.startswith(key + " ") for it in labels):
-                sys.exit(f"ci.py: {name} has a line for {key!r}, which no harness in HARNESSES is: "
-                         f"take it out with its harness")
+                sys.exit(
+                    f"ci.py: {name} has a line for {key!r}, which no harness in HARNESSES is: "
+                    f"take it out with its harness"
+                )
 
 
 def fast_here():
@@ -342,12 +364,19 @@ def run_one(args, env):
     home = tempfile.mkdtemp(prefix="rj-ci-", dir="/tmp" if SYSTEM != "windows" else None)
     # BLAZE_LOCK: the harnesses make throwaway workspaces with no committed lock: their builds may write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
     own = {"BLAZE_HOME": home, "BLAZE_LOCK": "write"}
-    status = subprocess.run([sys.executable, *args], cwd=HERE, env={**os.environ, **own, **env}, check=False).returncode
+    status = subprocess.run(
+        [sys.executable, *args], cwd=HERE, env={**os.environ, **own, **env}, check=False
+    ).returncode
     # A daemon the harness left running in that home, which nothing after it may talk to.
     blaze_cli = os.path.join(os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN", ""))), "blaze")
     if os.environ.get("BLAZE_BIN") and os.path.exists(blaze_cli + (".exe" if SYSTEM == "windows" else "")):
-        subprocess.run([blaze_cli, "blaze", "stop"], env={**os.environ, **own}, capture_output=True,
-                       timeout=120, check=False)
+        subprocess.run(
+            [blaze_cli, "blaze", "stop"],
+            env={**os.environ, **own},
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
     if status == 0:
         shutil.rmtree(home, ignore_errors=True)
     return status
@@ -361,7 +390,9 @@ def toolchain():
     job installs no blaze) and a Mac start every part the same way."""
     ran = subprocess.run([BLAZE_CLI, "toolchain"], capture_output=True, text=True, timeout=1800, check=False)
     if ran.returncode:
-        sys.exit(f"ci.py: `{BLAZE_CLI} toolchain` exited {ran.returncode}, so no harness can build:\n{ran.stderr[-3000:]}")
+        sys.exit(
+            f"ci.py: `{BLAZE_CLI} toolchain` exited {ran.returncode}, so no harness can build:\n{ran.stderr[-3000:]}"
+        )
     print(ran.stdout.strip(), flush=True)
 
 

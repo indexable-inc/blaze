@@ -45,6 +45,7 @@ bridge that changed is an error there to fix, not a copy to re-vendor. The rustc
 and the daemon match by the whole `rustc -V` line, so a binary built before the bump refuses
 the new nightly until it is rebuilt. docs/contributing.md, "Moving to a newer nightly".
 """
+
 import asyncio
 import datetime
 import json
@@ -68,12 +69,25 @@ PINS = os.path.join(ROOT, "crates/blaze-cargo/src/toolchain/pins.txt")
 DIST = "https://static.rust-lang.org/dist"
 RUST = "https://github.com/rust-lang/rust"
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "blaze-bump")
-HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
-         "x86_64-pc-windows-msvc"]
+HOSTS = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
 # rust-src is not blaze's (it compiles its own library/): the bump imports library/ from it
 # (library.py merge), and rustc's side of the harnesses names std's files where it installs.
-COMPONENTS = ["rustc", "cargo", "rust-std", "rust-src", "llvm-tools-preview", "rustfmt-preview",
-              "clippy-preview", "rust-analyzer-preview", "rustc-codegen-cranelift-preview"]
+COMPONENTS = [
+    "rustc",
+    "cargo",
+    "rust-std",
+    "rust-src",
+    "llvm-tools-preview",
+    "rustfmt-preview",
+    "clippy-preview",
+    "rust-analyzer-preview",
+    "rustc-codegen-cranelift-preview",
+]
 # Where the old pin is written down besides harness/toolchain and pins.txt.
 MENTIONS = ["site/install.sh", "crates/rustc_lexer/Cargo.toml"]
 # Docs that name the pin as it is today. Only its names and `rustc -V` move there: a bare commit
@@ -92,8 +106,13 @@ async def run(step, *argv, cwd=ROOT, bound=600, env=None, stdin=None):
     try:
         async with asyncio.timeout(bound):
             proc = await asyncio.create_subprocess_exec(
-                *argv, cwd=cwd, env=env, stdin=asyncio.subprocess.PIPE if stdin else None,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                *argv,
+                cwd=cwd,
+                env=env,
+                stdin=asyncio.subprocess.PIPE if stdin else None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
             out, err = await proc.communicate(stdin)
     except TimeoutError:
         raise Failed(f"{step}: `{' '.join(argv)}` took over {bound} s") from None
@@ -109,6 +128,7 @@ async def fetch(url, bound=60):
     def get():
         with urllib.request.urlopen(url, timeout=bound) as answer:
             return answer.read()
+
     async with asyncio.timeout(bound):
         return await asyncio.to_thread(get)
 
@@ -163,13 +183,19 @@ async def pick(date):
         channel = tasks[candidate].result()
         if channel is not None and not missing(channel):
             return candidate, channel
-        print(f"nightly-{candidate}: {'none published' if channel is None else 'lacks ' + ', '.join(missing(channel))}")
+        print(
+            f"nightly-{candidate}: {'none published' if channel is None else 'lacks ' + ', '.join(missing(channel))}"
+        )
     raise Failed("pick: no nightly of the last two weeks has every component blaze needs")
 
 
 def pinned():
     """The pin as pins.txt has it: toolchain name, `rustc -V` after `rustc `, commit."""
-    lines = dict(line.split(" ", 1) for line in Path(PINS).read_text().splitlines() if line and not line.startswith("#"))
+    lines = dict(
+        line.split(" ", 1)
+        for line in Path(PINS).read_text().splitlines()
+        if line and not line.startswith("#")
+    )
     return lines["release"].split()[0], lines["rustc"], lines["commit"]
 
 
@@ -181,8 +207,20 @@ async def checkout(commit, paths):
         await run("vendor: clone", "git", "init", "-q", repo)
         await run("vendor: clone", "git", "-C", repo, "remote", "add", "origin", RUST)
     await run("vendor: sparse", "git", "-C", repo, "sparse-checkout", "set", *paths)
-    await run(f"vendor: fetch {commit[:9]}", "git", "-C", repo, "fetch", "-q", "--depth", "1",
-              "--filter=blob:none", "origin", commit, bound=1800)
+    await run(
+        f"vendor: fetch {commit[:9]}",
+        "git",
+        "-C",
+        repo,
+        "fetch",
+        "-q",
+        "--depth",
+        "1",
+        "--filter=blob:none",
+        "origin",
+        commit,
+        bound=1800,
+    )
     await run(f"vendor: checkout {commit[:9]}", "git", "-C", repo, "checkout", "-q", "-f", commit)
     return repo
 
@@ -201,8 +239,12 @@ async def vendor(new):
 
 def move_mentions(old, new):
     (old_name, old_rustc, old_commit), (new_name, new_rustc, new_commit) = old, new
-    pairs = [(old_name, new_name), (old_rustc, new_rustc), (old_commit, new_commit),
-             (old_commit[:9], new_commit[:9])]
+    pairs = [
+        (old_name, new_name),
+        (old_rustc, new_rustc),
+        (old_commit, new_commit),
+        (old_commit[:9], new_commit[:9]),
+    ]
     for path in MENTIONS:
         full = os.path.join(ROOT, path)
         text = Path(full).read_text()
@@ -231,8 +273,14 @@ def move_mentions(old, new):
 
 async def library(date):
     """library/ merged to the standard library of the nightly of `date` (library.py merge)."""
-    said = await run("library", sys.executable, os.path.join(HERE, "library.py"), "merge",
-                     json.dumps({"date": date}), bound=900)
+    said = await run(
+        "library",
+        sys.executable,
+        os.path.join(HERE, "library.py"),
+        "merge",
+        json.dumps({"date": date}),
+        bound=900,
+    )
     print(said, end="")
 
 
@@ -249,8 +297,13 @@ async def bump(date):
     await run("pins", sys.executable, os.path.join(HERE, "toolchain_pins.py"), '{"write": true}', bound=900)
     new = pinned()
     await vendor(new[2])
-    await run("solver", sys.executable, os.path.join(ROOT, "tools/v2/solver_sync.py"),
-              json.dumps({"nightly": name}), bound=1800)
+    await run(
+        "solver",
+        sys.executable,
+        os.path.join(ROOT, "tools/v2/solver_sync.py"),
+        json.dumps({"nightly": name}),
+        bound=1800,
+    )
     await library(date)
     move_mentions(old, new)
     async with asyncio.TaskGroup() as group:
@@ -261,9 +314,26 @@ async def bump(date):
         if shutil.which("rustup"):
             # For cargo's link line in the harnesses and an editor's rust-analyzer; blaze reads
             # no rust-src.
-            group.create_task(run("rustup", "rustup", "toolchain", "install", name, "--profile", "minimal",
-                                  "-c", "rust-src", "-c", "llvm-tools", "-c", "rustfmt", "-c", "clippy",
-                                  bound=1200))
+            group.create_task(
+                run(
+                    "rustup",
+                    "rustup",
+                    "toolchain",
+                    "install",
+                    name,
+                    "--profile",
+                    "minimal",
+                    "-c",
+                    "rust-src",
+                    "-c",
+                    "llvm-tools",
+                    "-c",
+                    "rustfmt",
+                    "-c",
+                    "clippy",
+                    bound=1200,
+                )
+            )
     print(f"""
 blaze is pinned to {name} ({new[1]}). Left to do:
   - on x86-64 Linux, AArch64 Linux and arm64 macOS each: `python3 harness/answers.py --write`,
@@ -283,8 +353,7 @@ async def checks():
     env.setdefault("BLAZE_BIN", os.path.join(ROOT, "target/release/blaze-engine"))
     harness = [
         ["toolchain_pins.py", "{}"],
-        *(["ci.py", "run", json.dumps({"part": part})]
-          for part in ci.fast_parts()),
+        *(["ci.py", "run", json.dumps({"part": part})] for part in ci.fast_parts()),
     ]
     failed = []
 
