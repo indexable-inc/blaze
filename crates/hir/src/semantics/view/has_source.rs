@@ -338,8 +338,7 @@ impl HasSourceView for Function {
     ) -> Option<InFile<(TextRange, Option<Self::Ast<'db>>)>> {
         match self.id {
             AnyFunctionId::FunctionId(id) => Some(
-                loc_view(db, id.loc(db))
-                    .map(|source| (source.syntax().text_range(), Some(source))),
+                loc_view(db, id.loc(db)).map(|source| (source.syntax().text_range(), Some(source))),
             ),
             AnyFunctionId::BuiltinDeriveImplMethod { impl_, .. } => {
                 Some(impl_.loc(db).source(db).map(|range| (range, None)))
@@ -400,8 +399,7 @@ impl HasSourceView for Impl {
     ) -> Option<InFile<(TextRange, Option<Self::Ast<'db>>)>> {
         match self.id {
             AnyImplId::ImplId(id) => Some(
-                loc_view(db, id.loc(db))
-                    .map(|source| (source.syntax().text_range(), Some(source))),
+                loc_view(db, id.loc(db)).map(|source| (source.syntax().text_range(), Some(source))),
             ),
             AnyImplId::BuiltinDeriveImplId(impl_) => {
                 Some(impl_.loc(db).source(db).map(|range| (range, None)))

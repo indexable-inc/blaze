@@ -3,8 +3,8 @@
 
 use base_db::{Crate, Db, all_crates};
 use hir_def::{AdtId, EnumVariantId, ModuleDefId, ModuleId, nameres::crate_def_map};
-use hir_expand::name::Name;
 use hir_expand::fixture;
+use hir_expand::name::Name;
 
 use crate::{
     TyDefId,
@@ -75,7 +75,8 @@ fn only_a_foreign_non_exhaustive_enum_is_taken_as_inhabited() {
     let interner = DbInterner::new_with(&db, krate);
     let infcx: InferCtxt<'_> = interner.infer_ctxt().build(TypingMode::non_body_analysis());
     let env = ParamEnv::empty();
-    let uninhabited = |name| is_ty_uninhabited_from(&infcx, ty(&db, adt(&db, root, name)), root, env);
+    let uninhabited =
+        |name| is_ty_uninhabited_from(&infcx, ty(&db, adt(&db, root, name)), root, env);
     assert!(!uninhabited("dep::ForeignNonExhaustive"));
     assert!(uninhabited("dep::ForeignVoid"));
     assert!(uninhabited("dep::ForeignStruct"), "only an enum's applies");

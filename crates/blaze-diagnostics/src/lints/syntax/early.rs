@@ -27,9 +27,9 @@ mod macros;
 pub(crate) mod validation;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::{HirFileId, InFile};
 use span::SyntaxContext;
+use std::alloc::Global;
 use syntax::{SyntaxKind, SyntaxNodePtr, TextRange, view as ast};
 
 use crate::{
@@ -79,7 +79,9 @@ pub(crate) fn ctxt(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) -> Syntax
 pub(crate) fn range_from_expansion(cx: &Cx<'_, '_>, range: InFile<TextRange>) -> bool {
     match range.file_id.macro_file() {
         None => false,
-        Some(_) => !range.original_node_file_range_opt(cx.db).is_some_and(|(_, ctxt)| ctxt.is_root()),
+        Some(_) => {
+            !range.original_node_file_range_opt(cx.db).is_some_and(|(_, ctxt)| ctxt.is_root())
+        }
     }
 }
 
@@ -87,9 +89,9 @@ pub(crate) fn range_from_expansion(cx: &Cx<'_, '_>, range: InFile<TextRange>) ->
 /// `#[allow_internal_unsafe]`. A file's own text is of no expansion: no span map is read.
 pub(crate) fn allows_unsafe(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) -> bool {
     file.macro_file().is_some()
-        && ctxt(cx, file, range)
-        .outer_expn(cx.db)
-        .is_some_and(|call| hir_expand::MacroCallId::from(call).loc(cx.db).def.allow_internal_unsafe)
+        && ctxt(cx, file, range).outer_expn(cx.db).is_some_and(|call| {
+            hir_expand::MacroCallId::from(call).loc(cx.db).def.allow_internal_unsafe
+        })
 }
 
 /// The trees of the walk by the macro call (or the item or attribute of an attribute macro or

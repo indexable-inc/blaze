@@ -11,7 +11,8 @@ use hir::{LangItem, PathResolution};
 use syntax::{
     TextRange,
     view::{
-        self as ast, AstNode as _, HasArgList as _, HasAttrs as _, HasGenericArgs as _, HasName as _,
+        self as ast, AstNode as _, HasArgList as _, HasAttrs as _, HasGenericArgs as _,
+        HasName as _,
     },
 };
 
@@ -82,7 +83,8 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         return;
     }
     // clippy's `need!`: without these, it lints nothing.
-    let lang = [LangItem::Fn, LangItem::FnOnce, LangItem::FnMut, LangItem::Sized, LangItem::MetaSized];
+    let lang =
+        [LangItem::Fn, LangItem::FnOnce, LangItem::FnMut, LangItem::Sized, LangItem::MetaSized];
     if lang.iter().any(|it| cx.lang_trait(*it).is_none()) {
         return;
     }
@@ -131,9 +133,7 @@ fn report<'q, 't>(
     let Some(range) = cx.range(candidate.ty.syntax()) else { return };
     let span = cx.span(range);
     let adt = ty.as_adt();
-    let copy_help = adt
-        .filter(|_| ty.may_implement_copy(db))
-        .and_then(|adt| cx.def_span(adt));
+    let copy_help = adt.filter(|_| ty.may_implement_copy(db)).and_then(|adt| cx.def_span(adt));
     // The changes of the type and of each `.clone()`, when the type is `Vec` or `String`.
     let mut retyped: Option<(String, Vec<(TextRange, String)>)> = None;
     if adt.is_some() && adt == cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern("Vec")) {
@@ -144,7 +144,8 @@ fn report<'q, 't>(
             let element = cx.range(element.syntax()).map_or("_", |it| cx.snippet(it));
             retyped = Some((format!("&[{element}]"), clones));
         }
-    } else if adt.is_some() && adt == string_adt(cx)
+    } else if adt.is_some()
+        && adt == string_adt(cx)
         && let Some(local) = cx.local(candidate.pat)
         && let Some(clones) =
             clone_spans(cx, body.syntax(), local, &[("clone", ".to_string()"), ("as_str", "")])
@@ -208,7 +209,10 @@ fn by_value(ty: ast::Type<'_>) -> bool {
 /// clippy's `requires_exact_signature`: a proc macro's function.
 fn requires_exact_signature(function: ast::Fn<'_>) -> bool {
     function.attrs().any(|attr| {
-        matches!(attr.simple_name(), Some("proc_macro" | "proc_macro_attribute" | "proc_macro_derive"))
+        matches!(
+            attr.simple_name(),
+            Some("proc_macro" | "proc_macro_attribute" | "proc_macro_derive")
+        )
     })
 }
 

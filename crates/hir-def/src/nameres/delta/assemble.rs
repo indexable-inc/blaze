@@ -9,9 +9,9 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_mem::{Frame, Tag};
 use hir_expand::name::Name;
+use std::alloc::Global;
 use triomphe::Arc;
 
 use super::{
@@ -80,7 +80,8 @@ pub(super) fn data(db: &Db, krate: Crate, state: &CrateState) -> (Arc<DefMapCrat
 /// A view of the crate as `state` has it, over `rows` (the state's rows, moved in; [`rows_of`]
 /// gives them back).
 pub(super) fn view(krate: Crate, state: &CrateState, rows: ModulesMap) -> DefMap {
-    let (data, session_macros) = state.data.as_ref().expect("nameres delta: the crate data is made before a view");
+    let (data, session_macros) =
+        state.data.as_ref().expect("nameres delta: the crate data is made before a view");
     let mut view = DefMap {
         krate,
         block: None,
@@ -146,7 +147,13 @@ pub(super) fn shares(
     })
 }
 
-fn share(db: &Db, frame: &Frame, out: &GroupOut, view: &DefMap, local: &LocalDefMap) -> RecordShare {
+fn share(
+    db: &Db,
+    frame: &Frame,
+    out: &GroupOut,
+    view: &DefMap,
+    local: &LocalDefMap,
+) -> RecordShare {
     let imports = out.imports.iter().map(|(import, status)| (import, *status));
     let imports = name_records(db, frame, view, local, imports, Records::new_in(frame));
     let mut taken = Records::new_in(frame);
@@ -206,7 +213,10 @@ fn records_in(db: &Db, frame: &Frame, state: &CrateState) -> OwnedRecords {
     let mut seen: HashSet<Use, Global> = HashSet::new_in(Global); // alloc: once per write that changed the records
     let names = NameRecords {
         // alloc: the records' own lists, at exact size, once per write that changed them
-        uses: halves().flat_map(|it| it.uses.iter().copied()).filter(|&it| seen.insert(it)).collect(),
+        uses: halves()
+            .flat_map(|it| it.uses.iter().copied())
+            .filter(|&it| seen.insert(it))
+            .collect(),
         // alloc: as `uses`
         unresolved: halves().flat_map(|it| it.unresolved.iter().copied()).collect(),
         // alloc: as `uses`
@@ -222,7 +232,8 @@ fn records_in(db: &Db, frame: &Frame, state: &CrateState) -> OwnedRecords {
     let mut derive_helpers_in_scope = crate::nameres::DeriveHelpers::default();
     for out in groups().map(|it| &it.out) {
         // clone: each helper once, into the crate's table
-        derive_helpers_in_scope.extend(out.derive_helpers.iter().map(|(&item, it)| (item, it.clone())));
+        derive_helpers_in_scope
+            .extend(out.derive_helpers.iter().map(|(&item, it)| (item, it.clone())));
     }
     diagnostics.shrink_to_fit();
     derive_helpers_in_scope.shrink_to_fit();

@@ -15,11 +15,7 @@ pub(crate) use crate::parsing::reparsing::{
 };
 
 /// A source file's tree: in full, or as an outline whose `fn` bodies are lazy nodes.
-pub(crate) fn parse_text(
-    text: &Text,
-    edition: Edition,
-    outline: bool,
-) -> (Tree, Vec<SyntaxError>) {
+pub(crate) fn parse_text(text: &Text, edition: Edition, outline: bool) -> (Tree, Vec<SyntaxError>) {
     let _p = tracing::info_span!(target: "blaze", "parse_text", outline).entered();
     let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);

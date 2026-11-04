@@ -55,7 +55,12 @@ impl HirFrontend<'_> {
 }
 
 fn error(what: String) -> CodegenError {
-    CodegenError { unit: InstanceKey(ContentId::default()), item: ItemKey(ContentId::default()), what, front: None }
+    CodegenError {
+        unit: InstanceKey(ContentId::default()),
+        item: ItemKey(ContentId::default()),
+        what,
+        front: None,
+    }
 }
 
 /// What the link's ID of a crate's `global_asm!` object is derived under.
@@ -159,7 +164,12 @@ fn blocks(db: &Db, krate: Crate, crate_name: &str, arch: Arch) -> Result<Vec<Blo
 /// The text of one `global_asm!`, as rustc gives it to LLVM: its template, and on x86-64
 /// one that says `options(att_syntax)` in AT&T's syntax, which the assembler is switched to
 /// and back from (it is given every block in Intel's, [`crate::asm::lines_before`]).
-fn render(block: &mut Block, lowered: &GlobalAsm, crate_name: &str, arch: Arch) -> Result<(), String> {
+fn render(
+    block: &mut Block,
+    lowered: &GlobalAsm,
+    crate_name: &str,
+    arch: Arch,
+) -> Result<(), String> {
     if let Some(operand) = lowered.operands.first() {
         // alloc: the error's message
         return Err(format!(
@@ -267,11 +277,13 @@ fn diagnostics(said: &str) -> Vec<(usize, &str)> {
         while let Some(at) = rest.find(marker) {
             rest = &rest[at + marker.len()..];
             let mut fields = rest.splitn(3, ':');
-            let (Some(line), Some(column), Some(message)) = (fields.next(), fields.next(), fields.next())
+            let (Some(line), Some(column), Some(message)) =
+                (fields.next(), fields.next(), fields.next())
             else {
                 break;
             };
-            let (Ok(line), true) = (line.parse::<usize>(), column.chars().all(|it| it.is_ascii_digit()))
+            let (Ok(line), true) =
+                (line.parse::<usize>(), column.chars().all(|it| it.is_ascii_digit()))
             else {
                 continue;
             };

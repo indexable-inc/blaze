@@ -9,7 +9,7 @@
 use std::sync::OnceLock;
 
 use cranelift_codegen::{
-    Context, RelocTarget, RegClass,
+    Context, RegClass, RelocTarget,
     binemit::Reloc,
     control::ControlPlane,
     ir::{
@@ -347,8 +347,14 @@ fn encodes_as_cranelifts_assembler() {
             &[0x4c, 0x8b, 0x1d, 0, 0, 0, 0],
         ),
         (enc(|b| xstore(b, Sse::Dqu, at(RSP, 0x40), 6)), &[0xf3, 0x0f, 0x7f, 0x74, 0x24, 0x40]),
-        (enc(|b| xstore(b, Sse::Dqu, at(RSP, 0x40), 15)), &[0xf3, 0x44, 0x0f, 0x7f, 0x7c, 0x24, 0x40]),
-        (enc(|b| xload(b, Sse::Dqu, 15, at(RSP, 0x40))), &[0xf3, 0x44, 0x0f, 0x6f, 0x7c, 0x24, 0x40]),
+        (
+            enc(|b| xstore(b, Sse::Dqu, at(RSP, 0x40), 15)),
+            &[0xf3, 0x44, 0x0f, 0x7f, 0x7c, 0x24, 0x40],
+        ),
+        (
+            enc(|b| xload(b, Sse::Dqu, 15, at(RSP, 0x40))),
+            &[0xf3, 0x44, 0x0f, 0x6f, 0x7c, 0x24, 0x40],
+        ),
         (enc(|b| xload(b, Sse::Ss, 0, at(R12, 8))), &[0xf3, 0x41, 0x0f, 0x10, 0x44, 0x24, 0x08]),
         (enc(|b| xstore(b, Sse::Sd, at(R12, 8), 1)), &[0xf2, 0x41, 0x0f, 0x11, 0x4c, 0x24, 0x08]),
         (enc(|b| movq_to_xmm(b, 0, R10)), &[0x66, 0x49, 0x0f, 0x6e, 0xc2]),
@@ -371,7 +377,11 @@ fn encodes_as_cranelifts_assembler() {
 /// rbp, rsp`, the probe of `bytes`, `sub rsp, bytes`.
 fn leaf_with_slot(bytes: u32) -> ir::Function {
     build(sig(CallConv::SystemV, &[], &[]), |b, _| {
-        b.create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, bytes, 0));
+        b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            bytes,
+            0,
+        ));
         b.ins().return_(&[]);
     })
 }
@@ -501,7 +511,10 @@ fn dwarf_rows_follow_the_frame() {
     let code = ours(&func, &LINUX);
     let Some(Unwind::Dwarf { len, rows }) = &code.unwind else { panic!("{:?}", code.unwind) };
     assert_eq!(*len as usize, code.bytes.len());
-    assert_eq!(rows[..3], [(1, Rule::CfaOffset(16)), (1, Rule::Offset(6, -16)), (4, Rule::CfaRegister(6))]);
+    assert_eq!(
+        rows[..3],
+        [(1, Rule::CfaOffset(16)), (1, Rule::Offset(6, -16)), (4, Rule::CfaRegister(6))]
+    );
     let saves: Vec<_> = rows[3..8].iter().map(|row| row.1).collect();
     assert_eq!(
         saves,
@@ -518,7 +531,8 @@ fn dwarf_rows_follow_the_frame() {
     // After `pop rbp`, at the `ret`.
     assert_eq!(&code.bytes[at as usize - 1..at as usize + 1], &[0x5d, 0xc3]);
     assert!(rows.iter().all(|row| row.0 < *len));
-    let counter = code.relocs.iter().find(|it| it.name == Name::Counter).expect("the calls counter");
+    let counter =
+        code.relocs.iter().find(|it| it.name == Name::Counter).expect("the calls counter");
     assert_eq!((counter.kind, counter.addend), (Reloc::X86PCRel4, crate::tier::CALLS - 5));
     assert_eq!(code.slots.base, 12);
 }
@@ -548,7 +562,12 @@ fn calls_relocate_as_cranelift() {
     for target in [LINUX, WINDOWS] {
         let func = callers(conv(&target));
         let code = ours(&func, &target);
-        assert_eq!(relocs(&code.relocs), relocs(&cranelift(&func, &target).relocs), "{:?}", target.os);
+        assert_eq!(
+            relocs(&code.relocs),
+            relocs(&cranelift(&func, &target).relocs),
+            "{:?}",
+            target.os
+        );
         assert_eq!(code.calls.len(), 4);
     }
     let code = ours(&callers(CallConv::SystemV), &LINUX);
@@ -590,7 +609,12 @@ fn struct_arguments_copy_as_cranelift() {
             b.ins().return_(&[]);
         });
         let code = ours(&func, &target);
-        assert_eq!(relocs(&code.relocs), relocs(&cranelift(&func, &target).relocs), "{:?}", target.os);
+        assert_eq!(
+            relocs(&code.relocs),
+            relocs(&cranelift(&func, &target).relocs),
+            "{:?}",
+            target.os
+        );
         // The `memcpy` and the call.
         assert_eq!(code.calls.len(), 2);
     }
@@ -678,10 +702,8 @@ fn landing_pads_store_the_payload() {
 /// The immediate of the `add rsp` before the last `mov rsp, rbp`, `pop rbp`, `ret` (0 when
 /// there is none): what the epilogue frees, the distance from `rbp` down to `rsp`.
 fn freed(bytes: &[u8]) -> u32 {
-    let end = bytes
-        .windows(5)
-        .rposition(|w| w == [0x48, 0x89, 0xec, 0x5d, 0xc3])
-        .expect("an epilogue");
+    let end =
+        bytes.windows(5).rposition(|w| w == [0x48, 0x89, 0xec, 0x5d, 0xc3]).expect("an epilogue");
     if end >= 4 && bytes[end - 4..end - 1] == [0x48, 0x83, 0xc4] {
         bytes[end - 1] as i8 as u32
     } else if end >= 7 && bytes[end - 7..end - 4] == [0x48, 0x81, 0xc4] {
@@ -726,8 +748,7 @@ fn the_frame_is_cranelifts_frame_to_fp_offset() {
         assert_eq!(freed(&code.bytes), code.frame, "{:?}", target.os);
     }
     let frame = |func: &ir::Function| {
-        X64::frame(func, &LINUX, Area { size: 1024, align: 16 })
-            .unwrap_or_else(|e| panic!("{e}"))
+        X64::frame(func, &LINUX, Area { size: 1024, align: 16 }).unwrap_or_else(|e| panic!("{e}"))
     };
     let leaf = frame(&leaf_with_slot(64));
     let calls = frame(&stack_arguments());
@@ -738,7 +759,11 @@ fn the_frame_is_cranelifts_frame_to_fp_offset() {
 #[test]
 fn big_and_aligned_frames() {
     let func = build(sig(CallConv::SystemV, &[], &[]), |b, _| {
-        b.create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, 65536, 6));
+        b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            65536,
+            6,
+        ));
         let callee = import(b, 0, sig(CallConv::SystemV, &[], &[]), true);
         b.ins().call(callee, &[]);
         b.ins().return_(&[]);

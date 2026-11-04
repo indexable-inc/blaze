@@ -313,7 +313,10 @@ impl<'f> ImportQueues<'f> {
     }
 
     /// The next unresolved import of this pass, by index.
-    pub(super) fn next_unresolved<A: Allocator + Clone>(&mut self, imports: &Imports<A>) -> Option<u32> {
+    pub(super) fn next_unresolved<A: Allocator + Clone>(
+        &mut self,
+        imports: &Imports<A>,
+    ) -> Option<u32> {
         while let Some(Reverse(at)) = self.pending_unresolved.pop() {
             let i = at as usize;
             self.queued[i] &= !PENDING;
@@ -326,7 +329,10 @@ impl<'f> ImportQueues<'f> {
     }
 
     /// The next indeterminate import of this pass, by the order they became so.
-    pub(super) fn next_indeterminate<A: Allocator + Clone>(&mut self, imports: &Imports<A>) -> Option<u32> {
+    pub(super) fn next_indeterminate<A: Allocator + Clone>(
+        &mut self,
+        imports: &Imports<A>,
+    ) -> Option<u32> {
         while let Some(Reverse(seq)) = self.pending_indeterminate.pop() {
             let i = imports.indeterminate[seq as usize].0 as usize;
             self.queued[i] &= !PENDING;
@@ -435,7 +441,12 @@ impl<'f> ImportQueues<'f> {
     }
 
     /// A new legacy macro, extern prelude or `macro_use` prelude entry named `name`.
-    pub(super) fn wake_env<A: Allocator + Clone>(&mut self, imports: &Imports<A>, name: Name, ns: u8) {
+    pub(super) fn wake_env<A: Allocator + Clone>(
+        &mut self,
+        imports: &Imports<A>,
+        name: Name,
+        ns: u8,
+    ) {
         if !self.any_waiters.is_empty() {
             self.wake_any(imports);
         }

@@ -67,7 +67,12 @@ pub trait Source: Send + Sync + 'static {
     /// `key` compiled against `reader` (`Later::compile_kept`; with `to`, `Later::tier_up` at
     /// that tier). Refused when the front end at `reader`'s revision describes the instance
     /// under a key other than `key`.
-    fn compile(&self, reader: &Self::Reader, key: InstanceKey, to: Option<Tier>) -> Result<Kept, Refusal>;
+    fn compile(
+        &self,
+        reader: &Self::Reader,
+        key: InstanceKey,
+        to: Option<Tier>,
+    ) -> Result<Kept, Refusal>;
 
     /// Puts `puts` in the store, from any thread, without waiting on the store's writer.
     fn keep(&self, puts: Vec<Put>);
@@ -106,7 +111,9 @@ impl<S: Source> Lazily<S> {
             }
         }
         // alloc: an error
-        Err(format!("stopped by {MOST_STOPS} writes to the database in a row: a reader must wait out a write in progress"))
+        Err(format!(
+            "stopped by {MOST_STOPS} writes to the database in a row: a reader must wait out a write in progress"
+        ))
     }
 
     fn keep(&self, kept: Kept) -> CompiledFunction {

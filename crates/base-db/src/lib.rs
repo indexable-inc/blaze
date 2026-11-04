@@ -4,6 +4,8 @@
 #![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod budget_tests;
 mod change;
 mod content;
 pub mod crate_attrs;
@@ -19,11 +21,9 @@ mod settings;
 mod source_path;
 mod table;
 pub mod target;
-pub mod trees;
-#[cfg(test)]
-mod budget_tests;
 #[cfg(test)]
 mod tests;
+pub mod trees;
 mod view;
 
 use std::{str::FromStr as _, sync::atomic::AtomicUsize};
@@ -39,11 +39,11 @@ pub use crate::{
     editioned_file_id::EditionedFileId,
     files::{AliasError, ExpansionRead, Files, ReadBy},
     input::{
-        BuiltCrateData, BuiltDependency, BuiltFor, Crate, CrateBuilder, CrateBuilderId, CrateDataBuilder,
-        CrateDisplayName, CrateGraphBuilder, CrateName, CrateNamed, CrateOrigin, CrateType, CrateTypes,
-        CratesIdMap, CratesMap, DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin,
-        ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId,
-        TargetKind, UniqueCrateData, UnnamedCrate,
+        BuiltCrateData, BuiltDependency, BuiltFor, Crate, CrateBuilder, CrateBuilderId,
+        CrateDataBuilder, CrateDisplayName, CrateGraphBuilder, CrateName, CrateNamed, CrateOrigin,
+        CrateType, CrateTypes, CratesIdMap, CratesMap, DependencyBuilder, Env, ExtraCrateData,
+        LangCrateOrigin, ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel, SourceRoot,
+        SourceRootId, TargetKind, UniqueCrateData, UnnamedCrate,
     },
     maintain::{Implied, Maintained, Maintainer, Reads, Trigger, Written},
     named::NAMED_PATHS_DOMAIN,
@@ -56,7 +56,6 @@ pub use crate::{
     source_path::{AnchoredPath, AnchoredPathBuf, VfsPath},
 };
 use blaze_hash::HashSet;
-use std::alloc::Global;
 pub use blaze_ids::ContentId;
 use blaze_ids::Hasher;
 use blaze_query::db::{Durability, Setter};
@@ -64,11 +63,11 @@ pub use blaze_query::db::{par_for_each, par_map};
 pub use paths::{AbsPath, AbsPathBuf};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
 pub use span::FileId;
+use std::alloc::Global;
 use triomphe::Arc;
 
 pub type FxIndexSet<T> = indexmap::IndexSet<T, blaze_hash::FixedState>;
-pub type FxIndexMap<K, V> =
-    indexmap::IndexMap<K, V, blaze_hash::FixedState>;
+pub type FxIndexMap<K, V> = indexmap::IndexMap<K, V, blaze_hash::FixedState>;
 
 #[macro_export]
 macro_rules! impl_intern_key {
@@ -149,7 +148,9 @@ pub fn process_env_var(db: &Db, key: &str) -> Option<String> {
 /// keyed by in the process's environment.
 pub fn process_env_reads(db: &Db) -> Vec<(Crate, String)> {
     let mut read = db.files().env_read();
-    read.retain(|(krate, name)| !krate.data(db).origin.is_lang() && own_env_var(db, *krate, name).is_none());
+    read.retain(|(krate, name)| {
+        !krate.data(db).origin.is_lang() && own_env_var(db, *krate, name).is_none()
+    });
     read
 }
 
@@ -187,22 +188,30 @@ pub fn set_primary_crates(db: &mut Db, mut crates: Vec<Crate>) {
     crates.sort_unstable();
     crates.dedup();
     let crates: std::sync::Arc<[Crate]> = crates.into();
-    let read: Vec<Crate> =
-        db.files().env_read().into_iter().filter(|(_, name)| name == PRIMARY_PACKAGE).map(|(krate, _)| krate).collect();
+    let read: Vec<Crate> = db
+        .files()
+        .env_read()
+        .into_iter()
+        .filter(|(_, name)| name == PRIMARY_PACKAGE)
+        .map(|(krate, _)| krate)
+        .collect();
     db.write("set_primary_crates", |db| match PrimaryCrates::try_get(&*db) {
         Some(primary) => {
             let was = primary.crates(&*db);
             if was == crates {
                 return;
             }
-            let moved = read.iter().any(|it| was.binary_search(it).is_ok() != crates.binary_search(it).is_ok());
+            let moved = read
+                .iter()
+                .any(|it| was.binary_search(it).is_ok() != crates.binary_search(it).is_ok());
             primary.set_crates(db).to(crates);
             if moved {
                 db.note(maintain::Note::Crates);
             }
         }
         None => {
-            PrimaryCrates::new(db, crates);
+            // MEDIUM: of the request, like the crate graph; set again only when it moves.
+            PrimaryCrates::new(db, Durability::MEDIUM, crates);
             db.note(maintain::Note::Crates);
         }
     })
@@ -211,7 +220,10 @@ pub fn set_primary_crates(db: &mut Db, mut crates: Vec<Crate>) {
 /// The variable `name` as `krate` has it of its own: its variables ([`Crate::env`]), then
 /// [`PRIMARY_PACKAGE`] when it is primary ([`is_primary`]).
 pub fn own_env_var(db: &Db, krate: Crate, name: &str) -> Option<String> {
-    krate.env(db).get(name).or_else(|| (name == PRIMARY_PACKAGE && is_primary(db, krate)).then(|| "1".to_owned()))
+    krate
+        .env(db)
+        .get(name)
+        .or_else(|| (name == PRIMARY_PACKAGE && is_primary(db, krate)).then(|| "1".to_owned()))
 }
 
 /// The variable `name` as `env!` and `option_env!` in `krate` read it, as rustc reads them:
@@ -276,7 +288,9 @@ pub fn set_process_env(db: &mut Db, vars: Env) {
                 }
             }
             None => {
-                ProcessEnv::new(db, vars, content);
+                // MEDIUM: of the request, like the crate graph; set again only when a
+                // variable changes, never by an edit to a source file.
+                ProcessEnv::new(db, Durability::MEDIUM, vars, content);
                 db.note(maintain::Note::Crates);
             }
         }
@@ -341,7 +355,11 @@ impl FileText {
 
     /// What [`FileText::content_of_file`] hashes under [`FileText::DOMAIN`], appended to `out`:
     /// for hashing many in one batch.
-    pub(crate) fn content_bytes(file: &ContentId, appended_root_module: Option<&str>, out: &mut Vec<u8>) {
+    pub(crate) fn content_bytes(
+        file: &ContentId,
+        appended_root_module: Option<&str>,
+        out: &mut Vec<u8>,
+    ) {
         out.extend_from_slice(&file.0);
         content::opt_bytes(out, appended_root_module);
     }
@@ -491,7 +509,10 @@ impl SourceRootInput {
 
     /// [`SourceRootInput::source_root`] without a clone of the `Arc` (a write to the count
     /// every reader of the root shares).
-    pub fn source_root_ref<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db SourceRoot {
+    pub fn source_root_ref<'db, Db: ?Sized + blaze_query::db::Database>(
+        self,
+        db: &'db Db,
+    ) -> &'db SourceRoot {
         self.source_root_field(db)
     }
 
@@ -601,6 +622,22 @@ pub fn toolchain_channel(db: &Db, krate: Crate) -> Option<ReleaseChannel> {
     krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre).ok())
 }
 
+/// The kind of an input made from `krate`'s sources (a maintainer's per-crate state), by the
+/// crate's origin, which every crate has: `LOW` for a workspace crate (`Local`), `HIGH` for the
+/// standard library (`Lang`), rustc's crates and registry, git and vendored dependencies
+/// (`Library`). blaze-lower gives a crate the origin that matches its source root (a path
+/// package's root is local, every other package's a library's); a registry library's doctest
+/// crates are `Library` too (blaze-lower `doctests`). A library crate's input stated `LOW`
+/// would have every query over it verify again after each workspace edit.
+pub fn crate_durability(db: &Db, krate: Crate) -> Durability {
+    match krate.data(db).origin {
+        CrateOrigin::Local { .. } => Durability::LOW,
+        CrateOrigin::Library { .. } | CrateOrigin::Lang(_) | CrateOrigin::Rustc { .. } => {
+            Durability::HIGH
+        }
+    }
+}
+
 #[blaze_query::input(singleton, debug)]
 struct AllCrates {
     #[returns(clone)]
@@ -653,7 +690,7 @@ pub fn set_all_crates_with_durability(
                 all.set_content(db).with_durability(durability).to(content);
             }
             None => {
-                _ = AllCrates::builder(crates, content).durability(durability).new(db);
+                _ = AllCrates::new(db, durability, crates, content);
             }
         }
     })

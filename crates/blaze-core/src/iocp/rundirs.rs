@@ -14,9 +14,9 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{ERROR_ALREADY_EXISTS, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{
-        CreateDirectoryW, DeleteFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
-        FILE_ATTRIBUTE_REPARSE_POINT, FindClose, FindFirstFileW, FindNextFileW, RemoveDirectoryW, SetFileAttributesW,
-        WIN32_FIND_DATAW,
+        CreateDirectoryW, DeleteFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FindClose, FindFirstFileW,
+        FindNextFileW, RemoveDirectoryW, SetFileAttributesW, WIN32_FIND_DATAW,
     },
 };
 
@@ -71,7 +71,8 @@ impl RunDirs {
             self.wide_of(name);
             self.wide.push(0);
             // SAFETY: a NUL-terminated path; no security attributes.
-            let made = sys::check(unsafe { CreateDirectoryW(self.wide.as_ptr(), std::ptr::null()) });
+            let made =
+                sys::check(unsafe { CreateDirectoryW(self.wide.as_ptr(), std::ptr::null()) });
             self.wide.pop();
             let error = match made {
                 Ok(()) => return Ok(path),
@@ -85,7 +86,10 @@ impl RunDirs {
                 Some(ERROR_PATH_NOT_FOUND) if tries < 3 => std::fs::create_dir_all(&self.dir)?,
                 _ => {
                     // alloc: an error path.
-                    return Err(io::Error::new(error.kind(), format!("{}: {error}", path.display())));
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("{}: {error}", path.display()),
+                    ));
                 }
             }
         }
@@ -123,13 +127,17 @@ impl RunDirs {
         self.wide.truncate(at);
         if find != INVALID_HANDLE_VALUE {
             loop {
-                let len = found.cFileName.iter().position(|&it| it == 0).unwrap_or(found.cFileName.len());
+                let len =
+                    found.cFileName.iter().position(|&it| it == 0).unwrap_or(found.cFileName.len());
                 let name = &found.cFileName[..len];
                 if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
                     self.wide.push(BACKSLASH);
                     self.wide.extend_from_slice(name);
                     let attributes = found.dwFileAttributes;
-                    match (attributes & FILE_ATTRIBUTE_DIRECTORY != 0, attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0) {
+                    match (
+                        attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                        attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+                    ) {
                         (true, false) => self.remove_tree(),
                         (true, true) => self.with_nul(|wide| {
                             // SAFETY: a NUL-terminated path.

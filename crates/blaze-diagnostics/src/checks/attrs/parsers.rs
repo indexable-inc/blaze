@@ -118,7 +118,12 @@ static MODULES: [Option<Module>; index::COUNT] = {
 };
 
 /// The parser of the attribute `cx.attr`, whose path is `cx.builtin.path`, given its arguments.
-pub(crate) fn accept(node: &mut Node, module: Module, cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Accepted {
+pub(crate) fn accept(
+    node: &mut Node,
+    module: Module,
+    cx: &mut Accept<'_, '_, '_>,
+    args: &ArgParser,
+) -> Accepted {
     match module {
         Module::Codegen => codegen::accept(&mut node.codegen, cx, args),
         Module::Stability => stability::accept(&mut node.stability, cx, args),
@@ -130,7 +135,12 @@ pub(crate) fn accept(node: &mut Node, module: Module, cx: &mut Accept<'_, '_, '_
 
 /// What the group `group` of `module` makes of the node's attributes it took: rustc's
 /// `AttributeParser::finalize`.
-pub(crate) fn finalize(node: &mut Node, module: Module, group: &'static str, fx: &mut Finalize<'_, '_, '_>) -> Option<Parsed> {
+pub(crate) fn finalize(
+    node: &mut Node,
+    module: Module,
+    group: &'static str,
+    fx: &mut Finalize<'_, '_, '_>,
+) -> Option<Parsed> {
     match module {
         Module::Codegen => codegen::finalize(&mut node.codegen, group, fx),
         Module::Stability => stability::finalize(&mut node.stability, group, fx),
@@ -143,7 +153,13 @@ pub(crate) fn finalize(node: &mut Node, module: Module, group: &'static str, fx:
 /// The cross-attribute checks of the group `group`, once every attribute of the node is
 /// parsed: rustc's `finalize_check` (of a single parser, only when it converted one). `first`
 /// is the group's first attribute (for a single parser, the one it uses).
-pub(crate) fn check(module: Module, group: GroupId, first: usize, fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr]) {
+pub(crate) fn check(
+    module: Module,
+    group: GroupId,
+    first: usize,
+    fx: &mut Finalize<'_, '_, '_>,
+    parsed: &[ParsedAttr],
+) {
     match module {
         Module::Codegen => codegen::check(group, first, fx, parsed),
         Module::Stability => stability::check(group, first, fx, parsed),
@@ -290,11 +306,18 @@ mod tests {
 
     #[test]
     fn modules_are_as_by_a_scan() {
-        let mut paths: Vec<Vec<&str>> = table::builtins().iter().map(|it| it.path.to_vec()).collect();
+        let mut paths: Vec<Vec<&str>> =
+            table::builtins().iter().map(|it| it.path.to_vec()).collect();
         for (module_paths, _) in super::TAKES {
             paths.extend(module_paths.iter().map(|it| it.to_vec()));
         }
-        paths.extend([vec![], vec!["diagnostic"], vec!["no_such_attribute"], vec!["inline", "x"], vec!["Inline"]]);
+        paths.extend([
+            vec![],
+            vec!["diagnostic"],
+            vec!["no_such_attribute"],
+            vec!["inline", "x"],
+            vec!["Inline"],
+        ]);
         for path in &paths {
             assert_eq!(super::module(path), by_scan(path), "{path:?}");
         }

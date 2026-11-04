@@ -54,11 +54,22 @@ impl<'a> Os<'a> {
     }
 
     /// `getrandom(buf, len, flags)`, as a function or through `syscall`.
-    pub(super) fn getrandom(&mut self, g: &mut impl Guest, ret: &mut [u8], (buf, len): (u64, u64)) -> Done {
+    pub(super) fn getrandom(
+        &mut self,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (buf, len): (u64, u64),
+    ) -> Done {
         self.fill_random(g, ret, (buf, len), None)
     }
 
-    pub(super) fn getentropy(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], (buf, len): (u64, u64)) -> Done {
+    pub(super) fn getentropy(
+        &mut self,
+        t: Target,
+        g: &mut impl Guest,
+        ret: &mut [u8],
+        (buf, len): (u64, u64),
+    ) -> Done {
         if len > ENTROPY_MAX {
             return fail(t, g, ret, Errno::Io);
         }

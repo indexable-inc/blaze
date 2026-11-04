@@ -24,8 +24,8 @@ mod meta;
 use std::borrow::Cow;
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir::InFile;
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self as ast, AstNode},
@@ -43,8 +43,7 @@ use stdx::list::Join;
 
 const INVALID: &str = "invalid_doc_attributes";
 
-const PHASED_OUT: &str =
-    "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!";
+const PHASED_OUT: &str = "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!";
 
 /// The list forms of `DocParser`'s template, in its order.
 const FORMS: [&str; 25] = [
@@ -85,7 +84,8 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner<'_>]) -> 
             macro_call(cx, owner, &mut modules, &mut emitted);
             continue;
         }
-        let mut parser = Parser { cx, owner, buffered_at: None, state: State::default(), emitted: &mut emitted };
+        let mut parser =
+            Parser { cx, owner, buffered_at: None, state: State::default(), emitted: &mut emitted };
         for attr in &owner.attrs {
             parser.attr(attr);
         }
@@ -101,7 +101,12 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner<'_>]) -> 
 /// rustc's `InvocationCollector::check_attributes`, for what it says of `#[doc]`: each
 /// attribute of the macro call parsed alone, and `unused_doc_comments` for its doc strings,
 /// a run of them as one, from the call's first attribute on.
-fn macro_call(cx: &Cx<'_, '_>, owner: &Owner<'_>, modules: &mut comments::Modules, emitted: &mut Vec<Emitted>) {
+fn macro_call(
+    cx: &Cx<'_, '_>,
+    owner: &Owner<'_>,
+    modules: &mut comments::Modules,
+    emitted: &mut Vec<Emitted>,
+) {
     let at = comments::lint_node(cx, owner.node, modules);
     let mut span: Option<InFile<TextRange>> = None;
     for (i, attr) in owner.attrs.iter().enumerate() {
@@ -123,7 +128,10 @@ fn macro_call(cx: &Cx<'_, '_>, owner: &Owner<'_>, modules: &mut comments::Module
             // clone: a pointer, copied for a lint emitted
             source_fact(cx, &mut diag, at.clone());
             // clone: as above
-            emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()).buffered(Stage::Collected));
+            emitted.push(
+                Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone())
+                    .buffered(Stage::Collected),
+            );
         }
     }
 }
@@ -179,7 +187,10 @@ impl Parser<'_, '_, '_> {
                 // clone: a pointer, copied for a lint emitted
                 source_fact(self.cx, &mut diag, at.clone());
                 // clone: as above
-                self.emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()).buffered(Stage::Collected));
+                self.emitted.push(
+                    Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone())
+                        .buffered(Stage::Collected),
+                );
             }
             None => {
                 source_fact(self.cx, &mut diag, self.owner.at());
@@ -224,7 +235,8 @@ impl Parser<'_, '_, '_> {
         if self.owner.target == Target::Crate {
             return true;
         }
-        let mut diag = self.diag(INVALID, "this attribute can only be applied at the crate level", path);
+        let mut diag =
+            self.diag(INVALID, "this attribute can only be applied at the crate level", path);
         diag.note("read <https://doc.rust-lang.org/nightly/rustdoc/the-doc-attribute.html#at-the-crate-level> for more information");
         self.emit(diag);
         false
@@ -268,12 +280,16 @@ impl Parser<'_, '_, '_> {
     fn ill_formed(&mut self, attr: &Attr<'_>) {
         let (open, close) = if attr.is_unsafe() { ("unsafe(", ")") } else { ("", "") };
         // alloc: the diagnostic's text, as is all of `ill_formed`'s
-        let mut forms: Vec<String> = FORMS.iter().map(|it| format!("`{open}doc({it}){close}`")).collect();
+        let mut forms: Vec<String> =
+            FORMS.iter().map(|it| format!("`{open}doc({it}){close}`")).collect();
         // alloc: as above
         forms.push(format!("`{open}doc = \"string\"{close}`"));
         forms.sort_unstable();
         // alloc: as above
-        let message = format!("valid forms for the attribute are {}", stdx::list::list(forms.iter(), Join::And, false));
+        let message = format!(
+            "valid forms for the attribute are {}",
+            stdx::list::list(forms.iter(), Join::And, false)
+        );
         let diag = self.diag(INVALID, message, attr.in_file(attr.inner_range()));
         self.emit(diag);
     }
@@ -283,7 +299,8 @@ impl Parser<'_, '_, '_> {
         let path = attr.in_file(meta.path.range);
         let Some(word) = meta.path.word() else {
             // alloc: the diagnostic's text
-            let diag = self.diag(INVALID, format!("unknown `doc` attribute `{}`", meta.path.name()), path);
+            let diag =
+                self.diag(INVALID, format!("unknown `doc` attribute `{}`", meta.path.name()), path);
             self.emit(diag);
             return;
         };
@@ -298,7 +315,10 @@ impl Parser<'_, '_, '_> {
                     self.state.masked = Some(path);
                 }
             }
-            "html_favicon_url" | "html_logo_url" | "html_playground_url" | "html_root_url"
+            "html_favicon_url"
+            | "html_logo_url"
+            | "html_playground_url"
+            | "html_root_url"
             | "issue_tracker_base_url" => {
                 if self.string_value(attr, meta).is_some() {
                     self.crate_level(path);
@@ -324,7 +344,11 @@ impl Parser<'_, '_, '_> {
             "test" => {
                 let MetaArgs::List(list) = &meta.args else {
                     let at = meta.args.range().unwrap_or(meta.path.range);
-                    let diag = self.diag(INVALID, "`#[doc(test(...)]` takes a list of attributes", attr.in_file(at));
+                    let diag = self.diag(
+                        INVALID,
+                        "`#[doc(test(...)]` takes a list of attributes",
+                        attr.in_file(at),
+                    );
                     self.emit(diag);
                     return;
                 };
@@ -363,7 +387,8 @@ impl Parser<'_, '_, '_> {
             }
             "passes" | "no_default_passes" => {
                 // alloc: the diagnostic's text, as each note below
-                let mut diag = self.diag(INVALID, format!("unknown `doc` attribute `{word}`"), path);
+                let mut diag =
+                    self.diag(INVALID, format!("unknown `doc` attribute `{word}`"), path);
                 diag.span_label(self.cx.span(path), "no longer functions");
                 // alloc: as above
                 diag.note(format!(
@@ -456,7 +481,12 @@ impl Parser<'_, '_, '_> {
                 }
                 if let Some(used) = self.state.no_crate_inject {
                     let mut diag = self.diag(INVALID, "unused attribute", path);
-                    diag.suggestion(self.cx.span(path), "remove this attribute", "", Applicability::MachineApplicable);
+                    diag.suggestion(
+                        self.cx.span(path),
+                        "remove this attribute",
+                        "",
+                        Applicability::MachineApplicable,
+                    );
                     diag.span_note(self.cx.span(used), "attribute also specified here");
                     diag.warn(PHASED_OUT);
                     self.emit(diag);
@@ -473,7 +503,8 @@ impl Parser<'_, '_, '_> {
             }
             Some(name) => {
                 // alloc: the diagnostic's text
-                let diag = self.diag(INVALID, format!("unknown `doc(test)` attribute `{name}`"), path);
+                let diag =
+                    self.diag(INVALID, format!("unknown `doc(test)` attribute `{name}`"), path);
                 self.emit(diag);
             }
             None => {
@@ -486,12 +517,18 @@ impl Parser<'_, '_, '_> {
     /// `parse_auto_cfg`.
     fn auto_cfg(&mut self, attr: &Attr<'_>, meta: &MetaItem<'_>) {
         let expects_hide_or_show = |this: &mut Self, at: TextRange| {
-            let diag = this.diag(INVALID, "only `hide` or `show` are allowed in `#[doc(auto_cfg(...))]`", attr.in_file(at));
+            let diag = this.diag(
+                INVALID,
+                "only `hide` or `show` are allowed in `#[doc(auto_cfg(...))]`",
+                attr.in_file(at),
+            );
             this.emit(diag);
         };
         let unexpected = |this: &mut Self, name: &str, at: TextRange| {
             // alloc: the diagnostic's text
-            let message = format!("`#![doc(auto_cfg({name}(...)))]` only accepts identifiers or `values(...)`");
+            let message = format!(
+                "`#![doc(auto_cfg({name}(...)))]` only accepts identifiers or `values(...)`"
+            );
             let diag = this.diag(INVALID, message, attr.in_file(at));
             this.emit(diag);
         };
@@ -499,7 +536,11 @@ impl Parser<'_, '_, '_> {
             MetaArgs::None => return,
             MetaArgs::NameValue { value, .. } => {
                 if !value.is_bool() {
-                    let diag = self.diag(INVALID, "expected boolean for `#[doc(auto_cfg = ...)]`", attr.in_file(value.range()));
+                    let diag = self.diag(
+                        INVALID,
+                        "expected boolean for `#[doc(auto_cfg = ...)]`",
+                        attr.in_file(value.range()),
+                    );
                     self.emit(diag);
                 }
                 return;
@@ -545,7 +586,8 @@ impl Parser<'_, '_, '_> {
                             continue 'main;
                         }
                         if !has_names {
-                            let message = "there must be at least one identifier before `values(...)`";
+                            let message =
+                                "there must be at least one identifier before `values(...)`";
                             let diag = self.diag(INVALID, message, attr.in_file(sub.range()));
                             self.emit(diag);
                             continue 'main;
@@ -555,7 +597,11 @@ impl Parser<'_, '_, '_> {
                     }
                     MetaArgs::NameValue { .. } => unexpected(self, name, sub.range()),
                     _ => {
-                        let diag = self.diag(INVALID, "unexpected item after `values()`", attr.in_file(sub.range()));
+                        let diag = self.diag(
+                            INVALID,
+                            "unexpected item after `values()`",
+                            attr.in_file(sub.range()),
+                        );
                         self.emit(diag);
                     }
                 }
@@ -566,13 +612,19 @@ impl Parser<'_, '_, '_> {
     /// `parse_auto_cfg_values`: the items of `values(..)`, as `DocCfgHideShow` gathers them.
     fn auto_cfg_values(&mut self, attr: &Attr<'_>, list: &List<'_>) {
         let mix = |this: &mut Self, at: TextRange, value: TextRange| {
-            let mut diag = this.diag(INVALID, "`any()` was used when other values were provided", attr.in_file(at));
+            let mut diag = this.diag(
+                INVALID,
+                "`any()` was used when other values were provided",
+                attr.in_file(at),
+            );
             diag.span_label(this.cx.span(attr.in_file(value)), "value declared here");
             this.emit(diag);
         };
         let unexpected = |this: &mut Self, name: &str, at: TextRange| {
             // alloc: the diagnostic's text
-            let message = format!("`#![doc(auto_cfg({name}(...)))]` only accepts identifiers or `values(...)`");
+            let message = format!(
+                "`#![doc(auto_cfg({name}(...)))]` only accepts identifiers or `values(...)`"
+            );
             let diag = this.diag(INVALID, message, attr.in_file(at));
             this.emit(diag);
         };
@@ -632,7 +684,8 @@ fn check(cx: &Cx<'_, '_>, owner: &Owner<'_>, state: &State, emitted: &mut Vec<Em
     {
         let span = cx.span(*span);
         // clone: the diagnostic's span, as below
-        let mut diag = Diag::lint(INVALID, "this attribute can only be applied to a `use` item", span.clone());
+        let mut diag =
+            Diag::lint(INVALID, "this attribute can only be applied to a `use` item", span.clone());
         diag.span_label(span, "only applicable on `use` items");
         diag.span_label(cx.span(hir_span(owner)), "not a `use` item");
         diag.note("read <https://doc.rust-lang.org/nightly/rustdoc/the-doc-attribute.html#inline-and-no_inline> for more information");
@@ -642,7 +695,11 @@ fn check(cx: &Cx<'_, '_>, owner: &Owner<'_>, state: &State, emitted: &mut Vec<Em
         let span = cx.span(span);
         if owner.target != Target::ExternCrate {
             // clone: as above
-            let mut diag = Diag::lint(INVALID, "this attribute can only be applied to an `extern crate` item", span.clone());
+            let mut diag = Diag::lint(
+                INVALID,
+                "this attribute can only be applied to an `extern crate` item",
+                span.clone(),
+            );
             diag.span_label(span, "only applicable on `extern crate` items");
             diag.span_label(cx.span(hir_span(owner)), "not an `extern crate` item");
             diag.note("read <https://doc.rust-lang.org/unstable-book/language-features/doc-masked.html> for more information");
@@ -652,7 +709,11 @@ fn check(cx: &Cx<'_, '_>, owner: &Owner<'_>, state: &State, emitted: &mut Vec<Em
             .is_some_and(|it| it.self_token().is_some())
         {
             // clone: as above
-            let mut diag = Diag::lint(INVALID, "this attribute cannot be applied to an `extern crate self` item", span.clone());
+            let mut diag = Diag::lint(
+                INVALID,
+                "this attribute cannot be applied to an `extern crate self` item",
+                span.clone(),
+            );
             diag.span_label(span, "not applicable on `extern crate self` items");
             diag.span_label(cx.span(hir_span(owner)), "`extern crate self` defined here");
             emit(diag);
@@ -668,18 +729,26 @@ fn hir_span(owner: &Owner<'_>) -> InFile<TextRange> {
         Some(end) if end > range.start() => TextRange::new(range.start(), end),
         _ => range,
     };
-    let end_of = |kind: SyntaxKind| node.children().find(|it| it.kind() == kind).map(|it| it.text_range().end());
+    let end_of = |kind: SyntaxKind| {
+        node.children().find(|it| it.kind() == kind).map(|it| it.text_range().end())
+    };
     // `named_span`: to the end of the name, or of the generics when they are after it.
     let named = || until(end_of(SyntaxKind::NAME).max(end_of(SyntaxKind::GENERIC_PARAM_LIST)));
     let value = match node.kind() {
         SyntaxKind::SOURCE_FILE => inner_span(node),
         SyntaxKind::FN => ast::Fn::cast(node).map_or(range, signature_range_view),
         SyntaxKind::IMPL => def_range_view(node),
-        SyntaxKind::CONST | SyntaxKind::STATIC => {
-            until(node.children().find(|it| ast::Type::can_cast(it.kind())).map(|it| it.text_range().end()))
+        SyntaxKind::CONST | SyntaxKind::STATIC => until(
+            node.children()
+                .find(|it| ast::Type::can_cast(it.kind()))
+                .map(|it| it.text_range().end()),
+        ),
+        SyntaxKind::TRAIT if ast::Trait::cast(node).is_some_and(|it| it.eq_token().is_some()) => {
+            named()
         }
-        SyntaxKind::TRAIT if ast::Trait::cast(node).is_some_and(|it| it.eq_token().is_some()) => named(),
-        SyntaxKind::TRAIT => until(end_of(SyntaxKind::TYPE_BOUND_LIST).or_else(|| Some(named().end()))),
+        SyntaxKind::TRAIT => {
+            until(end_of(SyntaxKind::TYPE_BOUND_LIST).or_else(|| Some(named().end())))
+        }
         SyntaxKind::TYPE_ALIAS if is_trait_item(node) => {
             until(end_of(SyntaxKind::TYPE_BOUND_LIST).or_else(|| Some(named().end())))
         }
@@ -705,7 +774,9 @@ fn hir_span(owner: &Owner<'_>) -> InFile<TextRange> {
         | SyntaxKind::MODULE
         | SyntaxKind::MACRO_RULES
         | SyntaxKind::MACRO_DEF => named(),
-        SyntaxKind::CLOSURE_EXPR => until(end_of(SyntaxKind::RET_TYPE).or_else(|| end_of(SyntaxKind::PARAM_LIST))),
+        SyntaxKind::CLOSURE_EXPR => {
+            until(end_of(SyntaxKind::RET_TYPE).or_else(|| end_of(SyntaxKind::PARAM_LIST)))
+        }
         _ => range,
     };
     InFile::new(owner.node.file_id, value)
@@ -726,4 +797,3 @@ fn inner_span(node: ast::Node<'_>) -> TextRange {
     let last = elements.last().unwrap_or(first);
     first.text_range().cover(last.text_range())
 }
-

@@ -78,7 +78,11 @@ mod checked {
                         if claims.finish() {
                             cell::read(bytes.as_ptr(), CHUNKS);
                             for (at, value) in values.iter().enumerate() {
-                                assert_eq!(value.load(Ordering::Relaxed), at as u32 + 1, "chunk {at} unseen");
+                                assert_eq!(
+                                    value.load(Ordering::Relaxed),
+                                    at as u32 + 1,
+                                    "chunk {at} unseen"
+                                );
                             }
                             last.fetch_add(1, Ordering::Relaxed);
                         }

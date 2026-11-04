@@ -192,7 +192,11 @@ fn hash_over_pool(input: &[u8], key: &crate::CVWords, flags: u8) -> Hash {
 /// available; the same budget cuts the pieces and asks for the wakes.
 /// Other kernels and work kinds keep their policy (experiment, #125).
 fn tree_threads(len: usize, available: usize, degree: usize) -> usize {
-    if cfg!(all(target_arch = "x86_64", target_os = "linux")) && degree >= 16 { len.div_ceil(MAX_PIECE_LEN).max(2).min(available) } else { available }
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) && degree >= 16 {
+        len.div_ceil(MAX_PIECE_LEN).max(2).min(available)
+    } else {
+        available
+    }
 }
 
 fn spare_pool() -> Option<(&'static Pool, Caller<'static>)> {
@@ -205,12 +209,20 @@ fn spare_pool() -> Option<(&'static Pool, Caller<'static>)> {
 /// The subtree pieces of `input` at chunk `counter` and their chaining
 /// values, hashed over the pool (the SME2 thread's prefix first, where it
 /// takes one).
-fn tree_cvs(pool: &Pool, input: &[u8], key: &crate::CVWords, counter: u64, flags: u8) -> (Vec<Piece>, Vec<ChainingValue>) {
+fn tree_cvs(
+    pool: &Pool,
+    input: &[u8],
+    key: &crate::CVWords,
+    counter: u64,
+    flags: u8,
+) -> (Vec<Piece>, Vec<ChainingValue>) {
     let turn = crate::platform::Sme2Turn::take(Platform::detect(), true);
     let threads = tree_threads(input.len(), pool.threads, turn.platform().simd_degree());
-    let (pieces, own) = cut_with_prefix(input.len(), threads, prefix_for(&turn, input.len(), threads));
+    let (pieces, own) =
+        cut_with_prefix(input.len(), threads, prefix_for(&turn, input.len(), threads));
     let mut cvs = vec![ChainingValue::default(); pieces.len()];
-    let work = Work::Tree { input, pieces: &pieces, cvs: cvs.as_mut_ptr(), key: *key, counter, flags };
+    let work =
+        Work::Tree { input, pieces: &pieces, cvs: cvs.as_mut_ptr(), key: *key, counter, flags };
     pool.run_job(work, pieces.len(), own, turn.platform());
     drop(turn);
     (pieces, cvs)
@@ -222,10 +234,31 @@ fn tree_cvs(pool: &Pool, input: &[u8], key: &crate::CVWords, counter: u64, flags
 /// Requires a power-of-two number of chunks, at least MIN_SPLIT_LEN
 /// bytes, and `counter` a multiple
 /// of that number, as `Hasher::update` hands out.
-pub(crate) fn subtree_children(input: &[u8], key: &crate::CVWords, counter: u64, flags: u8) -> [u8; 2 * crate::OUT_LEN] {
-    assert!(input.len().is_power_of_two() && input.len() >= MIN_SPLIT_LEN, "a whole subtree of at least MIN_SPLIT_LEN bytes");
-    assert_eq!(counter % (input.len() / CHUNK_LEN) as u64, 0, "a subtree starts at a multiple of its chunk count");
-    let Some((pool, _caller)) = spare_pool() else { return crate::compress_subtree_to_parent_node(input, 0, key, counter, flags, pool_platform()) };
+pub(crate) fn subtree_children(
+    input: &[u8],
+    key: &crate::CVWords,
+    counter: u64,
+    flags: u8,
+) -> [u8; 2 * crate::OUT_LEN] {
+    assert!(
+        input.len().is_power_of_two() && input.len() >= MIN_SPLIT_LEN,
+        "a whole subtree of at least MIN_SPLIT_LEN bytes"
+    );
+    assert_eq!(
+        counter % (input.len() / CHUNK_LEN) as u64,
+        0,
+        "a subtree starts at a multiple of its chunk count"
+    );
+    let Some((pool, _caller)) = spare_pool() else {
+        return crate::compress_subtree_to_parent_node(
+            input,
+            0,
+            key,
+            counter,
+            flags,
+            pool_platform(),
+        );
+    };
     let (pieces, mut cvs) = tree_cvs(pool, input, key, counter, flags);
     let count = merge_to_children(&pieces, &mut cvs, key, flags);
     debug_assert_eq!(count, 2);
@@ -238,7 +271,13 @@ pub(crate) fn subtree_children(input: &[u8], key: &crate::CVWords, counter: u64,
 /// [`crate::hash_many`] over the machine's threads: below MIN_SPLIT_LEN
 /// of input, or with one message, on this thread.
 #[inline]
-pub(crate) fn hash_many(input: &[u8], message_len: usize, key: &crate::CVWords, flags: u8, outputs: &mut [[u8; crate::OUT_LEN]]) {
+pub(crate) fn hash_many(
+    input: &[u8],
+    message_len: usize,
+    key: &crate::CVWords,
+    flags: u8,
+    outputs: &mut [[u8; crate::OUT_LEN]],
+) {
     // The short path first and inline, so a small batch costs what
     // crate::hash_many costs; everything the pool needs is behind the call.
     if outputs.len() < 2 || input.len() < MIN_SPLIT_LEN {
@@ -248,25 +287,49 @@ pub(crate) fn hash_many(input: &[u8], message_len: usize, key: &crate::CVWords, 
 }
 
 #[inline(never)]
-fn hash_many_over_pool(input: &[u8], message_len: usize, key: &crate::CVWords, flags: u8, outputs: &mut [[u8; crate::OUT_LEN]]) {
+fn hash_many_over_pool(
+    input: &[u8],
+    message_len: usize,
+    key: &crate::CVWords,
+    flags: u8,
+    outputs: &mut [[u8; crate::OUT_LEN]],
+) {
     let slot = crate::many::slot_len(message_len);
-    assert_eq!(Some(input.len()), slot.checked_mul(outputs.len()), "input holds one slot of whole blocks per output");
+    assert_eq!(
+        Some(input.len()),
+        slot.checked_mul(outputs.len()),
+        "input holds one slot of whole blocks per output"
+    );
     let Some((pool, _caller)) = spare_pool() else {
         return crate::hash_many_serial(input, message_len, key, flags, outputs);
     };
     let pieces = cut_messages(outputs.len(), slot, pool.threads);
-    let work = Work::Messages { input, message_len, key: *key, flags, pieces: &pieces, outputs: outputs.as_mut_ptr() };
+    let work = Work::Messages {
+        input,
+        message_len,
+        key: *key,
+        flags,
+        pieces: &pieces,
+        outputs: outputs.as_mut_ptr(),
+    };
     pool.run_job(work, pieces.len(), 0, pool_platform());
 }
 
 /// [`crate::hash_each_multithreaded_with`]'s pool job: `items`, every one
 /// under MIN_SPLIT_LEN, cut into ranges of about [`next_piece_len`] of the
 /// bytes that remain.
-pub(crate) fn hash_each(key: &crate::CVWords, flags: u8, items: &[&[u8]], out: &mut [[u8; crate::OUT_LEN]]) {
+pub(crate) fn hash_each(
+    key: &crate::CVWords,
+    flags: u8,
+    items: &[&[u8]],
+    out: &mut [[u8; crate::OUT_LEN]],
+) {
     assert!(items.iter().all(|i| i.len() < MIN_SPLIT_LEN), "items under MIN_SPLIT_LEN");
     let Some((pool, _caller)) = spare_pool() else {
         let platform = Platform::detect();
-        return crate::each::hash_each_on(key, flags, items, out, platform, |item| crate::hash_serial_on(item, key, flags, platform));
+        return crate::each::hash_each_on(key, flags, items, out, platform, |item| {
+            crate::hash_serial_on(item, key, flags, platform)
+        });
     };
     let mut remaining: usize = items.iter().map(|i| i.len()).sum();
     let mut pieces = Vec::with_capacity(64);
@@ -295,7 +358,8 @@ fn cut_messages(count: usize, message_len: usize, threads: usize) -> Vec<Piece> 
     let mut start = 0;
     while start < count {
         let remaining = (count - start) * message_len.max(1);
-        let take = (next_piece_len(remaining, threads) / message_len.max(1)).clamp(1, count - start);
+        let take =
+            (next_piece_len(remaining, threads) / message_len.max(1)).clamp(1, count - start);
         pieces.push(Piece { offset: start, len: take });
         start += take;
     }
@@ -348,10 +412,23 @@ enum Work<'a> {
     /// Ranges of a batch of messages of one length, each in its slot of
     /// whole blocks in `input` (`offset` and `len` count messages); one
     /// digest each.
-    Messages { input: &'a [u8], message_len: usize, key: crate::CVWords, flags: u8, pieces: &'a [Piece], outputs: *mut [u8; crate::OUT_LEN] },
+    Messages {
+        input: &'a [u8],
+        message_len: usize,
+        key: crate::CVWords,
+        flags: u8,
+        pieces: &'a [Piece],
+        outputs: *mut [u8; crate::OUT_LEN],
+    },
     /// Ranges of a collection's items (`offset` and `len` count items),
     /// each under MIN_SPLIT_LEN; one digest each.
-    Each { items: &'a [&'a [u8]], key: crate::CVWords, flags: u8, pieces: &'a [Piece], outputs: *mut [u8; crate::OUT_LEN] },
+    Each {
+        items: &'a [&'a [u8]],
+        key: crate::CVWords,
+        flags: u8,
+        pieces: &'a [Piece],
+        outputs: *mut [u8; crate::OUT_LEN],
+    },
 }
 
 /// Any value on a cache line of its own.
@@ -374,7 +451,8 @@ impl Job<'_> {
                 let piece = pieces[index];
                 let bytes = &input[piece.offset..][..piece.len];
                 let counter = counter + (piece.offset / CHUNK_LEN) as u64;
-                let cv = crate::hash_all_at_once(bytes, key, counter, *flags, platform).chaining_value();
+                let cv =
+                    crate::hash_all_at_once(bytes, key, counter, *flags, platform).chaining_value();
                 unsafe { *cvs.add(index) = cv };
             }
             Work::Messages { input, message_len, key, flags, pieces, outputs } => {
@@ -382,15 +460,21 @@ impl Job<'_> {
                 let slot = crate::many::slot_len(*message_len);
                 let messages = &input[piece.offset * slot..][..piece.len * slot];
                 // Sound: this range of outputs belongs to piece `index` alone.
-                let digests = unsafe { core::slice::from_raw_parts_mut(outputs.add(piece.offset), piece.len) };
+                let digests = unsafe {
+                    core::slice::from_raw_parts_mut(outputs.add(piece.offset), piece.len)
+                };
                 crate::many::hash_many_on(messages, *message_len, key, *flags, digests, platform);
             }
             Work::Each { items, key, flags, pieces, outputs } => {
                 let piece = pieces[index];
                 // Sound: this range of outputs belongs to piece `index` alone.
-                let digests = unsafe { core::slice::from_raw_parts_mut(outputs.add(piece.offset), piece.len) };
+                let digests = unsafe {
+                    core::slice::from_raw_parts_mut(outputs.add(piece.offset), piece.len)
+                };
                 let range = &items[piece.offset..][..piece.len];
-                crate::each::hash_each_on(key, *flags, range, digests, platform, |item| crate::hash_serial_on(item, key, *flags, platform));
+                crate::each::hash_each_on(key, *flags, range, digests, platform, |item| {
+                    crate::hash_serial_on(item, key, *flags, platform)
+                });
             }
         }
     }
@@ -435,7 +519,8 @@ fn cut_with_prefix(len: usize, threads: usize, prefix: usize) -> (Vec<Piece>, us
     let first_after = next_piece_len(len - prefix, threads);
     let prefix = prefix / first_after * first_after;
     while offset < prefix {
-        let piece = MAX_PREFIX_PIECE_LEN.min(1 << (usize::BITS - 1 - (prefix - offset).leading_zeros()));
+        let piece =
+            MAX_PREFIX_PIECE_LEN.min(1 << (usize::BITS - 1 - (prefix - offset).leading_zeros()));
         pieces.push(Piece { offset, len: piece });
         offset += piece;
     }
@@ -493,7 +578,12 @@ fn sme2_prefix(len: usize, threads: usize) -> usize {
 /// the platform's SIMD parent kernel, carrying an odd final child upward.
 /// The final two CVs belong to the root's children, including a short right
 /// subtree, on the pool's platform like the pieces.
-fn merge_root(pieces: &[Piece], cvs: &mut [ChainingValue], key: &crate::CVWords, flags: u8) -> Hash {
+fn merge_root(
+    pieces: &[Piece],
+    cvs: &mut [ChainingValue],
+    key: &crate::CVWords,
+    flags: u8,
+) -> Hash {
     let count = merge_to_children(pieces, cvs, key, flags);
     debug_assert_eq!(count, 2);
     crate::hasher::parent_output(&cvs[0], &cvs[1], key, flags, pool_platform()).root_hash()
@@ -501,13 +591,20 @@ fn merge_root(pieces: &[Piece], cvs: &mut [ChainingValue], key: &crate::CVWords,
 
 /// [`merge_root`] up to the root's two children, left in `cvs[0]` and
 /// `cvs[1]`; returns 2.
-fn merge_to_children(pieces: &[Piece], cvs: &mut [ChainingValue], key: &crate::CVWords, flags: u8) -> usize {
+fn merge_to_children(
+    pieces: &[Piece],
+    cvs: &mut [ChainingValue],
+    key: &crate::CVWords,
+    flags: u8,
+) -> usize {
     debug_assert_eq!(pieces.len(), cvs.len());
     debug_assert!(pieces.len() >= 2);
     debug_assert_eq!(pieces[0].offset, 0);
     debug_assert!(pieces.last().unwrap().len > 0);
     debug_assert!(pieces[..pieces.len() - 1].iter().all(|p| p.len >= MIN_PIECE_LEN));
-    debug_assert!(pieces.windows(2).all(|w| w[0].len.is_power_of_two() && w[0].len >= w[1].len && w[0].offset + w[0].len == w[1].offset));
+    debug_assert!(pieces.windows(2).all(|w| w[0].len.is_power_of_two()
+        && w[0].len >= w[1].len
+        && w[0].offset + w[0].len == w[1].offset));
     let platform = pool_platform();
     let mut count = cvs.len();
     let mut width = MIN_PIECE_LEN;
@@ -521,8 +618,16 @@ fn merge_to_children(pieces: &[Piece], cvs: &mut [ChainingValue], key: &crate::C
             let children = (count - read).min(2 * crate::MAX_SIMD_DEGREE);
             // The inner loop's variant: each call merges at least one pair.
             assert!(children >= 2, "a parents call with under two children");
-            let parents = crate::compress_parents_parallel(cvs[read..read + children].as_flattened(), key, flags, platform, &mut out);
-            cvs[write..write + parents].as_flattened_mut().copy_from_slice(&out[..parents * crate::OUT_LEN]);
+            let parents = crate::compress_parents_parallel(
+                cvs[read..read + children].as_flattened(),
+                key,
+                flags,
+                platform,
+                &mut out,
+            );
+            cvs[write..write + parents]
+                .as_flattened_mut()
+                .copy_from_slice(&out[..parents * crate::OUT_LEN]);
             read += children;
             write += parents;
         }
@@ -557,7 +662,10 @@ fn subtree_cv(pieces: &[Piece], cvs: &[ChainingValue], mode: crate::Mode) -> Cha
     let len: usize = pieces.iter().map(|p| p.len).sum();
     let boundary = offset + crate::tree::left_len(len);
     let split = pieces.partition_point(|p| p.offset < boundary);
-    assert!(split > 0 && split < pieces.len() && pieces[split].offset == boundary, "pieces do not tile the tree");
+    assert!(
+        split > 0 && split < pieces.len() && pieces[split].offset == boundary,
+        "pieces do not tile the tree"
+    );
     let left = subtree_cv(&pieces[..split], &cvs[..split], mode);
     let right = subtree_cv(&pieces[split..], &cvs[split..], mode);
     crate::test::parent(&left, &right, mode).chaining_value()
@@ -584,8 +692,15 @@ struct Pool {
 /// workers. Calls run on the workers started so far.
 pub(crate) fn initialize(threads: usize) {
     // With one thread, none beside the caller: no SME2 thread either.
-    let sme2 = threads > 1 && cfg!(blake3_sme2) && !matches!(pool_platform(), p if core::mem::discriminant(&p) == core::mem::discriminant(&Platform::detect()));
-    let pool = Pool { callers: AtomicUsize::new(0), threads, sme2, park: crate::park::Park::new(threads - 1, crate::park::FANOUT) };
+    let sme2 = threads > 1
+        && cfg!(blake3_sme2)
+        && !matches!(pool_platform(), p if core::mem::discriminant(&p) == core::mem::discriminant(&Platform::detect()));
+    let pool = Pool {
+        callers: AtomicUsize::new(0),
+        threads,
+        sme2,
+        park: crate::park::Park::new(threads - 1, crate::park::FANOUT),
+    };
     assert!(POOL.set(pool).is_ok(), "initialize_multithreaded creates the pool once");
     if threads == 1 {
         return;
@@ -593,19 +708,33 @@ pub(crate) fn initialize(threads: usize) {
     // Before any thread starts: a child forked from here on has none of
     // them, and its multithreaded calls stop at `pool` (FORKED).
     unsafe extern "C" {
-        fn pthread_atfork(prepare: Option<extern "C" fn()>, parent: Option<extern "C" fn()>, child: Option<extern "C" fn()>) -> i32;
+        fn pthread_atfork(
+            prepare: Option<extern "C" fn()>,
+            parent: Option<extern "C" fn()>,
+            child: Option<extern "C" fn()>,
+        ) -> i32;
     }
     // Sound: the handler only stores to an atomic, which a forked child
     // may do.
-    assert_eq!(unsafe { pthread_atfork(None, None, Some(mark_forked)) }, 0, "registering the fork handler");
+    assert_eq!(
+        unsafe { pthread_atfork(None, None, Some(mark_forked)) },
+        0,
+        "registering the fork handler"
+    );
     if sme2 {
-        std::thread::Builder::new().name("blake3-sme2".into()).spawn(sme2_main).expect("spawning the SME2 thread");
+        std::thread::Builder::new()
+            .name("blake3-sme2".into())
+            .spawn(sme2_main)
+            .expect("spawning the SME2 thread");
     }
     std::thread::Builder::new()
         .name("blake3-worker-1".into())
         .spawn(move || {
             for worker in 2..threads {
-                std::thread::Builder::new().name(format!("blake3-worker-{worker}")).spawn(move || worker_main(worker - 1)).expect("spawning a BLAKE3 worker");
+                std::thread::Builder::new()
+                    .name(format!("blake3-worker-{worker}"))
+                    .spawn(move || worker_main(worker - 1))
+                    .expect("spawning a BLAKE3 worker");
             }
             worker_main(0)
         })
@@ -678,7 +807,9 @@ fn no_pool() -> &'static Pool {
         POOL.get().expect("initialize_multithreaded created the pool")
     }
     #[cfg(not(test))]
-    panic!("blake3-servil: call blake3_servil::initialize_multithreaded(None) once, before any multithreaded call or stream: it starts the threads they use")
+    panic!(
+        "blake3-servil: call blake3_servil::initialize_multithreaded(None) once, before any multithreaded call or stream: it starts the threads they use"
+    )
 }
 
 impl Pool {
@@ -703,7 +834,10 @@ impl Pool {
         let target = source.publish_job(ptr, pieces, own);
         if slot.is_some() && pieces > own + 1 {
             let budget = match &job.work {
-                Work::Tree { input, .. } => tree_threads(input.len(), self.threads, own_platform.simd_degree()).saturating_sub(1),
+                Work::Tree { input, .. } => {
+                    tree_threads(input.len(), self.threads, own_platform.simd_degree())
+                        .saturating_sub(1)
+                }
                 _ => pieces - own - 1,
             };
             self.wake_for((pieces - own - 1).min(budget));
@@ -794,7 +928,8 @@ pub(crate) mod sources {
     /// is hashed on its own thread.
     const SLOTS: usize = 64;
 
-    static REGISTERED: [AtomicPtr<Source>; SLOTS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; SLOTS];
+    static REGISTERED: [AtomicPtr<Source>; SLOTS] =
+        [const { AtomicPtr::new(core::ptr::null_mut()) }; SLOTS];
     static ACTIVE: AtomicU64 = AtomicU64::new(0);
     /// Streams open: workers spin a while for more work only when some are.
     static OPEN: OwnLine<AtomicUsize> = OwnLine(AtomicUsize::new(0));
@@ -844,7 +979,16 @@ pub(crate) mod sources {
         /// Register for the workers: the slot, or None when all are taken.
         pub(crate) fn register(&'static self) -> Option<usize> {
             let ptr = self as *const Source as *mut Source;
-            let slot = (0..SLOTS).find(|&i| REGISTERED[i].compare_exchange(core::ptr::null_mut(), ptr, Ordering::SeqCst, Ordering::Relaxed).is_ok())?;
+            let slot = (0..SLOTS).find(|&i| {
+                REGISTERED[i]
+                    .compare_exchange(
+                        core::ptr::null_mut(),
+                        ptr,
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            })?;
             ACTIVE.fetch_or(1 << slot, Ordering::SeqCst);
             Some(slot)
         }
@@ -859,7 +1003,10 @@ pub(crate) mod sources {
         /// worker parked, a worker.
         pub(crate) fn publish(&self, task: Task) {
             let p = self.finish.published.load(Ordering::Relaxed);
-            debug_assert!(p - self.claimed.load(Ordering::Relaxed) < self.ring.len(), "a source's ring holds every task not yet taken");
+            debug_assert!(
+                p - self.claimed.load(Ordering::Relaxed) < self.ring.len(),
+                "a source's ring holds every task not yet taken"
+            );
             // Sound: slot p % len is free (its last task was taken), and
             // only this stream writes it.
             unsafe { (*self.ring[p % self.ring.len()].get()).write(task) };
@@ -876,7 +1023,12 @@ pub(crate) mod sources {
 
         /// Make `job` the caller's current job, its pieces `0..own` the
         /// caller's own: the number `finished` must reach when it is done.
-        pub(crate) fn publish_job(&self, job: *mut Job<'static>, pieces: usize, own: usize) -> usize {
+        pub(crate) fn publish_job(
+            &self,
+            job: *mut Job<'static>,
+            pieces: usize,
+            own: usize,
+        ) -> usize {
             let base = self.finish.published.load(Ordering::Relaxed);
             debug_assert_eq!(self.finish.finished_count(), base, "the last job is finished");
             self.job.store(job, Ordering::Relaxed);
@@ -903,12 +1055,28 @@ pub(crate) mod sources {
                 // kernel's readahead stream by stream (official's I/O
                 // pattern), and runs shrink to one piece near the end for
                 // balance. A stream's tasks go one at a time.
-                let n = if self.ring.is_empty() { ((p - c) / (2 * pool().threads)).max(1) } else { 1 };
-                match self.claimed.compare_exchange_weak(c, c + n, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) if self.ring.is_empty() => return Some(Item::Pieces(self.job.load(Ordering::Relaxed), c - self.base.load(Ordering::Relaxed), n)),
+                let n =
+                    if self.ring.is_empty() { ((p - c) / (2 * pool().threads)).max(1) } else { 1 };
+                match self.claimed.compare_exchange_weak(
+                    c,
+                    c + n,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) if self.ring.is_empty() => {
+                        return Some(Item::Pieces(
+                            self.job.load(Ordering::Relaxed),
+                            c - self.base.load(Ordering::Relaxed),
+                            n,
+                        ));
+                    }
                     // Sound: this thread alone took slot c, written before
                     // `published` passed it.
-                    Ok(_) => return Some(Item::Task(unsafe { (*self.ring[c % self.ring.len()].get()).assume_init_read() })),
+                    Ok(_) => {
+                        return Some(Item::Task(unsafe {
+                            (*self.ring[c % self.ring.len()].get()).assume_init_read()
+                        }));
+                    }
                     Err(now) => c = now,
                 }
             }
@@ -924,7 +1092,10 @@ pub(crate) mod sources {
         }
 
         fn waiting(&self) -> usize {
-            self.finish.published.load(Ordering::Acquire).saturating_sub(self.claimed.load(Ordering::Acquire))
+            self.finish
+                .published
+                .load(Ordering::Acquire)
+                .saturating_sub(self.claimed.load(Ordering::Acquire))
         }
 
         /// Wake a parked worker for a task this stream has published that no
@@ -979,7 +1150,11 @@ pub(crate) mod sources {
     pub(crate) fn job_source() -> &'static Source {
         MINE.with(|mine| {
             mine.get_or_init(|| {
-                let source = FREE_JOBS.lock().unwrap().pop().unwrap_or_else(|| Box::leak(Box::new(Source::new(0))));
+                let source = FREE_JOBS
+                    .lock()
+                    .unwrap()
+                    .pop()
+                    .unwrap_or_else(|| Box::leak(Box::new(Source::new(0))));
                 source.finish.own();
                 Held(source)
             })
@@ -1078,7 +1253,8 @@ pub(crate) mod sources {
         fn test_visible_sees_a_waiting_item_and_its_kind() {
             let job: &'static Source = &*Box::leak(Box::new(Source::new(0)));
             let stream: &'static Source = &*Box::leak(Box::new(Source::new(4)));
-            let slots = [job.register().expect("a free slot"), stream.register().expect("a free slot")];
+            let slots =
+                [job.register().expect("a free slot"), stream.register().expect("a free slot")];
             assert!(!visible(false) && !visible(true), "nothing published: nothing visible");
             job.finish.published.store(1, Ordering::SeqCst);
             assert!(visible(false), "a job's piece waits: a worker sees it");
@@ -1098,8 +1274,10 @@ pub(crate) mod sources {
         /// every thread a program ever started).
         #[test]
         fn test_a_finished_threads_source_is_the_next_threads() {
-            let first = std::thread::spawn(|| job_source() as *const Source as usize).join().unwrap();
-            let second = std::thread::spawn(|| job_source() as *const Source as usize).join().unwrap();
+            let first =
+                std::thread::spawn(|| job_source() as *const Source as usize).join().unwrap();
+            let second =
+                std::thread::spawn(|| job_source() as *const Source as usize).join().unwrap();
             assert_eq!(first, second, "the second thread takes the source the first gave back");
         }
 
@@ -1108,12 +1286,20 @@ pub(crate) mod sources {
         /// would strand the rest, unseen by a test of one source).
         #[test]
         fn test_unregister_leaves_the_other_sources_registered() {
-            let sources: Vec<&'static Source> = (0..3).map(|_| &*Box::leak(Box::new(Source::new(0)))).collect();
-            let slots: Vec<usize> = sources.iter().map(|s| s.register().expect("a free slot")).collect();
+            let sources: Vec<&'static Source> =
+                (0..3).map(|_| &*Box::leak(Box::new(Source::new(0)))).collect();
+            let slots: Vec<usize> =
+                sources.iter().map(|s| s.register().expect("a free slot")).collect();
             Source::unregister(slots[1]);
-            assert!(!find(|t| core::ptr::eq(t, sources[1])), "the unregistered source is still reached");
+            assert!(
+                !find(|t| core::ptr::eq(t, sources[1])),
+                "the unregistered source is still reached"
+            );
             for &i in &[0, 2] {
-                assert!(find(|t| core::ptr::eq(t, sources[i])), "source {i} lost its registration with another's");
+                assert!(
+                    find(|t| core::ptr::eq(t, sources[i])),
+                    "source {i} lost its registration with another's"
+                );
             }
             for &i in &[0, 2] {
                 Source::unregister(slots[i]);
@@ -1125,7 +1311,8 @@ pub(crate) mod sources {
         /// a time, so only a test of several sees the walk past the first.
         #[test]
         fn test_find_reaches_every_registered_source() {
-            let sources: Vec<&'static Source> = (0..3).map(|_| &*Box::leak(Box::new(Source::new(0)))).collect();
+            let sources: Vec<&'static Source> =
+                (0..3).map(|_| &*Box::leak(Box::new(Source::new(0)))).collect();
             // Registered for the rest of the process, which is this test's.
             for s in &sources {
                 s.register().expect("a free slot");
@@ -1224,9 +1411,14 @@ impl Task {
         // Sound: a subtree's `out` is one 64-byte block.
         let out = unsafe { &mut *(self.out as *mut [u8; crate::BLOCK_LEN]) };
         if self.counter == 0 && self.len > CHUNK_LEN {
-            *out = crate::compress_subtree_to_parent_node(bytes, 0, &self.key, 0, self.flags, platform);
+            *out = crate::compress_subtree_to_parent_node(
+                bytes, 0, &self.key, 0, self.flags, platform,
+            );
         } else {
-            out[..crate::OUT_LEN].copy_from_slice(&crate::hash_all_at_once(bytes, &self.key, self.counter, self.flags, platform).chaining_value());
+            out[..crate::OUT_LEN].copy_from_slice(
+                &crate::hash_all_at_once(bytes, &self.key, self.counter, self.flags, platform)
+                    .chaining_value(),
+            );
         }
         unsafe { &*self.left }.fetch_sub(1, Ordering::Release);
     }
@@ -1245,8 +1437,17 @@ impl Task {
                 // space in place until the task's `left` is zero.
                 let bytes = unsafe { core::slice::from_raw_parts(m.input, m.len) };
                 let count = m.len / crate::many::slot_len(message_len);
-                let digests = unsafe { core::slice::from_raw_parts_mut(m.out as *mut [u8; crate::OUT_LEN], count) };
-                crate::many::hash_many_on(bytes, message_len, &self.key, self.flags, digests, platform);
+                let digests = unsafe {
+                    core::slice::from_raw_parts_mut(m.out as *mut [u8; crate::OUT_LEN], count)
+                };
+                crate::many::hash_many_on(
+                    bytes,
+                    message_len,
+                    &self.key,
+                    self.flags,
+                    digests,
+                    platform,
+                );
             }
             return;
         }
@@ -1254,7 +1455,9 @@ impl Task {
         // until the task's `left` is zero.
         if members.len() >= 2 && members.iter().all(|m| m.len == members[0].len) {
             match members[0].len {
-                crate::BLOCK_LEN => return self.run_equal_members::<{ crate::BLOCK_LEN }>(platform),
+                crate::BLOCK_LEN => {
+                    return self.run_equal_members::<{ crate::BLOCK_LEN }>(platform);
+                }
                 #[cfg(target_arch = "x86_64")]
                 128 => return self.run_equal_members::<128>(platform),
                 #[cfg(target_arch = "x86_64")]
@@ -1269,7 +1472,9 @@ impl Task {
         for m in members {
             let bytes = unsafe { core::slice::from_raw_parts(m.input, m.len) };
             let hash = crate::hash_serial_on(bytes, &self.key, self.flags, platform);
-            unsafe { core::ptr::copy_nonoverlapping(hash.as_bytes().as_ptr(), m.out, crate::OUT_LEN) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(hash.as_bytes().as_ptr(), m.out, crate::OUT_LEN)
+            };
         }
     }
 }
@@ -1282,7 +1487,8 @@ impl Task {
         let members = &self.member[..self.members];
         // Sound: the stream keeps every member's N bytes and `out` in place
         // until the task's `left` is zero.
-        let table: arrayvec::ArrayVec<&[u8; N], MEMBERS> = members.iter().map(|m| unsafe { &*(m.input as *const [u8; N]) }).collect();
+        let table: arrayvec::ArrayVec<&[u8; N], MEMBERS> =
+            members.iter().map(|m| unsafe { &*(m.input as *const [u8; N]) }).collect();
         let mut digests = [[0u8; crate::OUT_LEN]; MEMBERS];
         // One block carries every flag at once, and passes them as the
         // 64-byte batches do (flags_start and flags_end 0): with every
@@ -1294,7 +1500,16 @@ impl Task {
         } else {
             (self.flags, crate::CHUNK_START, crate::CHUNK_END | crate::ROOT)
         };
-        platform.hash_many::<N>(&table, &self.key, 0, crate::IncrementCounter::No, flags, start, end, digests[..members.len()].as_flattened_mut());
+        platform.hash_many::<N>(
+            &table,
+            &self.key,
+            0,
+            crate::IncrementCounter::No,
+            flags,
+            start,
+            end,
+            digests[..members.len()].as_flattened_mut(),
+        );
         for (m, digest) in members.iter().zip(&digests) {
             unsafe { core::ptr::copy_nonoverlapping(digest.as_ptr(), m.out, crate::OUT_LEN) };
         }
@@ -1404,11 +1619,24 @@ mod test {
             let mut cvs = vec![[0u8; crate::OUT_LEN]; pieces.len()];
             crate::test::paint_test_input(cvs.as_flattened_mut());
             let split = pieces.partition_point(|p| p.offset < crate::tree::left_len(len));
-            for mode in [crate::Mode::Plain, crate::Mode::Keyed(&key), crate::Mode::DeriveKeyWith(&context_key)] {
+            for mode in [
+                crate::Mode::Plain,
+                crate::Mode::Keyed(&key),
+                crate::Mode::DeriveKeyWith(&context_key),
+            ] {
                 let left = subtree_cv(&pieces[..split], &cvs[..split], mode);
                 let right = subtree_cv(&pieces[split..], &cvs[split..], mode);
                 let want = crate::test::parent(&left, &right, mode).root_hash();
-                assert_eq!(want, merge_root(&pieces, &mut cvs.clone(), &mode.key_and_flags().0, mode.key_and_flags().1), "len={len}, threads={threads}");
+                assert_eq!(
+                    want,
+                    merge_root(
+                        &pieces,
+                        &mut cvs.clone(),
+                        &mode.key_and_flags().0,
+                        mode.key_and_flags().1
+                    ),
+                    "len={len}, threads={threads}"
+                );
             }
         }
     }
@@ -1418,7 +1646,14 @@ mod test {
         let pool = pool();
         let input = std::vec![0x3Cu8; MIN_SPLIT_LEN];
         crate::RAN.with(|r| r.set(0));
-        assert_eq!(crate::performance::hash_multithreaded(crate::Mode::Plain, &crate::test::message(&input), input.len()), crate::convenience::hash(&input));
+        assert_eq!(
+            crate::performance::hash_multithreaded(
+                crate::Mode::Plain,
+                &crate::test::message(&input),
+                input.len()
+            ),
+            crate::convenience::hash(&input)
+        );
         assert_past_the_split("the call");
         assert_eq!(pool.callers.load(Ordering::SeqCst), 0, "the caller's place given back");
     }
@@ -1445,7 +1680,9 @@ mod test {
         // ends, which would hide a missing wake-up too.
         let worker = std::thread::spawn(move || {
             std::thread::sleep(10 * SPIN_BEFORE_SLEEP);
-            let Some(sources::Item::Pieces(_, _, n)) = source.take() else { panic!("the one piece") };
+            let Some(sources::Item::Pieces(_, _, n)) = source.take() else {
+                panic!("the one piece")
+            };
             assert_eq!(n, 1, "the one piece");
             source.finished(n);
         });
@@ -1479,7 +1716,8 @@ mod test {
         ];
         let counts: &[usize] = &[2, 3, 4, 7, 8, 15, 16, 17, 63, MEMBERS];
         let offsets: &[usize] = &[0, 1, 7, 63];
-        let api_modes = [crate::Mode::Plain, crate::Mode::Keyed(&key), crate::Mode::DeriveKey(context)];
+        let api_modes =
+            [crate::Mode::Plain, crate::Mode::Keyed(&key), crate::Mode::DeriveKey(context)];
         let mut golden = crate::test::Golden::new("equal_members");
         for len in [64, 128, 192, 256, 512, 1024] {
             for &count in counts {
@@ -1493,10 +1731,20 @@ mod test {
                             .collect();
                         for (mode, (words, flags)) in modes.iter().enumerate() {
                             let api_mode = api_modes[mode];
-                            let expected: Vec<[u8; crate::OUT_LEN]> =
-                                inputs.iter().map(|input| *crate::convenience::hash_with(api_mode, &input[offset..]).as_bytes()).collect();
+                            let expected: Vec<[u8; crate::OUT_LEN]> = inputs
+                                .iter()
+                                .map(|input| {
+                                    *crate::convenience::hash_with(api_mode, &input[offset..])
+                                        .as_bytes()
+                                })
+                                .collect();
                             golden.add(expected.as_flattened(), || {
-                                inputs.iter().flat_map(|input| crate::test::official::hash(api_mode, &input[offset..])).collect()
+                                inputs
+                                    .iter()
+                                    .flat_map(|input| {
+                                        crate::test::official::hash(api_mode, &input[offset..])
+                                    })
+                                    .collect()
                             });
                             for &platform in &platforms {
                                 let done = AtomicUsize::new(count);
@@ -1508,10 +1756,18 @@ mod test {
                                 let base = out.as_mut_ptr();
                                 for m in 0..count {
                                     let out = unsafe { base.add(m + 1) }.cast::<u8>();
-                                    task.member[m] = Member { input: inputs[m][offset..].as_ptr(), len: inputs[m].len() - offset, out };
+                                    task.member[m] = Member {
+                                        input: inputs[m][offset..].as_ptr(),
+                                        len: inputs[m].len() - offset,
+                                        out,
+                                    };
                                 }
                                 task.run(platform);
-                                assert_eq!(&out[1..count + 1], &expected[..], "{platform:?}, {count} x {len}, mixed {mixed}, offset {offset}, mode {mode}");
+                                assert_eq!(
+                                    &out[1..count + 1],
+                                    &expected[..],
+                                    "{platform:?}, {count} x {len}, mixed {mixed}, offset {offset}, mode {mode}"
+                                );
                                 assert_eq!(out[0], [0xAA; crate::OUT_LEN]);
                                 assert_eq!(out[count + 1], [0xAA; crate::OUT_LEN]);
                                 assert_eq!(done.load(Ordering::Acquire), 0);
@@ -1539,7 +1795,10 @@ mod test {
                 (MAX_PIECE_LEN + 1, 48, 2),
                 (2 * MAX_PIECE_LEN + 1, 48, 3),
             ] {
-                assert_eq!(tree_threads(len, available, degree), if enabled && degree >= 16 { budget } else { available });
+                assert_eq!(
+                    tree_threads(len, available, degree),
+                    if enabled && degree >= 16 { budget } else { available }
+                );
             }
         }
     }
@@ -1548,13 +1807,23 @@ mod test {
     fn test_next_piece_len() {
         assert_eq!(next_piece_len(64 * CHUNK_LEN, 16), MIN_PIECE_LEN);
         assert_eq!(next_piece_len(1 << 20, 16), 64 * CHUNK_LEN);
-        assert_eq!(next_piece_len(3 << 20, 16), 128 * CHUNK_LEN, "192 KiB caps at the longest piece");
+        assert_eq!(
+            next_piece_len(3 << 20, 16),
+            128 * CHUNK_LEN,
+            "192 KiB caps at the longest piece"
+        );
         assert_eq!(next_piece_len(1 << 30, 16), MAX_PIECE_LEN);
-        assert_eq!(next_piece_len((3 << 20) / 4, 16), 32 * CHUNK_LEN, "48 KiB rounds down to 32 KiB");
+        assert_eq!(
+            next_piece_len((3 << 20) / 4, 16),
+            32 * CHUNK_LEN,
+            "48 KiB rounds down to 32 KiB"
+        );
         for remaining in [MIN_PIECE_LEN + 1, 100_000, 1 << 20, (3 << 20) + 5, 1 << 27] {
             for threads in [2, 3, 16, 64] {
                 let piece = next_piece_len(remaining, threads);
-                assert!(piece.is_power_of_two() && piece >= MIN_PIECE_LEN && piece <= MAX_PIECE_LEN);
+                assert!(
+                    piece.is_power_of_two() && piece >= MIN_PIECE_LEN && piece <= MAX_PIECE_LEN
+                );
             }
         }
     }
@@ -1566,7 +1835,9 @@ mod test {
     fn test_cut_with_prefix_shapes_and_hashes() {
         let mut input = vec![0u8; 3 * (1 << 20) + 12345];
         crate::test::paint_test_input(&mut input);
-        for len in [MIN_PIECE_LEN + 1, 64 * CHUNK_LEN, 100 * CHUNK_LEN + 7, 1 << 20, 3 << 20, input.len()] {
+        for len in
+            [MIN_PIECE_LEN + 1, 64 * CHUNK_LEN, 100 * CHUNK_LEN + 7, 1 << 20, 3 << 20, input.len()]
+        {
             for threads in [2, 3, 4, 16] {
                 let prefix = sme2_prefix(len, threads);
                 let (pieces, own) = cut_with_prefix(len, threads, prefix);
@@ -1576,7 +1847,12 @@ mod test {
                 for (i, p) in pieces.iter().enumerate() {
                     assert_eq!(p.offset, offset);
                     if i + 1 < pieces.len() {
-                        assert!(p.len.is_power_of_two() && p.offset % p.len == 0 && p.len >= pieces[i + 1].len, "{len} {threads}: {pieces:?}");
+                        assert!(
+                            p.len.is_power_of_two()
+                                && p.offset % p.len == 0
+                                && p.len >= pieces[i + 1].len,
+                            "{len} {threads}: {pieces:?}"
+                        );
                     }
                     offset += p.len;
                 }
@@ -1584,10 +1860,21 @@ mod test {
                 let mut cvs: Vec<ChainingValue> = pieces
                     .iter()
                     .map(|p| {
-                        crate::hash_all_at_once(&input[p.offset..][..p.len], crate::IV, (p.offset / CHUNK_LEN) as u64, 0, Platform::detect()).chaining_value()
+                        crate::hash_all_at_once(
+                            &input[p.offset..][..p.len],
+                            crate::IV,
+                            (p.offset / CHUNK_LEN) as u64,
+                            0,
+                            Platform::detect(),
+                        )
+                        .chaining_value()
                     })
                     .collect();
-                assert_eq!(merge_root(&pieces, &mut cvs, crate::IV, 0), crate::convenience::hash(&input[..len]), "{len} {threads}");
+                assert_eq!(
+                    merge_root(&pieces, &mut cvs, crate::IV, 0),
+                    crate::convenience::hash(&input[..len]),
+                    "{len} {threads}"
+                );
             }
         }
     }
@@ -1615,13 +1902,25 @@ mod test {
             let key = [42u8; KEY_LEN];
             assert_eq!(
                 crate::convenience::hash_with(crate::Mode::Keyed(&key), &input[..len]),
-                hash_with_key(&input[..len], &crate::platform::words_from_le_bytes_32(&key), crate::KEYED_HASH),
+                hash_with_key(
+                    &input[..len],
+                    &crate::platform::words_from_le_bytes_32(&key),
+                    crate::KEYED_HASH
+                ),
                 "keyed len = {len}"
             );
             let context_key = crate::performance::context_key("lanes test");
             assert_eq!(
-                *Hasher::new(crate::Mode::DeriveKeyWith(&context_key)).update(&input[..len]).finalize().as_bytes(),
-                *hash_with_key(&input[..len], &crate::platform::words_from_le_bytes_32(&context_key), crate::DERIVE_KEY_MATERIAL).as_bytes(),
+                *Hasher::new(crate::Mode::DeriveKeyWith(&context_key))
+                    .update(&input[..len])
+                    .finalize()
+                    .as_bytes(),
+                *hash_with_key(
+                    &input[..len],
+                    &crate::platform::words_from_le_bytes_32(&context_key),
+                    crate::DERIVE_KEY_MATERIAL
+                )
+                .as_bytes(),
                 "derive len = {len}"
             );
         }
@@ -1635,7 +1934,9 @@ mod test {
         let mut input = vec![0u8; (5 * MIN_SPLIT_LEN + 1025).max(3 << 20) + 12345];
         crate::test::paint_test_input(&mut input);
         let key = [42u8; KEY_LEN];
-        for len in [0, 1, MIN_SPLIT_LEN, MIN_SPLIT_LEN + 1, 5 * MIN_SPLIT_LEN + 1025, 3 << 20, input.len()] {
+        for len in
+            [0, 1, MIN_SPLIT_LEN, MIN_SPLIT_LEN + 1, 5 * MIN_SPLIT_LEN + 1025, 3 << 20, input.len()]
+        {
             for first in [0, 1, 1024, 3000, MIN_SPLIT_LEN] {
                 for piece in [1000, MIN_SPLIT_LEN, 4 * MIN_SPLIT_LEN, 1 << 20, usize::MAX] {
                     let first = first.min(len);
@@ -1648,8 +1949,16 @@ mod test {
                         keyed.update_multithreaded(part);
                     }
                     let what = format!("len {len}, first {first}, pieces of {piece}");
-                    assert_eq!(hasher.finalize(), crate::convenience::hash(&input[..len]), "{what}");
-                    assert_eq!(keyed.finalize(), crate::convenience::hash_with(crate::Mode::Keyed(&key), &input[..len]), "keyed {what}");
+                    assert_eq!(
+                        hasher.finalize(),
+                        crate::convenience::hash(&input[..len]),
+                        "{what}"
+                    );
+                    assert_eq!(
+                        keyed.finalize(),
+                        crate::convenience::hash_with(crate::Mode::Keyed(&key), &input[..len]),
+                        "keyed {what}"
+                    );
                 }
             }
         }
@@ -1688,10 +1997,18 @@ mod test {
             let pieces = cut_messages(count, message_len, 16);
             assert!(pieces.len() >= 16, "{} ranges of {message_len}-byte messages", pieces.len());
             assert_eq!(pieces[0].offset, 0);
-            assert!(pieces.windows(2).all(|w| w[0].offset + w[0].len == w[1].offset && w[0].len >= w[1].len));
+            assert!(
+                pieces
+                    .windows(2)
+                    .all(|w| w[0].offset + w[0].len == w[1].offset && w[0].len >= w[1].len)
+            );
             assert_eq!(pieces.last().unwrap().offset + pieces.last().unwrap().len, count);
             let bytes = |p: &Piece| p.len * message_len;
-            assert!(pieces[..pieces.len() - 1].iter().all(|p| bytes(p) <= MAX_PIECE_LEN && bytes(p) >= MIN_PIECE_LEN / 2));
+            assert!(
+                pieces[..pieces.len() - 1]
+                    .iter()
+                    .all(|p| bytes(p) <= MAX_PIECE_LEN && bytes(p) >= MIN_PIECE_LEN / 2)
+            );
         }
         assert_eq!(cut_messages(100, crate::BLOCK_LEN, 16).len(), 1);
     }
@@ -1713,9 +2030,17 @@ mod test {
             }
             let input = &owned[..];
             let mut want = vec![[0u8; crate::OUT_LEN]; count];
-            crate::performance::hash_many(crate::Mode::Plain, &crate::performance::Batch::in_place(&crate::test::blocks(input), message_len), &mut want);
+            crate::performance::hash_many(
+                crate::Mode::Plain,
+                &crate::performance::Batch::in_place(&crate::test::blocks(input), message_len),
+                &mut want,
+            );
             for (i, digest) in want.iter().enumerate().take(200) {
-                assert_eq!(*digest, *crate::convenience::hash(&input[i * slot..][..message_len]).as_bytes(), "message {i}");
+                assert_eq!(
+                    *digest,
+                    *crate::convenience::hash(&input[i * slot..][..message_len]).as_bytes(),
+                    "message {i}"
+                );
             }
             let mut got = vec![[0u8; crate::OUT_LEN]; count];
             hash_many(input, message_len, crate::IV, 0, &mut got);
@@ -1730,7 +2055,11 @@ mod test {
         crate::test::paint_test_input(&mut buffer);
         let count = buffer.len() / crate::BLOCK_LEN;
         let mut want = vec![[0u8; crate::OUT_LEN]; count];
-        crate::performance::hash_many(crate::Mode::Plain, &crate::performance::Batch::in_place(&crate::test::blocks(&buffer), crate::BLOCK_LEN), &mut want);
+        crate::performance::hash_many(
+            crate::Mode::Plain,
+            &crate::performance::Batch::in_place(&crate::test::blocks(&buffer), crate::BLOCK_LEN),
+            &mut want,
+        );
         let tree_want = crate::convenience::hash(&buffer);
         let (want, buffer) = (&want[..], &buffer[..]);
         let barrier = std::sync::Barrier::new(16);

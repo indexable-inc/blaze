@@ -260,10 +260,8 @@ fn k() { #[a] }
         })
         .flatten()
         .collect();
-    let names: Vec<_> = fns
-        .iter()
-        .map(|it| (it.name().unwrap().to_string(), it.body_is_lazy()))
-        .collect();
+    let names: Vec<_> =
+        fns.iter().map(|it| (it.name().unwrap().to_string(), it.body_is_lazy())).collect();
     assert_eq!(
         names,
         [

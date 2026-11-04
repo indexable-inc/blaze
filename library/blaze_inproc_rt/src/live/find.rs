@@ -119,7 +119,8 @@ mod unix {
             .filter(|it| !it.is_empty());
         if let Some(path) = path {
             // SAFETY: NOLOAD opens nothing new; the handle is closed below.
-            let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_NOLOAD) };
+            let handle =
+                unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_NOLOAD) };
             let found = lookup(handle, &name, base);
             if !handle.is_null() {
                 // SAFETY: opened above; the image stays loaded, as it was before.

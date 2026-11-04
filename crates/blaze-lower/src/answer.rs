@@ -12,7 +12,9 @@ use base_db::{Db, EditionedFileId, FileId};
 use blaze_query::db::{Database, Id};
 use hir_expand::{FileRange, HirFileId};
 use proc_macro_api::bridge::questions::{ParentSpan, SpanJoin};
-use span::{ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext, TextRange, TextSize};
+use span::{
+    ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext, TextRange, TextSize,
+};
 
 pub use proc_macro_api::bridge::questions::{SubRequest, SubResponse};
 
@@ -37,7 +39,9 @@ fn answered(db: &Db, req: SubRequest) -> Result<SubResponse, String> {
         SubRequest::SourceText { file_id, ast_id, start, end } => {
             let range = resolve(db, file_id, ast_id, range(start, end)?)?;
             let source = db.file_text(range.file_id.file_id(db)).text(db);
-            let text = source.get(usize::from(range.range.start())..usize::from(range.range.end())).map(ToOwned::to_owned);
+            let text = source
+                .get(usize::from(range.range.start())..usize::from(range.range.end()))
+                .map(ToOwned::to_owned);
             SubResponse::SourceTextResult { text }
         }
         // Not incremental: requires building line index.
@@ -70,7 +74,10 @@ fn answered(db: &Db, req: SubRequest) -> Result<SubResponse, String> {
                 current_ctx = macro_call_loc.ctxt;
                 current_span = Span {
                     range: resolved.range,
-                    anchor: SpanAnchor { file_id: resolved.file_id.span_file_id(db), ast_id: ROOT_ERASED_FILE_AST_ID },
+                    anchor: SpanAnchor {
+                        file_id: resolved.file_id.span_file_id(db),
+                        ast_id: ROOT_ERASED_FILE_AST_ID,
+                    },
                     ctx: current_ctx,
                 };
                 if call_site_file.file_id().is_some() {
@@ -152,7 +159,10 @@ fn path_of(db: &Db, file: FileId) -> Option<String> {
 fn file(db: &Db, raw: u32) -> Result<FileId, String> {
     if raw > span::EditionedFileId::MAX_FILE_ID {
         // alloc: the message of a question refused.
-        return Err(format!("file_id {raw} is past the largest file id, {}", span::EditionedFileId::MAX_FILE_ID));
+        return Err(format!(
+            "file_id {raw} is past the largest file id, {}",
+            span::EditionedFileId::MAX_FILE_ID
+        ));
     }
     let file = FileId::from_raw(raw);
     match db.has_file_text(file) {
@@ -173,7 +183,11 @@ fn range(start: u32, end: u32) -> Result<TextRange, String> {
 
 /// The file and item of a span's anchor, each checked against the database, and where the item
 /// starts in the file.
-fn anchor(db: &Db, raw_file: u32, raw_ast: u32) -> Result<(SpanAnchor, EditionedFileId, TextSize), String> {
+fn anchor(
+    db: &Db,
+    raw_file: u32,
+    raw_ast: u32,
+) -> Result<(SpanAnchor, EditionedFileId, TextSize), String> {
     use span::EditionedFileId as Raw;
     if raw_file & Raw::RESERVED_MASK != 0 {
         // alloc: the message of a question refused.
@@ -181,15 +195,21 @@ fn anchor(db: &Db, raw_file: u32, raw_ast: u32) -> Result<(SpanAnchor, Editioned
     }
     if (raw_file & Raw::EDITION_MASK) >> Raw::FILE_ID_BITS > span::Edition::LATEST as u32 {
         // alloc: the message of a question refused.
-        return Err(format!("file_id {raw_file:#x} names an edition past {}", span::Edition::LATEST));
+        return Err(format!(
+            "file_id {raw_file:#x} names an edition past {}",
+            span::Edition::LATEST
+        ));
     }
     file(db, raw_file & Raw::FILE_ID_MASK)?;
-    let anchor = SpanAnchor { file_id: Raw::from_raw(raw_file), ast_id: ErasedFileAstId::from_raw(raw_ast) };
+    let anchor =
+        SpanAnchor { file_id: Raw::from_raw(raw_file), ast_id: ErasedFileAstId::from_raw(raw_ast) };
     let editioned = EditionedFileId::from_span_file_id(db, anchor.file_id);
-    let item = HirFileId::from(editioned).ast_id_map(db).try_get_erased(anchor.ast_id).ok_or_else(|| {
-        // alloc: the message of a question refused.
-        format!("ast_id {raw_ast} names no item of file_id {raw_file:#x}")
-    })?;
+    let item = HirFileId::from(editioned).ast_id_map(db).try_get_erased(anchor.ast_id).ok_or_else(
+        || {
+            // alloc: the message of a question refused.
+            format!("ast_id {raw_ast} names no item of file_id {raw_file:#x}")
+        },
+    )?;
     Ok((anchor, editioned, item.text_range().start()))
 }
 
@@ -217,7 +237,14 @@ fn context(db: &Db, raw: u32) -> Result<SyntaxContext, String> {
     }
 }
 
-fn span_of(db: &Db, file_id: u32, ast_id: u32, start: u32, end: u32, ctx: u32) -> Result<Span, String> {
+fn span_of(
+    db: &Db,
+    file_id: u32,
+    ast_id: u32,
+    start: u32,
+    end: u32,
+    ctx: u32,
+) -> Result<Span, String> {
     let range = range(start, end)?;
     let (anchor, _, at) = anchor(db, file_id, ast_id)?;
     within(range, at, file_id)?;

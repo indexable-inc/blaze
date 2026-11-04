@@ -101,10 +101,7 @@ pub(crate) fn expand_rules_in<'t, A: Allocator>(
             err => matcher::match_failure(db, frame, rules, input, call_style)
                 .unwrap_or_else(|| err.build()),
         });
-        ExpandResult {
-            value: (tree, idx.try_into().ok(), made),
-            err: match_err.or(transcribe_err),
-        }
+        ExpandResult { value: (tree, idx.try_into().ok(), made), err: match_err.or(transcribe_err) }
     } else {
         ExpandResult::new(
             (

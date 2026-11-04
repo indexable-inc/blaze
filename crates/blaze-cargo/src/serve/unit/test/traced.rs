@@ -83,12 +83,18 @@ impl Splice {
         let Traced { files, dirs, env, untraceable } = own;
         let found = &mut self.found;
         found.clear();
-        merge(&mut base.files, files, &mut self.files, |it| &it.0, |at, kept, given| {
-            if kept.1.is_none() && given.1.is_some() {
-                kept.1 = given.1;
-                found.push(at as u32);
-            }
-        });
+        merge(
+            &mut base.files,
+            files,
+            &mut self.files,
+            |it| &it.0,
+            |at, kept, given| {
+                if kept.1.is_none() && given.1.is_some() {
+                    kept.1 = given.1;
+                    found.push(at as u32);
+                }
+            },
+        );
         merge(&mut base.dirs, dirs, &mut self.dirs, |it| &it.0, |_, _, _| {});
         merge(&mut base.env, env, &mut self.env, |it| &it.0, |_, _, _| {});
         self.untraceable.clear();

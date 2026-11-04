@@ -62,12 +62,18 @@ toml_edit = { workspace = true, features = ["display", "parse"] }
 # The releases of blaze a workspace pins arrive over HTTPS as `.tar.gz`, checked against
 # every list of sums the release publishes: `B3SUMS` (blaze-ids) and `SHA256SUMS`.
 blaze-registry.workspace = true
+# blaze's home and its `config.toml` (`user_config`), read in one place with blaze-registry's `[net]`.
+blaze-manifest.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-sha256.workspace = true
 tar = { workspace = true, features = ["default"] }
 flate2 = { workspace = true, features = ["rust_backend"] }
 url.workspace = true
+# blaze's own updates (`update.rs`): `latest.json` from blaze's site and the state the daemon keeps.
+serde_json.workspace = true
+# The update check's and install's spans (`update.rs`).
+tracing.workspace = true
 # A build script's `rustc` (`as_rustc.rs`): a probe loaded with the standard library, lowered
 # into the front end and checked as `blaze check` checks a crate.
 base-db.workspace = true

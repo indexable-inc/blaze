@@ -53,13 +53,8 @@ impl AttrsOrCfg {
     {
         // alloc: the owner's attributes, the value; none for an owner without any
         let mut attrs = Vec::new();
-        let cfg = lower_attrs_into(
-            db,
-            ast::AnyHasAttrs::new(owner),
-            cfg_options,
-            span_map,
-            &mut attrs,
-        );
+        let cfg =
+            lower_attrs_into(db, ast::AnyHasAttrs::new(owner), cfg_options, span_map, &mut attrs);
         let attrs = AttrsOwned(attrs.into_boxed_slice());
         match cfg {
             // alloc: once an owner `cfg`d out, which is lowered no further
@@ -162,7 +157,9 @@ impl ops::Deref for Attrs<'_> {
 /// The attributes of an item of an [`ItemTree`](super::ItemTree), borrowed from its columns.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AttrsOrCfgRef<'a> {
-    Enabled { attrs: Attrs<'a> },
+    Enabled {
+        attrs: Attrs<'a>,
+    },
     /// The `cfg` that is false, and the attributes before it.
     CfgDisabled(&'a CfgExpr, Attrs<'a>),
 }

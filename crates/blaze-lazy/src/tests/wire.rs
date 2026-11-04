@@ -18,7 +18,11 @@ fn every_frame_round_trips() {
         Frame::Ask { request: u64::MAX, lazy: u32::MAX },
         Frame::Ready { request: 7, lazy: 3, target: 0xffff_8000_1234_5678 },
         Frame::Failed { request: 9, lazy: 1, why: "" },
-        Frame::Failed { request: 9, lazy: 1, why: "compiling `f::<ü>`: its MIR could not be built" },
+        Frame::Failed {
+            request: 9,
+            lazy: 1,
+            why: "compiling `f::<ü>`: its MIR could not be built",
+        },
     ];
     for frame in frames {
         let bytes = encoded(frame);

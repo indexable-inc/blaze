@@ -1,11 +1,11 @@
 use std::{cell::Cell, panic, sync::Arc as StdArc};
 
+use crate::{FileId, FileSet, VfsPath};
 use blaze_bytes::Bytes;
 use blaze_query::db::Durability;
 use span::Edition;
 use syntax::{FlatTree, SourceFile};
 use triomphe::Arc;
-use crate::{FileId, FileSet, VfsPath};
 
 use super::{Trees, write_section};
 use crate::{Db, EditionedFileId, SourceRoot, SourceRootId, reparse::WHOLE};
@@ -16,7 +16,8 @@ const EDITION: Edition = Edition::Edition2021;
 /// its bodies. Each text once: the store keeps a tree per text, so two files of one text (the
 /// fixtures have two empty ones) are one entry.
 fn texts() -> Vec<(String, String)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../parser/test_data/parser/ok");
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../parser/test_data/parser/ok");
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|it| it.unwrap().path())

@@ -54,7 +54,9 @@ pub struct RacingOp {
 impl fmt::Display for RacingOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.size {
-            Some(0) => f.write_str("multiple differently-sized atomic loads, including one load")?,
+            Some(0) => {
+                f.write_str("multiple differently-sized atomic loads, including one load")?
+            }
             Some(size) => write!(f, "{size}-byte {}", self.action.description())?,
             None => f.write_str(self.action.description())?,
         }
@@ -84,7 +86,10 @@ pub struct DataRace {
 pub enum RaceErrorKind {
     Race(DataRace),
     /// A weak atomic load read a store whose bytes were not initialized.
-    UninitLoad { alloc: AllocId, offset: u64 },
+    UninitLoad {
+        alloc: AllocId,
+        offset: u64,
+    },
     JoinDetached(ThreadId),
     JoinJoined(ThreadId),
     JoinSelf(ThreadId),
@@ -109,7 +114,9 @@ impl RaceError {
         let mut helps = Vec::new();
         if let RaceErrorKind::Race(race) = &self.kind {
             if race.mixed_size {
-                helps.push("overlapping unsynchronized atomic accesses must use the same access size");
+                helps.push(
+                    "overlapping unsynchronized atomic accesses must use the same access size",
+                );
                 helps.push("see https://doc.rust-lang.org/nightly/std/sync/atomic/index.html#memory-model-for-atomic-accesses for more information about the Rust memory model");
             }
             if race.retag {
@@ -147,9 +154,9 @@ impl fmt::Display for RaceError {
                 }
                 Ok(())
             }
-            RaceErrorKind::UninitLoad { .. } => {
-                f.write_str("using uninitialized data, but this operation requires initialized memory")
-            }
+            RaceErrorKind::UninitLoad { .. } => f.write_str(
+                "using uninitialized data, but this operation requires initialized memory",
+            ),
             RaceErrorKind::JoinDetached(_) => f.write_str("trying to join a detached thread"),
             RaceErrorKind::JoinJoined(_) => f.write_str("trying to join an already joined thread"),
             RaceErrorKind::JoinSelf(_) => f.write_str("trying to join itself"),

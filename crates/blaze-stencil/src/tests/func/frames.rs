@@ -43,7 +43,8 @@ pub fn slots(mk: &Mk) -> Family {
     let entry = mk.func(0, mk.sig_of(&[I64, I64], &[I64, I64]), |b, v| {
         let (a, bb) = (v[0], v[1]);
         let writer = import(b, FUNCS, 1, mk.sig_of(&[I64, I64], &[]), false);
-        let s: Vec<ir::StackSlot> = SLOTS.iter().map(|(size, shift)| slot(b, *size, *shift)).collect();
+        let s: Vec<ir::StackSlot> =
+            SLOTS.iter().map(|(size, shift)| slot(b, *size, *shift)).collect();
         let byte = b.ins().ireduce(I8, a);
         b.ins().stack_store(I64, byte, s[0], 0);
         b.ins().stack_store(I64, a, s[1], 0);
@@ -188,7 +189,9 @@ pub fn probe(mk: &Mk) -> Family {
         let at = b.ins().stack_addr(I64, large, 0);
         let r = call(b, callee, &[at, v[0]])[0];
         let mut acc = r;
-        for (place, off) in [(small, 0), (small, end), (large, 0), (large, 50_000), (large, PROBED[1] as i32 - 8)] {
+        for (place, off) in
+            [(small, 0), (small, end), (large, 0), (large, 50_000), (large, PROBED[1] as i32 - 8)]
+        {
             let word = b.ins().stack_load(I64, I64, place, off);
             acc = mix(b, acc, word, i64::from(off));
         }
@@ -225,7 +228,8 @@ mod run {
             .map(|input| plain(input).expect("values"))
             .collect();
         let reference = built.link(0, &[], &[]);
-        let want: Vec<Vec<DataValue>> = inputs.iter().map(|input| reference.values(0, input)).collect();
+        let want: Vec<Vec<DataValue>> =
+            inputs.iter().map(|input| reference.values(0, input)).collect();
         for mix in 0..built.mixes() {
             let exec = built.link(mix, &[], &[]);
             for (input, want) in inputs.iter().zip(&want) {

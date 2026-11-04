@@ -4,8 +4,8 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use hir_firewall::{CodeLeak, Codegen, EDIT, Harness, Report};
 use hir_expand::fixture;
+use hir_firewall::{CodeLeak, Codegen, EDIT, Harness, Report};
 
 /// Every function of `fixture` edited in turn, without codegen.
 fn run(fixture: &str) -> Report {
@@ -19,9 +19,10 @@ fn run(fixture: &str) -> Report {
 fn run_compiled(fixture: &str) -> Report {
     let mut db = fixture::db(fixture).into_db();
     let krate = fixture::test_crate(&db);
-    let host = blaze_lower::target_data(hir_ty_codegen::Target::host()).expect("this machine's target data");
-    let codegen =
-        Codegen::dev("fixture", Arc::new(HashMap::new()), &host).expect("a dev build's policy for this machine");
+    let host = blaze_lower::target_data(hir_ty_codegen::Target::host())
+        .expect("this machine's target data");
+    let codegen = Codegen::dev("fixture", Arc::new(HashMap::new()), &host)
+        .expect("a dev build's policy for this machine");
     let mut harness = Harness::new(&mut db, krate, Some(codegen)).expect("the harness sets up");
     harness.run(&mut db, 1).expect("every edit is made")
 }
@@ -34,8 +35,7 @@ fn assert_clean(report: &Report) {
 
 #[test]
 fn an_edit_of_each_function_reaches_only_it() {
-    let report = run(
-        r#"
+    let report = run(r#"
 //- minicore: sized, copy, fn, option, slice, index
 pub struct Point { pub x: u32, pub y: u32 }
 
@@ -74,8 +74,7 @@ pub fn uses_inner() -> u32 { inner::helper(3) }
 
 pub const LIMIT: u32 = 10;
 pub static NAME: &str = "point";
-"#,
-    );
+"#);
     assert_clean(&report);
 }
 
@@ -84,8 +83,7 @@ pub static NAME: &str = "point";
 /// caller.
 #[test]
 fn an_edit_that_keeps_a_hidden_type_reaches_no_caller() {
-    let report = run(
-        r#"
+    let report = run(r#"
 //- minicore: sized, copy, fn, future, send, sync
 pub fn counter() -> impl Fn() -> u32 { || 1 }
 pub fn calls_counter() -> u32 { counter()() }
@@ -93,8 +91,7 @@ pub fn calls_counter() -> u32 { counter()() }
 pub async fn later() -> u32 { 2 }
 fn is_send<T: Send>(_: T) {}
 pub fn checks_send() { is_send(later()); }
-"#,
-    );
+"#);
     assert_clean(&report);
 }
 
@@ -102,15 +99,13 @@ pub fn checks_send() { is_send(later()); }
 /// constants that call it again (they are backdated) and reaches nothing past them.
 #[test]
 fn an_edit_of_a_const_fn_that_keeps_its_value_reaches_no_user_of_the_value() {
-    let report = run(
-        r#"
+    let report = run(r#"
 //- minicore: sized, copy
 pub const fn one() -> u32 { 1 }
 pub const ONE: u32 = one();
 pub fn uses_one() -> [u8; ONE as usize] { [0; ONE as usize] }
 pub fn other() -> u32 { 3 }
-"#,
-    );
+"#);
     assert_clean(&report);
 }
 
@@ -167,14 +162,15 @@ pub fn calls_plain() -> u32 { plain(1) }
 /// The edit the harness makes is one codegen sees: each edited function's code hash changes.
 #[test]
 fn the_harness_edit_changes_the_edited_body_s_code() {
-    assert!(EDIT.starts_with(' ') && EDIT.ends_with(';'), "an edit is one statement after the `{{`");
-    let report = run(
-        r#"
+    assert!(
+        EDIT.starts_with(' ') && EDIT.ends_with(';'),
+        "an edit is one statement after the `{{`"
+    );
+    let report = run(r#"
 //- minicore: sized
 pub fn a() -> u32 { 1 }
 pub fn b() -> u32 { a() }
-"#,
-    );
+"#);
     assert!(report.code.iter().all(|it| !matches!(it, CodeLeak::Unchanged { .. })), "{report}");
     assert_eq!(report.edits, 2);
 }

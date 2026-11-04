@@ -280,7 +280,9 @@ impl<T: 'static> LocalKey<T> {
             None => Local::Outside,
             Some(None) => Local::Gone,
             Some(Some(Some(value))) => Local::Value(
-                value.downcast::<T>().unwrap_or_else(|_| unreachable!("a key's values have its type")),
+                value
+                    .downcast::<T>()
+                    .unwrap_or_else(|_| unreachable!("a key's values have its type")),
             ),
             Some(Some(None)) => {
                 // alloc: a thread's `thread_local!` value, once per thread and key, as std's

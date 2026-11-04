@@ -39,14 +39,16 @@ fn shape() -> Shape {
 fn image(section: &[u8]) -> Image<Vec<u8>> {
     let mut builder = Builder::new();
     builder.add(ID, SCHEMA, section);
-    Image::open(builder.finish().expect("a fuzz input's image fits")).expect("an image just built opens")
+    Image::open(builder.finish().expect("a fuzz input's image fits"))
+        .expect("an image just built opens")
 }
 
 /// The section `table` writes with the IDs `live` marks.
 fn write(table: &Table, live: &Live) -> Vec<u8> {
     let mut builder = Builder::new();
     table.write(live, &mut builder.section(ID, SCHEMA));
-    let image = Image::open(builder.finish().expect("a written table's image fits")).expect("a written image opens");
+    let image = Image::open(builder.finish().expect("a written table's image fits"))
+        .expect("a written image opens");
     let section = image.section(ID, SCHEMA).expect("a written section is there");
     image.whole(&section).expect("a written section reads whole").to_vec()
 }
@@ -71,7 +73,8 @@ pub struct Restored {
 fn read(table: &Table) -> Restored {
     let first = shape().statics + 1;
     let end = table.end();
-    let values: Vec<(u32, Box<[u8]>)> = (1..end).filter_map(|id| Some((id, table.get(id)?.into()))).collect();
+    let values: Vec<(u32, Box<[u8]>)> =
+        (1..end).filter_map(|id| Some((id, table.get(id)?.into()))).collect();
     let found = values.iter().map(|(_, bytes)| table.find(bytes)).collect();
     let mut live = Live::new();
     values.iter().filter(|&&(id, _)| id >= first).for_each(|&(id, _)| live.mark_id(id));
@@ -90,7 +93,9 @@ fn with_restored<T>(section: &[u8], read: impl FnOnce(&Table) -> T) -> Result<T,
         // they were freed.
         let image: &'static Image<Vec<u8>> = unsafe { &*at };
         let restored = image.section(ID, SCHEMA).map_err(RestoreError::from);
-        restored.and_then(|section| Table::restore(shape(), image, &section, &serial)).map(|table| read(&table))
+        restored
+            .and_then(|section| Table::restore(shape(), image, &section, &serial))
+            .map(|table| read(&table))
     };
     // SAFETY: `at` came from `Box::into_raw` above and is freed once, here, after the last use
     // of every borrow of it (above).
@@ -112,7 +117,9 @@ pub fn section(values: &[&[u8]], freed: &[u32]) -> Vec<u8> {
         table.intern(value);
     }
     let mut live = Live::new();
-    (shape().statics + 1..table.end()).filter(|id| !freed.contains(id)).for_each(|id| live.mark_id(id));
+    (shape().statics + 1..table.end())
+        .filter(|id| !freed.contains(id))
+        .for_each(|id| live.mark_id(id));
     write(&table, &live)
 }
 

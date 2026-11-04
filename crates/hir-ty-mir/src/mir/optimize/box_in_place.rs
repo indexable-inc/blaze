@@ -48,9 +48,9 @@ use smallvec::SmallVec;
 use crate::{
     db::HirDatabase,
     mir::{
-        AggregateKind, BasicBlock, BasicBlockId, CastKind, FieldIndex, Local, LocalId, MirBody, MirLowerError, MirSpan,
-        Operand, OperandKind, Place, ProjectionElem, Rvalue, Statement, StatementKind,
-        Terminator, TerminatorKind, VariantId, return_slot, transform::Ctx,
+        AggregateKind, BasicBlock, BasicBlockId, CastKind, FieldIndex, Local, LocalId, MirBody,
+        MirLowerError, MirSpan, Operand, OperandKind, Place, ProjectionElem, Rvalue, Statement,
+        StatementKind, Terminator, TerminatorKind, VariantId, return_slot, transform::Ctx,
     },
     next_solver::{ConstExt, GenericArg, GenericArgs, Ty, TyKind},
 };
@@ -247,7 +247,9 @@ fn built_by<'db>(
         while at < plan.len() {
             let index = plan[at].index;
             let built_ty = body.locals[plan[at].local].ty.as_ref();
-            let StatementKind::Assign(_, rvalue) = &data.statements[index].kind else { return None };
+            let StatementKind::Assign(_, rvalue) = &data.statements[index].kind else {
+                return None;
+            };
             let mut moves_drop = false;
             rvalue.for_each_operand(&mut |it| moves_drop |= moves_something_to_drop(ctx, body, it));
             if moves_drop {
@@ -274,7 +276,8 @@ fn built_by<'db>(
         // What comes after the allocation, which goes before the first statement of the plan,
         // may neither unwind nor run code.
         let first = plan.iter().map(|it| it.index).min().expect("the argument's own");
-        if data.statements[first..].iter().any(|it| matches!(it.kind, StatementKind::InlineAsm(_))) {
+        if data.statements[first..].iter().any(|it| matches!(it.kind, StatementKind::InlineAsm(_)))
+        {
             return None;
         }
         // Nor may it set or unset a local with something to drop: the call's cleanup, which the
@@ -333,7 +336,11 @@ fn fieldwise<'db>(ctx: &Ctx<'_, 'db>, kind: &AggregateKind, ty: Ty<'db>) -> bool
 
 /// `operand` moves a value with something to drop: one a panic before it is moved would leave
 /// for the caller's cleanup, which expects it moved.
-fn moves_something_to_drop<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, operand: &Operand) -> bool {
+fn moves_something_to_drop<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &MirBody<'db>,
+    operand: &Operand,
+) -> bool {
     match &operand.kind {
         OperandKind::Move(place) => ctx.needs_drop(place.as_ref().ty(body, &ctx.infcx, ctx.env).ty),
         _ => false,
@@ -387,14 +394,20 @@ fn std_alloc<'db>(ctx: &Ctx<'_, 'db>, new: FunctionId) -> Result<'db, Alloc> {
             Some(TerminatorKind::Goto { target }) => block = *target,
             Some(TerminatorKind::Call { func, args, destination, .. }) => {
                 let Some(alloc) = callee(func) else {
-                    return Err(refuse(format!("bb{} calls something not named", block_index(block))));
+                    return Err(refuse(format!(
+                        "bb{} calls something not named",
+                        block_index(block)
+                    )));
                 };
                 let name = FunctionSignature::of(db, alloc).name.as_str().to_owned(); // alloc: a name for an error
                 if name != "box_new_uninit" {
                     return Err(refuse(format!("its first call is of `{name}`")));
                 }
                 let [arg] = &args[..] else {
-                    return Err(refuse(format!("`box_new_uninit` is given {} arguments", args.len())));
+                    return Err(refuse(format!(
+                        "`box_new_uninit` is given {} arguments",
+                        args.len()
+                    )));
                 };
                 let layout = match &arg.kind {
                     _ if is_constant(arg) => arg,
@@ -476,7 +489,10 @@ fn rewrite<'db>(
         kind: TerminatorKind::Call { destination, target: Some(target), cleanup: box_cleanup, .. },
     }) = body.basic_blocks[site.block].terminator.take()
     else {
-        unreachable!("`find` took a `Box::new` call with a target in bb{}", block_index(site.block));
+        unreachable!(
+            "`find` took a `Box::new` call with a target in bb{}",
+            block_index(site.block)
+        );
     };
     let value_ty = body.locals[site.arg].ty.as_ref();
     let box_ty = ctx.normalize(destination.as_ref().ty(body, &ctx.infcx, ctx.env).ty);
@@ -489,7 +505,7 @@ fn rewrite<'db>(
     let allocate = move |target: BasicBlockId, cleanup: Option<BasicBlockId>| Terminator {
         span,
         kind: TerminatorKind::Call {
-            func: std.func.clone(), // clone: the function's constant, a refcount
+            func: std.func.clone(),   // clone: the function's constant, a refcount
             args: Box::new([layout]), // alloc: a call's arguments, kept in the body
             destination: Place::from(raw).store(),
             target: Some(target),
@@ -507,11 +523,13 @@ fn rewrite<'db>(
             let rest = body.basic_blocks[site.block].statements.split_off(first); // alloc: the block's tail, moved to the new block
             let mut statements = Vec::with_capacity(rest.len() + 8); // alloc: a block's statements, kept in the body
             statements.push(statement(StatementKind::StorageLive(typed), span));
-            statements.push(statement(StatementKind::Assign(Place::from(typed).store(), to_typed), span));
+            statements
+                .push(statement(StatementKind::Assign(Place::from(typed).store(), to_typed), span));
             statements.push(statement(StatementKind::StorageDead(raw), span));
             let in_box = Place::from(typed).project(ProjectionElem::Deref);
             let at_path = |path: &[FieldIndex]| {
-                path.iter().fold(in_box, |place, &field| place.project(ProjectionElem::Field(field)))
+                path.iter()
+                    .fold(in_box, |place, &field| place.project(ProjectionElem::Field(field)))
             };
             let placed = |local: LocalId| plan.iter().any(|it| it.local == local);
             for (offset, it) in rest.into_iter().enumerate() {
@@ -531,11 +549,16 @@ fn rewrite<'db>(
                             if is_placed {
                                 continue;
                             }
-                            let to = to.project(ProjectionElem::Field(FieldIndex(field as u32))).store();
-                            statements.push(statement(StatementKind::Assign(to, Rvalue::Use(operand)), it.span));
+                            let to =
+                                to.project(ProjectionElem::Field(FieldIndex(field as u32))).store();
+                            statements.push(statement(
+                                StatementKind::Assign(to, Rvalue::Use(operand)),
+                                it.span,
+                            ));
                         }
                     }
-                    rvalue => statements.push(statement(StatementKind::Assign(to.store(), rvalue), it.span)),
+                    rvalue => statements
+                        .push(statement(StatementKind::Assign(to.store(), rvalue), it.span)),
                 }
             }
             statements.push(statement(StatementKind::Assign(destination, to_box), span));
@@ -554,8 +577,19 @@ fn rewrite<'db>(
             // write: typed = raw as *mut T; (*typed) = f(..) -> [return: bb, unwind: free]
             // free: boxed = typed as Box<MaybeUninit<T>>; drop(boxed) -> unwind
             // bb: ..; dest = typed as Box<T>; goto target
-            let Some(Terminator { span: call_span, kind: TerminatorKind::Call { func, args, target: call_target, cleanup, from_hir_call, intrinsic, .. } }) =
-                body.basic_blocks[pred].terminator.take()
+            let Some(Terminator {
+                span: call_span,
+                kind:
+                    TerminatorKind::Call {
+                        func,
+                        args,
+                        target: call_target,
+                        cleanup,
+                        from_hir_call,
+                        intrinsic,
+                        ..
+                    },
+            }) = body.basic_blocks[pred].terminator.take()
             else {
                 unreachable!("`find` took the call that ends bb{}", block_index(pred));
             };
@@ -628,7 +662,11 @@ fn free_block<'db>(
             body.owner
         )));
     };
-    let uninit = Ty::new_adt(interner, AdtId::UnionId(maybe_uninit), GenericArgs::new_from_slice(&[GenericArg::from(value_ty)]));
+    let uninit = Ty::new_adt(
+        interner,
+        AdtId::UnionId(maybe_uninit),
+        GenericArgs::new_from_slice(&[GenericArg::from(value_ty)]),
+    );
     let mut box_args: SmallVec<[GenericArg<'db>; 2]> = SmallVec::new();
     box_args.push(GenericArg::from(uninit));
     box_args.extend(args.as_slice().iter().skip(1).copied());
@@ -636,10 +674,17 @@ fn free_block<'db>(
     let boxed = body.locals.alloc(Local { ty: uninit_box.store() });
     let to_box = Rvalue::Cast(CastKind::Transmute, move_of(typed), uninit_box.store());
     Ok(body.basic_blocks.alloc(BasicBlock {
-        statements: vec![statement(StatementKind::Assign(Place::from(boxed).store(), to_box), span)], // alloc: a block's statements, kept in the body
+        statements: vec![statement(
+            StatementKind::Assign(Place::from(boxed).store(), to_box),
+            span,
+        )], // alloc: a block's statements, kept in the body
         terminator: Some(Terminator {
             span,
-            kind: TerminatorKind::Drop { place: Place::from(boxed).store(), target: resume, unwind: None },
+            kind: TerminatorKind::Drop {
+                place: Place::from(boxed).store(),
+                target: resume,
+                unwind: None,
+            },
         }),
         is_cleanup: true,
     }))

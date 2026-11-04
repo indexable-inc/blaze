@@ -35,7 +35,11 @@ pub struct TooLarge {
 
 impl fmt::Display for TooLarge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "an image whose spine of {} bytes outgrows its {}-byte group", self.spine, self.group)
+        write!(
+            f,
+            "an image whose spine of {} bytes outgrows its {}-byte group",
+            self.spine, self.group
+        )
     }
 }
 
@@ -100,7 +104,8 @@ impl Builder {
         let group = self.group();
         let data_end = self.out.len().next_multiple_of(group);
         self.out.resize(data_end, 0);
-        let groups = u32::try_from(data_end / group - 1).map_err(|_| TooLarge { spine: usize::MAX, group })?;
+        let groups = u32::try_from(data_end / group - 1)
+            .map_err(|_| TooLarge { spine: usize::MAX, group })?;
         let tops = spine::tops_for(groups, self.shift);
         let spine_len = spine::spine_len(self.sections.len(), tops);
         if spine_len > group {
@@ -168,7 +173,10 @@ impl SectionWriter<'_> {
     /// Pads with zeros to a multiple of `align` (a power of two, at most a page) from the
     /// section's start, which is page aligned: where a value of that alignment goes next.
     pub fn align(&mut self, align: usize) -> u64 {
-        assert!(align.is_power_of_two() && align <= 1 << MIN_GROUP_SHIFT, "an alignment of {align}");
+        assert!(
+            align.is_power_of_two() && align <= 1 << MIN_GROUP_SHIFT,
+            "an alignment of {align}"
+        );
         let at = self.len().next_multiple_of(align as u64);
         self.builder.out.resize(self.start + at as usize, 0);
         self.finish_len();
@@ -210,7 +218,8 @@ impl SectionWriter<'_> {
         let Some(end) = end else {
             panic!("a patch of {} bytes at {at} of a section of {} bytes", bytes.len(), self.len())
         };
-        self.builder.out[self.start + at as usize..self.start + end as usize].copy_from_slice(bytes);
+        self.builder.out[self.start + at as usize..self.start + end as usize]
+            .copy_from_slice(bytes);
     }
 
     /// [`SectionWriter::patch`] of a record's bytes.

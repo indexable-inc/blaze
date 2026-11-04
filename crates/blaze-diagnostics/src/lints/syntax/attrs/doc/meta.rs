@@ -50,14 +50,22 @@ impl<'t> Lit<'t> {
         let token = self.token;
         match self.token.kind() {
             // alloc: `symbol` is a diagnostic's text, as is all below
-            SyntaxKind::STRING => ast::String::cast(token).map(|it| it.text_without_quotes().to_owned()),
+            SyntaxKind::STRING => {
+                ast::String::cast(token).map(|it| it.text_without_quotes().to_owned())
+            }
             // alloc: as above
-            SyntaxKind::BYTE_STRING => ast::ByteString::cast(token).map(|it| it.text_without_quotes().to_owned()),
+            SyntaxKind::BYTE_STRING => {
+                ast::ByteString::cast(token).map(|it| it.text_without_quotes().to_owned())
+            }
             // alloc: as above
-            SyntaxKind::C_STRING => ast::CString::cast(token).map(|it| it.text_without_quotes().to_owned()),
+            SyntaxKind::C_STRING => {
+                ast::CString::cast(token).map(|it| it.text_without_quotes().to_owned())
+            }
             SyntaxKind::CHAR | SyntaxKind::BYTE => {
                 // alloc: as above
-                let (Some(open), Some(close)) = (text.find('\''), text.rfind('\'')) else { return text.to_owned() };
+                let (Some(open), Some(close)) = (text.find('\''), text.rfind('\'')) else {
+                    return text.to_owned();
+                };
                 text.get(open + 1..close).map(str::to_owned)
             }
             SyntaxKind::INT_NUMBER => ast::IntNumber::cast(token).map(|it| {
@@ -66,7 +74,9 @@ impl<'t> Lit<'t> {
                 format!("{prefix}{digits}")
             }),
             // alloc: as above
-            SyntaxKind::FLOAT_NUMBER => ast::FloatNumber::cast(token).map(|it| it.split_into_parts().0.to_owned()),
+            SyntaxKind::FLOAT_NUMBER => {
+                ast::FloatNumber::cast(token).map(|it| it.split_into_parts().0.to_owned())
+            }
             _ => None,
         }
         // alloc: as above
@@ -78,12 +88,18 @@ impl<'t> Lit<'t> {
         let text = self.token.text();
         let token = self.token;
         match self.token.kind() {
-            SyntaxKind::INT_NUMBER => ast::IntNumber::cast(token).is_some_and(|it| it.suffix().is_some()),
-            SyntaxKind::FLOAT_NUMBER => ast::FloatNumber::cast(token).is_some_and(|it| it.suffix().is_some()),
-            SyntaxKind::STRING | SyntaxKind::BYTE_STRING | SyntaxKind::C_STRING => {
-                text.rfind('"').is_some_and(|close| !text[close + 1..].trim_start_matches('#').is_empty())
+            SyntaxKind::INT_NUMBER => {
+                ast::IntNumber::cast(token).is_some_and(|it| it.suffix().is_some())
             }
-            SyntaxKind::CHAR | SyntaxKind::BYTE => text.rfind('\'').is_some_and(|close| close + 1 < text.len()),
+            SyntaxKind::FLOAT_NUMBER => {
+                ast::FloatNumber::cast(token).is_some_and(|it| it.suffix().is_some())
+            }
+            SyntaxKind::STRING | SyntaxKind::BYTE_STRING | SyntaxKind::C_STRING => text
+                .rfind('"')
+                .is_some_and(|close| !text[close + 1..].trim_start_matches('#').is_empty()),
+            SyntaxKind::CHAR | SyntaxKind::BYTE => {
+                text.rfind('\'').is_some_and(|close| close + 1 < text.len())
+            }
             _ => false,
         }
     }
@@ -127,7 +143,9 @@ impl MetaArgs<'_> {
         match self {
             MetaArgs::None => None,
             MetaArgs::List(list) => Some(list.range),
-            MetaArgs::NameValue { eq, value } => Some(TextRange::new(eq.start(), value.range().end())),
+            MetaArgs::NameValue { eq, value } => {
+                Some(TextRange::new(eq.start(), value.range().end()))
+            }
         }
     }
 }
@@ -210,7 +228,11 @@ fn is_lit(kind: SyntaxKind) -> bool {
 fn is_segment(kind: SyntaxKind) -> bool {
     matches!(
         kind,
-        SyntaxKind::IDENT | SyntaxKind::SELF_KW | SyntaxKind::SUPER_KW | SyntaxKind::CRATE_KW | SyntaxKind::SELF_TYPE_KW
+        SyntaxKind::IDENT
+            | SyntaxKind::SELF_KW
+            | SyntaxKind::SUPER_KW
+            | SyntaxKind::CRATE_KW
+            | SyntaxKind::SELF_TYPE_KW
     )
 }
 
@@ -262,8 +284,9 @@ impl<'t, I: Iterator<Item = ast::Element<'t>>> Parser<'t, I> {
             SyntaxKind::COLON2 => Some((first.text_range(), 1)),
             SyntaxKind::COLON => {
                 let second = self.token(1)?;
-                (second.kind() == SyntaxKind::COLON && second.text_range().start() == first.text_range().end())
-                    .then(|| (first.text_range().cover(second.text_range()), 2))
+                (second.kind() == SyntaxKind::COLON
+                    && second.text_range().start() == first.text_range().end())
+                .then(|| (first.text_range().cover(second.text_range()), 2))
             }
             _ => None,
         }
@@ -306,7 +329,9 @@ impl<'t, I: Iterator<Item = ast::Element<'t>>> Parser<'t, I> {
         }
         let path = self.path()?;
         let args = match self.get(0) {
-            Some(NodeOrToken::Node(node)) if node.first_token().is_some_and(|it| it.kind() == SyntaxKind::L_PAREN) => {
+            Some(NodeOrToken::Node(node))
+                if node.first_token().is_some_and(|it| it.kind() == SyntaxKind::L_PAREN) =>
+            {
                 let tree = ast::TokenTree::cast(node)?;
                 self.bump(1);
                 MetaArgs::List(list(tree)?)
@@ -342,8 +367,12 @@ mod tests {
                 Item::Lit(lit) => format!("lit {}", lit.symbol()),
                 Item::Meta(meta) => match &meta.args {
                     MetaArgs::None => meta.path.name(),
-                    MetaArgs::List(list) => format!("{}({})", meta.path.name(), shape(list).join(", ")),
-                    MetaArgs::NameValue { value, .. } => format!("{} = {}", meta.path.name(), value.symbol()),
+                    MetaArgs::List(list) => {
+                        format!("{}({})", meta.path.name(), shape(list).join(", "))
+                    }
+                    MetaArgs::NameValue { value, .. } => {
+                        format!("{} = {}", meta.path.name(), value.symbol())
+                    }
                 },
             })
             .collect()
@@ -351,10 +380,14 @@ mod tests {
 
     #[test]
     fn a_list_parses_as_rustcs_meta_items() {
-        let shapes = first_list(r#"#[doc(foo::bar, crate::bar::baz = "bye", test(attr(allow(x))), 123,)] fn f() {}"#, |it| {
-            shape(&it.unwrap())
-        });
-        assert_eq!(shapes, ["foo::bar", "crate::bar::baz = bye", "test(attr(allow(x)))", "lit 123"]);
+        let shapes = first_list(
+            r#"#[doc(foo::bar, crate::bar::baz = "bye", test(attr(allow(x))), 123,)] fn f() {}"#,
+            |it| shape(&it.unwrap()),
+        );
+        assert_eq!(
+            shapes,
+            ["foo::bar", "crate::bar::baz = bye", "test(attr(allow(x)))", "lit 123"]
+        );
         let rooted = first_list("#[doc(::a, r#b::c)] fn f() {}", |it| shape(&it.unwrap()));
         assert_eq!(rooted, ["{{root}}::a", "b::c"]);
     }
@@ -391,18 +424,19 @@ mod tests {
 
     #[test]
     fn a_literal_is_read_as_rustc_reads_it() {
-        let values = first_list(r#"#[doc(a = "x\n", b = r"y", c = 1u8, d = true)] fn f() {}"#, |list| {
-            list.unwrap()
-                .items
-                .iter()
-                .map(|it| match it {
-                    Item::Meta(MetaItem { args: MetaArgs::NameValue { value, .. }, .. }) => {
-                        (value.symbol(), value.str().map(Cow::into_owned), value.suffixed())
-                    }
-                    _ => unreachable!(),
-                })
-                .collect::<Vec<(String, Option<String>, bool)>>()
-        });
+        let values =
+            first_list(r#"#[doc(a = "x\n", b = r"y", c = 1u8, d = true)] fn f() {}"#, |list| {
+                list.unwrap()
+                    .items
+                    .iter()
+                    .map(|it| match it {
+                        Item::Meta(MetaItem {
+                            args: MetaArgs::NameValue { value, .. }, ..
+                        }) => (value.symbol(), value.str().map(Cow::into_owned), value.suffixed()),
+                        _ => unreachable!(),
+                    })
+                    .collect::<Vec<(String, Option<String>, bool)>>()
+            });
         assert_eq!(
             values,
             [

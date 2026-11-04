@@ -36,8 +36,8 @@ pub mod inspect;
 pub mod json;
 pub mod live;
 pub mod observe;
-pub mod place;
 pub mod perf;
+pub mod place;
 #[cfg(feature = "native")]
 pub mod pprof;
 pub mod print;
@@ -45,6 +45,7 @@ pub mod reach;
 pub mod replace;
 pub mod run;
 pub mod say;
+pub mod terminal;
 pub mod test;
 
 use std::{
@@ -100,7 +101,7 @@ Commands:
     debug profile [--seconds N]    The daemon's flight recorder as a Chrome trace
     debug live                     The daemon's threads as they run
     debug sql [--live] QUERY       SQL over the profile history (with `--live`, the flight recorder too)
-    explain VIEW [NAME=VALUE ...]  One of the history's named views
+    explain RULE|PACKAGE|VIEW      A rule's long text, the last failure of PACKAGE with all it blocks, or a history view
     why [ITEM] [--all] [--json]    What the last build computed again instead of reusing, and why
     reach [ROOT] [--json]          What the edits since ROOT reach (items, functions, tests), and the root now
     slow [--build N] [--top N] [--json]   What made the last build slow, ranked by the time each fix saves
@@ -190,7 +191,8 @@ pub fn words(args: impl Iterator<Item = OsString>) -> Vec<OsString> {
 
 /// Whether stderr is colored when nothing says how: clap's choice for its own errors.
 fn auto_color() -> bool {
-    place::color(Some("auto"), |name| std::env::var(name).ok(), io::stderr().is_terminal()).unwrap_or(false)
+    place::color(Some("auto"), |name| std::env::var(name).ok(), io::stderr().is_terminal())
+        .unwrap_or(false)
 }
 
 /// One command line, run: its exit code.
@@ -232,7 +234,9 @@ pub fn command(words: Vec<OsString>) -> i32 {
             Exit::Failed.code()
         }
         Asked::Stop => said(daemon::stop(&mut io::stderr().lock(), auto_color())),
-        Asked::Status => said(daemon::status(&mut io::stdout().lock(), &mut io::stderr().lock(), auto_color())),
+        Asked::Status => {
+            said(daemon::status(&mut io::stdout().lock(), &mut io::stderr().lock(), auto_color()))
+        }
         Asked::Toolchain => match crate::toolchain::ensure() {
             Ok(chosen) => {
                 println!("{chosen}");
@@ -275,7 +279,8 @@ fn fmt(words: Vec<OsString>) -> i32 {
         match word.into_string() {
             Ok(word) => args.push(word),
             Err(word) => {
-                let what = format!("blaze fmt: the argument {} is not UTF-8", word.to_string_lossy());
+                let what =
+                    format!("blaze fmt: the argument {} is not UTF-8", word.to_string_lossy());
                 eprint!("{}", say::error(&what, auto_color()));
                 return Exit::Usage.code();
             }
@@ -294,10 +299,15 @@ pub fn request(asked: &Invocation, cargo: Cargo) -> Result<Request, String> {
     let flags = &asked.flags;
     Ok(match asked.command() {
         Command::Check => Request::Check { view, targets },
-        Command::Doc => Request::Doc { view, targets, no_deps: flags.no_deps, private: flags.private },
+        Command::Doc => {
+            Request::Doc { view, targets, no_deps: flags.no_deps, private: flags.private }
+        }
         Command::Test | Command::Bench if in_daemon(asked) => {
             if flags.ub && flags.no_run {
-                return Err("`--ub` runs the tests in blaze's evaluator, which `--no-run` says not to do".to_owned());
+                return Err(
+                    "`--ub` runs the tests in blaze's evaluator, which `--no-run` says not to do"
+                        .to_owned(),
+                );
             }
             let ub = flags.ub.then_some(Ub { seed: flags.ub_seed, schedules: flags.ub_schedules });
             let args = asked.program.iter().map(|it| {
@@ -306,9 +316,18 @@ pub fn request(asked: &Invocation, cargo: Cargo) -> Result<Request, String> {
                 })
             });
             let args = args.collect::<Result<_, _>>()?;
-            Request::Test { view, targets, filter: asked.filter.iter().cloned().collect(), all: !flags.reached, args, ub }
+            Request::Test {
+                view,
+                targets,
+                filter: asked.filter.iter().cloned().collect(),
+                all: !flags.reached,
+                args,
+                ub,
+            }
         }
-        Command::Build | Command::Run | Command::Test | Command::Bench => Request::Build { view, targets },
+        Command::Build | Command::Run | Command::Test | Command::Bench => {
+            Request::Build { view, targets }
+        }
     })
 }
 
@@ -328,13 +347,18 @@ fn prepared(asked: &Invocation, color: bool) -> Result<(Place, Request), String>
 fn prepared_cargo(asked: &Invocation, color: bool) -> Result<(Place, Cargo), String> {
     let cwd = std::env::current_dir().map_err(|error| format!("the current directory: {error}"))?;
     let env = place::env(std::env::vars_os())?;
-    let place = place::find(&cwd, asked.flags.manifest_path.as_deref(), place::script(&asked.args))?;
+    let place =
+        place::find(&cwd, asked.flags.manifest_path.as_deref(), place::script(&asked.args))?;
     let home = blaze_registry::cargo_home();
     let mut files = place::config_files(&place, &asked.flags.config, home.as_deref())?;
     if asked.command() == Command::Check {
         files.extend(place::clippy_files(&place)?);
     }
-    let width = place::width(|name| std::env::var(name).ok(), io::stderr().is_terminal(), place::stderr_columns)?;
+    let width = place::width(
+        |name| std::env::var(name).ok(),
+        io::stderr().is_terminal(),
+        place::stderr_columns,
+    )?;
     let cargo = place::cargo(asked, &place, env, files, color, width)?;
     Ok((place, cargo))
 }
@@ -353,7 +377,14 @@ fn cargo(asked: &Invocation) -> i32 {
             return refused(what, auto_color());
         }
         if let Err(error) = std::env::set_current_dir(directory) {
-            eprint!("{}", run::caused("could not change to requested directory", &[error.to_string()], auto_color()));
+            eprint!(
+                "{}",
+                run::caused(
+                    "could not change to requested directory",
+                    &[error.to_string()],
+                    auto_color()
+                )
+            );
             return Exit::Failed.code();
         }
     }
@@ -361,7 +392,12 @@ fn cargo(asked: &Invocation) -> i32 {
         return refused("cannot set both --verbose and --quiet", auto_color());
     }
     let var = |name: &str| std::env::var(name).ok();
-    let color = match place::color(asked.flags.color.as_deref(), var, io::stderr().is_terminal()) {
+    let config = match terminal::config() {
+        Ok(config) => config,
+        Err(what) => return refused(&what, auto_color()),
+    };
+    let flag = terminal::color_flag(asked.flags.color.as_deref(), &config, var);
+    let color = match place::color(flag, var, io::stderr().is_terminal()) {
         Ok(color) => color,
         Err(what) => return refused(&what, auto_color()),
     };
@@ -397,7 +433,16 @@ fn cargo(asked: &Invocation) -> i32 {
     };
     let stats = std::env::var_os("BLAZE_STATS").is_some();
     let fixing = pinned.is_some();
-    let shown = Shown { format, quiet: asked.flags.quiet, verbose: asked.flags.verbose, color, stats, fixing };
+    let terminal = terminal::stderr(&config, color);
+    let shown = Shown {
+        format,
+        quiet: asked.flags.quiet,
+        verbose: asked.flags.verbose,
+        color,
+        stats,
+        fixing,
+        terminal,
+    };
     // On a terminal, `test` draws its live view, whose screen thread writes stderr: the locks
     // below are taken only off that path.
     if live::wanted(asked, shown) {
@@ -413,12 +458,24 @@ fn cargo(asked: &Invocation) -> i32 {
         }
         return match then {
             Ok(Then::Exit(code)) => code,
-            Ok(Then::Exec(_) | Then::Fix(_)) => refused("the live test view ended in neither an exit code nor an error", color),
+            Ok(Then::Exec(_) | Then::Fix(_)) => {
+                refused("the live test view ended in neither an exit code nor an error", color)
+            }
             Err(error) => refused(&error.to_string(), color),
         };
     }
     let (mut out, mut err) = (io::stdout().lock(), io::stderr().lock());
-    let then = drive(&mut client, asked, &place, request, shown, started, &mut out, &mut err, &mut test::Spawned);
+    let then = drive(
+        &mut client,
+        asked,
+        &place,
+        request,
+        shown,
+        started,
+        &mut out,
+        &mut err,
+        &mut test::Spawned,
+    );
     // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
     let closed = client.close();
     // The daemon wrote its part before its last response, so every part is in by now.
@@ -427,14 +484,21 @@ fn cargo(asked: &Invocation) -> i32 {
         blaze_profile::finish();
     }
     if let Err(error) = closed {
-        let _ = err.write_all(say::error(&format!("closing the connection to the build engine: {error}"), color).as_bytes());
+        let _ = err.write_all(
+            say::error(&format!("closing the connection to the build engine: {error}"), color)
+                .as_bytes(),
+        );
         return Exit::Failed.code();
     }
     match then {
         Ok(Then::Exit(code)) => code,
         Ok(Then::Exec(exec)) => {
             drop(out);
-            run::exec(&exec, &mut err, run::Told { color, quiet: shown.quiet, verbose: shown.verbose })
+            run::exec(
+                &exec,
+                &mut err,
+                run::Told { color, quiet: shown.quiet, verbose: shown.verbose },
+            )
         }
         Ok(Then::Fix(found)) => {
             let Some(pinned) = &pinned else { return refused("`--fix` was not asked for", color) };
@@ -444,10 +508,17 @@ fn cargo(asked: &Invocation) -> i32 {
                         true => String::new(),
                         false => format!(": {}", fixed.files.join(", ")),
                     };
-                    let rest = format!("{} suggestion(s) in {} file(s){files}", fixed.made, fixed.files.len());
+                    let rest = format!(
+                        "{} suggestion(s) in {} file(s){files}",
+                        fixed.made,
+                        fixed.files.len()
+                    );
                     let _ = err.write_all(say::status("Fixed", &rest, color).as_bytes());
                     if fixed.left > 0 {
-                        let left = format!("{} suggestion(s) are not machine-applicable, or are outside the checkout", fixed.left);
+                        let left = format!(
+                            "{} suggestion(s) are not machine-applicable, or are outside the checkout",
+                            fixed.left
+                        );
                         let _ = err.write_all(say::status("Left", &left, color).as_bytes());
                     }
                     if fixed.errors == 0 { 0 } else { Exit::Failed.code() }
@@ -471,7 +542,12 @@ fn replaced(place: &Place, pairs: &[String], color: bool) -> i32 {
             let mut files: Vec<&str> = edited.items.iter().map(|it| it.file.as_str()).collect(); // alloc: CLI edge, the files named once
             files.sort_unstable();
             files.dedup();
-            let rest = format!("{} item(s) in {} file(s): {}", edited.items.len(), files.len(), files.join(", "));
+            let rest = format!(
+                "{} item(s) in {} file(s): {}",
+                edited.items.len(),
+                files.len(),
+                files.join(", ")
+            );
             eprint!("{}", say::status("Replaced", &rest, color));
             0
         }
@@ -493,7 +569,10 @@ pub enum Then {
 }
 
 /// The request sent and its responses printed, then what `run` or `test` runs after it.
-#[expect(clippy::too_many_arguments, reason = "the command, where it runs, how it speaks and what it speaks to")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the command, where it runs, how it speaks and what it speaks to"
+)]
 pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     api: &mut A,
     asked: &Invocation,
@@ -506,12 +585,14 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     programs: &mut P,
 ) -> io::Result<Then> {
     let mut printer = Printer::new(shown, &place.root, out, err);
+    printer.place(std::env::var("HOME").ok(), observe::last_failure());
     // alloc: once a request, for `--reached` and `--ub`; it grows by doubling, not by a result.
     let mut results: Vec<TestResult> = Vec::new();
     let mut unwritten = None;
     let mut docs = doc::Docs::default();
     let mut counted = asked.flags.baselines.is_some().then(baselines::Counted::default);
-    let mut found = (asked.command() == Command::Check && asked.flags.fix).then(|| fix::Found::new(&asked.flags.lints));
+    let mut found = (asked.command() == Command::Check && asked.flags.fix)
+        .then(|| fix::Found::new(&asked.flags.lints));
     let called = api.call(request, |response, more| {
         if let ResponseRef::Diagnostic(diagnostic) = &response {
             if let Some(counted) = &mut counted {
@@ -523,7 +604,10 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         }
         let printed = match response {
             ResponseRef::Documented(documented) => {
-                let printed = documented.crates.iter().try_for_each(|it| printer.status("Documenting", &it.package));
+                let printed = documented
+                    .crates
+                    .iter()
+                    .try_for_each(|it| printer.status("Documenting", &it.package));
                 docs.documented(documented);
                 printed
             }
@@ -559,7 +643,9 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             // alloc: the error a command ends with, once
             let what = match daemon::hung_up(&error).then(|| api.died()).flatten() {
                 Some(Ok(died)) => format!("{error}: {died}"),
-                Some(Err(why)) => format!("{error}, and what came of the daemon is not known: {why:#}"),
+                Some(Err(why)) => {
+                    format!("{error}, and what came of the daemon is not known: {why:#}")
+                }
                 None => error.to_string(),
             };
             printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
@@ -588,25 +674,41 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     }
     // Unless `--fail-fast`, the tests of every unit that built still run when another failed
     // (each failure was said, naming its unit), and the run then fails.
-    let tests_past_failure = !asked.flags.fail_fast && matches!(asked.command(), Command::Test | Command::Bench);
+    let tests_past_failure =
+        !asked.flags.fail_fast && matches!(asked.command(), Command::Test | Command::Bench);
     if !ok && !tests_past_failure {
         return Ok(Then::Exit(Exit::Failed.code()));
     }
-    let speaking =
-        Speaking { cwd: &place.cwd, color: shown.color, quiet: shown.quiet, verbose: shown.verbose, json: shown.format.json() };
+    let speaking = Speaking {
+        cwd: &place.cwd,
+        color: shown.color,
+        quiet: shown.quiet,
+        verbose: shown.verbose,
+        json: shown.format.json(),
+    };
     let artifacts = printer.take_artifacts();
     let unbuilt = printer.take_unbuilt();
     let members = printer.members();
     match asked.command() {
         Command::Build => Ok(Then::Exit(0)),
         Command::Check => {
-            let (Some(counted), Some(dir)) = (counted, &asked.flags.baselines) else { return Ok(Then::Exit(0)) };
+            let (Some(counted), Some(dir)) = (counted, &asked.flags.baselines) else {
+                return Ok(Then::Exit(0));
+            };
             // args.rs refuses `--baselines` without exactly one `--target`.
             let target = asked.flags.targets.first().map_or("", String::as_str);
-            match counted.finish(&place.root, dir, target, asked.flags.bless_baselines, &asked.flags.new_baselines) {
+            match counted.finish(
+                &place.root,
+                dir,
+                target,
+                asked.flags.bless_baselines,
+                &asked.flags.new_baselines,
+            ) {
                 Ok(said) => {
                     for line in said {
-                        printer.err().write_all(say::status("Baseline", &line, shown.color).as_bytes())?;
+                        printer
+                            .err()
+                            .write_all(say::status("Baseline", &line, shown.color).as_bytes())?;
                     }
                     Ok(Then::Exit(0))
                 }
@@ -631,7 +733,10 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             match exec {
                 Ok(exec) => {
                     if !shown.quiet {
-                        printer.err().write_all(say::status("Running", &exec.shown_at(shown.verbose), shown.color).as_bytes())?;
+                        printer.err().write_all(
+                            say::status("Running", &exec.shown_at(shown.verbose), shown.color)
+                                .as_bytes(),
+                        )?;
                     }
                     printer.err().flush()?;
                     Ok(Then::Exec(exec))
@@ -648,7 +753,8 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             Ok(Then::Exit(if passed && ok { 0 } else { Exit::Failed.code() }))
         }
         Command::Test | Command::Bench => {
-            let code = test::run(asked, &artifacts, &unbuilt, members, speaking, printer.err(), programs)?;
+            let code =
+                test::run(asked, &artifacts, &unbuilt, members, speaking, printer.err(), programs)?;
             Ok(Then::Exit(if ok { code } else { code.max(Exit::Failed.code()) }))
         }
     }

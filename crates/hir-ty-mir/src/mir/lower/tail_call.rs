@@ -85,11 +85,13 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             func
                         }
                         TyKind::Error(_) => {
-                            return Err(MirLowerError::MissingFunctionDefinition(
-                                self.owner, call,
+                            return Err(MirLowerError::MissingFunctionDefinition(self.owner, call));
+                        }
+                        _ => {
+                            return Err(MirLowerError::TypeError(
+                                "`become` of a call on a bad type",
                             ));
                         }
-                        _ => return Err(MirLowerError::TypeError("`become` of a call on a bad type")),
                     }
                 }
             }
@@ -160,7 +162,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     written.push(current);
                     self.set_terminator(
                         prev,
-                        TerminatorKind::Drop { place: Place::from(local).store(), target: current, unwind },
+                        TerminatorKind::Drop {
+                            place: Place::from(local).store(),
+                            target: current,
+                            unwind,
+                        },
                         span,
                     );
                 }

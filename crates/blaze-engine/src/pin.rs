@@ -199,7 +199,10 @@ fn manifest_text(manifest: &Path) -> Result<Option<String>, PinError> {
     match std::fs::read_to_string(manifest) {
         Ok(text) => Ok(Some(text)),
         Err(error)
-            if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) =>
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
         {
             Ok(None)
         }
@@ -290,11 +293,7 @@ pub(crate) fn is_version(version: &str) -> bool {
 /// Where blaze keeps the releases a pin ran: `versions` in `BLAZE_HOME`, else in `.blaze` in
 /// the user's home.
 pub(crate) fn versions() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Some(PathBuf::from(home).join("versions"));
-    }
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
-    Some(PathBuf::from(home).join(".blaze").join("versions"))
+    Some(blaze_manifest::user_config::home()?.join("versions"))
 }
 
 /// The `blaze` of `version` where [`versions`] keeps it.
@@ -314,7 +313,9 @@ mod tests {
         assert!(!is_version("nightly"));
         assert!(!is_version(""));
         // Only `0.<8 digits>.<N>`: a date that is missing or of another length is no release's.
-        for not in ["5", "0.1.0", "0.99999999999.0", "1.20261027.0", "0.20261027.0.1", "0.2026102a.0"] {
+        for not in
+            ["5", "0.1.0", "0.99999999999.0", "1.20261027.0", "0.20261027.0.1", "0.2026102a.0"]
+        {
             assert!(!is_version(not), "{not}");
         }
     }

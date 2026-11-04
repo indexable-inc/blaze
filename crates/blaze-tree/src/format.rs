@@ -41,7 +41,13 @@ impl<'f> Pattern<'f> {
     }
 
     /// Writes `node` as the pattern has it into `out`.
-    pub(crate) fn write(&self, graph: &Graph<'_>, node: NodeId, labels: &mut Labels, out: &mut String) {
+    pub(crate) fn write(
+        &self,
+        graph: &Graph<'_>,
+        node: NodeId,
+        labels: &mut Labels,
+        out: &mut String,
+    ) {
         let packages = graph.packages();
         match graph.node(node) {
             Node::Package { pkg, features, .. } => {

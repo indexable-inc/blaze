@@ -10,7 +10,6 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule as _, ModuleId,
     attrs::AttrFlags,
@@ -29,6 +28,7 @@ use hir_ty_mir::mir::{
 };
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use crate::{
     dispatch::{Cx, Instance, Target, Unseen, concrete_args, sites},
@@ -118,7 +118,9 @@ impl Unchecked {
         let name = crate_said(db, krate);
         match self {
             // alloc: an error's message, once
-            Unchecked::MissingRoot(missing) => format!("{}; the check of {name} stops", missing.said(db)),
+            Unchecked::MissingRoot(missing) => {
+                format!("{}; the check of {name} stops", missing.said(db))
+            }
             // alloc: as above
             Unchecked::NoSend => format!(
                 "the crate graph of {name} parks fibers (it has `blaze_graph::sched::stack::Yielder::suspend`) but has no `core::marker::Send`: the may-suspend check can't say what may be held across a park, so it checks nothing and stops"
@@ -213,14 +215,19 @@ fn walk(db: &Db, krate: Crate) -> Walk {
     let env = env_of(krate);
     let interner = DbInterner::new_with(db, krate);
     let mut starts = Vec::new(); // alloc: the walk's starts, once per crate
-    walk_bodies(db, crate_body_owners(db, krate), |_| true, |owner, _| {
-        if let DefWithBodyId::FunctionId(func) = owner
-            && FunctionSignature::of(db, func).has_body()
-            && let Some(args) = concrete_args(interner, func)
-        {
-            starts.push(Instance { def: Body::Fn(func), args: args.store() });
-        }
-    });
+    walk_bodies(
+        db,
+        crate_body_owners(db, krate),
+        |_| true,
+        |owner, _| {
+            if let DefWithBodyId::FunctionId(func) = owner
+                && FunctionSignature::of(db, func).has_body()
+                && let Some(args) = concrete_args(interner, func)
+            {
+                starts.push(Instance { def: Body::Fn(func), args: args.store() });
+            }
+        },
+    );
     let order = reached(db, &env, &starts);
     let mut drivers: Vec<ModuleId> = Vec::new(); // alloc: a few modules, once per crate
     for instance in &order {
@@ -233,7 +240,10 @@ fn walk(db: &Db, krate: Crate) -> Walk {
     }
     let checked = order
         .iter()
-        .filter(|it| checked_here(db, krate, it) && module_of(db, it.def).is_none_or(|it| !drivers.contains(&it)))
+        .filter(|it| {
+            checked_here(db, krate, it)
+                && module_of(db, it.def).is_none_or(|it| !drivers.contains(&it))
+        })
         .copied()
         .collect();
     Walk { order: order.into_boxed_slice(), checked, drivers: drivers.into_boxed_slice() }
@@ -305,7 +315,10 @@ pub fn suspend_points(db: &Db, krate: Crate, owner: DefWithBodyId) -> Box<[Point
 /// The path of the call at `site` to the root, as an error says it, when the call may park the
 /// fiber; `None` when it may not, or `krate`'s check does not check its body.
 pub fn may_suspend_at(db: &Db, krate: Crate, site: Site) -> Option<String> {
-    suspend_points(db, krate, site.owner).iter().find(|it| it.call == site).map(|it| it.path_said(db))
+    suspend_points(db, krate, site.owner)
+        .iter()
+        .find(|it| it.call == site)
+        .map(|it| it.path_said(db))
 }
 
 /// The functions of `krate`'s walk that run on a fiber or a pool thread: those the fiber
@@ -430,11 +443,18 @@ fn instance_check(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> C
                         let ty = cx.normalize(body.locals[local].ty.as_ref());
                         let why = match must_not_suspend(&cx, ty) {
                             Some(adt) => Some(Why::MustNotSuspend(adt)),
-                            None if !implements_trait_unique(ty, db, cx.env, *send) => Some(Why::NotSend),
+                            None if !implements_trait_unique(ty, db, cx.env, *send) => {
+                                Some(Why::NotSend)
+                            }
                             None => None,
                         };
                         let binding = binding_of(body, local);
-                        HeldLocal { binding, made: made_at(body, local, binding).map(site), ty: ty.store(), why }
+                        HeldLocal {
+                            binding,
+                            made: made_at(body, local, binding).map(site),
+                            ty: ty.store(),
+                            why,
+                        }
                     })
                     .collect();
                 points.push(Point { call: site(terminator.span), held, target, env });
@@ -443,7 +463,9 @@ fn instance_check(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> C
     }
 
     for slot in &sites.slots {
-        let marked = slot.method.is_some_and(|it| AttrFlags::query(db, it.into()).contains(AttrFlags::MAY_SUSPEND));
+        let marked = slot
+            .method
+            .is_some_and(|it| AttrFlags::query(db, it.into()).contains(AttrFlags::MAY_SUSPEND));
         if marked {
             continue;
         }
@@ -460,7 +482,11 @@ fn instance_check(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> C
             continue;
         }
         if let Some(target) = reified.targets.iter().find(|it| suspends(db, &cx.stored, it)) {
-            broken.push(Broken { at: site(reified.span), promise: Promise::Pointer, path: path(db, &cx.stored, target) });
+            broken.push(Broken {
+                at: site(reified.span),
+                promise: Promise::Pointer,
+                path: path(db, &cx.stored, target),
+            });
         }
     }
     Checked { points: points.into_boxed_slice(), broken: broken.into_boxed_slice() }
@@ -477,12 +503,16 @@ fn must_not_suspend<'db>(cx: &Cx<'db>, ty: Ty<'db>) -> Option<AdtId> {
                 return Some(adt);
             }
             match adt {
-                AdtId::StructId(it) if cx.lang.OwnedBox == Some(it) => must_not_suspend(cx, args.type_at(0)),
+                AdtId::StructId(it) if cx.lang.OwnedBox == Some(it) => {
+                    must_not_suspend(cx, args.type_at(0))
+                }
                 _ => None,
             }
         }
         TyKind::Tuple(fields) => fields.iter().find_map(|it| must_not_suspend(cx, it)),
-        TyKind::Array(inner, _) | TyKind::Slice(inner) | TyKind::Ref(_, inner, _) => must_not_suspend(cx, inner),
+        TyKind::Array(inner, _) | TyKind::Slice(inner) | TyKind::Ref(_, inner, _) => {
+            must_not_suspend(cx, inner)
+        }
         _ => None,
     }
 }
@@ -497,7 +527,8 @@ fn made_at(body: &MirBody<'_>, local: LocalId, binding: Option<BindingId>) -> Op
     if let Some(binding) = binding {
         return Some(MirSpan::BindingId(binding));
     }
-    let whole = |place: &hir_ty_mir::mir::StoredPlace| place.local == local && place.projection.is_empty();
+    let whole =
+        |place: &hir_ty_mir::mir::StoredPlace| place.local == local && place.projection.is_empty();
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::Assign(place, _) = &statement.kind

@@ -47,7 +47,9 @@ fn function(db: &Db, krate: Crate, name: &str) -> FunctionId {
     crate_body_owners(db, krate)
         .into_iter()
         .find_map(|def| match def {
-            DefWithBodyId::FunctionId(it) if FunctionSignature::of(db, it).name == Name::new_root(name) => {
+            DefWithBodyId::FunctionId(it)
+                if FunctionSignature::of(db, it).name == Name::new_root(name) =>
+            {
                 Some(it)
             }
             _ => None,
@@ -75,7 +77,8 @@ fn a_part_of_evaluated_constants_reads_back_in_another_database() {
 
     for name in ["sum", "named"] {
         let def = DefWithBodyId::FunctionId(function(&db, dep, name));
-        let served = check_cache::served_inference(&db, def).unwrap_or_else(|| panic!("`{name}` is served"));
+        let served =
+            check_cache::served_inference(&db, def).unwrap_or_else(|| panic!("`{name}` is served"));
         let own = infer_query_with_inspect(&db, def, None, LoweringMode::Analysis);
         assert!(!own.has_errors, "`{name}` infers with no error: {own:?}");
         assert!(served == own, "`{name}`: served {served:?}\nown {own:?}");

@@ -21,11 +21,7 @@ where
     /// [`label`](Generator::label), so draws made by the closure are grouped
     /// under a span carrying it.
     pub fn new(label: u64, f: F) -> Self {
-        ComposedGenerator {
-            label,
-            f,
-            _phantom: PhantomData,
-        }
+        ComposedGenerator { label, f, _phantom: PhantomData }
     }
 }
 

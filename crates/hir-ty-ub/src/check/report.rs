@@ -22,13 +22,19 @@ use crate::{
     ub::{Found, Ub},
 };
 
-pub(super) fn render<'db>(db: &'db Db, checker: &Checker<'db>, found: &Found, stack: &[Frame<'db>]) -> String {
+pub(super) fn render<'db>(
+    db: &'db Db,
+    checker: &Checker<'db>,
+    found: &Found,
+    stack: &[Frame<'db>],
+) -> String {
     let r = Report { db, checker };
     // alloc: the edge: the report of a failure.
     let mut out = String::new();
     let _ = writeln!(out, "error: {}", found.ub);
     r.at(&mut out, found.at);
-    let _ = writeln!(out, "   = note: on thread `{}`", checker.races.thread_display_name(found.thread));
+    let _ =
+        writeln!(out, "   = note: on thread `{}`", checker.races.thread_display_name(found.thread));
     match &found.ub {
         Ub::Aliasing(e) => {
             for event in e.history() {
@@ -66,7 +72,11 @@ pub(super) fn render<'db>(db: &'db Db, checker: &Checker<'db>, found: &Found, st
         _ => {}
     }
     if !stack.is_empty() {
-        let _ = writeln!(out, "   = note: BACKTRACE on thread `{}`:", checker.races.thread_display_name(found.thread));
+        let _ = writeln!(
+            out,
+            "   = note: BACKTRACE on thread `{}`:",
+            checker.races.thread_display_name(found.thread)
+        );
         for &(func, span, owner) in stack {
             let name = match func {
                 // alloc: the edge: the report of a failure.
@@ -145,10 +155,14 @@ fn source_range(db: &Db, def: InferBodyId<'_>, span: MirSpan) -> Option<(FileId,
             let body = Body::source_map(db, def);
             (&**body, body.self_param_syntax())
         }
-        InferBodyId::AnonConstId(def) => (ExpressionStore::with_source_map(db, def.loc(db).owner).1, None),
+        InferBodyId::AnonConstId(def) => {
+            (ExpressionStore::with_source_map(db, def.loc(db).owner).1, None)
+        }
     };
     let span: InFile<SyntaxNodePtr> = match span {
-        MirSpan::ExprId(e) | MirSpan::ExprEnd(e) => source_map.expr_syntax(e).ok()?.map(|it| it.into()),
+        MirSpan::ExprId(e) | MirSpan::ExprEnd(e) => {
+            source_map.expr_syntax(e).ok()?.map(|it| it.into())
+        }
         MirSpan::PatId(p) => source_map.pat_syntax(p).ok()?.map(|it| it.syntax_node_ptr()),
         MirSpan::BindingId(b) => source_map
             .patterns_for_binding(b)

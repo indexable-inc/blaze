@@ -85,7 +85,8 @@ it once it runs.
   to add their bodies' reads.
 - **What the key and reads do not cover is refused** (`deps::store`, `Refused`):
   - an expansion whose reads are not known (`ExpansionReads::Unknown`: untraced, it asked the
-    database, it read the clock, or its macro keeps a session). A wasm proc macro reports
+    database, it read the clock, or its macro keeps a session that does not settle or the call
+    moved the session's state on; a call of a crate that settles reports its reads). A wasm proc macro reports
     nothing, so it is always unknown: its expansion is keyed by the database's answers to its
     span questions, which `reads_now` can't work out again. Native proc macros, the default,
     are covered;

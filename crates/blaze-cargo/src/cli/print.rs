@@ -22,11 +22,14 @@ use std::{
     fmt::Write as _,
     hash::BuildHasher as _,
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
-use blaze_api::{Applicability, Artifact, DiagnosticRef, FetchVerb, Level, ResponseRef, TargetKind, UnitOfRef, Verb};
+use blaze_api::{
+    Applicability, Artifact, Blocks, DiagnosticRef, FetchVerb, Level, Report, ResponseRef,
+    Severity, TargetKind, Unchecked, UnitOfRef, Verb,
+};
 use blaze_hash::FixedState;
 use std::alloc::Global;
 
@@ -71,7 +74,9 @@ pub fn format(values: &[String]) -> Result<Format, String> {
         let json_with = |format: &mut Option<Format>, set: fn(&mut bool, &mut bool, &mut bool)| {
             let mut it = format.unwrap_or(json);
             match &mut it {
-                Format::Json { short, ansi, render_diagnostics } => set(short, ansi, render_diagnostics),
+                Format::Json { short, ansi, render_diagnostics } => {
+                    set(short, ansi, render_diagnostics)
+                }
                 // alloc: the error, once a request.
                 _ => return Err(TWO.to_owned()),
             }
@@ -105,6 +110,9 @@ pub struct Shown {
     /// `check --fix`: the run makes the suggestions it prints, so no summary hints at
     /// `blaze check --fix`.
     pub fixing: bool,
+    /// What stderr's terminal does beyond `color` (which wins): hyperlinks, its width, a
+    /// progress bar, notifications ([`super::terminal`]). A pipe's by default.
+    pub terminal: blaze_report::terminal::Terminal,
 }
 
 /// What one unit's diagnostics came to.
@@ -116,6 +124,9 @@ struct Counted {
     warned: say::Warned,
     /// Its summary was printed when it ended ([`ResponseRef::UnitEnded`]), as cargo prints it.
     ended: bool,
+    /// Its failure was said as a report ([`ResponseRef::Report`]), which says all cargo's
+    /// "could not compile" would: that line is left out.
+    reported: bool,
 }
 
 const _: () = assert!(size_of::<Counted>() == 28);
@@ -194,6 +205,17 @@ pub struct Printer<'a, O: Write, E: Write> {
     unbuilt: Vec<blaze_api::Unbuilt>,
     /// The daemon numbered a unit or package past [`IDS`]: said, and the build fails.
     refused: bool,
+    /// Where a report's paths are shown from: the checkout's root, and home as `~`
+    /// ([`Printer::place`]).
+    root: String,
+    home: Option<String>,
+    /// The reports of units ([`ResponseRef::Report`]) not yet printed, each with its unit's id:
+    /// held until what each blocks is known ([`ResponseRef::Unchecked`]), or the build ends.
+    held: Vec<(Option<u32>, Report)>,
+    /// Every error report printed, kept for `blaze explain` once the build ends.
+    failures: Vec<Report>,
+    /// Where the failures are kept ([`super::observe::last_failure`]); `None` keeps none.
+    remember: Option<Result<PathBuf, String>>,
 }
 
 impl<'a, O: Write, E: Write> Printer<'a, O, E> {
@@ -215,6 +237,73 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             built: None,
             unbuilt: Vec::new(), // alloc: none until a test unit did not build
             refused: false,
+            root: root.to_string_lossy().into_owned(), // alloc: once a printer
+            home: None,
+            held: Vec::new(),     // alloc: none until a unit failed with a report
+            failures: Vec::new(), // alloc: as above
+            remember: None,
+        }
+    }
+
+    /// The home directory paths are shown under as `~`, and where the build's failures are
+    /// kept for `blaze explain`: the command's. A printer not told shows paths whole but for
+    /// the checkout's and keeps nothing.
+    pub fn place(&mut self, home: Option<String>, remember: Result<PathBuf, String>) {
+        self.home = home;
+        self.remember = Some(remember);
+    }
+
+    /// How a report is rendered on stderr: the command's colour, and what its terminal does.
+    fn caps(&self) -> blaze_report::Caps {
+        let terminal = self.shown.terminal.caps;
+        blaze_report::Caps { color: self.shown.color, links: terminal.links, width: terminal.width }
+    }
+
+    /// `report` on stderr, as `--message-format=json` a line on stdout too; an error kept for
+    /// `blaze explain`.
+    fn report(&mut self, report: Report) -> io::Result<()> {
+        if self.shown.format.json() {
+            self.to(true)?;
+            self.line.push_str(&blaze_report::json_message(&report));
+            self.line.push('\n');
+        }
+        self.to(false)?;
+        let caps = self.caps();
+        let roots = blaze_report::Roots { workspace: Some(&self.root), home: self.home.as_deref() };
+        blaze_report::render_into(&mut self.line, &report, caps, &roots);
+        if report.severity == Severity::Error {
+            self.failures.push(report); // alloc: a failure's, once
+        }
+        Ok(())
+    }
+
+    /// Every report held, printed.
+    fn reports(&mut self) -> io::Result<()> {
+        for (_, report) in std::mem::take(&mut self.held) {
+            self.report(report)?;
+        }
+        Ok(())
+    }
+
+    /// What each held report's unit blocks, from what the build left unchecked behind it: its
+    /// packages (each unit named `package v1.2.3 (lib)`, its first word), in the plan's order,
+    /// the last the one named.
+    fn blocks(&mut self, unchecked: &Unchecked) {
+        for behind in &unchecked.behind {
+            let Some(id) = behind.id else { continue };
+            let Some((_, report)) = self.held.iter_mut().find(|(unit, _)| *unit == Some(id)) else {
+                continue;
+            };
+            let mut all: Vec<String> = Vec::new(); // alloc: a failure's, once
+            for unit in &behind.units {
+                let package = unit.split(' ').next().unwrap_or(unit);
+                if !all.iter().any(|it| it == package) {
+                    all.push(package.to_owned()); // alloc: as above
+                }
+            }
+            let notable = all.last().cloned().into_iter().collect(); // clone: as above
+            report.blocks =
+                Some(Blocks { count: all.len() as u64, what: "packages".to_owned(), notable, all });
         }
     }
 
@@ -230,7 +319,10 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         self.refused = true;
         say::leveled_with(&mut self.line, say::ERROR, "error", self.shown.color, |line| {
             // Writing to a String cannot fail.
-            let _ = write!(line, "the daemon numbered a {what} {index}, past the {IDS} a request's indexes stay under");
+            let _ = write!(
+                line,
+                "the daemon numbered a {what} {index}, past the {IDS} a request's indexes stay under"
+            );
         });
         Ok(())
     }
@@ -385,12 +477,21 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                 }
                 self.counted[at].ended = true;
                 self.to(false)?;
-                summary(&mut self.line, &self.units[at], &self.names, &self.counted[at], self.shown);
+                summary(
+                    &mut self.line,
+                    &self.units[at],
+                    &self.names,
+                    &self.counted[at],
+                    self.shown,
+                );
             }
             // What a failed build left unchecked: the tree to stderr in every format, so a
             // person sees how much the errors above do not cover; under JSON one line an agent
             // reads too.
             ResponseRef::Unchecked(unchecked) => {
+                // The failures it is behind, each with what it blocks, first.
+                self.blocks(&unchecked);
+                self.reports()?;
                 if self.shown.format.json() {
                     self.to(true)?;
                     self.line.push_str(&blaze_ui::api::unchecked_json(&unchecked));
@@ -416,10 +517,19 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                     blaze_ui::api::timeline_line(&mut self.line, &worked.steps_us);
                 }
             }
-            ResponseRef::Error(error) => {
-                self.to(false)?;
-                say::error_into(&mut self.line, error.what, self.shown.color);
+            // A unit's failure, said by blaze (a build script's, a refused directive): its
+            // unit's error, said once what it blocks is known.
+            ResponseRef::Report { unit, report } => {
+                if report.severity == Severity::Error
+                    && let Some(unit) = unit
+                    && let Some(at) = self.unit(unit)?
+                {
+                    self.counted[at].errors += 1;
+                    self.counted[at].reported = true;
+                }
+                self.held.push((unit.map(|it| it.id), report)); // alloc: a failure's, once
             }
+            ResponseRef::Error(error) => self.report(error.into_report())?,
             _ => {}
         }
         Ok(())
@@ -430,7 +540,9 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         // has no span and no code, so the text is compared only then); and an empty text, the
         // note naming codes to explain, which rustc doesn't write under short.
         if diagnostic.rendered.is_empty()
-            || (diagnostic.spans.is_empty() && diagnostic.code.is_none() && summarizes(diagnostic.message))
+            || (diagnostic.spans.is_empty()
+                && diagnostic.code.is_none()
+                && summarizes(diagnostic.message))
         {
             return Ok(());
         }
@@ -508,7 +620,14 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         let package = name(&mut self.names, say::package_name(unit.package_id));
         let target = name(&mut self.names, unit.target.name);
         let local = unit.package_id.starts_with("path+");
-        self.units.push(Unit { package, target, kind: unit.target.kind, test: unit.test, doctest: unit.doctest, local });
+        self.units.push(Unit {
+            package,
+            target,
+            kind: unit.target.kind,
+            test: unit.test,
+            doctest: unit.doctest,
+            local,
+        });
         let warned = say::Warned { fixable: Some(0), ..say::Warned::default() };
         self.counted.push(Counted { warned, ..Counted::default() });
         Ok(Some(row))
@@ -518,6 +637,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
     /// `Finished` and `build-finished`, all written.
     pub fn finish(&mut self, ok: bool, took: Duration) -> io::Result<()> {
         let color = self.shown.color;
+        self.reports()?;
         self.to(false)?;
         for (unit, counted) in self.units.iter().zip(&self.counted) {
             if !counted.ended {
@@ -534,8 +654,27 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         }
         // A slow build, done or not, points at what says why (`blaze slow`, docs/profiling.md).
         if took >= SLOW_BUILD && !self.shown.quiet && !self.shown.format.json() {
-            let what = format!("this build took {}: `blaze slow` says what made it slow and what to fix", say::elapsed(took));
+            let what = format!(
+                "this build took {}: `blaze slow` says what made it slow and what to fix",
+                say::elapsed(took)
+            );
             say::note_into(&mut self.line, &what, color);
+        }
+        // Kept for `blaze explain <package>`, which lists all a failure blocks.
+        if let (Some(remember), false) = (&self.remember, self.failures.is_empty()) {
+            let kept = remember
+                .as_ref()
+                .map_err(String::clone)
+                .and_then(|file| super::observe::remember(file, &self.failures));
+            if let Err(why) = kept {
+                self.to(false)?;
+                say::warning_into(
+                    &mut self.line,
+                    &format!("`blaze explain` won't know this build's failures: {why}"),
+                    color,
+                );
+            }
+            self.failures.clear();
         }
         if self.shown.format.json() {
             self.to(true)?;
@@ -553,7 +692,9 @@ const SLOW_BUILD: Duration = Duration::from_secs(30);
 
 /// rustc's closing lines, which cargo replaces with its own summary.
 fn summarizes(message: &str) -> bool {
-    message.starts_with("aborting due to") || message.ends_with(" warning emitted") || message.ends_with(" warnings emitted")
+    message.starts_with("aborting due to")
+        || message.ends_with(" warning emitted")
+        || message.ends_with(" warnings emitted")
 }
 
 /// A unit's "generated N warnings" (`JobQueue::report_warning_count` as the unit finishes, a
@@ -564,13 +705,32 @@ fn summary(line: &mut String, unit: &Unit, names: &str, counted: &Counted, shown
     let target = say::Named { kind: unit.kind, name: named(names, unit.target) };
     if !shown.quiet && counted.warned.total > 0 {
         say::leveled_with(line, say::WARN, "warning", shown.color, |line| {
-            say::generated_into(line, package, target, unit.test, unit.local && !shown.fixing, counted.warned);
+            say::generated_into(
+                line,
+                package,
+                target,
+                unit.test,
+                unit.local && !shown.fixing,
+                counted.warned,
+            );
         });
     }
-    if counted.errors > 0 {
+    if counted.errors > 0 && !counted.reported {
         say::leveled_with(line, say::ERROR, "error", shown.color, |line| match unit.doctest {
-            true => say::doctests_could_not_compile_into(line, package, counted.errors, counted.warnings),
-            false => say::could_not_compile_into(line, package, target, unit.test, counted.errors, counted.warnings),
+            true => say::doctests_could_not_compile_into(
+                line,
+                package,
+                counted.errors,
+                counted.warnings,
+            ),
+            false => say::could_not_compile_into(
+                line,
+                package,
+                target,
+                unit.test,
+                counted.errors,
+                counted.warnings,
+            ),
         });
     }
 }
@@ -589,10 +749,9 @@ fn named(names: &str, Name(at, len): Name) -> &str {
 
 /// cargo's `machine_applicable`: a child of the diagnostic suggests a fix rustfix may apply.
 fn fixable(diagnostic: DiagnosticRef<'_>) -> bool {
-    diagnostic
-        .children
-        .iter()
-        .any(|child| child.spans.iter().any(|span| span.applicability == Some(Applicability::MachineApplicable)))
+    diagnostic.children.iter().any(|child| {
+        child.spans.iter().any(|span| span.applicability == Some(Applicability::MachineApplicable))
+    })
 }
 
 #[cfg(test)]

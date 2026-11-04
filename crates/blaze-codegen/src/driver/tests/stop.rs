@@ -69,7 +69,12 @@ impl Prepare for Stopping<'_> {
         made
     }
 
-    fn masked(&self, unit: &Unit, prepared: &Prepared, refs: &crate::template::Refs) -> Option<Masked> {
+    fn masked(
+        &self,
+        unit: &Unit,
+        prepared: &Prepared,
+        refs: &crate::template::Refs,
+    ) -> Option<Masked> {
         self.machine.masked(unit, prepared, refs)
     }
 
@@ -128,7 +133,10 @@ fn a_stop_while_preparing_ends_a_dev_build_within_one_function() {
     let program = wide();
     let machine = stopping(&program, Some(10), None);
     let policy = policy(OptLevel::O0, Mode::Output);
-    stopped_with(Build::new(&machine, &program, &policy, &Memo::new()).run(&[(1, member())], &Store::default()));
+    stopped_with(
+        Build::new(&machine, &program, &policy, &Memo::new())
+            .run(&[(1, member())], &Store::default()),
+    );
     let (prepared, _, emitted) = machine.counts();
     assert!(prepared >= 10 && prepared <= within_one_function_a_core(10), "{prepared} prepared");
     assert!((prepared as u32) < LEAVES, "the stop came before every prepare was begun");
@@ -142,10 +150,16 @@ fn a_stop_while_compiling_ends_a_dev_build_within_one_function() {
     let program = wide();
     let machine = stopping(&program, None, Some(5));
     let policy = policy(OptLevel::O0, Mode::Output);
-    stopped_with(Build::new(&machine, &program, &policy, &Memo::new()).run(&[(1, member())], &Store::default()));
+    stopped_with(
+        Build::new(&machine, &program, &policy, &Memo::new())
+            .run(&[(1, member())], &Store::default()),
+    );
     let (prepared, _, emitted) = machine.counts();
     assert!(emitted >= 5 && emitted <= within_one_function_a_core(5), "{emitted} compiled");
-    assert!(prepared >= emitted && prepared <= within_one_function_a_core(emitted), "{prepared} prepared, {emitted} compiled");
+    assert!(
+        prepared >= emitted && prepared <= within_one_function_a_core(emitted),
+        "{prepared} prepared, {emitted} compiled"
+    );
     assert!((prepared as u32) < LEAVES, "the stop came before every prepare was begun");
 }
 
@@ -154,7 +168,10 @@ fn a_stop_while_preparing_ends_a_release_build_before_any_summary_is_decided() {
     let program = wide();
     let machine = stopping(&program, Some(10), None);
     let policy = policy(OptLevel::O3, Mode::Output);
-    stopped_with(Build::new(&machine, &program, &policy, &Memo::new()).run(&[(1, member())], &Store::default()));
+    stopped_with(
+        Build::new(&machine, &program, &policy, &Memo::new())
+            .run(&[(1, member())], &Store::default()),
+    );
     let (prepared, summarized, emitted) = machine.counts();
     assert!(prepared >= 10 && prepared <= within_one_function_a_core(10), "{prepared} prepared");
     assert!(summarized <= prepared);
@@ -166,7 +183,10 @@ fn a_stop_while_compiling_ends_a_release_build_within_one_function() {
     let program = wide();
     let machine = stopping(&program, None, Some(5));
     let policy = policy(OptLevel::O3, Mode::Output);
-    stopped_with(Build::new(&machine, &program, &policy, &Memo::new()).run(&[(1, member())], &Store::default()));
+    stopped_with(
+        Build::new(&machine, &program, &policy, &Memo::new())
+            .run(&[(1, member())], &Store::default()),
+    );
     let (_, summarized, emitted) = machine.counts();
     assert_eq!(summarized as u32, LEAVES + 1, "every summary was made before the first compile");
     assert!(emitted >= 5 && emitted <= within_one_function_a_core(5), "{emitted} compiled");
@@ -190,7 +210,9 @@ fn an_unset_stop_changes_nothing() {
     let program = wide();
     let machine = stopping(&program, None, None);
     let policy = policy(OptLevel::O0, Mode::Output);
-    let built = Build::new(&machine, &program, &policy, &Memo::new()).run(&[(1, member())], &Store::default()).unwrap();
+    let built = Build::new(&machine, &program, &policy, &Memo::new())
+        .run(&[(1, member())], &Store::default())
+        .unwrap();
     assert_eq!(built.functions.len() as u32, LEAVES + 1);
     assert_eq!(machine.counts(), (LEAVES as usize + 1, 0, LEAVES as usize + 1));
 }

@@ -33,7 +33,12 @@ fn import(module: &str) -> Import {
 }
 
 /// Function `n` of `code`'s header and `body` (no locals, the instructions, `end`).
-fn wasm_function(n: u8, code: &Code, body: &[u8], relocs: impl Fn(u32) -> Vec<Relocation>) -> CompiledFunction {
+fn wasm_function(
+    n: u8,
+    code: &Code,
+    body: &[u8],
+    relocs: impl Fn(u32) -> Vec<Relocation>,
+) -> CompiledFunction {
     let (code, start) = code.encode(body);
     CompiledFunction { arch: Arch::Wasm32, align: 1, ..function(n, &code, relocs(start)) }
 }
@@ -48,7 +53,12 @@ fn calling(n: u8, module: &str) -> CompiledFunction {
     let code = Code { imports: vec![(PUTS.to_owned(), import(module))], ..Code::default() };
     let body = [0x00, 0x10, 0x80, 0x80, 0x80, 0x80, 0x00, 0x0b];
     wasm_function(n, &code, &body, |start| {
-        vec![Relocation { at: start + 2, kind: RelocKind::WasmFunction, target: Target::Extern(PUTS.into()), addend: 0 }]
+        vec![Relocation {
+            at: start + 2,
+            kind: RelocKind::WasmFunction,
+            target: Target::Extern(PUTS.into()),
+            addend: 0,
+        }]
     })
 }
 
@@ -119,23 +129,35 @@ fn two_functions_importing_one_name_from_two_modules_is_an_error_naming_both() {
     // The same across links: the first stays as it was.
     let mut disk = Disk::default();
     disk.link(&mut image, program(&[&start, &f])).unwrap();
-    let error = image.stage(Change { added: vec![&g], ..Change::default() }).err().expect("a second import of `puts`");
+    let error = image
+        .stage(Change { added: vec![&g], ..Change::default() })
+        .err()
+        .expect("a second import of `puts`");
     says_both(&error, "env_a", "env_b");
     assert_eq!(error.function, Some(key(G)));
     assert_eq!(puts(&image), (Some(&import("env_a")), 1));
 
     // A static is a declarer the same way.
-    let error = image.stage(Change { statics: vec![&declaring("env_b")], ..Change::default() }).err().expect("a static's");
+    let error = image
+        .stage(Change { statics: vec![&declaring("env_b")], ..Change::default() })
+        .err()
+        .expect("a static's");
     says_both(&error, "env_a", "env_b");
     assert_eq!(error.function, None);
     assert!(error.what.contains(&format!("by the function {:?}", key(F))), "{}", error.what);
     assert!(error.what.contains("by the static"), "{}", error.what);
 
     // A different type is a different import too, and says so.
-    let other = Import { ty: Signature { params: vec![blaze_codegen::wasm::ValType::I32], results: Vec::new() }, ..import("env_a") };
+    let other = Import {
+        ty: Signature { params: vec![blaze_codegen::wasm::ValType::I32], results: Vec::new() },
+        ..import("env_a")
+    };
     let code = Code { imports: vec![(PUTS.to_owned(), other)], ..Code::default() };
     let typed = wasm_function(G, &code, &[0x00, 0x0b], |_| Vec::new());
-    let error = image.stage(Change { added: vec![&typed], ..Change::default() }).err().expect("another type");
+    let error = image
+        .stage(Change { added: vec![&typed], ..Change::default() })
+        .err()
+        .expect("another type");
     assert!(error.what.contains("of type"), "{}", error.what);
 }
 
@@ -168,7 +190,8 @@ fn replacing_a_function_with_one_importing_from_another_module_moves_the_import(
     disk.link(&mut image, program(&[&start, &g])).unwrap();
     assert!(imports_from(&module(&disk), "env_a"));
 
-    disk.link(&mut image, Change { removed: vec![key(G)], added: vec![&g2], ..Change::default() }).unwrap();
+    disk.link(&mut image, Change { removed: vec![key(G)], added: vec![&g2], ..Change::default() })
+        .unwrap();
     assert_eq!(puts(&image), (Some(&import("env_b")), 1));
     let bytes = module(&disk);
     assert!(imports_from(&bytes, "env_b") && !imports_from(&bytes, "env_a"));
@@ -178,10 +201,14 @@ fn replacing_a_function_with_one_importing_from_another_module_moves_the_import(
     assert_eq!(puts(&image), (Some(&import("env_a")), 1));
 
     // A static edited the same way: the old one is unmade before the new one declares.
-    disk.link(&mut image, Change { statics: vec![&declaring("env_a")], ..Change::default() }).unwrap();
-    assert_eq!(puts(&image), (Some(&import("env_a")), 2));
-    disk.link(&mut image, Change { removed: vec![key(G)], statics: vec![&declaring("env_b")], ..Change::default() })
+    disk.link(&mut image, Change { statics: vec![&declaring("env_a")], ..Change::default() })
         .unwrap();
+    assert_eq!(puts(&image), (Some(&import("env_a")), 2));
+    disk.link(
+        &mut image,
+        Change { removed: vec![key(G)], statics: vec![&declaring("env_b")], ..Change::default() },
+    )
+    .unwrap();
     assert_eq!(puts(&image), (Some(&import("env_b")), 1));
 }
 
@@ -196,7 +223,9 @@ fn a_wasm_image_is_laid_out_whole_each_link() {
         let output = crate::target::output(triple, None, crate::Debug::Lines, true).unwrap();
         assert!(!output.incremental, "{triple}");
     }
-    let error = Image::new(name(TO), Output { incremental: true, ..wasm() }).err().expect("an incremental wasm image");
+    let error = Image::new(name(TO), Output { incremental: true, ..wasm() })
+        .err()
+        .expect("an incremental wasm image");
     assert!(error.what.contains("an incremental Wasm image"), "{}", error.what);
     assert!(error.what.contains(TO), "{}", error.what);
 

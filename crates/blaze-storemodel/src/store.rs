@@ -75,7 +75,14 @@ pub fn short(key: &Key) -> String {
 impl Ledger {
     /// Records `who`'s put of `bytes` under `key` and checks the store's answer: a second
     /// value is refused naming the first, never taken.
-    pub fn put(&mut self, who: &str, key: Key, kind: Kind, bytes: &[u8], result: &Result<Ticket, Mismatch>) -> Result<(), Failure> {
+    pub fn put(
+        &mut self,
+        who: &str,
+        key: Key,
+        kind: Kind,
+        bytes: &[u8],
+        result: &Result<Ticket, Mismatch>,
+    ) -> Result<(), Failure> {
         let given = content_of(bytes);
         let refused = properties::REFUSED_NOT_OVERWRITTEN;
         match (result, self.accepted.get(&key)) {
@@ -96,11 +103,18 @@ impl Ledger {
             }
             (Err(mismatch), None) => Err(Failure::new(
                 refused,
-                format!("{who}'s put under {} was refused as a second value ({mismatch:?}), though none was put under it", short(&key)),
+                format!(
+                    "{who}'s put under {} was refused as a second value ({mismatch:?}), though none was put under it",
+                    short(&key)
+                ),
             )),
             (Err(mismatch), Some((_, had))) => {
                 let kept = content_of(had);
-                if mismatch.key != key || mismatch.kept != kept || mismatch.given != given || had.as_slice() == bytes {
+                if mismatch.key != key
+                    || mismatch.kept != kept
+                    || mismatch.given != given
+                    || had.as_slice() == bytes
+                {
                     return Err(Failure::new(
                         refused,
                         format!(
@@ -121,11 +135,20 @@ impl Ledger {
             Some((_, want)) if want.as_slice() == bytes => None,
             Some((_, want)) => Some(Failure::new(
                 properties::SERVES_ONLY_WRITTEN,
-                format!("{who} was served {:x} under {}, where the value written is {:x}", content_of(bytes), short(key), content_of(want)),
+                format!(
+                    "{who} was served {:x} under {}, where the value written is {:x}",
+                    content_of(bytes),
+                    short(key),
+                    content_of(want)
+                ),
             )),
             None => Some(Failure::new(
                 properties::SERVES_ONLY_WRITTEN,
-                format!("{who} was served {:x} under {}, which no writer put", content_of(bytes), short(key)),
+                format!(
+                    "{who} was served {:x} under {}, which no writer put",
+                    content_of(bytes),
+                    short(key)
+                ),
             )),
         }
     }
@@ -143,7 +166,13 @@ pub fn config() -> Config {
 
 /// Runs `effects` and what they lead to, each completing in the order asked, until none is
 /// in flight; more than `most` completions is a wait that does not end.
-pub fn drive(fs: &mut CrashFs, store: &mut Store, effects: &mut Vec<Effect>, most: usize, what: &str) -> Result<(), Failure> {
+pub fn drive(
+    fs: &mut CrashFs,
+    store: &mut Store,
+    effects: &mut Vec<Effect>,
+    most: usize,
+    what: &str,
+) -> Result<(), Failure> {
     for _ in 0..most {
         fs.submit(effects);
         if fs.is_idle() {
@@ -156,7 +185,10 @@ pub fn drive(fs: &mut CrashFs, store: &mut Store, effects: &mut Vec<Effect>, mos
     }
     Err(Failure::new(
         properties::EVERY_WAIT_ENDS,
-        format!("{what}: its IO did not end in {most} completions; in flight: {}", fs.in_flight().join(", ")),
+        format!(
+            "{what}: its IO did not end in {most} completions; in flight: {}",
+            fs.in_flight().join(", ")
+        ),
     ))
 }
 
@@ -178,7 +210,12 @@ pub fn contents(store: &Store, what: &str) -> Result<BTreeMap<Key, (Kind, Vec<u8
                 out.insert(key, (entry.kind, entry.bytes.to_vec()));
             }
             Ok(None) => {}
-            Err(corrupt) => return Err(Failure::new(properties::SERVES_ONLY_WRITTEN, format!("{what}: {corrupt}"))),
+            Err(corrupt) => {
+                return Err(Failure::new(
+                    properties::SERVES_ONLY_WRITTEN,
+                    format!("{what}: {corrupt}"),
+                ));
+            }
         }
     }
     Ok(out)
@@ -192,12 +229,20 @@ fn compare(
     let keys: BTreeSet<&Key> = got.keys().chain(want.keys()).collect();
     for key in keys {
         let text = |it: Option<&(Kind, Vec<u8>)>| {
-            it.map_or_else(|| "nothing".to_owned(), |(kind, bytes)| format!("{} {:x}", kind.name(), content_of(bytes)))
+            it.map_or_else(
+                || "nothing".to_owned(),
+                |(kind, bytes)| format!("{} {:x}", kind.name(), content_of(bytes)),
+            )
         };
         if got.get(key) != want.get(key) {
             return Err(Failure::new(
                 properties::RESTORE_EQUALS_FRESH,
-                format!("{what} holds {} under {}, where a fresh build holds {}", text(got.get(key)), short(key), text(want.get(key))),
+                format!(
+                    "{what} holds {} under {}, where a fresh build holds {}",
+                    text(got.get(key)),
+                    short(key),
+                    text(want.get(key))
+                ),
             ));
         }
     }
@@ -206,12 +251,19 @@ fn compare(
 
 /// A fresh build of every accepted value, on an empty disk: what every restore, built again,
 /// must equal.
-pub fn fresh(ledger: &Ledger, model: &Model, bounds: &Bounds) -> Result<BTreeMap<Key, (Kind, Vec<u8>)>, Failure> {
+pub fn fresh(
+    ledger: &Ledger,
+    model: &Model,
+    bounds: &Bounds,
+) -> Result<BTreeMap<Key, (Kind, Vec<u8>)>, Failure> {
     let mut fs = CrashFs::new(model.persist);
     let mut store = open(&mut fs, bounds, "a fresh build's open")?;
     for (key, (kind, bytes)) in &ledger.accepted {
         if let Err(mismatch) = store.put(*key, *kind, bytes) {
-            return Err(Failure::new(properties::REFUSED_NOT_OVERWRITTEN, format!("a fresh build refused {mismatch:?}")));
+            return Err(Failure::new(
+                properties::REFUSED_NOT_OVERWRITTEN,
+                format!("a fresh build refused {mismatch:?}"),
+            ));
         }
     }
     let mut effects = Vec::new();
@@ -231,23 +283,41 @@ pub fn no_extra(_: &Store, _: &Disk, _: &Ledger, _: &Bounds) -> Result<(), Failu
 /// The keys that must survive a crash now: those whose put the store calls durable, and
 /// those a build answered with.
 pub fn must_survive(store: &Store, ledger: &Ledger) -> BTreeSet<Key> {
-    ledger.tickets.iter().filter(|(ticket, _)| store.durable(*ticket)).map(|(_, key)| *key).chain(ledger.answered.iter().copied()).collect()
+    ledger
+        .tickets
+        .iter()
+        .filter(|(ticket, _)| store.durable(*ticket))
+        .map(|(_, key)| *key)
+        .chain(ledger.answered.iter().copied())
+        .collect()
 }
 
 /// A process started on `disk` after a crash, checked: it opens, serves only values some
 /// writer fully wrote, has every value that had to survive, and, built again, equals a fresh
 /// build, also after a clean stop and start.
-pub fn restore(disk: &Disk, ledger: &Ledger, survive: &BTreeSet<Key>, model: &Model, bounds: &Bounds, extra: Extra<'_>) -> Result<(), Failure> {
+pub fn restore(
+    disk: &Disk,
+    ledger: &Ledger,
+    survive: &BTreeSet<Key>,
+    model: &Model,
+    bounds: &Bounds,
+    extra: Extra<'_>,
+) -> Result<(), Failure> {
     let mut fs = CrashFs::from_disk(model.persist, disk);
     let mut store = open(&mut fs, bounds, "the restore's open")?;
     if let Some(broken) = store.broken() {
         return Err(Failure::new(
             properties::RESTORE_EQUALS_FRESH,
-            format!("the restore does not open: {broken}. A crash must leave a store that opens with what was durable"),
+            format!(
+                "the restore does not open: {broken}. A crash must leave a store that opens with what was durable"
+            ),
         ));
     }
     if !store.ready() {
-        return Err(Failure::new(properties::EVERY_WAIT_ENDS, "the restore's IO ended and it is not ready"));
+        return Err(Failure::new(
+            properties::EVERY_WAIT_ENDS,
+            "the restore's IO ended and it is not ready",
+        ));
     }
     let held = contents(&store, "the restore")?;
     for (key, (_, bytes)) in &held {
@@ -257,23 +327,37 @@ pub fn restore(disk: &Disk, ledger: &Ledger, survive: &BTreeSet<Key>, model: &Mo
     }
     let corrupt = store.verify(None);
     if let Some(first) = corrupt.first() {
-        return Err(Failure::new(properties::SERVES_ONLY_WRITTEN, format!("the restore's verify found {} corrupt: {first}", corrupt.len())));
+        return Err(Failure::new(
+            properties::SERVES_ONLY_WRITTEN,
+            format!("the restore's verify found {} corrupt: {first}", corrupt.len()),
+        ));
     }
     // What a build answered with first: the most specific loss.
-    if let Some(key) = ledger.answered.iter().find(|it| survive.contains(*it) && !held.contains_key(*it)) {
-        return Err(Failure::new(properties::ANSWERED_SURVIVES, format!("{} was lost: a build answered with it before the crash", short(key))));
+    if let Some(key) =
+        ledger.answered.iter().find(|it| survive.contains(*it) && !held.contains_key(*it))
+    {
+        return Err(Failure::new(
+            properties::ANSWERED_SURVIVES,
+            format!("{} was lost: a build answered with it before the crash", short(key)),
+        ));
     }
     if held.is_empty() && !survive.is_empty() {
         return Err(Failure::new(
             properties::NEVER_SILENTLY_EMPTY,
-            format!("the restore opened empty and said nothing, though {} values were durable or answered", survive.len()),
+            format!(
+                "the restore opened empty and said nothing, though {} values were durable or answered",
+                survive.len()
+            ),
         ));
     }
     for key in survive {
         if !held.contains_key(key) {
             return Err(Failure::new(
                 properties::ANSWERED_SURVIVES,
-                format!("{} was lost: the store called its put durable before the crash", short(key)),
+                format!(
+                    "{} was lost: the store called its put durable before the crash",
+                    short(key)
+                ),
             ));
         }
     }
@@ -282,7 +366,10 @@ pub fn restore(disk: &Disk, ledger: &Ledger, survive: &BTreeSet<Key>, model: &Mo
         if let Err(mismatch) = store.put(*key, *kind, bytes) {
             return Err(Failure::new(
                 properties::RESTORE_EQUALS_FRESH,
-                format!("building again on the restore, the put under {} was refused: {mismatch:?}", short(key)),
+                format!(
+                    "building again on the restore, the put under {} was refused: {mismatch:?}",
+                    short(key)
+                ),
             ));
         }
     }
@@ -295,9 +382,16 @@ pub fn restore(disk: &Disk, ledger: &Ledger, survive: &BTreeSet<Key>, model: &Mo
     let mut again = CrashFs::from_disk(model.persist, &fs.synced_disk());
     let store = open(&mut again, bounds, "the restore's restart")?;
     if let Some(broken) = store.broken() {
-        return Err(Failure::new(properties::RESTORE_EQUALS_FRESH, format!("the restore, built again, does not open after a clean stop: {broken}")));
+        return Err(Failure::new(
+            properties::RESTORE_EQUALS_FRESH,
+            format!("the restore, built again, does not open after a clean stop: {broken}"),
+        ));
     }
-    compare(&contents(&store, "the restore's restart")?, &fresh, "the restore, built again and started after a clean stop")
+    compare(
+        &contents(&store, "the restore's restart")?,
+        &fresh,
+        "the restore, built again and started after a clean stop",
+    )
 }
 
 /// Who takes a step: an actor, or the IO.
@@ -342,11 +436,20 @@ pub struct Run<'a> {
 
 impl<'a> Run<'a> {
     /// A store opened on an empty disk.
-    pub fn new(model: &'a Model, bounds: &'a Bounds, chooser: &'a mut Chooser, memo: &'a mut Memo, extra: Extra<'a>) -> Result<Run<'a>, Failure> {
+    pub fn new(
+        model: &'a Model,
+        bounds: &'a Bounds,
+        chooser: &'a mut Chooser,
+        memo: &'a mut Memo,
+        extra: Extra<'a>,
+    ) -> Result<Run<'a>, Failure> {
         let mut fs = CrashFs::new(model.persist);
         let store = open(&mut fs, bounds, "the first open")?;
         if let Some(broken) = store.broken() {
-            return Err(Failure::new(properties::RESTORE_EQUALS_FRESH, format!("a store on an empty disk does not open: {broken}")));
+            return Err(Failure::new(
+                properties::RESTORE_EQUALS_FRESH,
+                format!("a store on an empty disk does not open: {broken}"),
+            ));
         }
         Ok(Run {
             actors: Actors::default(),
@@ -485,8 +588,11 @@ impl<'a> Run<'a> {
             match self.actors.next(id) {
                 Next::Done => {}
                 Next::Await(tickets) => {
-                    let pending: Vec<String> =
-                        tickets.iter().filter(|it| !self.store.durable(**it)).map(ToString::to_string).collect();
+                    let pending: Vec<String> = tickets
+                        .iter()
+                        .filter(|it| !self.store.durable(**it))
+                        .map(ToString::to_string)
+                        .collect();
                     return Err(Failure::new(
                         properties::EVERY_WAIT_ENDS,
                         format!(
@@ -509,7 +615,10 @@ impl<'a> Run<'a> {
         let mut hasher = Hasher::new("blaze storemodel expectation 1");
         hasher.update(format!("{:?} {:?} {:?}", self.model.persist, *ledger, survive).as_bytes());
         let expected = hasher.finish();
-        let states = self.fs.crash_states(self.bounds.crash_states).map_err(|it| Failure::new(properties::EXPLORED, it.to_string()))?;
+        let states = self
+            .fs
+            .crash_states(self.bounds.crash_states)
+            .map_err(|it| Failure::new(properties::EXPLORED, it.to_string()))?;
         for state in states {
             let mut id = Hasher::new("blaze storemodel crash check 1");
             id.id(&digest(&state.disk)).id(&expected);
@@ -531,12 +640,17 @@ impl<'a> Run<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
     /// Puts value `value` under key `key`.
-    Put { key: u8, value: u8 },
+    Put {
+        key: u8,
+        value: u8,
+    },
     Flush,
     /// Waits for what the model's [`Wait`] says, then answers.
     AwaitAndAnswer,
     /// Reads key `key`.
-    Get { key: u8 },
+    Get {
+        key: u8,
+    },
     /// Answers at once, durable or not: a bug the model must find (its own test).
     AnswerUnwaited,
 }
@@ -559,19 +673,34 @@ pub fn value(v: u8) -> Vec<u8> {
 }
 
 /// The store scenario of `scripts`, one execution.
-pub fn run_store(scripts: &[Script], model: &Model, bounds: &Bounds, chooser: &mut Chooser, memo: &mut Memo) -> Result<(), Failure> {
+pub fn run_store(
+    scripts: &[Script],
+    model: &Model,
+    bounds: &Bounds,
+    chooser: &mut Chooser,
+    memo: &mut Memo,
+) -> Result<(), Failure> {
     let mut run = Run::new(model, bounds, chooser, memo, &no_extra)?;
     for script in scripts {
         let writer = run.store.writer();
         let reader = run.store.reader();
         let ledger = Arc::clone(&run.ledger);
         let (name, ops, wait) = (script.name, script.ops.clone(), model.wait);
-        run.actors.spawn(name, move |turn| writes(turn, name, writer, &reader, &ledger, &ops, wait))?;
+        run.actors
+            .spawn(name, move |turn| writes(turn, name, writer, &reader, &ledger, &ops, wait))?;
     }
     run.run()
 }
 
-fn writes(turn: &Turn, name: &str, mut writer: Writer, reader: &Reader, ledger: &Mutex<Ledger>, ops: &[Op], wait: Wait) {
+fn writes(
+    turn: &Turn,
+    name: &str,
+    mut writer: Writer,
+    reader: &Reader,
+    ledger: &Mutex<Ledger>,
+    ops: &[Op],
+    wait: Wait,
+) {
     let guard = blaze_cas::enter();
     let mut mine: Vec<Ticket> = Vec::new();
     let mut kept: Vec<Key> = Vec::new();
@@ -607,7 +736,10 @@ fn writes(turn: &Turn, name: &str, mut writer: Writer, reader: &Reader, ledger: 
                 let failure = match reader.get(&guard, &key(k)) {
                     Ok(None) => None,
                     Ok(Some(entry)) => ledger.lock().served(name, &key(k), entry.bytes),
-                    Err(corrupt) => Some(Failure::new(properties::SERVES_ONLY_WRITTEN, format!("{name} was served a corrupt value: {corrupt}"))),
+                    Err(corrupt) => Some(Failure::new(
+                        properties::SERVES_ONLY_WRITTEN,
+                        format!("{name} was served a corrupt value: {corrupt}"),
+                    )),
                 };
                 if let Some(failure) = failure {
                     turn.fail(failure);
@@ -619,7 +751,13 @@ fn writes(turn: &Turn, name: &str, mut writer: Writer, reader: &Reader, ledger: 
 
 /// A disk changed after the process stopped, as no crash makes it: the store must stop and
 /// say why, or serve everything that had to survive. Never open empty and say nothing.
-pub fn damaged(disk: &Disk, survive: &BTreeSet<Key>, ledger: &Ledger, model: &Model, bounds: &Bounds) -> Result<(), Failure> {
+pub fn damaged(
+    disk: &Disk,
+    survive: &BTreeSet<Key>,
+    ledger: &Ledger,
+    model: &Model,
+    bounds: &Bounds,
+) -> Result<(), Failure> {
     let mut fs = CrashFs::from_disk(model.persist, disk);
     let store = open(&mut fs, bounds, "the open of a damaged disk")?;
     if store.broken().is_some() {
@@ -631,16 +769,24 @@ pub fn damaged(disk: &Disk, survive: &BTreeSet<Key>, ledger: &Ledger, model: &Mo
             return Err(failure);
         }
     }
-    let lost: Vec<String> = survive.iter().filter(|it| !held.contains_key(*it)).map(short).collect();
+    let lost: Vec<String> =
+        survive.iter().filter(|it| !held.contains_key(*it)).map(short).collect();
     match (lost.is_empty(), held.is_empty()) {
         (true, _) => Ok(()),
         (false, true) => Err(Failure::new(
             properties::NEVER_SILENTLY_EMPTY,
-            format!("it opened empty and ready, saying nothing, though {} durable values were on the disk", survive.len()),
+            format!(
+                "it opened empty and ready, saying nothing, though {} durable values were on the disk",
+                survive.len()
+            ),
         )),
         (false, false) => Err(Failure::new(
             properties::NEVER_SILENTLY_EMPTY,
-            format!("it opened ready, saying nothing, without {} of the durable values: {}", lost.len(), lost.join(", ")),
+            format!(
+                "it opened ready, saying nothing, without {} of the durable values: {}",
+                lost.len(),
+                lost.join(", ")
+            ),
         )),
     }
 }

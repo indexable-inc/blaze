@@ -3,7 +3,6 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{
     expr_store::{ExpressionStore, StoreVisitor, scope::ExprScopes},
     hir::{ExprId, ExprOrPatId, PatId},
@@ -13,6 +12,7 @@ use hir_def::{
     },
     resolver::resolver_for_scope,
 };
+use std::alloc::Global;
 
 use crate::{InferBodyId, InferenceResult};
 
@@ -28,7 +28,8 @@ pub fn used_imports_with_traits(db: &Db, krate: Crate) -> UsedImports {
     // alloc: the query's result's input, once per execution.
     let mut uses = Vec::new();
     for owner in crate_body_owners(db, krate) {
-        let picks = InferenceResult::of(db, InferBodyId::DefWithBodyId(owner)).traits_in_scope_used();
+        let picks =
+            InferenceResult::of(db, InferBodyId::DefWithBodyId(owner)).traits_in_scope_used();
         if picks.is_empty() {
             continue;
         }
@@ -38,9 +39,10 @@ pub fn used_imports_with_traits(db: &Db, krate: Crate) -> UsedImports {
         for &(at, trait_) in picks {
             let expr = match at {
                 ExprOrPatId::ExprId(expr) => Some(expr),
-                ExprOrPatId::PatId(pat) => {
-                    pattern_owners.get_or_insert_with(|| owners_of_patterns(store)).get(&pat).copied()
-                }
+                ExprOrPatId::PatId(pat) => pattern_owners
+                    .get_or_insert_with(|| owners_of_patterns(store))
+                    .get(&pat)
+                    .copied(),
             };
             let scope = expr.and_then(|expr| scopes.scope_for(expr));
             resolver_for_scope(db, owner, scope).record_trait_uses(db, trait_, &mut uses);

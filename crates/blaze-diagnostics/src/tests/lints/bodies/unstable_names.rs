@@ -37,16 +37,11 @@ fn inference_unstable() {
         include_str!("unstable_names/auxiliary/inference_unstable_iterator.rs"),
         include_str!("unstable_names/auxiliary/inference_unstable_itertools.rs"),
     );
-    let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::RunPass, &crate::Options::default()));
+    let checked =
+        checked_with(&fixture, "$DIR/", &compiletest(Mode::RunPass, &crate::Options::default()));
     let written = normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }));
     assert_reports(
         &written,
-        &[
-            warning(16, &[]),
-            warning(19, &[]),
-            warning(22, &[]),
-            warning(25, &[]),
-            warning(28, &[]),
-        ],
+        &[warning(16, &[]), warning(19, &[]), warning(22, &[]), warning(25, &[]), warning(28, &[])],
     );
 }

@@ -122,7 +122,9 @@ fn scalar(a: &[u8], b: &[u8], from: usize) -> Option<usize> {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
 unsafe fn avx512(a: &[u8], b: &[u8]) -> Option<usize> {
-    use std::arch::x86_64::{__m512i, _mm512_cmpneq_epi8_mask, _mm512_loadu_si512, _mm512_maskz_loadu_epi8};
+    use std::arch::x86_64::{
+        __m512i, _mm512_cmpneq_epi8_mask, _mm512_loadu_si512, _mm512_maskz_loadu_epi8,
+    };
     let (n, pa, pb) = (a.len(), a.as_ptr(), b.as_ptr());
     /// # Safety
     ///
@@ -234,7 +236,10 @@ unsafe fn avx2(a: &[u8], b: &[u8]) -> Option<usize> {
         let m3 = unsafe { same(a3, b3) };
         let m = [m0, m1, m2, m3];
         if m[0] & m[1] & m[2] & m[3] != u32::MAX {
-            let all = u128::from(m[0]) | (u128::from(m[1]) << 32) | (u128::from(m[2]) << 64) | (u128::from(m[3]) << 96);
+            let all = u128::from(m[0])
+                | (u128::from(m[1]) << 32)
+                | (u128::from(m[2]) << 64)
+                | (u128::from(m[3]) << 96);
             return Some(at + (!all).trailing_zeros() as usize);
         }
         at += 128;
@@ -305,7 +310,10 @@ unsafe fn sse2(a: &[u8], b: &[u8]) -> Option<usize> {
         let m3 = unsafe { same(a3, b3) };
         let m = [m0, m1, m2, m3];
         if m[0] & m[1] & m[2] & m[3] != u16::MAX {
-            let all = u64::from(m[0]) | (u64::from(m[1]) << 16) | (u64::from(m[2]) << 32) | (u64::from(m[3]) << 48);
+            let all = u64::from(m[0])
+                | (u64::from(m[1]) << 16)
+                | (u64::from(m[2]) << 32)
+                | (u64::from(m[3]) << 48);
             return Some(at + (!all).trailing_zeros() as usize);
         }
         at += 64;
@@ -341,7 +349,8 @@ unsafe fn sse2(a: &[u8], b: &[u8]) -> Option<usize> {
 #[target_feature(enable = "neon")]
 unsafe fn neon(a: &[u8], b: &[u8]) -> Option<usize> {
     use std::arch::aarch64::{
-        uint8x16_t, vandq_u8, vceqq_u8, vget_lane_u64, vld1q_u8, vreinterpret_u64_u8, vreinterpretq_u16_u8, vshrn_n_u16,
+        uint8x16_t, vandq_u8, vceqq_u8, vget_lane_u64, vld1q_u8, vreinterpret_u64_u8,
+        vreinterpretq_u16_u8, vshrn_n_u16,
     };
     let (n, pa, pb) = (a.len(), a.as_ptr(), b.as_ptr());
     /// # Safety

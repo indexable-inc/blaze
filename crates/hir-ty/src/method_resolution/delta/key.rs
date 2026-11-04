@@ -41,7 +41,10 @@ pub(crate) enum ImplKey {
     /// for an error type, or an inherent impl whose self type does not simplify.
     Skip,
     /// A trait impl; `head` is `None` for a blanket impl.
-    Trait { trait_: TraitId, head: Option<Head> },
+    Trait {
+        trait_: TraitId,
+        head: Option<Head>,
+    },
     Inherent(Head),
 }
 

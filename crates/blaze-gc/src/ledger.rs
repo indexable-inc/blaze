@@ -33,10 +33,13 @@ impl Ledger {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Ledger, String> {
-        let ledger: Ledger =
-            serde_json::from_slice(bytes).map_err(|error| format!("it does not read as a ledger: {error}"))?;
+        let ledger: Ledger = serde_json::from_slice(bytes)
+            .map_err(|error| format!("it does not read as a ledger: {error}"))?;
         if ledger.format != FORMAT {
-            return Err(format!("it is of format {}, and this blaze reads format {FORMAT}", ledger.format));
+            return Err(format!(
+                "it is of format {}, and this blaze reads format {FORMAT}",
+                ledger.format
+            ));
         }
         Ok(ledger)
     }
@@ -45,7 +48,9 @@ impl Ledger {
 /// The ledger at `path`; `None` when there is none yet.
 pub fn read(path: &Path) -> Result<Option<Ledger>, String> {
     match std::fs::read(path) {
-        Ok(bytes) => Ledger::decode(&bytes).map(Some).map_err(|why| format!("{}: {why}", path.display())),
+        Ok(bytes) => {
+            Ledger::decode(&bytes).map(Some).map_err(|why| format!("{}: {why}", path.display()))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("reading {}: {error}", path.display())),
     }

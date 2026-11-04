@@ -75,7 +75,8 @@ mod tests {
     #[hegel::test]
     fn list_is_the_slice_matchs(tc: hegel::TestCase) {
         use hegel::generators as gs;
-        let items: Vec<String> = tc.draw(gs::vecs(gs::text().alphabet("ab ,").max_size(3)).max_size(5));
+        let items: Vec<String> =
+            tc.draw(gs::vecs(gs::text().alphabet("ab ,").max_size(3)).max_size(5));
         let quote: bool = tc.draw(gs::booleans());
         for join in [Join::And, Join::Or, Join::AndNoSerialComma] {
             let quoted: Vec<String> =

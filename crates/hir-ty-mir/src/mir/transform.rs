@@ -24,12 +24,12 @@ mod packed_drops;
 mod upvars;
 
 pub use cleanup::noop_landing_pads;
-pub use drop_states::{DropState, HeldPath, drop_states};
 pub(super) use cleanup::remove_noop_landing_pads;
+pub use drop_states::{DropState, HeldPath, drop_states};
 
 use std::cell::RefCell;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_hashcons::Interned;
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{DefWithBodyId, HasModule, attrs::AttrFlags, expr_store::Body};
@@ -41,8 +41,7 @@ use crate::{
     db::{HirDatabase, InternedCoroutineId},
     drop::{DropGlue, has_drop_glue},
     next_solver::{
-        DbInterner, ParamEnv, Region, StoredTy, Ty, TyKind,
-        TypingMode,
+        DbInterner, ParamEnv, Region, StoredTy, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
     },

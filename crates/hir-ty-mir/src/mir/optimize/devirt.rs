@@ -56,7 +56,8 @@ use rustc_type_ir::{
 };
 
 use crate::mir::{
-    BasicBlock, BasicBlockId, BinOp, CastKind, Local, LocalId, MirBody, MirLowerError, Operand, OperandKind, Place, ProjectionElem, Rvalue, Statement, StatementKind, SwitchTargets,
+    BasicBlock, BasicBlockId, BinOp, CastKind, Local, LocalId, MirBody, MirLowerError, Operand,
+    OperandKind, Place, ProjectionElem, Rvalue, Statement, StatementKind, SwitchTargets,
     Terminator, TerminatorKind, transform::Ctx,
 };
 use crate::{db::HirDatabase as _, infer::PointerCast, mir::location::track_caller};
@@ -187,7 +188,10 @@ fn site<'db>(
         Some("its object type names a parameter of the generic body")
     } else if fn_args.has_opaque_types() {
         Some("its object type names an opaque type the body does not see through")
-    } else if GenericPredicates::query_own_explicit(ctx.db, method.into()).skip_binder().next().is_some()
+    } else if GenericPredicates::query_own_explicit(ctx.db, method.into())
+        .skip_binder()
+        .next()
+        .is_some()
     {
         Some("the method has where clauses of its own, which a type's method may not meet")
     } else {
@@ -198,7 +202,9 @@ fn site<'db>(
         return None;
     }
     let receiver = match args.first().map(|it| ctx.normalize(ctx.operand_ty(body, it)).kind()) {
-        Some(TyKind::Ref(_, pointee, mutbl)) if erased(interner, pointee) == erased(interner, dyn_ty) => {
+        Some(TyKind::Ref(_, pointee, mutbl))
+            if erased(interner, pointee) == erased(interner, dyn_ty) =>
+        {
             mutbl
         }
         _ => {
@@ -292,7 +298,11 @@ enum Plan<'db> {
     /// Compare the vtable against each of `guarded` in order and call its method on a match;
     /// past them call `last`'s method, or without one the `dyn` call. `outcome` names it for
     /// the trace: `direct`, `compared` or `speculated`.
-    Rewrite { guarded: Vec<Ty<'db>>, last: Option<Ty<'db>>, outcome: &'static str },
+    Rewrite {
+        guarded: Vec<Ty<'db>>,
+        last: Option<Ty<'db>>,
+        outcome: &'static str,
+    },
 }
 
 fn plan<'db>(
@@ -337,9 +347,11 @@ fn plan<'db>(
         None => match seen(ctx, site, &targets, found) {
             // One type: every object of the type is of it, whichever copy of its vtable it
             // holds, so no compare.
-            (seen, None) if seen.len() == 1 => {
-                Plan::Rewrite { guarded: Vec::new(), last: Some(seen[0].ty.as_ref()), outcome: "direct" }
-            }
+            (seen, None) if seen.len() == 1 => Plan::Rewrite {
+                guarded: Vec::new(),
+                last: Some(seen[0].ty.as_ref()),
+                outcome: "direct",
+            },
             (seen, Some((unseen, why))) if seen.is_empty() => keep(format!(
                 "the body's crate {} can't name the method of {} for {:?}: {}",
                 ctx.krate().named(ctx.db),
@@ -362,14 +374,16 @@ fn plan<'db>(
             let mut counted: Vec<(usize, &Target)> = // alloc: a handful a call
                 targets.iter().copied().filter(|(_, it)| it.count.is_some()).collect();
             counted.sort_by(|(_, a), (_, b)| b.count.cmp(&a.count).then(a.id.0.cmp(&b.id.0)));
-            let hottest = counted.into_iter().find_map(|(at, target)| match sees(ctx, site, target.ty.as_ref()) {
-                Ok(()) => {
-                    found[at] = Found::Seen;
-                    Some(target)
-                }
-                Err(_) => {
-                    found[at] = Found::Unseen;
-                    None
+            let hottest = counted.into_iter().find_map(|(at, target)| {
+                match sees(ctx, site, target.ty.as_ref()) {
+                    Ok(()) => {
+                        found[at] = Found::Seen;
+                        Some(target)
+                    }
+                    Err(_) => {
+                        found[at] = Found::Unseen;
+                        None
+                    }
                 }
             });
             match hottest {
@@ -418,8 +432,13 @@ fn sees<'db>(ctx: &Ctx<'_, 'db>, site: &Site<'db>, ty: Ty<'db>) -> std::result::
     let mut args: Vec<GenericArg<'db>> = site.args.iter().collect(); // alloc: a call's generic arguments
     args[0] = ty.into();
     let env = ParamEnvAndCrate { param_env: ctx.env, krate: ctx.krate() };
-    let (method, _) = crate::mir::dispatch::impl_method(ctx.db, env, site.method, GenericArgs::new_from_slice(&args))
-        .map_err(Unseen::NoMethod)?;
+    let (method, _) = crate::mir::dispatch::impl_method(
+        ctx.db,
+        env,
+        site.method,
+        GenericArgs::new_from_slice(&args),
+    )
+    .map_err(Unseen::NoMethod)?;
     // A builtin derive's method: the compiler's, never `#[track_caller]` nor specialized.
     let Either::Left(func) = method else { return Ok(()) };
     let declared = AttrFlags::query(ctx.db, site.method.into()).contains(AttrFlags::TRACK_CALLER);
@@ -429,7 +448,8 @@ fn sees<'db>(ctx: &Ctx<'_, 'db>, site: &Site<'db>, ty: Ty<'db>) -> std::result::
     // Conservative where an impl's item is inherited along a specialization chain: rustc
     // finalizes such an item at the leaf impl, which the lookup does not name.
     if let ItemContainerId::ImplId(impl_id) = func.loc(ctx.db).container
-        && (FunctionSignature::of(ctx.db, func).is_default() || ImplSignature::of(ctx.db, impl_id).is_default())
+        && (FunctionSignature::of(ctx.db, func).is_default()
+            || ImplSignature::of(ctx.db, impl_id).is_default())
     {
         return Err(Unseen::Specializable);
     }
@@ -493,7 +513,9 @@ fn rewrite<'db>(
     let word = ctx
         .db
         .target_data_layout(ctx.krate())
-        .map_err(|_| MirLowerError::LayoutError(crate::layout::LayoutError::TargetLayoutNotAvailable))?
+        .map_err(|_| {
+            MirLowerError::LayoutError(crate::layout::LayoutError::TargetLayoutNotAvailable)
+        })?
         .pointer_size()
         .bytes_usize();
     let unit_ptr = Ty::new_ptr(interner, Ty::new_unit(interner), Mutability::Not);
@@ -515,13 +537,20 @@ fn rewrite<'db>(
         span,
     };
     let part = |of: LocalId, at: u64| {
-        let place = Place::from(of)
-            .project(ProjectionElem::ConstantIndex { offset: at, min_length: 2, from_end: false });
+        let place = Place::from(of).project(ProjectionElem::ConstantIndex {
+            offset: at,
+            min_length: 2,
+            from_end: false,
+        });
         Operand { kind: OperandKind::Copy(place.store()), span: None }
     };
-    let copy = |of: LocalId| Operand { kind: OperandKind::Copy(Place::from(of).store()), span: None };
-    let mov = |of: LocalId| Operand { kind: OperandKind::Move(Place::from(of).store()), span: None };
-    let [receiver_arg, rest @ ..] = &*args else { unreachable!("`site` took a call with a receiver") };
+    let copy =
+        |of: LocalId| Operand { kind: OperandKind::Copy(Place::from(of).store()), span: None };
+    let mov =
+        |of: LocalId| Operand { kind: OperandKind::Move(Place::from(of).store()), span: None };
+    let [receiver_arg, rest @ ..] = &*args else {
+        unreachable!("`site` took a call with a receiver")
+    };
     // The object's two words, by the code generator's layout of a wide pointer: the data
     // pointer, then the metadata.
     body.basic_blocks[block].statements.extend([
@@ -531,7 +560,9 @@ fn rewrite<'db>(
         assign(vtable, Rvalue::Use(part(parts, 1))),
     ]);
     let direct = |body: &mut MirBody<'db>, ty: Ty<'db>| {
-        let this = body.locals.alloc(Local { ty: Ty::new_ref(interner, Region::new_erased(interner), ty, site.receiver).store() });
+        let this = body.locals.alloc(Local {
+            ty: Ty::new_ref(interner, Region::new_erased(interner), ty, site.receiver).store(),
+        });
         let this_ty = body.locals[this].ty.as_ref();
         let mut method_args: Vec<GenericArg<'db>> = site.args.iter().collect(); // alloc: a call's generic arguments
         method_args[0] = ty.into();
@@ -568,7 +599,15 @@ fn rewrite<'db>(
                 statements: Vec::new(),
                 terminator: Some(Terminator {
                     span,
-                    kind: TerminatorKind::Call { func, args, destination: destination.clone(), target, cleanup, from_hir_call, intrinsic }, // clone: a refcount
+                    kind: TerminatorKind::Call {
+                        func,
+                        args,
+                        destination: destination.clone(),
+                        target,
+                        cleanup,
+                        from_hir_call,
+                        intrinsic,
+                    }, // clone: a refcount
                 }),
                 is_cleanup,
             })
@@ -578,13 +617,19 @@ fn rewrite<'db>(
     let mut next = otherwise;
     for &ty in guarded.iter().rev() {
         let on_match = direct(body, ty);
-        let null = Operand::from_bytes(vec![0; word].into_boxed_slice(), Ty::new_ptr(interner, ty, Mutability::Not)); // alloc: a constant, kept in the body
+        let null = Operand::from_bytes(
+            vec![0; word].into_boxed_slice(),
+            Ty::new_ptr(interner, ty, Mutability::Not),
+        ); // alloc: a constant, kept in the body
         let unsize = CastKind::PointerCoercion(PointerCast::Unsize);
         next = body.basic_blocks.alloc(BasicBlock {
             // alloc: the block's statements, kept in the body
             statements: vec![
                 assign(expected_fat, Rvalue::Cast(unsize, null, dyn_ptr.store())),
-                assign(expected_parts, Rvalue::Cast(CastKind::Transmute, mov(expected_fat), parts_ty.store())),
+                assign(
+                    expected_parts,
+                    Rvalue::Cast(CastKind::Transmute, mov(expected_fat), parts_ty.store()),
+                ),
                 assign(expected, Rvalue::Use(part(expected_parts, 1))),
                 assign(matched, Rvalue::BinaryOp(BinOp::Eq, copy(vtable), copy(expected))),
             ],

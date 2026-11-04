@@ -34,8 +34,17 @@ use super::{
 use crate::check::Cx;
 
 /// The methods that iterate a hash collection in its table's order.
-const ITERATE: &[&str] =
-    &["iter", "iter_mut", "keys", "values", "values_mut", "into_iter", "into_keys", "into_values", "drain"];
+const ITERATE: &[&str] = &[
+    "iter",
+    "iter_mut",
+    "keys",
+    "values",
+    "values_mut",
+    "into_iter",
+    "into_keys",
+    "into_values",
+    "drain",
+];
 
 /// How many methods a chain from an iteration is followed through to its `collect`.
 const CHAIN: usize = 16;
@@ -101,7 +110,11 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         infer: analysis.infer(),
         analysis,
         parents: Parents::of(body),
-        ordered: [adt(&["alloc", "vec", "Vec"]), adt(&["alloc", "collections", "VecDeque"]), adt(&["alloc", "string", "String"])],
+        ordered: [
+            adt(&["alloc", "vec", "Vec"]),
+            adt(&["alloc", "collections", "VecDeque"]),
+            adt(&["alloc", "string", "String"]),
+        ],
     };
     let target = cx.krate().to_display_target(walk.db);
     for (id, expr) in body.exprs() {
@@ -124,7 +137,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             false => walk.chain(id),
         };
         let Some(sink) = sink else { continue };
-        let Some(range) = analysis.expr_range(id).or_else(|| analysis.expr_range(iterated)) else { continue };
+        let Some(range) = analysis.expr_range(id).or_else(|| analysis.expr_range(iterated)) else {
+            continue;
+        };
         let message = format!(
             "`{}` is iterated in its hasher's order, and that order reaches {}",
             ty.strip_references().display(walk.db, target),
@@ -151,7 +166,9 @@ impl<'db> Walk<'_, 'db> {
             match self.body.expr(parent) {
                 Expr::MethodCall { receiver, .. } if receiver == child => {}
                 // `for x in map.iter()`: the loop's own `IntoIterator::into_iter` of the chain.
-                Expr::Call { args: [arg], .. } if *arg == child && self.method_name(parent) == Some("into_iter") => {
+                Expr::Call { args: [arg], .. }
+                    if *arg == child && self.method_name(parent) == Some("into_iter") =>
+                {
                     return self.for_loop(parent);
                 }
                 _ => return None,
@@ -187,18 +204,24 @@ impl<'db> Walk<'_, 'db> {
                 Expr::Block { tail: Some(it), .. } if it == child => child = parent,
                 Expr::Block { statements, .. } => {
                     let local = statements.iter().find_map(|it| match it {
-                        Statement::Let { pat, initializer: Some(init), .. } if init == child => match self.body.pat(pat) {
-                            Pat::Bind { id, subpat: None } => Some(id),
-                            _ => None,
-                        },
+                        Statement::Let { pat, initializer: Some(init), .. } if init == child => {
+                            match self.body.pat(pat) {
+                                Pat::Bind { id, subpat: None } => Some(id),
+                                _ => None,
+                            }
+                        }
                         _ => None,
                     })?;
                     return self.sink_of_local(local);
                 }
                 Expr::Ref { .. } => child = parent,
-                Expr::RecordLit { fields, .. } if fields.iter().any(|it| it.expr == child) => return Some(Sink::Stored),
+                Expr::RecordLit { fields, .. } if fields.iter().any(|it| it.expr == child) => {
+                    return Some(Sink::Stored);
+                }
                 Expr::Assignment { value, .. } if value == child => return Some(Sink::Stored),
-                Expr::Call { args, .. } | Expr::MethodCall { args, .. } if args.contains(&child) => {
+                Expr::Call { args, .. } | Expr::MethodCall { args, .. }
+                    if args.contains(&child) =>
+                {
                     let name = self.method_name(parent)?;
                     return (name != "into_iter").then(|| Sink::Passed(name.to_owned()));
                 }
@@ -213,7 +236,9 @@ impl<'db> Walk<'_, 'db> {
         // alloc: the uses of one collected local, a few
         let mut uses = Vec::new();
         for (id, expr) in self.body.exprs() {
-            if matches!(expr, Expr::Path(_)) && local_of(self.db, self.def, self.body, id) == Some(local) {
+            if matches!(expr, Expr::Path(_))
+                && local_of(self.db, self.def, self.body, id) == Some(local)
+            {
                 uses.push(id);
             }
         }
@@ -242,7 +267,9 @@ impl<'db> Walk<'_, 'db> {
     fn for_loop(&self, id: ExprId) -> Option<Sink> {
         let parent = self.parents.of_expr(id)?;
         let Expr::Match { arms: [arm], .. } = self.body.expr(parent) else { return None };
-        let Expr::Loop { body, source: LoopSource::ForLoop, .. } = self.body.expr(arm.expr) else { return None };
+        let Expr::Loop { body, source: LoopSource::ForLoop, .. } = self.body.expr(arm.expr) else {
+            return None;
+        };
         // alloc: the expressions of one loop's body, walked once
         let mut stack = vec![body];
         while let Some(at) = stack.pop() {
@@ -273,10 +300,19 @@ impl<'db> Walk<'_, 'db> {
 }
 
 /// The local the path expression `expr` of `def`'s body names, if it names one.
-pub(super) fn local_of(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId) -> Option<BindingId> {
+pub(super) fn local_of(
+    db: &Db,
+    def: DefWithBodyId,
+    body: &Body,
+    expr: ExprId,
+) -> Option<BindingId> {
     let Expr::Path(path) = body.expr(expr) else { return None };
     let scope = ExprScopes::of(db, def).scope_for(expr);
-    match resolver_for_scope(db, def, scope).resolve_path_in_value_ns_fully(db, path, body.expr_path_hygiene(expr)) {
+    match resolver_for_scope(db, def, scope).resolve_path_in_value_ns_fully(
+        db,
+        path,
+        body.expr_path_hygiene(expr),
+    ) {
         Some(ValueNs::LocalBinding(it)) => Some(it),
         _ => None,
     }

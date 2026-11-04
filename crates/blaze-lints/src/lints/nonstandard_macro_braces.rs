@@ -35,8 +35,17 @@ fn configured(cx: &Cx<'_, '_>, name: &str) -> Option<(char, char)> {
 
 fn standard(name: &str) -> Option<(char, char)> {
     Some(match name {
-        "assert_matches" | "debug_assert_matches" | "format" | "format_args" | "eprint"
-        | "eprintln" | "print" | "println" | "write" | "writeln" | "matches" => ('(', ')'),
+        "assert_matches"
+        | "debug_assert_matches"
+        | "format"
+        | "format_args"
+        | "eprint"
+        | "eprintln"
+        | "print"
+        | "println"
+        | "write"
+        | "writeln"
+        | "matches" => ('(', ')'),
         "cfg_select" => ('{', '}'),
         "vec" => ('[', ']'),
         _ => return None,

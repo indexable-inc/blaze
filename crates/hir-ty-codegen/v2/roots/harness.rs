@@ -436,8 +436,12 @@ fn text(tests: &[Test], test_type: &str, digest: &str, fork_server: &str) -> Str
              testfn: "
         );
         _ = match test.bench {
-            true => write!(text, "test::StaticBenchFn(|b| test::assert_test_result(crate::{name}(b)))"),
-            false => write!(text, "test::StaticTestFn(|| test::assert_test_result(crate::{name}()))"),
+            true => {
+                write!(text, "test::StaticBenchFn(|b| test::assert_test_result(crate::{name}(b)))")
+            }
+            false => {
+                write!(text, "test::StaticTestFn(|| test::assert_test_result(crate::{name}()))")
+            }
         };
         text.push_str(",\n    };\n");
     }

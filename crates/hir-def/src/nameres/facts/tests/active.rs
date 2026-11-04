@@ -10,10 +10,10 @@ use std::fmt::Write as _;
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_query::db::FromId;
+use std::alloc::Global;
 
-use super::{Exempt, compare_db, fixture_db, facts_crate_local_def_map};
+use super::{Exempt, compare_db, facts_crate_local_def_map, fixture_db};
 use crate::{
     ModuleId,
     nameres::facts::queries::{self, FactKey, RoundKey, RoundKind, RoundModules, SccKey},
@@ -71,7 +71,12 @@ fn name(db: &Db, module: ModuleId) -> String {
 
 /// The modules whose `query` ran for round `round`: its key's module (a component's anchor
 /// for `scc_state`).
-fn ran_at(db: &TestDB, events: &[(String, blaze_query::db::Id)], query: &str, round: u32) -> HashSet<String, Global> {
+fn ran_at(
+    db: &TestDB,
+    events: &[(String, blaze_query::db::Id)],
+    query: &str,
+    round: u32,
+) -> HashSet<String, Global> {
     events
         .iter()
         .filter(|(it, _)| it == query)
@@ -133,7 +138,11 @@ fn a_round_runs_only_the_leaf_its_macros_change_and_the_leafs_importers() {
     let m5 = modules.order.iter().position(|&it| name(&db, it) == "m5").expect("`m5`") as u32;
     let round = RoundKey::new(&db, krate, 2);
     assert!(!queries::runs(&db, round, m5));
-    assert_eq!(queries::fact_key(&db, round, m5).round(&db), 0, "`m5` has not changed since round 0");
+    assert_eq!(
+        queries::fact_key(&db, round, m5).round(&db),
+        0,
+        "`m5` has not changed since round 0"
+    );
 
     let mut diff = String::new();
     compare_db(&db, "active set", &Exempt::NONE, &mut diff);
@@ -148,8 +157,15 @@ fn the_importers_resolve_what_the_leaf_gains() {
     let two = hir_expand::name::Name::new_symbol_root(intern::Symbol::intern("Two"));
     for (module, data) in map.modules(&db) {
         let name = name(&db, module);
-        let importer = name.strip_prefix('m').and_then(|it| it.parse::<u32>().ok()).is_some_and(|it| it <= IMPORTERS);
-        assert_eq!(data.scope(&db).get(&two).types.is_some(), importer || name == "leaf", "`Two` in `{name}`");
+        let importer = name
+            .strip_prefix('m')
+            .and_then(|it| it.parse::<u32>().ok())
+            .is_some_and(|it| it <= IMPORTERS);
+        assert_eq!(
+            data.scope(&db).get(&two).types.is_some(),
+            importer || name == "leaf",
+            "`Two` in `{name}`"
+        );
     }
     let mut diff = String::new();
     compare_db(&db, "active set, importers", &Exempt::NONE, &mut diff);

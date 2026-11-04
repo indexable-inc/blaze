@@ -51,10 +51,13 @@ mod reference {
         pub(super) fn new(bytes: &[u8]) -> Code {
             let len = bytes.len().next_multiple_of(1 << 16);
             #[cfg(target_os = "macos")]
-            let (protection, flags) =
-                (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC, libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT);
+            let (protection, flags) = (
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+            );
             #[cfg(not(target_os = "macos"))]
-            let (protection, flags) = (libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS);
+            let (protection, flags) =
+                (libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS);
             // SAFETY: an anonymous mapping at no fixed address; the result is checked.
             let at = unsafe { libc::mmap(std::ptr::null_mut(), len, protection, flags, -1, 0) };
             assert_ne!(at, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
@@ -68,14 +71,20 @@ mod reference {
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), code.at, bytes.len()) };
             #[cfg(target_os = "macos")]
             // SAFETY: executable again on this thread; then the instruction cache sees the bytes.
-            unsafe { libc::pthread_jit_write_protect_np(1) };
+            unsafe {
+                libc::pthread_jit_write_protect_np(1)
+            };
             #[cfg(target_os = "macos")]
             // SAFETY: the instruction cache sees the bytes in the fresh mapping.
-            unsafe { sys_icache_invalidate(code.at.cast(), bytes.len()) };
+            unsafe {
+                sys_icache_invalidate(code.at.cast(), bytes.len())
+            };
             #[cfg(not(target_os = "macos"))]
             {
                 // SAFETY: the whole mapping made above.
-                let sealed = unsafe { libc::mprotect(code.at.cast(), len, libc::PROT_READ | libc::PROT_EXEC) };
+                let sealed = unsafe {
+                    libc::mprotect(code.at.cast(), len, libc::PROT_READ | libc::PROT_EXEC)
+                };
                 assert_eq!(sealed, 0, "mprotect: {}", std::io::Error::last_os_error());
                 #[cfg(target_arch = "aarch64")]
                 icache(code.at as usize, bytes.len());
@@ -122,7 +131,10 @@ mod reference {
 fn runs_what_the_reference_mapping_runs() {
     let reference = reference::Code::new(FORTY_TWO);
     let exec = Executable::new(FORTY_TWO, 0).unwrap();
-    assert_eq!(code_at(exec.code_address(), FORTY_TWO.len()), code_at(reference.at as u64, FORTY_TWO.len()));
+    assert_eq!(
+        code_at(exec.code_address(), FORTY_TWO.len()),
+        code_at(reference.at as u64, FORTY_TWO.len())
+    );
     assert_eq!(call(exec.code_address()), call(reference.at as u64));
     assert_eq!(call(exec.code_address()), 42);
 }
@@ -162,7 +174,8 @@ fn load_first_word(code: &mut [u8], data: &[u8]) {
 
 #[test]
 fn its_code_reaches_its_data() {
-    let mut exec = Executable::written(16, 3 << 16, |code, data| load_first_word(code, data)).unwrap();
+    let mut exec =
+        Executable::written(16, 3 << 16, |code, data| load_first_word(code, data)).unwrap();
     assert!(exec.data_address().abs_diff(exec.code_address()) < 1 << 30);
     assert_eq!(call(exec.code_address()), 0, "the data starts zeroed");
     exec.data()[..4].copy_from_slice(&0x5eed_f00du32.to_le_bytes());
@@ -186,7 +199,9 @@ fn its_data_is_zeroed_and_writable() {
 #[test]
 fn a_write_that_panics_leaves_the_thread_running_code() {
     let first = Executable::new(FORTY_TWO, 0).unwrap();
-    let panicked = std::panic::catch_unwind(|| Executable::written(16, 16, |_, _| panic!("a write that fails")));
+    let panicked = std::panic::catch_unwind(|| {
+        Executable::written(16, 16, |_, _| panic!("a write that fails"))
+    });
     assert!(panicked.is_err());
     assert_eq!(call(first.code_address()), 42);
     assert_eq!(call(Executable::new(FORTY_TWO, 0).unwrap().code_address()), 42);

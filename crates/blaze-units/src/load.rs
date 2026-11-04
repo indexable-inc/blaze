@@ -15,6 +15,7 @@ mod config;
 mod files;
 mod invocation;
 mod manifest;
+mod native;
 mod plan;
 mod resolve;
 mod sandbox;
@@ -36,14 +37,15 @@ use self::invocation::{Asked, Asking};
 use self::manifest::{WorkspaceKey, WorkspaceQuery, in_workspace};
 use self::units::Built;
 use crate::query::{
-    Cbor, Command, Fetch, LoadError, Mount, Plan, Planned, StdGraph, StdPlanned, Units, kinds, producer,
+    Cbor, Command, Fetch, LoadError, Mount, Plan, Planned, StdGraph, StdPlanned, Units, kinds,
+    producer,
 };
 use crate::{Filter, Intent};
 
 pub use self::files::Snap;
 pub use self::files::normal_text;
-pub use crate::Read;
 pub use self::view::{ResolveAsk, Resolving, ViewResolved, platform_cfg, resolve_view};
+pub use crate::Read;
 
 thread_local! {
     // alloc: grown once to the largest key the thread hashes, then reused by every key.
@@ -58,7 +60,9 @@ pub fn key_id<K: Serialize>(domain: &'static str, key: &K) -> ContentId {
         let mut held = held.borrow_mut();
         let (writer, bytes) = &mut *held;
         bytes.clear();
-        writer.append(bytes, key).unwrap_or_else(|error| panic!("a query key has no CBOR: {error}"));
+        writer
+            .append(bytes, key)
+            .unwrap_or_else(|error| panic!("a query key has no CBOR: {error}"));
         ContentId::of(domain, bytes)
     })
 }
@@ -163,7 +167,9 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
     let select = match (asked.workspace, asked.exclude.is_empty(), asked.packages.is_empty()) {
         (false, true, true) => Select::Default,
         (false, true, false) => Select::Packages(asked.packages.clone()),
-        (false, false, _) => return Err(error("--exclude can only be used together with --workspace")),
+        (false, false, _) => {
+            return Err(error("--exclude can only be used together with --workspace"));
+        }
         (true, true, _) => Select::All,
         (true, false, _) => Select::OptOut(asked.exclude.clone()),
     };
@@ -199,7 +205,8 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
     let mut build_std_features = None;
     for flag in &asked.unstable {
         let (name, value) = flag.split_once('=').unwrap_or((flag.as_str(), ""));
-        let list = || value.split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+        let list =
+            || value.split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect::<Vec<_>>();
         match name {
             "unstable-options" | "bindeps" | "codegen-backend" => {}
             "build-std" => build_std = Some(list()),
@@ -354,6 +361,7 @@ impl Query for Plan {
                 finished: built.finished,
                 link_dirs: built.link_dirs,
                 sandboxed_tests: built.sandboxed_tests,
+                native: built.native,
             }),
             Staged::Needs(fetches) => Planned::Needs(fetches),
             Staged::Failed(error) => Planned::Failed(error),
@@ -447,7 +455,8 @@ impl Query for Foreign {
                 roots: built.roots,
             }),
             Staged::Needs(fetches) => {
-                let what: Vec<String> = fetches.iter().map(|it| format!("`{}` at `{}`", it.what, it.at)).collect();
+                let what: Vec<String> =
+                    fetches.iter().map(|it| format!("`{}` at `{}`", it.what, it.at)).collect();
                 StdPlanned::Failed(LoadError {
                     what: format!(
                         "the workspace at `{}` reads what nothing fetches for it: {}",

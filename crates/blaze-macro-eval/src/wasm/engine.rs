@@ -49,7 +49,8 @@ fn make() -> Result<Engines, String> {
         .async_stack_size(blaze_graph::sched::FIBER_STACK)
         .wasm_backtrace_details(WasmBacktraceDetails::Disable);
     // alloc: error path
-    let engine = Engine::new(&config).map_err(|e| format!("Wasmtime could not make its engine: {e:#}"))?;
+    let engine =
+        Engine::new(&config).map_err(|e| format!("Wasmtime could not make its engine: {e:#}"))?;
     let mut bytes = Bytes::default();
     engine.precompile_compatibility_hash().hash(&mut bytes);
     bytes.write(std::env::consts::ARCH.as_bytes());
@@ -129,7 +130,10 @@ mod tests {
         let count = instance.get_typed_func::<i32, ()>(&mut store, "count").unwrap();
         count.call(&mut store, 1000).unwrap();
         let spent = (1 << 30) - store.get_fuel().unwrap();
-        assert!((2000..2100).contains(&spent), "1000 turns of a `sub` and a `br_if` spent {spent} fuel");
+        assert!(
+            (2000..2100).contains(&spent),
+            "1000 turns of a `sub` and a `br_if` spent {spent} fuel"
+        );
 
         store.set_fuel(1 << 20).unwrap();
         let spin = instance.get_typed_func::<(), ()>(&mut store, "spin").unwrap();

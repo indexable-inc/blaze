@@ -14,8 +14,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ComptimeUnsupported) -> Vec<Found>
     let form = d.form.syntax();
     // alloc: the message, for an error hir found
     let message = match d.feature_enabled {
-        false => format!("{form} is blaze's compile-time reflection, which needs `#![feature(blaze_comptime)]`"),
-        true => format!("{form} (`#![feature(blaze_comptime)]`) is not yet supported by blaze's type checker"),
+        false => format!(
+            "{form} is blaze's compile-time reflection, which needs `#![feature(blaze_comptime)]`"
+        ),
+        true => format!(
+            "{form} (`#![feature(blaze_comptime)]`) is not yet supported by blaze's type checker"
+        ),
     };
     let mut diag = Diag::error(None, message, cx.span_of(d.node));
     if !d.feature_enabled {

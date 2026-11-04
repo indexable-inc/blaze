@@ -54,14 +54,38 @@ const UP: usize = 64;
 /// `Iterator`'s adaptors a plain chain may have: each yields from the items of the iterator
 /// below, calling only the closures it is given.
 const ADAPTORS: &[&str] = &[
-    "map", "filter", "filter_map", "chain", "cloned", "copied", "enumerate", "zip", "rev", "skip", "take",
-    "step_by", "skip_while", "take_while", "map_while", "flat_map", "flatten",
+    "map",
+    "filter",
+    "filter_map",
+    "chain",
+    "cloned",
+    "copied",
+    "enumerate",
+    "zip",
+    "rev",
+    "skip",
+    "take",
+    "step_by",
+    "skip_while",
+    "take_while",
+    "map_while",
+    "flat_map",
+    "flatten",
 ];
 
 /// std's methods a plain chain may start from: each iterates what it is called on.
 const ROOTS: &[&str] = &[
-    "iter", "into_iter", "chars", "char_indices", "bytes", "keys", "values", "lines", "split_whitespace",
-    "windows", "chunks",
+    "iter",
+    "into_iter",
+    "chars",
+    "char_indices",
+    "bytes",
+    "keys",
+    "values",
+    "lines",
+    "split_whitespace",
+    "windows",
+    "chunks",
 ];
 
 /// What a collection is made of, for which uses ask the same of the iterator.
@@ -116,9 +140,15 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
         diagnostic.note(it.note);
         if let Some(part) = fix {
             // alloc: the fix's one part
-            diagnostic.multipart_suggestion("ask the iterator", vec![part], Applicability::MachineApplicable);
+            diagnostic.multipart_suggestion(
+                "ask the iterator",
+                vec![part],
+                Applicability::MachineApplicable,
+            );
         }
-        diagnostic.help(LINT.help()).help(format!("for further information visit {}", LINT.docs_url()));
+        diagnostic
+            .help(LINT.help())
+            .help(format!("for further information visit {}", LINT.docs_url()));
     }
 }
 
@@ -187,12 +217,20 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
         if exempt::exempt(cx.text(), collect_range, LINT) {
             continue;
         }
-        let collection = ty.as_adt().map_or_else(|| "collection".to_owned(), |it| it.name(db).as_str().to_owned());
+        let collection = ty
+            .as_adt()
+            .map_or_else(|| "collection".to_owned(), |it| it.name(db).as_str().to_owned());
         let (asked, instead) = match &use_ {
             Use::Ask("len", _) => ("for its `.len()`".to_owned(), "`.count()` counts the items"),
-            Use::Ask("is_empty", _) => ("for its `.is_empty()`".to_owned(), "`.next().is_none()` asks for one item"),
-            Use::Ask("first", _) => ("for its `.first()`".to_owned(), "`.next()` is the first item"),
-            Use::Ask(name, _) => (format!("for its `.{name}(..)`"), "`.any(|it| ..)` stops at the first match"),
+            Use::Ask("is_empty", _) => {
+                ("for its `.is_empty()`".to_owned(), "`.next().is_none()` asks for one item")
+            }
+            Use::Ask("first", _) => {
+                ("for its `.first()`".to_owned(), "`.next()` is the first item")
+            }
+            Use::Ask(name, _) => {
+                (format!("for its `.{name}(..)`"), "`.any(|it| ..)` stops at the first match")
+            }
             Use::Iterate => ("to be iterated once".to_owned(), "iterate the iterator itself"),
             Use::Passed(f) => (
                 format!("to be handed to `{f}`, which takes `impl IntoIterator`"),
@@ -210,8 +248,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
             (Use::Ask(name @ ("len" | "is_empty"), call), Made::Seq, true)
                 if cx.in_file() && walk.plain(receiver, *name == "len", 0) =>
             {
-                fix(analysis, receiver, *call, name)
-                    .map(|(range, receiver, suffix)| (range, format!("{}{suffix}", cx.snippet(receiver))))
+                fix(analysis, receiver, *call, name).map(|(range, receiver, suffix)| {
+                    (range, format!("{}{suffix}", cx.snippet(receiver)))
+                })
             }
             _ => None,
         };
@@ -229,7 +268,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
 fn made(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<Made> {
     let db = cx.db();
     let adt = ty.as_adt()?;
-    let item = |name: &str| cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt);
+    let item =
+        |name: &str| cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt);
     if item("Vec") || item("VecDeque") {
         return Some(Made::Seq);
     }
@@ -282,7 +322,11 @@ impl Walk<'_, '_> {
         let parent = self.parents.of_expr(collect)?;
         if let Expr::Block { statements, .. } = self.body.expr(parent) {
             let pat = statements.iter().find_map(|it| match it {
-                Statement::Let { pat, initializer: Some(init), else_branch: None, .. } if init == collect => Some(pat),
+                Statement::Let { pat, initializer: Some(init), else_branch: None, .. }
+                    if init == collect =>
+                {
+                    Some(pat)
+                }
                 _ => None,
             })?;
             let Pat::Bind { id: local, subpat: None } = self.body.pat(pat) else { return None };
@@ -304,7 +348,9 @@ impl Walk<'_, '_> {
         // alloc: the uses of one collected local, a few
         let mut uses = Vec::new();
         for (id, expr) in self.body.exprs() {
-            if matches!(expr, Expr::Path(_)) && local_of(self.db, self.def, self.body, id) == Some(local) {
+            if matches!(expr, Expr::Path(_))
+                && local_of(self.db, self.def, self.body, id) == Some(local)
+            {
                 uses.push(id);
             }
         }
@@ -358,7 +404,9 @@ impl Walk<'_, '_> {
                 let params = hir::Function::from(f).params_without_self(self.db);
                 let bounded = params.get(at).is_some_and(|it| self.into_iterator_param(it.ty()));
                 // alloc: a message's part
-                bounded.then(|| Use::Passed(FunctionSignature::of(self.db, f).name.as_str().to_owned()))
+                bounded.then(|| {
+                    Use::Passed(FunctionSignature::of(self.db, f).name.as_str().to_owned())
+                })
             }
             _ => None,
         }
@@ -380,12 +428,18 @@ impl Walk<'_, '_> {
 
     fn into_iterator_param(&self, ty: &hir::Type<'_>) -> bool {
         let Some(into_iterator) = self.into_iterator else { return false };
-        ty.as_type_param(self.db).is_some_and(|it| it.trait_bounds(self.db).contains(&into_iterator))
+        ty.as_type_param(self.db)
+            .is_some_and(|it| it.trait_bounds(self.db).contains(&into_iterator))
     }
 
     /// Whether a local the chain `receiver` reads is named again after the `collect` at
     /// `collected`, outside it.
-    fn read_again(&self, receiver: ExprId, collected: TextRange, analysis: &hir::BodyAnalysis<'_>) -> bool {
+    fn read_again(
+        &self,
+        receiver: ExprId,
+        collected: TextRange,
+        analysis: &hir::BodyAnalysis<'_>,
+    ) -> bool {
         // alloc: the locals of one chain, a few
         let mut read = Vec::new();
         let mut stack = vec![receiver]; // alloc: the expressions of one chain, walked once
@@ -401,9 +455,9 @@ impl Walk<'_, '_> {
         self.body.exprs().any(|(id, expr)| {
             matches!(expr, Expr::Path(_))
                 && local_of(self.db, self.def, self.body, id).is_some_and(|it| read.contains(&it))
-                && analysis
-                    .expr_range(id)
-                    .is_some_and(|it| !collected.contains_range(it) && it.start() > collected.start())
+                && analysis.expr_range(id).is_some_and(|it| {
+                    !collected.contains_range(it) && it.start() > collected.start()
+                })
         })
     }
 
@@ -430,7 +484,9 @@ impl Walk<'_, '_> {
             }
             let module = hir::Function::from(f).module(self.db);
             return ROOTS.contains(&name)
-                && ["core", "alloc", "std"].iter().any(|it| facts::crate_is(self.db, module.krate(self.db), it));
+                && ["core", "alloc", "std"]
+                    .iter()
+                    .any(|it| facts::crate_is(self.db, module.krate(self.db), it));
         }
         false
     }
@@ -482,7 +538,10 @@ fn keep(x: u32) -> bool { x > 2 }
         assert_eq!(found.matches(FOUND).count(), 3, "{found}");
         assert!(found.contains("only used for its `.len()`"), "{found}");
         assert!(found.contains("xs.iter().map(|x| x + 1).count()"), "the `len` is fixed:\n{found}");
-        assert!(found.contains("xs.iter().filter(|x| **x > 2).next().is_none()"), "the `is_empty` is fixed:\n{found}");
+        assert!(
+            found.contains("xs.iter().filter(|x| **x > 2).next().is_none()"),
+            "the `is_empty` is fixed:\n{found}"
+        );
         assert!(
             !found.contains("keep(**x)).next().is_none()"),
             "a closure that calls is not fixed to stop at the first item:\n{found}"
@@ -523,7 +582,10 @@ pub fn in_a_loop(xs: &[u32], n: u32) -> u32 {
 "#,
         );
         assert_eq!(found.matches(FOUND).count(), 1, "{found}");
-        assert!(found.contains("this `collect` into a `Vec` is only used to be iterated once"), "{found}");
+        assert!(
+            found.contains("this `collect` into a `Vec` is only used to be iterated once"),
+            "{found}"
+        );
     }
 
     #[test]

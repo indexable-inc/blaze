@@ -49,7 +49,9 @@ fn alias(db: &TestDB, name: &str) -> TypeAliasId {
     let found: Vec<TypeAliasId> = declarations(db)
         .into_iter()
         .filter_map(|def| match def {
-            ModuleDefId::TypeAliasId(it) if TypeAliasSignature::of(db, it).name.as_str() == name => {
+            ModuleDefId::TypeAliasId(it)
+                if TypeAliasSignature::of(db, it).name.as_str() == name =>
+            {
                 Some(it)
             }
             _ => None,
@@ -69,8 +71,7 @@ fn reflection_intrinsics_read_identity() {
         let class = classify(intrinsic);
         // `type_id_eq(a: TypeId, b: TypeId)` has no generic argument: it compares two values
         // whose identity the `type_id` calls that made them read.
-        if (name.starts_with("type_id") && name != "type_id_eq") || name.starts_with("type_name")
-        {
+        if (name.starts_with("type_id") && name != "type_id_eq") || name.starts_with("type_name") {
             assert_eq!(class, Class::Identity, "`{name}` tells types apart");
         }
         // `blaze_int_cast` is `as` between integers: its types' class and valid range.

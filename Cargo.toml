@@ -46,6 +46,8 @@ exclude = [
     # is its wasm implementation, built only there (vendor/libzstd-rs-sys/SOURCE.md).
     "vendor/zstd-sys",
     "vendor/libzstd-rs-sys",
+    # Patched below; its own tests and benches need dev-dependencies blaze has no use for.
+    "vendor/corosensei",
 ]
 resolver = "2"
 
@@ -161,9 +163,15 @@ unrecorded_span = "deny"
 # which drops an unknown field silently; AGENTS.md rule 3) is on through `internal` above, at
 # `warn`; other workspaces opt in.
 
-# llvm-sys's build script (vendor/llvm-sys/pin.rs) checks the pinned LLVM `nix develop` names.
-[workspace.metadata.blaze.sandbox]
-build-script-env = ["LLVM_SYS_231_PREFIX"]
+# The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
+# crates/hir-ty-codegen/llvm.json names for the target, checks its sha256, unpacks it read-only
+# under its home and sets LLVM_SYS_231_PREFIX to it for these build scripts, over any value the
+# shell has. llvm-sys's (vendor/llvm-sys/pin.rs) links it; blaze-stencil's makes its stencils with
+# it when `llvm-stencils` is on (the wasm seed builds it without, and asks for no LLVM).
+[workspace.metadata.blaze.native.llvm]
+pin = "crates/hir-ty-codegen/llvm.json"
+env = "LLVM_SYS_231_PREFIX"
+packages = ["llvm-sys", "blaze-stencil/llvm-stencils"]
 
 [workspace.package]
 version = "0.0.0"
@@ -258,6 +266,9 @@ wasmtime = { path = "vendor/wasmtime" }
 # rsasm's master after 0.1.3, which has aarch64's exclusive and LSE atomics that compiler_builtins'
 # outline atomics are written in (vendor/rsasm/SOURCE.md).
 rsasm = { path = "vendor/rsasm" }
+# For one release: its trampolines assembled from .S by cc, not `global_asm!`, which stage 0 drops
+# (#1659); removed when stage 0 is a release built after 8498b0dfc1 (vendor/corosensei/SOURCE.md).
+corosensei = { path = "vendor/corosensei" }
 
 [workspace.dependencies]
 # local crates
@@ -309,6 +320,7 @@ ix-prof = { path = "crates/ix-prof", default-features = false }
 blaze-explore = { path = "crates/blaze-explore" }
 blaze-web = { path = "crates/blaze-web" }
 blaze-protocol = { path = "crates/blaze-protocol" }
+blaze-report = { path = "crates/blaze-report" }
 blaze-serde = { path = "crates/blaze-serde" }
 blaze-serde-derive = { path = "crates/blaze-serde-derive" }
 blaze-ui = { path = "crates/blaze-ui" }

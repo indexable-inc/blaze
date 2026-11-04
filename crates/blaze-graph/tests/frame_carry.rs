@@ -23,7 +23,11 @@ const ROUNDS: usize = 16;
 const LONG: Duration = Duration::from_secs(60);
 
 fn message(panic: &(dyn std::any::Any + Send)) -> String {
-    panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned())).unwrap_or_default()
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned()))
+        .unwrap_or_default()
 }
 
 /// The innermost task's frame on this thread, by address.
@@ -44,7 +48,9 @@ fn a_task_that_resumes_on_another_thread_ends_on_that_thread() {
             return;
         }
     }
-    panic!("no job of {ROUNDS} rounds of {JOBS} resumed on another worker, so none crossed threads");
+    panic!(
+        "no job of {ROUNDS} rounds of {JOBS} resumed on another worker, so none crossed threads"
+    );
 }
 
 /// One round: how many of its jobs resumed on a worker other than the one they parked on.
@@ -67,14 +73,25 @@ fn round(pool: &Pool) -> usize {
                         let parked: ThreadId = thread::current().id();
                         parked_tx.send(()).unwrap();
                         waiter.wait().expect("an event's wait closes no cycle");
-                        assert_eq!(current(), inner, "the inner task's frame is current again where it resumed");
+                        assert_eq!(
+                            current(),
+                            inner,
+                            "the inner task's frame is current again where it resumed"
+                        );
                         thread::current().id() != parked
                     });
-                    assert_eq!(current(), outer, "the outer task's frame is current where the inner one ended");
+                    assert_eq!(
+                        current(),
+                        outer,
+                        "the outer task's frame is current where the inner one ended"
+                    );
                     frame::task(Tag::Other, |_| ());
                     moved
                 });
-                assert!(!frame::in_task(), "the outer task's end leaves no frame current where it ended");
+                assert!(
+                    !frame::in_task(),
+                    "the outer task's end leaves no frame current where it ended"
+                );
                 moved
             },
             move |it| _ = done_tx.send(it.map_err(|it| message(&*it))),

@@ -16,9 +16,10 @@ use intern::Symbol;
 
 use super::*;
 use crate::mir::eval::{
-    At, word_bytes,
+    At,
     machine::{Access, AtomicOrd, EvalThread},
     threads::Wait,
+    word_bytes,
 };
 
 /// The threads a run reports `available_parallelism` as: one, so libtest and thread pools run
@@ -430,7 +431,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let attr = self.attr_of(arg(0)?)?;
                 let state = self.uint_of(arg(1)?)?;
                 let target = self.target()?;
-                let Some(state) = target.os.detach_states().into_iter().find(|&it| u128::from(it) == state)
+                let Some(state) =
+                    target.os.detach_states().into_iter().find(|&it| u128::from(it) == state)
                 else {
                     return self.ret_int(destination, target.errno.inval.into()).map(|()| true);
                 };
@@ -745,7 +747,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let flags = self.uint_of(arg(2)?)? as u32;
                 let target = self.target()?;
                 if !matches!(size, 4 | 8) || flags & !OS_SYNC_SHARED != 0 {
-                    return self.fail(destination, Errors::Errno, target.errno.inval).map(|()| true);
+                    return self
+                        .fail(destination, Errors::Errno, target.errno.inval)
+                        .map(|()| true);
                 }
                 let count = if name == "os_sync_wake_by_address_any" { 1 } else { usize::MAX };
                 match self.wake(addr.to_usize(self.cached_ptr_size), u32::MAX, count)? {
@@ -860,7 +864,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let out = self.ptr_of(arg(1)?)?;
                 let target = self.target()?;
                 let Some(base) = target.os.clock_base(clock) else {
-                    return self.fail(destination, Errors::Errno, target.errno.inval).map(|()| true);
+                    return self
+                        .fail(destination, Errors::Errno, target.errno.inval)
+                        .map(|()| true);
                 };
                 let ns = base + self.now();
                 self.write_timespec(out, ns)?;
@@ -920,8 +926,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let page = self.target()?.page;
                 let mapped = self.heap_blocks.range(..=addr.offset).next_back().is_some_and(
                     |(&start, block)| {
-                        block.origin == Origin::Mmap
-                            && addr.offset + len <= start + block.size
+                        block.origin == Origin::Mmap && addr.offset + len <= start + block.size
                     },
                 );
                 let at = addr.to_usize(self.cached_ptr_size);
@@ -981,7 +986,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 if !pass.found || pass.pass + 1 >= DESTRUCTOR_ITERATIONS {
                     return None;
                 }
-                self.tls().destructors = DestructorPass { next_key: 0, pass: pass.pass + 1, found: false };
+                self.tls().destructors =
+                    DestructorPass { next_key: 0, pass: pass.pass + 1, found: false };
                 continue;
             }
             let key_id = pass.next_key;
@@ -1008,7 +1014,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         let cfg = self.crate_id.cfg_options(self.db);
         let is = |key: &str, value: &str| {
-            cfg.check_atom(&CfgAtom::KeyValue { key: Symbol::intern(key), value: Symbol::intern(value) })
+            cfg.check_atom(&CfgAtom::KeyValue {
+                key: Symbol::intern(key),
+                value: Symbol::intern(value),
+            })
         };
         let os = if is("target_os", "linux") || is("target_os", "android") {
             Os::Linux
@@ -1194,7 +1203,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 match flags & disable {
                     0 => {
                         let stack = self.read_pointer(new)?;
-                        let size = from_bytes!(usize, self.cached_ptr_size, self.read_memory(new.offset(size_at), word)?);
+                        let size = from_bytes!(
+                            usize,
+                            self.cached_ptr_size,
+                            self.read_memory(new.offset(size_at), word)?
+                        );
                         if size < target.os.minsigstksz() {
                             return self.fail(destination, Errors::Errno, target.errno.nomem);
                         }
@@ -1256,7 +1269,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.ret_int(destination, 0)
     }
 
-    fn exec_futex(&mut self, args: &[IntervalAndTy<'db>], destination: Interval) -> Result<'db, ()> {
+    fn exec_futex(
+        &mut self,
+        args: &[IntervalAndTy<'db>],
+        destination: Interval,
+    ) -> Result<'db, ()> {
         let arg = |i: usize| args.get(i).ok_or_else(|| missing("SYS_futex"));
         let target = self.target()?;
         let addr = self.ptr_of(arg(0)?)?;
@@ -1340,7 +1357,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             return self.fail(destination, errors, errno.timedout);
         }
         let resume = Resume::Wait { errors };
-        self.block_on(Wait::Shim { addr: addr.to_usize(self.cached_ptr_size), bitset, deadline, resume });
+        self.block_on(Wait::Shim {
+            addr: addr.to_usize(self.cached_ptr_size),
+            bitset,
+            deadline,
+            resume,
+        });
         Ok(())
     }
 
@@ -1352,10 +1374,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if M::CHECKS {
             self.machine.fence(AtomicOrd::SeqCst, false)?;
             let ptr = self.ptr(addr);
-            let access = Access::Atomic { ord: AtomicOrd::Relaxed, rmw: false, cxchg_failed: false };
+            let access =
+                Access::Atomic { ord: AtomicOrd::Relaxed, rmw: false, cxchg_failed: false };
             let shadow = self.machine.read(ptr, size as u64, size as u64, access)?;
             self.machine.require_init(&shadow, 0..size)?;
-            let older = self.machine.atomic_load(ptr, size as u64, AtomicOrd::Relaxed, &latest[..size])?;
+            let older =
+                self.machine.atomic_load(ptr, size as u64, AtomicOrd::Relaxed, &latest[..size])?;
             if let Some(older) = older {
                 latest[..size].copy_from_slice(&older);
             }
@@ -1364,7 +1388,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// Takes `mutex` for the running thread and gives `result`, or blocks until it can.
-    fn mutex_lock(&mut self, mutex: Address, result: i32, destination: Interval) -> Result<'db, ()> {
+    fn mutex_lock(
+        &mut self,
+        mutex: Address,
+        result: i32,
+        destination: Interval,
+    ) -> Result<'db, ()> {
         let mut state = self.mutex_get(mutex)?;
         let me = self.thread() + 1;
         if state.owner == 0 {
@@ -1395,7 +1424,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
         }
         let resume = Resume::MutexLock { mutex, result };
-        self.block_on(Wait::Shim { addr: mutex.to_usize(self.cached_ptr_size), bitset: u32::MAX, deadline: None, resume });
+        self.block_on(Wait::Shim {
+            addr: mutex.to_usize(self.cached_ptr_size),
+            bitset: u32::MAX,
+            deadline: None,
+            resume,
+        });
         Ok(())
     }
 
@@ -1559,7 +1593,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.poke_u32(cond.offset(layout.waiters), waiters + 1)?;
         self.mutex_unlock(mutex)?;
         let resume = Resume::CondWait { cond, mutex };
-        self.block_on(Wait::Shim { addr: cond.to_usize(self.cached_ptr_size), bitset: u32::MAX, deadline, resume });
+        self.block_on(Wait::Shim {
+            addr: cond.to_usize(self.cached_ptr_size),
+            bitset: u32::MAX,
+            deadline,
+            resume,
+        });
         Ok(())
     }
 
@@ -1567,13 +1606,16 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn semaphore_of(&self, arg: &IntervalAndTy<'db>) -> Result<'db, Address> {
         let semaphore = self.ptr_of(arg)?;
         let made = match semaphore.at() {
-            At::Heap(pos) => self.heap_blocks.get(&pos).is_some_and(|it| {
-                it.origin == Origin::Machine && it.size == 16
-            }),
+            At::Heap(pos) => self
+                .heap_blocks
+                .get(&pos)
+                .is_some_and(|it| it.origin == Origin::Machine && it.size == 16),
             _ => false,
         };
         if !made || from_bytes!(u64, self.peek_memory(semaphore.offset(8), 8)?) != SEMAPHORE_MAGIC {
-            not_supported!("a dispatch object that is not a semaphore dispatch_semaphore_create made")
+            not_supported!(
+                "a dispatch object that is not a semaphore dispatch_semaphore_create made"
+            )
         }
         Ok(semaphore)
     }

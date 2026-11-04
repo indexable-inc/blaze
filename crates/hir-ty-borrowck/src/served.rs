@@ -6,7 +6,6 @@ use std::sync::Arc;
 use base_db::{Crate, Db, all_crates};
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{
     DefWithBodyId, LoweringMode, expr_store::Body, nameres::demand::crate_body_owners,
     signatures::FunctionSignature,
@@ -15,6 +14,7 @@ use hir_expand::fixture;
 use hir_expand::name::Name;
 use hir_ty::{InferBodyId, check_cache, db::HirDatabase, infer_query_with_inspect};
 use hir_ty_mir::mir::lower_body_to_mir;
+use std::alloc::Global;
 
 use crate::checked;
 

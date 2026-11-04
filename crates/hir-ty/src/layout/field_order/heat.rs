@@ -252,7 +252,9 @@ impl Visit<'_, '_> {
     fn operand(&mut self, operand: &Operand) {
         match &operand.kind {
             OperandKind::Copy(place) | OperandKind::Move(place) => self.place(place),
-            OperandKind::Constant { .. } | OperandKind::Allocation { .. } | OperandKind::Static(_) => {}
+            OperandKind::Constant { .. }
+            | OperandKind::Allocation { .. }
+            | OperandKind::Static(_) => {}
         }
     }
 

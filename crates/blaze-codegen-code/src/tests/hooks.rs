@@ -32,7 +32,8 @@ pub(super) fn tokens(text: &str) -> Vec<Token> {
     let mut out = Vec::new();
     let mut at = 0;
     let n = chars.len();
-    let ahead = |at: usize, s: &str| s.chars().enumerate().all(|(i, c)| chars.get(at + i) == Some(&c));
+    let ahead =
+        |at: usize, s: &str| s.chars().enumerate().all(|(i, c)| chars.get(at + i) == Some(&c));
     while at < n {
         let c = chars[at];
         if c.is_whitespace() {
@@ -89,7 +90,8 @@ pub(super) fn tokens(text: &str) -> Vec<Token> {
             }
             let word: String = chars[start..at].iter().collect();
             // A raw string (`r"..."`, `r#"..."#`, `br#"..."#`), or a prefixed string or byte.
-            let raw = matches!(word.as_str(), "r" | "br" | "cr") && matches!(chars.get(at), Some('"' | '#'));
+            let raw = matches!(word.as_str(), "r" | "br" | "cr")
+                && matches!(chars.get(at), Some('"' | '#'));
             if raw {
                 let mut hashes = 0;
                 while chars.get(at) == Some(&'#') {
@@ -99,7 +101,10 @@ pub(super) fn tokens(text: &str) -> Vec<Token> {
                 if chars.get(at) == Some(&'"') {
                     let start = at + 1;
                     let mut end = start;
-                    while end < n && !(chars[end] == '"' && (1..=hashes).all(|i| chars.get(end + i) == Some(&'#'))) {
+                    while end < n
+                        && !(chars[end] == '"'
+                            && (1..=hashes).all(|i| chars.get(end + i) == Some(&'#')))
+                    {
                         end += 1;
                     }
                     out.push(Token::Str(chars[start..end.min(n)].iter().collect()));
@@ -237,7 +242,8 @@ pub(super) fn compiled(root: &Path) -> Vec<PathBuf> {
             continue;
         }
         out.push(file.clone());
-        let text = std::fs::read_to_string(&file).unwrap_or_else(|why| panic!("{}: {why}", file.display()));
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|why| panic!("{}: {why}", file.display()));
         let tokens = tokens(&text);
         let dir = file.parent().unwrap().to_path_buf();
         // Inline modules open at each brace depth, by name.
@@ -293,21 +299,30 @@ pub(super) fn compiled(root: &Path) -> Vec<PathBuf> {
                     attrs.clear();
                 }
                 Token::Punct(';') => attrs.clear(),
-                Token::Ident(word) if word == "include" && punct(tokens.get(at + 1), '!') && punct(tokens.get(at + 2), '(') => {
+                Token::Ident(word)
+                    if word == "include"
+                        && punct(tokens.get(at + 1), '!')
+                        && punct(tokens.get(at + 2), '(') =>
+                {
                     if let Some(Token::Str(path)) = tokens.get(at + 3) {
                         let included = dir.join(path);
                         if included.is_file() {
-                            stack.push((included.clone(), included.parent().unwrap().to_path_buf()));
+                            stack
+                                .push((included.clone(), included.parent().unwrap().to_path_buf()));
                         }
                     }
                 }
                 Token::Ident(word) if word == "mod" => {
-                    let test = attrs.iter().any(|it| it == "[cfg(test)]" || it.starts_with("[cfg(all(test,"));
+                    let test = attrs
+                        .iter()
+                        .any(|it| it == "[cfg(test)]" || it.starts_with("[cfg(all(test,"));
                     let Some(Token::Ident(name)) = tokens.get(at + 1) else {
                         at += 1;
                         continue;
                     };
-                    let path = attrs.iter().find_map(|it| it.strip_prefix("[path=\"")?.strip_suffix("\"]").map(str::to_owned));
+                    let path = attrs.iter().find_map(|it| {
+                        it.strip_prefix("[path=\"")?.strip_suffix("\"]").map(str::to_owned)
+                    });
                     match tokens.get(at + 2) {
                         Some(Token::Punct(';')) if !test => {
                             let mut under = base.clone();
@@ -317,13 +332,18 @@ pub(super) fn compiled(root: &Path) -> Vec<PathBuf> {
                             let candidates = match &path {
                                 Some(path) if inline.is_empty() => vec![dir.join(path)],
                                 Some(path) => vec![under.join(path)],
-                                None => vec![under.join(format!("{name}.rs")), under.join(name).join("mod.rs")],
+                                None => vec![
+                                    under.join(format!("{name}.rs")),
+                                    under.join(name).join("mod.rs"),
+                                ],
                             };
                             let found = candidates.iter().find(|it| it.is_file()).unwrap_or_else(|| {
                                 panic!("{} declares `mod {name};`, and none of {candidates:?} is there", file.display())
                             });
                             let own = found.parent().unwrap().join(found.file_stem().unwrap());
-                            let base = if found.file_name().is_some_and(|it| it == "mod.rs") || path.is_some() {
+                            let base = if found.file_name().is_some_and(|it| it == "mod.rs")
+                                || path.is_some()
+                            {
                                 found.parent().unwrap().to_path_buf()
                             } else {
                                 own
@@ -370,7 +390,11 @@ pub(super) fn roots(dir: &Path, program: bool) -> Vec<PathBuf> {
     let text = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
     let manifest: toml::Table = text.parse().unwrap();
     let mut out = Vec::new();
-    let lib = manifest.get("lib").and_then(|it| it.get("path")).and_then(toml::Value::as_str).unwrap_or("src/lib.rs");
+    let lib = manifest
+        .get("lib")
+        .and_then(|it| it.get("path"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("src/lib.rs");
     if dir.join(lib).is_file() {
         out.push(dir.join(lib));
     }
@@ -439,17 +463,25 @@ fn unreviewed(identities: &[&Identity]) -> Vec<String> {
             }
         }
         let mut found = BTreeSet::new();
-        for package in linked.iter().filter(|it| checkout.contains_key(it.as_str()) && !closure.contains(*it)) {
+        for package in
+            linked.iter().filter(|it| checkout.contains_key(it.as_str()) && !closure.contains(*it))
+        {
             let built_from = workspace.built_from_names(package).unwrap();
             for (file, traits) in &scanned[package.as_str()] {
                 for name in &traits.implemented {
                     let Some(defined_in) = hooks.get(name) else { continue };
                     // A trait of the same name it is not built from is another trait.
-                    if !defined_in.is_empty() && !defined_in.iter().any(|it| built_from.contains(it) && it != package) {
+                    if !defined_in.is_empty()
+                        && !defined_in.iter().any(|it| built_from.contains(it) && it != package)
+                    {
                         continue;
                     }
                     found.insert((package.clone(), name.clone()));
-                    if !identity.reviewed.iter().any(|it| it.package == package.as_str() && it.hook == name.as_str()) {
+                    if !identity
+                        .reviewed
+                        .iter()
+                        .any(|it| it.package == package.as_str() && it.hook == name.as_str())
+                    {
                         problems.push(format!(
                             "{}: {package} implements `{name}`, a hook of {}: add its package to its roots, or review \
                              it into its reviewed hooks",
@@ -463,10 +495,16 @@ fn unreviewed(identities: &[&Identity]) -> Vec<String> {
         let stale: Vec<&Hook> = identity
             .reviewed
             .iter()
-            .filter(|it| linked.contains(it.package) && !found.contains(&(it.package.to_owned(), it.hook.to_owned())))
+            .filter(|it| {
+                linked.contains(it.package)
+                    && !found.contains(&(it.package.to_owned(), it.hook.to_owned()))
+            })
             .collect();
         for hook in stale {
-            problems.push(format!("{}: reviewed hook no longer implemented past its closure: {hook:?}", identity.what));
+            problems.push(format!(
+                "{}: reviewed hook no longer implemented past its closure: {hook:?}",
+                identity.what
+            ));
         }
     }
     problems
@@ -502,5 +540,8 @@ fn an_impl_names_its_trait_and_a_fixture_string_names_none() {
     let traits = traits(&tokens(text));
     assert_eq!(traits.implemented, ["BodyFacts", "Lookup", "Prepare", "Send", "Last"]);
     assert_eq!(traits.defined, ["Hook".to_owned()].into_iter().collect());
-    assert_eq!(traits.dyns, ["Hooked".to_owned(), "Shown".to_owned(), "Fn".to_owned()].into_iter().collect());
+    assert_eq!(
+        traits.dyns,
+        ["Hooked".to_owned(), "Shown".to_owned(), "Fn".to_owned()].into_iter().collect()
+    );
 }

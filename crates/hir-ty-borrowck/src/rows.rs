@@ -351,7 +351,10 @@ pub(super) enum Edge<'e> {
     /// Only the bits of the mask, a row's length, cross.
     Mask(&'e [u64]),
     /// `(set & !kill) | gen`, by word: a row of [`Effects`].
-    Effect { words: &'e [u32], bits: &'e [[u64; 2]] },
+    Effect {
+        words: &'e [u32],
+        bits: &'e [[u64; 2]],
+    },
 }
 
 impl Edge<'_> {

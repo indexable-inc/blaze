@@ -15,19 +15,26 @@ use std::path::Path;
 fn the_front_end_identity_hashes_every_input_the_front_end_read() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     // As blaze-engine's build script reads it: the program that runs the front end.
-    let workspace = blaze_codegen_code::Workspace::read(&manifest_dir.join("../blaze-engine")).unwrap();
+    let workspace =
+        blaze_codegen_code::Workspace::read(&manifest_dir.join("../blaze-engine")).unwrap();
     let mut env = std::collections::BTreeMap::new();
     for name in ["TARGET", "HOST"] {
         env.insert(name.to_owned(), blaze_codegen_code::coverage::host().to_owned());
     }
     let build = blaze_codegen_code::BuildEnv::of(&env);
-    let worked = blaze_codegen_code::work_out_of(&workspace, &blaze_codegen_code::FRONT_END, &build).unwrap();
+    let worked =
+        blaze_codegen_code::work_out_of(&workspace, &blaze_codegen_code::FRONT_END, &build)
+            .unwrap();
     for krate in ["hir_def", "hir_ty", "blaze_macro_eval", "blaze_diagnostics"] {
         assert!(worked.crates.contains(krate), "{krate} is of the front end: {:?}", worked.crates);
     }
-    let made = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().expect("the target directory above CARGO_TARGET_TMPDIR");
+    let made = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .expect("the target directory above CARGO_TARGET_TMPDIR");
     let exe = std::env::current_exe().unwrap();
-    blaze_codegen_code::coverage::hold(&workspace, &worked, made, &exe).unwrap().assert_covered("the front end");
+    blaze_codegen_code::coverage::hold(&workspace, &worked, made, &exe)
+        .unwrap()
+        .assert_covered("the front end");
 }
 
 /// What the record's code identity is of covers every file and variable rustc read building
@@ -38,7 +45,8 @@ fn the_front_end_identity_hashes_every_input_the_front_end_read() {
 #[test]
 fn the_record_identity_hashes_every_input_what_makes_a_record_read() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace = blaze_codegen_code::Workspace::read(&manifest_dir.join("../blaze-engine")).unwrap();
+    let workspace =
+        blaze_codegen_code::Workspace::read(&manifest_dir.join("../blaze-engine")).unwrap();
     // cargo gives every build script `DEBUG`, `OPT_LEVEL` and `PROFILE`, which the identity keys
     // as how blaze is built; ring's build script says it reads `DEBUG`.
     let mut env = std::collections::BTreeMap::new();
@@ -49,16 +57,26 @@ fn the_record_identity_hashes_every_input_what_makes_a_record_read() {
         env.insert(name.to_owned(), value.to_owned());
     }
     let build = blaze_codegen_code::BuildEnv::of(&env);
-    let worked = blaze_codegen_code::work_out_of(&workspace, &blaze_codegen_code::RECORD, &build).unwrap();
+    let worked =
+        blaze_codegen_code::work_out_of(&workspace, &blaze_codegen_code::RECORD, &build).unwrap();
     for krate in ["blaze_cargo", "blaze_lints", "blaze_link", "hir_ty_codegen", "hir_def"] {
         assert!(worked.crates.contains(krate), "{krate} makes a record: {:?}", worked.crates);
     }
     for cut in blaze_codegen_code::RECORD_CUT {
-        assert!(!worked.packages.contains(cut.package), "{} is cut: {:?}", cut.package, worked.packages);
+        assert!(
+            !worked.packages.contains(cut.package),
+            "{} is cut: {:?}",
+            cut.package,
+            worked.packages
+        );
     }
-    let made = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().expect("the target directory above CARGO_TARGET_TMPDIR");
+    let made = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .expect("the target directory above CARGO_TARGET_TMPDIR");
     let exe = std::env::current_exe().unwrap();
-    blaze_codegen_code::coverage::hold(&workspace, &worked, made, &exe).unwrap().assert_covered("what makes a record");
+    blaze_codegen_code::coverage::hold(&workspace, &worked, made, &exe)
+        .unwrap()
+        .assert_covered("what makes a record");
 }
 
 /// Every file of the vendored trait solver is an input of the front end's code identity, so of
@@ -70,7 +88,9 @@ fn the_record_identity_hashes_every_input_what_makes_a_record_read() {
 #[test]
 fn the_front_end_identity_hashes_every_vendored_solver_file_and_patch() {
     fn files_under(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap_or_else(|why| panic!("listing {}: {why}", dir.display())) {
+        for entry in
+            std::fs::read_dir(dir).unwrap_or_else(|why| panic!("listing {}: {why}", dir.display()))
+        {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 files_under(&path, out);
@@ -81,17 +101,30 @@ fn the_front_end_identity_hashes_every_vendored_solver_file_and_patch() {
     }
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace = blaze_codegen_code::Workspace::read(&manifest_dir.join("../blaze-engine")).unwrap();
-    let worked =
-        blaze_codegen_code::work_out_of(&workspace, &blaze_codegen_code::FRONT_END, &blaze_codegen_code::BuildEnv::default())
-            .unwrap();
+    let workspace =
+        blaze_codegen_code::Workspace::read(&manifest_dir.join("../blaze-engine")).unwrap();
+    let worked = blaze_codegen_code::work_out_of(
+        &workspace,
+        &blaze_codegen_code::FRONT_END,
+        &blaze_codegen_code::BuildEnv::default(),
+    )
+    .unwrap();
     let mut on_disk = vec![workspace.root.join("harness/toolchain")];
     for krate in ["rustc_next_trait_solver", "rustc_type_ir", "rustc_type_ir_macros"] {
         files_under(&workspace.root.join("vendor").join(krate), &mut on_disk);
     }
-    let patches = on_disk.iter().filter(|it| it.extension().is_some_and(|ext| ext == "patch")).count();
+    let patches =
+        on_disk.iter().filter(|it| it.extension().is_some_and(|ext| ext == "patch")).count();
     assert!(patches >= 2, "the vendored solver has patches: found {patches} under vendor/");
-    let missing: Vec<String> =
-        on_disk.iter().filter(|it| !worked.files.contains(*it)).map(|it| it.display().to_string()).collect();
-    assert!(missing.is_empty(), "the front end's code identity misses {} solver file(s): {}", missing.len(), missing.join(", "));
+    let missing: Vec<String> = on_disk
+        .iter()
+        .filter(|it| !worked.files.contains(*it))
+        .map(|it| it.display().to_string())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the front end's code identity misses {} solver file(s): {}",
+        missing.len(),
+        missing.join(", ")
+    );
 }

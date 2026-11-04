@@ -751,7 +751,9 @@ mod tests {
                 names.push(Symbol::intern(&near));
             }
         }
-        names.extend(["", "derive", "macro_rules", "rustc_", "not_an_attribute"].map(Symbol::intern));
+        names.extend(
+            ["", "derive", "macro_rules", "rustc_", "not_an_attribute"].map(Symbol::intern),
+        );
         names.extend([sym::self_, sym::fn_, sym::sized, sym::Integer::get(7)]);
         for name in &names {
             assert_eq!(find_builtin_attr_idx(name), by_text(name), "{name:?}");

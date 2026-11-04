@@ -83,7 +83,9 @@ fn a_diagnostic_is_read_where_it_lies() {
     let ResponseRef::Diagnostic(lent) = read.body else { panic!("{:?}", read.body) };
     let within = item.as_ptr_range();
     let unit = lent.unit.unwrap();
-    for text in [lent.message, lent.rendered, unit.package_id, unit.target.name, lent.explanation.unwrap()] {
+    for text in
+        [lent.message, lent.rendered, unit.package_id, unit.target.name, lent.explanation.unwrap()]
+    {
         assert!(within.contains(&text.as_ptr()), "{text}");
     }
     assert_eq!(lent.spans.len(), 2);
@@ -133,7 +135,6 @@ fn a_streamed_response_read_in_place_allocates_nothing() {
             executable: 1,
         }),
         Response::Ran { code: Some(0), stderr: b"warn\n".to_vec(), stdout: b"hi\n".to_vec() },
-        Response::Error(ApiError::new("no such head", Some("main".to_owned()))),
         Response::Done { ok: false },
     ];
     let mut stream = Vec::new();
@@ -154,13 +155,16 @@ fn a_streamed_response_read_in_place_allocates_nothing() {
                     let kinds = it.unit.map_or(0, |unit| unit.target.kinds().count());
                     it.rendered.len() + spans + children + facts + kinds
                 }
-                ResponseRef::UnitEnded(it) => it.package_id.len() + it.target.crate_types.iter().count(),
+                ResponseRef::UnitEnded(it) => {
+                    it.package_id.len() + it.target.crate_types.iter().count()
+                }
                 ResponseRef::Unit(it) => it.name.len() + it.package as usize,
                 ResponseRef::Fetched { what, .. } => what.len(),
-                ResponseRef::BuildScript(it) => it.env.iter().count() + it.cfgs.iter().map(str::len).sum::<usize>(),
+                ResponseRef::BuildScript(it) => {
+                    it.env.iter().count() + it.cfgs.iter().map(str::len).sum::<usize>()
+                }
                 ResponseRef::TestResult(it) => it.output.len() + it.executable as usize,
                 ResponseRef::Ran { stderr, stdout, .. } => stderr.len() + stdout.len(),
-                ResponseRef::Error(it) => it.what.len(),
                 ResponseRef::Done { ok } => usize::from(ok),
                 other => panic!("{other:?}"),
             };
@@ -168,9 +172,10 @@ fn a_streamed_response_read_in_place_allocates_nothing() {
         read
     };
     let first = round();
-    let again = blaze_alloc_count::assert_at_most(0, "a warm read of streamed responses in place", || {
-        (0..50).map(|_| round()).sum::<usize>()
-    });
+    let again =
+        blaze_alloc_count::assert_at_most(0, "a warm read of streamed responses in place", || {
+            (0..50).map(|_| round()).sum::<usize>()
+        });
     assert_eq!(again, 50 * first);
 }
 

@@ -36,9 +36,9 @@ use std::{fmt, net::SocketAddr};
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, FileName, Tag};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_protocol::cbor;
+use std::alloc::Global;
 
 use crate::{
     ApiError, Arrived, Envelope, LONGEST_REQUEST, Reply, Request, RequestRef, Response,
@@ -202,7 +202,11 @@ pub struct Unsent {
 impl fmt::Display for Abandoned {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Abandoned { conns, unsent_bytes } = self;
-        write!(f, "hung up on {} connection(s) with {unsent_bytes} bytes of replies unsent", conns.len())?;
+        write!(
+            f,
+            "hung up on {} connection(s) with {unsent_bytes} bytes of replies unsent",
+            conns.len()
+        )?;
         for (at, Unsent { conn, bytes, last_request }) in conns.iter().enumerate() {
             let sep = if at == 0 { ": " } else { ", " };
             write!(f, "{sep}connection {} ({bytes} bytes", conn.0)?;
@@ -259,7 +263,10 @@ impl Server {
         }
         if listens && config.local {
             // alloc: error path, at start.
-            server.fail("the API server takes this process's requests only when it listens on nothing".to_owned());
+            server.fail(
+                "the API server takes this process's requests only when it listens on nothing"
+                    .to_owned(),
+            );
         }
         match config.unix {
             Some(Unix::Bind(name)) => server.listen(Side::Unix, Address::Unix(name), effects),
@@ -372,7 +379,8 @@ impl Server {
         let mut conns: Vec<Conn> = self.conns.keys().copied().collect();
         radix::sort_copy_by_key(&mut conns, |it| it.0);
         for conn in conns {
-            let unsent = |it: &Connection| it.sending.is_some() || (it.local && !it.queue.is_empty());
+            let unsent =
+                |it: &Connection| it.sending.is_some() || (it.local && !it.queue.is_empty());
             match self.conns.get(&conn).is_some_and(unsent) {
                 true => self.close(conn),
                 false => self.gone(conn, effects),
@@ -407,8 +415,17 @@ impl Server {
     /// `bytes` this process sent on its connection `conn`, in the Unix socket's frames: each
     /// whole request is handed over in `arrived`, and what is no request answered on `conn`, as
     /// a socket's would be. Bytes for a connection that is gone or closing are dropped.
-    pub fn send_local(&mut self, conn: Conn, bytes: &[u8], effects: &mut Vec<Effect>, arrived: &mut Vec<Arrived>) {
-        if let Some(Connection { reader: Reader::Unix(frames), local: true, closing: false, .. }) = self.conns.get_mut(&conn) {
+    pub fn send_local(
+        &mut self,
+        conn: Conn,
+        bytes: &[u8],
+        effects: &mut Vec<Effect>,
+        arrived: &mut Vec<Arrived>,
+    ) {
+        if let Some(Connection {
+            reader: Reader::Unix(frames), local: true, closing: false, ..
+        }) = self.conns.get_mut(&conn)
+        {
             frames.push(bytes);
             self.unix_items(conn, effects);
         }
@@ -418,8 +435,15 @@ impl Server {
     /// What was replied on this process's connection `conn` since it was last taken, its
     /// frames appended to `into`; `false` once the connection is gone, its replies all taken.
     /// A connection a stop closed is gone once they are.
-    pub fn take_local(&mut self, conn: Conn, into: &mut Vec<u8>, effects: &mut Vec<Effect>) -> bool {
-        let Some(connection) = self.conns.get_mut(&conn).filter(|it| it.local) else { return false };
+    pub fn take_local(
+        &mut self,
+        conn: Conn,
+        into: &mut Vec<u8>,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        let Some(connection) = self.conns.get_mut(&conn).filter(|it| it.local) else {
+            return false;
+        };
         into.extend_from_slice(&connection.queue);
         connection.queue.clear();
         if connection.closing {
@@ -713,9 +737,9 @@ impl Server {
             }
             return;
         }
-        let json = request
-            .header("Accept")
-            .is_some_and(|accept| media_is(Some(accept), &["application/json", "application/x-ndjson"]));
+        let json = request.header("Accept").is_some_and(|accept| {
+            media_is(Some(accept), &["application/json", "application/x-ndjson"])
+        });
         let kind = if json { "application/x-ndjson" } else { "application/cbor" };
         let Some(Connection { reader: Reader::Http { answering, .. }, queue, .. }) =
             self.conns.get_mut(&conn)

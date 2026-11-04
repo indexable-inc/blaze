@@ -34,7 +34,9 @@ of HTTP/3 at the transport is not tried again (below).
 ## HTTP/3
 
 `net.http3` in blaze's user configuration, `config.toml` in blaze's home (`$BLAZE_HOME`, else
-`~/.blaze`), says when a request goes over HTTP/3:
+`~/.blaze`), says when a request goes over HTTP/3. The file is found and read in one place,
+`crates/blaze-manifest/src/user_config.rs`, which `[update]` (docs/install.md, "Updates") is read
+through too:
 
 ```toml
 [net]

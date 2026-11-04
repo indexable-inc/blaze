@@ -143,7 +143,11 @@ impl WasmType {
             format::ValType::F64 => WasmType::F64,
             format::ValType::V128 => WasmType::V128,
             // alloc: an error
-            other => return Err(format!("wasm: a {other:?} in a signature, which Rust code has none of")),
+            other => {
+                return Err(format!(
+                    "wasm: a {other:?} in a signature, which Rust code has none of"
+                ));
+            }
         })
     }
 }
@@ -2918,14 +2922,23 @@ mod tests {
         let pair = WasmSignature { params: vec![WasmType::I64, WasmType::I64], results: vec![] };
         WasmFunction {
             signature: WasmSignature {
-                params: vec![WasmType::I32, WasmType::I64, WasmType::F32, WasmType::F64, WasmType::V128],
+                params: vec![
+                    WasmType::I32,
+                    WasmType::I64,
+                    WasmType::F32,
+                    WasmType::F64,
+                    WasmType::V128,
+                ],
                 results: vec![WasmType::I32],
             },
             types: vec![pair, WasmSignature { params: vec![], results: vec![WasmType::F64] }],
             type_fixups: vec![(7, 1), (300, 0)],
             stack_pointer_fixups: vec![1, 200],
             // One local declaration, `global.get` of a padded index, `call_indirect`, `end`.
-            body: vec![1, 2, 0x7f, 0x23, 0x80, 0x80, 0x80, 0x80, 0x00, 0x11, 0x81, 0x80, 0x80, 0x80, 0x00, 0x00, 0x0b],
+            body: vec![
+                1, 2, 0x7f, 0x23, 0x80, 0x80, 0x80, 0x80, 0x00, 0x11, 0x81, 0x80, 0x80, 0x80, 0x00,
+                0x00, 0x0b,
+            ],
         }
     }
 
@@ -2995,8 +3008,12 @@ mod tests {
         assert_eq!(through(&[types::F32, types::F32]), [(0, Class::F32), (4, Class::F32)]);
         assert_eq!(through(&[types::I128]), [(0, Class::Pair)]);
         for address in [Address::Bits32, Address::Bits64] {
-            let signature = WasmSignature::of(&returning(&[types::I8, types::I32]), address).unwrap();
-            assert_eq!(signature, WasmSignature { params: vec![address.wasm(), WasmType::I32], results: vec![] });
+            let signature =
+                WasmSignature::of(&returning(&[types::I8, types::I32]), address).unwrap();
+            assert_eq!(
+                signature,
+                WasmSignature { params: vec![address.wasm(), WasmType::I32], results: vec![] }
+            );
         }
         assert_eq!(Returned::of(&returning(&[types::I64])).unwrap(), Returned::Value(Class::Long));
     }

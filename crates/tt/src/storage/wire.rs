@@ -202,7 +202,11 @@ impl Tree {
         for &id in columns.symbols {
             out.extend_from_slice(symbol(id).as_str().as_bytes());
         }
-        debug_assert_eq!(out.len(), base + 4 * words + symbol_bytes, "the rows are the words counted");
+        debug_assert_eq!(
+            out.len(),
+            base + 4 * words + symbol_bytes,
+            "the rows are the words counted"
+        );
         out.resize(end_of_tree, 0);
     }
 }
@@ -331,10 +335,8 @@ impl<A: Allocator> TopSubtree<A> {
             return malformed("a symbol ending inside a char", at);
         }
         words.pad()?;
-        let total = HEADER
-            + 2 * (2 * nodes_len + subtrees)
-            + 3 * (wide_len + parts_len)
-            + symbols_len;
+        let total =
+            HEADER + 2 * (2 * nodes_len + subtrees) + 3 * (wide_len + parts_len) + symbols_len;
         if u32::try_from(total).is_err() {
             return malformed("a tree of 2^32 words or more", 0);
         }
@@ -722,7 +724,10 @@ impl<'a> Words<'a> {
         let at = self.read.at();
         let bytes = self.bytes(count.saturating_mul(size_of::<T>()))?;
         if !bytes.as_ptr().addr().is_multiple_of(align_of::<T>()) {
-            return Err(WireError::Malformed { what: "bytes not starting at a 4-byte boundary", at });
+            return Err(WireError::Malformed {
+                what: "bytes not starting at a 4-byte boundary",
+                at,
+            });
         }
         Ok(<[T]>::ref_from_bytes(bytes).expect("whole rows at their alignment"))
     }

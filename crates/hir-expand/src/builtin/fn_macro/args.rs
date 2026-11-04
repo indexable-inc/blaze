@@ -66,10 +66,12 @@ impl<'t> Arg<'t> {
     /// The literal of `-` and a literal, rustc's `ExprKind::Unary(UnOp::Neg, ..)` of one.
     pub(super) fn negated_literal(&self) -> Option<tt::Literal> {
         match self.tokens.iter().collect_array() {
-            Some([
-                TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: '-', .. })),
-                TtElement::Leaf(tt::Leaf::Literal(lit)),
-            ]) => Some(lit),
+            Some(
+                [
+                    TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: '-', .. })),
+                    TtElement::Leaf(tt::Leaf::Literal(lit)),
+                ],
+            ) => Some(lit),
             _ => None,
         }
     }
@@ -114,11 +116,7 @@ fn is_comma(element: &TtElement<'_>) -> bool {
 }
 
 /// The expression `iter` starts with, as rustc's `parse_expr` takes it.
-fn expr<'t>(
-    db: &Db,
-    iter: &mut TtIter<'t>,
-    delim_span: DelimSpan,
-) -> Result<Arg<'t>, ExpandError> {
+fn expr<'t>(db: &Db, iter: &mut TtIter<'t>, delim_span: DelimSpan) -> Result<Arg<'t>, ExpandError> {
     let at = iter.next_span().unwrap_or(delim_span.close);
     let mbe::ValueResult { value, err } =
         expect_fragment(db, iter, parser::PrefixEntryPoint::Expr, delim_span);
@@ -237,10 +235,7 @@ pub(super) enum Array<'t> {
 }
 
 /// The array `arg` is, if it is one.
-pub(super) fn array<'t>(
-    db: &Db,
-    arg: &Arg<'t>,
-) -> Option<Result<Array<'t>, ExpandError>> {
+pub(super) fn array<'t>(db: &Db, arg: &Arg<'t>) -> Option<Result<Array<'t>, ExpandError>> {
     let (subtree, mut iter) = arg.bracketed()?;
     let delim_span = subtree.delimiter.delim_span();
     let mut elements = SmallVec::new();
@@ -420,10 +415,10 @@ fn float<'a>(
                 .help("valid widths are 32 and 64"))
         }
         // alloc: an error's message, on the error path
-        Some(suffix) => Err(BuiltinError::new(format!(
-            "invalid suffix `{suffix}` for float literal"
-        ))
-        .help("valid suffixes are `f32` and `f64`")),
+        Some(suffix) => {
+            Err(BuiltinError::new(format!("invalid suffix `{suffix}` for float literal"))
+                .help("valid suffixes are `f32` and `f64`"))
+        }
     }
 }
 

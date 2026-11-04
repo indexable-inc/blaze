@@ -494,7 +494,12 @@ impl<'f> Side<'f> {
     /// The label of library rodata entry `entry` for the field of `form` at `at`, placed once
     /// unless out of that field's reach, as [`Side::konst`]. A function uses a few entries
     /// (float masks and bounds), so a scan of the ones placed beats a map.
-    fn rodata(&mut self, buf: &mut Buf<'_>, entry: u32, (at, form, addend): (u32, enc::Form, i64)) -> Label {
+    fn rodata(
+        &mut self,
+        buf: &mut Buf<'_>,
+        entry: u32,
+        (at, form, addend): (u32, enc::Form, i64),
+    ) -> Label {
         if let Some(&(_, label)) = self.rodata.iter().rev().find(|it| it.0 == entry)
             && !buf.placed_out_of_reach(at, form, label, addend)
         {
@@ -528,7 +533,12 @@ impl<'f> Side<'f> {
     }
 
     /// The call sites with their handlers, now that every edge's label is bound.
-    fn finish_calls(&mut self, func: &ir::Function, plan: &Plan<'_>, buf: &Buf<'_>) -> Result<(), Error> {
+    fn finish_calls(
+        &mut self,
+        func: &ir::Function,
+        plan: &Plan<'_>,
+        buf: &Buf<'_>,
+    ) -> Result<(), Error> {
         buf::sort_by_key_in_place(&mut self.sites, |it| it.0);
         for &(ret, inst) in &self.sites {
             let first = self.handlers.len() as u32;
@@ -589,7 +599,11 @@ pub fn survey<A: Glue>(func: &ir::Function, target: &Target, library: &Library) 
 }
 
 /// [`survey`] from a library's reader.
-pub(crate) fn survey_in<A: Glue>(func: &ir::Function, target: &Target, reader: &Reader<'_>) -> Vec<Error> {
+pub(crate) fn survey_in<A: Glue>(
+    func: &ir::Function,
+    target: &Target,
+    reader: &Reader<'_>,
+) -> Vec<Error> {
     // alloc: once per function surveyed, its refusals.
     let mut out = Vec::new();
     if func.layout.entry_block().is_none() {
@@ -623,7 +637,8 @@ pub(crate) fn compile_in<A: Glue, R>(
         return Err(Error::new("a function with no blocks"));
     }
     frame::task(Tag::Codegen, |temp| -> Result<R, Error> {
-        let (mut buf, mut plan, mut side) = (Buf::new_in(temp), Plan::new_in(temp), Side::new_in(temp));
+        let (mut buf, mut plan, mut side) =
+            (Buf::new_in(temp), Plan::new_in(temp), Side::new_in(temp));
         let (buf, plan, side) = (&mut buf, &mut plan, &mut side);
         scan::run(plan, func)?;
         select::run::<A>(plan, func, target, library)?;
@@ -639,9 +654,8 @@ pub(crate) fn compile_in<A: Glue, R>(
         let unwind = A::unwind(&mut Cx { buf, func, target, frame: &frame, plan, side })?;
         side.finish_calls(func, plan, buf)?;
         let (base, delta) = A::slot_base(&frame);
-        side.offsets.extend(
-            func.sized_stack_slots.keys().map(|slot| delta + plan.stack_slot(slot) as i32),
-        );
+        side.offsets
+            .extend(func.sized_stack_slots.keys().map(|slot| delta + plan.stack_slot(slot) as i32));
         buf.sort_relocs();
         let unwind = unwind.map(|kind| match kind {
             UnwindKind::Dwarf { len } => UnwindRef::Dwarf { len, rows: &side.rows },

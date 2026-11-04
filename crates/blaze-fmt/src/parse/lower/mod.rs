@@ -563,10 +563,7 @@ impl<'a> Lower<'a> {
             (Some(lo), Some(hi)) => lo.to(hi),
             _ => self.nsp(list.syntax()),
         };
-        let args = list
-            .generic_args()
-            .map(|arg| self.angle_arg(arg))
-            .collect();
+        let args = list.generic_args().map(|arg| self.angle_arg(arg)).collect();
         ast::GenericArgs::AngleBracketed(ast::AngleBracketedArgs { span, args })
     }
 
@@ -1127,10 +1124,7 @@ impl<'a> Lower<'a> {
             .map(|l| l.generic_params().map(|g| self.generic_param(g)).collect())
             .unwrap_or_default();
         let constness = if let Some(t) = b.tilde_token() {
-            let c = b
-                .const_token()
-                .map(|c| self.tsp(c))
-                .unwrap_or(self.tsp(t));
+            let c = b.const_token().map(|c| self.tsp(c)).unwrap_or(self.tsp(t));
             ast::BoundConstness::Maybe(self.tsp(t).to(c))
         } else if let Some(l) = b.l_brack_token() {
             let r = b

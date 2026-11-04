@@ -23,11 +23,8 @@ pub(crate) fn derive_struct_generator(input: &DeriveInput, data: &syn::DataStruc
 
     let (field_names, is_tuple): (Vec<syn::Ident>, bool) = match &data.fields {
         Fields::Named(fields) => {
-            let names: Vec<_> = fields
-                .named
-                .iter()
-                .map(|f| f.ident.as_ref().unwrap().clone())
-                .collect();
+            let names: Vec<_> =
+                fields.named.iter().map(|f| f.ident.as_ref().unwrap().clone()).collect();
             for field_name in &names {
                 if *field_name == "new"
                     || *field_name == "boxed"
@@ -50,24 +47,17 @@ pub(crate) fn derive_struct_generator(input: &DeriveInput, data: &syn::DataStruc
             (names, false)
         }
         Fields::Unnamed(fields) => {
-            let names = (0..fields.unnamed.len())
-                .map(|i| format_ident!("_{}", i))
-                .collect();
+            let names = (0..fields.unnamed.len()).map(|i| format_ident!("_{}", i)).collect();
             (names, true)
         }
         Fields::Unit => unreachable!(),
     };
 
-    let GenericsParts {
-        gen_params,
-        param_uses,
-        type_param_idents,
-        user_predicates,
-        ty_generics,
-    } = match split_generics(&input.generics) {
-        Ok(parts) => parts,
-        Err(err) => return err.to_compile_error().into(),
-    };
+    let GenericsParts { gen_params, param_uses, type_param_idents, user_predicates, ty_generics } =
+        match split_generics(&input.generics) {
+            Ok(parts) => parts,
+            Err(err) => return err.to_compile_error().into(),
+        };
     let self_ty = quote! { #name #ty_generics };
     let gen_params = if gen_params.is_empty() {
         quote! {}
@@ -92,32 +82,21 @@ pub(crate) fn derive_struct_generator(input: &DeriveInput, data: &syn::DataStruc
         .collect();
     {
         let mut seen = std::collections::HashSet::new();
-        if generator_params
-            .iter()
-            .any(|param| !seen.insert(param.to_string()))
-        {
-            generator_params = (0..field_names.len())
-                .map(|i| format_ident!("__G{}", i))
-                .collect();
+        if generator_params.iter().any(|param| !seen.insert(param.to_string())) {
+            generator_params = (0..field_names.len()).map(|i| format_ident!("__G{}", i)).collect();
         }
     }
 
     let generator_param_decls =
-        generator_params
-            .iter()
-            .zip(field_types.iter())
-            .map(|(param, ty)| {
-                quote! {
-                    #param = <#ty as ::hegel::generators::DefaultGenerator>::Generator
-                }
-            });
-
-    let generator_fields = field_names
-        .iter()
-        .zip(generator_params.iter())
-        .map(|(name, param)| {
-            quote! { #name: #param }
+        generator_params.iter().zip(field_types.iter()).map(|(param, ty)| {
+            quote! {
+                #param = <#ty as ::hegel::generators::DefaultGenerator>::Generator
+            }
         });
+
+    let generator_fields = field_names.iter().zip(generator_params.iter()).map(|(name, param)| {
+        quote! { #name: #param }
+    });
 
     let new_fields = field_types.iter().map(|ty| {
         quote! {
@@ -172,9 +151,8 @@ pub(crate) fn derive_struct_generator(input: &DeriveInput, data: &syn::DataStruc
         quote! { #name { #(#generate_fields,)* } }
     };
 
-    let print_idents: Vec<_> = (0..field_names.len())
-        .map(|i| format_ident!("__field{i}"))
-        .collect();
+    let print_idents: Vec<_> =
+        (0..field_names.len()).map(|i| format_ident!("__field{i}")).collect();
     let print_construct = if is_tuple {
         quote! { #name(#(#print_idents,)*) }
     } else {

@@ -4,7 +4,10 @@ use std::{
     mem::offset_of,
 };
 
-use blaze_format::{Aligned, FormatError, Part, Persist, Record, Rel, SchemaHash, Slice, Writer, buffer_id, open_as, schema_of, to_bytes};
+use blaze_format::{
+    Aligned, FormatError, Part, Persist, Record, Rel, SchemaHash, Slice, Writer, buffer_id,
+    open_as, schema_of, to_bytes,
+};
 use blaze_ids::{ContentId, Domain, Hasher, Idx, Interner, rng::SplitMix64 as Rng};
 
 use crate::{
@@ -91,8 +94,11 @@ fn read_leaf<'a>(root: &'a LeafRoot, buffer: &'a [u8]) -> Result<(u64, &'a str),
 }
 
 impl Persist for Leaf {
-    const SCHEMA: SchemaHash =
-        schema_of(&[Part::Str("hashcons test Leaf"), Part::U64(1), Part::Schema(<LeafRoot as Record>::SCHEMA)]);
+    const SCHEMA: SchemaHash = schema_of(&[
+        Part::Str("hashcons test Leaf"),
+        Part::U64(1),
+        Part::Schema(<LeafRoot as Record>::SCHEMA),
+    ]);
     type Ref<'a> = (u64, &'a str);
 
     fn write(&self, out: &mut Writer) -> u64 {
@@ -113,8 +119,11 @@ impl Load for Leaf {
 }
 
 impl Persist for Pair {
-    const SCHEMA: SchemaHash =
-        schema_of(&[Part::Str("hashcons test Pair"), Part::U64(1), Part::Schema(<PairRoot as Record>::SCHEMA)]);
+    const SCHEMA: SchemaHash = schema_of(&[
+        Part::Str("hashcons test Pair"),
+        Part::U64(1),
+        Part::Schema(<PairRoot as Record>::SCHEMA),
+    ]);
     type Ref<'a> = ((u64, &'a str), (u64, &'a str));
 
     fn write(&self, out: &mut Writer) -> u64 {
@@ -143,7 +152,10 @@ impl Load for Pair {
     type Parts = &'static HashCons<Leaf>;
 
     fn load((left, right): Self::Ref<'_>, leaves: &'static HashCons<Leaf>) -> Pair {
-        Pair { left: leaves.intern(Leaf::load(left, ())), right: leaves.intern(Leaf::load(right, ())) }
+        Pair {
+            left: leaves.intern(Leaf::load(left, ())),
+            right: leaves.intern(Leaf::load(right, ())),
+        }
     }
 }
 
@@ -308,7 +320,8 @@ fn the_same_value_from_many_threads_is_one_index() {
             .map(|worker| {
                 let cons = &cons;
                 scope.spawn(move || {
-                    let same: Vec<_> = (0..2_000).map(|_| cons.intern(leaf(7, "shared")).idx()).collect();
+                    let same: Vec<_> =
+                        (0..2_000).map(|_| cons.intern(leaf(7, "shared")).idx()).collect();
                     let many: Vec<_> = (0..10_000u64)
                         .map(|n| (n + worker * 997) % 10_000)
                         .map(|n| cons.intern(leaf(n, "many")).idx())
@@ -409,7 +422,10 @@ fn a_handle_persists_as_its_value() {
     assert_eq!(*loaded.get(), leaf(5, "five"));
     assert_eq!(loaded.content(), handle.content());
     assert_eq!(fresh.load_verified(&buffer, buffer_id(&bytes), ()).unwrap(), loaded);
-    assert!(matches!(fresh.load_verified(&buffer, ContentId([0; 32]), ()), Err(FormatError::Hash { .. })));
+    assert!(matches!(
+        fresh.load_verified(&buffer, ContentId([0; 32]), ()),
+        Err(FormatError::Hash { .. })
+    ));
 }
 
 fn fill(leaves: &'static HashCons<Leaf>, pairs: &HashCons<Pair>, values: &[(Leaf, Leaf)]) {
@@ -454,15 +470,21 @@ fn interleavings_give_the_same_fingerprints_and_bytes() {
     assert_eq!(threaded.len(), serial.len());
     assert_eq!(threaded_leaves.len(), serial_leaves.len());
     let contents = |pairs: &HashCons<Pair>| -> Vec<(ContentId, ContentId, ContentId)> {
-        pairs.sorted().iter().map(|it| (it.content(), it.get().left.content(), it.get().right.content())).collect()
+        pairs
+            .sorted()
+            .iter()
+            .map(|it| (it.content(), it.get().left.content(), it.get().right.content()))
+            .collect()
     };
     assert_eq!(contents(&threaded), contents(&serial));
     for (left, right) in &all {
         let a = threaded_leaves.lookup(&content_of(left)).unwrap();
         let b = serial_leaves.lookup(&content_of(left)).unwrap();
         assert_eq!(a.fingerprint(), b.fingerprint());
-        let pair_a = threaded.lookup(&content_of(&Pair { left: a, right: threaded_leaves.intern(right.clone()) }));
-        let pair_b = serial.lookup(&content_of(&Pair { left: b, right: serial_leaves.intern(right.clone()) }));
+        let pair_a = threaded
+            .lookup(&content_of(&Pair { left: a, right: threaded_leaves.intern(right.clone()) }));
+        let pair_b = serial
+            .lookup(&content_of(&Pair { left: b, right: serial_leaves.intern(right.clone()) }));
         assert_eq!(pair_a.unwrap().fingerprint(), pair_b.unwrap().fingerprint());
     }
     assert_eq!(threaded_leaves.write_pack(), serial_leaves.write_pack());
@@ -481,7 +503,10 @@ fn a_pack_loads_into_a_fresh_interner_as_the_same_bytes() {
     let fresh_pairs = HashCons::<Pair>::new();
     let leaf_buffer = Aligned::copy_from(&leaf_pack);
     let pair_buffer = Aligned::copy_from(&pair_pack);
-    assert_eq!(fresh_leaves.load_pack_verified(&leaf_buffer, buffer_id(&leaf_pack), ()).unwrap(), leaves.len());
+    assert_eq!(
+        fresh_leaves.load_pack_verified(&leaf_buffer, buffer_id(&leaf_pack), ()).unwrap(),
+        leaves.len()
+    );
     assert_eq!(fresh_pairs.load_pack(&pair_buffer, fresh_leaves).unwrap(), pairs.len());
     assert_eq!(fresh_leaves.len(), leaves.len());
     assert_eq!(fresh_pairs.len(), pairs.len());
@@ -505,7 +530,11 @@ fn a_pack_refuses_what_it_was_not_written_with() {
     let pack = cons.write_pack();
 
     assert!(matches!(
-        HashCons::<Leaf>::new().load_pack_verified(&Aligned::copy_from(&pack), ContentId([0; 32]), ()),
+        HashCons::<Leaf>::new().load_pack_verified(
+            &Aligned::copy_from(&pack),
+            ContentId([0; 32]),
+            ()
+        ),
         Err(FormatError::Hash { .. })
     ));
 
@@ -515,12 +544,17 @@ fn a_pack_refuses_what_it_was_not_written_with() {
 
     let mut tampered = pack.clone();
     let needle = b"the one name to change";
-    let at = tampered.windows(needle.len()).position(|it| it == needle).expect("the name in the pack");
+    let at =
+        tampered.windows(needle.len()).position(|it| it == needle).expect("the name in the pack");
     tampered[at] = b'T';
     let fresh = HashCons::<Leaf>::new();
     let loaded = fresh.load_pack(&Aligned::copy_from(&tampered), ());
     assert!(matches!(loaded, Err(FormatError::Invalid { .. })), "{loaded:?}");
-    assert_eq!(fresh.lookup(&content_of(&leaf(1, "The one name to change"))), None, "interned before it was checked");
+    assert_eq!(
+        fresh.lookup(&content_of(&leaf(1, "The one name to change"))),
+        None,
+        "interned before it was checked"
+    );
 }
 
 #[derive(Hash, PartialEq, Eq, Debug)]
@@ -557,11 +591,16 @@ fn hash_std_writes_fixed_width_little_endian() {
 #[test]
 fn a_derived_hash_is_content() {
     let cons = HashCons::<Shape>::new();
-    let shape = || Shape::Many(vec![Shape::Scalar { size: 4, align: 4 }, Shape::Scalar { size: 8, align: 8 }]);
+    let shape = || {
+        Shape::Many(vec![Shape::Scalar { size: 4, align: 4 }, Shape::Scalar { size: 8, align: 8 }])
+    };
     let a = cons.intern(shape());
     assert_eq!(cons.intern(shape()), a);
     assert_ne!(cons.intern(Shape::Scalar { size: 4, align: 4 }), a);
-    assert_ne!(content_of(&Shape::Many(vec![])), content_of(&Shape::Many(vec![Shape::Many(vec![])])));
+    assert_ne!(
+        content_of(&Shape::Many(vec![])),
+        content_of(&Shape::Many(vec![Shape::Many(vec![])]))
+    );
     assert_eq!(cons.len(), 2);
 }
 

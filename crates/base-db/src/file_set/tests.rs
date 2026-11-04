@@ -22,7 +22,8 @@ fn sizes(config: &FileSetConfig, files: &[&str]) -> Vec<usize> {
 #[test]
 fn path_prefix() {
     let config = config(&[&["/foo"], &["/foo/bar/baz"]]);
-    let files = ["/foo/src/lib.rs", "/foo/src/bar/baz/lib.rs", "/foo/bar/baz/lib.rs", "/quux/lib.rs"];
+    let files =
+        ["/foo/src/lib.rs", "/foo/src/bar/baz/lib.rs", "/foo/bar/baz/lib.rs", "/quux/lib.rs"];
     assert_eq!(sizes(&config, &files), [2, 1, 1]);
 }
 
@@ -87,7 +88,9 @@ fn classify_is_the_longest_prefix_a_scan_finds() {
     let lists: &[&[&str]] = &[&["/a"], &["/a/b", "/c"], &["/a/bc"], &["/a/b/c/d"], &["/c"]];
     let config = config(lists);
     let mut key = Vec::new();
-    for file in ["/a/x.rs", "/a/b/x.rs", "/a/bcd/x.rs", "/a/b/c/d/e/x.rs", "/c/x.rs", "/d/x.rs", "/x.rs"] {
+    for file in
+        ["/a/x.rs", "/a/b/x.rs", "/a/bcd/x.rs", "/a/b/c/d/e/x.rs", "/c/x.rs", "/d/x.rs", "/x.rs"]
+    {
         let file = path(file);
         key.clear();
         file.parent().unwrap().encode(&mut key);

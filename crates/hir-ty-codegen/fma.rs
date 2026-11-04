@@ -195,7 +195,8 @@ impl<'db> Facts<'db> {
         let operand = mark_projected;
         // The block each goes on in, where it goes there alone: a call of an intrinsic never
         // unwinds, whatever the MIR says.
-        let mut goes_on: HashMap<BasicBlockId, BasicBlockId, std::alloc::Global> = HashMap::new_in(std::alloc::Global);
+        let mut goes_on: HashMap<BasicBlockId, BasicBlockId, std::alloc::Global> =
+            HashMap::new_in(std::alloc::Global);
         for (id, block) in body.basic_blocks.iter() {
             for (at, statement) in block.statements.iter().enumerate() {
                 let StatementKind::Assign(place, rvalue) = &statement.kind else { continue };
@@ -439,12 +440,7 @@ impl<'db> FunctionCx<'_, 'db> {
         let [Some(x), Some(y), Some(z)] = wrapper.params.map(|at| args.get(at)) else {
             unsupported!("a call of `{name}` with fewer arguments than its fma takes");
         };
-        let site = Site {
-            operands: [x, y, z],
-            negated: wrapper.negated,
-            destination,
-            target,
-        };
+        let site = Site { operands: [x, y, z], negated: wrapper.negated, destination, target };
         self.lower_fma(Intrinsic::Simd(SimdOp::Fma), &site, dst, dst_ty)?;
         Ok(true)
     }
@@ -553,9 +549,8 @@ impl<'db> FunctionCx<'_, 'db> {
         // `213` is `op2 * op1 + op3`, the NaN of `op2` first: the first factor there.
         let (first, second) = if swapped { (2, 1) } else { (1, 2) };
         // alloc: the stub's text, the output
-        let text = format!(
-            "vmovaps {reg}0, {reg}{second}\n{op}213{suffix} {reg}0, {reg}{first}, {reg}3"
-        );
+        let text =
+            format!("vmovaps {reg}0, {reg}{second}\n{op}213{suffix} {reg}0, {reg}{first}, {reg}3");
         let lowered = avx512::Lowered {
             text,
             // alloc: `avx512::Lowered`'s loads, a `Vec` of its own
@@ -662,9 +657,8 @@ impl<'db> FunctionCx<'_, 'db> {
                 return Err("a block without end".into());
             };
             let kind = &terminator.kind;
-            let goes_on = |facts: &Facts<'db>, next: BasicBlockId| {
-                facts.preds.get(&next).copied() == Some(1)
-            };
+            let goes_on =
+                |facts: &Facts<'db>, next: BasicBlockId| facts.preds.get(&next).copied() == Some(1);
             match kind {
                 TerminatorKind::Goto { target } => {
                     let target = *target;
@@ -759,8 +753,7 @@ impl<'db> FunctionCx<'_, 'db> {
                     } else {
                         let name = FunctionSignature::of(db, callee).name.as_str();
                         let inlined = if monomorphic {
-                            self.rustc_inlines(here.func, callee)
-                                .map_err(|e| format!("{e:?}"))? // alloc: the error's message
+                            self.rustc_inlines(here.func, callee).map_err(|e| format!("{e:?}"))? // alloc: the error's message
                         } else {
                             None
                         };
@@ -1404,7 +1397,8 @@ impl<'db> FunctionCx<'_, 'db> {
     fn wrapper(&mut self, func: FunctionId) -> Result<Option<Wrapper>> {
         let db = self.cg.db;
         let Ok((body, _)) = root_body(db, func) else { return Ok(None) };
-        let mut of: HashMap<LocalId, (usize, bool), std::alloc::Global> = HashMap::new_in(std::alloc::Global);
+        let mut of: HashMap<LocalId, (usize, bool), std::alloc::Global> =
+            HashMap::new_in(std::alloc::Global);
         for (i, &param) in body.param_locals.iter().enumerate() {
             of.insert(param, (i, false));
         }
@@ -1463,14 +1457,14 @@ impl<'db> FunctionCx<'_, 'db> {
                         return Ok(None);
                     }
                     match (intrinsic, &args[..]) {
-                        (Intrinsic::Simd(SimdOp::Neg), [op]) => match local_of(op)
-                            .and_then(|it| of.get(&it))
-                        {
-                            Some(&(param, false)) => {
-                                _ = of.insert(destination.local, (param, true))
+                        (Intrinsic::Simd(SimdOp::Neg), [op]) => {
+                            match local_of(op).and_then(|it| of.get(&it)) {
+                                Some(&(param, false)) => {
+                                    _ = of.insert(destination.local, (param, true))
+                                }
+                                _ => return Ok(None),
                             }
-                            _ => return Ok(None),
-                        },
+                        }
                         (Intrinsic::Simd(SimdOp::Fma), [x, y, z]) if found.is_none() => {
                             let mut params = [0; 3];
                             let mut negated = [false; 3];

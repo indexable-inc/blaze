@@ -29,7 +29,7 @@ const skills = {
 	"compiler-correctness": {
 		title: "Compiler correctness",
 		description:
-			"What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's salsa crates, keys that cover every input, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox.",
+			"What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's query crates (blaze-query, derived from salsa), keys that cover every input, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox.",
 	},
 	"runtime-code": {
 		title: "Writing blaze's runtime code",
@@ -115,9 +115,9 @@ export const rules = [
 	{
 		id: "useful-not-parity",
 		skill: "compiler-correctness",
-		line: "rustc and cargo are references, not specs: judge output by usefulness and match them only where real code or tools depend on it.",
-		info: "rustc and cargo are references, never specs. Judge everything blaze does by how useful it is to the person or agent using it, not by how closely it matches them: errors, warnings, lints, CLI commands and flags, printed and JSON output, progress, the target directory's layout, file formats, caches, symbol names, debug info, what a build or test run does and in what order. Match them only where real code or tools depend on it (a program's behavior, a published crate's manifest, an editor reading the JSON); everywhere else pick the better design and delete the copy. Tests check what makes the result useful and correct, never that it equals rustc's or cargo's. `superset-of-rust` is unchanged: every program the pinned nightly builds still builds and runs as it does under rustc, except one that only builds through a rustc soundness bug.",
-		reason: "\"we dont need word for word ... be clear functional parity also not needed we care about usefulness just in general wrt rustc\" and \"make the rule MORE GENERAL than that not just errors\" (Andrew, 2026-10-31). On 2026-10-31 166 of blaze-diagnostics' 1223 tests failed, most on text that differed from rustc's (`{integer}` against `i32`, a span one column off, a lint count) and not on whether the error was useful. The plan's \"conformance only where real code depends on it\" (2fb77406fb) said this for behavior; this rule says it for everything.",
+		line: "rustc and cargo are references, not specs: design every output and interface as if from scratch, the best way for people and agents, and match them only where real code or tools depend on it.",
+		info: "rustc and cargo are references, never specs. Judge everything blaze does by how useful it is to the person or agent using it, not by how closely it matches them: errors, warnings, lints, CLI commands and flags, printed and JSON output, progress, the target directory's layout, file formats, caches, symbol names, debug info, what a build or test run does and in what order. Match them only where real code or tools depend on it (a program's behavior, a published crate's manifest, an editor reading the JSON); everywhere else pick the better design and delete the copy. Their style is no constraint either: how cargo or rustc words, colours, lays out or orders a message, a progress line, a summary or a flag is not a reason for blaze to do the same; design it as blaze would from scratch (structured data first, rendered for a person on a terminal and as data for an agent) and change it freely when a better way is found. Tests check what makes the result useful and correct, never that it equals rustc's or cargo's. `superset-of-rust` is unchanged: every program the pinned nightly builds still builds and runs as it does under rustc, except one that only builds through a rustc soundness bug.",
+		reason: "\"we dont need word for word ... be clear functional parity also not needed we care about usefulness just in general wrt rustc\" and \"make the rule MORE GENERAL than that not just errors\" (Andrew, 2026-10-31). On 2026-10-31 166 of blaze-diagnostics' 1223 tests failed, most on text that differed from rustc's (`{integer}` against `i32`, a span one column off, a lint count) and not on whether the error was useful. The plan's \"conformance only where real code depends on it\" (2fb77406fb) said this for behavior; this rule says it for everything. \"dont care about cargo/rustc output/style can change since blaze do things the BEST way if made from scratch\" (Andrew, 2026-11-04), when `blaze test` printed 250 identical green `Compiling x v0.0.0 (/abs/path)` lines in cargo's style.",
 	},
 	{
 		id: "blaze-uses-its-extensions",
@@ -185,8 +185,8 @@ export const rules = [
 		id: "sans-io-cores",
 		skill: "runtime-code",
 		line: "Every core is a synchronous state machine on an injected clock that owns no IO; drivers do the IO and stay thin.",
-		info: "Every core (a scheduler decision, a protocol, a retry or backoff policy, a lease, a maintainer's plan) is a synchronous state machine that reads time only from an injected clock (`advance_clock(now)`), owns no socket, file, thread, timer or sleep, and hands back decisions and deadlines (`take_decisions`, `next_deadline`). Drivers do the IO and stay thin. A test replays a transcript with no real clock.",
-		reason: "Andrew's rule for ix (2026-10-25), and `blaze_graph::sched` is built this way. A core that sleeps or reads wall time can only be tested by waiting, and those tests flake.",
+		info: "Every core (a scheduler decision, a protocol, a retry or backoff policy, a lease, a maintainer's plan) is a synchronous state machine that reads time only from an injected clock (`advance_clock(now)`), owns no socket, file, thread, timer or sleep, and hands back decisions and deadlines (`take_decisions`, `next_deadline`). Drivers do the IO and stay thin. A test replays a transcript with no real clock. Protocol code is a core too: an HTTP client or server, TLS (through rustls's own byte-in/byte-out `Connection`, never `tokio-rustls`), the daemon's wire protocol, a remote-cache or registry client. Its interface is bytes in, bytes and events out, so any IO backend can drive it (tokio today, io_uring on Linux later) by writing one thin driver, with no change to the core. A dependency that ties protocol logic to one runtime (hyper's connectors, hyper-util, reqwest, tokio-rustls) is replaced by a core and a driver, not wrapped.",
+		reason: "Andrew's rule for ix (2026-10-25), and `blaze_graph::sched` is built this way. A core that sleeps or reads wall time can only be tested by waiting, and those tests flake. Andrew, 2026-11-04, on the registry's HTTP client: \"is that sans io so u can have multiple io impl? like io uring on linux\" — a client built on hyper and tokio-rustls cannot move to io_uring without a rewrite.",
 	},
 	{
 		id: "every-wait-says-what",
@@ -281,6 +281,14 @@ export const rules = [
 		link: "docs/contributing.md#rules-for-code",
 	},
 	{
+		id: "spec-then-build",
+		skill: "changing-code",
+		line: "A change that needs a design gets a spec first, then the same lane builds it right away; a spec is never the deliverable.",
+		info: "Before a change that spans crates, adds a concept, or changes a persisted format, a protocol or a hot path, write a short spec as a `plan` doc under `docs/` (what, why, the chosen design and the losing alternative in a line, the cost budget, the migration, how it is proven). Have a fresh reviewer check it against the code when it is large. Then start building it in the same lane, in the same session, without waiting to be asked: fan out the code, build, land. The spec ships in the same pull request as the first code that implements it, and is marked `current` (or rewritten to describe what was built) once the work lands. A spec with no code behind it is unfinished work, not a result; a lane that cannot build what it specified says what blocks it and who it handed the work to.",
+		reason: "Andrew, 2026-11-04: \"by default write a spec but also do it right away (don't just write and not do)\". A plan written and left alone goes stale while the code moves, and the work it describes never happens.",
+		link: "docs/contributing.md#rules-for-code",
+	},
+	{
 		id: "one-concept-one-home",
 		skill: "changing-code",
 		line: "One type, one rule and one place per concept; merge duplicates and ban the removed name.",
@@ -290,8 +298,8 @@ export const rules = [
 	{
 		id: "semantics-in-front-end",
 		skill: "compiler-correctness",
-		line: "Language semantics go in the front end's salsa crates in `crates/`; codegen, the store, the daemon and the runtime stay outside.",
-		info: "Language semantics (MIR building and passes, borrow checking, const eval, layout, code-identity hashes) go in the front end's salsa crates in `crates/` (`hir-ty`, `hir-def` and the rest, derived from rust-analyzer but no longer synced with it), in a crate of their own where possible. Codegen, the store, the daemon, cargo integration and the runtime stay outside the front end.",
+		line: "Language semantics go in the front end's query crates in `crates/` (blaze-query's engine, derived from salsa, not salsa); codegen, the store, the daemon and the runtime stay outside.",
+		info: "Language semantics (MIR building and passes, borrow checking, const eval, layout, code-identity hashes) go in the front end's crates in `crates/` (`hir-ty`, `hir-def` and the rest, derived from rust-analyzer but no longer synced with it), whose queries run on blaze's own engine (`blaze_query::db`, crates/blaze-query: derived from salsa but not salsa; dense ids, in memory, one view at a time; persisted, shared results go through blaze-kernel), in a crate of their own where possible. Codegen, the store, the daemon, cargo integration and the runtime stay outside the front end.",
 		link: "docs/contributing.md#where-new-code-goes",
 	},
 	{

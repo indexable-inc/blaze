@@ -23,7 +23,10 @@ fn plain_records_are_checked_by_their_bounds() {
     let buffer = Aligned::copy_from(&written(1));
     let root = open::<Root>(&buffer).unwrap();
     assert_eq!(root.numbers.get(&buffer), &[1, 2, 3]);
-    assert!(matches!(open::<Root>(&Aligned::copy_from(&written(2))), Err(FormatError::Invalid { .. })));
+    assert!(matches!(
+        open::<Root>(&Aligned::copy_from(&written(2))),
+        Err(FormatError::Invalid { .. })
+    ));
 }
 
 #[test]
@@ -179,7 +182,12 @@ fn a_get_after_open_checks_only_what_it_reaches_directly() {
     const NODES: usize = 50;
     let mut out = Writer::new(Nodes::SCHEMA);
     let parts: Vec<(u64, u64)> = (0..NODES as u32)
-        .map(|n| (out.push(&Counted(n)), out.push_slice(&[Counted(10 * n), Counted(10 * n + 1), Counted(10 * n + 2)])))
+        .map(|n| {
+            (
+                out.push(&Counted(n)),
+                out.push_slice(&[Counted(10 * n), Counted(10 * n + 1), Counted(10 * n + 2)]),
+            )
+        })
         .collect();
     let at = out.next::<Node>();
     let nodes: Vec<Node> = parts
@@ -195,7 +203,8 @@ fn a_get_after_open_checks_only_what_it_reaches_directly() {
         .collect();
     assert_eq!(out.push_slice(&nodes), at);
     let root_at = out.next::<Nodes>();
-    let root = Nodes { nodes: Slice::between(root_at + offset_of!(Nodes, nodes) as u64, at, NODES) };
+    let root =
+        Nodes { nodes: Slice::between(root_at + offset_of!(Nodes, nodes) as u64, at, NODES) };
     assert_eq!(out.push(&root), root_at);
     let buffer = Aligned::copy_from(&out.finish(root_at));
 
@@ -207,7 +216,10 @@ fn a_get_after_open_checks_only_what_it_reaches_directly() {
     for (n, node) in nodes.iter().enumerate() {
         let n = n as u32;
         assert_eq!(node.leaf.get(&buffer), Some(&Counted(n)));
-        assert_eq!(node.more.get(&buffer), &[Counted(10 * n), Counted(10 * n + 1), Counted(10 * n + 2)]);
+        assert_eq!(
+            node.more.get(&buffer),
+            &[Counted(10 * n), Counted(10 * n + 1), Counted(10 * n + 2)]
+        );
     }
     assert_eq!(checks(), 4 * NODES, "each Counted checked once more, where it is reached");
 }
@@ -281,9 +293,8 @@ fn set_i32(bytes: &mut [u8], at: usize, value: i32) {
 fn a_reference_that_leaves_is_refused() {
     let forward = with_root(|bytes, root| set_i32(bytes, root + offset_of!(Root, leaf), 8));
     assert!(matches!(open::<Root>(&forward), Err(FormatError::OutOfBounds { .. })));
-    let into_header = with_root(|bytes, root| {
-        set_i32(bytes, root + offset_of!(Root, leaf), -(root as i32) + 8)
-    });
+    let into_header =
+        with_root(|bytes, root| set_i32(bytes, root + offset_of!(Root, leaf), -(root as i32) + 8));
     assert!(matches!(open::<Root>(&into_header), Err(FormatError::OutOfBounds { .. })));
     let misaligned = with_root(|bytes, root| {
         let at = root + offset_of!(Root, numbers);

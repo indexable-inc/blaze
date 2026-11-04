@@ -33,9 +33,9 @@ use std::{
 
 use blaze_api::{ApiError, Request, Response, ViewRef, client::Client};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_vfs::{Op, View};
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use crate::{
     CheckRun,
@@ -74,16 +74,24 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
         .and_then(|it| it.text(&config.app.key_file))
         .map_err(|error| error.what)?;
     // alloc: error path
-    let key = Key::from_pem(&key).map_err(|error| format!("{}: {error}", config.app.key_file.display()))?;
+    let key = Key::from_pem(&key)
+        .map_err(|error| format!("{}: {error}", config.app.key_file.display()))?;
     // clone: once, at start, the App's host
-    let app = App { id: config.app.id, installation: config.app.installation, key, api: config.app.api.clone() };
+    let app = App {
+        id: config.app.id,
+        installation: config.app.installation,
+        key,
+        api: config.app.api.clone(),
+    };
     // clone: once, at start; the error is an error path
     let github = GitHub::new(app, config.repo.clone()).map_err(|error| error.to_string())?;
     let secret = Secret::read(&config.webhook.secret_file).map_err(|error| error.what)?;
     let state = load(&config.state)?;
     let listener = TcpListener::bind(config.webhook.listen)
         // alloc: error path
-        .map_err(|error| format!("the webhook could not listen on {}: {error}", config.webhook.listen))?;
+        .map_err(|error| {
+            format!("the webhook could not listen on {}: {error}", config.webhook.listen)
+        })?;
 
     let (to_service, inputs) = crossbeam_channel::unbounded();
     let (to_pins, pin_commands) = crossbeam_channel::unbounded();
@@ -100,7 +108,8 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
         lanes.push(to_lane);
     }
     let to_github = Posts { lanes };
-    let shared = Arc::new(Shared { // alloc: once, at start, what every worker shares
+    let shared = Arc::new(Shared {
+        // alloc: once, at start, what every worker shares
         socket: config.daemon.socket.clone(), // clone: once, at start
         // clone: once, at start
         git: Mutex::new(Git { dir: config.git.dir.clone(), remote: config.git.remote.clone() }),
@@ -127,7 +136,8 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
             // alloc: error path
             .map_err(|error| format!("the webhook thread did not start: {error}"))?;
     }
-    log(&format!( // alloc: once, at start, the line saying what is served
+    log(&format!(
+        // alloc: once, at start, the line saying what is served
         "serving {} on {}, the daemon at {}",
         config.repo,
         config.webhook.listen,
@@ -146,7 +156,8 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
             log(&what);
         }
         // alloc: error path
-        let input = inputs.recv().map_err(|_| "every thread feeding the service ended".to_owned())?;
+        let input =
+            inputs.recv().map_err(|_| "every thread feeding the service ended".to_owned())?;
         let now = now();
         service.step(now, input, &mut out);
         for input in inputs.try_iter().take(MOST_STEPS - 1) {
@@ -202,7 +213,9 @@ fn dispatch(
 ) {
     match output {
         Output::Pin { root } => {
-            let _ = shared.pins.send(pins::Command::Open { view: ViewRef::Root(View { root }), reply: None });
+            let _ = shared
+                .pins
+                .send(pins::Command::Open { view: ViewRef::Root(View { root }), reply: None });
         }
         Output::Unpin { root } => {
             let _ = shared.pins.send(pins::Command::Close { root });
@@ -219,7 +232,8 @@ fn dispatch(
             });
             if !sent {
                 // alloc: error path
-                let what = format!("the worker of job {} is gone, so its request was not sent", job.0);
+                let what =
+                    format!("the worker of job {} is gone, so its request was not sent", job.0);
                 let error = Response::Error(ApiError::new(what, None));
                 let _ = shared.service.send(Input::Response { job, run, response: error });
                 let _ = shared.service.send(Input::Ended { job, run, ok: false });
@@ -262,7 +276,11 @@ fn dispatch(
 }
 
 /// The daemon's state made durable, then the VM's snapshot taken.
-fn take_snapshot(socket: &Path, config: &SnapshotConfig, name: &str) -> Result<snapshot::Kept, String> {
+fn take_snapshot(
+    socket: &Path,
+    config: &SnapshotConfig,
+    name: &str,
+) -> Result<snapshot::Kept, String> {
     let mut client = Client::unix(socket)
         // alloc: error path
         .map_err(|error| format!("could not reach the daemon at {}: {error}", socket.display()))?;
@@ -275,9 +293,12 @@ fn take_snapshot(socket: &Path, config: &SnapshotConfig, name: &str) -> Result<s
             _ => {}
         })
         // alloc: error path
-        .map_err(|error| format!("asking the daemon at {} to snapshot: {error}", socket.display()))?;
+        .map_err(|error| {
+            format!("asking the daemon at {} to snapshot: {error}", socket.display())
+        })?;
     if !(ok && durable) {
-        return Err(format!( // alloc: error path
+        return Err(format!(
+            // alloc: error path
             "the daemon at {} did not make its state durable: {}",
             socket.display(),
             said_or(&said, "it said nothing more")
@@ -332,7 +353,8 @@ fn send(
         Post::Create { run, check } => {
             let result = retry(backoff, || github.lock().create(&check));
             let result = result.map_err(|error| {
-                let what = format!( // alloc: error path
+                let what = format!(
+                    // alloc: error path
                     "creating check run {} on {} failed {} times: {error}",
                     check.name,
                     check.commit,
@@ -346,7 +368,8 @@ fn send(
         Post::Update { run, id, check } => {
             let result = retry(backoff, || github.lock().update(id, &check));
             if let Err(error) = result {
-                log(&format!( // alloc: error path
+                log(&format!(
+                    // alloc: error path
                     "updating check run {} ({id}, run {}) on {} to {:?} failed {} times: {error}",
                     check.name,
                     run.0,
@@ -359,7 +382,10 @@ fn send(
     }
 }
 
-fn retry<T>(backoff: Duration, mut attempt: impl FnMut() -> Result<T, GitHubError>) -> Result<T, GitHubError> {
+fn retry<T>(
+    backoff: Duration,
+    mut attempt: impl FnMut() -> Result<T, GitHubError>,
+) -> Result<T, GitHubError> {
     for tried in 0..GITHUB_RETRIES {
         match attempt() {
             Ok(it) => return Ok(it),
@@ -392,23 +418,29 @@ pub(crate) fn batches(ops: Vec<Op>, most: usize) -> Result<Vec<Vec<Op>>, String>
     };
     for op in ops {
         let cost = match &op {
-            Op::Write { path, bytes, .. } | Op::Edit { path, bytes, .. } => path.len() + bytes.len() + OP_OVERHEAD,
+            Op::Write { path, bytes, .. } | Op::Edit { path, bytes, .. } => {
+                path.len() + bytes.len() + OP_OVERHEAD
+            }
             Op::Delete { path } => path.len() + OP_OVERHEAD,
             Op::Rename { from, to } => from.len() + to.len() + OP_OVERHEAD,
         };
         match op {
             Op::Write { path, mut bytes, mode } if cost > most => {
-                let piece = most.checked_sub(path.len() + OP_OVERHEAD).filter(|it| *it > 0).ok_or_else(|| {
-                    // alloc: error path
-                    format!("the path {path} is too long for a request of the daemon's")
-                })?;
+                let piece = most
+                    .checked_sub(path.len() + OP_OVERHEAD)
+                    .filter(|it| *it > 0)
+                    .ok_or_else(|| {
+                        // alloc: error path
+                        format!("the path {path} is too long for a request of the daemon's")
+                    })?;
                 let first = piece.min(bytes.len());
                 let mut at = first as u64;
                 let edits: Vec<Op> = bytes[first..]
                     .chunks(piece)
                     .map(|piece| {
                         // alloc: once per piece of a file too big for one request
-                        let edit = Op::Edit { path: path.clone(), at, len: 0, bytes: piece.to_vec() };
+                        let edit =
+                            Op::Edit { path: path.clone(), at, len: 0, bytes: piece.to_vec() };
                         at += piece.len() as u64;
                         edit
                     })
@@ -448,12 +480,14 @@ pub(crate) fn save(path: &Path, state: &State) -> Result<(), String> {
     let mut temp = path.as_os_str().to_owned(); // alloc: once per save, beside one fsync
     temp.push(".tmp");
     let temp = PathBuf::from(temp);
-    let mut file = fs::File::create(&temp).map_err(|error| failed("creating the temporary file", &error))?;
+    let mut file =
+        fs::File::create(&temp).map_err(|error| failed("creating the temporary file", &error))?;
     file.write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| failed("writing the temporary file", &error))?;
     drop(file);
-    fs::rename(&temp, path).map_err(|error| failed("renaming the temporary file over it", &error))?;
+    fs::rename(&temp, path)
+        .map_err(|error| failed("renaming the temporary file over it", &error))?;
     if let Some(dir) = path.parent().filter(|it| !it.as_os_str().is_empty()) {
         fs::File::open(dir)
             .and_then(|dir| dir.sync_all())
@@ -465,7 +499,7 @@ pub(crate) fn save(path: &Path, state: &State) -> Result<(), String> {
 pub(crate) fn api_error(error: &ApiError) -> String {
     match &error.at {
         Some(at) => format!("{} (at {at})", error.what), // alloc: error path
-        None => error.what.clone(), // alloc: error path
+        None => error.what.clone(),                      // alloc: error path
     }
 }
 

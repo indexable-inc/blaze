@@ -47,7 +47,9 @@ impl fmt::Display for Unlearned {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Unlearned::Refused(refused) => write!(f, "{refused}"),
-            Unlearned::Version => write!(f, "the image's {} is of another blaze", SectionId::PLANE_HISTORY),
+            Unlearned::Version => {
+                write!(f, "the image's {} is of another blaze", SectionId::PLANE_HISTORY)
+            }
         }
     }
 }
@@ -61,8 +63,12 @@ pub fn history<S: Stable>(
 ) -> Result<(History, Option<Unlearned>), HistoryError> {
     match blaze_history::section::restore(image, config) {
         Ok(history) => Ok((history, None)),
-        Err(HistoryError::Refused(refused)) => Ok((History::new(config), Some(Unlearned::Refused(refused)))),
-        Err(HistoryError::Decode(DecodeError::Version)) => Ok((History::new(config), Some(Unlearned::Version))),
+        Err(HistoryError::Refused(refused)) => {
+            Ok((History::new(config), Some(Unlearned::Refused(refused))))
+        }
+        Err(HistoryError::Decode(DecodeError::Version)) => {
+            Ok((History::new(config), Some(Unlearned::Version)))
+        }
         Err(error) => Err(error),
     }
 }
@@ -76,7 +82,9 @@ pub fn trees(image: &Arc<Image<Mapping>>) -> Result<Option<base_db::trees::Trees
         Err(Refused::Missing { .. }) => return Ok(None),
         Err(refused) => return Err(refused.to_string()),
     };
-    let bytes = image.whole_bytes(&section).map_err(|corrupt| format!("the image's {}: {corrupt}", SectionId::SYNTAX_TREES))?;
+    let bytes = image
+        .whole_bytes(&section)
+        .map_err(|corrupt| format!("the image's {}: {corrupt}", SectionId::SYNTAX_TREES))?;
     base_db::trees::Trees::open(bytes).map(Some).map_err(|error| error.to_string())
 }
 
@@ -153,11 +161,17 @@ impl fmt::Display for ImageFailed {
         let file = &self.file;
         match &self.why {
             Unmade::Busy => write!(f, "the daemon image /{file}: {}", ImageError::Busy),
-            Unmade::Vfs(corrupt) => write!(f, "the daemon image /{file}: {}", ImageError::Corrupt(*corrupt)),
-            Unmade::Db(error) => write!(f, "the database's sections of the daemon image /{file}: {error}"),
+            Unmade::Vfs(corrupt) => {
+                write!(f, "the daemon image /{file}: {}", ImageError::Corrupt(*corrupt))
+            }
+            Unmade::Db(error) => {
+                write!(f, "the database's sections of the daemon image /{file}: {error}")
+            }
             Unmade::TooLarge(error) => write!(f, "the daemon image /{file}: {error}"),
             Unmade::Write(error) => write!(f, "writing the daemon image /{file}: {error}"),
-            Unmade::Map(error) => write!(f, "mapping the daemon image /{file} just written: {error}"),
+            Unmade::Map(error) => {
+                write!(f, "mapping the daemon image /{file} just written: {error}")
+            }
             Unmade::Open(error) => write!(f, "the daemon image /{file} just written: {error}"),
         }
     }
@@ -186,8 +200,17 @@ enum State {
     /// The VFS's journal is moving to another image: made once it can be.
     Waiting,
     /// `made` is how long the image took to make; the write of its `bytes` began at `since`.
-    Writing { mark: ImageMark, made: Duration, since: Instant, bytes: usize },
-    Mapping { made: Duration, wrote: Duration, since: Instant },
+    Writing {
+        mark: ImageMark,
+        made: Duration,
+        since: Instant,
+        bytes: usize,
+    },
+    Mapping {
+        made: Duration,
+        wrote: Duration,
+        since: Instant,
+    },
 }
 
 pub struct Images {
@@ -254,7 +277,9 @@ impl Images {
 
     fn make(&mut self, parts: &mut Parts<'_>, idle: bool) {
         let began = Instant::now();
-        let _span = tracing::info_span!(target: "blaze", "image make", bytes = tracing::field::Empty).entered();
+        let _span =
+            tracing::info_span!(target: "blaze", "image make", bytes = tracing::field::Empty)
+                .entered();
         let mut builder = Builder::new();
         let mark = match parts.vfs.write_image(&mut builder) {
             Ok(mark) => mark,
@@ -276,7 +301,10 @@ impl Images {
         blaze_history::section::write(parts.predict, &mut builder);
         if let Some(front) = parts.front {
             if let Some(failed) = front.trees().and_then(|it| it.failed()) {
-                tracing::warn!(failed, "a stored library tree failed to read: the image carries none of the old ones on");
+                tracing::warn!(
+                    failed,
+                    "a stored library tree failed to read: the image carries none of the old ones on"
+                );
             }
             // alloc: the section, once an image.
             let mut trees = Vec::new();
@@ -289,9 +317,18 @@ impl Images {
                 _span.record("bytes", bytes.len());
                 let len = bytes.len();
                 // clone: the effect owns its name; once an image.
-                parts.effects.push(Effect::Write { file: self.file.clone(), bytes, tag: self.write });
+                parts.effects.push(Effect::Write {
+                    file: self.file.clone(),
+                    bytes,
+                    tag: self.write,
+                });
                 self.made += 1;
-                self.state = State::Writing { mark, made: began.elapsed(), since: Instant::now(), bytes: len };
+                self.state = State::Writing {
+                    mark,
+                    made: began.elapsed(),
+                    since: Instant::now(),
+                    bytes: len,
+                };
             }
             Err(error) => self.fail(Unmade::TooLarge(error)),
         }
@@ -301,28 +338,33 @@ impl Images {
     pub fn complete(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>) {
         match (std::mem::replace(&mut self.state, State::Idle), completion.done) {
             (State::Writing { mark, made, since, .. }, Done::Written) => {
-                assert!(vfs.image_durable(mark.name), "the image written is the one the VFS staged last");
+                assert!(
+                    vfs.image_durable(mark.name),
+                    "the image written is the one the VFS staged last"
+                );
                 vfs.flush(effects);
                 // clone: as the write's.
                 effects.push(Effect::Map { file: self.file.clone(), tag: self.map });
                 self.state = State::Mapping { made, wrote: since.elapsed(), since: Instant::now() };
             }
             (State::Writing { .. }, Done::Failed(error)) => self.fail(Unmade::Write(error)),
-            (State::Mapping { made, wrote, since }, Done::Mapped(mapping)) => match Image::open(mapping) {
-                Ok(image) => {
-                    let (shape, mapped) = (Shape(&image), since.elapsed());
-                    tracing::info!(target: "blaze", bytes = image.len(), sections = image.sections().len(), made_ms = made.as_millis() as u64, wrote_ms = wrote.as_millis() as u64, "image written");
-                    eprintln!(
-                        "blaze serve: wrote the daemon image /{} {shape}: made in {}, written in {}, mapped in {}",
-                        self.file,
-                        ms(made),
-                        ms(wrote),
-                        ms(mapped)
-                    );
-                    self.mapped = Some(Arc::new(image));
+            (State::Mapping { made, wrote, since }, Done::Mapped(mapping)) => {
+                match Image::open(mapping) {
+                    Ok(image) => {
+                        let (shape, mapped) = (Shape(&image), since.elapsed());
+                        tracing::info!(target: "blaze", bytes = image.len(), sections = image.sections().len(), made_ms = made.as_millis() as u64, wrote_ms = wrote.as_millis() as u64, "image written");
+                        eprintln!(
+                            "blaze serve: wrote the daemon image /{} {shape}: made in {}, written in {}, mapped in {}",
+                            self.file,
+                            ms(made),
+                            ms(wrote),
+                            ms(mapped)
+                        );
+                        self.mapped = Some(Arc::new(image));
+                    }
+                    Err(error) => self.fail(Unmade::Open(error)),
                 }
-                Err(error) => self.fail(Unmade::Open(error)),
-            },
+            }
             (State::Mapping { .. }, Done::Failed(error)) => self.fail(Unmade::Map(error)),
             (_, done) => unreachable!("the daemon image's effect completed with {done:?}"),
         }
@@ -339,12 +381,18 @@ impl Images {
     pub fn doing(&self) -> Option<String> {
         let file = &self.file;
         Some(match self.state {
-            State::Idle if self.again => format!("making another daemon image /{file}: the daemon changed while the last was made"),
+            State::Idle if self.again => format!(
+                "making another daemon image /{file}: the daemon changed while the last was made"
+            ),
             State::Idle => return None,
-            State::Waiting => format!("waiting for the VFS journal to move before making the daemon image /{file}"),
+            State::Waiting => format!(
+                "waiting for the VFS journal to move before making the daemon image /{file}"
+            ),
             State::Writing { bytes, .. } => match self.again {
                 false => format!("writing the daemon image /{file} ({} MiB)", bytes >> 20),
-                true => format!("writing the daemon image /{file} ({} MiB), then another", bytes >> 20),
+                true => {
+                    format!("writing the daemon image /{file} ({} MiB), then another", bytes >> 20)
+                }
             },
             State::Mapping { .. } => format!("mapping the daemon image /{file} it wrote"),
         })
@@ -424,15 +472,23 @@ mod tests {
         let none = Image::open(Builder::new().finish().unwrap()).unwrap();
         let (restored, unlearned) = history(&none, config).unwrap();
         assert_eq!(restored.encode(), empty());
-        assert!(matches!(unlearned, Some(Unlearned::Refused(Refused::Missing { .. }))), "{unlearned:?}");
+        assert!(
+            matches!(unlearned, Some(Unlearned::Refused(Refused::Missing { .. }))),
+            "{unlearned:?}"
+        );
         // The schema of the section blaze-graph wrote before blaze-history owned it.
         let estimates = with_history(
-            blaze_format::schema("blaze plane history 1: Estimates::encode bytes, version blzest01"),
+            blaze_format::schema(
+                "blaze plane history 1: Estimates::encode bytes, version blzest01",
+            ),
             b"blzest01",
         );
         let (restored, unlearned) = history(&estimates, config).unwrap();
         assert_eq!(restored.encode(), empty());
-        assert!(matches!(unlearned, Some(Unlearned::Refused(Refused::Schema { .. }))), "{unlearned:?}");
+        assert!(
+            matches!(unlearned, Some(Unlearned::Refused(Refused::Schema { .. }))),
+            "{unlearned:?}"
+        );
         let older = with_history(HISTORY, b"blzhis00 and what followed");
         let (restored, unlearned) = history(&older, config).unwrap();
         assert_eq!(restored.encode(), empty());
@@ -454,7 +510,8 @@ mod tests {
     fn a_history_that_does_not_decode_stops_the_daemon_naming_it() {
         let mut cut = empty();
         cut.truncate(cut.len() - 1);
-        let Err(error) = history(&with_history(HISTORY, &cut), blaze_history::Config::default()) else {
+        let Err(error) = history(&with_history(HISTORY, &cut), blaze_history::Config::default())
+        else {
             panic!("a cut history decoded")
         };
         assert!(matches!(error, HistoryError::Decode(_)), "{error:?}");
@@ -472,13 +529,22 @@ mod shape_tests {
     fn an_images_shape_names_its_hash_bytes_and_sections_largest_first() {
         let mut builder = Builder::new();
         builder.add(SectionId::PLANE_HISTORY, SchemaHash(blaze_ids::ContentId([1; 32])), &[7; 10]);
-        builder.add(SectionId::DB_MEMOS, SchemaHash(blaze_ids::ContentId([2; 32])), &vec![9; 3 << 20]);
+        builder.add(
+            SectionId::DB_MEMOS,
+            SchemaHash(blaze_ids::ContentId([2; 32])),
+            &vec![9; 3 << 20],
+        );
         builder.add(SectionId::interned(1), SchemaHash(blaze_ids::ContentId([3; 32])), &[1; 100]);
         builder.add(SectionId::interned(2), SchemaHash(blaze_ids::ContentId([3; 32])), &[1; 100]);
         let image = Image::open(builder.finish().unwrap()).unwrap();
         let text = Shape(&image).to_string();
         assert!(text.starts_with(&format!("{} (", image.hash())), "{text}");
-        assert!(text.contains("4 sections; the database's memos 3.0 MiB; an interned table 0.0 MiB in 2"), "{text}");
+        assert!(
+            text.contains(
+                "4 sections; the database's memos 3.0 MiB; an interned table 0.0 MiB in 2"
+            ),
+            "{text}"
+        );
         assert!(text.ends_with("the plane's history 0.0 MiB)"), "{text}");
     }
 }

@@ -127,7 +127,10 @@ impl<'a> LexedStr<'a> {
     }
 
     /// [`LexedStr::lex`], with `HASH` each identifier's name hashed too.
-    fn lex_with<const FAST: bool, const HASH: bool>(edition: Edition, text: &'a str) -> LexedStr<'a> {
+    fn lex_with<const FAST: bool, const HASH: bool>(
+        edition: Edition,
+        text: &'a str,
+    ) -> LexedStr<'a> {
         let _p = tracing::info_span!(target: "blaze", "LexedStr::new").entered();
         assert!(text.len() <= u32::MAX as usize, "a text of 4 GiB or more");
         let mut conv = Converter::new(edition, text);
@@ -175,7 +178,9 @@ impl<'a> LexedStr<'a> {
         conv.extend_token(&token.kind, text);
         match conv.res.tokens.len() {
             // An edition's split (`c"x"`, `'r#a` before 2021, `#"x"` before 2024) leaves text.
-            1 if conv.offset == text.len() => Some((conv.res.raw_kind(0), conv.res.error.pop().map(|it| it.msg.into_owned()))),
+            1 if conv.offset == text.len() => {
+                Some((conv.res.raw_kind(0), conv.res.error.pop().map(|it| it.msg.into_owned())))
+            }
             _ => None,
         }
     }
@@ -333,7 +338,8 @@ impl<'a> Converter<'a> {
         while self.offset < text.len() {
             if let Some(classes) = classes {
                 if classify::is_simple_first(text.as_bytes()[self.offset]) {
-                    self.offset = scan::simple::<HASH>(&mut self.res, classes, self.edition, self.offset);
+                    self.offset =
+                        scan::simple::<HASH>(&mut self.res, classes, self.edition, self.offset);
                     if self.offset == text.len() {
                         break;
                     }
@@ -745,7 +751,10 @@ mod tests {
         assert_eq!(lexed.range_text(0..lexed.len()), text);
         let kinds: Vec<_> = (0..lexed.len()).map(|i| lexed.kind(i)).collect();
         assert!(kinds.contains(&STRING) && kinds.contains(&COMMENT) && kinds.contains(&FN_KW));
-        assert_eq!(LexedStr::single_token(Edition::CURRENT, &long_string).map(|it| it.0), Some(STRING));
+        assert_eq!(
+            LexedStr::single_token(Edition::CURRENT, &long_string).map(|it| it.0),
+            Some(STRING)
+        );
     }
 
     fn tokens(edition: Edition, text: &str) -> Vec<(SyntaxKind, &str, Option<String>)> {
@@ -852,10 +861,7 @@ mod tests {
         }
         for edition in [Edition::Edition2021, Edition::Edition2024] {
             assert_eq!(tokens(edition, "'r#lt"), [(LIFETIME_IDENT, "'r#lt", None)]);
-            assert_eq!(
-                LexedStr::single_token(edition, "'r#lt"),
-                Some((LIFETIME_IDENT, None))
-            );
+            assert_eq!(LexedStr::single_token(edition, "'r#lt"), Some((LIFETIME_IDENT, None)));
             for name in ["_", "self", "Self", "super", "crate"] {
                 let text = format!("'r#{name}");
                 let message = format!("`{name}` cannot be a raw lifetime");
@@ -886,11 +892,10 @@ mod tests {
                 let message = format!("`{name}` cannot be a raw identifier");
                 assert_eq!(tokens(edition, &text), [(IDENT, &*text, Some(message))]);
             }
-            assert_eq!(tokens(edition, "r#fn r#async"), [
-                (IDENT, "r#fn", None),
-                (WHITESPACE, " ", None),
-                (IDENT, "r#async", None),
-            ]);
+            assert_eq!(
+                tokens(edition, "r#fn r#async"),
+                [(IDENT, "r#fn", None), (WHITESPACE, " ", None), (IDENT, "r#async", None),]
+            );
         }
     }
 
@@ -899,7 +904,8 @@ mod tests {
     #[test]
     fn forced_keywords_split_and_are_gated_from_2021() {
         for edition in Edition::iter() {
-            let error = edition.at_least_2021().then(|| "forced keywords are experimental".to_owned());
+            let error =
+                edition.at_least_2021().then(|| "forced keywords are experimental".to_owned());
             assert_eq!(
                 tokens(edition, "k#fn"),
                 [(IDENT, "k", error), (POUND, "#", None), (FN_KW, "fn", None)],
@@ -924,11 +930,16 @@ mod tests {
         let expected = input(&whole.to_input(edition));
         for split in 0..=whole.len() {
             let at = whole.text_start(split);
-            let (head, tail) = (LexedStr::new(edition, &text[..at]), LexedStr::new(edition, &text[at..]));
+            let (head, tail) =
+                (LexedStr::new(edition, &text[..at]), LexedStr::new(edition, &text[at..]));
             if head.len() + tail.len() != whole.len() {
                 continue;
             }
-            assert_eq!(input(&head.to_input_followed_by(&tail, edition)), expected, "split at {at}");
+            assert_eq!(
+                input(&head.to_input_followed_by(&tail, edition)),
+                expected,
+                "split at {at}"
+            );
         }
     }
 
@@ -938,7 +949,10 @@ mod tests {
     #[test]
     fn the_input_in_one_pass_is_the_input_token_by_token() {
         let mut texts = super::differential::parser_files();
-        texts.push("fn f() { x.0.1 + 1. + 1.5 + 1e3; union::default; dyn auto macro_rules! /* c */ }".to_owned());
+        texts.push(
+            "fn f() { x.0.1 + 1. + 1.5 + 1e3; union::default; dyn auto macro_rules! /* c */ }"
+                .to_owned(),
+        );
         texts.push(format!("fn f() {{ \"{}\" ; 2. }}", "s".repeat((1 << 22) + 3)));
         for text in &texts {
             for edition in Edition::iter() {
@@ -950,7 +964,10 @@ mod tests {
                     if kind.is_trivia() {
                         was_joint = false;
                     } else if kind == IDENT {
-                        expected.push_ident(SyntaxKind::from_contextual_keyword(text, edition).unwrap_or(IDENT), edition);
+                        expected.push_ident(
+                            SyntaxKind::from_contextual_keyword(text, edition).unwrap_or(IDENT),
+                            edition,
+                        );
                     } else {
                         if was_joint {
                             expected.was_joint();
@@ -968,7 +985,8 @@ mod tests {
                 let got = lexed.to_input(edition);
                 assert_eq!(got.len(), expected.len(), "{edition:?}");
                 for i in 0..got.len() {
-                    let at = |it: &crate::Input| (it.kind(i), it.contextual_kind(i), it.is_joint(i));
+                    let at =
+                        |it: &crate::Input| (it.kind(i), it.contextual_kind(i), it.is_joint(i));
                     assert_eq!(at(&got), at(&expected), "token {i} in {edition:?}");
                 }
             }

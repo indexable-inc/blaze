@@ -31,7 +31,9 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, STATUS_COMMITMENT_LIMIT},
+    Foundation::{
+        GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, STATUS_COMMITMENT_LIMIT,
+    },
     Security::SECURITY_ATTRIBUTES,
     Storage::FileSystem::{
         CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
@@ -42,19 +44,23 @@ use windows_sys::Win32::{
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
             JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
-            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+            TerminateJobObject,
         },
-        Pipes::{CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT},
+        Pipes::{
+            CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+            PIPE_WAIT,
+        },
         Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-            DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
-            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, RegisterWaitForSingleObject,
-            ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
-            UnregisterWaitEx, UpdateProcThreadAttribute, WT_EXECUTEONLYONCE,
+            DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+            INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+            RegisterWaitForSingleObject, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+            STARTUPINFOW, TerminateProcess, UnregisterWaitEx, UpdateProcThreadAttribute,
+            WT_EXECUTEONLYONCE,
         },
     },
 };
@@ -108,7 +114,11 @@ pub(super) struct Finish {
 /// `command` made in its sandbox, made by `confine`, unless the sandbox is off; in a job of its
 /// own, suspended until the driver follows it.
 // dyn: as above.
-pub(super) fn start(dirs: &mut RunDirs, command: Box<Command>, confine: Option<&Arc<dyn Confine>>) -> io::Result<Started> {
+pub(super) fn start(
+    dirs: &mut RunDirs,
+    command: Box<Command>,
+    confine: Option<&Arc<dyn Confine>>,
+) -> io::Result<Started> {
     let n = serial();
     let (confined, scratch, confine) = match &command.sandbox {
         Sandbox::Off => (None, None, None),
@@ -146,7 +156,12 @@ pub(super) fn start(dirs: &mut RunDirs, command: Box<Command>, confine: Option<&
             env: &confined.env,
             dir: &confined.dir,
         },
-        None => Launch { program: &command.program, args: &command.args, env: &command.env, dir: &command.dir },
+        None => Launch {
+            program: &command.program,
+            args: &command.args,
+            env: &command.env,
+            dir: &command.dir,
+        },
     };
     let made = run(&launch, &command, n);
     let started = match made {
@@ -156,11 +171,22 @@ pub(super) fn start(dirs: &mut RunDirs, command: Box<Command>, confine: Option<&
                 dirs.remove(scratch);
             }
             // alloc: an error path.
-            return Err(io::Error::new(error.kind(), format!("starting {}: {error}", launch.program.display())));
+            return Err(io::Error::new(
+                error.kind(),
+                format!("starting {}: {error}", launch.program.display()),
+            ));
         }
     };
     let (process, thread, job, stdin, stdout, stderr) = started;
-    Ok(Started { process, thread, job, stdin, stdout, stderr, finish: Finish { command, confine, scratch } })
+    Ok(Started {
+        process,
+        thread,
+        job,
+        stdin,
+        stdout,
+        stderr,
+        finish: Finish { command, confine, scratch },
+    })
 }
 
 /// What a process is started as: its command's own, what its sandbox made of it, or the warm
@@ -172,7 +198,8 @@ pub(super) struct Launch<'a> {
     pub(super) dir: &'a Path,
 }
 
-type Handles = (OwnedHandle, OwnedHandle, OwnedHandle, Option<OwnedHandle>, OwnedHandle, OwnedHandle);
+type Handles =
+    (OwnedHandle, OwnedHandle, OwnedHandle, Option<OwnedHandle>, OwnedHandle, OwnedHandle);
 
 /// A run's standard handles, as a started process and a handed run have them: the driver's ends
 /// (overlapped, kept from children) and the child's (inheritable), its input's the null device
@@ -202,10 +229,15 @@ fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
     let job = job(command.memory)?;
     let Standard { stdin, stdout, stderr, theirs } = standard(command, n)?;
     let inherited = theirs.each_ref().map(|it| it.as_raw_handle());
-    let flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW;
+    let flags = CREATE_UNICODE_ENVIRONMENT
+        | EXTENDED_STARTUPINFO_PRESENT
+        | CREATE_SUSPENDED
+        | CREATE_NO_WINDOW;
     let (process, thread) = create(launch, inherited, &inherited, flags)?;
     // SAFETY: the job and the process just made, which has not run.
-    if let Err(error) = sys::check(unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) }) {
+    if let Err(error) = sys::check(unsafe {
+        AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle())
+    }) {
         // SAFETY: the process just made.
         unsafe { TerminateProcess(process.as_raw_handle(), KILLED) };
         // alloc: an error path.
@@ -499,7 +531,10 @@ struct Posted {
 impl Waiter {
     /// Posting to `port`, which outlives every wait of the driver's, `id` with `key`.
     pub(super) fn new(port: &Port, key: usize, id: u64) -> Waiter {
-        Waiter { posted: UnsafeCell::new(Posted { port: port.raw(), key, id }), _pinned: PhantomPinned }
+        Waiter {
+            posted: UnsafeCell::new(Posted { port: port.raw(), key, id }),
+            _pinned: PhantomPinned,
+        }
     }
 }
 

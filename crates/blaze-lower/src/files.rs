@@ -88,14 +88,16 @@ impl<T: Tree> Mounts<'_, T> {
         let mut path = path.to_owned();
         for _ in 0..=MAX_LINKS {
             let (root, under) = self.locate(&path)?;
-            let file = self
-                .tree
-                .file(root, &under)
-                .map_err(|corrupt| LowerError::at(format!("`{path}` can't be read: {corrupt}"), &path))?;
+            let file = self.tree.file(root, &under).map_err(|corrupt| {
+                LowerError::at(format!("`{path}` can't be read: {corrupt}"), &path)
+            })?;
             match file {
                 Some((_, Mode::Symlink, target)) => {
                     let target = std::str::from_utf8(&target).map_err(|_| {
-                        LowerError::at(format!("the symlink `{path}` points to a path that is not UTF-8"), &path)
+                        LowerError::at(
+                            format!("the symlink `{path}` points to a path that is not UTF-8"),
+                            &path,
+                        )
                     })?;
                     path = follow(&path, target);
                 }
@@ -114,14 +116,22 @@ impl<T: Tree> Mounts<'_, T> {
     /// Every file under the directory `dir`, by its path under `dir` as cargo names it, but
     /// those under a path of `skipped`. A symlink is read as what it points to; one that points
     /// to nothing is no file, as on the disk.
-    pub(crate) fn walk(&self, dir: &str, skipped: &[String], out: &mut Vec<Loaded>) -> Result<(), LowerError> {
+    pub(crate) fn walk(
+        &self,
+        dir: &str,
+        skipped: &[String],
+        out: &mut Vec<Loaded>,
+    ) -> Result<(), LowerError> {
         // Each directory as named, where its entries are read from, and the symlinks followed
         // to reach it.
         let mut dirs: Vec<(String, String, u32)> = vec![(dir.to_owned(), dir.to_owned(), 0)];
         while let Some((named, real, links)) = dirs.pop() {
             let (root, under) = self.locate(&real)?;
             let Some(entries) = self.tree.list(root, &under) else {
-                return Err(LowerError::at(format!("the directory `{real}` is not in its mount's files"), &real));
+                return Err(LowerError::at(
+                    format!("the directory `{real}` is not in its mount's files"),
+                    &real,
+                ));
             };
             for (name, is_dir) in entries.into_iter().rev() {
                 let child = format!("{named}/{name}");
@@ -138,7 +148,9 @@ impl<T: Tree> Mounts<'_, T> {
                     Node::Dir(target) if links < MAX_LINKS => dirs.push((child, target, links + 1)),
                     Node::Dir(_) => {
                         return Err(LowerError::at(
-                            format!("`{child}`: more than {MAX_LINKS} symlinked directories in a row"),
+                            format!(
+                                "`{child}`: more than {MAX_LINKS} symlinked directories in a row"
+                            ),
                             &child,
                         ));
                     }

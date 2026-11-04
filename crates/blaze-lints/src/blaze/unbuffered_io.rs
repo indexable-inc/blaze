@@ -29,7 +29,9 @@ use hir_expand::name::Name;
 use std::alloc::Global;
 use syntax::TextRange;
 
-use super::{Finding, Lint, alloc::written_callee, exempt, facts, hash_order_output::local_of, loops};
+use super::{
+    Finding, Lint, alloc::written_callee, exempt, facts, hash_order_output::local_of, loops,
+};
 use crate::check::Cx;
 
 const LINT: Lint = Lint::UnbufferedIo;
@@ -75,7 +77,12 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
 }
 
 /// The place `expr` names, its references and derefs peeled: a local, or a field of one.
-fn root(cx: &Cx<'_, '_>, def: DefWithBodyId, body: &Body, expr: ExprId) -> Option<(BindingId, Option<Name>)> {
+fn root(
+    cx: &Cx<'_, '_>,
+    def: DefWithBodyId,
+    body: &Body,
+    expr: ExprId,
+) -> Option<(BindingId, Option<Name>)> {
     let mut at = expr;
     for _ in 0..8 {
         match body.expr(at) {
@@ -99,11 +106,14 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let db = cx.db();
     let body = analysis.body();
     let infer = analysis.infer();
-    let times = u64::try_from(cx.conf().int("unbuffered-io-writes", TIMES as i64)).unwrap_or(TIMES).max(1);
-    let small = u64::try_from(cx.conf().int("unbuffered-io-small-read", SMALL as i64)).unwrap_or(SMALL);
+    let times =
+        u64::try_from(cx.conf().int("unbuffered-io-writes", TIMES as i64)).unwrap_or(TIMES).max(1);
+    let small =
+        u64::try_from(cx.conf().int("unbuffered-io-small-read", SMALL as i64)).unwrap_or(SMALL);
     let mut parents = None;
     // alloc: the places of one body written or read, a few
-    let mut groups: HashMap<(BindingId, Option<Name>, Way), (&'static str, Vec<Call>), Global> = HashMap::new_in(Global);
+    let mut groups: HashMap<(BindingId, Option<Name>, Way), (&'static str, Vec<Call>), Global> =
+        HashMap::new_in(Global);
     // alloc: the order the places were first seen, so the findings come out in source order
     let mut order = Vec::new();
     for (id, expr) in body.exprs() {
@@ -115,15 +125,23 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             (_, true) => Way::Read,
             _ => continue,
         };
-        let Some(adt) = analysis.ty(infer.expr_ty(receiver)).strip_references().as_adt() else { continue };
+        let Some(adt) = analysis.ty(infer.expr_ty(receiver)).strip_references().as_adt() else {
+            continue;
+        };
         let kinds = match way {
             Way::Write => WRITERS,
             Way::Read => READERS,
         };
-        let Some(kind) = kinds.iter().copied().find(|it| facts::adt_is(db, adt, "std", it)) else { continue };
+        let Some(kind) = kinds.iter().copied().find(|it| facts::adt_is(db, adt, "std", it)) else {
+            continue;
+        };
         if way == Way::Read {
             let Some(&buf) = args.first() else { continue };
-            let size = analysis.ty(infer.expr_ty(buf)).strip_references().as_array(db).map(|(_, n)| n as u64);
+            let size = analysis
+                .ty(infer.expr_ty(buf))
+                .strip_references()
+                .as_array(db)
+                .map(|(_, n)| n as u64);
             if !size.is_some_and(|it| it <= small) {
                 continue;
             }

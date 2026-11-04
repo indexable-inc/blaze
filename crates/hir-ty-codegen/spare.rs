@@ -245,7 +245,11 @@ mod tests {
         let sig = dfg.signatures.push(signature());
         let block = dfg.make_block();
         let to = dfg.block_call(block, &[]);
-        dfg.exception_tables.push(ir::ExceptionTableData::new(sig, to, [ir::ExceptionTableItem::Default(to)]));
+        dfg.exception_tables.push(ir::ExceptionTableData::new(
+            sig,
+            to,
+            [ir::ExceptionTableItem::Default(to)],
+        ));
         keep_context(used);
         let kept = context();
         assert_eq!(bytes(&kept.func), bytes(&ir::Function::new()));
@@ -289,7 +293,8 @@ mod tests {
             made
         };
         let cold = fill();
-        let warm = blaze_alloc_count::assert_at_most(0, "a warm unit's relocations and line rows", fill);
+        let warm =
+            blaze_alloc_count::assert_at_most(0, "a warm unit's relocations and line rows", fill);
         assert_eq!(cold, warm);
         assert_eq!(warm, (100, 100));
     }
@@ -321,8 +326,11 @@ mod tests {
     fn a_kept_layout_list_is_reused_whole() {
         LAYOUT_LISTS.with_borrow_mut(Vec::clear);
         let dl = rustc_abi::TargetDataLayout::default();
-        let scalar = crate::Scalar::Union { value: crate::Primitive::Int(rustc_abi::Integer::I32, true) };
-        let stock = |n| -> Vec<Box<Layout>> { (0..n).map(|_| Box::new(Layout::scalar(&dl, scalar))).collect() };
+        let scalar =
+            crate::Scalar::Union { value: crate::Primitive::Int(rustc_abi::Integer::I32, true) };
+        let stock = |n| -> Vec<Box<Layout>> {
+            (0..n).map(|_| Box::new(Layout::scalar(&dl, scalar))).collect()
+        };
         let fill = |boxes: Vec<Box<Layout>>| {
             let mut variants = layout_list();
             assert!(variants.is_empty(), "a kept list holds a layout past its build");
@@ -333,7 +341,8 @@ mod tests {
         };
         let cold = fill(stock(64));
         let warm_stock = stock(64);
-        let warm = blaze_alloc_count::assert_at_most(0, "a warm build's layout list", || fill(warm_stock));
+        let warm =
+            blaze_alloc_count::assert_at_most(0, "a warm build's layout list", || fill(warm_stock));
         assert_eq!((cold, warm), (64, 64));
         assert!(layout_list().is_empty());
     }

@@ -102,7 +102,8 @@ pub(super) fn render_records(db: &TestDB, def_map: &DefMap) -> String {
     }
     for &(glob, module) in glob_targets {
         let target = module.name(db).map_or("crate".to_owned(), |it| it.as_str().to_owned());
-        out += &format!("glob {} reads {target}\n", import_text(db, ImportOrExternCrate::Glob(glob)));
+        out +=
+            &format!("glob {} reads {target}\n", import_text(db, ImportOrExternCrate::Glob(glob)));
     }
     for it in macro_calls {
         out += &format!("call {}\n", via_text(db, it.via));
@@ -617,7 +618,8 @@ fn f() { ().clone(); }
     .into_db();
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
-    let ModuleDefId::TraitId(clone) = def_map.resolve_in_prelude(&db, &name("Clone")).types.unwrap().def
+    let ModuleDefId::TraitId(clone) =
+        def_map.resolve_in_prelude(&db, &name("Clone")).types.unwrap().def
     else {
         panic!()
     };

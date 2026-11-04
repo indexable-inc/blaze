@@ -174,7 +174,9 @@ enum RangeBound {
     Float(u128),
 }
 
-fn fields_of<'a, 'db>(pats: impl IntoIterator<Item = Pat<'a, 'db>>) -> Vec<IndexedPat<Cx<'a, 'db>>> {
+fn fields_of<'a, 'db>(
+    pats: impl IntoIterator<Item = Pat<'a, 'db>>,
+) -> Vec<IndexedPat<Cx<'a, 'db>>> {
     // alloc: `DeconstructedPat::new` takes its fields as a `Vec`; one per lowered pattern.
     pats.into_iter().enumerate().map(|(i, p)| p.at_index(i)).collect()
 }
@@ -310,9 +312,9 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
             }
             HirPat::Slice { prefix, slice, suffix } => {
                 let array_len = match ty.kind() {
-                    TyKind::Array(_, len) => Some(
-                        try_const_usize(db, len).ok_or(LowerError::Failed)? as usize,
-                    ),
+                    TyKind::Array(_, len) => {
+                        Some(try_const_usize(db, len).ok_or(LowerError::Failed)? as usize)
+                    }
                     TyKind::Slice(_) => None,
                     _ => return Err(LowerError::Failed),
                 };
@@ -326,7 +328,13 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                     lowered.push(self.lower(p)?);
                 }
                 let fields = fields_of(lowered);
-                Self::new_pat(Constructor::Slice(Slice::new(array_len, kind)), fields, kind.arity(), ty, pat)
+                Self::new_pat(
+                    Constructor::Slice(Slice::new(array_len, kind)),
+                    fields,
+                    kind.arity(),
+                    ty,
+                    pat,
+                )
             }
             HirPat::Ref { pat: inner, .. } => {
                 // A `&` that edition 2024's match ergonomics ate against an inherited reference.
@@ -644,7 +652,7 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
     fn not_partial_eq(&self, ty: Ty<'db>) -> ConstPatternError {
         let mut facts = PartialEqFacts {
             lowerer: self,
-            local_manual: Vec::new(), // alloc: none until `push_new`.
+            local_manual: Vec::new(),  // alloc: none until `push_new`.
             local_without: Vec::new(), // alloc: as above.
             manual: Vec::new(),        // alloc: as above.
             without: Vec::new(),       // alloc: as above.
@@ -704,7 +712,15 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
             let size = self.layout_size(field_ty)?;
             let le = field.read(backing).to_le_bytes();
             let field_bytes = le.get(..size).ok_or(LowerError::Failed)?;
-            lowered.push(self.value_pat(pat, field_ty, field_bytes, map, depth + 1, refusals, refused)?);
+            lowered.push(self.value_pat(
+                pat,
+                field_ty,
+                field_bytes,
+                map,
+                depth + 1,
+                refusals,
+                refused,
+            )?);
         }
         let arity = lowered.len();
         Ok(Self::new_pat(Constructor::Struct, fields_of(lowered), arity, ty, pat))
@@ -725,11 +741,12 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         }
         let db = self.cx.db;
         let env = ParamEnvAndCrate { param_env: self.cx.env, krate: self.cx.krate }.store();
-        let field = |offset: usize, size: usize| {
-            bytes.get(offset..offset + size).ok_or(LowerError::Failed)
-        };
+        let field =
+            |offset: usize, size: usize| bytes.get(offset..offset + size).ok_or(LowerError::Failed);
         Ok(match ty.kind() {
-            TyKind::Bool => Self::leaf(Constructor::Bool(bytes.first().is_some_and(|&b| b != 0)), ty, pat),
+            TyKind::Bool => {
+                Self::leaf(Constructor::Bool(bytes.first().is_some_and(|&b| b != 0)), ty, pat)
+            }
             TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) => {
                 let info = self.cx.int_info(ty).ok_or(LowerError::Failed)?;
                 let bits = truncate(read_uint(bytes).ok_or(LowerError::Failed)?, info.bits);
@@ -767,7 +784,15 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                 for (i, field_ty) in tys.iter().enumerate() {
                     let offset = layout.fields.offset(i).bytes_usize();
                     let size = self.layout_size(field_ty)?;
-                    lowered.push(self.value_pat(pat, field_ty, field(offset, size)?, map, depth + 1, refusals, refused)?);
+                    lowered.push(self.value_pat(
+                        pat,
+                        field_ty,
+                        field(offset, size)?,
+                        map,
+                        depth + 1,
+                        refusals,
+                        refused,
+                    )?);
                 }
                 let arity = lowered.len();
                 Self::new_pat(Constructor::Struct, fields_of(lowered), arity, ty, pat)
@@ -786,7 +811,15 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                         let i = u32::from(fid.into_raw()) as usize;
                         let offset = layout.fields.offset(i).bytes_usize();
                         let size = self.layout_size(field_ty)?;
-                        lowered.push(self.value_pat(pat, field_ty, field(offset, size)?, map, depth + 1, refusals, refused)?);
+                        lowered.push(self.value_pat(
+                            pat,
+                            field_ty,
+                            field(offset, size)?,
+                            map,
+                            depth + 1,
+                            refusals,
+                            refused,
+                        )?);
                     }
                     let arity = lowered.len();
                     Self::new_pat(Constructor::Struct, fields_of(lowered), arity, ty, pat)
@@ -795,7 +828,8 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                     let layout = db
                         .layout_of_adt(id.into(), args.store(), env)
                         .map_err(|_| LowerError::Failed)?;
-                    let target = db.target_data_layout(self.cx.krate).map_err(|_| LowerError::Failed)?;
+                    let target =
+                        db.target_data_layout(self.cx.krate).map_err(|_| LowerError::Failed)?;
                     let (variant, variant_layout) =
                         detect_variant_from_bytes(&layout, db, target, bytes, id)
                             .ok_or(LowerError::Failed)?;
@@ -805,7 +839,15 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                         let i = u32::from(fid.into_raw()) as usize;
                         let offset = variant_layout.fields.offset(i).bytes_usize();
                         let size = self.layout_size(field_ty)?;
-                        lowered.push(self.value_pat(pat, field_ty, field(offset, size)?, map, depth + 1, refusals, refused)?);
+                        lowered.push(self.value_pat(
+                            pat,
+                            field_ty,
+                            field(offset, size)?,
+                            map,
+                            depth + 1,
+                            refusals,
+                            refused,
+                        )?);
                     }
                     let arity = lowered.len();
                     let ctor = Constructor::Variant(VariantIdx::of(db, variant));
@@ -821,10 +863,24 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                 let size = self.layout_size(elem)?;
                 let mut lowered = Vec::with_capacity(len);
                 for i in 0..len {
-                    lowered.push(self.value_pat(pat, elem, field(i * size, size)?, map, depth + 1, refusals, refused)?);
+                    lowered.push(self.value_pat(
+                        pat,
+                        elem,
+                        field(i * size, size)?,
+                        map,
+                        depth + 1,
+                        refusals,
+                        refused,
+                    )?);
                 }
                 let kind = SliceKind::FixedLen(len);
-                Self::new_pat(Constructor::Slice(Slice::new(Some(len), kind)), fields_of(lowered), len, ty, pat)
+                Self::new_pat(
+                    Constructor::Slice(Slice::new(Some(len), kind)),
+                    fields_of(lowered),
+                    len,
+                    ty,
+                    pat,
+                )
             }
             TyKind::Ref(_, pointee, _) => {
                 let half = bytes.len() / 2;
@@ -843,11 +899,26 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                         let data = map.get(addr, size * count).ok_or(LowerError::Failed)?;
                         let mut lowered = Vec::with_capacity(count);
                         for i in 0..count {
-                            let elem_bytes = data.get(i * size..(i + 1) * size).ok_or(LowerError::Failed)?;
-                            lowered.push(self.value_pat(pat, elem, elem_bytes, map, depth + 1, refusals, refused)?);
+                            let elem_bytes =
+                                data.get(i * size..(i + 1) * size).ok_or(LowerError::Failed)?;
+                            lowered.push(self.value_pat(
+                                pat,
+                                elem,
+                                elem_bytes,
+                                map,
+                                depth + 1,
+                                refusals,
+                                refused,
+                            )?);
                         }
                         let kind = SliceKind::FixedLen(count);
-                        Self::new_pat(Constructor::Slice(Slice::new(None, kind)), fields_of(lowered), count, pointee, pat)
+                        Self::new_pat(
+                            Constructor::Slice(Slice::new(None, kind)),
+                            fields_of(lowered),
+                            count,
+                            pointee,
+                            pat,
+                        )
                     }
                     TyKind::Dynamic(..) | TyKind::Foreign(_) => {
                         refusals.valtree(ConstPatternError::Invalid(pointee.store()));
@@ -898,7 +969,12 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
     }
 
     /// A literal pattern, or `-` of one.
-    fn lit_expr_pat(&self, pat: PatId, ty: Ty<'db>, expr: ExprId) -> Result<Pat<'a, 'db>, LowerError> {
+    fn lit_expr_pat(
+        &self,
+        pat: PatId,
+        ty: Ty<'db>,
+        expr: ExprId,
+    ) -> Result<Pat<'a, 'db>, LowerError> {
         let (lit, negated) = self.literal_of(expr).ok_or(LowerError::Failed)?;
         self.lit_pat(pat, ty, lit, negated)
     }
@@ -914,7 +990,13 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         }
     }
 
-    fn lit_pat(&self, pat: PatId, ty: Ty<'db>, lit: &Literal, negated: bool) -> Result<Pat<'a, 'db>, LowerError> {
+    fn lit_pat(
+        &self,
+        pat: PatId,
+        ty: Ty<'db>,
+        lit: &Literal,
+        negated: bool,
+    ) -> Result<Pat<'a, 'db>, LowerError> {
         Ok(match (ty.kind(), lit) {
             (TyKind::Bool, Literal::Bool(b)) => Self::leaf(Constructor::Bool(*b), ty, pat),
             (TyKind::Char | TyKind::Int(_) | TyKind::Uint(_), _) => {
@@ -946,7 +1028,12 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
     }
 
     /// `b"..."` against `[u8; N]` or `[u8]`: its bytes, one `u8` pattern each.
-    fn byte_string(&self, pat: PatId, ty: Ty<'db>, bytes: &[u8]) -> Result<Pat<'a, 'db>, LowerError> {
+    fn byte_string(
+        &self,
+        pat: PatId,
+        ty: Ty<'db>,
+        bytes: &[u8],
+    ) -> Result<Pat<'a, 'db>, LowerError> {
         let (elem, array_len) = match ty.kind() {
             TyKind::Array(elem, _) => (elem, Some(bytes.len())),
             TyKind::Slice(elem) => (elem, None),
@@ -958,14 +1045,26 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         });
         let fields: Vec<_> = fields_of(lowered);
         let kind = SliceKind::FixedLen(bytes.len());
-        Ok(Self::new_pat(Constructor::Slice(Slice::new(array_len, kind)), fields, bytes.len(), ty, pat))
+        Ok(Self::new_pat(
+            Constructor::Slice(Slice::new(array_len, kind)),
+            fields,
+            bytes.len(),
+            ty,
+            pat,
+        ))
     }
 
     fn int_lit(&self, ty: Ty<'db>, lit: &Literal, negated: bool) -> Option<MaybeInfiniteInt> {
         let info = self.cx.int_info(ty)?;
         let bits = match *lit {
             Literal::Int(v, _) => (if negated { v.wrapping_neg() } else { v }) as u128,
-            Literal::Uint(v, _) => if negated { v.wrapping_neg() } else { v },
+            Literal::Uint(v, _) => {
+                if negated {
+                    v.wrapping_neg()
+                } else {
+                    v
+                }
+            }
             Literal::Char(c) => c as u128,
             _ => return None,
         };
@@ -976,9 +1075,9 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
     fn range_bound(&self, expr: ExprId, ty: Ty<'db>) -> Result<RangeBound, LowerError> {
         if let Some((lit, negated)) = self.literal_of(expr) {
             return match ty.kind() {
-                TyKind::Float(fty) => {
-                    float_lit_bits(fty, lit, negated).map(RangeBound::Float).ok_or(LowerError::Failed)
-                }
+                TyKind::Float(fty) => float_lit_bits(fty, lit, negated)
+                    .map(RangeBound::Float)
+                    .ok_or(LowerError::Failed),
                 _ => self.int_lit(ty, lit, negated).map(RangeBound::Int).ok_or(LowerError::Failed),
             };
         }
@@ -1018,8 +1117,14 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         let ctor = match ty.kind() {
             TyKind::Float(fty) => {
                 let (lo, hi) = (
-                    lo.map(|b| match b { RangeBound::Float(bits) => bits, RangeBound::Int(_) => 0 }),
-                    hi.map(|b| match b { RangeBound::Float(bits) => bits, RangeBound::Int(_) => 0 }),
+                    lo.map(|b| match b {
+                        RangeBound::Float(bits) => bits,
+                        RangeBound::Int(_) => 0,
+                    }),
+                    hi.map(|b| match b {
+                        RangeBound::Float(bits) => bits,
+                        RangeBound::Int(_) => 0,
+                    }),
                 );
                 let ctor = float_range_ctor(fty, lo, hi, range_end);
                 if !float_range_is_valid(&ctor) {
@@ -1075,7 +1180,12 @@ fn float_lit_bits(fty: FloatTy, lit: &Literal, negated: bool) -> Option<u128> {
     }
 }
 
-fn float_ctor<'a, 'db>(fty: FloatTy, lo: u128, hi: u128, end: RangeEnd) -> Constructor<Cx<'a, 'db>> {
+fn float_ctor<'a, 'db>(
+    fty: FloatTy,
+    lo: u128,
+    hi: u128,
+    end: RangeEnd,
+) -> Constructor<Cx<'a, 'db>> {
     float_range_ctor(fty, Some(lo), Some(hi), end)
 }
 

@@ -10,13 +10,13 @@
 //! ```
 //!
 //! Another key under `[net]` or `[net.http3-hosts]`, or a value none of those it takes, is an
-//! error naming the file and the key; other tables are not this module's (`[update]` is the
-//! launcher's, crates/blaze-engine/src/update.rs on branch launcher-update, which reads the
-//! same file: when both are on main, the file's path and its reading move to one place).
+//! error naming the file and the key; other tables are not this module's (`[update]` is
+//! crates/blaze-engine/src/update.rs's). The file is found and read in one place,
+//! `blaze_manifest::user_config`, for both.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Context as _;
+use blaze_manifest::user_config::{self, UserConfigError};
 
 use super::choice::{Http3, Proxies};
 
@@ -35,34 +35,26 @@ pub struct Net {
     pub adverts: Option<PathBuf>,
 }
 
-/// The configuration file's name, as messages say it when blaze's home can't be found.
-const CONFIG_SAID: &str = "~/.blaze/config.toml";
-
 impl Net {
     /// HTTP/3 off, no proxy, no adverts kept: what a test's client is made with.
     pub fn off() -> Net {
-        Net { config: CONFIG_SAID.to_owned(), ..Net::default() }
+        Net { config: user_config::SAID.to_owned(), ..Net::default() }
     }
 
     /// `[net]` of the user's `config.toml` (none: every setting's default), the process's
     /// proxies, and the adverts kept in the daemon's state (`<root>/v2/net/h3-adverts.json`).
     pub fn from_user_config() -> anyhow::Result<Net> {
-        let file = user_config_file();
+        let file = user_config::home().map(|home| user_config::file(&home));
         let mut net = Net {
-            config: file.as_ref().map_or_else(|| CONFIG_SAID.to_owned(), |it| it.display().to_string()),
+            config: file.as_ref().map_or_else(|| user_config::SAID.to_owned(), |it| it.display().to_string()),
             proxies: Proxies::from_env(|name| std::env::var(name).ok()),
             adverts: adverts_file()?,
             ..Net::default()
         };
-        if let Some(file) = file {
-            let text = match std::fs::read_to_string(&file) {
-                Ok(text) => Some(text),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error).with_context(|| format!("reading blaze's configuration {}", file.display())),
-            };
-            if let Some(text) = text {
-                (net.http3, net.hosts) = read(&file, &text)?;
-            }
+        if let Some(file) = file
+            && let Some(table) = user_config::read(&file)?
+        {
+            (net.http3, net.hosts) = read(&file, &table)?;
         }
         Ok(net)
     }
@@ -73,32 +65,18 @@ impl Net {
     }
 }
 
-/// `config.toml` in blaze's home: `$BLAZE_HOME`, else `~/.blaze` (crates/blaze-engine/src/pin.rs
-/// finds `versions/` there).
-fn user_config_file() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Some(PathBuf::from(home).join("config.toml"));
-    }
-    let home = std::env::var_os("HOME").filter(|it| !it.is_empty())?;
-    Some(PathBuf::from(home).join(".blaze").join("config.toml"))
-}
-
 /// Where the daemon keeps the adverts of HTTP/3: `net/h3-adverts.json` in its state.
 fn adverts_file() -> anyhow::Result<Option<PathBuf>> {
     let root = blaze_manifest::home::process_root().map_err(anyhow::Error::msg)?;
     Ok(root.map(|root| blaze_manifest::home::state(&root).join("net").join("h3-adverts.json")))
 }
 
-/// `net.http3` and `[net.http3-hosts]` of `text`, the contents of `file`.
-fn read(file: &Path, text: &str) -> anyhow::Result<(Http3, std::collections::BTreeMap<String, Http3>)> {
-    let table: toml::Table = toml::from_str(text).with_context(|| format!("{} is not TOML", file.display()))?;
+/// `net.http3` and `[net.http3-hosts]` of `table`, read from `file`.
+fn read(file: &Path, table: &toml::Table) -> Result<(Http3, std::collections::BTreeMap<String, Http3>), UserConfigError> {
     let mut http3 = Http3::default();
     let mut hosts = std::collections::BTreeMap::new();
-    let Some(net) = table.get("net") else { return Ok((http3, hosts)) };
-    let bad = |key: &str, wants: &str, got: &toml::Value| {
-        anyhow::anyhow!("{}: `{key}` is {wants}, not {got}", file.display())
-    };
-    let net = net.as_table().ok_or_else(|| bad("net", "a table", net))?;
+    let Some(net) = user_config::section(table, file, "net")? else { return Ok((http3, hosts)) };
+    let bad = |key: &str, wants: &str, got: &toml::Value| UserConfigError::setting(file, key, wants, got);
     let setting = |key: &str, value: &toml::Value| value.as_str().and_then(Http3::parse).ok_or_else(|| bad(key, Http3::NAMES, value));
     for (key, value) in net {
         match key.as_str() {

@@ -16,13 +16,13 @@
 //! not on a bound, and does not make it bounded.
 
 use base_db::Db;
+use hir::AsAssocItem as _;
 use hir_def::{
     FunctionId,
     expr_store::Body,
     hir::{BinaryOp, CmpOp, Expr, ExprId, LabelId, LoopSource},
     signatures::FunctionSignature,
 };
-use hir::AsAssocItem as _;
 
 use super::{
     Finding, Lint,
@@ -70,7 +70,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         let Some((wait, what)) = first_wait(cx, analysis, inner) else { continue };
         let parents = parents.get_or_insert_with(|| Parents::of(body));
         let exits = exits(body, parents, id, inner, label, source);
-        if exits.is_empty() || exits.iter().any(|&guard| guard.is_some_and(|it| compares(analysis, it))) {
+        if exits.is_empty()
+            || exits.iter().any(|&guard| guard.is_some_and(|it| compares(analysis, it)))
+        {
             continue;
         }
         let Some(range) = analysis.expr_range(wait) else { continue };
@@ -78,11 +80,11 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             hir::DefWithBody::Function(f) => format!("`{}`", f.name(db).as_str()),
             _ => "this item".to_owned(), // alloc: a message's part
         };
-        let until = exits
-            .iter()
-            .flatten()
-            .find_map(|&guard| analysis.expr_range(guard))
-            .map_or_else(|| "for what its `break` matches".to_owned(), |it| format!("for `{}`", cx.snippet(it))); // alloc: a message's part
+        let until =
+            exits.iter().flatten().find_map(|&guard| analysis.expr_range(guard)).map_or_else(
+                || "for what its `break` matches".to_owned(),
+                |it| format!("for `{}`", cx.snippet(it)),
+            ); // alloc: a message's part
         let message = format!(
             "this {kind} in {function} waits with {what} {until}, and nothing bounds it: no count, depth or \
              deadline is compared where it ends"
@@ -96,7 +98,11 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 
 /// The first wait of the loop body `inner`, outside the loops and closures in it, with what it
 /// is as the message names it.
-fn first_wait(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>, inner: ExprId) -> Option<(ExprId, String)> {
+fn first_wait(
+    cx: &Cx<'_, '_>,
+    analysis: &hir::BodyAnalysis<'_>,
+    inner: ExprId,
+) -> Option<(ExprId, String)> {
     let db = cx.db();
     let body = analysis.body();
     let infer = analysis.infer();
@@ -125,7 +131,9 @@ fn waits_with(cx: &Cx<'_, '_>, db: &Db, f: FunctionId) -> Option<String> {
     let function = hir::Function::from(f);
     let name = FunctionSignature::of(db, f).name.as_str();
     let krate = function.module(db).krate(db);
-    if let Some(path) = FREE.iter().find(|path| cx.std_def(path) == Some(hir::ModuleDef::Function(function))) {
+    if let Some(path) =
+        FREE.iter().find(|path| cx.std_def(path) == Some(hir::ModuleDef::Function(function)))
+    {
         return Some(format!("`{}`", path.join("::")));
     }
     if function.as_assoc_item(db).is_none() {
@@ -192,7 +200,9 @@ fn guard_of(body: &Body, parents: &Parents, exit: ExprId, id: ExprId) -> Option<
         match body.expr(parent) {
             Expr::If { condition, .. } if condition != child => return Some(condition),
             Expr::Match { arms, .. } => {
-                if let Some(guard) = arms.iter().find(|arm| arm.expr == child).and_then(|arm| arm.guard) {
+                if let Some(guard) =
+                    arms.iter().find(|arm| arm.expr == child).and_then(|arm| arm.guard)
+                {
                     return Some(guard);
                 }
             }
@@ -268,7 +278,10 @@ pub fn retry() -> u32 {
             found.contains("this `while` loop in `poll` waits with `std::thread::sleep` for `!ready()`, and nothing bounds it"),
             "{found}"
         );
-        assert!(found.contains("this `loop` in `spin` waits with `std::hint::spin_loop` for `ready()`"), "{found}");
+        assert!(
+            found.contains("this `loop` in `spin` waits with `std::hint::spin_loop` for `ready()`"),
+            "{found}"
+        );
         assert!(found.contains("this `loop` in `retry` waits with `std::thread::sleep` for what its `break` matches"), "{found}");
     }
 

@@ -54,9 +54,9 @@
 
 use base_db::{Crate, Db, ExtraCrateData, TargetKind};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use hir_expand::proc_macro::{ProcMacroKind, ProcMacros};
+use std::alloc::Global;
 
 use crate::{
     deps::{image::IMAGE_SCHEMA, reads, serve::Refused, signatures},
@@ -68,7 +68,10 @@ pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 4";
 
 /// What makes the images: the version of each encoding in them, so an image of another
 /// encoding is never found.
-#[expect(clippy::disallowed_types, reason = "the process's one producer content id: all image keys use the same encoding identity")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one producer content id: all image keys use the same encoding identity"
+)]
 pub static PRODUCER: std::sync::LazyLock<ContentId> = std::sync::LazyLock::new(|| {
     let mut hasher = Hasher::new(KEY_DOMAIN);
     hasher.part(b"producer");
@@ -113,7 +116,11 @@ pub struct KeyInputs {
 
 /// [`keys`], each with what it was made from: the same walk, so the closure is exactly the
 /// crates whose keys the key hashed.
-pub fn key_inputs(db: &Db, crates: &[Crate], build: ContentId) -> HashMap<Crate, KeyInputs, Global> {
+pub fn key_inputs(
+    db: &Db,
+    crates: &[Crate],
+    build: ContentId,
+) -> HashMap<Crate, KeyInputs, Global> {
     let memo = walked(db, crates, build);
     let inputs = |(&krate, key): (&Crate, &Option<ContentId>)| {
         // alloc: setup: once per crate a driver publishes
@@ -211,7 +218,8 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, memo: &Memo, hasher: &mut Ha
         crate_types,
         proc_macro_cwd,
     } = krate.data(db);
-    let ExtraCrateData { version, display_name, potential_cfg_options, built_for } = krate.extra_data(db);
+    let ExtraCrateData { version, display_name, potential_cfg_options, built_for } =
+        krate.extra_data(db);
 
     let root = db.file_source_root(*root_file_id).source_root_id(db);
     let root_path = db.source_root(root).source_root_ref(db).path_for_file(root_file_id);

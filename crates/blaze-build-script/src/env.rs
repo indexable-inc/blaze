@@ -85,7 +85,6 @@ impl Env {
             .filter(move |(_, it)| **it == from_unit)
             .map(|((name, value), _)| (name.as_os_str(), value.as_os_str()))
     }
-
 }
 
 /// What cargo sets on the command, in order, over what it inherits: a variable set, or taken

@@ -4,8 +4,8 @@
 
 use base_db::{Db, all_crates};
 use hir_def::{
-    DefWithBodyId, FunctionId, ModuleDefId, expr_store::Body, hir::ExprId,
-    nameres::crate_def_map, signatures::FunctionSignature,
+    DefWithBodyId, FunctionId, ModuleDefId, expr_store::Body, hir::ExprId, nameres::crate_def_map,
+    signatures::FunctionSignature,
 };
 use hir_expand::fixture;
 

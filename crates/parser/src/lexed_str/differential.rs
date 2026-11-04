@@ -18,16 +18,147 @@ use crate::Edition;
 /// `#`, escapes, `.` after digits, bases, exponents, suffixes, comments and their nesting,
 /// Unicode whitespace and identifiers, and the end of the text.
 const PIECES: &[&str] = &[
-    "r", "b", "c", "k", "br", "cr", "rb", "r#", "#", "##", "###", "\"", "\"#", "\"##", "'", "'a", "'r#a",
-    "'1", "'_", "_", "__", "0", "1", "9", "0x", "0b", "0o", "0x_", "0xfF", "1e", "1E", "1e+", "1e-", "e",
-    "E", "1.", "1.5", "..", ".", "1_000", "u8", "f32", "i128", "_u", "/", "//", "///", "////", "//!",
-    "/*", "*/", "/**", "/*!", "/**/", "/***", "*", "\n", " ", "\t", "\r", "\r\n", "\x0B", "\x0C",
-    "\u{85}", "\u{200E}", "\u{2028}", "é", "名", "🦀", "\u{200D}", "fn", "Self", "self", "let",
-    "async", "gen", "dyn", "try", "union", "{", "}", "(", ")", "[", "]", ";", ":", "::", "<", ">", "=",
-    "!", "?", "@", "$", "~", "^", "%", "&", "|", "+", "-", "\\", "x", "Z", "\0", "\x01", "\x7F", "`",
-    "\\n", "\\\"", "\\\\", "\\'", "\\0", "\\u{41}", "\\u{D800}", "\\u{}", "\\u{110000}", "\\x7f",
-    "\\x80", "\\x4", "\\\n", "\\\n\n", "\\q", "\"\\", "\"\"", "''", "'''", "'\\''", "b'", "b\"",
-    "r\"", "br\"", "c\"", "cr#\"", "r##\"", "\"##", "k#fn", "r#fn", "r#_", "r#self",
+    "r",
+    "b",
+    "c",
+    "k",
+    "br",
+    "cr",
+    "rb",
+    "r#",
+    "#",
+    "##",
+    "###",
+    "\"",
+    "\"#",
+    "\"##",
+    "'",
+    "'a",
+    "'r#a",
+    "'1",
+    "'_",
+    "_",
+    "__",
+    "0",
+    "1",
+    "9",
+    "0x",
+    "0b",
+    "0o",
+    "0x_",
+    "0xfF",
+    "1e",
+    "1E",
+    "1e+",
+    "1e-",
+    "e",
+    "E",
+    "1.",
+    "1.5",
+    "..",
+    ".",
+    "1_000",
+    "u8",
+    "f32",
+    "i128",
+    "_u",
+    "/",
+    "//",
+    "///",
+    "////",
+    "//!",
+    "/*",
+    "*/",
+    "/**",
+    "/*!",
+    "/**/",
+    "/***",
+    "*",
+    "\n",
+    " ",
+    "\t",
+    "\r",
+    "\r\n",
+    "\x0B",
+    "\x0C",
+    "\u{85}",
+    "\u{200E}",
+    "\u{2028}",
+    "é",
+    "名",
+    "🦀",
+    "\u{200D}",
+    "fn",
+    "Self",
+    "self",
+    "let",
+    "async",
+    "gen",
+    "dyn",
+    "try",
+    "union",
+    "{",
+    "}",
+    "(",
+    ")",
+    "[",
+    "]",
+    ";",
+    ":",
+    "::",
+    "<",
+    ">",
+    "=",
+    "!",
+    "?",
+    "@",
+    "$",
+    "~",
+    "^",
+    "%",
+    "&",
+    "|",
+    "+",
+    "-",
+    "\\",
+    "x",
+    "Z",
+    "\0",
+    "\x01",
+    "\x7F",
+    "`",
+    "\\n",
+    "\\\"",
+    "\\\\",
+    "\\'",
+    "\\0",
+    "\\u{41}",
+    "\\u{D800}",
+    "\\u{}",
+    "\\u{110000}",
+    "\\x7f",
+    "\\x80",
+    "\\x4",
+    "\\\n",
+    "\\\n\n",
+    "\\q",
+    "\"\\",
+    "\"\"",
+    "''",
+    "'''",
+    "'\\''",
+    "b'",
+    "b\"",
+    "r\"",
+    "br\"",
+    "c\"",
+    "cr#\"",
+    "r##\"",
+    "\"##",
+    "k#fn",
+    "r#fn",
+    "r#_",
+    "r#self",
 ];
 
 pub(super) fn random_text(rng: &mut SplitMix64) -> String {
@@ -78,7 +209,10 @@ pub(super) fn parser_files() -> Vec<String> {
 /// The parser's sources alone: real Rust with no intended lexer error.
 pub(super) fn parser_sources() -> Vec<String> {
     let out = read_all(&rust_files([manifest_dir().join("src")]));
-    assert!(out.iter().any(|it| it == include_str!("differential.rs")), "the parser's sources are found");
+    assert!(
+        out.iter().any(|it| it == include_str!("differential.rs")),
+        "the parser's sources are found"
+    );
     out
 }
 
@@ -87,7 +221,8 @@ pub(super) fn parser_sources() -> Vec<String> {
 fn assert_alike(edition: Edition, text: &str, what: &str) {
     let fast = LexedStr::lex::<true>(edition, text);
     let slow = LexedStr::lex::<false>(edition, text);
-    let errors = |it: &LexedStr<'_>| it.errors().map(|(i, e)| (i, e.to_owned())).collect::<Vec<_>>();
+    let errors =
+        |it: &LexedStr<'_>| it.errors().map(|(i, e)| (i, e.to_owned())).collect::<Vec<_>>();
     if *fast.tokens == *slow.tokens
         && *fast.checkpoints == *slow.checkpoints
         && fast.long == slow.long
@@ -98,7 +233,9 @@ fn assert_alike(edition: Edition, text: &str, what: &str) {
     }
     let near = |at: usize| text.get(at..).map(|it| it.chars().take(40).collect::<String>());
     let shared = fast.tokens.len().min(slow.tokens.len());
-    match (0..shared).find(|&i| fast.raw_kind(i) != slow.raw_kind(i) || fast.raw_len(i) != slow.raw_len(i)) {
+    match (0..shared)
+        .find(|&i| fast.raw_kind(i) != slow.raw_kind(i) || fast.raw_len(i) != slow.raw_len(i))
+    {
         Some(i) => {
             let at = slow.text_start(i);
             panic!(
@@ -132,7 +269,9 @@ fn assert_alike(edition: Edition, text: &str, what: &str) {
 fn assert_hashed(edition: Edition, text: &str, fast: &LexedStr<'_>, what: &str) {
     let hashed = LexedStr::new_hashed(edition, text);
     assert!(
-        *hashed.tokens == *fast.tokens && *hashed.checkpoints == *fast.checkpoints && hashed.long == fast.long,
+        *hashed.tokens == *fast.tokens
+            && *hashed.checkpoints == *fast.checkpoints
+            && hashed.long == fast.long,
         "{what} ({edition:?}): hashing changed the tokens"
     );
     assert!(hashed.errors().eq(fast.errors()), "{what} ({edition:?}): hashing changed the errors");
@@ -144,8 +283,14 @@ fn assert_hashed(edition: Edition, text: &str, fast: &LexedStr<'_>, what: &str) 
         if LexedStr::has_name_hash(hashed.raw_kind(i)) {
             let token = &text[at..at + len];
             let name = token.strip_prefix("r#").unwrap_or(token);
-            let hash = names.next().unwrap_or_else(|| panic!("{what} ({edition:?}): no hash for token {i}, {token:?}"));
-            assert_eq!(*hash, blaze_phf::name_hash(name.as_bytes()), "{what} ({edition:?}): token {i}, {token:?}");
+            let hash = names.next().unwrap_or_else(|| {
+                panic!("{what} ({edition:?}): no hash for token {i}, {token:?}")
+            });
+            assert_eq!(
+                *hash,
+                blaze_phf::name_hash(name.as_bytes()),
+                "{what} ({edition:?}): token {i}, {token:?}"
+            );
         }
         at += len;
     }
@@ -199,8 +344,26 @@ fn fast_and_rustc_lexer_lex_alike() {
 #[test]
 fn special_tokens_lex_alike_at_every_offset_of_a_window() {
     let specials = [
-        "1", "0x1f", "1.5e3", "2u8", "\"s\"", "\"a\\\"b\"", "'a", "'c'", "b'x'", "// c\n", "/* c */",
-        "/** d */", "r#x", "r#\"q\"#", "#", "`", "1\"s\"'c'#2", "//x\n'a 1", "\"crosses\"", "r#type",
+        "1",
+        "0x1f",
+        "1.5e3",
+        "2u8",
+        "\"s\"",
+        "\"a\\\"b\"",
+        "'a",
+        "'c'",
+        "b'x'",
+        "// c\n",
+        "/* c */",
+        "/** d */",
+        "r#x",
+        "r#\"q\"#",
+        "#",
+        "`",
+        "1\"s\"'c'#2",
+        "//x\n'a 1",
+        "\"crosses\"",
+        "r#type",
     ];
     for k in 0..130 {
         for special in specials {

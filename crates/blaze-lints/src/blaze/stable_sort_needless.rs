@@ -69,8 +69,12 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         let Some(element) = element(cx, &analysis.ty(infer.expr_ty(receiver))) else { continue };
         let found_here = match (name, args) {
             ("sort", []) => !primitive(db, &element, DEPTH) && same_when_equal(cx, &element, DEPTH),
-            ("sort_by_key", [key]) => whole_key(cx, def, body, *key) && same_when_equal(cx, &element, DEPTH),
-            ("sort_by", [compare]) => whole_compare(cx, def, body, *compare) && same_when_equal(cx, &element, DEPTH),
+            ("sort_by_key", [key]) => {
+                whole_key(cx, def, body, *key) && same_when_equal(cx, &element, DEPTH)
+            }
+            ("sort_by", [compare]) => {
+                whole_compare(cx, def, body, *compare) && same_when_equal(cx, &element, DEPTH)
+            }
             _ => false,
         };
         if !found_here {
@@ -139,7 +143,11 @@ fn same_when_equal(cx: &Cx<'_, '_>, ty: &hir::Type<'_>, depth: u32) -> bool {
         return false;
     }
     if let Some(builtin) = ty.as_builtin() {
-        return builtin.is_int() || builtin.is_uint() || builtin.is_char() || builtin.is_bool() || builtin.is_str();
+        return builtin.is_int()
+            || builtin.is_uint()
+            || builtin.is_char()
+            || builtin.is_bool()
+            || builtin.is_str();
     }
     if let Some((inner, _)) = ty.as_reference() {
         return inner.is_str();
@@ -158,7 +166,9 @@ fn same_when_equal(cx: &Cx<'_, '_>, ty: &hir::Type<'_>, depth: u32) -> bool {
         return false;
     }
     match adt {
-        hir::Adt::Struct(_) => ty.fields(db).iter().all(|(_, it)| same_when_equal(cx, it, depth - 1)),
+        hir::Adt::Struct(_) => {
+            ty.fields(db).iter().all(|(_, it)| same_when_equal(cx, it, depth - 1))
+        }
         hir::Adt::Enum(e) => {
             !adt.has_non_default_type_params(db)
                 && e.variants(db)
@@ -179,7 +189,9 @@ fn derives_order(cx: &Cx<'_, '_>, adt: hir::Adt) -> bool {
         }
         for (_, path) in check::derive_paths(attr) {
             let last = path.rsplit("::").next().unwrap_or(&path);
-            if let Some(at) = ["PartialEq", "Eq", "PartialOrd", "Ord"].iter().position(|it| *it == last) {
+            if let Some(at) =
+                ["PartialEq", "Eq", "PartialOrd", "Ord"].iter().position(|it| *it == last)
+            {
                 names[at] = true;
             }
         }
@@ -212,7 +224,9 @@ fn whole_key(cx: &Cx<'_, '_>, def: DefWithBodyId, body: &Body, key: ExprId) -> b
     match body.expr(inner) {
         Expr::Path(_) => is_param(inner),
         Expr::UnaryOp { expr, op: UnaryOp::Deref } => is_param(expr),
-        Expr::MethodCall { receiver, args: [], method_name, .. } => method_name.as_str() == "clone" && is_param(receiver),
+        Expr::MethodCall { receiver, args: [], method_name, .. } => {
+            method_name.as_str() == "clone" && is_param(receiver)
+        }
         _ => false,
     }
 }
@@ -222,8 +236,11 @@ fn whole_key(cx: &Cx<'_, '_>, def: DefWithBodyId, body: &Body, key: ExprId) -> b
 fn whole_compare(cx: &Cx<'_, '_>, def: DefWithBodyId, body: &Body, compare: ExprId) -> bool {
     let Some((params, inner)) = params(body, compare) else { return false };
     let [a, b] = params.as_slice() else { return false };
-    let Expr::MethodCall { receiver, args: [other], method_name, .. } = body.expr(inner) else { return false };
+    let Expr::MethodCall { receiver, args: [other], method_name, .. } = body.expr(inner) else {
+        return false;
+    };
     let local = |it: ExprId| local_of(cx.db(), def, body, it);
     let (x, y) = (local(receiver), local(*other));
-    method_name.as_str() == "cmp" && ((x == Some(*a) && y == Some(*b)) || (x == Some(*b) && y == Some(*a)))
+    method_name.as_str() == "cmp"
+        && ((x == Some(*a) && y == Some(*b)) || (x == Some(*b) && y == Some(*a)))
 }

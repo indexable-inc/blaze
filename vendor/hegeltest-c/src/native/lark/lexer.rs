@@ -105,10 +105,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn pos(&self) -> Pos {
-        Pos {
-            line: self.line,
-            column: self.column,
-        }
+        Pos { line: self.line, column: self.column }
     }
 
     fn advance(&mut self) -> char {
@@ -221,17 +218,10 @@ impl<'a> Scanner<'a> {
         while self.peek(0).is_some_and(cont) {
             s.push(self.advance());
         }
-        if self
-            .peek(0)
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if self.peek(0).is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(self.error(pos, "Illegal name for rules or terminals"));
         }
-        Ok(if is_rule {
-            Tok::Rule(s)
-        } else {
-            Tok::Terminal(s)
-        })
+        Ok(if is_rule { Tok::Rule(s) } else { Tok::Terminal(s) })
     }
 
     /// `STRING` is `"(\\"|\\\\|[^"\n])*?"i?`.
@@ -286,10 +276,7 @@ impl<'a> Scanner<'a> {
             }
         }
         let mut flags = String::new();
-        while self
-            .peek(0)
-            .is_some_and(|c| matches!(c, 'i' | 'm' | 's' | 'l' | 'u' | 'x'))
-        {
+        while self.peek(0).is_some_and(|c| matches!(c, 'i' | 'm' | 's' | 'l' | 'u' | 'x')) {
             flags.push(self.advance());
         }
         Ok(Tok::Regexp { body, flags })
@@ -304,9 +291,7 @@ impl<'a> Scanner<'a> {
         while self.peek(0).is_some_and(|c| c.is_ascii_digit()) {
             s.push(self.advance());
         }
-        s.parse::<i64>()
-            .map(Tok::Number)
-            .map_err(|_| self.error(pos, "Number is too large"))
+        s.parse::<i64>().map(Tok::Number).map_err(|_| self.error(pos, "Number is too large"))
     }
 
     fn directive(&mut self) -> GrammarResult<Tok> {
@@ -444,13 +429,8 @@ pub fn tokenize(text: &str) -> GrammarResult<Vec<Token>> {
     let mut owned = String::with_capacity(text.len() + 1);
     owned.push_str(text);
     owned.push('\n');
-    let mut scanner = Scanner {
-        chars: owned.chars().collect(),
-        text: &owned,
-        i: 0,
-        line: 1,
-        column: 1,
-    };
+    let mut scanner =
+        Scanner { chars: owned.chars().collect(), text: &owned, i: 0, line: 1, column: 1 };
     let mut tokens = Vec::new();
     while let Some(token) = scanner.next_token()? {
         tokens.push(token);

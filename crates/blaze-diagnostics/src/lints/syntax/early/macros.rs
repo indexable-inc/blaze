@@ -26,7 +26,9 @@ mod matchers;
 use cfg::CfgAtom;
 use hir::{InFile, MacroCallId, ModuleDef, PathResolution};
 use hir_def::MacroId;
-use hir_expand::{ExpandTo, MacroCallKind, MacroCallLoc, MacroDefKind, builtin::BuiltinAttrExpander};
+use hir_expand::{
+    ExpandTo, MacroCallKind, MacroCallLoc, MacroDefKind, builtin::BuiltinAttrExpander,
+};
 use intern::sym;
 use syntax::{
     NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextRange, TextSize,
@@ -93,7 +95,12 @@ pub(super) fn crate_at(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Option<InFile<Syntax
 /// `semicolon_in_expressions_from_macros` (`..._from_non_local_macros` for a macro of another
 /// crate): rustc parses what a `macro_rules!` macro called as an expression expands to as one
 /// expression, and when a `;` comes after it, buffers the lint at the `;` and drops it.
-fn trailing_semicolon(cx: &Cx<'_, '_>, tree: &Tree<'_>, call: MacroCallId, loc: &MacroCallLoc) -> Option<Emitted> {
+fn trailing_semicolon(
+    cx: &Cx<'_, '_>,
+    tree: &Tree<'_>,
+    call: MacroCallId,
+    loc: &MacroCallLoc,
+) -> Option<Emitted> {
     let db = cx.db;
     let MacroDefKind::Declarative(def, _) = loc.def.kind else { return None };
     let MacroCallKind::FnLike { expand_to, .. } = &loc.kind else { return None };
@@ -127,7 +134,8 @@ fn trailing_semicolon(cx: &Cx<'_, '_>, tree: &Tree<'_>, call: MacroCallId, loc: 
         true => "semicolon_in_expressions_from_macros",
         false => "semicolon_in_expressions_from_non_local_macros",
     };
-    let mut diag = Diag::lint(lint, "trailing semicolon in macro used in expression position", semicolon);
+    let mut diag =
+        Diag::lint(lint, "trailing semicolon in macro used in expression position", semicolon);
     if is_trailing {
         let name = def.to_view(db).name()?.text();
         diag.note("macro invocations at the end of a block are treated as expressions");
@@ -146,7 +154,10 @@ fn trailing_semicolon(cx: &Cx<'_, '_>, tree: &Tree<'_>, call: MacroCallId, loc: 
 fn is_trailing(call: ast::MacroCall<'_>) -> bool {
     let Some(expr) = call.syntax().parent().and_then(ast::MacroExpr::cast) else { return false };
     let Some(list) = expr.syntax().parent().and_then(ast::StmtList::cast) else { return false };
-    let braced = call.token_tree().and_then(|it| it.left_delimiter_token()).is_some_and(|it| it.kind() == T!['{']);
+    let braced = call
+        .token_tree()
+        .and_then(|it| it.left_delimiter_token())
+        .is_some_and(|it| it.kind() == T!['{']);
     !braced && list.tail_expr().is_some_and(|it| it.syntax() == expr.syntax())
 }
 
@@ -179,7 +190,12 @@ fn span_of_token(cx: &Cx<'_, '_>, call: MacroCallId, token: span::Span) -> Span 
 /// `incomplete_include`: rustc parses what `include!` called as an expression or a statement
 /// reads as one expression (`ExpandInclude::make_expr`), and buffers the lint at the first
 /// token of the file after it.
-fn incomplete_include(cx: &Cx<'_, '_>, tree: &Tree<'_>, call: MacroCallId, loc: &MacroCallLoc) -> Option<Emitted> {
+fn incomplete_include(
+    cx: &Cx<'_, '_>,
+    tree: &Tree<'_>,
+    call: MacroCallId,
+    loc: &MacroCallLoc,
+) -> Option<Emitted> {
     let db = cx.db;
     if !loc.def.is_include() {
         return None;
@@ -203,7 +219,11 @@ fn incomplete_include(cx: &Cx<'_, '_>, tree: &Tree<'_>, call: MacroCallId, loc: 
     let source = cx.vsema.parse(file);
     let rest = next_token(source.syntax(), read.range.end())?;
     let span = cx.span_in_file(file.file_id(db), rest.text_range());
-    let mut diag = Diag::lint("incomplete_include", "include macro expected single expression in source", span);
+    let mut diag = Diag::lint(
+        "incomplete_include",
+        "include macro expected single expression in source",
+        span,
+    );
     let at = enclosing(cx, loc.to_node_view(db));
     source_fact(cx, &mut diag, at);
     Some(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at))
@@ -254,8 +274,13 @@ fn unexpanded_test<'db>(
         if !matches!(path.segment()?.name_ref()?.text(), "test" | "bench" | "test_case") {
             return None;
         }
-        let Some(PathResolution::Def(ModuleDef::Macro(mac))) = cx.vsema.resolve_path(path) else { return None };
-        let MacroDefKind::BuiltInAttr(_, expander) = MacroId::from(mac).definition(cx.db).kind else { return None };
+        let Some(PathResolution::Def(ModuleDef::Macro(mac))) = cx.vsema.resolve_path(path) else {
+            return None;
+        };
+        let MacroDefKind::BuiltInAttr(_, expander) = MacroId::from(mac).definition(cx.db).kind
+        else {
+            return None;
+        };
         let name = match expander {
             BuiltinAttrExpander::Test => "test",
             BuiltinAttrExpander::Bench => "bench",
@@ -277,19 +302,27 @@ fn duplicated(
     invoked: TextRange,
 ) -> Option<Emitted> {
     // rustc does not look for it on an item that is a statement.
-    if node.value.parent().is_some_and(|it| matches!(it.kind(), SyntaxKind::STMT_LIST | SyntaxKind::MACRO_STMTS)) {
+    if node
+        .value
+        .parent()
+        .is_some_and(|it| matches!(it.kind(), SyntaxKind::STMT_LIST | SyntaxKind::MACRO_STMTS))
+    {
         return None;
     }
     let owner = ast::AnyHasAttrs::cast(node.value)?;
-    let (meta, attr) = walk
-        .attrs(owner)
-        .find(|(meta, _)| meta.syntax().text_range() != invoked && meta.simple_name() == Some(name))?;
+    let (meta, attr) = walk.attrs(owner).find(|(meta, _)| {
+        meta.syntax().text_range() != invoked && meta.simple_name() == Some(name)
+    })?;
     // An attribute `cfg_attr` gives is spanned by what `cfg_attr` holds of it.
     let range = match meta.syntax().parent().is_some_and(|it| it == attr.syntax()) {
         true => attr.syntax().text_range(),
         false => meta.syntax().text_range(),
     };
-    let mut diag = Diag::lint("duplicate_macro_attributes", "duplicated attribute", cx.span(node.with_value(range)));
+    let mut diag = Diag::lint(
+        "duplicate_macro_attributes",
+        "duplicated attribute",
+        cx.span(node.with_value(range)),
+    );
     let at = enclosing(cx, node);
     source_fact(cx, &mut diag, at);
     Some(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at))
@@ -303,7 +336,12 @@ fn enclosing(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>) -> InFile<SyntaxNodeP
     loop {
         let parent = node.value.parent();
         match parent {
-            Some(parent) if matches!(parent.kind(), SyntaxKind::MACRO_EXPR | SyntaxKind::MACRO_PAT | SyntaxKind::MACRO_TYPE) => {
+            Some(parent)
+                if matches!(
+                    parent.kind(),
+                    SyntaxKind::MACRO_EXPR | SyntaxKind::MACRO_PAT | SyntaxKind::MACRO_TYPE
+                ) =>
+            {
                 node = node.with_value(parent);
             }
             Some(parent) if parent.parent().is_some() || node.file_id.macro_file().is_none() => {

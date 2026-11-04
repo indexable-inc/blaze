@@ -5,8 +5,8 @@
 use parking_lot::Mutex;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_query::db::{Database as _, Event, EventKind};
+use std::alloc::Global;
 
 use super::Db;
 

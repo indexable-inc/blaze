@@ -36,7 +36,7 @@ use hir_ty_mir::mir::{
 use parking_lot::Mutex;
 use rustc_type_ir::inherent::IntoKind as _;
 
-use super::{HirFrontend, HirInstance, HirStatic, Hashes as _, Kind, RootKind, build::Build, refs};
+use super::{Hashes as _, HirFrontend, HirInstance, HirStatic, Kind, RootKind, build::Build, refs};
 use crate::{Instance, InstanceDef};
 
 const ARGS_DOMAIN: &str = "blaze v2 devirt object args 1";
@@ -44,7 +44,8 @@ const CODE_DOMAIN: &str = "blaze v2 devirt code 1";
 
 /// The symbols that load code at run time: a program that calls one may get objects whose
 /// vtables it never made.
-const LOADERS: &[&str] = &["dlopen", "dlmopen", "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW"];
+const LOADERS: &[&str] =
+    &["dlopen", "dlmopen", "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW"];
 
 /// What one walked body does with trait objects, each once, in the order found.
 #[derive(PartialEq, Eq, Debug, Default)]
@@ -79,7 +80,9 @@ impl Facts {
         (from, to): (Ty<'db>, Ty<'db>),
     ) {
         let interner = infcx.interner;
-        let key = |ty| devirt::principal_of(interner, ty, ty).map(|it| devirt::object_key(infcx, env, it));
+        let key = |ty| {
+            devirt::principal_of(interner, ty, ty).map(|it| devirt::object_key(infcx, env, it))
+        };
         let (Some(from), Some(to)) = (key(from), key(to)) else { return };
         if from != to && !self.upcasts.contains(&(from, to)) {
             self.upcasts.push((from, to));
@@ -140,7 +143,8 @@ pub(crate) fn takes_world(
     let Kind::Code(code, env) = &instance.0 else { return Ok(false) };
     let ours = inlined
         && matches!(code.def, InstanceDef::Fn(_) | InstanceDef::Closure(_))
-        && super::frontend::crate_of(db, &instance.0).is_some_and(|it| !it.data(db).origin.is_lang());
+        && super::frontend::crate_of(db, &instance.0)
+            .is_some_and(|it| !it.data(db).origin.is_lang());
     if !ours || owner() != Owner::Workspace {
         return Ok(false);
     }
@@ -175,7 +179,11 @@ fn sites(db: &Db, body: &MirBody<'_>) -> bool {
         };
         let Some((CallableDefId::FunctionId(method), args)) = func.fn_def() else { return false };
         matches!(method.loc(db).container, ItemContainerId::TraitId(_))
-            && args.as_slice().first().and_then(|it| it.ty()).is_some_and(|it| matches!(it.kind(), TyKind::Dynamic(..)))
+            && args
+                .as_slice()
+                .first()
+                .and_then(|it| it.ty())
+                .is_some_and(|it| matches!(it.kind(), TyKind::Dynamic(..)))
     })
 }
 
@@ -215,7 +223,10 @@ impl State {
 
     pub(crate) fn reached(&self, functions: &[(HirInstance, Origin)], statics: &[HirStatic]) {
         let mut program = self.0.lock();
-        if matches!(program.makes, Some((RootKind::Executable | RootKind::Test | RootKind::Shared, _))) {
+        if matches!(
+            program.makes,
+            Some((RootKind::Executable | RootKind::Test | RootKind::Shared, _))
+        ) {
             // clone: once per instance a final binary's walk reaches, its handle
             program.functions.extend_from_slice(functions);
             // clone: once per static a final binary's walk reaches, its handle
@@ -237,13 +248,17 @@ impl State {
     pub(crate) fn closed(&self, frontend: &HirFrontend<'_>) -> Result<bool, CodegenError> {
         let (makes, functions, statics, held) = {
             let mut program = self.0.lock();
-            let lists = (std::mem::take(&mut program.functions), std::mem::take(&mut program.statics));
+            let lists =
+                (std::mem::take(&mut program.functions), std::mem::take(&mut program.statics));
             (program.makes, lists.0, lists.1, program.held.as_ref().map(|it| it.world().id))
         };
-        let Some((kind, krate)) = makes.filter(|it| it.0 != RootKind::Library) else { return Ok(false) };
+        let Some((kind, krate)) = makes.filter(|it| it.0 != RootKind::Library) else {
+            return Ok(false);
+        };
         let made = frontend.with(|db| {
             let program = program_name(db, kind, krate);
-            let _span = tracing::info_span!(target: "blaze", "devirt world", program = &*program).entered();
+            let _span =
+                tracing::info_span!(target: "blaze", "devirt world", program = &*program).entered();
             world_of(frontend, db, (kind, program), &functions, &statics)
                 .map_err(|what| refused(db, krate, kind, what))
         })?;
@@ -304,7 +319,8 @@ fn world_of(
     functions: &[(HirInstance, Origin)],
     statics: &[HirStatic],
 ) -> Result<Option<World>, String> {
-    let mut objects: blaze_hash::HashMap<ObjectKey, Found, Global> = blaze_hash::HashMap::new_in(Global);
+    let mut objects: blaze_hash::HashMap<ObjectKey, Found, Global> =
+        blaze_hash::HashMap::new_in(Global);
     // alloc: once a program, the upcasts its bodies make
     let mut upcasts = Vec::new();
     let mut loads = None;
@@ -316,7 +332,9 @@ fn world_of(
         }
         let inlined = frontend.inlines_for(db, instance, requester)?;
         sites |= takes_world(db, instance, inlined, || frontend.owner(db, &instance.0))?;
-        let Some(facts) = refs::facts(db, instance, refs::Walking::plain(inlined))? else { continue };
+        let Some(facts) = refs::facts(db, instance, refs::Walking::plain(inlined))? else {
+            continue;
+        };
         for (ty, key) in &facts.vtables {
             // clone: a reference count, once per vtable the program makes
             objects.entry(*key).or_default().tys.push(ty.clone());
@@ -326,17 +344,24 @@ fn world_of(
             let found = objects.entry(*key).or_default();
             if found.open.is_none() {
                 // alloc: the reason, once an object
-                found.open = Some(format!("{} carries it across the program's edge", super::Named(db, instance)));
+                found.open = Some(format!(
+                    "{} carries it across the program's edge",
+                    super::Named(db, instance)
+                ));
             }
         }
-        let ours = super::frontend::crate_of(db, &instance.0).is_some_and(|it| !it.data(db).origin.is_lang());
+        let ours = super::frontend::crate_of(db, &instance.0)
+            .is_some_and(|it| !it.data(db).origin.is_lang());
         if ours && loads.is_none() {
             for it in refs::listed(db, instance, refs::Walking::plain(inlined))?.iter() {
                 if let FrontRef::Extern(name) = it
                     && LOADERS.contains(&name.as_str())
                 {
                     // alloc: the reason, once a program
-                    loads = Some(format!("{} loads code at run time (`{name}`)", super::Named(db, instance)));
+                    loads = Some(format!(
+                        "{} loads code at run time (`{name}`)",
+                        super::Named(db, instance)
+                    ));
                 }
             }
         }
@@ -346,10 +371,18 @@ fn world_of(
     }
     for value in statics {
         // An `extern_weak` static holds a foreign symbol's address: no vtable of its value.
-        let super::statics::Source::Compiled(compiled) = super::statics::source(db, value.0)? else { continue };
+        let super::statics::Source::Compiled(compiled) = super::statics::source(db, value.0)?
+        else {
+            continue;
+        };
         let mut facts = Facts::default();
         for request in &compiled.requests.datas {
-            if let crate::fragment::DataRequest::Vtable { ty, trait_ref: Some((trait_, args)), .. } = request {
+            if let crate::fragment::DataRequest::Vtable {
+                ty,
+                trait_ref: Some((trait_, args)),
+                ..
+            } = request
+            {
                 facts.vtable(ty, *trait_, args);
             }
         }
@@ -394,7 +427,10 @@ fn world_of(
         }
     }
     let everything = match kind {
-        RootKind::Shared => Some("the program is a cdylib: a program that loads it may make objects of its traits".to_owned()),
+        RootKind::Shared => Some(
+            "the program is a cdylib: a program that loads it may make objects of its traits"
+                .to_owned(),
+        ),
         _ => loads,
     };
     // alloc: once a program, its objects
@@ -465,4 +501,3 @@ fn object(
         digest,
     })
 }
-

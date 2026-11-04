@@ -12,8 +12,7 @@ mod untyped;
 
 /// `ok`, `map_err` and `unwrap_or_default` of `Result` are minicore's under `option`, `fn` and
 /// `default` (with `builtin_impls` for `u32: Default`).
-const MINICORE: &str =
-    "//- minicore: sized, copy, clone, derive, default, builtin_impls, fn, option, result, fmt, write, error, iterators\n";
+const MINICORE: &str = "//- minicore: sized, copy, clone, derive, default, builtin_impls, fn, option, result, fmt, write, error, iterators\n";
 
 const HIR_TY: &str = r#"
 //- /hir_ty/lib.rs crate:hir_ty
@@ -71,7 +70,8 @@ impl Display for Holds {
 }
 "#;
 
-const LINTS: &[&str] = &["error_debug", "dropped_error", "untyped_error", "hash_order_output", "wall_clock"];
+const LINTS: &[&str] =
+    &["error_debug", "dropped_error", "untyped_error", "hash_order_output", "wall_clock"];
 
 /// The lint a message is of.
 fn lint_of(message: &str) -> Option<&'static str> {
@@ -97,7 +97,9 @@ fn found(out: &str) -> Vec<(u32, &'static str)> {
     let mut found = Vec::new();
     let mut lint = None;
     for line in out.lines() {
-        if let Some(message) = line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: ")) {
+        if let Some(message) =
+            line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: "))
+        {
             lint = lint_of(message);
             continue;
         }
@@ -121,7 +123,10 @@ fn expected(source: &str) -> Vec<(u32, &'static str)> {
             None => (number, marks),
         };
         for mark in marks.split_whitespace() {
-            let lint = LINTS.iter().find(|&&it| it == mark).unwrap_or_else(|| panic!("`{mark}` is not a lint of these tests"));
+            let lint = LINTS
+                .iter()
+                .find(|&&it| it == mark)
+                .unwrap_or_else(|| panic!("`{mark}` is not a lint of these tests"));
             expected.push((number, *lint));
         }
     }
@@ -140,7 +145,11 @@ fn check_in(crates: &str, main: &str, flags: &str) -> String {
     let source = format!("{}{}", PRELUDE.trim_start_matches('\n'), main.trim_start_matches('\n'));
     let fixture = format!("{MINICORE}{HIR_TY}{crates}{source}");
     let out = lint(&fixture, flags);
-    assert_eq!(found(&out), expected(&source), "with `{flags}`, the findings of:\n{source}\nwere:\n{out}");
+    assert_eq!(
+        found(&out),
+        expected(&source),
+        "with `{flags}`, the findings of:\n{source}\nwere:\n{out}"
+    );
     out
 }
 
@@ -181,7 +190,8 @@ impl Display for Report {
         "-A clippy::all --deny=blaze::error_debug",
     );
     assert!(out.contains("it holds `hir_ty`'s `Ty`"), "a holder names what it holds:\n{out}");
-    let errors = out.lines().filter(|it| it.starts_with("error: the message of error `ParseError`")).count();
+    let errors =
+        out.lines().filter(|it| it.starts_with("error: the message of error `ParseError`")).count();
     assert_eq!(errors, 5, "each finding is an error naming the error type:\n{out}");
 }
 

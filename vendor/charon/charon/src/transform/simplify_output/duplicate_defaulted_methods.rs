@@ -19,14 +19,9 @@ impl Transform {
         };
         let item_id = *item_id;
         let original_method = original_method.clone();
-        let method_name = ctx
-            .translated
-            .assoc_item_name(trait_impl.impl_trait.id, method_id);
+        let method_name = ctx.translated.assoc_item_name(trait_impl.impl_trait.id, method_id);
         let mut name = ctx.translated.item_name(trait_impl.def_id).clone();
-        name.name.push(PathElem::Ident(
-            method_name.to_string(),
-            Disambiguator::ZERO,
-        ));
+        name.name.push(PathElem::Ident(method_name.to_string(), Disambiguator::ZERO));
 
         // Flatten the impl binder and the method binder. The resulting substitution maps the
         // trait default method into the generic context of the duplicated impl method.
@@ -38,9 +33,7 @@ impl Transform {
         .flatten();
         let mut fun_decl = original_method.substitute_params(subst.map(|x| *x.generics));
 
-        let FunSource::TraitDefault { trait_ref, .. } = fun_decl.src else {
-            unreachable!()
-        };
+        let FunSource::TraitDefault { trait_ref, .. } = fun_decl.src else { unreachable!() };
         fun_decl.def_id = FunDeclId::MAX; // We fix it up on insertion
         fun_decl.item_meta = ItemMeta {
             name,
@@ -109,13 +102,10 @@ impl TransformPass for Transform {
                 let new_id = ctx.translated.fun_decls.reserve_slot();
                 fun_decl.def_id = new_id;
                 // Takes care of adding to the names map as well.
-                ctx.translated
-                    .set_new_item_slot(ItemId::Fun(new_id), ItemByVal::Fun(fun_decl));
+                ctx.translated.set_new_item_slot(ItemId::Fun(new_id), ItemByVal::Fun(fun_decl));
 
-                let method = generics.map(|generics| FunDeclRef {
-                    id: new_id,
-                    generics: Box::new(generics),
-                });
+                let method = generics
+                    .map(|generics| FunDeclRef { id: new_id, generics: Box::new(generics) });
                 methods_to_insert.push((method_id, method));
             }
             let Some(trait_impl) = ctx.translated.trait_impls.get_mut(trait_impl_id) else {

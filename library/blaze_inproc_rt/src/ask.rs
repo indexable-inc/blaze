@@ -151,7 +151,12 @@ fn claim(words: &impl Words) -> Option<usize> {
             return None;
         }
         let index = (!seen).trailing_zeros() as usize;
-        match used.compare_exchange_weak(seen, seen | 1 << index, Ordering::SeqCst, Ordering::SeqCst) {
+        match used.compare_exchange_weak(
+            seen,
+            seen | 1 << index,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
             Ok(_) => return Some(index),
             Err(now) => seen = now,
         }
@@ -175,7 +180,9 @@ fn ask(words: &impl Words, index: usize, kind: Kind, body: &[u8]) -> u64 {
     let slot = base(index);
     let generation = words.word(slot + S_STATE).load(Ordering::Acquire) >> 8;
     put(words, slot + S_BODY, body);
-    words.word(slot + S_ASK).store(u64::from(kind.0) | (body.len() as u64) << 16, Ordering::Relaxed);
+    words
+        .word(slot + S_ASK)
+        .store(u64::from(kind.0) | (body.len() as u64) << 16, Ordering::Relaxed);
     words.word(slot + S_STATE).store(state(generation, ASKED), Ordering::Release);
     generation
 }
@@ -188,7 +195,12 @@ fn answered(words: &impl Words, index: usize, generation: u64) -> Result<(), u64
 }
 
 /// [`answered`], spinning for up to `spin` while it is not.
-fn answered_within(words: &impl Words, index: usize, generation: u64, spin: Duration) -> Result<(), u64> {
+fn answered_within(
+    words: &impl Words,
+    index: usize,
+    generation: u64,
+    spin: Duration,
+) -> Result<(), u64> {
     let start = Instant::now();
     let mut relax = Relax::new();
     loop {
@@ -221,7 +233,9 @@ fn answer(words: &impl Words, index: usize, out: &mut [u8]) -> Result<(Kind, usi
     let word = words.word(slot + S_ANSWER).load(Ordering::Relaxed);
     let (kind, len) = (Kind(word as u16), (word >> 16) as usize);
     if len > MOST_BODY {
-        return Err(Error::new(format!("the daemon's answer in slot {index} is {len} bytes, past the {MOST_BODY} a slot holds")));
+        return Err(Error::new(format!(
+            "the daemon's answer in slot {index} is {len} bytes, past the {MOST_BODY} a slot holds"
+        )));
     }
     let fits = len.min(out.len());
     get(words, slot + S_BODY, &mut out[..fits]);
@@ -230,7 +244,9 @@ fn answer(words: &impl Words, index: usize, out: &mut [u8]) -> Result<(Kind, usi
 
 /// Gives back slot `index`, its ask of `generation` answered and read.
 fn release(words: &impl Words, index: usize, generation: u64) {
-    words.word(base(index) + S_STATE).store(state((generation + 1) % GENERATIONS, FREE), Ordering::Release);
+    words
+        .word(base(index) + S_STATE)
+        .store(state((generation + 1) % GENERATIONS, FREE), Ordering::Release);
     words.word(W_USED).fetch_and(!(1 << index), Ordering::SeqCst);
     words.word(W_FREES).fetch_add(1, Ordering::SeqCst);
     if words.word(W_WAITING).load(Ordering::SeqCst) != 0 {
@@ -247,7 +263,10 @@ pub fn request(
     out: &mut [u8],
 ) -> Result<(Kind, usize), Error> {
     if body.len() > MOST_BODY {
-        return Err(Error::new(format!("an ask of {} bytes, past the {MOST_BODY} a slot holds", body.len())));
+        return Err(Error::new(format!(
+            "an ask of {} bytes, past the {MOST_BODY} a slot holds",
+            body.len()
+        )));
     }
     let _errno = sys::Errno::keep();
     let index = loop {
@@ -266,7 +285,9 @@ pub fn request(
     }
     let bell = bell(words, index);
     while let Err(seen) = answered_within(words, index, generation, ASKER_SPIN) {
-        if !sys::wait_answer(state_word(words, index), seen as u32, bell, LOOK) && sys::hung_up(stream) {
+        if !sys::wait_answer(state_word(words, index), seen as u32, bell, LOOK)
+            && sys::hung_up(stream)
+        {
             return Err(Error::new("the daemon hung up before it answered"));
         }
     }
@@ -277,7 +298,11 @@ pub fn request(
 
 /// The next asked slot from `from` on, taken: its index, generation and kind, its body put in
 /// `body`.
-fn take(words: &impl Words, from: usize, body: &mut Vec<u8>) -> Result<Option<(usize, u64, Kind)>, Error> {
+fn take(
+    words: &impl Words,
+    from: usize,
+    body: &mut Vec<u8>,
+) -> Result<Option<(usize, u64, Kind)>, Error> {
     for step in 0..SLOTS {
         let index = (from + step) % SLOTS;
         let slot = base(index);
@@ -286,13 +311,19 @@ fn take(words: &impl Words, from: usize, body: &mut Vec<u8>) -> Result<Option<(u
             continue;
         }
         let taken = state(now >> 8, TAKEN);
-        if words.word(slot + S_STATE).compare_exchange(now, taken, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if words
+            .word(slot + S_STATE)
+            .compare_exchange(now, taken, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             continue;
         }
         let ask = words.word(slot + S_ASK).load(Ordering::Relaxed);
         let len = (ask >> 16) as usize;
         if len > MOST_BODY {
-            return Err(Error::new(format!("an ask in slot {index} of {len} bytes, past the {MOST_BODY} a slot holds")));
+            return Err(Error::new(format!(
+                "an ask in slot {index} of {len} bytes, past the {MOST_BODY} a slot holds"
+            )));
         }
         body.resize(len, 0);
         get(words, slot + S_BODY, body);
@@ -309,17 +340,27 @@ fn answer_into(words: &impl Words, seq: u32, kind: Kind, body: &[u8]) -> Result<
         return Err(Error::new(format!("an answer to ask {seq:#x}, which names no slot")));
     }
     if body.len() > MOST_BODY {
-        return Err(Error::new(format!("an answer of {} bytes, past the {MOST_BODY} a slot holds", body.len())));
+        return Err(Error::new(format!(
+            "an answer of {} bytes, past the {MOST_BODY} a slot holds",
+            body.len()
+        )));
     }
     let slot = base(index);
     let word = words.word(slot + S_STATE);
-    if let Err(now) =
-        word.compare_exchange(state(generation, TAKEN), state(generation, ANSWERING), Ordering::Acquire, Ordering::Relaxed)
-    {
-        return Err(Error::new(format!("no ask {seq:#x} waits for an answer: its slot is in state {now:#x}")));
+    if let Err(now) = word.compare_exchange(
+        state(generation, TAKEN),
+        state(generation, ANSWERING),
+        Ordering::Acquire,
+        Ordering::Relaxed,
+    ) {
+        return Err(Error::new(format!(
+            "no ask {seq:#x} waits for an answer: its slot is in state {now:#x}"
+        )));
     }
     put(words, slot + S_BODY, body);
-    words.word(slot + S_ANSWER).store(u64::from(kind.0) | (body.len() as u64) << 16, Ordering::Relaxed);
+    words
+        .word(slot + S_ANSWER)
+        .store(u64::from(kind.0) | (body.len() as u64) << 16, Ordering::Relaxed);
     word.store(state(generation, ANSWERED), Ordering::Release);
     Ok(index)
 }
@@ -342,7 +383,10 @@ impl Run {
     /// Ends the process, `why` its run's error (the first one, when ended twice). Only while it
     /// has not been reaped: on macOS the process ID is all the daemon holds of it.
     pub fn kill(&self, why: &str) -> Result<(), Error> {
-        self.killed.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(|| why.to_owned());
+        self.killed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(|| why.to_owned());
         self.remote.kill().map_err(|it| Error::new(format!("ending process {}: {it}", self.pid)))
     }
 
@@ -372,7 +416,9 @@ impl Reader {
     pub fn recv(&mut self) -> Result<Frame<'_>, Error> {
         let mut relax = Relax::new();
         loop {
-            if let Some((index, generation, kind)) = take(&self.run.words, self.next, &mut self.body)? {
+            if let Some((index, generation, kind)) =
+                take(&self.run.words, self.next, &mut self.body)?
+            {
                 self.next = (index + 1) % SLOTS;
                 self.last = Some(Instant::now());
                 return Ok(Frame { kind, seq: seq(index, generation), body: &self.body });

@@ -181,7 +181,9 @@ fn push_zeros(into: &mut RegionVec<u8>, n: usize) -> io::Result<u32> {
 fn put(into: &mut RegionVec<u8>, bytes: &[u8]) -> io::Result<()> {
     into.try_extend_from_slice(bytes).map_err(|error| {
         // alloc: an error path.
-        io::Error::other(format!("the names of the requests on paths in flight fill their arena: {error}"))
+        io::Error::other(format!(
+            "the names of the requests on paths in flight fill their arena: {error}"
+        ))
     })
 }
 
@@ -228,7 +230,9 @@ fn push_temporary(into: &mut RegionVec<u8>, path: &Path) -> io::Result<u32> {
 /// The directory `path` is in, NUL-terminated at the end of `into`; where it starts.
 fn push_dir_of(into: &mut RegionVec<u8>, path: &Path) -> io::Result<u32> {
     match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => push_c(into, parent.as_os_str().as_bytes()),
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            push_c(into, parent.as_os_str().as_bytes())
+        }
         _ => push_c(into, b"."),
     }
 }
@@ -289,7 +293,13 @@ impl Uring {
 
     /// Starts [`Effect::WriteAt`] `tag` of `bytes` at `at` of `file`: a `statx` first where
     /// the write may bypass the page cache, then the open into a slot linked to the write.
-    pub(super) fn write_at(&mut self, tag: Tag, file: &FileName, at: u64, bytes: Vec<u8>) -> io::Result<()> {
+    pub(super) fn write_at(
+        &mut self,
+        tag: Tag,
+        file: &FileName,
+        at: u64,
+        bytes: Vec<u8>,
+    ) -> io::Result<()> {
         const SECTOR: u64 = 512;
         let len = bytes.len();
         let candidate = len >= DIRECT_LEAST && at % SECTOR == 0 && len as u64 % SECTOR == 0;
@@ -370,7 +380,13 @@ impl Uring {
 
     /// Starts [`Effect::Link`] `tag` (with `kind` [`Kind::Link`]) or [`Effect::Clone`] (with
     /// [`Kind::Clone`]) of `from` as `to`.
-    pub(super) fn copy(&mut self, tag: Tag, kind: Kind, from: &FileName, to: &FileName) -> io::Result<()> {
+    pub(super) fn copy(
+        &mut self,
+        tag: Tag,
+        kind: Kind,
+        from: &FileName,
+        to: &FileName,
+    ) -> io::Result<()> {
         self.forget(to);
         let mut hot = Hot::new(tag, kind, 0);
         hot.flags |= MAKE;
@@ -388,7 +404,13 @@ impl Uring {
 
     /// Starts [`Effect::Map`] (with `kind` [`Kind::Map`]) or [`Effect::Stat`] (with
     /// [`Kind::Stat`]; with `follow` false [`Effect::Lstat`]) `tag` of `file`.
-    pub(super) fn look(&mut self, tag: Tag, kind: Kind, follow: bool, file: &FileName) -> io::Result<()> {
+    pub(super) fn look(
+        &mut self,
+        tag: Tag,
+        kind: Kind,
+        follow: bool,
+        file: &FileName,
+    ) -> io::Result<()> {
         let push = |path: &Path, names: &mut RegionVec<u8>, at: &mut [u32; 5]| {
             at[0] = push_c(names, path.as_os_str().as_bytes())?;
             if kind == Kind::Stat {
@@ -406,7 +428,13 @@ impl Uring {
 
     /// Starts [`Effect::Read`] (`len`) or, with `None`, [`Effect::ReadAll`] `tag` of `file`,
     /// which no request keeps: a read of the file at its name now, open only while it reads.
-    pub(super) fn load(&mut self, tag: Tag, file: &FileName, at: u64, len: Option<usize>) -> io::Result<()> {
+    pub(super) fn load(
+        &mut self,
+        tag: Tag,
+        file: &FileName,
+        at: u64,
+        len: Option<usize>,
+    ) -> io::Result<()> {
         let mut hot = Hot::new(tag, Kind::Load, 0);
         hot.phase = QUEUED;
         let buf = match len {
@@ -481,10 +509,14 @@ impl Uring {
                         // A file's bytes: made in a task of the VFS's tag, which the memory
                         // line names.
                         // alloc: the read's result, handed to its asker.
-                        let bytes = blaze_mem::frame::task(blaze_mem::Tag::Vfs, |_| Vec::with_capacity(size as usize));
+                        let bytes = blaze_mem::frame::task(blaze_mem::Tag::Vfs, |_| {
+                            Vec::with_capacity(size as usize)
+                        });
                         *self.ops.buf_mut(id) = bytes;
                     }
-                    Err(error) => return Step::Ends(Some(Done::Failed(IoError(error.to_string())))), // alloc: an error.
+                    Err(error) => {
+                        return Step::Ends(Some(Done::Failed(IoError(error.to_string()))));
+                    } // alloc: an error.
                 }
             }
             self.ops.cold_mut(id).fds[0] = Some(fd);
@@ -505,7 +537,12 @@ impl Uring {
     }
 
     /// Starts the open of the kept file `file`, named `name`, made if missing with `make`.
-    pub(super) fn open(&mut self, file: Handle<Kept>, name: &FileName, make: bool) -> io::Result<()> {
+    pub(super) fn open(
+        &mut self,
+        file: Handle<Kept>,
+        name: &FileName,
+        make: bool,
+    ) -> io::Result<()> {
         let mut hot = Hot::new(NOBODYS, Kind::Open, file.to_bits());
         if make {
             hot.flags |= MAKE;
@@ -647,7 +684,8 @@ impl Uring {
             self.unkept(Handle::from_bits(hot.of), -libc::ENFILE, why);
         } else {
             // alloc: an error.
-            self.ready.push(Completion { tag: hot.tag, done: Done::Failed(IoError(why.to_owned())) });
+            self.ready
+                .push(Completion { tag: hot.tag, done: Done::Failed(IoError(why.to_owned())) });
         }
         self.end(id);
     }
@@ -660,7 +698,8 @@ impl Uring {
         let ud = |link: usize| data(id, link);
         let done = hot.done as usize;
         // What of its buffer is still to go: where it starts and how long it is.
-        let (rest, left) = (buf[done..].as_ptr() as u64, (buf.len() - done).min(u32::MAX as usize) as u32);
+        let (rest, left) =
+            (buf[done..].as_ptr() as u64, (buf.len() - done).min(u32::MAX as usize) as u32);
         // Every name, buffer and `statx` below stays where it is until the request's last
         // completion: the arenas and the buffer column are reserved memory that never moves,
         // and what a request holds in them stays until it ends (`Uring::end`).
@@ -678,7 +717,13 @@ impl Uring {
             }
             (Kind::Close, _) => {
                 // `file_index` is the slot plus one; `fd` must be 0 with it.
-                sqes[0] = Sqe { opcode: OP_CLOSE, fd: 0, splice_fd_in: hot.of as i32 + 1, user_data: ud(0), ..Sqe::default() };
+                sqes[0] = Sqe {
+                    opcode: OP_CLOSE,
+                    fd: 0,
+                    splice_fd_in: hot.of as i32 + 1,
+                    user_data: ud(0),
+                    ..Sqe::default()
+                };
                 1
             }
             (Kind::WriteAt, STATTING) => {
@@ -688,7 +733,11 @@ impl Uring {
             (Kind::WriteAt, _) => {
                 let slot = cold.slots[0];
                 let write = if hot.flags & DIRECT != 0 {
-                    debug_assert_ne!(hot.buffer, ops::NO_BUFFER, "a registered buffer, given before it is queued");
+                    debug_assert_ne!(
+                        hot.buffer,
+                        ops::NO_BUFFER,
+                        "a registered buffer, given before it is queued"
+                    );
                     let piece = (buf.len() - done).min(DIRECT_PIECE);
                     let to = self.registered.at(hot.buffer);
                     // SAFETY: the buffer is this request's alone (lent by `Lent` until it ends),
@@ -714,7 +763,8 @@ impl Uring {
                     sqes[0] = write;
                     return 1;
                 }
-                let flags = libc::O_WRONLY | if hot.flags & DIRECT != 0 { libc::O_DIRECT } else { 0 };
+                let flags =
+                    libc::O_WRONLY | if hot.flags & DIRECT != 0 { libc::O_DIRECT } else { 0 };
                 // An empty write only opens the file, which must be there.
                 let more = !buf.is_empty();
                 sqes[0] = open(name(0), flags, 0, slot, if more { SQE_IO_LINK } else { 0 }, ud(0));
@@ -737,7 +787,12 @@ impl Uring {
                     sqes[1] = open(name(0), flags, 0o644, temporary, SQE_IO_LINK, ud(1));
                     n = 2;
                 }
-                sqes[n] = Sqe { off: hot.done, addr: rest, len: left, ..on_slot(OP_WRITE, temporary, SQE_IO_LINK, ud(2)) };
+                sqes[n] = Sqe {
+                    off: hot.done,
+                    addr: rest,
+                    len: left,
+                    ..on_slot(OP_WRITE, temporary, SQE_IO_LINK, ud(2))
+                };
                 sqes[n + 1] = on_slot(OP_FSYNC, temporary, SQE_IO_LINK, ud(3));
                 sqes[n + 2] = two_names(OP_RENAMEAT, name(0), name(1), SQE_IO_LINK, ud(4));
                 sqes[n + 3] = on_slot(OP_FSYNC, dir, 0, ud(5));
@@ -780,7 +835,8 @@ impl Uring {
                 1
             }
             (Kind::Remove, phase) => {
-                sqes[0] = unlink(name(0), if phase == EMPTYING { libc::AT_REMOVEDIR } else { 0 }, ud(0));
+                sqes[0] =
+                    unlink(name(0), if phase == EMPTYING { libc::AT_REMOVEDIR } else { 0 }, ud(0));
                 1
             }
             (Kind::Link, _) => {
@@ -789,7 +845,14 @@ impl Uring {
             }
             (Kind::Clone, _) => {
                 // A symbolic link is never cloned through, and a FIFO does not block the open.
-                sqes[0] = open(name(0), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK, 0, NO_SLOT, SQE_IO_LINK, ud(0));
+                sqes[0] = open(
+                    name(0),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                    0,
+                    NO_SLOT,
+                    SQE_IO_LINK,
+                    ud(0),
+                );
                 let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL;
                 // A new file's mode, 0o666 less the umask, as every driver's clone and write.
                 sqes[1] = open(name(1), flags, 0o666, NO_SLOT, 0, ud(1));
@@ -813,7 +876,16 @@ impl Uring {
                     _ => {
                         let (addr, len) = spare_of(buf, buf.capacity());
                         let (fd, off) = (raw(&cold.fds[0]), cold.at + buf.len() as u64);
-                        Sqe { opcode: OP_READ, flags: spread, fd, off, addr, len, user_data: ud(0), ..Sqe::default() }
+                        Sqe {
+                            opcode: OP_READ,
+                            flags: spread,
+                            fd,
+                            off,
+                            addr,
+                            len,
+                            user_data: ud(0),
+                            ..Sqe::default()
+                        }
                     }
                 };
                 1
@@ -889,9 +961,14 @@ impl Uring {
             let (at, len) = (self.ops.cold(id).at, self.ops.buf(id).len() as u64);
             let statx = self.statx_of(id, &hot);
             // `stx_dio_offset_align`, where the mask says it is filled in.
-            let align = u64::from(if word(&statx, 0) & STATX_DIOALIGN != 0 { word(&statx, 156) } else { 0 });
+            let align = u64::from(if word(&statx, 0) & STATX_DIOALIGN != 0 {
+                word(&statx, 156)
+            } else {
+                0
+            });
             let hot = self.ops.get_mut(id).expect("in flight");
-            if align != 0 && DIRECT_PIECE as u64 % align == 0 && at % align == 0 && len % align == 0 {
+            if align != 0 && DIRECT_PIECE as u64 % align == 0 && at % align == 0 && len % align == 0
+            {
                 hot.flags |= DIRECT;
             }
             hot.phase = OPENING;
@@ -986,7 +1063,11 @@ impl Uring {
         if hot.phase == INSTALLING {
             if res < 0 {
                 // alloc: an error.
-                let why = format!("putting {} in the ring's table of files: {}", self.name_of(id, 0).to_string_lossy(), error(res));
+                let why = format!(
+                    "putting {} in the ring's table of files: {}",
+                    self.name_of(id, 0).to_string_lossy(),
+                    error(res)
+                );
                 self.unkept(file, res, &why);
                 return Step::Ends(None);
             }
@@ -1007,7 +1088,9 @@ impl Uring {
             let names = self.paths.arena(arena_of(&hot));
             let pad = names.len().next_multiple_of(4) - names.len();
             let at = (names.len() + pad) as u32;
-            let at = put(names, &[0; 3][..pad]).and_then(|()| put(names, &res.to_ne_bytes())).map(|()| at);
+            let at = put(names, &[0; 3][..pad])
+                .and_then(|()| put(names, &res.to_ne_bytes()))
+                .map(|()| at);
             let cold = self.ops.cold_mut(id);
             cold.fds[0] = Some(fd);
             match at {
@@ -1089,18 +1172,24 @@ impl Uring {
             // in the high half.
             let at = self.ops.cold(id).at;
             let res = -(at as u32 as i32);
-            let (from, to) = (self.name_of(id, 0).to_string_lossy(), self.name_of(id, 1).to_string_lossy());
+            let (from, to) =
+                (self.name_of(id, 0).to_string_lossy(), self.name_of(id, 1).to_string_lossy());
             if hot.flags & NOT_REGULAR != 0 {
                 let kind = crate::fs::kind_of_mode((at >> 32) as u32);
                 // alloc: an error path.
-                return Step::Ends(Some(Done::Failed(IoError(format!("{from} ({kind}) {}", crate::CLONE_OF_NO_FILE)))));
+                return Step::Ends(Some(Done::Failed(IoError(format!(
+                    "{from} ({kind}) {}",
+                    crate::CLONE_OF_NO_FILE
+                )))));
             }
             let why = match matches!(-res, libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL) {
                 // alloc: an error path.
                 true => format!(
                     "the file system of {to} ({}) cannot share blocks with {from} ({}): {}; blaze does not copy \
                      instead",
-                    crate::fs::volume_of(std::path::Path::new(&*to).parent().unwrap_or(std::path::Path::new(&*to))),
+                    crate::fs::volume_of(
+                        std::path::Path::new(&*to).parent().unwrap_or(std::path::Path::new(&*to))
+                    ),
                     crate::fs::volume_of(std::path::Path::new(&*from)),
                     error(res)
                 ),
@@ -1110,13 +1199,17 @@ impl Uring {
         }
         let [from, to, ..] = results;
         // SAFETY: each open's completion, where it opened: a descriptor of the driver's.
-        let [source, target] = [from, to].map(|it| (it >= 0).then(|| unsafe { OwnedFd::from_raw_fd(it) }));
+        let [source, target] =
+            [from, to].map(|it| (it >= 0).then(|| unsafe { OwnedFd::from_raw_fd(it) }));
         // A failed first open cancels the second: nothing was made.
         let Some(source) = source else {
             if from == -libc::ELOOP {
                 let name = self.name_of(id, 0).to_string_lossy();
                 // alloc: an error path.
-                return Step::Ends(Some(Done::Failed(IoError(format!("{name} {}", crate::CLONE_THROUGH_A_LINK)))));
+                return Step::Ends(Some(Done::Failed(IoError(format!(
+                    "{name} {}",
+                    crate::CLONE_THROUGH_A_LINK
+                )))));
             }
             // A socket or a device with no driver fails its open before any `fstat`: looked at
             // here (an `lstat` on the driver thread, on this error path only), it is refused as
@@ -1126,7 +1219,10 @@ impl Uring {
             if let Some(kind) = crate::fs::no_file_after_open(path, -from) {
                 let name = name.to_string_lossy();
                 // alloc: an error path.
-                return Step::Ends(Some(Done::Failed(IoError(format!("{name} ({kind}) {}", crate::CLONE_OF_NO_FILE)))));
+                return Step::Ends(Some(Done::Failed(IoError(format!(
+                    "{name} ({kind}) {}",
+                    crate::CLONE_OF_NO_FILE
+                )))));
             }
             return self.failed_on(id, "opening", 0, from);
         };
@@ -1142,7 +1238,9 @@ impl Uring {
         // A FIFO, socket or device swapped in (its open did not block, `O_NONBLOCK`) is refused
         // naming it, never cloned or said to be on a file system that cannot share blocks.
         let source = File::from(source);
-        let regular = source.metadata().map(|it| (it.file_type().is_file(), std::os::unix::fs::MetadataExt::mode(&it)));
+        let regular = source
+            .metadata()
+            .map(|it| (it.file_type().is_file(), std::os::unix::fs::MetadataExt::mode(&it)));
         let not_regular = matches!(regular, Ok((false, _)));
         let mut kind_bits = 0u32;
         let errno = match regular {
@@ -1158,7 +1256,8 @@ impl Uring {
                 // here.
                 // SAFETY: two open descriptors; the call reads the first's blocks into the
                 // second.
-                let cloned = unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
+                let cloned =
+                    unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
                 if cloned == 0 {
                     return Step::Ends(Some(Done::Cloned));
                 }
@@ -1203,7 +1302,9 @@ impl Uring {
         let (mask, mode, size) = (word(&statx, 0), word(&statx, 28) & 0xffff, wide(40));
         let (seconds, nanos) = (wide(112) as i64, word(&statx, 120));
         let modified_ns = match (mask & STATX_MTIME != 0, u64::try_from(seconds)) {
-            (true, Ok(seconds)) => seconds.saturating_mul(1_000_000_000).saturating_add(u64::from(nanos)),
+            (true, Ok(seconds)) => {
+                seconds.saturating_mul(1_000_000_000).saturating_add(u64::from(nanos))
+            }
             _ => 0,
         };
         let dir = mode & libc::S_IFMT == libc::S_IFDIR;
@@ -1257,7 +1358,9 @@ impl Uring {
             // SAFETY: `path` is the request's name `made_for` its kind, a path its push put
             // NUL-terminated in `arena`, which the request holds while in flight.
             let path = unsafe { self.paths.name(arena, path) }.to_bytes();
-            let Some(end) = path.get(from..).and_then(|rest| rest.iter().position(|&it| it == b'/')) else {
+            let Some(end) =
+                path.get(from..).and_then(|rest| rest.iter().position(|&it| it == b'/'))
+            else {
                 return Ok(None);
             };
             dir.extend_from_slice(&path[..from + end]);

@@ -51,7 +51,10 @@ fn a_slot_no_task_filled_is_an_error_naming_it_never_a_wait() {
     });
     let again = slot.claim(&db).err();
     assert_eq!(again, Some(SlotError::ClaimedAgain { slot: name() }));
-    assert!(again.unwrap().to_string().contains("`the impl directory`"), "the error names the slot");
+    assert!(
+        again.unwrap().to_string().contains("`the impl directory`"),
+        "the error names the slot"
+    );
     drop(claim);
     assert_eq!(slot.get(&db), Err(SlotError::Abandoned { slot: name() }));
 }
@@ -83,7 +86,8 @@ fn a_reader_waits_for_the_claim_and_reads_its_fill() {
 fn a_read_of_a_slot_no_task_claimed_never_takes_its_flight() {
     let db = Db(Storage::new(None));
     let slot = Slot::<u32>::empty(name());
-    let (held, stop, released) = (AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false));
+    let (held, stop, released) =
+        (AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false));
     std::thread::scope(|scope| {
         scope.spawn(|| {
             let hold = db.0.flights.hold(key(slot.serial)).unwrap();
@@ -102,7 +106,10 @@ fn a_read_of_a_slot_no_task_claimed_never_takes_its_flight() {
             std::thread::yield_now();
         }
         assert_eq!(slot.get(&db), Err(SlotError::Unclaimed { slot: name() }));
-        assert!(!released.load(Ordering::Acquire), "the read waited on a flight no claim of the slot holds");
+        assert!(
+            !released.load(Ordering::Acquire),
+            "the read waited on a flight no claim of the slot holds"
+        );
         stop.store(true, Ordering::Release);
     });
 }
@@ -129,7 +136,10 @@ fn a_claim_given_back_makes_its_readers_give_way_until_the_rerun_fills_it() {
     let slot = Slot::<u32>::empty(name());
     slot.claim(&db).unwrap().give_back();
     let read = Cancelled::catch(AssertUnwindSafe(|| slot.get(&db).copied()));
-    assert!(matches!(read, Err(Cancelled::WouldWaitOnItself { .. })), "a read of a given-back slot gives way: {read:?}");
+    assert!(
+        matches!(read, Err(Cancelled::WouldWaitOnItself { .. })),
+        "a read of a given-back slot gives way: {read:?}"
+    );
     let again = slot.claim(&db).expect("the rerun claims the slot anew");
     std::thread::scope(|scope| {
         let reader = scope.spawn(|| slot.get(&db).copied());
@@ -162,7 +172,11 @@ fn a_failed_pass_abandons_its_unfilled_slots_so_readers_never_give_way() {
     assert!(!full.abandon(), "a full slot keeps its value");
     for slot in [&given, &never] {
         let read = Cancelled::catch(AssertUnwindSafe(|| slot.get(&db).copied()));
-        assert_eq!(read, Ok(Err(SlotError::Abandoned { slot: name() })), "a reader reads Abandoned at once");
+        assert_eq!(
+            read,
+            Ok(Err(SlotError::Abandoned { slot: name() })),
+            "a reader reads Abandoned at once"
+        );
     }
     assert_eq!(full.get(&db), Ok(&9));
     assert_eq!(claim.fill(1), Ok(Filled::First));

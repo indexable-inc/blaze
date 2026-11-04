@@ -164,7 +164,7 @@ part, in which tier, on which hosts.
 and each harness in the Python that runs it. A harness moved to one typed input (AGENTS.md,
 scripts-take-typed-input) reads it with the workspace's `typed_input`, so it runs the same way
 by hand: `uv run --frozen python harness/storekills.py '{"blaze": "target/release/blaze", "kills": 10}'`.
-The store harnesses, `own_inputs.py`, `fuzz/store.py`, `includes.py`, `keys.py`, `fuzz/edits.py`,
+The store harnesses, `own_inputs.py`, `fuzz/store.py`, `includes.py`, `incremental.py`, `keys.py`, `fuzz/edits.py`,
 `focused.py`, `toolchain_bump.py` and `ci.py` itself take their JSON so far; the fields are in each script's docstring.
 
 The flake's `scripts` shell supplies uv, Python 3.13 and Node for pyright, all from `flake.lock`:
@@ -280,6 +280,39 @@ written from cargo again, and a change to one is a change to what blaze expects.
 | `headerpad.py` | A program whose unwind table does not fit the room its link leaves after the load commands: the first link is told the room the unwind information of its objects wants and is linked once ([#173](https://github.com/indexable-inc/blaze/issues/173)), the edits after it are spliced, and a restarted daemon starts from the room kept beside the executable ([#13](https://github.com/indexable-inc/blaze/issues/13)). It is built for macOS 14, as nix's shell builds, which Apple's linker gives chained fixups unless told not to ([#30](https://github.com/indexable-inc/blaze/issues/30)). The daemon's own links. macOS on AArch64 |
 | `tiers.py` | Tiers ([tiers.md](tiers.md)): `demo/lifebench` running under the daemon reaches levels 2 and 3 with output identical to blaze's build from nothing with `BLAZE_TIER=off`, an edit of a tiered function demotes it and is applied at once, and `BLAZE_TIER=off` changes nothing. macOS on AArch64 (any native blaze, which has LLVM); it exits 0 elsewhere |
 | `tierbench.py` | The benchmark table of [tiers.md](tiers.md): `demo/lifebench` at level 1, 2 and 3 under a daemon and as cargo builds it (release, and `-O3` with the dev profile's checks), in interleaved rounds, the steady rate of each; `--together` runs a round's builds at once, for a loaded machine. Measures; checks nothing; not in CI |
+
+### Incremental cost
+
+`incremental.py` is the gate on what an incremental `blaze check` of blaze's own workspace costs,
+by count. Until it, no harness measured that cost, and on 2026-11-04 a check after a one-line
+edit had grown to about 40 minutes unnoticed, through five unrelated bugs of one class: memory
+never given back, a memory forecast that serialised the scheduler, cache keys over temporary
+directories' variables, proc-macro output marked unknown, and cycle results never reused. Each
+makes work that should verify run again, so the gate counts the work rather than chasing each.
+
+One daemon in a home of its own runs five `blaze check --workspace` (`args`) of the checkout:
+warm (cold in that home; only reported), a no-op from another shell (another `TMPDIR`,
+`OLDPWD`, `SHLVL` and `PWD`, from `crates/`, and a variable the daemon never saw), the same check
+after the daemon is killed with SIGKILL (it has to log `restored the daemon image`), a body edit
+of a leaf function of `blaze-format` (`edit`, a crate most of the workspace depends on), and the
+edit taken back. The no-op and the restore have to run nothing: no plane node
+(`builds.misses`), no query (`query_counts.executed` summed over the build) and no `misses` row.
+The edit and its undo may run at most `edit.max_ran` plane nodes and `edit.max_executed` queries,
+and no `misses` row may be of an item outside `blaze-format`: a dependent crate whose
+signatures did not change verifies. The daemon's `live bytes` at the end of the no-op may exceed
+the warm check's, and the undo's the no-op's, by at most `heap_growth_bytes`.
+
+It reads every count from the profile history with `blaze debug sql --json`, under the DuckDB the
+flake pins (`nix build .#duckdb`, or `duckdb` in its input): the check's `builds` row, its
+`query_counts` and its `misses` ([profiling.md](profiling.md)). `query_counts.written`, each
+input's fields its setters wrote in the build, names what the build changed; the counter was
+added for this gate (`crates/blaze-query/src/db/counts.rs`, `WRITTEN`). On a failure it prints,
+in one pass, every bound each check broke and, for those checks, the query functions that ran
+most, the inputs written and every `misses` row with its cause and what changed. Wall time and
+the daemon's peak heap are printed beside the counts and gate nothing. The edited file is
+restored on every exit. Linux and macOS; the train's part `incremental`.
+
+    uv run --frozen python harness/incremental.py '{"blaze": "target/release/blaze"}'
 
 ### The store
 
@@ -492,7 +525,7 @@ for each platform, each on a machine of its own kind.
 |---|---|---|---|
 | `blaze.yaml` (`gate`) | pull request | on Linux x86-64: blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`, `blaze test`, only the tests the change reached), from the newest release and the store main pushed to blaze's remote; on Linux x86-64 and macOS, `blaze check --workspace --message-format short` with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from cold: nothing pushes its store); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `harness/rustcsites.py` | 49 min on a store the release has not compiled into |
 | `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64, AArch64 and macOS, every test, then a push of the store for the runs after it. Its `linux x64 / build` passing is what cuts a canary (`canary.yaml`); the whole run green, unit tests on every platform, is what stable needs besides the promotion gate ([release.md](release.md)). And on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
-| `fmt.yaml` | push to main | `cargo fmt --all`, and a commit `fmt` when it changed a file | 2 min |
+| `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file | 2 min |
 | `train.yaml` | push to main, by hand | everything below, then a release or the train's issue | about 45 min |
 | `blaze.yaml` | a change the build and the unit tests do not read | the two scripts | 1 min |
 
@@ -537,7 +570,7 @@ on every platform), and 51 of 140 queue runs on 2026-10-25 and 26 failed, most o
 entries that later landed unchanged.
 
 No check refuses a pull request for its formatting: `fmt.yaml` formats main after each push and
-commits the result as `fmt`. Run `cargo fmt --all` before pushing all the same, so that the
+commits the result as `fmt`. Run `blaze fmt --all` before pushing all the same, so that the
 diff of a pull request is its change.
 
 `harness/imports.py` has every script of the harness imported, so one that only the train or a
@@ -632,8 +665,8 @@ with LLVM, as every native blaze has it, hands the binary to its other jobs, and
 - `harness/unittests.py` on each platform;
 - every part of `ci.py parts`, a job each: `core-1` ... `core-N` (the
   harnesses of `core`, packed by the seconds `CORE` in ci.py says each takes, so that no part
-  is longer than its longest harness), `keys-1` ... `keys-3`, `store-kills`, `store` and
-  `daemon`;
+  is longer than its longest harness), `keys-1` ... `keys-3`, `store-kills`, `store`,
+  `daemon` and `incremental` ([Incremental cost](#incremental-cost));
 - `blaze_cli.py`: its checks, ripgrep and hyperfine, and fd (Linux x86-64 and macOS), and
   ripgrep, fd, bat, hyperfine, just, axum and nushell with each project's tests (Linux AArch64;
   axum and nushell not blocking, [#26](https://github.com/indexable-inc/blaze/issues/26) and

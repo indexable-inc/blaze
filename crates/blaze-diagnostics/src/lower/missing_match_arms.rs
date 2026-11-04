@@ -31,7 +31,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::MissingMatchArms<'db>) -> Ve
     let arms: Vec<ast::MatchArm<'db>> =
         // alloc: once per error, the arms the suggestion is placed after.
         match_expr.and_then(|it| it.match_arm_list()).map_or_else(Vec::new, |it| it.arms().collect());
-    let braces = match_expr.and_then(|it| braces_span(cx, &sp, scrut.with_value(it.syntax().text_range())));
+    let braces =
+        match_expr.and_then(|it| braces_span(cx, &sp, scrut.with_value(it.syntax().text_range())));
     let text = cx.file_of(&sp).map(|it| cx.file_text(it));
     let mut diag = match d.no_arms && !is_enum_with_variants(cx, ty) {
         true => type_not_empty(cx, d, &sp, braces, text),
@@ -74,7 +75,9 @@ fn type_not_empty<'db>(
     }
     match foreign_non_exhaustive(cx, ty) {
         // alloc: the error's text, for an error hir found
-        true => diag.note(format!("the matched value is of type `{printed}`, which is marked as non-exhaustive")),
+        true => diag.note(format!(
+            "the matched value is of type `{printed}`, which is marked as non-exhaustive"
+        )),
         // alloc: the error's text, for an error hir found
         false => diag.note(format!("the matched value is of type `{printed}`")),
     };
@@ -112,11 +115,20 @@ struct Arms<'s> {
 }
 
 /// rustc's `report_non_exhaustive_match` past its empty case.
-fn not_covered<'db>(cx: &Cx<'_, 'db>, d: &hir::MissingMatchArms<'db>, sp: &Span, arms: Arms<'_>) -> Diag {
+fn not_covered<'db>(
+    cx: &Cx<'_, 'db>,
+    d: &hir::MissingMatchArms<'db>,
+    sp: &Span,
+    arms: Arms<'_>,
+) -> Diag {
     let witnesses = &d.witnesses;
     let joined = joined(witnesses);
     // alloc: clone: the error's parts, for an error hir found
-    let mut diag = Diag::error(Some("E0004"), format!("non-exhaustive patterns: {joined} not covered"), sp.clone());
+    let mut diag = Diag::error(
+        Some("E0004"),
+        format!("non-exhaustive patterns: {joined} not covered"),
+        sp.clone(),
+    );
     // alloc: clone: the error's parts, for an error hir found
     diag.span_label(sp.clone(), format!("pattern{} {joined} not covered", plural(witnesses.len())));
     if let Some(here) = DefinedHere::of(cx, &d.scrutinee_ty, &d.variants, true) {
@@ -129,7 +141,9 @@ fn not_covered<'db>(cx: &Cx<'_, 'db>, d: &hir::MissingMatchArms<'db>, sp: &Span,
         diag.note("references are always considered inhabited");
     }
     for (pat, konst) in &d.consts_like_bindings {
-        let Some((name, def)) = const_like_binding(cx, cx.node_view(*pat).value, *konst) else { continue };
+        let Some((name, def)) = const_like_binding(cx, cx.node_view(*pat).value, *konst) else {
+            continue;
+        };
         let at = cx.span_of_ptr(*pat);
         diag.span_label(
             // clone: the error's parts, for an error hir found
@@ -190,7 +204,11 @@ fn not_covered<'db>(cx: &Cx<'_, 'db>, d: &hir::MissingMatchArms<'db>, sp: &Span,
 }
 
 /// rustc's notes on the types `collect_special_tys` found in the first witness.
-fn special_ty_notes<'db>(cx: &Cx<'_, 'db>, diag: &mut Diag, special_tys: &[(Type<'db>, SpecialTy)]) {
+fn special_ty_notes<'db>(
+    cx: &Cx<'_, 'db>,
+    diag: &mut Diag,
+    special_tys: &[(Type<'db>, SpecialTy)],
+) {
     for (ty, special) in special_tys {
         let ty = cx.ty(ty);
         match special {
@@ -217,7 +235,12 @@ fn special_ty_notes<'db>(cx: &Cx<'_, 'db>, diag: &mut Diag, special_tys: &[(Type
 
 /// Where rustc suggests the missing arm, and its code: in the braces of an empty match, after
 /// its only arm, or after its last when it is laid out as the one before it.
-fn arm_suggestion(cx: &Cx<'_, '_>, sp: &Span, arms: Arms<'_>, suggested_arm: &str) -> Option<(Span, String)> {
+fn arm_suggestion(
+    cx: &Cx<'_, '_>,
+    sp: &Span,
+    arms: Arms<'_>,
+    suggested_arm: &str,
+) -> Option<(Span, String)> {
     let arm_span = |arm: &ast::MatchArm<'_>| cx.span(InFile::new(arms.file, arm_range(*arm)));
     // rustc asks whether the body is a block to leave the comma out, which never holds: THIR
     // wraps every arm's body in a scope.
@@ -235,7 +258,13 @@ fn arm_suggestion(cx: &Cx<'_, '_>, sp: &Span, arms: Arms<'_>, suggested_arm: &st
         [only] => {
             let only = arm_span(only);
             let pre = match arms.text {
-                Some(text) if is_multiline(text, only.lo, extend_while(text, only.hi, |c| c.is_whitespace() || c == ',')) => {
+                Some(text)
+                    if is_multiline(
+                        text,
+                        only.lo,
+                        extend_while(text, only.hi, |c| c.is_whitespace() || c == ','),
+                    ) =>
+                {
                     // alloc: the error's text, for an error hir found
                     format!("\n{}", indentation_before(text, only.lo))
                 }
@@ -351,7 +380,8 @@ pub(super) fn all_chars(node: ast::Node<'_>, f: impl Fn(char) -> bool) -> bool {
 fn foreign_non_exhaustive(cx: &Cx<'_, '_>, ty: &Type<'_>) -> bool {
     ty.as_adt().is_some_and(|adt| {
         adt.module(cx.db).krate(cx.db) != cx.krate
-            && AttrFlags::query(cx.db, hir_def::AdtId::from(adt).into()).contains(AttrFlags::NON_EXHAUSTIVE)
+            && AttrFlags::query(cx.db, hir_def::AdtId::from(adt).into())
+                .contains(AttrFlags::NON_EXHAUSTIVE)
     })
 }
 
@@ -432,10 +462,14 @@ mod tests {
 
     #[test]
     fn the_witnesses_are_joined_as_rustc_joins_them() {
-        let witnesses = |names: &[&str]| names.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
+        let witnesses =
+            |names: &[&str]| names.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
         assert_eq!(joined(&witnesses(&["None"])), "`None`");
         assert_eq!(joined(&witnesses(&["A", "B(_)"])), "`A` and `B(_)`");
-        assert_eq!(joined(&witnesses(&["A", "S { a: and, .. }", "C"])), "`A`, `S { a: and, .. }` and `C`");
+        assert_eq!(
+            joined(&witnesses(&["A", "S { a: and, .. }", "C"])),
+            "`A`, `S { a: and, .. }` and `C`"
+        );
         assert_eq!(joined(&witnesses(&["A", "B", "C", "D"])), "`A`, `B`, `C` and 1 more");
         assert_eq!(joined(&witnesses(&["A", "B", "C", "D", "E", "F"])), "`A`, `B`, `C` and 3 more");
     }
@@ -445,6 +479,9 @@ mod tests {
         let text = "fn main() {\n    match x {\n        A => {}\n    }\n}\n";
         let at = text.find("A =>").unwrap() as u32;
         assert_eq!(indentation_before(text, at), "        ");
-        assert_eq!(extend_while(text, at + 7, |c| c.is_whitespace() || c == ','), text.find("    }").unwrap() as u32 + 4);
+        assert_eq!(
+            extend_while(text, at + 7, |c| c.is_whitespace() || c == ','),
+            text.find("    }").unwrap() as u32 + 4
+        );
     }
 }

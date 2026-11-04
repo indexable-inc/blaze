@@ -26,18 +26,21 @@ mod tests;
 use base_db::{Crate, Db};
 use blaze_codegen::{CodegenError, InstanceKey, driver::CheckRoot, plan::Origin};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule,
-    ItemContainerId, Lookup, ModuleDefId, ModuleId, attrs::AttrFlags, expr_store::ExpressionStore,
-    hir::generics::GenericParams, nameres::crate_def_map,
+    ItemContainerId, Lookup, ModuleDefId, ModuleId,
+    attrs::AttrFlags,
+    expr_store::ExpressionStore,
+    hir::generics::GenericParams,
+    nameres::crate_def_map,
     signatures::{FunctionSignature, StaticFlags, StaticSignature},
 };
 use hir_expand::name::Name;
 use hir_ty::db::HirDatabase;
 use intern::sym;
+use std::alloc::Global;
 
 use super::{HirFrontend, HirInstance, HirStatic, Kind, frontend::root_in};
 use crate::compile_time_only;
@@ -287,7 +290,9 @@ impl Order<'_> {
     fn root(&mut self, func: FunctionId) -> Option<Checked> {
         let rooted = Some(func) == self.start
             || self.kept.contains(&func)
-            || (self.library && compiled(self.db, func) && self.listed.seen.contains(&root_in(self.db, func)));
+            || (self.library
+                && compiled(self.db, func)
+                && self.listed.seen.contains(&root_in(self.db, func)));
         rooted.then(|| Checked::Function(root_in(self.db, func)))
     }
 
@@ -347,7 +352,9 @@ impl Order<'_> {
 
     fn assoc_body(&mut self, item: AssocItemId) {
         match item {
-            AssocItemId::FunctionId(it) if FunctionSignature::of(self.db, it).has_body() => self.body(it.into()),
+            AssocItemId::FunctionId(it) if FunctionSignature::of(self.db, it).has_body() => {
+                self.body(it.into())
+            }
             AssocItemId::FunctionId(_) | AssocItemId::TypeAliasId(_) => {}
             AssocItemId::ConstId(it) => self.body(it.into()),
         }
@@ -440,7 +447,9 @@ fn library(db: &Db, krate: Crate, listed: &mut Listed) {
             let named = |adt: AdtId| !local(adt.module(db)) || adts.contains(&adt);
             let trait_ = db.impl_trait(imp).map(|it| it.skip_binder().def_id.0);
             let reached = match trait_ {
-                Some(it) => adt.is_none_or(named) && (!local(it.module(db)) || traits.contains(&it)),
+                Some(it) => {
+                    adt.is_none_or(named) && (!local(it.module(db)) || traits.contains(&it))
+                }
                 None => adt.is_some_and(|it| local(it.module(db)) && adts.contains(&it)),
             };
             if !reached {

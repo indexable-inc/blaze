@@ -50,7 +50,8 @@ impl Token {
     /// Whether `given` is this token, in time that depends only on its length.
     pub fn matches(&self, given: &str) -> bool {
         let (ours, given) = (self.0.as_bytes(), given.as_bytes());
-        ours.len() == given.len() && ours.iter().zip(given).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+        ours.len() == given.len()
+            && ours.iter().zip(given).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
     }
 }
 
@@ -135,9 +136,14 @@ mod tests {
         assert!(prod.allows(Some("https://ix.dev")));
         assert!(!prod.allows(Some(DEV_ORIGIN)));
         assert!(dev.allows(Some(DEV_ORIGIN)) && dev.allows(Some(ORIGIN)));
-        for refused in
-            [None, Some("http://ix.dev"), Some("https://ix.dev.evil.example"), Some("https://ix.dev/"), Some("null"), Some("")]
-        {
+        for refused in [
+            None,
+            Some("http://ix.dev"),
+            Some("https://ix.dev.evil.example"),
+            Some("https://ix.dev/"),
+            Some("null"),
+            Some(""),
+        ] {
             assert!(!prod.allows(refused) && !dev.allows(refused), "{refused:?}");
         }
     }

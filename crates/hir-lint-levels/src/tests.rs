@@ -1,20 +1,27 @@
 use base_db::{Crate, Db};
 use blaze_lint_defs::{Level, LintId, LintOptions};
 use hir_def::{
-    DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, ModuleDefId, VariantId, expr_store::ExpressionStore,
+    DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, ModuleDefId, VariantId,
+    expr_store::ExpressionStore,
     hir::{Expr, ExprId},
     nameres::crate_def_map,
 };
-use syntax::view::{self as ast, AstNode as _, HasName as _};
 use hir_expand::fixture;
+use syntax::view::{self as ast, AstNode as _, HasName as _};
 
-use crate::{LevelCx, LevelError, Levels, attrs, crate_lint_level, lint_level, lint_level_at, query::owner_node};
+use crate::{
+    LevelCx, LevelError, Levels, attrs, crate_lint_level, lint_level, lint_level_at,
+    query::owner_node,
+};
 
 const LINT: LintId = LintId::LONG_RUNNING_CONST_EVAL;
 
 fn db_of(fixture: &str) -> (Db, Crate) {
     let db = fixture::db(fixture).into_db();
-    let krate = *base_db::all_crates(&db).iter().find(|it| it.data(&db).origin.is_local()).expect("a local crate");
+    let krate = *base_db::all_crates(&db)
+        .iter()
+        .find(|it| it.data(&db).origin.is_local())
+        .expect("a local crate");
     (db, krate)
 }
 
@@ -27,7 +34,9 @@ fn item(db: &Db, krate: Crate, name: &str) -> ModuleDefId {
                 ModuleDefId::FunctionId(id) => ExpressionStoreOwnerId::Body(id.into()),
                 ModuleDefId::ConstId(id) => ExpressionStoreOwnerId::Body(id.into()),
                 ModuleDefId::StaticId(id) => ExpressionStoreOwnerId::Body(id.into()),
-                ModuleDefId::AdtId(id) => ExpressionStoreOwnerId::Signature(GenericDefId::AdtId(id)),
+                ModuleDefId::AdtId(id) => {
+                    ExpressionStoreOwnerId::Signature(GenericDefId::AdtId(id))
+                }
                 _ => continue,
             };
             let node = owner_node(db, owner).value;
@@ -55,9 +64,15 @@ fn body(db: &Db, krate: Crate, name: &str) -> DefWithBodyId {
 
 /// The level at each `const { .. }` of `owner`'s store, in the order of their expressions.
 fn at_inline_consts(db: &Db, owner: ExpressionStoreOwnerId) -> Vec<Level> {
-    let consts: Vec<ExprId> =
-        ExpressionStore::of(db, owner).exprs().filter(|(_, it)| matches!(it, Expr::Const(_))).map(|(id, _)| id).collect();
-    consts.into_iter().map(|expr| lint_level_at(db, owner, Some(expr), LINT).expect("an inline const has syntax")).collect()
+    let consts: Vec<ExprId> = ExpressionStore::of(db, owner)
+        .exprs()
+        .filter(|(_, it)| matches!(it, Expr::Const(_)))
+        .map(|(id, _)| id)
+        .collect();
+    consts
+        .into_iter()
+        .map(|expr| lint_level_at(db, owner, Some(expr), LINT).expect("an inline const has syntax"))
+        .collect()
 }
 
 /// The level at the root of an anon const of `owner`'s store: every expression of a struct's
@@ -65,8 +80,16 @@ fn at_inline_consts(db: &Db, owner: ExpressionStoreOwnerId) -> Vec<Level> {
 fn at_anon_const(db: &Db, owner: ExpressionStoreOwnerId) -> Level {
     let exprs: Vec<ExprId> = ExpressionStore::of(db, owner).exprs().map(|(id, _)| id).collect();
     assert!(!exprs.is_empty(), "{owner:?} has an anon const");
-    let levels: Vec<Level> = exprs.iter().map(|&expr| lint_level_at(db, owner, Some(expr), LINT).expect("an array length has syntax")).collect();
-    assert!(levels.windows(2).all(|it| it[0] == it[1]), "one level across one anon const: {levels:?}");
+    let levels: Vec<Level> = exprs
+        .iter()
+        .map(|&expr| {
+            lint_level_at(db, owner, Some(expr), LINT).expect("an array length has syntax")
+        })
+        .collect();
+    assert!(
+        levels.windows(2).all(|it| it[0] == it[1]),
+        "one level across one anon const: {levels:?}"
+    );
     levels[0]
 }
 
@@ -84,13 +107,20 @@ fn main() {}
 "#,
     );
     let fields = |name: &str| match item(&db, krate, name) {
-        ModuleDefId::AdtId(hir_def::AdtId::StructId(id)) => ExpressionStoreOwnerId::VariantFields(VariantId::StructId(id)),
+        ModuleDefId::AdtId(hir_def::AdtId::StructId(id)) => {
+            ExpressionStoreOwnerId::VariantFields(VariantId::StructId(id))
+        }
         other => panic!("`{name}` is {other:?}"),
     };
     assert_eq!(at_anon_const(&db, fields("Allowed")), Level::Allow);
     assert_eq!(at_anon_const(&db, fields("Denied")), Level::Deny);
-    let ModuleDefId::FunctionId(warned) = item(&db, krate, "warned") else { panic!("`warned` is a function") };
-    assert_eq!(at_anon_const(&db, ExpressionStoreOwnerId::Signature(GenericDefId::FunctionId(warned))), Level::Warn);
+    let ModuleDefId::FunctionId(warned) = item(&db, krate, "warned") else {
+        panic!("`warned` is a function")
+    };
+    assert_eq!(
+        at_anon_const(&db, ExpressionStoreOwnerId::Signature(GenericDefId::FunctionId(warned))),
+        Level::Warn
+    );
 }
 
 #[test]
@@ -179,7 +209,10 @@ fn main() {}
     assert_eq!(with(&[]), (Level::Warn, Level::Allow));
     assert_eq!(with(&["-D", "warnings"]), (Level::Deny, Level::Allow));
     assert_eq!(with(&["--cap-lints", "allow"]), (Level::Allow, Level::Allow));
-    assert_eq!(with(&["--force-warn", "long-running-const-eval"]), (Level::ForceWarn, Level::ForceWarn));
+    assert_eq!(
+        with(&["--force-warn", "long-running-const-eval"]),
+        (Level::ForceWarn, Level::ForceWarn)
+    );
     // As rustc's `shallow_lint_levels_on`, the HIR's levels don't hold a `forbid` against the
     // attributes inside it: the early pass's E0453 is what stops the build.
     assert_eq!(with(&["-F", "long-running-const-eval"]), (Level::Warn, Level::Allow));
@@ -225,8 +258,13 @@ fn main() {}
     let (store, map) = ExpressionStore::with_source_map(&db, owner);
     for (expr, _) in store.exprs() {
         match map.expr_syntax(expr) {
-            Ok(_) => assert!(lint_level_at(&db, owner, Some(expr), LINT).is_ok(), "{expr:?} has syntax"),
-            Err(_) => assert_eq!(lint_level_at(&db, owner, Some(expr), LINT), Err(LevelError::NoSyntax { owner, expr })),
+            Ok(_) => {
+                assert!(lint_level_at(&db, owner, Some(expr), LINT).is_ok(), "{expr:?} has syntax")
+            }
+            Err(_) => assert_eq!(
+                lint_level_at(&db, owner, Some(expr), LINT),
+                Err(LevelError::NoSyntax { owner, expr })
+            ),
         }
     }
 }
@@ -254,7 +292,9 @@ fn own() {}
     let mut cx = LevelCx::new(&db, krate, &opts);
     let mut levels = Levels::new(&mut cx, &mut (), true, false);
     let at = |name: &str| match item(&db, krate, name) {
-        ModuleDefId::FunctionId(id) => attrs::key(owner_node(&db, ExpressionStoreOwnerId::Body(id.into()))),
+        ModuleDefId::FunctionId(id) => {
+            attrs::key(owner_node(&db, ExpressionStoreOwnerId::Body(id.into())))
+        }
         other => panic!("`{name}` is {other:?}"),
     };
     let mut level = |name: &str, in_file: bool| {

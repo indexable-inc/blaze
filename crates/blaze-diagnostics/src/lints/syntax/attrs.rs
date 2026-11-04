@@ -35,11 +35,11 @@ pub(crate) mod target;
 pub(crate) use target::Target;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use either::Either;
 use hir::{HirFileId, InFile};
 use intern::Symbol;
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange,
     view::{self as ast, AstNode},
@@ -109,9 +109,11 @@ impl<'t> Attr<'t> {
             AttrKind::Meta { meta, .. } => (None, meta.path()),
             AttrKind::Doc(_) => (Some("doc"), None),
         };
-        doc.into_iter().chain(path.into_iter().flat_map(|it| it.segments()).map(|it| match it.name_ref() {
-            Some(name) => name.text(),
-            None => it.syntax().text(),
+        doc.into_iter().chain(path.into_iter().flat_map(|it| it.segments()).map(|it| {
+            match it.name_ref() {
+                Some(name) => name.text(),
+                None => it.syntax().text(),
+            }
         }))
     }
 
@@ -217,7 +219,9 @@ impl Owner<'_> {
 /// its attributes as `cfg` and `cfg_attr` leave them; the nodes with none left out.
 pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>> {
     // alloc: empty, allocates nothing
-    let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return Vec::new() };
+    let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else {
+        return Vec::new();
+    };
     let crate_root = HirFileId::from(root);
     let mut declared: HashMap<HirFileId, InFile<SyntaxNodePtr>, Global> = HashMap::new_in(Global);
     for module in crate::checks::modules(cx) {
@@ -232,18 +236,28 @@ pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>>
     // A module file's inner attributes are its `mod` item's: only those are looked up.
     let mut module_items: HashMap<InFile<SyntaxNodePtr>, usize, Global> = HashMap::new_in(Global);
     for tree in &walk.trees {
-        for node in tree.of_kind(|kind| ast::AnyHasAttrs::can_cast(kind) || kind == SyntaxKind::MACRO_EXPR) {
+        for node in
+            tree.of_kind(|kind| ast::AnyHasAttrs::can_cast(kind) || kind == SyntaxKind::MACRO_EXPR)
+        {
             // The parser puts a macro call expression's attributes on the `MACRO_EXPR`, which has
             // no `HasAttrs`; rustc's expansion checks them as the call's (`check_attributes` of
             // `collect_bang`).
             if let Some(call) = ast::MacroExpr::cast(node).and_then(|it| it.macro_call()) {
                 // alloc: empty until an attribute, then the owner's row of the table
                 let mut attrs = Vec::new();
-                let written = node.children().filter_map(ast::AnyAttr::cast).filter(|it| it.kind().is_outer());
+                let written = node
+                    .children()
+                    .filter_map(ast::AnyAttr::cast)
+                    .filter(|it| it.kind().is_outer());
                 written_attributes(walk, tree.file, written, &mut attrs);
                 if !attrs.is_empty() {
                     let node = InFile::new(tree.file, call.syntax());
-                    owners.push(Owner { node, target: Target::MacroCall, attrs, buffered_at: None });
+                    owners.push(Owner {
+                        node,
+                        target: Target::MacroCall,
+                        attrs,
+                        buffered_at: None,
+                    });
                 }
                 continue;
             }
@@ -265,11 +279,18 @@ pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>>
             if attrs.is_empty() && !is_module {
                 continue;
             }
-            let Some(target) = Target::of(cx, InFile::new(tree.file, node), crate_root) else { continue };
+            let Some(target) = Target::of(cx, InFile::new(tree.file, node), crate_root) else {
+                continue;
+            };
             if is_module {
                 module_items.insert(tree.ptr(node), owners.len());
             }
-            owners.push(Owner { node: InFile::new(tree.file, node), target, attrs, buffered_at: None });
+            owners.push(Owner {
+                node: InFile::new(tree.file, node),
+                target,
+                attrs,
+                buffered_at: None,
+            });
         }
     }
     // `-Z crate-attr`'s, each a file of its own, after the crate root's own inner attributes.
@@ -280,13 +301,22 @@ pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>>
             None => {
                 let root = walk.tree(crate_root).expect("the walk has the crate root's tree").root;
                 // alloc: empty, filled below
-                owners.insert(0, Owner { node: InFile::new(crate_root, root), target: Target::Crate, attrs: Vec::new(), buffered_at: None });
+                owners.insert(
+                    0,
+                    Owner {
+                        node: InFile::new(crate_root, root),
+                        target: Target::Crate,
+                        attrs: Vec::new(),
+                        buffered_at: None,
+                    },
+                );
                 0
             }
         };
         for &file in applied {
             let source = file.parse(cx.db).view();
-            let has_attrs = ast::AnyHasAttrs::cast(source.syntax()).expect("a source file has attributes");
+            let has_attrs =
+                ast::AnyHasAttrs::cast(source.syntax()).expect("a source file has attributes");
             attributes(walk, HirFileId::from(file), has_attrs, &mut owners[at].attrs);
         }
     }
@@ -313,7 +343,9 @@ pub(crate) fn invoking_attrs<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Own
     for tree in &walk.trees {
         for &node in &tree.replaced {
             let Some(item) = ast::Item::cast(node) else { continue };
-            let Some(call) = cx.vsema.expand_attr_macro(item).and_then(|it| it.value.file_id.macro_file()) else {
+            let Some(call) =
+                cx.vsema.expand_attr_macro(item).and_then(|it| it.value.file_id.macro_file())
+            else {
                 continue;
             };
             let loc = call.loc(db);
@@ -321,8 +353,12 @@ pub(crate) fn invoking_attrs<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Own
             if !matches!(loc.def.kind, hir_expand::MacroDefKind::BuiltInAttr(..)) {
                 continue;
             }
-            let hir_expand::MacroCallKind::Attr { ast_id, censored_attr_ids, .. } = &loc.kind else { continue };
-            let invoked = censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id).1;
+            let hir_expand::MacroCallKind::Attr { ast_id, censored_attr_ids, .. } = &loc.kind
+            else {
+                continue;
+            };
+            let invoked =
+                censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id).1;
             let range = invoked.syntax().text_range();
             // alloc: the item's attributes, once per attribute macro call
             let mut attrs = Vec::new();
@@ -342,7 +378,12 @@ pub(crate) fn invoking_attrs<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Own
 
 /// The attributes of `owner`, written in `file`, with `cfg_attr` expanded as the crate's cfg
 /// says and the `cfg`s left out (rustc keeps only a trace of them), pushed onto `attrs`.
-fn attributes<'db>(walk: &Walk<'db>, file: HirFileId, owner: ast::AnyHasAttrs<'db>, attrs: &mut Vec<Attr<'db>>) {
+fn attributes<'db>(
+    walk: &Walk<'db>,
+    file: HirFileId,
+    owner: ast::AnyHasAttrs<'db>,
+    attrs: &mut Vec<Attr<'db>>,
+) {
     written_attributes(walk, file, ast::attrs_with_doc_including_inner(&owner), attrs);
 }
 
@@ -357,24 +398,32 @@ fn written_attributes<'db>(
         ast::AnyAttr::Attr(it) => Either::Left(it),
         ast::AnyAttr::DocComment(it) => Either::Right(it),
     });
-    hir_expand::attrs::expand_cfg_attr_with_doc_comments_view::<_, ()>(written, || walk.cfg, |it| {
-        match it {
-            Either::Left((ast::Meta::CfgMeta(_), _)) => {}
-            Either::Left((meta, written)) => {
-                let unsafety = meta.syntax().parent().and_then(ast::UnsafeMeta::cast);
-                let top = written.meta();
-                let from_cfg_attr = matches!(top, Some(ast::Meta::CfgAttrMeta(_)))
-                    || matches!(top, Some(ast::Meta::UnsafeMeta(it)) if matches!(it.meta(), Some(ast::Meta::CfgAttrMeta(_))));
-                let inner = written.kind().is_inner();
-                attrs.push(Attr { file, kind: AttrKind::Meta { meta, written, unsafety, from_cfg_attr }, inner });
+    hir_expand::attrs::expand_cfg_attr_with_doc_comments_view::<_, ()>(
+        written,
+        || walk.cfg,
+        |it| {
+            match it {
+                Either::Left((ast::Meta::CfgMeta(_), _)) => {}
+                Either::Left((meta, written)) => {
+                    let unsafety = meta.syntax().parent().and_then(ast::UnsafeMeta::cast);
+                    let top = written.meta();
+                    let from_cfg_attr = matches!(top, Some(ast::Meta::CfgAttrMeta(_)))
+                        || matches!(top, Some(ast::Meta::UnsafeMeta(it)) if matches!(it.meta(), Some(ast::Meta::CfgAttrMeta(_))));
+                    let inner = written.kind().is_inner();
+                    attrs.push(Attr {
+                        file,
+                        kind: AttrKind::Meta { meta, written, unsafety, from_cfg_attr },
+                        inner,
+                    });
+                }
+                Either::Right(doc) => {
+                    let inner = doc.kind().is_inner();
+                    attrs.push(Attr { file, kind: AttrKind::Doc(doc), inner });
+                }
             }
-            Either::Right(doc) => {
-                let inner = doc.kind().is_inner();
-                attrs.push(Attr { file, kind: AttrKind::Doc(doc), inner });
-            }
-        }
-        std::ops::ControlFlow::Continue(())
-    });
+            std::ops::ControlFlow::Continue(())
+        },
+    );
 }
 
 /// A lint attribute parsing gives as AST lowering parses `owner`'s attributes: emitted with
@@ -383,7 +432,8 @@ fn written_attributes<'db>(
 pub(crate) fn parsed(diag: Diag, owner: &Owner<'_>) -> Emitted {
     match &owner.buffered_at {
         // clone: a pointer, copied for a lint emitted
-        Some(at) => Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()).buffered(Stage::Collected),
+        Some(at) => Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone())
+            .buffered(Stage::Collected),
         None => Emitted::new(diag, Phase::Items, Pass::Delayed, owner.at()),
     }
 }

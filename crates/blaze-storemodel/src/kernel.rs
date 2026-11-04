@@ -15,8 +15,8 @@ use std::sync::Arc;
 use blaze_cas::{Guard, Key, Kind, Mismatch, Reader, Store, Ticket, Writer};
 use blaze_ids::ContentId;
 use blaze_kernel::{
-    CodeId, Compute, Fact, Get, Got, Kernel, KernelError, Put, Read, ReadKind, Reading, Reads, Seen, Step, StepError,
-    StepId, Subject, World, WorldError,
+    CodeId, Compute, Fact, Get, Got, Kernel, KernelError, Put, Read, ReadKind, Reading, Reads,
+    Seen, Step, StepError, StepId, Subject, World, WorldError,
 };
 use blaze_store_check::Setting;
 use parking_lot::Mutex;
@@ -42,7 +42,9 @@ impl World for Dials {
     fn hash(&self, read: Read<'_>) -> Result<Seen, WorldError> {
         match (read.kind, read.key) {
             (DIAL, []) => Ok(Seen::Is(ContentId::of(HASHED, &[0xd1, self.dial]))),
-            (FACT, &[at]) => Ok(Seen::Is(ContentId::of(HASHED, &[at, self.facts[usize::from(at) % 4]]))),
+            (FACT, &[at]) => {
+                Ok(Seen::Is(ContentId::of(HASHED, &[at, self.facts[usize::from(at) % 4]])))
+            }
             _ => Err(WorldError::new(read, "the model's world has no such read")),
         }
     }
@@ -178,8 +180,12 @@ const CODE_DOMAIN: &str = "blaze storemodel code 1";
 /// The kernel every model uses: both steps registered.
 pub fn kernel() -> Kernel {
     let mut kernel = Kernel::new();
-    kernel.register::<Dialed>(CodeId(ContentId::of(CODE_DOMAIN, b"dialed"))).expect("one registration");
-    kernel.register::<Salted>(CodeId(ContentId::of(CODE_DOMAIN, b"salted"))).expect("one registration");
+    kernel
+        .register::<Dialed>(CodeId(ContentId::of(CODE_DOMAIN, b"dialed")))
+        .expect("one registration");
+    kernel
+        .register::<Salted>(CodeId(ContentId::of(CODE_DOMAIN, b"salted")))
+        .expect("one registration");
     kernel
 }
 
@@ -236,7 +242,13 @@ fn outcome(got: Result<Got<'_>, KernelError>) -> Result<Outcome, String> {
 }
 
 /// A kernel get's outcome; an error other than a conflict, rendered.
-fn get<P: Put + ?Sized>(which: Which, kernel: &Kernel, store: &mut P, world: &Dials, input: u8) -> Result<Outcome, String> {
+fn get<P: Put + ?Sized>(
+    which: Which,
+    kernel: &Kernel,
+    store: &mut P,
+    world: &Dials,
+    input: u8,
+) -> Result<Outcome, String> {
     match which {
         Which::Dialed => outcome(kernel.get::<Dialed, P>(store, world, &input, &Setting::OFF)),
         Which::Salted => outcome(kernel.get::<Salted, P>(store, world, &input, &Setting::OFF)),
@@ -244,7 +256,13 @@ fn get<P: Put + ?Sized>(which: Which, kernel: &Kernel, store: &mut P, world: &Di
 }
 
 /// A kernel lookup's value; an error, rendered.
-fn find<G: Get + ?Sized>(which: Which, kernel: &Kernel, store: &G, world: &Dials, input: u8) -> Result<Option<Vec<u8>>, String> {
+fn find<G: Get + ?Sized>(
+    which: Which,
+    kernel: &Kernel,
+    store: &G,
+    world: &Dials,
+    input: u8,
+) -> Result<Option<Vec<u8>>, String> {
     let found = match which {
         Which::Dialed => kernel.find::<Dialed, G>(store, world, &input),
         Which::Salted => kernel.find::<Salted, G>(store, world, &input),
@@ -285,11 +303,19 @@ fn asks(
         turn.pause(format!("find {}", asker.input));
         let found = find(which, kernel, &Reading { reader, guard: &guard }, world, asker.input);
         let failure = match found {
-            Err(error) => Some(Failure::new(properties::KERNEL_GETS_END, format!("{}'s lookup failed: {error}", asker.name))),
-            Ok(Some(value)) if which == Which::Dialed && value != dialed(asker.input, world) => Some(Failure::new(
-                properties::SERVES_ONLY_WRITTEN,
-                format!("{}'s lookup found {value:?}, which its world does not make", asker.name),
+            Err(error) => Some(Failure::new(
+                properties::KERNEL_GETS_END,
+                format!("{}'s lookup failed: {error}", asker.name),
             )),
+            Ok(Some(value)) if which == Which::Dialed && value != dialed(asker.input, world) => {
+                Some(Failure::new(
+                    properties::SERVES_ONLY_WRITTEN,
+                    format!(
+                        "{}'s lookup found {value:?}, which its world does not make",
+                        asker.name
+                    ),
+                ))
+            }
             Ok(_) => None,
         };
         if let Some(failure) = failure {
@@ -298,18 +324,34 @@ fn asks(
         return;
     }
     turn.pause(format!("get {}", asker.input));
-    let mut gated =
-        Gated { reader, writer: &mut writer, guard: &guard, turn, ledger, who: asker.name, tickets: Vec::new(), kept: Vec::new() };
+    let mut gated = Gated {
+        reader,
+        writer: &mut writer,
+        guard: &guard,
+        turn,
+        ledger,
+        who: asker.name,
+        tickets: Vec::new(),
+        kept: Vec::new(),
+    };
     let got = get(which, kernel, &mut gated, world, asker.input);
     let (tickets, kept) = (gated.tickets, gated.kept);
     let failure = match &got {
-        Err(error) => Some(Failure::new(properties::KERNEL_GETS_END, format!("{}'s get failed: {error}", asker.name))),
+        Err(error) => Some(Failure::new(
+            properties::KERNEL_GETS_END,
+            format!("{}'s get failed: {error}", asker.name),
+        )),
         Ok(Outcome::Conflict { .. }) if which == Which::Dialed => Some(Failure::new(
             properties::REFUSED_NOT_OVERWRITTEN,
             format!("{}'s get of a pure step was refused as a conflict: {got:?}", asker.name),
         )),
-        Ok(Outcome::Hit(value) | Outcome::Computed(value)) if which == Which::Dialed && *value != dialed(asker.input, world) => {
-            Some(Failure::new(properties::SERVES_ONLY_WRITTEN, format!("{}'s get gave {value:?}, which its world does not make", asker.name)))
+        Ok(Outcome::Hit(value) | Outcome::Computed(value))
+            if which == Which::Dialed && *value != dialed(asker.input, world) =>
+        {
+            Some(Failure::new(
+                properties::SERVES_ONLY_WRITTEN,
+                format!("{}'s get gave {value:?}, which its world does not make", asker.name),
+            ))
         }
         Ok(_) => None,
     };
@@ -333,17 +375,32 @@ fn asks(
 /// The kernel's checks of a restore: each lookup finds nothing or a value some actor's world
 /// makes, an actor that answered still finds its value, and the kernel run again on the
 /// restore gives what it gives on an empty store.
-fn check(scenario: &KernelScenario, kernel: &Kernel, model: &Model, store: &Store, disk: &Disk, ledger: &Ledger, bounds: &Bounds) -> Result<(), Failure> {
+fn check(
+    scenario: &KernelScenario,
+    kernel: &Kernel,
+    model: &Model,
+    store: &Store,
+    disk: &Disk,
+    ledger: &Ledger,
+    bounds: &Bounds,
+) -> Result<(), Failure> {
     for asker in scenario.askers.iter().filter(|it| !it.finds) {
         let world = &scenario.worlds[asker.world];
         let allowed = allowed(scenario, asker.input, asker.world);
-        let found = find(scenario.which, kernel, store, world, asker.input)
-            .map_err(|error| Failure::new(properties::KERNEL_GETS_END, format!("a lookup on the restore failed: {error}")))?;
+        let found = find(scenario.which, kernel, store, world, asker.input).map_err(|error| {
+            Failure::new(
+                properties::KERNEL_GETS_END,
+                format!("a lookup on the restore failed: {error}"),
+            )
+        })?;
         match found {
             Some(value) if !allowed.contains(&value) => {
                 return Err(Failure::new(
                     properties::SERVES_ONLY_WRITTEN,
-                    format!("a lookup of {}'s input on the restore found {value:?}, which no actor made in its world", asker.name),
+                    format!(
+                        "a lookup of {}'s input on the restore found {value:?}, which no actor made in its world",
+                        asker.name
+                    ),
                 ));
             }
             Some(_) => {}
@@ -352,7 +409,10 @@ fn check(scenario: &KernelScenario, kernel: &Kernel, model: &Model, store: &Stor
                 if matches!(outcome, Some(Outcome::Hit(_) | Outcome::Computed(_))) {
                     return Err(Failure::new(
                         properties::ANSWERED_SURVIVES,
-                        format!("{} answered ({outcome:?}), and after the crash a lookup of its input in its world misses", asker.name),
+                        format!(
+                            "{} answered ({outcome:?}), and after the crash a lookup of its input in its world misses",
+                            asker.name
+                        ),
                     ));
                 }
             }
@@ -367,10 +427,20 @@ fn check(scenario: &KernelScenario, kernel: &Kernel, model: &Model, store: &Stor
     let mut values: BTreeMap<&str, (Outcome, Outcome)> = BTreeMap::new();
     for asker in scenario.askers.iter().filter(|it| !it.finds) {
         let world = &scenario.worlds[asker.world];
-        let on_restore = get(scenario.which, kernel, &mut again, world, asker.input)
-            .map_err(|error| Failure::new(properties::KERNEL_GETS_END, format!("{}'s get again on the restore failed: {error}", asker.name)))?;
-        let on_fresh = get(scenario.which, kernel, &mut fresh, world, asker.input)
-            .map_err(|error| Failure::new(properties::KERNEL_GETS_END, format!("{}'s get on a fresh store failed: {error}", asker.name)))?;
+        let on_restore =
+            get(scenario.which, kernel, &mut again, world, asker.input).map_err(|error| {
+                Failure::new(
+                    properties::KERNEL_GETS_END,
+                    format!("{}'s get again on the restore failed: {error}", asker.name),
+                )
+            })?;
+        let on_fresh =
+            get(scenario.which, kernel, &mut fresh, world, asker.input).map_err(|error| {
+                Failure::new(
+                    properties::KERNEL_GETS_END,
+                    format!("{}'s get on a fresh store failed: {error}", asker.name),
+                )
+            })?;
         values.insert(asker.name, (on_restore, on_fresh));
     }
     if scenario.which == Which::Dialed {
@@ -382,7 +452,9 @@ fn check(scenario: &KernelScenario, kernel: &Kernel, model: &Model, store: &Stor
             if value(on_restore) != value(on_fresh) || value(on_restore).is_none() {
                 return Err(Failure::new(
                     properties::RESTORE_EQUALS_FRESH,
-                    format!("{name}'s get on the restore gave {on_restore:?}, and on a fresh store {on_fresh:?}"),
+                    format!(
+                        "{name}'s get on the restore gave {on_restore:?}, and on a fresh store {on_fresh:?}"
+                    ),
                 ));
             }
         }
@@ -391,11 +463,19 @@ fn check(scenario: &KernelScenario, kernel: &Kernel, model: &Model, store: &Stor
 }
 
 /// The kernel scenario, one execution.
-pub fn run_kernel(scenario: &KernelScenario, model: &Model, bounds: &Bounds, chooser: &mut Chooser, memo: &mut Memo) -> Result<(), Failure> {
+pub fn run_kernel(
+    scenario: &KernelScenario,
+    model: &Model,
+    bounds: &Bounds,
+    chooser: &mut Chooser,
+    memo: &mut Memo,
+) -> Result<(), Failure> {
     let kernel = Arc::new(kernel());
     let extra = {
         let kernel = Arc::clone(&kernel);
-        move |store: &Store, disk: &Disk, ledger: &Ledger, bounds: &Bounds| check(scenario, &kernel, model, store, disk, ledger, bounds)
+        move |store: &Store, disk: &Disk, ledger: &Ledger, bounds: &Bounds| {
+            check(scenario, &kernel, model, store, disk, ledger, bounds)
+        }
     };
     let mut run = Run::new(model, bounds, chooser, memo, &extra)?;
     for asker in &scenario.askers {
@@ -405,7 +485,9 @@ pub fn run_kernel(scenario: &KernelScenario, model: &Model, bounds: &Bounds, cho
         let kernel = Arc::clone(&kernel);
         let world = scenario.worlds[asker.world];
         let (asker, which, wait) = (*asker, scenario.which, model.wait);
-        run.actors.spawn(asker.name, move |turn| asks(turn, asker, which, wait, &kernel, &world, writer, &reader, &ledger))?;
+        run.actors.spawn(asker.name, move |turn| {
+            asks(turn, asker, which, wait, &kernel, &world, writer, &reader, &ledger)
+        })?;
     }
     run.run()
 }

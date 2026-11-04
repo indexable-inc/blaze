@@ -3,9 +3,9 @@
 //! (`line!` and `column!` expand to their values), and the places those macros give are where
 //! they are written.
 
+use hir_expand::fixture;
 use hir_ty::{db::HirDatabase, next_solver::GenericArgs};
 use hir_ty_mir::mir::{MirOptLevel, MirOptions};
-use hir_expand::fixture;
 
 use crate::{constant, db::TestDB, function};
 

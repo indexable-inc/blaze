@@ -34,7 +34,12 @@ use crate::{
 
 /// rustc's `potentially_unnecessary_qualifications`, less those whose name alone is found
 /// through an import found unused or redundant, in the order late resolution comes to them.
-pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>, uses: &Uses<'_, '_>, unused: &Unused) -> Vec<Found> {
+pub(super) fn lints<'db>(
+    cx: &Cx<'_, 'db>,
+    walk: &Walk<'db>,
+    uses: &Uses<'_, '_>,
+    unused: &Unused,
+) -> Vec<Found> {
     // alloc: holds only diagnostics that fire; empty, it allocates nothing
     let mut found = Vec::new();
     let mut scratch = Scratch::default();
@@ -70,7 +75,10 @@ fn qualification<'db>(
     }
     let parent = path.syntax().parent()?;
     let kind = parent.kind();
-    let ns = if ast::PathExpr::can_cast(kind) || ast::PathPat::can_cast(kind) || ast::TupleStructPat::can_cast(kind) {
+    let ns = if ast::PathExpr::can_cast(kind)
+        || ast::PathPat::can_cast(kind)
+        || ast::TupleStructPat::can_cast(kind)
+    {
         Ns::Values
     } else if ast::RecordExpr::can_cast(kind)
         || ast::RecordPat::can_cast(kind)
@@ -90,7 +98,10 @@ fn qualification<'db>(
     {
         return None;
     }
-    let end = segments.iter().position(|&(_, segment)| has_generic_args(segment)).map_or(segments.len(), |it| it + 1);
+    let end = segments
+        .iter()
+        .position(|&(_, segment)| has_generic_args(segment))
+        .map_or(segments.len(), |it| it + 1);
     resolve_into(cx, &segments[..end], resolved);
     let scope = cx.vsema.scope(path.syntax())?;
     let module = ModuleId::from(scope.module());
@@ -103,13 +114,19 @@ fn qualification<'db>(
     })?;
     let ns = if seg + 1 == segments.len() { ns } else { Ns::Types };
     let found_through =
-        entry(&uses.lookup(cx, module, PathKind::Plain, std::slice::from_ref(&name)), ns).and_then(|it| it.import);
-    if found_through.is_some_and(|it| unused.unused.contains(&it) || unused.redundant.contains(&it)) {
+        entry(&uses.lookup(cx, module, PathKind::Plain, std::slice::from_ref(&name)), ns)
+            .and_then(|it| it.import);
+    if found_through.is_some_and(|it| unused.unused.contains(&it) || unused.redundant.contains(&it))
+    {
         return None;
     }
     let start = segments[0].1.syntax().text_range().start();
     let removal = TextRange::new(start, segments[seg].1.syntax().text_range().start());
-    let mut diag = Diag::lint("unused_qualifications", "unnecessary qualification", cx.span(InFile::new(file, path.syntax().text_range())));
+    let mut diag = Diag::lint(
+        "unused_qualifications",
+        "unnecessary qualification",
+        cx.span(InFile::new(file, path.syntax().text_range())),
+    );
     diag.suggestion_verbose(
         cx.span(InFile::new(file, removal)),
         "remove the unnecessary path segments",
@@ -228,5 +245,7 @@ fn written(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) -> bool {
     if file.macro_file().is_none() {
         return true;
     }
-    InFile::new(file, range).original_node_file_range_opt(cx.db).is_some_and(|(_, ctxt)| ctxt.is_root())
+    InFile::new(file, range)
+        .original_node_file_range_opt(cx.db)
+        .is_some_and(|(_, ctxt)| ctxt.is_root())
 }

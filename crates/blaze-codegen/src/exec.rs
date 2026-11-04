@@ -15,9 +15,7 @@ use blaze_items::{CodeHash, ItemKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CompiledFunction, Init, InstanceKey, Settings, Static, Target,
-    driver::Built,
-    plan::Mode,
+    CompiledFunction, Init, InstanceKey, Settings, Static, Target, driver::Built, plan::Mode,
 };
 
 pub const FN_ID_DOMAIN: &str = "blaze v2 exec fn id 3";
@@ -65,9 +63,10 @@ pub fn bound(
             Target::Data(id) => hasher.update(&[2]).id(id),
             Target::Extern(name) => hasher.update(&[3]).part(name.as_bytes()),
             Target::Weak(name) => hasher.update(&[4]).part(name.as_bytes()),
-            Target::Position(_) | Target::Coverage(_) | Target::Counter(_) | Target::ProfileCounters => {
-                hasher.update(&[5])
-            }
+            Target::Position(_)
+            | Target::Coverage(_)
+            | Target::Counter(_)
+            | Target::ProfileCounters => hasher.update(&[5]),
         };
     }
     Ok(hasher.finish())
@@ -90,7 +89,9 @@ fn static_value(it: &Static) -> ContentId {
         }
     }
     let mut hasher = Hasher::new(STATIC_VALUE_DOMAIN);
-    hasher.update(&it.align.to_le_bytes()).update(&[u8::from(it.mutable), u8::from(it.thread_local)]);
+    hasher
+        .update(&it.align.to_le_bytes())
+        .update(&[u8::from(it.mutable), u8::from(it.thread_local)]);
     hasher.opt_part(it.section.as_deref());
     match &it.init {
         Init::Bytes { bytes, relocs } => {
@@ -103,7 +104,11 @@ fn static_value(it: &Static) -> ContentId {
     }
     hasher.update(&(it.data.len() as u64).to_le_bytes());
     for data in &it.data {
-        hasher.id(&data.id).update(&data.align.to_le_bytes()).update(&[u8::from(data.writable)]).part(&data.bytes);
+        hasher
+            .id(&data.id)
+            .update(&data.align.to_le_bytes())
+            .update(&[u8::from(data.writable)])
+            .part(&data.bytes);
         rows(&mut hasher, &data.relocs);
     }
     hasher.finish()
@@ -149,7 +154,8 @@ impl StaticBounds {
         bind: impl Fn(&InstanceKey) -> Option<ContentId>,
     ) -> StaticBounds {
         // alloc: once per test binary linked, its statics
-        let mut nodes: Vec<((ItemKey, ContentId), ContentId, Vec<&'a Target>)> = statics.into_iter().collect();
+        let mut nodes: Vec<((ItemKey, ContentId), ContentId, Vec<&'a Target>)> =
+            statics.into_iter().collect();
         nodes.sort_unstable_by_key(|it| it.0);
         let count = nodes.len();
         assert!(count < StaticBounds::UNSEEN as usize, "fewer statics than `UNSEEN`");
@@ -267,7 +273,9 @@ impl StaticBounds {
                         Some(callee) => hasher.update(&[0]).id(&callee),
                         None => {
                             // alloc: an error, of a walk that missed a function a static names
-                            bound = Err(format!("the static {item:?} refers to {key:?}, which the build has no instance of"));
+                            bound = Err(format!(
+                                "the static {item:?} refers to {key:?}, which the build has no instance of"
+                            ));
                             continue;
                         }
                     },
@@ -281,12 +289,17 @@ impl StaticBounds {
                         };
                         let theirs = self.component[to] as usize;
                         if theirs == component as usize {
-                            let place = members.binary_search(&(to as u32)).expect("a member of its own cycle");
+                            let place = members
+                                .binary_search(&(to as u32))
+                                .expect("a member of its own cycle");
                             hasher.update(&[1]).update(&(place as u32).to_le_bytes())
                         } else {
                             match &self.bounds[theirs] {
                                 Ok(it) => {
-                                    let (from, to) = (self.anchor_starts[theirs] as usize, self.anchor_starts[theirs + 1] as usize);
+                                    let (from, to) = (
+                                        self.anchor_starts[theirs] as usize,
+                                        self.anchor_starts[theirs + 1] as usize,
+                                    );
                                     self.anchors.extend_from_within(from..to);
                                     hasher.update(&[6]).id(it)
                                 }
@@ -305,7 +318,9 @@ impl StaticBounds {
                         self.anchors.push(span.anchor);
                         hasher.update(&[5]).id(&span.anchor).update(&span.index.to_le_bytes())
                     }
-                    Target::Coverage(_) | Target::Counter(_) | Target::ProfileCounters => hasher.update(&[7]),
+                    Target::Coverage(_) | Target::Counter(_) | Target::ProfileCounters => {
+                        hasher.update(&[7])
+                    }
                 };
             }
         }
@@ -324,10 +339,15 @@ impl StaticBounds {
 
     /// The bound of the static `item` `instance` and the anchors it names, transitively;
     /// `None` when the build has no such static.
-    fn of(&self, item: &ItemKey, instance: &ContentId) -> Option<(&Result<ContentId, String>, &[ContentId])> {
+    fn of(
+        &self,
+        item: &ItemKey,
+        instance: &ContentId,
+    ) -> Option<(&Result<ContentId, String>, &[ContentId])> {
         let at = self.keys.binary_search(&(*item, *instance)).ok()?;
         let component = self.component[at] as usize;
-        let anchors = &self.anchors[self.anchor_starts[component] as usize..self.anchor_starts[component + 1] as usize];
+        let anchors = &self.anchors
+            [self.anchor_starts[component] as usize..self.anchor_starts[component + 1] as usize];
         Some((&self.bounds[component], anchors))
     }
 }
@@ -365,7 +385,9 @@ fn named_by(
             Target::Static { item, instance } => {
                 let Some((bound, named)) = bounds.of(item, instance) else {
                     // alloc: an error, of a build that missed a static its code names
-                    return Err(format!("its code refers to the static {item:?} {instance:?}, which the build has none of"));
+                    return Err(format!(
+                        "its code refers to the static {item:?} {instance:?}, which the build has none of"
+                    ));
                 };
                 // clone: an error, of a static with no bound
                 statics.push((*item, *instance, bound.clone()?));
@@ -396,7 +418,8 @@ impl SpanIds {
         use blaze_graph::par;
         assert!(spans.len() < u32::MAX as usize, "fewer span tables than 2^32 - 1");
         // alloc: once per test binary linked, an ID per span table
-        let ids: Vec<(ContentId, ContentId)> = par::map(spans, |(anchor, bytes)| (*anchor, ContentId::of(SPAN_TABLE_DOMAIN, bytes)));
+        let ids: Vec<(ContentId, ContentId)> =
+            par::map(spans, |(anchor, bytes)| (*anchor, ContentId::of(SPAN_TABLE_DOMAIN, bytes)));
         let capacity = (ids.len() * 2).next_power_of_two().max(2);
         // alloc: once per test binary linked, the table's slots
         let mut slots = vec![0u32; capacity];
@@ -546,7 +569,9 @@ impl TestGraph {
             if stop(at) {
                 return true;
             }
-            let (Some(&from), Some(&to)) = (self.starts.get(at as usize), self.starts.get(at as usize + 1)) else {
+            let (Some(&from), Some(&to)) =
+                (self.starts.get(at as usize), self.starts.get(at as usize + 1))
+            else {
                 continue;
             };
             for &next in self.edges.get(from as usize..to as usize).unwrap_or_default() {
@@ -594,19 +619,34 @@ impl ExecError {
         let names = &built.debug_names;
         // alloc: an error's message, written once at the edge
         let mut said = String::new();
-        self.render(&mut said, |key| names.binary_search_by_key(key, |it| it.0).ok().map(|at| names[at].1.as_str()))
-            .expect("writing to a string cannot fail");
+        self.render(&mut said, |key| {
+            names.binary_search_by_key(key, |it| it.0).ok().map(|at| names[at].1.as_str())
+        })
+        .expect("writing to a string cannot fail");
         said
     }
 
-    fn render<'a>(&self, f: &mut impl fmt::Write, name: impl Fn(&InstanceKey) -> Option<&'a str>) -> fmt::Result {
+    fn render<'a>(
+        &self,
+        f: &mut impl fmt::Write,
+        name: impl Fn(&InstanceKey) -> Option<&'a str>,
+    ) -> fmt::Result {
         let named = |key: &InstanceKey| Named(*key, name(key));
         match self {
             ExecError::Unbound { function, why } => {
-                write!(f, "{} has no bound code, which test selection keys it by: {why}", named(function))
+                write!(
+                    f,
+                    "{} has no bound code, which test selection keys it by: {why}",
+                    named(function)
+                )
             }
             ExecError::Twice { function, other } => {
-                write!(f, "{} and {} are one function across versions", named(function), named(other))
+                write!(
+                    f,
+                    "{} and {} are one function across versions",
+                    named(function),
+                    named(other)
+                )
             }
             ExecError::PastTable { function, slot, slots } => {
                 write!(f, "{} is in slot {slot} of a jump table of {slots}", named(function))
@@ -618,13 +658,24 @@ impl ExecError {
                 write!(f, "the test `{test}` is at root {root}, which the build does not have")
             }
             ExecError::NotCompiled { function } => {
-                write!(f, "{} has no code in the build, so what positions and statics it names is not known", named(function))
+                write!(
+                    f,
+                    "{} has no code in the build, so what positions and statics it names is not known",
+                    named(function)
+                )
             }
             ExecError::NoSpans { function, anchor } => {
-                write!(f, "{} names the span table {anchor:?}, which the link was not given", named(function))
+                write!(
+                    f,
+                    "{} names the span table {anchor:?}, which the link was not given",
+                    named(function)
+                )
             }
             ExecError::Unwalked { functions, inputs } => {
-                write!(f, "the build's reference graph has {functions} functions for {inputs} instances, so its tests' reach can't be walked")
+                write!(
+                    f,
+                    "the build's reference graph has {functions} functions for {inputs} instances, so its tests' reach can't be walked"
+                )
             }
         }
     }
@@ -682,7 +733,10 @@ impl ExecTable {
     pub fn reaches(&self, test: usize, hit: impl Fn(&CodeHash) -> bool) -> bool {
         let Some((_, root)) = self.tests.get(test) else { return false };
         self.graph.walk(*root, |node| {
-            self.graph.marks.get(node as usize).is_some_and(|marks| marks.iter().any(|it| hit(&CodeHash(*it))))
+            self.graph
+                .marks
+                .get(node as usize)
+                .is_some_and(|marks| marks.iter().any(|it| hit(&CodeHash(*it))))
         })
     }
 
@@ -704,32 +758,50 @@ impl ExecTable {
         tests: impl IntoIterator<Item = (String, usize)>,
     ) -> Result<ExecTable, ExecError> {
         use blaze_graph::par;
-        assert_eq!(built.versions.len(), built.inputs.len(), "a build gives a version per instance");
+        assert_eq!(
+            built.versions.len(),
+            built.inputs.len(),
+            "a build gives a version per instance"
+        );
         let count = built.inputs.len();
         assert!(count < ExecTable::EMPTY as usize, "fewer functions than `EMPTY`");
         let statics = StaticBounds::new(
-            built.statics.iter().map(|it| ((it.item, it.instance), static_value(it), static_targets(it))),
-            |key| built.inputs.binary_search_by_key(key, |it| it.0).ok().map(|at| built.versions[at].0),
+            built
+                .statics
+                .iter()
+                .map(|it| ((it.item, it.instance), static_value(it), static_targets(it))),
+            |key| {
+                built
+                    .inputs
+                    .binary_search_by_key(key, |it| it.0)
+                    .ok()
+                    .map(|at| built.versions[at].0)
+            },
         );
         let spans = SpanIds::new(spans);
         // Each function's on every core, in key order.
         // alloc: per worker, the anchors and statics of one function, reused
         // alloc: once per test binary, a bound per function
-        let placed: Vec<Result<ContentId, ExecError>> = par::map_init(0..count, || (Vec::new(), Vec::new()), |(anchors, named), at| {
-            let function = built.inputs[at].0;
-            let bound = match &built.versions[at].1 {
-                Ok(it) => *it,
-                // clone: an error
-                Err(why) => return Err(ExecError::Unbound { function, why: why.clone() }),
-            };
-            let runs = built.deduped.merged.get(&function).unwrap_or(&function);
-            let Ok(code) = built.functions.binary_search_by_key(runs, |it| it.key) else {
-                return Err(ExecError::NotCompiled { function });
-            };
-            named_by(&built.functions[code], &statics, anchors, named)
-                .map_err(|why| ExecError::Unbound { function, why })?;
-            placed(bound, named, anchors, &spans).map_err(|anchor| ExecError::NoSpans { function, anchor })
-        });
+        let placed: Vec<Result<ContentId, ExecError>> = par::map_init(
+            0..count,
+            || (Vec::new(), Vec::new()),
+            |(anchors, named), at| {
+                let function = built.inputs[at].0;
+                let bound = match &built.versions[at].1 {
+                    Ok(it) => *it,
+                    // clone: an error
+                    Err(why) => return Err(ExecError::Unbound { function, why: why.clone() }),
+                };
+                let runs = built.deduped.merged.get(&function).unwrap_or(&function);
+                let Ok(code) = built.functions.binary_search_by_key(runs, |it| it.key) else {
+                    return Err(ExecError::NotCompiled { function });
+                };
+                named_by(&built.functions[code], &statics, anchors, named)
+                    .map_err(|why| ExecError::Unbound { function, why })?;
+                placed(bound, named, anchors, &spans)
+                    .map_err(|anchor| ExecError::NoSpans { function, anchor })
+            },
+        );
         // alloc: once per test binary, the identity order
         let mut order: Vec<u32> = (0..count as u32).collect();
         // By place too, so that of two functions with one `FnId` the later is named.
@@ -788,7 +860,11 @@ impl ExecTable {
             // alloc: once per test binary, the graph its tests are walked over
             edges: edges.to_vec(),
             // alloc: once per test binary, a place per node
-            place: rank.iter().copied().chain((functions..marks.len()).map(|_| ExecTable::EMPTY)).collect(),
+            place: rank
+                .iter()
+                .copied()
+                .chain((functions..marks.len()).map(|_| ExecTable::EMPTY))
+                .collect(),
             // alloc: once per test binary, the marks per node
             marks: marks.to_vec(),
         };

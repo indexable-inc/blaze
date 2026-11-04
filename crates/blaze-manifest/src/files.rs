@@ -19,7 +19,8 @@ pub trait Files {
     /// A `Files` that keeps manifests parsed answers from them, so nothing parses one twice.
     fn manifest(&self, path: &Path) -> anyhow::Result<TomlManifest> {
         // alloc: an error's context, made only when the read fails.
-        let bytes = self.read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
+        let bytes =
+            self.read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
         crate::manifest::parse_manifest(path, &bytes)
     }
     /// What is at `path`, following links; `None` for nothing there.
@@ -153,7 +154,8 @@ pub fn glob<F: Files>(
     let scope = if root_len > 0 { PathBuf::from(&pattern[..root_len]) } else { PathBuf::from(".") };
 
     let mut parts = Vec::new();
-    for component in pattern[root_len.min(pattern.len())..].split_terminator(std::path::is_separator)
+    for component in
+        pattern[root_len.min(pattern.len())..].split_terminator(std::path::is_separator)
     {
         parts.push(Part {
             pattern: glob::Pattern::new(component)?,
@@ -363,7 +365,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_trailing_separator_keeps_directories_only() {
-        assert_eq!(matched(&tree(), "/w/crates/*/"), ["/w/crates/.hidden", "/w/crates/a", "/w/crates/b"]);
+        assert_eq!(
+            matched(&tree(), "/w/crates/*/"),
+            ["/w/crates/.hidden", "/w/crates/a", "/w/crates/b"]
+        );
     }
 
     #[test]
@@ -398,7 +403,8 @@ pub(crate) mod tests {
     /// reader's errors.
     #[test]
     fn kept_bytes_are_lent() {
-        let mem = Mem::default().file("/w/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\n");
+        let mem =
+            Mem::default().file("/w/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\n");
         let kept = mem.0[Path::new("/w/Cargo.toml")].as_ref().unwrap().as_ptr();
         let read = mem.read(Path::new("/w/Cargo.toml")).unwrap();
         assert!(matches!(read, Cow::Borrowed(it) if it.as_ptr() == kept));
@@ -459,7 +465,10 @@ pub(crate) mod tests {
             ("crates/a/examples/demo.rs", ""),
             ("crates/a/build.rs", ""),
             ("crates/a/README.md", ""),
-            ("crates/b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+            (
+                "crates/b/Cargo.toml",
+                "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
             ("crates/b/src/main.rs", ""),
             ("crates/b/tests/it.rs", ""),
         ]
@@ -485,7 +494,8 @@ pub(crate) mod tests {
     /// same `cargo metadata --no-deps`.
     #[test]
     fn a_workspace_reads_the_same_through_any_files() {
-        let scratch = std::env::temp_dir().join(format!("blaze-manifest-files-{}", std::process::id()));
+        let scratch =
+            std::env::temp_dir().join(format!("blaze-manifest-files-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).unwrap();
         let root = scratch.canonicalize().unwrap().display().to_string();
         let mut mem = Mem::default().dir(&format!("{root}/home"));
@@ -531,7 +541,8 @@ pub(crate) mod tests {
         let root = root.canonicalize().unwrap();
         for pattern in ["m/*", "m/*/", "m/**", "m/**/Cargo.toml", "[mn]", "m/a", "m/zz", "m/.*"] {
             let pattern = format!("{}/{pattern}", root.display());
-            let ours: Vec<PathBuf> = glob(&Disk, &pattern).unwrap().into_iter().map(Result::unwrap).collect();
+            let ours: Vec<PathBuf> =
+                glob(&Disk, &pattern).unwrap().into_iter().map(Result::unwrap).collect();
             let theirs: Vec<PathBuf> = glob::glob(&pattern).unwrap().map(Result::unwrap).collect();
             assert_eq!(ours, theirs, "{pattern}");
         }

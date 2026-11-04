@@ -12,8 +12,8 @@ use rustc_type_ir::{TypeSuperVisitable, TypeVisitable, TypeVisitor, inherent::In
 use crate::{
     FrameSet,
     consteval::try_const_usize,
-    frame_set,
     db::HirDatabase,
+    frame_set,
     next_solver::{
         DbInterner, EarlyBinder, GenericArgs, ParamEnv, Ty, TyKind,
         infer::{InferCtxt, traits::ObligationCause},
@@ -185,7 +185,8 @@ impl<'a, 'db> UninhabitedFrom<'a, 'db> {
             // add a variant to. A `#[non_exhaustive]` struct or variant is walked all the same.
             AdtId::EnumId(e)
                 if e.krate(self.db()) != self.local
-                    && AttrFlags::query(self.db(), e.into()).contains(AttrFlags::NON_EXHAUSTIVE) =>
+                    && AttrFlags::query(self.db(), e.into())
+                        .contains(AttrFlags::NON_EXHAUSTIVE) =>
             {
                 CONTINUE_OPAQUELY_INHABITED
             }

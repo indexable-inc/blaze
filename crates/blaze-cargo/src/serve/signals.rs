@@ -4,9 +4,9 @@
 //! it. The one place `serve` uses `unsafe`:
 //! installing a handler is a libc call, and std has no safe way to do it.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicI32, AtomicUsize};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// What the line a signal that ends the daemon writes starts with, then its pid, then
 /// [`ENDED_BY`], the signal's number and its name: `blaze serve: pid 7 ended by signal 6,
@@ -73,7 +73,9 @@ pub fn dump_asked() -> bool {
 #[cfg(unix)]
 pub fn catch() {
     extern "C" fn on(signal: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
-        if SIGNAL.compare_exchange(0, signal, Ordering::Relaxed, Ordering::Relaxed).is_ok() && !info.is_null() {
+        if SIGNAL.compare_exchange(0, signal, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            && !info.is_null()
+        {
             // SAFETY: an `SA_SIGINFO` handler's `info` is the kernel's, whole and live for the
             // handler; a SIGTERM or SIGINT's sender fields are the ones it filled.
             let (pid, uid) = unsafe { ((*info).si_pid(), (*info).si_uid()) };
@@ -93,8 +95,8 @@ pub fn catch() {
     // SAFETY: `sigaction` is integers, a mask of integers and a handler address; zeroed is
     // its empty value.
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction =
-        on as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as libc::sighandler_t;
+    action.sa_sigaction = on as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+        as libc::sighandler_t;
     action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
     for signal in [libc::SIGTERM, libc::SIGINT] {
         // SAFETY: `action` is live and whole; its handler, `on`, only does atomic operations,
@@ -226,7 +228,9 @@ pub fn record_ends() {
         // which all-zero bytes are a valid value (no handler, no flags, an empty mask).
         let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
         // SAFETY: `old` is live for the call to fill; a null new action changes nothing.
-        if unsafe { libc::sigaction(signal, std::ptr::null(), &mut old) } != 0 || old.sa_sigaction != libc::SIG_DFL {
+        if unsafe { libc::sigaction(signal, std::ptr::null(), &mut old) } != 0
+            || old.sa_sigaction != libc::SIG_DFL
+        {
             continue;
         }
         // SAFETY: as for `old`.
@@ -251,7 +255,8 @@ const FAULTS: [libc::c_int; 2] = [libc::SIGSEGV, libc::SIGBUS];
 /// Each of [`FAULTS`]' handler and flags before [`record_faults`]: atomics, as the handler reads
 /// them inside a signal.
 #[cfg(unix)]
-static BEFORE: [(AtomicUsize, AtomicI32); 2] = [const { (AtomicUsize::new(libc::SIG_DFL), AtomicI32::new(0)) }; 2];
+static BEFORE: [(AtomicUsize, AtomicI32); 2] =
+    [const { (AtomicUsize::new(libc::SIG_DFL), AtomicI32::new(0)) }; 2];
 
 /// Has SIGSEGV and SIGBUS write `blaze serve: pid N ended by signal S, NAME: ... at 0xADDR on
 /// thread T (tid I)` to stderr, then hands the signal to the handler that was there with what
@@ -260,7 +265,11 @@ static BEFORE: [(AtomicUsize, AtomicI32); 2] = [const { (AtomicUsize::new(libc::
 /// that names it, never silently.
 #[cfg(unix)]
 fn record_faults() {
-    extern "C" fn faulted(signal: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
+    extern "C" fn faulted(
+        signal: libc::c_int,
+        info: *mut libc::siginfo_t,
+        context: *mut libc::c_void,
+    ) {
         let mut line = Line { bytes: [0; 160], len: 0 };
         line.put(PID_SAYS.as_bytes());
         // SAFETY: `getpid` takes nothing and is async-signal-safe.
@@ -278,8 +287,9 @@ fn record_faults() {
         // SAFETY: `name` is live and its length is passed. For the calling thread
         // `pthread_getname_np` copies the name the thread keeps (Linux: `prctl`, a system
         // call), with no lock and no allocation.
-        let named =
-            unsafe { libc::pthread_getname_np(libc::pthread_self(), name.as_mut_ptr().cast(), name.len()) } == 0;
+        let named = unsafe {
+            libc::pthread_getname_np(libc::pthread_self(), name.as_mut_ptr().cast(), name.len())
+        } == 0;
         let len = name.iter().position(|&it| it == 0).unwrap_or(name.len());
         line.put(if named && len > 0 { &name[..len] } else { b"<unnamed>" });
         line.put(b" (tid ");
@@ -288,7 +298,8 @@ fn record_faults() {
         // SAFETY: as in `record_ends`'s handler: `write` of the line's written bytes.
         unsafe { libc::write(libc::STDERR_FILENO, line.bytes.as_ptr().cast(), line.len) };
         let at = usize::from(signal != libc::SIGSEGV);
-        let (handler, flags) = (BEFORE[at].0.load(Ordering::Acquire), BEFORE[at].1.load(Ordering::Acquire));
+        let (handler, flags) =
+            (BEFORE[at].0.load(Ordering::Acquire), BEFORE[at].1.load(Ordering::Acquire));
         if handler == libc::SIG_DFL || handler == libc::SIG_IGN {
             // SAFETY: as for `old` in `record_ends`.
             let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -327,8 +338,9 @@ fn record_faults() {
         BEFORE[at].1.store(old.sa_flags, Ordering::Release);
         // SAFETY: as for `old`.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction =
-            faulted as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as libc::sighandler_t;
+        action.sa_sigaction = faulted
+            as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+            as libc::sighandler_t;
         // On the alternate stack std gives each thread, as std's own handler is: a stack
         // overflow leaves no room on the thread's stack.
         action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
@@ -478,7 +490,8 @@ mod tests {
             unsafe { libc::dup2(fds[1], libc::STDERR_FILENO) };
             record_faults();
             // SAFETY: none: the read faults, on purpose, at an address no mapping has.
-            let _fault = unsafe { std::ptr::read_volatile(std::ptr::without_provenance::<u8>(0x40)) };
+            let _fault =
+                unsafe { std::ptr::read_volatile(std::ptr::without_provenance::<u8>(0x40)) };
             // SAFETY: `_exit` ends the child at once; reached only if the fault was not one.
             unsafe { libc::_exit(0) };
         }
@@ -503,6 +516,11 @@ mod tests {
         let by = libc::WTERMSIG(status);
         assert!(by == libc::SIGSEGV || by == libc::SIGBUS, "ended by the fault, not {by}: {said}");
         assert!(said.starts_with(&format!("{PID_SAYS}{child}{ENDED_BY}{by}")), "{said}");
-        assert!(said.contains(" at 0x40 on thread ") && said.contains(" (tid ") && said.ends_with(")\n"), "{said}");
+        assert!(
+            said.contains(" at 0x40 on thread ")
+                && said.contains(" (tid ")
+                && said.ends_with(")\n"),
+            "{said}"
+        );
     }
 }

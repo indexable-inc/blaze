@@ -110,14 +110,20 @@ pub struct Built {
 
 /// The function that selects `shape` for `target`, compiled with `isa`'s frontend config. An
 /// error names why no IR can select it.
-pub fn build(shape: Shape, target: &Target, isa: &dyn TargetIsa, baked: &Baked) -> Result<Built, String> {
+pub fn build(
+    shape: Shape,
+    target: &Target,
+    isa: &dyn TargetIsa,
+    baked: &Baked,
+) -> Result<Built, String> {
     let sig = ir::Signature::new(host::call_conv(target));
     let mut func = ir::Function::with_name_signature(ir::UserFuncName::user(0, 0), sig);
     let mut fcx = FunctionBuilderContext::new();
     let mut b = FunctionBuilder::new(&mut func, &mut fcx);
     let entry = b.create_block();
     b.switch_to_block(entry);
-    let mut cx = Cx { b, entry, shape, baked: *baked, inputs: Vec::new(), returns: false, ss: None };
+    let mut cx =
+        Cx { b, entry, shape, baked: *baked, inputs: Vec::new(), returns: false, ss: None };
     cx.body()?;
     let Cx { mut b, inputs, .. } = cx;
     b.seal_all_blocks();
@@ -152,9 +158,12 @@ fn loaded(op: Op, ty: Ty) -> Ty {
         Op::Uload8 | Op::Sload8 => Ty::I8,
         Op::Uload16 | Op::Sload16 => Ty::I16,
         Op::Uload32 | Op::Sload32 => Ty::I32,
-        Op::Uload8x8 | Op::Sload8x8 | Op::Uload16x4 | Op::Sload16x4 | Op::Uload32x2 | Op::Sload32x2 => {
-            Ty::I64
-        }
+        Op::Uload8x8
+        | Op::Sload8x8
+        | Op::Uload16x4
+        | Op::Sload16x4
+        | Op::Uload32x2
+        | Op::Sload32x2 => Ty::I64,
         _ => ty,
     }
 }
@@ -602,10 +611,18 @@ impl Cx<'_> {
             Op::SsubOverflow => self.pure(|b, [x, y, _]| pair(b.ins().ssub_overflow(x, y))),
             Op::UmulOverflow => self.pure(|b, [x, y, _]| pair(b.ins().umul_overflow(x, y))),
             Op::SmulOverflow => self.pure(|b, [x, y, _]| pair(b.ins().smul_overflow(x, y))),
-            Op::UaddOverflowCin => self.pure(|b, [x, y, c]| pair(b.ins().uadd_overflow_cin(x, y, c))),
-            Op::SaddOverflowCin => self.pure(|b, [x, y, c]| pair(b.ins().sadd_overflow_cin(x, y, c))),
-            Op::UsubOverflowBin => self.pure(|b, [x, y, c]| pair(b.ins().usub_overflow_bin(x, y, c))),
-            Op::SsubOverflowBin => self.pure(|b, [x, y, c]| pair(b.ins().ssub_overflow_bin(x, y, c))),
+            Op::UaddOverflowCin => {
+                self.pure(|b, [x, y, c]| pair(b.ins().uadd_overflow_cin(x, y, c)))
+            }
+            Op::SaddOverflowCin => {
+                self.pure(|b, [x, y, c]| pair(b.ins().sadd_overflow_cin(x, y, c)))
+            }
+            Op::UsubOverflowBin => {
+                self.pure(|b, [x, y, c]| pair(b.ins().usub_overflow_bin(x, y, c)))
+            }
+            Op::SsubOverflowBin => {
+                self.pure(|b, [x, y, c]| pair(b.ins().ssub_overflow_bin(x, y, c)))
+            }
             Op::UaddOverflowTrap => {
                 self.pure(|b, [x, y, _]| vec![b.ins().uadd_overflow_trap(x, y, user_trap())])
             }
@@ -683,7 +700,8 @@ impl Cx<'_> {
             Op::Splat => self.pure(|b, [x, _, _]| vec![b.ins().splat(t, x)]),
             Op::Swizzle => self.pure(|b, [x, y, _]| vec![b.ins().swizzle(x, y)]),
             Op::Shuffle => {
-                let mask = self.b.func.dfg.immediates.push(ConstantData::from(&self.baked.bytes[..]));
+                let mask =
+                    self.b.func.dfg.immediates.push(ConstantData::from(&self.baked.bytes[..]));
                 self.pure(|b, [x, y, _]| vec![b.ins().shuffle(x, y, mask)]);
             }
             Op::Insertlane => self.pure(|b, [x, y, _]| vec![b.ins().insertlane(x, y, aux)]),

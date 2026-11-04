@@ -396,7 +396,15 @@ LL | unsafe extern "C" {
 error: aborting due to 2 previous errors
 
 "#;
-    assert_eq!(crate::tests::items::ui_core("safe-unsafe-on-unadorned-extern-block.rs", "2021", "copy", source), stderr);
+    assert_eq!(
+        crate::tests::items::ui_core(
+            "safe-unsafe-on-unadorned-extern-block.rs",
+            "2021",
+            "copy",
+            source
+        ),
+        stderr
+    );
 }
 
 #[test]
@@ -527,11 +535,7 @@ pub fn main() {
 "#;
     assert_reports(
         &ui("lifetime_starts_expressions.rs", "2015", source),
-        &[
-            error(8, &[]),
-            error(33, &[]),
-            warning(15, &[]),
-        ],
+        &[error(8, &[]), error(33, &[]), warning(15, &[])],
     );
 }
 
@@ -573,7 +577,16 @@ macro_rules! println {
 }
 "#;
     let std = (std_items, "pub use crate::println;");
-    assert_eq!(ui_std("break-label-with-parens-147542.rs", "2015", "sized, fmt, builtin_impls", std, source), "");
+    assert_eq!(
+        ui_std(
+            "break-label-with-parens-147542.rs",
+            "2015",
+            "sized, fmt, builtin_impls",
+            std,
+            source
+        ),
+        ""
+    );
 }
 
 #[test]
@@ -826,7 +839,15 @@ LL |     type Assoc3 where = () where;
 warning: 5 warnings emitted
 
 "#;
-    assert_eq!(crate::tests::items::ui_core("where-clause-placement-assoc-type-in-impl.rs", "2015", "copy", source), stderr);
+    assert_eq!(
+        crate::tests::items::ui_core(
+            "where-clause-placement-assoc-type-in-impl.rs",
+            "2015",
+            "copy",
+            source
+        ),
+        stderr
+    );
 }
 
 #[test]
@@ -879,7 +900,15 @@ LL +     type Assoc2 = () where i32: Copy, u32: Copy;
 warning: 2 warnings emitted
 
 "#;
-    assert_eq!(crate::tests::items::ui_core("where-clause-placement-assoc-type-in-trait.rs", "2015", "copy", source), stderr);
+    assert_eq!(
+        crate::tests::items::ui_core(
+            "where-clause-placement-assoc-type-in-trait.rs",
+            "2015",
+            "copy",
+            source
+        ),
+        stderr
+    );
 }
 
 #[test]

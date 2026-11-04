@@ -263,12 +263,8 @@ impl<'a> Shrinker<'a> {
         let epoch = self.improvements;
         let prefix: Vec<ChoiceValue> = raised.iter().map(|n| n.value()).collect();
         let max_size = flattened_len(&self.current_nodes) + PROBE_EXTENSION;
-        let Some(realised) = self
-            .consider_reshaped(ShrinkRun::Probe {
-                prefix: &prefix,
-                max_size,
-            })
-            .await?
+        let Some(realised) =
+            self.consider_reshaped(ShrinkRun::Probe { prefix: &prefix, max_size }).await?
         else {
             return Ok(());
         };
@@ -276,10 +272,7 @@ impl<'a> Shrinker<'a> {
             return Ok(());
         }
         let path_unchanged = realised.len() == raised.len()
-            && realised
-                .iter()
-                .zip(&raised)
-                .all(|(r, c)| r.value() == c.value());
+            && realised.iter().zip(&raised).all(|(r, c)| r.value() == c.value());
         if path_unchanged {
             return Ok(());
         }
@@ -320,9 +313,8 @@ pub(super) async fn try_bump_ij(
     j: usize,
     bump_val: &ChoiceValue,
 ) -> ShrinkResult<bool> {
-    let replacements: HashMap<usize, ChoiceValue> = [(i, new_val.clone()), (j, bump_val.clone())]
-        .into_iter()
-        .collect();
+    let replacements: HashMap<usize, ChoiceValue> =
+        [(i, new_val.clone()), (j, bump_val.clone())].into_iter().collect();
     shrinker.replace(&replacements).await
 }
 

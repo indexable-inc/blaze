@@ -65,7 +65,11 @@ fn parts(cx: &Cx<'_, '_>, diag: &mut Diag, d: &hir::BorrowckError) {
             // alloc: a note's spans, once per diagnostic (the edge).
             primary: child.spans.iter().map(|&it| cx.span(it)).collect(),
             // clone: a note's labels hir owns, once per diagnostic (the edge).
-            labels: child.labels.iter().map(|&(range, ref label)| (cx.span(range), label.clone())).collect(),
+            labels: child
+                .labels
+                .iter()
+                .map(|&(range, ref label)| (cx.span(range), label.clone()))
+                .collect(),
         };
         // clone: a note's text hir owns, once per diagnostic (the edge).
         diag.sub(level, child.message.clone(), span, false);
@@ -82,7 +86,11 @@ fn parts(cx: &Cx<'_, '_>, diag: &mut Diag, d: &hir::BorrowckError) {
             false => SuggestionStyle::ShowCode,
         };
         // clone: a suggestion's edits hir owns, once per diagnostic (the edge).
-        let edits = suggestion.parts.iter().map(|&(range, ref code)| (cx.span(range), code.clone())).collect();
+        let edits = suggestion
+            .parts
+            .iter()
+            .map(|&(range, ref code)| (cx.span(range), code.clone()))
+            .collect();
         // clone: a suggestion's text hir owns, once per diagnostic (the edge).
         diag.suggestion_with_style(edits, suggestion.message.clone(), applicability, style);
     }
@@ -146,7 +154,11 @@ mod tests {
         let fixture = "//- /main.rs crate:main\nfn main() { let mut n = 1; let _ = n; }\n";
         with_cx(fixture, &["-A", "unused_mut", "-A", "blaze::const_impure"], |cx| {
             let file = cx.krate.root_module(cx.db).definition_source_file_id(cx.db);
-            let pat = cx.root(file).descendants().find_map(ast::IdentPat::cast).expect("the pattern `mut n`");
+            let pat = cx
+                .root(file)
+                .descendants()
+                .find_map(ast::IdentPat::cast)
+                .expect("the pattern `mut n`");
             let node = InFile::new(file, ast::ptr(pat.syntax()));
             let unused_mut = hir::BorrowckError {
                 node,
@@ -161,7 +173,10 @@ mod tests {
             // The first lowering decides the crate's lints that may fire, once per crate.
             assert!(super::lower(cx, &unused_mut).is_empty());
             let found = assert_at_most(0, "an allowed lint's lowering", || {
-                (super::lower(cx, &unused_mut).len(), crate::lower::const_impure::lower(cx, &impure).len())
+                (
+                    super::lower(cx, &unused_mut).len(),
+                    crate::lower::const_impure::lower(cx, &impure).len(),
+                )
             });
             assert_eq!(found, (0, 0));
         });

@@ -32,7 +32,15 @@ const ID: SectionId = SectionId::SYMBOLS;
 
 /// One compiled-in value, so made IDs start at 2.
 fn shape() -> Shape {
-    Shape { statics: 1, static_bytes: |_| b"s", key: crate::order_key, align: 1, size: 1, text: true, overlay: Overlay::Secret }
+    Shape {
+        statics: 1,
+        static_bytes: |_| b"s",
+        key: crate::order_key,
+        align: 1,
+        size: 1,
+        text: true,
+        overlay: Overlay::Secret,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,7 +154,9 @@ fn model_freed_ids_are_taken_once() {
         let histories = Arc::new(Histories::default());
         let other = {
             let (table, histories) = (table.clone(), histories.clone());
-            thread::spawn(move || [Op::Intern(0), Op::Find(1)].map(|op| run(&histories, &table, op)))
+            thread::spawn(move || {
+                [Op::Intern(0), Op::Find(1)].map(|op| run(&histories, &table, op))
+            })
         };
         let one = run(&histories, &table, Op::Intern(1));
         let zero = run(&histories, &table, Op::Find(0));

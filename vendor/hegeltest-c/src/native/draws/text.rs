@@ -89,9 +89,7 @@ fn compute_intervals(alphabet: &TextAlphabet) -> Result<IntervalSet, EngineError
         Some("latin-1") | Some("iso-8859-1") => (0, 255),
         Some("utf-8") | None => (0, 0x10FFFF),
         Some(other) => {
-            return Err(EngineError::InvalidArgument(format!(
-                "invalid codec: {other}"
-            )));
+            return Err(EngineError::InvalidArgument(format!("invalid codec: {other}")));
         }
     };
     let cp_min = codec_min.max(alphabet.min_codepoint);
@@ -99,14 +97,10 @@ fn compute_intervals(alphabet: &TextAlphabet) -> Result<IntervalSet, EngineError
 
     let categories = alphabet.categories.as_ref();
     let exclude_categories = alphabet.exclude_categories.as_ref();
-    let include_chars: Option<Vec<char>> = alphabet
-        .include_characters
-        .as_ref()
-        .map(|s| s.chars().collect());
-    let exclude_chars: Option<Vec<char>> = alphabet
-        .exclude_characters
-        .as_ref()
-        .map(|s| s.chars().collect());
+    let include_chars: Option<Vec<char>> =
+        alphabet.include_characters.as_ref().map(|s| s.chars().collect());
+    let exclude_chars: Option<Vec<char>> =
+        alphabet.exclude_characters.as_ref().map(|s| s.chars().collect());
 
     for cat in categories
         .iter()
@@ -164,11 +158,8 @@ fn compute_intervals(alphabet: &TextAlphabet) -> Result<IntervalSet, EngineError
         if excl_cats.iter().all(|c| c == "Cs") {
             base
         } else {
-            let non_cs: Vec<String> = excl_cats
-                .iter()
-                .filter(|c| c.as_str() != "Cs")
-                .cloned()
-                .collect();
+            let non_cs: Vec<String> =
+                excl_cats.iter().filter(|c| c.as_str() != "Cs").cloned().collect();
             let cat_union = categories_union(&non_cs, alphabet.unicode_version)?;
             base.difference(&cat_union)?
         }

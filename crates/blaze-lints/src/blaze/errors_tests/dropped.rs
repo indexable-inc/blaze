@@ -78,12 +78,16 @@ fn dropped_error() {
 fn dropped_error_leaves_clippys_places_to_clippy() {
     let source = DROPPED
         .replace("    read().ok(); //~ dropped_error", "    read().ok();")
-        .replace("let _ = read().map_err(|_| 1u32); //~ dropped_error", "let _ = read().map_err(|_| 1u32);")
+        .replace(
+            "let _ = read().map_err(|_| 1u32); //~ dropped_error",
+            "let _ = read().map_err(|_| 1u32);",
+        )
         .replace("    read().map_err(|_| 1u32) //~ dropped_error", "    read().map_err(|_| 1u32)");
     let out = check(
         &source,
         "-A clippy::all --warn=blaze::dropped_error --warn=clippy::unused_result_ok --warn=clippy::map_err_ignore",
     );
-    let clippy = out.lines().filter(|it| it.starts_with("warning: `map_err(|_| ..)` throws away")).count();
+    let clippy =
+        out.lines().filter(|it| it.starts_with("warning: `map_err(|_| ..)` throws away")).count();
     assert_eq!(clippy, 2, "map_err_ignore reports both `|_|` closures:\n{out}");
 }

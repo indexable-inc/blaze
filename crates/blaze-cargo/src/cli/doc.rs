@@ -23,7 +23,9 @@ pub struct Docs {
 impl Docs {
     pub fn documented(&mut self, documented: Documented) {
         if self.documented.is_some() {
-            self.failed.get_or_insert_with(|| "the daemon said twice where the documentation goes".to_owned());
+            self.failed.get_or_insert_with(|| {
+                "the daemon said twice where the documentation goes".to_owned()
+            });
             return;
         }
         self.documented = Some(documented);
@@ -41,11 +43,14 @@ impl Docs {
 
     fn write(&self, path: &str, page: &[u8]) -> Result<(), String> {
         let Some(documented) = &self.documented else {
-            return Err(format!("the daemon sent the page `{path}` before saying where the documentation goes"));
+            return Err(format!(
+                "the daemon sent the page `{path}` before saying where the documentation goes"
+            ));
         };
         let to = under(Path::new(&documented.dir), path)?;
         if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| format!("creating {}: {error}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("creating {}: {error}", parent.display()))?;
         }
         std::fs::write(&to, page).map_err(|error| format!("writing {}: {error}", to.display()))
     }
@@ -70,7 +75,8 @@ impl Docs {
         let names: Vec<&str> = documented.crates.iter().map(|it| it.name.as_str()).collect();
         let kept = |name: &str| under(dir, name).is_ok_and(|it| it.join("index.html").is_file());
         let text = blaze_doc::html::crates_list(earlier.as_deref(), kept, &names);
-        std::fs::write(&list, text).map_err(|error| format!("writing {}: {error}", list.display()))?;
+        std::fs::write(&list, text)
+            .map_err(|error| format!("writing {}: {error}", list.display()))?;
         Ok(documented)
     }
 }
@@ -82,14 +88,22 @@ fn under(dir: &Path, path: &str) -> Result<PathBuf, String> {
     let named = !path.is_empty() && rel.components().all(|it| matches!(it, Component::Normal(_)));
     match named {
         true => Ok(dir.join(rel)),
-        false => Err(format!("the daemon sent the page `{path}`, which is not under {}", dir.display())),
+        false => {
+            Err(format!("the daemon sent the page `{path}`, which is not under {}", dir.display()))
+        }
     }
 }
 
 /// What cargo doc says once the pages are written: `Generated` of the first crate asked for's
 /// front page, and how many others were asked for; with `--open`, `Opening` it instead, and it
 /// opened as cargo opens it.
-pub fn done(documented: &Documented, open: bool, quiet: bool, color: bool, err: &mut impl Write) -> io::Result<()> {
+pub fn done(
+    documented: &Documented,
+    open: bool,
+    quiet: bool,
+    color: bool,
+    err: &mut impl Write,
+) -> io::Result<()> {
     let mut asked = documented.crates.iter().filter(|it| it.asked);
     let Some(first) = asked.next() else { return Ok(()) };
     let page = Path::new(&documented.dir).join(&first.name).join("index.html");
@@ -99,7 +113,9 @@ pub fn done(documented: &Documented, open: bool, quiet: bool, color: bool, err: 
         }
         return match opened(&page) {
             Ok(()) => Ok(()),
-            Err(why) => err.write_all(say::warning(&format!("failed to open: {why}"), color).as_bytes()),
+            Err(why) => {
+                err.write_all(say::warning(&format!("failed to open: {why}"), color).as_bytes())
+            }
         };
     }
     if quiet {
@@ -138,7 +154,10 @@ mod tests {
     #[test]
     fn a_page_lands_under_the_documentation_alone() {
         let dir = Path::new("/w/target/doc");
-        assert_eq!(under(dir, "app/index.html").unwrap(), Path::new("/w/target/doc/app/index.html"));
+        assert_eq!(
+            under(dir, "app/index.html").unwrap(),
+            Path::new("/w/target/doc/app/index.html")
+        );
         assert!(under(dir, "../escape.html").is_err());
         assert!(under(dir, "/etc/passwd").is_err());
         assert!(under(dir, "app/../../x").is_err());

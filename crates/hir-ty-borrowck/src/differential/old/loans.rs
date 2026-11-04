@@ -4,13 +4,13 @@
 //! borrows goes away.
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir_def::{
     DefWithBodyId,
     hir::{Array, Expr},
 };
 use rustc_type_ir::inherent::IntoKind;
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use hir_ty::{
     InferBodyId,

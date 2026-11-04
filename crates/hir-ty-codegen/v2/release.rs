@@ -14,6 +14,12 @@
 #[cfg(feature = "llvm")]
 use std::sync::Arc;
 
+#[cfg(feature = "llvm")]
+use blaze_codegen::{
+    Backend, InstanceKey, ProfileRecord, Profiled, Target,
+    settings::{DebugInfo, Pgo},
+    summary::{self, Arg, Call},
+};
 use blaze_codegen::{
     CodegenError, Unit,
     backend::{Emitted, Import},
@@ -22,19 +28,13 @@ use blaze_codegen::{
     template::Refs,
 };
 #[cfg(feature = "llvm")]
-use blaze_codegen::{
-    Backend, InstanceKey, ProfileRecord, Profiled, Target,
-    settings::{DebugInfo, Pgo},
-    summary::{self, Arg, Call},
-};
-#[cfg(feature = "llvm")]
 use blaze_items::CodeHash;
 #[cfg(feature = "llvm")]
 use cranelift_module::{DataId, FuncId};
 
-use super::{Function, failed};
 #[cfg(feature = "llvm")]
 use super::{Built, DataPlace, Places};
+use super::{Function, failed};
 #[cfg(feature = "llvm")]
 use crate::{
     ConstBlob,
@@ -169,7 +169,9 @@ pub(crate) fn summarize(
         .datas
         .iter()
         .flat_map(|it| match it {
-            DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => &blob.fn_relocs[..],
+            DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => {
+                &blob.fn_relocs[..]
+            }
             _ => &[][..],
         })
         .map(|it| it.1.as_u32());
@@ -236,7 +238,11 @@ pub(crate) fn emit(
         return Err(failed(
             unit,
             // alloc: an error
-            format!("{} references given for a function prepared against {}", refs.len(), function.places.refs),
+            format!(
+                "{} references given for a function prepared against {}",
+                refs.len(),
+                function.places.refs
+            ),
         ));
     }
     let empty = Imports::default();
@@ -255,7 +261,18 @@ pub(crate) fn emit(
         let (places, spans) = (&function.places, &function.spans);
         let (variables, scopes) = (&function.variables, &function.scopes);
         // alloc: empty, no allocation; assembly has no report
-        return emitted(unit, function.target, places, spans, variables, scopes, code, &requests, refs, Vec::new());
+        return emitted(
+            unit,
+            function.target,
+            places,
+            spans,
+            variables,
+            scopes,
+            code,
+            &requests,
+            refs,
+            Vec::new(),
+        );
     }
     // Nothing summarized a unit compiled without imports, or one whose summary the store had.
     let (own, mismatched, applied) = match function.release.own.take() {
@@ -266,7 +283,11 @@ pub(crate) fn emit(
         }
     };
     let features = function.features;
-    let asked = crate::llvm::report::Asked::of(spec.report, spec.debuginfo != DebugInfo::None, function.target);
+    let asked = crate::llvm::report::Asked::of(
+        spec.report,
+        spec.debuginfo != DebugInfo::None,
+        function.target,
+    );
     let Function { code: Built::Ir(pending), places, .. } = &mut function else {
         return Err(failed(unit, "an assembly function has no IR for LLVM"));
     };
@@ -278,10 +299,20 @@ pub(crate) fn emit(
     for import in imported {
         let Some(module) = &import.export.module else {
             // alloc: an error
-            return Err(failed(unit, format!("imports {}, which has no LLVM export", import.key.0)));
+            return Err(failed(
+                unit,
+                format!("imports {}, which has no LLVM export", import.key.0),
+            ));
         };
-        let (funcs, datas) =
-            merge(unit, &mut pending.wants, places, refs, &module.requests, &import.export.places, import.refs)?;
+        let (funcs, datas) = merge(
+            unit,
+            &mut pending.wants,
+            places,
+            refs,
+            &module.requests,
+            &import.export.places,
+            import.refs,
+        )?;
         merged.push((import, module, funcs, datas));
     }
     let mut linked = Vec::with_capacity(imported.len());
@@ -316,7 +347,8 @@ pub(crate) fn emit(
         // What the import's own IR built in is in its export, so in this code too.
         inlined.extend_from_slice(&import.export.inlined);
     }
-    places.refs = u32::try_from(refs.len()).map_err(|_| failed(unit, "more than 2^32 references"))?;
+    places.refs =
+        u32::try_from(refs.len()).map_err(|_| failed(unit, "more than 2^32 references"))?;
     // clone: `Given` owns what LLVM is told; the decision is the build's, borrowed
     let mut given = Given { constants: decided.constants.clone(), ..Given::default() };
     for (callee, attrs) in &decided.callees {
@@ -352,8 +384,18 @@ pub(crate) fn emit(
     let report = super::report::rows(found, spans, &places.funcs, refs)
         // alloc: an error
         .map_err(|why| failed(unit, format!("its report: {why}")))?;
-    let mut emitted =
-        emitted(unit, function.target, places, spans, variables, scopes, code, &pending.wants.requests, refs, report)?;
+    let mut emitted = emitted(
+        unit,
+        function.target,
+        places,
+        spans,
+        variables,
+        scopes,
+        code,
+        &pending.wants.requests,
+        refs,
+        report,
+    )?;
     // What the IR built in (MIR-inlined, `#[inline(always)]` of no member) is the code's too.
     inlined.extend_from_slice(&function.inlined);
     inlined.sort_unstable();
@@ -367,9 +409,17 @@ pub(crate) fn emit(
 /// What SanitizerCoverage made for a function, as its compiled function has it: `None` where
 /// the build has no SanitizerCoverage.
 #[cfg(feature = "llvm")]
-fn coverage(spec: &Spec, covered: crate::llvm::sanitize::Covered) -> Option<blaze_codegen::Covered> {
+fn coverage(
+    spec: &Spec,
+    covered: crate::llvm::sanitize::Covered,
+) -> Option<blaze_codegen::Covered> {
     let crate::llvm::sanitize::Covered { arrays: [counters, flags, guards], pcs } = covered;
-    spec.sanitize.coverage.is_on().then_some(blaze_codegen::Covered { counters, flags, guards, pcs })
+    spec.sanitize.coverage.is_on().then_some(blaze_codegen::Covered {
+        counters,
+        flags,
+        guards,
+        pcs,
+    })
 }
 
 /// `code` against `refs`, by the function's `places`, as the Cranelift backend converts its
@@ -390,9 +440,13 @@ fn emitted(
     report: Vec<super::report::Row>,
 ) -> Result<Emitted, CodegenError> {
     // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
-    let isa: &dyn cranelift_codegen::isa::TargetIsa = &**crate::isa_for(target).map_err(|e| failed(unit, e))?;
+    let isa: &dyn cranelift_codegen::isa::TargetIsa =
+        &**crate::isa_for(target).map_err(|e| failed(unit, e))?;
     let (converted, extra) = super::places::resolve_owning(places, refs, |resolve| {
-        let side = super::report::with_side(super::side::of(variables, scopes, &code, resolve.frame())?, report)?;
+        let side = super::report::with_side(
+            super::side::of(variables, scopes, &code, resolve.frame())?,
+            report,
+        )?;
         let converted = super::convert::function(
             resolve.frame(),
             unit.instance.key(),
@@ -500,7 +554,10 @@ fn profiled(
     applied: bool,
 ) -> Result<Option<Profiled>, CodegenError> {
     if mismatched && applied {
-        return Err(failed(unit, "its pre-link read a profile of it with another hash and also gave it counts"));
+        return Err(failed(
+            unit,
+            "its pre-link read a profile of it with another hash and also gave it counts",
+        ));
     }
     match (spec.pgo, counted, mismatched || applied) {
         (Pgo::None, None, false) => Ok(None),
@@ -525,13 +582,20 @@ fn profiled(
 /// What the function request `request` is in the build: the instance's key of a function
 /// of it, `None` for an outside symbol.
 #[cfg(feature = "llvm")]
-fn key(unit: &Unit, places: &Places, refs: &Refs, request: u32) -> Result<Option<InstanceKey>, CodegenError> {
+fn key(
+    unit: &Unit,
+    places: &Places,
+    refs: &Refs,
+    request: u32,
+) -> Result<Option<InstanceKey>, CodegenError> {
     let target = places
         .funcs
         .get(request as usize)
         .and_then(|&it| refs.get(it as usize))
         // alloc: an error
-        .ok_or_else(|| failed(unit, format!("function request {request} has no place among the references")))?;
+        .ok_or_else(|| {
+            failed(unit, format!("function request {request} has no place among the references"))
+        })?;
     match target {
         Target::Function(key) | Target::Direct(key) => Ok(Some(*key)),
         Target::Extern(_) | Target::Weak(_) => Ok(None),
@@ -580,7 +644,12 @@ fn by_key(places: &Places, refs: &Refs, wanted: InstanceKey) -> Vec<u32> {
 /// name: its place among the unit's references, or [`super::places::OWN`] when they lack it,
 /// which `emitted` keeps by name in the template (`Emitted::extra`).
 #[cfg(feature = "llvm")]
-fn placed_since(unit: &Unit, wants: &Wants, places: &mut Places, refs: &Refs) -> Result<(), CodegenError> {
+fn placed_since(
+    unit: &Unit,
+    wants: &Wants,
+    places: &mut Places,
+    refs: &Refs,
+) -> Result<(), CodegenError> {
     for request in &wants.requests.funcs[places.funcs.len()..] {
         let FuncTarget::Symbol(name) = &request.target else {
             return Err(failed(unit, "LLVM asked for a function that is no symbol"));
@@ -624,18 +693,26 @@ fn merge(
         let found = refs.iter().position(|it| it == target).map(|it| it as u32);
         found.ok_or_else(|| {
             // alloc: an error
-            failed(unit, format!("an import refers to {target:?}, which the compile's references lack"))
+            failed(
+                unit,
+                format!("an import refers to {target:?}, which the compile's references lack"),
+            )
         })
     };
     let theirs_of = |place: u32| {
         their_refs
             .get(place as usize)
             // alloc: an error
-            .ok_or_else(|| failed(unit, format!("an import's place {place} is past its references")))
+            .ok_or_else(|| {
+                failed(unit, format!("an import's place {place} is past its references"))
+            })
     };
     let mut funcs = Vec::with_capacity(requests.funcs.len());
     for (at, request) in requests.funcs.iter().enumerate() {
-        let theirs = *theirs.funcs.get(at).ok_or_else(|| failed(unit, "an import's request without its place"))?;
+        let theirs = *theirs
+            .funcs
+            .get(at)
+            .ok_or_else(|| failed(unit, "an import's request without its place"))?;
         let place = place_in(theirs_of(theirs)?)?;
         let named = |id: usize| places.funcs.get(id).and_then(|&it| refs.get(it as usize));
         let before = wants.requests.funcs.len();
@@ -650,8 +727,9 @@ fn merge(
             // The build keys a callee by who asks for it: the instance the compile asks for is
             // another function of the build than the one the import's body calls, and each
             // request is a declaration of its own (`Symbol::Func` of its ID).
-            let found = (0..wants.requests.funcs.len())
-                .find(|&it| wants.requests.funcs[it] == *request && named(it) == refs.get(place as usize));
+            let found = (0..wants.requests.funcs.len()).find(|&it| {
+                wants.requests.funcs[it] == *request && named(it) == refs.get(place as usize)
+            });
             match found {
                 Some(it) => it as u32,
                 None => {
@@ -677,12 +755,14 @@ fn merge(
         let moved = |blob: &ConstBlob| -> Result<ConstBlob, CodegenError> {
             let relocs = blob.relocs.iter().map(|&(offset, target, addend)| {
                 let moved = datas.get(target.as_u32() as usize).copied();
-                let moved = moved.ok_or_else(|| failed(unit, "an import's data points at data after it"))?;
+                let moved = moved
+                    .ok_or_else(|| failed(unit, "an import's data points at data after it"))?;
                 Ok((offset, DataId::from_u32(moved), addend))
             });
             let fn_relocs = blob.fn_relocs.iter().map(|&(offset, target)| {
                 let moved = funcs.get(target.as_u32() as usize).copied();
-                let moved = moved.ok_or_else(|| failed(unit, "an import's data points at no function"))?;
+                let moved =
+                    moved.ok_or_else(|| failed(unit, "an import's data points at no function"))?;
                 Ok((offset, FuncId::from_u32(moved)))
             });
             Ok(ConstBlob {
@@ -697,7 +777,9 @@ fn merge(
         };
         let before = wants.requests.datas.len();
         let id = match request {
-            DataRequest::Blob { blob, identity } => wants.define_data_as(moved(blob)?, *identity).as_u32(),
+            DataRequest::Blob { blob, identity } => {
+                wants.define_data_as(moved(blob)?, *identity).as_u32()
+            }
             DataRequest::Vtable { ty, trait_ref, blob } => {
                 let found = wants.requests.datas.iter().position(|it| {
                     matches!(it, DataRequest::Vtable { ty: other, trait_ref: other_ref, .. }
@@ -708,7 +790,11 @@ fn merge(
                     None => {
                         let blob = moved(blob)?;
                         // clone: the compile's request owns its type; the import's export is shared, borrowed
-                        wants.requests.datas.push(DataRequest::Vtable { ty: ty.clone(), trait_ref: trait_ref.clone(), blob });
+                        wants.requests.datas.push(DataRequest::Vtable {
+                            ty: ty.clone(),
+                            trait_ref: trait_ref.clone(),
+                            blob,
+                        });
                         before as u32
                     }
                 }
@@ -795,9 +881,16 @@ mod tests {
         let their_refs = [Target::Extern("b".to_owned()), Target::Extern("a".to_owned())];
         let refs = [Target::Extern("a".to_owned()), Target::Extern("b".to_owned())];
 
-        let (funcs, datas) =
-            merge(&unit(), &mut wants, &mut places, &refs, &theirs.requests, &their_places, &their_refs)
-                .unwrap();
+        let (funcs, datas) = merge(
+            &unit(),
+            &mut wants,
+            &mut places,
+            &refs,
+            &theirs.requests,
+            &their_places,
+            &their_refs,
+        )
+        .unwrap();
         assert_eq!(funcs, [1, 0]);
         assert_eq!(datas, [0, 1, 2]);
         assert_eq!(places.funcs, [0, 1]);
@@ -806,9 +899,16 @@ mod tests {
         assert_eq!(moved.relocs, [(0, DataId::from_u32(0), 0)]);
         assert_eq!(moved.fn_relocs, [(8, FuncId::from_u32(1))]);
         // The location is one request, however many bodies ask for it.
-        let again =
-            merge(&unit(), &mut wants, &mut places, &refs, &theirs.requests, &their_places, &their_refs)
-                .unwrap();
+        let again = merge(
+            &unit(),
+            &mut wants,
+            &mut places,
+            &refs,
+            &theirs.requests,
+            &their_places,
+            &their_refs,
+        )
+        .unwrap();
         assert_eq!(again, (funcs, datas));
         assert_eq!(wants.requests.datas.len(), 3);
     }
@@ -827,8 +927,18 @@ mod tests {
         let their_places = Places { funcs: vec![0], datas: Vec::new(), refs: 1 };
         let their_refs = [Target::Direct(instance(6))];
         let refs = [Target::Direct(instance(5)), Target::Direct(instance(6))];
-        let mut merged =
-            || merge(&unit(), &mut wants, &mut places, &refs, &theirs.requests, &their_places, &their_refs).unwrap();
+        let mut merged = || {
+            merge(
+                &unit(),
+                &mut wants,
+                &mut places,
+                &refs,
+                &theirs.requests,
+                &their_places,
+                &their_refs,
+            )
+            .unwrap()
+        };
         assert_eq!(merged().0, [1]);
         assert_eq!(merged().0, [1]);
         assert_eq!(places.funcs, [0, 1]);
@@ -859,7 +969,11 @@ mod tests {
     #[test]
     fn requests_are_keys_by_their_places() {
         let places = Places { funcs: vec![1, 0, 2, 1], datas: Vec::new(), refs: 3 };
-        let refs = [Target::Function(instance(5)), Target::Direct(instance(6)), Target::Extern("x".to_owned())];
+        let refs = [
+            Target::Function(instance(5)),
+            Target::Direct(instance(6)),
+            Target::Extern("x".to_owned()),
+        ];
         assert_eq!(key(&unit(), &places, &refs, 0).unwrap(), Some(instance(6)));
         assert_eq!(key(&unit(), &places, &refs, 2).unwrap(), None);
         assert!(key(&unit(), &places, &refs, 4).is_err());
@@ -955,7 +1069,8 @@ mod tests {
         let name = pgo::name(unit.item, unit.instance.args);
         let counted =
             || pgo::Counted { name: name.clone(), name_ref: 5, hash: 7, counters: 3, version: 10 };
-        let Some(Profiled::Counted(record)) = profiled(&unit, &with(Pgo::Generate), Some(counted()), false, false).unwrap()
+        let Some(Profiled::Counted(record)) =
+            profiled(&unit, &with(Pgo::Generate), Some(counted()), false, false).unwrap()
         else {
             panic!("an instrumented function without its record");
         };

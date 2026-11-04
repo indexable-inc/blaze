@@ -104,4 +104,3 @@ fn peel<'t>(
     };
     Some((range, peeled, message))
 }
-

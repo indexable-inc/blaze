@@ -36,7 +36,9 @@ impl<'f> Prog<'f> {
 
     fn room(&mut self, bytes: u32) -> Result<(), Error> {
         let data = &self.data;
-        self.buf.room(bytes, self.island.as_ref(), |label| data.iter().find(|it| it.0 == label).map(|it| &it.1[..]))
+        self.buf.room(bytes, self.island.as_ref(), |label| {
+            data.iter().find(|it| it.0 == label).map(|it| &it.1[..])
+        })
     }
 
     fn nops(&mut self, count: u32) -> Result<(), Error> {
@@ -82,7 +84,9 @@ impl<'f> Prog<'f> {
             }
         }
         let data = &self.data;
-        self.buf.settle(self.island.as_ref(), |label| data.iter().find(|it| it.0 == label).map(|it| &it.1[..]))?;
+        self.buf.settle(self.island.as_ref(), |label| {
+            data.iter().find(|it| it.0 == label).map(|it| &it.1[..])
+        })?;
         self.buf.resolve()?;
         Ok(self.buf.bytes().to_vec()) // alloc: test
     }
@@ -142,8 +146,16 @@ fn a_branch_one_step_past_its_reach_goes_through_one_veneer() {
         for tail in [8, 3 << 20] {
             // Back: exactly at its reach it is written as is, and no island is needed.
             let (code, veneer) = branch(form, insn, reach.back, tail);
-            assert!(!veneer, "{form:?} back {} with {tail} after went through a veneer", reach.back);
-            assert_eq!(code.len() as i64, 8 - reach.back + 4 + i64::from(tail), "{form:?}: an island no branch needed");
+            assert!(
+                !veneer,
+                "{form:?} back {} with {tail} after went through a veneer",
+                reach.back
+            );
+            assert_eq!(
+                code.len() as i64,
+                8 - reach.back + 4 + i64::from(tail),
+                "{form:?}: an island no branch needed"
+            );
             let (_, veneer) = branch(form, insn, reach.back - 4, tail);
             assert!(veneer, "{form:?} back {} reached without a veneer", reach.back - 4);
             // Ahead: the label is unbound when the branch is written, so its island comes
@@ -175,7 +187,10 @@ fn a_datum_past_the_reach_of_its_use_is_placed_within_it() {
             let code = prog.end().unwrap_or_else(|e| panic!("{form:?}: {e}"));
             for (at, seed) in uses {
                 let (to, _) = follow(&code, at, form);
-                assert_eq!(&code[to as usize..to as usize + 16], &core::array::from_fn::<u8, 16, _>(|i| seed * 16 + i as u8));
+                assert_eq!(
+                    &code[to as usize..to as usize + 16],
+                    &core::array::from_fn::<u8, 16, _>(|i| seed * 16 + i as u8)
+                );
                 assert_eq!(to % 16, 0, "{form:?}: datum {seed} placed off its alignment");
             }
         });
@@ -213,8 +228,9 @@ fn crossing_branches_land_and_write_the_same_bytes() {
                 prog.nops_to(size / labels.len() as u32 * n as u32).unwrap();
                 for _ in 0..3 {
                     let other = labels[rng.next_u64() as usize % labels.len()];
-                    let (form, insn) = [(Form::A64CondBr19, B_EQ), (Form::A64TestBr14, TBZ), (Form::A64Jump26, B)]
-                        [rng.next_u64() as usize % 3];
+                    let (form, insn) =
+                        [(Form::A64CondBr19, B_EQ), (Form::A64TestBr14, TBZ), (Form::A64Jump26, B)]
+                            [rng.next_u64() as usize % 3];
                     uses.push((prog.refer(insn, form, other).unwrap(), form, other.0 as usize));
                 }
                 prog.buf.bind(label);
@@ -223,7 +239,11 @@ fn crossing_branches_land_and_write_the_same_bytes() {
             }
             let code = prog.end().unwrap_or_else(|e| panic!("{e}"));
             for (at, form, label) in uses {
-                assert_eq!(follow(&code, at, form).0, targets[label], "{form:?} at {at:#x} to label {label}");
+                assert_eq!(
+                    follow(&code, at, form).0,
+                    targets[label],
+                    "{form:?} at {at:#x} to label {label}"
+                );
             }
             code
         })

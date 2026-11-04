@@ -39,13 +39,9 @@ impl Generator<HegelRandom> for RandomsGenerator {
     fn do_draw(&self, tc: &TestCase) -> HegelRandom {
         if self.use_true_random {
             let seed: u64 = integers().do_draw(tc);
-            HegelRandom {
-                source: RandomSource::True(Box::new(StdRng::seed_from_u64(seed))),
-            }
+            HegelRandom { source: RandomSource::True(Box::new(StdRng::seed_from_u64(seed))) }
         } else {
-            HegelRandom {
-                source: RandomSource::Artificial(tc.clone(), None),
-            }
+            HegelRandom { source: RandomSource::Artificial(tc.clone(), None) }
         }
     }
 }
@@ -72,10 +68,7 @@ impl PrintableGenerator<HegelRandom> for RandomsGenerator {
         HegelRandom {
             source: RandomSource::Artificial(
                 tc.clone(),
-                Some(RngPrintSlot {
-                    printer: slot,
-                    recorded: 0,
-                }),
+                Some(RngPrintSlot { printer: slot, recorded: 0 }),
             ),
         }
     }
@@ -153,10 +146,7 @@ impl TryRng for HegelRandom {
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         match &mut self.source {
             RandomSource::Artificial(tc, slot) => {
-                let bytes: Vec<u8> = binary()
-                    .min_size(dest.len())
-                    .max_size(dest.len())
-                    .do_draw(tc);
+                let bytes: Vec<u8> = binary().min_size(dest.len()).max_size(dest.len()).do_draw(tc);
                 dest.copy_from_slice(&bytes);
                 if let Some(slot) = slot {
                     slot.record(format_args!("{bytes:?}"));
@@ -188,7 +178,5 @@ impl TryRng for HegelRandom {
 /// }
 /// ```
 pub fn randoms() -> RandomsGenerator {
-    RandomsGenerator {
-        use_true_random: false,
-    }
+    RandomsGenerator { use_true_random: false }
 }

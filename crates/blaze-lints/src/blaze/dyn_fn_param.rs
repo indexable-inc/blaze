@@ -47,11 +47,15 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let hir::DefWithBody::Function(f) = analysis.def() else { return found };
     let Ok(def) = DefWithBodyId::try_from(analysis.def()) else { return found };
     let db = cx.db();
-    if matches!(f.visibility(db), hir::Visibility::Public) || cx.expansion().is_some() || cx.is_in_test(cx.root()) {
+    if matches!(f.visibility(db), hir::Visibility::Public)
+        || cx.expansion().is_some()
+        || cx.is_in_test(cx.root())
+    {
         return found;
     }
     if f.as_assoc_item(db).is_some_and(|it| {
-        it.implemented_trait(db).is_some() || matches!(it.container(db), hir::AssocItemContainer::Trait(_))
+        it.implemented_trait(db).is_some()
+            || matches!(it.container(db), hir::AssocItemContainer::Trait(_))
     }) {
         return found;
     }
@@ -81,7 +85,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     // A function that calls itself is left alone (polymorphic recursion).
     let recursive = body.exprs().any(|(id, expr)| {
         matches!(expr, Expr::Call { .. } | Expr::MethodCall { .. })
-            && general_facts::callee(db, analysis, id).is_some_and(|it| hir::Function::from(it.f) == f)
+            && general_facts::callee(db, analysis, id)
+                .is_some_and(|it| hir::Function::from(it.f) == f)
     });
     if recursive {
         return found;
@@ -90,7 +95,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     for (id, expr) in body.exprs() {
         let Expr::Call { callee, .. } = expr else { continue };
         let called = dyn_in_hot_field::peel(body, callee);
-        let Some(local) = super::hash_order_output::local_of(db, def, body, called) else { continue };
+        let Some(local) = super::hash_order_output::local_of(db, def, body, called) else {
+            continue;
+        };
         let Some(&(_, trait_)) = params.iter().find(|(it, _)| *it == local) else { continue };
         if loops::enclosing_loop(cx, analysis, &parents, id).is_none() {
             continue;

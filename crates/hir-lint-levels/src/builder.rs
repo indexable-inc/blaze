@@ -18,7 +18,6 @@ use std::{hash::BuildHasher, num::NonZeroU32, ops::Range};
 
 use base_db::{Crate, Db};
 use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use blaze_lint_defs::{Checked, Feature, Level, Lint, LintId, LintOptions, LintSet, Store};
 use cfg::CfgOptions;
 use hashbrown::HashTable;
@@ -26,6 +25,7 @@ use hir_def::unstable_features::UnstableFeatures;
 use hir_expand::{HirFileId, InFile};
 use intern::Symbol;
 use span::Edition;
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange,
     view::{self as ast, AstNode as _, HasAttrs as _},
@@ -72,9 +72,16 @@ pub enum Source {
     Default,
     /// An attribute: the name it sets the level of (the new one of a renamed lint, with its
     /// tool for a tool's), where the name is, and its `reason`.
-    Node { name: Symbol, at: InFile<TextRange>, reason: Option<Symbol> },
+    Node {
+        name: Symbol,
+        at: InFile<TextRange>,
+        reason: Option<Symbol>,
+    },
     /// The command line: the name given, with `_` for `-`, and the level of its flag.
-    CommandLine { name: Box<str>, level: Level },
+    CommandLine {
+        name: Box<str>,
+        level: Level,
+    },
 }
 
 /// What deciding levels in a crate reads, and what the builders of the crate find and share:
@@ -108,8 +115,13 @@ impl<'a, 'db> LevelCx<'a, 'db> {
         let cfg = krate.cfg_options(db);
         let root = HirFileId::from(krate.root_file_id(db));
         // alloc: setup, once per crate's levels; empty but for `-Z crate-attr`
-        let crate_attrs: Box<[HirFileId]> = base_db::applied_crate_attr_files(db, krate).iter().map(|&it| HirFileId::from(it)).collect();
-        let root_attrs = ast::AnyHasAttrs::cast(root.root(db)).into_iter().flat_map(|it| ast::attrs_including_inner(&it));
+        let crate_attrs: Box<[HirFileId]> = base_db::applied_crate_attr_files(db, krate)
+            .iter()
+            .map(|&it| HirFileId::from(it))
+            .collect();
+        let root_attrs = ast::AnyHasAttrs::cast(root.root(db))
+            .into_iter()
+            .flat_map(|it| ast::attrs_including_inner(&it));
         let cli_attrs = crate_attrs
             .iter()
             .filter_map(|it| ast::SourceFile::cast(it.root(db)))
@@ -146,7 +158,10 @@ impl<'a, 'db> LevelCx<'a, 'db> {
     fn expect_id(&mut self, file: HirFileId, range: TextRange) -> ExpectId {
         let next = self.expects.len();
         *self.expects.entry((file, range)).or_insert_with(|| {
-            let id = u32::try_from(next + 1).ok().and_then(NonZeroU32::new).expect("fewer than 2^32 expectations");
+            let id = u32::try_from(next + 1)
+                .ok()
+                .and_then(NonZeroU32::new)
+                .expect("fewer than 2^32 expectations");
             ExpectId(id)
         })
     }
@@ -177,7 +192,13 @@ pub enum Event<'a, 'db> {
     /// A name on the command line (`tool::` and `name`, as given with `_` for `-`) that rustc's
     /// `check_lint_name` finds renamed, removed, unknown, a deprecated name of a tool's lint,
     /// or of an unknown tool.
-    CommandLine { given: &'a str, tool: Option<&'a str>, name: &'a str, level: Level, checked: &'a Checked },
+    CommandLine {
+        given: &'a str,
+        tool: Option<&'a str>,
+        name: &'a str,
+        level: Level,
+        checked: &'a Checked,
+    },
     /// An element of a lint attribute's list of `node` that is no name, at `at`. `pre`: of
     /// the crate's root file, written as itself, so rustc's pre-expansion lint pass says it
     /// too.
@@ -196,20 +217,42 @@ pub enum Event<'a, 'db> {
     /// The early builder's `insert_spec`: an attribute's level `new` for `lint` where an
     /// earlier `forbid` (`old`) holds; `groups` when either names a group, which makes it the
     /// `forbidden_lint_groups` lint rather than E0453.
-    Overruled { node: InFile<ast::Node<'db>>, lint: &'static Lint, new: Spec, old: Spec, groups: bool },
+    Overruled {
+        node: InFile<ast::Node<'db>>,
+        lint: &'static Lint,
+        new: Spec,
+        old: Spec,
+        groups: bool,
+    },
     /// `lint` is behind `feature`, which the crate lacks: named in an attribute of `node` at
     /// `at`, or on the command line.
-    Gated { node: Option<InFile<ast::Node<'db>>>, lint: &'static Lint, feature: Feature, at: Option<InFile<TextRange>> },
+    Gated {
+        node: Option<InFile<ast::Node<'db>>>,
+        lint: &'static Lint,
+        feature: Feature,
+        at: Option<InFile<TextRange>>,
+    },
     /// A level for a lint only the crate's own attributes set, set at `at` of `node`, below
     /// the crate.
-    CrateLevelOnly { node: InFile<ast::Node<'db>>, level: Level, name: &'a Symbol, at: InFile<TextRange> },
+    CrateLevelOnly {
+        node: InFile<ast::Node<'db>>,
+        level: Level,
+        name: &'a Symbol,
+        at: InFile<TextRange>,
+    },
 }
 
 /// What a builder that speaks hands what it finds to: given the builder and the context as
 /// they are when it is found, and the set the name is being added to (for the level of the
 /// lint that says it, which is the level there at that moment).
 pub trait Sink<'db> {
-    fn event(&mut self, levels: &Levels<'db>, cx: &LevelCx<'_, 'db>, set: SetId, event: Event<'_, 'db>);
+    fn event(
+        &mut self,
+        levels: &Levels<'db>,
+        cx: &LevelCx<'_, 'db>,
+        set: SetId,
+        event: Event<'_, 'db>,
+    );
 }
 
 /// The sink of a builder that says nothing.
@@ -283,7 +326,12 @@ impl<'db> Levels<'db> {
     /// The builder with the command line's levels (rustc's `add_command_line`), and, when it
     /// `speaks`, what it finds wrong with the names on it handed to `sink`; one that does not
     /// is for levels alone.
-    pub fn new(cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, early: bool, speaks: bool) -> Levels<'db> {
+    pub fn new(
+        cx: &mut LevelCx<'_, 'db>,
+        sink: &mut impl Sink<'db>,
+        early: bool,
+        speaks: bool,
+    ) -> Levels<'db> {
         let mut levels = Levels::empty(early, speaks, cx.opts.opts.len());
         let opts = cx.opts;
         for (name, level) in &*opts.opts {
@@ -326,7 +374,14 @@ impl<'db> Levels<'db> {
         &self.cmd_at[level as usize]
     }
 
-    fn command_line(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, given: &str, level: Level, speaks: bool) {
+    fn command_line(
+        &mut self,
+        cx: &mut LevelCx<'_, 'db>,
+        sink: &mut impl Sink<'db>,
+        given: &str,
+        level: Level,
+        speaks: bool,
+    ) {
         let (tool, name) = match given.split_once("::") {
             Some((tool, name)) => (Some(tool), name),
             None => (None, given),
@@ -337,14 +392,21 @@ impl<'db> Levels<'db> {
             }
             let checked = cx.store.check(name, tool);
             if !matches!(checked, Checked::Ok(_) | Checked::Tool(_, None) | Checked::MissingTool) {
-                sink.event(self, cx, COMMAND_LINE, Event::CommandLine { given, tool, name, level, checked: &checked });
+                sink.event(
+                    self,
+                    cx,
+                    COMMAND_LINE,
+                    Event::CommandLine { given, tool, name, level, checked: &checked },
+                );
             }
         }
         let Some(lints) = cx.store.find_lints(given) else { return };
         let source = cx.add_source(Source::CommandLine { name: given.into(), level });
         for &lint in lints {
             let id = lint.id();
-            if self.command_line_at(Level::ForceWarn).contains(id) || self.command_line_at(Level::Forbid).contains(id) {
+            if self.command_line_at(Level::ForceWarn).contains(id)
+                || self.command_line_at(Level::Forbid).contains(id)
+            {
                 continue;
             }
             if self.gated(cx, sink, COMMAND_LINE, lint, None, None) {
@@ -356,7 +418,12 @@ impl<'db> Levels<'db> {
     /// Every node of `nodes` with attributes, as rustc's walk of the crate comes to it: what is
     /// said of the attributes is said now, once. The caller gives the nodes [`attrs::owns`]
     /// lets through for this builder ([`Levels::is_early`] for its generic parameters).
-    pub fn walk(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, nodes: impl IntoIterator<Item = InFile<ast::Node<'db>>>) {
+    pub fn walk(
+        &mut self,
+        cx: &mut LevelCx<'_, 'db>,
+        sink: &mut impl Sink<'db>,
+        nodes: impl IntoIterator<Item = InFile<ast::Node<'db>>>,
+    ) {
         self.walking = true;
         for node in nodes {
             self.set_at(cx, sink, node);
@@ -366,7 +433,12 @@ impl<'db> Levels<'db> {
 
     /// [`Levels::set_at`] of the node `at` points to, with no tree walked when a node at it was
     /// seen.
-    pub fn set_of(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, at: InFile<SyntaxNodePtr>) -> SetId {
+    pub fn set_of(
+        &mut self,
+        cx: &mut LevelCx<'_, 'db>,
+        sink: &mut impl Sink<'db>,
+        at: InFile<SyntaxNodePtr>,
+    ) -> SetId {
         let hash = FixedState.hash_one(at);
         if let Some(&(_, set)) = self.at.find(hash, |(it, _)| *it == at) {
             return set;
@@ -377,7 +449,12 @@ impl<'db> Levels<'db> {
 
     /// The set in force at `node`: of its attributes, else of the nearest node around it with
     /// any. Each node between it and the nearest one seen is hashed once.
-    pub fn set_at(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, node: InFile<ast::Node<'db>>) -> SetId {
+    pub fn set_at(
+        &mut self,
+        cx: &mut LevelCx<'_, 'db>,
+        sink: &mut impl Sink<'db>,
+        node: InFile<ast::Node<'db>>,
+    ) -> SetId {
         self.walk_out(cx, sink, node, false)
     }
 
@@ -386,7 +463,12 @@ impl<'db> Levels<'db> {
     /// so the walk out from the node stops at the root of its file, inside the command line's
     /// set: a module file has neither its `mod` item's levels nor the crate's
     /// (rust-lang/rust#132218). A macro's expansion is walked out of to the file of its call.
-    pub fn set_of_in_file(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, at: InFile<SyntaxNodePtr>) -> SetId {
+    pub fn set_of_in_file(
+        &mut self,
+        cx: &mut LevelCx<'_, 'db>,
+        sink: &mut impl Sink<'db>,
+        at: InFile<SyntaxNodePtr>,
+    ) -> SetId {
         let hash = FixedState.hash_one(at);
         if let Some(&(_, set)) = self.in_file.find(hash, |(it, _)| *it == at) {
             return set;
@@ -397,7 +479,13 @@ impl<'db> Levels<'db> {
 
     /// [`Levels::set_at`], or [`Levels::set_of_in_file`] when `in_file`, each with its own
     /// table of the nodes seen.
-    fn walk_out(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, node: InFile<ast::Node<'db>>, in_file: bool) -> SetId {
+    fn walk_out(
+        &mut self,
+        cx: &mut LevelCx<'_, 'db>,
+        sink: &mut impl Sink<'db>,
+        node: InFile<ast::Node<'db>>,
+        in_file: bool,
+    ) -> SetId {
         let mut chain = std::mem::take(&mut self.chain);
         let mut next = Some(node);
         let mut set = COMMAND_LINE;
@@ -409,7 +497,8 @@ impl<'db> Levels<'db> {
                 set = known;
                 break;
             }
-            let file_root = node.value.kind() == SyntaxKind::SOURCE_FILE && !node.file_id.is_macro();
+            let file_root =
+                node.value.kind() == SyntaxKind::SOURCE_FILE && !node.file_id.is_macro();
             next = if in_file && file_root { None } else { attrs::parent(cx.db, cx.krate, node) };
             chain.push((hash, key, node));
         }
@@ -426,7 +515,12 @@ impl<'db> Levels<'db> {
     /// `create_derived_impl` puts it beside the ADT with the ADT's `allow`, `warn`, `deny` and
     /// `forbid` copied onto it, not its `expect`s nor its other attributes. Made anew each time
     /// it is asked.
-    pub fn set_of_derived(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, adt: InFile<ast::Node<'db>>) -> SetId {
+    pub fn set_of_derived(
+        &mut self,
+        cx: &mut LevelCx<'_, 'db>,
+        sink: &mut impl Sink<'db>,
+        adt: InFile<ast::Node<'db>>,
+    ) -> SetId {
         let parent = match attrs::parent(cx.db, cx.krate, adt) {
             Some(around) => self.set_at(cx, sink, around),
             None => COMMAND_LINE,
@@ -442,7 +536,13 @@ impl<'db> Levels<'db> {
         self.close(set)
     }
 
-    fn push_node(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, parent: SetId, node: InFile<ast::Node<'db>>) -> SetId {
+    fn push_node(
+        &mut self,
+        cx: &mut LevelCx<'_, 'db>,
+        sink: &mut impl Sink<'db>,
+        parent: SetId,
+        node: InFile<ast::Node<'db>>,
+    ) -> SetId {
         let Some(owner) = attrs::owner(node.value, self.early) else { return parent };
         let is_crate = node.value.kind() == SyntaxKind::SOURCE_FILE && node.file_id == cx.root;
         let reads = attrs::read(owner, cx.cfg, cx.edition);
@@ -498,13 +598,19 @@ impl<'db> Levels<'db> {
         for read in reads {
             let (level, mut items, pre) = match read {
                 Read::Allows(id) => {
-                    let spec = Spec { level: Level::Allow, expect: None, source: SourceId::DEFAULT };
+                    let spec =
+                        Spec { level: Level::Allow, expect: None, source: SourceId::DEFAULT };
                     self.insert(set, id, spec);
                     continue;
                 }
                 Read::Level(level, items, direct) => (level, items, in_root && direct),
             };
-            let malformed = |range: TextRange, what: Malformed| Event::Malformed { node, at: InFile::new(file, range), what, pre };
+            let malformed = |range: TextRange, what: Malformed| Event::Malformed {
+                node,
+                at: InFile::new(file, range),
+                what,
+                pre,
+            };
             let tail = match items.last() {
                 None => continue,
                 Some(it) => match &it.kind {
@@ -522,7 +628,9 @@ impl<'db> Levels<'db> {
                 Tail::Reason(string, value) => {
                     match string {
                         Some(string) => reason = Some(string),
-                        None if says => sink.event(self, cx, set, malformed(value, Malformed::ReasonNotString)),
+                        None if says => {
+                            sink.event(self, cx, set, malformed(value, Malformed::ReasonNotString))
+                        }
                         None => {}
                     }
                     items.pop();
@@ -553,17 +661,34 @@ impl<'db> Levels<'db> {
                 let checked = cx.store.check(&name, tool.map(|it| it.name()));
                 let named = match &checked {
                     Checked::Ok(_) => Some(Symbol::intern(path.last().map_or("", |it| it.name()))),
-                    Checked::Tool(_, None) => Some(tool.map_or_else(|| Symbol::intern(&name), |tool| Symbol::intern_concat(&[tool.name(), "::", &name]))),
+                    Checked::Tool(_, None) => Some(tool.map_or_else(
+                        || Symbol::intern(&name),
+                        |tool| Symbol::intern_concat(&[tool.name(), "::", &name]),
+                    )),
                     Checked::Tool(_, Some(new)) => Some(Symbol::intern(new)),
                     Checked::Renamed(new) => Some(Symbol::intern(new)),
-                    Checked::MissingTool | Checked::NoTool | Checked::Removed(_) | Checked::NoLint { .. } => None,
+                    Checked::MissingTool
+                    | Checked::NoTool
+                    | Checked::Removed(_)
+                    | Checked::NoLint { .. } => None,
                 };
                 let speaks_of = matches!(
                     checked,
-                    Checked::Tool(_, Some(_)) | Checked::NoTool | Checked::Renamed(_) | Checked::Removed(_) | Checked::NoLint { .. }
+                    Checked::Tool(_, Some(_))
+                        | Checked::NoTool
+                        | Checked::Renamed(_)
+                        | Checked::Removed(_)
+                        | Checked::NoLint { .. }
                 );
                 if says && speaks_of {
-                    let event = Event::Name { node, at, tool: tool.map(|it| (it.name(), it.range)), name: &name, checked: &checked, pre };
+                    let event = Event::Name {
+                        node,
+                        at,
+                        tool: tool.map(|it| (it.name(), it.range)),
+                        name: &name,
+                        checked: &checked,
+                        pre,
+                    };
                     sink.event(self, cx, set, event);
                 }
                 let lints = match &checked {
@@ -572,11 +697,15 @@ impl<'db> Levels<'db> {
                         Checked::Ok(lints) => lints,
                         other => panic!("`{name}` is renamed to `{new}`, which is {other:?}"),
                     },
-                    Checked::MissingTool | Checked::NoTool | Checked::Removed(_) | Checked::NoLint { .. } => continue,
+                    Checked::MissingTool
+                    | Checked::NoTool
+                    | Checked::Removed(_)
+                    | Checked::NoLint { .. } => continue,
                 };
                 let named = named.expect("a name that sets levels has a name for its source");
                 // clone: an interned symbol, a reference count
-                let source = cx.add_source(Source::Node { name: named, at, reason: reason.clone() });
+                let source =
+                    cx.add_source(Source::Node { name: named, at, reason: reason.clone() });
                 for &lint in lints {
                     if self.gated(cx, sink, set, lint, Some(node), Some(at)) {
                         self.insert_spec(cx, sink, set, node, lint, Spec { level, expect, source });
@@ -591,20 +720,29 @@ impl<'db> Levels<'db> {
                     let is_unfulfilled = matches!(lints, [only] if only.id() == LintId::UNFULFILLED_LINT_EXPECTATIONS);
                     // clone: an interned symbol, once per `#[expect]` name
                     let reason = reason.clone();
-                    self.expectations.push(Expectation { id, key: at, reason, is_unfulfilled, node });
+                    self.expectations.push(Expectation {
+                        id,
+                        key: at,
+                        reason,
+                        is_unfulfilled,
+                        node,
+                    });
                 }
             }
         }
         if says && !is_crate {
             let range = self.range(set);
             // clone: a `Range<usize>`, no allocation
-            let ignored = self.ids[range.clone()].iter().zip(&self.specs[range]).find_map(|(id, spec)| {
-                match cx.source(spec.source) {
-                    // clone: an interned symbol, for a warning
-                    Source::Node { name, at, .. } if id.lint().crate_level_only => Some((spec.level, name.clone(), *at)),
-                    _ => None,
-                }
-            });
+            let ignored =
+                self.ids[range.clone()].iter().zip(&self.specs[range]).find_map(|(id, spec)| {
+                    match cx.source(spec.source) {
+                        // clone: an interned symbol, for a warning
+                        Source::Node { name, at, .. } if id.lint().crate_level_only => {
+                            Some((spec.level, name.clone(), *at))
+                        }
+                        _ => None,
+                    }
+                });
             if let Some((level, name, at)) = ignored {
                 sink.event(self, cx, set, Event::CrateLevelOnly { node, level, name: &name, at });
             }
@@ -643,8 +781,12 @@ impl<'db> Levels<'db> {
             return;
         }
         let spec = match (old.level, spec.level) {
-            (Level::ForceWarn, Level::Expect) => Spec { level: Level::ForceWarn, expect: spec.expect, source: old.source },
-            (Level::ForceWarn, _) => Spec { level: Level::ForceWarn, expect: None, source: old.source },
+            (Level::ForceWarn, Level::Expect) => {
+                Spec { level: Level::ForceWarn, expect: spec.expect, source: old.source }
+            }
+            (Level::ForceWarn, _) => {
+                Spec { level: Level::ForceWarn, expect: None, source: old.source }
+            }
             _ => spec,
         };
         self.insert(set, lint.id(), spec);
@@ -674,7 +816,13 @@ impl<'db> Levels<'db> {
     /// The level of `lint` in `set`: rustc's `reveal_actual_level_spec`, with `warnings` and
     /// `--cap-lints`.
     pub fn spec(&self, cx: &LevelCx<'_, '_>, lint: &'static Lint, set: SetId) -> Spec {
-        reveal(lint, self.raw(lint.id(), set), self.raw(LintId::WARNINGS, set), cx.edition, cx.opts.cap)
+        reveal(
+            lint,
+            self.raw(lint.id(), set),
+            self.raw(LintId::WARNINGS, set),
+            cx.edition,
+            cx.opts.cap,
+        )
     }
 
     fn range(&self, set: SetId) -> Range<usize> {
@@ -752,8 +900,18 @@ impl<'db> Levels<'db> {
 /// rustc's `reveal_actual_level_spec`: the level of `lint` from `raw`, what the sets give it
 /// (its default level in `edition` when none does), with `warnings`' level from the sets
 /// (`warnings`) and the cap `--cap-lints` gives.
-pub fn reveal(lint: &'static Lint, raw: Option<Spec>, warnings: Option<Spec>, edition: Edition, cap: Option<Level>) -> Spec {
-    let mut spec = raw.unwrap_or(Spec { level: lint.default_level(edition), expect: None, source: SourceId::DEFAULT });
+pub fn reveal(
+    lint: &'static Lint,
+    raw: Option<Spec>,
+    warnings: Option<Spec>,
+    edition: Edition,
+    cap: Option<Level>,
+) -> Spec {
+    let mut spec = raw.unwrap_or(Spec {
+        level: lint.default_level(edition),
+        expect: None,
+        source: SourceId::DEFAULT,
+    });
     if spec.level == Level::Warn
         && let Some(warnings) = warnings
     {
@@ -828,7 +986,12 @@ mod tests {
         for &id in &ids {
             for level in ALL_LEVELS {
                 let scanned = levels.own(COMMAND_LINE, id).is_some_and(|it| it.level == level);
-                assert_eq!(levels.command_line_at(level).contains(id), scanned, "{} at {level:?}", id.lint().name);
+                assert_eq!(
+                    levels.command_line_at(level).contains(id),
+                    scanned,
+                    "{} at {level:?}",
+                    id.lint().name
+                );
             }
         }
         let mut sets = vec![COMMAND_LINE];
@@ -848,12 +1011,22 @@ mod tests {
         assert_eq!(levels.parent.len(), levels.start.len());
         for &set in &sets {
             for &id in &ids {
-                assert_eq!(levels.raw(id, set), raw_by_scan(&levels, id, set), "{} in set {set}", id.lint().name);
+                assert_eq!(
+                    levels.raw(id, set),
+                    raw_by_scan(&levels, id, set),
+                    "{} in set {set}",
+                    id.lint().name
+                );
             }
             let (seen, flat) = levels.flatten(set);
             for &id in &ids {
                 let flat_level = flat.iter().find(|(it, _)| *it == id).map(|&(_, level)| level);
-                assert_eq!(flat_level, levels.raw(id, set).map(|it| it.level), "{} flattened in set {set}", id.lint().name);
+                assert_eq!(
+                    flat_level,
+                    levels.raw(id, set).map(|it| it.level),
+                    "{} flattened in set {set}",
+                    id.lint().name
+                );
                 assert_eq!(seen.contains(id), flat_level.is_some());
             }
         }

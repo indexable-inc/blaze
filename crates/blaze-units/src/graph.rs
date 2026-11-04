@@ -13,15 +13,14 @@
 //! once per sort with [`order`], and units sort by a `u128` of their ranks. Strings are made
 //! only for the JSON and for errors.
 
+use blaze_hash::hash_map::Entry;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use blaze_hash::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 
 use anyhow::{Context as _, bail};
 use blaze_hash::{FixedHasher, HashMap, HashSet};
-use std::alloc::Global;
 use blaze_manifest::config::CompileKind as ProfileKind;
 use blaze_manifest::profiles::{
     Lto, PanicStrategy, Profile, ProfileRoot, Strip, StripInner, UnitFor,
@@ -30,6 +29,7 @@ use blaze_manifest::targets::{CrateType, Target, TargetKind};
 use blaze_resolve::resolver::FeaturesFor;
 use blaze_resolve::{DepKind, Dependency, InternedString, PackageId, Resolve};
 use cargo_util_schemas::manifest::TomlDebugInfo;
+use std::alloc::Global;
 
 use crate::{Filter, Intent, LibRule, Package, Platformed, Request, Rule, order, schema};
 
@@ -333,11 +333,10 @@ impl Profiles {
             return id;
         }
         let classes = &self.classes;
-        let class = self.by_class.find_or_insert(
-            class_hash(&profile),
-            classes.len() as u32,
-            |class| exact[classes[class as usize] as usize] == profile,
-        );
+        let class =
+            self.by_class.find_or_insert(class_hash(&profile), classes.len() as u32, |class| {
+                exact[classes[class as usize] as usize] == profile
+            });
         let class = match class {
             Some(class) => class,
             None => {
@@ -713,14 +712,22 @@ fn build_graph(request: &Request<'_>) -> anyhow::Result<schema::UnitGraph> {
     let roots = state.generate_root_units()?;
     if roots.is_empty() {
         // alloc: none, the vectors being empty.
-        return Ok(schema::UnitGraph { version: schema::VERSION, units: Vec::new(), roots: Vec::new() });
+        return Ok(schema::UnitGraph {
+            version: schema::VERSION,
+            units: Vec::new(),
+            roots: Vec::new(),
+        });
     }
     for &root in &roots {
         let row = state.units[root as usize];
         let target = state.target(row.key.pkg, row.key.target);
         let host_only = !target.proc_macro && state.root_is_host_only(row.key.pkg)?;
         let unit_for = if row.key.mode.is_any_test() {
-            if target.proc_macro || host_only { UnitFor::new_host_test() } else { UnitFor::new_test() }
+            if target.proc_macro || host_only {
+                UnitFor::new_host_test()
+            } else {
+                UnitFor::new_test()
+            }
         } else if target.is_custom_build() {
             UnitFor::new_host(false)
         } else if target.proc_macro || host_only {
@@ -755,11 +762,16 @@ impl<'r, 'a> State<'r, 'a> {
             let targets = &package.manifest.targets;
             let scripts = target_lists.len() as u32;
             target_lists.extend(
-                targets.iter().enumerate().filter(|(_, t)| t.is_custom_build()).map(|(at, _)| at as u32),
+                targets
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.is_custom_build())
+                    .map(|(at, _)| at as u32),
             );
             let bins = target_lists.len() as u32;
-            target_lists
-                .extend(targets.iter().enumerate().filter(|(_, t)| t.is_bin()).map(|(at, _)| at as u32));
+            target_lists.extend(
+                targets.iter().enumerate().filter(|(_, t)| t.is_bin()).map(|(at, _)| at as u32),
+            );
             let end = target_lists.len() as u32;
             pkgs.push(Pkg {
                 id,
@@ -1037,7 +1049,8 @@ impl<'r, 'a> State<'r, 'a> {
         match self.dep_features.entry((pkg, has_dev_units, kind)) {
             Entry::Occupied(it) => Ok(*it.get()),
             Entry::Vacant(it) => {
-                let (host, platform) = (self.platforms[Kind::Host as usize], self.platforms[kind as usize]);
+                let (host, platform) =
+                    (self.platforms[Kind::Host as usize], self.platforms[kind as usize]);
                 let used = |d: &Dependency| {
                     (has_dev_units || d.kind() != DepKind::Development)
                         && d.platform().is_none_or(|p| platform.activates(p) || host.activates(p))
@@ -1064,8 +1077,9 @@ impl<'r, 'a> State<'r, 'a> {
                             }
                         };
                         let features_for = FeaturesFor::from_for_host(proc_macro || d.is_build());
-                        let on =
-                            external(|| features.activated_features_unverified(dep.id, features_for));
+                        let on = external(|| {
+                            features.activated_features_unverified(dep.id, features_for)
+                        });
                         for feature in on.into_iter().flatten() {
                             pairs.push((d.name_in_toml(), feature));
                         }
@@ -1090,7 +1104,13 @@ impl<'r, 'a> State<'r, 'a> {
 
     /// A root unit (cargo's `new_units`); `host_only` is [`State::root_is_host_only`]'s:
     /// the root is built for the host as a build dependency is, with its host features.
-    fn new_unit(&mut self, pkg: u32, at: u32, initial: Mode, host_only: bool) -> anyhow::Result<u32> {
+    fn new_unit(
+        &mut self,
+        pkg: u32,
+        at: u32,
+        initial: Mode,
+        host_only: bool,
+    ) -> anyhow::Result<u32> {
         let target = self.target(pkg, at);
         let mode = match initial {
             Mode::Test
@@ -1100,7 +1120,8 @@ impl<'r, 'a> State<'r, 'a> {
             }
             mode => mode,
         };
-        let features = self.features_of(pkg, FeaturesFor::from_for_host(target.proc_macro || host_only))?;
+        let features =
+            self.features_of(pkg, FeaturesFor::from_for_host(target.proc_macro || host_only))?;
         let unit_for = if initial.is_any_test() {
             if host_only { UnitFor::new_host_test() } else { UnitFor::new_test() }
         } else if host_only {
@@ -1110,8 +1131,10 @@ impl<'r, 'a> State<'r, 'a> {
         } else {
             UnitFor::new_normal()
         };
-        let profile = self.profile(pkg, unit_for, if host_only { Kind::Host } else { Kind::Target });
-        let kind = self.kind_for(Kind::Target, target.for_host || host_only, target.proc_macro, mode);
+        let profile =
+            self.profile(pkg, unit_for, if host_only { Kind::Host } else { Kind::Target });
+        let kind =
+            self.kind_for(Kind::Target, target.for_host || host_only, target.proc_macro, mode);
         let class = self.profiles.class_of[profile as usize];
         Ok(self.intern(Key { pkg, target: at, features, class, kind, mode }, profile))
     }
@@ -1180,7 +1203,9 @@ impl<'r, 'a> State<'r, 'a> {
                             Intent::Build | Intent::Check { .. } => t.is_bin() || t.is_lib(),
                             // cargo's: a binary named as its package's library is left out.
                             Intent::Doc { .. } => {
-                                t.doc && (!t.is_bin() || !targets.iter().any(|l| l.is_lib() && l.name == t.name))
+                                t.doc
+                                    && (!t.is_bin()
+                                        || !targets.iter().any(|l| l.is_lib() && l.name == t.name))
                             }
                         };
                         if picked {
@@ -1248,7 +1273,14 @@ impl<'r, 'a> State<'r, 'a> {
                     Rule::Just(_) => is_bench,
                 };
                 self.list_rule_targets(packages, bins, "bin", Target::is_bin, default_mode, out)?;
-                self.list_rule_targets(packages, examples, "example", is_example, default_mode, out)?;
+                self.list_rule_targets(
+                    packages,
+                    examples,
+                    "example",
+                    is_example,
+                    default_mode,
+                    out,
+                )?;
                 self.list_rule_targets(packages, tests, "test", test_filter, test_mode, out)?;
                 self.list_rule_targets(packages, benches, "bench", bench_filter, test_mode, out)?;
             }
@@ -1279,7 +1311,13 @@ impl<'r, 'a> State<'r, 'a> {
                 false => (FeaturesFor::NormalOrDev, kind),
             };
             let available = match &t.required_features {
-                Some(required) => self.has_features(pkg, features_for, self.request.has_dev_units, kind, required)?,
+                Some(required) => self.has_features(
+                    pkg,
+                    features_for,
+                    self.request.has_dev_units,
+                    kind,
+                    required,
+                )?,
                 None => true,
             };
             if t.is_lib() || available {
@@ -1336,8 +1374,16 @@ impl<'r, 'a> State<'r, 'a> {
             // read where the request is made: the request has none.
             let script_for = unit_for.for_custom_build();
             let target = row.key.target;
-            let dep =
-                self.new_unit_dep(id, pkg, target, script_for, Kind::Host, Mode::Build, None, own_public)?;
+            let dep = self.new_unit_dep(
+                id,
+                pkg,
+                target,
+                script_for,
+                Kind::Host,
+                Mode::Build,
+                None,
+                own_public,
+            )?;
             self.built.push(dep);
             self.ranges[id as usize] = (start, 1);
             return Ok(());
@@ -1398,9 +1444,11 @@ impl<'r, 'a> State<'r, 'a> {
                 // cargo's `maybe_lib`.
                 if let Some(lib) = self.pkgs[pkg as usize].linkable {
                     let mode = check_or_build_mode(row.key.mode, lib.for_host);
-                    let dep_for = unit_for.with_dependency(custom_build, lib.for_host, lib.proc_macro);
+                    let dep_for =
+                        unit_for.with_dependency(custom_build, lib.for_host, lib.proc_macro);
                     let kind = self.kind_for(row.key.kind, lib.for_host, lib.proc_macro, mode);
-                    let dep = self.new_unit_dep(id, pkg, lib.at, dep_for, kind, mode, None, own_public)?;
+                    let dep =
+                        self.new_unit_dep(id, pkg, lib.at, dep_for, kind, mode, None, own_public)?;
                     self.built.push(dep);
                 }
 
@@ -1413,7 +1461,13 @@ impl<'r, 'a> State<'r, 'a> {
                         let bin_at = self.target_lists[at as usize];
                         let bin = self.target(pkg, bin_at);
                         if let Some(required) = &bin.required_features
-                            && !self.has_features(pkg, self.own_features_for(pkg)?, false, row.key.kind, required)?
+                            && !self.has_features(
+                                pkg,
+                                self.own_features_for(pkg)?,
+                                false,
+                                row.key.kind,
+                                required,
+                            )?
                         {
                             continue;
                         }
@@ -1487,7 +1541,8 @@ impl<'r, 'a> State<'r, 'a> {
     /// each unit's sorted as cargo sorts `UnitDep`s.
     fn connect_and_sort(&mut self) -> anyhow::Result<Csr> {
         let n = self.units.len();
-        let is_run = |units: &[Row], unit: u32| units[unit as usize].key.mode == Mode::RunCustomBuild;
+        let is_run =
+            |units: &[Row], unit: u32| units[unit as usize].key.mode == Mode::RunCustomBuild;
 
         // The units that depend on each build script's run, as CSR.
         // alloc: three columns per build.
@@ -1534,13 +1589,16 @@ impl<'r, 'a> State<'r, 'a> {
                         continue;
                     }
                     let other_pkg = &self.pkgs[other_row.key.pkg as usize];
-                    let linkable = other_pkg.linkable.is_some_and(|lib| lib.at == other_row.key.target);
+                    let linkable =
+                        other_pkg.linkable.is_some_and(|lib| lib.at == other_row.key.target);
                     if !(linkable && other_pkg.links) || other.dev {
                         continue;
                     }
                     let (other_start, other_len) = self.ranges[other.unit as usize];
-                    let other_deps = &self.built[other_start as usize..(other_start + other_len) as usize];
-                    let Some(&run_dep) = other_deps.iter().find(|it| is_run(&self.units, it.unit)) else {
+                    let other_deps =
+                        &self.built[other_start as usize..(other_start + other_len) as usize];
+                    let Some(&run_dep) = other_deps.iter().find(|it| is_run(&self.units, it.unit))
+                    else {
                         continue;
                     };
                     let dep_name = if other.dep_name != NONE {
@@ -1638,7 +1696,8 @@ impl<'r, 'a> State<'r, 'a> {
             sh.scratch.push(Dep { unit, ..dep });
         }
         let row = self.units[id as usize];
-        let kind = if sh.to_host && row.key.kind == Kind::Target { Kind::Host } else { row.key.kind };
+        let kind =
+            if sh.to_host && row.key.kind == Kind::Target { Kind::Host } else { row.key.kind };
         let profile = self.profiles.get(row.profile);
         let profiles = &self.profiles;
         let strip = profile.strip.is_deferred()
@@ -1648,7 +1707,8 @@ impl<'r, 'a> State<'r, 'a> {
                 .all(|d| !profiles.get(sh.units[d.unit as usize].profile).debuginfo.is_turned_on());
         let debuginfo = if for_host && sh.to_host && profile.debuginfo.is_deferred() {
             let probe = Key { kind: Kind::Target, ..row.key };
-            let built = self.by_key.get(&probe).is_some_and(|&it| self.ranges[it as usize].0 != NONE);
+            let built =
+                self.by_key.get(&probe).is_some_and(|&it| self.ranges[it as usize].0 != NONE);
             if built { Debuginfo::Finalize } else { Debuginfo::Weaken }
         } else {
             Debuginfo::Keep
@@ -1662,7 +1722,8 @@ impl<'r, 'a> State<'r, 'a> {
             hasher.write_u32(dep.unit);
         }
         let next = sh.units.len() as u32;
-        let (units, offsets, edges, deps) = (&sh.units, &sh.offsets, &sh.edges, &sh.scratch[base..]);
+        let (units, offsets, edges, deps) =
+            (&sh.units, &sh.offsets, &sh.edges, &sh.scratch[base..]);
         let same = |at: u32| {
             let at = at as usize;
             let theirs = &edges[offsets[at] as usize..offsets[at + 1] as usize];
@@ -1727,7 +1788,8 @@ impl<'r, 'a> State<'r, 'a> {
                 end += 1;
             }
             if end - run > 1 {
-                sorted[run..end].sort_unstable_by(|a, b| cmp_shared(sh, &key, &self.names, a.1, b.1));
+                sorted[run..end]
+                    .sort_unstable_by(|a, b| cmp_shared(sh, &key, &self.names, a.1, b.1));
             }
             run = end;
         }
@@ -1738,7 +1800,8 @@ impl<'r, 'a> State<'r, 'a> {
         }
 
         let explicit = self.request.target.unwrap_or(self.request.host);
-        let mut profiles: Vec<Option<schema::Profile>> = Vec::with_capacity(self.profiles.exact.len());
+        let mut profiles: Vec<Option<schema::Profile>> =
+            Vec::with_capacity(self.profiles.exact.len());
         profiles.resize_with(self.profiles.exact.len(), || None);
         let mut pkg_ids: Vec<Option<String>> = Vec::with_capacity(self.pkgs.len());
         pkg_ids.resize_with(self.pkgs.len(), || None);
@@ -1768,7 +1831,9 @@ impl<'r, 'a> State<'r, 'a> {
                         // alloc: the output owns its strings.
                         Kind::Target => Some(explicit.triple.clone()),
                         // alloc: the output owns its strings.
-                        Kind::MacroWasm => Some(self.platforms[Kind::MacroWasm as usize].triple.clone()),
+                        Kind::MacroWasm => {
+                            Some(self.platforms[Kind::MacroWasm as usize].triple.clone())
+                        }
                     },
                     // Its triple may be the target's too (`--target wasm32-wasip1`): this tells
                     // the two units apart downstream, as `kind` does here.
@@ -1776,7 +1841,12 @@ impl<'r, 'a> State<'r, 'a> {
                     mode: row.key.mode.schema(),
                     checked_as_test: row.key.mode == Mode::CheckTest,
                     // alloc: the output owns its strings.
-                    features: self.features.get(row.key.features).iter().map(|it| it.to_string()).collect(),
+                    features: self
+                        .features
+                        .get(row.key.features)
+                        .iter()
+                        .map(|it| it.to_string())
+                        .collect(),
                     is_std: false,
                     dependencies: sh
                         .of(id)
@@ -1797,7 +1867,9 @@ impl<'r, 'a> State<'r, 'a> {
             out.push(unit);
         }
         // alloc: the output.
-        let roots: Vec<usize> = output(|| roots.iter().map(|&it| index[sh.memo[it as usize] as usize] as usize).collect());
+        let roots: Vec<usize> = output(|| {
+            roots.iter().map(|&it| index[sh.memo[it as usize] as usize] as usize).collect()
+        });
         self.ranks.sorted = sorted;
         Ok(schema::UnitGraph { version: schema::VERSION, units: out, roots })
     }
@@ -1867,9 +1939,13 @@ fn schema_profile(p: &Profile) -> anyhow::Result<schema::Profile> {
             TomlDebugInfo::Limited => schema::DebugInfo::Level(1),
             TomlDebugInfo::Full => schema::DebugInfo::Level(2),
             // alloc: the output owns its strings.
-            TomlDebugInfo::LineDirectivesOnly => schema::DebugInfo::Named("line-directives-only".to_owned()),
+            TomlDebugInfo::LineDirectivesOnly => {
+                schema::DebugInfo::Named("line-directives-only".to_owned())
+            }
             // alloc: the output owns its strings.
-            TomlDebugInfo::LineTablesOnly => schema::DebugInfo::Named("line-tables-only".to_owned()),
+            TomlDebugInfo::LineTablesOnly => {
+                schema::DebugInfo::Named("line-tables-only".to_owned())
+            }
         },
         // clone: the output owns its strings.
         split_debuginfo: p.split_debuginfo.clone(),
@@ -1907,7 +1983,9 @@ fn schema_target(pkg: PackageId, target: &Target) -> anyhow::Result<schema::Targ
     // alloc: the output owns its strings.
     let one = |name: &str| vec![name.to_owned()];
     // alloc: the output owns its strings.
-    let types = |kinds: &[CrateType]| -> Vec<String> { kinds.iter().map(|it| it.as_str().to_owned()).collect() };
+    let types = |kinds: &[CrateType]| -> Vec<String> {
+        kinds.iter().map(|it| it.as_str().to_owned()).collect()
+    };
     let kind = match &target.kind {
         TargetKind::Lib(kinds) => types(kinds),
         TargetKind::Bin => one("bin"),

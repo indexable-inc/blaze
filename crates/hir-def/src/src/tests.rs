@@ -4,9 +4,9 @@
 use std::fmt::Write as _;
 
 use expect_test::expect_file;
+use hir_expand::fixture;
 use la_arena::{Idx, RawIdx};
 use syntax::{SyntaxKind, TextRange};
-use hir_expand::fixture;
 
 use super::*;
 use crate::{
@@ -215,8 +215,13 @@ fn use_tree_views() {
             assert_eq!(of_view(view::AstNode::syntax(&view)), node);
             let in_views = views.value.get(index).map(|&it| of_view(view::AstNode::syntax(&it)));
             assert_eq!(in_views, Some(node));
-            writeln!(out, "use {owner} tree {}: {:?} {node:?}", u32::from(idx.into_raw()), views.file_id)
-                .unwrap();
+            writeln!(
+                out,
+                "use {owner} tree {}: {:?} {node:?}",
+                u32::from(idx.into_raw()),
+                views.file_id
+            )
+            .unwrap();
             seen += 1;
         }
     }

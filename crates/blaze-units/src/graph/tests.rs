@@ -89,7 +89,8 @@ fn dev() -> Profile {
 fn profiles_cargo_holds_equal_are_one_class_and_each_is_kept_as_made() {
     let mut profiles = Profiles::default();
     let target = profiles.intern(dev());
-    let host = profiles.intern(Profile { debuginfo: DebugInfo::Deferred(TomlDebugInfo::Full), ..dev() });
+    let host =
+        profiles.intern(Profile { debuginfo: DebugInfo::Deferred(TomlDebugInfo::Full), ..dev() });
     let renamed = profiles.intern(Profile { name: "test".to_owned(), ..dev() });
     let optimized = profiles.intern(Profile { opt_level: "3".to_owned(), ..dev() });
 
@@ -151,7 +152,8 @@ fn chains_tell_apart_entries_that_share_a_hash() {
 
 #[test]
 fn names_compare_by_prefix_as_strings_do() {
-    let names = ["", "\0", "a", "a\0", "a\0b", "abcdefgh", "abcdefgg", "abcdefghi", "abcdefgh\0", "b", "é"];
+    let names =
+        ["", "\0", "a", "a\0", "a\0b", "abcdefgh", "abcdefgg", "abcdefghi", "abcdefgh\0", "b", "é"];
     for a in names {
         for b in names {
             assert_eq!(order::name(a, b), a.cmp(b), "{a:?} and {b:?}");
@@ -219,7 +221,9 @@ mod load {
             .units
             .iter()
             .enumerate()
-            .filter(|(_, it)| !it.is_std && it.mode == Mode::Build && it.target.is_lib() && it.target.name == name)
+            .filter(|(_, it)| {
+                !it.is_std && it.mode == Mode::Build && it.target.is_lib() && it.target.name == name
+            })
             .collect()
     }
 
@@ -273,7 +277,8 @@ mod load {
     fn with_a_target_the_host_and_the_target_build_their_own_units() {
         let (_, graph) = graph(&build_and_normal(), &["--target", HOST]);
         let b = libs(&graph, "b");
-        let mut platforms: Vec<Option<&str>> = b.iter().map(|(_, it)| it.platform.as_deref()).collect();
+        let mut platforms: Vec<Option<&str>> =
+            b.iter().map(|(_, it)| it.platform.as_deref()).collect();
         platforms.sort();
         assert_eq!(platforms, [None, Some(HOST)]);
     }
@@ -302,7 +307,9 @@ mod load {
         assert_eq!(a.platform.as_deref(), Some(HOST));
         let script_at = script(graph, "a", Mode::Build);
         assert_eq!(graph.units[script_at].platform, None, "the build script is the host's");
-        let owned = |std: Vec<(&str, usize)>| std.into_iter().map(|(name, at)| (name.to_owned(), at)).collect();
+        let owned = |std: Vec<(&str, usize)>| {
+            std.into_iter().map(|(name, at)| (name.to_owned(), at)).collect()
+        };
         let (a_std, script_std) = (owned(std_of(graph, a_at)), owned(std_of(graph, script_at)));
         let mut outputs: Vec<&str> = (0..graph.units.len())
             .filter(|&at| graph.units[at].is_std)
@@ -320,12 +327,16 @@ mod load {
     /// shipped, so theirs is compiled for the target's baseline. Two stds of two keys, in two
     /// directories: the target's program never links the host's native std.
     #[test]
-    fn in_a_dev_build_with_a_target_of_the_hosts_own_triple_the_host_and_the_target_have_a_std_each() {
+    fn in_a_dev_build_with_a_target_of_the_hosts_own_triple_the_host_and_the_target_have_a_std_each()
+     {
         let (units, a_std, script_std) = target_and_host_std(&[]);
         assert!(!a_std.is_empty() && !script_std.is_empty(), "each has a std");
-        let shared: Vec<&(String, usize)> = a_std.iter().filter(|it| script_std.contains(it)).collect();
+        let shared: Vec<&(String, usize)> =
+            a_std.iter().filter(|it| script_std.contains(it)).collect();
         assert!(shared.is_empty(), "the host and the target share std units {shared:?}");
-        let runs_here = |std: &[(String, usize)]| std.iter().map(|(_, at)| units.graph.units[*at].runs_here()).collect::<Vec<_>>();
+        let runs_here = |std: &[(String, usize)]| {
+            std.iter().map(|(_, at)| units.graph.units[*at].runs_here()).collect::<Vec<_>>()
+        };
         assert!(runs_here(&script_std).iter().all(|&it| it), "the host's std runs here");
         assert!(runs_here(&a_std).iter().all(|&it| !it), "the target's std runs elsewhere");
     }
@@ -333,7 +344,8 @@ mod load {
     /// In a release build both run elsewhere, so the host's std and the target's are one key:
     /// one set of std units, which both use.
     #[test]
-    fn in_a_release_build_with_a_target_of_the_hosts_own_triple_the_host_and_the_target_share_one_std() {
+    fn in_a_release_build_with_a_target_of_the_hosts_own_triple_the_host_and_the_target_share_one_std()
+     {
         let (_, a_std, script_std) = target_and_host_std(&["--release"]);
         assert!(!a_std.is_empty(), "a has a std");
         assert_eq!(a_std, script_std, "the host and the target share one std");
@@ -387,7 +399,8 @@ mod load {
     #[test]
     fn a_build_scripts_run_waits_for_the_runs_of_its_links_dependencies() {
         let a = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nl = { path = \"l\" }\n";
-        let l = "[package]\nname = \"l\"\nversion = \"0.1.0\"\nedition = \"2024\"\nlinks = \"foo\"\n";
+        let l =
+            "[package]\nname = \"l\"\nversion = \"0.1.0\"\nedition = \"2024\"\nlinks = \"foo\"\n";
         let files = [
             ("ws/Cargo.toml", a),
             ("ws/build.rs", "fn main() {}\n"),
@@ -397,8 +410,13 @@ mod load {
             ("ws/l/src/lib.rs", ""),
         ];
         let (_, graph) = graph(&files, &[]);
-        let (a_run, l_run) = (script(&graph, "a", Mode::RunCustomBuild), script(&graph, "l", Mode::RunCustomBuild));
-        let waits = graph.units[a_run].dependencies.iter().find(|it| it.index == l_run).expect("a's run waits for l's");
+        let (a_run, l_run) =
+            (script(&graph, "a", Mode::RunCustomBuild), script(&graph, "l", Mode::RunCustomBuild));
+        let waits = graph.units[a_run]
+            .dependencies
+            .iter()
+            .find(|it| it.index == l_run)
+            .expect("a's run waits for l's");
         assert_eq!(waits.extern_crate_name, "build_script_build");
     }
 
@@ -439,15 +457,30 @@ mod load {
         let wasm = Some(crate::load::MACRO_WASM);
         let (_, m) = lib(&graph, "m");
         assert_eq!((m.platform.as_deref(), m.macro_wasm), (wasm, true));
-        let mut b: Vec<(Option<&str>, bool)> = libs(&graph, "b").iter().map(|(_, it)| (it.platform.as_deref(), it.macro_wasm)).collect();
+        let mut b: Vec<(Option<&str>, bool)> = libs(&graph, "b")
+            .iter()
+            .map(|(_, it)| (it.platform.as_deref(), it.macro_wasm))
+            .collect();
         b.sort();
-        assert_eq!(b, [(None, false), (wasm, true)], "a's b for the host, m's b for the wasm macros");
+        assert_eq!(
+            b,
+            [(None, false), (wasm, true)],
+            "a's b for the host, m's b for the wasm macros"
+        );
         let m_b = libs(&graph, "b").into_iter().find(|(_, it)| it.macro_wasm).map(|(at, _)| at);
         assert!(m.dependencies.iter().any(|it| Some(it.index) == m_b), "m uses the wasm b");
         let built = &graph.units[script(&graph, "m", Mode::Build)];
-        assert_eq!((built.platform.as_deref(), built.macro_wasm), (None, false), "a build script still runs on the host");
+        assert_eq!(
+            (built.platform.as_deref(), built.macro_wasm),
+            (None, false),
+            "a build script still runs on the host"
+        );
         let run = &graph.units[script(&graph, "m", Mode::RunCustomBuild)];
-        assert_eq!((run.platform.as_deref(), run.macro_wasm), (wasm, true), "its run is for the unit it feeds");
+        assert_eq!(
+            (run.platform.as_deref(), run.macro_wasm),
+            (wasm, true),
+            "its run is for the unit it feeds"
+        );
     }
 
     #[test]
@@ -460,7 +493,12 @@ mod load {
     #[test]
     fn a_proc_macros_own_tests_are_built_for_the_host() {
         // `--lib`: a doctest unit has no plan (blaze runs no rustdoc).
-        let graph = units(&Ask { command: Command::Test, args: &["-p", "m", "--lib"], ..ask(&with_a_proc_macro()) }).graph;
+        let graph = units(&Ask {
+            command: Command::Test,
+            args: &["-p", "m", "--lib"],
+            ..ask(&with_a_proc_macro())
+        })
+        .graph;
         let tests: Vec<&Unit> = graph
             .units
             .iter()
@@ -468,7 +506,11 @@ mod load {
             .collect();
         assert_eq!(tests.len(), 1, "{tests:?}");
         let test = tests[0];
-        assert_eq!((test.platform.as_deref(), test.macro_wasm), (None, false), "a test is a program that runs here");
+        assert_eq!(
+            (test.platform.as_deref(), test.macro_wasm),
+            (None, false),
+            "a test is a program that runs here"
+        );
         let deps: Vec<(&str, Option<&str>, bool)> = test
             .dependencies
             .iter()
@@ -498,15 +540,26 @@ mod load {
                 .map(|dep| {
                     let unit = &graph.units[dep.index];
                     assert_eq!(unit.macro_wasm, units.plans[dep.index].macro_wasm, "{unit:?}");
-                    (dep.extern_crate_name.as_str(), unit.platform.as_deref(), units.plans[dep.index].macro_wasm)
+                    (
+                        dep.extern_crate_name.as_str(),
+                        unit.platform.as_deref(),
+                        units.plans[dep.index].macro_wasm,
+                    )
                 })
                 .collect()
         };
         let m_std = std_of(m_at);
         assert!(m_std.iter().any(|(name, _, _)| *name == "proc_macro"), "{m_std:?}");
-        assert!(m_std.iter().all(|&(_, platform, bridged)| platform == wasm && bridged), "{m_std:?}");
+        assert!(
+            m_std.iter().all(|&(_, platform, bridged)| platform == wasm && bridged),
+            "{m_std:?}"
+        );
         let a_std = std_of(a_at);
-        assert!(!a_std.is_empty() && a_std.iter().all(|&(_, platform, bridged)| platform.is_none() && !bridged), "{a_std:?}");
+        assert!(
+            !a_std.is_empty()
+                && a_std.iter().all(|&(_, platform, bridged)| platform.is_none() && !bridged),
+            "{a_std:?}"
+        );
     }
 
     /// A build for `wasm32-wasip1`, the wasm macros' own triple, plans two units of each
@@ -520,7 +573,10 @@ mod load {
         let graph = &units.graph;
         let (a_at, a) = lib(graph, "a");
         assert_eq!((a.platform.as_deref(), a.macro_wasm), (Some(wasm), false));
-        assert_eq!(a.profile.panic, "abort", "cargo passes no `-C panic=unwind`, and {wasm} aborts");
+        assert_eq!(
+            a.profile.panic, "abort",
+            "cargo passes no `-C panic=unwind`, and {wasm} aborts"
+        );
         let (m_at, m) = lib(graph, "m");
         assert_eq!((m.platform.as_deref(), m.macro_wasm), (Some(wasm), true));
         let b = libs(graph, "b");
@@ -528,7 +584,11 @@ mod load {
         let target_b = b.iter().find(|(_, it)| !it.macro_wasm).expect("the target's b").0;
         let macro_b = b.iter().find(|(_, it)| it.macro_wasm).expect("the macros' b").0;
         for at in [target_b, macro_b] {
-            assert_eq!(graph.units[at].platform.as_deref(), Some(wasm), "both are built for {wasm}");
+            assert_eq!(
+                graph.units[at].platform.as_deref(),
+                Some(wasm),
+                "both are built for {wasm}"
+            );
         }
         assert!(a.dependencies.iter().any(|it| it.index == target_b), "a uses the target's b");
         assert!(m.dependencies.iter().any(|it| it.index == macro_b), "m uses the macros' b");
@@ -538,23 +598,44 @@ mod load {
         assert_ne!(target.metadata, macros.metadata);
         let macro_dir = format!("/{wasm}+macros/");
         let target_dir = format!("/{wasm}/");
-        assert!(!macros.outputs.is_empty() && macros.outputs.iter().all(|it| it.contains(&macro_dir)), "{:?}", macros.outputs);
         assert!(
-            !target.outputs.is_empty() && target.outputs.iter().all(|it| it.contains(&target_dir) && !it.contains(&macro_dir)),
+            !macros.outputs.is_empty() && macros.outputs.iter().all(|it| it.contains(&macro_dir)),
+            "{:?}",
+            macros.outputs
+        );
+        assert!(
+            !target.outputs.is_empty()
+                && target
+                    .outputs
+                    .iter()
+                    .all(|it| it.contains(&target_dir) && !it.contains(&macro_dir)),
             "{:?}",
             target.outputs
         );
-        assert!(target.outputs.iter().all(|it| !macros.outputs.contains(it)), "no output of one is the other's");
+        assert!(
+            target.outputs.iter().all(|it| !macros.outputs.contains(it)),
+            "no output of one is the other's"
+        );
         // The standard libraries: each its own units and plans, the macros' taking the bridge.
         let std_of = |at: usize| -> Vec<usize> {
-            graph.units[at].dependencies.iter().map(|it| it.index).filter(|&dep| graph.units[dep].is_std).collect()
+            graph.units[at]
+                .dependencies
+                .iter()
+                .map(|it| it.index)
+                .filter(|&dep| graph.units[dep].is_std)
+                .collect()
         };
         let (a_std, m_std) = (std_of(a_at), std_of(m_at));
         assert!(!a_std.is_empty() && !m_std.is_empty());
-        assert!(a_std.iter().all(|it| !m_std.contains(it)), "a's std is not m's: {a_std:?} {m_std:?}");
+        assert!(
+            a_std.iter().all(|it| !m_std.contains(it)),
+            "a's std is not m's: {a_std:?} {m_std:?}"
+        );
         assert!(a_std.iter().all(|&it| !graph.units[it].macro_wasm && !units.plans[it].macro_wasm));
         assert!(m_std.iter().all(|&it| graph.units[it].macro_wasm && units.plans[it].macro_wasm));
-        let ids = |at: &[usize]| -> Vec<&str> { at.iter().map(|&it| units.plans[it].unit_id.as_str()).collect() };
+        let ids = |at: &[usize]| -> Vec<&str> {
+            at.iter().map(|&it| units.plans[it].unit_id.as_str()).collect()
+        };
         let (a_ids, m_ids) = (ids(&a_std), ids(&m_std));
         assert!(a_ids.iter().all(|it| !m_ids.contains(it)), "{a_ids:?} {m_ids:?}");
         let outputs = |at: &[usize]| -> Vec<&str> {
@@ -582,7 +663,9 @@ mod load {
         let (small_budget, small_graph) = graph(&small, &[]);
 
         let names: Vec<String> = (0..12).map(|it| format!("p{it}")).collect();
-        let mut a = String::from("[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n");
+        let mut a = String::from(
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n",
+        );
         for name in &names {
             a.push_str(&format!("{name} = {{ path = \"{name}\" }}\n"));
         }
@@ -595,9 +678,14 @@ mod load {
                 (format!("ws/{name}/Cargo.toml"), manifest)
             })
             .collect();
-        let sources: Vec<String> = names.iter().map(|name| format!("ws/{name}/src/lib.rs")).collect();
-        let mut large: Vec<(&str, &str)> =
-            vec![("ws/Cargo.toml", a.as_str()), ("ws/src/lib.rs", ""), ("ws/b/Cargo.toml", B), ("ws/b/src/lib.rs", "")];
+        let sources: Vec<String> =
+            names.iter().map(|name| format!("ws/{name}/src/lib.rs")).collect();
+        let mut large: Vec<(&str, &str)> = vec![
+            ("ws/Cargo.toml", a.as_str()),
+            ("ws/src/lib.rs", ""),
+            ("ws/b/Cargo.toml", B),
+            ("ws/b/src/lib.rs", ""),
+        ];
         for ((path, manifest), source) in manifests.iter().zip(&sources) {
             large.push((path.as_str(), manifest.as_str()));
             large.push((source.as_str(), ""));

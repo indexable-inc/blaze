@@ -355,7 +355,10 @@ impl Paths {
 
     /// The address of byte `at` of `arena`, which is below its length.
     pub(super) fn at(&self, arena: u8, at: u32) -> *mut u8 {
-        self.arenas[arena as usize].as_ptr_at(at as usize).expect("a name of a request in flight").as_ptr()
+        self.arenas[arena as usize]
+            .as_ptr_at(at as usize)
+            .expect("a name of a request in flight")
+            .as_ptr()
     }
 
     /// The NUL-terminated name at `at` of `arena`, which a request put there.
@@ -404,7 +407,10 @@ pub(super) struct Lent {
 impl Lent {
     pub(super) fn new(count: u16) -> Lent {
         // alloc: setup, once per driver.
-        Lent { free: (0..count).rev().collect(), waiting: VecDeque::with_capacity(super::ENTRIES as usize) }
+        Lent {
+            free: (0..count).rev().collect(),
+            waiting: VecDeque::with_capacity(super::ENTRIES as usize),
+        }
     }
 
     /// A buffer for `id`, or none, `id` then waiting for the next given back.
@@ -461,7 +467,8 @@ mod tests {
                 if model.is_empty() || (model.len() < 128 && rng.below(3) != 0) {
                     let bytes = next.to_le_bytes().to_vec();
                     let cold = Cold { at: next * 3, ..Cold::EMPTY };
-                    let id = ops.insert(Hot::new(Tag(next), Kind::Read, next * 5), bytes.clone(), cold);
+                    let id =
+                        ops.insert(Hot::new(Tag(next), Kind::Read, next * 5), bytes.clone(), cold);
                     model.insert(next, (id, next * 5, bytes, next * 3));
                 } else {
                     let key = *model.keys().nth(rng.below(model.len() as u64) as usize).unwrap();
@@ -474,7 +481,10 @@ mod tests {
             }
             for (key, (id, of, bytes, at)) in &model {
                 let hot = ops.get(*id).expect("live");
-                assert_eq!((hot.tag, hot.of, ops.buf(*id), ops.cold(*id).at), (Tag(*key), *of, bytes, *at));
+                assert_eq!(
+                    (hot.tag, hot.of, ops.buf(*id), ops.cold(*id).at),
+                    (Tag(*key), *of, bytes, *at)
+                );
             }
         }
     }
@@ -505,8 +515,9 @@ mod tests {
     #[test]
     fn a_write_without_a_free_buffer_waits_for_the_next() {
         let mut ops = Ops::new(64).unwrap();
-        let ids: Vec<Id> =
-            (0..12).map(|n| ops.insert(Hot::new(Tag(n), Kind::WriteAt, 0), Vec::new(), Cold::EMPTY)).collect();
+        let ids: Vec<Id> = (0..12)
+            .map(|n| ops.insert(Hot::new(Tag(n), Kind::WriteAt, 0), Vec::new(), Cold::EMPTY))
+            .collect();
         let mut lent = Lent::new(4);
         let mut holding: VecDeque<(Id, u16)> = VecDeque::new();
         for &id in &ids {

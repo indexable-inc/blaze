@@ -105,14 +105,18 @@ impl<'a> View<'a> {
     /// ascending. Nothing past the check can index out of bounds or join out of order.
     pub fn parse(bytes: &'a [u8]) -> Result<View<'a>, String> {
         // alloc: error path, and the trace is refused.
-        let file: File<'a> = blaze_protocol::cbor::from_slice(bytes).map_err(|e| format!("the trace: {e}"))?;
+        let file: File<'a> =
+            blaze_protocol::cbor::from_slice(bytes).map_err(|e| format!("the trace: {e}"))?;
         View::of(file)
     }
 
     fn of(file: File<'a>) -> Result<View<'a>, String> {
         if file.version != VERSION {
             // alloc: error path, and the trace is refused.
-            return Err(format!("a trace of version {}; this reads version {VERSION}", file.version));
+            return Err(format!(
+                "a trace of version {}; this reads version {VERSION}",
+                file.version
+            ));
         }
         let view = View {
             kinds: exact(file.kinds, "kinds")?,
@@ -144,26 +148,40 @@ impl<'a> View<'a> {
         ];
         if let Some((what, got, want)) = lengths.into_iter().find(|&(_, got, want)| got != want) {
             // alloc: error path, and the trace is refused.
-            return Err(format!("the trace has {n} keys and {m} edges, and {got} elements of `{what}`, not {want}"));
+            return Err(format!(
+                "the trace has {n} keys and {m} edges, and {got} elements of `{what}`, not {want}"
+            ));
         }
         if n == 0 && self.edges_from.is_empty() {
             // alloc: error path, and the trace is refused.
-            return if m == 0 { Ok(()) } else { Err(format!("the trace has no keys and {m} edges")) };
+            return if m == 0 {
+                Ok(())
+            } else {
+                Err(format!("the trace has no keys and {m} edges"))
+            };
         }
         if self.edges_from.len() != n + 1 || self.from(0) != 0 || self.from(n) != m {
             // alloc: error path, and the trace is refused.
-            return Err(format!("the trace's `edges_from` does not run from 0 to its {m} edges over its {n} keys"));
+            return Err(format!(
+                "the trace's `edges_from` does not run from 0 to its {m} edges over its {n} keys"
+            ));
         }
         let mut unsorted = None;
         join::split(
             n,
             join::pieces(n),
-            |range| range.into_iter().find(|&i| self.from(i) > self.from(i + 1) || (i > 0 && self.key(i - 1) >= self.key(i))),
+            |range| {
+                range.into_iter().find(|&i| {
+                    self.from(i) > self.from(i + 1) || (i > 0 && self.key(i - 1) >= self.key(i))
+                })
+            },
             |piece| unsorted = unsorted.or(piece),
         );
         if let Some(i) = unsorted {
             // alloc: error path, and the trace is refused.
-            return Err(format!("the trace's key {i} is not above the one before it, or its edges end before they start"));
+            return Err(format!(
+                "the trace's key {i} is not above the one before it, or its edges end before they start"
+            ));
         }
         let mut highest = None;
         join::split(
@@ -174,7 +192,9 @@ impl<'a> View<'a> {
         );
         match highest {
             // alloc: error path, and the trace is refused.
-            Some(read) if read as usize >= n => Err(format!("an edge of the trace reads key {read}; it has {n}")),
+            Some(read) if read as usize >= n => {
+                Err(format!("an edge of the trace reads key {read}; it has {n}"))
+            }
             _ => Ok(()),
         }
     }
@@ -190,7 +210,9 @@ impl<'a> View<'a> {
             column.iter().map(|f| Fingerprint(u128::from_le_bytes(*f))).collect()
         };
         // alloc: as above.
-        let indices = |column: &[[u8; 4]]| -> Vec<u32> { column.iter().map(|w| u32::from_le_bytes(*w)).collect() };
+        let indices = |column: &[[u8; 4]]| -> Vec<u32> {
+            column.iter().map(|w| u32::from_le_bytes(*w)).collect()
+        };
         Trace {
             // alloc: as above.
             keys: (0..self.kinds.len()).map(|i| self.key(i)).collect(),
@@ -210,7 +232,10 @@ impl Columns for View<'_> {
     }
 
     fn key(&self, i: usize) -> QueryKey {
-        QueryKey { kind: QueryKind(u16::from_le_bytes(self.kinds[i])), input: ContentId(self.inputs[i]) }
+        QueryKey {
+            kind: QueryKind(u16::from_le_bytes(self.kinds[i])),
+            input: ContentId(self.inputs[i]),
+        }
     }
 
     fn has(&self, i: usize) -> bool {
@@ -248,7 +273,11 @@ impl Columns for View<'_> {
 
 /// `items` as `column`, each one's fixed-width little-endian bytes after the last's, written over
 /// what `column` held.
-fn fill<'c, T, const N: usize>(column: &'c mut Vec<u8>, items: &[T], bytes: impl Fn(&T) -> [u8; N]) -> Bytes<'c> {
+fn fill<'c, T, const N: usize>(
+    column: &'c mut Vec<u8>,
+    items: &[T],
+    bytes: impl Fn(&T) -> [u8; N],
+) -> Bytes<'c> {
     column.clear();
     for item in items {
         column.extend_from_slice(&bytes(item));
@@ -289,8 +318,14 @@ impl Serialize for Trace {
         file.serialize_field("reads", &fill(&mut column, &self.reads, |r| r.to_le_bytes()))?;
         file.serialize_field("inputs", &fill(&mut column, &self.keys, |k| k.input.0))?;
         file.serialize_field("version", &VERSION)?;
-        file.serialize_field("edges_from", &fill(&mut column, &self.edges_from, |e| e.to_le_bytes()))?;
-        file.serialize_field("fingerprints", &fill(&mut column, &self.fingerprints, |f| f.0.to_le_bytes()))?;
+        file.serialize_field(
+            "edges_from",
+            &fill(&mut column, &self.edges_from, |e| e.to_le_bytes()),
+        )?;
+        file.serialize_field(
+            "fingerprints",
+            &fill(&mut column, &self.fingerprints, |f| f.0.to_le_bytes()),
+        )?;
         file.end()
     }
 }
@@ -320,9 +355,17 @@ pub(crate) mod tests {
         let mut builder = TraceBuilder::default();
         for _ in 0..results {
             let edges: Vec<Edge> = (0..rng.below(7))
-                .map(|_| Edge { read: key(rng.below(keys)), saw: Fingerprint(u128::from(rng.below(4))) })
+                .map(|_| Edge {
+                    read: key(rng.below(keys)),
+                    saw: Fingerprint(u128::from(rng.below(4))),
+                })
                 .collect();
-            builder.insert(key(rng.below(keys)), Fingerprint(u128::from(rng.below(4))), &edges, rng.below(2) == 0);
+            builder.insert(
+                key(rng.below(keys)),
+                Fingerprint(u128::from(rng.below(4))),
+                &edges,
+                rng.below(2) == 0,
+            );
         }
         builder.finish()
     }
@@ -356,7 +399,11 @@ pub(crate) mod tests {
             assert_eq!((view.read(e), view.saw(e)), (trace.read(e), trace.saw(e)));
         }
         for w in 0..=blaze_ids::bits::words_for(trace.keys()) {
-            assert_eq!((view.has_word(w), view.ran_word(w)), (trace.has_word(w), trace.ran_word(w)), "word {w}");
+            assert_eq!(
+                (view.has_word(w), view.ran_word(w)),
+                (trace.has_word(w), trace.ran_word(w)),
+                "word {w}"
+            );
         }
     }
 
@@ -377,8 +424,11 @@ pub(crate) mod tests {
 
     fn declared(trace: &Trace) -> (Vec<u8>, u64) {
         let le = |words: &[u64]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
-        let wide = |column: &[Fingerprint]| column.iter().flat_map(|f| f.0.to_le_bytes()).collect::<Vec<u8>>();
-        let narrow = |column: &[u32]| column.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let wide = |column: &[Fingerprint]| {
+            column.iter().flat_map(|f| f.0.to_le_bytes()).collect::<Vec<u8>>()
+        };
+        let narrow =
+            |column: &[u32]| column.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
         let kinds: Vec<u8> = trace.keys.iter().flat_map(|k| k.kind.0.to_le_bytes()).collect();
         let inputs: Vec<u8> = trace.keys.iter().flat_map(|k| k.input.0).collect();
         let (has, ran) = (le(super::words(&trace.has)), le(super::words(&trace.ran)));
@@ -420,19 +470,24 @@ pub(crate) mod tests {
     fn a_trace_is_written_with_one_buffer_and_read_with_none() {
         let trace = seeded(12, 2000, 6000);
         let bytes = blaze_protocol::cbor::to_vec(&trace).unwrap();
-        let (mut writer, mut out) = (blaze_protocol::cbor::Writer::new(), Vec::with_capacity(bytes.len()));
+        let (mut writer, mut out) =
+            (blaze_protocol::cbor::Writer::new(), Vec::with_capacity(bytes.len()));
         blaze_alloc_count::assert_at_most(1, "a trace written: its one column buffer", || {
             writer.append(&mut out, &trace).unwrap()
         });
         assert_eq!(out, bytes);
         View::parse(&bytes).unwrap();
-        let view = blaze_alloc_count::assert_at_most(0, "a trace parsed and checked in place, one piece", || {
-            View::parse(&bytes).unwrap()
-        });
+        let view = blaze_alloc_count::assert_at_most(
+            0,
+            "a trace parsed and checked in place, one piece",
+            || View::parse(&bytes).unwrap(),
+        );
         assert_eq!(view.keys(), trace.keys());
-        let owned = blaze_alloc_count::assert_at_most(8, "a trace copied out: one allocation a column", || {
-            view.to_trace()
-        });
+        let owned = blaze_alloc_count::assert_at_most(
+            8,
+            "a trace copied out: one allocation a column",
+            || view.to_trace(),
+        );
         assert_eq!(owned, trace);
     }
 

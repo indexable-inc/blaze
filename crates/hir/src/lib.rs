@@ -56,7 +56,6 @@ use std::{
 use arrayvec::ArrayVec;
 use base_db::{CrateDisplayName, CrateOrigin, Db, LangCrateOrigin, TargetKind, all_crates};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_hashcons::Interned;
 use either::Either;
 use hir_def::{
@@ -119,6 +118,7 @@ use rustc_type_ir::{
     inherent::{AdtDef as _, GenericArgs as _, IntoKind, SliceLike, Term as _, Ty as _},
 };
 use span::{AstIdNode, Edition, FileId};
+use std::alloc::Global;
 use stdx::{format_to, impl_from, never};
 use syntax::{
     AstNode, AstPtr, SmolStr, SyntaxNode, TextRange, ToSmolStr,
@@ -165,7 +165,6 @@ pub use crate::{
     attrs::{AttrsOwner, AttrsWithOwner, HasAttrs, resolve_doc_path_on},
     body_analysis::BodyAnalysis,
     diagnostics::*,
-    source_analyzer::NotInAstIdMap,
     match_lints::{
         BindingOrigin, BindingWithVariantName, ConstPatternError, IrrefutableLet, LetSource,
         ManualPartialEq, MatchLint, NonContiguousRangeEndpoints, OverlappingRangeEndpoints,
@@ -177,6 +176,7 @@ pub use crate::{
         VisibleTraits,
         view::{self, FieldSourceView, LocalSourceView, ModuleSourceView},
     },
+    source_analyzer::NotInAstIdMap,
 };
 
 // Be careful with these re-exports.
@@ -327,10 +327,7 @@ impl Crate {
             .collect() // alloc: editor edge, once per request
     }
 
-    pub fn transitive_reverse_dependencies(
-        self,
-        db: &Db,
-    ) -> impl Iterator<Item = Crate> {
+    pub fn transitive_reverse_dependencies(self, db: &Db) -> impl Iterator<Item = Crate> {
         self.id.transitive_rev_deps(db).iter().map(|&id| Crate { id })
     }
 
@@ -412,15 +409,13 @@ impl Crate {
             }
         });
         crate::scratch::give_importables_seen(seen);
-        crate::scratch::LentCopied::new(found).map(
-            |(item, do_not_complete)| {
-                let item = match ItemInNs::from(item) {
-                    ItemInNs::Types(mod_id) | ItemInNs::Values(mod_id) => Either::Left(mod_id),
-                    ItemInNs::Macros(mac_id) => Either::Right(mac_id),
-                };
-                (item, do_not_complete)
-            },
-        )
+        crate::scratch::LentCopied::new(found).map(|(item, do_not_complete)| {
+            let item = match ItemInNs::from(item) {
+                ItemInNs::Types(mod_id) | ItemInNs::Values(mod_id) => Either::Left(mod_id),
+                ItemInNs::Macros(mac_id) => Either::Right(mac_id),
+            };
+            (item, do_not_complete)
+        })
     }
 
     pub fn all(db: &Db) -> Vec<Crate> {
@@ -526,10 +521,7 @@ impl ModuleDef {
         Some(segments.map(|it| it.display(db, edition).to_string()).join("::"))
     }
 
-    pub fn canonical_module_path(
-        &self,
-        db: &Db,
-    ) -> Option<impl Iterator<Item = Module>> {
+    pub fn canonical_module_path(&self, db: &Db) -> Option<impl Iterator<Item = Module>> {
         self.module(db).map(|it| it.path_to_root(db).into_iter().rev())
     }
 
@@ -772,11 +764,7 @@ impl Module {
     }
 
     /// Returns a `ModuleScope`: a set of items, visible in this module.
-    pub fn scope(
-        self,
-        db: &Db,
-        visible_from: Option<Module>,
-    ) -> Vec<(Name, ScopeDef<'_>)> {
+    pub fn scope(self, db: &Db, visible_from: Option<Module>) -> Vec<(Name, ScopeDef<'_>)> {
         self.id
             .def_map(db)
             .module(db, self.id)
@@ -1493,10 +1481,7 @@ impl<'db> AnonConst<'db> {
         Type { owner: TypeOwnerId::from_anon_const(self.id, db), ty: loc.ty.get() }
     }
 
-    pub fn eval(
-        self,
-        db: &'db Db,
-    ) -> Result<EvaluatedConst<'db>, ConstEvalError<'db>> {
+    pub fn eval(self, db: &'db Db) -> Result<EvaluatedConst<'db>, ConstEvalError<'db>> {
         let ty = self.id.loc(db).ty.get().instantiate_identity().skip_norm_wip();
         db.anon_const_eval(self.id, GenericArgs::empty(), None).map(|it| EvaluatedConst {
             allocation: it,
@@ -1629,10 +1614,7 @@ impl DefWithBody {
     }
 
     /// Returns an iterator over the inferred types of all expressions in this body.
-    pub fn expression_types<'db>(
-        self,
-        db: &'db Db,
-    ) -> impl Iterator<Item = Type<'db>> {
+    pub fn expression_types<'db>(self, db: &'db Db) -> impl Iterator<Item = Type<'db>> {
         self.id().into_iter().flat_map(move |def_id| {
             let infer = InferenceResult::of(db, def_id);
             let def_id = def_id.generic_def(db);
@@ -1846,7 +1828,11 @@ impl Function {
                 let found = self.signature(db)?.sig.output();
                 ImplTraitInTraitError::ReturnType {
                     trait_method,
-                    expected: ty(hir_ty::rpitit::rpitits_unknown(interner, trait_fn, expected.output())),
+                    expected: ty(hir_ty::rpitit::rpitits_unknown(
+                        interner,
+                        trait_fn,
+                        expected.output(),
+                    )),
                     found: ty(found),
                 }
             }
@@ -1858,7 +1844,10 @@ impl Function {
                     .map(|(&impl_trait, clause)| {
                         let clause = rustc_type_ir::set_aliases_to_non_rigid(interner, clause)
                             .skip_normalization();
-                        (impl_trait, WherePredicate { clause, owner: TypeOwnerId::GenericDefId(owner) })
+                        (
+                            impl_trait,
+                            WherePredicate { clause, owner: TypeOwnerId::GenericDefId(owner) },
+                        )
                     })
                     .collect(), // alloc: error path, a reported error's bounds
             },
@@ -2275,8 +2264,8 @@ impl<'db> Param<'db> {
                         parent_infer: parent.into(),
                         binding_id: self_param.user_written,
                     })
-                } else if let Pat::Bind { id, .. } =
-                    body.pat(body.params[self.idx - body.self_param.is_some() as usize].user_written)
+                } else if let Pat::Bind { id, .. } = body
+                    .pat(body.params[self.idx - body.self_param.is_some() as usize].user_written)
                 {
                     Some(Local {
                         parent: parent.into(),
@@ -2572,11 +2561,12 @@ impl Trait {
     }
 
     pub fn function(self, db: &Db, name: &impl PartialEq<Name>) -> Option<Function> {
-        self.id.trait_items(db).items.iter().find(|(n, _)| *name == *n).and_then(|&(_, it)| match it
-        {
-            AssocItemId::FunctionId(id) => Some(id.into()),
-            _ => None,
-        })
+        self.id.trait_items(db).items.iter().find(|(n, _)| *name == *n).and_then(
+            |&(_, it)| match it {
+                AssocItemId::FunctionId(id) => Some(id.into()),
+                _ => None,
+            },
+        )
     }
 
     pub fn items(self, db: &Db) -> Vec<AssocItem> {
@@ -2609,11 +2599,7 @@ impl Trait {
         TraitSignature::of(db, self.id).flags.contains(TraitFlags::DENY_EXPLICIT_IMPL)
     }
 
-    pub fn type_or_const_param_count(
-        &self,
-        db: &Db,
-        count_required_only: bool,
-    ) -> usize {
+    pub fn type_or_const_param_count(&self, db: &Db, count_required_only: bool) -> usize {
         GenericParams::of(db,self.id.into())
             .iter_type_or_consts()
             .filter(|(_, ty)| !matches!(ty, TypeOrConstParamData::TypeParamData(ty) if ty.provenance != TypeParamProvenance::TypeParamList))
@@ -3436,8 +3422,9 @@ impl GenericDef {
         GenericPredicates::query_own_explicit(db, id)
             .iter_identity()
             .map(|clause| {
-                let clause = rustc_type_ir::set_aliases_to_non_rigid(interner, clause.skip_norm_wip())
-                    .skip_normalization();
+                let clause =
+                    rustc_type_ir::set_aliases_to_non_rigid(interner, clause.skip_norm_wip())
+                        .skip_normalization();
                 WherePredicate { clause, owner }
             })
             .collect() // alloc: editor edge, the owned predicate list callers take
@@ -3498,10 +3485,7 @@ impl<'db> GenericSubstitution<'db> {
         }
     }
 
-    fn types_impl(
-        &self,
-        db: &'db Db,
-    ) -> impl Iterator<Item = (Ty<'db>, Option<Name>)> {
+    fn types_impl(&self, db: &'db Db) -> impl Iterator<Item = (Ty<'db>, Option<Name>)> {
         let container = match self.def {
             GenericDefId::ConstId(id) => Some(id.lookup(db).container),
             GenericDefId::FunctionId(id) => Some(id.lookup(db).container),
@@ -3612,7 +3596,6 @@ impl<'db> Local<'db> {
         let ty = infer.binding_ty(self.binding_id);
         Type::new_body(db, def, ty)
     }
-
 }
 
 impl PartialOrd for Local<'_> {
@@ -4067,12 +4050,9 @@ impl Impl {
             Either::Left(impls) => result.extend(impls.iter().copied().map(Impl::from)),
             Either::Right(impls) => result.extend(impls.iter().copied().map(Impl::from)),
         };
-        method_resolution::with_incoherent_inherent_impls(
-            db,
-            krate.id,
-            &simplified_ty,
-            |impls| extend_with_impls(Either::Left(impls)),
-        );
+        method_resolution::with_incoherent_inherent_impls(db, krate.id, &simplified_ty, |impls| {
+            extend_with_impls(Either::Left(impls))
+        });
         if let Some(module) = method_resolution::simplified_type_module(db, &simplified_ty) {
             InherentImpls::for_each_crate_and_block(
                 db,
@@ -4180,13 +4160,13 @@ impl Impl {
             AnyImplId::ImplId(id) => {
                 Either::Left(id.impl_items(db).items.iter().map(|&(_, it)| it.into()))
             }
-            AnyImplId::BuiltinDeriveImplId(impl_) => Either::Right(
-                impl_.loc(db).trait_.all_methods().iter().map(move |&method| {
+            AnyImplId::BuiltinDeriveImplId(impl_) => {
+                Either::Right(impl_.loc(db).trait_.all_methods().iter().map(move |&method| {
                     AssocItem::Function(Function {
                         id: AnyFunctionId::BuiltinDeriveImplMethod { method, impl_ },
                     })
-                }),
-            ),
+                }))
+            }
         }
     }
 
@@ -4230,7 +4210,9 @@ pub struct TraitBound<'db> {
 
 impl<'db> TraitBound<'db> {
     fn new(interner: DbInterner<'db>, bound: hir_ty::next_solver::PolyTraitRef<'db>) -> Self {
-        Self { bound: rustc_type_ir::set_aliases_to_non_rigid(interner, bound).skip_normalization() }
+        Self {
+            bound: rustc_type_ir::set_aliases_to_non_rigid(interner, bound).skip_normalization(),
+        }
     }
 
     pub fn trait_(&self) -> Trait {
@@ -4470,10 +4452,7 @@ impl<'db> Coroutine<'db> {
     }
 }
 
-fn captured_items<'db>(
-    db: &'db Db,
-    closure: InternedClosure<'db>,
-) -> Vec<ClosureCapture<'db>> {
+fn captured_items<'db>(db: &'db Db, closure: InternedClosure<'db>) -> Vec<ClosureCapture<'db>> {
     let InternedClosure { owner: infer_owner, expr: closure, .. } = closure;
     let infer = InferenceResult::of(db, infer_owner);
     let owner = infer_owner.expression_store_owner(db);
@@ -4506,9 +4485,11 @@ impl<'db> ClosureCapture<'db> {
 
     /// Returns whether this place has any field (aka. non-deref) projections.
     pub fn has_field_projections(&self) -> bool {
-        self.capture.place.projections.iter().any(|proj| {
-            matches!(proj.kind, hir_ty::closure_analysis::ProjectionKind::Field { .. })
-        })
+        self.capture
+            .place
+            .projections
+            .iter()
+            .any(|proj| matches!(proj.kind, hir_ty::closure_analysis::ProjectionKind::Field { .. }))
     }
 
     pub fn usages(&self) -> CaptureUsages<'db> {
@@ -4723,12 +4704,7 @@ impl TypeOwnerId {
         self.unify(other).expect("failed to unify type owners")
     }
 
-    fn can_rebase_into(
-        self,
-        db: &Db,
-        rebase_into: Self,
-        self_ty: EarlyBinder<'_, Ty<'_>>,
-    ) -> bool {
+    fn can_rebase_into(self, db: &Db, rebase_into: Self, self_ty: EarlyBinder<'_, Ty<'_>>) -> bool {
         if self == rebase_into || !self_ty.skip_binder().has_param() {
             return true;
         }
@@ -4944,11 +4920,7 @@ impl<'db> Type<'db> {
     ///
     ///  - The type does not reference generic parameters, or
     ///  - `rebase_into` is in the context of a child of our context (for example, a function in an impl).
-    pub fn try_rebase_into(
-        &self,
-        db: &'db Db,
-        rebase_into: &Type<'db>,
-    ) -> Option<Self> {
+    pub fn try_rebase_into(&self, db: &'db Db, rebase_into: &Type<'db>) -> Option<Self> {
         if self.owner.can_rebase_into(db, rebase_into.owner, self.ty) {
             Some(Type { owner: rebase_into.owner, ty: self.ty })
         } else {
@@ -4958,19 +4930,11 @@ impl<'db> Type<'db> {
 
     /// If `self` can be rebased into `rebase_into`, returns that. Otherwise, instantiates `self` with errors
     /// and returns that.
-    pub fn rebase_into_or_error(
-        &self,
-        db: &'db Db,
-        rebase_into: &Type<'db>,
-    ) -> Type<'db> {
+    pub fn rebase_into_or_error(&self, db: &'db Db, rebase_into: &Type<'db>) -> Type<'db> {
         self.try_rebase_into(db, rebase_into).unwrap_or_else(|| self.instantiate_with_errors(db))
     }
 
-    pub fn try_rebase_into_owner(
-        &self,
-        db: &'db Db,
-        new_owner: GenericDef,
-    ) -> Option<Self> {
+    pub fn try_rebase_into_owner(&self, db: &'db Db, new_owner: GenericDef) -> Option<Self> {
         let new_owner = new_owner.id()?.into();
         if self.owner.can_rebase_into(db, new_owner, self.ty) {
             Some(Type { owner: new_owner, ty: self.ty })
@@ -4979,12 +4943,9 @@ impl<'db> Type<'db> {
         }
     }
 
-    pub fn rebase_into_owner_or_error(
-        &self,
-        db: &'db Db,
-        new_owner: GenericDef,
-    ) -> Self {
-        self.try_rebase_into_owner(db, new_owner).unwrap_or_else(|| self.instantiate_with_errors(db))
+    pub fn rebase_into_owner_or_error(&self, db: &'db Db, new_owner: GenericDef) -> Self {
+        self.try_rebase_into_owner(db, new_owner)
+            .unwrap_or_else(|| self.instantiate_with_errors(db))
     }
 
     pub fn unknown(db: &'db Db) -> Self {
@@ -4997,10 +4958,7 @@ impl<'db> Type<'db> {
         Type { owner: ty.owner, ty: ty.ty.map_bound(|ty| Ty::new_slice(interner, ty)) }
     }
 
-    pub fn new_tuple(
-        db: &'db Db,
-        tys: impl IntoIterator<Item: Borrow<Type<'db>>>,
-    ) -> Self {
+    pub fn new_tuple(db: &'db Db, tys: impl IntoIterator<Item: Borrow<Type<'db>>>) -> Self {
         let interner = DbInterner::new_no_crate(db);
         let mut owner = None::<TypeOwnerId>;
         let ty = Ty::new_tup_from_iter(
@@ -5122,7 +5080,10 @@ impl<'db> Type<'db> {
         let interner = DbInterner::new_no_crate(db);
         let ty_mutability = hir_ty::lower_mutability(mutability);
         let region = Region::new_erased(interner);
-        self.derived_with(interner, Ty::new_ref(interner, region, self.ty.skip_binder(), ty_mutability))
+        self.derived_with(
+            interner,
+            Ty::new_ref(interner, region, self.ty.skip_binder(), ty_mutability),
+        )
     }
 
     pub fn is_slice(&self) -> bool {
@@ -5199,9 +5160,7 @@ impl<'db> Type<'db> {
                     _ => None,
                 };
                 let param_env = match body {
-                    Some(body) => {
-                        hir_ty::comptime_env::owner_param_env(db, body.into(), param_env)
-                    }
+                    Some(body) => hir_ty::comptime_env::owner_param_env(db, body.into(), param_env),
                     None => param_env,
                 };
                 ParamEnvAndCrate { param_env, krate }
@@ -5353,12 +5312,7 @@ impl<'db> Type<'db> {
     ///
     /// Unlike almost anything that takes more than one type, you *can* pass types from different origins
     /// to this function.
-    pub fn has_any_impl(
-        &self,
-        db: &'db Db,
-        trait_: Trait,
-        args: &[Type<'db>],
-    ) -> bool {
+    pub fn has_any_impl(&self, db: &'db Db, trait_: Trait, args: &[Type<'db>]) -> bool {
         let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: self.krate(db) };
         traits::implements_trait_unique_with_infcx(db, env, trait_.id, |infcx| {
             let mut args = Self::instantiate_many_with_infer(iter::once(self).chain(args), infcx);
@@ -5630,11 +5584,7 @@ impl<'db> Type<'db> {
 
     /// [`Type::fields`] of `variant` of this enum type, its fields typed with this type's
     /// arguments. Empty when this is not the enum `variant` belongs to.
-    pub fn variant_fields(
-        &self,
-        db: &'db Db,
-        variant: EnumVariant,
-    ) -> Vec<(Field, Self)> {
+    pub fn variant_fields(&self, db: &'db Db, variant: EnumVariant) -> Vec<(Field, Self)> {
         let interner = DbInterner::new_no_crate(db);
         let TyKind::Adt(adt_def, substs) = self.ty.skip_binder().kind() else {
             return Vec::new(); // alloc: empty
@@ -5686,10 +5636,7 @@ impl<'db> Type<'db> {
     }
 
     // FIXME: We should probably remove this.
-    pub fn fingerprint_for_trait_impl(
-        &self,
-        db: &'db Db,
-    ) -> Option<SimplifiedType<'db>> {
+    pub fn fingerprint_for_trait_impl(&self, db: &'db Db) -> Option<SimplifiedType<'db>> {
         fast_reject::simplify_type(
             DbInterner::new_no_crate(db),
             self.ty.skip_binder(),
@@ -5699,10 +5646,7 @@ impl<'db> Type<'db> {
 
     /// Returns types that this type dereferences to (including this type itself). The returned
     /// iterator won't yield the same type more than once even if the deref chain contains a cycle.
-    pub fn autoderef(
-        &self,
-        db: &'db Db,
-    ) -> impl Iterator<Item = Type<'db>> + use<'_, 'db> {
+    pub fn autoderef(&self, db: &'db Db) -> impl Iterator<Item = Type<'db>> + use<'_, 'db> {
         let interner = DbInterner::new_no_crate(db);
         self.autoderef_(db).map(move |ty| self.derived_with(interner, ty))
     }
@@ -5730,11 +5674,7 @@ impl<'db> Type<'db> {
         slot
     }
 
-    fn iterate_assoc_item_ids(
-        &self,
-        db: &'db Db,
-        callback: &mut impl FnMut(AssocItemId) -> bool,
-    ) {
+    fn iterate_assoc_item_ids(&self, db: &'db Db, callback: &mut impl FnMut(AssocItemId) -> bool) {
         let mut handle_impls = |impls: &[ImplId]| {
             for &impl_def in impls {
                 for &(_, item) in impl_def.impl_items(db).items.iter() {
@@ -5867,7 +5807,8 @@ impl<'db> Type<'db> {
         name: Option<&Name>,
         mut callback: impl FnMut(Function) -> Option<T>,
     ) -> Option<T> {
-        let _p = tracing::info_span!(target: "blaze", "iterate_method_candidates_with_traits").entered();
+        let _p =
+            tracing::info_span!(target: "blaze", "iterate_method_candidates_with_traits").entered();
         let mut slot = None;
         self.iterate_method_candidates_split_inherent(db, scope, traits_in_scope, name, |f| {
             match callback(f) {
@@ -5966,11 +5907,7 @@ impl<'db> Type<'db> {
 
             match name {
                 Some(name) => {
-                    match ctx.probe_for_name(
-                        method_resolution::Mode::MethodCall,
-                        *name,
-                        self_ty,
-                    ) {
+                    match ctx.probe_for_name(method_resolution::Mode::MethodCall, *name, self_ty) {
                         Ok(candidate)
                         | Err(method_resolution::MethodError::PrivateMatch(candidate)) => {
                             let method_resolution::CandidateId::FunctionId(id) = candidate.item
@@ -6142,10 +6079,7 @@ impl<'db> Type<'db> {
 
     /// If a type can be represented as `dyn Trait`, returns all traits accessible via this type,
     /// or an empty iterator otherwise.
-    pub fn applicable_inherent_traits(
-        &self,
-        db: &'db Db,
-    ) -> impl Iterator<Item = Trait> {
+    pub fn applicable_inherent_traits(&self, db: &'db Db) -> impl Iterator<Item = Trait> {
         let _p = tracing::info_span!(target: "blaze", "applicable_inherent_traits").entered();
         self.autoderef_(db)
             .filter_map(|ty| ty.dyn_trait())
@@ -6562,18 +6496,16 @@ impl<'db> Layout<'db> {
                 let size = field_size(0)?;
                 stride.bytes().checked_sub(size)
             }
-            layout::FieldsShape::Arbitrary { ref offsets, ref in_memory_order } => {
-                in_memory_order
-                    .iter()
-                    .map(|src| (src.0.into_raw().into_u32() as usize, offsets[*src].bytes()))
-                    .chain(iter::once((0, self.0.size.bytes())))
-                    .array_windows()
-                    .filter_map(|[(i, start), (_, end)]| {
-                        let size = field_size(i)?;
-                        end.checked_sub(start)?.checked_sub(size)
-                    })
-                    .max()
-            }
+            layout::FieldsShape::Arbitrary { ref offsets, ref in_memory_order } => in_memory_order
+                .iter()
+                .map(|src| (src.0.into_raw().into_u32() as usize, offsets[*src].bytes()))
+                .chain(iter::once((0, self.0.size.bytes())))
+                .array_windows()
+                .filter_map(|[(i, start), (_, end)]| {
+                    let size = field_size(i)?;
+                    end.checked_sub(start)?.checked_sub(size)
+                })
+                .max(),
         }
     }
 
@@ -6594,9 +6526,7 @@ impl<'db> Layout<'db> {
     /// `TagEncoding::Direct`): the tag's size and each variant's size, in bytes, in declaration
     /// order (rustc's `variants[i].size`, tag included, as `variant_size_differences` reads
     /// them). `None` for a niche-encoded enum or any layout with one variant.
-    pub fn direct_tag_variant_sizes(
-        &self,
-    ) -> Option<(u64, impl ExactSizeIterator<Item = u64>)> {
+    pub fn direct_tag_variant_sizes(&self) -> Option<(u64, impl ExactSizeIterator<Item = u64>)> {
         let layout::Variants::Multiple { tag, tag_encoding: TagEncoding::Direct, variants, .. } =
             &self.0.variants
         else {
@@ -6898,7 +6828,12 @@ pub enum ImplTraitInTraitError<'db> {
     /// rustc's "return type captures more lifetimes than trait definition": the impl's type
     /// `hidden` for the `impl_trait`th `impl Trait` names the lifetime `lifetime` (its name as
     /// written, `'_` for one left out), which the trait's does not capture.
-    UncapturedLifetime { trait_method: Function, impl_trait: u32, lifetime: Box<str>, hidden: Type<'db> },
+    UncapturedLifetime {
+        trait_method: Function,
+        impl_trait: u32,
+        lifetime: Box<str>,
+        hidden: Type<'db>,
+    },
     /// The type of the `impl_trait`th `impl Trait`, in the bounds of another, can't be worked
     /// out: those bounds stay ambiguous with the outer one's type (rustc's E0283 or E0284).
     Unsolved { trait_method: Function, impl_trait: u32 },

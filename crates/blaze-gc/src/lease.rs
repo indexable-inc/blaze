@@ -91,7 +91,10 @@ pub enum Wait {
 impl std::fmt::Display for Wait {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Wait::Busy => write!(f, "its lease is held exclusively (blaze's collector or `blaze clean` renaming it)"),
+            Wait::Busy => write!(
+                f,
+                "its lease is held exclusively (blaze's collector or `blaze clean` renaming it)"
+            ),
             Wait::Short => write!(
                 f,
                 "its lease file holds no whole nonce (its maker is writing it, or died before it did, and it is rewritten only {ABANDONED:?} after it was last written)"
@@ -199,7 +202,8 @@ impl Lease {
         // once abandoned (review N8), never counted against the attempts.
         let mut short = None;
         while attempts < ATTEMPTS {
-            std::fs::create_dir_all(dir).map_err(|error| format!("making {}: {error}", dir.display()))?;
+            std::fs::create_dir_all(dir)
+                .map_err(|error| format!("making {}: {error}", dir.display()))?;
             let Some(file) = open_or_make(dir)? else {
                 attempts += 1;
                 continue;
@@ -237,7 +241,8 @@ impl Lease {
             USED.push(dir.to_path_buf());
         }
         for _ in 0..ATTEMPTS {
-            std::fs::create_dir_all(dir).map_err(|error| format!("making {}: {error}", dir.display()))?;
+            std::fs::create_dir_all(dir)
+                .map_err(|error| format!("making {}: {error}", dir.display()))?;
             let Some(file) = open_or_make(dir)? else { continue };
             let mut file = match Locked::try_lock_shared(file) {
                 Ok(Ok(file)) => file,
@@ -283,9 +288,13 @@ impl Drop for Lease {
 /// while it waited, the file stopped being `dir`'s lease (the collector renamed the directory),
 /// so the caller makes it afresh rather than wait out the bound. For a thread that may wait (the
 /// daemon's start); a pool thread takes [`Lease::try_hold`].
-#[allow(clippy::disallowed_methods, reason = "a bounded wait on another process's lock, which has no wake to park on")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a bounded wait on another process's lock, which has no wake to park on"
+)]
 fn lock_shared(mut file: File, dir: &Path) -> Result<Option<Locked>, String> {
-    let _span = tracing::info_span!(target: "blaze", "waits on the gc lease", dir = %dir.display()).entered();
+    let _span = tracing::info_span!(target: "blaze", "waits on the gc lease", dir = %dir.display())
+        .entered();
     let until = Instant::now() + SHARED_WAIT;
     let mut spin = blaze_spin::SpinWait::new();
     loop {
@@ -313,12 +322,24 @@ fn lock_shared(mut file: File, dir: &Path) -> Result<Option<Locked>, String> {
 /// Waits a little for `dir`'s lease file to hold a whole nonce, `since` when it was first seen
 /// without one; past [`GIVE_WAY`] an error naming the directory and the state. For a thread that
 /// may wait ([`Lease::hold`], the daemon's start).
-#[allow(clippy::disallowed_methods, reason = "a bounded wait on another process's write, which has no wake to park on")]
-fn wait_whole(dir: &Path, since: &mut Option<(Instant, blaze_spin::SpinWait)>) -> Result<(), String> {
-    let _span = tracing::info_span!(target: "blaze", "waits on a lease file's nonce", dir = %dir.display()).entered();
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a bounded wait on another process's write, which has no wake to park on"
+)]
+fn wait_whole(
+    dir: &Path,
+    since: &mut Option<(Instant, blaze_spin::SpinWait)>,
+) -> Result<(), String> {
+    let _span =
+        tracing::info_span!(target: "blaze", "waits on a lease file's nonce", dir = %dir.display())
+            .entered();
     let (first, spin) = since.get_or_insert_with(|| (Instant::now(), blaze_spin::SpinWait::new()));
     if first.elapsed() >= GIVE_WAY {
-        return Err(format!("{}'s lease was not taken in {GIVE_WAY:?}: {}", dir.display(), Wait::Short));
+        return Err(format!(
+            "{}'s lease was not taken in {GIVE_WAY:?}: {}",
+            dir.display(),
+            Wait::Short
+        ));
     }
     if !spin.spin() {
         *spin = blaze_spin::SpinWait::new();
@@ -416,7 +437,9 @@ fn same_file(file: &File, dir: &Path) -> Result<bool, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        let held = file.metadata().map_err(|error| format!("reading {}: {error}", lease_of(dir).display()))?;
+        let held = file
+            .metadata()
+            .map_err(|error| format!("reading {}: {error}", lease_of(dir).display()))?;
         Ok(held.dev() == there.dev() && held.ino() == there.ino())
     }
     #[cfg(not(unix))]

@@ -45,7 +45,14 @@ impl DiagnosticHost for Cx<'_, '_> {
     /// parameters or return type; all of an `async` or `gen` block. The coroutine of an
     /// `async` closure's body has the closure's: it has no syntax of its own, and is the body
     /// of the closure.
-    fn closure_span(&self, owner: ExpressionStoreOwnerId, expr: ExprId, kind: ClosureKind, short: bool, out: &mut String) {
+    fn closure_span(
+        &self,
+        owner: ExpressionStoreOwnerId,
+        expr: ExprId,
+        kind: ClosureKind,
+        short: bool,
+        out: &mut String,
+    ) {
         let db = self.db;
         let (store, map) = ExpressionStore::with_source_map(db, owner);
         let src = map
@@ -61,10 +68,14 @@ impl DiagnosticHost for Cx<'_, '_> {
                 _ => Err(err),
             })
             .unwrap_or_else(|_| {
-                panic!("the closure-like expression {expr:?} of {owner:?} (of {:?}) has no syntax", owner.krate(db))
+                panic!(
+                    "the closure-like expression {expr:?} of {owner:?} (of {:?}) has no syntax",
+                    owner.krate(db)
+                )
             });
         let node = self.node_view(src);
-        let span = self.span(node.with_value(crate::cx::closure_decl_range_view(node.value.syntax())));
+        let span =
+            self.span(node.with_value(crate::cx::closure_decl_range_view(node.value.syntax())));
         let file = self.file_of(&span).expect("a span the context made");
         let text = self.file_text(file);
         let (lo_line, lo_col) = line_col(text, span.lo);
@@ -73,15 +84,16 @@ impl DiagnosticHost for Cx<'_, '_> {
             write!(out, "{name}:{lo_line}:{lo_col}").expect("a `String` takes every write");
         } else {
             let (hi_line, hi_col) = line_col(text, span.hi);
-            write!(out, "{}:{lo_line}:{lo_col}: {hi_line}:{hi_col}", span.file).expect("a `String` takes every write");
+            write!(out, "{}:{lo_line}:{lo_col}: {hi_line}:{hi_col}", span.file)
+                .expect("a `String` takes every write");
         }
     }
 
     fn anon_const_text(&self, owner: ExpressionStoreOwnerId, expr: ExprId, out: &mut String) {
         let (_, map) = ExpressionStore::with_source_map(self.db, owner);
-        let src = map
-            .expr_syntax(expr)
-            .unwrap_or_else(|_| panic!("the anonymous constant {expr:?} of {owner:?} is not written"));
+        let src = map.expr_syntax(expr).unwrap_or_else(|_| {
+            panic!("the anonymous constant {expr:?} of {owner:?} is not written")
+        });
         let span = self.span(src.map(|it| it.text_range()));
         out.push_str(self.snippet(&span).expect("a span the context made is in its file"));
     }
