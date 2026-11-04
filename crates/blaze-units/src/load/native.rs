@@ -23,7 +23,7 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use blaze_manifest::Files;
+use blaze_manifest::files::Files;
 use serde::Deserialize;
 
 use crate::query::{LoadError, NativeInput};

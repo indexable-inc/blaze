@@ -10,7 +10,11 @@
 //! stops naming the flags. `run`, `minimize` and `seeds` work in any build, and each target's
 //! `#[test]` runs its seeds in a plain one.
 
-#![feature(core_intrinsics, sanitize)]
+// `cfg_sanitize`: raw.rs writes `sanitize(address = "off")` under `cfg(sanitize = "address")`,
+// the one build it does anything in, so the stage 0 blaze (0.20261030), whose check knows only
+// the removed `no_sanitize`, never sees it. Go back to the bare attribute once the pinned
+// release's check is the v2 front end (crates/hir-expand/src/inert_attr_macro.rs has it).
+#![feature(core_intrinsics, sanitize, cfg_sanitize)]
 #![allow(internal_features)]
 #![deny(unsafe_code)]
 // A command-line tool: it reports on stderr.

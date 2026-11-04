@@ -151,7 +151,7 @@ fn caller() -> u64 {
 macro_rules! compares {
     ($($name:ident($ty:ty) $width:literal;)*) => {$(
         #[unsafe(no_mangle)]
-        #[sanitize(address = "off")]
+        #[cfg_attr(sanitize = "address", sanitize(address = "off"))]
         pub(crate) extern "C" fn $name(a: $ty, b: $ty) {
             distance(caller(), a as u64, b as u64);
             recent(a as u64, b as u64, $width);
@@ -171,38 +171,38 @@ compares! {
 // One byte is no word for the dictionary: the value profile alone.
 
 #[unsafe(no_mangle)]
-#[sanitize(address = "off")]
+#[cfg_attr(sanitize = "address", sanitize(address = "off"))]
 pub(crate) extern "C" fn __sanitizer_cov_trace_cmp1(a: u8, b: u8) {
     distance(caller(), a as u64, b as u64);
 }
 
 #[unsafe(no_mangle)]
-#[sanitize(address = "off")]
+#[cfg_attr(sanitize = "address", sanitize(address = "off"))]
 pub(crate) extern "C" fn __sanitizer_cov_trace_const_cmp1(a: u8, b: u8) {
     distance(caller(), a as u64, b as u64);
 }
 
 #[unsafe(no_mangle)]
-#[sanitize(address = "off")]
+#[cfg_attr(sanitize = "address", sanitize(address = "off"))]
 pub(crate) extern "C" fn __sanitizer_cov_trace_div4(divisor: u32) {
     distance(caller(), divisor as u64, 0);
 }
 
 #[unsafe(no_mangle)]
-#[sanitize(address = "off")]
+#[cfg_attr(sanitize = "address", sanitize(address = "off"))]
 pub(crate) extern "C" fn __sanitizer_cov_trace_div8(divisor: u64) {
     distance(caller(), divisor, 0);
 }
 
 #[unsafe(no_mangle)]
-#[sanitize(address = "off")]
+#[cfg_attr(sanitize = "address", sanitize(address = "off"))]
 pub(crate) extern "C" fn __sanitizer_cov_trace_gep(index: usize) {
     distance(caller(), index as u64, 0);
 }
 
 /// An indirect call: the (caller, callee) pair, as libFuzzer's `HandleCallerCallee`.
 #[unsafe(no_mangle)]
-#[sanitize(address = "off")]
+#[cfg_attr(sanitize = "address", sanitize(address = "off"))]
 pub(crate) extern "C" fn __sanitizer_cov_trace_pc_indir(callee: usize) {
     value(caller().wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ callee as u64);
 }
@@ -210,7 +210,7 @@ pub(crate) extern "C" fn __sanitizer_cov_trace_pc_indir(callee: usize) {
 /// A `switch`: `cases[0]` cases of `cases[1]` bits, then the cases. Not a comparison callback:
 /// the comparisons here call those, which call nothing.
 #[unsafe(no_mangle)]
-#[sanitize(address = "off")]
+#[cfg_attr(sanitize = "address", sanitize(address = "off"))]
 pub(crate) extern "C" fn __sanitizer_cov_trace_switch(val: u64, cases: *const u64) {
     let pc = caller();
     // SAFETY: SanitizerCoverage passes its table of the switch: a count, a width and the count
@@ -236,7 +236,7 @@ pub(crate) extern "C" fn __sanitizer_cov_trace_switch(val: u64, cases: *const u6
 /// What AddressSanitizer's `memcmp` and `bcmp` interceptors tell: the operands of a byte
 /// comparison that differed, for the dictionary, and how long a prefix they share, per site.
 #[unsafe(no_mangle)]
-#[sanitize(address = "off")]
+#[cfg_attr(sanitize = "address", sanitize(address = "off"))]
 pub(crate) extern "C" fn __sanitizer_weak_hook_memcmp(
     caller: *const c_void,
     s1: *const c_void,
@@ -487,7 +487,7 @@ unsafe fn counter_word(start: *const u8, w: usize) -> u64 {
 /// counters are read a cache line at a time, and a line of zeros, most of them, costs two
 /// vector loads and a test.
 #[unsafe(no_mangle)]
-#[sanitize(address = "off")]
+#[cfg_attr(sanitize = "address", sanitize(address = "off"))]
 #[inline(never)]
 fn __sanitizer_blaze_fuzzer_drain(coverage: &Coverage<'_>, features: &mut Vec<u32>, values: bool) {
     let mut snapshot = [0u64; VALUE_WORDS];
@@ -570,7 +570,7 @@ fn clear(module: &Module) {
 
 /// [`Coverage::run`]. Nothing between the clears and the call of `check` is traced.
 #[unsafe(no_mangle)]
-#[sanitize(address = "off")]
+#[cfg_attr(sanitize = "address", sanitize(address = "off"))]
 #[inline(never)]
 fn __sanitizer_blaze_fuzzer_run(coverage: &Coverage<'_>, check: fn(&[u8]), data: &[u8], now: u64) -> bool {
     for module in &coverage.modules {
