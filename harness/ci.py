@@ -120,7 +120,7 @@ HARNESSES = [
     # fails naming it (#730); a program built with #731's unstable rustflags has its edits spliced.
     ("core", ["artifactedits.py"], {}, on("linux", "macos"), 1),
     ("core", ["testselect.py"], {}, on("linux", "macos"), 2),
-    # Each kind of reason a test is not hermetic, told from its code, and pure tests kept by it.
+    # A sandboxed test is kept by what it executed and read; one outside is said and runs every time.
     ("core", ["hermetic.py"], {}, on("linux", "macos"), 2),
     ("core", ["doctestonce.py"], {}, on("linux", "macos"), 1),
     # A lazy static's initializer inlines a dependency's helper, which is then edited.

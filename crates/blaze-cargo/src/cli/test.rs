@@ -370,7 +370,8 @@ const EXECUTABLES: u32 = 1 << 20;
 const UNSEEN: u32 = u32::MAX;
 
 /// `blaze test --reached`: the results the daemon sent, by test executable in the order they
-/// came, as libtest's pretty format prints them; whether every one that ran passed. A test the
+/// came, as libtest's pretty format prints them (with a JSON `--message-format`, a
+/// `blaze-test-result` line each); whether every one that ran passed. A test the
 /// edit did not reach is not run, and is named as such (blaze's word, not libtest's). Last, on
 /// stderr, the tests that ran outside the sandbox (docs/cargo.md: their passes are never kept).
 // dyn: the CLI's output writers, written once per test result printed.
@@ -379,6 +380,27 @@ pub fn reached(results: &[TestResult], speaking: Speaking<'_>, out: &mut dyn Wri
         out.flush()?;
         return Ok(true);
     };
+    // A JSON `--message-format`: each result whole, as the daemon sent it, a
+    // `blaze-test-result` line on stdout among the build's messages (`json::test_result`).
+    if speaking.json {
+        // alloc: one line's buffer, reused, once a request
+        let mut text = String::new();
+        let mut passed_all = true;
+        for result in results {
+            passed_all &= result.outcome != TestOutcome::Failed;
+            text.clear();
+            super::json::test_result(&mut text, result);
+            text.push('\n');
+            out.write_all(text.as_bytes())?;
+        }
+        out.flush()?;
+        if !speaking.quiet {
+            text.clear();
+            outside(&mut text, results, speaking.color);
+            err.write_all(text.as_bytes())?;
+        }
+        return Ok(passed_all);
+    }
     // Each executable's place in the order executables first came, found by the daemon's dense
     // index (`TestResult::executable`) with no hash.
     // alloc: these, `starts`, `next`, `grouped` and `text`, once a request.

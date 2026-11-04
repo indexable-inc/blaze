@@ -763,7 +763,11 @@ run them instead and send each result, which the client prints in libtest's form
   writes on the slot's first call) and, in the sandbox, what it read; a test whose executed
   functions and reads are as they were when it passed is not run, and is reported cached with
   its last pass (`crates/blaze-testsel`). A test that ran outside the sandbox is never kept,
-  and the client names those last, on stderr. The design is
+  and the client names those last, on stderr. With a JSON `--message-format` each result is a
+  `blaze-test-result` line on stdout instead of libtest's text: `name`, `binary`,
+  `executable`, `outcome`, `millis`, `outside`, `output`, and `cached` (null for a test that
+  ran; else the kept run's `basis`, `executed` or `reached`, its `why`, `millis` and
+  `outcome`), as `crates/blaze-cargo/src/cli/json.rs` (`test_result`) writes it. The design is
   [v2/plan/lanes/usercode/tests.md](v2/plan/lanes/usercode/tests.md) and
   [v2/plan/design/compile-time.md](v2/plan/design/compile-time.md), idea 3.
 - `--ub` runs the tests picked (every one, or with `--reached` those it would run) in blaze's
