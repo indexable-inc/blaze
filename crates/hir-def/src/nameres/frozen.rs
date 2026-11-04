@@ -514,7 +514,7 @@ fn holds(bytes: &[u8], part: &[u8]) -> bool {
 }
 
 /// `to` from the directory `from`, with `..` where it is not under it.
-fn relative(from: &str, to: &str) -> String {
+pub(crate) fn relative(from: &str, to: &str) -> String {
     // alloc: encoding, once per crate per image write (not on a build's path)
     let from: Vec<_> = from.split('/').filter(|it| !it.is_empty()).collect();
     // alloc: encoding, once per crate per image write (not on a build's path)
