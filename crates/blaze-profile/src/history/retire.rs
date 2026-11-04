@@ -67,6 +67,11 @@ impl Retired {
         retired
     }
 
+    /// Whether nothing was ever retired: generation 0.
+    pub fn never(&self) -> bool {
+        self.generation == 0 && self.files.is_empty()
+    }
+
     /// Whether `name` is retired and not yet deleted.
     pub fn holds(&self, name: &str) -> bool {
         self.files.iter().any(|(it, _)| it == name)
@@ -74,8 +79,13 @@ impl Retired {
 
     /// The positions in [`Retired::files`] of the files no live pin of `pins` may still read:
     /// retired at a generation every pin has said, or all of them when no reader pins.
+    ///
+    /// A pin that said a generation above the history's holds every file too: it read a history
+    /// before this one's generations (one adopted, [`super::manifest`]), so its number says
+    /// nothing of them.
     pub fn reapable(&self, pins: &[Pinned]) -> Vec<usize> {
-        let oldest = pins.iter().map(|it| it.unwrap_or(0)).min();
+        let oldest =
+            pins.iter().map(|it| it.filter(|&said| said <= self.generation).unwrap_or(0)).min();
         // alloc: once a flush that retired files
         (0..self.files.len()).filter(|&at| oldest.is_none_or(|it| self.files[at].1 <= it)).collect()
     }

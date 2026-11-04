@@ -186,3 +186,25 @@ pub(crate) fn pinned(dir: &Path) -> Result<Vec<Pinned>, HistoryError> {
     }
     Ok(retire::pinned(&live, &said))
 }
+
+/// The highest generation any reader in [`PINS`] of the history `dir` said, live or not (0:
+/// none): where an adopted history's generation starts, so no reader still running took it to
+/// cover files retired after adoption.
+pub(crate) fn said_most(dir: &Path) -> Result<u64, HistoryError> {
+    let pins = dir.join(PINS);
+    let entries = match fs::read_dir(&pins) {
+        Ok(it) => it,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(io_error(&pins, "listing")(error)),
+    };
+    let mut most = 0;
+    for entry in entries {
+        let entry = entry.map_err(io_error(&pins, "listing"))?;
+        if let Some(PinFile::Said { generation, .. }) =
+            entry.file_name().to_str().and_then(PinFile::parse)
+        {
+            most = most.max(generation);
+        }
+    }
+    Ok(most)
+}

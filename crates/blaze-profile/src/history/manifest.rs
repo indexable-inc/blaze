@@ -90,8 +90,9 @@ pub struct Manifest {
     /// table this blaze does not know (a newer blaze's) is kept as written, and read by no view.
     tables: BTreeMap<String, BTreeMap<String, Entry>>,
     /// The history's generation and the files unlisted and not yet deleted
-    /// ([`super::retire`]).
-    #[serde(default)]
+    /// ([`super::retire`]). Left out while nothing was ever retired, so a manifest of a history
+    /// that never merged nor capped reads as it did before retirement.
+    #[serde(default, skip_serializing_if = "Retired::never")]
     retired: Retired,
 }
 
@@ -304,6 +305,12 @@ pub enum ManifestError {
     Unversioned,
     /// Its retired files are not ones a writer retires: `why`.
     Retired(&'static str),
+    /// It would list (or lists) `file`, which it retired and a reader may still read: a file
+    /// put in its place would change under that reader, and a manifest that lists and retires
+    /// one name is no manifest a reader can trust.
+    Relisted {
+        file: String,
+    },
 }
 
 impl fmt::Display for ManifestError {
@@ -330,6 +337,10 @@ impl fmt::Display for ManifestError {
                 "its footer says no `blaze.schema` version: no blaze writer wrote it, so no reader can say what its rows mean (delete it, or the directory)"
             ),
             ManifestError::Retired(why) => write!(f, "what it says is retired can't be: {why}"),
+            ManifestError::Relisted { file } => write!(
+                f,
+                "it would list `{file}`, which it retired and a reader may still be reading: a file written again takes a new name, never a retired one's"
+            ),
         }
     }
 }
@@ -438,7 +449,12 @@ impl Manifest {
     }
 
     /// Lists the file `name`, of a form blaze writes ([`listable`]), with its entry.
+    /// A retired name is [`ManifestError::Relisted`].
     pub(crate) fn insert(&mut self, name: &str, entry: Entry) -> Result<(), ManifestError> {
+        if self.retired.holds(name) {
+            // alloc: an error
+            return Err(ManifestError::Relisted { file: name.to_owned() });
+        }
         let Some(table) = listable(name) else {
             return Err(ManifestError::Entry {
                 // alloc: an error
@@ -492,13 +508,14 @@ impl Manifest {
             return Err(ManifestError::Format(manifest.format));
         }
         manifest.retired.check().map_err(ManifestError::Retired)?;
+        if manifest.retired.files.iter().any(|(it, _)| listable(it).is_none()) {
+            // Never a name of the manifest's own files, nor of a reader's pins: a reap deletes it.
+            return Err(ManifestError::Retired("a retired file is of no form blaze lists"));
+        }
         if let Some((name, _)) = manifest.retired.files.iter().find(|(it, _)| manifest.contains(it))
         {
             // clone: an error
-            return Err(ManifestError::Entry {
-                table: table_of(name).unwrap_or("of none").to_owned(),
-                file: name.clone(),
-            });
+            return Err(ManifestError::Relisted { file: name.clone() });
         }
         for (table, files) in &manifest.tables {
             let known = schema::TABLES.iter().any(|it| it.name == table.as_str());
@@ -596,17 +613,22 @@ pub fn read(dir: &Path) -> Result<Manifest, HistoryError> {
     let path = dir.join(FILE);
     match fs::read(&path) {
         Ok(bytes) => Manifest::decode(&bytes).map_err(|why| HistoryError::Manifest { path, why }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            adopted(dir).map(|(manifest, _)| manifest)
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => adopted(dir),
         Err(error) => Err(io_error(&path, "reading the manifest")(error)),
     }
 }
 
-/// The manifest the files of `dir` make, for a history written before manifests, and the
-/// files it leaves out because a merged file holds their rows. Every Parquet file not hidden
-/// and not a schema file is listed, or is [`HistoryError::Unclassified`].
-fn adopted(dir: &Path) -> Result<(Manifest, Vec<String>), HistoryError> {
+/// The manifest the files of `dir` make, for a history written before manifests. Every Parquet
+/// file not hidden and not a schema file is listed, or is [`HistoryError::Unclassified`],
+/// except the ones that left the history: those [`LEGACY_RETIRED`] names (a blaze of pins with
+/// no manifest retired them; their generations kept), and those a merged file holds the rows
+/// of, retired now. None is deleted here: a reader of a blaze before manifests may have it
+/// pinned, so it waits for a reap like any retired file.
+///
+/// The generation starts at the highest that file or any pin in [`super::PINS`] says, never 0:
+/// a reader still running that said generation 7 holds only files retired after 7, so a file
+/// retired here at 1 would be deleted under it.
+fn adopted(dir: &Path) -> Result<Manifest, HistoryError> {
     // alloc: the directory's files, once a history is adopted
     let mut names: Vec<String> = Vec::new();
     for entry in fs::read_dir(dir).map_err(io_error(dir, "listing"))? {
@@ -636,6 +658,19 @@ fn adopted(dir: &Path) -> Result<(Manifest, Vec<String>), HistoryError> {
         }
     }
     names.sort_unstable();
+    let legacy = legacy_retired(dir)?;
+    // alloc: once a history is adopted
+    let mut retired = Retired {
+        generation: legacy.generation.max(super::pin::said_most(dir)?),
+        files: Vec::new(),
+    };
+    for (name, generation) in legacy.files {
+        // One gone already was reaped before the writer that retired it stopped.
+        if let Ok(at) = names.binary_search(&name) {
+            names.remove(at);
+            retired.files.push((name, generation));
+        }
+    }
     // alloc: once a history is adopted
     let parsed: Vec<(usize, Name)> =
         names.iter().enumerate().filter_map(|(at, it)| Some((at, Name::parse(it)?))).collect();
@@ -645,6 +680,7 @@ fn adopted(dir: &Path) -> Result<(Manifest, Vec<String>), HistoryError> {
     let gone: BTreeSet<usize> =
         super::compact::superseded(&named).into_iter().map(|at| parsed[at].0).collect();
     let mut manifest = Manifest::new();
+    manifest.retired = retired;
     // alloc: once a history is adopted
     let mut superseded = Vec::new();
     for (at, name) in names.into_iter().enumerate() {
@@ -660,7 +696,57 @@ fn adopted(dir: &Path) -> Result<(Manifest, Vec<String>), HistoryError> {
             .insert(&name, entry)
             .map_err(|why| HistoryError::Manifest { path: dir.join(FILE), why })?;
     }
-    Ok((manifest, superseded))
+    manifest.retire(superseded.iter().map(String::as_str));
+    manifest.retired.check().map_err(|why| HistoryError::Manifest {
+        path: dir.join(LEGACY_RETIRED),
+        why: ManifestError::Retired(why),
+    })?;
+    Ok(manifest)
+}
+
+/// The file in which a blaze of pins with no manifest (main from 2026-11-04, #1696) kept its
+/// generation and retired files. Read once, when its history is adopted, then deleted.
+pub const LEGACY_RETIRED: &str = "retired";
+
+/// What [`LEGACY_RETIRED`] says, or nothing retired at generation 0 when it is not there.
+fn legacy_retired(dir: &Path) -> Result<Retired, HistoryError> {
+    const HEADER: &str = "blaze profile history retired v1";
+    let path = dir.join(LEGACY_RETIRED);
+    let text = match fs::read_to_string(&path) {
+        Ok(it) => it,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Retired::default()),
+        Err(error) => {
+            return Err(io_error(&path, "reading the retired files of a history before manifests")(
+                error,
+            ));
+        }
+    };
+    let refused =
+        |why| HistoryError::Manifest { path: path.clone(), why: ManifestError::Retired(why) };
+    let mut lines = text.lines();
+    if lines.next() != Some(HEADER) {
+        return Err(refused("its first line is not `blaze profile history retired v1`"));
+    }
+    let generation = lines
+        .next()
+        .and_then(|it| it.strip_prefix("generation "))
+        .and_then(|it| it.parse().ok())
+        .ok_or_else(|| refused("its second line is not `generation <number>`"))?;
+    // alloc: once a history is adopted
+    let mut files = Vec::new();
+    for line in lines {
+        let (at, name) =
+            line.split_once(' ').ok_or_else(|| refused("a line is not `<generation> <file>`"))?;
+        let at = at.parse().map_err(|_| refused("a line's generation is not a number"))?;
+        if listable(name).is_none() {
+            return Err(refused("a line names no file of a form blaze lists"));
+        }
+        // alloc: a file's name, once a history is adopted
+        files.push((name.to_owned(), at));
+    }
+    let retired = Retired { generation, files };
+    retired.check().map_err(refused)?;
+    Ok(retired)
 }
 
 /// The manifest of a history, held under its lock by a writer: changed in memory, then
@@ -687,23 +773,7 @@ pub(crate) fn hold(dir: &Path) -> Result<Held, HistoryError> {
                 .map_err(|why| HistoryError::Manifest { path: path.clone(), why })?;
             (manifest, false)
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let (manifest, superseded) = adopted(dir)?;
-            for name in superseded {
-                let file = dir.join(name);
-                match fs::remove_file(&file) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(io_error(
-                            &file,
-                            "deleting a file a merged file holds the rows of",
-                        )(error));
-                    }
-                }
-            }
-            (manifest, true)
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (adopted(dir)?, true),
         Err(error) => return Err(io_error(&path, "reading the manifest")(error)),
     };
     let written = match adopting {
@@ -716,6 +786,20 @@ pub(crate) fn hold(dir: &Path) -> Result<Held, HistoryError> {
     // alloc: once a commit
     let mut held = Held { path, manifest, written, _lock: lock };
     held.commit()?;
+    if adopting {
+        // The manifest now says what it said; a reader reads the manifest, never it.
+        let legacy = dir.join(LEGACY_RETIRED);
+        match fs::remove_file(&legacy) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(io_error(
+                    &legacy,
+                    "deleting the retired files of a history before manifests, adopted",
+                )(error));
+            }
+        }
+    }
     Ok(held)
 }
 

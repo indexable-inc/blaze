@@ -757,6 +757,18 @@ pub(crate) fn write_listed(
         bytes += size;
     }
     let mut held = manifest::hold(dir)?;
+    // Nothing is put over a retired file: a pinned reader may be reading it (a `blaze debug time`
+    // racing the cap that retired its build).
+    if let Some(&(path, ..)) =
+        files.iter().find(|(path, ..)| held.manifest().retired().holds(name_of(path)))
+    {
+        // alloc: an error
+        let file = name_of(path).to_owned();
+        return Err(HistoryError::Manifest {
+            path: dir.join(manifest::FILE),
+            why: manifest::ManifestError::Relisted { file },
+        });
+    }
     for (&(path, table, parts), at) in files.iter().zip(&hidden) {
         fs::rename(at, path).map_err(io_error(path, "renaming into place"))?;
         held.add(name_of(path), manifest::Entry::of_batches(table, parts))?;

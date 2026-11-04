@@ -3,7 +3,7 @@
 //! `sql/examples.sql`, cut out at compile time; [`PRELUDE`] (`sql/views.sql`) defines the tables
 //! and views that SQL reads, over the files of the directories [`prelude`] is given.
 
-use std::{fmt, fmt::Write as _};
+use std::{fmt, fmt::Write as _, path::Path};
 
 use serde_json::{Map, Value};
 
@@ -469,7 +469,7 @@ pub fn prelude(dir: &Path, manifest: &Manifest, scope: Scope) -> Result<String, 
         if it.sigil != b'@' {
             return Ok(());
         }
-        let Some(table) = schema::TABLES.iter().position(|table| table.name == it.name) else {
+        let Some(table) = schema::TABLES.iter().find(|table| table.name == it.name) else {
             // alloc: an error, a bug in views.sql
             return Err(ViewError::Undeclared { view: "views.sql", name: it.name.to_owned() });
         };
