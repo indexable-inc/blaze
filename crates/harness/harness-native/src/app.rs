@@ -1196,8 +1196,8 @@ impl App {
         match (k.as_str(), m.shift) {
             ("]", _) | ("}", _) => self.step_object(1),
             ("[", _) | ("{", _) => self.step_object(-1),
-            ("t", false) => self.spawn("claude"),
-            ("t", true) => self.spawn("codex"),
+            ("t" | "n", false) => self.spawn("claude"),
+            ("t" | "n", true) => self.spawn("codex"),
             ("w", false) => self.kill(),
             ("s", false) => self.toggle_sidebar(),
             ("k", false) => {
