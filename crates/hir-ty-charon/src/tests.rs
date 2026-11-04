@@ -48,9 +48,7 @@ fn checked_add_is_a_panicking_add() {
 
 #[test]
 fn while_is_a_loop() {
-    let out = llbc(
-        "pub fn count(n: u32) -> u32 { let mut i = 0; while i < n { i += 1; } i }\n",
-    );
+    let out = llbc("pub fn count(n: u32) -> u32 { let mut i = 0; while i < n { i += 1; } i }\n");
     assert!(out.contains("loop {"), "{out}");
 }
 
@@ -101,7 +99,8 @@ fn closure_is_refused_by_name() {
 
 #[test]
 fn json_is_deterministic() {
-    let source = "pub fn incr(x: u32) -> u32 { x + 1 }\npub fn twice(x: u32) -> u32 { incr(incr(x)) }\n";
+    let source =
+        "pub fn incr(x: u32) -> u32 { x + 1 }\npub fn twice(x: u32) -> u32 { incr(incr(x)) }\n";
     let first = {
         let db = db(source);
         llbc_json(&to_llbc(&db, main_crate(&db)).expect("LLBC"))

@@ -220,7 +220,9 @@ impl<'a, 'db> BodyCx<'a, 'db> {
             m::StatementKind::Assign(place, m::Rvalue::BinaryOp(op, left, right))
                 if matches!(
                     op,
-                    m::BinOp::AddWithOverflow | m::BinOp::SubWithOverflow | m::BinOp::MulWithOverflow
+                    m::BinOp::AddWithOverflow
+                        | m::BinOp::SubWithOverflow
+                        | m::BinOp::MulWithOverflow
                 ) =>
             {
                 let which = match op {
@@ -248,14 +250,17 @@ impl<'a, 'db> BodyCx<'a, 'db> {
                     safety: c::CallSafety::Inherit,
                 };
                 let target = self.blocks.reserve_slot();
-                let on_unwind =
-                    self.push_block(open.kind.further_unwind_kind(), c::TerminatorKind::UndefinedBehavior);
+                let on_unwind = self.push_block(
+                    open.kind.further_unwind_kind(),
+                    c::TerminatorKind::UndefinedBehavior,
+                );
                 let kind = open.kind;
                 self.close(open, c::TerminatorKind::Call { call, dest, target, on_unwind });
                 return Ok(Open { id: target, kind, statements: Vec::new() }); // alloc: a block's statements
             }
             m::StatementKind::Assign(place, rvalue) => {
-                let assigned = (|| Ok(c::StatementKind::Assign(self.place(place)?, self.rvalue(rvalue)?)))();
+                let assigned =
+                    (|| Ok(c::StatementKind::Assign(self.place(place)?, self.rvalue(rvalue)?)))();
                 match assigned {
                     Ok(it) => it,
                     Err(err) => return Err((open, err)),
@@ -263,8 +268,12 @@ impl<'a, 'db> BodyCx<'a, 'db> {
             }
             // A read for the borrow checker only; runtime MIR keeps it, rustc's drops it.
             m::StatementKind::FakeRead(_) | m::StatementKind::Nop => return Ok(open),
-            m::StatementKind::StorageLive(local) => c::StatementKind::StorageLive(self.local_ids[local]),
-            m::StatementKind::StorageDead(local) => c::StatementKind::StorageDead(self.local_ids[local]),
+            m::StatementKind::StorageLive(local) => {
+                c::StatementKind::StorageLive(self.local_ids[local])
+            }
+            m::StatementKind::StorageDead(local) => {
+                c::StatementKind::StorageDead(self.local_ids[local])
+            }
             m::StatementKind::Deinit(_) => {
                 let err = self.refuse("a `Deinit` statement", why::PHASE);
                 return Err((open, err));
@@ -299,14 +308,18 @@ impl<'a, 'db> BodyCx<'a, 'db> {
                 let ty = self.mir.locals[place.local].ty.as_ref();
                 if !types::trivially_droppable(self.ctx, ty) {
                     // alloc: an error
-                    return Err(self.refuse(format!("a drop of a value of type `{ty:?}`"), why::DROPS));
+                    return Err(
+                        self.refuse(format!("a drop of a value of type `{ty:?}`"), why::DROPS)
+                    );
                 }
                 c::TerminatorKind::Goto { target: self.block(*target) }
             }
             m::TerminatorKind::DropAndReplace { .. } => {
                 return Err(self.refuse("a `DropAndReplace` terminator", why::PHASE));
             }
-            m::TerminatorKind::Call { func, args, destination, target, cleanup, intrinsic, .. } => {
+            m::TerminatorKind::Call {
+                func, args, destination, target, cleanup, intrinsic, ..
+            } => {
                 if intrinsic.is_some() {
                     return Err(self.refuse("a call of an intrinsic", why::OPERATIONS));
                 }
@@ -356,7 +369,10 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         let scrutinee_ty = scrutinee.ty().clone(); // clone: a hash-consed handle
         let c::TyKind::Scalar(scalar) = scrutinee_ty.kind() else {
             // alloc: an error
-            return Err(self.refuse(format!("a switch on a value of type `{scrutinee_ty:?}`"), why::OPERATIONS));
+            return Err(self.refuse(
+                format!("a switch on a value of type `{scrutinee_ty:?}`"),
+                why::OPERATIONS,
+            ));
         };
         let scalar = *scalar;
         let mut branches: c::IndexVec<c::BranchId, c::BlockId> = c::IndexVec::new(); // alloc: a switch's branches
@@ -375,7 +391,8 @@ impl<'a, 'db> BodyCx<'a, 'db> {
             let branch = branch_of(self, bb);
             let Some(kind) = c::ConstantExprKind::from_bits(&scalar, value) else {
                 // alloc: an error
-                return Err(self.refuse(format!("the switch value {value} of `{scalar:?}`"), why::OPERATIONS));
+                return Err(self
+                    .refuse(format!("the switch value {value} of `{scalar:?}`"), why::OPERATIONS));
             };
             // clone: a hash-consed handle
             values.push((c::ConstantExpr::new(kind, scrutinee_ty.clone()), branch));
@@ -419,11 +436,15 @@ impl<'a, 'db> BodyCx<'a, 'db> {
                 len: self.operand(len)?,
                 index: self.operand(index)?,
             },
-            m::AssertKind::Overflow(op, left, right) => {
-                c::BuiltinAssertKind::Overflow(self.bin_op(op)?, self.operand(left)?, self.operand(right)?)
-            }
+            m::AssertKind::Overflow(op, left, right) => c::BuiltinAssertKind::Overflow(
+                self.bin_op(op)?,
+                self.operand(left)?,
+                self.operand(right)?,
+            ),
             m::AssertKind::OverflowNeg(it) => c::BuiltinAssertKind::OverflowNeg(self.operand(it)?),
-            m::AssertKind::DivisionByZero(it) => c::BuiltinAssertKind::DivisionByZero(self.operand(it)?),
+            m::AssertKind::DivisionByZero(it) => {
+                c::BuiltinAssertKind::DivisionByZero(self.operand(it)?)
+            }
             m::AssertKind::RemainderByZero(it) => {
                 c::BuiltinAssertKind::RemainderByZero(self.operand(it)?)
             }
@@ -521,19 +542,25 @@ impl<'a, 'db> BodyCx<'a, 'db> {
                         let ty = self.ty(ty.as_ref())?;
                         let Some(tref) = ty.as_adt() else {
                             // alloc: an error
-                            return Err(self.refuse(format!("a tuple of type `{ty:?}`"), why::PHASE));
+                            return Err(
+                                self.refuse(format!("a tuple of type `{ty:?}`"), why::PHASE)
+                            );
                         };
                         c::AggregateKind::Adt(tref.clone(), None, None) // clone: a type reference
                     }
                     m::AggregateKind::Adt(variant, args) => {
                         if !args.as_ref().is_empty() {
-                            return Err(self.refuse("a generic struct or enum value", why::GENERICS));
+                            return Err(
+                                self.refuse("a generic struct or enum value", why::GENERICS)
+                            );
                         }
                         self.adt_aggregate(*variant)?
                     }
                     m::AggregateKind::Array(_) => return Err(self.refuse("an array", why::TYPES)),
                     m::AggregateKind::Union(..) => return Err(self.refuse("a union", why::TYPES)),
-                    m::AggregateKind::Closure(_) => return Err(self.refuse("a closure", why::CONTROL)),
+                    m::AggregateKind::Closure(_) => {
+                        return Err(self.refuse("a closure", why::CONTROL));
+                    }
                 };
                 let mut out = Vec::with_capacity(operands.len()); // alloc: an aggregate's fields
                 for operand in operands.iter() {
@@ -556,17 +583,24 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         let db = self.ctx.db;
         let (adt, index) = match variant {
             VariantId::StructId(it) => (hir_def::AdtId::StructId(it), None),
-            VariantId::EnumVariantId(it) => {
-                (hir_def::AdtId::EnumId(it.loc(db).parent), Some(c::VariantId::from_usize(it.index(db))))
-            }
+            VariantId::EnumVariantId(it) => (
+                hir_def::AdtId::EnumId(it.loc(db).parent),
+                Some(c::VariantId::from_usize(it.index(db))),
+            ),
             VariantId::UnionId(_) => return Err(self.refuse("a union", why::TYPES)),
         };
         let Some(&id) = self.ctx.adts.get(&adt) else {
             let name = crate::names::adt_path(db, adt).display;
             // alloc: an error
-            return Err(self.refuse(format!("a value of `{name}`, which is not translated"), why::TYPES));
+            return Err(
+                self.refuse(format!("a value of `{name}`, which is not translated"), why::TYPES)
+            );
         };
-        Ok(c::AggregateKind::Adt(c::TypeDeclRef::new(id, c::GenericArgs::empty(), None), index, None))
+        Ok(c::AggregateKind::Adt(
+            c::TypeDeclRef::new(id, c::GenericArgs::empty(), None),
+            index,
+            None,
+        ))
     }
 
     fn operand(&mut self, operand: &m::Operand) -> Result<c::Operand, Unsupported> {
@@ -583,12 +617,16 @@ impl<'a, 'db> BodyCx<'a, 'db> {
                     return Ok(c::Operand::Const(c::ConstantExpr::mk_unit()));
                 }
                 let bits = match konst.as_ref().kind() {
-                    ConstKind::Value(value) => value.try_to_leaf().map(|leaf| leaf.to_bits_unchecked()),
+                    ConstKind::Value(value) => {
+                        value.try_to_leaf().map(|leaf| leaf.to_bits_unchecked())
+                    }
                     _ => None,
                 };
                 let Some(bits) = bits else {
                     // alloc: an error
-                    return Err(self.refuse(format!("a constant of type `{ty:?}`"), why::OPERATIONS));
+                    return Err(
+                        self.refuse(format!("a constant of type `{ty:?}`"), why::OPERATIONS)
+                    );
                 };
                 c::Operand::Const(self.scalar_const(cty, bits)?)
             }
@@ -604,7 +642,9 @@ impl<'a, 'db> BodyCx<'a, 'db> {
                 let memory: &[u8] = &allocation.memory;
                 if memory.len() > 16 || !matches!(cty.kind(), c::TyKind::Scalar(_)) {
                     // alloc: an error
-                    return Err(self.refuse(format!("a constant of type `{cty:?}`"), why::OPERATIONS));
+                    return Err(
+                        self.refuse(format!("a constant of type `{cty:?}`"), why::OPERATIONS)
+                    );
                 }
                 let mut bytes = [0u8; 16];
                 if self.ctx.little_endian {
@@ -628,7 +668,10 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         match kind {
             Some(kind) => Ok(c::ConstantExpr::new(kind, ty)),
             // alloc: an error
-            None => Err(self.refuse(format!("the constant {bits:#x} of type `{ty:?}`"), why::OPERATIONS)),
+            None => {
+                Err(self
+                    .refuse(format!("the constant {bits:#x} of type `{ty:?}`"), why::OPERATIONS))
+            }
         }
     }
 
@@ -649,12 +692,17 @@ impl<'a, 'db> BodyCx<'a, 'db> {
                 ),
                 m::ProjectionElem::Downcast(VariantId::EnumVariantId(variant)) => {
                     let Some(m::ProjectionElem::Field(field)) = elems.get(index + 1) else {
-                        return Err(self.refuse("a downcast not followed by a field", why::OPERATIONS));
+                        return Err(
+                            self.refuse("a downcast not followed by a field", why::OPERATIONS)
+                        );
                     };
                     index += 1;
                     let variant = c::VariantId::from_usize(variant.index(self.ctx.db));
                     (
-                        c::ProjectionElem::Field(Some(variant), c::FieldId::from_usize(field.0 as usize)),
+                        c::ProjectionElem::Field(
+                            Some(variant),
+                            c::FieldId::from_usize(field.0 as usize),
+                        ),
                         None,
                     )
                 }
@@ -683,7 +731,8 @@ impl<'a, 'db> BodyCx<'a, 'db> {
             };
             let Some(ty) = ty else {
                 // alloc: an error
-                return Err(self.refuse(format!("the projection `{elem:?}` of `{:?}`", out.ty()), why::PHASE));
+                return Err(self
+                    .refuse(format!("the projection `{elem:?}` of `{:?}`", out.ty()), why::PHASE));
             };
             out = out.project(elem, ty);
         }

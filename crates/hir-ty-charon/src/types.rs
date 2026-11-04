@@ -237,7 +237,10 @@ pub(crate) fn adt_decl<'db>(
                         errors.push(refuse(
                             item,
                             // alloc: an error
-                            format!("the discriminant of `{}`, which did not evaluate: {err:?}", name.as_str()),
+                            format!(
+                                "the discriminant of `{}`, which did not evaluate: {err:?}",
+                                name.as_str()
+                            ),
                             why::OPERATIONS,
                         ));
                         continue;

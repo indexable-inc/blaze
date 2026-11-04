@@ -87,7 +87,7 @@ pub(crate) fn item_path(
 pub(crate) fn plain_path(segments: &[&str]) -> ItemPath {
     ItemPath {
         name: Name { name: segments.iter().map(|it| ident(it)).collect() }, // alloc: a Charon name
-        display: segments.join("::"), // alloc: a path
+        display: segments.join("::"),                                       // alloc: a path
     }
 }
 

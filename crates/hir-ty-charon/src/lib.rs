@@ -24,9 +24,9 @@ mod bodies;
 mod items;
 mod names;
 mod signatures;
-mod types;
 #[cfg(test)]
 mod tests;
+mod types;
 
 use std::{
     cell::RefCell,
@@ -82,14 +82,22 @@ pub struct Unsupported {
 
 impl fmt::Display for Unsupported {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "`{}`: {} is not translated to LLBC ({})", self.function, self.construct, self.why)
+        write!(
+            f,
+            "`{}`: {} is not translated to LLBC ({})",
+            self.function, self.construct, self.why
+        )
     }
 }
 
 impl std::error::Error for Unsupported {}
 
 /// `Unsupported` for `construct` of `function`, refused by `why`.
-pub(crate) fn refuse(function: &str, construct: impl Into<String>, why: &'static str) -> Unsupported {
+pub(crate) fn refuse(
+    function: &str,
+    construct: impl Into<String>,
+    why: &'static str,
+) -> Unsupported {
     Unsupported {
         function: function.to_owned(), // alloc: an error, once per refusal
         construct: construct.into(),
@@ -107,7 +115,12 @@ pub enum Error {
     /// Charon's passes reported errors. `items` are the items they named, `bodies` each
     /// function body left with an error (its path and Charon's message), `unstructured` the
     /// functions whose bodies the passes did not structure. Charon prints its messages to stderr.
-    Charon { error_count: usize, items: Vec<String>, bodies: Vec<String>, unstructured: Vec<String> },
+    Charon {
+        error_count: usize,
+        items: Vec<String>,
+        bodies: Vec<String>,
+        unstructured: Vec<String>,
+    },
     /// A pass panicked: the panic's message. Only this crate's job fails.
     Panicked(String),
 }

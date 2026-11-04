@@ -11,16 +11,18 @@ use std::alloc::Global;
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
 use charon_lib::ast::{
-    Body, DeBruijnVar, File, ItemByVal, FileId, FileName, FloatTy, FunDecl, FunDeclId,
-    FunSig, FunSource, GenericParams as CGenericParams, IntTy as CIntTy, IntegerTy, ItemId,
-    ItemMeta, ItemOpacity, RuntimeChecks, ScalarTy, SeqHashMap, Span, TargetInfo, TranslatedCrate,
-    Ty as CTy, TyKind as CTyKind, TypeDeclId, TypeParam, TypeVarId, UIntTy as CUIntTy, Variance,
+    Body, DeBruijnVar, File, FileId, FileName, FloatTy, FunDecl, FunDeclId, FunSig, FunSource,
+    GenericParams as CGenericParams, IntTy as CIntTy, IntegerTy, ItemByVal, ItemId, ItemMeta,
+    ItemOpacity, RuntimeChecks, ScalarTy, SeqHashMap, Span, TargetInfo, TranslatedCrate, Ty as CTy,
+    TyKind as CTyKind, TypeDeclId, TypeParam, TypeVarId, UIntTy as CUIntTy, Variance,
     from_rustc::{Arch, BinaryFormat, CfgAbi, Env, Os},
 };
 use charon_lib::ids::IndexVec;
 use hir_def::{
     AdtId, AssocItemId, FunctionId, GenericDefId, HasModule as _, ImplId, ItemContainerId,
-    Lookup as _, ModuleDefId, hir::generics::GenericParams, nameres::crate_def_map,
+    Lookup as _, ModuleDefId,
+    hir::generics::GenericParams,
+    nameres::crate_def_map,
     signatures::{
         ConstSignature, FunctionSignature, ImplSignature, StaticSignature, TraitSignature,
         TypeAliasSignature,
@@ -106,8 +108,7 @@ pub(crate) fn translate(db: &Db, krate: Crate) -> Result<TranslatedCrate, Vec<Un
     translated.runtime_checks = RuntimeChecks {
         overflow_checks: cfg
             .check_atom(&cfg::CfgAtom::Flag(intern::Symbol::intern("overflow_checks"))),
-        ub_checks: cfg
-            .check_atom(&cfg::CfgAtom::Flag(intern::Symbol::intern("debug_assertions"))),
+        ub_checks: cfg.check_atom(&cfg::CfgAtom::Flag(intern::Symbol::intern("debug_assertions"))),
         contract_checks: cfg.contract_checks(),
     };
     // Every span is `Span::dummy()`, file 0: the file is named so a reader can resolve it.
@@ -156,14 +157,22 @@ pub(crate) fn translate(db: &Db, krate: Crate) -> Result<TranslatedCrate, Vec<Un
                     _ => {
                         let name = FunctionSignature::of(db, func).name.as_str().to_owned(); // alloc: a name
                         let path = names::item_path(&crate_name, &modules, None, &name);
-                        errors.push(refuse(&path.display, "a function in an extern block", why::UNSAFE));
+                        errors.push(refuse(
+                            &path.display,
+                            "a function in an extern block",
+                            why::UNSAFE,
+                        ));
                     }
                 },
                 ModuleDefId::AdtId(adt @ (AdtId::StructId(_) | AdtId::EnumId(_))) => {
                     let path = names::adt_path(db, adt);
                     let params = GenericParams::of(db, GenericDefId::AdtId(adt));
                     if !params.is_empty() || !params.has_no_predicates() {
-                        errors.push(refuse(&path.display, "a generic struct or enum", why::GENERICS));
+                        errors.push(refuse(
+                            &path.display,
+                            "a generic struct or enum",
+                            why::GENERICS,
+                        ));
                         continue;
                     }
                     let id = ctx.translated.type_decls.reserve_slot();
@@ -217,16 +226,26 @@ pub(crate) fn translate(db: &Db, krate: Crate) -> Result<TranslatedCrate, Vec<Un
         match inherent_impl(&mut ctx, &crate_name, &modules, imp) {
             Ok(Some(impl_of)) => {
                 for (name, item) in imp.impl_items(db).items.iter() {
-                    let path = names::item_path(&crate_name, &modules, Some(&impl_of), name.as_str());
+                    let path =
+                        names::item_path(&crate_name, &modules, Some(&impl_of), name.as_str());
                     match *item {
                         AssocItemId::FunctionId(func) => {
                             let id = ctx.translated.fun_decls.reserve_slot();
                             ctx.funs.insert(func, id);
                             let self_ty = impl_of.self_ty.clone(); // clone: a hash-consed handle
-                            locals.push(LocalFn { func, id, path, src: FunSource::InherentImpl { self_ty } });
+                            locals.push(LocalFn {
+                                func,
+                                id,
+                                path,
+                                src: FunSource::InherentImpl { self_ty },
+                            });
                         }
                         AssocItemId::ConstId(_) => {
-                            errors.push(refuse(&path.display, "an associated constant", why::ITEMS));
+                            errors.push(refuse(
+                                &path.display,
+                                "an associated constant",
+                                why::ITEMS,
+                            ));
                         }
                         AssocItemId::TypeAliasId(_) => {
                             errors.push(refuse(&path.display, "an associated type", why::TRAITS));
@@ -332,7 +351,11 @@ fn self_ty_name(db: &Db, self_ty: hir_ty::next_solver::Ty<'_>) -> Option<String>
 impl<'db> Ctx<'db> {
     /// The id of the function a body calls, `caller` the caller's path for errors: a local
     /// function walked, or a foreign one declared without a body on first use.
-    pub(crate) fn callee(&mut self, caller: &str, func: FunctionId) -> Result<FunDeclId, Unsupported> {
+    pub(crate) fn callee(
+        &mut self,
+        caller: &str,
+        func: FunctionId,
+    ) -> Result<FunDeclId, Unsupported> {
         if let Some(&id) = self.funs.get(&func) {
             return Ok(id);
         }
@@ -345,19 +368,30 @@ impl<'db> Ctx<'db> {
             ItemContainerId::TraitId(_) => {
                 let path = names::item_path(&crate_name, &modules, None, &name);
                 // alloc: an error
-                return Err(refuse(caller, format!("a call of the trait method `{}`", path.display), why::TRAITS));
+                return Err(refuse(
+                    caller,
+                    format!("a call of the trait method `{}`", path.display),
+                    why::TRAITS,
+                ));
             }
             ItemContainerId::ExternBlockId(_) => {
                 let path = names::item_path(&crate_name, &modules, None, &name);
                 // alloc: an error
-                return Err(refuse(caller, format!("a call of the extern function `{}`", path.display), why::UNSAFE));
+                return Err(refuse(
+                    caller,
+                    format!("a call of the extern function `{}`", path.display),
+                    why::UNSAFE,
+                ));
             }
             _ if local => {
                 let path = names::item_path(&crate_name, &modules, None, &name);
                 return Err(refuse(
                     caller,
                     // alloc: an error
-                    format!("a call of `{}`, a function this walk does not translate (one declared in a block, or of a refused impl)", path.display),
+                    format!(
+                        "a call of `{}`, a function this walk does not translate (one declared in a block, or of a refused impl)",
+                        path.display
+                    ),
                     why::ITEMS,
                 ));
             }
@@ -367,12 +401,20 @@ impl<'db> Ctx<'db> {
             ItemContainerId::ImplId(imp) => {
                 let impl_of = inherent_impl(self, &crate_name, &modules, imp).map_err(|err| {
                     // alloc: an error
-                    refuse(caller, format!("a call of `{name}` from `{}`: {}", err.function, err.construct), err.why)
+                    refuse(
+                        caller,
+                        format!("a call of `{name}` from `{}`: {}", err.function, err.construct),
+                        err.why,
+                    )
                 })?;
                 let Some(impl_of) = impl_of else {
                     // An impl with the function in it has items.
                     // alloc: an error
-                    return Err(refuse(caller, format!("a call of `{name}`, whose impl lists no items"), why::PHASE));
+                    return Err(refuse(
+                        caller,
+                        format!("a call of `{name}`, whose impl lists no items"),
+                        why::PHASE,
+                    ));
                 };
                 let path = names::item_path(&crate_name, &modules, Some(&impl_of), &name);
                 (path, FunSource::InherentImpl { self_ty: impl_of.self_ty })
@@ -384,7 +426,10 @@ impl<'db> Ctx<'db> {
                 refuse(
                     caller,
                     // alloc: an error
-                    format!("a call of `{}`, whose signature has {}", path.display, first.construct),
+                    format!(
+                        "a call of `{}`, whose signature has {}",
+                        path.display, first.construct
+                    ),
                     first.why,
                 )
             })?;
@@ -393,7 +438,12 @@ impl<'db> Ctx<'db> {
         self.regions.insert(id, generics.regions.len());
         let decl = FunDecl {
             def_id: id,
-            item_meta: ItemMeta::dummy_public(Span::dummy(), path.name, false, ItemOpacity::Foreign),
+            item_meta: ItemMeta::dummy_public(
+                Span::dummy(),
+                path.name,
+                false,
+                ItemOpacity::Foreign,
+            ),
             generics,
             signature: Box::new(sig), // alloc: a Charon signature
             src,
@@ -435,12 +485,17 @@ impl<'db> Ctx<'db> {
         let id = self.translated.fun_decls.reserve_slot();
         let decl = FunDecl {
             def_id: id,
-            item_meta: ItemMeta::dummy_public(Span::dummy(), path.name, false, ItemOpacity::Foreign),
+            item_meta: ItemMeta::dummy_public(
+                Span::dummy(),
+                path.name,
+                false,
+                ItemOpacity::Foreign,
+            ),
             generics,
             signature: Box::new(sig), // alloc: a Charon signature
             src: FunSource::Normal,
             body: Body::Intrinsic {
-                name: name.to_owned(), // alloc: a name
+                name: name.to_owned(),                                       // alloc: a name
                 arg_names: vec![Some("x".to_owned()), Some("y".to_owned())], // alloc: names
                 fallback: None,
                 fallback_is_spec: false,

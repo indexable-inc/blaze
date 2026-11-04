@@ -84,7 +84,9 @@ pub(crate) fn signature<'db>(
                     ..RegionParam::new(id, name, Variance::Unknown)
                 });
             }
-            BoundVariableKind::Ty(_) | BoundVariableKind::Const | BoundVariableKind::Reflected(_) => {
+            BoundVariableKind::Ty(_)
+            | BoundVariableKind::Const
+            | BoundVariableKind::Reflected(_) => {
                 errors.push(refuse(
                     item,
                     "a late-bound type or const variable in the signature",
