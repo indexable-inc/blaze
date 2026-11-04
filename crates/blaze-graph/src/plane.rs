@@ -140,6 +140,30 @@ impl Memo for NoMemo {
 pub struct Budget {
     pub bytes: u64,
     pub from: String,
+    /// What the least limit loses before it is the budget: what others use and the margin
+    /// ([`crate::arena::machine_budget`]). The limit that fits a task is its need and this.
+    #[serde(default)]
+    pub kept_back: u64,
+}
+
+impl Budget {
+    /// The memory limit, in whole GiB, under which a task predicted to hold `need` bytes
+    /// fits: its need and what the limit loses to others and the margin ([`Budget::kept_back`]).
+    pub fn to_fit(&self, need: u64) -> u64 {
+        need.saturating_add(self.kept_back).div_ceil(1 << 30)
+    }
+
+    /// What to tell blaze so a task predicted to hold `need` bytes fits, for the error that
+    /// refuses it: the exact `BLAZE_DAEMON_MEMORY_GB`.
+    pub fn advice(&self, need: u64) -> String {
+        let fit = self.to_fit(need);
+        // alloc: the message of a task refused for memory, once
+        format!(
+            "to fit it, run with BLAZE_DAEMON_MEMORY_GB={fit} (or `--memory-gb {fit}`) on a \
+             machine with that much memory, which every other limit above must allow too; a \
+             command with another value than the daemon's restarts it when idle"
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -959,6 +983,11 @@ pub struct Plane<M = NoMemo> {
     running: [usize; 2],
     granted: u64,
     held: u64,
+    /// What the process holds besides the tasks granted memory that kept the best task held
+    /// back for memory in the last dispatch from starting: the bytes of it to let go for that
+    /// task to start now; 0 when none was held back, or only granted tasks held it back
+    /// ([`Plane::short`]).
+    short: u64,
     /// The virtual time of each pool: that of the request not idle that started a task last.
     vclock: [u128; 2],
     /// The same, of the idle requests, which share it among themselves alone.
@@ -1043,6 +1072,7 @@ impl<M: Memo> Plane<M> {
             running: [0; 2],
             granted: 0,
             held: 0,
+            short: 0,
             vclock: [0; 2],
             idle_vclock: [0; 2],
             // Each `Vec` here is empty scratch the plane keeps: it grows to the most a step needs
@@ -1080,6 +1110,16 @@ impl<M: Memo> Plane<M> {
     /// The memory granted to the tasks running now.
     pub fn granted(&self) -> u64 {
         self.granted
+    }
+
+    /// The bytes of what the process holds besides its granted tasks (a front end kept, values
+    /// its caches keep: [`PlaneInput::Held`] less the grants) that held back a task for memory
+    /// in the last dispatch: letting go of that much would have let the best such task start
+    /// then. 0 when no task was held back, or only granted tasks did (they end, and give it
+    /// back). The driver lets go of what it can when this is not 0 (`blaze-cargo`'s release of
+    /// a front end), which waiting alone never would.
+    pub fn short(&self) -> u64 {
+        self.short
     }
 
     /// The state of `id`, if it was added.
@@ -1430,7 +1470,7 @@ impl<M: Memo> Plane<M> {
     fn after(&mut self, at: u64, out: &mut Vec<PlaneOutput>, touched: &mut Vec<u32>) {
         self.settle_deferred(at, out, touched);
         self.last_ns = at;
-        self.dispatch(at, out, touched);
+        self.dispatch(at, out);
         let requests = &self.requests;
         radix::sort_copy_by_key_in(
             touched,
@@ -2191,7 +2231,8 @@ impl<M: Memo> Plane<M> {
         (request.idle, request.vtime[p], Reverse(request.weight), request.seq)
     }
 
-    fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>, touched: &mut Vec<u32>) {
+    fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>) {
+        self.short = 0;
         for pool in [Pool::Io, Pool::Work] {
             let (p, limit) = (pool_at(pool), self.threads(pool));
             if self.config.budget.is_none() {
@@ -2240,13 +2281,6 @@ impl<M: Memo> Plane<M> {
                         }
                         self.passed = passed;
                         self.start(at, me, out);
-                    }
-                    Pick::Fail(me, why) => {
-                        self.passed = passed;
-                        self.leave_task(me);
-                        touched.push(self.rows[me as usize].request);
-                        self.deferred.push((me, NodeState::Failed { why }));
-                        self.settle_deferred(at, out, touched);
                     }
                     Pick::None => {
                         self.passed = passed;
@@ -2375,13 +2409,20 @@ impl<M: Memo> Plane<M> {
 
     /// The node of request `r` whose task starts next on pool `p`, as memory allows; the tasks
     /// of it that did not fit, before that one, are added to `passed`. Only with a budget.
+    ///
+    /// A task that fits the budget at all (one over it was refused as it was added,
+    /// [`too_big`]) never waits for good: once no task granted memory runs it starts, alone,
+    /// whatever the process holds besides. Its grant then holds every other task with memory
+    /// back until it ends. Refusing it there (as this did until memadmit: ten test targets of
+    /// blaze's own refused behind a prediction of 15.78 GB with 31 GB held and none of it
+    /// granted) would fail a unit that waiting could never help, since nothing granted is left
+    /// to end and give memory back; what the process holds besides is the driver's to let go
+    /// ([`Plane::short`]), and a prediction is a guess, not a measure (rule 15: the wait ends,
+    /// in a start).
     fn pick(&mut self, r: u32, p: usize, passed: &mut Vec<TaskHandle>) -> Pick {
         let free = self.memory_free().expect("a budget");
-        // A task predicted the whole budget runs alone: once nothing granted memory runs,
-        // whatever the process holds besides, and while it runs nothing granted memory fits.
         let whole = self.config.budget.as_ref().expect("a budget").bytes;
         let alone = self.granted == 0;
-        let nothing_runs = self.running == [0, 0];
         let hold = self.hold();
         // An idle request's task passed over holds back no other.
         let counts = !self.requests[r as usize].idle;
@@ -2408,7 +2449,7 @@ impl<M: Memo> Plane<M> {
                         break;
                     }
                 }
-                _ if memory <= free || (memory == whole && alone) => {
+                _ if memory <= free || (memory <= whole && alone) => {
                     picked = me;
                     break;
                 }
@@ -2431,24 +2472,17 @@ impl<M: Memo> Plane<M> {
         if picked != NONE {
             return Pick::Start(picked);
         }
-        if unfit == NONE || !nothing_runs {
-            return Pick::None;
+        if unfit != NONE && self.short == 0 {
+            // The first task held back, of the request whose turn it is: what the process
+            // holds besides the grants kept it out by this much.
+            let memory = self.tasks[row_of(self.rows[unfit as usize].task)].memory;
+            let held_besides = self.held.saturating_sub(self.granted);
+            let by_grants = whole.saturating_sub(self.granted);
+            if memory <= by_grants {
+                self.short = memory.saturating_sub(free).min(held_besides);
+            }
         }
-        let budget = self.config.budget.as_ref().expect("a budget");
-        let cold = &self.cold[unfit as usize];
-        let request = &self.requests[r as usize];
-        Pick::Fail(
-            unfit, // alloc: below, the message of a node that fails for memory, once
-            format!(
-                "{} needs {} of memory as predicted, and with nothing of blaze's running \
-                 the process holds {} of the {} it may use ({})",
-                request.name(cold),
-                gb(cold.memory),
-                gb(self.held),
-                gb(budget.bytes),
-                budget.from
-            ),
-        )
+        Pick::None
     }
 
     fn start(&mut self, at: u64, me: u32, out: &mut Vec<PlaneOutput>) {
@@ -2516,8 +2550,6 @@ fn running_live(rows: &[NodeRow], states: &[NodeState], (priority, seq, node): (
 
 enum Pick {
     Start(u32),
-    /// It cannot fit even with nothing running.
-    Fail(u32, String),
     None,
 }
 
@@ -2532,11 +2564,12 @@ fn too_big(config: &PlaneConfig, request: &Request, cold: &NodeCold) -> Option<S
     (cold.memory > budget.bytes).then(|| {
         // alloc: the message of a node refused for memory, once
         format!(
-            "{} needs {} of memory as predicted, more than blaze may use here: {} ({})",
+            "{} needs {} of memory as predicted, more than blaze may use here: {} ({}); {}",
             request.name(cold),
             gb(cold.memory),
             gb(budget.bytes),
-            budget.from
+            budget.from,
+            budget.advice(cold.memory)
         )
     })
 }

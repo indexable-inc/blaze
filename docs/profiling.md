@@ -16,6 +16,14 @@ several readers.
   I/O per span.
 - **The readers.**
   - The history: Parquet files the recorder flushes. `blaze debug sql` runs DuckDB over them.
+    A flush writes one file a table, `<build>-<first:08>-<last:08>-<level>.<table>.parquet`
+    (an older `<build>-<seq:08>.<table>.parquet` is read too). The history merges a build's files
+    as they come, 16 of a level into one of the next (`history::compact::FAN_IN`), and all of a
+    build's into one when it ends, by copying column chunks without decoding them: a build keeps
+    at most about 15 files a level a table while it runs and one a table after. Before this a
+    self-build left 6,175 files. A reader that globs the files during a merge can see a merged
+    file and its inputs at once, or miss an input deleted after its glob; it reads a finished
+    build exactly. At open the history deletes inputs a crash left beside their merged file.
   - The live feed: Arrow batches every 250 ms over the daemon's socket. `blaze debug live`
     renders them as a TUI, and the explorer at ix.dev/explore draws them.
   - The stall watchdog: it writes the buffer out when a request stops moving.
@@ -76,6 +84,8 @@ outermost first. `?` marks a nullable column.
 | unit | utf8? | the unit it was of: a unit phase's package, version and target (`serde v1.0.219 (build script)`), or an ad hoc span's field `unit` (a codegen unit) |
 | frame_grow_copies | u64? | blocks its thread's task frames moved to grow them while it was open; null when not counted or closed on another thread |
 | frame_copied_bytes | u64? | bytes those moves copied |
+| folded_spans | u64? | how many of its children were folded into `folded` instead of written (schema 3); null when none |
+| folded_ns | i64? | those children's durations, added: time under it that no written child covers but that is not its own (`time::Model` takes it from the span's own running time) |
 | awaits | utf8? | what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it |
 | owner | u64? | who runs what a `wait` waits for (for a key, the job running it, as `switches.job` names it; null when not known), or the job that holds a `hold`. A `hold` span (a key held across a suspension, such as a codegen round) names its holder here, so its waiters' `owner` matches it |
 | steps | u64? | the basic blocks a `macro expand` ran on the evaluator, or the instances a `build script proof` walked (`hir_ty_pure::ScriptProof::steps`: the same on a cold, warm or busy daemon, and the margin under the proof's bound); null for a compiled run, a run or proof that did not end, and any other span |
@@ -332,14 +342,24 @@ next job inside no span. Three views read it:
 
 ### `folded`: one row a sum of short spans of one site, on one thread, over a stretch
 
-A span the recorder closes in under `flight::FOLD_BELOW` (5 us) is summed instead of written when
-no row could name it: it has no child written and none open, no event or sample happened in it,
-no job was given in it, it fills no typed column, it was never held across a wait or moved to
-another thread, and it made no frame copies. A `job`, `wait` or `hold` span is never folded. A
-thread sums by site, depth 0 or not, and build, in 64 slots, and writes a sum as a row when its
-slot is needed for another, when it has been open `flight::FOLD_AGE` (50 ms), when the worker goes
-idle, when its ring passes to another thread, and when a build ends. Only blaze's CLI and daemon
-turn folding on (`flight::fold_below`); a test records every span unless it asks.
+A span the recorder closes in under `flight::FOLD_BELOW` (20 us) is summed instead of written when
+no row could name it: it has no child, no event or sample happened in it, no job was given in it,
+it fills no typed column, it was never held across a wait or moved to another thread, and it made
+no frame copies. A `wait` span is folded only under `flight::WAIT_FOLD_BELOW` (1 us; of build 24's
+164,892 waits under 1 us none parked, while 42,532 of the 96,076 from 1 to 5 us did), and a `job`
+or `hold` span never. The parent keeps exact totals: its row's `folded_spans` and `folded_ns` say
+how many children were folded and their time, so nothing is dropped. A thread sums by site,
+parent site, depth 0 or not, and build, in 128 slots (4 probes from a key's home), and writes a sum
+as a row when its slot is needed for another, when it has been open `flight::FOLD_AGE` (50 ms),
+when the worker goes idle, when its ring passes to another thread, and when a build ends. Only
+blaze's CLI and daemon turn folding on (`flight::fold_below`, called in `blaze_cargo::cli::main`;
+until schema 3 nothing called it and every span was written); a test records every span unless it
+asks. On build 24 of the s05b home, 133 million of 154 million tagged spans were under 20 us and
+fold into about 1.1 million rows (measured from that build's spans; estimated, not yet recorded).
+
+The view `span_sums` is `spans` (one run a row) and `folded` (`spans` runs a row) under one shape
+(`runs`, `dur_ns`, `max_dur_ns`, `self_cpu_ns`, `allocs`, `alloc_bytes`, `root`, `query_kind`):
+count or time spans by name or query kind from it, not from `spans` alone.
 
 | column | type | |
 |---|---|---|
@@ -358,6 +378,8 @@ turn folding on (`flight::fold_below`); a test records every span unless it asks
 | self_cpu_ns | i64? | their own CPU, added, where the thread counts CPU |
 | alloc_bytes | u64? | the bytes they allocated, added |
 | allocs | u64? | the allocations they made, added |
+| parent_name | dict? | their parent's callsite name; null at a root |
+| parent_target | dict? | their parent's callsite target |
 
 ### `events`: one row a `tracing` event the recorder keeps, on the thread it happened on
 
@@ -383,6 +405,15 @@ fields are interned as one name, so a message that changes each time (a count, a
 name each time. `blaze debug time --trace` shows each event as an instant on its job's fiber
 track (its span's lane when it names no job, its thread's otherwise), and `--html` lists the
 build's first 500.
+
+Each link says its image's shape as events (crates/blaze-link/src/shape.rs), once a stage after
+its layout: `link region`, one a region with its `addr`, `size` (bytes placed), `capacity` (the
+range kept), `section` and `class`; and `link code`, the code's pieces and bytes `by=backend`
+(stencil, cranelift, llvm, native, linker, unsaid) and `by=crate` (the 16 largest, then the
+rest). `blaze explain link_regions` lists each image's regions by address with the bytes unused
+before each, and `blaze explain link_code` its code by backend and crate. A link refused for
+reach or room (`OutOfReach`, `NoRoom`, a field a value does not fit) shows the same regions in
+its message, the reach's two ends marked.
 
 ### `errors`: one row an error a build said: a diagnostic of level error, or each function a refused-functions error names
 
@@ -554,7 +585,7 @@ nothing while that thread flushed, and a flush of a busy build took 2 to 10 s: a
 102 s build step skipped about 42 million rows. Now a thread of its own (`blaze-drain`) reads the
 rings every `history::DRAIN` (50 ms), whatever the flush is doing, and asks for a flush once it
 holds `history::FLUSH_ROWS` rows; past `history::BACKLOG_ROWS` it stops reading and counts what is
-written over as `profile rows skipped behind`. Spans under `flight::FOLD_BELOW` (5 us) that no
+written over as `profile rows skipped behind`. Spans under `flight::FOLD_BELOW` (20 us) that no
 row names are summed into `folded` rows (below) instead of a row each; on that self-build 64% of
 the spans were under 2 us, and `find_container` and `Semantics::analyze_impl` (about 3 us) came
 360,000 a second on a worker, more than a ring holds between two reads. The gate counts the folded roots' time as covered. It also fails on every perf sample blocked in a mutex, condition
@@ -686,9 +717,16 @@ What the profile could not see is listed after the findings, as blind spots, nev
 - a critical path that stops short of the build's start;
 - rows the recorder lost (`rows_lost`): spans it had no slot for, rows a ring wrote over between
   drains, and of those the rows skipped while the history's writer was behind, each counted.
+- spans the model did not read (`spans_cut`, report version 4): a build of more spans than
+  `time::load::SPAN_BUDGET` (8 million) is modelled from those at or past the least floor (0, then
+  100 us, 1 ms, ... 1 s) that fits, with every root `job` and `wait` span and every unended one. The
+  report says the floor and the spans and time left out. A short span's time is its parent's
+  own, and a park inside a nested wait under the floor reads as an unnamed wait. The spans by name
+  still count every span.
+
 
 Its header says the recorder's loss on a line of its own, even when it lost nothing
-(`recorder: lost no rows; summed N spans under 5us into folded (S)`), and `--json` has it as
+(`recorder: lost no rows; summed N spans under 20us into folded (S)`), and `--json` has it as
 `summary.recorder`. A total in a report whose recorder lost rows is short by what they held.
 
 The analysis is `blaze_profile::slow::analyse`. It is a pure function over the time model
@@ -704,6 +742,20 @@ that was most of a cold build's switches and spans, and the tagged rows alone sh
 the work. Since then a pool job works for the build of the job that gave it to the pool
 (`blaze_graph::sched::Given::build`), on whichever thread it runs, so a `par::map` a build's
 codegen gives the pool is that build's.
+
+How far that reading goes is bounded. On 2026-11-03 one 52-minute cold build (build 24 of
+`s05b-home`) held 192 million spans, 130 million of them under 5 us. `blaze slow` read every one
+into the model, and was killed past 19 GiB of its own after DuckDB had taken 22 GB for that one
+query. Since 2026-11-04:
+- the build's spans are counted by duration in DuckDB first, and only the floor's are read
+  (above): 7.4 million of build 24's, at 10 ms;
+- a build past the budget even at the 1 s floor is refused (`TimeError::TooManySpans`), naming
+  its count, rather than read in part;
+- DuckDB runs with `sql::THREADS` (8) threads and `sql::MEMORY_LIMIT` (4 GB), spilling into the
+  query's scratch directory. Left alone it took every core and 80% of RAM;
+- queries that don't wait on each other's answers go to one DuckDB (`sql::run_all`). Making the
+  views reads the footer of every file of the history (17 CPU-seconds over a home of 6,000
+  files), so each extra process paid that again: `blaze slow` went from 13 DuckDB processes to 5.
 
 ## The flight recorder
 

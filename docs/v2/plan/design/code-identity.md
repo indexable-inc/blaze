@@ -188,10 +188,18 @@ naming its replacement (rule 11). The call sites are in the identity lane's hand
    that depends on one of the closure's, by any edge of the lock, is an input (its lock checksum
    or its manifest), since cargo unifies features across what it builds together.
    Cargo's unit records and the standard library's shared directory (which holds std units'
-   records alone) still key by the whole executable (`blaze_cargo::serve::unit::deps::build`):
-   a record is made by blaze-cargo, whose closure is every linked package but blaze-engine, so
-   a content identity of its code would move on the same edits. A record miss reruns the unit
-   against images and stores that stay. The trait solver has no identity of its own: hir-ty and
+   records alone) key by `RecordMakers` (`blaze_cargo::serve::record_makers`): `FRONT_END`,
+   `CODEGEN` and `RECORD`, the code identity of blaze-cargo and every package it is built from
+   but those `RECORD_CUT` names (the explorer and its page, the plane's history, the client's
+   rendering), each cut with why no record depends on it and the root files that name it, held
+   both ways by a test (`tests::cuts`); a cut that a closure package other than a root is built
+   from is refused. Never the executable's bytes: an edit of blaze-engine or a cut package keeps
+   every record. blaze-cargo's `the_record_identity_hashes_every_input_what_makes_a_record_read`
+   holds `RECORD` to dep-info like the front end's. Still one input: blaze-cargo whole, the CLI
+   and daemon with it, until record-making is a crate of its own. Accepted, as for the other two:
+   the C compiler, its flags and SDK for C in the closure (ring among it), and which `--features`
+   blaze itself is built with beyond what reaches a build script (`CARGO_FEATURE_*`). A record
+   miss reruns the unit against images and stores that stay. The trait solver has no identity of its own: hir-ty and
    the vendored solver crates are in `FRONT_END`'s closure, and the goal and item stores' solver
    version is a domain over it, so no build script runs in the front end (a `SOLVER` identity
    worked out by hir-ty's own build script reran hir-ty and its 36 dependents on every

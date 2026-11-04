@@ -1277,6 +1277,15 @@ pub(crate) struct File {
     pub debug: Vec<(u64, usize)>,
 }
 
+/// How far from its base a format's image may reach ([`Writer::window`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Window {
+    /// The most bytes from the base to the end of the last region's room.
+    pub bytes: u64,
+    /// What in the format sets it, as an error says it.
+    pub why: &'static str,
+}
+
 /// An object format.
 pub(crate) trait Writer: Send + Sync {
     fn format(&self) -> Format;
@@ -1290,6 +1299,21 @@ pub(crate) trait Writer: Send + Sync {
     fn order(&self, classes: &mut Vec<Class>);
 
     fn prot(&self, class: &Class) -> Prot;
+
+    /// How far from the base the image's regions may reach, their room included (a dev run's
+    /// reservations, which hold no bytes, aside): checked on the laid-out addresses before
+    /// anything is written (`Stage::check_reach`). `None` where the format sets no such limit
+    /// of its own.
+    fn window(&self) -> Option<Window> {
+        None
+    }
+
+    /// The section a region of `class` is in the file, as the format names it: what an error
+    /// about the region says.
+    fn section_name(&self, class: &Class) -> String {
+        // alloc: error path
+        format!("{class:?}")
+    }
 
     /// The class a section a static or native object names goes in, and its rank in that
     /// class: pieces of a lower rank go first, of one rank in input order. `.init_array.00099`
@@ -1404,6 +1428,14 @@ impl Writer for Formats {
     #[inline]
     fn prot(&self, class: &Class) -> Prot {
         each!(self, it => it.prot(class))
+    }
+
+    fn window(&self) -> Option<Window> {
+        each!(self, it => it.window())
+    }
+
+    fn section_name(&self, class: &Class) -> String {
+        each!(self, it => it.section_name(class))
     }
 
     #[inline]

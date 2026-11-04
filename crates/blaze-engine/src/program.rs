@@ -40,6 +40,15 @@ pub fn main() -> ExitCode {
         eprintln!("error: {why}");
         return ExitCode::FAILURE;
     }
+    // What unit records and the standard library's shared directory are keyed by, with the two
+    // above: the code of what makes a record, worked out in the same walk
+    // (`blaze_cargo::serve::record_makers`), never this executable's bytes.
+    if let Err(why) = blaze_cargo::serve::RecordCode::from_hex(env!("BLAZE_RECORD_CODE"))
+        .and_then(blaze_cargo::serve::set_record_code)
+    {
+        eprintln!("error: {why}");
+        return ExitCode::FAILURE;
+    }
     if as_rustc::is_me() {
         as_rustc::command();
     }

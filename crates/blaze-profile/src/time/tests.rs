@@ -50,6 +50,7 @@ fn span(thread: u32, span_id: u64, parent: Option<u64>, name: &str, start_ns: i6
         start_ns,
         dur_ns,
         self_cpu_ns: None,
+        folded_ns: 0,
     }
 }
 
@@ -393,6 +394,14 @@ fn a_thread_no_switch_names_is_a_lane_running_between_its_wait_spans() {
         [("running", 0, 10), ("parked_or_queued", 10, 40), ("running", 40, 50), ("unrecorded", 50, 80), ("running", 80, 100)]
     );
     assert_eq!(span_time(&m, 1).uncovered_ns(), 20);
+}
+
+#[test]
+fn a_spans_folded_children_are_covered_not_its_own() {
+    let outer = SpanIn { folded_ns: 6, ..span(5, 1, None, "client", 0, 50) };
+    let wait = span(5, 2, Some(1), WAIT_SPAN, 10, 30);
+    let m = model(vec![], vec![outer, wait], None);
+    assert_eq!(span_time(&m, 1).uncovered_ns(), 20 - 6, "running 20 under no row, 6 of it under folded children");
 }
 
 #[test]

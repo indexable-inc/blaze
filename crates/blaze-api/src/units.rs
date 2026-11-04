@@ -21,8 +21,9 @@ pub const LABEL: &str = "inc.indexable.blaze";
 const PLIST_FILE: &str = "inc.indexable.blaze.plist";
 pub const SOCKET_UNIT: &str = "blaze.socket";
 pub const SERVICE_UNIT: &str = "blaze.service";
-/// The variables of the installing shell the daemon is given, sorted: what it reads to find
-/// its state, socket and store, and the `PATH` and `HOME` of what it runs. `BLAZE_SANDBOX` is
+/// The variables of the installing shell the daemon is always given, sorted: what it reads to
+/// find its state, socket and store, and the `PATH` and `HOME` of what it runs. Beside them, the
+/// daemon settings the CLI names ([`here`]'s `settings`) that the shell sets. `BLAZE_SANDBOX` is
 /// never one: a sandbox turned off for one shell stays a choice of that shell.
 pub const CAPTURED: [&str; 5] = ["BLAZE_CACHE", "BLAZE_HOME", "HOME", "PATH", "XDG_CACHE_HOME"];
 /// A file the CLI writes says so in its first line.
@@ -41,7 +42,8 @@ pub struct Unit {
     pub socket: PathBuf,
     /// The file the daemon's output is appended to, absolute.
     pub log: PathBuf,
-    /// The daemon's environment, of [`CAPTURED`]'s names.
+    /// The daemon's environment, of [`CAPTURED`]'s names and the daemon settings [`here`] was
+    /// given.
     pub env: Vec<(String, String)>,
 }
 
@@ -364,18 +366,21 @@ pub fn place_here() -> Result<Place, UnitError> {
 }
 
 /// The [`Unit`] of `program` serving `socket`, logging to `log`, with this process's
-/// [`CAPTURED`] variables, and this user's [`Place`] for it.
+/// [`CAPTURED`] variables and its values of the daemon's `settings` (what the daemon keeps for
+/// its life, so a socket-started daemon has the installing shell's), and this user's [`Place`]
+/// for it.
 #[cfg(unix)]
-pub fn here(program: PathBuf, socket: PathBuf, log: PathBuf) -> Result<(Unit, Place), UnitError> {
+pub fn here(program: PathBuf, socket: PathBuf, log: PathBuf, settings: &[&str]) -> Result<(Unit, Place), UnitError> {
     let place = place_here()?;
-    let env = captured(|name| std::env::var(name).ok());
+    let env = captured(settings, |name| std::env::var(name).ok());
     Ok((Unit { program, socket, log, env }, place))
 }
 
-/// The variables of [`CAPTURED`] that `get` has, as [`Unit::env`] takes them.
-pub fn captured(get: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+/// The variables of [`CAPTURED`] and of `settings` that `get` has, as [`Unit::env`] takes them.
+pub fn captured(settings: &[&str], get: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
     CAPTURED
         .iter()
+        .chain(settings)
         // alloc: the variables, once per `blaze daemon install`.
         .filter_map(|name| Some(((*name).to_owned(), get(name).filter(|it| !it.is_empty())?)))
         // alloc: as above.

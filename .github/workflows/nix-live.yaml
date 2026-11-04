@@ -144,7 +144,8 @@ jobs:
     name: live edits (macOS arm64)
     if: github.event_name != 'pull_request'
     runs-on: macos-15
-    timeout-minutes: 60
+    # blaze-engine's build by blaze, from the tests job's store: longer than an hour when cold.
+    timeout-minutes: 240
     # Not required: it runs a daemon, a program and a patch between them on a hosted macOS VM,
     # which has been the least steady thing in the repository. Whatever it says is still shown.
     continue-on-error: true
@@ -159,10 +160,10 @@ jobs:
           job: tests
       # Where it is real code: the whole of macos.rs and the patch format.
       - run: nix develop --command blaze test --release -p blaze-live --locked
-      # The blaze that edits the program: cargo's, with no cache, since the blaze that blaze
-      # builds runs about ten times slower until it inlines one function into another
-      # (https://github.com/indexable-inc/blaze/issues/899).
-      - run: cargo build --release -p blaze-engine
+      # The blaze that edits the program: blaze's build of it (AGENTS.md rule
+      # blaze-builds-blaze), the one users get; then the stage 0's daemon ends before it starts.
+      - run: nix develop --command blaze build --release -p blaze-engine --locked
+      - run: blaze stop
       - name: edit a running program
         run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 harness/live_e2e.py
       - name: crash reports

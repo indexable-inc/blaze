@@ -13,8 +13,13 @@ use crate::span;
 /// Bumped when a column changes meaning or is removed; adding a nullable column at the end of
 /// a table does not bump it. At 2, among others: `spans.owner` names a job by its generation
 /// << 32 | its slot (was slot + 1), and so does `switches.wait_value` of a park on a job (was
-/// its slot).
-pub const VERSION: u32 = 2;
+/// its slot). At 3: `spans` no longer holds every span. Spans shorter than
+/// `flight::FOLD_BELOW` (waits shorter than `flight::WAIT_FOLD_BELOW`) are summed into
+/// `folded` rows a parent's site and site, and a span's self time is its duration less its
+/// children's rows and its `folded_ns`. A file of version 2 or older has no `folded_ns` column
+/// and folded nothing (no blaze before 3 turned folding on), so a null `folded_ns` reads as
+/// 0 and its spans' self time stays right.
+pub const VERSION: u32 = 3;
 
 /// The name of the clock the `*_ns` instants count on, as `hello` says it.
 #[cfg(target_os = "linux")]
@@ -118,15 +123,30 @@ const SPAN_FRAMES: [Column; 2] = [
     opt("frame_copied_bytes", Type::U64, "bytes those moves copied"),
 ];
 
+/// What a span's children folded into `folded` rows took of it (`flight::fold_below`), after
+/// the frame counts; added at version 3.
+const SPAN_FOLDED: [Column; 2] = [
+    opt(
+        "folded_spans",
+        Type::U64,
+        "its children too short for a row each (`folded`), summed under its name there; null when none was",
+    ),
+    opt(
+        "folded_ns",
+        Type::I64,
+        "their durations summed: its self time is dur_ns less its children's rows and this; null when none was",
+    ),
+];
+
 const SPAN_COLUMNS: usize =
-    SPAN_HEAD.len() + span::GENERIC + SPAN_FRAMES.len() + span::TYPED;
+    SPAN_HEAD.len() + span::GENERIC + SPAN_FRAMES.len() + SPAN_FOLDED.len() + span::TYPED;
 
 /// The span columns in their order: the head, the generic columns span kinds and ad hoc spans
-/// fill, the frame counts, then the typed columns only span kinds fill ([`span`]). A typed
-/// column added to the registry goes at the end, so it keeps `VERSION`.
+/// fill, the frame counts, the folded children, then the typed columns only span kinds fill
+/// ([`span`]). A typed column added to the registry goes at the end, so it keeps `VERSION`.
 const SPAN_ALL: [Column; SPAN_COLUMNS] = {
-    let parts: [&[Column]; 4] =
-        [&SPAN_HEAD, &span::GENERIC_COLUMNS, &SPAN_FRAMES, &span::TYPED_COLUMNS];
+    let parts: [&[Column]; 5] =
+        [&SPAN_HEAD, &span::GENERIC_COLUMNS, &SPAN_FRAMES, &SPAN_FOLDED, &span::TYPED_COLUMNS];
     let mut out = [SPAN_HEAD[0]; SPAN_COLUMNS];
     let mut at = 0;
     let mut part = 0;
@@ -249,12 +269,15 @@ pub const EVENTS: Table = Table {
     ],
 };
 
-/// One row a sum of short spans: those of a site, root or not, that a thread closed in a stretch
-/// of up to `flight::FOLD_AGE`, each shorter than `flight::FOLD_BELOW`, named by no other row
-/// and saying no typed column, folded instead of written one row each (`flight::fold_below`).
+/// One row a sum of short spans: those of a site under spans of one site, root or not, that a
+/// thread closed in a stretch of up to `flight::FOLD_AGE`, each shorter than
+/// `flight::FOLD_BELOW` and named by no other row, saying no typed column or a wait shorter
+/// than `flight::WAIT_FOLD_BELOW`, folded instead of written one row each
+/// (`flight::fold_below`). Every span folded is counted in one row here, and its parent's
+/// `spans` row says how many and how long (`folded_spans`, `folded_ns`).
 pub const FOLDED: Table = Table {
     name: "folded",
-    doc: "one row a sum of a site's short spans (under 5 us, named by no row) a thread closed in a stretch, kept as a sum instead of a row each",
+    doc: "one row a sum of a site's short spans under one parent's site (under 20 us, a wait under 1 us, named by no row) a thread closed in a stretch, kept as a sum instead of a row each",
     columns: &[
         BUILD_ID,
         PROCESS,
@@ -271,6 +294,12 @@ pub const FOLDED: Table = Table {
         opt("self_cpu_ns", Type::I64, "their self CPU summed, as `spans.self_cpu_ns`; null when not counted"),
         opt("alloc_bytes", Type::U64, "bytes their thread allocated while they were open, summed"),
         opt("allocs", Type::U64, "allocations made while they were open, summed"),
+        opt(
+            "parent_name",
+            Type::Dict,
+            "the name of the spans they were inside, as `spans.name`; null for roots and where none was open as they closed",
+        ),
+        opt("parent_target", Type::Dict, "that parent's tracing target, as `spans.target`"),
     ],
 };
 

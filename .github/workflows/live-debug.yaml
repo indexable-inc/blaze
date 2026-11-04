@@ -25,14 +25,20 @@ jobs:
   live-edits:
     name: live edits (macOS arm64, debug)
     runs-on: macos-15
-    timeout-minutes: 90
+    # A store main's build job has not compiled into builds for longer than an hour on macOS.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
-      # cargo, with no cache: this debugs blaze as rustc compiles it, since the blaze that blaze
-      # builds runs about ten times slower until it inlines one function into another
-      # (https://github.com/indexable-inc/blaze/issues/899).
-      - run: cargo build --release -p blaze-engine
+      # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version
+      # names and the pinned LLVM, as blaze-platform.yaml's build job has them, from the store
+      # main's build job pushed. This debugs the blaze users get, which blaze builds.
+      - uses: ./.github/actions/blaze
+        with:
+          job: build
+          llvm: true
+      - run: blaze build --release -p blaze-engine --locked
+      # The stage 0's daemon ends before the blaze just built starts one of its own.
+      - run: blaze stop
       - name: edit a running program, edit after edit
         env:
           LIVE_EDITS: ${{ inputs.edits || '8' }}

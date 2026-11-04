@@ -105,6 +105,11 @@ pub enum DaemonError {
     /// The daemon was started and closed its ready pipe in `phase`, before it listened, and
     /// had not ended a moment ([`ENDING`]) after.
     Closed { socket: PathBuf, log: PathBuf, pid: u32, phase: Phase },
+    /// The daemon reached keeps for its life settings this command sets to other values
+    /// ([`crate::serve::settings::drift`]): refused before any request, each named with both
+    /// values. `activated`: a socket unit starts it, with the settings `blaze daemon install`
+    /// captured.
+    Drifted { socket: PathBuf, pid: u32, drift: Vec<crate::serve::settings::Drift>, activated: bool },
 }
 
 impl std::fmt::Display for DaemonError {
@@ -138,6 +143,22 @@ impl std::fmt::Display for DaemonError {
                 socket.display(),
                 log.display()
             ),
+            DaemonError::Drifted { socket, pid, drift, activated } => {
+                let said = crate::serve::settings::said(drift);
+                let fix = match activated {
+                    true => "its socket unit starts it with the daemon settings of the shell that ran `blaze daemon \
+                             install`: run `blaze daemon install` again from a shell with this command's values (it \
+                             captures them and restarts the daemon), or run this command without them",
+                    false => "`blaze stop`, then run this again, and the daemon it starts has this command's values; or \
+                              run this command without them, to build with the daemon's",
+                };
+                write!(
+                    f,
+                    "the daemon at {} (pid {pid}) keeps for its life other settings than this command sets: {said}. \
+                     Nothing was sent to it; {fix}",
+                    socket.display()
+                )
+            }
         }
     }
 }
@@ -157,8 +178,11 @@ pub fn nothing_listens(error: &ClientError) -> bool {
 /// only where no unit serves the socket, and says so.
 ///
 /// A command that may start one ([`Start::IfMissing`]) first asks the daemon that answers which
-/// blaze it is ([`builds`]): one of another build is stopped, saying so, and this one started,
-/// so no request of this blaze runs on another's.
+/// blaze it is and what it was started with ([`builds`]): one of another build is stopped,
+/// saying so, and this one started, so no request of this blaze runs on another's; one keeping
+/// other values of settings this command sets ([`crate::serve::settings`]) is refused before
+/// any request, naming each setting, both values and the fix ([`DaemonError::Drifted`]), so no
+/// build runs under values it did not ask for. It is never restarted over them.
 #[cfg(all(unix, feature = "native"))]
 pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     let socket = crate::serve::socket()?;
@@ -221,22 +245,27 @@ fn reaped(status: std::process::ExitStatus) -> Option<Reaped> {
 /// written first.
 pub const REPLACING: Duration = Duration::from_secs(120);
 
-/// Whether the daemon a client reached is this blaze ([`builds`]).
+/// Whether the daemon a client reached is this blaze, started as this command asks ([`builds`]).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Builds {
     Same,
     /// Another build: the daemon's pid and build, and this blaze's.
     Other { pid: u32, theirs: blaze_api::Build, ours: blaze_api::Build },
+    /// This build, keeping other values of settings the command's environment sets: the
+    /// daemon's pid and each setting that differs.
+    Settings { pid: u32, drift: Vec<crate::serve::settings::Drift> },
 }
 
 /// Asks the daemon on `api` for its [`Status`], and for nothing else, and says whether it is
 /// this blaze: its executable is `ours`, unchanged, or else this blaze's build (`hash`, called
-/// only then, as it reads this blaze's bytes) has its build's hash. A daemon of another schema
-/// can't be told to stop by this one: that is the error, naming both.
+/// only then, as it reads this blaze's bytes) has its build's hash; and, when it is, whether it
+/// keeps the values of the `settings` this command sets ([`crate::serve::settings::drift`]). A
+/// daemon of another schema can't be told to stop by this one: that is the error, naming both.
 pub fn builds<A: Api>(
     api: &mut A,
     socket: &Path,
     ours: &blaze_api::Executable,
+    settings: &[blaze_api::Setting],
     hash: impl FnOnce() -> anyhow::Result<blaze_api::Build>,
 ) -> anyhow::Result<Builds> {
     let mut status = None;
@@ -260,14 +289,17 @@ pub fn builds<A: Api>(
     let Some(status) = status.filter(|_| ok) else {
         anyhow::bail!("the daemon at {} answered its Status with no status: {}", socket.display(), said.join("; "));
     };
-    if status.build.exe == *ours {
+    if status.build.exe != *ours {
+        let ours = hash()?;
+        if ours.id != status.build.id {
+            return Ok(Builds::Other { pid: status.pid, theirs: status.build, ours });
+        }
+    }
+    let drift = crate::serve::settings::drift(settings, &status.settings);
+    if drift.is_empty() {
         return Ok(Builds::Same);
     }
-    let ours = hash()?;
-    if ours.id == status.build.id {
-        return Ok(Builds::Same);
-    }
-    Ok(Builds::Other { pid: status.pid, theirs: status.build, ours })
+    Ok(Builds::Settings { pid: status.pid, drift })
 }
 
 /// `build`'s path and the start of its hash, as a line names it.
@@ -278,19 +310,28 @@ fn named(build: &blaze_api::Build) -> String {
 }
 
 /// The connection `client` was, made again for the command's own request, when its daemon is
-/// this blaze; `None` once one of another build was stopped, for this one to start.
+/// this blaze keeping the settings this command sets ([`DaemonError::Drifted`] when not);
+/// `None` once one of another build was stopped, for this one to start.
 #[cfg(all(unix, feature = "native"))]
 fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client>> {
     use anyhow::Context as _;
     let exe = std::env::current_exe().context("finding blaze's own executable")?;
     let file = std::fs::File::open(&exe).with_context(|| format!("reading blaze itself, {}", exe.display()))?;
     let ours = crate::serve::executable(&exe, &file)?;
-    let (pid, theirs, ours) = match builds(&mut client, socket, &ours, || crate::serve::build_of(&exe))? {
+    let settings = crate::serve::settings::of_client(|name| std::env::var_os(name));
+    let (pid, theirs, ours) = match builds(&mut client, socket, &ours, &settings, || crate::serve::build_of(&exe))? {
         Builds::Same => {
             return match Client::unix(socket) {
                 Ok(client) => Ok(Some(client)),
                 Err(error) => Err(DaemonError::Connect { socket: socket.to_owned(), error }.into()),
             };
+        }
+        // Never a restart: one daemon serves every lane of a home, and a restart on each
+        // difference would cut off a build that arrived since the Status, and two lanes of
+        // other values would take turns restarting it (earlyfail, round 2).
+        Builds::Settings { pid, drift } => {
+            let activated = activation(socket)? == Installed::Yes;
+            return Err(DaemonError::Drifted { socket: socket.to_owned(), pid, drift, activated }.into());
         }
         Builds::Other { pid, theirs, ours } => (pid, theirs, ours),
     };
@@ -760,11 +801,16 @@ pub fn units(verb: DaemonVerb, err: &mut dyn std::io::Write, color: bool) -> any
     use blaze_api::units;
     let socket = crate::serve::socket()?;
     let place = units::place_here()?;
+    let settings = crate::serve::settings::STARTED_WITH;
+    let mut kept = String::new();
     let steps = match verb {
         DaemonVerb::Install => {
             let program = std::env::current_exe().context("finding blaze's own executable")?;
             let log = crate::serve::state()?.join("serve.log");
-            let (unit, place) = units::here(program, socket.clone(), log)?;
+            let (unit, place) = units::here(program, socket.clone(), log, settings)?;
+            for (name, value) in unit.env.iter().filter(|(name, _)| settings.contains(&name.as_str())) {
+                kept.push_str(&format!(" {name}={value}")); // alloc: the install's line, once
+            }
             units::install(&unit, &place)?
         }
         DaemonVerb::Uninstall => match units::installed(&place, &socket)? {
@@ -786,9 +832,15 @@ pub fn units(verb: DaemonVerb, err: &mut dyn std::io::Write, color: bool) -> any
     match verb {
         DaemonVerb::Install => writeln!(
             err,
-            "installed {}: the system starts the daemon at the first connection to {}",
+            "installed {}: the system starts the daemon at the first connection to {}, with {}; a command \
+             that sets another value of one is refused, and `blaze daemon install` from a shell with the new \
+             values changes them",
             units::main_file(&place).display(),
-            socket.display()
+            socket.display(),
+            match kept.is_empty() {
+                true => "none of the daemon settings set (this shell sets none of them)".to_owned(),
+                false => format!("the daemon settings of this shell:{kept}"), // alloc: the install's line, once
+            }
         )?,
         DaemonVerb::Uninstall => writeln!(err, "uninstalled the units in {}", place.dir.display())?,
     }
@@ -837,6 +889,16 @@ pub fn status_lines(status: &Status) -> String {
     );
     if let Some(why) = &status.history {
         lines.push_str(&format!("history: {why}\n"));
+    }
+    // The settings it was started with that are set: what a client setting other values is
+    // refused over ([`crate::serve::settings`]).
+    let set: Vec<String> = status
+        .settings
+        .iter()
+        .filter_map(|it| Some(format!("{}={}", it.name, it.value.as_deref()?)))
+        .collect();
+    if !set.is_empty() {
+        lines.push_str(&format!("settings: {}\n", set.join(" ")));
     }
     // The bugs the daemon went on past, always said, so 0 is read as checked.
     let bugs: u64 = status.bugs.iter().map(|it| it.count).sum();

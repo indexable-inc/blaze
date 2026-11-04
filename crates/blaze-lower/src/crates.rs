@@ -381,6 +381,194 @@ pub(crate) fn built_for(of: BuiltFor<'_>) -> base_db::BuiltFor {
     base_db::BuiltFor { platform: of.platform.map(Symbol::intern), macro_wasm: of.macro_wasm }
 }
 
+/// The variables of a build script's run that its dependents' profile decides beside
+/// `OUT_DIR`: `OPT_LEVEL` and `DEBUG`, the profile's opt-level and debuginfo. A `cc`-based
+/// script writes other objects for each, and may write other sources, cfgs or variables too.
+const RUN_PROFILE_VARS: [&str; 2] = ["OPT_LEVEL", "DEBUG"];
+
+/// The cfg atom of a crate whose unit depends on a build script's run of a run family of more
+/// than one run class ([`run_classes`]): `blaze::build_script_profile = "OPT_LEVEL=0 DEBUG=false"`,
+/// that run's [`RUN_PROFILE_VARS`]. Two such crates alike but for their run are two, and their
+/// output may differ, so this tells their keys apart (`blaze_items::key::crate_key` hashes every
+/// cfg atom; rule keys-cover-every-input), and every dependent's key after them by its
+/// dependencies'. Not an identifier, so no `cfg(...)` of a program names it, and set after the
+/// target's cfgs and rustc's flags, so neither `--print cfg` nor `CARGO_CFG_*` shows it.
+pub(crate) const RUN_PROFILE: &str = "blaze::build_script_profile";
+
+/// What makes two build script runs one run class, or one run family ([`run_classes`]):
+/// everything of the run but the variables `ignored` names. Its dependencies are by their unit,
+/// a run's by its class (or family).
+#[derive(PartialEq, Eq, Hash)]
+struct RunKey<'a> {
+    pkg_id: &'a str,
+    target: &'a str,
+    src_path: &'a std::path::Path,
+    built_for: BuiltFor<'a>,
+    features: &'a [String],
+    is_std: bool,
+    deps: Vec<(usize, &'a str)>,
+    env: Vec<(&'a str, &'a str)>,
+    cfgs: &'a [String],
+    rustflags: &'a [String],
+    links: Option<&'a str>,
+    unsandboxed: bool,
+}
+
+/// The build's runs of build scripts by what the front end can tell of them before they run.
+pub(crate) struct RunClasses {
+    /// Each unit's run class: for a build script's run, the first run (by index) of the runs of
+    /// that build script apart only in their `OUT_DIR`, whose name cargo hashes from the
+    /// profile (two profiles apart only in what the run never reads, as `codegen-units`, `lto`
+    /// or `strip`). Their inputs are the same, so they are one run to the front end, read under
+    /// the first's `OUT_DIR`, and the units apart only in which run of a class they depend on
+    /// are one crate (`lower_writes`). Any other unit is its own.
+    pub(crate) class: Vec<usize>,
+    /// By unit, for a run: whether its run family (its runs apart only in `OUT_DIR` and
+    /// [`RUN_PROFILE_VARS`]) has runs of another class. cargo runs a build script once per
+    /// profile of the units depending on it, so a release build's host package reached both
+    /// as a normal dependency (`profile.release`) and as a build dependency
+    /// (`profile.release.build-override`, opt-level 0) has two runs that differ in `OPT_LEVEL`.
+    /// What they give is known only once both ran, and may differ, so their dependents are two
+    /// crates, each read from its own run as rustc reads them, and the crates of such a run's
+    /// dependents carry [`RUN_PROFILE`].
+    pub(crate) keyed: Vec<bool>,
+}
+
+/// The build's [`RunClasses`].
+pub(crate) fn run_classes(units: &Units) -> RunClasses {
+    let class = run_partition(units, &["OUT_DIR"]);
+    let family = run_partition(units, &["OUT_DIR", RUN_PROFILE_VARS[0], RUN_PROFILE_VARS[1]]);
+    // alloc: once a lowering, a flag per unit
+    let mut keyed = vec![false; class.len()];
+    // The class of each family's first run, and whether another class was seen in it.
+    // alloc: once a lowering, an entry per family of runs
+    let mut seen: blaze_hash::HashMap<usize, (usize, bool), std::alloc::Global> =
+        blaze_hash::HashMap::new_in(std::alloc::Global);
+    let runs = || (0..class.len()).filter(|&at| units.graph.units[at].mode == Mode::RunCustomBuild);
+    for at in runs() {
+        let entry = seen.entry(family[at]).or_insert((class[at], false));
+        entry.1 |= entry.0 != class[at];
+    }
+    for at in runs() {
+        keyed[at] = seen.get(&family[at]).is_some_and(|&(_, more)| more);
+    }
+    RunClasses { class, keyed }
+}
+
+/// Each unit's part of the build's runs by everything but the variables `ignored` names: for a
+/// run, the first run (by index) of its part; any other unit is its own.
+///
+/// A run's dependencies count by their own part, so runs of a `links` package's dependents that
+/// wait on two runs of one part are one part too: parts only merge from pass to pass, so the
+/// passes settle within one per run (the longest chain of runs), and one more to see it.
+fn run_partition(units: &Units, ignored: &[&str]) -> Vec<usize> {
+    let all = &units.graph.units;
+    let mut part: Vec<usize> = (0..all.len()).collect(); // alloc: once a lowering, one per unit
+    let runs = all.iter().filter(|it| it.mode == Mode::RunCustomBuild).count();
+    if runs < 2 {
+        return part;
+    }
+    for _ in 0..=runs {
+        // The first run of each part, once a pass of a lowering.
+        let mut first: blaze_hash::HashMap<RunKey<'_>, usize, std::alloc::Global> =
+            blaze_hash::HashMap::new_in(std::alloc::Global); // alloc: once a pass of a lowering, a key per run
+        let mut moved = false;
+        for (index, unit) in all.iter().enumerate() {
+            if unit.mode != Mode::RunCustomBuild {
+                continue;
+            }
+            let plan = &units.plans[index];
+            let key = RunKey {
+                pkg_id: &unit.pkg_id,
+                target: &unit.target.name,
+                src_path: &unit.target.src_path,
+                built_for: unit.built_for(),
+                features: &unit.features,
+                is_std: unit.is_std,
+                deps: unit
+                    .dependencies
+                    .iter()
+                    .map(|dep| (part.get(dep.index).copied().unwrap_or(dep.index), dep.extern_crate_name.as_str()))
+                    .collect(), // alloc: as `first`, one per run
+                env: plan
+                    .env
+                    .iter()
+                    .filter(|(name, _)| !ignored.contains(&name.as_str()))
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect(), // alloc: as `first`, one per run
+                cfgs: &plan.cfgs,
+                rustflags: &plan.rustflags,
+                links: plan.links.as_deref(),
+                unsandboxed: plan.unsandboxed,
+            };
+            let rep = *first.entry(key).or_insert(index);
+            if part[index] != rep {
+                part[index] = rep;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    part
+}
+
+/// The [`RUN_PROFILE`] atom of a crate whose unit depends on run `run`: each of the run's
+/// [`RUN_PROFILE_VARS`] as `NAME=value`, or `NAME unset`.
+pub(crate) fn run_profile_atom(units: &Units, run: usize) -> CfgAtom {
+    let env = units.plans.get(run).map_or(&[][..], |it| it.env.as_slice());
+    let value = RUN_PROFILE_VARS
+        .iter()
+        .map(|name| match env.iter().find(|(it, _)| it == name) {
+            Some((_, value)) => format!("{name}={value}"), // alloc: once per crate of such a run, its atom
+            None => format!("{name} unset"),               // alloc: as above
+        })
+        .collect::<Vec<_>>() // alloc: as above
+        .join(" ");
+    CfgAtom::KeyValue { key: Symbol::intern(RUN_PROFILE), value: Symbol::intern(&value) }
+}
+
+/// `unit`'s variables (`plan.env`) as its crate is made with them: an `OUT_DIR` that is one of
+/// its runs' named by its run class's ([`run_classes`]), so units apart only in which run of a
+/// class they depend on have one crate. A run's own `OUT_DIR` is in its plan.
+pub(crate) fn class_env(units: &Units, unit: &Unit, env: &[(String, String)], class: &[usize]) -> Vec<(String, String)> {
+    let mut out = env.to_vec(); // alloc: once per unit lowered, its variables, which its crate and lowering keep
+    for (name, value) in &mut out {
+        if name != "OUT_DIR" {
+            continue;
+        }
+        let run = unit.dependencies.iter().map(|dep| dep.index).find(|&at| {
+            units.graph.units.get(at).is_some_and(|it| it.mode == Mode::RunCustomBuild)
+                && units.plans.get(at).and_then(|it| it.out_dir.as_deref()) == Some(value.as_str())
+        });
+        if let Some(canonical) = run.and_then(|at| units.plans[class[at]].out_dir.as_ref()) {
+            value.clone_from(canonical);
+        }
+    }
+    out
+}
+
+/// `bytes` with each `from` in it written as `to`; borrowed when there is none.
+pub(crate) fn replace_bytes<'a>(bytes: &'a [u8], from: &[u8], to: &[u8]) -> Cow<'a, [u8]> {
+    let Some(&head) = from.first() else { return Cow::Borrowed(bytes) };
+    let found = |at: usize| bytes[at] == head && bytes[at..].starts_with(from);
+    let Some(mut at) = (0..bytes.len()).find(|&at| found(at)) else { return Cow::Borrowed(bytes) };
+    let mut out = Vec::with_capacity(bytes.len()); // alloc: a run's file that names its `OUT_DIR`, once per apply
+    let mut kept = 0;
+    loop {
+        out.extend_from_slice(&bytes[kept..at]);
+        out.extend_from_slice(to);
+        kept = at + from.len();
+        match (kept..bytes.len()).find(|&at| found(at)) {
+            Some(next) => at = next,
+            None => break,
+        }
+    }
+    out.extend_from_slice(&bytes[kept..]);
+    Cow::Owned(out)
+}
+
 /// The standard library's crates are the language's, path packages local, the rest libraries.
 pub(crate) fn origin(package: &PackagePlan, unit: &Unit) -> CrateOrigin {
     if unit.is_std {

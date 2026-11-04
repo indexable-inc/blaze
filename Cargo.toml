@@ -157,6 +157,9 @@ dyn_fn_param = "warn"
 box_large_new = "warn"
 # Zero findings since every span outside a `blaze*` crate named `target: "blaze"`.
 unrecorded_span = "deny"
+# `lenient_deserialize` (a serde `Deserialize` derive without `#[serde(deny_unknown_fields)]`,
+# which drops an unknown field silently; AGENTS.md rule 3) is on through `internal` above, at
+# `warn`; other workspaces opt in.
 
 # llvm-sys's build script (vendor/llvm-sys/pin.rs) checks the pinned LLVM `nix develop` names.
 [workspace.metadata.blaze.sandbox]
@@ -201,6 +204,14 @@ debug = 0
 # after every edit, so its rebuild time is the edit loop ("make release mode at least incremental",
 # Andrew, 2026-11-03; a release rebuild took 5-12 min). The shipped binary is `dist`, built from
 # scratch with incremental off.
+incremental = true
+
+# bootstrap: stage 0 refuses build-override and release twins of one crate (crossbeam-channel) as
+# one key twice (fixed by crateclash); matching the profiles makes them one unit. Drop at the next stage.
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 16
+debug = 0
 incremental = true
 
 # As in `profile.dev.package`: build dependencies are built at opt-level 0 otherwise.
@@ -288,6 +299,7 @@ blaze-units = { path = "crates/blaze-units" }
 blaze-lower = { path = "crates/blaze-lower" }
 blaze-wasm-pack = { path = "crates/blaze-wasm-pack" }
 blaze-doc = { path = "crates/blaze-doc" }
+blaze-fmt = { path = "crates/blaze-fmt" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
 blaze-core = { path = "crates/blaze-core" }
 blaze-graph = { path = "crates/blaze-graph" }
@@ -313,6 +325,7 @@ blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-codegen-code = { path = "crates/blaze-codegen-code" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
+blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-hash = { path = "crates/blaze-hash" }
 blaze-ids = { path = "crates/blaze-ids" }
@@ -565,6 +578,8 @@ rsasm = { version = "=0.1.3", default-features = false, features = ["x86", "aarc
 lzma-rust2 = { version = "0.24.0", default-features = false }
 # blaze's map shared between threads (`blaze_hash::SharedMap`): lock-free reads, no guard held across calls.
 papaya = "0.2.5"
+# SHA-512 for blaze-fetch's pins; SHA-256 is blaze-sha256's.
+sha2 = "0.11"
 # blaze's locks and condition variables: `std::sync`'s are disallowed (`.clippy.toml`).
 parking_lot = "0.12.5"
 pathdiff = "0.2.3"

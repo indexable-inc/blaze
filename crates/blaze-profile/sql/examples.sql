@@ -155,14 +155,14 @@ ORDER BY runs.from_ns, runs.step DESC
 LIMIT $limit
 
 -- name: allocations_per_query_kind
--- says: a build's allocations per query kind: bytes and allocations made while its spans were open (the queries under them too)
+-- says: a build's allocations per query kind: bytes and allocations made while its spans were open (the queries under them too), folded runs counted
 SELECT
     query_kind,
-    count(*) AS runs,
+    sum(runs) AS runs,
     sum(alloc_bytes) AS alloc_bytes,
     sum(allocs) AS allocs,
-    round(sum(alloc_bytes) / count(*)) AS bytes_per_run
-FROM spans
+    round(sum(alloc_bytes) / sum(runs)) AS bytes_per_run
+FROM span_sums
 WHERE build_id = $build AND query_kind IS NOT NULL
 GROUP BY query_kind
 ORDER BY alloc_bytes DESC NULLS LAST
@@ -176,15 +176,15 @@ ORDER BY dur_ns DESC
 LIMIT $limit
 
 -- name: busiest_threads
--- says: the threads that spent most of a build inside spans, by the time of their outermost spans
+-- says: the threads that spent most of a build inside spans, by the time of their outermost spans, folded ones counted
 SELECT
     process,
     thread,
     any_value(thread_name) AS thread_name,
     sum(dur_ns) / 1e6 AS busy_ms,
-    count(*) AS spans
-FROM spans
-WHERE build_id = $build AND depth = 0
+    sum(runs) AS spans
+FROM span_sums
+WHERE build_id = $build AND root
 GROUP BY process, thread
 ORDER BY busy_ms DESC
 LIMIT $limit
@@ -218,14 +218,14 @@ ORDER BY taken DESC
 LIMIT $limit
 
 -- name: time_by_span_name
--- says: a build's time per span name: how many, their whole time, their own CPU time and the longest
+-- says: a build's time per span name: how many, their whole time, their own CPU time and the longest, folded spans counted
 SELECT
     name,
-    count(*) AS spans,
+    sum(runs) AS spans,
     sum(dur_ns) / 1e6 AS total_ms,
     sum(self_cpu_ns) / 1e6 AS self_cpu_ms,
-    max(dur_ns) / 1e6 AS longest_ms
-FROM spans
+    max(max_dur_ns) / 1e6 AS longest_ms
+FROM span_sums
 WHERE build_id = $build
 GROUP BY name
 ORDER BY total_ms DESC
@@ -480,10 +480,20 @@ ORDER BY errors DESC, kind
 -- name: reexecution_per_query_kind
 -- says: per query function in a build, the work repeated and what eviction cost: runs, rows verified without running, runs of a row in a view it already ran in, runs for an evicted value, and values a budget's pass let go or dropped (the query engine's counts, `query_counts`), beside its spans' runs, distinct function names and time; a span's `function` is a display name several bodies share, so span_names undercounts keys
 WITH spanned AS (
-    SELECT query_kind, count(*) AS span_runs, count(DISTINCT function) AS span_names, sum(dur_ns) AS span_ns
-    FROM spans
-    WHERE build_id = $build AND query_kind IS NOT NULL
-    GROUP BY query_kind
+    SELECT sums.query_kind, sums.span_runs, named.span_names, sums.span_ns
+    FROM (
+        SELECT query_kind, sum(runs) AS span_runs, sum(dur_ns) AS span_ns
+        FROM span_sums
+        WHERE build_id = $build AND query_kind IS NOT NULL
+        GROUP BY query_kind
+    ) AS sums
+    LEFT JOIN (
+        -- A folded span has no `function`: the names are of the spans with a row.
+        SELECT query_kind, count(DISTINCT function) AS span_names
+        FROM spans
+        WHERE build_id = $build AND query_kind IS NOT NULL
+        GROUP BY query_kind
+    ) AS named USING (query_kind)
 ), counted AS (
     SELECT * FROM query_counts WHERE build_id = $build
 ), kinds AS (
@@ -520,3 +530,49 @@ LEFT JOIN counters ON counters.t_ns >= builds.started_ns AND counters.t_ns <= bu
 GROUP BY builds.build_id
 ORDER BY builds.build_id DESC
 LIMIT $limit
+
+-- name: link_regions
+-- says: each region of each image a build linked, by address, as the stage that laid it out said it (`link region` events, crates/blaze-link/src/shape.rs): its section and class, address, bytes placed, room, and the bytes unused before it
+WITH regions AS (
+    SELECT
+        regexp_extract(message, ' image=(\S+)', 1) AS image,
+        cast(regexp_extract(message, ' generation=(\d+)', 1) AS bigint) AS generation,
+        regexp_extract(message, ' full=(\S+)', 1) = 'true' AS whole,
+        cast(regexp_extract(message, ' addr=(\d+)', 1) AS bigint) AS addr,
+        cast(regexp_extract(message, ' size=(\d+)', 1) AS bigint) AS size,
+        cast(regexp_extract(message, ' capacity=(\d+)', 1) AS bigint) AS capacity,
+        regexp_extract(message, ' section=(\S+)', 1) AS section,
+        regexp_extract(message, ' class=(.*)$', 1) AS class
+    FROM events
+    WHERE build_id = $build AND starts_with(message, 'link region ')
+)
+SELECT
+    image,
+    generation,
+    whole,
+    section,
+    class,
+    addr,
+    size,
+    capacity,
+    addr - lag(addr + greatest(size, capacity)) OVER (PARTITION BY image, generation ORDER BY addr) AS unused_before
+FROM regions
+ORDER BY image, generation, addr
+
+-- name: link_code
+-- says: the code of each image a build linked (its code, patch, stub and executable named regions), by backend (stencil, cranelift, llvm, native, linker, unsaid) and by crate (the 16 largest, then the rest as one row): pieces and bytes, as the stage that laid it out said it (`link code` events, crates/blaze-link/src/shape.rs); an incremental stage's rows count only the code it placed
+WITH code AS (
+    SELECT
+        regexp_extract(message, ' image=(\S+)', 1) AS image,
+        cast(regexp_extract(message, ' generation=(\d+)', 1) AS bigint) AS generation,
+        regexp_extract(message, ' full=(\S+)', 1) = 'true' AS whole,
+        regexp_extract(message, ' by=(\S+)', 1) AS summed_by,
+        cast(regexp_extract(message, ' pieces=(\d+)', 1) AS bigint) AS pieces,
+        cast(regexp_extract(message, ' bytes=(\d+)', 1) AS bigint) AS code_bytes,
+        regexp_extract(message, ' what=(.*)$', 1) AS what
+    FROM events
+    WHERE build_id = $build AND starts_with(message, 'link code ')
+)
+SELECT image, generation, whole, summed_by, what, pieces, code_bytes
+FROM code
+ORDER BY image, generation, summed_by, code_bytes DESC, what

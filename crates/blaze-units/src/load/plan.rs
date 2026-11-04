@@ -617,8 +617,39 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         }));
     }
 
+    one_unit_per_path(units, &plans)?;
     let base = input.base_profile;
     Ok(PlanOutput { plans, finished: finished(input.requested_profile, &base.opt_level, base.debuginfo.is_turned_on()) })
+}
+
+/// One path, one unit: two units planned to write one file (a binary's or an example's copy in
+/// the profile's directory, a test's program in its `deps`, of two packages' targets of one
+/// name) are refused, naming both and the file, where cargo warns and the last to finish wins:
+/// what is there would hang on which unit was placed last.
+fn one_unit_per_path(units: &[Unit], plans: &[Option<UnitPlan>]) -> Result<(), LoadError> {
+    let count = plans.iter().flatten().map(|it| it.outputs.len()).sum();
+    // alloc: once per plan, a key per output path, dropped when checked
+    let mut owner: HashMap<&str, usize, Global> = HashMap::with_capacity_in(count, Global);
+    for (at, plan) in plans.iter().enumerate() {
+        let Some(plan) = plan else { continue };
+        for path in &plan.outputs {
+            match owner.entry(path.as_str()) {
+                Entry::Vacant(it) => {
+                    it.insert(at);
+                }
+                Entry::Occupied(it) if *it.get() == at => {}
+                Entry::Occupied(it) => {
+                    let (first, second) = (&units[*it.get()], &units[at]);
+                    return Err(error(format!(
+                        "`{}`'s {:?} target `{}` and `{}`'s {:?} target `{}` would both be placed at `{path}`, and one path is \
+                         one unit's [one-unit-per-path]: rename one of the targets, or build one package at a time",
+                        first.pkg_id, first.mode, first.target.name, second.pkg_id, second.mode, second.target.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The unit's `Metadata`, its dependencies' first.

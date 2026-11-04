@@ -1246,11 +1246,15 @@ fn a_fold_candidate_prepared_as_another_shape_than_the_landed_fails_the_build() 
 }
 
 /// A chain of `count` functions from 1, each calling the next, all of `body` and `drop_glue`.
+/// Each that calls the next is one generic's code, as instances whose code reads their
+/// arguments alike are; the last, which calls nothing, is other code (the base case's impl),
+/// as a front end describes it: one code with one reference fewer would be one instance key
+/// for two bodies, which the walk refuses (rule 18).
 fn chain(count: u32, drop_glue: bool, limit: u32) -> Program {
     let mut program = Program { recursion_limit: Some(limit), ..Program::default() };
     for id in 1..=count {
         let calls: &[u32] = if id < count { &[id + 1] } else { &[] };
-        program.function(id, 0x77, calls).code_of = Some(1);
+        program.function(id, 0x77, calls).code_of = (id < count).then_some(1);
         program.bodies.insert(id, (7, drop_glue));
     }
     program.functions.get_mut(&1).unwrap().symbol = Some("main".to_owned());
@@ -1347,12 +1351,13 @@ fn the_limit_counts_on_rustcs_depth_first_path_not_the_shortest() {
     program.function(1, 0x11, &[pad(75), go(130)]).symbol = Some("main".to_owned());
     for k in 0..=75 {
         let calls = if k == 0 { [go(60)] } else { [pad(k - 1)] };
-        program.function(pad(k), 0x22, &calls).code_of = Some(1);
+        // `Z`'s impl (`k == 0`) is its own code; each `S<N>`'s is the one generic's.
+        program.function(pad(k), 0x22, &calls).code_of = (k != 0).then_some(1);
         program.bodies.insert(pad(k), (if k == 0 { 3 } else { 2 }, false));
     }
     for k in 0..=130 {
         let calls: &[u32] = if k == 0 { &[] } else { &[go(k - 1)] };
-        program.function(go(k), 0x33, calls).code_of = Some(1);
+        program.function(go(k), 0x33, calls).code_of = (k != 0).then_some(1);
         program.bodies.insert(go(k), (if k == 0 { 5 } else { 4 }, false));
     }
     let built = Build::new(&Machine::default(), &program, &policy, &Memo::new()).run(&[(1, member())], &Store::default());

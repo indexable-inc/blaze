@@ -2,8 +2,8 @@
 //! and dynamic libraries (`MH_DYLIB`) on AArch64 and x86-64, laid out as ld64 lays them.
 //!
 //! Segments, in address order: `__PAGEZERO` (an executable's first 4 GiB, unmapped),
-//! `__TEXT` (the headers, code, read-only data, `__unwind_info`, `__eh_frame`: read and
-//! run), `__DATA_CONST` (what the loader fixes up and then makes read-only: the GOT,
+//! `__TEXT` (the headers, an incremental image's patch code, code, read-only data,
+//! `__unwind_info`, `__eh_frame`: read and run), `__DATA_CONST` (what the loader fixes up and then makes read-only: the GOT,
 //! initializers, constant data with pointers, the C objects' `__compact_unwind`), `__DATA`
 //! (the jump table's cells, data, thread-locals, zeroed data), a dev run's reservations
 //! (`__BLAZE_ARENA`, `__BLAZE_CELLS`, `__BLAZE_FIXED`: no access and no file bytes, which its
@@ -14,9 +14,17 @@
 //! (`LC_DYLD_INFO_ONLY`), not in chains.
 //!
 //! Every region but a zeroed one is in the file at its address less the base, so a region's
-//! offset never moves while its address doesn't. dyld finds the thread-local variable
-//! descriptors by their section's type (`S_THREAD_LOCAL_VARIABLES`): they are all in
-//! [`Class::ThreadVars`], C objects' too.
+//! offset never moves while its address doesn't. Everything but a dev run's reservations and
+//! zero-fill is within 4 GiB of the base ([`WINDOW`]).
+//!
+//! The patch region ([`Class::Patch`]) is first in `__TEXT`, before `__text`: what a full
+//! link places is then laid out as ld64 lays it, nothing between the code and what it
+//! reaches (its stubs, `__eh_frame`, the GOT), so an incremental image's reach is a full
+//! one's. Patch code reaches `__text` forwards and everything else across it; `__eh_frame`
+//! reaches it with 8-byte FDE addresses ([`crate::unwind::Pointers`]).
+//!
+//! dyld finds the thread-local variable descriptors by their section's type
+//! (`S_THREAD_LOCAL_VARIABLES`): they are all in [`Class::ThreadVars`], C objects' too.
 //!
 //! Names in Mach-O carry a leading underscore and the core's don't ([`push_core_name`],
 //! [`spelled`]); a Mach-O name without one (`section$start$...`) is the core's with a
@@ -81,7 +89,7 @@ use parking_lot::Mutex;
 use crate::cow::CowBytes;
 use crate::model::{
     Class, Counts, Data, Delta, File, Holds, Name, NativeFile, Names, Placed, Plan, Prot, Region,
-    Reserve, SectionKind, SectionName, Special, Writer, zeroed,
+    Reserve, SectionKind, SectionName, Special, Window, Writer, zeroed,
 };
 use smallvec::SmallVec;
 use crate::output::Platform;
@@ -98,6 +106,15 @@ const SEGMENT: usize = 72;
 const SECTION: usize = 80;
 const NLIST: usize = 16;
 const UNWIND_INFO: &str = "__unwind_info";
+/// How far from the base a Mach-O image's regions reach, their room included: a section's
+/// file offset is 32 bits (and every region's is its address less the base), `__unwind_info`
+/// names a function by a 32-bit offset from the base, and a dev executable runs in 4 GiB of
+/// code memory (blaze-cargo's `inproc::IMAGE`). Zero-fill has no file bytes and no code, so
+/// it is not counted ([`crate::place::past_window`]).
+const WINDOW: Window = Window {
+    bytes: 1 << 32,
+    why: "Mach-O's 32-bit section file offsets and `__unwind_info`'s 32-bit function offsets from the image's base",
+};
 /// The dev runtime's start hook, as the core names it (`_blaze_inproc_start` in Mach-O).
 const START: &str = "blaze_inproc_start";
 
@@ -346,8 +363,13 @@ impl Segment {
 /// The segment of a class and its place in the segment.
 fn place(class: &Class) -> (Segment, u8) {
     match class {
-        Class::Text => (Segment::Text, 0),
-        Class::Patch => (Segment::Text, 1),
+        // First, right after the headers: the patch region's room ([`crate::place`]) is then
+        // between nothing a full link places and what it reaches. Between `__text` and
+        // `__eh_frame` it lengthened every FDE's reach back by the room; between
+        // `__eh_frame` and the GOT, a CIE's personality's (`pcrel|sdata4`, as LLVM writes it)
+        // and `__text`'s GOT loads.
+        Class::Patch => (Segment::Text, 0),
+        Class::Text => (Segment::Text, 1),
         Class::Stubs => (Segment::Text, 2),
         Class::Plt => (Segment::Text, 3),
         Class::Named { name, .. } => match Segment::of(split(name).0) {
@@ -659,6 +681,16 @@ impl Writer for MachO {
         place(class).0.prot()
     }
 
+    fn window(&self) -> Option<Window> {
+        Some(WINDOW)
+    }
+
+    fn section_name(&self, class: &Class) -> String {
+        let (segment, section, _) = section_of(class);
+        // alloc: error path
+        format!("{},{section}", segment.name())
+    }
+
     fn section(
         &self,
         name: &str,
@@ -917,9 +949,14 @@ fn segment_bound<const SEGMENT: u8, const END: bool, const PAGE: u64>(regions: &
     }
 }
 
+/// `value` as a 32-bit field of the file (a section's offset, a size): past it is a
+/// [`crate::Refusal::FieldRange`], whose message the stage gives the image's regions.
 fn u32_of(value: u64, what: &str) -> Result<u32, LinkError> {
-    // alloc: error path
-    u32::try_from(value).map_err(|_| error(format!("{what} ({value:#x}) doesn't fit 32 bits")))
+    u32::try_from(value).map_err(|_| LinkError {
+        refusal: Some(crate::Refusal::FieldRange),
+        // alloc: error path
+        ..error(format!("{what} ({value:#x}) doesn't fit 32 bits"))
+    })
 }
 
 /// A segment or section name as a load command holds it; `name` is at most 16 bytes.

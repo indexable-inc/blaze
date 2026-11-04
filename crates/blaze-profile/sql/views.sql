@@ -1,5 +1,6 @@
 -- The DuckDB views over blaze's Parquet history (crates/blaze-profile/src/history.rs): one a
--- table of crates/blaze-profile/src/schema.rs, and `queries` and `passes` over `spans`.
+-- table of crates/blaze-profile/src/schema.rs, `queries` and `passes` over `spans`, and
+-- `span_sums` over `spans` and `folded`.
 -- `blaze debug sql` runs this before each query, with every `@<table>` replaced by the list of
 -- globs of that table's files, `['<dir>/*.<table>.parquet', ...]`: the history's directory and,
 -- with `--live`, the recorder's last seconds beside it. Each directory holds an empty
@@ -68,10 +69,25 @@ SELECT * FROM read_parquet(@perf_runs, union_by_name = true);
 CREATE OR REPLACE VIEW perf_functions AS
 SELECT * FROM read_parquet(@perf_functions, union_by_name = true);
 
--- Sums of short spans, each under 5 us and named by no row, kept as one row a site, thread
--- and stretch instead of a row each (`flight::fold_below`): `spans` holds the rest.
+-- Sums of short spans, each under 20 us (a wait under 1 us) and named by no row, kept as one
+-- row a site, parent's site, thread and stretch instead of a row each (`flight::fold_below`):
+-- `spans` holds the rest, and a parent's row says what its folded children took
+-- (`folded_spans`, `folded_ns`).
 CREATE OR REPLACE VIEW folded AS
 SELECT * FROM read_parquet(@folded, union_by_name = true);
+
+-- Every span, as a row of `spans` (`runs` 1) or as a sum of `folded` (`runs` its spans): what a
+-- count, total or longest by name, query kind or thread reads, so the folded ones are counted.
+-- A folded query's kind is its name, as a row's is.
+CREATE OR REPLACE VIEW span_sums AS
+SELECT build_id, process, thread, thread_name, name, target, query_kind, depth = 0 AS root,
+    CAST(1 AS UBIGINT) AS runs, dur_ns, dur_ns AS max_dur_ns, self_cpu_ns, alloc_bytes, allocs
+FROM spans
+UNION ALL BY NAME
+SELECT build_id, process, thread, thread_name, name, target,
+    CASE WHEN ends_with(name, '_query') THEN name END AS query_kind, root = 1 AS root,
+    CAST(spans AS UBIGINT) AS runs, dur_ns, max_dur_ns, self_cpu_ns, alloc_bytes, allocs
+FROM folded;
 
 -- What crates/blaze-profile/src/time.rs derives from `switches` and `spans`, for each build
 -- `blaze debug time` has read: a job's intervals end to end, each span's time by its job's

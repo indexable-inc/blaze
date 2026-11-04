@@ -72,7 +72,13 @@ after lowering.
    Overflow checks are made where rustc makes them: in a crate that checks overflow, in a
    function with `#[rustc_inherit_overflow_checks]` and in every constant and static. They are
    optional checks, which the code generator and the interpreter skip where the instance does
-   not check overflow, as rustc's codegen does. Every `CheckedBinaryOp` becomes a `BinaryOp`.
+   not check overflow, as rustc's codegen does. Whose setting that is
+   (`hir_ty_mir::mir::overflow`): the crate that compiles the instance, which
+   is each crate that uses it for a generic, a closure or an `#[inline]` function
+   (`home::compiled_by_user`, rustc's `should_codegen_locally`), else its own crate. The code
+   generator compiles such an instance for the crate that asks for it, and its callees are
+   asked for by that crate, so the setting reaches `<u8 as Add>::add` through
+   `impl Add<&u8> for u8` too. Every `CheckedBinaryOp` becomes a `BinaryOp`.
 2. **`upvars::upvars_in_place`**: see Coroutines.
 3. **`cleanup::remove_noop_landing_pads`**: rustc's `RemoveNoopLandingPads`. An unwind edge to
    a cleanup block that only ends storage on the way to `UnwindResume` goes.

@@ -21,8 +21,8 @@ use crate::{
     Unchecked, UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 33;
-const RESPONSES: usize = 42;
+const REQUESTS: usize = 34;
+const RESPONSES: usize = 43;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -300,6 +300,14 @@ impl Gen {
             29 => Request::Gc { dry_run: self.yes() },
             30 => Request::Rebuilt { all: self.yes(), cwd: self.maybe_text(), item: self.maybe_text() },
             31 => Request::Launch { program: self.text(), pid: self.u32() },
+            32 => Request::FetchUrl {
+                url: self.maybe_text(),
+                repo: self.maybe_text(),
+                rev: self.maybe_text(),
+                digest: self.text(),
+                most_bytes: if self.yes() { Some(self.wide()) } else { None },
+                out: self.maybe_text(),
+            },
             _ => Request::Stop,
         }
     }
@@ -568,6 +576,7 @@ impl Gen {
                 views: self.u32(),
                 history: self.maybe(Gen::text),
                 requests: self.many(depth, Gen::wide),
+                settings: self.many(depth, |g| crate::Setting { name: g.text(), value: g.maybe(Gen::text) }),
                 budget_bytes: self.wide(),
                 memory_bytes: self.wide(),
                 build: crate::Build {
@@ -696,6 +705,7 @@ impl Gen {
             37 => Response::Rebuilt(self.rebuilt(depth)),
             38 => Response::Launched { live: self.yes(), env: self.many(depth, |g| (g.text(), g.text())) },
             39 => Response::Stopping { doing: self.text() },
+            41 => Response::Stored { path: self.maybe_text(), blake3: self.text() },
             40 => Response::Unchecked(Unchecked {
                 open: self.many(depth, |g| OpenFailure { unit: g.text(), checked: g.texts(depth + 1) }),
                 behind: self.many(depth, |g| Behind { why: g.text(), unit: g.text(), units: g.texts(depth + 1) }),
@@ -834,7 +844,8 @@ fn request_index(request: &Request) -> usize {
         Request::Gc { .. } => 29,
         Request::Rebuilt { .. } => 30,
         Request::Launch { .. } => 31,
-        Request::Stop => 32,
+        Request::FetchUrl { .. } => 32,
+        Request::Stop => 33,
     }
 }
 
@@ -882,7 +893,8 @@ fn response_index(response: &Response) -> usize {
         Response::Launched { .. } => 38,
         Response::Stopping { .. } => 39,
         Response::Unchecked(_) => 40,
-        Response::Of { .. } => 41,
+        Response::Stored { .. } => 41,
+        Response::Of { .. } => 42,
     }
 }
 

@@ -36,7 +36,7 @@ use crate::stage::{Content, Stage, error, function_of, named_in};
 use crate::state::{self, Def, PieceId, PieceRef, Space, State, What};
 use crate::symbols::{IdNo, SymKey, Symbols};
 use crate::thunk;
-use crate::{Debug, Format, LinkError, OutputKind};
+use crate::{Debug, Format, LinkError, OutputKind, Refusal};
 
 /// What a symbol is worth to a fixup.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -527,6 +527,9 @@ impl Reloc<'_> {
                 format!("{:?} at {:#x} in {}: {what}", fixup.apply, fixup.at, describe(piece.sym)),
             )
         };
+        // A value its field can't hold, or a branch no thunk reaches: a reach, whose message
+        // the stage gives the image's regions ([`crate::shape::explained`]).
+        let past = |fixup: &Fixup, what: String| LinkError { refusal: Some(Refusal::FieldRange), ..fail(fixup, what) };
         for fixup in fixups {
             let p = piece.addr + fixup.at;
             let Some(place) = fixup.at.checked_sub(job.lo).and_then(|at| field.get_mut(at as usize..)) else {
@@ -728,13 +731,17 @@ impl Reloc<'_> {
                 out.rebase.push(fixup.at);
             }
             let (s, a) = if slid && thunk::extends(fixup.apply) && !thunk::reaches(p, s.wrapping_add(fixup.addend as u64), thunk::REACH) {
-                self.thunk(fixup, plt, p, s).map_err(|it| fail(fixup, it))?
+                self.thunk(fixup, plt, p, s).map_err(|it| past(fixup, it))?
             } else {
                 (s, fixup.addend)
             };
             let ctx = Ctx { arch: self.arch, format: self.format, s, a, p, g, m, base: self.base, tls: self.tls, tp };
-            // alloc: error path
-            reloc::apply(fixup.apply, &ctx, place).map_err(|it| fail(fixup, it.to_string()))?;
+            reloc::apply(fixup.apply, &ctx, place).map_err(|it| match it.reach() {
+                // alloc: error path
+                true => past(fixup, it.to_string()),
+                // alloc: error path
+                false => fail(fixup, it.to_string()),
+            })?;
         }
         Ok(())
     }

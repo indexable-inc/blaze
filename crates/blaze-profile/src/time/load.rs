@@ -16,7 +16,7 @@ use arrow_array::{
 };
 
 use super::{
-    Event, EventIn, Input, LaneId, Model, SpanIn, State, SwitchIn, TimeError, html,
+    Event, EventIn, Input, JOB_SPAN, LaneId, Model, SpanCut, SpanIn, State, SwitchIn, TimeError, WAIT_SPAN, html,
     path::{self, Path as CriticalPath},
     report::{self, By},
     trace,
@@ -48,12 +48,26 @@ pub struct Ask<'a> {
 /// `blaze debug time`: the build's model, its tables written into the history, and the report
 /// printed; the page and the trace written where `ask` says.
 pub fn run(source: &Source<'_>, ask: &Ask<'_>) -> Result<String, TimeError> {
-    let model = Model::build(load(source, ask.build)?)?;
+    let Rows { input, process: _, cut } = rows(source, pick(source, ask.build)?)?;
+    let model = Model::build(input)?;
     let path = path::critical(&model);
     let written = write(source.history, &model, &path)?;
     // alloc: the report, once a report
     let mut out = String::new();
     report::summary(&model, &mut out);
+    if cut.floor_ns > 0 {
+        // Writing to a `String` does not fail.
+        _ = writeln!(
+            out,
+            "spans read: {} of {}, past the bound of {SPAN_BUDGET}: those under {:.3} s ({} spans, {:.1} s summed) are not in the model, \
+             but every root job and wait span is",
+            cut.read,
+            cut.spans,
+            cut.floor_ns as f64 / 1e9,
+            cut.cut(),
+            cut.cut_ns as f64 / 1e9
+        );
+    }
     out.push('\n');
     report::table(&report::rows(&model, ask.by, ask.matching), ask.by, ask.top, &mut out);
     out.push('\n');
@@ -87,6 +101,21 @@ fn put(path: &Path, bytes: &[u8], doing: &'static str) -> Result<(), TimeError> 
 
 pub(crate) fn query(source: &Source<'_>, sql: &str, doing: &'static str) -> Result<Vec<RecordBatch>, TimeError> {
     sql::run(&sql::Query { duckdb: source.duckdb, history: source.history, sql }).map_err(|error| TimeError::Sql { doing, error })
+}
+
+/// Each of `sqls` in one DuckDB ([`sql::run_all`]): their answers, in order, one for each.
+pub(crate) fn query_many(source: &Source<'_>, sqls: &[&str], doing: &'static str) -> Result<Vec<Vec<RecordBatch>>, TimeError> {
+    let answers = sql::run_all(source.duckdb, source.history, sqls).map_err(|error| TimeError::Sql { doing, error })?;
+    if answers.len() != sqls.len() {
+        return Err(TimeError::BadColumn { table: "answers", column: "count", why: "is not one answer for each query DuckDB was asked" });
+    }
+    Ok(answers)
+}
+
+/// [`query_many`] of a fixed number of queries.
+pub(crate) fn query_all<const N: usize>(source: &Source<'_>, sqls: [&str; N], doing: &'static str) -> Result<[Vec<RecordBatch>; N], TimeError> {
+    <[Vec<RecordBatch>; N]>::try_from(query_many(source, &sqls, doing)?)
+        .map_err(|_| TimeError::BadColumn { table: "answers", column: "count", why: "is not one answer for each query DuckDB was asked" })
 }
 
 /// A build to read and its window ([`pick`]).
@@ -177,11 +206,141 @@ fn last_row(source: &Source<'_>, pid: u32, since: i64) -> Result<i64, TimeError>
 
 /// The rows of `build`, or of the last build that ended or whose daemon died.
 pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError> {
-    rows(source, pick(source, build)?).map(|(input, _)| input)
+    rows(source, pick(source, build)?).map(|it| it.input)
 }
 
-/// The rows of the picked build, and the process whose rows are of it (`None` when none is).
-pub fn rows(source: &Source<'_>, pick: Pick) -> Result<(Input, Option<u32>), TimeError> {
+/// The most spans of one build the model reads. Each costs the model about half a KiB (its
+/// `SpanIn` with its strings, its time, parent and place; estimated, 2026-11-04), so this bounds
+/// the spans to about 4 GiB; the 192 million of build 24 (2026-11-03) would have been about
+/// 90 GiB, and `blaze slow` passed 19 GiB and was killed. The spans by name, which
+/// `blaze slow` counts in DuckDB, always count them all.
+pub const SPAN_BUDGET: u64 = 8_000_000;
+
+/// The floors [`rows`] tries, shortest first: the first that keeps the spans within
+/// [`SPAN_BUDGET`] is taken (0: every span). None is under 100 us: the recorder folds what is
+/// shorter than [`crate::flight::FOLD_BELOW`] (20 us) at record time, so a floor of 1 or 10 us
+/// would cut only the short spans it keeps on purpose (jobs, waits that parked). Folding does
+/// not change the floor a build like build 24 needs: its 16.9 M spans of 100 us and longer are
+/// past the budget whatever is folded under them, so it is still read from 10 ms.
+const FLOORS_NS: [i64; 6] = [0, 100_000, 1_000_000, 10_000_000, 100_000_000, 1_000_000_000];
+
+/// The condition on a `spans` row that it is read at `floor` ([`SpanCut`]): at or past it, a
+/// root job or wait span, or unended. Every root job and wait span is kept whatever its length:
+/// the jobs' spans name what each job ran and who gave it, the waits' what each park waited
+/// on, and as roots they leave no child without its parent. [`cut_sql`]'s buckets say the same.
+fn kept_at(floor: i64) -> String {
+    if floor <= 0 {
+        // alloc: a query's part, once a report
+        return "true".to_owned();
+    }
+    // alloc: a query's part, once a floor a report
+    format!("(dur_ns IS NULL OR dur_ns >= {floor} OR (depth = 0 AND name IN ('{JOB_SPAN}', '{WAIT_SPAN}')))")
+}
+
+/// The first of [`FLOORS_NS`] whose spans fit in `budget`, given `kept`, how many each keeps
+/// (fewer at each higher floor): `None` when none does.
+fn floor_within(kept: &[u64; FLOORS_NS.len()], budget: u64) -> Option<usize> {
+    kept.iter().position(|&it| it <= budget)
+}
+
+/// The spans of `spans` (a query's `FROM` item) and their time by bucket: bucket `i` holds
+/// those [`FLOORS_NS`]`[i]` keeps and the next floor does not, the last those every floor keeps
+/// ([`kept_at`]). One expression and a group a row: half the CPU of a count filtered
+/// for each floor (21.8 against 48.1 CPU-seconds over build 24's 192 million spans, 2026-11-04).
+fn cut_sql(spans: &str) -> String {
+    let last = FLOORS_NS.len() - 1;
+    // alloc: a query, once a report
+    let mut sql = format!("SELECT CAST(CASE WHEN dur_ns IS NULL OR (depth = 0 AND name IN ('{JOB_SPAN}', '{WAIT_SPAN}')) THEN {last}");
+    for (i, next) in FLOORS_NS[1..].iter().enumerate() {
+        // Writing to a `String` does not fail.
+        _ = write!(sql, " WHEN dur_ns < {next} THEN {i}");
+    }
+    _ = write!(
+        sql,
+        " ELSE {last} END AS UBIGINT) AS bucket, CAST(count(*) AS UBIGINT) AS spans, CAST(coalesce(sum(dur_ns), 0) AS BIGINT) AS dur_ns \
+         FROM {spans} GROUP BY 1 ORDER BY 1"
+    );
+    sql
+}
+
+/// Each floor's spans kept and time left out, from the spans and time of each bucket
+/// ([`cut_sql`]), and the spans all told.
+fn by_floor(buckets: &[(usize, u64, i64)]) -> ([u64; FLOORS_NS.len()], [i64; FLOORS_NS.len()], u64) {
+    let (mut kept, mut cut_ns) = ([0; FLOORS_NS.len()], [0; FLOORS_NS.len()]);
+    let mut total = 0;
+    for &(bucket, spans, dur_ns) in buckets {
+        total += spans;
+        for (floor, (kept, cut_ns)) in kept.iter_mut().zip(cut_ns.iter_mut()).enumerate() {
+            if bucket >= floor {
+                *kept += spans;
+            } else {
+                *cut_ns += dur_ns;
+            }
+        }
+    }
+    (kept, cut_ns, total)
+}
+
+/// The floor [`cut_sql`]'s answer `batches` gives `build`'s spans, or the refusal when none
+/// keeps them within [`SPAN_BUDGET`].
+fn cut_of(batches: &[RecordBatch], build: u64) -> Result<SpanCut, TimeError> {
+    // alloc: the buckets, once a report
+    let mut buckets = Vec::with_capacity(FLOORS_NS.len());
+    for batch in batches {
+        const T: &str = "spans";
+        let (bucket, spans, dur) = (uints(batch, T, "bucket")?, uints(batch, T, "spans")?, ints(batch, T, "dur_ns")?);
+        for row in 0..batch.num_rows() {
+            let Some(at) = get(bucket, row, |it, row| it.value(row)) else { continue };
+            let at = usize::try_from(at).unwrap_or(usize::MAX).min(FLOORS_NS.len() - 1);
+            buckets.push((at, get(spans, row, |it, row| it.value(row)).unwrap_or(0), get(dur, row, |it, row| it.value(row)).unwrap_or(0)));
+        }
+    }
+    let (kept, cut_ns, total) = by_floor(&buckets);
+    let Some(at) = floor_within(&kept, SPAN_BUDGET) else {
+        let last = FLOORS_NS.len() - 1;
+        return Err(TimeError::TooManySpans { build, spans: total, read: kept[last], floor_ns: FLOORS_NS[last], budget: SPAN_BUDGET });
+    };
+    Ok(SpanCut { floor_ns: FLOORS_NS[at], spans: total, read: kept[at], cut_ns: cut_ns[at] })
+}
+
+/// Build 24's buckets (2026-11-03, recorded before folding was on): within the budget only from
+/// the 10 ms floor on, and every floor keeps what the next does and more. Bucket 0 is the sum of
+/// the three DuckDB counted under 1 us, 1 to 10 us and 10 to 100 us when the floors began at
+/// 1 us.
+#[cfg(test)]
+#[test]
+fn a_floor_is_the_least_that_keeps_the_spans_within_the_budget() {
+    let buckets = [
+        (0, 86_226_859 + 63_454_625 + 25_748_628, 26_269_603_463 + 252_220_641_959 + 715_994_250_394),
+        (1, 6_920_778, 2_516_678_571_008),
+        (2, 2_642_107, 8_700_493_894_942),
+        (3, 714_057, 17_909_316_998_858),
+        (4, 42_229, 10_606_481_020_222),
+        (5, 6_601_283, 69_084_468_020_044),
+    ];
+    let (kept, cut_ns, total) = by_floor(&buckets);
+    // As DuckDB counted each floor's condition (`kept_at`) row by row over the same spans.
+    assert_eq!(kept, [192_350_566, 16_920_454, 9_999_676, 7_357_569, 6_643_512, 6_601_283]);
+    assert_eq!(cut_ns[3], 12_211_656_961_766);
+    assert_eq!(total, 192_350_566);
+    assert_eq!(floor_within(&kept, SPAN_BUDGET), Some(3));
+    assert_eq!(floor_within(&kept, 6_000_000), None, "past the last floor is a refusal, not a cut further");
+    assert_eq!(floor_within(&kept, u64::MAX), Some(0), "a build within the budget is read whole");
+}
+
+/// A build's rows ([`rows`]).
+#[derive(Debug)]
+pub struct Rows {
+    pub input: Input,
+    /// The process whose rows are of the build; `None` when none is.
+    pub process: Option<u32>,
+    /// Which of its spans `input` holds.
+    pub cut: SpanCut,
+}
+
+/// The rows of the picked build, the process whose rows are of it, and which of its spans were
+/// read ([`SpanCut`]: all of them, unless they pass [`SPAN_BUDGET`]).
+pub fn rows(source: &Source<'_>, pick: Pick) -> Result<Rows, TimeError> {
     let Pick { build, row: build_row, died: _ } = pick;
     // Rows of no build in the build's window are its too: the recorder leaves `build_id` null on
     // a job's rows once its code let go of the build (most of a cold build's switches and spans
@@ -192,7 +351,7 @@ pub fn rows(source: &Source<'_>, pick: Pick) -> Result<(Input, Option<u32>), Tim
     let process = build_process(source, build)?;
     let window = window.map(|(t0, t1)| (t0, t1, process.map_or(String::new(), |it| format!(" AND process = {it}"))));
     // alloc: a query, once a report
-    let sql = format!(
+    let switches_sql = format!(
         "SELECT CAST(process AS BIGINT) AS process, CAST(thread AS BIGINT) AS thread, CAST(t_ns AS BIGINT) AS t_ns, \
          CAST(event AS VARCHAR) AS event, CAST(job AS UBIGINT) AS job, CAST(fiber AS BIGINT) AS fiber, \
          CAST(core AS BIGINT) AS core, CAST(wait_kind AS VARCHAR) AS wait_kind, CAST(wait_value AS UBIGINT) AS wait_value, \
@@ -200,7 +359,28 @@ pub fn rows(source: &Source<'_>, pick: Pick) -> Result<(Input, Option<u32>), Tim
          CAST(queued_ns AS BIGINT) AS queued_ns FROM {}",
         of_build("switches", build, SWITCHES_SINCE_2, window.as_ref().map(|(t0, t1, of)| format!("t_ns BETWEEN {t0} AND {t1}{of}")))
     );
-    let switches = switches(&query(source, &sql, "reading the build's switches")?)?;
+    let of_spans =
+        of_build("spans", build, SPANS_SINCE_2, window.as_ref().map(|(t0, t1, of)| format!("start_ns >= {t0} AND start_ns < {t1}{of}")));
+    // alloc: a query, once a report
+    let events_sql = format!(
+        "SELECT CAST(process AS BIGINT) AS process, CAST(thread AS BIGINT) AS thread, CAST(t_ns AS BIGINT) AS t_ns, \
+         CAST(job AS UBIGINT) AS job, CAST(level AS VARCHAR) AS level, CAST(target AS VARCHAR) AS target, \
+         CAST(name AS VARCHAR) AS name, CAST(message AS VARCHAR) AS message, CAST(span_id AS UBIGINT) AS span_id \
+         FROM events WHERE build_id = {build}{}",
+        window.as_ref().map_or(String::new(), |(t0, t1, of)| format!(" OR (build_id IS NULL AND t_ns BETWEEN {t0} AND {t1}{of})"))
+    );
+    // The switches, the spans' count by duration and the events in one DuckDB: the views are
+    // made once ([`sql::run_all`]). The spans wait on the count's floor.
+    let [switches_rows, cut_rows, events_rows] = query_all(
+        source,
+        [switches_sql.as_str(), cut_sql(&of_spans).as_str(), events_sql.as_str()],
+        "reading the build's switches and events, and counting its spans by duration",
+    )?;
+    let switches = switches(&switches_rows)?;
+    let cut = cut_of(&cut_rows, build)?;
+    let events = events(&events_rows)?;
+    // Their Arrow copies go before the spans come in.
+    drop((switches_rows, cut_rows, events_rows));
     // alloc: a query, once a report
     let sql = format!(
         "SELECT CAST(process AS BIGINT) AS process, CAST(thread AS BIGINT) AS thread, CAST(span_id AS UBIGINT) AS span_id, \
@@ -208,20 +388,14 @@ pub fn rows(source: &Source<'_>, pick: Pick) -> Result<(Input, Option<u32>), Tim
          CAST(crate AS VARCHAR) AS krate, CAST(function AS VARCHAR) AS function, CAST(unit AS VARCHAR) AS unit, \
          CAST(awaits AS VARCHAR) AS awaits, CAST(owner AS UBIGINT) AS owner, CAST(job AS UBIGINT) AS job, \
          CAST(creator AS UBIGINT) AS creator, CAST(start_ns AS BIGINT) AS start_ns, CAST(dur_ns AS BIGINT) AS dur_ns, \
-         CAST(self_cpu_ns AS BIGINT) AS self_cpu_ns FROM {}",
-        of_build("spans", build, SPANS_SINCE_2, window.as_ref().map(|(t0, t1, of)| format!("start_ns >= {t0} AND start_ns < {t1}{of}")))
+         CAST(self_cpu_ns AS BIGINT) AS self_cpu_ns, CAST(coalesce(folded_ns, 0) AS BIGINT) AS folded_ns \
+         FROM {of_spans} WHERE {}",
+        kept_at(cut.floor_ns)
     );
     let spans = spans(&query(source, &sql, "reading the build's spans")?)?;
-    // alloc: a query, once a report
-    let sql = format!(
-        "SELECT CAST(process AS BIGINT) AS process, CAST(thread AS BIGINT) AS thread, CAST(t_ns AS BIGINT) AS t_ns, \
-         CAST(job AS UBIGINT) AS job, CAST(level AS VARCHAR) AS level, CAST(target AS VARCHAR) AS target, \
-         CAST(name AS VARCHAR) AS name, CAST(message AS VARCHAR) AS message, CAST(span_id AS UBIGINT) AS span_id \
-         FROM events WHERE build_id = {build}{}",
-        window.as_ref().map_or(String::new(), |(t0, t1, of)| format!(" OR (build_id IS NULL AND t_ns BETWEEN {t0} AND {t1}{of})"))
-    );
-    let events = events(&query(source, &sql, "reading the build's events")?)?;
-    Ok((Input { build, build_row, switches, spans, events }, process))
+    // What was read, not what was counted: a flush between the two queries adds rows.
+    let cut = SpanCut { read: spans.len() as u64, ..cut };
+    Ok(Rows { input: Input { build, build_row, switches, spans, events }, process, cut })
 }
 
 /// The process whose rows are of `build`, `None` when no row is. Rows of one build from more
@@ -264,7 +438,9 @@ fn build_process(source: &Source<'_>, build: u64) -> Result<Option<u32>, TimeErr
 /// naming a column no file has fails to bind.
 const SWITCHES_SINCE_2: &str =
     "NULL::UBIGINT AS by_job, NULL::BIGINT AS since_ns, NULL::UBIGINT AS began_as, NULL::BIGINT AS queued_ns";
-const SPANS_SINCE_2: &str = "NULL::UBIGINT AS job, NULL::UBIGINT AS creator";
+/// And `spans.folded_ns`, which version 3 added: a file of an older version folded nothing
+/// ([`crate::schema::VERSION`]), so its null reads as 0.
+const SPANS_SINCE_2: &str = "NULL::UBIGINT AS job, NULL::UBIGINT AS creator, NULL::BIGINT AS folded_ns";
 
 /// `table`'s rows of `build`, and its rows of no build that `window` holds (a condition on the
 /// row's time), with the `added` columns null where its files have none.
@@ -358,6 +534,7 @@ fn spans(batches: &[RecordBatch]) -> Result<Vec<SpanIn>, TimeError> {
         let (unit, awaits, owner, of_job) = (texts(batch, T, "unit")?, texts(batch, T, "awaits")?, uints(batch, T, "owner")?, uints(batch, T, "job")?);
         let creator = uints(batch, T, "creator")?;
         let (start_ns, dur_ns, self_cpu) = (ints(batch, T, "start_ns")?, ints(batch, T, "dur_ns")?, ints(batch, T, "self_cpu_ns")?);
+        let folded = ints(batch, T, "folded_ns")?;
         let null = |column: &'static str| TimeError::BadColumn { table: T, column, why: "is null" };
         for row in 0..batch.num_rows() {
             out.push(SpanIn {
@@ -377,6 +554,7 @@ fn spans(batches: &[RecordBatch]) -> Result<Vec<SpanIn>, TimeError> {
                 start_ns: get(start_ns, row, |it, row| it.value(row)).ok_or(null("start_ns"))?,
                 dur_ns: get(dur_ns, row, |it, row| it.value(row)).ok_or(null("dur_ns"))?,
                 self_cpu_ns: get(self_cpu, row, |it, row| it.value(row)),
+                folded_ns: get(folded, row, |it, row| it.value(row)).unwrap_or(0),
             });
         }
     }

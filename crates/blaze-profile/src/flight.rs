@@ -1055,7 +1055,8 @@ const SPAN_COPIED_ROW: u64 = 0xfe;
 /// said its typed columns ([`span::TYPED_COLUMNS`]): up to [`COL_WORDS`] values a row, each
 /// plus one, at the words `COL_WORDS` names, and the span's id at word 3. Word 4's bytes 1..6
 /// say whose value each word holds: a typed column's index, [`CPU_COL`] for the span's self
-/// CPU, [`THREAD_COL`] for the thread that made a span another closed, [`NO_COL`] for none.
+/// CPU, [`THREAD_COL`] for the thread that made a span another closed, [`FOLDED_COL`] and
+/// [`FOLDED_TICKS_COL`] for the children it folded, [`NO_COL`] for none.
 const SPAN_COLS_ROW: u64 = 0xfa;
 const COL_WORDS: [usize; 5] = [1, 2, 5, 6, 7];
 /// The thread that made a span closed by another (on another ring, or on its ring after the
@@ -1064,7 +1065,11 @@ const COL_WORDS: [usize; 5] = [1, 2, 5, 6, 7];
 const THREAD_COL: u64 = 0xfd;
 const CPU_COL: u64 = 0xfe;
 const NO_COL: u64 = 0xff;
-const _: () = assert!(TYPED < THREAD_COL as usize, "a typed column's index is a byte of its own");
+/// How many of a span's children were folded ([`fold_below`]), and their ticks summed: said
+/// only when some were.
+const FOLDED_COL: u64 = 0xfc;
+const FOLDED_TICKS_COL: u64 = 0xfb;
+const _: () = assert!(TYPED < FOLDED_TICKS_COL as usize, "a typed column's index is a byte of its own");
 const UNCOUNTED: u64 = 1;
 
 const _: () = {
@@ -1125,6 +1130,11 @@ struct Slot {
     /// [`NAMED_ONE`] each: a child written whole, an event, a sample, a pool job it gave):
     /// a span with either is written whole as it closes, never folded ([`fold_below`]).
     kids: AtomicU64,
+    /// Its children folded ([`fold_below`]) and their ticks summed: the time of its own the
+    /// rows under it leave out, which its row says (`spans.folded_spans`, `folded_ns`) so its
+    /// self time stays exact.
+    folded: AtomicU64,
+    folded_ticks: AtomicU64,
 }
 
 /// A row naming a span, in [`Slot::kids`].
@@ -1151,6 +1161,8 @@ impl Slot {
         cpu_under: AtomicU64::new(0),
         cpu_entered: AtomicU64::new(0),
         kids: AtomicU64::new(0),
+        folded: AtomicU64::new(0),
+        folded_ticks: AtomicU64::new(0),
     };
 }
 
@@ -1175,6 +1187,9 @@ struct Opened {
     held: bool,
     /// [`Slot::kids`] as it closed.
     kids: u64,
+    /// [`Slot::folded`] and [`Slot::folded_ticks`] as it closed.
+    folded: u64,
+    folded_ticks: u64,
 }
 
 impl Opened {
@@ -1364,6 +1379,8 @@ impl Ring {
             cpu_under: slot.cpu_under.load(Ordering::Relaxed),
             held: what & HELD_BIT != 0,
             kids: slot.kids.load(Ordering::Relaxed),
+            folded: slot.folded.load(Ordering::Relaxed),
+            folded_ticks: slot.folded_ticks.load(Ordering::Relaxed),
         };
         fence(Ordering::Acquire);
         (slot.id.load(Ordering::Relaxed) == id).then_some(opened)
@@ -1612,6 +1629,8 @@ fn began(site: u16, parent: Option<u64>, said: &Said) -> u64 {
     slot.cpu_under.store(0, Ordering::Relaxed);
     slot.cpu_entered.store(0, Ordering::Relaxed);
     slot.kids.store(0, Ordering::Relaxed);
+    slot.folded.store(0, Ordering::Relaxed);
+    slot.folded_ticks.store(0, Ordering::Relaxed);
     slot.alloc_bytes.store(alloc.bytes, Ordering::Relaxed);
     slot.allocs.store(alloc.count, Ordering::Relaxed);
     slot.frame_copies.store(copied.copies, Ordering::Relaxed);
@@ -1813,28 +1832,43 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
     let ticks = now.wrapping_sub(opened.start);
     let cpu = self_cpu(&opened);
     let copied = FRAME_COPIED.get().is_some().then(frame_copied);
-    // Noise, folded into its site's sum on this thread: short, named by no row (no child
-    // written whole, no event, sample or job), saying no typed column (a `job`, `wait`, `hold`
-    // and every other kind that says one is the model's), on the thread it began on, and
-    // copying no frame.
-    let fold = ticks < fold_ticks()
+    // Noise, folded into its sum under its parent's site on this thread: short, named by no
+    // row (no child written whole, no event, sample or job), on the thread it began on, copying
+    // no frame, and saying no typed column (a `job`, `hold` and every other kind that says one
+    // is the model's), or a wait too short to have parked ([`WAIT_FOLD_BELOW`]).
+    let below = if opened.typed == [0; TYPED] {
+        fold_ticks()
+    } else if Some(opened.site) == <span::Wait as span::Span>::site() {
+        wait_fold_ticks()
+    } else {
+        0
+    };
+    let fold = ticks < below
         && opened.kids == 0
         && !opened.held
         && !moved
-        && opened.typed == [0; TYPED]
         && copied.is_none_or(|it| it.copies == opened.copied.copies);
-    // Its parent is named by this row when it is written whole, and has one child less open.
-    if let Some(parent) = open_slot(opened.parent) {
+    // Its parent is named by this row when it is written whole, and has one child less open;
+    // a folded child's ticks are its parent's to say ([`Slot::folded`]).
+    let parent = open_slot(opened.parent);
+    let mut parent_site = 0;
+    if let Some(parent) = parent {
         parent.kids.fetch_add(if fold { u64::MAX } else { NAMED_ONE - 1 }, Ordering::Relaxed);
+        if fold {
+            parent.folded.fetch_add(1, Ordering::Relaxed);
+            parent.folded_ticks.fetch_add(ticks, Ordering::Relaxed);
+            parent_site = (parent.what.load(Ordering::Relaxed) & ((1 << SITE_BITS) - 1)) as u16;
+        }
     }
     let key = crate::hot::record::key(opened.site, opened.of as u32);
     let waits_on = opened.typed[<span::col::WaitsOn as span::Column>::AT - span::GENERIC];
     crate::hot::record::closed(&ring.hot, key, ticks, waits_on);
     if fold {
-        folded(ring, &opened, now, cpu, allocs, bytes);
+        folded(ring, &opened, parent_site, now, cpu, allocs, bytes);
     } else {
         ring.put([now, opened.start, id, opened.parent, what, opened.of, build_unit, bytes]);
-        put_cols(ring, now, id, cpu, moved.then_some(opened.thread), &opened.typed);
+        let folded = (opened.folded != 0).then_some((opened.folded, opened.folded_ticks));
+        put_cols(ring, now, id, cpu, moved.then_some(opened.thread), folded, &opened.typed);
         if let Some(copied) = copied {
             let row = if moved {
                 Some([0, 0, UNCOUNTED])
@@ -1855,76 +1889,110 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
 
 // --- Folding short spans ------------------------------------------------------------------
 
-/// Spans shorter than this, of a process that folds them ([`fold_below`]). On a self-build
-/// (profrows, 2026-11-02) 64% of 30 M spans were under 2 us (a worker's search and switch
-/// between jobs, name resolution's updates, a parse); with those folded the rings still
-/// wrapped, as `find_container` and `Semantics::analyze_impl` (about 3 us each, with a CPU
-/// column row each) came 360 k a second on a worker, more rows a drain than a ring holds.
-pub const FOLD_BELOW: Duration = Duration::from_micros(5);
+/// Spans shorter than this, of a process that folds them ([`fold_below`]), are summed under
+/// their parent's site instead of written a row each; the parent's row says how many and how
+/// long ([`Slot::folded`]), so its self time stays exact, and the sum keeps their count, time,
+/// longest and self CPU.
+///
+/// Why 20 us (build 24 of a 52-minute cold self-build, 2026-11-04, 153.9 M spans tagged with
+/// the build): 132.8 M spans (86%) were under 20 us and 98.5 M under 5 us; the 5 to 20 us band
+/// is mostly `codegen describe` (24.6 M of its 35 M). Of those under 20 us, the ones saying no
+/// typed column (129.9 M) sum to about 1.1 M rows a thread, parent and name each
+/// [`FOLD_AGE`], so the spans table goes from 153.9 M rows to about 25 M (6x fewer). Their
+/// self CPU is small beside the build's: 88 s under 5 us and 823 s under 100 us, of 16,407 s.
+/// No reader looks at one span this short: `blaze slow` reads spans of 10 ms and longer on
+/// that build ([`crate::time::load::SPAN_BUDGET`]). Waits fold only below
+/// [`WAIT_FOLD_BELOW`].
+pub const FOLD_BELOW: Duration = Duration::from_micros(20);
+
+/// Waits shorter than this fold ([`fold_below`]); longer ones are written a row each with what
+/// they waited on (rule every-wait-says-what). A wait this short never parked: on build 24 none
+/// of the 164,892 waits under 1 us held a `parked` switch, while 42,532 of the 96,076 from 1
+/// to 5 us did. Its sum keeps the count and time under its parent's site, not what it was on.
+pub const WAIT_FOLD_BELOW: Duration = Duration::from_micros(1);
 
 /// How long a thread holds a site's folded spans before it writes their row: about a drain
 /// ([`crate::history::DRAIN`]), so a flush finds what the threads that keep working folded.
 /// A pool worker writes its own as it goes idle, any thread as it ends.
 pub const FOLD_AGE: Duration = Duration::from_millis(50);
 
-/// [`FOLD_BELOW`] and [`FOLD_AGE`] in ticks, once [`fold_below`] set them: 0 folds nothing.
+/// [`FOLD_BELOW`], [`WAIT_FOLD_BELOW`] and [`FOLD_AGE`] in ticks, once [`fold_below`] set
+/// them: 0 folds nothing.
 static FOLD_TICKS: AtomicU64 = AtomicU64::new(0);
+static WAIT_FOLD_TICKS: AtomicU64 = AtomicU64::new(0);
 static FOLD_AGE_TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// Has this process fold each span shorter than `below` into a sum a site, a thread and a
+/// Has this process fold each span shorter than `below`, and each wait shorter than
+/// [`WAIT_FOLD_BELOW`] (or `below`, if shorter), into a sum a parent's site, site, thread and
 /// build (the `folded` table's rows) instead of writing its row, unless a row names it or it
-/// says a typed column ([`closed`]); a site's sum is written at least every [`FOLD_AGE`]. A
-/// driver (blaze's CLI) sets it once; a process that never does records every span.
+/// says a typed column ([`closed`]); a sum is written at least every [`FOLD_AGE`]. blaze's
+/// CLI sets it once, to [`FOLD_BELOW`], for the client and the daemon; a process that never
+/// does records every span.
 pub fn fold_below(below: Duration) {
     let scale = clock::Scale::now();
     FOLD_AGE_TICKS.store(scale.ticks_in(FOLD_AGE.as_nanos() as u64), Ordering::Relaxed);
+    WAIT_FOLD_TICKS.store(scale.ticks_in(below.min(WAIT_FOLD_BELOW).as_nanos() as u64), Ordering::Relaxed);
     FOLD_TICKS.store(scale.ticks_in(below.as_nanos() as u64), Ordering::Relaxed);
 }
 
 #[cfg(test)]
 thread_local! {
-    /// A test's own [`fold_below`] and [`FOLD_AGE`] in ticks, on its thread alone, so the
-    /// tests beside it running in the process record every span.
-    static FOLD_HERE: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+    /// A test's own [`fold_below`] (spans, waits) and [`FOLD_AGE`] in ticks, on its thread
+    /// alone, so the tests beside it running in the process record every span.
+    static FOLD_HERE: Cell<Option<(u64, u64, u64)>> = const { Cell::new(None) };
 }
 
-/// Has this thread alone fold spans shorter than `below`, writing their sums after `age`.
+/// Has this thread alone fold spans shorter than `below` and waits shorter than `waits_below`,
+/// writing their sums after `age`.
 #[cfg(test)]
-pub(crate) fn fold_here(below: Duration, age: Duration) {
+pub(crate) fn fold_here(below: Duration, waits_below: Duration, age: Duration) {
     let scale = clock::Scale::now();
-    FOLD_HERE.with(|it| it.set(Some((scale.ticks_in(below.as_nanos() as u64), scale.ticks_in(age.as_nanos() as u64)))));
+    let ticks = |it: Duration| scale.ticks_in(it.as_nanos() as u64);
+    FOLD_HERE.with(|it| it.set(Some((ticks(below), ticks(waits_below), ticks(age)))));
 }
 
 #[inline]
 fn fold_ticks() -> u64 {
     #[cfg(test)]
-    if let Some((below, _)) = FOLD_HERE.with(Cell::get) {
+    if let Some((below, _, _)) = FOLD_HERE.with(Cell::get) {
         return below;
     }
     FOLD_TICKS.load(Ordering::Relaxed)
 }
 
 #[inline]
+fn wait_fold_ticks() -> u64 {
+    #[cfg(test)]
+    if let Some((_, waits, _)) = FOLD_HERE.with(Cell::get) {
+        return waits;
+    }
+    WAIT_FOLD_TICKS.load(Ordering::Relaxed)
+}
+
+#[inline]
 fn fold_age_ticks() -> u64 {
     #[cfg(test)]
-    if let Some((_, age)) = FOLD_HERE.with(Cell::get) {
+    if let Some((_, _, age)) = FOLD_HERE.with(Cell::get) {
         return age;
     }
     FOLD_AGE_TICKS.load(Ordering::Relaxed)
 }
 
-/// The plot byte of a [`Fold`]'s row. Word 4 above it: the site (bits 8..20), whether its
-/// spans were roots (depth 0, as `uncovered_per_worker` counts them; 20), whether their CPU (21) and allocations (22) were counted, and how
-/// many spans (24..56).
+/// The plot byte of a [`Fold`]'s row. Word 4 above it: the site (bits 8..20), its parent's site
+/// (20..32, 0 for none open), how many spans (32..56), whether they were roots (depth 0, as
+/// `uncovered_per_worker` counts them; 56), and whether their CPU (57) and allocations (58)
+/// were counted.
 const FOLD_ROW: u64 = 0xf9;
-const FOLD_ROOT: u64 = 1 << 20;
-const FOLD_CPU: u64 = 1 << 21;
-const FOLD_ALLOCS: u64 = 1 << 22;
-const FOLD_SPANS_SHIFT: u32 = 24;
-const FOLD_SPANS_MAX: u64 = (1 << 32) - 1;
-const _: () = assert!(SITE_BITS == 12, "a fold row's site is bits 8..20");
+const FOLD_PARENT_SHIFT: u32 = 20;
+const FOLD_SPANS_SHIFT: u32 = 32;
+const FOLD_SPANS_MAX: u64 = (1 << 24) - 1;
+const FOLD_ROOT: u64 = 1 << 56;
+const FOLD_CPU: u64 = 1 << 57;
+const FOLD_ALLOCS: u64 = 1 << 58;
+const _: () = assert!(SITE_BITS == 12, "a fold row's site is bits 8..20 and its parent's 20..32");
 
-/// A thread's sums of short spans a site, root or not, and build: written as one row.
+/// A thread's sums of short spans a site, parent's site, root or not, and build: written as
+/// one row.
 #[derive(Clone, Copy)]
 struct Fold {
     /// [`fold_key`]; 0 for an empty slot.
@@ -1941,8 +2009,12 @@ struct Fold {
 
 const NO_FOLD: Fold = Fold { key: 0, first: 0, last: 0, spans: 0, ticks: 0, max: 0, cpu: None, allocs: None };
 
-/// Slots a thread folds into, by key: a key that finds its slot taken writes the other's row.
-const FOLD_SLOTS: usize = 64;
+/// Slots a thread folds into, by key. On build 24 a thread held at most 55 keys (a parent's
+/// name and a name) in a [`FOLD_AGE`], 27 at the 99th percentile; a key looks in
+/// [`FOLD_PROBES`] slots from its home, and one that finds them all taken writes its home's
+/// row early.
+const FOLD_SLOTS: usize = 128;
+const FOLD_PROBES: usize = 4;
 
 struct Folds {
     slots: [Fold; FOLD_SLOTS],
@@ -1956,17 +2028,24 @@ thread_local! {
     static FOLDS: RefCell<Folds> = const { RefCell::new(Folds { slots: [NO_FOLD; FOLD_SLOTS], oldest: u64::MAX }) };
 }
 
-fn fold_key(site: u16, root: bool, build: u32) -> u64 {
-    u64::from(build) << 32 | u64::from(root) << 16 | 1 << 15 | u64::from(site)
+/// A sum's key: its build, its parent's site, whether its spans are roots and its site, with a
+/// bit set so no key is 0.
+fn fold_key(site: u16, parent_site: u16, root: bool, build: u32) -> u64 {
+    u64::from(build) << 32 | u64::from(parent_site) << 16 | u64::from(root) << 13 | 1 << 12 | u64::from(site)
 }
 
-/// Adds the span `opened`, closing now, to its sum on this thread; `cpu` and `allocs` as its
-/// row would have them, plus one (0: not counted).
-fn folded(ring: &Ring, opened: &Opened, now: u64, cpu: u64, allocs: u64, bytes: u64) {
-    let key = fold_key(opened.site, opened.depth == 0, opened.build);
-    let at = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % FOLD_SLOTS;
+/// Adds the span `opened`, closing now under a parent of `parent_site` (0: none open), to its
+/// sum on this thread; `cpu` and `allocs` as its row would have them, plus one (0: not
+/// counted).
+fn folded(ring: &Ring, opened: &Opened, parent_site: u16, now: u64, cpu: u64, allocs: u64, bytes: u64) {
+    let key = fold_key(opened.site, parent_site, opened.depth == 0, opened.build);
+    let home = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57) as usize % FOLD_SLOTS;
     _ = FOLDS.try_with(|folds| {
         let Ok(mut folds) = folds.try_borrow_mut() else { return };
+        let at = (0..FOLD_PROBES)
+            .map(|probe| (home + probe) % FOLD_SLOTS)
+            .find(|&at| folds.slots[at].key == key || folds.slots[at].key == 0)
+            .unwrap_or(home);
         let slot = &mut folds.slots[at];
         if slot.key != key && slot.key != 0 {
             put_fold(ring, slot);
@@ -2002,9 +2081,16 @@ fn put_fold(ring: &Ring, fold: &mut Fold) {
         return;
     }
     let site = key & ((1 << SITE_BITS) - 1);
-    let root = if key >> 16 & 1 == 1 { FOLD_ROOT } else { 0 };
+    let parent_site = key >> 16 & ((1 << SITE_BITS) - 1);
+    let root = if key >> 13 & 1 == 1 { FOLD_ROOT } else { 0 };
     let counted = if cpu.is_some() { FOLD_CPU } else { 0 } | if allocs.is_some() { FOLD_ALLOCS } else { 0 };
-    let what = KIND_PLOT << 62 | spans.min(FOLD_SPANS_MAX) << FOLD_SPANS_SHIFT | counted | root | site << 8 | FOLD_ROW;
+    let what = KIND_PLOT << 62
+        | counted
+        | root
+        | spans.min(FOLD_SPANS_MAX) << FOLD_SPANS_SHIFT
+        | parent_site << FOLD_PARENT_SHIFT
+        | site << 8
+        | FOLD_ROW;
     let (count, bytes) = allocs.unwrap_or((0, 0));
     let build = key >> 32;
     ring.put([last, first, ticks, max, what, cpu.unwrap_or(0), build << 32 | count.min(u64::from(u32::MAX)), bytes]);
@@ -2039,15 +2125,17 @@ pub fn flush_folds() {
 }
 
 /// Writes the [`SPAN_COLS_ROW`]s of the span `id`, closing now: its self CPU (`cpu`, plus one;
-/// 0: not counted), the thread that made it when another closes it (`made_by`) and each typed
-/// column said, [`COL_WORDS`] a row.
+/// 0: not counted), the thread that made it when another closes it (`made_by`), the children it
+/// folded and their ticks (`folded`) and each typed column said, [`COL_WORDS`] a row.
 #[inline]
-fn put_cols(ring: &Ring, now: u64, id: u64, cpu: u64, made_by: Option<u64>, typed: &[u64; TYPED]) {
+fn put_cols(ring: &Ring, now: u64, id: u64, cpu: u64, made_by: Option<u64>, folded: Option<(u64, u64)>, typed: &[u64; TYPED]) {
     let said = (cpu != 0).then_some((CPU_COL, cpu));
     let made_by = made_by.map(|it| (THREAD_COL, it));
+    let folded = folded.into_iter().flat_map(|(spans, ticks)| [(FOLDED_COL, spans), (FOLDED_TICKS_COL, ticks)]);
     let mut values = said
         .into_iter()
         .chain(made_by)
+        .chain(folded)
         .chain((0..TYPED).filter(|&it| typed[it] != 0).map(|it| (it as u64, typed[it])));
     loop {
         let mut row = [now, 0, 0, id, 0, 0, 0, 0];
@@ -2147,6 +2235,10 @@ pub struct SpanRow {
     /// The words of its typed columns, as its span kind said them (0: not said): read with
     /// [`SpanRow::get`] or as its kind ([`span::read`]).
     pub typed: [u64; TYPED],
+    /// Its children folded into `folded` rows ([`fold_below`]) and their durations summed: 0
+    /// when none was. Its self time is its duration less its children's rows and this.
+    pub folded_spans: u64,
+    pub folded_ns: i64,
 }
 
 impl SpanRow {
@@ -2215,13 +2307,16 @@ pub struct EventRow {
 }
 
 /// A row of the schema's `folded` table: the spans of a site shorter than [`fold_below`]'s
-/// threshold that a thread closed in a stretch, summed ([`closed`]).
+/// threshold that a thread closed in a stretch under spans of one site, summed ([`closed`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FoldRow {
     pub build: u32,
     pub thread: u32,
     pub thread_name: Sym,
     pub site: u16,
+    /// The site of the span they were inside, whose row says their count and time
+    /// ([`SpanRow::folded_spans`]): 0 for none open as they closed.
+    pub parent_site: u16,
     /// Its spans were roots (depth 0): a worker's own work between jobs, which the gate counts
     /// as covered.
     pub root: bool,
@@ -2372,6 +2467,8 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         unit: row[6] as u32,
                         self_cpu_ns: None,
                         typed: [0; TYPED],
+                        folded_spans: 0,
+                        folded_ns: 0,
                     });
                 }
                 KIND_PLOT if row[4] & 0xff == SWITCH_ROW => {
@@ -2420,6 +2517,8 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         for (place, &word) in COL_WORDS.iter().enumerate() {
                             match row[4] >> (8 * (place + 1)) & 0xff {
                                 CPU_COL => span.self_cpu_ns = row[word].checked_sub(1),
+                                FOLDED_COL => span.folded_spans = row[word],
+                                FOLDED_TICKS_COL => span.folded_ns = scale.ns(row[word]) as i64,
                                 THREAD_COL => {
                                     span.thread = (row[word] >> 32) as u32;
                                     span.thread_name = row[word] as Sym;
@@ -2438,6 +2537,7 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                     thread: by.tid,
                     thread_name: by.name,
                     site: (row[4] >> 8 & ((1 << SITE_BITS) - 1)) as u16,
+                    parent_site: (row[4] >> FOLD_PARENT_SHIFT & ((1 << SITE_BITS) - 1)) as u16,
                     root: row[4] & FOLD_ROOT != 0,
                     from_ns: scale.mono(row[1]),
                     to_ns: scale.mono(row[0]),
@@ -3369,30 +3469,53 @@ mod tests {
             let tid = crate::sampler::os_tid() as u32;
             let mut cursor = Cursor::default();
             _ = mine(&mut cursor, tid);
-            fold_here(Duration::from_secs(5), Duration::from_secs(600));
+            fold_here(Duration::from_secs(5), Duration::from_secs(5), Duration::from_secs(600));
             let _build = building(23);
             for _ in 0..100 {
                 let _short = tracing::info_span!(target: "blaze", "fold short").entered();
             }
             {
                 let _parent = tracing::info_span!(target: "blaze", "fold parent").entered();
+                for _ in 0..3 {
+                    let _child = tracing::info_span!(target: "blaze", "fold child").entered();
+                }
                 let _named = tracing::info_span!(target: "blaze", "fold named").entered();
                 tracing::info!(target: "blaze", "fold names its span");
             }
             let typed = span::open_raw(span::Job { kind: span::Name::kept("fold typed"), job: 9, creator: None });
             span::close_raw(typed);
-            let (folds, spans) = mine(&mut cursor, tid);
-            assert!(folds.is_empty(), "a sum younger than its age is held: {folds:?}");
-            assert!(!spans.iter().any(|it| it == "fold short"), "a short span named by no row is no row: {spans:?}");
-            for kept in ["fold parent", "fold named", <span::Job as span::Span>::NAME] {
-                assert!(spans.iter().any(|it| it == kept), "{kept} is a row: one an event names, its parent, a typed span: {spans:?}");
+            let wait = span::open_raw(span::Wait {
+                awaits: span::Name::kept("fold wait"),
+                function: span::Name::kept("fold wait"),
+                owner: None,
+                on: blaze_graph::wait::WaitKind::Channel,
+            });
+            span::close_raw(wait);
+            let mut read = Read::default();
+            self::read(&mut cursor, &mut read);
+            let spans: Vec<&SpanRow> = read.spans.iter().filter(|it| it.thread == tid).collect();
+            let named = |it: &SpanRow| meta(it.site).map(|it| it.name());
+            assert!(read.folds.iter().all(|it| it.thread != tid), "a sum younger than its age is held: {:?}", read.folds);
+            for gone in ["fold short", "fold child", <span::Wait as span::Span>::NAME] {
+                assert!(!spans.iter().any(|it| named(it) == Some(gone)), "{gone}, short and named by no row, is no row: {spans:?}");
             }
+            for kept in ["fold parent", "fold named", <span::Job as span::Span>::NAME] {
+                assert!(spans.iter().any(|it| named(it) == Some(kept)), "{kept} is a row: one an event names, its parent, a typed span: {spans:?}");
+            }
+            let parent = spans.iter().find(|it| named(it) == Some("fold parent")).expect("the parent is a row");
+            assert_eq!(parent.folded_spans, 3, "a parent says the children it folded: {parent:?}");
+            assert!(parent.folded_ns > 0 && parent.folded_ns <= parent.dur_ns, "{parent:?}");
             flush_folds();
             let (folds, _) = mine(&mut cursor, tid);
-            let [fold] = folds.as_slice() else { panic!("one sum of the site: {folds:?}") };
-            assert_eq!(meta(fold.site).map(|it| it.name()), Some("fold short"));
-            assert_eq!((fold.spans, fold.root, fold.build), (100, true, 23));
-            assert!(fold.dur_ns >= fold.max_dur_ns && fold.to_ns >= fold.from_ns && fold.max_dur_ns > 0, "{fold:?}");
+            let sum = |name: &str| folds.iter().find(|it| meta(it.site).map(|it| it.name()) == Some(name)).unwrap_or_else(|| panic!("a sum of {name}: {folds:?}"));
+            assert_eq!(folds.len(), 3, "one sum a site and parent: {folds:?}");
+            let short = sum("fold short");
+            assert_eq!((short.spans, short.root, short.build, short.parent_site), (100, true, 23, 0));
+            assert!(short.dur_ns >= short.max_dur_ns && short.to_ns >= short.from_ns && short.max_dur_ns > 0, "{short:?}");
+            let child = sum("fold child");
+            assert_eq!((child.spans, child.root, child.parent_site), (3, false, parent.site));
+            assert_eq!(child.dur_ns, parent.folded_ns, "the parent's folded time is its children's sum");
+            assert_eq!(sum(<span::Wait as span::Span>::NAME).spans, 1, "a wait shorter than its bound folds, counted");
             for _ in 0..10 {
                 let _short = tracing::info_span!(target: "blaze", "fold at the end").entered();
             }

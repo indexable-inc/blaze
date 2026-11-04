@@ -15,6 +15,11 @@ mod client;
 #[cfg(not(feature = "net"))]
 mod offline;
 
+/// Whether this blaze can ask a server for anything: built with the `net` feature. Without it
+/// every request is [`NoNet`], so what is not in the store or the sources already can't be had,
+/// and a build says so for every such package at once.
+pub const NET: bool = cfg!(feature = "net");
+
 #[cfg(feature = "net")]
 pub use client::HyperHttp;
 #[cfg(not(feature = "net"))]
@@ -39,6 +44,10 @@ impl Response {
 // dyn: what `dyn Http` returns, one per network request, which costs far more than its box.
 pub type Pending<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// Where a streamed body goes, a piece at a time ([`Http::stream`]); an error stops the
+/// transfer.
+pub type Sink<'s> = &'s mut (dyn FnMut(&[u8]) -> std::io::Result<()> + Send);
+
 /// What asks servers for files. An error is one where no answer came, which is worth trying
 /// again, as cargo tries a connection or a transfer that failed again.
 pub trait Http: Send + Sync {
@@ -48,6 +57,21 @@ pub trait Http: Send + Sync {
     /// requests are in flight at once. By default it is asked and answered on this thread.
     fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
         Box::pin(std::future::ready(self.get(url, headers)))
+    }
+
+    /// [`Http::get`] whose 200 body goes to `sink` as it comes instead of into the answer, whose
+    /// `body` is then empty; any other answer is given for its error, with at most the first
+    /// 64 KiB of its body (HyperHttp's bound: no error page fills memory). By default (a test's
+    /// fake) the body is collected first and handed over after.
+    fn stream(&self, url: &str, headers: &[(&str, &str)], sink: Sink<'_>) -> anyhow::Result<Response> {
+        let mut answer = self.get(url, headers)?;
+        if answer.status == 200 {
+            for piece in answer.body.chunks(64 * 1024) {
+                sink(piece).map_err(|e| anyhow::anyhow!("keeping the body of {}: {e}", blaze_fetch::redact(url)))?;
+            }
+            answer.body = Vec::new(); // alloc: empty, allocates nothing
+        }
+        Ok(answer)
     }
 
     /// A wait that holds no thread; by default it holds this one ([`wait_out`]).
@@ -78,7 +102,8 @@ impl HttpNotSuccessful {
         }
     }
 
-    fn is_spurious(&self) -> bool {
+    /// Whether another try may get a better answer: a server error, or too many requests.
+    pub fn is_spurious(&self) -> bool {
         (500..600).contains(&self.code) || self.code == 429
     }
 }
@@ -161,7 +186,7 @@ impl Retry {
         let left = self.retries - *tried;
         if !self.quiet {
             let tries = if left == 1 { "try" } else { "tries" };
-            eprintln!("warning: spurious network error ({left} {tries} remaining): {e:#}");
+            eprintln!("warning: spurious network error ({left} {tries} remaining): {}", blaze_fetch::scrub(&format!("{e:#}")));
         }
         *tried += 1;
         let after = e.downcast_ref::<HttpNotSuccessful>().and_then(retry_after);

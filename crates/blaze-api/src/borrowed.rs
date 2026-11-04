@@ -91,6 +91,11 @@ pub enum ResponseRef<'a> {
     Rebuilt(Rebuilt),
     Launched { live: bool, env: Vec<(String, String)> },
     Stopping { doing: &'a str },
+    Stored {
+        #[serde(borrow)]
+        path: Option<&'a str>,
+        blake3: &'a str,
+    },
 }
 
 /// [`LiveFrame`], read where it lies: a frame every 250 ms decodes with no copy of its tables.
@@ -336,6 +341,7 @@ impl ResponseRef<'_> {
             ResponseRef::Rebuilt(it) => Response::Rebuilt(it),
             ResponseRef::Launched { live, env } => Response::Launched { live, env },
             ResponseRef::Stopping { doing } => Response::Stopping { doing: owned(doing) },
+            ResponseRef::Stored { path, blake3 } => Response::Stored { path: maybe(path), blake3: owned(blake3) },
         }
     }
 }

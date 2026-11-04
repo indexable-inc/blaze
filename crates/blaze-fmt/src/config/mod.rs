@@ -375,18 +375,20 @@ impl Config {
         let table = parsed
             .as_table()
             .ok_or_else(|| String::from("Parsed config was not table"))?;
-        for key in table.keys() {
-            if !Config::is_valid_name(key) {
-                let msg = &format!("Warning: Unknown configuration option `{key}`\n");
-                err.push_str(msg)
-            }
+        // rustfmt warns of an option it does not know and formats without it; blaze fmt has no
+        // rustfmt to leave it to, so an option it would not run refuses the file, naming each.
+        let refused = refused_options(table);
+        if !refused.is_empty() {
+            return Err(format!(
+                "blaze fmt refuses `{}`: it has options blaze fmt does not run (remove them, or \
+                 file them against crates/blaze-fmt):\n{}",
+                file_path.display(),
+                refused.join("\n")
+            ));
         }
 
         match parsed.try_into::<PartialConfig>() {
             Ok(parsed_config) => {
-                if !err.is_empty() {
-                    eprint!("{err}");
-                }
                 let dir = file_path.parent().ok_or_else(|| {
                     format!("failed to get parent directory for {}", file_path.display())
                 })?;
@@ -403,6 +405,28 @@ impl Config {
             }
         }
     }
+}
+
+/// The options of a rustfmt.toml that blaze fmt refuses, each with why: a name that is none of
+/// rustfmt 1.11.0's options (the pinned nightly's), and a non-empty `ignore`, whose gitignore
+/// matching is not ported (`ignore_path`).
+fn refused_options(table: &::toml::Table) -> Vec<String> {
+    let mut refused = Vec::new(); // alloc: the refused options of one config file, for its error
+    for key in table.keys() {
+        if !Config::is_valid_name(key) {
+            refused.push(format!(
+                "  `{key}`: not an option of rustfmt {} (the pinned nightly's)",
+                crate::RUSTFMT_VERSION
+            ));
+        }
+    }
+    let ignores = table.get("ignore").is_some_and(|it| it.as_array().is_none_or(|it| !it.is_empty()));
+    if ignores {
+        refused.push(String::from(
+            "  `ignore`: rustfmt's gitignore matching of it is not ported to blaze fmt",
+        ));
+    }
+    refused
 }
 
 /// Looks for a configuration file in the given directory and its parents.

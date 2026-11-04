@@ -77,8 +77,9 @@ use serde::{Deserialize, Serialize};
 /// [`Response::Rebuilt`] (`blaze why`), grouped on the daemon. 27: [`Worked::placed`]. 28:
 /// [`Request::Launch`] and [`Response::Launched`]. 29: [`Response::Stopping`]. 30:
 /// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`]. 33:
-/// [`Status::bugs`].
-pub const SCHEMA: u32 = 33;
+/// [`Status::bugs`]. 34: [`Request::FetchUrl`] and [`Response::Stored`]. 35:
+/// [`Status::settings`].
+pub const SCHEMA: u32 = 35;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -335,6 +336,22 @@ pub enum Request {
     /// at) is a dev executable the daemon holds (docs/v2/plan/lanes/fastcompile/inproc.md).
     /// Answered with [`Response::Launched`] by the daemon's loop, which holds the programs.
     Launch { pid: u32, program: String },
+    /// `blaze fetch-url '<json>'`: the bytes of `url`, or the tree of the git repository `repo`
+    /// at the full commit `rev`, whose digest is `digest` (`sha256:<hex>`, `sha512:<hex>` or
+    /// `blake3:<hex>`; a git tree's over its canonical listing): from the daemon's store when it
+    /// has them, else fetched, checked and kept there (blaze-fetch). Exactly one of `url` and
+    /// `repo` (with `rev`). `most_bytes` bounds the download (blaze-fetch's
+    /// `DEFAULT_MOST_BYTES` when `None`); `out`, an absolute directory, is where to write the
+    /// bytes out, named by their BLAKE3 (with none, they are only kept in the store). Answered
+    /// with [`Response::Stored`] by the daemon's loop, which holds the store.
+    FetchUrl {
+        url: Option<String>,
+        repo: Option<String>,
+        rev: Option<String>,
+        digest: String,
+        most_bytes: Option<u64>,
+        out: Option<String>,
+    },
 }
 
 /// [`Request::Rebuilt`]'s answer.
@@ -665,6 +682,10 @@ pub enum Response {
     /// hangs up (making, writing and mapping its image), said as it begins: `blaze stop` waits
     /// for each step in turn and, when one outlasts its patience, names it.
     Stopping { doing: String },
+    /// [`Request::FetchUrl`]'s answer: the bytes' BLAKE3 (`blake3`, in hex), as the store
+    /// keeps them, and, when the request named `out`, where they are written out, read-only
+    /// and named by it: a file for a URL, a directory for a git tree.
+    Stored { path: Option<String>, blake3: String },
 }
 
 /// What a [`Request::Doc`] documented.
@@ -1307,8 +1328,22 @@ pub struct Status {
     /// naming the file; `None` while every flush has been written.
     pub history: Option<String>,
     pub requests: Vec<u64>,
+    /// What the daemon was started with that it keeps for its life
+    /// (`blaze-cargo`'s `serve::settings::STARTED_WITH`, one each, in that order): a client
+    /// whose own environment says otherwise restarts an idle daemon, or refuses at once, before
+    /// it sends a request, never builds under the daemon's values.
+    pub settings: Vec<Setting>,
     pub budget_bytes: u64,
     pub memory_bytes: u64,
+}
+
+/// One setting a daemon takes from how it was started and keeps for its life
+/// ([`Status::settings`]): an environment variable's name and the value the daemon runs with,
+/// `None` where it was unset. Never a secret: no token or key is one.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Setting {
+    pub name: String,
+    pub value: Option<String>,
 }
 
 /// One site's bugs the daemon reported and went on past ([`Status::bugs`]): a value formatted

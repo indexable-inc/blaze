@@ -355,13 +355,21 @@ fn locate_all(
     let files = *ctx.files();
     let mut here = Vec::new();
     let mut needs: Vec<Fetch> = Vec::new();
+    // Every package that can't be had, not the first: an offline build lacking ten says ten
+    // in one run (lane earlyfail).
+    // Each with whether one run that may fetch has it ([`Located::Unfetched`]).
+    let mut failed: Vec<(LoadError, bool)> = Vec::new();
     for &id in ids {
         let checksum = checksums.get(&id).and_then(Option::as_deref);
         match files.with_cx(|cx| sources.locate(cx, id, checksum))? {
             Located::Here { manifest } => here.push((id, manifest)),
             Located::Needs(fetch) => needs.push(fetch),
-            Located::Failed(error) => return Ok(Staged::Failed(error)),
+            Located::Failed(error) => failed.push((error, false)),
+            Located::Unfetched(error) => failed.push((error, true)),
         }
+    }
+    if !failed.is_empty() {
+        return Ok(Staged::Failed(all_failed(failed, sources)));
     }
     if !needs.is_empty() {
         return Ok(Staged::Needs(needs));
@@ -385,6 +393,41 @@ fn locate_all(
         }
     }
     Ok(Staged::Done(read))
+}
+
+/// The packages the lock pins that can't be had (`failed`, in the lock's order, each with
+/// whether one run that may fetch has it), as one error: one alone as it is (cargo's own), more
+/// each under its own line; and, for those only a fetch lacks ([`Located::Unfetched`]), where
+/// blaze looked and how to have them. A path package, a git index or a bad replacement is no
+/// fetch's to fix, and gets no such note.
+fn all_failed(mut failed: Vec<(LoadError, bool)>, sources: &Sources) -> LoadError {
+    if failed.len() == 1 {
+        return failed.pop().expect("one error").0;
+    }
+    // alloc: an error, once per load that failed
+    let mut what = format!("{} packages the lock file pins can't be had:", failed.len());
+    for (error, _) in &failed {
+        let mut lines = error.what.lines().filter(|it| !it.trim().is_empty());
+        if let Some(first) = lines.next() {
+            what.push_str("\n  - ");
+            what.push_str(first);
+        }
+        for line in lines {
+            what.push_str("\n      ");
+            what.push_str(line.trim_start());
+        }
+    }
+    let unfetched: Vec<&str> = failed.iter().filter(|(_, fetch)| *fetch).filter_map(|(error, _)| error.at.as_deref()).collect();
+    if let (Some(flag), false) = (sources.offline(), unfetched.is_empty()) {
+        what.push_str(&format!(
+            "\nthis build is offline ({flag}), and blaze's sources ({}) hold {} of them ({}): one run without \
+             {flag} fetches them there",
+            sources.kept(),
+            unfetched.len(),
+            unfetched.join(", ")
+        ));
+    }
+    LoadError { what, at: None }
 }
 
 /// The members `select` selects, as cargo's `Packages::from_flags` and

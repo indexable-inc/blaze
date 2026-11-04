@@ -131,15 +131,15 @@ pub fn parse(value: Option<&std::ffi::OsStr>) -> Result<Setting, CoresError> {
     }
 }
 
-/// Why the budget can't be made, or a request's disagrees with the process's.
+/// Why the budget can't be made. A command whose budget disagrees with the running daemon's
+/// is refused by the CLI with every other setting it differs in (blaze-cargo's
+/// `serve::settings`, by [`Cores::agrees`]), not here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoresError {
     /// `BLAZE_CORES` holds `value`, which is not what it takes.
     Invalid { value: String },
     /// The machine's core count can't be read.
     Machine { why: String },
-    /// A command line asked `asked` of a daemon that started with `daemon`.
-    Differs { asked: Cores, daemon: Cores },
 }
 
 impl fmt::Display for CoresError {
@@ -155,12 +155,6 @@ impl fmt::Display for CoresError {
                 f,
                 "the number of cores this machine lets blaze use (std::thread::available_parallelism), \
                  which {VAR}'s budget is made from, can't be read: {why}"
-            ),
-            CoresError::Differs { asked, daemon } => write!(
-                f,
-                "this command asks for {asked}, and the running daemon started with {daemon}: a daemon's \
-                 cores and priority are set once, when it starts; run `blaze stop` and run the command \
-                 again, and the daemon it starts takes this command's {VAR}"
             ),
         }
     }
@@ -206,24 +200,6 @@ pub fn get() -> Result<Cores, CoresError> {
     )]
     static CORES: std::sync::OnceLock<Result<Cores, CoresError>> = std::sync::OnceLock::new();
     CORES.get_or_init(|| machine().and_then(|machine| of(std::env::var_os(VAR).as_deref(), machine))).clone() // clone: an error's text at most, once per site
-}
-
-/// The budget a command line's environment `env` asks for (its `BLAZE_CORES`) agrees with
-/// `daemon`'s, the running daemon's: a daemon's budget and priority are fixed when it starts
-/// (its worker pool, its plane, its nice value), so a request asking for others is refused
-/// rather than run with the daemon's.
-///
-/// # Errors
-///
-/// [`CoresError::Invalid`] for a value [`parse`] refuses; [`CoresError::Differs`] for a budget
-/// or priority other than the daemon's.
-pub fn check_request<'a>(daemon: Cores, env: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<(), CoresError> {
-    let value = env.into_iter().find(|(name, _)| *name == VAR).map(|(_, value)| std::ffi::OsStr::new(value));
-    let asked = of(value, daemon.machine)?;
-    match daemon.agrees(&asked) {
-        true => Ok(()),
-        false => Err(CoresError::Differs { asked, daemon }),
-    }
 }
 
 /// Why the process's priority was not lowered: the call, and what the OS said.
@@ -350,17 +326,14 @@ mod tests {
     }
 
     #[test]
-    fn a_request_agrees_with_the_daemon_by_budget_and_priority() {
+    fn budgets_agree_by_budget_and_priority() {
         let daemon = Cores::resolve(Setting::Default, n(18));
-        assert_eq!(check_request(daemon, std::iter::empty()), Ok(()));
-        assert_eq!(check_request(daemon, [("BLAZE_CORES", "16")]), Ok(()));
-        assert_eq!(
-            check_request(daemon, [("PATH", "/bin"), ("BLAZE_CORES", "all")]),
-            Err(CoresError::Differs { asked: Cores::resolve(Setting::All, n(18)), daemon })
-        );
-        assert_eq!(check_request(daemon, [("BLAZE_CORES", "x")]), Err(CoresError::Invalid { value: "x".to_owned() }));
+        assert!(daemon.agrees(&of(None, n(18)).unwrap()));
+        assert!(daemon.agrees(&of(Some("16".as_ref()), n(18)).unwrap()));
+        assert!(!daemon.agrees(&of(Some("all".as_ref()), n(18)).unwrap()));
+        assert_eq!(of(Some("x".as_ref()), n(18)), Err(CoresError::Invalid { value: "x".to_owned() }));
         // `all` on a machine the default would also give every core still differs: priority.
         let all = Cores::resolve(Setting::All, n(18));
-        assert!(matches!(check_request(all, [("BLAZE_CORES", "18")]), Err(CoresError::Differs { .. })));
+        assert!(!all.agrees(&of(Some("18".as_ref()), n(18)).unwrap()));
     }
 }

@@ -220,7 +220,8 @@ pub enum Class {
     Workspace,
     /// A profile's directory in a workspace's build dir (`debug`, `release`, ...).
     Profile,
-    /// The shared standard library's store of one blaze build, `<machine>/std/<build id>`.
+    /// The shared standard library's store of every blaze whose code making records is one,
+    /// `<machine>/std/<makers>` (blaze-cargo's `serve::RecordMakers`).
     Std,
     /// A temporary a writer left (a name ending `.tmp`), in an area or a build dir.
     Temp,

@@ -318,6 +318,133 @@ fn units_apart_only_in_what_the_front_end_does_not_read_are_one_crate() {
     assert_eq!(base_db::all_crates(built.lowered.db()).len(), 7);
 }
 
+/// A build script's run, `twin`, of `a` at another `OUT_DIR` (`out_dir`, as cargo names it
+/// from the profile) with its own variables `env`, and `a`'s lib and `b`'s bin again at
+/// opt-level 3 above it: by unit, the run, the lib and the bin.
+fn twins(units: &mut Units, out_dir: &str, env: &[(&str, &str)]) -> (usize, usize, usize) {
+    let fixture = self::units();
+    let of = |at: usize| {
+        let mut unit = fixture.graph.units[at].clone();
+        unit.profile.opt_level = "3".to_owned();
+        unit
+    };
+    let mut push = |mut unit: Unit, dependencies: Vec<UnitDep>, plan: UnitPlan| {
+        unit.dependencies = dependencies;
+        units.graph.units.push(unit);
+        units.plans.push(plan);
+        units.graph.units.len() - 1
+    };
+    let run = push(of(RUN), vec![dep(BUILD_SCRIPT, "build_script_build", false)], plan(&[], env, Some(out_dir)));
+    let lib_env = [("CARGO_PKG_NAME", "a"), ("OUT_DIR", out_dir)];
+    let lib_deps = vec![dep(CORE, "core", true), dep(run, "build_script_build", false)];
+    let lib = push(of(LIB), lib_deps, plan(&["feature=\"fast\""], &lib_env, None));
+    let bin_deps = vec![dep(lib, "alpha", false), dep(MACRO, "m", false), dep(CORE, "core", true)];
+    let bin = push(of(BIN), bin_deps, plan(&[], &[("CARGO_PKG_NAME", "b")], None));
+    (run, lib, bin)
+}
+
+/// What a run of `a`'s build script under `out_dir` gives: `cfg`, and a variable and a file that
+/// name its `OUT_DIR`.
+fn gen_ran(out_dir: &str, cfg: &str) -> Ran {
+    Ran {
+        cfgs: vec![cfg.to_owned()],
+        env: vec![("GEN".to_owned(), format!("{out_dir}/gen.rs"))],
+        out_dir: out_dir.to_owned(),
+        files: vec![("gen.rs".to_owned(), format!("// {out_dir}\npub fn gen() {{}}\n").into_bytes())],
+    }
+}
+
+/// Whether `krate`'s cfg holds a [`crates::RUN_PROFILE`] atom.
+fn has_run_profile(db: &Db, krate: Crate) -> bool {
+    krate.cfg_options(db).into_iter().any(|atom| matches!(atom, CfgAtom::KeyValue { key, .. } if key.as_str() == crates::RUN_PROFILE))
+}
+
+/// A host package reached both as a normal dependency and as a build dependency under two
+/// profiles apart only in what its build script's run never reads (`codegen-units`, say), as
+/// cargo plans it: `a`'s lib again at another opt-level, with a run of `a`'s build script of
+/// its own (an `OUT_DIR` cargo names from the profile), and `b` again above it. The two runs
+/// have the same inputs but their `OUT_DIR`, so they are one run class: each twin is one crate
+/// with the first's, read under the first run's `OUT_DIR`, and no two crates have one key (else
+/// `blaze_items::key::check_crate_keys` stops the build). The class's run that ends first is
+/// the one its crates read; its twin's is taken and read by no crate.
+#[test]
+fn units_apart_only_in_their_profile_and_its_runs_out_dir_are_one_crate() {
+    const OUT_FAST: &str = "/w/target/release/build/a-2/out";
+    let mut units = units();
+    let (run, lib, bin) = twins(&mut units, OUT_FAST, &[]);
+    let mut built = lowered(&units).unwrap();
+    let db = built.lowered.db();
+    assert_eq!(krate(&built, lib), krate(&built, LIB));
+    assert_eq!(krate(&built, bin), krate(&built, BIN), "a crate above twins is one too");
+    assert_eq!(base_db::all_crates(db).len(), 6);
+    assert_eq!(krate(&built, LIB).env(db).get("OUT_DIR").as_deref(), Some(OUT_DIR));
+    assert!(!has_run_profile(db, krate(&built, LIB)), "one run class in its family: no profile to tell apart");
+    blaze_items::key::check_crate_keys(db).unwrap_or_else(|clash| panic!("{clash}"));
+
+    // The optimized run first, its variable and its file naming its own `OUT_DIR`: the front
+    // end reads them under the class's.
+    built.lowered.ran(run, &gen_ran(OUT_FAST, "has_gen")).unwrap();
+    let db = built.lowered.db();
+    let shared = krate(&built, LIB);
+    assert!(shared.cfg_options(db).check_atom(&flag("has_gen")));
+    assert_eq!(shared.env(db).get("OUT_DIR").as_deref(), Some(OUT_DIR));
+    assert_eq!(shared.env(db).get("GEN").as_deref(), Some(format!("{OUT_DIR}/gen.rs").as_str()));
+    let generated = path(&format!("{OUT_DIR}/gen.rs"));
+    let file = root_of(db, shared).file_for_path(&generated).copied().expect("the run's file, under the class's `OUT_DIR`");
+    assert_eq!(&**db.file_text(file).text(db), format!("// {OUT_DIR}\npub fn gen() {{}}\n").as_str());
+    assert!(root_of(db, shared).file_for_path(&path(&format!("{OUT_FAST}/gen.rs"))).is_none());
+
+    // Its twin is taken and changes nothing the front end reads, whatever it gave; the class's
+    // own run again is applied again.
+    built.lowered.ran(RUN, &gen_ran(OUT_DIR, "other")).unwrap();
+    let db = built.lowered.db();
+    assert!(shared.cfg_options(db).check_atom(&flag("has_gen")) && !shared.cfg_options(db).check_atom(&flag("other")));
+    built.lowered.ran(run, &gen_ran(OUT_FAST, "again")).unwrap();
+    assert!(shared.cfg_options(built.lowered.db()).check_atom(&flag("again")));
+}
+
+/// The same twins as a release build plans a host package reached both as a normal dependency
+/// (`profile.release`, opt-level 3) and as a build dependency (`build-override`, opt-level 0):
+/// their runs differ in `OPT_LEVEL`, and a `cc`-based script gives each its own output (other
+/// objects, and maybe other sources, cfgs or variables), known only once both ran. So each twin
+/// is a crate of its own, read from its own run under its own `OUT_DIR` as rustc reads it,
+/// with its run's profile in its cfg (`crates::RUN_PROFILE`) to tell the keys apart: without
+/// it, the two libs are alike in all their key covers.
+#[test]
+fn units_apart_in_their_runs_opt_level_are_two_crates_each_of_its_own_run() {
+    const OUT_FAST: &str = "/w/target/release/build/a-2/out";
+    let mut units = units();
+    units.plans[RUN].env = vec![("OPT_LEVEL".to_owned(), "0".to_owned()), ("DEBUG".to_owned(), "false".to_owned())];
+    let (run, lib, bin) = twins(&mut units, OUT_FAST, &[("OPT_LEVEL", "3"), ("DEBUG", "false")]);
+    let mut built = lowered(&units).unwrap();
+    let db = built.lowered.db();
+    let (slow, fast) = (krate(&built, LIB), krate(&built, lib));
+    assert_ne!(slow, fast);
+    assert_ne!(krate(&built, bin), krate(&built, BIN), "a crate above either twin is two too");
+    assert_eq!(base_db::all_crates(db).len(), 8);
+    assert!(slow.cfg_options(db).check_atom(&key_value(crates::RUN_PROFILE, "OPT_LEVEL=0 DEBUG=false")));
+    assert!(fast.cfg_options(db).check_atom(&key_value(crates::RUN_PROFILE, "OPT_LEVEL=3 DEBUG=false")));
+    assert!(!has_run_profile(db, krate(&built, CORE)), "a crate of no such run");
+    assert_eq!(slow.env(db).get("OUT_DIR").as_deref(), Some(OUT_DIR));
+    assert_eq!(fast.env(db).get("OUT_DIR").as_deref(), Some(OUT_FAST));
+    blaze_items::key::check_crate_keys(db).unwrap_or_else(|clash| panic!("{clash}"));
+
+    // The runs give other output: each twin reads its own, under its own `OUT_DIR`.
+    built.lowered.ran(run, &gen_ran(OUT_FAST, "fast_gen")).unwrap();
+    built.lowered.ran(RUN, &gen_ran(OUT_DIR, "slow_gen")).unwrap();
+    let db = built.lowered.db();
+    let has = |krate: Crate, name: &str| krate.cfg_options(db).check_atom(&flag(name));
+    assert!(has(fast, "fast_gen") && !has(fast, "slow_gen"));
+    assert!(has(slow, "slow_gen") && !has(slow, "fast_gen"));
+    for (krate, out_dir) in [(slow, OUT_DIR), (fast, OUT_FAST)] {
+        assert_eq!(krate.env(db).get("GEN").as_deref(), Some(format!("{out_dir}/gen.rs").as_str()));
+        let generated = path(&format!("{out_dir}/gen.rs"));
+        let file = root_of(db, krate).file_for_path(&generated).copied().expect("each run's file, under its own `OUT_DIR`");
+        assert_eq!(&**db.file_text(file).text(db), format!("// {out_dir}\npub fn gen() {{}}\n").as_str());
+    }
+    blaze_items::key::check_crate_keys(db).unwrap_or_else(|clash| panic!("{clash}"));
+}
+
 #[test]
 fn deps_are_by_extern_name_in_the_units_order() {
     let built = lowered(&units()).unwrap();

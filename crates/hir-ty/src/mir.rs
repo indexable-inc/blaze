@@ -126,6 +126,15 @@ impl<'db> Operand {
         }
     }
 
+    /// A constant of `bytes` with no memory map, interned without copying `bytes` when it is
+    /// there already.
+    pub fn from_scalar_bytes(bytes: &[u8], ty: Ty<'db>) -> Self {
+        Operand {
+            kind: OperandKind::Allocation { allocation: Allocation::of_bytes(ty, bytes).store() },
+            span: None,
+        }
+    }
+
     pub fn from_bytes(data: Box<[u8]>, ty: Ty<'db>) -> Self {
         Operand::from_concrete_const(data, MemoryMap::default(), ty)
     }

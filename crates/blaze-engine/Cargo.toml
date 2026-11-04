@@ -80,8 +80,9 @@ cfg.workspace = true
 hir.workspace = true
 intern.workspace = true
 
-# `BLAZE_CODEGEN_CODE` (build.rs): the code generator's code identity, of the packages it is
-# built from, so a rebuild that edits none of them keeps every stored template.
+# `BLAZE_CODEGEN_CODE`, `BLAZE_FRONT_END_CODE` and `BLAZE_RECORD_CODE` (build.rs): the code
+# identities of the code generator, the front end and what makes a unit's record, each of the
+# packages it is built from, so a rebuild that edits none of them keeps what each keys.
 [build-dependencies]
 blaze-codegen-code.workspace = true
 

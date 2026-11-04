@@ -183,10 +183,41 @@ pub struct SpanIn {
     /// `spans.self_cpu_ns`: its job's CPU while it was open, less the spans under it; `None`
     /// when not counted.
     pub self_cpu_ns: Option<i64>,
+    /// `spans.folded_ns`: its children too short for a row each ([`crate::flight::FOLD_BELOW`]),
+    /// summed; 0 when none was. They ran inside it, so its uncovered time leaves them out.
+    pub folded_ns: i64,
 }
 
 /// The name of a span that is a wait (`blaze_graph::wait`'s spans).
 pub const WAIT_SPAN: &str = "wait";
+
+/// The name of a job's root span ([`crate::span::Job`]): the span that names its job and creator.
+pub const JOB_SPAN: &str = <crate::span::Job as crate::span::Span>::NAME;
+
+/// Which of a build's spans [`load::rows`] read. One build can hold hundreds of millions of
+/// spans (192 million in build 24 of a 52-minute cold build, 2026-11-03), more than the model
+/// can hold, so past [`load::SPAN_BUDGET`] it reads the spans at or past `floor_ns`, every
+/// root [`JOB_SPAN`] and [`WAIT_SPAN`] and every span the record never ended, and none of the
+/// shorter ones. Taken by duration, the spans read keep every parent they have: a child lies
+/// inside its parent, so is never longer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpanCut {
+    /// The least duration of a span read; 0 when every span was.
+    pub floor_ns: i64,
+    /// The build's spans, all told.
+    pub spans: u64,
+    /// Of them, those read.
+    pub read: u64,
+    /// The durations of those not read, summed: a nested one's time is also its parent's.
+    pub cut_ns: i64,
+}
+
+impl SpanCut {
+    /// The spans not read.
+    pub fn cut(&self) -> u64 {
+        self.spans.saturating_sub(self.read)
+    }
+}
 
 /// The name of a pool worker's span of its own work between jobs (`blaze_graph::pool::Driving`):
 /// no job's, and no thread lane's either, as a worker's idle is no thread's running.
@@ -293,6 +324,7 @@ impl Input {
                 start_ns: it.start_ns,
                 dur_ns: it.dur_ns,
                 self_cpu_ns: it.self_cpu_ns.and_then(|it| i64::try_from(it).ok()),
+                folded_ns: it.folded_ns,
             });
         }
         let events = read
@@ -339,6 +371,9 @@ pub enum TimeError {
     /// The rows of build `build` come from more than one process: each daemon numbered a build
     /// so in one history. Read as one build, their workers and windows would be summed.
     ManyProcesses { build: u64, processes: Vec<OfProcess> },
+    /// Build `build` holds more spans than the model reads ([`load::SPAN_BUDGET`]) even at the
+    /// highest floor tried: `read` at `floor_ns`, of `spans`.
+    TooManySpans { build: u64, spans: u64, read: u64, floor_ns: i64, budget: u64 },
 }
 
 /// A process's rows of a build ([`TimeError::ManyProcesses`]): how many, and from when to when.
@@ -375,6 +410,13 @@ impl fmt::Display for TimeError {
                      is its identity (rule 18), so this one is refused rather than read as one build of all their workers"
                 )
             }
+            TimeError::TooManySpans { build, spans, read, floor_ns, budget } => write!(
+                f,
+                "build {build} has {spans} spans, and even taking only those of {:.1} s or more, every root job and wait \
+                 span and every unended one, the model would hold {read}, past its bound of {budget} \
+                 (time::load::SPAN_BUDGET): read it with `blaze debug sql` over the spans view instead",
+                *floor_ns as f64 / 1e9
+            ),
         }
     }
 }
@@ -1505,8 +1547,12 @@ impl Model {
                 *end = (*end).max(span.end_ns());
             }
         }
-        for (it, under) in self.span_time.iter_mut().zip(under) {
+        for ((it, under), span) in self.span_time.iter_mut().zip(under).zip(&self.spans) {
             it.own = it.totals.minus(under);
+            // Its folded children ran inside it, under a span with no row: covered, never its
+            // own. A fold neither parks nor waits ([`crate::flight::WAIT_FOLD_BELOW`]), so
+            // their time is running time.
+            it.own.running_ns -= span.folded_ns.clamp(0, it.own.running_ns.max(0));
         }
     }
 }

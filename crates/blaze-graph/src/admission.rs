@@ -256,6 +256,16 @@ impl Squeeze {
         now.limit != u64::MAX && (now.squeezed() || now.over.is_some()) && now.held >= self.after
     }
 
+    /// Whether a release is due at `now` for a task the plane holds back for memory the
+    /// process holds besides its tasks (`crate::Plane::short`): under a limit, whatever the
+    /// line, once blaze has grown by a [`STEP`]th of the limit since the last release ended.
+    /// Waiting would never free that memory, and the line (an eighth under the limit) may be
+    /// far above what keeps a task out: 31 GB held of 47 kept out a task predicted 15.78 GB
+    /// with the line at 41 (memadmit).
+    pub const fn short(&self, now: Pressure) -> bool {
+        now.limit != u64::MAX && now.held >= self.after
+    }
+
     /// A release ended, leaving `now`: the next is due only past a [`STEP`]th more.
     pub fn released(&mut self, now: Pressure) {
         self.after = now.held.saturating_add(now.limit / STEP);

@@ -31,7 +31,7 @@ use blaze_graph::{
     machine::{NodeId, Outcome, Pool},
     plane::{Key, NodeRef, Nodes, Unsettled},
 };
-use blaze_hash::HashSet;
+use blaze_hash::{HashMap, HashSet};
 use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_protocol::events::{Event, NodeState};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -89,6 +89,8 @@ pub struct Fresh {
     nodes: Nodes,
     tasks: Vec<Task>,
     keys: Vec<Option<Key>>,
+    /// Each node's unit's source bytes ([`Plane::push_sized`]); 0 for a node not sized.
+    sizes: Vec<u64>,
     count: u32,
 }
 
@@ -589,6 +591,9 @@ struct Batch<W> {
     tasks: Vec<Task>,
     /// Each node's key, read once when it ends, for what its run teaches.
     keys: Vec<Option<Key>>,
+    /// Each node's unit's source bytes, 0 for none ([`Plane::push_sized`]): what its peak
+    /// teaches its kind's bytes held per KiB of source.
+    sizes: Vec<u64>,
     live: u32,
     work: Option<Arc<W>>,
     reads: bool,
@@ -619,7 +624,21 @@ pub struct Plane<W: Work, P: Predict> {
     /// Each node whose task replays what was kept, so its run teaches nothing
     /// ([`Plane::replays`]), until it ends or settles.
     replays: HashSet<NodeId, Global>,
+    /// By kind, the bytes a unit's phase held per KiB of its source, learned as sized nodes
+    /// end ([`Plane::push_sized`]) by [`admission::Estimate`]'s rule: a high quantile of the
+    /// kind's recent ratios. Not kept in the image: a daemon starts from [`PER_SOURCE_KIB`]
+    /// and learns again in its first build.
+    per_kib: HashMap<TaskKind, admission::Estimate, Global>, // alloc: the plane's, an entry a kind
 }
+
+/// What a unit's phase of a kind with no ratio measured yet is predicted to hold per KiB of
+/// its source: 1 MiB, a thousand bytes for each byte of source. Never more than the kind's own
+/// peak ([`Plane::push_sized`]), so a guess too high costs no more than the kind floor did.
+pub const PER_SOURCE_KIB: u64 = 1 << 20;
+
+/// The least a sized unit's phase is predicted to hold, however small its source: the
+/// history's prediction for a kind never seen (`blaze_history::Config::unseen_bytes`).
+pub const SIZED_FLOOR: u64 = 64 << 20;
 
 pub(crate) fn ns(at: Duration) -> u64 {
     u64::try_from(at.as_nanos()).unwrap_or(u64::MAX)
@@ -641,6 +660,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
             loops: BTreeMap::new(),
             alone: BTreeMap::new(),
             replays: HashSet::new_in(Global), // alloc: the plane's, once
+            per_kib: HashMap::new_in(Global), // alloc: the plane's, once
         })
     }
 
@@ -671,7 +691,9 @@ impl<W: Work, P: Predict> Plane<W, P> {
     pub fn fresh(&mut self, count: u32, name_bytes: usize, deps: usize) -> Fresh {
         let first = self.reserve(count);
         let nodes = Nodes::with_capacity(first, count as usize, name_bytes, deps);
-        Fresh { nodes, tasks: Vec::with_capacity(count as usize), keys: Vec::with_capacity(count as usize), count }
+        let (tasks, keys, sizes) =
+            (Vec::with_capacity(count as usize), Vec::with_capacity(count as usize), Vec::with_capacity(count as usize));
+        Fresh { nodes, tasks, keys, sizes, count }
     }
 
     /// The next node of `fresh`, its id; its memory raised to what its kind and key are
@@ -725,7 +747,74 @@ impl<W: Work, P: Predict> Plane<W, P> {
         }
         fresh.tasks.push(task);
         fresh.keys.push(learn);
+        fresh.sizes.push(0);
         fresh.nodes.push(node)
+    }
+
+    /// The next node of `fresh`, a phase of a unit of `source` bytes of Rust source, predicted
+    /// and taught by `learn` as [`Plane::push_learned`] is, but sized by the unit itself, not
+    /// floored at its kind's peak.
+    ///
+    /// A kind's peak is the most any task of it held lately (it rises at once and comes down
+    /// by halves only after [`admission::WINDOW`] smaller ones in a row): one large crate's
+    /// codegen (15.78 GB of blaze's own) made every unit's codegen predict that much,
+    /// `ahash`'s and a build script's alike, and a test build with 31 GB held refused ten
+    /// targets for it (memadmit). A unit is instead predicted its source's KiB times what its
+    /// kind held per KiB lately ([`Plane::per_kib`]; [`PER_SOURCE_KIB`] until measured), at
+    /// least [`SIZED_FLOOR`] and at most the kind's peak. One whose key has a record is
+    /// predicted the more of that record and its sized prediction, so a phase that hands work
+    /// to pool threads (whose bytes its own thread does not see) is still held to what units
+    /// of its size hold. `source` 0 (not read) predicts as [`Plane::push_learned`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Plane::push_learned`].
+    pub fn push_sized(&self, fresh: &mut Fresh, mut node: NodeRef<'_>, task: Task, learn: Key, source: u64) -> NodeId {
+        if source == 0 {
+            return self.push_learned(fresh, node, task, learn);
+        }
+        assert!(node.key.is_none(), "node {} is given a key of the plane's beside the one it learns by", node.name);
+        assert!((fresh.tasks.len() as u32) < fresh.count, "a batch of {} nodes given another", fresh.count);
+        let kind = match task {
+            Task::Thread { kind, .. } | Task::Loop { kind } => kind,
+            Task::Gone => panic!("node {} is pushed with no task", node.name),
+        };
+        let Prediction { cost, peak } = self.predict.predict(kind, Some(learn));
+        let sized = self.sized(kind, source);
+        let predicted = match self.predict.measured(kind, Some(learn)) {
+            true => peak.max(sized),
+            false => sized,
+        };
+        node.memory = node.memory.max(predicted);
+        if let Some(cost) = cost {
+            node.cost = cost;
+        }
+        fresh.tasks.push(task);
+        fresh.keys.push(Some(learn));
+        fresh.sizes.push(source);
+        fresh.nodes.push(node)
+    }
+
+    /// What a unit of `source` bytes of source is predicted to hold in a task of `kind`: its
+    /// KiB times the kind's bytes per KiB, at least [`SIZED_FLOOR`], at most the kind's peak
+    /// (or the floor, where that is less).
+    fn sized(&self, kind: TaskKind, source: u64) -> u64 {
+        let per_kib = self.per_kib(kind).unwrap_or(PER_SOURCE_KIB);
+        let kind_peak = self.predict.predict(kind, None).peak;
+        source.div_ceil(1024).saturating_mul(per_kib).max(SIZED_FLOOR).min(kind_peak.max(SIZED_FLOOR))
+    }
+
+    /// The bytes a sized node of `kind` held per KiB of its source lately, once one ended:
+    /// what [`Plane::push_sized`] predicts by.
+    pub fn per_kib(&self, kind: TaskKind) -> Option<u64> {
+        self.per_kib.get(&kind).filter(|it| it.seen > 0).map(|it| it.predicted)
+    }
+
+    /// The bytes of what the process holds besides the tasks granted memory that held back a
+    /// task for memory as the plane last dispatched ([`blaze_graph::Plane::short`]): 0 when
+    /// none was, or only granted tasks did. The loop lets go of what it can for it.
+    pub fn short(&self) -> u64 {
+        self.graph.short()
     }
 
     /// The next node of `fresh`, a part of a program's build of `kind` ([`kinds::PROGRAM`], its
@@ -755,6 +844,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         }
         fresh.tasks.push(Task::Thread { kind, arg });
         fresh.keys.push(Some(program));
+        fresh.sizes.push(0);
         fresh.nodes.push(node)
     }
 
@@ -796,6 +886,12 @@ impl<W: Work, P: Predict> Plane<W, P> {
     fn key(&self, id: NodeId) -> Option<Key> {
         let (first, batch) = self.batches.range(..=id.0).next_back()?;
         batch.keys.get((id.0 - first) as usize).copied().flatten()
+    }
+
+    /// Node `id`'s unit's source bytes, 0 for a node not sized.
+    fn size(&self, id: NodeId) -> u64 {
+        let Some((first, batch)) = self.batches.range(..=id.0).next_back() else { return 0 };
+        batch.sizes.get((id.0 - first) as usize).copied().unwrap_or(0)
     }
 
     fn settled(&mut self, id: NodeId) {
@@ -843,7 +939,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         work: Option<W>,
         reads: bool,
     ) -> Result<(), Error> {
-        let Fresh { nodes, tasks, keys, count } = fresh;
+        let Fresh { nodes, tasks, keys, sizes, count } = fresh;
         let work = work.map(Arc::new); // alloc: one per batch, shared by its tasks
         assert_eq!(tasks.len() as u32, count, "a batch is added with every node it was made for");
         assert!(
@@ -852,7 +948,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         );
         let first = nodes.first();
         if count > 0 {
-            self.batches.insert(first.0, Batch { tasks, keys, live: count, work, reads, request: request.0 });
+            self.batches.insert(first.0, Batch { tasks, keys, sizes, live: count, work, reads, request: request.0 });
         }
         match self.step(PlaneInput::AddNodes { at_ns: ns(at), request, nodes }) {
             Ok(()) => Ok(()),
@@ -961,6 +1057,10 @@ impl<W: Work, P: Predict> Plane<W, P> {
             let peak = self.learned(id, task.kind, key, peak);
             if !self.replays.remove(&id) {
                 self.predict.observe(task.kind, key, ran_ns, peak);
+                let source = self.size(id);
+                if source > 0 {
+                    self.per_kib.entry(task.kind).or_default().observe(peak / source.div_ceil(1024));
+                }
             }
             let input = PlaneInput::Done { at_ns: ns(at), id, outcome, added: Vec::new(), group: None, peak };
             self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of task {id}: {error}"));
@@ -1432,7 +1532,7 @@ mod tests {
     /// measured, after which the program is predicted by what it held.
     #[test]
     fn a_program_is_admitted_by_its_own_measure_and_one_never_measured_runs_alone() {
-        let budget = Budget { bytes: 1 << 30, from: "the test's budget".to_owned() };
+        let budget = Budget { bytes: 1 << 30, from: "the test's budget".to_owned(), kept_back: 0 };
         let config = PlaneConfig { io: 1, work: 2, budget: Some(budget), starve_after: 8 };
         let history = blaze_history::History::new(blaze_history::Config::default());
         let mut plane = Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();

@@ -285,6 +285,8 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             out.push('\n');
         }
         Response::Stopping { doing } => put!(out, "{} {doing}\n", status("Stopping")),
+        Response::Stored { path: Some(path), blake3 } => put!(out, "{} blake3:{blake3} at {path}\n", status("Stored")),
+        Response::Stored { path: None, blake3 } => put!(out, "{} blake3:{blake3} in the store\n", status("Stored")),
     }
 }
 

@@ -6,9 +6,10 @@
 //!
 //! A unit's result is kept in the store as its record, under what it was made from: the
 //! front end's identity of the unit's inputs (its sources, cfgs, env, its dependencies' and
-//! their build scripts' results, deeply), its plan, its profile and target, the toolchain and
-//! blaze's own code ([`Toolchain::id`](blaze_codegen::settings::Toolchain)), the bytes of a
-//! `-C profile-use` profile, the goal and the colour of its diagnostics ([`RecordInputs`]),
+//! their build scripts' results, deeply), its plan, its profile and target, the code identities
+//! of the front end, the code generator and what makes the record
+//! ([`crate::serve::RecordMakers`]), the bytes of a `-C profile-use` profile, the goal and the
+//! colour of its diagnostics ([`RecordInputs`]),
 //! and filed by what its code read that no key names, the process variables and what its
 //! proc-macro expansions read outside the tree, with their values ([`reads`]). A unit
 //! whose record and outputs are all in the store is fresh: its diagnostics are replayed as
@@ -106,7 +107,13 @@ struct RecordRef<'a> {
     made: &'a Made,
 }
 
-const RECORD: &str = "blaze v2 cargo unit record 8";
+/// The domain of a record's key, and the record's format version: bumped by hand on any change
+/// to what a record holds or how it is laid out ([`Record`], [`RecordRef`], [`header`]) or to
+/// how its key is made ([`RecordInputs::key`]), so that no record of another format is read as
+/// this one's. blaze-cargo's own code is of [`crate::serve::RecordCode`] too, so such a change
+/// moves every key even unbumped; the bump says so by name. 9: keyed by
+/// [`crate::serve::RecordMakers`] in place of the executable's bytes.
+const RECORD: &str = "blaze v2 cargo unit record 9";
 const OUTPUT: &str = "blaze v2 cargo output 1";
 /// A span table's anchor and content, as a test's selection holds it.
 const SPANS: &str = "blaze v2 cargo test spans 1";
@@ -273,8 +280,9 @@ fn with_record_inputs<T>(
     then: impl FnOnce(&RecordInputs<'_>) -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
     let u = job.unit(unit)?;
-    // The whole executable ([`super::deps::build`]): a record is made by blaze-cargo itself.
-    let blaze = super::deps::build()?;
+    // The code of what makes it ([`super::deps::record_makers`]): a record is made by
+    // blaze-cargo itself, from the front end's and the code generator's outputs.
+    let makers = super::deps::record_makers()?;
     let runs = runs(job, unit);
     // An inert script's compile makes nothing, unless `BLAZE_ELIDE=verify` builds it to run it.
     let verified = u.target.is_custom_build()
@@ -301,7 +309,7 @@ fn with_record_inputs<T>(
         plan: job.plan(unit)?,
         run_env: &runs.env,
         script_check_cfgs: script_check_cfgs(job, unit)?,
-        blaze,
+        makers,
         goal: keyed_goal(job.input.goal, u),
         color: job.input.color,
         short: job.input.short,
@@ -428,10 +436,13 @@ pub(crate) struct RecordInputs<'a> {
     /// The `--check-cfg`s its package's build script runs printed ([`script_check_cfgs`]):
     /// its check's lints read them, and neither its plan nor its crate's identity holds them.
     pub(crate) script_check_cfgs: Vec<String>,
-    /// The blaze that makes the record: its whole executable ([`super::deps::build`]), as a
-    /// record holds what blaze-cargo, the lints and the linker made, past the code generator
-    /// whose code `Toolchain::id` is. The unit's target and flags are in its plan.
-    pub(crate) blaze: ContentId,
+    /// The code that makes the record ([`super::deps::record_makers`]): the front end's (its
+    /// diagnostics, and the bodies the code generator compiles), the code generator's (the
+    /// code it makes; the unit's target and flags, the rest of `Toolchain::id`, are in its
+    /// plan) and that of blaze-cargo's closure (the lints, the linker, the files blaze-cargo
+    /// writes and the record's encoding). Each moves on any edit of a package it is of, so a
+    /// record made by other code is never found.
+    pub(crate) makers: crate::serve::RecordMakers,
     /// [`keyed_goal`].
     pub(crate) goal: u8,
     pub(crate) color: bool,
@@ -462,7 +473,7 @@ impl RecordInputs<'_> {
             hash_cbor(&mut hasher, scratch, self.run_env, "run environment", unit)?;
             hash_cbor(&mut hasher, scratch, &self.script_check_cfgs, "build scripts' check-cfgs", unit)
         })?;
-        hasher.id(&self.blaze).update(&[
+        hasher.id(&self.makers.front_end).id(&self.makers.codegen).id(&self.makers.record).update(&[
             self.goal,
             u8::from(self.color),
             u8::from(self.short),
@@ -519,7 +530,9 @@ impl RecordInputs<'_> {
             cbor("plan", self.plan)?,
             cbor("run environment", &self.run_env)?,
             cbor("the check-cfgs its build scripts printed", &self.script_check_cfgs)?,
-            id("the blaze executable", Some(&self.blaze)),
+            id("the front end's code identity", Some(&self.makers.front_end)),
+            id("the code generator's code identity", Some(&self.makers.codegen)),
+            id("the code identity of what makes a record (blaze-cargo's closure)", Some(&self.makers.record)),
             bytes("goal", &[self.goal]),
             flag("color", self.color),
             flag("short diagnostics", self.short),

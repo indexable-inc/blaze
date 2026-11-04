@@ -27,6 +27,7 @@ typed-input = { workspace = true }
 target-version = "py313"
 line-length = 110
 include = [
+  ".github/scripts/build_release.py",
   ".github/scripts/downstream.py",
   ".github/scripts/downstream_build.py",
   "harness/ci.py",
@@ -58,6 +59,7 @@ include = [
 
 [tool.pyright]
 include = [
+  ".github/scripts/build_release.py",
   ".github/scripts/downstream.py",
   ".github/scripts/downstream_build.py",
   "harness/ci.py",

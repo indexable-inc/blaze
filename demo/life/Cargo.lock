@@ -181,6 +181,9 @@ dependencies = [
 [[package]]
 name = "blaze-bytes"
 version = "0.0.0"
+dependencies = [
+ "blaze-mem",
+]
 
 [[package]]
 name = "blaze-check"
@@ -232,6 +235,7 @@ dependencies = [
  "blaze-protocol",
  "blaze-radix",
  "blaze-reclaim",
+ "blaze-rng",
  "blaze-serde",
  "blaze-spin",
  "corosensei",
@@ -316,7 +320,6 @@ version = "0.0.0"
 dependencies = [
  "blaze-check",
  "blaze-reclaim",
- "blaze-spin",
  "crossbeam-channel",
  "libc",
  "parking_lot",
@@ -353,6 +356,7 @@ dependencies = [
  "blaze-reclaim",
  "blaze-serde",
  "blaze-vfs",
+ "crossbeam-queue",
  "either",
  "hashbrown 0.17.1",
  "indexmap",
@@ -361,6 +365,7 @@ dependencies = [
  "serde",
  "smallvec",
  "thin-vec",
+ "tracing",
  "triomphe",
 ]
 
@@ -2693,6 +2698,7 @@ version = "0.0.0"
 dependencies = [
  "itertools",
  "libc",
+ "parking_lot",
  "stacker",
  "tracing",
 ]

@@ -6,8 +6,10 @@ summary: What blaze removes from disk and when: the collector of build dirs, sha
 
 blaze writes outside the checkout only: a build dir per workspace under blaze's root
 (`<root>/build/<name>-<id>`, [cargo.md](cargo.md#where-a-build-writes)), the daemon's state
-(`<root>/v2`), and one standard library store per blaze build, shared by every daemon of the
-machine (`<machine>/std/<build id>`). The collector, `crates/blaze-gc`, removes what is no
+(`<root>/v2`), and one standard library store per code of what makes std's records (the front
+end's, the code generator's and blaze-cargo's code identities, `serve::RecordMakers` in
+crates/blaze-cargo, never the executable's bytes), shared by every daemon of the machine
+(`<machine>/std/<makers>`). The collector, `crates/blaze-gc`, removes what is no
 longer used of the first and the last, so a machine that builds many checkouts does not fill its
 disk. The daemon's state (its store, image and journal) is never listed, so never a candidate;
 eviction inside a store is not done yet ([v2-store.md](v2-store.md#not-done-here)).
@@ -26,7 +28,7 @@ in the root's, `std/` only in the machine's):
 |---|---|---|
 | workspace | `build/<dir>` | its checkout is gone (and it was unused for a day), or it was unused past its TTL (14 days) |
 | profile | each directory in a workspace (`debug`, `release`, a target's) | its workspace is past its cap (16 GiB, least recently used first), or its volume is under pressure; its last use is the newer of its files' times and the record's stamp for it, written by each build that uses it |
-| std | `std/<build id>` | no daemon has started on it for the TTL, or its volume is under pressure (least recently started first, after every profile); a store a running daemon holds the lease of stays |
+| std | `std/<makers>` | no daemon has started on it for the TTL, or its volume is under pressure (least recently started first, after every profile); a store a running daemon holds the lease of stays |
 | temporary | a `*.tmp` file in a workspace | it is older than the grace and its workspace's lease is free; renamed under that lease |
 | trash | `.blaze-trash/<entry>` | it is unlinked once moved there |
 

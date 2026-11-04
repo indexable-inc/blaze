@@ -3,8 +3,8 @@
 
     canary.py cut '{"push": false, "min_minutes": 30, "wait": "<sha>", "wait_minutes": 90}'
         the newest commit of main (first parents, since the newest release) that main's merge
-        gate built: the job `linux x64 / build` of blaze.yaml's run on the push of that commit
-        passed. Not the whole run: no unit tests, no other platform (stable waits for those,
+        gate built: a job of BUILDS (`linux x64 / build` or `linux arm64 / build`) of
+        blaze.yaml's run on the push of that commit passed. Not the whole run: no unit tests, no other platform (stable waits for those,
         promote.py tested). When it has changes since that release beyond the bots' own and
         the docs: the tag v0.YYYYMMDD.N on that commit, made through the API, and release.yaml
         dispatched on it.
@@ -52,9 +52,15 @@ TREE_VERSION = "0.0.0"
 WORKSPACE_VERSION = re.compile(r'(\[workspace\.package\]\nversion = ")([^"]+)"')
 # How many of main's newest commits `cut` looks through for a built one.
 LOOK_BACK = 40
-# The merge gate, and the job of its run on a push to main that a canary needs to have passed.
+# The merge gate, and the jobs of its run on a push to main of which a canary needs one to have
+# passed: blaze built by blaze on Linux. Either says main builds; x86-64's is on a hosted
+# runner, whose 16 GB the build outgrows into swap until the runner is shut down (#1654), and
+# AArch64's is on a 64-vCPU ix runner, whose memory grows to 256 GiB, when the repository
+# variable BLAZE_IX_RUNNERS is on (blaze.yaml). With only x86-64's counted, no canary was cut
+# from 2026-11-01 on: every build of main since was shut down or refused.
 GATE = ".github/workflows/blaze.yaml"
-BUILD = "linux x64 / build"
+BUILDS = ("linux x64 / build", "linux arm64 / build")
+BUILD = " or ".join(f"`{name}`" for name in BUILDS)
 # How often a wait asks again.
 POLL_SECS = 60
 # How long a pushed commit's gate run may take to appear before the push counts as having none.
@@ -151,8 +157,8 @@ def gate_run(sha):
 
 
 def build(sha, pushed=False):
-    """Where main's build of `sha` is: "built" (`linux x64 / build` passed), "failed",
-    "building", or "none" (the gate builds nothing for it: a change to nothing the build reads,
+    """Where main's build of `sha` is: "built" (a job of BUILDS passed), "failed" (each of
+    them that ran ended otherwise), "building" (none passed and one still runs), or "none" (the gate builds nothing for it: a change to nothing the build reads,
     or no gate run, which a commit pushed by a workflow's own token has). With `pushed`, `sha`
     was just pushed and its run may not be there yet: no run is "building" for the first
     `RUN_GRACE_SECS` of the wait, and "none" after."""
@@ -160,12 +166,17 @@ def build(sha, pushed=False):
     if gate is None:
         return ("building" if pushed and time.monotonic() < STARTED + RUN_GRACE_SECS else "none"), None
     jobs = {j["name"]: j for j in json.loads(run("gh", "api", f"repos/{REPO}/actions/runs/{gate['id']}/jobs?filter=latest&per_page=100"))["jobs"]}
-    if job := jobs.get(BUILD):
-        if job["status"] != "completed":
-            return "building", gate
-        return ("built" if job["conclusion"] == "success" else "failed"), gate
-    # A skipped `linux x64` (blaze.yaml's call of blaze-platform.yaml) has no jobs of its own.
-    if gate["status"] == "completed" or jobs.get("linux x64", {}).get("status") == "completed":
+    builds = [jobs[name] for name in BUILDS if name in jobs]
+    if any(job["status"] == "completed" and job["conclusion"] == "success" for job in builds):
+        return "built", gate
+    if any(job["status"] != "completed" for job in builds):
+        return "building", gate
+    if builds:
+        return "failed", gate
+    # A skipped `linux x64` or `linux arm64` (blaze.yaml's call of blaze-platform.yaml) has no
+    # jobs of its own.
+    callers = [jobs.get(name.split(" / ")[0], {}) for name in BUILDS]
+    if gate["status"] == "completed" or all(it.get("status") == "completed" for it in callers):
         return "none", gate
     return "building", gate
 
@@ -204,7 +215,7 @@ def cut(args):
         wait_for_build(since, args.wait, args.wait_minutes)
     head = next((sha for sha in since if build(sha)[0] == "built"), None)
     if head is None:
-        return summary(f"none of main's {len(since)} newest commits since {base} has passed `{BUILD}` yet; no canary")
+        return summary(f"none of main's {len(since)} newest commits since {base} has passed {BUILD} yet; no canary")
     if base:
         files = run("git", "diff", "--name-only", f"{base}..{head}").split()
         if not any(not DOCS.search(f) for f in files):

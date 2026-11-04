@@ -174,6 +174,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::query_in_loop",
             "blaze::string_key",
             "blaze::nll_workaround",
+            "blaze::lenient_deserialize",
         ],
     ),
 ];

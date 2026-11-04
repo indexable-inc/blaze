@@ -65,8 +65,9 @@ const WORKSPACES: usize = 16;
 /// What a subject's parts are named and what its subject is made of: bumped when a part's
 /// name or a subject's makeup changes (`compile::unit_subject`, `FnNode::subject`, the part
 /// names in `blaze-codegen`'s driver and `compile::RecordInputs::parts`), so an old file's
-/// records are not compared with new ones under other names.
-const NAMING: u32 = 2;
+/// records are not compared with new ones under other names. 3: a record's "the blaze
+/// executable" part became its three makers' code identities (`RecordMakers`).
+const NAMING: u32 = 3;
 
 /// What the ledger holds of a subject: its key and the parts of it when it was last computed
 /// by a build that ended well. Fields in the order deterministic CBOR sorts their names.

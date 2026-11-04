@@ -8,7 +8,9 @@
 //! read them beside the history.
 
 use std::{
-    fmt, fs, io,
+    fmt,
+    fmt::Write as _,
+    fs, io,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -156,9 +158,29 @@ pub fn run(query: &Query<'_>) -> Result<Vec<RecordBatch>, SqlError> {
 /// explorer does when the page cancels a query.
 pub fn run_with(query: &Query<'_>, stop: &Stop) -> Result<Vec<RecordBatch>, SqlError> {
     let mut scratch = Scratch::new()?;
-    let answer = run_in(&scratch.dir, query, &[query.history], stop);
+    let answer = run_in(&scratch.dir, query.duckdb, &[query.sql], &[query.history], stop).map(only);
     scratch.keep = answer.as_ref().is_err_and(|it| !matches!(it, SqlError::Stopped));
     answer
+}
+
+/// Runs each of `sqls` over the history at `history`, in one DuckDB: their answers, in order.
+/// The views are made once for all of them, and making them reads the footer of every file of
+/// the history (17 CPU-seconds and 0.7 GB over the 6,000 files of one home, 2026-11-04), so a
+/// reader with several queries that do not hang on each other's answers asks them together.
+pub fn run_all(duckdb: &Path, history: &Path, sqls: &[&str]) -> Result<Vec<Vec<RecordBatch>>, SqlError> {
+    if sqls.is_empty() {
+        // alloc: nothing, no query asked
+        return Ok(Vec::new());
+    }
+    let mut scratch = Scratch::new()?;
+    let answers = run_in(&scratch.dir, duckdb, sqls, &[history], &crossbeam_channel::never());
+    scratch.keep = answers.is_err();
+    answers
+}
+
+/// The answer of a run of one query.
+fn only(mut answers: Vec<Vec<RecordBatch>>) -> Vec<RecordBatch> {
+    answers.pop().unwrap_or_default()
 }
 
 /// Runs `query` over the history and the last `window` of this process's flight recorder:
@@ -177,7 +199,7 @@ pub fn run_live_with(
     let live = scratch.dir.join("live");
     let answer = history::write_live(window, &live)
         .map_err(SqlError::Live)
-        .and_then(|_| run_in(&scratch.dir, query, &[query.history, &live], stop));
+        .and_then(|_| run_in(&scratch.dir, query.duckdb, &[query.sql], &[query.history, &live], stop).map(only));
     scratch.keep = answer.as_ref().is_err_and(|it| !matches!(it, SqlError::Stopped));
     answer
 }
@@ -255,36 +277,76 @@ fn exit_heard(handle: usize) -> io::Result<()> {
     }
 }
 
-/// The DuckDB script of `sql` over `dirs`: no extension installed, the views, then the query
-/// copied to `answer` as Parquet.
-fn script(sql: &str, dirs: &[&Path], answer: &Path) -> Result<String, SqlError> {
+/// DuckDB's threads for one query. Left alone, DuckDB takes every core: a `blaze slow` on
+/// 2026-11-04 ran it at about 1,750% CPU and froze other work on the shared Mac. Reads of the
+/// history share the machine with builds, so they are capped.
+pub const THREADS: u32 = 8;
+
+/// DuckDB's memory for one query. Left alone, DuckDB takes 80% of RAM (a `blaze slow` reached
+/// 22 GB in one query, 2026-11-03). Past this, an operator spills to the query's scratch
+/// directory ([`script`]'s `temp_directory`), and one that can't spill fails the query with
+/// DuckDB's error naming it: never a quiet second route.
+pub const MEMORY_LIMIT: &str = "4GB";
+
+/// The DuckDB script of `sqls` over `dirs`: no extension installed, DuckDB's threads and memory
+/// capped ([`THREADS`], [`MEMORY_LIMIT`]) with spills in `scratch`, the views, then each query
+/// copied to its answer in `scratch` as Parquet ([`answer_in`]).
+fn script(sqls: &[&str], dirs: &[&Path], scratch: &Path) -> Result<String, SqlError> {
     let prelude = views::prelude(dirs)?;
-    let answer = answer.to_str().ok_or_else(|| SqlError::Answer {
+    // In the scratch directory: removed with the query's other files.
+    let spill = scratch.join("spill");
+    let spill = spill.to_str().ok_or_else(|| SqlError::Answer {
         // alloc: an error
-        path: answer.to_owned(),
+        path: spill.clone(),
         // alloc: an error
-        error: "its path is not UTF-8, and the script DuckDB runs names it".to_owned(),
+        error: "the query's spill directory is not UTF-8, and the script DuckDB runs names it".to_owned(),
     })?;
-    let sql = sql.trim().trim_end_matches(';').trim_end();
     // alloc: the script, once a query
-    let mut out = String::with_capacity(prelude.len() + sql.len() + 256);
+    let mut out = String::with_capacity(prelude.len() + sqls.iter().map(|it| it.len() + 256).sum::<usize>() + 256);
     out.push_str("SET autoinstall_known_extensions = false;\nSET enable_progress_bar = false;\n");
+    // Writing to a `String` does not fail.
+    _ = writeln!(out, "SET threads = {THREADS};\nSET memory_limit = '{MEMORY_LIMIT}';");
+    out.push_str("SET temp_directory = ");
+    views::quote(spill, &mut out);
+    out.push_str(";\n");
+    // A query that reads a file another read already reads its footer from memory.
+    out.push_str("SET parquet_metadata_cache = true;\n");
     out.push_str(&prelude);
-    out.push_str("\nCOPY (\n");
-    out.push_str(sql);
-    out.push_str("\n) TO ");
-    views::quote(answer, &mut out);
-    out.push_str(" (FORMAT parquet, COMPRESSION zstd);\n");
+    for (i, sql) in sqls.iter().enumerate() {
+        let answer = answer_in(scratch, i);
+        let answer = answer.to_str().ok_or_else(|| SqlError::Answer {
+            // clone: an error
+            path: answer.clone(),
+            // alloc: an error
+            error: "its path is not UTF-8, and the script DuckDB runs names it".to_owned(),
+        })?;
+        let sql = sql.trim().trim_end_matches(';').trim_end();
+        out.push_str("\nCOPY (\n");
+        out.push_str(sql);
+        out.push_str("\n) TO ");
+        views::quote(answer, &mut out);
+        out.push_str(" (FORMAT parquet, COMPRESSION zstd);\n");
+    }
     Ok(out)
+}
+
+/// Where the answer of the `i`th query of a script goes.
+fn answer_in(scratch: &Path, i: usize) -> PathBuf {
+    if i == 0 {
+        scratch.join("answer.parquet")
+    } else {
+        // alloc: a path, once a query
+        scratch.join(format!("answer-{i}.parquet"))
+    }
 }
 
 fn run_in(
     scratch: &Path,
-    query: &Query<'_>,
+    duckdb: &Path,
+    sqls: &[&str],
     dirs: &[&Path],
     stop: &Stop,
-) -> Result<Vec<RecordBatch>, SqlError> {
-    let duckdb = query.duckdb;
+) -> Result<Vec<Vec<RecordBatch>>, SqlError> {
     let no_duckdb = |why: &str| SqlError::NoDuckdb {
         // alloc: an error
         path: duckdb.to_owned(),
@@ -305,10 +367,9 @@ fn run_in(
     for dir in dirs {
         history::ensure_schemas(dir).map_err(SqlError::History)?;
     }
-    let answer = scratch.join("answer.parquet");
     let script_path = scratch.join("query.sql");
     let init = scratch.join("init.sql");
-    fs::write(&script_path, script(query.sql, dirs, &answer)?).map_err(io_error(&script_path, "writing"))?;
+    fs::write(&script_path, script(sqls, dirs, scratch)?).map_err(io_error(&script_path, "writing"))?;
     // An empty init file, so the user's ~/.duckdbrc does not change what the query means.
     fs::write(&init, b"").map_err(io_error(&init, "writing"))?;
     let stdin = fs::File::open(&script_path).map_err(io_error(&script_path, "opening"))?;
@@ -335,7 +396,7 @@ fn run_in(
     let refused = |message: String| SqlError::Duckdb {
         message,
         // alloc: an error
-        sql: query.sql.to_owned(),
+        sql: sqls.join(";\n"),
         // clone: an error
         script: script_path.clone(),
     };
@@ -345,16 +406,27 @@ fn run_in(
         // alloc: an error
         return Err(refused(format!("{} ({status})", stderr.trim())));
     }
-    if !answer.exists() {
-        // alloc: an error
-        return Err(refused(format!("it wrote no answer, and said: {}", stderr.trim())));
+    // alloc: the answers, once a script
+    let mut answers = Vec::with_capacity(sqls.len());
+    for i in 0..sqls.len() {
+        let answer = answer_in(scratch, i);
+        if !answer.exists() {
+            // alloc: an error
+            return Err(refused(format!("it wrote no answer to query {} of {}, and said: {}", i + 1, sqls.len(), stderr.trim())));
+        }
+        answers.push(read_answer(&answer)?);
     }
+    Ok(answers)
+}
+
+/// DuckDB's answer at `answer`, as Arrow record batches.
+fn read_answer(answer: &Path) -> Result<Vec<RecordBatch>, SqlError> {
     let answer_error = |error: String| SqlError::Answer {
-        // clone: an error
-        path: answer.clone(),
+        // alloc: an error
+        path: answer.to_owned(),
         error,
     };
-    let file = fs::File::open(&answer).map_err(io_error(&answer, "opening DuckDB's answer"))?;
+    let file = fs::File::open(answer).map_err(io_error(answer, "opening DuckDB's answer"))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .and_then(|it| it.build())
         // alloc: an error
@@ -382,10 +454,17 @@ mod tests {
 
     #[test]
     fn the_script_installs_nothing_and_copies_one_query_out() {
-        let script = script("SELECT 1 ;\n", &[Path::new("/h")], Path::new("/tmp/it's/answer.parquet")).unwrap();
+        let script = script(&["SELECT 1 ;\n", "SELECT 2"], &[Path::new("/h")], Path::new("/tmp/it's")).unwrap();
         assert!(script.starts_with("SET autoinstall_known_extensions = false;"));
+        assert!(script.contains("SET threads = 8;\nSET memory_limit = '4GB';\nSET temp_directory = '/tmp/it''s/spill';\n"), "{script}");
         assert!(script.contains("read_parquet(['/h/*.spans.parquet'], union_by_name = true)"));
-        assert!(script.ends_with("COPY (\nSELECT 1\n) TO '/tmp/it''s/answer.parquet' (FORMAT parquet, COMPRESSION zstd);\n"), "{script}");
+        assert!(
+            script.ends_with(
+                "COPY (\nSELECT 1\n) TO '/tmp/it''s/answer.parquet' (FORMAT parquet, COMPRESSION zstd);\n\
+                 \nCOPY (\nSELECT 2\n) TO '/tmp/it''s/answer-1.parquet' (FORMAT parquet, COMPRESSION zstd);\n"
+            ),
+            "{script}"
+        );
     }
 
     #[test]

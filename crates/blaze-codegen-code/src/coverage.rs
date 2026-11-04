@@ -1,7 +1,8 @@
 //! The dep-info check of an identity: what building the closure's crates read, as cargo's
 //! dep-info and build-script output in a target directory say, held to what the identity is of.
 //! A test of a package the program's closure is built for calls [`hold`] on its own target
-//! directory: hir-ty-codegen's for [`crate::CODEGEN`], blaze-cargo's for [`crate::FRONT_END`].
+//! directory: hir-ty-codegen's for [`crate::CODEGEN`], blaze-cargo's for [`crate::FRONT_END`] and
+//! [`crate::RECORD`].
 
 use std::path::{Path, PathBuf};
 
@@ -175,10 +176,19 @@ pub fn hold(workspace: &Workspace, worked: &Worked, made: &Path, exe: &Path) -> 
             }
         }
     }
+    // `CARGO_MANIFEST_LINKS` is the manifest's `links` (ring's build script says it reads it).
     let derived = |name: &str| {
         name.starts_with("CARGO_PKG_")
             || name.starts_with("CARGO_CFG_")
-            || matches!(name, "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH" | "CARGO_CRATE_NAME" | "CARGO_PRIMARY_PACKAGE" | "OUT_DIR")
+            || matches!(
+                name,
+                "CARGO_MANIFEST_DIR"
+                    | "CARGO_MANIFEST_PATH"
+                    | "CARGO_MANIFEST_LINKS"
+                    | "CARGO_CRATE_NAME"
+                    | "CARGO_PRIMARY_PACKAGE"
+                    | "OUT_DIR"
+            )
     };
     let hashed_env: std::collections::BTreeSet<&str> =
         worked.inputs.iter().filter(|it| it.kind == "env").map(|it| it.name.as_str()).collect();

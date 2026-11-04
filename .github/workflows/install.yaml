@@ -129,14 +129,25 @@ jobs:
   archive:
     name: this commit's build
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    # A clean build of blaze by blaze, as a release's: about 97 minutes on this runner.
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v7
-      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
-      # cargo and rustc, with no cache: this is the release's own recipe (build_release.py, the
-      # dist profile), and the recipe is what it checks.
-      - run: python3 .github/scripts/build_release.py --target x86_64-unknown-linux-gnu --out shipped --no-pgo
-        timeout-minutes: 40
+      # The release's own recipe, and the recipe is what it checks: the stage 0
+      # .github/blaze-version names (blaze builds blaze, never cargo or rustc), the pinned LLVM,
+      # and a store of this job's own that nothing pushes, so a clean build (release.yaml).
+      - uses: ./.github/actions/blaze
+        with:
+          job: install-archive
+          llvm: true
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - run: |
+          uv run --frozen --no-dev python .github/scripts/build_release.py \
+            '{"target": "x86_64-unknown-linux-gnu", "out": "shipped", "pgo": "off"}'
+        timeout-minutes: 300
       - name: archive
         run: |
           name=blaze-commit-x86_64-unknown-linux-gnu

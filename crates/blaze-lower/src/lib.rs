@@ -40,7 +40,7 @@ mod harness;
 #[cfg(test)]
 mod tests;
 
-use std::{cell::Cell, collections::HashMap, fmt};
+use std::{borrow::Cow, cell::Cell, collections::HashMap, fmt};
 use std::alloc::Global;
 
 use base_db::{FileSetConfig, Trigger};
@@ -182,8 +182,14 @@ pub struct Ran {
 pub struct Lowered {
     db: Db,
     crates: std::sync::Arc<Crates>,
-    /// By unit: the runs applied to it, by the run's unit.
-    applied: Vec<Vec<(usize, Applied)>>,
+    /// By crate: the runs applied to it, by the run's class ([`crates::run_classes`]), the
+    /// first run of the class. By crate, not by unit: units apart only in which run of a class
+    /// they depend on share a crate, and each of its writes is made from all its runs.
+    applied: blaze_hash::HashMap<Crate, Vec<(usize, Applied)>, Global>,
+    /// By run class with more than one run: the run of it applied first since the last
+    /// [`Lowered::refresh`], the one [`Lowered::ran`] applies for the class in this job. Per
+    /// job: each job applies its runs again, and the first of a class to end is its own.
+    class_runs: blaze_hash::HashMap<usize, usize, Global>,
     /// Every file of the front end by its absolute path as cargo names it. A task may hold it
     /// past its read of the database (the code generator's names); a write changes it in
     /// place when no task does.
@@ -266,6 +272,10 @@ struct Lowering {
     /// For a unit built to run in the macro host, whether its crate links `proc_macro`, as its
     /// root read when lowered.
     macro_host: Option<MacroHost>,
+    /// For a build script's run, the first run of its run class ([`crates::run_classes`]),
+    /// whose `OUT_DIR` the front end reads every run of the class's files under; its own index
+    /// for any other unit.
+    class: usize,
 }
 
 /// What a macro-host crate's cfg was decided by ([`crates::host_side`]): its root, the root's
@@ -298,11 +308,12 @@ pub fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, Lower
 pub fn lower_into<T: blaze_query::Tree>(mut db: Db, lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
     let setup = db.batch(Trigger::named("the build lowered"), |db| lower_writes(db, lower))?;
     db.require_batches();
-    let Setup { unit_count, lowerings, sets, loads, view, workspace_root, const_macros, spellings } = setup;
+    let Setup { lowerings, sets, loads, view, workspace_root, const_macros, spellings } = setup;
     let paths = paths_of(&db, sets);
     Ok(Lowered {
         db,
-        applied: (0..unit_count).map(|_| Vec::new()).collect(),
+        applied: blaze_hash::HashMap::new_in(Global),
+        class_runs: blaze_hash::HashMap::new_in(Global),
         crates: std::sync::Arc::new(Crates { units: lowerings, sets }),
         paths: std::sync::Arc::new(paths),
         identities: blaze_hash::HashMap::new_in(Global),
@@ -318,7 +329,6 @@ pub fn lower_into<T: blaze_query::Tree>(mut db: Db, lower: Lower<'_, T>) -> Resu
 
 /// What [`lower_writes`] made beside the inputs it wrote.
 struct Setup {
-    unit_count: usize,
     lowerings: Vec<Lowering>,
     /// [`Crates::sets`].
     sets: usize,
@@ -576,6 +586,11 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
     let toolchain = crates::toolchain()?;
     // By triple and whether the crates are the standard library's.
     let mut workspaces: HashMap<(&str, bool), Arc<CrateWorkspaceData>> = HashMap::new();
+    // Runs of one build script apart only in their `OUT_DIR` are one run to the front end, and
+    // runs apart in their profile's `OPT_LEVEL` or `DEBUG` too are told apart by their
+    // dependents' keys (`crates::run_classes`).
+    let classes = crates::run_classes(units);
+    let class = &classes.class;
     let mut lowerings: Vec<Lowering> = Vec::with_capacity(unit_count);
     for (index, unit) in units.graph.units.iter().enumerate() {
         let plan = &units.plans[index];
@@ -590,6 +605,7 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
             env: Vec::new(),
             proc_macro: unit.gives_expanders(),
             macro_host: None,
+            class: class[index],
         });
     }
     for (index, unit) in units.graph.units.iter().enumerate() {
@@ -634,6 +650,13 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
         let mut cfg = crates::cfg(unit, plan, triple, host_cpu, what)?;
         if const_plan.group_of[index].is_some() {
             cfg.insert_atom(intern::Symbol::intern(const_macros::CFG));
+        }
+        // Its runs whose output may be other than their twins' of another profile: its key is
+        // told apart from those twins' dependents' by the run's profile (`crates::RUN_PROFILE`).
+        for dep in &unit.dependencies {
+            if classes.keyed.get(dep.index).copied().unwrap_or(false) {
+                cfg.extend([crates::run_profile_atom(units, dep.index)]);
+            }
         }
         let durability = if library[set_of[unit.pkg_id.as_str()]] { Durability::HIGH } else { Durability::MEDIUM };
         let macros = match const_plan.group_of[index] {
@@ -741,19 +764,25 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
             potential_cfg_options: None,
             built_for: crates::built_for(unit.built_for()),
         };
-        let env: Env = plan.env.iter().cloned().collect();
+        // Its `OUT_DIR` and its runs by their run class: units apart only in which run of a
+        // class they depend on (two profiles apart only in what a run never reads, as
+        // `codegen-units`) are one crate below.
+        let plan_env = crates::class_env(units, unit, &plan.env, class);
+        let env: Env = plan_env.iter().cloned().collect();
         let runs: Vec<usize> = unit
             .dependencies
             .iter()
             .filter(|dep| units.graph.units[dep.index].mode == Mode::RunCustomBuild)
-            .map(|dep| dep.index)
+            .map(|dep| class[dep.index])
             .collect();
         // A crate whose root blaze appends a module to ([`Lowered::append_roots`]: a test's
         // harness, a wasm proc macro's list of macros and bridge glue) has a root of its own,
         // an alias of the file on disk, so no other crate of that file reads the module.
         let aliased = (crates::is_test(unit, plan) && plan.harness) || wasm_macro(unit, plan);
         // Units cargo keeps apart for what the front end does not read (a profile's opt-level
-        // or debuginfo) are one crate: two crates of one key would name each other's items.
+        // or debuginfo, and which run of a run class they depend on) are one crate: two
+        // crates of one key would name each other's items (`blaze_items::key::check_crate_keys`).
+        // Their codegen stays apart: each unit's policy is of its own profile.
         let made_of_root = made.entry(root_file).or_default();
         let same = made_of_root.iter().find(|it| {
             it.data == data
@@ -789,7 +818,7 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
         lowering.krate = Some(krate);
         lowering.cfg = cfg;
         lowering.macro_host = macro_host;
-        lowering.env = plan.env.clone();
+        lowering.env = plan_env;
     }
     base_db::set_all_crates_with_durability(db, all, Durability::MEDIUM);
 
@@ -810,7 +839,6 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
     name_sources(db, workspace_root.dir.as_deref(), &config.library, &spellings);
 
     Ok(Setup {
-        unit_count,
         lowerings,
         sets: library.len(),
         loads: read,
@@ -821,8 +849,8 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
     })
 }
 
-/// What a crate of [`lower_into`] was made of, and the build scripts' runs its unit is given:
-/// a later unit of all the same is lowered to it.
+/// What a crate of [`lower_into`] was made of, and the build scripts' runs its unit is given
+/// (by run class): a later unit of all the same is lowered to it.
 struct Made {
     /// With the root file on disk, which an aliased crate's root is an alias of.
     data: base_db::BuiltCrateData,
@@ -939,26 +967,43 @@ impl Lowered {
     /// root), so `include!` and `env!("OUT_DIR")` read them. Applying a run again replaces
     /// what it applied before, files it no longer left included.
     ///
+    /// A run is applied as its run class (`crates::run_classes`) is: under the class's
+    /// `OUT_DIR` (its first run's), its own named as that one wherever what it gave says it
+    /// (`canonical_run`). The runs of a class of several have the same inputs but their
+    /// `OUT_DIR`, so they are one run to the front end, and their dependents one crate: the run
+    /// of the class that ends first since the last [`Lowered::refresh`] is applied, and each
+    /// other run of the class after it is taken (checked, its own outputs left for its own
+    /// dependents' link) and changes nothing the front end reads, as a run blaze served from
+    /// another of the same inputs would. Runs apart in their profile's `OPT_LEVEL` or `DEBUG`
+    /// are of two classes, each applied to its own dependents' crates.
+    ///
     /// A write: `&mut self` means no task holds a reference to read through, so nothing is
     /// cancelled or waited for here; tasks that read after it read the run applied. One change:
     /// its files, cfgs and envs are one batch, and inside [`Lowered::batch`] part of that one.
     pub fn ran(&mut self, run: usize, ran: &Ran) -> Result<(), LowerError> {
         let crates = self.crates.clone();
-        let (lowering, cfgs) = checked(&crates, run, ran)?;
+        let (lowering, _) = checked(&crates, run, ran)?;
+        if !self.applies_for_class(&crates, run) {
+            return Ok(());
+        }
+        let ran = canonical_run(&crates, run, ran);
+        let cfgs = cfg_atoms(&ran, &lowering.what)?;
         let trigger = Trigger::of("a build script's run applied", &lowering.what);
-        self.batch(trigger, |this| this.apply_run(run, ran, &crates, lowering, &cfgs))
+        self.batch(trigger, |this| this.apply_run(&ran, &crates, lowering, &cfgs))
     }
 
-    /// [`Lowered::ran`]'s writes, in its batch: `run` checked against `crates`, its unit
-    /// `lowering`, its cfgs `cfgs`.
-    fn apply_run(
-        &mut self,
-        run: usize,
-        ran: &Ran,
-        crates: &Crates,
-        lowering: &Lowering,
-        cfgs: &[CfgAtom],
-    ) -> Result<(), LowerError> {
+    /// Whether run `run` is the one applied for its run class in this job: the first of the
+    /// class to end since the last [`Lowered::refresh`] (kept as the class's), or any run of a
+    /// class of one.
+    fn applies_for_class(&mut self, crates: &Crates, run: usize) -> bool {
+        let class = crates.units[run].class;
+        let shared = crates.units.iter().enumerate().any(|(at, it)| at != run && it.class == class);
+        !shared || *self.class_runs.entry(class).or_insert(run) == run
+    }
+
+    /// [`Lowered::ran`]'s writes, in its batch: `ran`, a run checked against `crates` and made
+    /// its class's ([`canonical_run`]), of unit `lowering`, its cfgs `cfgs`.
+    fn apply_run(&mut self, ran: &Ran, crates: &Crates, lowering: &Lowering, cfgs: &[CfgAtom]) -> Result<(), LowerError> {
         let out_dir = &ran.out_dir;
         let mut loaded = Vec::with_capacity(ran.files.len());
         for (path, bytes) in &ran.files {
@@ -971,12 +1016,19 @@ impl Lowered {
         let db = &mut self.db;
         let change = set_files(db, out_dir, &[], lowering.set, crates.sets, &loaded)?;
         note(&mut self.paths, db, lowering.set, &change);
+        let class = lowering.class;
+        // Each crate once: units of one crate depend on runs of the same classes.
+        let mut written: Vec<Crate> = Vec::with_capacity(lowering.dependents.len()); // alloc: once per apply, a handful
         for &dependent in &lowering.dependents {
             let Some(krate) = crates.units[dependent].krate else { continue };
-            let runs = &mut self.applied[dependent];
-            runs.retain(|(it, _)| *it != run);
+            if written.contains(&krate) {
+                continue;
+            }
+            written.push(krate);
+            let runs = self.applied.entry(krate).or_default();
+            runs.retain(|(it, _)| *it != class);
             let applying = Applied { cfgs: cfgs.to_vec(), env: ran.env.clone(), out_dir: out_dir.clone() };
-            runs.push((run, applying));
+            runs.push((class, applying));
             radix::sort_by_key(runs, |(it, _)| *it as u64);
             let base = &crates.units[dependent];
             let mut cfg = base.cfg.clone();
@@ -1027,8 +1079,10 @@ impl Lowered {
         // batch: the database takes writes only in batches, and this one notes nothing.
         let vars: Env = config.invocation.env.iter().cloned().collect();
         self.db.batch(Trigger::named("the process environment set"), |db| base_db::set_process_env(db, vars));
-        // A new job: its units' roots are appended to again, and may be made other than before.
+        // A new job: its units' roots are appended to again, and may be made other than before;
+        // the first of its runs of a class to end is the class's, whichever an earlier job's was.
         self.appended.clear();
+        self.class_runs.clear();
         if root == self.view {
             // The view did not move, but a file outside it may have.
             self.db.reload_included_files(INCLUDED_MOVED);
@@ -1211,12 +1265,38 @@ fn checked<'a>(crates: &'a Crates, run: usize, ran: &Ran) -> Result<(&'a Lowerin
             lowering.what.clone(),
         ));
     }
-    let cfgs = ran
-        .cfgs
-        .iter()
-        .map(|it| crates::atom(it).map_err(|what| LowerError::at(what, lowering.what.clone())))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((lowering, cfgs))
+    Ok((lowering, cfg_atoms(ran, &lowering.what)?))
+}
+
+/// `ran`'s cfgs as `--cfg` takes them, an error naming unit `what` for one it doesn't.
+fn cfg_atoms(ran: &Ran, what: &str) -> Result<Vec<CfgAtom>, LowerError> {
+    ran.cfgs.iter().map(|it| crates::atom(it).map_err(|why| LowerError::at(why, what))).collect()
+}
+
+/// `ran`, of build script run `run`, as the front end applies it: under its run class's
+/// `OUT_DIR` (its first run's, [`crates::run_classes`]), its own `OUT_DIR` written as that one
+/// wherever one of its cfgs, variables or files says it, so whichever run of a class ends first,
+/// its dependents read one `OUT_DIR`, and a generated file that names its directory names the
+/// one the front end reads it from. As it is for the first run of a class, or a run of no class
+/// of several.
+fn canonical_run<'a>(crates: &Crates, run: usize, ran: &'a Ran) -> Cow<'a, Ran> {
+    let class = crates.units[run].class;
+    let Some(out_dir) = crates.units.get(class).and_then(|it| it.out_dir.as_deref()) else { return Cow::Borrowed(ran) };
+    if class == run || out_dir == ran.out_dir {
+        return Cow::Borrowed(ran);
+    }
+    let own = ran.out_dir.as_str();
+    let text = |it: &String| it.replace(own, out_dir); // alloc: once per apply of a run not its class's first
+    Cow::Owned(Ran {
+        cfgs: ran.cfgs.iter().map(text).collect(), // alloc: as above
+        env: ran.env.iter().map(|(name, value)| (name.clone(), text(value))).collect(), // alloc: as above
+        out_dir: out_dir.to_owned(), // alloc: as above
+        files: ran
+            .files
+            .iter()
+            .map(|(path, bytes)| (path.clone(), crates::replace_bytes(bytes, own.as_bytes(), out_dir.as_bytes()).into_owned()))
+            .collect(), // alloc: as above
+    })
 }
 
 /// The change [`Lowered::refresh`] writes when a file outside the VFS that `include_bytes!` or

@@ -326,6 +326,11 @@ impl Writer for Elf {
         self.output.arch
     }
 
+    fn section_name(&self, class: &Class) -> String {
+        // alloc: error path
+        image::section_name(class).to_owned()
+    }
+
     fn plan(&self) -> Plan {
         Plan {
             base: 0,

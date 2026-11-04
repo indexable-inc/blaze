@@ -610,12 +610,19 @@ fn callee_options(
         return options;
     }
     if callee.data(db).origin.is_lang() {
-        let level = MirOptLevel::Release;
-        return MirOptions { level, ub_checks: false, inline: true, ..options };
+        return shipped(options);
     }
     let debug_assertions =
         callee.cfg_options(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::debug_assertions));
     MirOptions { ub_checks: debug_assertions, ..options }
+}
+
+/// `options` as rustc's shipped standard library was optimized with: `-O`, not incremental
+/// and without UB checks, so its inliner ran (`Inline::is_enabled`). What a body of the
+/// toolchain's crates is built into another's under ([`callee_options`]), and what rustc
+/// decided their [`cross_crate_inlinable`] with ([`shipped_cross_crate_inlinable`]).
+fn shipped(options: MirOptions) -> MirOptions {
+    MirOptions { level: MirOptLevel::Release, ub_checks: false, inline: true, ..options }
 }
 
 /// rustc's `cross_crate_inlinable` of a function whose bodies are optimized with `options`:
@@ -624,28 +631,8 @@ fn callee_options(
 /// says.
 #[blaze_query::tracked(returns(copy))]
 fn cross_crate_inlinable(db: &Db, func: FunctionId, options: MirOptions) -> bool {
-    let attrs = Attrs::of_fn(db, func);
-    if attrs.extern_indicator() {
-        return false;
-    }
-    if attrs.has(AttrFlags::RUSTC_INTRINSIC) {
-        return true;
-    }
-    if attrs.has(AttrFlags::RUSTC_COMPTIME) {
-        return false;
-    }
-    match attrs.inline {
-        InlineAttr::Never => return false,
-        InlineAttr::Hint | InlineAttr::Always | InlineAttr::Force => return true,
-        InlineAttr::None => {}
-    }
-    // Code generators may not support the float types in calls, and inlining avoids them.
-    let sig = db.callable_item_signature(func.into()).instantiate_identity().skip_norm_wip();
-    let floats = sig.skip_binder().inputs_and_output.iter().any(|ty| {
-        matches!(ty.kind(), TyKind::Float(FloatTy::F16 | FloatTy::F128))
-    });
-    if floats {
-        return true;
+    if let Some(written) = written_cross_crate_inlinable(db, func) {
+        return written;
     }
     if !options.inline {
         return false;
@@ -657,6 +644,44 @@ fn cross_crate_inlinable(db: &Db, func: FunctionId, options: MirOptions) -> bool
             place.as_ref().ty(body, &ctx.infcx, ctx.env).ty.is_trivially_pure_clone_copy()
         })
     })
+}
+
+/// [`cross_crate_inlinable`] of a function of the toolchain's crates, as rustc decided it when
+/// it built the standard library it ships ([`shipped`]): read by
+/// `home::compiled_by_user` for a function no attribute decides.
+pub(crate) fn shipped_cross_crate_inlinable(db: &Db, func: FunctionId) -> bool {
+    cross_crate_inlinable(db, func, shipped(MirOptions::at(MirOptLevel::Release).built_in()))
+}
+
+/// What rustc's `cross_crate_inlinable` (`rustc_mir_transform/src/cross_crate_inline.rs`)
+/// decides of `func` from its attributes and signature alone, before it looks at how its
+/// crate is built: `None` where it goes on to infer it from the optimized body. Memoized: the
+/// code generator asks it of every instance it describes (`home::compiled_by_user`).
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn written_cross_crate_inlinable(db: &Db, func: FunctionId) -> Option<bool> {
+    let attrs = Attrs::of_fn(db, func);
+    // Globally shared: it is named from outside the crate, so no copy is made in another.
+    if attrs.extern_indicator() {
+        return Some(false);
+    }
+    // An intrinsic's fallback body: always copied, so the MIR inliner never takes it.
+    if attrs.has(AttrFlags::RUSTC_INTRINSIC) {
+        return Some(true);
+    }
+    if attrs.has(AttrFlags::RUSTC_COMPTIME) {
+        return Some(false);
+    }
+    match attrs.inline {
+        InlineAttr::Never => return Some(false),
+        InlineAttr::Hint | InlineAttr::Always | InlineAttr::Force => return Some(true),
+        InlineAttr::None => {}
+    }
+    // Code generators may not support the float types in calls, and inlining avoids them.
+    let sig = db.callable_item_signature(func.into()).instantiate_identity().skip_norm_wip();
+    let floats = sig.skip_binder().inputs_and_output.iter().any(|ty| {
+        matches!(ty.kind(), TyKind::Float(FloatTy::F16 | FloatTy::F128))
+    });
+    floats.then_some(true)
 }
 
 /// [`written_checked_at`] of `body`, its own setting read once.

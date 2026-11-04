@@ -36,7 +36,8 @@ jobs:
   build:
     name: build both blazes
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # A cold build of ours by blaze: about 97 minutes on this runner, then Astral's.
+    timeout-minutes: 300
     outputs:
       ours: ${{ steps.commits.outputs.ours }}
       astral: ${{ steps.commits.outputs.astral }}
@@ -57,12 +58,20 @@ jobs:
           echo "ours=$(git -C ours rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "astral=$(git -C astral rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "astral_toolchain=$(cat astral/harness/toolchain)" >> "$GITHUB_OUTPUT"
+      # Ours, built by blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 its
+      # .github/blaze-version names, with its own Rust, and the pinned LLVM below /usr/local/lib
+      # (a build script in blaze's sandbox names only system directories of libraries), as
+      # .github/actions/blaze sets them up; that action's paths are the workspace's, and this
+      # checkout is under ours/. Swap for a cold build, which outgrows the runner's 16 GB (#1654).
       - name: our blaze
         working-directory: ours
         run: |
-          tc=$(cat harness/toolchain)
-          rustup toolchain install "$tc" --profile minimal -c rust-src
-          cargo +"$tc" build --locked --release -p blaze-engine
+          sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
+          sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
+          python3 .github/scripts/llvm.py fetch --target x86_64-unknown-linux-gnu --dir /usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu
+          sudo fallocate -l 20G /mnt/blaze.swap && sudo chmod 600 /mnt/blaze.swap && sudo mkswap /mnt/blaze.swap > /dev/null && sudo swapon /mnt/blaze.swap
+          LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu blaze build --locked --release -p blaze-engine
+          blaze stop
           mkdir -p ../bins/ours && find target/release -maxdepth 1 -type f -perm -u+x -exec cp {} ../bins/ours/ \;
       - name: Astral's blaze
         working-directory: astral

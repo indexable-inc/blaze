@@ -196,7 +196,7 @@ has is durable at once. A layer that is not there stops the store.
 ## A shared store
 
 `Store::open_shared` opens a store several daemons on one machine write at once: one build's
-std under `<user cache>/blaze/std/<blaze build id>/store`, shared by every BLAZE_HOME. No lock
+std under `<user cache>/blaze/std/<makers>/store` (`<makers>`: blaze-cargo's `serve::RecordMakers`), shared by every BLAZE_HOME. No lock
 is taken. Each daemon is a writer (`SharedConfig::writer`, one per BLAZE_HOME) with a store
 directory of its own in the shared one, `w-<writer>`, written as any store is, so two daemons'
 commits never touch one file. Every other writer's directory is read as a layer behind its own,

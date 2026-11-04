@@ -10,8 +10,11 @@
 # demand up to 256 GiB, forked from a snapshot of the last green job on main with the same labels,
 # its disk (the checkout, blaze's store under $HOME, the toolchain, LLVM) included. Each job has
 # its own label set (`blaze-build`, `blaze-tests`), so each forks its own job's snapshot; main's
-# `warm` runs make the snapshots and the pull requests' `gate` runs fork them. ix serves AArch64
-# alone today, so `ix-cpu` goes with `linux-arm64`.
+# `warm` runs make the snapshots and the pull requests' `gate` runs fork them. `ix-arch` is the
+# runner's architecture label: ix's runner plane picks the machine by it (`arm64`, or `x64`,
+# whose cap is 64 vCPUs) and refuses one it does not serve, and ix serves AArch64 alone today,
+# so `x64` goes on only with BLAZE_IX_X64_RUNNERS (blaze.yaml). Memory has no label: every ix
+# runner's grows on demand to the platform's 256 GiB.
 name: blaze platform
 on:
   workflow_call:
@@ -28,6 +31,10 @@ on:
         description: "vCPUs of the ix runner the build and the unit tests run on (8, 16, 32, 64 or 128), or empty for `os`"
         type: string
         default: ""
+      ix-arch:
+        description: "the ix runner's architecture label, `arm64` or `x64`, which has to be the platform's"
+        type: string
+        default: arm64
       tier:
         description: "`fast` (the fast tier's harnesses), `full` (every harness), as in harness/ci.py, or `gate` and `warm` (none)"
         type: string
@@ -68,8 +75,9 @@ env:
   BLAZE_CI_IX: ${{ inputs.ix-cpu != '' }}
   # blaze builds and tests blaze (AGENTS.md rule blaze-builds-blaze): the latest release is the
   # compiler and its store the one cache, pulled from the shared remote main's runs push to
-  # (.github/actions/blaze). Windows builds with cargo, and no cache, since release.yaml makes
-  # no release of blaze for Windows yet, so there is no blaze there to build with.
+  # (.github/actions/blaze). On Windows the build and the tests stop with an error: release.yaml
+  # makes no release of blaze for Windows yet, so there is no blaze there to build with, and
+  # cargo is no stand-in (rule no-fallback).
   BLAZE: ${{ !startsWith(inputs.os, 'windows') }}
 
 defaults:
@@ -85,7 +93,7 @@ jobs:
     # (harness/unittests.py), and hands over what it compiled, so only the crates built with
     # `cfg(test)` are compiled here.
     needs: build
-    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "arm64", "ix-cpu-{0}", "blaze-tests"]', inputs.ix-cpu)) || inputs.os }}
+    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "{1}", "ix-cpu-{0}", "blaze-tests"]', inputs.ix-cpu, inputs.ix-arch)) || inputs.os }}
     # A store blaze's release has not compiled into yet: 49 min on Linux x86-64, and over an
     # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
     # enough for that one run to finish and push, which the runs after it then pull.
@@ -104,17 +112,14 @@ jobs:
       # it, and says of each that passed before whether it passed again.
       BLAZE_TESTS: ${{ github.ref == 'refs/heads/main' && 'verify' || 'affected' }}
     steps:
-      # Nightly cargo's build-dir layout gives rustc one `-L dependency=` per dependency: for
-      # blaze-cargo that is over Windows' 32K command line, and sccache spawns rustc with it as is.
-      - if: runner.os == 'Windows'
+      - name: no blaze for Windows
+        if: env.BLAZE != 'true'
         run: |
-          git config --global core.autocrlf false
-          echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
+          echo "::error::blaze's unit tests on Windows need a release of blaze for Windows to build them with (release.yaml makes none yet); blaze builds blaze, never cargo (AGENTS.md rule blaze-builds-blaze)"
+          exit 1
       - uses: actions/checkout@v7
       # With blaze, no rustup and no Nix: blaze brings its own Rust (.github/actions/blaze), and
-      # the C compiler and linker are the runner's. cargo's on Windows, with rustup's nightly.
-      - if: env.BLAZE != 'true'
-        uses: ./.github/actions/toolchain
+      # the C compiler and linker are the runner's.
       # With the build job's project too, and LLVM: the tests are built with the features the
       # build ships (harness/unittests.py, FEATURES).
       - if: env.BLAZE == 'true'
@@ -157,9 +162,6 @@ jobs:
         timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
         run: |
           $PYTHON harness/unittests.py '{"args": ["--events", "json"]}'
-      - if: env.BLAZE != 'true'
-        run: |
-          $PYTHON harness/unittests.py '{"cargo": true}'
       # What was compiled, and each test that passed, for the runs after this one; a run whose
       # tests failed pushes too, since what it compiled is no less right. The daemons end
       # first: a push sends sealed packs, and a daemon's last pack seals when it ends.
@@ -175,43 +177,26 @@ jobs:
 
   build:
     name: build
-    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "arm64", "ix-cpu-{0}", "blaze-build"]', inputs.ix-cpu)) || inputs.os }}
+    runs-on: ${{ inputs.ix-cpu != '' && fromJSON(format('["self-hosted", "ix", "{1}", "ix-cpu-{0}", "blaze-build"]', inputs.ix-cpu, inputs.ix-arch)) || inputs.os }}
     # A store blaze's release has not compiled into builds for about 97 minutes on Linux
     # x86-64 (docs/unit-keys.md), and longer on macOS's 7 GB runner.
     timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 150 }}
     # The remote's write token and signing key, for main's push alone.
     environment: ${{ github.ref == 'refs/heads/main' && inputs.tier == 'warm' && !startsWith(inputs.os, 'windows') && 'cache-writer' || '' }}
-    env:
-      # The `fast` and `full` tiers (the train) build with cargo, as release.yaml does: their
-      # harnesses and benches time and test the blaze users get, and the code blaze compiles
-      # for itself runs about ten times slower than rustc's, since it inlines no function into
-      # another yet (https://github.com/indexable-inc/blaze/issues/899; the smoke corpus took
-      # 15 min instead of 74 s, unit tests 60 s instead of 5). The merge gate and main build
-      # with blaze.
-      # Named harness runs are a new route: bootstrap them with blaze too.
-      BLAZE: ${{ !startsWith(inputs.os, 'windows') && (inputs.harnesses != '' || (inputs.tier != 'fast' && inputs.tier != 'full')) }}
+    # Every tier builds with blaze, the train's `fast` and `full` too, as release.yaml does: their
+    # harnesses and benches time and test the blaze users get, which blaze builds. That blaze's
+    # code runs slower than rustc's while it inlines too little
+    # (https://github.com/indexable-inc/blaze/issues/899) is the work, not a reason for cargo.
     outputs:
       parts: ${{ steps.parts.outputs.parts || steps.focused.outputs.parts }}
     steps:
-      - name: blaze bootstrap for named harnesses
-        if: runner.os == 'Windows' && inputs.harnesses != ''
+      - name: no blaze for Windows
+        if: env.BLAZE != 'true'
         run: |
-          echo 'Named harness builds on Windows need a released Windows blaze to bootstrap with; none is shipped yet.' >&2
+          echo "::error::building blaze on Windows needs a release of blaze for Windows to build it with (release.yaml makes none yet); blaze builds blaze, never cargo (AGENTS.md rule blaze-builds-blaze)"
           exit 1
-      # Nightly cargo's build-dir layout gives rustc one `-L dependency=` per dependency: for
-      # blaze-cargo that is over Windows' 32K command line, and sccache spawns rustc with it as is.
-      - if: runner.os == 'Windows'
-        run: |
-          git config --global core.autocrlf false
-          echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
-      # cargo's build (the train's tiers, Windows): rustup's nightly, and the flake's dev shell
-      # with the pinned LLVM.
-      - if: env.BLAZE != 'true'
-        uses: ./.github/actions/toolchain
-        with:
-          llvm: build
-      # blaze's build (the gate, main): no rustup and no Nix. blaze brings its own Rust and the
+      # blaze's build (every tier): no rustup and no Nix. blaze brings its own Rust and the
       # pinned LLVM (LLVM_SYS_231_PREFIX, fetched by its sha256), and the C compiler, linker and
       # libc are the runner's.
       - if: env.BLAZE == 'true'
@@ -226,23 +211,11 @@ jobs:
       # Against the LLVM blaze pins. blaze's build is of every package the unit tests are of,
       # with their features and profile (harness/unittests.py), so that its libraries are the
       # ones the tests job's programs are built on. Every one of them is a dependency of
-      # blaze-engine, and each has the features it has in blaze-engine's build alone. On
-      # Windows, which has no Nix, the build is against the static C runtime, and names
-      # libraries of the SDK that the linker is not otherwise shown.
+      # blaze-engine, and each has the features it has in blaze-engine's build alone.
       - name: blaze build --release, of what the unit tests are built on
         if: env.BLAZE == 'true'
         run: |
           $PYTHON harness/unittests.py '{"build": true}'
-      - name: cargo build -p blaze-engine --release
-        if: env.BLAZE != 'true'
-        run: |
-          if [ "$RUNNER_OS" = Windows ]; then
-            sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/Lib/"*/um/x64 | tail -n 1)
-            export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\x1f%s\x1f%s\x1f%s' -C target-feature=+crt-static -L "native=$(cygpath -w "$sdk")")
-            cargo build -p blaze-engine --release --locked
-          else
-            nix develop --command cargo build -p blaze-engine --release --locked
-          fi
       # The daemon ends first: its last pack seals when it does.
       - if: always() && env.BLAZE == 'true' && steps.blaze.outcome == 'success'
         run: blaze stop

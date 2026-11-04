@@ -85,11 +85,12 @@ fn f(n: u32, flag: bool) -> u32 {
 
 /// With the atom, a `requires` is tested at the head of the body and an `ensures` at every way
 /// out (the `return` and the body's value), each aborting where it fails; without it the
-/// clauses stay ghost.
+/// clauses stay ghost. The fixture declares `panic_nounwind` itself, so it enables
+/// `lang_items`, as rustc asks of any `#[lang]` (E0658) and `crate_lang_items` does.
 #[test]
 fn requires_and_ensures_abort_only_with_contract_checks() {
     let source = r#"
-#![feature(blaze_verify)]
+#![feature(blaze_verify, lang_items)]
 #[lang = "panic_nounwind"]
 fn panic_nounwind(_: &'static str) -> ! { loop {} }
 fn add_one(n: u32) -> (r: u32)

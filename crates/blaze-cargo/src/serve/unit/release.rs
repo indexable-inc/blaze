@@ -351,6 +351,16 @@ impl<K: Copy + Eq + Hash> Release<K> {
         }
     }
 
+    /// The plane holds a task back for memory the process holds besides its tasks
+    /// (`blaze_graph::Plane::short`): a release is due if [`Squeeze::short`] says so, read
+    /// by `now` only if it can matter. Its sweep caps the values the front end keeps by bytes
+    /// at their fair shares and drops every MIR, as one memory made due does.
+    pub(crate) fn short_under(&mut self, now: impl FnOnce() -> Pressure) {
+        if self.on && !self.pressed {
+            self.pressed = self.squeeze.short(now());
+        }
+    }
+
     /// Whether the build should stop its readers for a release: memory makes one due, or no
     /// unit is open and a crate is finished (no reader to wait for).
     pub(crate) fn due(&self) -> bool {

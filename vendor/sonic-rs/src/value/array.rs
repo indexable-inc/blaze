@@ -622,22 +622,41 @@ pub type Drain<'a> = std::vec::Drain<'a, Value>;
 
 use std::{
     ops::{Index, IndexMut},
-    slice::SliceIndex,
 };
 
-impl<I: SliceIndex<[Value]>> Index<I> for Array {
-    type Output = I::Output;
+// bootstrap: the pinned stage 0 (v0.20261030.0) refuses the generic
+// `impl<I: SliceIndex<[Value]>> Index<I> for Array` with a false E0311 (the associated type may
+// not live long enough), so `Array` is indexed by each of std's slice indices by name. Put the
+// generic impl back at the next stage 0.
+macro_rules! index_array {
+    ($($index:ty => $output:ty),* $(,)?) => {$(
+        impl Index<$index> for Array {
+            type Output = $output;
 
-    #[inline]
-    fn index(&self, index: I) -> &Self::Output {
-        Index::index(&**self, index)
-    }
+            #[inline]
+            fn index(&self, index: $index) -> &$output {
+                &(**self)[index]
+            }
+        }
+
+        impl IndexMut<$index> for Array {
+            #[inline]
+            fn index_mut(&mut self, index: $index) -> &mut $output {
+                &mut (**self)[index]
+            }
+        }
+    )*};
 }
 
-impl<I: SliceIndex<[Value]>> IndexMut<I> for Array {
-    fn index_mut(&mut self, index: I) -> &mut Self::Output {
-        IndexMut::index_mut(&mut **self, index)
-    }
+index_array! {
+    usize => Value,
+    std::ops::Range<usize> => [Value],
+    std::ops::RangeFrom<usize> => [Value],
+    std::ops::RangeTo<usize> => [Value],
+    std::ops::RangeFull => [Value],
+    std::ops::RangeInclusive<usize> => [Value],
+    std::ops::RangeToInclusive<usize> => [Value],
+    (std::ops::Bound<usize>, std::ops::Bound<usize>) => [Value],
 }
 
 //////////////////////////////////////////////////////////////////////////////

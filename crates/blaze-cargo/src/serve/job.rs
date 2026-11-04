@@ -195,6 +195,9 @@ pub struct Setup {
     pub builds: String,
     /// Where the packages it fetches are kept: [`super::Options::sources`].
     pub sources: String,
+    /// The daemon's store, where a fetched `.crate` is kept and looked up first
+    /// (`<state>/store`): what an error naming the packages it could not fetch says it looked in.
+    pub store: String,
     /// The triple of the machine the daemon runs on.
     pub host: String,
     /// The daemon's `PATH` and `HOME`: an agent's invocation's whole environment.
@@ -207,6 +210,63 @@ pub struct Setup {
     /// User code's runs take ranges of `2^32` from `runs` up to `runs_end`.
     pub runs: u64,
     pub runs_end: u64,
+}
+
+/// Every fetch of a batch that failed (`failed`, places in `fetches`), as one error: each
+/// package, index file or git tree by name and version and where it was to come from, with why
+/// it did not (`errors`, by where it mounts), then where blaze looked first (its store `store`
+/// and its sources `sources`) and, in a blaze built without `net`, how to get them: one run of a
+/// networked blaze with the same `BLAZE_HOME`. One failure in a networked blaze is its own error,
+/// as cargo says it.
+fn unavailable(
+    fetches: &[Fetch],
+    failed: &[u32],
+    errors: &HashMap<String, ApiError, Global>,
+    sources: &str,
+    store: &str,
+) -> ApiError {
+    let net = blaze_registry::http::NET;
+    // alloc: an error, once per batch that failed
+    let mut places: Vec<usize> = failed.iter().map(|&it| it as usize).collect();
+    places.sort_unstable();
+    places.dedup();
+    if let [only] = places[..]
+        && net
+        && let Some(error) = errors.get(&fetches[only].at)
+    {
+        return error.clone(); // clone: the error, once
+    }
+    // alloc: as above
+    let mut what = format!(
+        "{} of the {} sources this build needs could not be fetched, so nothing was compiled:",
+        places.len(),
+        fetches.len()
+    );
+    for &at in &places {
+        let fetch = &fetches[at];
+        let kind = match &fetch.kind {
+            FetchKind::Crate { .. } => "package",
+            FetchKind::IndexFile => "index file",
+            FetchKind::Git { .. } => "git tree",
+        };
+        what.push_str(&format!("\n  - {} ({kind}) from {}", fetch.what, fetch.url));
+        // Without `net` each says the same (no HTTP client), said once below instead.
+        if net && let Some(error) = errors.get(&fetch.at) {
+            for line in error.what.lines().filter(|it| !it.trim().is_empty()) {
+                what.push_str("\n      ");
+                what.push_str(line);
+            }
+        }
+    }
+    what.push_str(&format!("\nblaze looked for each first in its store ({store}) and its sources ({sources})"));
+    if !net {
+        what.push_str(
+            ", which hold none of them, and this blaze is built without blaze-registry's `net` feature (the seed \
+             profile), so it fetches nothing: run the same command once with a networked blaze and the same \
+             BLAZE_HOME, which fetches them into that store and those sources, and this blaze then builds offline",
+        );
+    }
+    ApiError::new(blaze_fetch::scrub(&what), Some(sources.to_owned()))
 }
 
 /// The single-flight key of the standard library's source.
@@ -537,6 +597,37 @@ fn node<'a>(kind: NodeKind, name: &'a str, deps: &'a [NodeId], pool: Pool, key: 
     NodeRef { kind, name, deps, pool, cost: 1, key, memory: 0 }
 }
 
+/// Why a build of `checkout` that keeps its front end is refused before it lowers anything:
+/// the task storing what it leaves for the store ([`Jobs::store_kept`]) last held, for this
+/// very checkout ([`store_cost_key`]'s record), more than the budget, so the plane would refuse
+/// it (`too_big`) only once the whole build is done (46.47 GB of a 42 GB budget, ten minutes
+/// in, on 2026-11-03).
+///
+/// Only this checkout's own record refuses: a checkout never measured, or one whose record
+/// fits, goes on, whatever another tree's stores held (the kind's peak). The refusal is the
+/// late one's verdict, minutes sooner: the store's node is predicted at least this record
+/// ([`lone_learned`] floors it at its kind's peak beside), and the record cannot come down
+/// while it is over the budget, as only a store of this checkout teaches it and none is
+/// admitted (earlyfail). The error says the exact `BLAZE_DAEMON_MEMORY_GB` that fits it.
+fn stores_too_much<S: Steps>(plane: &Tasks<S>, checkout: &str) -> Option<ApiError> {
+    let budget = plane.budget()?;
+    let need = plane.predict().record(kinds::STORE_KEPT, &store_cost_key(checkout))?.peak;
+    (need > budget.bytes).then(|| {
+        let gb = |bytes: u64| format!("{:.2} GB", bytes as f64 / f64::from(1 << 30));
+        // alloc: an error, once per build refused
+        let what = format!(
+            "the build of {checkout} would need {} of memory to store what it leaves for the store \
+             (as its last store of its kept front end held), more than blaze may use \
+             here: {} ({}), so nothing was built; {}",
+            gb(need),
+            gb(budget.bytes),
+            budget.from,
+            budget.advice(need)
+        );
+        ApiError::new(what, Some(checkout.to_owned()))
+    })
+}
+
 /// A batch of one thread task of kind `task`, with no deps.
 fn lone<S: Steps>(plane: &mut Tasks<S>, kind: NodeKind, name: &str, pool: Pool, key: Option<Key>, task: TaskKind) -> Fresh {
     let mut fresh = plane.fresh(1, name.len(), 0);
@@ -555,6 +646,15 @@ fn lone_learned<S: Steps>(plane: &mut Tasks<S>, kind: NodeKind, name: &str, pool
 /// from one build to the next.
 fn lower_cost_key(checkout: &str) -> Key {
     let mut hasher = blaze_ids::Hasher::new("blaze v2 lowering cost 1");
+    hasher.update(checkout.as_bytes());
+    Key(hasher.finish().0)
+}
+
+/// The predictor's key of the store of `checkout`'s kept front end ([`Jobs::store_kept`]):
+/// what it held is learned per checkout, as its lowering is ([`lower_cost_key`]), so a large
+/// tree's store refuses no other's early ([`stores_too_much`]).
+fn store_cost_key(checkout: &str) -> Key {
+    let mut hasher = blaze_ids::Hasher::new("blaze v2 kept front end store cost 1");
     hasher.update(checkout.as_bytes());
     Key(hasher.finish().0)
 }
@@ -713,16 +813,6 @@ fn targets_of(work: &Work) -> Option<&Targets> {
         | Work::Doc { targets, .. } => Some(targets),
         Work::Tables | Work::Snapshot | Work::Edit(_) => None,
     }
-}
-
-/// The cores a cargo command line's environment asks for (`BLAZE_CORES`) are the daemon's:
-/// its budget sized the plane and the worker pool and its priority was set as it started, so a
-/// command asking for others is refused, naming both, rather than run on the daemon's. An
-/// agent's request has no environment of its own and runs on the daemon's.
-fn cores_agree(work: &Work) -> Result<(), blaze_core::cores::CoresError> {
-    let daemon = blaze_core::cores::get()?;
-    let Some(cargo) = targets_of(work).and_then(|it| it.cargo.as_ref()) else { return Ok(()) };
-    blaze_core::cores::check_request(daemon, cargo.env.iter().map(|(name, value)| (name.as_str(), value.as_str())))
 }
 
 /// The directory `BLAZE_PROFILE` names in the environment of the cargo command line that asked
@@ -1158,6 +1248,10 @@ struct Fetching {
     fetches: Arc<[Fetch]>,
     /// How many have not settled.
     left: u32,
+    /// The places of those that failed, in the order they settled: every one is said at once
+    /// as the batch ends ([`unavailable`]), never the first alone, so a blaze that can't fetch
+    /// (built without `net`) names every package it lacks in one run.
+    failed: Vec<u32>,
     prep: Prep,
 }
 
@@ -2336,11 +2430,6 @@ impl<S: Steps> Jobs<S> {
     }
 
     fn begin(&mut self, w: &mut World<'_, S>, id: JobId, view: Option<Opened>, work: Work, idle: bool) {
-        if let Err(why) = cores_agree(&work) {
-            // alloc: error path, once per refused job
-            w.said.push(Said::Finish(id, false, Some(ApiError::new(why.to_string(), None)), None));
-            return;
-        }
         let views = match (&work, view) {
             (Work::Reach { from, .. }, Some(to)) => vec![*from, to], // alloc: once per job
             (_, Some(view)) => vec![view],                           // alloc: once per job
@@ -2603,6 +2692,36 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
+    /// The plane holds a task back for `short` bytes of what the process holds besides its
+    /// tasks ([`Plane::short`]), which no task's end gives back: every kept front end of a
+    /// checkout is let go (none is in use: a build takes its own out while it runs, and the
+    /// next build of that checkout lowers anew), and each build's front end is asked to let go
+    /// of what nothing still to compile reads ([`Writer::short`]). Then the plane's next
+    /// admission sees what is left; one that still fits nowhere starts alone once nothing
+    /// granted memory runs (`blaze_graph::Plane`'s `pick`).
+    fn short(&mut self, short: u64) {
+        let kept = self.roots.fronts.iter().filter(|it| it.is_some()).count();
+        if kept > 0 {
+            let _span = tracing::info_span!(target: "blaze", "kept front ends let go for memory", short, kept).entered();
+            for (root, &id) in self.roots.ids.iter() {
+                if let Some(front) = self.roots.fronts[id as usize].take() {
+                    eprintln!(
+                        "blaze serve: the kept front end of {root} is let go, and its next build lowers anew: \
+                         a task waits for {:.2} GiB the process holds besides its tasks",
+                        short as f64 / f64::from(1u32 << 30)
+                    );
+                    drop(front);
+                }
+            }
+        }
+        for &id in &self.order {
+            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
+            if let Stage::Units(build) = &mut job.stage {
+                build.writer.short();
+            }
+        }
+    }
+
     /// Each job's waiting writes applied where no reader of its front end is left, and the
     /// tasks held for them posted with readers of what they made. Asking a job whose readers
     /// still run costs one load of its reference count. Called as the loop winds up each
@@ -2610,6 +2729,10 @@ impl<S: Steps> Jobs<S> {
     /// ended, so the step that hears the last one applies the write. The daemon calls it
     /// once a turn as well, for a reader that outlives its task.
     pub fn apply_writes(&mut self, w: &mut World<'_, S>) {
+        let short = w.plane.short();
+        if short > 0 {
+            self.short(short);
+        }
         let order = std::mem::take(&mut self.order);
         let mut posts = std::mem::take(&mut self.posts);
         for &id in &order {
@@ -2899,23 +3022,34 @@ impl<S: Steps> Jobs<S> {
                     return;
                 }
                 if !ok {
-                    let at = &fetching.fetches[place].at;
-                    // clone: a failed fetch's error, for each job that asked it
-                    let error = self.fetch_failed.get(at).cloned().unwrap_or_else(|| {
-                        ApiError::new(format!("fetching {at}: {why}"), Some(at.clone())) // alloc: an error, once
-                    });
-                    job.over.get_or_insert((false, Some(error)));
+                    // Kept going: the batch's other fetches settle too, and the job ends once
+                    // with every failure, not the first (lane earlyfail: a blaze without `net`
+                    // said one missing package a run).
+                    fetching.failed.push(place as u32);
+                    if !self.fetch_failed.contains_key(&fetching.fetches[place].at) {
+                        let at = &fetching.fetches[place].at;
+                        // alloc: an error, once per source; clone: its place, the map's key
+                        let error = ApiError::new(format!("fetching {at}: {why}"), Some(at.clone()));
+                        // clone: as above
+                        self.fetch_failed.insert(at.clone(), error);
+                    }
                 }
                 fetching.left -= 1;
                 if fetching.left > 0 {
                     job.stage = Stage::Fetch(fetching);
                     return;
                 }
-                let prep = fetching.prep;
+                // What ended the job meanwhile (a cancel) is its error before any fetch's.
                 if let Some((_, error)) = job.over.take() {
                     self.end(w, id, false, error);
                     return;
                 }
+                if !fetching.failed.is_empty() {
+                    let error = unavailable(&fetching.fetches, &fetching.failed, &self.fetch_failed, &self.setup.sources, &self.setup.store);
+                    self.end(w, id, false, Some(error));
+                    return;
+                }
+                let prep = fetching.prep;
                 w.db.close(prep.queries);
                 job.queries.retain(|it| *it != prep.queries);
                 self.open(w, id, prep.opened, prep.asked);
@@ -3037,7 +3171,12 @@ impl<S: Steps> Jobs<S> {
                 let first = fresh.first();
                 // clone: two refcounts, once per batch of fetches
                 let work = Step::of(&job.cancelled, Does::Fetch { steps: w.steps.clone(), fetches: fetches.clone() });
-                job.stage = Stage::Fetch(Fetching { first, fetches, left: count, prep });
+                // This batch's fetches say their own errors: one an earlier run of a source left
+                // is not this run's cause, and is said by no later error.
+                for fetch in fetches.iter() {
+                    self.fetch_failed.remove(&fetch.at);
+                }
+                job.stage = Stage::Fetch(Fetching { first, fetches, left: count, failed: Vec::new(), prep });
                 self.add(w, id, fresh, Some(work), false);
             }
             Planned::Ready(mut units) => {
@@ -3157,6 +3296,17 @@ impl<S: Steps> Jobs<S> {
 
     /// A job's view lowered by one task, into its root's kept front end if there is one.
     fn lower(&mut self, w: &mut World<'_, S>, id: JobId, input: JobInput, root: Option<u32>, name: &str, checkout: String) {
+        // A check, build, test or run of a root keeps its front end and stores it once done
+        // ([`Jobs::store_kept`]): refused now, before anything is built, when this checkout's
+        // own last store could never be admitted. Every other work stores nothing.
+        let keeps = root.is_some()
+            && self.jobs.get(key_of(id)).is_some_and(|job| {
+                matches!(job.work, Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. })
+            });
+        if keeps && let Some(error) = stores_too_much(w.plane, &checkout) {
+            self.end(w, id, false, Some(error));
+            return;
+        }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         let kept = Mutex::new(root.and_then(|root| self.roots.fronts[root as usize].take()));
         let (steps, lowering) = (w.steps.clone(), input.clone()); // clone: refcounts, once per view
@@ -3177,7 +3327,7 @@ impl<S: Steps> Jobs<S> {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         let request = w.plane.open(w.now, false, job.idle);
         let name = named("storing the kept front end of ", &checkout);
-        let fresh = lone(w.plane, NodeKind::Store, &name, Pool::Work, None, kinds::STORE_KEPT);
+        let fresh = lone_learned(w.plane, NodeKind::Store, &name, Pool::Work, kinds::STORE_KEPT, store_cost_key(&checkout));
         let (node, count) = (fresh.first(), fresh.count());
         // clone: the checkout's path, once per build, for the task's span
         let does = Does::StoreKept { steps: Arc::clone(w.steps), kept: Mutex::new(Some(kept)), checkout: checkout.clone() };
@@ -3448,6 +3598,11 @@ impl<S: Steps> Jobs<S> {
         // alloc: a name and a deps buffer, once per build, reused by every unit
         let (mut name, mut deps) = (String::new(), Vec::new());
         let mut next = first.0;
+        // Each unit's source bytes, what its phases' memory is predicted from
+        // (`Plane::push_sized`): a stat of each `.rs` file under its modules' directories,
+        // once a directory a build, named so its time is its own (rule 14).
+        let sizing = tracing::info_span!(target: "blaze", "unit source sizes", units = built);
+        let mut seen = HashMap::new_in(Global); // alloc: once per build, a directory an entry
         for offset in 0..built {
             let at = unit_at(offset);
             let unit = &all[at];
@@ -3465,6 +3620,7 @@ impl<S: Steps> Jobs<S> {
                 next += 1;
                 continue;
             }
+            let source = sizing.in_scope(|| super::unit::source_bytes(unit, &mut seen));
             let base = next;
             let of = |phase: Phase| {
                 let index = phases.iter().position(|it| *it == phase).expect("a phase a unit's phases have");
@@ -3500,7 +3656,7 @@ impl<S: Steps> Jobs<S> {
                     Some((kind, key)) => _ = w.plane.push_program(&mut nodes, spec, kind, arg, key),
                     None => {
                         let learn = super::unit::cost_key(unit, Some(phase));
-                        _ = w.plane.push_learned(&mut nodes, spec, Task::Thread { kind: task, arg }, learn);
+                        _ = w.plane.push_sized(&mut nodes, spec, Task::Thread { kind: task, arg }, learn, source);
                     }
                 }
                 next += 1;

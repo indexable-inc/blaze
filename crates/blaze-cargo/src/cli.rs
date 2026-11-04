@@ -30,6 +30,7 @@ pub mod cache;
 pub mod clean;
 pub mod daemon;
 pub mod doc;
+pub mod fetch_url;
 pub mod fix;
 pub mod inspect;
 pub mod json;
@@ -84,6 +85,8 @@ Commands:
                 `--list` every workspace's with its size, `--all` removes them all
     cache gc    Collect what blaze keeps on disk now (`--dry-run` removes nothing, `--last`
                 prints the daemon's last runs)
+    fmt         Format the workspace's packages with blaze's own rustfmt (`--check`, `-p NAME`,
+                `--all`, `-- RUSTFMT_ARGS`), or the `.rs` files named; `blaze fmt --help`
     serve       Run the daemon the other commands are clients of
     stop        Make the daemon's state durable and stop it
     status      What the daemon is doing
@@ -129,6 +132,10 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
         blaze_profile::flight::FrameCopied { copies: it.copies, bytes: it.bytes }
     });
     _ = blaze_profile::flight::count_cpu(blaze_profile::thread_cpu);
+    // Spans too short for any reader to look at one are summed under their parent instead of a
+    // row each: 86% of a self-build's spans (`flight::FOLD_BELOW`). Until 2026-11-04 nothing
+    // set this, and one 52-minute build wrote 192 M spans in 6,175 files.
+    blaze_profile::flight::fold_below(blaze_profile::flight::FOLD_BELOW);
     if words.first().is_some_and(|it| it == "serve") {
         #[cfg(feature = "native")]
         return crate::serve::main(words.into_iter().skip(1));
@@ -218,7 +225,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Unknown(name) => {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 doc, clean, cache, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, \
+                 doc, clean, cache, fmt, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, \
                  explain, why, reach and slow"
             );
             eprint!("{}", say::error(&what, auto_color()));
@@ -253,8 +260,28 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Perf(words) => perf::main(words, auto_color()),
         Asked::Clean(words) => clean::main(words, auto_color()),
         Asked::Cache(words) => cache::main(&words, auto_color()),
+        Asked::FetchUrl(words) => fetch_url::main(&words, auto_color()),
+        Asked::Fmt(words) => fmt(words),
         Asked::Cargo(asked) => cargo(&asked),
     }
+}
+
+/// `blaze fmt`: blaze's formatter over the words after `fmt`, in this process; no daemon, and no
+/// rustfmt or cargo-fmt is started. A word that is not UTF-8 is refused, naming it: the
+/// formatter's command line is rustfmt's and cargo-fmt's, which read only UTF-8.
+fn fmt(words: Vec<OsString>) -> i32 {
+    let mut args = Vec::with_capacity(words.len()); // alloc: the formatter's command line, once
+    for word in words {
+        match word.into_string() {
+            Ok(word) => args.push(word),
+            Err(word) => {
+                let what = format!("blaze fmt: the argument {} is not UTF-8", word.to_string_lossy());
+                eprint!("{}", say::error(&what, auto_color()));
+                return Exit::Usage.code();
+            }
+        }
+    }
+    blaze_fmt::command::main(args)
 }
 
 /// The request of a cargo command line, once its place and `Cargo` are known. `test` runs in

@@ -299,6 +299,220 @@ fn instances_with_one_share_key_are_one() {
     });
 }
 
+/// A `std` (a lang crate, so built without overflow checks, as rustc ships it) whose `u8`
+/// addition is core's `impl Add for u8` (`core::internal_macros`' `add_impl!`): `#[inline]`
+/// and `#[rustc_inherit_overflow_checks]`; and core's `forward_ref_binop!` impl of `u8 + &u8`,
+/// `#[inline]`, generic in a lifetime only and keeping no check of its own, which calls it (as
+/// `impl Sum<&u8> for u8` and `impl AddAssign<&u8> for u8` do). Beside them, a body that
+/// inherits the checks but is `#[inline(never)]`. The program, built with overflow checks
+/// (`cfg:overflow_checks`, as a debug build is), adds `255 + 1` through a generic `sum`,
+/// through `255 + &1` and through the shared body.
+const INHERITED_CHECKS: &str = r#"
+//- minicore: sized
+//- /std.rs crate:std
+#![feature(lang_items, rustc_attrs)]
+pub mod panicking {
+    #[lang = "panic_bounds_check"]
+    #[track_caller]
+    pub fn panic_bounds_check(index: usize, len: usize) -> ! { loop {} }
+    pub mod panic_const {
+        #[track_caller] pub const fn panic_const_add_overflow() -> ! { loop {} }
+    }
+}
+pub mod ops {
+    #[lang = "add"]
+    pub trait Add<Rhs = Self> {
+        type Output;
+        fn add(self, rhs: Rhs) -> Self::Output;
+    }
+    impl Add for u8 {
+        type Output = u8;
+        #[inline]
+        #[rustc_inherit_overflow_checks]
+        fn add(self, other: u8) -> u8 { self + other }
+    }
+    impl<'a> Add<&'a u8> for u8 {
+        type Output = u8;
+        #[inline]
+        fn add(self, other: &'a u8) -> u8 { <u8 as Add>::add(self, *other) }
+    }
+}
+#[inline(never)]
+#[rustc_inherit_overflow_checks]
+pub fn add_shared(a: u8, b: u8) -> u8 { a + b }
+//- /main.rs crate:main deps:std cfg:overflow_checks
+use std::ops::Add;
+pub fn sum<T: Add<Output = T>>(a: T, b: T) -> T { a + b }
+pub fn by_ref(a: u8, b: &u8) -> u8 { a + b }
+pub fn roots() -> (u8, u8, u8) {
+    (sum(255u8, 1u8), std::add_shared(255u8, 1u8), by_ref(255u8, &1u8))
+}
+"#;
+
+/// A build whose profile has overflow checks `checked` (a debug build's, or a release
+/// build's), as [`policy`] at opt-level 0 otherwise.
+fn checks_policy(checked: bool) -> Policy {
+    let mut policy = policy(OptLevel::O0);
+    policy.profile.overflow_checks = checked;
+    policy
+}
+
+/// Whether `instance` is a function named `name`.
+fn is_named(db: &Db, instance: &HirInstance, name: &str) -> bool {
+    matches!(&instance.0, Kind::Code(called, _)
+        if matches!(called.def, InstanceDef::Fn(func) if FunctionSignature::of(db, func).name.as_str() == name))
+}
+
+/// The functions named `name` that `from` calls, each instance once, in the order called.
+fn called_named(db: &Db, from: &HirInstance, name: &str) -> Vec<HirInstance> {
+    refs::walk(db, from, refs::Walking::plain(false))
+        .expect("the walk")
+        .into_iter()
+        .filter_map(|it| match it {
+            FrontRef::Function(instance) if is_named(db, &instance, name) => Some(instance),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the code of `instance` compiled with overflow checks `checked` can panic on an
+/// addition that overflows: its IR calls `panicking::panic_const::panic_const_add_overflow`.
+/// Its walk lists that panic whatever the setting, and its IR asks for nothing past its walk;
+/// the IR asks for the panic exactly when it is built against the walk without the panic and
+/// asks for what that has not.
+fn panics_on_overflow(frontend: &HirFrontend, instance: &HirInstance, checked: bool) -> bool {
+    let build = Build::of(&spec());
+    frontend.with(|db| {
+        let walked = refs::walk(db, instance, refs::Walking::plain(false)).expect("the walk");
+        let placed = |listed: Vec<FrontRef<HirInstance, super::HirStatic>>| {
+            let mut code = built(db, instance, crate::Target::for_fixtures(), checked, build)
+                .unwrap_or_else(|e| panic!("{instance:?}: {e}"));
+            let requests = match &mut code {
+                super::Built::Ir(pending) => &mut pending.wants.requests,
+                super::Built::Assembled(_, requests) => requests,
+            };
+            let mut placer = Placer::listed(listed);
+            place_requests(db, &HashSource::ById(ById), compiled_in(db, instance), &mut placer, requests)
+        };
+        let is_panic = |it: &FrontRef<HirInstance, super::HirStatic>| {
+            matches!(it, FrontRef::Function(f) if is_named(db, f, "panic_const_add_overflow"))
+        };
+        assert_eq!(walked.iter().filter(|&it| is_panic(it)).count(), 1, "{instance:?} walks {walked:?}");
+        placed(walked.clone()).unwrap_or_else(|e| panic!("{instance:?} asks for what its walk has not: {e}"));
+        placed(walked.into_iter().filter(|it| !is_panic(it)).collect()).is_err()
+    })
+}
+
+/// rustc compiles an `#[inline]` function of another crate in each crate that uses it
+/// (`rustc_monomorphize` `should_codegen_locally`), and `#[rustc_inherit_overflow_checks]`
+/// makes its kept overflow checks run where that crate's `-C overflow-checks` says
+/// (`rustc_codegen_ssa` `codegen_assert_terminator`). So a crate built with overflow checks
+/// whose generic `sum::<u8>` adds `255 + 1` through std's `impl Add for u8` panics, and built
+/// without it wraps: the impl is compiled under its user's setting, and the two compiles are
+/// two keys (rule 18). The `#[inline(never)]` body is compiled once, in std, built without
+/// overflow checks, so it wraps whoever calls it, as under rustc.
+#[test]
+fn an_inline_body_that_inherits_overflow_checks_takes_its_users_setting() {
+    use blaze_codegen::backend::Frontend as _;
+    let (db, frontend) = held_as(fixture::db(INHERITED_CHECKS).into_db(), &checks_policy(true));
+    // A failure's message formats instances, whose types are the database's.
+    blaze_query::db::attach(db, || {
+        let root = frontend.root(function(db, "roots"));
+        let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
+        let sums = frontend.with(|hir| called(hir, &root, function(db, "sum")));
+        let [sum] = &sums[..] else { panic!("{sums:?}") };
+        let adds = frontend.with(|hir| called_named(hir, sum, "add"));
+        let [add] = &adds[..] else { panic!("`sum::<u8>` calls {adds:?}") };
+        let shared = frontend.with(|hir| called_named(hir, &root, "add_shared"));
+        let [shared] = &shared[..] else { panic!("`roots` calls {shared:?}") };
+        // The overflow checks each is compiled with, asked for by the program's crate, in a
+        // build whose profile has `checked`, and the key of its unit.
+        let planned = |instance: &HirInstance, checked: bool| {
+            let described = (frontend.describe(instance, &origin))
+                .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
+            let choice = (checks_policy(checked).choose(&described.origin, described.overflow_checks))
+                .expect("the plan");
+            let settings = choice.first.settings();
+            let key = UnitInstance { code: described.code, args: described.args, settings }.key();
+            (choice.first.overflow_checks, key)
+        };
+        let (debug, debug_key) = planned(add, true);
+        assert!(debug, "`<u8 as Add>::add` is compiled under std's overflow checks, not its user's");
+        assert!(panics_on_overflow(&frontend, add, debug), "`sum(255u8, 1u8)` wraps in a debug build");
+        let (release, release_key) = planned(add, false);
+        assert!(!release && !panics_on_overflow(&frontend, add, release));
+        assert_ne!(debug_key, release_key, "one key for the add compiled with and without checks");
+        let (once, _) = planned(shared, true);
+        assert!(!once, "an `#[inline(never)]` body of std is compiled under std's setting");
+        assert!(!panics_on_overflow(&frontend, shared, once));
+    });
+}
+
+/// rustc compiles every instance its user compiles in the user's crate, so the user's
+/// overflow checks reach `<u8 as Add>::add` through `impl Add<&u8> for u8`, which keeps no
+/// check of its own and is generic in a lifetime only: `255u8 + &1u8`,
+/// `[200u8, 100].iter().sum::<u8>()` and `acc += &v` panic in a debug build. The forwarding
+/// impl is compiled for the crate that asks for it, which then asks for the add, as the
+/// driver's walk does (a callee's requester is its caller's origin).
+#[test]
+fn overflow_checks_reach_an_inheriting_body_through_inline_bodies_without_checks() {
+    use blaze_codegen::backend::Frontend as _;
+    let (db, frontend) = held_as(fixture::db(INHERITED_CHECKS).into_db(), &checks_policy(true));
+    blaze_query::db::attach(db, || {
+        let root = frontend.root(function(db, "roots"));
+        let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
+        let by_ref = frontend.with(|hir| called(hir, &root, function(db, "by_ref")));
+        let [by_ref] = &by_ref[..] else { panic!("`roots` calls {by_ref:?}") };
+        let forwards = frontend.with(|hir| called_named(hir, by_ref, "add"));
+        let [forward] = &forwards[..] else { panic!("`by_ref` calls {forwards:?}") };
+        let adds = frontend.with(|hir| called_named(hir, forward, "add"));
+        let [add] = &adds[..] else { panic!("`<u8 as Add<&u8>>::add` calls {adds:?}") };
+        let forwarded = (frontend.describe(forward, &origin)).unwrap_or_else(|e| panic!("{forward:?}: {}", e.what));
+        assert_eq!(forwarded.origin, origin, "`impl Add<&u8> for u8` is compiled for std, not its user");
+        let described = (frontend.describe(add, &forwarded.origin)).unwrap_or_else(|e| panic!("{add:?}: {}", e.what));
+        let choice = (checks_policy(true).choose(&described.origin, described.overflow_checks)).expect("the plan");
+        assert!(choice.first.overflow_checks, "`255u8 + &1u8` wraps in a debug build");
+        assert!(panics_on_overflow(&frontend, add, choice.first.overflow_checks));
+    });
+}
+
+/// An instance its users compile (`#[inline]`: std's `<u8 as Add>::add`) is walked as one
+/// whatever asks for it: describing it for a crate whose units inline nothing (the member, at
+/// opt-level 0) and for one whose units inline (std, as shipped), and preparing it, which
+/// names no requester, list one walk. Were the walk its asker's, a unit of one origin would
+/// be prepared against references listed for another and the build refuse it (a unit whose
+/// MIR is inlined of references listed for units that inline none, or a reference count
+/// other than the walk's), as with a dependency at opt-level 3 and a member at 0.
+#[test]
+fn an_instance_its_users_compile_is_walked_alike_for_every_asker() {
+    use blaze_codegen::{backend::Frontend as _, plan::Origin};
+    let policy = checks_policy(true);
+    let (db, frontend) = held_as(fixture::db(INHERITED_CHECKS).into_db(), &policy);
+    blaze_query::db::attach(db, || {
+        let root = frontend.root(function(db, "roots"));
+        let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
+        let sums = frontend.with(|hir| called(hir, &root, function(db, "sum")));
+        let [sum] = &sums[..] else { panic!("{sums:?}") };
+        let adds = frontend.with(|hir| called_named(hir, sum, "add"));
+        let [add] = &adds[..] else { panic!("`sum::<u8>` calls {adds:?}") };
+        let described = (frontend.describe(add, &origin)).unwrap_or_else(|e| panic!("{add:?}: {}", e.what));
+        let spec = (policy.choose(&described.origin, described.overflow_checks)).expect("the plan").first;
+        frontend.with(|hir| {
+            let walking = frontend.walking(hir, add).expect("the walk");
+            for asker in [origin, Origin::Std] {
+                let inlined = frontend.inlines_for(hir, add, &asker).expect("the walk");
+                assert_eq!(inlined, walking.inlined, "described for {asker:?} and prepared, walked apart");
+            }
+            let refs: Vec<blaze_codegen::Target> = (0..described.refs.len())
+                .map(|at| blaze_codegen::Target::Extern(format!("ref{at}")))
+                .collect();
+            Backends::default()
+                .prepared(hir, &frontend.hashes, &unit(&spec), &spec, (add, walking), &refs)
+                .unwrap_or_else(|e| panic!("{add:?} described for the member, prepared: {e:?}"));
+        });
+    });
+}
+
 const SHAPES: &str = r#"
 //- minicore: sized, option
 pub struct A(pub u32);
@@ -1696,6 +1910,69 @@ fn the_walk_lists_what_a_built_in_callees_inlined_body_calls() {
     });
 }
 
+const LIBRARY_BUILDS_IN: &str = r#"
+//- minicore: sized, copy, ord
+//- /dep.rs crate:dep library
+#[inline(never)]
+pub fn leaf(x: u32) -> bool { x > 7 }
+#[inline]
+pub fn mid(x: u32) -> bool { leaf(x) }
+pub struct S;
+impl core::cmp::PartialEq<u32> for S {
+    #[inline(always)]
+    fn eq(&self, other: &u32) -> bool { mid(*other) }
+}
+//- /main.rs crate:main deps:dep
+pub fn caller(a: &dep::S, b: &u32) -> bool { a == b }
+"#;
+
+/// A body of the library's, whose own MIR is the same under every unit's settings, still
+/// builds in the `#[inline(always)]` callees of other crates under the unit's, where their
+/// bodies are MIR-inlined: core's `<&S as PartialEq<&u32>>::eq` builds in `dep`'s
+/// `<S as PartialEq<u32>>::eq`, which inlined asks for `leaf` through `mid`, as smol_str's
+/// `<&SmolStr as PartialEq<&str>>::eq` asked for `Repr::as_str` and `memcmp`. The walk for
+/// inlining units lists it, the walk without does not, and the unit's IR asks only for what
+/// its walk lists.
+#[test]
+fn the_walk_of_a_library_body_lists_what_its_built_in_callees_inlined_call() {
+    use hir_def::HasModule as _;
+    let (db, frontend) = held_as(fixture::db(LIBRARY_BUILDS_IN).into_db(), &policy(OptLevel::O3));
+    let root = frontend.root(function(db, "caller"));
+    frontend.with(|db| {
+        let named = |it: &places::Ref, name: &str, lang: bool| match it {
+            FrontRef::Function(HirInstance(Kind::Code(called, _))) => match called.def {
+                InstanceDef::Fn(func) => {
+                    FunctionSignature::of(db, func).name.as_str() == name
+                        && func.krate(db).data(db).origin.is_lang() == lang
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        let called = refs::walk(db, &root, refs::Walking::plain(false)).expect("the walk of `caller`");
+        let Some(FrontRef::Function(eq)) = called.iter().find(|it| named(it, "eq", true)).cloned() else {
+            panic!("`caller` calls core's `eq`: {called:?}")
+        };
+        assert!(frontend.inlines(db, &eq).expect("the policy"));
+        let plain = refs::walk(db, &eq, refs::Walking::plain(false)).expect("the walk");
+        let walked = refs::walk(db, &eq, refs::Walking::plain(true)).expect("the walk for inlining");
+        assert!(plain.iter().any(|it| named(it, "mid", false)), "{plain:?}");
+        assert!(!plain.iter().any(|it| named(it, "leaf", false)), "{plain:?}");
+        assert!(walked.iter().any(|it| named(it, "leaf", false)), "{walked:?}");
+        assert_eq!(walked[..plain.len()], plain[..]);
+        let krate = compiled_in(db, &eq);
+        let mut place = |refs: Vec<places::Ref>| {
+            let mut code = built_as(db, &llvm(2), &eq);
+            let super::Built::Ir(pending) = &mut code else { panic!("asm") };
+            let mut placer = Placer::listed(refs);
+            place_requests(db, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests)
+                .map(drop)
+        };
+        assert!(place(plain).is_err(), "the unit's IR asks for `leaf`");
+        place(walked).expect("the unit's IR asks only for what its walk lists");
+    });
+}
+
 const TRACKED: &str = r#"
 //- minicore: sized, copy, panic_location
 use core::panic::Location;
@@ -1967,6 +2244,88 @@ pub fn roots(x: u32) {
         });
         let [a, b] = &glues[..] else { panic!("{glues:?}") };
         assert_ne!(key(a), key(b), "{a:?} and {b:?}");
+    });
+}
+
+/// Rule 18 for which callees are one instance: `one::<A>` and `one::<B>` have one compile
+/// identity, so `two::<A, B>` and `two::<A, A>` do too, and one shared identity in their
+/// arguments' place (asserted first, so the keys differ only by their placement). But the first
+/// calls two instances and the second one: two places against one, and other code, so they are
+/// two keys. `three::<A, B, A>` and `three::<A, B, B>` list the same two places and differ only
+/// in which one the third call is given; `reified::<A, B, A>` and `reified::<A, B, B>` the
+/// same through function pointers, which the recorder gives a request asked for before
+/// (`Wants::asks`). `two::<A, A>` and `two::<B, B>` place their calls alike and stay one key.
+/// A build of blaze gave `needs_realloc::<Vec<usize>, ExtendedKeyPurpose>` and
+/// `needs_realloc::<CertificateDer, CertificateDer>` one key over 12 references against 11.
+#[test]
+fn instances_whose_calls_are_placed_apart_have_two_keys() {
+    use blaze_codegen::backend::Frontend as _;
+    let (db, frontend) = frontend(
+        r#"
+//- minicore: sized
+pub struct A(pub u32);
+pub struct B(pub u32);
+pub fn one<T>(x: &T) -> &T { x }
+pub fn two<S, D>(s: &S, d: &D) -> (&S, &D) { (one(s), one(d)) }
+pub fn three<S, D, E>(s: &S, d: &D, e: &E) { one(s); one(d); one(e); }
+pub fn nothing<T>() {}
+pub fn reified<S, D, E>() -> [fn(); 3] { [nothing::<S>, nothing::<D>, nothing::<E>] }
+pub fn roots(a: A, b: B) {
+    two(&a, &b);
+    two(&a, &a);
+    two(&b, &b);
+    three(&a, &b, &a);
+    three(&a, &b, &b);
+    reified::<A, B, A>();
+    reified::<A, B, B>();
+}
+"#,
+    );
+    // A failure's message formats instances, whose types are the database's.
+    blaze_query::db::attach(db, || {
+        let policy = policy(OptLevel::O0);
+        let root = frontend.root(function(db, "roots"));
+        let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
+        let key = |instance: &HirInstance| {
+            let described = (frontend.describe(instance, &origin))
+                .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
+            let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+            let key = UnitInstance { code: described.code, args: described.args, settings: choice.first.settings() }.key();
+            (key, described.code)
+        };
+        // What the key held in the arguments' place before the placement was mixed in.
+        let shared = |instance: &HirInstance| {
+            frontend.with(|hir| frontend.shared_args(hir, &instance.0, &origin)).unwrap_or_else(|e| panic!("{instance:?}: {e}"))
+        };
+        let of = |name| {
+            let func = function(db, name);
+            frontend.with(|hir| called(hir, &root, func))
+        };
+        let one = function(db, "one");
+        let ones = |instance: &HirInstance| frontend.with(|hir| called(hir, instance, one)).len();
+
+        let twos = of("two");
+        let [ab, aa, bb] = &twos[..] else { panic!("{twos:?}") };
+        // The precondition: one code and one shared identity, so only the placement tells
+        // them apart.
+        assert_eq!((key(ab).1, shared(ab)), (key(aa).1, shared(aa)), "{ab:?} and {aa:?}");
+        assert_eq!((key(aa).1, shared(aa)), (key(bb).1, shared(bb)), "{aa:?} and {bb:?}");
+        // The cause: `two::<A, B>` lists two instances of `one`, `two::<A, A>` one.
+        assert_eq!((ones(ab), ones(aa), ones(bb)), (2, 1, 1));
+        assert_ne!(key(ab).0, key(aa).0, "{ab:?} and {aa:?}");
+        assert_ne!(key(ab).0, key(bb).0, "{ab:?} and {bb:?}");
+        assert_eq!(key(aa).0, key(bb).0, "{aa:?} and {bb:?}");
+
+        let threes = of("three");
+        let [aba, abb] = &threes[..] else { panic!("{threes:?}") };
+        assert_eq!((key(aba).1, shared(aba)), (key(abb).1, shared(abb)), "{aba:?} and {abb:?}");
+        // Two places each: only which one the third call is given differs.
+        assert_eq!((ones(aba), ones(abb)), (2, 2));
+        assert_ne!(key(aba).0, key(abb).0, "{aba:?} and {abb:?}");
+
+        let reifieds = of("reified");
+        let [aba, abb] = &reifieds[..] else { panic!("{reifieds:?}") };
+        assert_ne!(key(aba).0, key(abb).0, "{aba:?} and {abb:?}");
     });
 }
 

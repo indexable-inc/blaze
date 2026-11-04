@@ -33,11 +33,13 @@
 # memory grows on demand up to 256 GiB, in place of Linux x86-64 on a hosted runner, whose 16 GB
 # a build of blaze outgrows into swap for an hour or more and was shut down in (#1654); main's
 # `linux arm64` build and tests and the lint baselines run there too, and their green runs on
-# main are the snapshots the gate's runs fork, store and checkout included. ix serves AArch64
-# alone today, so Linux x86-64's build and tests stay on main's push, on a hosted runner. Unset,
-# every job runs on GitHub's hosted runners as before: a job whose labels no runner serves
-# waits for one for a day, so the variable goes on only once the ix-runners app serves this
-# repository.
+# main are the snapshots the gate's runs fork, store and checkout included. Linux x86-64's
+# build and tests (main's push, and the gate's when BLAZE_IX_RUNNERS is off) move to a 64-vCPU
+# x86-64 ix runner with the repository variable BLAZE_IX_X64_RUNNERS, a variable of its own
+# because ix serves AArch64 alone today and refuses an `x64` job: until it serves x86-64 they stay
+# on a hosted runner, whose build of blaze OOMs (#1376). Unset, every job runs on GitHub's hosted
+# runners as before: a job whose labels no runner serves waits for one for a day, so each
+# variable goes on only once the ix-runners app serves this repository on that architecture.
 name: blaze
 on:
   push:
@@ -133,6 +135,8 @@ jobs:
     with:
       platform: linux-x64
       os: ubuntu-24.04
+      ix-cpu: ${{ vars.BLAZE_IX_X64_RUNNERS == 'true' && '64' || '' }}
+      ix-arch: x64
       tier: ${{ needs.changes.outputs.tier }}
       smoke: true
 

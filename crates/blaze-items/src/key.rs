@@ -102,7 +102,12 @@ pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
     // What it is built for: the host, a target or the wasm proc macros. Two builds of one
     // package and cfg for two of these (std for the host and for `--target` of the host's own
     // triple, or for `wasm32-wasip1` and its proc macros) differ in what the key leaves out,
-    // their `OUT_DIR` and build script runs, so they are two crates.
+    // their `OUT_DIR` and build script runs, so they are two crates. Within one of these, the
+    // runs of one build script apart only in their `OUT_DIR` are one run in the front end, so
+    // their crates are one; runs apart in their profile's `OPT_LEVEL` or `DEBUG` too (a
+    // release build's host package as a normal and as a `build-override` dependency) may give
+    // other output, so their crates are two, told apart by the cfg atom
+    // `blaze::build_script_profile` below (`blaze_lower`'s `run_classes`).
     extra.built_for.hash_into(&mut h);
     // Which of its package's targets it is, as cargo's units tell them apart: the kind of
     // the manifest's target with its name above, and what it is built as (`--test` makes any

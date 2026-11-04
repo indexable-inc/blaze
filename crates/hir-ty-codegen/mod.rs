@@ -748,6 +748,34 @@ impl Instance {
         }
     }
 
+    /// Whether rustc compiles it into each crate that uses it rather than linking every user to
+    /// one copy compiled in its own crate: a shim that [`Self::is_generic`] says, else
+    /// `hir_ty_mir::mir::home::compiled_by_user` (a generic, a closure or coroutine, an
+    /// `#[inline]` function), never a function linked by a symbol of its own
+    /// ([`linked_symbol`]: a symbol has one definition; `compiled_by_user` already says no for
+    /// every such attribute but the `eh_personality` lang item's, which no attribute names).
+    /// The one rule of which origin v2 compiles an instance for (`HirFrontend::compiled_for`),
+    /// which walk its references are listed for, whether it heads its own recursion path, and
+    /// which crate's `-C debug-assertions` its MIR's UB checks follow ([`body_options`]).
+    fn compiled_by_user(&self, db: &Db) -> bool {
+        use hir_ty_mir::mir::dispatch::Body;
+        let body = match self.def {
+            InstanceDef::Fn(func) => Body::Fn(func),
+            InstanceDef::Closure(id) => Body::Closure(id),
+            InstanceDef::Coroutine(id) => Body::Coroutine(id),
+            InstanceDef::CoroutineByMove(id) => Body::CoroutineByMove(id),
+            InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::VtableShim(_)
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => return self.is_generic(),
+        };
+        // The usual answer first, memoized; the symbol only of what it says yes to.
+        hir_ty_mir::mir::home::compiled_by_user(db, body, self.args.as_ref())
+            && !matches!(self.def, InstanceDef::Fn(func)
+                if !self.is_generic() && linked_symbol(db, func).is_some())
+    }
+
     /// The environment the instance is compiled in when a function compiled in `asked` asks
     /// for it: `hir_ty_mir::mir::home::env_of`, the one rule purity's walk and identity use
     /// too. Not generic, it is its own crate's: rustc compiles it there once, whoever calls it.
@@ -1695,8 +1723,8 @@ fn rustc_inlines(level: MirOptLevel, lang: bool, optimized: bool) -> bool {
     level == MirOptLevel::Release && (lang || optimized)
 }
 
-/// What a body of `written` is asked with, `generic` where it is an instance compiled per
-/// instance ([`Instance::is_generic`]): what the v2 unit's settings say
+/// What a body of `written` is asked with, `per_user` where it is an instance each crate that
+/// uses it compiles ([`Instance::compiled_by_user`]): what the v2 unit's settings say
 /// ([`v2::build::Build::options`]) when `build` is a unit's, else what v1 reads of the crate
 /// and the environment ([`mir_options_of`]). Never the crate the instance is worked out in
 /// (its home): that is a choice of sharing, which no store key names.
@@ -1704,10 +1732,10 @@ fn body_options(
     db: &Db,
     build: Option<v2::build::Build>,
     written: Crate,
-    generic: bool,
+    per_user: bool,
 ) -> Result<MirOptions> {
     match build {
-        Some(build) => Ok(build.options(db, written, generic)),
+        Some(build) => Ok(build.options(db, written, per_user)),
         None => mir_options_of(db, written),
     }
 }
@@ -1731,7 +1759,7 @@ fn instance_body<'db>(
     };
     let Some(owner) = instance.def.mir_owner() else { unsupported!("the body of a shim") };
     let written = owner.written_in(db).module(db).krate(db);
-    let options = body_options(db, build, written, instance.is_generic())?;
+    let options = body_options(db, build, written, instance.compiled_by_user(db))?;
     let body = tally
         .step(Step::Mir, || db.mir(owner, MirStage::compiled(owner, options)))
         .and_then(|it| filled(it, &args, &env));

@@ -18,6 +18,7 @@
 
 mod daemon;
 mod fetch;
+mod fetch_url;
 mod gc;
 mod heads;
 mod image;
@@ -29,6 +30,7 @@ pub mod observe;
 pub(crate) mod once;
 mod plane;
 mod pulse;
+pub mod settings;
 pub(crate) mod signals;
 mod still;
 #[cfg(all(unix, feature = "native"))]
@@ -129,12 +131,6 @@ pub fn machine() -> anyhow::Result<PathBuf> {
     std::path::absolute(&dir).with_context(|| format!("the machine's shared directory {} against the current directory", dir.display()))
 }
 
-/// Which blaze `exe` is: the hash of its bytes, so two builds of one commit, a dirty tree's,
-/// are two. What the daemons of one build share is under it, as only that build made it.
-pub fn build_id(exe: &Path) -> anyhow::Result<blaze_ids::ContentId> {
-    Ok(build_of(exe)?.id)
-}
-
 /// The content identity of the code that computes what the front end keeps in the store, and
 /// of how it was built (`blaze_codegen_code::FRONT_END`): what def-map images and the check
 /// outcomes, bodies and constants served beside them, the goal and item stores and kept
@@ -142,24 +138,30 @@ pub fn build_id(exe: &Path) -> anyhow::Result<blaze_ids::ContentId> {
 /// generator's in one walk and the program hands it over with [`set_front_end_code`] before any
 /// command runs, so an edit outside the front end's packages (the code generator, the CLI, the
 /// daemon, the lints) keeps every image, goal and expansion stored. Unit records and the
-/// standard library's shared directory stay keyed by the whole executable ([`build_id`]): a
-/// record is made by blaze-cargo itself, past the front end.
+/// standard library's shared directory are keyed by it with the code generator's and the
+/// record's ([`RecordMakers`]): a record is made by blaze-cargo itself, past the front end.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FrontEndCode(pub blaze_ids::ContentId);
 
 impl FrontEndCode {
     /// Of the 64 hex digits `blaze_codegen_code::emit_all` sets `BLAZE_FRONT_END_CODE` to.
     pub fn from_hex(hex: &str) -> Result<FrontEndCode, String> {
-        let refused = || format!("the front end's code identity `{hex}` is not 64 hex digits (`BLAZE_FRONT_END_CODE`)");
-        if hex.len() != 64 || !hex.is_ascii() {
-            return Err(refused());
-        }
-        let mut bytes = [0u8; 32];
-        for (byte, at) in bytes.iter_mut().zip((0..64).step_by(2)) {
-            *byte = u8::from_str_radix(&hex[at..at + 2], 16).map_err(|_| refused())?;
-        }
-        Ok(FrontEndCode(blaze_ids::ContentId(bytes)))
+        code_of_hex(hex, "the front end's code identity", "BLAZE_FRONT_END_CODE").map(FrontEndCode)
     }
+}
+
+/// The content ID of `hex`, 64 hex digits a build script of `blaze_codegen_code` set `env` to;
+/// `what` names it in the error.
+fn code_of_hex(hex: &str, what: &str, env: &str) -> Result<blaze_ids::ContentId, String> {
+    let refused = || format!("{what} `{hex}` is not 64 hex digits (`{env}`)");
+    if hex.len() != 64 || !hex.is_ascii() {
+        return Err(refused());
+    }
+    let mut bytes = [0u8; 32];
+    for (byte, at) in bytes.iter_mut().zip((0..64).step_by(2)) {
+        *byte = u8::from_str_radix(&hex[at..at + 2], 16).map_err(|_| refused())?;
+    }
+    Ok(blaze_ids::ContentId(bytes))
 }
 
 #[expect(
@@ -195,8 +197,105 @@ pub fn front_end_code() -> Result<FrontEndCode, String> {
     })
 }
 
-/// [`build_id`] of `exe` with the file it hashed ([`executable`]), as one open file was both:
-/// one that changed while it was read is an error.
+/// The content identity of the code that makes a unit's record (`blaze_codegen_code::RECORD`):
+/// blaze-cargo and every package it is built from but those the identity cuts (the explorer, its
+/// page, the plane's history, the client's rendering), and how it was built. blaze-engine's build
+/// script works it out in the walk that works out [`FrontEndCode`], and the program hands it
+/// over with [`set_record_code`] before any command runs, so an edit of blaze-engine or a cut
+/// package keeps every record and the standard library's shared directory.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RecordCode(pub blaze_ids::ContentId);
+
+impl RecordCode {
+    /// Of the 64 hex digits `blaze_codegen_code::emit_all` sets `BLAZE_RECORD_CODE` to.
+    pub fn from_hex(hex: &str) -> Result<RecordCode, String> {
+        code_of_hex(hex, "the code identity of what makes a unit's record", "BLAZE_RECORD_CODE").map(RecordCode)
+    }
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "which code makes the process's records, handed over once by the program's main so that no edit outside it changes this crate"
+)]
+static RECORD_CODE: std::sync::OnceLock<RecordCode> = std::sync::OnceLock::new();
+
+/// Hands over the code identity of what makes the process's records: once, before the first
+/// job. Handing over another one after is refused, naming both.
+pub fn set_record_code(code: RecordCode) -> Result<(), String> {
+    match RECORD_CODE.get_or_init(|| code) {
+        it if *it == code => Ok(()),
+        // alloc: an error, once
+        it => Err(format!(
+            "the code identity of what makes a unit's record is {:x} already, and {:x} was handed over: one \
+             process is one maker of records",
+            it.0, code.0
+        )),
+    }
+}
+
+/// The code identity [`set_record_code`] was handed, or an error naming who should have.
+/// blaze-cargo's own tests are one made-up maker, handed over on first ask.
+pub fn record_code() -> Result<RecordCode, String> {
+    #[cfg(test)]
+    set_record_code(RecordCode(blaze_ids::ContentId([0x7c; 32])))?;
+    RECORD_CODE.get().copied().ok_or_else(|| {
+        "the process was handed no code identity of what makes a unit's record \
+         (`blaze_cargo::serve::set_record_code`): the program that runs it hands over its build script's \
+         `BLAZE_RECORD_CODE` before any job, and blaze keys no record by the executable's bytes in its place"
+            // alloc: an error
+            .to_owned()
+    })
+}
+
+/// What makes a unit's record, by the content identity of each part's code: the front end
+/// (its diagnostics and what the code generator compiles of it), the code generator (the code
+/// it makes) and what makes the record itself (blaze-cargo with the lints, the linker and the
+/// record's encoding, [`RecordCode`]). What a unit's record key and the standard library's
+/// shared directory are keyed by in place of the executable's bytes: every byte of a record or
+/// of a file in that directory is made by code of these three closures from the inputs the key
+/// names beside them, and the executable's other code (blaze-engine, the cut packages) makes
+/// none of it (`blaze_codegen_code::RECORD_CUT`, `RECORD_REVIEWED`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RecordMakers {
+    pub front_end: blaze_ids::ContentId,
+    pub codegen: blaze_ids::ContentId,
+    pub record: blaze_ids::ContentId,
+}
+
+impl RecordMakers {
+    /// The three as one ID: what the standard library's shared directory is named by.
+    pub fn id(&self) -> blaze_ids::ContentId {
+        blaze_ids::Hasher::new(RECORD_MAKERS).id(&self.front_end).id(&self.codegen).id(&self.record).finish()
+    }
+}
+
+/// The domain of [`RecordMakers::id`].
+const RECORD_MAKERS: &str = "blaze v2 record makers 1";
+
+/// The process's [`RecordMakers`], or an error naming the identity it was not handed.
+/// The code generator's code identity in blaze-cargo's own tests: one value, since the process
+/// holds one and every test that asks for it hands over this ([`record_makers`],
+/// `answers::own`'s `-vV` test).
+#[cfg(test)]
+pub(crate) const TEST_CODEGEN_CODE: hir_ty_codegen::v2::CodegenCode =
+    hir_ty_codegen::v2::CodegenCode(blaze_ids::ContentId([0x5a; 32]));
+
+/// blaze-cargo's own tests are one made-up code generator, [`TEST_CODEGEN_CODE`], handed over on
+/// first ask, as `answers::own`'s tests hand it over, so either may ask first.
+pub fn record_makers() -> Result<RecordMakers, String> {
+    #[cfg(test)]
+    hir_ty_codegen::v2::set_code(TEST_CODEGEN_CODE)?;
+    Ok(RecordMakers {
+        front_end: front_end_code()?.0,
+        codegen: hir_ty_codegen::v2::code()?.0,
+        record: record_code()?.0,
+    })
+}
+
+/// Which blaze `exe` is, the hash of its bytes, with the file it hashed ([`executable`]), as
+/// one open file was both: one that changed while it was read is an error. What a client
+/// compares with the daemon's to know it speaks to the same blaze; no stored value is keyed by
+/// it ([`RecordMakers`]).
 pub fn build_of(exe: &Path) -> anyhow::Result<blaze_api::Build> {
     use std::io::Read as _;
     let mut file = std::fs::File::open(exe).with_context(|| format!("reading blaze itself, {}", exe.display()))?;
@@ -719,8 +818,8 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     // dyn: the sandbox's `Confine`, asked once per spawn
     let confine: Arc<dyn Confine> = Arc::new(blaze_usercode::confine::Launcher { program: paths.launcher.clone() });
     // The process's one budget (`BLAZE_CORES`), read as `blaze serve` started and its priority
-    // lowered then ([`crate::cli::main`]): a request asking for another is refused
-    // ([`blaze_core::cores::check_request`]).
+    // lowered then ([`crate::cli::main`]): a command setting another is refused before any
+    // request, with every other setting it differs in ([`settings`]).
     let cores = blaze_core::cores::get().context("the number of cores the daemon's plane works on")?;
     tracing::info!(target: "blaze", "{cores}");
     let threads = cores.budget.get();
@@ -731,10 +830,14 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     let sysroot = crate::toolchain::sysroot()
         .with_context(|| format!("blaze's toolchain ({}) is not on this machine: `blaze toolchain` installs it", crate::toolchain::name()))?;
     tracing::info!(sysroot = %sysroot.display(), "blaze's toolchain");
-    // Keyed by the whole executable: the shared store holds std units' records and outputs
-    // alone, and a record is made by blaze-cargo, past the front end ([`FrontEndCode`]).
+    // Which blaze this is, for clients to compare: no stored value is keyed by it.
     let build = build_of(&paths.launcher)?;
-    let std = machine()?.join("std").join(format!("{:x}", build.id));
+    // Keyed by what makes std's records and outputs ([`RecordMakers`]), never the executable's
+    // bytes: the shared store holds std units' records and outputs alone, and each std key's
+    // outputs are files at fixed paths under it, so two blazes share it only when every byte
+    // either writes there is made by the same code from the same inputs (AGENTS.md rule 22).
+    let makers = record_makers().map_err(|why| anyhow::anyhow!(why))?;
+    let std = machine()?.join("std").join(format!("{:x}", makers.id()));
     std::fs::create_dir_all(&std).with_context(|| format!("making the standard library's shared directory {}", std.display()))?;
     // Its lease, held for the daemon's life: no collector, this daemon's or another
     // process's, renames the shared store away while this daemon may read or write it
@@ -757,6 +860,10 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     if let Some(first) = swept.first() {
         tracing::info!(target: "blaze", removed = swept.len(), first = %first.display(), "half-written fetched packages removed");
     }
+    // The limit as told (`--memory-gb` first), read once: what the budget is made of and what
+    // the daemon says it was started with ([`settings`]), so a client asking another is told.
+    let told = told_limit(serving.memory, std::env::var_os(MEMORY_VAR))?;
+    let settings = settings::of_daemon(told.as_ref(), |name| std::env::var_os(name));
     let options = Options {
         state: file_name(&paths.state)?,
         std: file_name(&std)?,
@@ -766,8 +873,7 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
         socket: paths.socket.as_deref().map(file_name).transpose()?,
         http: serving.http.zip(token),
         budget: Some(
-            blaze_graph::arena::machine_budget(1 << 30, told_limit(serving.memory, std::env::var_os(MEMORY_VAR))?)
-                .context("the memory the daemon's tasks may hold")?,
+            blaze_graph::arena::machine_budget(1 << 30, told).context("the memory the daemon's tasks may hold")?,
         ),
         threads,
         io: 16,
@@ -783,6 +889,7 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
         toolchain,
         color: false,
         build,
+        settings,
         outside: blaze_vfs::outside::dirs(),
         stall: serving.stall.unwrap_or(blaze_profile::Watchdog::BOUND),
         #[cfg(unix)]

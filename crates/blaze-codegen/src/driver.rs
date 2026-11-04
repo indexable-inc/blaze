@@ -228,6 +228,10 @@ pub struct Built {
     /// The instances the front end inferred cold ([`Described::cold`]), by key: a full link
     /// puts them after every other function.
     pub cold: Vec<InstanceKey>,
+    /// Every instance the walk reached, sorted by key, each once, with how it was made: its
+    /// backend and the least origin that asked for it (`FnNode::least_origin`). The linker
+    /// sums an image's code by them; nothing is keyed by them.
+    pub made: Vec<(InstanceKey, crate::Made)>,
     /// Every dev template a whole build took from the store or made, sorted, each once (a lazy
     /// build's are not recorded yet): the kernel's entries, for the oracle.
     pub kernel: Vec<KernelEntry>,
@@ -2174,6 +2178,11 @@ impl<'a, B: Prepare> Build<'a, B> {
         identities.append(&mut out.folded);
         // alloc: per build, what it gives the linker
         let cold = nodes.iter().filter(|it| it.1.described.cold).map(|it| *it.0).collect();
+        let made = nodes
+            .iter()
+            .map(|(key, node)| (*key, crate::Made { backend: node.spec.backend, origin: node.least_origin }))
+            // alloc: per build, what it gives the linker
+            .collect();
         let reach = Reach::new(
             nodes.iter().map(|(key, node)| {
                 let marks = [node.unit.instance.code.0, node.unit.instance.args];
@@ -2222,6 +2231,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             memo_used: used,
             identities,
             cold,
+            made,
             kernel,
             misses,
         })

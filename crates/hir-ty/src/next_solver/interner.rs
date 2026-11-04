@@ -4934,6 +4934,18 @@ pub(crate) mod table {
             unsafe { self.values.get(row.get().into()) }
         }
 
+        /// The row whose value `same` accepts, looked for by `key`, a borrowed form of the value
+        /// that hashes as it does. Takes no lock and adds no row: `None` is only a hint, and the
+        /// caller interns the owned value, which settles it.
+        #[inline]
+        pub(crate) fn find_by<V: Erase<Static = T>, Q: Hash + ?Sized>(
+            &self,
+            key: &Q,
+            same: impl Fn(&V) -> bool,
+        ) -> Option<NonZeroU32> {
+            self.index.find(key, |row| same(unerase_ref(self.indexed(row))))
+        }
+
         /// The value of `row`. Panics if it is not a row of this table.
         #[inline]
         pub(crate) fn get<V: Erase<Static = T>>(&self, row: NonZeroU32) -> &V {

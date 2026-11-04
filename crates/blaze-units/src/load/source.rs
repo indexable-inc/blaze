@@ -51,6 +51,10 @@ pub(crate) enum Located {
     Here { manifest: String },
     Needs(Fetch),
     Failed(LoadError),
+    /// A package of a sparse registry or a git source that blaze's sources don't hold, which
+    /// this offline build may not fetch: cargo's error, as a download's ([`unfetched`]). One
+    /// run that may fetch has it, unlike every [`Located::Failed`].
+    Unfetched(LoadError),
 }
 
 /// A registry's index file, as read.
@@ -148,7 +152,7 @@ impl Sources {
         if let Some(flag) = self.offline
             && from.kind() != &SourceKind::LocalRegistry
         {
-            return Ok(Err(anyhow!("attempting to make an HTTP request, but {flag} was specified")));
+            return Ok(Ok(unfetched(id, flag)));
         }
         let sha256 = match checksum.filter(|it| !it.is_empty()) {
             Some(it) => it.to_owned(),
@@ -259,10 +263,7 @@ impl Sources {
             return Ok(tree::checkout_package(cx, &at, id)?.map(|manifest| Located::Here { manifest }));
         }
         if let Some(flag) = self.offline {
-            return Ok(Err(download_error(
-                id,
-                anyhow!("attempting to make an HTTP request, but {flag} was specified"),
-            )));
+            return Ok(Ok(unfetched(id, flag)));
         }
         Ok(Ok(Located::Needs(Fetch {
             what: format!("git repository `{}`", from.url()),
@@ -350,6 +351,12 @@ impl Sources {
         self.offline
     }
 
+    /// Where fetched packages are kept ([`crate::query::BuildConfig::sources`]), as errors say
+    /// where blaze looked.
+    pub(crate) fn kept(&self) -> &str {
+        &self.kept
+    }
+
     /// The registry `id`'s packages come from, when `id` is a registry and what replaces it is
     /// one too.
     pub(crate) fn registry_of(&self, id: SourceId) -> anyhow::Result<Option<SourceId>> {
@@ -380,6 +387,13 @@ impl Sources {
 /// cargo's error for a package it could not fetch.
 fn download_error(id: PackageId, error: anyhow::Error) -> anyhow::Error {
     error.context(format!("failed to download `{} v{}`", id.name(), id.version()))
+}
+
+/// `id`, which blaze's sources don't hold and an offline build (`flag`) may not fetch, as
+/// cargo says it: a download refused.
+fn unfetched(id: PackageId, flag: &str) -> Located {
+    let error = download_error(id, anyhow!("attempting to make an HTTP request, but {flag} was specified"));
+    Located::Unfetched(load_error(&error, Some(format!("{} v{}", id.name(), id.version()))))
 }
 
 fn git_index(from: SourceId) -> anyhow::Error {

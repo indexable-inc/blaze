@@ -36,6 +36,8 @@ hir-ty-ub.workspace = true
 hir-ty-pure.workspace = true
 # `blaze doc`'s pages, made in the daemon from the front end (`serve::unit::doc`).
 blaze-doc.workspace = true
+# `blaze fmt`: blaze's formatter, run in the client's process; it asks nothing of the daemon.
+blaze-fmt.workspace = true
 # `blaze pack`'s pack, made in the daemon (`serve::unit::pack`). It names no code generator, so
 # blaze-wasm's `wasm` feature never reaches this build.
 blaze-wasm-pack.workspace = true
@@ -75,6 +77,8 @@ proc-macro-api.workspace = true
 blaze-ui.workspace = true
 blaze-units.workspace = true
 blaze-registry.workspace = true
+# `.crate` files and `blaze fetch-url`: bytes by their digest, kept in the store.
+blaze-fetch.workspace = true
 # The `SourceId` of a git dependency the daemon fetches (`serve/fetch/git.rs`).
 blaze-source.workspace = true
 blaze-build-script.workspace = true

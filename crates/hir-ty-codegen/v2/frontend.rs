@@ -16,15 +16,14 @@ use blaze_items::{CodeHash, ItemId, ItemKey};
 use blaze_query::db::FromId;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId,
-    GenericParamId, HasModule, Lookup, attrs::AttrFlags, expr_store::ExpressionStore,
-    signatures::FunctionSignature,
+    GenericParamId, HasModule, Lookup, signatures::FunctionSignature,
 };
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
     db::{InternedClosure, InternedClosureId, InternedCoroutineId},
     next_solver::{DbInterner, GenericArgs, ParamEnv, Region, RegionExt, Ty, TyKind},
 };
-use hir_ty_mir::mir::{MirOptions, overflow::crate_checks_overflow};
+use hir_ty_mir::mir::MirOptions;
 use hir_ty_identity::{Compiled, OptionsSet, Shim, Subject, instance_identity};
 use hir_ty_mir::mir::dispatch;
 use hir_ty_share::Unshared;
@@ -155,8 +154,8 @@ struct Units {
     /// Whether some unit of the origin MIR-inlines (`Spec::mir_inline`), at the first spec or
     /// one a build tiers it up to.
     inlines: ByOrigin<Result<bool, PlanError>>,
-    /// Some origin's units inline: what a generic, which every origin may ask for, is walked
-    /// with.
+    /// Some origin's units inline: what an instance every origin may ask for and compile (a
+    /// generic, an `#[inline]` function, a closure: [`user_compiled`]) is walked with.
     any: bool,
     /// Whether some unit of the origin tells a debugger of its named locals
     /// ([`DebugInfo::tells_locals`](blaze_codegen::settings::DebugInfo::tells_locals), at the
@@ -316,8 +315,9 @@ impl<'db> HirFrontend<'db> {
     }
 
     /// Whether a unit of `instance` MIR-inlines bodies of crates other than the library's,
-    /// whose code then calls what they call: one of its crate's origin when it is not
-    /// generic, else of any origin, as any may ask for it. What its references are walked
+    /// whose code then calls what they call: one of its crate's origin when it is compiled
+    /// there only, else ([`user_compiled`]: a generic, an `#[inline]` function, a closure) of
+    /// any origin, as any may ask for it. What its references are walked
     /// for ([`refs::walk`]).
     pub(crate) fn inlines(
         &self,
@@ -334,19 +334,31 @@ impl<'db> HirFrontend<'db> {
         super::devirt::walking(db, self.devirt.world(), instance, inlined, || self.owner(db, &instance.0))
     }
 
-    /// [`Self::inlines`] as describing `instance` for `requester` decides it: of the origin of
-    /// its crate when it is not generic, else of the requester's.
+    /// [`Self::inlines`] as describing `instance` for `requester` decides it: of the origin
+    /// [`Self::compiled_for`] picks.
     pub(crate) fn inlines_for(
         &self,
         db: &Db,
         instance: &HirInstance,
         requester: &Origin,
     ) -> Result<bool, String> {
-        let origin = match crate_of(db, &instance.0) {
-            Some(krate) if !generic(&instance.0) => self.origin(db, krate),
-            _ => *requester,
-        };
+        let origin = self.compiled_for(db, instance, requester);
         self.inlines_as(db, instance, Some(&origin))
+    }
+
+    /// The origin `instance` is compiled for when `requester` asks for it: the requester's
+    /// where rustc compiles it into each crate that uses it ([`user_compiled`]), else its own
+    /// crate's, where rustc links every user to one copy. It follows that rule alone, never
+    /// the instance's overflow checks, so turning them on or off moves no code between origins.
+    /// Its callees are asked for by this origin (the driver's walk), so a body that takes its
+    /// caller's overflow checks (core's `#[inline] #[rustc_inherit_overflow_checks]` operator
+    /// impls) reached through other bodies their user compiles (`impl Add<&u8> for u8`,
+    /// `impl Sum<&u8> for u8`) takes the user's.
+    fn compiled_for(&self, db: &Db, instance: &HirInstance, requester: &Origin) -> Origin {
+        match crate_of(db, &instance.0) {
+            Some(krate) if !user_compiled(db, &instance.0) => self.origin(db, krate),
+            _ => *requester,
+        }
     }
 
     /// [`Self::inlines`], with the origin of the instance's crate when the caller has it.
@@ -357,8 +369,10 @@ impl<'db> HirFrontend<'db> {
         origin: Option<&Origin>,
     ) -> Result<bool, String> {
         let Some(units) = &self.units else { return Err(NO_POLICY.to_owned()) }; // alloc: an error
+        // One answer for every requester of an instance its users compile, as describing it for
+        // one and preparing it (`walking`, which names no requester) must list one walk.
         let of_origin = match crate_of(db, &instance.0) {
-            Some(krate) if !generic(&instance.0) => match origin {
+            Some(krate) if !user_compiled(db, &instance.0) => match origin {
                 Some(origin) => units.inlines.get(origin),
                 None => units.inlines.get(&self.origin(db, krate)),
             },
@@ -417,10 +431,7 @@ impl<'db> HirFrontend<'db> {
         // Each failure past here is the front end's of this instance: the error carries its item.
         let fail = |what: String| super::failed_in_front(db, None, Some(item), instance, what);
         let generic = generic(&instance.0);
-        let origin = match crate_of(db, &instance.0) {
-            Some(krate) if !generic => self.origin(db, krate),
-            _ => *requester,
-        };
+        let origin = self.compiled_for(db, instance, requester);
         let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
         let owner = self.owner(db, &instance.0);
         let walking = super::devirt::walking(db, self.devirt.world(), instance, inlined, || owner).map_err(fail)?;
@@ -430,13 +441,21 @@ impl<'db> HirFrontend<'db> {
         let code = super::devirt::code(built_in_code, refs::read(db, instance, walking).map_err(fail)?);
         let plain = args_of(db, hashes, &instance.0).map_err(fail)?;
         let args = match generic {
-            true => self.generic_args(db, &instance.0, &origin, plain).map_err(fail)?,
+            true => {
+                let placement = refs::placement(db, instance, walking).map_err(fail)?;
+                self.generic_args(db, &instance.0, &origin, plain, placement).map_err(fail)?
+            }
             false => plain,
         };
         let identity = identity(db, &instance.0, item, plain);
         let bound = bound(db, &instance.0, code, plain);
         let cold = cold_of(db, &instance.0);
-        let overflow_checks = if generic { written_checks(db, &instance.0) } else { None };
+        // Always the origin's profile, which keys it (rule 18). Pinning the setting of one
+        // whose MIR keeps no check would let requesters that differ only in overflow checks
+        // share its key while its callees that take their caller's setting differ between them
+        // (`<u8 as Add>::add` under `impl Add<&u8> for u8`); for one compiled in its own crate
+        // only, the origin's profile is already that crate's setting.
+        let overflow_checks = None;
         let symbol = symbol_of(db, &instance.0).map_err(fail)?;
         let mut refs = refs::walk(db, instance, walking).map_err(fail)?;
         asked_by(owner, &mut refs);
@@ -466,20 +485,37 @@ impl<'db> HirFrontend<'db> {
     }
 
     /// A generic's arguments in its key, compiled as `origin` asks: what its code reads of them
-    /// ([`Self::shared_args`]) and, where a unit of `origin` tells a debugger of its named
-    /// locals ([`Units::tells`]), `plain`, its arguments' content ID ([`args_of`]). A told
-    /// local's type is in the IR's shape and the side table (`side::Variable::ty`), and it is
-    /// the instance's own (`&UnsafeCell<usize>` or `&UnsafeCell<Align8<*mut ()>>` for one body
-    /// of one compile identity), so two instances sharing one key would give the store two
-    /// shapes under it, or one instance the other's debug info (rule 18). Without told locals
-    /// the instances stay one.
-    fn generic_args(&self, db: &Db, kind: &Kind, origin: &Origin, plain: ContentId) -> Result<ContentId, String> {
+    /// ([`Self::shared_args`]) with `placement`, which place of its references each request of
+    /// its code is given ([`refs::placement`]), and, where a unit of `origin` tells a debugger
+    /// of its named locals ([`Units::tells`]), `plain`, its arguments' content ID
+    /// ([`args_of`]). A told local's type is in the IR's shape and the side table
+    /// (`side::Variable::ty`), and it is the instance's own (`&UnsafeCell<usize>` or
+    /// `&UnsafeCell<Align8<*mut ()>>` for one body of one compile identity), so two instances
+    /// sharing one key would give the store two shapes under it, or one instance the other's
+    /// debug info (rule 18). Without told locals the instances stay one.
+    ///
+    /// A compile identity names each callee by its own identity, never by which instance it
+    /// is, so callees of equal identities that are one instance in one instance of the generic
+    /// and two in another (`size_of::<S>` and `size_of::<D>` in `needs_realloc::<S, D>` for
+    /// `S == D` and for two types of one layout) leave it equal, while the reference list,
+    /// which holds each instance once, and so the code, which names a reference by its place,
+    /// differ: `placement` is that one difference (rule 18).
+    fn generic_args(
+        &self,
+        db: &Db,
+        kind: &Kind,
+        origin: &Origin,
+        plain: ContentId,
+        placement: ContentId,
+    ) -> Result<ContentId, String> {
         let shared = self.shared_args(db, kind, origin)?;
-        // Already the instance's own arguments ([`args_of`]): mixing `plain` in again would only
-        // change the key, not what it covers.
+        // Already the instance's own arguments ([`args_of`]), which its walk, and so its
+        // placement, is made from: mixing either in would only change the key, not what it
+        // covers.
         if shared == plain {
             return Ok(shared);
         }
+        let shared = Hasher::new(PLACED_ARGS_DOMAIN).id(&shared).id(&placement).finish();
         match self.tells(origin)? {
             true => Ok(Hasher::new(TOLD_ARGS_DOMAIN).id(&shared).id(&plain).finish()),
             false => Ok(shared),
@@ -498,7 +534,7 @@ impl<'db> HirFrontend<'db> {
     /// ([`args_of`]). Both give exact code. A key that can't be made for any other reason is
     /// an error: the instance is never compiled per instance in its place. A generic callee is
     /// of its caller's origin, so its key here is the one its caller's key holds.
-    fn shared_args(&self, db: &Db, kind: &Kind, origin: &Origin) -> Result<ContentId, String> {
+    pub(super) fn shared_args(&self, db: &Db, kind: &Kind, origin: &Origin) -> Result<ContentId, String> {
         let Kind::Code(instance, env) = kind else { return args_of(db, &self.hashes, kind) };
         let compiled = self.body_options(origin)?;
         // clone: the query's key, a reference count
@@ -695,14 +731,12 @@ fn counted(db: &Db, kind: &Kind) -> Counted {
 }
 
 /// Whether `kind` is collected in its own crate's build only, as rustc's
-/// `should_codegen_locally` is false for it in a crate that uses it: a function with no type or
-/// const arguments that is not `#[inline]` (nor `#[rustc_force_inline]`). A shim, a closure and
-/// a coroutine are built where they are used, as rustc builds them.
+/// `should_codegen_locally` is false for it in a crate that uses it: a function its users do
+/// not compile ([`user_compiled`], the one rule of it). A shim, a closure and a coroutine are
+/// built where they are used, as rustc builds them.
 fn heads_own_path(db: &Db, kind: &Kind) -> bool {
     let Kind::Code(instance, _) = kind else { return false };
-    let InstanceDef::Fn(func) = instance.def else { return false };
-    !instance.is_generic()
-        && !AttrFlags::query(db, func.into()).intersects(AttrFlags::IS_INLINE | AttrFlags::RUSTC_FORCE_INLINE)
+    matches!(instance.def, InstanceDef::Fn(_)) && !user_compiled(db, kind)
 }
 
 /// What `kind` is an instance of, as rustc's `check_recursion_limit` counts its `DefId`
@@ -1127,6 +1161,9 @@ const SHARED_ARGS_DOMAIN: &str = "blaze v2 shared args 2";
 /// A compile identity and the arguments' content ID, for a generic whose told locals' types
 /// are in its shape ([`HirFrontend::generic_args`]).
 const TOLD_ARGS_DOMAIN: &str = "blaze v2 told args 1";
+/// A compile identity with which place of its references each request of the code is given
+/// ([`refs::placement`]), for a generic shared under it ([`HirFrontend::generic_args`]).
+const PLACED_ARGS_DOMAIN: &str = "blaze v2 placed args 1";
 
 /// Whether an instance with no compile identity for `why` is compiled for its arguments alone:
 /// [`Unshared::is_per_instance`], which compile identity reads for a caller too.
@@ -1351,32 +1388,12 @@ fn bound(db: &Db, kind: &Kind, code: CodeHash, args: ContentId) -> Result<Conten
     Ok(hasher.finish())
 }
 
-/// The overflow checks the MIR of a generic says, as rustc builds a crate's MIR with its own:
-/// none in the standard library's, and the instantiating crate's where the body inherits them.
-fn written_checks(db: &Db, kind: &Kind) -> Option<bool> {
-    let Kind::Code(instance, _) = kind else { return None };
-    let (krate, inherits) = match instance.def {
-        InstanceDef::Fn(func) => (
-            func.krate(db),
-            AttrFlags::query(db, func.into()).contains(AttrFlags::RUSTC_INHERIT_OVERFLOW_CHECKS),
-        ),
-        def => {
-            let loc = closure_loc(db, def)?;
-            let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
-            (loc.owner.module(db).krate(db), store.inherits_overflow_checks(loc.expr))
-        }
-    };
-    if inherits {
-        return None;
-    }
-    Some(match crate_checks_overflow(db, krate) {
-        Some(checked) => checked,
-        // A crate of the toolchain (`origin.is_lang()`), which has no `-C overflow-checks` of
-        // its own: the standard library ships built without them, so a body of it that does
-        // not inherit its callers' setting is written unchecked. Not a guess for a missing
-        // value: it is what the toolchain's MIR says.
-        None => false,
-    })
+/// [`crate::Instance::compiled_by_user`] of `kind`'s instance: the one rule of which origin an
+/// instance is compiled for ([`HirFrontend::compiled_for`]) and which units' walk its
+/// references are listed for ([`HirFrontend::inlines`]), so the two never disagree.
+fn user_compiled(db: &Db, kind: &Kind) -> bool {
+    let Kind::Code(instance, _) = kind else { return false };
+    instance.compiled_by_user(db)
 }
 
 /// The symbol outside code names an instance by: `#[no_mangle]`, `#[export_name]`, the

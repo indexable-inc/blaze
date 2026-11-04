@@ -156,6 +156,9 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
     columns.extend([
         column(UInt64Array::from_iter(spans.iter().map(|it| it.copied.map(|it| it.copies)))),
         column(UInt64Array::from_iter(spans.iter().map(|it| it.copied.map(|it| it.bytes)))),
+        // Null where it folded none: most spans.
+        column(UInt64Array::from_iter(spans.iter().map(|it| (it.folded_spans != 0).then_some(it.folded_spans)))),
+        column(Int64Array::from_iter(spans.iter().map(|it| (it.folded_spans != 0).then_some(it.folded_ns)))),
     ]);
     for cells in typed {
         columns.push(span_column(spans, cells)?);
@@ -343,13 +346,19 @@ pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, 
 pub fn folded(folds: &[FoldRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
     let rows = folds.len();
     let (mut threads, mut names, mut targets) = (Dict::new(), Dict::new(), Dict::new());
+    let (mut parents, mut parent_targets) = (Dict::new(), Dict::new());
     // alloc: a batch's keys, once a read
     let (mut thread_keys, mut name_keys, mut target_keys) = (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
+    // alloc: a batch's keys, once a read
+    let (mut parent_keys, mut parent_target_keys) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in folds {
         let meta = flight::meta(row.site);
         thread_keys.push(threads.key(u64::from(row.thread_name), || flight::name(row.thread_name).unwrap_or_else(|| "?".into())));
         name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name())));
         target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target())));
+        let parent = (row.parent_site != 0).then(|| flight::meta(row.parent_site));
+        parent_keys.push(parent.map(|meta| parents.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.name()))));
+        parent_target_keys.push(parent.map(|meta| parent_targets.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.target()))));
     }
     // alloc: a batch's list of columns, once a read
     let columns: Vec<ArrayRef> = vec![
@@ -368,6 +377,8 @@ pub fn folded(folds: &[FoldRow], process: Process<'_>) -> Result<RecordBatch, Ar
         column(Int64Array::from_iter(folds.iter().map(|it| it.self_cpu_ns.map(|it| it as i64)))),
         column(UInt64Array::from_iter(folds.iter().map(|it| it.alloc.map(|it| it.bytes)))),
         column(UInt64Array::from_iter(folds.iter().map(|it| it.alloc.map(|it| it.count)))),
+        parents.finish(UInt32Array::from(parent_keys))?,
+        parent_targets.finish(UInt32Array::from(parent_target_keys))?,
     ];
     RecordBatch::try_new(schema_of(&schema::FOLDED), columns)
 }
@@ -466,6 +477,8 @@ mod tests {
             unit: 0,
             self_cpu_ns: Some(700),
             typed: typed.typed,
+            folded_spans: 0,
+            folded_ns: 0,
         };
         assert_eq!(said.get::<col::Outcome>(), Some(Outcome::Ok));
         let unsaid = SpanRow { span_id: 12, self_cpu_ns: None, typed: Said::EMPTY.typed, ..said };

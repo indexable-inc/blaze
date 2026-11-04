@@ -3752,8 +3752,8 @@ mod tests {
 
     #[test]
     fn an_object_is_indexed_once_with_its_frame_records() {
-        let cie = unwind::cie(1, -8, 16, &[], false).unwrap();
-        let fde = unwind::fde(4, &[], false, false).unwrap();
+        let cie = unwind::cie(1, -8, 16, &[], false, unwind::Pointers::Sdata4).unwrap();
+        let fde = unwind::fde(4, &[], false, false, unwind::Pointers::Sdata4).unwrap();
         let fde_at = cie.bytes.len();
         let mut frame = cie.bytes.clone();
         frame.extend_from_slice(&fde.bytes);

@@ -39,6 +39,17 @@ pub(crate) enum Bad {
 
 const _: () = assert!(size_of::<Bad>() <= 24);
 
+impl Bad {
+    /// Whether it is a value too far for its field: a distance or an offset the image's layout
+    /// made, which [`crate::Refusal::FieldRange`] marks so its message shows the layout.
+    pub(crate) fn reach(self) -> bool {
+        matches!(
+            self,
+            Bad::Signed32(_) | Bad::Unsigned32(_) | Bad::Branch { .. } | Bad::Adrp(_) | Bad::Adr(_) | Bad::TpRange(_)
+        )
+    }
+}
+
 impl fmt::Display for Bad {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {

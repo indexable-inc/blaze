@@ -146,6 +146,15 @@ pub(crate) fn crate_data(
     let mut is_proc_macro = krate_data.target_kind.is_proc_macro();
     // Process other crate-level attributes.
     for attr in &*attrs {
+        // `#![blaze::arbitrary_ints]`: `u3` and `i24` name integers in this crate
+        // (`DefMap::arbitrary_ints`, docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "arbitrary_ints"
+        {
+            crate_data.arbitrary_ints = true;
+            continue;
+        }
         let Some(attr_name) = attr.path.as_ident() else { continue };
 
         match () {

@@ -43,8 +43,10 @@ pub use render::{text, thread_line};
 /// The version of the report's JSON: bumped when a field changes meaning or goes away. 2: an
 /// unnamed wait's `hidden_ns` is the wall its waits cover, not their parked time summed, and
 /// waits the record never ends are their own blind spot (`unended_wait`). 3: a build whose
-/// daemon died is reported, to that daemon's last row, with `build.died`.
-pub const VERSION: u32 = 3;
+/// daemon died is reported, to that daemon's last row, with `build.died`. 4: a build past
+/// `time::load::SPAN_BUDGET` spans is modelled from its spans at or past a floor, said by the
+/// blind spot `spans_cut`.
+pub const VERSION: u32 = 4;
 
 /// The build the report is of, as its `builds` row says.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -112,6 +114,8 @@ pub struct Facts {
     pub query_counts: Vec<QueryCount>,
     pub memory: Memory,
     pub recorder: Recorder,
+    /// Which of the build's spans the model read ([`crate::time::load::SPAN_BUDGET`]).
+    pub spans: crate::time::SpanCut,
 }
 
 /// What the flight recorder itself dropped or summed over the build's window, from its own
@@ -389,6 +393,8 @@ pub enum BlindKind {
     PathCut,
     /// Rows the flight recorder lost: spans it could not open, rows a ring wrote over.
     RowsLost,
+    /// Spans under the floor the model read from, past its bound ([`crate::time::SpanCut`]).
+    SpansCut,
 }
 
 /// The least saving a finding needs to be listed: 1% of the wall time, and at least this.
@@ -1248,6 +1254,27 @@ impl<'a> Ctx<'a> {
                     format!("{} spans the recorder had no slot to open (`profile spans lost`)", r.spans_lost.unwrap_or(0)),
                 ],
                 fix: "behind: make the history's flush faster or its backlog larger; wrapped: a bigger `flight::CAP` or a shorter drain; spans: find what held its open slots".to_owned(),
+            });
+        }
+        let cut = self.facts.spans;
+        if cut.floor_ns > 0 {
+            out.push(BlindSpot {
+                kind: BlindKind::SpansCut,
+                hidden_ns: 0,
+                subject: "spans".to_owned(),
+                title: format!(
+                    "the model read {} of the build's {} spans, past its bound of {}: those under {:.3} s it did not",
+                    cut.read,
+                    cut.spans,
+                    crate::time::load::SPAN_BUDGET,
+                    cut.floor_ns as f64 / 1e9
+                ),
+                evidence: vec![
+                    format!("{} spans not read, {} between them (a nested span's time is its parent's too)", cut.cut(), s(cut.cut_ns)),
+                    "every root job and wait span was read; a span's time under the floor is its parent's own, and a park inside a nested wait under it reads as an unnamed wait".to_owned(),
+                    "the spans by name count every span, read or not, and the ones the recorder folded (`folded`)".to_owned(),
+                ],
+                fix: "for the short spans, query the build's `spans` and `folded` (`span_sums`) with `blaze debug sql`; the floor is set by the spans long enough that the recorder keeps a row each, so reading more takes a model that holds more spans (`time::load::SPAN_BUDGET`)".to_owned(),
             });
         }
         let a = model.anomalies;

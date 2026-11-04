@@ -211,10 +211,14 @@ fn main() {
 /// is a placeholder for the type's drop glue: inlined, it dropped nothing, and std's
 /// `Vec::retain_mut` dropped none of what it removed (cc's build scripts leaked every job token
 /// and hung, queue 01523).
+///
+/// The crate declares `drop_glue` itself, which takes `#![feature(lang_items)]` (rustc's E0658;
+/// `crate_lang_items` collects none without it), so the root starts with it, before `out`.
 #[test]
 fn a_drop_in_place_that_inlines_still_drops() {
-    check_output(
-        "drop, manually_drop, deref, copy, slice, index, coerce_unsized",
+    let fixture = format!(
+        "//- minicore: add, builtin_impls, drop, manually_drop, deref, copy, slice, index, \
+         coerce_unsized\n#![feature(lang_items)]\n{OUT}\n{}",
         r#"
 mod p {
     #[inline(always)]
@@ -243,9 +247,9 @@ fn main() {
     drop_at(&*loud as *const Loud as *mut Loud);
     out(6);
 }
-"#,
-        "5 6 ",
+"#
     );
+    check_pass_and_stdio(&fixture, "5 6 ", "");
 }
 
 #[test]

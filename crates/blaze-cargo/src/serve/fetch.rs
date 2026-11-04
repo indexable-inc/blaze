@@ -1,7 +1,8 @@
 //! The sources a build's load asks for ([`Fetch`]), fetched and checked as cargo fetches them
-//! (docs/v2/plan/lanes/cargo/notes.md section 3): a `.crate` by its lock file's sha256 and
-//! unpacked in memory with cargo's checks of its paths, a sparse index's file as served, a git
-//! tree at exactly its locked commit. Called on an IO thread of the plane ([`super::work::Steps::fetch`]).
+//! (docs/v2/plan/lanes/cargo/notes.md section 3): a `.crate` got through blaze-fetch with its
+//! lock file's sha256 as the pin (from the store when it has it, else downloaded, checked and
+//! kept there) and unpacked in memory with cargo's checks of its paths, a sparse index's file
+//! as served, a git tree at exactly its locked commit. Called on an IO thread of the plane ([`super::work::Steps::fetch`]).
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +14,7 @@ mod tests;
 use std::{path::PathBuf, sync::Arc};
 
 use blaze_api::ApiError;
+use blaze_fetch::{FetchError, Producer, StoreOf, scrub};
 use blaze_ids::{ContentId, Hasher};
 use blaze_registry::http::{Http, HttpNotSuccessful, HyperHttp, Response, Retry};
 use blaze_units::query::{Fetch, FetchKind};
@@ -34,13 +36,15 @@ pub struct Fetcher<H: Http> {
     /// own under it, removed once the tree is read. Never the user's `$CARGO_HOME`, so no
     /// lock is shared with cargo or another fetch.
     scratch: PathBuf,
+    /// Where a `.crate` is kept and looked up: the daemon's store as of each fetch.
+    store: StoreOf,
 }
 
 impl Fetcher<HyperHttp> {
     /// A fetcher over blaze-registry's HTTP client (`HyperHttp`), with cargo's retries, doing
     /// git's work under `scratch`.
     pub fn new(scratch: PathBuf) -> Result<Fetcher<HyperHttp>, String> {
-        let http = HyperHttp::shared().map_err(|e| redact(&format!("{e:#}")))?;
+        let http = HyperHttp::shared().map_err(|e| scrub(&format!("{e:#}")))?;
         Ok(Fetcher::with_http(http, scratch))
     }
 }
@@ -48,7 +52,12 @@ impl Fetcher<HyperHttp> {
 impl<H: Http + 'static> Fetcher<H> {
     /// The same over any `Http` (tests use a fake).
     pub fn with_http(http: Arc<H>, scratch: PathBuf) -> Fetcher<H> {
-        Fetcher { http, retry: Retry { quiet: true, ..Retry::default() }, scratch }
+        Fetcher { http, retry: Retry { quiet: true, ..Retry::default() }, scratch, store: StoreOf::Installed }
+    }
+
+    /// The same, keeping `.crate` files in `store` in place of the process's (a test's own).
+    pub fn keeping_in(self, store: StoreOf) -> Fetcher<H> {
+        Fetcher { store, ..self }
     }
 
     /// The same, tried again as `retry` says (cargo's `net.retry`); never said on stderr, which
@@ -68,41 +77,48 @@ impl<H: Http + 'static> Fetcher<H> {
         Ok(source)
     }
 
-    /// A `.crate`: downloaded, or read where a `local-registry` keeps it (a `file://` URL, as
-    /// the load names one), checked by the lock file's sha256, unpacked (cargo's
-    /// `RegistrySource::download`, `finish_download` and `unpack_package`, and
-    /// `LocalRegistry::download`).
+    /// A `.crate`: from the store, else downloaded through blaze-fetch, or read where a
+    /// `local-registry` keeps it (a `file://` URL, as the load names one); checked by the lock
+    /// file's sha256 as the pin; unpacked (cargo's `RegistrySource::download`,
+    /// `finish_download` and `unpack_package`, and `LocalRegistry::download`).
     fn package(&self, fetch: &Fetch, sha256: &str) -> Result<Source, ApiError> {
-        let body = match fetch.url.strip_prefix("file://") {
-            Some(path) => std::fs::read(path).map_err(|e| {
-                failed(fetch, &[format!("failed to read `{path}`")], Some(&anyhow::Error::new(e)))
-            })?,
-            None => {
-                let answer = self.get(&fetch.url, &[], &[]).map_err(|e| {
-                    let texts = [
-                        format!("failed to download `{}`", fetch.what),
-                        format!("failed to download from `{}`", fetch.url),
-                    ];
-                    failed(fetch, &texts, Some(&e))
+        let pin = blaze_registry::pinned::crate_pin(sha256).ok_or_else(|| {
+            failed(fetch, &[format!("the lock file's checksum `{sha256}` of `{}` is not a sha256", fetch.what)], None)
+        })?;
+        let refused = |e: FetchError| {
+            let first = match e {
+                FetchError::Mismatch { .. } => format!("failed to verify the checksum of `{}`", fetch.what),
+                _ => format!("failed to download `{}`", fetch.what),
+            };
+            failed(fetch, &[first], Some(&anyhow::Error::new(e)))
+        };
+        let read;
+        let kept;
+        let body: &[u8] = match fetch.url.strip_prefix("file://") {
+            Some(path) => {
+                read = std::fs::read(path).map_err(|e| {
+                    failed(fetch, &[format!("failed to read `{path}`")], Some(&anyhow::Error::new(e)))
                 })?;
-                answer.body
+                blaze_fetch::verify(Producer::Given(path.to_owned()), &pin, &read).map_err(refused)?;
+                &read
+            }
+            None => {
+                // dyn: the I/O driver, as blaze-fetch takes it
+                let http: Arc<dyn Http> = self.http.clone();
+                let net = Arc::new(blaze_registry::pinned::Net::new(http));
+                let fetcher = blaze_fetch::Fetcher::new(self.store, net, self.scratch.join("downloads"))
+                    .with_policy(blaze_registry::pinned::policy(&self.retry));
+                // clone: once a package
+                let source = blaze_fetch::Source::Url { url: fetch.url.clone(), digest: pin };
+                let object = fetcher.get(&source).map_err(refused)?;
+                kept = fetcher.bytes(&object).map_err(refused)?;
+                &kept
             }
         };
-        let actual = blaze_registry::download::checksum(&body);
-        if !actual.eq_ignore_ascii_case(sha256) {
-            return Err(failed(
-                fetch,
-                &[
-                    format!("failed to verify the checksum of `{}`", fetch.what),
-                    format!("the lock file's sha256 is `{sha256}`, the download's `{actual}`"),
-                ],
-                None,
-            ));
-        }
         let prefix = last_part(&fetch.at).ok_or_else(|| {
             failed(fetch, &[format!("`{}` names no package directory", fetch.at)], None)
         })?;
-        let mut files = archive::unpack(&body, prefix).map_err(|cause| {
+        let mut files = archive::unpack(body, prefix).map_err(|cause| {
             failed(fetch, &[format!("failed to unpack package `{}`", fetch.what), cause], None)
         })?;
         let under_lock = format!("{PACKAGE_SOURCE_LOCK}/");
@@ -390,24 +406,5 @@ fn failed(fetch: &Fetch, texts: &[String], error: Option<&anyhow::Error>) -> Api
             what.push_str(text.trim_end());
         }
     }
-    ApiError { what: redact(&what), at: Some(fetch.what.clone()) }
-}
-
-/// `text` with the userinfo of every URL in it (`https://user:token@host/`) taken out, as
-/// cargo's messages never show a credential.
-fn redact(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("://") {
-        let (before, after) = rest.split_at(at + "://".len());
-        out.push_str(before);
-        let ends = |it: char| it.is_whitespace() || "/?#`'\"<>".contains(it);
-        let authority = after.find(ends).unwrap_or(after.len());
-        rest = match after[..authority].rfind('@') {
-            Some(user) => &after[user + 1..],
-            None => after,
-        };
-    }
-    out.push_str(rest);
-    out
+    ApiError { what: scrub(&what), at: Some(fetch.what.clone()) }
 }

@@ -468,8 +468,8 @@ fn classes_in_ld64_order() {
     assert_eq!(
         classes,
         vec![
-            Class::Text,
             Class::Patch,
+            Class::Text,
             Class::Plt,
             Class::Rodata,
             Class::Synthetic(super::UNWIND_INFO),
@@ -491,6 +491,122 @@ fn classes_in_ld64_order() {
     assert_eq!(writer.prot(&Class::InitArray), Prot::R);
     assert_eq!(writer.prot(&Class::Got), Prot::R);
     assert_eq!(writer.prot(&Class::ThreadVars), Prot::RW);
+}
+
+/// A big debug image laid out as the core lays one out, from sizes alone: the writer's order, a
+/// page at each change of protection, the patch room of its code ([`crate::place::patch_room`]).
+/// 1.25 GiB of code and 0.5 GiB of read-only data, so with the room it spans more than 2 GiB.
+/// The room is before the code, so nothing a full link places is across it: `__eh_frame`
+/// reaches back over the code and data alone (under 2 GiB here, where the room between
+/// them made it 3 GiB) and a CIE's personality reaches the GOT over nothing. A patch
+/// function's FDE reaches back more than 2 GiB, which its 8-byte field does and a 4-byte
+/// one doesn't. Past 4 GiB the image is refused, naming the section.
+#[test]
+fn a_big_image_keeps_its_reach_with_patch_room() {
+    use crate::place::{past_window, patch_room, span};
+    use crate::reloc::{Ctx, apply};
+    use crate::unwind::Pointers;
+
+    const GIB: u64 = 1 << 30;
+    let writer = super::writer(&executable(Arch::Aarch64)).unwrap();
+    let plan = writer.plan();
+    let text = 0x5000_0000u64;
+    let lay_out = |rodata: u64| -> Vec<Region> {
+        let sizes = [
+            (Class::Text, text),
+            (Class::Patch, 0),
+            (Class::Plt, 0x1000),
+            (Class::Rodata, rodata),
+            (Class::Synthetic(super::UNWIND_INFO), 0x40_0000),
+            (Class::EhFrame, 0x200_0000),
+            (Class::Got, 0x8000),
+            (Class::Data, 0x10_0000),
+            (Class::Bss, 0x10_0000),
+        ];
+        let mut classes: Vec<Class> = sizes.iter().map(|it| it.0.clone()).collect();
+        writer.order(&mut classes);
+        let (mut addr, mut prot) = (plan.base + plan.headers, Prot::R);
+        let mut regions = Vec::new();
+        for class in classes {
+            let size = sizes.iter().find(|it| it.0 == class).unwrap().1;
+            let this = writer.prot(&class);
+            if this != prot {
+                (addr, prot) = (addr.next_multiple_of(plan.page), this);
+            }
+            let capacity = if class == Class::Patch { patch_room(text, plan.page) } else { size };
+            regions.push(Region { class, addr, capacity, size, prot: this, align: 16 });
+            addr += capacity;
+        }
+        regions
+    };
+
+    let regions = lay_out(GIB / 2);
+    let at = |class: Class| regions.iter().find(|it| it.class == class).unwrap();
+    let (patch, code, eh_frame, got) = (at(Class::Patch), at(Class::Text), at(Class::EhFrame), at(Class::Got));
+    assert_eq!(patch.capacity, GIB, "the room is as large as the code, at most 1 GiB");
+    assert_eq!(patch.addr, plan.base + plan.headers, "the room is first, after the headers");
+    assert!(patch.addr + patch.capacity <= code.addr, "and before the code");
+    assert!(span(regions.iter()) > 2 * GIB);
+    assert!(eh_frame.addr - code.addr < 2 * GIB, "an FDE reaches back over code and data alone");
+    assert!(got.addr - eh_frame.addr < 2 * GIB, "a personality reaches the GOT over nothing");
+    assert!(past_window(regions.iter(), plan.base, super::WINDOW.bytes).is_none());
+    assert_eq!(writer.window(), Some(super::WINDOW));
+
+    // A patch function at the room's start, its FDE at `__eh_frame`'s end.
+    let pointers = Pointers::of(Format::MachO);
+    let function = patch.addr;
+    let field = eh_frame.addr + eh_frame.size - 0x40 + 8;
+    assert!(field - function > 2 * GIB);
+    let ctx = Ctx {
+        arch: Arch::Aarch64,
+        format: Format::MachO,
+        s: function,
+        a: 0,
+        p: field,
+        g: 0,
+        m: 0,
+        base: plan.base,
+        tls: None,
+        tp: None,
+    };
+    let mut bytes = [0u8; 8];
+    apply(pointers.apply(), &ctx, &mut bytes).unwrap();
+    assert_eq!(field.wrapping_add(u64::from_le_bytes(bytes)), function, "the 8-byte field reads back");
+    assert!(apply(Pointers::Sdata4.apply(), &ctx, &mut bytes[..4]).is_err(), "a 4-byte field doesn't reach");
+
+    // 2 GiB of read-only data: `__const` ends past 4 GiB from the base.
+    let big = lay_out(2 * GIB);
+    let (region, end) = past_window(big.iter(), plan.base, super::WINDOW.bytes).expect("past the window");
+    assert_eq!(region.class, Class::Rodata);
+    assert!(end - plan.base > super::WINDOW.bytes);
+    assert_eq!(writer.section_name(&region.class), "__TEXT,__const");
+    assert_eq!(writer.section_name(&Class::EhFrame), "__TEXT,__eh_frame");
+
+    // 5 GiB of zero-fill past the window: no file bytes and no code, a valid image.
+    let mut zero = lay_out(GIB / 2);
+    let bss = zero.iter_mut().find(|it| it.class == Class::Bss).unwrap();
+    (bss.size, bss.capacity) = (5 * GIB, 5 * GIB);
+    assert!(past_window(zero.iter(), plan.base, super::WINDOW.bytes).is_none(), "zero-fill is not counted");
+
+    // An incremental stage's refusal is relinked from scratch; a full link's is final.
+    let refusal = |scratch| crate::LinkError {
+        function: None,
+        what: String::new(),
+        refusal: Some(crate::Refusal::OutOfReach(Box::new(crate::OutOfReach {
+            section: "__TEXT,__eh_frame".into(),
+            what: String::new(),
+            reach: 1 << 31,
+            limit: i32::MAX as u64,
+            rule: "",
+            scratch,
+            from: 0,
+            to: 1 << 31,
+            layout: Vec::new(),
+        }))),
+    };
+    assert!(refusal(true).no_room().is_some());
+    assert!(refusal(false).no_room().is_none());
+    assert!(refusal(false).out_of_reach().is_some());
 }
 
 #[test]

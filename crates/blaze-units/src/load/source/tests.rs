@@ -85,7 +85,7 @@ impl Query for Locate {
         Ok(Cbor(match sources.locate(cx, id, key.checksum.as_deref())? {
             Located::Here { manifest } => Answer::Here(manifest),
             Located::Needs(fetch) => Answer::Needs(fetch),
-            Located::Failed(error) => Answer::Failed(error),
+            Located::Failed(error) | Located::Unfetched(error) => Answer::Failed(error),
         }))
     }
 }

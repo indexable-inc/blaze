@@ -77,6 +77,21 @@ impl Shadow<()> for Pointers {
         self.len = self.len.max(end);
     }
 
+    /// The pieces shifted by `size` for each copy, in order and disjoint as they are: no
+    /// put per element, so a `[0u8; 1 << 20]` costs nothing but its length.
+    fn repeat(&self, size: usize, count: usize) -> Self {
+        let mut pieces = SmallVec::new();
+        if !self.pieces.is_empty() {
+            pieces.reserve(self.pieces.len() * count);
+            for i in 0..count {
+                pieces.extend(self.pieces.iter().map(|&(at, len)| (at + i * size, len)));
+            }
+        }
+        // As `count` puts leave it: the last copy ends at its own length.
+        let len = count.checked_sub(1).map_or(0, |last| last * size + self.len);
+        Self { len, pieces }
+    }
+
     #[inline]
     fn prov_at(&self, at: usize, size: usize) -> Option<()> {
         self.pieces.iter().any(|&(start, len)| start == at && len == size).then_some(())

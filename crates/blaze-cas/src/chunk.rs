@@ -117,9 +117,13 @@ unsafe fn cut_avx512(bytes: &[u8]) -> usize {
     let mut at = MIN;
     while at + 8 <= end {
         let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-        let indices = _mm512_cvtepu8_epi64(_mm_cvtsi64_si128(word as i64));
-        // SAFETY: every index is a byte, so below 256, and `table` has 256 words.
-        let gear = unsafe { _mm512_i64gather_epi64::<8>(indices, table.as_ptr().cast()) };
+        // bootstrap: the pinned stage 0 (v0.20261030.0) and blaze today have no
+        // `llvm.x86.avx512.gather.qpq.512`, so the eight gear words load one by one (lane i is
+        // byte i). Put back `_mm512_i64gather_epi64::<8>` once blaze compiles that intrinsic and
+        // the stage 0 that builds this tree does too.
+        let b = word.to_le_bytes();
+        let g = |i: usize| table[b[i] as usize] as i64;
+        let gear = _mm512_set_epi64(g(7), g(6), g(5), g(4), g(3), g(2), g(1), g(0));
         let mut scan = gear;
         scan = _mm512_add_epi64(scan, _mm512_slli_epi64::<1>(_mm512_alignr_epi64::<7>(scan, zero)));
         scan = _mm512_add_epi64(scan, _mm512_slli_epi64::<2>(_mm512_alignr_epi64::<6>(scan, zero)));

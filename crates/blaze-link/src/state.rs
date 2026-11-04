@@ -17,7 +17,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use blaze_codegen::{InstanceKey, Line};
+use blaze_codegen::{InstanceKey, Line, Made};
 use blaze_hash::HashMap;
 use std::alloc::Global;
 use blaze_ids::{ContentId, radix};
@@ -190,7 +190,14 @@ pub(crate) struct FunctionInfo {
     pub windows: Option<(Sym, Option<Sym>, Option<Sym>)>,
     /// [`State::lines`] of it.
     pub lines: ListRef,
+    /// How it was made ([`crate::Change::made`]), as its index in [`State::makes`]; [`NO_MADE`]
+    /// when the change said nothing of it. What the image's shape sums its code by. An index,
+    /// not the [`Made`] (24 bytes), so the struct stays within its size.
+    pub made: u32,
 }
+
+/// [`FunctionInfo::made`] of a function the change said nothing of.
+pub(crate) const NO_MADE: u32 = u32::MAX;
 
 /// Of each symbol, besides its definition: the pieces referring to it (a list with room to
 /// grow), the first jump-table slot running it, and whether resolution looks at it.
@@ -504,6 +511,10 @@ pub(crate) struct State {
     /// One past the last thunk island index given ([`crate::thunk`]): a full link's segments,
     /// then one per incremental stage whose new code needed a thunk.
     pub islands: u32,
+    /// Each distinct way the image's functions were made, once: what
+    /// [`FunctionInfo::made`] indexes. A few hundred at most (crates by backends); a stage
+    /// adds with `Arc::make_mut` only the new ones.
+    pub makes: Arc<Vec<Made>>,
 
     hot: CowVec<Hot>,
     what: CowVec<What>,
@@ -565,6 +576,7 @@ impl State {
             lineage: [0; 16],
             laid_out: false,
             islands: 0,
+            makes: Arc::default(),
             hot: CowVec::default(),
             what: CowVec::default(),
             sort: CowVec::default(),
@@ -1065,9 +1077,10 @@ impl State {
         fde: Option<Sym>,
         windows: Option<(Sym, Option<Sym>, Option<Sym>)>,
         lines: &[Line],
+        made: u32,
     ) -> FuncId {
         let lines = self.lines.push(lines);
-        self.functions.push(FunctionInfo { key, id, fde, windows, lines }) as FuncId
+        self.functions.push(FunctionInfo { key, id, fde, windows, lines, made }) as FuncId
     }
 
     /// The image's id, its build id in the file: of its lineage and generation.
@@ -1083,6 +1096,11 @@ impl State {
 
     pub fn function(&self, id: FuncId) -> &FunctionInfo {
         self.functions.get(id as usize).expect("a function")
+    }
+
+    /// How `function` was made, when its change said.
+    pub fn made(&self, function: &FunctionInfo) -> Option<Made> {
+        self.makes.get(function.made as usize).copied()
     }
 
     pub fn lines(&self, info: &FunctionInfo) -> &[Line] {

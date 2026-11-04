@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{CODEGEN, FRONT_END, Hook, Identity};
+use crate::{CODEGEN, FRONT_END, Hook, Identity, RECORD};
 
 /// A token of Rust, as far as the hooks need: comments are dropped, and a lifetime or a
 /// character is no token.
@@ -366,7 +366,7 @@ pub(super) fn compiled(root: &Path) -> Vec<PathBuf> {
 
 /// The roots of what the package at `dir` puts in a program: its library, and its binaries when
 /// it is the program itself.
-fn roots(dir: &Path, program: bool) -> Vec<PathBuf> {
+pub(super) fn roots(dir: &Path, program: bool) -> Vec<PathBuf> {
     let text = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
     let manifest: toml::Table = text.parse().unwrap();
     let mut out = Vec::new();
@@ -472,12 +472,12 @@ fn unreviewed(identities: &[&Identity]) -> Vec<String> {
     problems
 }
 
-/// C1 of the review, held on blaze's own tree for the code generator's identity and the front
-/// end's: code past an identity's closure that its closure runs through a hook is a root of it
-/// (so an input) or reviewed.
+/// C1 of the review, held on blaze's own tree for the code generator's identity, the front
+/// end's and the record's: code past an identity's closure (a cut package among it) that its
+/// closure runs through a hook is a root of it (so an input) or reviewed.
 #[test]
 fn every_hook_implemented_past_the_closure_is_reviewed() {
-    let problems = unreviewed(&[&CODEGEN, &FRONT_END]);
+    let problems = unreviewed(&[&CODEGEN, &FRONT_END, &RECORD]);
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 

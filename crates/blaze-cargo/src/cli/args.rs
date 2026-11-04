@@ -349,6 +349,11 @@ pub enum Asked {
     Clean(Vec<OsString>),
     /// `blaze cache`, with the words after it ([`super::cache::main`]).
     Cache(Vec<OsString>),
+    /// `blaze fetch-url '<json>'`, with the words after it ([`super::fetch_url::main`]).
+    FetchUrl(Vec<OsString>),
+    /// `blaze fmt`, with the words after it: blaze's formatter, run in this process
+    /// ([`blaze_fmt::command::main`]).
+    Fmt(Vec<OsString>),
     Help(Option<Command>),
     Version,
     /// A command that is none of blaze's.
@@ -645,6 +650,8 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("perf") => return Ok(Asked::Perf(words.collect())),
             Some("clean") => return Ok(Asked::Clean(words.collect())),
             Some("cache") => return Ok(Asked::Cache(words.collect())),
+            Some("fetch-url") => return Ok(Asked::FetchUrl(words.collect())),
+            Some("fmt") => return Ok(Asked::Fmt(words.collect())),
             Some("daemon") => {
                 return Ok(match words.next().as_deref().and_then(std::ffi::OsStr::to_str) {
                     Some("install") => Asked::Daemon(DaemonVerb::Install),

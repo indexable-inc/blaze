@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use blaze_codegen::{
-    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, RelocKind, Relocs, Static, Target, Unwind,
+    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Made, RelocKind, Relocs, Static, Target, Unwind,
 };
 use blaze_format::cursor::{self, Reader};
 use blaze_graph::par;
@@ -427,7 +427,7 @@ impl<'a> Stage<'a> {
             let (id, name) = (self.symbols.id(&key.0), self.symbols.name(name));
             self.new.set_debug_name(id, name);
         }
-        self.functions(&change.added)?;
+        self.functions(&change.added, change.made)?;
         self.slots(&change.slots)?;
         for it in &change.statics {
             self.add_static(it)?;
@@ -684,9 +684,19 @@ impl<'a> Stage<'a> {
     /// The functions added, made into pieces: their keys built in parallel and interned in
     /// one batch. They are made in key order, never the change's: slots are given out in the
     /// order functions are made, and an image is the same whatever order its functions came in.
-    fn functions(&mut self, added: &[&'a CompiledFunction]) -> Result<(), LinkError> {
+    /// `made` is how each was made, sorted by key ([`Change::made`]).
+    fn functions(&mut self, added: &[&'a CompiledFunction], made: &[(InstanceKey, Made)]) -> Result<(), LinkError> {
         if added.is_empty() {
             return Ok(());
+        }
+        if !made.is_sorted_by(|a, b| a.0 < b.0) {
+            return Err(error(None, "`Change::made` is not sorted by key, each key once: the change is the caller's bug"));
+        }
+        // The index in `State::makes` of each way of making already there; new ones are added.
+        // alloc: once a stage that adds functions, an entry a distinct way of making (a few hundred)
+        let mut makes: HashMap<Made, u32, Global> = HashMap::new_in(Global);
+        for (at, it) in self.new.makes.iter().enumerate() {
+            makes.insert(*it, at as u32);
         }
         let arena = self.arena;
         let mut seen: HashSet<&InstanceKey, Global> = HashSet::new_in(Global);
@@ -747,7 +757,18 @@ impl<'a> Stage<'a> {
         let syms = self.symbols.intern_wide(keys);
         let mut at = 0;
         for (function, count) in todo.iter().zip(counts) {
-            self.add_function(*function, &syms[at..at + count])?;
+            let made = match made.binary_search_by_key(&function.key, |it| it.0) {
+                Ok(found) => {
+                    let it = made[found].1;
+                    *makes.entry(it).or_insert_with(|| {
+                        let makes = Arc::make_mut(&mut self.new.makes);
+                        makes.push(it);
+                        makes.len() as u32 - 1
+                    })
+                }
+                Err(_) => crate::state::NO_MADE,
+            };
+            self.add_function(*function, &syms[at..at + count], made)?;
             at += count;
         }
         self.functions += todo.len() as u64;
@@ -886,7 +907,7 @@ impl<'a> Stage<'a> {
         Err(crate::lazy::no_hook(self.output.format))
     }
 
-    fn add_function(&mut self, function: &'a CompiledFunction, syms: &[Sym]) -> Result<(), LinkError> {
+    fn add_function(&mut self, function: &'a CompiledFunction, syms: &[Sym], made: u32) -> Result<(), LinkError> {
         let key = Some(function.key);
         let body = syms[0];
         let id = self.symbols.id(&function.key.0);
@@ -904,11 +925,15 @@ impl<'a> Stage<'a> {
         match &function.unwind {
             Some(Unwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda }) => {
                 let personality = personality.as_ref().map(|it| self.target_sym(it)).transpose()?;
+                let pointers = unwind::Pointers::of(self.output.format);
+                // The pointer encoding is part of the CIE's bytes: an image kept from a link
+                // that wrote another one has its CIEs under other keys, and its FDEs keep them.
                 let mut hasher = Hasher::new(CIE_DOMAIN);
                 hasher
                     .part(&code_align.to_le_bytes())
                     .part(&data_align.to_le_bytes())
                     .part(&return_address.to_le_bytes())
+                    .part(&[pointers.encoding()])
                     .part(cie);
                 if let Some(personality) = personality {
                     self.scratch.clear();
@@ -924,6 +949,7 @@ impl<'a> Stage<'a> {
                         *return_address,
                         cie,
                         personality.is_some(),
+                        pointers,
                         &mut *self.scratch,
                     )
                     .map_err(|it| error(key, it))?;
@@ -953,6 +979,7 @@ impl<'a> Stage<'a> {
                     fde,
                     personality.is_some(),
                     lsda.is_some(),
+                    pointers,
                     &mut *self.scratch,
                 )
                 .map_err(|it| error(key, it))?;
@@ -962,10 +989,10 @@ impl<'a> Stage<'a> {
                     Field::CiePointer => {
                         Fixup { at: *at, apply: Apply::Delta32, target: sym, addend: *at as i64, minus: Some(cie_sym) }
                     }
-                    Field::Function => Fixup { at: *at, apply: Apply::Rel32, target: body, addend: 0, minus: None },
+                    Field::Function => Fixup { at: *at, apply: pointers.apply(), target: body, addend: 0, minus: None },
                     Field::Lsda => Fixup {
                         at: *at,
-                        apply: Apply::Rel32,
+                        apply: pointers.apply(),
                         target: lsda.expect("an LSDA field"),
                         addend: 0,
                         minus: None,
@@ -1005,7 +1032,7 @@ impl<'a> Stage<'a> {
             None => {}
         }
         self.add_coverage(function, id, body)?;
-        let info = self.new.add_function(function.key, id, fde_sym, windows, &function.lines);
+        let info = self.new.add_function(function.key, id, fde_sym, windows, &function.lines, made);
         let (class, rank) = self.own(Class::Text);
         let mut piece = Self::piece_in(
             body,
