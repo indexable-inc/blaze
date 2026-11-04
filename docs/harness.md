@@ -532,6 +532,29 @@ with `uv run --frozen`, and the gate runs ruff and pyright over the ones the wor
 (today `.github/scripts/downstream.py`, `harness/focused.py` and `python/`); an older script
 moves in when it is next changed. `harness/imports.py` runs in the workspace's Python too.
 
+### ix runners
+
+The repository variable `BLAZE_IX_RUNNERS` moves the slow Linux jobs to ix's GitHub Actions
+runners ([ix.dev/docs/runners](https://ix.dev/docs/runners)). Set to `true`, the gate's build and
+unit tests run on Linux AArch64 (`linux arm64 / build`, `linux arm64 / tests`) in place of Linux
+x86-64, and main's `linux arm64` jobs and `lint-baselines` move with them, each on
+`[self-hosted, ix, arm64, ix-cpu-64, blaze-<job>]`: 64 vCPUs, and memory that grows on demand up
+to 256 GiB, where a hosted runner has 4 vCPUs and 16 GB. A cold build of blaze needs about 28 GB
+and on a hosted runner swapped for over an hour; the run of #1654 was shut down in it.
+
+Every ix runner is a fork of the snapshot of the last green job on main with the same labels, its
+disk included: the checkout, `target/`, the toolchain, the pinned LLVM and blaze's store, which
+`.github/actions/blaze` keeps under `$HOME/.cache/blaze-ci/store` there (ix's scrub deletes
+`_work/_temp` before a snapshot) and bounds at 200G. The pull from the remote then fetches only
+what main pushed since. A pull request's fork never becomes a snapshot. No swap is made on ix:
+its scrub refuses to snapshot a machine with swap on.
+
+ix serves AArch64 alone today, so with the variable on, Linux x86-64's build and unit tests run
+only on main's push (and the train), on hosted runners, and `workspace-check` stays on hosted
+runners on both platforms. Unset, every job runs on hosted runners: a job whose labels no runner
+serves waits a day for one, so the variable goes on only once the ix-runners GitHub App serves
+this repository and its ix account can pay.
+
 ### Named harnesses, and the projects downstream
 
 Two workflows run part of what the train does, by hand, for a change that wants an answer
