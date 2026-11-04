@@ -8,7 +8,8 @@ use std::{
 };
 
 use crate::{
-    Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, Io, Kind, Request, RequestId, Step, client::redirect_to,
+    Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, Io, Kind, Request, RequestId, Step,
+    client::redirect_to,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,15 +99,25 @@ fn a_chunked_body_is_read_whole_however_it_is_cut() {
             received(&mut client, conn, piece);
         }
         let got = answer(&events(&mut client));
-        assert_eq!(got, (200, b"Wikipedia in \r\n\r\nchunks.".to_vec(), true), "cut every {cut} bytes");
+        assert_eq!(
+            got,
+            (200, b"Wikipedia in \r\n\r\nchunks.".to_vec(), true),
+            "cut every {cut} bytes"
+        );
     }
 
     let mut client = client();
     let (conn, _) = open(&mut client, 1, Request::get("http://example.test/a"));
-    received(&mut client, conn, b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nab\r\n");
+    received(
+        &mut client,
+        conn,
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nab\r\n",
+    );
     let got = events(&mut client);
     let error = failed(&got);
-    let Kind::Io { step: Step::Body, host, port: 80, why } = &error.kind else { panic!("{error:?}") };
+    let Kind::Io { step: Step::Body, host, port: 80, why } = &error.kind else {
+        panic!("{error:?}")
+    };
     assert_eq!(host, "example.test");
     assert!(why.contains("not hex"), "{why}");
     assert!(ios(&mut client).contains(&Io::Close { conn }));
@@ -142,7 +153,9 @@ fn a_kept_alive_connection_is_reused_until_it_idles_out() {
     client.request(RequestId(3), Request::get("http://other.test:8080/")).unwrap();
     let asked = ios(&mut client);
     assert!(
-        asked.iter().any(|it| matches!(it, Io::Connect { host, port: 8080, .. } if host == "other.test")),
+        asked
+            .iter()
+            .any(|it| matches!(it, Io::Connect { host, port: 8080, .. } if host == "other.test")),
         "{asked:?}"
     );
     client.cancel(RequestId(3));
@@ -170,12 +183,18 @@ fn a_request_its_pooled_connection_closed_under_is_asked_again() {
     received(&mut client, first, b"");
     let asked = ios(&mut client);
     assert!(asked.contains(&Io::Close { conn: first }), "{asked:?}");
-    let Some(Io::Connect { conn: second, .. }) = asked.iter().find(|it| matches!(it, Io::Connect { .. })).cloned() else {
+    let Some(Io::Connect { conn: second, .. }) =
+        asked.iter().find(|it| matches!(it, Io::Connect { .. })).cloned()
+    else {
         panic!("{asked:?}")
     };
     client.complete(Completion::Connected { conn: second });
     assert!(sent(&mut client, second).starts_with(b"GET /b HTTP/1.1\r\n"));
-    received(&mut client, second, b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1\r\n\r\nk");
+    received(
+        &mut client,
+        second,
+        b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1\r\n\r\nk",
+    );
     assert_eq!(answer(&events(&mut client)), (200, b"k".to_vec(), true));
     assert!(ios(&mut client).contains(&Io::Close { conn: second }));
 }
@@ -189,7 +208,8 @@ fn a_redirect_is_followed_and_its_connection_kept() {
     received(&mut client, one, b"HTTP/1.1 302 Found\r\nLocation: http://two.test/b?sig=1\r\nContent-Length: 5\r\n\r\nmoved");
     assert_eq!(events(&mut client), []);
     let asked = ios(&mut client);
-    let Some(Io::Connect { conn: two, host, port: 80 }) = asked.iter().find(|it| matches!(it, Io::Connect { .. })).cloned()
+    let Some(Io::Connect { conn: two, host, port: 80 }) =
+        asked.iter().find(|it| matches!(it, Io::Connect { .. })).cloned()
     else {
         panic!("{asked:?}")
     };
@@ -204,7 +224,10 @@ fn a_redirect_is_followed_and_its_connection_kept() {
 
     client.request(RequestId(2), Request::get("http://one.test/c")).unwrap();
     let asked = ios(&mut client);
-    assert!(asked.iter().any(|it| matches!(it, Io::Send { conn, .. } if *conn == one)), "{asked:?}");
+    assert!(
+        asked.iter().any(|it| matches!(it, Io::Send { conn, .. } if *conn == one)),
+        "{asked:?}"
+    );
     assert!(!asked.iter().any(|it| matches!(it, Io::Connect { .. })), "{asked:?}");
 }
 
@@ -212,13 +235,17 @@ fn a_redirect_is_followed_and_its_connection_kept() {
 #[test]
 fn a_request_past_its_redirects_fails() {
     let tls = crate::roots::with_roots(rustls::RootCertStore::empty()).unwrap();
-    let mut client = Client::new(Config { redirects: 1, ..Config::new(tls, "blaze-test", TIMEOUT) });
+    let mut client =
+        Client::new(Config { redirects: 1, ..Config::new(tls, "blaze-test", TIMEOUT) });
     let (one, _) = open(&mut client, 1, Request::get("http://one.test/a"));
     received(&mut client, one, b"HTTP/1.1 301 Moved\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n");
     sent(&mut client, one);
     received(&mut client, one, b"HTTP/1.1 301 Moved\r\nLocation: /c\r\nContent-Length: 0\r\n\r\n");
     let got = events(&mut client);
-    assert_eq!(*failed(&got), Error { url: "http://one.test/b".to_owned(), kind: Kind::Redirects { most: 1 } });
+    assert_eq!(
+        *failed(&got),
+        Error { url: "http://one.test/b".to_owned(), kind: Kind::Redirects { most: 1 } }
+    );
 }
 
 /// With HTTPS only a redirect may move within HTTPS but never off it, to an absolute or a
@@ -226,11 +253,20 @@ fn a_request_past_its_redirects_fails() {
 #[test]
 fn an_https_only_redirect_to_plain_http_is_refused() {
     let from = url::Url::parse("https://github.com/o/r/releases/download/v1/a.tar.gz").unwrap();
-    let to = |location: &str, https_only: bool| redirect_to(&from, location, https_only).map(String::from);
-    assert_eq!(to("https://objects.example/a?sig=1", true), Ok("https://objects.example/a?sig=1".to_owned()));
+    let to = |location: &str, https_only: bool| {
+        redirect_to(&from, location, https_only).map(String::from)
+    };
+    assert_eq!(
+        to("https://objects.example/a?sig=1", true),
+        Ok("https://objects.example/a?sig=1".to_owned())
+    );
     assert_eq!(to("/b", true), Ok("https://github.com/b".to_owned()));
     for location in ["http://objects.example/a", "HTTP://objects.example/a"] {
-        assert_eq!(to(location, true), Err(Kind::Downgraded { to: "http://objects.example/a".to_owned() }), "{location}");
+        assert_eq!(
+            to(location, true),
+            Err(Kind::Downgraded { to: "http://objects.example/a".to_owned() }),
+            "{location}"
+        );
     }
     assert_eq!(to("http://objects.example/a", false), Ok("http://objects.example/a".to_owned()));
 }
@@ -257,7 +293,10 @@ fn a_request_with_no_answer_fails_at_its_deadline() {
     received(&mut client, conn, b"de");
     client.advance_clock(at + TIMEOUT);
     let got = events(&mut client);
-    assert!(matches!(&failed(&got).kind, Kind::Stalled { after, .. } if *after == TIMEOUT), "{got:?}");
+    assert!(
+        matches!(&failed(&got).kind, Kind::Stalled { after, .. } if *after == TIMEOUT),
+        "{got:?}"
+    );
     let bodies: Vec<u8> = got
         .iter()
         .filter_map(|it| match it {
@@ -281,10 +320,17 @@ fn a_malformed_answer_fails_naming_the_host_and_step() {
     let error = failed(&got);
     assert!(matches!(&error.kind, Kind::Io { step: Step::Head, .. }), "{error:?}");
     let said = error.to_string();
-    assert!(said.starts_with("reading the answer's head from example.test:80: not an HTTP/1 answer"), "{said}");
+    assert!(
+        said.starts_with("reading the answer's head from example.test:80: not an HTTP/1 answer"),
+        "{said}"
+    );
     assert!(!said.contains("/a"), "the message names no path: {said}");
     let asked = ios(&mut client);
-    assert!(asked.contains(&Io::Close { conn }) && !asked.iter().any(|it| matches!(it, Io::Connect { .. })), "{asked:?}");
+    assert!(
+        asked.contains(&Io::Close { conn })
+            && !asked.iter().any(|it| matches!(it, Io::Connect { .. })),
+        "{asked:?}"
+    );
 }
 
 /// A gzip body is decoded when gzip was asked for, held to the bound once decoded, and comes
@@ -296,7 +342,10 @@ fn gzip_is_decoded_where_asked_and_bodies_are_held_to_their_bound() {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     encoder.write_all(&plain).unwrap();
     let zipped = encoder.finish().unwrap();
-    let head = format!("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n", zipped.len());
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+        zipped.len()
+    );
     let answered = [head.as_bytes(), &zipped[..]].concat();
 
     let mut client = client();
@@ -321,7 +370,8 @@ fn gzip_is_decoded_where_asked_and_bodies_are_held_to_their_bound() {
     assert_eq!(failed(&got).kind, Kind::TooBig { most: 100, said: None, decoded: true });
 
     let mut client = self::client();
-    let (conn, _) = open(&mut client, 1, Request { most: 3, ..Request::get("http://example.test/a") });
+    let (conn, _) =
+        open(&mut client, 1, Request { most: 3, ..Request::get("http://example.test/a") });
     received(&mut client, conn, b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n");
     let got = events(&mut client);
     assert_eq!(failed(&got).kind, Kind::TooBig { most: 3, said: Some(4), decoded: false });
@@ -354,22 +404,31 @@ fn a_slow_asker_holds_the_transfer_back() {
 /// holding a self-signed certificate for `localhost` that the client trusts as its one root.
 fn tls_exchange(url: &str) -> (Vec<Event>, Vec<u8>) {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap().self_signed(&key).unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
     let der = cert.der().clone();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(der.clone()).unwrap();
-    let mut client = Client::new(Config::new(crate::roots::with_roots(roots).unwrap(), "blaze-test", TIMEOUT));
+    let mut client =
+        Client::new(Config::new(crate::roots::with_roots(roots).unwrap(), "blaze-test", TIMEOUT));
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(vec![der], rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()))
+        .with_single_cert(
+            vec![der],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        )
         .unwrap();
     let mut server = rustls::ServerConnection::new(Arc::new(config)).unwrap();
 
     client.request(RequestId(1), Request::get(url)).unwrap();
-    let Some(Io::Connect { conn, port: 443, .. }) = client.next_io() else { panic!("no connect to port 443") };
+    let Some(Io::Connect { conn, port: 443, .. }) = client.next_io() else {
+        panic!("no connect to port 443")
+    };
     client.complete(Completion::Connected { conn });
     let mut asked = Vec::new();
     let mut answered = false;
@@ -396,7 +455,10 @@ fn tls_exchange(url: &str) -> (Vec<Event>, Vec<u8>) {
             Err(e) => panic!("{e}"),
         }
         if !answered && asked.windows(4).any(|it| it == b"\r\n\r\n") {
-            server.writer().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecret").unwrap();
+            server
+                .writer()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecret")
+                .unwrap();
             answered = true;
         }
         let mut out = Vec::new();
@@ -420,12 +482,18 @@ fn tls_exchange(url: &str) -> (Vec<Event>, Vec<u8>) {
 #[test]
 fn tls_is_spoken_through_rustls_sans_io() {
     let (got, asked) = tls_exchange("https://localhost/secret");
-    assert!(asked.starts_with(b"GET /secret HTTP/1.1\r\nhost: localhost\r\n"), "{}", String::from_utf8_lossy(&asked));
+    assert!(
+        asked.starts_with(b"GET /secret HTTP/1.1\r\nhost: localhost\r\n"),
+        "{}",
+        String::from_utf8_lossy(&asked)
+    );
     assert_eq!(answer(&got), (200, b"secret".to_vec(), true));
 
     let (got, _) = tls_exchange("https://other.test/secret");
     let error = failed(&got);
-    let Kind::Io { step: Step::Tls, host, port: 443, why } = &error.kind else { panic!("{error:?}") };
+    let Kind::Io { step: Step::Tls, host, port: 443, why } = &error.kind else {
+        panic!("{error:?}")
+    };
     assert_eq!(host, "other.test");
     assert!(why.contains("certificate"), "{why}");
 }

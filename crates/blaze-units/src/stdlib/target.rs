@@ -777,7 +777,9 @@ impl CfgArgs {
                 }
                 _ if !flag.starts_with('-') => {}
                 other => {
-                    return Err(format!("blaze does not know which cfgs rustc's `{other}` decides"));
+                    return Err(format!(
+                        "blaze does not know which cfgs rustc's `{other}` decides"
+                    ));
                 }
             }
         }

@@ -21,9 +21,13 @@ pub(crate) enum Session {
 impl Session {
     /// TLS with the server `name`, as `config` says (its roots, its versions, no ALPN). Its
     /// handshake starts as the connection's first bytes are sent.
-    pub(crate) fn tls(config: &Arc<ClientConfig>, name: ServerName<'static>) -> Result<Session, String> {
+    pub(crate) fn tls(
+        config: &Arc<ClientConfig>,
+        name: ServerName<'static>,
+    ) -> Result<Session, String> {
         // alloc: an error's message, made only when it fails.
-        let mut conn = ClientConnection::new(Arc::clone(config), name).map_err(|e| e.to_string())?;
+        let mut conn =
+            ClientConnection::new(Arc::clone(config), name).map_err(|e| e.to_string())?;
         // Plaintext given before the handshake ends waits in rustls; the client bounds what it
         // gives (one request's head and body), so rustls need not.
         conn.set_buffer_limit(None);

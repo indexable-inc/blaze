@@ -79,7 +79,11 @@ pub struct Config {
 
 impl Config {
     /// `tls`, `user_agent` and `timeout`, with [`REDIRECTS`], [`IDLE_FOR`] and [`IDLE_MOST`].
-    pub fn new(tls: Arc<rustls::ClientConfig>, user_agent: impl Into<String>, timeout: Duration) -> Config {
+    pub fn new(
+        tls: Arc<rustls::ClientConfig>,
+        user_agent: impl Into<String>,
+        timeout: Duration,
+    ) -> Config {
         Config {
             tls,
             user_agent: user_agent.into(),
@@ -146,14 +150,27 @@ pub enum Io {
 /// How an [`Io`] went.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Completion {
-    Connected { conn: ConnId },
+    Connected {
+        conn: ConnId,
+    },
     /// `why` as the system said it.
-    ConnectFailed { conn: ConnId, why: String },
-    Sent { conn: ConnId },
+    ConnectFailed {
+        conn: ConnId,
+        why: String,
+    },
+    Sent {
+        conn: ConnId,
+    },
     /// Empty when the peer closed the connection.
-    Received { conn: ConnId, bytes: Vec<u8> },
+    Received {
+        conn: ConnId,
+        bytes: Vec<u8>,
+    },
     /// A send or receive on `conn` failed: `why` as the system said it.
-    Broken { conn: ConnId, why: String },
+    Broken {
+        conn: ConnId,
+        why: String,
+    },
 }
 
 /// What the client tells a request's asker.
@@ -161,11 +178,24 @@ pub enum Completion {
 pub enum Event {
     /// The final answer's head: `url` is the address that answered, after redirects; header
     /// names are in lower case.
-    Head { request: RequestId, url: String, status: u16, headers: Vec<(String, String)> },
+    Head {
+        request: RequestId,
+        url: String,
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
     /// The body's next piece, decoded. The asker says it took it with [`Client::consumed`].
-    Body { request: RequestId, bytes: Vec<u8> },
-    Done { request: RequestId },
-    Failed { request: RequestId, error: Error },
+    Body {
+        request: RequestId,
+        bytes: Vec<u8>,
+    },
+    Done {
+        request: RequestId,
+    },
+    Failed {
+        request: RequestId,
+        error: Error,
+    },
 }
 
 impl Event {
@@ -275,20 +305,33 @@ impl fmt::Display for Kind {
         match self {
             Kind::Url(why) => write!(f, "no address this client asks: {why}"),
             Kind::Header(why) => write!(f, "a header the client can't send: {why}"),
-            Kind::NotHttps => f.write_str("not an https:// address, and this is fetched over HTTPS only"),
-            Kind::Downgraded { .. } => f.write_str("it redirects off https://, and this is fetched over HTTPS only"),
+            Kind::NotHttps => {
+                f.write_str("not an https:// address, and this is fetched over HTTPS only")
+            }
+            Kind::Downgraded { .. } => {
+                f.write_str("it redirects off https://, and this is fetched over HTTPS only")
+            }
             Kind::Redirects { most } => write!(f, "more than {most} redirects"),
-            Kind::RedirectsNowhere { status } => write!(f, "it redirects ({status}) nowhere: its answer has no Location"),
+            Kind::RedirectsNowhere { status } => {
+                write!(f, "it redirects ({status}) nowhere: its answer has no Location")
+            }
             Kind::TooBig { most, said: Some(said), .. } => {
-                write!(f, "its body is {said} bytes as its Content-Length says, more than the {most} it may be")
+                write!(
+                    f,
+                    "its body is {said} bytes as its Content-Length says, more than the {most} it may be"
+                )
             }
             Kind::TooBig { most, said: None, decoded } => write!(
                 f,
                 "its body is more than the {most} bytes it may be{}, and reading it stopped there",
                 if *decoded { " once its gzip is decoded" } else { "" }
             ),
-            Kind::NoAnswer { after, host, port } => write!(f, "no answer from {host}:{port} in {after:?}"),
-            Kind::Stalled { after, host, port } => write!(f, "the transfer from {host}:{port} stalled for {after:?}"),
+            Kind::NoAnswer { after, host, port } => {
+                write!(f, "no answer from {host}:{port} in {after:?}")
+            }
+            Kind::Stalled { after, host, port } => {
+                write!(f, "the transfer from {host}:{port} stalled for {after:?}")
+            }
             Kind::Io { step, host, port, why } => write!(f, "{step} {host}:{port}: {why}"),
             Kind::Gzip(why) => write!(f, "its body is not the gzip its head says: {why}"),
             Kind::InUse => f.write_str("its request id is another request's, still in flight"),
@@ -499,17 +542,25 @@ impl Client {
             Err(e) => {
                 // alloc: an error's message, made only when it fails.
                 let kind = Kind::Url(format!("it does not parse as a URL: {e}"));
-                self.events.push_back(Event::Failed { request: id, error: Error { url: request.url, kind } });
+                self.events.push_back(Event::Failed {
+                    request: id,
+                    error: Error { url: request.url, kind },
+                });
                 return Ok(());
             }
         };
         let refused = if request.https_only && url.scheme() != "https" {
             Some(Kind::NotHttps)
         } else {
-            request.headers.iter().find_map(|(name, value)| h1::refuse_header(name, value)).map(Kind::Header)
+            request
+                .headers
+                .iter()
+                .find_map(|(name, value)| h1::refuse_header(name, value))
+                .map(Kind::Header)
         };
         if let Some(kind) = refused {
-            self.events.push_back(Event::Failed { request: id, error: Error { url: request.url, kind } });
+            self.events
+                .push_back(Event::Failed { request: id, error: Error { url: request.url, kind } });
             return Ok(());
         }
         let exchange = Exchange {
@@ -620,7 +671,10 @@ impl Client {
                         Ok(name) => name,
                         Err(e) => {
                             // alloc: an error's message, made only when it fails.
-                            let why = format!("`{}` is no name a TLS certificate can be checked against: {e}", origin.host);
+                            let why = format!(
+                                "`{}` is no name a TLS certificate can be checked against: {e}",
+                                origin.host
+                            );
                             return self.fail(id, Kind::Url(why));
                         }
                     };
@@ -637,7 +691,11 @@ impl Client {
                 let conn = ConnId(self.next_conn);
                 self.next_conn += 1;
                 // alloc: one per connection, the host the driver resolves.
-                self.io.push_back(Io::Connect { conn, host: origin.host.clone(), port: origin.port });
+                self.io.push_back(Io::Connect {
+                    conn,
+                    host: origin.host.clone(),
+                    port: origin.port,
+                });
                 // alloc: one per connection, its origin.
                 self.conns.insert(conn, Conn::new(origin.clone(), session));
                 conn
@@ -683,7 +741,9 @@ impl Client {
         }
         let wants = match &conn.work {
             Work::Idle | Work::Head { .. } | Work::Draining { .. } => true,
-            Work::Body { request, .. } => self.exchanges.get(request).is_some_and(|it| it.unconsumed < WINDOW),
+            Work::Body { request, .. } => {
+                self.exchanges.get(request).is_some_and(|it| it.unconsumed < WINDOW)
+            }
         };
         if wants && !conn.receiving && !conn.eof {
             conn.receiving = true;
@@ -749,7 +809,10 @@ impl Client {
                 }
                 Work::Head { request } => {
                     let request = *request;
-                    let head_request = self.exchanges.get(&request).is_some_and(|it| it.request.method == http::Method::HEAD);
+                    let head_request = self
+                        .exchanges
+                        .get(&request)
+                        .is_some_and(|it| it.request.method == http::Method::HEAD);
                     let head = match h1::parse_head(&conn.plain, head_request) {
                         Ok(Some(head)) => head,
                         Ok(None) => {
@@ -779,7 +842,9 @@ impl Client {
                 Work::Body { request, body, reusable } => {
                     let request = *request;
                     let reusable = *reusable;
-                    let Some(exchange) = self.exchanges.get_mut(&request) else { return self.close(id) };
+                    let Some(exchange) = self.exchanges.get_mut(&request) else {
+                        return self.close(id);
+                    };
                     if exchange.unconsumed >= WINDOW {
                         exchange.deadline = None;
                         return;
@@ -822,7 +887,9 @@ impl Client {
         let redirects = self.config.redirects;
         let Some(exchange) = self.exchanges.get_mut(&request) else { return self.close(conn) };
         if (300..400).contains(&status) && status != 304 {
-            let Some(location) = location else { return self.fail(request, Kind::RedirectsNowhere { status }) };
+            let Some(location) = location else {
+                return self.fail(request, Kind::RedirectsNowhere { status });
+            };
             let next = match redirect_to(&exchange.url, &location, exchange.request.https_only) {
                 Ok(next) => next,
                 Err(kind) => return self.fail(request, kind),
@@ -947,7 +1014,12 @@ impl Client {
 
 /// `data`, the body's next bytes as sent, to the asker of `request`: decoded if it is gzip,
 /// held to the request's bound.
-fn deliver(exchange: &mut Exchange, data: Vec<u8>, events: &mut VecDeque<Event>, request: RequestId) -> Result<(), Kind> {
+fn deliver(
+    exchange: &mut Exchange,
+    data: Vec<u8>,
+    events: &mut VecDeque<Event>,
+    request: RequestId,
+) -> Result<(), Kind> {
     if data.is_empty() {
         return Ok(());
     }
@@ -965,7 +1037,12 @@ fn deliver(exchange: &mut Exchange, data: Vec<u8>, events: &mut VecDeque<Event>,
 
 /// `bytes`, decoded, to the asker of `request` as an [`Event::Body`]; a gzip body's decoded
 /// bytes held to the bound. A full window stops the stall's clock until the asker takes some.
-fn give(exchange: &mut Exchange, bytes: Vec<u8>, events: &mut VecDeque<Event>, request: RequestId) -> Result<(), Kind> {
+fn give(
+    exchange: &mut Exchange,
+    bytes: Vec<u8>,
+    events: &mut VecDeque<Event>,
+    request: RequestId,
+) -> Result<(), Kind> {
     if bytes.is_empty() {
         return Ok(());
     }
@@ -986,9 +1063,15 @@ fn give(exchange: &mut Exchange, bytes: Vec<u8>, events: &mut VecDeque<Event>, r
 
 /// Where `from` redirecting to `location` (its `Location`, maybe relative) leads; with
 /// `https_only`, a redirect off HTTPS is [`Kind::Downgraded`].
-pub(crate) fn redirect_to(from: &url::Url, location: &str, https_only: bool) -> Result<url::Url, Kind> {
+pub(crate) fn redirect_to(
+    from: &url::Url,
+    location: &str,
+    https_only: bool,
+) -> Result<url::Url, Kind> {
     // alloc: an error's message, made only when it fails.
-    let next = from.join(location).map_err(|e| Kind::Url(format!("its redirect leads to no address: {e}")))?;
+    let next = from
+        .join(location)
+        .map_err(|e| Kind::Url(format!("its redirect leads to no address: {e}")))?;
     if https_only && next.scheme() != "https" {
         return Err(Kind::Downgraded { to: next.into() });
     }
@@ -1002,7 +1085,11 @@ fn origin_of(url: &url::Url) -> Result<Origin, Kind> {
         "https" => true,
         "http" => false,
         // alloc: an error's message, made only when it fails.
-        other => return Err(Kind::Url(format!("its scheme `{other}` is neither http nor https, the only ones this client speaks"))),
+        other => {
+            return Err(Kind::Url(format!(
+                "its scheme `{other}` is neither http nor https, the only ones this client speaks"
+            )));
+        }
     };
     // alloc: one per exchange, the host its connection goes to.
     let host = match url.host() {

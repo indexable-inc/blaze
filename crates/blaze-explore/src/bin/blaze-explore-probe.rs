@@ -52,24 +52,35 @@ fn input() -> Result<Input, String> {
     let mut args = std::env::args().skip(1);
     let text = match (args.next(), args.next()) {
         (None, _) => "{}".to_owned(),
-        (Some(_), Some(extra)) => return Err(format!("it takes one JSON value, and `{extra}` is a second")),
+        (Some(_), Some(extra)) => {
+            return Err(format!("it takes one JSON value, and `{extra}` is a second"));
+        }
         (Some(arg), None) if arg == "-" => {
             let mut text = String::new();
             std::io::stdin().read_to_string(&mut text).map_err(|why| format!("stdin: {why}"))?;
             text
         }
         (Some(arg), None) if arg.trim_start().starts_with('{') => arg,
-        (Some(path), None) => std::fs::read_to_string(&path).map_err(|why| format!("{path}: {why}"))?,
+        (Some(path), None) => {
+            std::fs::read_to_string(&path).map_err(|why| format!("{path}: {why}"))?
+        }
     };
-    serde_json::from_str(&text).map_err(|why| format!("the input `{text}` is not {{\"page\", \"port\"}}: {why}"))
+    serde_json::from_str(&text)
+        .map_err(|why| format!("the input `{text}` is not {{\"page\", \"port\"}}: {why}"))
 }
 
 fn run() -> Result<(), String> {
     let input = input()?;
     if !input.page.starts_with("https://") {
-        return Err(format!("the page `{}` is not https: a browser opens WebTransport only from a secure page", input.page));
+        return Err(format!(
+            "the page `{}` is not https: a browser opens WebTransport only from a secure page",
+            input.page
+        ));
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|why| format!("the wall clock: {why}"))?.as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|why| format!("the wall clock: {why}"))?
+        .as_secs();
     let cert = Cert::make(Validity::starting(now)).map_err(|why| why.to_string())?;
     let identity = cert.identity().map_err(|why| why.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -82,12 +93,22 @@ fn run() -> Result<(), String> {
 async fn serve(input: &Input, identity: Identity, cert: &Cert) -> Result<(), String> {
     let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, input.port)))
         .map_err(|why| format!("listening on 127.0.0.1:{}: {why}", input.port))?;
-    let config = ServerConfig { identity, transport: Transport { idle: Duration::from_secs(30), keep_alive: Some(Duration::from_secs(5)) } };
-    let (driver, mut incoming) = Driver::spawn(&tokio::runtime::Handle::current(), socket, Some(config), None)
-        .map_err(|why| why.to_string())?;
+    let config = ServerConfig {
+        identity,
+        transport: Transport {
+            idle: Duration::from_secs(30),
+            keep_alive: Some(Duration::from_secs(5)),
+        },
+    };
+    let (driver, mut incoming) =
+        Driver::spawn(&tokio::runtime::Handle::current(), socket, Some(config), None)
+            .map_err(|why| why.to_string())?;
     let port = driver.local_addr().port();
     println!("{}#127.0.0.1:{port}/{}", input.page, cert.hash);
-    println!("certificate valid until {} (Unix seconds); Ctrl-C stops the probe", cert.validity.not_after_s);
+    println!(
+        "certificate valid until {} (Unix seconds); Ctrl-C stops the probe",
+        cert.validity.not_after_s
+    );
     while let Some(request) = incoming.recv().await {
         tokio::spawn(echo(request));
     }

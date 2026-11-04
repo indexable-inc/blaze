@@ -116,7 +116,9 @@ pub(crate) fn next(bytes: &[u8]) -> Result<Option<Frame<'_>>, FrameError> {
         return Err(FrameError {
             code: code::H3_EXCESSIVE_LOAD,
             // alloc: an error's message, made only when it fails.
-            why: format!("a frame of type {ty:#x} is {len} bytes, past the {MOST_FRAME} this endpoint reads"),
+            why: format!(
+                "a frame of type {ty:#x} is {len} bytes, past the {MOST_FRAME} this endpoint reads"
+            ),
         });
     }
     let start = a + b;
@@ -165,7 +167,9 @@ impl Settings {
             return Err("SETTINGS_H3_DATAGRAM is not 1");
         }
         if !self.enable_webtransport && self.webtransport_max_sessions == 0 {
-            return Err("neither SETTINGS_ENABLE_WEBTRANSPORT nor SETTINGS_WEBTRANSPORT_MAX_SESSIONS is set");
+            return Err(
+                "neither SETTINGS_ENABLE_WEBTRANSPORT nor SETTINGS_WEBTRANSPORT_MAX_SESSIONS is set",
+            );
         }
         Ok(())
     }
@@ -279,7 +283,10 @@ mod tests {
         // A GREASE id (0x21 + 0x1f) is ignored.
         assert_eq!(parse_settings(&[0x40, 0x40, 0x05]).unwrap(), Settings::default());
         assert_eq!(parse_settings(&[0x02, 0x00]).unwrap_err().code, code::H3_SETTINGS_ERROR);
-        assert_eq!(parse_settings(&[0x33, 0x01, 0x33, 0x01]).unwrap_err().code, code::H3_SETTINGS_ERROR);
+        assert_eq!(
+            parse_settings(&[0x33, 0x01, 0x33, 0x01]).unwrap_err().code,
+            code::H3_SETTINGS_ERROR
+        );
         assert_eq!(parse_settings(&[0x33]).unwrap_err().code, code::H3_FRAME_ERROR);
     }
 
@@ -297,7 +304,11 @@ mod tests {
         put_close(&mut long, 0, &"é".repeat(600));
         let frame = next(&long).unwrap().unwrap();
         let (_, payload, _) = next_capsule(frame.payload).unwrap();
-        assert_eq!(payload.len(), 4 + 1024, "the reason is cut to 1024 bytes at a character boundary");
+        assert_eq!(
+            payload.len(),
+            4 + 1024,
+            "the reason is cut to 1024 bytes at a character boundary"
+        );
     }
 
     #[test]

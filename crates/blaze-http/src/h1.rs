@@ -68,7 +68,9 @@ pub fn refuse_header(name: &str, value: &str) -> Option<String> {
     for owned in ["content-length", "transfer-encoding", "connection"] {
         if name.eq_ignore_ascii_case(owned) {
             // alloc: an error's message, made only when it fails.
-            return Some(format!("`{name}` is the client's to say: it frames the body and keeps the connection itself"));
+            return Some(format!(
+                "`{name}` is the client's to say: it frames the body and keeps the connection itself"
+            ));
         }
     }
     None
@@ -146,7 +148,8 @@ pub fn parse_head(buffer: &[u8], head_request: bool) -> Result<Option<Head>, Str
                     return Err(format!("a Content-Length of {said:?}"));
                 }
                 // alloc: an error's message, made only when it fails.
-                let said: u64 = said.parse().map_err(|_| format!("a Content-Length of {said}, past 2^64"))?;
+                let said: u64 =
+                    said.parse().map_err(|_| format!("a Content-Length of {said}, past 2^64"))?;
                 match length {
                     Some(was) if was != said => {
                         // alloc: an error's message, made only when it fails.
@@ -158,7 +161,10 @@ pub fn parse_head(buffer: &[u8], head_request: bool) -> Result<Option<Head>, Str
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             encoded = true;
             // `chunked` frames the body only as the last coding; after another it is the close.
-            let last = String::from_utf8_lossy(raw).rsplit(',').next().map(|it| it.trim().to_ascii_lowercase());
+            let last = String::from_utf8_lossy(raw)
+                .rsplit(',')
+                .next()
+                .map(|it| it.trim().to_ascii_lowercase());
             chunked = last.as_deref() == Some("chunked");
         } else if name.eq_ignore_ascii_case("connection") {
             for token in String::from_utf8_lossy(raw).split(',') {
@@ -229,9 +235,13 @@ impl Body {
         match self {
             Body::Length(0) | Body::Close => Ok(()),
             // alloc: an error's message, made only when it fails.
-            Body::Length(left) => Err(format!("the connection closed with {left} bytes of the body unsent")),
+            Body::Length(left) => {
+                Err(format!("the connection closed with {left} bytes of the body unsent"))
+            }
             Body::Chunked(chunked) if chunked.done() => Ok(()),
-            Body::Chunked(_) => Err("the connection closed in the middle of a chunked body".to_owned()),
+            Body::Chunked(_) => {
+                Err("the connection closed in the middle of a chunked body".to_owned())
+            }
         }
     }
 }
@@ -290,14 +300,17 @@ impl Chunked {
                     out.extend_from_slice(&input[at..at + take]);
                     at += take;
                     let left = left - take as u64;
-                    self.state = if left == 0 { ChunkState::DataCr } else { ChunkState::Data(left) };
+                    self.state =
+                        if left == 0 { ChunkState::DataCr } else { ChunkState::Data(left) };
                     continue;
                 }
                 ChunkState::Size | ChunkState::Extension => {
                     self.line += 1;
                     if self.line > CHUNK_LINE_MOST {
                         // alloc: an error's message, made only when it fails.
-                        return Err(format!("a chunk-size line longer than the {CHUNK_LINE_MOST} bytes allowed"));
+                        return Err(format!(
+                            "a chunk-size line longer than the {CHUNK_LINE_MOST} bytes allowed"
+                        ));
                     }
                     match (self.state, byte) {
                         (ChunkState::Size, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F') => {
@@ -310,7 +323,9 @@ impl Chunked {
                             self.digits += 1;
                         }
                         (_, b'\r') if self.digits > 0 => self.state = ChunkState::SizeLf,
-                        (_, b';' | b' ' | b'\t') if self.digits > 0 => self.state = ChunkState::Extension,
+                        (_, b';' | b' ' | b'\t') if self.digits > 0 => {
+                            self.state = ChunkState::Extension
+                        }
                         (ChunkState::Extension, b'\n') => {
                             return Err("a chunk-size line ended by LF alone, not CRLF".to_owned());
                         }
@@ -325,7 +340,11 @@ impl Chunked {
                     if byte != b'\n' {
                         return Err("a chunk-size line not ended by CRLF".to_owned());
                     }
-                    self.state = if self.size == 0 { ChunkState::Trailer } else { ChunkState::Data(self.size) };
+                    self.state = if self.size == 0 {
+                        ChunkState::Trailer
+                    } else {
+                        ChunkState::Data(self.size)
+                    };
                     self.size = 0;
                     self.line = 0;
                     self.digits = 0;
@@ -342,7 +361,10 @@ impl Chunked {
                     }
                     self.state = ChunkState::Size;
                 }
-                ChunkState::Trailer | ChunkState::TrailerLine | ChunkState::TrailerLf | ChunkState::EndLf => {
+                ChunkState::Trailer
+                | ChunkState::TrailerLine
+                | ChunkState::TrailerLf
+                | ChunkState::EndLf => {
                     self.line += 1;
                     if self.line > HEAD_MOST {
                         // alloc: an error's message, made only when it fails.
@@ -350,8 +372,12 @@ impl Chunked {
                     }
                     self.state = match (self.state, byte) {
                         (ChunkState::Trailer, b'\r') => ChunkState::EndLf,
-                        (ChunkState::Trailer | ChunkState::TrailerLine, b'\r') => ChunkState::TrailerLf,
-                        (ChunkState::Trailer | ChunkState::TrailerLine, _) => ChunkState::TrailerLine,
+                        (ChunkState::Trailer | ChunkState::TrailerLine, b'\r') => {
+                            ChunkState::TrailerLf
+                        }
+                        (ChunkState::Trailer | ChunkState::TrailerLine, _) => {
+                            ChunkState::TrailerLine
+                        }
                         (ChunkState::TrailerLf, b'\n') => ChunkState::Trailer,
                         (ChunkState::EndLf, b'\n') => ChunkState::Done,
                         (_, _) => return Err("a trailer line not ended by CRLF".to_owned()),

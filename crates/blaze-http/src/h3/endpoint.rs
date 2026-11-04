@@ -14,8 +14,8 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{
-    ConnectionError, ConnectionHandle, DatagramEvent, Dir, EndpointConfig, FinishError, ReadError, Side, StreamEvent,
-    StreamId, VarInt, WriteError,
+    ConnectionError, ConnectionHandle, DatagramEvent, Dir, EndpointConfig, FinishError, ReadError,
+    Side, StreamEvent, StreamId, VarInt, WriteError,
 };
 
 use super::{
@@ -113,9 +113,15 @@ pub enum Closed {
 impl std::fmt::Display for Closed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Closed::Refused { status } => write!(f, "the server refused the session with status {status}"),
-            Closed::ByPeer { code, reason } => write!(f, "the peer closed the session with code {code}: {reason:?}"),
-            Closed::Local { code, reason } => write!(f, "the session was closed here with code {code}: {reason:?}"),
+            Closed::Refused { status } => {
+                write!(f, "the server refused the session with status {status}")
+            }
+            Closed::ByPeer { code, reason } => {
+                write!(f, "the peer closed the session with code {code}: {reason:?}")
+            }
+            Closed::Local { code, reason } => {
+                write!(f, "the session was closed here with code {code}: {reason:?}")
+            }
             Closed::Failed(error) => write!(f, "{error}"),
         }
     }
@@ -208,7 +214,9 @@ enum State {
     /// A server's CONNECT that came before the client's SETTINGS.
     Held(SessionRequest),
     /// A server's CONNECT handed to the asker.
-    Requested { draft02: bool },
+    Requested {
+        draft02: bool,
+    },
     /// A client's session whose CONNECT waits for the server's SETTINGS.
     Waiting,
     /// A client's CONNECT sent, its answer not yet come.
@@ -294,18 +302,27 @@ fn h3_code(code: u64) -> VarInt {
 
 fn gone(stream: u64, conn: ConnId) -> Error {
     // alloc: an error's message, made only when it fails.
-    Error { peer: None, step: Step::Stream, why: format!("stream {stream} of connection {} is not open here", conn.0) }
+    Error {
+        peer: None,
+        step: Step::Stream,
+        why: format!("stream {stream} of connection {} is not open here", conn.0),
+    }
 }
 
 impl Endpoint {
     /// An endpoint that serves with `server`, connects with `client`, or both; `epoch` is the
     /// instant the driver's clock counts from.
-    pub fn new(epoch: Instant, server: Option<ServerConfig>, client: Option<ClientConfig>) -> Result<Endpoint, Error> {
+    pub fn new(
+        epoch: Instant,
+        server: Option<ServerConfig>,
+        client: Option<ClientConfig>,
+    ) -> Result<Endpoint, Error> {
         let serving = server.as_ref().map(|it| it.transport);
         let server = server.as_ref().map(config::server).transpose()?;
         let client = client.as_ref().map(config::client).transpose()?;
         // alloc: one per endpoint.
-        let quic = quinn_proto::Endpoint::new(Arc::new(EndpointConfig::default()), server, true, None);
+        let quic =
+            quinn_proto::Endpoint::new(Arc::new(EndpointConfig::default()), server, true, None);
         Ok(Endpoint {
             quic,
             serving,
@@ -339,7 +356,8 @@ impl Endpoint {
             if conn.settings_due.is_some_and(|due| due <= self.now) {
                 conn.settings_due = None;
                 // alloc: an error's message, made only when it fails.
-                let why = format!("no SETTINGS within {} s of the handshake", SETTINGS_WAIT.as_secs());
+                let why =
+                    format!("no SETTINGS within {} s of the handshake", SETTINGS_WAIT.as_secs());
                 conn.fail(code::H3_MISSING_SETTINGS, Step::Settings, why, &mut cx);
             }
             if conn.linger.is_some_and(|due| due <= self.now) {
@@ -407,10 +425,15 @@ impl Endpoint {
                     Err(refused) => {
                         if let Some(transmit) = refused.response {
                             buf.truncate(transmit.size);
-                            self.transmits.push_back(Transmit { to: transmit.destination, bytes: buf });
+                            self.transmits
+                                .push_back(Transmit { to: transmit.destination, bytes: buf });
                         }
                         // alloc: an error's message, made only when it fails.
-                        let error = Error { peer: Some(from), step: Step::Handshake, why: refused.cause.to_string() };
+                        let error = Error {
+                            peer: Some(from),
+                            step: Step::Handshake,
+                            why: refused.cause.to_string(),
+                        };
                         self.events.push_back(Event::Refused { peer: from, error });
                     }
                 }
@@ -496,15 +519,27 @@ impl Endpoint {
 
     fn conn(&mut self, id: ConnId) -> Result<&mut Conn, Error> {
         // alloc: an error's message, made only when it fails.
-        self.conns.get_mut(&id).ok_or_else(|| Error { peer: None, step: Step::Session, why: format!("connection {} is gone", id.0) })
+        self.conns.get_mut(&id).ok_or_else(|| Error {
+            peer: None,
+            step: Step::Session,
+            why: format!("connection {} is gone", id.0),
+        })
     }
 
     /// Runs `f` on connection `id` with a context, then drives it.
-    fn with<T>(&mut self, id: ConnId, f: impl FnOnce(&mut Conn, &mut Cx<'_>) -> Result<T, Error>) -> Result<T, Error> {
+    fn with<T>(
+        &mut self,
+        id: ConnId,
+        f: impl FnOnce(&mut Conn, &mut Cx<'_>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let (now, at) = (self.now, self.at());
         let conn = self.conns.get_mut(&id);
         // alloc: an error's message, made only when it fails.
-        let conn = conn.ok_or_else(|| Error { peer: None, step: Step::Session, why: format!("connection {} is gone", id.0) })?;
+        let conn = conn.ok_or_else(|| Error {
+            peer: None,
+            step: Step::Session,
+            why: format!("connection {} is gone", id.0),
+        })?;
         let mut cx = Cx { events: &mut self.events, now, at, id };
         let out = f(conn, &mut cx);
         self.drive(id);
@@ -514,7 +549,12 @@ impl Endpoint {
     /// Opens a WebTransport session to `to` at `url` (`https://host:port/path`), with `headers`
     /// (lowercase names, no pseudo-fields) on its CONNECT. Its outcome is
     /// [`Event::SessionOpened`] or [`Event::SessionClosed`].
-    pub fn connect(&mut self, to: SocketAddr, url: &str, headers: &[(&str, &str)]) -> Result<SessionId, Error> {
+    pub fn connect(
+        &mut self,
+        to: SocketAddr,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<SessionId, Error> {
         // alloc: an error's message, made only when it fails.
         let fail = |why: String| Error { peer: Some(to), step: Step::Connect, why };
         let Some(client) = self.client.clone() else {
@@ -522,7 +562,8 @@ impl Endpoint {
             return Err(fail("this endpoint was made without a ClientConfig".to_owned()));
         };
         // alloc: an error's message, made only when it fails.
-        let parsed = url::Url::parse(url).map_err(|why| fail(format!("`{url}` is not a URL: {why}")))?;
+        let parsed =
+            url::Url::parse(url).map_err(|why| fail(format!("`{url}` is not a URL: {why}")))?;
         if parsed.scheme() != "https" {
             // alloc: an error's message, made only when it fails.
             return Err(fail(format!("`{url}` is not https, which WebTransport needs")));
@@ -536,9 +577,14 @@ impl Endpoint {
             None => return Err(fail(format!("`{url}` has no host"))),
         };
         for (name, _) in headers {
-            if name.starts_with(':') || name.bytes().any(|it| it.is_ascii_uppercase()) || name.is_empty() {
+            if name.starts_with(':')
+                || name.bytes().any(|it| it.is_ascii_uppercase())
+                || name.is_empty()
+            {
                 // alloc: an error's message, made only when it fails.
-                return Err(fail(format!("the header `{name}` is a pseudo-field or not lowercase")));
+                return Err(fail(format!(
+                    "the header `{name}` is a pseudo-field or not lowercase"
+                )));
             }
         }
         // alloc: the CONNECT's fields, once a session.
@@ -554,11 +600,10 @@ impl Endpoint {
             headers: headers.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())).collect(),
         };
         // alloc: an error's message, made only when it fails.
-        let (handle, quic) = self.quic.connect(self.at(), client, to, &name).map_err(|why| Error {
-            peer: Some(to),
-            step: Step::Handshake,
-            why: why.to_string(),
-        })?;
+        let (handle, quic) = self
+            .quic
+            .connect(self.at(), client, to, &name)
+            .map_err(|why| Error { peer: Some(to), step: Step::Handshake, why: why.to_string() })?;
         let id = self.add(handle, quic, to, Side::Client, Some(connect));
         let stream = StreamId::new(Side::Client, Dir::Bi, 0);
         if let Some(conn) = self.conns.get_mut(&id) {
@@ -573,16 +618,24 @@ impl Endpoint {
     pub fn accept(&mut self, session: SessionId) -> Result<(), Error> {
         let sid = quic_id(session.stream).ok_or_else(|| gone(session.stream, session.conn))?;
         self.with(session.conn, |conn, cx| {
-            let Some(entry) = conn.sessions.get_mut(&sid) else { return Err(gone(session.stream, session.conn)) };
+            let Some(entry) = conn.sessions.get_mut(&sid) else {
+                return Err(gone(session.stream, session.conn));
+            };
             let State::Requested { draft02 } = entry.state else {
                 // alloc: an error's message, made only when it fails.
-                return Err(conn.error(Step::Session, format!("session {} was not asked for, or was answered", session.stream)));
+                return Err(conn.error(
+                    Step::Session,
+                    format!("session {} was not asked for, or was answered", session.stream),
+                ));
             };
             entry.state = State::Open;
             // alloc: one answer's head, once a session.
             let mut head = Vec::new();
             if draft02 {
-                qpack::encode(&[(":status", "200"), ("sec-webtransport-http3-draft", "draft02")], &mut head);
+                qpack::encode(
+                    &[(":status", "200"), ("sec-webtransport-http3-draft", "draft02")],
+                    &mut head,
+                );
             } else {
                 qpack::encode(&[(":status", "200")], &mut head);
             }
@@ -599,12 +652,20 @@ impl Endpoint {
         self.with(session.conn, |conn, cx| {
             if !(300..=599).contains(&status) {
                 // alloc: an error's message, made only when it fails.
-                return Err(conn.error(Step::Session, format!("a refusal's status is 300 to 599, and {status} is not")));
+                return Err(conn.error(
+                    Step::Session,
+                    format!("a refusal's status is 300 to 599, and {status} is not"),
+                ));
             }
             match conn.sessions.get(&sid).map(|it| &it.state) {
                 Some(State::Requested { .. } | State::Held(_)) => {}
                 // alloc: an error's message, made only when it fails.
-                _ => return Err(conn.error(Step::Session, format!("session {} was not asked for, or was answered", session.stream))),
+                _ => {
+                    return Err(conn.error(
+                        Step::Session,
+                        format!("session {} was not asked for, or was answered", session.stream),
+                    ));
+                }
             }
             conn.sessions.remove(&sid);
             conn.answer(sid, status, cx);
@@ -615,12 +676,18 @@ impl Endpoint {
 
     /// Opens a stream in an open session: `Ok(None)` when the peer allows no more streams now
     /// ([`Event::StreamsAvailable`] says when to ask again).
-    pub fn open(&mut self, session: SessionId, direction: Direction) -> Result<Option<StreamRef>, Error> {
+    pub fn open(
+        &mut self,
+        session: SessionId,
+        direction: Direction,
+    ) -> Result<Option<StreamRef>, Error> {
         let sid = quic_id(session.stream).ok_or_else(|| gone(session.stream, session.conn))?;
         self.with(session.conn, |conn, cx| {
             if !matches!(conn.sessions.get(&sid).map(|it| &it.state), Some(State::Open)) {
                 // alloc: an error's message, made only when it fails.
-                return Err(conn.error(Step::Session, format!("session {} is not open", session.stream)));
+                return Err(
+                    conn.error(Step::Session, format!("session {} is not open", session.stream))
+                );
             }
             let Some(id) = conn.quic.streams().open(direction.quic()) else { return Ok(None) };
             let mut stream = Stream::new(Kind::Wt { session: sid, open: true });
@@ -648,7 +715,9 @@ impl Endpoint {
             let entry = conn.wt_stream(id).ok_or_else(|| gone(stream.stream, stream.conn))?;
             if entry.fin || entry.finished {
                 // alloc: an error's message, made only when it fails.
-                return Err(conn.error(Step::Stream, format!("stream {} was finished", stream.stream)));
+                return Err(
+                    conn.error(Step::Stream, format!("stream {} was finished", stream.stream))
+                );
             }
             entry.out.extend_from_slice(bytes);
             entry.asked = true;
@@ -691,7 +760,12 @@ impl Endpoint {
         self.with(stream.conn, |conn, _| {
             if !conn.receives(id) {
                 // alloc: an error's message, made only when it fails.
-                return Err(conn.error(Step::Stream, format!("stream {id} is this side's unidirectional stream: there is nothing to stop")));
+                return Err(conn.error(
+                    Step::Stream,
+                    format!(
+                        "stream {id} is this side's unidirectional stream: there is nothing to stop"
+                    ),
+                ));
             }
             let entry = conn.wt_stream(id).ok_or_else(|| gone(stream.stream, stream.conn))?;
             if !entry.recv_open {
@@ -724,11 +798,16 @@ impl Endpoint {
         self.with(session.conn, |conn, _| {
             if !matches!(conn.sessions.get(&sid).map(|it| &it.state), Some(State::Open)) {
                 // alloc: an error's message, made only when it fails.
-                return Err(conn.error(Step::Datagram, format!("session {} is not open", session.stream)));
+                return Err(
+                    conn.error(Step::Datagram, format!("session {} is not open", session.stream))
+                );
             }
             if conn.peer_settings.is_some_and(|it| !it.h3_datagram) {
                 // alloc: an error's message, made only when it fails.
-                return Err(conn.error(Step::Datagram, "the peer's SETTINGS have no SETTINGS_H3_DATAGRAM = 1".to_owned()));
+                return Err(conn.error(
+                    Step::Datagram,
+                    "the peer's SETTINGS have no SETTINGS_H3_DATAGRAM = 1".to_owned(),
+                ));
             }
             // alloc: one datagram, handed to quinn-proto.
             let mut payload = Vec::with_capacity(8 + bytes.len());
@@ -738,7 +817,11 @@ impl Endpoint {
                 .datagrams()
                 .send(Bytes::from(payload), true)
                 // alloc: an error's message, made only when it fails.
-                .map_err(|why| Error { peer: Some(conn.peer), step: Step::Datagram, why: why.to_string() })
+                .map_err(|why| Error {
+                    peer: Some(conn.peer),
+                    step: Step::Datagram,
+                    why: why.to_string(),
+                })
         })
     }
 
@@ -765,7 +848,11 @@ impl Endpoint {
                     conn.close_session(sid, code, reason, cx);
                 }
                 if conn.linger.is_none() {
-                    conn.quic.close(cx.at, h3_code(code::H3_NO_ERROR), Bytes::copy_from_slice(reason.as_bytes()));
+                    conn.quic.close(
+                        cx.at,
+                        h3_code(code::H3_NO_ERROR),
+                        Bytes::copy_from_slice(reason.as_bytes()),
+                    );
                 }
                 Ok(())
             });
@@ -776,7 +863,11 @@ impl Endpoint {
     pub fn set_identity(&mut self, identity: config::Identity) -> Result<(), Error> {
         let Some(transport) = self.serving else {
             // alloc: an error's message, made only when it fails.
-            return Err(Error { peer: None, step: Step::Config, why: "this endpoint does not serve".to_owned() });
+            return Err(Error {
+                peer: None,
+                step: Step::Config,
+                why: "this endpoint does not serve".to_owned(),
+            });
         };
         let server = config::server(&ServerConfig { identity, transport })?;
         self.quic.set_server_config(Some(server));
@@ -828,7 +919,10 @@ impl Conn {
             return Ok(());
         }
         // alloc: an error's message, made only when it fails.
-        Err(self.error(Step::Stream, format!("stream {id} is the peer's unidirectional stream: this side cannot send on it")))
+        Err(self.error(
+            Step::Stream,
+            format!("stream {id} is the peer's unidirectional stream: this side cannot send on it"),
+        ))
     }
 
     /// Tells the asker how the peer's side of stream `id` ended, once.
@@ -837,7 +931,9 @@ impl Conn {
         let at = StreamRef { conn: cx.id, stream: u64::from(id) };
         match stream.ended.take() {
             Some(End::Fin) => cx.events.push_back(Event::StreamFinished { stream: at }),
-            Some(End::Reset(code)) => cx.events.push_back(Event::StreamReset { stream: at, code: frame::h3_to_wt(code) }),
+            Some(End::Reset(code)) => {
+                cx.events.push_back(Event::StreamReset { stream: at, code: frame::h3_to_wt(code) })
+            }
             None => {}
         }
     }
@@ -848,7 +944,10 @@ impl Conn {
         let Some(stream) = self.streams.get_mut(&id) else { return };
         stream.kind = Kind::Wt { session: sid, open: true };
         let session = SessionId { conn: cx.id, stream: u64::from(sid) };
-        cx.events.push_back(Event::StreamOpened { session, stream: StreamRef { conn: cx.id, stream: u64::from(id) } });
+        cx.events.push_back(Event::StreamOpened {
+            session,
+            stream: StreamRef { conn: cx.id, stream: u64::from(id) },
+        });
         self.deliver(id, cx);
         self.tell_end(id, cx);
         self.forget_if_done(id);
@@ -1000,7 +1099,9 @@ impl Conn {
         stream.out.clear();
         stream.out_at = 0;
         if std::mem::take(&mut stream.asked) {
-            cx.events.push_back(Event::StreamSent { stream: StreamRef { conn: cx.id, stream: u64::from(id) } });
+            cx.events.push_back(Event::StreamSent {
+                stream: StreamRef { conn: cx.id, stream: u64::from(id) },
+            });
         }
         if stream.fin && !stream.finished {
             stream.finished = true;
@@ -1029,7 +1130,9 @@ impl Conn {
             quinn_proto::Event::ConnectionLost { reason } => {
                 let clean = match &reason {
                     ConnectionError::LocallyClosed => self.failed.is_none(),
-                    ConnectionError::ApplicationClosed(close) => close.error_code.into_inner() == code::H3_NO_ERROR,
+                    ConnectionError::ApplicationClosed(close) => {
+                        close.error_code.into_inner() == code::H3_NO_ERROR
+                    }
                     _ => false,
                 };
                 if clean {
@@ -1047,14 +1150,12 @@ impl Conn {
                 self.end_sessions(&Closed::Failed(error.clone()), cx);
                 self.lost = Some(error);
             }
-            quinn_proto::Event::Stream(StreamEvent::Opened { dir }) => {
-                loop {
-                    let Some(id) = self.quic.streams().accept(dir) else { break };
-                    let kind = if dir == Dir::Uni { Kind::PeerUni } else { Kind::PeerBidi };
-                    self.streams.insert(id, Stream::new(kind));
-                    self.read(id, cx);
-                }
-            }
+            quinn_proto::Event::Stream(StreamEvent::Opened { dir }) => loop {
+                let Some(id) = self.quic.streams().accept(dir) else { break };
+                let kind = if dir == Dir::Uni { Kind::PeerUni } else { Kind::PeerBidi };
+                self.streams.insert(id, Stream::new(kind));
+                self.read(id, cx);
+            },
             quinn_proto::Event::Stream(StreamEvent::Readable { id }) => self.read(id, cx),
             quinn_proto::Event::Stream(StreamEvent::Writable { id }) => self.flush(id, cx),
             quinn_proto::Event::Stream(StreamEvent::Finished { id }) => {
@@ -1063,7 +1164,9 @@ impl Conn {
                     self.linger = Some(cx.now);
                 }
             }
-            quinn_proto::Event::Stream(StreamEvent::Stopped { id, error_code }) => self.stopped(id, error_code, cx),
+            quinn_proto::Event::Stream(StreamEvent::Stopped { id, error_code }) => {
+                self.stopped(id, error_code, cx)
+            }
             quinn_proto::Event::Stream(StreamEvent::Available { .. }) => {
                 for (sid, session) in &self.sessions {
                     if matches!(session.state, State::Open) {
@@ -1075,7 +1178,9 @@ impl Conn {
             quinn_proto::Event::DatagramReceived => {
                 loop {
                     let Some(bytes) = self.quic.datagrams().recv() else { break };
-                    let Some((quarter, n)) = varint::get(&bytes).filter(|(it, _)| *it <= varint::MAX / 4) else {
+                    let Some((quarter, n)) =
+                        varint::get(&bytes).filter(|(it, _)| *it <= varint::MAX / 4)
+                    else {
                         // alloc: an error's message, made only when it fails.
                         let why = "a datagram with no quarter stream ID (RFC 9297, 2.1)".to_owned();
                         self.fail(code::H3_DATAGRAM_ERROR, Step::Datagram, why, cx);
@@ -1087,7 +1192,8 @@ impl Conn {
                     if matches!(self.sessions.get(&sid).map(|it| &it.state), Some(State::Open)) {
                         let session = SessionId { conn: cx.id, stream: u64::from(sid) };
                         // alloc: one datagram's payload, handed to the asker.
-                        cx.events.push_back(Event::Datagram { session, bytes: bytes[n..].to_vec() });
+                        cx.events
+                            .push_back(Event::Datagram { session, bytes: bytes[n..].to_vec() });
                     }
                 }
             }
@@ -1099,7 +1205,8 @@ impl Conn {
         self.connected = true;
         let Some(id) = self.quic.streams().open(Dir::Uni) else {
             // alloc: an error's message, made only when it fails.
-            let why = "the peer allows no unidirectional stream for HTTP/3's control stream".to_owned();
+            let why =
+                "the peer allows no unidirectional stream for HTTP/3's control stream".to_owned();
             self.fail(code::H3_STREAM_CREATION_ERROR, Step::Settings, why, cx);
             return;
         };
@@ -1128,13 +1235,19 @@ impl Conn {
             Kind::Request => {
                 if self.sessions.contains_key(&id) {
                     // alloc: an error's message, made only when it fails.
-                    let error = self.error(Step::Session, format!("the peer stopped the session's CONNECT stream with code {code}"));
+                    let error = self.error(
+                        Step::Session,
+                        format!("the peer stopped the session's CONNECT stream with code {code}"),
+                    );
                     self.end_session(id, Closed::Failed(error), cx);
                 }
             }
             Kind::Wt { open: true, .. } => {
                 let at = StreamRef { conn: cx.id, stream: u64::from(id) };
-                cx.events.push_back(Event::StreamStopped { stream: at, code: frame::h3_to_wt(code.into_inner()) });
+                cx.events.push_back(Event::StreamStopped {
+                    stream: at,
+                    code: frame::h3_to_wt(code.into_inner()),
+                });
                 self.forget_if_done(id);
             }
             _ => {}
@@ -1216,14 +1329,20 @@ impl Conn {
         match stream.kind {
             Kind::PeerControl | Kind::Drain => {
                 // alloc: an error's message, made only when it fails.
-                let why = "the peer closed one of its critical streams (control or QPACK)".to_owned();
+                let why =
+                    "the peer closed one of its critical streams (control or QPACK)".to_owned();
                 self.fail(code::H3_CLOSED_CRITICAL_STREAM, Step::Stream, why, cx);
             }
             Kind::Request => {
                 if self.sessions.contains_key(&id) {
                     let closed = match end {
                         // alloc: an error's message, made only when it fails.
-                        End::Reset(code) => Closed::Failed(self.error(Step::Session, format!("the peer reset the session's CONNECT stream with code {code:#x}"))),
+                        End::Reset(code) => Closed::Failed(self.error(
+                            Step::Session,
+                            format!(
+                                "the peer reset the session's CONNECT stream with code {code:#x}"
+                            ),
+                        )),
                         // A FIN with no capsule is a close with code 0 (the draft, 6).
                         End::Fin => Closed::ByPeer { code: 0, reason: String::new() },
                     };
@@ -1261,7 +1380,10 @@ impl Conn {
         }
         let bytes = std::mem::take(&mut stream.inbuf);
         stream.unconsumed += bytes.len();
-        cx.events.push_back(Event::StreamData { stream: StreamRef { conn: cx.id, stream: u64::from(id) }, bytes });
+        cx.events.push_back(Event::StreamData {
+            stream: StreamRef { conn: cx.id, stream: u64::from(id) },
+            bytes,
+        });
     }
 
     /// Parses what stream `id` has buffered, as its kind reads it.
@@ -1291,20 +1413,31 @@ impl Conn {
                             // No MAX_PUSH_ID is ever sent, so no push ID is allowed (RFC 9114,
                             // 4.6), and a server never takes one.
                             // alloc: an error's message, made only when it fails.
-                            let why = format!("the peer opened push stream {id}, and no push was allowed");
-                            let code = if self.side == Side::Server { code::H3_STREAM_CREATION_ERROR } else { code::H3_ID_ERROR };
+                            let why = format!(
+                                "the peer opened push stream {id}, and no push was allowed"
+                            );
+                            let code = if self.side == Side::Server {
+                                code::H3_STREAM_CREATION_ERROR
+                            } else {
+                                code::H3_ID_ERROR
+                            };
                             self.fail(code, Step::Stream, why, cx);
                             return;
                         }
                         frame::STREAM_WEBTRANSPORT => {
-                            let Some((session, m)) = varint::get(&stream.inbuf[n..]) else { return };
+                            let Some((session, m)) = varint::get(&stream.inbuf[n..]) else {
+                                return;
+                            };
                             stream.inbuf.drain(..n + m);
                             self.wt_header(id, session, cx);
                         }
                         // A type this endpoint does not know, GREASE included (RFC 9114, 6.2).
                         _ => {
                             self.streams.remove(&id);
-                            _ = self.quic.recv_stream(id).stop(h3_code(code::H3_STREAM_CREATION_ERROR));
+                            _ = self
+                                .quic
+                                .recv_stream(id)
+                                .stop(h3_code(code::H3_STREAM_CREATION_ERROR));
                             return;
                         }
                     }
@@ -1319,7 +1452,9 @@ impl Conn {
                         stream.kind = Kind::Request;
                     } else {
                         // alloc: an error's message, made only when it fails.
-                        let why = format!("the server opened bidirectional stream {id} that is not WebTransport's");
+                        let why = format!(
+                            "the server opened bidirectional stream {id} that is not WebTransport's"
+                        );
                         self.fail(code::H3_STREAM_CREATION_ERROR, Step::Stream, why, cx);
                         return;
                     }
@@ -1339,16 +1474,24 @@ impl Conn {
     /// A WebTransport stream named its session: it is the session's if that is open, held if
     /// the session may yet open, refused past [`MOST_HELD`].
     fn wt_header(&mut self, id: StreamId, session: u64, cx: &mut Cx<'_>) {
-        let Some(sid) = quic_id(session).filter(|it| it.dir() == Dir::Bi && it.initiator() == Side::Client) else {
+        let Some(sid) =
+            quic_id(session).filter(|it| it.dir() == Dir::Bi && it.initiator() == Side::Client)
+        else {
             // alloc: an error's message, made only when it fails.
-            let why = format!("stream {id} names session {session}, which is not a client's bidirectional stream");
+            let why = format!(
+                "stream {id} names session {session}, which is not a client's bidirectional stream"
+            );
             self.streams.remove(&id);
             self.fail(code::H3_ID_ERROR, Step::Stream, why, cx);
             return;
         };
         let open = matches!(self.sessions.get(&sid).map(|it| &it.state), Some(State::Open));
         if !open {
-            let held = self.streams.values().filter(|it| matches!(it.kind, Kind::Wt { open: false, .. })).count();
+            let held = self
+                .streams
+                .values()
+                .filter(|it| matches!(it.kind, Kind::Wt { open: false, .. }))
+                .count();
             if held >= MOST_HELD {
                 self.streams.remove(&id);
                 let refused = h3_code(code::WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
@@ -1388,7 +1531,8 @@ impl Conn {
             let (ty, len, settings) = match frame::next(&stream.inbuf) {
                 Ok(None) => return,
                 Ok(Some(found)) => {
-                    let settings = (found.ty == frame::SETTINGS).then(|| frame::parse_settings(found.payload));
+                    let settings =
+                        (found.ty == frame::SETTINGS).then(|| frame::parse_settings(found.payload));
                     (found.ty, found.len, settings)
                 }
                 Err(error) => return self.fail(error.code, Step::Settings, error.why, cx),
@@ -1400,7 +1544,9 @@ impl Conn {
                     self.settings_due = None;
                     self.settings_came(cx);
                 }
-                (_, _, Some(Err(error))) => return self.fail(error.code, Step::Settings, error.why, cx),
+                (_, _, Some(Err(error))) => {
+                    return self.fail(error.code, Step::Settings, error.why, cx);
+                }
                 (false, ty, None) => {
                     // alloc: an error's message, made only when it fails.
                     let why = format!("the control stream's first frame is {ty:#x}, not SETTINGS");
@@ -1422,20 +1568,33 @@ impl Conn {
     /// client sends its CONNECT if the server takes WebTransport.
     fn settings_came(&mut self, cx: &mut Cx<'_>) {
         // alloc: the held session ids, once a connection.
-        let held: Vec<StreamId> = self.sessions.iter().filter(|(_, it)| matches!(it.state, State::Held(_))).map(|(id, _)| *id).collect();
+        let held: Vec<StreamId> = self
+            .sessions
+            .iter()
+            .filter(|(_, it)| matches!(it.state, State::Held(_)))
+            .map(|(id, _)| *id)
+            .collect();
         for sid in held {
             let Some(session) = self.sessions.get_mut(&sid) else { continue };
-            let State::Held(request) = std::mem::replace(&mut session.state, State::Requested { draft02: false }) else { continue };
+            let State::Held(request) =
+                std::mem::replace(&mut session.state, State::Requested { draft02: false })
+            else {
+                continue;
+            };
             let draft02 = draft02(&request.headers);
             session.state = State::Requested { draft02 };
-            cx.events.push_back(Event::SessionRequest { session: SessionId { conn: cx.id, stream: u64::from(sid) }, request });
+            cx.events.push_back(Event::SessionRequest {
+                session: SessionId { conn: cx.id, stream: u64::from(sid) },
+                request,
+            });
         }
         let Some(connect) = self.connect.take() else { return };
         let sid = StreamId::new(Side::Client, Dir::Bi, 0);
         let settings = self.peer_settings.unwrap_or_default();
         if let Err(missing) = settings.serves_webtransport() {
             // alloc: an error's message, made only when it fails.
-            let error = self.error(Step::Settings, format!("the server does not take WebTransport: {missing}"));
+            let error = self
+                .error(Step::Settings, format!("the server does not take WebTransport: {missing}"));
             self.linger = Some(cx.now);
             self.end_session(sid, Closed::Failed(error), cx);
             return;
@@ -1444,7 +1603,10 @@ impl Conn {
             Some(id) if id == sid => {}
             _ => {
                 // alloc: an error's message, made only when it fails.
-                let error = self.error(Step::Connect, "the CONNECT's stream could not be opened as the connection's first".to_owned());
+                let error = self.error(
+                    Step::Connect,
+                    "the CONNECT's stream could not be opened as the connection's first".to_owned(),
+                );
                 self.linger = Some(cx.now);
                 self.end_session(sid, Closed::Failed(error), cx);
                 return;
@@ -1496,7 +1658,8 @@ impl Conn {
                 (None, frame::HEADERS) => self.connect_came(id, &payload, cx),
                 (Some(1), frame::HEADERS) => self.answer_came(id, &payload, cx),
                 (Some(2), frame::DATA) => self.capsules(id, &payload, cx),
-                (None | Some(1), frame::DATA) | (_, frame::SETTINGS | frame::GOAWAY | frame::MAX_PUSH_ID | frame::CANCEL_PUSH) => {
+                (None | Some(1), frame::DATA)
+                | (_, frame::SETTINGS | frame::GOAWAY | frame::MAX_PUSH_ID | frame::CANCEL_PUSH) => {
                     // alloc: an error's message, made only when it fails.
                     let why = format!("frame {ty:#x} on a CONNECT stream where it may not be");
                     return self.fail(code::H3_FRAME_UNEXPECTED, Step::Connect, why, cx);
@@ -1514,16 +1677,30 @@ impl Conn {
             Err(why) => return self.fail(code::QPACK_DECOMPRESSION_FAILED, Step::Connect, why, cx),
         };
         let field = |name: &str| fields.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
-        let refused = match (field(":method"), field(":protocol"), field(":scheme"), field(":authority"), field(":path")) {
+        let refused = match (
+            field(":method"),
+            field(":protocol"),
+            field(":scheme"),
+            field(":authority"),
+            field(":path"),
+        ) {
             (Some("CONNECT"), Some("webtransport"), Some("https"), Some(_), Some(_)) => None,
             (Some("CONNECT"), Some(protocol), ..) if protocol != "webtransport" => {
                 // alloc: an error's message, made only when it fails.
-                Some((501, format!("a CONNECT for `{protocol}`, which this endpoint does not speak (only webtransport)")))
+                Some((
+                    501,
+                    format!(
+                        "a CONNECT for `{protocol}`, which this endpoint does not speak (only webtransport)"
+                    ),
+                ))
             }
             // alloc: an error's message, made only when it fails.
-            (method, protocol, scheme, authority, path) => Some((400, format!(
-                "a request that is not a WebTransport CONNECT: :method {method:?}, :protocol {protocol:?}, :scheme {scheme:?}, :authority {authority:?}, :path {path:?}"
-            ))),
+            (method, protocol, scheme, authority, path) => Some((
+                400,
+                format!(
+                    "a request that is not a WebTransport CONNECT: :method {method:?}, :protocol {protocol:?}, :scheme {scheme:?}, :authority {authority:?}, :path {path:?}"
+                ),
+            )),
         };
         if let Some((status, why)) = refused {
             let error = self.error(Step::Connect, why);
@@ -1558,14 +1735,17 @@ impl Conn {
             Ok(it) => it,
             Err(why) => return self.fail(code::QPACK_DECOMPRESSION_FAILED, Step::Connect, why, cx),
         };
-        let status = fields.iter().find(|(n, _)| n == ":status").and_then(|(_, v)| v.parse::<u16>().ok());
+        let status =
+            fields.iter().find(|(n, _)| n == ":status").and_then(|(_, v)| v.parse::<u16>().ok());
         match status {
             Some(100..=199) => {}
             Some(200..=299) => {
                 if let Some(session) = self.sessions.get_mut(&id) {
                     session.state = State::Open;
                 }
-                cx.events.push_back(Event::SessionOpened { session: SessionId { conn: cx.id, stream: u64::from(id) } });
+                cx.events.push_back(Event::SessionOpened {
+                    session: SessionId { conn: cx.id, stream: u64::from(id) },
+                });
                 self.release(id, cx);
             }
             Some(status) => {
@@ -1589,7 +1769,10 @@ impl Conn {
             let Some((ty, body, len)) = frame::next_capsule(&session.capsules) else {
                 if session.capsules.len() as u64 > frame::MOST_FRAME {
                     // alloc: an error's message, made only when it fails.
-                    let why = format!("a capsule past {} bytes on the session's CONNECT stream", frame::MOST_FRAME);
+                    let why = format!(
+                        "a capsule past {} bytes on the session's CONNECT stream",
+                        frame::MOST_FRAME
+                    );
                     self.fail(code::H3_EXCESSIVE_LOAD, Step::Session, why, cx);
                 }
                 return;
@@ -1601,16 +1784,21 @@ impl Conn {
                 continue;
             }
             let close = (ty == frame::CLOSE_WEBTRANSPORT_SESSION).then(|| {
-                let code = body.get(..4).map_or(0, |it| u32::from_be_bytes([it[0], it[1], it[2], it[3]]));
-                let reason = String::from_utf8_lossy(body.get(4..).unwrap_or_default()).into_owned();
+                let code =
+                    body.get(..4).map_or(0, |it| u32::from_be_bytes([it[0], it[1], it[2], it[3]]));
+                let reason =
+                    String::from_utf8_lossy(body.get(4..).unwrap_or_default()).into_owned();
                 (code, reason, body.len() >= 4)
             });
             session.capsules.drain(..len);
             match close {
-                Some((code, reason, true)) => return self.peer_closed(id, Closed::ByPeer { code, reason }, cx),
+                Some((code, reason, true)) => {
+                    return self.peer_closed(id, Closed::ByPeer { code, reason }, cx);
+                }
                 Some((_, _, false)) => {
                     // alloc: an error's message, made only when it fails.
-                    let why = "a CLOSE_WEBTRANSPORT_SESSION capsule shorter than its 4-byte code".to_owned();
+                    let why = "a CLOSE_WEBTRANSPORT_SESSION capsule shorter than its 4-byte code"
+                        .to_owned();
                     return self.fail(code::H3_MESSAGE_ERROR, Step::Session, why, cx);
                 }
                 // Unknown capsules: skipped (RFC 9297, 3.2).

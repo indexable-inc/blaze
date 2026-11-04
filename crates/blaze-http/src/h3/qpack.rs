@@ -179,7 +179,9 @@ pub(crate) fn decode(block: &[u8]) -> Result<Vec<(String, String)>, String> {
             let name = get_string(block, &mut at, 3)?;
             if name.bytes().any(|it| it.is_ascii_uppercase()) {
                 // alloc: an error's message, made only when it fails.
-                return Err(format!("the field name `{name}` has uppercase letters (RFC 9114, 4.2)"));
+                return Err(format!(
+                    "the field name `{name}` has uppercase letters (RFC 9114, 4.2)"
+                ));
             }
             let value = get_string(block, &mut at, 7)?;
             (name, value)
@@ -194,12 +196,17 @@ pub(crate) fn decode(block: &[u8]) -> Result<Vec<(String, String)>, String> {
 
 fn dynamic(what: &str) -> String {
     // alloc: an error's message, made only when it fails.
-    format!("{what}: the field section references QPACK's dynamic table, which this endpoint advertised as empty")
+    format!(
+        "{what}: the field section references QPACK's dynamic table, which this endpoint advertised as empty"
+    )
 }
 
 fn entry(index: u64) -> Result<(&'static str, &'static str), String> {
     // alloc: an error's message, made only when it fails.
-    usize::try_from(index).ok().and_then(|it| STATIC.get(it).copied()).ok_or_else(|| format!("static table index {index} is past its 99 entries"))
+    usize::try_from(index)
+        .ok()
+        .and_then(|it| STATIC.get(it).copied())
+        .ok_or_else(|| format!("static table index {index} is past its 99 entries"))
 }
 
 /// Appends `value` as an integer with an `n`-bit prefix (RFC 7541, 5.1), `flags` in the
@@ -259,7 +266,8 @@ fn get_int(block: &[u8], at: &mut usize, n: u32) -> Result<(u8, u64), String> {
 /// The string with an `n`-bit length prefix at `*at`, its Huffman bit just above the prefix.
 fn get_string(block: &[u8], at: &mut usize, n: u32) -> Result<String, String> {
     let (flags, len) = get_int(block, at, n)?;
-    let end = usize::try_from(len).ok().and_then(|it| at.checked_add(it)).filter(|&it| it <= block.len());
+    let end =
+        usize::try_from(len).ok().and_then(|it| at.checked_add(it)).filter(|&it| it <= block.len());
     // alloc: an error's message, made only when it fails.
     let end = end.ok_or_else(|| format!("a string of {len} bytes runs past the field section"))?;
     let raw = &block[*at..end];
@@ -309,7 +317,9 @@ mod tests {
     #[test]
     fn huffman_values_and_long_indexes_are_read() {
         let mut block = vec![0, 0, 0x50, 0x80 | 12];
-        block.extend_from_slice(&[0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]);
+        block.extend_from_slice(&[
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ]);
         // Indexed, static, index 95 (`user-agent`): 0xff then 95 - 63 = 32.
         block.extend_from_slice(&[0xff, 32]);
         let fields = decode(&block).unwrap();
@@ -319,7 +329,8 @@ mod tests {
 
     #[test]
     fn the_dynamic_table_is_refused_by_name() {
-        for block in [&[1u8, 0][..], &[0, 0, 0x80], &[0, 0, 0x40, 0], &[0, 0, 0x10], &[0, 0, 0x00]] {
+        for block in [&[1u8, 0][..], &[0, 0, 0x80], &[0, 0, 0x40, 0], &[0, 0, 0x10], &[0, 0, 0x00]]
+        {
             let why = decode(block).unwrap_err();
             assert!(why.contains("dynamic table"), "{block:?}: {why}");
         }

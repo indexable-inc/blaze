@@ -13,12 +13,14 @@ use bytes::BytesMut;
 use quinn_proto::{DatagramEvent, EndpointConfig};
 
 use super::{
-    ClientConfig, Closed, Direction, Endpoint, Event, Identity, SETTINGS_WAIT, ServerConfig, SessionId, Step, StreamRef, Transport,
-    config, frame,
+    ClientConfig, Closed, Direction, Endpoint, Event, Identity, SETTINGS_WAIT, ServerConfig,
+    SessionId, Step, StreamRef, Transport, config, frame,
 };
 
-const SERVER: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4433);
-const CLIENT: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 50_000);
+const SERVER: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4433);
+const CLIENT: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 50_000);
 const URL: &str = "https://localhost:4433/explore/v1?x=1";
 /// The most steps of the clock one wait takes before the test fails as stuck.
 const MOST_STEPS: usize = 10_000;
@@ -41,7 +43,12 @@ fn identity() -> (Identity, [u8; 32]) {
 /// The server's endpoint, and what a client pins to take its certificate.
 fn server(epoch: Instant) -> (Endpoint, [u8; 32]) {
     let (identity, hash) = identity();
-    let server = Endpoint::new(epoch, Some(ServerConfig { identity, transport: Transport::default() }), None).unwrap();
+    let server = Endpoint::new(
+        epoch,
+        Some(ServerConfig { identity, transport: Transport::default() }),
+        None,
+    )
+    .unwrap();
     (server, hash)
 }
 
@@ -84,8 +91,11 @@ struct Mute {
 
 impl Mute {
     fn new(epoch: Instant, pin: [u8; 32]) -> Mute {
-        let client = config::client(&ClientConfig { pins: vec![pin], transport: Transport::default() }).unwrap();
-        let mut endpoint = quinn_proto::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+        let client =
+            config::client(&ClientConfig { pins: vec![pin], transport: Transport::default() })
+                .unwrap();
+        let mut endpoint =
+            quinn_proto::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
         let (handle, conn) = endpoint.connect(epoch, client, SERVER, "localhost").unwrap();
         Mute { epoch, now: Duration::ZERO, endpoint, conn, handle, lost: None }
     }
@@ -123,7 +133,9 @@ impl Peer for Mute {
     fn take(&mut self, from: SocketAddr, bytes: &[u8]) {
         let mut buf = Vec::new();
         let at = self.epoch + self.now;
-        if let Some(DatagramEvent::ConnectionEvent(_, event)) = self.endpoint.handle(at, from, None, None, BytesMut::from(bytes), &mut buf) {
+        if let Some(DatagramEvent::ConnectionEvent(_, event)) =
+            self.endpoint.handle(at, from, None, None, BytesMut::from(bytes), &mut buf)
+        {
             self.conn.handle_event(event);
         }
         while let Some(event) = self.conn.poll_endpoint_events() {
@@ -181,7 +193,8 @@ impl<C: Peer> Pair<C> {
     fn run_until(&mut self, until: Duration) {
         self.pump();
         for _ in 0..MOST_STEPS {
-            let next = [self.server.next_deadline(), self.client.deadline()].into_iter().flatten().min();
+            let next =
+                [self.server.next_deadline(), self.client.deadline()].into_iter().flatten().min();
             match next {
                 Some(at) if at <= until => self.set(at.max(self.now)),
                 _ => return self.set(until),
@@ -195,8 +208,19 @@ impl Pair<Endpoint> {
     fn new() -> Pair<Endpoint> {
         let epoch = Instant::now();
         let (server, pin) = server(epoch);
-        let client = Endpoint::new(epoch, None, Some(ClientConfig { pins: vec![pin], transport: Transport::default() })).unwrap();
-        Pair { server, client, now: Duration::ZERO, server_events: Vec::new(), client_events: Vec::new() }
+        let client = Endpoint::new(
+            epoch,
+            None,
+            Some(ClientConfig { pins: vec![pin], transport: Transport::default() }),
+        )
+        .unwrap();
+        Pair {
+            server,
+            client,
+            now: Duration::ZERO,
+            server_events: Vec::new(),
+            client_events: Vec::new(),
+        }
     }
 
     fn settle(&mut self) {
@@ -212,11 +236,14 @@ impl Pair<Endpoint> {
             Event::SessionRequest { session, .. } => Some(*session),
             _ => None,
         });
-        let server = server.unwrap_or_else(|| panic!("no SessionRequest: {:?}", self.server_events));
+        let server =
+            server.unwrap_or_else(|| panic!("no SessionRequest: {:?}", self.server_events));
         self.server.accept(server).unwrap();
         self.settle();
         assert!(
-            self.client_events.iter().any(|it| matches!(it, Event::SessionOpened { session } if *session == client)),
+            self.client_events
+                .iter()
+                .any(|it| matches!(it, Event::SessionOpened { session } if *session == client)),
             "{:?}",
             self.client_events
         );
@@ -242,7 +269,11 @@ fn finished(events: &[Event], stream: StreamRef) -> bool {
 
 fn opened(events: &[Event], session: SessionId, direction: Direction) -> Option<StreamRef> {
     events.iter().find_map(|it| match it {
-        Event::StreamOpened { session: at, stream } if *at == session && stream.direction() == direction => Some(*stream),
+        Event::StreamOpened { session: at, stream }
+            if *at == session && stream.direction() == direction =>
+        {
+            Some(*stream)
+        }
         _ => None,
     })
 }
@@ -250,7 +281,10 @@ fn opened(events: &[Event], session: SessionId, direction: Direction) -> Option<
 #[test]
 fn settings_are_exchanged_and_the_connect_is_accepted() {
     let mut pair = Pair::new();
-    let client = pair.client.connect(SERVER, URL, &[("origin", "https://ix.dev"), ("user-agent", "test")]).unwrap();
+    let client = pair
+        .client
+        .connect(SERVER, URL, &[("origin", "https://ix.dev"), ("user-agent", "test")])
+        .unwrap();
     pair.settle();
     let request = pair.server_events.iter().find_map(|it| match it {
         Event::SessionRequest { request, .. } => Some(request.clone()),
@@ -267,7 +301,9 @@ fn settings_are_exchanged_and_the_connect_is_accepted() {
     // Each side read the other's SETTINGS: the ones wtransport sent, which Chrome takes.
     for (side, conn) in [("server", 0), ("client", 0)] {
         let endpoint = if side == "server" { &mut pair.server } else { &mut pair.client };
-        let settings = endpoint.peer_settings(super::ConnId(conn)).unwrap_or_else(|| panic!("{side} has no SETTINGS"));
+        let settings = endpoint
+            .peer_settings(super::ConnId(conn))
+            .unwrap_or_else(|| panic!("{side} has no SETTINGS"));
         assert_eq!(settings.serves_webtransport(), Ok(()), "{side}");
         assert_eq!(settings.webtransport_max_sessions, 1, "{side}");
         assert_eq!(settings.qpack_max_table_capacity, 0, "{side}");
@@ -279,21 +315,35 @@ fn settings_are_exchanged_and_the_connect_is_accepted() {
     });
     pair.server.accept(session.unwrap()).unwrap();
     pair.settle();
-    assert!(pair.client_events.iter().any(|it| matches!(it, Event::SessionOpened { session } if *session == client)));
-    assert_eq!(session.unwrap().stream, 0, "the session is the connection's first bidirectional stream");
+    assert!(
+        pair.client_events
+            .iter()
+            .any(|it| matches!(it, Event::SessionOpened { session } if *session == client))
+    );
+    assert_eq!(
+        session.unwrap().stream,
+        0,
+        "the session is the connection's first bidirectional stream"
+    );
 }
 
 #[test]
 fn a_bidirectional_stream_is_echoed() {
     let mut pair = Pair::new();
     let (server, client) = pair.open();
-    let stream = pair.client.open(client, Direction::Bi).unwrap().expect("the server allows streams");
+    let stream =
+        pair.client.open(client, Direction::Bi).unwrap().expect("the server allows streams");
     pair.client.send(stream, b"ping").unwrap();
     pair.client.finish(stream).unwrap();
     pair.settle();
-    assert!(pair.client_events.iter().any(|it| matches!(it, Event::StreamSent { stream: at } if *at == stream)));
+    assert!(
+        pair.client_events
+            .iter()
+            .any(|it| matches!(it, Event::StreamSent { stream: at } if *at == stream))
+    );
 
-    let at = opened(&pair.server_events, server, Direction::Bi).unwrap_or_else(|| panic!("{:?}", pair.server_events));
+    let at = opened(&pair.server_events, server, Direction::Bi)
+        .unwrap_or_else(|| panic!("{:?}", pair.server_events));
     assert_eq!(at.stream, stream.stream, "one stream, seen from each side");
     assert_eq!(data_of(&pair.server_events, at), b"ping");
     assert!(finished(&pair.server_events, at));
@@ -310,20 +360,27 @@ fn a_bidirectional_stream_is_echoed() {
 fn a_unidirectional_stream_is_echoed_on_one_the_server_opens() {
     let mut pair = Pair::new();
     let (server, client) = pair.open();
-    let stream = pair.client.open(client, Direction::Uni).unwrap().expect("the server allows streams");
+    let stream =
+        pair.client.open(client, Direction::Uni).unwrap().expect("the server allows streams");
     pair.client.send(stream, b"one way").unwrap();
     pair.client.finish(stream).unwrap();
     pair.settle();
-    let at = opened(&pair.server_events, server, Direction::Uni).unwrap_or_else(|| panic!("{:?}", pair.server_events));
+    let at = opened(&pair.server_events, server, Direction::Uni)
+        .unwrap_or_else(|| panic!("{:?}", pair.server_events));
     assert_eq!(data_of(&pair.server_events, at), b"one way");
     assert!(finished(&pair.server_events, at));
-    assert!(pair.server.send(at, b"x").is_err_and(|it| it.step == Step::Stream), "the peer's unidirectional stream takes no bytes");
+    assert!(
+        pair.server.send(at, b"x").is_err_and(|it| it.step == Step::Stream),
+        "the peer's unidirectional stream takes no bytes"
+    );
 
-    let back = pair.server.open(server, Direction::Uni).unwrap().expect("the client allows streams");
+    let back =
+        pair.server.open(server, Direction::Uni).unwrap().expect("the client allows streams");
     pair.server.send(back, b"one way").unwrap();
     pair.server.finish(back).unwrap();
     pair.settle();
-    let seen = opened(&pair.client_events, client, Direction::Uni).unwrap_or_else(|| panic!("{:?}", pair.client_events));
+    let seen = opened(&pair.client_events, client, Direction::Uni)
+        .unwrap_or_else(|| panic!("{:?}", pair.client_events));
     assert_eq!(data_of(&pair.client_events, seen), b"one way");
     assert!(finished(&pair.client_events, seen));
 }
@@ -365,12 +422,25 @@ fn a_refused_session_ends_with_its_status() {
 fn a_certificate_not_pinned_fails_the_handshake_naming_the_server() {
     let epoch = Instant::now();
     let (server, _) = server(epoch);
-    let client = Endpoint::new(epoch, None, Some(ClientConfig { pins: vec![[7; 32]], transport: Transport::default() })).unwrap();
-    let mut pair = Pair { server, client, now: Duration::ZERO, server_events: Vec::new(), client_events: Vec::new() };
+    let client = Endpoint::new(
+        epoch,
+        None,
+        Some(ClientConfig { pins: vec![[7; 32]], transport: Transport::default() }),
+    )
+    .unwrap();
+    let mut pair = Pair {
+        server,
+        client,
+        now: Duration::ZERO,
+        server_events: Vec::new(),
+        client_events: Vec::new(),
+    };
     let session = pair.client.connect(SERVER, URL, &[]).unwrap();
     pair.settle();
     let closed = pair.client_events.iter().find_map(|it| match it {
-        Event::SessionClosed { session: at, closed: Closed::Failed(error) } if *at == session => Some(error.clone()),
+        Event::SessionClosed { session: at, closed: Closed::Failed(error) } if *at == session => {
+            Some(error.clone())
+        }
         _ => None,
     });
     let error = closed.unwrap_or_else(|| panic!("{:?}", pair.client_events));
@@ -390,8 +460,14 @@ fn a_closed_session_tells_the_peer_its_code_and_reason() {
             _ => None,
         })
     };
-    assert_eq!(closed(&pair.client_events, client), Some(Closed::ByPeer { code: 7, reason: "bye".to_owned() }));
-    assert_eq!(closed(&pair.server_events, server), Some(Closed::Local { code: 7, reason: "bye".to_owned() }));
+    assert_eq!(
+        closed(&pair.client_events, client),
+        Some(Closed::ByPeer { code: 7, reason: "bye".to_owned() })
+    );
+    assert_eq!(
+        closed(&pair.server_events, server),
+        Some(Closed::Local { code: 7, reason: "bye".to_owned() })
+    );
     assert!(pair.client.open(client, Direction::Bi).is_err(), "a closed session opens no stream");
 
     // Then the connection closes, cleanly, and is forgotten by both.
@@ -410,7 +486,13 @@ fn a_peer_with_no_settings_fails_at_exactly_the_settings_wait() {
     let epoch = Instant::now();
     let (server, pin) = server(epoch);
     let client = Mute::new(epoch, pin);
-    let mut pair = Pair { server, client, now: Duration::ZERO, server_events: Vec::new(), client_events: Vec::new() };
+    let mut pair = Pair {
+        server,
+        client,
+        now: Duration::ZERO,
+        server_events: Vec::new(),
+        client_events: Vec::new(),
+    };
     pair.pump();
     assert!(!pair.client.conn.is_handshaking(), "the handshake is done at {:?}", pair.now);
     let connected = pair.now;
@@ -445,7 +527,13 @@ fn a_request_that_is_not_webtransport_is_answered_and_reported() {
     let conn = super::ConnId(0);
     let mut head = Vec::new();
     super::qpack::encode(
-        &[(":method", "CONNECT"), (":protocol", "websocket"), (":scheme", "https"), (":authority", "x"), (":path", "/")],
+        &[
+            (":method", "CONNECT"),
+            (":protocol", "websocket"),
+            (":scheme", "https"),
+            (":authority", "x"),
+            (":path", "/"),
+        ],
         &mut head,
     );
     let mut bytes = Vec::new();

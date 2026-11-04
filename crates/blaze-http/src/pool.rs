@@ -49,7 +49,11 @@ impl Pool {
         if self.most == 0 {
             return Some(conn);
         }
-        let gone = if self.idle.len() >= self.most { self.idle.pop_front().map(|it| it.conn) } else { None };
+        let gone = if self.idle.len() >= self.most {
+            self.idle.pop_front().map(|it| it.conn)
+        } else {
+            None
+        };
         self.idle.push_back(Idle { origin, conn, since: now });
         gone
     }

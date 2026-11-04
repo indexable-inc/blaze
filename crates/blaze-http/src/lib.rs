@@ -77,6 +77,6 @@ pub mod tokio_driver;
 mod tests;
 
 pub use client::{
-    Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, IDLE_MOST, Io, Kind, REDIRECTS, Request, RequestId,
-    Step, WINDOW,
+    Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, IDLE_MOST, Io, Kind, REDIRECTS,
+    Request, RequestId, Step, WINDOW,
 };

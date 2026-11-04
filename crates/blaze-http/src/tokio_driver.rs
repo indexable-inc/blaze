@@ -133,10 +133,18 @@ struct Loop {
     askers: BTreeMap<RequestId, mpsc::UnboundedSender<Event>>,
 }
 
-async fn run(mut client: Client, mut inbox: mpsc::UnboundedReceiver<Message>, to_loop: mpsc::UnboundedSender<Message>) {
+async fn run(
+    mut client: Client,
+    mut inbox: mpsc::UnboundedReceiver<Message>,
+    to_loop: mpsc::UnboundedSender<Message>,
+) {
     let start = Instant::now();
-    let mut state =
-        Loop { to_loop, sockets: BTreeMap::new(), connecting: BTreeMap::new(), askers: BTreeMap::new() };
+    let mut state = Loop {
+        to_loop,
+        sockets: BTreeMap::new(),
+        connecting: BTreeMap::new(),
+        askers: BTreeMap::new(),
+    };
     loop {
         client.advance_clock(start.elapsed());
         while let Some(io) = client.next_io() {

@@ -24,7 +24,9 @@ impl fmt::Display for TlsSetup {
                 f,
                 "the machine's certificates cannot be read: no root certificate to check servers with ({skipped} did not parse; errors loading them: {errors:?})"
             ),
-            TlsSetup::Versions(why) => write!(f, "rustls on ring has no safe default TLS versions: {why}"),
+            TlsSetup::Versions(why) => {
+                write!(f, "rustls on ring has no safe default TLS versions: {why}")
+            }
         }
     }
 }

@@ -214,7 +214,10 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
         }
         // alloc: the error, once, and nothing runs.
         Err(error) => {
-            return Err(format!("making the run's temporary directory {}: {error}", temp.display()));
+            return Err(format!(
+                "making the run's temporary directory {}: {error}",
+                temp.display()
+            ));
         }
     }
     let writes = Vec::with_capacity(spec.write.len());

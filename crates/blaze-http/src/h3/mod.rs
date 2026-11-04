@@ -70,10 +70,12 @@ mod tests;
 
 use std::net::SocketAddr;
 
-pub use config::{ALPN, ClientConfig, Identity, MOST_VALID, ServerConfig, Transport, check_pinned, server_tls};
+pub use config::{
+    ALPN, ClientConfig, Identity, MOST_VALID, ServerConfig, Transport, check_pinned, server_tls,
+};
 pub use endpoint::{
-    Closed, ConnId, Direction, Endpoint, Event, LINGER, MOST_HELD, SETTINGS_WAIT, SessionId, SessionRequest, StreamRef, Transmit,
-    WINDOW,
+    Closed, ConnId, Direction, Endpoint, Event, LINGER, MOST_HELD, SETTINGS_WAIT, SessionId,
+    SessionRequest, StreamRef, Transmit, WINDOW,
 };
 pub use frame::Settings;
 

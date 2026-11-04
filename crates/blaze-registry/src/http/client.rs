@@ -70,7 +70,8 @@ impl HyperHttp {
             clippy::disallowed_types,
             reason = "the process's one HTTP client: its runtime and connection pool are shared by every fetch"
         )]
-        static SHARED: std::sync::OnceLock<Result<Arc<HyperHttp>, String>> = std::sync::OnceLock::new();
+        static SHARED: std::sync::OnceLock<Result<Arc<HyperHttp>, String>> =
+            std::sync::OnceLock::new();
         let shared = SHARED.get_or_init(|| {
             HyperHttp::new(Duration::from_secs(30)).map(Arc::new).map_err(|e| format!("{e:#}"))
         });
@@ -96,7 +97,14 @@ impl HyperHttp {
         headers: &[(&str, &str)],
         bounds: Bounds,
     ) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.fetch(Method::GET, url, headers, Vec::new(), bounds, None))
+        self.runtime.block_on(self.client.fetch(
+            Method::GET,
+            url,
+            headers,
+            Vec::new(),
+            bounds,
+            None,
+        ))
     }
 }
 
@@ -118,7 +126,10 @@ impl Requests {
             // alloc: one per request, handed to the client.
             url: url.to_owned(),
             // alloc: one per request, its headers handed to the client.
-            headers: headers.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
             body,
             // A streamed body is written out as it comes and hashed from there, so it is asked
             // for as it is kept: not encoded. Any other is asked for as gzip, decoded by the
@@ -142,8 +153,12 @@ impl Requests {
             let encoded = headers.iter().find(|(name, _)| name == "content-encoding");
             // A server's answer, not a lost connection: asking again gets the same, so it is
             // no `Transport` error and never tried again.
-            if let Some((_, encoding)) = encoded.filter(|(_, it)| !it.eq_ignore_ascii_case("identity")) {
-                anyhow::bail!("{said} sent its body as `{encoding}`, which was not asked for, so none of it was kept");
+            if let Some((_, encoding)) =
+                encoded.filter(|(_, it)| !it.eq_ignore_ascii_case("identity"))
+            {
+                anyhow::bail!(
+                    "{said} sent its body as `{encoding}`, which was not asked for, so none of it was kept"
+                );
             }
             // Held to `bounds.most` by the client, as sent (nothing is decoded).
             while let Some(piece) = body(&mut answer, &said).await? {
@@ -161,10 +176,12 @@ impl Requests {
         let mut bytes = Vec::new();
         while let Some(piece) = body(&mut answer, &said).await? {
             let left = room.saturating_sub(bytes.len());
-            if piece.len() > left {
+            // Stage 0 (blaze 0.20261030.1) finds no `len` on `[u8]` in this body; Vec's own works.
+            if Vec::len(&piece) > left {
                 if !streamed {
                     // The client holds the body to `most` itself; past it is its bug, said here.
-                    let refused = Refused::TooBig { url: said.clone(), most, said: None, decoded: true };
+                    let refused =
+                        Refused::TooBig { url: said.clone(), most, said: None, decoded: true };
                     return Err(refused.into());
                 }
                 bytes.extend_from_slice(&piece[..left]);
@@ -176,7 +193,9 @@ impl Requests {
         let mut response = Response { status, headers, body: bytes };
         // gzip a streamed request did not ask for, on an error's body: decoded for its message,
         // as far as `most`. Any other request's gzip the client decoded.
-        if streamed && response.header("content-encoding").is_some_and(|it| it.eq_ignore_ascii_case("gzip")) {
+        if streamed
+            && response.header("content-encoding").is_some_and(|it| it.eq_ignore_ascii_case("gzip"))
+        {
             // alloc: one per gzip error body, at most `most` bytes and one.
             let mut decoded = Vec::new();
             flate2::read::GzDecoder::new(&response.body[..])
@@ -218,12 +237,24 @@ fn failed(error: blaze_http::Error) -> anyhow::Error {
     match error.kind {
         Kind::NotHttps => Refused::NotHttps { url: said }.into(),
         Kind::Downgraded { to } => Refused::Downgraded { from: said, to: redact(&to) }.into(),
-        Kind::TooBig { most, said: length, decoded } => Refused::TooBig { url: said, most, said: length, decoded }.into(),
-        Kind::NoAnswer { after, .. } => Transport(format!("no answer from {said} in {after:?}")).into(),
-        Kind::Stalled { after, .. } => Transport(format!("transfer from {said} stalled for {after:?}")).into(),
-        Kind::Io { step, host, port, why } => Transport(scrub(&format!("{step} {host}:{port} for {said}: {why}"))).into(),
+        Kind::TooBig { most, said: length, decoded } => {
+            Refused::TooBig { url: said, most, said: length, decoded }.into()
+        }
+        Kind::NoAnswer { after, .. } => {
+            Transport(format!("no answer from {said} in {after:?}")).into()
+        }
+        Kind::Stalled { after, .. } => {
+            Transport(format!("transfer from {said} stalled for {after:?}")).into()
+        }
+        Kind::Io { step, host, port, why } => {
+            Transport(scrub(&format!("{step} {host}:{port} for {said}: {why}"))).into()
+        }
         Kind::Gzip(why) => Transport(format!("{said} sent gzip that is not: {why}")).into(),
-        kind @ (Kind::Url(_) | Kind::Header(_) | Kind::Redirects { .. } | Kind::RedirectsNowhere { .. } | Kind::InUse) => {
+        kind @ (Kind::Url(_)
+        | Kind::Header(_)
+        | Kind::Redirects { .. }
+        | Kind::RedirectsNowhere { .. }
+        | Kind::InUse) => {
             anyhow::anyhow!("{said}: {kind}")
         }
     }
@@ -234,8 +265,20 @@ impl Http for HyperHttp {
         self.send(Method::GET, url, headers, Vec::new())
     }
 
-    fn stream(&self, url: &str, headers: &[(&str, &str)], sink: Sink<'_>) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.fetch(Method::GET, url, headers, Vec::new(), Bounds::NONE, Some(sink)))
+    fn stream(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        sink: Sink<'_>,
+    ) -> anyhow::Result<Response> {
+        self.runtime.block_on(self.client.fetch(
+            Method::GET,
+            url,
+            headers,
+            Vec::new(),
+            Bounds::NONE,
+            Some(sink),
+        ))
     }
 
     fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
@@ -318,9 +361,12 @@ mod tests {
     fn a_stalled_transfer_says_no_credential() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let to = format!("http://127.0.0.1:{port}/b?X-Amz-Credential=me@example&X-Amz-Signature=secret");
+        let to =
+            format!("http://127.0.0.1:{port}/b?X-Amz-Credential=me@example&X-Amz-Signature=secret");
         let answers = [
-            format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
             "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc".to_owned(),
         ];
         std::thread::Builder::new()
@@ -385,7 +431,11 @@ mod tests {
                             }
                         };
                         asked.drain(..end);
-                        if stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.is_err() {
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -394,7 +444,11 @@ mod tests {
         };
         std::thread::Builder::new()
             .name("a keep-alive server".to_owned())
-            .spawn(move || server.block_on(async move { _ = tokio::time::timeout(Duration::from_secs(60), serving).await }))
+            .spawn(move || {
+                server.block_on(async move {
+                    _ = tokio::time::timeout(Duration::from_secs(60), serving).await
+                })
+            })
             .unwrap();
 
         let http = HyperHttp::new(Duration::from_secs(10)).unwrap();
@@ -403,7 +457,11 @@ mod tests {
             let got = http.get(&url, &[]).unwrap();
             assert_eq!((got.status, &got.body[..]), (200, &b"ok"[..]));
         }
-        assert_eq!(accepted.load(Ordering::SeqCst), 1, "three requests should have shared one connection");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "three requests should have shared one connection"
+        );
 
         let refusing = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let closed = refusing.local_addr().unwrap().port();
@@ -411,7 +469,12 @@ mod tests {
         let got = http.get(&format!("http://127.0.0.1:{closed}/a"), &[]).unwrap_err();
         let said = format!("{got:#}");
         assert!(got.downcast_ref::<Transport>().is_some(), "{said}");
-        assert!(said.contains(&format!("connecting to 127.0.0.1:{closed} for http://127.0.0.1:{closed}/a")), "{said}");
+        assert!(
+            said.contains(&format!(
+                "connecting to 127.0.0.1:{closed} for http://127.0.0.1:{closed}/a"
+            )),
+            "{said}"
+        );
     }
 
     /// A redirect off HTTPS (blaze-http's tests follow one there) is [`Refused::Downgraded`],
@@ -425,7 +488,10 @@ mod tests {
         match failed(error).downcast_ref::<Refused>() {
             Some(Refused::Downgraded { from, to }) => assert_eq!(
                 (from.as_str(), to.as_str()),
-                ("https://github.com/o/r/releases/download/v1/a.tar.gz", "http://objects.example/a")
+                (
+                    "https://github.com/o/r/releases/download/v1/a.tar.gz",
+                    "http://objects.example/a"
+                )
             ),
             other => panic!("{other:?}"),
         }

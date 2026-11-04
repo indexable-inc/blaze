@@ -97,7 +97,9 @@ fn transport(limits: &Transport) -> Result<Arc<TransportConfig>, Error> {
 /// the check that rustls takes the certificate and key at all.
 pub fn server_tls(identity: &Identity) -> Result<rustls::ServerConfig, Error> {
     // alloc: an error's message, made only when it fails.
-    let refused = |why: rustls::Error| config_error(format!("rustls did not take the certificate and key: {why}"));
+    let refused = |why: rustls::Error| {
+        config_error(format!("rustls did not take the certificate and key: {why}"))
+    };
     let mut tls = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(refused)?
@@ -131,7 +133,10 @@ pub(crate) fn server(config: &ServerConfig) -> Result<Arc<quinn_proto::ServerCon
 pub(crate) fn client(config: &ClientConfig) -> Result<quinn_proto::ClientConfig, Error> {
     let provider = provider();
     // alloc: one verifier per config.
-    let verifier = Arc::new(Pinned { pins: config.pins.clone(), algorithms: provider.signature_verification_algorithms });
+    let verifier = Arc::new(Pinned {
+        pins: config.pins.clone(),
+        algorithms: provider.signature_verification_algorithms,
+    });
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         // alloc: an error's message, made only when it fails.
@@ -166,7 +171,8 @@ impl ServerCertVerifier for Pinned {
         _ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        check_pinned(end_entity.as_ref(), &self.pins, now.as_secs()).map_err(rustls::Error::General)?;
+        check_pinned(end_entity.as_ref(), &self.pins, now.as_secs())
+            .map_err(rustls::Error::General)?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -201,7 +207,10 @@ pub fn check_pinned(der: &[u8], pins: &[[u8; 32]], now_s: u64) -> Result<(), Str
         // alloc: an error's message, made only when it fails.
         let hex: String = hash.iter().map(|it| format!("{it:02x}")).collect();
         // alloc: an error's message, made only when it fails.
-        return Err(format!("the server's certificate (SHA-256 {hex}) is not one of the {} pinned", pins.len()));
+        return Err(format!(
+            "the server's certificate (SHA-256 {hex}) is not one of the {} pinned",
+            pins.len()
+        ));
     }
     let facts = der::read(der).map_err(|why| {
         // alloc: an error's message, made only when it fails.
@@ -214,7 +223,9 @@ pub fn check_pinned(der: &[u8], pins: &[[u8; 32]], now_s: u64) -> Result<(), Str
     let span = facts.not_after_s.saturating_sub(facts.not_before_s);
     if span > MOST_VALID.as_secs() {
         // alloc: an error's message, made only when it fails.
-        return Err(format!("the server's certificate is valid {span} s, past the 14 days serverCertificateHashes takes"));
+        return Err(format!(
+            "the server's certificate is valid {span} s, past the 14 days serverCertificateHashes takes"
+        ));
     }
     if !(facts.not_before_s..=facts.not_after_s).contains(&now_s) {
         // alloc: an error's message, made only when it fails.
@@ -263,7 +274,11 @@ mod der {
         Ok((tag, &rest[..len], &rest[len..]))
     }
 
-    fn expect(bytes: &[u8], tag: u8, what: &'static str) -> Result<(&[u8], &[u8]), &'static str> {
+    fn expect<'a>(
+        bytes: &'a [u8],
+        tag: u8,
+        what: &'static str,
+    ) -> Result<(&'a [u8], &'a [u8]), &'static str> {
         let (got, contents, rest) = element(bytes)?;
         if got != tag {
             return Err(what);
@@ -292,7 +307,8 @@ mod der {
         let (spki, _) = expect(rest, SEQUENCE, "the subject's public key info is not a SEQUENCE")?;
         let (algorithm, _) = expect(spki, SEQUENCE, "the key's algorithm is not a SEQUENCE")?;
         let (oid, params) = expect(algorithm, OID, "the key's algorithm is not an OID")?;
-        let p256 = oid == EC_PUBLIC_KEY && matches!(element(params), Ok((OID, curve, _)) if curve == P256);
+        let p256 =
+            oid == EC_PUBLIC_KEY && matches!(element(params), Ok((OID, curve, _)) if curve == P256);
         Ok(Facts { not_before_s, not_after_s, p256 })
     }
 
@@ -301,7 +317,11 @@ mod der {
         let digits = |range: std::ops::Range<usize>| -> Result<u64, &'static str> {
             let part = text.get(range).ok_or("a time is cut off")?;
             part.iter().try_fold(0u64, |acc, it| {
-                if it.is_ascii_digit() { Ok(acc * 10 + u64::from(it - b'0')) } else { Err("a time has a non-digit") }
+                if it.is_ascii_digit() {
+                    Ok(acc * 10 + u64::from(it - b'0'))
+                } else {
+                    Err("a time has a non-digit")
+                }
             })
         };
         let (year, at) = match tag {
@@ -316,8 +336,14 @@ mod der {
             return Err("a validity time is not YYMMDDHHMMSSZ");
         }
         let (month, day) = (digits(at..at + 2)?, digits(at + 2..at + 4)?);
-        let (hour, minute, second) = (digits(at + 4..at + 6)?, digits(at + 6..at + 8)?, digits(at + 8..at + 10)?);
-        if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        let (hour, minute, second) =
+            (digits(at + 4..at + 6)?, digits(at + 6..at + 8)?, digits(at + 8..at + 10)?);
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || hour > 23
+            || minute > 59
+            || second > 60
+        {
             return Err("a validity time is out of range");
         }
         if year < 1970 {

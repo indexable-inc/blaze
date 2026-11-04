@@ -30,7 +30,8 @@ use tokio::{
 };
 
 use super::{
-    ClientConfig, Closed, Direction, Endpoint, Error, Event, Identity, ServerConfig, SessionId, SessionRequest, Step, StreamRef,
+    ClientConfig, Closed, Direction, Endpoint, Error, Event, Identity, ServerConfig, SessionId,
+    SessionRequest, Step, StreamRef,
 };
 
 /// The largest UDP datagram read.
@@ -47,19 +48,63 @@ pub struct Driver {
 
 /// What the loop is told by the handles.
 enum Message {
-    Connect { to: SocketAddr, url: String, headers: Vec<(String, String)>, reply: oneshot::Sender<Result<Session, Closed>> },
-    Accept { session: SessionId, reply: oneshot::Sender<Result<Session, Closed>> },
-    Refuse { session: SessionId, status: u16 },
-    Open { session: SessionId, open: Opening },
-    Send { stream: StreamRef, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), StreamError>> },
-    Finish { stream: StreamRef },
-    Reset { stream: StreamRef, code: u32 },
-    Stop { stream: StreamRef, code: u32 },
-    Consumed { stream: StreamRef, bytes: usize },
-    Datagram { session: SessionId, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), Error>> },
-    Close { session: SessionId, code: u32, reason: String },
-    SetIdentity { identity: Identity, reply: oneshot::Sender<Result<(), Error>> },
-    CloseAll { code: u32, reason: String, reply: oneshot::Sender<()> },
+    Connect {
+        to: SocketAddr,
+        url: String,
+        headers: Vec<(String, String)>,
+        reply: oneshot::Sender<Result<Session, Closed>>,
+    },
+    Accept {
+        session: SessionId,
+        reply: oneshot::Sender<Result<Session, Closed>>,
+    },
+    Refuse {
+        session: SessionId,
+        status: u16,
+    },
+    Open {
+        session: SessionId,
+        open: Opening,
+    },
+    Send {
+        stream: StreamRef,
+        bytes: Vec<u8>,
+        reply: oneshot::Sender<Result<(), StreamError>>,
+    },
+    Finish {
+        stream: StreamRef,
+    },
+    Reset {
+        stream: StreamRef,
+        code: u32,
+    },
+    Stop {
+        stream: StreamRef,
+        code: u32,
+    },
+    Consumed {
+        stream: StreamRef,
+        bytes: usize,
+    },
+    Datagram {
+        session: SessionId,
+        bytes: Vec<u8>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    Close {
+        session: SessionId,
+        code: u32,
+        reason: String,
+    },
+    SetIdentity {
+        identity: Identity,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    CloseAll {
+        code: u32,
+        reason: String,
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// A stream asked for, waiting for the peer to allow one.
@@ -134,7 +179,11 @@ impl Driver {
         client: Option<ClientConfig>,
     ) -> Result<(Driver, mpsc::UnboundedReceiver<Request>), Error> {
         // alloc: an error's message, made only when it fails.
-        let io = |what: &str, why: std::io::Error| Error { peer: None, step: Step::Config, why: format!("{what}: {why}") };
+        let io = |what: &str, why: std::io::Error| Error {
+            peer: None,
+            step: Step::Config,
+            why: format!("{what}: {why}"),
+        };
         let local = socket.local_addr().map_err(|why| io("the UDP socket's address", why))?;
         socket.set_nonblocking(true).map_err(|why| io("the UDP socket made non-blocking", why))?;
         let socket = {
@@ -167,7 +216,12 @@ impl Driver {
 
     /// Opens a session to `to` at `url` (`https://host:port/path`), sending `headers`
     /// (lowercase names, no pseudo-fields) with its CONNECT.
-    pub async fn connect(&self, to: SocketAddr, url: &str, headers: &[(&str, &str)]) -> Result<Session, Closed> {
+    pub async fn connect(
+        &self,
+        to: SocketAddr,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Session, Closed> {
         let (reply, answer) = oneshot::channel();
         // alloc: the ask's fields, once a session.
         let headers = headers.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())).collect();
@@ -183,7 +237,11 @@ impl Driver {
     pub async fn set_identity(&self, identity: Identity) -> Result<(), Error> {
         let (reply, answer) = oneshot::channel();
         // alloc: an error's message, made only when it fails.
-        let gone = || Error { peer: None, step: Step::Config, why: "the HTTP/3 driver stopped".to_owned() };
+        let gone = || Error {
+            peer: None,
+            step: Step::Config,
+            why: "the HTTP/3 driver stopped".to_owned(),
+        };
         if self.to_loop.send(Message::SetIdentity { identity, reply }).is_err() {
             return Err(gone());
         }
@@ -333,7 +391,12 @@ impl Session {
     /// Opens a bidirectional stream, waiting while the peer allows no more.
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), Closed> {
         let (reply, answer) = oneshot::channel();
-        if self.inner.to_loop.send(Message::Open { session: self.inner.id, open: Opening::Bi(reply) }).is_err() {
+        if self
+            .inner
+            .to_loop
+            .send(Message::Open { session: self.inner.id, open: Opening::Bi(reply) })
+            .is_err()
+        {
             return Err(driver_gone(Some(self.inner.peer)));
         }
         answer.await.unwrap_or_else(|_| Err(driver_gone(Some(self.inner.peer))))
@@ -342,7 +405,12 @@ impl Session {
     /// Opens a unidirectional stream, waiting while the peer allows no more.
     pub async fn open_uni(&self) -> Result<SendStream, Closed> {
         let (reply, answer) = oneshot::channel();
-        if self.inner.to_loop.send(Message::Open { session: self.inner.id, open: Opening::Uni(reply) }).is_err() {
+        if self
+            .inner
+            .to_loop
+            .send(Message::Open { session: self.inner.id, open: Opening::Uni(reply) })
+            .is_err()
+        {
             return Err(driver_gone(Some(self.inner.peer)));
         }
         answer.await.unwrap_or_else(|_| Err(driver_gone(Some(self.inner.peer))))
@@ -354,7 +422,11 @@ impl Session {
         // alloc: one datagram, handed to the loop.
         let message = Message::Datagram { session: self.inner.id, bytes: bytes.to_vec(), reply };
         // alloc: an error's message, made only when it fails.
-        let gone = || Error { peer: Some(self.inner.peer), step: Step::Datagram, why: "the HTTP/3 driver stopped".to_owned() };
+        let gone = || Error {
+            peer: Some(self.inner.peer),
+            step: Step::Datagram,
+            why: "the HTTP/3 driver stopped".to_owned(),
+        };
         if self.inner.to_loop.send(message).is_err() {
             return Err(gone());
         }
@@ -397,7 +469,11 @@ impl SendStream {
         }
         let (reply, answer) = oneshot::channel();
         // alloc: the bytes, handed to the loop.
-        if self.to_loop.send(Message::Send { stream: self.stream, bytes: bytes.to_vec(), reply }).is_err() {
+        if self
+            .to_loop
+            .send(Message::Send { stream: self.stream, bytes: bytes.to_vec(), reply })
+            .is_err()
+        {
             return Err(StreamError::Gone);
         }
         answer.await.unwrap_or(Err(StreamError::Gone))
@@ -610,7 +686,8 @@ impl Loop {
         match message {
             Message::Connect { to, url, headers, reply } => {
                 // alloc: the CONNECT's fields as the core takes them, once a session.
-                let fields: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+                let fields: Vec<(&str, &str)> =
+                    headers.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
                 match self.endpoint.connect(to, &url, &fields) {
                     Ok(session) => {
                         self.connects.insert(session, reply);
@@ -661,12 +738,16 @@ impl Loop {
                 self.forget(stream);
             }
             Message::Consumed { stream, bytes } => self.endpoint.consumed(stream, bytes),
-            Message::Datagram { session, bytes, reply } => _ = reply.send(self.endpoint.send_datagram(session, &bytes)),
+            Message::Datagram { session, bytes, reply } => {
+                _ = reply.send(self.endpoint.send_datagram(session, &bytes))
+            }
             Message::Close { session, code, reason } => {
                 // A session already gone needs no close.
                 _ = self.endpoint.close(session, code, &reason);
             }
-            Message::SetIdentity { identity, reply } => _ = reply.send(self.endpoint.set_identity(identity)),
+            Message::SetIdentity { identity, reply } => {
+                _ = reply.send(self.endpoint.set_identity(identity))
+            }
             Message::CloseAll { code, reason, reply } => {
                 self.endpoint.close_all(code, &reason);
                 self.closing.push(reply);
@@ -676,7 +757,8 @@ impl Loop {
 
     fn gone_session(&self, session: SessionId) -> Closed {
         // alloc: an error's message, made only when it fails.
-        let why = format!("session {} of connection {} is not open", session.stream, session.conn.0);
+        let why =
+            format!("session {} of connection {} is not open", session.stream, session.conn.0);
         Closed::Failed(Error { peer: self.endpoint.peer(session.conn), step: Step::Session, why })
     }
 
@@ -689,7 +771,8 @@ impl Loop {
         let (uni, uni_rx) = mpsc::unbounded_channel();
         let (datagrams, datagrams_rx) = mpsc::channel(DATAGRAMS_HELD);
         let (closed, closed_rx) = watch::channel(None);
-        self.sessions.insert(id, SessionTx { bi, uni, datagrams, closed, opening: VecDeque::new() });
+        self.sessions
+            .insert(id, SessionTx { bi, uni, datagrams, closed, opening: VecDeque::new() });
         let inner = SessionInner {
             id,
             peer,
@@ -705,7 +788,11 @@ impl Loop {
 
     /// The handles of a stream, and the loop's side of it: a [`SendStream`] unless it is the
     /// peer's unidirectional one, a [`RecvStream`] unless it is this side's.
-    fn stream(&mut self, stream: StreamRef, opener: Opener) -> Option<(Option<SendStream>, Option<RecvStream>)> {
+    fn stream(
+        &mut self,
+        stream: StreamRef,
+        opener: Opener,
+    ) -> Option<(Option<SendStream>, Option<RecvStream>)> {
         let to_loop = self.handle()?;
         let (sends, receives) = match (stream.direction(), opener) {
             (Direction::Bi, _) => (true, true),
@@ -721,7 +808,14 @@ impl Loop {
         let recv = receives.then(|| {
             let (pieces, pieces_rx) = mpsc::unbounded_channel();
             tx.pieces = Some(pieces);
-            RecvStream { stream, to_loop, pieces: pieces_rx, piece: Vec::new(), at: 0, ended: false }
+            RecvStream {
+                stream,
+                to_loop,
+                pieces: pieces_rx,
+                piece: Vec::new(),
+                at: 0,
+                ended: false,
+            }
         });
         self.streams.insert(stream, tx);
         Some((send, recv))
@@ -734,7 +828,9 @@ impl Loop {
             let Some(open) = tx.opening.pop_front() else { return };
             match self.endpoint.open(session, open.direction()) {
                 Ok(Some(stream)) => match (open, self.stream(stream, Opener::Here)) {
-                    (Opening::Bi(reply), Some((Some(send), Some(recv)))) => _ = reply.send(Ok((send, recv))),
+                    (Opening::Bi(reply), Some((Some(send), Some(recv)))) => {
+                        _ = reply.send(Ok((send, recv)))
+                    }
                     (Opening::Uni(reply), Some((Some(send), _))) => _ = reply.send(Ok(send)),
                     (open, _) => open.fail(driver_gone(None)),
                 },
@@ -814,7 +910,11 @@ impl Loop {
                 }
                 Event::StreamData { stream, bytes } => {
                     let len = bytes.len();
-                    let taken = self.streams.get(&stream).and_then(|it| it.pieces.as_ref()).is_some_and(|it| it.send(Piece::Data(bytes)).is_ok());
+                    let taken = self
+                        .streams
+                        .get(&stream)
+                        .and_then(|it| it.pieces.as_ref())
+                        .is_some_and(|it| it.send(Piece::Data(bytes)).is_ok());
                     if !taken {
                         // No reader: its drop stops the stream, and what came meanwhile is let go.
                         self.endpoint.consumed(stream, len);
@@ -834,7 +934,8 @@ impl Loop {
                     self.forget(stream);
                 }
                 Event::StreamSent { stream } => {
-                    if let Some(sent) = self.streams.get_mut(&stream).and_then(|it| it.sent.take()) {
+                    if let Some(sent) = self.streams.get_mut(&stream).and_then(|it| it.sent.take())
+                    {
                         _ = sent.send(Ok(()));
                     }
                 }
