@@ -122,10 +122,6 @@ pub struct Expansion {
     pub output: Result<String, String>,
 }
 
-/// The expansion of a call by a proc macro the compiler has in it (`blaze_wasm::macros`), for
-/// a call the pack has no expansion of: `None` when it has no such macro.
-pub type Builtin = fn(&Call) -> Option<Result<String, String>>;
-
 pub type Expansions = HashMap<Call, Result<String, String>, Global>;
 
 /// A proc macro that is the expansions it had when the pack was made.
@@ -134,7 +130,6 @@ struct Replay {
     krate: String,
     name: String,
     expansions: Arc<Expansions>,
-    builtin: Builtin,
     /// Calls there was no expansion for.
     missed: Arc<Mutex<Vec<Call>>>,
 }
@@ -152,11 +147,11 @@ impl ProcMacroExpander for Replay {
         };
         let output = match self.expansions.get(&recorded) {
             Some(output) => output.clone(),
-            None => (self.builtin)(&recorded).unwrap_or_else(|| {
+            None => {
                 let missed = format!("no expansion of `{}` was recorded for this input", recorded.name);
                 self.missed.lock().push(recorded);
                 Err(missed)
-            }),
+            }
         };
         let output = output.map_err(ProcMacroExpansionError::Panic)?;
         syntax_bridge::parse_to_token_tree_static_span(Edition::CURRENT, call.call_site, &output)
@@ -203,7 +198,7 @@ impl Kind {
 }
 
 impl Pack {
-    pub fn project(self, builtin: Builtin) -> Result<Project, String> {
+    pub fn project(self) -> Result<Project, String> {
         let paths: HashMap<u32, &str, Global> = self.files.iter().map(|it| (it.id, &*it.path)).collect();
         let roots = self
             .roots
@@ -275,7 +270,6 @@ impl Pack {
                         krate: krate.name.clone().unwrap_or_default(),
                         name: it.name.clone(),
                         expansions: expansions.clone(),
-                        builtin,
                         missed: missed.clone(),
                     }),
                     disabled: false,

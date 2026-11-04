@@ -14,7 +14,6 @@ pub mod bundle;
 #[cfg(target_family = "wasm")]
 mod exports;
 pub mod link;
-pub mod macros;
 pub use blaze_wasm_pack as pack;
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -200,8 +199,8 @@ impl Compiler {
 
     /// Sets the workspace of a pack as what there is to compile. The file its program starts
     /// at is [`MAIN`] from then on.
-    pub fn set_pack(&mut self, pack: pack::Pack, builtin: pack::Builtin) -> Result<(), String> {
-        let project = pack.project(builtin)?;
+    pub fn set_pack(&mut self, pack: pack::Pack) -> Result<(), String> {
+        let project = pack.project()?;
         let mut change = ChangeWithProcMacros::default();
         for (id, path, text) in project.files {
             let path = if id == project.main { MAIN.to_owned() } else { path };
