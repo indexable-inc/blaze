@@ -2199,11 +2199,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             };
             let (_, mut it) = self.held.swap_remove(at);
             if let Said::Finish(_, _, Some(error), _) = &mut it {
-                // alloc: the error's text, once a held build
-                match &why {
-                    Some(why) => error.what = format!("{}; {why}", error.what),
-                    None => error.what = format!("{}; the daemon stopped while the build waited for gc to free space", error.what),
-                }
+                // alloc: the error and its words, once a held build
+                let more = match &why {
+                    Some(why) => why.to_string(),
+                    None => "the daemon stopped while the build waited for gc to free space".to_owned(),
+                };
+                *error = error.clone().and(&more);
             }
             said.push(it);
         }

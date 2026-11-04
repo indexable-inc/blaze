@@ -53,6 +53,8 @@ pub(crate) struct Built {
     pub link_dirs: Vec<String>,
     /// The workspace's `sandboxed-tests` experiment ([`crate::query::Units::sandboxed_tests`]).
     pub sandboxed_tests: bool,
+    /// The pinned native inputs the graph's build script runs are given ([`crate::query::Units::native`]).
+    pub native: Vec<crate::query::NativeInput>,
 }
 
 /// The units of `resolved`, as `spec` asks for them.
@@ -454,6 +456,31 @@ pub(crate) fn units(
     packages.extend(std_packages);
     packages.sort_by(|a, b| a.id.cmp(&b.id));
     packages.dedup_by(|a, b| a.id == b.id);
+    // A foreign load builds another build's dependencies (the standard library's), whose
+    // scripts are given nothing of this workspace's.
+    let native = match &spec.foreign {
+        Some(_) => Vec::new(),
+        None => {
+            // alloc: each build script run of the graph, once a load
+            let runs: Vec<super::native::ScriptRun<'_>> = graph
+                .units
+                .iter()
+                .filter(|unit| unit.mode == Mode::RunCustomBuild && !unit.is_std)
+                .filter_map(|unit| {
+                    let (id, _) = packages_by_spec.get(&unit.pkg_id)?;
+                    Some(super::native::ScriptRun {
+                        package: id.name().as_str(),
+                        platform: unit.platform.as_deref(),
+                        features: &unit.features,
+                    })
+                })
+                .collect();
+            match super::native::needed(ctx.files(), ws.custom_metadata(), ws.root_manifest(), &host.triple, &runs) {
+                Ok(it) => it,
+                Err(error) => return Ok(Staged::Failed(error)),
+            }
+        }
+    };
     Ok(Staged::Done(Built {
         graph,
         plans,
@@ -466,6 +493,7 @@ pub(crate) fn units(
         roots: named_roots,
         link_dirs: opt_out.link_dirs,
         sandboxed_tests: opt_out.sandboxed_tests,
+        native,
     }))
 }
 

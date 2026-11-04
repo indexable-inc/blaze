@@ -31,10 +31,11 @@ impl Pin {
     pub(crate) fn refusal(&self, found: &str) -> String {
         format!(
             "blaze links only the LLVM crates/hir-ty-codegen/llvm.json pins (LLVM {}, commit {}), \
-             and {found}. Build inside `nix develop`, which sets {PIN_PREFIX} to the flake's \
-             blaze-llvm, or unpack its release with `python3 .github/scripts/llvm.py fetch \
-             --target <triple> --dir <dir>` and set {PIN_PREFIX} to <dir>; for a target llvm.json \
-             has no release for, build one with the `llvm` workflow (.github/workflows/llvm.yaml)",
+             and {found}. blaze sets {PIN_PREFIX} itself, to the release llvm.json pins for the \
+             target, fetched by its sha256 and unpacked under blaze's home \
+             (`[workspace.metadata.blaze.native.llvm]` in the root Cargo.toml, docs/cargo.md \
+             \"Pinned native inputs\"); build with blaze. For a target llvm.json has no release \
+             for, build one with the `llvm` workflow (.github/workflows/llvm.yaml)",
             self.version, self.commit
         )
     }
@@ -54,10 +55,8 @@ fn pinned_llvm_config() -> Option<std::path::PathBuf> {
     if let Some(prefix) = prefix.as_ref().filter(|it| !it.is_empty()) {
         println!("cargo::rerun-if-changed={}", std::path::Path::new(prefix).join(PIN_MARKER).display());
     }
-    let pin = match std::fs::read_to_string(&json)
-        .map_err(|e| e.to_string())
-        .and_then(|it| Pin::parse(&it))
-    {
+    let text = std::fs::read_to_string(&json).map_err(|e| e.to_string());
+    let pin = match text.as_deref().map_err(String::clone).and_then(Pin::parse) {
         Ok(pin) => pin,
         Err(e) => {
             println!("cargo::error=blaze's LLVM pin `{}` can't be read: {e}", json.display());
@@ -67,9 +66,42 @@ fn pinned_llvm_config() -> Option<std::path::PathBuf> {
     match pin_check(&pin, prefix.as_deref(), std::env::consts::EXE_SUFFIX) {
         Ok(config) => Some(config),
         Err(found) => {
+            pin_report(&pin, text.as_deref().unwrap_or_default(), prefix.as_deref(), &found);
             println!("cargo::error={}", pin.refusal(&found));
             None
         }
+    }
+}
+
+/// The refusal again as `cargo:blaze-report=` lines (crates/blaze-report/src/script.rs), which
+/// blaze shows as its report: the cause in a line, what is needed and found, and fixes filled
+/// in for this target. cargo keeps them as metadata and shows the `cargo::error` alone.
+#[cfg_attr(test, allow(dead_code))]
+fn pin_report(pin: &Pin, json: &str, prefix: Option<&std::ffi::OsStr>, found: &str) {
+    let say = |field: &str, text: &str| println!("cargo:blaze-report={field}={}", text.replace(['\n', '\r'], " "));
+    let unset = prefix.is_none_or(|it| it.is_empty());
+    match unset {
+        true => say("headline", "llvm-sys can't find LLVM"),
+        false => say("headline", &format!("llvm-sys can't use the LLVM `{PIN_PREFIX}` names")),
+    }
+    say("rule", "llvm:pin");
+    let commit = &pin.commit[..pin.commit.len().min(8)];
+    say("fact.needs", &format!("needs LLVM {} ({commit}), pinned in crates/hir-ty-codegen/llvm.json", pin.version));
+    match unset {
+        true => say("fact.found", &format!("`{PIN_PREFIX}` is not set")),
+        false => say("fact.found", found),
+    }
+    say("fix", "nix develop");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    match pin_sha256(json, &target) {
+        Ok(Some(_)) => {
+            say("fix", &format!("python3 .github/scripts/llvm.py fetch --target {target} --dir ~/.blaze/llvm"));
+            say("fix+", &format!("export {PIN_PREFIX}=~/.blaze/llvm"));
+        }
+        Ok(None) | Err(_) => say(
+            "fact.release",
+            &format!("llvm.json has no release for `{target}`: build one with the `llvm` workflow (.github/workflows/llvm.yaml)"),
+        ),
     }
 }
 

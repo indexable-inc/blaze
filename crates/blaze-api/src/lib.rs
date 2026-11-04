@@ -46,10 +46,11 @@ pub mod units;
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 pub use borrowed::{
-    ApiErrorRef, BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, ResponseRef,
+    BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, ResponseRef,
     SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
 };
 pub use blaze_protocol::events::NodeKind;
+pub use blaze_report::{Blocks, Fact, Fix, Report, Severity, Span as ReportSpan, Text};
 pub use intent::{Edit, Edited, EditedItem, How, Target};
 pub use blaze_vfs::{Mode, Op};
 
@@ -78,8 +79,9 @@ use serde::{Deserialize, Serialize};
 /// [`Request::Launch`] and [`Response::Launched`]. 29: [`Response::Stopping`]. 30:
 /// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`]. 33:
 /// [`Status::bugs`]. 34: [`Request::FetchUrl`] and [`Response::Stored`]. 35:
-/// [`Status::settings`].
-pub const SCHEMA: u32 = 35;
+/// [`Status::settings`]. 36: an [`ApiError`] is its [`Report`] (docs/v2/plan/structured-output.md),
+/// [`Response::Report`], and [`Behind::id`].
+pub const SCHEMA: u32 = 36;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -686,6 +688,10 @@ pub enum Response {
     /// keeps them, and, when the request named `out`, where they are written out, read-only
     /// and named by it: a file for a URL, a directory for a git tree.
     Stored { path: Option<String>, blake3: String },
+    /// Something blaze itself says, of a unit (`unit`) or of the request: a build script that
+    /// failed, a directive the sandbox refused. A diagnostic of code is a
+    /// [`Response::Diagnostic`]; an error that ends the request is a [`Response::Error`].
+    Report { unit: Option<UnitOf>, report: Report },
 }
 
 /// What a [`Request::Doc`] documented.
@@ -973,6 +979,9 @@ pub struct Unbuilt {
 /// A failure of [`Unchecked::behind`].
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Behind {
+    /// The dense id ([`UnitOf::id`]) of the unit that failed, where the daemon knows it: what a
+    /// [`Response::Report`] of that unit is matched to its blocked units by.
+    pub id: Option<u32>,
     /// Why it failed, as its node says: `the build script failed`, `errors in its items`.
     pub why: String,
     /// The unit that failed.
@@ -1427,17 +1436,62 @@ pub struct TagMemory {
     pub high_water: u64,
 }
 
-/// What failed, and where.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+/// What failed, and where: a [`Report`] (docs/v2/plan/structured-output.md), which is all
+/// the wire carries. `what` and `at` are its words, flat ([`Report::flat`]), for a caller that
+/// puts an error into a sentence of its own; they are made from the report and never change
+/// it, so an error is changed through its report ([`ApiError::and`], [`ApiError::from`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ApiError {
     /// A file, a package, a query, a function: where it failed, as precisely as known.
     pub at: Option<String>,
     pub what: String,
+    report: Report,
 }
 
 impl ApiError {
+    /// An error that is words only ([`Report::text`]): a caller not yet given a report of its
+    /// own. docs/v2/plan/structured-output.md counts these down.
     pub fn new(what: impl Into<String>, at: Option<String>) -> ApiError {
-        ApiError { what: what.into(), at }
+        ApiError::from(Report::text(what, at))
+    }
+
+    pub fn report(&self) -> &Report {
+        &self.report
+    }
+
+    pub fn into_report(self) -> Report {
+        self.report
+    }
+
+    /// The error with `more` said after its headline: `what; more`.
+    pub fn and(self, more: &str) -> ApiError {
+        let mut report = self.report;
+        report.headline.push(blaze_report::Span::Plain(format!("; {more}"))); // alloc: an error's, once
+        ApiError::from(report)
+    }
+}
+
+impl From<Report> for ApiError {
+    fn from(report: Report) -> ApiError {
+        ApiError { at: report.at.as_ref().map(Text::flat), what: report.flat(), report }
+    }
+}
+
+impl From<ApiError> for Report {
+    fn from(error: ApiError) -> Report {
+        error.report
+    }
+}
+
+impl Serialize for ApiError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.report.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ApiError {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<ApiError, D::Error> {
+        Report::deserialize(deserializer).map(ApiError::from)
     }
 }
 

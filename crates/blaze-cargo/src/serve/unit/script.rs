@@ -26,9 +26,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use blaze_api::{ApiError, BuildScriptRan, Diagnostic, Level, Response, UnitOf};
+use blaze_api::{ApiError, BuildScriptRan, Diagnostic, Level, Report, Response, Text, UnitOf};
 use blaze_build_script::{
     output::{Context, Output, Severity},
+    run::Failed,
     unit as bs,
 };
 use blaze_cas::Store;
@@ -49,6 +50,7 @@ use super::{
     error::{UnitError, manifest_dir},
     package_of, say,
 };
+use crate::serve::native::NativeDir;
 use crate::serve::work::{RunPuts, Runs, Writer};
 
 /// The job's variable that asks an inert script compiled and run as well, and checked against
@@ -195,6 +197,7 @@ fn script_env(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsStrin
         launcher: &job.shared.launcher,
         program: named_program(units, compile).map_err(|it| it.what)?,
         scripts: &job.scripts,
+        native: &job.input.native,
     };
     let unit = script_unit(&of, run)?;
     let env = inherited(&job.input.config.invocation.env, job.plan(run).map_err(|it| it.what)?);
@@ -214,6 +217,38 @@ pub(crate) struct Of<'a> {
     /// What each run told cargo, by its unit; a slot not set is a run not ended.
     #[expect(clippy::disallowed_types, reason = "the job's slots, one per unit, each set once by its run: per job, not global")]
     pub(crate) scripts: &'a [std::sync::OnceLock<Applied>],
+    /// The build's pinned native inputs, laid out ([`crate::serve::work::JobInput::native`]).
+    pub(crate) native: &'a [NativeDir],
+}
+
+/// The pinned native inputs of `native` the build script of `unit` (its package, the target
+/// it is built for, its features) is given ([`blaze_units::query::NativeInput::gives`]).
+pub(crate) fn given<'a>(native: &'a [NativeDir], unit: &'a bs::Unit) -> impl Iterator<Item = &'a NativeDir> + 'a {
+    native.iter().filter(move |it| it.input.target == unit.target && it.input.gives(&unit.package.name, &unit.features))
+}
+
+/// The variables of the pinned native inputs the build script of `package`, built for
+/// `target`, is given: each the directory its input is laid out in, set over whatever the job's
+/// environment says of it (`force`), so the script is pointed at the verified layout and never
+/// at a place the machine names. An input the load said the run is given that was not laid out
+/// is an error naming it: nothing else is put in its place.
+fn native_env(of: &Of<'_>, package: &str, target: &str, features: &[String]) -> Result<Vec<bs::ConfigEnv>, String> {
+    let mut out = Vec::new(); // alloc: a run's few variables, once a run
+    for input in of.units.native.iter().filter(|it| it.target == target && it.gives(package, features)) {
+        let laid = of.native.iter().find(|it| it.input == *input).ok_or_else(|| {
+            format!(
+                "pinned native input `{}` for target `{target}`, which `{package}`'s build script is given in `{}`, \
+                 was not laid out before the script ran",
+                input.name, input.env
+            )
+        })?;
+        let value = laid.dir.to_str().ok_or_else(|| {
+            format!("pinned native input `{}` is laid out at {}, which is not UTF-8", input.name, laid.dir.display())
+        })?;
+        // clone: the run's own variable, once an input a run
+        out.push(bs::ConfigEnv { name: input.env.clone(), value: value.to_owned(), force: true });
+    }
+    Ok(out)
 }
 
 fn var<'a>(plan: &'a UnitPlan, name: &str) -> Option<&'a str> {
@@ -241,6 +276,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         _ => format!("{} v{}", package.name, package.version),
     };
     let target = triple_of(unit, of.host).to_owned();
+    let config_env = native_env(of, &package.name, &target, &unit.features)?;
     let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&plan.rustflags)?;
     let target_cfgs = blaze_units::stdlib::target::target_cfg(&target, &cfg_args)?;
     let profile = &unit.profile;
@@ -327,7 +363,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         },
         workspace_member: package.is_member,
         dependencies,
-        config_env: Vec::new(),
+        config_env,
         dylib_search: bs::DylibSearch {
             host_deps: vec![profile_dir.join("deps")],
             host_root: Some(profile_dir),
@@ -386,25 +422,45 @@ pub(crate) fn inherited(job: &[(String, String)], plan: &UnitPlan) -> Vec<(OsStr
 #[derive(Debug)]
 pub(crate) struct Judged {
     pub(crate) output: Option<Output>,
-    /// cargo's lines of it: its warnings, and why it failed.
+    /// The warnings it logged, as cargo's lines.
     pub(crate) diagnostics: Vec<Diagnostic>,
+    /// Why the build of its package fails, when it does: said as a [`Response::Report`] of
+    /// the unit.
+    pub(crate) failure: Option<Report>,
+}
+
+/// Where a run of `unit` is: `build script of NAME VERSION  (DIR)`, the version left out for a
+/// workspace member's.
+pub(crate) fn script_at(unit: &bs::Unit) -> Text {
+    let package = &unit.package;
+    let version = (!unit.workspace_member).then_some(package.version.as_str());
+    Text::new()
+        .words("build script of ")
+        .package(&package.name, version)
+        .words("  (")
+        .path(&package.manifest_dir.to_string_lossy())
+        .words(")")
 }
 
 /// What a sandboxed script may print, checked before cargo reads it
 /// ([`crate::directives`]); `None` when it may print it all.
-pub(crate) fn refused(unit: &bs::Unit, stdout: &[u8], link_dirs: &[PathBuf]) -> Option<String> {
+pub(crate) fn refused(unit: &bs::Unit, stdout: &[u8], link_dirs: &[PathBuf]) -> Option<Report> {
     let ran = crate::directives::Ran {
         package_dir: &unit.package.manifest_dir,
         out_dir: &unit.out_dir,
         link_dirs,
     };
     let refused = crate::directives::refused(stdout, &ran);
-    (!refused.is_empty()).then(|| crate::directives::refused_error(&unit.package.name, &refused))
+    (!refused.is_empty()).then(|| crate::directives::refused_report(&unit.package.name, script_at(unit), &refused))
 }
 
+/// The most lines of what a failed run printed that its report shows, from each stream's end.
+const TAIL: usize = 20;
+
 /// `value`, a run of `unit` started in `env`, as cargo makes of it: what it printed, once it
-/// succeeded, with its warnings; or why the build fails, with the output cargo shows. Read
-/// from the bytes alone: cargo's files of the run are the caller's to write ([`ScriptRun`]).
+/// succeeded, with its warnings; or why the build fails, with what cargo shows of the run.
+/// Read from the bytes alone: cargo's files of the run are the caller's to write
+/// ([`ScriptRun`]).
 pub(crate) fn judge(
     unit: &bs::Unit,
     env: &[(OsString, OsString)],
@@ -414,44 +470,112 @@ pub(crate) fn judge(
     color: bool,
 ) -> Judged {
     let cx = Context { nightly_features_allowed: true, ..Context::of(unit, env) };
-    let line = |severity: &Severity, message: &str| {
-        let level = match severity {
-            Severity::Error => Level::Error,
-            Severity::Warning => Level::Warning,
-        };
-        say::cargo(level, format!("{}@{}: {message}", unit.package.name, unit.package.version), of.cloned(), color)
-    };
-    let failure = |error: String| {
-        let what = match error.starts_with("failed to run custom build command") {
-            true => error,
-            false => format!(
-                "failed to run custom build command for `{}`\n\nCaused by:\n  {}",
-                unit.package.descr(),
-                error.lines().collect::<Vec<_>>().join("\n  ")
-            ),
-        };
-        say::cargo(Level::Error, what, of.cloned(), color)
+    // Its errors are its failure's report; its warnings are cargo's lines.
+    let warnings = |logged: &[(Severity, String)]| -> Vec<Diagnostic> {
+        (logged.iter())
+            .filter_map(|(severity, message)| match severity {
+                Severity::Warning => Some(say::cargo(
+                    Level::Warning,
+                    format!("{}@{}: {message}", unit.package.name, unit.package.version),
+                    of.cloned(),
+                    color,
+                )),
+                Severity::Error => None,
+            })
+            .collect()
     };
     let status = blaze_build_script::run::Ended { code: value.code, signal: value.signal };
     match blaze_build_script::run::judge(unit, &cx, status, &value.stdout, &value.stderr) {
         Ok(output) => {
-            let mut diagnostics: Vec<Diagnostic> =
-                output.log_messages.iter().map(|(severity, message)| line(severity, message)).collect();
+            let diagnostics = warnings(&output.log_messages);
             if let Some(link_dirs) = checked
-                && let Some(why) = refused(unit, &value.stdout, link_dirs)
+                && let Some(report) = refused(unit, &value.stdout, link_dirs)
             {
-                diagnostics.push(say::refused(why, of.cloned(), color));
-                return Judged { output: None, diagnostics };
+                return Judged { output: None, diagnostics, failure: Some(report) };
             }
-            Judged { output: Some(output), diagnostics }
+            Judged { output: Some(output), diagnostics, failure: None }
         }
         Err(failed) => {
-            let mut diagnostics: Vec<Diagnostic> =
-                failed.log_messages.iter().map(|(severity, message)| line(severity, message)).collect();
-            diagnostics.push(failure(failed.error.0));
-            Judged { output: None, diagnostics }
+            let diagnostics = warnings(&failed.log_messages);
+            let failure = failure(unit, status, &failed, &value.stdout, &value.stderr);
+            Judged { output: None, diagnostics, failure: Some(failure) }
         }
     }
+}
+
+/// Why the build of `unit`'s package fails after a run that ended with `status` and printed
+/// `stdout` and `stderr`: it failed (`build-script:failed`), logged errors
+/// (`build-script:error`), or printed what can't be read (`build-script:output`). What the
+/// script says of itself in `cargo:blaze-report=` lines ([`blaze_report::script`]) is the
+/// report's headline, rule, facts and fixes; blaze's words of the run stay as facts under it.
+fn failure(unit: &bs::Unit, status: blaze_build_script::run::Ended, failed: &Failed, stdout: &[u8], stderr: &[u8]) -> Report {
+    let printed = String::from_utf8_lossy(stdout);
+    let said = blaze_report::script::read(&printed);
+    let errors: Vec<&str> = (failed.log_messages.iter())
+        .filter_map(|(severity, message)| match severity {
+            Severity::Error => Some(message.as_str()),
+            Severity::Warning => None,
+        })
+        .collect(); // alloc: a failure's, once
+    let mut report = match (status.success(), errors.as_slice()) {
+        (false, _) => {
+            let report = Report::error(Text::plain("the build script failed"))
+                .rule("build-script:failed")
+                .fact("ended", Text::plain(format!("it ended with {status}"))); // alloc: as above
+            let report = tail(report, "stderr", &String::from_utf8_lossy(stderr));
+            // Its directives are cargo's, not words for a person.
+            tail(report, "stdout", &printed)
+        }
+        (true, [one]) => Report::error(Text::marked(one)).rule("build-script:error"),
+        (true, []) => {
+            let text = &failed.error.0;
+            let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
+            let mut report = Report::error(Text::marked(first)).rule("build-script:output");
+            for line in rest.lines().map(str::trim).filter(|it| !it.is_empty()) {
+                report = report.fact("output", Text::marked(line));
+            }
+            report
+        }
+        (true, many) => {
+            let headline = Text::new().words("the build script logged ").count(many.len() as u64).words(" errors");
+            let mut report = Report::error(headline).rule("build-script:error");
+            for error in many {
+                report = report.fact("error", Text::marked(error));
+            }
+            report
+        }
+    };
+    report = report.at(script_at(unit));
+    let Some(said) = said else { return report };
+    // Its own words lead; a logged error that only says them again in cargo's one line goes.
+    if !status.success() || said.headline.is_none() {
+        report.facts.splice(0..0, said.facts);
+    } else {
+        report.facts = said.facts;
+    }
+    if let Some(headline) = said.headline {
+        report.headline = headline;
+    }
+    if let Some(rule) = said.rule {
+        report.rule = Some(rule);
+    }
+    report.fixes = said.fixes;
+    for line in said.unread {
+        report = report.fact("unread", Text::plain(line));
+    }
+    report
+}
+
+/// `report` with the last [`TAIL`] lines of `text` that are not cargo directives, each a fact
+/// under `key`.
+fn tail(mut report: Report, key: &str, text: &str) -> Report {
+    let lines: Vec<&str> = (text.lines())
+        .filter(|it| !it.trim().is_empty() && !it.starts_with("cargo:"))
+        .collect(); // alloc: a failure's, once
+    for line in &lines[lines.len().saturating_sub(TAIL)..] {
+        report = report.fact(key, Text::plain(*line));
+    }
+    report
 }
 
 /// What cargo's `build-script-executed` says of a run.
@@ -618,6 +742,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         launcher: &job.shared.launcher,
         program: script_path,
         scripts: &job.scripts,
+        native: &job.input.native,
     };
     let unit = script_unit(&of, run).map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
     let env = inherited(&job.input.config.invocation.env, job.plan(run)?);
@@ -632,10 +757,19 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         job.shared.launcher.clone(),
         job.shared.tools.clone(),
     ];
+    // Each pinned native input it is given is read where it is laid out, and its digest is
+    // part of the run's key ([`Place::pinned`]).
+    let pinned: Vec<(String, String)> = given(&job.input.native, &unit)
+        .map(|it| {
+            read.push(it.dir.clone());
+            (it.input.env.clone(), format!("sha256:{}", it.input.sha256)) // clone: the run's own, once an input a run
+        })
+        .collect();
     read.dedup();
     let place = Place {
         code,
         read,
+        pinned,
         network: false,
         memory: None,
         mode: match rechecks(job)? {
@@ -646,6 +780,23 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     };
     let prepared = script::prepare(&unit, &env, &place)
         .map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))?;
+    // The variable the script reads is the layout, whatever else set it (a check, not a
+    // fallback: `native_env` forces it).
+    for laid in given(&job.input.native, &unit) {
+        let set = prepared.spec.command.env.iter().find(|(name, _)| name.as_os_str() == laid.input.env.as_str());
+        if set.is_none_or(|(_, value)| Path::new(value) != laid.dir) {
+            return Err(ApiError::new(
+                format!(
+                    "the build script of `{}` is not started with `{}` set to {}, where pinned native input `{}` is laid out",
+                    unit.package.descr(),
+                    laid.input.env,
+                    laid.dir.display(),
+                    laid.input.name
+                ),
+                Some(laid.input.pin.clone()), // clone: an error's place, once
+            ));
+        }
+    }
     let disk = blaze_usercode::inputs::Disk::new(prepared.env.clone());
     let how = match outside(job, run) {
         true => How::Outside(Command { sandbox: Sandbox::Off, ..prepared.spec.command }),
@@ -963,7 +1114,12 @@ impl ScriptRun {
         let link_dirs: Vec<PathBuf> = match start.how {
             How::Outside(_) => Vec::new(),
             _ => match crate::directives::link_dirs(&job.units().link_dirs, &start.env) {
-                Ok(it) => it,
+                // The layouts of the pinned native inputs it was given may be searched and
+                // be an rpath: each is the verified unpacking of its pinned archive.
+                Ok(mut it) => {
+                    it.extend(given(&job.input.native, &start.unit).map(|it| it.dir.clone()));
+                    it
+                }
                 Err(why) => {
                     return self.error(format!("the build script of `{}`: {why}", start.unit.package.descr()), out);
                 }
@@ -976,6 +1132,9 @@ impl ScriptRun {
         let of = self.of();
         let judged = judge(&start.unit, &start.env, &value, checked, of.as_ref(), job.input.color);
         out.extend(judged.diagnostics.into_iter().map(Response::Diagnostic));
+        if let Some(report) = judged.failure {
+            out.push(Response::Report { unit: of, report });
+        }
         let Some(output) = judged.output else {
             self.state = State::Done;
             return Some(false);

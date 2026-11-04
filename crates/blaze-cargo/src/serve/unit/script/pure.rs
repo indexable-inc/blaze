@@ -255,6 +255,7 @@ fn run_of(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsString)>)
         launcher: &job.shared.launcher,
         program: named_program(units, compile)?,
         scripts: &job.scripts,
+        native: &job.input.native,
     };
     // alloc: the edge: the error the build stops with
     let unit = script_unit(&of, run).map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;

@@ -59,7 +59,8 @@ The installer downloads the build for your machine from the
 [releases](https://github.com/indexable-inc/blaze/releases), checks it against the checksums
 published with it, puts `blaze` and the programs it runs in `~/.cargo/bin`, and
 runs `blaze toolchain` to download its Rust, a command v2's blaze does not have, so on v2 this
-step fails. It asks nothing. Run it again to upgrade. Releases are dated, `0.YYYYMMDD.N`, and come in two channels
+step fails. It asks nothing. Run it again to upgrade, or run `blaze update`
+([Updates](#updates)). Releases are dated, `0.YYYYMMDD.N`, and come in two channels
 ([release.md](release.md)): **stable**, the default, is releases that passed the heavy tests
 (real projects on macOS and Linux), and **canary** is the newest release, published as soon as
 it is built and promoted to stable, unchanged, once it passes them. End the line with
@@ -70,6 +71,67 @@ download it), and `--help` says what else it takes.
 Over a blaze from before 2026-10-28 it removes the programs with their old names and says so.
 Until the first dated release, it
 installs the `nightly` prerelease, a build of 2026-10-20 that nothing updates any more.
+
+## Updates
+
+blaze tells you when a newer release is out, on stderr, before a command's output:
+
+    blaze 0.20261104.3 is out (this is 0.20261104.0): blaze update · notes: https://github.com/indexable-inc/blaze/releases/tag/v0.20261104.3
+
+and, in a workspace that pins an older release (`[workspace.metadata.blaze] version`):
+
+    this workspace pins blaze 0.20261027.2, 8 days behind 0.20261104.3: blaze pin 0.20261104.3
+
+Each is said on every command while it holds, even one release behind. A release that is
+**yanked** (known broken; [release.md](release.md#yanking-a-release) says how a release is
+yanked) is said louder, on every command, under CI too, with the reason and what moves off it:
+
+    warning: blaze 0.20261101.0 is YANKED: miscompiles drops (#1234)
+    warning: `blaze update` installs blaze 0.20261104.3
+
+Nothing here waits on the network. blaze's daemon reads `https://ix.dev/blaze/latest.json` every
+five minutes in the background (with its ETag, so an unchanged file is a `304`) and keeps what it
+found in `~/.blaze/update/state.json`; a command reads only that file. Before the daemon's first
+check nothing is said, and a check that fails keeps what the last one found and invents nothing.
+What stops the daemon from doing its part (a `config.toml` or `~/.blaze/default` it cannot
+read, an `"auto"` install that failed) is kept there too and said as one `warning:` line.
+Under CI (`CI` set) or when stderr is not a terminal, only a yanked release is said.
+
+`blaze update` reads `latest.json` at once, downloads the newest release of your channel,
+checks it as a pinned release is checked (every list of sums it publishes:
+[cargo.md](cargo.md#pinning-a-release-of-blaze)), puts it in `~/.blaze/versions/<version>`,
+makes it the default and prints the first lines of its notes. The default is what runs outside
+pinned workspaces: the `blaze` you installed runs it in its place, as it runs a pinned release
+(`~/.blaze/default` names it; running install.sh again removes it, so the blaze installed last
+runs). A daemon of the release before is replaced at the next command, as when any other build
+of blaze meets it. `blaze update --check` says what is out and installs nothing.
+
+`blaze update` never installs a yanked release: when your channel's newest is yanked it refuses
+and says so, and when moving off a yanked release goes to an older one it says that it is a
+downgrade. A `~/.blaze/default` it cannot parse is replaced, and it says so. When the blaze that
+runs is newer than the channel's newest (a canary under `"stable"`), it says that rather than
+calling it the newest.
+
+`blaze update` never changes a workspace's pin: there, it says the pin and that `blaze pin
+<version>` moves it. `blaze pin 0.YYYYMMDD.N` pins that release (fetched and checked first);
+`blaze pin` alone pins the blaze that runs it.
+
+The settings are `[update]` in `~/.blaze/config.toml` (`$BLAZE_HOME/config.toml`), which
+`blaze update --mode M` and `blaze update --channel C` write:
+
+| `mode` | |
+|---|---|
+| `"warn"` (the default) | the lines above |
+| `"auto"` | the lines above, and the daemon installs the newest release as the default by itself, saying `blaze updated to <version>; notes: <url>` at the next command. Never a pin. A release it failed to install is not tried again by itself; `blaze update` tries it |
+| `"off"` | no line about newer releases or old pins. The daemon still reads `latest.json` every five minutes, so that a yanked release is still said |
+| `"offline"` | no network at all: the daemon reads nothing and `blaze update` refuses. A release yanked after this is set is never said (what an earlier check kept still is) |
+
+`channel` is `"stable"` (the default) or `"canary"`, the releases whose newest counts;
+install.sh with `--channel canary` sets it. A setting that is not one of these is said in place
+of the lines, which stay off but for a yanked release until it is fixed. `BLAZE_RELEASES`, which
+moves the releases ([cargo.md](cargo.md#pinning-a-release-of-blaze)), moves `latest.json` with
+them: `<mirror>/latest.json`. A build of blaze's tree (`0.0.0-dev`) checks nothing and runs
+itself; `blaze update --check` works there.
 
 ## From crates.io
 

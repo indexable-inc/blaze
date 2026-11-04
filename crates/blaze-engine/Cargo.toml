@@ -68,6 +68,10 @@ blaze-sha256.workspace = true
 tar = { workspace = true, features = ["default"] }
 flate2 = { workspace = true, features = ["rust_backend"] }
 url.workspace = true
+# blaze's own updates (`update.rs`): `latest.json` from blaze's site and the state the daemon keeps.
+serde_json.workspace = true
+# The update check's and install's spans (`update.rs`).
+tracing.workspace = true
 # A build script's `rustc` (`as_rustc.rs`): a probe loaded with the standard library, lowered
 # into the front end and checked as `blaze check` checks a crate.
 base-db.workspace = true

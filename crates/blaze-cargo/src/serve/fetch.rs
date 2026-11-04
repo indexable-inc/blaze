@@ -66,6 +66,16 @@ impl<H: Http + 'static> Fetcher<H> {
         Fetcher { retry: Retry { quiet: true, ..retry }, ..self }
     }
 
+    /// blaze-fetch over this fetcher's HTTP, retries and store: what gets a `.crate` and a
+    /// pinned native input ([`super::native::ensure`]) by its digest, from the store first.
+    pub fn pinned(&self) -> blaze_fetch::Fetcher {
+        // dyn: the I/O driver, as blaze-fetch takes it
+        let http: Arc<dyn Http> = self.http.clone();
+        let net = Arc::new(blaze_registry::pinned::Net::new(http));
+        blaze_fetch::Fetcher::new(self.store, net, self.scratch.join("downloads"))
+            .with_policy(blaze_registry::pinned::policy(&self.retry))
+    }
+
     /// `fetch`, fetched and checked, as the daemon puts it into the VFS.
     pub fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
         let source = match &fetch.kind {
@@ -103,11 +113,7 @@ impl<H: Http + 'static> Fetcher<H> {
                 &read
             }
             None => {
-                // dyn: the I/O driver, as blaze-fetch takes it
-                let http: Arc<dyn Http> = self.http.clone();
-                let net = Arc::new(blaze_registry::pinned::Net::new(http));
-                let fetcher = blaze_fetch::Fetcher::new(self.store, net, self.scratch.join("downloads"))
-                    .with_policy(blaze_registry::pinned::policy(&self.retry));
+                let fetcher = self.pinned();
                 // clone: once a package
                 let source = blaze_fetch::Source::Url { url: fetch.url.clone(), digest: pin };
                 let object = fetcher.get(&source).map_err(refused)?;
@@ -406,5 +412,5 @@ fn failed(fetch: &Fetch, texts: &[String], error: Option<&anyhow::Error>) -> Api
             what.push_str(text.trim_end());
         }
     }
-    ApiError { what: scrub(&what), at: Some(fetch.what.clone()) }
+    ApiError::new(scrub(&what), Some(fetch.what.clone()))
 }

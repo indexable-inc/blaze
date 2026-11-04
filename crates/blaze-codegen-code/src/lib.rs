@@ -843,6 +843,8 @@ fn emitted(identities: &[&Identity]) -> Result<(), String> {
     let build = if identities.iter().any(|it| it.how_built) {
         let env: BTreeMap<String, String> = std::env::vars().collect();
         let mut build = BuildEnv::of(&env);
+        // asks blaze: blaze sets a build script's `RUSTC` to its stand-in for rustc, so the
+        // compiler asked is blaze, which answers `-vV` itself (docs/no-rustc.md, end state 3).
         build.compiler = Some(compiler(&var("RUSTC")?)?);
         build
     } else {
@@ -941,6 +943,7 @@ fn var(name: &str) -> Result<String, String> {
 /// What `rustc -vV` says of the compiler that builds the program: its version, commit and host,
 /// and for blaze as `rustc`, which blaze it is.
 fn compiler(rustc: &str) -> Result<String, String> {
+    // asks blaze: `rustc` is the build script's `$RUSTC`, blaze's stand-in, so blaze answers.
     let out = Command::new(rustc).arg("-vV").output().map_err(|why| format!("running `{rustc} -vV`: {why}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);

@@ -439,11 +439,56 @@ pub struct Units {
     /// `[workspace.metadata.blaze]`: every member's tests run sandboxed but those
     /// [`TestSandbox`] takes out.
     pub sandboxed_tests: bool,
+    /// The pinned native inputs (`[workspace.metadata.blaze.native.<name>]`, docs/cargo.md,
+    /// "Pinned native inputs") some build script run of this graph is given: one per input and
+    /// target, sorted by name then target. The daemon fetches and lays out each before any
+    /// script runs.
+    pub native: Vec<NativeInput>,
 }
 
 impl Versioned for Units {
     // 13: `CARGO_PRIMARY_PACKAGE` left the plans' variables ([`Units::is_primary`]).
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 13");
+    // 14: the pinned native inputs ([`Units::native`]).
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 14");
+}
+
+/// One pinned native input for one target: an archive named by its digest, which blaze fetches,
+/// unpacks read-only under its home, and hands to the build scripts of `packages` in the
+/// variable `env` (docs/cargo.md, "Pinned native inputs").
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct NativeInput {
+    /// The table's name, `llvm` of `[workspace.metadata.blaze.native.llvm]`.
+    pub name: String,
+    /// The target triple whose archive this is: the platform of the script runs that get it.
+    pub target: String,
+    /// The variable the scripts read the unpacked directory from.
+    pub env: String,
+    /// The packages whose build scripts are given it, sorted: each a name, or `name/feature`
+    /// for that package's script only when the run has the feature on.
+    pub packages: Vec<String>,
+    /// Where the archive is downloaded from: `https://`.
+    pub url: String,
+    /// The archive's sha256, 64 lowercase hex digits, as the pin file says.
+    pub sha256: String,
+    /// The pin file the URL and digest were read from, absolute: what errors name.
+    pub pin: String,
+}
+
+impl NativeInput {
+    /// Whether the build script of the package named `package`, run with `features` on, is
+    /// given this input.
+    pub fn gives(&self, package: &str, features: &[String]) -> bool {
+        names_script(&self.packages, package, features)
+    }
+}
+
+/// Whether `packages`, as [`NativeInput::packages`] lists them (`name` or `name/feature`), name
+/// the build script of `package` run with `features` on.
+pub fn names_script(packages: &[String], package: &str, features: &[String]) -> bool {
+    packages.iter().any(|it| match it.split_once('/') {
+        Some((name, feature)) => name == package && features.iter().any(|on| on == feature),
+        None => it == package,
+    })
 }
 
 impl Units {
