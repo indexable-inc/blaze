@@ -225,6 +225,38 @@ fn a_dependencys_change_changes_its_dependents_ids() {
 }
 
 #[test]
+fn a_crates_build_target_changes_its_content_and_its_dependents() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let b = add(&mut graph, files[2], CfgOptions::default(), Env::default());
+    depend(&mut graph, a, b, "b");
+    let crates = graph.set_in_db(&mut db);
+    let (a, b) = (crates[&a], crates[&b]);
+    let ids = |db: &Db| (a.content(db), b.content(db), all_crates_content(db));
+    let before = ids(&db);
+    let original = b.extra_data(&db).clone(); // clone: test restores the original input
+    let mut seen = vec![before.1]; // alloc: the four target identities under test
+    for built_for in [
+        crate::BuiltFor { platform: Some(Symbol::intern("x86_64-unknown-linux-gnu")), macro_wasm: false },
+        crate::BuiltFor { platform: Some(Symbol::intern("wasm32-wasip1")), macro_wasm: false },
+        crate::BuiltFor { platform: Some(Symbol::intern("wasm32-wasip1")), macro_wasm: true },
+    ] {
+        let mut extra = original.clone(); // clone: change only what the crate is built for
+        extra.built_for = built_for;
+        b.set_extra_data(&mut db, extra);
+        let after = ids(&db);
+        assert_ne!(after.0, before.0, "the dependent's content follows its dependency");
+        assert_ne!(after.2, before.2, "the graph's content follows its crates");
+        assert!(!seen.contains(&after.1), "host, target and proc-macro builds are distinct");
+        seen.push(after.1);
+    }
+    b.set_extra_data(&mut db, original);
+    assert_eq!(ids(&db), before);
+}
+
+#[test]
 fn a_crates_types_read_back_and_are_in_its_id() {
     let mut db = Db::for_tests();
     let files = load(&mut db, 0, FILES);
