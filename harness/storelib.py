@@ -345,6 +345,7 @@ def linked(ws: str, env: Mapping[str, str], step: str, program: str, timeout: fl
     naming `step`."""
     ran = subprocess.run(
         ["blaze", "build", "--message-format=json"],
+        check=False,
         cwd=ws,
         env=dict(env),
         capture_output=True,
@@ -885,7 +886,7 @@ def blaze_status_of(text: str) -> BlazeStatus:
 def blaze_status(blaze: str, env: dict[str, str], cwd: str | None = None, timeout: float = 60) -> BlazeStatus:
     """`blaze status --json` asked of the daemon `env`'s home names (`BLAZE_HOME`); it starts
     none. A failed answer is `Failed`, naming its exit code and stderr."""
-    ran = subprocess.run([blaze, "status", "--json"], cwd=cwd, env=env, capture_output=True, text=True,
+    ran = subprocess.run([blaze, "status", "--json"], check=False, cwd=cwd, env=env, capture_output=True, text=True,
                          timeout=timeout, stdin=subprocess.DEVNULL)
     if ran.returncode != 0:
         raise Failed(f"`{blaze} status --json` exited {ran.returncode}: {ran.stderr[-1500:]}")
@@ -930,7 +931,7 @@ def blaze_toolchain_of(text: str) -> Toolchain:
 
 def blaze_toolchain(blaze: str, env: dict[str, str], timeout: float = 900) -> Toolchain:
     """`blaze toolchain --json`: downloads blaze's Rust once when it is not there yet."""
-    ran = subprocess.run([blaze, "toolchain", "--json"], env=env, capture_output=True, text=True,
+    ran = subprocess.run([blaze, "toolchain", "--json"], check=False, env=env, capture_output=True, text=True,
                          timeout=timeout, stdin=subprocess.DEVNULL)
     if ran.returncode != 0:
         raise Failed(f"`{blaze} toolchain --json` exited {ran.returncode}: {ran.stderr[-1500:]}")
