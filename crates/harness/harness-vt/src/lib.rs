@@ -34,11 +34,36 @@ pub use libghostty_vt::terminal::Mode;
 
 /// A cell's pixel size as the daemon reports it (CSI 14/16 t). It has no font, so this is a nominal 8x16.
 pub const CELL_PX: (u32, u32) = (8, 16);
-/// The default ink and ground the daemon reports (OSC 10/11).
-pub const DEFAULT_FG: (u8, u8, u8) = (0xd8, 0xd8, 0xd8);
-pub const DEFAULT_BG: (u8, u8, u8) = (0x1c, 0x1c, 0x1c);
-/// What XTVERSION answers.
-pub const XTVERSION: &str = "harness";
+/// The default ink and ground the daemon reports (OSC 10/11): harness-native's dark theme.
+pub const DEFAULT_FG: (u8, u8, u8) = (0xdc, 0xdc, 0xe0);
+pub const DEFAULT_BG: (u8, u8, u8) = (0x12, 0x12, 0x14);
+/// Ghostty's version when no Ghostty is installed to ask.
+const GHOSTTY_VERSION_FALLBACK: &str = "1.3.2";
+
+/// The installed Ghostty's version as `ghostty +version` prints it (`1.3.2-main+291fd050b`), which is what Ghostty
+/// puts in XTVERSION and TERM_PROGRAM_VERSION. Asked once (about 20 ms); [`GHOSTTY_VERSION_FALLBACK`] without one.
+#[must_use]
+pub fn ghostty_version() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        ["/Applications/Ghostty.app/Contents/MacOS/ghostty", "ghostty"]
+            .iter()
+            .find_map(|bin| {
+                let out = std::process::Command::new(bin).arg("+version").output().ok()?;
+                let s = String::from_utf8_lossy(&out.stdout);
+                s.lines().next()?.strip_prefix("Ghostty ").map(|v| v.trim().to_owned())
+            })
+            .unwrap_or_else(|| GHOSTTY_VERSION_FALLBACK.to_owned())
+    })
+}
+
+/// What XTVERSION answers: Ghostty's own reply (`ghostty <version>`), since this is Ghostty's terminal core and
+/// programs (Claude Code among them) pick their Ghostty paths from it.
+#[must_use]
+pub fn xtversion() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| format!("ghostty {}", ghostty_version()))
+}
 
 /// A colour as the program set it: unset, a palette index, or truecolor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -308,15 +333,16 @@ impl Term {
         ok(term.on_pwd_changed(move |_| s.borrow_mut().changes.pwd = true));
         let s = shared.clone();
         ok(term.on_bell(move |_| s.borrow_mut().changes.bells += 1));
-        ok(term.on_xtversion(|_| Some(XTVERSION)));
+        ok(term.on_xtversion(|_| Some(xtversion())));
         ok(term.on_size(|t| {
             Some(SizeReportSize { rows: t.rows().ok()?, columns: t.cols().ok()?, cell_width: CELL_PX.0, cell_height: CELL_PX.1 })
         }));
-        // VT220-class with ANSI colour (CSI ? 62 ; 22 c), and CSI > 0 ; 10 ; 1 c: what the daemon always answered.
+        // As Ghostty answers (termio/stream_handler.zig): CSI ? 62 ; 22 c (VT220, ANSI colour; Ghostty adds 52 only
+        // when it lets programs write the clipboard, which harness does not) and CSI > 1 ; 10 ; 0 c.
         ok(term.on_device_attributes(|_| {
             Some(DeviceAttributes {
                 primary: PrimaryDeviceAttributes::new(ConformanceLevel::LEVEL_2, &[DeviceAttributeFeature::ANSI_COLOR]),
-                secondary: SecondaryDeviceAttributes { device_type: DeviceType::VT100, firmware_version: 10, rom_cartridge: 1 },
+                secondary: SecondaryDeviceAttributes { device_type: DeviceType::VT220, firmware_version: 10, rom_cartridge: 0 },
                 tertiary: TertiaryDeviceAttributes::default(),
             })
         }));
