@@ -1,13 +1,13 @@
 ---
 name: flecs-ui
-description: "Building native UI as Flecs (the harness app in crates/harness/): views are flecs script prefabs over den's primitives (ui.Row/Column/Grid/LazyColumn/IconButton...), state is components and relationships, Rust only feeds data in and runs the hot paths. Covers the layering, the primitive vocabulary, tokens and themes, keybindings as data, how to verify with offscreen shots, and the Flecs 4.2 reactive-template style to move to once 4.2 is vendored (today: flecs 4.1.6). Load before touching any crates/harness/**/*.flecs, the crates/harness/harness-native-ui-* crates, or adding a widget, row, pane or shortcut."
+description: "Building native UI as Flecs (the harness app in crates/harness/): views are flecs script prefabs over den's primitives (ui.Row/Column/Grid/LazyColumn/IconButton...), state is components and relationships, Rust only feeds data in and runs the hot paths. Covers the layering, the primitive vocabulary, tokens and themes, keybindings as data, how to verify with offscreen shots, the Flecs 4.2 traps, and the 4.2 reactive-template style views are moving to. Load before touching any crates/harness/**/*.flecs, the crates/harness/harness-native-ui-* crates, or adding a widget, row, pane or shortcut."
 ---
 
 # Native UI as Flecs
 
 General Flecs rules, traits and script syntax are in the `flecs` skill; this one is how the harness app builds UI
-with them. Paths below are relative to `crates/harness/`. The app is copied from den's native stack: flecs v4.1.6
-(vendored in `vendor/flecs`, upstream plus hyperion's patches, see `vendor/flecs/SOURCE.md`), Metal through the
+with them. Paths below are relative to `crates/harness/`. The app is copied from den's native stack: flecs v4.2.0
+(vendored in `vendor/flecs` from the indexable-inc/flecs fork, branch `indexable/v4.2`; see `vendor/flecs/SOURCE.md`), Metal through the
 indexable-inc/slang fork (`harness-native/build.rs`), den's text shaper plus Slug outlines, libghostty-vt for terminal
 state (`harness-vt`).
 
@@ -56,16 +56,26 @@ springs, drawing, the daemon link. Everything a designer would tweak lives in sc
 New UI need not covered here: add a primitive (component + prim prefab + a gallery example under
 `harness-native-ui-prims/scene/examples/`), then use it. Gallery: `HARNESS_NATIVE_GALLERY=1` with `HARNESS_NATIVE_SHOT`.
 
-## Today: prefabs filled from Rust (flecs 4.1.6)
+## Today: prefabs filled from Rust
 
 - Views are prefabs; Rust keeps rows by key with `for_each`/`for_each_of` (`ui.List` or a column) and
   `lazy_for_each`/`lazy_for_each_of` (a `Lazy` container), and sets what differs through `View::part("name")`
   (all in `harness-native-ui-view/src/lib.rs`).
 - Write new views so they convert mechanically to the 4.2 style below: data in, parts derived from it.
 
-## Target once flecs 4.2 is vendored: reactive templates (not available yet)
+## Flecs 4.2 traps (the vendored version)
 
-Nothing below runs on the vendored 4.1.6; check `vendor/flecs/SOURCE.md` before using it.
+- Deferring is explicit in 4.2. In C (what hyperion-ecs wraps) `it->world` is now the real world and `it->stage` is
+  the deferred one (`vendor/hyperion-ecs/src/system.rs`: `Iter::world` and the stage accessor); mutate from systems
+  through the stage (or collect, then write), never rely on implicit `defer_begin`. `e.stage()` is the C++ spelling only.
+- 4.2 renames `(OnInstantiate, Override)` to `Copy`. Children of script prefab/template scopes default to the new
+  non-fragmenting Parent storage; v4.2.0 aborts at shutdown with it (flecs_non_fragmenting_childof_move), so each
+  top-level scene scope says `@tree ChildOf` until upstream fixes it.
+- Since 4.2, prefabs, constraint traits, cached queries and query plans are addons: features of `hyperion-flecs-c`.
+
+## Target: reactive templates (4.2 has them; no view uses them yet)
+
+Views are being converted from the prefab style above; write new keyed views as templates once the conversion lands.
 A row/pane/overlay is a `template` whose `prop`s are its data; conditional parts are `if` blocks. Fine-grained
 reactivity re-runs only the statements that read a changed prop, and children survive, so springs, hover and
 matched-geometry state on them keep running.
@@ -94,12 +104,10 @@ template hn.ObjRow {
 - Rust sets the instance's props from the model (one `set` per changed row) and never pokes `part("...")`.
 - Use template interfaces for families (`template Row { prop name; prop icon }`, `template SessionRow : Row`), and
   pass a template as a prop (`List(row: SessionRow)`) to share list code between sidebar and archive.
-- Also in 4.2: `for (i, v) in coll`, string formatting `"{x:.2}"`, `fn`, `include widgets/...`, `export mut`
+- Also available: `for (i, v) in coll`, string formatting `"{x:.2}"`, `fn`, `include widgets/...`, `export mut`
   tokens Rust may change, vector literals and maps.
 - `async` + `flecs.script.input` must be bridged to our pointer/key system; if a behaviour needs the hot path
   (terminal input, key dispatch), keep it in Rust.
-- Deferring is explicit in 4.2: mutate from systems/observers through `e.stage()` (or a stage you merge), never
-  rely on implicit `defer_begin`.
 
 ## Tokens, theme and look
 
