@@ -826,6 +826,7 @@ dependencies = [
  "harness-native-api",
  "harness-native-flecs",
  "harness-native-ui-draw-api",
+ "harness-native-ui-layout-api",
  "harness-native-ui-look-api",
  "harness-native-ui-motion-api",
  "harness-native-ui-node-api",
@@ -893,7 +894,10 @@ version = "0.1.0"
 dependencies = [
  "harness-native-api",
  "harness-native-flecs",
+ "harness-native-ui-layout-api",
+ "harness-native-ui-look-api",
  "harness-native-ui-motion-api",
+ "harness-native-ui-node-api",
  "harness-native-ui-spring-api",
 ]
 
@@ -902,6 +906,8 @@ name = "harness-native-ui-motion-api"
 version = "0.1.0"
 dependencies = [
  "harness-native-flecs",
+ "harness-native-ui-layout-api",
+ "harness-native-ui-look-api",
  "harness-native-ui-spring-api",
  "hyperion-api-layouts",
 ]
@@ -960,6 +966,7 @@ dependencies = [
  "harness-native-flecs",
  "harness-native-ui-input-api",
  "harness-native-ui-layout-api",
+ "harness-native-ui-motion-api",
  "harness-native-ui-node-api",
  "harness-native-ui-text-api",
 ]
