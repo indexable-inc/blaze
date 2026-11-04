@@ -1,4 +1,4 @@
-// blaze's launch video: 12 seconds, 1920 by 1080 at 60 fps with sound, for X/Twitter. The words are the post's; the video
+// blaze's launch video: 10 seconds, 1920 by 1080 at 60 fps with sound, for X/Twitter. The words are the post's; the video
 // is the mark alone, and starts and ends on the dark ground, so it loops.
 //
 //   cd crates/harness && cargo run --release -p harness-video -- harness-video/scene/launch.flecs blaze-launch.mp4
@@ -6,8 +6,8 @@
 // The mark (harness-native-blaze, the same mark and soundtrack as indexable-inc/anim):
 //   0.35 to 1.5   the letters drop in from the top of the frame, one by one, each landing on a note climbing A B C# E G#
 //   1.7           the fire catches from the b to the e, on A major; the frame starts a slow push in
-//   5.4 to 8.4    the letters glow white hot, burn down the fire's colours and crumble into embers
-//   8.0           where they stood, where to find it, arriving hot and cooling; it holds while the last embers ring
+//   3.8 to 6.8    the letters glow white hot, burn down the fire's colours and crumble into embers
+//   6.4           where they stood, where to find it, arriving hot and cooling; it holds while the last embers ring
 //                 out, then fades slowly to the dark ground the video started on
 //
 // Motion is data: a `Cue` child moves one member of its node (`Pose.fade`, `Pose.shrink`...) between two values over a
@@ -48,11 +48,11 @@ launch_part {
 // ---- the video ----
 // The mark's timeline: its letters start falling at `drop`, and it burns away from `burn`.
 const drop = 0.35
-const burn = 5.4
+const burn = 3.8
 
 @tree ChildOf
 launch : ui.ZStack {
-  Video: {width: 960, height: 540, fps: 60, seconds: 12, scale: 2}
+  Video: {width: 960, height: 540, fps: 60, seconds: 10, scale: 2}
   Fill: $tone_ground
   Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
   Size: {w: {kind: Fixed, value: 960, min: 0, max: 0}, h: {kind: Fixed, value: 540, min: 0, max: 0}}
@@ -61,7 +61,7 @@ launch : ui.ZStack {
     mark : ui.Node {
       BlazeMark: {start: $drop, exit: $burn}
       Size: {w: {kind: Fixed, value: 43 * $mark_cell, min: 0, max: 0}, h: {kind: Fixed, value: 23 * $mark_cell, min: 0, max: 0}}
-      cue.PushIn push(at: 1.6, dur: 5.6, by: 0.06)
+      cue.PushIn push(at: 1.6, dur: 3.6, by: 0.05)
     }
   }
 
@@ -69,8 +69,8 @@ launch : ui.ZStack {
   outro : launch_part.Layer {
     url : launch_part.Lead {
       Text: {s: "ix.dev/blaze"}
-      GlyphsIn: {at: 8.0, per: 0.045, dur: 0.5, by: 0, ease: Out, cool: 1.1, hot: $fire_3}
-      cue.FadeOut leave(at: 10.4, dur: 1.3)
+      GlyphsIn: {at: 6.4, per: 0.045, dur: 0.5, by: 0, ease: Out, cool: 1.1, hot: $fire_3}
+      cue.FadeOut leave(at: 8.4, dur: 1.2)
     }
   }
 }
