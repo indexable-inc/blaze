@@ -1497,8 +1497,9 @@ impl App {
                     self.step_object(-1);
                 }
             }
-            ("t" | "n", false) => self.spawn("claude"),
-            ("t" | "n", true) => self.spawn("codex"),
+            ("n", _) => self.spawn("shell"),
+            ("t", false) => self.spawn("claude"),
+            ("t", true) => self.spawn("codex"),
             ("w", false) => self.kill(),
             ("s", false) => self.toggle_sidebar(),
             ("k", false) => {
