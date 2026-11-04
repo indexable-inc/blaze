@@ -903,6 +903,9 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     }
     signals::catch();
     signals::record_ends();
+    // After `record_ends`, which leaves a signal something handles alone: the crash record's
+    // handler goes in front of what is there and hands each signal on to it.
+    blaze_profile::crash::install();
     plane::record_panics();
     plane::record_alloc_failures();
     // Each query run is progress to the stall watchdog: a check inside queries for minutes is

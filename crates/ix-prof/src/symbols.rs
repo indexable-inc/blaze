@@ -494,6 +494,32 @@ pub fn names(pcs: &[u64]) -> BTreeMap<u64, String> {
     out
 }
 
+/// A name for each of `pcs`, return addresses of this same executable as another process
+/// loaded it, `slide` from its file's addresses (a process that ran this executable and is
+/// gone: blaze-profile's crash records). An address in the executable's code is named as
+/// [`names`] names it; any other (a shared library's in that process, whose loads are not
+/// known here) is its bare address.
+pub fn names_slid(pcs: &[u64], slide: u64) -> BTreeMap<u64, String> {
+    let ours = self::slide();
+    let mut out = BTreeMap::new();
+    for &pc in pcs {
+        let name = pc.checked_sub(slide).zip(ours).and_then(|(at, ours)| own()?.name(at, ours));
+        out.insert(pc, name.unwrap_or_else(|| format!("{pc:#x}")));
+    }
+    out
+}
+
+/// How far this executable was loaded from the addresses its file gives, once a process: what a
+/// record of raw addresses keeps so they can be named later ([`names_slid`]).
+pub fn own_slide() -> Option<u64> {
+    slide()
+}
+
+/// Where this executable is loaded (its first byte's address), once a process.
+pub fn own_load_base() -> Option<u64> {
+    own_base()
+}
+
 /// How far the executable was loaded from the addresses its file gives.
 #[cfg(target_os = "macos")]
 fn slide() -> Option<u64> {

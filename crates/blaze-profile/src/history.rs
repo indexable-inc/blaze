@@ -93,11 +93,11 @@ use parquet::{
 
 use crate::{
     batches::{self, Process},
-    clock,
+    clock, crash,
     errors::{self, ErrorRow},
     facts::{self, CrateDepRow, LinkRow, MissRow, QueryCountRow},
     flight::{self, CounterRow, Cursor, Plot, Read, SpanRow},
-    identity,
+    identity, panics,
     sampler::{self, Sample},
     schema::{self, Column, Table, Type},
     symbols,
@@ -174,7 +174,7 @@ pub fn writer(dir: &Path) -> Option<u32> {
 }
 
 #[cfg(unix)]
-fn alive(pid: u32) -> bool {
+pub(crate) fn alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
     // SAFETY: signal 0 sends nothing: the kernel only checks that `pid` names a process.
     let sent = unsafe { libc::kill(pid, 0) };
@@ -182,7 +182,7 @@ fn alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn alive(_pid: u32) -> bool {
+pub(crate) fn alive(_pid: u32) -> bool {
     true
 }
 
@@ -267,6 +267,8 @@ pub struct Flushed {
     pub crate_deps: usize,
     pub query_counts: usize,
     pub misses: usize,
+    /// Panics and recovered fatal signals ([`crate::panics`], [`crate::crash`]).
+    pub panics: usize,
     /// Spans the threads were inside as the flush read them.
     pub open: usize,
     pub folded: usize,
@@ -396,7 +398,7 @@ fn dictionary(column: &Column) -> bool {
     match column.ty {
         Type::Dict | Type::Stack | Type::Utf8 | Type::U16 | Type::U32 => true,
         Type::U64 => column.name == "build_id",
-        Type::I64 | Type::F64 => false,
+        Type::I64 | Type::F64 | Type::Pcs => false,
     }
 }
 
@@ -797,6 +799,14 @@ pub struct History {
     unidentified: Option<HistoryError>,
     /// The threads' open spans the last flush wrote, their times left out ([`same_open`]).
     open_written: Vec<flight::ThreadNow>,
+    /// Whether flushes write this process's panics ([`History::record_panics`]), the panics
+    /// read so far, and a flush's new ones.
+    panics_on: bool,
+    panicked: u64,
+    raised: Vec<panics::Raised>,
+    /// The fatal signals of gone processes found as the history opened ([`crash::recover`]):
+    /// their rows go with the next flush, their files once it wrote them.
+    crashes: crash::Recovered,
 }
 
 /// The files of the history `dir` as its open finds them, under the manifest's lock: what a
@@ -883,6 +893,14 @@ impl History {
         let (kept, last_build, flushed) = sweep(dir)?;
         let seq = kept.iter().map(|it| it.name.last).max().unwrap_or(0).max(flushed) + 1;
         let total = kept.iter().map(|it| it.bytes).sum();
+        // Each gone process's fatal signal: a row for the first flush. A record refused (another
+        // layout, another blaze) is set aside and said; it never stops the history opening.
+        let crashes = crash::recover(dir);
+        for refused in &crashes.refused {
+            tracing::warn!(target: "blaze", "{refused}");
+        }
+        // A build of a daemon that crashed before a flush named a file for it keeps its number.
+        last_build = crashes.rows.iter().filter_map(|it| it.build_id).fold(last_build, u64::max);
         let mut writer = Writer::new();
         writer.schemas(dir)?;
         let blaze = identity::binary().map_err(|error| HistoryError::Identity {
@@ -937,6 +955,11 @@ impl History {
             unidentified: None,
             // alloc: once a history
             open_written: Vec::new(),
+            panics_on: false,
+            panicked: 0,
+            // alloc: once a history
+            raised: Vec::new(),
+            crashes,
         };
         history.trim()?;
         Ok(history)
@@ -944,6 +967,20 @@ impl History {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Has each flush write the panics this process raised since the last ([`crate::panics`]):
+    /// a daemon's history, the one of its process. Off, as in a test's history, a flush writes
+    /// only the fatal signals it recovered, so what a test's flush writes never depends on a
+    /// panic of another test of its process.
+    pub fn record_panics(&mut self) {
+        self.panics_on = true;
+    }
+
+    /// The crash records the history refused as it opened, each set aside as
+    /// `crash.<pid>.refused` ([`crash::recover`]).
+    pub fn refused_crashes(&self) -> &[crash::CrashError] {
+        &self.crashes.refused
     }
 
     /// The first build id no file of the history names: where the daemon starts numbering its
@@ -1118,7 +1155,15 @@ impl History {
         let ended = build;
         let seq = self.seq;
         self.seq += 1;
-        let named = self.named_for(build);
+        // The panics since the last flush, and the crashes recovered as the history opened.
+        self.raised.clear();
+        let panics_skipped = match self.panics_on {
+            true => panics::since(&mut self.panicked, &mut self.raised),
+            false => 0,
+        };
+        let mut panic_rows = panics::rows(&self.raised);
+        panic_rows.append(&mut self.crashes.rows);
+        let named = panic_rows.iter().filter_map(|it| it.build_id).fold(self.named_for(build), u64::max);
         // The spans of `build` are given its commit; the rest (other builds', and none's) none.
         let commit = build
             .and_then(|build| self.ended.iter().find(|it| it.build_id == build))
@@ -1169,6 +1214,7 @@ impl History {
             true => RecordBatch::new_empty(batches::schema_of(&schema::OPEN)),
         };
         let open = [open];
+        let panics = [panics::batch(&panic_rows).map_err(arrow_error(&schema::PANICS))?];
         let mut flushed = Flushed {
             seq,
             spans: rows(&spans),
@@ -1184,13 +1230,14 @@ impl History {
             misses: rows(&misses),
             open: rows(&open),
             folded: rows(&folded),
-            skipped: self.read.skipped + samples_skipped,
+            panics: rows(&panics),
+            skipped: self.read.skipped + samples_skipped + panics_skipped,
             ..Flushed::default()
         };
         let build = named;
         flushed.build = build;
         self.last_build = self.last_build.max(build);
-        let tables: [(&'static Table, &[RecordBatch]); 13] = [
+        let tables: [(&'static Table, &[RecordBatch]); 14] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
@@ -1204,6 +1251,7 @@ impl History {
             (&schema::MISSES, &misses),
             (&schema::OPEN, &open),
             (&schema::FOLDED, &folded),
+            (&schema::PANICS, &panics),
         ];
         // The files written, listed in one commit after the last: a reader sees all of the
         // flush or none of it.
@@ -1247,6 +1295,11 @@ impl History {
         self.crate_deps.clear();
         self.query_counts.clear();
         self.misses.clear();
+        // The crashes' rows are written: their records go. One that can't be deleted is read
+        // again by the next daemon, and its row written twice; said, not stopping the flush.
+        if let Err(error) = self.crashes.written() {
+            tracing::warn!(target: "blaze", "{error}");
+        }
         let compacted = self.compact(ended, &mut flushed);
         flushed.deleted = self.trim()?;
         compacted?;

@@ -15,6 +15,15 @@ pub(crate) fn names(pcs: &[u64]) -> HashMap<u64, String, Global> {
     names
 }
 
+/// A name for each of `pcs` of another process of this same executable, loaded `slide` from its
+/// file's addresses: its code in the executable named by this one's symbols, the rest bare
+/// addresses (where its libraries were loaded is not known here).
+pub(crate) fn names_slid(pcs: &[u64], slide: u64) -> HashMap<u64, String, Global> {
+    let mut names = HashMap::new_in(Global);
+    names.extend(ix_prof::symbols::names_slid(pcs, slide));
+    names
+}
+
 #[cfg(test)]
 thread_local! {
     /// Calls to [`names`] on this thread: a test of what asks for names reads it.

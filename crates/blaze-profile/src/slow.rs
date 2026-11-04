@@ -45,8 +45,9 @@ pub use render::{text, thread_line};
 /// waits the record never ends are their own blind spot (`unended_wait`). 3: a build whose
 /// daemon died is reported, to that daemon's last row, with `build.died`. 4: a build past
 /// `time::load::SPAN_BUDGET` spans is modelled from its spans at or past a floor, said by the
-/// blind spot `spans_cut`.
-pub const VERSION: u32 = 4;
+/// blind spot `spans_cut`. 5: `build.panics`, the build's panics and its daemon's fatal signal,
+/// each with its stack's top frames.
+pub const VERSION: u32 = 5;
 
 /// The build the report is of, as its `builds` row says.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -63,6 +64,25 @@ pub struct BuildFacts {
     pub misses: Option<u64>,
     /// How its daemon died during it: it has no end row, and is reported to that daemon's last.
     pub died: Option<Died>,
+    /// Its panics, and the fatal signal its daemon died of, oldest first (`panics` rows).
+    pub panics: Vec<PanicFacts>,
+}
+
+/// A panic of a build, or the fatal signal its daemon died of: a `panics` row
+/// ([`crate::schema::PANICS`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PanicFacts {
+    /// `panic` or `signal`.
+    pub kind: String,
+    /// A job's boundary caught it: that job failed, the build went on.
+    pub caught: bool,
+    pub message: Option<String>,
+    pub location: Option<String>,
+    pub thread: Option<String>,
+    pub signal: Option<String>,
+    /// The frames a person reads first, innermost first, past the panic machinery's
+    /// ([`crate::panics::top_frames`]).
+    pub top: Vec<String>,
 }
 
 /// The death of a build's daemon ([`BuildFacts::died`]), and what it was running then.

@@ -334,7 +334,14 @@ pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling,
             // from what this one wrote.
             let _owner = owner;
             match History::open(&at, history::CAP_BYTES, blaze_profile::sampler::process()) {
-                Ok(history) => {
+                Ok(mut history) => {
+                    // The daemon's own panics go to its history, and a fatal signal of it to
+                    // `crash.<pid>` beside it, which the next daemon's history turns into a row.
+                    history.record_panics();
+                    if let Err(why) = blaze_profile::crash::arm(&at) {
+                        tracing::warn!("{why}");
+                        eprintln!("blaze serve: {why}");
+                    }
                     _ = opened_to.send(Ok(history.next_build()));
                     // Off the daemon's start path: builds that end meanwhile wait in `rows`.
                     now.set(Step::Restoring, 0);
