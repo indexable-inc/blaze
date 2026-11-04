@@ -348,10 +348,16 @@ pub enum Plot {
     /// `never!` that failed. Written by the history with each build's flush and whenever it
     /// grew; each site that reported is also a row of `errors` of kind `blaze-bug`.
     BlazeBugs,
+    /// Heap bytes of every span map kept as a query's value (a macro expansion's, from
+    /// `parse_macro_expansion`) and still alive (`span::kept_maps`): what a packed layout of
+    /// the maps would shrink. Plotted with the memory's plots.
+    SpanMapBytes,
+    /// Pieces (a text range and its span each) of the maps of [`Plot::SpanMapBytes`].
+    SpanMapPieces,
 }
 
 impl Plot {
-    pub const ALL: [Plot; 21] = [
+    pub const ALL: [Plot; 23] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -373,6 +379,8 @@ impl Plot {
         Plot::ReservedBytes,
         Plot::ProfileRowsBehind,
         Plot::BlazeBugs,
+        Plot::SpanMapBytes,
+        Plot::SpanMapPieces,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -398,6 +406,8 @@ impl Plot {
             Plot::ReservedBytes => "reserved bytes",
             Plot::ProfileRowsBehind => "profile rows skipped behind",
             Plot::BlazeBugs => "blaze bugs",
+            Plot::SpanMapBytes => "span map bytes",
+            Plot::SpanMapPieces => "span map pieces",
         }
     }
 

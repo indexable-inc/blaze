@@ -22,7 +22,7 @@ pub use self::{
     },
     hygiene::{SyntaxContext, Transparency},
     lines::{Kernel, LineIndex, Place, char_width, display_width},
-    map::{RealSpanMap, SpanMap},
+    map::{RealSpanMap, SpanMap, kept_maps},
 };
 
 pub use syntax::Edition;
