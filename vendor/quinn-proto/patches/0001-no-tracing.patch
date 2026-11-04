@@ -1057,18 +1057,19 @@ index 1488575..79f0f9d 100644
      }
  
 diff --git a/src/connection/qlog.rs b/src/connection/qlog.rs
-index dafba3c..49cd251 100644
+index dafba3c..28624e1 100644
 --- a/src/connection/qlog.rs
 +++ b/src/connection/qlog.rs
-@@ -16,7 +16,6 @@ use qlog::{
+@@ -15,8 +15,6 @@ use qlog::{
+     },
      streamer::QlogStreamer,
  };
- #[cfg(feature = "qlog")]
+-#[cfg(feature = "qlog")]
 -use tracing::warn;
  
  use crate::{
      ConnectionId, Instant,
-@@ -37,9 +36,7 @@ impl QlogStream {
+@@ -37,9 +35,7 @@ impl QlogStream {
          event.group_id = Some(orig_rem_cid.to_string());
  
          let mut qlog_streamer = self.0.lock().unwrap();
