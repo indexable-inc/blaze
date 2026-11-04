@@ -71,25 +71,28 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     removed name. Skill: `changing-code`.
 29. **semantics-in-front-end**: Language semantics go in the front end's salsa crates in `crates/`;
     codegen, the store, the daemon and the runtime stay outside. Skill: `compiler-correctness`.
-30. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
+30. **library-over-language**: Build a feature as a library on the language that exists; when no library
+    can express it, add the smallest general primitive, never an ad hoc language feature. Skill:
+    `compiler-correctness`.
+31. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
     deterministic CBOR. Skill: `docs-and-scripts`.
-31. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
+32. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
     on AWS. Skill: `build-and-test`.
-32. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
+33. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
     runs `blaze check` and `blaze test` once. Skill: `build-and-test`.
-33. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
+34. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
     `build-and-test`.
-34. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
+35. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
     never push to main. Skill: `landing`.
-35. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
+36. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
     lane what changed. Skill: `landing`.
-36. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
+37. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
     branch. Skill: `build-and-test`.
-37. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
+38. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
     `landing`.
-38. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
+39. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
     plan, record or superseded; keep current docs true. Skill: `docs-and-scripts`.
-39. **scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not
+40. **scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not
     flags or environment variables. Skill: `docs-and-scripts`.
 
 ## Code Review Rules

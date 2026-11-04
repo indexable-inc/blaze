@@ -101,4 +101,18 @@ the store, the daemon, cargo integration and the runtime stay outside the front 
 
 See [docs/contributing.md#where-new-code-goes](../../../docs/contributing.md#where-new-code-goes).
 
+## library-over-language (rule 30)
+
+Before adding an attribute, intrinsic or special case to the compiler, write the feature as library
+code on what the language already has: traits, generics, const eval, compile-time reflection
+(`core::mem::type_info`), allocators, effects and the purity proof. When it cannot be written that
+way, the language is missing a primitive: add the smallest general one that makes the library
+possible (nightly's API where one exists, otherwise an opt-in blaze extension), and keep the set of
+primitives small. The compiler proves and exposes facts (purity, code identity, layout, reflection);
+policy (caching, storage, hash formats, how code is executed) lives in libraries anyone can read or
+replace. Example: `Canonical` is library code over `type_info`, and `#[blaze::cache]` lowers to a
+call on a library `Executor`; the compiler generates neither the hashing nor the caching.
+
+See [docs/contributing.md#where-new-code-goes](../../../docs/contributing.md#where-new-code-goes).
+
 <!-- End of the generated rules. Hand-written notes follow. -->
