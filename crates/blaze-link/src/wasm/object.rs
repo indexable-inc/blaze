@@ -677,7 +677,9 @@ fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
             return Err("a memory64 (wasm64) object in a wasm32 link".to_owned());
         } // alloc: error path
         Some(false) if memory64 => {
-            return Err("a wasm32 object, its memory 32-bit, in a memory64 (wasm64) link".to_owned());
+            return Err(
+                "a wasm32 object, its memory 32-bit, in a memory64 (wasm64) link".to_owned()
+            );
         } // alloc: error path
         _ => {}
     }
