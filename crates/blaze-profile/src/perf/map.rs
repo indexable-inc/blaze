@@ -111,7 +111,9 @@ impl Map {
                 1 => Some(at.id("a node's identity")?),
                 // alloc: an error
                 other => {
-                    return Err(format!("node {index} has flags {other:#x}, which no blaze writes"));
+                    return Err(format!(
+                        "node {index} has flags {other:#x}, which no blaze writes"
+                    ));
                 }
             };
             let key = at.id("a node's key")?;
