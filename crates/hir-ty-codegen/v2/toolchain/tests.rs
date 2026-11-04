@@ -154,8 +154,10 @@ fn frame_pointers_are_the_flags_or_the_targets() {
     assert!(of(LINUX, &["--codegen", "force_frame_pointers=yes"]).unwrap().frame_pointers);
     assert!(of(LINUX, &["-Cforce-frame-pointers"]).unwrap().frame_pointers);
     assert!(!of(LINUX, &["-Cforce-frame-pointers=yes", "-Cforce-frame-pointers=no"]).unwrap().frame_pointers);
+    // Apple's frame records are its code's own (`Target::llvm_frame_pointer`), not forced.
     let apple = of("aarch64-apple-darwin", &["-Cforce-frame-pointers=no"]).unwrap();
-    assert!(apple.frame_pointers, "Apple's ABI keeps them");
+    assert!(!apple.frame_pointers, "only the flags force every frame pointer");
+    assert!(of("aarch64-apple-darwin", &["-Cforce-frame-pointers=yes"]).unwrap().frame_pointers);
     assert_eq!(apple.cpu, "apple-m1");
     assert!(of(LINUX, &["-Cforce-frame-pointers=sometimes"]).is_err());
 }
@@ -214,9 +216,8 @@ fn elsewhere_is_the_baseline() {
         return;
     }
     let elsewhere = of(Target::host(), &[]).unwrap();
-    let apple = Target::host().contains("-apple-");
     assert!(elsewhere.features.is_empty(), "{:?}", elsewhere.features);
-    assert_eq!(elsewhere.frame_pointers, apple);
+    assert!(!elsewhere.frame_pointers, "no flag forces them, on Apple's targets too");
     for other in [LINUX, "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"] {
         assert!(of(other, &[]).unwrap().features.is_empty(), "{other}");
     }

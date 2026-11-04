@@ -2722,6 +2722,34 @@ attributes #0 = { alwaysinline }
         assert!(byte_offset(&loose, &context, base, by).is_err());
     }
 
+    /// Every function blaze gives LLVM on an Apple target keeps a frame record where it calls,
+    /// unforced (v1's units and exports pass `false`), as rustc's `non-leaf`: a release
+    /// function that saved x29/x30 below an unmoved x29 left its caller to its DWARF rows
+    /// alone, and ld64 encoded those frameless, so a panic on a fiber found no catch
+    /// (2026-11-04). Forced, every function keeps one; elsewhere unforced, none is asked.
+    #[test]
+    fn apple_functions_keep_a_frame_record_unforced() {
+        let attribute = |triple: &str, forced: bool| {
+            let target = crate::Target::of(triple).expect("a target");
+            let func = ir::Function::with_name_signature(
+                ir::UserFuncName::default(),
+                ir::Signature::new(target.call_conv),
+            );
+            let context = Context::create();
+            let module = context.create_module("frame");
+            let own = Defined { name: OWN, func: &func, pointees: &[], named: &[], weights: None, marked: false };
+            let function = Lowering::add(&context, &module, target, &own, forced).expect("added");
+            function
+                .get_string_attribute(AttributeLoc::Function, "frame-pointer")
+                .map(|it| it.get_string_value().to_string_lossy().into_owned())
+        };
+        assert_eq!(attribute("aarch64-apple-darwin", false).as_deref(), Some("non-leaf"));
+        assert_eq!(attribute("x86_64-apple-darwin", false).as_deref(), Some("non-leaf"));
+        assert_eq!(attribute("aarch64-apple-darwin", true).as_deref(), Some("all"));
+        assert_eq!(attribute("aarch64-unknown-linux-gnu", false), None);
+        assert_eq!(attribute("x86_64-unknown-linux-gnu", true).as_deref(), Some("all"));
+    }
+
     /// The text of the module `func` lowers to as the function being compiled, whose
     /// parameters point to `pointees`, once it verifies, and once `pipeline` ran over it (and
     /// it verified again) if one is given.

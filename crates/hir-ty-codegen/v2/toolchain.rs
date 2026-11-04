@@ -212,7 +212,11 @@ pub fn toolchain_for(
         // alloc: per toolchain made, its features
         .collect();
     features.sort_unstable();
-    let frame_pointers = flags.frame_pointers.unwrap_or(false) || keeps_frame_pointers(&emitted);
+    // Only what the flags force: the frame records the target's ABI wants of every function
+    // that calls are its code's own, whatever this says (`Target::requires_frame_pointers`,
+    // `Target::llvm_frame_pointer`), as rustc's `-C force-frame-pointers=no` cannot take
+    // Apple's away.
+    let frame_pointers = flags.frame_pointers.unwrap_or(false);
     let relocation = match flags.relocation.as_deref() {
         None | Some("default") => default_relocation(&emitted),
         Some("pic" | "pie") => Relocation::Pic,
@@ -513,11 +517,6 @@ fn turn_off(on: &mut BTreeSet<String>, implies: &[(&str, &[&str])], name: &str) 
             }
         }
     }
-}
-
-/// Whether the target keeps frame pointers whatever the flags say: Apple's ABIs require them.
-fn keeps_frame_pointers(target: &Target) -> bool {
-    target.triple().contains("-apple-")
 }
 
 /// rustc's relocation model of the target: PE images are reached relative to the
