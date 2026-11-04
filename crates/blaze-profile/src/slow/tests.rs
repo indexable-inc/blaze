@@ -462,7 +462,7 @@ fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path:
         .output()
         .unwrap();
     assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
-    crate::history::manifest::list_written(&dir);
+    crate::history::list_written(&dir);
     dir
 }
 

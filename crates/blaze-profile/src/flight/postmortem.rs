@@ -45,7 +45,7 @@
 //! ([`super::decode`]), gives their names and sites numbers of this process (names for the
 //! length of one [`Recovered`], sites for the process's life, [`super::foreign_site`]), and
 //! hands them to the history, which writes them as rows of the dead process and marks its
-//! running builds `crashed`; then the file is deleted ([`Found::remove`]).
+//! running builds `crashed`; then the history's core deletes the file.
 //!
 //! The history's flush marks are two-phase, so a crash between a flush's commit and its mark
 //! never has its rows written twice (2026-11-04: they were). Before it commits flush `seq`, the
@@ -66,9 +66,10 @@
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports, unused_variables, unused_mut))]
 
+#[cfg(test)]
+use std::{fs::File, io::Read as _};
 use std::{
-    fs::{self, File},
-    io::{self, Read as _, Seek as _, SeekFrom},
+    fs, io,
     path::{Path, PathBuf},
     sync::{
         OnceLock,
@@ -346,7 +347,7 @@ pub(crate) fn file_name(pid: u32) -> String {
 }
 
 /// The pid of a file named as [`file_name`] names one.
-fn pid_of(name: &str) -> Option<u32> {
+pub(crate) fn pid_of(name: &str) -> Option<u32> {
     name.strip_prefix("flight-")?.strip_suffix(".map")?.parse().ok()
 }
 
@@ -1070,17 +1071,20 @@ pub fn forget() {
 
 // --- The reader -------------------------------------------------------------------------
 
-/// The mapping of a process that died, locked by this one: no other reader takes it meanwhile.
+/// The mapping of a process that died, its bytes as the history's core mapped them (the core
+/// holds its lock meanwhile: no other reader takes it).
 #[derive(Debug)]
 pub struct Found {
     path: PathBuf,
     pid: u32,
-    file: Locked,
+    mapping: blaze_core::Mapping,
 }
 
-/// The mappings in `dir` of processes that died, by pid: those whose lock no one holds. A
-/// mapping a live process holds is left alone.
-pub fn dead(dir: &Path) -> Result<Vec<Found>, PostmortemError> {
+/// The mappings in `dir` of processes that died, by pid, read into memory: those whose lock no
+/// one holds. A mapping a live process holds is left alone. For tests: the history's core finds
+/// them in production.
+#[cfg(test)]
+fn dead(dir: &Path) -> Result<Vec<Found>, PostmortemError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1106,7 +1110,14 @@ pub fn dead(dir: &Path) -> Result<Vec<Found>, PostmortemError> {
             Err(error) => return Err(io_error(&path, "opening")(error)),
         };
         match Locked::try_lock(file).map_err(io_error(&path, "locking"))? {
-            Ok(file) => found.push(Found { path, pid, file }),
+            Ok(file) => {
+                let mut file: &File = &file;
+                // alloc: a test's copy of a dead process's file
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map_err(io_error(&path, "reading"))?;
+                let mapping = blaze_core::Mapping::copy(&bytes);
+                found.push(Found { path, pid, mapping });
+            }
             // Its process is alive, or another reader holds it.
             Err(_held) => {}
         }
@@ -1178,6 +1189,12 @@ fn word(bytes: &[u8], at: usize) -> u64 {
 }
 
 impl Found {
+    /// The mapping of dead process `pid` at `path`, mapped by the history's core under its
+    /// lock.
+    pub(crate) fn of(path: PathBuf, pid: u32, mapping: blaze_core::Mapping) -> Found {
+        Found { path, pid, mapping }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -1186,14 +1203,12 @@ impl Found {
         self.pid
     }
 
-    /// `len` bytes of the file from `at`.
-    fn bytes(&self, at: usize, len: usize, what: &'static str) -> Result<Vec<u8>, PostmortemError> {
-        let mut file: &File = &self.file;
-        file.seek(SeekFrom::Start(at as u64)).map_err(io_error(&self.path, what))?;
-        // alloc: a part of a dead process's file, once a postmortem
-        let mut bytes = vec![0; len];
-        file.read_exact(&mut bytes).map_err(io_error(&self.path, what))?;
-        Ok(bytes)
+    /// `len` bytes of the file from `at`; a file that ends before them is torn, naming `what`
+    /// was read.
+    fn bytes(&self, at: usize, len: usize, what: &'static str) -> Result<&[u8], PostmortemError> {
+        at.checked_add(len)
+            .and_then(|end| self.mapping.bytes().get(at..end))
+            .ok_or_else(|| self.torn(what))
     }
 
     fn refuse(&self, what: &'static str, found: u64, expected: u64) -> PostmortemError {
@@ -1208,13 +1223,13 @@ impl Found {
 
     /// The header, checked to be of this layout; `None` for a file whose process died making
     /// it (no magic yet), which holds no rows. A file of another layout is refused, naming it.
-    fn header(&self) -> Result<Option<Vec<u8>>, PostmortemError> {
-        let len = self.file.metadata().map_err(io_error(&self.path, "reading the size of"))?.len();
+    fn header(&self) -> Result<Option<&[u8]>, PostmortemError> {
+        let len = self.mapping.bytes().len() as u64;
         if len < PAGE as u64 {
             return Ok(None);
         }
         let header = self.bytes(0, PAGE, "reading the header of")?;
-        let h = |at: usize| word(&header, at * 8);
+        let h = |at: usize| word(header, at * 8);
         if h(H_MAGIC) == 0 {
             return Ok(None);
         }
@@ -1241,7 +1256,7 @@ impl Found {
     /// The mapping's nonce, which the manifest names it by (`manifest::Recorder`); `None` for
     /// a file with no header, which holds no rows. A file of another layout is refused.
     pub fn nonce(&self) -> Result<Option<u64>, PostmortemError> {
-        Ok(self.header()?.map(|header| word(&header, H_NONCE * 8)))
+        Ok(self.header()?.map(|header| word(header, H_NONCE * 8)))
     }
 
     /// Reads back the dead process's rows past its last committed flush, its running builds,
@@ -1271,7 +1286,7 @@ impl Found {
         };
         // A process that died making its file wrote no magic: nothing of it to read.
         let Some(header) = self.header()? else { return Ok(recovered) };
-        let h = |at: usize| word(&header, at * 8);
+        let h = |at: usize| word(header, at * 8);
         recovered.nonce = h(H_NONCE);
         let rings = h(H_RINGS);
         // The slot whose marks it reads from: the pending flush's once the manifest says it
@@ -1634,8 +1649,10 @@ impl Found {
         Ok(())
     }
 
-    /// Deletes the file, its rows written: then lets go of its lock.
-    pub fn remove(self) -> Result<(), PostmortemError> {
+    /// Deletes the file, its rows written. For tests: the history's core deletes it in
+    /// production.
+    #[cfg(test)]
+    fn remove(self) -> Result<(), PostmortemError> {
         fs::remove_file(&self.path).map_err(io_error(&self.path, "deleting, its rows written,"))
     }
 }

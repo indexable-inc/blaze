@@ -21,7 +21,8 @@
 //! so a phase or function table is a DuckDB query over it (docs/profiling.md).
 //! docs/profiling.md says how to read all of it.
 
-#![feature(allocator_api)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
 use std::{path::Path, sync::OnceLock, time::Instant};
 

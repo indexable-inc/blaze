@@ -18,11 +18,12 @@
 //!   handler that was there before (blaze-cargo's, which logs a line and goes on to std's), or,
 //!   where that was the default, raises it again, which ends the process with it as it would
 //!   have. Only the first fatal signal of a process is recorded.
-//! - [`recover`] reads each `crash.<pid>` of a process that is gone: refused, with a typed
-//!   [`CrashError`], when its layout or its executable is not this one (its addresses would be
-//!   named by another binary's symbols); else a row, named by this executable's symbols at the
-//!   dead process's load slide, and the file is deleted once the row is written. A file whose
-//!   process recorded nothing (it ended cleanly, or was killed) is deleted at once.
+//! - The history's core (`history::files`) reads each `crash.<pid>` of a process that is gone
+//!   through [`read`]: refused, with a typed [`CrashError`], when its layout or its executable is
+//!   not this one (its addresses would be named by another binary's symbols); else a row, named
+//!   by this executable's symbols at the dead process's load slide, and the file is deleted once
+//!   the commit that lists the row consumed it. A file whose process recorded nothing (it ended
+//!   cleanly, or was killed) is deleted at once.
 //!
 //! The record is one fixed page so it can live in any mapping: the flight recorder's rings may
 //! move into mapped files of their own per process, and the record is then a region of that
@@ -388,7 +389,7 @@ pub fn of_process(dir: &Path, pid: u32) -> Result<Option<PanicRow>, CrashError> 
     Ok(read(&path, &bytes, &ours)?.map(|crash| crash.row()))
 }
 
-/// What [`recover`] found in a history's directory.
+/// What the history's core found of crash records in a history's directory as it opened.
 #[derive(Debug, Default)]
 pub struct Recovered {
     /// A row of each crash recorded.
@@ -396,8 +397,9 @@ pub struct Recovered {
     /// The `images` row of each crash's executable, by its process: what names its row's
     /// `stack_pcs` ([`Crash::image`]).
     pub(crate) images: Vec<(u32, crate::batches::ImageRow)>,
-    /// Their files: deleted once their rows are written ([`Recovered::written`]).
-    pub files: Vec<PathBuf>,
+    /// Their files' names in the history's directory: deleted once the commit that lists
+    /// their rows consumed them ([`Written`]).
+    pub files: Vec<String>,
     /// Each one's process and the instant of its signal, as `rows` and `files`: what the
     /// manifest names a record by once a file it lists holds its row
     /// (`history::manifest::Consumed::crashes`).
@@ -410,7 +412,8 @@ pub struct Recovered {
 /// (`ids`), then deleted (`files`), so a crash between the two never writes a row twice.
 #[derive(Debug, Default)]
 pub(crate) struct Written {
-    pub(crate) files: Vec<PathBuf>,
+    /// Their files' names in the history's directory.
+    pub(crate) files: Vec<String>,
     pub(crate) ids: Vec<(u32, i64)>,
 }
 
@@ -423,146 +426,21 @@ impl Written {
         self.files.append(&mut other.files);
         self.ids.append(&mut other.ids);
     }
-
-    /// Deletes the records, the commit that consumed them done; the first that can't be
-    /// deleted is the error, and the rest stay for the next open, which deletes them unread.
-    pub(crate) fn delete(&mut self) -> Result<(), CrashError> {
-        self.ids.clear();
-        for path in self.files.drain(..) {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(CrashError::Io {
-                        path,
-                        doing: "deleting a recovered crash record",
-                        error,
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Recovered {
-    /// The rows were written and committed: their files go.
-    pub fn written(&mut self) -> Result<(), CrashError> {
-        self.images.clear();
-        self.take_written().delete()
-    }
-
     /// The rows are written to a file not yet listed: they leave this, and their records
     /// go once the commit that lists them consumed them ([`Written`]).
     pub(crate) fn take_written(&mut self) -> Written {
         self.rows.clear();
         Written { files: std::mem::take(&mut self.files), ids: std::mem::take(&mut self.ids) }
     }
-
-    /// Leaves out the records whose rows a listed file holds already (`written`, the
-    /// manifest's): a crash came between that commit and their deletes. Each is deleted now,
-    /// unread; one that can't be is refused, naming it.
-    pub(crate) fn drop_written(&mut self, written: &std::collections::BTreeSet<(u32, i64)>) {
-        let mut at = 0;
-        while at < self.ids.len() {
-            if !written.contains(&self.ids[at]) {
-                at += 1;
-                continue;
-            }
-            let (pid, _) = self.ids.remove(at);
-            self.rows.remove(at);
-            let path = self.files.remove(at);
-            self.images.retain(|it| it.0 != pid);
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => self.refused.push(CrashError::Io {
-                    path,
-                    doing: "deleting a crash record whose row the history lists already",
-                    error,
-                }),
-            }
-        }
-    }
 }
 
-/// The crash records in `dir` of processes that are gone (not this one, not alive).
-pub fn recover(dir: &Path) -> Recovered {
-    let mut out = Recovered::default();
-    let entries = match fs::read_dir(dir) {
-        Ok(it) => it,
-        Err(error) => {
-            // alloc: an error
-            out.refused.push(CrashError::Io {
-                path: dir.to_owned(),
-                doing: "listing the history's crash records",
-                error,
-            });
-            return out;
-        }
-    };
-    let mut ours = None;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name
-            .to_str()
-            .and_then(|it| it.strip_prefix("crash."))
-            .and_then(|it| it.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if pid == std::process::id() || crate::history::alive(pid) {
-            continue;
-        }
-        let path = entry.path();
-        let bytes = match fs::read(&path) {
-            Ok(it) => it,
-            Err(error) => {
-                out.refused.push(CrashError::Io { path, doing: "reading", error });
-                continue;
-            }
-        };
-        let hash = match ours.get_or_insert_with(crate::identity::binary_hash) {
-            Ok(hash) => *hash,
-            Err(error) => {
-                // alloc: an error
-                let error = io::Error::new(error.kind(), error.to_string());
-                out.refused.push(CrashError::OursUnhashed { path, error });
-                continue;
-            }
-        };
-        match read(&path, &bytes, &hash) {
-            Ok(None) => {
-                if let Err(error) = fs::remove_file(&path) {
-                    out.refused.push(CrashError::Io {
-                        path,
-                        doing: "deleting a crash record with nothing recorded",
-                        error,
-                    });
-                }
-            }
-            Ok(Some(crash)) => {
-                out.ids.push((crash.pid, crash.t_ns));
-                out.rows.push(crash.row());
-                if let Some(image) = crash.image() {
-                    out.images.push((crash.pid, image));
-                }
-                out.files.push(path);
-            }
-            Err(refused) => {
-                let aside = dir.join(format!("{}.refused", file_name(pid)));
-                if let Err(error) = fs::rename(&path, &aside) {
-                    out.refused.push(CrashError::Io {
-                        path,
-                        doing: "setting aside a refused crash record",
-                        error,
-                    });
-                }
-                out.refused.push(refused);
-            }
-        }
-    }
-    out
+/// The pid of a crash record named `crash.<pid>`; `None` for any other name (a refused one,
+/// `crash.<pid>.refused`, among them).
+pub(crate) fn pid_of(name: &str) -> Option<u32> {
+    name.strip_prefix("crash.")?.parse().ok()
 }
 
 /// A record's page, mapped: what the handler writes through.
@@ -1085,9 +963,16 @@ mod tests {
         std::hint::black_box(());
     }
 
-    /// A record written by the handler's own code round-trips through recovery: one `signal`
-    /// row naming the signal, its address and the function that faulted, and its file goes once
-    /// the row is written.
+    /// The record of `path` as the history's core reads it: the file's bytes through [`read`],
+    /// against this executable's hash.
+    fn read_back(path: &Path) -> Result<Option<Crash>, CrashError> {
+        let ours = crate::identity::binary_hash().unwrap();
+        read(path, &fs::read(path).unwrap(), &ours)
+    }
+
+    /// A record written by the handler's own code round-trips through [`read`]: one `signal`
+    /// row naming the signal, its address and the function that faulted, and the image that
+    /// names its stack.
     #[test]
     fn a_crash_file_round_trips_through_recovery() {
         crate::stack::ready();
@@ -1095,9 +980,8 @@ mod tests {
         let path = dir.join(file_name(GONE));
         let page = page_in(&path, GONE);
         faults_here(page);
-        let mut recovered = recover(&dir);
-        assert!(recovered.refused.is_empty(), "{:?}", recovered.refused);
-        let [row] = &recovered.rows[..] else { panic!("one row: {:?}", recovered.rows) };
+        let crash = read_back(&path).unwrap().expect("a crash recorded");
+        let row = &crash.row();
         assert_eq!(row.kind, Kind::Signal);
         assert_eq!(row.process, GONE);
         assert_eq!(row.signal, Some("SIGSEGV"));
@@ -1124,42 +1008,39 @@ mod tests {
             row.stack
         );
         assert_eq!(row.boot, None);
-        let [(pid, image)] = &recovered.images[..] else { panic!("one image of the crash") };
-        assert_eq!(*pid, GONE);
+        let image = crash.image().expect("an image of the crash");
+        assert_eq!(crash.pid, GONE);
         assert_eq!(image.blake3.as_deref(), Ok(crate::identity::binary().unwrap().as_str()));
         let inner = *row.stack_pcs.last().unwrap();
         assert!(
             inner >= image.base && inner - image.base < image.size,
             "the faulting pc is in the image's code"
         );
-        let batch = crate::panics::batch(&recovered.rows).unwrap();
+        let batch = crate::panics::batch(std::slice::from_ref(row)).unwrap();
         assert_eq!(batch.num_rows(), 1);
-        assert!(path.exists(), "kept until its row is written");
-        recovered.written().unwrap();
-        assert!(!path.exists());
-        assert!(recover(&dir).rows.is_empty());
+        _ = fs::remove_dir_all(&dir);
     }
 
-    /// A record whose process recorded nothing is deleted with no row; a second fault of the
-    /// same process is not recorded over the first.
+    /// A record whose process recorded nothing reads as no row; a second fault of the same
+    /// process is not recorded over the first.
     #[test]
     fn only_the_first_fault_is_recorded_and_an_armed_record_alone_is_no_row() {
         let dir = scratch("armed");
         let path = dir.join(file_name(GONE));
         let page = page_in(&path, GONE);
-        assert!(recover(&dir).rows.is_empty());
-        assert!(!path.exists(), "a record with nothing recorded is deleted");
+        assert!(read_back(&path).unwrap().is_none(), "an armed record holds no crash");
+        fs::remove_file(&path).unwrap();
         let page2 = page_in(&path, GONE);
         page2.record(&Fault { signal: libc::SIGBUS, code: 1, addr: 1, pc: 0, fp: 0 });
         page2.record(&Fault { signal: libc::SIGSEGV, code: 1, addr: 2, pc: 0, fp: 0 });
-        let recovered = recover(&dir);
-        let [row] = &recovered.rows[..] else { panic!("one row: {:?}", recovered.rows) };
-        assert_eq!(row.signal, Some("SIGBUS"));
+        let crash = read_back(&path).unwrap().expect("the first fault recorded");
+        assert_eq!(crash.row().signal, Some("SIGBUS"));
         _ = page;
+        _ = fs::remove_dir_all(&dir);
     }
 
     /// A record of another layout, or of another executable, is refused with a typed error naming
-    /// the file, and set aside so it is not read again.
+    /// the file. (Setting a refused file aside is the history's core's, tested there.)
     #[test]
     fn a_record_of_another_layout_or_blaze_is_refused() {
         let dir = scratch("refused");
@@ -1182,17 +1063,15 @@ mod tests {
         let refused = read(&path, &bytes, &other).unwrap_err();
         assert!(matches!(refused, CrashError::OtherBlaze { pid: GONE, .. }), "{refused}");
         assert!(matches!(read(&path, &bytes[..8], &ours), Err(CrashError::NotARecord { .. })));
-        // On disk: the file of another layout is refused and set aside.
-        let mut on_disk = fs::read(&path).unwrap();
-        on_disk[LAYOUT_AT..LAYOUT_AT + 4].copy_from_slice(&(LAYOUT + 1).to_le_bytes());
-        fs::write(&path, &on_disk).unwrap();
-        let recovered = recover(&dir);
-        assert!(recovered.rows.is_empty());
-        assert!(
-            matches!(recovered.refused[..], [CrashError::Layout { .. }]),
-            "{:?}",
-            recovered.refused
-        );
-        assert!(!path.exists() && dir.join(format!("{}.refused", file_name(GONE))).exists());
+        _ = page;
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Only a record's own name gives a pid: a refused one set aside is not read again.
+    #[test]
+    fn a_record_s_pid_is_its_name_s() {
+        assert_eq!(pid_of("crash.12"), Some(12));
+        assert_eq!(pid_of("crash.12.refused"), None);
+        assert_eq!(pid_of("flight-12.map"), None);
     }
 }

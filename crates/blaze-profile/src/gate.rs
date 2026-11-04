@@ -946,6 +946,35 @@ fn merges_exact(duckdb: &Path, history: &Path, build: u64) -> Check {
     }
 }
 
+/// The Parquet files `inputs` merged into `output` as the history's core merges them
+/// ([`history::merge::Concat`]): their column chunks copied, the file written whole.
+fn merge(
+    output: &Path,
+    inputs: &[PathBuf],
+    properties: &parquet::file::properties::WriterProperties,
+) -> Result<(), String> {
+    // alloc: a merge's inputs, once a table
+    let mut read = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        // alloc: an input's bytes, once a merge
+        let bytes = fs::read(input).map_err(|error| format!("reading {}: {error}", input.display()))?;
+        let input = history::merge::Input::of_bytes(bytes::Bytes::from(bytes))
+            .map_err(|error| format!("reading the footer of {}: {error}", input.display()))?;
+        read.push(input);
+    }
+    let merged = history::merge::Concat::new(read, properties)
+        .and_then(history::merge::Concat::all)
+        .map_err(|failed| {
+            let file = match failed.input {
+                Some(at) => inputs[at].display().to_string(),
+                None => output.display().to_string(),
+            };
+            // alloc: an error
+            format!("merging into {}: {} {file}: {}", output.display(), failed.doing, failed.error)
+        })?;
+    fs::write(output, &merged).map_err(|error| format!("writing {}: {error}", output.display()))
+}
+
 fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, String> {
     let name = CheckName::MergesExact;
     let (_pin, files) = files_of(history, build)?;
@@ -970,8 +999,7 @@ fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, Stri
         }
         // alloc: a path, once a table
         let output = out.join(format!("merged.{}.parquet", schema::TABLES[table].name));
-        history::concat(&output, &inputs, writer.properties(table))
-            .map_err(|error| error.to_string())?;
+        merge(&output, &inputs, writer.properties(table))?;
         let mut read = 0;
         for input in &inputs {
             read += footer(input)?.0;
