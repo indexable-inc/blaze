@@ -215,8 +215,21 @@ pub fn leave(v: View<'_>) {
 /// recycled for one that scrolled in (renamed, re-indexed, `update` told it is fresh) and the rest are deleted. `update`
 /// runs for every row in view with its index and whether it was just made or rebound. Before layout has said a range, the
 /// first `overscan` + 16 rows are made. Returns how many rows exist.
-pub fn lazy_for_each<'a, K: AsRef<str>>(parent: View<'a>, prefab: &str, count: u32, key: impl Fn(u32) -> K, mut update: impl FnMut(View<'a>, u32, bool)) -> usize {
+pub fn lazy_for_each<'a, K: AsRef<str>>(parent: View<'a>, prefab: &str, count: u32, key: impl Fn(u32) -> K, update: impl FnMut(View<'a>, u32, bool)) -> usize {
+    lazy_for_each_of(parent, count, key, |_| prefab, update)
+}
+
+/// [`lazy_for_each`] for a list whose rows are not all alike (day headings among items, a note, a "load more" foot):
+/// row `i` is made from `prefab(i)`, and a row that scrolled out is recycled only for one made from the same prefab.
+/// Every row is still the `Lazy` container's `row` points long.
+pub fn lazy_for_each_of<'a, 'p, K: AsRef<str>>(
+    parent: View<'a>, count: u32, key: impl Fn(u32) -> K, prefab: impl Fn(u32) -> &'p str, mut update: impl FnMut(View<'a>, u32, bool),
+) -> usize {
     let e = parent.0;
+    let world = e.world();
+    // The prefab a row was made from (not one that prefab is made from), as `for_each_of` tells them apart.
+    let base = |name: &str| self::prefab(world, name).map(|p| *p.id());
+    let made_from = |row: EntityView<'_>, b: Option<u64>| b.is_none_or(|b| row.owns((flecs::IsA::ID, b)));
     let mut lazy = e.try_cloned::<&Lazy>().unwrap_or_default();
     if lazy.count != count {
         lazy.count = count;
@@ -234,11 +247,19 @@ pub fn lazy_for_each<'a, K: AsRef<str>>(parent: View<'a>, prefab: &str, count: u
     });
     let mut live = 0;
     for (i, k) in &want {
-        let (row, fresh) = match parent.part(k) {
+        let pf = prefab(*i);
+        let b = base(pf);
+        let kept = parent.part(k).filter(|row| made_from(row.0, b));
+        if kept.is_none()
+            && let Some(stale) = parent.part(k)
+        {
+            stale.0.destruct();
+        }
+        let (row, fresh) = match kept {
             Some(row) => (row, false),
-            None => match spare.pop() {
-                Some(c) => (View(c).named(k), true),
-                None => (parent.child(prefab).named(k), true),
+            None => match spare.iter().position(|&c| made_from(c, b)) {
+                Some(at) => (View(spare.swap_remove(at)).named(k), true),
+                None => (parent.child(pf).named(k), true),
             },
         };
         if row.0.try_cloned::<&LazyIndex>().is_none_or(|l| l.i != *i) {
